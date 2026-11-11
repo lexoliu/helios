@@ -41,7 +41,7 @@ pub use hash::{
 };
 pub use ndp::{
     Ipv6DnsServers, Ipv6RouterConfiguration, MAX_ADVERTISED_PREFIXES, MAX_IPV6_DNS_SERVERS,
-    MAX_ROUTER_SOLICITATIONS, NeighborDiscovery, ROUTER_SOLICITATION_INTERVAL_NANOS,
+    MAX_ROUTER_SOLICITATIONS, NeighborDiscovery, OnLinkPrefix, ROUTER_SOLICITATION_INTERVAL_NANOS,
     SLAAC_PREFIX_LEN, interpret_router_advertisement,
 };
 pub use packet::{
@@ -55,7 +55,7 @@ pub use packet::{
 pub use stack::{
     DEFAULT_TCP_LISTEN_BACKLOG, DhcpLease, DnsQueryId, IcmpEchoKey, IcmpEchoReply,
     Ipv4MulticastMembership, MAX_ICMP_ECHO_REPLIES, MAX_IPV4_MULTICAST_MEMBERSHIPS,
-    MAX_OUTBOUND_FRAMES, MAX_UDP_RX, MAX_UDP_SOCKETS, NeighborEntry, NeighborState,
+    MAX_OUTBOUND_FRAMES, MAX_UDP_RX, MAX_UDP_SOCKETS, NeighborCache, NeighborEntry, NeighborState,
     OutboundBatchStatus, Route, RouteTable, RxChecksumOffload, SocketId, Stack, StackConfig,
     StackEvent, StackInstant, TcpAccept, TcpCloseOutcome, TcpConnectState, TcpConnectTerminalError,
     TcpListenBacklog, TcpReadIntoState, TcpReadState, TcpSendState, TcpStackCounters, UdpEgress,
@@ -866,4 +866,10 @@ pub enum StackError {
     /// Multicast membership storage was exhausted.
     #[error("network multicast membership table is full")]
     MulticastMembershipTableFull,
+    /// Route storage was exhausted and nothing could be displaced.
+    #[error("network route table is full")]
+    RouteTableFull,
+    /// Interface address storage was exhausted.
+    #[error("network address table is full")]
+    AddressTableFull,
 }

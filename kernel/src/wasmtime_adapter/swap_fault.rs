@@ -22,6 +22,10 @@ use crate::memory::{SwapFaultError, installed_swap_handle};
 /// Reads the page at `addr` back in, blocking the fiber this is called
 /// on until the swap device has it.
 ///
+/// Returns `Ok` once the page is present, whether this request read it
+/// back or another fault on the same page already had: the faulting
+/// instruction is retried either way.
+///
 /// Returns `Err` when the page could not be reinstated. The caller must
 /// then let the fault reach the runtime's trap handler, which unwinds
 /// the guest — returning to the faulting instruction would fault again

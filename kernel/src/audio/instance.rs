@@ -37,6 +37,7 @@ use triomphe::Arc;
 
 use crate::device::DeviceWindow;
 use crate::pins::{PinnedArena, PinnedRun};
+use crate::process::AudioClaimCap;
 
 use super::AudioServiceError;
 use super::service::{AudioClaim, AudioService, PERIODS_IN_FLIGHT, PeriodRing, PlaybackFormat};
@@ -112,11 +113,12 @@ impl AudioOwnership {
         service: &AudioService,
         id: u32,
         window: DeviceWindow,
+        cap: AudioClaimCap,
     ) -> Result<(), AudioServiceError> {
         if self.claim.is_some() {
             return Err(AudioServiceError::AlreadyClaimed);
         }
-        let claim = service.claim(id)?;
+        let claim = service.claim(id, cap)?;
         self.pins = Some(AudioPins::new(window));
         self.claim = Some(claim);
         Ok(())

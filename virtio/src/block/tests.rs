@@ -646,6 +646,38 @@ fn an_answer_the_interrupt_finds_the_ring_held_for_is_finished_as_the_ring_is_le
 }
 
 #[test]
+fn an_answer_for_a_request_never_submitted_resets_the_device_and_fails_every_request() {
+    let device = device();
+    let waiting = Arc::new(Probe::default());
+    let detached = Arc::new(Probe::default());
+    let waiter = block_on(device.submit_read(0, TestBuffer::probed(512, &waiting)));
+    drop(block_on(
+        device.submit_write(1, TestBuffer::probed(512, &detached)),
+    ));
+    let stray = next_token(&device);
+
+    // The device names a chain the driver never handed it.
+    ring(&device).device_complete(stray, 1);
+    device.handle_interrupt();
+
+    assert!(
+        device.object().transport.status().is_empty(),
+        "the device is reset before any buffer is handed back"
+    );
+    assert_eq!(waiting.completions(), [Err(IoError::DeviceFault)]);
+    assert_eq!(detached.completions(), [Err(IoError::DeviceFault)]);
+    assert_eq!(detached.drops(), 1, "nobody waits for the write's buffer");
+    let failed = block_on(waiter);
+    assert_eq!(failed.result, Err(IoError::DeviceFault));
+    assert_eq!(waiting.drops(), 0, "the waiter has its buffer back");
+
+    let kicks = device.object().transport.kick_count();
+    let refused = block_on(device.read(2, TestBuffer::new(512)));
+    assert_eq!(refused.result, Err(IoError::DeviceFault));
+    assert_eq!(device.object().transport.kick_count(), kicks);
+}
+
+#[test]
 fn multiqueue_programs_one_queue_per_processor() {
     let transport = FakeTransport::new(FakeTransportConfig {
         device_type: DeviceType::Block,

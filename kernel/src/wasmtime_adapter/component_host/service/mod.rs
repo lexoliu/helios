@@ -1,6 +1,8 @@
 use crate::ComponentHostNetwork;
 mod argv;
 pub(crate) use argv::ProgramArgv;
+mod environment;
+use environment::LaunchEnvironment;
 mod shared_memory;
 use shared_memory::*;
 mod memory;
@@ -54,11 +56,11 @@ use crate::wasmtime_adapter::{WasmtimeCompiledComponent, WasmtimeCompiledCoreMod
 use crate::wasmtime_adapter::{
     WasmtimePrecompiledKind,
     wasi::{
-        DebugFileSystem, DebugFileSystemSnapshot, FsDescriptor, FsNodeKind, WasiImportSet,
-        bindings::filesystem::types as fs_types, preview1 as p1,
+        DebugFileSystem, DebugFileSystemSnapshot, FileContents, FsDescriptor, FsNodeKind,
+        WasiImportSet, bindings::filesystem::types as fs_types, preview1 as p1,
     },
 };
-use crate::{ProgramExecErrorDetail, RuntimeMessage};
+use crate::{BootfsBytes, ProgramExecErrorDetail, RuntimeMessage};
 use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -84,7 +86,6 @@ use wasmtime::{
 };
 
 const COMPILER_PLUGIN_PATH: &str = "/bin/compiler.cwasm";
-const HELIOS_PROCESS_ID_ENV: &str = "HELIOS_PROCESS_ID";
 const RAYON_NUM_THREADS_ENV: &[u8] = b"RAYON_NUM_THREADS=";
 const WASM_PAGE_SIZE: usize = 64 * 1024;
 const PROGRAM_SHARED_MEMORY_MAX_PAGES: u32 = 8192;
@@ -192,7 +193,7 @@ where
 /// it once it is running.
 pub(super) struct ProgramLaunch<Net: ComponentHostNetwork> {
     argv: ProgramArgv,
-    env: Vec<(String, String)>,
+    env: LaunchEnvironment,
     authority: ProcessAuthority,
     filesystem: Option<DebugFileSystemSnapshot>,
     /// Inherited preview1 descriptors. Only core modules have a
@@ -207,7 +208,9 @@ pub(super) struct ProgramLaunch<Net: ComponentHostNetwork> {
 
 impl<Net: ComponentHostNetwork> ProgramLaunch<Net> {
     /// A launch that inherits nothing: no descriptors, no signal
-    /// dispositions.
+    /// dispositions. `env` is the caller's environment; the kernel owns
+    /// `HELIOS_PROCESS_ID` and replaces any entry for it (see
+    /// [`LaunchEnvironment`]).
     pub(super) fn new(
         argv: ProgramArgv,
         env: Vec<(String, String)>,
@@ -216,7 +219,7 @@ impl<Net: ComponentHostNetwork> ProgramLaunch<Net> {
     ) -> Self {
         Self {
             argv,
-            env,
+            env: LaunchEnvironment::from_guest(env),
             authority,
             filesystem,
             descriptors: None,
@@ -296,7 +299,7 @@ where
     // InstancePre moved the median from 53 ms to 50-51 ms. Cache only modules
     // whose imports are independent of per-process shared-memory binding.
     core_module_instance_pre_cache: CoreModuleInstancePreCache<CpuImpl, Net, HostFs>,
-    compiler_artifact: Option<Bytes>,
+    compiler_artifact: Option<BootfsBytes>,
     /// Lazily-built compiler kernel-plugin runtime. The plugin's
     /// `wasmtime::Module`, `InstancePre`, and 512 MiB `SharedMemory` are
     /// allocated on first compile and reused for every subsequent call,
@@ -334,20 +337,49 @@ struct ProgramSpawnRequest<Net: ComponentHostNetwork> {
     signal_dispositions: Vec<WasixSignalDisposition>,
 }
 
+/// A program's bytes, classified by how far the kernel trusts them.
+///
+/// The trust follows where the bytes came from, never which path or
+/// branch read them: only [`BootfsBytes`] can become a
+/// [`ProgramSource::BootfsArtifact`], which loads without a signature
+/// check. A cwasm from anywhere else, guest-written files and the host
+/// share alike, is a [`ProgramSource::SignedArtifact`] and loads only
+/// if its signature verifies against the kernel's trusted roots.
 pub(crate) enum ProgramSource {
     RawWasm(Bytes),
     SignedArtifact(Bytes),
-    BootfsArtifact(Bytes),
+    BootfsArtifact(BootfsBytes),
 }
 
 impl ProgramSource {
+    /// Classifies a program read from the in-memory filesystem by the
+    /// provenance its node carries.
+    pub(crate) fn from_file(contents: FileContents) -> Self {
+        match contents {
+            FileContents::Bootfs(bytes) if cwasm::is_cwasm(bytes.as_slice()) => {
+                Self::BootfsArtifact(bytes)
+            }
+            FileContents::Bootfs(bytes) => Self::RawWasm(bytes.to_bytes()),
+            FileContents::Written(bytes) => Self::from_untrusted(bytes),
+        }
+    }
+
+    /// Classifies bytes no boot payload vouches for: a file a guest
+    /// wrote, or one read from the host share.
+    pub(crate) fn from_untrusted(bytes: Bytes) -> Self {
+        if cwasm::is_cwasm(&bytes) {
+            Self::SignedArtifact(bytes)
+        } else {
+            Self::RawWasm(bytes)
+        }
+    }
+
     /// Byte length of the payload the source carries, whichever
     /// variant it is.
     pub(crate) fn payload_len(&self) -> usize {
         match self {
-            Self::RawWasm(bytes) | Self::SignedArtifact(bytes) | Self::BootfsArtifact(bytes) => {
-                bytes.len()
-            }
+            Self::RawWasm(bytes) | Self::SignedArtifact(bytes) => bytes.len(),
+            Self::BootfsArtifact(bytes) => bytes.as_slice().len(),
         }
     }
 }
@@ -1266,7 +1298,7 @@ where
     ) -> Result<ChildHandle, ProgramExecError> {
         let ProgramLaunch {
             argv,
-            mut env,
+            env,
             authority,
             filesystem,
             descriptors,
@@ -1280,12 +1312,7 @@ where
             .instance_registry
             .register(argv.program_name().to_owned(), started_at);
         let instance_id = launched_instance.id();
-        assert!(
-            !env.iter()
-                .any(|(name, _)| name.as_str() == HELIOS_PROCESS_ID_ENV),
-            "{HELIOS_PROCESS_ID_ENV} is reserved for the kernel program launcher"
-        );
-        env.push((HELIOS_PROCESS_ID_ENV.into(), instance_id.raw().to_string()));
+        let env = env.into_process_env(instance_id);
         let signal_state = WasixSignalState::new();
         let request = ProgramSpawnRequest {
             argv,
@@ -2059,10 +2086,9 @@ where
     fn read_compiler_plugin_artifact(
         &self,
         exec_context: &ProgramExecContext<CpuImpl, Net, HostFs>,
-    ) -> Result<Bytes, ProgramExecError> {
+    ) -> Result<BootfsBytes, ProgramExecError> {
         self.inner
             .compiler_artifact
-            .clone()
             .or_else(|| read_bootfs_artifact(&exec_context.runtime_state, COMPILER_PLUGIN_PATH))
             .ok_or(ProgramExecError {
                 kind: ProgramExecErrorKind::InvalidPath,
@@ -2876,6 +2902,9 @@ mod tests {
         parent.grant_terminal_rights(crate::TerminalAuthorityRights::OUTPUT);
         parent.grant_process_rights(crate::ProcessAuthorityRights::SPAWN);
         parent.grant_link_rights(crate::LinkAuthorityRights::SYMLINK_READ);
+        parent.grant_device_classes(
+            crate::DeviceClassRights::DISPLAY | crate::DeviceClassRights::AUDIO,
+        );
 
         let child = wasix_proc_spawn_inherited_non_directory_authority(&parent);
 
@@ -2894,6 +2923,27 @@ mod tests {
             child.link_rights(),
             crate::LinkAuthorityRights::SYMLINK_READ
         );
+        assert_eq!(
+            child.device_class_rights(),
+            crate::DeviceClassRights::DISPLAY | crate::DeviceClassRights::AUDIO
+        );
+        assert!(parent.contains_authority(&child));
+    }
+
+    #[test]
+    fn proc_spawn_inherits_device_classes_but_not_named_devices() {
+        let mut parent = ProcessAuthority::empty();
+        parent.grant_device_classes(crate::DeviceClassRights::all());
+        parent
+            .grant_device(
+                crate::DeviceName::new("pci:0000:00:04.0").expect("the test name is short"),
+            )
+            .expect("one named device fits");
+
+        let child = wasix_proc_spawn_inherited_non_directory_authority(&parent);
+
+        assert_eq!(child.device_class_rights(), crate::DeviceClassRights::all());
+        assert!(child.granted_devices().is_empty());
         assert!(parent.contains_authority(&child));
     }
 

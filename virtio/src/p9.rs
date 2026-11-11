@@ -153,7 +153,7 @@ impl<T: VirtioTransport> Virtio9pDevice<T> {
         let used_len = await_completion(&self.inflight, &self.queue, token, || {
             self.interrupts.notified()
         })
-        .await;
+        .await?;
 
         let header_len = u32::from_le_bytes([response[0], response[1], response[2], response[3]]);
         if header_len != used_len {

@@ -280,7 +280,11 @@ tools/wasi-apps/smoke.sh
 It runs the AArch64/HVF VM path for standard dash, the wall clock the
 kernel seeded from the platform RTC, Bash plus coreutils
 pipeline/redirection/script/cwd/env/exit-status behavior, QuickJS,
-CPython stdlib imports, and an ICMP echo against the slirp gateway. Set
+CPython stdlib imports, the refusal of a guest-written cwasm whose
+signature does not verify (an unchanged copy of a bootfs cwasm still
+verifies and runs; only boot-payload bytes skip the check), and an ICMP
+echo against the slirp gateway. The `smoke-x86-64` CI lane runs the same
+cwasm refusal step under KVM. Set
 `HELIOS_WASI_SMOKE_RELEASE=1` when the smoke should rebuild and boot
 release artifacts. Set `HELIOS_WASI_SMOKE_CURL=1` to include the networked
 curl smoke (run twice, once by bootfs path and once by bare name, so both

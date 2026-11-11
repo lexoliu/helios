@@ -55,6 +55,7 @@ use atomic_waker::AtomicWaker;
 use core::cell::UnsafeCell;
 use core::cmp;
 use core::future::Future;
+use core::hint::spin_loop;
 use core::mem::{size_of, size_of_val};
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering, fence};
@@ -155,6 +156,16 @@ const COMPLETE: u8 = 2;
 /// The device has the request and nobody waits for it: whoever drains
 /// its answer frees the slot.
 const DETACHED: u8 = 3;
+
+// The states of the device as the driver sees it.
+/// The device keeps the used-ring contract; requests are accepted.
+const RUNNING: u8 = 0;
+/// The device broke the used-ring contract and is being reset; it may
+/// still be writing into the buffers it was handed.
+const RESETTING: u8 = 1;
+/// The reset is complete, so the device touches no buffer any more:
+/// every request still in flight is finished with a device fault.
+const STOPPED: u8 = 2;
 
 /// How a multiqueue driver decides which queue a request belongs on.
 ///
@@ -395,6 +406,8 @@ pub struct VirtioBlockDevice<T: VirtioTransport, C: QueueAffinity, B> {
     limits: RequestLimits,
     readonly: bool,
     counters: RequestCounters,
+    /// [`RUNNING`], [`RESETTING`] or [`STOPPED`].
+    state: AtomicU8,
 }
 
 pub struct VirtioBlockResource<T: VirtioTransport, C: QueueAffinity, B> {
@@ -817,6 +830,7 @@ impl<T: VirtioTransport, C: QueueAffinity, B: BlockBuffer> VirtioBlockDevice<T, 
             },
             readonly,
             counters: RequestCounters::default(),
+            state: AtomicU8::new(RUNNING),
         })
     }
 
@@ -1065,6 +1079,12 @@ impl<T: VirtioTransport, C: QueueAffinity, B: BlockBuffer> VirtioBlockDevice<T, 
             let notified = queue.available.notified();
             {
                 let mut ring = queue.ring.lock();
+                // Tested under the ring lock: a reset that lands later
+                // finds this request pending when it takes the lock.
+                if self.state.load(Ordering::SeqCst) != RUNNING {
+                    self.unlock(queue, ring);
+                    break Err((IoError::DeviceFault, buffer.take()));
+                }
                 let id = ring.next_free_descriptor();
                 let request = queue.request(id);
                 if ring.has_room_for(buffers) && request.state.load(Ordering::Acquire) == IDLE {
@@ -1160,16 +1180,33 @@ impl<T: VirtioTransport, C: QueueAffinity, B: BlockBuffer> VirtioBlockDevice<T, 
                 return finished;
             };
             queue.drain_pending.store(false, Ordering::SeqCst);
+            match self.state.load(Ordering::SeqCst) {
+                RUNNING => {}
+                // The context resetting the device drains every queue
+                // once the reset is done.
+                RESETTING => return finished,
+                _ => {
+                    finished += self.fail_in_flight(queue);
+                    drop(ring);
+                    queue.available.notify_all();
+                    return finished;
+                }
+            }
             let mut answered: ArrayVec<(u16, u32), BLOCK_QUEUE_SLOTS> = ArrayVec::new();
-            ring.drain_used(|id, used| answered.push((id, used)));
+            let drained = ring.drain_used(|id, used| answered.push((id, used)));
             drop(ring);
-            // Every popped chain gave its descriptors back to the ring.
+            // Every popped chain gave its descriptors back to the ring;
+            // answers popped before a fault stand.
             let mut released = answered.len();
             for &(id, used) in &answered {
                 released += self.finish(queue, id, used);
             }
             queue.note_released(released);
             finished += answered.len();
+            if drained.is_err() {
+                self.stop();
+                return finished;
+            }
             fence(Ordering::SeqCst);
             if !queue.drain_pending.load(Ordering::SeqCst) {
                 return finished;
@@ -1228,6 +1265,72 @@ impl<T: VirtioTransport, C: QueueAffinity, B: BlockBuffer> VirtioBlockDevice<T, 
                 panic!("virtio-blk device answered descriptor {id}, whose slot is in state {state}")
             }
         }
+    }
+
+    /// Gives up on a device that broke the used-ring contract.
+    ///
+    /// The device is reset first, because only a device that has been
+    /// reset is done with the buffers it was handed (virtio 1.2, device
+    /// status field: a reset is complete once the status reads back
+    /// zero). Then every request still in flight on every queue finishes
+    /// with a device fault and hands its buffer back, and the driver
+    /// refuses every request from then on.
+    fn stop(&self) {
+        if self
+            .state
+            .compare_exchange(RUNNING, RESETTING, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        tracing::error!("virtio-blk device broke the used-ring contract; resetting it");
+        self.transport.reset();
+        while !self.transport.status().is_empty() {
+            spin_loop();
+        }
+        self.state.store(STOPPED, Ordering::SeqCst);
+        // A queue someone else holds is failed by its holder as it lets
+        // go, through the drain request `reap` leaves.
+        for queue in self.queues.iter() {
+            self.reap(queue);
+        }
+    }
+
+    /// Finishes every request in flight on `queue` with a device fault,
+    /// answering how many it finished. The caller holds the ring, and
+    /// the device has been reset.
+    fn fail_in_flight(&self, queue: &BlockQueue<T, B>) -> usize {
+        let mut failed = 0;
+        for request in queue.requests.iter() {
+            if !matches!(request.state.load(Ordering::Acquire), PENDING | DETACHED) {
+                continue;
+            }
+            // SAFETY: the device has the request and the ring is held, so
+            // no other drainer touches the body, and the reset device
+            // writes into it no more; a waiter reads it only once complete.
+            let body = unsafe { &mut *request.body.get() };
+            body.result = Err(IoError::DeviceFault);
+            if let Some(buffer) = body.buffer.as_mut() {
+                buffer.complete(Err(IoError::DeviceFault));
+            }
+            match request.state.compare_exchange(
+                PENDING,
+                COMPLETE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => request.waker.wake(),
+                Err(DETACHED) => {
+                    drop(body.buffer.take());
+                    request.state.store(IDLE, Ordering::Release);
+                }
+                Err(state) => {
+                    panic!("virtio-blk request was failed in slot state {state}")
+                }
+            }
+            failed += 1;
+        }
+        failed
     }
 }
 

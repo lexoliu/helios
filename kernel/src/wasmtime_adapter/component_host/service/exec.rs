@@ -165,20 +165,18 @@ pub(super) struct WasixProcessSnapshot<Net: ComponentHostNetwork> {
     pub(super) rewind_stack: Vec<u8>,
 }
 
+/// The kernel-provisioned artifact at `path`, read from the boot payload
+/// itself rather than from a filesystem a guest can write to.
 pub(super) fn read_bootfs_artifact<CpuImpl, Net, HostFs>(
     runtime_state: &HostRuntimeState<CpuImpl, Net, HostFs>,
     path: &str,
-) -> Option<Bytes>
+) -> Option<BootfsBytes>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    let filesystem = crate::wasmtime_adapter::wasi::DebugFileSystem::<
-        HostRuntimeState<CpuImpl, Net, HostFs>,
-        HostFs,
-    >::new(runtime_state.clone());
-    filesystem.read_program_file_bytes(path).ok()
+    runtime_state.bootfs()?.file_bytes(path)
 }
 
 impl<Net: ComponentHostNetwork> WasixAsyncifyState<Net> {
@@ -1712,8 +1710,7 @@ where
         kind: ProgramExecErrorKind::InvalidBinary,
         detail: ProgramExecErrorDetail::InvalidEntryPoint,
     })?;
-    let mut environment = store.data().environment.clone();
-    environment.retain(|(name, _)| name.as_str() != HELIOS_PROCESS_ID_ENV);
+    let environment = store.data().environment.clone();
     let (_, stdin_reader) = crate::byte_channel();
     let output_mode = OutputMode::RoutedChild {
         stdin_rx: stdin_reader,
@@ -1761,8 +1758,9 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    let lower = store.data_mut().entropy.insecure_u64();
-    let upper = store.data_mut().entropy.insecure_u64();
+    let data = store.data_mut();
+    let lower = data.entropy.insecure_u64(data.runtime_state.root_entropy());
+    let upper = data.entropy.insecure_u64(data.runtime_state.root_entropy());
     let hash = (u128::from(upper) << 64) | u128::from(lower);
     if hash == 0 { 1 } else { hash }
 }
@@ -2008,10 +2006,9 @@ pub(super) fn map_artifact_profile_error(error: ArtifactProfileError) -> Program
     }
 }
 
-pub(super) fn trusted_bootfs_payload(bytes: &Bytes) -> Result<Bytes, ProgramExecError> {
-    let trusted = cwasm::trust_bootfs_artifact(UntrustedCwasm::new(bytes))
-        .map_err(map_artifact_trust_error)?;
-    Ok(bytes.slice(..trusted.payload().len()))
+pub(super) fn trusted_bootfs_payload(bytes: &BootfsBytes) -> Result<Bytes, ProgramExecError> {
+    let trusted = cwasm::trust_bootfs_artifact(bytes).map_err(map_artifact_trust_error)?;
+    Ok(bytes.to_bytes().slice(..trusted.payload().len()))
 }
 
 pub(super) fn trusted_signed_payload(bytes: &Bytes) -> Result<Bytes, ProgramExecError> {
