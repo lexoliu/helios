@@ -318,8 +318,7 @@ mod tests {
         let backend = backend(8192);
         let token = swapped(&backend, 4096, 5).expect("swap out");
         let refused = block_on(backend.swap_in(token, staged(&backend, 2048, 0)))
-            .err()
-            .expect("a short page is refused");
+            .expect_err("a short page is refused");
         assert!(
             matches!(refused.error, FileSwapError::InvalidDestination { .. }),
             "got {:?}",

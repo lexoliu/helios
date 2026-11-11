@@ -1914,6 +1914,7 @@ fn append_read_payload(response: &[u8], output: &mut Vec<u8>) -> Result<usize, H
 mod tests {
     use super::*;
     use crate::test_support::ManualClockCpu;
+    use alloc::vec;
     use futures_lite::future::{block_on, zip};
 
     #[test]
