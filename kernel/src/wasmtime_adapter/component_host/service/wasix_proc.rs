@@ -2276,6 +2276,7 @@ pub(super) fn wasix_proc_spawn_resolve_child_cwd(
             kind: FsNodeKind::Directory,
             flags,
             identity: None,
+            mount: None,
         },
     })
 }
@@ -3167,6 +3168,7 @@ pub(super) fn wasix_spawn_resolve_cwd_target<Net: ComponentHostNetwork>(
             kind: FsNodeKind::Directory,
             flags,
             identity: None,
+            mount: None,
         },
     })
 }

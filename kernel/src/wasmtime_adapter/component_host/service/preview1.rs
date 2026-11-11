@@ -695,6 +695,7 @@ where
                 kind: FsNodeKind::Directory,
                 flags,
                 identity: None,
+                mount: None,
             },
         })
     }
@@ -4578,6 +4579,7 @@ mod tests {
                 kind: FsNodeKind::File,
                 flags: fs_types::DescriptorFlags::READ,
                 identity: None,
+                mount: None,
             },
             offset: 0,
             fdflags: 0,
@@ -4603,6 +4605,7 @@ mod tests {
                 | fs_types::DescriptorFlags::WRITE
                 | fs_types::DescriptorFlags::MUTATE_DIRECTORY,
             identity: None,
+            mount: None,
         };
         let file = block_on(wasi_fs::open_at(
             &namespace,

@@ -11,7 +11,9 @@
 use helios_hal::fs::{FileSystem, FsError as VfsError, Metadata, NodeKind, OpenFlags};
 use pin_project_lite::pin_project;
 
-use crate::{ComponentHostNetwork, FileContents, Follow, Namespace, Resolved, object_identity};
+use crate::{
+    ComponentHostNetwork, FileContents, Follow, MountHold, Namespace, Resolved, object_identity,
+};
 
 use super::*;
 
@@ -74,6 +76,15 @@ pub struct FsDescriptor {
     pub(crate) kind: FsNodeKind,
     pub(crate) flags: fs_types::DescriptorFlags,
     pub(crate) identity: Option<ObjectIdentity>,
+    /// The hold on the mount `open-at` resolved this through, which keeps
+    /// that mount from being unmounted while the descriptor lives. `None`
+    /// for a preopen or a working directory, which the process's authority
+    /// names rather than an open, and for the namespace's root.
+    #[expect(
+        dead_code,
+        reason = "held for its effect: a live share is what makes unmount busy"
+    )]
+    pub(crate) mount: Option<MountHold>,
 }
 
 /// What every filesystem operation here resolves with.
@@ -277,6 +288,7 @@ where
         kind,
         flags,
         identity: Some(object_identity(&metadata)),
+        mount: resolved.hold(),
     })
 }
 
@@ -1063,6 +1075,7 @@ pub(crate) fn preopen_descriptor(preopen: &crate::DirectoryPreopen) -> FsDescrip
         kind: FsNodeKind::Directory,
         flags: descriptor_flags_from_authority(preopen.rights()),
         identity: None,
+        mount: None,
     }
 }
 

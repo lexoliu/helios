@@ -219,7 +219,7 @@ pub use surface::{
 };
 pub use vfs::{
     BOOT_DEVICE, FileContents, Follow, HostShare, MAX_MOUNTS, MAX_SYMLINK_DEPTH, MemoryFs,
-    MountError, MountRequestError, MountSource, MountTable, MountedFs, Namespace,
+    MountError, MountHold, MountRequestError, MountSource, MountTable, MountedFs, Namespace,
     ROOT_LAYER_DEVICE, Resolved, RootFs, object_identity, request_mount, request_unmount,
     symlink_target, within_directory,
 };

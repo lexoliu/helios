@@ -213,9 +213,10 @@ fn a_cancelled_unmount_leaves_the_mount_live() {
 fn unmount_refuses_a_mount_with_mounts_below_it() {
     let namespace = namespace();
     mount_memory(&namespace, "/mnt");
-    let resolved = namespace.resolve("/mnt").expect("resolves");
     block_on(
-        resolved
+        namespace
+            .resolve("/mnt")
+            .expect("resolves")
             .writable()
             .expect("writable")
             .create_directory(FsPath::new("inner").expect("valid"), 1),
@@ -244,8 +245,14 @@ fn a_read_only_mount_refuses_changes() {
     ))
     .expect("mounts");
     assert_eq!(read(&namespace, "/mnt/bin/tool"), b"tool");
-    let resolved = namespace.resolve("/mnt/bin/tool").expect("resolves");
-    assert_eq!(resolved.writable().map(drop), Err(FsError::ReadOnly));
+    assert_eq!(
+        namespace
+            .resolve("/mnt/bin/tool")
+            .expect("resolves")
+            .writable()
+            .map(drop),
+        Err(FsError::ReadOnly)
+    );
 }
 
 #[test]
@@ -383,8 +390,14 @@ fn a_mount_request_with_mount_authority_attaches_the_source() {
     ))
     .expect("root may mount the boot image");
     assert_eq!(read(&namespace, "/mnt/bin/tool"), b"tool");
-    let resolved = namespace.resolve("/mnt/bin/tool").expect("resolves");
-    assert_eq!(resolved.writable().map(drop), Err(FsError::ReadOnly));
+    assert_eq!(
+        namespace
+            .resolve("/mnt/bin/tool")
+            .expect("resolves")
+            .writable()
+            .map(drop),
+        Err(FsError::ReadOnly)
+    );
 
     assert_eq!(
         block_on(crate::request_mount(

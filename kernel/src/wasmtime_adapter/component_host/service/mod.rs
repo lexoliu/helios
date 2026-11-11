@@ -2581,12 +2581,14 @@ mod tests {
             kind: FsNodeKind::Directory,
             flags: fs_types::DescriptorFlags::READ,
             identity: None,
+            mount: None,
         };
         let work = FsDescriptor {
             path: "/work".into(),
             kind: FsNodeKind::Directory,
             flags: fs_types::DescriptorFlags::READ,
             identity: None,
+            mount: None,
         };
 
         assert_eq!(
@@ -2635,6 +2637,7 @@ mod tests {
                 kind: FsNodeKind::File,
                 flags: fs_types::DescriptorFlags::WRITE,
                 identity: None,
+                mount: None,
             },
             offset: 0,
             fdflags: 0,
@@ -2724,6 +2727,7 @@ mod tests {
                 kind: FsNodeKind::File,
                 flags: fs_types::DescriptorFlags::WRITE,
                 identity: None,
+                mount: None,
             },
             offset: 0,
             fdflags: 0,
@@ -2764,6 +2768,7 @@ mod tests {
                 kind: FsNodeKind::File,
                 flags: fs_types::DescriptorFlags::READ,
                 identity: None,
+                mount: None,
             },
             offset: 0,
             fdflags: P1_FDFLAG_NONBLOCK,
@@ -2866,6 +2871,7 @@ mod tests {
                 kind: FsNodeKind::Directory,
                 flags: fs_types::DescriptorFlags::READ,
                 identity: None,
+                mount: None,
             },
         };
 
@@ -2984,6 +2990,7 @@ mod tests {
                 kind: FsNodeKind::File,
                 flags: fs_types::DescriptorFlags::READ,
                 identity: None,
+                mount: None,
             },
             offset: 0,
             fdflags: 0,
@@ -2994,6 +3001,7 @@ mod tests {
                 kind: FsNodeKind::File,
                 flags: fs_types::DescriptorFlags::READ,
                 identity: None,
+                mount: None,
             },
             offset: 0,
             fdflags: 0,
@@ -3032,6 +3040,7 @@ mod tests {
                             kind: FsNodeKind::Directory,
                             flags: fs_types::DescriptorFlags::READ,
                             identity: None,
+                            mount: None,
                         },
                     },
                     false,
@@ -3060,6 +3069,7 @@ mod tests {
                 kind: FsNodeKind::Directory,
                 flags: fs_types::DescriptorFlags::READ,
                 identity: None,
+                mount: None,
             },
         };
         let mut authority = ProcessAuthority::empty();
@@ -3102,6 +3112,7 @@ mod tests {
                             kind: FsNodeKind::Directory,
                             flags: fs_types::DescriptorFlags::READ,
                             identity: None,
+                            mount: None,
                         },
                     },
                     false,
@@ -3115,6 +3126,7 @@ mod tests {
                     kind: FsNodeKind::Directory,
                     flags: fs_types::DescriptorFlags::READ,
                     identity: None,
+                    mount: None,
                 },
             }),
         };
@@ -3138,6 +3150,7 @@ mod tests {
                             kind: FsNodeKind::Directory,
                             flags: fs_types::DescriptorFlags::READ,
                             identity: None,
+                            mount: None,
                         },
                     },
                     false,

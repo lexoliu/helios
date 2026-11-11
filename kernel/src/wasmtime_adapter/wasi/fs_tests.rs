@@ -41,6 +41,7 @@ fn root() -> FsDescriptor {
             | fs_types::DescriptorFlags::WRITE
             | fs_types::DescriptorFlags::MUTATE_DIRECTORY,
         identity: None,
+        mount: None,
     }
 }
 
@@ -790,4 +791,31 @@ fn a_directory_holding_a_mount_point_is_busy() {
     }
     let mounted = block_on(stat_path(&namespace, "/a/b", Follow::No)).expect("still mounted");
     assert_eq!(mounted.kind, NodeKind::Directory);
+}
+
+#[test]
+fn a_mount_with_a_descriptor_or_stream_open_on_it_is_busy() {
+    let namespace = namespace();
+    mount_memory(&namespace, "/mnt");
+    let descriptor = create_file(&namespace, "mnt/notes", "日本語 한국어".as_bytes());
+    let stream = super::stream_target(
+        &namespace,
+        &descriptor,
+        fs_types::DescriptorFlags::READ,
+        fs_types::ErrorCode::NotPermitted,
+    )
+    .expect("a stream over the file");
+
+    let unmount = || block_on(namespace.table().unmount("/mnt"));
+    assert_eq!(unmount(), Err(crate::MountError::Busy("/mnt".into())));
+    drop(descriptor);
+    assert_eq!(unmount(), Err(crate::MountError::Busy("/mnt".into())));
+    assert_eq!(
+        block_on(super::read_resolved(stream.clone(), 0, 64))
+            .expect("the stream still reads")
+            .as_ref(),
+        "日本語 한국어".as_bytes()
+    );
+    drop(stream);
+    unmount().expect("nothing holds the mount any more");
 }

@@ -215,7 +215,7 @@ pub enum MountError {
     AlreadyMounted(String),
     #[error("{0:?} is not a mount point")]
     NotMounted(String),
-    #[error("{0:?} has mounts below it")]
+    #[error("{0:?} is in use: a mount below it, or a descriptor or stream open on it")]
     Busy(String),
     #[error("the mount table holds {MAX_MOUNTS} mounts already")]
     TableFull,
@@ -233,6 +233,44 @@ struct Mount<H> {
     point: String,
     rights: FileSystemRights,
     fs: MountedFs<H>,
+    /// The table's own share of the mount's hold; any other share is a
+    /// descriptor or stream that keeps the mount from being unmounted.
+    hold: MountHold,
+}
+
+/// What an open descriptor or file stream keeps of the mount it resolved
+/// through: while any is alive, [`MountTable::unmount`] refuses with
+/// [`MountError::Busy`], as POSIX `umount` refuses a filesystem with
+/// files open on it. Clones share one hold.
+///
+/// It is a count and nothing else, so a descriptor carries it without
+/// naming the filesystem's type.
+#[derive(Clone)]
+pub struct MountHold(Arc<()>);
+
+impl MountHold {
+    fn new() -> Self {
+        Self(Arc::new(()))
+    }
+
+    /// Whether anything besides the table holds the mount.
+    fn is_held(&self) -> bool {
+        !self.0.is_unique()
+    }
+}
+
+impl core::fmt::Debug for MountHold {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("MountHold")
+    }
+}
+
+/// What a resolution found in the table: the mount that owns a path.
+struct Located<H> {
+    point_len: usize,
+    rights: FileSystemRights,
+    fs: MountedFs<H>,
+    hold: MountHold,
 }
 
 /// One mount's place in the table.
@@ -298,6 +336,17 @@ struct Retiring<'a, H> {
 }
 
 impl<H> Retiring<'_, H> {
+    /// Whether a descriptor or stream holds the retiring mount.
+    fn held(&self) -> bool {
+        // SAFETY: the slot is retiring and its mount stays in place until
+        // this guard empties it; only the hold's count is read.
+        unsafe { &*self.slot.mount.get() }
+            .as_ref()
+            .expect("a retiring slot holds a mount")
+            .hold
+            .is_held()
+    }
+
     /// Takes the mount out of the slot and leaves the slot empty.
     fn retire(self) -> Option<Mount<H>> {
         let this = core::mem::ManuallyDrop::new(self);
@@ -417,6 +466,7 @@ impl<H: Clone> MountTable<H> {
                 point: point.to_owned(),
                 rights,
                 fs,
+                hold: MountHold::new(),
             });
         }
         slot.state.store(SLOT_LIVE, AtomicOrdering::SeqCst);
@@ -425,7 +475,12 @@ impl<H: Clone> MountTable<H> {
 
     /// Unmounts the filesystem at `point`, once no resolution is looking
     /// at it.
+    ///
+    /// A mount with a mount below it, or with a descriptor or stream still
+    /// holding it ([`MountHold`]), is in use: [`MountError::Busy`], and the
+    /// mount stays as it was.
     pub async fn unmount(&self, point: &str) -> Result<(), MountError> {
+        let busy = || MountError::Busy(point.to_owned());
         let slot = {
             let _writer = self.inner.writer.lock();
             let mut found = None;
@@ -438,9 +493,12 @@ impl<H: Clone> MountTable<H> {
                     .as_ref()
                     .expect("a live slot holds a mount");
                 if mounted.point == point {
+                    if mounted.hold.is_held() {
+                        return Err(busy());
+                    }
                     found = Some(slot);
                 } else if point_covers(point, &mounted.point) {
-                    return Err(MountError::Busy(point.to_owned()));
+                    return Err(busy());
                 }
             }
             let slot = found.ok_or_else(|| MountError::NotMounted(point.to_owned()))?;
@@ -456,19 +514,29 @@ impl<H: Clone> MountTable<H> {
         while slot.pins.load(AtomicOrdering::SeqCst) != 0 {
             crate::yield_now().await;
         }
+        // Every resolution that could have taken a share has let go, and
+        // none can take one now: a share still out is a holder.
+        if retiring.held() {
+            return Err(busy());
+        }
         drop(retiring.retire());
         Ok(())
     }
 
-    /// The mount whose point is the longest prefix of `absolute`, as the
-    /// length of its point, its rights and its filesystem.
-    fn longest_match(&self, absolute: &str) -> Option<(usize, FileSystemRights, MountedFs<H>)> {
-        let mut best: Option<(usize, FileSystemRights, MountedFs<H>)> = None;
+    /// The mount whose point is the longest prefix of `absolute`.
+    fn longest_match(&self, absolute: &str) -> Option<Located<H>> {
+        let mut best: Option<Located<H>> = None;
         for slot in &self.inner.slots {
-            let longer = |len: usize| best.as_ref().is_none_or(|(best, _, _)| len > *best);
+            let longer = |len: usize| best.as_ref().is_none_or(|best| len > best.point_len);
             if let Some(found) = slot.read(|mount| {
-                (point_covers(&mount.point, absolute) && longer(mount.point.len()))
-                    .then(|| (mount.point.len(), mount.rights, mount.fs.clone()))
+                (point_covers(&mount.point, absolute) && longer(mount.point.len())).then(|| {
+                    Located {
+                        point_len: mount.point.len(),
+                        rights: mount.rights,
+                        fs: mount.fs.clone(),
+                        hold: mount.hold.clone(),
+                    }
+                })
             }) {
                 best = found.or(best);
             }
@@ -509,6 +577,9 @@ pub struct Resolved<H> {
     absolute: String,
     /// Length of the mount point in `absolute`; `0` for the root mount.
     point_len: usize,
+    /// A share of the mount's hold; `None` for the namespace's root, which
+    /// is never unmounted.
+    hold: Option<MountHold>,
 }
 
 impl<H: HostFileSystem> Resolved<H> {
@@ -551,6 +622,13 @@ impl<H: HostFileSystem> Resolved<H> {
     /// the two can stay within one filesystem.
     pub fn same_mount(&self, other: &Self) -> bool {
         self.mount_point() == other.mount_point()
+    }
+
+    /// A share of the hold on the mount this resolved through, for a
+    /// descriptor or stream that keeps using it; `None` on the namespace's
+    /// root, which is never unmounted.
+    pub fn hold(&self) -> Option<MountHold> {
+        self.hold.clone()
     }
 
     /// Whether the path names the root of its mount.
@@ -674,17 +752,23 @@ impl<H: HostFileSystem> Namespace<H> {
         if !absolute.starts_with('/') {
             return Err(FsError::Invalid);
         }
-        let (point_len, rights, fs) = self.table.longest_match(absolute).unwrap_or((
-            0,
-            FileSystemRights::READ | FileSystemRights::WRITE,
-            MountedFs::Root(self.root.clone()),
-        ));
-        let resolved = Resolved {
-            fs,
-            rights,
-            absolute: absolute.to_owned(),
-            point_len,
+        let resolved = match self.table.longest_match(absolute) {
+            Some(located) => Resolved {
+                fs: located.fs,
+                rights: located.rights,
+                absolute: absolute.to_owned(),
+                point_len: located.point_len,
+                hold: Some(located.hold),
+            },
+            None => Resolved {
+                fs: MountedFs::Root(self.root.clone()),
+                rights: FileSystemRights::READ | FileSystemRights::WRITE,
+                absolute: absolute.to_owned(),
+                point_len: 0,
+                hold: None,
+            },
         };
+        let point_len = resolved.point_len;
         let inside = &resolved.absolute[point_len..];
         FsPath::new(inside.strip_prefix('/').unwrap_or(inside)).ok_or(FsError::Invalid)?;
         Ok(resolved)

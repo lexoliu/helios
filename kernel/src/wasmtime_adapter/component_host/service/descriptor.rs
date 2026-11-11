@@ -1136,6 +1136,7 @@ pub(super) fn preview1_cwd_from_authority(authority: &ProcessAuthority) -> Optio
             kind: FsNodeKind::Directory,
             flags: directory_authority_to_descriptor_flags(preopen.rights()),
             identity: None,
+            mount: None,
         },
     })
 }
@@ -1183,6 +1184,7 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
                 kind: FsNodeKind::Directory,
                 flags: directory_authority_to_descriptor_flags(preopen.rights()),
                 identity: None,
+                mount: None,
             };
             table.entries.push(Some(Preview1DescriptorEntry::new(
                 Preview1Descriptor::Preopen {

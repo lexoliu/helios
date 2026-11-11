@@ -3375,6 +3375,7 @@ mod tests {
                 | p3fs::DescriptorFlags::WRITE
                 | p3fs::DescriptorFlags::MUTATE_DIRECTORY,
             identity: None,
+            mount: None,
         };
         let descriptor = block_on(crate::wasmtime_adapter::wasi::open_at(
             store.filesystem(),
