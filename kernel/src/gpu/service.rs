@@ -56,6 +56,7 @@ use crate::buffer::Buffer;
 use crate::component::{ProviderError, ProviderSender};
 use crate::display::SequenceSignal;
 use crate::exec::Notify;
+use crate::process::GpuClaimCap;
 
 use super::Gpu3dServiceError;
 
@@ -323,7 +324,10 @@ impl Gpu3dService {
     /// to hold — when another instance holds it, and when the previous
     /// owner's resources are still being handed back: the engine is
     /// not free until the display engine says it is.
-    pub fn claim(&self) -> Result<Gpu3dClaim, Gpu3dServiceError> {
+    ///
+    /// `_cap` is the proof that the caller's authority names the GPU
+    /// class; the check happened where the cap was derived.
+    pub fn claim(&self, _cap: GpuClaimCap) -> Result<Gpu3dClaim, Gpu3dServiceError> {
         if !self.shared.renders {
             return Err(Gpu3dServiceError::NoRenderer);
         }

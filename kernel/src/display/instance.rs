@@ -24,6 +24,8 @@
 //! the last of those references does — after the display engine has let
 //! go of it, whatever order the instance's own side went in.
 
+use crate::process::DisplayClaimCap;
+
 use super::DisplayServiceError;
 use super::service::{DisplayClaim, DisplayService};
 
@@ -48,11 +50,15 @@ impl DisplayOwnership {
     ///
     /// Refused when this instance already holds it — a second claim
     /// would make the release ambiguous — and when somebody else does.
-    pub fn claim(&mut self, service: &DisplayService) -> Result<(), DisplayServiceError> {
+    pub fn claim(
+        &mut self,
+        service: &DisplayService,
+        cap: DisplayClaimCap,
+    ) -> Result<(), DisplayServiceError> {
         if self.claim.is_some() {
             return Err(DisplayServiceError::AlreadyClaimed);
         }
-        self.claim = Some(service.claim()?);
+        self.claim = Some(service.claim(cap)?);
         Ok(())
     }
 

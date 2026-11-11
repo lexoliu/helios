@@ -21,6 +21,7 @@ mod instance;
 mod io;
 mod kernel_exception;
 mod log;
+mod machine;
 mod memory;
 mod network;
 mod process;
@@ -150,6 +151,7 @@ pub use kernel_exception::{
     KernelException, KernelExceptionCause, KernelExceptionDispatch, KernelNativeTrapHandler,
     dispatch_native_trap, install_native_trap_handler,
 };
+pub use machine::{AdvanceCause, Generation, MachineGeneration, MachineGenerationHandle};
 pub use memory::{
     AccessibilityPlan, BalloonHandle, BalloonStats, BootMemoryPlan, BootRegionSplitter,
     CommittedRegion, CommittedRemoval, Decommitted, ENTROPY_RESEED_INTERVAL, EntropyPool,
@@ -186,16 +188,18 @@ pub use network::{
     validate_http_path_with_query, validate_http_status_code,
 };
 pub use process::{
-    ClockAuthorityRights, DescriptorEntry, DescriptorId, DescriptorTable, DescriptorTableError,
-    DirectoryAuthorityRights, DirectoryCap, DirectoryPreopen, DnsCap, ExecAuthority, ForkAuthority,
-    FutexKey, FutexTable, FutexWaitRegistration, GuestAddress, JoinAuthority, LinkAuthorityRights,
-    LinkSourceCap, LinkTargetDirectoryCap, MulticastCap, NetworkAdminCap, NetworkAuthorityRights,
-    NetworkCap, PrivilegedBindCap, ProcessAuthority, ProcessAuthorityError, ProcessAuthorityRights,
-    ProcessId, ProcessMemoryIdentity, ProcessRecord, ProcessState, ProcessTable, ProcessTableError,
-    ProgramExecError, ProgramExecErrorDetail, ProgramExecErrorKind, ProgramOutOfMemory,
-    RuntimeMessage, SetWallClockCap, SignalAuthority, SpawnAuthority, SymlinkCreateCap,
-    SymlinkReadCap, TcpCap, TerminalAuthorityRights, TerminalInputCap, TerminalOutputCap, ThreadId,
-    ThreadRecord, ThreadState, ThreadTable, ThreadTableError, TtyControlCap, UdpCap,
+    AudioClaimCap, ClockAuthorityRights, DescriptorEntry, DescriptorId, DescriptorTable,
+    DescriptorTableError, DeviceClassRights, DeviceGrantClaimCap, DirectoryAuthorityRights,
+    DirectoryCap, DirectoryPreopen, DisplayClaimCap, DnsCap, ExecAuthority, ForkAuthority,
+    FutexKey, FutexTable, FutexWaitRegistration, GpuClaimCap, GuestAddress, InputClaimCap,
+    JoinAuthority, LinkAuthorityRights, LinkSourceCap, LinkTargetDirectoryCap, MulticastCap,
+    NetworkAdminCap, NetworkAuthorityRights, NetworkCap, PrivilegedBindCap, ProcessAuthority,
+    ProcessAuthorityError, ProcessAuthorityRights, ProcessId, ProcessMemoryIdentity, ProcessRecord,
+    ProcessState, ProcessTable, ProcessTableError, ProgramExecError, ProgramExecErrorDetail,
+    ProgramExecErrorKind, ProgramOutOfMemory, RuntimeMessage, SetWallClockCap, SignalAuthority,
+    SpawnAuthority, SymlinkCreateCap, SymlinkReadCap, TcpCap, TerminalAuthorityRights,
+    TerminalInputCap, TerminalOutputCap, ThreadId, ThreadRecord, ThreadState, ThreadTable,
+    ThreadTableError, TtyControlCap, UdpCap,
 };
 pub use profiling::{
     CodeAttribution, InstructionProfile, InstructionProfileError, InstructionSampler,
@@ -206,11 +210,11 @@ pub use profiling::{
 pub use runtime::{
     AuthorityDomain, ComponentHostFilesystemState, ComponentHostNetwork, ComponentNetworkService,
     ComponentNetworkState, DnsError, DnsErrorKind, ExecOutput, ExecResult, HostDirEntry,
-    HostFileSystem, HostFsError, HostFsErrorKind, HostMetadata, Ipv4Address, NetworkErrorDetail,
-    NetworkHandle, NetworkIpAddress, NetworkPacketPump, ObjectIdentity, PingError, PingErrorKind,
-    PingReply, RegisteredTcpReadBuffer, RuntimeState, SocketReadiness, TcpAccepted, TcpError,
-    TcpErrorKind, TcpListener, TcpReadProgress, TcpWriteProgress, UdpBinding, UdpDatagram,
-    UdpError, UdpErrorKind,
+    HostDirLimit, HostFileSystem, HostFsError, HostFsErrorKind, HostMetadata, Ipv4Address,
+    NetworkErrorDetail, NetworkHandle, NetworkIpAddress, NetworkPacketPump, ObjectIdentity,
+    PingError, PingErrorKind, PingReply, RegisteredTcpReadBuffer, RuntimeState, SocketReadiness,
+    TcpAccepted, TcpError, TcpErrorKind, TcpListener, TcpReadProgress, TcpWriteProgress,
+    UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
 };
 pub use surface::{
     MAX_INSTANCE_SURFACES, MAX_LIVE_SURFACES, ReturnedSurfaces, SURFACE_EVENT_QUEUE_DEPTH,

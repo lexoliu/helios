@@ -24,7 +24,8 @@ interface device {
 
   /// Why a request was refused.
   enum error {
-    /// No device with this name was discovered.
+    /// No device with this name was discovered, or the kernel did not
+    /// grant this instance the device. The two are not distinguished.
     not-found,
     /// Another instance already holds the device.
     already-claimed,

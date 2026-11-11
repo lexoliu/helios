@@ -25,10 +25,11 @@
 
 use std::fmt;
 use std::fs;
+use std::io::Write as _;
 use std::net::Ipv4Addr;
 use std::os::unix::fs::FileTypeExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus};
+use std::process::{Command, ExitStatus, Stdio};
 
 use clap::{Args as ClapArgs, ValueEnum};
 use console::style;
@@ -617,6 +618,50 @@ pub(crate) enum VmNetworkSetupError {
 
     #[error("bridge address {address} leaves no usable DHCP host range")]
     BridgeRangeEmpty { address: Ipv4Net },
+
+    #[error("failed to feed the standard input of `{command}`")]
+    StdinWrite {
+        command: String,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("failed to read the forwarding setting {path} of uplink `{interface}`")]
+    ForwardingUnreadable {
+        interface: String,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("{path} holds `{raw}`, which is not a forwarding setting")]
+    ForwardingUnparsable { path: PathBuf, raw: String },
+
+    #[error(
+        "{path} records host state from an earlier `net-setup` that was not torn down; run \
+         `net-teardown` for this bridge first, so the values it restores are the host's own"
+    )]
+    StateExists { path: PathBuf },
+
+    #[error(
+        "{path} is missing, so the host state `net-setup` changed (the vhost-net ACL, the uplink \
+         forwarding setting) cannot be restored; was `net-setup` run for this bridge?"
+    )]
+    StateMissing { path: PathBuf },
+
+    #[error("failed to read the host state record {path}")]
+    StateUnreadable {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("failed to decode the host state record {path}")]
+    StateUndecodable {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
 }
 
 /// Backend selection as it arrives from the command line.
@@ -1243,6 +1288,9 @@ fn has_vmnet_entitlement(binary: &Path) -> Result<bool, VmNetworkError> {
 pub(crate) struct PrivilegedCommand {
     program: String,
     args: Vec<String>,
+    /// Bytes fed to the command's standard input, whose standard output
+    /// is then discarded (`tee`, writing a root-owned file).
+    stdin: Option<String>,
 }
 
 impl PrivilegedCommand {
@@ -1254,7 +1302,13 @@ impl PrivilegedCommand {
         Self {
             program: program.to_owned(),
             args: args.into_iter().map(Into::into).collect(),
+            stdin: None,
         }
+    }
+
+    fn with_stdin(mut self, stdin: String) -> Self {
+        self.stdin = Some(stdin);
+        self
     }
 
     /// The command as a user could retype it, including the `sudo` prefix
@@ -1297,12 +1351,29 @@ impl PrivilegedCommand {
     /// Runs the command as a probe, returning its status instead of
     /// treating a non-zero exit as a failure.
     fn status(&self, elevate: bool) -> Result<ExitStatus, VmNetworkSetupError> {
-        self.build(elevate)
-            .status()
-            .map_err(|source| VmNetworkSetupError::Spawn {
-                command: self.display(elevate),
-                source,
-            })
+        let spawn = |source| VmNetworkSetupError::Spawn {
+            command: self.display(elevate),
+            source,
+        };
+        let mut command = self.build(elevate);
+        let Some(input) = &self.stdin else {
+            return command.status().map_err(spawn);
+        };
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .map_err(spawn)?;
+        let mut stdin = child.stdin.take().expect("stdin was requested piped");
+        let written = stdin.write_all(input.as_bytes());
+        // Closing the pipe is what lets the command see end of input.
+        drop(stdin);
+        let status = child.wait().map_err(spawn)?;
+        written.map_err(|source| VmNetworkSetupError::StdinWrite {
+            command: self.display(elevate),
+            source,
+        })?;
+        Ok(status)
     }
 
     /// Runs the command and captures stdout, for probes whose output the
@@ -1370,6 +1441,91 @@ pub(crate) struct NetTeardownCommand {
 /// Path of the pid file the optional dnsmasq responder writes.
 fn dnsmasq_pid_file(bridge: &str) -> PathBuf {
     PathBuf::from("/var/run").join(format!("helios-dnsmasq-{bridge}.pid"))
+}
+
+/// The host state `net-setup` changes outside the interfaces it creates,
+/// recorded for `net-teardown`. It lives beside the dnsmasq pid file, the
+/// other record the two helpers share, and is written by a privileged
+/// `tee` because `/var/run` is root's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct NetState {
+    /// The account granted an ACL entry on [`VHOST_NET_DEVICE`].
+    vhost_uid: u32,
+    /// The forwarding setting of the NAT uplink before setup; `None` when
+    /// `--net-no-nat` left forwarding alone.
+    uplink: Option<UplinkForwarding>,
+}
+
+/// An interface's `forwarding` value as setup found it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct UplinkForwarding {
+    interface: String,
+    previous: u32,
+}
+
+/// Path of the [`NetState`] record of one bridge.
+fn net_state_file(bridge: &str) -> PathBuf {
+    PathBuf::from("/var/run").join(format!("helios-net-{bridge}.json"))
+}
+
+impl NetState {
+    fn load(bridge: &str) -> Result<Self, VmNetworkSetupError> {
+        let path = net_state_file(bridge);
+        let raw = match fs::read(&path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(VmNetworkSetupError::StateMissing { path });
+            }
+            Err(source) => return Err(VmNetworkSetupError::StateUnreadable { path, source }),
+        };
+        serde_json::from_slice(&raw)
+            .map_err(|source| VmNetworkSetupError::StateUndecodable { path, source })
+    }
+}
+
+/// The `sysctl` name of an interface's IPv4 `forwarding` setting. The
+/// slash form keeps a dot inside an interface name (`eth0.100`) from
+/// being read as a separator.
+fn forwarding_sysctl(interface: &str) -> String {
+    format!("net/ipv4/conf/{interface}/forwarding")
+}
+
+/// Reads the uplink's current `forwarding` value.
+fn read_uplink_forwarding(interface: String) -> Result<UplinkForwarding, VmNetworkSetupError> {
+    let path = Path::new("/proc/sys").join(forwarding_sysctl(&interface));
+    let raw =
+        fs::read_to_string(&path).map_err(|source| VmNetworkSetupError::ForwardingUnreadable {
+            interface: interface.clone(),
+            path: path.clone(),
+            source,
+        })?;
+    let previous = raw
+        .trim()
+        .parse()
+        .map_err(|_| VmNetworkSetupError::ForwardingUnparsable {
+            path,
+            raw: raw.trim().to_owned(),
+        })?;
+    Ok(UplinkForwarding {
+        interface,
+        previous,
+    })
+}
+
+/// The NAT uplink and the forwarding value setup found on it; `None`
+/// under `--net-no-nat`.
+fn resolve_uplink(
+    command: &NetSetupCommand,
+) -> Result<Option<UplinkForwarding>, VmNetworkSetupError> {
+    if command.no_nat {
+        return Ok(None);
+    }
+    let interface = match &command.uplink {
+        Some(uplink) => uplink.clone(),
+        None => default_uplink()?,
+    };
+    validate_interface_name(&interface)?;
+    read_uplink_forwarding(interface).map(Some)
 }
 
 /// The DHCP pool carved out of the bridge subnet: every host address
@@ -1461,10 +1617,21 @@ fn tap_setup_plan(
     command: &NetSetupCommand,
     ifname: &str,
     bridge: &str,
+    (uid, gid): (u32, u32),
+    uplink: Option<&UplinkForwarding>,
 ) -> Result<Vec<PrivilegedCommand>, VmNetworkSetupError> {
     let multi_queue = setup_tap_multi_queue(command.network.queues)?;
-    let (uid, gid) = invoking_credentials();
     let mut plan = Vec::new();
+    // The record comes first, so a setup that fails part way is still
+    // undone by `net-teardown`.
+    let state = NetState {
+        vhost_uid: uid,
+        uplink: uplink.cloned(),
+    };
+    plan.push(
+        PrivilegedCommand::new("tee", [net_state_file(bridge).display().to_string()])
+            .with_stdin(serde_json::to_string(&state).expect("a plain struct serialises to JSON")),
+    );
     // The queues are served by vhost-net threads, so the node has to be
     // this account's to open, the same way the tap below is created
     // owned by it. The steps are unconditional because a probe cannot
@@ -1472,11 +1639,20 @@ fn tap_setup_plan(
     // the module is loaded, the first open autoloads the module, and the
     // device event that follows re-applies udev's root:kvm 0660 rule
     // over anything done to the node earlier. Loading the module first
-    // and letting udev finish with the event makes the chmod the last
-    // word.
+    // and letting udev finish with the event makes the ACL the last
+    // word. An ACL entry for the one account, not a mode change, so no
+    // other local user gains the in-kernel vhost backend; `setfacl` takes
+    // the numeric uid, so no user-name lookup is involved.
     plan.push(PrivilegedCommand::new("modprobe", ["vhost_net"]));
     plan.push(PrivilegedCommand::new("udevadm", ["settle"]));
-    plan.push(PrivilegedCommand::new("chmod", ["0666", VHOST_NET_DEVICE]));
+    plan.push(PrivilegedCommand::new(
+        "setfacl",
+        [
+            "-m".to_owned(),
+            format!("u:{uid}:rw"),
+            VHOST_NET_DEVICE.to_owned(),
+        ],
+    ));
     if !interface_exists(bridge) {
         plan.push(PrivilegedCommand::new(
             "ip",
@@ -1509,16 +1685,27 @@ fn tap_setup_plan(
         ["link", "set", ifname, "master", bridge],
     ));
     plan.push(PrivilegedCommand::new("ip", ["link", "set", ifname, "up"]));
-    if !command.no_nat {
-        let uplink = match &command.uplink {
-            Some(uplink) => uplink.clone(),
-            None => default_uplink()?,
-        };
-        validate_interface_name(&uplink)?;
-        plan.push(PrivilegedCommand::new(
-            "sysctl",
-            ["-w", "net.ipv4.ip_forward=1"],
-        ));
+    if let Some(UplinkForwarding {
+        interface: uplink, ..
+    }) = uplink
+    {
+        // IPv4 `forwarding` is a per-interface setting that governs the
+        // packets received on that interface (kernel
+        // `Documentation/networking/ip-sysctl.rst`, `conf/interface/*`
+        // `forwarding`; `ip_route_input_slow` in `net/ipv4/route.c`
+        // consults the ingress device only). A guest's packets arrive on
+        // the bridge and the replies arrive on the uplink, so those two
+        // interfaces are enabled and nothing else: `net.ipv4.ip_forward`
+        // would turn on every interface of the host.
+        for interface in [bridge, uplink.as_str()] {
+            plan.push(PrivilegedCommand::new(
+                "sysctl",
+                [
+                    "-w".to_owned(),
+                    format!("{}=1", forwarding_sysctl(interface)),
+                ],
+            ));
+        }
         plan.push(PrivilegedCommand::new(
             "nft",
             ["add", "table", "inet", NAT_TABLE],
@@ -1546,7 +1733,7 @@ fn tap_setup_plan(
                 "saddr",
                 &command.bridge_address.trunc().to_string(),
                 "oifname",
-                &uplink,
+                uplink,
                 "masquerade",
             ],
         ));
@@ -1574,6 +1761,7 @@ fn tap_setup_plan(
 fn tap_teardown_plan(
     ifname: &str,
     bridge: &str,
+    state: &NetState,
     elevate: bool,
 ) -> Result<Vec<PrivilegedCommand>, VmNetworkSetupError> {
     let mut plan = Vec::new();
@@ -1611,7 +1799,57 @@ fn tap_teardown_plan(
     if interface_exists(bridge) {
         plan.push(PrivilegedCommand::new("ip", ["link", "del", bridge]));
     }
+    plan.extend(restore_host_state(
+        bridge,
+        state,
+        Path::new(VHOST_NET_DEVICE).exists(),
+    ));
     Ok(plan)
+}
+
+/// The steps that give back what [`NetState`] recorded and then drop the
+/// record.
+fn restore_host_state(
+    bridge: &str,
+    state: &NetState,
+    vhost_node_present: bool,
+) -> Vec<PrivilegedCommand> {
+    let mut plan = Vec::new();
+    // The bridge's own forwarding setting went with the bridge; the
+    // uplink is the host's, so it gets back the value setup found.
+    if let Some(uplink) = &state.uplink {
+        plan.push(PrivilegedCommand::new(
+            "sysctl",
+            [
+                "-w".to_owned(),
+                format!(
+                    "{}={}",
+                    forwarding_sysctl(&uplink.interface),
+                    uplink.previous
+                ),
+            ],
+        ));
+    }
+    // When the module was unloaded since, the node is gone and udev
+    // recreates it without the entry.
+    if vhost_node_present {
+        plan.push(PrivilegedCommand::new(
+            "setfacl",
+            [
+                "-x".to_owned(),
+                format!("u:{}", state.vhost_uid),
+                VHOST_NET_DEVICE.to_owned(),
+            ],
+        ));
+    }
+    plan.push(PrivilegedCommand::new(
+        "rm",
+        [
+            "-f".to_owned(),
+            net_state_file(bridge).display().to_string(),
+        ],
+    ));
+    plan
 }
 
 fn execute_plan(
@@ -1638,7 +1876,18 @@ pub(crate) fn run_setup(command: NetSetupCommand) -> Result<(), VmNetworkSetupEr
         check_tap_queue_mode(&ifname, read_tun_flags(&ifname)?, multi_queue)?;
     }
     let elevate = !is_root();
-    let plan = tap_setup_plan(&command, &ifname, &bridge)?;
+    let state_file = net_state_file(&bridge);
+    if state_file.exists() {
+        return Err(VmNetworkSetupError::StateExists { path: state_file });
+    }
+    let uplink = resolve_uplink(&command)?;
+    let plan = tap_setup_plan(
+        &command,
+        &ifname,
+        &bridge,
+        invoking_credentials(),
+        uplink.as_ref(),
+    )?;
     execute_plan(&plan, elevate, command.dry_run)?;
     if command.dry_run {
         return Ok(());
@@ -1681,7 +1930,8 @@ pub(crate) fn run_teardown(command: NetTeardownCommand) -> Result<(), VmNetworkS
     require_tap_backend(&network)?;
     let (ifname, bridge) = tap_names(&network)?;
     let elevate = !is_root();
-    let plan = tap_teardown_plan(&ifname, &bridge, elevate)?;
+    let state = NetState::load(&bridge)?;
+    let plan = tap_teardown_plan(&ifname, &bridge, &state, elevate)?;
     execute_plan(&plan, elevate, command.dry_run)?;
     Ok(())
 }
@@ -2303,19 +2553,43 @@ mod tests {
             dhcp: true,
             dry_run: true,
         };
-        let plan = tap_setup_plan(&command, "helios0", "helios-br0")
-            .expect("a fully specified tap plan builds");
+        let uplink = UplinkForwarding {
+            interface: "eth0".to_owned(),
+            previous: 0,
+        };
+        let build = |command: &NetSetupCommand| {
+            tap_setup_plan(
+                command,
+                "helios0",
+                "helios-br0",
+                (1000, 1000),
+                Some(&uplink),
+            )
+        };
+        let plan = build(&command).expect("a fully specified tap plan builds");
         let rendered: Vec<String> = plan.iter().map(|step| step.display(true)).collect();
-        // The vhost-net node is handed to this account only after the
-        // module is loaded and udev has finished applying its own rule,
-        // and before the tap that depends on it is created.
+        // The record of what setup changes is written before anything is
+        // changed. Then the vhost-net node is granted to this account
+        // only after the module is loaded and udev has finished applying
+        // its own rule, and before the tap that depends on it is created.
         assert_eq!(
-            &rendered[..3],
+            &rendered[..4],
             [
+                "sudo tee /var/run/helios-net-helios-br0.json",
                 "sudo modprobe vhost_net",
                 "sudo udevadm settle",
-                "sudo chmod 0666 /dev/vhost-net",
+                "sudo setfacl -m u:1000:rw /dev/vhost-net",
             ]
+        );
+        assert_eq!(
+            plan[0].stdin.as_deref(),
+            Some(r#"{"vhost_uid":1000,"uplink":{"interface":"eth0","previous":0}}"#)
+        );
+        assert!(
+            !rendered
+                .iter()
+                .any(|step| step.contains("chmod") || step.contains("ip_forward")),
+            "no world access to the node and no global forwarding: {rendered:?}"
         );
         assert!(rendered.iter().any(|step| {
             step.starts_with("sudo ip tuntap add dev helios0 mode tap multi_queue user ")
@@ -2323,7 +2597,18 @@ mod tests {
         assert!(rendered.contains(&"sudo ip link set helios0 master helios-br0".to_owned()));
         // `shell_words::join` quotes the `key=value` words so every
         // printed step is copy-pasteable into a shell verbatim.
-        assert!(rendered.contains(&"sudo sysctl -w 'net.ipv4.ip_forward=1'".to_owned()));
+        // Forwarding is enabled for the bridge and the uplink only.
+        let forwarding: Vec<&String> = rendered
+            .iter()
+            .filter(|step| step.contains("forwarding"))
+            .collect();
+        assert_eq!(
+            forwarding,
+            [
+                "sudo sysctl -w 'net/ipv4/conf/helios-br0/forwarding=1'",
+                "sudo sysctl -w 'net/ipv4/conf/eth0/forwarding=1'",
+            ]
+        );
         assert!(rendered.iter().any(|step| step.contains("masquerade")));
         assert!(
             rendered
@@ -2332,7 +2617,7 @@ mod tests {
         );
         for queues in [1, 4] {
             command.network.queues = Some(queues);
-            let plan = tap_setup_plan(&command, "helios0", "helios-br0").expect("valid queue mode");
+            let plan = build(&command).expect("valid queue mode");
             let tap = plan
                 .iter()
                 .map(|step| step.display(true))
@@ -2342,8 +2627,116 @@ mod tests {
         }
         command.network.queues = Some(0);
         assert!(matches!(
-            tap_setup_plan(&command, "helios0", "helios-br0"),
+            build(&command),
             Err(VmNetworkSetupError::Network(VmNetworkError::ZeroQueues))
+        ));
+    }
+
+    #[test]
+    fn a_setup_without_nat_touches_no_forwarding_setting() {
+        let command = NetSetupCommand {
+            network: VmNetworkArgs {
+                backend: Some(VmNetworkBackend::Tap),
+                queues: None,
+                ifname: Some("helios0".to_owned()),
+                bridge: Some("helios-br0".to_owned()),
+                socket_vmnet_path: None,
+                socket_vmnet_client: None,
+                device_props: Vec::new(),
+                pcap: None,
+            },
+            bridge_address: "10.77.0.1/24".parse().expect("a valid CIDR"),
+            uplink: None,
+            no_nat: true,
+            dhcp: false,
+            dry_run: true,
+        };
+        let plan = tap_setup_plan(&command, "helios0", "helios-br0", (1000, 1000), None)
+            .expect("a plan without NAT builds");
+        let rendered: Vec<String> = plan.iter().map(|step| step.display(true)).collect();
+        assert!(
+            !rendered
+                .iter()
+                .any(|step| step.contains("forwarding") || step.contains("nft"))
+        );
+        assert_eq!(
+            plan[0].stdin.as_deref(),
+            Some(r#"{"vhost_uid":1000,"uplink":null}"#)
+        );
+    }
+
+    #[test]
+    fn the_teardown_restores_what_setup_recorded() {
+        let state = NetState {
+            vhost_uid: 1000,
+            uplink: Some(UplinkForwarding {
+                interface: "eth0".to_owned(),
+                previous: 0,
+            }),
+        };
+        let rendered: Vec<String> = restore_host_state("helios-br0", &state, true)
+            .iter()
+            .map(|step| step.display(true))
+            .collect();
+        assert_eq!(
+            rendered,
+            [
+                "sudo sysctl -w 'net/ipv4/conf/eth0/forwarding=0'",
+                "sudo setfacl -x u:1000 /dev/vhost-net",
+                "sudo rm -f /var/run/helios-net-helios-br0.json",
+            ]
+        );
+        // A host that already forwarded on the uplink keeps doing so, and
+        // a node that no longer exists has no entry to remove.
+        let state = NetState {
+            uplink: state.uplink.map(|uplink| UplinkForwarding {
+                previous: 1,
+                ..uplink
+            }),
+            ..state
+        };
+        let rendered: Vec<String> = restore_host_state("helios-br0", &state, false)
+            .iter()
+            .map(|step| step.display(true))
+            .collect();
+        assert_eq!(
+            rendered,
+            [
+                "sudo sysctl -w 'net/ipv4/conf/eth0/forwarding=1'",
+                "sudo rm -f /var/run/helios-net-helios-br0.json",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_state_record_round_trips_through_its_serialisation() {
+        let state = NetState {
+            vhost_uid: 501,
+            uplink: Some(UplinkForwarding {
+                interface: "eth0.100".to_owned(),
+                previous: 1,
+            }),
+        };
+        let encoded = serde_json::to_string(&state).expect("serialises");
+        assert_eq!(
+            serde_json::from_str::<NetState>(&encoded).expect("deserialises"),
+            state
+        );
+        // A dot in an interface name stays literal in the sysctl name.
+        assert_eq!(
+            forwarding_sysctl("eth0.100"),
+            "net/ipv4/conf/eth0.100/forwarding"
+        );
+    }
+
+    #[test]
+    fn a_teardown_without_a_record_names_the_file_it_looked_for() {
+        let error = NetState::load("helios-no-such-bridge")
+            .expect_err("no record exists for a bridge that was never set up");
+        assert!(matches!(
+            error,
+            VmNetworkSetupError::StateMissing { ref path }
+                if path == Path::new("/var/run/helios-net-helios-no-such-bridge.json")
         ));
     }
 

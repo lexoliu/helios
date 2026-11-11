@@ -32,6 +32,7 @@ use super::lease::{GrantLease, PublishedDevice};
 use super::platform::device_hooks_installed;
 use crate::buffer::ViewGroup;
 use crate::io::ExternalInterruptHandler;
+use crate::process::DeviceGrantClaimCap;
 
 /// Devices one machine may grant away.
 ///
@@ -147,15 +148,26 @@ impl DeviceGrantRegistry {
             .find(|device| device.grant.name().as_str() == name)
     }
 
-    /// Take exclusive ownership of `name`. Every view the owner is later
-    /// given of the device — a region, a ring — goes in `views`, the set
-    /// that ends when the lease does.
+    /// Take exclusive ownership of the device `cap` names. Every view the
+    /// owner is later given of the device — a region, a ring — goes in
+    /// `views`, the set that ends when the lease does.
+    ///
+    /// The cap is the proof that the caller's authority names this
+    /// device; it can only be derived from an authority that does, so
+    /// the registry never sees a name its caller was not granted. A
+    /// device the machine did not publish is
+    /// [`GrantError::NotFound`].
     ///
     /// The second caller for a device that already has an owner gets
     /// [`GrantError::AlreadyClaimed`]; there is no queue, because a
     /// driver waiting for hardware another driver holds is a
     /// provisioning mistake rather than a transient shortage.
-    pub fn claim(&self, name: &str, views: ViewGroup) -> Result<GrantLease, GrantError> {
+    pub fn claim(
+        &self,
+        cap: DeviceGrantClaimCap,
+        views: ViewGroup,
+    ) -> Result<GrantLease, GrantError> {
+        let name = cap.name().as_str();
         let device = self.device(name).ok_or(GrantError::NotFound)?;
         device
             .claimed

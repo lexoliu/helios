@@ -35,6 +35,7 @@ use helios_hal::audio::{PcmParams, StreamDirection};
 use triomphe::Arc;
 
 use crate::buffer::Buffer;
+use crate::process::AudioClaimCap;
 
 use super::AudioServiceError;
 use super::service::{AudioClaim, AudioService, PERIODS_IN_FLIGHT, PeriodRing, PlaybackFormat};
@@ -71,11 +72,16 @@ impl AudioOwnership {
     }
 
     /// Take exclusive ownership of the stream `id` names.
-    pub fn claim(&mut self, service: &AudioService, id: u32) -> Result<(), AudioServiceError> {
+    pub fn claim(
+        &mut self,
+        service: &AudioService,
+        id: u32,
+        cap: AudioClaimCap,
+    ) -> Result<(), AudioServiceError> {
         if self.claim.is_some() {
             return Err(AudioServiceError::AlreadyClaimed);
         }
-        self.claim = Some(service.claim(id)?);
+        self.claim = Some(service.claim(id, cap)?);
         Ok(())
     }
 

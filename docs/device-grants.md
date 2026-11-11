@@ -28,6 +28,35 @@ plugin's block, net or serial export back into the kernel are phase 2.
 | Bus-mastering memory | a pinned, physically contiguous buffer, and the address the device has to issue for it | `GrantLease::dma_alloc` |
 | To be killable | every one of the above undone before anyone else is offered the device | `Drop for GrantLease` |
 
+### A claim is a capability
+
+`helios:system/device` is linked into every program, and holding the
+import grants nothing. `claim(name)` succeeds only for an instance whose
+`ProcessAuthority` names that device, and `available()` lists only the
+devices it names. The kernel derives a typed `DeviceGrantClaimCap` from
+the authority and passes it down to `DeviceGrantRegistry::claim`, so the
+registry cannot be reached without one. An instance that holds no grant
+for a device is answered `not-found`, exactly as for a name nobody
+published, so a claim cannot be used to learn what the machine has.
+
+A named device is granted by the kernel at the point it starts the
+driver for it, never through the program-spawn grant list, and a
+WASIX child does not inherit its parent's named devices: the device
+belongs to the driver instance. An instance holds at most `MAX_GRANTS`
+named devices, the number the registry can publish.
+
+The display, the input devices, the 3D engine and audio are separate
+machine-wide resources and are gated by device classes (`display`,
+`input`, `gpu`, `audio`) in the same authority. `ProcessAuthority::root`
+grants none of them. The kernel adds the display and input classes to
+the compositor it starts and every class to the debugger, which can hand
+a child only what it holds; a program a parent spawns receives the
+classes the parent lists, never more than the parent has. Without a
+class, `display.claim`, `gpu.claim` and `audio.claim` answer
+`unavailable`, `input.available` and `audio.available` list nothing, and
+`stats` omits the entries the program could not claim: the answers of a
+machine without that hardware.
+
 ### Registers are memory, not calls
 
 A register access has to cost what a load costs. Helios owns the user

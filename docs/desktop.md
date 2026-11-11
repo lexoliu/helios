@@ -146,7 +146,9 @@ virtio-input online transport=pci name="QEMU Virtio Tablet" ev=KEY,REL,ABS abs=x
 ```
 
 `available()` lists what the machine has, `claim(name)` takes one, and
-the claim's `events()` stream carries the device's `(kind, code, value)`
+both answer only an instance whose authority carries the input device
+class — any other program sees a machine with no input device. The
+claim's `events()` stream carries the device's `(kind, code, value)`
 triples with evdev's own `SYN_REPORT` framing intact. Nothing is
 translated: the numbers are Linux's, from the same generated table the
 kernel's drivers read them by, so a program names a key the way every
@@ -214,7 +216,9 @@ The kernel owns the device and hands the right to *play* one stream to
 exactly one instance at a time, the way it hands out a display surface
 and an input device. `available()` lists every stream that plays and what
 each will accept; `claim(id)` takes one, and a second caller is refused
-rather than queued.
+rather than queued. Both answer only an instance whose authority carries
+the audio device class; any other program sees a machine with no sound
+device.
 
 A claim is one agreement and then one byte stream. `negotiate(format)`
 fixes the rate, the channel count and the sample layout — a format the
@@ -369,7 +373,11 @@ the check cannot disagree with the desktop about a glyph, a colour or a
 cell.
 
 It claims the display through `helios:system/display` and every device
-`helios:system/input` lists, and says so on the way up:
+`helios:system/input` lists, and says so on the way up. The kernel
+starts it with the display and input device classes in its authority and
+nothing else of the machine's hardware; the programs typed at its
+terminal inherit neither, so they cannot claim the display or read the
+keyboard it holds:
 
 ```text
 compositor:online scanout=0 width=1280 height=800

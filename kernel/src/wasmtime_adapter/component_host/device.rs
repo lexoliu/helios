@@ -46,10 +46,12 @@ use super::{StoreData, guest_memory, view_trap};
 
 /// Register `helios:system/device` in a linker.
 ///
-/// Every program linker gets it. The interface is a capability only in
-/// the sense that the registry is: a claim by an instance the kernel
-/// never gave a device to is refused, so an ordinary program importing
-/// it learns there is no device for it and nothing else.
+/// Every program linker gets it, and the authority is the instance's
+/// own: a claim is answered `not-found` unless the instance's
+/// [`ProcessAuthority`](crate::ProcessAuthority) names the device, and
+/// `available` lists only the devices it names. An ordinary program
+/// importing it therefore sees the machine as one with no granted
+/// devices, whether or not the machine has any.
 pub(super) fn add_device_to_linker<CpuImpl, Net, HostFs>(
     linker: &mut Linker<StoreData<CpuImpl, Net, HostFs>>,
 ) -> wasmtime::Result<()>
@@ -163,8 +165,19 @@ where
         &mut self,
         name: String,
     ) -> wasmtime::Result<Result<Resource<GrantHandle>, device_wit::Error>> {
+        // A device the instance was not granted is answered exactly as a
+        // device nobody published is, so a claim cannot be used to learn
+        // what the machine has.
+        let Ok(cap) = self.process_authority().derive_device_grant_cap(&name) else {
+            tracing::warn!(
+                target: "helios_kernel::device",
+                device = name.as_str(),
+                "an instance asked for a device it was not granted"
+            );
+            return Ok(Err(device_wit::Error::NotFound));
+        };
         let registry = self.runtime_state.device_grants();
-        if let Err(error) = self.device.claim(registry, &name, &mut self.views) {
+        if let Err(error) = self.device.claim(registry, cap, &mut self.views) {
             tracing::warn!(
                 target: "helios_kernel::device",
                 device = name.as_str(),
@@ -189,11 +202,13 @@ where
     }
 
     fn available(&mut self) -> wasmtime::Result<Vec<String>> {
+        let granted = self.process_authority().granted_devices();
         Ok(self
             .runtime_state
             .device_grants()
             .devices()
             .iter()
+            .filter(|device| granted.contains(device.grant().name()))
             .map(|device| device.grant().name().as_str().to_string())
             .collect())
     }
@@ -475,5 +490,150 @@ where
             Err(error) => return Ok(Err(to_wit_error(error))),
         };
         Ok(Ok(data.table.push(DmaBufferHandle::new(device, buffer))?))
+    }
+}
+
+/// What a component sees when it calls `device.available` and
+/// `device.claim`: both are answered by the instance's own authority
+/// before they reach the registry.
+#[cfg(test)]
+mod tests {
+    use alloc::vec;
+
+    use helios_hal::device::DmaCapability;
+    use helios_hal::iommu::DmaTranslation;
+
+    use super::device_wit as contract;
+    use crate::device::test_hooks;
+    use crate::wasmtime_adapter::component_host::service::test_store;
+    use crate::{DeviceGrant, DeviceName, DmaBudget, ProcessAuthority};
+
+    const PUBLISHED: &str = "test:alpha";
+    const OTHER: &str = "test:beta";
+
+    fn grant(name: &str) -> DeviceGrant {
+        DeviceGrant::new(
+            DeviceName::new(name).expect("the test names are short"),
+            DmaBudget {
+                capability: DmaCapability {
+                    address_bits: 64,
+                    coherent: true,
+                    translation: DmaTranslation::direct(),
+                },
+                byte_budget: 1 << 20,
+            },
+        )
+    }
+
+    /// A store under `authority` on a machine that published both test
+    /// devices.
+    fn store_under(authority: ProcessAuthority) -> test_store::TestStoreData {
+        test_hooks::install();
+        test_store::store_data_authorized(authority, |runtime_state| {
+            runtime_state
+                .device_grants()
+                .publish([grant(PUBLISHED), grant(OTHER)])
+                .expect("discovery publishes once");
+        })
+    }
+
+    fn claim(data: &mut test_store::TestStoreData, name: &str) -> Result<(), contract::Error> {
+        <test_store::TestStoreData as contract::Host>::claim(data, name.into())
+            .expect("a claim is answered, not trapped")
+            .map(drop)
+    }
+
+    fn name_of(authority_device: &str) -> ProcessAuthority {
+        let mut authority = ProcessAuthority::empty();
+        authority
+            .grant_device(DeviceName::new(authority_device).expect("the test names are short"))
+            .expect("one named device fits");
+        authority
+    }
+
+    /// A published device and one nobody published get the same answer,
+    /// whatever the program holds, so a claim cannot be used to learn
+    /// what the machine has.
+    #[test]
+    fn ordinary_program_claiming_a_published_device_is_told_not_found() {
+        for authority in [
+            ProcessAuthority::empty(),
+            ProcessAuthority::root(),
+            // Granted a different device, and every class.
+            {
+                let mut authority = name_of(OTHER);
+                authority.grant_device_classes(crate::DeviceClassRights::all());
+                authority
+            },
+        ] {
+            let mut data = store_under(authority);
+            let published = claim(&mut data, PUBLISHED);
+            let unpublished = claim(&mut data, "test:missing");
+            assert_eq!(published, Err(contract::Error::NotFound));
+            assert_eq!(published, unpublished);
+            assert!(!data.device.holds_device());
+            assert!(
+                data.runtime_state
+                    .device_grants()
+                    .device(PUBLISHED)
+                    .is_some_and(|device| !device.is_claimed()),
+                "the device is still free for its owner"
+            );
+        }
+    }
+
+    /// `available` lists what the instance may claim and nothing else.
+    #[test]
+    fn available_lists_only_the_devices_the_caller_is_granted() {
+        let mut ordinary = store_under(ProcessAuthority::empty());
+        assert!(
+            <test_store::TestStoreData as contract::Host>::available(&mut ordinary)
+                .expect("the list is answered")
+                .is_empty()
+        );
+
+        let mut owner = store_under(name_of(OTHER));
+        assert_eq!(
+            <test_store::TestStoreData as contract::Host>::available(&mut owner)
+                .expect("the list is answered"),
+            vec![alloc::string::String::from(OTHER)]
+        );
+    }
+
+    /// The inventory a program reads agrees with what its claims answer:
+    /// a device it cannot claim is not listed.
+    #[test]
+    fn program_stats_hide_devices_the_caller_cannot_claim() {
+        let names = |data: &test_store::TestStoreData| {
+            let mut sample = data.runtime_state.snapshot(0);
+            sample.restrict_to(data.process_authority());
+            sample
+                .devices
+                .iter()
+                .map(|device| alloc::string::String::from(device.name.as_str()))
+                .collect::<alloc::vec::Vec<_>>()
+        };
+
+        assert!(names(&store_under(ProcessAuthority::empty())).is_empty());
+        assert_eq!(
+            names(&store_under(name_of(OTHER))),
+            vec![alloc::string::String::from(OTHER)]
+        );
+    }
+
+    /// The driver the kernel granted a device to claims it.
+    #[test]
+    fn provisioned_driver_claims_its_named_device() {
+        let mut data = store_under(name_of(PUBLISHED));
+
+        assert_eq!(claim(&mut data, PUBLISHED), Ok(()));
+        assert!(data.device.holds_device());
+
+        let mut other = store_under(name_of(PUBLISHED));
+        assert_eq!(
+            claim(&mut other, OTHER),
+            Err(contract::Error::NotFound),
+            "the grant names one device, not the machine's"
+        );
     }
 }

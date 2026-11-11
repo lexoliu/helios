@@ -59,7 +59,7 @@ use crate::surface::{
 };
 use crate::wasmtime_adapter::bindings::compositor::bindings::{CompositorHost, exports};
 use crate::wasmtime_adapter::component_host::{guest_memory, view_trap};
-use crate::{ProcessAuthority, ProviderReceiver, provider_channel};
+use crate::{DeviceClassRights, ProcessAuthority, ProviderReceiver, provider_channel};
 use thiserror::Error;
 use wasmtime::component::{Accessor, AccessorTask, HasSelf, ResourceTable};
 
@@ -80,6 +80,16 @@ pub(super) const COMPOSITOR_PLUGIN_INSTANCE_NAME: &str = "compositor-plugin";
 /// short enough that a restart looks instant to whoever is watching the
 /// screen.
 const RESTART_DELAY: Duration = Duration::from_millis(250);
+
+/// The authority the compositor runs with: everything `root` grants,
+/// since it spawns the shell it draws and is bootfs-provisioned and
+/// signed like the system components, plus the display and the input
+/// devices it draws and reads. It never claims the GPU.
+fn compositor_authority() -> ProcessAuthority {
+    let mut authority = ProcessAuthority::root();
+    authority.grant_device_classes(DeviceClassRights::DISPLAY | DeviceClassRights::INPUT);
+    authority
+}
 
 /// Provision the `compositor` plugin, if this kernel image ships one.
 ///
@@ -254,10 +264,7 @@ where
             DebugFileSystem::new(exec_context.runtime_state.clone()),
             alloc::vec![String::from(COMPOSITOR_PLUGIN_PATH)],
             Vec::new(),
-            // Same authority the system components get: the compositor
-            // spawns the shell it draws, and it is bootfs-provisioned
-            // and signed like they are.
-            ProcessAuthority::root(),
+            compositor_authority(),
             OutputMode::Serial,
             exec_context.read_serial,
             exec_context.write_serial,
@@ -565,8 +572,25 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{DesktopRefusal, desktop_refusal};
+    use super::{DesktopRefusal, compositor_authority, desktop_refusal};
     use crate::test_support::TestRuntimeState;
+
+    /// The compositor draws the display and reads the input devices, and
+    /// is given nothing else of the machine's hardware.
+    #[test]
+    fn provisioned_compositor_claims_the_display_and_every_input_device() {
+        let authority = compositor_authority();
+
+        assert!(authority.derive_display_claim_cap().is_ok());
+        assert!(authority.derive_input_claim_cap().is_ok());
+        assert!(authority.derive_gpu_claim_cap().is_err());
+        assert!(authority.derive_audio_claim_cap().is_err());
+        assert!(authority.granted_devices().is_empty());
+        assert!(
+            authority.derive_spawn_authority().is_ok(),
+            "it keeps what root grants: it spawns the shell it draws"
+        );
+    }
 
     /// A bench-lane or smoke boot has no display device. The plugin is
     /// not started there, instead of being rebuilt every restart delay

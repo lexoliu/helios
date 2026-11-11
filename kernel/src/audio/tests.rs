@@ -25,6 +25,7 @@ use triomphe::Arc;
 
 use crate::component::{ProviderReceiver, provider_channel};
 use crate::device::test_hooks;
+use crate::process::test_caps;
 use crate::test_support::{ManualClockCpu, TestCpu};
 
 use super::owner::{drain_audio_events, play, serve_playback};
@@ -267,7 +268,9 @@ impl PlaybackDevice for ScriptedDevice {
 fn negotiation_refuses_a_rate_the_device_did_not_list() {
     let (service, _inboxes) = service_of(&[playback_stream(0)]);
     let mut audio = AudioOwnership::new();
-    audio.claim(&service, 0).expect("the stream is free");
+    audio
+        .claim(&service, 0, test_caps::audio())
+        .expect("the stream is free");
     let runs = test_hooks::live_runs();
 
     assert_eq!(
@@ -310,7 +313,9 @@ fn negotiation_refuses_a_rate_the_device_did_not_list() {
 fn a_negotiated_stream_pins_one_run_per_period() {
     let (service, _inboxes) = service_of(&[playback_stream(0)]);
     let mut audio = AudioOwnership::new();
-    audio.claim(&service, 0).expect("the stream is free");
+    audio
+        .claim(&service, 0, test_caps::audio())
+        .expect("the stream is free");
     let runs = test_hooks::live_runs();
 
     let (ring, params) = audio.negotiate(TONE).expect("the device takes this format");
@@ -338,20 +343,22 @@ fn a_negotiated_stream_pins_one_run_per_period() {
 fn a_second_claimant_is_refused_the_stream_the_first_holds() {
     let (service, _inboxes) = service_of(&[playback_stream(0), playback_stream(1)]);
     let mut first = AudioOwnership::new();
-    first.claim(&service, 0).expect("the stream is free");
+    first
+        .claim(&service, 0, test_caps::audio())
+        .expect("the stream is free");
 
     let mut second = AudioOwnership::new();
     assert_eq!(
-        second.claim(&service, 0).err(),
+        second.claim(&service, 0, test_caps::audio()).err(),
         Some(AudioServiceError::AlreadyClaimed)
     );
     assert_eq!(
-        first.claim(&service, 1).err(),
+        first.claim(&service, 1, test_caps::audio()).err(),
         Some(AudioServiceError::AlreadyClaimed),
         "an instance holds one playback stream at a time"
     );
     assert!(
-        second.claim(&service, 1).is_ok(),
+        second.claim(&service, 1, test_caps::audio()).is_ok(),
         "the other stream is somebody else's to take"
     );
 }
@@ -364,11 +371,11 @@ fn a_capture_stream_is_refused_as_a_capture_stream() {
     let mut audio = AudioOwnership::new();
 
     assert_eq!(
-        audio.claim(&service, 1).err(),
+        audio.claim(&service, 1, test_caps::audio()).err(),
         Some(AudioServiceError::NotPlayback)
     );
     assert_eq!(
-        audio.claim(&service, 7).err(),
+        audio.claim(&service, 7, test_caps::audio()).err(),
         Some(AudioServiceError::NoSuchStream)
     );
     assert_eq!(
@@ -385,14 +392,16 @@ fn a_capture_stream_is_refused_as_a_capture_stream() {
 fn dying_hands_the_stream_back_through_the_playback_task() {
     let (service, inboxes) = service_of(&[playback_stream(0)]);
     let mut audio = AudioOwnership::new();
-    audio.claim(&service, 0).expect("the stream is free");
+    audio
+        .claim(&service, 0, test_caps::audio())
+        .expect("the stream is free");
     audio.negotiate(TONE).expect("the device takes this format");
 
     drop(audio);
 
     let mut other = AudioOwnership::new();
     assert_eq!(
-        other.claim(&service, 0).err(),
+        other.claim(&service, 0, test_caps::audio()).err(),
         Some(AudioServiceError::AlreadyClaimed),
         "the stream is not free until the device has stopped reading its pages"
     );
@@ -417,7 +426,7 @@ fn dying_hands_the_stream_back_through_the_playback_task() {
     });
 
     assert!(
-        other.claim(&service, 0).is_ok(),
+        other.claim(&service, 0, test_caps::audio()).is_ok(),
         "the stream is free once the device has been stopped and the pages given back"
     );
 }
@@ -430,7 +439,9 @@ fn the_device_holds_no_more_than_the_periods_in_flight() {
     test_hooks::install();
     let (service, _inboxes) = service_of(&[playback_stream(0)]);
     let mut audio = AudioOwnership::new();
-    audio.claim(&service, 0).expect("the stream is free");
+    audio
+        .claim(&service, 0, test_caps::audio())
+        .expect("the stream is free");
     let (ring, params) = audio.negotiate(TONE).expect("the device takes this format");
 
     let device = ScriptedDevice::new(topology(&[playback_stream(0)]));
@@ -482,7 +493,9 @@ fn a_final_part_period_is_played_with_its_tail_zeroed() {
     test_hooks::install();
     let (service, _inboxes) = service_of(&[playback_stream(0)]);
     let mut audio = AudioOwnership::new();
-    audio.claim(&service, 0).expect("the stream is free");
+    audio
+        .claim(&service, 0, test_caps::audio())
+        .expect("the stream is free");
     let (ring, params) = audio.negotiate(TONE).expect("the device takes this format");
 
     let device = ScriptedDevice::new(topology(&[playback_stream(0)]));
@@ -521,7 +534,9 @@ fn a_final_part_period_is_played_with_its_tail_zeroed() {
 fn an_underrun_reaches_the_player_as_feedback_and_nothing_is_substituted() {
     let (service, _inboxes) = service_of(&[playback_stream(0)]);
     let mut audio = AudioOwnership::new();
-    audio.claim(&service, 0).expect("the stream is free");
+    audio
+        .claim(&service, 0, test_caps::audio())
+        .expect("the stream is free");
     let claim = audio.claim_ref().expect("the claim was just taken");
     let mut feedback = claim.feedback();
 
@@ -557,7 +572,9 @@ fn every_period_the_device_takes_reports_its_latency() {
     test_hooks::install();
     let (service, _inboxes) = service_of(&[playback_stream(0)]);
     let mut audio = AudioOwnership::new();
-    audio.claim(&service, 0).expect("the stream is free");
+    audio
+        .claim(&service, 0, test_caps::audio())
+        .expect("the stream is free");
     let mut feedback = audio
         .claim_ref()
         .expect("the claim was just taken")
@@ -641,7 +658,9 @@ fn a_stop_asked_for_after_the_material_ran_out_is_answered() {
     test_hooks::install();
     let (service, inboxes) = service_of(&[playback_stream(0)]);
     let mut audio = AudioOwnership::new();
-    audio.claim(&service, 0).expect("the stream is free");
+    audio
+        .claim(&service, 0, test_caps::audio())
+        .expect("the stream is free");
     let (ring, params) = audio.negotiate(TONE).expect("the device takes this format");
     let sender = audio
         .claim_ref()
@@ -707,7 +726,9 @@ fn a_players_feedback_ends_when_the_stream_is_torn_down() {
     test_hooks::install();
     let (service, inboxes) = service_of(&[playback_stream(0)]);
     let mut audio = AudioOwnership::new();
-    audio.claim(&service, 0).expect("the stream is free");
+    audio
+        .claim(&service, 0, test_caps::audio())
+        .expect("the stream is free");
     let (ring, params) = audio.negotiate(TONE).expect("the device takes this format");
     let claim = audio.claim_ref().expect("the claim was just taken");
     let sender = claim.sender();
@@ -762,7 +783,9 @@ fn a_released_claims_reader_ends_and_never_sees_the_next_claims_feedback() {
     test_hooks::install();
     let (service, inboxes) = service_of(&[playback_stream(0)]);
     let mut audio = AudioOwnership::new();
-    audio.claim(&service, 0).expect("the stream is free");
+    audio
+        .claim(&service, 0, test_caps::audio())
+        .expect("the stream is free");
     let mut feedback = audio
         .claim_ref()
         .expect("the claim was just taken")
@@ -799,7 +822,7 @@ fn a_released_claims_reader_ends_and_never_sees_the_next_claims_feedback() {
 
     let mut second = AudioOwnership::new();
     second
-        .claim(&service, 0)
+        .claim(&service, 0, test_caps::audio())
         .expect("the released stream is free to take");
     let mut fresh = second
         .claim_ref()
@@ -832,7 +855,9 @@ fn a_stop_mid_stream_ends_the_producer_rather_than_parking_it() {
     test_hooks::install();
     let (service, _inboxes) = service_of(&[playback_stream(0)]);
     let mut audio = AudioOwnership::new();
-    audio.claim(&service, 0).expect("the stream is free");
+    audio
+        .claim(&service, 0, test_caps::audio())
+        .expect("the stream is free");
     let (ring, params) = audio.negotiate(TONE).expect("the device takes this format");
     let mut writer = PeriodWriter::new(ring.clone());
     let period = alloc::vec![0x11_u8; params.period_bytes as usize];
@@ -886,7 +911,9 @@ async fn write_some(writer: &mut PeriodWriter, bytes: &[u8]) -> usize {
 fn a_released_claim_frees_its_word_only_after_the_device_is_stopped() {
     let (service, _inboxes) = service_of(&[playback_stream(0)]);
     let mut audio = AudioOwnership::new();
-    audio.claim(&service, 0).expect("the stream is free");
+    audio
+        .claim(&service, 0, test_caps::audio())
+        .expect("the stream is free");
 
     audio.release();
 
@@ -911,7 +938,9 @@ fn a_device_that_refuses_to_start_ends_its_producer() {
     test_hooks::install();
     let (service, _inboxes) = service_of(&[playback_stream(0)]);
     let mut audio = AudioOwnership::new();
-    audio.claim(&service, 0).expect("the stream is free");
+    audio
+        .claim(&service, 0, test_caps::audio())
+        .expect("the stream is free");
     let (ring, params) = audio.negotiate(TONE).expect("the device takes this format");
 
     let mut device = ScriptedDevice::new(topology(&[playback_stream(0)]));
@@ -964,7 +993,9 @@ fn a_rejected_period_ends_the_stream_and_its_producer() {
     test_hooks::install();
     let (service, _inboxes) = service_of(&[playback_stream(0)]);
     let mut audio = AudioOwnership::new();
-    audio.claim(&service, 0).expect("the stream is free");
+    audio
+        .claim(&service, 0, test_caps::audio())
+        .expect("the stream is free");
     let (ring, params) = audio.negotiate(TONE).expect("the device takes this format");
 
     let mut device = ScriptedDevice::new(topology(&[playback_stream(0)]));
@@ -1018,7 +1049,9 @@ fn a_rejected_period_mid_stream_collects_the_rest_of_the_ring() {
     test_hooks::install();
     let (service, _inboxes) = service_of(&[playback_stream(0)]);
     let mut audio = AudioOwnership::new();
-    audio.claim(&service, 0).expect("the stream is free");
+    audio
+        .claim(&service, 0, test_caps::audio())
+        .expect("the stream is free");
     let (ring, params) = audio.negotiate(TONE).expect("the device takes this format");
 
     let mut device = ScriptedDevice::new(topology(&[playback_stream(0)]));
@@ -1073,7 +1106,9 @@ fn a_device_that_refuses_to_release_keeps_its_chains_but_frees_the_claim() {
     test_hooks::install();
     let (service, inboxes) = service_of(&[playback_stream(0)]);
     let mut audio = AudioOwnership::new();
-    audio.claim(&service, 0).expect("the stream is free");
+    audio
+        .claim(&service, 0, test_caps::audio())
+        .expect("the stream is free");
     let (ring, params) = audio.negotiate(TONE).expect("the device takes this format");
 
     let mut device = ScriptedDevice::new(topology(&[playback_stream(0)]));
@@ -1135,7 +1170,7 @@ fn a_device_that_refuses_to_release_keeps_its_chains_but_frees_the_claim() {
     );
     let mut second = AudioOwnership::new();
     second
-        .claim(&service, 0)
+        .claim(&service, 0, test_caps::audio())
         .expect("a refused release did not wedge the stream");
 }
 
@@ -1151,7 +1186,9 @@ fn a_write_that_completes_on_its_first_poll_is_settled_the_same() {
     test_hooks::install();
     let (service, _inboxes) = service_of(&[playback_stream(0)]);
     let mut audio = AudioOwnership::new();
-    audio.claim(&service, 0).expect("the stream is free");
+    audio
+        .claim(&service, 0, test_caps::audio())
+        .expect("the stream is free");
     let (ring, params) = audio.negotiate(TONE).expect("the device takes this format");
 
     let mut device = ScriptedDevice::new(topology(&[playback_stream(0)]));
@@ -1199,7 +1236,9 @@ fn a_closed_ring_takes_no_more_bytes() {
     test_hooks::install();
     let (service, _inboxes) = service_of(&[playback_stream(0)]);
     let mut audio = AudioOwnership::new();
-    audio.claim(&service, 0).expect("the stream is free");
+    audio
+        .claim(&service, 0, test_caps::audio())
+        .expect("the stream is free");
     let (ring, params) = audio.negotiate(TONE).expect("the device takes this format");
     let mut writer = PeriodWriter::new(ring.clone());
     let period = alloc::vec![0x33_u8; params.period_bytes as usize];
@@ -1222,7 +1261,9 @@ fn a_period_cursor_writes_into_the_pinned_period_itself() {
     test_hooks::install();
     let (service, _inboxes) = service_of(&[playback_stream(0)]);
     let mut audio = AudioOwnership::new();
-    audio.claim(&service, 0).expect("the stream is free");
+    audio
+        .claim(&service, 0, test_caps::audio())
+        .expect("the stream is free");
     let (ring, params) = audio.negotiate(TONE).expect("the device takes this format");
 
     block_on(async {
@@ -1265,4 +1306,99 @@ fn a_period_cursor_writes_into_the_pinned_period_itself() {
             "the bytes the cursors wrote are the bytes the device is handed"
         );
     });
+}
+
+/// What a component sees when it calls `audio.available` and
+/// `audio.claim`: both are answered by the instance's own authority
+/// before they reach the service.
+#[cfg(feature = "wasmtime-runtime")]
+mod component_host {
+    use super::*;
+    use crate::wasmtime_adapter::bindings::audio::bindings::helios::system::audio as contract;
+    use crate::wasmtime_adapter::component_host::service::test_store;
+    use crate::{DeviceClassRights, ProcessAuthority};
+
+    fn authority_with(classes: DeviceClassRights) -> ProcessAuthority {
+        let mut authority = ProcessAuthority::empty();
+        authority.grant_device_classes(classes);
+        authority
+    }
+
+    fn store_under(
+        authority: ProcessAuthority,
+        service: &AudioService,
+    ) -> test_store::TestStoreData {
+        test_store::store_data_authorized(authority, |runtime_state| {
+            runtime_state.install_audio_service(service.clone());
+        })
+    }
+
+    /// An ordinary program lists no streams and is told what a machine
+    /// with no sound device tells everyone, and the stream stays free
+    /// for its owner.
+    #[test]
+    fn ordinary_program_is_refused_playback_and_lists_no_streams() {
+        let (service, _inboxes) = service_of(&[playback_stream(0)]);
+
+        for authority in [
+            ProcessAuthority::empty(),
+            ProcessAuthority::root(),
+            authority_with(DeviceClassRights::all() - DeviceClassRights::AUDIO),
+        ] {
+            let mut data = store_under(authority, &service);
+            let listed = <test_store::TestStoreData as contract::Host>::available(&mut data)
+                .expect("the list is answered");
+            assert!(listed.is_empty(), "the machine's streams are not listed");
+            let answer = <test_store::TestStoreData as contract::Host>::claim(&mut data, 0)
+                .expect("a refusal is an answer, not a trap");
+            assert_eq!(answer.err(), Some(contract::Error::Unavailable));
+            assert!(!data.device.audio().holds_stream());
+        }
+
+        service
+            .claim(0, test_caps::audio())
+            .expect("nobody took the stream");
+
+        let mut absent = test_store::store_data_authorized(ProcessAuthority::empty(), |_| {});
+        let none = <test_store::TestStoreData as contract::Host>::claim(&mut absent, 0)
+            .expect("a machine with no sound device answers");
+        assert_eq!(
+            none.err(),
+            Some(contract::Error::Unavailable),
+            "the answer is the one a machine with no sound device gives"
+        );
+    }
+
+    /// The inventory a program reads agrees with what its claims answer:
+    /// a stream it cannot claim is not listed.
+    #[test]
+    fn program_stats_hide_streams_the_caller_cannot_claim() {
+        let (service, _inboxes) = service_of(&[playback_stream(0)]);
+        let listed = |authority: ProcessAuthority| {
+            let data = store_under(authority, &service);
+            let mut sample = data.runtime_state.snapshot(0);
+            sample.restrict_to(data.process_authority());
+            sample.audio.len()
+        };
+
+        assert_eq!(listed(ProcessAuthority::empty()), 0);
+        assert_eq!(listed(authority_with(DeviceClassRights::AUDIO)), 1);
+    }
+
+    /// A program that holds the audio class lists the streams and claims
+    /// one.
+    #[test]
+    fn debugger_granted_child_claims_a_playback_stream() {
+        let (service, _inboxes) = service_of(&[playback_stream(0)]);
+        let mut data = store_under(authority_with(DeviceClassRights::AUDIO), &service);
+
+        let listed = <test_store::TestStoreData as contract::Host>::available(&mut data)
+            .expect("the list is answered");
+        assert_eq!(listed.len(), 1);
+        let answer = <test_store::TestStoreData as contract::Host>::claim(&mut data, 0)
+            .expect("the claim is answered");
+
+        assert!(answer.is_ok(), "the audio class opens the stream");
+        assert!(data.device.audio().holds_stream());
+    }
 }

@@ -28,6 +28,8 @@
 
 use crate::buffer::{ViewError, ViewGroup, ViewTable};
 
+use crate::process::GpuClaimCap;
+
 use super::{Gpu3dServiceError, MAX_GPU_VIEWS};
 
 use super::service::{Gpu3dClaim, Gpu3dService};
@@ -64,11 +66,12 @@ impl Gpu3dOwnership {
         &mut self,
         service: &Gpu3dService,
         views: ViewGroup,
+        cap: GpuClaimCap,
     ) -> Result<(), Gpu3dServiceError> {
         if self.claim.is_some() {
             return Err(Gpu3dServiceError::AlreadyClaimed);
         }
-        self.claim = Some(service.claim()?);
+        self.claim = Some(service.claim(cap)?);
         self.views = Some(views);
         Ok(())
     }

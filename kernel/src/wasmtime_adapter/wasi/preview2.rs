@@ -1553,7 +1553,11 @@ where
             && let Ok(service) = self.filesystem().host_service().map_err(error_code_from_p3)
         {
             let host_path = host_path.to_owned();
-            match service.read_dir(&host_path).await {
+            // The whole listing is mirrored, so the bound is the mirror's.
+            match service
+                .read_dir(&host_path, super::GUEST_DIRECTORY_MIRROR_LIMIT)
+                .await
+            {
                 Ok(entries) => {
                     self.filesystem_mut()
                         .seed_host_directory_entries(&descriptor.path, entries);
@@ -1850,7 +1854,11 @@ where
                     // Directory listings still mirror into the embedded view:
                     // `read-directory` walks that node list synchronously.
                     // File contents do not — they stream on demand instead.
-                    let entries = match service.read_dir(&host_path).await {
+                    // The whole listing is mirrored, so the bound is the mirror's.
+                    let entries = match service
+                        .read_dir(&host_path, super::GUEST_DIRECTORY_MIRROR_LIMIT)
+                        .await
+                    {
                         Ok(entries) => entries,
                         Err(err) => {
                             return Ok(Err(error_code_from_p3(map_host_fs_error(err))));

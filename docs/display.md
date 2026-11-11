@@ -19,6 +19,12 @@ offered the display. That is the same rule `device.claim` follows
 a display another compositor holds is a provisioning mistake, not a
 shortage.
 
+Holding the display is a right, not a race. An instance may claim it
+only when its `ProcessAuthority` carries the display device class, which
+the kernel grants to the compositor it starts and to the debugger, and
+which a program receives only from a parent that holds it. Every other
+program is told what a machine with no display tells it: `unavailable`.
+
 ## Where the pixels are
 
 Nowhere the kernel owns.

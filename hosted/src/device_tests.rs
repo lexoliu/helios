@@ -12,8 +12,9 @@ use helios_hal::vmm::{
     AddressSpace, AddressSpaceError, PageFlags, Translation, VirtAddr, VirtRange,
 };
 use helios_kernel::{
-    DeviceGrantRegistry, GrantError, GrantInterrupt, GrantLease, GuestMemory, Span, ViewError,
-    ViewTable, WASM_PAGE_BYTES,
+    DeviceGrantClaimCap, DeviceGrantRegistry, DeviceName, GrantError, GrantInterrupt, GrantLease,
+    GuestMemory, ProcessAuthority, ProcessAuthorityError, Span, ViewError, ViewTable,
+    WASM_PAGE_BYTES,
 };
 
 use crate::device::{
@@ -102,10 +103,49 @@ fn registry() -> DeviceGrantRegistry {
     registry
 }
 
+/// The cap an owner the kernel granted the hosted device to holds.
+fn device_cap() -> DeviceGrantClaimCap {
+    let mut authority = ProcessAuthority::empty();
+    authority
+        .grant_device(DeviceName::new(HOSTED_DEVICE_NAME).expect("the hosted name fits"))
+        .expect("one named device fits");
+    authority
+        .derive_device_grant_cap(HOSTED_DEVICE_NAME)
+        .expect("the authority names the hosted device")
+}
+
 fn claim(registry: &DeviceGrantRegistry, views: &mut ViewTable) -> GrantLease {
     registry
-        .claim(HOSTED_DEVICE_NAME, views.group())
+        .claim(device_cap(), views.group())
         .expect("the device is free")
+}
+
+/// An instance the kernel did not grant the device to has no way to ask
+/// for it, and what it is told about the real device is what it is told
+/// about one the machine never published.
+#[test]
+fn a_claim_without_the_device_cap_is_answered_as_missing() {
+    let registry = registry();
+    assert!(
+        registry.device(HOSTED_DEVICE_NAME).is_some(),
+        "the machine publishes the device"
+    );
+
+    let ordinary = ProcessAuthority::empty();
+    let published = ordinary
+        .derive_device_grant_cap(HOSTED_DEVICE_NAME)
+        .expect_err("an ordinary instance holds no cap for a published device");
+    let unpublished = ordinary
+        .derive_device_grant_cap("hosted:not-a-device")
+        .expect_err("an ordinary instance holds no cap for any device");
+
+    assert!(matches!(
+        (published, unpublished),
+        (
+            ProcessAuthorityError::DeviceGrantExceedsAuthority(_),
+            ProcessAuthorityError::DeviceGrantExceedsAuthority(_)
+        )
+    ));
 }
 
 fn reclaim(lease: GrantLease, views: &mut ViewTable) {
@@ -217,9 +257,7 @@ fn the_device_goes_to_one_owner_at_a_time() {
     let first = claim(&registry, &mut first_views);
 
     assert_eq!(
-        registry
-            .claim(HOSTED_DEVICE_NAME, second_views.group())
-            .err(),
+        registry.claim(device_cap(), second_views.group()).err(),
         Some(GrantError::AlreadyClaimed)
     );
 

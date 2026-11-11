@@ -28,6 +28,7 @@ use crate::buffer::{Buffer, GuestMemory, Span, ViewTable, WASM_PAGE_BYTES};
 use crate::component::ProviderReceiver;
 use crate::device::test_hooks;
 use crate::display::SequenceSignal;
+use crate::process::test_caps;
 use crate::test_support::TestCpu;
 
 use super::owner::{gpu3d_channels, serve_control, serve_submit};
@@ -257,7 +258,7 @@ fn claimed_in(shared: &Arc<Gpu3dShared>, views: &mut ViewTable) -> Gpu3dOwnershi
     let service = Gpu3dService::from_shared(shared.clone());
     let mut ownership = Gpu3dOwnership::new();
     ownership
-        .claim(&service, views.group())
+        .claim(&service, views.group(), test_caps::gpu())
         .expect("the engine is free");
     ownership
 }
@@ -295,15 +296,15 @@ fn a_second_instance_is_refused_the_engine_the_first_holds() {
     let (shared, _control, _submit) = gpu3d_channels(true);
     let service = Gpu3dService::from_shared(shared.clone());
 
-    let first = service.claim().expect("the engine is free");
+    let first = service.claim(test_caps::gpu()).expect("the engine is free");
     assert_eq!(
-        service.claim().err(),
+        service.claim(test_caps::gpu()).err(),
         Some(Gpu3dServiceError::AlreadyClaimed)
     );
 
     drop(first);
     assert_eq!(
-        service.claim().err(),
+        service.claim(test_caps::gpu()).err(),
         Some(Gpu3dServiceError::AlreadyClaimed)
     );
 }
@@ -317,7 +318,10 @@ fn an_engine_that_renders_nothing_cannot_be_claimed() {
     let (shared, _control, _submit) = gpu3d_channels(false);
     let service = Gpu3dService::from_shared(shared);
 
-    assert_eq!(service.claim().err(), Some(Gpu3dServiceError::NoRenderer));
+    assert_eq!(
+        service.claim(test_caps::gpu()).err(),
+        Some(Gpu3dServiceError::NoRenderer)
+    );
     assert!(!service.is_claimed());
 }
 
@@ -332,10 +336,10 @@ fn one_instance_holds_the_engine_once() {
 
     let group = ViewTable::new().group();
     ownership
-        .claim(&service, group)
+        .claim(&service, group, test_caps::gpu())
         .expect("the engine is free");
     assert_eq!(
-        ownership.claim(&service, group).err(),
+        ownership.claim(&service, group, test_caps::gpu()).err(),
         Some(Gpu3dServiceError::AlreadyClaimed)
     );
 }
@@ -761,7 +765,7 @@ fn a_released_claim_unmaps_then_destroys_then_frees() {
 
     let service = Gpu3dService::from_shared(shared.clone());
     assert!(
-        service.claim().is_ok(),
+        service.claim(test_caps::gpu()).is_ok(),
         "the engine is free once its resources are back"
     );
 }
@@ -873,7 +877,7 @@ fn a_request_queued_before_release_is_dropped() {
     );
     let service = Gpu3dService::from_shared(shared);
     assert!(
-        service.claim().is_ok(),
+        service.claim(test_caps::gpu()).is_ok(),
         "the engine is free once its resources are back"
     );
 }
@@ -1050,7 +1054,7 @@ mod component_host {
         let service = Gpu3dService::from_shared(shared.clone());
         let mut data = test_store::store_data(&service);
         data.device
-            .claim_gpu(&service, &mut data.views)
+            .claim_gpu(&service, &mut data.views, test_caps::gpu())
             .expect("the engine is free");
         let first = data.device.gpu().claim_ref().expect("held").generation();
         let (buffer, view) = shown(&mut data, 0);
@@ -1085,7 +1089,7 @@ mod component_host {
                 crate::yield_now().await;
             }
             data.device
-                .claim_gpu(&service, &mut data.views)
+                .claim_gpu(&service, &mut data.views, test_caps::gpu())
                 .expect("the engine is free once its resources are back");
         });
         assert!(data.views.is_empty(), "the release ended the claim's views");
@@ -1138,7 +1142,7 @@ mod component_host {
         let service = Gpu3dService::from_shared(shared.clone());
         let mut data = test_store::store_data(&service);
         data.device
-            .claim_gpu(&service, &mut data.views)
+            .claim_gpu(&service, &mut data.views, test_caps::gpu())
             .expect("the engine is free");
         let first = data.device.gpu().claim_ref().expect("held").generation();
         let context = data
@@ -1157,7 +1161,7 @@ mod component_host {
                 crate::yield_now().await;
             }
             data.device
-                .claim_gpu(&service, &mut data.views)
+                .claim_gpu(&service, &mut data.views, test_caps::gpu())
                 .expect("the engine is free once its resources are back");
         });
         let live = data.device.gpu().claim_ref().expect("held").generation();
@@ -1196,5 +1200,66 @@ mod component_host {
             served.is_ok(),
             "the live claim's context still opens its stream"
         );
+    }
+
+    fn authority_with(classes: crate::DeviceClassRights) -> crate::ProcessAuthority {
+        let mut authority = crate::ProcessAuthority::empty();
+        authority.grant_device_classes(classes);
+        authority
+    }
+
+    /// An ordinary program is told what a machine with no 3D service
+    /// tells everyone, not `no-renderer`, and the engine stays free for
+    /// its owner.
+    #[test]
+    fn ordinary_program_is_refused_the_gpu_as_if_there_were_none() {
+        test_hooks::install();
+        let (shared, _control, _submit) = gpu3d_channels(true);
+        let service = Gpu3dService::from_shared(shared.clone());
+
+        for authority in [
+            crate::ProcessAuthority::empty(),
+            crate::ProcessAuthority::root(),
+            authority_with(crate::DeviceClassRights::all() - crate::DeviceClassRights::GPU),
+        ] {
+            let mut data = test_store::store_data_authorized(authority, |runtime_state| {
+                runtime_state.install_gpu3d_service(service.clone());
+            });
+            let answer = <test_store::TestStoreData as contract::Host>::claim(&mut data)
+                .expect("a refusal is an answer, not a trap");
+            assert_eq!(answer.err(), Some(contract::Error::Unavailable));
+            assert!(!data.device.gpu().holds_gpu());
+        }
+        assert!(!service.is_claimed(), "nobody took the engine");
+
+        let mut absent =
+            test_store::store_data_authorized(crate::ProcessAuthority::empty(), |_| {});
+        let none = <test_store::TestStoreData as contract::Host>::claim(&mut absent)
+            .expect("a machine with no 3D service answers");
+        assert_eq!(
+            none.err(),
+            Some(contract::Error::Unavailable),
+            "the answer is the one a machine with no 3D service gives"
+        );
+    }
+
+    /// A program that holds the GPU class claims the engine.
+    #[test]
+    fn debugger_granted_child_claims_the_gpu() {
+        test_hooks::install();
+        let (shared, _control, _submit) = gpu3d_channels(true);
+        let service = Gpu3dService::from_shared(shared.clone());
+        let mut data = test_store::store_data_authorized(
+            authority_with(crate::DeviceClassRights::GPU),
+            |runtime_state| {
+                runtime_state.install_gpu3d_service(service.clone());
+            },
+        );
+
+        let answer = <test_store::TestStoreData as contract::Host>::claim(&mut data)
+            .expect("the claim is answered");
+
+        assert!(answer.is_ok(), "the GPU class opens the engine");
+        assert!(service.is_claimed());
     }
 }

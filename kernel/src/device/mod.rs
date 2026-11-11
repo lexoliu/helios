@@ -75,6 +75,7 @@ mod tests {
         DeviceGrant, DeviceGrantRegistry, DeviceName, DmaBudget, GrantError, GrantInterrupt,
     };
     use crate::buffer::{GuestMemory, Span, ViewError, ViewTable, WASM_PAGE_BYTES};
+    use crate::process::test_caps;
     use helios_hal::device::{DeviceRegion, DeviceRegionAttributes, DmaCapability};
     use helios_hal::iommu::{DmaTranslation, PhysicalRange};
     use helios_hal::vmm::VirtAddr;
@@ -162,11 +163,13 @@ mod tests {
         let registry = registry(&["test:alpha"]);
         let mut views = ViewTable::new();
         let first = registry
-            .claim("test:alpha", views.group())
+            .claim(test_caps::device("test:alpha"), views.group())
             .expect("the first owner gets the device");
 
         assert_eq!(
-            registry.claim("test:alpha", views.group()).err(),
+            registry
+                .claim(test_caps::device("test:alpha"), views.group())
+                .err(),
             Some(GrantError::AlreadyClaimed)
         );
 
@@ -174,7 +177,43 @@ mod tests {
         // supervisor restarting a dead driver is not blocked by the
         // instance it just killed.
         drop(first);
-        assert!(registry.claim("test:alpha", views.group()).is_ok());
+        assert!(
+            registry
+                .claim(test_caps::device("test:alpha"), views.group())
+                .is_ok()
+        );
+    }
+
+    /// The only route to a cap is an authority that names the device, so
+    /// the owner the kernel provisioned claims it and an instance
+    /// granted a different device never holds a cap for this one.
+    #[test]
+    fn the_named_owner_claims_its_device() {
+        let registry = registry(&["test:alpha", "test:beta"]);
+        let mut views = ViewTable::new();
+        let mut owner = crate::ProcessAuthority::empty();
+        owner
+            .grant_device(DeviceName::new("test:alpha").expect("the test names are short"))
+            .expect("one named device fits");
+
+        let cap = owner
+            .derive_device_grant_cap("test:alpha")
+            .expect("the owner is granted its device");
+        let lease = registry
+            .claim(cap, views.group())
+            .expect("the named owner gets the device");
+        assert_eq!(lease.grant().name().as_str(), "test:alpha");
+
+        assert!(
+            owner.derive_device_grant_cap("test:beta").is_err(),
+            "a grant for one device is no cap for another"
+        );
+        assert!(
+            crate::ProcessAuthority::empty()
+                .derive_device_grant_cap("test:alpha")
+                .is_err(),
+            "an ordinary instance holds no cap for any device"
+        );
     }
 
     #[test]
@@ -183,7 +222,9 @@ mod tests {
         let mut views = ViewTable::new();
 
         assert_eq!(
-            registry.claim("test:missing", views.group()).err(),
+            registry
+                .claim(test_caps::device("test:missing"), views.group())
+                .err(),
             Some(GrantError::NotFound)
         );
     }
@@ -196,7 +237,7 @@ mod tests {
         let registry = registry(&["test:alpha"]);
         let mut views = ViewTable::new();
         let mut lease = registry
-            .claim("test:alpha", views.group())
+            .claim(test_caps::device("test:alpha"), views.group())
             .expect("the device is free");
         let before = test_hooks::shootdowns();
 
@@ -257,7 +298,7 @@ mod tests {
         let registry = registry(&["test:alpha"]);
         let mut views = ViewTable::new();
         let mut lease = registry
-            .claim("test:alpha", views.group())
+            .claim(test_caps::device("test:alpha"), views.group())
             .expect("the device is free");
         lease
             .map_region(0, &mut views, memory(), pages(0, 1))
@@ -277,7 +318,7 @@ mod tests {
         let registry = registry(&["test:alpha"]);
         let mut views = ViewTable::new();
         let mut lease = registry
-            .claim("test:alpha", views.group())
+            .claim(test_caps::device("test:alpha"), views.group())
             .expect("the device is free");
         let before = test_hooks::shootdowns();
 
@@ -306,7 +347,7 @@ mod tests {
         let registry = registry(&["test:alpha"]);
         let mut views = ViewTable::new();
         let mut lease = registry
-            .claim("test:alpha", views.group())
+            .claim(test_caps::device("test:alpha"), views.group())
             .expect("the device is free");
 
         assert_eq!(
@@ -322,7 +363,7 @@ mod tests {
         let registry = registry(&["test:alpha"]);
         let mut views = ViewTable::new();
         let mut lease = registry
-            .claim("test:alpha", views.group())
+            .claim(test_caps::device("test:alpha"), views.group())
             .expect("the device is free");
         let before = test_hooks::shootdowns();
 
@@ -369,7 +410,7 @@ mod tests {
             .expect("discovery publishes once");
         let mut views = ViewTable::new();
         let mut lease = registry
-            .claim("test:small", views.group())
+            .claim(test_caps::device("test:small"), views.group())
             .expect("the device is free");
 
         lease
@@ -395,7 +436,7 @@ mod tests {
         let registry = registry(&["test:alpha"]);
         let mut views = ViewTable::new();
         let mut lease = registry
-            .claim("test:alpha", views.group())
+            .claim(test_caps::device("test:alpha"), views.group())
             .expect("the device is free");
 
         lease
@@ -423,7 +464,7 @@ mod tests {
         let registry = registry(&["test:alpha"]);
         let mut views = ViewTable::new();
         let mut lease = registry
-            .claim("test:alpha", views.group())
+            .claim(test_caps::device("test:alpha"), views.group())
             .expect("the device is free");
 
         assert_eq!(
@@ -441,7 +482,7 @@ mod tests {
         let registry = registry(&["test:alpha"]);
         let mut views = ViewTable::new();
         let mut lease = registry
-            .claim("test:alpha", views.group())
+            .claim(test_caps::device("test:alpha"), views.group())
             .expect("the device is free");
         lease
             .map_region(0, &mut views, memory(), pages(5, 1))
@@ -463,7 +504,7 @@ mod tests {
         let registry = registry(&["test:alpha"]);
         let mut views = ViewTable::new();
         let mut lease = registry
-            .claim("test:alpha", views.group())
+            .claim(test_caps::device("test:alpha"), views.group())
             .expect("the device is free");
 
         assert_eq!(
@@ -499,7 +540,7 @@ mod tests {
         let registry = registry(&["test:alpha"]);
         let mut views = ViewTable::new();
         let lease = registry
-            .claim("test:alpha", views.group())
+            .claim(test_caps::device("test:alpha"), views.group())
             .expect("the device is free");
         lease.relay().unmask(0).expect("the source exists");
 
@@ -529,7 +570,7 @@ mod tests {
         let mut views = ViewTable::new();
         let mut ownership = super::DeviceOwnership::new();
         ownership
-            .claim(&registry, "test:alpha", &mut views)
+            .claim(&registry, test_caps::device("test:alpha"), &mut views)
             .expect("the device is free");
         ownership
             .lease_mut()
@@ -543,7 +584,9 @@ mod tests {
         assert!(views.is_empty(), "no view of the device outlives the grant");
         assert!(!ownership.holds_device());
         assert!(
-            registry.claim("test:alpha", views.group()).is_ok(),
+            registry
+                .claim(test_caps::device("test:alpha"), views.group())
+                .is_ok(),
             "releasing gives the device back"
         );
     }
@@ -556,11 +599,11 @@ mod tests {
         let mut views = ViewTable::new();
         let mut ownership = super::DeviceOwnership::new();
         ownership
-            .claim(&registry, "test:alpha", &mut views)
+            .claim(&registry, test_caps::device("test:alpha"), &mut views)
             .expect("the first device is free");
 
         assert_eq!(
-            ownership.claim(&registry, "test:beta", &mut views),
+            ownership.claim(&registry, test_caps::device("test:beta"), &mut views),
             Err(GrantError::AlreadyClaimed)
         );
     }

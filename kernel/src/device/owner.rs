@@ -19,6 +19,7 @@ use crate::audio::{AudioOwnership, AudioService, AudioServiceError};
 use crate::buffer::{ViewError, ViewTable};
 use crate::display::{DisplayOwnership, DisplayService, DisplayServiceError};
 use crate::gpu::{Gpu3dOwnership, Gpu3dService, Gpu3dServiceError};
+use crate::process::{AudioClaimCap, DeviceGrantClaimCap, DisplayClaimCap, GpuClaimCap};
 use crate::surface::SurfaceOwnership;
 
 use super::grant::{DeviceName, GrantError};
@@ -76,8 +77,9 @@ impl DeviceOwnership {
         &mut self,
         service: &Gpu3dService,
         views: &mut ViewTable,
+        cap: GpuClaimCap,
     ) -> Result<(), Gpu3dServiceError> {
-        self.gpu.claim(service, views.group())
+        self.gpu.claim(service, views.group(), cap)
     }
 
     /// This instance's side of the surface path.
@@ -106,8 +108,9 @@ impl DeviceOwnership {
         &mut self,
         service: &AudioService,
         id: u32,
+        cap: AudioClaimCap,
     ) -> Result<(), AudioServiceError> {
-        self.audio.claim(service, id)
+        self.audio.claim(service, id, cap)
     }
 
     /// This instance's side of the display path.
@@ -121,8 +124,12 @@ impl DeviceOwnership {
     }
 
     /// Take exclusive ownership of the machine's display.
-    pub fn claim_display(&mut self, service: &DisplayService) -> Result<(), DisplayServiceError> {
-        self.display.claim(service)
+    pub fn claim_display(
+        &mut self,
+        service: &DisplayService,
+        cap: DisplayClaimCap,
+    ) -> Result<(), DisplayServiceError> {
+        self.display.claim(service, cap)
     }
 
     /// Whether this instance holds a device.
@@ -130,20 +137,20 @@ impl DeviceOwnership {
         self.lease.is_some()
     }
 
-    /// Take exclusive ownership of the device `name` names.
+    /// Take exclusive ownership of the device `cap` names.
     ///
     /// Refused when this instance already holds one — a driver drives
     /// one device, and a second claim would make reclaim ambiguous.
     pub fn claim(
         &mut self,
         registry: &DeviceGrantRegistry,
-        name: &str,
+        cap: DeviceGrantClaimCap,
         views: &mut ViewTable,
     ) -> Result<(), GrantError> {
         if self.lease.is_some() {
             return Err(GrantError::AlreadyClaimed);
         }
-        self.lease = Some(registry.claim(name, views.group())?);
+        self.lease = Some(registry.claim(cap, views.group())?);
         Ok(())
     }
 
