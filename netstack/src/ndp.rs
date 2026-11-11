@@ -132,7 +132,7 @@ pub struct Ipv6RouterConfiguration {
     /// On-link prefixes to install as connected routes.
     pub on_link_prefixes: ArrayVec<OnLinkPrefix, MAX_ADVERTISED_PREFIXES>,
     /// Addresses SLAAC derives from autonomous prefixes.
-    pub addresses: ArrayVec<Ipv6Cidr, MAX_ADVERTISED_PREFIXES>,
+    pub addresses: ArrayVec<AdvertisedAddress, MAX_ADVERTISED_PREFIXES>,
     /// Link MTU option, when present.
     pub link_mtu: Option<u32>,
     /// `CurHopLimit`, when the router specified one (zero means unspecified).
@@ -151,6 +151,19 @@ pub struct OnLinkPrefix {
     pub valid_lifetime_seconds: u32,
 }
 
+/// An address SLAAC derives from an autonomous prefix, with the
+/// lifetimes of the Prefix Information option it came from. Whether the
+/// address is new or already configured, and what a zero valid lifetime
+/// then means, is the stack's decision (RFC 4862 §5.5.3 (d), (e)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdvertisedAddress {
+    pub address: Ipv6Cidr,
+    /// Preferred Lifetime in seconds; `0xffff_ffff` is infinity.
+    pub preferred_lifetime_seconds: u32,
+    /// Valid Lifetime in seconds; `0xffff_ffff` is infinity.
+    pub valid_lifetime_seconds: u32,
+}
+
 /// Prefixes retained from one advertisement. QEMU's user-mode network
 /// advertises a single prefix; four leaves room for a real router
 /// advertising a handful without unbounded state.
@@ -159,7 +172,9 @@ pub const MAX_ADVERTISED_PREFIXES: usize = 4;
 impl Ipv6RouterConfiguration {
     /// Whether the advertisement yielded anything worth installing.
     pub fn configures_interface(&self) -> bool {
-        !self.addresses.is_empty()
+        self.addresses
+            .iter()
+            .any(|address| address.valid_lifetime_seconds != 0)
             || !self.on_link_prefixes.is_empty()
             || self.router_lifetime_seconds != 0
     }
@@ -169,10 +184,13 @@ impl Ipv6RouterConfiguration {
 /// and routes it implies for an interface with hardware address `mac`.
 ///
 /// A prefix is autoconfigured when it carries the A bit, is a /64 (the
-/// only length a modified EUI-64 identifier fits), has a non-zero valid
-/// lifetime, and is not the link-local prefix. On-link (L bit) prefixes
-/// are reported separately because a prefix can be on-link without being
-/// autonomous.
+/// only length a modified EUI-64 identifier fits), does not announce a
+/// preferred lifetime above its valid lifetime (§5.5.3 (c)), and is not
+/// the link-local prefix. The address is reported with both lifetimes,
+/// a zero valid lifetime included: whether it creates, refreshes or
+/// leaves an address alone is the stack's decision. On-link (L bit)
+/// prefixes with a non-zero valid lifetime are reported separately
+/// because a prefix can be on-link without being autonomous.
 pub fn interpret_router_advertisement(
     advertisement: Icmpv6RouterAdvertisement<'_>,
     router: Ipv6Address,
@@ -207,13 +225,19 @@ pub fn interpret_router_advertisement(
                 // The prefix length arrives from the wire, so reject an
                 // out-of-range one here rather than letting `Ipv6Cidr`'s
                 // constructor assert on a hostile advertisement.
-                if prefix.prefix_len > 128
-                    || prefix.valid_lifetime_seconds == 0
-                    || prefix.prefix.is_link_local()
-                {
+                if prefix.prefix_len > 128 || prefix.prefix.is_link_local() {
                     continue;
                 }
-                if prefix.on_link {
+                // RFC 4862 §5.5.3 (c): a preferred lifetime above the
+                // valid lifetime silently ignores the whole option.
+                if prefix.preferred_lifetime_seconds > prefix.valid_lifetime_seconds {
+                    continue;
+                }
+                // A zero valid lifetime installs no route, and for an
+                // address is the stack's call: it withdraws nothing on its
+                // own for an address that exists (§5.5.3 (e)) and creates
+                // none for one that does not (§5.5.3 (d)).
+                if prefix.on_link && prefix.valid_lifetime_seconds != 0 {
                     let _ = configuration.on_link_prefixes.try_push(OnLinkPrefix {
                         prefix: Ipv6Cidr::new(prefix.prefix, prefix.prefix_len),
                         valid_lifetime_seconds: prefix.valid_lifetime_seconds,
@@ -221,9 +245,11 @@ pub fn interpret_router_advertisement(
                 }
                 if prefix.autonomous && prefix.prefix_len == SLAAC_PREFIX_LEN {
                     let address = Ipv6Address::from_prefix_and_eui64(prefix.prefix, mac);
-                    let _ = configuration
-                        .addresses
-                        .try_push(Ipv6Cidr::new(address, prefix.prefix_len));
+                    let _ = configuration.addresses.try_push(AdvertisedAddress {
+                        address: Ipv6Cidr::new(address, prefix.prefix_len),
+                        preferred_lifetime_seconds: prefix.preferred_lifetime_seconds,
+                        valid_lifetime_seconds: prefix.valid_lifetime_seconds,
+                    });
                 }
             }
             NdpOption::TargetLinkLayerAddress(_) | NdpOption::Other { .. } => {}
@@ -311,12 +337,17 @@ mod tests {
         assert_eq!(configuration.hop_limit, Some(64));
         assert_eq!(
             configuration.addresses.as_slice(),
-            &[Ipv6Cidr::new(
-                Ipv6Address::new([
-                    0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0x50, 0x54, 0x00, 0xff, 0xfe, 0x12, 0x34, 0x56,
-                ]),
-                64,
-            )]
+            &[AdvertisedAddress {
+                address: Ipv6Cidr::new(
+                    Ipv6Address::new([
+                        0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0x50, 0x54, 0x00, 0xff, 0xfe, 0x12, 0x34,
+                        0x56,
+                    ]),
+                    64,
+                ),
+                preferred_lifetime_seconds: 14_400,
+                valid_lifetime_seconds: 86_400,
+            }]
         );
         assert_eq!(
             configuration.on_link_prefixes.as_slice(),
@@ -338,12 +369,13 @@ mod tests {
     }
 
     #[test]
-    fn expired_prefix_and_non_autonomous_prefix_do_not_autoconfigure() {
-        let mut buffer = [0u8; 128];
+    fn zero_lifetime_prefix_is_passed_on_and_non_autonomous_prefix_has_no_address() {
+        let mut buffer = [0u8; 160];
         buffer[..16].fill(0);
         buffer[0] = 134;
         let mut offset = 16;
-        // Zero valid lifetime: ignored entirely.
+        // Zero valid lifetime: no route, but the address is reported with
+        // its lifetime so the stack applies RFC 4862 §5.5.3 (d) or (e).
         buffer[offset..offset + 32].fill(0);
         buffer[offset] = 3;
         buffer[offset + 1] = 4;
@@ -369,9 +401,36 @@ mod tests {
             panic!("router advertisement should parse");
         };
         let configuration = interpret_router_advertisement(advertisement, ROUTER, MAC);
-        assert!(configuration.addresses.is_empty());
+        assert_eq!(configuration.addresses.len(), 1);
+        assert_eq!(configuration.addresses[0].valid_lifetime_seconds, 0);
         assert_eq!(configuration.on_link_prefixes.len(), 1);
         assert_eq!(configuration.router_lifetime_seconds, 0);
+    }
+
+    #[test]
+    fn preferred_lifetime_above_valid_lifetime_ignores_the_option() {
+        let mut buffer = [0u8; 64];
+        buffer[..16].fill(0);
+        buffer[0] = 134;
+        let offset = 16;
+        buffer[offset..offset + 32].fill(0);
+        buffer[offset] = 3;
+        buffer[offset + 1] = 4;
+        buffer[offset + 2] = 64;
+        buffer[offset + 3] = 0xc0;
+        buffer[offset + 4..offset + 8].copy_from_slice(&1_000u32.to_be_bytes());
+        buffer[offset + 8..offset + 12].copy_from_slice(&1_001u32.to_be_bytes());
+        buffer[offset + 16] = 0x20;
+        buffer[offset + 17] = 0x01;
+
+        let Some(Icmpv6Packet::RouterAdvertisement(advertisement)) =
+            Icmpv6Packet::parse(&buffer[..offset + 32])
+        else {
+            panic!("router advertisement should parse");
+        };
+        let configuration = interpret_router_advertisement(advertisement, ROUTER, MAC);
+        assert!(configuration.addresses.is_empty());
+        assert!(configuration.on_link_prefixes.is_empty());
     }
 
     #[test]
