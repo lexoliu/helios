@@ -503,8 +503,8 @@ nobody edits a version or a changelog by hand.
   block. Evidence in the PR body is concrete:
   the run id, the lane, the median, the negotiated feature line, the log
   line that proved the diagnosis.
-- A change to the Wasmtime fork, to a CI runner or lane, to this file, or to
-  anything that publishes is discussed with a maintainer before it is made.
+- A change to the Wasmtime fork, to a CI runner or lane, or to anything that
+  publishes is discussed with a maintainer before it is made.
 
 ## 9. Working in parallel
 
