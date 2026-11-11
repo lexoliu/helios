@@ -60,6 +60,7 @@ def command_run(args: argparse.Namespace) -> int:
         iterations=args.iterations,
         runner_label=args.runner_label,
         allow_busy_host=args.allow_busy_host,
+        prebuilt=args.prebuilt,
         helios_timeout_seconds=args.helios_timeout_seconds,
         helios_side_timeout_seconds=args.helios_side_timeout_seconds,
         skip_linux_workloads=tuple(args.skip_linux_workloads),
@@ -236,6 +237,15 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--iterations", type=int)
     run.add_argument("--runner-label")
     run.add_argument("--allow-busy-host", action="store_true")
+    run.add_argument(
+        "--prebuilt",
+        action="store_true",
+        help=(
+            "build nothing on this host: the inspector, helios-cli, the kernel image, its "
+            "helios-bootfs and the native counterparts must already be in place, and the run "
+            "lists every one that is missing before it starts a guest"
+        ),
+    )
     run.add_argument("--helios-timeout-seconds", type=int, default=9000)
     run.add_argument("--helios-side-timeout-seconds", type=int, default=10800)
     run.add_argument(

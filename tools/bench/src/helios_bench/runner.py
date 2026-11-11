@@ -182,6 +182,12 @@ class RunOptions:
     # shares it out over twice as many boots, and each of those boots
     # carries one workload rather than a whole class.
     baseline: Baseline | None = None
+    # The host compiles nothing: the inspector, helios-cli, the kernel
+    # image, its `helios-bootfs` and the native counterparts were put in
+    # place beforehand (a CI artifact and files copied from the machine
+    # that built them). The run refuses to start when any of them is
+    # missing, and never builds one.
+    prebuilt: bool = False
     # The merged `.profdata` the candidate kernel is compiled against
     # (docs/pgo.md). It pairs the same way a baseline commit does, and
     # against the plain release build of this checkout: what varies
@@ -383,6 +389,9 @@ def helios_command(
             "--helios-accel",
             lane.accelerator,
             "--skip-linux",
+            # The driver's boots never build; this is also the build it
+            # does before them, which a prebuilt run has no host for.
+            *(["--helios-skip-build"] if options.prebuilt else []),
             "--helios-timeout-seconds",
             str(options.helios_timeout_seconds),
             "--helios-side-timeout-seconds",
@@ -406,7 +415,7 @@ def plan(options: RunOptions, manifest: Manifest, workloads: list[dict]) -> list
     lane = options.lane
     iterations = options.iterations or manifest.statistics.iterations
     commands = []
-    if options.sides & LINUX_SIDES:
+    if options.sides & LINUX_SIDES and not options.prebuilt:
         commands.append(
             PlannedCommand(
                 description=f"build the native counterparts for {lane.guest_arch}",
@@ -613,6 +622,107 @@ def inspector_for(workspace_root: Path) -> Path:
     return workspace_root / "target" / "release" / "helios-inspector"
 
 
+def kernel_path(workspace_root: Path, lane: Lane, profile_use: Path | None) -> Path:
+    """The kernel image the inspector of ``workspace_root`` boots on ``lane``.
+
+    Asked of the inspector, which owns the mapping from architecture and
+    build profile to artifact directory. The answer is a path and not a
+    promise that the file exists. A failing `kernel-path` is a broken
+    inspector, a wrong workspace root or a refused profile (a `--release`
+    x86-64 kernel reads the fetched profile, `helios-cli profile-fetch`),
+    and is fatal.
+    """
+    argv = [
+        str(inspector_for(workspace_root)),
+        "vm",
+        "--arch",
+        lane.helios_arch,
+        "--release",
+        "--accel",
+        lane.accelerator,
+    ]
+    if profile_use is not None:
+        argv += ["--profile-use", str(profile_use)]
+    argv.append("kernel-path")
+    env = os.environ.copy()
+    env["HELIOS_WORKSPACE_ROOT"] = str(workspace_root)
+    completed = subprocess.run(argv, cwd=REPO_ROOT, env=env, capture_output=True, text=True, check=False)
+    if completed.returncode != 0:
+        raise SystemExit(
+            f"`{shlex.join(argv)}` exited with status {completed.returncode}: {completed.stderr.strip()}"
+        )
+    return Path(completed.stdout.strip())
+
+
+def helios_cli_for_repo() -> Path:
+    """The `helios-cli` this checkout's driver boots with (`HELIOS_CLI_BIN` pins it)."""
+    return Path(os.environ.get("HELIOS_CLI_BIN", REPO_ROOT / "target" / "release" / "helios-cli"))
+
+
+NATIVE_BIN_REFERENCE = re.compile(r"\{native_bin\}/([\w.+-]+)")
+
+
+def native_counterparts(options: RunOptions, workloads: list[dict]) -> list[str]:
+    """The native binaries the Linux sides of the selected workloads run."""
+    runner = workload_runner()
+    names = set()
+    for workload in workloads:
+        if workload["name"] in options.skip_linux_workloads:
+            continue
+        for side in options.sides & LINUX_SIDES:
+            for template in runner.counterpart_templates(workload, side.value):
+                names.update(NATIVE_BIN_REFERENCE.findall(template))
+    return sorted(names)
+
+
+def missing_prebuilt_files(options: RunOptions, workloads: list[dict]) -> list[str]:
+    """Every file a prebuilt run reads that is not on disk, as one line each.
+
+    The kernel image and `helios-bootfs` are named by the inspector's
+    `kernel-path`. The inspector has no question for the payload, which
+    `kernel-prebuild` writes at `target/kernel-prebuild/<triple>/<build>/`,
+    beside the kernel's `target/<triple>/<build>/` (inspector/src/vm.rs,
+    `kernel_prebuild_dir`).
+    """
+    lane = options.lane
+    missing = []
+    if Side.HELIOS in options.sides:
+        inspector = inspector_for(REPO_ROOT)
+        cli = helios_cli_for_repo()
+        for what, tool in (("helios-inspector", inspector), ("helios-cli", cli)):
+            if not (tool.is_file() and os.access(tool, os.X_OK)):
+                missing.append(f"{tool} ({what}, not an executable file)")
+        if inspector.is_file() and os.access(inspector, os.X_OK):
+            kernel = kernel_path(REPO_ROOT, lane, None)
+            build_dir, triple_dir = kernel.parent, kernel.parent.parent
+            bootfs = (
+                triple_dir.parent / "kernel-prebuild" / triple_dir.name / build_dir.name / "helios-bootfs"
+            )
+            for what, path in (("kernel image", kernel), ("helios-bootfs", bootfs)):
+                if not path.is_file():
+                    missing.append(f"{path} ({what})")
+        else:
+            missing.append(
+                "the kernel image and helios-bootfs paths (they are asked of the inspector, which is missing)"
+            )
+    if options.sides & LINUX_SIDES:
+        for name in native_counterparts(options, workloads):
+            path = NATIVE_ARTIFACTS / lane.guest_arch / name
+            if not path.is_file():
+                missing.append(f"{path} (native counterpart)")
+    return missing
+
+
+def require_prebuilt(options: RunOptions, workloads: list[dict]) -> None:
+    """Refuses a prebuilt run before any guest starts if a file it reads is missing."""
+    missing = missing_prebuilt_files(options, workloads)
+    if missing:
+        raise SystemExit(
+            "--prebuilt builds nothing, and these files the run reads are missing:\n  - "
+            + "\n  - ".join(missing)
+        )
+
+
 def kernel_pgo_uncovered(
     workspace_root: Path,
     lane: Lane,
@@ -634,27 +744,7 @@ def kernel_pgo_uncovered(
     workspace root, or a refused profile, and it is fatal rather than a
     missing count.
     """
-    inspector = inspector_for(workspace_root)
-    argv = [
-        str(inspector),
-        "vm",
-        "--arch",
-        lane.helios_arch,
-        "--release",
-        "--accel",
-        lane.accelerator,
-    ]
-    if profile_use is not None:
-        argv += ["--profile-use", str(profile_use)]
-    argv.append("kernel-path")
-    env = os.environ.copy()
-    env["HELIOS_WORKSPACE_ROOT"] = str(workspace_root)
-    completed = subprocess.run(argv, cwd=REPO_ROOT, env=env, capture_output=True, text=True, check=False)
-    if completed.returncode != 0:
-        raise SystemExit(
-            f"`{shlex.join(argv)}` exited with status {completed.returncode}: {completed.stderr.strip()}"
-        )
-    listing = Path(completed.stdout.strip() + ".pgo-uncovered.txt")
+    listing = Path(str(kernel_path(workspace_root, lane, profile_use)) + ".pgo-uncovered.txt")
     if not listing.is_file():
         return None
     with listing.open("r", encoding="utf-8") as handle:
@@ -1124,6 +1214,11 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
             "a run that rebuilds the baseline times it as the helios_baseline_rebuild side, and "
             "only such a run has that side: --sides and --baseline-rebuild-profile-use disagree"
         )
+    if options.prebuilt and paired:
+        raise SystemExit(
+            "--prebuilt builds nothing, and a paired run builds its second Helios image: "
+            "drop --prebuilt or the pairing options"
+        )
     workload_manifest = load_workloads()
     workloads = select_workloads(workload_manifest, options.workload_names)
     commands = plan(options, manifest, workloads)
@@ -1133,6 +1228,8 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
         for command in commands:
             print(f"# {command.description}\n{command.shell()}")
         return None
+    if options.prebuilt:
+        require_prebuilt(options, workloads)
 
     # The monotonic clock the retry's budget check reads, started before
     # the baseline is prepared and the first command runs: `started`
@@ -1223,6 +1320,7 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
             if options.baseline
             else (git_sha() if paired else None),
             kernel_build=options.kernel_build,
+            prebuilt=options.prebuilt,
             baseline_kernel_build=options.baseline_kernel_build,
             kernel_profile=profiles.candidate,
             baseline_kernel_profile=profiles.baseline,
