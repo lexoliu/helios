@@ -490,15 +490,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "buddy_system_allocator"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b672b945a3e4f4f40bfd4cd5ee07df9e796a42254ce7cd6d2599ad969244c44a"
-dependencies = [
- "spin 0.10.1",
-]
-
-[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1965,7 +1956,6 @@ dependencies = [
  "async-task",
  "atomic-waker",
  "bitflags 2.13.1",
- "buddy_system_allocator",
  "bytes",
  "concurrent-queue",
  "critical-section",
@@ -3813,12 +3803,6 @@ checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
 dependencies = [
  "lock_api",
 ]
-
-[[package]]
-name = "spin"
-version = "0.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "023a211cb3138dbc438680b32560ad89f699977624c9f8dbb95a47d5b4c07dd3"
 
 [[package]]
 name = "spin"

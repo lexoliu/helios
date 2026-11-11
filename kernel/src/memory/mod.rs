@@ -3,7 +3,6 @@
 //! `irq_safe` carries the lock every allocator here is built on: an
 //! interrupt handler allocates, so the lock that guards an allocator
 //! has to mask interrupts while it is held.
-//! `pmm` exposes the kernel's physical-frame allocator wrapper.
 //! `fiber_stack` owns the arena the runtime's async stacks are committed
 //! out of one page-fault at a time, and `frame_reserve` holds the frames
 //! that fault path is allowed to allocate.
@@ -26,7 +25,6 @@ mod frame_slab;
 mod irq_safe;
 mod mapping_cost;
 mod owner;
-mod pmm;
 mod policy;
 mod reported;
 mod reservations;
@@ -56,7 +54,6 @@ pub use owner::{
     MemoryOwner, UserMemoryOwnerScope, UserMemoryOwners, configure_user_memory_owner_processors,
     current_user_memory_owner, enter_user_memory_owner,
 };
-pub use pmm::KernelPhysFrameAllocator;
 pub use policy::{
     BootMemoryPlan, BootRegionSplitter, KERNEL_HEAP_BOOTSTRAP_BYTES,
     KERNEL_HEAP_GROWTH_CHUNK_BYTES, KERNEL_HEAP_MAX_BOOT_FRACTION, KERNEL_HEAP_MIN_RESERVE_BYTES,

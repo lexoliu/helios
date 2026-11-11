@@ -11,7 +11,6 @@ mod init_program;
 mod memory_policy_tests;
 mod net;
 mod oom_killer_tests;
-mod pmm_tests;
 mod rtc;
 mod runtime;
 mod swap;

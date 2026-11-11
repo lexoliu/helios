@@ -6,8 +6,8 @@
 //! the pool refuses one, and whether that number grows with the
 //! machine.
 //!
-//! Hosted-side for the same reason as `pmm_tests` and
-//! `oom_killer_tests`: the kernel crate's lib-test compilation has
+//! Hosted-side for the same reason as `oom_killer_tests`: the kernel
+//! crate's lib-test compilation has
 //! pre-existing breakage in unrelated WASI binding code, and
 //! `UserMemoryPool` behaves identically wherever its memory comes from.
 

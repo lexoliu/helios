@@ -127,13 +127,6 @@ pressure budget or remaining target. This accounts for actual occupied
 frames rather than a smaller requested count that the pool would round
 up, and rechecks available budget after awaiting the host (#266).
 
-`KernelPhysFrameAllocator` (`kernel/src/memory/pmm.rs`) also contains a
-buddy heap and frame slab, but has no production allocation call path in
-the current tree. Its constructors are used by tests; x86 page-table
-allocation uses `DirectMappedFrameAllocator` and the global allocator.
-Issue #249 was closed as not planned after this call-path check, rather
-than attributing benchmark costs to an unused allocator.
-
 ## Why the split is not a fraction
 
 It used to be. The kernel heap kept a quarter of every boot region and
