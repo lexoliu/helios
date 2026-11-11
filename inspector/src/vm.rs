@@ -37,6 +37,7 @@ use crate::{
     ConnectError, InterruptError, SessionCommand, SessionError, connect_client, run_connected,
 };
 
+mod disk;
 mod input;
 mod instruction_profile;
 mod kernel_image;
@@ -47,6 +48,7 @@ mod raw_profile;
 mod vcpu_state;
 mod x86_image_audit;
 
+use disk::{DiskSpecError, VmDiskSpec, validate_disks};
 use input::{InputScript, InputScriptError, InputStatement};
 use network::{
     HostPlatform, NetSetupCommand, NetTeardownCommand, QemuNetArgs, VmNetwork, VmNetworkArgs,
@@ -138,6 +140,14 @@ pub(crate) enum VmConfigError {
     NoNativeAccelerator(#[from] NoNativeAccelerator),
     #[error("--data-disk-size must be greater than zero")]
     ZeroDataDiskSize,
+    #[error("{0}")]
+    DiskSpec(#[from] DiskSpecError),
+    #[error("--disk image {path} cannot be opened: {source}")]
+    DiskImage {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
     #[error("--gdb-wait requires --gdb or --debug")]
     GdbWaitWithoutGdb,
     #[error("{0}")]
@@ -1413,6 +1423,10 @@ pub(crate) struct VmConfigFile {
     pub(crate) keep_runtime_dir: Option<bool>,
     #[serde(default)]
     pub(crate) data_disk_size: Option<u64>,
+    /// `--disk` entries, in the same `<image>,serial=<name>[,readonly]`
+    /// form; the command line's are attached after these.
+    #[serde(default)]
+    pub(crate) disk: Vec<String>,
     #[serde(default)]
     pub(crate) acpi: Option<bool>,
     #[serde(default)]
@@ -1541,6 +1555,11 @@ pub(crate) struct VmCommand {
     /// Size in bytes of the scratch disk every profile attaches.
     #[arg(long)]
     data_disk_size: Option<u64>,
+
+    /// Attach a raw disk image the guest can mount, found by its serial:
+    /// `<image>,serial=<name>[,readonly]`. Repeat for more disks.
+    #[arg(long = "disk", value_name = "IMAGE,serial=NAME[,readonly]")]
+    disks: Vec<VmDiskSpec>,
 
     #[arg(long)]
     gdb: Option<String>,
@@ -1968,6 +1987,8 @@ struct ResolvedVmCommand {
     accel: Vec<String>,
     shared_dir: Option<PathBuf>,
     data_disk_bytes: u64,
+    /// `--disk` images, their paths canonical, in attach order.
+    disks: Vec<VmDiskSpec>,
     gdb: Option<String>,
     gdb_wait: bool,
     monitor: Option<String>,
@@ -2417,6 +2438,7 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
     if data_disk_bytes == 0 {
         return Err(VmConfigError::ZeroDataDiskSize);
     }
+    let disks = resolve_disks(file.disk, command.disks)?;
     let gdb = command
         .gdb
         .or(file.gdb)
@@ -2525,6 +2547,7 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
         accel,
         shared_dir,
         data_disk_bytes,
+        disks,
         gdb,
         gdb_wait,
         monitor,
@@ -5109,6 +5132,12 @@ impl VmRuntime {
             &data_disk,
             command.virtio_devices,
         );
+        configure_disks(
+            &mut qemu,
+            command.profile.data_disk,
+            &command.disks,
+            command.virtio_devices,
+        );
         if let Some(host_share) = command.profile.host_share
             && let Some(shared_dir) = &command.shared_dir
         {
@@ -5620,6 +5649,54 @@ fn configure_data_disk(
     qemu.arg("-device").arg(device.to_string());
 }
 
+/// The `--disk` images to attach: the config file's, then the command
+/// line's, each image opened by its canonical path so a relative path
+/// means the same disk whatever directory QEMU runs in.
+fn resolve_disks(
+    file: Vec<String>,
+    command: Vec<VmDiskSpec>,
+) -> Result<Vec<VmDiskSpec>, VmConfigError> {
+    let mut disks = file
+        .iter()
+        .map(|spec| spec.parse::<VmDiskSpec>())
+        .collect::<Result<Vec<_>, _>>()?;
+    disks.extend(command);
+    validate_disks(&disks, DATA_DISK_SERIAL)?;
+    for disk in &mut disks {
+        disk.image = fs::canonicalize(&disk.image).map_err(|source| VmConfigError::DiskImage {
+            path: disk.image.display().to_string(),
+            source,
+        })?;
+    }
+    Ok(disks)
+}
+
+/// Attaches every `--disk` image on the scratch disk's transport, each
+/// with the serial the guest names it by.
+fn configure_disks(
+    qemu: &mut Command,
+    transport: VmDataDiskProfile,
+    disks: &[VmDiskSpec],
+    queues: VirtioDeviceProfile,
+) {
+    for (index, disk) in disks.iter().enumerate() {
+        let id = format!("disk{index}");
+        qemu.arg("-drive").arg(disk.drive(&id).to_string());
+        let mut device = QemuOptions::new(match transport {
+            VmDataDiskProfile::VirtioMmio => "virtio-blk-device",
+            VmDataDiskProfile::VirtioPci => "virtio-blk-pci",
+        });
+        device.set("drive", &id);
+        device.set("serial", &disk.serial);
+        apply_transport(
+            transport == VmDataDiskProfile::VirtioPci,
+            queues,
+            &mut device,
+        );
+        qemu.arg("-device").arg(device.to_string());
+    }
+}
+
 fn configure_host_share(
     qemu: &mut Command,
     host_share: VmHostShareProfile,
@@ -6055,6 +6132,51 @@ mod tests {
         qemu.get_args()
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect()
+    }
+
+    /// Every `--disk` rides the scratch disk's transport, so it reaches
+    /// the kernel on the bus the kernel already scans for block devices,
+    /// and carries the serial the guest finds it by.
+    #[test]
+    fn extra_disks_are_attached_with_their_serial_on_the_scratch_disks_bus() {
+        let disks: Vec<VmDiskSpec> = [
+            "/images/rootfs.erofs,serial=rootfs,readonly",
+            "/images/home.btrfs,serial=home",
+        ]
+        .iter()
+        .map(|spec| spec.parse().expect("a valid disk"))
+        .collect();
+
+        assert_eq!(
+            rendered(|qemu| configure_disks(
+                qemu,
+                VmDataDiskProfile::VirtioMmio,
+                &disks,
+                VirtioDeviceProfile::default()
+            )),
+            [
+                "-drive",
+                "if=none,format=raw,file=/images/rootfs.erofs,id=disk0,readonly=on",
+                "-device",
+                "virtio-blk-device,drive=disk0,serial=rootfs",
+                "-drive",
+                "if=none,format=raw,file=/images/home.btrfs,id=disk1",
+                "-device",
+                "virtio-blk-device,drive=disk1,serial=home",
+            ]
+        );
+        let pci = rendered(|qemu| {
+            configure_disks(
+                qemu,
+                VmDataDiskProfile::VirtioPci,
+                &disks[..1],
+                VirtioDeviceProfile::default(),
+            )
+        });
+        assert!(
+            pci[3].starts_with("virtio-blk-pci,drive=disk0,serial=rootfs"),
+            "{pci:?}"
+        );
     }
 
     /// A capture is only evidence if it is a capture of the guest's own
@@ -7449,6 +7571,7 @@ mod tests {
             accel: vec!["tcg".to_owned()],
             shared_dir: None,
             data_disk_size: None,
+            disks: Vec::new(),
             gdb: None,
             gdb_wait: false,
             monitor: None,
@@ -7509,6 +7632,7 @@ mod tests {
             accel: vec!["tcg".to_owned()],
             shared_dir: None,
             data_disk_size: None,
+            disks: Vec::new(),
             gdb: None,
             gdb_wait: false,
             monitor: None,
@@ -7648,6 +7772,7 @@ mod tests {
             accel: vec!["tcg".to_owned()],
             shared_dir: None,
             data_disk_size: None,
+            disks: Vec::new(),
             gdb: None,
             gdb_wait: false,
             monitor: None,
@@ -7787,6 +7912,7 @@ mod tests {
                 .collect(),
             shared_dir: None,
             data_disk_bytes: DEFAULT_DATA_DISK_BYTES,
+            disks: Vec::new(),
             gdb: None,
             gdb_wait: false,
             monitor: None,
@@ -7998,6 +8124,7 @@ mod tests {
                 .collect(),
             shared_dir: Some(repo_root().expect("workspace root must resolve")),
             data_disk_bytes: DEFAULT_DATA_DISK_BYTES,
+            disks: Vec::new(),
             gdb: None,
             gdb_wait: false,
             monitor: None,
