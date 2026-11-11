@@ -17,6 +17,7 @@ use helios_hal::display::{
     CursorImage, DisplayDevice, DisplayError, DisplayMode, DisplayResult, FramebufferId,
     PixelFormat, Point, Rect, ScanoutId, ScanoutInfo, ScanoutList,
 };
+use helios_hal::io::IoError;
 use helios_hal::pmm::PhysFrameRange;
 use std::sync::Mutex;
 use triomphe::Arc;
@@ -69,6 +70,19 @@ struct FakeDisplay {
     /// A caller's end of the reply, dropped while the next resource is
     /// being created: the caller stopped waiting mid-create.
     abandon_on_create: Mutex<Option<CreateAnswer>>,
+    /// How every `create_framebuffer` fails, while a test wants it to.
+    create_failure: Mutex<Option<CreateFailure>>,
+}
+
+/// The two ways a create can fail, which differ in what the engine may
+/// be left holding.
+#[derive(Clone, Copy)]
+enum CreateFailure {
+    /// The engine answered with a refusal, so it holds nothing.
+    Refused,
+    /// No answer came, as on a faulted queue: the request may still be
+    /// with the engine.
+    Unanswered,
 }
 
 impl FakeDisplay {
@@ -78,7 +92,12 @@ impl FakeDisplay {
             next: Mutex::new(1),
             refuse_destroy: false,
             abandon_on_create: Mutex::new(None),
+            create_failure: Mutex::new(None),
         }
+    }
+
+    fn fail_creates(&self, failure: CreateFailure) {
+        *self.create_failure.lock().expect("no test panics here") = Some(failure);
     }
 
     fn refusing_destroy() -> Self {
@@ -131,7 +150,11 @@ impl DisplayDevice for FakeDisplay {
                 .expect("no test panics here")
                 .take(),
         );
-        Ok(id)
+        match *self.create_failure.lock().expect("no test panics here") {
+            Some(CreateFailure::Refused) => Err(DisplayError::Unspecified),
+            Some(CreateFailure::Unanswered) => Err(DisplayError::Transport(IoError::DeviceFault)),
+            None => Ok(id),
+        }
     }
 
     async fn destroy_framebuffer(&self, framebuffer: FramebufferId) -> DisplayResult<()> {
@@ -225,6 +248,15 @@ fn claimed(shared: &Arc<DisplayShared>) -> DisplayOwnership {
 /// Ask the server to create one surface for `ownership`, handing it the
 /// only reference to a fresh frame buffer.
 async fn create_surface(ownership: &DisplayOwnership) -> FramebufferId {
+    request_surface(ownership)
+        .await
+        .expect("the fake display agrees")
+}
+
+/// [`create_surface`], with the engine's answer left to the caller.
+async fn request_surface(
+    ownership: &DisplayOwnership,
+) -> Result<FramebufferId, DisplayServiceError> {
     let generation = ownership
         .claim_ref()
         .expect("the claim is held")
@@ -244,7 +276,6 @@ async fn create_surface(ownership: &DisplayOwnership) -> FramebufferId {
             answer,
         )
         .await
-        .expect("the fake display agrees")
 }
 
 /// A second instance is refused rather than queued: a compositor waiting
@@ -616,6 +647,42 @@ fn a_frame_buffer_the_engine_would_not_release_stays_pinned() {
         2,
         "neither run goes back to a pool the engine may still be reading"
     );
+}
+
+/// A create the display engine never answered may have left the request
+/// that names the run with the engine, so the run stays out of the pool;
+/// a create it refused attached nothing, and the run goes back.
+#[test]
+fn a_frame_buffer_is_kept_only_when_its_create_was_never_answered() {
+    test_hooks::install();
+    let (shared, control, _cursor) = display_channels();
+    let device = FakeDisplay::new();
+    let ownership = claimed(&shared);
+    let runs = test_hooks::live_runs();
+
+    with_server(&device, &shared, &control, async {
+        device.fail_creates(CreateFailure::Refused);
+        assert!(request_surface(&ownership).await.is_err());
+        for _ in 0..3 {
+            crate::yield_now().await;
+        }
+        assert_eq!(
+            test_hooks::live_runs(),
+            runs,
+            "an answered refusal frees the frame buffer's run"
+        );
+
+        device.fail_creates(CreateFailure::Unanswered);
+        assert!(request_surface(&ownership).await.is_err());
+        for _ in 0..3 {
+            crate::yield_now().await;
+        }
+        assert_eq!(
+            test_hooks::live_runs() - runs,
+            1,
+            "a create the engine never answered keeps its run"
+        );
+    });
 }
 
 /// What a component sees when it calls `display.claim`: the claim is
