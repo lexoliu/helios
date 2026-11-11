@@ -3,9 +3,10 @@
 
 use super::packed::PackedRing;
 use super::split::SplitRing;
-use super::{Ring, VirtQueue};
+use super::{ChainEntry, MAX_CHAIN_BUFFERS, Ring, VirtQueue, VirtqueueError, build_chain};
+use crate::bus::DmaBuffer;
 use crate::features::NegotiatedFeatures;
-use crate::testing::{FakeTransport, FakeTransportConfig};
+use crate::testing::{FakeTransport, FakeTransportConfig, WindowDmaPool};
 use crate::transport::VirtioFeatures;
 use helios_hal::io::IoError;
 
@@ -900,4 +901,67 @@ fn a_reset_lets_a_faulted_queue_run_again() {
         .expect("the queue works after a reset");
     split(&queue).device_complete(token, 8);
     assert_eq!(queue.pop_used_with_len(), Ok(Some((token, 8))));
+}
+
+/// A transport whose pool translates a 64 KiB window and is followed by
+/// a page of real memory the device cannot reach.
+fn windowed_transport() -> (WindowDmaPool, FakeTransport<WindowDmaPool>) {
+    let pool = WindowDmaPool::with_unmapped_tail(16 * 4096, 4096);
+    let transport = FakeTransport::with_dma(FakeTransportConfig::default(), pool.clone());
+    (pool, transport)
+}
+
+fn empty_chain() -> [ChainEntry; MAX_CHAIN_BUFFERS] {
+    [ChainEntry {
+        addr: 0,
+        len: 0,
+        writable: false,
+    }; MAX_CHAIN_BUFFERS]
+}
+
+#[test]
+fn a_buffer_running_past_the_window_is_refused_with_its_address() {
+    let (pool, transport) = windowed_transport();
+    let mut queue = VirtQueue::new(&transport, 0, 8, 2, features(VirtioFeatures::empty()))
+        .expect("queue should initialize");
+    // Starts inside the window, so a first-byte translation accepts it.
+    let straddling = pool.straddling_the_window_end(16, 16);
+    let refused = VirtqueueError::Unreachable {
+        address: straddling.as_ptr() as usize,
+        bytes: 32,
+    };
+
+    let mut chain = empty_chain();
+    assert_eq!(
+        build_chain(&transport, &[straddling], None, &mut [], &mut chain),
+        Err(refused)
+    );
+
+    let in_flight = queue.available_descriptors();
+    assert_eq!(
+        queue.submit(&transport, &[straddling], &mut []),
+        Err(IoError::DeviceFault)
+    );
+    assert_eq!(queue.available_descriptors(), in_flight);
+}
+
+#[test]
+fn a_buffer_wholly_inside_the_window_translates_as_before() {
+    let (pool, transport) = windowed_transport();
+    let mut queue = VirtQueue::new(&transport, 0, 8, 2, features(VirtioFeatures::empty()))
+        .expect("queue should initialize");
+    let page = pool.pages(1);
+    let bytes = unsafe { core::slice::from_raw_parts(page.as_ptr(), 4096) };
+
+    let mut chain = empty_chain();
+    let used = build_chain(&transport, &[bytes], None, &mut [], &mut chain)
+        .expect("a page inside the window translates");
+    assert_eq!(used, 1);
+    assert_eq!(chain[0].addr, page.phys_addr());
+    assert_eq!(chain[0].len, 4096);
+    assert!(!chain[0].writable);
+
+    queue
+        .submit(&transport, &[bytes], &mut [])
+        .expect("the same page can be submitted");
 }

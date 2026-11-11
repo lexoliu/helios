@@ -68,6 +68,8 @@ pub enum VirtqueueError {
     Full { needed: usize },
     #[error("virtqueue ring memory could not be allocated")]
     RingAllocation,
+    #[error("{bytes} bytes at {address:#x} are not reachable by the device")]
+    Unreachable { address: usize, bytes: usize },
     #[error("this queue did not negotiate VIRTIO_F_RING_RESET")]
     ResetUnsupported,
     #[error("the device completed descriptor {id}, which is not a chain in flight on this queue")]
@@ -87,7 +89,9 @@ impl From<VirtqueueError> for IoError {
             VirtqueueError::EmptyChain => Self::DeviceFault,
             VirtqueueError::ChainTooLong { .. } => Self::OutOfBounds,
             VirtqueueError::Full { .. } => Self::DeviceFault,
-            VirtqueueError::RingAllocation => Self::DeviceFault,
+            VirtqueueError::RingAllocation | VirtqueueError::Unreachable { .. } => {
+                Self::DeviceFault
+            }
             VirtqueueError::ResetUnsupported => Self::Unsupported,
             VirtqueueError::UnexpectedUsedId { .. }
             | VirtqueueError::SpuriousCompletion
@@ -1105,7 +1109,10 @@ fn foreign_entry<P: DmaPool>(
     Ok(ChainEntry {
         addr: dma
             .device_range(payload.start, payload.bytes)
-            .map_err(|_| VirtqueueError::RingAllocation)?,
+            .map_err(|_| VirtqueueError::Unreachable {
+                address: payload.start as usize,
+                bytes: len as usize,
+            })?,
         len,
         writable: false,
     })
@@ -1117,8 +1124,11 @@ fn entry<P: DmaPool>(dma: &P, buffer: &[u8], writable: bool) -> Result<ChainEntr
     }
     Ok(ChainEntry {
         addr: dma
-            .dma_addr(buffer.as_ptr())
-            .map_err(|_| VirtqueueError::RingAllocation)?,
+            .dma_range(buffer)
+            .map_err(|refused| VirtqueueError::Unreachable {
+                address: refused.address,
+                bytes: refused.bytes,
+            })?,
         len: u32::try_from(buffer.len()).map_err(|_| VirtqueueError::ChainTooLong {
             actual: buffer.len(),
             limit: u32::MAX as usize,

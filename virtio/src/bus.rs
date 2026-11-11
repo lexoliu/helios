@@ -50,11 +50,38 @@ pub enum DmaAddressing {
     Platform,
 }
 
+/// A range of memory a device cannot reach.
+///
+/// Names the buffer that was refused, so a driver bug that submits memory
+/// outside the device's windows is reported with the address instead of as
+/// a generic device fault.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{bytes} bytes at {address:#x} are not reachable by the device")]
+pub struct DmaUnreachable {
+    /// The host address of the first byte of the refused buffer, or the
+    /// physical address of a run named by one.
+    pub address: usize,
+    pub bytes: usize,
+}
+
+impl From<DmaUnreachable> for IoError {
+    fn from(_: DmaUnreachable) -> Self {
+        Self::DeviceFault
+    }
+}
+
 pub trait DmaPool: Send + Sync + 'static {
     type Buffer: DmaBuffer;
 
     fn allocate_zeroed(&self, layout: Layout) -> IoResult<Self::Buffer>;
-    fn dma_addr(&self, ptr: *const u8) -> IoResult<u64>;
+
+    /// The address a device has to issue to reach `buffer`.
+    ///
+    /// The whole slice has to be device-reachable and contiguous in the
+    /// device's address space: a buffer that starts inside what the device
+    /// can reach and runs past its end is refused, not translated by its
+    /// first byte.
+    fn dma_range(&self, buffer: &[u8]) -> Result<u64, DmaUnreachable>;
 
     /// The address a device has to issue to reach `bytes` of physical
     /// memory at `physical`, which this pool did not allocate.
@@ -184,8 +211,8 @@ impl DmaPool for IdentityDmaPool {
         Ok(IdentityDmaBuffer { ptr, layout })
     }
 
-    fn dma_addr(&self, ptr: *const u8) -> IoResult<u64> {
-        Ok(ptr as usize as u64)
+    fn dma_range(&self, buffer: &[u8]) -> Result<u64, DmaUnreachable> {
+        Ok(buffer.as_ptr() as usize as u64)
     }
 
     /// Physical addresses and host addresses are the same thing in this
@@ -221,8 +248,13 @@ impl DmaPool for OffsetDmaPool {
         Ok(physical)
     }
 
-    fn dma_addr(&self, ptr: *const u8) -> IoResult<u64> {
-        self.translate(ptr)
+    /// The offset is linear, so a buffer is contiguous in physical memory
+    /// exactly when it is in the kernel's address space.
+    fn dma_range(&self, buffer: &[u8]) -> Result<u64, DmaUnreachable> {
+        self.translate(buffer.as_ptr()).map_err(|_| DmaUnreachable {
+            address: buffer.as_ptr() as usize,
+            bytes: buffer.len(),
+        })
     }
 
     fn addressing(&self) -> DmaAddressing {
@@ -290,9 +322,17 @@ impl<P: DmaPool> DmaPool for PlatformDmaPool<P> {
         })
     }
 
-    fn dma_addr(&self, ptr: *const u8) -> IoResult<u64> {
-        let physical = self.inner.dma_addr(ptr)?;
-        Ok(self.translation.device_address(physical)?)
+    /// The whole slice has to sit inside one window of the translation.
+    fn dma_range(&self, buffer: &[u8]) -> Result<u64, DmaUnreachable> {
+        let unreachable = DmaUnreachable {
+            address: buffer.as_ptr() as usize,
+            bytes: buffer.len(),
+        };
+        let physical = self.inner.dma_range(buffer)?;
+        let bytes = u64::try_from(buffer.len()).map_err(|_| unreachable)?;
+        self.translation
+            .device_range(physical, bytes)
+            .map_err(|_| unreachable)
     }
 
     fn device_range(&self, physical: u64, bytes: u64) -> IoResult<u64> {
@@ -413,7 +453,9 @@ mod tests {
     use helios_hal::io::IoError;
     use helios_hal::iommu::{DmaTranslation, DmaWindow, IoVirtAddr};
 
-    use super::{DmaAddressing, DmaBuffer, DmaPool, IdentityDmaPool, PlatformDmaPool};
+    use super::{
+        DmaAddressing, DmaBuffer, DmaPool, DmaUnreachable, IdentityDmaPool, PlatformDmaPool,
+    };
 
     /// A platform with no translation unit hands the device physical
     /// addresses and must not ask it to negotiate anything.
@@ -426,9 +468,16 @@ mod tests {
         assert_eq!(pool.addressing(), DmaAddressing::Physical);
         assert_eq!(buffer.phys_addr(), buffer.as_ptr() as usize as u64);
         assert_eq!(
-            pool.dma_addr(buffer.as_ptr()).expect("translation"),
+            pool.dma_range(buffer_bytes(&buffer, 0, 256))
+                .expect("translation"),
             buffer.as_ptr() as usize as u64
         );
+    }
+
+    /// The bytes `offset..offset + len` of `buffer`.
+    fn buffer_bytes<B: DmaBuffer>(buffer: &B, offset: usize, len: usize) -> &[u8] {
+        assert!(offset + len <= buffer.len());
+        unsafe { core::slice::from_raw_parts(buffer.as_ptr().add(offset), len) }
     }
 
     #[test]
@@ -451,13 +500,46 @@ mod tests {
 
         assert_eq!(pool.addressing(), DmaAddressing::Platform);
         assert_eq!(
-            pool.dma_addr(reference.as_ptr()).expect("translation"),
+            pool.dma_range(buffer_bytes(&reference, 0, 16))
+                .expect("translation"),
             0x10_0000_0000
         );
         assert_eq!(
-            pool.dma_addr(unsafe { reference.as_ptr().add(0x40) })
+            pool.dma_range(buffer_bytes(&reference, 0x40, 16))
                 .expect("translation"),
             0x10_0000_0040
+        );
+        assert_eq!(
+            pool.dma_range(buffer_bytes(&reference, 0, 4096))
+                .expect("a slice that fills the window translates"),
+            0x10_0000_0000
+        );
+    }
+
+    /// A slice that starts inside a window and runs past its end used to
+    /// translate by its first byte. It is refused, with the address.
+    #[test]
+    fn a_buffer_straddling_the_end_of_a_window_is_refused() {
+        let layout = Layout::from_size_align(8192, 4096).expect("layout");
+        let reference = IdentityDmaPool
+            .allocate_zeroed(layout)
+            .expect("allocation succeeds");
+        let translation = DmaTranslation::confined()
+            .with_window(DmaWindow {
+                physical_start: reference.phys_addr(),
+                bytes: 4096,
+                iova_start: IoVirtAddr::new(0x10_0000_0000),
+            })
+            .expect("the window fits");
+        let pool = PlatformDmaPool::new(IdentityDmaPool, translation);
+
+        let straddling = buffer_bytes(&reference, 4096 - 16, 32);
+        assert_eq!(
+            pool.dma_range(straddling),
+            Err(DmaUnreachable {
+                address: straddling.as_ptr() as usize,
+                bytes: 32,
+            })
         );
     }
 

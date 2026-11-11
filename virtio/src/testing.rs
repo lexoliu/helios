@@ -18,7 +18,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use helios_hal::io::{IoError, IoResult};
 use spin::Mutex;
 
-use crate::bus::{DeviceBus, DmaAddressing, DmaBuffer, DmaPool, IdentityDmaPool};
+use crate::bus::{DeviceBus, DmaAddressing, DmaBuffer, DmaPool, DmaUnreachable, IdentityDmaPool};
 use crate::transport::{DeviceStatus, DeviceType, InterruptStatus, VirtioTransport};
 
 const REG_MAGIC_VALUE: usize = 0x000;
@@ -543,6 +543,10 @@ pub(crate) const DEVICE_WINDOW_BASE: u64 = 1 << 32;
 /// has been handed out.
 struct WindowArena {
     storage: Vec<u8>,
+    /// Bytes of the storage, from the page-aligned base, the device
+    /// window covers. Storage past it is real memory the device cannot
+    /// reach, which lets a test build a slice that straddles the end.
+    window: usize,
     next: AtomicUsize,
 }
 
@@ -575,12 +579,30 @@ unsafe impl Sync for WindowDmaBuffer {}
 impl WindowDmaPool {
     /// A pool over `size` bytes, page aligned at the start.
     pub(crate) fn new(size: usize) -> Self {
+        Self::with_unmapped_tail(size, 0)
+    }
+
+    /// A pool whose window covers `size` bytes and is followed by
+    /// `tail` bytes of memory the device cannot reach.
+    pub(crate) fn with_unmapped_tail(size: usize, tail: usize) -> Self {
         Self {
             arena: Arc::new(WindowArena {
-                storage: alloc::vec![0; size + PAGE_ALIGNMENT],
+                storage: alloc::vec![0; size + tail + PAGE_ALIGNMENT],
+                window: size,
                 next: AtomicUsize::new(0),
             }),
         }
+    }
+
+    /// A slice of real memory that starts `inside` bytes before the end
+    /// of the window and runs `outside` bytes past it.
+    pub(crate) fn straddling_the_window_end(&self, inside: usize, outside: usize) -> &[u8] {
+        let end = self.arena_base() + self.arena_len();
+        let storage_end = self.arena.storage.as_ptr() as usize + self.arena.storage.len();
+        assert!(inside <= self.arena_len() && end + outside <= storage_end);
+        // SAFETY: the range lies inside `storage`, which the arena owns
+        // for as long as `self` lives.
+        unsafe { core::slice::from_raw_parts((end - inside) as *const u8, inside + outside) }
     }
 
     fn arena_base(&self) -> usize {
@@ -588,7 +610,7 @@ impl WindowDmaPool {
     }
 
     fn arena_len(&self) -> usize {
-        self.arena.storage.len() - (self.arena_base() - self.arena.storage.as_ptr() as usize)
+        self.arena.window
     }
 
     /// A zeroed, page-aligned buffer of `pages` 4 KiB pages.
@@ -626,13 +648,22 @@ impl DmaPool for WindowDmaPool {
         })
     }
 
-    /// Arena memory translates into the window; everything else — a
-    /// request header a driver builds on its stack, say — keeps its host
-    /// address, the way a kernel's linear map would.
-    fn dma_addr(&self, ptr: *const u8) -> IoResult<u64> {
-        let host = ptr as usize;
+    /// Arena memory translates into the window, and a slice that starts
+    /// in the window has to end in it. Everything that starts outside —
+    /// a request header a driver builds on its stack, say — keeps its
+    /// host address, the way a kernel's linear map would.
+    fn dma_range(&self, buffer: &[u8]) -> Result<u64, DmaUnreachable> {
+        let host = buffer.as_ptr() as usize;
         match host.checked_sub(self.arena_base()) {
-            Some(offset) if offset < self.arena_len() => Ok(DEVICE_WINDOW_BASE + offset as u64),
+            Some(offset) if offset < self.arena_len() => {
+                if buffer.len() > self.arena_len() - offset {
+                    return Err(DmaUnreachable {
+                        address: host,
+                        bytes: buffer.len(),
+                    });
+                }
+                Ok(DEVICE_WINDOW_BASE + offset as u64)
+            }
             _ => Ok(host as u64),
         }
     }

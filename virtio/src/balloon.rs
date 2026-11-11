@@ -476,7 +476,7 @@ impl<T: VirtioTransport> VirtioBalloonDevice<T> {
                 return Err(IoError::OutOfBounds);
             }
             for page in range.chunks(BALLOON_PAGE_SIZE) {
-                let address = dma.dma_addr(page.as_ptr())?;
+                let address = dma.dma_range(page)?;
                 if !address.is_multiple_of(BALLOON_PAGE_SIZE as u64) {
                     return Err(IoError::OutOfBounds);
                 }
