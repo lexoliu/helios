@@ -17,8 +17,9 @@ use crate::wasmtime_adapter::wasi::net::ipv6_address_groups;
 use bytes::Bytes;
 
 use crate::{
-    ClockAuthorityRights, DeviceClassRights, DirectoryAuthorityRights, LinkAuthorityRights,
-    NetworkAuthorityRights, ProcessAuthority, ProcessAuthorityError, TerminalAuthorityRights,
+    ClockAuthorityRights, DeviceClassRights, DiagnosticAuthorityRights, DirectoryAuthorityRights,
+    LinkAuthorityRights, NetworkAuthorityRights, ProcessAuthority, ProcessAuthorityError,
+    TerminalAuthorityRights,
 };
 use crate::{
     ComponentCache, ComponentOutputMode, ComponentOutputRoute, ComponentOutputStreamKind,
@@ -891,6 +892,22 @@ macro_rules! impl_authority_conversion {
                             .map_err(map_process_authority_error)?;
                         authority.grant_device_classes(rights);
                     }
+                    $bindings::helios::system::programs::CapabilityGrant::Diagnostics(
+                        diagnostics,
+                    ) => {
+                        let mut rights = DiagnosticAuthorityRights::empty();
+                        for right in diagnostics.rights {
+                            rights |= match right {
+                                $bindings::helios::system::programs::DiagnosticsRight::ObserveMachine => {
+                                    DiagnosticAuthorityRights::OBSERVE_MACHINE
+                                }
+                            };
+                        }
+                        let rights = caller_authority
+                            .derive_diagnostic_rights(rights)
+                            .map_err(map_process_authority_error)?;
+                        authority.grant_diagnostic_rights(rights);
+                    }
                 }
             }
             Ok(authority)
@@ -976,15 +993,15 @@ mod authority_tests {
         require_spawn_authority, tcp_connect_network_rights, udp_bind_network_rights,
     };
     use crate::{
-        ClockAuthorityRights, DeviceClassRights, DirectoryAuthorityRights, DirectoryPreopen,
-        LinkAuthorityRights, NetworkAuthorityRights, ProcessAuthority, ProcessAuthorityRights,
-        TerminalAuthorityRights,
+        ClockAuthorityRights, DeviceClassRights, DiagnosticAuthorityRights,
+        DirectoryAuthorityRights, DirectoryPreopen, LinkAuthorityRights, NetworkAuthorityRights,
+        ProcessAuthority, ProcessAuthorityRights, TerminalAuthorityRights,
     };
 
     use program_wit::programs::{
-        CapabilityGrant, ClockGrant, ClockRight, DeviceClass, DeviceGrant, DirectoryGrant,
-        FilesystemRight, LinkGrant, LinkRight, NetworkGrant, NetworkRight, ProcessGrant,
-        ProcessRight, TerminalGrant, TerminalRight,
+        CapabilityGrant, ClockGrant, ClockRight, DeviceClass, DeviceGrant, DiagnosticsGrant,
+        DiagnosticsRight, DirectoryGrant, FilesystemRight, LinkGrant, LinkRight, NetworkGrant,
+        NetworkRight, ProcessGrant, ProcessRight, TerminalGrant, TerminalRight,
     };
 
     fn directory_grant(
@@ -1023,6 +1040,10 @@ mod authority_tests {
         CapabilityGrant::Device(DeviceGrant { classes })
     }
 
+    fn diagnostics_grant(rights: Vec<DiagnosticsRight>) -> CapabilityGrant {
+        CapabilityGrant::Diagnostics(DiagnosticsGrant { rights })
+    }
+
     #[test]
     fn empty_grants_create_zero_child_authority() {
         let child = build_program_child_authority(&ProcessAuthority::root(), Vec::new())
@@ -1036,7 +1057,60 @@ mod authority_tests {
         assert!(child.link_rights().is_empty());
         assert!(child.device_class_rights().is_empty());
         assert!(child.granted_devices().is_empty());
+        assert!(child.diagnostic_rights().is_empty());
         assert!(child.cwd().is_none());
+    }
+
+    #[test]
+    fn diagnostics_grant_derives_from_caller_authority() {
+        let mut caller = ProcessAuthority::empty();
+        caller.grant_diagnostic_rights(DiagnosticAuthorityRights::OBSERVE_MACHINE);
+
+        let child = build_program_child_authority(
+            &caller,
+            vec![diagnostics_grant(vec![DiagnosticsRight::ObserveMachine])],
+        )
+        .expect("a caller holding the right may hand it on");
+
+        assert_eq!(
+            child.diagnostic_rights(),
+            DiagnosticAuthorityRights::OBSERVE_MACHINE
+        );
+    }
+
+    #[test]
+    fn diagnostics_grant_exceeding_caller_is_refused() {
+        let error = build_program_child_authority(
+            &ProcessAuthority::root(),
+            vec![diagnostics_grant(vec![DiagnosticsRight::ObserveMachine])],
+        )
+        .expect_err("root authority holds no diagnostic right to hand on");
+        assert_eq!(error.kind, crate::ProgramExecErrorKind::PermissionDenied);
+
+        let error = build_program_child_authority(
+            &ProcessAuthority::root(),
+            vec![diagnostics_grant(Vec::new())],
+        )
+        .expect_err("an empty diagnostics grant is a mistake");
+        assert_eq!(error.kind, crate::ProgramExecErrorKind::PermissionDenied);
+    }
+
+    /// The inspector session launches `perf` through the debugger, so the
+    /// debugger holds the right it hands on.
+    #[test]
+    fn debugger_authority_hands_the_observe_right_to_what_it_launches() {
+        let debugger = super::debugger_authority();
+
+        let child = build_program_child_authority(
+            &debugger,
+            vec![diagnostics_grant(vec![DiagnosticsRight::ObserveMachine])],
+        )
+        .expect("the debugger holds the observe right");
+
+        assert_eq!(
+            child.diagnostic_rights(),
+            DiagnosticAuthorityRights::OBSERVE_MACHINE
+        );
     }
 
     #[test]
@@ -1513,7 +1587,9 @@ fn map_process_authority_error(error: ProcessAuthorityError) -> crate::ProgramEx
         | ProcessAuthorityError::DeviceClassGrantExceedsAuthority(_)
         | ProcessAuthorityError::DeviceGrantExceedsAuthority(_)
         | ProcessAuthorityError::DeviceNameTooLong
-        | ProcessAuthorityError::TooManyDeviceGrants => {
+        | ProcessAuthorityError::TooManyDeviceGrants
+        | ProcessAuthorityError::EmptyDiagnosticRights
+        | ProcessAuthorityError::DiagnosticGrantExceedsAuthority(_) => {
             crate::ProgramExecErrorKind::PermissionDenied
         }
     };
@@ -1558,13 +1634,16 @@ where
 }
 
 /// The authority the embedded debugger runs with: everything `root`
-/// grants, plus every device class. The debugger claims no device
-/// itself; it holds the classes because a program can be handed only
-/// what its launcher holds, and the inspector session runs desktop,
-/// input and audio programs through it.
+/// grants, plus every device class and the machine-observation right.
+/// The debugger claims no device itself; it holds the classes because a
+/// program can be handed only what its launcher holds, and the inspector
+/// session runs desktop, input and audio programs through it. It holds
+/// the observation right for the same reason: the inspector session
+/// runs `perf` through it.
 fn debugger_authority() -> ProcessAuthority {
     let mut authority = ProcessAuthority::root();
     authority.grant_device_classes(DeviceClassRights::all());
+    authority.grant_diagnostic_rights(DiagnosticAuthorityRights::OBSERVE_MACHINE);
     authority
 }
 

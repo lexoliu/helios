@@ -399,6 +399,15 @@ fn map_capability_grants_to_host(
                         .collect(),
                 })
             }
+            programs::CapabilityGrant::Diagnostics(grant) => {
+                host_programs::CapabilityGrant::Diagnostics(host_programs::DiagnosticsGrant {
+                    rights: grant
+                        .rights
+                        .into_iter()
+                        .map(map_diagnostics_right_to_host)
+                        .collect(),
+                })
+            }
         })
         .collect()
 }
@@ -466,6 +475,16 @@ fn map_device_class_to_host(class: programs::DeviceClass) -> host_programs::Devi
         programs::DeviceClass::Input => host_programs::DeviceClass::Input,
         programs::DeviceClass::Gpu => host_programs::DeviceClass::Gpu,
         programs::DeviceClass::Audio => host_programs::DeviceClass::Audio,
+    }
+}
+
+fn map_diagnostics_right_to_host(
+    right: programs::DiagnosticsRight,
+) -> host_programs::DiagnosticsRight {
+    match right {
+        programs::DiagnosticsRight::ObserveMachine => {
+            host_programs::DiagnosticsRight::ObserveMachine
+        }
     }
 }
 
