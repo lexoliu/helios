@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use ed25519_dalek::{SecretKey, SigningKey, VerifyingKey};
 use fatfs::{FatType, FileSystem, FormatVolumeOptions, FsOptions};
 use helios_artifact::bootfs::{self, WriteEntry};
-use helios_artifact::{TrailerError, cwasm_target_supports_wasm_simd, sign_payload_with_key};
+use helios_artifact::cwasm_target_supports_wasm_simd;
 use helios_compiler_support::{AotCompileHint, CompileError, precompile_artifact};
 use helios_profdata::{
     FetchedProfile, KERNEL_PROFILE_ARTIFACT, KERNEL_PROFILE_ASSET, KERNEL_PROFILE_WORKFLOW,
@@ -35,75 +35,11 @@ mod boot_kernel;
 #[derive(Debug, thiserror::Error)]
 enum CliError {
     #[error("{0}")]
-    Aot(#[from] AotError),
-    #[error("{0}")]
-    CompilerPlugin(#[from] CompilerPluginError),
-    #[error("{0}")]
     KernelPrebuild(#[from] PrebuildError),
     #[error("{0}")]
     LimineUefiImage(#[from] LimineError),
     #[error("{0}")]
     ProfileFetch(#[from] ProfileFetchError),
-}
-
-/// Why an ahead-of-time compile did not produce a signed artifact.
-#[derive(Debug, thiserror::Error)]
-enum AotError {
-    #[error("{0}")]
-    Key(#[from] KeyError),
-    #[error("failed to read {path}: {source}")]
-    ReadInput {
-        path: String,
-        #[source]
-        source: io::Error,
-    },
-    #[error("{0}")]
-    Compile(#[from] CompileError),
-    #[error("failed to sign AOT payload: {source}")]
-    Sign {
-        #[source]
-        source: TrailerError,
-    },
-    #[error("failed to write {path}: {source}")]
-    WriteOutput {
-        path: String,
-        #[source]
-        source: io::Error,
-    },
-}
-
-/// Why the in-kernel compiler plugin could not be compiled and signed.
-#[derive(Debug, thiserror::Error)]
-enum CompilerPluginError {
-    #[error("{COMPILER_PLUGIN_ROOT_KEY_ENV} is required: {source}")]
-    MissingRootKey {
-        #[source]
-        source: std::env::VarError,
-    },
-    #[error("failed to decode compiler plugin root key: {source}")]
-    DecodeRootKey {
-        #[source]
-        source: hex::FromHexError,
-    },
-    #[error("root key must be 32 bytes, got {len}")]
-    RootKeyLength { len: usize },
-    #[error("failed to read wasm from stdin: {source}")]
-    ReadStdin {
-        #[source]
-        source: io::Error,
-    },
-    #[error("{0}")]
-    Compile(#[from] CompileError),
-    #[error("failed to sign compiler plugin output: {source}")]
-    Sign {
-        #[source]
-        source: TrailerError,
-    },
-    #[error("failed to write signed cwasm to stdout: {source}")]
-    WriteStdout {
-        #[source]
-        source: io::Error,
-    },
 }
 
 /// Why the root signing keypair could not be read or written.
@@ -613,7 +549,6 @@ enum ProfileFetchError {
 }
 
 const COMPILER_PLUGIN_BOOTFS_PATH: &str = "bin/compiler.cwasm";
-const COMPILER_PLUGIN_ROOT_KEY_ENV: &str = "HELIOS_COMPILER_ROOT_KEY_HEX";
 const COMPILER_PLUGIN_SHARED_MEMORY_MAX_BYTES: usize = 512 * 1024 * 1024;
 const LIMINE_IMAGE_BYTES: u64 = 768 * 1024 * 1024;
 const LIMINE_PARTITION_START_LBA: u32 = 2048;
@@ -644,8 +579,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    Aot(AotCommand),
-    CompilerPlugin(CompilerPluginCommand),
     KernelPrebuild(KernelPrebuildCommand),
     LimineUefiImage(LimineUefiImageCommand),
     ProfileFetch(ProfileFetchCommand),
@@ -666,28 +599,6 @@ impl From<Hint> for AotCompileHint {
             Hint::Performance => Self::Performance,
         }
     }
-}
-
-#[derive(Parser)]
-struct AotCommand {
-    #[arg(long)]
-    input: PathBuf,
-    #[arg(long)]
-    output: PathBuf,
-    #[arg(long)]
-    target: String,
-    #[arg(long, default_value = "performance")]
-    hint: Hint,
-    #[arg(long)]
-    root_key: PathBuf,
-}
-
-#[derive(Parser)]
-struct CompilerPluginCommand {
-    #[arg(long)]
-    target: String,
-    #[arg(long, default_value = "performance")]
-    hint: Hint,
 }
 
 #[derive(Parser)]
@@ -849,8 +760,6 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<(), CliError> {
     match cli.command {
-        Commands::Aot(command) => Ok(run_aot(command)?),
-        Commands::CompilerPlugin(command) => Ok(run_compiler_plugin(command)?),
         Commands::KernelPrebuild(command) => {
             Ok(run_kernel_prebuild(command, cli.workspace_root.as_deref())?)
         }
@@ -859,44 +768,6 @@ fn run(cli: Cli) -> Result<(), CliError> {
             Ok(run_profile_fetch(command, cli.workspace_root.as_deref())?)
         }
     }
-}
-
-fn run_aot(command: AotCommand) -> Result<(), AotError> {
-    let root_signing_key = read_signing_key(&command.root_key)?;
-    let wasm = fs::read(&command.input).map_err(|source| AotError::ReadInput {
-        path: command.input.display().to_string(),
-        source,
-    })?;
-    let payload = precompile_artifact(&wasm, &command.target, command.hint.into())?.bytes;
-    let signed = sign_payload_with_key(&payload, &root_signing_key)
-        .map_err(|source| AotError::Sign { source })?;
-    fs::write(&command.output, signed).map_err(|source| AotError::WriteOutput {
-        path: command.output.display().to_string(),
-        source,
-    })?;
-    Ok(())
-}
-
-fn run_compiler_plugin(command: CompilerPluginCommand) -> Result<(), CompilerPluginError> {
-    let root_key_hex = std::env::var(COMPILER_PLUGIN_ROOT_KEY_ENV)
-        .map_err(|source| CompilerPluginError::MissingRootKey { source })?;
-    let root_key_bytes: [u8; 32] = hex::decode(root_key_hex.trim())
-        .map_err(|source| CompilerPluginError::DecodeRootKey { source })?
-        .try_into()
-        .map_err(|bytes: Vec<u8>| CompilerPluginError::RootKeyLength { len: bytes.len() })?;
-    let root_signing_key = SigningKey::from_bytes(&root_key_bytes);
-
-    let mut wasm = Vec::new();
-    io::stdin()
-        .read_to_end(&mut wasm)
-        .map_err(|source| CompilerPluginError::ReadStdin { source })?;
-    let payload = precompile_artifact(&wasm, &command.target, command.hint.into())?.bytes;
-    let signed = sign_payload_with_key(&payload, &root_signing_key)
-        .map_err(|source| CompilerPluginError::Sign { source })?;
-    io::stdout()
-        .write_all(&signed)
-        .map_err(|source| CompilerPluginError::WriteStdout { source })?;
-    Ok(())
 }
 
 fn run_kernel_prebuild(

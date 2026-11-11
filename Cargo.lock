@@ -1732,7 +1732,6 @@ dependencies = [
  "helios-compiler-support",
  "helios-profdata",
  "helios-workspace-root",
- "hex",
  "mbrman",
  "object",
  "rand 0.10.2",
