@@ -248,7 +248,8 @@ the canonical arm64+HVF surface.
 ### Current state in Helios
 
 The host share is 9p. `inspector/src/vm.rs:1928-1941` builds
-`-fsdev local,id=hostfs,path=…,security_model=none,multidevs=remap` and
+`-fsdev local,id=hostfs,path=…,security_model=none,multidevs=remap,readonly=on`
+(without `readonly=on` under `--shared-dir-writable`) and
 attaches it to `virtio-9p-device` (aarch64, riscv64) or `virtio-9p-pci`
 (x86). The guest side is the in-kernel 9p client at
 `kernel/src/host_fs/client.rs`, speaking 9P2000.L behind the

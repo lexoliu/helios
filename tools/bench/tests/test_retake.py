@@ -19,7 +19,7 @@ from helios_bench import runner
 from helios_bench.assemble import assemble_report
 from helios_bench.baseline import Baseline
 from helios_bench.gate import evaluate_paired, gate_report
-from helios_bench.manifest import load_manifest
+from helios_bench.manifest import WasmtimePin, load_manifest
 from helios_bench.render import render_gate
 from helios_bench.report import Report, RunInfo, Side
 from helios_bench.runner import (
@@ -41,6 +41,8 @@ QUIET = {"name": "quickjs-loop", "class": "compute", "headline": True}
 SIDE_SHOW = {"name": "fs-smallfiles", "class": "fs", "headline": False}
 WORKLOADS = [HEADLINE, QUIET, SIDE_SHOW]
 
+BASELINE_FORK = WasmtimePin(repository="lexoliu/wasmtime", revision="2fb47b20" + "0" * 32)
+
 
 def tight(center: float, seed: int):
     return iterations(center, center * 0.02, seed)
@@ -57,7 +59,13 @@ def options(tmp_path) -> RunOptions:
         out_dir=tmp_path / "out",
         advisory=True,
         sides=frozenset({Side.HELIOS, Side.HELIOS_BASELINE}),
-        baseline=Baseline(ref="merge-base", sha="a" * 40, worktree=tmp_path / "worktree"),
+        baseline=Baseline(
+            ref="merge-base",
+            sha="a" * 40,
+            worktree=tmp_path / "worktree",
+            wasmtime=BASELINE_FORK,
+            fork_root="",
+        ),
     )
 
 

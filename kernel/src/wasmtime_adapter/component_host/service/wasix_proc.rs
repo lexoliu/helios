@@ -2203,6 +2203,10 @@ pub(super) fn wasix_proc_spawn_inherited_non_directory_authority(
     authority.grant_terminal_rights(parent.terminal_rights());
     authority.grant_process_rights(parent.process_rights());
     authority.grant_link_rights(parent.link_rights());
+    // Device classes follow the shell to the programs it runs. A named
+    // device does not: it belongs to the driver instance it was granted
+    // to, not to that instance's children.
+    authority.grant_device_classes(parent.device_class_rights());
     authority
 }
 

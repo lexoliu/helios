@@ -197,7 +197,7 @@ impl<T: VirtioTransport> RingOps<T> for PackedRing<T> {
         is_used(self.read_descriptor(self.next_used).flags, self.used_wrap)
     }
 
-    fn pop_used(&mut self) -> Option<(u16, u32)> {
+    fn pop_used(&mut self) -> Result<Option<(u16, u32)>, VirtqueueError> {
         if self.core.features.in_order() {
             self.pop_used_in_order()
         } else {
@@ -282,15 +282,15 @@ impl<T: VirtioTransport> PackedRing<T> {
         }
     }
 
-    fn pop_used_unordered(&mut self) -> Option<(u16, u32)> {
+    fn pop_used_unordered(&mut self) -> Result<Option<(u16, u32)>, VirtqueueError> {
         let descriptor = self.read_descriptor(self.next_used);
         if !is_used(descriptor.flags, self.used_wrap) {
-            return None;
+            return Ok(None);
         }
         fence(Ordering::Acquire);
-        let id = descriptor.id;
+        let id = self.core.complete_head(u32::from(descriptor.id))?;
         self.finish_completion(id);
-        Some((id, descriptor.len))
+        Ok(Some((id, descriptor.len)))
     }
 
     /// VIRTIO_F_IN_ORDER completion (virtio 1.2 §2.8.9).
@@ -301,31 +301,30 @@ impl<T: VirtioTransport> PackedRing<T> {
     /// is unambiguous here: every used descriptor carries the device's
     /// wrap counter, so the driver knows exactly one entry was written
     /// and expands it back into the chains it submitted before that id.
-    fn pop_used_in_order(&mut self) -> Option<(u16, u32)> {
+    fn pop_used_in_order(&mut self) -> Result<Option<(u16, u32)>, VirtqueueError> {
         if self.core.batch.remaining == 0 {
             let descriptor = self.read_descriptor(self.next_used);
             if !is_used(descriptor.flags, self.used_wrap) {
-                return None;
+                return Ok(None);
             }
             fence(Ordering::Acquire);
             self.core
-                .begin_in_order_batch(descriptor.id, descriptor.len);
+                .begin_in_order_batch(u32::from(descriptor.id), descriptor.len)?;
         }
 
         let (id, len) = self.core.next_in_order_completion();
+        let id = self.core.complete_head(u32::from(id))?;
         self.finish_completion(id);
-        Some((id, len))
+        Ok(Some((id, len)))
     }
 
+    /// `id` has already been taken out of the in-flight set, so it is a
+    /// chain this driver submitted and `slots` holds its ring positions.
     fn finish_completion(&mut self, id: u16) {
-        assert!(
-            usize::from(id) < self.slots.len(),
-            "virtio device completed unknown buffer id {id}"
-        );
         let occupied = self.slots[usize::from(id)];
-        assert!(
+        debug_assert!(
             occupied != 0,
-            "virtio device completed buffer id {id}, which was not in flight"
+            "in-flight buffer id {id} occupies no ring position"
         );
         self.slots[usize::from(id)] = 0;
         self.free_slots += occupied;

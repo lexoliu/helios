@@ -1726,6 +1726,7 @@ pub static AARCH64_SWAP_HOOKS: SwapVmHooks = SwapVmHooks {
     scan_committed_pages: hook_scan_committed_pages,
     owned_resident_bytes: hook_owned_resident_bytes,
     drain_orphaned_swap_tokens: hook_drain_orphaned_swap_tokens,
+    now_ticks: crate::read_counter,
 };
 
 /// The arena's address-space surface for this backend.
