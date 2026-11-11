@@ -157,11 +157,6 @@ enum PrebuildError {
         #[source]
         source: io::Error,
     },
-    #[error("failed to sign init AOT payload: {source}")]
-    SignInit {
-        #[source]
-        source: TrailerError,
-    },
     #[error("failed to write {path}: {source}")]
     Write {
         path: String,
@@ -326,14 +321,6 @@ enum BootfsError {
         path: String,
         #[source]
         source: io::Error,
-    },
-    #[error("failed to sign {payload} AOT payload: {source}")]
-    Sign {
-        /// Which payload was being signed, spelled the way the message
-        /// reads it.
-        payload: String,
-        #[source]
-        source: TrailerError,
     },
     #[error("failed to write {path}: {source}")]
     Write {
@@ -819,14 +806,12 @@ struct ExternalBootArtifact {
 /// The inputs every bootfs asset build shares.
 ///
 /// They travel together because each asset is compiled by the same cargo, for
-/// the same profile and target, signed by the same root key, and resolved
-/// against the same checkout.
+/// the same profile and target, and resolved against the same checkout.
 struct BootBuild<'a> {
     cargo: &'a Path,
     profile: &'a str,
     out_dir: &'a Path,
     target: &'a str,
-    root_signing_key: &'a SigningKey,
     workspace_root: &'a WorkspaceRoot,
 }
 
@@ -944,9 +929,7 @@ fn run_kernel_prebuild(
         Hint::Performance.into(),
     )?
     .bytes;
-    let init_signed = sign_payload_with_key(&init_payload, &root_signing_key)
-        .map_err(|source| PrebuildError::SignInit { source })?;
-    fs::write(&init_cwasm, init_signed).map_err(|source| PrebuildError::Write {
+    fs::write(&init_cwasm, init_payload).map_err(|source| PrebuildError::Write {
         path: init_cwasm.display().to_string(),
         source,
     })?;
@@ -956,7 +939,6 @@ fn run_kernel_prebuild(
         profile: &command.profile,
         out_dir: &command.out_dir,
         target: &command.target,
-        root_signing_key: &root_signing_key,
         workspace_root: &workspace_root,
     };
     let mut bootfs_assets = Vec::new();
@@ -976,6 +958,7 @@ fn run_kernel_prebuild(
         &bootfs_assets,
         &init_cwasm,
         &command.init_argv0,
+        &root_signing_key,
     )?;
 
     let resolve = |path: &Path| {
@@ -1018,6 +1001,7 @@ fn write_bootfs_image(
     assets: &[BootAsset],
     init_component: &Path,
     init_argv0: &str,
+    signing_key: &SigningKey,
 ) -> Result<(), PrebuildError> {
     let mut directories = Vec::new();
     let mut files = Vec::new();
@@ -1119,7 +1103,8 @@ fn write_bootfs_image(
         modified_nanos: 0,
     });
 
-    fs::write(image_path, bootfs::write_image(&entries)).map_err(|source| PrebuildError::Write {
+    let signed = bootfs::sign_image(bootfs::write_image(&entries), signing_key);
+    fs::write(image_path, signed).map_err(|source| PrebuildError::Write {
         path: image_path.display().to_string(),
         source,
     })
@@ -1525,14 +1510,8 @@ fn build_compiler_plugin_asset(build: &BootBuild<'_>) -> Result<BootAsset, Bootf
         source,
     })?;
     let payload = precompile_artifact(&wasm, build.target, Hint::Performance.into())?.bytes;
-    let signed = sign_payload_with_key(&payload, build.root_signing_key).map_err(|source| {
-        BootfsError::Sign {
-            payload: "compiler plugin".to_owned(),
-            source,
-        }
-    })?;
     let output_path = build.out_dir.join("compiler_plugin.cwasm");
-    write_bootfs_artifact(&output_path, signed)?;
+    write_bootfs_artifact(&output_path, payload)?;
 
     Ok(BootAsset {
         path: COMPILER_PLUGIN_BOOTFS_PATH.to_owned(),
@@ -1541,7 +1520,8 @@ fn build_compiler_plugin_asset(build: &BootBuild<'_>) -> Result<BootAsset, Bootf
     })
 }
 
-/// Writes one signed bootfs artifact to `path`.
+/// Writes one bare Wasmtime bootfs artifact to `path`; the image's own
+/// footer is what signs it.
 fn write_bootfs_artifact(path: &Path, bytes: Vec<u8>) -> Result<(), BootfsError> {
     fs::write(path, bytes).map_err(|source| BootfsError::Write {
         path: path.display().to_string(),
@@ -1828,16 +1808,10 @@ fn build_boot_program_asset(
     let component_bytes = encode_component(&wasm_path)?;
     let payload =
         precompile_artifact(&component_bytes, build.target, Hint::Performance.into())?.bytes;
-    let signed = sign_payload_with_key(&payload, build.root_signing_key).map_err(|source| {
-        BootfsError::Sign {
-            payload: "bootfs".to_owned(),
-            source,
-        }
-    })?;
     let output_path = build
         .out_dir
         .join(format!("{}_bootfs_component.cwasm", manifest.command));
-    write_bootfs_artifact(&output_path, signed)?;
+    write_bootfs_artifact(&output_path, payload)?;
 
     Ok(BootAsset {
         path: format!("bin/{}", manifest.command),
@@ -1856,16 +1830,10 @@ fn build_external_boot_artifact_assets(
         source: error,
     })?;
     let payload = precompile_artifact(&wasm, build.target, Hint::Performance.into())?.bytes;
-    let signed = sign_payload_with_key(&payload, build.root_signing_key).map_err(|source| {
-        BootfsError::Sign {
-            payload: format!("external bootfs {}", artifact.command),
-            source,
-        }
-    })?;
     let output_path = build
         .out_dir
         .join(format!("{}_bootfs_component.cwasm", artifact.command));
-    write_bootfs_artifact(&output_path, signed)?;
+    write_bootfs_artifact(&output_path, payload)?;
 
     let mut assets = vec![BootAsset {
         path: artifact.bootfs_path,
