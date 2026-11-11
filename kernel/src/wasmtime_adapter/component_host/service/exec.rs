@@ -60,7 +60,7 @@ where
     pub(super) env: Vec<(String, String)>,
     pub(super) executable: ProgramExecutable<CpuImpl, Net, HostFs>,
     pub(super) authority: ProcessAuthority,
-    pub(super) filesystem: Option<MemoryFs>,
+    pub(super) filesystem: Option<Namespace<HostFs>>,
     pub(super) descriptors: Option<Preview1DescriptorTable<Net>>,
     pub(super) signal_state: WasixSignalState,
     pub(super) signal_dispositions: Vec<WasixSignalDisposition>,
@@ -181,7 +181,12 @@ where
         .expect("a boot artifact is named by an absolute guest path");
     let path = helios_hal::fs::FsPath::new(inside)
         .expect("a boot artifact path is a normalized filesystem path");
-    runtime_state.mounts().boot().file_contents(path).ok()
+    runtime_state
+        .root_namespace()
+        .table()
+        .boot()
+        .file_contents(path)
+        .ok()
 }
 
 impl<Net: ComponentHostNetwork> WasixAsyncifyState<Net> {
@@ -202,7 +207,7 @@ pub(super) async fn run_program_executable<CpuImpl, Net, HostFs>(
     argv: ProgramArgv,
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
-    filesystem: Option<MemoryFs>,
+    filesystem: Option<Namespace<HostFs>>,
     descriptors: Option<Preview1DescriptorTable<Net>>,
     signal_state: WasixSignalState,
     signal_dispositions: Vec<WasixSignalDisposition>,
@@ -307,7 +312,7 @@ pub(super) async fn run_program_core_module<CpuImpl, Net, HostFs>(
     argv: ProgramArgv,
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
-    filesystem: Option<MemoryFs>,
+    filesystem: Option<Namespace<HostFs>>,
     descriptors: Option<Preview1DescriptorTable<Net>>,
     signal_state: WasixSignalState,
     signal_dispositions: Vec<WasixSignalDisposition>,
@@ -561,7 +566,7 @@ pub(super) async fn run_program_core_module_with_restore<CpuImpl, Net, HostFs>(
     argv: ProgramArgv,
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
-    filesystem: Option<MemoryFs>,
+    filesystem: Option<Namespace<HostFs>>,
     signal_state: WasixSignalState,
     spawner: crate::InstanceSpawner<CpuImpl>,
     progress: helios_hal::watchdog::ProgressCounter,
@@ -988,7 +993,7 @@ pub(super) async fn run_program_component<CpuImpl, Net, HostFs>(
     argv: ProgramArgv,
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
-    filesystem: Option<MemoryFs>,
+    filesystem: Option<Namespace<HostFs>>,
     _signal_state: WasixSignalState,
     spawner: crate::InstanceSpawner<CpuImpl>,
     progress: helios_hal::watchdog::ProgressCounter,
@@ -1024,10 +1029,8 @@ where
     let store_prepare_started = profile_runtime_state
         .profiling_enabled()
         .then(|| profile_cpu.now().ticks());
-    let filesystem = match filesystem {
-        Some(snapshot) => Namespace::sharing(exec_context.runtime_state.mounts(), snapshot),
-        None => Namespace::new(exec_context.runtime_state.mounts()),
-    };
+    let filesystem =
+        filesystem.unwrap_or_else(|| exec_context.runtime_state.root_namespace().descend());
     let (mut store, interrupts) = crate::wasmtime_adapter::store_with_state(
         engine,
         StoreData::<CpuImpl, Net, HostFs>::new(
@@ -1731,7 +1734,7 @@ where
             argv,
             environment,
             store.data().authority.clone(),
-            Some(store.data().filesystem.root_layer()),
+            Some(store.data().filesystem.clone()),
         ),
         output_mode,
         ChildStdio {

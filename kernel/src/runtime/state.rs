@@ -9,7 +9,7 @@ use crate::{
     BOOT_DEVICE, BootFs, BootPayload, DEFAULT_PERF_METRIC_CAPACITY, DEFAULT_PROFILE_STACK_CAPACITY,
     DEFAULT_TRACE_HISTORY_CAPACITY, EmbeddedComponent, FoldedProfileSample, FutexKey, FutexTable,
     FutexWaitRegistration, HEAP_SIZE_CLASS_COUNT, HOST_SHARE_GUEST_MOUNT_PATH, HeapStats,
-    HostShare, InstanceRegistry, InstructionSampler, MountTable, MountedFs, Notify,
+    HostShare, InstanceRegistry, InstructionSampler, MountTable, MountedFs, Namespace, Notify,
     PerfMetricFilter, PerfMetricHistory, PerfMetricSample, PerfSample, ProfileFilter, ProfileScope,
     ProfileSink, StatsSample, TraceEvent, TraceFilter, TraceHistory,
 };
@@ -112,10 +112,11 @@ struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     /// `argv0`, and the boot filesystem it carries — parsed from the
     /// boot module at bring-up.
     payload: BootPayload,
-    /// Which filesystem owns each guest path. Its root is the payload's
-    /// boot filesystem; the host share joins it once a backend installs
+    /// The root namespace: the kernel's own process tree, which every
+    /// program's tree descends from. Its root is the payload's boot
+    /// filesystem; the host share joins its table once a backend installs
     /// the 9p client.
-    mounts: MountTable<HostFsService>,
+    namespace: Namespace<HostFsService>,
     tracing: Mutex<TraceHistory>,
     /// The profile and perf histories, held as a handle rather than as
     /// fields so a subsystem this state owns can record into them
@@ -352,7 +353,10 @@ where
                 vsock_service: Once::new(),
                 futex_table: Mutex::new(FutexTable::new()),
                 payload,
-                mounts: MountTable::new(BootFs::new(payload.bootfs(), BOOT_DEVICE)),
+                namespace: Namespace::new(MountTable::new(BootFs::new(
+                    payload.bootfs(),
+                    BOOT_DEVICE,
+                ))),
                 tracing: Mutex::new(TraceHistory::new(DEFAULT_TRACE_HISTORY_CAPACITY)),
                 profiles: ProfileSink::new(
                     DEFAULT_PROFILE_STACK_CAPACITY,
@@ -960,7 +964,8 @@ where
         );
         *slot = Some(service.clone());
         self.inner
-            .mounts
+            .namespace
+            .table()
             .mount(
                 HOST_SHARE_GUEST_MOUNT_PATH,
                 MountedFs::Host(HostShare::new(service)),
@@ -969,9 +974,10 @@ where
             .unwrap_or_else(|error| panic!("host share mount failed at bring-up: {error}"));
     }
 
-    /// The kernel's mount table.
-    pub fn mounts(&self) -> MountTable<HostFsService> {
-        self.inner.mounts.clone()
+    /// The root namespace. A program the kernel launches runs in a tree
+    /// that descends from it ([`Namespace::descend`]).
+    pub fn root_namespace(&self) -> &Namespace<HostFsService> {
+        &self.inner.namespace
     }
 
     pub fn host_fs_service(&self) -> Option<HostFsService> {

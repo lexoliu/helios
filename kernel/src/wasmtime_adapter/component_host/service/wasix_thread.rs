@@ -348,7 +348,7 @@ where
     let output_mode = caller.data().output_mode.clone();
     let read_serial = caller.data().read_serial;
     let write_serial = caller.data().write_serial;
-    let filesystem = caller.data().filesystem.root_layer();
+    let filesystem = caller.data().filesystem.clone();
     let descriptors = caller.data().descriptors.clone();
     let signal_state = caller.data().signal_state.clone();
     let wasix_abi = caller.data().wasix_abi;

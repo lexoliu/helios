@@ -1041,7 +1041,6 @@ pub(crate) mod test_store {
     use triomphe::Arc;
     use wasmtime::component::ResourceTable;
 
-    use crate::Namespace;
     use crate::component::{ComponentOutputMode, ComponentStoreData};
     use crate::gpu::Gpu3dService;
     use crate::test_support::{TestCpu, TestNetworkService};
@@ -1157,7 +1156,7 @@ pub(crate) mod test_store {
             registry,
             instance,
             None,
-            Namespace::new(runtime_state.mounts()),
+            runtime_state.root_namespace().descend(),
             Vec::new(),
             Vec::new(),
             authority,

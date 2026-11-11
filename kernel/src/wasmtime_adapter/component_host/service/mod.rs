@@ -192,11 +192,15 @@ where
 /// Distinct from [`ProgramExecContext`], which is the host the program
 /// runs *in*, and from [`ChildStdio`], which is how the caller talks to
 /// it once it is running.
-pub(super) struct ProgramLaunch<Net: ComponentHostNetwork> {
+pub(super) struct ProgramLaunch<Net: ComponentHostNetwork, HostFs: crate::HostFileSystem> {
     argv: ProgramArgv,
     env: LaunchEnvironment,
     authority: ProcessAuthority,
-    filesystem: Option<MemoryFs>,
+    /// The namespace the program runs in: the launcher's own tree when it
+    /// shares it, or a tree descending from the launcher's. `None` for a
+    /// program the kernel launches, which runs in a tree descending from
+    /// the root namespace.
+    filesystem: Option<Namespace<HostFs>>,
     /// Inherited preview1 descriptors. Only core modules have a
     /// descriptor table; a component ignores one.
     descriptors: Option<Preview1DescriptorTable<Net>>,
@@ -207,7 +211,7 @@ pub(super) struct ProgramLaunch<Net: ComponentHostNetwork> {
     timeline: phases::Timeline,
 }
 
-impl<Net: ComponentHostNetwork> ProgramLaunch<Net> {
+impl<Net: ComponentHostNetwork, HostFs: crate::HostFileSystem> ProgramLaunch<Net, HostFs> {
     /// A launch that inherits nothing: no descriptors, no signal
     /// dispositions. `env` is the caller's environment; the kernel owns
     /// `HELIOS_PROCESS_ID` and replaces any entry for it (see
@@ -216,7 +220,7 @@ impl<Net: ComponentHostNetwork> ProgramLaunch<Net> {
         argv: ProgramArgv,
         env: Vec<(String, String)>,
         authority: ProcessAuthority,
-        filesystem: Option<MemoryFs>,
+        filesystem: Option<Namespace<HostFs>>,
     ) -> Self {
         Self {
             argv,
@@ -328,11 +332,11 @@ struct ProgramComponent {
     _code: CodeRegistration,
 }
 
-struct ProgramSpawnRequest<Net: ComponentHostNetwork> {
+struct ProgramSpawnRequest<Net: ComponentHostNetwork, HostFs: crate::HostFileSystem> {
     argv: ProgramArgv,
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
-    filesystem: Option<MemoryFs>,
+    filesystem: Option<Namespace<HostFs>>,
     descriptors: Option<Preview1DescriptorTable<Net>>,
     signal_state: WasixSignalState,
     signal_dispositions: Vec<WasixSignalDisposition>,
@@ -1216,7 +1220,7 @@ where
         exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
         source: ProgramSource,
         hint: Option<AotCompileHint>,
-        launch: ProgramLaunch<Net>,
+        launch: ProgramLaunch<Net, HostFs>,
     ) -> Result<ChildHandle, ProgramExecError> {
         super::emit_program_stage_marker(exec_context.write_serial, "program:spawn-begin");
         let executable = self
@@ -1242,7 +1246,7 @@ where
         exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
         source: ProgramSource,
         hint: Option<AotCompileHint>,
-        mut launch: ProgramLaunch<Net>,
+        mut launch: ProgramLaunch<Net, HostFs>,
         output_mode: OutputMode,
         stdio: ChildStdio,
     ) -> Result<ChildHandle, ProgramExecError> {
@@ -1267,7 +1271,7 @@ where
         &self,
         exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
         executable: ProgramExecutable<CpuImpl, Net, HostFs>,
-        launch: ProgramLaunch<Net>,
+        launch: ProgramLaunch<Net, HostFs>,
     ) -> Result<ChildHandle, ProgramExecError> {
         let (stdin_writer, stdin_reader) = crate::byte_channel();
         let (stdout_writer, stdout_reader) = crate::byte_channel();
@@ -1293,7 +1297,7 @@ where
         &self,
         exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
         executable: ProgramExecutable<CpuImpl, Net, HostFs>,
-        launch: ProgramLaunch<Net>,
+        launch: ProgramLaunch<Net, HostFs>,
         output_mode: OutputMode,
         stdio: ChildStdio,
     ) -> Result<ChildHandle, ProgramExecError> {
@@ -1405,7 +1409,7 @@ where
         source: ProgramSource,
         hint: Option<AotCompileHint>,
         stdin: Vec<u8>,
-        launch: ProgramLaunch<Net>,
+        launch: ProgramLaunch<Net, HostFs>,
     ) -> Result<ExecResult, ProgramExecError> {
         self.exec_buffered_with_snapshot(exec_context, source, hint, stdin, launch)
             .await
@@ -1418,7 +1422,7 @@ where
         source: ProgramSource,
         hint: Option<AotCompileHint>,
         stdin: Vec<u8>,
-        launch: ProgramLaunch<Net>,
+        launch: ProgramLaunch<Net, HostFs>,
     ) -> Result<(ExecResult, Option<MemoryFs>), ProgramExecError> {
         let executable = self
             .load_executable(
@@ -1439,7 +1443,7 @@ where
         exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
         executable: ProgramExecutable<CpuImpl, Net, HostFs>,
         stdin: Vec<u8>,
-        launch: ProgramLaunch<Net>,
+        launch: ProgramLaunch<Net, HostFs>,
     ) -> Result<(ExecResult, Option<MemoryFs>), ProgramExecError> {
         let mut child = self.spawn_loaded(exec_context, executable, launch)?;
 

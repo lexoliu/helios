@@ -305,21 +305,68 @@ fn the_table_refuses_a_mount_past_its_capacity() {
     );
 }
 
-#[test]
-fn namespaces_share_mounts_but_not_root_layers() {
-    let first = namespace();
-    let second = Namespace::new(first.table().clone());
-    let child = Namespace::sharing(first.table().clone(), first.root_layer());
-    mount_memory(&first, "/mnt");
-    create(&first, "/mnt/shared", b"everyone");
-    create(&first, "/private", b"one tree");
+fn unmount_cap(point: &str) -> crate::UnmountCap {
+    ProcessAuthority::root()
+        .derive_unmount_cap(point)
+        .expect("root may unmount anywhere")
+}
 
-    assert_eq!(read(&second, "/mnt/shared"), b"everyone");
+#[test]
+fn a_mount_belongs_to_its_tree_and_the_trees_below_it() {
+    let root = namespace();
+    let tree = root.descend();
+    let same_tree = tree.clone();
+    let below = tree.descend();
+    let other = root.descend();
+    mount_memory(&root, "/mnt");
+    create(&root, "/mnt/kernel", "日本語".as_bytes());
+    mount_memory(&tree, "/scratch");
+    create(&tree, "/scratch/tree", "한국어".as_bytes());
+
+    // The root namespace's mount reaches every tree below it.
+    for namespace in [&tree, &same_tree, &below, &other] {
+        assert_eq!(read(namespace, "/mnt/kernel"), "日本語".as_bytes());
+    }
+    // A tree's own mount reaches the tree and its descendants only.
+    for namespace in [&same_tree, &below] {
+        assert_eq!(read(namespace, "/scratch/tree"), "한국어".as_bytes());
+    }
+    for namespace in [&root, &other] {
+        assert_eq!(owner(namespace, "/scratch/tree").0, "/");
+        assert_eq!(
+            block_on(namespace.stat("/scratch/tree", Follow::No)).map(drop),
+            Err(FsError::NoEntry)
+        );
+    }
+    // Only the tree that made a mount removes it.
+    for namespace in [&root, &other, &below] {
+        assert_eq!(
+            block_on(namespace.unmount(&unmount_cap("/scratch"))),
+            Err(MountError::NotMounted("/scratch".into()))
+        );
+    }
     assert_eq!(
-        block_on(second.stat("/private", Follow::No)).map(drop),
-        Err(FsError::NoEntry)
+        block_on(tree.unmount(&unmount_cap("/mnt"))),
+        Err(MountError::NotMounted("/mnt".into()))
     );
-    assert_eq!(read(&child, "/private"), b"one tree");
+    block_on(same_tree.unmount(&unmount_cap("/scratch"))).expect("the tree unmounts its own");
+    assert_eq!(owner(&below, "/scratch/tree").0, "/");
+}
+
+#[test]
+fn a_tree_shares_its_root_layer_and_a_descendant_starts_its_own() {
+    let root = namespace();
+    let tree = root.descend();
+    let same_tree = tree.clone();
+    let below = tree.descend();
+    create(&tree, "/private", b"one tree");
+    assert_eq!(read(&same_tree, "/private"), b"one tree");
+    for namespace in [&root, &below] {
+        assert_eq!(
+            block_on(namespace.stat("/private", Follow::No)).map(drop),
+            Err(FsError::NoEntry)
+        );
+    }
 }
 
 #[test]

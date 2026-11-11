@@ -1850,7 +1850,7 @@ where
     let exec_context = caller.data().exec_context();
     let authority = caller.data().authority.clone();
     let descriptors = caller.data().descriptors.clone_for_exec();
-    let filesystem = Some(caller.data().filesystem.root_layer());
+    let filesystem = Some(caller.data().filesystem.clone());
     let signal_state = caller.data().signal_state.clone();
     let signal_dispositions = caller.data().signal_dispositions.clone();
     let write_serial = caller.data().write_serial;
@@ -3418,7 +3418,7 @@ where
     let service = runtime_state.wait_for_program_service().await;
     let exec_context = caller.data().exec_context();
     let authority = authority.unwrap_or_else(|| caller.data().authority.clone());
-    let filesystem = Some(caller.data().filesystem.root_layer());
+    let filesystem = Some(caller.data().filesystem.clone());
     let launch_started = p1_kernel_profile_start(caller.data());
     let mut child = service
         .spawn_with_output_mode(

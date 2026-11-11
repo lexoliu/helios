@@ -409,10 +409,14 @@ macro_rules! impl_program_bindings {
                         ProgramExecContext::from_store(access.get()),
                         access.get().process_authority().clone(),
                         access.get().cpu.clone(),
+                        // The child starts a tree of its own below the
+                        // caller's: it sees the caller's mounts, and its
+                        // own stay its own.
+                        access.get().filesystem().descend(),
                     ))
                 });
                 async move {
-                    let (service, context, caller_authority, cpu) = snapshot?;
+                    let (service, context, caller_authority, cpu, namespace) = snapshot?;
                     let mut launch = phases::Trace::begin(cpu, "spawn", &request.path);
                     let Some(service) = service else {
                         launch.refused(ProgramExecErrorKind::Unavailable);
@@ -461,7 +465,7 @@ macro_rules! impl_program_bindings {
                                 ProgramArgv::launched(request.name, request.args),
                                 request.env,
                                 child_authority,
-                                None,
+                                Some(namespace),
                             )
                             .with_timeline(launch.timeline().for_task()),
                         )
@@ -509,10 +513,14 @@ macro_rules! impl_program_bindings {
                         ProgramExecContext::from_store(access.get()),
                         access.get().process_authority().clone(),
                         access.get().cpu.clone(),
+                        // The child starts a tree of its own below the
+                        // caller's: it sees the caller's mounts, and its
+                        // own stay its own.
+                        access.get().filesystem().descend(),
                     ))
                 });
                 async move {
-                    let (service, context, caller_authority, cpu) = snapshot?;
+                    let (service, context, caller_authority, cpu, namespace) = snapshot?;
                     let launch = phases::Trace::begin(cpu, "exec", &request.path);
                     let Some(service) = service else {
                         launch.refused(ProgramExecErrorKind::Unavailable);
@@ -574,7 +582,7 @@ macro_rules! impl_program_bindings {
                                 ProgramArgv::launched(request.name, request.args),
                                 request.env,
                                 child_authority,
-                                None,
+                                Some(namespace),
                             )
                             .with_timeline(launch.timeline().clone()),
                         )

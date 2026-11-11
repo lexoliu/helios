@@ -256,7 +256,7 @@ where
             exec_context.instance_registry.clone(),
             instance,
             None,
-            Namespace::new(exec_context.runtime_state.mounts()),
+            exec_context.runtime_state.root_namespace().descend(),
             alloc::vec![String::from(COMPOSITOR_PLUGIN_PATH)],
             Vec::new(),
             compositor_authority(),

@@ -244,7 +244,9 @@ where
 
         let linker = component_linker(&engine.engine, binding_set, &compiled.component)?;
 
-        let filesystem = crate::Namespace::new(context.host_filesystem_state.mounts());
+        // A system component is kernel-launched: its tree descends from
+        // the root namespace and sees the kernel's mounts.
+        let filesystem = context.host_filesystem_state.root_namespace().descend();
         let debug_port = if context.has_debug_port {
             Some(())
         } else {

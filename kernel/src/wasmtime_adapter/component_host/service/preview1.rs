@@ -78,7 +78,7 @@ where
         read_serial: crate::SerialReader,
         write_serial: crate::DebugSerialWriter,
         imported_memory: Option<SharedMemory>,
-        filesystem: Option<MemoryFs>,
+        filesystem: Option<Namespace<HostFs>>,
         descriptors: Option<Preview1DescriptorTable<Net>>,
         signal_state: WasixSignalState,
         thread_signals: WasixSignalState,
@@ -87,10 +87,7 @@ where
         wasix_abi: bool,
         threads: WasixImageThreads<CpuImpl, Net, HostFs>,
     ) -> Self {
-        let filesystem = filesystem.map_or_else(
-            || Namespace::new(runtime_state.mounts()),
-            |snapshot| Namespace::sharing(runtime_state.mounts(), snapshot),
-        );
+        let filesystem = filesystem.unwrap_or_else(|| runtime_state.root_namespace().descend());
         let entropy = crate::EntropyPool::derive(runtime_state.root_entropy(), instance.id().raw());
         let descriptors =
             descriptors.unwrap_or_else(|| Preview1DescriptorTable::from_authority(&authority));
