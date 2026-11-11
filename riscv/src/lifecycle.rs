@@ -40,7 +40,7 @@ use core::arch::{asm, global_asm};
 use core::mem::offset_of;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use helios_hal::ProcessorId;
+use helios_hal::cpu::ProcessorId;
 
 use super::{
     _hart_restart, MAX_TRACKED_HARTS, ONLINE_HARTS, hart_bit, hart_status,

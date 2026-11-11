@@ -391,9 +391,9 @@ fn translate(virtual_address: usize) -> u64 {
 /// # Safety
 ///
 /// The caller is the only writer of `context`, and interrupts are masked.
-unsafe fn prepare_context(context: *mut UnsafeCell<ResumeContext>, psci: Psci) {
+unsafe fn prepare_context(context: *mut ResumeContext, psci: Psci) {
     // SAFETY: the caller owns the context.
-    let context = unsafe { &mut *UnsafeCell::raw_get(context) };
+    let context = unsafe { &mut *context };
     let entry_virtual = &raw const __helios_aarch64_cpu_resume as usize;
     let entry_end = &raw const __helios_aarch64_cpu_resume_end as usize;
     let entry_physical = translate(entry_virtual);
@@ -498,7 +498,7 @@ unsafe extern "C" fn power_off(context: *const ResumeContext) -> u64 {
 /// `context` is the calling processor's prepared context.
 #[unsafe(naked)]
 unsafe extern "C" fn save_and_power_off(
-    context: *mut UnsafeCell<ResumeContext>,
+    context: *mut ResumeContext,
     power_off: unsafe extern "C" fn(*const ResumeContext) -> u64,
 ) -> u64 {
     naked_asm!(
