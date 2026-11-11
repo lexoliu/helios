@@ -47,6 +47,7 @@ use triomphe::Arc;
 
 use crate::component::{ProviderError, ProviderSender};
 use crate::exec::{Notify, NotifyWaiter};
+use crate::process::InputClaimCap;
 
 use super::{InputServiceError, MAX_CLAIMED_DEVICES};
 
@@ -298,7 +299,10 @@ impl InputService {
     /// owner's stream starts from the reports that follow. A report the
     /// device was publishing at that instant may still reach it, which
     /// is the input the user was giving as the claim was taken.
-    pub fn claim(&self, name: &str) -> Result<InputClaim, InputServiceError> {
+    ///
+    /// `_cap` is the proof that the caller's authority names the input
+    /// class; the check happened where the cap was derived.
+    pub fn claim(&self, name: &str, _cap: InputClaimCap) -> Result<InputClaim, InputServiceError> {
         if self.devices.is_empty() {
             return Err(InputServiceError::Unavailable);
         }

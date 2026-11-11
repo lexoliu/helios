@@ -9,7 +9,7 @@ from pathlib import Path
 
 from helios_bench import REPO_ROOT
 from helios_bench.artifacts import RUNS_DIR, committed_reports, fetch_reports, run_dir
-from helios_bench.baseline import MERGE_BASE
+from helios_bench.baseline import MERGE_BASE, fork_root, pinned_wasmtime
 from helios_bench.baseline import resolve as resolve_baseline
 from helios_bench.gate import gate_report
 from helios_bench.manifest import host_deviations, load_manifest
@@ -102,6 +102,12 @@ def command_lanes(args: argparse.Namespace) -> int:
     else:
         for lane in lanes:
             print(lane.name)
+    return 0
+
+
+def command_baseline_fork(args: argparse.Namespace) -> int:
+    pin = pinned_wasmtime(args.sha)
+    print(json.dumps({"root": fork_root(pin), "repository": pin.repository, "revision": pin.revision}))
     return 0
 
 
@@ -334,6 +340,16 @@ def build_parser() -> argparse.ArgumentParser:
     lanes.add_argument("--select", default="all", help="a lane name, or all")
     lanes.add_argument("--format", choices=["names", "github-matrix"], default="names")
     lanes.set_defaults(func=command_lanes)
+
+    baseline_fork = subcommands.add_parser(
+        "baseline-fork",
+        help=(
+            "print, as JSON, the Wasmtime fork a baseline commit pins and the directory "
+            "beside the candidate its checkout and profile collection are laid out in"
+        ),
+    )
+    baseline_fork.add_argument("--sha", required=True, help="the baseline commit, resolved")
+    baseline_fork.set_defaults(func=command_baseline_fork)
 
     host_check = subcommands.add_parser("host-check", help="list how this host deviates from a lane")
     host_check.add_argument("--lane", required=True)

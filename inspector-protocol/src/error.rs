@@ -176,3 +176,64 @@ impl DispatchError {
         }
     }
 }
+
+/// A frame or console line the guest sent that the wire format's
+/// stated limits refuse.
+///
+/// The guest is the untrusted side of the link, so every size it
+/// announces or implies is judged against the limits in [`crate::wire`]
+/// before the host allocates for it. The wire layer reports through
+/// `io::Error` to match the stream it reads, carrying this enum as the
+/// payload; use [`WireError::from_io`] to recover it.
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub enum WireError {
+    /// A frame header announced a payload above the frame maximum.
+    #[error("frame payload of {len} bytes exceeds the {max}-byte maximum")]
+    FrameTooLarge { len: usize, max: usize },
+
+    /// A length-prefixed field announced more bytes than the frame still
+    /// holds.
+    #[error("{field} announces {len} elements needing {needed} bytes, but {remaining} remain")]
+    LengthExceedsInput {
+        field: &'static str,
+        len: u32,
+        needed: usize,
+        remaining: usize,
+    },
+
+    /// The guest console produced more than the line maximum without a
+    /// newline or a frame header.
+    #[error("console line exceeds the {max}-byte maximum without a terminator")]
+    ConsoleLineTooLong { max: usize },
+
+    /// A peer sent one invocation more undelivered payload than the
+    /// transport holds for it. Only that invocation fails.
+    #[error(
+        "invocation {invocation} would hold {held} undelivered bytes, over the {max}-byte maximum"
+    )]
+    InboundBacklogExceeded {
+        invocation: u32,
+        held: usize,
+        max: usize,
+    },
+
+    /// A peer addressed more distinct paths on one invocation than the
+    /// transport holds state for. Only that invocation fails.
+    #[error("invocation {invocation} addressed more than the {max} inbound path(s) it may hold")]
+    TooManyInboundPaths { invocation: u32, max: usize },
+}
+
+impl WireError {
+    /// The wire fault carried by `error`, if that is what it is.
+    pub fn from_io(error: &std::io::Error) -> Option<&Self> {
+        error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<Self>())
+    }
+}
+
+impl From<WireError> for std::io::Error {
+    fn from(error: WireError) -> Self {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+    }
+}

@@ -8,7 +8,7 @@ from helios_bench.manifest import (
     Lane,
     fedora_image,
     load_manifest,
-    vendored_wasmtime_revision,
+    vendored_wasmtime_pin,
     wasmtime_linux_release,
 )
 from helios_bench.report import WorkloadClass
@@ -28,7 +28,9 @@ def test_manifest_lanes_are_complete() -> None:
 
 
 def test_pins_come_from_their_single_sources() -> None:
-    revision = vendored_wasmtime_revision()
+    pin = vendored_wasmtime_pin()
+    revision = pin.revision
+    assert pin.repository == "lexoliu/wasmtime"
     assert len(revision) == 40
     action = (REPO_ROOT / ".github/actions/checkout-wasmtime/action.yml").read_text(encoding="utf-8")
     assert revision in action
