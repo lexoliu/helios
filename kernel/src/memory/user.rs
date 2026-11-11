@@ -867,7 +867,7 @@ mod tests {
         let pool = pool(8 * 1024 * 1024);
         let free_before = PhysFrameAllocator::stats(&pool, NodeId::FIRST).free_frames();
 
-        let range = pool.allocate(64, false).expect("64 frames");
+        let range = pool.allocate(NodeId::FIRST, 64, false).expect("64 frames");
         assert_eq!(range.frame_count, 64);
         assert!(PhysFrameAllocator::stats(&pool, NodeId::FIRST).free_frames() < free_before);
 
@@ -889,7 +889,7 @@ mod tests {
         let free_before = PhysFrameAllocator::stats(&pool, NodeId::FIRST).free_frames();
 
         let mut runs = 0usize;
-        let named = block_on(pool.free_runs(512, 256, |run| {
+        let named = block_on(pool.free_runs(NodeId::FIRST, 512, 256, |run| {
             assert_eq!(run.frame_count, 512);
             runs += 1;
             core::future::ready(())
@@ -920,7 +920,7 @@ mod tests {
 
         let mut reported = None;
         assert_eq!(
-            block_on(pool.free_runs(16, 1, |run| {
+            block_on(pool.free_runs(NodeId::FIRST, 16, 1, |run| {
                 unsafe {
                     core::ptr::write_bytes(run.start.phys_addr() as *mut u8, 0xc3, run.byte_size());
                 }
