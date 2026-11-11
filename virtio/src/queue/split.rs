@@ -126,7 +126,7 @@ impl<T: VirtioTransport> RingOps<T> for SplitRing<T> {
         self.read_used_idx() != self.last_used_idx
     }
 
-    fn pop_used(&mut self) -> Option<(u16, u32)> {
+    fn pop_used(&mut self) -> Result<Option<(u16, u32)>, VirtqueueError> {
         if self.core.features.in_order() {
             self.pop_used_in_order()
         } else {
@@ -260,14 +260,15 @@ impl<T: VirtioTransport> SplitRing<T> {
         ids[0]
     }
 
-    fn pop_used_unordered(&mut self) -> Option<(u16, u32)> {
+    fn pop_used_unordered(&mut self) -> Result<Option<(u16, u32)>, VirtqueueError> {
         if self.read_used_idx() == self.last_used_idx {
-            return None;
+            return Ok(None);
         }
         fence(Ordering::Acquire);
         let elem = self.read_used_elem(self.last_used_idx & (self.core.size - 1));
-        let head = self.finish_completion(elem.id as u16);
-        Some((head, elem.len))
+        let head = self.core.complete_head(elem.id)?;
+        self.finish_completion(head);
+        Ok(Some((head, elem.len)))
     }
 
     /// VIRTIO_F_IN_ORDER completion (virtio 1.2 §2.7.9).
@@ -279,11 +280,11 @@ impl<T: VirtioTransport> SplitRing<T> {
     /// submitted first; otherwise the authoritative entry is the one at
     /// the end of what the device published, and the chains in between
     /// are, per the specification, buffers the device used completely.
-    fn pop_used_in_order(&mut self) -> Option<(u16, u32)> {
+    fn pop_used_in_order(&mut self) -> Result<Option<(u16, u32)>, VirtqueueError> {
         if self.core.batch.remaining == 0 {
             let used_idx = self.read_used_idx();
             if used_idx == self.last_used_idx {
-                return None;
+                return Ok(None);
             }
             fence(Ordering::Acquire);
             let mask = self.core.size - 1;
@@ -291,25 +292,29 @@ impl<T: VirtioTransport> SplitRing<T> {
                 .core
                 .order
                 .front()
-                .expect("virtqueue reported a completion with nothing in flight");
+                .ok_or(VirtqueueError::SpuriousCompletion)?;
             let here = self.read_used_elem(self.last_used_idx & mask);
-            let (final_id, final_len) = if here.id as u16 == front {
-                (front, here.len)
+            let (final_id, final_len) = if here.id == u32::from(front) {
+                (here.id, here.len)
             } else {
                 let tail = self.read_used_elem(used_idx.wrapping_sub(1) & mask);
-                (tail.id as u16, tail.len)
+                (tail.id, tail.len)
             };
-            self.core.begin_in_order_batch(final_id, final_len);
+            self.core.begin_in_order_batch(final_id, final_len)?;
         }
 
         let (id, len) = self.core.next_in_order_completion();
+        let id = self.core.complete_head(u32::from(id))?;
         self.finish_completion(id);
-        Some((id, len))
+        Ok(Some((id, len)))
     }
 
     /// Advances the used cursor, republishes the used event and returns
     /// the chain's descriptors to the pool.
-    fn finish_completion(&mut self, head: u16) -> u16 {
+    ///
+    /// `head` has already been taken out of the in-flight set, so it is a
+    /// chain this driver submitted and the shadow table is its own.
+    fn finish_completion(&mut self, head: u16) {
         self.last_used_idx = self.last_used_idx.wrapping_add(1);
         if self.core.features.event_idx() {
             self.write_used_event(self.last_used_idx);
@@ -322,7 +327,6 @@ impl<T: VirtioTransport> SplitRing<T> {
             fence(Ordering::SeqCst);
         }
         self.release_chain(head);
-        head
     }
 
     fn release_chain(&mut self, head: u16) {
@@ -553,6 +557,12 @@ impl<T: VirtioTransport> SplitRing<T> {
 
     /// Device side: complete one chain by its identifier.
     pub(super) fn device_complete(&self, id: u16, len: u32) {
+        self.device_complete_raw(u32::from(id), len);
+    }
+
+    /// Device side: completes with a raw 32-bit used-element id, which a
+    /// misbehaving device may set to anything.
+    pub(super) fn device_complete_raw(&self, id: u32, len: u32) {
         let used_idx = self.read_used_idx();
         let slot = used_idx & (self.core.size - 1);
         unsafe {
@@ -560,10 +570,7 @@ impl<T: VirtioTransport> SplitRing<T> {
                 .as_ptr()
                 .add(4 + usize::from(slot) * size_of::<UsedElem>())
                 .cast::<UsedElem>()
-                .write_volatile(UsedElem {
-                    id: u32::from(id),
-                    len,
-                });
+                .write_volatile(UsedElem { id, len });
             self.device_area
                 .as_ptr()
                 .cast::<u16>()

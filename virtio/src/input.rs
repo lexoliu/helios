@@ -221,7 +221,7 @@ impl<T: VirtioTransport> VirtioInputDevice<T> {
             slots,
             slot_for_token,
         } = state;
-        let Some((token, used_len)) = queue.pop_used_with_len() else {
+        let Some((token, used_len)) = queue.pop_used_with_len()? else {
             return Ok(None);
         };
         let index = usize::from(
@@ -304,7 +304,7 @@ impl<T: VirtioTransport> InputDevice for VirtioInputDevice<T> {
         await_completion(&self.status_inflight, &self.status_queue, token, || {
             self.interrupts.notified()
         })
-        .await;
+        .await?;
         Ok(())
     }
 }
