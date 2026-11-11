@@ -19,6 +19,8 @@ mod runtime;
 mod swap;
 #[cfg(test)]
 mod swap_tests;
+#[cfg(test)]
+mod timer_cross_processor_tests;
 mod vmm;
 
 pub use device::{
