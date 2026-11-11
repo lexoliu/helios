@@ -73,22 +73,32 @@ runs:
     # expression, so this names the `checkout-path` default rather than
     # the input; every caller checks out at `helios`.
     - uses: ./helios/.github/actions/vhost-vsock
-    - uses: astral-sh/setup-uv@v6
-    - uses: taiki-e/install-action@v2
+    # The release workflow runs this action in a job that holds a write
+    # token, so everything it pulls in is named by commit: a tag or a
+    # branch is its owner's to move.
+    - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+    - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
       with:
         tool: wasm-tools
-    - uses: mlugg/setup-zig@v2
+    - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
       with:
         version: 0.13.0
     - name: Stage Limine bootloader share
       shell: bash
+      env:
+        # The head of `v11.x-binary` when this was pinned.
+        LIMINE_COMMIT: 5be26a73d7b7b4d4477d18be94e1d16e615adf56
       run: |
-        git clone --depth 1 --branch v11.x-binary \
-          https://github.com/limine-bootloader/limine "$GITHUB_WORKSPACE/limine"
+        set -euo pipefail
+        git init --quiet "$GITHUB_WORKSPACE/limine"
+        git -C "$GITHUB_WORKSPACE/limine" fetch --quiet --depth 1 \
+          https://github.com/limine-bootloader/limine "$LIMINE_COMMIT"
+        git -C "$GITHUB_WORKSPACE/limine" checkout --quiet --detach FETCH_HEAD
+        test "$(git -C "$GITHUB_WORKSPACE/limine" rev-parse HEAD)" = "$LIMINE_COMMIT"
         make -C "$GITHUB_WORKSPACE/limine"
     - name: Restore WASI tooling artifacts
       id: artifact-cache
-      uses: actions/cache@v4
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
       with:
         path: |
           ${{ inputs.checkout-path }}/artifacts/wasi-tools
@@ -102,14 +112,14 @@ runs:
       run: tools/wasi-apps/build.sh
     - name: Restore pinned Fedora VM assets
       if: inputs.guest-arch != ''
-      uses: actions/cache@v4
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
       with:
         path: |
           ${{ inputs.checkout-path }}/target/perf-baselines/linux-vm/fedora-${{ inputs.guest-arch }}/*.qcow2
           ${{ inputs.checkout-path }}/target/perf-baselines/linux-vm/fedora-${{ inputs.guest-arch }}/sources
           ${{ inputs.checkout-path }}/target/perf-baselines/linux-vm/fedora-${{ inputs.guest-arch }}/tools
         key: fedora-vm-assets-${{ inputs.guest-arch }}-${{ hashFiles(format('{0}/tools/wasi-apps/fedora_qemu_baseline.py', inputs.checkout-path)) }}
-    - uses: Swatinem/rust-cache@v2
+    - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       with:
         workspaces: ${{ inputs.checkout-path }}
         key: ${{ inputs.rust-cache-key }}

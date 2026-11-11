@@ -14,10 +14,10 @@ on:
         type: string
         required: true
 
+# Read-only by default: each job below names what it writes, so a step in
+# one job never holds the token another job needs.
 permissions:
-  contents: write
-  pull-requests: write
-  id-token: write
+  contents: read
 
 jobs:
   release-plz:
@@ -26,6 +26,12 @@ jobs:
     # that release and never cuts one.
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
+    # Tags and releases, the release pull request, and the OIDC identity
+    # crates.io trades for a publishing token.
+    permissions:
+      contents: write
+      pull-requests: write
+      id-token: write
     outputs:
       # What release-plz released, as it reports it: a JSON array of
       # `{package_name, prs, tag, version}` and a flag saying whether that
@@ -34,20 +40,24 @@ jobs:
       releases: ${{ steps.release-plz.outputs.releases }}
       releases-created: ${{ steps.release-plz.outputs.releases_created }}
     steps:
-      - uses: actions/checkout@v4
+      # Every action in a job that holds a write token is named by commit:
+      # a tag is the action owner's to move.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
       # Mint a short-lived crates.io token from the GitHub OIDC identity
       # instead of a stored CARGO_REGISTRY_TOKEN. Trusted publishing is
       # configured per crate on crates.io; a crate that has never been
       # published cannot be configured, so the step stays non-blocking
       # until the first `cargo publish` bootstrap lands it.
-      - uses: rust-lang/crates-io-auth-action@v1
+      - uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1
         id: crates-io-auth
         continue-on-error: true
       - id: release-plz
-        uses: MarcoIeni/release-plz-action@v0.5
+        uses: MarcoIeni/release-plz-action@66b324fd6c72d05d2a08568492ecdd62bfb8a62b # v0.5
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
@@ -116,10 +126,13 @@ jobs:
     if: needs.kernel-release-tag.outputs.tag != ''
     runs-on: ubuntu-24.04
     timeout-minutes: 240
+    # The release's assets are the one thing this job writes.
+    permissions:
+      contents: write
     env:
       RELEASE_TAG: ${{ needs.kernel-release-tag.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           path: helios
           # The released tree, not the branch that has moved on since: a
