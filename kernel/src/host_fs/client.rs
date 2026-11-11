@@ -1691,7 +1691,7 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFileSystem
     }
 }
 
-fn path_segments(path: &str) -> impl Iterator<Item = &str> {
+fn path_segments(path: &str) -> impl Iterator<Item = &str> + Clone {
     path.split('/').filter(|segment| !segment.is_empty())
 }
 
