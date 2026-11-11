@@ -1,8 +1,10 @@
+use std::cell::RefCell;
 use std::sync::Arc;
 use std::thread;
 
 use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase, TimerInterrupt, current_processor};
 use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
+use helios_kernel::Timer;
 
 use crate::runtime::HostedMachine;
 
@@ -23,9 +25,48 @@ impl HostedCpu {
         set_current_processor(processor);
         Self { machine }
     }
+
+    /// Installs the calling processor's timer, which runs its interrupt
+    /// step whenever the machine's timer thread has raised this
+    /// processor's timer interrupt. The processor calls this once, after
+    /// `helios_kernel::init`, the way the bare-metal backends install
+    /// theirs; an interrupt raised before that stays pending.
+    pub fn install_timer(&self, timer: Timer<HostedCpu>) {
+        PROCESSOR_TIMER.with(|slot| {
+            let previous = slot.borrow_mut().replace(timer);
+            assert!(
+                previous.is_none(),
+                "hosted processor timer was installed more than once"
+            );
+        });
+    }
+
+    /// Delivers a pending timer interrupt to the calling processor: runs
+    /// the installed timer's interrupt step if the machine raised one.
+    ///
+    /// A hosted processor is a thread and cannot be preempted, so an
+    /// interrupt is taken where the thread yields control to the
+    /// machine, which is [`Cpu::park_current`].
+    fn take_timer_interrupt(&self) {
+        PROCESSOR_TIMER.with(|slot| {
+            let slot = slot.borrow();
+            let Some(timer) = slot.as_ref() else {
+                return;
+            };
+            if self.machine.take_timer_interrupt(current_processor()) {
+                timer.handle_interrupt();
+            }
+        });
+    }
 }
 
 thread_local! {
+    /// This thread's processor timer, installed by
+    /// [`HostedCpu::install_timer`]. Only the processor's own thread runs
+    /// its interrupt step, so it lives with the thread rather than in
+    /// the shared machine.
+    static PROCESSOR_TIMER: RefCell<Option<Timer<HostedCpu>>> = const { RefCell::new(None) };
+
     /// This thread's logical processor, seeded when the thread's
     /// [`HostedCpu`] is built and read by the identity contract below.
     static CURRENT_PROCESSOR: core::cell::Cell<Option<ProcessorId>> =
@@ -64,8 +105,16 @@ impl Cpu for HostedCpu {
         self.machine.bootstrap_processor()
     }
 
+    /// Parks until woken, taking the processor's timer interrupt on the
+    /// way in and on the way out: one raised while it ran is handled
+    /// before it sleeps, and one that woke it is handled before it
+    /// returns. A raise between the check and the park leaves its unpark
+    /// token, so the park returns at once and the interrupt is taken on
+    /// the way out.
     fn park_current(&self) {
+        self.take_timer_interrupt();
         thread::park();
+        self.take_timer_interrupt();
     }
 
     fn start_processor(&self, processor: ProcessorId) {

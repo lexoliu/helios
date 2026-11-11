@@ -159,6 +159,12 @@ struct ProcessorSlot {
     /// `restart_processor` does.
     run: Mutex<SlotRun>,
     restarted: Condvar,
+    /// The processor's timer interrupt, raised by the timer thread when
+    /// the processor's deadline expires and taken by the processor in
+    /// `park_current`. It is a level, not a count: expiries before the
+    /// processor takes it are one interrupt, as with a hardware
+    /// comparator.
+    timer_interrupt: AtomicBool,
 }
 
 /// Where a hosted processor's thread stands between a stop and a restart.
@@ -296,6 +302,22 @@ impl HostedMachine {
         self.slot(processor).started.load(Ordering::Acquire)
     }
 
+    /// Raises `processor`'s timer interrupt and wakes it to take it.
+    fn raise_timer_interrupt(&self, processor: ProcessorId) {
+        self.slot(processor)
+            .timer_interrupt
+            .store(true, Ordering::Release);
+        self.wake_processor(processor);
+    }
+
+    /// Takes `processor`'s pending timer interrupt, if the timer thread
+    /// raised one.
+    pub(crate) fn take_timer_interrupt(&self, processor: ProcessorId) -> bool {
+        self.slot(processor)
+            .timer_interrupt
+            .swap(false, Ordering::Acquire)
+    }
+
     pub(crate) fn wake_processor(&self, processor: ProcessorId) {
         let slot = self.slot(processor);
         if let Some(thread) = slot.thread.get() {
@@ -329,6 +351,10 @@ impl HostedMachine {
         while *run == SlotRun::Stopped {
             run = slot.restarted.wait(run).unwrap();
         }
+        // A comparator that expired before the withdrawal reached the
+        // timer thread fired into a stopped processor, which takes no
+        // interrupt: it comes back with a fresh deadline of its own.
+        slot.timer_interrupt.store(false, Ordering::Release);
     }
 
     /// Puts a stopped processor's thread back in service; one that has
@@ -419,6 +445,7 @@ fn spawn_processor_thread(
                 .with_dma_model(DmaModel::Translated)
                 .with_devices(devices);
             let kernel = helios_kernel::init(platform);
+            cpu.install_timer(kernel.timer());
             let debug_state = shared_debug_state(&machine, payload);
             if processor == machine.bootstrap_processor() {
                 init_serial();
@@ -521,6 +548,7 @@ impl ProcessorSlot {
             started: AtomicBool::new(false),
             run: Mutex::new(SlotRun::Running),
             restarted: Condvar::new(),
+            timer_interrupt: AtomicBool::new(false),
         }
     }
 }
@@ -583,7 +611,7 @@ fn fire_expired_deadlines(machine: &HostedMachine, deadlines: &mut [Option<Insta
             && d <= now
         {
             *deadline = None;
-            machine.wake_processor(ProcessorId::new(slot as u16));
+            machine.raise_timer_interrupt(ProcessorId::new(slot as u16));
         }
     }
 }

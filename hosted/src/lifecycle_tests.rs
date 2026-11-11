@@ -86,6 +86,7 @@ fn a_secondary_goes_offline_hands_its_timers_and_work_over_and_comes_back() {
                     thread::park();
                 }
                 let kernel = helios_kernel::init(platform(&machine, SECONDARY, 2));
+                HostedCpu::new(SECONDARY, machine.clone()).install_timer(kernel.timer());
 
                 // A sleep first polled here is registered on this
                 // processor's timer base; it is due long after the
@@ -108,7 +109,9 @@ fn a_secondary_goes_offline_hands_its_timers_and_work_over_and_comes_back() {
         .expect("the secondary registers its thread");
 
     let kernel = helios_kernel::init(platform(&machine, BOOTSTRAP, 2));
-    HostedCpu::new(BOOTSTRAP, machine.clone()).start_processor(SECONDARY);
+    let cpu = HostedCpu::new(BOOTSTRAP, machine.clone());
+    cpu.install_timer(kernel.timer());
+    cpu.start_processor(SECONDARY);
     let control = kernel.processor_control();
     let timer = kernel.timer();
     let spawner = kernel.spawner();
@@ -218,4 +221,39 @@ fn a_secondary_goes_offline_hands_its_timers_and_work_over_and_comes_back() {
             "no global task ran on the secondary after it came back"
         );
     });
+}
+
+/// A processor with nothing else running fires one sleep after another:
+/// each expiry is the processor's timer interrupt, whose step arms the
+/// next deadline.
+#[test]
+fn a_lone_processor_fires_consecutive_sleeps() {
+    const SLEEPS: u32 = 5;
+    let machine = HostedMachine::new(1, BOOTSTRAP, DEFAULT_HEAP_BYTES);
+    let (done_tx, done_rx) = mpsc::channel();
+    {
+        let machine = machine.clone();
+        thread::Builder::new()
+            .name("helios-timer-p0".to_owned())
+            .spawn(move || {
+                machine.register_thread(BOOTSTRAP, thread::current());
+                let kernel = helios_kernel::init(platform(&machine, BOOTSTRAP, 1));
+                HostedCpu::new(BOOTSTRAP, machine.clone()).install_timer(kernel.timer());
+                let timer = kernel.timer();
+                kernel.run_local_future(async move {
+                    for _ in 0..SLEEPS {
+                        timer.sleep_for(Duration::from_millis(20)).await;
+                    }
+                });
+                done_tx
+                    .send(())
+                    .expect("the test thread waits for the sleeps");
+            })
+            .expect("spawn the processor's thread");
+    }
+    // The wait is on a channel, not on the kernel's timer, so a timer that
+    // never fires fails the test instead of hanging it.
+    done_rx
+        .recv_timeout(STEP_DEADLINE)
+        .expect("the processor's consecutive sleeps never all fired");
 }
