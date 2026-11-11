@@ -1820,6 +1820,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "helios-firmware"
+version = "0.1.0"
+dependencies = [
+ "arrayvec",
+ "fdt",
+ "helios-hal",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "helios-gpu-test"
 version = "0.1.0"
 dependencies = [
