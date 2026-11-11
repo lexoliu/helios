@@ -121,6 +121,8 @@ maintainer's decision and the fork's revision moves once, per §1.
   transport. Replacing any of them with IDE, an emulated legacy device, an
   ad-hoc host file, or other fallback I/O is an architectural change that
   needs explicit approval in the task that proposes it.
+- A TPM 2.0 (`tpm/`) is the one device outside virtio. It carries measured
+  boot and sealing, and never data I/O.
 - A well-maintained, `no_std`-friendly third-party crate beats a hand-rolled
   implementation.
 
@@ -445,7 +447,7 @@ just test-units
 `just lint` is `tools/fmt.sh --check`, `cargo deny --workspace check bans`
 against `deny.toml`, and `cargo clippy … -D warnings` over the host crates, each
 guest program, and the three bare-metal targets.
-`just test-units` runs the `hal`, `virtio`, `netstack`, `kernel`,
+`just test-units` runs the `hal`, `virtio`, `netstack`, `tpm`, `kernel`,
 `inspector-protocol` and `workspace-root` unit tests, every `hosted` test,
 and the `hal_layering` test (`kernel/tests/`) that enforces §1. The recipe names each integration
 test with `--test <name>`, so a new enforcement test is added to the recipe
