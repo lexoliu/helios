@@ -1864,9 +1864,3 @@ pub(super) fn p1_probe_descriptor<Net: ComponentHostNetwork>(
         (None, _) => Err(p1::errno::BADF),
     }
 }
-
-pub(super) fn p1_descriptor_stat_from_host_metadata(
-    metadata: &crate::HostMetadata,
-) -> fs_types::DescriptorStat {
-    crate::wasmtime_adapter::wasi::descriptor_stat_from_host_metadata(metadata)
-}

@@ -1035,10 +1035,10 @@ pub(crate) mod test_store {
     use triomphe::Arc;
     use wasmtime::component::ResourceTable;
 
+    use crate::Namespace;
     use crate::component::{ComponentOutputMode, ComponentStoreData};
     use crate::gpu::Gpu3dService;
     use crate::test_support::{TestCpu, TestNetworkService};
-    use crate::wasmtime_adapter::wasi::DebugFileSystem;
     use crate::{
         Executor, InstanceRegistry, ProcessAuthority, TaskFunding, UnsupportedHostFileSystem,
     };
@@ -1124,7 +1124,7 @@ pub(crate) mod test_store {
             registry,
             instance,
             None,
-            DebugFileSystem::new(runtime_state),
+            Namespace::new(runtime_state.mounts()),
             Vec::new(),
             Vec::new(),
             ProcessAuthority::empty(),

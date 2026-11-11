@@ -110,6 +110,18 @@ interface programs {
     rights: list<link-right>,
   }
 
+  enum mount-right {
+    mount,
+    unmount,
+  }
+
+  record mount-grant {
+    /// Mount-table rights granted to the child. These must be a subset of
+    /// the caller's mount authority; where the child may mount is still
+    /// bounded by its directory grants.
+    rights: list<mount-right>,
+  }
+
   variant capability-grant {
     directory(directory-grant),
     network(network-grant),
@@ -117,6 +129,7 @@ interface programs {
     terminal(terminal-grant),
     process(process-grant),
     link(link-grant),
+    mount(mount-grant),
   }
 
   record spawn-request {

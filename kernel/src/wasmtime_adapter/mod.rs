@@ -244,8 +244,7 @@ where
 
         let linker = component_linker(&engine.engine, binding_set, &compiled.component)?;
 
-        let filesystem =
-            crate::wasmtime_adapter::wasi::DebugFileSystem::new(context.host_filesystem_state);
+        let filesystem = crate::Namespace::new(context.host_filesystem_state.mounts());
         let debug_port = if context.has_debug_port {
             Some(())
         } else {

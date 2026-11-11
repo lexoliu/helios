@@ -286,35 +286,6 @@ pub(super) fn p1_iovs_memory_ranges(
     Ok(ranges)
 }
 
-pub(super) fn copy_preview1_ranges_to_slice(
-    memory_base: *const u8,
-    ranges: &[(usize, usize)],
-    destination: &mut [u8],
-) {
-    let mut copied = 0usize;
-    for (start, len) in ranges {
-        let next = copied
-            .checked_add(*len)
-            .expect("validated preview1 iov ranges overflowed while copying");
-        // SAFETY: `p1_iovs_memory_ranges` validated every source range
-        // against the live guest memory, and `destination` was allocated
-        // to the exact summed iov length before this copy.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                memory_base.add(*start),
-                destination.as_mut_ptr().add(copied),
-                *len,
-            );
-        }
-        copied = next;
-    }
-    assert_eq!(
-        copied,
-        destination.len(),
-        "validated preview1 iov ranges did not fill destination"
-    );
-}
-
 pub(super) fn p1_read_memory<T>(
     _caller: &mut Caller<'_, T>,
     memory: Preview1Memory,

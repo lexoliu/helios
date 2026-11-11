@@ -171,7 +171,7 @@ where
             exec_context.instance_registry.clone(),
             instance,
             None,
-            DebugFileSystem::new(exec_context.runtime_state.clone()),
+            Namespace::new(exec_context.runtime_state.mounts()),
             alloc::vec![String::from(HTTP_CLIENT_PLUGIN_PATH)],
             Vec::new(),
             // Same authority the system components get: the plugin needs the

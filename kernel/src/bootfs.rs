@@ -1,14 +1,29 @@
+//! The boot filesystem: the read-only tree the boot payload carries.
+//!
+//! [`EmbeddedBootFs`] is the image as the payload parse leaves it, two
+//! slices of `'static` entries. [`BootFs`] is that image as a mountable
+//! [`FileSystem`]: an index sorted by path, built once when the kernel
+//! takes the payload and shared by every mount and every instance, so no
+//! instance copies the tree.
+//!
+//! Concurrency contract: a [`BootFs`] is immutable after
+//! [`BootFs::new`]; every operation reads it from any processor without a
+//! lock, and every mutating operation fails with [`FsError::ReadOnly`].
+
 extern crate alloc;
 
-use alloc::borrow::ToOwned;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::cmp::Ordering;
 
+use bytes::Bytes;
 use helios_hal::fs::{
-    Directory, DirectoryEntry, DirectoryHandle, DirectoryRights, File, FileHandle, FileRights,
-    FileSystem, IoError, IoResult,
+    DeviceId, DirCookie, DirEntry, FileSystem, FsError, FsPath, FsResult, Metadata, NodeId,
+    NodeKind, OpenFlags,
 };
-use helios_hal::resource::KernelResource;
+use triomphe::Arc;
+
+use crate::vfs::cmp_to_children;
 
 /// Single immutable file view into the payload the backend hands the kernel.
 #[derive(Clone, Copy)]
@@ -31,38 +46,6 @@ pub struct EmbeddedBootDirectory {
 pub struct EmbeddedBootFs {
     directories: &'static [EmbeddedBootDirectory],
     files: &'static [EmbeddedBootFile],
-}
-
-/// Read-only directory view into an [`EmbeddedBootFs`].
-#[derive(Clone)]
-pub struct BootDirectory {
-    image: EmbeddedBootFs,
-    path: String,
-}
-
-/// Read-only file view into an [`EmbeddedBootFs`].
-#[derive(Clone)]
-pub struct BootFile {
-    path: &'static str,
-    contents: &'static [u8],
-    offset: usize,
-}
-
-/// Directory entry returned by bootfs enumeration.
-pub struct BootDirectoryEntry {
-    name: String,
-    is_directory: bool,
-}
-
-/// Operations available on a capability-clamped bootfs directory handle.
-pub trait BootDirectoryHandleExt {
-    fn list(&self) -> Vec<BootDirectoryEntry>;
-    fn open_directory(
-        &self,
-        path: &str,
-        rights: DirectoryRights,
-    ) -> Option<DirectoryHandle<BootDirectory>>;
-    fn open_file(&self, path: &str, rights: FileRights) -> Option<FileHandle<BootFile>>;
 }
 
 impl EmbeddedBootFile {
@@ -112,6 +95,12 @@ impl EmbeddedBootFs {
         Self { directories, files }
     }
 
+    /// An image with nothing in it, for a kernel whose payload carries no
+    /// boot filesystem.
+    pub const fn empty() -> Self {
+        Self::new(&[], &[])
+    }
+
     pub const fn directories(&self) -> &'static [EmbeddedBootDirectory] {
         self.directories
     }
@@ -123,368 +112,311 @@ impl EmbeddedBootFs {
     pub const fn is_empty(&self) -> bool {
         self.directories.is_empty() && self.files.is_empty()
     }
+}
 
-    /// Creates the root directory capability for this boot filesystem.
+/// Inode number of the root directory. Entry `i` of the index is inode
+/// `i + FIRST_ENTRY_INODE`.
+const ROOT_INODE: u64 = 1;
+const FIRST_ENTRY_INODE: u64 = 2;
+
+/// One object of the image: a file, a directory the image lists, or a
+/// directory only implied by the paths below it.
+struct BootNode {
+    /// Path from the image root. An implied directory's path is a prefix
+    /// of the `'static` path that implies it, so no node owns its name.
+    path: &'static str,
+    kind: NodeKind,
+    contents: &'static [u8],
+    modified_nanos: u64,
+}
+
+/// The image as a mountable read-only filesystem.
+#[derive(Clone)]
+pub struct BootFs {
+    index: Arc<BootIndex>,
+}
+
+struct BootIndex {
+    device: DeviceId,
+    /// Every object but the root, sorted by path bytes, so the objects
+    /// below one directory form one contiguous run.
+    nodes: Vec<BootNode>,
+}
+
+impl BootFs {
+    /// Indexes `image` as device `device`.
     ///
-    /// Bootfs is immutable, so only read rights are valid here.
-    pub fn root_directory(self, rights: DirectoryRights) -> DirectoryHandle<BootDirectory> {
-        assert!(
-            DirectoryRights::READ.contains(rights),
-            "bootfs root directory only supports read rights"
-        );
-        KernelResource::new(BootDirectory::root(self), rights)
-    }
-
-    fn directory_exists(&self, path: &str) -> bool {
-        if path.is_empty() {
-            return true;
-        }
-
-        if self
-            .directories
-            .iter()
-            .any(|directory| directory.path == path)
-        {
-            return true;
-        }
-
-        let prefix = with_trailing_slash(path);
-        self.files.iter().any(|file| file.path.starts_with(&prefix))
-    }
-
-    fn file(&self, path: &str) -> Option<BootFile> {
-        self.files
-            .iter()
-            .find(|file| file.path == path)
-            .map(|file| BootFile {
-                path: file.path,
-                contents: file.contents,
-                offset: 0,
-            })
-    }
-}
-
-impl BootDirectory {
-    fn root(image: EmbeddedBootFs) -> Self {
-        Self {
-            image,
-            path: String::new(),
-        }
-    }
-
-    pub fn path(&self) -> &str {
-        if self.path.is_empty() {
-            "/"
-        } else {
-            &self.path
-        }
-    }
-
-    fn resolve_path(&self, path: &str) -> String {
-        normalize_path(Some(&self.path), path)
-    }
-}
-
-impl BootFile {
-    pub const fn path(&self) -> &'static str {
-        self.path
-    }
-
-    pub const fn contents(&self) -> &'static [u8] {
-        self.contents
-    }
-}
-
-impl BootDirectoryEntry {
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    pub fn is_directory(&self) -> bool {
-        self.is_directory
-    }
-}
-
-impl BootDirectoryHandleExt for DirectoryHandle<BootDirectory> {
-    fn list(&self) -> Vec<BootDirectoryEntry> {
-        assert!(
-            self.rights().contains(DirectoryRights::READ),
-            "bootfs directory listing requires read rights"
-        );
-
-        let directory = self.object();
-        let prefix = if directory.path.is_empty() {
-            String::new()
-        } else {
-            with_trailing_slash(&directory.path)
-        };
-        let mut entries: Vec<BootDirectoryEntry> = Vec::new();
-
-        for child in directory_child_entries(&directory.image, &prefix) {
-            if entries.iter().any(|entry| entry.name == child.name) {
-                continue;
-            }
-            entries.push(BootDirectoryEntry {
-                name: child.name.to_owned(),
-                is_directory: child.is_directory,
+    /// Panics when the image names one path as both a file and a
+    /// directory: the payload is kernel input the build produced, and an
+    /// image like that is a build defect, not something to serve.
+    pub fn new(image: EmbeddedBootFs, device: DeviceId) -> Self {
+        let mut nodes: Vec<BootNode> = Vec::new();
+        for file in image.files() {
+            push_implied_directories(&mut nodes, file.path());
+            nodes.push(BootNode {
+                path: file.path(),
+                kind: NodeKind::File,
+                contents: file.contents(),
+                modified_nanos: file.modified_nanos(),
             });
         }
-
-        entries
+        for directory in image.directories() {
+            push_implied_directories(&mut nodes, directory.path());
+            nodes.push(BootNode {
+                path: directory.path(),
+                kind: NodeKind::Directory,
+                contents: &[],
+                modified_nanos: directory.modified_nanos(),
+            });
+        }
+        // A listed directory keeps its own timestamp over the zero an
+        // implied one carries: sort the listed one first, then keep the
+        // first of each path.
+        nodes.sort_by(|left, right| {
+            left.path
+                .cmp(right.path)
+                .then_with(|| right.modified_nanos.cmp(&left.modified_nanos))
+        });
+        nodes.dedup_by(|later, earlier| {
+            if later.path != earlier.path {
+                return false;
+            }
+            assert!(
+                later.kind == NodeKind::Directory && earlier.kind == NodeKind::Directory,
+                "bootfs path {} is both a file and a directory",
+                later.path
+            );
+            true
+        });
+        Self {
+            index: Arc::new(BootIndex { device, nodes }),
+        }
     }
 
-    fn open_directory(
+    pub fn device(&self) -> DeviceId {
+        self.index.device
+    }
+
+    /// The bytes of the file at `path`, borrowed from the payload.
+    pub fn file_contents(&self, path: FsPath<'_>) -> FsResult<&'static [u8]> {
+        let node = self.index.lookup(path)?;
+        match node.map(|(_, node)| node) {
+            Some(node) if node.kind == NodeKind::File => Ok(node.contents),
+            Some(_) | None => Err(FsError::IsDirectory),
+        }
+    }
+}
+
+/// Pushes a directory node for every proper ancestor of `path`.
+fn push_implied_directories(nodes: &mut Vec<BootNode>, path: &'static str) {
+    for (end, _) in path.match_indices('/') {
+        nodes.push(BootNode {
+            path: &path[..end],
+            kind: NodeKind::Directory,
+            contents: &[],
+            modified_nanos: 0,
+        });
+    }
+}
+
+impl BootIndex {
+    /// The node at `path`: `Ok(None)` is the root, which has no node.
+    fn lookup(&self, path: FsPath<'_>) -> FsResult<Option<(usize, &BootNode)>> {
+        if path.is_root() {
+            return Ok(None);
+        }
+        let index = self
+            .nodes
+            .binary_search_by(|node| node.path.cmp(path.as_str()))
+            .map_err(|_| FsError::NoEntry)?;
+        Ok(Some((index, &self.nodes[index])))
+    }
+
+    fn metadata(&self, path: FsPath<'_>) -> FsResult<Metadata> {
+        Ok(match self.lookup(path)? {
+            None => Metadata {
+                id: NodeId::new(self.device, ROOT_INODE),
+                kind: NodeKind::Directory,
+                link_count: 1,
+                size: 0,
+                access_nanos: 0,
+                modified_nanos: 0,
+                status_nanos: 0,
+            },
+            Some((index, node)) => Metadata {
+                id: NodeId::new(self.device, entry_inode(index)),
+                kind: node.kind,
+                link_count: 1,
+                size: node.contents.len() as u64,
+                access_nanos: node.modified_nanos,
+                modified_nanos: node.modified_nanos,
+                status_nanos: node.modified_nanos,
+            },
+        })
+    }
+
+    /// The run of nodes below the directory at `path`.
+    fn descendants(&self, path: FsPath<'_>) -> core::ops::Range<usize> {
+        if path.is_root() {
+            return 0..self.nodes.len();
+        }
+        let directory = path.as_str();
+        let start = self
+            .nodes
+            .partition_point(|node| cmp_to_children(node.path, directory) == Ordering::Less);
+        let end = start
+            + self.nodes[start..]
+                .partition_point(|node| cmp_to_children(node.path, directory) == Ordering::Equal);
+        start..end
+    }
+
+    fn read_dir(
         &self,
-        path: &str,
-        rights: DirectoryRights,
-    ) -> Option<DirectoryHandle<BootDirectory>> {
-        assert!(
-            self.rights().contains(rights),
-            "requested bootfs directory rights exceed parent capability"
-        );
-
-        let path = self.object().resolve_path(path);
-        self.object().image.directory_exists(&path).then(|| {
-            KernelResource::new(
-                BootDirectory {
-                    image: self.object().image,
-                    path,
-                },
-                rights,
-            )
-        })
-    }
-
-    fn open_file(&self, path: &str, rights: FileRights) -> Option<FileHandle<BootFile>> {
-        assert!(
-            self.rights().contains(DirectoryRights::READ),
-            "bootfs file lookup requires read rights"
-        );
-        assert!(
-            FileRights::READ.contains(rights),
-            "bootfs files only support read rights"
-        );
-
-        let path = self.object().resolve_path(path);
-        self.object()
-            .image
-            .file(&path)
-            .map(|file| KernelResource::new(file, rights))
-    }
-}
-
-struct DirectoryChildEntry<'a> {
-    name: &'a str,
-    is_directory: bool,
-}
-
-fn directory_child_entries<'a>(
-    image: &'a EmbeddedBootFs,
-    prefix: &'a str,
-) -> impl Iterator<Item = DirectoryChildEntry<'a>> {
-    let directories = image.directories().iter().filter_map(move |directory| {
-        let remainder = directory.path.strip_prefix(prefix)?;
-        if remainder.is_empty() {
-            return None;
+        path: FsPath<'_>,
+        cookie: DirCookie,
+        max_entries: usize,
+    ) -> FsResult<Vec<DirEntry>> {
+        if let Some((_, node)) = self.lookup(path)?
+            && node.kind != NodeKind::Directory
+        {
+            return Err(FsError::NotDirectory);
         }
-        let name = remainder
-            .split_once('/')
-            .map_or(remainder, |(name, _)| name);
-        Some(DirectoryChildEntry {
-            name,
-            is_directory: true,
-        })
-    });
-    let files = image.files().iter().filter_map(move |file| {
-        let remainder = file.path.strip_prefix(prefix)?;
-        if remainder.is_empty() {
-            return None;
-        }
-        let (name, is_directory) = match remainder.split_once('/') {
-            Some((name, _)) => (name, true),
-            None => (remainder, false),
+        let prefix_len = if path.is_root() {
+            0
+        } else {
+            path.as_str().len() + 1
         };
-        Some(DirectoryChildEntry { name, is_directory })
-    });
-    directories.chain(files)
-}
-
-impl FileSystem for EmbeddedBootFs {
-    type Directory = BootDirectory;
-    type File = BootFile;
-
-    fn open(
-        &self,
-        path: &str,
-    ) -> impl core::future::Future<
-        Output = IoResult<Option<DirectoryEntry<Self::Directory, Self::File>>>,
-    > + Send {
-        let path = normalize_path(None, path);
-        let image = *self;
-
-        async move {
-            if image.directory_exists(&path) {
-                return Ok(Some(DirectoryEntry::Directory(BootDirectory {
-                    image,
-                    path,
-                })));
+        let run = self.descendants(path);
+        let resume = usize::try_from(cookie.raw()).map_err(|_| FsError::Invalid)?;
+        let mut entries = Vec::new();
+        for index in run.start.max(resume)..run.end {
+            if entries.len() == max_entries {
+                break;
             }
-
-            Ok(image.file(&path).map(DirectoryEntry::File))
-        }
-    }
-
-    async fn create_directory(&self, _path: &str) -> IoResult<Self::Directory> {
-        Err(IoError::ReadOnly)
-    }
-
-    async fn remove(&self, _path: &str) -> IoResult<()> {
-        Err(IoError::ReadOnly)
-    }
-
-    async fn rename(&self, _source: &str, _destination: &str) -> IoResult<()> {
-        Err(IoError::ReadOnly)
-    }
-}
-
-impl Directory for BootDirectory {
-    type File = BootFile;
-
-    fn list(
-        &self,
-    ) -> impl core::future::Future<Output = IoResult<Vec<DirectoryEntry<Self, Self::File>>>> + Send
-    where
-        Self: Sized,
-    {
-        let directory = self.clone();
-
-        async move {
-            let prefix = if directory.path.is_empty() {
-                String::new()
-            } else {
-                with_trailing_slash(&directory.path)
-            };
-            let mut entries: Vec<DirectoryEntry<BootDirectory, BootFile>> = Vec::new();
-
-            for child in directory_child_entries(&directory.image, &prefix) {
-                let next_path = directory_child_path(&directory.path, child.name);
-                if directory_entry_exists(&entries, &next_path) {
-                    continue;
-                }
-
-                if child.is_directory {
-                    entries.push(DirectoryEntry::Directory(BootDirectory {
-                        image: directory.image,
-                        path: next_path,
-                    }));
-                } else if let Some(file) = directory.image.file(&next_path) {
-                    entries.push(DirectoryEntry::File(file));
-                }
+            let node = &self.nodes[index];
+            let name = &node.path[prefix_len..];
+            if name.contains('/') {
+                continue;
             }
-
-            Ok(entries)
+            entries.push(DirEntry {
+                name: String::from(name),
+                kind: node.kind,
+                inode: entry_inode(index),
+                next: DirCookie::new(index as u64 + 1),
+            });
         }
-    }
-
-    async fn create_directory(&self, _path: &str) -> IoResult<Self>
-    where
-        Self: Sized,
-    {
-        Err(IoError::ReadOnly)
-    }
-
-    fn open_file(
-        &self,
-        path: &str,
-    ) -> impl core::future::Future<Output = IoResult<Option<Self::File>>> + Send {
-        let directory = self.clone();
-        let path = path.to_owned();
-
-        async move { Ok(directory.image.file(&directory.resolve_path(&path))) }
-    }
-
-    async fn remove(&self, _path: &str) -> IoResult<()> {
-        Err(IoError::ReadOnly)
-    }
-
-    async fn rename(&self, _source: &str, _destination: &str) -> IoResult<()> {
-        Err(IoError::ReadOnly)
+        Ok(entries)
     }
 }
 
-fn directory_child_path(directory: &str, child: &str) -> String {
-    if directory.is_empty() {
-        child.to_owned()
-    } else {
-        let mut path = String::with_capacity(directory.len() + 1 + child.len());
-        path.push_str(directory);
-        path.push('/');
-        path.push_str(child);
-        path
-    }
+const fn entry_inode(index: usize) -> u64 {
+    index as u64 + FIRST_ENTRY_INODE
 }
 
-fn directory_entry_exists(entries: &[DirectoryEntry<BootDirectory, BootFile>], path: &str) -> bool {
-    entries.iter().any(|entry| match entry {
-        DirectoryEntry::Directory(existing) => existing.path == path,
-        DirectoryEntry::File(existing) => existing.path == path,
-    })
-}
-
-impl File for BootFile {
-    fn read(
-        &mut self,
-        buf: &mut [u8],
-    ) -> impl core::future::Future<Output = IoResult<usize>> + Send {
-        let remaining = &self.contents[self.offset..];
-        let count = remaining.len().min(buf.len());
-        buf[..count].copy_from_slice(&remaining[..count]);
-        self.offset += count;
-
-        async move { Ok(count) }
+impl FileSystem for BootFs {
+    async fn stat(&self, path: FsPath<'_>) -> FsResult<Metadata> {
+        self.index.metadata(path)
     }
 
-    async fn write(&mut self, _buf: &[u8]) -> IoResult<usize> {
-        Err(IoError::ReadOnly)
-    }
-
-    async fn truncate(&mut self) -> IoResult<()> {
-        Err(IoError::ReadOnly)
-    }
-}
-
-fn normalize_path(base: Option<&str>, path: &str) -> String {
-    let mut segments: Vec<&str> = Vec::new();
-
-    if !path.starts_with('/')
-        && let Some(base) = base
-    {
-        for segment in base.split('/') {
-            if !segment.is_empty() {
-                segments.push(segment);
+    async fn open(&self, path: FsPath<'_>, flags: OpenFlags, _now: u64) -> FsResult<Metadata> {
+        let metadata = match self.index.metadata(path) {
+            Ok(metadata) => metadata,
+            Err(FsError::NoEntry) if flags.contains(OpenFlags::CREATE) => {
+                return Err(FsError::ReadOnly);
             }
+            Err(error) => return Err(error),
+        };
+        if flags.contains(OpenFlags::CREATE | OpenFlags::EXCLUSIVE) {
+            return Err(FsError::Exists);
         }
-    }
-
-    for segment in path.split('/') {
-        match segment {
-            "" | "." => {}
-            ".." => panic!("bootfs paths must not contain parent traversal"),
-            _ => segments.push(segment),
+        if flags.contains(OpenFlags::DIRECTORY) && metadata.kind != NodeKind::Directory {
+            return Err(FsError::NotDirectory);
         }
+        if flags.contains(OpenFlags::TRUNCATE) {
+            return Err(FsError::ReadOnly);
+        }
+        Ok(metadata)
     }
 
-    segments.join("/")
-}
-
-fn with_trailing_slash(path: &str) -> String {
-    if path.is_empty() {
-        return String::new();
+    async fn read_at(&self, path: FsPath<'_>, offset: u64, max_bytes: usize) -> FsResult<Bytes> {
+        let contents = self.file_contents(path)?;
+        let offset = usize::try_from(offset).map_err(|_| FsError::Overflow)?;
+        if offset >= contents.len() {
+            return Ok(Bytes::new());
+        }
+        let end = offset.saturating_add(max_bytes).min(contents.len());
+        Ok(Bytes::from_static(&contents[offset..end]))
     }
 
-    let mut prefixed = path.to_owned();
-    prefixed.push('/');
-    prefixed
+    async fn write_at(&self, _: FsPath<'_>, _: u64, _: &[u8], _: u64) -> FsResult<()> {
+        Err(FsError::ReadOnly)
+    }
+
+    async fn append(&self, _: FsPath<'_>, _: &[u8], _: u64) -> FsResult<u64> {
+        Err(FsError::ReadOnly)
+    }
+
+    async fn set_size(&self, _: FsPath<'_>, _: u64, _: u64) -> FsResult<()> {
+        Err(FsError::ReadOnly)
+    }
+
+    async fn set_times(
+        &self,
+        _: FsPath<'_>,
+        _: Option<u64>,
+        _: Option<u64>,
+        _: u64,
+    ) -> FsResult<()> {
+        Err(FsError::ReadOnly)
+    }
+
+    async fn read_dir(
+        &self,
+        path: FsPath<'_>,
+        cookie: DirCookie,
+        max_entries: usize,
+    ) -> FsResult<Vec<DirEntry>> {
+        self.index.read_dir(path, cookie, max_entries)
+    }
+
+    async fn create_directory(&self, _: FsPath<'_>, _: u64) -> FsResult<()> {
+        Err(FsError::ReadOnly)
+    }
+
+    async fn remove_directory(&self, _: FsPath<'_>) -> FsResult<()> {
+        Err(FsError::ReadOnly)
+    }
+
+    async fn unlink(&self, _: FsPath<'_>) -> FsResult<()> {
+        Err(FsError::ReadOnly)
+    }
+
+    async fn rename(&self, _: FsPath<'_>, _: FsPath<'_>, _: u64) -> FsResult<()> {
+        Err(FsError::ReadOnly)
+    }
+
+    async fn link(&self, _: FsPath<'_>, _: FsPath<'_>, _: u64) -> FsResult<()> {
+        Err(FsError::ReadOnly)
+    }
+
+    async fn symlink(&self, _: &str, _: FsPath<'_>, _: u64) -> FsResult<()> {
+        Err(FsError::ReadOnly)
+    }
+
+    async fn read_link(&self, path: FsPath<'_>) -> FsResult<String> {
+        // The image format carries no symbolic links.
+        self.index.metadata(path)?;
+        Err(FsError::Invalid)
+    }
+
+    async fn sync(&self, path: FsPath<'_>) -> FsResult<()> {
+        // Nothing here was ever written, so everything is already durable.
+        self.index.metadata(path).map(drop)
+    }
+
+    async fn sync_data(&self, path: FsPath<'_>) -> FsResult<()> {
+        self.index.metadata(path).map(drop)
+    }
 }
 
 #[cfg(test)]
@@ -492,24 +424,43 @@ mod tests {
     extern crate std;
 
     use alloc::boxed::Box;
+    use alloc::string::String;
+    use alloc::vec::Vec;
 
     use futures_lite::future::block_on;
     use helios_artifact::bootfs::{EntryKind, WriteEntry, write_image};
+    use helios_hal::fs::{DeviceId, DirCookie, FileSystem, FsError, FsPath, NodeKind, OpenFlags};
 
-    use super::{BootDirectoryHandleExt, EmbeddedBootDirectory, EmbeddedBootFile, EmbeddedBootFs};
-    use helios_hal::fs::{
-        Directory, DirectoryEntry, DirectoryRights, File, FileRights, FileSystem,
-    };
-    use helios_hal::io::IoError;
+    use super::{BootFs, EmbeddedBootDirectory, EmbeddedBootFile, EmbeddedBootFs};
 
     const IMAGE: EmbeddedBootFs = EmbeddedBootFs::new(
-        &[EmbeddedBootDirectory::new("empty", 0)],
+        &[EmbeddedBootDirectory::new("empty", 7)],
         &[
-            EmbeddedBootFile::new("bin/init.program", b"init", 0),
+            EmbeddedBootFile::new("bin/init.program", b"init", 3),
             EmbeddedBootFile::new("lib/runtime.component", b"runtime", 0),
             EmbeddedBootFile::new("etc/config.txt", b"config", 0),
+            EmbeddedBootFile::new("lib/nested/deep.txt", b"deep", 0),
+            // Sorts between `lib` and `lib/…`: the run below `lib` must
+            // still be found.
+            EmbeddedBootFile::new("lib.txt", b"sibling", 0),
         ],
     );
+
+    fn boot() -> BootFs {
+        BootFs::new(IMAGE, DeviceId::new(1))
+    }
+
+    fn path(path: &str) -> FsPath<'_> {
+        FsPath::new(path).expect("test paths are valid")
+    }
+
+    fn names(fs: &BootFs, directory: &str) -> Vec<(String, NodeKind)> {
+        block_on(fs.read_dir(path(directory), DirCookie::START, usize::MAX))
+            .expect("directory lists")
+            .into_iter()
+            .map(|entry| (entry.name, entry.kind))
+            .collect()
+    }
 
     /// A bootfs read back out of a real `helios-bootfs` image — the same
     /// parse the kernel applies to the payload a backend hands it.
@@ -546,103 +497,91 @@ mod tests {
     }
 
     #[test]
-    fn lists_root_entries() {
-        let root = IMAGE.root_directory(DirectoryRights::READ);
-        let entries = root.list();
+    fn lists_listed_and_implied_directories_once() {
+        let fs = boot();
+        assert_eq!(
+            names(&fs, ""),
+            [
+                (String::from("bin"), NodeKind::Directory),
+                (String::from("empty"), NodeKind::Directory),
+                (String::from("etc"), NodeKind::Directory),
+                (String::from("lib"), NodeKind::Directory),
+                (String::from("lib.txt"), NodeKind::File),
+            ]
+        );
+        assert_eq!(
+            names(&fs, "lib"),
+            [
+                (String::from("nested"), NodeKind::Directory),
+                (String::from("runtime.component"), NodeKind::File),
+            ]
+        );
+        assert_eq!(names(&fs, "empty"), []);
+    }
 
-        assert_eq!(entries.len(), 4);
-        assert!(
-            entries
-                .iter()
-                .any(|entry| entry.name() == "bin" && entry.is_directory())
+    #[test]
+    fn listing_resumes_from_a_cookie() {
+        let fs = boot();
+        let first = block_on(fs.read_dir(FsPath::ROOT, DirCookie::START, 2)).expect("lists");
+        assert_eq!(first.len(), 2);
+        let rest = block_on(fs.read_dir(FsPath::ROOT, first[1].next, usize::MAX)).expect("lists");
+        let all: Vec<_> = first.iter().chain(&rest).map(|entry| &entry.name).collect();
+        assert_eq!(all, ["bin", "empty", "etc", "lib", "lib.txt"]);
+    }
+
+    #[test]
+    fn stat_reports_identity_size_and_listed_timestamps() {
+        let fs = boot();
+        let root = block_on(fs.stat(FsPath::ROOT)).expect("root stats");
+        let file = block_on(fs.stat(path("bin/init.program"))).expect("file stats");
+        let empty = block_on(fs.stat(path("empty"))).expect("listed directory stats");
+        assert_eq!(root.kind, NodeKind::Directory);
+        assert_eq!(
+            (file.kind, file.size, file.modified_nanos),
+            (NodeKind::File, 4, 3)
         );
-        assert!(
-            entries
-                .iter()
-                .any(|entry| entry.name() == "lib" && entry.is_directory())
-        );
-        assert!(
-            entries
-                .iter()
-                .any(|entry| entry.name() == "etc" && entry.is_directory())
-        );
-        assert!(
-            entries
-                .iter()
-                .any(|entry| entry.name() == "empty" && entry.is_directory())
+        assert_eq!(empty.modified_nanos, 7);
+        assert_eq!(file.id.device, DeviceId::new(1));
+        assert_ne!(file.id, empty.id);
+        assert_ne!(file.id, root.id);
+        assert_eq!(
+            block_on(fs.stat(path("bin/missing"))).map(drop),
+            Err(FsError::NoEntry)
         );
     }
 
     #[test]
-    fn opens_nested_files() {
-        let root = IMAGE.root_directory(DirectoryRights::READ);
-        let lib = root
-            .open_directory("lib", DirectoryRights::READ)
-            .expect("embedded lib directory must exist");
-        let runtime = lib
-            .open_file("runtime.component", FileRights::READ)
-            .expect("embedded runtime.component must exist");
-
-        assert_eq!(runtime.object().path(), "lib/runtime.component");
-        assert_eq!(runtime.object().contents(), b"runtime");
+    fn reads_positionally_and_refuses_every_mutation() {
+        let fs = boot();
+        let read = block_on(fs.read_at(path("lib/runtime.component"), 2, 3)).expect("reads");
+        assert_eq!(read.as_ref(), b"nti");
+        let past_end = block_on(fs.read_at(path("lib/runtime.component"), 99, 3)).expect("reads");
+        assert!(past_end.is_empty());
+        assert_eq!(
+            block_on(fs.write_at(path("etc/config.txt"), 0, b"x", 0)),
+            Err(FsError::ReadOnly)
+        );
+        assert_eq!(
+            block_on(fs.open(path("etc/new"), OpenFlags::CREATE, 0)).map(drop),
+            Err(FsError::ReadOnly)
+        );
+        assert_eq!(
+            block_on(fs.unlink(path("etc/config.txt"))),
+            Err(FsError::ReadOnly)
+        );
     }
 
     #[test]
-    fn packs_directory_tree_in_payload() {
-        let root = payload_image().root_directory(DirectoryRights::READ);
-        let bin = root
-            .open_directory("bin", DirectoryRights::READ)
-            .expect("payload bin directory must exist");
-        let init = bin
-            .open_file("init.txt", FileRights::READ)
-            .expect("payload init.txt must exist");
-        let lib = root
-            .open_directory("lib", DirectoryRights::READ)
-            .expect("payload lib directory must exist");
-        let module = lib
-            .open_file("module.txt", FileRights::READ)
-            .expect("payload module.txt must exist");
-
-        assert_eq!(init.object().contents(), b"boot init\n");
-        assert_eq!(module.object().contents(), b"boot module\n");
-    }
-
-    #[test]
-    fn exposes_read_only_filesystem_trait() {
-        let entry = block_on(payload_image().open("/lib/module.txt"))
-            .expect("bootfs open should succeed")
-            .expect("module.txt must exist");
-        let mut file = match entry {
-            DirectoryEntry::File(file) => file,
-            DirectoryEntry::Directory(_) => panic!("expected file entry"),
-        };
-        let mut buf = [0_u8; 32];
-        let read = block_on(file.read(&mut buf)).expect("bootfs read should succeed");
-        let write = block_on(file.write(b"mutate"));
-
-        assert_eq!(&buf[..read], b"boot module\n");
-        assert!(matches!(write, Err(IoError::ReadOnly)));
-    }
-
-    #[test]
-    fn lists_directories_via_filesystem_trait() {
-        let entry = block_on(payload_image().open("/"))
-            .expect("bootfs open should succeed")
-            .expect("bootfs root must exist");
-        let directory = match entry {
-            DirectoryEntry::Directory(directory) => directory,
-            DirectoryEntry::File(_) => panic!("expected root directory"),
-        };
-        let entries = block_on(directory.list()).expect("bootfs list should succeed");
-
-        assert_eq!(entries.len(), 2);
-        assert!(entries.iter().any(|entry| matches!(
-            entry,
-            DirectoryEntry::Directory(directory) if directory.path() == "bin"
-        )));
-        assert!(entries.iter().any(|entry| matches!(
-            entry,
-            DirectoryEntry::Directory(directory) if directory.path() == "lib"
-        )));
+    fn serves_a_parsed_payload() {
+        let fs = BootFs::new(payload_image(), DeviceId::new(1));
+        let read = block_on(fs.read_at(path("lib/module.txt"), 0, 64)).expect("reads");
+        assert_eq!(read.as_ref(), b"boot module\n");
+        assert_eq!(
+            names(&fs, ""),
+            [
+                (String::from("bin"), NodeKind::Directory),
+                (String::from("lib"), NodeKind::Directory),
+            ]
+        );
     }
 }

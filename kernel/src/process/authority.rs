@@ -67,6 +67,17 @@ bitflags! {
     }
 }
 
+bitflags! {
+    /// Rights over the kernel's mount table.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct MountAuthorityRights: u8 {
+        /// Attach a filesystem at a directory the holder may change.
+        const MOUNT = 1 << 0;
+        /// Detach a filesystem from a directory the holder may change.
+        const UNMOUNT = 1 << 1;
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DirectoryPreopen {
     source_path: String,
@@ -147,6 +158,19 @@ pub struct SymlinkCreateCap(LinkAuthorityRights);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SymlinkReadCap(LinkAuthorityRights);
 
+/// Authority to attach a filesystem at one mount point: the holder has the
+/// mount right and may change the directory at `point`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MountCap {
+    point: String,
+}
+
+/// Authority to detach the filesystem at one mount point.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnmountCap {
+    point: String,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProcessAuthority {
     directory_preopens: Vec<DirectoryPreopen>,
@@ -156,6 +180,7 @@ pub struct ProcessAuthority {
     terminal: TerminalAuthorityRights,
     process: ProcessAuthorityRights,
     link: LinkAuthorityRights,
+    mount: MountAuthorityRights,
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -186,6 +211,12 @@ pub enum ProcessAuthorityError {
     ProcessGrantExceedsAuthority(ProcessAuthorityRights),
     #[error("link grant exceeds caller authority: {0:?}")]
     LinkGrantExceedsAuthority(LinkAuthorityRights),
+    #[error("mount grant rights must not be empty")]
+    EmptyMountRights,
+    #[error("mount grant exceeds caller authority: {0:?}")]
+    MountGrantExceedsAuthority(MountAuthorityRights),
+    #[error("mount point {0} is outside the caller's mutate-directory authority")]
+    MountPointOutsideAuthority(String),
 }
 
 impl DirectoryPreopen {
@@ -300,6 +331,20 @@ impl_link_cap!(LinkTargetDirectoryCap);
 impl_link_cap!(SymlinkCreateCap);
 impl_link_cap!(SymlinkReadCap);
 
+impl MountCap {
+    /// The normalized guest path the filesystem is attached at.
+    pub fn point(&self) -> &str {
+        &self.point
+    }
+}
+
+impl UnmountCap {
+    /// The normalized guest path the filesystem is detached from.
+    pub fn point(&self) -> &str {
+        &self.point
+    }
+}
+
 impl ProcessAuthority {
     pub const fn empty() -> Self {
         Self {
@@ -310,6 +355,7 @@ impl ProcessAuthority {
             terminal: TerminalAuthorityRights::empty(),
             process: ProcessAuthorityRights::empty(),
             link: LinkAuthorityRights::empty(),
+            mount: MountAuthorityRights::empty(),
         }
     }
 
@@ -358,6 +404,7 @@ impl ProcessAuthority {
                 | LinkAuthorityRights::SYMLINK_CREATE
                 | LinkAuthorityRights::SYMLINK_READ,
         );
+        authority.grant_mount_rights(MountAuthorityRights::MOUNT | MountAuthorityRights::UNMOUNT);
         authority
     }
 
@@ -405,6 +452,10 @@ impl ProcessAuthority {
         self.link
     }
 
+    pub fn mount_rights(&self) -> MountAuthorityRights {
+        self.mount
+    }
+
     pub fn grant_network_rights(&mut self, rights: NetworkAuthorityRights) {
         self.network |= rights;
     }
@@ -423,6 +474,10 @@ impl ProcessAuthority {
 
     pub fn grant_link_rights(&mut self, rights: LinkAuthorityRights) {
         self.link |= rights;
+    }
+
+    pub fn grant_mount_rights(&mut self, rights: MountAuthorityRights) {
+        self.mount |= rights;
     }
 
     pub fn derive_directory_preopen(
@@ -623,6 +678,46 @@ impl ProcessAuthority {
             .map(SymlinkReadCap)
     }
 
+    pub fn derive_mount_rights(
+        &self,
+        rights: MountAuthorityRights,
+    ) -> Result<MountAuthorityRights, ProcessAuthorityError> {
+        if rights.is_empty() {
+            return Err(ProcessAuthorityError::EmptyMountRights);
+        }
+        if !self.mount.contains(rights) {
+            return Err(ProcessAuthorityError::MountGrantExceedsAuthority(rights));
+        }
+        Ok(rights)
+    }
+
+    /// Authority to attach a filesystem at `point`: the mount right, and
+    /// mutate-directory authority over the point, since a mount replaces
+    /// what the directory shows.
+    pub fn derive_mount_cap(&self, point: &str) -> Result<MountCap, ProcessAuthorityError> {
+        self.derive_mount_rights(MountAuthorityRights::MOUNT)?;
+        Ok(MountCap {
+            point: self.mutable_mount_point(point)?,
+        })
+    }
+
+    /// Authority to detach the filesystem at `point`, under the same
+    /// directory authority attaching it needed.
+    pub fn derive_unmount_cap(&self, point: &str) -> Result<UnmountCap, ProcessAuthorityError> {
+        self.derive_mount_rights(MountAuthorityRights::UNMOUNT)?;
+        Ok(UnmountCap {
+            point: self.mutable_mount_point(point)?,
+        })
+    }
+
+    fn mutable_mount_point(&self, point: &str) -> Result<String, ProcessAuthorityError> {
+        let point = normalize_authority_path(point)?;
+        if !self.has_directory_authority(&point, DirectoryAuthorityRights::MUTATE_DIRECTORY) {
+            return Err(ProcessAuthorityError::MountPointOutsideAuthority(point));
+        }
+        Ok(point)
+    }
+
     pub fn can_load_program(&self, path: &str) -> bool {
         self.has_directory_authority(path, DirectoryAuthorityRights::READ)
             || self.has_directory_authority(path, DirectoryAuthorityRights::EXECUTE)
@@ -653,6 +748,7 @@ impl ProcessAuthority {
             && self.terminal.contains(child.terminal)
             && self.process.contains(child.process)
             && self.link.contains(child.link)
+            && self.mount.contains(child.mount)
     }
 
     fn has_directory_authority(&self, path: &str, rights: DirectoryAuthorityRights) -> bool {
@@ -680,7 +776,7 @@ fn directory_contains(directory: &str, path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClockAuthorityRights, DirectoryAuthorityRights, LinkAuthorityRights,
+        ClockAuthorityRights, DirectoryAuthorityRights, LinkAuthorityRights, MountAuthorityRights,
         NetworkAuthorityRights, ProcessAuthority, ProcessAuthorityError, ProcessAuthorityRights,
         TerminalAuthorityRights,
     };
@@ -892,6 +988,90 @@ mod tests {
                 .derive_symlink_create_cap()
                 .expect_err("symlink create cap must require symlink-create right"),
             ProcessAuthorityError::LinkGrantExceedsAuthority(_)
+        ));
+    }
+
+    #[test]
+    fn mount_requires_the_mount_right() {
+        let mut authority = ProcessAuthority::empty();
+        authority.insert_directory_preopen(
+            super::DirectoryPreopen::new(
+                "/",
+                "/",
+                DirectoryAuthorityRights::READ | DirectoryAuthorityRights::MUTATE_DIRECTORY,
+            )
+            .expect("test preopen should be valid"),
+        );
+
+        assert!(matches!(
+            authority
+                .derive_mount_cap("/mnt")
+                .expect_err("a mount without the mount right must be refused"),
+            ProcessAuthorityError::MountGrantExceedsAuthority(MountAuthorityRights::MOUNT)
+        ));
+        assert!(matches!(
+            authority
+                .derive_unmount_cap("/mnt")
+                .expect_err("an unmount without the unmount right must be refused"),
+            ProcessAuthorityError::MountGrantExceedsAuthority(MountAuthorityRights::UNMOUNT)
+        ));
+    }
+
+    #[test]
+    fn mount_point_must_lie_under_mutate_directory_authority() {
+        let mut authority = ProcessAuthority::empty();
+        authority.grant_mount_rights(MountAuthorityRights::MOUNT);
+        authority.insert_directory_preopen(
+            super::DirectoryPreopen::new("/", "/", DirectoryAuthorityRights::READ)
+                .expect("test preopen should be valid"),
+        );
+        authority.insert_directory_preopen(
+            super::DirectoryPreopen::new(
+                "/data",
+                "/data",
+                DirectoryAuthorityRights::READ | DirectoryAuthorityRights::MUTATE_DIRECTORY,
+            )
+            .expect("test preopen should be valid"),
+        );
+
+        assert!(matches!(
+            authority
+                .derive_mount_cap("/mnt")
+                .expect_err("a read-only directory must not take a mount"),
+            ProcessAuthorityError::MountPointOutsideAuthority(_)
+        ));
+        assert!(matches!(
+            authority
+                .derive_mount_cap("/data/../data/disk")
+                .expect_err("an absolute mount point never climbs with `..`"),
+            ProcessAuthorityError::InvalidPath(_)
+        ));
+        let cap = authority
+            .derive_mount_cap("/data/disk")
+            .expect("a directory the caller may change takes a mount");
+        assert_eq!(cap.point(), "/data/disk");
+    }
+
+    #[test]
+    fn root_holds_mount_authority_and_delegates_a_subset() {
+        let root = ProcessAuthority::root();
+        assert_eq!(
+            root.derive_mount_cap("/mnt")
+                .expect("root may mount anywhere")
+                .point(),
+            "/mnt"
+        );
+
+        let mut child = ProcessAuthority::empty();
+        child.grant_mount_rights(
+            root.derive_mount_rights(MountAuthorityRights::MOUNT)
+                .expect("root may delegate the mount right"),
+        );
+        assert!(root.contains_authority(&child));
+        assert!(!child.contains_authority(&root));
+        assert!(matches!(
+            child.derive_mount_rights(MountAuthorityRights::UNMOUNT),
+            Err(ProcessAuthorityError::MountGrantExceedsAuthority(_))
         ));
     }
 

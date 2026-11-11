@@ -1840,6 +1840,7 @@ version = "0.1.0"
 dependencies = [
  "arrayvec",
  "bitflags 2.13.1",
+ "bytes",
  "fdt",
  "strength_reduce",
  "thiserror 2.0.20",

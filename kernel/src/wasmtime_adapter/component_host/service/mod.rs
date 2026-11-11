@@ -54,10 +54,11 @@ use crate::wasmtime_adapter::{WasmtimeCompiledComponent, WasmtimeCompiledCoreMod
 use crate::wasmtime_adapter::{
     WasmtimePrecompiledKind,
     wasi::{
-        DebugFileSystem, DebugFileSystemSnapshot, FsDescriptor, FsNodeKind, WasiImportSet,
+        self as wasi_fs, FileWriteMode, FsDescriptor, FsNodeKind, WasiImportSet,
         bindings::filesystem::types as fs_types, preview1 as p1,
     },
 };
+use crate::{MemoryFs, Namespace};
 use crate::{ProgramExecErrorDetail, RuntimeMessage};
 use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
@@ -194,7 +195,7 @@ pub(super) struct ProgramLaunch<Net: ComponentHostNetwork> {
     argv: ProgramArgv,
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
-    filesystem: Option<DebugFileSystemSnapshot>,
+    filesystem: Option<MemoryFs>,
     /// Inherited preview1 descriptors. Only core modules have a
     /// descriptor table; a component ignores one.
     descriptors: Option<Preview1DescriptorTable<Net>>,
@@ -212,7 +213,7 @@ impl<Net: ComponentHostNetwork> ProgramLaunch<Net> {
         argv: ProgramArgv,
         env: Vec<(String, String)>,
         authority: ProcessAuthority,
-        filesystem: Option<DebugFileSystemSnapshot>,
+        filesystem: Option<MemoryFs>,
     ) -> Self {
         Self {
             argv,
@@ -328,7 +329,7 @@ struct ProgramSpawnRequest<Net: ComponentHostNetwork> {
     argv: ProgramArgv,
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
-    filesystem: Option<DebugFileSystemSnapshot>,
+    filesystem: Option<MemoryFs>,
     descriptors: Option<Preview1DescriptorTable<Net>>,
     signal_state: WasixSignalState,
     signal_dispositions: Vec<WasixSignalDisposition>,
@@ -415,7 +416,7 @@ impl ChildHandle {
 pub struct ChildExit {
     pub instance_id: crate::InstanceId,
     pub exit_code: u32,
-    filesystem: Option<DebugFileSystemSnapshot>,
+    filesystem: Option<MemoryFs>,
 }
 
 pub fn install_program_service<CpuImpl, Net, HostFs, WatchdogImpl>(
@@ -1391,7 +1392,7 @@ where
         hint: Option<AotCompileHint>,
         stdin: Vec<u8>,
         launch: ProgramLaunch<Net>,
-    ) -> Result<(ExecResult, Option<DebugFileSystemSnapshot>), ProgramExecError> {
+    ) -> Result<(ExecResult, Option<MemoryFs>), ProgramExecError> {
         let executable = self
             .load_executable(
                 &exec_context,
@@ -1412,7 +1413,7 @@ where
         executable: ProgramExecutable<CpuImpl, Net, HostFs>,
         stdin: Vec<u8>,
         launch: ProgramLaunch<Net>,
-    ) -> Result<(ExecResult, Option<DebugFileSystemSnapshot>), ProgramExecError> {
+    ) -> Result<(ExecResult, Option<MemoryFs>), ProgramExecError> {
         let mut child = self.spawn_loaded(exec_context, executable, launch)?;
 
         // Feed stdin in one shot, then close the writer to signal EOF.

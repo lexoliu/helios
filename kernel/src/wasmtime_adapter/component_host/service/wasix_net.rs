@@ -2353,25 +2353,9 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    if let Some(host_path) = crate::guest_host_share_path(&file.path).map(ToOwned::to_owned) {
-        let service = caller
-            .data()
-            .filesystem
-            .host_service()
-            .map_err(p1_errno_from_fs)?;
-        let max_bytes = u32::try_from(count).map_err(|_| p1::errno::OVERFLOW)?;
-        return service
-            .read_file_range(&host_path, offset, max_bytes)
-            .await
-            .map(Bytes::from)
-            .map_err(|error| {
-                p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(error))
-            });
-    }
-    caller
-        .data()
-        .filesystem
-        .read_file_chunk(file, offset, count)
+    let namespace = p1_namespace(caller);
+    wasi_fs::read(&namespace, file, offset, count)
+        .await
         .map_err(p1_errno_from_fs)
 }
 

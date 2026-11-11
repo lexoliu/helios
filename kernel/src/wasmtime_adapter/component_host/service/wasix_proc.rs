@@ -397,13 +397,15 @@ where
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             WASIX_MODULE,
             "chdir",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
-             path: i32,
-             path_len: i32|
-             -> i32 { wasix_chdir(&mut caller, path as u32, path_len as u32) },
+             (path, path_len): (i32, i32)| {
+                Box::new(
+                    async move { wasix_chdir(&mut caller, path as u32, path_len as u32).await },
+                )
+            },
         )
         .map_err(map_program_runtime_error)?;
     linker
@@ -1012,7 +1014,7 @@ where
 pub(super) async fn wasix_path_filestat_get<CpuImpl, Net, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     fd: i32,
-    _flags: u32,
+    flags: u32,
     path: u32,
     path_len: u32,
     stat: u32,
@@ -1045,7 +1047,8 @@ where
             p1_null_device_stat(),
         );
     }
-    let (identity, stat_value) = match p1_stat_absolute_path(caller, &absolute).await {
+    let follow = p1_path_flags(flags).contains(fs_types::PathFlags::SYMLINK_FOLLOW);
+    let (identity, stat_value) = match p1_stat_absolute_path(caller, &absolute, follow).await {
         Ok(stat) => stat,
         Err(errno) => return errno,
     };
@@ -1369,7 +1372,7 @@ pub(super) fn wasix_getcwd_required_len(cwd: &str) -> Result<u32, i32> {
     u32::try_from(cwd.len()).map_err(|_| p1::errno::OVERFLOW)
 }
 
-pub(super) fn wasix_chdir<CpuImpl, Net, HostFs>(
+pub(super) async fn wasix_chdir<CpuImpl, Net, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     path: u32,
     path_len: u32,
@@ -1386,7 +1389,7 @@ where
         Ok(path) => path,
         Err(_) => return p1::errno::FAULT,
     };
-    caller.data_mut().chdir(&path)
+    caller.data_mut().chdir(&path).await
 }
 
 pub(super) fn wasix_callback_signal<CpuImpl, Net, HostFs>(
@@ -1847,7 +1850,7 @@ where
     let exec_context = caller.data().exec_context();
     let authority = caller.data().authority.clone();
     let descriptors = caller.data().descriptors.clone_for_exec();
-    let filesystem = Some(caller.data().filesystem.snapshot());
+    let filesystem = Some(caller.data().filesystem.root_layer());
     let signal_state = caller.data().signal_state.clone();
     let signal_dispositions = caller.data().signal_dispositions.clone();
     let write_serial = caller.data().write_serial;
@@ -2085,7 +2088,7 @@ where
             Ok(preopen) => preopen,
             Err(_) => return launch_exit_errno(&trace, p1::errno::FAULT),
         };
-        match wasix_proc_spawn_preopen_authority(caller.data(), &preopen, chroot) {
+        match wasix_proc_spawn_preopen_authority(caller, &preopen, chroot).await {
             Ok(authority) => authority,
             Err(errno) => return launch_exit_errno(&trace, errno),
         }
@@ -2097,11 +2100,14 @@ where
             Err(_) => return launch_exit_errno(&trace, p1::errno::FAULT),
         };
         if !working_dir.is_empty() && working_dir != "." {
-            let cwd =
-                match wasix_proc_spawn_resolve_child_cwd(caller.data(), &authority, &working_dir) {
-                    Ok(cwd) => cwd,
-                    Err(errno) => return launch_exit_errno(&trace, errno),
-                };
+            let cwd = match wasix_proc_spawn_resolve_child_cwd(&authority, &working_dir) {
+                Ok(cwd) => cwd,
+                Err(errno) => return launch_exit_errno(&trace, errno),
+            };
+            let namespace = p1_namespace(caller);
+            if let Err(errno) = wasix_require_directory(&namespace, &cwd.descriptor.path).await {
+                return launch_exit_errno(&trace, errno);
+            }
             let cap = match authority.derive_directory_cap(
                 &cwd.descriptor.path,
                 &cwd.guest_name,
@@ -2141,8 +2147,25 @@ where
     wasix_write_process_handles(caller, memory, ret_handles, result)
 }
 
-pub(super) fn wasix_proc_spawn_preopen_authority<CpuImpl, Net, HostFs>(
-    store: &Preview1ProgramStore<CpuImpl, Net, HostFs>,
+/// Refuses a path that does not name a directory.
+pub(super) async fn wasix_require_directory<HostFs>(
+    namespace: &Namespace<HostFs>,
+    path: &str,
+) -> Result<(), i32>
+where
+    HostFs: crate::HostFileSystem,
+{
+    let metadata = wasi_fs::stat_path(namespace, path, false)
+        .await
+        .map_err(p1_errno_from_fs)?;
+    if metadata.kind != helios_hal::fs::NodeKind::Directory {
+        return Err(p1::errno::NOTDIR);
+    }
+    Ok(())
+}
+
+pub(super) async fn wasix_proc_spawn_preopen_authority<CpuImpl, Net, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     preopen: &str,
     chroot: bool,
 ) -> Result<ProcessAuthority, i32>
@@ -2151,18 +2174,16 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    let mut authority = wasix_proc_spawn_inherited_non_directory_authority(&store.authority);
+    let namespace = p1_namespace(caller);
+    let mut authority =
+        wasix_proc_spawn_inherited_non_directory_authority(&caller.data().authority);
     let mut chroot_entry = None;
     for entry in wasix_split_lines(preopen) {
+        let store = caller.data();
         let guest_name = wasix_proc_spawn_preopen_guest_name(store.cwd.as_ref(), &entry)?;
         let (source_path, flags) = store.resolve_absolute_guest_path(&guest_name)?;
-        let stat = store
-            .filesystem
-            .stat(&source_path)
-            .map_err(p1_errno_from_fs)?;
-        if !matches!(stat.type_, fs_types::DescriptorType::Directory) {
-            return Err(p1::errno::NOTDIR);
-        }
+        wasix_require_directory(&namespace, &source_path).await?;
+        let store = caller.data();
         let rights = descriptor_flags_to_directory_authority(flags);
         if chroot {
             if chroot_entry.is_some() {
@@ -2181,7 +2202,8 @@ where
         let Some((source_path, rights)) = chroot_entry else {
             return Err(p1::errno::INVAL);
         };
-        let preopen = store
+        let preopen = caller
+            .data()
             .authority
             .derive_directory_preopen(&source_path, "/", rights)
             .map_err(|_| p1::errno::NOTCAPABLE)?;
@@ -2203,6 +2225,7 @@ pub(super) fn wasix_proc_spawn_inherited_non_directory_authority(
     authority.grant_terminal_rights(parent.terminal_rights());
     authority.grant_process_rights(parent.process_rights());
     authority.grant_link_rights(parent.link_rights());
+    authority.grant_mount_rights(parent.mount_rights());
     authority
 }
 
@@ -2218,16 +2241,13 @@ pub(super) fn wasix_proc_spawn_preopen_guest_name(
     }
 }
 
-pub(super) fn wasix_proc_spawn_resolve_child_cwd<CpuImpl, Net, HostFs>(
-    store: &Preview1ProgramStore<CpuImpl, Net, HostFs>,
+/// The working directory `path` names for a spawned child under
+/// `authority`; whether it is a directory is the caller's to check, with
+/// [`wasix_require_directory`].
+pub(super) fn wasix_proc_spawn_resolve_child_cwd(
     authority: &ProcessAuthority,
     path: &str,
-) -> Result<Preview1Cwd, i32>
-where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
-{
+) -> Result<Preview1Cwd, i32> {
     let (guest_name, source_path, flags) = if path.starts_with('/') {
         let guest_name =
             crate::resolve_absolute_path(path).map_err(p1_errno_from_component_path)?;
@@ -2244,13 +2264,6 @@ where
     };
     if !flags.contains(fs_types::DescriptorFlags::READ) {
         return Err(p1::errno::NOTCAPABLE);
-    }
-    let stat = store
-        .filesystem
-        .stat(&source_path)
-        .map_err(p1_errno_from_fs)?;
-    if !matches!(stat.type_, fs_types::DescriptorType::Directory) {
-        return Err(p1::errno::NOTDIR);
     }
     Ok(Preview1Cwd {
         guest_name,
@@ -2512,10 +2525,7 @@ where
         };
         let (code, filesystem) = wasix_child_exit_result(exit.await);
         if let Some(filesystem) = filesystem {
-            caller
-                .data_mut()
-                .filesystem
-                .replace_with_snapshot(filesystem);
+            caller.data_mut().filesystem.adopt_root_layer(filesystem);
         }
         let Some(index) = caller.data().find_child_index(Some(child_pid)) else {
             return wasix_write_join_nothing(caller, memory, ret_status);
@@ -2527,7 +2537,7 @@ where
 
 pub(super) fn wasix_child_exit_result(
     result: Result<Result<ChildExit, ProgramExecError>, futures::channel::oneshot::Canceled>,
-) -> (u32, Option<DebugFileSystemSnapshot>) {
+) -> (u32, Option<MemoryFs>) {
     match result {
         Ok(Ok(exit)) => (exit.exit_code, exit.filesystem),
         Ok(Err(_)) | Err(_) => (u32::from(p1::errno::IO as u16), None),
@@ -2918,7 +2928,8 @@ where
                     .map_err(|_| p1::errno::FAULT)?;
             let path = wasix_read_exec_string(caller, memory, path_ptr, path_len)
                 .map_err(|_| p1::errno::FAULT)?;
-            wasix_apply_spawn_chdir(caller.data(), snapshot, fd, &path)
+            let namespace = p1_namespace(caller);
+            wasix_apply_spawn_chdir(&namespace, snapshot, fd, &path).await
         }
         WASIX_PROC_SPAWN_FD_OP_FCHDIR => wasix_apply_spawn_fchdir(snapshot, fd),
         WASIX_PROC_SPAWN_FD_OP_OPEN => {
@@ -3043,18 +3054,18 @@ pub(super) fn wasix_spawn_resolve_open_base<Net: ComponentHostNetwork>(
     Ok((base, path.to_owned()))
 }
 
-pub(super) fn wasix_apply_spawn_chdir<CpuImpl, Net, HostFs>(
-    store: &Preview1ProgramStore<CpuImpl, Net, HostFs>,
+pub(super) async fn wasix_apply_spawn_chdir<HostFs, Net>(
+    namespace: &Namespace<HostFs>,
     snapshot: &mut WasixSpawnFdSnapshot<Net>,
     fd: i32,
     path: &str,
 ) -> Result<(), i32>
 where
-    CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    let cwd = wasix_spawn_resolve_cwd_target(store, snapshot, fd, path)?;
+    let cwd = wasix_spawn_resolve_cwd_target(snapshot, fd, path)?;
+    wasix_require_directory(namespace, &cwd.descriptor.path).await?;
     let cap = snapshot
         .authority
         .derive_directory_cap(
@@ -3105,17 +3116,13 @@ pub(super) fn wasix_apply_spawn_fchdir<Net: ComponentHostNetwork>(
     Ok(())
 }
 
-pub(super) fn wasix_spawn_resolve_cwd_target<CpuImpl, Net, HostFs>(
-    store: &Preview1ProgramStore<CpuImpl, Net, HostFs>,
+/// The working directory a spawn's `chdir` action names; whether it is a
+/// directory is the caller's to check, with [`wasix_require_directory`].
+pub(super) fn wasix_spawn_resolve_cwd_target<Net: ComponentHostNetwork>(
     snapshot: &WasixSpawnFdSnapshot<Net>,
     fd: i32,
     path: &str,
-) -> Result<Preview1Cwd, i32>
-where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
-{
+) -> Result<Preview1Cwd, i32> {
     let (guest_name, source_path, flags) = if path.starts_with('/') {
         let guest_name =
             crate::resolve_absolute_path(path).map_err(p1_errno_from_component_path)?;
@@ -3148,13 +3155,6 @@ where
 
     if !flags.contains(fs_types::DescriptorFlags::READ) {
         return Err(p1::errno::NOTCAPABLE);
-    }
-    let stat = store
-        .filesystem
-        .stat(&source_path)
-        .map_err(p1_errno_from_fs)?;
-    if !matches!(stat.type_, fs_types::DescriptorType::Directory) {
-        return Err(p1::errno::NOTDIR);
     }
     Ok(Preview1Cwd {
         guest_name,
@@ -3287,41 +3287,17 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    let host_path = crate::guest_host_share_path(source_path).map(ToOwned::to_owned);
-    let source_is_host = host_path.is_some();
-    let source = if let Some(host_path) = host_path {
-        let service = caller
-            .data()
-            .runtime_state
-            .host_filesystem_service()
-            .ok_or_else(|| {
-                wasmtime::Error::new(ProgramExecError {
-                    kind: ProgramExecErrorKind::PermissionDenied,
-                    detail: ProgramExecErrorDetail::ProgramSourceNotGranted,
-                })
-            })?;
-        service
-            .read_file(&host_path)
-            .await
-            .map(Bytes::from)
-            .map_err(|_| {
-                wasmtime::Error::new(ProgramExecError {
-                    kind: ProgramExecErrorKind::PermissionDenied,
-                    detail: ProgramExecErrorDetail::ProgramSourceNotGranted,
-                })
-            })?
-    } else {
-        caller
-            .data()
-            .filesystem
-            .read_program_file_bytes(source_path)
-            .map_err(|_| {
-                wasmtime::Error::new(ProgramExecError {
-                    kind: ProgramExecErrorKind::PermissionDenied,
-                    detail: ProgramExecErrorDetail::ProgramSourceNotGranted,
-                })
-            })?
-    };
+    let namespace = p1_namespace(caller);
+    let file = wasi_fs::read_program_file(&namespace, source_path)
+        .await
+        .map_err(|_| {
+            wasmtime::Error::new(ProgramExecError {
+                kind: ProgramExecErrorKind::PermissionDenied,
+                detail: ProgramExecErrorDetail::ProgramSourceNotGranted,
+            })
+        })?;
+    let source_is_host = file.from_host_share;
+    let source = file.bytes;
     let source = if cwasm::is_cwasm(&source) {
         if source_is_host {
             ProgramSource::SignedArtifact(source)
@@ -3439,7 +3415,7 @@ where
     let service = runtime_state.wait_for_program_service().await;
     let exec_context = caller.data().exec_context();
     let authority = authority.unwrap_or_else(|| caller.data().authority.clone());
-    let filesystem = Some(caller.data().filesystem.snapshot());
+    let filesystem = Some(caller.data().filesystem.root_layer());
     let launch_started = p1_kernel_profile_start(caller.data());
     let mut child = service
         .spawn_with_output_mode(

@@ -60,7 +60,7 @@ where
     pub(super) env: Vec<(String, String)>,
     pub(super) executable: ProgramExecutable<CpuImpl, Net, HostFs>,
     pub(super) authority: ProcessAuthority,
-    pub(super) filesystem: Option<DebugFileSystemSnapshot>,
+    pub(super) filesystem: Option<MemoryFs>,
     pub(super) descriptors: Option<Preview1DescriptorTable<Net>>,
     pub(super) signal_state: WasixSignalState,
     pub(super) signal_dispositions: Vec<WasixSignalDisposition>,
@@ -152,7 +152,7 @@ pub(super) struct WasixProcessSnapshot<Net: ComponentHostNetwork> {
     pub(super) memory: Vec<u8>,
     pub(super) memory_pages: u32,
     pub(super) descriptors: Preview1DescriptorTable<Net>,
-    pub(super) filesystem: DebugFileSystemSnapshot,
+    pub(super) filesystem: MemoryFs,
     pub(super) authority: ProcessAuthority,
     pub(super) cwd: Option<Preview1Cwd>,
     pub(super) arguments: Vec<String>,
@@ -174,11 +174,17 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    let filesystem = crate::wasmtime_adapter::wasi::DebugFileSystem::<
-        HostRuntimeState<CpuImpl, Net, HostFs>,
-        HostFs,
-    >::new(runtime_state.clone());
-    filesystem.read_program_file_bytes(path).ok()
+    let inside = path
+        .strip_prefix('/')
+        .expect("a boot artifact is named by an absolute guest path");
+    let path = helios_hal::fs::FsPath::new(inside)
+        .expect("a boot artifact path is a normalized filesystem path");
+    runtime_state
+        .mounts()
+        .boot()
+        .file_contents(path)
+        .ok()
+        .map(Bytes::from_static)
 }
 
 impl<Net: ComponentHostNetwork> WasixAsyncifyState<Net> {
@@ -199,7 +205,7 @@ pub(super) async fn run_program_executable<CpuImpl, Net, HostFs>(
     argv: ProgramArgv,
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
-    filesystem: Option<DebugFileSystemSnapshot>,
+    filesystem: Option<MemoryFs>,
     descriptors: Option<Preview1DescriptorTable<Net>>,
     signal_state: WasixSignalState,
     signal_dispositions: Vec<WasixSignalDisposition>,
@@ -304,7 +310,7 @@ pub(super) async fn run_program_core_module<CpuImpl, Net, HostFs>(
     argv: ProgramArgv,
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
-    filesystem: Option<DebugFileSystemSnapshot>,
+    filesystem: Option<MemoryFs>,
     descriptors: Option<Preview1DescriptorTable<Net>>,
     signal_state: WasixSignalState,
     signal_dispositions: Vec<WasixSignalDisposition>,
@@ -558,7 +564,7 @@ pub(super) async fn run_program_core_module_with_restore<CpuImpl, Net, HostFs>(
     argv: ProgramArgv,
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
-    filesystem: Option<DebugFileSystemSnapshot>,
+    filesystem: Option<MemoryFs>,
     signal_state: WasixSignalState,
     spawner: crate::InstanceSpawner<CpuImpl>,
     progress: helios_hal::watchdog::ProgressCounter,
@@ -835,7 +841,7 @@ where
         Ok(()) => CoreModuleRunCompletion::Exit(Ok(ChildExit {
             instance_id: run.instance_id,
             exit_code: 0,
-            filesystem: Some(store.data().filesystem.snapshot()),
+            filesystem: Some(store.data().filesystem.root_layer()),
         })),
         // Main's call stopped because a spawned thread ended the process;
         // the process ends the way that thread's call ended it: it exits
@@ -848,7 +854,7 @@ where
                 WasixProcessEnd::Exit(code) => CoreModuleRunCompletion::Exit(Ok(ChildExit {
                     instance_id: run.instance_id,
                     exit_code: code,
-                    filesystem: Some(store.data().filesystem.snapshot()),
+                    filesystem: Some(store.data().filesystem.root_layer()),
                 })),
                 WasixProcessEnd::Exec(replacement) => CoreModuleRunCompletion::Exec(replacement),
                 WasixProcessEnd::Fail(failure) => CoreModuleRunCompletion::Exit(Err(failure)),
@@ -862,7 +868,7 @@ where
                 CoreModuleRunCompletion::Exit(end.map(|exit_code| ChildExit {
                     instance_id: run.instance_id,
                     exit_code,
-                    filesystem: Some(store.data().filesystem.snapshot()),
+                    filesystem: Some(store.data().filesystem.root_layer()),
                 }))
             }
         }
@@ -985,7 +991,7 @@ pub(super) async fn run_program_component<CpuImpl, Net, HostFs>(
     argv: ProgramArgv,
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
-    filesystem: Option<DebugFileSystemSnapshot>,
+    filesystem: Option<MemoryFs>,
     _signal_state: WasixSignalState,
     spawner: crate::InstanceSpawner<CpuImpl>,
     progress: helios_hal::watchdog::ProgressCounter,
@@ -1022,10 +1028,8 @@ where
         .profiling_enabled()
         .then(|| profile_cpu.now().ticks());
     let filesystem = match filesystem {
-        Some(snapshot) => {
-            DebugFileSystem::from_snapshot(exec_context.runtime_state.clone(), snapshot)
-        }
-        None => DebugFileSystem::new(exec_context.runtime_state.clone()),
+        Some(snapshot) => Namespace::sharing(exec_context.runtime_state.mounts(), snapshot),
+        None => Namespace::new(exec_context.runtime_state.mounts()),
     };
     let (mut store, interrupts) = crate::wasmtime_adapter::store_with_state(
         engine,
@@ -1553,7 +1557,7 @@ where
         memory: memory_bytes,
         memory_pages,
         descriptors: store.data().descriptors.clone(),
-        filesystem: store.data().filesystem.snapshot(),
+        filesystem: store.data().filesystem.root_layer(),
         authority: store.data().authority.clone(),
         cwd: store.data().cwd.clone(),
         arguments: store.data().arguments.clone(),
@@ -1731,7 +1735,7 @@ where
             argv,
             environment,
             store.data().authority.clone(),
-            Some(store.data().filesystem.snapshot()),
+            Some(store.data().filesystem.root_layer()),
         ),
         output_mode,
         ChildStdio {

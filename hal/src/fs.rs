@@ -1,12 +1,18 @@
 pub use crate::io::{IoError, IoResult};
 
 use crate::resource::{KernelResource, ResourceRights};
+use alloc::string::String;
 use alloc::vec::Vec;
 use bitflags::bitflags;
+use bytes::Bytes;
 use core::future::Future;
+use thiserror::Error;
 
 bitflags! {
-    #[derive(Clone, Copy, PartialEq, Eq)]
+    /// What a mount of a filesystem may do with it: a mount without
+    /// `WRITE` refuses every mutating operation whatever the filesystem
+    /// itself would allow.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct FileSystemRights: u8 {
         const READ = 1 << 0;
         const WRITE = 1 << 1;
@@ -66,78 +72,353 @@ pub type BlockDeviceHandle<T> = KernelResource<T, BlockDeviceRights>;
 /// optional host-share device.
 pub const HOST_SHARE_MOUNT_TAG: &str = "hostshare";
 
-/// Filesystem lookup result with concrete, already-rights-clamped resources.
+// The filesystem contract.
+//
+// It covers the POSIX file and directory operations (positional I/O,
+// `stat`, directory iteration, links, `fsync`) and follows the split the
+// Linux VFS draws between an inode, a dentry and an open file:
+//
+// - The *inode* layer is this trait. A filesystem answers for the objects
+//   it stores, named by a [`FsPath`] relative to its own root, and reports
+//   their identity ([`NodeId`]: the device and inode numbers `st_dev` and
+//   `st_ino` carry) and [`Metadata`].
+// - The *dentry* layer, turning a full path into a filesystem and a path
+//   inside it, belongs to whoever composes filesystems: the kernel's mount
+//   table resolves `..`, mount crossings and symbolic links before a
+//   filesystem sees a path, so an [`FsPath`] never holds `.`, `..` or an
+//   empty segment.
+// - The *open file* layer, an offset and the rights a descriptor was opened
+//   with, is the caller's: every data operation here is positional.
+//
+// Concurrency contract: every method takes `&self` and may be called from
+// any processor at once; an implementation serialises its own state.
+// Futures borrow their arguments only for the call, so a caller that must
+// own a transfer across polls clones the filesystem (every implementation
+// is a cheap handle) and the path into an owning future.
+
+/// Errors a filesystem operation reports.
 ///
-/// The resource itself carries its own rights, so callers do not need to keep a
-/// second side table to know what they may do with the returned handle.
-pub enum DirectoryEntry<Directory, File> {
-    Directory(Directory),
-    File(File),
+/// The set is the POSIX errno subset a filesystem operation can fail
+/// with; a layer above maps each variant onto its own codes.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum FsError {
+    #[error("no such file or directory")]
+    NoEntry,
+    #[error("file exists")]
+    Exists,
+    #[error("not a directory")]
+    NotDirectory,
+    #[error("is a directory")]
+    IsDirectory,
+    #[error("directory not empty")]
+    NotEmpty,
+    #[error("read-only filesystem object")]
+    ReadOnly,
+    #[error("operation not permitted")]
+    NotPermitted,
+    #[error("link or rename across filesystems")]
+    CrossDevice,
+    #[error("too many levels of symbolic links")]
+    Loop,
+    #[error("invalid argument")]
+    Invalid,
+    #[error("value too large for the filesystem")]
+    Overflow,
+    #[error("name is not valid UTF-8")]
+    IllegalByteSequence,
+    #[error("operation not supported by this filesystem")]
+    Unsupported,
+    #[error("input/output error")]
+    Io,
 }
 
-pub trait DirectoryEntryExt<Directory, File> {
-    fn directory(self) -> Option<Directory>;
-    fn file(self) -> Option<File>;
+pub type FsResult<T> = Result<T, FsError>;
+
+/// What kind of object a path names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum NodeKind {
+    Directory,
+    File,
+    Symlink,
 }
 
-impl<Directory, File> DirectoryEntryExt<Directory, File> for DirectoryEntry<Directory, File> {
-    fn directory(self) -> Option<Directory> {
-        match self {
-            Self::Directory(directory) => Some(directory),
-            Self::File(_) => None,
-        }
+/// Names one filesystem instance: what `st_dev` reports.
+///
+/// Two objects on the same device with the same inode number are the same
+/// object. Zero is reserved, so a zeroed field is never a valid device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct DeviceId(u64);
+
+impl DeviceId {
+    /// Panics on zero, the reserved value.
+    pub const fn new(raw: u64) -> Self {
+        assert!(raw != 0, "device id zero is reserved");
+        Self(raw)
     }
 
-    fn file(self) -> Option<File> {
-        match self {
-            Self::Directory(_) => None,
-            Self::File(file) => Some(file),
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+/// The identity of one filesystem object: `st_dev` and `st_ino`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct NodeId {
+    pub device: DeviceId,
+    pub inode: u64,
+}
+
+impl NodeId {
+    pub const fn new(device: DeviceId, inode: u64) -> Self {
+        Self { device, inode }
+    }
+}
+
+/// What `stat` reports about one object.
+///
+/// Times are nanoseconds since the Unix epoch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Metadata {
+    pub id: NodeId,
+    pub kind: NodeKind,
+    pub link_count: u64,
+    /// Bytes of a file, bytes of a symbolic link's target, zero for a
+    /// directory.
+    pub size: u64,
+    pub access_nanos: u64,
+    pub modified_nanos: u64,
+    pub status_nanos: u64,
+}
+
+bitflags! {
+    /// How [`FileSystem::open`] treats the object at a path.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct OpenFlags: u8 {
+        /// Create a regular file when nothing exists at the path.
+        const CREATE = 1 << 0;
+        /// With `CREATE`, fail with [`FsError::Exists`] when something
+        /// already exists at the path.
+        const EXCLUSIVE = 1 << 1;
+        /// Truncate an existing regular file to zero bytes.
+        const TRUNCATE = 1 << 2;
+        /// The object must be a directory.
+        const DIRECTORY = 1 << 3;
+    }
+}
+
+/// Where a directory listing resumes.
+///
+/// Opaque to the caller: it is [`DirCookie::START`] or a value a previous
+/// [`DirEntry::next`] returned, and it stays valid across calls the way a
+/// POSIX `telldir` position does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DirCookie(u64);
+
+impl DirCookie {
+    pub const START: Self = Self(0);
+
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+/// One entry of a directory listing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirEntry {
+    pub name: String,
+    pub kind: NodeKind,
+    /// The entry's inode number, or zero from a filesystem whose listing
+    /// does not carry one (a 9p share lists names and types only).
+    pub inode: u64,
+    /// The cookie that resumes the listing after this entry.
+    pub next: DirCookie,
+}
+
+/// A path relative to the root of one filesystem.
+///
+/// Holds no leading `/`, no empty segment, and no `.` or `..`: those are
+/// resolved by the layer that composes filesystems, before a path reaches
+/// one. The empty path names the filesystem's root.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FsPath<'a>(&'a str);
+
+impl<'a> FsPath<'a> {
+    pub const ROOT: FsPath<'static> = FsPath("");
+
+    /// Validates `path`, or `None` when it carries a leading or trailing
+    /// `/`, an empty segment, `.` or `..`.
+    pub fn new(path: &'a str) -> Option<Self> {
+        if path.is_empty() {
+            return Some(Self(path));
+        }
+        path.split('/')
+            .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
+            .then_some(Self(path))
+    }
+
+    pub const fn as_str(self) -> &'a str {
+        self.0
+    }
+
+    pub const fn is_root(self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The parent directory and the final name, or `None` for the root.
+    pub fn split_last(self) -> Option<(FsPath<'a>, &'a str)> {
+        if self.is_root() {
+            return None;
+        }
+        Some(match self.0.rsplit_once('/') {
+            Some((parent, name)) => (Self(parent), name),
+            None => (FsPath::ROOT, self.0),
+        })
+    }
+
+    /// Whether `self` is `ancestor` or lies below it.
+    pub fn starts_with(self, ancestor: FsPath<'_>) -> bool {
+        if ancestor.is_root() {
+            return true;
+        }
+        match self.0.strip_prefix(ancestor.0) {
+            Some(rest) => rest.is_empty() || rest.starts_with('/'),
+            None => false,
         }
     }
 }
 
-pub trait FileSystem: Send + Sync {
-    type Directory: Directory;
-    type File: File;
+/// One filesystem: the operations every mount kind implements.
+///
+/// Mutating operations take `now`, the caller's wall-clock time in
+/// nanoseconds since the Unix epoch, which a filesystem without a clock of
+/// its own stamps on what it changes; one that keeps its own time (a host
+/// share) ignores it. Symbolic links are never followed here: `stat`
+/// describes the link itself, and resolving a link is the caller's job.
+pub trait FileSystem: Clone + Send + Sync + 'static {
+    /// Describes the object at `path` without following a final symbolic
+    /// link.
+    fn stat<'a>(&'a self, path: FsPath<'a>)
+    -> impl Future<Output = FsResult<Metadata>> + Send + 'a;
 
-    fn open(
-        &self,
-        path: &str,
-    ) -> impl Future<Output = IoResult<Option<DirectoryEntry<Self::Directory, Self::File>>>> + Send;
+    /// Opens the object at `path` as `flags` asks, creating or truncating
+    /// a regular file, and describes what was opened.
+    fn open<'a>(
+        &'a self,
+        path: FsPath<'a>,
+        flags: OpenFlags,
+        now: u64,
+    ) -> impl Future<Output = FsResult<Metadata>> + Send + 'a;
 
-    fn create_directory(
-        &self,
-        path: &str,
-    ) -> impl Future<Output = IoResult<Self::Directory>> + Send;
+    /// Reads at most `max_bytes` from `offset`. An empty result is end of
+    /// file.
+    fn read_at<'a>(
+        &'a self,
+        path: FsPath<'a>,
+        offset: u64,
+        max_bytes: usize,
+    ) -> impl Future<Output = FsResult<Bytes>> + Send + 'a;
 
-    fn remove(&self, path: &str) -> impl Future<Output = IoResult<()>> + Send;
+    /// Writes all of `data` at `offset`, zero-filling any gap past the end.
+    fn write_at<'a>(
+        &'a self,
+        path: FsPath<'a>,
+        offset: u64,
+        data: &'a [u8],
+        now: u64,
+    ) -> impl Future<Output = FsResult<()>> + Send + 'a;
 
-    fn rename(&self, source: &str, destination: &str) -> impl Future<Output = IoResult<()>> + Send;
-}
+    /// Writes all of `data` at the end of the file as the filesystem sees
+    /// it at the time of the write, and resolves with the offset it landed
+    /// at.
+    fn append<'a>(
+        &'a self,
+        path: FsPath<'a>,
+        data: &'a [u8],
+        now: u64,
+    ) -> impl Future<Output = FsResult<u64>> + Send + 'a;
 
-pub trait File: Send {
-    fn read(&mut self, buf: &mut [u8]) -> impl Future<Output = IoResult<usize>> + Send;
-    fn write(&mut self, buf: &[u8]) -> impl Future<Output = IoResult<usize>> + Send;
+    /// Truncates or zero-extends a regular file to `size` bytes.
+    fn set_size<'a>(
+        &'a self,
+        path: FsPath<'a>,
+        size: u64,
+        now: u64,
+    ) -> impl Future<Output = FsResult<()>> + Send + 'a;
 
-    fn truncate(&mut self) -> impl Future<Output = IoResult<()>> + Send;
-}
+    /// Sets the access and modification times; `None` leaves one as it is.
+    fn set_times<'a>(
+        &'a self,
+        path: FsPath<'a>,
+        access_nanos: Option<u64>,
+        modified_nanos: Option<u64>,
+        now: u64,
+    ) -> impl Future<Output = FsResult<()>> + Send + 'a;
 
-pub trait Directory: Send {
-    type File: File;
+    /// Lists at most `max_entries` entries of the directory at `path`,
+    /// resuming at `cookie`. Fewer than `max_entries` means the listing is
+    /// complete. `.` and `..` are not listed.
+    fn read_dir<'a>(
+        &'a self,
+        path: FsPath<'a>,
+        cookie: DirCookie,
+        max_entries: usize,
+    ) -> impl Future<Output = FsResult<Vec<DirEntry>>> + Send + 'a;
 
-    fn list(&self) -> impl Future<Output = IoResult<Vec<DirectoryEntry<Self, Self::File>>>> + Send
-    where
-        Self: Sized;
+    fn create_directory<'a>(
+        &'a self,
+        path: FsPath<'a>,
+        now: u64,
+    ) -> impl Future<Output = FsResult<()>> + Send + 'a;
 
-    fn create_directory(&self, path: &str) -> impl Future<Output = IoResult<Self>> + Send
-    where
-        Self: Sized;
+    /// Removes an empty directory.
+    fn remove_directory<'a>(
+        &'a self,
+        path: FsPath<'a>,
+    ) -> impl Future<Output = FsResult<()>> + Send + 'a;
 
-    fn open_file(&self, path: &str) -> impl Future<Output = IoResult<Option<Self::File>>> + Send;
+    /// Removes a non-directory name.
+    fn unlink<'a>(&'a self, path: FsPath<'a>) -> impl Future<Output = FsResult<()>> + Send + 'a;
 
-    fn remove(&self, path: &str) -> impl Future<Output = IoResult<()>> + Send;
+    /// Moves `source` to `destination` within this filesystem.
+    fn rename<'a>(
+        &'a self,
+        source: FsPath<'a>,
+        destination: FsPath<'a>,
+        now: u64,
+    ) -> impl Future<Output = FsResult<()>> + Send + 'a;
 
-    fn rename(&self, source: &str, destination: &str) -> impl Future<Output = IoResult<()>> + Send;
+    /// Gives the non-directory at `existing` the further name `link`.
+    fn link<'a>(
+        &'a self,
+        existing: FsPath<'a>,
+        link: FsPath<'a>,
+        now: u64,
+    ) -> impl Future<Output = FsResult<()>> + Send + 'a;
+
+    /// Creates a symbolic link at `link` whose target text is `target`.
+    fn symlink<'a>(
+        &'a self,
+        target: &'a str,
+        link: FsPath<'a>,
+        now: u64,
+    ) -> impl Future<Output = FsResult<()>> + Send + 'a;
+
+    /// The target text of the symbolic link at `path`.
+    fn read_link<'a>(
+        &'a self,
+        path: FsPath<'a>,
+    ) -> impl Future<Output = FsResult<String>> + Send + 'a;
+
+    /// Makes the file's data and metadata durable.
+    fn sync<'a>(&'a self, path: FsPath<'a>) -> impl Future<Output = FsResult<()>> + Send + 'a;
+
+    /// Makes the file's data durable, and the metadata needed to read it
+    /// back.
+    fn sync_data<'a>(&'a self, path: FsPath<'a>) -> impl Future<Output = FsResult<()>> + Send + 'a;
 }
 
 bitflags! {
@@ -353,5 +634,38 @@ pub trait BlockDevice: Send + Sync {
 
     fn block_count(&self) -> usize {
         self.geometry().capacity_blocks
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FsPath;
+
+    #[test]
+    fn fs_path_refuses_what_resolution_must_remove() {
+        for refused in ["/a", "a/", "a//b", ".", "a/./b", "..", "a/../b"] {
+            assert_eq!(FsPath::new(refused), None, "{refused:?} must be refused");
+        }
+        for accepted in ["", "a", "a/b", "a/.b", "a..b"] {
+            assert!(
+                FsPath::new(accepted).is_some(),
+                "{accepted:?} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn fs_path_splits_and_compares_by_segment() {
+        let path = FsPath::new("usr/lib/python").expect("valid path");
+        let (parent, name) = path.split_last().expect("not the root");
+        assert_eq!((parent.as_str(), name), ("usr/lib", "python"));
+        assert_eq!(
+            FsPath::new("bin").and_then(FsPath::split_last),
+            Some((FsPath::ROOT, "bin"))
+        );
+        assert_eq!(FsPath::ROOT.split_last(), None);
+        assert!(path.starts_with(FsPath::new("usr").expect("valid path")));
+        assert!(path.starts_with(FsPath::ROOT));
+        assert!(!path.starts_with(FsPath::new("us").expect("valid path")));
     }
 }
