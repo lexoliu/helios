@@ -156,7 +156,7 @@ impl ResumeContext {
             handle_alloc_error(layout);
         }
         assert!(
-            ptr as usize % PAGE_BYTES == 0,
+            (ptr as usize).is_multiple_of(PAGE_BYTES),
             "the AArch64 kernel heap did not honour the page alignment of a resume context"
         );
         // SAFETY: the pointer came from the global allocator with this
