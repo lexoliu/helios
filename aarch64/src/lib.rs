@@ -1291,25 +1291,25 @@ extern "C" fn aarch64_handle_sync_exception(
         {
             return;
         }
-        // A reserved page inside a live fiber stack is a demand commit
-        // the kernel resolves here, with no lock and no allocation; the
-        // guard page below one is a stack overflow and stays a fault.
-        stack_fault = helios_kernel::resolve_stack_fault(helios_hal::vmm::VirtAddr::new(far_el1));
-        if stack_fault == helios_kernel::StackFault::Committed {
-            return;
-        }
-        // A swapped-out page is ours to resolve, and resolving it means
-        // waiting for the swap device. Redirect the faulting context
-        // onto a kernel trampoline running on its own stack, which can
-        // block the fiber the way a host call does; everything else —
-        // guard pages included — still belongs to the runtime.
-        if helios_kernel::swapped_token(helios_hal::vmm::VirtAddr::new(far_el1)).is_some() {
-            // SAFETY: `frame` is the frame the entry above wrote, and
-            // `enter_swap_fault_trampoline` only rewrites fields in it.
-            unsafe {
-                enter_swap_fault_trampoline(frame, far_el1);
+        match helios_kernel::classify_user_page_fault(helios_hal::vmm::VirtAddr::new(far_el1)) {
+            // A reserved page inside a live fiber stack was a demand
+            // commit the kernel resolved in place.
+            helios_kernel::UserPageFault::Resolved => return,
+            // A swapped-out page is ours to resolve, and resolving it
+            // means waiting for the swap device. Redirect the faulting
+            // context onto a kernel trampoline running on its own stack,
+            // which can block the fiber the way a host call does.
+            helios_kernel::UserPageFault::Swapped => {
+                // SAFETY: `frame` is the frame the entry above wrote, and
+                // `enter_swap_fault_trampoline` only rewrites fields in it.
+                unsafe {
+                    enter_swap_fault_trampoline(frame, far_el1);
+                }
+                return;
             }
-            return;
+            // Everything else — guard pages included — still belongs to
+            // the runtime.
+            helios_kernel::UserPageFault::Unclaimed(fault) => stack_fault = fault,
         }
     }
 
@@ -1376,33 +1376,24 @@ unsafe fn enter_swap_fault_trampoline(frame: *mut SyncTrapFrame, faulting_addres
 /// runtime's trap handler, which unwinds the guest. Only a fault the
 /// runtime does not claim either is fatal.
 extern "C" fn swap_fault_trampoline(frame: *mut SyncTrapFrame, faulting_address: usize) -> ! {
-    let outcome = helios_kernel::resolve_swap_fault_blocking(helios_hal::vmm::VirtAddr::new(
-        faulting_address,
-    ));
-    if outcome.is_ok() {
+    // SAFETY: the frame is intact; only its saved registers are read. The
+    // trampoline runs with the interrupt mask the faulting context had
+    // (`SPSR` was left alone), so what the runtime's unwind lands in runs
+    // on that context's terms without a mask to restore.
+    let (elr_el1, frame_pointer) = unsafe { ((*frame).elr as usize, (*frame).x[29] as usize) };
+    helios_kernel::run_swap_fault_trampoline(
+        helios_hal::vmm::VirtAddr::new(faulting_address),
+        KernelException {
+            cause: KernelExceptionCause::DataFault,
+            instruction_pointer: elr_el1,
+            frame_pointer,
+            faulting_address: Some(faulting_address),
+        },
         // SAFETY: `frame` is the copy `enter_swap_fault_trampoline` put
         // one frame below this stack's interrupted SP, and this code is
         // running on that stack.
-        unsafe { __helios_aarch64_swap_fault_resume(frame) }
-    }
-    // SAFETY: the frame is intact; only its saved registers are read.
-    let (elr_el1, frame_pointer) = unsafe { ((*frame).elr as usize, (*frame).x[29] as usize) };
-    tracing::error!(
-        target: "helios_aarch64::swap",
-        addr = faulting_address,
-        error = ?outcome.err(),
-        "page fault on a swapped-out page could not be resolved"
-    );
-    // As above: the handler returns only when it did not claim the fault.
-    // SAFETY: the frame is intact; only its saved `spsr` is read.
-    restore_irq_mask_for_unwind(unsafe { (*frame).spsr });
-    let _ = helios_kernel::dispatch_native_trap(KernelException {
-        cause: KernelExceptionCause::DataFault,
-        instruction_pointer: elr_el1,
-        frame_pointer,
-        faulting_address: Some(faulting_address),
-    });
-    panic!("unresolvable swap fault at {faulting_address:#x} that the runtime did not claim either")
+        || unsafe { __helios_aarch64_swap_fault_resume(frame) },
+    )
 }
 
 /// IRQ entry point for every exception level slot, called from
