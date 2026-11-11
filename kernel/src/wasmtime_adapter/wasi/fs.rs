@@ -55,11 +55,58 @@ pub(super) fn record_component_fs_profile<CpuImpl, Net, HostFs>(
     }
 }
 
+/// What a node holds, and where it came from.
+///
+/// A file seeded from the boot payload holds [`crate::BootfsBytes`]; every
+/// write, truncate or creation stores [`FileContents::Written`], so a
+/// node that anyone has modified can no longer claim the payload's trust.
+/// Directories and symlinks hold `Written` bytes (empty, or the link
+/// target).
+#[derive(Clone, Debug)]
+pub(crate) enum FileContents {
+    Bootfs(crate::BootfsBytes),
+    Written(Bytes),
+}
+
+// Every instance seeds one node per bootfs entry, so carrying provenance
+// must not make a node larger than the plain `Bytes` it replaced.
+const _: () = assert!(
+    core::mem::size_of::<FileContents>() == core::mem::size_of::<Bytes>(),
+    "FileContents must stay the size of Bytes"
+);
+
+impl FileContents {
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Bootfs(bytes) => bytes.as_slice(),
+            Self::Written(bytes) => bytes,
+        }
+    }
+
+    fn slice(&self, range: core::ops::Range<usize>) -> Bytes {
+        match self {
+            Self::Bootfs(bytes) => Bytes::from_static(&bytes.as_slice()[range]),
+            Self::Written(bytes) => bytes.slice(range),
+        }
+    }
+
+    fn into_bytes(self) -> Bytes {
+        match self {
+            Self::Bootfs(bytes) => bytes.to_bytes(),
+            Self::Written(bytes) => bytes,
+        }
+    }
+
+    const fn empty() -> Self {
+        Self::Written(Bytes::new())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct FsNode {
     pub(super) path: String,
     pub(super) kind: FsNodeKind,
-    pub(super) contents: Bytes,
+    pub(super) contents: FileContents,
     pub(super) identity: ObjectIdentity,
     pub(super) access_nanos: u64,
     pub(super) modified_nanos: u64,
@@ -91,7 +138,7 @@ impl FsNode {
     pub(super) fn new(
         path: String,
         kind: FsNodeKind,
-        contents: Bytes,
+        contents: FileContents,
         identity: ObjectIdentity,
         timestamp_nanos: u64,
         readonly: bool,
@@ -146,7 +193,7 @@ impl DebugFileSystemState {
         state.insert_node(FsNode::new(
             String::from("/"),
             FsNodeKind::Directory,
-            Bytes::new(),
+            FileContents::empty(),
             ObjectIdentity::new(AuthorityDomain::GUEST_BOOTFS, 1),
             0,
             false,
@@ -839,7 +886,7 @@ where
         self.snapshot.inner.lock().insert_node(FsNode::new(
             absolute,
             FsNodeKind::File,
-            Bytes::from_static(file.contents()),
+            FileContents::Bootfs(file.bootfs_bytes()),
             identity,
             modified_nanos,
             true,
@@ -880,7 +927,7 @@ where
                 } else {
                     FsNodeKind::File
                 },
-                Bytes::new(),
+                FileContents::empty(),
                 identity,
                 0,
                 true,
@@ -928,7 +975,7 @@ where
         state.insert_node(FsNode::new(
             path.to_owned(),
             FsNodeKind::Directory,
-            Bytes::new(),
+            FileContents::empty(),
             identity,
             timestamp_nanos,
             readonly,
@@ -945,7 +992,7 @@ where
     pub(super) fn node_size(node: &FsNode) -> u64 {
         match node.kind {
             FsNodeKind::Directory => 0,
-            FsNodeKind::File | FsNodeKind::Symlink => node.contents.len() as u64,
+            FsNodeKind::File | FsNodeKind::Symlink => node.contents.as_slice().len() as u64,
         }
     }
 
@@ -994,7 +1041,7 @@ where
         if node.kind != FsNodeKind::Symlink || !follow_symlink {
             return Ok(absolute.to_owned());
         }
-        let payload = core::str::from_utf8(&node.contents)
+        let payload = core::str::from_utf8(node.contents.as_slice())
             .map_err(|_| fs_types::ErrorCode::IllegalByteSequence)?;
         let target = Self::resolve_symlink_payload(absolute, payload)?;
         self.resolve_open_path(&target, follow_symlink, depth + 1)
@@ -1164,21 +1211,23 @@ where
         let offset: usize = offset
             .try_into()
             .map_err(|_| fs_types::ErrorCode::Overflow)?;
-        let contents = node.contents.as_ref();
-        if offset >= contents.len() {
+        let len = node.contents.as_slice().len();
+        if offset >= len {
             return Ok(Bytes::new());
         }
         let end = offset
             .checked_add(max_bytes)
-            .map(|value| value.min(contents.len()))
+            .map(|value| value.min(len))
             .ok_or(fs_types::ErrorCode::Overflow)?;
         Ok(node.contents.slice(offset..end))
     }
 
-    pub(crate) fn read_program_file_bytes(
+    /// The contents of the file at `path` with their provenance, which
+    /// is what decides how far a program read from it is trusted.
+    pub(crate) fn read_program_file(
         &self,
         path: &str,
-    ) -> core::result::Result<Bytes, fs_types::ErrorCode> {
+    ) -> core::result::Result<FileContents, fs_types::ErrorCode> {
         let node = self.get_node(path)?;
         if node.kind != FsNodeKind::File {
             return Err(fs_types::ErrorCode::IsDirectory);
@@ -1211,7 +1260,7 @@ where
                     .iter_mut()
                     .filter(|linked| linked.identity == node.identity)
                 {
-                    linked.contents = contents.clone();
+                    linked.contents = FileContents::Written(contents.clone());
                     linked.touch_modified(now_nanos);
                 }
                 Ok(())
@@ -1231,7 +1280,7 @@ where
                 state.insert_node(FsNode::new(
                     path.to_owned(),
                     FsNodeKind::File,
-                    Bytes::copy_from_slice(bytes),
+                    FileContents::Written(Bytes::copy_from_slice(bytes)),
                     identity,
                     now_nanos,
                     false,
@@ -1239,13 +1288,6 @@ where
                 Ok(())
             }
         }
-    }
-
-    pub(crate) fn is_readonly_path(
-        &self,
-        path: &str,
-    ) -> core::result::Result<bool, fs_types::ErrorCode> {
-        Ok(self.get_node(path)?.readonly)
     }
 
     pub(crate) fn write_at(
@@ -1328,12 +1370,13 @@ where
         let linked_count = node.link_count;
         let offset = match offset {
             FsWriteOffset::At(offset) => offset,
-            FsWriteOffset::Append => node.contents.len(),
+            FsWriteOffset::Append => node.contents.as_slice().len(),
         };
         let end = offset
             .checked_add(byte_len)
             .ok_or(fs_types::ErrorCode::Overflow)?;
-        let contents = core::mem::take(&mut state.nodes[index].contents);
+        let contents = core::mem::replace(&mut state.nodes[index].contents, FileContents::empty())
+            .into_bytes();
         let mut contents = if linked_count == 1 {
             match contents.try_into_mut() {
                 Ok(contents) => contents,
@@ -1355,7 +1398,7 @@ where
             .iter_mut()
             .filter(|node| node.identity == identity)
         {
-            linked.contents = contents.clone();
+            linked.contents = FileContents::Written(contents.clone());
             linked.touch_modified(now_nanos);
         }
         Ok(())
@@ -1410,7 +1453,8 @@ where
         }
         let identity = node.identity;
         let linked_count = node.link_count;
-        let contents = core::mem::take(&mut state.nodes[index].contents);
+        let contents = core::mem::replace(&mut state.nodes[index].contents, FileContents::empty())
+            .into_bytes();
         let mut contents = if linked_count == 1 {
             match contents.try_into_mut() {
                 Ok(contents) => contents,
@@ -1426,7 +1470,7 @@ where
             .iter_mut()
             .filter(|node| node.identity == identity)
         {
-            linked.contents = contents.clone();
+            linked.contents = FileContents::Written(contents.clone());
             linked.touch_modified(now_nanos);
         }
         Ok(())
@@ -1538,7 +1582,7 @@ where
                     .iter_mut()
                     .filter(|node| node.identity == identity)
                 {
-                    linked.contents = Bytes::new();
+                    linked.contents = FileContents::empty();
                     linked.touch_modified(now_nanos);
                 }
             }
@@ -1578,7 +1622,7 @@ where
         let node = FsNode::new(
             absolute.clone(),
             FsNodeKind::File,
-            Bytes::new(),
+            FileContents::empty(),
             identity,
             now_nanos,
             false,
@@ -1680,7 +1724,7 @@ where
         self.snapshot.inner.lock().insert_node(FsNode::new(
             absolute,
             FsNodeKind::Directory,
-            Bytes::new(),
+            FileContents::empty(),
             identity,
             now_nanos,
             false,
@@ -1814,7 +1858,7 @@ where
         self.snapshot.inner.lock().insert_node(FsNode::new(
             absolute,
             FsNodeKind::Symlink,
-            Bytes::copy_from_slice(payload.as_bytes()),
+            FileContents::Written(Bytes::copy_from_slice(payload.as_bytes())),
             identity,
             now_nanos,
             false,
@@ -1836,7 +1880,7 @@ where
         if node.kind != FsNodeKind::Symlink {
             return Err(fs_types::ErrorCode::Invalid);
         }
-        let payload = core::str::from_utf8(&node.contents)
+        let payload = core::str::from_utf8(node.contents.as_slice())
             .map_err(|_| fs_types::ErrorCode::IllegalByteSequence)?;
         Ok(payload.to_owned())
     }
