@@ -8,6 +8,7 @@ mod congestion;
 mod dhcp;
 mod dns;
 mod hash;
+mod icmp_rate;
 mod isn;
 mod ndp;
 mod packet;

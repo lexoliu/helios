@@ -24,6 +24,17 @@ impl Ipv4Address {
     pub const fn is_multicast(self) -> bool {
         self.0[0] >= 224 && self.0[0] <= 239
     }
+
+    /// `127.0.0.0/8`, the loopback network (RFC 1122 section 3.2.1.3).
+    pub const fn is_loopback(self) -> bool {
+        self.0[0] == 127
+    }
+
+    /// `240.0.0.0/4`, the reserved class E, which holds the limited
+    /// broadcast address too.
+    pub const fn is_class_e(self) -> bool {
+        self.0[0] >= 240
+    }
 }
 
 impl fmt::Debug for Ipv4Address {
