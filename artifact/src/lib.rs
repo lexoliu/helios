@@ -3,6 +3,12 @@
 extern crate alloc;
 
 pub mod bootfs;
+mod isa;
+
+pub use isa::{
+    CwasmIsaLevels, CwasmTarget, IsaFeature, IsaLevel, IsaLevelError, NativeFeatureProbe,
+    ProbeAnswers, cwasm_target_isa_levels,
+};
 
 use alloc::vec::Vec;
 use core::fmt;
