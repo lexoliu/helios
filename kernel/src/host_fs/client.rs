@@ -48,8 +48,8 @@ use triomphe::Arc;
 
 use super::cache::{CachedAttributes, HostFsCache, HostFsCacheStats, PooledReadFid};
 use crate::{
-    AuthorityDomain, HostDirEntry, HostFileSystem, HostFsError, HostFsErrorKind, HostMetadata,
-    ObjectIdentity, ProfileSink, RawMutex,
+    AuthorityDomain, HostDirEntry, HostDirLimit, HostFileSystem, HostFsError, HostFsErrorKind,
+    HostMetadata, ObjectIdentity, ProfileSink, RawMutex,
 };
 
 /// The msize this client asks for. The server answers with its own
@@ -1076,11 +1076,13 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         &self,
         session: Session,
         fid: u32,
+        limit: HostDirLimit,
     ) -> Result<Vec<HostDirEntry>, HostFsError> {
         self.open(fid, P9_DOTL_RDONLY | P9_DOTL_DIRECTORY).await?;
 
         let batch = u32::try_from(session.payload_chunk()).expect("a readdir batch fits in u32");
         let mut entries = Vec::new();
+        let mut name_bytes = 0_usize;
         let mut offset = 0_u64;
         loop {
             let response = self
@@ -1101,20 +1103,42 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
             if count == 0 {
                 break;
             }
-            let end = cursor + count;
+            // The count is the server's: it must lie inside the reply, and
+            // the entries must end exactly on it.
+            let end = cursor
+                .checked_add(count)
+                .filter(|end| *end <= response.len())
+                .ok_or(HostFsError::Protocol(
+                    "readdir payload count exceeds the reply",
+                ))?;
             while cursor < end {
                 let qid_type = read_u8(&response, cursor)?;
                 cursor += 1;
                 cursor += 4;
                 cursor += 8;
-                offset = read_u64_le(&response, cursor)?;
+                // The offset is the cookie the next `Treaddir` resumes from.
+                // One that does not move past the offset this batch was
+                // requested at, or past the entry before it, would have the
+                // server answer the same entries again forever.
+                let entry_offset = read_u64_le(&response, cursor)?;
+                if entry_offset <= offset {
+                    return Err(HostFsError::Protocol(
+                        "readdir offsets did not strictly increase",
+                    ));
+                }
+                offset = entry_offset;
                 cursor += 8;
                 let type_ = read_u8(&response, cursor)?;
                 cursor += 1;
                 let name = read_string(&response, &mut cursor)?;
+                if cursor > end {
+                    return Err(HostFsError::Protocol("readdir entry overran its payload"));
+                }
                 if name == "." || name == ".." {
                     continue;
                 }
+                name_bytes = name_bytes.saturating_add(name.len());
+                limit.check(entries.len() + 1, name_bytes)?;
                 entries.push(HostDirEntry {
                     name,
                     is_directory: qid_type & P9_QTDIR != 0 || type_ == 4,
@@ -1196,13 +1220,20 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         metadata
     }
 
-    async fn read_dir_impl(&self, path: &str) -> Result<Vec<HostDirEntry>, HostFsError> {
+    async fn read_dir_impl(
+        &self,
+        path: &str,
+        limit: HostDirLimit,
+    ) -> Result<Vec<HostDirEntry>, HostFsError> {
         if let Some(entries) = self.inner.cache.directory(path, self.now_nanos()) {
+            // A listing cached for an earlier caller may be past this one's limit.
+            let name_bytes: usize = entries.iter().map(|entry| entry.name.len()).sum();
+            limit.check(entries.len(), name_bytes)?;
             return Ok(entries);
         }
         let session = self.session().await?;
         let target = self.walk(session, path).await?;
-        let entries = self.read_dir_entries(session, target.value()).await;
+        let entries = self.read_dir_entries(session, target.value(), limit).await;
         self.clunk(target).await;
         if let Ok(entries) = &entries {
             self.inner
@@ -1602,8 +1633,12 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFileSystem
             .await
     }
 
-    async fn read_dir<'a>(&'a self, path: &'a str) -> Result<Vec<HostDirEntry>, HostFsError> {
-        self.profiled("op-read-dir", self.read_dir_impl(path), |entries| {
+    async fn read_dir<'a>(
+        &'a self,
+        path: &'a str,
+        limit: HostDirLimit,
+    ) -> Result<Vec<HostDirEntry>, HostFsError> {
+        self.profiled("op-read-dir", self.read_dir_impl(path, limit), |entries| {
             entries.iter().map(|entry| entry.name.len()).sum()
         })
         .await
@@ -2034,6 +2069,46 @@ mod tests {
         fail_type: Option<u8>,
         /// Answer every request with a tag nobody asked under.
         corrupt_tag: bool,
+        /// How `Treaddir` is answered, when not with an empty batch.
+        readdir: ReaddirFault,
+    }
+
+    /// A misbehaving answer to `Treaddir`.
+    #[derive(Clone, Copy, Default)]
+    enum ReaddirFault {
+        /// An empty batch: the end of the directory.
+        #[default]
+        None,
+        /// The same one-entry batch every time, whatever offset was asked.
+        RepeatBatch,
+        /// A fresh one-entry batch every time, with offsets that rise, so
+        /// the directory never ends.
+        Endless,
+    }
+
+    /// A limit far above anything the happy-path tests list.
+    const TEST_DIR_LIMIT: HostDirLimit = HostDirLimit {
+        max_entries: 1 << 16,
+        max_name_bytes: 1 << 20,
+    };
+
+    /// One `Treaddir` entry: qid, offset, type, name.
+    fn dirent(offset: u64, name: &str) -> Vec<u8> {
+        let mut entry = Vec::new();
+        entry.extend_from_slice(&qid(0, offset));
+        entry.extend_from_slice(&offset.to_le_bytes());
+        entry.push(8); // DT_REG
+        entry.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        entry.extend_from_slice(name.as_bytes());
+        entry
+    }
+
+    /// An `Rreaddir` body carrying `entries`.
+    fn readdir_body(entries: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        body.extend_from_slice(entries);
+        body
     }
 
     #[derive(Default)]
@@ -2168,7 +2243,22 @@ mod tests {
                     let count = u32::from_le_bytes([body[12], body[13], body[14], body[15]]);
                     reply.extend_from_slice(&count.to_le_bytes());
                 }
-                P9_TREADDIR => reply.extend_from_slice(&0_u32.to_le_bytes()),
+                P9_TREADDIR => match self.inner.fault.readdir {
+                    ReaddirFault::None => reply.extend_from_slice(&0_u32.to_le_bytes()),
+                    ReaddirFault::RepeatBatch => {
+                        reply.extend_from_slice(&readdir_body(&dirent(7, "same")));
+                    }
+                    ReaddirFault::Endless => {
+                        let offset = u64::from_le_bytes([
+                            body[4], body[5], body[6], body[7], body[8], body[9], body[10],
+                            body[11],
+                        ]) + 1;
+                        reply.extend_from_slice(&readdir_body(&dirent(
+                            offset,
+                            &alloc::format!("entry-{offset}"),
+                        )));
+                    }
+                },
                 P9_TCLUNK => {
                     let fid = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
                     self.log().clunked.push(fid);
@@ -2542,9 +2632,12 @@ mod tests {
         } = fixture(P9_REQUESTED_MSIZE, FakeFault::default());
 
         block_on(async {
-            client.read_dir_impl("/alpha").await.expect("first listing");
             client
-                .read_dir_impl("/alpha")
+                .read_dir_impl("/alpha", TEST_DIR_LIMIT)
+                .await
+                .expect("first listing");
+            client
+                .read_dir_impl("/alpha", TEST_DIR_LIMIT)
                 .await
                 .expect("cached listing");
         });
@@ -2554,18 +2647,108 @@ mod tests {
     }
 
     #[test]
+    fn a_repeated_readdir_batch_is_a_protocol_error() {
+        let Fixture {
+            client, transport, ..
+        } = fixture(
+            P9_REQUESTED_MSIZE,
+            FakeFault {
+                readdir: ReaddirFault::RepeatBatch,
+                ..FakeFault::default()
+            },
+        );
+
+        let error = block_on(client.read_dir_impl("/alpha", TEST_DIR_LIMIT))
+            .expect_err("a server that repeats a batch must not loop the client");
+
+        assert!(
+            matches!(error, HostFsError::Protocol(message) if message.contains("strictly increase")),
+            "{error:?}"
+        );
+        assert_eq!(
+            transport.log().readdirs,
+            2,
+            "the second batch repeats the first one's offset and ends the listing"
+        );
+    }
+
+    #[test]
+    fn a_listing_past_the_callers_limit_is_an_error() {
+        let limit = HostDirLimit {
+            max_entries: 10,
+            max_name_bytes: 1 << 20,
+        };
+        let client = client(
+            P9_REQUESTED_MSIZE,
+            FakeFault {
+                readdir: ReaddirFault::Endless,
+                ..FakeFault::default()
+            },
+        );
+
+        let error = block_on(client.read_dir_impl("/alpha", limit))
+            .expect_err("an endless directory must hit the entry bound");
+
+        assert!(
+            matches!(
+                error,
+                HostFsError::DirectoryTooLarge {
+                    max_entries: 10,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn a_listing_past_the_callers_name_byte_limit_is_an_error() {
+        let limit = HostDirLimit {
+            max_entries: 1 << 16,
+            max_name_bytes: 64,
+        };
+        let client = client(
+            P9_REQUESTED_MSIZE,
+            FakeFault {
+                readdir: ReaddirFault::Endless,
+                ..FakeFault::default()
+            },
+        );
+
+        let error = block_on(client.read_dir_impl("/alpha", limit))
+            .expect_err("an endless directory must hit the byte bound");
+
+        assert!(
+            matches!(
+                error,
+                HostFsError::DirectoryTooLarge {
+                    max_name_bytes: 64,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
     fn creating_a_file_invalidates_the_parent_listing() {
         let Fixture {
             client, transport, ..
         } = fixture(P9_REQUESTED_MSIZE, FakeFault::default());
 
         block_on(async {
-            client.read_dir_impl("/alpha").await.expect("first listing");
+            client
+                .read_dir_impl("/alpha", TEST_DIR_LIMIT)
+                .await
+                .expect("first listing");
             client
                 .create_file_impl("/alpha/beta")
                 .await
                 .expect("create the file");
-            client.read_dir_impl("/alpha").await.expect("fresh listing");
+            client
+                .read_dir_impl("/alpha", TEST_DIR_LIMIT)
+                .await
+                .expect("fresh listing");
         });
 
         assert_eq!(

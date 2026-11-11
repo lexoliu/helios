@@ -3,7 +3,7 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::{HostDirEntry, HostFileSystem, HostFsError, HostMetadata};
+use crate::{HostDirEntry, HostDirLimit, HostFileSystem, HostFsError, HostMetadata};
 
 /// A [`HostFileSystem`] implementation that rejects every operation with
 /// [`helios_hal::io::IoError::Unsupported`].
@@ -35,6 +35,7 @@ impl HostFileSystem for UnsupportedHostFileSystem {
     fn read_dir(
         &self,
         _path: &str,
+        _limit: HostDirLimit,
     ) -> impl core::future::Future<Output = Result<Vec<HostDirEntry>, HostFsError>> + Send + '_
     {
         unsupported()
