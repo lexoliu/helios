@@ -4,10 +4,12 @@
 //! takes it; dropping what that returns — or dying — hands every surface
 //! back and leaves the outputs blank.
 //!
-//! Pixels never go through a call. A surface's frame buffer is memory
-//! the kernel pinned inside this program's own linear memory, so
-//! [`Surface::pixels`] is an ordinary mutable slice and drawing a frame
-//! is writing to it. [`Surface::present`] then costs one round trip and
+//! Pixels never go through a call. A surface's frame buffer is whole
+//! pages of this program's own heap that the kernel backs with the
+//! device's pinned frames for as long as the surface lives, so
+//! [`Surface::pixels`] is an ordinary mutable slice — `copy_from_slice`
+//! and `fill` work on it like on any other — and drawing a frame is
+//! writing to it. [`Surface::present`] then costs one round trip and
 //! copies nothing: the display engine reads the same bytes.
 
 use std::vec::Vec;
@@ -15,11 +17,15 @@ use std::vec::Vec;
 use thiserror::Error;
 
 use crate::bindings::helios::system::display as raw;
+use crate::memory::{Backed, Block, BlockError};
 use crate::wit_bindgen::StreamReader;
 
 pub use crate::bindings::helios::system::display::{
-    DisplayChange, FrameToken, Mode, PixelFormat, Placement, Point, Rect, Scanout,
+    DisplayChange, FrameToken, Mode, PixelFormat, Point, Rect, Scanout,
 };
+/// Every pixel format this contract carries is four bytes wide.
+pub use crate::memory::BYTES_PER_PIXEL;
+pub use crate::memory::Span;
 
 /// Why a display request was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
@@ -38,12 +44,14 @@ pub enum DisplayError {
     OutOfBounds,
     #[error("this claim already holds as many surfaces as it may")]
     TooManySurfaces,
-    #[error("this program's display window has no room left")]
-    WindowExhausted,
+    #[error("the frame buffer's pages are not a whole-page run of this program's memory")]
+    BadSpan,
     #[error("no contiguous run of memory left for a frame buffer")]
     OutOfMemory,
     #[error("the display engine faulted")]
     DeviceFault,
+    #[error("this program's heap cannot supply the frame buffer: {0}")]
+    Heap(#[from] BlockError),
 }
 
 impl From<raw::Error> for DisplayError {
@@ -56,15 +64,12 @@ impl From<raw::Error> for DisplayError {
             raw::Error::UnsupportedMode => Self::UnsupportedMode,
             raw::Error::OutOfBounds => Self::OutOfBounds,
             raw::Error::TooManySurfaces => Self::TooManySurfaces,
-            raw::Error::WindowExhausted => Self::WindowExhausted,
+            raw::Error::BadSpan => Self::BadSpan,
             raw::Error::OutOfMemory => Self::OutOfMemory,
             raw::Error::DeviceFault => Self::DeviceFault,
         }
     }
 }
-
-/// Every pixel format this contract carries is four bytes wide.
-pub const BYTES_PER_PIXEL: usize = 4;
 
 /// The hardware cursor plane is a fixed 64 by 64 pixels.
 pub const CURSOR_WIDTH: u32 = 64;
@@ -112,19 +117,25 @@ impl Display {
 
     /// Create a frame buffer of `mode` in `format` and point `scanout`
     /// at it.
+    ///
+    /// The frame buffer is taken from this program's heap, sized to
+    /// `mode`, and starts zeroed.
     pub async fn create(
         &self,
         scanout: u32,
         mode: Mode,
         format: PixelFormat,
     ) -> Result<Surface, DisplayError> {
+        let block = Block::for_pixels(mode.width, mode.height)?;
         let raw = self
             .raw
-            .create(scanout, mode, format)
+            .create(scanout, mode, format, block.span())
             .await
             .map_err(DisplayError::from)?;
-        let buffer = raw.buffer();
-        Ok(Surface { raw, mode, buffer })
+        Ok(Surface {
+            frame: Backed::new(raw, block),
+            mode,
+        })
     }
 
     /// Every change to the device's set of outputs, from now on.
@@ -134,10 +145,13 @@ impl Display {
 }
 
 /// One frame buffer on one output.
+///
+/// The kernel resource and the heap pages its frame buffer is shown in
+/// are one value (see [`Backed`]): dropping the surface takes it off its
+/// output, and only then gives the pages back to the allocator.
 pub struct Surface {
-    raw: raw::Surface,
+    frame: Backed<raw::Surface>,
     mode: Mode,
-    buffer: Placement,
 }
 
 impl Surface {
@@ -146,9 +160,9 @@ impl Surface {
         self.mode
     }
 
-    /// Where the frame buffer sits in this program's linear memory.
-    pub const fn placement(&self) -> Placement {
-        self.buffer
+    /// The pages of this program's memory the frame buffer is shown at.
+    pub fn span(&self) -> Span {
+        self.frame.span()
     }
 
     /// How many bytes one row of this surface occupies.
@@ -161,33 +175,22 @@ impl Surface {
     /// Rows are [`Surface::stride`] bytes, top row first, with no
     /// padding between them. What is written here is what the display
     /// engine reads when [`Surface::present`] names it — there is no
-    /// staging copy anywhere.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the kernel placed the frame buffer somewhere this
-    /// program cannot address, which would mean the two disagree about
-    /// the size of a pointer.
+    /// staging copy anywhere. The slice is exactly
+    /// `stride * height` bytes of this program's own heap, valid for as
+    /// long as the borrow of the surface.
     pub fn pixels(&mut self) -> &mut [u8] {
-        let offset = usize::try_from(self.buffer.offset)
-            .expect("the kernel places a frame buffer inside this program's address space");
-        let length = usize::try_from(self.buffer.length)
-            .expect("the kernel places a frame buffer inside this program's address space");
-        // SAFETY: the kernel pinned `length` bytes of physically
-        // contiguous memory at `offset` in this program's linear memory
-        // and mapped them readable and writable for as long as this
-        // surface exists. Nothing else in this program can reach them:
-        // the offset is above everything the allocator can ever hand
-        // out, because the kernel caps this program's memory growth
-        // below it while it holds the display.
-        unsafe { core::slice::from_raw_parts_mut(offset as *mut u8, length) }
+        self.frame.bytes_mut()
     }
 
     /// Publish the pixels written into `region`.
     ///
     /// Resolves when the display engine has taken the frame.
     pub async fn present(&self, region: Rect) -> Result<FrameToken, DisplayError> {
-        self.raw.present(region).await.map_err(DisplayError::from)
+        self.frame
+            .resource()
+            .present(region)
+            .await
+            .map_err(DisplayError::from)
     }
 
     /// Publish the whole surface.
@@ -204,7 +207,7 @@ impl Surface {
     /// Every frame this surface publishes, one item per flush the
     /// display engine completes.
     pub fn vsync(&self) -> StreamReader<FrameToken> {
-        self.raw.vsync()
+        self.frame.resource().vsync()
     }
 
     /// Put `image` on the cursor plane of this surface's output.
@@ -214,7 +217,8 @@ impl Surface {
     /// value because the call hands it to the kernel: a borrow would
     /// only move the copy one level up.
     pub async fn set_cursor(&self, image: Vec<u8>, hotspot: Point) -> Result<(), DisplayError> {
-        self.raw
+        self.frame
+            .resource()
             .set_cursor(image, hotspot)
             .await
             .map_err(DisplayError::from)
@@ -226,7 +230,8 @@ impl Surface {
     /// the display engine's own cursor queue, so it never waits behind a
     /// frame this surface is presenting.
     pub async fn move_cursor(&self, position: Point) -> Result<(), DisplayError> {
-        self.raw
+        self.frame
+            .resource()
             .move_cursor(position)
             .await
             .map_err(DisplayError::from)
@@ -234,6 +239,10 @@ impl Surface {
 
     /// Take the pointer off this surface's output entirely.
     pub async fn hide_cursor(&self) -> Result<(), DisplayError> {
-        self.raw.hide_cursor().await.map_err(DisplayError::from)
+        self.frame
+            .resource()
+            .hide_cursor()
+            .await
+            .map_err(DisplayError::from)
     }
 }

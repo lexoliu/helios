@@ -21,11 +21,49 @@ use super::owner::MemoryOwner;
 
 /// A committed sub-range of a reservation, the flags it was granted,
 /// and the instance it was committed for.
+///
+/// A region can be *substituted*: its leaf entries were rewritten in
+/// place to show a pinned run or a device region instead of the pool
+/// frames the runtime committed. It stays part of the committed extent,
+/// so a protection change applies to it like any committed page and a
+/// commit never lands on it, but its frames are not the reservation's:
+/// they belong to the run's owner or to a device, so nothing that frees
+/// a reservation's frames may free them, swap and aging skip them, and
+/// they are not resident memory of [`Self::owner`]. The owner and flags
+/// stay recorded because ending the substitution puts memory back with
+/// them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CommittedRegion {
     pub range: VirtRange,
     pub flags: PageFlags,
     pub owner: MemoryOwner,
+    pub substituted: bool,
+}
+
+/// What [`ReservationTracker::record_decommit`] took out of the
+/// tracker.
+#[derive(Debug, Default)]
+pub struct Decommitted {
+    /// Swapped pages inside the range, whose tokens the caller must
+    /// release.
+    pub swapped: Vec<SwapEntry>,
+    /// The parts of the range that were substituted, coalesced and
+    /// ascending. Their frames are not the pool's: the caller drops
+    /// those mappings and shoots them down without freeing a frame,
+    /// before it frees the rest of the range.
+    pub substituted: Vec<VirtRange>,
+}
+
+/// What [`ReservationTracker::take_committed_intersections`] took out of
+/// the tracker.
+#[derive(Debug, Default)]
+pub struct CommittedRemoval {
+    /// Every committed sub-range that was removed, substituted ones
+    /// included.
+    pub ranges: Vec<VirtRange>,
+    /// The substituted parts of those, coalesced and ascending: see
+    /// [`Decommitted::substituted`].
+    pub substituted: Vec<VirtRange>,
 }
 
 /// One page whose contents live in a swap backend instead of memory.
@@ -153,6 +191,7 @@ impl ReservationTracker {
             range: virt,
             flags,
             owner,
+            substituted: false,
         });
         Ok(orphaned)
     }
@@ -169,38 +208,39 @@ impl ReservationTracker {
 
     /// Removes `virt` from the committed set after validating coverage,
     /// returning any swapped pages inside it whose tokens the caller
-    /// must release.
-    pub fn record_decommit(
-        &mut self,
-        virt: VirtRange,
-    ) -> Result<Vec<SwapEntry>, AddressSpaceError> {
+    /// must release and any substituted parts whose frames are not the
+    /// pool's to take back.
+    pub fn record_decommit(&mut self, virt: VirtRange) -> Result<Decommitted, AddressSpaceError> {
         self.ensure_committed(virt)?;
         let reservation = self.find_mut(virt)?;
+        let substituted = substituted_parts(&reservation.committed, virt);
         remove_committed_range(&mut reservation.committed, virt);
-        Ok(take_swapped_range(&mut reservation.swapped, virt))
+        Ok(Decommitted {
+            swapped: take_swapped_range(&mut reservation.swapped, virt),
+            substituted,
+        })
     }
 
     /// Replaces the committed flags for `virt` after the backend changed
     /// the hardware protection. Coverage must have been prechecked with
     /// [`Self::ensure_committed`].
+    ///
+    /// Each region the range touches keeps its own owner and its
+    /// substituted mark: a protection change is not a substitution
+    /// change.
     pub fn record_protect(
         &mut self,
         virt: VirtRange,
         flags: PageFlags,
     ) -> Result<(), AddressSpaceError> {
         let reservation = self.find_mut(virt)?;
-        let owner = reservation
-            .committed
-            .iter()
-            .find(|region| ranges_overlap(region.range, virt))
-            .map(|region| region.owner)
-            .unwrap_or(MemoryOwner::NONE);
+        let pieces = clipped_regions(&reservation.committed, virt);
         remove_committed_range(&mut reservation.committed, virt);
-        reservation.committed.push(CommittedRegion {
-            range: virt,
-            flags,
-            owner,
-        });
+        for piece in pieces {
+            reservation
+                .committed
+                .push(CommittedRegion { flags, ..piece });
+        }
         // A protection change applies to the swapped pages too: they go
         // back with the flags the runtime last asked for.
         for entry in &mut reservation.swapped {
@@ -208,6 +248,128 @@ impl ReservationTracker {
                 entry.flags = flags;
             }
         }
+        Ok(())
+    }
+
+    /// Whether `virt` can be substituted: inside a reservation, every
+    /// page committed or swapped out, and none of it substituted
+    /// already. Changes nothing.
+    ///
+    /// A swapped-out page counts because a program's buffer is ordinary
+    /// memory the swap policy may have evicted; the backend finds such a
+    /// page's leaf holding a swap descriptor instead of a frame.
+    ///
+    /// [`AddressSpaceError::NotCommitted`] when any page is neither,
+    /// [`AddressSpaceError::Substituted`] when any page already shows
+    /// something else.
+    pub fn check_substitutable(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
+        let reservation = self.find(virt)?;
+        if !committed_or_swapped_cover(&reservation.committed, &reservation.swapped, virt) {
+            return Err(AddressSpaceError::NotCommitted);
+        }
+        self.ensure_unsubstituted(virt)
+    }
+
+    /// Refuses with [`AddressSpaceError::Substituted`] when any page of
+    /// `virt` is substituted: for an operation that moves or copies the
+    /// pool frames behind a range, which a substitution does not have.
+    pub fn ensure_unsubstituted(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
+        let reservation = self.find(virt)?;
+        if reservation
+            .committed
+            .iter()
+            .any(|region| region.substituted && ranges_overlap(region.range, virt))
+        {
+            return Err(AddressSpaceError::Substituted);
+        }
+        Ok(())
+    }
+
+    /// Marks `virt` substituted after the backend rewrote its leaves.
+    /// The range stays committed, with the flags and owner each of its
+    /// regions already carried.
+    ///
+    /// A swapped-out page inside `virt` leaves the swapped set and joins
+    /// the substituted region with the flags and owner its swap entry
+    /// carried, so ending the substitution gives it back as it was. Its
+    /// entry is returned: the caller releases the token like one a
+    /// commit orphaned, and has no pool frame to free for that page.
+    pub fn record_substitute(
+        &mut self,
+        virt: VirtRange,
+    ) -> Result<Vec<SwapEntry>, AddressSpaceError> {
+        self.check_substitutable(virt)?;
+        let reservation = self.find_mut(virt)?;
+        let mut pieces = clipped_regions(&reservation.committed, virt);
+        remove_committed_range(&mut reservation.committed, virt);
+        let swapped = take_swapped_range(&mut reservation.swapped, virt);
+        pieces.extend(swapped.iter().map(|entry| CommittedRegion {
+            range: VirtRange::new(entry.addr, PhysFrame::SIZE),
+            flags: entry.flags,
+            owner: entry.owner,
+            substituted: false,
+        }));
+        for piece in pieces {
+            reservation.committed.push(CommittedRegion {
+                substituted: true,
+                ..piece
+            });
+        }
+        Ok(swapped)
+    }
+
+    /// The regions that make up `virt`, clipped to it, when every page
+    /// of it is substituted: what a backend needs to put memory back
+    /// with the flags and owner each page had.
+    ///
+    /// [`AddressSpaceError::NotSubstituted`] when any page of `virt` is
+    /// not.
+    pub fn substituted_regions(
+        &self,
+        virt: VirtRange,
+    ) -> Result<Vec<CommittedRegion>, AddressSpaceError> {
+        let reservation = self.find(virt)?;
+        if !substituted_regions_cover(&reservation.committed, virt) {
+            return Err(AddressSpaceError::NotSubstituted);
+        }
+        Ok(clipped_regions(&reservation.committed, virt))
+    }
+
+    /// Clears the substituted mark on `virt` after the backend put
+    /// memory back. The range stays committed with its flags and owner.
+    pub fn record_restore(&mut self, virt: VirtRange) -> Result<(), AddressSpaceError> {
+        let pieces = self.substituted_regions(virt)?;
+        let reservation = self.find_mut(virt)?;
+        remove_committed_range(&mut reservation.committed, virt);
+        for piece in pieces {
+            reservation.committed.push(CommittedRegion {
+                substituted: false,
+                ..piece
+            });
+        }
+        Ok(())
+    }
+
+    /// Removes the substituted `virt` from the committed set after the
+    /// backend dropped its mapping, leaving it reserved and
+    /// uncommitted.
+    pub fn record_withdraw(&mut self, virt: VirtRange) -> Result<(), AddressSpaceError> {
+        self.substituted_regions(virt)?;
+        let reservation = self.find_mut(virt)?;
+        remove_committed_range(&mut reservation.committed, virt);
+        Ok(())
+    }
+
+    /// Puts `regions` back verbatim as the committed set of `virt`,
+    /// undoing a change a backend could not finish.
+    pub fn replace_committed(
+        &mut self,
+        virt: VirtRange,
+        regions: &[CommittedRegion],
+    ) -> Result<(), AddressSpaceError> {
+        let reservation = self.find_mut(virt)?;
+        remove_committed_range(&mut reservation.committed, virt);
+        reservation.committed.extend_from_slice(regions);
         Ok(())
     }
 
@@ -243,17 +405,7 @@ impl ReservationTracker {
         virt: VirtRange,
     ) -> Result<Vec<CommittedRegion>, AddressSpaceError> {
         let reservation = self.find(virt)?;
-        Ok(reservation
-            .committed
-            .iter()
-            .filter_map(|region| {
-                range_intersection(region.range, virt).map(|range| CommittedRegion {
-                    range,
-                    flags: region.flags,
-                    owner: region.owner,
-                })
-            })
-            .collect())
+        Ok(clipped_regions(&reservation.committed, virt))
     }
 
     /// Removes and returns the swapped pages inside `virt`, for callers
@@ -267,21 +419,26 @@ impl ReservationTracker {
     }
 
     /// Removes and returns the committed sub-ranges intersecting `virt`,
-    /// for callers that decommit hardware state afterwards.
+    /// for callers that decommit hardware state afterwards, and which of
+    /// them were substituted.
     pub fn take_committed_intersections(
         &mut self,
         virt: VirtRange,
-    ) -> Result<Vec<VirtRange>, AddressSpaceError> {
+    ) -> Result<CommittedRemoval, AddressSpaceError> {
         let reservation = self.find_mut(virt)?;
-        let overlaps: Vec<VirtRange> = reservation
+        let ranges: Vec<VirtRange> = reservation
             .committed
             .iter()
             .filter_map(|region| range_intersection(region.range, virt))
             .collect();
-        for subrange in &overlaps {
+        let substituted = substituted_parts(&reservation.committed, virt);
+        for subrange in &ranges {
             remove_committed_range(&mut reservation.committed, *subrange);
         }
-        Ok(overlaps)
+        Ok(CommittedRemoval {
+            ranges,
+            substituted,
+        })
     }
 
     /// Splits `virt` into already-committed sub-ranges (to re-protect)
@@ -369,6 +526,9 @@ impl ReservationTracker {
             .find(|region| region.range.contains(addr))
             .copied()
             .ok_or(AddressSpaceError::NotCommitted)?;
+        if region.substituted {
+            return Err(AddressSpaceError::Substituted);
+        }
         remove_committed_range(&mut reservation.committed, page);
         let entry = SwapEntry {
             addr,
@@ -398,6 +558,7 @@ impl ReservationTracker {
             range: page,
             flags: entry.flags,
             owner: entry.owner,
+            substituted: false,
         });
         Ok(entry)
     }
@@ -413,12 +574,14 @@ impl ReservationTracker {
             .copied()
     }
 
-    /// Bytes committed for `owner` across every reservation.
+    /// Bytes committed for `owner` across every reservation. A
+    /// substituted region is not counted: its frames are not `owner`'s
+    /// resident memory.
     pub fn owned_resident_bytes(&self, owner: MemoryOwner) -> u64 {
         self.reservations
             .iter()
             .flat_map(|reservation| reservation.committed.iter())
-            .filter(|region| region.owner == owner)
+            .filter(|region| region.owner == owner && !region.substituted)
             .map(|region| region.range.byte_len as u64)
             .sum()
     }
@@ -442,7 +605,8 @@ impl ReservationTracker {
 
     /// Visits `owner`'s committed regions, largest first, until `visit`
     /// returns `false`. Largest first because a swap-out pass wants the
-    /// fewest scans for the most reclaimed pages.
+    /// fewest scans for the most reclaimed pages. Substituted regions
+    /// are skipped: their frames are not the pool's to age or evict.
     pub fn owned_committed_regions<Visit>(&self, owner: MemoryOwner, mut visit: Visit)
     where
         Visit: FnMut(CommittedRegion) -> bool,
@@ -451,7 +615,7 @@ impl ReservationTracker {
             .reservations
             .iter()
             .flat_map(|reservation| reservation.committed.iter())
-            .filter(|region| region.owner == owner)
+            .filter(|region| region.owner == owner && !region.substituted)
             .copied()
             .collect();
         regions.sort_by_key(|region| core::cmp::Reverse(region.range.byte_len));
@@ -462,12 +626,14 @@ impl ReservationTracker {
         }
     }
 
-    /// Every owner that currently has committed pages.
+    /// Every owner that currently has resident (unsubstituted)
+    /// committed pages.
     pub fn owners(&self) -> Vec<MemoryOwner> {
         let mut owners: Vec<MemoryOwner> = self
             .reservations
             .iter()
             .flat_map(|reservation| reservation.committed.iter())
+            .filter(|region| !region.substituted)
             .map(|region| region.owner)
             .filter(|owner| !owner.is_none())
             .collect();
@@ -489,6 +655,35 @@ impl ReservationTracker {
             .find(|reservation| range_contains(reservation.range, virt))
             .ok_or(AddressSpaceError::NotReserved)
     }
+}
+
+/// The parts of `range` that lie outside every range of `excluded`,
+/// ascending. `excluded` is ascending and non-overlapping, as
+/// [`Decommitted::substituted`] and [`CommittedRemoval::substituted`]
+/// are.
+///
+/// A backend whose unmap refuses a page with no leaf unmaps these
+/// instead of `range`, once it has dropped the substituted parts.
+pub fn ranges_outside(range: VirtRange, excluded: &[VirtRange]) -> Vec<VirtRange> {
+    let mut parts = Vec::new();
+    let mut cursor = range.start.raw();
+    let end = range.end().raw();
+    for hole in excluded {
+        let Some(hole) = range_intersection(*hole, range) else {
+            continue;
+        };
+        if cursor < hole.start.raw() {
+            parts.push(VirtRange::new(
+                VirtAddr::new(cursor),
+                hole.start.raw() - cursor,
+            ));
+        }
+        cursor = hole.end().raw();
+    }
+    if cursor < end {
+        parts.push(VirtRange::new(VirtAddr::new(cursor), end - cursor));
+    }
+    parts
 }
 
 /// Rejects empty and misaligned ranges before any bookkeeping.
@@ -564,6 +759,76 @@ fn committed_regions_cover(regions: &[CommittedRegion], range: VirtRange) -> boo
     true
 }
 
+/// Whether every page of `range` is inside a committed region or is a
+/// swapped-out page.
+fn committed_or_swapped_cover(
+    regions: &[CommittedRegion],
+    swapped: &[SwapEntry],
+    range: VirtRange,
+) -> bool {
+    let mut cursor = range.start.raw();
+    let end = range.end().raw();
+    while cursor < end {
+        let addr = VirtAddr::new(cursor);
+        if let Some(region) = regions.iter().find(|region| region.range.contains(addr)) {
+            cursor = region.range.end().raw().min(end);
+        } else if swapped.iter().any(|entry| entry.addr == addr) {
+            cursor += PhysFrame::SIZE;
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether substituted regions cover every page of `range`.
+fn substituted_regions_cover(regions: &[CommittedRegion], range: VirtRange) -> bool {
+    let mut cursor = range.start.raw();
+    let end = range.end().raw();
+    while cursor < end {
+        let Some(region) = regions
+            .iter()
+            .find(|region| region.substituted && region.range.contains(VirtAddr::new(cursor)))
+        else {
+            return false;
+        };
+        cursor = region.range.end().raw().min(end);
+    }
+    true
+}
+
+/// Every region intersecting `range`, clipped to it, ascending.
+fn clipped_regions(regions: &[CommittedRegion], range: VirtRange) -> Vec<CommittedRegion> {
+    let mut clipped: Vec<CommittedRegion> = regions
+        .iter()
+        .filter_map(|region| {
+            range_intersection(region.range, range).map(|clip| CommittedRegion {
+                range: clip,
+                ..*region
+            })
+        })
+        .collect();
+    clipped.sort_by_key(|region| region.range.start.raw());
+    clipped
+}
+
+/// The substituted parts of `range`, adjacent ones joined, ascending.
+fn substituted_parts(regions: &[CommittedRegion], range: VirtRange) -> Vec<VirtRange> {
+    let mut parts: Vec<VirtRange> = Vec::new();
+    for region in clipped_regions(regions, range)
+        .into_iter()
+        .filter(|region| region.substituted)
+    {
+        match parts.last_mut() {
+            Some(last) if last.end().raw() == region.range.start.raw() => {
+                last.byte_len += region.range.byte_len;
+            }
+            _ => parts.push(region.range),
+        }
+    }
+    parts
+}
+
 /// Removes and returns every swap entry inside `range`.
 fn take_swapped_range(entries: &mut Vec<SwapEntry>, range: VirtRange) -> Vec<SwapEntry> {
     let mut taken = Vec::new();
@@ -596,6 +861,7 @@ fn remove_committed_range(regions: &mut Vec<CommittedRegion>, range: VirtRange) 
                 ),
                 flags: region.flags,
                 owner: region.owner,
+                substituted: region.substituted,
             });
         }
         if range.end().raw() < region.range.end().raw() {
@@ -603,6 +869,7 @@ fn remove_committed_range(regions: &mut Vec<CommittedRegion>, range: VirtRange) 
                 range: VirtRange::new(range.end(), region.range.end().raw() - range.end().raw()),
                 flags: region.flags,
                 owner: region.owner,
+                substituted: region.substituted,
             });
         }
     }
@@ -653,8 +920,8 @@ mod tests {
             .unwrap();
         tracker.record_decommit(range(0x1_1000, 1)).unwrap();
         assert_eq!(
-            tracker.record_decommit(range(0x1_1000, 1)),
-            Err(AddressSpaceError::NotCommitted)
+            tracker.record_decommit(range(0x1_1000, 1)).err(),
+            Some(AddressSpaceError::NotCommitted)
         );
         assert_eq!(
             tracker.lookup(VirtAddr::new(0x1_1000)),
@@ -736,7 +1003,8 @@ mod tests {
         let taken = tracker
             .take_committed_intersections(range(0x1_1000, 3))
             .unwrap();
-        assert_eq!(taken, [range(0x1_1000, 1)]);
+        assert_eq!(taken.ranges, [range(0x1_1000, 1)]);
+        assert!(taken.substituted.is_empty());
         assert!(matches!(
             tracker.lookup(VirtAddr::new(0x1_0000)),
             ReservationLookup::Committed(_)
@@ -744,6 +1012,359 @@ mod tests {
         assert_eq!(
             tracker.lookup(VirtAddr::new(0x1_1000)),
             ReservationLookup::Reserved
+        );
+    }
+
+    const RW: PageFlags = PageFlags::READ.union(PageFlags::WRITE);
+
+    fn owner(raw: u64) -> MemoryOwner {
+        MemoryOwner::new(raw)
+    }
+
+    /// A four-page reservation committed as two regions with different
+    /// owners, like a linear memory that grew once.
+    fn grown_tracker() -> ReservationTracker {
+        let mut tracker = tracker_with_reservation(0x1_0000, 4);
+        tracker
+            .record_commit(range(0x1_0000, 2), RW, owner(7))
+            .unwrap();
+        tracker
+            .record_commit(range(0x1_2000, 2), PageFlags::READ, owner(8))
+            .unwrap();
+        tracker
+    }
+
+    #[test]
+    fn substitution_requires_committed_unsubstituted_pages() {
+        let mut tracker = tracker_with_reservation(0x1_0000, 4);
+        tracker
+            .record_commit(range(0x1_0000, 2), RW, owner(7))
+            .unwrap();
+        assert_eq!(
+            tracker.record_substitute(range(0x1_1000, 2)),
+            Err(AddressSpaceError::NotCommitted),
+            "a range that reaches an uncommitted page is refused"
+        );
+        assert_eq!(
+            tracker.record_substitute(range(0x9_0000, 1)),
+            Err(AddressSpaceError::NotReserved)
+        );
+        tracker.record_substitute(range(0x1_1000, 1)).unwrap();
+        assert_eq!(
+            tracker.record_substitute(range(0x1_0000, 2)),
+            Err(AddressSpaceError::Substituted),
+            "a range that overlaps a live substitution is refused"
+        );
+        assert!(matches!(
+            tracker.lookup(VirtAddr::new(0x1_0000)),
+            ReservationLookup::Committed(CommittedRegion {
+                substituted: false,
+                ..
+            })
+        ));
+        assert!(matches!(
+            tracker.lookup(VirtAddr::new(0x1_1000)),
+            ReservationLookup::Committed(CommittedRegion {
+                substituted: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn substitution_keeps_flags_and_owner_per_region_and_skips_accounting() {
+        let mut tracker = grown_tracker();
+        assert_eq!(tracker.owned_resident_bytes(owner(7)), 2 * PAGE as u64);
+        tracker.record_substitute(range(0x1_1000, 2)).unwrap();
+        // The substituted pages are in both regions: one page of each.
+        assert_eq!(tracker.owned_resident_bytes(owner(7)), PAGE as u64);
+        assert_eq!(tracker.owned_resident_bytes(owner(8)), PAGE as u64);
+        let regions = tracker.substituted_regions(range(0x1_1000, 2)).unwrap();
+        assert_eq!(
+            regions,
+            [
+                CommittedRegion {
+                    range: range(0x1_1000, 1),
+                    flags: RW,
+                    owner: owner(7),
+                    substituted: true,
+                },
+                CommittedRegion {
+                    range: range(0x1_2000, 1),
+                    flags: PageFlags::READ,
+                    owner: owner(8),
+                    substituted: true,
+                },
+            ]
+        );
+        let mut visited = Vec::new();
+        tracker.owned_committed_regions(owner(7), |region| {
+            visited.push(region.range);
+            true
+        });
+        assert_eq!(
+            visited,
+            [range(0x1_0000, 1)],
+            "scans skip substituted pages"
+        );
+        assert_eq!(tracker.owners(), [owner(7), owner(8)]);
+    }
+
+    #[test]
+    fn protect_and_accessibility_plan_treat_substituted_pages_as_committed() {
+        let mut tracker = grown_tracker();
+        tracker.record_substitute(range(0x1_1000, 2)).unwrap();
+        let plan = tracker.accessibility_plan(range(0x1_0000, 4)).unwrap();
+        assert!(
+            plan.commit.is_empty(),
+            "nothing commits over a substitution"
+        );
+        assert_eq!(
+            plan.protect.iter().map(|r| r.byte_len).sum::<usize>(),
+            4 * PAGE
+        );
+        tracker.ensure_committed(range(0x1_0000, 4)).unwrap();
+        tracker
+            .record_protect(range(0x1_0000, 4), PageFlags::READ)
+            .unwrap();
+        let regions = tracker.committed_intersections(range(0x1_0000, 4)).unwrap();
+        assert!(regions.iter().all(|region| region.flags == PageFlags::READ));
+        let substituted: usize = regions
+            .iter()
+            .filter(|region| region.substituted)
+            .map(|region| region.range.byte_len)
+            .sum();
+        assert_eq!(substituted, 2 * PAGE, "a protection change keeps the mark");
+        let owners: Vec<MemoryOwner> = regions
+            .iter()
+            .filter(|region| region.range.start.raw() == 0x1_2000)
+            .map(|region| region.owner)
+            .collect();
+        assert_eq!(owners, [owner(8)], "and the owner of each region");
+    }
+
+    #[test]
+    fn decommit_reports_the_substituted_parts_and_take_forgets_them() {
+        let mut tracker = grown_tracker();
+        tracker.record_substitute(range(0x1_1000, 2)).unwrap();
+        let removed = tracker.record_decommit(range(0x1_0000, 4)).unwrap();
+        assert!(removed.swapped.is_empty());
+        assert_eq!(
+            removed.substituted,
+            [range(0x1_1000, 2)],
+            "adjacent substituted pieces of two regions are one part"
+        );
+        assert_eq!(
+            tracker.lookup(VirtAddr::new(0x1_1000)),
+            ReservationLookup::Reserved
+        );
+
+        let mut tracker = grown_tracker();
+        tracker.record_substitute(range(0x1_0000, 1)).unwrap();
+        let removal = tracker
+            .take_committed_intersections(range(0x1_0000, 4))
+            .unwrap();
+        assert_eq!(removal.substituted, [range(0x1_0000, 1)]);
+        assert_eq!(
+            removal.ranges.iter().map(|r| r.byte_len).sum::<usize>(),
+            4 * PAGE
+        );
+        assert_eq!(tracker.owned_resident_bytes(owner(7)), 0);
+    }
+
+    #[test]
+    fn release_hands_back_substituted_regions_marked() {
+        let mut tracker = grown_tracker();
+        tracker.record_substitute(range(0x1_2000, 1)).unwrap();
+        let released = tracker.release(range(0x1_0000, 4)).unwrap();
+        let marked: Vec<VirtRange> = released
+            .committed
+            .iter()
+            .filter(|region| region.substituted)
+            .map(|region| region.range)
+            .collect();
+        assert_eq!(marked, [range(0x1_2000, 1)]);
+    }
+
+    #[test]
+    fn partial_decommit_leaves_the_rest_of_a_substitution_substituted() {
+        let mut tracker = grown_tracker();
+        tracker.record_substitute(range(0x1_0000, 4)).unwrap();
+        let removed = tracker.record_decommit(range(0x1_1000, 1)).unwrap();
+        assert_eq!(removed.substituted, [range(0x1_1000, 1)]);
+        // The two remainders are still substituted and can still be
+        // withdrawn, each on its own.
+        tracker.record_withdraw(range(0x1_0000, 1)).unwrap();
+        tracker.record_restore(range(0x1_2000, 2)).unwrap();
+        assert_eq!(
+            tracker.record_withdraw(range(0x1_2000, 1)),
+            Err(AddressSpaceError::NotSubstituted)
+        );
+    }
+
+    #[test]
+    fn restore_clears_the_mark_and_withdraw_uncommits() {
+        let mut tracker = grown_tracker();
+        tracker.record_substitute(range(0x1_1000, 2)).unwrap();
+        assert_eq!(
+            tracker.record_restore(range(0x1_0000, 2)),
+            Err(AddressSpaceError::NotSubstituted),
+            "a range that is only partly substituted is not restorable"
+        );
+        tracker.record_restore(range(0x1_1000, 2)).unwrap();
+        assert_eq!(
+            tracker.record_restore(range(0x1_1000, 2)),
+            Err(AddressSpaceError::NotSubstituted)
+        );
+        assert_eq!(tracker.owned_resident_bytes(owner(7)), 2 * PAGE as u64);
+        assert_eq!(tracker.owned_resident_bytes(owner(8)), 2 * PAGE as u64);
+
+        tracker.record_substitute(range(0x1_1000, 2)).unwrap();
+        tracker.record_withdraw(range(0x1_1000, 2)).unwrap();
+        assert_eq!(
+            tracker.lookup(VirtAddr::new(0x1_1000)),
+            ReservationLookup::Reserved
+        );
+        assert_eq!(
+            tracker.lookup(VirtAddr::new(0x1_2000)),
+            ReservationLookup::Reserved
+        );
+        // Reserved-uncommitted is what a commit expects to find.
+        tracker.precheck_commit(range(0x1_1000, 2)).unwrap();
+        assert!(matches!(
+            tracker.lookup(VirtAddr::new(0x1_0000)),
+            ReservationLookup::Committed(_)
+        ));
+    }
+
+    #[test]
+    fn a_substituted_page_is_never_swapped_out() {
+        let mut tracker = tracker_with_reservation(0x1_0000, 2);
+        tracker
+            .record_commit(range(0x1_0000, 2), RW, owner(7))
+            .unwrap();
+        tracker.record_substitute(range(0x1_0000, 1)).unwrap();
+        let token = SwapToken::new(1).unwrap();
+        assert_eq!(
+            tracker.record_swap_out(VirtAddr::new(0x1_0000), token),
+            Err(AddressSpaceError::Substituted)
+        );
+        tracker
+            .record_swap_out(VirtAddr::new(0x1_1000), token)
+            .unwrap();
+    }
+
+    #[test]
+    fn substitution_covers_swapped_pages_and_keeps_their_flags_and_owner() {
+        let mut tracker = grown_tracker();
+        let token_a = SwapToken::new(1).unwrap();
+        let token_b = SwapToken::new(2).unwrap();
+        tracker
+            .record_swap_out(VirtAddr::new(0x1_1000), token_a)
+            .unwrap();
+        tracker
+            .record_swap_out(VirtAddr::new(0x1_2000), token_b)
+            .unwrap();
+        tracker.check_substitutable(range(0x1_0000, 4)).unwrap();
+        let swapped = tracker.record_substitute(range(0x1_0000, 4)).unwrap();
+        assert_eq!(
+            swapped,
+            [
+                SwapEntry {
+                    addr: VirtAddr::new(0x1_1000),
+                    token: token_a,
+                    flags: RW,
+                    owner: owner(7),
+                },
+                SwapEntry {
+                    addr: VirtAddr::new(0x1_2000),
+                    token: token_b,
+                    flags: PageFlags::READ,
+                    owner: owner(8),
+                },
+            ],
+            "the swap entries come back for the caller to release"
+        );
+        assert!(
+            tracker.take_swap_entries_in(range(0x1_0000, 4)).is_empty(),
+            "nothing is left swapped"
+        );
+        let regions = tracker.substituted_regions(range(0x1_0000, 4)).unwrap();
+        let flags_and_owner = |addr: usize| {
+            regions
+                .iter()
+                .find(|region| region.range.contains(VirtAddr::new(addr)))
+                .map(|region| (region.flags, region.owner))
+        };
+        assert_eq!(flags_and_owner(0x1_0000), Some((RW, owner(7))));
+        assert_eq!(flags_and_owner(0x1_1000), Some((RW, owner(7))));
+        assert_eq!(flags_and_owner(0x1_2000), Some((PageFlags::READ, owner(8))));
+        assert_eq!(flags_and_owner(0x1_3000), Some((PageFlags::READ, owner(8))));
+        assert_eq!(
+            regions.iter().map(|r| r.range.byte_len).sum::<usize>(),
+            4 * PAGE
+        );
+        tracker.record_restore(range(0x1_0000, 4)).unwrap();
+        assert_eq!(tracker.owned_resident_bytes(owner(7)), 2 * PAGE as u64);
+        assert_eq!(tracker.owned_resident_bytes(owner(8)), 2 * PAGE as u64);
+    }
+
+    #[test]
+    fn substitution_refuses_a_hole_beside_a_swapped_page_and_changes_nothing() {
+        let mut tracker = tracker_with_reservation(0x1_0000, 4);
+        tracker
+            .record_commit(range(0x1_0000, 3), RW, owner(7))
+            .unwrap();
+        let token = SwapToken::new(1).unwrap();
+        tracker
+            .record_swap_out(VirtAddr::new(0x1_1000), token)
+            .unwrap();
+        // The fourth page was never committed.
+        assert_eq!(
+            tracker.record_substitute(range(0x1_0000, 4)),
+            Err(AddressSpaceError::NotCommitted)
+        );
+        assert_eq!(
+            tracker.take_swap_entries_in(range(0x1_0000, 4)).len(),
+            1,
+            "the swap entry is still filed"
+        );
+    }
+
+    #[test]
+    fn substitution_refuses_a_substituted_page_beside_a_swapped_one() {
+        let mut tracker = tracker_with_reservation(0x1_0000, 3);
+        tracker
+            .record_commit(range(0x1_0000, 3), RW, owner(7))
+            .unwrap();
+        tracker.record_substitute(range(0x1_2000, 1)).unwrap();
+        let token = SwapToken::new(1).unwrap();
+        tracker
+            .record_swap_out(VirtAddr::new(0x1_0000), token)
+            .unwrap();
+        assert_eq!(
+            tracker.record_substitute(range(0x1_0000, 3)),
+            Err(AddressSpaceError::Substituted)
+        );
+        assert_eq!(tracker.take_swap_entries_in(range(0x1_0000, 3)).len(), 1);
+    }
+
+    #[test]
+    fn ranges_outside_cuts_the_excluded_parts_out() {
+        let whole = range(0x1_0000, 6);
+        assert_eq!(ranges_outside(whole, &[]), [whole]);
+        assert_eq!(
+            ranges_outside(whole, &[range(0x1_1000, 1), range(0x1_3000, 2)]),
+            [range(0x1_0000, 1), range(0x1_2000, 1), range(0x1_5000, 1)]
+        );
+        assert!(ranges_outside(whole, &[whole]).is_empty());
+        assert_eq!(
+            ranges_outside(
+                range(0x1_2000, 2),
+                &[range(0x1_0000, 3), range(0x9_0000, 1)]
+            ),
+            [range(0x1_3000, 1)],
+            "holes outside the range are ignored and straddling ones are clipped"
         );
     }
 

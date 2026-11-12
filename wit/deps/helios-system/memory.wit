@@ -1,0 +1,39 @@
+package helios:system@0.1.0;
+
+/// How a program names a part of its own linear memory to the kernel.
+///
+/// Everything a program shares with hardware or with another program
+/// without a copy — a frame buffer, a window's pixels, a command buffer,
+/// a device's registers — appears inside memory the program already
+/// has, at a place the program chose. The program allocates whole pages
+/// from its own allocator and passes them as a `span`; the kernel
+/// changes what backs those pages and nothing else about them. They
+/// stay inside the memory's current size, so every access to them,
+/// scalar or bulk, is bounded exactly as an access to any other byte
+/// the program owns.
+///
+/// When whatever was shown there ends — the resource is dropped, the
+/// grant is released — the pages are ordinary zeroed memory again and
+/// the program may free them. Freeing them while they are still shown
+/// hands a device's memory to the allocator; `helios-api` holds the
+/// two together so that cannot be written.
+interface memory {
+  /// A run of whole wasm pages of the calling instance's linear memory.
+  ///
+  /// `offset` and `length` are both multiples of 65536, `length` is not
+  /// zero, the run ends at or below the memory's current size, and it
+  /// overlaps nothing the kernel is already showing in this memory. A
+  /// span that breaks any of these is refused with the interface's
+  /// `bad-span`.
+  ///
+  /// The call a span is passed to says how long it has to be: the size
+  /// of what is shown, rounded up to whole wasm pages. Where what is
+  /// shown ends before the span does, the rest of the span stays the
+  /// program's own memory.
+  record span {
+    /// Byte offset of the first page.
+    offset: u64,
+    /// How many bytes the run covers.
+    length: u64,
+  }
+}
