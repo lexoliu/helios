@@ -67,7 +67,7 @@ use core::cell::UnsafeCell;
 use core::ffi::c_int;
 use core::ptr;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use helios_hal::device::{DeviceRegion, DeviceRegionAttributes, DmaPlacement};
 use helios_hal::iommu::PhysicalRange;
@@ -144,6 +144,45 @@ fn level_index(virt: usize, level: usize) -> usize {
 
 fn entry_phys(entry: u64) -> usize {
     ((entry >> PTE_PPN_SHIFT) << PAGE_SHIFT) as usize
+}
+
+/// The slot of entry `index` in `table`.
+///
+/// # Safety
+///
+/// `table` is a live page table and `index < PTE_COUNT`.
+unsafe fn pte_slot(table: *mut [u64; PTE_COUNT], index: usize) -> *mut u64 {
+    debug_assert!(index < PTE_COUNT);
+    // SAFETY: the caller's contract keeps the offset inside the table.
+    unsafe { table.cast::<u64>().add(index) }
+}
+
+/// Loads a page-table entry with acquire ordering.
+///
+/// Every entry a walker can reach without the reservation lock is
+/// published by [`store_pte`], so an entry read here is ordered after
+/// whatever its writer did before publishing it: a table's zeroing, a
+/// frame's fill.
+///
+/// # Safety
+///
+/// `entry` is an aligned entry of a live page table.
+unsafe fn load_pte(entry: *const u64) -> u64 {
+    // SAFETY: the caller's contract; a 64-bit access to an aligned entry
+    // is single-copy atomic.
+    unsafe { AtomicU64::from_ptr(entry.cast_mut()) }.load(Ordering::Acquire)
+}
+
+/// Publishes a page-table entry with release ordering, so a hart that
+/// loads it with [`load_pte`] sees everything written before the store.
+///
+/// # Safety
+///
+/// `entry` is an aligned entry of a live page table, and the caller holds
+/// the reservation lock (or is the only hart that can reach the table).
+unsafe fn store_pte(entry: *mut u64, value: u64) {
+    // SAFETY: the caller's contract.
+    unsafe { AtomicU64::from_ptr(entry) }.store(value, Ordering::Release);
 }
 
 #[repr(align(4096))]
@@ -322,23 +361,48 @@ impl RiscvUserAddressSpace {
         self.root_phys as *mut [u64; PTE_COUNT]
     }
 
-    fn ensure_intermediate(table: &mut [u64; PTE_COUNT], index: usize) -> &mut [u64; PTE_COUNT] {
-        let entry = &mut table[index];
-        if *entry & PTE_VALID != 0 {
+    /// The table `table[index]` points at, building it first when the
+    /// entry is empty.
+    ///
+    /// The new table is zeroed before the entry that makes it reachable
+    /// is stored, and the store is a release: a hart walking these tables
+    /// without the reservation lock (`leaf_entry`, which the demand-commit
+    /// fault path and the swap fault entry call) loads the entry with
+    /// acquire and so reads the table's zeroed words, never what the frame
+    /// held before. A plain store carries no such order under RVWMO.
+    ///
+    /// # Safety
+    ///
+    /// `table` is a live page table, and the caller holds the reservation
+    /// lock, so no other hart stores to it.
+    unsafe fn ensure_intermediate(
+        table: *mut [u64; PTE_COUNT],
+        index: usize,
+    ) -> *mut [u64; PTE_COUNT] {
+        // SAFETY: the caller's `table` is live and `index` is in range.
+        let slot = unsafe { pte_slot(table, index) };
+        // SAFETY: `slot` is an aligned entry of a live table.
+        let entry = unsafe { load_pte(slot) };
+        if entry & PTE_VALID != 0 {
             assert!(
-                *entry & PTE_LEAF_MASK == 0,
+                entry & PTE_LEAF_MASK == 0,
                 "Sv48 user-VA index {index:#x} collides with a leaf mapping"
             );
-            let phys = entry_phys(*entry);
-            return unsafe { &mut *(phys as *mut [u64; PTE_COUNT]) };
+            return entry_phys(entry) as *mut [u64; PTE_COUNT];
         }
         let layout = Layout::from_size_align(PAGE_SIZE, PAGE_SIZE)
             .expect("Sv48 page-table layout is well-formed");
         let raw = unsafe { alloc_zeroed(layout) };
         let raw = NonNull::new(raw).expect("Sv48 page-table allocation failed");
         let phys = raw.as_ptr() as usize;
-        *entry = ((phys as u64) >> PAGE_SHIFT) << PTE_PPN_SHIFT | PTE_VALID;
-        unsafe { &mut *(phys as *mut [u64; PTE_COUNT]) }
+        // SAFETY: as above; the release orders the zeroing before it.
+        unsafe {
+            store_pte(
+                slot,
+                ((phys as u64) >> PAGE_SHIFT) << PTE_PPN_SHIFT | PTE_VALID,
+            );
+        }
+        phys as *mut [u64; PTE_COUNT]
     }
 
     /// Pointer to the leaf entry for `virt`, allocating the
@@ -347,22 +411,30 @@ impl RiscvUserAddressSpace {
     /// The caller holds this address space's reservation lock, so no
     /// other hart is editing its tables.
     fn ensure_leaf_entry(&self, virt: usize) -> *mut u64 {
-        let mut table = unsafe { &mut *self.root_table() };
+        let mut table = self.root_table();
         for level in (1..LEVELS).rev() {
-            table = Self::ensure_intermediate(table, level_index(virt, level));
+            // SAFETY: `table` is live, and the caller holds the
+            // reservation lock.
+            table = unsafe { Self::ensure_intermediate(table, level_index(virt, level)) };
         }
-        &mut table[level_index(virt, 0)]
+        // SAFETY: the walk above ended at a live leaf table.
+        unsafe { pte_slot(table, level_index(virt, 0)) }
     }
 
     /// Pointer to the leaf entry for `virt`, or `None` when the walk
     /// runs into a missing table.
     ///
-    /// The caller holds this address space's reservation lock, so no
-    /// other hart is editing its tables.
+    /// Takes no lock, so the demand-commit fault path and the swap fault
+    /// entry call it too. Table frames are never freed while the address
+    /// space lives, and each entry is loaded with acquire to pair with the
+    /// release store that published the table it names
+    /// ([`Self::ensure_intermediate`]).
     fn leaf_entry(&self, virt: usize) -> Option<*mut u64> {
         let mut table = self.root_table();
         for level in (1..LEVELS).rev() {
-            let entry = unsafe { (*table)[level_index(virt, level)] };
+            // SAFETY: `table` is the root or a table an entry named, and
+            // tables are never freed.
+            let entry = unsafe { load_pte(pte_slot(table, level_index(virt, level))) };
             if entry & PTE_VALID == 0 {
                 return None;
             }
@@ -372,7 +444,8 @@ impl RiscvUserAddressSpace {
             );
             table = entry_phys(entry) as *mut [u64; PTE_COUNT];
         }
-        Some(unsafe { &raw mut (*table)[level_index(virt, 0)] })
+        // SAFETY: as above.
+        Some(unsafe { pte_slot(table, level_index(virt, 0)) })
     }
 
     /// Builds every table level above the leaf for `virt`, leaving the
@@ -382,12 +455,12 @@ impl RiscvUserAddressSpace {
     /// what makes `ensure_intermediate`'s heap allocation safe here and
     /// impossible in fault context.
     fn ensure_leaf_table(&self, virt: usize) {
-        // SAFETY: the root table is a live page table reached through
-        // the HHDM, and the caller holds the reservation lock, so no
-        // other processor is editing this walk.
-        let mut table = unsafe { &mut *self.root_table() };
+        let mut table = self.root_table();
         for level in (1..LEVELS).rev() {
-            table = Self::ensure_intermediate(table, level_index(virt, level));
+            // SAFETY: the root table is a live page table, and the caller
+            // holds the reservation lock, so no other hart is editing
+            // this walk.
+            table = unsafe { Self::ensure_intermediate(table, level_index(virt, level)) };
         }
     }
 
@@ -425,13 +498,17 @@ impl RiscvUserAddressSpace {
         flags: u64,
     ) -> Result<(), AddressSpaceError> {
         let entry_ptr = self.ensure_leaf_entry(virt);
-        let entry = unsafe { entry_ptr.read_volatile() };
+        // SAFETY: `ensure_leaf_entry` returned a live leaf, and the caller
+        // holds the reservation lock.
+        let entry = unsafe { load_pte(entry_ptr) };
         if entry & PTE_VALID != 0 {
             return Err(AddressSpaceError::Overlap);
         }
         let ppn = (phys as u64) >> PAGE_SHIFT;
+        // SAFETY: as above.
         unsafe {
-            entry_ptr.write_volatile(
+            store_pte(
+                entry_ptr,
                 (ppn << PTE_PPN_SHIFT) | flags | PTE_VALID | PTE_ACCESSED | PTE_DIRTY,
             );
         }
@@ -442,12 +519,15 @@ impl RiscvUserAddressSpace {
         let entry_ptr = self
             .leaf_entry(virt)
             .ok_or(AddressSpaceError::NotCommitted)?;
-        let entry = unsafe { entry_ptr.read_volatile() };
+        // SAFETY: `leaf_entry` walked live tables, and the caller holds
+        // the reservation lock.
+        let entry = unsafe { load_pte(entry_ptr) };
         if entry & PTE_VALID == 0 {
             return Err(AddressSpaceError::NotCommitted);
         }
+        // SAFETY: as above.
         unsafe {
-            entry_ptr.write_volatile(0);
+            store_pte(entry_ptr, 0);
         }
         Ok(entry)
     }
@@ -456,13 +536,16 @@ impl RiscvUserAddressSpace {
         let entry_ptr = self
             .leaf_entry(virt)
             .ok_or(AddressSpaceError::NotCommitted)?;
-        let old_entry = unsafe { entry_ptr.read_volatile() };
+        // SAFETY: as in `unmap_4k_no_flush`.
+        let old_entry = unsafe { load_pte(entry_ptr) };
         if old_entry & PTE_VALID == 0 {
             return Err(AddressSpaceError::NotCommitted);
         }
         let ppn = old_entry >> PTE_PPN_SHIFT;
+        // SAFETY: as above.
         unsafe {
-            entry_ptr.write_volatile(
+            store_pte(
+                entry_ptr,
                 (ppn << PTE_PPN_SHIFT) | flags | PTE_VALID | PTE_ACCESSED | PTE_DIRTY,
             );
         }
@@ -473,18 +556,21 @@ impl RiscvUserAddressSpace {
         let entry_ptr = self
             .leaf_entry(virt)
             .ok_or(AddressSpaceError::NotCommitted)?;
-        let old_entry = unsafe { entry_ptr.read_volatile() };
+        // SAFETY: as in `unmap_4k_no_flush`.
+        let old_entry = unsafe { load_pte(entry_ptr) };
         if old_entry & PTE_VALID == 0 {
             return Err(AddressSpaceError::NotCommitted);
         }
+        // SAFETY: as above.
         unsafe {
-            entry_ptr.write_volatile(new_entry);
+            store_pte(entry_ptr, new_entry);
         }
         Ok(old_entry)
     }
 
     fn translate_4k(&self, virt: usize) -> Option<(usize, u64)> {
-        let entry = unsafe { self.leaf_entry(virt)?.read_volatile() };
+        // SAFETY: `leaf_entry` walked live tables.
+        let entry = unsafe { load_pte(self.leaf_entry(virt)?) };
         if entry & PTE_VALID == 0 {
             return None;
         }
@@ -666,7 +752,7 @@ impl RiscvUserAddressSpace {
                 .ok_or(AddressSpaceError::NotCommitted)?;
             // SAFETY: the pointer came from a walk of live tables, and
             // the caller holds the reservation lock.
-            if unsafe { leaf.read_volatile() } & PTE_VALID == 0 {
+            if unsafe { load_pte(leaf) } & PTE_VALID == 0 {
                 return Err(AddressSpaceError::NotCommitted);
             }
             leaves.push(leaf);
@@ -734,8 +820,9 @@ impl RiscvUserAddressSpace {
             let ppn = ((physical + index * PAGE_SIZE) as u64) >> PAGE_SHIFT;
             // SAFETY: as in `present_leaf_ptrs`.
             unsafe {
-                replaced.push(leaf.read_volatile());
-                leaf.write_volatile(
+                replaced.push(load_pte(leaf));
+                store_pte(
+                    leaf,
                     (ppn << PTE_PPN_SHIFT) | pte_flags | PTE_VALID | PTE_ACCESSED | PTE_DIRTY,
                 );
             }
@@ -999,7 +1086,8 @@ impl AddressSpace for RiscvUserAddressSpace {
             let ppn = (phys as u64) >> PAGE_SHIFT;
             // SAFETY: as in `substitute_leaves`.
             unsafe {
-                leaf.write_volatile(
+                store_pte(
+                    leaf,
                     (ppn << PTE_PPN_SHIFT) | pte_flags | PTE_VALID | PTE_ACCESSED | PTE_DIRTY,
                 );
             }
@@ -1072,14 +1160,16 @@ impl AddressSpace for RiscvUserAddressSpace {
         // only the fiber running on it ever faults on. This backend
         // identity-maps physical memory, so the pool's pointer is the
         // physical address.
-        let entry = unsafe { entry_ptr.read_volatile() };
+        let entry = unsafe { load_pte(entry_ptr) };
         if entry & PTE_VALID != 0 {
             return Err(AddressSpaceError::Overlap);
         }
         let ppn = (frame.as_ptr() as u64) >> PAGE_SHIFT;
-        // SAFETY: as above; the store publishes a complete leaf.
+        // SAFETY: as above; the release store publishes a complete leaf
+        // after the frame's contents.
         unsafe {
-            entry_ptr.write_volatile(
+            store_pte(
+                entry_ptr,
                 (ppn << PTE_PPN_SHIFT) | pte_flags | PTE_VALID | PTE_ACCESSED | PTE_DIRTY,
             );
         }
