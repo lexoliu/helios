@@ -226,6 +226,19 @@ impl FlowTuple {
         reversed
     }
 
+    /// The same flow with its destination port replaced.
+    pub fn with_destination_port(self, destination_port: u16) -> Self {
+        let mut replaced = self;
+        debug_assert!(
+            matches!(self.len, 12 | 36),
+            "flow tuple of {} bytes is neither IPv4 nor IPv6",
+            self.len
+        );
+        // The destination port is the last two bytes of either form.
+        replaced.bytes[self.len - 2..self.len].copy_from_slice(&destination_port.to_be_bytes());
+        replaced
+    }
+
     fn as_bytes(&self) -> &[u8] {
         &self.bytes[..self.len]
     }
@@ -280,6 +293,49 @@ pub fn toeplitz(key: &[u8; RSS_KEY_BYTES], tuple: &FlowTuple) -> FlowHash {
 /// The hash of a flow under the standard key.
 pub fn flow_hash(tuple: &FlowTuple) -> FlowHash {
     toeplitz(&STANDARD_RSS_KEY, tuple)
+}
+
+/// The hash of one flow as a function of its destination port.
+///
+/// Toeplitz is linear over GF(2): the hash is the XOR of one key window
+/// per set input bit. For a fixed rest of the tuple the hash of any
+/// destination port is therefore the hash with port zero XOR the
+/// per-bit contribution of each set bit of the port, so 17 evaluations
+/// of [`flow_hash`] answer the hash of all 65536 ports exactly, with
+/// 16 XORs at most each. The terms are taken from [`flow_hash`] itself,
+/// never from a second reading of the key, so this cannot disagree with
+/// the device's hash in bit order.
+///
+/// Concurrency contract: a plain value, a pure function of the tuple it
+/// was built from. No state, no locks; safe on every processor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DestinationPortHashes {
+    /// The hash with destination port zero.
+    rest: u32,
+    /// `bits[i]` is the contribution of destination-port bit `i`.
+    bits: [u32; 16],
+}
+
+impl DestinationPortHashes {
+    /// The hashes of `tuple` with every destination port.
+    pub fn of(tuple: &FlowTuple) -> Self {
+        let rest = flow_hash(&tuple.with_destination_port(0)).get();
+        let bits = core::array::from_fn(|bit| {
+            flow_hash(&tuple.with_destination_port(1 << bit)).get() ^ rest
+        });
+        Self { rest, bits }
+    }
+
+    /// The hash of the flow with `destination_port`.
+    pub fn hash(&self, destination_port: u16) -> FlowHash {
+        let mut hash = self.rest;
+        for (bit, contribution) in self.bits.iter().enumerate() {
+            if destination_port & (1 << bit) != 0 {
+                hash ^= contribution;
+            }
+        }
+        FlowHash(hash)
+    }
 }
 
 #[cfg(test)]
@@ -389,6 +445,57 @@ mod tests {
                 assert!(
                     (0..RSS_INDIRECTION_ENTRIES)
                         .any(|slot| rss_indirection_entry(slot, buckets) == bucket)
+                );
+            }
+        }
+    }
+
+    /// The linear form answers exactly what the hash computes, for every
+    /// destination port, on the published vectors and other tuples of
+    /// both families.
+    #[test]
+    fn destination_port_hashes_equal_the_flow_hash_for_every_port() {
+        let ipv6_source = Ipv6Address::new([
+            0x3f, 0xfe, 0x25, 0x01, 0x02, 0x00, 0x1f, 0xff, 0, 0, 0, 0, 0, 0, 0, 0x07,
+        ]);
+        let ipv6_destination = Ipv6Address::new([
+            0x3f, 0xfe, 0x25, 0x01, 0x02, 0x00, 0x00, 0x03, 0, 0, 0, 0, 0, 0, 0, 0x01,
+        ]);
+        let tuples = [
+            FlowTuple::ipv4(
+                Ipv4Address::new([66, 9, 149, 187]),
+                2794,
+                Ipv4Address::new([161, 142, 100, 80]),
+                1766,
+            ),
+            FlowTuple::ipv4(
+                Ipv4Address::new([199, 92, 111, 2]),
+                14230,
+                Ipv4Address::new([65, 69, 140, 83]),
+                4739,
+            ),
+            FlowTuple::ipv4(
+                Ipv4Address::new([192, 0, 2, 1]),
+                0,
+                Ipv4Address::new([255, 255, 255, 255]),
+                0xffff,
+            ),
+            FlowTuple::ipv6(ipv6_source, 2794, ipv6_destination, 1766),
+            FlowTuple::ipv6(ipv6_destination, 443, ipv6_source, 0),
+            FlowTuple::ipv6(
+                Ipv6Address::new([0xff; 16]),
+                0xffff,
+                Ipv6Address::new([0x55; 16]),
+                0x8001,
+            ),
+        ];
+        for tuple in tuples {
+            let hashes = DestinationPortHashes::of(&tuple);
+            for port in 0..=u16::MAX {
+                assert_eq!(
+                    hashes.hash(port),
+                    flow_hash(&tuple.with_destination_port(port)),
+                    "destination port {port} of {tuple:?}"
                 );
             }
         }
