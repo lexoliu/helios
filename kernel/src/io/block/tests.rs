@@ -1314,7 +1314,8 @@ fn a_recycled_entry_takes_a_page_of_the_disk_whose_block_it_holds_next() {
     );
 
     block_on(async {
-        let block = cache.disk(1).read(2).await.expect("data block 2");
+        let disk = cache.disk(1);
+        let block = disk.read(2).await.expect("data block 2");
         assert!(block.iter().all(|byte| *byte == 2));
     });
     assert_eq!(

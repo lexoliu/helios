@@ -346,7 +346,7 @@ const fn readable(state: u64) -> bool {
 
 /// What the cache needs of a disk's memory: the bounds
 /// [`BlockDevice::Memory`] carries, named once.
-trait PageMemory: DmaBuffer + AsRef<[u8]> + AsMut<[u8]> {}
+pub(super) trait PageMemory: DmaBuffer + AsRef<[u8]> + AsMut<[u8]> {}
 
 impl<Memory: DmaBuffer + AsRef<[u8]> + AsMut<[u8]>> PageMemory for Memory {}
 
