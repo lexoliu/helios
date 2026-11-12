@@ -9,7 +9,6 @@ use tcp::*;
 mod udp;
 use udp::*;
 mod component;
-use component::*;
 mod shard;
 use shard::*;
 mod identifiers;
@@ -30,18 +29,18 @@ use bytes::Bytes;
 use helios_hal::cpu::{Cpu, HardwarePerfCounters, current_processor};
 use helios_hal::io::IoError;
 use helios_netstack::{
-    DEFAULT_HOP_LIMIT, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DNS_PORT, DhcpClientMessage,
-    DhcpDnsServers, DhcpMessageType, DhcpPacket, DhcpServerMessage, DnsQuery, DnsQuestionWriter,
-    DnsRecordType, DnsResponse, EthernetFrame, EthernetProtocol, FlowTuple, IcmpEchoKey,
-    IcmpEchoReply, Icmpv4Packet, Icmpv6Packet, InterfaceEventMark, IpAddress, IpCidr, IpProtocol,
-    Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6AddressEntry, Ipv6Cidr, Ipv6Packet,
-    IsnSecret, MAX_OUTBOUND_FRAMES, NeighborCache, NeighborEntry,
+    DEFAULT_HOP_LIMIT, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DNS_PORT, DhcpAction, DhcpClient,
+    DhcpDestination, DhcpDnsServers, DhcpLease, DhcpPacket, DhcpTransmit, DnsQuery,
+    DnsQuestionWriter, DnsRecordType, DnsResponse, EthernetFrame, EthernetProtocol, FlowTuple,
+    IcmpEchoKey, IcmpEchoReply, Icmpv4Packet, Icmpv6Packet, InterfaceEventMark, IpAddress, IpCidr,
+    IpProtocol, Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6AddressEntry, Ipv6Cidr,
+    Ipv6Packet, IsnSecret, MAX_OUTBOUND_FRAMES, NeighborCache, NeighborEntry,
     NetworkInterface as NetworkDevice, OutboundBatchStatus, Route, RouteTable, RxChecksumOffload,
     RxDrain, RxFrame, SegmentationOffload, Stack, StackConfig, StackError, StackEvent,
     StackInstant, TcpCloseKind, TcpConnectState, TcpConnectTerminalError, TcpEndpoint,
     TcpListenBacklog, TcpPacket, TcpReadIntoState, TcpReadState, TcpReceiveDiagnostics,
     TcpSendState, TcpStackCounters, UdpEgress, UdpEndpoint, UdpPacket, UdpPayload,
-    UdpSocketBinding, UdpSocketError, flow_hash,
+    UdpSocketBinding, UdpSocketError, flow_hash, next_transaction_id,
 };
 use spin::{Mutex as SpinMutex, RwLock as SpinRwLock};
 
@@ -75,12 +74,17 @@ const INTERNAL_DHCP_SOCKET_INDEX: usize = 0;
 /// needs one: the resolver uses an ordinary connected socket.
 const INTERNAL_UDP_RESERVED_SLOTS: usize = 1;
 const LOCAL_NETWORK_PORT: NetworkPortId = NetworkPortId::new(0);
-const DHCP_RETRANSMIT_NANOS: u64 = 1_000_000_000;
-/// REQUESTs an INIT-REBOOT client sends before giving the lease up and
-/// starting over from DISCOVER. RFC 2131 section 3.2 leaves the count
-/// to the client; with the retransmission interval above, four tries
-/// is the few seconds a server on the same link needs to answer.
-const DHCP_REBOOT_ATTEMPTS: u32 = 4;
+/// The longest a park waits on the interface's configuration duties
+/// when the DHCP client has no earlier deadline.
+///
+/// The DHCP client names its own next deadline. IPv6 router
+/// solicitation, which shares the duty, has no deadline the stack
+/// exposes, so a park on the duty still wakes at this interval to
+/// give a dropped solicitation its retransmission. One second is the
+/// interval the duty was polled at when DHCP retransmitted on it, and
+/// leaves a solicitation, which the stack paces at RFC 4861's
+/// four-second `RTR_SOLICITATION_INTERVAL`, at most that late.
+const CONFIGURATION_POLL_NANOS: u64 = 1_000_000_000;
 const MAX_TCP_STREAM_HANDLES: usize = 256;
 const MAX_TCP_LISTENER_HANDLES: usize = 64;
 const MAX_UDP_SOCKET_HANDLES: usize = 256;
@@ -101,8 +105,8 @@ const NETWORK_PROGRESS_WAIT: Duration = Duration::from_micros(50);
 /// caller's deadline and give up without ever asking twice. The
 /// callers that own such a duty — the DNS resolver and the ping walk
 /// while its next hop is still unresolved — bound their wait by this
-/// instead. DHCP has a retransmission interval of its own
-/// (`DHCP_RETRANSMIT_NANOS`) and bounds its wait by that.
+/// instead. DHCP has deadlines of its own, which the client names, and
+/// bounds its wait by those (`NetworkService::configuration_wait`).
 const NETWORK_RETRANSMIT_WAIT: Duration = Duration::from_millis(250);
 // AArch64/HVF local TCP diagnostics showed that matching the borrowed RX
 // batch to the virtio polling budget moves receive work in the right
@@ -241,8 +245,32 @@ pub struct NetworkQueueStats {
     pub tcp_window_updates_sent: u64,
     /// Segments this shard retransmitted, by timer or fast retransmit.
     pub tcp_retransmits_sent: u64,
-    /// Connections this shard holds.
+    /// Connections this shard holds, orphans included.
     pub tcp_sockets: u32,
+    /// How many of `tcp_sockets` are orphans: closed by their owner while
+    /// the stack still runs out the connection.
+    pub tcp_orphan_sockets: u32,
+    /// What those orphans still owe their peers, in bytes: sent and
+    /// unacknowledged plus queued and unsent.
+    pub tcp_orphan_send_queued_bytes: u64,
+    /// Orphans in `FIN-WAIT-1`: their FIN is sent, unacknowledged.
+    pub tcp_orphan_fin_wait_1: u32,
+    /// Orphans in `FIN-WAIT-2`: their FIN is acknowledged, the peer's has
+    /// not arrived.
+    pub tcp_orphan_fin_wait_2: u32,
+    /// Orphans in `CLOSING`: both FINs crossed, theirs unacknowledged.
+    pub tcp_orphan_closing: u32,
+    /// Orphans in `LAST-ACK`: the peer closed first and their FIN is
+    /// unacknowledged.
+    pub tcp_orphan_last_ack: u32,
+    /// Orphans in `TIME-WAIT`: waiting out the 2MSL timer.
+    pub tcp_orphan_time_wait: u32,
+    /// Orphans in any other state (`CLOSED` awaiting the sweep,
+    /// `ESTABLISHED`, `CLOSE-WAIT`, `SYN-SENT`, `SYN-RECEIVED`).
+    pub tcp_orphan_other_state: u32,
+    /// Orphans whose retransmission timer is armed: a sent segment awaits
+    /// acknowledgement.
+    pub tcp_orphan_retransmit_armed: u32,
     /// How many of them are refusing segments for want of receive room.
     /// Nonzero with `tcp_sockets` at zero is a leaked window: the shard
     /// will refuse frames with no socket left that could relieve it.
@@ -627,11 +655,6 @@ impl<T, const CAPACITY: usize> HandleSlab<T, CAPACITY> {
     }
 }
 
-const fn next_transaction_id(current: u32) -> u32 {
-    let next = current.wrapping_add(1);
-    if next == 0 { 1 } else { next }
-}
-
 impl<CpuImpl, DeviceImpl> NetworkService<CpuImpl, DeviceImpl>
 where
     CpuImpl: Cpu + Clone,
@@ -748,6 +771,15 @@ where
                         tcp_window_updates_sent: tcp.window_updates_sent,
                         tcp_retransmits_sent: tcp.retransmits_sent,
                         tcp_sockets: tcp.sockets,
+                        tcp_orphan_sockets: tcp.orphan_sockets,
+                        tcp_orphan_send_queued_bytes: tcp.orphan_send_queued_bytes,
+                        tcp_orphan_fin_wait_1: tcp.orphan_fin_wait_1,
+                        tcp_orphan_fin_wait_2: tcp.orphan_fin_wait_2,
+                        tcp_orphan_closing: tcp.orphan_closing,
+                        tcp_orphan_last_ack: tcp.orphan_last_ack,
+                        tcp_orphan_time_wait: tcp.orphan_time_wait,
+                        tcp_orphan_other_state: tcp.orphan_other_state,
+                        tcp_orphan_retransmit_armed: tcp.orphan_retransmit_armed,
                         tcp_receive_backpressured_sockets: tcp.receive_backpressured_sockets,
                         tcp_receive_window_bytes: tcp.receive_window_bytes,
                         receive_queued_bytes: tcp.receive_queued_bytes,
@@ -990,11 +1022,11 @@ where
                 return Err(timeout_error());
             }
             // A dropped DISCOVER or router solicitation produces no
-            // event at all, so the wait is capped by the retransmission
-            // interval the client state machine expects.
+            // event at all, so the wait is capped by the next deadline
+            // of the configuration state machines.
             self.wait_for_shard_progress(
                 wait,
-                self.retransmit_wait(deadline_nanos, Duration::from_nanos(DHCP_RETRANSMIT_NANOS)),
+                self.retransmit_wait(deadline_nanos, self.configuration_wait()),
             )
             .await;
         }
@@ -1012,22 +1044,28 @@ where
         // shard that solicits is the shard that receives.
         // `publish_from_shard` republishes the resulting addresses and
         // routes to the rest of the set.
-        let configured = {
+        let (configured, lease_changed, driven) = {
             let mut state = self.inner.state.shard_for_default().lock();
-            state
-                .drive_dhcp(now)
-                .map_err(NetworkConfigurationError::Control)?;
-            state
-                .drive_ipv6_autoconfig(now)
-                .map_err(NetworkConfigurationError::Control)?;
-            if state.is_configured() {
+            let dhcp = state.drive_dhcp(now);
+            let ipv6 = state.drive_ipv6_autoconfig(now);
+            // A lease that ended leaves the shard unconfigured, and the
+            // control plane still holding it: publishing is what takes
+            // it back, and the sync below is what takes it off every
+            // other shard. Both happen before a failure is reported,
+            // because what the drive changed is already on the shard.
+            if dhcp.lease_changed || state.is_configured() {
                 self.inner.control.publish_from_shard(&state);
             }
-            state.is_configured()
+            (
+                state.is_configured(),
+                dhcp.lease_changed,
+                dhcp.result.and(ipv6),
+            )
         };
-        if configured {
+        if configured || lease_changed {
             self.synchronize_control_plane();
         }
+        driven.map_err(NetworkConfigurationError::Control)?;
         self.drive_network(NetworkPollSource::Configuration)
             .await
             .map_err(NetworkConfigurationError::Device)?;
@@ -1049,13 +1087,14 @@ where
     fn drive_interface_configuration(&self) {
         let now = StackInstant::from_nanos(self.now_nanos());
         let mut state = self.inner.state.shard_for_default().lock();
-        state
-            .drive_dhcp(now)
-            .unwrap_or_else(|error| tracing::debug!(?error, "failed to drive DHCP"));
+        let dhcp = state.drive_dhcp(now);
+        if let Err(error) = dhcp.result {
+            tracing::debug!(?error, "failed to drive DHCP");
+        }
         state.drive_ipv6_autoconfig(now).unwrap_or_else(|error| {
             tracing::debug!(?error, "failed to drive IPv6 autoconfiguration")
         });
-        if state.is_configured() {
+        if dhcp.lease_changed || state.is_configured() {
             self.inner.control.publish_from_shard(&state);
         }
     }
@@ -1123,17 +1162,48 @@ where
     /// hand it — a frame another processor drained, a read that
     /// relieved receive backpressure — raises the arrival signal the
     /// park races this bound against.
-    fn pump_wait(&self, pair: usize) -> Duration {
+    fn pump_wait(&self, pair: usize, interface_wide: bool) -> Duration {
         let pair_count = self.inner.device.queue_pair_count().max(1);
         let now = self.now_nanos();
-        let next_stack_deadline = self
+        let next_tcp_deadline = self
             .inner
             .state
             .pair_tcp_deadline_nanos(pair, pair_count)
-            .map_or(DHCP_RETRANSMIT_NANOS, |deadline| {
-                deadline.saturating_sub(now).min(DHCP_RETRANSMIT_NANOS)
+            .map_or(CONFIGURATION_POLL_NANOS, |deadline| {
+                deadline.saturating_sub(now).min(CONFIGURATION_POLL_NANOS)
             });
-        self.progress_wait(Duration::from_nanos(next_stack_deadline))
+        let bound = Duration::from_nanos(next_tcp_deadline);
+        // The configuration duty is the bootstrap pump's alone, so its
+        // park is bounded by the DHCP client's next deadline as well.
+        let bound = if interface_wide {
+            bound.min(self.configuration_wait())
+        } else {
+            bound
+        };
+        self.progress_wait(bound)
+    }
+
+    /// How long a park may last before the interface's configuration
+    /// duties are due again: the DHCP client's next deadline — a
+    /// retransmission, T1, T2 or the lease's expiry — and no longer than
+    /// [`CONFIGURATION_POLL_NANOS`], which covers IPv6 router
+    /// solicitation.
+    fn configuration_wait(&self) -> Duration {
+        let now = self.now_nanos();
+        let deadline = self
+            .inner
+            .state
+            .shard_for_default()
+            .lock()
+            .dhcp
+            .next_deadline();
+        let nanos = deadline.map_or(CONFIGURATION_POLL_NANOS, |deadline| {
+            deadline
+                .nanos()
+                .saturating_sub(now)
+                .min(CONFIGURATION_POLL_NANOS)
+        });
+        Duration::from_nanos(nanos)
     }
 
     /// The wait to hand [`Self::wait_for_progress`] for a caller that
@@ -1498,7 +1568,7 @@ pub(crate) mod fixture {
     /// This is what a close test reads instead of the wire. Whether a
     /// FIN is on the outbound queue says nothing about when it leaves;
     /// the pump publishes it, and a pump nobody woke sleeps out its
-    /// bound — the soonest protocol timer, `DHCP_RETRANSMIT_NANOS` away
+    /// bound — the soonest protocol timer, `CONFIGURATION_POLL_NANOS` away
     /// on a guest with nothing else to send (#231).
     pub(crate) struct PumpPark<'a> {
         parked: Pin<Box<ProgressChanged<'a>>>,
@@ -1766,9 +1836,9 @@ mod tests {
 
     use helios_netstack::{
         ArpOperation, ArpPacket, ETHERNET_FRAME_BYTES, EthernetFrame, EthernetProtocol,
-        IcmpEchoKey, Icmpv4Packet, Icmpv6Packet, IpAddress, IpCidr, IpProtocol, Ipv4Address,
-        Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6Packet, IsnSecret, MAX_OUTBOUND_FRAMES,
-        NeighborEntry, NeighborState, Route, StackConfig, StackInstant, TCP_RECEIVE_WINDOW_BYTES,
+        IcmpEchoKey, Icmpv4Packet, Icmpv6Packet, IpAddress, IpProtocol, Ipv4Address, Ipv4Cidr,
+        Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6Packet, IsnSecret, MAX_OUTBOUND_FRAMES,
+        NeighborEntry, NeighborState, StackConfig, StackInstant, TCP_RECEIVE_WINDOW_BYTES,
         TcpEndpoint, TcpFlags, TcpHeader, TcpListenBacklog, TcpPacket, TransportChecksum,
         UdpEndpoint, UdpPacket, UdpPayload, UdpSocketBinding, internet_checksum,
     };
@@ -1776,20 +1846,23 @@ mod tests {
     use alloc::vec::Vec;
     use bytes::Bytes;
     use futures_lite::future::{block_on, poll_once};
-    use helios_netstack::RxFrame;
-
-    use crate::test_support::{
-        RecordingNetworkInterface, RecordingSmpCpu, TestCpu, test_root_entropy,
+    use helios_netstack::{
+        DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DhcpClient, DhcpMessageType, DhcpServerMessage,
+        DhcpState, RxFrame,
     };
 
+    use crate::test_support::{
+        ManualClockCpu, RecordingNetworkInterface, RecordingSmpCpu, TestCpu, test_root_entropy,
+    };
+
+    use super::component::DnsQueryPair;
     use super::{
-        AddressAttemptError, DHCP_REBOOT_ATTEMPTS, DHCP_RETRANSMIT_NANOS, DhcpClientState,
-        DhcpDnsServers, DhcpMessageType, DhcpServerMessage, DnsQueryPair, HandleSlab,
-        NETWORK_BUSY_POLL_ROUNDS, NETWORK_TX_BATCH_FRAMES, NetworkIpAddress, NetworkPollBudget,
-        NetworkPollProgress, NetworkPollScope, NetworkPollSource, NetworkPollState,
-        NetworkPumpAction, NetworkPumpCadence, NetworkShard, ReplicaHandle, TcpListenerId,
-        TcpReadProgress, UdpSocketId, icmp_echo_payload, limit_udp_datagram_bytes,
-        map_ipv4_address, parse_ipv6, receive_pair_order,
+        AddressAttemptError, DhcpDnsServers, HandleSlab, NETWORK_BUSY_POLL_ROUNDS,
+        NETWORK_TX_BATCH_FRAMES, NetworkIpAddress, NetworkPollBudget, NetworkPollProgress,
+        NetworkPollScope, NetworkPollSource, NetworkPollState, NetworkPumpAction,
+        NetworkPumpCadence, NetworkShard, ReplicaHandle, TcpListenerId, TcpReadProgress,
+        UdpSocketId, icmp_echo_payload, limit_udp_datagram_bytes, map_ipv4_address, parse_ipv6,
+        receive_pair_order,
     };
 
     fn ipv6_tcp_frame(
@@ -2058,95 +2131,115 @@ mod tests {
         TcpListenerId(ReplicaHandle::new(slot).get())
     }
 
-    /// A restored machine may be on another network, so a bound client
-    /// asks the link to confirm its lease (INIT-REBOOT) and keeps the
-    /// address while it waits; a client with no lease has nothing to ask
-    /// about.
+    /// A restored machine may be on another network, so a client that
+    /// holds a lease asks the link to confirm it (INIT-REBOOT) and keeps
+    /// the address while it waits; one with no lease has an exchange of
+    /// its own under way and is left alone.
     #[test]
     fn a_restored_machine_asks_the_link_to_confirm_its_lease() {
         let mut shard = test_network_shard();
-        let lease = Ipv4Cidr::new(Ipv4Address::new([192, 0, 2, 10]), 24);
-
-        assert_eq!(
-            shard.begin_lease_revalidation(9, StackInstant::from_nanos(1)),
-            Ok(false),
-            "a client still looking for an address has no lease to confirm"
+        assert!(
+            !shard.begin_lease_revalidation(9, StackInstant::from_nanos(SECOND)),
+            "a client still in INIT has no lease to confirm"
         );
-
-        shard
-            .stack
-            .add_ipv4_address(lease)
-            .expect("test address should be accepted");
-        shard.dhcp = DhcpClientState::Bound;
-        assert_eq!(
-            shard.begin_lease_revalidation(9, StackInstant::from_nanos(1)),
-            Ok(true)
+        assert_eq!(shard.dhcp.state(), DhcpState::Init);
+        let own_exchange = shard.dhcp.transaction_id();
+        drive_dhcp_ok(&mut shard, SECOND);
+        assert_eq!(shard.dhcp.state(), DhcpState::Selecting);
+        assert!(
+            !shard.begin_lease_revalidation(9, StackInstant::from_nanos(SECOND)),
+            "a client mid-DISCOVER has no lease to confirm"
         );
-        assert_eq!(
-            shard.dhcp,
-            DhcpClientState::Rebooting {
-                transaction_id: 9,
-                requested_ip: lease.address(),
-                attempts: 1,
-                last_sent: StackInstant::from_nanos(1),
-            }
+        assert_eq!(shard.dhcp.state(), DhcpState::Selecting);
+        assert_eq!(shard.dhcp.transaction_id(), own_exchange);
+
+        let mut shard = dhcp_bound_shard();
+        let start = 100 * SECOND;
+        assert!(shard.begin_lease_revalidation(9, StackInstant::from_nanos(start)));
+        assert_eq!(shard.dhcp.state(), DhcpState::Rebooting);
+        assert_eq!(shard.dhcp.transaction_id(), 9);
+        assert!(
+            !drive_dhcp_ok(&mut shard, start),
+            "a question about the lease changes nothing yet"
         );
         assert_eq!(
             shard.stack.ipv4_addresses().count(),
             1,
             "the address stays in use until the link answers"
         );
-        let frame = shard
-            .stack
-            .take_outbound()
-            .expect("a DHCP REQUEST frame should be queued");
-        let ethernet = EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
-        let ipv4 = Ipv4Packet::parse(ethernet.payload).expect("IPv4 packet should parse");
-        let udp = UdpPacket::parse(ipv4.payload).expect("UDP datagram should parse");
-        assert_eq!(udp.destination_port, helios_netstack::DHCP_SERVER_PORT);
-        // The requested-IP option (50) names the old lease, and the
-        // server-identifier option (54) is absent: any server may answer.
+        let frames = drain_outbound(&mut shard);
+        let (destination, port, payload) = dhcp_datagram(
+            frames
+                .last()
+                .expect("a DHCP REQUEST frame should be queued"),
+        );
+        assert_eq!(destination, Ipv4Address::BROADCAST);
+        assert_eq!(port, DHCP_SERVER_PORT);
+        // The requested-IP option (50) names the held address.
         assert!(
-            udp.payload
+            payload
                 .windows(6)
                 .any(|option| option == [50, 4, 192, 0, 2, 10])
         );
-        assert!(!udp.payload.windows(2).any(|option| option == [54, 4]));
     }
 
     /// A link that never confirms the lease leaves the client no reason
-    /// to trust it: after the retries it starts over as a NAK would.
+    /// to trust it: after the attempts the shard takes the address, the
+    /// route and the resolvers off the interface, and asks for a new
+    /// lease.
     #[test]
-    fn an_unconfirmed_lease_is_given_up_after_the_retries() {
-        let mut shard = test_network_shard();
-        shard
-            .stack
-            .add_ipv4_address(Ipv4Cidr::new(Ipv4Address::new([192, 0, 2, 10]), 24))
-            .expect("test address should be accepted");
-        shard.dhcp = DhcpClientState::Bound;
-        shard
-            .begin_lease_revalidation(9, StackInstant::from_nanos(0))
-            .expect("the first REQUEST is built");
+    fn an_unconfirmed_lease_is_taken_off_the_interface() {
+        let mut shard = dhcp_bound_shard();
+        let start = 100 * SECOND;
+        assert!(shard.begin_lease_revalidation(9, StackInstant::from_nanos(start)));
 
-        for attempt in 2..=DHCP_REBOOT_ATTEMPTS {
-            let now = StackInstant::from_nanos(u64::from(attempt) * DHCP_RETRANSMIT_NANOS);
-            shard.retransmit_dhcp(now).expect("a retry is sent");
-            assert!(
-                matches!(
-                    shard.dhcp,
-                    DhcpClientState::Rebooting { attempts, .. } if attempts == attempt
-                ),
-                "attempt {attempt}: {:?}",
-                shard.dhcp
-            );
+        for attempt in 0..4 {
+            assert!(!drive_dhcp_ok(&mut shard, start + attempt * SECOND));
+            assert_eq!(shard.stack.ipv4_addresses().count(), 1);
         }
-        assert_eq!(shard.stack.ipv4_addresses().count(), 1);
+        drain_outbound(&mut shard);
 
-        let now =
-            StackInstant::from_nanos(u64::from(DHCP_REBOOT_ATTEMPTS + 1) * DHCP_RETRANSMIT_NANOS);
-        shard.retransmit_dhcp(now).expect("the exchange ends");
-        assert_eq!(shard.dhcp, DhcpClientState::Init { transaction_id: 10 });
+        assert!(
+            drive_dhcp_ok(&mut shard, start + 4 * SECOND),
+            "the lease ended"
+        );
+
         assert_eq!(shard.stack.ipv4_addresses().count(), 0);
+        assert!(!has_default_route(&shard));
+        assert!(shard.dns_servers.is_empty());
+        assert_eq!(shard.dhcp.state(), DhcpState::Selecting);
+        let frames = drain_outbound(&mut shard);
+        let (destination, port, _) = dhcp_datagram(
+            frames
+                .last()
+                .expect("a DHCP DISCOVER frame should be queued"),
+        );
+        assert_eq!(destination, Ipv4Address::BROADCAST);
+        assert_eq!(port, DHCP_SERVER_PORT);
+    }
+
+    /// A server on the new link may confirm another address than the one
+    /// the machine held: the shard swaps the old one for it.
+    #[test]
+    fn a_confirmation_that_names_another_address_replaces_the_one_held() {
+        let mut shard = dhcp_bound_shard();
+        let start = 100 * SECOND;
+        assert!(shard.begin_lease_revalidation(9, StackInstant::from_nanos(start)));
+        drive_dhcp_ok(&mut shard, start);
+        drain_outbound(&mut shard);
+        let moved = Ipv4Address::new([192, 0, 2, 77]);
+        let mut ack = dhcp_reply(&shard.dhcp, DhcpMessageType::Ack);
+        ack.your_ip = moved;
+        deliver_dhcp(&mut shard, &ack, start + SECOND);
+
+        assert!(drive_dhcp_ok(&mut shard, start + SECOND));
+
+        assert_eq!(shard.dhcp.state(), DhcpState::Bound);
+        assert_eq!(shard.stack.ipv4_addresses().count(), 1);
+        assert_eq!(
+            shard.stack.primary_ipv4_address(),
+            Some(Ipv4Cidr::new(moved, 24))
+        );
     }
 
     /// A link that comes back is not the link that went away: the lease,
@@ -2155,122 +2248,453 @@ mod tests {
     /// unless the client is put back at the start.
     #[test]
     fn a_link_bounce_restarts_interface_configuration() {
-        let mut shard = test_network_shard();
-        shard
-            .stack
-            .add_ipv4_address(Ipv4Cidr::new(Ipv4Address::new([192, 0, 2, 10]), 24))
-            .expect("test address should be accepted");
-        shard
-            .stack
-            .routes_mut()
-            .add(Route {
-                destination: IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::UNSPECIFIED, 0)),
-                gateway: Some(IpAddress::Ipv4(Ipv4Address::new([192, 0, 2, 1]))),
-                expires_at: None,
-            })
-            .expect("test gateway should be accepted");
-        shard.dhcp = DhcpClientState::Bound;
-        shard
-            .dns_servers
-            .push(helios_netstack::Ipv4Address::new([192, 0, 2, 1]));
+        let mut shard = dhcp_bound_shard();
+        assert_eq!(shard.dhcp.state(), DhcpState::Bound);
 
         shard.restart_link_configuration(9);
 
-        assert_eq!(shard.dhcp, DhcpClientState::Init { transaction_id: 9 });
+        assert_eq!(shard.dhcp.state(), DhcpState::Init);
+        assert_eq!(shard.dhcp.transaction_id(), 9);
         assert_eq!(shard.stack.ipv4_addresses().count(), 0);
         assert!(shard.stack.routes().iter().next().is_none());
         assert!(shard.dns_servers.is_empty());
 
         // With the client back at Init the next configuration round
         // sends a fresh DISCOVER for the new link.
-        shard
-            .drive_dhcp(StackInstant::from_nanos(1))
-            .expect("a restarted DHCP client should send DISCOVER");
-        assert_eq!(
-            shard.dhcp,
-            DhcpClientState::Selecting {
-                transaction_id: 9,
-                last_sent: StackInstant::from_nanos(1),
-            }
+        drive_dhcp_ok(&mut shard, 1);
+        assert_eq!(shard.dhcp.state(), DhcpState::Selecting);
+        let frames = drain_outbound(&mut shard);
+        let (destination, port, _) = dhcp_datagram(
+            frames
+                .last()
+                .expect("a DHCP DISCOVER frame should be queued"),
         );
-        let frame = shard
-            .stack
-            .take_outbound()
-            .expect("a DHCP DISCOVER frame should be queued");
-        let ethernet = EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
-        let ipv4 = Ipv4Packet::parse(ethernet.payload).expect("IPv4 packet should parse");
-        let udp = UdpPacket::parse(ipv4.payload).expect("UDP datagram should parse");
-        assert_eq!(udp.destination_port, helios_netstack::DHCP_SERVER_PORT);
+        assert_eq!(destination, Ipv4Address::BROADCAST);
+        assert_eq!(port, DHCP_SERVER_PORT);
     }
 
-    fn dhcp_reply(
-        message_type: DhcpMessageType,
-        transaction_id: u32,
-        server_identifier: Option<Ipv4Address>,
-    ) -> DhcpServerMessage {
+    const SECOND: u64 = 1_000_000_000;
+    const DHCP_SERVER: Ipv4Address = Ipv4Address::new([192, 0, 2, 1]);
+    const DHCP_LEASED: Ipv4Address = Ipv4Address::new([192, 0, 2, 10]);
+    const DHCP_ROUTER: Ipv4Address = Ipv4Address::new([192, 0, 2, 254]);
+    const DHCP_LEASE_SECONDS: u32 = 3600;
+
+    /// What `client`'s server would send back in `message_type`: a
+    /// 24-bit lease of [`DHCP_LEASED`] with a router and a resolver
+    /// for [`DHCP_LEASE_SECONDS`].
+    fn dhcp_reply(client: &DhcpClient, message_type: DhcpMessageType) -> DhcpServerMessage {
+        let mut dns_servers = DhcpDnsServers::new();
+        dns_servers.push(DHCP_SERVER);
         DhcpServerMessage {
             message_type,
-            transaction_id,
-            your_ip: Ipv4Address::UNSPECIFIED,
-            server_identifier,
-            subnet_mask: None,
-            router: None,
-            dns_servers: DhcpDnsServers::new(),
-            lease_seconds: None,
+            transaction_id: client.transaction_id(),
+            client_mac: test_stack_config().mac,
+            your_ip: DHCP_LEASED,
+            server_identifier: Some(DHCP_SERVER),
+            subnet_mask: Some(Ipv4Address::new([255, 255, 255, 0])),
+            router: Some(DHCP_ROUTER),
+            dns_servers,
+            lease_seconds: Some(DHCP_LEASE_SECONDS),
+            renewal_seconds: None,
+            rebinding_seconds: None,
         }
     }
 
-    /// RFC 2131 §4.4.1: only a client waiting on a REQUEST takes a
-    /// DHCPNAK, and only one for its own exchange from the server it
-    /// selected.
-    #[test]
-    fn dhcp_nak_is_accepted_only_from_the_selected_server_while_requesting() {
-        let server = Ipv4Address::new([192, 0, 2, 1]);
-        let stranger = Ipv4Address::new([192, 0, 2, 66]);
-        let requesting = DhcpClientState::Requesting {
-            transaction_id: 7,
-            requested_ip: Ipv4Address::new([192, 0, 2, 10]),
-            server_identifier: server,
-            last_sent: StackInstant::from_nanos(0),
-        };
-
-        let nak = |transaction_id, server_identifier| {
-            dhcp_reply(DhcpMessageType::Nak, transaction_id, server_identifier)
-        };
-        assert!(requesting.accepts_reply(&nak(7, Some(server))));
-        assert!(!requesting.accepts_reply(&nak(8, Some(server))));
-        assert!(!requesting.accepts_reply(&nak(7, Some(stranger))));
-        assert!(!requesting.accepts_reply(&nak(7, None)));
-
-        for state in [
-            DhcpClientState::Bound,
-            DhcpClientState::Init { transaction_id: 7 },
-            DhcpClientState::Selecting {
-                transaction_id: 7,
-                last_sent: StackInstant::from_nanos(0),
-            },
-        ] {
-            assert!(!state.accepts_reply(&nak(7, Some(server))));
-        }
+    /// Puts a server's reply in the DHCP client's socket the way the
+    /// receive path does: a broadcast datagram to port 68.
+    fn deliver_dhcp(shard: &mut NetworkShard, message: &DhcpServerMessage, now: u64) {
+        let mut payload = [0u8; 548];
+        let len = message
+            .encode(&mut payload)
+            .expect("a DHCP reply should fit a datagram");
+        let (frame, frame_len) = ipv4_udp_frame(
+            DHCP_SERVER,
+            DHCP_SERVER_PORT,
+            Ipv4Address::BROADCAST,
+            DHCP_CLIENT_PORT,
+            &payload[..len],
+        );
+        shard
+            .stack
+            .receive_frame(&frame[..frame_len], StackInstant::from_nanos(now))
+            .expect("a DHCP reply should be handled");
     }
 
-    /// RFC 2131 §3.2: an INIT-REBOOT REQUEST names no server, so any
-    /// server on the link may answer it, and only the `xid` ties the
-    /// answer to the exchange.
-    #[test]
-    fn a_rebooting_client_takes_a_reply_to_its_exchange_from_any_server() {
-        let server = Ipv4Address::new([192, 0, 2, 1]);
-        let rebooting = DhcpClientState::Rebooting {
-            transaction_id: 7,
-            requested_ip: Ipv4Address::new([192, 0, 2, 10]),
-            attempts: 1,
-            last_sent: StackInstant::from_nanos(0),
-        };
-        for message_type in [DhcpMessageType::Ack, DhcpMessageType::Nak] {
-            assert!(rebooting.accepts_reply(&dhcp_reply(message_type, 7, Some(server))));
-            assert!(rebooting.accepts_reply(&dhcp_reply(message_type, 7, None)));
-            assert!(!rebooting.accepts_reply(&dhcp_reply(message_type, 8, Some(server))));
+    fn drain_outbound(shard: &mut NetworkShard) -> Vec<Vec<u8>> {
+        let mut frames = Vec::new();
+        while let Some(frame) = shard.stack.take_outbound() {
+            frames.push(frame.as_slice().to_vec());
         }
+        frames
+    }
+
+    /// The destination address, the destination port and the payload of
+    /// the IPv4 UDP datagram a frame carries.
+    fn dhcp_datagram(frame: &[u8]) -> (Ipv4Address, u16, Vec<u8>) {
+        let ethernet = EthernetFrame::parse(frame).expect("Ethernet frame should parse");
+        let ipv4 = Ipv4Packet::parse(ethernet.payload).expect("IPv4 packet should parse");
+        let udp = UdpPacket::parse(ipv4.payload).expect("UDP datagram should parse");
+        (ipv4.destination, udp.destination_port, udp.payload.to_vec())
+    }
+
+    /// Drives the shard's DHCP client at `now` nanoseconds, a drive that
+    /// must not fail, and reports whether it changed the lease.
+    fn drive_dhcp_ok(shard: &mut NetworkShard, now: u64) -> bool {
+        let drive = shard.drive_dhcp(StackInstant::from_nanos(now));
+        drive.result.expect("the DHCP drive should not fail");
+        drive.lease_changed
+    }
+
+    /// Runs the shard's DHCP client through DISCOVER, OFFER and REQUEST
+    /// at `start` nanoseconds, and leaves it waiting for the ACK.
+    fn dhcp_offered(shard: &mut NetworkShard, start: u64) {
+        assert!(!drive_dhcp_ok(shard, start), "DISCOVER changes no lease");
+        let offer = dhcp_reply(&shard.dhcp, DhcpMessageType::Offer);
+        deliver_dhcp(shard, &offer, start);
+        assert!(!drive_dhcp_ok(shard, start), "REQUEST changes no lease");
+        assert_eq!(shard.dhcp.state(), DhcpState::Requesting);
+        drain_outbound(shard);
+    }
+
+    /// Runs the shard's DHCP client through DISCOVER, OFFER, REQUEST
+    /// and ACK, the exchange starting at `start` nanoseconds.
+    fn dhcp_exchange(shard: &mut NetworkShard, start: u64) {
+        dhcp_offered(shard, start);
+        let ack = dhcp_reply(&shard.dhcp, DhcpMessageType::Ack);
+        deliver_dhcp(shard, &ack, start);
+        assert!(
+            drive_dhcp_ok(shard, start),
+            "an installed lease is a change to the lease"
+        );
+        drain_outbound(shard);
+    }
+
+    /// A shard whose client holds a one hour lease from `0 s`.
+    fn dhcp_bound_shard() -> NetworkShard {
+        let mut shard = test_network_shard();
+        dhcp_exchange(&mut shard, 0);
+        assert_eq!(shard.dhcp.state(), DhcpState::Bound);
+        assert_eq!(
+            shard.stack.primary_ipv4_address(),
+            Some(Ipv4Cidr::new(DHCP_LEASED, 24))
+        );
+        shard
+    }
+
+    fn has_default_route(shard: &NetworkShard) -> bool {
+        shard
+            .stack
+            .routes()
+            .iter()
+            .any(|route| route.gateway.is_some())
+    }
+
+    /// RFC 2131 §4.4.5: at T1, half the lease, the client asks the
+    /// server it leased from to renew, and the address stays configured
+    /// while it waits and after the ACK.
+    #[test]
+    fn a_lease_is_renewed_at_t1() {
+        let mut shard = dhcp_bound_shard();
+
+        assert!(!drive_dhcp_ok(&mut shard, 1799 * SECOND));
+        assert_eq!(shard.dhcp.state(), DhcpState::Bound);
+        assert!(drain_outbound(&mut shard).is_empty());
+
+        assert!(!drive_dhcp_ok(&mut shard, 1800 * SECOND));
+        assert_eq!(shard.dhcp.state(), DhcpState::Renewing);
+        assert_eq!(shard.stack.ipv4_addresses().count(), 1);
+        // The REQUEST is unicast to the server, whose hardware address
+        // this shard has not learned, so what left is the ARP request
+        // for it; the client asks again a second later rather than a
+        // minute.
+        let frames = drain_outbound(&mut shard);
+        let ethernet = EthernetFrame::parse(&frames[0]).expect("Ethernet frame should parse");
+        assert_eq!(ethernet.protocol, EthernetProtocol::Arp);
+        assert_eq!(
+            shard.dhcp.next_deadline(),
+            Some(StackInstant::from_nanos(1801 * SECOND))
+        );
+
+        let ack = dhcp_reply(&shard.dhcp, DhcpMessageType::Ack);
+        deliver_dhcp(&mut shard, &ack, 1801 * SECOND);
+        assert!(drive_dhcp_ok(&mut shard, 1801 * SECOND));
+        assert_eq!(shard.dhcp.state(), DhcpState::Bound);
+        // The renewed lease runs from the request at T1 (RFC 2131 §4.4.1).
+        assert_eq!(
+            shard.dhcp.lease().and_then(|lease| lease.expires_at),
+            Some(StackInstant::from_nanos((1800 + 3600) * SECOND))
+        );
+        assert_eq!(shard.stack.ipv4_addresses().count(), 1);
+    }
+
+    /// RFC 2131 §4.4.5: at T2, seven eighths of the lease, the client
+    /// asks every server by broadcast, with its address in `ciaddr`.
+    #[test]
+    fn a_lease_is_rebound_at_t2() {
+        let mut shard = dhcp_bound_shard();
+        drive_dhcp_ok(&mut shard, 1800 * SECOND);
+        drain_outbound(&mut shard);
+
+        assert!(!drive_dhcp_ok(&mut shard, 3150 * SECOND));
+
+        assert_eq!(shard.dhcp.state(), DhcpState::Rebinding);
+        let frames = drain_outbound(&mut shard);
+        let (destination, port, payload) =
+            dhcp_datagram(frames.last().expect("a REQUEST should be queued"));
+        assert_eq!(destination, Ipv4Address::BROADCAST);
+        assert_eq!(port, DHCP_SERVER_PORT);
+        // `ciaddr` is the fourth word of the BOOTP header.
+        assert_eq!(&payload[12..16], &DHCP_LEASED.octets());
+        assert_eq!(shard.stack.ipv4_addresses().count(), 1);
+    }
+
+    /// RFC 2131 §4.4.5: a lease nobody renewed is given up at its
+    /// expiry, with the router and the resolvers that came with it,
+    /// and the client starts over from DISCOVER.
+    #[test]
+    fn an_expired_lease_is_removed() {
+        let mut shard = dhcp_bound_shard();
+        drive_dhcp_ok(&mut shard, 1800 * SECOND);
+        drive_dhcp_ok(&mut shard, 3150 * SECOND);
+        drain_outbound(&mut shard);
+        assert!(has_default_route(&shard));
+        assert!(!shard.dns_servers.is_empty());
+
+        let changed = drive_dhcp_ok(&mut shard, 3600 * SECOND);
+
+        assert!(changed);
+        assert_eq!(shard.stack.ipv4_addresses().count(), 0);
+        assert!(!has_default_route(&shard));
+        assert!(shard.dns_servers.is_empty());
+        assert_eq!(shard.dhcp.state(), DhcpState::Selecting);
+        let frames = drain_outbound(&mut shard);
+        let (destination, port, _) =
+            dhcp_datagram(frames.last().expect("a DISCOVER should be queued"));
+        assert_eq!(destination, Ipv4Address::BROADCAST);
+        assert_eq!(port, DHCP_SERVER_PORT);
+    }
+
+    /// An ACK that carries no subnet mask is neither an error for
+    /// whoever waits on an address nor a lease declined: the prefix is
+    /// the one the address class names, 24 bits for 192.0.2.10
+    /// (RFC 791 §3.2), and the interface is configured with it.
+    #[test]
+    fn an_ack_without_a_subnet_mask_configures_the_class_prefix() {
+        let mut shard = test_network_shard();
+        dhcp_offered(&mut shard, 0);
+        let mut ack = dhcp_reply(&shard.dhcp, DhcpMessageType::Ack);
+        ack.subnet_mask = None;
+        deliver_dhcp(&mut shard, &ack, 0);
+
+        let changed = drive_dhcp_ok(&mut shard, 0);
+
+        assert!(changed);
+        assert_eq!(shard.dhcp.state(), DhcpState::Bound);
+        assert_eq!(
+            shard.stack.primary_ipv4_address(),
+            Some(Ipv4Cidr::new(DHCP_LEASED, 24))
+        );
+        assert!(has_default_route(&shard));
+        assert!(drain_outbound(&mut shard).is_empty());
+    }
+
+    /// A lease the shard has no room for is not left bound in the
+    /// client with nothing on the interface: the drive reports the
+    /// failure and the change, keeps the addresses that were there, and
+    /// the client starts over after its backoff.
+    #[test]
+    fn a_lease_the_shard_cannot_install_sends_the_client_back_to_init() {
+        let mut shard = test_network_shard();
+        let mut statics = 0;
+        while shard
+            .stack
+            .add_ipv4_address(Ipv4Cidr::new(
+                Ipv4Address::new([198, 51, 100, statics + 1]),
+                32,
+            ))
+            .is_ok()
+        {
+            statics += 1;
+        }
+        dhcp_offered(&mut shard, 0);
+        let ack = dhcp_reply(&shard.dhcp, DhcpMessageType::Ack);
+        deliver_dhcp(&mut shard, &ack, 0);
+
+        let drive = shard.drive_dhcp(StackInstant::from_nanos(0));
+
+        assert!(matches!(
+            drive.result,
+            Err(crate::NetworkControlError::InvalidAddress)
+        ));
+        assert!(drive.lease_changed);
+        assert_eq!(shard.dhcp.state(), DhcpState::Init);
+        assert_eq!(shard.dhcp.lease(), None);
+        assert_eq!(
+            shard.dhcp.next_deadline(),
+            Some(StackInstant::from_nanos(10 * SECOND))
+        );
+        assert_eq!(shard.stack.ipv4_addresses().count(), usize::from(statics));
+        assert!(
+            shard
+                .stack
+                .ipv4_addresses()
+                .all(|address| address.address() != DHCP_LEASED)
+        );
+        assert!(!has_default_route(&shard));
+        assert!(shard.dns_servers.is_empty());
+        assert!(drain_outbound(&mut shard).is_empty());
+    }
+
+    /// A drive that took a NAK's lease off the shard and then could not
+    /// queue the DISCOVER that follows still reports the removal, or the
+    /// control plane would keep the refused address and the next sync
+    /// would put it back.
+    #[test]
+    fn a_lease_change_is_reported_when_a_later_step_of_the_drive_fails() {
+        let now = 1800 * SECOND;
+        let mut shard = dhcp_bound_shard();
+        drive_dhcp_ok(&mut shard, now);
+        drain_outbound(&mut shard);
+        let nak = dhcp_reply(&shard.dhcp, DhcpMessageType::Nak);
+        deliver_dhcp(&mut shard, &nak, now);
+        let filled = (0..=MAX_OUTBOUND_FRAMES).any(|_| {
+            shard
+                .stack
+                .send_udp_ipv4_from(
+                    Ipv4Address::UNSPECIFIED,
+                    Ipv4Address::BROADCAST,
+                    super::UdpEgress {
+                        source_port: DHCP_CLIENT_PORT,
+                        destination_port: DHCP_SERVER_PORT,
+                        payload: b"filler",
+                        hop_limit: super::DEFAULT_HOP_LIMIT,
+                    },
+                    0,
+                    StackInstant::from_nanos(now),
+                )
+                .is_err()
+        });
+        assert!(filled, "the outbound queue should fill");
+
+        let drive = shard.drive_dhcp(StackInstant::from_nanos(now));
+
+        assert!(matches!(
+            drive.result,
+            Err(crate::NetworkControlError::BackendFault)
+        ));
+        assert!(drive.lease_changed);
+        assert_eq!(shard.stack.ipv4_addresses().count(), 0);
+        assert!(!has_default_route(&shard));
+        // The client moved on, and its DISCOVER is due again a second on.
+        assert_eq!(shard.dhcp.state(), DhcpState::Selecting);
+        assert_eq!(
+            shard.dhcp.next_deadline(),
+            Some(StackInstant::from_nanos(now + SECOND))
+        );
+    }
+
+    /// The service over a clock the test moves, with its DHCP client
+    /// bound to a one hour lease at `0 s`, and the control plane told.
+    fn dhcp_bound_service() -> (
+        super::NetworkService<ManualClockCpu, RecordingNetworkInterface>,
+        ManualClockCpu,
+    ) {
+        let cpu = ManualClockCpu::new();
+        let service = super::NetworkService::new(
+            cpu.clone(),
+            crate::test_support::test_profile_sink(),
+            crate::test_support::test_uptime_clock(),
+            crate::test_support::test_timer(cpu.clone()),
+            RecordingNetworkInterface::new(1),
+            test_root_entropy(),
+        );
+        {
+            let mut shard = service.inner.state.shard_for_default().lock();
+            dhcp_exchange(&mut shard, 0);
+            service.inner.control.publish_from_shard(&shard);
+        }
+        service.synchronize_control_plane();
+        assert_eq!(
+            service.inner.control.list_ipv4_addresses().len(),
+            1,
+            "the control plane learned the lease"
+        );
+        (service, cpu)
+    }
+
+    /// The regression this change is for: a NAK removed the address from
+    /// the default shard alone, the control plane kept it, and the next
+    /// synchronisation put it back on every shard.
+    #[test]
+    fn a_nak_while_renewing_leaves_no_shard_holding_the_address_after_a_sync() {
+        let (service, cpu) = dhcp_bound_service();
+        // A second shard, which an earlier sync gave the lease.
+        let mut other = test_network_shard();
+        service.inner.control.synchronize_shard(&mut other);
+        assert_eq!(other.stack.ipv4_addresses().count(), 1);
+
+        cpu.advance(1800 * SECOND);
+        service.drive_interface_configuration();
+        {
+            let mut shard = service.inner.state.shard_for_default().lock();
+            assert_eq!(shard.dhcp.state(), DhcpState::Renewing);
+            let nak = dhcp_reply(&shard.dhcp, DhcpMessageType::Nak);
+            deliver_dhcp(&mut shard, &nak, 1800 * SECOND);
+        }
+        service.drive_interface_configuration();
+        service.synchronize_control_plane();
+        // The poll round runs the sync again, and it has nothing to
+        // put back.
+        service.synchronize_control_plane();
+        service.inner.control.synchronize_shard(&mut other);
+
+        assert!(service.inner.control.list_ipv4_addresses().is_empty());
+        service.inner.state.for_each(|shard| {
+            assert_eq!(shard.stack.ipv4_addresses().count(), 0);
+            assert!(!has_default_route(shard));
+            assert!(shard.dns_servers.is_empty());
+        });
+        assert_eq!(other.stack.ipv4_addresses().count(), 0);
+        assert!(!has_default_route(&other));
+        let shard = service.inner.state.shard_for_default().lock();
+        assert_eq!(shard.dhcp.state(), DhcpState::Selecting);
+    }
+
+    /// A lease that expires leaves the control plane the same way.
+    #[test]
+    fn an_expired_lease_leaves_the_control_plane() {
+        let (service, cpu) = dhcp_bound_service();
+
+        cpu.advance(3600 * SECOND);
+        service.drive_interface_configuration();
+        service.synchronize_control_plane();
+
+        assert!(service.inner.control.list_ipv4_addresses().is_empty());
+        service.inner.state.for_each(|shard| {
+            assert_eq!(shard.stack.ipv4_addresses().count(), 0);
+            assert!(!has_default_route(shard));
+        });
+    }
+
+    /// The pump's park ends when the DHCP client is next due, not a
+    /// second later than a lease deadline and not on a timer nothing
+    /// needs.
+    #[test]
+    fn the_configuration_wait_follows_the_dhcp_deadline() {
+        let (service, cpu) = dhcp_bound_service();
+
+        // T1 is half an hour away and the bound is the poll interval
+        // that covers router solicitation.
+        assert_eq!(
+            service.configuration_wait(),
+            core::time::Duration::from_nanos(super::CONFIGURATION_POLL_NANOS)
+        );
+
+        cpu.advance(1800 * SECOND - 250_000_000);
+        assert_eq!(
+            service.configuration_wait(),
+            core::time::Duration::from_millis(250)
+        );
     }
 
     #[test]
@@ -3259,7 +3683,7 @@ mod tests {
     /// them: it raises no arrival, completes no descriptor and arms no
     /// timer, so a writer that queued its bytes and returned left the
     /// segment for the packet pump — which, having nothing to do, was
-    /// parked for `DHCP_RETRANSMIT_NANOS`.
+    /// parked for `CONFIGURATION_POLL_NANOS`.
     ///
     /// A request/response exchange therefore paid a second per round
     /// trip: `tcp-latency`'s 5000 sixteen-byte round trips could not

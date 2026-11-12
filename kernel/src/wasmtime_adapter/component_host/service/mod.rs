@@ -26,6 +26,8 @@ pub(super) use surface::add_surface_to_linker;
 mod audio;
 pub use audio::PlaybackHandle;
 pub(super) use audio::add_audio_to_linker;
+mod compile_session;
+use compile_session::*;
 mod compiler;
 use compiler::*;
 mod exec;
@@ -122,6 +124,29 @@ type Preview1IovRanges = SmallVec<[(usize, usize); 8]>;
 type CompilerThreadTasks = SmallVec<[crate::JoinHandle<CompilerThreadReport>; 8]>;
 type CompilerThreadReports = SmallVec<[CompilerThreadReport; 8]>;
 type CompilerPluginHandle<CpuImpl, Net, HostFs> = Arc<CompilerPluginRuntime<CpuImpl, Net, HostFs>>;
+
+/// What one call into the compiler plugin compiles, and how.
+#[derive(Clone, Copy)]
+struct CompilerCallInput<'a> {
+    wasm: &'a Bytes,
+    hint: AotCompileHint,
+    profile: bool,
+}
+
+/// What one compile session takes from its requester: the compiler plugin's
+/// artifact, the input, and how to compile it.
+struct CompileJob {
+    compiler_payload: Bytes,
+    wasm: Bytes,
+    hint: AotCompileHint,
+    profile: bool,
+}
+
+/// How a compile's body ended, with the phase timestamps it filled in.
+struct CompileEnd {
+    result: Result<(Vec<u8>, CompilerThreadReports), ProgramExecError>,
+    phases: CompilerPhaseTimestamps,
+}
 
 /// What [`UserProgramService::aot`] produced.
 pub(crate) struct AotArtifact {
@@ -779,6 +804,14 @@ where
 {
     spawn_network_packet_pump(&kernel, &debug_state);
     let topology = kernel.topology();
+    // Every backend's bootstrap processor reaches here only after starting
+    // its secondaries, and a backend enables its mechanisms on a processor
+    // before `start_processor` returns for it, so the line follows every
+    // processor's enable.
+    if helios_hal::cpu::current_processor() == topology.bootstrap_processor {
+        crate::control_flow::ReturnAddressCoverage::of(&cpu, env!("HELIOS_BUILD_TARGET"))
+            .log(topology.configured_processors);
+    }
     match component_host_processor_role(
         helios_hal::cpu::current_processor(),
         topology.configured_processors,
@@ -1230,6 +1263,7 @@ where
     /// future resolving with its exit status.
     pub(super) async fn spawn(
         &self,
+        compile: &CompileAuthority,
         exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
         source: ProgramSource,
         hint: Option<AotCompileHint>,
@@ -1238,11 +1272,11 @@ where
         super::emit_program_stage_marker(exec_context.write_serial, "program:spawn-begin");
         let executable = self
             .load_executable(
+                compile,
                 &exec_context,
                 launch.argv.program_name(),
                 &source,
                 hint,
-                exec_context.write_serial,
                 &launch.timeline,
             )
             .await?;
@@ -1256,9 +1290,9 @@ where
     /// rather than at every call site.
     async fn spawn_with_output_mode(
         &self,
+        compile: &CompileAuthority,
         exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
         source: ProgramSource,
-        hint: Option<AotCompileHint>,
         mut launch: ProgramLaunch<Net, HostFs>,
         output_mode: OutputMode,
         stdio: ChildStdio,
@@ -1266,11 +1300,11 @@ where
         super::emit_program_stage_marker(exec_context.write_serial, "program:spawn-begin");
         let executable = self
             .load_executable(
+                compile,
                 &exec_context,
                 launch.argv.program_name(),
                 &source,
-                hint,
-                exec_context.write_serial,
+                None,
                 &launch.timeline,
             )
             .await?;
@@ -1418,19 +1452,21 @@ where
     /// along with the exit code.
     pub(super) async fn exec_buffered(
         &self,
+        compile: &CompileAuthority,
         exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
         source: ProgramSource,
         hint: Option<AotCompileHint>,
         stdin: Vec<u8>,
         launch: ProgramLaunch<Net, HostFs>,
     ) -> Result<ExecResult, ProgramExecError> {
-        self.exec_buffered_with_snapshot(exec_context, source, hint, stdin, launch)
+        self.exec_buffered_with_snapshot(compile, exec_context, source, hint, stdin, launch)
             .await
             .map(|(result, _)| result)
     }
 
     async fn exec_buffered_with_snapshot(
         &self,
+        compile: &CompileAuthority,
         exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
         source: ProgramSource,
         hint: Option<AotCompileHint>,
@@ -1439,11 +1475,11 @@ where
     ) -> Result<(ExecResult, Option<MemoryFs>), ProgramExecError> {
         let executable = self
             .load_executable(
+                compile,
                 &exec_context,
                 launch.argv.program_name(),
                 &source,
                 hint,
-                exec_context.write_serial,
                 &launch.timeline,
             )
             .await?;
@@ -1507,13 +1543,14 @@ where
 
     pub(crate) async fn aot(
         &self,
+        compile: &CompileAuthority,
         exec_context: &ProgramExecContext<CpuImpl, Net, HostFs>,
         wasm: &Bytes,
         hint: AotCompileHint,
         profile: bool,
     ) -> Result<AotArtifact, ProgramExecError> {
         let signed = self
-            .compile_raw_component_to_signed_artifact(exec_context, wasm, hint, profile)
+            .compile_raw_component_to_signed_artifact(compile, exec_context, wasm, hint, profile)
             .await?;
         Ok(AotArtifact {
             signed,
@@ -1523,13 +1560,14 @@ where
 
     async fn load_executable(
         &self,
+        compile: &CompileAuthority,
         exec_context: &ProgramExecContext<CpuImpl, Net, HostFs>,
         program: &str,
         source: &ProgramSource,
         hint: Option<AotCompileHint>,
-        write_serial: crate::DebugSerialWriter,
         timeline: &phases::Timeline,
     ) -> Result<ProgramExecutable<CpuImpl, Net, HostFs>, ProgramExecError> {
+        let write_serial = exec_context.write_serial;
         let started_at = monotonic_nanos(&self.inner.clock_cpu);
         timeline.record(&self.inner.clock_cpu, LaunchPhase::LoadBegin);
         let payload = match source {
@@ -1556,7 +1594,13 @@ where
                     .map_err(map_artifact_profile_error)?;
                 let hint = hint.unwrap_or(AotCompileHint::Performance);
                 let signed = self
-                    .compile_raw_component_to_signed_artifact(exec_context, wasm, hint, false)
+                    .compile_raw_component_to_signed_artifact(
+                        compile,
+                        exec_context,
+                        wasm,
+                        hint,
+                        false,
+                    )
                     .await?;
                 let signed = Bytes::from(signed);
                 trusted_signed_payload(&signed)?
@@ -1773,12 +1817,13 @@ where
 
     async fn compile_raw_component_to_signed_artifact(
         &self,
+        _: &CompileAuthority,
         exec_context: &ProgramExecContext<CpuImpl, Net, HostFs>,
         wasm: &Bytes,
         hint: AotCompileHint,
         profile: bool,
     ) -> Result<Vec<u8>, ProgramExecError> {
-        let mut phases = CompilerPhaseTimestamps {
+        let phases = CompilerPhaseTimestamps {
             processor: if profile {
                 helios_hal::cpu::current_processor().id()
             } else {
@@ -1792,17 +1837,91 @@ where
             ..CompilerPhaseTimestamps::default()
         };
         let compiler_artifact = self.read_compiler_plugin_artifact(exec_context)?;
-        let compiler_payload = trusted_bootfs_payload(&compiler_artifact)?;
-        let (payload, thread_reports) = self
-            .invoke_compiler_core_module(
-                exec_context,
-                compiler_payload,
-                wasm,
-                hint,
-                profile,
-                &mut phases,
-            )
-            .await?;
+        let job = CompileJob {
+            compiler_payload: trusted_bootfs_payload(&compiler_artifact)?,
+            wasm: wasm.clone(),
+            hint,
+            profile,
+        };
+        // The compile runs in a task of its own, whichever route asked for
+        // it, and this call holds only the receiving half of its reply: the
+        // compile outlives a requester that stops waiting, and stops itself
+        // when that happens (`run_compile_session`).
+        let (reply, artifact) = futures::channel::oneshot::channel();
+        exec_context.spawner.spawn_detached({
+            let service = self.clone();
+            let exec_context = exec_context.clone();
+            async move {
+                service
+                    .compile_session(&exec_context, job, phases, reply)
+                    .await;
+            }
+        });
+        match artifact.await {
+            Ok(result) => result,
+            Err(_) => Err(ProgramExecError {
+                kind: ProgramExecErrorKind::Internal,
+                detail: ProgramExecErrorDetail::CompileSessionEnded,
+            }),
+        }
+    }
+
+    /// The compile session task: waits for the compile slot, runs the compile
+    /// with the slot held until every worker is joined, condemns the compile
+    /// if its requester leaves, and replies with the signed artifact.
+    async fn compile_session(
+        &self,
+        exec_context: &ProgramExecContext<CpuImpl, Net, HostFs>,
+        job: CompileJob,
+        phases: CompilerPhaseTimestamps,
+        reply: futures::channel::oneshot::Sender<Result<Vec<u8>, ProgramExecError>>,
+    ) {
+        let profile = job.profile;
+        run_compile_session(
+            &self.inner.compile_slot,
+            reply,
+            || {
+                let started_at = exec_context
+                    .runtime_state
+                    .uptime_nanos(exec_context.cpu.now().ticks());
+                let instance = exec_context.instance_registry.register_with_policy(
+                    "compiler-plugin",
+                    started_at,
+                    crate::OomPolicy::KernelPlugin,
+                );
+                let condemn = {
+                    let registry = exec_context.instance_registry.clone();
+                    let interrupts = self.inner.engine.interrupts().clone();
+                    let cpu = exec_context.cpu.clone();
+                    let runtime_state = exec_context.runtime_state.clone();
+                    let id = instance.id();
+                    move || {
+                        condemn_abandoned_compile(
+                            &registry,
+                            &interrupts,
+                            id,
+                            runtime_state.uptime_nanos(cpu.now().ticks()),
+                        );
+                    }
+                };
+                (
+                    condemn,
+                    self.run_compile(exec_context, job, instance, phases),
+                )
+            },
+            |end| Self::sign_compiled(exec_context, profile, end),
+        )
+        .await;
+    }
+
+    /// Signs what a finished compile produced and reports its phases.
+    fn sign_compiled(
+        exec_context: &ProgramExecContext<CpuImpl, Net, HostFs>,
+        profile: bool,
+        end: CompileEnd,
+    ) -> Result<Vec<u8>, ProgramExecError> {
+        let CompileEnd { result, mut phases } = end;
+        let (payload, thread_reports) = result?;
         let signed =
             cwasm::sign_trusted_artifact_payload(&payload).map_err(map_artifact_trust_error)?;
         phases.signed_ns = if profile {
@@ -1828,23 +1947,39 @@ where
         Ok(signed)
     }
 
-    async fn invoke_compiler_core_module(
+    /// The compile proper, run with the compile slot held: the plugin's call,
+    /// then the join of every worker task the plugin spawned, so the slot is
+    /// never released while one still runs on the plugin's memory.
+    async fn run_compile(
         &self,
         exec_context: &ProgramExecContext<CpuImpl, Net, HostFs>,
-        compiler_payload: Bytes,
-        wasm: &Bytes,
-        hint: AotCompileHint,
-        profile: bool,
-        phases: &mut CompilerPhaseTimestamps,
-    ) -> Result<(Vec<u8>, CompilerThreadReports), ProgramExecError> {
-        let _compile_slot = self.inner.compile_slot.acquire().await;
+        job: CompileJob,
+        instance: crate::RegisteredInstance,
+        mut phases: CompilerPhaseTimestamps,
+    ) -> CompileEnd {
+        let CompileJob {
+            compiler_payload,
+            wasm,
+            hint,
+            profile,
+        } = job;
         phases.slot_acquired_ns = if profile {
             monotonic_nanos(&exec_context.cpu)
         } else {
             0
         };
         let result = self
-            .invoke_compiler_inner(exec_context, &compiler_payload, wasm, hint, profile, phases)
+            .invoke_compiler_inner(
+                exec_context,
+                &compiler_payload,
+                instance,
+                CompilerCallInput {
+                    wasm: &wasm,
+                    hint,
+                    profile,
+                },
+                &mut phases,
+            )
             .await;
         let thread_reports = self.await_compiler_thread_tasks().await;
         phases.tasks_joined_ns = if profile {
@@ -1867,7 +2002,10 @@ where
             );
             *self.inner.compiler_plugin.lock() = None;
         }
-        result.map(|payload| (payload, thread_reports))
+        CompileEnd {
+            result: result.map(|payload| (payload, thread_reports)),
+            phases,
+        }
     }
 
     async fn await_compiler_thread_tasks(&self) -> CompilerThreadReports {
@@ -1901,13 +2039,18 @@ where
         &self,
         exec_context: &ProgramExecContext<CpuImpl, Net, HostFs>,
         compiler_payload: &Bytes,
-        wasm: &Bytes,
-        hint: AotCompileHint,
-        profile: bool,
+        compiler_instance: crate::RegisteredInstance,
+        input: CompilerCallInput<'_>,
         phases: &mut CompilerPhaseTimestamps,
     ) -> Result<Vec<u8>, ProgramExecError> {
-        let (plugin, plugin_cached) =
-            self.ensure_compiler_plugin(exec_context, compiler_payload)?;
+        let CompilerCallInput {
+            wasm,
+            hint,
+            profile,
+        } = input;
+        let (plugin, plugin_cached) = self
+            .ensure_compiler_plugin(exec_context, compiler_payload)
+            .await?;
         phases.plugin_cached = plugin_cached;
         phases.plugin_ready_ns = if profile {
             monotonic_nanos(&exec_context.cpu)
@@ -1915,39 +2058,32 @@ where
             0
         };
         let engine = self.inner.engine.raw();
-        let started_at = exec_context
-            .runtime_state
-            .uptime_nanos(exec_context.cpu.now().ticks());
-        let compiler_instance = exec_context.instance_registry.register_with_policy(
-            "compiler-plugin",
-            started_at,
-            crate::OomPolicy::KernelPlugin,
-        );
-        let store_data = CompilerCoreStore {
+        let store_data = CompilerCoreStore::new(CompilerCompileContext {
             cpu: exec_context.cpu.clone(),
             spawner: exec_context.spawner.clone(),
             runtime_state: exec_context.runtime_state.clone(),
-            instance: Arc::new(compiler_instance),
+            instance: compiler_instance,
             shared: plugin.shared.clone(),
-            preview1_descriptors: CompilerPreview1Descriptors::new(),
             write_serial: exec_context.write_serial,
             _marker: core::marker::PhantomData,
-        };
+        });
         let mut store = wasmtime::Store::new(engine, store_data);
-        let _interrupts = configure_compiler_core_store(&mut store);
-        let instance = plugin
-            .instance_pre
-            .instantiate_async(&mut store)
+        let drive = configure_compiler_core_store(&mut store);
+        let instance = drive
+            .instantiate(&mut store, &plugin.instance_pre)
             .await
             .map_err(map_program_runtime_error)?;
         let tls_base = plugin.main_thread_tls_base;
         set_compiler_tls_base(&mut store, &instance, tls_base)?;
-        let pthread_self_offset = instance
-            .get_typed_func::<(), i32>(&mut store, HELIOS_COMPILER_PTHREAD_SELF_OFFSET)
-            .map_err(map_program_runtime_error)?
-            .call_async(&mut store, ())
-            .await
-            .map_err(map_program_runtime_error)? as u32;
+        let pthread_self_offset = {
+            let pthread_self_offset = instance
+                .get_typed_func::<(), i32>(&mut store, HELIOS_COMPILER_PTHREAD_SELF_OFFSET)
+                .map_err(map_program_runtime_error)?;
+            drive
+                .call(&mut store, &pthread_self_offset, ())
+                .await
+                .map_err(map_program_runtime_error)? as u32
+        };
         let thread_pointer = tls_base
             .checked_add(pthread_self_offset)
             .ok_or(ProgramExecError {
@@ -1957,8 +2093,8 @@ where
         let initialize = instance
             .get_typed_func::<i32, ()>(&mut store, HELIOS_COMPILER_INITIALIZE)
             .map_err(map_program_runtime_error)?;
-        initialize
-            .call_async(&mut store, thread_pointer as i32)
+        drive
+            .call(&mut store, &initialize, thread_pointer as i32)
             .await
             .map_err(map_program_runtime_error)?;
         let exports = CompilerExports {
@@ -1981,15 +2117,18 @@ where
             0
         };
         let outstanding_before =
-            compiler_outstanding_bytes(&mut store, &exports.outstanding).await?;
+            compiler_outstanding_bytes(&drive, &mut store, &exports.outstanding).await?;
         let mut allocations = CompilerAllocations::new();
         let outcome = Self::call_compiler(
+            &drive,
             &mut store,
             &exports,
             &mut allocations,
-            wasm,
-            hint,
-            profile,
+            CompilerCallInput {
+                wasm,
+                hint,
+                profile,
+            },
             phases,
         )
         .await;
@@ -2000,9 +2139,11 @@ where
         // comes before the compile's own result: it says the plugin's memory
         // can no longer be trusted, which is what discards the runtime.
         let result = outcome?;
-        allocations.release(&mut store, &exports.free).await?;
+        allocations
+            .release(&drive, &mut store, &exports.free)
+            .await?;
         let outstanding_after =
-            compiler_outstanding_bytes(&mut store, &exports.outstanding).await?;
+            compiler_outstanding_bytes(&drive, &mut store, &exports.outstanding).await?;
         ensure_compiler_buffers_returned(outstanding_before, outstanding_after)?;
         result
     }
@@ -2012,23 +2153,28 @@ where
     /// `allocations` and releases them according to the returned
     /// [`CompilerCallOutcome`].
     async fn call_compiler(
+        drive: &CompilerStoreDrive<CpuImpl>,
         store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, HostFs>>,
         exports: &CompilerExports,
         allocations: &mut CompilerAllocations,
-        wasm: &Bytes,
-        hint: AotCompileHint,
-        profile: bool,
+        input: CompilerCallInput<'_>,
         phases: &mut CompilerPhaseTimestamps,
     ) -> CompilerCallOutcome {
+        let CompilerCallInput {
+            wasm,
+            hint,
+            profile,
+        } = input;
         let target = env!("HELIOS_BUILD_TARGET").as_bytes();
         let wasm_ptr = allocations
-            .alloc(&mut *store, &exports.alloc, wasm.len(), 1)
+            .alloc(drive, &mut *store, &exports.alloc, wasm.len(), 1)
             .await?;
         let target_ptr = allocations
-            .alloc(&mut *store, &exports.alloc, target.len(), 1)
+            .alloc(drive, &mut *store, &exports.alloc, target.len(), 1)
             .await?;
         let request_ptr = allocations
             .alloc(
+                drive,
                 &mut *store,
                 &exports.alloc,
                 CompilerRequestHeader::SIZE,
@@ -2068,35 +2214,27 @@ where
             return Ok(Err(error));
         }
         phases.input_done_ns = if profile {
-            monotonic_nanos(&store.data().cpu)
+            monotonic_nanos(&store.data().context.cpu)
         } else {
             0
         };
         phases.compile_started_ns = if profile {
-            monotonic_nanos(&store.data().cpu)
+            monotonic_nanos(&store.data().context.cpu)
         } else {
             0
         };
-        let compile_started = store.data().cpu.now().ticks();
-        let response_ptr = exports
-            .compile
-            .call_async(
+        let response_ptr = drive
+            .call(
                 &mut *store,
+                &exports.compile,
                 (request_ptr as i32, CompilerRequestHeader::SIZE as i32),
             )
             .await;
         phases.compile_returned_ns = if profile {
-            monotonic_nanos(&store.data().cpu)
+            monotonic_nanos(&store.data().context.cpu)
         } else {
             0
         };
-        let compile_elapsed = store
-            .data()
-            .cpu
-            .now()
-            .ticks()
-            .saturating_sub(compile_started);
-        store.data().record_user_ticks(compile_elapsed);
         let response_ptr = response_ptr.map_err(map_program_runtime_error)? as u32;
         Ok(accept_compiler_response(
             store.data(),
@@ -2124,14 +2262,19 @@ where
     /// it forever after. The cached `wasmtime::Module`, `InstancePre`
     /// and 512 MiB `SharedMemory` are stable across calls; per-call work
     /// drops to a fresh `wasmtime::Store` and `instance_pre.instantiate`.
-    fn ensure_compiler_plugin(
+    ///
+    /// Called only with the compile slot held, which is what makes the
+    /// build exclusive: nothing else builds or discards the cached runtime
+    /// between the check below and the store at the end, so the cache's
+    /// lock is never held across the build's awaits.
+    async fn ensure_compiler_plugin(
         &self,
         exec_context: &ProgramExecContext<CpuImpl, Net, HostFs>,
         compiler_payload: &Bytes,
     ) -> Result<(CompilerPluginHandle<CpuImpl, Net, HostFs>, bool), ProgramExecError> {
-        let mut slot = self.inner.compiler_plugin.lock();
-        if let Some(plugin) = slot.as_ref() {
-            return Ok((plugin.clone(), true));
+        let cached = self.inner.compiler_plugin.lock().clone();
+        if let Some(plugin) = cached {
+            return Ok((plugin, true));
         }
 
         // The compiler plugin is a precompiled core module; a component
@@ -2188,16 +2331,15 @@ where
             scratch_started_at,
             crate::OomPolicy::KernelPlugin,
         );
-        let scratch_store_data = CompilerCoreStore {
+        let scratch_store_data = CompilerCoreStore::new(CompilerCompileContext {
             cpu: exec_context.cpu.clone(),
             spawner: exec_context.spawner.clone(),
             runtime_state: exec_context.runtime_state.clone(),
-            instance: Arc::new(scratch_instance),
+            instance: scratch_instance,
             shared: shared.clone(),
-            preview1_descriptors: CompilerPreview1Descriptors::new(),
             write_serial: exec_context.write_serial,
             _marker: core::marker::PhantomData,
-        };
+        });
         let mut scratch_store = wasmtime::Store::new(engine, scratch_store_data);
         define_compiler_shared_memory(&mut linker, &scratch_store, &module, shared_memory)?;
 
@@ -2206,9 +2348,10 @@ where
                 .instantiate_pre(&module)
                 .map_err(map_program_runtime_error)?,
         );
-        let scratch_interrupts = configure_compiler_core_store(&mut scratch_store);
-        let scratch_instance = instance_pre
-            .instantiate(&mut scratch_store)
+        let scratch_drive = configure_compiler_core_store(&mut scratch_store);
+        let scratch_instance = scratch_drive
+            .instantiate(&mut scratch_store, &instance_pre)
+            .await
             .map_err(map_program_runtime_error)?;
         let main_thread_tls_base = compiler_tls_base(&mut scratch_store, &scratch_instance)?;
         if main_thread_tls_base == 0 {
@@ -2218,7 +2361,7 @@ where
                 detail: ProgramExecErrorDetail::CompilerPluginInvalid,
             });
         }
-        drop(scratch_interrupts);
+        drop(scratch_drive);
         drop(scratch_store);
         shared.instance_pre.call_once(|| instance_pre.clone());
 
@@ -2229,7 +2372,7 @@ where
             main_thread_tls_base,
             _code: code,
         });
-        *slot = Some(plugin.clone());
+        *self.inner.compiler_plugin.lock() = Some(plugin.clone());
         Ok((plugin, false))
     }
 }
