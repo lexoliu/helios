@@ -7367,6 +7367,7 @@ mod tests {
                     profile_use: None,
                     boot_programs: Vec::new(),
                     no_compiler_plugin: true,
+                    bootfs_root: None,
                 };
                 let arguments = cargo_arguments(&kernel_build_command(root, &build));
                 assert_eq!(
