@@ -13,24 +13,25 @@ use heapless::binary_heap::{BinaryHeap, Min};
 use siphasher::sip::SipHasher24;
 
 use crate::address::lifetime_deadline;
+use crate::icmp_rate::IcmpRateLimit;
 use crate::{
     AddressLifetimes, AdvertisedAddress, ArpOperation, ArpPacket, BbrV3, CongestionControl,
     DEFAULT_POLL_BUDGET, DhcpDnsServers, EthernetAddress, EthernetFrame, EthernetProtocol,
-    Icmpv4DestinationUnreachableCode, Icmpv4Packet, Icmpv6DestinationUnreachableCode, Icmpv6Packet,
-    IpAddress, IpCidr, Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6AddressEntry, Ipv6Cidr,
-    Ipv6DnsServers, Ipv6Packet, Ipv6RouterConfiguration, Ipv6Scope, NeighborDiscovery,
-    PacketBuffer, RxChecksumReport, RxFrame, RxFrameOffload, SegmentationOffload, StackError,
-    TcpCloseAction, TcpCloseKind, TcpEndpoint, TcpFlags, TcpHeader, TcpHeaderOptions, TcpPacket,
-    TcpReceiveBuffer, TcpReceiveCounters, TcpReceiveDiagnostics, TcpSegmentBudget, TcpSocket,
-    TcpTransmitSegment, TransportChecksum, TxChecksum, TxFrameRef, TxSegmentation, UdpPacket,
-    icmpv6_checksum_valid, interpret_router_advertisement, ipv4_checksum,
-    partial_transport_checksum_completes, tcp_checksum_valid, udp_checksum_valid,
+    Icmpv4DestinationUnreachableCode, Icmpv4Echo, Icmpv4Packet, Icmpv6DestinationUnreachableCode,
+    Icmpv6Echo, Icmpv6Packet, IpAddress, IpCidr, Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Address,
+    Ipv6AddressEntry, Ipv6Cidr, Ipv6DnsServers, Ipv6Packet, Ipv6RouterConfiguration, Ipv6Scope,
+    NdpOptions, NeighborDiscovery, PacketBuffer, RxChecksumReport, RxFrame, RxFrameOffload,
+    SegmentationOffload, StackError, TcpCloseAction, TcpCloseKind, TcpEndpoint, TcpFlags,
+    TcpHeader, TcpHeaderOptions, TcpPacket, TcpReceiveBuffer, TcpReceiveCounters,
+    TcpReceiveDiagnostics, TcpSegmentBudget, TcpSocket, TcpState, TcpTransmitSegment,
+    TransportChecksum, TxChecksum, TxFrameRef, TxSegmentation, UdpPacket, icmpv6_checksum_valid,
+    interpret_router_advertisement, ipv4_checksum, partial_transport_checksum_completes,
+    tcp_checksum_valid, udp_checksum_valid,
 };
 
 pub const MAX_ROUTES: usize = 32;
 pub const MAX_NEIGHBORS: usize = 128;
 pub const MAX_OUTBOUND_FRAMES: usize = 32;
-pub const MAX_STACK_EVENTS: usize = 64;
 pub const MAX_UDP_RX: usize = 64;
 /// Echo exchanges remembered: requests sent and not yet answered, so a
 /// reply or an ICMP error quoting one can be told from a forgery, and
@@ -41,6 +42,20 @@ pub const MAX_UDP_RX: usize = 64;
 /// replies that raced past their waiter's deadline. The oldest
 /// exchange is forgotten once the table fills.
 pub const MAX_ICMP_ECHO_EXCHANGES: usize = 8;
+/// Next hops whose address resolution one stack paces at once: one per
+/// entry the neighbor cache holds, since every resolution under way
+/// keeps an Incomplete entry there. A record is displaced only once its
+/// last request is a full interval old, so this is also the most
+/// requests one stack puts on the wire per interval.
+const MAX_PENDING_RESOLUTIONS: usize = MAX_NEIGHBORS;
+/// The time between two requests for the same address: RFC 1122 section
+/// 2.3.2.1 asks for at most one ARP request per second per destination,
+/// and RFC 4861 section 10 sets RETRANS_TIMER to 1000 ms.
+const ADDRESS_RESOLUTION_RETRANSMIT_NANOS: u64 = 1_000_000_000;
+/// Requests sent for one address before resolution is given up on.
+/// RFC 4861 section 10 sets MAX_MULTICAST_SOLICIT to 3; RFC 1122 section
+/// 2.3.2.1 asks only for a small bound, and ARP takes the same one.
+const ADDRESS_RESOLUTION_MAX_REQUESTS: u8 = 3;
 pub const MAX_UDP_SOCKETS: usize = 256;
 pub const MAX_IPV4_MULTICAST_MEMBERSHIPS: usize = 64;
 pub const MAX_PATH_MTU_ENTRIES: usize = 128;
@@ -420,6 +435,40 @@ pub struct IcmpEchoReply {
     /// Length of the echoed data, which equals the length of the payload
     /// the request carried.
     pub payload_bytes: u16,
+}
+
+/// An address whose link-layer address this stack is asking for: how
+/// many requests went out and when the last one did. The neighbor cache
+/// holds the Incomplete entry, but it cannot carry this: the kernel
+/// replaces every shard's cache with its own mirror whenever it
+/// synchronizes the control plane, which would restart the pacing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AddressResolution {
+    target: IpAddress,
+    requests: u8,
+    last_request_at: StackInstant,
+}
+
+/// The fields of a Neighbor Advertisement (RFC 4861 section 4.4) the
+/// stack acts on.
+#[derive(Clone, Copy, Debug)]
+struct NeighborAdvertisement<'a> {
+    target: Ipv6Address,
+    /// S flag: the advertisement answers a solicitation.
+    solicited: bool,
+    /// O flag: the advertised address replaces a cached one.
+    override_cache: bool,
+    options: NdpOptions<'a>,
+}
+
+/// What the network layer needs of the Ethernet frame an IP packet
+/// arrived in.
+#[derive(Clone, Copy, Debug)]
+struct RxLink {
+    source: EthernetAddress,
+    /// The frame was addressed to a group (broadcast or multicast)
+    /// rather than to this interface.
+    group_destination: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1065,6 +1114,193 @@ pub enum StackEvent {
     TcpClosed {
         socket: SocketId,
     },
+}
+
+/// What a socket slot has to tell its owner, one bit per kind.
+///
+/// Raising a bit that is already raised changes nothing: an owner that
+/// drains late learns that the socket became readable or closed, never
+/// how many times.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SlotEvent(u8);
+
+impl SlotEvent {
+    const TCP_CONNECTED: Self = Self(1 << 0);
+    const TCP_READABLE: Self = Self(1 << 1);
+    const TCP_CLOSED: Self = Self(1 << 2);
+    const UDP_DATAGRAM: Self = Self(1 << 3);
+}
+
+/// Per-slot event bits and the order in which slots became pending.
+///
+/// `queued` marks the slots that have an entry in `order`, so `order`
+/// holds at most one entry per slot and never outgrows `SLOTS`. An entry
+/// can outlive its bits when [`SlotEvents::forget`] clears a slot; `take`
+/// discards it when it reaches the front.
+#[derive(Clone, Debug)]
+struct SlotEvents<const SLOTS: usize> {
+    raised: [u8; SLOTS],
+    queued: [bool; SLOTS],
+    order: Deque<u16, SLOTS>,
+}
+
+impl<const SLOTS: usize> SlotEvents<SLOTS> {
+    fn new() -> Self {
+        Self {
+            raised: [0; SLOTS],
+            queued: [false; SLOTS],
+            order: Deque::new(),
+        }
+    }
+
+    fn raise(&mut self, slot: usize, event: SlotEvent) {
+        if !self.queued[slot] {
+            self.order
+                .push_back(u16::try_from(slot).expect("event slot exceeds u16"))
+                .unwrap_or_else(|_| unreachable!("a slot is queued once, so SLOTS entries fit"));
+            self.queued[slot] = true;
+        }
+        self.raised[slot] |= event.0;
+    }
+
+    /// Drops whatever `slot` still owes. A socket id is its slot, so a
+    /// slot handed to a new socket must not carry the previous socket's
+    /// events into the new one's name.
+    fn forget(&mut self, slot: usize) {
+        self.raised[slot] = 0;
+    }
+
+    /// Lowest raised bit of the slot that has waited longest.
+    fn take(&mut self) -> Option<(usize, SlotEvent)> {
+        loop {
+            let slot = usize::from(*self.order.front()?);
+            let raised = self.raised[slot];
+            let bit = raised.isolate_lowest_one();
+            self.raised[slot] = raised & !bit;
+            if self.raised[slot] == 0 {
+                self.order.pop_front();
+                self.queued[slot] = false;
+            }
+            if bit != 0 {
+                return Some((slot, SlotEvent(bit)));
+            }
+        }
+    }
+}
+
+/// The events the stack owes its owner, coalesced by what they describe.
+///
+/// A queue of occurrences would be sized by how often things happen; this
+/// is sized by the state it summarises, so no push can find it full: one
+/// bit per socket and kind, one entry per neighbour the cache can hold,
+/// and the latest lease and Router Advertisement.
+///
+/// Concurrency: plain data owned by one stack, which one shard drives, so
+/// every operation runs on the owner. Events come out in the order
+/// DHCP lease, Router Advertisement, neighbours, TCP sockets, UDP sockets;
+/// within a kind, in the order the subjects first became pending, except
+/// that a socket slot reused before its previous socket's events were
+/// taken keeps that place in line.
+#[derive(Clone, Debug)]
+struct StackEvents {
+    dhcp: Option<DhcpLease>,
+    ipv6: Option<Ipv6RouterConfiguration>,
+    /// Neighbours with an update the owner has not taken, oldest first.
+    /// The event carries the cache's current entry for the address, so
+    /// only the address is kept.
+    neighbors: ArrayVec<IpAddress, MAX_NEIGHBORS>,
+    tcp: SlotEvents<MAX_TCP_SOCKETS>,
+    udp: SlotEvents<MAX_UDP_SOCKETS>,
+}
+
+impl StackEvents {
+    fn new() -> Self {
+        Self {
+            dhcp: None,
+            ipv6: None,
+            neighbors: ArrayVec::new(),
+            tcp: SlotEvents::new(),
+            udp: SlotEvents::new(),
+        }
+    }
+
+    /// Records `event`. `neighbors` is the cache a neighbour update
+    /// summarises: it has already learned the entry the event names.
+    fn push(&mut self, event: StackEvent, neighbors: &NeighborCache) {
+        match event {
+            StackEvent::DhcpConfigured(lease) => self.dhcp = Some(lease),
+            StackEvent::Ipv6Autoconfigured(configuration) => self.ipv6 = Some(configuration),
+            StackEvent::NeighborUpdated(entry) => self.neighbor_updated(entry.ip, neighbors),
+            StackEvent::UdpDatagram { socket } => self
+                .udp
+                .raise(udp_socket_index(socket), SlotEvent::UDP_DATAGRAM),
+            StackEvent::TcpConnected { socket } => self
+                .tcp
+                .raise(socket_index(socket), SlotEvent::TCP_CONNECTED),
+            StackEvent::TcpReadable { socket } => self
+                .tcp
+                .raise(socket_index(socket), SlotEvent::TCP_READABLE),
+            StackEvent::TcpClosed { socket } => {
+                self.tcp.raise(socket_index(socket), SlotEvent::TCP_CLOSED)
+            }
+        }
+    }
+
+    /// Called as a TCP slot is handed to a new socket.
+    fn forget_tcp(&mut self, slot: usize) {
+        self.tcp.forget(slot);
+    }
+
+    /// Called as a UDP slot is handed to a new socket.
+    fn forget_udp(&mut self, slot: usize) {
+        self.udp.forget(slot);
+    }
+
+    fn neighbor_updated(&mut self, ip: IpAddress, neighbors: &NeighborCache) {
+        if self.neighbors.contains(&ip) {
+            return;
+        }
+        if self.neighbors.is_full() {
+            // The cache holds at most `MAX_NEIGHBORS` addresses and
+            // already holds `ip`, which is not pending, so at least one
+            // pending address has been evicted. Its update describes an
+            // entry that no longer exists.
+            let evicted = self
+                .neighbors
+                .iter()
+                .position(|pending| neighbors.get(*pending).is_none())
+                .expect("a full pending set and a cache holding a new address cannot overlap");
+            self.neighbors.remove(evicted);
+        }
+        self.neighbors.push(ip);
+    }
+
+    fn take(&mut self, neighbors: &NeighborCache) -> Option<StackEvent> {
+        if let Some(lease) = self.dhcp.take() {
+            return Some(StackEvent::DhcpConfigured(lease));
+        }
+        if let Some(configuration) = self.ipv6.take() {
+            return Some(StackEvent::Ipv6Autoconfigured(configuration));
+        }
+        while !self.neighbors.is_empty() {
+            let ip = self.neighbors.remove(0);
+            if let Some(entry) = neighbors.get(ip) {
+                return Some(StackEvent::NeighborUpdated(entry));
+            }
+        }
+        if let Some((slot, event)) = self.tcp.take() {
+            let socket = socket_id(slot);
+            return Some(match event {
+                SlotEvent::TCP_CONNECTED => StackEvent::TcpConnected { socket },
+                SlotEvent::TCP_READABLE => StackEvent::TcpReadable { socket },
+                _ => StackEvent::TcpClosed { socket },
+            });
+        }
+        let (slot, _) = self.udp.take()?;
+        Some(StackEvent::UdpDatagram {
+            socket: udp_socket_id(slot),
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2430,8 +2666,18 @@ where
     ipv6_dns_servers: Ipv6DnsServers,
     ipv4_multicast_memberships: ArrayVec<Ipv4MulticastMembership, MAX_IPV4_MULTICAST_MEMBERSHIPS>,
     neighbors: NeighborCache,
+    /// Pacing of the requests for next hops that are not resolved yet,
+    /// oldest ask first; see [`Stack::next_resolution_request`].
+    resolutions: ArrayVec<AddressResolution, MAX_PENDING_RESOLUTIONS>,
+    /// The bucket the ICMP and ICMPv6 errors this stack originates are
+    /// drawn from.
+    icmp_error_rate: IcmpRateLimit,
+    /// The bucket echo replies of both families are drawn from, apart
+    /// from the errors' so that a flood of echo requests, which any host
+    /// can send, never silences them.
+    icmp_echo_rate: IcmpRateLimit,
     outbound: OutboundFrameQueue,
-    events: Deque<StackEvent, MAX_STACK_EVENTS>,
+    events: StackEvents,
     udp: UdpSocketSlab,
     udp_rx: Deque<UdpQueuedReceive, MAX_UDP_RX>,
     /// Echo requests sent from this shard, oldest first, each marked
@@ -2449,6 +2695,11 @@ where
     /// were still finishing an orderly close.
     tcp_orphans: TcpOrphans,
     tcp: TcpSocketSlab<C>,
+    /// Position in the slab's active set where the next drive starts
+    /// emitting: the socket whose turn the last full outbound queue cut
+    /// short, so a socket late in the set is never behind every other
+    /// socket on every drive. Taken modulo the set's current length.
+    tcp_drive_start: usize,
     tcp_timers: BinaryHeap<TcpTimerEntry, Min, MAX_TCP_TIMER_ENTRIES>,
     tcp_timer_generations: [u32; MAX_TCP_SOCKETS],
     tcp_timer_deadlines: [Option<u64>; MAX_TCP_SOCKETS],
@@ -2562,8 +2813,35 @@ pub struct TcpStackCounters {
     pub window_updates_sent: u64,
     /// Segments retransmitted, by timer or by fast retransmit.
     pub retransmits_sent: u64,
-    /// Connections this stack currently holds.
+    /// Connections this stack currently holds, orphans included: an
+    /// orphan keeps its slot in the socket slab until the sweep reclaims
+    /// it, and the count walks that slab.
     pub sockets: u32,
+    /// How many of `sockets` are orphans: closed by their owner while the
+    /// stack still runs out the connection (FIN exchange, retransmission,
+    /// `TIME-WAIT`).
+    pub orphan_sockets: u32,
+    /// What those orphans still owe their peers, in bytes: sent and
+    /// unacknowledged plus queued and unsent.
+    pub orphan_send_queued_bytes: u64,
+    /// Orphans in `FIN-WAIT-1`: their FIN is sent, unacknowledged.
+    pub orphan_fin_wait_1: u32,
+    /// Orphans in `FIN-WAIT-2`: their FIN is acknowledged, the peer's
+    /// has not arrived.
+    pub orphan_fin_wait_2: u32,
+    /// Orphans in `CLOSING`: both FINs crossed, theirs unacknowledged.
+    pub orphan_closing: u32,
+    /// Orphans in `LAST-ACK`: the peer closed first and their FIN is
+    /// unacknowledged.
+    pub orphan_last_ack: u32,
+    /// Orphans in `TIME-WAIT`: waiting out the 2MSL timer.
+    pub orphan_time_wait: u32,
+    /// Orphans in any other state (`CLOSED` awaiting the sweep,
+    /// `ESTABLISHED`, `CLOSE-WAIT`, `SYN-SENT`, `SYN-RECEIVED`).
+    pub orphan_other_state: u32,
+    /// Orphans whose retransmission timer is armed: a sent segment
+    /// awaits acknowledgement.
+    pub orphan_retransmit_armed: u32,
     /// How many of them have a full receive queue and are refusing
     /// segments. A count that stays nonzero while `sockets` is zero is a
     /// leaked window, and the stack will refuse frames for ever.
@@ -2646,6 +2924,10 @@ impl OutboundFrameQueue {
 
     fn reserve(&mut self) -> Result<usize, StackError> {
         self.free.pop_front().ok_or(StackError::OutputQueueFull)
+    }
+
+    fn has_free_slot(&self) -> bool {
+        !self.free.is_empty()
     }
 
     fn frame_mut(&mut self, slot: usize) -> &mut PacketBuffer {
@@ -2825,8 +3107,11 @@ where
             ipv6_dns_servers: Ipv6DnsServers::new(),
             ipv4_multicast_memberships: ArrayVec::new(),
             neighbors: NeighborCache::new(),
+            resolutions: ArrayVec::new(),
+            icmp_error_rate: IcmpRateLimit::new(),
+            icmp_echo_rate: IcmpRateLimit::new(),
             outbound: OutboundFrameQueue::new(),
-            events: Deque::new(),
+            events: StackEvents::new(),
             udp: UdpSocketSlab::new(),
             udp_rx: Deque::new(),
             icmp_echo_exchanges: ArrayVec::new(),
@@ -2836,6 +3121,7 @@ where
             tcp_listener_children: [None; MAX_TCP_SOCKETS],
             tcp_orphans: TcpOrphans::new(),
             tcp: TcpSocketSlab::new(),
+            tcp_drive_start: 0,
             tcp_timers: BinaryHeap::new(),
             tcp_timer_generations: [0; MAX_TCP_SOCKETS],
             tcp_timer_deadlines: [None; MAX_TCP_SOCKETS],
@@ -2849,6 +3135,15 @@ where
     /// What this stack's TCP layer has sent and what it is advertising.
     pub fn tcp_counters(&self) -> TcpStackCounters {
         let mut sockets = 0u32;
+        let mut orphan_sockets = 0u32;
+        let mut orphan_send_queued_bytes = 0u64;
+        let mut orphan_fin_wait_1 = 0u32;
+        let mut orphan_fin_wait_2 = 0u32;
+        let mut orphan_closing = 0u32;
+        let mut orphan_last_ack = 0u32;
+        let mut orphan_time_wait = 0u32;
+        let mut orphan_other_state = 0u32;
+        let mut orphan_retransmit_armed = 0u32;
         let mut receive_window_bytes = 0u64;
         let mut receive_queued_bytes = 0u64;
         let mut out_of_order_queued_bytes = 0u64;
@@ -2858,6 +3153,26 @@ where
                 continue;
             };
             sockets += 1;
+            if self.tcp_orphans.contains(index) {
+                orphan_sockets += 1;
+                orphan_send_queued_bytes =
+                    orphan_send_queued_bytes.saturating_add(socket.send_queued_bytes());
+                let by_state = match socket.state() {
+                    TcpState::FinWait1 => &mut orphan_fin_wait_1,
+                    TcpState::FinWait2 => &mut orphan_fin_wait_2,
+                    TcpState::Closing => &mut orphan_closing,
+                    TcpState::LastAck => &mut orphan_last_ack,
+                    TcpState::TimeWait => &mut orphan_time_wait,
+                    TcpState::Closed
+                    | TcpState::Listen
+                    | TcpState::SynSent
+                    | TcpState::SynReceived
+                    | TcpState::Established
+                    | TcpState::CloseWait => &mut orphan_other_state,
+                };
+                *by_state += 1;
+                orphan_retransmit_armed += u32::from(socket.retransmission_timer_armed());
+            }
             receive_window_bytes = receive_window_bytes
                 .saturating_add(u64::from(socket.advertised_receive_window_bytes()));
             receive_queued_bytes =
@@ -2870,6 +3185,15 @@ where
             window_updates_sent: self.tcp_transmit_counters.window_updates_sent,
             retransmits_sent: self.tcp_transmit_counters.retransmits_sent,
             sockets,
+            orphan_sockets,
+            orphan_send_queued_bytes,
+            orphan_fin_wait_1,
+            orphan_fin_wait_2,
+            orphan_closing,
+            orphan_last_ack,
+            orphan_time_wait,
+            orphan_other_state,
+            orphan_retransmit_armed,
             receive_backpressured_sockets: self.tcp_receive_backpressured_count as u32,
             receive_window_bytes,
             receive_queued_bytes,
@@ -2916,27 +3240,19 @@ where
     }
 
     pub fn learn_neighbor(&mut self, entry: NeighborEntry) {
+        if entry.state != NeighborState::Incomplete {
+            // The address is resolved, so the requests for it are over.
+            self.resolutions
+                .retain(|resolution| resolution.target != entry.ip);
+        }
         let routes = &self.routes;
         self.neighbors
             .learn(entry, |address| routes.is_gateway(address));
-        Self::push_event_into(&mut self.events, StackEvent::NeighborUpdated(entry));
+        self.push_event(StackEvent::NeighborUpdated(entry));
     }
 
-    /// Records a neighbor observation that is only allowed to replace a
-    /// cached link-layer address when `override_cache` is set.
-    ///
-    /// RFC 4861 §7.2.5: an observation that does not carry the override
-    /// bit — a Neighbor Advertisement without it — may create a cache
-    /// entry or refresh a matching one, but must leave a resolved entry
-    /// with a different address alone.
-    fn learn_neighbor_without_override(&mut self, entry: NeighborEntry, override_cache: bool) {
-        match self.neighbors.get(entry.ip) {
-            Some(cached)
-                if cached.state != NeighborState::Incomplete
-                    && cached.mac != entry.mac
-                    && !override_cache => {}
-            _ => self.learn_neighbor(entry),
-        }
+    fn push_event(&mut self, event: StackEvent) {
+        self.events.push(event, &self.neighbors);
     }
 
     /// Adds an address and its connected route, or fails without changing
@@ -3385,10 +3701,7 @@ where
 
         if configuration.configures_interface() {
             self.ipv6_discovery.record_advertisement();
-            Self::push_event_into(
-                &mut self.events,
-                StackEvent::Ipv6Autoconfigured(configuration),
-            );
+            self.push_event(StackEvent::Ipv6Autoconfigured(configuration));
         }
     }
 
@@ -3447,13 +3760,15 @@ where
         let payload_range = bytes_subrange(frame.as_ref(), parsed.payload);
         let payload_bytes = frame.slice(payload_range.clone());
         let offload = offload.advance(payload_range.start);
+        let link = RxLink {
+            source: parsed.source,
+            // The group bit of the first octet marks broadcast and every
+            // multicast destination (IEEE 802, I/G).
+            group_destination: parsed.destination[0] & 1 == 1,
+        };
         match parsed.protocol {
-            EthernetProtocol::Ipv4 => {
-                self.receive_ipv4(parsed.source, &payload_bytes, offload, now)
-            }
-            EthernetProtocol::Ipv6 => {
-                self.receive_ipv6(parsed.source, &payload_bytes, offload, now)
-            }
+            EthernetProtocol::Ipv4 => self.receive_ipv4(link, &payload_bytes, offload, now),
+            EthernetProtocol::Ipv6 => self.receive_ipv6(link, &payload_bytes, offload, now),
             EthernetProtocol::Arp => self.receive_arp(parsed.source, parsed.payload, now),
         }
     }
@@ -3497,12 +3812,12 @@ where
         &mut self,
         key: TcpAckReplaceKey,
         encode: impl Fn(&mut PacketBuffer) -> Result<(), StackError>,
-    ) -> Result<bool, StackError> {
+    ) -> Result<(), StackError> {
         if self
             .outbound
             .replace_ready_tcp_ack(key, |frame| encode(frame))?
         {
-            return Ok(true);
+            return Ok(());
         }
         let slot = self.outbound.reserve()?;
         let frame = self.outbound.frame_mut(slot);
@@ -3511,7 +3826,7 @@ where
             Ok(()) => {
                 self.outbound.set_tcp_ack_key(slot, key);
                 self.outbound.commit(slot);
-                Ok(true)
+                Ok(())
             }
             Err(error) => {
                 self.outbound.release(slot);
@@ -3520,56 +3835,20 @@ where
         }
     }
 
+    /// Takes the next event the stack owes its owner.
+    ///
+    /// The queue behind it summarises state rather than logging it, so
+    /// it is bounded by that state (see [`StackEvents`]) and an owner
+    /// that drains late sees each socket and neighbour once, however
+    /// many times it changed.
     pub fn take_event(&mut self) -> Option<StackEvent> {
-        self.events.pop_front()
-    }
-
-    fn push_event_into(events: &mut Deque<StackEvent, MAX_STACK_EVENTS>, event: StackEvent) {
-        match event {
-            StackEvent::NeighborUpdated(entry) => {
-                if let Some(existing) = events.iter_mut().find_map(|event| match event {
-                    StackEvent::NeighborUpdated(existing) if existing.ip == entry.ip => {
-                        Some(existing)
-                    }
-                    _ => None,
-                }) {
-                    *existing = entry;
-                    return;
-                }
-                events
-                    .push_back(StackEvent::NeighborUpdated(entry))
-                    .unwrap_or_else(|_| panic!("stack event queue is full"));
-            }
-            StackEvent::UdpDatagram { socket } => {
-                if events
-                    .iter()
-                    .any(|event| matches!(event, StackEvent::UdpDatagram { socket: queued } if *queued == socket))
-                {
-                    return;
-                }
-                events
-                    .push_back(StackEvent::UdpDatagram { socket })
-                    .unwrap_or_else(|_| panic!("stack event queue is full"));
-            }
-            StackEvent::TcpReadable { socket } => {
-                if events
-                    .iter()
-                    .any(|event| matches!(event, StackEvent::TcpReadable { socket: queued } if *queued == socket))
-                {
-                    return;
-                }
-                events
-                    .push_back(StackEvent::TcpReadable { socket })
-                    .unwrap_or_else(|_| panic!("stack event queue is full"));
-            }
-            event => events
-                .push_back(event)
-                .unwrap_or_else(|_| panic!("stack event queue is full")),
-        }
+        self.events.take(&self.neighbors)
     }
 
     pub fn open_udp(&mut self, binding: UdpSocketBinding) -> Result<UdpSocketId, StackError> {
-        self.udp.insert(binding)
+        let socket = self.udp.insert(binding)?;
+        self.events.forget_udp(udp_socket_index(socket));
+        Ok(socket)
     }
 
     pub fn rebind_udp(
@@ -3832,266 +4111,308 @@ where
 
     /// Runs the stack's timers: every TCP socket's, and the IPv4
     /// reassembly cache's expiry.
+    ///
+    /// Every active socket has its timers run and then, while the
+    /// outbound queue has room, its turn on the wire. Turns go round the
+    /// active set from the socket whose turn the last full queue cut
+    /// short, so when the queue fills on every drive a socket still waits
+    /// at most one lap of the set, however busy the sockets ahead of it
+    /// are. A full queue ends the turns, not the drive: whatever a socket
+    /// did not emit stays pending on it for its next turn, and the timers
+    /// and the orphan sweep still run. Nothing is marked sent before it
+    /// has an outbound slot.
     pub fn drive_tcp(&mut self, now: StackInstant) -> Result<(), StackError> {
         self.ipv4_reassembly.expire(now);
-        let mut pending_syn =
-            ArrayVec::<(usize, TcpEndpoint, TcpEndpoint, TcpHeader, TcpHeaderOptions), 16>::new();
-        let mut pending_syn_ack =
-            ArrayVec::<(usize, TcpEndpoint, TcpEndpoint, TcpHeader, TcpHeaderOptions), 16>::new();
-        let mut pending_ack = ArrayVec::<
-            (
-                usize,
-                TcpEndpoint,
-                TcpEndpoint,
-                TcpHeader,
-                TcpHeaderOptions,
-                u8,
-            ),
-            16,
-        >::new();
-        let mut pending_retransmit = ArrayVec::<(usize, TcpTransmitSegment), 16>::new();
-        let mut pending_data = ArrayVec::<(usize, TcpTransmitSegment), 16>::new();
-        for active_slot in 0..self.tcp.active_len() {
-            let index = self.tcp.active_index(active_slot);
-            let (deadline, newly_closed) = {
-                let segment_budget = {
-                    let Some(socket) = self.tcp.get(index) else {
-                        panic!("TCP active socket index referenced a missing socket");
-                    };
-                    socket
-                        .local_endpoint()
-                        .zip(socket.remote_endpoint())
-                        .map(|(local, remote)| self.tcp_segment_budget_for(local, remote))
-                };
-                let Some(socket) = self.tcp.get_mut(index) else {
-                    panic!("TCP active socket index referenced a missing socket");
-                };
-                let previous_state = socket.state();
-                socket.expire_timers(now.nanos());
-                let closed = socket.state() == crate::TcpState::Closed;
-                // Retirement is a transition, not a condition: a closed
-                // socket stays in the active set until its owner drops
-                // it, and repeating the retirement every drive would
-                // repeat its close event too.
-                let newly_closed = closed && previous_state != crate::TcpState::Closed;
-                if !closed
-                    && let (Some(local), Some(remote)) =
-                        (socket.local_endpoint(), socket.remote_endpoint())
-                {
-                    let segment_budget =
-                        segment_budget.expect("TCP connected socket lost PMTU endpoints");
-                    let retransmitting = {
-                        if let Some(segment) = socket.pending_retransmission_with_mtu(
-                            now.nanos(),
-                            segment_budget.wire_segment(),
-                        ) {
-                            pending_retransmit
-                                .try_push((index, segment))
-                                .unwrap_or_else(|_| panic!("TCP retransmit burst overflowed"));
-                            true
-                        } else {
-                            false
-                        }
-                    };
-                    if !retransmitting {
-                        if let Some(header) = socket.pending_syn() {
-                            pending_syn
-                                .try_push((
-                                    index,
-                                    local,
-                                    remote,
-                                    header,
-                                    socket.pending_syn_options(now.nanos()),
-                                ))
-                                .unwrap_or_else(|_| {
-                                    panic!("TCP control transmit burst overflowed")
-                                });
-                        }
-                        if let Some(header) = socket.pending_syn_ack() {
-                            pending_syn_ack
-                                .try_push((
-                                    index,
-                                    local,
-                                    remote,
-                                    header,
-                                    socket.pending_syn_ack_options(now.nanos()),
-                                ))
-                                .unwrap_or_else(|_| {
-                                    panic!("TCP SYN-ACK transmit burst overflowed")
-                                });
-                        }
-                        if let Some(segment) =
-                            socket.take_transmit_segment(now.nanos(), segment_budget)
-                        {
-                            pending_data
-                                .try_push((index, segment))
-                                .unwrap_or_else(|_| panic!("TCP data transmit burst overflowed"));
-                        }
-                    }
-                    if let Some(header) = socket.pending_ack() {
-                        pending_ack
-                            .try_push((
-                                index,
-                                local,
-                                remote,
-                                header,
-                                socket.pending_ack_options(now.nanos()),
-                                socket.pending_ack_count(),
-                            ))
-                            .unwrap_or_else(|_| panic!("TCP ACK transmit burst overflowed"));
-                    }
+        // Nothing below inserts into or removes from the active set
+        // before the sweep, so a position names one socket for the whole
+        // walk.
+        let active = self.tcp.active_len();
+        let start = self.tcp_drive_start.checked_rem(active).unwrap_or(0);
+        let mut emitting = true;
+        let mut failure = None;
+        for offset in 0..active {
+            let position = (start + offset) % active;
+            let index = self.tcp.active_index(position);
+            match self.drive_tcp_socket(index, emitting, now) {
+                Ok(()) => {}
+                Err(StackError::OutputQueueFull) => {
+                    emitting = false;
+                    self.tcp_drive_start = position;
                 }
-                (socket.next_deadline_nanos(), newly_closed)
-            };
-            if newly_closed {
-                if self.tcp.terminal_error(index).is_none() {
-                    self.retire_closed_tcp_socket(index);
-                }
-                // An orphan's former owner is gone and its slot is
-                // about to be handed to another connection, so an event
-                // naming it would be read by whoever holds that slot
-                // next. The sweep below is the whole of its retirement.
-                if !self.tcp_orphans.contains(index) {
-                    Self::push_event_into(
-                        &mut self.events,
-                        StackEvent::TcpClosed {
-                            socket: socket_id(index),
-                        },
-                    );
+                // Anything else belongs to this socket's path and ends
+                // its turn, not the others'.
+                Err(error) => {
+                    failure.get_or_insert(error);
                 }
             }
-            self.schedule_tcp_timer_deadline(index, deadline);
-        }
-
-        for (index, local, remote, header, options) in pending_syn {
-            let hop_limit = self.tcp_socket_hop_limit(index);
-            if self.queue_tcp(
-                local,
-                remote,
-                TcpEgress {
-                    header,
-                    options,
-                    payload: TcpTxPayload::Flat(&[]),
-                    hop_limit,
-                },
-                index as u16,
-                now,
-            )? {
-                let socket = self
-                    .tcp
-                    .get_mut(index)
-                    .expect("TCP socket disappeared while queuing SYN");
-                socket.mark_syn_queued(now.nanos());
-                self.schedule_tcp_timer(index);
-            }
-        }
-        for (index, local, remote, header, options) in pending_syn_ack {
-            let hop_limit = self.tcp_socket_hop_limit(index);
-            if self.queue_tcp(
-                local,
-                remote,
-                TcpEgress {
-                    header,
-                    options,
-                    payload: TcpTxPayload::Flat(&[]),
-                    hop_limit,
-                },
-                index as u16,
-                now,
-            )? {
-                let socket = self
-                    .tcp
-                    .get_mut(index)
-                    .expect("TCP socket disappeared while queuing SYN-ACK");
-                socket.mark_syn_ack_queued(now.nanos());
-                self.schedule_tcp_timer(index);
-            }
-        }
-        for (index, local, remote, header, options, acks) in pending_ack {
-            let hop_limit = self.tcp_socket_hop_limit(index);
-            // Every owed acknowledgement gets its own frame. All but the
-            // first repeat the same acknowledgement number, which is
-            // exactly the duplicate-ACK signal the peer counts before it
-            // retransmits a hole ahead of its own timer.
-            for ack in 0..acks {
-                let queued = match self.queue_tcp(
-                    local,
-                    remote,
-                    TcpEgress {
-                        header,
-                        options,
-                        payload: TcpTxPayload::Flat(&[]),
-                        hop_limit,
-                    },
-                    index as u16,
-                    now,
-                ) {
-                    Ok(queued) => queued,
-                    // The first acknowledgement is what the peer is
-                    // owed; the duplicates behind it are a loss hint,
-                    // and must not take the last outbound slot from the
-                    // retransmission they are asking for.
-                    Err(StackError::OutputQueueFull) if ack != 0 => break,
-                    Err(error) => return Err(error),
-                };
-                if !queued {
-                    break;
-                }
-                let socket = self
-                    .tcp
-                    .get_mut(index)
-                    .expect("TCP socket disappeared while queuing ACK");
-                let queued_ack = socket.mark_ack_queued();
-                self.tcp_transmit_counters.acks_sent += 1;
-                if queued_ack.reopened_window {
-                    self.tcp_transmit_counters.window_updates_sent += 1;
-                }
-                self.schedule_tcp_timer(index);
-            }
-        }
-        for (index, segment) in pending_retransmit {
-            let sequence = segment.header.sequence;
-            let identification = segment.sequence_len as u16;
-            let hop_limit = self.tcp_socket_hop_limit(index);
-            if self.queue_tcp(
-                segment.local,
-                segment.remote,
-                TcpEgress {
-                    header: segment.header,
-                    options: segment.options,
-                    payload: self.tcp_tx_payload(&segment),
-                    hop_limit,
-                },
-                identification,
-                now,
-            )? {
-                let socket = self
-                    .tcp
-                    .get_mut(index)
-                    .expect("TCP socket disappeared while queuing retransmission");
-                socket.mark_retransmission_queued(sequence, now.nanos());
-                self.tcp_transmit_counters.retransmits_sent += 1;
-                self.schedule_tcp_timer(index);
-            }
-        }
-        for (index, segment) in pending_data {
-            let identification = segment.sequence_len as u16;
-            let hop_limit = self.tcp_socket_hop_limit(index);
-            self.queue_tcp(
-                segment.local,
-                segment.remote,
-                TcpEgress {
-                    header: segment.header,
-                    options: segment.options,
-                    payload: self.tcp_tx_payload(&segment),
-                    hop_limit,
-                },
-                identification,
-                now,
-            )?;
-            self.schedule_tcp_timer(index);
         }
         self.sweep_tcp_orphans(now);
+        failure.map_or(Ok(()), Err)
+    }
+
+    /// Runs socket `index`'s timers and, when `emit` is set, its turn on
+    /// the wire, then schedules its next deadline from what both left.
+    fn drive_tcp_socket(
+        &mut self,
+        index: usize,
+        emit: bool,
+        now: StackInstant,
+    ) -> Result<(), StackError> {
+        let segment_budget = {
+            let socket = self.active_tcp_socket(index);
+            socket
+                .local_endpoint()
+                .zip(socket.remote_endpoint())
+                .map(|(local, remote)| self.tcp_segment_budget_for(local, remote))
+        };
+        let socket = self.active_tcp_socket_mut(index);
+        let previous_state = socket.state();
+        socket.expire_timers(now.nanos());
+        let closed_by_timers = socket.state() == crate::TcpState::Closed;
+        let turn = match segment_budget {
+            Some(budget) if emit && !closed_by_timers => self.emit_tcp_turn(index, budget, now),
+            _ => Ok(()),
+        };
+        // Retirement is a transition, not a condition: a closed socket
+        // stays in the active set until its owner drops it, and
+        // repeating the retirement every drive would repeat its close
+        // event too. It is judged once the turn is over because the
+        // turn can close the socket as well: the retransmission limit
+        // closes it when the retransmission is queued.
+        if self.active_tcp_socket(index).state() == crate::TcpState::Closed
+            && previous_state != crate::TcpState::Closed
+        {
+            if self.tcp.terminal_error(index).is_none() {
+                self.retire_closed_tcp_socket(index);
+            }
+            // An orphan's former owner is gone and its slot is about to
+            // be handed to another connection, so an event naming it
+            // would be read by whoever holds that slot next. The sweep
+            // is the whole of its retirement.
+            if !self.tcp_orphans.contains(index) {
+                self.push_event(StackEvent::TcpClosed {
+                    socket: socket_id(index),
+                });
+            }
+        }
+        self.schedule_tcp_timer(index);
+        turn
+    }
+
+    /// Socket `index`'s turn on the wire, in the order a connection
+    /// needs its segments: a due retransmission, or else its handshake
+    /// and its next data segment; then the acknowledgements it still
+    /// owes. Data carries an acknowledgement, so a socket that sent data
+    /// owes one fewer afterwards.
+    ///
+    /// The first error ends the turn with the rest still pending on the
+    /// socket.
+    fn emit_tcp_turn(
+        &mut self,
+        index: usize,
+        budget: TcpSegmentBudget,
+        now: StackInstant,
+    ) -> Result<(), StackError> {
+        let (local, remote) = self.active_tcp_endpoints(index);
+        let socket = self.active_tcp_socket(index);
+        if let Some(segment) =
+            socket.pending_retransmission_with_mtu(now.nanos(), budget.wire_segment())
+        {
+            self.emit_tcp_retransmission(index, &segment, now)?;
+            // The retransmission limit closes the connection, and a
+            // closed connection owes its peer nothing more.
+            if self.active_tcp_socket(index).state() == crate::TcpState::Closed {
+                return Ok(());
+            }
+        } else {
+            if let Some(header) = socket.pending_syn() {
+                let options = socket.pending_syn_options(now.nanos());
+                if self.queue_tcp_control(index, local, remote, header, options, now)? {
+                    self.active_tcp_socket_mut(index)
+                        .mark_syn_queued(now.nanos());
+                }
+            } else if let Some(header) = socket.pending_syn_ack() {
+                let options = socket.pending_syn_ack_options(now.nanos());
+                if self.queue_tcp_control(index, local, remote, header, options, now)? {
+                    self.active_tcp_socket_mut(index)
+                        .mark_syn_ack_queued(now.nanos());
+                }
+            }
+            self.emit_tcp_data(index, local, remote, budget, now)?;
+        }
+        self.emit_tcp_acks(index, local, remote, now)
+    }
+
+    fn active_tcp_socket(&self, index: usize) -> &TcpSocket<C> {
+        self.tcp
+            .get(index)
+            .unwrap_or_else(|| panic!("TCP active socket index referenced a missing socket"))
+    }
+
+    fn active_tcp_socket_mut(&mut self, index: usize) -> &mut TcpSocket<C> {
+        self.tcp
+            .get_mut(index)
+            .unwrap_or_else(|| panic!("TCP active socket index referenced a missing socket"))
+    }
+
+    fn active_tcp_endpoints(&self, index: usize) -> (TcpEndpoint, TcpEndpoint) {
+        let socket = self.active_tcp_socket(index);
+        socket
+            .local_endpoint()
+            .zip(socket.remote_endpoint())
+            .expect("TCP socket lost its endpoints during a drive")
+    }
+
+    fn emit_tcp_retransmission(
+        &mut self,
+        index: usize,
+        segment: &TcpTransmitSegment,
+        now: StackInstant,
+    ) -> Result<(), StackError> {
+        let sequence = segment.header.sequence;
+        let identification = segment.sequence_len as u16;
+        let hop_limit = self.tcp_socket_hop_limit(index);
+        if self.queue_tcp(
+            segment.local,
+            segment.remote,
+            TcpEgress {
+                header: segment.header,
+                options: segment.options,
+                payload: self.tcp_tx_payload(segment),
+                hop_limit,
+            },
+            identification,
+            now,
+        )? {
+            self.active_tcp_socket_mut(index)
+                .mark_retransmission_queued(sequence, now.nanos());
+            self.tcp_transmit_counters.retransmits_sent += 1;
+        }
+        Ok(())
+    }
+
+    /// Queues a segment that has no payload and no sequence-space
+    /// bookkeeping beyond what its caller marks afterwards.
+    fn queue_tcp_control(
+        &mut self,
+        index: usize,
+        local: TcpEndpoint,
+        remote: TcpEndpoint,
+        header: TcpHeader,
+        options: TcpHeaderOptions,
+        now: StackInstant,
+    ) -> Result<bool, StackError> {
+        let hop_limit = self.tcp_socket_hop_limit(index);
+        self.queue_tcp(
+            local,
+            remote,
+            TcpEgress {
+                header,
+                options,
+                payload: TcpTxPayload::Flat(&[]),
+                hop_limit,
+            },
+            index as u16,
+            now,
+        )
+    }
+
+    /// Sends the next segment `index` has queued, if any.
+    ///
+    /// Taking a segment moves it into flight, so the slot it will leave
+    /// through and the link address it is bound for are secured before
+    /// the take, and the frame is built for that address without a
+    /// second lookup. A socket with nothing to send is still asked,
+    /// because asking is also what arms and clears its persist timer.
+    fn emit_tcp_data(
+        &mut self,
+        index: usize,
+        local: TcpEndpoint,
+        remote: TcpEndpoint,
+        budget: TcpSegmentBudget,
+        now: StackInstant,
+    ) -> Result<(), StackError> {
+        let link = if self.active_tcp_socket(index).has_pending_transmit() {
+            if !self.outbound.has_free_slot() {
+                return Err(StackError::OutputQueueFull);
+            }
+            // Unresolved, the next hop has been solicited and the data
+            // stays queued on the socket until it answers.
+            let Some(link) = self.resolve_tcp_link_address(local, remote, now)? else {
+                return Ok(());
+            };
+            Some(link)
+        } else {
+            None
+        };
+        let Some(segment) = self
+            .active_tcp_socket_mut(index)
+            .take_transmit_segment(now.nanos(), budget)
+        else {
+            return Ok(());
+        };
+        let link = link.expect("a TCP socket with nothing pending produced a segment");
+        let identification = segment.sequence_len as u16;
+        let hop_limit = self.tcp_socket_hop_limit(index);
+        // The segment is in flight from here on, so a failure would lose
+        // it. Its slot and link address are secured above and `budget`
+        // sized it to the path MTU this drive read, so nothing is left
+        // that can refuse it.
+        self.queue_tcp_frame(
+            link,
+            segment.local,
+            segment.remote,
+            TcpEgress {
+                header: segment.header,
+                options: segment.options,
+                payload: self.tcp_tx_payload(&segment),
+                hop_limit,
+            },
+            identification,
+        )
+        .unwrap_or_else(|error| {
+            panic!("TCP segment taken into flight could not be queued: {error:?}")
+        });
+        Ok(())
+    }
+
+    /// Sends the acknowledgements `index` still owes.
+    fn emit_tcp_acks(
+        &mut self,
+        index: usize,
+        local: TcpEndpoint,
+        remote: TcpEndpoint,
+        now: StackInstant,
+    ) -> Result<(), StackError> {
+        let socket = self.active_tcp_socket(index);
+        let Some(header) = socket.pending_ack() else {
+            return Ok(());
+        };
+        let options = socket.pending_ack_options(now.nanos());
+        let acks = socket.pending_ack_count();
+        // Every owed acknowledgement gets its own frame. All but the
+        // first repeat the same acknowledgement number, which is
+        // exactly the duplicate-ACK signal the peer counts before it
+        // retransmits a hole ahead of its own timer.
+        for ack in 0..acks {
+            let queued = match self.queue_tcp_control(index, local, remote, header, options, now) {
+                Ok(queued) => queued,
+                // The first acknowledgement is what the peer is
+                // owed; the duplicates behind it are a loss hint,
+                // and must not take the last outbound slot from the
+                // retransmission they are asking for.
+                Err(StackError::OutputQueueFull) if ack != 0 => break,
+                Err(error) => return Err(error),
+            };
+            if !queued {
+                break;
+            }
+            let queued_ack = self.active_tcp_socket_mut(index).mark_ack_queued();
+            self.tcp_transmit_counters.acks_sent += 1;
+            if queued_ack.reopened_window {
+                self.tcp_transmit_counters.window_updates_sent += 1;
+            }
+        }
         Ok(())
     }
 
@@ -4846,6 +5167,66 @@ where
         TcpSegmentBudget::coalesced(wire_segment, coalesced)
     }
 
+    /// The link address a TCP segment from `local` to `remote` leaves
+    /// for, or `None` after queuing the solicitation that will resolve
+    /// it.
+    fn resolve_tcp_link_address(
+        &mut self,
+        local: TcpEndpoint,
+        remote: TcpEndpoint,
+        now: StackInstant,
+    ) -> Result<Option<EthernetAddress>, StackError> {
+        match (local.address, remote.address) {
+            (IpAddress::Ipv4(source), IpAddress::Ipv4(destination)) => {
+                self.resolve_ipv4_link_address(source, destination, now)
+            }
+            (IpAddress::Ipv6(source), IpAddress::Ipv6(destination)) => {
+                self.resolve_ipv6_link_address(source, destination, now)
+            }
+            _ => panic!("TCP endpoint address families must match"),
+        }
+    }
+
+    fn resolve_ipv4_link_address(
+        &mut self,
+        source: Ipv4Address,
+        destination: Ipv4Address,
+        now: StackInstant,
+    ) -> Result<Option<EthernetAddress>, StackError> {
+        let next_hop = self.next_hop(IpAddress::Ipv4(destination));
+        let next_hop = match next_hop {
+            Some(IpAddress::Ipv4(next_hop)) => next_hop,
+            Some(IpAddress::Ipv6(_)) => panic!("IPv4 route resolved to IPv6 next hop"),
+            None => destination,
+        };
+        let mac = self.neighbor_mac(IpAddress::Ipv4(next_hop));
+        if mac.is_none() {
+            self.queue_arp_request(source, next_hop, now)?;
+        }
+        Ok(mac)
+    }
+
+    fn resolve_ipv6_link_address(
+        &mut self,
+        source: Ipv6Address,
+        destination: Ipv6Address,
+        now: StackInstant,
+    ) -> Result<Option<EthernetAddress>, StackError> {
+        let next_hop = self.next_hop(IpAddress::Ipv6(destination));
+        let next_hop = match next_hop {
+            Some(IpAddress::Ipv6(next_hop)) => next_hop,
+            Some(IpAddress::Ipv4(_)) => panic!("IPv6 route resolved to IPv4 next hop"),
+            None => destination,
+        };
+        let mac = self.neighbor_mac(IpAddress::Ipv6(next_hop));
+        if mac.is_none() {
+            self.queue_ndp_solicitation(source, next_hop, now)?;
+        }
+        Ok(mac)
+    }
+
+    /// Queues `segment`, or reports `false` after soliciting the next
+    /// hop's link address when it is not yet resolved.
     fn queue_tcp(
         &mut self,
         local: TcpEndpoint,
@@ -4854,12 +5235,57 @@ where
         identification: u16,
         now: StackInstant,
     ) -> Result<bool, StackError> {
+        self.ensure_tcp_segment_fits(local, remote, &segment)?;
+        let Some(destination_mac) = self.resolve_tcp_link_address(local, remote, now)? else {
+            return Ok(false);
+        };
+        self.queue_tcp_frame(destination_mac, local, remote, segment, identification)?;
+        Ok(true)
+    }
+
+    /// Checks `segment` against the path MTU. A coalesced burst is
+    /// measured per wire segment: the device splits it into MSS-sized
+    /// packets, and those are what the path has to carry.
+    fn ensure_tcp_segment_fits(
+        &self,
+        local: TcpEndpoint,
+        remote: TcpEndpoint,
+        segment: &TcpEgress<'_>,
+    ) -> Result<(), StackError> {
+        let tcp_len = TcpPacket::MIN_HEADER_LEN
+            .checked_add(segment.options.encoded_len())
+            .and_then(|header_len| header_len.checked_add(segment.payload.wire_segment_len()))
+            .ok_or(StackError::PacketTooLarge)?;
+        let header_len = match local.address {
+            IpAddress::Ipv4(_) => EthernetFrame::HEADER_LEN + Ipv4Packet::MIN_HEADER_LEN,
+            IpAddress::Ipv6(_) => EthernetFrame::HEADER_LEN + Ipv6Packet::HEADER_LEN,
+        };
+        self.ensure_path_packet_fits(
+            PathMtuKey::new(local.address, remote.address),
+            header_len,
+            tcp_len,
+        )
+    }
+
+    /// Encodes `segment` for `destination_mac` into the outbound queue.
+    fn queue_tcp_frame(
+        &mut self,
+        destination_mac: EthernetAddress,
+        local: TcpEndpoint,
+        remote: TcpEndpoint,
+        segment: TcpEgress<'_>,
+        identification: u16,
+    ) -> Result<(), StackError> {
         match (local.address, remote.address) {
-            (IpAddress::Ipv4(source), IpAddress::Ipv4(destination)) => {
-                self.queue_tcp_ipv4(source, destination, segment, identification, now)
-            }
+            (IpAddress::Ipv4(source), IpAddress::Ipv4(destination)) => self.queue_tcp_ipv4(
+                destination_mac,
+                source,
+                destination,
+                segment,
+                identification,
+            ),
             (IpAddress::Ipv6(source), IpAddress::Ipv6(destination)) => {
-                self.queue_tcp_ipv6(source, destination, segment, now)
+                self.queue_tcp_ipv6(destination_mac, source, destination, segment)
             }
             _ => panic!("TCP endpoint address families must match"),
         }
@@ -4867,38 +5293,15 @@ where
 
     fn queue_tcp_ipv4(
         &mut self,
+        destination_mac: EthernetAddress,
         source: Ipv4Address,
         destination: Ipv4Address,
         segment: TcpEgress<'_>,
         identification: u16,
-        now: StackInstant,
-    ) -> Result<bool, StackError> {
+    ) -> Result<(), StackError> {
         let TcpEgress {
             header, payload, ..
         } = segment;
-        // A coalesced burst is measured per wire segment: the device
-        // splits it into MSS-sized packets, and those are what the path
-        // has to carry.
-        let tcp_len = TcpPacket::MIN_HEADER_LEN
-            .checked_add(segment.options.encoded_len())
-            .and_then(|header_len| header_len.checked_add(payload.wire_segment_len()))
-            .ok_or(StackError::PacketTooLarge)?;
-        self.ensure_path_packet_fits(
-            PathMtuKey::new(IpAddress::Ipv4(source), IpAddress::Ipv4(destination)),
-            EthernetFrame::HEADER_LEN + Ipv4Packet::MIN_HEADER_LEN,
-            tcp_len,
-        )?;
-        let next_hop = self.next_hop(IpAddress::Ipv4(destination));
-        let next_hop = match next_hop {
-            Some(IpAddress::Ipv4(next_hop)) => next_hop,
-            Some(IpAddress::Ipv6(_)) => panic!("IPv4 route resolved to IPv6 next hop"),
-            None => destination,
-        };
-        let Some(destination_mac) = self.neighbor_mac(IpAddress::Ipv4(next_hop)) else {
-            self.queue_arp_request(source, next_hop, now)?;
-            return Ok(false);
-        };
-
         let checksum = self.transport_checksum();
         let path = FramePath {
             destination_mac,
@@ -4924,42 +5327,20 @@ where
             );
         }
         self.queue_outbound_frame(|frame| {
-            encode_tcp_ipv4_frame(frame, path, segment, identification, checksum)?;
-            Ok(true)
+            encode_tcp_ipv4_frame(frame, path, segment, identification, checksum)
         })
     }
 
     fn queue_tcp_ipv6(
         &mut self,
+        destination_mac: EthernetAddress,
         source: Ipv6Address,
         destination: Ipv6Address,
         segment: TcpEgress<'_>,
-        now: StackInstant,
-    ) -> Result<bool, StackError> {
+    ) -> Result<(), StackError> {
         let TcpEgress {
             header, payload, ..
         } = segment;
-        // Same per-wire-segment rule as the IPv4 path above.
-        let tcp_len = TcpPacket::MIN_HEADER_LEN
-            .checked_add(segment.options.encoded_len())
-            .and_then(|header_len| header_len.checked_add(payload.wire_segment_len()))
-            .ok_or(StackError::PacketTooLarge)?;
-        self.ensure_path_packet_fits(
-            PathMtuKey::new(IpAddress::Ipv6(source), IpAddress::Ipv6(destination)),
-            EthernetFrame::HEADER_LEN + Ipv6Packet::HEADER_LEN,
-            tcp_len,
-        )?;
-        let next_hop = self.next_hop(IpAddress::Ipv6(destination));
-        let next_hop = match next_hop {
-            Some(IpAddress::Ipv6(next_hop)) => next_hop,
-            Some(IpAddress::Ipv4(_)) => panic!("IPv6 route resolved to IPv4 next hop"),
-            None => destination,
-        };
-        let Some(destination_mac) = self.neighbor_mac(IpAddress::Ipv6(next_hop)) else {
-            self.queue_ndp_solicitation(source, next_hop, now)?;
-            return Ok(false);
-        };
-
         let checksum = self.transport_checksum();
         let path = FramePath {
             destination_mac,
@@ -4984,10 +5365,7 @@ where
                 |frame| encode_tcp_ipv6_frame(frame, path, segment, checksum),
             );
         }
-        self.queue_outbound_frame(|frame| {
-            encode_tcp_ipv6_frame(frame, path, segment, checksum)?;
-            Ok(true)
-        })
+        self.queue_outbound_frame(|frame| encode_tcp_ipv6_frame(frame, path, segment, checksum))
     }
 
     fn receive_arp(
@@ -5023,7 +5401,7 @@ where
 
     fn receive_ipv4(
         &mut self,
-        source_mac: EthernetAddress,
+        link: RxLink,
         frame: &Bytes,
         offload: RxFrameOffload,
         now: StackInstant,
@@ -5050,25 +5428,19 @@ where
                     // arrived with, not the datagram reassembly just
                     // produced, so the reassembled packet is verified in
                     // software like any frame without metadata.
-                    self.dispatch_ipv4(
-                        source_mac,
-                        &packet_bytes,
-                        packet,
-                        RxFrameOffload::none(),
-                        now,
-                    )
+                    self.dispatch_ipv4(link, &packet_bytes, packet, RxFrameOffload::none(), now)
                 }
                 Ipv4ReassemblyResult::NeedMoreFragments
                 | Ipv4ReassemblyResult::InvalidFragment
                 | Ipv4ReassemblyResult::CacheFull => Ok(false),
             };
         }
-        self.dispatch_ipv4(source_mac, frame, packet, offload, now)
+        self.dispatch_ipv4(link, frame, packet, offload, now)
     }
 
     fn dispatch_ipv4(
         &mut self,
-        source_mac: EthernetAddress,
+        link: RxLink,
         frame: &Bytes,
         packet: Ipv4Packet<'_>,
         offload: RxFrameOffload,
@@ -5101,7 +5473,7 @@ where
                     offload,
                 )?;
                 if !consumed && should_send_icmpv4_error_for_destination(packet.destination) {
-                    self.queue_icmpv4_port_unreachable(source_mac, packet, frame.as_ref())?;
+                    self.queue_icmpv4_port_unreachable(link, packet, frame.as_ref(), now)?;
                 }
                 Ok(false)
             }
@@ -5109,7 +5481,7 @@ where
                 if !self.accepts_ipv4_destination(packet.protocol, packet.destination) {
                     return Ok(false);
                 }
-                self.receive_icmpv4(packet, now)
+                self.receive_icmpv4(link, packet, now)
             }
             crate::IpProtocol::Icmpv6 => Ok(false),
         }
@@ -5125,7 +5497,7 @@ where
 
     fn receive_ipv6(
         &mut self,
-        source_mac: EthernetAddress,
+        link: RxLink,
         frame: &Bytes,
         offload: RxFrameOffload,
         now: StackInstant,
@@ -5158,7 +5530,7 @@ where
                     offload,
                 )?;
                 if !consumed {
-                    self.queue_icmpv6_port_unreachable(source_mac, packet, frame.as_ref())?;
+                    self.queue_icmpv6_port_unreachable(link, packet, frame.as_ref(), now)?;
                 }
                 Ok(false)
             }
@@ -5166,7 +5538,7 @@ where
                 if !self.accepts_ipv6_icmp_destination(packet.destination) {
                     return Ok(false);
                 }
-                self.receive_icmpv6(source_mac, packet, now)
+                self.receive_icmpv6(link, packet, now)
             }
             crate::IpProtocol::Icmp => Ok(false),
         }
@@ -5237,18 +5609,102 @@ where
             .map(|entry| entry.cidr().address())
     }
 
+    /// Whether a send that found `target` unresolved is to put a request
+    /// for it on the wire at `now`: at most one request per
+    /// [`ADDRESS_RESOLUTION_RETRANSMIT_NANOS`] and
+    /// [`ADDRESS_RESOLUTION_MAX_REQUESTS`] of them (RFC 1122 section
+    /// 2.3.2.1, RFC 4861 section 7.2.2). A send inside the interval, the
+    /// ARP and the Neighbor Discovery path alike, only reports the
+    /// resolution as pending.
+    ///
+    /// A new resolution displaces, when the table is full, only a record
+    /// whose last request is a full interval old: displacing a younger one
+    /// would let its address be asked for again at once. When every record
+    /// is younger, the new address is refused and its send stays pending,
+    /// so no number of distinct addresses lifts the per-address limit or
+    /// the total of [`MAX_PENDING_RESOLUTIONS`] requests per interval.
+    ///
+    /// Once the last request has gone unanswered for a full interval the
+    /// resolution has failed: it is forgotten, the call that noticed asks
+    /// for nothing, and the next send to the address begins afresh.
+    ///
+    /// When a request is due and the cache holds no Incomplete entry for
+    /// `target` (resolution begins, or the cache displaced or replaced
+    /// the entry since), one is written: an advertisement only completes
+    /// an entry that exists. A request counts as sent when this returns
+    /// true, even if the output queue then has no room for the frame.
+    fn take_resolution_request(&mut self, target: IpAddress, now: StackInstant) -> bool {
+        let interval_elapsed = |last_request_at: StackInstant| {
+            now.nanos().saturating_sub(last_request_at.nanos())
+                >= ADDRESS_RESOLUTION_RETRANSMIT_NANOS
+        };
+        match self
+            .resolutions
+            .iter()
+            .position(|resolution| resolution.target == target)
+        {
+            Some(index) => {
+                let resolution = &mut self.resolutions[index];
+                if !interval_elapsed(resolution.last_request_at) {
+                    return false;
+                }
+                if resolution.requests == ADDRESS_RESOLUTION_MAX_REQUESTS {
+                    tracing::debug!(
+                        ?target,
+                        requests = resolution.requests,
+                        "address resolution failed"
+                    );
+                    self.resolutions.swap_remove(index);
+                    return false;
+                }
+                resolution.requests += 1;
+                resolution.last_request_at = now;
+            }
+            None => {
+                if self.resolutions.is_full() {
+                    let (oldest, last_request_at) = self
+                        .resolutions
+                        .iter()
+                        .enumerate()
+                        .map(|(index, resolution)| (index, resolution.last_request_at))
+                        .min_by_key(|&(_, last_request_at)| last_request_at)
+                        .unwrap_or_else(|| panic!("a full resolution table has an oldest entry"));
+                    if !interval_elapsed(last_request_at) {
+                        return false;
+                    }
+                    self.resolutions.swap_remove(oldest);
+                }
+                self.resolutions.push(AddressResolution {
+                    target,
+                    requests: 1,
+                    last_request_at: now,
+                });
+            }
+        }
+        if self
+            .neighbors
+            .get(target)
+            .is_none_or(|entry| entry.state != NeighborState::Incomplete)
+        {
+            self.learn_neighbor(NeighborEntry {
+                ip: target,
+                mac: [0; 6],
+                state: NeighborState::Incomplete,
+                updated_at: now,
+            });
+        }
+        true
+    }
+
     fn queue_ndp_solicitation(
         &mut self,
         source: Ipv6Address,
         target: Ipv6Address,
         now: StackInstant,
     ) -> Result<(), StackError> {
-        self.learn_neighbor(NeighborEntry {
-            ip: IpAddress::Ipv6(target),
-            mac: [0; 6],
-            state: NeighborState::Incomplete,
-            updated_at: now,
-        });
+        if !self.take_resolution_request(IpAddress::Ipv6(target), now) {
+            return Ok(());
+        }
         let destination = target.solicited_node_multicast();
         let destination_mac = ipv6_multicast_mac(destination);
         self.queue_icmpv6_neighbor_solicitation(source, destination, target, destination_mac)
@@ -5366,12 +5822,9 @@ where
         target: Ipv4Address,
         now: StackInstant,
     ) -> Result<(), StackError> {
-        self.learn_neighbor(NeighborEntry {
-            ip: IpAddress::Ipv4(target),
-            mac: [0; 6],
-            state: NeighborState::Incomplete,
-            updated_at: now,
-        });
+        if !self.take_resolution_request(IpAddress::Ipv4(target), now) {
+            return Ok(());
+        }
         self.queue_arp(
             [0xff; 6],
             ArpPacket {
@@ -5425,22 +5878,19 @@ where
         })
     }
 
-    fn queue_icmpv4_port_unreachable(
+    /// Queues an IPv4 packet carrying the ICMP message `encode` writes,
+    /// `icmp_len` octets long, to `destination_mac`.
+    ///
+    /// The packet is one atomic datagram (DF set, never fragmented), so
+    /// its identification is free (RFC 6864 section 4.1) and is zero.
+    fn queue_icmpv4(
         &mut self,
         destination_mac: EthernetAddress,
-        packet: Ipv4Packet<'_>,
-        packet_bytes: &[u8],
+        source: Ipv4Address,
+        destination: Ipv4Address,
+        icmp_len: usize,
+        encode: impl FnOnce(&mut [u8]) -> Option<usize>,
     ) -> Result<(), StackError> {
-        if !self.should_answer_ipv4_destination_unreachable(packet) {
-            return Ok(());
-        }
-        let quoted_len = packet_bytes.len().min(Ipv4Packet::MIN_HEADER_LEN + 8);
-        let quoted = &packet_bytes[..quoted_len];
-        let icmp_len = Icmpv4Packet::HEADER_LEN
-            .checked_add(quoted.len())
-            .unwrap_or_else(|| panic!("ICMPv4 unreachable quote length overflowed"));
-        let source = packet.destination;
-        let destination = packet.source;
         let local_mac = self.config.mac;
         self.queue_outbound_frame(|frame| {
             let storage = frame.storage_mut();
@@ -5457,52 +5907,25 @@ where
                 destination,
                 crate::IpProtocol::Icmp,
                 icmp_len,
-                packet.payload.len() as u16,
-                64,
+                0,
+                crate::DEFAULT_HOP_LIMIT,
             )
             .ok_or(StackError::OutputQueueFull)?;
-            offset += Icmpv4Packet::encode_destination_unreachable(
-                &mut storage[offset..],
-                Icmpv4Packet::DESTINATION_UNREACHABLE_PORT_CODE,
-                quoted,
-            )
-            .ok_or(StackError::OutputQueueFull)?;
+            offset += encode(&mut storage[offset..]).ok_or(StackError::OutputQueueFull)?;
             frame.set_len(offset);
             Ok(())
         })
     }
 
-    fn should_answer_ipv4_destination_unreachable(&self, packet: Ipv4Packet<'_>) -> bool {
-        self.owns_ip_address(IpAddress::Ipv4(packet.destination))
-            && !packet.source.is_unspecified()
-            && !packet.destination.is_unspecified()
-            && !packet.destination.is_multicast()
-            && packet.destination.octets() != [255, 255, 255, 255]
-    }
-
-    fn queue_icmpv6_port_unreachable(
+    /// The IPv6 counterpart of [`Self::queue_icmpv4`].
+    fn queue_icmpv6(
         &mut self,
         destination_mac: EthernetAddress,
-        packet: Ipv6Packet<'_>,
-        packet_bytes: &[u8],
+        source: Ipv6Address,
+        destination: Ipv6Address,
+        icmp_len: usize,
+        encode: impl FnOnce(&mut [u8]) -> Option<usize>,
     ) -> Result<(), StackError> {
-        if !self.should_answer_ipv6_destination_unreachable(packet) {
-            return Ok(());
-        }
-        let header_len = EthernetFrame::HEADER_LEN
-            .checked_add(Ipv6Packet::HEADER_LEN)
-            .and_then(|len| len.checked_add(Icmpv6Packet::DESTINATION_UNREACHABLE_HEADER_LEN))
-            .unwrap_or_else(|| panic!("ICMPv6 unreachable header length overflowed"));
-        let quote_capacity =
-            self.config.mtu.checked_sub(header_len).unwrap_or_else(|| {
-                panic!("MTU cannot hold ICMPv6 destination-unreachable headers")
-            });
-        let quoted = &packet_bytes[..packet_bytes.len().min(quote_capacity)];
-        let icmp_len = Icmpv6Packet::DESTINATION_UNREACHABLE_HEADER_LEN
-            .checked_add(quoted.len())
-            .unwrap_or_else(|| panic!("ICMPv6 unreachable quote length overflowed"));
-        let source = packet.destination;
-        let destination = packet.source;
         let local_mac = self.config.mac;
         self.queue_outbound_frame(|frame| {
             let storage = frame.storage_mut();
@@ -5519,28 +5942,174 @@ where
                 destination,
                 crate::IpProtocol::Icmpv6,
                 icmp_len,
-                64,
+                crate::DEFAULT_HOP_LIMIT,
             )
             .ok_or(StackError::OutputQueueFull)?;
-            offset += Icmpv6Packet::encode_destination_unreachable(
-                &mut storage[offset..],
-                source,
-                destination,
-                Icmpv6Packet::DESTINATION_UNREACHABLE_PORT_CODE,
-                quoted,
-            )
-            .ok_or(StackError::OutputQueueFull)?;
+            offset += encode(&mut storage[offset..]).ok_or(StackError::OutputQueueFull)?;
             frame.set_len(offset);
             Ok(())
         })
     }
 
-    fn should_answer_ipv6_destination_unreachable(&self, packet: Ipv6Packet<'_>) -> bool {
-        self.owns_ip_address(IpAddress::Ipv6(packet.destination))
-            && !packet.source.is_unspecified()
-            && !packet.source.is_multicast()
+    /// Whether a reply of `payload_len` octets after `header_len` octets
+    /// of headers fits one frame: the interface and path MTU, and the
+    /// packet buffer the frame is built in. The stack never fragments.
+    fn reply_fits_one_frame(
+        &self,
+        path: PathMtuKey,
+        header_len: usize,
+        payload_len: usize,
+    ) -> bool {
+        header_len
+            .checked_add(payload_len)
+            .is_some_and(|frame_len| {
+                frame_len
+                    <= self
+                        .effective_path_frame_mtu(path)
+                        .min(crate::ETHERNET_FRAME_BYTES)
+            })
+    }
+
+    /// Answers a datagram for a port nobody listens on with ICMP port
+    /// unreachable, unless RFC 1122 section 3.2.2 or the rate limit says
+    /// not to. The quote is the original header at its real length, which
+    /// IP options extend, and the first 8 octets after it (RFC 792).
+    fn queue_icmpv4_port_unreachable(
+        &mut self,
+        link: RxLink,
+        packet: Ipv4Packet<'_>,
+        packet_bytes: &[u8],
+        now: StackInstant,
+    ) -> Result<(), StackError> {
+        if !self.should_answer_ipv4_destination_unreachable(link, packet)
+            || !self.icmp_error_rate.try_acquire(now)
+        {
+            return Ok(());
+        }
+        let quoted_len = packet
+            .header_len
+            .checked_add(8)
+            .unwrap_or_else(|| panic!("ICMPv4 unreachable quote length overflowed"))
+            .min(packet.total_len)
+            .min(packet_bytes.len());
+        let quoted = &packet_bytes[..quoted_len];
+        let icmp_len = Icmpv4Packet::HEADER_LEN
+            .checked_add(quoted.len())
+            .unwrap_or_else(|| panic!("ICMPv4 unreachable quote length overflowed"));
+        self.queue_icmpv4(
+            link.source,
+            packet.destination,
+            packet.source,
+            icmp_len,
+            |output| {
+                Icmpv4Packet::encode_destination_unreachable(
+                    output,
+                    Icmpv4Packet::DESTINATION_UNREACHABLE_PORT_CODE,
+                    quoted,
+                )
+            },
+        )
+    }
+
+    /// Whether an ICMP error may answer `packet` (RFC 1122 section
+    /// 3.2.2, RFC 1812 section 4.3.2.7): it was sent to a unicast address
+    /// of this host, not as a link-layer broadcast or multicast, by one
+    /// host. The only error this stack originates answers a UDP datagram,
+    /// so the rule against answering an ICMP error holds by construction,
+    /// and reassembly before dispatch means no fragment is ever answered.
+    fn should_answer_ipv4_destination_unreachable(
+        &self,
+        link: RxLink,
+        packet: Ipv4Packet<'_>,
+    ) -> bool {
+        self.owns_ip_address(IpAddress::Ipv4(packet.destination))
             && !packet.destination.is_unspecified()
             && !packet.destination.is_multicast()
+            && packet.destination.octets() != [255, 255, 255, 255]
+            && !link.group_destination
+            && self.is_ipv4_unicast_sender(packet.source)
+    }
+
+    /// Whether `source` names one host, which is what a reply or an
+    /// error can be sent back to: not unspecified, multicast, loopback,
+    /// class E (the limited broadcast address included) or the directed
+    /// broadcast address of a connected subnet.
+    fn is_ipv4_unicast_sender(&self, source: Ipv4Address) -> bool {
+        !source.is_unspecified()
+            && !source.is_multicast()
+            && !source.is_loopback()
+            && !source.is_class_e()
+            && !self
+                .ipv4_addresses
+                .iter()
+                .copied()
+                .any(|local| ipv4_directed_broadcast(local) == Some(source))
+    }
+
+    /// The ICMPv6 counterpart of [`Self::queue_icmpv4_port_unreachable`].
+    /// The message never exceeds the IPv6 minimum MTU of 1280 octets, nor
+    /// what one frame of this interface holds (RFC 4443 section 2.4 (c)).
+    fn queue_icmpv6_port_unreachable(
+        &mut self,
+        link: RxLink,
+        packet: Ipv6Packet<'_>,
+        packet_bytes: &[u8],
+        now: StackInstant,
+    ) -> Result<(), StackError> {
+        if !self.should_answer_ipv6_destination_unreachable(link, packet)
+            || !self.icmp_error_rate.try_acquire(now)
+        {
+            return Ok(());
+        }
+        let header_len = EthernetFrame::HEADER_LEN
+            .checked_add(Ipv6Packet::HEADER_LEN)
+            .and_then(|len| len.checked_add(Icmpv6Packet::DESTINATION_UNREACHABLE_HEADER_LEN))
+            .unwrap_or_else(|| panic!("ICMPv6 unreachable header length overflowed"));
+        let interface_capacity =
+            self.config.mtu.checked_sub(header_len).unwrap_or_else(|| {
+                panic!("MTU cannot hold ICMPv6 destination-unreachable headers")
+            });
+        let minimum_mtu_capacity = IPV6_MINIMUM_LINK_MTU
+            - Ipv6Packet::HEADER_LEN
+            - Icmpv6Packet::DESTINATION_UNREACHABLE_HEADER_LEN;
+        let original_len = Ipv6Packet::HEADER_LEN + packet.payload.len();
+        let quoted_len = original_len
+            .min(packet_bytes.len())
+            .min(interface_capacity)
+            .min(minimum_mtu_capacity);
+        let quoted = &packet_bytes[..quoted_len];
+        let icmp_len = Icmpv6Packet::DESTINATION_UNREACHABLE_HEADER_LEN
+            .checked_add(quoted.len())
+            .unwrap_or_else(|| panic!("ICMPv6 unreachable quote length overflowed"));
+        let source = packet.destination;
+        let destination = packet.source;
+        self.queue_icmpv6(link.source, source, destination, icmp_len, |output| {
+            Icmpv6Packet::encode_destination_unreachable(
+                output,
+                source,
+                destination,
+                Icmpv6Packet::DESTINATION_UNREACHABLE_PORT_CODE,
+                quoted,
+            )
+        })
+    }
+
+    /// The IPv6 counterpart of
+    /// [`Self::should_answer_ipv4_destination_unreachable`] (RFC 4443
+    /// section 2.4 (e)). The stack originates neither Packet Too Big nor
+    /// Parameter Problem, so the exceptions of 2.4 (e.3) do not arise, and
+    /// a packet with an extension header, a fragment one included, never
+    /// parses.
+    fn should_answer_ipv6_destination_unreachable(
+        &self,
+        link: RxLink,
+        packet: Ipv6Packet<'_>,
+    ) -> bool {
+        self.owns_ip_address(IpAddress::Ipv6(packet.destination))
+            && !packet.destination.is_unspecified()
+            && !packet.destination.is_multicast()
+            && !link.group_destination
+            && is_ipv6_unicast_sender(packet.source)
     }
 
     /// Whether the device, not the stack, is answerable for this
@@ -5671,12 +6240,9 @@ where
                     .unwrap_or_else(|_| panic!("TCP accept queue is full"));
             }
             if outcome.readable {
-                Self::push_event_into(
-                    &mut self.events,
-                    StackEvent::TcpReadable {
-                        socket: socket_id(index),
-                    },
-                );
+                self.push_event(StackEvent::TcpReadable {
+                    socket: socket_id(index),
+                });
             }
             // A segment that ended the connection — a peer RST above all
             // — leaves a blocked reader with nothing else to wait for,
@@ -5689,12 +6255,9 @@ where
                 && current_state == crate::TcpState::Closed
                 && !self.tcp_orphans.contains(index)
             {
-                Self::push_event_into(
-                    &mut self.events,
-                    StackEvent::TcpClosed {
-                        socket: socket_id(index),
-                    },
-                );
+                self.push_event(StackEvent::TcpClosed {
+                    socket: socket_id(index),
+                });
             }
             if outcome.receive_backpressure {
                 return Err(StackError::ReceiveBackpressure);
@@ -5788,7 +6351,7 @@ where
 
     fn receive_icmpv6(
         &mut self,
-        source_mac: EthernetAddress,
+        link: RxLink,
         packet: Ipv6Packet<'_>,
         now: StackInstant,
     ) -> Result<bool, StackError> {
@@ -5807,57 +6370,24 @@ where
                 self.apply_ipv6_router_configuration(configuration, now);
             }
             Icmpv6Packet::NeighborSolicitation { target, options } => {
-                if packet.source.is_unspecified() {
-                    return Ok(false);
-                }
-                // RFC 4861 §4.3: prefer the solicitation's own source
-                // link-layer option over the Ethernet header, which a
-                // bridge or proxy may have rewritten.
-                let neighbor_mac = options.source_link_layer_address().unwrap_or(source_mac);
-                if self.is_on_link(IpAddress::Ipv6(packet.source)) {
-                    self.learn_neighbor(NeighborEntry {
-                        ip: IpAddress::Ipv6(packet.source),
-                        mac: neighbor_mac,
-                        state: NeighborState::Reachable,
-                        updated_at: now,
-                    });
-                }
-                if self
-                    .ipv6_addresses
-                    .iter()
-                    .any(|entry| entry.cidr().address() == target)
-                {
-                    self.queue_icmpv6_neighbor_advertisement(
-                        target,
-                        packet.source,
-                        target,
-                        neighbor_mac,
-                    )?;
-                }
+                self.receive_neighbor_solicitation(link, packet, target, options, now)?;
             }
             Icmpv6Packet::NeighborAdvertisement {
                 target,
+                solicited,
                 override_cache,
                 options,
-                ..
             } => {
-                // RFC 4861 §4.4: the target link-layer option names the
-                // node the advertisement speaks for, which is not the
-                // Ethernet source when a router proxies for it.
-                let target_mac = options.target_link_layer_address().unwrap_or(source_mac);
-                // §7.2.5: without the override bit an advertisement may
-                // not replace a cached link-layer address that differs.
-                if self.is_on_link(IpAddress::Ipv6(target)) {
-                    self.learn_neighbor_without_override(
-                        NeighborEntry {
-                            ip: IpAddress::Ipv6(target),
-                            mac: target_mac,
-                            state: NeighborState::Reachable,
-                            updated_at: now,
-                        },
+                self.receive_neighbor_advertisement(
+                    packet,
+                    NeighborAdvertisement {
+                        target,
+                        solicited,
                         override_cache,
-                    );
-                }
+                        options,
+                    },
+                    now,
+                );
             }
             Icmpv6Packet::DestinationUnreachable(unreachable) => {
                 self.receive_icmp_destination_unreachable(IcmpDestinationUnreachable::Ipv6(
@@ -5877,13 +6407,263 @@ where
                     echo.payload,
                 );
             }
-            Icmpv6Packet::EchoRequest(_) => {}
+            Icmpv6Packet::EchoRequest(echo) => {
+                self.answer_icmpv6_echo_request(link, packet, echo, now)?;
+            }
         }
         Ok(false)
     }
 
+    /// The checks RFC 4861 section 7.1 puts on a Neighbor Solicitation
+    /// and a Neighbor Advertisement alike: the hop limit is 255, so the
+    /// sender is on this link, the ICMP code is 0, the target is not a
+    /// multicast address and every option has a length. The ICMP length
+    /// of 24 octets or more is the parser's.
+    fn neighbor_message_is_valid(
+        packet: Ipv6Packet<'_>,
+        target: Ipv6Address,
+        options: NdpOptions<'_>,
+    ) -> bool {
+        packet.hop_limit == 255
+            && packet.payload.get(1) == Some(&0)
+            && !target.is_multicast()
+            && options.is_well_formed()
+    }
+
+    /// Takes in a Neighbor Solicitation (RFC 4861 sections 7.1.1 and
+    /// 7.2.3) and answers it when it asks for one of this host's
+    /// addresses. A message that fails validation changes nothing.
+    ///
+    /// The sender's link-layer address option makes an entry only for an
+    /// address on this link, and only a Stale one: the solicitation shows
+    /// that the sender wants to reach this host, not that this host can
+    /// reach it. Without the option there is nothing to cache.
+    fn receive_neighbor_solicitation(
+        &mut self,
+        link: RxLink,
+        packet: Ipv6Packet<'_>,
+        target: Ipv6Address,
+        options: NdpOptions<'_>,
+        now: StackInstant,
+    ) -> Result<(), StackError> {
+        if !Self::neighbor_message_is_valid(packet, target, options) {
+            return Ok(());
+        }
+        let sender_mac = options.source_link_layer_address();
+        if packet.source.is_unspecified() {
+            // Duplicate address detection (RFC 4861 section 7.2.4): there
+            // is no sender to cache or to answer, and a solicitation to
+            // any destination but a solicited-node multicast address, or
+            // carrying a link-layer option, is invalid anyway.
+            return Ok(());
+        }
+        if let Some(mac) = sender_mac
+            && self.is_on_link(IpAddress::Ipv6(packet.source))
+            && self
+                .neighbors
+                .get(IpAddress::Ipv6(packet.source))
+                .is_none_or(|cached| cached.mac != mac)
+        {
+            self.learn_neighbor(NeighborEntry {
+                ip: IpAddress::Ipv6(packet.source),
+                mac,
+                state: NeighborState::Stale,
+                updated_at: now,
+            });
+        }
+        if self
+            .ipv6_addresses
+            .iter()
+            .any(|entry| entry.cidr().address() == target)
+        {
+            // RFC 4861 section 4.3: prefer the solicitation's own source
+            // link-layer option over the Ethernet header, which a bridge
+            // or proxy may have rewritten.
+            self.queue_icmpv6_neighbor_advertisement(
+                target,
+                packet.source,
+                target,
+                sender_mac.unwrap_or(link.source),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Takes in a Neighbor Advertisement (RFC 4861 sections 7.1.2 and
+    /// 7.2.5). A message that fails validation changes nothing, and one
+    /// for an address nobody asked about creates no entry: only an entry
+    /// that exists is updated.
+    fn receive_neighbor_advertisement(
+        &mut self,
+        packet: Ipv6Packet<'_>,
+        advertisement: NeighborAdvertisement<'_>,
+        now: StackInstant,
+    ) {
+        let NeighborAdvertisement {
+            target,
+            solicited,
+            override_cache,
+            options,
+        } = advertisement;
+        if !Self::neighbor_message_is_valid(packet, target, options)
+            // An advertisement sent to a multicast address answers no
+            // solicitation.
+            || (packet.destination.is_multicast() && solicited)
+        {
+            return;
+        }
+        let Some(cached) = self.neighbors.get(IpAddress::Ipv6(target)) else {
+            return;
+        };
+        // RFC 4861 section 4.4: the target link-layer option names the
+        // node the advertisement speaks for, which is not the Ethernet
+        // source when a router proxies for it.
+        let advertised_mac = options.target_link_layer_address();
+        let updated = if cached.state == NeighborState::Incomplete {
+            let Some(mac) = advertised_mac else {
+                return;
+            };
+            NeighborEntry {
+                mac,
+                state: if solicited {
+                    NeighborState::Reachable
+                } else {
+                    NeighborState::Stale
+                },
+                updated_at: now,
+                ..cached
+            }
+        } else if override_cache || advertised_mac.is_none_or(|mac| mac == cached.mac) {
+            let mac = advertised_mac.unwrap_or(cached.mac);
+            if !solicited && mac == cached.mac {
+                // Neither the address nor the state changes, so there is
+                // nothing to record, nor to republish to the control plane.
+                return;
+            }
+            let state = if solicited {
+                NeighborState::Reachable
+            } else {
+                NeighborState::Stale
+            };
+            NeighborEntry {
+                mac,
+                state,
+                updated_at: now,
+                ..cached
+            }
+        } else if cached.state == NeighborState::Reachable {
+            // A different address without the override flag: suspect the
+            // entry, but keep its address.
+            NeighborEntry {
+                state: NeighborState::Stale,
+                ..cached
+            }
+        } else {
+            return;
+        };
+        self.learn_neighbor(updated);
+    }
+
+    /// Answers an ICMPv6 echo request addressed to a unicast address of
+    /// this host with an echo reply carrying the same identifier,
+    /// sequence number and data (RFC 4443 sections 4.1 and 4.2).
+    ///
+    /// A request to a multicast address is not answered, which RFC 4443
+    /// section 4.2 allows, and neither is one sent as a link-layer
+    /// multicast or from an address that is no single host. The reply
+    /// goes to the link-layer address the request came from and is built
+    /// in the outbound packet buffer, so it holds no reference to the
+    /// receive buffer. It is never larger than the request. A request
+    /// whose reply would not fit one frame is dropped rather than cut
+    /// short, since the reply must carry all of the data and the stack
+    /// does not fragment.
+    fn answer_icmpv6_echo_request(
+        &mut self,
+        link: RxLink,
+        packet: Ipv6Packet<'_>,
+        echo: Icmpv6Echo<'_>,
+        now: StackInstant,
+    ) -> Result<(), StackError> {
+        if packet.destination.is_multicast()
+            || link.group_destination
+            || !is_ipv6_unicast_sender(packet.source)
+        {
+            return Ok(());
+        }
+        let source = packet.destination;
+        let destination = packet.source;
+        let icmp_len = Icmpv6Packet::ECHO_HEADER_LEN
+            .checked_add(echo.payload.len())
+            .ok_or(StackError::PacketTooLarge)?;
+        let path = PathMtuKey::new(IpAddress::Ipv6(source), IpAddress::Ipv6(destination));
+        if !self.reply_fits_one_frame(
+            path,
+            EthernetFrame::HEADER_LEN + Ipv6Packet::HEADER_LEN,
+            icmp_len,
+        ) {
+            tracing::debug!(
+                icmp_len,
+                "dropping an echo request whose reply would not fit a frame"
+            );
+            return Ok(());
+        }
+        if !self.icmp_echo_rate.try_acquire(now) {
+            return Ok(());
+        }
+        self.queue_icmpv6(link.source, source, destination, icmp_len, |output| {
+            Icmpv6Packet::encode_echo_reply(
+                output,
+                source,
+                destination,
+                echo.identifier,
+                echo.sequence,
+                echo.payload,
+            )
+        })
+    }
+
+    /// The ICMPv4 counterpart of [`Self::answer_icmpv6_echo_request`]
+    /// (RFC 1122 section 3.2.2.6). Only a request to a unicast address of
+    /// this host gets here; one to a broadcast or multicast address is
+    /// dropped before.
+    fn answer_icmpv4_echo_request(
+        &mut self,
+        link: RxLink,
+        packet: Ipv4Packet<'_>,
+        echo: Icmpv4Echo<'_>,
+        now: StackInstant,
+    ) -> Result<(), StackError> {
+        if link.group_destination || !self.is_ipv4_unicast_sender(packet.source) {
+            return Ok(());
+        }
+        let source = packet.destination;
+        let destination = packet.source;
+        let icmp_len = Icmpv4Packet::HEADER_LEN
+            .checked_add(echo.payload.len())
+            .ok_or(StackError::PacketTooLarge)?;
+        let path = PathMtuKey::new(IpAddress::Ipv4(source), IpAddress::Ipv4(destination));
+        if !self.reply_fits_one_frame(
+            path,
+            EthernetFrame::HEADER_LEN + Ipv4Packet::MIN_HEADER_LEN,
+            icmp_len,
+        ) {
+            tracing::debug!(
+                icmp_len,
+                "dropping an echo request whose reply would not fit a frame"
+            );
+            return Ok(());
+        }
+        if !self.icmp_echo_rate.try_acquire(now) {
+            return Ok(());
+        }
+        self.queue_icmpv4(link.source, source, destination, icmp_len, |output| {
+            Icmpv4Packet::encode_echo_reply(output, echo.identifier, echo.sequence, echo.payload)
+        })
+    }
+
     fn receive_icmpv4(
         &mut self,
+        link: RxLink,
         packet: Ipv4Packet<'_>,
         now: StackInstant,
     ) -> Result<bool, StackError> {
@@ -5913,7 +6693,9 @@ where
                     echo.payload,
                 );
             }
-            Icmpv4Packet::EchoRequest(_) => {}
+            Icmpv4Packet::EchoRequest(echo) => {
+                self.answer_icmpv4_echo_request(link, packet, echo, now)?;
+            }
         }
         Ok(false)
     }
@@ -6103,12 +6885,9 @@ where
             .abort();
         self.refresh_tcp_indices_after_state(index);
         self.clear_tcp_timer(index);
-        Self::push_event_into(
-            &mut self.events,
-            StackEvent::TcpClosed {
-                socket: socket_id(index),
-            },
-        );
+        self.push_event(StackEvent::TcpClosed {
+            socket: socket_id(index),
+        });
     }
 
     fn receive_udp(
@@ -6202,6 +6981,7 @@ where
 
     fn insert_tcp(&mut self, socket: TcpSocket<C>) -> SocketId {
         let id = self.tcp.insert(socket);
+        self.events.forget_tcp(socket_index(id));
         self.schedule_tcp_timer(socket_index(id));
         id
     }
@@ -6333,6 +7113,14 @@ where
                 continue;
             }
             if socket.receive_buffered_bytes() != 0 {
+                // The sweep runs after a drive the outbound queue cut
+                // short too. The orphan keeps its slot until a drive
+                // with room, rather than going away with its reset
+                // dropped.
+                if !self.outbound.has_free_slot() {
+                    position += 1;
+                    continue;
+                }
                 self.reset_tcp_socket(socket_id(index), now);
                 self.tcp
                     .get_mut(index)
@@ -7346,6 +8134,12 @@ fn should_send_icmpv4_error_for_destination(destination: Ipv4Address) -> bool {
     !destination.is_multicast() && destination != Ipv4Address::BROADCAST
 }
 
+/// Whether `source` names one host, which is what a reply or an error
+/// can be sent back to: not unspecified, multicast or loopback.
+fn is_ipv6_unicast_sender(source: Ipv6Address) -> bool {
+    !source.is_unspecified() && !source.is_multicast() && !source.is_loopback()
+}
+
 fn ipv4_multicast_mac(address: Ipv4Address) -> EthernetAddress {
     let octets = address.octets();
     [0x01, 0x00, 0x5e, octets[1] & 0x7f, octets[2], octets[3]]
@@ -7362,6 +8156,7 @@ mod tests {
     use crate::NewReno;
     use crate::TcpFlags;
     use crate::{Ipv6AddressOrigin, Lifetime, TWO_HOURS_SECONDS};
+    use alloc::collections::BTreeSet;
     use alloc::vec;
 
     const LOCAL_MAC: EthernetAddress = [0x02, 0, 0, 0, 0, 1];
@@ -8056,36 +8851,36 @@ mod tests {
             ..queued
         };
         assert!(
-            stack
-                .queue_tcp_ipv4(
-                    local,
-                    peer,
-                    TcpEgress {
-                        header: queued,
-                        options: TcpHeaderOptions::empty(),
-                        payload: TcpTxPayload::Flat(&[]),
-                        hop_limit: crate::DEFAULT_HOP_LIMIT,
-                    },
-                    1,
-                    StackInstant::from_nanos(1),
-                )
-                .expect("first ACK should queue")
+            queue_tcp_ipv4_segment(
+                &mut stack,
+                local,
+                peer,
+                TcpEgress {
+                    header: queued,
+                    options: TcpHeaderOptions::empty(),
+                    payload: TcpTxPayload::Flat(&[]),
+                    hop_limit: crate::DEFAULT_HOP_LIMIT,
+                },
+                1,
+                StackInstant::from_nanos(1),
+            )
+            .expect("first ACK should queue")
         );
         assert!(
-            stack
-                .queue_tcp_ipv4(
-                    local,
-                    peer,
-                    TcpEgress {
-                        header: replacement,
-                        options: TcpHeaderOptions::empty(),
-                        payload: TcpTxPayload::Flat(&[]),
-                        hop_limit: crate::DEFAULT_HOP_LIMIT,
-                    },
-                    2,
-                    StackInstant::from_nanos(2),
-                )
-                .expect("replacement ACK should queue")
+            queue_tcp_ipv4_segment(
+                &mut stack,
+                local,
+                peer,
+                TcpEgress {
+                    header: replacement,
+                    options: TcpHeaderOptions::empty(),
+                    payload: TcpTxPayload::Flat(&[]),
+                    hop_limit: crate::DEFAULT_HOP_LIMIT,
+                },
+                2,
+                StackInstant::from_nanos(2),
+            )
+            .expect("replacement ACK should queue")
         );
 
         let frame = stack
@@ -8211,36 +9006,36 @@ mod tests {
             ..queued
         };
         assert!(
-            stack
-                .queue_tcp_ipv4(
-                    local,
-                    peer,
-                    TcpEgress {
-                        header: queued,
-                        options: TcpHeaderOptions::empty(),
-                        payload: TcpTxPayload::Flat(&[]),
-                        hop_limit: crate::DEFAULT_HOP_LIMIT,
-                    },
-                    1,
-                    StackInstant::from_nanos(1),
-                )
-                .expect("first ACK should queue")
+            queue_tcp_ipv4_segment(
+                &mut stack,
+                local,
+                peer,
+                TcpEgress {
+                    header: queued,
+                    options: TcpHeaderOptions::empty(),
+                    payload: TcpTxPayload::Flat(&[]),
+                    hop_limit: crate::DEFAULT_HOP_LIMIT,
+                },
+                1,
+                StackInstant::from_nanos(1),
+            )
+            .expect("first ACK should queue")
         );
         assert!(
-            stack
-                .queue_tcp_ipv4(
-                    local,
-                    peer,
-                    TcpEgress {
-                        header: next_sequence,
-                        options: TcpHeaderOptions::empty(),
-                        payload: TcpTxPayload::Flat(&[]),
-                        hop_limit: crate::DEFAULT_HOP_LIMIT,
-                    },
-                    2,
-                    StackInstant::from_nanos(2),
-                )
-                .expect("different sequence ACK should queue")
+            queue_tcp_ipv4_segment(
+                &mut stack,
+                local,
+                peer,
+                TcpEgress {
+                    header: next_sequence,
+                    options: TcpHeaderOptions::empty(),
+                    payload: TcpTxPayload::Flat(&[]),
+                    hop_limit: crate::DEFAULT_HOP_LIMIT,
+                },
+                2,
+                StackInstant::from_nanos(2),
+            )
+            .expect("different sequence ACK should queue")
         );
 
         let first = stack
@@ -10686,20 +11481,20 @@ mod tests {
         };
         let payload = Bytes::from(vec![0x5a_u8; TCP_SCATTER_MIN_PAYLOAD_BYTES]);
         assert!(
-            stack
-                .queue_tcp_ipv4(
-                    local,
-                    peer_addr,
-                    TcpEgress {
-                        header,
-                        options: TcpHeaderOptions::empty(),
-                        payload: TcpTxPayload::Scatter(&payload),
-                        hop_limit: crate::DEFAULT_HOP_LIMIT,
-                    },
-                    1,
-                    StackInstant::from_nanos(1),
-                )
-                .expect("scatter TCP segment should queue")
+            queue_tcp_ipv4_segment(
+                &mut stack,
+                local,
+                peer_addr,
+                TcpEgress {
+                    header,
+                    options: TcpHeaderOptions::empty(),
+                    payload: TcpTxPayload::Scatter(&payload),
+                    hop_limit: crate::DEFAULT_HOP_LIMIT,
+                },
+                1,
+                StackInstant::from_nanos(1),
+            )
+            .expect("scatter TCP segment should queue")
         );
 
         let frame = stack
@@ -12834,6 +13629,134 @@ mod tests {
         );
     }
 
+    /// An orphan that still owes its peer data is counted, with that
+    /// data, until the sweep reclaims it; `sockets` counts it throughout.
+    #[test]
+    fn tcp_counters_report_orphans_with_their_queued_data_until_swept() {
+        const PAYLOAD: &[u8] = &[0x5a; 100];
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let (mut stack, socket) = open_established_tcp_stack(local, peer);
+
+        let live = stack.tcp_counters();
+        assert_eq!((live.sockets, live.orphan_sockets), (1, 0));
+        assert_eq!(live.orphan_send_queued_bytes, 0);
+
+        assert_eq!(stack.tcp_send(socket, PAYLOAD), Ok(PAYLOAD.len()));
+        assert_eq!(
+            stack.close_tcp_socket(socket, StackInstant::from_nanos(2)),
+            Ok(TcpCloseOutcome::Finishing)
+        );
+        let orphaned = stack.tcp_counters();
+        assert_eq!(
+            (orphaned.sockets, orphaned.orphan_sockets),
+            (1, 1),
+            "an orphan keeps its slot, so `sockets` still counts it"
+        );
+        assert!(
+            orphaned.orphan_send_queued_bytes >= PAYLOAD.len() as u64,
+            "the unsent payload is still owed: {orphaned:?}"
+        );
+
+        stack
+            .drive_tcp(StackInstant::from_nanos(2))
+            .expect("the close should queue the data and a FIN");
+        while take_tcp_segment(&mut stack).is_some() {}
+        assert!(
+            stack.tcp_counters().orphan_send_queued_bytes > 0,
+            "sent but unacknowledged data is still owed"
+        );
+
+        // The FIN follows the data's acknowledgement. This side's data
+        // starts at sequence 8 (see `open_established_tcp_stack`).
+        let (ack, ack_len) = tcp_segment(
+            peer,
+            local,
+            TcpHeader {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 101,
+                acknowledgement: 8 + PAYLOAD.len() as u32,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+            },
+        );
+        stack
+            .receive_tcp(
+                IpAddress::Ipv4(peer),
+                IpAddress::Ipv4(local),
+                &Bytes::copy_from_slice(&ack[..ack_len]),
+                RxFrameOffload::none(),
+                StackInstant::from_nanos(3),
+            )
+            .expect("the peer's acknowledgement should be accepted");
+        stack
+            .drive_tcp(StackInstant::from_nanos(3))
+            .expect("the acknowledged data should release the FIN");
+        let (flags, fin_sequence, _) =
+            take_tcp_segment(&mut stack).expect("the close owes its peer a FIN");
+        assert!(flags.contains(TcpFlags::FIN));
+        let finishing = stack.tcp_counters();
+        assert_eq!(
+            (
+                finishing.orphan_fin_wait_1,
+                finishing.orphan_fin_wait_2,
+                finishing.orphan_closing,
+                finishing.orphan_last_ack,
+                finishing.orphan_time_wait,
+                finishing.orphan_other_state,
+                finishing.orphan_retransmit_armed,
+            ),
+            (1, 0, 0, 0, 0, 0, 1),
+            "an orphan whose FIN is unacknowledged is in FIN-WAIT-1 with its timer armed"
+        );
+
+        let time_wait_started = 3;
+        deliver_peer_fin(
+            &mut stack,
+            local,
+            peer,
+            fin_sequence.wrapping_add(1),
+            time_wait_started,
+        );
+        let waiting = stack.tcp_counters();
+        assert_eq!(
+            (
+                waiting.orphan_sockets,
+                waiting.orphan_fin_wait_1,
+                waiting.orphan_time_wait,
+                waiting.orphan_other_state,
+                waiting.orphan_retransmit_armed,
+            ),
+            (1, 0, 1, 0, 0),
+            "the peer's FIN-ACK leaves the orphan in TIME-WAIT with nothing in flight"
+        );
+        stack
+            .drive_tcp(StackInstant::from_nanos(
+                time_wait_started + crate::tcp::TCP_TIME_WAIT_NANOS,
+            ))
+            .expect("the 2MSL timer should expire");
+        let swept = stack.tcp_counters();
+        assert_eq!(
+            (
+                swept.sockets,
+                swept.orphan_sockets,
+                swept.orphan_send_queued_bytes
+            ),
+            (0, 0, 0),
+            "a swept orphan leaves the counters"
+        );
+        assert_eq!(
+            (
+                swept.orphan_time_wait,
+                swept.orphan_other_state,
+                swept.orphan_retransmit_armed
+            ),
+            (0, 0, 0),
+            "a swept orphan leaves the counters"
+        );
+    }
+
     /// A slab that orphans fill is the stack's to report, not to panic
     /// on: a close keeps its socket for the whole of `TIME-WAIT`, so a
     /// guest that opens and closes faster than 2MSL drains reaches a
@@ -14443,6 +15366,236 @@ mod tests {
         );
     }
 
+    /// A stack with one wildcard listener on 8080 and the peer's
+    /// neighbour resolved, for the tests that need a passive open.
+    fn listening_tcp_stack(
+        local: Ipv4Address,
+        peer: Ipv4Address,
+        backlog: TcpListenBacklog,
+    ) -> (Stack, SocketId) {
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
+        stack.learn_neighbor(NeighborEntry {
+            ip: IpAddress::Ipv4(peer),
+            mac: PEER_MAC,
+            state: NeighborState::Reachable,
+            updated_at: StackInstant::from_nanos(0),
+        });
+        let listener = stack
+            .open_tcp_listen(
+                TcpEndpoint {
+                    address: IpAddress::Ipv4(Ipv4Address::UNSPECIFIED),
+                    port: 8080,
+                },
+                backlog,
+            )
+            .expect("wildcard TCP listener should bind");
+        (stack, listener)
+    }
+
+    /// Delivers one segment from `peer`'s `remote_port` to the
+    /// listener's port 8080.
+    fn deliver_to_listener(
+        stack: &mut Stack,
+        local: Ipv4Address,
+        peer: Ipv4Address,
+        remote_port: u16,
+        header: TcpHeader,
+        payload: &[u8],
+        now: u64,
+    ) {
+        let (segment, segment_len) = tcp_segment_with_payload(
+            peer,
+            local,
+            TcpHeader {
+                source_port: remote_port,
+                destination_port: 8080,
+                ..header
+            },
+            payload,
+        );
+        stack
+            .receive_tcp(
+                IpAddress::Ipv4(peer),
+                IpAddress::Ipv4(local),
+                &Bytes::copy_from_slice(&segment[..segment_len]),
+                RxFrameOffload::none(),
+                StackInstant::from_nanos(now),
+            )
+            .expect("segment for the listener's connection should be handled");
+    }
+
+    /// Drives the stack at `now` and counts the `TcpClosed` events for
+    /// `socket` that it raised, discarding the frames it queued.
+    fn drive_counting_closes(stack: &mut Stack, socket: SocketId, now: u64) -> usize {
+        stack
+            .drive_tcp(StackInstant::from_nanos(now))
+            .expect("drive should not fail");
+        while stack.take_outbound().is_some() {}
+        let mut closes = 0;
+        while let Some(event) = stack.take_event() {
+            if event == (StackEvent::TcpClosed { socket }) {
+                closes += 1;
+            }
+        }
+        closes
+    }
+
+    /// #725. The retransmission limit closes a connection inside the
+    /// turn that queues its retransmission, after the drive has looked
+    /// for a close, and the next drive finds the socket already closed.
+    /// The retirement has to happen in the drive that closes it: the
+    /// four-tuple leaves the endpoint index, the receive window is
+    /// surrendered and the close is announced once.
+    #[test]
+    fn a_connection_the_retransmission_limit_closes_is_retired() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let (mut stack, listener) = listening_tcp_stack(local, peer, DEFAULT_TCP_LISTEN_BACKLOG);
+        let syn_ack = drive_passive_open_to_syn_ack(&mut stack, peer, local, 49152, 1);
+        deliver_to_listener(
+            &mut stack,
+            local,
+            peer,
+            49152,
+            TcpHeader {
+                source_port: 0,
+                destination_port: 0,
+                sequence: 11,
+                acknowledgement: syn_ack.sequence.wrapping_add(1),
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+            },
+            &[],
+            2,
+        );
+        let accepted = stack
+            .take_tcp_accept(listener)
+            .expect("listener should be live")
+            .expect("the handshake ACK should complete the connection");
+        let socket = accepted.socket;
+
+        // The peer fills the receive queue and the application never
+        // reads it back.
+        let payload = [0u8; crate::tcp::TCP_RECEIVE_SEGMENT_BYTES];
+        let mut sequence = 11u32;
+        for index in 0..crate::tcp::TCP_RECEIVE_BACKPRESSURE_SEGMENTS {
+            deliver_to_listener(
+                &mut stack,
+                local,
+                peer,
+                49152,
+                TcpHeader {
+                    source_port: 0,
+                    destination_port: 0,
+                    sequence,
+                    acknowledgement: syn_ack.sequence.wrapping_add(1),
+                    flags: TcpFlags::ACK,
+                    window_size: u16::MAX,
+                },
+                &payload,
+                index as u64 + 3,
+            );
+            sequence = sequence.wrapping_add(crate::tcp::TCP_RECEIVE_SEGMENT_BYTES as u32);
+        }
+        assert!(stack.receive_backpressured());
+
+        // Data in flight to a peer that never answers again.
+        assert_eq!(stack.tcp_send(socket, b"unanswered"), Ok(10));
+        while stack.take_event().is_some() {}
+        let mut closes = 0;
+        let mut now = 1_000_000_000u64;
+        for _ in 0..=u32::from(crate::tcp::TCP_MAX_RETRANSMISSIONS) + 2 {
+            closes += drive_counting_closes(&mut stack, socket, now);
+            // Far past any backed-off retransmission timeout.
+            now += 600_000_000_000;
+        }
+        assert_eq!(
+            stack.tcp_connect_state(socket),
+            Ok(TcpConnectState::Closed(TcpConnectTerminalError::Closed))
+        );
+        assert_eq!(
+            closes, 1,
+            "the close is announced once, in the drive that made it"
+        );
+        assert!(
+            !stack.receive_backpressured(),
+            "a closed socket cannot be relieved and must not refuse frames for the stack"
+        );
+        assert_eq!(stack.tcp_counters().receive_backpressured_sockets, 0);
+
+        // The four-tuple is free: the same remote endpoint opens a new
+        // connection with the listener instead of reaching the dead one.
+        let syn_ack = drive_passive_open_to_syn_ack(&mut stack, peer, local, 49152, now);
+        assert_eq!(
+            syn_ack.flags,
+            TcpFlags::SYN.union(TcpFlags::ACK),
+            "the listener should answer the new SYN"
+        );
+        deliver_to_listener(
+            &mut stack,
+            local,
+            peer,
+            49152,
+            TcpHeader {
+                source_port: 0,
+                destination_port: 0,
+                sequence: 11,
+                acknowledgement: syn_ack.sequence.wrapping_add(1),
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+            },
+            &[],
+            now + 1,
+        );
+        let fresh = stack
+            .take_tcp_accept(listener)
+            .expect("listener should be live")
+            .expect("the new connection should be accepted");
+        assert_ne!(fresh.socket, socket);
+
+        // Nothing announces the old socket again.
+        for _ in 0..3 {
+            now += 600_000_000_000;
+            assert_eq!(drive_counting_closes(&mut stack, socket, now), 0);
+        }
+    }
+
+    /// #725. A child still waiting in the listener's backlog that the
+    /// retransmission limit closes gives its place back and leaves the
+    /// accept queue clean.
+    #[test]
+    fn an_unaccepted_child_the_retransmission_limit_closes_gives_back_its_backlog_place() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let (mut stack, listener) = listening_tcp_stack(local, peer, TcpListenBacklog::new(1));
+        // The SYN-ACK is never answered, so the child in SYN-RECEIVED
+        // retransmits it until the limit.
+        let syn_ack = drive_passive_open_to_syn_ack(&mut stack, peer, local, 49152, 1);
+        assert_eq!(syn_ack.flags, TcpFlags::SYN.union(TcpFlags::ACK));
+        let mut now = 1_000_000_000u64;
+        for _ in 0..=u32::from(crate::tcp::TCP_MAX_RETRANSMISSIONS) + 2 {
+            stack
+                .drive_tcp(StackInstant::from_nanos(now))
+                .expect("drive should not fail");
+            while stack.take_outbound().is_some() {}
+            now += 600_000_000_000;
+        }
+        assert_eq!(stack.tcp_accept_pending(listener), Ok(false));
+        assert_eq!(stack.take_tcp_accept(listener), Ok(None));
+
+        // The only backlog place is free again: another remote's SYN is
+        // answered rather than dropped.
+        let syn_ack = drive_passive_open_to_syn_ack(&mut stack, peer, local, 49153, now);
+        assert_eq!(syn_ack.flags, TcpFlags::SYN.union(TcpFlags::ACK));
+    }
+
     /// A bulk receiver with a reader that lags behind the wire: the
     /// window closes, and every read has to be able to reopen it and
     /// say so on the wire. Drives a whole 64 MiB transfer through the
@@ -15792,11 +16945,14 @@ mod tests {
         assert!(solicited);
         assert!(override_cache);
         assert_eq!(options.target_link_layer_address(), Some(LOCAL_MAC));
-        // The solicitation's own source link-layer option seeded the cache.
+        // The solicitation's own source link-layer option seeded the
+        // cache, as Stale (RFC 4861 section 7.2.3).
         assert!(
             stack
                 .neighbors()
-                .any(|entry| entry.ip == IpAddress::Ipv6(peer) && entry.mac == PEER_MAC)
+                .any(|entry| entry.ip == IpAddress::Ipv6(peer)
+                    && entry.mac == PEER_MAC
+                    && entry.state == NeighborState::Stale)
         );
     }
 
@@ -16245,5 +17401,2009 @@ mod tests {
         }
         assert!(cache.get(pinned).is_some());
         assert_eq!(cache.len(), MAX_NEIGHBORS);
+    }
+
+    // ---------------------------------------------------------------
+    // Neighbor discovery validation, resolution pacing, ICMP error
+    // output and the echo responder.
+    // ---------------------------------------------------------------
+
+    const SECOND_MAC: EthernetAddress = [0x02, 0, 0, 0, 0, 0x99];
+    const LINK_LOCAL_PEER: Ipv6Address =
+        Ipv6Address::new([0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9]);
+    const ONE_SECOND: u64 = 1_000_000_000;
+
+    fn link_local_stack() -> Stack {
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
+        stack
+            .configure_ipv6_link_local()
+            .expect("link-local address should be accepted");
+        stack
+    }
+
+    fn link_layer_option(kind: u8, mac: EthernetAddress) -> [u8; 8] {
+        let mut option = [0u8; 8];
+        option[0] = kind;
+        option[1] = 1;
+        option[2..8].copy_from_slice(&mac);
+        option
+    }
+
+    /// An ICMPv6 neighbor message of `kind` (135 or 136) with `flags` in
+    /// its first reserved octet, checksummed for the addresses it is
+    /// sent between.
+    fn neighbor_message(
+        source: Ipv6Address,
+        destination: Ipv6Address,
+        kind: u8,
+        code: u8,
+        flags: u8,
+        target: Ipv6Address,
+        options: &[u8],
+    ) -> ([u8; 128], usize) {
+        let mut body = [0u8; 128];
+        let len = 24 + options.len();
+        body[0] = kind;
+        body[1] = code;
+        body[4] = flags;
+        body[8..24].copy_from_slice(&target.octets());
+        body[24..len].copy_from_slice(options);
+        let checksum = crate::icmpv6_checksum(source, destination, &body[..len]);
+        body[2..4].copy_from_slice(&checksum.to_be_bytes());
+        (body, len)
+    }
+
+    /// An Ethernet frame carrying `body` in an IPv6 packet.
+    fn ipv6_icmpv6_frame(
+        source_mac: EthernetAddress,
+        destination_mac: EthernetAddress,
+        source: Ipv6Address,
+        destination: Ipv6Address,
+        hop_limit: u8,
+        body: &[u8],
+    ) -> ([u8; crate::ETHERNET_FRAME_BYTES], usize) {
+        let mut frame = [0u8; crate::ETHERNET_FRAME_BYTES];
+        let mut offset = EthernetFrame::encode_header(
+            &mut frame,
+            destination_mac,
+            source_mac,
+            EthernetProtocol::Ipv6,
+        )
+        .expect("test Ethernet header should fit");
+        offset += Ipv6Packet::encode_header(
+            &mut frame[offset..],
+            source,
+            destination,
+            crate::IpProtocol::Icmpv6,
+            body.len(),
+            hop_limit,
+        )
+        .expect("test IPv6 header should fit");
+        frame[offset..offset + body.len()].copy_from_slice(body);
+        (frame, offset + body.len())
+    }
+
+    #[derive(Clone, Copy)]
+    struct TestNeighborMessage<'a> {
+        source_mac: EthernetAddress,
+        source: Ipv6Address,
+        destination: Ipv6Address,
+        hop_limit: u8,
+        kind: u8,
+        code: u8,
+        flags: u8,
+        target: Ipv6Address,
+        options: &'a [u8],
+    }
+
+    /// Delivers one neighbor message to `stack` and returns the stack's
+    /// outbound frames as `(destination MAC, IPv6 payload)` pairs.
+    fn deliver_neighbor_message(
+        stack: &mut Stack,
+        message: TestNeighborMessage<'_>,
+        now: u64,
+    ) -> Vec<Vec<u8>> {
+        let (body, len) = neighbor_message(
+            message.source,
+            message.destination,
+            message.kind,
+            message.code,
+            message.flags,
+            message.target,
+            message.options,
+        );
+        let destination_mac = if message.destination.is_multicast() {
+            ipv6_multicast_mac(message.destination)
+        } else {
+            LOCAL_MAC
+        };
+        let (frame, frame_len) = ipv6_icmpv6_frame(
+            message.source_mac,
+            destination_mac,
+            message.source,
+            message.destination,
+            message.hop_limit,
+            &body[..len],
+        );
+        stack
+            .receive_frame(&frame[..frame_len], StackInstant::from_nanos(now))
+            .expect("a neighbor message should be handled");
+        let mut sent = Vec::new();
+        while let Some(frame) = stack.take_outbound() {
+            sent.push(frame.as_slice().to_vec());
+        }
+        sent
+    }
+
+    const NS: u8 = 135;
+    const NA: u8 = 136;
+    const NA_SOLICITED: u8 = 0x40;
+    const NA_OVERRIDE: u8 = 0x20;
+
+    fn cached(stack: &Stack, address: Ipv6Address) -> Option<NeighborEntry> {
+        stack
+            .neighbors()
+            .find(|entry| entry.ip == IpAddress::Ipv6(address))
+    }
+
+    #[test]
+    fn a_neighbor_solicitation_from_off_link_changes_nothing() {
+        let mut stack = link_local_stack();
+        let local = stack.ipv6_link_local_address().expect("link-local address");
+        let known = NeighborEntry {
+            ip: IpAddress::Ipv6(LINK_LOCAL_PEER),
+            mac: PEER_MAC,
+            state: NeighborState::Reachable,
+            updated_at: StackInstant::from_nanos(0),
+        };
+        stack.learn_neighbor(known);
+        while stack.take_event().is_some() {}
+
+        // A solicitation a router forwarded arrives with a hop limit
+        // below 255 and claims the on-link peer's address with another
+        // link-layer address.
+        let sent = deliver_neighbor_message(
+            &mut stack,
+            TestNeighborMessage {
+                source_mac: SECOND_MAC,
+                source: LINK_LOCAL_PEER,
+                destination: local,
+                hop_limit: 64,
+                kind: NS,
+                code: 0,
+                flags: 0,
+                target: local,
+                options: &link_layer_option(1, SECOND_MAC),
+            },
+            5,
+        );
+
+        assert!(sent.is_empty(), "a routed solicitation is not answered");
+        assert_eq!(cached(&stack, LINK_LOCAL_PEER), Some(known));
+        assert!(stack.take_event().is_none());
+    }
+
+    #[test]
+    fn a_solicitation_creates_a_stale_entry_and_is_answered() {
+        let mut stack = link_local_stack();
+        let local = stack.ipv6_link_local_address().expect("link-local address");
+
+        let sent = deliver_neighbor_message(
+            &mut stack,
+            TestNeighborMessage {
+                source_mac: PEER_MAC,
+                source: LINK_LOCAL_PEER,
+                destination: local.solicited_node_multicast(),
+                hop_limit: 255,
+                kind: NS,
+                code: 0,
+                flags: 0,
+                target: local,
+                options: &link_layer_option(1, PEER_MAC),
+            },
+            5,
+        );
+
+        assert_eq!(sent.len(), 1, "the solicitation is answered");
+        // RFC 4861 section 7.2.3: an entry made from a solicitation is
+        // Stale until the neighbor's reachability is confirmed.
+        assert_eq!(
+            cached(&stack, LINK_LOCAL_PEER).map(|entry| (entry.mac, entry.state)),
+            Some((PEER_MAC, NeighborState::Stale))
+        );
+    }
+
+    #[test]
+    fn a_malformed_neighbor_solicitation_changes_nothing() {
+        let local = link_local_stack()
+            .ipv6_link_local_address()
+            .expect("link-local address");
+        let solicited_node = local.solicited_node_multicast();
+        let valid = TestNeighborMessage {
+            source_mac: PEER_MAC,
+            source: LINK_LOCAL_PEER,
+            destination: solicited_node,
+            hop_limit: 255,
+            kind: NS,
+            code: 0,
+            flags: 0,
+            target: local,
+            options: &link_layer_option(1, PEER_MAC),
+        };
+        let zero_length_option = [1u8, 0, 0, 0, 0, 0, 0, 0];
+        let truncated_option = [1u8, 2, 0, 0, 0, 0, 0, 0];
+        let multicast_target = Ipv6Address::ALL_NODES_LINK_LOCAL;
+        let rejected = [
+            (
+                "nonzero ICMP code",
+                TestNeighborMessage { code: 1, ..valid },
+            ),
+            (
+                "multicast target",
+                TestNeighborMessage {
+                    target: multicast_target,
+                    ..valid
+                },
+            ),
+            (
+                "zero-length option",
+                TestNeighborMessage {
+                    options: &zero_length_option,
+                    ..valid
+                },
+            ),
+            (
+                "option longer than the message",
+                TestNeighborMessage {
+                    options: &truncated_option,
+                    ..valid
+                },
+            ),
+            (
+                "unspecified source carrying a link-layer option",
+                TestNeighborMessage {
+                    source: Ipv6Address::UNSPECIFIED,
+                    ..valid
+                },
+            ),
+            (
+                "unspecified source to a unicast destination",
+                TestNeighborMessage {
+                    source: Ipv6Address::UNSPECIFIED,
+                    destination: local,
+                    options: &[],
+                    ..valid
+                },
+            ),
+        ];
+        for (name, message) in rejected {
+            let mut stack = link_local_stack();
+            let sent = deliver_neighbor_message(&mut stack, message, 5);
+            assert!(sent.is_empty(), "{name}: no answer");
+            assert_eq!(stack.neighbors().count(), 0, "{name}: no cache entry");
+        }
+
+        let mut stack = link_local_stack();
+        assert_eq!(
+            deliver_neighbor_message(&mut stack, valid, 5).len(),
+            1,
+            "the unmodified solicitation is answered"
+        );
+    }
+
+    #[test]
+    fn an_unsolicited_neighbor_advertisement_creates_no_entry() {
+        let mut stack = link_local_stack();
+        let local = stack.ipv6_link_local_address().expect("link-local address");
+
+        deliver_neighbor_message(
+            &mut stack,
+            TestNeighborMessage {
+                source_mac: PEER_MAC,
+                source: LINK_LOCAL_PEER,
+                destination: local,
+                hop_limit: 255,
+                kind: NA,
+                code: 0,
+                flags: NA_OVERRIDE,
+                target: LINK_LOCAL_PEER,
+                options: &link_layer_option(2, PEER_MAC),
+            },
+            5,
+        );
+
+        assert_eq!(stack.neighbors().count(), 0);
+    }
+
+    #[test]
+    fn a_neighbor_advertisement_resolves_an_incomplete_entry_only_as_the_rfc_says() {
+        let local = link_local_stack()
+            .ipv6_link_local_address()
+            .expect("link-local address");
+        fn advertise(
+            destination: Ipv6Address,
+            hop_limit: u8,
+            flags: u8,
+            options: &[u8],
+        ) -> TestNeighborMessage<'_> {
+            TestNeighborMessage {
+                source_mac: PEER_MAC,
+                source: LINK_LOCAL_PEER,
+                destination,
+                hop_limit,
+                kind: NA,
+                code: 0,
+                flags,
+                target: LINK_LOCAL_PEER,
+                options,
+            }
+        }
+        let incomplete = NeighborEntry {
+            ip: IpAddress::Ipv6(LINK_LOCAL_PEER),
+            mac: [0; 6],
+            state: NeighborState::Incomplete,
+            updated_at: StackInstant::from_nanos(1),
+        };
+        let target_option = link_layer_option(2, PEER_MAC);
+        let state_after = |message: TestNeighborMessage<'_>| {
+            let mut stack = link_local_stack();
+            stack.learn_neighbor(incomplete);
+            deliver_neighbor_message(&mut stack, message, 5);
+            cached(&stack, LINK_LOCAL_PEER).map(|entry| (entry.mac, entry.state))
+        };
+
+        assert_eq!(
+            state_after(advertise(
+                local,
+                255,
+                NA_SOLICITED | NA_OVERRIDE,
+                &target_option
+            )),
+            Some((PEER_MAC, NeighborState::Reachable)),
+            "a solicited advertisement completes the resolution"
+        );
+        assert_eq!(
+            state_after(advertise(local, 255, NA_OVERRIDE, &target_option)),
+            Some((PEER_MAC, NeighborState::Stale)),
+            "an unsolicited one gives an address that is not yet confirmed"
+        );
+        assert_eq!(
+            state_after(advertise(local, 255, NA_SOLICITED, &[])),
+            Some(([0; 6], NeighborState::Incomplete)),
+            "without a target link-layer address there is nothing to record"
+        );
+        assert_eq!(
+            state_after(advertise(
+                local,
+                64,
+                NA_SOLICITED | NA_OVERRIDE,
+                &target_option
+            )),
+            Some(([0; 6], NeighborState::Incomplete)),
+            "an advertisement that was routed is dropped"
+        );
+        assert_eq!(
+            state_after(advertise(local, 255, 0, &[2, 0, 0, 0, 0, 0, 0, 0])),
+            Some(([0; 6], NeighborState::Incomplete)),
+            "an option of length zero voids the message"
+        );
+    }
+
+    #[test]
+    fn a_neighbor_advertisement_without_override_demotes_but_never_replaces_a_reachable_entry() {
+        let mut stack = link_local_stack();
+        let local = stack.ipv6_link_local_address().expect("link-local address");
+        stack.learn_neighbor(NeighborEntry {
+            ip: IpAddress::Ipv6(LINK_LOCAL_PEER),
+            mac: PEER_MAC,
+            state: NeighborState::Reachable,
+            updated_at: StackInstant::from_nanos(0),
+        });
+
+        deliver_neighbor_message(
+            &mut stack,
+            TestNeighborMessage {
+                source_mac: SECOND_MAC,
+                source: LINK_LOCAL_PEER,
+                destination: local,
+                hop_limit: 255,
+                kind: NA,
+                code: 0,
+                flags: NA_SOLICITED,
+                target: LINK_LOCAL_PEER,
+                options: &link_layer_option(2, SECOND_MAC),
+            },
+            5,
+        );
+        assert_eq!(
+            cached(&stack, LINK_LOCAL_PEER).map(|entry| (entry.mac, entry.state)),
+            Some((PEER_MAC, NeighborState::Stale)),
+            "RFC 4861 section 7.2.5: a reachable entry goes Stale, keeping its address"
+        );
+
+        deliver_neighbor_message(
+            &mut stack,
+            TestNeighborMessage {
+                source_mac: SECOND_MAC,
+                source: LINK_LOCAL_PEER,
+                destination: local,
+                hop_limit: 255,
+                kind: NA,
+                code: 0,
+                flags: NA_SOLICITED,
+                target: LINK_LOCAL_PEER,
+                options: &link_layer_option(2, SECOND_MAC),
+            },
+            6,
+        );
+        assert_eq!(
+            cached(&stack, LINK_LOCAL_PEER).map(|entry| (entry.mac, entry.state)),
+            Some((PEER_MAC, NeighborState::Stale)),
+            "a stale entry ignores a differing address without the override flag"
+        );
+
+        deliver_neighbor_message(
+            &mut stack,
+            TestNeighborMessage {
+                source_mac: SECOND_MAC,
+                source: LINK_LOCAL_PEER,
+                destination: local,
+                hop_limit: 255,
+                kind: NA,
+                code: 0,
+                flags: NA_SOLICITED | NA_OVERRIDE,
+                target: LINK_LOCAL_PEER,
+                options: &link_layer_option(2, SECOND_MAC),
+            },
+            7,
+        );
+        assert_eq!(
+            cached(&stack, LINK_LOCAL_PEER).map(|entry| (entry.mac, entry.state)),
+            Some((SECOND_MAC, NeighborState::Reachable)),
+            "an overriding solicited advertisement replaces the address"
+        );
+    }
+
+    #[test]
+    fn an_unsolicited_advertisement_that_changes_nothing_records_nothing() {
+        let mut stack = link_local_stack();
+        let local = stack.ipv6_link_local_address().expect("link-local address");
+        let known = NeighborEntry {
+            ip: IpAddress::Ipv6(LINK_LOCAL_PEER),
+            mac: PEER_MAC,
+            state: NeighborState::Stale,
+            updated_at: StackInstant::from_nanos(0),
+        };
+        stack.learn_neighbor(known);
+        while stack.take_event().is_some() {}
+
+        let target_option = link_layer_option(2, PEER_MAC);
+        for (flags, options) in [(NA_OVERRIDE, &target_option[..]), (0, &[][..])] {
+            deliver_neighbor_message(
+                &mut stack,
+                TestNeighborMessage {
+                    source_mac: PEER_MAC,
+                    source: LINK_LOCAL_PEER,
+                    destination: local,
+                    hop_limit: 255,
+                    kind: NA,
+                    code: 0,
+                    flags,
+                    target: LINK_LOCAL_PEER,
+                    options,
+                },
+                5,
+            );
+            assert_eq!(cached(&stack, LINK_LOCAL_PEER), Some(known), "{flags:#x}");
+            assert!(
+                stack.take_event().is_none(),
+                "{flags:#x}: nothing to republish"
+            );
+        }
+    }
+
+    #[test]
+    fn a_resolution_whose_incomplete_entry_was_replaced_is_still_completed() {
+        let mut stack = autoconfigured_stack();
+        let local = stack.ipv6_link_local_address().expect("link-local address");
+        let peer = Ipv6Address::new([0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9]);
+        let send = |stack: &mut Stack, now: u64| {
+            stack.send_udp_ipv6(
+                peer,
+                UdpEgress {
+                    source_port: 4040,
+                    destination_port: 8080,
+                    payload: b"probe",
+                    hop_limit: crate::DEFAULT_HOP_LIMIT,
+                },
+                StackInstant::from_nanos(now),
+            )
+        };
+        assert_eq!(send(&mut stack, 0), Ok(0));
+        while stack.take_outbound().is_some() {}
+        // The kernel replaces a shard's cache with the control plane's
+        // copy, which need not hold the Incomplete entry.
+        stack.replace_neighbors([]);
+
+        assert_eq!(send(&mut stack, ONE_SECOND), Ok(0));
+        assert_eq!(stack.take_outbound().into_iter().count(), 1, "the repeat");
+        assert_eq!(
+            cached(&stack, peer).map(|entry| entry.state),
+            Some(NeighborState::Incomplete),
+            "the repeat restores the entry the answer completes"
+        );
+        deliver_neighbor_message(
+            &mut stack,
+            TestNeighborMessage {
+                source_mac: PEER_MAC,
+                source: peer,
+                destination: local,
+                hop_limit: 255,
+                kind: NA,
+                code: 0,
+                flags: NA_SOLICITED | NA_OVERRIDE,
+                target: peer,
+                options: &link_layer_option(2, PEER_MAC),
+            },
+            ONE_SECOND + 1,
+        );
+        assert_eq!(send(&mut stack, ONE_SECOND + 2), Ok(5));
+    }
+
+    #[test]
+    fn an_advertisement_to_a_multicast_destination_is_not_solicited() {
+        let mut stack = link_local_stack();
+        stack.learn_neighbor(NeighborEntry {
+            ip: IpAddress::Ipv6(LINK_LOCAL_PEER),
+            mac: PEER_MAC,
+            state: NeighborState::Stale,
+            updated_at: StackInstant::from_nanos(0),
+        });
+
+        deliver_neighbor_message(
+            &mut stack,
+            TestNeighborMessage {
+                source_mac: PEER_MAC,
+                source: LINK_LOCAL_PEER,
+                destination: Ipv6Address::ALL_NODES_LINK_LOCAL,
+                hop_limit: 255,
+                kind: NA,
+                code: 0,
+                flags: NA_SOLICITED | NA_OVERRIDE,
+                target: LINK_LOCAL_PEER,
+                options: &link_layer_option(2, PEER_MAC),
+            },
+            5,
+        );
+
+        assert_eq!(
+            cached(&stack, LINK_LOCAL_PEER).map(|entry| entry.state),
+            Some(NeighborState::Stale),
+            "RFC 4861 section 7.1.2: the Solicited flag must be clear"
+        );
+    }
+
+    /// A stack on `10.0.0.0/16` whose default gateway is unresolved.
+    fn stack_with_unresolved_gateway() -> Stack {
+        let mut stack = stack_with_resolved_gateway();
+        stack.replace_neighbors([]);
+        stack
+    }
+
+    fn send_to_remote(stack: &mut Stack, now: u64) -> Result<usize, StackError> {
+        stack.send_udp_ipv4(
+            Ipv4Address::new([198, 51, 100, 7]),
+            UdpEgress {
+                source_port: 4040,
+                destination_port: 8080,
+                payload: b"probe",
+                hop_limit: crate::DEFAULT_HOP_LIMIT,
+            },
+            1,
+            StackInstant::from_nanos(now),
+        )
+    }
+
+    #[test]
+    fn an_unresolved_ipv4_next_hop_is_asked_for_once_a_second_and_a_bounded_number_of_times() {
+        let mut stack = stack_with_unresolved_gateway();
+        let mut requests = Vec::new();
+        // A sender that retries every 100 ms for five seconds.
+        for step in 0..=50u64 {
+            let now = step * ONE_SECOND / 10;
+            assert_eq!(
+                send_to_remote(&mut stack, now),
+                Ok(0),
+                "a send to an unresolved next hop reports pending resolution"
+            );
+            while let Some(frame) = stack.take_outbound() {
+                let ethernet =
+                    EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
+                assert_eq!(ethernet.protocol, EthernetProtocol::Arp);
+                let arp = ArpPacket::parse(ethernet.payload).expect("ARP packet should parse");
+                assert_eq!(arp.operation, ArpOperation::Request);
+                assert_eq!(arp.target_protocol, GATEWAY);
+                requests.push(now);
+            }
+            if now < 3 * ONE_SECOND {
+                assert_eq!(
+                    stack
+                        .neighbors()
+                        .find(|entry| entry.ip == IpAddress::Ipv4(GATEWAY))
+                        .map(|entry| entry.updated_at),
+                    Some(StackInstant::from_nanos(0)),
+                    "pending sends leave the entry's timestamp alone"
+                );
+            }
+        }
+
+        assert_eq!(
+            requests[..3],
+            [0, ONE_SECOND, 2 * ONE_SECOND],
+            "three requests, a second apart"
+        );
+        assert!(
+            requests[3] > 3 * ONE_SECOND,
+            "no fourth request while the third is still being waited on: {requests:?}"
+        );
+        assert!(
+            requests
+                .windows(2)
+                .all(|pair| pair[1] - pair[0] >= ONE_SECOND),
+            "never more than one request a second: {requests:?}"
+        );
+    }
+
+    #[test]
+    fn an_arp_reply_ends_the_resolution_and_the_send_goes_out() {
+        let mut stack = stack_with_unresolved_gateway();
+        assert_eq!(send_to_remote(&mut stack, 0), Ok(0));
+        while stack.take_outbound().is_some() {}
+
+        let (reply, len) = arp_frame(ArpOperation::Reply, PEER_MAC, GATEWAY, LOCAL_V4);
+        stack
+            .receive_frame(&reply[..len], StackInstant::from_nanos(1000))
+            .expect("an ARP reply should be handled");
+
+        assert_eq!(send_to_remote(&mut stack, 2000), Ok(5));
+        let frame = stack.take_outbound().expect("the datagram is queued");
+        let ethernet = EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
+        assert_eq!(ethernet.protocol, EthernetProtocol::Ipv4);
+        assert_eq!(ethernet.destination, PEER_MAC);
+    }
+
+    #[test]
+    fn cycling_through_more_unresolved_addresses_than_the_stack_paces_lifts_no_limit() {
+        let mut stack = stack_with_unresolved_gateway();
+        // Twice as many on-link addresses as resolutions are paced, each
+        // sent to every 50 ms for seven seconds.
+        let targets: Vec<Ipv4Address> = (0..2 * MAX_PENDING_RESOLUTIONS)
+            .map(|index| Ipv4Address::new([10, 0, 1 + (index / 200) as u8, (index % 200) as u8]))
+            .collect();
+        let mut requests: Vec<(u64, Ipv4Address)> = Vec::new();
+        for step in 0..140u64 {
+            let now = step * ONE_SECOND / 20;
+            for &target in &targets {
+                let sent = stack.send_udp_ipv4(
+                    target,
+                    UdpEgress {
+                        source_port: 4040,
+                        destination_port: 8080,
+                        payload: b"probe",
+                        hop_limit: crate::DEFAULT_HOP_LIMIT,
+                    },
+                    1,
+                    StackInstant::from_nanos(now),
+                );
+                assert_eq!(sent, Ok(0), "{target:?} is unresolved");
+                // As the kernel's shard does after each pass.
+                while stack.take_event().is_some() {}
+                while let Some(frame) = stack.take_outbound() {
+                    let ethernet = EthernetFrame::parse(frame.as_slice())
+                        .expect("Ethernet frame should parse");
+                    let arp = ArpPacket::parse(ethernet.payload).expect("ARP packet should parse");
+                    assert_eq!(arp.operation, ArpOperation::Request);
+                    requests.push((now, arp.target_protocol));
+                }
+            }
+        }
+
+        for &target in &targets {
+            let times: Vec<u64> = requests
+                .iter()
+                .filter(|(_, asked)| *asked == target)
+                .map(|(at, _)| *at)
+                .collect();
+            assert!(!times.is_empty(), "{target:?} is asked for in turn");
+            assert!(
+                times.windows(2).all(|pair| pair[1] - pair[0] >= ONE_SECOND),
+                "{target:?} is asked for at most once a second: {times:?}"
+            );
+        }
+        for (index, &(start, _)) in requests.iter().enumerate() {
+            let in_window = requests[index..]
+                .iter()
+                .take_while(|(at, _)| *at < start + ONE_SECOND)
+                .count();
+            assert!(
+                in_window <= MAX_PENDING_RESOLUTIONS,
+                "{in_window} requests in the second from {start}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unresolved_ipv6_next_hop_is_solicited_at_the_same_pace() {
+        let mut stack = autoconfigured_stack();
+        let peer = Ipv6Address::new([0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9]);
+        let mut solicitations = Vec::new();
+        for step in 0..=50u64 {
+            let now = step * ONE_SECOND / 10;
+            assert_eq!(
+                stack.send_udp_ipv6(
+                    peer,
+                    UdpEgress {
+                        source_port: 4040,
+                        destination_port: 8080,
+                        payload: b"probe",
+                        hop_limit: crate::DEFAULT_HOP_LIMIT,
+                    },
+                    StackInstant::from_nanos(now),
+                ),
+                Ok(0)
+            );
+            while let Some(frame) = stack.take_outbound() {
+                let ethernet =
+                    EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
+                let ipv6 = Ipv6Packet::parse(ethernet.payload).expect("IPv6 packet should parse");
+                assert!(matches!(
+                    Icmpv6Packet::parse(ipv6.payload),
+                    Some(Icmpv6Packet::NeighborSolicitation { target, .. }) if target == peer
+                ));
+                solicitations.push(now);
+            }
+            if now < 3 * ONE_SECOND {
+                assert_eq!(
+                    cached(&stack, peer).map(|entry| entry.updated_at),
+                    Some(StackInstant::from_nanos(0)),
+                    "pending sends and retries leave the entry's timestamp alone"
+                );
+            }
+        }
+
+        assert_eq!(solicitations[..3], [0, ONE_SECOND, 2 * ONE_SECOND]);
+        assert!(solicitations[3] > 3 * ONE_SECOND, "{solicitations:?}");
+        assert!(
+            solicitations
+                .windows(2)
+                .all(|pair| pair[1] - pair[0] >= ONE_SECOND),
+            "{solicitations:?}"
+        );
+    }
+
+    /// A UDP datagram to a closed port inside an IPv4 header carrying
+    /// `options` (a multiple of four octets).
+    fn ipv4_udp_frame_with_options(
+        source: Ipv4Address,
+        destination: Ipv4Address,
+        payload: &[u8],
+        options: &[u8],
+    ) -> ([u8; crate::ETHERNET_FRAME_BYTES], usize) {
+        assert!(options.len().is_multiple_of(4));
+        let mut frame = [0u8; crate::ETHERNET_FRAME_BYTES];
+        let mut offset =
+            EthernetFrame::encode_header(&mut frame, LOCAL_MAC, PEER_MAC, EthernetProtocol::Ipv4)
+                .expect("test Ethernet header should fit");
+        let header = offset;
+        let header_len = Ipv4Packet::MIN_HEADER_LEN + options.len();
+        let total_len = header_len + UdpPacket::HEADER_LEN + payload.len();
+        frame[header] = 0x40 | (header_len / 4) as u8;
+        frame[header + 2..header + 4].copy_from_slice(&(total_len as u16).to_be_bytes());
+        frame[header + 4..header + 6].copy_from_slice(&7u16.to_be_bytes());
+        frame[header + 8] = 64;
+        frame[header + 9] = crate::IpProtocol::Udp.number();
+        frame[header + 12..header + 16].copy_from_slice(&source.octets());
+        frame[header + 16..header + 20].copy_from_slice(&destination.octets());
+        frame[header + 20..header + header_len].copy_from_slice(options);
+        let checksum = ipv4_checksum(&frame[header..header + header_len]);
+        frame[header + 10..header + 12].copy_from_slice(&checksum.to_be_bytes());
+        offset += header_len;
+        offset += UdpPacket::encode(
+            &mut frame[offset..],
+            IpAddress::Ipv4(source),
+            IpAddress::Ipv4(destination),
+            53,
+            4040,
+            payload,
+            TransportChecksum::Software,
+        )
+        .expect("test UDP datagram should fit");
+        (frame, offset)
+    }
+
+    fn ipv4_test_stack() -> (Stack, Ipv4Address, Ipv4Address) {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
+        (stack, local, peer)
+    }
+
+    #[test]
+    fn an_ipv4_error_quotes_the_whole_header_when_it_carries_options() {
+        let (mut stack, local, peer) = ipv4_test_stack();
+        // Four no-operation options: a 24-octet header.
+        let (frame, len) = ipv4_udp_frame_with_options(peer, local, b"payload", &[1, 1, 1, 1]);
+
+        stack
+            .receive_frame(&frame[..len], StackInstant::from_nanos(1))
+            .expect("closed UDP frame should be handled");
+
+        let response = stack.take_outbound().expect("port unreachable is queued");
+        let ethernet =
+            EthernetFrame::parse(response.as_slice()).expect("Ethernet frame should parse");
+        let ipv4 = Ipv4Packet::parse(ethernet.payload).expect("IPv4 packet should parse");
+        let Some(Icmpv4Packet::DestinationUnreachable(unreachable)) =
+            Icmpv4Packet::parse(ipv4.payload)
+        else {
+            panic!("expected an ICMP destination unreachable");
+        };
+        // RFC 792: the original header at its real length, then 64 bits.
+        assert_eq!(
+            unreachable.original,
+            &frame[EthernetFrame::HEADER_LEN..][..24 + 8]
+        );
+    }
+
+    fn ipv4_echo_frame(
+        source: Ipv4Address,
+        destination: Ipv4Address,
+        payload: &[u8],
+    ) -> ([u8; crate::ETHERNET_FRAME_BYTES], usize) {
+        let mut frame = [0u8; crate::ETHERNET_FRAME_BYTES];
+        let mut offset =
+            EthernetFrame::encode_header(&mut frame, LOCAL_MAC, PEER_MAC, EthernetProtocol::Ipv4)
+                .expect("test Ethernet header should fit");
+        offset += Ipv4Packet::encode_header(
+            &mut frame[offset..],
+            source,
+            destination,
+            crate::IpProtocol::Icmp,
+            Icmpv4Packet::HEADER_LEN + payload.len(),
+            3,
+            64,
+        )
+        .expect("test IPv4 header should fit");
+        offset += Icmpv4Packet::encode_echo_request(&mut frame[offset..], 0x1234, 7, payload)
+            .expect("test echo request should fit");
+        (frame, offset)
+    }
+
+    #[test]
+    fn an_ipv4_echo_request_to_a_unicast_address_is_answered() {
+        let (mut stack, local, peer) = ipv4_test_stack();
+        let payload: Vec<u8> = (0..=255u8).cycle().take(300).collect();
+        let (frame, len) = ipv4_echo_frame(peer, local, &payload);
+
+        stack
+            .receive_frame(&frame[..len], StackInstant::from_nanos(1))
+            .expect("echo request should be handled");
+
+        let response = stack.take_outbound().expect("an echo reply is queued");
+        let ethernet =
+            EthernetFrame::parse(response.as_slice()).expect("Ethernet frame should parse");
+        assert_eq!(ethernet.destination, PEER_MAC);
+        assert_eq!(ethernet.source, LOCAL_MAC);
+        let ipv4 = Ipv4Packet::parse(ethernet.payload).expect("IPv4 packet should parse");
+        assert_eq!((ipv4.source, ipv4.destination), (local, peer));
+        assert_eq!(ipv4.protocol, crate::IpProtocol::Icmp);
+        let Some(Icmpv4Packet::EchoReply(reply)) = Icmpv4Packet::parse(ipv4.payload) else {
+            panic!("expected an echo reply");
+        };
+        assert_eq!((reply.identifier, reply.sequence), (0x1234, 7));
+        assert_eq!(reply.payload, payload.as_slice());
+        assert!(stack.take_outbound().is_none());
+    }
+
+    #[test]
+    fn an_ipv4_echo_request_to_a_broadcast_address_is_not_answered() {
+        let (mut stack, _, peer) = ipv4_test_stack();
+        for destination in [
+            Ipv4Address::BROADCAST,
+            Ipv4Address::new([192, 0, 2, 255]),
+            Ipv4Address::new([224, 0, 0, 1]),
+        ] {
+            let (frame, len) = ipv4_echo_frame(peer, destination, b"ping");
+            stack
+                .receive_frame(&frame[..len], StackInstant::from_nanos(1))
+                .expect("echo request should be handled");
+            assert!(stack.take_outbound().is_none(), "{destination:?}");
+        }
+    }
+
+    #[test]
+    fn an_ipv4_echo_reply_is_bounded_by_one_frame() {
+        let (mut stack, local, peer) = ipv4_test_stack();
+        // 1514-octet frame: 14 + 20 + 8 + 1472.
+        let fits = [0xa5u8; 1472];
+        let (frame, len) = ipv4_echo_frame(peer, local, &fits);
+        stack
+            .receive_frame(&frame[..len], StackInstant::from_nanos(1))
+            .expect("echo request should be handled");
+        assert!(
+            stack.take_outbound().is_some(),
+            "the largest reply that fits"
+        );
+    }
+
+    #[test]
+    fn an_echo_reply_that_would_exceed_the_interface_mtu_is_dropped() {
+        // A 600-octet interface frame holds an IPv4 echo reply of 558
+        // data octets and an IPv6 one of 538.
+        let config = StackConfig::new(LOCAL_MAC, 600, TEST_ISN_SECRET);
+        let (_, local, peer) = ipv4_test_stack();
+        let mut stack = Stack::new(config);
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
+        for (payload_len, answered) in [(558, true), (559, false)] {
+            let (frame, len) = ipv4_echo_frame(peer, local, &vec![0xa5; payload_len]);
+            stack
+                .receive_frame(&frame[..len], StackInstant::from_nanos(1))
+                .expect("echo request should be handled");
+            assert_eq!(stack.take_outbound().is_some(), answered, "{payload_len}");
+        }
+
+        let mut stack = Stack::new(config);
+        stack
+            .configure_ipv6_link_local()
+            .expect("link-local address should be accepted");
+        let local = stack.ipv6_link_local_address().expect("link-local address");
+        for (payload_len, answered) in [(538, true), (539, false)] {
+            let (frame, len) = ipv6_echo_frame(LINK_LOCAL_PEER, local, &vec![0xa5; payload_len]);
+            stack
+                .receive_frame(&frame[..len], StackInstant::from_nanos(1))
+                .expect("echo request should be handled");
+            assert_eq!(stack.take_outbound().is_some(), answered, "{payload_len}");
+        }
+    }
+
+    /// Delivers `frame` and counts the frames the stack answers with.
+    fn answers_to(stack: &mut Stack, frame: &[u8], now: u64) -> usize {
+        stack
+            .receive_frame(frame, StackInstant::from_nanos(now))
+            .expect("the frame should be handled");
+        let mut answers = 0;
+        while stack.take_outbound().is_some() {
+            answers += 1;
+        }
+        answers
+    }
+
+    /// Delivers `frame` `count` times at `now` and counts the answers.
+    fn answers_to_repeated(stack: &mut Stack, frame: &[u8], count: u32, now: u64) -> usize {
+        (0..count).map(|_| answers_to(stack, frame, now)).sum()
+    }
+
+    #[test]
+    fn icmp_errors_and_echo_replies_are_each_rate_limited_and_never_starve_each_other() {
+        use crate::icmp_rate::{ICMP_BURST_MESSAGES, ICMP_MESSAGES_PER_SECOND};
+        let (mut stack, local, peer) = ipv4_test_stack();
+        let (closed_port, closed_len) = ipv4_udp_frame(peer, 53, local, 4040, b"x");
+        let closed_port = &closed_port[..closed_len];
+        let (echo, echo_len) = ipv4_echo_frame(peer, local, b"ping");
+        let echo = &echo[..echo_len];
+
+        assert_eq!(
+            answers_to_repeated(&mut stack, echo, ICMP_BURST_MESSAGES + 10, 1),
+            ICMP_BURST_MESSAGES as usize,
+            "one burst of echo replies, no more"
+        );
+        assert_eq!(
+            answers_to_repeated(&mut stack, closed_port, ICMP_BURST_MESSAGES + 10, 1),
+            ICMP_BURST_MESSAGES as usize,
+            "an echo flood leaves the errors their own burst"
+        );
+        assert_eq!(answers_to(&mut stack, echo, 1), 0);
+
+        // One token accrues per 1 / rate seconds, in each bucket.
+        let token = ONE_SECOND / u64::from(ICMP_MESSAGES_PER_SECOND);
+        assert_eq!(answers_to(&mut stack, echo, 1 + token), 1);
+        assert_eq!(answers_to(&mut stack, echo, 1 + token), 0);
+        assert_eq!(answers_to(&mut stack, closed_port, 1 + token), 1);
+        assert_eq!(answers_to(&mut stack, closed_port, 1 + token), 0);
+    }
+
+    #[test]
+    fn icmpv6_errors_and_echo_replies_draw_from_the_same_buckets_as_icmpv4() {
+        use crate::icmp_rate::ICMP_BURST_MESSAGES;
+        let (mut stack, local, peer) = ipv4_test_stack();
+        stack
+            .configure_ipv6_link_local()
+            .expect("link-local address should be accepted");
+        let local_v6 = stack.ipv6_link_local_address().expect("link-local address");
+        let (v4_error, v4_error_len) = ipv4_udp_frame(peer, 53, local, 4040, b"x");
+        let (v6_error, v6_error_len) = ipv6_udp_frame(LINK_LOCAL_PEER, 53, local_v6, 4040, b"x");
+        let (v4_echo, v4_echo_len) = ipv4_echo_frame(peer, local, b"ping");
+        let (v6_echo, v6_echo_len) = ipv6_echo_frame(LINK_LOCAL_PEER, local_v6, b"ping");
+        let half = ICMP_BURST_MESSAGES / 2;
+
+        let errors = answers_to_repeated(&mut stack, &v4_error[..v4_error_len], half, 1)
+            + answers_to_repeated(
+                &mut stack,
+                &v6_error[..v6_error_len],
+                ICMP_BURST_MESSAGES,
+                1,
+            );
+        assert_eq!(errors, ICMP_BURST_MESSAGES as usize);
+        let replies = answers_to_repeated(&mut stack, &v6_echo[..v6_echo_len], half, 1)
+            + answers_to_repeated(&mut stack, &v4_echo[..v4_echo_len], ICMP_BURST_MESSAGES, 1);
+        assert_eq!(replies, ICMP_BURST_MESSAGES as usize);
+    }
+
+    #[test]
+    fn no_icmpv4_error_answers_a_source_that_is_not_one_host() {
+        let (mut stack, local, peer) = ipv4_test_stack();
+        for source in [
+            Ipv4Address::UNSPECIFIED,
+            Ipv4Address::BROADCAST,
+            Ipv4Address::new([192, 0, 2, 255]),
+            Ipv4Address::new([224, 0, 0, 5]),
+            Ipv4Address::new([127, 0, 0, 1]),
+            Ipv4Address::new([240, 0, 0, 1]),
+        ] {
+            let (frame, len) = ipv4_udp_frame(source, 53, local, 4040, b"x");
+            assert_eq!(answers_to(&mut stack, &frame[..len], 1), 0, "{source:?}");
+        }
+        let (frame, len) = ipv4_udp_frame(peer, 53, local, 4040, b"x");
+        assert_eq!(
+            answers_to(&mut stack, &frame[..len], 1),
+            1,
+            "a unicast host"
+        );
+    }
+
+    #[test]
+    fn no_icmpv4_error_answers_a_packet_sent_to_a_group() {
+        let (mut stack, local, peer) = ipv4_test_stack();
+        for destination in [
+            Ipv4Address::BROADCAST,
+            Ipv4Address::new([192, 0, 2, 255]),
+            Ipv4Address::new([224, 0, 0, 1]),
+        ] {
+            let (frame, len) = ipv4_udp_frame(peer, 53, destination, 4040, b"x");
+            assert_eq!(
+                answers_to(&mut stack, &frame[..len], 1),
+                0,
+                "{destination:?}"
+            );
+        }
+        // A unicast destination in a frame sent to the link-layer
+        // broadcast address.
+        let (mut frame, len) = ipv4_udp_frame(peer, 53, local, 4040, b"x");
+        frame[..6].fill(0xff);
+        assert_eq!(answers_to(&mut stack, &frame[..len], 1), 0);
+    }
+
+    #[test]
+    fn no_icmpv6_error_answers_a_source_that_is_not_one_host_or_a_group() {
+        let mut stack = link_local_stack();
+        let local = stack.ipv6_link_local_address().expect("link-local address");
+        for source in [
+            Ipv6Address::UNSPECIFIED,
+            Ipv6Address::LOOPBACK,
+            Ipv6Address::ALL_NODES_LINK_LOCAL,
+        ] {
+            let (frame, len) = ipv6_udp_frame(source, 53, local, 4040, b"x");
+            assert_eq!(answers_to(&mut stack, &frame[..len], 1), 0, "{source:?}");
+        }
+        let (frame, len) = ipv6_udp_frame(
+            LINK_LOCAL_PEER,
+            53,
+            Ipv6Address::ALL_NODES_LINK_LOCAL,
+            4040,
+            b"x",
+        );
+        assert_eq!(
+            answers_to(&mut stack, &frame[..len], 1),
+            0,
+            "multicast destination"
+        );
+        let (mut frame, len) = ipv6_udp_frame(LINK_LOCAL_PEER, 53, local, 4040, b"x");
+        frame[..6].copy_from_slice(&[0x33, 0x33, 0, 0, 0, 1]);
+        assert_eq!(
+            answers_to(&mut stack, &frame[..len], 1),
+            0,
+            "link-layer multicast"
+        );
+        let (frame, len) = ipv6_udp_frame(LINK_LOCAL_PEER, 53, local, 4040, b"x");
+        assert_eq!(
+            answers_to(&mut stack, &frame[..len], 1),
+            1,
+            "a unicast host"
+        );
+    }
+
+    #[test]
+    fn an_icmpv6_error_never_exceeds_the_ipv6_minimum_mtu() {
+        let mut stack = link_local_stack();
+        let local = stack.ipv6_link_local_address().expect("link-local address");
+        // The datagram is 1448 octets of IPv6 packet, more than an error
+        // may carry back.
+        let (frame, len) = ipv6_udp_frame(LINK_LOCAL_PEER, 53, local, 4040, &[0x7e; 1400]);
+        stack
+            .receive_frame(&frame[..len], StackInstant::from_nanos(1))
+            .expect("closed UDP frame should be handled");
+
+        let response = stack.take_outbound().expect("port unreachable is queued");
+        let ethernet =
+            EthernetFrame::parse(response.as_slice()).expect("Ethernet frame should parse");
+        let ipv6 = Ipv6Packet::parse(ethernet.payload).expect("IPv6 packet should parse");
+        assert_eq!(
+            Ipv6Packet::HEADER_LEN + ipv6.payload.len(),
+            1280,
+            "the largest message RFC 4443 section 2.4 (c) allows"
+        );
+        let Some(Icmpv6Packet::DestinationUnreachable(unreachable)) =
+            Icmpv6Packet::parse(ipv6.payload)
+        else {
+            panic!("expected an ICMPv6 destination unreachable");
+        };
+        assert_eq!(
+            unreachable.original,
+            &frame[EthernetFrame::HEADER_LEN..][..unreachable.original.len()]
+        );
+
+        // A small interface holds less still.
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, 600, TEST_ISN_SECRET));
+        stack
+            .configure_ipv6_link_local()
+            .expect("link-local address should be accepted");
+        stack
+            .receive_frame(&frame[..len], StackInstant::from_nanos(1))
+            .expect("closed UDP frame should be handled");
+        let response = stack.take_outbound().expect("port unreachable is queued");
+        assert_eq!(response.as_slice().len(), 600);
+    }
+
+    fn ipv6_echo_frame(
+        source: Ipv6Address,
+        destination: Ipv6Address,
+        payload: &[u8],
+    ) -> ([u8; crate::ETHERNET_FRAME_BYTES], usize) {
+        let mut body = [0u8; crate::ETHERNET_FRAME_BYTES];
+        let body_len =
+            Icmpv6Packet::encode_echo_request(&mut body, source, destination, 0x4321, 9, payload)
+                .expect("test echo request should fit");
+        ipv6_icmpv6_frame(
+            PEER_MAC,
+            LOCAL_MAC,
+            source,
+            destination,
+            64,
+            &body[..body_len],
+        )
+    }
+
+    #[test]
+    fn an_ipv6_echo_request_to_a_unicast_address_is_answered() {
+        let mut stack = link_local_stack();
+        let local = stack.ipv6_link_local_address().expect("link-local address");
+        let payload: Vec<u8> = (0..=255u8).cycle().take(300).collect();
+        let (frame, len) = ipv6_echo_frame(LINK_LOCAL_PEER, local, &payload);
+
+        stack
+            .receive_frame(&frame[..len], StackInstant::from_nanos(1))
+            .expect("echo request should be handled");
+
+        let response = stack.take_outbound().expect("an echo reply is queued");
+        let ethernet =
+            EthernetFrame::parse(response.as_slice()).expect("Ethernet frame should parse");
+        assert_eq!(ethernet.destination, PEER_MAC);
+        let ipv6 = Ipv6Packet::parse(ethernet.payload).expect("IPv6 packet should parse");
+        assert_eq!((ipv6.source, ipv6.destination), (local, LINK_LOCAL_PEER));
+        assert!(crate::icmpv6_checksum_valid(
+            ipv6.source,
+            ipv6.destination,
+            ipv6.payload
+        ));
+        let Some(Icmpv6Packet::EchoReply(reply)) = Icmpv6Packet::parse(ipv6.payload) else {
+            panic!("expected an echo reply");
+        };
+        assert_eq!((reply.identifier, reply.sequence), (0x4321, 9));
+        assert_eq!(reply.payload, payload.as_slice());
+    }
+
+    #[test]
+    fn an_ipv6_echo_request_to_a_multicast_address_is_not_answered() {
+        let mut stack = link_local_stack();
+        let (frame, len) =
+            ipv6_echo_frame(LINK_LOCAL_PEER, Ipv6Address::ALL_NODES_LINK_LOCAL, b"ping");
+        stack
+            .receive_frame(&frame[..len], StackInstant::from_nanos(1))
+            .expect("echo request should be handled");
+        assert!(stack.take_outbound().is_none());
+    }
+
+    #[test]
+    fn no_echo_reply_answers_a_source_that_is_not_one_host_or_a_group_frame() {
+        let (mut stack, local, peer) = ipv4_test_stack();
+        for source in [
+            Ipv4Address::UNSPECIFIED,
+            Ipv4Address::BROADCAST,
+            Ipv4Address::new([192, 0, 2, 255]),
+            Ipv4Address::new([224, 0, 0, 5]),
+            Ipv4Address::new([127, 0, 0, 1]),
+            Ipv4Address::new([240, 0, 0, 1]),
+        ] {
+            let (frame, len) = ipv4_echo_frame(source, local, b"ping");
+            assert_eq!(answers_to(&mut stack, &frame[..len], 1), 0, "{source:?}");
+        }
+        let (mut frame, len) = ipv4_echo_frame(peer, local, b"ping");
+        frame[..6].fill(0xff);
+        assert_eq!(
+            answers_to(&mut stack, &frame[..len], 1),
+            0,
+            "link-layer broadcast"
+        );
+
+        let mut stack = link_local_stack();
+        let local = stack.ipv6_link_local_address().expect("link-local address");
+        for source in [
+            Ipv6Address::UNSPECIFIED,
+            Ipv6Address::LOOPBACK,
+            Ipv6Address::ALL_NODES_LINK_LOCAL,
+        ] {
+            let (frame, len) = ipv6_echo_frame(source, local, b"ping");
+            assert_eq!(answers_to(&mut stack, &frame[..len], 1), 0, "{source:?}");
+        }
+        let (mut frame, len) = ipv6_echo_frame(LINK_LOCAL_PEER, local, b"ping");
+        frame[..6].copy_from_slice(&[0x33, 0x33, 0, 0, 0, 1]);
+        assert_eq!(
+            answers_to(&mut stack, &frame[..len], 1),
+            0,
+            "link-layer multicast"
+        );
+    }
+
+    #[test]
+    fn a_received_echo_request_is_not_taken_for_the_reply_to_one_sent() {
+        let (mut stack, local, peer) = ipv4_test_stack();
+        stack.learn_neighbor(NeighborEntry {
+            ip: IpAddress::Ipv4(peer),
+            mac: PEER_MAC,
+            state: NeighborState::Reachable,
+            updated_at: StackInstant::from_nanos(0),
+        });
+        // The frames below carry identifier 0x1234 and sequence 7.
+        let key = IcmpEchoKey {
+            destination: IpAddress::Ipv4(peer),
+            identifier: 0x1234,
+            sequence: 7,
+        };
+        assert_eq!(
+            stack.send_icmp_echo_request(
+                key.destination,
+                key.identifier,
+                key.sequence,
+                b"ping",
+                1,
+                StackInstant::from_nanos(1),
+            ),
+            Ok(4)
+        );
+        while stack.take_outbound().is_some() {}
+
+        // The peer asks the same question back.
+        let (request, len) = ipv4_echo_frame(peer, local, b"ping");
+        assert_eq!(answers_to(&mut stack, &request[..len], 2), 1);
+        assert_eq!(stack.take_icmp_echo_reply(key), None);
+
+        // Its answer is what completes the exchange.
+        let (mut reply, len) = ipv4_echo_frame(peer, local, b"ping");
+        let icmp = EthernetFrame::HEADER_LEN + Ipv4Packet::MIN_HEADER_LEN;
+        Icmpv4Packet::encode_echo_reply(&mut reply[icmp..len], 0x1234, 7, b"ping")
+            .expect("test echo reply should fit");
+        answers_to(&mut stack, &reply[..len], 3);
+        assert!(stack.take_icmp_echo_reply(key).is_some());
+    }
+
+    #[test]
+    fn an_ipv6_echo_reply_is_bounded_by_one_frame() {
+        let mut stack = link_local_stack();
+        let local = stack.ipv6_link_local_address().expect("link-local address");
+        // 1514-octet frame: 14 + 40 + 8 + 1452.
+        let (frame, len) = ipv6_echo_frame(LINK_LOCAL_PEER, local, &[0x5a; 1452]);
+        stack
+            .receive_frame(&frame[..len], StackInstant::from_nanos(1))
+            .expect("echo request should be handled");
+        assert!(
+            stack.take_outbound().is_some(),
+            "the largest reply that fits"
+        );
+    }
+
+    const FLOW_LOCAL: Ipv4Address = Ipv4Address::new([192, 0, 2, 10]);
+    const FLOW_PEER: Ipv4Address = Ipv4Address::new([192, 0, 2, 20]);
+    const FLOW_FIRST_PORT: u16 = 40_000;
+    /// The most sockets one drive may be asked to put on the wire before
+    /// the test makes room: what the old fixed-size collections held.
+    const OLD_BURST: u16 = 16;
+    /// Peer initial sequence number of every flow, and what its SYN-ACK
+    /// acknowledges (local initial sequence 7, plus the SYN).
+    const FLOW_PEER_SEQUENCE: u32 = 100;
+    const FLOW_LOCAL_NEXT: u32 = 8;
+
+    fn at(nanos: u64) -> StackInstant {
+        StackInstant::from_nanos(nanos)
+    }
+
+    /// Queues `segment` the way every TCP sender does, between the
+    /// endpoints its header's ports name.
+    fn queue_tcp_ipv4_segment(
+        stack: &mut Stack,
+        source: Ipv4Address,
+        destination: Ipv4Address,
+        segment: TcpEgress<'_>,
+        identification: u16,
+        now: StackInstant,
+    ) -> Result<bool, StackError> {
+        stack.queue_tcp(
+            TcpEndpoint {
+                address: IpAddress::Ipv4(source),
+                port: segment.header.source_port,
+            },
+            TcpEndpoint {
+                address: IpAddress::Ipv4(destination),
+                port: segment.header.destination_port,
+            },
+            segment,
+            identification,
+            now,
+        )
+    }
+
+    fn flow_peer_neighbor() -> NeighborEntry {
+        NeighborEntry {
+            ip: IpAddress::Ipv4(FLOW_PEER),
+            mac: PEER_MAC,
+            state: NeighborState::Reachable,
+            updated_at: at(0),
+        }
+    }
+
+    fn flow_stack(peer_resolved: bool) -> Stack {
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(FLOW_LOCAL, 24))
+            .expect("test address should be accepted");
+        if peer_resolved {
+            stack.learn_neighbor(flow_peer_neighbor());
+        }
+        stack
+    }
+
+    fn flow_connect(stack: &mut Stack, flow: u16) -> SocketId {
+        stack
+            .open_tcp_connect(
+                TcpEndpoint {
+                    address: IpAddress::Ipv4(FLOW_LOCAL),
+                    port: FLOW_FIRST_PORT + flow,
+                },
+                TcpEndpoint {
+                    address: IpAddress::Ipv4(FLOW_PEER),
+                    port: 80,
+                },
+                7,
+            )
+            .expect("test TCP connect should allocate a socket")
+    }
+
+    #[derive(Debug)]
+    struct FlowFrame {
+        flow: u16,
+        flags: TcpFlags,
+        sequence: u32,
+        acknowledgement: u32,
+        payload: Vec<u8>,
+    }
+
+    /// Every TCP frame the stack has queued, oldest first; frames that
+    /// are not TCP from a flow (ARP and the like) are discarded.
+    fn drain_flow_frames(stack: &mut Stack) -> Vec<FlowFrame> {
+        let mut frames = Vec::new();
+        while let Some(frame) = stack.take_outbound() {
+            let Some(ethernet) = EthernetFrame::parse(frame.as_slice()) else {
+                continue;
+            };
+            let Some(ipv4) = Ipv4Packet::parse(ethernet.payload) else {
+                continue;
+            };
+            if ipv4.protocol != crate::IpProtocol::Tcp {
+                continue;
+            }
+            let tcp = TcpPacket::parse(ipv4.payload).expect("TCP packet should parse");
+            frames.push(FlowFrame {
+                flow: tcp.source_port - FLOW_FIRST_PORT,
+                flags: tcp.flags,
+                sequence: tcp.sequence,
+                acknowledgement: tcp.acknowledgement,
+                payload: tcp.payload.to_vec(),
+            });
+        }
+        frames
+    }
+
+    fn flow_receive(
+        stack: &mut Stack,
+        flow: u16,
+        flags: TcpFlags,
+        sequence: u32,
+        acknowledgement: u32,
+        now: u64,
+    ) {
+        flow_receive_payload(stack, flow, flags, sequence, acknowledgement, &[], now);
+    }
+
+    fn flow_receive_payload(
+        stack: &mut Stack,
+        flow: u16,
+        flags: TcpFlags,
+        sequence: u32,
+        acknowledgement: u32,
+        payload: &[u8],
+        now: u64,
+    ) {
+        let (segment, len) = tcp_segment_with_payload(
+            FLOW_PEER,
+            FLOW_LOCAL,
+            TcpHeader {
+                source_port: 80,
+                destination_port: FLOW_FIRST_PORT + flow,
+                sequence,
+                acknowledgement,
+                flags,
+                window_size: u16::MAX,
+            },
+            payload,
+        );
+        stack
+            .receive_tcp(
+                IpAddress::Ipv4(FLOW_PEER),
+                IpAddress::Ipv4(FLOW_LOCAL),
+                &Bytes::copy_from_slice(&segment[..len]),
+                RxFrameOffload::none(),
+                at(now),
+            )
+            .expect("peer segment should be accepted");
+    }
+
+    /// Opens `count` connections and answers every SYN, `OLD_BURST` at a
+    /// time so the setup never asks one drive for more than the old
+    /// collections held. Every socket ends established; with
+    /// `owing_acks` each still owes the ACK of its handshake, all at
+    /// once, and without it the ACKs have gone out.
+    fn establish_flows(stack: &mut Stack, count: u16, owing_acks: bool) -> Vec<SocketId> {
+        let mut sockets = Vec::new();
+        let syn_ack = |stack: &mut Stack, flows: core::ops::Range<u16>| {
+            for flow in flows {
+                flow_receive(
+                    stack,
+                    flow,
+                    TcpFlags::SYN.union(TcpFlags::ACK),
+                    FLOW_PEER_SEQUENCE,
+                    FLOW_LOCAL_NEXT,
+                    1,
+                );
+            }
+        };
+        for first in (0..count).step_by(usize::from(OLD_BURST)) {
+            let last = (first + OLD_BURST).min(count);
+            sockets.extend((first..last).map(|flow| flow_connect(stack, flow)));
+            stack.drive_tcp(at(1)).expect("SYNs should be queued");
+            let syns = drain_flow_frames(stack);
+            assert_eq!(syns.len(), usize::from(last - first));
+            if !owing_acks {
+                syn_ack(stack, first..last);
+                stack.drive_tcp(at(1)).expect("ACKs should be queued");
+                let acks = drain_flow_frames(stack);
+                assert_eq!(acks.len(), usize::from(last - first));
+            }
+        }
+        if owing_acks {
+            syn_ack(stack, 0..count);
+        }
+        sockets
+    }
+
+    /// Drives until a drive queues nothing more, and returns every TCP
+    /// frame the drives produced.
+    fn settle(stack: &mut Stack, now: u64) -> Vec<FlowFrame> {
+        let mut frames = Vec::new();
+        for _ in 0..32 {
+            stack.drive_tcp(at(now)).expect("drive should succeed");
+            let more = drain_flow_frames(stack);
+            if more.is_empty() {
+                return frames;
+            }
+            frames.extend(more);
+        }
+        panic!("the stack kept queueing frames across 32 drives");
+    }
+
+    fn flow_payload(flow: u16) -> Vec<u8> {
+        vec![flow as u8 + 1; 50 + usize::from(flow)]
+    }
+
+    #[test]
+    fn drive_queues_syns_for_more_sockets_than_a_burst_held() {
+        let mut stack = flow_stack(true);
+        for flow in 0..30 {
+            flow_connect(&mut stack, flow);
+        }
+        stack.drive_tcp(at(1)).expect("SYNs should be queued");
+        let frames = drain_flow_frames(&mut stack);
+        assert_eq!(frames.len(), 30);
+        assert!(frames.iter().all(|frame| frame.flags == TcpFlags::SYN));
+        let flows: BTreeSet<u16> = frames.iter().map(|frame| frame.flow).collect();
+        assert_eq!(flows.len(), 30);
+    }
+
+    #[test]
+    fn syns_to_an_unresolved_next_hop_stay_pending_past_a_burst() {
+        let mut stack = flow_stack(false);
+        for flow in 0..20 {
+            flow_connect(&mut stack, flow);
+        }
+        stack
+            .drive_tcp(at(1))
+            .expect("an unresolved next hop leaves the SYNs pending");
+        assert!(drain_flow_frames(&mut stack).is_empty());
+
+        stack.learn_neighbor(flow_peer_neighbor());
+        stack.drive_tcp(at(2)).expect("SYNs should be queued");
+        let frames = drain_flow_frames(&mut stack);
+        let flows: BTreeSet<u16> = frames.iter().map(|frame| frame.flow).collect();
+        assert_eq!(frames.len(), 20);
+        assert_eq!(flows.len(), 20);
+    }
+
+    #[test]
+    fn syns_past_the_outbound_queue_wait_for_the_next_drive() {
+        let mut stack = flow_stack(true);
+        for flow in 0..100 {
+            flow_connect(&mut stack, flow);
+        }
+        stack.drive_tcp(at(1)).expect("a full queue ends the pass");
+        let first = drain_flow_frames(&mut stack);
+        assert_eq!(first.len(), MAX_OUTBOUND_FRAMES);
+
+        let mut flows: Vec<u16> = first.iter().map(|frame| frame.flow).collect();
+        flows.extend(settle(&mut stack, 1).iter().map(|frame| frame.flow));
+        // Each SYN left exactly once: a SYN is marked sent only after
+        // it has a slot, so none was skipped and none repeated.
+        flows.sort_unstable();
+        assert_eq!(flows, (0..100).collect::<Vec<u16>>());
+    }
+
+    #[test]
+    fn drive_acknowledges_more_sockets_than_a_burst_held() {
+        let mut stack = flow_stack(true);
+        establish_flows(&mut stack, 40, true);
+        stack.drive_tcp(at(1)).expect("ACKs should be queued");
+        let first = drain_flow_frames(&mut stack);
+        assert_eq!(first.len(), MAX_OUTBOUND_FRAMES);
+
+        let rest = settle(&mut stack, 1);
+        let mut flows: Vec<u16> = first.iter().chain(&rest).map(|frame| frame.flow).collect();
+        flows.sort_unstable();
+        assert_eq!(flows, (0..40).collect::<Vec<u16>>());
+        for frame in first.iter().chain(&rest) {
+            assert_eq!(frame.flags, TcpFlags::ACK);
+            assert_eq!(frame.acknowledgement, FLOW_PEER_SEQUENCE + 1);
+        }
+    }
+
+    #[test]
+    fn drive_sends_data_for_more_sockets_than_a_burst_held() {
+        let mut stack = flow_stack(true);
+        let sockets = establish_flows(&mut stack, 30, false);
+        for (flow, socket) in sockets.iter().enumerate() {
+            let payload = flow_payload(flow as u16);
+            assert_eq!(stack.tcp_send(*socket, &payload), Ok(payload.len()));
+        }
+        stack.drive_tcp(at(2)).expect("data should be queued");
+        let frames = drain_flow_frames(&mut stack);
+        assert_eq!(frames.len(), 30);
+        for frame in &frames {
+            assert_eq!(frame.payload, flow_payload(frame.flow), "{frame:?}");
+            assert_eq!(frame.sequence, FLOW_LOCAL_NEXT);
+        }
+        assert!(settle(&mut stack, 2).is_empty());
+    }
+
+    #[test]
+    fn a_full_outbound_queue_mid_pass_loses_no_data() {
+        let mut stack = flow_stack(true);
+        let sockets = establish_flows(&mut stack, OLD_BURST, false);
+        for (flow, socket) in sockets.iter().enumerate() {
+            let payload = flow_payload(flow as u16);
+            assert_eq!(stack.tcp_send(*socket, &payload), Ok(payload.len()));
+        }
+        // Leave room for half of the data frames.
+        for _ in 0..MAX_OUTBOUND_FRAMES - usize::from(OLD_BURST) / 2 {
+            stack
+                .queue_arp_reply(FLOW_LOCAL, FLOW_PEER, PEER_MAC)
+                .expect("filler frame should be queued");
+        }
+
+        stack
+            .drive_tcp(at(2))
+            .expect("a full outbound queue ends the pass without failing it");
+        let mut frames = drain_flow_frames(&mut stack);
+        assert_eq!(frames.len(), usize::from(OLD_BURST) / 2);
+        // Same instant, far inside every retransmission timeout: what was
+        // left behind has to come out of the next drive, not the timer.
+        frames.extend(settle(&mut stack, 2));
+
+        let mut flows: Vec<u16> = frames.iter().map(|frame| frame.flow).collect();
+        flows.sort_unstable();
+        assert_eq!(flows, (0..OLD_BURST).collect::<Vec<u16>>());
+        for frame in &frames {
+            assert_eq!(frame.payload, flow_payload(frame.flow), "{frame:?}");
+            assert_eq!(frame.sequence, FLOW_LOCAL_NEXT);
+        }
+    }
+
+    #[test]
+    fn the_orphan_sweep_runs_when_the_outbound_queue_fills() {
+        let mut stack = flow_stack(true);
+        let sockets = establish_flows(&mut stack, 2, false);
+        let (orphan, sender) = (sockets[0], sockets[1]);
+
+        // The orphan closes: its FIN goes out and the peer's FIN-ACK
+        // leaves it in TIME-WAIT with nobody left to read it.
+        stack
+            .close_tcp_socket(orphan, at(2))
+            .expect("close should finish the connection");
+        settle(&mut stack, 2);
+        flow_receive(
+            &mut stack,
+            0,
+            TcpFlags::FIN.union(TcpFlags::ACK),
+            FLOW_PEER_SEQUENCE + 1,
+            FLOW_LOCAL_NEXT + 1,
+            2,
+        );
+        settle(&mut stack, 2);
+
+        let payload = flow_payload(1);
+        assert_eq!(stack.tcp_send(sender, &payload), Ok(payload.len()));
+        for _ in 0..MAX_OUTBOUND_FRAMES {
+            stack
+                .queue_arp_reply(FLOW_LOCAL, FLOW_PEER, PEER_MAC)
+                .expect("filler frame should be queued");
+        }
+        let after_time_wait = 2 + crate::tcp::TCP_TIME_WAIT_NANOS + 1;
+        stack
+            .drive_tcp(at(after_time_wait))
+            .expect("a full outbound queue ends the pass without failing it");
+
+        assert_eq!(
+            stack.tcp_connect_state(orphan),
+            Err(StackError::UnknownSocket),
+            "the sweep reclaims the expired orphan even though the pass ended full"
+        );
+        // The sender's data never got a slot, so it was never taken.
+        assert!(drain_flow_frames(&mut stack).is_empty());
+        let frames = settle(&mut stack, after_time_wait);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].payload, payload);
+        assert_eq!(frames[0].sequence, FLOW_LOCAL_NEXT);
+    }
+
+    #[test]
+    fn closing_more_sockets_than_the_event_queue_held_never_overflows_it() {
+        const SOCKETS: u16 = 70;
+        let mut stack = flow_stack(true);
+        let sockets = establish_flows(&mut stack, SOCKETS, false);
+        // Each connection shuts its side down and is answered by the
+        // peer's FIN, which leaves it in TIME-WAIT.
+        for chunk in sockets.chunks(usize::from(OLD_BURST)) {
+            for socket in chunk {
+                stack
+                    .tcp_shutdown_send(*socket)
+                    .expect("shutdown should queue the FIN");
+            }
+            settle(&mut stack, 2);
+        }
+        for flow in 0..SOCKETS {
+            flow_receive(
+                &mut stack,
+                flow,
+                TcpFlags::FIN.union(TcpFlags::ACK),
+                FLOW_PEER_SEQUENCE + 1,
+                FLOW_LOCAL_NEXT + 1,
+                2,
+            );
+            settle(&mut stack, 2);
+        }
+        // The owner drains on receive; from here the stack receives
+        // nothing, and its timers alone close every socket.
+        while stack.take_event().is_some() {}
+
+        stack
+            .drive_tcp(at(2 + crate::tcp::TCP_TIME_WAIT_NANOS + 1))
+            .expect("expiring TIME-WAIT should not fail");
+
+        let mut closed = BTreeSet::new();
+        while let Some(event) = stack.take_event() {
+            let StackEvent::TcpClosed { socket } = event else {
+                panic!("unexpected event {event:?}");
+            };
+            assert!(
+                closed.insert(socket_index(socket)),
+                "{socket:?} reported twice"
+            );
+        }
+        let expected: BTreeSet<usize> = sockets.into_iter().map(socket_index).collect();
+        assert_eq!(closed, expected);
+    }
+
+    #[test]
+    fn neighbor_events_are_bounded_by_the_neighbor_cache() {
+        let mut stack = flow_stack(false);
+        let neighbor = |index: u16, updated: u64| NeighborEntry {
+            ip: IpAddress::Ipv4(Ipv4Address::new([10, 1, (index >> 8) as u8, index as u8])),
+            mac: [0x02, 0, 0, 0, (index >> 8) as u8, index as u8],
+            state: NeighborState::Reachable,
+            updated_at: at(updated),
+        };
+        for index in 0..300 {
+            stack.learn_neighbor(neighbor(index, 1));
+        }
+        // One address, updated over and over, is still one event.
+        for round in 2..1000 {
+            stack.learn_neighbor(neighbor(299, round));
+        }
+
+        let cached: Vec<NeighborEntry> = stack.neighbors().collect();
+        let mut reported = Vec::new();
+        while let Some(event) = stack.take_event() {
+            let StackEvent::NeighborUpdated(entry) = event else {
+                panic!("unexpected event {event:?}");
+            };
+            reported.push(entry);
+        }
+        assert_eq!(reported.len(), cached.len());
+        assert!(reported.iter().all(|entry| cached.contains(entry)));
+        for (position, entry) in reported.iter().enumerate() {
+            assert!(
+                reported[..position]
+                    .iter()
+                    .all(|other| other.ip != entry.ip),
+                "{:?} reported twice",
+                entry.ip
+            );
+        }
+        assert!(reported.contains(&neighbor(299, 999)));
+    }
+
+    /// More flows than the outbound queue holds, so that a drive that
+    /// gives every flow a frame fills it.
+    const CROWD: u16 = MAX_OUTBOUND_FRAMES as u16 + 8;
+
+    #[test]
+    fn a_late_socket_gets_its_turn_while_earlier_sockets_always_have_data() {
+        let late = CROWD - 1;
+        let mut stack = flow_stack(true);
+        let sockets = establish_flows(&mut stack, CROWD, false);
+        // Several segments each, so the flows ahead of the late one have
+        // data on every drive the test makes.
+        let busy = vec![0x42; 16 * 1024];
+        for socket in &sockets[..usize::from(late)] {
+            assert_eq!(stack.tcp_send(*socket, &busy), Ok(busy.len()));
+        }
+        let payload = flow_payload(late);
+        assert_eq!(
+            stack.tcp_send(sockets[usize::from(late)], &payload),
+            Ok(payload.len())
+        );
+
+        // A millisecond apart: past any pacing gap, far inside the RTO.
+        let mut late_frames = Vec::new();
+        for drive in 0..2 {
+            stack
+                .drive_tcp(at(2 + drive * 1_000_000))
+                .expect("a full outbound queue ends the turns, not the drive");
+            let frames = drain_flow_frames(&mut stack);
+            assert_eq!(
+                frames.len(),
+                MAX_OUTBOUND_FRAMES,
+                "drive {drive} fills the queue"
+            );
+            late_frames.extend(frames.into_iter().filter(|frame| frame.flow == late));
+        }
+        // Two drives are one lap of the active set: the second starts at
+        // the turn the first cut short.
+        assert_eq!(late_frames.len(), 1);
+        assert_eq!(late_frames[0].payload, payload);
+        assert_eq!(late_frames[0].sequence, FLOW_LOCAL_NEXT);
+    }
+
+    #[test]
+    fn retransmissions_past_the_outbound_queue_wait_for_the_next_drive() {
+        let mut stack = flow_stack(true);
+        let sockets = establish_flows(&mut stack, CROWD, false);
+        for (flow, socket) in sockets.iter().enumerate() {
+            let payload = flow_payload(flow as u16);
+            assert_eq!(stack.tcp_send(*socket, &payload), Ok(payload.len()));
+        }
+        assert_eq!(settle(&mut stack, 2).len(), usize::from(CROWD));
+
+        // Nothing is acknowledged, so every flow's timer runs out at once.
+        let expired = 2 + 2 * crate::tcp::TCP_INITIAL_RTO_NANOS;
+        stack
+            .drive_tcp(at(expired))
+            .expect("a full outbound queue ends the turns, not the drive");
+        let mut frames = drain_flow_frames(&mut stack);
+        assert_eq!(frames.len(), MAX_OUTBOUND_FRAMES);
+        frames.extend(settle(&mut stack, expired));
+
+        // Each segment went out again exactly once: marked only once
+        // queued, so none was skipped and none repeated.
+        let mut flows: Vec<u16> = frames.iter().map(|frame| frame.flow).collect();
+        flows.sort_unstable();
+        assert_eq!(flows, (0..CROWD).collect::<Vec<u16>>());
+        for frame in &frames {
+            assert_eq!(frame.payload, flow_payload(frame.flow), "{frame:?}");
+            assert_eq!(frame.sequence, FLOW_LOCAL_NEXT);
+        }
+        assert_eq!(stack.tcp_counters().retransmits_sent, u64::from(CROWD));
+    }
+
+    #[test]
+    fn data_for_an_unresolved_next_hop_stays_on_its_socket() {
+        let mut stack = flow_stack(true);
+        let socket = establish_flows(&mut stack, 1, false)[0];
+        // The peer's entry leaves the cache with the connection open.
+        stack.replace_neighbors(core::iter::empty());
+        let payload = flow_payload(0);
+        assert_eq!(stack.tcp_send(socket, &payload), Ok(payload.len()));
+        stack
+            .drive_tcp(at(2))
+            .expect("an unresolved next hop leaves the data pending");
+        assert!(drain_flow_frames(&mut stack).is_empty());
+
+        // The next drive after the answer, far inside the RTO, sends the
+        // bytes from where the stream stood.
+        stack.learn_neighbor(flow_peer_neighbor());
+        let frames = settle(&mut stack, 2);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].payload, payload);
+        assert_eq!(frames[0].sequence, FLOW_LOCAL_NEXT);
+    }
+
+    #[test]
+    fn an_orphan_reset_waits_for_room_in_the_outbound_queue() {
+        let mut stack = flow_stack(true);
+        let orphan = establish_flows(&mut stack, 1, false)[0];
+        // The owner closes; the peer acknowledges the FIN, which leaves
+        // the orphan in FIN-WAIT-2, and then keeps sending into it.
+        stack
+            .close_tcp_socket(orphan, at(2))
+            .expect("close should start the FIN sequence");
+        assert!(
+            settle(&mut stack, 2)
+                .iter()
+                .any(|frame| frame.flags.contains(TcpFlags::FIN))
+        );
+        flow_receive_payload(
+            &mut stack,
+            0,
+            TcpFlags::ACK.union(TcpFlags::PSH),
+            FLOW_PEER_SEQUENCE + 1,
+            FLOW_LOCAL_NEXT + 1,
+            b"nobody reads this",
+            2,
+        );
+
+        for _ in 0..MAX_OUTBOUND_FRAMES {
+            stack
+                .queue_arp_reply(FLOW_LOCAL, FLOW_PEER, PEER_MAC)
+                .expect("filler frame should be queued");
+        }
+        stack
+            .drive_tcp(at(2))
+            .expect("a full outbound queue ends the turns, not the drive");
+        assert!(
+            stack.tcp_connect_state(orphan).is_ok(),
+            "the orphan keeps its slot until its reset has room"
+        );
+
+        assert!(drain_flow_frames(&mut stack).is_empty());
+        let frames = settle(&mut stack, 2);
+        assert!(
+            frames
+                .iter()
+                .any(|frame| frame.flags.contains(TcpFlags::RST)),
+            "{frames:?}"
+        );
+        assert_eq!(
+            stack.tcp_connect_state(orphan),
+            Err(StackError::UnknownSocket)
+        );
+    }
+
+    #[test]
+    fn a_reused_socket_slot_does_not_inherit_its_predecessors_events() {
+        let mut stack = flow_stack(true);
+        let first = establish_flows(&mut stack, 1, false)[0];
+        while stack.take_event().is_some() {}
+        // The peer resets the connection, which owes the owner a close
+        // event; the owner drops the socket without draining it.
+        flow_receive(&mut stack, 0, TcpFlags::RST, FLOW_PEER_SEQUENCE + 1, 0, 2);
+        stack
+            .remove_tcp_socket(first, at(2))
+            .expect("the closed socket should be removed");
+
+        let second = flow_connect(&mut stack, 1);
+        assert_eq!(second, first, "the slot is handed straight back out");
+        assert_eq!(stack.take_event(), None);
+    }
+
+    #[test]
+    fn a_reused_socket_slot_reports_its_own_events() {
+        let mut stack = flow_stack(true);
+        let sockets = establish_flows(&mut stack, 2, false);
+        while stack.take_event().is_some() {}
+        // Both connections are reset; the first slot is reused before
+        // the owner drains, and the new socket is then reset in turn.
+        for flow in 0..2 {
+            flow_receive(
+                &mut stack,
+                flow,
+                TcpFlags::RST,
+                FLOW_PEER_SEQUENCE + 1,
+                0,
+                2,
+            );
+        }
+        stack
+            .remove_tcp_socket(sockets[0], at(2))
+            .expect("the closed socket should be removed");
+        let reused = flow_connect(&mut stack, 2);
+        assert_eq!(reused, sockets[0]);
+        stack.drive_tcp(at(2)).expect("the SYN should be queued");
+        flow_receive(
+            &mut stack,
+            2,
+            TcpFlags::RST.union(TcpFlags::ACK),
+            0,
+            FLOW_LOCAL_NEXT,
+            2,
+        );
+
+        let mut events = Vec::new();
+        while let Some(event) = stack.take_event() {
+            events.push(event);
+        }
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(events.contains(&StackEvent::TcpClosed { socket: sockets[1] }));
+        assert!(events.contains(&StackEvent::TcpClosed { socket: reused }));
     }
 }

@@ -717,6 +717,60 @@ mod tests {
             .collect()
     }
 
+    /// Creates of one path that race on several processors: one wins,
+    /// every other is told the name exists, and none panics. Each round
+    /// races the four ways a name comes into being.
+    #[test]
+    fn racing_creates_of_one_path_leave_one_winner() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        const RACERS: usize = 8;
+        const ROUNDS: usize = 200;
+
+        let fs = tree();
+        block_on(fs.open(path("existing"), OpenFlags::CREATE, 0)).expect("creates");
+        for round in 0..ROUNDS {
+            let name = alloc::format!("raced-{round}");
+            let barrier = Barrier::new(RACERS);
+            let outcomes: Vec<Result<(), FsError>> = thread::scope(|scope| {
+                let racers: Vec<_> = (0..RACERS)
+                    .map(|racer| {
+                        let (fs, name, barrier) = (&fs, &name, &barrier);
+                        scope.spawn(move || {
+                            let new = path(name);
+                            barrier.wait();
+                            block_on(async {
+                                match racer % 4 {
+                                    0 => fs
+                                        .open(new, OpenFlags::CREATE | OpenFlags::EXCLUSIVE, 1)
+                                        .await
+                                        .map(drop),
+                                    1 => fs.create_directory(new, 1).await,
+                                    2 => fs.symlink("existing", new, 1).await,
+                                    _ => fs.link(path("existing"), new, 1).await,
+                                }
+                            })
+                        })
+                    })
+                    .collect();
+                racers
+                    .into_iter()
+                    .map(|racer| racer.join().expect("no create panics"))
+                    .collect()
+            });
+            let winners = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
+            assert_eq!(winners, 1, "round {round}: {outcomes:?}");
+            assert!(
+                outcomes
+                    .iter()
+                    .all(|outcome| matches!(outcome, Ok(()) | Err(FsError::Exists))),
+                "round {round}: {outcomes:?}"
+            );
+            block_on(fs.stat(path(&name))).expect("the winner's node is there");
+        }
+    }
+
     #[test]
     fn creates_writes_and_reads_back_positionally() {
         let fs = tree();

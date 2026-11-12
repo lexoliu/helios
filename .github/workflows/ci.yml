@@ -2,6 +2,8 @@ name: CI
 
 on:
   pull_request:
+    # `ready_for_review` runs the full selection a draft skipped.
+    types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [dev]
   workflow_dispatch:
@@ -25,7 +27,9 @@ jobs:
   # lane to the surfaces it reads; the filters below name those surfaces
   # by path. A skipped lane reports as skipped, which a required check
   # counts as passing; no ruleset on `dev` requires a lane of this
-  # workflow. A dispatch and a push to `dev` run every lane.
+  # workflow. A dispatch and a push to `dev` run every lane. A draft pull
+  # request is not a merge candidate and runs `lint-fmt` alone; marking
+  # it ready for review runs the rest.
   #
   # It also says whether the change touches what fixes the kernel
   # profile's format (the profdata header check, the guest's raw writer)
@@ -113,14 +117,16 @@ jobs:
       - id: select
         env:
           CHANGED: ${{ steps.filter.outputs.changes || 'null' }}
+          DRAFT: ${{ github.event.pull_request.draft == true }}
         run: |
           set -euo pipefail
-          lanes="$(jq -c --argjson changed "${CHANGED}" '
+          lanes="$(jq -c --argjson changed "${CHANGED}" --argjson draft "${DRAFT}" '
             to_entries
             | map(select($changed == null
                 or (.value.surfaces + ["shared", "pin"]
                     | any(. as $surface | $changed | index($surface)))))
-            | map(.key)' .github/ci-lanes.json)"
+            | map(.key)
+            | if $draft then map(select(. == "lint-fmt")) else . end' .github/ci-lanes.json)"
           checks="$(jq -c --argjson lanes "${lanes}" '
             to_entries
             | map(select(.value.command and (.key as $name | $lanes | index($name))))
@@ -132,11 +138,12 @@ jobs:
 
   # The collection a `profile_format` change spends in place of dev's
   # profile: the same workflow `bench-suite.yml` calls, on this run's
-  # commit, uploaded under the stable artifact name.
+  # commit, uploaded under the stable artifact name. `smoke-x86-64` is its
+  # only reader, so a run that skips that lane (a draft) skips this too.
   kernel-profile:
     name: kernel-profile
     needs: changes
-    if: needs.changes.outputs.profile_format == 'true'
+    if: needs.changes.outputs.profile_format == 'true' && contains(fromJSON(needs.changes.outputs.lanes), 'smoke-x86-64')
     permissions:
       contents: read
     uses: ./.github/workflows/kernel-profile.yml
@@ -422,6 +429,38 @@ jobs:
             shell -c 'curl http://detectportal.firefox.com/success.txt' 2>&1 > curl-smoke.out | tee "$runtime/inspector.log"
           cat curl-smoke.out
           grep -Fqx success curl-smoke.out
+      - name: Fetch over TLS with curl
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          # Without this the step reports tee's status, not the
+          # command's, and a runner script that fails is invisible.
+          set -o pipefail
+          # The same fetch through the plugin's TLS transport: the
+          # handshake, the certificate chain against the compiled-in
+          # roots, and the validity window against the wall clock the
+          # platform RTC seeded. The same boot then fetches from three
+          # origins that each present a bad certificate (expired, issued
+          # for another name, self-signed), which must each fail as
+          # `tls-certificate-error`; the trailing `true` keeps the last
+          # failed fetch's exit status from failing the step before the
+          # log is read.
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/curl-https"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
+            --accel tcg \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger \
+            --boot-program curl --boot-program http-client --no-compiler-plugin \
+            shell -c 'curl https://detectportal.firefox.com/success.txt; curl https://expired.badssl.com/; curl https://wrong.host.badssl.com/; curl https://self-signed.badssl.com/; true' 2>&1 > curl-https-smoke.out | tee "$runtime/inspector.log"
+          cat curl-https-smoke.out
+          grep -Fqx success curl-https-smoke.out
+          # curl prints the error code through its Debug form
+          # (`ErrorCode::TlsCertificateError`), on whichever stream the
+          # inspector relays the guest's stderr to.
+          test "$(cat curl-https-smoke.out "$runtime/inspector.log" | grep -Fc 'http request failed: ErrorCode::TlsCertificateError')" -eq 3
       - name: Upload the inspector runtime directories
         if: failure()
         uses: actions/upload-artifact@v4
@@ -1169,6 +1208,30 @@ jobs:
             2>&1 > curl-smoke.out | tee "$runtime/inspector.log"
           cat curl-smoke.out
           grep -Fqx success curl-smoke.out
+      - name: Fetch over TLS with curl
+        shell: bash
+        working-directory: helios
+        run: |
+          # Without this the step reports tee's status, not the
+          # command's, and a runner script that fails is invisible.
+          set -o pipefail
+          # The counterpart of smoke-riscv64's TLS step, under KVM, with the
+          # same three bad-certificate fetches.
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/curl-https"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            --accel kvm \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger \
+            --boot-program curl --boot-program http-client --no-compiler-plugin \
+            shell -c 'curl https://detectportal.firefox.com/success.txt; curl https://expired.badssl.com/; curl https://wrong.host.badssl.com/; curl https://self-signed.badssl.com/; true' \
+            2>&1 > curl-https-smoke.out | tee "$runtime/inspector.log"
+          cat curl-https-smoke.out
+          grep -Fqx success curl-https-smoke.out
+          # curl prints the error code through its Debug form
+          # (`ErrorCode::TlsCertificateError`), on whichever stream the
+          # inspector relays the guest's stderr to.
+          test "$(cat curl-https-smoke.out "$runtime/inspector.log" | grep -Fc 'http request failed: ErrorCode::TlsCertificateError')" -eq 3
       - name: Draw on the display and capture the scanout
         timeout-minutes: 5
         shell: bash

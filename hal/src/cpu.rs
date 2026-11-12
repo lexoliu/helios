@@ -1,4 +1,5 @@
 use core::ptr::NonNull;
+use core::sync::atomic::AtomicU8;
 use core::time::Duration;
 
 use strength_reduce::StrengthReducedU64;
@@ -266,6 +267,44 @@ pub enum TimerInterrupt {
     Periodic,
 }
 
+/// The control-flow integrity a backend brought up for code that runs at
+/// the kernel's privilege level.
+///
+/// # Concurrency contract
+///
+/// The backend computes the value on the bootstrap processor before the
+/// `Cpu` reaches the kernel and never changes it. It enables every
+/// mechanism the value names on each processor before that processor runs
+/// anything the kernel schedules and before [`Cpu::start_processor`]
+/// returns for it, and refuses to start a processor that lacks one.
+/// Reading the value is a copy, on any processor and in any context.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ControlFlowIntegrity {
+    /// The backend's image signs every return address a non-leaf function
+    /// saves on the stack and authenticates it before returning, with one
+    /// instruction key shared by every processor (Arm FEAT_PAuth, key A).
+    /// Other code is authenticated only where it was compiled to sign its
+    /// own return addresses; a return address saved without signing (an
+    /// exception frame, assembly) is not covered.
+    pub return_addresses: Option<ReturnAddressSigning>,
+}
+
+impl ControlFlowIntegrity {
+    /// A backend that enabled no control-flow integrity mechanism.
+    pub const NONE: Self = Self {
+        return_addresses: None,
+    };
+}
+
+/// How a processor reacts to a return address that fails authentication.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReturnAddressSigning {
+    /// A failed authentication raises an exception at the authenticating
+    /// instruction (Arm FEAT_FPAC); without it the instruction leaves a
+    /// pointer that faults where it is used.
+    pub faults_at_authentication: bool,
+}
+
 pub trait Cpu: Send + Sync + 'static {
     /// How this platform's timer interrupt is scheduled.
     ///
@@ -295,11 +334,80 @@ pub trait Cpu: Send + Sync + 'static {
     /// stronger fairness guarantee.
     fn park_current(&self);
 
+    /// What [`Cpu::mask_to_wake_only`] answers: the narrowed mask, put
+    /// back when the value drops. It is the calling processor's own
+    /// register state, so a backend's type is not `Send`.
+    type WakeOnlyMask;
+
+    /// Narrows the calling processor's interrupt mask to the wake
+    /// [`Cpu::wake_processor`] raises and the cross-processor maintenance
+    /// IPIs (a TLB shootdown), and holds it until the answer drops.
+    ///
+    /// Every other source (a device interrupt, a timer tick, a doorbell)
+    /// stays pending in the interrupt controller and is taken when the
+    /// answer drops. This is how a processor is held off from code that
+    /// runs in a handler while it stays able to take the IPIs another
+    /// processor's work depends on: the shootdown a processor broadcasts
+    /// is acknowledged by every processor that has run in the space, so a
+    /// processor that is held must keep taking it, and a processor that
+    /// broadcasts one must have interrupts enabled. The mask is a hardware
+    /// property (a priority mask that lets only the wake class through, a
+    /// supervisor interrupt-enable set restricted to the software
+    /// interrupt), and it names no consumer.
+    ///
+    /// The mask the answer restores is the one it replaced. It composes
+    /// with the interrupt flag and does not touch it: it may be raised
+    /// with the flag set or clear. A caller that must not be interrupted
+    /// at all in the window between its own announcement and the mask
+    /// masks the flag first
+    /// ([`crate::critical_section::LocalInterruptsMasked`]).
+    fn mask_to_wake_only(&self) -> Self::WakeOnlyMask;
+
+    /// Parks the current processor until `word` no longer reads `held`,
+    /// with every interrupt source masked except the ones that carry no
+    /// driver or task code: the wake [`Cpu::wake_processor`] raises and
+    /// the cross-processor maintenance IPIs (a TLB shootdown).
+    ///
+    /// This is what lets a machine hold a processor still while another
+    /// one works alone: no device interrupt, timer tick or doorbell
+    /// reaches the parked processor, so nothing it would run can touch
+    /// state the working processor owns. It is a hardware property (a
+    /// priority mask that lets only the wake class through, a supervisor
+    /// interrupt-enable set restricted to the software interrupt), and it
+    /// names no consumer. The mask is [`Cpu::mask_to_wake_only`], held for
+    /// the length of the wait.
+    ///
+    /// # Contract
+    ///
+    /// * The caller has masked interrupts on this processor
+    ///   ([`crate::critical_section::LocalInterruptsMasked`]) before it
+    ///   announces to anyone that it is parked, and holds nothing a wake
+    ///   handler needs. Because the interrupt flag is already clear, no
+    ///   handler can run between the announcement and the finer mask
+    ///   this call installs. The call enables interrupts only while the
+    ///   finer mask is in place, to take the wake, and leaves the flag
+    ///   as it found it.
+    /// * `word` is tested with `Acquire` after the finer mask is in place
+    ///   and again after every wake, so a store another processor made
+    ///   before it called [`Cpu::wake_processor`] is seen by the time
+    ///   this returns. The test comes before the wait on every backend,
+    ///   and a wake raised between them stays pending and completes the
+    ///   wait, so a store made between the test and the wait is not lost.
+    /// * A wake that does not change `word` is absorbed and the wait
+    ///   resumes; the call returns only when the word has changed.
+    /// * The finer mask is lifted before it returns. Interrupts that were
+    ///   held off by it then arrive when the caller's own mask drops, as
+    ///   ordinary interrupts.
+    fn park_wake_only(&self, word: &AtomicU8, held: u8);
+
     /// Starts execution on a secondary processor.
     ///
     /// The kernel calls this during bootstrap for every processor other than the
     /// bootstrap processor. Implementations may panic if the platform cannot start the
     /// requested processor, because that is a real bring-up failure.
+    ///
+    /// The call returns only after that processor has enabled every
+    /// mechanism [`Cpu::control_flow_integrity`] names.
     fn start_processor(&self, processor: ProcessorId);
 
     /// Nudges a processor that may currently be parked so it can observe newly
@@ -385,6 +493,15 @@ pub trait Cpu: Send + Sync + 'static {
         false
     }
 
+    /// The control-flow integrity this backend enabled on every processor.
+    ///
+    /// The default [`ControlFlowIntegrity::NONE`] means the backend enabled
+    /// nothing. A backend that enables a mechanism reports it here, and the
+    /// value is the same on every processor.
+    fn control_flow_integrity(&self) -> ControlFlowIntegrity {
+        ControlFlowIntegrity::NONE
+    }
+
     /// Zero-initializes `size` bytes starting at `ptr`.
     ///
     /// The default implementation falls through to
@@ -416,9 +533,22 @@ pub trait Cpu: Send + Sync + 'static {
 mod tests {
     use core::time::Duration;
 
-    use super::Timebase;
+    use super::{ControlFlowIntegrity, ReturnAddressSigning, Timebase};
 
     const GIGAHERTZ: u64 = 1_000_000_000;
+
+    #[test]
+    fn no_control_flow_integrity_names_no_mechanism() {
+        assert_eq!(ControlFlowIntegrity::NONE.return_addresses, None);
+        assert_ne!(
+            ControlFlowIntegrity::NONE,
+            ControlFlowIntegrity {
+                return_addresses: Some(ReturnAddressSigning {
+                    faults_at_authentication: false,
+                }),
+            }
+        );
+    }
 
     #[test]
     fn infinite_guest_timeout_saturates_instead_of_panicking() {

@@ -239,16 +239,16 @@ where
             .map_or(p1::errno::NOTCAPABLE, |_| p1::errno::SUCCESS)
     }
 
-    pub(super) fn require_spawn_authority(&self) -> i32 {
+    pub(super) fn require_spawn_authority(&self) -> Result<SpawnAuthority, i32> {
         self.authority
             .derive_spawn_authority()
-            .map_or(p1::errno::NOTCAPABLE, |_| p1::errno::SUCCESS)
+            .map_err(|_| p1::errno::NOTCAPABLE)
     }
 
-    pub(super) fn require_exec_authority(&self) -> i32 {
+    pub(super) fn require_exec_authority(&self) -> Result<ExecAuthority, i32> {
         self.authority
             .derive_exec_authority()
-            .map_or(p1::errno::NOTCAPABLE, |_| p1::errno::SUCCESS)
+            .map_err(|_| p1::errno::NOTCAPABLE)
     }
 
     pub(super) fn require_fork_authority(&self) -> i32 {
@@ -357,10 +357,7 @@ where
         if let Some(stop) = self.signals().owed_stop() {
             return Err(stop);
         }
-        if let Some(reason) = self.activity.pending_kill() {
-            return Err(wasmtime::Error::from(crate::InstanceKilled { reason }));
-        }
-        Ok(wasmtime::InterruptAction::Yield)
+        crate::wasmtime_adapter::preemption::kill_or_yield(self.activity.pending_kill())
     }
 
     /// Deliver stdout/stderr bytes to a kernel-served sink, or hand
@@ -817,8 +814,8 @@ where
              -> i32 {
                 fill_random(
                     caller.data().memory(),
-                    &caller.data().shared.entropy,
-                    caller.data().runtime_state.root_entropy(),
+                    &caller.data().context.shared.entropy,
+                    caller.data().context.runtime_state.root_entropy(),
                     GuestAddress::wasm32(ptr as u32),
                     len as u32,
                 )
@@ -842,7 +839,7 @@ where
                 write_u64(
                     caller.data().memory(),
                     GuestAddress::wasm32(ptr as u32),
-                    crate::monotonic_nanos(&caller.data().cpu),
+                    crate::monotonic_nanos(&caller.data().context.cpu),
                 )
             },
         )
@@ -895,7 +892,7 @@ where
              count: i32,
              size: i32|
              -> i32 {
-                let thread_count = compiler_plugin_worker_threads(&caller.data().cpu);
+                let thread_count = compiler_plugin_worker_threads(&caller.data().context.cpu);
                 let env_len = compiler_rayon_env_len(thread_count);
                 let memory = caller.data().memory();
                 let first = write_u32(memory, GuestAddress::wasm32(count as u32), 1);
@@ -958,8 +955,8 @@ where
             "wasi",
             "thread-spawn",
             |caller: Caller<'_, CompilerCoreStore<CpuImpl, Net, HostFs>>, start_arg: i32| -> i32 {
-                let store_data = caller.data().clone();
-                let next = store_data.shared.next_thread_id.try_update(
+                let context = caller.data().context.clone();
+                let next = context.shared.next_thread_id.try_update(
                     AtomicOrdering::Relaxed,
                     AtomicOrdering::Relaxed,
                     |value| (value <= 0x1fff_fffe).then_some(value + 1),
@@ -968,55 +965,55 @@ where
                     return -1;
                 };
                 let thread_id = previous + 1;
-                let instance_pre = store_data
+                let instance_pre = context
                     .shared
                     .instance_pre
                     .get()
                     .unwrap_or_else(|| panic!("compiler thread-spawn called before instance pre"))
                     .clone();
-                let spawner = store_data.spawner.clone();
-                let shared = store_data.shared.clone();
-                let spawned_ns = crate::monotonic_nanos(&store_data.cpu);
+                let spawner = context.spawner.clone();
+                let shared = context.shared.clone();
+                let spawned_ns = crate::monotonic_nanos(&context.cpu);
                 let task = spawner.spawn(async move {
-                    let started_ns = crate::monotonic_nanos(&store_data.cpu);
+                    let started_ns = crate::monotonic_nanos(&context.cpu);
                     let processor = helios_hal::cpu::current_processor().id();
-                    let mut store =
-                        wasmtime::Store::new(instance_pre.module().engine(), store_data);
-                    let _interrupts = configure_compiler_core_store(&mut store);
-                    let thread_started_ticks = store.data().cpu.now().ticks();
-                    let (result, instantiated_ns) = match instance_pre
-                        .instantiate_async(&mut store)
+                    // The worker's own store, accounted and driven like the
+                    // compile's main store and every program's.
+                    let mut store = wasmtime::Store::new(
+                        instance_pre.module().engine(),
+                        CompilerCoreStore::new(context),
+                    );
+                    let drive = configure_compiler_core_store(&mut store);
+                    let (result, instantiated_ns) = match drive
+                        .instantiate(&mut store, &instance_pre)
                         .await
                     {
                         Ok(instance) => {
                             let start = instance
                                 .get_typed_func::<(i32, i32), ()>(&mut store, "wasi_thread_start");
-                            let instantiated_ns = crate::monotonic_nanos(&store.data().cpu);
+                            let instantiated_ns = crate::monotonic_nanos(&store.data().context.cpu);
                             let result = match start {
                                 Ok(start) => {
-                                    start.call_async(&mut store, (thread_id, start_arg)).await
+                                    drive.call(&mut store, &start, (thread_id, start_arg)).await
                                 }
                                 Err(error) => Err(error),
                             };
                             (result, instantiated_ns)
                         }
                         Err(error) => {
-                            let instantiated_ns = crate::monotonic_nanos(&store.data().cpu);
+                            let instantiated_ns = crate::monotonic_nanos(&store.data().context.cpu);
                             (Err(error), instantiated_ns)
                         }
                     };
-                    let finished_ns = crate::monotonic_nanos(&store.data().cpu);
-                    let thread_elapsed = store
-                        .data()
-                        .cpu
-                        .now()
-                        .ticks()
-                        .saturating_sub(thread_started_ticks);
-                    store.data().record_user_ticks(thread_elapsed);
-                    if let Err(error) = result {
+                    let finished_ns = crate::monotonic_nanos(&store.data().context.cpu);
+                    // A trap here is the compile's: the other stores are told
+                    // by the condemnation, and the requester gets this error.
+                    let trap = result.err().and_then(|error| {
                         tracing::error!(thread_id, "compiler plugin thread failed: {error:#}");
-                    }
+                        store.data().context.condemn_for_store_end(error)
+                    });
                     CompilerThreadReport {
+                        trap,
                         thread_id,
                         processor,
                         spawned_ns,
@@ -5163,7 +5160,7 @@ mod tests {
     /// closes its stream straight from `WasixOwnedTcpStream::drop` and
     /// never went through that drain. Its FIN therefore sat in the
     /// queue until the pump's park expired, which on a guest with
-    /// nothing else to send is `DHCP_RETRANSMIT_NANOS` — a second of
+    /// nothing else to send is `CONFIGURATION_POLL_NANOS` — a second of
     /// silence the peer spends holding an established connection
     /// (#231). This asks the park, not the wire: the previous test
     /// already proves the FIN is queued, and what was wrong was when it
