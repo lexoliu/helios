@@ -271,22 +271,34 @@ pub(super) fn p1_iov_bytes(
     Ok(bytes)
 }
 
-/// Copies the guest bytes `ranges` name into `destination`, which is
-/// exactly as long as they are together: a gathered write's one copy.
-pub(super) fn p1_gather_into(
+/// Copies into `destination` the guest bytes `ranges` name together,
+/// starting `at` bytes into them: one region of a gathered write's one
+/// copy. The ranges hold at least `at + destination.len()` bytes.
+pub(super) fn p1_gather_from(
     memory: Preview1Memory,
     ranges: &[(usize, usize)],
+    mut at: usize,
     destination: &mut [u8],
 ) {
     let mut rest = destination;
     for source in p1_guest_slices(memory, ranges) {
-        let (head, tail) = rest.split_at_mut(source.len());
-        head.copy_from_slice(source);
+        if rest.is_empty() {
+            break;
+        }
+        if at >= source.len() {
+            at -= source.len();
+            continue;
+        }
+        let source = &source[at..];
+        at = 0;
+        let count = source.len().min(rest.len());
+        let (head, tail) = rest.split_at_mut(count);
+        head.copy_from_slice(&source[..count]);
         rest = tail;
     }
     debug_assert!(
         rest.is_empty(),
-        "a gathered write's destination is its length"
+        "a gathered write's ranges cover every region of it"
     );
 }
 
@@ -298,7 +310,8 @@ fn p1_guest_slices(
     ranges.iter().map(move |&(start, len)| {
         // SAFETY: each range was checked against the guest memory's length
         // (`p1_iovs_memory_ranges`), and guest memory neither moves nor
-        // shrinks during the host call that holds `memory`.
+        // shrinks during the host call that holds `memory`, its awaits
+        // included.
         unsafe { core::slice::from_raw_parts((memory.base as *const u8).add(start), len) }
     })
 }

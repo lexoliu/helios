@@ -2700,9 +2700,13 @@ where
     let now_nanos = caller.data().now_nanos();
     let end = {
         let file = wasi_fs::writable_file(&namespace, &descriptor).map_err(p1_errno_from_fs)?;
-        wasi_fs::write_resolved_with(&file, position, layout.byte_len, now_nanos, |destination| {
-            p1_gather_into(memory, &ranges, destination)
-        })
+        wasi_fs::write_resolved_with(
+            &file,
+            position,
+            layout.byte_len,
+            now_nanos,
+            |at, destination| p1_gather_from(memory, &ranges, at, destination),
+        )
         .await
         .map_err(p1_errno_from_fs)?
     };
