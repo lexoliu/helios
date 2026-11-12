@@ -36,6 +36,7 @@ use alloc::vec::Vec;
 use core::num::NonZeroUsize;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use arrayvec::ArrayVec;
 use lru::LruCache;
 use spin::Mutex as SpinMutex;
 
@@ -65,7 +66,7 @@ const DIRECTORY_CACHE_ENTRY_BUDGET: usize = 4096;
 /// bound rather than one the server stated. It sits far below the open
 /// descriptor budget a `virtfs` export keeps before it starts reclaiming
 /// fids behind the client's back.
-const READ_FID_POOL_ENTRIES: usize = 32;
+pub(super) const READ_FID_POOL_ENTRIES: usize = 32;
 
 /// How the host share's caches have served the kernel since boot.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -372,6 +373,42 @@ impl HostFsCache {
             Counters::bump(&self.counters.evictions);
             entry.fid
         })
+    }
+
+    /// Drops every entry in every table, and hands back the read fids
+    /// the pool was parking.
+    ///
+    /// A restore calls it: the entries were stamped with monotonic ages
+    /// that did not advance while the machine was stopped, so none of
+    /// them can be trusted to be inside its TTL. A parked fid is still
+    /// open on the server unless the session itself was lost, so the
+    /// caller owes each a `Tclunk` or, for a lost session, nothing.
+    pub(super) fn clear(&self) -> ArrayVec<u32, READ_FID_POOL_ENTRIES> {
+        let mut dropped = 0;
+        {
+            let mut attributes = self.attributes.lock();
+            dropped += attributes.len();
+            attributes.clear();
+        }
+        {
+            let mut directories = self.directories.lock();
+            dropped += directories.listings.len();
+            directories.listings.clear();
+            directories.resident_entries = 0;
+        }
+        let mut parked = ArrayVec::new();
+        {
+            let mut read_fids = self.read_fids.lock();
+            while let Some((_, entry)) = read_fids.pop_lru() {
+                parked.push(entry.fid);
+            }
+        }
+        dropped += parked.len();
+        Counters::add(
+            &self.counters.invalidations,
+            u64::try_from(dropped).expect("a cache entry count fits in u64"),
+        );
+        parked
     }
 
     /// Drops everything the cache knows about `path` after the kernel
