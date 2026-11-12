@@ -45,6 +45,7 @@ pub(crate) fn install<WatchdogImpl>(
     pci: &PciRoot,
     address: PciAddress,
     physical_memory_offset: usize,
+    generation: helios_kernel::MachineGenerationHandle,
 ) -> BalloonHandle
 where
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
@@ -60,7 +61,7 @@ where
         panic!("failed to initialize the virtio-balloon function at {address}: {error}")
     });
     let device = Arc::new(device);
-    let handle = helios_kernel::install_memory_balloon(kernel, device.clone());
+    let handle = helios_kernel::install_memory_balloon(kernel, device.clone(), generation);
     // Local, like the balloon tasks it wakes: `install_memory_balloon`
     // keeps those on the processor that brought the device up.
     kernel.spawn_local_detached(poll_interrupt_status(device, kernel.timer()));

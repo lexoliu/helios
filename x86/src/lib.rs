@@ -552,7 +552,13 @@ fn install_pci_devices<WatchdogImpl>(
         tracing::info!("no virtio-gpu function on the PCI bus; this machine has no display");
     }
     if let Some(address) = balloon_function {
-        let handle = balloon::install(kernel, pci, address, physical_memory_offset);
+        let handle = balloon::install(
+            kernel,
+            pci,
+            address,
+            physical_memory_offset,
+            debug_state.machine_generation_handle(),
+        );
         debug_state.install_memory_balloon(handle);
     }
     if input_functions.is_empty() {
