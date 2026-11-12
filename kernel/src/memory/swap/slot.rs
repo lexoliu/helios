@@ -69,6 +69,12 @@ pub(super) const GRANULES_PER_FRAME: usize = PhysFrame::SIZE / GRANULE_BYTES;
 /// Bytes ahead of an object's payload: its slot index, little endian.
 pub(super) const OBJECT_HEADER_BYTES: usize = 4;
 
+/// Granules an object takes: its header and `compressed_len` bytes of LZ4
+/// block, rounded up.
+pub(super) const fn object_granules(compressed_len: usize) -> usize {
+    (OBJECT_HEADER_BYTES + compressed_len).div_ceil(GRANULE_BYTES)
+}
+
 /// Slots in one leaf, and entries in one interior node.
 const FANOUT: usize = 512;
 const FANOUT_BITS: u32 = FANOUT.trailing_zeros();
@@ -156,7 +162,7 @@ pub(super) struct StoredObject {
     not(test),
     expect(
         dead_code,
-        reason = "the store that places objects is the next commit's"
+        reason = "only the store uses it, and the eviction ladder that drives the store is the next stage"
     )
 )]
 impl StoreFrameIndex {
@@ -178,7 +184,7 @@ impl StoreFrameIndex {
     not(test),
     expect(
         dead_code,
-        reason = "the store that places objects is the next commit's"
+        reason = "only the store uses it, and the eviction ladder that drives the store is the next stage"
     )
 )]
 impl Granule {
@@ -196,7 +202,7 @@ impl Granule {
     not(test),
     expect(
         dead_code,
-        reason = "the store that places objects is the next commit's"
+        reason = "only the store uses it, and the eviction ladder that drives the store is the next stage"
     )
 )]
 impl CompressedLen {
@@ -210,7 +216,7 @@ impl CompressedLen {
     not(test),
     expect(
         dead_code,
-        reason = "the store that places objects is the next commit's"
+        reason = "only the store uses it, and the eviction ladder that drives the store is the next stage"
     )
 )]
 impl StoredObject {
@@ -268,8 +274,7 @@ impl Gate {
 
     /// The length of a compressed block, if it passes.
     pub(super) fn accept(&self, compressed_len: usize) -> Option<CompressedLen> {
-        let granules = (OBJECT_HEADER_BYTES + compressed_len).div_ceil(GRANULE_BYTES);
-        if granules > usize::from(self.accept_granules) {
+        if object_granules(compressed_len) > usize::from(self.accept_granules) {
             return None;
         }
         // At most 63 granules less the header: 4028 bytes, 12 bits.

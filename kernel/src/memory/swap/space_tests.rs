@@ -8,22 +8,20 @@
 //! the frame, the rollback of a refused reinstatement, the orphan queue
 //! and the ageing walk.
 
-use alloc::alloc::{Layout, alloc_zeroed};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, Once};
 
 use helios_hal::cpu::ProcessorId;
 use helios_hal::pmm::PhysFrame;
 use helios_hal::vmm::{AddressSpaceError, PageAge, PageFlags, SwapToken, VirtAddr, VirtRange};
 
+use super::test_pool::{allocated_bytes, serialise};
 use super::{AGE_BATCH_PAGES, SwapLeafFormat, SwapSpace};
 use crate::memory::{
-    MemoryOwner, ReservationTracker, allocate_user_frame_zeroed_on, allocate_user_memory_pool,
-    deallocate_user_frame_on, install_user_memory_pool, user_heap_stats,
+    MemoryOwner, ReservationTracker, allocate_user_frame_zeroed_on, deallocate_user_frame_on,
 };
 
 const PAGE: usize = PhysFrame::SIZE;
@@ -31,7 +29,6 @@ const PAGE: usize = PhysFrame::SIZE;
 /// virtual address, only the frames its leaves name.
 const BASE: usize = 0x4000_0000;
 const MODEL_PAGES: usize = 512;
-const POOL_BYTES: usize = 4 * 1024 * 1024;
 const OWNER: MemoryOwner = MemoryOwner::new(1);
 const RW: PageFlags = PageFlags::READ.union(PageFlags::WRITE);
 
@@ -51,30 +48,6 @@ fn page_addr(page: usize) -> VirtAddr {
 
 fn swap_word(token: SwapToken) -> u64 {
     SWAP_MARKER | (u64::from(token.raw()) << SWAP_TOKEN_SHIFT)
-}
-
-/// The tests share one process-global pool when run as threads, and read
-/// its accounting, so they take turns.
-fn serialise() -> MutexGuard<'static, ()> {
-    static TURN: Mutex<()> = Mutex::new(());
-    static POOL: Once = Once::new();
-    let guard = TURN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    POOL.call_once(|| {
-        let layout = Layout::from_size_align(POOL_BYTES, PAGE).expect("pool layout");
-        // Leaked on purpose: the pool is a `&'static` for the life of the
-        // test process.
-        // SAFETY: the layout has a non-zero size.
-        let base = unsafe { alloc_zeroed(layout) } as usize;
-        assert!(base != 0, "pool backing");
-        let pool = install_user_memory_pool(allocate_user_memory_pool());
-        pool.initialize(&[(base, base + POOL_BYTES)]);
-        pool.configure_processors(1);
-    });
-    guard
-}
-
-fn allocated_bytes() -> usize {
-    user_heap_stats().allocated_bytes
 }
 
 struct ModelFormat {

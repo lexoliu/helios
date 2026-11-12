@@ -113,6 +113,7 @@ mod leaf;
 mod slot;
 mod space;
 mod stack;
+mod store;
 
 use slot::{Claim, DiskKey, SlotAllocator, SlotIndex, SlotState, SlotTable};
 
@@ -1282,6 +1283,10 @@ mod slot_tests;
 mod space_tests;
 #[cfg(test)]
 mod stack_tests;
+#[cfg(test)]
+mod store_tests;
+#[cfg(test)]
+mod test_pool;
 
 #[cfg(test)]
 mod tests {
