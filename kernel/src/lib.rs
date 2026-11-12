@@ -8,6 +8,7 @@ extern crate std;
 
 mod audio;
 mod bootfs;
+mod bring_up;
 mod buffer;
 mod component;
 mod device;
@@ -20,6 +21,7 @@ mod input;
 mod instance;
 mod io;
 mod kernel_exception;
+mod limine_tpm_event_log;
 mod log;
 mod machine;
 mod memory;
@@ -62,6 +64,7 @@ pub use bootfs::{
     BootDirectory, BootDirectoryEntry, BootDirectoryHandleExt, BootFile, BootfsBytes,
     EmbeddedBootDirectory, EmbeddedBootFile, EmbeddedBootFs,
 };
+pub use bring_up::complete_device_future_at_bring_up;
 pub use buffer::{
     BYTES_PER_PIXEL, Buffer, BufferError, GuestMemory, MAX_VIEWS, Span, ViewError, ViewGroup,
     ViewId, ViewTable, WASM_PAGE_BYTES,
@@ -155,6 +158,7 @@ pub use kernel_exception::{
     KernelException, KernelExceptionCause, KernelExceptionDispatch, KernelNativeTrapHandler,
     dispatch_native_trap, install_native_trap_handler,
 };
+pub use limine_tpm_event_log::LimineTpmEventLogRequest;
 pub use machine::{AdvanceCause, Generation, MachineGeneration, MachineGenerationHandle};
 pub use memory::{
     AccessibilityPlan, BalloonHandle, BalloonStats, BootMemoryPlan, BootRegionSplitter,

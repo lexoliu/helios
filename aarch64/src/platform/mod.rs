@@ -120,6 +120,19 @@ pub(crate) struct ConsoleDescription {
     pub(crate) interrupt: SpiInterrupt,
 }
 
+/// The machine's TPM 2.0, as the firmware describes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TpmDescription {
+    /// Locality 0 of a TPM whose interface the firmware named.
+    Described {
+        base: u64,
+        interface: helios_tpm::InterfaceDescription,
+    },
+    /// A TPM the ACPI TPM2 table describes through a start method this
+    /// kernel does not drive.
+    Unsupported { start_method: u32 },
+}
+
 /// Which redistributor frame belongs to which processor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RedistributorAffinity {
@@ -209,6 +222,9 @@ pub(crate) struct PlatformDescription {
     pub(crate) virtio: Slots<VirtioMmioSlot, MAX_VIRTIO_MMIO_SLOTS>,
     /// Hardware no kernel driver claims, offered to driver plugins.
     pub(crate) grantable: Slots<GrantableDevice, MAX_GRANTABLE_DEVICES>,
+    /// The TPM 2.0, when the firmware describes one: the ACPI TPM2
+    /// table, or a `tcg,tpm-tis-mmio` node.
+    pub(crate) tpm: Option<TpmDescription>,
     /// The entropy the bootloader left behind, from the device tree's
     /// `/chosen/rng-seed`. ACPI has no equivalent property, so an
     /// ACPI-described machine starts from the processor's own random

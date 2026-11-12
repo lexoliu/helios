@@ -14,8 +14,8 @@ use tpm2_protocol::TpmWriter;
 use tpm2_protocol::basic::{TpmBuffer, TpmHandle, TpmUint16, TpmUint32};
 use tpm2_protocol::constant::TPM_MAX_COMMAND_SIZE;
 use tpm2_protocol::data::{
-    Tpm2bNvPublic, TpmAlgId, TpmCap, TpmRc, TpmRcBase, TpmRh, TpmSe, TpmSt, TpmaNv, TpmaSession,
-    TpmlDigestValues, TpmlPcrSelection, TpmsAuthCommand, TpmsNvPublic, TpmsPcrSelect,
+    Tpm2bNvPublic, TpmAlgId, TpmCap, TpmPt, TpmRc, TpmRcBase, TpmRh, TpmSe, TpmSt, TpmaNv,
+    TpmaSession, TpmlDigestValues, TpmlPcrSelection, TpmsAuthCommand, TpmsNvPublic, TpmsPcrSelect,
     TpmsPcrSelection, TpmtHa, TpmtSymDef, TpmuCapabilities, TpmuHa, TpmuSymKeyBits, TpmuSymMode,
 };
 use tpm2_protocol::frame::{
@@ -50,6 +50,27 @@ const SLOT_ATTRIBUTES: TpmaNv = TpmaNv::from_bits_truncate(
 /// A SHA-256 digest's size: the size of every policy digest here, of
 /// every value extended and of the secret.
 const SHA256_LEN: usize = 32;
+
+/// `TPMA_PERMANENT.ownerAuthSet` (TPM 2.0 Part 2, "TPMA_PERMANENT",
+/// bit 0): the owner hierarchy's authorization value is not empty.
+const PERMANENT_OWNER_AUTH_SET: u32 = 1 << 0;
+/// `TPMA_STARTUP_CLEAR.shEnable` (TPM 2.0 Part 2,
+/// "TPMA_STARTUP_CLEAR", bit 1): the owner (storage) hierarchy is
+/// enabled.
+const STARTUP_CLEAR_SH_ENABLE: u32 = 1 << 1;
+
+/// Whether the owner hierarchy accepts the empty authorization the
+/// sealed slot is defined and replaced with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwnerAuthorization {
+    /// The hierarchy is enabled and its authorization value is empty.
+    Accepted,
+    /// Someone set the owner's authorization value, so the empty one is
+    /// refused.
+    Set,
+    /// The owner hierarchy is disabled until the next TPM reset.
+    Disabled,
+}
 
 /// Why [`Tpm::open`] refused a TPM.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
@@ -122,7 +143,10 @@ fn malformed(operation: &'static str) -> MeasuredBootError {
     MeasuredBootError::MalformedResponse { operation }
 }
 
-fn transport_failed(operation: &'static str, error: TransportError) -> MeasuredBootError {
+pub(crate) fn transport_failed(
+    operation: &'static str,
+    error: TransportError,
+) -> MeasuredBootError {
     match error {
         TransportError::Timeout { state, waited_ms } => {
             MeasuredBootError::Timeout { state, waited_ms }
@@ -207,6 +231,47 @@ impl<T: Transport> Tpm<T> {
             return Err(OpenError::RegistersMissing { missing });
         }
         Ok(tpm)
+    }
+
+    /// The route the TPM is reached through.
+    pub const fn transport(&self) -> &T {
+        &self.transport
+    }
+
+    /// Whether the owner hierarchy accepts the empty authorization,
+    /// read from `TPM_PT_PERMANENT` and `TPM_PT_STARTUP_CLEAR`.
+    pub async fn owner_authorization(&mut self) -> Result<OwnerAuthorization, MeasuredBootError> {
+        const OPERATION: &str = "TPM2_GetCapability(TPM_CAP_TPM_PROPERTIES)";
+        // TPM_PT_STARTUP_CLEAR follows TPM_PT_PERMANENT, so one request
+        // for two properties starting at the first reads both (TPM 2.0
+        // Part 2, "TPM_PT").
+        let command = TpmGetCapabilityCommand {
+            handles: [],
+            cap: TpmCap::TpmProperties,
+            property: TpmUint32::new(TpmPt::Permanent.value()),
+            property_count: TpmUint32::new(2),
+        };
+        let response: TpmGetCapabilityResponse =
+            succeeded(OPERATION, self.execute(OPERATION, &command, &[]).await?)?;
+        let TpmuCapabilities::TpmProperties(properties) = response.capability_data.data else {
+            return Err(malformed(OPERATION));
+        };
+        let value = |wanted: TpmPt| {
+            properties
+                .iter()
+                .find(|property| property.property == wanted)
+                .map(|property| property.value.value())
+                .ok_or(malformed(OPERATION))
+        };
+        let permanent = value(TpmPt::Permanent)?;
+        let startup_clear = value(TpmPt::StartupClear)?;
+        Ok(if startup_clear & STARTUP_CLEAR_SH_ENABLE == 0 {
+            OwnerAuthorization::Disabled
+        } else if permanent & PERMANENT_OWNER_AUTH_SET != 0 {
+            OwnerAuthorization::Set
+        } else {
+            OwnerAuthorization::Accepted
+        })
     }
 
     /// Sends one command and reads its response, returning the TPM's

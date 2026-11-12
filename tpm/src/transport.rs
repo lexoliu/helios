@@ -97,12 +97,22 @@ pub enum InterfaceError {
 /// Buffer (TCG ACPI Specification, TPM2 table "Start Method"; QEMU
 /// `include/hw/acpi/tpm.h` `TPM2_START_METHOD_MMIO` and
 /// `TPM2_START_METHOD_CRB`).
-const ACPI_START_METHOD_TIS: u32 = 6;
-const ACPI_START_METHOD_CRB: u32 = 7;
+pub(crate) const ACPI_START_METHOD_TIS: u32 = 6;
+pub(crate) const ACPI_START_METHOD_CRB: u32 = 7;
 
 /// The device tree `compatible` of the FIFO interface over MMIO, the
 /// one QEMU writes for its `tpm-tis-device` (`hw/core/sysbus-fdt.c`).
 const DT_COMPATIBLE_TIS: &str = "tcg,tpm-tis-mmio";
+
+impl<W, C> Interface<W, C> {
+    /// The interface's name, as the PTP calls it.
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::Crb(_) => "CRB",
+            Self::Tis(_) => "FIFO",
+        }
+    }
+}
 
 impl<W: RegisterWindow, C: Clock> Interface<W, C> {
     /// The interface an ACPI TPM2 table's start method names.

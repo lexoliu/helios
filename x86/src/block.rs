@@ -54,9 +54,9 @@ pub(crate) fn discover(pci: &PciRoot) -> Vec<PciAddress> {
 
 /// Brings up every block function and hands them to the kernel, which
 /// gives each the role its serial names.
-pub(crate) fn install<WatchdogImpl>(
+pub(crate) fn install<WatchdogImpl, MeasuredBootImpl>(
     cpu: &X86Cpu,
-    kernel: &helios_kernel::Kernel<X86Cpu, WatchdogImpl>,
+    kernel: &helios_kernel::Kernel<X86Cpu, WatchdogImpl, MeasuredBootImpl>,
     pci: &PciRoot,
     functions: &[(PciAddress, X86DmaPool)],
     destination_apic_id: u32,
@@ -65,6 +65,7 @@ pub(crate) fn install<WatchdogImpl>(
 ) -> Vec<BlockInterrupt>
 where
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
 {
     let discovered: Vec<BlockInterrupt> = functions
         .iter()

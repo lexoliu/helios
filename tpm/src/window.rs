@@ -4,6 +4,15 @@ use core::ptr::NonNull;
 
 use helios_hal::mmio;
 
+/// How many bytes one locality's registers span, for both interfaces.
+///
+/// The TCG PC Client Platform TPM Profile places the localities 4 KiB
+/// apart ("TPM Locality Address Mapping": locality 0 at `FED4_0xxxh`,
+/// locality 1 at `FED4_1xxxh`), and QEMU maps exactly that much for its
+/// CRB (`TPM_CRB_ADDR_SIZE`) and per locality of its FIFO
+/// (`TPM_TIS_LOCALITY_SHIFT`).
+pub const LOCALITY_BYTES: usize = 0x1000;
+
 /// The bytes of one TPM locality's register page, addressed by offset.
 ///
 /// Reads take `&mut self` as writes do: a FIFO read consumes the byte it

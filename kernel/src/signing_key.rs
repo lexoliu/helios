@@ -31,9 +31,6 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use core::fmt;
-use core::future::Future;
-use core::pin::pin;
-use core::task::{Context, Poll, Waker};
 
 use ed25519_dalek::SigningKey;
 use helios_artifact::bootfs::Fingerprint;
@@ -48,6 +45,7 @@ use thiserror::Error;
 use zeroize::Zeroizing;
 
 use crate::RootEntropy;
+use crate::bring_up::complete_device_future_at_bring_up;
 
 /// The register the kernel extends with the boot payload it verified.
 ///
@@ -253,28 +251,19 @@ pub async fn settle_signing_key<Device: MeasuredBoot>(
 /// Settles the key during bring-up, states which path it took, and
 /// stops the boot when the device failed.
 ///
-/// This is one of the `block_on` sites AGENTS.md §4 allows: a bootstrap
-/// entry point that runs on the bootstrap processor before the executor
-/// starts, with nothing else to yield to. The measured-boot contract
-/// makes every operation's future wait on nothing but the device and
-/// read it again on each poll, so the spin waits on a device register
-/// and not on software state, and each wait is bounded by the device's
-/// own timeout.
+/// It runs before the executor starts, so the device's futures are
+/// driven by [`complete_device_future_at_bring_up`]: the measured-boot
+/// contract makes every operation wait on nothing but the device.
 pub(crate) fn settle_signing_key_at_bring_up<Device: MeasuredBoot>(
     measured_boot: Option<&mut Device>,
     payload_digest: &Sha256Digest,
     entropy: &RootEntropy,
 ) -> CwasmSigningKey {
-    let settled = {
-        let mut settle = pin!(settle_signing_key(measured_boot, payload_digest, entropy));
-        let mut context = Context::from_waker(Waker::noop());
-        loop {
-            match settle.as_mut().poll(&mut context) {
-                Poll::Ready(settled) => break settled,
-                Poll::Pending => core::hint::spin_loop(),
-            }
-        }
-    }
+    let settled = complete_device_future_at_bring_up(settle_signing_key(
+        measured_boot,
+        payload_digest,
+        entropy,
+    ))
     .unwrap_or_else(|error| panic!("the compiler-signing key could not be settled: {error}"));
     if settled.source == SeedSource::Provisioned(ProvisionCause::ForeignSlot) {
         tracing::warn!(
@@ -303,6 +292,10 @@ fn draw_seed(entropy: &RootEntropy) -> SealedSecret {
 
 #[cfg(test)]
 mod tests {
+    use core::future::Future;
+    use core::pin::pin;
+    use core::task::{Context, Poll, Waker};
+
     use helios_hal::measured_boot::NoMeasuredBoot;
     use helios_hal::measured_boot_model::{MeasuredBootModel, Operation, OperationKind};
 

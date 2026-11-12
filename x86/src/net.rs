@@ -77,15 +77,16 @@ pub(crate) struct MsixDelivery {
 
 /// Brings up the virtio-net function and installs the kernel network
 /// service on top of it.
-pub(crate) fn install<WatchdogImpl>(
+pub(crate) fn install<WatchdogImpl, MeasuredBootImpl>(
     cpu: &X86Cpu,
-    kernel: &Kernel<X86Cpu, WatchdogImpl>,
+    kernel: &Kernel<X86Cpu, WatchdogImpl, MeasuredBootImpl>,
     function: PciFunction<'_>,
     delivery: MsixDelivery,
     debug_state: &RuntimeState,
 ) -> NetworkInterrupts
 where
     WatchdogImpl: Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
 {
     // One message per queue pair, each delivered to the local APIC of
     // the processor whose shard drains that pair, plus one for

@@ -60,8 +60,8 @@ pub(crate) fn count_input_devices(platform: &PlatformDescription) -> usize {
 /// One call for every device rather than one per device: the kernel owns
 /// the machine's input devices as a set, because that is what a program
 /// asking "what can I read?" is answered from.
-pub(crate) fn install<WatchdogImpl>(
-    kernel: &helios_kernel::Kernel<crate::Aarch64Cpu, WatchdogImpl>,
+pub(crate) fn install<WatchdogImpl, MeasuredBootImpl>(
+    kernel: &helios_kernel::Kernel<crate::Aarch64Cpu, WatchdogImpl, MeasuredBootImpl>,
     platform: &PlatformDescription,
     physical_memory_offset: usize,
     handoff: &crate::LimineBootHandoff,
@@ -69,6 +69,7 @@ pub(crate) fn install<WatchdogImpl>(
 ) -> Vec<InputInterrupt>
 where
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
 {
     let discovered = discover_input_devices(platform, physical_memory_offset, handoff);
     let service = helios_kernel::install_input_devices(

@@ -40,14 +40,15 @@ pub(crate) fn discover(pci: &PciRoot) -> Option<PciAddress> {
 
 /// Brings up the virtio-balloon function at `address` and hands it to
 /// the kernel's balloon tasks.
-pub(crate) fn install<WatchdogImpl>(
-    kernel: &helios_kernel::Kernel<crate::X86Cpu, WatchdogImpl>,
+pub(crate) fn install<WatchdogImpl, MeasuredBootImpl>(
+    kernel: &helios_kernel::Kernel<crate::X86Cpu, WatchdogImpl, MeasuredBootImpl>,
     pci: &PciRoot,
     address: PciAddress,
     physical_memory_offset: usize,
 ) -> BalloonHandle
 where
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
 {
     let device = helios_virtio::balloon_from_pci(
         &pci.access(),

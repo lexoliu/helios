@@ -19,18 +19,35 @@
 //! the executor each time the device is not ready, so a slow TPM never
 //! pins a processor. Each wait is bounded by the timeout the PTP sets
 //! for that state and fails with the state's name when it passes.
+//!
+//! # Discovery
+//!
+//! [`AcpiTpm2`] reads the ACPI TPM2 table both ACPI-described backends
+//! find the TPM through, and [`qualify`] runs the checks every backend
+//! runs before it hands the kernel a TPM: the registers the chain
+//! measured the kernel into, the owner authorization the sealed slot
+//! needs, and the loader's [`EventLog`] recording the kernel image.
 #![no_std]
 
+mod acpi;
+mod boot;
 mod clock;
 mod crb;
 mod device;
+mod event_log;
 mod tis;
 mod transport;
 mod window;
 
+pub use acpi::{AcpiTpm2, AcpiTpm2Error, AcpiTpm2Locality, PC_CLIENT_FIFO_LOCALITY_0};
+pub use boot::{
+    Discovered, Discovery, InterfaceDescription, KERNEL_IMAGE_REGISTERS, LoaderLog, QualifyError,
+    Unqualified, discover, qualify,
+};
 pub use clock::Clock;
 pub use crb::Crb;
-pub use device::{OpenError, SLOT_INDEX, Tpm};
+pub use device::{OpenError, OwnerAuthorization, SLOT_INDEX, Tpm};
+pub use event_log::{EV_IPL, Event, EventLog, EventLogError, LIMINE_KERNEL_IMAGE, LoaderEvent};
 pub use tis::Tis;
 pub use transport::{Interface, InterfaceError, Transport, TransportError};
-pub use window::{MmioWindow, RegisterWindow};
+pub use window::{LOCALITY_BYTES, MmioWindow, RegisterWindow};

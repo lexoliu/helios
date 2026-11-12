@@ -45,6 +45,7 @@ mod network;
 mod qemu;
 mod qmp;
 mod raw_profile;
+mod tpm;
 mod vcpu_state;
 mod x86_image_audit;
 
@@ -57,6 +58,7 @@ use network::{
 use qemu::QemuOptions;
 use qmp::{QmpClient, QmpError, SizeError};
 use raw_profile::{ProfileCommand, RawProfileCollectError};
+use tpm::{Swtpm, SwtpmError, VmTpm, VmTpmBackend, VmTpmError, VmTpmProfile};
 pub(crate) use vcpu_state::VcpuStateCapture;
 
 /// Why a `vm` session did not run.
@@ -175,6 +177,8 @@ pub(crate) enum VmConfigError {
     Network(#[from] VmNetworkError),
     #[error("{0}")]
     AudioDev(#[from] AudioDevError),
+    #[error("{0}")]
+    Tpm(#[from] VmTpmError),
     #[error("--shared-dir-writable requires --shared-dir (or `shared_dir` in the config file)")]
     WritableShareWithoutDir,
     #[error("shared directory does not exist: {path}")]
@@ -351,6 +355,8 @@ pub(crate) enum VmRuntimeError {
         #[source]
         source: io::Error,
     },
+    #[error("{0}")]
+    Swtpm(#[from] SwtpmError),
     #[error("failed to start QEMU executable {path}: {source}")]
     SpawnQemu {
         path: String,
@@ -997,6 +1003,10 @@ struct VmProfile {
     /// How this profile would attach a vsock device, when a session asks
     /// for the vsock RPC transport.
     vsock: VmVsockProfile,
+    /// The TPM front end this profile attaches when a session asks for a
+    /// TPM (`--tpm`); `None` where the kernel takes no measured-boot
+    /// device.
+    tpm: Option<VmTpmProfile>,
     /// Linker script fragment that places this target's LLVM
     /// instrumentation sections, for `--profile-generate` builds.
     ///
@@ -1060,6 +1070,7 @@ const AARCH64_VIRT_HVF_PROFILE: VmProfile = VmProfile {
     input: VmInputProfile::VirtioInputMmio,
     sound: VmSoundProfile::VirtioSoundMmio,
     vsock: VmVsockProfile::VhostVsockMmio,
+    tpm: Some(VmTpmProfile::TisMmio),
     profile_generate_linker_script: Some("aarch64/profile-generate.ld"),
     release_kernel_profile: false,
 };
@@ -1094,6 +1105,7 @@ const AARCH64_VIRT_TCG_PROFILE: VmProfile = VmProfile {
     input: VmInputProfile::VirtioInputMmio,
     sound: VmSoundProfile::VirtioSoundMmio,
     vsock: VmVsockProfile::VhostVsockMmio,
+    tpm: Some(VmTpmProfile::TisMmio),
     profile_generate_linker_script: Some("aarch64/profile-generate.ld"),
     release_kernel_profile: false,
 };
@@ -1127,6 +1139,9 @@ const RISCV64_VM_PROFILE: VmProfile = VmProfile {
     input: VmInputProfile::VirtioInputMmio,
     sound: VmSoundProfile::VirtioSoundMmio,
     vsock: VmVsockProfile::VhostVsockMmio,
+    // The riscv kernel keeps its per-boot signing seed and takes no
+    // measured-boot device.
+    tpm: None,
     profile_generate_linker_script: Some("riscv/profile-generate.x"),
     release_kernel_profile: false,
 };
@@ -1157,6 +1172,7 @@ const X86_64_VM_PROFILE: VmProfile = VmProfile {
     input: VmInputProfile::VirtioInputPci,
     sound: VmSoundProfile::VirtioSoundPci,
     vsock: VmVsockProfile::VhostVsockPci,
+    tpm: Some(VmTpmProfile::Crb),
     profile_generate_linker_script: None,
     // The one architecture performance is measured on, and the one
     // release.yml collects and publishes a profile for.
@@ -1459,6 +1475,10 @@ pub(crate) struct VmConfigFile {
     #[serde(default)]
     pub(crate) audiodev: Option<String>,
     #[serde(default)]
+    pub(crate) tpm: Option<VmTpmBackend>,
+    #[serde(default)]
+    pub(crate) tpm_state: Option<PathBuf>,
+    #[serde(default)]
     pub(crate) network: VmNetworkFile,
 }
 
@@ -1706,6 +1726,18 @@ pub(crate) struct VmCommand {
     /// Anything but `none` attaches a virtio-sound device to the guest.
     #[arg(long, value_name = "BACKEND")]
     audiodev: Option<String>,
+
+    /// Give the guest a TPM 2.0 for measured boot, emulated on the host:
+    /// `swtpm` behind QEMU's `tpm-crb` on x86-64 and `tpm-tis-device` on
+    /// aarch64. Refused on riscv64, whose kernel takes none.
+    #[arg(long, value_enum, value_name = "BACKEND")]
+    tpm: Option<VmTpmBackend>,
+
+    /// Directory the TPM keeps its non-volatile state in, created when
+    /// missing and never removed, so what the guest sealed survives the
+    /// next boot. Without it the state lives in the runtime directory.
+    #[arg(long, value_name = "DIR")]
+    tpm_state: Option<PathBuf>,
 
     #[command(flatten)]
     network: VmNetworkArgs,
@@ -2030,6 +2062,7 @@ struct ResolvedVmCommand {
     display: VmDisplayBackend,
     renderer: Option<VmGpuRenderer>,
     audiodev: VmAudioDev,
+    tpm: Option<VmTpm>,
     virtio_devices: VirtioDeviceProfile,
     rpc_transport: VmRpcTransport,
     vsock_cid: u32,
@@ -2533,6 +2566,12 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
         Some(text) => VmAudioDev::parse(&text)?,
         None => VmAudioDev::default(),
     };
+    let tpm = VmTpm::resolve(
+        command.tpm.or(file.tpm),
+        command.tpm_state.or(file.tpm_state),
+        profile.tpm,
+        arch_label(arch),
+    )?;
     let virtio_devices = VirtioDeviceProfile {
         ring: if command.virtio_packed || file.virtio_packed.unwrap_or(false) {
             VirtioRingLayout::Packed
@@ -2595,6 +2634,7 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
         display,
         renderer,
         audiodev,
+        tpm,
         virtio_devices,
         rpc_transport,
         vsock_cid,
@@ -2781,6 +2821,9 @@ fn ensure_qemu_command(command: &ResolvedVmCommand) -> Result<(), VmConfigError>
         command
             .network
             .preflight(&command.qemu_bin, qemu_net.queue_pairs())?;
+    }
+    if let Some(tpm) = &command.tpm {
+        tpm.preflight()?;
     }
     Ok(())
 }
@@ -4818,6 +4861,9 @@ struct VmRuntime {
     _socket_dir: VmSocketDir,
     qemu_log: PathBuf,
     child: Child,
+    /// The TPM emulator, when the session asked for a TPM; ended after
+    /// QEMU, which holds its control channel.
+    swtpm: Option<Swtpm>,
 }
 
 enum VmTransport {
@@ -5003,6 +5049,18 @@ impl VmRuntime {
         prepare_log_path(&qemu_log)?;
         let artifact = prepare_boot_artifact(command, Some(runtime_dir.path()))?;
         let data_disk = prepare_data_disk(command, runtime_dir.path())?;
+        // QEMU connects to the emulator's control socket while it builds
+        // the machine, so the emulator is listening first.
+        let swtpm = command
+            .tpm
+            .as_ref()
+            .map(|tpm| {
+                tpm.start(
+                    runtime_dir.path(),
+                    &socket_dir.path().join(tpm::SOCKET_NAME),
+                )
+            })
+            .transpose()?;
 
         let spinner = spinner(&match &command.qemu_net {
             Some(qemu_net) => format!(
@@ -5078,32 +5136,7 @@ impl VmRuntime {
             qemu.arg("-cpu").arg(cpu);
         }
         qemu.args(&command.qemu_arg);
-        // QEMU sits in its own process group, so a signal aimed at the
-        // inspector's group (a terminal's SIGINT, a driver's timeout kill)
-        // never reaches it and the shutdown in `VmRuntime::drop` is the one
-        // path that ends it. An inspector that dies by a signal runs no
-        // `Drop`, so on Linux the kernel ends QEMU with the thread that
-        // spawned it instead; `spawn` runs on the main thread, which lives
-        // as long as the process. Bench run 34443906698 left nineteen
-        // guests running that way, one per timed-out boot, under every
-        // boot that followed.
-        qemu.process_group(0);
-        #[cfg(target_os = "linux")]
-        {
-            // SAFETY: the closure runs in the child between fork and exec;
-            // `prctl` sets one flag on the calling task and allocates
-            // nothing, takes no lock and touches no memory the parent
-            // shares.
-            unsafe {
-                qemu.pre_exec(|| {
-                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == 0 {
-                        Ok(())
-                    } else {
-                        Err(std::io::Error::last_os_error())
-                    }
-                });
-            }
-        }
+        keep_off_the_terminal(&mut qemu);
         if command.serial_stdio {
             qemu.stdin(Stdio::piped());
             qemu.stdout(Stdio::piped());
@@ -5205,6 +5238,9 @@ impl VmRuntime {
                 command.virtio_devices,
             );
         }
+        if let (Some(tpm), Some(swtpm)) = (&command.tpm, &swtpm) {
+            tpm.apply(&mut qemu, &qemu_option_value(swtpm.socket())?);
+        }
 
         let mut child = qemu.spawn().map_err(|source| VmRuntimeError::SpawnQemu {
             path: command.qemu_bin.display().to_string(),
@@ -5249,6 +5285,7 @@ impl VmRuntime {
             runtime_dir,
             _socket_dir: socket_dir,
             child,
+            swtpm,
         })
     }
 
@@ -5305,6 +5342,9 @@ impl VmRuntime {
         if let Ok(None) = self.child.try_wait() {
             let _ = self.child.kill();
             let _ = self.child.wait();
+        }
+        if let Some(swtpm) = &mut self.swtpm {
+            swtpm.shutdown();
         }
     }
 }
@@ -5437,36 +5477,85 @@ fn qemu_option_value(path: &Path) -> Result<String, VmRuntimeError> {
     Ok(text.replace(',', ",,"))
 }
 
+/// Puts a host process the VM depends on (QEMU, `swtpm`) where only the
+/// inspector ends it.
+///
+/// It sits in its own process group, so a signal aimed at the
+/// inspector's group (a terminal's SIGINT, a driver's timeout kill)
+/// never reaches it and the shutdown in `VmRuntime::drop` is the one
+/// path that ends it. An inspector that dies by a signal runs no `Drop`,
+/// so on Linux the kernel ends the child with the thread that spawned it
+/// instead; `VmRuntime::spawn` runs on the main thread, which lives as
+/// long as the process. Bench run 34443906698 left nineteen guests
+/// running that way, one per timed-out boot, under every boot that
+/// followed.
+fn keep_off_the_terminal(child: &mut Command) {
+    child.process_group(0);
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: the closure runs in the child between fork and exec;
+        // `prctl` sets one flag on the calling task and allocates
+        // nothing, takes no lock and touches no memory the parent
+        // shares.
+        unsafe {
+            child.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+    }
+}
+
+/// How the wait for a child's listening socket ended.
+enum SocketWait {
+    Ready,
+    Exited,
+    TimedOut,
+}
+
+/// Waits up to [`DEFAULT_SOCKET_WAIT`] for `child` to create
+/// `socket_path`, and notices when it exits first.
+fn poll_for_socket(socket_path: &Path, child: &mut Child) -> io::Result<SocketWait> {
+    let started = Instant::now();
+    while started.elapsed() < DEFAULT_SOCKET_WAIT {
+        if socket_path.exists() {
+            return Ok(SocketWait::Ready);
+        }
+        if child.try_wait()?.is_some() {
+            return Ok(SocketWait::Exited);
+        }
+        std::thread::sleep(SOCKET_POLL_INTERVAL);
+    }
+    Ok(SocketWait::TimedOut)
+}
+
 fn wait_for_socket(
     socket_path: &Path,
     qemu_log: &Path,
     child: &mut Child,
 ) -> Result<(), VmRuntimeError> {
-    let started = Instant::now();
-    while started.elapsed() < DEFAULT_SOCKET_WAIT {
-        if socket_path.exists() {
-            return Ok(());
-        }
-        if child
-            .try_wait()
-            .map_err(|source| VmRuntimeError::PollQemu { source })?
-            .is_some()
-        {
+    match poll_for_socket(socket_path, child)
+        .map_err(|source| VmRuntimeError::PollQemu { source })?
+    {
+        SocketWait::Ready => Ok(()),
+        SocketWait::Exited => {
             let log =
                 fs::read_to_string(qemu_log).map_err(|source| VmRuntimeError::ReadQemuLog {
                     path: qemu_log.display().to_string(),
                     source,
                 })?;
-            return Err(VmRuntimeError::QemuExitedBeforeSocket {
+            Err(VmRuntimeError::QemuExitedBeforeSocket {
                 socket: socket_path.display().to_string(),
                 log,
-            });
+            })
         }
-        std::thread::sleep(SOCKET_POLL_INTERVAL);
+        SocketWait::TimedOut => Err(VmRuntimeError::SocketTimedOut {
+            socket: socket_path.display().to_string(),
+        }),
     }
-    Err(VmRuntimeError::SocketTimedOut {
-        socket: socket_path.display().to_string(),
-    })
 }
 
 fn spinner(label: &str) -> ProgressBar {
@@ -7676,6 +7765,8 @@ mod tests {
             display: None,
             renderer: None,
             audiodev: None,
+            tpm: None,
+            tpm_state: None,
             network: default_network_args(),
             command: None,
         }
@@ -7738,6 +7829,8 @@ mod tests {
             display: None,
             renderer: None,
             audiodev: None,
+            tpm: None,
+            tpm_state: None,
             network: default_network_args(),
             command: None,
         };
@@ -7828,6 +7921,122 @@ mod tests {
         );
     }
 
+    /// `--tpm swtpm` and `--tpm-state` as a command line spells them, and
+    /// the same two keys in the config file.
+    #[test]
+    fn tpm_flags_and_config_keys_resolve_to_one_tpm() {
+        #[derive(clap::Parser)]
+        struct VmLine {
+            #[command(flatten)]
+            command: VmCommand,
+        }
+        let tempdir =
+            tempfile::tempdir().expect("temporary directory for VM config resolution must exist");
+        let missing = tempdir.path().join("missing-vm.json");
+        let state = tempdir.path().join("tpm-state");
+        let path = |path: &Path| path.to_str().expect("tempdir paths are UTF-8").to_owned();
+        let line = <VmLine as clap::Parser>::try_parse_from([
+            "vm".to_owned(),
+            "--arch".to_owned(),
+            "x86-64".to_owned(),
+            // Named, as every test names it, so this resolves on any host.
+            "--accel".to_owned(),
+            "tcg".to_owned(),
+            "--no-build".to_owned(),
+            "--tpm".to_owned(),
+            "swtpm".to_owned(),
+            "--tpm-state".to_owned(),
+            path(&state),
+            "--config".to_owned(),
+            path(&missing),
+        ])
+        .expect("--tpm takes a backend and --tpm-state a directory");
+        assert_eq!(line.command.tpm, Some(VmTpmBackend::Swtpm));
+        let from_flags = resolve(line.command)
+            .expect("q35 attaches a TPM")
+            .tpm
+            .expect("--tpm asks for a TPM");
+
+        let config = tempdir.path().join("vm.json");
+        fs::write(
+            &config,
+            serde_json::json!({ "tpm": "swtpm", "tpm_state": state }).to_string(),
+        )
+        .expect("the VM config must be writable");
+        let from_file = resolve(VmCommand {
+            config: Some(config),
+            ..minimal_command()
+        })
+        .expect("q35 attaches a TPM")
+        .tpm
+        .expect("`tpm` in the config file asks for a TPM");
+        assert_eq!(from_flags, from_file);
+
+        let mut qemu = Command::new("true");
+        from_file.apply(&mut qemu, "swtpm.sock");
+        let arguments: Vec<_> = qemu
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            arguments.last().map(String::as_str),
+            Some("tpm-crb,tpmdev=tpm0")
+        );
+    }
+
+    /// aarch64 puts its TPM on the platform bus in both firmware
+    /// descriptions; riscv64 takes none, and says so before anything is
+    /// built.
+    #[test]
+    fn the_tpm_front_end_follows_the_machine() {
+        let tempdir =
+            tempfile::tempdir().expect("temporary directory for VM config resolution must exist");
+        let config = tempdir.path().join("missing-vm.json");
+        for acpi in [false, true] {
+            let tpm = resolve(VmCommand {
+                arch: VmArch::Aarch64,
+                acpi,
+                tpm: Some(VmTpmBackend::Swtpm),
+                config: Some(config.clone()),
+                ..minimal_command()
+            })
+            .expect("the virt machine attaches a TPM")
+            .tpm
+            .expect("--tpm asks for a TPM");
+            let mut qemu = Command::new("true");
+            tpm.apply(&mut qemu, "swtpm.sock");
+            assert!(
+                qemu.get_args()
+                    .any(|argument| argument == "tpm-tis-device,tpmdev=tpm0"),
+                "acpi={acpi}"
+            );
+        }
+        let error = resolve(VmCommand {
+            arch: VmArch::Riscv64,
+            tpm: Some(VmTpmBackend::Swtpm),
+            config: Some(config.clone()),
+            ..minimal_command()
+        })
+        .expect_err("riscv64 takes no measured-boot device");
+        assert!(
+            matches!(
+                error,
+                VmConfigError::Tpm(VmTpmError::Unavailable { arch: "riscv64" })
+            ),
+            "{error}"
+        );
+        let error = resolve(VmCommand {
+            tpm_state: Some(tempdir.path().join("tpm-state")),
+            config: Some(config),
+            ..minimal_command()
+        })
+        .expect_err("a state directory names no TPM by itself");
+        assert!(
+            matches!(error, VmConfigError::Tpm(VmTpmError::StateWithoutTpm)),
+            "{error}"
+        );
+    }
+
     /// Every endpoint the unit protects is told to translate; the unit
     /// itself is not one of its own endpoints.
     #[test]
@@ -7911,6 +8120,8 @@ mod tests {
             display: None,
             renderer: None,
             audiodev: None,
+            tpm: None,
+            tpm_state: None,
             network: default_network_args(),
             command: None,
         };
@@ -8048,6 +8259,7 @@ mod tests {
             display: VmDisplayBackend::None,
             renderer: None,
             audiodev: VmAudioDev::None,
+            tpm: None,
             needs_qmp: false,
             virtio_devices: VirtioDeviceProfile::default(),
             rpc_transport: VmRpcTransport::Serial,
@@ -8261,6 +8473,7 @@ mod tests {
             display: VmDisplayBackend::None,
             renderer: None,
             audiodev: VmAudioDev::None,
+            tpm: None,
             needs_qmp: false,
             virtio_devices: VirtioDeviceProfile::default(),
             rpc_transport: VmRpcTransport::Serial,
