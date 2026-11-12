@@ -2528,16 +2528,18 @@ mod tests {
             client.stat_path_impl("/alpha").await.expect("first stat");
             client.read_file_impl("/alpha").await.expect("first read");
         });
-        {
+        let clunked_before = {
             let log = transport.log();
             assert_eq!((log.versions, log.attaches), (1, 1));
             assert_eq!(log.getattrs, 1, "the read's size probe came from the cache");
-        }
+            log.clunked.clone()
+        };
 
         block_on(client.reset_session_forgotten());
-        assert!(
-            transport.log().clunked.is_empty(),
-            "the server forgot the fids, so none is clunked"
+        assert_eq!(
+            transport.log().clunked,
+            clunked_before,
+            "the server forgot the fids, so the reset clunks none"
         );
         assert_eq!(client.inner.fids.live_count(), 0);
         assert_eq!(client.inner.session.get(), None);
