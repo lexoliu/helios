@@ -72,6 +72,11 @@ const INTERNAL_DHCP_SOCKET_INDEX: usize = 0;
 const INTERNAL_UDP_RESERVED_SLOTS: usize = 1;
 const LOCAL_NETWORK_PORT: NetworkPortId = NetworkPortId::new(0);
 const DHCP_RETRANSMIT_NANOS: u64 = 1_000_000_000;
+/// REQUESTs an INIT-REBOOT client sends before giving the lease up and
+/// starting over from DISCOVER. RFC 2131 section 3.2 leaves the count
+/// to the client; with the retransmission interval above, four tries
+/// is the few seconds a server on the same link needs to answer.
+const DHCP_REBOOT_ATTEMPTS: u32 = 4;
 const MAX_TCP_STREAM_HANDLES: usize = 256;
 const MAX_TCP_LISTENER_HANDLES: usize = 64;
 const MAX_UDP_SOCKET_HANDLES: usize = 256;
@@ -1759,12 +1764,13 @@ mod tests {
     use crate::test_support::{RecordingNetworkInterface, RecordingSmpCpu, TestCpu};
 
     use super::{
-        AddressAttemptError, DhcpClientState, DhcpDnsServers, DhcpMessageType, DhcpServerMessage,
-        HandleSlab, NETWORK_BUSY_POLL_ROUNDS, NETWORK_TX_BATCH_FRAMES, NetworkIpAddress,
-        NetworkPollBudget, NetworkPollProgress, NetworkPollScope, NetworkPollSource,
-        NetworkPollState, NetworkPumpAction, NetworkPumpCadence, NetworkShard, ReplicaHandle,
-        TcpListenerId, TcpReadProgress, UdpSocketId, icmp_echo_payload, limit_udp_datagram_bytes,
-        map_ipv4_address, parse_ipv6, receive_pair_order,
+        AddressAttemptError, DHCP_REBOOT_ATTEMPTS, DHCP_RETRANSMIT_NANOS, DhcpClientState,
+        DhcpDnsServers, DhcpMessageType, DhcpServerMessage, HandleSlab, NETWORK_BUSY_POLL_ROUNDS,
+        NETWORK_TX_BATCH_FRAMES, NetworkIpAddress, NetworkPollBudget, NetworkPollProgress,
+        NetworkPollScope, NetworkPollSource, NetworkPollState, NetworkPumpAction,
+        NetworkPumpCadence, NetworkShard, ReplicaHandle, TcpListenerId, TcpReadProgress,
+        UdpSocketId, icmp_echo_payload, limit_udp_datagram_bytes, map_ipv4_address, parse_ipv6,
+        receive_pair_order,
     };
 
     fn ipv6_tcp_frame(
@@ -2028,6 +2034,97 @@ mod tests {
         TcpListenerId(ReplicaHandle::new(slot).get())
     }
 
+    /// A restored machine may be on another network, so a bound client
+    /// asks the link to confirm its lease (INIT-REBOOT) and keeps the
+    /// address while it waits; a client with no lease has nothing to ask
+    /// about.
+    #[test]
+    fn a_restored_machine_asks_the_link_to_confirm_its_lease() {
+        let mut shard = test_network_shard();
+        let lease = Ipv4Cidr::new(Ipv4Address::new([192, 0, 2, 10]), 24);
+
+        assert_eq!(
+            shard.begin_lease_revalidation(9, StackInstant::from_nanos(1)),
+            Ok(false),
+            "a client still looking for an address has no lease to confirm"
+        );
+
+        shard
+            .stack
+            .add_ipv4_address(lease)
+            .expect("test address should be accepted");
+        shard.dhcp = DhcpClientState::Bound;
+        assert_eq!(
+            shard.begin_lease_revalidation(9, StackInstant::from_nanos(1)),
+            Ok(true)
+        );
+        assert_eq!(
+            shard.dhcp,
+            DhcpClientState::Rebooting {
+                transaction_id: 9,
+                requested_ip: lease.address(),
+                attempts: 1,
+                last_sent: StackInstant::from_nanos(1),
+            }
+        );
+        assert_eq!(
+            shard.stack.ipv4_addresses().count(),
+            1,
+            "the address stays in use until the link answers"
+        );
+        let frame = shard
+            .stack
+            .take_outbound()
+            .expect("a DHCP REQUEST frame should be queued");
+        let ethernet = EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
+        let ipv4 = Ipv4Packet::parse(ethernet.payload).expect("IPv4 packet should parse");
+        let udp = UdpPacket::parse(ipv4.payload).expect("UDP datagram should parse");
+        assert_eq!(udp.destination_port, helios_netstack::DHCP_SERVER_PORT);
+        // The requested-IP option (50) names the old lease, and the
+        // server-identifier option (54) is absent: any server may answer.
+        assert!(
+            udp.payload
+                .windows(6)
+                .any(|option| option == [50, 4, 192, 0, 2, 10])
+        );
+        assert!(!udp.payload.windows(2).any(|option| option == [54, 4]));
+    }
+
+    /// A link that never confirms the lease leaves the client no reason
+    /// to trust it: after the retries it starts over as a NAK would.
+    #[test]
+    fn an_unconfirmed_lease_is_given_up_after_the_retries() {
+        let mut shard = test_network_shard();
+        shard
+            .stack
+            .add_ipv4_address(Ipv4Cidr::new(Ipv4Address::new([192, 0, 2, 10]), 24))
+            .expect("test address should be accepted");
+        shard.dhcp = DhcpClientState::Bound;
+        shard
+            .begin_lease_revalidation(9, StackInstant::from_nanos(0))
+            .expect("the first REQUEST is built");
+
+        for attempt in 2..=DHCP_REBOOT_ATTEMPTS {
+            let now = StackInstant::from_nanos(u64::from(attempt) * DHCP_RETRANSMIT_NANOS);
+            shard.retransmit_dhcp(now).expect("a retry is sent");
+            assert!(
+                matches!(
+                    shard.dhcp,
+                    DhcpClientState::Rebooting { attempts, .. } if attempts == attempt
+                ),
+                "attempt {attempt}: {:?}",
+                shard.dhcp
+            );
+        }
+        assert_eq!(shard.stack.ipv4_addresses().count(), 1);
+
+        let now =
+            StackInstant::from_nanos(u64::from(DHCP_REBOOT_ATTEMPTS + 1) * DHCP_RETRANSMIT_NANOS);
+        shard.retransmit_dhcp(now).expect("the exchange ends");
+        assert_eq!(shard.dhcp, DhcpClientState::Init { transaction_id: 10 });
+        assert_eq!(shard.stack.ipv4_addresses().count(), 0);
+    }
+
     /// A link that comes back is not the link that went away: the lease,
     /// the routes it pointed at and the resolvers that came with it are
     /// all stale, and nothing would ask the new link for an address
@@ -2130,6 +2227,25 @@ mod tests {
             },
         ] {
             assert!(!state.accepts_reply(&nak(7, Some(server))));
+        }
+    }
+
+    /// RFC 2131 §3.2: an INIT-REBOOT REQUEST names no server, so any
+    /// server on the link may answer it, and only the `xid` ties the
+    /// answer to the exchange.
+    #[test]
+    fn a_rebooting_client_takes_a_reply_to_its_exchange_from_any_server() {
+        let server = Ipv4Address::new([192, 0, 2, 1]);
+        let rebooting = DhcpClientState::Rebooting {
+            transaction_id: 7,
+            requested_ip: Ipv4Address::new([192, 0, 2, 10]),
+            attempts: 1,
+            last_sent: StackInstant::from_nanos(0),
+        };
+        for message_type in [DhcpMessageType::Ack, DhcpMessageType::Nak] {
+            assert!(rebooting.accepts_reply(&dhcp_reply(message_type, 7, Some(server))));
+            assert!(rebooting.accepts_reply(&dhcp_reply(message_type, 7, None)));
+            assert!(!rebooting.accepts_reply(&dhcp_reply(message_type, 8, Some(server))));
         }
     }
 

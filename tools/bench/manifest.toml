@@ -93,3 +93,15 @@ linux_vm_memory = "2G"
 net_backend = "user"
 net_host = "10.0.2.2"
 devices = ["virtio-blk-pci", "virtio-net-device", "virtio-rng-device"]
+# Two rounds: each side goes first once, so drift between the two halves
+# of a round (thermal state, background daemons) lands on each column in
+# turn and a cell's warm series pools both orders (#491).
+rounds = 2
+
+# What still differs between the two columns by construction. The Wasmtime
+# revisions are read from where they are pinned (helios_bench.asymmetries);
+# these are fixed by how the lane builds and runs each side.
+[lane.stated_asymmetries]
+[lane.stated_asymmetries.stack_limit_interruption]
+helios = "compiled into every cwasm"
+linux = "not compiled in"

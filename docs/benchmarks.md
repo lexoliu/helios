@@ -878,7 +878,7 @@ its warm series. Ordinary measurements isolate these listeners; explicit
 `--reuse-host-listeners` is reserved for reconnect diagnosis and marks the
 report as unsuitable for performance acceptance.
 
-The `bench-x86-64-linux` lane of `ci.yml` is unchanged except that the
+The `bench-x86-64-linux` lane of `bench-lane.yml` is unchanged except that the
 inspector now writes the host CPU model into the `run` record it emits,
 so a comparison between two of its runs can tell one machine from two.
 

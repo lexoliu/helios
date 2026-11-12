@@ -139,6 +139,41 @@ class InstructionSampling(BaseModel):
     dropped: int = Field(description="samples the guest's rings refused over those boots")
 
 
+class PressureReading(BaseModel):
+    """One `kern.memorystatus_vm_pressure_level` reading around a side of a round."""
+
+    round: int
+    side: str = Field(description="`helios` or `linux`: the side the reading brackets")
+    moment: Literal["before", "after"]
+    level: int
+
+
+#: What `kern.memorystatus_vm_pressure_level` reads on a host under no
+#: memory pressure; 2 is warn and 4 is critical.
+PRESSURE_NORMAL = 1
+
+
+class HostGate(BaseModel):
+    """The host state a run was gated on, and what it read (#491).
+
+    On macOS memory pressure is read around every side of every round,
+    and the run is inconclusive unless it was normal throughout. A Linux
+    host is not gated: there is no equivalent reading this tool takes.
+    """
+
+    applies: bool
+    note: str = Field(description="what was read and why, or why the gate does not apply to this host")
+    readings: list[PressureReading] = Field(default_factory=list)
+
+    @property
+    def violations(self) -> list[PressureReading]:
+        return [reading for reading in self.readings if reading.level != PRESSURE_NORMAL]
+
+    @property
+    def inconclusive(self) -> bool:
+        return bool(self.violations)
+
+
 class RunInfo(BaseModel):
     id: str | None
     url: str | None
@@ -279,6 +314,18 @@ class RunInfo(BaseModel):
         default=None,
         description="how the `helios_baseline_rebuild` column was sampled, when the run built and sampled it",
     )
+    rounds: int | None = Field(
+        default=None,
+        description=(
+            "the number of alternating rounds the run took (#491): each round times both sides "
+            "once and consecutive rounds swap which goes first; None is a single pass"
+        ),
+    )
+    host_gate: HostGate | None = Field(
+        default=None,
+        description="the host state the run was gated on and every reading it took; None for a report "
+        "written before the gate existed",
+    )
 
     @property
     def paired(self) -> bool:
@@ -298,6 +345,14 @@ class Hardware(BaseModel):
     memory_bytes: int
     accelerator: str
     qemu_version: str | None
+
+
+class Asymmetry(BaseModel):
+    """One thing the two columns of a lane still differ in by construction (#491)."""
+
+    what: str
+    helios: str
+    linux: str
 
 
 class Pins(BaseModel):
@@ -349,6 +404,10 @@ class Pins(BaseModel):
             "plugin with, built from this checkout against `wasmtime_revision`"
         ),
     )
+    asymmetries: list[Asymmetry] = Field(
+        default_factory=list,
+        description="what still differs between the Helios and Linux columns by construction (#491)",
+    )
 
 
 class Thresholds(BaseModel):
@@ -361,6 +420,10 @@ class Thresholds(BaseModel):
 
 
 class Iteration(BaseModel):
+    round: int = Field(
+        default=1,
+        description="the alternating round (#491) this launch was timed in; `index` counts within it",
+    )
     index: int
     elapsed_ms: float
     cold: bool
@@ -390,6 +453,10 @@ class Cell(BaseModel):
     rejected: bool
     rejection_reason: str | None
     metrics: dict[str, SeriesStats] = Field(description="warm-series statistics of every bench.<name> metric")
+    round_medians: list[float] = Field(
+        default_factory=list,
+        description="the warm median of each alternating round, in round order; empty for a single pass",
+    )
 
 
 class Comparison(BaseModel):

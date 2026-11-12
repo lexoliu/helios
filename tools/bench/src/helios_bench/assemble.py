@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import statistics
+
 from helios_bench.report import (
     Cell,
     Comparison,
@@ -22,6 +24,7 @@ from helios_bench.stats import (
     StatsConfig,
     intervals_overlap,
     noise_floor,
+    relative_shift,
     series_stats,
     split_cold_warm,
 )
@@ -36,27 +39,75 @@ def stats_config(thresholds: Thresholds) -> StatsConfig:
     )
 
 
-def build_cell(side: Side, iterations: list[Iteration], thresholds: Thresholds) -> Cell:
+def build_cell(
+    side: Side, iterations: list[Iteration], thresholds: Thresholds, round_floor: float | None = None
+) -> Cell:
+    """One cell's statistics, pooling the alternating rounds it was timed in (#491).
+
+    Each round's first ``warmup_discard`` launches are its cold series and
+    the rest its warm one; the cell's warm series pools every round's. A
+    cell timed in more than one round is also rejected, like a dispersed
+    one, when its rounds' warm medians spread by more than ``round_floor``,
+    the noise floor: two orders of the same run that disagree by more than
+    the host moved by say the order, not the system, set the number.
+    """
     config = stats_config(thresholds)
-    ordered = sorted(iterations, key=lambda iteration: iteration.index)
-    cold_values, warm_values = split_cold_warm([it.elapsed_ms for it in ordered], thresholds.warmup_discard)
+    ordered = sorted(iterations, key=lambda iteration: (iteration.round, iteration.index))
+    by_round: dict[int, list[Iteration]] = {}
+    for iteration in ordered:
+        by_round.setdefault(iteration.round, []).append(iteration)
+    cold_values: list[float] = []
+    warm_values: list[float] = []
+    round_warm: list[list[float]] = []
+    for members in by_round.values():
+        cold, warm = split_cold_warm([it.elapsed_ms for it in members], thresholds.warmup_discard)
+        cold_values += cold
+        warm_values += warm
+        round_warm.append(warm)
     warm = series_stats(warm_values, config)
     cold = series_stats(cold_values, config)
-    rejected = warm.cv > thresholds.cv_bound
-    reason = f"warm CV {warm.cv:.3f} exceeds bound {thresholds.cv_bound:.3f}" if rejected else None
-    metric_names = sorted({name for it in ordered[thresholds.warmup_discard :] for name in it.metrics})
+    reasons = []
+    if warm.cv > thresholds.cv_bound:
+        reasons.append(f"warm CV {warm.cv:.3f} exceeds bound {thresholds.cv_bound:.3f}")
+    round_medians: list[float] = []
+    if len(by_round) > 1:
+        if round_floor is None:
+            raise ValueError(
+                f"a cell timed in {len(by_round)} rounds is judged against the noise floor, "
+                "and the run has no control workload to give one"
+            )
+        round_medians = [float(statistics.median(values)) for values in round_warm]
+        disagreement = relative_shift(min(round_medians), max(round_medians))
+        if disagreement > round_floor:
+            reasons.append(
+                f"round medians disagree by {disagreement:.3f}, beyond the noise floor {round_floor:.3f}"
+            )
+    metric_names = sorted(
+        {
+            name
+            for members in by_round.values()
+            for it in members[thresholds.warmup_discard :]
+            for name in it.metrics
+        }
+    )
     metrics = {}
     for name in metric_names:
-        values = [it.metrics[name] for it in ordered[thresholds.warmup_discard :] if name in it.metrics]
+        values = [
+            it.metrics[name]
+            for members in by_round.values()
+            for it in members[thresholds.warmup_discard :]
+            if name in it.metrics
+        ]
         metrics[name] = series_stats(values, config)
     return Cell(
         side=side,
         iterations=ordered,
         cold=cold,
         warm=warm,
-        rejected=rejected,
-        rejection_reason=reason,
+        rejected=bool(reasons),
+        rejection_reason="; ".join(reasons) if reasons else None,
         metrics=metrics,
+        round_medians=round_medians,
     )
 
 
@@ -183,6 +234,7 @@ def assemble_report(
     never compared, so it is not one.
     """
     floor = control.noise_floor if control is not None else 0.0
+    round_floor = control.noise_floor if control is not None else None
     results = []
     for workload in workloads:
         cells: dict[Side, Cell] = {}
@@ -194,7 +246,7 @@ def assemble_report(
             if raw_cell.failure is not None:
                 failures[side] = raw_cell.failure
                 continue
-            cells[side] = build_cell(side, raw_cell.iterations, thresholds)
+            cells[side] = build_cell(side, raw_cell.iterations, thresholds, round_floor)
         if not cells and not failures:
             continue
         check_matched_metrics(workload, cells)
