@@ -1,5 +1,6 @@
 use helios_artifact::{
-    CWASM_MEMORY_GUARD_SIZE, CWASM_MEMORY_RESERVATION, cwasm_target_cranelift_flags,
+    CWASM_MEMORY_GUARD_SIZE, CWASM_MEMORY_RESERVATION, CwasmCodeProtection,
+    cwasm_target_code_protection, cwasm_target_cranelift_flags,
     cwasm_target_guest_stack_limit_offset, cwasm_target_supports_wasm_simd,
 };
 use std::cell::{Cell, RefCell};
@@ -9,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use thiserror::Error;
 use wasmparser::{Encoding, Parser, Payload};
-use wasmtime::{Config, Engine, OptLevel, StackLimitLocation, Strategy};
+use wasmtime::{Config, Engine, ModuleVersionStrategy, OptLevel, StackLimitLocation, Strategy};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AotCompileHint {
@@ -82,6 +83,11 @@ pub enum CompileError {
     #[error("Wasmtime rejected target {target}: {source}")]
     Target {
         target: String,
+        source: wasmtime::Error,
+    },
+    #[error("Wasmtime rejected artifact version {version:?}: {source}")]
+    ModuleVersion {
+        version: String,
         source: wasmtime::Error,
     },
     #[error("failed to precompile core module: {0}")]
@@ -415,6 +421,21 @@ fn compiler_worker_count() -> usize {
         .map_or(1, NonZeroUsize::get)
 }
 
+/// The protection the machine code of a `hint` compile for `target` carries.
+///
+/// Cranelift's code carries what the target's ISA flags ask for. Winch's
+/// does not: its aarch64 frame setup is `stp fp, lr` with no `paci*` or
+/// `auti*` (`winch/codegen/src/isa/aarch64/masm.rs`), so a `Fast` compile
+/// is unprotected even though `sign_return_address` is among its ISA flags.
+fn code_protection(target: &str, hint: AotCompileHint) -> CwasmCodeProtection {
+    match hint {
+        AotCompileHint::Fast => CwasmCodeProtection::NONE,
+        AotCompileHint::Balanced | AotCompileHint::Performance => {
+            cwasm_target_code_protection(target)
+        }
+    }
+}
+
 /// The engine configuration that decides the machine code a precompile for
 /// `target` under `hint` produces: the target and its ISA flags, the compiler
 /// strategy and optimisation level, the wasm features, and the memory
@@ -449,6 +470,16 @@ pub fn codegen_config(target: &str, hint: AotCompileHint) -> Result<Config> {
             config.strategy(Strategy::Cranelift);
             config.cranelift_opt_level(OptLevel::Speed);
         }
+    }
+    // The version string records the protection the machine code carries,
+    // and the kernel engine refuses an artifact whose string differs from
+    // the protection it requires.
+    if let Some(version) = code_protection(target, hint)
+        .module_version(ModuleVersionStrategy::WasmtimeVersion.as_str())
+    {
+        config
+            .module_version(ModuleVersionStrategy::Custom(version.clone()))
+            .map_err(|source| CompileError::ModuleVersion { version, source })?;
     }
     config.wasm_component_model(true);
     config.wasm_component_model_async(true);
@@ -518,9 +549,14 @@ fn build_engine_config(target: &str, hint: AotCompileHint, worker_count: usize) 
     Ok(config)
 }
 
-#[cfg(all(test, target_arch = "x86_64"))]
+#[cfg(test)]
 mod tests {
-    use super::{AotCompileHint, build_engine_config, precompile_artifact};
+    #[cfg(target_arch = "x86_64")]
+    use super::build_engine_config;
+    use super::{AotCompileHint, CwasmCodeProtection, code_protection, precompile_artifact};
+    #[cfg(target_arch = "x86_64")]
+    use wasmtime::ModuleVersionStrategy;
+    #[cfg(target_arch = "x86_64")]
     use wasmtime::{Engine, Module};
 
     const MINIMAL_MODULE: &[u8] = &[
@@ -531,6 +567,83 @@ mod tests {
         0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b, // body
     ];
 
+    /// The marker `CwasmCodeProtection::module_version` puts in the version
+    /// string, which sits uncompressed in the artifact's engine section.
+    const SIGNING_MARKER: &[u8] = b"+return-address-signing";
+
+    fn contains_marker(bytes: &[u8]) -> bool {
+        bytes
+            .windows(SIGNING_MARKER.len())
+            .any(|window| window == SIGNING_MARKER)
+    }
+
+    /// Cranelift's aarch64 output records that it signs return addresses.
+    #[test]
+    fn aarch64_cranelift_artifacts_record_return_address_signing() {
+        for hint in [AotCompileHint::Balanced, AotCompileHint::Performance] {
+            let artifact = precompile_artifact(MINIMAL_MODULE, "aarch64-unknown-none", hint)
+                .expect("the minimal module precompiles for aarch64");
+            assert!(contains_marker(&artifact.bytes), "{hint:?}");
+        }
+    }
+
+    /// Winch's aarch64 output does not sign, so a `Fast` compile records
+    /// the protection of unprotected code whatever the target's flags say.
+    #[test]
+    fn a_winch_compile_records_no_protection() {
+        let target = "aarch64-unknown-none";
+        assert_eq!(
+            code_protection(target, AotCompileHint::Fast),
+            CwasmCodeProtection::NONE
+        );
+        for hint in [AotCompileHint::Balanced, AotCompileHint::Performance] {
+            assert!(
+                code_protection(target, hint).return_addresses_signed,
+                "{hint:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn targets_without_signing_record_no_protection() {
+        for target in ["x86_64-unknown-none", "riscv64gc-unknown-none-elf"] {
+            let artifact = precompile_artifact(MINIMAL_MODULE, target, AotCompileHint::Performance)
+                .expect("the minimal module precompiles");
+            assert!(!contains_marker(&artifact.bytes), "{target}");
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn an_engine_requiring_signed_code_refuses_an_unsigned_artifact() {
+        let target = "x86_64-unknown-linux-gnu";
+        let artifact = precompile_artifact(MINIMAL_MODULE, target, AotCompileHint::Performance)
+            .expect("the minimal module precompiles");
+
+        let same = build_engine_config(target, AotCompileHint::Performance, 1)
+            .expect("the engine config builds");
+        let same_engine = Engine::new(&same).expect("the engine builds");
+        unsafe { Module::deserialize(&same_engine, &artifact.bytes) }
+            .expect("an artifact deserializes into an engine with the config it was built under");
+
+        let mut requiring_signed = build_engine_config(target, AotCompileHint::Performance, 1)
+            .expect("the engine config builds");
+        let version = CwasmCodeProtection {
+            return_addresses_signed: true,
+        }
+        .module_version(ModuleVersionStrategy::WasmtimeVersion.as_str())
+        .expect("signed code has its own version");
+        requiring_signed
+            .module_version(ModuleVersionStrategy::Custom(version))
+            .expect("the version string is accepted");
+        let engine = Engine::new(&requiring_signed).expect("the engine builds");
+        let error = unsafe { Module::deserialize(&engine, &artifact.bytes) }
+            .expect_err("unsigned code must not load into an engine that requires signing");
+        let debug = format!("{error:?}");
+        assert!(debug.contains("incompatible version"), "{debug}");
+    }
+
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn deserialization_rejects_an_unavailable_enabled_isa_flag() {
         let target = "x86_64-unknown-linux-gnu";
