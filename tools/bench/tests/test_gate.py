@@ -210,6 +210,32 @@ def test_a_metric_without_a_unit_stops_the_gate(paired_flat_report: Report) -> N
         evaluate_paired(paired_flat_report)
 
 
+def test_a_matched_metric_is_a_condition_not_a_row(paired_flat_report: Report) -> None:
+    """`compiler_workers` is held equal by assembly and has no unit to give (#849)."""
+    workload = paired_flat_report.workload("hostcall-loop")
+    for side in (Side.HELIOS, Side.HELIOS_BASELINE):
+        workload.cells[side].metrics["compiler_workers"] = workload.cells[side].metrics["rtt_p50_us"]
+    workload.matched_metrics = ("compiler_workers",)
+    result = evaluate_paired(paired_flat_report)
+
+    assert "compiler_workers" not in {row.measurement for row in result.rows}
+    assert result.unpaired_metrics == []
+    assert not result.blocking
+
+
+def test_a_matched_metric_one_run_does_not_carry_is_still_skipped(paired_flat_report: Report) -> None:
+    """A baseline built before the metric existed has no `compiler_workers`."""
+    workload = paired_flat_report.workload("hostcall-loop")
+    workload.cells[Side.HELIOS].metrics["compiler_workers"] = workload.cells[Side.HELIOS].metrics[
+        "rtt_p50_us"
+    ]
+    workload.matched_metrics = ("compiler_workers",)
+    result = evaluate_paired(paired_flat_report)
+
+    assert result.unpaired_metrics == []
+    assert "compiler_workers" not in {row.measurement for row in result.rows}
+
+
 @pytest.mark.parametrize(
     ("metric", "expected"),
     [
