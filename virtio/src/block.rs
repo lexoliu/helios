@@ -72,9 +72,10 @@ use helios_hal::io::{IoError, IoResult};
 use helios_hal::resource::KernelResource;
 use helios_hal::vmm::SwapBackend;
 
-use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate};
+use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate, renegotiate};
 use crate::notify::Notify;
 use crate::queue::{MAX_CHAIN_BUFFERS, VirtQueue};
+use crate::resume::{DeviceReset, QuiesceError, ReinitError, driver_ok, settle};
 use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
 
 /// virtio-blk addresses every request in 512-byte sectors regardless of
@@ -908,6 +909,94 @@ impl<T: VirtioTransport, C: QueueAffinity, B: BlockBuffer> VirtioBlockDevice<T, 
         }
     }
 
+    /// Waits for every request the device owns, on every queue, to
+    /// complete, so the device may be reset. See [`crate::resume`] for
+    /// the contract; `expired` says when the caller's deadline has
+    /// passed.
+    ///
+    /// Each answer is finished the way the interrupt path finishes it:
+    /// its buffer hears its result and its waiter is woken, so the waiter
+    /// finds a complete slot when the machine runs again. A device the
+    /// driver already stopped holds nothing.
+    pub fn quiesce(&self, mut expired: impl FnMut() -> bool) -> Result<(), QuiesceError> {
+        let device = DeviceType::Block;
+        for (index, queue) in self.queues.iter().enumerate() {
+            let index = u16::try_from(index).expect("queue indices were built from a u16");
+            settle(device, index, &mut expired, || {
+                if self.state.load(Ordering::SeqCst) != RUNNING {
+                    return Ok(0);
+                }
+                self.reap(queue);
+                queue
+                    .ring
+                    .try_lock()
+                    .map(|ring| ring.in_flight_chains())
+                    .ok_or(QuiesceError::QueueBusy {
+                        device,
+                        queue: index,
+                    })
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Brings a reset device back with the features it had, after
+    /// [`Self::quiesce`]: every queue is re-programmed at its ring with
+    /// fresh indices. Block keeps no state outside its rings, so there is
+    /// nothing else to restore; what the device reports about itself is
+    /// compared with what the driver brought up.
+    pub fn reinitialize(&self) -> Result<DeviceReset, ReinitError> {
+        let device = DeviceType::Block;
+        if self.state.load(Ordering::SeqCst) != RUNNING {
+            return Err(ReinitError::StateNotRestorable {
+                device,
+                what: "a device the driver stopped after it broke the used-ring contract",
+            });
+        }
+        renegotiate(&self.transport, self.features)?;
+        self.check_identity()?;
+        for (index, queue) in self.queues.iter().enumerate() {
+            let index = u16::try_from(index).expect("queue indices were built from a u16");
+            let mut ring = queue.ring.try_lock().ok_or(ReinitError::QueueBusy {
+                device,
+                queue: index,
+            })?;
+            ring.reinitialize(&self.transport)?;
+            drop(ring);
+            queue.drain_pending.store(false, Ordering::SeqCst);
+        }
+        driver_ok(&self.transport);
+        Ok(DeviceReset { device })
+    }
+
+    /// Compares what the device reports about itself with what the
+    /// driver brought up. A device is untrusted, and a disk of another
+    /// size is not the disk the image was taken against.
+    fn check_identity(&self) -> Result<(), ReinitError> {
+        let device = DeviceType::Block;
+        let changed = |what| ReinitError::DeviceChanged { device, what };
+        let block_bytes = if self.features.device(BLK_F_BLK_SIZE) {
+            usize::try_from(self.transport.read_config_u32(CFG_BLK_SIZE))
+                .map_err(|_| changed("logical block size"))?
+        } else {
+            SECTOR_SIZE
+        };
+        if block_bytes != self.geometry.logical_block_bytes {
+            return Err(changed("logical block size"));
+        }
+        let sectors = u64::from(self.transport.read_config_u32(CFG_CAPACITY_LOW))
+            | (u64::from(self.transport.read_config_u32(CFG_CAPACITY_HIGH)) << 32);
+        let blocks = usize::try_from(sectors).map_err(|_| changed("capacity"))?
+            / self.limits.sectors_per_block;
+        if blocks != self.geometry.capacity_blocks {
+            return Err(changed("capacity"));
+        }
+        if queue_count(&self.transport, &self.cpu, self.features) != self.queues.len() {
+            return Err(changed("queue count"));
+        }
+        Ok(())
+    }
+
     /// The first sector of a logical block.
     fn sector_of(&self, block_id: usize) -> u64 {
         (block_id as u64) * self.limits.sectors_per_block as u64
@@ -1562,6 +1651,17 @@ impl<T: VirtioTransport, C: QueueAffinity, B: BlockBuffer> VirtioBlockResource<T
 
     pub fn handle_interrupt(&self) {
         self.resource.object().handle_interrupt();
+    }
+
+    /// Waits for every request the device owns to complete. See
+    /// [`VirtioBlockDevice::quiesce`].
+    pub fn quiesce(&self, expired: impl FnMut() -> bool) -> Result<(), QuiesceError> {
+        self.object().quiesce(expired)
+    }
+
+    /// Brings a reset device back. See [`VirtioBlockDevice::reinitialize`].
+    pub fn reinitialize(&self) -> Result<DeviceReset, ReinitError> {
+        self.object().reinitialize()
     }
 
     /// The feature set the underlying device negotiated.

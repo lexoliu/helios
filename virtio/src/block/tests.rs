@@ -541,6 +541,125 @@ fn requests_are_pipelined_and_completed_out_of_order() {
 }
 
 #[test]
+fn quiesce_waits_for_every_request_in_flight_and_leaves_the_answers_for_their_waiters() {
+    let device = device();
+    let first_token = next_token(&device);
+    let mut read_first = pin!(device.read(0, TestBuffer::new(512)));
+    assert!(block_on(poll_once(read_first.as_mut())).is_none());
+    let second_token = next_token(&device);
+    let mut read_second = pin!(device.read(1, TestBuffer::new(512)));
+    assert!(block_on(poll_once(read_second.as_mut())).is_none());
+
+    // The device answers while the quiesce spins, the later request
+    // first.
+    let mut answers = [(second_token, 0x22_u8), (first_token, 0x11_u8)].into_iter();
+    let mut passes = 0;
+    device
+        .quiesce(|| {
+            passes += 1;
+            if let Some((token, byte)) = answers.next() {
+                answer(&device, token, &read_response(byte, 512));
+            }
+            false
+        })
+        .expect("the device answers inside the deadline");
+    assert_eq!(passes, 2);
+    assert_eq!(ring(&device).in_flight_chains(), 0);
+
+    let first = block_on(poll_once(read_first.as_mut())).expect("the first read is done");
+    assert_eq!(first.buffer.bytes(), [0x11_u8; 512]);
+    let second = block_on(poll_once(read_second.as_mut())).expect("the second read is done");
+    assert_eq!(second.buffer.bytes(), [0x22_u8; 512]);
+}
+
+#[test]
+fn quiesce_gives_up_when_the_deadline_passes() {
+    let device = device();
+    let mut read = pin!(device.read(0, TestBuffer::new(512)));
+    assert!(block_on(poll_once(read.as_mut())).is_none());
+
+    assert_eq!(
+        device.quiesce(|| true),
+        Err(QuiesceError::RequestsStillInFlight {
+            device: DeviceType::Block,
+            queue: 0,
+            count: 1,
+        })
+    );
+}
+
+#[test]
+fn a_reset_device_serves_requests_again_with_the_features_it_had() {
+    let device = device_with(BLK_F_RO, |_| {});
+    let mut read = pin!(device.read(0, TestBuffer::new(512)));
+    assert!(block_on(poll_once(read.as_mut())).is_none());
+    device
+        .quiesce(|| {
+            answer(&device, 0, &read_response(0x5a, 512));
+            false
+        })
+        .expect("the device answers inside the deadline");
+
+    device.object().transport.reset_behind_the_driver();
+    assert_eq!(
+        device.reinitialize(),
+        Ok(DeviceReset {
+            device: DeviceType::Block
+        })
+    );
+
+    let done = block_on(poll_once(read.as_mut())).expect("the answer from before the reset");
+    assert_eq!(done.buffer.bytes(), [0x5a_u8; 512]);
+    let transport = &device.object().transport;
+    assert_eq!(transport.driver_features(), device.features().bits());
+    let programmed = transport.programmed_queues();
+    assert_eq!(programmed.len(), 2);
+    assert_eq!(programmed[0], programmed[1]);
+
+    // The ring starts again from its first descriptor and works.
+    assert_eq!(next_token(&device), 0);
+    let mut again = pin!(device.read(1, TestBuffer::new(512)));
+    assert!(block_on(poll_once(again.as_mut())).is_none());
+    assert_eq!(request_of(&device, 0), header(ReqType::In, 1));
+    complete(&device, 0, &read_response(0x6b, 512));
+    let done = block_on(poll_once(again.as_mut())).expect("the read after the reset");
+    assert_eq!(done.buffer.bytes(), [0x6b_u8; 512]);
+}
+
+#[test]
+fn a_device_that_offers_fewer_features_after_the_reset_is_refused() {
+    let device = device_with(BLK_F_RO, |_| {});
+    device.object().transport.withdraw_features(BLK_F_RO);
+
+    assert_eq!(
+        device.reinitialize(),
+        Err(ReinitError::Renegotiate(
+            crate::features::RenegotiateError::FeatureWithdrawn {
+                device: DeviceType::Block,
+                bit: 5,
+            }
+        ))
+    );
+}
+
+#[test]
+fn a_disk_of_another_size_after_the_reset_is_refused() {
+    let device = device();
+    device
+        .object()
+        .transport
+        .set_config_u32(CFG_CAPACITY_LOW, TEST_CAPACITY_SECTORS * 2);
+
+    assert_eq!(
+        device.reinitialize(),
+        Err(ReinitError::DeviceChanged {
+            device: DeviceType::Block,
+            what: "capacity",
+        })
+    );
+}
+
+#[test]
 fn a_readonly_device_refuses_writes() {
     let device = device_with(BLK_F_RO, |_| {});
 
