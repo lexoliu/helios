@@ -136,7 +136,7 @@ pub use instance::{
     CondemnedMemory, InstanceActivity, InstanceId, InstanceProfileTotal, InstanceRegistry,
     InstanceSnapshot, KernelHeapCharge, KillOutcome, KillReason, MemoryPool, OOM_RECLAIM_GRACE,
     OomKillDecision, OomKillOutcome, OomPolicy, OomVictim, ProcessorTurn, RegisteredInstance,
-    StoreTurns, allow_instance_resource_growth,
+    StoreTurns, UserMemoryCharge, allow_instance_resource_growth,
 };
 pub use io::{
     BlockCache, BlockCacheError, BlockCacheLimits, BlockInstallError, BlockMut, BlockPages,

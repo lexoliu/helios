@@ -103,7 +103,14 @@ where
         let user_heap = user_heap_stats();
         let user_available = user_heap.available_bytes();
         if user_available < growth {
-            self.request_oom_kill_for_growth(MemoryPool::User, growth);
+            request_oom_kill(
+                &self.runtime_state,
+                &self.instance_registry,
+                &self.cpu,
+                self.instance().id(),
+                MemoryPool::User,
+                growth,
+            );
             return Some(
                 ProgramOutOfMemory {
                     requested_bytes: desired,
@@ -118,7 +125,14 @@ where
         let heap = heap_stats();
         let headroom = KernelHeapHeadroom::of(heap, user_available);
         if let Some(shortfall) = headroom.growth_shortfall_bytes(growth) {
-            self.request_oom_kill_for_growth(MemoryPool::Kernel, shortfall);
+            request_oom_kill(
+                &self.runtime_state,
+                &self.instance_registry,
+                &self.cpu,
+                self.instance().id(),
+                MemoryPool::Kernel,
+                shortfall,
+            );
             // Every number in this refusal describes the kernel side
             // of the grow, including the request: reporting the guest's
             // `desired` here alongside kernel-heap availability is what
@@ -139,73 +153,89 @@ where
 
         None
     }
+}
 
-    /// Ask the OOM killer to cover `requested_bytes` of `pool`.
-    ///
-    /// The killer answers against its condemned-memory ledger, so a
-    /// shortfall that an in-flight kill already covers condemns nothing
-    /// further: `memory_growing` is a synchronous Wasmtime callback and
-    /// cannot wait for the reclaim, so the requester takes its typed
-    /// `ProgramOutOfMemory` failure either way and retries when the
-    /// guest next asks for the memory. Logged at warn level so
-    /// post-mortem analysis can trace which instance was sacrificed for
-    /// which grow request, and which requests were absorbed by a kill
-    /// that had already happened.
-    fn request_oom_kill_for_growth(&self, pool: MemoryPool, requested_bytes: usize) {
-        // VIRTIO_BALLOON_F_DEFLATE_ON_OOM: memory the host is holding is
-        // reclaimed before memory a program is using. The balloon task
-        // does the deflating, so this only asks; the requester still
-        // takes this grow failure and retries.
-        if let Some(balloon) = self.runtime_state.memory_balloon() {
-            balloon.request_deflate();
+/// Ask the OOM killer to cover `requested_bytes` of `pool` for
+/// `requester`.
+///
+/// The one OOM request: a refused linear-memory grow, a refused kernel
+/// heap grow and any later refusal of user-pool frames (a store-held
+/// buffer, a file page) all come through here, so the balloon, the
+/// condemned-memory ledger and the log line behave the same for every
+/// one. It takes the pieces of a store rather than the store, because a
+/// stream that outlives the call that made it holds exactly these.
+///
+/// The killer answers against its condemned-memory ledger, so a
+/// shortfall that an in-flight kill already covers condemns nothing
+/// further: the requester cannot wait for the reclaim, so it takes its
+/// typed failure either way and retries when it next asks for the
+/// memory. Logged at warn level so post-mortem analysis can trace which
+/// instance was sacrificed for which request, and which requests were
+/// absorbed by a kill that had already happened.
+pub(crate) fn request_oom_kill<CpuImpl, Net, HostFs>(
+    runtime_state: &crate::wasmtime_adapter::component_host::HostRuntimeState<CpuImpl, Net, HostFs>,
+    instance_registry: &crate::InstanceRegistry,
+    cpu: &CpuImpl,
+    requester: crate::InstanceId,
+    pool: MemoryPool,
+    requested_bytes: usize,
+) where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    HostFs: HostFileSystem,
+{
+    // VIRTIO_BALLOON_F_DEFLATE_ON_OOM: memory the host is holding is
+    // reclaimed before memory a program is using. The balloon task
+    // does the deflating, so this only asks; the requester still
+    // takes its failure and retries.
+    if let Some(balloon) = runtime_state.memory_balloon() {
+        balloon.request_deflate();
+    }
+    let decision = instance_registry.condemn_for_oom(
+        requester,
+        pool,
+        requested_bytes as u64,
+        monotonic_nanos(cpu),
+    );
+    let condemned = decision.condemned;
+    match decision.outcome {
+        OomKillOutcome::Condemned(victim) => {
+            deliver_kill(runtime_state, victim.id);
+            tracing::warn!(
+            target: "helios_kernel::oom",
+            requester = ?requester,
+            pool = ?pool,
+            requested_bytes,
+            victim_id = ?victim.id,
+            victim_name = %victim.name,
+            victim_memory_bytes = victim.memory_bytes,
+            victim_kernel_bytes = victim.kernel_bytes,
+            victim_policy = ?victim.policy,
+            score = victim.score,
+            condemned_pending_bytes = condemned.pending_bytes,
+            condemned_stale_bytes = condemned.stale_bytes,
+            "OOM killer condemned victim to free memory"
+            );
         }
-        let requester = self.instance().id();
-        let decision = self.instance_registry.condemn_for_oom(
-            requester,
-            pool,
-            requested_bytes as u64,
-            monotonic_nanos(&self.cpu),
-        );
-        let condemned = decision.condemned;
-        match decision.outcome {
-            OomKillOutcome::Condemned(victim) => {
-                deliver_kill(&self.runtime_state, victim.id);
-                tracing::warn!(
-                target: "helios_kernel::oom",
-                requester = ?requester,
-                pool = ?pool,
-                requested_bytes,
-                victim_id = ?victim.id,
-                victim_name = %victim.name,
-                victim_memory_bytes = victim.memory_bytes,
-                victim_kernel_bytes = victim.kernel_bytes,
-                victim_policy = ?victim.policy,
-                score = victim.score,
-                condemned_pending_bytes = condemned.pending_bytes,
-                condemned_stale_bytes = condemned.stale_bytes,
-                "OOM killer condemned victim to free memory"
-                );
-            }
-            OomKillOutcome::AwaitingReclaim => tracing::debug!(
-                target: "helios_kernel::oom",
-                requester = ?requester,
-                pool = ?pool,
-                requested_bytes,
-                condemned_pending_bytes = condemned.pending_bytes,
-                condemned_stale_bytes = condemned.stale_bytes,
-                "memory already condemned covers this grow — requester retries instead of \
-                 condemning another instance"
-            ),
-            OomKillOutcome::NoVictim => tracing::warn!(
-                target: "helios_kernel::oom",
-                requester = ?requester,
-                pool = ?pool,
-                requested_bytes,
-                condemned_pending_bytes = condemned.pending_bytes,
-                condemned_stale_bytes = condemned.stale_bytes,
-                "OOM killer found no eligible victim — requester takes the grow failure"
-            ),
-        }
+        OomKillOutcome::AwaitingReclaim => tracing::debug!(
+            target: "helios_kernel::oom",
+            requester = ?requester,
+            pool = ?pool,
+            requested_bytes,
+            condemned_pending_bytes = condemned.pending_bytes,
+            condemned_stale_bytes = condemned.stale_bytes,
+            "memory already condemned covers this request — requester retries instead of \
+             condemning another instance"
+        ),
+        OomKillOutcome::NoVictim => tracing::warn!(
+            target: "helios_kernel::oom",
+            requester = ?requester,
+            pool = ?pool,
+            requested_bytes,
+            condemned_pending_bytes = condemned.pending_bytes,
+            condemned_stale_bytes = condemned.stale_bytes,
+            "OOM killer found no eligible victim — requester takes its failure"
+        ),
     }
 }
 

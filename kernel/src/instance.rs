@@ -231,7 +231,8 @@ pub struct OomVictim {
     pub name: String,
     /// The pool that ran out, and therefore the one `score` ranks.
     pub pool: MemoryPool,
-    /// User-pool bytes: the instance's wasm linear memory.
+    /// User-pool bytes: the instance's wasm linear memory plus the
+    /// memory its stores hold through [`UserMemoryCharge`]s.
     pub memory_bytes: u64,
     /// Kernel-heap bytes attributed to the instance.
     pub kernel_bytes: u64,
@@ -245,6 +246,8 @@ pub struct InstanceSnapshot {
     pub name: String,
     pub started_at: u64,
     pub uptime: u64,
+    /// User-pool bytes the instance holds: linear memory plus the
+    /// memory its stores hold through [`UserMemoryCharge`]s.
     pub memory_bytes: u64,
     pub cpu_busy: u16,
 }
@@ -283,6 +286,16 @@ struct InstanceEntry {
     /// derived from `memory_bytes` instead of charged, so the two can
     /// never drift apart — see [`InstanceEntry::kernel_heap_bytes`].
     kernel_bytes: AtomicU64,
+    /// User-pool memory the instance's stores hold beyond its linear
+    /// memory: stack checkpoints, process snapshots and fork stacks.
+    /// One [`UserMemoryCharge`] per buffer, released when the buffer's
+    /// owning store drops, which is also when the frames go back, so
+    /// killing the instance returns exactly these bytes.
+    ///
+    /// `AcqRel` add and subtract from any processor; read under the
+    /// registry's `entries` lock by victim ranking and condemnation,
+    /// and by [`InstanceRegistry::snapshot`].
+    held_user_bytes: AtomicU64,
     /// The processor time of every store this instance holds. The swap
     /// policy reads it to decide whether an instance has been idle long
     /// enough to evict; stats and profiles read the total.
@@ -357,6 +370,7 @@ impl InstanceRegistry {
             started_at,
             memory_bytes: AtomicU64::new(0),
             kernel_bytes: AtomicU64::new(0),
+            held_user_bytes: AtomicU64::new(0),
             stores: Mutex::new(StoreClocks::new(started_at)),
             policy,
             kill_flag: AtomicU8::new(KILL_FLAG_NONE),
@@ -578,7 +592,7 @@ impl InstanceRegistry {
                 name: entry.name.clone(),
                 started_at: entry.started_at,
                 uptime: now_nanos.saturating_sub(entry.started_at),
-                memory_bytes: entry.memory_bytes.load(Ordering::Acquire),
+                memory_bytes: entry.user_pool_bytes(),
                 cpu_busy,
             });
         }
@@ -617,7 +631,7 @@ impl Default for InstanceRegistry {
 fn best_victim(entries: &Slab<Box<InstanceEntry>>, pool: MemoryPool) -> Option<OomVictim> {
     let mut best: Option<OomVictim> = None;
     for (_, entry) in entries.iter() {
-        let memory_bytes = entry.memory_bytes.load(Ordering::Acquire);
+        let memory_bytes = entry.user_pool_bytes();
         let kernel_bytes = entry.kernel_heap_bytes();
         let pool_bytes = match pool {
             MemoryPool::User => memory_bytes,
@@ -719,7 +733,7 @@ fn condemn_entry(
         .compare_exchange(KILL_FLAG_NONE, encoded, Ordering::AcqRel, Ordering::Acquire)
         .ok()?;
     let condemned = CondemnedBytes {
-        user: entry.memory_bytes.load(Ordering::Acquire),
+        user: entry.user_pool_bytes(),
         kernel: entry.kernel_heap_bytes(),
     };
     entry.condemned_at.store(now_nanos, Ordering::Release);
@@ -800,6 +814,27 @@ impl RegisteredInstance {
         }
     }
 
+    /// User-pool bytes a kill of this instance returns: its linear
+    /// memory plus every live [`UserMemoryCharge`] against it.
+    pub fn user_pool_bytes(&self) -> u64 {
+        self.entry().user_pool_bytes()
+    }
+
+    /// Charge `bytes` of user-pool memory to this instance for as long
+    /// as the returned charge is alive.
+    ///
+    /// Infallible: the frame allocation that precedes the charge is the
+    /// admission, so there is nothing for the charge to refuse.
+    pub fn charge_user_memory(&self, bytes: u64) -> UserMemoryCharge {
+        self.entry()
+            .held_user_bytes
+            .fetch_add(bytes, Ordering::AcqRel);
+        UserMemoryCharge {
+            instance: self.clone(),
+            bytes,
+        }
+    }
+
     /// Returns `Some(reason)` when the instance has been condemned by
     /// the OOM killer or a supervisor and the runtime should trap at
     /// the guest's next interrupt check.
@@ -839,6 +874,38 @@ impl Drop for KernelHeapCharge {
             .update(Ordering::AcqRel, Ordering::Acquire, |charged| {
                 charged.saturating_sub(bytes)
             });
+    }
+}
+
+/// User-pool memory held for an instance by a store-owned buffer, charged
+/// for as long as the buffer is alive.
+///
+/// Sibling of [`KernelHeapCharge`] for the other pool. What it counts is
+/// memory a kill gives back: the buffer dies with the store that owns it
+/// and the store with the instance, so the OOM killer ranks and
+/// condemns by it. Memory that outlives its writer (file pages) holds no
+/// charge. The charge holds a handle on the instance, so it never
+/// outlives the registry entry it counts against.
+pub struct UserMemoryCharge {
+    instance: RegisteredInstance,
+    bytes: u64,
+}
+
+impl UserMemoryCharge {
+    /// The bytes this charge holds against its instance.
+    pub const fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+impl Drop for UserMemoryCharge {
+    fn drop(&mut self) {
+        let bytes = self.bytes;
+        self.instance.entry().held_user_bytes.update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |charged| charged.saturating_sub(bytes),
+        );
     }
 }
 
@@ -1161,6 +1228,14 @@ impl ProcessorTurn<'_> {
 }
 
 impl InstanceEntry {
+    /// User-pool bytes this instance holds: its linear memory plus what
+    /// its stores hold through [`UserMemoryCharge`]s.
+    fn user_pool_bytes(&self) -> u64 {
+        self.memory_bytes
+            .load(Ordering::Acquire)
+            .saturating_add(self.held_user_bytes.load(Ordering::Acquire))
+    }
+
     /// Kernel heap attributed to this instance.
     ///
     /// Two terms, because the kernel knows about its own allocations in
@@ -1186,7 +1261,54 @@ impl InstanceEntry {
 mod tests {
     use alloc::vec;
 
-    use super::{InstanceActivity, InstanceRegistry};
+    use super::{InstanceActivity, InstanceRegistry, MemoryPool, OomKillOutcome};
+
+    /// A user-memory charge is the instance's user-pool footprint beside
+    /// its linear memory: the score ranks by it, the stats report it, a
+    /// condemnation records it, and dropping the charge returns all
+    /// three.
+    #[test]
+    fn a_user_memory_charge_counts_until_it_drops() {
+        let registry = InstanceRegistry::new();
+        let instance = registry.register("holder", 0);
+        instance.set_memory_bytes(4096);
+
+        let charge = instance.charge_user_memory(1 << 20);
+        assert_eq!(charge.bytes(), 1 << 20);
+        assert_eq!(instance.user_pool_bytes(), 4096 + (1 << 20));
+        assert_eq!(registry.snapshot(1)[0].memory_bytes, 4096 + (1 << 20));
+        let victim = registry.pick_oom_victim(MemoryPool::User).unwrap();
+        assert_eq!(victim.score, 4096 + (1 << 20));
+        assert_eq!(victim.memory_bytes, 4096 + (1 << 20));
+
+        let requester = registry.register("requester", 0);
+        let decision = registry.condemn_for_oom(requester.id(), MemoryPool::User, 1, 10);
+        assert!(matches!(decision.outcome, OomKillOutcome::Condemned(_)));
+        assert_eq!(decision.condemned.pending_bytes, 4096 + (1 << 20));
+
+        drop(charge);
+        assert_eq!(instance.user_pool_bytes(), 4096);
+        assert_eq!(registry.snapshot(2)[0].memory_bytes, 4096);
+    }
+
+    /// Two charges on one instance add and release independently, and
+    /// the kernel heap is not what they count against.
+    #[test]
+    fn user_memory_charges_stack_and_leave_the_kernel_heap_alone() {
+        let registry = InstanceRegistry::new();
+        let instance = registry.register("holder", 0);
+        let kernel_before = instance.kernel_heap_bytes();
+
+        let first = instance.charge_user_memory(100);
+        let second = instance.charge_user_memory(30);
+        assert_eq!(instance.user_pool_bytes(), 130);
+        assert_eq!(instance.kernel_heap_bytes(), kernel_before);
+        drop(first);
+        assert_eq!(instance.user_pool_bytes(), 30);
+        drop(second);
+        assert_eq!(instance.user_pool_bytes(), 0);
+        assert!(registry.pick_oom_victim(MemoryPool::User).is_none());
+    }
 
     #[test]
     fn assigns_stable_ids() {
