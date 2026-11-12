@@ -44,7 +44,7 @@ use spin::Mutex as SpinMutex;
 use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate_with, renegotiate};
 use crate::notify::Notify;
 use crate::queue::VirtQueue;
-use crate::resume::{DeviceReset, QuiesceError, ReinitError, driver_ok, settle};
+use crate::resume::{DeviceReset, Lost, QuiesceError, ReinitError, conclude, driver_ok, settle};
 use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
 
 const NET_QUEUE_SIZE: u16 = 256;
@@ -792,9 +792,13 @@ pub struct VirtioNetDevice<T: VirtioTransport> {
     /// half-programmed: a wrong table would put a flow on a queue whose
     /// processor does not own the socket, which is worse than the hop.
     rss: Option<RssLimits>,
-    /// Keeps one control command at a time between its submission and
-    /// its ack, without holding the queue's own lock across the poll.
-    control_gate: SpinMutex<()>,
+    /// The queue-pair count the device advertised at bring-up, which
+    /// placed the control queue at `2 * max_pairs`. Re-read after a reset
+    /// and compared, because a device that advertises another count has
+    /// its control queue somewhere else.
+    max_pairs: u16,
+    /// Set once a restore command timed out and the device is lost.
+    lost: Lost,
 }
 
 /// Why a control-queue command did not come back acknowledged.
@@ -901,6 +905,67 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
     /// it the count — while its completions had no listener, which is
     /// the stall #381's review caught.
     pub fn new(transport: T, pair_budget: QueuePairBudget) -> IoResult<Self> {
+        let device = Self::build(transport, pair_budget)?;
+        let features = device.features;
+
+        // Activate every queue pair on the device side. The device
+        // ships with a single pair active by default; without this
+        // command extra RX queues we just allocated would not
+        // receive traffic. A steering device is told the same count
+        // inside its RSS configuration instead, which is the command
+        // that also hands it the table and the key.
+        //
+        // Coalescing follows, because the per-virtqueue form addresses
+        // queues by index and a pair the device has not been told to
+        // activate has no budget to set.
+        device
+            .program_control(&mut || false)
+            .map_err(ControlError::without_deadline)?;
+
+        // The negotiated set is the only record of what the host packet
+        // path was actually able to offer: a slirp-backed device
+        // negotiates neither multiqueue nor segmentation offload, so a
+        // measurement taken against it exercises none of the driver's
+        // offload paths. Logging it at bring-up puts the feature set of
+        // every run into the boot log, where a benchmark lane can record
+        // which backend it really measured. The ring bits are already on
+        // the `virtio features negotiated` line this device emitted, so
+        // only the device-class facts are repeated here.
+        tracing::info!(
+            queue_pairs = device.queue_pair_count(),
+            csum = device.tx_checksum_negotiated,
+            host_tso4 = device.tso_v4_negotiated,
+            host_tso6 = device.tso_v6_negotiated,
+            host_ecn = device.tso_ecn_negotiated,
+            guest_csum = device.guest_checksum_negotiated,
+            guest_tso4 = device.guest_tso_v4_negotiated,
+            guest_tso6 = device.guest_tso_v6_negotiated,
+            guest_ecn = features.device(NET_FEATURE_GUEST_ECN),
+            guest_ufo = device.guest_ufo_negotiated,
+            mrg_rxbuf = device.mergeable_rx_buffers,
+            mq = features.device(NET_FEATURE_MQ),
+            ctrl_vq = features.device(NET_FEATURE_CTRL_VQ),
+            rss = device.steers_receives(),
+            hash_report = features.device(NET_FEATURE_HASH_REPORT),
+            notf_coal = features.device(NET_FEATURE_NOTF_COAL),
+            vq_notf_coal = features.device(NET_FEATURE_VQ_NOTF_COAL),
+            notf_coal_max_packets = NET_NOTF_COAL_MAX_PACKETS,
+            notf_coal_max_usecs = NET_NOTF_COAL_MAX_USECS,
+            status = device.status_negotiated,
+            link_up = device.link_up.load(Ordering::Relaxed),
+            max_frame_len = device.max_frame_len,
+            max_receive_frame_len = device.max_receive_frame_len,
+            rx_buffer_len = device.rx_buffer_len,
+            "virtio-net online"
+        );
+        Ok(device)
+    }
+
+    /// Negotiates, programs every queue and sets `DRIVER_OK`, leaving
+    /// the control-queue commands (the live queue count, receive
+    /// steering and notification coalescing) to
+    /// [`Self::program_control`].
+    fn build(transport: T, pair_budget: QueuePairBudget) -> IoResult<Self> {
         if transport.device_type() != DeviceType::Network {
             return Err(IoError::Unsupported);
         }
@@ -1001,17 +1066,8 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         })?;
 
         let mac_address = read_mac_address(&transport);
-        let ip_mtu = read_mtu(&transport, features);
-        let max_frame_len = ip_mtu
-            .checked_add(ETH_HEADER_LEN)
-            .ok_or(IoError::DeviceFault)?;
-        // A device that cannot hold the table and key this driver's
-        // demux is defined in terms of is left unsteered rather than
-        // half-programmed.
-        let rss = features
-            .device(NET_FEATURE_RSS)
-            .then(|| read_rss_limits(&transport))
-            .filter(|limits| limits.accepts_our_table());
+        let WireConfig { max_frame_len, rss } =
+            read_wire_config(&transport, features).ok_or(IoError::DeviceFault)?;
         if features.device(NET_FEATURE_RSS) && rss.is_none() {
             tracing::warn!(
                 "virtio-net offered RSS but cannot hold a {RSS_INDIRECTION_ENTRIES}-entry table with a {RSS_KEY_BYTES}-byte key over the four-tuple hash types; receives stay unsteered"
@@ -1231,13 +1287,9 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         // Optional control queue. Allocated AFTER all RX/TX queues
         // because virtio places it at index 2*max_pairs, not
         // immediately after the queues we activated.
+        let max_pairs = device_max_pairs(&transport, features);
         let control = if features.device(NET_FEATURE_CTRL_VQ) {
-            let device_max = if features.device(NET_FEATURE_MQ) {
-                read_max_virtqueue_pairs(&transport).max(1)
-            } else {
-                1
-            };
-            let ctrl_index = control_queue_index(device_max);
+            let ctrl_index = control_queue_index(max_pairs);
             let ctrl_size = transport.queue_max_size(ctrl_index).min(NET_QUEUE_SIZE);
             // The driver has already told the device it accepted
             // `CTRL_VQ`, so a control queue that cannot be brought up is
@@ -1313,62 +1365,12 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             status_negotiated: features.device(NET_FEATURE_STATUS),
             link_up: AtomicBool::new(true),
             rss,
-            control_gate: SpinMutex::new(()),
+            max_pairs,
+            lost: Lost::new(),
         };
         device
             .link_up
             .store(read_link_up(&device.transport, features), Ordering::Relaxed);
-
-        // Activate every queue pair on the device side. The device
-        // ships with a single pair active by default; without this
-        // command extra RX queues we just allocated would not
-        // receive traffic. A steering device is told the same count
-        // inside its RSS configuration instead, which is the command
-        // that also hands it the table and the key.
-        //
-        // Coalescing follows, because the per-virtqueue form addresses
-        // queues by index and a pair the device has not been told to
-        // activate has no budget to set.
-        device
-            .program_control(&mut || false)
-            .map_err(ControlError::without_deadline)?;
-
-        // The negotiated set is the only record of what the host packet
-        // path was actually able to offer: a slirp-backed device
-        // negotiates neither multiqueue nor segmentation offload, so a
-        // measurement taken against it exercises none of the driver's
-        // offload paths. Logging it at bring-up puts the feature set of
-        // every run into the boot log, where a benchmark lane can record
-        // which backend it really measured. The ring bits are already on
-        // the `virtio features negotiated` line this device emitted, so
-        // only the device-class facts are repeated here.
-        tracing::info!(
-            queue_pairs = device.queue_pair_count(),
-            csum = device.tx_checksum_negotiated,
-            host_tso4 = device.tso_v4_negotiated,
-            host_tso6 = device.tso_v6_negotiated,
-            host_ecn = device.tso_ecn_negotiated,
-            guest_csum = device.guest_checksum_negotiated,
-            guest_tso4 = device.guest_tso_v4_negotiated,
-            guest_tso6 = device.guest_tso_v6_negotiated,
-            guest_ecn = features.device(NET_FEATURE_GUEST_ECN),
-            guest_ufo = device.guest_ufo_negotiated,
-            mrg_rxbuf = device.mergeable_rx_buffers,
-            mq = features.device(NET_FEATURE_MQ),
-            ctrl_vq = features.device(NET_FEATURE_CTRL_VQ),
-            rss = device.steers_receives(),
-            hash_report = features.device(NET_FEATURE_HASH_REPORT),
-            notf_coal = features.device(NET_FEATURE_NOTF_COAL),
-            vq_notf_coal = features.device(NET_FEATURE_VQ_NOTF_COAL),
-            notf_coal_max_packets = NET_NOTF_COAL_MAX_PACKETS,
-            notf_coal_max_usecs = NET_NOTF_COAL_MAX_USECS,
-            status = device.status_negotiated,
-            link_up = device.link_up.load(Ordering::Relaxed),
-            max_frame_len = device.max_frame_len,
-            max_receive_frame_len = device.max_receive_frame_len,
-            rx_buffer_len = device.rx_buffer_len,
-            "virtio-net online"
-        );
         Ok(device)
     }
 
@@ -1460,11 +1462,16 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
     /// only spells out its own payload.
     ///
     /// `expired` is asked between polls of the used ring. The queue lock
-    /// is released for each poll and the command is kept exclusive by
-    /// `control_gate` instead, so the caller's check may look at the
-    /// queue. A command that outlives its deadline is still the
-    /// device's: its buffers live in the control state for the device's
-    /// whole life, and the caller treats the device as lost.
+    /// is released for each poll, so the caller's check may look at the
+    /// queue. A command that outlives
+    /// its deadline is still the device's: its buffers live in the
+    /// control state for the device's whole life, and the caller treats
+    /// the device as lost.
+    ///
+    /// Commands are issued only from bring-up and from `reinitialize`,
+    /// each on one processor with nothing else running, so the control
+    /// state's own lock is the only discipline needed: no second command
+    /// can be between its submission and its ack.
     fn send_control_command(
         &self,
         class: u8,
@@ -1475,7 +1482,6 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         let Some(control) = self.control.as_ref() else {
             return Err(IoError::Unsupported.into());
         };
-        let _gate = self.control_gate.lock();
         {
             let mut state = control.lock();
             // Destructure under `&mut` so the split borrows of the
@@ -1749,7 +1755,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             })?;
         }
         if let Some(control) = self.control.as_ref() {
-            let queue = control_queue_index(self.control_device_max_pairs());
+            let queue = control_queue_index(self.max_pairs);
             settle(device, queue, &mut expired, || {
                 let state = control
                     .try_lock()
@@ -1760,13 +1766,10 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         Ok(())
     }
 
-    /// The pair count the control queue's index is derived from.
-    fn control_device_max_pairs(&self) -> u16 {
-        if self.features.device(NET_FEATURE_MQ) {
-            read_max_virtqueue_pairs(&self.transport).max(1)
-        } else {
-            1
-        }
+    /// The pair count the device advertises now, which the control
+    /// queue's index is derived from.
+    fn device_max_pairs(&self) -> u16 {
+        device_max_pairs(&self.transport, self.features)
     }
 
     /// Brings a reset device back with the features it had, after
@@ -1783,10 +1786,18 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
     /// control queue, the link state is read again, and the receive
     /// queues are kicked. The control commands are polled, because the
     /// machine is frozen: `expired` bounds each answer.
-    pub fn reinitialize(
-        &self,
-        mut expired: impl FnMut() -> bool,
-    ) -> Result<DeviceReset, ReinitError> {
+    ///
+    /// A restore command that outlives `expired` loses the device for
+    /// good: every later call answers [`ReinitError::DeviceLost`]. A
+    /// failure leaves the device FAILED. The driver keeps no completion
+    /// table, so there is no parked request to fail.
+    pub fn reinitialize(&self, expired: impl FnMut() -> bool) -> Result<DeviceReset, ReinitError> {
+        self.lost.refuse(DeviceType::Network)?;
+        let outcome = self.lost.observe(self.restore(expired));
+        conclude(&self.transport, outcome, |_| {})
+    }
+
+    fn restore(&self, mut expired: impl FnMut() -> bool) -> Result<DeviceReset, ReinitError> {
         let device = DeviceType::Network;
         renegotiate(&self.transport, self.features)?;
 
@@ -1794,17 +1805,15 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         if read_mac_address(&self.transport) != self.mac_address {
             return Err(changed("the hardware address"));
         }
-        let mtu = read_mtu(&self.transport, self.features);
-        if mtu.checked_add(ETH_HEADER_LEN) != Some(self.max_frame_len) {
+        let wire = read_wire_config(&self.transport, self.features);
+        if wire.map(|wire| wire.max_frame_len) != Some(self.max_frame_len) {
             return Err(changed("the MTU"));
         }
-        let rss = self
-            .features
-            .device(NET_FEATURE_RSS)
-            .then(|| read_rss_limits(&self.transport))
-            .filter(|limits| limits.accepts_our_table());
-        if rss != self.rss {
+        if wire.and_then(|wire| wire.rss) != self.rss {
             return Err(changed("the receive scaling limits"));
+        }
+        if self.device_max_pairs() != self.max_pairs {
+            return Err(changed("the number of queue pairs it advertises"));
         }
 
         for (pair_idx, pair) in self.queue_pairs.iter().enumerate() {
@@ -1850,7 +1859,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                 .try_lock()
                 .ok_or(ReinitError::QueueBusy {
                     device,
-                    queue: control_queue_index(self.control_device_max_pairs()),
+                    queue: control_queue_index(self.max_pairs),
                 })?
                 .queue
                 .reinitialize(&self.transport)?;
@@ -2654,6 +2663,16 @@ fn read_max_virtqueue_pairs<T: VirtioTransport>(transport: &T) -> u16 {
     transport.read_config_u16(NET_CONFIG_MAX_VIRTQUEUE_PAIRS_OFFSET)
 }
 
+/// The queue-pair count the device advertises, which places the control
+/// queue at `2 * pairs` (virtio 1.2 §5.1.2).
+fn device_max_pairs<T: VirtioTransport>(transport: &T, features: NegotiatedFeatures) -> u16 {
+    if features.device(NET_FEATURE_MQ) {
+        read_max_virtqueue_pairs(transport).max(1)
+    } else {
+        1
+    }
+}
+
 /// `rss_max_key_size`, `rss_max_indirection_table_length` and
 /// `supported_hash_types`, read as one dword each so the transport's
 /// aligned config accessors cover them.
@@ -2715,6 +2734,35 @@ fn read_link_up<T: VirtioTransport>(transport: &T, features: NegotiatedFeatures)
         return true;
     }
     transport.read_config_u16(NET_CONFIG_STATUS_OFFSET) & NET_STATUS_LINK_UP != 0
+}
+
+/// What the configuration space says about the frames the device carries
+/// and how it steers receives, derived once for bring-up and again for a
+/// re-initialisation, which compares the two.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WireConfig {
+    /// The largest Ethernet frame: the device's MTU and the link header.
+    max_frame_len: usize,
+    /// The receive-side scaling limits the device reported, present only
+    /// when `VIRTIO_NET_F_RSS` was negotiated *and* the device can hold
+    /// the table and key this driver's demux is defined in terms of.
+    rss: Option<RssLimits>,
+}
+
+/// Reads the wire configuration, or `None` when the MTU leaves no room
+/// for the link header in a `usize`.
+fn read_wire_config<T: VirtioTransport>(
+    transport: &T,
+    features: NegotiatedFeatures,
+) -> Option<WireConfig> {
+    let max_frame_len = read_mtu(transport, features).checked_add(ETH_HEADER_LEN)?;
+    // A device that cannot hold the table and key this driver's demux is
+    // defined in terms of is left unsteered rather than half-programmed.
+    let rss = features
+        .device(NET_FEATURE_RSS)
+        .then(|| read_rss_limits(transport))
+        .filter(|limits| limits.accepts_our_table());
+    Some(WireConfig { max_frame_len, rss })
 }
 
 fn read_mtu<T: VirtioTransport>(transport: &T, features: NegotiatedFeatures) -> usize {
@@ -4513,6 +4561,118 @@ mod tests {
         assert_eq!(
             programmed, 2,
             "the control queue at 2 * 4, before and after"
+        );
+    }
+
+    /// A two-pair device offering receive scaling and notification
+    /// coalescing, built without the polled bring-up commands.
+    fn steered_device() -> VirtioNetDevice<FakeTransport> {
+        let transport = multiqueue_transport(
+            NET_FEATURE_MQ
+                | NET_FEATURE_CTRL_VQ
+                | super::NET_FEATURE_RSS
+                | super::NET_FEATURE_NOTF_COAL,
+            2,
+            &[],
+        );
+        // `rss_max_key_size` at 17 and the table length at 18..20 share
+        // the dword at 16 with `duplex`.
+        let key = u32::try_from(super::RSS_KEY_BYTES).unwrap();
+        let table = u32::try_from(super::RSS_INDIRECTION_ENTRIES).unwrap();
+        transport.set_config_u32(16, (key << 8) | (table << 16));
+        transport.set_config_u32(20, super::NET_RSS_HASH_TYPES);
+        VirtioNetDevice::build(transport, QueuePairBudget::new(2))
+            .expect("a steered two-pair device comes up")
+    }
+
+    /// Plays the device on the control queue, recording the class and
+    /// command of every request and acknowledging each with `ack`.
+    fn recording_answers<'a>(
+        device: &'a VirtioNetDevice<FakeTransport>,
+        seen: &'a core::cell::RefCell<Vec<(u8, u8, usize)>>,
+        ack: u8,
+    ) -> impl FnMut() -> bool + 'a {
+        move || {
+            let state = device
+                .control
+                .as_ref()
+                .expect("the device negotiated a control queue")
+                .lock();
+            if let Some(&token) = state.queue.device_in_flight_heads().first() {
+                let request = state.queue.device_request(token);
+                seen.borrow_mut()
+                    .push((request[0], request[1], request.len() - 2));
+                state.queue.device_respond(token, &[ack]);
+                state.queue.device_complete(token, 1);
+            }
+            false
+        }
+    }
+
+    /// A reset device has forgotten its receive steering and its
+    /// coalescing; reinitialisation sends both again.
+    #[test]
+    fn a_reset_device_is_steered_and_coalesced_again() {
+        let device = steered_device();
+        device.quiesce(|| false).expect("the control queue is idle");
+        device.transport.reset_behind_the_driver();
+
+        let seen = core::cell::RefCell::new(Vec::new());
+        assert_eq!(
+            device.reinitialize(recording_answers(&device, &seen, super::CTRL_ACK_OK)),
+            Ok(DeviceReset {
+                device: DeviceType::Network
+            })
+        );
+        let seen = seen.into_inner();
+        assert_eq!(
+            seen.iter()
+                .map(|&(class, command, _)| (class, command))
+                .collect::<Vec<_>>(),
+            [
+                (super::CTRL_CLASS_MQ, super::CTRL_CMD_MQ_RSS_CONFIG),
+                (
+                    super::CTRL_CLASS_NOTF_COAL,
+                    super::CTRL_CMD_NOTF_COAL_RX_SET
+                ),
+                (
+                    super::CTRL_CLASS_NOTF_COAL,
+                    super::CTRL_CMD_NOTF_COAL_TX_SET
+                ),
+            ]
+        );
+        assert_eq!(seen[0].2, super::CTRL_RSS_CONFIG_PAYLOAD_BYTES);
+    }
+
+    #[test]
+    fn a_device_that_advertises_another_pair_count_is_not_driven_again() {
+        let device = steered_device();
+        device.quiesce(|| false).expect("the control queue is idle");
+        device.transport.reset_behind_the_driver();
+        device
+            .transport
+            .set_config_u16(NET_CONFIG_MAX_VIRTQUEUE_PAIRS_OFFSET, 4);
+
+        assert!(matches!(
+            device.reinitialize(|| false),
+            Err(ReinitError::DeviceChanged { .. })
+        ));
+    }
+
+    /// A restore command the device never answers loses the device,
+    /// and nothing drives it afterwards.
+    #[test]
+    fn a_device_lost_by_a_timed_out_restore_is_refused_afterwards() {
+        let device = steered_device();
+        device.quiesce(|| false).expect("the control queue is idle");
+        device.transport.reset_behind_the_driver();
+
+        assert!(device.reinitialize(|| true).is_err());
+        assert_eq!(
+            device.reinitialize(|| false),
+            Err(ReinitError::DeviceLost {
+                device: DeviceType::Network
+            })
         );
     }
 }
