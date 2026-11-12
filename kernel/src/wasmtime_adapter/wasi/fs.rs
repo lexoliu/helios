@@ -2775,8 +2775,9 @@ where
                     // Directory — eagerly seed its direct children into the
                     // embedded FS so read_directory can walk them without
                     // re-entering async 9p I/O.
+                    // The whole listing is mirrored, so the bound is the mirror's.
                     let entries = service
-                        .read_dir(&host_path)
+                        .read_dir(&host_path, GUEST_DIRECTORY_MIRROR_LIMIT)
                         .await
                         .map_err(map_host_fs_error)?;
                     let opened = FsDescriptor {
@@ -3319,6 +3320,20 @@ pub(super) fn map_component_fs_path_error(
     }
 }
 
+/// The most a guest's directory listing may mirror from the host share.
+///
+/// Every WASI surface pulls a host directory whole into the embedded
+/// filesystem as nodes (`seed_host_directory_entries`) before the guest reads
+/// it, so the guest's buffer pages an already-held listing and bounds nothing,
+/// and the kernel keeps no per-guest budget for the mirror. This is therefore
+/// a policy bound chosen here, not one derived from a stated budget: it keeps
+/// a host that never ends a listing from growing kernel memory without limit,
+/// while a real directory of tens of thousands of names still lists.
+pub(crate) const GUEST_DIRECTORY_MIRROR_LIMIT: crate::HostDirLimit = crate::HostDirLimit {
+    max_entries: 65_536,
+    max_name_bytes: 4 * 1024 * 1024,
+};
+
 pub(crate) fn map_host_fs_error(error: crate::HostFsError) -> fs_types::ErrorCode {
     match error.kind() {
         HostFsErrorKind::NoEntry => fs_types::ErrorCode::NoEntry,
@@ -3328,6 +3343,7 @@ pub(crate) fn map_host_fs_error(error: crate::HostFsError) -> fs_types::ErrorCod
         HostFsErrorKind::NotEmpty => fs_types::ErrorCode::NotEmpty,
         HostFsErrorKind::ReadOnly => fs_types::ErrorCode::ReadOnly,
         HostFsErrorKind::Unsupported => fs_types::ErrorCode::Unsupported,
+        HostFsErrorKind::NameTooLong => fs_types::ErrorCode::NameTooLong,
         HostFsErrorKind::Io => fs_types::ErrorCode::Io,
     }
 }

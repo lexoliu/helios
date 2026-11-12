@@ -15,7 +15,48 @@ pub(super) enum DhcpClientState {
         server_identifier: Ipv4Address,
         last_sent: StackInstant,
     },
+    /// INIT-REBOOT (RFC 2131 section 3.2): the interface holds an
+    /// address from before a machine restore and has asked any server
+    /// on the link to confirm it.
+    Rebooting {
+        transaction_id: u32,
+        requested_ip: Ipv4Address,
+        /// REQUESTs sent so far, the first included.
+        attempts: u32,
+        last_sent: StackInstant,
+    },
     Bound,
+}
+
+impl DhcpClientState {
+    /// Whether `message` is a reply to the request this client has
+    /// outstanding.
+    ///
+    /// RFC 2131 §4.3.2 and §4.4.1 (table 4) make DHCPACK and DHCPNAK
+    /// meaningful only in REQUESTING, RENEWING, REBINDING and REBOOTING,
+    /// and require a client to discard a message whose `xid` is not its
+    /// own; §3.1 has the selected server alone answer the REQUEST, and a
+    /// server's NAK carries its server identifier (§4.3.2, table 3).
+    /// This client has no RENEWING or REBINDING state (a lease is never
+    /// renewed). `Requesting` accepts a reply from the server it
+    /// selected. `Rebooting` selected none: its INIT-REBOOT REQUEST
+    /// carries no server identifier and any server on the link may
+    /// confirm or refuse the address (§3.2, §4.3.2), so the `xid` alone
+    /// decides. `Bound` never accepts one.
+    pub(super) fn accepts_reply(&self, message: &DhcpServerMessage) -> bool {
+        match *self {
+            Self::Requesting {
+                transaction_id,
+                server_identifier,
+                ..
+            } => {
+                message.transaction_id == transaction_id
+                    && message.server_identifier == Some(server_identifier)
+            }
+            Self::Rebooting { transaction_id, .. } => message.transaction_id == transaction_id,
+            Self::Init { .. } | Self::Selecting { .. } | Self::Bound => false,
+        }
+    }
 }
 
 impl<CpuImpl, DeviceImpl> NetworkService<CpuImpl, DeviceImpl>
@@ -66,6 +107,11 @@ where
     }
 
     /// Runs one dual-family lookup over an already-open resolver socket.
+    ///
+    /// The lookup's two question ids are drawn at random from the
+    /// socket's shard. An answer is matched on this lookup's own
+    /// socket, so the ids have to differ from each other and from
+    /// nothing else: no lookup holds an id another could want.
     async fn resolve_through(
         &self,
         socket: &ResolverSocket,
@@ -77,7 +123,7 @@ where
             .state
             .shard_at(socket.shard_idx)
             .lock()
-            .next_dns_query_pair();
+            .draw_dns_query_pair();
         let mut answers = DnsAnswers::new();
         loop {
             // The answers land in the socket's own shard, whichever
@@ -91,7 +137,7 @@ where
             let now = StackInstant::from_nanos(self.now_nanos());
             let mut shard = self.inner.state.shard_at(socket.shard_idx).lock();
             shard.send_dns_queries(socket, queries, host, &answers, now)?;
-            shard.poll_dns_responses(socket, queries, &mut answers)?;
+            shard.poll_dns_responses(socket, queries, host, &mut answers)?;
             drop(shard);
             if answers.complete() {
                 return answers.finish();
@@ -252,6 +298,36 @@ where
         })
     }
 
+    /// Asks the DHCP server whether the lease the interface holds is
+    /// still good, once the machine has been restored.
+    ///
+    /// The DHCP client lives on the default shard, so that is the one
+    /// state this touches, under its own lock for the length of one
+    /// message. Live TCP is left alone: a connection keeps working if
+    /// the lease is confirmed. Resolves once the REQUEST has
+    /// been handed to the device; the packet pumps carry the exchange
+    /// on from there.
+    pub(super) async fn revalidate_lease(&self) {
+        let now_nanos = self.now_nanos();
+        let transaction_id = next_transaction_id(now_nanos as u32);
+        let sent = self
+            .inner
+            .state
+            .shard_for_default()
+            .lock()
+            .begin_lease_revalidation(transaction_id, StackInstant::from_nanos(now_nanos));
+        match sent {
+            Ok(true) => {
+                tracing::info!("machine restored: re-validating the DHCP lease");
+                if let Err(error) = self.drive_network(NetworkPollSource::Configuration).await {
+                    tracing::warn!(?error, "the lease re-validation could not be sent");
+                }
+            }
+            Ok(false) => {}
+            Err(error) => tracing::warn!(?error, "the lease re-validation could not be built"),
+        }
+    }
+
     pub(super) async fn drive_dns(&self) -> Result<(), DnsError> {
         self.drive_network(NetworkPollSource::Dns)
             .await
@@ -305,6 +381,10 @@ where
 
     fn hardware_address(&self) -> [u8; 6] {
         NetworkService::hardware_address(self)
+    }
+
+    async fn revalidate_lease(&self) {
+        NetworkService::revalidate_lease(self).await;
     }
 
     async fn ipv4_cidr(&self) -> Option<crate::Ipv4Cidr> {
@@ -804,30 +884,40 @@ impl NetworkShard {
                         last_sent: now,
                     };
                 }
-                (DhcpClientState::Requesting { transaction_id, .. }, DhcpMessageType::Ack)
-                    if message.transaction_id == transaction_id =>
+                (DhcpClientState::Requesting { .. }, DhcpMessageType::Ack)
+                    if self.dhcp.accepts_reply(&message) =>
                 {
-                    let prefix_len = message
-                        .subnet_mask
-                        .map(ipv4_mask_prefix_len)
-                        .transpose()?
-                        .ok_or(NetworkControlError::InvalidAddress)?;
-                    self.stack
-                        .add_ipv4_address(Ipv4Cidr::new(message.your_ip, prefix_len));
-                    if let Some(router) = message.router {
-                        self.set_default_ipv4_gateway(map_ipv4_address(router))?;
-                    }
-                    self.dns_servers.clear();
-                    self.dns_servers.extend(message.dns_servers);
-                    self.dhcp = DhcpClientState::Bound;
+                    self.bind_lease(message)?;
                 }
-                (_, DhcpMessageType::Nak) => {
+                (DhcpClientState::Rebooting { requested_ip, .. }, DhcpMessageType::Ack)
+                    if self.dhcp.accepts_reply(&message) =>
+                {
+                    if message.your_ip != requested_ip {
+                        // The server granted another address: the one
+                        // held from before the restore is not ours.
+                        self.stack.clear_ipv4_addresses();
+                    }
+                    self.bind_lease(message)?;
+                }
+                // A refused INIT-REBOOT means the address held from
+                // before the restore is not ours (RFC 2131 §3.2, step 3).
+                (
+                    DhcpClientState::Requesting { .. } | DhcpClientState::Rebooting { .. },
+                    DhcpMessageType::Nak,
+                ) if self.dhcp.accepts_reply(&message) => {
                     self.stack.clear_ipv4_addresses();
                     self.dhcp = DhcpClientState::Init {
                         transaction_id: next_transaction_id(message.transaction_id),
                     };
                 }
-                _ => {}
+                (state, message_type) => {
+                    tracing::debug!(
+                        ?state,
+                        ?message_type,
+                        transaction_id = message.transaction_id,
+                        "dropped DHCP message that is not a reply to the outstanding exchange"
+                    );
+                }
             }
         }
 
@@ -841,6 +931,67 @@ impl NetworkShard {
             self.retransmit_dhcp(now)?;
         }
         Ok(())
+    }
+
+    /// Applies an ACK: the address, gateway and resolvers it carries
+    /// become the interface's configuration, and the client is bound.
+    fn bind_lease(&mut self, message: DhcpServerMessage) -> Result<(), NetworkControlError> {
+        let prefix_len = message
+            .subnet_mask
+            .map(ipv4_mask_prefix_len)
+            .transpose()?
+            .ok_or(NetworkControlError::InvalidAddress)?;
+        self.stack
+            .add_ipv4_address(Ipv4Cidr::new(message.your_ip, prefix_len))
+            .map_err(|_| NetworkControlError::InvalidAddress)?;
+        if let Some(router) = message.router {
+            self.set_default_ipv4_gateway(map_ipv4_address(router))?;
+        }
+        self.dns_servers.clear();
+        self.dns_servers.extend(message.dns_servers);
+        self.dhcp = DhcpClientState::Bound;
+        Ok(())
+    }
+
+    /// Starts INIT-REBOOT for the lease the interface holds, after a
+    /// machine restore that may have moved it to another network.
+    ///
+    /// Returns whether a question was sent: only a client that is bound
+    /// holds a lease to ask about, and one that is not has an exchange
+    /// of its own under way, which already asks the link for an address.
+    /// The address stays in use until the server answers or the retries
+    /// run out ([`DHCP_REBOOT_ATTEMPTS`]).
+    pub(super) fn begin_lease_revalidation(
+        &mut self,
+        transaction_id: u32,
+        now: StackInstant,
+    ) -> Result<bool, NetworkControlError> {
+        if self.dhcp != DhcpClientState::Bound {
+            return Ok(false);
+        }
+        let Some(lease) = self.stack.primary_ipv4_address() else {
+            return Ok(false);
+        };
+        let requested_ip = lease.address();
+        self.send_dhcp_init_reboot(transaction_id, requested_ip, now)?;
+        self.dhcp = DhcpClientState::Rebooting {
+            transaction_id,
+            requested_ip,
+            attempts: 1,
+            last_sent: now,
+        };
+        Ok(true)
+    }
+
+    pub(super) fn send_dhcp_init_reboot(
+        &mut self,
+        transaction_id: u32,
+        requested_ip: Ipv4Address,
+        now: StackInstant,
+    ) -> Result<(), NetworkControlError> {
+        let message =
+            DhcpClientMessage::init_reboot(transaction_id, self.stack.config().mac, requested_ip);
+        self.send_dhcp_message(message, transaction_id as u16, now)
     }
 
     pub(super) fn send_dhcp_discover(
@@ -943,21 +1094,13 @@ impl NetworkShard {
         self.stack.take_icmp_echo_reply(key)
     }
 
-    fn next_dns_query_id(&mut self) -> u16 {
-        let id = self.next_dns_query_id;
-        self.next_dns_query_id = self.next_dns_query_id.wrapping_add(1);
-        if self.next_dns_query_id == 0 {
-            self.next_dns_query_id = 1;
-        }
-        id
-    }
-
-    /// The two question ids one dual-family lookup will carry.
-    pub(super) fn next_dns_query_pair(&mut self) -> DnsQueryPair {
-        DnsQueryPair {
-            a: self.next_dns_query_id(),
-            aaaa: self.next_dns_query_id(),
-        }
+    /// The two question ids one dual-family lookup will carry, drawn
+    /// from the shard's random stream.
+    pub(super) fn draw_dns_query_pair(&mut self) -> DnsQueryPair {
+        DnsQueryPair::from_draws(
+            self.entropy.below(DnsQueryPair::IDS),
+            self.entropy.below(DnsQueryPair::IDS - 1),
+        )
     }
 
     /// Sends whichever of the pair's questions is still outstanding.
@@ -1014,10 +1157,16 @@ impl NetworkShard {
 
     /// Drains this lookup's resolver socket, banking whichever of the
     /// pair's answers have arrived.
+    ///
+    /// A datagram counts as an answer only when its id selects one of
+    /// the pair and the question it repeats is `host` with that id's
+    /// record type: anything else, a forgery included, is dropped and
+    /// leaves the question outstanding.
     pub(super) fn poll_dns_responses(
         &mut self,
         socket: &ResolverSocket,
         queries: DnsQueryPair,
+        host: &str,
         answers: &mut DnsAnswers,
     ) -> Result<(), DnsError> {
         let socket = socket.stack_socket;
@@ -1025,16 +1174,22 @@ impl NetworkShard {
             kind: DnsErrorKind::Unavailable,
             detail: NetworkErrorDetail::DnsQueryStartFailed,
         })? {
-            let Some(message) = DnsResponse::parse(&datagram.bytes).and_then(DnsResponse::message)
-            else {
+            let Some(response) = DnsResponse::parse(&datagram.bytes) else {
                 continue;
             };
-            if message.id == queries.a {
-                answers.a_answered = true;
-            } else if message.id == queries.aaaa {
-                answers.aaaa_answered = true;
+            let record = if response.id() == queries.a {
+                DnsRecordType::A
+            } else if response.id() == queries.aaaa {
+                DnsRecordType::Aaaa
             } else {
                 continue;
+            };
+            let Some(message) = response.message(DnsQuery { name: host, record }) else {
+                continue;
+            };
+            match record {
+                DnsRecordType::A => answers.a_answered = true,
+                DnsRecordType::Aaaa => answers.aaaa_answered = true,
             }
             answers.extend(message.addresses.iter().copied());
         }
@@ -1049,7 +1204,9 @@ impl NetworkShard {
         now: StackInstant,
     ) -> Result<(), NetworkControlError> {
         if self.stack.ipv6_link_local_address().is_none() {
-            self.stack.configure_ipv6_link_local();
+            self.stack
+                .configure_ipv6_link_local()
+                .map_err(|_| NetworkControlError::BackendFault)?;
         }
         self.stack
             .drive_ipv6_autoconfig(now)
@@ -1073,6 +1230,25 @@ pub(super) struct ResolverSocket {
 pub(super) struct DnsQueryPair {
     pub(super) a: u16,
     pub(super) aaaa: u16,
+}
+
+impl DnsQueryPair {
+    /// Ids a question may carry: every nonzero 16-bit value.
+    pub(super) const IDS: u32 = u16::MAX as u32;
+
+    /// The pair two uniform draws select: `first` in `0..IDS` picks the
+    /// `A` id, and `second` in `0..IDS - 1` picks the `AAAA` id among
+    /// the ids that are left, so the two always differ and neither is
+    /// zero.
+    pub(super) fn from_draws(first: u32, second: u32) -> Self {
+        debug_assert!(first < Self::IDS && second < Self::IDS - 1);
+        // Both sums are reduced below `IDS` before the `1 +`, so each
+        // id lies in `1..=u16::MAX`.
+        Self {
+            a: (1 + first) as u16,
+            aaaa: (1 + (first + 1 + second) % Self::IDS) as u16,
+        }
+    }
 }
 
 /// Answers accumulated for one dual-family lookup.

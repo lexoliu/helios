@@ -15,10 +15,10 @@ name: bench-suite
 #     default) and by pull requests carrying the `bench` label.
 #
 # A pull request also runs **paired**: a second Helios image is built from
-# the merge base with dev and every workload is booted for both images
-# back to back on the one runner. That comparison carries no change of
-# machine, so its half of the gate blocks on a headline regression even
-# though the report itself is advisory (#173).
+# the dev commit it is merged against and every workload is booted for
+# both images back to back on the one runner. That comparison carries no
+# change of machine, so its half of the gate blocks on a headline
+# regression even though the report itself is advisory (#173).
 
 on:
   workflow_dispatch:
@@ -68,8 +68,15 @@ on:
 # dispatch. The event is part of the group because a push to `dev` runs
 # only `tooling`, and in one group with a dispatched measurement it
 # cancelled that measurement hours in (#318).
+#
+# A label other than `bench` runs nothing (`tooling` skips, and every
+# other job needs it) and takes a group of its own, so it cannot cancel a
+# measurement hours in (#687).
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  group: >-
+    ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}${{
+      github.event.action == 'labeled' && github.event.label.name != 'bench'
+      && format('-label-{0}', github.run_id) || '' }}
   cancel-in-progress: true
 
 permissions:
@@ -83,6 +90,7 @@ env:
 jobs:
   tooling:
     name: tooling
+    if: github.event.action != 'labeled' || github.event.label.name == 'bench'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     outputs:
@@ -96,6 +104,16 @@ jobs:
       per_column_profiles: ${{ steps.mode.outputs.per_column_profiles }}
       profile_columns: ${{ steps.columns.outputs.profile_columns }}
       baseline_profile: ${{ steps.mode.outputs.baseline_profile }}
+      # The commit the baseline column is built from, resolved once here:
+      # the profile collections and the suite job read the same one
+      # (#773). Empty when the run pairs nothing.
+      baseline_sha: ${{ steps.columns.outputs.baseline_sha }}
+      # The Wasmtime fork the paired baseline commit pins, and the
+      # directory beside the candidate its checkout is laid out in: empty
+      # when it pins the candidate's own fork (#486).
+      baseline_fork_root: ${{ steps.columns.outputs.baseline_fork_root }}
+      baseline_wasmtime_repository: ${{ steps.columns.outputs.baseline_wasmtime_repository }}
+      baseline_wasmtime_revision: ${{ steps.columns.outputs.baseline_wasmtime_revision }}
       # The suite's matrix, from tools/bench/manifest.toml: the lanes have
       # one definition.
       matrix: ${{ steps.lanes.outputs.matrix }}
@@ -107,10 +125,14 @@ jobs:
           BASELINE_REF: ${{ inputs.baseline_ref }}
           BASELINE_KERNEL_BUILD: ${{ inputs.baseline_kernel_build }}
           TCP_PROBE: ${{ inputs.tcp_probe }}
-          # A labelled pull request is paired against its base the way
-          # the suite job pairs it, by the base SHA GitHub merged against.
+          # A labelled pull request is paired against the dev commit it is
+          # merged against: the first parent of the merge commit the run
+          # checked out, which is the candidate. The event's `base.sha`
+          # is the tip dev had when the pull request was opened, and
+          # every commit dev gained since would be measured as the pull
+          # request's (#773).
           PR_BENCH: ${{ github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'bench') }}
-          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_MERGE_SHA: ${{ github.sha }}
         run: |
           if [ "$EVENT_NAME" = workflow_dispatch ]; then
             echo "advisory=$REQUESTED_ADVISORY" >> "$GITHUB_OUTPUT"
@@ -130,8 +152,9 @@ jobs:
           # commit is paired and built the profiled way — a plain control
           # has no profile to collect. Paired runs are the acceptance
           # dispatches above and a labelled pull request, which the suite
-          # pairs against its base SHA; the TCP probe pairs too but is
-          # diagnosis, not measurement, and reads the fetched profile.
+          # pairs against the commit it is merged against; the TCP probe
+          # pairs too but is diagnosis, not measurement, and reads the
+          # fetched profile.
           # `profile-columns` spends the list as its matrix;
           # `baseline_profile` tells the suite whether the baseline
           # column's artifact exists.
@@ -139,7 +162,7 @@ jobs:
           per_column_profiles=false
           if [ "$TCP_PROBE" != true ]; then
             if [ "$PR_BENCH" = true ]; then
-              pairing_ref="$PR_BASE_SHA"
+              pairing_ref="$PR_MERGE_SHA^1"
               per_column_profiles=true
             elif [ "$EVENT_NAME" = workflow_dispatch ] && [ "$REQUESTED_ADVISORY" = true ] \
               && { [ -n "$BASELINE_REF" ] || [ "$BASELINE_KERNEL_BUILD" = release ]; }; then
@@ -156,8 +179,13 @@ jobs:
           echo "pairing_ref=$pairing_ref" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
         with:
+          # Beside the Wasmtime fork, which helios-compiler-host builds
+          # against through the workspace's `../wasmtime` path.
+          path: helios
           # The matrix below resolves the pairing ref against history.
           fetch-depth: 0
+      - uses: ./helios/.github/actions/checkout-wasmtime
+      - uses: astral-sh/setup-uv@v6
       # The collections' matrix, with every ref resolved to its commit:
       # `actions/checkout` reads a `ref` that is not forty hex digits as
       # a branch or tag, so a short SHA or `merge-base` has to be
@@ -167,50 +195,85 @@ jobs:
       # the suite builds the baseline once more against it, and how far
       # the two builds of one commit time apart is the build drift the
       # gate holds every row to (#479).
+      # Each column builds against the Wasmtime fork its own commit pins
+      # (#486), and the kernel profile names Wasmtime's crates by the
+      # fork's absolute path (#359): a baseline pinning another fork than
+      # the candidate's is laid out in a directory of its own, and its
+      # collections get the same `root` so they compile against the fork
+      # at the path the suite will build it from. `helios-bench
+      # baseline-fork` reads the pin from the baseline commit.
       - id: columns
+        working-directory: helios
         env:
           CANDIDATE_SHA: ${{ github.sha }}
           PAIRING_REF: ${{ steps.mode.outputs.pairing_ref }}
           BASELINE_PROFILE: ${{ steps.mode.outputs.baseline_profile }}
         run: |
           candidate="$(jq -c -n --arg ref "$CANDIDATE_SHA" \
-            '{column: "candidate", ref: $ref, artifact: "helios-kernel-profdata-candidate"}')"
-          if [ "$BASELINE_PROFILE" = true ]; then
+            '{column: "candidate", ref: $ref, artifact: "helios-kernel-profdata-candidate", root: ""}')"
+          sha=""
+          root=""
+          repository=""
+          revision=""
+          if [ -n "$PAIRING_REF" ]; then
             if [ "$PAIRING_REF" = merge-base ]; then
               sha="$(git merge-base HEAD origin/dev)"
             else
               sha="$(git rev-parse --verify "$PAIRING_REF^{commit}")"
             fi
-            baseline="$(jq -c -n --arg ref "$sha" \
-              '{column: "baseline", ref: $ref, artifact: "helios-kernel-profdata-baseline"}')"
-            rebuild="$(jq -c -n --arg ref "$sha" \
-              '{column: "baseline-rebuild", ref: $ref, artifact: "helios-kernel-profdata-baseline-rebuild"}')"
+            fork="$(uv run --project tools/bench --quiet helios-bench baseline-fork --sha "$sha")"
+            root="$(printf '%s' "$fork" | jq -r .root)"
+            repository="$(printf '%s' "$fork" | jq -r .repository)"
+            revision="$(printf '%s' "$fork" | jq -r .revision)"
+          fi
+          {
+            echo "baseline_sha=$sha"
+            echo "baseline_fork_root=$root"
+            echo "baseline_wasmtime_repository=$repository"
+            echo "baseline_wasmtime_revision=$revision"
+          } >> "$GITHUB_OUTPUT"
+          if [ "$BASELINE_PROFILE" = true ]; then
+            baseline="$(jq -c -n --arg ref "$sha" --arg root "$root" \
+              '{column: "baseline", ref: $ref, artifact: "helios-kernel-profdata-baseline", root: $root}')"
+            rebuild="$(jq -c -n --arg ref "$sha" --arg root "$root" \
+              '{column: "baseline-rebuild", ref: $ref, artifact: "helios-kernel-profdata-baseline-rebuild", root: $root}')"
             columns="$(jq -c -n --argjson candidate "$candidate" --argjson baseline "$baseline" \
               --argjson rebuild "$rebuild" '[$candidate, $baseline, $rebuild]')"
           else
             columns="$(jq -c -n --argjson candidate "$candidate" '[$candidate]')"
           fi
           echo "profile_columns=$columns" >> "$GITHUB_OUTPUT"
-      - uses: astral-sh/setup-uv@v6
       - name: Lint and test tools/bench
-        working-directory: tools/bench
+        working-directory: helios/tools/bench
         run: |
           uv sync --quiet
           uv run ruff check .
           uv run ruff format --check .
           uv run pytest -q
       - id: lanes
-        working-directory: tools/bench
+        working-directory: helios/tools/bench
         run: |
           select="${{ github.event_name == 'workflow_dispatch' && inputs.lanes || 'all' }}"
           echo "matrix=$(uv run helios-bench lanes --select "$select" --format github-matrix)" >> "$GITHUB_OUTPUT"
       - name: Verify the committed README and docs sections match their run's report
-        working-directory: tools/bench
+        working-directory: helios/tools/bench
         run: uv run helios-bench render check
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.13.0
+      # helios-compiler-host is a glibc binary for the Fedora guest, linked
+      # through zig.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+      # The host tool links the Wasmtime fork, a release build this job
+      # would otherwise repeat from nothing on every run.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: helios
+          key: bench-native
       - name: Build the native counterparts
+        working-directory: helios
         run: tools/bench/native/build.sh x86_64
 
   # A paired run holds each column to a profile collected from the commit
@@ -241,6 +304,7 @@ jobs:
     with:
       ref: ${{ matrix.ref }}
       artifact: ${{ matrix.artifact }}
+      root: ${{ matrix.root }}
 
   suite:
     name: suite-${{ matrix.lane }}
@@ -272,10 +336,7 @@ jobs:
       HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
       HELIOS_BOOT_SYNC_TIMEOUT_SECS: ${{ matrix.boot-timeout }}
       HELIOS_WORKLOAD_BENCH_RUNTIME_DIR: ${{ github.workspace }}/bench-runtime
-      BENCH_BASELINE_REF: >-
-        ${{ github.event_name == 'pull_request'
-            && github.event.pull_request.base.sha
-            || inputs.baseline_ref }}
+      BENCH_BASELINE_REF: ${{ needs.tooling.outputs.baseline_sha }}
       BENCH_BASELINE_KERNEL_BUILD: ${{ inputs.baseline_kernel_build }}
     timeout-minutes: ${{ inputs.tcp_probe && 40 || 420 }}
     strategy:
@@ -287,13 +348,22 @@ jobs:
         with:
           path: helios
           # The paired mode builds a git worktree of the commit this pull
-          # request branched from, so the checkout has to carry history
+          # request is merged against, so the checkout has to carry history
           # rather than the single commit a default checkout fetches.
           fetch-depth: 0
       - uses: ./helios/.github/actions/checkout-wasmtime
+      # The fork the baseline commit pins, when it is not the candidate's:
+      # its checkout is laid out beside it, at the path its profile was
+      # collected against (#486, tools/bench/src/helios_bench/baseline.py).
+      - name: Check out the baseline's Wasmtime fork
+        if: needs.tooling.outputs.baseline_fork_root != ''
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ needs.tooling.outputs.baseline_wasmtime_repository }}
+          ref: ${{ needs.tooling.outputs.baseline_wasmtime_revision }}
+          path: ${{ needs.tooling.outputs.baseline_fork_root }}/wasmtime
       - uses: ./helios/.github/actions/bench-host
         with:
-          rust-cache-key: bench-suite-${{ matrix.lane }}
           network-tools: ${{ matrix.net-backend == 'tap' }}
           guest-arch: ${{ matrix.guest-arch }}
           flamegraphs: "true"
@@ -399,10 +469,10 @@ jobs:
           if [ -n "${{ inputs.iterations }}" ]; then
             args+=(--iterations "${{ inputs.iterations }}")
           fi
-          # A pull request is timed against the commit it branched from,
-          # named by its base SHA rather than recomputed: that is the
-          # merge base GitHub itself used, and it is in the checkout
-          # because this job fetched the history.
+          # The baseline is the commit the tooling job resolved: a
+          # dispatch's `baseline_ref`, or the dev commit a pull request is
+          # merged against. It is in the checkout because this job
+          # fetched the history.
           if [ -n "${BENCH_BASELINE_REF}" ]; then
             args+=(--baseline-ref "${BENCH_BASELINE_REF}")
           fi
@@ -544,7 +614,6 @@ jobs:
       - uses: ./helios/.github/actions/checkout-wasmtime
       - uses: ./helios/.github/actions/bench-host
         with:
-          rust-cache-key: suite-pgo
           network-tools: "true"
           flamegraphs: "true"
           inspector: "true"

@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
@@ -25,6 +26,7 @@ use wasmparser::Parser as WasmParser;
 use wit_component::ComponentEncoder;
 
 mod boot_kernel;
+mod venus_fetch;
 
 /// Why a `helios-cli` invocation did not do what it was asked.
 ///
@@ -43,6 +45,10 @@ enum CliError {
     LimineUefiImage(#[from] LimineError),
     #[error("{0}")]
     ProfileFetch(#[from] ProfileFetchError),
+    #[error("{0}")]
+    VenusProtocolFetch(#[from] venus_fetch::VenusFetchError),
+    #[error("{0}")]
+    WorkspaceRoot(#[from] WorkspaceRootError),
 }
 
 /// Why an ahead-of-time compile did not produce a signed artifact.
@@ -131,7 +137,18 @@ enum KeyError {
         #[source]
         source: rand::rngs::SysError,
     },
+    #[error(
+        "{path} is a secret key with mode {mode:03o}; it must be readable by its owner alone (600)"
+    )]
+    SecretKeyExposed { path: String, mode: u32 },
 }
+
+/// The mode a secret key file is created with: its owner reads and writes
+/// it, and nobody else can open it.
+const SECRET_KEY_MODE: u32 = 0o600;
+
+/// The permission bits of everyone but the owner.
+const GROUP_AND_OTHER: u32 = 0o077;
 
 /// Why the kernel-prebuild manifest and the bootfs it describes could
 /// not be produced.
@@ -650,6 +667,9 @@ enum Commands {
     KernelPrebuild(KernelPrebuildCommand),
     LimineUefiImage(LimineUefiImageCommand),
     ProfileFetch(ProfileFetchCommand),
+    /// Download the venus-protocol files `venus/protocol-inputs.toml` pins,
+    /// which the `helios-venus` build reads.
+    VenusProtocolFetch,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -860,6 +880,10 @@ fn run(cli: Cli) -> Result<(), CliError> {
         Commands::LimineUefiImage(command) => Ok(run_limine_uefi_image(command)?),
         Commands::ProfileFetch(command) => {
             Ok(run_profile_fetch(command, cli.workspace_root.as_deref())?)
+        }
+        Commands::VenusProtocolFetch => {
+            let workspace_root = WorkspaceRoot::resolve(cli.workspace_root.as_deref())?;
+            Ok(venus_fetch::run(workspace_root.path())?)
         }
     }
 }
@@ -1531,6 +1555,15 @@ fn build_compiler_plugin_asset(build: &BootBuild<'_>) -> Result<BootAsset, Bootf
             source,
         }
     })?;
+    // The exact module this run precompiled into the bootfs, at a path that
+    // does not depend on cargo's target-directory layout: the bench's Linux
+    // + Wasmtime column runs this file under `helios-compiler-host`, so both
+    // columns run one plugin build.
+    let wasm_output_path = build.out_dir.join("compiler_plugin.wasm");
+    fs::write(&wasm_output_path, &wasm).map_err(|source| BootfsError::Write {
+        path: wasm_output_path.display().to_string(),
+        source,
+    })?;
     let output_path = build.out_dir.join("compiler_plugin.cwasm");
     write_bootfs_artifact(&output_path, signed)?;
 
@@ -2123,10 +2156,18 @@ fn ensure_root_keypair(
             .try_fill_bytes(&mut secret)
             .map_err(|source| KeyError::Entropy { source })?;
         let signing_key = SigningKey::from_bytes(&secret);
-        fs::write(root_secret_path, signing_key.to_bytes()).map_err(|source| KeyError::Write {
-            path: root_secret_path.display().to_string(),
-            source,
-        })?;
+        // The mode is set by the call that creates the file, so the secret
+        // is never on disk under the process umask.
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(SECRET_KEY_MODE)
+            .open(root_secret_path)
+            .and_then(|mut file| file.write_all(&signing_key.to_bytes()))
+            .map_err(|source| KeyError::Write {
+                path: root_secret_path.display().to_string(),
+                source,
+            })?;
         signing_key
     };
     // The public key always lands next to the secret: it is the copy the
@@ -2146,10 +2187,21 @@ fn ensure_root_keypair(
 }
 
 fn read_signing_key(path: &Path) -> Result<SigningKey, KeyError> {
-    let bytes = fs::read(path).map_err(|source| KeyError::Read {
+    let read_error = |source| KeyError::Read {
         path: path.display().to_string(),
         source,
-    })?;
+    };
+    let mut file = fs::File::open(path).map_err(read_error)?;
+    // Judged on the open handle, so the file read is the file checked.
+    let mode = file.metadata().map_err(read_error)?.permissions().mode() & 0o777;
+    if mode & GROUP_AND_OTHER != 0 {
+        return Err(KeyError::SecretKeyExposed {
+            path: path.display().to_string(),
+            mode,
+        });
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(read_error)?;
     let secret_bytes: [u8; 32] =
         bytes
             .as_slice()
@@ -2164,6 +2216,32 @@ fn read_signing_key(path: &Path) -> Result<SigningKey, KeyError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_root_secret_is_readable_by_its_owner_alone() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let secret = dir.path().join(ROOT_SECRET_FILE);
+        ensure_root_keypair(&secret, &dir.path().join("root.pub")).expect("a new keypair");
+        let mode = fs::metadata(&secret)
+            .expect("the secret was written")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, SECRET_KEY_MODE);
+    }
+
+    #[test]
+    fn a_root_secret_others_can_read_is_refused_with_its_mode() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let secret = dir.path().join(ROOT_SECRET_FILE);
+        fs::write(&secret, [7_u8; 32]).expect("a key file");
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o644)).expect("a wider mode");
+        let error = ensure_root_keypair(&secret, &dir.path().join("root.pub"))
+            .expect_err("a world-readable secret is refused");
+        assert!(
+            matches!(error, KeyError::SecretKeyExposed { mode: 0o644, .. }),
+            "{error}"
+        );
+    }
 
     #[test]
     fn every_shape_of_github_token_makes_a_header_line() {

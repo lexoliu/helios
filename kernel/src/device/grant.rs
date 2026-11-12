@@ -140,18 +140,18 @@ pub enum GrantError {
     NoSuchRegion,
     #[error("the grant has no interrupt with this index")]
     NoSuchInterrupt,
-    #[error("the region is already mapped into the owner's memory")]
+    #[error("the region is already shown in the owner's memory")]
     RegionAlreadyMapped,
-    #[error("the owner's device window has no room left")]
-    WindowExhausted,
     #[error("the request exceeds the device's pinned-memory budget")]
     BudgetExhausted,
     #[error("the alignment is not a power of two")]
     BadAlignment,
     #[error("a buffer the device cannot reach was allocated for it")]
     Unreachable,
-    #[error("the address space refused the mapping: {0}")]
-    AddressSpace(#[from] helios_hal::vmm::AddressSpaceError),
+    #[error("the region or ring could not be shown in the owner's memory: {0}")]
+    View(#[from] crate::buffer::ViewError),
+    #[error("the ring could not be pinned: {0}")]
+    Buffer(#[from] crate::buffer::BufferError),
 }
 
 /// One device instance, whole: the physical ranges it answers on, the

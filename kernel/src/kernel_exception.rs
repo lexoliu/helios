@@ -88,19 +88,28 @@ pub fn install_native_trap_handler(handler: KernelNativeTrapHandler) {
 /// Hands `exception` to the runtime's native trap handler.
 ///
 /// Returns [`KernelExceptionDispatch::Unhandled`] when no handler is
-/// installed yet or when the runtime did not claim the exception; a
-/// claimed exception never returns here, because the handler unwinds
-/// out of the faulting stack.
+/// installed yet or when the runtime did not claim the exception. A
+/// claimed exception never returns here: the handler ends it by writing
+/// the stack and frame pointers of the runtime's resume point and
+/// branching there, and that write is where execution leaves the stack
+/// this call was made on. No backend code runs after it.
 ///
-/// A backend restores everything its entry's epilogue would have
-/// restored before it calls this: the interrupted context's interrupt
-/// mask, and any per-processor entry state the epilogue hands back (the
-/// RISC-V entry's trap stack top in `sscratch`). The exception entry
-/// masked interrupts and marked the processor as inside a handler, a
-/// claimed trap never returns through the epilogue, and what the
-/// handler unwinds into is the interrupted code's continuation, which
-/// must run on that code's terms and take its next trap on the trap
-/// stack.
+/// So the backend calls this with the processor already in the state
+/// its exception epilogue would have restored: the interrupted context's
+/// interrupt mask and stack-pointer selection, and every piece of
+/// per-processor entry state the epilogue hands back (the AArch64
+/// exception-stack top in `SP_EL0` with `SP_EL1` selected, the RISC-V
+/// trap-stack top in `sscratch`). It calls from a stack that no
+/// exception taken during the call builds its frame on: the interrupted
+/// stack itself, after the epilogue has returned onto it, or a
+/// per-processor stack set aside for the call, which the backend
+/// switches to off the exception stack. The switch and the hand-back
+/// are one step, taken with interrupts still masked and in that order,
+/// so the entry state is handed back at the moment execution leaves the
+/// exception stack. Handing it back while still running there would let
+/// an interrupt build its frame over the live one; handing it back after
+/// the call is impossible. A trap the runtime declines is reported from
+/// the same state.
 pub fn dispatch_native_trap(exception: KernelException) -> KernelExceptionDispatch {
     let raw_handler = NATIVE_TRAP_HANDLER.load(Ordering::Acquire);
     if raw_handler == 0 {

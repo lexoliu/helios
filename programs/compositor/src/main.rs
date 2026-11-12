@@ -38,7 +38,7 @@ use std::vec::Vec;
 
 use helios_api::bindings::wit_stream;
 use helios_api::channel::{Receiver, Sender, bounded};
-use helios_api::compositor::{Error, Guest, Placement, Rect};
+use helios_api::compositor::{BlockError, Error, Guest, Rect, Span};
 use helios_api::display::{Display, DisplayError, Mode, PixelFormat, Point};
 use helios_api::input::{Device, InputError, InputEvent, available, codes, ends_frame};
 use helios_api::programs::{
@@ -131,8 +131,7 @@ enum Event {
         id: u64,
         width: u32,
         height: u32,
-        buffer: Placement,
-        reply: Sender<Result<(), Error>>,
+        reply: Sender<Result<Span, Error>>,
     },
     /// A client published pixels in one.
     Commit {
@@ -140,9 +139,9 @@ enum Event {
         region: Region,
         reply: Sender<Result<(), Error>>,
     },
-    /// A client's window is gone. The kernel unmaps this component's
-    /// view of its pages the moment `destroy` returns, so the answer is
-    /// what says the desktop has stopped reading them.
+    /// A client's window is gone. The kernel has already made this
+    /// component's view of its pages ordinary memory again, so the
+    /// desktop frees them and stops reading the window.
     Destroy { id: u64, reply: Sender<()> },
 }
 
@@ -161,13 +160,12 @@ impl Guest for Compositor {
         }
     }
 
-    async fn create(id: u64, dimensions: Rect, buffer: Placement) -> Result<(), Error> {
+    async fn create(id: u64, dimensions: Rect) -> Result<Span, Error> {
         let (reply, answer) = bounded(1);
         ask(Event::Create {
             id,
             width: dimensions.width,
             height: dimensions.height,
-            buffer,
             reply,
         })?;
         answer.recv().await.map_err(|_| Error::NoCompositor)?
@@ -186,8 +184,8 @@ impl Guest for Compositor {
     async fn destroy(id: u64) {
         let (reply, answer) = bounded(1);
         if ask(Event::Destroy { id, reply }).is_ok() {
-            // The view goes the moment this returns, so the answer is
-            // waited for rather than assumed.
+            // The window's pages are freed by the desktop, so the answer
+            // is waited for rather than assumed.
             let _ = answer.recv().await;
         }
     }
@@ -489,12 +487,13 @@ async fn handle(
             id,
             width,
             height,
-            buffer,
             reply,
         } => {
-            desktop.add_client(id, width, height, buffer.offset, buffer.length);
-            println!("compositor:window id={id} width={width} height={height}");
-            let _ = reply.send(Ok(())).await;
+            let answer = desktop.add_client(id, width, height).map_err(client_error);
+            if answer.is_ok() {
+                println!("compositor:window id={id} width={width} height={height}");
+            }
+            let _ = reply.send(answer).await;
             Ok(false)
         }
         Event::Commit { id, region, reply } => {
@@ -512,6 +511,16 @@ async fn handle(
             let _ = reply.send(()).await;
             Ok(false)
         }
+    }
+}
+
+/// How a failure to take pages for a client's window reads to that
+/// client.
+const fn client_error(error: BlockError) -> Error {
+    match error {
+        // The window has no pixels, or more than any memory could hold.
+        BlockError::Empty | BlockError::TooLarge => Error::UnsupportedSize,
+        BlockError::OutOfMemory { .. } => Error::OutOfMemory,
     }
 }
 

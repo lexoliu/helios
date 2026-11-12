@@ -12,6 +12,8 @@ mod component;
 use component::*;
 mod shard;
 use shard::*;
+mod identifiers;
+use identifiers::*;
 
 extern crate alloc;
 
@@ -29,13 +31,14 @@ use helios_hal::cpu::{Cpu, HardwarePerfCounters, current_processor};
 use helios_hal::io::IoError;
 use helios_netstack::{
     DEFAULT_HOP_LIMIT, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DNS_PORT, DhcpClientMessage,
-    DhcpDnsServers, DhcpMessageType, DhcpPacket, DnsQuestionWriter, DnsRecordType, DnsResponse,
-    EthernetFrame, EthernetProtocol, FlowTuple, IcmpEchoKey, IcmpEchoReply, Icmpv4Packet,
-    Icmpv6Packet, InterfaceEventMark, IpAddress, IpCidr, IpProtocol, Ipv4Address, Ipv4Cidr,
-    Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6Packet, MAX_OUTBOUND_FRAMES, NeighborCache,
-    NeighborEntry, NetworkInterface as NetworkDevice, OutboundBatchStatus, Route, RouteTable,
-    RxChecksumOffload, RxDrain, RxFrame, SegmentationOffload, Stack, StackConfig, StackError,
-    StackEvent, StackInstant, TcpCloseKind, TcpConnectState, TcpConnectTerminalError, TcpEndpoint,
+    DhcpDnsServers, DhcpMessageType, DhcpPacket, DhcpServerMessage, DnsQuery, DnsQuestionWriter,
+    DnsRecordType, DnsResponse, EthernetFrame, EthernetProtocol, FlowTuple, IcmpEchoKey,
+    IcmpEchoReply, Icmpv4Packet, Icmpv6Packet, InterfaceEventMark, IpAddress, IpCidr, IpProtocol,
+    Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6AddressEntry, Ipv6Cidr, Ipv6Packet,
+    IsnSecret, MAX_OUTBOUND_FRAMES, NeighborCache, NeighborEntry,
+    NetworkInterface as NetworkDevice, OutboundBatchStatus, Route, RouteTable, RxChecksumOffload,
+    RxDrain, RxFrame, SegmentationOffload, Stack, StackConfig, StackError, StackEvent,
+    StackInstant, TcpCloseKind, TcpConnectState, TcpConnectTerminalError, TcpEndpoint,
     TcpListenBacklog, TcpPacket, TcpReadIntoState, TcpReadState, TcpReceiveDiagnostics,
     TcpSendState, TcpStackCounters, UdpEgress, UdpEndpoint, UdpPacket, UdpPayload,
     UdpSocketBinding, UdpSocketError, flow_hash,
@@ -48,8 +51,9 @@ use crate::{
     Ipv4Cidr as KernelIpv4Cidr, Ipv4Route as KernelIpv4Route, MacAddress, NetworkAdminBackend,
     NetworkBridgeRequest, NetworkControlError, NetworkErrorDetail, NetworkIpAddress, NetworkPortId,
     PingError, PingErrorKind, PingReply, ProfileSink, ProgressMark, ProgressSignal,
-    RegisteredTcpReadBuffer, TcpAccepted, TcpError, TcpErrorKind, TcpListener, TcpReadProgress,
-    TcpWriteProgress, Timer, UdpBinding, UdpDatagram, UdpError, UdpErrorKind, UptimeClock,
+    RegisteredTcpReadBuffer, RootEntropyHandle, TcpAccepted, TcpError, TcpErrorKind, TcpListener,
+    TcpReadProgress, TcpWriteProgress, Timer, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
+    UptimeClock,
 };
 use triomphe::Arc;
 
@@ -72,6 +76,11 @@ const INTERNAL_DHCP_SOCKET_INDEX: usize = 0;
 const INTERNAL_UDP_RESERVED_SLOTS: usize = 1;
 const LOCAL_NETWORK_PORT: NetworkPortId = NetworkPortId::new(0);
 const DHCP_RETRANSMIT_NANOS: u64 = 1_000_000_000;
+/// REQUESTs an INIT-REBOOT client sends before giving the lease up and
+/// starting over from DISCOVER. RFC 2131 section 3.2 leaves the count
+/// to the client; with the retransmission interval above, four tries
+/// is the few seconds a server on the same link needs to answer.
+const DHCP_REBOOT_ATTEMPTS: u32 = 4;
 const MAX_TCP_STREAM_HANDLES: usize = 256;
 const MAX_TCP_LISTENER_HANDLES: usize = 64;
 const MAX_UDP_SOCKET_HANDLES: usize = 256;
@@ -184,7 +193,7 @@ struct NetworkIpv4AddressTable {
 
 #[derive(Clone, Debug)]
 struct NetworkIpv6AddressTable {
-    entries: Vec<Ipv6Cidr>,
+    entries: Vec<Ipv6AddressEntry>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -371,7 +380,7 @@ impl NetworkControlPlane {
             .replace_ipv4_addresses(self.ipv4_addresses.load_full().entries.iter().copied());
         shard
             .stack
-            .replace_ipv6_addresses(self.ipv6_addresses.load_full().entries.iter().copied());
+            .replace_ipv6_address_entries(self.ipv6_addresses.load_full().entries.iter().copied());
         shard
             .stack
             .replace_ipv6_dns_servers(self.ipv6_dns_servers.load_full().entries.iter().copied());
@@ -407,7 +416,7 @@ impl NetworkControlPlane {
             }));
         self.ipv6_addresses
             .store(StdArc::new(NetworkIpv6AddressTable {
-                entries: shard.stack.ipv6_addresses().collect(),
+                entries: shard.stack.ipv6_address_entries().collect(),
             }));
         self.ipv6_dns_servers
             .store(StdArc::new(NetworkIpv6DnsServers {
@@ -472,7 +481,12 @@ impl NetworkControlPlane {
     }
 
     fn list_ipv6_addresses(&self) -> Vec<Ipv6Cidr> {
-        self.ipv6_addresses.load_full().entries.clone()
+        self.ipv6_addresses
+            .load_full()
+            .entries
+            .iter()
+            .map(Ipv6AddressEntry::cidr)
+            .collect()
     }
 
     fn list_ipv4_addresses(&self) -> Vec<KernelIpv4Cidr> {
@@ -629,6 +643,7 @@ where
         clock: UptimeClock,
         timer: Timer<CpuImpl>,
         device: DeviceImpl,
+        root_entropy: RootEntropyHandle,
     ) -> Self {
         let transaction_id = cpu.now().ticks() as u32;
         let capabilities = device.capabilities();
@@ -666,7 +681,12 @@ where
         } else {
             SegmentationOffload::none()
         };
-        let stack_config = StackConfig::new(mac, max_frame_len)
+        // The key of the initial sequence number function (RFC 6528) is
+        // drawn once, here, and shared by every shard's stack, so a
+        // flow's number does not depend on which shard opens it.
+        let mut isn_key = [0_u8; IsnSecret::BYTES];
+        root_entropy.fill(&mut isn_key);
+        let stack_config = StackConfig::new(mac, max_frame_len, IsnSecret::from_bytes(isn_key))
             .with_rx_budget(rx_poll_budget)
             .with_rx_checksum_offload(rx_checksum_offload)
             .with_tx_checksum_offload(tx_checksum_offload)
@@ -675,7 +695,13 @@ where
         let stack_rx_budget = Stack::new(stack_config).config().rx_budget;
         let state = NetworkShardSet::new(shard_count, |index| {
             let staggered_xid = transaction_id.wrapping_add(index as u32);
-            NetworkShard::new(stack_config, staggered_xid, index, shard_count)
+            NetworkShard::new(
+                stack_config,
+                staggered_xid,
+                index,
+                shard_count,
+                root_entropy.clone(),
+            )
         });
         Self {
             inner: Arc::new(NetworkServiceInner {
@@ -1540,6 +1566,7 @@ pub(crate) mod fixture {
                 crate::test_support::test_uptime_clock(),
                 crate::test_support::test_timer(cpu),
                 device,
+                crate::test_support::test_root_entropy(),
             );
             let fixture = Self {
                 service,
@@ -1557,7 +1584,10 @@ pub(crate) mod fixture {
                     .state
                     .shard_at(DEFAULT_SHARD_IDX)
                     .lock();
-                shard.stack.add_ipv4_address(Ipv4Cidr::new(Self::LOCAL, 24));
+                shard
+                    .stack
+                    .add_ipv4_address(Ipv4Cidr::new(Self::LOCAL, 24))
+                    .expect("test address should be accepted");
                 shard.stack.learn_neighbor(NeighborEntry {
                     ip: IpAddress::Ipv4(Self::PEER),
                     mac: Self::PEER_MAC,
@@ -1737,7 +1767,7 @@ mod tests {
     use helios_netstack::{
         ArpOperation, ArpPacket, ETHERNET_FRAME_BYTES, EthernetFrame, EthernetProtocol,
         IcmpEchoKey, Icmpv4Packet, Icmpv6Packet, IpAddress, IpCidr, IpProtocol, Ipv4Address,
-        Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6Packet, MAX_OUTBOUND_FRAMES,
+        Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6Packet, IsnSecret, MAX_OUTBOUND_FRAMES,
         NeighborEntry, NeighborState, Route, StackConfig, StackInstant, TCP_RECEIVE_WINDOW_BYTES,
         TcpEndpoint, TcpFlags, TcpHeader, TcpListenBacklog, TcpPacket, TransportChecksum,
         UdpEndpoint, UdpPacket, UdpPayload, UdpSocketBinding, internet_checksum,
@@ -1748,15 +1778,18 @@ mod tests {
     use futures_lite::future::{block_on, poll_once};
     use helios_netstack::RxFrame;
 
-    use crate::test_support::{RecordingNetworkInterface, RecordingSmpCpu, TestCpu};
+    use crate::test_support::{
+        RecordingNetworkInterface, RecordingSmpCpu, TestCpu, test_root_entropy,
+    };
 
     use super::{
-        AddressAttemptError, DhcpClientState, HandleSlab, NETWORK_BUSY_POLL_ROUNDS,
-        NETWORK_TX_BATCH_FRAMES, NetworkIpAddress, NetworkPollBudget, NetworkPollProgress,
-        NetworkPollScope, NetworkPollSource, NetworkPollState, NetworkPumpAction,
-        NetworkPumpCadence, NetworkShard, ReplicaHandle, TcpListenerId, TcpReadProgress,
-        UdpSocketId, icmp_echo_payload, limit_udp_datagram_bytes, map_ipv4_address, parse_ipv6,
-        receive_pair_order,
+        AddressAttemptError, DHCP_REBOOT_ATTEMPTS, DHCP_RETRANSMIT_NANOS, DhcpClientState,
+        DhcpDnsServers, DhcpMessageType, DhcpServerMessage, DnsQueryPair, HandleSlab,
+        NETWORK_BUSY_POLL_ROUNDS, NETWORK_TX_BATCH_FRAMES, NetworkIpAddress, NetworkPollBudget,
+        NetworkPollProgress, NetworkPollScope, NetworkPollSource, NetworkPollState,
+        NetworkPumpAction, NetworkPumpCadence, NetworkShard, ReplicaHandle, TcpListenerId,
+        TcpReadProgress, UdpSocketId, icmp_echo_payload, limit_udp_datagram_bytes,
+        map_ipv4_address, parse_ipv6, receive_pair_order,
     };
 
     fn ipv6_tcp_frame(
@@ -1971,7 +2004,12 @@ mod tests {
     }
 
     fn test_stack_config() -> StackConfig {
-        StackConfig::new([0x02, 0, 0, 0, 0, 1], ETHERNET_FRAME_BYTES).with_rx_budget(8)
+        StackConfig::new(
+            [0x02, 0, 0, 0, 0, 1],
+            ETHERNET_FRAME_BYTES,
+            IsnSecret::from_bytes([0x5a; IsnSecret::BYTES]),
+        )
+        .with_rx_budget(8)
     }
 
     /// The first datagram slot a replicated bind may take: the DHCP
@@ -1987,7 +2025,7 @@ mod tests {
     }
 
     fn test_network_shard() -> NetworkShard {
-        NetworkShard::new(test_stack_config(), 1, 0, 1)
+        NetworkShard::new(test_stack_config(), 1, 0, 1, test_root_entropy())
     }
 
     /// Installs one shard's replica of a bound datagram socket and
@@ -2020,6 +2058,97 @@ mod tests {
         TcpListenerId(ReplicaHandle::new(slot).get())
     }
 
+    /// A restored machine may be on another network, so a bound client
+    /// asks the link to confirm its lease (INIT-REBOOT) and keeps the
+    /// address while it waits; a client with no lease has nothing to ask
+    /// about.
+    #[test]
+    fn a_restored_machine_asks_the_link_to_confirm_its_lease() {
+        let mut shard = test_network_shard();
+        let lease = Ipv4Cidr::new(Ipv4Address::new([192, 0, 2, 10]), 24);
+
+        assert_eq!(
+            shard.begin_lease_revalidation(9, StackInstant::from_nanos(1)),
+            Ok(false),
+            "a client still looking for an address has no lease to confirm"
+        );
+
+        shard
+            .stack
+            .add_ipv4_address(lease)
+            .expect("test address should be accepted");
+        shard.dhcp = DhcpClientState::Bound;
+        assert_eq!(
+            shard.begin_lease_revalidation(9, StackInstant::from_nanos(1)),
+            Ok(true)
+        );
+        assert_eq!(
+            shard.dhcp,
+            DhcpClientState::Rebooting {
+                transaction_id: 9,
+                requested_ip: lease.address(),
+                attempts: 1,
+                last_sent: StackInstant::from_nanos(1),
+            }
+        );
+        assert_eq!(
+            shard.stack.ipv4_addresses().count(),
+            1,
+            "the address stays in use until the link answers"
+        );
+        let frame = shard
+            .stack
+            .take_outbound()
+            .expect("a DHCP REQUEST frame should be queued");
+        let ethernet = EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
+        let ipv4 = Ipv4Packet::parse(ethernet.payload).expect("IPv4 packet should parse");
+        let udp = UdpPacket::parse(ipv4.payload).expect("UDP datagram should parse");
+        assert_eq!(udp.destination_port, helios_netstack::DHCP_SERVER_PORT);
+        // The requested-IP option (50) names the old lease, and the
+        // server-identifier option (54) is absent: any server may answer.
+        assert!(
+            udp.payload
+                .windows(6)
+                .any(|option| option == [50, 4, 192, 0, 2, 10])
+        );
+        assert!(!udp.payload.windows(2).any(|option| option == [54, 4]));
+    }
+
+    /// A link that never confirms the lease leaves the client no reason
+    /// to trust it: after the retries it starts over as a NAK would.
+    #[test]
+    fn an_unconfirmed_lease_is_given_up_after_the_retries() {
+        let mut shard = test_network_shard();
+        shard
+            .stack
+            .add_ipv4_address(Ipv4Cidr::new(Ipv4Address::new([192, 0, 2, 10]), 24))
+            .expect("test address should be accepted");
+        shard.dhcp = DhcpClientState::Bound;
+        shard
+            .begin_lease_revalidation(9, StackInstant::from_nanos(0))
+            .expect("the first REQUEST is built");
+
+        for attempt in 2..=DHCP_REBOOT_ATTEMPTS {
+            let now = StackInstant::from_nanos(u64::from(attempt) * DHCP_RETRANSMIT_NANOS);
+            shard.retransmit_dhcp(now).expect("a retry is sent");
+            assert!(
+                matches!(
+                    shard.dhcp,
+                    DhcpClientState::Rebooting { attempts, .. } if attempts == attempt
+                ),
+                "attempt {attempt}: {:?}",
+                shard.dhcp
+            );
+        }
+        assert_eq!(shard.stack.ipv4_addresses().count(), 1);
+
+        let now =
+            StackInstant::from_nanos(u64::from(DHCP_REBOOT_ATTEMPTS + 1) * DHCP_RETRANSMIT_NANOS);
+        shard.retransmit_dhcp(now).expect("the exchange ends");
+        assert_eq!(shard.dhcp, DhcpClientState::Init { transaction_id: 10 });
+        assert_eq!(shard.stack.ipv4_addresses().count(), 0);
+    }
+
     /// A link that comes back is not the link that went away: the lease,
     /// the routes it pointed at and the resolvers that came with it are
     /// all stale, and nothing would ask the new link for an address
@@ -2029,7 +2158,8 @@ mod tests {
         let mut shard = test_network_shard();
         shard
             .stack
-            .add_ipv4_address(Ipv4Cidr::new(Ipv4Address::new([192, 0, 2, 10]), 24));
+            .add_ipv4_address(Ipv4Cidr::new(Ipv4Address::new([192, 0, 2, 10]), 24))
+            .expect("test address should be accepted");
         shard
             .stack
             .routes_mut()
@@ -2073,6 +2203,76 @@ mod tests {
         assert_eq!(udp.destination_port, helios_netstack::DHCP_SERVER_PORT);
     }
 
+    fn dhcp_reply(
+        message_type: DhcpMessageType,
+        transaction_id: u32,
+        server_identifier: Option<Ipv4Address>,
+    ) -> DhcpServerMessage {
+        DhcpServerMessage {
+            message_type,
+            transaction_id,
+            your_ip: Ipv4Address::UNSPECIFIED,
+            server_identifier,
+            subnet_mask: None,
+            router: None,
+            dns_servers: DhcpDnsServers::new(),
+            lease_seconds: None,
+        }
+    }
+
+    /// RFC 2131 §4.4.1: only a client waiting on a REQUEST takes a
+    /// DHCPNAK, and only one for its own exchange from the server it
+    /// selected.
+    #[test]
+    fn dhcp_nak_is_accepted_only_from_the_selected_server_while_requesting() {
+        let server = Ipv4Address::new([192, 0, 2, 1]);
+        let stranger = Ipv4Address::new([192, 0, 2, 66]);
+        let requesting = DhcpClientState::Requesting {
+            transaction_id: 7,
+            requested_ip: Ipv4Address::new([192, 0, 2, 10]),
+            server_identifier: server,
+            last_sent: StackInstant::from_nanos(0),
+        };
+
+        let nak = |transaction_id, server_identifier| {
+            dhcp_reply(DhcpMessageType::Nak, transaction_id, server_identifier)
+        };
+        assert!(requesting.accepts_reply(&nak(7, Some(server))));
+        assert!(!requesting.accepts_reply(&nak(8, Some(server))));
+        assert!(!requesting.accepts_reply(&nak(7, Some(stranger))));
+        assert!(!requesting.accepts_reply(&nak(7, None)));
+
+        for state in [
+            DhcpClientState::Bound,
+            DhcpClientState::Init { transaction_id: 7 },
+            DhcpClientState::Selecting {
+                transaction_id: 7,
+                last_sent: StackInstant::from_nanos(0),
+            },
+        ] {
+            assert!(!state.accepts_reply(&nak(7, Some(server))));
+        }
+    }
+
+    /// RFC 2131 §3.2: an INIT-REBOOT REQUEST names no server, so any
+    /// server on the link may answer it, and only the `xid` ties the
+    /// answer to the exchange.
+    #[test]
+    fn a_rebooting_client_takes_a_reply_to_its_exchange_from_any_server() {
+        let server = Ipv4Address::new([192, 0, 2, 1]);
+        let rebooting = DhcpClientState::Rebooting {
+            transaction_id: 7,
+            requested_ip: Ipv4Address::new([192, 0, 2, 10]),
+            attempts: 1,
+            last_sent: StackInstant::from_nanos(0),
+        };
+        for message_type in [DhcpMessageType::Ack, DhcpMessageType::Nak] {
+            assert!(rebooting.accepts_reply(&dhcp_reply(message_type, 7, Some(server))));
+            assert!(rebooting.accepts_reply(&dhcp_reply(message_type, 7, None)));
+            assert!(!rebooting.accepts_reply(&dhcp_reply(message_type, 8, Some(server))));
+        }
+    }
+
     #[test]
     fn parse_ipv6_accepts_compressed_numeric_hosts() {
         assert_eq!(
@@ -2089,7 +2289,10 @@ mod tests {
         let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         let remote = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
         let mut state = test_network_shard();
-        state.stack.add_ipv6_address(Ipv6Cidr::new(local, 64));
+        state
+            .stack
+            .add_ipv6_address(Ipv6Cidr::new(local, 64))
+            .expect("test address should be accepted");
         state.stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv6(remote),
             mac: [0x02, 0, 0, 0, 0, 2],
@@ -2104,6 +2307,7 @@ mod tests {
                 443,
                 49_152,
                 helios_netstack::DEFAULT_HOP_LIMIT,
+                StackInstant::from_nanos(0),
             )
             .expect("IPv6 TCP connect should allocate a socket");
         state
@@ -2133,7 +2337,10 @@ mod tests {
         let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         let remote = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
         let mut state = test_network_shard();
-        state.stack.add_ipv6_address(Ipv6Cidr::new(local, 64));
+        state
+            .stack
+            .add_ipv6_address(Ipv6Cidr::new(local, 64))
+            .expect("test address should be accepted");
         state.stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv6(remote),
             mac: [0x02, 0, 0, 0, 0, 2],
@@ -2147,6 +2354,7 @@ mod tests {
                 443,
                 49_152,
                 helios_netstack::DEFAULT_HOP_LIMIT,
+                StackInstant::from_nanos(0),
             )
             .expect("IPv6 TCP connect should allocate a socket");
         state
@@ -2199,7 +2407,10 @@ mod tests {
         let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         let remote = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
         let mut state = test_network_shard();
-        state.stack.add_ipv6_address(Ipv6Cidr::new(local, 64));
+        state
+            .stack
+            .add_ipv6_address(Ipv6Cidr::new(local, 64))
+            .expect("test address should be accepted");
         state.stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv6(remote),
             mac: [0x02, 0, 0, 0, 0, 2],
@@ -2213,6 +2424,7 @@ mod tests {
                 443,
                 49_152,
                 helios_netstack::DEFAULT_HOP_LIMIT,
+                StackInstant::from_nanos(0),
             )
             .expect("IPv6 TCP connect should allocate a socket");
         state
@@ -2316,7 +2528,10 @@ mod tests {
         let local = Ipv4Address::new([10, 0, 2, 15]);
         let remote = Ipv4Address::new([10, 0, 2, 2]);
         let mut state = test_network_shard();
-        state.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        state
+            .stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         state.stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv4(remote),
             mac: [0x02, 0, 0, 0, 0, 2],
@@ -2385,7 +2600,10 @@ mod tests {
         let local = Ipv4Address::new([10, 0, 2, 15]);
         let remote = Ipv4Address::new([10, 0, 2, 2]);
         let mut state = test_network_shard();
-        state.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        state
+            .stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         state.stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv4(remote),
             mac: [0x02, 0, 0, 0, 0, 2],
@@ -2427,7 +2645,10 @@ mod tests {
         let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         let remote = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
         let mut state = test_network_shard();
-        state.stack.add_ipv6_address(Ipv6Cidr::new(local, 64));
+        state
+            .stack
+            .add_ipv6_address(Ipv6Cidr::new(local, 64))
+            .expect("test address should be accepted");
         state.stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv6(remote),
             mac: [0x02, 0, 0, 0, 0, 2],
@@ -2473,7 +2694,10 @@ mod tests {
         let local = Ipv4Address::new([10, 0, 2, 15]);
         let remote = Ipv4Address::new([10, 0, 2, 2]);
         let mut state = test_network_shard();
-        state.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        state
+            .stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         let key = IcmpEchoKey {
             destination: IpAddress::Ipv4(remote),
             identifier: 9,
@@ -2499,7 +2723,10 @@ mod tests {
         let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         let remote = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
         let mut state = test_network_shard();
-        state.stack.add_ipv6_address(Ipv6Cidr::new(local, 64));
+        state
+            .stack
+            .add_ipv6_address(Ipv6Cidr::new(local, 64))
+            .expect("test address should be accepted");
         state.stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv6(remote),
             mac: [0x02, 0, 0, 0, 0, 2],
@@ -2539,7 +2766,10 @@ mod tests {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let remote = Ipv4Address::new([192, 0, 2, 20]);
         let mut state = test_network_shard();
-        state.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        state
+            .stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         state.stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv4(remote),
             mac: [0x02, 0, 0, 0, 0, 2],
@@ -2567,7 +2797,10 @@ mod tests {
         let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         let remote = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
         let mut state = test_network_shard();
-        state.stack.add_ipv6_address(Ipv6Cidr::new(local, 64));
+        state
+            .stack
+            .add_ipv6_address(Ipv6Cidr::new(local, 64))
+            .expect("test address should be accepted");
         let socket = bind_udp(&mut state, FIRST_TEST_UDP_SLOT, 4040);
         let (frame, len) = ipv6_udp_frame(remote, 53, local, 4040, b"hello");
 
@@ -2591,7 +2824,10 @@ mod tests {
         let expected_peer = Ipv4Address::new([192, 0, 2, 20]);
         let other_peer = Ipv4Address::new([192, 0, 2, 30]);
         let mut state = test_network_shard();
-        state.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        state
+            .stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         let socket = bind_udp(&mut state, FIRST_TEST_UDP_SLOT, 4040);
         state
             .connect_udp_socket(socket, IpAddress::Ipv4(expected_peer), 53)
@@ -2633,7 +2869,10 @@ mod tests {
         let first_peer = Ipv4Address::new([192, 0, 2, 20]);
         let second_peer = Ipv4Address::new([192, 0, 2, 30]);
         let mut state = test_network_shard();
-        state.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        state
+            .stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         let socket = bind_udp(&mut state, FIRST_TEST_UDP_SLOT, 4040);
         state
             .connect_udp_socket(socket, IpAddress::Ipv4(first_peer), 53)
@@ -2669,7 +2908,10 @@ mod tests {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let mut state = test_network_shard();
-        state.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        state
+            .stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         let socket = bind_udp(&mut state, FIRST_TEST_UDP_SLOT, 4040);
         state
             .connect_udp_socket(socket, IpAddress::Ipv4(peer), 53)
@@ -2696,7 +2938,10 @@ mod tests {
         let first_peer = Ipv4Address::new([192, 0, 2, 20]);
         let second_peer = Ipv4Address::new([192, 0, 2, 30]);
         let mut state = test_network_shard();
-        state.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        state
+            .stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         let first = bind_udp(&mut state, FIRST_TEST_UDP_SLOT, 4040);
         state
             .connect_udp_socket(first, IpAddress::Ipv4(first_peer), 53)
@@ -2746,7 +2991,13 @@ mod tests {
         let cpu = RecordingSmpCpu::new(0, 2);
         let control = super::NetworkControlPlane::new();
         let state = super::NetworkShardSet::new(2, |index| {
-            NetworkShard::new(test_stack_config(), 1 + index as u32, index, 2)
+            NetworkShard::new(
+                test_stack_config(),
+                1 + index as u32,
+                index,
+                2,
+                test_root_entropy(),
+            )
         });
         // A bound datagram socket is replicated: the same slot on every
         // shard, with the receive path deciding which replica gets a
@@ -2756,7 +3007,10 @@ mod tests {
             .install_replica(
                 FIRST_TEST_UDP_SLOT,
                 |shard, slot| {
-                    shard.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+                    shard
+                        .stack
+                        .add_ipv4_address(Ipv4Cidr::new(local, 24))
+                        .expect("test address should be accepted");
                     shard.install_udp_bind(slot, 49_153)
                 },
                 NetworkShard::remove_udp_replica,
@@ -2858,7 +3112,13 @@ mod tests {
         let cpu = RecordingSmpCpu::new(0, 2);
         let control = super::NetworkControlPlane::new();
         let state = super::NetworkShardSet::new(2, |index| {
-            NetworkShard::new(test_stack_config(), 1 + index as u32, index, 2)
+            NetworkShard::new(
+                test_stack_config(),
+                1 + index as u32,
+                index,
+                2,
+                test_root_entropy(),
+            )
         });
         // The port the connection is opened on is the one whose replies
         // hash back to the owning shard, exactly as
@@ -2877,7 +3137,10 @@ mod tests {
 
         let stream = {
             let mut shard = state.shard_at(owner).lock();
-            shard.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+            shard
+                .stack
+                .add_ipv4_address(Ipv4Cidr::new(local, 24))
+                .expect("test address should be accepted");
             let socket = shard
                 .stack
                 .open_tcp_connect(
@@ -3023,7 +3286,10 @@ mod tests {
 
         let socket = {
             let mut shard = state.shard_at(owner).lock();
-            shard.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+            shard
+                .stack
+                .add_ipv4_address(Ipv4Cidr::new(local, 24))
+                .expect("test address should be accepted");
             shard.stack.learn_neighbor(NeighborEntry {
                 ip: IpAddress::Ipv4(peer),
                 mac: PEER_MAC,
@@ -3078,7 +3344,10 @@ mod tests {
 
         let stream = {
             let mut shard = state.shard_at(owner).lock();
-            shard.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+            shard
+                .stack
+                .add_ipv4_address(Ipv4Cidr::new(local, 24))
+                .expect("test address should be accepted");
             shard.stack.learn_neighbor(NeighborEntry {
                 ip: IpAddress::Ipv4(peer),
                 mac: PEER_MAC,
@@ -3195,12 +3464,21 @@ mod tests {
         let owner = 1;
         let cpu = RecordingSmpCpu::new(0, 2);
         let state = super::NetworkShardSet::new(2, |index| {
-            NetworkShard::new(test_stack_config(), 1 + index as u32, index, 2)
+            NetworkShard::new(
+                test_stack_config(),
+                1 + index as u32,
+                index,
+                2,
+                test_root_entropy(),
+            )
         });
 
         let stream = {
             let mut shard = state.shard_at(owner).lock();
-            shard.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+            shard
+                .stack
+                .add_ipv4_address(Ipv4Cidr::new(local, 24))
+                .expect("test address should be accepted");
             let socket = shard
                 .stack
                 .open_tcp_connect(
@@ -3350,6 +3628,7 @@ mod tests {
             crate::test_support::test_uptime_clock(),
             crate::test_support::test_timer(cpu),
             device,
+            test_root_entropy(),
         )
     }
 
@@ -3437,7 +3716,8 @@ mod tests {
             .shard_at(0)
             .lock()
             .stack
-            .add_ipv4_address(Ipv4Cidr::new(local, 24));
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
 
         // Both marks are sampled before the interrupt lands, the way
         // `run_packet_pump` and every operation take theirs before
@@ -3633,6 +3913,7 @@ mod tests {
             crate::test_support::test_uptime_clock(),
             crate::test_support::test_timer(cpu),
             device,
+            test_root_entropy(),
         )
     }
 
@@ -3788,7 +4069,13 @@ mod tests {
         for shard_count in [1usize, 2, 3, 4, 8] {
             let mut previous_end = None;
             for shard_idx in 0..shard_count {
-                let shard = NetworkShard::new(test_stack_config(), 1, shard_idx, shard_count);
+                let mut shard = NetworkShard::new(
+                    test_stack_config(),
+                    1,
+                    shard_idx,
+                    shard_count,
+                    test_root_entropy(),
+                );
                 let (first, last) = shard.ephemeral_window();
                 assert!(first <= last);
                 match previous_end {
@@ -3796,18 +4083,138 @@ mod tests {
                     Some(previous) => assert_eq!(first, previous + 1),
                 }
                 previous_end = Some(last);
+                let walk: Vec<u16> = shard.ephemeral_walk().collect();
                 assert_eq!(
-                    shard.advance_ephemeral_port(last),
-                    first,
-                    "the walk wraps inside its own window"
+                    walk.len(),
+                    usize::from(last - first) + 1,
+                    "a walk tries every port of its window"
                 );
-                assert_eq!(
-                    shard.ephemeral_port_attempts(),
-                    usize::from(last - first) + 1
+                assert!(
+                    walk.iter().all(|port| (first..=last).contains(port)),
+                    "a walk stays inside its own window"
                 );
             }
             assert_eq!(previous_end, Some(super::EPHEMERAL_PORT_END));
         }
+    }
+
+    /// An ephemeral port is not the next number after the last one: a
+    /// sender who saw one connection's port could otherwise name the
+    /// next. Ports come from the root generator, so a run of draws is
+    /// neither ascending nor repeating.
+    #[test]
+    fn ephemeral_ports_are_not_handed_out_in_order() {
+        let mut shard = test_network_shard();
+        let ports: Vec<u16> = (0..32)
+            .map(|_| {
+                shard
+                    .allocate_udp_local_port()
+                    .expect("the window has free ports")
+            })
+            .collect();
+        assert!(
+            ports
+                .windows(2)
+                .any(|pair| pair[1] != pair[0].wrapping_add(1)),
+            "consecutive draws were sequential: {ports:?}"
+        );
+        let mut distinct = ports.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert!(
+            distinct.len() > 1,
+            "draws from a 16384 port window were all one port: {ports:?}"
+        );
+        let (first, last) = shard.ephemeral_window();
+        assert!(ports.iter().all(|port| (first..=last).contains(port)));
+    }
+
+    /// A port a socket already holds is never handed out again, however
+    /// the walk starts.
+    #[test]
+    fn an_ephemeral_port_in_use_is_never_returned() {
+        let mut shard = test_network_shard();
+        let mut taken = Vec::new();
+        for _ in 0..64 {
+            let port = shard
+                .allocate_udp_local_port()
+                .expect("the window has free ports");
+            assert!(!taken.contains(&port), "{port} was handed out while bound");
+            shard
+                .stack
+                .open_udp(UdpSocketBinding::wildcard(port))
+                .expect("the port the allocator returned binds");
+            taken.push(port);
+        }
+    }
+
+    /// A lookup's two question ids differ and are nonzero, and
+    /// successive lookups are not counted up.
+    #[test]
+    fn dns_query_ids_are_random_and_distinct_within_a_lookup() {
+        let mut shard = test_network_shard();
+        let pairs: Vec<DnsQueryPair> = (0..32).map(|_| shard.draw_dns_query_pair()).collect();
+        for pair in &pairs {
+            assert_ne!(pair.a, pair.aaaa);
+            assert_ne!(pair.a, 0);
+            assert_ne!(pair.aaaa, 0);
+        }
+        let ids: Vec<u16> = pairs.iter().flat_map(|pair| [pair.a, pair.aaaa]).collect();
+        assert!(
+            ids.windows(2)
+                .any(|pair| pair[1] != pair[0].wrapping_add(1)),
+            "ids were handed out in order: {ids:?}"
+        );
+    }
+
+    /// Every draw maps to two different nonzero ids, the edges of both
+    /// ranges included.
+    #[test]
+    fn a_dns_query_pair_never_repeats_an_id_or_uses_zero() {
+        let last = DnsQueryPair::IDS - 1;
+        for first in [0, 1, last / 2, last - 1, last] {
+            for second in [0, 1, last / 2, last - 1] {
+                let pair = DnsQueryPair::from_draws(first, second);
+                assert_ne!(pair.a, pair.aaaa, "draws {first}, {second}");
+                assert_ne!(pair.a, 0);
+                assert_ne!(pair.aaaa, 0);
+            }
+        }
+        assert_eq!(
+            DnsQueryPair::from_draws(last, 0),
+            DnsQueryPair {
+                a: u16::MAX,
+                aaaa: 1
+            }
+        );
+    }
+
+    /// The initial sequence number key is drawn once for the whole
+    /// service, so every shard's stack agrees on a flow's number.
+    #[test]
+    fn every_shard_shares_one_sequence_number_key() {
+        let service = test_network_service();
+        let local = TcpEndpoint {
+            address: IpAddress::Ipv4(Ipv4Address::new([192, 0, 2, 10])),
+            port: 49_152,
+        };
+        let remote = TcpEndpoint {
+            address: IpAddress::Ipv4(Ipv4Address::new([198, 51, 100, 7])),
+            port: 443,
+        };
+        let now = StackInstant::from_nanos(1_000_000);
+        let sequences: Vec<u32> = (0..service.inner.state.shard_count())
+            .map(|index| {
+                service
+                    .inner
+                    .state
+                    .shard_at(index)
+                    .lock()
+                    .stack
+                    .tcp_initial_sequence(local, remote, now)
+            })
+            .collect();
+        assert!(sequences.windows(2).all(|pair| pair[0] == pair[1]));
     }
 
     /// A listener retired the way its owner retires it gives its port
@@ -3874,14 +4281,23 @@ mod tests {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([198, 51, 100, 20]);
         let state = super::NetworkShardSet::new(3, |index| {
-            NetworkShard::new(test_stack_config(), 1 + index as u32, index, 3)
+            NetworkShard::new(
+                test_stack_config(),
+                1 + index as u32,
+                index,
+                3,
+                test_root_entropy(),
+            )
         });
         let listener = TcpListenerId(ReplicaHandle::new(FIRST_TEST_LISTENER_SLOT).get());
         state
             .install_replica(
                 FIRST_TEST_LISTENER_SLOT,
                 |shard, slot| {
-                    shard.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+                    shard
+                        .stack
+                        .add_ipv4_address(Ipv4Cidr::new(local, 24))
+                        .expect("test address should be accepted");
                     shard.stack.learn_neighbor(NeighborEntry {
                         ip: IpAddress::Ipv4(peer),
                         mac: [0x02, 0, 0, 0, 0, 2],
@@ -4018,7 +4434,13 @@ mod tests {
     fn shard_arrivals_deduplicate_within_one_receive_batch() {
         let cpu = RecordingSmpCpu::new(0, 4);
         let state = super::NetworkShardSet::new(4, |index| {
-            NetworkShard::new(test_stack_config(), 1 + index as u32, index, 4)
+            NetworkShard::new(
+                test_stack_config(),
+                1 + index as u32,
+                index,
+                4,
+                test_root_entropy(),
+            )
         });
         let mut arrivals = super::ShardArrivals::new();
         arrivals.record(2);
@@ -4054,14 +4476,23 @@ mod tests {
         let peer = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
         let router = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]);
         let state = super::NetworkShardSet::new(2, |index| {
-            NetworkShard::new(test_stack_config(), 1 + index as u32, index, 2)
+            NetworkShard::new(
+                test_stack_config(),
+                1 + index as u32,
+                index,
+                2,
+                test_root_entropy(),
+            )
         });
         let socket = UdpSocketId(ReplicaHandle::new(FIRST_TEST_UDP_SLOT).get());
         state
             .install_replica(
                 FIRST_TEST_UDP_SLOT,
                 |shard, slot| {
-                    shard.stack.add_ipv6_address(Ipv6Cidr::new(local, 64));
+                    shard
+                        .stack
+                        .add_ipv6_address(Ipv6Cidr::new(local, 64))
+                        .expect("test address should be accepted");
                     shard.stack.learn_neighbor(NeighborEntry {
                         ip: IpAddress::Ipv6(peer),
                         mac: [0x02, 0, 0, 0, 0, 2],
@@ -4131,7 +4562,10 @@ mod tests {
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let group = Ipv4Address::new([224, 0, 0, 251]);
         let mut state = test_network_shard();
-        state.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        state
+            .stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         let socket = bind_udp(&mut state, FIRST_TEST_UDP_SLOT, 4040);
         let (first, first_len) = ipv4_udp_frame(peer, 5353, group, 4040, b"first");
         let (second, second_len) = ipv4_udp_frame(peer, 5353, group, 4040, b"second");
@@ -4194,7 +4628,10 @@ mod tests {
         let group = Ipv4Address::new([224, 0, 0, 251]);
         let unicast = Ipv4Address::new([192, 0, 2, 20]);
         let mut state = test_network_shard();
-        state.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        state
+            .stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
 
         let error = state
             .join_multicast_v4(map_ipv4_address(group), map_ipv4_address(other))
@@ -4226,7 +4663,10 @@ mod tests {
         let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         let remote = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
         let mut state = test_network_shard();
-        state.stack.add_ipv6_address(Ipv6Cidr::new(local, 64));
+        state
+            .stack
+            .add_ipv6_address(Ipv6Cidr::new(local, 64))
+            .expect("test address should be accepted");
         state.stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv6(remote),
             mac: [0x02, 0, 0, 0, 0, 2],
@@ -4492,7 +4932,10 @@ mod tests {
 
         let stream = {
             let mut shard = state.shard_at(owner).lock();
-            shard.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+            shard
+                .stack
+                .add_ipv4_address(Ipv4Cidr::new(local, 24))
+                .expect("test address should be accepted");
             // Published, not merely installed: every poll pushes the
             // control plane's configuration back into the shards, so an
             // address only one shard knows about does not survive one.

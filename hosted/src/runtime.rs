@@ -350,16 +350,27 @@ fn spawn_processor_thread(
                 // there, so the root DRBG never reseeds after boot.
                 // `NoEntropyDevice` is uninhabited, which is how that
                 // fact is stated to the type system.
+                //
+                // A hosted run has no VMM generation ID window, so the
+                // machine generation moves only through `advance`.
+                let machine_generation = helios_kernel::MachineGeneration::new(None);
+                debug_state.install_machine_generation(machine_generation.clone());
                 debug_state.install_root_entropy(helios_kernel::seed_root_entropy(
                     &cpu,
                     None,
                     None::<&helios_kernel::NoEntropyDevice>,
+                    machine_generation,
                 ));
 
                 // The host's clock is this backend's calendar, and it is
                 // read once, here, before any component can ask what
                 // time it is.
                 debug_state.seed_wall_clock(cpu.now().ticks(), &HostRtc);
+                helios_kernel::install_generation_reactions(
+                    &kernel,
+                    debug_state.clone(),
+                    Some(HostRtc),
+                );
 
                 // Install host filesystem if configured.
                 if let Some(root) = config.init_wasi_root() {

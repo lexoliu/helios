@@ -336,6 +336,12 @@ pub trait DisplayDevice: Send + Sync + 'static {
     /// one flat span, row-major from the first range's first byte. The
     /// pages stay the caller's; the device only reads them, and only
     /// between this call and [`DisplayDevice::destroy_framebuffer`].
+    ///
+    /// An error the device answered leaves it holding nothing.
+    /// [`DisplayError::Transport`] means no answer was obtained: the
+    /// request may have reached the device, which may then read the
+    /// pages at any later time, and the caller has no handle to release
+    /// them by.
     fn create_framebuffer<'a>(
         &'a self,
         mode: DisplayMode,
@@ -345,7 +351,8 @@ pub trait DisplayDevice: Send + Sync + 'static {
 
     /// Releases a frame buffer and hands its backing pages back.
     ///
-    /// On return the device holds no reference to the caller's pages.
+    /// Once this resolves `Ok` the device holds no reference to the
+    /// caller's pages. Any error leaves it free to keep reading them.
     fn destroy_framebuffer(
         &self,
         framebuffer: FramebufferId,
