@@ -27,7 +27,9 @@ pub use authority::{
     TerminalInputCap, TerminalOutputCap, TtyControlCap, UdpCap, UnmountCap,
 };
 pub(crate) use descriptor::FreeDescriptorSlots;
-pub use descriptor::{DescriptorEntry, DescriptorId, DescriptorTable, DescriptorTableError};
+pub use descriptor::{
+    DescriptorEntry, DescriptorId, DescriptorLimit, DescriptorTable, DescriptorTableError,
+};
 pub use futex::{FutexKey, FutexTable, FutexWaitRegistration, GuestAddress, ProcessMemoryIdentity};
 pub use program_service::{
     ProgramExecError, ProgramExecErrorDetail, ProgramExecErrorKind, ProgramOutOfMemory,
