@@ -951,6 +951,11 @@ extern "C" fn aarch64_kernel_main() -> ! {
     // Each secondary read the key before it set `started`, and
     // `start_processor` returned only after that, so nothing reads it again.
     platform_state.instruction_key.wipe();
+    #[cfg(helios_cfi_self_test)]
+    // SAFETY: `EnIA` was set with the machine's key on this processor above.
+    unsafe {
+        cfi::self_test()
+    };
 
     helios_kernel::run_component_host_processor_forever(
         cpu,
