@@ -2584,20 +2584,18 @@ mod tests {
 
     /// A local task that requeues itself every run and counts them, until
     /// `stop` is set. `each_run` runs once per run, after the count.
-    fn self_rewaking_task(
+    async fn self_rewaking_task(
         spins: Arc<AtomicUsize>,
         stop: Arc<AtomicBool>,
         each_run: impl Fn(usize) + 'static,
-    ) -> impl core::future::Future<Output = ()> + 'static {
-        async move {
-            loop {
-                let run = spins.fetch_add(1, Ordering::Relaxed) + 1;
-                each_run(run);
-                if stop.load(Ordering::Relaxed) {
-                    break;
-                }
-                yield_now().await;
+    ) {
+        loop {
+            let run = spins.fetch_add(1, Ordering::Relaxed) + 1;
+            each_run(run);
+            if stop.load(Ordering::Relaxed) {
+                break;
             }
+            yield_now().await;
         }
     }
 
