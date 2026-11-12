@@ -110,6 +110,18 @@ interface programs {
     rights: list<link-right>,
   }
 
+  enum mount-right {
+    mount,
+    unmount,
+  }
+
+  record mount-grant {
+    /// Mount-table rights granted to the child. These must be a subset of
+    /// the caller's mount authority; where the child may mount is still
+    /// bounded by its directory grants.
+    rights: list<mount-right>,
+  }
+
   /// A machine-wide device class a program may claim. A program that
   /// holds none of them sees the same answers as a machine without that
   /// hardware: `available` lists nothing and `claim` reports the device
@@ -136,6 +148,7 @@ interface programs {
     terminal(terminal-grant),
     process(process-grant),
     link(link-grant),
+    mount(mount-grant),
     device(device-grant),
   }
 
