@@ -361,15 +361,18 @@ fn x86_kernel_main() -> ! {
     debug_state.install_root_entropy(root_entropy.clone());
     // The calendar is read once, here, before any component can ask
     // what time it is. The TSC carries wall time forward from that
-    // reading; nothing re-synchronises it afterwards.
-    match rtc::discover(rsdp_address, physical_memory_offset) {
+    // reading; only a machine restore re-reads it, which the reactions
+    // task does with the same clock.
+    let rtc = rtc::discover(rsdp_address, physical_memory_offset);
+    match &rtc {
         Some(rtc) => {
-            debug_state.seed_wall_clock(cpu.now().ticks(), &rtc);
+            debug_state.seed_wall_clock(cpu.now().ticks(), rtc);
         }
         None => {
             tracing::warn!("the FADT points at no readable CMOS clock; wall time reads as uptime");
         }
     }
+    helios_kernel::install_generation_reactions(&kernel, debug_state.clone(), rtc);
     // Devices are brought up while the bootstrap processor still runs
     // with interrupts masked, so their MSI-X routes are published before
     // the first message can be delivered.

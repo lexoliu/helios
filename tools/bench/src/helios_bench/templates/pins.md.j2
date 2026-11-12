@@ -24,3 +24,4 @@
 {% for path, digest in report.pins.bootfs_cwasm.items() %}
 | cwasm `{{ path }}` | `{{ digest }}` |
 {% endfor %}
+{% include "construction_pins.md.j2" %}

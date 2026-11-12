@@ -52,9 +52,10 @@ struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     /// on. Installed before the root entropy.
     machine_generation: Once<MachineGenerationHandle>,
     /// Nanoseconds between the monotonic clock and wall time, as the
-    /// platform's real-time clock set them during bring-up. Empty on a
-    /// machine that carries no such clock, where wall time is uptime.
-    wall_clock_offset_nanos: Once<i128>,
+    /// platform's real-time clock last set them: at bring-up, and again
+    /// after each machine restore. Unseeded on a machine that carries no
+    /// such clock, where wall time is uptime.
+    wall_clock: crate::exec::WallClock,
     /// Queue into the `http-client` kernel plugin. Empty on a kernel image
     /// that does not provision the plugin, in which case the runtime adapter
     /// answers a configuration error rather than trapping.
@@ -334,7 +335,7 @@ where
                 network_service_ready: Notify::new(),
                 root_entropy: Once::new(),
                 machine_generation: Once::new(),
-                wall_clock_offset_nanos: Once::new(),
+                wall_clock: crate::exec::WallClock::new(),
                 http_client: ProviderSlot::new(),
                 host_fs_service: Mutex::new(None),
                 block_service: Once::new(),
@@ -678,8 +679,9 @@ where
     /// The backend calls this once, on the bootstrap processor, after
     /// the kernel's log is installed and before any component runs, so
     /// every store the runtime opens afterwards reads the same calendar.
-    /// The clock is read exactly once: the monotonic timer carries time
-    /// forward from here, and nothing re-synchronises it.
+    /// The monotonic timer carries time forward from here; only a machine
+    /// restore moves the calendar again, through
+    /// [`Self::reseed_wall_clock`].
     ///
     /// A clock that answers with something no calendar can mean is a
     /// bring-up fault rather than a degraded mode, so it panics instead
@@ -688,19 +690,10 @@ where
     where
         Rtc: RealTimeClock,
     {
-        let wall = rtc.read().unwrap_or_else(|error| {
-            panic!(
-                "platform real-time clock {} could not be read: {error}",
-                Rtc::SOURCE
-            )
-        });
-        let offset = crate::exec::wall_clock_offset_nanos(wall, self.uptime_nanos(current_ticks));
-        let mut installed = false;
-        self.inner.wall_clock_offset_nanos.call_once(|| {
-            installed = true;
-            offset
-        });
-        assert!(installed, "the wall clock was seeded more than once");
+        let wall = Self::read_rtc(rtc);
+        self.inner
+            .wall_clock
+            .seed(self.offset_for(current_ticks, wall));
         tracing::info!(
             "wall clock seeded source={} unix_seconds={}",
             Rtc::SOURCE,
@@ -709,14 +702,48 @@ where
         wall
     }
 
+    /// Moves the wall clock to `wall`, a reading the real-time clock
+    /// gave at `current_ticks`, after the machine's calendar was
+    /// disturbed by a restore.
+    ///
+    /// Every store reads the machine's offset live, so each of them
+    /// follows at its next read. A caller is the machine-generation
+    /// reactions task, the only writer after bring-up.
+    pub fn reseed_wall_clock(&self, current_ticks: u64, wall: UnixSeconds) {
+        self.inner
+            .wall_clock
+            .reseed(self.offset_for(current_ticks, wall));
+    }
+
+    /// One reading of `rtc`, fatal when the device cannot answer: the
+    /// same fault whether it is the boot read or a read after a restore.
+    pub(crate) fn read_rtc<Rtc: RealTimeClock>(rtc: &Rtc) -> UnixSeconds {
+        rtc.read().unwrap_or_else(|error| {
+            panic!(
+                "platform real-time clock {} could not be read: {error}",
+                Rtc::SOURCE
+            )
+        })
+    }
+
+    /// The offset that puts the monotonic clock, at `current_ticks`, on
+    /// `wall`. A reading beyond what 64 bits of nanoseconds carry, which
+    /// is the year 2262, panics naming it.
+    fn offset_for(&self, current_ticks: u64, wall: UnixSeconds) -> i64 {
+        let offset = crate::exec::wall_clock_offset_nanos(wall, self.uptime_nanos(current_ticks));
+        i64::try_from(offset).unwrap_or_else(|_| {
+            panic!(
+                "real-time clock reported {} seconds, which is beyond the year 2262 that a \
+                 64-bit nanosecond wall-clock offset carries",
+                wall.get()
+            )
+        })
+    }
+
     /// Nanoseconds between the monotonic clock and wall time, zero until
     /// a real-time clock has seeded it.
     pub fn wall_clock_offset_nanos(&self) -> i128 {
-        self.inner
-            .wall_clock_offset_nanos
-            .get()
-            .copied()
-            .unwrap_or_default()
+        i128::from(self.inner.wall_clock.offset_nanos())
     }
 
     /// Wall time in nanoseconds since the Unix epoch, as the seeded
@@ -924,6 +951,18 @@ where
         );
     }
 
+    /// The machine generation as a shared handle, for a task that has to
+    /// own it.
+    pub fn machine_generation_handle(&self) -> MachineGenerationHandle {
+        self.inner
+            .machine_generation
+            .get()
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!("the machine generation was used before the backend installed it")
+            })
+    }
+
     /// The machine generation of this boot.
     pub fn machine_generation(&self) -> &MachineGeneration {
         self.inner.machine_generation.get().unwrap_or_else(|| {
@@ -943,6 +982,12 @@ where
 
     /// The root DRBG every instance pool is derived from.
     pub fn root_entropy(&self) -> &RootEntropy {
+        self.root_entropy_handle()
+    }
+
+    /// The shared handle to the root DRBG, cloned by a subsystem that
+    /// keeps drawing from it after construction.
+    pub fn root_entropy_handle(&self) -> &RootEntropyHandle {
         self.inner
             .root_entropy
             .get()
@@ -1242,6 +1287,52 @@ mod tests {
     use alloc::vec;
 
     use super::*;
+
+    /// A real-time clock whose reading the test moves, as a restore
+    /// moves the calendar.
+    struct SettableRtc(core::cell::Cell<u64>);
+
+    impl RealTimeClock for SettableRtc {
+        const SOURCE: &'static str = "test clock";
+
+        fn read(&self) -> Result<UnixSeconds, helios_hal::rtc::RtcError> {
+            Ok(UnixSeconds::new(self.0.get()))
+        }
+    }
+
+    #[test]
+    fn a_reseed_moves_the_wall_clock_to_the_new_reading() {
+        let state = RuntimeState::<(), (), ()>::new(
+            Timebase::new(1_000_000_000),
+            1,
+            0,
+            BootPayload::for_tests(),
+        );
+        let rtc = SettableRtc(core::cell::Cell::new(1_000));
+        state.seed_wall_clock(2_000_000_000, &rtc);
+        assert_eq!(state.wall_clock_nanos(2_000_000_000), 1_000_000_000_000);
+        assert_eq!(state.wall_clock_nanos(5_000_000_000), 1_003_000_000_000);
+
+        // The machine was stopped and the calendar moved a day.
+        rtc.0.set(1_000 + 86_400);
+        let wall = RuntimeState::<(), (), ()>::read_rtc(&rtc);
+        state.reseed_wall_clock(6_000_000_000, wall);
+        assert_eq!(state.wall_clock_nanos(6_000_000_000), 87_400_000_000_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "seeded more than once")]
+    fn seeding_the_wall_clock_twice_is_a_bring_up_fault() {
+        let state = RuntimeState::<(), (), ()>::new(
+            Timebase::new(1_000_000_000),
+            1,
+            0,
+            BootPayload::for_tests(),
+        );
+        let rtc = SettableRtc(core::cell::Cell::new(1_000));
+        state.seed_wall_clock(0, &rtc);
+        state.seed_wall_clock(0, &rtc);
+    }
 
     #[test]
     fn runtime_state_records_kernel_heap_delta_metrics() {

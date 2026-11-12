@@ -1,0 +1,9 @@
+{% if report.run.rounds %}
+| Rounds | {{ report.run.rounds }}, alternating: each round times both sides once, consecutive rounds swap which goes first, and a cell's warm series pools them |
+{% endif %}
+{% if report.run.host_gate %}
+| Host gate | {{ report.run.host_gate.note }}{% if report.run.host_gate.applies %}: {% for reading in report.run.host_gate.readings %}{{ reading.side }} {{ reading.moment }} round {{ reading.round }} = {{ reading.level }}{{ ", " if not loop.last }}{% endfor %}{% if report.run.host_gate.inconclusive %}; **inconclusive**{% else %}; normal throughout{% endif %}{% endif %} |
+{% endif %}
+{% for asymmetry in report.pins.asymmetries %}
+| Differs by construction: {{ asymmetry.what }} | Helios: {{ asymmetry.helios }}; Linux: {{ asymmetry.linux }} |
+{% endfor %}

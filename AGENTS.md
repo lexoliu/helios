@@ -469,6 +469,12 @@ red lane names the surface that broke:
 | `smoke-aarch64` | `ubuntu-24.04-arm`, `--accel tcg` | Boot from the device tree and from ACPI, against a pinned upstream QEMU the lane builds and caches, because Ubuntu 24.04's QEMU asserts in its emulated GICv3 under multi-threaded TCG. |
 | `bench-x86-64-linux` | `ubuntu-24.04`, `--accel kvm`, multi-queue tap | The workload benchmarks of §3.6, with the negotiated virtio-net features reported. |
 
+The bench lane is the exception: it lives in `bench-lane.yml` and runs
+nightly against `dev` and on `workflow_dispatch` for any ref, never on a
+pull request, because one unpaired run is no performance evidence (§3.6)
+and the lane is the heaviest job there is. A failed nightly run files a
+`bench`/`bug` issue, or comments on the one already open.
+
 Every lane runs on a Linux runner. macOS runners are not used: their queue
 dominates the run and nothing Helios ships targets macOS. Every boot in CI
 names its accelerator explicitly, per §5.

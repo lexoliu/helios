@@ -12,6 +12,33 @@
 //!   first. The async mutex that serialises establishment is held
 //!   across the handshake because that is its entire job; every later
 //!   reader takes no lock at all.
+//! * A session ends only when the server stops knowing it, which a
+//!   machine restore can cause. [`HostFsClient::reset_session_forgotten`]
+//!   then runs under the same establishment lock, so it never splits a
+//!   handshake: it unpublishes the session, starts a new era in the fid
+//!   space and empties the caches, all without a `Tclunk`. Readers stay
+//!   lock-free. An operation in flight across the reset fails with its
+//!   own error; its fids are of the old era, which the allocator
+//!   recognises and ignores, and it caches nothing afterwards. The next
+//!   operation establishes a new session.
+//! * A VMM snapshot needs the share released: QEMU refuses to snapshot
+//!   a guest whose 9p root fid is attached. [`HostFsClient::prepare_snapshot`]
+//!   therefore closes a gate that every operation passes once, on entry
+//!   and for its whole duration, and waits for the operations already
+//!   inside to leave. Operations arriving at a closed gate park on the
+//!   gate's release signal; none fails. With nothing in flight it
+//!   clunks every pooled fid and the root fid, and the session stays
+//!   unpublished. The gate opens again exactly when
+//!   [`HostFsClient::snapshot_finished`] runs (the source machine
+//!   resumes) or a machine restore reaches
+//!   [`HostFileSystem::after_machine_restore`] (the restored copy); the
+//!   parked operations then race for the establishment lock, and the
+//!   one that wins attaches the session for all of them. Both signals
+//!   are armed before the state they announce is read, so neither a
+//!   release nor the last operation leaving can be missed. The gate is
+//!   taken by the public operations only, never by the helpers they
+//!   call, so an operation never waits on a gate it is itself holding
+//!   open. The clunks the hold sends are not operations.
 //! * Each operation owns its tags and fids: a tag for the lifetime of
 //!   one message, a fid for the lifetime of the operation, both handed
 //!   out by allocators behind a spin mutex that is taken only to
@@ -37,7 +64,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use bytes::BytesMut;
 use core::future::Future;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use helios_hal::cpu::{Cpu, HardwarePerfCounters};
 use helios_hal::io::IoError;
 use objectpool::{Pool, ReusableObject};
@@ -48,7 +75,7 @@ use triomphe::Arc;
 use super::cache::{CachedAttributes, HostFsCache, HostFsCacheStats, PooledReadFid};
 use crate::{
     AuthorityDomain, HostDirEntry, HostDirLimit, HostFileSystem, HostFsError, HostFsErrorKind,
-    HostMetadata, ObjectIdentity, ProfileSink, RawMutex,
+    HostMetadata, HostShareRestore, Notify, ObjectIdentity, ProfileSink, RawMutex,
 };
 
 /// The msize this client asks for. The server answers with its own
@@ -262,6 +289,12 @@ impl SessionCell {
         let word = (u64::from(session.msize) << 32) | u64::from(session.root_fid);
         self.published.store(word, Ordering::Release);
     }
+
+    /// Returns the cell to "not established yet". The caller holds
+    /// `establishing`.
+    fn unpublish(&self) {
+        self.published.store(0, Ordering::Release);
+    }
 }
 
 /// A dense allocator for one 9p handle space.
@@ -272,8 +305,15 @@ impl SessionCell {
 /// free index, so a handle is bounded by how many are live at once and
 /// the sentinel is only ever reached by a caller that leaked handles —
 /// which is a fault to report, not a condition to recover from.
+///
+/// A space can be [reset](Self::reset) when the server forgets every
+/// handle in it. A handle is the slab key plus the space's `base`, and a
+/// reset moves `base` past every number the old era could have handed
+/// out, so a handle from before the reset is recognisable by being below
+/// the base: releasing it is ignored, and a new handle can never equal
+/// one still held by an operation that was in flight across the reset.
 struct HandleAllocator {
-    live: SpinMutex<Slab<()>>,
+    live: SpinMutex<LiveHandles>,
     /// The value this space reserves — `NOTAG` or `NOFID` — and
     /// therefore the exclusive upper bound on a handle.
     reserved: u32,
@@ -281,10 +321,20 @@ struct HandleAllocator {
     exhausted: &'static str,
 }
 
+/// What the allocator's spin lock guards.
+struct LiveHandles {
+    slab: Slab<()>,
+    /// The value of slab key zero in the current era.
+    base: u32,
+}
+
 impl HandleAllocator {
     fn new(capacity: usize, reserved: u32, space: &'static str, exhausted: &'static str) -> Self {
         Self {
-            live: SpinMutex::new(Slab::with_capacity(capacity)),
+            live: SpinMutex::new(LiveHandles {
+                slab: Slab::with_capacity(capacity),
+                base: 0,
+            }),
             reserved,
             space,
             exhausted,
@@ -294,11 +344,14 @@ impl HandleAllocator {
     fn allocate(&self) -> Result<Handle<'_>, HostFsError> {
         let value = {
             let mut live = self.live.lock();
-            let key = live.insert(());
-            match u32::try_from(key) {
-                Ok(value) if value < self.reserved => value,
+            let key = live.slab.insert(());
+            match u32::try_from(key)
+                .ok()
+                .and_then(|key| live.base.checked_add(key))
+            {
+                Some(value) if value < self.reserved => value,
                 _ => {
-                    live.remove(key);
+                    live.slab.remove(key);
                     return Err(HostFsError::Protocol(self.exhausted));
                 }
             }
@@ -310,19 +363,43 @@ impl HandleAllocator {
     }
 
     fn release(&self, value: u32) {
-        let key = usize::try_from(value).expect("a 9p handle fits in usize");
         let mut live = self.live.lock();
+        let Some(key) = value.checked_sub(live.base) else {
+            // A handle from before a reset: the server forgot it, and
+            // the number belongs to no live era.
+            return;
+        };
+        let key = usize::try_from(key).expect("a 9p handle fits in usize");
         assert!(
-            live.contains(key),
+            live.slab.contains(key),
             "9p {} {value} was released twice",
             self.space
         );
-        live.remove(key);
+        live.slab.remove(key);
+    }
+
+    /// Whether `value` was handed out in the current era, which is
+    /// whether the server can still know it.
+    fn is_current(&self, value: u32) -> bool {
+        value >= self.live.lock().base
+    }
+
+    /// Forgets every live handle and starts a new era.
+    ///
+    /// The base moves past the slab's capacity, which bounds every key
+    /// the old era handed out. A space that has gone through so many
+    /// resets that the base reaches the reserved value reports exhaustion
+    /// from [`Self::allocate`].
+    fn reset(&self) {
+        let mut live = self.live.lock();
+        let span = u32::try_from(live.slab.capacity()).unwrap_or(u32::MAX);
+        live.slab.clear();
+        live.base = live.base.saturating_add(span).min(self.reserved);
     }
 
     #[cfg(test)]
     fn live_count(&self) -> usize {
-        self.live.lock().len()
+        self.live.lock().slab.len()
     }
 }
 
@@ -358,6 +435,102 @@ impl Drop for Handle<'_> {
     }
 }
 
+/// The bit of [`SnapshotGate::state`] that says the share is held.
+const GATE_HELD: usize = 1;
+/// What one operation inside the gate adds to [`SnapshotGate::state`],
+/// above the held bit.
+const GATE_ONE_OPERATION: usize = 2;
+
+/// Lets operations through until a snapshot hold closes it.
+///
+/// One word carries the held bit and the number of operations inside,
+/// so an operation entering and the hold closing are ordered by a single
+/// compare-exchange: an operation either got in before the bit was set,
+/// and is counted for the drain, or sees the bit and parks. Entering and
+/// leaving are lock-free; the two [`Notify`]s are broadcasts, each
+/// armed before the word is read.
+struct SnapshotGate {
+    /// Bit 0 is [`GATE_HELD`]; the rest counts operations inside.
+    state: AtomicUsize,
+    /// Fired when the last operation leaves a held gate.
+    drained: Notify,
+    /// Fired when a held gate opens.
+    released: Notify,
+}
+
+impl SnapshotGate {
+    fn new() -> Self {
+        Self {
+            state: AtomicUsize::new(0),
+            drained: Notify::new(),
+            released: Notify::new(),
+        }
+    }
+
+    /// Waits for the gate to be open and enters it. Any task may call it.
+    async fn enter(&self) -> GateEntry<'_> {
+        loop {
+            let released = self.released.notified();
+            let state = self.state.load(Ordering::Acquire);
+            if state & GATE_HELD == 0 {
+                if self
+                    .state
+                    .compare_exchange_weak(
+                        state,
+                        state + GATE_ONE_OPERATION,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    return GateEntry { gate: self };
+                }
+                continue;
+            }
+            released.await;
+        }
+    }
+
+    /// Closes the gate and waits for every operation inside to leave.
+    /// Closing a closed gate only waits for the drain again.
+    async fn close_and_drain(&self) {
+        self.state.fetch_or(GATE_HELD, Ordering::AcqRel);
+        loop {
+            let drained = self.drained.notified();
+            if self.state.load(Ordering::Acquire) >> 1 == 0 {
+                return;
+            }
+            drained.await;
+        }
+    }
+
+    /// Opens the gate, reporting whether it was closed.
+    fn open(&self) -> bool {
+        let was_held = self.state.fetch_and(!GATE_HELD, Ordering::AcqRel) & GATE_HELD != 0;
+        if was_held {
+            self.released.notify_all();
+        }
+        was_held
+    }
+}
+
+/// One operation inside the gate; leaving it is dropping it.
+struct GateEntry<'a> {
+    gate: &'a SnapshotGate,
+}
+
+impl Drop for GateEntry<'_> {
+    fn drop(&mut self) {
+        let before = self
+            .gate
+            .state
+            .fetch_sub(GATE_ONE_OPERATION, Ordering::AcqRel);
+        if before == GATE_HELD | GATE_ONE_OPERATION {
+            self.gate.drained.notify_all();
+        }
+    }
+}
+
 /// The clock and hardware-counter readings a profiled span is
 /// measured between.
 #[derive(Clone, Copy)]
@@ -378,6 +551,8 @@ struct ClientInner<Transport: HostFsTransport, CpuImpl: Cpu + Clone> {
     /// network service for its `kernel;network;` phases.
     profiles: ProfileSink,
     session: SessionCell,
+    /// Closed for the length of a VMM snapshot; see the module docs.
+    gate: SnapshotGate,
     tags: HandleAllocator,
     fids: HandleAllocator,
     cache: HostFsCache,
@@ -407,6 +582,7 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         Self {
             inner: Arc::new(ClientInner {
                 session: SessionCell::new(),
+                gate: SnapshotGate::new(),
                 tags: HandleAllocator::new(
                     depth,
                     u32::from(P9_NOTAG),
@@ -427,6 +603,89 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
     /// How the session's caches have been serving the kernel.
     pub fn cache_stats(&self) -> HostFsCacheStats {
         self.inner.cache.stats()
+    }
+
+    /// Drops the session without telling the server, because the server
+    /// no longer knows it: the machine came back from an image taken
+    /// before the session was attached, so a `Tclunk` would name a fid
+    /// that does not exist. Every cached answer and pooled fid goes with
+    /// it, and the next operation runs `Tversion`/`Tattach` afresh.
+    ///
+    /// The session lock is held for the reset, so an establishment that
+    /// is under way finishes first and none starts in the middle. An
+    /// operation in flight across the reset fails with its own transport
+    /// error: its fids belong to the old era, so returning them to the
+    /// allocator is ignored and nothing it parked in the cache afterwards
+    /// is kept.
+    pub async fn reset_session_forgotten(&self) {
+        let _establishing = self.inner.session.establishing.lock().await;
+        self.inner.session.unpublish();
+        self.inner.fids.reset();
+        // The pooled read fids go unclunked: the server forgot them too.
+        let forgotten = self.inner.cache.clear();
+        tracing::info!(
+            parked_fids = forgotten.len(),
+            "9p session dropped: the server no longer knows it"
+        );
+    }
+
+    /// Gives the share back to the host for a VMM snapshot and keeps it
+    /// given back.
+    ///
+    /// The gate closes first, so no operation starts from here on, and
+    /// the call waits for those already inside to finish. The session
+    /// lock is taken only after the drain, because an operation inside
+    /// may itself be waiting for it to establish the session. With the
+    /// client quiet, every pooled read fid and then the root fid are
+    /// clunked, which is what lifts QEMU's snapshot blocker, and the
+    /// session is left unpublished. The hold ends in
+    /// [`Self::snapshot_finished`] or in a machine restore. A caller
+    /// that abandons this future after the gate closed leaves the hold
+    /// in force; ending it is still one of those two.
+    pub async fn prepare_snapshot(&self) {
+        self.inner.gate.close_and_drain().await;
+        let _establishing = self.inner.session.establishing.lock().await;
+        let Some(session) = self.inner.session.get() else {
+            tracing::info!("9p snapshot hold taken with no session attached");
+            return;
+        };
+        self.inner.session.unpublish();
+        let parked = self.inner.cache.clear();
+        let parked_fids = parked.len();
+        for fid in parked {
+            self.clunk_value(fid).await;
+        }
+        self.clunk_value(session.root_fid).await;
+        tracing::info!(parked_fids, "9p session released for a snapshot");
+    }
+
+    /// Ends the hold [`Self::prepare_snapshot`] took, because the
+    /// snapshot is over and this machine runs on. A no-op when no hold
+    /// is in force.
+    pub fn snapshot_finished(&self) {
+        if self.inner.gate.open() {
+            tracing::info!("9p snapshot hold ended: the share attaches again on next use");
+        }
+    }
+
+    /// Forgets every cached answer without touching the session, for a
+    /// restore after which the server is the same one but the monotonic
+    /// ages the entries were stamped with no longer mean what they did.
+    ///
+    /// A pooled read fid is still valid on the server, so it is
+    /// clunked, not forgotten.
+    pub async fn flush_cache(&self) {
+        for fid in self.inner.cache.clear() {
+            self.clunk_value(fid).await;
+        }
+    }
+
+    /// Whether `session` is still the one the client holds, as opposed
+    /// to one a reset dropped. An answer learned through a dropped
+    /// session describes the machine before the restore and is not
+    /// cached.
+    fn is_current(&self, session: Session) -> bool {
+        self.inner.session.get() == Some(session)
     }
 
     /// The monotonic reading the caches age their entries against.
@@ -478,16 +737,19 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         );
     }
 
-    /// Runs `operation` under its `kernel;hostfs;<phase>` counter:
-    /// count is the call itself, nanos the whole wall-clock span and
-    /// bytes whatever payload `payload` reads off the result — zero
-    /// for an operation that moves none.
+    /// Runs `operation` as one public host-share operation: inside the
+    /// snapshot gate for its whole duration, and under its
+    /// `kernel;hostfs;<phase>` counter. Count is the call itself, nanos
+    /// the whole wall-clock span and bytes whatever payload `payload`
+    /// reads off the result — zero for an operation that moves none.
+    /// Time parked at a closed gate is not part of the span.
     async fn profiled<T>(
         &self,
         phase: &'static str,
         operation: impl Future<Output = Result<T, HostFsError>> + Send,
         payload: impl FnOnce(&T) -> usize + Send,
     ) -> Result<T, HostFsError> {
+        let _inside = self.inner.gate.enter().await;
         let start = self.profile_start();
         let result = operation.await;
         if let Some(start) = start {
@@ -729,6 +991,11 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
     /// opened them, so their client-side number is retained past that
     /// operation's stack frame and released here instead.
     async fn clunk_value(&self, fid: u32) {
+        if !self.inner.fids.is_current(fid) {
+            // Handed out before a session reset: the server forgot it
+            // along with the session, so a `Tclunk` would name nothing.
+            return;
+        }
         if let Err(error) = self
             .transact(
                 P9Message::Clunk,
@@ -765,7 +1032,12 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
 
     /// Parks a read fid for the next read of `path`, clunking whatever
     /// the pool had to give up to make room for it.
-    async fn release_read_fid(&self, path: &str, fid: u32) {
+    async fn release_read_fid(&self, session: Session, path: &str, fid: u32) {
+        if !self.is_current(session) {
+            // The session was dropped while the fid was in use: the
+            // server forgot it, so there is nothing to park or clunk.
+            return;
+        }
         if let Some(orphaned) = self.inner.cache.park_read_fid(path, fid, self.now_nanos()) {
             self.clunk_value(orphaned).await;
         }
@@ -789,7 +1061,15 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
 
     /// Remembers what the host answered about `path`, including that it
     /// answered "no such path".
-    fn record_stat(&self, path: &str, result: &Result<HostMetadata, HostFsError>) {
+    fn record_stat(
+        &self,
+        session: Session,
+        path: &str,
+        result: &Result<HostMetadata, HostFsError>,
+    ) {
+        if !self.is_current(session) {
+            return;
+        }
         let now_nanos = self.now_nanos();
         match result {
             Ok(metadata) => self
@@ -1048,7 +1328,7 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
             }
             Err(error) => Err(error),
         };
-        self.record_stat(path, &metadata);
+        self.record_stat(session, path, &metadata);
         metadata
     }
 
@@ -1067,7 +1347,9 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         let target = self.walk(session, path).await?;
         let entries = self.read_dir_entries(session, target.value(), limit).await;
         self.clunk(target).await;
-        if let Ok(entries) = &entries {
+        if let Ok(entries) = &entries
+            && self.is_current(session)
+        {
             self.inner
                 .cache
                 .insert_directory(path, entries, self.now_nanos());
@@ -1085,7 +1367,7 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         let fid = match self.acquire_read_fid(session, path).await {
             Ok(fid) => fid,
             Err(error) => {
-                self.record_stat(path, &Err(error.clone()));
+                self.record_stat(session, path, &Err(error.clone()));
                 tracing::warn!("host-fs read_file({path}) failed: {error:?}");
                 return Err(error);
             }
@@ -1096,7 +1378,7 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
                 None => {
                     let metadata = self.get_attr(fid).await?;
                     let size = metadata.size;
-                    self.record_stat(path, &Ok(metadata));
+                    self.record_stat(session, path, &Ok(metadata));
                     size
                 }
             };
@@ -1106,7 +1388,7 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         if let Err(error) = &data {
             tracing::warn!("host-fs read_file({path}) failed: {error:?}");
         }
-        self.release_read_fid(path, fid).await;
+        self.release_read_fid(session, path, fid).await;
         data
     }
 
@@ -1129,7 +1411,7 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
                 "host-fs read_file_range(path={path}, offset={offset}, max_bytes={max_bytes}) failed: {error:?}"
             );
         }
-        self.release_read_fid(path, fid).await;
+        self.release_read_fid(session, path, fid).await;
         data
     }
 
@@ -1460,6 +1742,25 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFileSystem
         Some(self.cache_stats())
     }
 
+    async fn after_machine_restore(&self, restore: HostShareRestore) {
+        match restore {
+            HostShareRestore::ServerKept => self.flush_cache().await,
+            HostShareRestore::SessionLost => self.reset_session_forgotten().await,
+        }
+        // A restored copy never sees `snapshot-finished`: its machine
+        // generation advancing is what ends a hold taken before the
+        // snapshot, after the session state above is settled.
+        self.snapshot_finished();
+    }
+
+    async fn prepare_snapshot(&self) {
+        HostFsClient::prepare_snapshot(self).await;
+    }
+
+    fn snapshot_finished(&self) {
+        HostFsClient::snapshot_finished(self);
+    }
+
     async fn stat_path<'a>(&'a self, path: &'a str) -> Result<HostMetadata, HostFsError> {
         self.profiled("op-stat", self.stat_path_impl(path), |_| 0)
             .await
@@ -1762,7 +2063,8 @@ fn append_read_payload(response: &[u8], output: &mut Vec<u8>) -> Result<usize, H
 mod tests {
     use super::*;
     use crate::test_support::ManualClockCpu;
-    use futures_lite::future::{block_on, zip};
+    use core::pin::pin;
+    use futures_lite::future::{block_on, poll_once, zip};
 
     #[test]
     fn p9_setattr_times_uses_specific_timestamp_flags() {
@@ -2386,6 +2688,233 @@ mod tests {
         );
         assert_eq!(client.cache_stats().attribute_hits, 1);
         assert_eq!(client.cache_stats().attribute_misses, 2);
+    }
+
+    #[test]
+    fn a_session_the_server_forgot_is_dropped_without_a_clunk_and_attached_again() {
+        let Fixture {
+            client, transport, ..
+        } = fixture(P9_REQUESTED_MSIZE, FakeFault::default());
+
+        block_on(async {
+            client.stat_path_impl("/alpha").await.expect("first stat");
+            client.read_file_impl("/alpha").await.expect("first read");
+        });
+        let clunked_before = {
+            let log = transport.log();
+            assert_eq!((log.versions, log.attaches), (1, 1));
+            assert_eq!(log.getattrs, 1, "the read's size probe came from the cache");
+            log.clunked.clone()
+        };
+
+        block_on(client.reset_session_forgotten());
+        assert_eq!(
+            transport.log().clunked,
+            clunked_before,
+            "the server forgot the fids, so the reset clunks none"
+        );
+        assert_eq!(client.inner.fids.live_count(), 0);
+        assert_eq!(client.inner.session.get(), None);
+
+        block_on(async {
+            client.stat_path_impl("/alpha").await.expect("stat after");
+        });
+        let log = transport.log();
+        assert_eq!(
+            (log.versions, log.attaches),
+            (2, 2),
+            "the next operation sends Tversion and Tattach"
+        );
+        assert_eq!(
+            log.getattrs, 2,
+            "attributes cached before the reset are not served"
+        );
+        drop(log);
+        assert_eq!(client.inner.fids.live_count(), 1, "only the new root fid");
+    }
+
+    #[test]
+    fn a_restore_that_kept_the_server_flushes_the_cache_and_clunks_the_parked_fid() {
+        let Fixture {
+            client, transport, ..
+        } = fixture(P9_REQUESTED_MSIZE, FakeFault::default());
+
+        block_on(async {
+            client.read_file_impl("/alpha").await.expect("first read");
+        });
+        assert!(transport.log().clunked.is_empty());
+
+        block_on(client.flush_cache());
+        assert_eq!(
+            transport.log().clunked.len(),
+            1,
+            "the pooled fid is still known to the server, so it is clunked"
+        );
+
+        block_on(async {
+            client.stat_path_impl("/alpha").await.expect("stat after");
+        });
+        let log = transport.log();
+        assert_eq!(
+            (log.versions, log.attaches),
+            (1, 1),
+            "the session is the server's still and is kept"
+        );
+        assert_eq!(
+            log.getattrs, 2,
+            "the flushed attributes are asked for again"
+        );
+    }
+
+    #[test]
+    fn a_fid_handed_out_before_a_reset_cannot_be_confused_with_a_later_one() {
+        let fids = HandleAllocator::new(4, P9_NOFID, "fid", "fids exhausted");
+        let before = fids.allocate().expect("a fid").retain();
+        let also_before = fids.allocate().expect("a fid").retain();
+        assert!(fids.is_current(before));
+
+        fids.reset();
+        assert!(!fids.is_current(before));
+        assert_eq!(fids.live_count(), 0);
+
+        let after = fids.allocate().expect("a fid after the reset");
+        assert!(
+            ![before, also_before].contains(&after.value()),
+            "a new fid never equals one an old operation still holds"
+        );
+        // An operation from before the reset returns its fid: ignored,
+        // and the new fid stays live.
+        fids.release(before);
+        assert_eq!(fids.live_count(), 1);
+        drop(after);
+        assert_eq!(fids.live_count(), 0);
+    }
+
+    #[test]
+    fn a_snapshot_hold_releases_the_root_fid_parks_operations_and_attaches_once_on_finish() {
+        let Fixture {
+            client, transport, ..
+        } = fixture(P9_REQUESTED_MSIZE, FakeFault::default());
+
+        block_on(async {
+            client.stat_path("/alpha").await.expect("stat before");
+            client.read_file("/alpha").await.expect("read before");
+            let root_fid = client
+                .inner
+                .session
+                .get()
+                .expect("the session is attached")
+                .root_fid;
+
+            let clunked_before = transport.log().clunked.len();
+            client.prepare_snapshot().await;
+            {
+                let log = transport.log();
+                assert!(
+                    log.clunked.contains(&root_fid),
+                    "the root fid is clunked, which lifts the VMM's snapshot blocker"
+                );
+                assert_eq!(
+                    log.clunked.len() - clunked_before,
+                    2,
+                    "the pooled read fid and the root fid"
+                );
+            }
+            assert_eq!(client.inner.session.get(), None);
+            assert_eq!(client.inner.fids.live_count(), 0, "no fid is left");
+
+            // Two operations issued during the hold: neither fails and
+            // neither reaches the server.
+            let walks_before = transport.log().walks;
+            let mut first = pin!(client.stat_path("/beta"));
+            let mut second = pin!(client.read_dir("/", TEST_DIR_LIMIT));
+            assert!(poll_once(first.as_mut()).await.is_none());
+            assert!(poll_once(second.as_mut()).await.is_none());
+            assert_eq!(transport.log().walks, walks_before);
+            assert_eq!(transport.log().attaches, 1, "no attach during the hold");
+
+            client.snapshot_finished();
+            let (first, second) = zip(first, second).await;
+            first.expect("the parked stat completes after the finish");
+            second.expect("the parked listing completes after the finish");
+        });
+
+        let log = transport.log();
+        assert_eq!(
+            (log.versions, log.attaches),
+            (2, 2),
+            "the session is attached exactly once more, for both parked operations"
+        );
+        drop(log);
+        assert_eq!(client.inner.fids.live_count(), 1, "only the new root fid");
+    }
+
+    #[test]
+    fn a_machine_restore_ends_a_snapshot_hold() {
+        let Fixture {
+            client, transport, ..
+        } = fixture(P9_REQUESTED_MSIZE, FakeFault::default());
+
+        block_on(async {
+            client.stat_path("/alpha").await.expect("stat before");
+            client.prepare_snapshot().await;
+            let mut parked = pin!(client.stat_path("/beta"));
+            assert!(poll_once(parked.as_mut()).await.is_none());
+
+            client
+                .after_machine_restore(HostShareRestore::SessionLost)
+                .await;
+            parked.await.expect("the parked stat completes");
+            // The source's `snapshot-finished` arriving after the restore
+            // reaction must not disturb the new session.
+            client.snapshot_finished();
+            client.stat_path("/gamma").await.expect("stat after");
+        });
+
+        let log = transport.log();
+        assert_eq!((log.versions, log.attaches), (2, 2));
+    }
+
+    #[test]
+    fn preparing_a_snapshot_waits_for_the_operation_in_flight() {
+        let Fixture {
+            client, transport, ..
+        } = fixture(P9_REQUESTED_MSIZE, FakeFault::default());
+
+        block_on(async {
+            let mut operation = pin!(client.stat_path("/alpha"));
+            assert!(
+                poll_once(operation.as_mut()).await.is_none(),
+                "the fake server answers after a yield, so the operation is in flight"
+            );
+
+            let mut prepare = pin!(client.prepare_snapshot());
+            let mut polls = 0;
+            let outcome = loop {
+                if let Some(outcome) = poll_once(operation.as_mut()).await {
+                    break outcome;
+                }
+                assert!(
+                    poll_once(prepare.as_mut()).await.is_none(),
+                    "prepare finished while an operation was still in flight"
+                );
+                assert!(
+                    !transport.log().clunked.contains(&0),
+                    "the root fid is not clunked under an operation in flight"
+                );
+                polls += 1;
+                assert!(polls < 100, "the operation never completed");
+            };
+            outcome.expect("the operation in flight completes, it is not failed");
+
+            prepare.await;
+        });
+
+        let log = transport.log();
+        assert_eq!(log.clunked.len(), 2, "the operation's fid and the root fid");
+        drop(log);
+        assert_eq!(client.inner.session.get(), None);
+        assert_eq!(client.inner.fids.live_count(), 0);
     }
 
     #[test]

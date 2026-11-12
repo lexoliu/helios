@@ -1770,6 +1770,9 @@ dependencies = [
 [[package]]
 name = "helios-compiler-abi"
 version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.21",
+]
 
 [[package]]
 name = "helios-compiler-plugin"
@@ -2039,6 +2042,7 @@ dependencies = [
  "divan",
  "heapless",
  "helios-hal",
+ "siphasher",
  "thiserror 2.0.21",
  "tracing",
  "wide",
@@ -3908,9 +3912,9 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "siphasher"
-version = "1.0.3"
+version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
+checksum = "33f4fe9184a62d842c9ef383018f3306d8ba224fd9d836f56d7288308847c256"
 
 [[package]]
 name = "slab"

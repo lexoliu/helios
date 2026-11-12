@@ -24,7 +24,7 @@ use alloc::boxed::Box;
 use arrayvec::ArrayVec;
 use core::ptr::NonNull;
 
-use helios_hal::fs::{BlockBuffer, OwnedBlockBuffer};
+use helios_hal::fs::{AnswerFlag, BlockBuffer, OwnedBlockBuffer};
 use helios_hal::io::IoResult;
 
 use super::cache::{CACHE_BLOCK_BYTES, CacheRun, MAX_RUN_BLOCKS};
@@ -64,6 +64,9 @@ pub struct BlockPages {
     /// The cache blocks the request fills or writes, when the block cache
     /// issued it.
     run: Option<CacheRun>,
+    /// Raised once the request is over, when the holder asked to learn
+    /// it (see [`OwnedBlockBuffer::raise_on_answer`]).
+    answered: Option<AnswerFlag>,
 }
 
 // SAFETY: the pages are either the buffer's own or cache pages the run
@@ -80,6 +83,7 @@ impl BlockPages {
             owned: 0,
             len: 0,
             run: Some(run),
+            answered: None,
         }
     }
 
@@ -156,10 +160,17 @@ impl BlockBuffer for BlockPages {
         if let Some(run) = self.run.as_mut() {
             run.complete(result);
         }
+        if let Some(answered) = self.answered.take() {
+            answered.raise();
+        }
     }
 }
 
 impl OwnedBlockBuffer for BlockPages {
+    fn raise_on_answer(&mut self, flag: AnswerFlag) {
+        self.answered = Some(flag);
+    }
+
     fn zeroed(len: usize) -> Option<Self> {
         let count = len.div_ceil(CACHE_BLOCK_BYTES);
         if count > MAX_RUN_BLOCKS {
@@ -170,6 +181,7 @@ impl OwnedBlockBuffer for BlockPages {
             owned: 0,
             len: 0,
             run: None,
+            answered: None,
         };
         for _ in 0..count {
             buffer.push_owned(Page::zeroed());
