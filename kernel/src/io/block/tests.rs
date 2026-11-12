@@ -862,7 +862,7 @@ fn red_pressure_drops_clean_compressed_blocks_and_writes_back_dirty_ones() {
     shrink(&cache, PressureLevel::Red);
 
     // Both left the cache; the dirty one reached the disk uncompressed
-    // first, from a page staged for the write and freed after it.
+    // first, decompressed into the driver's run.
     assert_eq!(cache.resident_blocks(), 0);
     assert_eq!(cache.page_buffers(), 0);
     assert_eq!(cache.compressed_pool().stats().stored_pages, 0);
@@ -875,7 +875,7 @@ fn red_pressure_drops_clean_compressed_blocks_and_writes_back_dirty_ones() {
 }
 
 #[test]
-fn red_pressure_on_a_full_pool_holds_no_more_pages_than_one_request_carries() {
+fn writing_back_compressed_blocks_allocates_no_page() {
     // Four blocks a request: write-back runs of four blocks.
     let mut state = MemoryDisk::build("images", CACHE_BLOCK_BYTES, 32);
     state.max_transfer_bytes = 4 * CACHE_BLOCK_BYTES;
@@ -897,6 +897,7 @@ fn red_pressure_on_a_full_pool_holds_no_more_pages_than_one_request_carries() {
     // The pool is full: nothing more fits until it gives pages back.
     let pool = cache.compressed_pool();
     pool.set_limit_bytes(pool.stats().stored_bytes);
+    let allocated = pages_allocated(&cache);
 
     let peak = Arc::new(AtomicUsize::new(0));
     {
@@ -910,10 +911,15 @@ fn red_pressure_on_a_full_pool_holds_no_more_pages_than_one_request_carries() {
     // The probe holds a clone of the cache; let it go.
     disk.state.on_write.lock().take();
 
-    assert!(
-        peak.load(Ordering::SeqCst) <= 4,
-        "red pressure held {} page buffers at once",
-        peak.load(Ordering::SeqCst)
+    assert_eq!(
+        peak.load(Ordering::SeqCst),
+        0,
+        "a write-back of compressed blocks held page buffers"
+    );
+    assert_eq!(
+        pages_allocated(&cache),
+        allocated,
+        "a write-back of compressed blocks allocated a page"
     );
     assert_eq!(cache.page_buffers(), 0);
     assert_eq!(cache.resident_blocks(), 0);
@@ -1031,11 +1037,64 @@ fn sync_writes_a_dirty_block_held_compressed_uncompressed() {
         disk.bytes_at(5 * CACHE_BLOCK_BYTES, CACHE_BLOCK_BYTES),
         [0x55; CACHE_BLOCK_BYTES]
     );
-    // The block stays compressed, now clean, and the page the write was
-    // staged in is gone.
+    // The block stays compressed and now clean, and the write allocated
+    // no page.
     assert!(dirty_blocks(&cache).is_empty());
     assert_eq!(cache.compressed_blocks(), 1);
     assert_eq!(cache.page_buffers(), 0);
+    assert_eq!(pages_allocated(&cache), 1);
+
+    // A hit decompresses it for good, and its bytes are what was written.
+    block_on(async {
+        let block = view.read(5).await.expect("block 5 from the pool");
+        assert!(block.iter().all(|byte| *byte == 0x55));
+    });
+    assert_eq!(cache.compressed_blocks(), 0);
+}
+
+#[test]
+fn a_hit_on_a_compressed_block_under_write_back_waits_for_the_write() {
+    let disk = MemoryDisk::with_blocks("images", CACHE_BLOCK_BYTES, 16);
+    let cache = cache_over(&disk, 16, 1);
+    let view = cache.disk(0);
+    let mut context = Context::from_waker(Waker::noop());
+
+    block_on(async {
+        view.overwrite(5).await.expect("block 5").fill(0x55);
+    });
+    compress_cold_blocks(&cache);
+    assert_eq!(cache.compressed_blocks(), 1);
+
+    // The device holds the write: a paused disk keeps every data request
+    // it accepts, unanswered and unfilled, until `resume`.
+    disk.pause();
+    assert!(poll_up_to(view.sync(), 1).is_none());
+    assert_eq!(disk.accepted(), 1);
+
+    // The write still reads the compressed page, so a hit parks on the
+    // write-back and the page stays.
+    let mut hit = pin!(view.read(5));
+    for _ in 0..3 {
+        assert!(hit.as_mut().poll(&mut context).is_pending());
+    }
+    assert_eq!(cache.compressed_blocks(), 1);
+    assert_eq!(cache.page_buffers(), 0);
+    assert!(disk.writes().is_empty());
+
+    disk.resume();
+
+    let Poll::Ready(Ok(block)) = hit.as_mut().poll(&mut context) else {
+        panic!("the hit should be answered once the write is");
+    };
+    assert!(block.iter().all(|byte| *byte == 0x55));
+    drop(block);
+    assert_eq!(disk.writes(), [Op::Write(5, 1)]);
+    assert_eq!(
+        disk.bytes_at(5 * CACHE_BLOCK_BYTES, CACHE_BLOCK_BYTES),
+        [0x55; CACHE_BLOCK_BYTES]
+    );
+    assert!(dirty_blocks(&cache).is_empty());
+    assert_eq!(cache.compressed_blocks(), 0);
 }
 
 #[test]
@@ -1649,7 +1708,10 @@ fn the_cache_stays_coherent_under_real_threads() {
                     };
                     cache.set_pressure(level);
                     run_or_abandon(cache.shrink(level), abandon_after(seed));
-                    if pass.is_multiple_of(3)
+                    // A sync right after a yellow pass writes dirty
+                    // compressed blocks back from their compressed pages
+                    // while the readers hit them.
+                    if (pass % 4 == 1 || pass.is_multiple_of(3))
                         && let Some(synced) = run_or_abandon(view.sync(), abandon_after(seed >> 2))
                     {
                         synced.expect("sync");
@@ -1690,6 +1752,10 @@ fn the_cache_stays_coherent_under_real_threads() {
     assert!(dirty_blocks(&cache).is_empty());
     assert_eq!(disk.accepted(), 0);
     assert_eq!(cache.disk(0).stats().write_errors, 0);
+    assert!(
+        cache.compressed_pool().stats().stores > 0,
+        "the reclaimer compressed blocks, dirty ones among them"
+    );
     assert_eq!(
         idle_blocks(&cache),
         cache.resident_blocks(),
