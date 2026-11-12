@@ -47,7 +47,7 @@ pub use cache::{
     BlockCache, BlockCacheError, BlockCacheLimits, BlockMut, BlockRef, CACHE_BLOCK_BYTES,
     CacheLayoutError, CachedDisk, CachedDiskStats,
 };
-pub use pages::{BlockPages, DevicePages};
+pub use pages::BlockPages;
 pub use scratch::{
     BlockSelfCheckError, BlockStats, ScratchDisk, ScratchDiskStats, install_scratch_swap,
 };
@@ -241,7 +241,7 @@ fn open_mount_sources<Device>(
     pool: CompressedPool,
 ) -> Option<BlockCache<Device>>
 where
-    Device: BlockDevice<Buffer = DevicePages<Device>>,
+    Device: BlockDevice<Buffer = BlockPages>,
 {
     let mut disks = ArrayVec::<CacheDisk<Device>, MAX_BLOCK_DEVICES>::new();
     for (serial, device) in mount_sources {
@@ -285,7 +285,7 @@ async fn reclaim_under_pressure<CpuImpl, Device>(
 ) -> !
 where
     CpuImpl: Cpu + Clone,
-    Device: BlockDevice<Buffer = DevicePages<Device>>,
+    Device: BlockDevice<Buffer = BlockPages>,
 {
     loop {
         timer.sleep_for(RECLAIM_TICK).await;
@@ -319,7 +319,7 @@ pub fn install_block_devices<CpuImpl, WatchdogImpl, Device, Install>(
 ) where
     CpuImpl: Cpu + Clone + Send + Sync + 'static,
     WatchdogImpl: Watchdog + Clone,
-    Device: BlockDevice<Buffer = DevicePages<Device>> + 'static,
+    Device: BlockDevice<Buffer = BlockPages> + 'static,
     Install: FnOnce(BlockService, ScratchDisk<Device>, Option<BlockCache<Device>>) + 'static,
 {
     if devices.is_empty() {

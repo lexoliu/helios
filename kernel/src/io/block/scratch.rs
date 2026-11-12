@@ -18,7 +18,6 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use helios_hal::cpu::Cpu;
-use helios_hal::dma::DmaError;
 use helios_hal::fs::{
     BlockDevice, BlockDeviceCapabilities, BlockGeometry, BlockQueueTopology, BlockRange,
     BlockSerial, IoError, IoResult, OwnedBlockBuffer,
@@ -43,8 +42,6 @@ pub enum BlockSelfCheckError {
         capacity_blocks: usize,
         block_bytes: usize,
     },
-    #[error("scratch disk memory refused a {bytes}-byte self-check buffer: {error}")]
-    Buffer { bytes: usize, error: DmaError },
     #[error("scratch disk write failed: {0}")]
     Write(IoError),
     #[error("scratch disk cache flush failed: {0}")]
@@ -236,18 +233,6 @@ where
             .saturating_sub(self.self_check_blocks())
     }
 
-    /// A zeroed request buffer for `bytes` of the self-check, made of the
-    /// disk's own memory.
-    fn check_buffer(&self, bytes: usize) -> Result<Device::Buffer, BlockSelfCheckError>
-    where
-        Device::Buffer: OwnedBlockBuffer<Memory = <Device as BlockDevice>::Memory>,
-    {
-        self.device
-            .memory(bytes)
-            .map(Device::Buffer::owning)
-            .map_err(|error| BlockSelfCheckError::Buffer { bytes, error })
-    }
-
     /// Proves the disk round-trips before anything depends on it.
     ///
     /// The pattern is random so a device that answers with a stale or
@@ -257,7 +242,7 @@ where
     /// wrote through.
     pub async fn self_check(&self, root: &RootEntropyHandle) -> Result<(), BlockSelfCheckError>
     where
-        Device::Buffer: OwnedBlockBuffer<Memory = <Device as BlockDevice>::Memory>,
+        Device::Buffer: OwnedBlockBuffer,
     {
         let geometry = self.stats.geometry;
         let block_bytes = geometry.logical_block_bytes;
@@ -275,7 +260,7 @@ where
         let pattern = &mut pattern[..bytes];
         root.fill(pattern);
 
-        let mut written = self.check_buffer(bytes)?;
+        let mut written = Device::Buffer::zeroed(bytes);
         written.as_mut().copy_from_slice(pattern);
         self.write(start_block, written)
             .await
@@ -283,7 +268,7 @@ where
         self.flush().await.map_err(BlockSelfCheckError::Flush)?;
 
         let ((), read) = self
-            .read(start_block, self.check_buffer(bytes)?)
+            .read(start_block, Device::Buffer::zeroed(bytes))
             .await
             .map_err(|failure| BlockSelfCheckError::Read(failure.into_error()))?;
         let readback = read.as_ref();
@@ -320,15 +305,10 @@ where
     Device: BlockDevice,
 {
     type Buffer = Device::Buffer;
-    type Memory = Device::Memory;
     type Waiter<'a>
         = Device::Waiter<'a>
     where
         Self: 'a;
-
-    fn memory(&self, bytes: usize) -> Result<Device::Memory, DmaError> {
-        self.device.memory(bytes)
-    }
 
     async fn submit_read(&self, block_id: usize, buffer: Device::Buffer) -> Device::Waiter<'_> {
         self.stats.counters.reads.fetch_add(1, Ordering::Relaxed);

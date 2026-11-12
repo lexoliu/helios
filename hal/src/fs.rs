@@ -1,6 +1,6 @@
 pub use crate::io::{IoError, IoResult};
 
-use crate::dma::{BufResult, DmaBuffer, DmaError};
+use crate::dma::BufResult;
 use crate::resource::{KernelResource, ResourceRights};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -406,24 +406,20 @@ impl AnswerFlag {
 /// holder fills and reads them through its byte views: a scratch or swap
 /// page, as opposed to a cache's own blocks.
 ///
-/// It is made of one run of [`BlockDevice::memory`]; a request copies its
-/// bytes to and from the driver's own memory like every other request
+/// Its bytes are one run of kernel memory, and a request copies them to and
+/// from the driver's own memory like every other request
 /// ([`BlockBuffer::fill`], [`BlockBuffer::deliver`]). Its byte views are
 /// that run's, and like every request buffer's they are not touched while a
 /// request carries the buffer.
 pub trait OwnedBlockBuffer: BlockBuffer + AsRef<[u8]> + AsMut<[u8]> {
-    /// The device memory the buffer is made of: a device's
-    /// [`BlockDevice::Memory`].
-    type Memory;
-
     /// Has the buffer raise `flag` in [`BlockBuffer::complete`], after
     /// whatever else completing it does. A buffer dropped uncompleted —
     /// its submission dropped before the device accepted it — never
     /// raises it.
     fn raise_on_answer(&mut self, flag: AnswerFlag);
 
-    /// A request buffer whose bytes are all of `memory`'s.
-    fn owning(memory: Self::Memory) -> Self;
+    /// A buffer of `len` zero bytes: one run of kernel memory.
+    fn zeroed(len: usize) -> Self;
 }
 
 /// A block device.
@@ -450,30 +446,6 @@ pub trait OwnedBlockBuffer: BlockBuffer + AsRef<[u8]> + AsMut<[u8]> {
 pub trait BlockDevice: Send + Sync {
     /// The buffers this device's data requests carry.
     type Buffer: BlockBuffer;
-
-    /// Memory this device can reach, in which a consumer keeps the bytes
-    /// its requests carry: a cache's blocks, a page staged for a write, a
-    /// scratch or swap buffer. A run is for this device's requests; the
-    /// memory of one device is not handed to another.
-    ///
-    /// A run may be dropped in the device's interrupt handler: a request
-    /// buffer that owns one is completed and, when nobody waits for it
-    /// any more, dropped by the driver's completion path (see
-    /// [`BlockBuffer`]). The drop contract is [`DmaBuffer`]'s.
-    type Memory: DmaBuffer + AsRef<[u8]> + AsMut<[u8]>;
-
-    /// Allocates `bytes` zeroed bytes this device can reach, as one run
-    /// that is contiguous in the device's address space, exactly `bytes`
-    /// long and aligned to a page ([`crate::pmm::PhysFrame::SIZE`]).
-    ///
-    /// A request carries a whole number of logical blocks, so a consumer
-    /// asks for a non-zero multiple of
-    /// [`BlockGeometry::logical_block_bytes`]; any other length is
-    /// refused with [`DmaError::InvalidLength`]. A refusal of the memory
-    /// itself is the device's [`crate::dma::DmaMemory`] answer, handed to
-    /// the caller that needed the bytes. The memory is requested as
-    /// `READ | WRITE`, because a block is read into and written from.
-    fn memory(&self, bytes: usize) -> Result<Self::Memory, DmaError>;
 
     /// A request the device has accepted, until its answer is collected.
     type Waiter<'a>: Future<Output = BufResult<(), Self::Buffer>> + Send + 'a

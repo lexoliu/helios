@@ -21,14 +21,10 @@ use helios_kernel::ExternalInterruptHandler;
 use crate::Aarch64Cpu;
 use crate::debug_state::RuntimeState;
 
-type Aarch64VirtioBlockTransport =
-    helios_virtio::VirtioMmioTransport<helios_virtio::MmioBus<helios_virtio::OffsetDmaPool>>;
-
-/// The device's requests carry pages of its own transport's DMA memory.
 type Aarch64VirtioBlockDevice = helios_virtio::VirtioBlockResource<
-    Aarch64VirtioBlockTransport,
+    helios_virtio::VirtioMmioTransport<helios_virtio::MmioBus<helios_virtio::OffsetDmaPool>>,
     Aarch64Cpu,
-    helios_kernel::BlockPages<helios_virtio::TransportBuffer<Aarch64VirtioBlockTransport>>,
+    helios_kernel::BlockPages,
 >;
 
 #[derive(Clone)]

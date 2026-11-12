@@ -17,7 +17,7 @@ use alloc::vec::Vec;
 
 use helios_hal::fs::BlockDeviceRights;
 use helios_kernel::{ExternalInterruptHandler, RootEntropyHandle};
-use helios_virtio::{DeviceType, TransportBuffer, VirtioBlockResource, VirtioPciTransport};
+use helios_virtio::{DeviceType, VirtioBlockResource, VirtioPciTransport};
 use pci_types::PciAddress;
 
 use crate::X86Cpu;
@@ -25,12 +25,8 @@ use crate::exceptions::BLOCK_INTERRUPT_VECTORS;
 use crate::iommu::X86DmaPool;
 use crate::pci::PciRoot;
 
-/// The device's requests carry pages of its own transport's DMA memory.
-type X86VirtioBlockDevice = VirtioBlockResource<
-    VirtioPciTransport<X86DmaPool>,
-    X86Cpu,
-    helios_kernel::BlockPages<TransportBuffer<VirtioPciTransport<X86DmaPool>>>,
->;
+type X86VirtioBlockDevice =
+    VirtioBlockResource<VirtioPciTransport<X86DmaPool>, X86Cpu, helios_kernel::BlockPages>;
 
 #[derive(Clone)]
 pub(crate) struct VirtioBlockDevice {

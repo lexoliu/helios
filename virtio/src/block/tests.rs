@@ -1,8 +1,8 @@
 use super::*;
 
 use crate::testing::{
-    Allocation, CONFINED_ARENA_BYTES, ConfinedDmaBuffer, ConfinedDmaPool, ConfinedTransport,
-    FakeAffinity, FakeTransport, FakeTransportConfig, Lifetime,
+    CONFINED_ARENA_BYTES, ConfinedDmaBuffer, ConfinedDmaPool, ConfinedTransport, FakeAffinity,
+    FakeTransport, FakeTransportConfig, Lifetime,
 };
 use crate::transport::VirtioFeatures;
 use alloc::sync::Arc;
@@ -10,8 +10,7 @@ use alloc::vec;
 use core::pin::pin;
 use core::ptr::NonNull;
 use futures_lite::future::{block_on, poll_once};
-use helios_hal::dma::{DmaBuffer, DmaError};
-use helios_hal::iommu::DmaAccess;
+use helios_hal::dma::DmaError;
 use spin::Mutex as SpinMutex;
 
 /// A device with 2 MiB of capacity in 512-byte sectors.
@@ -87,7 +86,14 @@ impl TestBuffer {
 
     /// `len` zero bytes of `pool`'s memory.
     fn in_pool(pool: &ConfinedDmaPool, len: usize) -> Self {
-        Self::owning(pool.buffer(len))
+        let mut memory = pool.buffer(len);
+        Self {
+            bytes: NonNull::from(memory.as_mut_slice()),
+            device_memory: Some(memory),
+            probe: None,
+            answered: None,
+            on_fill: None,
+        }
     }
 
     /// `len` zero bytes of host memory.
@@ -186,20 +192,12 @@ impl BlockBuffer for TestBuffer {
 }
 
 impl OwnedBlockBuffer for TestBuffer {
-    type Memory = ConfinedDmaBuffer;
-
     fn raise_on_answer(&mut self, flag: AnswerFlag) {
         self.answered = Some(flag);
     }
 
-    fn owning(mut memory: ConfinedDmaBuffer) -> Self {
-        Self {
-            bytes: NonNull::from(memory.as_mut_slice()),
-            device_memory: Some(memory),
-            probe: None,
-            answered: None,
-            on_fill: None,
-        }
+    fn zeroed(len: usize) -> Self {
+        Self::host(len)
     }
 }
 
@@ -792,54 +790,6 @@ fn the_header_and_the_status_travel_in_the_requests_own_slot() {
     assert_eq!(request_of(&device, 0), header(ReqType::In, 0));
 }
 
-#[test]
-fn request_memory_is_the_devices_own_in_whole_blocks() {
-    let device = device();
-    let block = device.block_size();
-    let memory = device
-        .memory(2 * block)
-        .expect("two blocks of request memory");
-    assert_eq!(memory.len(), 2 * block);
-    assert!(
-        (memory.as_ptr() as usize).is_multiple_of(PhysFrame::SIZE),
-        "request memory starts on a page"
-    );
-    let buffer = TestBuffer::owning(memory);
-    assert!(
-        device.object().transport.pool().reaches(buffer.as_ref()),
-        "request memory is memory the device reaches"
-    );
-    for bytes in [0, block + 1] {
-        assert_eq!(
-            device.memory(bytes).err(),
-            Some(DmaError::InvalidLength {
-                bytes,
-                required_multiple: block,
-            })
-        );
-    }
-}
-
-/// Request memory is carried by a request and given back, and a request
-/// reads and writes it: a cache page is read into and written from.
-#[test]
-fn request_memory_is_per_request_and_read_write() {
-    let device = device();
-    let block = device.block_size();
-    let pool = device.object().transport.pool().clone();
-    let before = pool.allocations().len();
-    let _memory = device.memory(block).expect("one block of request memory");
-    let served = pool.allocations();
-    assert_eq!(
-        served[before..],
-        [Allocation {
-            lifetime: Lifetime::PerRequest,
-            access: DmaAccess::READ | DmaAccess::WRITE,
-            bytes: block,
-        }]
-    );
-}
-
 /// Rings and control slots are resident for the life of the device.
 #[test]
 fn rings_and_control_slots_are_resident() {
@@ -1339,12 +1289,10 @@ fn test_geometry() -> BlockGeometry {
 
 /// A block device backed by host memory, for the swap backend tests. It
 /// carries a request out as it is submitted, answers it at once unless
-/// told to hold its answers, and hands out request memory from a confined
-/// pool of its own.
+/// told to hold its answers.
 struct MemoryBlockDevice {
     blocks: SpinMutex<Vec<u8>>,
     block_size: usize,
-    memory: ConfinedDmaPool,
     flushes: AtomicU64,
     fail_reads: bool,
     /// Each submission first parks once, as one waiting for room in a
@@ -1397,9 +1345,6 @@ impl MemoryBlockDevice {
         Self {
             blocks: SpinMutex::new(vec![0_u8; block_size * block_count]),
             block_size,
-            // A bump arena that never reuses memory: room for every
-            // page-aligned staging buffer one swap test allocates.
-            memory: ConfinedDmaPool::new(64 * PhysFrame::SIZE),
             flushes: AtomicU64::new(0),
             fail_reads: false,
             queue_full: AtomicBool::new(false),
@@ -1480,18 +1425,7 @@ impl MemoryBlockDevice {
 
 impl BlockDevice for MemoryBlockDevice {
     type Buffer = TestBuffer;
-    type Memory = ConfinedDmaBuffer;
     type Waiter<'a> = MemoryWaiter;
-
-    fn memory(&self, bytes: usize) -> Result<ConfinedDmaBuffer, DmaError> {
-        let layout =
-            Layout::from_size_align(bytes, PhysFrame::SIZE).map_err(|_| DmaError::TooLarge {
-                bytes,
-                limit: isize::MAX as usize & !(PhysFrame::SIZE - 1),
-            })?;
-        self.memory
-            .allocate(layout, DmaAccess::READ | DmaAccess::WRITE)
-    }
 
     async fn submit_read(&self, block_id: usize, mut buffer: TestBuffer) -> Self::Waiter<'_> {
         self.wait_for_room().await;
@@ -1566,10 +1500,6 @@ fn a_swapped_out_page_comes_back_unchanged_and_is_not_committed() {
     // rounded up to the next one, and the page rides in its head.
     let mut page = backend.buffer(1300).expect("staging buffer");
     assert_eq!(page.as_ref().len(), 1536);
-    assert!(
-        backend.device.memory.reaches(page.as_ref()),
-        "the staging page is the device's own memory"
-    );
     assert_eq!(
         backend.buffer(0).err(),
         Some(VirtioBlockSwapError::EmptyPayload)

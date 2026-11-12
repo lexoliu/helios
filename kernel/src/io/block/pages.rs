@@ -1,95 +1,101 @@
-//! The memory a kernel block request carries: pages of the disk's own
-//! device memory, owned by the request until the device answers.
+//! The memory a kernel block request carries: whole pages of the kernel
+//! heap, owned by the request until the device answers.
 //!
 //! Every block device the kernel drives carries [`BlockPages`], so one
-//! device type serves the block cache and the scratch disk alike. Every
-//! byte a request carries is memory its disk allocated
-//! ([`BlockDevice::memory`]), never the kernel heap; the driver copies it
-//! to and from memory of its own for the device ([`BlockBuffer::fill`] and
-//! [`BlockBuffer::deliver`]), so the device never reaches the buffer
-//! itself. The memory of a request is either the request's own — a
-//! scratch or swap buffer its holder fills or reads, a page the cache
-//! staged for a write — or the block cache's entries, whose pages the
-//! cache allocated from the same disk and which the request holds through
-//! the entries' state words: locked for a read, in write-back for a
-//! write. A cache request also carries its [`CacheRun`], which the
-//! driver's completion path completes, so the entries are finished by the
-//! answer itself rather than by the task that submitted it.
+//! device type serves the block cache and the scratch disk alike. The
+//! bytes of a request are kernel memory, never memory a device reaches:
+//! the driver copies them to and from memory of its own
+//! ([`BlockBuffer::fill`] and [`BlockBuffer::deliver`]), so the device
+//! never sees the buffer itself. The pages of a request are either the
+//! request's own — a scratch or swap buffer its holder fills or reads, a
+//! copy the cache staged for a write — or the block cache's entries,
+//! which the request holds through the entries' state words: locked for a
+//! read, in write-back for a write. A cache request also carries its
+//! [`CacheRun`], which the driver's completion path completes, so the
+//! entries are finished by the answer itself rather than by the task that
+//! submitted it.
 //!
 //! Concurrency contract: a buffer has one owner at a time — its builder,
 //! then the driver, then the waiter or nobody — and is never shared while
-//! a request carries it. Its completion and its drop may run in the
-//! device's interrupt handler, so neither blocks nor takes a lock an
-//! interrupt handler cannot take: the cache's half is the run's lock-free
-//! state transitions, and the memory it owns is freed through the
-//! device's [`BlockDevice::Memory`], whose free path the trait requires to
-//! be one an interrupt handler may take. Today every backend's pool is
-//! heap-backed, so that free is a `dealloc` into the kernel heap, which
-//! takes the heap's `IrqSafeMutex` (`KernelAllocator::heap` in the
-//! kernel's `lib.rs`) with the local processor's interrupts masked.
+//! a request carries it. `fill` and `deliver` only copy: `fill` runs in
+//! the submitting task before the device is given the request, `deliver`
+//! in the driver's completion path, which is the device's interrupt
+//! handler or the task that drained the answer, and a page a read fills
+//! is locked by its run until `complete` publishes it. The completion and
+//! the drop of a buffer may run in the device's interrupt handler, so
+//! neither blocks nor takes a lock an interrupt handler cannot take: the
+//! cache's half is the run's lock-free state transitions, and freeing an
+//! owned page goes to the kernel heap, whose lock is interrupt-safe.
 
 extern crate alloc;
 
-use alloc::vec::Vec;
+use alloc::boxed::Box;
 use arrayvec::ArrayVec;
 use core::ptr::NonNull;
 
-use helios_hal::dma::DmaBuffer;
-use helios_hal::fs::{AnswerFlag, BlockBuffer, BlockDevice, OwnedBlockBuffer};
+use helios_hal::fs::{AnswerFlag, BlockBuffer, OwnedBlockBuffer};
 use helios_hal::io::IoResult;
 
 use super::cache::{CACHE_BLOCK_BYTES, CacheRun, MAX_RUN_BLOCKS};
 
-/// The request buffer of a block device the kernel drives: [`BlockPages`]
-/// made of that device's own memory.
-pub type DevicePages<Device> = BlockPages<<Device as BlockDevice>::Memory>;
+/// A page buffer, aligned to its size so that it never straddles a page.
+#[repr(C, align(4096))]
+pub(super) struct Page(pub(super) [u8; CACHE_BLOCK_BYTES]);
+
+const _: () = assert!(
+    core::mem::size_of::<Page>() == CACHE_BLOCK_BYTES
+        && core::mem::align_of::<Page>() == CACHE_BLOCK_BYTES,
+    "a block buffer page is one page, aligned to a page"
+);
+
+const _: () = assert!(
+    MAX_RUN_BLOCKS <= u32::BITS as usize,
+    "a request's owned pages are one bit each in a u32"
+);
+
+impl Page {
+    /// A zeroed page from the kernel heap.
+    pub(super) fn zeroed() -> Box<Self> {
+        // SAFETY: all zeroes is a valid `[u8; N]`, the page's only field.
+        unsafe { Box::<Self>::new_zeroed().assume_init() }
+    }
+}
 
 /// The kernel's [`BlockBuffer`]: either up to [`MAX_RUN_BLOCKS`] cache
-/// pages of a cache request, laid end to end, or one run of device memory
-/// the buffer owns.
-pub struct BlockPages<Memory> {
-    /// The first byte of each whole page a cache request transfers, in
-    /// block order: the entries' own pages and the ones it staged.
-    pages: ArrayVec<NonNull<u8>, MAX_RUN_BLOCKS>,
-    /// Pages the cache staged for this write, which the request owns and
-    /// frees with it. On the heap because only a write of compressed
-    /// blocks stages any, and room for a whole run inline would put
-    /// [`MAX_RUN_BLOCKS`] device buffers in every in-flight request slot
-    /// of the driver.
-    staged: Vec<Memory>,
-    /// The memory of a buffer built by [`OwnedBlockBuffer::owning`], its
-    /// one segment; `None` for a cache request.
-    owned: Option<Memory>,
+/// pages of a cache request, laid end to end, or one run of heap bytes the
+/// buffer owns.
+pub struct BlockPages {
+    /// The whole pages a cache request transfers, in block order.
+    pages: ArrayVec<NonNull<Page>, MAX_RUN_BLOCKS>,
+    /// Bit `i` set: page `i` is this buffer's own, freed with it.
+    owned: u32,
+    /// The bytes of a buffer built by [`OwnedBlockBuffer::zeroed`]; `None`
+    /// for a cache request.
+    own: Option<Box<[u8]>>,
     /// The cache blocks the request fills or writes, when the block cache
     /// issued it.
-    run: Option<CacheRun<Memory>>,
+    run: Option<CacheRun>,
     /// Raised once the request is over, when the holder asked to learn
     /// it (see [`OwnedBlockBuffer::raise_on_answer`]).
     answered: Option<AnswerFlag>,
 }
 
-// SAFETY: the pages are the buffer's own memory or cache pages the run
+// SAFETY: the pages are either the buffer's own or cache pages the run
 // holds through their entries' state words, which no other owner touches
 // while the buffer lives; nothing in it is tied to a thread.
-unsafe impl<Memory: Send> Send for BlockPages<Memory> {}
+unsafe impl Send for BlockPages {}
 // SAFETY: a shared buffer only reads: its byte view reads memory it owns,
 // and its pages are addresses, not accesses.
-unsafe impl<Memory: Sync> Sync for BlockPages<Memory> {}
+unsafe impl Sync for BlockPages {}
 
-/// The first byte of `memory`, taken from the buffer's own pointer so a
-/// device write through it is not a write through a shared borrow.
-fn start(memory: &impl DmaBuffer) -> NonNull<u8> {
-    NonNull::new(memory.as_ptr()).expect("a device memory buffer names memory")
-}
-
-impl<Memory: DmaBuffer> BlockPages<Memory> {
+impl BlockPages {
     /// A request buffer for a cache run, whose pages the cache pushes
     /// next.
-    pub(super) fn for_run(run: CacheRun<Memory>, staged: usize) -> Self {
+    pub(super) fn for_run(run: CacheRun) -> Self {
         Self {
             pages: ArrayVec::new(),
-            staged: Vec::with_capacity(staged),
-            owned: None,
+            owned: 0,
+            own: None,
             run: Some(run),
             answered: None,
         }
@@ -97,19 +103,18 @@ impl<Memory: DmaBuffer> BlockPages<Memory> {
 
     /// Appends a page the request borrows from a cache entry the run
     /// holds.
-    pub(super) fn push_borrowed(&mut self, page: &Memory) {
-        self.pages.push(start(page));
+    pub(super) fn push_borrowed(&mut self, page: NonNull<Page>) {
+        self.pages.push(page);
     }
 
-    /// Appends a page the cache staged for this write, which the request
-    /// owns from here.
-    pub(super) fn push_staged(&mut self, page: Memory) {
-        self.pages.push(start(&page));
-        self.staged.push(page);
+    /// Appends a page the request owns.
+    pub(super) fn push_owned(&mut self, page: Box<Page>) {
+        self.owned |= 1 << self.pages.len();
+        self.pages.push(NonNull::from(Box::leak(page)));
     }
 
     /// The cache blocks a cache request names.
-    fn run(&self) -> &CacheRun<Memory> {
+    fn run(&self) -> &CacheRun {
         self.run
             .as_ref()
             .expect("a block request built by the cache carries its run")
@@ -129,70 +134,63 @@ impl<Memory: DmaBuffer> BlockPages<Memory> {
         self.run().id(index)
     }
 
-    /// The memory of a buffer its holder fills or reads.
-    fn own_memory(&self) -> &Memory {
-        self.owned
-            .as_ref()
-            .expect("only a buffer made of its own memory is filled or read by its holder")
+    /// The bytes of a buffer its holder fills or reads.
+    fn own_bytes(&self) -> &[u8] {
+        self.own
+            .as_deref()
+            .expect("only a buffer made of its own bytes is filled or read by its holder")
     }
 }
 
-impl<Memory> Drop for BlockPages<Memory> {
+impl Drop for BlockPages {
     fn drop(&mut self) {
         // The run first: it gives its entries back, as answered or as
-        // never seen by the device, and stops counting staged pages. The
-        // memory the buffer owns is freed after it, with the fields.
+        // never seen by the device, and stops counting staged pages.
         drop(self.run.take());
+        for (index, page) in self.pages.drain(..).enumerate() {
+            if self.owned & (1 << index) != 0 {
+                // SAFETY: an owned page came from `Box::leak` in
+                // `push_owned`, and is freed once, here.
+                drop(unsafe { Box::from_raw(page.as_ptr()) });
+            }
+        }
     }
 }
 
-/// The request's memory laid end to end: the buffer's own run, then the
-/// cache pages of a cache request in block order.
-///
-/// Concurrency contract: the buffer has one owner at a time and no request
-/// holds it while `fill` or `deliver` run, so neither synchronises with
-/// anything: `fill` runs in the submitting task before the device is given
-/// the request, `deliver` in the driver's completion path, which is the
-/// device's interrupt handler or the task that drained the answer. Both
-/// are copies into or out of memory the request owns or holds through its
-/// entries' state words, and take no lock and allocate nothing.
-impl<Memory: DmaBuffer + AsRef<[u8]> + AsMut<[u8]>> BlockBuffer for BlockPages<Memory> {
+impl BlockBuffer for BlockPages {
     fn len(&self) -> usize {
-        self.owned.as_ref().map_or(0, DmaBuffer::len) + self.pages.len() * CACHE_BLOCK_BYTES
+        self.own
+            .as_deref()
+            .map_or(self.pages.len() * CACHE_BLOCK_BYTES, <[u8]>::len)
     }
 
     fn fill(&mut self, to: &mut [u8]) {
         debug_assert_eq!(to.len(), self.len(), "a write is filled whole");
-        let (own, pages) = to.split_at_mut(self.owned.as_ref().map_or(0, DmaBuffer::len));
-        if let Some(memory) = &self.owned {
-            own.copy_from_slice(memory.as_ref());
+        if let Some(own) = &self.own {
+            to.copy_from_slice(own);
+            return;
         }
-        let (blocks, _) = pages.as_chunks_mut::<CACHE_BLOCK_BYTES>();
+        let (blocks, _) = to.as_chunks_mut::<CACHE_BLOCK_BYTES>();
         for (page, to) in self.pages.iter().zip(blocks) {
             // SAFETY: the page is a cache entry's the run holds, or one
-            // the request staged, so nothing writes it while the request
-            // carries it, and it is a whole cache block.
-            to.copy_from_slice(unsafe {
-                core::slice::from_raw_parts(page.as_ptr(), CACHE_BLOCK_BYTES)
-            });
+            // the request owns, so nothing writes it while the request
+            // carries it.
+            to.copy_from_slice(&unsafe { page.as_ref() }.0);
         }
     }
 
     fn deliver(&mut self, from: &[u8]) {
         debug_assert_eq!(from.len(), self.len(), "a read is delivered whole");
-        let (own, pages) = from.split_at(self.owned.as_ref().map_or(0, DmaBuffer::len));
-        if let Some(memory) = &mut self.owned {
-            memory.as_mut().copy_from_slice(own);
+        if let Some(own) = &mut self.own {
+            own.copy_from_slice(from);
+            return;
         }
-        let (blocks, _) = pages.as_chunks::<CACHE_BLOCK_BYTES>();
-        for (page, from) in self.pages.iter().zip(blocks) {
+        let (blocks, _) = from.as_chunks::<CACHE_BLOCK_BYTES>();
+        for (page, from) in self.pages.iter_mut().zip(blocks) {
             // SAFETY: the page is a cache entry's the run holds locked for
             // this read, which no reader sees before `complete` publishes
-            // it, so this is the only access; it is a whole cache block.
-            unsafe {
-                core::slice::from_raw_parts_mut(page.as_ptr(), CACHE_BLOCK_BYTES)
-                    .copy_from_slice(from);
-            }
+            // it, so this is the only access.
+            unsafe { page.as_mut() }.0.copy_from_slice(from);
         }
     }
 
@@ -206,38 +204,32 @@ impl<Memory: DmaBuffer + AsRef<[u8]> + AsMut<[u8]>> BlockBuffer for BlockPages<M
     }
 }
 
-impl<Memory> OwnedBlockBuffer for BlockPages<Memory>
-where
-    Memory: DmaBuffer + AsRef<[u8]> + AsMut<[u8]>,
-{
-    type Memory = Memory;
-
+impl OwnedBlockBuffer for BlockPages {
     fn raise_on_answer(&mut self, flag: AnswerFlag) {
         self.answered = Some(flag);
     }
 
-    fn owning(memory: Memory) -> Self {
+    fn zeroed(len: usize) -> Self {
         Self {
             pages: ArrayVec::new(),
-            staged: Vec::new(),
-            owned: Some(memory),
+            owned: 0,
+            own: Some(alloc::vec![0; len].into_boxed_slice()),
             run: None,
             answered: None,
         }
     }
 }
 
-impl<Memory: DmaBuffer + AsRef<[u8]>> AsRef<[u8]> for BlockPages<Memory> {
+impl AsRef<[u8]> for BlockPages {
     fn as_ref(&self) -> &[u8] {
-        self.own_memory().as_ref()
+        self.own_bytes()
     }
 }
 
-impl<Memory: DmaBuffer + AsMut<[u8]>> AsMut<[u8]> for BlockPages<Memory> {
+impl AsMut<[u8]> for BlockPages {
     fn as_mut(&mut self) -> &mut [u8] {
-        self.owned
-            .as_mut()
-            .expect("only a buffer made of its own memory is filled or read by its holder")
-            .as_mut()
+        self.own
+            .as_deref_mut()
+            .expect("only a buffer made of its own bytes is filled or read by its holder")
     }
 }

@@ -1,28 +1,24 @@
 extern crate std;
 
-use alloc::alloc::{alloc_zeroed, dealloc};
 use alloc::boxed::Box;
 use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::alloc::Layout;
 use core::future::Future;
 use core::pin::{Pin, pin};
-use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::task::{Context, Poll, Waker};
 
 use futures_lite::future::block_on;
 use helios_hal::cpu::ProcessorId;
-use helios_hal::dma::{BufError, BufResult, DeviceAddress, DmaBuffer, DmaError};
+use helios_hal::dma::{BufError, BufResult};
 use helios_hal::fs::{
     BlockBuffer, BlockDevice, BlockDeviceCapabilities, BlockGeometry, BlockQueueTopology,
     BlockRange, BlockSerial, IoError, IoResult,
 };
-use helios_hal::pmm::PhysFrame;
 use spin::Mutex;
 
-use super::cache::{CacheDisk, DiskLayout, dirty_blocks, idle_blocks};
+use super::cache::{CacheDisk, DiskLayout, dirty_blocks, idle_blocks, pages_allocated};
 use super::*;
 use crate::memory::{CompressedPool, RootEntropy};
 use crate::test_support::TestCpu;
@@ -40,61 +36,6 @@ enum Op {
 /// while the request is in flight.
 type WriteProbe = Box<dyn Fn() + Send + Sync>;
 
-/// The request memory a [`MemoryDisk`] hands out: zeroed, page-aligned
-/// host memory, which the disk reaches wherever it is, as a heap-backed
-/// DMA pool's memory is reached today.
-struct DiskMemory {
-    start: NonNull<u8>,
-    layout: Layout,
-    /// The disk's count of live buffers, which this one leaves when it
-    /// is freed.
-    live: Arc<AtomicUsize>,
-}
-
-// SAFETY: the buffer owns its bytes and frees them once, wherever it is
-// dropped.
-unsafe impl Send for DiskMemory {}
-// SAFETY: a shared buffer only reads its bytes.
-unsafe impl Sync for DiskMemory {}
-
-impl DmaBuffer for DiskMemory {
-    fn device_address(&self) -> DeviceAddress {
-        DeviceAddress::new(self.start.as_ptr() as u64)
-    }
-
-    fn as_ptr(&self) -> *mut u8 {
-        self.start.as_ptr()
-    }
-
-    fn len(&self) -> usize {
-        self.layout.size()
-    }
-}
-
-impl AsRef<[u8]> for DiskMemory {
-    fn as_ref(&self) -> &[u8] {
-        // SAFETY: the buffer owns `layout.size()` bytes at `start`.
-        unsafe { core::slice::from_raw_parts(self.start.as_ptr(), self.layout.size()) }
-    }
-}
-
-impl AsMut<[u8]> for DiskMemory {
-    fn as_mut(&mut self) -> &mut [u8] {
-        // SAFETY: as in `as_ref`, and `&mut self` excludes every other
-        // reference to the bytes.
-        unsafe { core::slice::from_raw_parts_mut(self.start.as_ptr(), self.layout.size()) }
-    }
-}
-
-impl Drop for DiskMemory {
-    fn drop(&mut self) {
-        // SAFETY: allocated with this layout in `MemoryDisk::memory`, and
-        // freed once, here.
-        unsafe { dealloc(self.start.as_ptr(), self.layout) };
-        self.live.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
 /// Which way a [`MemoryDisk`] data request moves bytes.
 #[derive(Clone, Copy)]
 enum Direction {
@@ -105,7 +46,7 @@ enum Direction {
 /// Where a request's answer meets its waiter.
 #[derive(Default)]
 struct Answer {
-    completion: Option<BufResult<(), BlockPages<DiskMemory>>>,
+    completion: Option<BufResult<(), BlockPages>>,
     waker: Option<Waker>,
     /// The waiter was dropped: the answer goes nowhere.
     detached: bool,
@@ -116,7 +57,7 @@ struct Answer {
 struct Accepted {
     direction: Direction,
     block_id: usize,
-    buffer: BlockPages<DiskMemory>,
+    buffer: BlockPages,
     answer: Arc<Mutex<Answer>>,
 }
 
@@ -134,7 +75,7 @@ struct MemoryWaiter {
 }
 
 impl Future for MemoryWaiter {
-    type Output = BufResult<(), BlockPages<DiskMemory>>;
+    type Output = BufResult<(), BlockPages>;
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         let mut answer = self.answer.lock();
@@ -178,12 +119,6 @@ struct DiskState {
     /// something answers them, as a device that has not answered yet.
     queue: Mutex<Queue>,
     on_write: Mutex<Option<WriteProbe>>,
-    /// While set, the disk's memory refuses every allocation.
-    refuse_memory: AtomicBool,
-    /// Request memory allocated so far.
-    allocations: AtomicUsize,
-    /// Request memory allocated and not yet freed.
-    live_memory: Arc<AtomicUsize>,
 }
 
 /// A disk in host memory that answers a fixed serial and logs every
@@ -214,25 +149,7 @@ impl MemoryDisk {
             corrupt_readback: false,
             queue: Mutex::new(Queue::default()),
             on_write: Mutex::new(None),
-            refuse_memory: AtomicBool::new(false),
-            allocations: AtomicUsize::new(0),
-            live_memory: Arc::new(AtomicUsize::new(0)),
         }
-    }
-
-    /// Makes the disk's memory refuse every allocation, or stop refusing.
-    fn refuse_memory(&self, refuse: bool) {
-        self.state.refuse_memory.store(refuse, Ordering::SeqCst);
-    }
-
-    /// Request memory the disk allocated so far.
-    fn allocations(&self) -> usize {
-        self.state.allocations.load(Ordering::SeqCst)
-    }
-
-    /// Request memory the disk allocated that is not freed yet.
-    fn live_memory(&self) -> usize {
-        self.state.live_memory.load(Ordering::SeqCst)
     }
 
     fn new(serial: &'static str) -> Self {
@@ -304,12 +221,7 @@ impl MemoryDisk {
         self.state.queue.lock().accepted.len()
     }
 
-    fn submit(
-        &self,
-        direction: Direction,
-        block_id: usize,
-        buffer: BlockPages<DiskMemory>,
-    ) -> MemoryWaiter {
+    fn submit(&self, direction: Direction, block_id: usize, buffer: BlockPages) -> MemoryWaiter {
         let answer = Arc::new(Mutex::new(Answer::default()));
         let request = Accepted {
             direction,
@@ -419,47 +331,17 @@ impl MemoryDisk {
 }
 
 impl BlockDevice for MemoryDisk {
-    type Buffer = BlockPages<DiskMemory>;
-    type Memory = DiskMemory;
+    type Buffer = BlockPages;
     type Waiter<'a>
         = MemoryWaiter
     where
         Self: 'a;
 
-    fn memory(&self, bytes: usize) -> Result<DiskMemory, DmaError> {
-        let block_bytes = self.state.block_bytes;
-        if bytes == 0 || !bytes.is_multiple_of(block_bytes) {
-            return Err(DmaError::InvalidLength {
-                bytes,
-                required_multiple: block_bytes,
-            });
-        }
-        if self.state.refuse_memory.load(Ordering::SeqCst) {
-            return Err(DmaError::Exhausted { bytes });
-        }
-        let layout =
-            Layout::from_size_align(bytes, PhysFrame::SIZE).map_err(|_| DmaError::TooLarge {
-                bytes,
-                limit: isize::MAX as usize & !(PhysFrame::SIZE - 1),
-            })?;
-        // SAFETY: the layout is not zero-sized: `bytes` is a non-zero
-        // multiple of the block size.
-        let start = NonNull::new(unsafe { alloc_zeroed(layout) })
-            .expect("the test host has memory for a request buffer");
-        self.state.allocations.fetch_add(1, Ordering::SeqCst);
-        self.state.live_memory.fetch_add(1, Ordering::SeqCst);
-        Ok(DiskMemory {
-            start,
-            layout,
-            live: Arc::clone(&self.state.live_memory),
-        })
-    }
-
-    async fn submit_read(&self, block_id: usize, buffer: BlockPages<DiskMemory>) -> MemoryWaiter {
+    async fn submit_read(&self, block_id: usize, buffer: BlockPages) -> MemoryWaiter {
         self.submit(Direction::Read, block_id, buffer)
     }
 
-    async fn submit_write(&self, block_id: usize, buffer: BlockPages<DiskMemory>) -> MemoryWaiter {
+    async fn submit_write(&self, block_id: usize, buffer: BlockPages) -> MemoryWaiter {
         self.submit(Direction::Write, block_id, buffer)
     }
 
@@ -657,22 +539,6 @@ fn a_disk_that_does_not_round_trip_fails_its_self_check() {
         block_on(scratch.self_check(&root())),
         Err(BlockSelfCheckError::Mismatch { block: 0 })
     );
-}
-
-#[test]
-fn a_scratch_disk_whose_memory_refuses_the_self_check_buffer_fails_its_self_check() {
-    let disk = MemoryDisk::new(SCRATCH_DISK_SERIAL);
-    disk.refuse_memory(true);
-    let scratch = ScratchDisk::new(disk.clone());
-
-    assert_eq!(
-        block_on(scratch.self_check(&root())),
-        Err(BlockSelfCheckError::Buffer {
-            bytes: 4096,
-            error: DmaError::Exhausted { bytes: 4096 },
-        })
-    );
-    assert_eq!(scratch.stats().writes, 0);
 }
 
 #[test]
@@ -1170,139 +1036,10 @@ fn sync_writes_a_dirty_block_held_compressed_uncompressed() {
     assert!(dirty_blocks(&cache).is_empty());
     assert_eq!(cache.compressed_blocks(), 1);
     assert_eq!(cache.page_buffers(), 0);
-    assert_eq!(disk.live_memory(), 0);
 }
 
 #[test]
-fn a_miss_whose_page_the_disk_refuses_fails_and_holds_nothing() {
-    let disk = MemoryDisk::with_blocks("images", CACHE_BLOCK_BYTES, 16);
-    let cache = cache_over(&disk, 16, 1);
-    let view = cache.disk(0);
-
-    disk.refuse_memory(true);
-    block_on(async {
-        assert_eq!(
-            view.read(2).await.err(),
-            Some(BlockCacheError::Memory(DmaError::Exhausted { bytes: 4096 }))
-        );
-    });
-    assert_eq!(disk.reads(), 0, "nothing reaches the device without a page");
-    assert_eq!(cache.resident_blocks(), 0);
-    assert_eq!(cache.page_buffers(), 0);
-
-    disk.refuse_memory(false);
-    block_on(async {
-        let block = view
-            .read(2)
-            .await
-            .expect("block 2 once the memory gives a page");
-        assert!(block.iter().all(|byte| *byte == 2));
-    });
-    assert_eq!(disk.live_memory(), cache.page_buffers());
-}
-
-#[test]
-fn a_compressed_hit_whose_page_the_disk_refuses_fails_and_stays_compressed() {
-    let disk = MemoryDisk::with_blocks("images", CACHE_BLOCK_BYTES, 16);
-    let cache = cache_over(&disk, 16, 1);
-    let view = cache.disk(0);
-
-    block_on(async {
-        drop(view.read(3).await.expect("block 3"));
-    });
-    compress_cold_blocks(&cache);
-    assert_eq!(cache.compressed_blocks(), 1);
-
-    disk.refuse_memory(true);
-    block_on(async {
-        assert_eq!(
-            view.read(3).await.err(),
-            Some(BlockCacheError::Memory(DmaError::Exhausted { bytes: 4096 }))
-        );
-    });
-    assert_eq!(cache.compressed_blocks(), 1);
-    assert_eq!(cache.page_buffers(), 0);
-    assert_eq!(
-        idle_blocks(&cache),
-        1,
-        "the refused hit leaves nothing held"
-    );
-
-    disk.refuse_memory(false);
-    let reads = disk.reads();
-    block_on(async {
-        let block = view
-            .read(3)
-            .await
-            .expect("block 3 once the memory gives a page");
-        assert!(block.iter().all(|byte| *byte == 3));
-    });
-    assert_eq!(disk.reads(), reads, "the hit still asks the device nothing");
-}
-
-#[test]
-fn an_overwrite_of_a_compressed_block_whose_page_the_disk_refuses_leaves_it_compressed() {
-    let disk = MemoryDisk::with_blocks("images", CACHE_BLOCK_BYTES, 16);
-    let cache = cache_over(&disk, 16, 1);
-    let view = cache.disk(0);
-
-    block_on(async {
-        view.overwrite(4).await.expect("block 4").fill(0x44);
-    });
-    compress_cold_blocks(&cache);
-    assert_eq!(cache.compressed_blocks(), 1);
-
-    disk.refuse_memory(true);
-    block_on(async {
-        assert_eq!(
-            view.overwrite(4).await.err(),
-            Some(BlockCacheError::Memory(DmaError::Exhausted { bytes: 4096 }))
-        );
-    });
-    assert_eq!(cache.compressed_blocks(), 1);
-    assert_eq!(dirty_blocks(&cache), [4_u64]);
-    assert_eq!(idle_blocks(&cache), 1);
-}
-
-#[test]
-fn a_sync_whose_staging_page_the_disk_refuses_fails_and_keeps_the_block_dirty() {
-    let disk = MemoryDisk::with_blocks("images", CACHE_BLOCK_BYTES, 16);
-    let cache = cache_over(&disk, 16, 1);
-    let view = cache.disk(0);
-
-    block_on(async {
-        view.overwrite(5).await.expect("block 5").fill(0x55);
-    });
-    compress_cold_blocks(&cache);
-    assert_eq!(cache.compressed_blocks(), 1);
-
-    disk.refuse_memory(true);
-    block_on(async {
-        assert_eq!(
-            view.sync().await,
-            Err(BlockCacheError::Memory(DmaError::Exhausted { bytes: 4096 }))
-        );
-    });
-    assert_eq!(disk.writes(), []);
-    assert_eq!(dirty_blocks(&cache), [5_u64]);
-    assert_eq!(cache.page_buffers(), 0);
-
-    disk.refuse_memory(false);
-    block_on(async {
-        view.sync()
-            .await
-            .expect("sync once the memory gives a page");
-    });
-    assert_eq!(disk.writes(), [Op::Write(5, 1)]);
-    assert_eq!(
-        disk.bytes_at(5 * CACHE_BLOCK_BYTES, CACHE_BLOCK_BYTES),
-        [0x55; CACHE_BLOCK_BYTES]
-    );
-    assert!(dirty_blocks(&cache).is_empty());
-}
-
-#[test]
-fn a_recycled_entry_takes_a_page_of_the_disk_whose_block_it_holds_next() {
+fn a_recycled_entry_keeps_its_page_whatever_disk_it_served() {
     let images = MemoryDisk::with_blocks("images", CACHE_BLOCK_BYTES, 16);
     let data = MemoryDisk::with_blocks("data", CACHE_BLOCK_BYTES, 16);
     let cache = BlockCache::new(
@@ -1322,7 +1059,7 @@ fn a_recycled_entry_takes_a_page_of_the_disk_whose_block_it_holds_next() {
         drop(cache.disk(0).read(1).await.expect("images block 1"));
     });
     assert_eq!(
-        images.allocations(),
+        pages_allocated(&cache),
         1,
         "an entry recycled for the same disk keeps its page"
     );
@@ -1333,14 +1070,9 @@ fn a_recycled_entry_takes_a_page_of_the_disk_whose_block_it_holds_next() {
         assert!(block.iter().all(|byte| *byte == 2));
     });
     assert_eq!(
-        data.allocations(),
+        pages_allocated(&cache),
         1,
-        "an entry recycled for another disk takes a page of that disk"
-    );
-    assert_eq!(
-        images.live_memory(),
-        0,
-        "and gives the first disk's page back"
+        "an entry recycled for another disk keeps its page too"
     );
     assert_eq!(cache.page_buffers(), 1);
 }

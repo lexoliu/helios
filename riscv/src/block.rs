@@ -23,13 +23,8 @@ use crate::RiscvCpu;
 use crate::debug_state::RuntimeState;
 use crate::net::InterruptSourceId;
 
-/// The device's requests carry pages of its own transport's DMA memory.
-type RiscvVirtioBlockDevice = helios_virtio::VirtioMmioBlockDevice<
-    RiscvCpu,
-    helios_kernel::BlockPages<
-        helios_virtio::TransportBuffer<helios_virtio::VirtioMmioTransport<helios_virtio::MmioBus>>,
-    >,
->;
+type RiscvVirtioBlockDevice =
+    helios_virtio::VirtioMmioBlockDevice<RiscvCpu, helios_kernel::BlockPages>;
 
 #[derive(Clone)]
 pub(crate) struct VirtioBlockDevice {

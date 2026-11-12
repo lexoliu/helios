@@ -231,6 +231,9 @@ pub trait DmaBuffer: Send + Sync + 'static {
 }
 
 /// Memory a device reaches with no mapping request on the data path.
+///
+/// The memory of one device is not handed to another: a buffer is for the
+/// requests of the device whose memory allocated it.
 pub trait DmaMemory: Send + Sync + 'static {
     /// A buffer the device reaches and the CPU reads and writes as bytes.
     ///

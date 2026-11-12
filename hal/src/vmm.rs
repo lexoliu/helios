@@ -262,14 +262,15 @@ pub trait SwapBackend: Send + Sync + 'static {
     /// Reasons a swap operation can fail.
     type Error: core::fmt::Display + core::fmt::Debug + Send + Sync + 'static;
 
-    /// Memory a page is staged in on its way to and from the storage.
-    ///
-    /// The storage reads and writes the buffer in place, so the backend
-    /// allocates it: a backend on a device that transfers by DMA hands out
-    /// memory the device can reach, one on a file hands out plain memory.
+    /// Memory a page is staged in on its way to and from the storage:
+    /// plain kernel memory. A backend on a device copies it through memory
+    /// of the device's own when it transfers it, so the device never
+    /// reaches the buffer.
     type Buffer: AsRef<[u8]> + AsMut<[u8]> + Send + Sync + 'static;
 
-    /// Allocates a zeroed staging buffer able to hold `bytes` bytes.
+    /// Allocates a zeroed staging buffer of plain kernel memory, able to
+    /// hold `bytes` bytes. It refuses a length the storage cannot
+    /// transfer.
     ///
     /// The buffer may be longer than `bytes` when the storage transfers in
     /// whole units: the caller uses the first `bytes` bytes and the

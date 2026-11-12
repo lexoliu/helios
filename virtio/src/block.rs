@@ -525,8 +525,6 @@ pub enum VirtioBlockSwapError {
     InvalidDestination { expected: usize, actual: usize },
     #[error("swap block I/O failed: {0}")]
     Io(#[from] IoError),
-    #[error("swap staging memory was refused: {0}")]
-    Memory(#[from] DmaError),
 }
 
 #[derive(Default)]
@@ -2084,36 +2082,10 @@ impl<T: VirtioTransport, C: QueueAffinity, B: BlockBuffer> BlockDevice
     for VirtioBlockResource<T, C, B>
 {
     type Buffer = B;
-    type Memory = TransportBuffer<T>;
     type Waiter<'a>
         = VirtioBlockWaiter<'a, T, C, B>
     where
         Self: 'a;
-
-    /// Memory from the transport's DMA pool, which is the memory this
-    /// device's requests are translated against.
-    fn memory(&self, bytes: usize) -> Result<TransportBuffer<T>, DmaError> {
-        let logical_block_bytes = self.object().geometry.logical_block_bytes;
-        if bytes == 0 || !bytes.is_multiple_of(logical_block_bytes) {
-            return Err(DmaError::InvalidLength {
-                bytes,
-                required_multiple: logical_block_bytes,
-            });
-        }
-        // A size no layout can describe is larger than any run the
-        // address space holds; `isize::MAX` rounded down to the page is
-        // the most `Layout` accepts at this alignment.
-        let layout =
-            Layout::from_size_align(bytes, PhysFrame::SIZE).map_err(|_| DmaError::TooLarge {
-                bytes,
-                limit: isize::MAX as usize & !(PhysFrame::SIZE - 1),
-            })?;
-        self.object()
-            .transport
-            .bus()
-            .dma()
-            .allocate(layout, READ_WRITE)
-    }
 
     async fn submit_read(&self, block_id: usize, buffer: B) -> Self::Waiter<'_> {
         VirtioBlockWaiter {
@@ -2183,17 +2155,17 @@ impl<T: VirtioTransport, C: QueueAffinity, B: BlockBuffer> BlockDevice
 impl<D> SwapBackend for VirtioBlockSwapBackend<D>
 where
     D: BlockDevice + 'static,
-    D::Buffer: OwnedBlockBuffer<Memory = <D as BlockDevice>::Memory> + Sync,
+    D::Buffer: OwnedBlockBuffer + Sync,
 {
     type Token = VirtioBlockSwapToken;
     type Error = VirtioBlockSwapError;
 
     type Buffer = D::Buffer;
 
-    /// The staging buffer is a request buffer made of the device's own
-    /// memory, rounded up to whole blocks: a request carries whole
-    /// blocks, so the page is stored and restored as the buffer itself
-    /// and never copied into one.
+    /// The staging buffer is a request buffer of plain kernel memory,
+    /// rounded up to whole blocks: a request carries whole blocks, so the
+    /// page is stored and restored as the buffer itself and never copied
+    /// into one. The driver copies it through the device's own memory.
     fn buffer(&self, bytes: usize) -> Result<Self::Buffer, Self::Error> {
         if bytes == 0 {
             return Err(VirtioBlockSwapError::EmptyPayload);
@@ -2202,8 +2174,7 @@ where
         if block_size == 0 {
             return Err(VirtioBlockSwapError::InvalidBlockSize);
         }
-        let memory = self.device.memory(bytes.next_multiple_of(block_size))?;
-        Ok(D::Buffer::owning(memory))
+        Ok(D::Buffer::zeroed(bytes.next_multiple_of(block_size)))
     }
 
     /// Writes the whole of `page` into a freshly allocated extent.

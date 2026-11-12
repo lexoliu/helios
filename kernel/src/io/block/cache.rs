@@ -28,14 +28,12 @@
 //!   which makes the entries valid, clean, dirty again or stale, and
 //!   records a failure for the next sync — whether or not the task that
 //!   submitted it still waits. The completion is lock-free apart from the
-//!   one interrupt-safe lock that keeps the disk's last error, and the
-//!   request's own pages are freed through the disk's memory, whose free
-//!   path an interrupt handler may take ([`BlockDevice::Memory`]), so it
-//!   may run in the device's interrupt handler. The device is the
-//!   backend's type, monomorphized in, and a multi-queue device gives
-//!   each processor its own queue, so requests from different processors
-//!   share nothing on their way down. Nothing is handed to another task
-//!   to issue.
+//!   one interrupt-safe lock that keeps the disk's last error, so it may
+//!   run in the device's interrupt handler. The device is the backend's
+//!   type, monomorphized in, and a multi-queue device gives each
+//!   processor its own queue, so requests from different processors share
+//!   nothing on their way down. Nothing is handed to another task to
+//!   issue.
 //! - **Waiting parks on a hashed wait table.** A task waiting on an
 //!   entry sets the entry's `WAITERS` bit in the same word the state
 //!   lives in and parks on one of [`WAIT_TABLE_SIZE`] broadcast signals;
@@ -147,52 +145,40 @@
 //!
 //! # Memory
 //!
-//! Blocks live in page-sized, page-aligned buffers of their disk's own
-//! device memory ([`BlockDevice::memory`]), zeroed when they are
-//! allocated, so a request carries an entry's page to the device in place
-//! and a device is never handed a page it cannot reach. A page belongs to
-//! the disk whose block it holds: an entry recycled for another disk's
-//! block gives its page back and takes one of the new disk's. The cache
-//! is kernel memory (AGENTS §3.1), never charged to an instance. It grows
-//! while the machine's memory pressure is green and recycles its coldest
-//! clean block once it is not. The entry table's bound is half the
-//! machine — the cache cannot grow past the point where pressure stops
-//! being green — and only the entries the cache actually grows into are
-//! allocated. A free entry holds no buffer.
-//!
-//! A page the disk's memory refuses is a typed failure of the operation
-//! that needed it ([`BlockCacheError::Memory`]): the miss that needed an
-//! entry, the hit that decompresses a block, the overwrite of a
-//! compressed block, the sync that stages a compressed dirty block for
-//! its write. The cache neither recycles harder nor tries again because
-//! of it.
+//! Blocks live in page-sized, page-aligned buffers taken zeroed from the
+//! kernel heap: the cache is kernel memory (AGENTS §3.1), never charged
+//! to an instance, and a device never sees a page of it, because the
+//! driver copies every request through memory of its own
+//! ([`helios_hal::fs::BlockBuffer`]). A page is the cache's, whatever
+//! disk its block belongs to: an entry recycled for another disk's block
+//! keeps its page. The cache grows while the machine's memory pressure is
+//! green and recycles its coldest clean block once it is not. The entry
+//! table's bound is half the machine — the cache cannot grow past the
+//! point where pressure stops being green — and only the entries the
+//! cache actually grows into are allocated. A free entry holds no
+//! buffer.
 //!
 //! Under pressure, [`BlockCache::shrink`] moves blocks down two tiers:
 //!
 //! - **Yellow compresses.** The coldest blocks nobody holds, clean and
-//!   dirty, are compressed into the kernel's [`CompressedPool`], which
-//!   lives on the kernel heap, and their pages go back to the memory of
-//!   the disk that allocated them, freed through its
-//!   [`BlockDevice::Memory`]. The entry stays in the index, marked
-//!   `COMPRESSED`, so a later hit decompresses it into a fresh page of
-//!   the disk's memory without asking the device. A dirty block stays
-//!   dirty while it is compressed: it reaches the disk uncompressed,
-//!   through the same write-back and [`CachedDisk::sync`] as any other
-//!   dirty block, from a page of the disk's memory decompressed for the
-//!   write alone, which the request owns and frees when it is done. A
-//!   block that does not compress below
-//!   [`crate::memory::INCOMPRESSIBLE_BYTES`] skips the tier: a clean one
-//!   is dropped and a dirty one is written back and dropped, as zswap
-//!   and zram send such a page straight to the backing device. When the pool is full it evicts its own coldest pages first
+//!   dirty, are compressed into the kernel's [`CompressedPool`] and their
+//!   page buffers go back to the heap. The entry stays in the index,
+//!   marked `COMPRESSED`, so a later hit decompresses it into a fresh
+//!   buffer without asking the device. A dirty block stays dirty while it
+//!   is compressed: it reaches the disk uncompressed, through the same
+//!   write-back and [`CachedDisk::sync`] as any other dirty block, from a
+//!   page decompressed for the write alone. A block that does not
+//!   compress below [`crate::memory::INCOMPRESSIBLE_BYTES`] skips the
+//!   tier: a clean one is dropped and a dirty one is written back and
+//!   dropped, as zswap and zram send such a page straight to the backing
+//!   device. When the pool is full it evicts its own coldest pages first
 //!   — a clean one is dropped, a dirty one written back uncompressed —
 //!   and the block is offered once more.
 //! - **Red empties the cache of everything nobody holds.** Clean blocks
 //!   are dropped, compressed or not; dirty ones are written back and then
-//!   dropped, and every page they held goes back to its disk's memory. A
-//!   compressed block is written from a page decompressed for that write,
-//!   so emptying the tier never holds more page buffers than one request
-//!   carries. A staging page the disk's memory refuses leaves its block
-//!   dirty in the cache, for the next sync to write or report.
+//!   dropped. A compressed block is written from a page decompressed for
+//!   that write, so emptying the tier never holds more page buffers than
+//!   one request carries.
 //!
 //! The miss path's clock may also recycle a clean compressed entry, as
 //! it recycles any clean one; it does not compress the block it
@@ -207,6 +193,7 @@ use core::cell::UnsafeCell;
 use core::future::poll_fn;
 use core::ops::{Deref, DerefMut};
 use core::pin::pin;
+use core::ptr::NonNull;
 use core::sync::atomic::{
     AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence,
 };
@@ -214,14 +201,12 @@ use core::sync::atomic::{
 use arrayvec::ArrayVec;
 use crossbeam_utils::CachePadded;
 use helios_hal::cpu::current_processor;
-use helios_hal::dma::DmaBuffer;
-use helios_hal::dma::DmaError;
 use helios_hal::fs::{BlockDevice, BlockGeometry, BlockSerial};
 use helios_hal::io::{IoError, IoResult};
 use helios_hal::pmm::PhysFrame;
 use spin::{Mutex, Once};
 
-use super::pages::{BlockPages, DevicePages};
+use super::pages::{BlockPages, Page};
 use crate::exec::InFlight;
 use crate::memory::{CompressRefusal, CompressedPage, CompressedPool, IrqSafeMutex};
 use crate::{MAX_BLOCK_DEVICES, PressureLevel, ProgressSignal};
@@ -345,33 +330,13 @@ const fn readable(state: u64) -> bool {
     state & (VALID | LOCKED | STALE) == VALID
 }
 
-/// What the cache needs of a disk's memory: the bounds
-/// [`BlockDevice::Memory`] carries, named once.
-pub(super) trait PageMemory: DmaBuffer + AsRef<[u8]> + AsMut<[u8]> {}
-
-impl<Memory: DmaBuffer + AsRef<[u8]> + AsMut<[u8]>> PageMemory for Memory {}
-
-/// The block a cache page holds.
-fn block_of<Memory: PageMemory>(page: &Memory) -> &[u8; CACHE_BLOCK_BYTES] {
-    page.as_ref()
-        .try_into()
-        .expect("a block cache page is one cache block long")
-}
-
-/// The block a cache page holds, to write.
-fn block_of_mut<Memory: PageMemory>(page: &mut Memory) -> &mut [u8; CACHE_BLOCK_BYTES] {
-    page.as_mut()
-        .try_into()
-        .expect("a block cache page is one cache block long")
-}
-
 /// Where an entry keeps its block.
-enum Slot<Memory> {
+enum Slot {
     /// A free entry, or one whose block left the cache.
     Empty,
-    /// The block in a page of the memory of the disk the entry's key
-    /// names; its bytes are the block's once the state says [`VALID`].
-    Buffer(Memory),
+    /// The block in a page buffer; its bytes are the block's once the
+    /// state says [`VALID`].
+    Buffer(Box<Page>),
     /// The block compressed into the pool.
     Compressed(CompressedPage),
 }
@@ -393,8 +358,6 @@ pub enum BlockCacheError {
     Aborted,
     #[error("the device failed: {0}")]
     Device(IoError),
-    #[error("the disk's memory refused a page: {0}")]
-    Memory(DmaError),
 }
 
 /// Why a disk cannot be put behind the cache.
@@ -417,7 +380,7 @@ pub(super) struct DiskLayout {
     /// block is not addressable through the cache.
     pub(super) capacity_blocks: u64,
     /// Cache blocks one device request carries: as many as the device's
-    /// segments hold, up to [`MAX_RUN_BLOCKS`].
+    /// transfer limit holds, up to [`MAX_RUN_BLOCKS`].
     pub(super) run_blocks: usize,
     /// Cache blocks one miss reads, aligned to their own size: the
     /// device's optimal transfer, or the missing block alone when the
@@ -530,7 +493,7 @@ impl Gate {
 
 /// One cached block's metadata. Type-stable: an entry is reused for
 /// other blocks but never freed while the cache lives.
-struct Entry<Memory> {
+struct Entry {
     /// `block << DISK_BITS | disk`, or [`NO_KEY`].
     key: AtomicU64,
     state: AtomicU64,
@@ -539,7 +502,7 @@ struct Entry<Memory> {
     next: AtomicU32,
     /// Read and replaced only as the state word allows; see
     /// [`Entry::slot`] and [`Entry::slot_mut`].
-    slot: UnsafeCell<Slot<Memory>>,
+    slot: UnsafeCell<Slot>,
 }
 
 // SAFETY: every field but `slot` is atomic. `slot` is replaced only by
@@ -548,9 +511,9 @@ struct Entry<Memory> {
 // read only by tasks whose share, lock or reclaim excludes that owner;
 // the acquiring and releasing operations on the state word order those
 // accesses.
-unsafe impl<Memory: Send + Sync> Sync for Entry<Memory> {}
+unsafe impl Sync for Entry {}
 
-impl<Memory> Entry<Memory> {
+impl Entry {
     const fn free() -> Self {
         Self {
             key: AtomicU64::new(NO_KEY),
@@ -567,7 +530,7 @@ impl<Memory> Entry<Memory> {
     /// Nobody may replace the slot while the reference lives: the caller
     /// holds the entry `LOCKED`, under `RECLAIM`, or holds a share of
     /// it.
-    unsafe fn slot(&self) -> &Slot<Memory> {
+    unsafe fn slot(&self) -> &Slot {
         // SAFETY: the caller's hold excludes the only writers.
         unsafe { &*self.slot.get() }
     }
@@ -583,14 +546,12 @@ impl<Memory> Entry<Memory> {
         clippy::mut_from_ref,
         reason = "the entry's state word, not the borrow, grants exclusive access to the slot"
     )]
-    unsafe fn slot_mut(&self) -> &mut Slot<Memory> {
+    unsafe fn slot_mut(&self) -> &mut Slot {
         // SAFETY: the caller's exclusive ownership excludes every other
         // access.
         unsafe { &mut *self.slot.get() }
     }
-}
 
-impl<Memory: PageMemory> Entry<Memory> {
     /// The bytes of a buffer the caller may read.
     ///
     /// # Safety
@@ -600,7 +561,7 @@ impl<Memory: PageMemory> Entry<Memory> {
     unsafe fn bytes(&self) -> &[u8; CACHE_BLOCK_BYTES] {
         // SAFETY: forwarded from the caller.
         match unsafe { self.slot() } {
-            Slot::Buffer(page) => block_of(page),
+            Slot::Buffer(page) => &page.0,
             Slot::Empty | Slot::Compressed(_) => {
                 panic!("a block cache entry read as a buffer holds none")
             }
@@ -619,7 +580,7 @@ impl<Memory: PageMemory> Entry<Memory> {
     unsafe fn bytes_mut(&self) -> &mut [u8; CACHE_BLOCK_BYTES] {
         // SAFETY: forwarded from the caller.
         match unsafe { self.slot_mut() } {
-            Slot::Buffer(page) => block_of_mut(page),
+            Slot::Buffer(page) => &mut page.0,
             Slot::Empty | Slot::Compressed(_) => {
                 panic!("a block cache entry written as a buffer holds none")
             }
@@ -666,8 +627,8 @@ enum RunKind {
 /// the request's end without one, gives them back. It may be completed
 /// in the device's interrupt handler, so nothing here blocks, logs or
 /// takes a lock an interrupt handler cannot take.
-pub(super) struct CacheRun<Memory> {
-    cache: Arc<CacheCore<Memory>>,
+pub(super) struct CacheRun {
+    cache: Arc<CacheCore>,
     disk: usize,
     first_block: u64,
     ids: ArrayVec<u32, MAX_RUN_BLOCKS>,
@@ -678,7 +639,7 @@ pub(super) struct CacheRun<Memory> {
     answered: bool,
 }
 
-impl<Memory> CacheRun<Memory> {
+impl CacheRun {
     /// The device answered the request, or refused it.
     pub(super) fn complete(&mut self, result: IoResult<()>) {
         assert!(!self.answered, "a block cache request was answered twice");
@@ -732,7 +693,7 @@ impl<Memory> CacheRun<Memory> {
     }
 }
 
-impl<Memory> Drop for CacheRun<Memory> {
+impl Drop for CacheRun {
     fn drop(&mut self) {
         let cache = &*self.cache;
         cache.pages.fetch_sub(self.staged, Ordering::Relaxed);
@@ -768,10 +729,6 @@ enum Skip {
     /// Dirty or in flight, held by someone else: settled once the first
     /// pass's writes are done.
     Busy,
-    /// Compressed and dirty, and the disk's memory refused the page its
-    /// write is staged in: settled by the second pass like a held block,
-    /// where a refusal fails the sync.
-    Refused,
 }
 
 /// The blocks one read request fills, in block order. Every entry is
@@ -784,18 +741,17 @@ struct ReadRun {
 
 /// The blocks one write request carries, in block order. Every entry is
 /// in write-back with a share and a pin the write gives back.
-struct WriteRun<Memory> {
+struct WriteRun {
     disk: usize,
     first_block: u64,
     ids: ArrayVec<u32, MAX_RUN_BLOCKS>,
     /// For a block held compressed, its bytes decompressed for this
-    /// write alone into a page of the disk's memory; the entry keeps its
-    /// compressed page.
-    staged: ArrayVec<Option<Memory>, MAX_RUN_BLOCKS>,
+    /// write alone; the entry keeps its compressed page.
+    staged: ArrayVec<Option<Box<Page>>, MAX_RUN_BLOCKS>,
 }
 
-impl<Memory> WriteRun<Memory> {
-    fn new(disk: usize, block: u64, id: u32, staged: Option<Memory>) -> Self {
+impl WriteRun {
+    fn new(disk: usize, block: u64, id: u32, staged: Option<Box<Page>>) -> Self {
         let mut run = Self {
             disk,
             first_block: block,
@@ -806,12 +762,12 @@ impl<Memory> WriteRun<Memory> {
         run
     }
 
-    fn push_back(&mut self, id: u32, staged: Option<Memory>) {
+    fn push_back(&mut self, id: u32, staged: Option<Box<Page>>) {
         self.ids.push(id);
         self.staged.push(staged);
     }
 
-    fn push_front(&mut self, id: u32, staged: Option<Memory>) {
+    fn push_front(&mut self, id: u32, staged: Option<Box<Page>>) {
         self.ids.insert(0, id);
         self.staged.insert(0, staged);
         self.first_block -= 1;
@@ -953,11 +909,9 @@ struct SyncTurn {
 struct DiskErrors {
     /// Bumped by every failed write; a sync compares it across itself.
     writes: AtomicU64,
-    /// How the disk last failed: what the device said when it last
-    /// failed a request, written by a request's completion, which may run
-    /// in an interrupt handler, or the disk's memory refusing the page a
-    /// sync needed to write a block.
-    last: IrqSafeMutex<Option<BlockCacheError>>,
+    /// What the device said when it last failed a request. Written by a
+    /// request's completion, which may run in an interrupt handler.
+    last: IrqSafeMutex<Option<IoError>>,
 }
 
 /// What the cache knows about one disk it serves, as the caller hands
@@ -1026,19 +980,14 @@ impl DiskState {
         counter(row).fetch_add(amount, Ordering::Relaxed);
     }
 
-    /// Records a request the device failed.
     fn record_error(&self, error: IoError) {
-        self.record_failure(BlockCacheError::Device(error));
+        self.errors.last.with(|last| *last = Some(error));
     }
 
-    fn record_failure(&self, failure: BlockCacheError) {
-        self.errors.last.with(|last| *last = Some(failure));
-    }
-
-    fn last_failure(&self) -> BlockCacheError {
+    fn last_error(&self) -> IoError {
         self.errors
             .last
-            .with(|last| last.unwrap_or(BlockCacheError::Device(IoError::DeviceFault)))
+            .with(|last| last.unwrap_or(IoError::DeviceFault))
     }
 
     fn is_aborted(&self) -> bool {
@@ -1074,13 +1023,13 @@ impl Drop for Leading<'_> {
 
 /// A commit in progress. Dropped before it finished, it aborts the
 /// disk: the commit block may or may not be on the media.
-struct Committing<'a, Memory> {
-    cache: &'a CacheCore<Memory>,
+struct Committing<'a> {
+    cache: &'a CacheCore,
     disk: usize,
     finished: bool,
 }
 
-impl<Memory> Drop for Committing<'_, Memory> {
+impl Drop for Committing<'_> {
     fn drop(&mut self) {
         if !self.finished {
             self.cache.abort(self.disk);
@@ -1089,22 +1038,21 @@ impl<Memory> Drop for Committing<'_, Memory> {
 }
 
 /// A run of entries allocated together the first time an id in it is named.
-type Segment<Memory> = Once<Box<[CachePadded<Entry<Memory>>]>>;
+type Segment = Once<Box<[CachePadded<Entry>]>>;
 
 /// The cache and the devices it reaches: the core every request's
 /// completion holds, and the disks' devices, which only the tasks that
-/// issue requests need, and which allocate every page the cache holds.
-pub(super) struct CacheShared<Device: BlockDevice> {
-    core: Arc<CacheCore<Device::Memory>>,
+/// issue requests need.
+pub(super) struct CacheShared<Device> {
+    core: Arc<CacheCore>,
     /// In the order of [`CacheCore::disks`].
     devices: ArrayVec<Device, MAX_BLOCK_DEVICES>,
 }
 
 /// Everything the cache keeps but the devices. A request's completion
-/// holds it, so it names no device type, only the type of the memory the
-/// devices hand out.
-pub(super) struct CacheCore<Memory> {
-    segments: Box<[Segment<Memory>]>,
+/// holds it, so it names no device type.
+pub(super) struct CacheCore {
+    segments: Box<[Segment]>,
     max_entries: u32,
     /// Entries ever created; ids below it name a live segment.
     allocated: CachePadded<AtomicU32>,
@@ -1127,20 +1075,24 @@ pub(super) struct CacheCore<Memory> {
     pressure: CachePadded<AtomicU8>,
     /// Page buffers the cache holds, staged write copies included.
     pages: CachePadded<AtomicUsize>,
+    /// Pages ever allocated, for tests that check a recycled entry keeps
+    /// its page.
+    #[cfg(test)]
+    pages_allocated: AtomicUsize,
     /// The tier cold blocks are compressed into under pressure.
     pool: CompressedPool,
     disks: ArrayVec<DiskState, MAX_BLOCK_DEVICES>,
 }
 
-impl<Device: BlockDevice> Deref for CacheShared<Device> {
-    type Target = CacheCore<Device::Memory>;
+impl<Device> Deref for CacheShared<Device> {
+    type Target = CacheCore;
 
-    fn deref(&self) -> &CacheCore<Device::Memory> {
+    fn deref(&self) -> &CacheCore {
         &self.core
     }
 }
 
-impl<Device: BlockDevice> CacheShared<Device> {
+impl<Device> CacheShared<Device> {
     fn new(
         limits: BlockCacheLimits,
         processors: usize,
@@ -1165,7 +1117,7 @@ impl<Device: BlockDevice> CacheShared<Device> {
 }
 
 /// The parts of the cache that never reach a device.
-impl<Memory> CacheCore<Memory> {
+impl CacheCore {
     /// A cache with no disk yet; [`CacheShared::new`] adds them.
     fn new(limits: BlockCacheLimits, processors: usize, pool: CompressedPool) -> Self {
         assert!(
@@ -1206,12 +1158,14 @@ impl<Memory> CacheCore<Memory> {
             reclaimable: CachePadded::new(Gate::new()),
             pressure: CachePadded::new(AtomicU8::new(PressureLevel::Green as u8)),
             pages: CachePadded::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            pages_allocated: AtomicUsize::new(0),
             pool,
             disks: ArrayVec::new(),
         }
     }
 
-    fn entry(&self, id: u32) -> &Entry<Memory> {
+    fn entry(&self, id: u32) -> &Entry {
         let segment = self.segments[id as usize / SEGMENT_ENTRIES]
             .get()
             .unwrap_or_else(|| {
@@ -1261,14 +1215,20 @@ impl<Memory> CacheCore<Memory> {
         }
     }
 
-    /// Gives a page back to the memory of the disk that allocated it.
-    fn release_page(&self, page: Memory) {
+    fn new_page(&self) -> Box<Page> {
+        self.pages.fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        self.pages_allocated.fetch_add(1, Ordering::Relaxed);
+        Page::zeroed()
+    }
+
+    fn release_page(&self, page: Box<Page>) {
         drop(page);
         self.pages.fetch_sub(1, Ordering::Relaxed);
     }
 
     /// Frees what a slot the caller took out of an entry held.
-    fn release_slot(&self, slot: Slot<Memory>) {
+    fn release_slot(&self, slot: Slot) {
         match slot {
             Slot::Empty => {}
             Slot::Buffer(page) => self.release_page(page),
@@ -1532,9 +1492,8 @@ impl<Memory> CacheCore<Memory> {
     }
 
     /// Takes the coldest evictable entry out of the index, giving
-    /// referenced entries a second chance. Answers it with the disk whose
-    /// block it held, whose memory any page it holds is.
-    fn evict_one(&self) -> Option<(u32, usize)> {
+    /// referenced entries a second chance.
+    fn evict_one(&self) -> Option<u32> {
         let allocated = self.allocated.load(Ordering::Acquire);
         if allocated == 0 {
             return None;
@@ -1559,32 +1518,44 @@ impl<Memory> CacheCore<Memory> {
                 .compare_exchange(current, RECLAIM, Ordering::SeqCst, Ordering::Relaxed)
                 .is_ok()
             {
-                // The owner of a `RECLAIM` entry is the only writer of
-                // its key, so the key read here is the one unlinked.
-                let disk = key_disk(self.entry(id).key.load(Ordering::Acquire));
                 self.unlink(id);
-                return Some((id, disk));
+                return Some(id);
             }
         }
         None
     }
 
-    /// An entry this caller owns under [`RECLAIM`], with the disk whose
-    /// page it may still hold: `None` for a free or new entry, which
-    /// holds nothing.
+    /// An entry this caller owns under [`RECLAIM`], with a buffer.
     ///
     /// Green pressure reuses a free entry or grows; otherwise the clock
     /// recycles a clean block first. An `urgent` claim — a reader that
     /// cannot proceed without one — grows under pressure when nothing
-    /// is evictable; a speculative one does not.
-    fn take_entry(&self, urgent: bool) -> Option<(u32, Option<usize>)> {
-        let fresh = || self.pop_free().or_else(|| self.grow()).map(|id| (id, None));
-        let recycled = || self.evict_one().map(|(id, disk)| (id, Some(disk)));
-        if self.pressure() == PressureLevel::Green {
-            fresh().or_else(recycled)
+    /// is evictable; a speculative one does not. A recycled entry keeps
+    /// its page, whichever disk's block it held: pages are the kernel's.
+    fn try_claim(&self, urgent: bool) -> Option<u32> {
+        let id = if self.pressure() == PressureLevel::Green {
+            self.pop_free()
+                .or_else(|| self.grow())
+                .or_else(|| self.evict_one())
         } else {
-            recycled().or_else(|| if urgent { fresh() } else { None })
+            self.evict_one().or_else(|| {
+                if urgent {
+                    self.pop_free().or_else(|| self.grow())
+                } else {
+                    None
+                }
+            })
+        }?;
+        // SAFETY: this task owns the entry under `RECLAIM`, and no
+        // reference into its slot lives.
+        let slot = unsafe { self.entry(id).slot_mut() };
+        // A recycled buffer is reused as it is: a read fills it whole and
+        // an overwrite zeroes it before anyone sees its bytes.
+        if !matches!(slot, Slot::Buffer(_)) {
+            let previous = core::mem::replace(slot, Slot::Buffer(self.new_page()));
+            self.release_slot(previous);
         }
+        Some(id)
     }
 
     /// An idle dirty entry, found by the clock. A dirty entry of an
@@ -1647,70 +1618,20 @@ impl<Memory> CacheCore<Memory> {
     fn abandon_read(&self, id: u32) {
         self.transition(id, |state| (state & !LOCKED) - PIN);
     }
-}
 
-/// The parts of the cache that take pages from a disk's memory.
-impl<Device: BlockDevice> CacheShared<Device> {
-    /// A zeroed page of `disk`'s memory, for one cache block.
-    fn new_page(&self, disk: usize) -> Result<Device::Memory, DmaError> {
-        let page = self.devices[disk].memory(CACHE_BLOCK_BYTES)?;
-        self.pages.fetch_add(1, Ordering::Relaxed);
-        Ok(page)
-    }
-
-    /// An entry this caller owns under [`RECLAIM`], holding a page of
-    /// `disk`'s memory, or `None` when [`CacheCore::take_entry`] finds
-    /// none.
-    ///
-    /// Fails when the disk's memory refuses the page the entry needs; the
-    /// entry goes back to the free list.
-    fn try_claim(&self, disk: usize, urgent: bool) -> Result<Option<u32>, DmaError> {
-        let Some((id, holder)) = self.take_entry(urgent) else {
-            return Ok(None);
-        };
-        // A recycled page of the same disk is reused as it is: a read
-        // fills it whole and an overwrite zeroes it before anyone sees its
-        // bytes. A page of another disk is that disk's memory, so it goes
-        // back and the entry takes one of this disk's.
-        //
-        // SAFETY: this task owns the entry under `RECLAIM`, and no
-        // reference into its slot lives.
-        let reusable =
-            holder == Some(disk) && matches!(unsafe { self.entry(id).slot() }, Slot::Buffer(_));
-        if !reusable {
-            let page = match self.new_page(disk) {
-                Ok(page) => page,
-                Err(error) => {
-                    self.push_free(id);
-                    return Err(error);
-                }
-            };
-            // SAFETY: as above.
-            let slot = unsafe { self.entry(id).slot_mut() };
-            let previous = core::mem::replace(slot, Slot::Buffer(page));
-            self.release_slot(previous);
-        }
-        Ok(Some(id))
-    }
-
-    /// Moves the pinned, dirty entry `id` of `disk` into write-back, with
-    /// a share and a pin of the write's own. A block held compressed is
-    /// decompressed into a page of the disk's memory staged for the
-    /// write, and keeps its compressed page.
+    /// Moves the pinned, dirty entry `id` into write-back, with a share
+    /// and a pin of the write's own. A block held compressed is
+    /// decompressed into a page staged for the write, and keeps its
+    /// compressed page.
     ///
     /// Answers `None`, doing nothing, when the entry is clean, held, or
-    /// already in flight. Fails when the disk's memory refuses the
-    /// staging page; the entry is left as it was, dirty and compressed.
-    fn start_writeback(
-        &self,
-        disk: usize,
-        id: u32,
-    ) -> Result<Option<Option<Device::Memory>>, DmaError> {
+    /// already in flight.
+    fn start_writeback(&self, id: u32) -> Option<Option<Box<Page>>> {
         let entry = self.entry(id);
         let mut current = entry.state.load(Ordering::Acquire);
         loop {
             if current & DIRTY == 0 || current & (LOCKED | WRITEBACK | RECLAIM) != 0 {
-                return Ok(None);
+                return None;
             }
             let next = if current & COMPRESSED == 0 {
                 ((current & !DIRTY) | WRITEBACK) + SHARE + PIN
@@ -1723,22 +1644,16 @@ impl<Device: BlockDevice> CacheShared<Device> {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) if current & COMPRESSED == 0 => return Ok(Some(None)),
+                Ok(_) if current & COMPRESSED == 0 => return Some(None),
                 Ok(_) => break,
                 Err(observed) => current = observed,
             }
         }
-        let mut staged = match self.new_page(disk) {
-            Ok(page) => page,
-            Err(error) => {
-                self.transition(id, |state| state & !LOCKED);
-                return Err(error);
-            }
-        };
+        let mut staged = self.new_page();
         // SAFETY: this task holds the entry `LOCKED`, so nobody replaces
         // its slot while the compressed page is read.
         match unsafe { entry.slot() } {
-            Slot::Compressed(page) => page.decompress_into(block_of_mut(&mut staged)),
+            Slot::Compressed(page) => page.decompress_into(&mut staged.0),
             Slot::Empty | Slot::Buffer(_) => {
                 panic!("block cache entry {id} is marked compressed without a compressed page")
             }
@@ -1746,30 +1661,24 @@ impl<Device: BlockDevice> CacheShared<Device> {
         self.transition(id, |state| {
             ((state & !(LOCKED | DIRTY)) | WRITEBACK) + SHARE + PIN
         });
-        Ok(Some(Some(staged)))
+        Some(Some(staged))
     }
 
     /// Starts the write-back of the next block of `disk` after or
     /// before a run, if it is cached and dirty.
-    ///
-    /// A neighbour whose staging page the disk's memory refuses ends the
-    /// run there, as a held one does: it stays dirty and in its disk's
-    /// dirty set, and its own write-back as a seed is where the refusal
-    /// is answered.
-    fn start_neighbour(&self, disk: usize, block: u64) -> Option<(u32, Option<Device::Memory>)> {
+    fn start_neighbour(&self, disk: usize, block: u64) -> Option<(u32, Option<Box<Page>>)> {
         let id = self.find(key_of(disk, block), Take::Pin)?;
-        let started = self.start_writeback(disk, id);
+        let started = self.start_writeback(id);
         self.unpin(id);
-        started.ok().flatten().map(|staged| (id, staged))
+        started.map(|staged| (id, staged))
     }
 
     /// Starts the write-back of the entry `seed` and of the dirty blocks
     /// next to it on its disk, as far as one request carries. Answers
-    /// `None` when `seed` cannot be written now, and fails when the
-    /// disk's memory refuses the page `seed`'s write is staged in.
-    fn start_write_run(&self, seed: u32) -> Result<Option<WriteRun<Device::Memory>>, DmaError> {
+    /// `None` when `seed` cannot be written now.
+    fn start_write_run(&self, seed: u32) -> Option<WriteRun> {
         if !self.try_take(seed, Take::Pin) {
-            return Ok(None);
+            return None;
         }
         let _held = Held {
             cache: self,
@@ -1777,19 +1686,16 @@ impl<Device: BlockDevice> CacheShared<Device> {
         };
         let key = self.entry(seed).key.load(Ordering::Acquire);
         if key == NO_KEY {
-            return Ok(None);
+            return None;
         }
         let disk = key_disk(key);
         let state = &self.disks[disk];
         if state.is_aborted() {
             self.discard(seed);
-            return Ok(None);
+            return None;
         }
         let block = key_block(key);
-        let Some(staged) = self.start_writeback(disk, seed)? else {
-            return Ok(None);
-        };
-        let mut run = WriteRun::new(disk, block, seed, staged);
+        let mut run = WriteRun::new(disk, block, seed, self.start_writeback(seed)?);
         let limit = state.layout.run_blocks;
         let mut after = block + 1;
         while run.ids.len() < limit && after < state.layout.capacity_blocks {
@@ -1805,23 +1711,21 @@ impl<Device: BlockDevice> CacheShared<Device> {
             };
             run.push_front(id, staged);
         }
-        Ok(Some(run))
+        Some(run)
     }
 
-    /// Decompresses the compressed entry `id` of `disk` into a fresh page
-    /// of the disk's memory, so it is valid again with its dirtiness
-    /// unchanged. Answers false, doing nothing, when the entry is not
-    /// compressed or another task owns it; that task's release wakes
-    /// anyone waiting on the entry. Fails when the disk's memory refuses
-    /// the page; the entry is left compressed.
+    /// Decompresses the compressed entry `id` into a fresh buffer, so it
+    /// is valid again with its dirtiness unchanged. Answers false, doing
+    /// nothing, when the entry is not compressed or another task owns
+    /// it; that task's release wakes anyone waiting on the entry.
     ///
     /// The caller holds a pin.
-    fn try_inflate(&self, disk: usize, id: u32) -> Result<bool, DmaError> {
+    fn try_inflate(&self, id: u32) -> bool {
         let entry = self.entry(id);
         let mut current = entry.state.load(Ordering::Acquire);
         loop {
             if current & COMPRESSED == 0 || current & (LOCKED | RECLAIM) != 0 {
-                return Ok(false);
+                return false;
             }
             match entry.state.compare_exchange_weak(
                 current,
@@ -1833,19 +1737,13 @@ impl<Device: BlockDevice> CacheShared<Device> {
                 Err(observed) => current = observed,
             }
         }
-        let mut page = match self.new_page(disk) {
-            Ok(page) => page,
-            Err(error) => {
-                self.transition(id, |state| state & !LOCKED);
-                return Err(error);
-            }
-        };
+        let mut page = self.new_page();
         // SAFETY: this task holds the entry `LOCKED`. Shares are granted
         // only on a valid buffer, and a write-back in flight reads the
         // copy it staged, so no reference into the slot lives.
         let slot = unsafe { entry.slot_mut() };
         match &*slot {
-            Slot::Compressed(compressed) => compressed.decompress_into(block_of_mut(&mut page)),
+            Slot::Compressed(compressed) => compressed.decompress_into(&mut page.0),
             Slot::Empty | Slot::Buffer(_) => {
                 panic!("block cache entry {id} is marked compressed without a compressed page")
             }
@@ -1853,11 +1751,9 @@ impl<Device: BlockDevice> CacheShared<Device> {
         let previous = core::mem::replace(slot, Slot::Buffer(page));
         self.release_slot(previous);
         self.transition(id, |state| (state & !(LOCKED | COMPRESSED)) | VALID);
-        Ok(true)
+        true
     }
-}
 
-impl<Memory: PageMemory> CacheCore<Memory> {
     /// Compresses the idle, valid entry `id`, last seen in state
     /// `current`, into the pool and frees its buffer.
     fn compress_entry(&self, id: u32, current: u64) -> Demotion {
@@ -1878,7 +1774,7 @@ impl<Memory: PageMemory> CacheCore<Memory> {
         // no share is outstanding.
         let slot = unsafe { entry.slot_mut() };
         let compressed = match &*slot {
-            Slot::Buffer(page) => self.pool.compress(block_of(page)),
+            Slot::Buffer(page) => self.pool.compress(&page.0),
             Slot::Empty | Slot::Compressed(_) => {
                 panic!("block cache entry {id} is valid without a buffer")
             }
@@ -1898,9 +1794,7 @@ impl<Memory: PageMemory> CacheCore<Memory> {
             }
         }
     }
-}
 
-impl<Memory> CacheCore<Memory> {
     /// Drops the idle, clean entry `id`, last seen in state `current`,
     /// from the cache, freeing its buffer or its compressed page.
     /// Answers whether it did.
@@ -1980,71 +1874,66 @@ impl<Memory> CacheCore<Memory> {
 /// an `.await` between taking its entries and handing them to its
 /// [`BlockPages`], so a task dropped at any `.await` leaves no entry
 /// held by a request that does not exist.
-impl<Device: BlockDevice> CacheShared<Device> {
+impl<Device> CacheShared<Device> {
     /// The request for the read run `run`, whose entries this task locked.
-    fn read_pages(&self, run: ReadRun) -> DevicePages<Device> {
-        let mut pages = BlockPages::for_run(
-            CacheRun {
-                cache: Arc::clone(&self.core),
-                disk: run.disk,
-                first_block: run.first_block,
-                ids: run.ids,
-                kind: RunKind::Read,
-                staged: 0,
-                answered: false,
-            },
-            0,
-        );
+    fn read_pages(&self, run: ReadRun) -> BlockPages {
+        let mut pages = BlockPages::for_run(CacheRun {
+            cache: Arc::clone(&self.core),
+            disk: run.disk,
+            first_block: run.first_block,
+            ids: run.ids,
+            kind: RunKind::Read,
+            staged: 0,
+            answered: false,
+        });
         for index in 0..pages.run_blocks() {
             let id = pages.run_id(index);
             // SAFETY: the run holds the entry `LOCKED` with no share
             // outstanding, and a locked entry claimed for a read holds a
             // buffer, which nobody replaces until the read completes.
-            match unsafe { self.entry(id).slot_mut() } {
-                Slot::Buffer(page) => pages.push_borrowed(page),
+            let page = match unsafe { self.entry(id).slot_mut() } {
+                Slot::Buffer(page) => NonNull::from(&mut **page),
                 Slot::Empty | Slot::Compressed(_) => {
                     panic!("block cache entry {id} was locked for a read without a buffer")
                 }
-            }
+            };
+            pages.push_borrowed(page);
         }
         pages
     }
 
     /// The request for the write run `run`, whose entries are in
     /// write-back with a share of the run's own.
-    fn write_pages(&self, run: WriteRun<Device::Memory>, kind: RunKind) -> DevicePages<Device> {
+    fn write_pages(&self, run: WriteRun, kind: RunKind) -> BlockPages {
         let WriteRun {
             disk,
             first_block,
             ids,
             staged,
         } = run;
-        let staged_pages = staged.iter().flatten().count();
-        let mut pages = BlockPages::for_run(
-            CacheRun {
-                cache: Arc::clone(&self.core),
-                disk,
-                first_block,
-                ids: ids.clone(),
-                kind,
-                staged: staged_pages,
-                answered: false,
-            },
-            staged_pages,
-        );
+        let mut pages = BlockPages::for_run(CacheRun {
+            cache: Arc::clone(&self.core),
+            disk,
+            first_block,
+            ids: ids.clone(),
+            kind,
+            staged: staged.iter().flatten().count(),
+            answered: false,
+        });
         for (id, staged) in ids.into_iter().zip(staged) {
             match staged {
-                Some(page) => pages.push_staged(page),
+                Some(page) => pages.push_owned(page),
                 None => {
                     // SAFETY: the run holds a share of the entry, so it
                     // holds a valid buffer that nobody writes or replaces
-                    // until the write completes; the device only reads it.
-                    match unsafe { self.entry(id).slot() } {
-                        Slot::Buffer(page) => pages.push_borrowed(page),
+                    // until the write completes; the request only reads it.
+                    let page = match unsafe { self.entry(id).slot() } {
+                        Slot::Buffer(page) => NonNull::from(&**page),
                         Slot::Empty | Slot::Compressed(_) => {
                             panic!("block cache entry {id} is in write-back without a buffer")
                         }
-                    }
+                    };
+                    pages.push_borrowed(page);
                 }
             }
         }
@@ -2052,24 +1941,22 @@ impl<Device: BlockDevice> CacheShared<Device> {
     }
 
     /// Starts the write-back of `seed` with its dirty neighbours, as one
-    /// request, if it can be written now. Fails when the disk's memory
-    /// refuses the page `seed`'s write is staged in.
-    fn start_write_back(&self, seed: u32) -> Result<Option<DevicePages<Device>>, DmaError> {
-        Ok(self
-            .start_write_run(seed)?
-            .map(|run| self.write_pages(run, RunKind::WriteBack)))
+    /// request, if it can be written now.
+    fn start_write_back(&self, seed: u32) -> Option<BlockPages> {
+        self.start_write_run(seed)
+            .map(|run| self.write_pages(run, RunKind::WriteBack))
     }
 }
 
 /// The parts of the cache that talk to the device.
 impl<Device> CacheShared<Device>
 where
-    Device: BlockDevice<Buffer = DevicePages<Device>>,
+    Device: BlockDevice<Buffer = BlockPages>,
 {
     /// Reads the run `pages` carries into its entries. Its completion
     /// makes them valid or failed, whether or not this task is still
     /// there to see it. Answers whether the device delivered the blocks.
-    async fn read_run(&self, pages: DevicePages<Device>) -> bool {
+    async fn read_run(&self, pages: BlockPages) -> bool {
         let (disk, first_block, blocks) = pages.run_target();
         let state = &self.disks[disk];
         let first = first_block as usize * state.layout.device_blocks_per_block;
@@ -2089,7 +1976,7 @@ where
     /// Writes the run `pages` carries. Its completion makes the blocks
     /// clean, dirty again or stale, and records a failure for the next
     /// sync, whether or not this task is still there to see it.
-    async fn write_run(&self, pages: DevicePages<Device>) -> Result<(), IoError> {
+    async fn write_run(&self, pages: BlockPages) -> Result<(), IoError> {
         let (disk, first_block, blocks) = pages.run_target();
         let state = &self.disks[disk];
         let first = first_block as usize * state.layout.device_blocks_per_block;
@@ -2105,15 +1992,12 @@ where
 
     /// Writes the entry `seed` back with its dirty neighbours, if it can
     /// be written now.
-    ///
-    /// Fails only when the disk's memory refuses the page `seed`'s write
-    /// is staged in, which leaves it dirty; a write the device fails is
-    /// counted in the disk's error sequence, which the next sync reports.
-    async fn write_back(&self, seed: u32) -> Result<(), DmaError> {
-        if let Some(pages) = self.start_write_back(seed)? {
+    async fn write_back(&self, seed: u32) {
+        if let Some(pages) = self.start_write_back(seed) {
+            // A failure is counted in the disk's error sequence, which the
+            // next sync reports.
             let _ = self.write_run(pages).await;
         }
-        Ok(())
     }
 
     /// Commits the device's write cache.
@@ -2128,37 +2012,32 @@ where
         result
     }
 
-    /// An entry for a miss on `disk`, holding a page of its memory,
-    /// writing idle dirty blocks back when the cache holds nothing it can
-    /// recycle.
-    ///
-    /// Fails when a disk's memory refuses a page the claim needs: the
-    /// entry's own, or the one an idle dirty compressed block's write-back
-    /// is staged in.
-    async fn claim(&self, disk: usize) -> Result<u32, DmaError> {
+    /// An entry for a miss, writing idle dirty blocks back when the cache
+    /// holds nothing it can recycle.
+    async fn claim(&self) -> u32 {
         loop {
-            if let Some(id) = self.try_claim(disk, true)? {
-                return Ok(id);
+            if let Some(id) = self.try_claim(true) {
+                return id;
             }
             // Every entry is pinned, dirty or in flight and the cache is
             // at its bound. Wait until an entry comes free or one goes
             // idle dirty, which this task then writes back itself.
-            let mut claimed = Ok(None);
+            let mut claimed = None;
             let mut dirty = None;
             self.reclaimable
                 .wait_until(|| {
-                    claimed = self.try_claim(disk, true);
-                    if matches!(claimed, Ok(None)) {
+                    claimed = self.try_claim(true);
+                    if claimed.is_none() {
                         dirty = self.find_idle_dirty();
                     }
-                    !matches!(claimed, Ok(None)) || dirty.is_some()
+                    claimed.is_some() || dirty.is_some()
                 })
                 .await;
-            if let Some(id) = claimed? {
-                return Ok(id);
+            if let Some(id) = claimed {
+                return id;
             }
             if let Some(id) = dirty {
-                self.write_back(id).await?;
+                self.write_back(id).await;
             }
         }
     }
@@ -2170,16 +2049,7 @@ where
         if current & DIRTY == 0 {
             return self.drop_entry(id, current);
         }
-        if let Err(error) = self.write_back(id).await {
-            // A reclaim pass answers what it gave back and has nobody to
-            // fail to: the block stays dirty and cached, and the next sync
-            // of its disk writes it or answers the refusal.
-            tracing::warn!(
-                ?error,
-                "block cache could not stage a compressed dirty block for its write-back; it stays cached"
-            );
-            return false;
-        }
+        self.write_back(id).await;
         let current = self.entry(id).state.load(Ordering::SeqCst);
         self.drop_entry(id, current)
     }
@@ -2280,7 +2150,7 @@ where
 
     /// The run a sync's first pass starts for the entry `id` it took out
     /// of `disk`'s dirty set, or why it starts none.
-    fn sync_candidate(&self, disk: usize, id: u32) -> Result<DevicePages<Device>, Skip> {
+    fn sync_candidate(&self, disk: usize, id: u32) -> Result<BlockPages, Skip> {
         let pending = |state: u64| state & (DIRTY | WRITEBACK) != 0;
         if !pending(self.entry(id).state.load(Ordering::SeqCst)) {
             return Err(Skip::Clean);
@@ -2289,10 +2159,8 @@ where
         if key == NO_KEY || key_disk(key) != disk {
             return Err(Skip::Clean);
         }
-        match self.start_write_back(id) {
-            Ok(Some(pages)) => return Ok(pages),
-            Ok(None) => {}
-            Err(_) => return Err(Skip::Refused),
+        if let Some(pages) = self.start_write_back(id) {
+            return Ok(pages);
         }
         if pending(self.entry(id).state.load(Ordering::SeqCst)) {
             Err(Skip::Busy)
@@ -2305,18 +2173,15 @@ where
     /// far as a write does: waits out its writer or its write in flight,
     /// and writes it once if it is still dirty. Dirt that comes back after
     /// that write is left in the set for the next sync.
-    ///
-    /// Fails when the disk's memory refuses the page the block's write is
-    /// staged in; the block stays dirty and goes back in the set.
-    async fn settle(&self, disk: usize, id: u32) -> Result<(), DmaError> {
+    async fn settle(&self, disk: usize, id: u32) {
         if !self.try_take(id, Take::Pin) {
             // Being recycled: it was clean.
-            return Ok(());
+            return;
         }
         let _held = Held { cache: self, id };
         let key = self.entry(id).key.load(Ordering::Acquire);
         if key == NO_KEY || key_disk(key) != disk {
-            return Ok(());
+            return;
         }
         let mut written = false;
         loop {
@@ -2324,29 +2189,22 @@ where
                 .wait_state(id, |state| state & (LOCKED | WRITEBACK) == 0)
                 .await;
             if state & DIRTY == 0 {
-                return Ok(());
+                return;
             }
             if self.disks[disk].is_aborted() {
                 self.discard(id);
-                return Ok(());
+                return;
             }
             if written {
                 self.mark_dirty(disk, id);
-                return Ok(());
+                return;
             }
             // A run that cannot start now is retried once the task that
             // took the entry meanwhile lets it go.
-            match self.start_write_back(id) {
-                Ok(Some(pages)) => {
-                    written = true;
-                    // A failure is counted in the disk's error sequence.
-                    let _ = self.write_run(pages).await;
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    self.mark_dirty(disk, id);
-                    return Err(error);
-                }
+            if let Some(pages) = self.start_write_back(id) {
+                written = true;
+                // A failure is counted in the disk's error sequence.
+                let _ = self.write_run(pages).await;
             }
         }
     }
@@ -2354,13 +2212,8 @@ where
     /// The work of the sync leading `disk`: every block in the dirty set
     /// when it starts reaches the disk, then the device's write cache is
     /// committed.
-    ///
-    /// A block whose staging page the disk's memory refuses is left dirty
-    /// for the next sync, the refusal is recorded as the disk's last
-    /// failure, and the rest of the sync still runs; the sync then fails.
-    async fn lead_sync(&self, disk: usize) -> Result<(), BlockCacheError> {
-        let state = &self.disks[disk];
-        let set = &state.dirty;
+    async fn lead_sync(&self, disk: usize) -> Result<(), IoError> {
+        let set = &self.disks[disk].dirty;
         // First pass: start a run for every dirty block nobody holds,
         // keeping a bounded number of requests in flight.
         {
@@ -2369,7 +2222,7 @@ where
             while let Some(id) = drain.next() {
                 match self.sync_candidate(disk, id) {
                     Err(Skip::Clean) => {}
-                    Err(Skip::Busy | Skip::Refused) => set.insert(id),
+                    Err(Skip::Busy) => set.insert(id),
                     Ok(pages) => {
                         // The request owns its blocks from here: a sync
                         // dropped with it still queued puts them back in
@@ -2390,31 +2243,21 @@ where
         }
         // Second pass: whatever was held, in flight elsewhere, or failed
         // is waited for and written.
-        let mut refused = None;
         let mut drain = Drain::new(set);
         while let Some(id) = drain.next() {
-            if let Err(error) = self.settle(disk, id).await {
-                tracing::warn!(?error, serial = ?state.serial, "block cache sync could not stage a compressed dirty block for its write");
-                let failure = BlockCacheError::Memory(error);
-                state.record_failure(failure);
-                refused = Some(failure);
-            }
+            self.settle(disk, id).await;
         }
-        let flushed = self.flush_device(disk).await;
-        match refused {
-            Some(failure) => Err(failure),
-            None => flushed.map_err(BlockCacheError::Device),
-        }
+        self.flush_device(disk).await
     }
 }
 
 /// The kernel's block cache, shared by every mount-source disk, which
 /// reaches them through the backend's device type.
-pub struct BlockCache<Device: BlockDevice> {
+pub struct BlockCache<Device> {
     shared: Arc<CacheShared<Device>>,
 }
 
-impl<Device: BlockDevice> Clone for BlockCache<Device> {
+impl<Device> Clone for BlockCache<Device> {
     fn clone(&self) -> Self {
         Self {
             shared: Arc::clone(&self.shared),
@@ -2424,7 +2267,7 @@ impl<Device: BlockDevice> Clone for BlockCache<Device> {
 
 impl<Device> BlockCache<Device>
 where
-    Device: BlockDevice<Buffer = DevicePages<Device>>,
+    Device: BlockDevice<Buffer = BlockPages>,
 {
     /// A cache over `disks`, which keep their order.
     pub(super) fn new(
@@ -2472,7 +2315,7 @@ where
         self.shared.pressure.store(level as u8, Ordering::Relaxed);
     }
 
-    /// Gives memory nobody holds back to the disks it came from. Under yellow
+    /// Gives memory nobody holds back to the kernel heap. Under yellow
     /// pressure the coldest eighth of the cache is compressed into the
     /// [`CompressedPool`], which evicts its own coldest pages when it is
     /// full, and a block it still refuses leaves the cache; under red
@@ -2515,12 +2358,12 @@ pub struct CachedDiskStats {
 ///
 /// Blocks are [`CACHE_BLOCK_BYTES`] long and numbered from the start of
 /// the disk.
-pub struct CachedDisk<Device: BlockDevice> {
+pub struct CachedDisk<Device> {
     cache: BlockCache<Device>,
     disk: usize,
 }
 
-impl<Device: BlockDevice> Clone for CachedDisk<Device> {
+impl<Device> Clone for CachedDisk<Device> {
     fn clone(&self) -> Self {
         Self {
             cache: self.cache.clone(),
@@ -2531,32 +2374,28 @@ impl<Device: BlockDevice> Clone for CachedDisk<Device> {
 
 /// A block a [`CachedDisk::read`] holds; the bytes cannot change while
 /// it lives.
-///
-/// `Memory` is the disk's [`BlockDevice::Memory`], which holds the bytes.
-pub struct BlockRef<'a, Memory> {
-    cache: &'a CacheCore<Memory>,
+pub struct BlockRef<'a> {
+    cache: &'a CacheCore,
     id: u32,
     bytes: &'a [u8; CACHE_BLOCK_BYTES],
 }
 
 /// A block a [`CachedDisk::write`] or [`CachedDisk::overwrite`] holds
 /// exclusively. Dropping it leaves the block dirty.
-///
-/// `Memory` is the disk's [`BlockDevice::Memory`], which holds the bytes.
-pub struct BlockMut<'a, Memory> {
-    cache: &'a CacheCore<Memory>,
+pub struct BlockMut<'a> {
+    cache: &'a CacheCore,
     disk: usize,
     id: u32,
     bytes: &'a mut [u8; CACHE_BLOCK_BYTES],
 }
 
 /// A pin this task holds, given back when it is dropped.
-struct Held<'a, Memory> {
-    cache: &'a CacheCore<Memory>,
+struct Held<'a> {
+    cache: &'a CacheCore,
     id: u32,
 }
 
-impl<Memory> Drop for Held<'_, Memory> {
+impl Drop for Held<'_> {
     fn drop(&mut self) {
         self.cache.unpin(self.id);
     }
@@ -2564,7 +2403,7 @@ impl<Memory> Drop for Held<'_, Memory> {
 
 impl<Device> CachedDisk<Device>
 where
-    Device: BlockDevice<Buffer = DevicePages<Device>>,
+    Device: BlockDevice<Buffer = BlockPages>,
 {
     fn shared(&self) -> &CacheShared<Device> {
         &self.cache.shared
@@ -2619,14 +2458,12 @@ where
         Ok(())
     }
 
-    /// How the disk last failed: a device error, or a page its memory
-    /// refused a sync.
     fn device_error(&self) -> BlockCacheError {
-        self.state().last_failure()
+        BlockCacheError::Device(self.state().last_error())
     }
 
     /// The block, read from the disk if the cache does not hold it.
-    pub async fn read(&self, block: u64) -> Result<BlockRef<'_, Device::Memory>, BlockCacheError> {
+    pub async fn read(&self, block: u64) -> Result<BlockRef<'_>, BlockCacheError> {
         let key = self.key(block)?;
         let cache = self.shared();
         if let Some(id) = cache.lookaside_find(key, Take::Share) {
@@ -2636,7 +2473,7 @@ where
             cache.remember(key, id);
             return Ok(self.block_ref(id));
         }
-        let (held, inserted) = self.hold(key).await?;
+        let (held, inserted) = self.hold(key).await;
         if inserted && !self.read_miss(held.id, block).await {
             return Err(self.device_error());
         }
@@ -2652,9 +2489,7 @@ where
             }
             if state & COMPRESSED != 0 {
                 // A hit in the compressed tier: no device read.
-                cache
-                    .try_inflate(self.disk, held.id)
-                    .map_err(BlockCacheError::Memory)?;
+                cache.try_inflate(held.id);
                 continue;
             }
             if state & STALE != 0 && (shares(state) != 0 || state & WRITEBACK != 0) {
@@ -2720,10 +2555,10 @@ where
 
     /// The block for modification, read from the disk first if the
     /// cache does not hold it.
-    pub async fn write(&self, block: u64) -> Result<BlockMut<'_, Device::Memory>, BlockCacheError> {
+    pub async fn write(&self, block: u64) -> Result<BlockMut<'_>, BlockCacheError> {
         self.writable()?;
         let key = self.key(block)?;
-        let (held, inserted) = self.hold(key).await?;
+        let (held, inserted) = self.hold(key).await;
         if inserted && !self.read_one(held.id, block).await {
             return Err(self.device_error());
         }
@@ -2733,13 +2568,10 @@ where
     /// The block for modification without reading it: the caller is
     /// about to write every byte. It starts zeroed, whatever the cache
     /// held for it.
-    pub async fn overwrite(
-        &self,
-        block: u64,
-    ) -> Result<BlockMut<'_, Device::Memory>, BlockCacheError> {
+    pub async fn overwrite(&self, block: u64) -> Result<BlockMut<'_>, BlockCacheError> {
         self.writable()?;
         let key = self.key(block)?;
-        let (held, inserted) = self.hold(key).await?;
+        let (held, inserted) = self.hold(key).await;
         if inserted {
             // Inserted locked: this task already owns the buffer.
             let id = held.id;
@@ -2858,7 +2690,7 @@ where
             .map_err(BlockCacheError::Device)
     }
 
-    fn block_ref(&self, id: u32) -> BlockRef<'_, Device::Memory> {
+    fn block_ref(&self, id: u32) -> BlockRef<'_> {
         let cache = self.shared();
         BlockRef {
             cache,
@@ -2870,7 +2702,7 @@ where
         }
     }
 
-    fn block_mut(&self, id: u32, zero: bool) -> BlockMut<'_, Device::Memory> {
+    fn block_mut(&self, id: u32, zero: bool) -> BlockMut<'_> {
         let cache = self.shared();
         // SAFETY: the caller holds the entry `LOCKED` with no share
         // outstanding and its slot holds a buffer, so this guard is the
@@ -2889,18 +2721,14 @@ where
 
     /// The entry for `key`, pinned, inserting it if the cache has none.
     /// An inserted entry comes back locked by this task and not valid.
-    /// Fails when a disk's memory refuses a page the miss needs.
-    async fn hold(&self, key: u64) -> Result<(Held<'_, Device::Memory>, bool), BlockCacheError> {
+    async fn hold(&self, key: u64) -> (Held<'_>, bool) {
         let cache = self.shared();
         if let Some(id) = cache.find(key, Take::Pin) {
-            return Ok((Held { cache, id }, false));
+            return (Held { cache, id }, false);
         }
         self.state().count(|counters| &counters.misses);
-        let id = cache
-            .claim(self.disk)
-            .await
-            .map_err(BlockCacheError::Memory)?;
-        Ok(match cache.insert(key, id) {
+        let id = cache.claim().await;
+        match cache.insert(key, id) {
             Insert::Inserted => (Held { cache, id }, true),
             Insert::Existing(existing) => {
                 // Another miss inserted the block while this one was
@@ -2914,7 +2742,7 @@ where
                     false,
                 )
             }
-        })
+        }
     }
 
     /// Locks the pinned entry, last seen unlocked in `state` with no
@@ -2989,11 +2817,6 @@ where
     /// An entry inserted locked for `block`, which nobody asked for yet,
     /// for readahead. `None` when the cache holds the block already or
     /// cannot place it without waiting.
-    ///
-    /// A page the disk's memory refuses places nothing either, and ends
-    /// the readahead window there: the demand read the window rides with
-    /// does not need the page, and failing it for one would fail a read
-    /// the device can serve.
     fn claim_absent(&self, block: u64) -> Option<u32> {
         let cache = self.shared();
         let key = key_of(self.disk, block);
@@ -3001,7 +2824,7 @@ where
             cache.unpin(id);
             return None;
         }
-        let id = cache.try_claim(self.disk, false).ok().flatten()?;
+        let id = cache.try_claim(false)?;
         match cache.insert(key, id) {
             // The insertion pin is the read's.
             Insert::Inserted => Some(id),
@@ -3018,10 +2841,10 @@ where
     /// it does not.
     async fn exclusive(
         &self,
-        held: Held<'_, Device::Memory>,
+        held: Held<'_>,
         block: u64,
         contents: bool,
-    ) -> Result<BlockMut<'_, Device::Memory>, BlockCacheError> {
+    ) -> Result<BlockMut<'_>, BlockCacheError> {
         let cache = self.shared();
         let id = held.id;
         let entry = cache.entry(id);
@@ -3040,18 +2863,13 @@ where
             }
             if state & COMPRESSED != 0 {
                 if contents {
-                    cache
-                        .try_inflate(self.disk, id)
-                        .map_err(BlockCacheError::Memory)?;
+                    cache.try_inflate(id);
                     continue;
                 }
                 // The whole block is about to be replaced, so its
                 // compressed bytes are dropped rather than decompressed.
                 // Readers keep parking on the lock until the writer is
-                // done. The page comes first, so a refusal leaves the
-                // entry as it was; it starts zeroed, as the disk's memory
-                // hands it out.
-                let page = cache.new_page(self.disk).map_err(BlockCacheError::Memory)?;
+                // done.
                 if entry
                     .state
                     .compare_exchange(
@@ -3062,13 +2880,12 @@ where
                     )
                     .is_err()
                 {
-                    cache.release_page(page);
                     continue;
                 }
                 // SAFETY: this task holds the entry `LOCKED`; a
                 // compressed entry with no write-back has no share.
                 let slot = unsafe { entry.slot_mut() };
-                let previous = core::mem::replace(slot, Slot::Buffer(page));
+                let previous = core::mem::replace(slot, Slot::Buffer(cache.new_page()));
                 cache.release_slot(previous);
                 core::mem::forget(held);
                 return Ok(self.block_mut(id, false));
@@ -3098,7 +2915,7 @@ where
     }
 }
 
-impl<Memory> Deref for BlockRef<'_, Memory> {
+impl Deref for BlockRef<'_> {
     type Target = [u8; CACHE_BLOCK_BYTES];
 
     fn deref(&self) -> &Self::Target {
@@ -3106,13 +2923,13 @@ impl<Memory> Deref for BlockRef<'_, Memory> {
     }
 }
 
-impl<Memory> Drop for BlockRef<'_, Memory> {
+impl Drop for BlockRef<'_> {
     fn drop(&mut self) {
         self.cache.release(self.id, Take::Share);
     }
 }
 
-impl<Memory> Deref for BlockMut<'_, Memory> {
+impl Deref for BlockMut<'_> {
     type Target = [u8; CACHE_BLOCK_BYTES];
 
     fn deref(&self) -> &Self::Target {
@@ -3120,13 +2937,13 @@ impl<Memory> Deref for BlockMut<'_, Memory> {
     }
 }
 
-impl<Memory> DerefMut for BlockMut<'_, Memory> {
+impl DerefMut for BlockMut<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.bytes
     }
 }
 
-impl<Memory> Drop for BlockMut<'_, Memory> {
+impl Drop for BlockMut<'_> {
     fn drop(&mut self) {
         let (previous, _) = self.cache.update(self.id, |state| {
             ((state & !(LOCKED | FAILED | STALE)) | VALID | DIRTY | REFERENCED) - PIN
@@ -3140,9 +2957,7 @@ impl<Memory> Drop for BlockMut<'_, Memory> {
 /// The blocks the cache holds dirty, for tests that need to see its
 /// state.
 #[cfg(test)]
-pub(super) fn dirty_blocks<Device: BlockDevice>(
-    cache: &BlockCache<Device>,
-) -> alloc::vec::Vec<u64> {
+pub(super) fn dirty_blocks<Device>(cache: &BlockCache<Device>) -> alloc::vec::Vec<u64> {
     let shared = &cache.shared;
     let allocated = shared.allocated.load(Ordering::Acquire);
     (0..allocated)
@@ -3151,10 +2966,17 @@ pub(super) fn dirty_blocks<Device: BlockDevice>(
         .collect()
 }
 
+/// Pages the cache ever allocated, for tests that check an entry keeps
+/// its page when it is recycled.
+#[cfg(test)]
+pub(super) fn pages_allocated<Device>(cache: &BlockCache<Device>) -> usize {
+    cache.shared.pages_allocated.load(Ordering::Relaxed)
+}
+
 /// Resident entries nobody holds, for tests that check nothing is left
 /// held once every task and request is done.
 #[cfg(test)]
-pub(super) fn idle_blocks<Device: BlockDevice>(cache: &BlockCache<Device>) -> usize {
+pub(super) fn idle_blocks<Device>(cache: &BlockCache<Device>) -> usize {
     cache.shared.idle_blocks()
 }
 
