@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 arrayvec = { version = "0.7.6", default-features = false }
 async-lock = { version = "3.4.2", default-features = false }
+atomic-waker = { version = "1.1.2", default-features = false }
 bitflags = "2.11.0"
 fdt = { version = "0.1.5", default-features = false }
 bytes = { version = "1.10.1", default-features = false }
