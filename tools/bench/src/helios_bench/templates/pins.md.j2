@@ -27,6 +27,15 @@
 | Fedora image | `{{ report.pins.fedora_image_url }}` (`{{ report.pins.fedora_image_sha256 }}`) |
 | QEMU | `{{ report.pins.qemu_version }}` |
 | Guest | {{ report.pins.vcpus }} vCPUs, {{ report.pins.memory }} (Helios) / {{ report.pins.linux_vm_memory }} (Linux), `{{ report.pins.net_backend }}` network, inspector RPC over `{{ report.pins.rpc_transport or "unrecorded" }}`, {{ report.pins.devices | join(", ") }} |
+{% set helios_ram = report.pins.helios_guest_ram %}
+{% set linux_ram = report.pins.linux_guest_ram %}
+{% if helios_ram or linux_ram %}
+{% if helios_ram == linux_ram %}
+| Guest RAM | Helios and Linux alike: {{ helios_ram.describe() }} |
+{% else %}
+| Guest RAM | Helios: {{ helios_ram.describe() if helios_ram else "unrecorded" }}; Linux: {{ linux_ram.describe() if linux_ram else "unrecorded" }}; **not equal** |
+{% endif %}
+{% endif %}
 {% for path, digest in report.pins.wasm_artifacts.items() %}
 | wasm `{{ path }}` | `{{ digest }}` |
 {% endfor %}

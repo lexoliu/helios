@@ -79,6 +79,7 @@ def write_jsonl(path: Path, cells: dict[str, list]) -> None:
                     {
                         "type": "iteration",
                         "workload": name,
+                        "runner": "program",
                         "iteration": iteration.index,
                         "elapsed_ms": iteration.elapsed_ms,
                         "metrics": dict(iteration.metrics),

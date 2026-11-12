@@ -48,6 +48,10 @@ pub enum DisplayError {
     BadSpan,
     #[error("no contiguous run of memory left for a frame buffer")]
     OutOfMemory,
+    #[error("the display engine cannot scan out a blob")]
+    NoBlobScanout,
+    #[error("the blob's gpu session has ended")]
+    StaleBlob,
     #[error("the display engine faulted")]
     DeviceFault,
     #[error("this program's heap cannot supply the frame buffer: {0}")]
@@ -66,6 +70,8 @@ impl From<raw::Error> for DisplayError {
             raw::Error::TooManySurfaces => Self::TooManySurfaces,
             raw::Error::BadSpan => Self::BadSpan,
             raw::Error::OutOfMemory => Self::OutOfMemory,
+            raw::Error::NoBlobScanout => Self::NoBlobScanout,
+            raw::Error::StaleBlob => Self::StaleBlob,
             raw::Error::DeviceFault => Self::DeviceFault,
         }
     }
@@ -138,9 +144,63 @@ impl Display {
         })
     }
 
+    /// Point `scanout` at a `mode` frame in `format` read straight out
+    /// of a renderer's blob, starting `offset` bytes in, `stride` bytes
+    /// from one row to the next.
+    ///
+    /// Nothing is copied or pinned: the frame is whatever was drawn into
+    /// the blob, and [`BlobSurface::present`] tells the scanout to
+    /// re-read it. The surface keeps the blob alive on the device, so
+    /// the two may be dropped in either order: the scanout is blanked
+    /// before the blob is destroyed.
+    pub async fn create_from_blob(
+        &self,
+        scanout: u32,
+        mode: Mode,
+        format: PixelFormat,
+        blob: &crate::bindings::helios::system::gpu::Blob,
+        offset: u32,
+        stride: u32,
+    ) -> Result<BlobSurface, DisplayError> {
+        let raw = self
+            .raw
+            .create_from_blob(scanout, mode, format, blob, offset, stride)
+            .await
+            .map_err(DisplayError::from)?;
+        Ok(BlobSurface { raw, mode })
+    }
+
     /// Every change to the device's set of outputs, from now on.
     pub fn changed(&self) -> StreamReader<DisplayChange> {
         self.raw.changed()
+    }
+}
+
+/// One output scanning a frame out of a renderer's blob.
+///
+/// The blob stays the renderer's: dropping the surface takes it off its
+/// output and leaves the blob as it was.
+pub struct BlobSurface {
+    raw: raw::Surface,
+    mode: Mode,
+}
+
+impl BlobSurface {
+    /// The mode this surface was created at.
+    pub const fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    /// Tell the output to re-read `region` of the blob.
+    ///
+    /// Resolves when the display engine has flushed it.
+    pub async fn present(&self, region: Rect) -> Result<FrameToken, DisplayError> {
+        self.raw.present(region).await.map_err(DisplayError::from)
+    }
+
+    /// Every frame this surface publishes.
+    pub fn vsync(&self) -> StreamReader<FrameToken> {
+        self.raw.vsync()
     }
 }
 

@@ -10,6 +10,9 @@ embedded-debugger = ["helios-kernel/embedded-debugger"]
 [dependencies]
 acpi = "6.1.1"
 arm-gic = "0.9.1"
+# The ID, key and control registers return-address signing programs. `arm-gic`
+# pins its sysreg subcrates to exactly 0.4.0, so this stays at that version.
+arm-sysregs = { version = "0.4.0", default-features = false, features = ["el1"] }
 bytes = { version = "1.12.1", default-features = false }
 critical-section = { version = "1.2.0", features = ["restore-state-usize"] }
 fdt = { version = "0.1.5", default-features = false }
@@ -22,6 +25,8 @@ spin = "0.12.3"
 thiserror = { version = "2.0.20", default-features = false }
 triomphe = { version = "0.1.16", default-features = false }
 tracing.workspace = true
+# Wipes the instruction key's stack copy with volatile writes.
+zeroize = { version = "1.9.0", default-features = false }
 
 [lints]
 workspace = true

@@ -120,8 +120,9 @@ pub use exec::{
     parse_console_text, wall_clock_offset_nanos, yield_now,
 };
 pub use gpu::{
-    ContextRecord, Gpu3dClaim, Gpu3dOwnership, Gpu3dSender, Gpu3dService, Gpu3dServiceError,
-    MAX_GPU_BLOBS, MAX_GPU_CONTEXTS, MAX_GPU_VIEWS, install_gpu3d_device,
+    ContextRecord, ContextShared, Gpu3dOwnership, Gpu3dSender, Gpu3dService, Gpu3dServiceError,
+    Gpu3dSession, MAX_EXECUTE_BYTES, MAX_GPU_BLOBS, MAX_GPU_CONTEXTS, MAX_GPU_VIEWS,
+    MAX_MACHINE_GPU_BLOBS, MAX_MACHINE_GPU_CONTEXTS, RingTimeline, SessionId, install_gpu3d_device,
 };
 pub use helios_hal::Platform;
 pub use helios_netstack::{
@@ -207,7 +208,7 @@ pub use process::{
     AudioClaimCap, ClockAuthorityRights, CompileAuthority, DescriptorEntry, DescriptorId,
     DescriptorLimit, DescriptorTable, DescriptorTableError, DeviceClassRights, DeviceGrantClaimCap,
     DirectoryAuthorityRights, DirectoryCap, DirectoryPreopen, DisplayClaimCap, DnsCap,
-    ExecAuthority, ForkAuthority, FutexKey, FutexTable, FutexWaitRegistration, GpuClaimCap,
+    ExecAuthority, ForkAuthority, FutexKey, FutexTable, FutexWaitRegistration, GpuOpenCap,
     GuestAddress, InputClaimCap, JoinAuthority, LinkAuthorityRights, LinkSourceCap,
     LinkTargetDirectoryCap, MountAuthorityRights, MountCap, MulticastCap, NetworkAdminCap,
     NetworkAuthorityRights, NetworkCap, PrivilegedBindCap, ProcessAuthority, ProcessAuthorityError,
