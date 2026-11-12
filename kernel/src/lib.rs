@@ -198,8 +198,8 @@ pub use network::{
     validate_http_path_with_query, validate_http_status_code,
 };
 pub use process::{
-    AudioClaimCap, ClockAuthorityRights, DescriptorEntry, DescriptorId, DescriptorLimit,
-    DescriptorTable, DescriptorTableError, DeviceClassRights, DeviceGrantClaimCap,
+    AudioClaimCap, ClockAuthorityRights, CompileAuthority, DescriptorEntry, DescriptorId,
+    DescriptorLimit, DescriptorTable, DescriptorTableError, DeviceClassRights, DeviceGrantClaimCap,
     DirectoryAuthorityRights, DirectoryCap, DirectoryPreopen, DisplayClaimCap, DnsCap,
     ExecAuthority, ForkAuthority, FutexKey, FutexTable, FutexWaitRegistration, GpuClaimCap,
     GuestAddress, InputClaimCap, JoinAuthority, LinkAuthorityRights, LinkSourceCap,
@@ -918,16 +918,15 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> Kernel<CpuImpl, Watch
     /// `interrupt_guests` asks the runtime that runs guests to interrupt
     /// each one that is running now (`GuestInterrupts::interrupt_running`),
     /// so a processor inside wasm reaches a boundary at its next check
-    /// and not at the end of its slice; what it answers lives as long as
-    /// the freeze does. The concurrency contract, and what the caller may
-    /// do while the machine is held, are in `exec::freeze`. The answer
-    /// pets this kernel's hardware watchdog on request, which a hold
-    /// longer than the watchdog's timeout needs.
-    pub async fn freeze<Request>(
+    /// and not at the end of its slice. The concurrency contract, and
+    /// what the caller may do while the machine is held, are in
+    /// `exec::freeze`. The answer pets this kernel's hardware watchdog on
+    /// request, which a hold longer than the watchdog's timeout needs.
+    pub async fn freeze(
         &self,
         arrival_deadline: Duration,
-        interrupt_guests: impl FnOnce() -> Request,
-    ) -> Result<FrozenMachine<CpuImpl, WatchdogImpl, Request>, FreezeError> {
+        interrupt_guests: impl FnOnce(),
+    ) -> Result<FrozenMachine<CpuImpl, WatchdogImpl>, FreezeError> {
         self.executor
             .freeze(
                 &self.timer,

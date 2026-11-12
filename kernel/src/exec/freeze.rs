@@ -14,8 +14,7 @@
 //! waits on a lock of the barrier's: it publishes a word, wakes the
 //! secondaries and awaits their arrival, and a secondary parks on the
 //! word. (What the caller's `interrupt_guests` does is its own contract;
-//! the runtime's takes a spin lock that is held only across synchronous
-//! bookkeeping, never over a boundary.)
+//! the runtime's takes no lock.)
 //!
 //! State, each word with one writer:
 //!
@@ -42,12 +41,8 @@
 //! 2. asks the guests that are running to stop, which ends each at its
 //!    next function entry or loop header and returns it to the executor
 //!    (the caller supplies that, because the scheduler knows nothing of
-//!    the runtime that runs guests, and keeps whatever it answers, a
-//!    request that guests yield on, until the freeze ends: a guest that
-//!    no processor runs through the scheduler's own slice preemption, the
-//!    in-kernel compiler, yields only for such a request). A guest that
-//!    runs no wasm, or is already suspended, reaches the executor on its
-//!    own;
+//!    the runtime that runs guests). A guest that runs no wasm, or is
+//!    already suspended, reaches the executor on its own;
 //! 3. wakes every secondary, whatever it is doing: a secondary that is
 //!    running reads `hold` at its next boundary, and one that is idle,
 //!    polling or parked is brought back to its run loop. The wake is
@@ -382,16 +377,6 @@ impl<CpuImpl: Cpu + Clone> Drop for Release<CpuImpl> {
     }
 }
 
-/// A freeze's hold on the machine, and the request the caller made of
-/// the runtime that runs guests when it began, which the caller's value
-/// ends when it drops.
-struct Hold<CpuImpl: Cpu + Clone, Request> {
-    // Field order is the drop order: the request ends before the
-    // secondaries are released.
-    _request: Request,
-    _release: Release<CpuImpl>,
-}
-
 /// The machine, held still. Every processor but this one is parked at a
 /// scheduler boundary with its interrupts held off, no task is polled on
 /// any of them, no timer fires, and this processor takes only the wake
@@ -415,11 +400,10 @@ struct Hold<CpuImpl: Cpu + Clone, Request> {
 /// performs, at least once per timeout, or the hardware resets the
 /// machine.
 #[must_use = "the machine stays frozen until this is dropped"]
-pub struct FrozenMachine<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog = NoWatchdog, Request = ()> {
-    // Field order is the thaw order: the guests' request ends and the
-    // secondaries are released first, and this processor's mask is
-    // lifted last.
-    _hold: Hold<CpuImpl, Request>,
+pub struct FrozenMachine<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog = NoWatchdog> {
+    // Field order is the thaw order: the secondaries are released first,
+    // and this processor's mask is lifted last.
+    _release: Release<CpuImpl>,
     _mask: CpuImpl::WakeOnlyMask,
     /// The mask is this processor's register state, whatever a backend's
     /// own type for it says.
@@ -427,9 +411,7 @@ pub struct FrozenMachine<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog = NoWatchd
     watchdog: WatchdogImpl,
 }
 
-impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog, Request>
-    FrozenMachine<CpuImpl, WatchdogImpl, Request>
-{
+impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog> FrozenMachine<CpuImpl, WatchdogImpl> {
     /// Releases every processor and lifts this processor's mask.
     pub fn thaw(self) {
         drop(self);
@@ -450,10 +432,7 @@ impl Executor {
     /// other processors take to reach a boundary, and
     /// `interrupt_guests` asks the runtime that runs guests to end the
     /// turn of each guest that is running now (it is how a processor
-    /// inside wasm reaches a boundary before its slice ends). It answers
-    /// whatever the runtime keeps for as long as the freeze lasts, a
-    /// request that guests must yield on while it is pending for one,
-    /// and the freeze drops it before it releases the machine. The
+    /// inside wasm reaches a boundary before its slice ends). The
     /// contract is in the module documentation.
     ///
     /// # Errors
@@ -465,13 +444,13 @@ impl Executor {
     ///
     /// The future is `!Send`: it records the processor it first runs on
     /// as the freezer, and runs only there.
-    pub async fn freeze<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog, Request>(
+    pub async fn freeze<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog>(
         &self,
         timer: &Timer<CpuImpl>,
         watchdog: WatchdogImpl,
         arrival_deadline: Duration,
-        interrupt_guests: impl FnOnce() -> Request,
-    ) -> Result<FrozenMachine<CpuImpl, WatchdogImpl, Request>, FreezeError> {
+        interrupt_guests: impl FnOnce(),
+    ) -> Result<FrozenMachine<CpuImpl, WatchdogImpl>, FreezeError> {
         // Held for the whole future, and moved into the answer at its
         // end, so that the future is `!Send` (a value that nothing uses
         // later is not kept across an await, and would not count): the
@@ -509,10 +488,7 @@ impl Executor {
             held,
         };
 
-        let hold = Hold {
-            _request: interrupt_guests(),
-            _release: release,
-        };
+        interrupt_guests();
         for index in 0..barrier.arrivals.len() {
             if index != usize::from(freezer.id()) {
                 cpu.wake_processor(processor_at(index));
@@ -553,7 +529,7 @@ impl Executor {
             .phase
             .store(Phase::Frozen as u8, Ordering::Release);
         Ok(FrozenMachine {
-            _hold: hold,
+            _release: release,
             _mask: mask,
             _processor_local: processor_local,
             watchdog,

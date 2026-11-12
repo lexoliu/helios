@@ -80,9 +80,6 @@ divan = { version = "0.1.21", default-features = false }
 futures-lite = "2.6.1"
 arc-swap = "1.7.1"
 wasm-encoder = "0.245.0"
-# The preemption tests run a small guest, which needs the compiler the
-# kernel itself does not link (it loads precompiled modules).
-wasmtime = { path = "../../wasmtime/crates/wasmtime", default-features = false, features = ["cranelift", "runtime", "std"] }
 
 [[bench]]
 name = "data_structures"
