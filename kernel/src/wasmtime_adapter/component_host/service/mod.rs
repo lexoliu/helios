@@ -806,6 +806,14 @@ where
 {
     spawn_network_packet_pump(&kernel, &debug_state);
     let topology = kernel.topology();
+    // Every backend's bootstrap processor reaches here only after starting
+    // its secondaries, and a backend enables its mechanisms on a processor
+    // before `start_processor` returns for it, so the line follows every
+    // processor's enable.
+    if helios_hal::cpu::current_processor() == topology.bootstrap_processor {
+        crate::control_flow::ReturnAddressCoverage::of(&cpu, env!("HELIOS_BUILD_TARGET"))
+            .log(topology.configured_processors);
+    }
     match component_host_processor_role(
         helios_hal::cpu::current_processor(),
         topology.configured_processors,
