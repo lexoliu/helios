@@ -18,7 +18,7 @@ use helios_artifact::{
 /// the program service and read lock-free from any processor; nothing writes
 /// it after selection.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct GuestIsa {
+pub struct GuestIsa {
     triple: &'static str,
     processor: &'static IsaLevel,
 }
@@ -41,7 +41,7 @@ impl GuestIsa {
     /// Panics naming the error when the probe does not answer a feature of
     /// the target's levels or the processor does not satisfy the floor level:
     /// the kernel cannot compile for a processor it cannot describe.
-    pub(crate) fn for_build_target(probe: Option<NativeFeatureProbe>) -> Self {
+    pub fn for_build_target(probe: Option<NativeFeatureProbe>) -> Self {
         let triple = env!("HELIOS_BUILD_TARGET");
         Self::select(triple, probe).unwrap_or_else(|error| {
             panic!("cannot select the guest ISA level for {triple}: {error}")

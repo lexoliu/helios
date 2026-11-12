@@ -623,6 +623,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
         cpu.processor_count(),
         cpu.now().ticks(),
         payload,
+        helios_kernel::GuestIsa::for_build_target(cpu.native_feature_probe()),
     );
     platform_state.install_debug_state(debug_state.clone());
     let console = helios_kernel::RecordingConsole::new(

@@ -21,6 +21,8 @@ mod instance;
 mod io;
 #[cfg(feature = "wasmtime-runtime")]
 mod isa;
+#[cfg(feature = "wasmtime-runtime")]
+pub use isa::GuestIsa;
 mod kernel_exception;
 mod log;
 mod machine;

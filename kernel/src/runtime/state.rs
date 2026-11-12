@@ -97,9 +97,9 @@ struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     /// What the platform's IOMMU confines, once the backend has built
     /// the domains. Empty on a machine whose devices are not behind one.
     iommu_report: Once<alloc::sync::Arc<crate::IommuReport>>,
-    /// The ISA level the program service compiles guest code for, set once
-    /// when the service is installed and reported through the statistics.
-    guest_isa: Once<crate::isa::GuestIsa>,
+    /// The ISA level the program service compiles guest code for, chosen
+    /// when the state is built and reported through the statistics.
+    guest_isa: crate::isa::GuestIsa,
     /// The memory balloon the host resizes this guest through. Empty on
     /// a machine that gave the kernel none.
     balloon: Once<BalloonHandle>,
@@ -321,6 +321,7 @@ where
         processor_count: usize,
         boot_ticks: u64,
         payload: BootPayload,
+        guest_isa: crate::isa::GuestIsa,
     ) -> Self {
         Self {
             inner: Arc::new(RuntimeStateInner {
@@ -341,7 +342,7 @@ where
                 block_service: Once::new(),
                 device_grants: DeviceGrantRegistry::new(),
                 iommu_report: Once::new(),
-                guest_isa: Once::new(),
+                guest_isa,
                 balloon: Once::new(),
                 swap: Once::new(),
                 display_service: Once::new(),
@@ -982,16 +983,9 @@ where
         self.inner.block_service.get().cloned()
     }
 
-    /// Publishes the ISA level the program service compiles guest code for.
-    ///
-    /// Called once, when the program service is installed.
-    pub(crate) fn install_guest_isa(&self, guest_isa: crate::isa::GuestIsa) {
-        let mut installed = false;
-        self.inner.guest_isa.call_once(|| {
-            installed = true;
-            guest_isa
-        });
-        assert!(installed, "guest ISA was installed more than once");
+    /// The ISA level the program service compiles guest code for.
+    pub(crate) fn guest_isa(&self) -> crate::isa::GuestIsa {
+        self.inner.guest_isa
     }
 
     /// Publishes what the platform's IOMMU confines.
@@ -1097,12 +1091,7 @@ where
 {
     pub fn snapshot(&self, current_ticks: u64) -> StatsSample {
         let uptime = self.ticks_to_nanos(current_ticks.saturating_sub(self.inner.boot_ticks));
-        // Every sample is read by a program or the debugger, which the
-        // program service runs, and the service installs this first.
-        let guest_isa =
-            self.inner.guest_isa.get().expect(
-                "statistics were sampled before the program service selected the guest ISA",
-            );
+        let guest_isa = self.inner.guest_isa;
         StatsSample {
             timestamp: uptime,
             uptime,
@@ -1266,6 +1255,7 @@ mod tests {
             1,
             0,
             BootPayload::for_tests(),
+            crate::isa::GuestIsa::for_build_target(Some(crate::test_support::floor_only_probe)),
         );
         let baseline = crate::heap_stats();
         state.inner.heap_perf_snapshot.reset(baseline);

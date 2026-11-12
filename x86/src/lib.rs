@@ -226,7 +226,13 @@ fn x86_kernel_main() -> ! {
     let timebase = Timebase::new(detect_tsc_frequency_hz());
     let tsc_base = read_tsc();
     let payload = helios_kernel::BootPayload::from_boot_modules(&handoff.modules);
-    let debug_state = debug_state::RuntimeState::new(timebase, processor_count, 0, payload);
+    let debug_state = debug_state::RuntimeState::new(
+        timebase,
+        processor_count,
+        0,
+        payload,
+        helios_kernel::GuestIsa::for_build_target(Some(detect_x86_native_feature)),
+    );
     // Every processor's periodic timer samples the instruction it
     // interrupted while instruction sampling runs
     // (`smp::handle_local_timer_interrupt`).

@@ -513,10 +513,11 @@ where
         return service;
     }
 
-    // Selected here, on the bootstrap processor before any secondary runs
-    // guest code, and logged once: this is the single place every backend's
-    // program service passes through, after the logger is up.
-    let guest_isa = GuestIsa::for_build_target(cpu.native_feature_probe());
+    // Selected by the backend when it built the runtime state, before any
+    // secondary processor ran guest code, and logged once here: this is the
+    // single place every backend's program service passes through, after the
+    // logger is up.
+    let guest_isa = debug_state.guest_isa();
     guest_isa.log();
     let cache_budget = machine_memory().free_bytes / COMPONENT_CACHE_FRACTION;
     let shared_memory_pool_budget =
@@ -548,7 +549,6 @@ where
             _marker: core::marker::PhantomData,
         }),
     };
-    debug_state.install_guest_isa(guest_isa);
     debug_state.install_program_service(service.clone());
     spawn_instruction_sample_drain(kernel, &service, debug_state);
     let plugin_context = ProgramExecContext {
