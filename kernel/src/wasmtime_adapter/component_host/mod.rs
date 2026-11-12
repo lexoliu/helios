@@ -685,7 +685,7 @@ macro_rules! impl_program_bindings {
                     match write_program_artifact(
                         accessor,
                         &request.destination_path,
-                        &artifact,
+                        &artifact.signed,
                         &caller_authority,
                         &write_cpu,
                         write_serial,
@@ -704,6 +704,7 @@ macro_rules! impl_program_bindings {
                     }
                     Ok(Ok($bindings::helios::system::programs::AotResult {
                         destination_path: request.destination_path,
+                        worker_threads: artifact.worker_threads,
                     }))
                 }
             }

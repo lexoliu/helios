@@ -1756,6 +1756,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "helios-compiler-host"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "getrandom 0.3.4",
+ "helios-compiler-abi",
+ "helios-compiler-support",
+ "serde",
+ "serde_json",
+ "target-lexicon",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tracing",
+ "tracing-log",
+ "tracing-subscriber",
+ "wasmtime",
+ "wat",
+]
+
+[[package]]
 name = "helios-compiler-plugin"
 version = "0.1.0"
 dependencies = [
