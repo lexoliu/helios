@@ -62,10 +62,16 @@ use helios_hal::iommu::PhysicalRange;
 use helios_hal::pmm::PhysFrameRange;
 
 use crate::bus::{DeviceBus, DmaAddressing, DmaPool};
-use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate_with};
-use crate::inflight::{InFlight, await_completion, submit_chain, submit_chain_with_payload};
+use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate_with, renegotiate};
+use crate::inflight::{
+    InFlight, await_completion, drain_to_idle, reinitialize_requests, submit_chain,
+    submit_chain_with_payload,
+};
 use crate::notify::Notify;
 use crate::queue::{VirtQueue, negotiated_queue_size};
+use crate::resume::{
+    DeviceReset, PolledError, QuiesceError, ReinitError, driver_ok, polled_command,
+};
 use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
 
 /// The control queue (virtio 1.2 §5.7.2): every command that touches the
@@ -201,6 +207,62 @@ struct FramebufferRecord {
     format: PixelFormat,
 }
 
+/// One resource as it has to be created again on a device that lost it.
+#[derive(Clone, Debug)]
+struct ResourceRestore {
+    id: FramebufferId,
+    mode: DisplayMode,
+    format: PixelFormat,
+    /// The `virtio_gpu_mem_entry` table the backing was attached with.
+    entries: MemEntryTable,
+    /// Whether the attach has been sent: a creation that was between
+    /// its two commands when the machine froze is restored as far as it
+    /// had got, and its own next command finishes it.
+    backed: bool,
+}
+
+/// A scanout pointed at part of a resource.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ScanoutAssignment {
+    framebuffer: FramebufferId,
+    source: Rect,
+}
+
+/// The pointer image and place a cursor plane was last given.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CursorPlacement {
+    framebuffer: FramebufferId,
+    position: Point,
+    hotspot: Point,
+}
+
+/// What the device has been asked to hold, which a device that lost its
+/// state has to be asked for again.
+///
+/// Every entry is written before the command that makes the device hold
+/// it is sent, and put back if the device refuses it, so a command that
+/// completed while its caller had not yet run again is already here when
+/// the machine is frozen. A destroyed resource leaves the record before
+/// its commands are sent, for the same reason: a device that never had
+/// it again answers the caller's remaining commands with an unknown
+/// resource, which is the truth.
+#[derive(Debug)]
+struct Restorable {
+    resources: ArrayVec<ResourceRestore, MAX_FRAMEBUFFERS>,
+    scanouts: [Option<ScanoutAssignment>; MAX_SCANOUTS],
+    cursors: [Option<CursorPlacement>; MAX_SCANOUTS],
+}
+
+impl Restorable {
+    const fn new() -> Self {
+        Self {
+            resources: ArrayVec::new_const(),
+            scanouts: [None; MAX_SCANOUTS],
+            cursors: [None; MAX_SCANOUTS],
+        }
+    }
+}
+
 /// What a request named, so that an `ERR_INVALID_*` answer can say which
 /// of them the device did not recognise.
 ///
@@ -283,6 +345,9 @@ pub struct VirtioGpuDevice<T: VirtioTransport> {
     /// mapped. Absent on a device that publishes no such window, which
     /// is every device with no renderer.
     host_visible: Option<PhysicalRange>,
+    /// What a reset device has to be told again. A spin lock held for a
+    /// copy, never across a call into a queue.
+    restorable: Mutex<Restorable>,
 }
 
 impl<T: VirtioTransport> VirtioGpuDevice<T> {
@@ -367,6 +432,7 @@ impl<T: VirtioTransport> VirtioGpuDevice<T> {
             blobs: Mutex::new(ArrayVec::new()),
             fences_signalled: Notify::new(),
             host_visible,
+            restorable: Mutex::new(Restorable::new()),
         })
     }
 
@@ -586,6 +652,235 @@ impl<T: VirtioTransport> VirtioGpuDevice<T> {
         Ok(decode_edid_preferred_mode(&response))
     }
 
+    /// Marks whether `resource`'s backing attach has been sent.
+    fn set_backed(&self, resource: FramebufferId, backed: bool) {
+        if let Some(held) = self
+            .restorable
+            .lock()
+            .resources
+            .iter_mut()
+            .find(|held| held.id == resource)
+        {
+            held.backed = backed;
+        }
+    }
+
+    /// Points `scanout`'s record at `assignment` and answers what it
+    /// was. A scanout this device does not have has no record, and the
+    /// device refuses the command that names it.
+    fn assign_scanout(
+        &self,
+        scanout: ScanoutId,
+        assignment: Option<ScanoutAssignment>,
+    ) -> Option<ScanoutAssignment> {
+        let mut restorable = self.restorable.lock();
+        let slot = restorable.scanouts.get_mut(scanout.index() as usize)?;
+        core::mem::replace(slot, assignment)
+    }
+
+    /// Records the pointer image and place `scanout`'s cursor plane is
+    /// being given.
+    fn place_cursor(&self, scanout: ScanoutId, placement: Option<CursorPlacement>) {
+        if let Some(slot) = self
+            .restorable
+            .lock()
+            .cursors
+            .get_mut(scanout.index() as usize)
+        {
+            *slot = placement;
+        }
+    }
+
+    /// Waits for every command and every cursor update the device owns
+    /// to complete, so the device may be reset. See [`crate::resume`]
+    /// for the contract; `expired` says when the caller's deadline has
+    /// passed.
+    pub fn quiesce(&self, mut expired: impl FnMut() -> bool) -> Result<(), QuiesceError> {
+        drain_to_idle(
+            &self.control_inflight,
+            &self.control,
+            &self.transport,
+            CONTROL_QUEUE_INDEX,
+            &mut expired,
+        )?;
+        drain_to_idle(
+            &self.cursor_inflight,
+            &self.cursor,
+            &self.transport,
+            CURSOR_QUEUE_INDEX,
+            &mut expired,
+        )
+    }
+
+    /// Brings a reset device back with the features it had, after
+    /// [`Self::quiesce`].
+    ///
+    /// The queues are programmed again, and the device must present the
+    /// scanouts, capability sets and host-visible window it did. Every
+    /// resource is then created again, backed again and filled again
+    /// from the pages its owner still holds; every scanout is pointed
+    /// where it was and flushed, and every cursor plane given its image
+    /// again. The commands are polled, because the machine is frozen:
+    /// `expired` bounds each answer.
+    ///
+    /// A device holding renderer contexts or blob resources is refused
+    /// before it is touched: a context's state lives in the host's
+    /// renderer and cannot be rebuilt from this driver's records.
+    pub fn reinitialize(
+        &self,
+        mut expired: impl FnMut() -> bool,
+    ) -> Result<DeviceReset, ReinitError> {
+        let device = DeviceType::Gpu;
+        if !self.contexts.lock().is_empty() {
+            return Err(ReinitError::StateNotRestorable {
+                device,
+                what: "renderer contexts",
+            });
+        }
+        if !self.blobs.lock().is_empty() {
+            return Err(ReinitError::StateNotRestorable {
+                device,
+                what: "blob resources",
+            });
+        }
+        renegotiate(&self.transport, self.features)?;
+        reinitialize_requests(
+            &self.control_inflight,
+            &self.control,
+            &self.transport,
+            CONTROL_QUEUE_INDEX,
+        )?;
+        reinitialize_requests(
+            &self.cursor_inflight,
+            &self.cursor,
+            &self.transport,
+            CURSOR_QUEUE_INDEX,
+        )?;
+        let changed = |what| ReinitError::DeviceChanged { device, what };
+        if self.transport.read_config_u32(CONFIG_NUM_SCANOUTS) != self.scanout_count {
+            return Err(changed("the number of scanouts"));
+        }
+        if self.transport.read_config_u32(CONFIG_NUM_CAPSETS) != self.capset_count {
+            return Err(changed("the number of capability sets"));
+        }
+        if self
+            .transport
+            .shared_memory_region(render::SHM_ID_HOST_VISIBLE)
+            != self.host_visible
+        {
+            return Err(changed("the host-visible window"));
+        }
+        driver_ok(&self.transport);
+
+        let restorable = self.restorable.lock();
+        for resource in &restorable.resources {
+            let subject = RequestSubject::framebuffer(resource.id);
+            self.restore_control(
+                &encode_resource_create_2d(resource.id, resource.format, resource.mode),
+                "a resource",
+                subject,
+                &mut expired,
+            )?;
+            if !resource.backed {
+                continue;
+            }
+            let mut attach = encode_attach_backing(
+                resource.id,
+                resource.entries.len() / MEM_ENTRY_BYTES,
+            )
+            .to_vec();
+            attach.extend_from_slice(&resource.entries);
+            self.restore_control(&attach, "a resource's backing", subject, &mut expired)?;
+            // The device's copy of the pixels went with the reset: the
+            // caller's pages still hold them.
+            self.restore_control(
+                &encode_transfer_to_host_2d(resource.id, Rect::of(resource.mode), 0),
+                "a resource's pixels",
+                subject,
+                &mut expired,
+            )?;
+        }
+        for (index, assignment) in restorable.scanouts.iter().enumerate() {
+            let Some(assignment) = assignment else {
+                continue;
+            };
+            let scanout = ScanoutId::new(index as u32);
+            let subject = RequestSubject::both(scanout, assignment.framebuffer);
+            self.restore_control(
+                &encode_set_scanout(scanout, assignment.framebuffer, assignment.source),
+                "a scanout",
+                subject,
+                &mut expired,
+            )?;
+            self.restore_control(
+                &encode_resource_flush(assignment.framebuffer, assignment.source),
+                "a scanout's picture",
+                subject,
+                &mut expired,
+            )?;
+        }
+        for (index, placement) in restorable.cursors.iter().enumerate() {
+            let Some(placement) = placement else {
+                continue;
+            };
+            let request = encode_update_cursor(
+                CMD_UPDATE_CURSOR,
+                ScanoutId::new(index as u32),
+                placement.position,
+                placement.framebuffer.raw(),
+                placement.hotspot,
+            );
+            polled_command(&self.transport, &self.cursor, &request, 0, &mut expired)
+                .map_err(|error| Self::restore_failure("a cursor", error))?;
+        }
+        Ok(DeviceReset { device })
+    }
+
+    /// One control command that restores state, as the error a reset
+    /// reports.
+    fn restore_control(
+        &self,
+        request: &[u8],
+        what: &'static str,
+        subject: RequestSubject,
+        expired: &mut impl FnMut() -> bool,
+    ) -> Result<(), ReinitError> {
+        let (response, written) = polled_command(
+            &self.transport,
+            &self.control,
+            request,
+            CTRL_HEADER_BYTES,
+            expired,
+        )
+        .map_err(|error| Self::restore_failure(what, error))?;
+        if (written as usize) < CTRL_HEADER_BYTES {
+            return Err(Self::restore_failure(
+                what,
+                PolledError::Queue(IoError::DeviceFault),
+            ));
+        }
+        check_response(&response, RESP_OK_NODATA, subject).map_err(|error| {
+            tracing::error!(%error, what, "virtio-gpu refused to restore state");
+            Self::restore_failure(what, PolledError::Queue(IoError::DeviceFault))
+        })
+    }
+
+    fn restore_failure(what: &'static str, error: PolledError) -> ReinitError {
+        let device = DeviceType::Gpu;
+        match error {
+            PolledError::Expired => ReinitError::RestoreTimedOut { device, what },
+            PolledError::Busy => ReinitError::QueueBusy {
+                device,
+                queue: CONTROL_QUEUE_INDEX,
+            },
+            PolledError::Queue(error) => ReinitError::Restore {
+                device,
+                what,
+                error,
+            },
+        }
+    }
+
     /// The record for `framebuffer`, or the error that says it is not
     /// this device's.
     fn record(&self, framebuffer: FramebufferId) -> DisplayResult<FramebufferRecord> {
@@ -708,6 +1003,15 @@ impl<T: VirtioTransport> helios_hal::display::DisplayDevice for VirtioGpuDevice<
             }
             framebuffers.push(FramebufferRecord { id, mode, format });
         }
+        // The two tables are the same length: a resource is in this one
+        // from the moment it is in the other.
+        self.restorable.lock().resources.push(ResourceRestore {
+            id,
+            mode,
+            format,
+            entries: entries.clone(),
+            backed: false,
+        });
 
         let create = encode_resource_create_2d(id, format, mode);
         let mut response = [0_u8; CTRL_HEADER_BYTES];
@@ -723,6 +1027,7 @@ impl<T: VirtioTransport> helios_hal::display::DisplayDevice for VirtioGpuDevice<
         let attached = match created {
             Ok(()) => {
                 let attach = encode_attach_backing(id, backing.len());
+                self.set_backed(id, true);
                 self.control_command(
                     &attach,
                     &entries,
@@ -736,6 +1041,7 @@ impl<T: VirtioTransport> helios_hal::display::DisplayDevice for VirtioGpuDevice<
         };
         if let Err(error) = attached {
             self.framebuffers.lock().retain(|record| record.id != id);
+            self.restorable.lock().resources.retain(|held| held.id != id);
             return Err(error);
         }
         Ok(id)
@@ -743,25 +1049,42 @@ impl<T: VirtioTransport> helios_hal::display::DisplayDevice for VirtioGpuDevice<
 
     async fn destroy_framebuffer(&self, framebuffer: FramebufferId) -> DisplayResult<()> {
         let record = self.record(framebuffer)?;
+        let taken = {
+            let mut restorable = self.restorable.lock();
+            let position = restorable
+                .resources
+                .iter()
+                .position(|held| held.id == framebuffer);
+            position.map(|position| restorable.resources.remove(position))
+        };
         let mut response = [0_u8; CTRL_HEADER_BYTES];
         let detach = encode_resource_only(CMD_RESOURCE_DETACH_BACKING, record.id);
-        self.control_command(
-            &detach,
-            &[],
-            &mut response,
-            RESP_OK_NODATA,
-            RequestSubject::framebuffer(record.id),
-        )
-        .await?;
         let unref = encode_resource_only(CMD_RESOURCE_UNREF, record.id);
-        self.control_command(
-            &unref,
-            &[],
-            &mut response,
-            RESP_OK_NODATA,
-            RequestSubject::framebuffer(record.id),
-        )
-        .await?;
+        let destroyed = async {
+            self.control_command(
+                &detach,
+                &[],
+                &mut response,
+                RESP_OK_NODATA,
+                RequestSubject::framebuffer(record.id),
+            )
+            .await?;
+            self.control_command(
+                &unref,
+                &[],
+                &mut response,
+                RESP_OK_NODATA,
+                RequestSubject::framebuffer(record.id),
+            )
+            .await
+        }
+        .await;
+        if let Err(error) = destroyed {
+            if let Some(taken) = taken {
+                self.restorable.lock().resources.push(taken);
+            }
+            return Err(error);
+        }
         // Only once the device has let the resource go: until then the
         // caller's pages are still on loan to it.
         self.framebuffers
@@ -789,14 +1112,26 @@ impl<T: VirtioTransport> helios_hal::display::DisplayDevice for VirtioGpuDevice<
         }
         let request = encode_set_scanout(scanout, record.id, source);
         let mut response = [0_u8; CTRL_HEADER_BYTES];
-        self.control_command(
-            &request,
-            &[],
-            &mut response,
-            RESP_OK_NODATA,
-            RequestSubject::both(scanout, record.id),
-        )
-        .await
+        let previous = self.assign_scanout(
+            scanout,
+            Some(ScanoutAssignment {
+                framebuffer: record.id,
+                source,
+            }),
+        );
+        let set = self
+            .control_command(
+                &request,
+                &[],
+                &mut response,
+                RESP_OK_NODATA,
+                RequestSubject::both(scanout, record.id),
+            )
+            .await;
+        if set.is_err() {
+            self.assign_scanout(scanout, previous);
+        }
+        set
     }
 
     async fn blank_scanout(&self, scanout: ScanoutId) -> DisplayResult<()> {
@@ -808,14 +1143,20 @@ impl<T: VirtioTransport> helios_hal::display::DisplayDevice for VirtioGpuDevice<
         let request =
             encode_set_scanout(scanout, FramebufferId::new(RESOURCE_NONE), Rect::default());
         let mut response = [0_u8; CTRL_HEADER_BYTES];
-        self.control_command(
-            &request,
-            &[],
-            &mut response,
-            RESP_OK_NODATA,
-            RequestSubject::scanout(scanout),
-        )
-        .await
+        let previous = self.assign_scanout(scanout, None);
+        let blanked = self
+            .control_command(
+                &request,
+                &[],
+                &mut response,
+                RESP_OK_NODATA,
+                RequestSubject::scanout(scanout),
+            )
+            .await;
+        if blanked.is_err() {
+            self.assign_scanout(scanout, previous);
+        }
+        blanked
     }
 
     async fn flush(&self, framebuffer: FramebufferId, region: Rect) -> DisplayResult<()> {
@@ -858,6 +1199,14 @@ impl<T: VirtioTransport> helios_hal::display::DisplayDevice for VirtioGpuDevice<
             record.id.raw(),
             image.hotspot,
         );
+        self.place_cursor(
+            scanout,
+            Some(CursorPlacement {
+                framebuffer: record.id,
+                position,
+                hotspot: image.hotspot,
+            }),
+        );
         self.cursor_command(&request).await
     }
 
@@ -869,6 +1218,7 @@ impl<T: VirtioTransport> helios_hal::display::DisplayDevice for VirtioGpuDevice<
             RESOURCE_NONE,
             Point::new(0, 0),
         );
+        self.place_cursor(scanout, None);
         self.cursor_command(&request).await
     }
 
@@ -880,6 +1230,14 @@ impl<T: VirtioTransport> helios_hal::display::DisplayDevice for VirtioGpuDevice<
             RESOURCE_NONE,
             Point::new(0, 0),
         );
+        if let Some(Some(placement)) = self
+            .restorable
+            .lock()
+            .cursors
+            .get_mut(scanout.index() as usize)
+        {
+            placement.position = position;
+        }
         self.cursor_command(&request).await
     }
 

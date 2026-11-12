@@ -238,13 +238,18 @@ pub(crate) fn polled_command<T: VirtioTransport>(
     let mut response = vec![0_u8; response_bytes];
     let token = {
         let mut ring = queue.try_lock().ok_or(PolledError::Busy)?;
-        let token = ring
-            .submit(
+        // A queue that carries no reply (the gpu cursor queue) takes a
+        // chain with no writable buffer.
+        let token = if response.is_empty() {
+            ring.submit(transport, &[request.as_slice()], &mut [])
+        } else {
+            ring.submit(
                 transport,
                 &[request.as_slice()],
                 &mut [response.as_mut_slice()],
             )
-            .map_err(PolledError::Queue)?;
+        }
+        .map_err(PolledError::Queue)?;
         ring.notify(transport);
         token
     };
