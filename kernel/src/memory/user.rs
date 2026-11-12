@@ -56,32 +56,52 @@ impl UserMemoryPool {
         self.frame_slab.configure_processors(processor_count);
     }
 
-    /// Hands `bytes` of the pool to the kernel heap, for good.
+    /// Lends `bytes` of the pool to a kernel owner that keeps it.
     ///
     /// This is the run-time half of the boot memory policy: the pool is
     /// seeded with everything the machine has and the kernel heap takes
     /// what it turns out to need out of it, rather than both guessing
-    /// their share at boot. See [`super::policy`] for why the transfer
-    /// is one-way.
+    /// their share at boot. See [`super::policy`] for why the heap's
+    /// transfer is one-way. A lender that can give a block back, such as
+    /// a device's DMA arena, returns it with [`Self::take_back`].
     ///
     /// `bytes` must be a power of two, and the block comes back aligned
     /// to its own size, so the pool loses one buddy rather than a
-    /// straddling pair.
+    /// straddling pair. The result is the block's `[start, end)` range.
     ///
     /// Called from inside the global allocator, so it must not itself
     /// allocate on the kernel heap — which is why it goes through
     /// [`Self::allocate_raw`], skipping both the free-page reporting
-    /// check and the frame slab.
-    pub(crate) fn lend_to_kernel_heap(&self, bytes: usize) -> Option<(usize, usize)> {
+    /// check and the frame slab. The block's contents are unspecified:
+    /// memory the pool showed to a free-page consumer may have been
+    /// discarded, and a lender zeroes what it hands on.
+    pub fn lend_chunk(&self, bytes: usize) -> Option<(usize, usize)> {
         debug_assert!(bytes.is_power_of_two(), "a lend is one buddy block");
         let layout = Layout::from_size_align(bytes, bytes).ok()?;
         let (ptr, size) = self.allocate_raw(layout, None).ok()?;
-        // The pool never sees this memory again, so it must stop
-        // counting towards the frame-slab capacity the pool sizes from
-        // its own total.
+        // While lent, the memory must stop counting towards the
+        // frame-slab capacity the pool sizes from its own total.
         self.total_bytes.fetch_sub(size, Ordering::Release);
         let start = ptr.as_ptr() as usize;
         Some((start, start + size))
+    }
+
+    /// Takes back a block [`Self::lend_chunk`] lent, as the pool's free
+    /// memory again.
+    ///
+    /// `start..end` is exactly the range the lend returned, and nothing
+    /// refers to it any more.
+    pub fn take_back(&self, start: usize, end: usize) {
+        let bytes = end - start;
+        debug_assert!(bytes.is_power_of_two(), "a lend is one buddy block");
+        let ptr = NonNull::new(core::ptr::with_exposed_provenance_mut::<u8>(start))
+            .unwrap_or_else(|| panic!("a lent chunk starts at a null address"));
+        let layout = Layout::from_size_align(bytes, bytes)
+            .unwrap_or_else(|_| panic!("a lent chunk of {bytes} bytes is not a buddy block"));
+        // Capacity first: the frame slab sizes itself from it when the
+        // block is returned.
+        self.total_bytes.fetch_add(bytes, Ordering::Release);
+        self.deallocate_with_processor(ptr, layout, None);
     }
 
     pub fn stats(&self) -> UserHeapStats {
@@ -488,9 +508,10 @@ pub(crate) fn user_pool_available_bytes() -> usize {
     installed_user_memory_pool().map_or(0, |pool| pool.stats().available_bytes())
 }
 
-/// See [`UserMemoryPool::lend_to_kernel_heap`].
+/// The kernel heap's lend, which it never gives back. See
+/// [`UserMemoryPool::lend_chunk`].
 pub(crate) fn lend_user_memory_to_kernel_heap(bytes: usize) -> Option<(usize, usize)> {
-    installed_user_memory_pool()?.lend_to_kernel_heap(bytes)
+    installed_user_memory_pool()?.lend_chunk(bytes)
 }
 
 /// See [`UserMemoryPool::largest_servable_bytes`].
@@ -896,5 +917,38 @@ mod tests {
             "user memory the host may have discarded is zeroed on reuse"
         );
         assert_eq!(PhysFrameAllocator::stats(&pool).reported_frames, 0);
+    }
+
+    /// A lender that gives its block back leaves the pool as it found it:
+    /// the buddy block is free again and the frame-slab capacity, which
+    /// the lend subtracted, is restored.
+    #[test]
+    fn a_lent_chunk_comes_back_as_the_pools_free_memory() {
+        let pool = pool(4 * 1024 * 1024);
+        let before = pool.stats();
+        let capacity = pool.total_bytes.load(Ordering::Acquire);
+        let chunk_bytes = 64 * 1024;
+
+        let (start, end) = pool.lend_chunk(chunk_bytes).expect("the pool has room");
+        assert_eq!(end - start, chunk_bytes);
+        assert_eq!(start % chunk_bytes, 0, "a lend is aligned to its own size");
+        assert_eq!(
+            pool.stats().allocated_bytes,
+            before.allocated_bytes + chunk_bytes,
+            "a lent chunk is out of the pool's free memory"
+        );
+        assert_eq!(
+            pool.total_bytes.load(Ordering::Acquire),
+            capacity - chunk_bytes,
+            "a lent chunk is out of the frame-slab capacity"
+        );
+
+        pool.take_back(start, end);
+        assert_eq!(pool.stats(), before);
+        assert_eq!(pool.total_bytes.load(Ordering::Acquire), capacity);
+        assert!(
+            pool.lend_chunk(chunk_bytes).is_some(),
+            "the returned block serves the next lend"
+        );
     }
 }
