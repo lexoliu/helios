@@ -44,9 +44,9 @@ const UART_IER_RDI: u8 = 1 << 0;
 #[derive(Clone, Copy)]
 pub(crate) struct DebugTransport {
     uart_base: usize,
-    /// The PLIC source the same device-tree node routes the port's
+    /// The PLIC line the same device-tree node routes the port's
     /// interrupt to.
-    plic_source: net::InterruptSourceId,
+    plic_line: net::PlicInterrupt,
 }
 
 impl DebugTransport {
@@ -71,9 +71,8 @@ impl DebugTransport {
         let region = node.reg()?.next()?;
         // The PLIC's specifier is a bare source number, the same
         // one-cell binding the grant walk decodes.
-        let plic_source = helios_virtio::node_interrupt(fdt, &node)
-            .and_then(|interrupt| NonZeroU32::new(interrupt.number))
-            .map(net::InterruptSourceId)
+        let plic_line = helios_virtio::node_interrupt(fdt, &node)
+            .and_then(net::PlicInterrupt::from_specifier)
             .unwrap_or_else(|| {
                 panic!(
                     "the {} debug UART node declares no PLIC source in its interrupts cell; \
@@ -83,7 +82,7 @@ impl DebugTransport {
             });
         Some(Self {
             uart_base: region.starting_address as usize,
-            plic_source,
+            plic_line,
         })
     }
 
@@ -138,7 +137,7 @@ pub(crate) fn count_virtio_mmio_devices(fdt: &Fdt<'_>, expected: DeviceType) -> 
 }
 
 use core::arch::{asm, global_asm};
-use core::num::{NonZeroU32, NonZeroUsize};
+use core::num::NonZeroUsize;
 use core::ops::Range;
 use core::sync::atomic::{AtomicUsize, Ordering, compiler_fence};
 
@@ -354,7 +353,9 @@ struct HartRuntime {
     hart_id: ProcessorId,
     timer: Timer<RiscvCpu>,
     wasmtime_tls: WasmtimeTlsSlots,
-    external_interrupts: Option<net::ExternalInterrupts>,
+    /// The PLIC domains this hart takes interrupts for, if any; the
+    /// `SupervisorExternal` trap arm claims from them.
+    external_interrupts: Option<net::HartInterrupts>,
     program_service: Option<debug_state::ProgramService>,
     /// The stack a kernel exception the kernel did not resolve is handed
     /// to the runtime from (`trap::hand_over_trap`). It is not the trap
@@ -821,91 +822,95 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     });
     // Only the bootstrap hart brings devices up, and it is the hart
     // that holds the root DRBG handle.
-    let external_interrupts = root_entropy.and_then(|root_entropy| {
-        // Every platform device shares one PLIC context, so the context
-        // is opened once and each device attaches its own source to it.
-        net::discover_plic_context(&fdt, bootstrap_processor.id()).map(|(plic, context)| {
-            let mut interrupts = net::ExternalInterrupts::new(plic, context);
-            // The device path's platform surface comes up with the
-            // controller and before any grant is published, which the
-            // registry enforces.
-            device::install_hooks(plic, context);
-            // The boot UART is a device the kernel drives itself: its
-            // PLIC source is enabled and prioritised like the virtio
-            // devices'. The handler masks the receive line at the port
-            // and raises the debug console's receive signal; the waiter
-            // re-arms the line while it listens.
-            if let Some(transport) = DEBUG_TRANSPORT.get().copied() {
-                interrupts.attach_debug_serial(
-                    transport.plic_source,
-                    DebugTransport::console().interrupt_handler::<DebugTransport>(),
-                );
-            }
-            if let Some(network) = net::install_network_service(&cpu, &kernel, &fdt, &debug_state) {
-                interrupts.attach_network(network);
-            }
-            if let Some(host_fs) = host_fs::install(&cpu, &fdt, &debug_state) {
-                interrupts.attach_host_fs(host_fs);
-            }
-            if let Some(entropy) = entropy_device {
-                entropy::install(&kernel, &entropy, root_entropy.clone());
-                interrupts.attach_entropy(entropy);
-            }
-            if let Some(balloon) =
-                balloon::install(&kernel, &fdt, debug_state.machine_generation_handle())
-            {
-                debug_state.install_memory_balloon(balloon.handle.clone());
-                interrupts.attach_balloon(balloon);
-            }
-            if let Some(vsock) = vsock::install(&kernel, &cpu, &fdt, &debug_state) {
-                interrupts.attach_vsock(vsock);
-            }
-            if let Some(display) = gpu::install(&cpu, &kernel, &fdt, &debug_state) {
-                interrupts.attach_display(display);
-            }
-            for device in input::install(&kernel, &fdt, &debug_state) {
-                interrupts.attach_input(device);
-            }
-            if let Some(sound) = snd::install(&kernel, &fdt, &debug_state) {
-                interrupts.attach_sound(sound);
-            }
-            for block in block::install(&cpu, &kernel, &fdt, &debug_state, root_entropy) {
-                interrupts.attach_block(block);
-            }
-            // Everything the kernel drives itself has claimed its
-            // source by now, so what the tree describes and nobody took
-            // is exactly what a driver plugin may be handed.
-            for (source, route) in device::publish_grants(&fdt, debug_state.device_grants()) {
-                interrupts.attach_device(source, route);
-            }
-            // The Sv48 address space reserves and commits lazily, so a page
-            // could be taken away here — but the backend has not wired the
-            // other half: no `SwapVmHooks` table, so a not-present PTE
-            // carries no swap token and the fault handler has nothing to
-            // look the page up by. Extending swap to this backend is #25's
-            // follow-up to #59.
-            helios_kernel::disable_swap(helios_kernel::SwapDisabled::NoSwapHooks);
-            interrupts
-        })
-    });
-    // The debug console's readers park on the UART's interrupt, so a
-    // machine that describes the UART but gives this hart no PLIC
-    // context to route it through would hang every serial read; refuse
-    // it here rather than at the first parked reader.
-    assert!(
-        current_hart != bootstrap_processor
-            || external_interrupts.is_some()
-            || DEBUG_TRANSPORT.get().is_none(),
-        "the device tree describes a debug UART but no PLIC supervisor-external context for \
-         hart {hart_id}; the serial line could only be polled"
-    );
+    if let Some(root_entropy) = root_entropy {
+        // A machine may carry several PLICs — QEMU's `virt` gives every
+        // socket its own and wires devices to different ones — so each
+        // PLIC is its own domain, taken by one hart with a context in
+        // it, and each device attaches to the domain its node's
+        // interrupt parent names.
+        let mut domains = net::InterruptDomains::discover(&fdt, bootstrap_processor);
+        // The device path's platform surface comes up before any grant
+        // is published, which the registry enforces.
+        device::install_hooks();
+        // The boot UART is a device the kernel drives itself: its
+        // PLIC source is enabled and prioritised like the virtio
+        // devices'. The handler masks the receive line at the port
+        // and raises the debug console's receive signal; the waiter
+        // re-arms the line while it listens.
+        if let Some(transport) = DEBUG_TRANSPORT.get().copied() {
+            // The debug console's readers park on the UART's interrupt,
+            // so a UART on a controller no hart takes interrupts from
+            // would hang every serial read; refuse it here rather than
+            // at the first parked reader.
+            assert!(
+                domains.takes(transport.plic_line.controller),
+                "the device tree wires the debug UART to the interrupt controller at {:#x}, in \
+                 which no hart has a PLIC supervisor-external context; the serial line could \
+                 only be polled",
+                transport.plic_line.controller.base()
+            );
+            domains.attach_debug_serial(
+                transport.plic_line,
+                DebugTransport::console().interrupt_handler::<DebugTransport>(),
+            );
+        }
+        if let Some(network) = net::install_network_service(&cpu, &kernel, &fdt, &debug_state) {
+            domains.attach_network(network);
+        }
+        if let Some(host_fs) = host_fs::install(&cpu, &fdt, &debug_state) {
+            domains.attach_host_fs(host_fs);
+        }
+        if let Some(entropy) = entropy_device {
+            entropy::install(&kernel, &entropy, root_entropy.clone());
+            domains.attach_entropy(entropy);
+        }
+        if let Some(balloon) =
+            balloon::install(&kernel, &fdt, debug_state.machine_generation_handle())
+        {
+            debug_state.install_memory_balloon(balloon.handle.clone());
+            domains.attach_balloon(balloon);
+        }
+        if let Some(vsock) = vsock::install(&kernel, &cpu, &fdt, &debug_state) {
+            domains.attach_vsock(vsock);
+        }
+        if let Some(display) = gpu::install(&cpu, &kernel, &fdt, &debug_state) {
+            domains.attach_display(display);
+        }
+        for device in input::install(&kernel, &fdt, &debug_state) {
+            domains.attach_input(device);
+        }
+        if let Some(sound) = snd::install(&kernel, &fdt, &debug_state) {
+            domains.attach_sound(sound);
+        }
+        for block in block::install(&cpu, &kernel, &fdt, &debug_state, root_entropy) {
+            domains.attach_block(block);
+        }
+        // Everything the kernel drives itself has claimed its
+        // source by now, so what the tree describes and nobody took
+        // is exactly what a driver plugin may be handed.
+        let grants = device::publish_grants(&fdt, debug_state.device_grants(), &domains);
+        for (line, route) in grants {
+            domains.attach_device(line, route);
+        }
+        // Every route is in place, and no secondary hart has been
+        // started: each takes its domains from the published table when
+        // it builds its runtime below.
+        net::publish_interrupt_domains(domains);
+        // The Sv48 address space reserves and commits lazily, so a page
+        // could be taken away here — but the backend has not wired the
+        // other half: no `SwapVmHooks` table, so a not-present PTE
+        // carries no swap token and the fault handler has nothing to
+        // look the page up by. Extending swap to this backend is #25's
+        // follow-up to #59.
+        helios_kernel::disable_swap(helios_kernel::SwapDisabled::NoSwapHooks);
+    }
     let mut hart_runtime = HartRuntime {
         trap_stack: trap::allocate_trap_stack(),
         guest_stack_limit: AtomicUsize::new(usize::MAX),
         hart_id: current_hart,
         timer: kernel.timer(),
         wasmtime_tls: WasmtimeTlsSlots::new(),
-        external_interrupts,
+        external_interrupts: net::HartInterrupts::of(current_hart),
         program_service: None,
         hand_over_stack: trap::allocate_trap_stack(),
         hand_over_probe: trap::HandOverProbe::new(),

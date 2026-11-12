@@ -39,8 +39,9 @@ pub use bus::{
     OffsetDmaBuffer, OffsetDmaPool, PlatformDmaBuffer, PlatformDmaPool,
 };
 pub use discovery::{
-    InterruptTrigger, MmioCandidate, MmioInterrupt, NodeInterrupt, mmio_candidates,
-    mmio_device_matches, node_interrupt, node_interrupt_kind,
+    InterruptController, InterruptTrigger, MmioCandidate, MmioInterrupt, NodeInterrupt,
+    PlicDescription, PlicHartContext, mmio_candidates, mmio_device_matches, node_interrupt,
+    node_interrupt_kind, plic_descriptions,
 };
 pub use features::{
     NegotiatedFeatures, RING_FEATURES, RenegotiateError, negotiate, negotiate_with, renegotiate,

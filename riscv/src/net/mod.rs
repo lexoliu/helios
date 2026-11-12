@@ -1,23 +1,24 @@
 extern crate alloc;
 
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::num::NonZeroU32;
 
 use fdt::Fdt;
-use fdt::node::FdtNode;
-use helios_hal::cpu::Cpu;
+use helios_hal::cpu::{Cpu, ProcessorId};
 use helios_hal::io::IoError;
 use helios_hal::watchdog::Watchdog;
 use helios_kernel::{
-    DebugSerialInterrupt, ExternalInterruptHandler, ExternalInterruptRoutes, InterfaceCapabilities,
-    InterfaceEventMark, Kernel, LinkState, NetworkDevice, PacketBuffer,
+    DebugSerialInterrupt, DeviceInterruptRoute, ExternalInterruptHandler, ExternalInterruptRoutes,
+    GrantInterrupt, InterfaceCapabilities, InterfaceEventMark, Kernel, LinkState, NetworkDevice,
+    PacketBuffer,
 };
+use helios_virtio::{InterruptController, MmioInterrupt};
 use plic::Plic;
+use spin::{Mutex, Once};
 
 use crate::RiscvCpu;
 use crate::debug_state::RuntimeState;
-
-const SUPERVISOR_EXTERNAL_INTERRUPT: u32 = 9;
 
 type RiscvVirtioNetTransport = helios_virtio::VirtioMmioTransport<helios_virtio::MmioBus>;
 type RiscvVirtioNetDevice = helios_virtio::VirtioNetDevice<RiscvVirtioNetTransport>;
@@ -27,10 +28,10 @@ pub(crate) struct VirtioNetworkDevice {
     inner: Arc<RiscvVirtioNetDevice>,
     /// Held so the interrupt handler can steer by IPI.
     ///
-    /// The PLIC source is enabled on the bootstrap hart's context
-    /// alone, so every queue pair's completions are noticed there
-    /// whichever hart owns them. Waking the owners is the only steering
-    /// a single-source transport can do.
+    /// The transport has one interrupt line, and the hart that takes
+    /// its PLIC's interrupts notices every queue pair's completions
+    /// whichever hart owns the pair. Waking the owners is the only
+    /// steering a single-source transport can do.
     cpu: RiscvCpu,
 }
 
@@ -39,22 +40,89 @@ pub(crate) struct VirtioNetworkDevice {
 /// raises the debug console's receive signal.
 type DebugSerialHandler = DebugSerialInterrupt<crate::DebugTransport>;
 
+type DeviceRoutes = ExternalInterruptRoutes<
+    InterruptSourceId,
+    VirtioNetworkDevice,
+    crate::host_fs::HostFsTransportService,
+    crate::entropy::VirtioEntropyDevice,
+    crate::balloon::VirtioBalloonInterrupt,
+    crate::vsock::VirtioVsockDevice,
+    crate::gpu::VirtioDisplayDevice,
+    crate::input::VirtioInputDevice,
+    crate::snd::VirtioSoundDevice,
+    crate::block::VirtioBlockDevice,
+    DebugSerialHandler,
+>;
+
+/// Bits of a granted device's [`GrantInterrupt`] that carry its PLIC
+/// source; the bits above them carry the index of the source's
+/// [`ExternalInterrupts`] domain in [`InterruptDomains`].
+///
+/// The PLIC numbers its sources 1 to 1023, ID 0 meaning "no interrupt"
+/// (RISC-V PLIC Specification 1.0.0, "Interrupt Identifiers" and
+/// "Memory Map"), so ten bits hold any of them. The kernel treats a grant's interrupt number as opaque
+/// and hands it back unchanged to the `mask` and `unmask` hooks, which
+/// is what lets the backend fold the controller in: a bare source
+/// number is unique on one PLIC only. With one PLIC the encoding is the
+/// source number itself.
+const GRANT_SOURCE_BITS: u32 = 10;
+
+/// The machine's interrupt domains, from the moment the bootstrap hart
+/// has attached every device until the machine stops.
+///
+/// A static because the device path's masking hooks are plain function
+/// pointers by design (`DeviceInterruptHooks`), and they act on the
+/// domain a granted source belongs to. The harts reach it through
+/// [`HartInterrupts`], handed to each one's runtime when it is built.
+static INTERRUPT_DOMAINS: Once<InterruptDomains> = Once::new();
+
+/// One PLIC's interrupt domain: the controller, the context of the hart
+/// that takes its interrupts, and the routes of every device wired to
+/// it.
+///
+/// # Concurrency contract
+///
+/// Built on the bootstrap hart while no other hart runs kernel code:
+/// devices attach through `&mut self`, which sets their priorities,
+/// enables them on `context` and opens its threshold. Then moved into
+/// [`INTERRUPT_DOMAINS`] by [`publish_interrupt_domains`], and never
+/// mutated again except through the PLIC's own registers.
+///
+/// Afterwards `hart` alone claims and completes on `context`, from its
+/// supervisor-external trap, and so it alone runs the route handlers.
+/// When `hart` is not the bootstrap hart that is a hart other than the
+/// one that brought the devices up; every handler here is `Send + Sync`
+/// (the static requires it) and wakes its device's owners by `Notify`
+/// or IPI, which reach a task wherever it runs.
+///
+/// The enable words are written from any hart — a granted device's
+/// owner masks and unmasks from wherever its task runs, and `mask` also
+/// runs in `hart`'s interrupt context — always through
+/// [`Self::set_source_enabled`].
 pub(crate) struct ExternalInterrupts {
     plic: &'static Plic,
+    controller: InterruptController,
+    hart: ProcessorId,
     context: PlicContext,
-    routes: ExternalInterruptRoutes<
-        InterruptSourceId,
-        VirtioNetworkDevice,
-        crate::host_fs::HostFsTransportService,
-        crate::entropy::VirtioEntropyDevice,
-        crate::balloon::VirtioBalloonInterrupt,
-        crate::vsock::VirtioVsockDevice,
-        crate::gpu::VirtioDisplayDevice,
-        crate::input::VirtioInputDevice,
-        crate::snd::VirtioSoundDevice,
-        crate::block::VirtioBlockDevice,
-        DebugSerialHandler,
-    >,
+    /// Serialises this PLIC's enable words.
+    ///
+    /// `plic::Plic::enable` and `disable` are a read-modify-write of the
+    /// 32-bit word that carries a source's enable bit, and that word
+    /// covers thirty-two sources. Two harts touching two different
+    /// sources in the same word therefore race, and one of them loses
+    /// its bit — a granted device that stops delivering, or worse, a
+    /// kernel device that does. Each PLIC has its own words, so each
+    /// domain has its own lock; only `context`'s words are ever written.
+    ///
+    /// The lock is taken with interrupts masked on the local hart
+    /// because one of the writers is a granted device's `mask`, which
+    /// runs in interrupt context: a task holding this lock and then
+    /// interrupted into `mask` on its own hart would spin on itself.
+    enable_words: Mutex<()>,
+    /// Whether any device is routed here. A PLIC nothing is wired to
+    /// keeps its sources disabled and its taking hart never visits it.
+    routed: bool,
+    routes: DeviceRoutes,
 }
 
 impl ExternalInterruptHandler for VirtioNetworkDevice {
@@ -69,10 +137,34 @@ pub(crate) struct PlicContext(pub(crate) usize);
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct InterruptSourceId(pub(crate) NonZeroU32);
 
+/// One device's interrupt line: the PLIC its node's interrupt parent
+/// names, and the source number on that PLIC.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PlicInterrupt {
+    pub(crate) controller: InterruptController,
+    pub(crate) source: InterruptSourceId,
+}
+
+impl PlicInterrupt {
+    /// The line a decoded `interrupts` specifier names. `None` for
+    /// source 0, which the PLIC reserves for "no interrupt".
+    pub(crate) fn from_specifier(interrupt: MmioInterrupt) -> Option<Self> {
+        NonZeroU32::new(interrupt.number).map(|number| Self {
+            controller: interrupt.controller,
+            source: InterruptSourceId(number),
+        })
+    }
+
+    /// The source number, for the bring-up log.
+    pub(crate) fn number(self) -> u32 {
+        self.source.0.get()
+    }
+}
+
 /// The network device the bootstrap hart brought up, together with the
-/// PLIC source the device tree routes it to.
+/// PLIC line the device tree routes it to.
 pub(crate) struct NetworkInterrupt {
-    source: InterruptSourceId,
+    line: PlicInterrupt,
     device: VirtioNetworkDevice,
 }
 
@@ -90,7 +182,7 @@ where
     // advertising more pairs than the machine has harts is clamped to
     // what has a pump rather than left to collect frames nobody drains.
     let pair_budget = helios_virtio::QueuePairBudget::new(cpu.processor_count());
-    let Some((device, source)) = discover_network_device(cpu, fdt, pair_budget) else {
+    let Some((device, line)) = discover_network_device(cpu, fdt, pair_budget) else {
         tracing::warn!("virtio network device was not discovered on the platform bus");
         return None;
     };
@@ -99,116 +191,315 @@ where
         pair_budget = pair_budget.get(),
         queue_pairs = device.queue_pair_count(),
         "virtio network online irq={}",
-        source.0.get()
+        line.number()
     );
-    Some(NetworkInterrupt { source, device })
+    Some(NetworkInterrupt { line, device })
 }
 
 impl ExternalInterrupts {
-    /// Opens the bootstrap hart's PLIC context. Devices attach to it as
-    /// they come up; a source with no route reaching `handle` is a
-    /// bring-up bug and panics there.
-    pub(crate) fn new(plic: &'static Plic, context: PlicContext) -> Self {
+    /// Opens `hart`'s `context` on `plic`. Devices attach to it as they
+    /// come up; a source with no route reaching `handle` is a bring-up
+    /// bug and panics there.
+    fn new(
+        plic: &'static Plic,
+        controller: InterruptController,
+        hart: ProcessorId,
+        context: PlicContext,
+    ) -> Self {
         Self {
             plic,
+            controller,
+            hart,
             context,
+            enable_words: Mutex::new(()),
+            routed: false,
             routes: ExternalInterruptRoutes::new(),
         }
     }
 
-    pub(crate) fn attach_network(&mut self, interrupt: NetworkInterrupt) {
-        self.enable_source(interrupt.source);
-        self.routes.add_network(interrupt.source, interrupt.device);
-    }
-
-    pub(crate) fn attach_host_fs(&mut self, interrupt: crate::host_fs::HostFsInterrupt) {
-        self.enable_source(interrupt.source);
-        self.routes
-            .set_host_fs(interrupt.source, interrupt.transport);
-    }
-
-    pub(crate) fn attach_vsock(&mut self, interrupt: crate::vsock::VsockInterrupt) {
-        self.enable_source(interrupt.source);
-        self.routes.set_vsock(interrupt.source, interrupt.device);
-    }
-
-    pub(crate) fn attach_display(&mut self, interrupt: crate::gpu::DisplayInterrupt) {
-        self.enable_source(interrupt.source);
-        self.routes.set_display(interrupt.source, interrupt.device);
-    }
-
-    pub(crate) fn attach_input(&mut self, interrupt: crate::input::InputInterrupt) {
-        self.enable_source(interrupt.source);
-        self.routes.add_input(interrupt.source, interrupt.device);
-    }
-
-    pub(crate) fn attach_sound(&mut self, interrupt: crate::snd::SoundInterrupt) {
-        self.enable_source(interrupt.source);
-        self.routes.set_sound(interrupt.source, interrupt.device);
-    }
-
-    pub(crate) fn attach_entropy(&mut self, interrupt: crate::entropy::EntropyInterrupt) {
-        self.enable_source(interrupt.source);
-        self.routes.set_entropy(interrupt.source, interrupt.device);
-    }
-
-    pub(crate) fn attach_balloon(&mut self, interrupt: crate::balloon::BalloonInterrupt) {
-        self.enable_source(interrupt.source);
-        self.routes.set_balloon(interrupt.source, interrupt.handler);
-    }
-
-    pub(crate) fn attach_block(&mut self, interrupt: crate::block::BlockInterrupt) {
-        self.enable_source(interrupt.source);
-        self.routes.add_block(interrupt.source, interrupt.device);
-    }
-
-    /// Route the debug UART's source; the handler masks the port's
-    /// receive line and raises the debug console's receive signal in
-    /// interrupt context.
-    pub(crate) fn attach_debug_serial(
-        &mut self,
-        source: InterruptSourceId,
-        handler: DebugSerialHandler,
-    ) {
-        self.enable_source(source);
-        self.routes.set_debug_serial(source, handler);
-    }
-
-    fn enable_source(&self, source: InterruptSourceId) {
+    /// Give `source` a priority, enable it on the taking context and
+    /// open the context's threshold.
+    fn enable_source(&mut self, source: InterruptSourceId) {
         self.plic.set_priority(source, 1);
-        // Through the device path's guarded accessor, because that is
-        // the one place that owns the read-modify-write of a PLIC
-        // enable word — see its comment. A kernel device brought up
-        // while a granted one is being masked would otherwise lose a
-        // bit to it.
-        crate::device::set_source_enabled(self.plic, self.context, source, true);
+        self.set_source_enabled(source, true);
         self.plic.set_threshold(self.context, 0);
+        self.routed = true;
     }
 
-    /// Route a source a user-mode driver owns.
-    ///
-    /// Unlike every other attach, the source is left disabled: the
-    /// grant's owner arms it with its own `unmask`, and until something
-    /// owns the device an interrupt would have nowhere to go.
-    pub(crate) fn attach_device(
-        &mut self,
-        source: InterruptSourceId,
-        route: helios_kernel::DeviceInterruptRoute,
-    ) {
-        self.plic.set_threshold(self.context, 0);
-        self.routes.add_device(source, route);
+    /// Arm or hold off one source on the taking context, without
+    /// disturbing the thirty-one that share its enable word.
+    pub(crate) fn set_source_enabled(&self, source: InterruptSourceId, enabled: bool) {
+        critical_section::with(|_| {
+            let _words = self.enable_words.lock();
+            if enabled {
+                self.plic.enable(source, self.context);
+            } else {
+                self.plic.disable(source, self.context);
+            }
+        });
     }
 
-    pub(crate) fn handle(&self) {
+    /// Claim, dispatch and complete every source pending on the taking
+    /// context. Runs on the taking hart only, in its supervisor-external
+    /// trap.
+    fn handle(&self) {
         while let Some(source) = self.plic.claim(self.context) {
             let source = InterruptSourceId(source);
             assert!(
                 self.routes.route(source),
-                "unexpected external interrupt source={} on PLIC context={}",
+                "unexpected external interrupt source={} on the PLIC at {:#x}, context={}",
                 source.0.get(),
+                self.controller.base(),
                 self.context.0
             );
             self.plic.complete(self.context, source);
+        }
+    }
+}
+
+/// Every PLIC domain on the machine, one per controller a hart can take
+/// interrupts from.
+///
+/// # Concurrency contract
+///
+/// The bootstrap hart discovers the domains and attaches every device
+/// to the domain of its line's controller while it is the only hart
+/// running kernel code, then publishes the whole table once, before it
+/// starts any secondary hart. From then on the table is immutable:
+/// each hart's trap reads the domains it takes with no lock, and the
+/// grant hooks read the one a granted source belongs to.
+///
+/// A source enabled during bring-up on a context whose hart is not yet
+/// running stays pending there: that hart takes no external interrupt
+/// until it has installed its runtime, which carries the published
+/// table, and enabled its own `sie.SEIE`.
+pub(crate) struct InterruptDomains {
+    /// Indexed by the domain number a granted source's
+    /// [`GrantInterrupt`] carries, so never reordered.
+    domains: Vec<ExternalInterrupts>,
+}
+
+impl InterruptDomains {
+    /// One domain for every PLIC in which some hart has a
+    /// supervisor-external context, taken by the hart
+    /// [`helios_virtio::plic_descriptions`] chooses.
+    ///
+    /// A PLIC no hart has a supervisor context in has no domain, so a
+    /// device wired to it fails at attach rather than never
+    /// interrupting.
+    pub(crate) fn discover(fdt: &Fdt<'_>, bootstrap_hart: ProcessorId) -> Self {
+        let domains = helios_virtio::plic_descriptions(fdt, bootstrap_hart.id())
+            .filter_map(|plic| {
+                let taking = plic.taking?;
+                // SAFETY: the device tree names this window as a PLIC's
+                // registers, and the kernel's identity map covers the
+                // platform's MMIO.
+                let registers = unsafe { Plic::from_addr(plic.controller.base()) };
+                Some(ExternalInterrupts::new(
+                    registers,
+                    plic.controller,
+                    ProcessorId::new(taking.hart),
+                    PlicContext(taking.context),
+                ))
+            })
+            .collect();
+        Self { domains }
+    }
+
+    /// Whether some hart takes `controller`'s interrupts.
+    pub(crate) fn takes(&self, controller: InterruptController) -> bool {
+        self.index_of(controller).is_some()
+    }
+
+    fn index_of(&self, controller: InterruptController) -> Option<usize> {
+        self.domains
+            .iter()
+            .position(|domain| domain.controller == controller)
+    }
+
+    fn domain_mut(&mut self, line: PlicInterrupt, device: &str) -> &mut ExternalInterrupts {
+        let index = self.index_of(line.controller).unwrap_or_else(|| {
+            panic!(
+                "{device} is wired to the interrupt controller at {:#x}, in which no hart has a \
+                 PLIC supervisor-external context",
+                line.controller.base()
+            )
+        });
+        &mut self.domains[index]
+    }
+
+    /// Enable `line` on its domain's taking context and hand its route
+    /// to `route`.
+    fn attach(
+        &mut self,
+        line: PlicInterrupt,
+        device: &str,
+        route: impl FnOnce(&mut DeviceRoutes, InterruptSourceId),
+    ) {
+        let domain = self.domain_mut(line, device);
+        domain.enable_source(line.source);
+        route(&mut domain.routes, line.source);
+    }
+
+    pub(crate) fn attach_network(&mut self, interrupt: NetworkInterrupt) {
+        self.attach(interrupt.line, "virtio-net", |routes, source| {
+            routes.add_network(source, interrupt.device);
+        });
+    }
+
+    pub(crate) fn attach_host_fs(&mut self, interrupt: crate::host_fs::HostFsInterrupt) {
+        self.attach(interrupt.line, "virtio-9p", |routes, source| {
+            routes.set_host_fs(source, interrupt.transport);
+        });
+    }
+
+    pub(crate) fn attach_vsock(&mut self, interrupt: crate::vsock::VsockInterrupt) {
+        self.attach(interrupt.line, "virtio-vsock", |routes, source| {
+            routes.set_vsock(source, interrupt.device);
+        });
+    }
+
+    pub(crate) fn attach_display(&mut self, interrupt: crate::gpu::DisplayInterrupt) {
+        self.attach(interrupt.line, "virtio-gpu", |routes, source| {
+            routes.set_display(source, interrupt.device);
+        });
+    }
+
+    pub(crate) fn attach_input(&mut self, interrupt: crate::input::InputInterrupt) {
+        self.attach(interrupt.line, "virtio-input", |routes, source| {
+            routes.add_input(source, interrupt.device);
+        });
+    }
+
+    pub(crate) fn attach_sound(&mut self, interrupt: crate::snd::SoundInterrupt) {
+        self.attach(interrupt.line, "virtio-snd", |routes, source| {
+            routes.set_sound(source, interrupt.device);
+        });
+    }
+
+    pub(crate) fn attach_entropy(&mut self, interrupt: crate::entropy::EntropyInterrupt) {
+        self.attach(interrupt.line, "virtio-rng", |routes, source| {
+            routes.set_entropy(source, interrupt.device);
+        });
+    }
+
+    pub(crate) fn attach_balloon(&mut self, interrupt: crate::balloon::BalloonInterrupt) {
+        self.attach(interrupt.line, "virtio-balloon", |routes, source| {
+            routes.set_balloon(source, interrupt.handler);
+        });
+    }
+
+    pub(crate) fn attach_block(&mut self, interrupt: crate::block::BlockInterrupt) {
+        self.attach(interrupt.line, "virtio-blk", |routes, source| {
+            routes.add_block(source, interrupt.device);
+        });
+    }
+
+    /// Route the debug UART's line; the handler masks the port's
+    /// receive line and raises the debug console's receive signal in
+    /// interrupt context.
+    pub(crate) fn attach_debug_serial(&mut self, line: PlicInterrupt, handler: DebugSerialHandler) {
+        self.attach(line, "the debug UART", |routes, source| {
+            routes.set_debug_serial(source, handler);
+        });
+    }
+
+    /// Route a line a user-mode driver owns.
+    ///
+    /// Unlike every other attach, the source is given a priority and
+    /// left disabled: the grant's owner arms it with its own `unmask`,
+    /// and until something owns the device an interrupt would have
+    /// nowhere to go.
+    pub(crate) fn attach_device(&mut self, line: PlicInterrupt, route: DeviceInterruptRoute) {
+        let domain = self.domain_mut(line, "a granted device");
+        domain.plic.set_priority(line.source, 1);
+        domain.set_source_enabled(line.source, false);
+        domain.plic.set_threshold(domain.context, 0);
+        domain.routed = true;
+        domain.routes.add_device(line.source, route);
+    }
+
+    /// The number a grant for `line` carries: its domain's index above
+    /// [`GRANT_SOURCE_BITS`], its source below. `None` when no hart
+    /// takes `line`'s controller, so the device cannot interrupt.
+    pub(crate) fn grant_interrupt(&self, line: PlicInterrupt) -> Option<GrantInterrupt> {
+        let index = u32::try_from(self.index_of(line.controller)?)
+            .unwrap_or_else(|_| panic!("the machine has more PLIC domains than a u32 indexes"));
+        let source = line.number();
+        assert!(
+            source >> GRANT_SOURCE_BITS == 0,
+            "PLIC source {source} is beyond the 1023 a PLIC numbers"
+        );
+        Some(GrantInterrupt::new((index << GRANT_SOURCE_BITS) | source))
+    }
+
+    /// The domain and source a [`Self::grant_interrupt`] number names.
+    pub(crate) fn granted_source(&self, raw: u32) -> (&ExternalInterrupts, InterruptSourceId) {
+        let domain = self
+            .domains
+            .get((raw >> GRANT_SOURCE_BITS) as usize)
+            .unwrap_or_else(|| panic!("granted interrupt {raw:#x} names no PLIC domain"));
+        let source = NonZeroU32::new(raw & ((1 << GRANT_SOURCE_BITS) - 1))
+            .unwrap_or_else(|| panic!("granted interrupt {raw:#x} names PLIC source 0"));
+        (domain, InterruptSourceId(source))
+    }
+
+    fn taken_by(&self, hart: ProcessorId) -> impl Iterator<Item = &ExternalInterrupts> + '_ {
+        self.domains
+            .iter()
+            .filter(move |domain| domain.routed && domain.hart == hart)
+    }
+}
+
+/// Publish the machine's domains. Called once, by the bootstrap hart,
+/// after every device has attached and before any secondary is started.
+pub(crate) fn publish_interrupt_domains(domains: InterruptDomains) {
+    assert!(
+        INTERRUPT_DOMAINS.get().is_none(),
+        "the interrupt domains were published more than once"
+    );
+    INTERRUPT_DOMAINS.call_once(|| domains);
+}
+
+/// The published domains.
+///
+/// # Panics
+///
+/// Before [`publish_interrupt_domains`]: a hart building its runtime, or
+/// a granted device masked, before the bootstrap hart finished bring-up
+/// would otherwise miss every route.
+pub(crate) fn interrupt_domains() -> &'static InterruptDomains {
+    INTERRUPT_DOMAINS
+        .get()
+        .expect("the interrupt domains were reached before the bootstrap hart published them")
+}
+
+/// The domains one hart takes, as its supervisor-external trap reaches
+/// them. `None` when the hart takes none, so an external interrupt
+/// reaching it is a bring-up bug.
+#[derive(Clone, Copy)]
+pub(crate) struct HartInterrupts {
+    domains: &'static InterruptDomains,
+    hart: ProcessorId,
+}
+
+impl HartInterrupts {
+    pub(crate) fn of(hart: ProcessorId) -> Option<Self> {
+        let domains = interrupt_domains();
+        domains
+            .taken_by(hart)
+            .next()
+            .is_some()
+            .then_some(Self { domains, hart })
+    }
+
+    /// Claim and dispatch everything pending on every domain this hart
+    /// takes. The PLIC raises `sip.SEIP` while any of them has a source
+    /// pending on this hart's context, so each is drained before the
+    /// trap returns.
+    pub(crate) fn handle(&self) {
+        for domain in self.domains.taken_by(self.hart) {
+            domain.handle();
         }
     }
 }
@@ -344,17 +635,16 @@ fn discover_network_device(
     cpu: &RiscvCpu,
     fdt: &Fdt<'_>,
     pair_budget: helios_virtio::QueuePairBudget,
-) -> Option<(VirtioNetworkDevice, InterruptSourceId)> {
+) -> Option<(VirtioNetworkDevice, PlicInterrupt)> {
     let candidate = helios_virtio::mmio_candidates(fdt).find(|candidate| {
         crate::matches_virtio_mmio_device(candidate.base, helios_virtio::DeviceType::Network)
     })?;
     let base = candidate.base;
     let header = core::ptr::NonNull::new(base as *mut u8)
         .unwrap_or_else(|| panic!("virtio MMIO base {base:#x} was unexpectedly null"));
-    let irq_source = candidate
+    let line = candidate
         .interrupt
-        .and_then(|interrupt| NonZeroU32::new(interrupt.number))
-        .map(InterruptSourceId)
+        .and_then(PlicInterrupt::from_specifier)
         .unwrap_or_else(|| panic!("virtio-net node at {base:#x} has no valid interrupt source"));
     let device = unsafe { helios_virtio::net_from_mmio(header, candidate.size, pair_budget) }
         .unwrap_or_else(|error| {
@@ -365,117 +655,6 @@ fn discover_network_device(
             inner: Arc::new(device),
             cpu: cpu.clone(),
         },
-        irq_source,
+        line,
     ))
-}
-
-pub(crate) fn discover_plic_context(
-    fdt: &Fdt<'_>,
-    hart_id: u16,
-) -> Option<(&'static Plic, PlicContext)> {
-    // A machine may carry several PLICs (QEMU `virt` gives each socket its
-    // own); the hart's supervisor-external context lives in exactly one.
-    fdt.all_nodes()
-        .filter(|node| {
-            node.compatible().is_some_and(|compatible| {
-                compatible
-                    .all()
-                    .any(|name| matches!(name, "sifive,plic-1.0.0" | "riscv,plic0"))
-            })
-        })
-        .find_map(|node| {
-            let context = parse_plic_context(fdt, node, hart_id)?;
-            let base = node.reg()?.next()?.starting_address as usize;
-            Some((unsafe { Plic::from_addr(base) }, context))
-        })
-}
-
-fn parse_plic_context(fdt: &Fdt<'_>, node: FdtNode<'_, '_>, hart_id: u16) -> Option<PlicContext> {
-    let interrupts_extended = node.property("interrupts-extended")?;
-    let mut cells = interrupts_extended
-        .value
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|&cell| u32::from_be_bytes(cell));
-    let mut index = 0usize;
-
-    while let Some(phandle) = cells.next() {
-        let controller = fdt.find_phandle(phandle).unwrap_or_else(|| {
-            panic!("PLIC references unknown interrupt controller phandle {phandle}")
-        });
-        let interrupt_cells = controller.interrupt_cells().unwrap_or_else(|| {
-            panic!("interrupt controller phandle {phandle} is missing #interrupt-cells")
-        });
-        let spec = cells
-            .next()
-            .unwrap_or_else(|| panic!("PLIC interrupts-extended truncated for phandle {phandle}"));
-        for _ in 1..interrupt_cells {
-            let _ = cells.next().unwrap_or_else(|| {
-                panic!("PLIC interrupts-extended truncated extra cells for phandle {phandle}")
-            });
-        }
-        if controller_hart_id(fdt, phandle) == Some(hart_id)
-            && spec == SUPERVISOR_EXTERNAL_INTERRUPT
-        {
-            return Some(PlicContext(index));
-        }
-        index = index.saturating_add(1);
-    }
-
-    None
-}
-
-fn controller_hart_id(fdt: &Fdt<'_>, phandle: u32) -> Option<u16> {
-    let cpus = fdt.find_node("/cpus")?;
-    let address_cells = cpus.cell_sizes().address_cells;
-
-    for cpu in cpus.children() {
-        if cpu
-            .property("device_type")
-            .is_none_or(|property| property.value != b"cpu\0")
-        {
-            continue;
-        }
-
-        let hart = parse_cpu_hart_id(cpu, address_cells)?;
-        for child in cpu.children() {
-            if child.property("interrupt-controller").is_none() {
-                continue;
-            }
-            if node_phandle(child) == Some(phandle) {
-                return Some(hart);
-            }
-        }
-    }
-    None
-}
-
-fn node_phandle(node: FdtNode<'_, '_>) -> Option<u32> {
-    node.property("phandle")
-        .or_else(|| node.property("linux,phandle"))
-        .map(|property| read_be_u32(property.value))
-}
-
-fn parse_cpu_hart_id(node: FdtNode<'_, '_>, address_cells: usize) -> Option<u16> {
-    let reg = node.property("reg")?;
-    let hart = match address_cells {
-        1 => read_be_u32(reg.value) as usize,
-        2 => {
-            let high = read_be_u32(&reg.value[..4]) as u64;
-            let low = read_be_u32(&reg.value[4..8]) as u64;
-            ((high << 32) | low) as usize
-        }
-        cells => panic!("unsupported CPU address-cells value {cells}"),
-    };
-    Some(hart as u16)
-}
-
-fn read_be_u32(bytes: &[u8]) -> u32 {
-    let bytes: [u8; 4] = bytes
-        .get(..4)
-        .unwrap_or_else(|| panic!("expected a 4-byte device-tree cell"))
-        .try_into()
-        .unwrap_or_else(|_| panic!("expected a 4-byte device-tree cell"));
-    u32::from_be_bytes(bytes)
 }

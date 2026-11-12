@@ -7,13 +7,12 @@
 //!
 //! Concurrency contract: the devices are discovered and programmed on
 //! the bootstrap hart before external interrupts are unmasked, and their
-//! completions arrive on the PLIC sources the device tree names, so
+//! completions arrive on the PLIC lines the device tree names, so
 //! every reader parks on a notification rather than polling a used ring.
 
 extern crate alloc;
 
 use alloc::vec::Vec;
-use core::num::NonZeroU32;
 
 use fdt::Fdt;
 use helios_hal::fs::BlockDeviceRights;
@@ -21,7 +20,7 @@ use helios_kernel::ExternalInterruptHandler;
 
 use crate::RiscvCpu;
 use crate::debug_state::RuntimeState;
-use crate::net::InterruptSourceId;
+use crate::net::PlicInterrupt;
 
 type RiscvVirtioBlockDevice =
     helios_virtio::VirtioMmioBlockDevice<RiscvCpu, helios_kernel::BlockPages>;
@@ -32,9 +31,9 @@ pub(crate) struct VirtioBlockDevice {
 }
 
 /// One block device the bootstrap hart brought up, together with the
-/// PLIC source the device tree routes it to.
+/// PLIC line the device tree routes it to.
 pub(crate) struct BlockInterrupt {
-    pub(crate) source: InterruptSourceId,
+    pub(crate) line: PlicInterrupt,
     pub(crate) device: VirtioBlockDevice,
 }
 
@@ -79,7 +78,7 @@ where
         },
     );
     for interrupt in &discovered {
-        tracing::info!(irq = interrupt.source.0.get(), "virtio block online");
+        tracing::info!(irq = interrupt.line.number(), "virtio block online");
     }
     discovered
 }
@@ -96,10 +95,9 @@ fn discover_block_devices(cpu: &RiscvCpu, fdt: &Fdt<'_>) -> Vec<BlockInterrupt> 
             let base = candidate.base;
             let header = core::ptr::NonNull::new(base as *mut u8)
                 .unwrap_or_else(|| panic!("virtio MMIO base {base:#x} was unexpectedly null"));
-            let source = candidate
+            let line = candidate
                 .interrupt
-                .and_then(|interrupt| NonZeroU32::new(interrupt.number))
-                .map(InterruptSourceId)
+                .and_then(PlicInterrupt::from_specifier)
                 .unwrap_or_else(|| {
                     panic!("virtio-blk node at {base:#x} has no valid interrupt source")
                 });
@@ -115,7 +113,7 @@ fn discover_block_devices(cpu: &RiscvCpu, fdt: &Fdt<'_>) -> Vec<BlockInterrupt> 
                 panic!("failed to initialize virtio-blk device at {base:#x}: {error}")
             });
             BlockInterrupt {
-                source,
+                line,
                 device: VirtioBlockDevice { inner: device },
             }
         })
