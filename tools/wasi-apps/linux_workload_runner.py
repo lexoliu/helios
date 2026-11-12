@@ -65,6 +65,7 @@ class HostEndpoints:
     http_url: str | None = None
     tcp_host: str | None = None
     tcp_port: int | None = None
+    tcp_upload_port: int | None = None
     tcp_echo_port: int | None = None
 
 
@@ -224,6 +225,10 @@ def render(template: str, context: RenderContext, workload: dict) -> str:
         if hosts.tcp_port is None:
             raise SystemExit(f"workload {workload['name']} requires --host-tcp-port")
         rendered = rendered.replace("{host_tcp_port}", str(hosts.tcp_port))
+    if "{host_tcp_upload_port}" in rendered:
+        if hosts.tcp_upload_port is None:
+            raise SystemExit(f"workload {workload['name']} requires --host-tcp-upload-port")
+        rendered = rendered.replace("{host_tcp_upload_port}", str(hosts.tcp_upload_port))
     if "{host_tcp_echo_port}" in rendered:
         if hosts.tcp_echo_port is None:
             raise SystemExit(f"workload {workload['name']} requires --host-tcp-echo-port")
@@ -517,6 +522,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--host-http-url")
     run_parser.add_argument("--host-tcp-host")
     run_parser.add_argument("--host-tcp-port", type=int)
+    run_parser.add_argument("--host-tcp-upload-port", type=int)
     run_parser.add_argument("--host-tcp-echo-port", type=int)
     run_parser.add_argument(
         "--keep-going",
@@ -548,7 +554,13 @@ def main() -> None:
         context = RenderContext(
             repo_root=root,
             wasmtime_bin=args.wasmtime_bin,
-            hosts=HostEndpoints(args.host_http_url, args.host_tcp_host, args.host_tcp_port, args.host_tcp_echo_port),
+            hosts=HostEndpoints(
+                args.host_http_url,
+                args.host_tcp_host,
+                args.host_tcp_port,
+                args.host_tcp_upload_port,
+                args.host_tcp_echo_port,
+            ),
             workdir=Path(tempfile.mkdtemp(prefix="helios-bench-")),
         )
         run_workloads(

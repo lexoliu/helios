@@ -558,12 +558,15 @@ where
         let mut waiter = registry.returns_waiter();
         loop {
             for returned in registry.take_returned() {
-                for id in &returned.ids {
-                    // The view ends and the window goes off the desktop;
-                    // the client's buffer goes back to its pool with the
-                    // view's reference.
-                    destroy_surface(accessor, &self.guest, *id).await?;
-                }
+                // The view ends and the window goes off the desktop;
+                // the client's buffer goes back to its pool with the
+                // view's reference.
+                destroy_surface(accessor, &self.guest, returned.id()).await?;
+                // Only now does the window's slot come back. A failure
+                // above ends this task and drops the guards it still
+                // holds, which releases them the way the dead
+                // compositor's windows are.
+                returned.drained();
             }
             core::future::poll_fn(|cx| registry.poll_returns(cx, &mut waiter)).await;
         }
