@@ -25,6 +25,7 @@ use triomphe::Arc;
 use crate::buffer::Buffer;
 use crate::component::ProviderReceiver;
 use crate::device::test_hooks;
+use crate::gpu::ScanoutHold;
 use crate::process::test_caps;
 use crate::test_support::TestCpu;
 
@@ -468,7 +469,7 @@ fn a_blob_surface_is_scanned_out_once_and_each_present_flushes_the_blob() {
                     generation,
                     scanout,
                     layout,
-                    hold: held_blob.hold_scanout(),
+                    hold: ScanoutHold::new(&held_blob),
                     reply,
                 },
                 answer,

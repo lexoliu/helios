@@ -168,15 +168,6 @@ impl BlobShared {
     pub fn is_scanned_out(&self) -> bool {
         self.scanouts.load(Ordering::Acquire) != 0
     }
-
-    /// Hold the blob for one scanout of it.
-    ///
-    /// Taken in the store step that checks the blob's session is open,
-    /// so a release that starts afterwards sees the hold.
-    pub fn hold_scanout(self: &Arc<Self>) -> ScanoutHold {
-        self.scanouts.fetch_add(1, Ordering::AcqRel);
-        ScanoutHold { blob: self.clone() }
-    }
 }
 
 /// One scanout's hold on a blob: the blob is not destroyed while it
@@ -186,6 +177,15 @@ pub struct ScanoutHold {
 }
 
 impl ScanoutHold {
+    /// Hold the blob for one scanout of it.
+    ///
+    /// Taken in the store step that checks the blob's session is open,
+    /// so a release that starts afterwards sees the hold.
+    pub fn new(blob: &Arc<BlobShared>) -> Self {
+        blob.scanouts.fetch_add(1, Ordering::AcqRel);
+        Self { blob: blob.clone() }
+    }
+
     /// The blob held.
     pub fn blob(&self) -> BlobId {
         self.blob.id

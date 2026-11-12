@@ -35,7 +35,7 @@ use crate::test_support::TestCpu;
 use super::owner::{gpu3d_channels, serve_control, serve_submit};
 use super::service::{
     BlobShared, BlobSpec, ContextShared, ControlMessage, Gpu3dRequest, Gpu3dSender, Gpu3dService,
-    Gpu3dShared, InlineCommands, SubmitCommands, SubmitMessage, SubmitRequest,
+    Gpu3dShared, InlineCommands, ScanoutHold, SubmitCommands, SubmitMessage, SubmitRequest,
 };
 use super::{
     ContextRecord, Gpu3dOwnership, Gpu3dServiceError, MAX_GPU_BLOBS, MAX_GPU_CONTEXTS,
@@ -1548,7 +1548,7 @@ fn a_scanned_out_blob_is_destroyed_only_once_the_scanout_lets_go() {
         .await
         .expect("the fake engine agrees");
         // What a blob surface carries while it is presented.
-        let scanout = blob.hold_scanout();
+        let scanout = ScanoutHold::new(&blob);
 
         // The handle goes first.
         queue_destroy(&ownership, blob.id()).await;
@@ -1581,7 +1581,7 @@ fn a_scanned_out_blob_is_destroyed_only_once_the_scanout_lets_go() {
         )
         .await
         .expect("the fake engine agrees");
-        let scanout = second.hold_scanout();
+        let scanout = ScanoutHold::new(&second);
         close(&mut ownership, &mut views);
         settle().await;
         assert!(!device.saw(&Call::DestroyBlob(second.id())));

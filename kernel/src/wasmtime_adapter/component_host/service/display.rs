@@ -750,7 +750,7 @@ where
                 if !data.device.gpu().is_current(blob.session) {
                     return Ok(Err(DisplayServiceError::StaleBlob));
                 }
-                Ok(Ok((blob.id, blob.shared.hold_scanout())))
+                Ok(Ok((blob.id, ScanoutHold::new(&blob.shared))))
             },
         )?;
         let (blob, hold) = match named {
