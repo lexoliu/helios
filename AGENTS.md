@@ -459,8 +459,8 @@ red lane names the surface that broke:
 
 | Lane | Runner | What it proves |
 | --- | --- | --- |
-| `check-host`, `check-aarch64`, `check-riscv`, `check-x86` | `ubuntu-24.04` | Every surface compiles. |
-| `lint-fmt`, `lint-host`, `lint-aarch64`, `lint-riscv`, `lint-x86` | `ubuntu-24.04` | Formatting, the `deny.toml` bans, and clippy at `-D warnings`. |
+| `check-host` | `ubuntu-24.04` | The host surfaces compile. |
+| `lint-fmt`, `lint-host`, `lint-aarch64`, `lint-riscv`, `lint-x86` | `ubuntu-24.04` | Formatting, the `deny.toml` bans, and clippy at `-D warnings`; a bare-metal lint lane is also that target's compile check, since clippy builds the packages `check-target` checks. |
 | `test-units`, `test-embedded-debugger` | `ubuntu-24.04` | Unit tests and the embedded debugger. |
 | `smoke-x86-64` | `ubuntu-24.04`, `--accel kvm` | Boot, shell, CPython, the in-kernel compiler, a trapped OOB load, curl over virtio-net, the raw serial captures. |
 | `smoke-riscv64` | `ubuntu-24.04`, `--accel tcg` | Boot, shell, CPython, a trapped OOB load, the inspector RPC over vsock, curl over virtio-net. |
@@ -472,6 +472,11 @@ nightly against `dev` and on `workflow_dispatch` for any ref, never on a
 pull request, because one unpaired run is no performance evidence (§3.6)
 and the lane is the heaviest job there is. A failed nightly run files a
 `bench`/`bug` issue, or comments on the one already open.
+
+A pull request runs only the lanes whose surfaces its change touches
+(`.github/ci-lanes.json`), and a draft runs `lint-fmt` alone until it is
+marked ready for review. Only the host lanes keep a Rust cache, and only
+a `dev` push writes it.
 
 Every lane runs on a Linux runner. macOS runners are not used: their queue
 dominates the run and nothing Helios ships targets macOS. Every boot in CI
