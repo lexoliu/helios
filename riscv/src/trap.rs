@@ -146,6 +146,95 @@ unsafe extern "C" {
     /// Raises the probe's interrupt and returning trap. `probe` is a
     /// [`HandOverProbe`]'s address.
     fn __helios_riscv_hand_over_probe_returning(probe: usize);
+    /// Restores the context `frame` holds, except `tp`, and returns into
+    /// it with the `SIE` the frame's `SPIE` records.
+    ///
+    /// # Safety
+    ///
+    /// `frame` must be a [`TrapFrame`] copy [`enter_swap_fault_trampoline`]
+    /// put on the stack this code is running on.
+    fn __helios_riscv_swap_fault_resume(frame: *mut TrapFrame) -> !;
+}
+
+/// Rewrites a saved context so the trap exit returns into
+/// [`swap_fault_trampoline`] on the faulting stack instead of retrying the
+/// faulting instruction.
+///
+/// A copy of the context goes one frame below the interrupted `sp`, which
+/// is free because the riscv psABI has no red zone, and the trampoline gets
+/// its address. The exit restores the frame, `sstatus` included, so the
+/// `sret` lands in the trampoline in supervisor mode with `SIE` as the
+/// faulting context had it, and hands `sscratch` back to the trap stack
+/// top: the trampoline runs outside a handler, and may block the fiber it
+/// runs on.
+///
+/// # Safety
+///
+/// `frame` must be the outermost frame the trap entry built (its exit
+/// hands `sscratch` back), and the `sp` it records must be a live stack
+/// with a frame's worth of room below it.
+pub(crate) unsafe fn enter_swap_fault_trampoline(
+    frame: &mut TrapFrame,
+    faulting_address: usize,
+    access: crate::vmm::FaultAccess,
+) {
+    let landing = (frame.general.sp - size_of::<TrapFrame>()) & !15;
+    // SAFETY: the caller's contract. The write lands on the faulting
+    // fiber's own stack below its `sp`; a fault on it is a demand commit of
+    // that stack, which a nested trap, its frame built on the trap stack,
+    // resolves and returns from.
+    unsafe {
+        (landing as *mut TrapFrame).write(*frame);
+    }
+    frame.general.a0 = landing;
+    frame.general.a1 = faulting_address;
+    frame.general.a2 = usize::from(access == crate::vmm::FaultAccess::Fetch);
+    frame.general.sp = landing;
+    frame.sepc = swap_fault_trampoline as *const () as usize;
+}
+
+/// Resolves a swapped-out page from the faulting context's own stack.
+///
+/// This runs in the fiber the fault interrupted, so it may block that
+/// fiber exactly as an async host call does: the executor keeps running,
+/// the swap task performs the read, and the fiber is resumed here, on
+/// whichever hart polls it next. On success the saved context is restored
+/// and the faulting instruction runs again, having observed nothing.
+///
+/// A fault the kernel cannot resolve (no fiber to block, the fiber
+/// cancelled mid-wait, the swap device refusing the read) is handed to
+/// the runtime's trap handler, which unwinds the guest. Only a fault the
+/// runtime does not claim either is fatal.
+///
+/// `fetch` says whether the fault was an instruction fetch: the saved
+/// registers do not record `scause`.
+extern "C" fn swap_fault_trampoline(
+    frame: *mut TrapFrame,
+    faulting_address: usize,
+    fetch: bool,
+) -> ! {
+    // SAFETY: the frame is intact; only its saved registers are read. The
+    // trampoline runs with the interrupt mask the faulting context had
+    // (`SPIE` was left alone), so what the runtime's unwind lands in runs
+    // on that context's terms without a mask to restore.
+    let (sepc, frame_pointer) = unsafe { ((*frame).sepc, (*frame).general.s0) };
+    helios_kernel::run_swap_fault_trampoline(
+        helios_hal::vmm::VirtAddr::new(faulting_address),
+        KernelException {
+            cause: if fetch {
+                KernelExceptionCause::InstructionFault
+            } else {
+                KernelExceptionCause::DataFault
+            },
+            instruction_pointer: sepc,
+            frame_pointer,
+            faulting_address: Some(faulting_address),
+        },
+        // SAFETY: `frame` is the copy `enter_swap_fault_trampoline` put
+        // one frame below this stack's interrupted `sp`, and this code is
+        // running on that stack.
+        || unsafe { __helios_riscv_swap_fault_resume(frame) },
+    )
 }
 
 /// Allocates one hart's trap stack and returns its byte range.
@@ -209,6 +298,13 @@ fn trap_stack_top_for(frame: &TrapFrame) -> usize {
             .cast::<usize>()
             .read()
     }
+}
+
+/// Whether `frame` is the outermost the trap entry built: the interrupted
+/// context was outside every handler, so its `sp` is a stack a fiber can
+/// block on and the exit hands `sscratch` back to the trap stack top.
+pub(crate) fn is_outermost_frame(frame: &TrapFrame) -> bool {
+    trap_stack_top_for(frame) != 0
 }
 
 /// What the hand-over needs once the trap stack is gone: the exception

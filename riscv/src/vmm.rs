@@ -67,22 +67,25 @@ use core::cell::UnsafeCell;
 use core::ffi::c_int;
 use core::ptr;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use helios_hal::device::{DeviceRegion, DeviceRegionAttributes, DmaPlacement};
 use helios_hal::iommu::PhysicalRange;
 use helios_hal::pmm::PhysFrame;
 use helios_hal::vmm::{
-    AddressSpace, AddressSpaceError, PageFlags, Translation, VirtAddr, VirtRange,
+    AddressSpace, AddressSpaceError, PageAge, PageFlags, SwapToken, Translation, VirtAddr,
+    VirtRange,
 };
 use helios_kernel::runtime_memory::{
     self, RuntimeMemoryHooks, default_memory_image_free, default_memory_image_map_at,
     default_memory_image_new, default_page_size,
 };
 use helios_kernel::{
-    FiberStackVmHooks, MemoryOwner, ReservationLookup, ReservationTracker, VaCursor,
-    allocate_user_frame_zeroed_on, allocate_user_run_zeroed_on, deallocate_user_frame_on,
-    deallocate_user_run_on, install_fiber_stack_hooks, ranges_outside, validate_range,
+    FiberStackVmHooks, InstalledAddressSpace, MemoryOwner, ReservationLookup, ReservationTracker,
+    SwapLeafFormat, SwapSpace, SwapVmHooks, VaCursor, allocate_user_frame_zeroed_on,
+    allocate_user_run_zeroed_on, current_user_memory_owner, deallocate_user_frame_on,
+    deallocate_user_run_on, install_fiber_stack_hooks, ranges_outside, swap_vm_hooks,
+    validate_range,
 };
 use spin::{Mutex, Once};
 
@@ -107,6 +110,35 @@ const PTE_DIRTY: u64 = 1 << 7;
 const PTE_PPN_SHIFT: u32 = 10;
 const PTE_FLAGS_MASK: u64 = (1 << PTE_PPN_SHIFT) - 1;
 const PTE_LEAF_MASK: u64 = PTE_READ | PTE_WRITE | PTE_EXECUTE;
+
+/// Marks an invalid leaf as a swap entry: the low RSW bit (the privileged
+/// spec's bits 9:8, reserved for supervisor software).
+///
+/// With V clear the hardware ignores every other bit of the entry, so the
+/// whole word is the kernel's. An all-zero entry stays "reserved, never
+/// committed": a token is never zero, so no token encodes to zero. This
+/// backend writes no other non-zero invalid leaf.
+const PTE_SWAP: u64 = 1 << 8;
+
+/// The token sits where a valid leaf keeps its PPN, bits 10..42. No
+/// inversion: the L1TF hazard that makes x86 invert the field is an Intel
+/// microarchitecture behaviour.
+const fn swap_entry(token: SwapToken) -> u64 {
+    PTE_SWAP | ((token.raw() as u64) << PTE_PPN_SHIFT)
+}
+
+/// The token an entry carries, `None` for a valid leaf, an empty entry or
+/// anything else that is not exactly a swap entry.
+const fn swap_entry_token(entry: u64) -> Option<SwapToken> {
+    if entry & (PTE_VALID | PTE_SWAP) != PTE_SWAP {
+        return None;
+    }
+    let token = entry >> PTE_PPN_SHIFT;
+    if token > u32::MAX as u64 {
+        return None;
+    }
+    SwapToken::new(token as u32)
+}
 
 const SATP_MODE_SHIFT: u32 = 60;
 const SATP_MODE_SV48: u64 = 9 << SATP_MODE_SHIFT;
@@ -144,6 +176,45 @@ fn level_index(virt: usize, level: usize) -> usize {
 
 fn entry_phys(entry: u64) -> usize {
     ((entry >> PTE_PPN_SHIFT) << PAGE_SHIFT) as usize
+}
+
+/// The slot of entry `index` in `table`.
+///
+/// # Safety
+///
+/// `table` is a live page table and `index < PTE_COUNT`.
+unsafe fn pte_slot(table: *mut [u64; PTE_COUNT], index: usize) -> *mut u64 {
+    debug_assert!(index < PTE_COUNT);
+    // SAFETY: the caller's contract keeps the offset inside the table.
+    unsafe { table.cast::<u64>().add(index) }
+}
+
+/// Loads a page-table entry with acquire ordering.
+///
+/// Every entry a walker can reach without the reservation lock is
+/// published by [`store_pte`], so an entry read here is ordered after
+/// whatever its writer did before publishing it: a table's zeroing, a
+/// frame's fill.
+///
+/// # Safety
+///
+/// `entry` is an aligned entry of a live page table.
+unsafe fn load_pte(entry: *const u64) -> u64 {
+    // SAFETY: the caller's contract; a 64-bit access to an aligned entry
+    // is single-copy atomic.
+    unsafe { AtomicU64::from_ptr(entry.cast_mut()) }.load(Ordering::Acquire)
+}
+
+/// Publishes a page-table entry with release ordering, so a hart that
+/// loads it with [`load_pte`] sees everything written before the store.
+///
+/// # Safety
+///
+/// `entry` is an aligned entry of a live page table, and the caller holds
+/// the reservation lock (or is the only hart that can reach the table).
+unsafe fn store_pte(entry: *mut u64, value: u64) {
+    // SAFETY: the caller's contract.
+    unsafe { AtomicU64::from_ptr(entry) }.store(value, Ordering::Release);
 }
 
 #[repr(align(4096))]
@@ -258,6 +329,14 @@ pub struct RiscvUserAddressSpace {
     root_phys: usize,
     va_cursor: VaCursor,
     state: Mutex<ReservationTracker>,
+    /// Everything about swapping a page that is not this backend's leaf
+    /// encoding or TLB work: the order of a swap-out, the frame, the
+    /// bookkeeping rollback, the orphan queue and the ageing walk. This
+    /// backend supplies the leaf through [`SwapLeafFormat`].
+    ///
+    /// Lock order is `state` then the space's own `orphans`; the drain
+    /// takes only `orphans`.
+    swap: SwapSpace,
 }
 
 #[derive(Clone, Copy)]
@@ -268,13 +347,103 @@ struct RelocationPage {
     new_phys: usize,
 }
 
+/// The access a page fault was raised for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FaultAccess {
+    Load,
+    Store,
+    Fetch,
+}
+
+impl FaultAccess {
+    /// The permission bit a leaf must grant for this access to be allowed.
+    const fn permission(self) -> u64 {
+        match self {
+            Self::Load => PTE_READ,
+            Self::Store => PTE_WRITE,
+            Self::Fetch => PTE_EXECUTE,
+        }
+    }
+
+    /// The flags a hart that does not update them in hardware (Svade)
+    /// faults on until software sets them: accessed for every access,
+    /// dirty for a store.
+    const fn tracked_flags(self) -> u64 {
+        match self {
+            Self::Store => PTE_ACCESSED | PTE_DIRTY,
+            Self::Load | Self::Fetch => PTE_ACCESSED,
+        }
+    }
+}
+
 impl RiscvUserAddressSpace {
     fn new(root_phys: usize) -> Self {
         Self {
             root_phys,
             va_cursor: VaCursor::new(USER_VA_BASE, USER_VA_END),
             state: Mutex::new(ReservationTracker::new()),
+            swap: SwapSpace::new(),
         }
+    }
+
+    /// Resolves a page fault the hardware raised on a leaf that is valid
+    /// and grants the access: reports whether the instruction can simply
+    /// run again.
+    ///
+    /// Two causes look alike from the trap. A hart without hardware
+    /// accessed/dirty updates (Svade) faults on a leaf whose A bit (or D
+    /// bit, for a store) is clear, which the ageing pass arms by clearing
+    /// A; setting it here is what makes the next scan read the page as
+    /// hot. And a hart may have cached the leaf while it was invalid (a
+    /// swap entry that [`SwapLeafFormat::attach`] has since made valid
+    /// from another hart): a local fence drops that translation. Both end
+    /// the same way, a full local `sfence.vma` and a retry, so one step
+    /// covers them.
+    ///
+    /// Returns `false` when the address is outside the user window, has no
+    /// valid leaf, or the leaf does not grant the access: the fault then
+    /// belongs to the swap or stack classifier, or to the runtime.
+    ///
+    /// Runs in trap context with no lock, so it races every writer of the
+    /// leaf: swap-out turning it into a swap entry, `protect`, `decommit`.
+    /// The flags are set with a compare-exchange against the entry that
+    /// was read, and an entry that changed is judged again rather than
+    /// written over: a plain store of the old value with the bit set would
+    /// resurrect a mapping to a frame already returned to the pool.
+    pub(crate) fn resolve_spurious_fault(&self, addr: VirtAddr, access: FaultAccess) -> bool {
+        let virt = addr.page_floor().raw();
+        if !(USER_VA_BASE..USER_VA_END).contains(&virt) {
+            return false;
+        }
+        let Some(entry_ptr) = self.leaf_entry(virt) else {
+            return false;
+        };
+        // SAFETY: `leaf_entry` walked live tables, which are never freed
+        // while the address space lives, to an aligned entry.
+        let leaf = unsafe { AtomicU64::from_ptr(entry_ptr) };
+        let wanted = access.tracked_flags();
+        let mut entry = leaf.load(Ordering::Acquire);
+        loop {
+            if entry & PTE_VALID == 0 || entry & access.permission() == 0 {
+                return false;
+            }
+            if entry & wanted == wanted {
+                break;
+            }
+            match leaf.compare_exchange(entry, entry | wanted, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => break,
+                Err(changed) => entry = changed,
+            }
+        }
+        // A full local fence, not one scoped to the address: `sfence.vma`
+        // with an address operand orders and invalidates only leaf entries
+        // for that address, and this hart may instead have cached an
+        // invalid non-leaf entry, from before `ensure_intermediate` built
+        // the table under a later commit. Only the full fence clears it,
+        // and a spurious fault is rare enough to pay for it.
+        fence_local_all();
+        true
     }
 
     /// Page-table attributes for one device region.
@@ -322,23 +491,48 @@ impl RiscvUserAddressSpace {
         self.root_phys as *mut [u64; PTE_COUNT]
     }
 
-    fn ensure_intermediate(table: &mut [u64; PTE_COUNT], index: usize) -> &mut [u64; PTE_COUNT] {
-        let entry = &mut table[index];
-        if *entry & PTE_VALID != 0 {
+    /// The table `table[index]` points at, building it first when the
+    /// entry is empty.
+    ///
+    /// The new table is zeroed before the entry that makes it reachable
+    /// is stored, and the store is a release: a hart walking these tables
+    /// without the reservation lock (`leaf_entry`, which the demand-commit
+    /// fault path and the swap fault entry call) loads the entry with
+    /// acquire and so reads the table's zeroed words, never what the frame
+    /// held before. A plain store carries no such order under RVWMO.
+    ///
+    /// # Safety
+    ///
+    /// `table` is a live page table, and the caller holds the reservation
+    /// lock, so no other hart stores to it.
+    unsafe fn ensure_intermediate(
+        table: *mut [u64; PTE_COUNT],
+        index: usize,
+    ) -> *mut [u64; PTE_COUNT] {
+        // SAFETY: the caller's `table` is live and `index` is in range.
+        let slot = unsafe { pte_slot(table, index) };
+        // SAFETY: `slot` is an aligned entry of a live table.
+        let entry = unsafe { load_pte(slot) };
+        if entry & PTE_VALID != 0 {
             assert!(
-                *entry & PTE_LEAF_MASK == 0,
+                entry & PTE_LEAF_MASK == 0,
                 "Sv48 user-VA index {index:#x} collides with a leaf mapping"
             );
-            let phys = entry_phys(*entry);
-            return unsafe { &mut *(phys as *mut [u64; PTE_COUNT]) };
+            return entry_phys(entry) as *mut [u64; PTE_COUNT];
         }
         let layout = Layout::from_size_align(PAGE_SIZE, PAGE_SIZE)
             .expect("Sv48 page-table layout is well-formed");
         let raw = unsafe { alloc_zeroed(layout) };
         let raw = NonNull::new(raw).expect("Sv48 page-table allocation failed");
         let phys = raw.as_ptr() as usize;
-        *entry = ((phys as u64) >> PAGE_SHIFT) << PTE_PPN_SHIFT | PTE_VALID;
-        unsafe { &mut *(phys as *mut [u64; PTE_COUNT]) }
+        // SAFETY: as above; the release orders the zeroing before it.
+        unsafe {
+            store_pte(
+                slot,
+                ((phys as u64) >> PAGE_SHIFT) << PTE_PPN_SHIFT | PTE_VALID,
+            );
+        }
+        phys as *mut [u64; PTE_COUNT]
     }
 
     /// Pointer to the leaf entry for `virt`, allocating the
@@ -347,22 +541,30 @@ impl RiscvUserAddressSpace {
     /// The caller holds this address space's reservation lock, so no
     /// other hart is editing its tables.
     fn ensure_leaf_entry(&self, virt: usize) -> *mut u64 {
-        let mut table = unsafe { &mut *self.root_table() };
+        let mut table = self.root_table();
         for level in (1..LEVELS).rev() {
-            table = Self::ensure_intermediate(table, level_index(virt, level));
+            // SAFETY: `table` is live, and the caller holds the
+            // reservation lock.
+            table = unsafe { Self::ensure_intermediate(table, level_index(virt, level)) };
         }
-        &mut table[level_index(virt, 0)]
+        // SAFETY: the walk above ended at a live leaf table.
+        unsafe { pte_slot(table, level_index(virt, 0)) }
     }
 
     /// Pointer to the leaf entry for `virt`, or `None` when the walk
     /// runs into a missing table.
     ///
-    /// The caller holds this address space's reservation lock, so no
-    /// other hart is editing its tables.
+    /// Takes no lock, so the demand-commit fault path and the swap fault
+    /// entry call it too. Table frames are never freed while the address
+    /// space lives, and each entry is loaded with acquire to pair with the
+    /// release store that published the table it names
+    /// ([`Self::ensure_intermediate`]).
     fn leaf_entry(&self, virt: usize) -> Option<*mut u64> {
         let mut table = self.root_table();
         for level in (1..LEVELS).rev() {
-            let entry = unsafe { (*table)[level_index(virt, level)] };
+            // SAFETY: `table` is the root or a table an entry named, and
+            // tables are never freed.
+            let entry = unsafe { load_pte(pte_slot(table, level_index(virt, level))) };
             if entry & PTE_VALID == 0 {
                 return None;
             }
@@ -372,7 +574,8 @@ impl RiscvUserAddressSpace {
             );
             table = entry_phys(entry) as *mut [u64; PTE_COUNT];
         }
-        Some(unsafe { &raw mut (*table)[level_index(virt, 0)] })
+        // SAFETY: as above.
+        Some(unsafe { pte_slot(table, level_index(virt, 0)) })
     }
 
     /// Builds every table level above the leaf for `virt`, leaving the
@@ -382,12 +585,12 @@ impl RiscvUserAddressSpace {
     /// what makes `ensure_intermediate`'s heap allocation safe here and
     /// impossible in fault context.
     fn ensure_leaf_table(&self, virt: usize) {
-        // SAFETY: the root table is a live page table reached through
-        // the HHDM, and the caller holds the reservation lock, so no
-        // other processor is editing this walk.
-        let mut table = unsafe { &mut *self.root_table() };
+        let mut table = self.root_table();
         for level in (1..LEVELS).rev() {
-            table = Self::ensure_intermediate(table, level_index(virt, level));
+            // SAFETY: the root table is a live page table, and the caller
+            // holds the reservation lock, so no other hart is editing
+            // this walk.
+            table = unsafe { Self::ensure_intermediate(table, level_index(virt, level)) };
         }
     }
 
@@ -425,13 +628,17 @@ impl RiscvUserAddressSpace {
         flags: u64,
     ) -> Result<(), AddressSpaceError> {
         let entry_ptr = self.ensure_leaf_entry(virt);
-        let entry = unsafe { entry_ptr.read_volatile() };
+        // SAFETY: `ensure_leaf_entry` returned a live leaf, and the caller
+        // holds the reservation lock.
+        let entry = unsafe { load_pte(entry_ptr) };
         if entry & PTE_VALID != 0 {
             return Err(AddressSpaceError::Overlap);
         }
         let ppn = (phys as u64) >> PAGE_SHIFT;
+        // SAFETY: as above.
         unsafe {
-            entry_ptr.write_volatile(
+            store_pte(
+                entry_ptr,
                 (ppn << PTE_PPN_SHIFT) | flags | PTE_VALID | PTE_ACCESSED | PTE_DIRTY,
             );
         }
@@ -442,12 +649,15 @@ impl RiscvUserAddressSpace {
         let entry_ptr = self
             .leaf_entry(virt)
             .ok_or(AddressSpaceError::NotCommitted)?;
-        let entry = unsafe { entry_ptr.read_volatile() };
+        // SAFETY: `leaf_entry` walked live tables, and the caller holds
+        // the reservation lock.
+        let entry = unsafe { load_pte(entry_ptr) };
         if entry & PTE_VALID == 0 {
             return Err(AddressSpaceError::NotCommitted);
         }
+        // SAFETY: as above.
         unsafe {
-            entry_ptr.write_volatile(0);
+            store_pte(entry_ptr, 0);
         }
         Ok(entry)
     }
@@ -456,13 +666,16 @@ impl RiscvUserAddressSpace {
         let entry_ptr = self
             .leaf_entry(virt)
             .ok_or(AddressSpaceError::NotCommitted)?;
-        let old_entry = unsafe { entry_ptr.read_volatile() };
+        // SAFETY: as in `unmap_4k_no_flush`.
+        let old_entry = unsafe { load_pte(entry_ptr) };
         if old_entry & PTE_VALID == 0 {
             return Err(AddressSpaceError::NotCommitted);
         }
         let ppn = old_entry >> PTE_PPN_SHIFT;
+        // SAFETY: as above.
         unsafe {
-            entry_ptr.write_volatile(
+            store_pte(
+                entry_ptr,
                 (ppn << PTE_PPN_SHIFT) | flags | PTE_VALID | PTE_ACCESSED | PTE_DIRTY,
             );
         }
@@ -473,18 +686,21 @@ impl RiscvUserAddressSpace {
         let entry_ptr = self
             .leaf_entry(virt)
             .ok_or(AddressSpaceError::NotCommitted)?;
-        let old_entry = unsafe { entry_ptr.read_volatile() };
+        // SAFETY: as in `unmap_4k_no_flush`.
+        let old_entry = unsafe { load_pte(entry_ptr) };
         if old_entry & PTE_VALID == 0 {
             return Err(AddressSpaceError::NotCommitted);
         }
+        // SAFETY: as above.
         unsafe {
-            entry_ptr.write_volatile(new_entry);
+            store_pte(entry_ptr, new_entry);
         }
         Ok(old_entry)
     }
 
     fn translate_4k(&self, virt: usize) -> Option<(usize, u64)> {
-        let entry = unsafe { self.leaf_entry(virt)?.read_volatile() };
+        // SAFETY: `leaf_entry` walked live tables.
+        let entry = unsafe { load_pte(self.leaf_entry(virt)?) };
         if entry & PTE_VALID == 0 {
             return None;
         }
@@ -646,6 +862,7 @@ impl RiscvUserAddressSpace {
     fn decommit_committed_subranges(&self, range: VirtRange) -> Result<(), AddressSpaceError> {
         validate_range(range)?;
         let mut state = self.state.lock();
+        self.swap.discard(self, state.take_swap_entries_in(range));
         let removal = state.take_committed_intersections(range)?;
         // A substitution inside the range is dropped without freeing the
         // run's frames, as a withdraw would.
@@ -666,7 +883,27 @@ impl RiscvUserAddressSpace {
                 .ok_or(AddressSpaceError::NotCommitted)?;
             // SAFETY: the pointer came from a walk of live tables, and
             // the caller holds the reservation lock.
-            if unsafe { leaf.read_volatile() } & PTE_VALID == 0 {
+            if unsafe { load_pte(leaf) } & PTE_VALID == 0 {
+                return Err(AddressSpaceError::NotCommitted);
+            }
+            leaves.push(leaf);
+        }
+        Ok(leaves)
+    }
+
+    /// The leaf pointer of every page of `virt`, when every one of them
+    /// is valid or a swap entry: a page the swap policy evicted has no
+    /// frame, and substitution takes it like a resident one. Nothing is
+    /// changed.
+    fn substitutable_leaf_ptrs(&self, virt: VirtRange) -> Result<Vec<*mut u64>, AddressSpaceError> {
+        let mut leaves = Vec::with_capacity(virt.byte_len / PAGE_SIZE);
+        for offset in (0..virt.byte_len).step_by(PAGE_SIZE) {
+            let leaf = self
+                .leaf_entry(virt.start.raw() + offset)
+                .ok_or(AddressSpaceError::NotCommitted)?;
+            // SAFETY: as in `present_leaf_ptrs`.
+            let entry = unsafe { load_pte(leaf) };
+            if entry & PTE_VALID == 0 && swap_entry_token(entry).is_none() {
                 return Err(AddressSpaceError::NotCommitted);
             }
             leaves.push(leaf);
@@ -710,16 +947,17 @@ impl RiscvUserAddressSpace {
         Ok(())
     }
 
-    /// Rewrite the leaves of the committed (this backend never swaps),
-    /// unsubstituted `virt` to
-    /// `physical` with `pte_flags`, give the pool frames they had back,
-    /// and mark the range substituted.
+    /// Rewrite the leaves of the committed or swapped-out, unsubstituted
+    /// `virt` to `physical` with `pte_flags`, give the pool frames they
+    /// had back, release the swap tokens of the pages that were swapped
+    /// out, and mark the range substituted.
     ///
     /// The reservation lock is held from the check, across every leaf
     /// rewrite and the shootdown, to the bookkeeping. Each leaf goes from
-    /// one valid entry to another in one store, so a hart racing the call
-    /// reads the old page or the new one, and the old frames are freed
-    /// only after the range fence has returned on every hart.
+    /// one valid entry (or a swap entry) to another in one store, so a hart
+    /// racing the call reads the old page or the new one, and the old
+    /// frames are freed only after the range fence has returned on every
+    /// hart.
     fn substitute_leaves(
         &self,
         virt: VirtRange,
@@ -728,14 +966,19 @@ impl RiscvUserAddressSpace {
     ) -> Result<(), AddressSpaceError> {
         let mut state = self.state.lock();
         state.check_substitutable(virt)?;
-        let leaves = self.present_leaf_ptrs(virt)?;
+        let leaves = self.substitutable_leaf_ptrs(virt)?;
         let mut replaced = Vec::with_capacity(leaves.len());
         for (index, leaf) in leaves.into_iter().enumerate() {
             let ppn = ((physical + index * PAGE_SIZE) as u64) >> PAGE_SHIFT;
             // SAFETY: as in `present_leaf_ptrs`.
             unsafe {
-                replaced.push(leaf.read_volatile());
-                leaf.write_volatile(
+                // A swapped-out page's leaf holds no frame.
+                let entry = load_pte(leaf);
+                if entry & PTE_VALID != 0 {
+                    replaced.push(entry);
+                }
+                store_pte(
+                    leaf,
                     (ppn << PTE_PPN_SHIFT) | pte_flags | PTE_VALID | PTE_ACCESSED | PTE_DIRTY,
                 );
             }
@@ -744,10 +987,9 @@ impl RiscvUserAddressSpace {
         for entry in replaced {
             self.dealloc_user_phys(entry_phys(entry));
         }
-        // This backend never swaps, so every page was committed and no
-        // swap extent is orphaned.
-        let orphaned = state.record_substitute(virt)?;
-        debug_assert!(orphaned.is_empty());
+        // The swapped-out pages' leaves are already the substitution's,
+        // which `discard` leaves alone; it only queues their tokens.
+        self.swap.discard(self, state.record_substitute(virt)?);
         Ok(())
     }
 
@@ -778,6 +1020,11 @@ impl RiscvUserAddressSpace {
     ) -> Result<(), AddressSpaceError> {
         let pte_flags = page_flags_to_pte(flags)?;
         state.precheck_commit(virt)?;
+        // Committing over a swapped-out page throws its contents away:
+        // the runtime asked for fresh anonymous memory here. Clearing the
+        // leaf is what `map_4k_no_flush` needs to see, and the extent
+        // behind the token still has to be given back.
+        self.swap.discard(self, state.take_swap_entries_in(virt));
 
         let mut mapped_pages = 0;
         for offset in (0..virt.byte_len).step_by(PAGE_SIZE) {
@@ -798,11 +1045,12 @@ impl RiscvUserAddressSpace {
         }
         flush_tlb_pages(virt.start.raw(), mapped_pages);
 
-        // This backend has no swap, so committing over the range can
-        // never orphan a swap extent; the assertion keeps that true if
-        // swap reaches this architecture (#25).
-        let orphaned = state.record_commit(virt, flags, MemoryOwner::NONE)?;
-        debug_assert!(orphaned.is_empty());
+        // Attributed to whoever the hart is committing for: the swap
+        // policy's ageing pass walks an owner's committed regions, so a
+        // commit attributed to nobody could never be evicted.
+        let owner = current_user_memory_owner(crate::current_hart_id());
+        self.swap
+            .discard(self, state.record_commit(virt, flags, owner)?);
         Ok(())
     }
 
@@ -830,6 +1078,162 @@ impl RiscvUserAddressSpace {
     }
 }
 
+/// The Sv48 leaf encoding swap works through.
+///
+/// A swap entry is an invalid leaf (V clear, so the hardware ignores every
+/// other bit) with [`PTE_SWAP`] set and the token in the PPN field.
+///
+/// # Ageing
+///
+/// The A bit is the ageing source. A hart with Svadu sets it atomically
+/// in the walk; a hart with Svade faults on a leaf whose A is clear, and
+/// [`RiscvUserAddressSpace::resolve_spurious_fault`] sets it with a
+/// compare-exchange. [`Self::test_and_clear_accessed`] clears it with an
+/// atomic AND and [`Self::accessed_cleared`] does nothing: a hart that
+/// still caches the translation keeps the page from reading cold until it
+/// refills, which costs a mistaken eviction at worst, never correctness
+/// (Linux riscv's `ptep_clear_flush_young` makes the same trade and does
+/// not flush). A shootdown per batch would interrupt every hart to make an
+/// idle instance's ageing exact.
+impl SwapLeafFormat for RiscvUserAddressSpace {
+    fn swapped_token(&self, addr: VirtAddr) -> Option<SwapToken> {
+        let virt = addr.page_floor().raw();
+        // Checked before any walk: the kernel's identity map is one
+        // root-level leaf, which `leaf_entry` refuses to walk through.
+        if !(USER_VA_BASE..USER_VA_END).contains(&virt) {
+            return None;
+        }
+        // SAFETY: `leaf_entry` walked live tables to an aligned entry.
+        swap_entry_token(unsafe { load_pte(self.leaf_entry(virt)?) })
+    }
+
+    fn detach(
+        &self,
+        _tracker: &ReservationTracker,
+        addr: VirtAddr,
+        token: SwapToken,
+    ) -> Result<NonNull<u8>, AddressSpaceError> {
+        let entry_ptr = self
+            .leaf_entry(addr.raw())
+            .ok_or(AddressSpaceError::NotCommitted)?;
+        // SAFETY: `leaf_entry` walked live tables, and the caller holds
+        // the reservation lock, which serialises every software write to
+        // the leaf. Hardware may still set A and D concurrently; the leaf
+        // is replaced outright, so nothing it did survives.
+        let old_entry = unsafe { load_pte(entry_ptr) };
+        if old_entry & PTE_VALID == 0 {
+            return Err(AddressSpaceError::NotCommitted);
+        }
+        // SAFETY: as above.
+        unsafe {
+            store_pte(entry_ptr, swap_entry(token));
+        }
+        // Local invalidate plus the SBI range fence, which returns once
+        // every hart has completed it: when this returns no hart
+        // translates the page any more, so a store from a hart that was
+        // running the instance either landed before the fence and the
+        // caller's copy sees it, or faults on the swap entry.
+        flush_tlb_pages(addr.raw(), 1);
+        // The identity map makes the frame's physical address its kernel
+        // alias.
+        Ok(NonNull::new(entry_phys(old_entry) as *mut u8)
+            .unwrap_or_else(|| panic!("RISC-V swap-out found a null frame in a valid leaf")))
+    }
+
+    fn attach(
+        &self,
+        _tracker: &ReservationTracker,
+        addr: VirtAddr,
+        expected: SwapToken,
+        frame: NonNull<u8>,
+        flags: PageFlags,
+    ) -> Result<(), AddressSpaceError> {
+        let pte_flags = page_flags_to_pte(flags)?;
+        let entry_ptr = self
+            .leaf_entry(addr.raw())
+            .ok_or(AddressSpaceError::NotSwapped)?;
+        // SAFETY: `leaf_entry` walked live tables, and the leaf is written
+        // only under the reservation lock the caller holds.
+        let current = unsafe { load_pte(entry_ptr) };
+        if swap_entry_token(current) != Some(expected) {
+            return Err(AddressSpaceError::NotSwapped);
+        }
+        let ppn = (frame.as_ptr() as u64) >> PAGE_SHIFT;
+        // The caller filled the frame with data stores, and RISC-V orders
+        // those before an instruction fetch only through `fence.i` on the
+        // fetching hart. An instance owns the memory its code occupies for
+        // its whole turn, host calls included, so an executable page can
+        // have been evicted; fence every hart's instruction stream before
+        // the leaf exposes the page to any of them.
+        if flags.contains(PageFlags::EXECUTE) {
+            crate::fence_instruction_streams();
+        }
+        // SAFETY: as above. The release orders the frame's contents,
+        // filled by the caller, before the leaf that exposes them.
+        unsafe {
+            store_pte(
+                entry_ptr,
+                (ppn << PTE_PPN_SHIFT) | pte_flags | PTE_VALID | PTE_ACCESSED | PTE_DIRTY,
+            );
+        }
+        // No remote fence: any hart may hold a stale invalid entry for
+        // this page, speculative walks included, but a hart that does
+        // faults on it, and `resolve_spurious_fault` fences that hart,
+        // whichever it is. The fence here covers this hart.
+        fence_local_page(addr.raw());
+        Ok(())
+    }
+
+    fn clear_swapped(&self, addr: VirtAddr) {
+        let Some(entry_ptr) = self.leaf_entry(addr.raw()) else {
+            return;
+        };
+        // SAFETY: as in `attach`.
+        if swap_entry_token(unsafe { load_pte(entry_ptr) }).is_none() {
+            return;
+        }
+        // SAFETY: as above.
+        unsafe {
+            store_pte(entry_ptr, 0);
+        }
+    }
+
+    fn test_and_clear_accessed(&self, addr: VirtAddr) -> Option<PageAge> {
+        let entry_ptr = self.leaf_entry(addr.raw())?;
+        // SAFETY: as in `attach`.
+        if unsafe { load_pte(entry_ptr) } & PTE_VALID == 0 {
+            return None;
+        }
+        // The leaf is valid and only this lock's holder makes one invalid,
+        // so clearing the bit by an atomic AND cannot touch a swap
+        // entry's token bits; it can race hardware updates and the fault
+        // entry's compare-exchange, which the AND does not lose.
+        // SAFETY: as above; the entry is aligned.
+        let previous =
+            unsafe { AtomicU64::from_ptr(entry_ptr) }.fetch_and(!PTE_ACCESSED, Ordering::AcqRel);
+        Some(if previous & PTE_ACCESSED != 0 {
+            PageAge::Hot
+        } else {
+            PageAge::Cold
+        })
+    }
+
+    fn accessed_cleared(&self, _start: VirtAddr, _pages: usize) {
+        // Clearing A narrows no permission, so no shootdown is due, but
+        // every address-space mutation invalidates the local TLB: a stale
+        // entry with A set would keep the hart from setting it again, and
+        // the next scan would read a touched page as cold. One full fence
+        // per batch, which is why the caller batches.
+        fence_local_all();
+    }
+}
+
+impl InstalledAddressSpace for RiscvUserAddressSpace {
+    fn installed() -> &'static Self {
+        user_as()
+    }
+}
+
 impl AddressSpace for RiscvUserAddressSpace {
     fn reserve(&self, byte_len: usize) -> Result<VirtRange, AddressSpaceError> {
         if byte_len == 0 {
@@ -848,10 +1252,9 @@ impl AddressSpace for RiscvUserAddressSpace {
     fn release(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
         let mut state = self.state.lock();
         let released = state.release(virt)?;
-        // This backend has no swap, so a released reservation never holds
-        // a swap token; the assertion keeps that true if swap ever reaches
-        // this architecture (#25).
-        debug_assert!(released.swapped.is_empty());
+        // First, so a committed region that fails to unmap below cannot
+        // strand the swapped pages' tokens: their leaves are separate.
+        self.swap.discard(self, released.swapped);
         for region in &released.committed {
             if region.substituted {
                 self.drop_substituted_leaves(region.range);
@@ -873,7 +1276,7 @@ impl AddressSpace for RiscvUserAddressSpace {
         validate_range(virt)?;
         let mut state = self.state.lock();
         let removed = state.record_decommit(virt)?;
-        debug_assert!(removed.swapped.is_empty());
+        self.swap.discard(self, removed.swapped);
         // A substitution inside the range is dropped without freeing the
         // run's frames, as a withdraw would.
         self.drop_substituted_parts(&removed.substituted);
@@ -999,7 +1402,8 @@ impl AddressSpace for RiscvUserAddressSpace {
             let ppn = (phys as u64) >> PAGE_SHIFT;
             // SAFETY: as in `substitute_leaves`.
             unsafe {
-                leaf.write_volatile(
+                store_pte(
+                    leaf,
                     (ppn << PTE_PPN_SHIFT) | pte_flags | PTE_VALID | PTE_ACCESSED | PTE_DIRTY,
                 );
             }
@@ -1048,8 +1452,8 @@ impl AddressSpace for RiscvUserAddressSpace {
         // this region: its pages are not resident until something faults
         // on them, and ageing one would offer the policy the very stack
         // its fault handler is standing on.
-        let orphaned = state.record_commit(virt, flags, MemoryOwner::NONE)?;
-        debug_assert!(orphaned.is_empty());
+        self.swap
+            .discard(self, state.record_commit(virt, flags, MemoryOwner::NONE)?);
         Ok(())
     }
 
@@ -1072,14 +1476,16 @@ impl AddressSpace for RiscvUserAddressSpace {
         // only the fiber running on it ever faults on. This backend
         // identity-maps physical memory, so the pool's pointer is the
         // physical address.
-        let entry = unsafe { entry_ptr.read_volatile() };
+        let entry = unsafe { load_pte(entry_ptr) };
         if entry & PTE_VALID != 0 {
             return Err(AddressSpaceError::Overlap);
         }
         let ppn = (frame.as_ptr() as u64) >> PAGE_SHIFT;
-        // SAFETY: as above; the store publishes a complete leaf.
+        // SAFETY: as above; the release store publishes a complete leaf
+        // after the frame's contents.
         unsafe {
-            entry_ptr.write_volatile(
+            store_pte(
+                entry_ptr,
                 (ppn << PTE_PPN_SHIFT) | pte_flags | PTE_VALID | PTE_ACCESSED | PTE_DIRTY,
             );
         }
@@ -1088,15 +1494,7 @@ impl AddressSpace for RiscvUserAddressSpace {
         // the invalid entry on the hart that walked it — which is this
         // one, the one that just faulted. No other hart has looked at
         // this page, because no other hart runs this fiber.
-        // SAFETY: `sfence.vma` with a virtual address operand is a
-        // supervisor-legal local fence.
-        unsafe {
-            core::arch::asm!(
-                "sfence.vma {addr}, zero",
-                addr = in(reg) virt,
-                options(nostack, preserves_flags),
-            );
-        }
+        fence_local_page(virt);
         Ok(())
     }
 
@@ -1111,7 +1509,11 @@ impl AddressSpace for RiscvUserAddressSpace {
         }
         let mut state = self.state.lock();
         let removed = state.record_decommit(virt)?;
-        debug_assert!(removed.swapped.is_empty() && removed.substituted.is_empty());
+        debug_assert!(
+            removed.swapped.is_empty() && removed.substituted.is_empty(),
+            "a demand-commit region is never offered to the swap policy or substituted"
+        );
+        self.swap.discard(self, removed.swapped);
         self.unmap_demand_pages(mapped);
         Ok(())
     }
@@ -1133,6 +1535,46 @@ impl AddressSpace for RiscvUserAddressSpace {
             },
             None => Translation::Reserved,
         }
+    }
+
+    fn swap_out_page(
+        &self,
+        addr: VirtAddr,
+        token: SwapToken,
+        out: &mut [u8],
+    ) -> Result<PageFlags, AddressSpaceError> {
+        self.swap
+            .swap_out_page(&mut self.state.lock(), self, addr, token, out)
+    }
+
+    fn swap_in_page(&self, addr: VirtAddr, bytes: &[u8]) -> Result<SwapToken, AddressSpaceError> {
+        self.swap
+            .swap_in_page(&mut self.state.lock(), self, addr, bytes)
+    }
+
+    fn swapped_token(&self, addr: VirtAddr) -> Option<SwapToken> {
+        SwapLeafFormat::swapped_token(self, addr)
+    }
+
+    fn scan_committed_pages<Visit>(&self, owner: u64, visit: Visit) -> usize
+    where
+        Visit: FnMut(VirtAddr, PageFlags, PageAge) -> bool,
+    {
+        self.swap
+            .scan_committed_pages(&self.state.lock(), self, owner, visit)
+    }
+
+    fn owned_resident_bytes(&self, owner: u64) -> u64 {
+        self.state
+            .lock()
+            .owned_resident_bytes(MemoryOwner::new(owner))
+    }
+
+    fn drain_orphaned_swap_tokens<Visit>(&self, visit: Visit) -> usize
+    where
+        Visit: FnMut(SwapToken),
+    {
+        self.swap.drain_orphaned_swap_tokens(visit)
     }
 
     fn relocate(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
@@ -1158,6 +1600,32 @@ impl AddressSpace for RiscvUserAddressSpace {
             self.dealloc_user_phys(page.old_phys);
         }
         Ok(())
+    }
+}
+
+/// Drops every translation this hart has cached, leaf and non-leaf.
+fn fence_local_all() {
+    // SAFETY: `sfence.vma` with both operands zero is a supervisor-legal
+    // local fence.
+    unsafe {
+        core::arch::asm!("sfence.vma zero, zero", options(nostack, preserves_flags),);
+    }
+}
+
+/// Drops this hart's cached translation of the page at `virt`.
+///
+/// A hart may cache a leaf while it is invalid, so a leaf that becomes
+/// valid needs this on every hart that could have looked at it; the
+/// callers say which hart that is.
+fn fence_local_page(virt: usize) {
+    // SAFETY: `sfence.vma` with a virtual address operand is a
+    // supervisor-legal local fence.
+    unsafe {
+        core::arch::asm!(
+            "sfence.vma {addr}, zero",
+            addr = in(reg) virt,
+            options(nostack, preserves_flags),
+        );
     }
 }
 
@@ -1204,8 +1672,11 @@ fn page_flags_to_pte(flags: PageFlags) -> Result<u64, AddressSpaceError> {
     if flags.contains(PageFlags::READ) {
         pte |= PTE_READ;
     }
+    // Write without read is a reserved leaf encoding (every access through
+    // it faults, and the spurious-fault retry would loop on it), so write
+    // implies read, as aarch64's read-write access permission does.
     if flags.contains(PageFlags::WRITE) {
-        pte |= PTE_WRITE;
+        pte |= PTE_READ | PTE_WRITE;
     }
     if flags.contains(PageFlags::EXECUTE) {
         pte |= PTE_EXECUTE;
@@ -1234,14 +1705,54 @@ const _: () = {
     assert!(USER_VA_END - USER_VA_BASE >= 2 * 1000 * (4 * GIB + 32 * (1 << 20)));
 };
 
+/// The swap entry's encoding, proved at compile time: this crate has no
+/// host test target, so `check-target` is what evaluates these.
+const _: () = {
+    let (Some(one), Some(largest)) = (SwapToken::new(1), SwapToken::new(u32::MAX)) else {
+        panic!("1 and u32::MAX are valid swap tokens");
+    };
+    // Round trips, at both ends of the token range.
+    match swap_entry_token(swap_entry(one)) {
+        Some(token) => assert!(token.raw() == 1),
+        None => panic!("token 1 does not survive the swap entry encoding"),
+    }
+    match swap_entry_token(swap_entry(largest)) {
+        Some(token) => assert!(token.raw() == u32::MAX),
+        None => panic!("the largest token does not survive the swap entry encoding"),
+    }
+    // V is clear, the marker is set, and the only other bits are the PPN
+    // field's 32 token bits: flag bits 1..=7 and 9 and everything from
+    // bit 42 up stay zero.
+    assert!(swap_entry(one) & PTE_VALID == 0);
+    assert!(swap_entry(largest) & ((1 << PTE_PPN_SHIFT) - 1) == PTE_SWAP);
+    assert!(swap_entry(largest) >> (PTE_PPN_SHIFT + SwapToken::BITS) == 0);
+    // What is not a swap entry decodes to nothing: an empty entry, a
+    // valid leaf (with or without the marker bit) and a marker with no
+    // token behind it.
+    assert!(swap_entry_token(0).is_none());
+    assert!(swap_entry_token(swap_entry(one) | PTE_VALID).is_none());
+    assert!(
+        swap_entry_token(PTE_VALID | PTE_READ | PTE_WRITE | PTE_ACCESSED | PTE_DIRTY).is_none()
+    );
+    assert!(swap_entry_token(PTE_SWAP).is_none());
+    // A token never decodes from bits above the 32 the encoding writes.
+    assert!(swap_entry_token(PTE_SWAP | (1 << (PTE_PPN_SHIFT + SwapToken::BITS))).is_none());
+};
+
 /// Register the boot-time `RiscvUserAddressSpace` as the active
 /// runtime custom-virtual-memory backend. Must be called once on
 /// the bootstrap hart, after `install_kernel_paging`, before any
 /// runtime engine is constructed.
 pub fn install_runtime_memory_hooks() {
     runtime_memory::install_hooks(&RISCV_VMM_HOOKS);
+    helios_kernel::install_swap_hooks(&RISCV_SWAP_HOOKS);
     install_fiber_stack_hooks(&RISCV_FIBER_STACK_HOOKS);
 }
+
+/// The kernel's view of this backend's swap surface. Its clock is the
+/// `time` CSR, the counter `RiscvCpu::now` reads.
+static RISCV_SWAP_HOOKS: SwapVmHooks =
+    swap_vm_hooks::<RiscvUserAddressSpace>(riscv::register::time::read64);
 
 /// The arena's address-space surface for this backend.
 ///

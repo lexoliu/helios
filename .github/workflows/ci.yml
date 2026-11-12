@@ -378,6 +378,37 @@ jobs:
             shell -c 'curl http://detectportal.firefox.com/success.txt' 2>&1 > curl-smoke.out | tee "$runtime/inspector.log"
           cat curl-smoke.out
           grep -Fqx success curl-smoke.out
+      - name: Evict and restore an instance through swap
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          # Without this the step reports tee's status, not the
+          # command's, and a runner script that fails is invisible.
+          set -o pipefail
+          # The inspector attaches the `helios-data` scratch disk on every
+          # boot, and the kernel swaps to it. `procbench swap-cycle` fills
+          # a child's memory with a per-page pattern, holds the machine
+          # under pressure with a hog it keeps touching until the child's
+          # pages have left memory, then has the child verify every byte
+          # and requires the swap-in counter to cover them. It prints
+          # `swap-cycle:<pages>` only when every page came back
+          # byte-exact; 64 MiB is 16384 pages of 4 KiB.
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/swap-cycle"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
+            --accel tcg \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger --boot-program procbench \
+            --no-compiler-plugin \
+            shell --trace-log "$runtime/guest-tracing.log" \
+            -c '/bin/procbench swap-cycle --mib 64 /bin/procbench' \
+            2>&1 > swap-cycle-smoke.out | tee "$runtime/inspector.log"
+          cat swap-cycle-smoke.out
+          cat "$runtime/guest-tracing.log"
+          grep -Fqx swap-cycle:16384 swap-cycle-smoke.out
+          ! grep -Fq 'Kernel panic' swap-cycle-smoke.out
       - name: Upload the inspector runtime directories
         if: failure()
         uses: actions/upload-artifact@v4

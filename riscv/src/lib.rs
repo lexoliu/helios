@@ -871,13 +871,6 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
             for (source, route) in device::publish_grants(&fdt, debug_state.device_grants()) {
                 interrupts.attach_device(source, route);
             }
-            // The Sv48 address space reserves and commits lazily, so a page
-            // could be taken away here — but the backend has not wired the
-            // other half: no `SwapVmHooks` table, so a not-present PTE
-            // carries no swap token and the fault handler has nothing to
-            // look the page up by. Extending swap to this backend is #25's
-            // follow-up to #59.
-            helios_kernel::disable_swap(helios_kernel::SwapDisabled::NoSwapHooks);
             interrupts
         })
     });
@@ -1273,19 +1266,53 @@ unsafe fn configure_interrupts() {
 /// instruction again. Every other path diverges: into the hand-over to
 /// the runtime's trap handler (`trap::hand_over_trap`), which leaves the
 /// trap stack for good, or into a panic.
-fn handle_exception(exception: Exception, tf: &TrapFrame) {
+fn handle_exception(exception: Exception, tf: &mut TrapFrame) {
     let stval = riscv::register::stval::read();
-    // A reserved page inside a live fiber stack is a demand commit the
-    // kernel resolves here, with no lock and no allocation; the guard
-    // page below one is a stack overflow and stays a fault. This is the
-    // first fault this backend can resolve without unwinding, which is
-    // why the function above it returns at all.
-    let stack_fault = match kernel_exception_faulting_address(exception, stval) {
-        Some(addr) => helios_kernel::resolve_stack_fault(helios_hal::vmm::VirtAddr::new(addr)),
-        None => helios_kernel::StackFault::Elsewhere,
-    };
-    if stack_fault == helios_kernel::StackFault::Committed {
-        return;
+    let mut stack_fault = helios_kernel::StackFault::Elsewhere;
+    if let Some(addr) = kernel_exception_faulting_address(exception, stval) {
+        let addr = helios_hal::vmm::VirtAddr::new(addr);
+        let access = page_fault_access(exception);
+        // A page fault on a leaf that is valid and grants the access is
+        // not a fault the guest or the swap policy can answer: either the
+        // hart without hardware accessed/dirty updates (Svade) is asking
+        // for the bit the ageing pass cleared, or it cached the leaf while
+        // it was invalid. Set the bit or fence the page and retry.
+        if let Some(access) = access
+            && vmm::user_address_space()
+                .is_some_and(|space| space.resolve_spurious_fault(addr, access))
+        {
+            return;
+        }
+        match helios_kernel::classify_user_page_fault(addr) {
+            // A reserved page inside a live fiber stack is a demand
+            // commit the kernel resolved here, with no lock and no
+            // allocation; the guard page below one is a stack overflow
+            // and stays a fault.
+            helios_kernel::UserPageFault::Resolved => return,
+            // A swapped-out page is ours to resolve, and resolving it
+            // means waiting for the swap device. Redirect the faulting
+            // context onto a kernel trampoline running on its own stack,
+            // which can block the fiber the way a host call does. Only
+            // an outermost frame can: a fault inside a trap handler has
+            // no fiber stack to block on, and falls through to the
+            // report below.
+            helios_kernel::UserPageFault::Swapped => {
+                if let Some(access) = access
+                    && trap::is_outermost_frame(tf)
+                {
+                    // SAFETY: `tf` is the outermost frame the entry
+                    // built, and the `sp` it recorded is the faulting
+                    // context's live stack.
+                    unsafe {
+                        trap::enter_swap_fault_trampoline(tf, addr.raw(), access);
+                    }
+                    return;
+                }
+            }
+            // Everything else, guard pages included, still belongs to
+            // the runtime.
+            helios_kernel::UserPageFault::Unclaimed(fault) => stack_fault = fault,
+        }
     }
     match trap_origin(tf) {
         TrapOrigin::Kernel => {
@@ -1336,6 +1363,18 @@ fn kernel_exception_cause(exception: Exception) -> Option<KernelExceptionCause> 
         | Exception::LoadPageFault
         | Exception::StorePageFault => Some(KernelExceptionCause::DataFault),
         Exception::UserEnvCall | Exception::SupervisorEnvCall => None,
+    }
+}
+
+/// The access a page fault was raised for, `None` for every exception
+/// that is not one (an access fault, a misaligned access and the rest
+/// never have a leaf to fix up or a swap entry to read).
+fn page_fault_access(exception: Exception) -> Option<vmm::FaultAccess> {
+    match exception {
+        Exception::LoadPageFault => Some(vmm::FaultAccess::Load),
+        Exception::StorePageFault => Some(vmm::FaultAccess::Store),
+        Exception::InstructionPageFault => Some(vmm::FaultAccess::Fetch),
+        _ => None,
     }
 }
 

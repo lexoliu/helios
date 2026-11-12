@@ -49,7 +49,8 @@ pub(crate) fn count_block_devices(fdt: &Fdt<'_>) -> usize {
 }
 
 /// Brings up every block device on the platform bus and hands them to
-/// the kernel, which gives each the role its serial names.
+/// the kernel, which gives each the role its serial names and returns
+/// the scratch disk for swap.
 pub(crate) fn install<WatchdogImpl>(
     cpu: &RiscvCpu,
     kernel: &helios_kernel::Kernel<RiscvCpu, WatchdogImpl>,
@@ -66,16 +67,28 @@ where
         .map(|interrupt| interrupt.device.inner.clone())
         .collect();
     let state = debug_state.clone();
-    // Swap is not wired on this backend, so the scratch disk is proved
-    // and counted but nothing writes to it yet. Nothing mounts a disk
-    // yet either, so the mount sources' cache is held by its reclaim
-    // task alone.
+    let spawner = kernel.spawner();
+    let timer = kernel.timer();
+    let swap_cpu = cpu.clone();
+    // Nothing mounts a disk yet, so the mount sources' cache is held by
+    // its reclaim task alone.
     helios_kernel::install_block_devices(
         kernel,
         root,
         devices,
-        move |service, _scratch, _mount_sources| {
+        move |service, scratch, _mount_sources| {
             state.install_block_service(service);
+            if let Some(swap) = helios_kernel::install_scratch_swap(
+                state.instance_registry(),
+                scratch,
+                spawner,
+                timer,
+                swap_cpu,
+                "virtio-blk",
+                helios_virtio::VirtioBlockSwapBackend::new,
+            ) {
+                state.install_swap(swap);
+            }
         },
     );
     for interrupt in &discovered {

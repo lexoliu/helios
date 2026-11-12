@@ -179,4 +179,49 @@ __helios_riscv_trap_hand_over:
     call __helios_riscv_trap_hand_over_main
     unimp
 
+// Returns to a context the trap entry saved, from kernel code running on
+// the stack that context was interrupted on, after the swap-fault
+// trampoline has brought the page back. The frame is the copy
+// `enter_swap_fault_trampoline` put one frame below the interrupted `sp`.
+//
+// This is the exit above with three differences. It runs outside any
+// handler, so `sscratch` is already the trap stack top of the hart it
+// runs on and is left alone. It runs with `SIE` clear until the `sret`,
+// which restores it from the frame's `SPIE`. And it does not restore `tp`
+// (`x4`): the fiber that took the fault may be resumed on another hart
+// than the one it faulted on, `tp` is the hart's identity (the per-hart
+// stack limit the guest's entry checks is read through it), and the
+// value the frame holds names the hart the fault was taken on.
+//
+// a0: the saved `TrapFrame`.
+.section .text.helios_swap_fault_resume, "ax"
+.global __helios_riscv_swap_fault_resume
+.balign 4
+__helios_riscv_swap_fault_resume:
+    csrci sstatus, HELIOS_SSTATUS_SIE
+    mv sp, a0
+    ld t1, HELIOS_TRAP_SSTATUS(sp)
+    li t3, SSTATUS_FS_MASK
+    and t3, t1, t3
+    // Adopt the frame's `FS` before touching `f0`-`f31`, as the exit does.
+    csrw sstatus, t1
+    beqz t3, 2f
+    ld t4, HELIOS_TRAP_FCSR(sp)
+    fscsr t4
+    .irp n, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    fld f\n, (HELIOS_TRAP_F0 + \n * 8)(sp)
+    .endr
+    // Writing the floating-point file set `FS` to `Dirty`; put back the
+    // value the frame recorded.
+    csrw sstatus, t1
+2:
+    ld t2, HELIOS_TRAP_SEPC(sp)
+    csrw sepc, t2
+    .irp n, 1,3,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    ld x\n, (\n * 8)(sp)
+    .endr
+    // The stack pointer last: everything above is addressed through it.
+    ld x2, HELIOS_TRAP_SP(sp)
+    sret
+
 .option pop
