@@ -209,6 +209,11 @@ impl InFlightHeads {
             .sum()
     }
 
+    #[cfg(test)]
+    fn contains(&self, id: u16) -> bool {
+        self.bits[usize::from(id) / 64] & (1 << (id % 64)) != 0
+    }
+
     fn insert(&mut self, id: u16) {
         let word = &mut self.bits[usize::from(id) / 64];
         assert!(
@@ -1121,6 +1126,17 @@ impl<T: VirtioTransport> VirtQueue<T> {
             written += take;
         }
         u32::try_from(written).expect("device response length fits a u32")
+    }
+
+    /// Device side, tests only: the heads of the chains the device owns.
+    #[cfg(test)]
+    pub(crate) fn device_in_flight_heads(&self) -> alloc::vec::Vec<u16> {
+        match &self.ring {
+            Ring::Split(ring) => ring.device_in_flight_heads(),
+            Ring::Packed(_) => {
+                panic!("device_in_flight_heads drives the split ring")
+            }
+        }
     }
 
     #[cfg(test)]

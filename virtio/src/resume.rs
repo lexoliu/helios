@@ -43,9 +43,13 @@
 //!   polled again. It takes each queue lock with `try_lock` and holds it
 //!   only while the queue is re-programmed.
 
+use alloc::vec;
+use alloc::vec::Vec;
+use async_lock::Mutex as AsyncMutex;
 use helios_hal::io::IoError;
 
 use crate::features::RenegotiateError;
+use crate::queue::VirtQueue;
 use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
 
 /// The proof that a device was reset and rebuilt.
@@ -152,6 +156,15 @@ pub enum ReinitError {
         /// The state.
         what: &'static str,
     },
+    /// The device did not answer a command that restores state it lost
+    /// before the caller's deadline.
+    #[error("virtio {device:?} did not answer the command that restores {what} in time")]
+    RestoreTimedOut {
+        /// The device.
+        device: DeviceType,
+        /// The state being restored.
+        what: &'static str,
+    },
     /// The device refused a command that restores state it lost.
     #[error("virtio {device:?} refused to restore {what}: {error}")]
     Restore {
@@ -192,6 +205,76 @@ pub(crate) fn settle(
         // hardware progress and not a wait on software state.
         core::hint::spin_loop();
     }
+}
+
+/// Why one polled command did not produce an answer.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PolledError {
+    /// The caller's deadline passed with the command still the device's.
+    Expired,
+    /// The queue refused the command or the device faulted.
+    Queue(IoError),
+    /// A queue lock was held across the freeze.
+    Busy,
+}
+
+/// Runs one command on a queue the caller owns exclusively, by polling
+/// its used ring, for a machine that is frozen: no interrupt will be
+/// delivered and no task will run, so nothing else could complete it.
+///
+/// The buffers are heap copies made here, because the device writes the
+/// answer into them. When `expired` ends the wait the command is still
+/// the device's, so the buffers are leaked rather than freed under a
+/// device that may yet write to them. Returns the answer and the number
+/// of bytes the device wrote.
+pub(crate) fn polled_command<T: VirtioTransport>(
+    transport: &T,
+    queue: &AsyncMutex<VirtQueue<T>>,
+    request: &[u8],
+    response_bytes: usize,
+    expired: &mut impl FnMut() -> bool,
+) -> Result<(Vec<u8>, u32), PolledError> {
+    let request = request.to_vec();
+    let mut response = vec![0_u8; response_bytes];
+    let token = {
+        let mut ring = queue.try_lock().ok_or(PolledError::Busy)?;
+        let token = ring
+            .submit(
+                transport,
+                &[request.as_slice()],
+                &mut [response.as_mut_slice()],
+            )
+            .map_err(PolledError::Queue)?;
+        ring.notify(transport);
+        token
+    };
+    let written = loop {
+        // The lock is taken for one pop and released before `expired`
+        // runs, so the caller's deadline check is free to look at the
+        // queue.
+        let popped = queue
+            .try_lock()
+            .ok_or(PolledError::Busy)?
+            .pop_used_with_len()
+            .map_err(PolledError::Queue)?;
+        match popped {
+            Some((completed, written)) => {
+                assert_eq!(
+                    completed, token,
+                    "a polled command found a completion that is not its own"
+                );
+                break written;
+            }
+            None if expired() => {
+                core::mem::forget(request);
+                core::mem::forget(response);
+                return Err(PolledError::Expired);
+            }
+            None => core::hint::spin_loop(),
+        }
+    };
+    transport.ack_interrupt();
+    Ok((response, written))
 }
 
 /// Tells a re-handshaken device that the driver is ready, once every

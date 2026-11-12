@@ -76,10 +76,17 @@ use helios_hal::audio::{
 };
 use helios_hal::io::{IoError, IoResult};
 
-use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate};
-use crate::inflight::{InFlight, await_completion, submit_chain};
+use spin::Mutex as SpinMutex;
+
+use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate, renegotiate};
+use crate::inflight::{
+    InFlight, await_completion, drain_to_idle, reinitialize_requests, submit_chain,
+};
 use crate::notify::Notify;
 use crate::queue::{VirtQueue, negotiated_queue_size};
+use crate::resume::{
+    DeviceReset, PolledError, QuiesceError, ReinitError, driver_ok, polled_command,
+};
 use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
 
 /// The control queue: every question and every state change.
@@ -257,6 +264,45 @@ impl SoundTopology {
     }
 }
 
+/// How far a stream has been driven through the state machine of
+/// virtio 1.2 §5.14.6.6.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamPhase {
+    /// `PCM_SET_PARAMS` has not been accepted.
+    Unconfigured,
+    /// Parameters are set; also where `PCM_RELEASE` leaves a stream.
+    ParamsSet,
+    /// `PCM_PREPARE` has allocated the device side; `PCM_STOP` leaves a
+    /// stream here too.
+    Prepared,
+    /// `PCM_START` has begun the device's clock.
+    Running,
+}
+
+/// What the driver has asked a stream to be, which is everything a
+/// device that lost its state needs to be told again.
+///
+/// The record is written *before* a command is sent and put back if the
+/// device refuses it, so a command that completed on the device while
+/// its caller had not yet run again is already in the record when the
+/// machine is frozen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StreamRecord {
+    params: Option<PcmParams>,
+    phase: StreamPhase,
+    /// Set when a quiesce stopped the stream so that its transmits could
+    /// complete: the re-initialisation starts it again.
+    resume: bool,
+}
+
+impl StreamRecord {
+    const UNCONFIGURED: Self = Self {
+        params: None,
+        phase: StreamPhase::Unconfigured,
+        resume: false,
+    };
+}
+
 /// The event ring together with the buffer pool that backs it.
 ///
 /// Slot bookkeeping lives beside the queue rather than behind a lock of
@@ -295,6 +341,13 @@ pub struct VirtioSndDevice<T: VirtioTransport> {
     /// than a lock because there is nothing else in the word to keep
     /// consistent with it.
     period_bytes: [AtomicU32; MAX_STREAMS],
+    /// What each stream was last asked to be, for a device that has to
+    /// be told again after a reset. A spin lock held for a copy, never
+    /// across a call into the queue.
+    records: SpinMutex<[StreamRecord; MAX_STREAMS]>,
+    /// How many of each kind of item the device presented at bring-up,
+    /// to compare with what a reset device presents.
+    counts: ItemCounts,
     features: NegotiatedFeatures,
 }
 
@@ -433,6 +486,8 @@ impl<T: VirtioTransport> VirtioSndDevice<T> {
             event_arrivals: Notify::new(),
             topology: SoundTopology::empty(),
             period_bytes: [const { AtomicU32::new(0) }; MAX_STREAMS],
+            records: SpinMutex::new([StreamRecord::UNCONFIGURED; MAX_STREAMS]),
+            counts,
             features,
         };
         Ok((device, counts))
@@ -506,10 +561,37 @@ impl<T: VirtioTransport> VirtioSndDevice<T> {
     /// Runs one command whose whole body is a PCM header.
     async fn stream_command(&self, code: u32, stream: StreamId) -> AudioResult<()> {
         self.playback_stream(stream)?;
+        let phase = match code {
+            R_PCM_PREPARE | R_PCM_STOP => StreamPhase::Prepared,
+            R_PCM_START => StreamPhase::Running,
+            R_PCM_RELEASE => StreamPhase::ParamsSet,
+            _ => unreachable!("a stream command is prepare, start, stop or release"),
+        };
+        let previous = self.record(stream, |record| {
+            record.phase = phase;
+            record.resume = false;
+        });
         let request = encode_pcm_header(code, stream);
         let mut response = [0_u8; HEADER_BYTES];
-        self.control_command(&request, &mut response).await?;
+        if let Err(error) = self.control_command(&request, &mut response).await {
+            self.put_back(stream, previous);
+            return Err(error);
+        }
         Ok(())
+    }
+
+    /// Changes `stream`'s record and answers what it was.
+    fn record(&self, stream: StreamId, change: impl FnOnce(&mut StreamRecord)) -> StreamRecord {
+        let mut records = self.records.lock();
+        let record = &mut records[stream.index() as usize];
+        let previous = *record;
+        change(record);
+        previous
+    }
+
+    /// Restores a record a refused command had already replaced.
+    fn put_back(&self, stream: StreamId, previous: StreamRecord) {
+        self.record(stream, |record| *record = previous);
     }
 
     /// The description of `stream`, refusing one this device does not
@@ -535,6 +617,228 @@ impl<T: VirtioTransport> VirtioSndDevice<T> {
         self.period_bytes
             .get(stream.index() as usize)
             .ok_or(AudioError::UnknownStream(stream))
+    }
+
+    /// Waits for every command and every period the device owns to
+    /// complete, so the device may be reset. See [`crate::resume`] for
+    /// the contract; `expired` says when the caller's deadline has
+    /// passed.
+    ///
+    /// A running stream is stopped first, because a device is free to
+    /// hold a period until its clock reaches it, and a stopped stream is
+    /// one whose pending periods the device completes. Each stream
+    /// stopped here is remembered and started again by
+    /// [`Self::reinitialize`]. The event ring is not waited on, and the
+    /// receive queue is never posted.
+    pub fn quiesce(&self, mut expired: impl FnMut() -> bool) -> Result<(), QuiesceError> {
+        let device = DeviceType::Sound;
+        drain_to_idle(
+            &self.control_inflight,
+            &self.control,
+            &self.transport,
+            CONTROL_QUEUE_INDEX,
+            &mut expired,
+        )?;
+        for index in 0..MAX_STREAMS {
+            let stream = StreamId::new(index as u32);
+            if self.records.lock()[index].phase != StreamPhase::Running {
+                continue;
+            }
+            let fault = QuiesceError::DeviceFault {
+                device,
+                queue: CONTROL_QUEUE_INDEX,
+            };
+            let request = encode_pcm_header(R_PCM_STOP, stream);
+            let (response, written) = polled_command(
+                &self.transport,
+                &self.control,
+                &request,
+                HEADER_BYTES,
+                &mut expired,
+            )
+            .map_err(|error| match error {
+                PolledError::Expired => QuiesceError::RequestsStillInFlight {
+                    device,
+                    queue: CONTROL_QUEUE_INDEX,
+                    count: 1,
+                },
+                PolledError::Queue(_) => fault,
+                PolledError::Busy => QuiesceError::QueueBusy {
+                    device,
+                    queue: CONTROL_QUEUE_INDEX,
+                },
+            })?;
+            if (written as usize) < HEADER_BYTES
+                || status_of(&response).and_then(check_status).is_err()
+            {
+                return Err(fault);
+            }
+            self.record(stream, |record| {
+                record.phase = StreamPhase::Prepared;
+                record.resume = true;
+            });
+        }
+        drain_to_idle(
+            &self.tx_inflight,
+            &self.tx,
+            &self.transport,
+            TX_QUEUE_INDEX,
+            &mut expired,
+        )
+    }
+
+    /// Brings a reset device back with the features it had, after
+    /// [`Self::quiesce`].
+    ///
+    /// The queues are programmed again at their memory and the event
+    /// ring is stocked again. The device must still present the streams,
+    /// jacks and channel maps it did, and every stream is driven back
+    /// through `PCM_SET_PARAMS`, `PCM_PREPARE` and, for one the quiesce
+    /// stopped, `PCM_START`. Those commands are polled, because the
+    /// machine is frozen: `expired` bounds each answer.
+    pub fn reinitialize(
+        &self,
+        mut expired: impl FnMut() -> bool,
+    ) -> Result<DeviceReset, ReinitError> {
+        let device = DeviceType::Sound;
+        renegotiate(&self.transport, self.features)?;
+        reinitialize_requests(
+            &self.control_inflight,
+            &self.control,
+            &self.transport,
+            CONTROL_QUEUE_INDEX,
+        )?;
+        reinitialize_requests(&self.tx_inflight, &self.tx, &self.transport, TX_QUEUE_INDEX)?;
+        self.rx
+            .try_lock()
+            .ok_or(ReinitError::QueueBusy {
+                device,
+                queue: RX_QUEUE_INDEX,
+            })?
+            .reinitialize(&self.transport)?;
+        {
+            let mut events = self.events.try_lock().ok_or(ReinitError::QueueBusy {
+                device,
+                queue: EVENT_QUEUE_INDEX,
+            })?;
+            let EventRing {
+                queue,
+                slots,
+                slot_for_token,
+            } = &mut *events;
+            queue.reinitialize_discarding(&self.transport)?;
+            for index in 0..slot_for_token.len() {
+                let slot = &mut slots[index * EVENT_BYTES..(index + 1) * EVENT_BYTES];
+                let token = queue
+                    .submit_output_deferred(&self.transport, slot)
+                    .map_err(|error| ReinitError::Restore {
+                        device,
+                        what: "the event buffers",
+                        error,
+                    })?;
+                slot_for_token[usize::from(token)] =
+                    u16::try_from(index).expect("event slots were built from a u16 count");
+            }
+            queue.publish();
+        }
+        let found = ItemCounts {
+            streams: counted(&self.transport, CONFIG_STREAMS, MAX_STREAMS, "streams").map_err(
+                |_| ReinitError::DeviceChanged {
+                    device,
+                    what: "the number of streams",
+                },
+            )?,
+            jacks: counted(&self.transport, CONFIG_JACKS, MAX_JACKS, "jacks").map_err(|_| {
+                ReinitError::DeviceChanged {
+                    device,
+                    what: "the number of jacks",
+                }
+            })?,
+            chmaps: counted(
+                &self.transport,
+                CONFIG_CHMAPS,
+                MAX_CHANNEL_MAPS,
+                "channel maps",
+            )
+            .map_err(|_| ReinitError::DeviceChanged {
+                device,
+                what: "the number of channel maps",
+            })?,
+        };
+        if found != self.counts {
+            return Err(ReinitError::DeviceChanged {
+                device,
+                what: "the number of streams, jacks or channel maps",
+            });
+        }
+        driver_ok(&self.transport);
+        self.events
+            .try_lock()
+            .expect("the event lock was just released")
+            .queue
+            .notify(&self.transport);
+
+        for index in 0..MAX_STREAMS {
+            let stream = StreamId::new(index as u32);
+            let record = self.records.lock()[index];
+            let Some(params) = record.params else {
+                continue;
+            };
+            let mut steps: [Option<(Vec<u8>, &'static str)>; 3] = [None, None, None];
+            steps[0] = Some((
+                encode_set_params(stream, &params).to_vec(),
+                "a stream's parameters",
+            ));
+            if matches!(record.phase, StreamPhase::Prepared | StreamPhase::Running) {
+                steps[1] = Some((
+                    encode_pcm_header(R_PCM_PREPARE, stream).to_vec(),
+                    "a prepared stream",
+                ));
+            }
+            if record.phase == StreamPhase::Running || record.resume {
+                steps[2] = Some((
+                    encode_pcm_header(R_PCM_START, stream).to_vec(),
+                    "a running stream",
+                ));
+            }
+            for (request, what) in steps.into_iter().flatten() {
+                let (response, written) = polled_command(
+                    &self.transport,
+                    &self.control,
+                    &request,
+                    HEADER_BYTES,
+                    &mut expired,
+                )
+                .map_err(|error| match error {
+                    PolledError::Expired => ReinitError::RestoreTimedOut { device, what },
+                    PolledError::Busy => ReinitError::QueueBusy {
+                        device,
+                        queue: CONTROL_QUEUE_INDEX,
+                    },
+                    PolledError::Queue(error) => ReinitError::Restore {
+                        device,
+                        what,
+                        error,
+                    },
+                })?;
+                if (written as usize) < HEADER_BYTES
+                    || status_of(&response).and_then(check_status).is_err()
+                {
+                    return Err(ReinitError::Restore {
+                        device,
+                        what,
+                        error: IoError::DeviceFault,
+                    });
+                }
+            }
+            if record.resume {
+                self.record(stream, |record| {
+                    record.phase = StreamPhase::Running;
+                    record.resume = false;
+                });
+            }
+        }
+        Ok(DeviceReset { device })
     }
 
     /// Takes one event out of the ring, if the device has published one,
@@ -598,7 +902,15 @@ impl<T: VirtioTransport> PlaybackDevice for VirtioSndDevice<T> {
         check_params(&info, &params)?;
         let request = encode_set_params(stream, &params);
         let mut response = [0_u8; HEADER_BYTES];
-        self.control_command(&request, &mut response).await?;
+        let previous = self.record(stream, |record| {
+            record.params = Some(params);
+            record.phase = StreamPhase::ParamsSet;
+            record.resume = false;
+        });
+        if let Err(error) = self.control_command(&request, &mut response).await {
+            self.put_back(stream, previous);
+            return Err(error);
+        }
         // Only once the device has taken them: a length remembered for a
         // configuration the device refused would let the next `write`
         // hand it a period it never agreed to.

@@ -36,6 +36,8 @@ use super::{
     VirtioSndDevice, XFER_STATUS_BYTES, decode_channel_maps, decode_event, decode_jacks,
     decode_streams,
 };
+use crate::features::RenegotiateError;
+use crate::resume::{DeviceReset, QuiesceError, ReinitError};
 use crate::testing::{FakeTransport, FakeTransportConfig};
 use crate::transport::{DeviceType, VirtioFeatures, VirtioTransport};
 
@@ -808,4 +810,195 @@ fn an_event_round_trips_through_its_wire_bytes() {
         decode_event(&bytes, EVENT_BYTES as u32),
         Err(AudioError::UnexpectedResponse { code: 0x4321 })
     );
+}
+
+/// Plays the device for a driver that is polling it: answers the one
+/// control command the driver has outstanding, or else the oldest
+/// period, and records the control request it read.
+fn play_device(device: &VirtioSndDevice<FakeTransport>, requests: &mut Vec<Vec<u8>>) {
+    let control = device
+        .control
+        .try_lock()
+        .expect("a polling driver does not hold the control queue lock")
+        .device_in_flight_heads();
+    if let Some(&token) = control.first() {
+        requests.push(control_request(device, token));
+        answer_control(device, token, &S_OK.to_le_bytes());
+        return;
+    }
+    let tx = device
+        .tx
+        .try_lock()
+        .expect("a polling driver does not hold the transmit queue lock")
+        .device_in_flight_heads();
+    if let Some(&token) = tx.first() {
+        answer_tx(device, token, S_OK, 0);
+    }
+}
+
+/// Drives a stream to `PCM_START` and leaves one period with the device.
+fn running_stream_and_a_period(device: &VirtioSndDevice<FakeTransport>) -> Vec<u8> {
+    for step in 0..3 {
+        let (_, outcome) = match step {
+            0 => round_trip(device, pin!(device.set_params(STREAM, params())), S_OK),
+            1 => round_trip(device, pin!(device.prepare(STREAM)), S_OK),
+            _ => round_trip(device, pin!(device.start(STREAM)), S_OK),
+        };
+        assert_eq!(outcome, Ok(()));
+    }
+    alloc::vec![0x5a_u8; params().period_bytes as usize]
+}
+
+/// A quiesce stops a running stream, which is what lets the device
+/// complete the period it holds, and the period's writer still gets its
+/// answer afterwards.
+#[test]
+fn quiesce_stops_a_running_stream_and_waits_for_its_periods() {
+    let device = device();
+    let period = running_stream_and_a_period(&device);
+    let mut write = pin!(device.write(STREAM, &period));
+    pending_tx(&device, write.as_mut());
+
+    let mut requests = Vec::new();
+    device
+        .quiesce(|| {
+            play_device(&device, &mut requests);
+            false
+        })
+        .expect("the device answers inside the deadline");
+
+    assert_eq!(requests.len(), 1);
+    assert_eq!(command_of(&requests[0]), R_PCM_STOP);
+    assert_eq!(
+        block_on(poll_once(write.as_mut())),
+        Some(Ok(helios_hal::audio::XferStatus { latency_bytes: 0 })),
+        "the completion reaped during the quiesce is still the writer's"
+    );
+}
+
+#[test]
+fn quiesce_gives_up_when_the_deadline_passes() {
+    let device = device();
+    let (_, outcome) = round_trip(&device, pin!(device.set_params(STREAM, params())), S_OK);
+    assert_eq!(outcome, Ok(()));
+    let period = alloc::vec![0_u8; params().period_bytes as usize];
+    let mut write = pin!(device.write(STREAM, &period));
+    pending_tx(&device, write.as_mut());
+
+    assert_eq!(
+        device.quiesce(|| true),
+        Err(QuiesceError::RequestsStillInFlight {
+            device: DeviceType::Sound,
+            queue: 2,
+            count: 1,
+        })
+    );
+}
+
+/// The device lost the stream; it is driven back through the commands
+/// that built it, in order, and then plays again.
+#[test]
+fn a_reset_device_gets_its_streams_back_with_the_features_it_had() {
+    let device = device();
+    let period = running_stream_and_a_period(&device);
+    let mut write = pin!(device.write(STREAM, &period));
+    pending_tx(&device, write.as_mut());
+    let mut ignored = Vec::new();
+    device
+        .quiesce(|| {
+            play_device(&device, &mut ignored);
+            false
+        })
+        .expect("the device answers inside the deadline");
+    assert!(block_on(poll_once(write.as_mut())).is_some());
+
+    device.transport.reset_behind_the_driver();
+    let mut requests = Vec::new();
+    assert_eq!(
+        device.reinitialize(|| {
+            play_device(&device, &mut requests);
+            false
+        }),
+        Ok(DeviceReset {
+            device: DeviceType::Sound
+        })
+    );
+    let commands: Vec<u32> = requests.iter().map(|request| command_of(request)).collect();
+    assert_eq!(commands, [R_PCM_SET_PARAMS, R_PCM_PREPARE, R_PCM_START]);
+    assert_eq!(word_at(&requests[0], 8), params().buffer_bytes);
+    assert_eq!(device.transport.driver_features(), device.features().bits());
+    assert_eq!(device.transport.driver_reset_count(), 2);
+
+    // The ring starts again and the stream takes a period.
+    let mut next = pin!(device.write(STREAM, &period));
+    let token = pending_tx(&device, next.as_mut());
+    answer_tx(&device, token, S_OK, 1);
+    assert_eq!(
+        block_on(poll_once(next)),
+        Some(Ok(helios_hal::audio::XferStatus { latency_bytes: 1 }))
+    );
+    // The event ring was posted again whole.
+    report(&device, 0, EVT_PCM_XRUN, 0);
+    assert!(block_on(poll_once(pin!(device.next_event()))).is_some());
+}
+
+#[test]
+fn a_device_that_never_answers_a_restore_command_times_out() {
+    let device = device();
+    let _ = running_stream_and_a_period(&device);
+    assert_eq!(
+        device.reinitialize(|| true),
+        Err(ReinitError::RestoreTimedOut {
+            device: DeviceType::Sound,
+            what: "a stream's parameters",
+        })
+    );
+}
+
+#[test]
+fn a_device_that_offers_fewer_features_after_the_reset_is_refused() {
+    let device = device();
+    device
+        .transport
+        .withdraw_features(VirtioFeatures::VERSION_1.bits());
+    assert_eq!(
+        device.reinitialize(|| false),
+        Err(ReinitError::Renegotiate(
+            RenegotiateError::FeatureWithdrawn {
+                device: DeviceType::Sound,
+                bit: 32,
+            }
+        ))
+    );
+}
+
+#[test]
+fn a_device_that_presents_other_streams_is_refused() {
+    let device = device();
+    device.transport.set_config_u32(super::CONFIG_STREAMS, 2);
+    assert_eq!(
+        device.reinitialize(|| false),
+        Err(ReinitError::DeviceChanged {
+            device: DeviceType::Sound,
+            what: "the number of streams, jacks or channel maps",
+        })
+    );
+}
+
+/// A command the device refused is not remembered: the reset device is
+/// not told about a stream it never agreed to.
+#[test]
+fn a_refused_command_leaves_no_record_to_restore() {
+    let device = device();
+    let (_, outcome) = round_trip(&device, pin!(device.set_params(STREAM, params())), S_IO_ERR);
+    assert!(outcome.is_err());
+
+    let mut requests = Vec::new();
+    let _reset = device
+        .reinitialize(|| {
+            play_device(&device, &mut requests);
+            false
+        })
+        .expect("a device with nothing to restore comes back");
+    assert!(requests.is_empty());
 }
