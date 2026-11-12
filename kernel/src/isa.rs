@@ -64,22 +64,23 @@ impl GuestIsa {
         tracing::info!(
             triple = self.triple,
             processor = self.processor.name(),
-            flags = %CraneliftFlags(self.processor),
+            flags = %CraneliftFlags(self.compile_target()),
             "guest code ISA level selected"
         );
     }
 }
 
-/// A level's Cranelift flags, comma separated, floor's first.
-struct CraneliftFlags(&'static IsaLevel);
+/// A compile target's Cranelift flags, comma separated: the level's
+/// features, floor's first, then the target's settings.
+struct CraneliftFlags(CwasmTarget<'static>);
 
 impl fmt::Display for CraneliftFlags {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (index, feature) in self.0.features().enumerate() {
+        for (index, flag) in self.0.cranelift_flags().enumerate() {
             if index > 0 {
                 formatter.write_str(",")?;
             }
-            formatter.write_str(feature.cranelift_flag())?;
+            formatter.write_str(flag)?;
         }
         Ok(())
     }
@@ -117,10 +118,11 @@ mod tests {
     #[test]
     fn the_flags_line_lists_every_flag_of_the_level() {
         let guest = GuestIsa::for_build_target(Some(floor_only_probe));
-        let flags = std::format!("{}", CraneliftFlags(guest.processor()));
+        let flags = std::format!("{}", CraneliftFlags(guest.compile_target()));
+        let levels = cwasm_target_isa_levels(env!("HELIOS_BUILD_TARGET"));
         assert_eq!(
             flags.split(',').filter(|flag| !flag.is_empty()).count(),
-            guest.processor().features().count()
+            guest.processor().features().count() + levels.cranelift_settings().len()
         );
     }
 }

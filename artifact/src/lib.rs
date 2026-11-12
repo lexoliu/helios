@@ -10,6 +10,8 @@ pub use isa::{
     ProbeAnswers, cwasm_target_isa_levels,
 };
 
+use alloc::format;
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
@@ -64,6 +66,51 @@ pub fn cwasm_target_supports_wasm_simd(target: &str) -> bool {
 pub fn cwasm_target_guest_stack_limit_offset(target: &str) -> Option<i32> {
     let os = target.split('-').nth(2);
     (os == Some("none")).then_some(GUEST_STACK_LIMIT_OFFSET)
+}
+
+/// The code protection the machine code of a cwasm artifact carries.
+///
+/// It is part of an artifact's compatibility: the compiler records it in the
+/// artifact's version string through [`Self::module_version`], and the kernel
+/// engine, which requires the protection [`cwasm_target_code_protection`]
+/// names for its target, refuses an artifact whose string differs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CwasmCodeProtection {
+    /// Every function that sets up a frame signs its return address and
+    /// authenticates it before returning.
+    pub return_addresses_signed: bool,
+}
+
+impl CwasmCodeProtection {
+    /// Code that carries no protection.
+    pub const NONE: Self = Self {
+        return_addresses_signed: false,
+    };
+
+    /// The version string a Wasmtime engine records in, and requires of, an
+    /// artifact with this protection, given the string it uses without one
+    /// (`wasmtime`). `None` means the engine keeps its default strategy, so
+    /// an unprotected artifact is byte-identical to one built before the
+    /// protection was recorded.
+    ///
+    /// The string is a compatibility key compared for byte equality, not a
+    /// document.
+    pub fn module_version(self, wasmtime: &str) -> Option<String> {
+        self.return_addresses_signed
+            .then(|| format!("{wasmtime}+return-address-signing"))
+    }
+}
+
+/// The code protection every Cranelift-compiled cwasm artifact for `target`
+/// carries, at any of its ISA levels. It is derived from the settings every
+/// level's Cranelift flags include
+/// ([`CwasmIsaLevels::cranelift_settings`]), so the two cannot drift apart.
+pub fn cwasm_target_code_protection(target: &str) -> CwasmCodeProtection {
+    CwasmCodeProtection {
+        return_addresses_signed: cwasm_target_isa_levels(target)
+            .cranelift_settings()
+            .contains(&isa::SIGN_RETURN_ADDRESS),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -270,7 +317,75 @@ impl fmt::Display for SignatureAlgorithm {
 
 #[cfg(test)]
 mod tests {
-    use super::{GUEST_STACK_LIMIT_OFFSET, cwasm_target_guest_stack_limit_offset};
+    use alloc::vec::Vec;
+
+    use super::{
+        CwasmCodeProtection, CwasmTarget, GUEST_STACK_LIMIT_OFFSET, cwasm_target_code_protection,
+        cwasm_target_guest_stack_limit_offset, cwasm_target_isa_levels,
+    };
+
+    #[test]
+    fn aarch64_targets_sign_return_addresses_and_others_do_not() {
+        for target in [
+            "aarch64-unknown-none",
+            "aarch64-apple-darwin",
+            "aarch64-unknown-linux-gnu",
+        ] {
+            assert_eq!(
+                cwasm_target_code_protection(target),
+                CwasmCodeProtection {
+                    return_addresses_signed: true
+                },
+                "{target}"
+            );
+        }
+        for target in [
+            "x86_64-unknown-none",
+            "x86_64-unknown-linux-gnu",
+            "riscv64gc-unknown-none-elf",
+        ] {
+            assert_eq!(
+                cwasm_target_code_protection(target),
+                CwasmCodeProtection::NONE,
+                "{target}"
+            );
+        }
+    }
+
+    /// Only the HINT-space signing flag is enabled: `has_pauth` would allow
+    /// non-HINT instructions the kernel's feature probe does not answer for,
+    /// and the B key is not the one the kernel enables. Every level of the
+    /// target signs.
+    #[test]
+    fn aarch64_flags_sign_with_the_hint_forms_and_key_a_only() {
+        let triple = "aarch64-unknown-none";
+        for level in cwasm_target_isa_levels(triple).iter() {
+            let flags: Vec<_> = CwasmTarget::new(triple, level.name())
+                .expect("a defined level")
+                .cranelift_flags()
+                .collect();
+            assert!(flags.contains(&"sign_return_address"), "{flags:?}");
+            assert!(!flags.contains(&"has_pauth"), "{flags:?}");
+            assert!(
+                !flags.contains(&"sign_return_address_with_bkey"),
+                "{flags:?}"
+            );
+            assert!(!flags.contains(&"sign_return_address_all"), "{flags:?}");
+        }
+    }
+
+    #[test]
+    fn no_protection_keeps_the_default_version_strategy() {
+        assert_eq!(CwasmCodeProtection::NONE.module_version("48"), None);
+        assert_eq!(
+            CwasmCodeProtection {
+                return_addresses_signed: true
+            }
+            .module_version("48")
+            .as_deref(),
+            Some("48+return-address-signing")
+        );
+    }
 
     /// Every bare-metal kernel target reads the processor's word; a hosted
     /// target keeps the limit in the store.

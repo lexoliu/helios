@@ -12,6 +12,11 @@
 //! about when it checks an artifact's recorded flags. Wasmtime's own mapping
 //! (`check_compatible_with_isa_flag` in `crates/wasmtime/src/engine.rs` of the
 //! fork) is the authority for the second name.
+//!
+//! A target may also enable code-generation settings at every level. They
+//! are not processor features: no level adds them, no probe is asked about
+//! them, and Wasmtime accepts an artifact carrying them on any processor of
+//! the target.
 
 use alloc::string::String;
 use core::iter::FusedIterator;
@@ -225,10 +230,24 @@ const AARCH64_LSE_FP16_DOTPROD: IsaLevel = IsaLevel::above(
 
 const RISCV64GC: IsaLevel = IsaLevel::floor("riscv64gc", &[]);
 
-/// The chain of levels a target's cwasm artifacts can be compiled for.
+/// The Cranelift setting that signs the return address of every function
+/// that sets up a frame, with the A key, and authenticates it before
+/// returning.
+pub(crate) const SIGN_RETURN_ADDRESS: &str = "sign_return_address";
+
+// `sign_return_address` emits HINT-space instructions, which do nothing on a
+// processor that does not enforce them, so it holds at every level and asks
+// the probe nothing (the fork's `check_compatible_with_isa_flag` accepts it
+// on any host). `has_pauth` is not enabled: it would allow the non-HINT
+// forms, which need the feature.
+const AARCH64_SETTINGS: &[&str] = &[SIGN_RETURN_ADDRESS];
+
+/// The chain of levels a target's cwasm artifacts can be compiled for, and
+/// the code-generation settings every one of them enables.
 #[derive(Clone, Copy, Debug)]
 pub struct CwasmIsaLevels {
     top: &'static IsaLevel,
+    settings: &'static [&'static str],
 }
 
 /// The levels defined for `target`.
@@ -239,19 +258,26 @@ pub struct CwasmIsaLevels {
 /// Helios has no cwasm support for is a build misconfiguration, not a case to
 /// compile for a guess.
 pub fn cwasm_target_isa_levels(target: &str) -> CwasmIsaLevels {
-    let top = if target.starts_with("x86_64-") {
-        &X86_64_V4_VBMI_BITALG
+    let (top, settings): (_, &'static [&'static str]) = if target.starts_with("x86_64-") {
+        (&X86_64_V4_VBMI_BITALG, &[])
     } else if target.starts_with("aarch64-") {
-        &AARCH64_LSE_FP16_DOTPROD
+        (&AARCH64_LSE_FP16_DOTPROD, AARCH64_SETTINGS)
     } else if target.starts_with("riscv64") {
-        &RISCV64GC
+        (&RISCV64GC, &[])
     } else {
         panic!("no cwasm ISA levels are defined for target {target}")
     };
-    CwasmIsaLevels { top }
+    CwasmIsaLevels { top, settings }
 }
 
 impl CwasmIsaLevels {
+    /// The Cranelift settings every level of the target enables. They are
+    /// not features: [`select`](Self::select) and
+    /// [`probe_answers`](Self::probe_answers) never ask the probe about them.
+    pub const fn cranelift_settings(&self) -> &'static [&'static str] {
+        self.settings
+    }
+
     /// The lowest level, which every processor the target supports satisfies.
     pub fn floor(&self) -> &'static IsaLevel {
         self.top.at_rank(0)
@@ -361,13 +387,18 @@ pub struct ProbeAnswers(u64);
 pub struct CwasmTarget<'a> {
     triple: &'a str,
     level: &'static IsaLevel,
+    settings: &'static [&'static str],
 }
 
 impl<'a> CwasmTarget<'a> {
     /// Names the level `level` of `triple`'s chain.
     pub fn new(triple: &'a str, level: &str) -> Result<Self, IsaLevelError> {
-        let level = cwasm_target_isa_levels(triple).by_name(level)?;
-        Ok(Self { triple, level })
+        let levels = cwasm_target_isa_levels(triple);
+        Ok(Self {
+            triple,
+            level: levels.by_name(level)?,
+            settings: levels.cranelift_settings(),
+        })
     }
 
     pub const fn triple(&self) -> &'a str {
@@ -378,9 +409,14 @@ impl<'a> CwasmTarget<'a> {
         self.level
     }
 
-    /// The Cranelift flags that compile for the level, the floor's first.
+    /// The Cranelift flags that compile for the level: its features, the
+    /// floor's first, then the settings every level of the target enables.
     pub fn cranelift_flags(&self) -> impl Iterator<Item = &'static str> + use<> {
-        self.level.features().map(IsaFeature::cranelift_flag)
+        let settings = self.settings;
+        self.level
+            .features()
+            .map(IsaFeature::cranelift_flag)
+            .chain(settings.iter().copied())
     }
 }
 
@@ -497,7 +533,7 @@ mod tests {
         let expected: [(&str, &[&str]); 4] = [
             (X86, X86_FLOOR),
             ("x86_64-unknown-linux-gnu", X86_FLOOR),
-            (AARCH64, &["has_lse", "has_fp16"]),
+            (AARCH64, &["has_lse", "has_fp16", "sign_return_address"]),
             (RISCV, &[]),
         ];
         for (target, flags) in expected {
@@ -529,8 +565,44 @@ mod tests {
         let aarch64 = CwasmTarget::new(AARCH64, "aarch64-lse-fp16-dotprod").unwrap();
         assert_eq!(
             aarch64.cranelift_flags().collect::<Vec<_>>(),
-            ["has_lse", "has_fp16", "has_dotprod"]
+            ["has_lse", "has_fp16", "has_dotprod", "sign_return_address"]
         );
+    }
+
+    /// A target-wide setting reaches every level's flags and no level's
+    /// features, so neither selection nor the probe answers ask about it.
+    #[test]
+    fn settings_hold_at_every_level_and_are_never_probed() {
+        for target in [X86, AARCH64, RISCV] {
+            let levels = cwasm_target_isa_levels(target);
+            for level in levels.iter() {
+                let flags: Vec<_> = CwasmTarget::new(target, level.name())
+                    .unwrap()
+                    .cranelift_flags()
+                    .collect();
+                for setting in levels.cranelift_settings() {
+                    assert!(flags.contains(setting), "{target} {}", level.name());
+                    assert!(
+                        level
+                            .features()
+                            .all(|feature| feature.cranelift_flag() != *setting
+                                && feature.probe_name() != *setting),
+                        "{target} {}",
+                        level.name()
+                    );
+                }
+            }
+        }
+        fn silent_on_settings(name: &str) -> Option<bool> {
+            (name != SIGN_RETURN_ADDRESS).then_some(true)
+        }
+        let levels = cwasm_target_isa_levels(AARCH64);
+        assert_eq!(levels.cranelift_settings(), [SIGN_RETURN_ADDRESS]);
+        assert_eq!(
+            levels.select(Some(silent_on_settings)).unwrap().name(),
+            "aarch64-lse-fp16-dotprod"
+        );
+        assert!(levels.probe_answers(silent_on_settings).is_ok());
     }
 
     #[test]

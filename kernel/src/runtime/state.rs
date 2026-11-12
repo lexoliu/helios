@@ -1083,6 +1083,11 @@ where
         assert!(installed, "memory balloon was installed more than once");
     }
 
+    /// The memory balloon, when the platform gave this kernel one.
+    pub fn memory_balloon(&self) -> Option<BalloonHandle> {
+        self.inner.balloon.get().cloned()
+    }
+
     /// Publishes swap, once a backend has brought it up.
     pub fn install_swap(&self, swap: crate::SwapHandle) {
         let mut installed = false;
@@ -1228,7 +1233,7 @@ where
     }
 
     fn memory_balloon(&self) -> Option<BalloonHandle> {
-        self.inner.balloon.get().cloned()
+        RuntimeState::memory_balloon(self)
     }
 
     fn device_grants(&self) -> &DeviceGrantRegistry {
