@@ -591,6 +591,60 @@ jobs:
           # rather than something that quietly starts or stops being
           # true.
           ! grep -qF 'device grant published' "$runtime/inspector.log"
+      # The swap tiers on the architecture the compressed store ships
+      # on: a child fills a region with a mix of random, text and zero
+      # pages, the command holds the machine under allocation until the
+      # kernel evicts it, and every byte has to come back. The disk tier
+      # takes the random pages, the compressed store the text, and the
+      # zero pages take no storage, so the run crosses all three. The
+      # run without the scratch disk proves the RAM tiers carry on
+      # alone. Random pages have nowhere to go there, since the store
+      # refuses what does not compress, so the command could never see
+      # them evicted: that run is text pages, which the store takes.
+      - name: Swap pages out and back on aarch64 with the scratch disk
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+          HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          set -o pipefail
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/swap-disk"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G \
+            --accel tcg \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger --boot-program procbench \
+            --no-compiler-plugin \
+            shell -c '/bin/procbench swap-cycle --content mixed /bin/procbench; echo guest-alive' \
+            2>&1 > swap-disk.out | tee "$runtime/inspector.log"
+          cat swap-disk.out
+          grep -Eq '^swap-cycle:[0-9]+$' swap-disk.out
+          grep -Fqx guest-alive swap-disk.out
+          ! grep -Fq 'Kernel panic' swap-disk.out
+      - name: Swap pages out and back on aarch64 without the scratch disk
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+          HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          set -o pipefail
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/swap-no-disk"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G \
+            --accel tcg --no-data-disk \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger --boot-program procbench \
+            --no-compiler-plugin \
+            shell -c '/bin/procbench swap-cycle --content text /bin/procbench; echo guest-alive' \
+            2>&1 > swap-no-disk.out | tee "$runtime/inspector.log"
+          cat swap-no-disk.out
+          grep -Eq '^swap-cycle:[0-9]+$' swap-no-disk.out
+          grep -Fqx guest-alive swap-no-disk.out
+          ! grep -Fq 'Kernel panic' swap-no-disk.out
       - name: Upload the inspector runtime directories
         if: failure()
         uses: actions/upload-artifact@v4

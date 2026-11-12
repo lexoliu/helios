@@ -472,7 +472,9 @@ block device online, self check passed capacity_bytes=268435456 …
 Every inspector profile attaches that disk: `virtio-blk-device` on the
 MMIO platforms (aarch64, riscv64) and `virtio-blk-pci` on x86, always
 with `serial=helios-data`, backed by a `data.img` in the VM's runtime
-directory whose size `--data-disk-size` controls. `helios-inspector
+directory whose size `--data-disk-size` controls. `--no-data-disk` leaves
+it off, which boots a machine with no swap device: the swap tiers in RAM
+carry on alone. `helios-inspector
 stats` shows the device the guest kernel ended up with, its geometry, its
 queues and the requests the kernel has issued.
 
