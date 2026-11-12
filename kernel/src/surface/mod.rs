@@ -7,11 +7,10 @@
 //!
 //! * [`service`] is the registry and the queues. It mints a surface
 //!   identity, holds the events the compositor routed to it, and carries
-//!   what a dying client hands back. No trait object and no lock crosses
-//!   the boundary into the compositor's store.
-//! * [`instance`] is a client's side: the pinned, physically contiguous
-//!   pages its window lives in, inside its own linear memory, and the
-//!   surfaces it holds.
+//!   the identities of a dying client's windows. No trait object and no
+//!   lock crosses the boundary into the compositor's store.
+//! * [`instance`] is each instance's side: the windows a client holds,
+//!   and the views the compositor holds of them.
 //!
 //! The compositor itself is a user-mode wasm program like any other. It
 //! is reached through a [`crate::ProviderSlot`], the same write-once
@@ -23,33 +22,34 @@
 //! # Where the pixels are
 //!
 //! In the client's linear memory and in the compositor's, at the same
-//! time. One physically contiguous run is committed from the client's
-//! pool into the client's surface window, and the same run is mapped a
-//! second time into the compositor's. A client writes its window with
-//! ordinary stores, `commit` is one message, and the compositor composes
-//! from the bytes the client wrote. The kernel never sees a pixel.
+//! time. One [`crate::Buffer`] is pinned from the client's pool and
+//! shown at the span the client named; the compositor names a span of
+//! its own memory when it is told about the window, and the same buffer
+//! is shown there. A client writes its window with ordinary stores,
+//! `commit` is one message, and the compositor composes from the bytes
+//! the client wrote. The kernel never sees a pixel.
 //!
 //! # What a surface's pages cost, and when they come back
 //!
 //! They are the client's, charged to the client's pool, and they come
-//! back when the client's arena ends — which is when the instance dies —
-//! not when one surface of many is dropped. That is the rule
-//! [`crate::PinnedArena`] already states for a display frame buffer,
-//! and it is here for the same reason: a span released while somebody
-//! else still holds a view of it would put whatever the pool hands out
-//! next in front of the compositor. A client that churns through windows
-//! exhausts its own surface window and is told so.
+//! back when the last view of them ends. Each view holds a reference to
+//! the buffer, so a client that drops a window, or dies, while the
+//! compositor is still composing from it leaves the run pinned behind
+//! the compositor's view until the supervisor ends that view; nothing
+//! the pool hands out next can appear in front of the compositor.
 //!
 //! # Concurrency contract
 //!
 //! Stated per part: [`service`] for the registry and the queues,
-//! [`instance`] for the arena. The one rule that spans them is the
-//! release: a client's surfaces are let go by a drop, which cannot await
-//! anything, so the drop hands the whole arena to the compositor's
-//! supervisor and raises the return signal. The supervisor takes the
-//! windows off the desktop, drops its views of their pages, and only
-//! then lets the arena go, which is the point at which the pages are the
-//! client's pool's again.
+//! [`instance`] for the store-side records, [`crate::buffer`] for the
+//! frame buffers and views. The one rule that spans them is how a
+//! client lets a window go — by dying, by dropping the resource, or by
+//! cancelling a `create` the compositor was told about: each is a drop,
+//! which cannot await anything, so the drop hands the windows'
+//! identities to the compositor's supervisor and raises the return
+//! signal. The supervisor ends the compositor's view of each and then
+//! tells the compositor the window is gone; the buffer goes back to the
+//! client's pool when that view's reference does.
 
 mod instance;
 mod service;
@@ -58,11 +58,13 @@ mod tests;
 
 use thiserror::Error;
 
+use crate::buffer::{BufferError, ViewError};
+
 pub use instance::SurfaceOwnership;
 pub use service::{
-    MAX_INSTANCE_SURFACES, MAX_LIVE_SURFACES, ReturnedSurfaces, SURFACE_EVENT_QUEUE_DEPTH,
-    SURFACE_REQUEST_QUEUE_DEPTH, SurfaceCreate, SurfaceEvents, SurfaceGeometry, SurfaceId,
-    SurfaceRect, SurfaceRequest, SurfaceService, SurfaceShared,
+    MAX_INSTANCE_SURFACES, MAX_LIVE_SURFACES, ReturnedSurface, ReturnedSurfaces,
+    SURFACE_EVENT_QUEUE_DEPTH, SURFACE_REQUEST_QUEUE_DEPTH, SurfaceCreate, SurfaceEvents,
+    SurfaceGeometry, SurfaceId, SurfaceRect, SurfaceRequest, SurfaceService, SurfaceShared,
 };
 
 /// Why a surface request was refused.
@@ -92,11 +94,17 @@ pub enum SurfaceServiceError {
     /// The rectangle does not lie inside the surface it names.
     #[error("the region does not lie inside the surface")]
     OutOfBounds,
-    /// The instance's surface window has no room left.
-    #[error("this instance's surface window has no room left")]
-    WindowExhausted,
-    /// The frame buffer could not be pinned, or the compositor could not
-    /// be given a view of it.
+    /// The span is not whole pages inside the memory it names, is not
+    /// the length the window needs, or overlaps something already shown
+    /// there — the client's span, or the one the compositor answered
+    /// `create` with.
+    #[error("the window cannot be shown at that span: {0}")]
+    BadSpan(ViewError),
+    /// The compositor answered a request with its own `bad-span`, which
+    /// carries no reason the kernel can name.
+    #[error("the compositor refused a span")]
+    CompositorBadSpan,
+    /// The frame buffer could not be pinned.
     #[error("no contiguous run of memory left for a window")]
     OutOfMemory,
     /// A handle that outlived its surface.
@@ -108,17 +116,39 @@ pub enum SurfaceServiceError {
     NotTheCompositor,
 }
 
-impl From<crate::PinError> for SurfaceServiceError {
-    fn from(error: crate::PinError) -> Self {
+/// A frame buffer the pool refused, in the vocabulary a client acts on.
+impl From<BufferError> for SurfaceServiceError {
+    fn from(error: BufferError) -> Self {
         match error {
-            crate::PinError::EmptyRun => Self::UnsupportedSize,
-            crate::PinError::TooManyRuns => Self::TooManySurfaces,
-            crate::PinError::WindowExhausted => Self::WindowExhausted,
-            // A machine that cannot hand the compositor a view of the
-            // client's pages cannot compose the client's window at all,
-            // and the client's answer is the same as having no memory
-            // for it: this window cannot be backed here.
-            crate::PinError::OutOfMemory | crate::PinError::ShareRefused => Self::OutOfMemory,
+            BufferError::Empty | BufferError::TooLarge => Self::UnsupportedSize,
+            // An address space that refuses a run it was asked for
+            // correctly cannot back this window at all, and the client's
+            // answer is the same as having no memory for it.
+            BufferError::OutOfMemory | BufferError::AddressSpace(_) => Self::OutOfMemory,
+        }
+    }
+}
+
+/// A view the store refused, in the vocabulary a client acts on.
+impl From<ViewError> for SurfaceServiceError {
+    fn from(error: ViewError) -> Self {
+        match error {
+            ViewError::NoUnsharedMemory
+            | ViewError::Misaligned
+            | ViewError::OutOfBounds { .. }
+            | ViewError::WrongLength { .. }
+            | ViewError::Overlap => Self::BadSpan(error),
+            ViewError::TooManyViews => Self::TooManySurfaces,
+            // A window that cannot be shown for want of memory, or that
+            // the address space refused at a span the table had
+            // checked, cannot be backed here.
+            ViewError::OutOfMemory { .. } | ViewError::AddressSpace(_) => Self::OutOfMemory,
+            // A frame buffer is never a device region, and a surface ends
+            // only views it recorded: either answer means the surface
+            // table and the store's views disagree.
+            ViewError::UnalignedRegion | ViewError::NotShown => {
+                panic!("a surface's view answered {error}, which only a kernel defect produces")
+            }
         }
     }
 }

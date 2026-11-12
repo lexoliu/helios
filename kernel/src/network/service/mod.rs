@@ -32,13 +32,13 @@ use helios_netstack::{
     DhcpDnsServers, DhcpMessageType, DhcpPacket, DhcpServerMessage, DnsQuestionWriter,
     DnsRecordType, DnsResponse, EthernetFrame, EthernetProtocol, FlowTuple, IcmpEchoKey,
     IcmpEchoReply, Icmpv4Packet, Icmpv6Packet, InterfaceEventMark, IpAddress, IpCidr, IpProtocol,
-    Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6Packet, MAX_OUTBOUND_FRAMES,
-    NeighborCache, NeighborEntry, NetworkInterface as NetworkDevice, OutboundBatchStatus, Route,
-    RouteTable, RxChecksumOffload, RxDrain, RxFrame, SegmentationOffload, Stack, StackConfig,
-    StackError, StackEvent, StackInstant, TcpCloseKind, TcpConnectState, TcpConnectTerminalError,
-    TcpEndpoint, TcpListenBacklog, TcpPacket, TcpReadIntoState, TcpReadState,
-    TcpReceiveDiagnostics, TcpSendState, TcpStackCounters, UdpEgress, UdpEndpoint, UdpPacket,
-    UdpPayload, UdpSocketBinding, UdpSocketError, flow_hash,
+    Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6AddressEntry, Ipv6Cidr, Ipv6Packet,
+    MAX_OUTBOUND_FRAMES, NeighborCache, NeighborEntry, NetworkInterface as NetworkDevice,
+    OutboundBatchStatus, Route, RouteTable, RxChecksumOffload, RxDrain, RxFrame,
+    SegmentationOffload, Stack, StackConfig, StackError, StackEvent, StackInstant, TcpCloseKind,
+    TcpConnectState, TcpConnectTerminalError, TcpEndpoint, TcpListenBacklog, TcpPacket,
+    TcpReadIntoState, TcpReadState, TcpReceiveDiagnostics, TcpSendState, TcpStackCounters,
+    UdpEgress, UdpEndpoint, UdpPacket, UdpPayload, UdpSocketBinding, UdpSocketError, flow_hash,
 };
 use spin::{Mutex as SpinMutex, RwLock as SpinRwLock};
 
@@ -184,7 +184,7 @@ struct NetworkIpv4AddressTable {
 
 #[derive(Clone, Debug)]
 struct NetworkIpv6AddressTable {
-    entries: Vec<Ipv6Cidr>,
+    entries: Vec<Ipv6AddressEntry>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -371,7 +371,7 @@ impl NetworkControlPlane {
             .replace_ipv4_addresses(self.ipv4_addresses.load_full().entries.iter().copied());
         shard
             .stack
-            .replace_ipv6_addresses(self.ipv6_addresses.load_full().entries.iter().copied());
+            .replace_ipv6_address_entries(self.ipv6_addresses.load_full().entries.iter().copied());
         shard
             .stack
             .replace_ipv6_dns_servers(self.ipv6_dns_servers.load_full().entries.iter().copied());
@@ -407,7 +407,7 @@ impl NetworkControlPlane {
             }));
         self.ipv6_addresses
             .store(StdArc::new(NetworkIpv6AddressTable {
-                entries: shard.stack.ipv6_addresses().collect(),
+                entries: shard.stack.ipv6_address_entries().collect(),
             }));
         self.ipv6_dns_servers
             .store(StdArc::new(NetworkIpv6DnsServers {
@@ -472,7 +472,12 @@ impl NetworkControlPlane {
     }
 
     fn list_ipv6_addresses(&self) -> Vec<Ipv6Cidr> {
-        self.ipv6_addresses.load_full().entries.clone()
+        self.ipv6_addresses
+            .load_full()
+            .entries
+            .iter()
+            .map(Ipv6AddressEntry::cidr)
+            .collect()
     }
 
     fn list_ipv4_addresses(&self) -> Vec<KernelIpv4Cidr> {
