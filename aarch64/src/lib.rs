@@ -1002,6 +1002,10 @@ impl Cpu for Aarch64Cpu {
             take_pending_irq();
         }
         drop(mask);
+        // The wake the loop took, or one that raced it, leaves its latch
+        // set; `park_current` would take it as a wake for work it does
+        // not have.
+        runtime.wake_pending.store(false, Ordering::Release);
     }
 
     fn start_processor(&self, processor: ProcessorId) {
