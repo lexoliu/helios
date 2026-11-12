@@ -171,6 +171,22 @@ impl GuestInterrupts {
         self.running.interrupt_overdue(now);
     }
 
+    /// Interrupts every guest, on any processor, that is running now,
+    /// however long it has run.
+    ///
+    /// The freeze barrier calls it so that a guest in the middle of wasm
+    /// reaches the executor at its next function-entry or loop-header
+    /// check, instead of at the end of its slice. It makes the same
+    /// request [`Self::preempt_overdue`] does, so the store's callback
+    /// runs the same yield (or condemnation), and takes the same
+    /// lock-free, allocation-free, IPI-free walk: it is callable from
+    /// task context on any processor. A guest that is suspended or in
+    /// host code is not reached, because it is not running and reaches
+    /// the executor on its own.
+    pub fn interrupt_running(&self) {
+        self.running.interrupt_all();
+    }
+
     /// Interrupts every live store of `instance`, wherever it is: running
     /// on a processor, suspended on its fiber, or in host code.
     ///
@@ -318,6 +334,19 @@ impl<Target: Interruptible> RunningSlots<Target> {
     /// Interrupts every published target that has run for at least one
     /// slice by `now`.
     fn interrupt_overdue(&self, now: Instant) {
+        self.interrupt_where(|started| now.ticks().saturating_sub(started) >= self.slice_ticks);
+    }
+
+    /// Interrupts every published target, however long it has run.
+    fn interrupt_all(&self) {
+        self.interrupt_where(|_| true);
+    }
+
+    /// Interrupts every published target whose `started` tick `due`
+    /// accepts. The reader protocol of the module docs covers the walk,
+    /// whichever caller's policy decides.
+    #[inline]
+    fn interrupt_where(&self, due: impl Fn(u64) -> bool) {
         for slot in &self.slots {
             // An idle processor costs one load; the counted path below
             // runs only for a slot that names a target.
@@ -328,8 +357,7 @@ impl<Target: Interruptible> RunningSlots<Target> {
             let target = slot.target.load(Ordering::SeqCst);
             if !target.is_null() {
                 let started = slot.started.load(Ordering::Acquire);
-                let overdue = now.ticks().saturating_sub(started) >= self.slice_ticks;
-                if overdue && slot.target.load(Ordering::Relaxed) == target {
+                if due(started) && slot.target.load(Ordering::Relaxed) == target {
                     // SAFETY: `readers` counts this walk, and the owner
                     // that loaded `target` into the slot does not return
                     // from the withdrawal of `target` until `readers` is
@@ -528,6 +556,37 @@ mod tests {
         drop(first_run);
         slots.interrupt_overdue(Instant::new(10_000));
         interrupted(4);
+        assert_eq!(violations.load(Ordering::Relaxed), 0);
+    }
+
+    /// A freeze interrupts every running target on every processor at
+    /// once, whatever each one's run length, and no target whose run has
+    /// ended.
+    #[test]
+    fn interrupting_every_running_guest_ignores_how_long_each_has_run() {
+        let slots = RunningSlots::new(3, 1_000_000);
+        let (count, violations) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let first = Recorder::new(&count, &violations);
+        let third = Recorder::new(&count, &violations);
+
+        slots.interrupt_all();
+        assert_eq!(count.load(Ordering::Relaxed), 0, "no guest is running");
+
+        let first_run = slots.publish(ProcessorId::new(0), &first, Instant::new(7));
+        let third_run = slots.publish(ProcessorId::new(2), &third, Instant::new(8));
+        slots.interrupt_all();
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            2,
+            "both runs are younger than a slice and both are interrupted"
+        );
+
+        drop(third_run);
+        slots.interrupt_all();
+        assert_eq!(count.load(Ordering::Relaxed), 3);
+        drop(first_run);
+        slots.interrupt_all();
+        assert_eq!(count.load(Ordering::Relaxed), 3);
         assert_eq!(violations.load(Ordering::Relaxed), 0);
     }
 
