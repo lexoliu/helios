@@ -1877,8 +1877,8 @@ fn fdt_cells(bytes: &[u8]) -> Option<usize> {
         return None;
     }
     let mut value = 0usize;
-    for cell in bytes.chunks_exact(4) {
-        let cell = u32::from_be_bytes(cell.try_into().ok()?) as usize;
+    for &cell in bytes.as_chunks::<4>().0 {
+        let cell = u32::from_be_bytes(cell) as usize;
         value = value.checked_shl(32)? | cell;
     }
     Some(value)

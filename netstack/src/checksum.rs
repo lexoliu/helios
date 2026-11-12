@@ -340,11 +340,11 @@ fn sum_words_wide(bytes: &[u8]) -> u32 {
     }
 
     let mut sum = lanes.to_array().into_iter().sum::<u32>();
-    let mut chunks = bytes[offset..].chunks_exact(2);
-    for chunk in chunks.by_ref() {
-        sum += u32::from(u16::from_be_bytes([chunk[0], chunk[1]]));
+    let (words, remainder) = bytes[offset..].as_chunks::<2>();
+    for &word in words {
+        sum += u32::from(u16::from_be_bytes(word));
     }
-    if let [last] = chunks.remainder() {
+    if let [last] = remainder {
         sum += u32::from(*last) << 8;
     }
     sum
