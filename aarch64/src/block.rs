@@ -15,7 +15,7 @@ use alloc::vec::Vec;
 
 use crate::platform::PlatformDescription;
 use arm_gic::{IntId, Trigger};
-use helios_hal::fs::{BlockDevice, BlockDeviceRights};
+use helios_hal::fs::BlockDeviceRights;
 use helios_kernel::ExternalInterruptHandler;
 
 use crate::Aarch64Cpu;
