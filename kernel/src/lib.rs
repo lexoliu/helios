@@ -109,8 +109,8 @@ pub use exec::{
     ProfileHistory, ProfileScope, ProfileSink, ProgressChanged, ProgressMark, ProgressSignal,
     RawMutex, RawMutexLease, RawRwLock, RawRwLockReadLease, RawRwLockWriteLease, RwLock,
     RwLockReadGuard, RwLockWriteGuard, Sleep, Spawner, StatsSample, TaskCapacityError, TaskFunding,
-    Timer, TraceEvent, TraceField, TraceFilter, TraceHistory, TraceLevel, TraceValue, UptimeClock,
-    YieldNow, elapsed_millis, matches_perf_metric_filter, matches_profile_filter,
+    Timer, TraceEvent, TraceField, TraceFilter, TraceHistory, TraceLevel, TraceLog, TraceValue,
+    UptimeClock, YieldNow, elapsed_millis, matches_perf_metric_filter, matches_profile_filter,
     matches_trace_filter, monotonic_nanos, parse_console_text, wall_clock_offset_nanos, yield_now,
 };
 pub use gpu::{

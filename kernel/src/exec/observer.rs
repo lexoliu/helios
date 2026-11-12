@@ -221,10 +221,15 @@ pub struct ProfileFilter {
     pub stack_prefixes: PrefixSet,
 }
 
+/// One folded stack and its weight.
+///
+/// The stack is shared so that copying a sample out of a history clones a
+/// pointer and allocates nothing, which is what lets a read copy the
+/// history under its lock and do the rest after releasing it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FoldedProfileSample {
     pub scope: ProfileScope,
-    pub stack: String,
+    pub stack: Arc<str>,
     pub weight: u64,
 }
 
@@ -233,10 +238,12 @@ pub struct PerfMetricFilter {
     pub name_prefixes: PrefixSet,
 }
 
+/// One perf metric. Its name is shared for the reason
+/// [`FoldedProfileSample::stack`] is.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PerfMetricSample {
     pub scope: ProfileScope,
-    pub name: String,
+    pub name: Arc<str>,
     pub count: u64,
     pub total_events: u64,
     pub total_nanos: u64,
@@ -254,11 +261,112 @@ pub enum ProfileScope {
     User,
 }
 
+/// Most entries one stream poll copies out of the trace history in one
+/// lock hold, and so the size of the stack buffer it matches them in.
+pub const TRACE_STREAM_BATCH: usize = 32;
+
+/// Most lock holds one stream poll makes. With [`TRACE_STREAM_BATCH`] it
+/// covers the default history in one poll.
+const TRACE_STREAM_POLL_BATCHES: usize = 16;
+
+/// The events of a [`TraceLog`], oldest first, each with the sequence
+/// number it was recorded under.
+///
+/// Sequence numbers are contiguous: an event's index is its sequence
+/// number minus the first retained one, which is what lets a stream resume
+/// by position instead of by search. The events are shared so a reader
+/// copies pointers out of the history; nothing here allocates once
+/// constructed, because the queue is built at its capacity.
+///
+/// Concurrency: none of its own. It is only reachable through the lock of
+/// the [`TraceLog`] that owns it.
 #[derive(Debug)]
 pub struct TraceHistory {
     next_seq: u64,
     capacity: usize,
-    events: VecDeque<(u64, TraceEvent)>,
+    events: VecDeque<(u64, Arc<TraceEvent>)>,
+}
+
+/// The kernel's recent trace events and how they are read.
+///
+/// Concurrency contract: any processor records and any processor reads.
+/// Every operation takes the one history lock for a bounded, allocation-free
+/// copy and does everything else outside it.
+/// - Recording builds each event's [`Arc`] before locking, so the lock
+///   covers one `push_back`, and an evicted event is moved out under the
+///   lock and dropped after it, so no allocation or free happens under the
+///   lock.
+/// - [`Self::recent`] reserves its snapshot before locking, clones at most
+///   the history's capacity of pointers under the lock, and filters,
+///   limits and lowers after it.
+/// - [`Self::next_after`] keeps no buffer: each lock hold copies at most
+///   [`TRACE_STREAM_BATCH`] pointers after the caller's cursor into a stack
+///   array, and the filter runs after the lock is released, in at most
+///   `TRACE_STREAM_POLL_BATCHES` holds.
+///
+/// Nothing a reader does under the lock can re-enter it: the filter runs
+/// on pointers the reader already owns.
+#[derive(Debug)]
+pub struct TraceLog {
+    /// The history's capacity, kept outside the lock so a reader can size
+    /// its snapshot before taking it.
+    capacity: usize,
+    history: Mutex<TraceHistory>,
+}
+
+impl TraceLog {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            history: Mutex::new(TraceHistory::new(capacity)),
+        }
+    }
+
+    /// Records every non-empty line of `text` as one event stamped
+    /// `timestamp`, each pushed as it is parsed.
+    pub fn record_console_text(&self, timestamp: u64, text: &str) {
+        parse_console_text(timestamp, text, |event| {
+            let event = Arc::new(event);
+            let evicted = self.history.lock().push(event);
+            // The oldest event's last reference may free it; that happens
+            // here, with the lock released.
+            drop(evicted);
+        });
+    }
+
+    /// The newest `limit` events `filter` admits, oldest first.
+    pub fn recent(&self, filter: &TraceFilter, limit: u32) -> Vec<Arc<TraceEvent>> {
+        let mut events = Vec::with_capacity(self.capacity);
+        self.history.lock().copy_into(&mut events);
+        events.retain(|event| matches_trace_filter(event, filter));
+        let keep = limit as usize;
+        if events.len() > keep {
+            events.drain(..events.len() - keep);
+        }
+        events
+    }
+
+    /// The first event after `*cursor` that `filter` admits, with `*cursor`
+    /// moved onto it. When none is found, `*cursor` is left on the last
+    /// event examined so the next call resumes after it. A cursor that has
+    /// fallen behind the oldest retained event resumes at that event.
+    pub fn next_after(&self, cursor: &mut u64, filter: &TraceFilter) -> Option<Arc<TraceEvent>> {
+        for _ in 0..TRACE_STREAM_POLL_BATCHES {
+            let mut batch = ArrayVec::<(u64, Arc<TraceEvent>), TRACE_STREAM_BATCH>::new();
+            self.history.lock().copy_after_into(*cursor, &mut batch);
+            let exhausted = batch.len() < TRACE_STREAM_BATCH;
+            for (seq, event) in batch {
+                *cursor = seq;
+                if matches_trace_filter(&event, filter) {
+                    return Some(event);
+                }
+            }
+            if exhausted {
+                return None;
+            }
+        }
+        None
+    }
 }
 
 /// The profile and perf histories a subsystem records into.
@@ -270,9 +378,13 @@ pub struct TraceHistory {
 /// records its own phases, so a service that reached the histories
 /// through the runtime state would be a type that contains itself.
 ///
-/// Every operation is callable from any processor: the enable flag is
-/// an atomic and each history is behind its own lock, taken for the
-/// length of one record.
+/// Concurrency contract: every operation is callable from any processor.
+/// The enable flag is an atomic and each history is behind its own lock.
+/// A record holds its lock for the length of one record. A read
+/// ([`Self::folded`], [`Self::metrics`]) reserves its snapshot before
+/// locking, clones at most the history's capacity of pointers under the
+/// lock, and filters, sorts and truncates after releasing it, so no read
+/// allocates or frees while a history lock is held.
 #[derive(Clone)]
 pub struct ProfileSink {
     inner: Arc<ProfileSinkInner>,
@@ -280,6 +392,10 @@ pub struct ProfileSink {
 
 struct ProfileSinkInner {
     enabled: AtomicBool,
+    /// The histories' capacities, kept outside their locks so a read can
+    /// size its snapshot before taking one.
+    profile_capacity: usize,
+    perf_metric_capacity: usize,
     profiling: Mutex<ProfileHistory>,
     perf_metrics: Mutex<PerfMetricHistory>,
 }
@@ -289,10 +405,28 @@ impl ProfileSink {
         Self {
             inner: Arc::new(ProfileSinkInner {
                 enabled: AtomicBool::new(false),
+                profile_capacity,
+                perf_metric_capacity,
                 profiling: Mutex::new(ProfileHistory::new(profile_capacity)),
                 perf_metrics: Mutex::new(PerfMetricHistory::new(perf_metric_capacity)),
             }),
         }
+    }
+
+    /// The folded stacks `filter` admits, heaviest first, at most `limit`
+    /// of them (all when `limit` is zero).
+    pub fn folded(&self, filter: &ProfileFilter, limit: u32) -> Vec<FoldedProfileSample> {
+        let mut samples = Vec::with_capacity(self.inner.profile_capacity);
+        self.inner.profiling.lock().copy_into(&mut samples);
+        ProfileHistory::rank(samples, filter, limit)
+    }
+
+    /// The perf metrics `filter` admits, slowest total first, at most
+    /// `limit` of them (all when `limit` is zero).
+    pub fn metrics(&self, filter: &PerfMetricFilter, limit: u32) -> Vec<PerfMetricSample> {
+        let mut samples = Vec::with_capacity(self.inner.perf_metric_capacity);
+        self.inner.perf_metrics.lock().copy_into(&mut samples);
+        PerfMetricHistory::rank(samples, filter, limit)
     }
 
     /// Whether anything is recording. Every record path tests this
@@ -433,7 +567,8 @@ impl KeyedSample for PerfMetricSample {
 /// path amortised O(log capacity).
 ///
 /// Concurrency: none of its own. Each history sits behind the lock of
-/// the [`ProfileSink`] that owns it, held for one record.
+/// the [`ProfileSink`] that owns it, held for one record or for one
+/// pointer-cloning copy of the held samples.
 #[derive(Debug)]
 struct KeyedSamples<Sample> {
     capacity: usize,
@@ -597,7 +732,8 @@ trait ProfileStackInput {
     /// on the stack, so looking one up allocates nothing.
     fn with_name<R>(&self, with: impl FnOnce(&str) -> R) -> R;
 
-    fn into_string(self) -> String;
+    /// The name as the shared string a held sample keeps.
+    fn into_shared(self) -> Arc<str>;
 }
 
 impl ProfileStackInput for String {
@@ -605,8 +741,8 @@ impl ProfileStackInput for String {
         with(self)
     }
 
-    fn into_string(self) -> String {
-        self
+    fn into_shared(self) -> Arc<str> {
+        Arc::from(self)
     }
 }
 
@@ -615,8 +751,8 @@ impl ProfileStackInput for &str {
         with(self)
     }
 
-    fn into_string(self) -> String {
-        self.to_owned()
+    fn into_shared(self) -> Arc<str> {
+        Arc::from(self)
     }
 }
 
@@ -639,8 +775,8 @@ impl ProfileStackInput for ProfileStackParts<'_> {
         with(self.joined().as_str())
     }
 
-    fn into_string(self) -> String {
-        self.joined().as_str().to_owned()
+    fn into_shared(self) -> Arc<str> {
+        Arc::from(self.joined().as_str())
     }
 }
 
@@ -654,42 +790,57 @@ impl TraceHistory {
         }
     }
 
-    pub fn push(&mut self, event: TraceEvent) {
-        if self.events.len() == self.capacity {
-            let dropped = self.events.pop_front();
-            assert!(dropped.is_some(), "trace history underflowed");
-        }
+    /// Appends `event`, handing back the oldest event when the history was
+    /// full so the caller can drop it after releasing the lock.
+    #[must_use = "an evicted event is dropped by the caller, outside the history's lock"]
+    pub fn push(&mut self, event: Arc<TraceEvent>) -> Option<Arc<TraceEvent>> {
+        let evicted = (self.events.len() == self.capacity).then(|| {
+            self.events
+                .pop_front()
+                .expect("a full trace history holds an event")
+                .1
+        });
         let seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);
         self.events.push_back((seq, event));
+        evicted
     }
 
-    pub fn record_console_text(&mut self, timestamp: u64, text: &str) {
-        for event in parse_console_text(timestamp, text) {
-            self.push(event);
+    /// Appends a pointer to every held event to `out`, oldest first.
+    /// `out` must have room for them, so nothing allocates.
+    pub fn copy_into(&self, out: &mut Vec<Arc<TraceEvent>>) {
+        debug_assert!(
+            out.capacity() - out.len() >= self.events.len(),
+            "the snapshot was not reserved before the lock"
+        );
+        out.extend(self.events.iter().map(|(_, event)| event.clone()));
+    }
+
+    /// Appends the events after sequence number `cursor`, oldest first, to
+    /// `out` until it is full. A cursor behind the oldest retained event
+    /// starts at that event.
+    pub fn copy_after_into<const N: usize>(
+        &self,
+        cursor: u64,
+        out: &mut ArrayVec<(u64, Arc<TraceEvent>), N>,
+    ) {
+        let Some(&(first_seq, _)) = self.events.front() else {
+            return;
+        };
+        // Sequence numbers are contiguous, so the first event after the
+        // cursor sits at this offset from the front.
+        let start = cursor.saturating_add(1).saturating_sub(first_seq);
+        let start = usize::try_from(start).unwrap_or(usize::MAX);
+        if start >= self.events.len() {
+            return;
         }
-    }
-
-    pub fn recent(&self, filter: &TraceFilter, limit: u32) -> Vec<TraceEvent> {
-        let mut events = self
-            .events
-            .iter()
-            .map(|(_, event)| event)
-            .filter(|event| matches_trace_filter(event, filter))
-            .cloned()
-            .collect::<Vec<_>>();
-        let keep = limit as usize;
-        if events.len() > keep {
-            events.drain(..events.len() - keep);
-        }
-        events
-    }
-
-    pub fn next_after(&self, cursor: u64, filter: &TraceFilter) -> Option<(u64, TraceEvent)> {
-        self.events
-            .iter()
-            .find(|(seq, event)| *seq > cursor && matches_trace_filter(event, filter))
-            .map(|(seq, event)| (*seq, event.clone()))
+        let room = out.remaining_capacity();
+        out.extend(
+            self.events
+                .range(start..)
+                .take(room)
+                .map(|(seq, event)| (*seq, event.clone())),
+        );
     }
 }
 
@@ -749,29 +900,36 @@ impl ProfileHistory {
 
         self.samples.insert(FoldedProfileSample {
             scope,
-            stack: stack.into_string(),
+            stack: stack.into_shared(),
             weight,
         });
     }
 
-    pub fn folded(
-        &self,
+    /// Appends a copy of every held sample to `out`, in the history's
+    /// own order. `out` must have room for them, so nothing allocates: a
+    /// copy clones a pointer, not the stack.
+    pub fn copy_into(&self, out: &mut Vec<FoldedProfileSample>) {
+        debug_assert!(
+            out.capacity() - out.len() >= self.samples.samples.len(),
+            "the snapshot was not reserved before the lock"
+        );
+        out.extend(self.samples.iter().cloned());
+    }
+
+    /// Filters a copy taken by [`Self::copy_into`], orders it heaviest
+    /// first (ties by stack) and keeps `limit` of it, all when `limit` is
+    /// zero. It takes no lock, so it is for after the lock is released.
+    pub fn rank(
+        mut samples: Vec<FoldedProfileSample>,
         filter: &ProfileFilter,
-        additional: impl IntoIterator<Item = FoldedProfileSample>,
         limit: u32,
     ) -> Vec<FoldedProfileSample> {
-        let mut samples = self
-            .samples
-            .iter()
-            .cloned()
-            .chain(additional)
-            .filter(|sample| matches_profile_filter(sample, filter))
-            .collect::<Vec<_>>();
+        samples.retain(|sample| matches_profile_filter(sample, filter));
         samples.sort_by(|left, right| {
             right
                 .weight
                 .cmp(&left.weight)
-                .then_with(|| left.stack.cmp(&right.stack))
+                .then_with(|| (*left.stack).cmp(&*right.stack))
         });
         let keep = limit as usize;
         if keep != 0 && samples.len() > keep {
@@ -888,7 +1046,7 @@ impl PerfMetricHistory {
 
         self.samples.insert(PerfMetricSample {
             scope,
-            name: name.into_string(),
+            name: name.into_shared(),
             count: 1,
             total_events: events,
             total_nanos: elapsed_nanos,
@@ -901,19 +1059,33 @@ impl PerfMetricHistory {
         });
     }
 
-    pub fn recent(&self, filter: &PerfMetricFilter, limit: u32) -> Vec<PerfMetricSample> {
-        let mut samples = self
-            .samples
-            .iter()
-            .filter(|sample| matches_perf_metric_filter(sample, filter))
-            .cloned()
-            .collect::<Vec<_>>();
+    /// Appends a copy of every held sample to `out`, in the history's
+    /// own order. `out` must have room for them, so nothing allocates: a
+    /// copy clones a pointer, not the name.
+    pub fn copy_into(&self, out: &mut Vec<PerfMetricSample>) {
+        debug_assert!(
+            out.capacity() - out.len() >= self.samples.samples.len(),
+            "the snapshot was not reserved before the lock"
+        );
+        out.extend(self.samples.iter().cloned());
+    }
+
+    /// Filters a copy taken by [`Self::copy_into`], orders it by total
+    /// time, then count, then name, and keeps `limit` of it, all when
+    /// `limit` is zero. It takes no lock, so it is for after the lock is
+    /// released.
+    pub fn rank(
+        mut samples: Vec<PerfMetricSample>,
+        filter: &PerfMetricFilter,
+        limit: u32,
+    ) -> Vec<PerfMetricSample> {
+        samples.retain(|sample| matches_perf_metric_filter(sample, filter));
         samples.sort_by(|left, right| {
             right
                 .total_nanos
                 .cmp(&left.total_nanos)
                 .then_with(|| right.count.cmp(&left.count))
-                .then_with(|| left.name.cmp(&right.name))
+                .then_with(|| (*left.name).cmp(&*right.name))
         });
         let keep = limit as usize;
         if keep != 0 && samples.len() > keep {
@@ -923,15 +1095,16 @@ impl PerfMetricHistory {
     }
 }
 
-pub fn parse_console_text(timestamp: u64, text: &str) -> Vec<TraceEvent> {
+/// Hands `push` one event per non-empty line of `text`, each as soon as it
+/// is parsed, so no list of them is built.
+pub fn parse_console_text(timestamp: u64, text: &str, mut push: impl FnMut(TraceEvent)) {
     let stripped = strip_ansi(text);
-    stripped
-        .lines()
-        .filter_map(|raw_line| {
-            let line = raw_line.trim();
-            (!line.is_empty()).then(|| parse_console_line(timestamp, line))
-        })
-        .collect()
+    for raw_line in stripped.lines() {
+        let line = raw_line.trim();
+        if !line.is_empty() {
+            push(parse_console_line(timestamp, line));
+        }
+    }
 }
 
 pub fn matches_trace_filter(event: &TraceEvent, filter: &TraceFilter) -> bool {
@@ -1044,25 +1217,99 @@ fn strip_ansi(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use alloc::borrow::ToOwned;
-    use alloc::string::String;
+    use alloc::string::{String, ToString};
     use alloc::vec;
     use alloc::vec::Vec;
 
     use super::{
         FoldedProfileSample, MAX_FILTER_PREFIX_BYTES, MAX_FILTER_PREFIXES, PerfMetricFilter,
-        PerfMetricHistory, PerfSample, PrefixSet, PrefixSetError, ProfileFilter, ProfileHistory,
-        ProfileScope, TraceEvent, TraceField, TraceFilter, TraceHistory, TraceLevel, TraceValue,
-        matches_trace_filter, parse_console_text,
+        PerfMetricHistory, PerfMetricSample, PerfSample, PrefixSet, PrefixSetError, ProfileFilter,
+        ProfileHistory, ProfileScope, ProfileSink, TRACE_STREAM_BATCH, TraceEvent, TraceField,
+        TraceFilter, TraceLevel, TraceLog, TraceValue, matches_trace_filter, parse_console_text,
     };
     use helios_hal::cpu::HardwarePerfCounterDelta;
+    use triomphe::Arc;
 
     fn prefixes<const N: usize>(list: [&str; N]) -> PrefixSet {
         PrefixSet::from_prefixes(list).expect("the test prefixes fit the filter bounds")
     }
 
+    /// A read of one history alone, the copy and the ranking that
+    /// [`super::ProfileSink::folded`] runs either side of its lock.
+    fn folded(
+        history: &ProfileHistory,
+        filter: &ProfileFilter,
+        limit: u32,
+    ) -> Vec<FoldedProfileSample> {
+        let mut samples = Vec::with_capacity(history.samples.samples.len());
+        history.copy_into(&mut samples);
+        ProfileHistory::rank(samples, filter, limit)
+    }
+
+    fn metrics(
+        history: &PerfMetricHistory,
+        filter: &PerfMetricFilter,
+        limit: u32,
+    ) -> Vec<PerfMetricSample> {
+        let mut samples = Vec::with_capacity(history.samples.samples.len());
+        history.copy_into(&mut samples);
+        PerfMetricHistory::rank(samples, filter, limit)
+    }
+
+    fn event(target: &str, message: &str) -> TraceEvent {
+        TraceEvent {
+            timestamp: 0,
+            level: TraceLevel::Info,
+            target: target.to_owned(),
+            fields: vec![TraceField {
+                key: "message".to_owned(),
+                value: TraceValue::Text(message.to_owned()),
+            }],
+        }
+    }
+
+    fn message(event: &TraceEvent) -> &str {
+        match &event.fields[0].value {
+            TraceValue::Text(text) => text,
+            other => panic!("the test events carry text, not {other:?}"),
+        }
+    }
+
+    /// A log holding `count` events whose messages are their numbers and
+    /// whose targets alternate between `even` and `odd`.
+    fn numbered_log(capacity: usize, count: usize) -> TraceLog {
+        let log = TraceLog::new(capacity);
+        for number in 0..count {
+            let target = if number % 2 == 0 { "even" } else { "odd" };
+            let mut history = log.history.lock();
+            let evicted = history.push(Arc::new(event(target, &number.to_string())));
+            drop(history);
+            drop(evicted);
+        }
+        log
+    }
+
+    fn messages(events: &[Arc<TraceEvent>]) -> Vec<String> {
+        events
+            .iter()
+            .map(|event| message(event).to_owned())
+            .collect()
+    }
+
+    fn only(target: &str) -> TraceFilter {
+        TraceFilter {
+            min_level: None,
+            target_prefixes: prefixes([target]),
+        }
+    }
+
     #[test]
     fn parses_kernel_console_prefixes() {
-        let event = parse_console_text(42, "INFO [helios_kernel] Kernel initialized")
+        let mut parsed = Vec::new();
+        parse_console_text(42, "INFO [helios_kernel] Kernel initialized", |event| {
+            parsed.push(event)
+        });
+        let event = parsed
             .into_iter()
             .next()
             .expect("console line should produce one event");
@@ -1079,7 +1326,7 @@ mod tests {
 
     #[test]
     fn trace_history_applies_filter_and_limit() {
-        let mut history = TraceHistory::new(8);
+        let history = TraceLog::new(8);
         history.record_console_text(1, "INFO [helios_kernel] one\nWARN [helios_shell] two\n");
 
         let filter = TraceFilter {
@@ -1091,6 +1338,150 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].level, TraceLevel::Warn);
         assert_eq!(events[0].target, "helios_shell");
+    }
+
+    #[test]
+    fn recent_returns_the_matching_subset_oldest_first() {
+        let log = numbered_log(16, 10);
+
+        let evens = log.recent(&only("even"), 16);
+        assert_eq!(messages(&evens), ["0", "2", "4", "6", "8"]);
+
+        let newest_two = log.recent(&only("odd"), 2);
+        assert_eq!(messages(&newest_two), ["7", "9"]);
+
+        let everything = log.recent(
+            &TraceFilter {
+                min_level: None,
+                target_prefixes: PrefixSet::default(),
+            },
+            16,
+        );
+        assert_eq!(everything.len(), 10);
+        assert!(log.recent(&only("even"), 0).is_empty());
+    }
+
+    #[test]
+    fn eviction_drops_the_oldest_events_in_order() {
+        let log = numbered_log(4, 10);
+
+        let all = PrefixSet::default();
+        let retained = log.recent(
+            &TraceFilter {
+                min_level: None,
+                target_prefixes: all,
+            },
+            16,
+        );
+        assert_eq!(messages(&retained), ["6", "7", "8", "9"]);
+        assert_eq!(messages(&log.recent(&only("even"), 16)), ["6", "8"]);
+    }
+
+    #[test]
+    fn push_hands_back_the_evicted_event() {
+        let log = TraceLog::new(2);
+        let mut history = log.history.lock();
+        assert!(history.push(Arc::new(event("t", "a"))).is_none());
+        assert!(history.push(Arc::new(event("t", "b"))).is_none());
+        let evicted = history
+            .push(Arc::new(event("t", "c")))
+            .expect("a full history gives up its oldest event");
+        assert_eq!(message(&evicted), "a");
+    }
+
+    /// Drains a log through the stream poll, returning the messages in
+    /// delivery order.
+    fn drain(log: &TraceLog, cursor: &mut u64, filter: &TraceFilter) -> Vec<String> {
+        let mut delivered = Vec::new();
+        while let Some(event) = log.next_after(cursor, filter) {
+            delivered.push(message(&event).to_owned());
+        }
+        delivered
+    }
+
+    #[test]
+    fn stream_poll_returns_the_events_recent_returns() {
+        let log = numbered_log(64, 50);
+        let filter = only("odd");
+
+        let mut cursor = 0;
+        let streamed = drain(&log, &mut cursor, &filter);
+
+        assert_eq!(streamed, messages(&log.recent(&filter, 64)));
+        assert_eq!(streamed.len(), 25);
+        assert_eq!(cursor, 50, "the cursor ends on the last event examined");
+        assert!(log.next_after(&mut cursor, &filter).is_none());
+    }
+
+    #[test]
+    fn stream_batches_do_not_skip_or_repeat_events() {
+        // More events than one batch holds, and a filter that drops
+        // whole batches, so the poll crosses batch boundaries both while
+        // delivering and while skipping.
+        let count = TRACE_STREAM_BATCH * 5 + 7;
+        let log = numbered_log(256, count);
+        let everything = TraceFilter {
+            min_level: None,
+            target_prefixes: PrefixSet::default(),
+        };
+
+        let mut cursor = 0;
+        let streamed = drain(&log, &mut cursor, &everything);
+        let expected = (0..count)
+            .map(|number| number.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(streamed, expected);
+
+        let log = TraceLog::new(256);
+        for number in 0..count {
+            // Whole batches of "skip" around a few "keep" events.
+            let target = if number % 100 == 99 { "keep" } else { "skip" };
+            let evicted = log
+                .history
+                .lock()
+                .push(Arc::new(event(target, &number.to_string())));
+            drop(evicted);
+        }
+        let mut cursor = 0;
+        let kept = drain(&log, &mut cursor, &only("keep"));
+        assert_eq!(kept, ["99"]);
+    }
+
+    #[test]
+    fn stream_cursor_behind_the_history_resumes_at_the_oldest_event() {
+        let log = numbered_log(4, 10);
+        let everything = TraceFilter {
+            min_level: None,
+            target_prefixes: PrefixSet::default(),
+        };
+
+        // Sequence numbers start at 1, so events 6..=9 hold 7..=10 and a
+        // cursor at 2 has fallen behind them.
+        let mut cursor = 2;
+        let streamed = drain(&log, &mut cursor, &everything);
+        assert_eq!(streamed, ["6", "7", "8", "9"]);
+        assert_eq!(cursor, 10);
+
+        let mut fresh = 0;
+        assert_eq!(drain(&log, &mut fresh, &everything), ["6", "7", "8", "9"]);
+    }
+
+    #[test]
+    fn stream_sees_events_recorded_after_it_drained() {
+        let log = numbered_log(8, 3);
+        let everything = TraceFilter {
+            min_level: None,
+            target_prefixes: PrefixSet::default(),
+        };
+        let mut cursor = 0;
+        assert_eq!(drain(&log, &mut cursor, &everything), ["0", "1", "2"]);
+
+        log.record_console_text(0, "INFO [late] later\n");
+        let late = log
+            .next_after(&mut cursor, &everything)
+            .expect("an event recorded after the drain is delivered");
+        assert_eq!(late.target, "late");
+        assert!(log.next_after(&mut cursor, &everything).is_none());
     }
 
     #[test]
@@ -1118,18 +1509,52 @@ mod tests {
         history.record_str(ProfileScope::Kernel, "kernel;executor;processor-0", 5);
         history.record_str(ProfileScope::Kernel, "kernel;executor;processor-0", 7);
 
-        let samples = history.folded(
+        let samples = folded(
+            &history,
             &ProfileFilter {
                 scope: Some(ProfileScope::Kernel),
                 stack_prefixes: PrefixSet::default(),
             },
-            [],
             4,
         );
 
         assert_eq!(samples.len(), 1);
-        assert_eq!(samples[0].stack, "kernel;executor;processor-0");
+        assert_eq!(&*samples[0].stack, "kernel;executor;processor-0");
         assert_eq!(samples[0].weight, 12);
+    }
+
+    #[test]
+    fn sink_reads_filter_sort_and_limit_after_the_copy() {
+        let sink = ProfileSink::new(4, 4);
+        sink.set_enabled(true);
+        sink.record_profile_stack_parts_nanos(ProfileScope::Kernel, "kernel;", "a", 1);
+        sink.record_profile_stack_parts_nanos(ProfileScope::Kernel, "kernel;", "b", 9);
+        sink.record_profile_stack_parts_nanos(ProfileScope::User, "user;", "c", 5);
+        sink.record_perf_metric_parts(
+            ProfileScope::Kernel,
+            "kernel;",
+            "m",
+            PerfSample::timed(7, HardwarePerfCounterDelta::default(), 0),
+        );
+
+        let folded = sink.folded(
+            &ProfileFilter {
+                scope: None,
+                stack_prefixes: prefixes(["kernel;"]),
+            },
+            1,
+        );
+        assert_eq!(folded.len(), 1);
+        assert_eq!(&*folded[0].stack, "kernel;b");
+
+        let metrics = sink.metrics(
+            &PerfMetricFilter {
+                name_prefixes: PrefixSet::default(),
+            },
+            0,
+        );
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(&*metrics[0].name, "kernel;m");
     }
 
     #[test]
@@ -1138,17 +1563,17 @@ mod tests {
         history.record_parts(ProfileScope::User, "user;", "dash", 3);
         history.record_parts(ProfileScope::User, "user;", "dash", 9);
 
-        let samples = history.folded(
+        let samples = folded(
+            &history,
             &ProfileFilter {
                 scope: Some(ProfileScope::User),
                 stack_prefixes: prefixes(["user;"]),
             },
-            [],
             4,
         );
 
         assert_eq!(samples.len(), 1);
-        assert_eq!(samples[0].stack, "user;dash");
+        assert_eq!(&*samples[0].stack, "user;dash");
         assert_eq!(samples[0].weight, 12);
     }
 
@@ -1167,7 +1592,7 @@ mod tests {
             if let Some(sample) = self
                 .samples
                 .iter_mut()
-                .find(|sample| sample.scope == scope && sample.stack == stack)
+                .find(|sample| sample.scope == scope && &*sample.stack == stack)
             {
                 sample.weight = sample.weight.saturating_add(weight);
                 return;
@@ -1187,7 +1612,7 @@ mod tests {
             }
             self.samples.push(FoldedProfileSample {
                 scope,
-                stack: stack.to_owned(),
+                stack: Arc::from(stack),
                 weight,
             });
         }
@@ -1198,7 +1623,7 @@ mod tests {
                 right
                     .weight
                     .cmp(&left.weight)
-                    .then_with(|| left.stack.cmp(&right.stack))
+                    .then_with(|| (*left.stack).cmp(&*right.stack))
             });
             samples
         }
@@ -1295,7 +1720,7 @@ mod tests {
                         stack_prefixes: PrefixSet::default(),
                     };
                     assert_eq!(
-                        keyed.folded(&filter, [], 0),
+                        folded(&keyed, &filter, 0),
                         linear.folded(),
                         "capacity {capacity}, record {step}"
                     );
@@ -1305,7 +1730,7 @@ mod tests {
                 scope: None,
                 stack_prefixes: PrefixSet::default(),
             };
-            assert_eq!(keyed.folded(&filter, [], 0), linear.folded());
+            assert_eq!(folded(&keyed, &filter, 0), linear.folded());
         }
     }
 
@@ -1319,17 +1744,17 @@ mod tests {
         history.record_str(ProfileScope::Kernel, "d", 5);
         // Not heavier than the lightest (`c`, 1): dropped.
         history.record_str(ProfileScope::Kernel, "e", 1);
-        let samples = history.folded(
+        let samples = folded(
+            &history,
             &ProfileFilter {
                 scope: None,
                 stack_prefixes: PrefixSet::default(),
             },
-            [],
             0,
         );
         let stacks = samples
             .iter()
-            .map(|sample| (sample.stack.as_str(), sample.weight))
+            .map(|sample| (&*sample.stack, sample.weight))
             .collect::<Vec<_>>();
         assert_eq!(stacks, vec![("d", 5), ("a", 2), ("c", 1)]);
     }
@@ -1351,16 +1776,23 @@ mod tests {
                 );
                 linear.record(scope, name, nanos);
             });
-            let recent = keyed
-                .recent(
-                    &PerfMetricFilter {
-                        name_prefixes: PrefixSet::default(),
-                    },
-                    0,
+            let recent = metrics(
+                &keyed,
+                &PerfMetricFilter {
+                    name_prefixes: PrefixSet::default(),
+                },
+                0,
+            )
+            .into_iter()
+            .map(|sample| {
+                (
+                    sample.scope,
+                    String::from(&*sample.name),
+                    sample.count,
+                    sample.total_nanos,
                 )
-                .into_iter()
-                .map(|sample| (sample.scope, sample.name, sample.count, sample.total_nanos))
-                .collect::<Vec<_>>();
+            })
+            .collect::<Vec<_>>();
             assert_eq!(recent, linear.recent(), "capacity {capacity}");
         }
     }
@@ -1399,7 +1831,8 @@ mod tests {
             },
         );
 
-        let samples = history.recent(
+        let samples = metrics(
+            &history,
             &PerfMetricFilter {
                 name_prefixes: prefixes(["kernel;network;"]),
             },
@@ -1408,7 +1841,7 @@ mod tests {
 
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0].scope, ProfileScope::Kernel);
-        assert_eq!(samples[0].name, "kernel;network;tx-submit");
+        assert_eq!(&*samples[0].name, "kernel;network;tx-submit");
         assert_eq!(samples[0].count, 2);
         assert_eq!(samples[0].total_events, 0);
         assert_eq!(samples[0].total_nanos, 35);
@@ -1446,7 +1879,8 @@ mod tests {
             },
         );
 
-        let samples = history.recent(
+        let samples = metrics(
+            &history,
             &PerfMetricFilter {
                 name_prefixes: prefixes(["kernel;executor;"]),
             },
@@ -1454,7 +1888,7 @@ mod tests {
         );
 
         assert_eq!(samples.len(), 1);
-        assert_eq!(samples[0].name, "kernel;executor;local-runnable");
+        assert_eq!(&*samples[0].name, "kernel;executor;local-runnable");
         assert_eq!(samples[0].count, 2);
         assert_eq!(samples[0].total_events, 18);
         assert_eq!(samples[0].total_nanos, 0);

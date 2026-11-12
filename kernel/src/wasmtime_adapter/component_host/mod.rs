@@ -3019,7 +3019,7 @@ where
                         .runtime_state
                         .recent(&filter, limit)
                         .into_iter()
-                        .map(convert_event)
+                        .map(|event| convert_event(&event))
                         .collect::<Vec<_>>()
                 })
                 .map_err(debugger_wit::filters::FilterError::from);
@@ -3155,7 +3155,7 @@ macro_rules! impl_profiling_bindings {
             ) -> $wit::profiling::FoldedSample {
                 $wit::profiling::FoldedSample {
                     scope: convert_profile_scope_from_local(sample.scope),
-                    stack: sample.stack,
+                    stack: sample.stack.to_string(),
                     weight: sample.weight,
                 }
             }
@@ -3165,7 +3165,7 @@ macro_rules! impl_profiling_bindings {
             ) -> $wit::profiling::MetricSample {
                 $wit::profiling::MetricSample {
                     scope: convert_profile_scope_from_local(sample.scope),
-                    name: sample.name,
+                    name: sample.name.to_string(),
                     count: sample.count,
                     total_events: sample.total_events,
                     total_nanos: sample.total_nanos,
@@ -3336,7 +3336,7 @@ where
                         .runtime_state
                         .recent(&filter, limit)
                         .into_iter()
-                        .map(convert_program_event)
+                        .map(|event| convert_program_event(&event))
                         .collect::<Vec<_>>()
                 })
                 .map_err(program_wit::filters::FilterError::from);
@@ -4161,6 +4161,10 @@ where
     }
 }
 
+/// The debugger's trace stream. It owns a filter and a cursor and no
+/// buffer: each poll runs on the store's task and asks the trace log for
+/// the next admitted event, which copies a bounded batch of pointers under
+/// the log's lock and matches after releasing it.
 struct TracingStreamProducer {
     filter: TraceFilter,
     cursor: u64,
@@ -4192,14 +4196,14 @@ where
             return Poll::Ready(Ok(StreamResult::Cancelled));
         }
 
+        let this = &mut *self;
         match store
             .data()
             .runtime_state
-            .next_after(self.cursor, &self.filter)
+            .next_after(&mut this.cursor, &this.filter)
         {
-            Some((seq, event)) => {
-                self.cursor = seq;
-                destination.set_buffer(Some(convert_event(event)));
+            Some(event) => {
+                destination.set_buffer(Some(convert_event(&event)));
                 Poll::Ready(Ok(StreamResult::Completed))
             }
             None => Poll::Pending,
@@ -4207,6 +4211,8 @@ where
     }
 }
 
+/// The program world's trace stream, with the contract of
+/// [`TracingStreamProducer`].
 struct ProgramTracingStreamProducer {
     filter: TraceFilter,
     cursor: u64,
@@ -4239,14 +4245,14 @@ where
             return Poll::Ready(Ok(StreamResult::Cancelled));
         }
 
+        let this = &mut *self;
         match store
             .data()
             .runtime_state
-            .next_after(self.cursor, &self.filter)
+            .next_after(&mut this.cursor, &this.filter)
         {
-            Some((seq, event)) => {
-                self.cursor = seq;
-                destination.set_buffer(Some(convert_program_event(event)));
+            Some(event) => {
+                destination.set_buffer(Some(convert_program_event(&event)));
                 Poll::Ready(Ok(StreamResult::Completed))
             }
             None => Poll::Pending,
@@ -4623,61 +4629,60 @@ fn convert_program_memory_pressure(
     }
 }
 
-fn convert_event(event: TraceEvent) -> debugger_wit::tracing::Event {
+/// Lowers a shared history event. The history keeps its copy for other
+/// readers, so the guest's copy of each string is made here, after the
+/// history's lock is released.
+fn convert_event(event: &TraceEvent) -> debugger_wit::tracing::Event {
     debugger_wit::tracing::Event {
         timestamp: event.timestamp,
         level: convert_level_from_local(event.level),
-        target: event.target,
-        fields: event.fields.into_iter().map(convert_field).collect(),
+        target: event.target.clone(),
+        fields: event.fields.iter().map(convert_field).collect(),
     }
 }
 
-fn convert_program_event(event: TraceEvent) -> program_wit::tracing::Event {
+fn convert_program_event(event: &TraceEvent) -> program_wit::tracing::Event {
     program_wit::tracing::Event {
         timestamp: event.timestamp,
         level: convert_program_level_from_local(event.level),
-        target: event.target,
-        fields: event
-            .fields
-            .into_iter()
-            .map(convert_program_field)
-            .collect(),
+        target: event.target.clone(),
+        fields: event.fields.iter().map(convert_program_field).collect(),
     }
 }
 
-fn convert_field(field: TraceField) -> debugger_wit::tracing::Field {
+fn convert_field(field: &TraceField) -> debugger_wit::tracing::Field {
     debugger_wit::tracing::Field {
-        key: field.key,
-        value: convert_value(field.value),
+        key: field.key.clone(),
+        value: convert_value(&field.value),
     }
 }
 
-fn convert_program_field(field: TraceField) -> program_wit::tracing::Field {
+fn convert_program_field(field: &TraceField) -> program_wit::tracing::Field {
     program_wit::tracing::Field {
-        key: field.key,
-        value: convert_program_value(field.value),
+        key: field.key.clone(),
+        value: convert_program_value(&field.value),
     }
 }
 
-fn convert_value(value: TraceValue) -> debugger_wit::tracing::Value {
+fn convert_value(value: &TraceValue) -> debugger_wit::tracing::Value {
     match value {
-        TraceValue::Boolean(value) => debugger_wit::tracing::Value::Boolean(value),
-        TraceValue::Signed64(value) => debugger_wit::tracing::Value::Signed64(value),
-        TraceValue::Unsigned64(value) => debugger_wit::tracing::Value::Unsigned64(value),
-        TraceValue::Float64(value) => debugger_wit::tracing::Value::Float64(value),
-        TraceValue::Text(value) => debugger_wit::tracing::Value::Text(value),
-        TraceValue::Blob(value) => debugger_wit::tracing::Value::Blob(value),
+        TraceValue::Boolean(value) => debugger_wit::tracing::Value::Boolean(*value),
+        TraceValue::Signed64(value) => debugger_wit::tracing::Value::Signed64(*value),
+        TraceValue::Unsigned64(value) => debugger_wit::tracing::Value::Unsigned64(*value),
+        TraceValue::Float64(value) => debugger_wit::tracing::Value::Float64(*value),
+        TraceValue::Text(value) => debugger_wit::tracing::Value::Text(value.clone()),
+        TraceValue::Blob(value) => debugger_wit::tracing::Value::Blob(value.clone()),
     }
 }
 
-fn convert_program_value(value: TraceValue) -> program_wit::tracing::Value {
+fn convert_program_value(value: &TraceValue) -> program_wit::tracing::Value {
     match value {
-        TraceValue::Boolean(value) => program_wit::tracing::Value::Boolean(value),
-        TraceValue::Signed64(value) => program_wit::tracing::Value::Signed64(value),
-        TraceValue::Unsigned64(value) => program_wit::tracing::Value::Unsigned64(value),
-        TraceValue::Float64(value) => program_wit::tracing::Value::Float64(value),
-        TraceValue::Text(value) => program_wit::tracing::Value::Text(value),
-        TraceValue::Blob(value) => program_wit::tracing::Value::Blob(value),
+        TraceValue::Boolean(value) => program_wit::tracing::Value::Boolean(*value),
+        TraceValue::Signed64(value) => program_wit::tracing::Value::Signed64(*value),
+        TraceValue::Unsigned64(value) => program_wit::tracing::Value::Unsigned64(*value),
+        TraceValue::Float64(value) => program_wit::tracing::Value::Float64(*value),
+        TraceValue::Text(value) => program_wit::tracing::Value::Text(value.clone()),
+        TraceValue::Blob(value) => program_wit::tracing::Value::Blob(value.clone()),
     }
 }
 

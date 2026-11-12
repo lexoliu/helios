@@ -38,8 +38,8 @@ pub use observer::{
     FoldedProfileSample, MAX_FILTER_PREFIX_BYTES, MAX_FILTER_PREFIXES, PerfMetricFilter,
     PerfMetricHistory, PerfMetricSample, PerfSample, PrefixSet, PrefixSetError, ProfileFilter,
     ProfileHistory, ProfileScope, ProfileSink, StatsSample, TraceEvent, TraceField, TraceFilter,
-    TraceHistory, TraceLevel, TraceValue, matches_perf_metric_filter, matches_profile_filter,
-    matches_trace_filter, parse_console_text,
+    TraceHistory, TraceLevel, TraceLog, TraceValue, matches_perf_metric_filter,
+    matches_profile_filter, matches_trace_filter, parse_console_text,
 };
 pub use sync::{
     Mutex, MutexGuard, Notified, Notify, NotifyWaiter, OwnedRawMutexLease, OwnedRawRwLockReadLease,

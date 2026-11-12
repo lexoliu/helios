@@ -2691,9 +2691,7 @@ mod tests {
         profiles: &crate::ProfileSink,
     ) -> alloc::collections::BTreeMap<String, crate::PerfMetricSample> {
         profiles
-            .perf_metrics()
-            .lock()
-            .recent(
+            .metrics(
                 &crate::PerfMetricFilter {
                     name_prefixes: crate::PrefixSet::from_prefixes(["kernel;hostfs;"])
                         .expect("one short prefix fits the filter bounds"),
@@ -2701,7 +2699,7 @@ mod tests {
                 u32::MAX,
             )
             .into_iter()
-            .map(|sample| (sample.name.clone(), sample))
+            .map(|sample| (String::from(&*sample.name), sample))
             .collect()
     }
 
