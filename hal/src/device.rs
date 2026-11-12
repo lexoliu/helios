@@ -36,10 +36,16 @@ pub trait InterruptRoutedDevice: MemoryMappedDevice {
 /// cacheable mapping returns whatever the line last held, and a write
 /// that the store buffer merges with its neighbour reaches the device as
 /// one access instead of two. The kernel therefore has to be told which
-/// of the two a range is before it can map it anywhere.
+/// of the three a range is before it can map it anywhere.
+///
+/// Each backend maps every kind with its own architecture's memory
+/// type: x86-64 through a page-attribute-table entry, AArch64 through a
+/// MAIR index, RISC-V through the platform's physical memory attributes
+/// of the address, which no leaf entry Helios writes can change.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemoryKind {
-    /// A register file. Accesses reach the device in program order,
+    /// A register file, or memory whose owner requires every access to
+    /// reach it uncached. Accesses reach the device in program order,
     /// exactly as wide as the instruction issued them, and are neither
     /// cached, merged, speculated, nor replayed.
     Device,
@@ -47,6 +53,13 @@ pub enum MemoryKind {
     /// framebuffer, an option ROM, a prefetchable aperture. Cacheable
     /// and reorderable.
     Normal,
+    /// Memory the processor may treat as RAM but must not cache: reads
+    /// go to the memory, and stores may be merged in a write-combining
+    /// buffer and reach it in any order until a fence drains them. What
+    /// a host renderer asks for when the bytes behind a mapping are
+    /// device memory another agent reads without snooping the guest's
+    /// caches.
+    WriteCombining,
 }
 
 /// The access rules one physical range carries.
@@ -82,6 +95,24 @@ impl DeviceRegionAttributes {
     /// the device publishes.
     pub const PREFETCHABLE_MEMORY: Self = Self {
         kind: MemoryKind::Normal,
+        writable: true,
+        prefetchable: true,
+    };
+
+    /// Writable memory reached through a write-combining mapping: reads
+    /// have no side effects, and stores are merged rather than cached.
+    pub const WRITE_COMBINING_MEMORY: Self = Self {
+        kind: MemoryKind::WriteCombining,
+        writable: true,
+        prefetchable: true,
+    };
+
+    /// Writable memory every access must reach uncached. It has no read
+    /// side effects, so it stays prefetchable; what it shares with a
+    /// register file is that nothing may sit between the processor and
+    /// it.
+    pub const UNCACHED_MEMORY: Self = Self {
+        kind: MemoryKind::Device,
         writable: true,
         prefetchable: true,
     };

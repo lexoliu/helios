@@ -43,5 +43,9 @@
   },
   "smoke-x86-64": {
     "surfaces": ["x86", "host_tools", "programs"]
+  },
+  "smoke-x86-64-venus": {
+    "surfaces": ["gpu"],
+    "exclusive": true
   }
 }

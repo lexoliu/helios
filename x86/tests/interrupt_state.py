@@ -1,9 +1,39 @@
 import hashlib
 import json
 import platform
+import re
 import subprocess
 import tempfile
 from pathlib import Path
+
+
+def substitute_asm_operands(text, rust_source):
+    """Replace each `{name}` the way the `global_asm!` that includes
+    exceptions.S does: from its `name = const CONST` operands and the
+    literal value of each `CONST`, so the Rust constants stay the one
+    source of the vectors."""
+    invocation = re.search(
+        r'global_asm!\(\s*include_str!\("exceptions\.S"\),(?P<operands>[^)]*)\)',
+        rust_source,
+    )
+    if invocation is None:
+        raise SystemExit("x86/src/exceptions.rs has no global_asm! including exceptions.S")
+    for name, constant in re.findall(
+        r"(\w+)\s*=\s*const\s+(\w+)", invocation.group("operands")
+    ):
+        definition = re.search(
+            rf"const\s+{constant}\s*:\s*\w+\s*=\s*(0x[0-9a-fA-F_]+|[0-9_]+)\s*;",
+            rust_source,
+        )
+        if definition is None:
+            raise SystemExit(
+                f"operand {name}'s constant {constant} is not a literal in x86/src/exceptions.rs"
+            )
+        text = text.replace("{" + name + "}", str(int(definition.group(1).replace("_", ""), 0)))
+    leftover = re.search(r"\{\w+\}", text)
+    if leftover is not None:
+        raise SystemExit(f"exceptions.S operand {leftover.group(0)} has no const operand")
+    return text
 
 
 def host_components():
@@ -41,6 +71,7 @@ def main():
         raise SystemExit(
             "IRQ register test requires x86-64 Linux or macOS with x86-64 execution"
         )
+    text = substitute_asm_operands(text, (root / "x86/src/exceptions.rs").read_text())
     output = root / "target/x86-interrupt-tests"
     output.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=output) as directory:

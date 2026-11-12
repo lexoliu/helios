@@ -441,14 +441,14 @@ where
                     NetworkPumpAction::Continue => {}
                     NetworkPumpAction::Yield => crate::yield_now().await,
                     NetworkPumpAction::Wait => {
-                        self.wait_for_shard_progress(wait, self.pump_wait(pair))
+                        self.wait_for_shard_progress(wait, self.pump_wait(pair, interface_wide))
                             .await;
                     }
                 },
                 Err(error) => {
                     cadence.reset();
                     tracing::debug!(?error, "network packet pump failed to drive device");
-                    self.wait_for_shard_progress(wait, self.pump_wait(pair))
+                    self.wait_for_shard_progress(wait, self.pump_wait(pair, interface_wide))
                         .await;
                 }
             }
@@ -610,63 +610,6 @@ where
             return;
         };
         self.run_packet_pump(assignment).await;
-    }
-}
-
-impl NetworkShard {
-    pub(super) fn retransmit_dhcp(&mut self, now: StackInstant) -> Result<(), NetworkControlError> {
-        match self.dhcp {
-            DhcpClientState::Selecting {
-                transaction_id,
-                last_sent,
-            } if now.nanos().saturating_sub(last_sent.nanos()) >= DHCP_RETRANSMIT_NANOS => {
-                self.send_dhcp_discover(transaction_id, now)?;
-                self.dhcp = DhcpClientState::Selecting {
-                    transaction_id,
-                    last_sent: now,
-                };
-            }
-            DhcpClientState::Requesting {
-                transaction_id,
-                requested_ip,
-                server_identifier,
-                last_sent,
-            } if now.nanos().saturating_sub(last_sent.nanos()) >= DHCP_RETRANSMIT_NANOS => {
-                self.send_dhcp_request(transaction_id, requested_ip, server_identifier, now)?;
-                self.dhcp = DhcpClientState::Requesting {
-                    transaction_id,
-                    requested_ip,
-                    server_identifier,
-                    last_sent: now,
-                };
-            }
-            DhcpClientState::Rebooting {
-                transaction_id,
-                requested_ip,
-                attempts,
-                last_sent,
-            } if now.nanos().saturating_sub(last_sent.nanos()) >= DHCP_RETRANSMIT_NANOS => {
-                if attempts >= DHCP_REBOOT_ATTEMPTS {
-                    // Nobody on this link confirmed the lease, so it
-                    // cannot be assumed good: configuration starts over
-                    // exactly as a NAK would start it.
-                    self.stack.clear_ipv4_addresses();
-                    self.dhcp = DhcpClientState::Init {
-                        transaction_id: next_transaction_id(transaction_id),
-                    };
-                } else {
-                    self.send_dhcp_init_reboot(transaction_id, requested_ip, now)?;
-                    self.dhcp = DhcpClientState::Rebooting {
-                        transaction_id,
-                        requested_ip,
-                        attempts: attempts + 1,
-                        last_sent: now,
-                    };
-                }
-            }
-            _ => {}
-        }
-        Ok(())
     }
 }
 
