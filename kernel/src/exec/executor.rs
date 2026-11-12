@@ -2363,10 +2363,8 @@ mod tests {
     /// A future that counts its one run and fits the arena's smallest
     /// block, so the arena admits `TEST_SHARE_BYTES / TASK_ARENA_ALIGN`
     /// of them.
-    fn counting_task(ran: Arc<AtomicUsize>) -> impl core::future::Future<Output = ()> + Send {
-        async move {
-            ran.fetch_add(1, Ordering::Relaxed);
-        }
+    async fn counting_task(ran: Arc<AtomicUsize>) {
+        ran.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Runs passes until one finds nothing to run, and returns how many
