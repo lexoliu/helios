@@ -896,3 +896,41 @@ fn the_stats_say_what_each_tier_holds_and_where_each_fault_was_served() {
     );
     harness.finish();
 }
+
+#[test]
+fn a_machine_with_no_disk_swaps_to_the_ram_tiers_and_takes_a_device_that_comes_up_later() {
+    let mut harness = Harness::diskless();
+    assert_eq!(harness.handle.stats().disk, None, "no device is attached");
+
+    let text = text_page(3);
+    let random = random_page(21);
+    let compressible = harness.resident_with(1, text.clone());
+    let incompressible = harness.resident_with(2, random.clone());
+    assert_eq!(harness.evict(compressible), Ok(Placed::Out));
+    assert_eq!(
+        harness.evict(incompressible),
+        Ok(Placed::Kept),
+        "with nowhere to put it, a page that does not compress stays resident"
+    );
+
+    let port = SwapDiskPort {
+        attachments: harness.service.attachments.clone(),
+        handle: harness.handle.clone(),
+    };
+    port.attach(harness.backend.clone(), "test-disk", 1 << 20);
+    harness.service.take_attachment();
+    let disk = harness.handle.stats().disk.expect("the device is attached");
+    assert_eq!((disk.backend, disk.capacity_bytes), ("test-disk", 1 << 20));
+
+    assert_eq!(harness.evict(incompressible), Ok(Placed::Out));
+    assert_eq!(harness.handle.stats().disk.expect("attached").pages, 1);
+    harness
+        .fault(incompressible)
+        .expect("the disk page faults back");
+    harness
+        .fault(compressible)
+        .expect("the stored page faults back");
+    assert_eq!(harness.contents(incompressible), random);
+    assert_eq!(harness.contents(compressible), text);
+    harness.finish();
+}

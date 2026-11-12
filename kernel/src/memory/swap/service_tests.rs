@@ -329,8 +329,6 @@ impl Harness {
         let baseline = allocated_bytes();
         let backend = FlakyBackend::default();
         let handle = SwapHandle::new(
-            "test",
-            0,
             SwapClock {
                 timebase: Timebase::new(1_000_000_000),
                 now_ticks: TEST_HOOKS.now_ticks,
@@ -342,13 +340,20 @@ impl Harness {
         let registry = InstanceRegistry::new();
         let instance = registry.register("evicted", 0);
         with_space(|space| space.owner = Some((registry.clone(), instance.id())));
-        let service = SwapService::new(
-            disk.then(|| Disk::new(backend.clone())),
+        let mut service = SwapService::new(
             handle.clone(),
             &TEST_HOOKS,
             registry,
             TestCpu::with_entropy(0),
+            Arc::new(ConcurrentQueue::bounded(1)),
         );
+        if disk {
+            service.attach(DiskAttachment {
+                backend: backend.clone(),
+                name: "test",
+                capacity_bytes: 0,
+            });
+        }
         Self {
             _turn: turn,
             service,

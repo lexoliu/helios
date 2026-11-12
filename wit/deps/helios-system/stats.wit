@@ -393,8 +393,9 @@ interface stats {
     /// Absent on a machine that gave the kernel no memory balloon.
     balloon: option<memory-balloon>,
     /// Absent on a machine with no swap: one whose address space cannot
-    /// fault a swapped-out page back in, or that has no disk to write
-    /// pages to.
+    /// fault a swapped-out page back in. A machine with no disk still
+    /// swaps, to the compressed store, and reports it with `disk`
+    /// absent.
     swap: option<swap>,
     /// Absent on a machine with no host share, or one whose host
     /// filesystem is reached without a 9p session in front of it.

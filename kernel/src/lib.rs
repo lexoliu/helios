@@ -149,8 +149,8 @@ pub use io::{
     MAX_DEVICE_INTERRUPTS, MAX_INPUT_DEVICES, MAX_IOMMU_ENDPOINTS, MAX_NETWORK_INTERRUPTS,
     PanicSerial, PollKey, PollRegistration, PollRegistry, PollRegistryError, PollSourceKind,
     RecordingConsole, SCRATCH_DISK_SERIAL, ScratchDisk, ScratchDiskStats, SerialReader, TryRead,
-    TryWrite, admit_block_devices, byte_channel, emit_panic_report, install_block_devices,
-    install_scratch_swap, read_debug_serial, read_serial, try_read_serial, wake_queue_owners,
+    TryWrite, admit_block_devices, attach_scratch_swap, byte_channel, emit_panic_report,
+    install_block_devices, read_debug_serial, read_serial, try_read_serial, wake_queue_owners,
 };
 pub use kernel_exception::{
     KernelException, KernelExceptionCause, KernelExceptionDispatch, KernelNativeTrapHandler,
@@ -172,9 +172,9 @@ pub use memory::{
     KERNEL_HEAP_RESERVE_FRACTION, KernelPhysFrameAllocator, MemoryOwner, NoCryptographicEntropy,
     NoEntropyDevice, ROOT_ENTROPY_MATERIAL_BYTES, RegionShares, ReleasedReservation,
     ReservationLookup, ReservationTracker, RootEntropy, RootEntropyHandle, SWAP_TICK, StackFault,
-    SwapDisabled, SwapDiskStats, SwapEntry, SwapFaultError, SwapFaultSource, SwapFaultStats,
-    SwapHandle, SwapLeafFormat, SwapPolicy, SwapPolicyError, SwapSpace, SwapStats, SwapStoreStats,
-    SwapVmHooks, SwapZeroStats, TASK_ARENA_FRACTION, TASK_ARENA_MIN_BYTES,
+    SwapDisabled, SwapDiskPort, SwapDiskStats, SwapEntry, SwapFaultError, SwapFaultSource,
+    SwapFaultStats, SwapHandle, SwapLeafFormat, SwapPolicy, SwapPolicyError, SwapSpace, SwapStats,
+    SwapStoreStats, SwapVmHooks, SwapZeroStats, TASK_ARENA_FRACTION, TASK_ARENA_MIN_BYTES,
     USER_POOL_MIN_REGION_BYTES, UserHeapStats, UserMemoryOwnerScope, UserMemoryOwners,
     UserMemoryPool, VaCursor, allocate_user_frame_uninit_on, allocate_user_frame_zeroed,
     allocate_user_frame_zeroed_on, allocate_user_memory_pool, allocate_user_run_zeroed_on,

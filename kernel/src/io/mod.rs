@@ -18,8 +18,7 @@ pub use block::{
     BlockCache, BlockCacheError, BlockCacheLimits, BlockInstallError, BlockMut, BlockPages,
     BlockRef, BlockRouteError, BlockSelfCheckError, BlockService, BlockStats, CACHE_BLOCK_BYTES,
     CacheLayoutError, CachedDisk, CachedDiskStats, DiskRefusal, DiskRole, SCRATCH_DISK_SERIAL,
-    ScratchDisk, ScratchDiskStats, admit_block_devices, install_block_devices,
-    install_scratch_swap,
+    ScratchDisk, ScratchDiskStats, admit_block_devices, attach_scratch_swap, install_block_devices,
 };
 pub use child::{
     ByteReadWait, ByteReader, ByteWriteWait, ByteWriter, ClosedPeer, TryRead, TryWrite,

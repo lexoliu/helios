@@ -235,8 +235,6 @@ pub enum SwapDisabled {
          swap token"
     )]
     NoSwapHooks,
-    #[error("machine gave the kernel no scratch block device to swap to")]
-    NoSwapDevice,
 }
 
 /// Why a swap-in did not happen.
@@ -459,11 +457,18 @@ struct SwapShared {
     /// The address space's swap surface, which the fault path reaches
     /// without the owner.
     hooks: &'static SwapVmHooks,
-    backend: &'static str,
-    capacity_bytes: u64,
+    /// The swap device, once the owner has attached one. Set at most once.
+    disk: Once<DiskInfo>,
     /// Reads the time a fault is issued and the time it completes, so
     /// both ends of its latency come from one clock.
     clock: SwapClock,
+}
+
+/// What observers are told about the attached swap device.
+#[derive(Clone, Copy)]
+struct DiskInfo {
+    backend: &'static str,
+    capacity_bytes: u64,
 }
 
 /// The clock fault latency is measured on: the platform's tick counter and
@@ -613,13 +618,7 @@ impl SwapShared {
 }
 
 impl SwapHandle {
-    fn new(
-        backend: &'static str,
-        capacity_bytes: u64,
-        clock: SwapClock,
-        hooks: &'static SwapVmHooks,
-        processors: usize,
-    ) -> Self {
+    fn new(clock: SwapClock, hooks: &'static SwapVmHooks, processors: usize) -> Self {
         // The store can never hold more frames than the pool has.
         let pool_frames = user_heap_stats().total_bytes / PhysFrame::SIZE;
         Self {
@@ -633,8 +632,7 @@ impl SwapHandle {
                     .expect("the default policy is within its ranges"),
                 counters: Counters::new(processors),
                 hooks,
-                backend,
-                capacity_bytes,
+                disk: Once::new(),
                 clock,
             }),
         }
@@ -652,9 +650,9 @@ impl SwapHandle {
                 .unwrap_or(0),
         };
         SwapStats {
-            disk: Some(SwapDiskStats {
-                backend: shared.backend,
-                capacity_bytes: shared.capacity_bytes,
+            disk: shared.disk.get().map(|disk| SwapDiskStats {
+                backend: disk.backend,
+                capacity_bytes: disk.capacity_bytes,
                 stored_bytes: totals.disk_bytes,
                 pages: totals.disk_pages,
                 pages_out_raw: totals.pages_out_disk_raw,
@@ -973,60 +971,85 @@ pub fn disable_swap(reason: SwapDisabled) {
 
 /// Spawns the task that owns swap, and publishes its handle.
 ///
-/// The task is local to the calling processor because the swap device's
-/// completions are: a backend brings the scratch disk up on one
-/// processor and routes its interrupt there.
+/// Swap runs from here with its RAM tiers alone: the zero tier and the
+/// compressed store need no device, so a machine with no disk swaps too. The
+/// device, if the platform has one, comes up later and reaches the owner
+/// through the returned [`SwapDiskPort`].
+///
+/// `Backend` names the type of that device, which the owner has to be
+/// compiled against; a platform with no device never builds one.
+///
+/// The owner holds nothing bound to its processor: the swap backend runs any
+/// operation from any task on any processor, so it starts on the calling
+/// one and may be moved.
 pub fn install_swap<CpuImpl, Backend>(
     spawner: Spawner<CpuImpl>,
     timer: Timer<CpuImpl>,
     cpu: CpuImpl,
     registry: InstanceRegistry,
-    backend: Backend,
-    backend_name: &'static str,
-    capacity_bytes: u64,
-) -> SwapHandle
+) -> (SwapHandle, SwapDiskPort<Backend>)
 where
     CpuImpl: Cpu + Clone + Send + Sync + 'static,
-    Backend: SwapBackend,
+    Backend: SwapBackend + 'static,
 {
     let hooks = installed_swap_hooks().unwrap_or_else(|| {
-        panic!("swap backend installed before the address space published its swap hooks")
+        panic!("swap installed before the address space published its swap hooks")
     });
     let clock = SwapClock {
         timebase: cpu.timebase(),
         now_ticks: hooks.now_ticks,
     };
-    let handle = SwapHandle::new(
-        backend_name,
-        capacity_bytes,
-        clock,
-        hooks,
-        cpu.processor_count(),
-    );
+    let handle = SwapHandle::new(clock, hooks, cpu.processor_count());
     let mut published = false;
     HANDLE.call_once(|| {
         published = true;
         handle.clone()
     });
-    assert!(published, "swap backend installed more than once");
+    assert!(published, "swap installed more than once");
 
-    let service = SwapService::new(
-        Some(Disk::new(backend)),
-        handle.clone(),
-        hooks,
-        registry,
-        cpu,
-    );
+    let attachments = Arc::new(ConcurrentQueue::bounded(1));
+    let service = SwapService::new(handle.clone(), hooks, registry, cpu, attachments.clone());
     spawner.spawn_local_detached(async move {
         service.run(timer).await;
     });
-    tracing::info!(
-        target: "helios_kernel::swap",
-        backend = backend_name,
-        capacity_bytes,
-        "swap online"
-    );
-    handle
+    tracing::info!(target: "helios_kernel::swap", "swap online, RAM tiers only");
+    let port = SwapDiskPort {
+        attachments,
+        handle: handle.clone(),
+    };
+    (handle, port)
+}
+
+/// A swap device on its way to the owner task.
+struct DiskAttachment<Backend> {
+    backend: Backend,
+    name: &'static str,
+    capacity_bytes: u64,
+}
+
+/// The way a swap device reaches the owner once the platform has brought it
+/// up. Attaching consumes the port, so a device attaches at most once.
+pub struct SwapDiskPort<Backend> {
+    attachments: Arc<ConcurrentQueue<DiskAttachment<Backend>>>,
+    handle: SwapHandle,
+}
+
+impl<Backend: SwapBackend> SwapDiskPort<Backend> {
+    /// Hands `backend`, which holds `capacity_bytes`, to the owner, which
+    /// takes it at its next wake-up and starts using it for pages the RAM
+    /// tiers do not take. Any task.
+    pub fn attach(self, backend: Backend, name: &'static str, capacity_bytes: u64) {
+        let attachment = DiskAttachment {
+            backend,
+            name,
+            capacity_bytes,
+        };
+        assert!(
+            self.attachments.push(attachment).is_ok(),
+            "a swap device attached twice through one port"
+        );
+        self.handle.poke();
+    }
 }
 
 /// How a page's bytes are laid out in the extent the backend holds.
@@ -1104,6 +1127,9 @@ struct SwapService<Backend: SwapBackend, CpuImpl> {
     /// The swap device, if one is attached. Without one, a page that no RAM
     /// tier takes stays in memory.
     disk: Option<Disk<Backend>>,
+    /// Where a device arrives from [`SwapDiskPort::attach`]; taken at the
+    /// top of every loop.
+    attachments: Arc<ConcurrentQueue<DiskAttachment<Backend>>>,
     handle: SwapHandle,
     hooks: &'static SwapVmHooks,
     registry: InstanceRegistry,
@@ -1161,14 +1187,15 @@ where
     CpuImpl: Cpu + Clone,
 {
     fn new(
-        disk: Option<Disk<Backend>>,
         handle: SwapHandle,
         hooks: &'static SwapVmHooks,
         registry: InstanceRegistry,
         cpu: CpuImpl,
+        attachments: Arc<ConcurrentQueue<DiskAttachment<Backend>>>,
     ) -> Self {
         Self {
-            disk,
+            disk: None,
+            attachments,
             handle,
             hooks,
             registry,
@@ -1185,8 +1212,41 @@ where
         }
     }
 
+    /// Starts using a device the platform has brought up, and tells
+    /// observers about it.
+    fn attach(&mut self, attachment: DiskAttachment<Backend>) {
+        assert!(
+            self.disk.is_none(),
+            "a swap device attached while another is in use"
+        );
+        let mut recorded = false;
+        self.handle.shared.disk.call_once(|| {
+            recorded = true;
+            DiskInfo {
+                backend: attachment.name,
+                capacity_bytes: attachment.capacity_bytes,
+            }
+        });
+        assert!(recorded, "swap recorded two devices");
+        self.disk = Some(Disk::new(attachment.backend));
+        tracing::info!(
+            target: "helios_kernel::swap",
+            backend = attachment.name,
+            capacity_bytes = attachment.capacity_bytes,
+            "swap device attached"
+        );
+    }
+
+    /// Takes the device [`SwapDiskPort::attach`] sent, if one came.
+    fn take_attachment(&mut self) {
+        if let Ok(attachment) = self.attachments.pop() {
+            self.attach(attachment);
+        }
+    }
+
     async fn run(mut self, timer: Timer<CpuImpl>) -> ! {
         loop {
+            self.take_attachment();
             // Frames the faults emptied go back to the pool before anything
             // else asks the pool for one.
             self.store.drain(&self.handle.shared.store);
@@ -2181,7 +2241,7 @@ mod tests {
     #[test]
     fn a_poke_releases_one_wait_and_the_next_one_parks() {
         let _turn = test_pool::serialise();
-        let handle = SwapHandle::new("test", 0, test_clock(), &service_tests::TEST_HOOKS, 1);
+        let handle = SwapHandle::new(test_clock(), &service_tests::TEST_HOOKS, 1);
 
         handle.poke();
         assert!(

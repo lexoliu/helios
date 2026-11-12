@@ -446,7 +446,9 @@ images it may mount, on the same bus and in an order nothing guarantees,
 so the kernel gives each disk a role by the serial it reports
 (`kernel/src/io/block/`):
 
-- `helios-data` is the scratch disk, the kernel's own, which backs swap;
+- `helios-data` is the scratch disk, the kernel's own, which backs swap's
+  disk tier. Swap itself runs without it, on the zero and compressed
+  tiers; the disk attaches when the block service brings it up;
 - any other serial names a mount source, which the kernel puts behind its
   block cache, handed back to the backend typed as its device, where the
   mount layer finds it by serial;

@@ -661,6 +661,16 @@ extern "C" fn aarch64_kernel_main() -> ! {
             .with_dma_model(DmaModel::Translated)
             .with_devices(devices),
     );
+    // Swap runs from boot on its RAM tiers; the scratch disk, if the machine
+    // has one, attaches through the port once the block service brings it
+    // up.
+    let (swap, swap_disk_port) = helios_kernel::install_swap::<_, block::SwapDisk>(
+        kernel.spawner(),
+        kernel.timer(),
+        cpu,
+        debug_state.instance_registry(),
+    );
+    debug_state.install_swap(swap);
     tracing::info!(
         "platform described by {} console={:#x} gicd={:#x} gicr={:#x} virtio-slots={} rtc={}",
         platform.source,
@@ -848,7 +858,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
         physical_memory_offset,
         &handoff,
         &debug_state,
-        root_entropy,
+        swap_disk_port,
     ) {
         gic.enable_device_interrupt(
             block.interrupt,
