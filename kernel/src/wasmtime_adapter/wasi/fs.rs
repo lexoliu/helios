@@ -1033,12 +1033,13 @@ where
     ) -> Poll<Result<StreamResult>> {
         let mut this = self.project();
         if this.pending.is_none() {
-            let available = source.remaining(&mut store);
-            if available == 0 {
+            // One chunk per poll, the size preview1's `fd_write` moves for
+            // the same file; the guest's `stream.write` returns the count
+            // taken and the rest is its next write.
+            let bytes = read_bounded_chunk(&mut source, &mut store, GUEST_IO_CHUNK_BYTES)?;
+            if bytes.is_empty() {
                 return Poll::Ready(Ok(StreamResult::Completed));
             }
-            let mut bytes = Vec::with_capacity(available);
-            source.read(&mut store, &mut bytes)?;
             let now = (*this.getter)(store.data_mut()).now_nanos();
             let write = (*this.start)(this.held.clone(), *this.mode, bytes, now);
             this.pending.set(Some(write));

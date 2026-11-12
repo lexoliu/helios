@@ -1,6 +1,35 @@
 use super::*;
 use crate::ComponentHostNetwork;
 
+/// How many bytes one poll of a stream consumer takes from a write of
+/// `remaining` bytes: the whole write when it fits `limit`, `limit`
+/// otherwise.
+pub(super) const fn bounded_chunk_len(remaining: usize, limit: usize) -> usize {
+    if remaining < limit { remaining } else { limit }
+}
+
+/// Takes at most `limit` bytes of the guest's pending write into an owned
+/// buffer, empty when the write is. The reservation is the chunk, never the
+/// write, so what a consumer holds does not depend on the guest's length;
+/// every consumer that copies a write out of guest memory reads through
+/// this and names the bound of its own sink.
+///
+/// The writer is told how many bytes were taken (`Source::read` advances
+/// the write by what it moved), and Wasmtime does not poll again for the
+/// rest: the guest's `stream.write` completes with that short count.
+pub(super) fn read_bounded_chunk<T: 'static>(
+    source: &mut Source<'_, u8>,
+    store: &mut StoreContextMut<'_, T>,
+    limit: usize,
+) -> Result<Vec<u8>> {
+    let len = bounded_chunk_len(source.remaining(&mut *store), limit);
+    let mut bytes = Vec::with_capacity(len);
+    if len != 0 {
+        source.read(&mut *store, &mut bytes)?;
+    }
+    Ok(bytes)
+}
+
 pub(super) struct SerialStreamConsumer<T, CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
@@ -75,7 +104,14 @@ where
 {
     type Item = u8;
 
-    /// Copy the guest's batch into the store's stdout/stderr sink.
+    /// Copy one chunk of the guest's batch into the store's stdout/stderr
+    /// sink.
+    ///
+    /// The chunk is [`GUEST_IO_CHUNK_BYTES`] at most and the guest's
+    /// `stream.write` returns the count taken, so the rest of a larger
+    /// write comes back as the guest's next write. The console segments
+    /// what it is offered at its own bound, so a chunk costs one pass
+    /// through that loop, and `pending` never holds more than one chunk.
     ///
     /// A child-pipe sink is bounded, so this parks — `pending` keeps the
     /// bytes and `poll_write_output_bytes` registers the waker — instead
@@ -88,12 +124,10 @@ where
         _: bool,
     ) -> Poll<Result<StreamResult>> {
         if self.pending.is_none() {
-            let available = source.remaining(&mut store);
-            if available == 0 {
+            let bytes = read_bounded_chunk(&mut source, &mut store, GUEST_IO_CHUNK_BYTES)?;
+            if bytes.is_empty() {
                 return Poll::Ready(Ok(StreamResult::Completed));
             }
-            let mut bytes = Vec::with_capacity(available);
-            source.read(&mut store, &mut bytes)?;
             self.pending = Some(Bytes::from(bytes));
         }
 
@@ -289,9 +323,15 @@ impl Drop for ChannelStreamConsumer {
 impl<T: 'static> StreamConsumer<T> for ChannelStreamConsumer {
     type Item = u8;
 
-    /// Copy the parent's batch into the child's stdin channel, parking on
-    /// a full channel the way [`TcpWriteConsumer`](super::net::TcpWriteConsumer)
-    /// parks on a busy socket.
+    /// Copy one chunk of the parent's batch into the child's stdin channel,
+    /// parking on a full channel the way
+    /// [`TcpWriteConsumer`](super::net::TcpWriteConsumer) parks on a busy
+    /// socket.
+    ///
+    /// The channel bounds how many chunks it queues, not their size, so a
+    /// chunk is [`GUEST_IO_CHUNK_BYTES`] at most and what the channel
+    /// holds is that many bytes per slot. The guest's `stream.write`
+    /// returns the count taken and the rest is its next write.
     fn poll_consume(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -300,12 +340,10 @@ impl<T: 'static> StreamConsumer<T> for ChannelStreamConsumer {
         _: bool,
     ) -> Poll<Result<StreamResult>> {
         if self.pending.is_none() {
-            let available = source.remaining(&mut store);
-            if available == 0 {
+            let bytes = read_bounded_chunk(&mut source, &mut store, GUEST_IO_CHUNK_BYTES)?;
+            if bytes.is_empty() {
                 return Poll::Ready(Ok(StreamResult::Completed));
             }
-            let mut bytes = Vec::with_capacity(available);
-            source.read(&mut store, &mut bytes)?;
             self.pending = Some(Bytes::from(bytes));
         }
 
@@ -318,5 +356,150 @@ impl<T: 'static> StreamConsumer<T> for ChannelStreamConsumer {
             Poll::Ready(Ok(())) => Poll::Ready(Ok(StreamResult::Completed)),
             Poll::Ready(Err(_closed)) => Poll::Ready(Ok(StreamResult::Dropped)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ProcessAuthority;
+    use crate::wasmtime_adapter::component_host::service::test_store::{
+        TestStoreData, store_data_routed,
+    };
+    use futures_lite::future::block_on;
+    use wasmtime::component::StreamReader;
+
+    /// A guest write several chunks long whose last chunk is short, with
+    /// bytes that differ from one chunk to the next so a reordered or
+    /// repeated chunk shows.
+    fn long_guest_write() -> Vec<u8> {
+        (0..3 * GUEST_IO_CHUNK_BYTES + 17)
+            .map(|index| (index % 251) as u8)
+            .collect()
+    }
+
+    fn async_engine() -> wasmtime::Engine {
+        let mut config = wasmtime::Config::new();
+        config.wasm_component_model(true);
+        config.wasm_component_model_async(true);
+        wasmtime::Engine::new(&config).expect("an engine with the component model async enabled")
+    }
+
+    /// Everything `reader` delivers until `total` bytes have arrived, as
+    /// the chunks the sink was handed.
+    async fn chunks_until(reader: &crate::ByteReader, total: usize) -> Vec<Bytes> {
+        let mut chunks = Vec::new();
+        let mut taken = 0;
+        while taken < total {
+            let chunk = reader
+                .read()
+                .await
+                .expect("the sink delivers every byte before it closes");
+            taken += chunk.len();
+            chunks.push(chunk);
+        }
+        chunks
+    }
+
+    fn assert_arrived_in_bounded_chunks(chunks: &[Bytes], guest: &[u8]) {
+        let lens: Vec<usize> = chunks.iter().map(Bytes::len).collect();
+        assert_eq!(
+            lens,
+            [
+                GUEST_IO_CHUNK_BYTES,
+                GUEST_IO_CHUNK_BYTES,
+                GUEST_IO_CHUNK_BYTES,
+                17
+            ],
+            "each poll hands the sink one chunk, never the whole write"
+        );
+        let arrived: Vec<u8> = chunks
+            .iter()
+            .flat_map(|chunk| chunk.iter().copied())
+            .collect();
+        assert_eq!(arrived, guest, "every byte arrives, in order");
+    }
+
+    #[test]
+    fn a_write_larger_than_any_heap_asks_for_one_chunk() {
+        // `usize::MAX` is a write no heap could hold: the reservation is
+        // the chunk, whatever the guest says.
+        assert_eq!(
+            bounded_chunk_len(usize::MAX, GUEST_IO_CHUNK_BYTES),
+            GUEST_IO_CHUNK_BYTES
+        );
+        assert_eq!(
+            bounded_chunk_len(GUEST_IO_CHUNK_BYTES + 1, GUEST_IO_CHUNK_BYTES),
+            GUEST_IO_CHUNK_BYTES
+        );
+        assert_eq!(
+            bounded_chunk_len(GUEST_IO_CHUNK_BYTES, GUEST_IO_CHUNK_BYTES),
+            GUEST_IO_CHUNK_BYTES
+        );
+        assert_eq!(bounded_chunk_len(17, GUEST_IO_CHUNK_BYTES), 17);
+        assert_eq!(bounded_chunk_len(0, GUEST_IO_CHUNK_BYTES), 0);
+    }
+
+    #[test]
+    fn child_stdin_consumer_hands_the_channel_one_chunk_per_poll() {
+        let engine = async_engine();
+        let mut store = wasmtime::Store::new(&engine, ());
+        let (writer, reader) = crate::byte_channel();
+        let guest = long_guest_write();
+        let total = guest.len();
+
+        let chunks = block_on(store.run_concurrent(async move |accessor| {
+            accessor.with(|mut access| {
+                let stream = StreamReader::new(&mut access, guest.clone())
+                    .expect("a host stream over the guest's bytes");
+                stream
+                    .pipe(&mut access, ChannelStreamConsumer::detached(writer))
+                    .expect("the consumer takes the stream");
+            });
+            chunks_until(&reader, total).await
+        }))
+        .expect("the concurrent run completes");
+
+        assert_arrived_in_bounded_chunks(&chunks, &long_guest_write());
+    }
+
+    #[test]
+    fn stdout_consumer_hands_a_child_pipe_one_chunk_per_poll() {
+        let engine = async_engine();
+        let (stdout_tx, stdout_rx) = crate::byte_channel();
+        let (stderr_tx, _stderr_rx) = crate::byte_channel();
+        let (_stdin_tx, stdin_rx) = crate::byte_channel();
+        let data: TestStoreData = store_data_routed(
+            ProcessAuthority::empty(),
+            crate::ComponentOutputMode::Child {
+                stdin_rx,
+                stdout_tx,
+                stderr_tx,
+            },
+            |_| {},
+        );
+        let mut store = wasmtime::Store::new(&engine, data);
+        let guest = long_guest_write();
+        let total = guest.len();
+        let (result_tx, _result_rx) = oneshot::channel();
+
+        let chunks = block_on(store.run_concurrent(async move |accessor| {
+            accessor.with(|mut access| {
+                let stream = StreamReader::new(&mut access, guest.clone())
+                    .expect("a host stream over the guest's bytes");
+                let consumer = SerialStreamConsumer::new(
+                    |data: &mut TestStoreData| data,
+                    result_tx,
+                    OutputStreamKind::Stdout,
+                );
+                stream
+                    .pipe(&mut access, consumer)
+                    .expect("the consumer takes the stream");
+            });
+            chunks_until(&stdout_rx, total).await
+        }))
+        .expect("the concurrent run completes");
+
+        assert_arrived_in_bounded_chunks(&chunks, &long_guest_write());
     }
 }

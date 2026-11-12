@@ -56,7 +56,7 @@ use crate::wasmtime_adapter::{WasmtimeCompiledComponent, WasmtimeCompiledCoreMod
 use crate::wasmtime_adapter::{
     WasmtimePrecompiledKind,
     wasi::{
-        self as wasi_fs, FsDescriptor, FsNodeKind, WasiImportSet,
+        self as wasi_fs, FsDescriptor, FsNodeKind, GUEST_IO_CHUNK_BYTES, WasiImportSet,
         bindings::filesystem::types as fs_types, preview1 as p1,
     },
 };

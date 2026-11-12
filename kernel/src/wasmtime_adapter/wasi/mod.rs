@@ -68,6 +68,13 @@ const DEFAULT_WASI_TCP_KEEP_ALIVE_IDLE_NANOS: u64 = 7_200_000_000_000;
 const DEFAULT_WASI_TCP_KEEP_ALIVE_INTERVAL_NANOS: u64 = 75_000_000_000;
 const DEFAULT_WASI_TCP_KEEP_ALIVE_COUNT: u32 = 9;
 pub(crate) const MAX_WASI_UDP_DATAGRAM_BYTES: usize = u16::MAX as usize;
+/// The most guest bytes one host call or one stream poll holds in kernel
+/// memory at once when it has to copy them out of linear memory. A transfer
+/// larger than this moves in successive chunks, so what the call holds never
+/// grows with the guest's length. 64 KiB is the largest UDP payload
+/// (`u16::MAX` rounded to a power of two) and the WASI UDP default buffer
+/// size ([`DEFAULT_WASI_UDP_BUFFER_BYTES`]).
+pub(crate) const GUEST_IO_CHUNK_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 #[error("guest requested wasi preview2 exit code {code}")]
