@@ -613,39 +613,68 @@ fn balloon_lines(sample: &stats::Sample) -> Vec<Line<'static>> {
     vec![Line::from(vec![
         Span::styled("balloon  ", Style::default().fg(Color::Cyan)),
         Span::raw(format!(
-            "{held}, {} reported free",
-            format_bytes(balloon.reported_bytes)
+            "{held}, {} reported free ({} in all)",
+            format_bytes(balloon.reported_bytes),
+            format_bytes(balloon.reported_bytes_total)
         )),
     ])]
 }
 
 /// What the kernel has swapped out, on a machine that has swap.
 ///
-/// The number that matters when a guest feels slow is the mean fault
-/// latency, so it is shown next to how much is out rather than in a
-/// panel of its own.
+/// Three lines: the swap device, the compressed store, and the faults by
+/// the tier that served them. The number that matters when a guest feels
+/// slow is the mean wait of each source, so it is shown beside the count
+/// rather than in a panel of its own.
 fn swap_lines(sample: &stats::Sample) -> Vec<Line<'static>> {
     let Some(swap) = &sample.swap else {
         return Vec::new();
     };
-    let latency = if swap.faults_served == 0 {
-        String::from("no faults yet")
+    let label = |text: &'static str| Span::styled(text, Style::default().fg(Color::Cyan));
+    let disk = match &swap.disk {
+        Some(disk) => format!(
+            "{} ({} pages) of {} on {}",
+            format_bytes(disk.stored_bytes),
+            disk.pages,
+            format_bytes(disk.capacity_bytes),
+            disk.backend
+        ),
+        None => String::from("no disk attached"),
+    };
+    let store = &swap.store;
+    let ratio = if store.frames == 0 {
+        String::new()
     } else {
         format!(
-            "{} faults, {} mean",
-            swap.faults_served,
-            format_duration_nanos(swap.mean_fault_latency)
+            ", {:.1} pages per frame",
+            store.pages as f64 / store.frames as f64
         )
     };
-    vec![Line::from(vec![
-        Span::styled("swap     ", Style::default().fg(Color::Cyan)),
-        Span::raw(format!(
-            "{} of {} on {}, {latency}",
-            format_bytes(swap.used_bytes),
-            format_bytes(swap.capacity_bytes),
-            swap.backend
-        )),
-    ])]
+    let store = format!(
+        "{} pages in {} frames, limit {}{ratio}",
+        store.pages,
+        store.frames,
+        format_bytes(store.limit_bytes)
+    );
+    let source = |name: &str, source: &stats::SwapFaultSource| {
+        format!(
+            "{name} {} ({})",
+            source.count,
+            format_duration_nanos(source.mean_wait)
+        )
+    };
+    let faults = [
+        source("zero", &swap.faults.zero),
+        source("store", &swap.faults.store),
+        source("parked", &swap.faults.parked),
+        source("disk", &swap.faults.disk),
+    ]
+    .join(", ");
+    vec![
+        Line::from(vec![label("swap     "), Span::raw(disk)]),
+        Line::from(vec![label("  store  "), Span::raw(store)]),
+        Line::from(vec![label("  faults "), Span::raw(faults)]),
+    ]
 }
 
 /// The block device the kernel identified at boot, or the fact that it

@@ -128,6 +128,11 @@ pub struct BalloonStats {
     pub actual_bytes: u64,
     /// Bytes named to the host as free in the last reporting pass.
     pub reported_bytes: u64,
+    /// Bytes named to the host as free across every reporting pass since
+    /// boot. `reported_bytes` is overwritten by each pass; this only grows,
+    /// and observers use it to see reporting keep up with memory freed
+    /// (by compression, for one). It is observability only.
+    pub reported_bytes_total: u64,
 }
 
 /// A shared view of the balloon for observers and the OOM path.
@@ -140,6 +145,7 @@ struct BalloonShared {
     target_pages: AtomicU32,
     actual_pages: AtomicU32,
     reported_bytes: AtomicU64,
+    reported_bytes_total: AtomicU64,
     /// Set by the runtime's out-of-memory path.
     deflate_requested: AtomicBool,
     /// Wakes the task that owns the inflated runs.
@@ -161,6 +167,7 @@ impl BalloonHandle {
                 target_pages: AtomicU32::new(0),
                 actual_pages: AtomicU32::new(0),
                 reported_bytes: AtomicU64::new(0),
+                reported_bytes_total: AtomicU64::new(0),
                 deflate_requested: AtomicBool::new(false),
                 work: Notify::new(),
             }),
@@ -173,6 +180,7 @@ impl BalloonHandle {
             target_bytes: pages_to_bytes(self.shared.target_pages.load(Ordering::Acquire)),
             actual_bytes: pages_to_bytes(self.shared.actual_pages.load(Ordering::Acquire)),
             reported_bytes: self.shared.reported_bytes.load(Ordering::Acquire),
+            reported_bytes_total: self.shared.reported_bytes_total.load(Ordering::Acquire),
         }
     }
 
@@ -540,6 +548,10 @@ async fn report_free_memory_forever<CpuImpl, Pool, Device>(
         if reported_frames != 0 {
             let bytes = (PhysFrameAllocator::stats(pool).reported_frames * PhysFrame::SIZE) as u64;
             handle.shared.reported_bytes.store(bytes, Ordering::Release);
+            handle
+                .shared
+                .reported_bytes_total
+                .fetch_add((reported_frames * PhysFrame::SIZE) as u64, Ordering::AcqRel);
             tracing::info!(
                 named_bytes = (reported_frames * PhysFrame::SIZE) as u64,
                 reported_bytes = bytes,

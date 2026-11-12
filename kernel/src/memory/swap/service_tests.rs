@@ -634,7 +634,7 @@ fn two_faults_on_one_page_both_succeed() {
         "the page is present, so the instruction retries"
     );
     assert_eq!(harness.contents(addr), pattern(0xb0));
-    assert_eq!(harness.handle.stats().pages_in, 1);
+    assert_eq!(harness.handle.stats().faults.disk.count, 1);
 }
 
 /// An instance that begins a turn while the pass is waiting on the
@@ -690,9 +690,9 @@ fn fault_latency_counts_the_time_a_request_spent_queued() {
     assert_eq!(poll(&mut fault), Some(Ok(())));
 
     let stats = harness.handle.stats();
-    assert_eq!(stats.faults_served, 1);
+    assert_eq!(stats.faults.disk.count, 1);
     assert_eq!(
-        stats.mean_fault_latency_nanos, 50_000,
+        stats.faults.disk.mean_wait_nanos, 50_000,
         "latency runs from the request to its completion, queue included"
     );
 }
@@ -751,7 +751,15 @@ fn a_read_that_lands_after_the_range_was_decommitted_leaves_the_slot_for_the_dra
     let addr = harness.resident(1, 0x77);
     harness.evict(addr).expect("evict");
     let index = harness.index_of(addr).expect("swapped");
-    assert_eq!(harness.handle.stats().used_bytes, PAGE as u64);
+    assert_eq!(
+        harness
+            .handle
+            .stats()
+            .disk
+            .expect("a disk is attached")
+            .stored_bytes,
+        PAGE as u64
+    );
 
     harness.backend.decommit_during_next_read(addr);
     assert_eq!(
@@ -760,9 +768,18 @@ fn a_read_that_lands_after_the_range_was_decommitted_leaves_the_slot_for_the_dra
         "a decommitted page is not a failed fault: the retried instruction classifies it afresh"
     );
     assert_eq!(harness.slot(index), SlotState::Vacant);
-    assert_eq!(harness.handle.stats().pages_in, 0, "nothing was reinstated");
     assert_eq!(
-        harness.handle.stats().used_bytes,
+        harness.handle.stats().faults.disk.count,
+        0,
+        "nothing was reinstated"
+    );
+    assert_eq!(
+        harness
+            .handle
+            .stats()
+            .disk
+            .expect("a disk is attached")
+            .stored_bytes,
         0,
         "the extent was consumed by the read"
     );
@@ -812,5 +829,13 @@ fn an_orphan_that_meets_a_claimed_slot_is_kept_until_the_claim_resolves() {
         "the kept orphan is released on the next pass, with no new one drained"
     );
     assert!(matches!(harness.slot(index), SlotState::Free { .. }));
-    assert_eq!(harness.handle.stats().used_bytes, 0);
+    assert_eq!(
+        harness
+            .handle
+            .stats()
+            .disk
+            .expect("a disk is attached")
+            .stored_bytes,
+        0
+    );
 }

@@ -189,7 +189,7 @@ mod space;
 mod stack;
 mod store;
 
-use counters::{Counters, FaultSource, Placement, Totals};
+use counters::{Counters, FaultSource, Held, Placement, Totals};
 use policy::PolicyCells;
 use slot::{Claim, DiskKey, SlotAllocator, SlotIndex, SlotState, SlotTable, StoreFrameIndex};
 use store::{Limits, Store, StoreFrames, StoreFull};
@@ -255,22 +255,97 @@ pub enum SwapFaultError {
 }
 
 /// What swap is holding, as observers see it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+///
+/// Gauges say what is held now; every other count is cumulative since boot.
+/// What each quantity of interest is made of: the compression ratio is
+/// `store.pages / store.frames`, the layout's efficiency is
+/// `store.payload_bytes / (store.frames * 4096)`, and the store's occupancy
+/// against its limit is `store.frames * 4096 / store.limit_bytes`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SwapStats {
+    /// The swap device, absent while none is attached.
+    pub disk: Option<SwapDiskStats>,
+    pub zero: SwapZeroStats,
+    pub store: SwapStoreStats,
+    pub faults: SwapFaultStats,
+    /// Pages detached into a tier. A page put back is not counted. Net
+    /// reclaim is this less `store.frames` less the pages faulted back.
+    pub frames_released: u64,
+    /// The settings in force.
+    pub policy: SwapPolicy,
+}
+
+/// What the swap device holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SwapDiskStats {
     /// Name of the backing store, for the stats panel.
     pub backend: &'static str,
     /// Bytes the backing store can hold in total.
     pub capacity_bytes: u64,
-    /// Bytes of it currently holding swapped-out pages.
-    pub used_bytes: u64,
-    /// Pages written out since boot.
+    /// Gauge: bytes handed to the backend and still held.
+    pub stored_bytes: u64,
+    /// Gauge: pages on the device.
+    pub pages: u64,
+    /// Pages written out as they were.
+    pub pages_out_raw: u64,
+    /// Pages written out as LZ4 blocks.
+    pub pages_out_compressed: u64,
+    /// Objects moved from the store to the device.
+    pub written_back: u64,
+    /// Gauge: pages whose bytes no tier holds any more.
+    pub pages_lost: u64,
+}
+
+/// Pages that were all zeros, which take no storage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SwapZeroStats {
+    /// Gauge: zero pages swapped out.
+    pub pages: u64,
     pub pages_out: u64,
-    /// Pages read back in since boot.
-    pub pages_in: u64,
-    /// Guest faults resolved by reading a page back.
-    pub faults_served: u64,
-    /// Mean time a faulting guest waited, over every fault served.
-    pub mean_fault_latency_nanos: u64,
+}
+
+/// The compressed store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SwapStoreStats {
+    /// The most the store may take of the pool now, in bytes.
+    pub limit_bytes: u64,
+    /// Gauge: user-pool frames the store holds, the spare included.
+    pub frames: u64,
+    /// Gauge: compressed pages.
+    pub pages: u64,
+    /// Gauge: bytes of their LZ4 blocks.
+    pub payload_bytes: u64,
+    /// Gauge: raw pages parked after a placement failed.
+    pub parked_pages: u64,
+    pub pages_out: u64,
+    /// Pages that did not compress to the policy's bound.
+    pub rejected_incompressible: u64,
+    /// Compressible pages the store refused for its limit.
+    pub rejected_full: u64,
+    /// Pages no tier took, which stayed in memory.
+    pub put_back: u64,
+    /// Frames compaction emptied.
+    pub compacted_frames: u64,
+}
+
+/// Faults by the tier that resolved them. Latency runs from the fault's
+/// issue to its resolution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SwapFaultStats {
+    pub zero: SwapFaultSource,
+    pub store: SwapFaultSource,
+    pub parked: SwapFaultSource,
+    pub disk: SwapFaultSource,
+    /// Faults that found their slot held by another path and waited.
+    pub contended_waits: u64,
+}
+
+/// Faults one tier resolved.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SwapFaultSource {
+    pub count: u64,
+    /// Mean time a faulting guest waited, over `count` faults.
+    pub mean_wait_nanos: u64,
 }
 
 /// The platform address space's swap surface, as plain function
@@ -567,16 +642,51 @@ impl SwapHandle {
 
     /// What swap is holding right now.
     pub fn stats(&self) -> SwapStats {
-        let totals = self.shared.counters.totals();
-        let faults = totals.faults();
+        let shared = &*self.shared;
+        let totals = shared.counters.totals();
+        let policy = shared.policy.load();
+        let source = |source: FaultSource, count: u64| SwapFaultSource {
+            count,
+            mean_wait_nanos: totals.fault_wait_nanos[source as usize]
+                .checked_div(count)
+                .unwrap_or(0),
+        };
         SwapStats {
-            backend: self.shared.backend,
-            capacity_bytes: self.shared.capacity_bytes,
-            used_bytes: totals.disk_pages * PhysFrame::SIZE as u64,
-            pages_out: totals.pages_out(),
-            pages_in: faults,
-            faults_served: faults,
-            mean_fault_latency_nanos: totals.fault_wait_nanos.checked_div(faults).unwrap_or(0),
+            disk: Some(SwapDiskStats {
+                backend: shared.backend,
+                capacity_bytes: shared.capacity_bytes,
+                stored_bytes: totals.disk_bytes,
+                pages: totals.disk_pages,
+                pages_out_raw: totals.pages_out_disk_raw,
+                pages_out_compressed: totals.pages_out_disk_compressed,
+                written_back: totals.written_back,
+                pages_lost: totals.lost_pages,
+            }),
+            zero: SwapZeroStats {
+                pages: totals.zero_pages,
+                pages_out: totals.pages_out_zero,
+            },
+            store: SwapStoreStats {
+                limit_bytes: (store_limits(&policy).limit_frames() * PhysFrame::SIZE) as u64,
+                frames: shared.store.held_frames() as u64,
+                pages: totals.store_pages,
+                payload_bytes: totals.store_payload_bytes,
+                parked_pages: totals.parked_pages,
+                pages_out: totals.pages_out_store,
+                rejected_incompressible: totals.rejected_incompressible,
+                rejected_full: totals.rejected_full,
+                put_back: totals.put_back,
+                compacted_frames: totals.compacted_frames,
+            },
+            faults: SwapFaultStats {
+                zero: source(FaultSource::Zero, totals.faults_zero),
+                store: source(FaultSource::Store, totals.faults_store),
+                parked: source(FaultSource::Parked, totals.faults_parked),
+                disk: source(FaultSource::Disk, totals.faults_disk),
+                contended_waits: totals.contended_waits,
+            },
+            frames_released: totals.pages_out(),
+            policy,
         }
     }
 
@@ -741,7 +851,9 @@ impl SwapHandle {
                     other => unreachable!("a RAM-tier claim was taken from {other:?}"),
                 };
                 shared.release(claim);
-                shared.counters.here().fault(
+                let counters = shared.counters.here();
+                counters.unhold(Held::of_ram(state));
+                counters.fault(
                     source,
                     shared.clock.now_nanos().saturating_sub(issued_nanos),
                 );
@@ -925,6 +1037,16 @@ enum DiskEncoding {
     /// An LZ4 block of this many bytes, which the backend must be asked for
     /// by exactly that length.
     Lz4(slot::CompressedLen),
+}
+
+impl DiskEncoding {
+    /// Bytes the extent holds.
+    fn bytes(self) -> usize {
+        match self {
+            Self::Raw => PhysFrame::SIZE,
+            Self::Lz4(len) => len.get(),
+        }
+    }
 }
 
 /// What the owner knows about a page on the disk: the backend's token for
@@ -1141,7 +1263,7 @@ where
         if pages_in == 0 && pages_out == 0 {
             return;
         }
-        let latency = after.fault_wait_nanos - before.fault_wait_nanos;
+        let latency = after.total_fault_wait_nanos() - before.total_fault_wait_nanos();
         self.report = current;
         tracing::info!(
             target: "helios_kernel::swap",
@@ -1163,7 +1285,7 @@ where
             in_disk = after.faults_disk - before.faults_disk,
             contended_waits = after.contended_waits - before.contended_waits,
             written_back = after.written_back - before.written_back,
-            compacted = after.compacted - before.compacted,
+            compacted_frames = after.compacted_frames - before.compacted_frames,
             mean_fault_latency_nanos = latency.checked_div(pages_in).unwrap_or(0),
             disk_pages = after.disk_pages,
             store_frames = self.store.frames(),
@@ -1250,7 +1372,10 @@ where
         // The backend has consumed the extent, so the token is dead and
         // the buffer holds the page's only copy.
         disk.remove(key);
-        shared.counters.here().disk_pages(-1);
+        shared
+            .counters
+            .here()
+            .unhold(Held::Disk(entry.encoding.bytes()));
         if let DiskEncoding::Lz4(len) = entry.encoding {
             // The device is outside the kernel's integrity boundary: a block
             // that does not decode to one page is a failed read of this
@@ -1356,7 +1481,7 @@ where
         match disk.backend.swap_out(bytes).await {
             Ok(token) => {
                 let key = disk.insert(token, encoding);
-                shared.counters.here().disk_pages(1);
+                shared.counters.here().hold(Held::Disk(encoding.bytes()));
                 shared.restore(claim, SlotState::Disk(key));
                 Ok(())
             }
@@ -1369,6 +1494,7 @@ where
                     "swapped-out page lost: the swap backend refused it back and no other copy exists"
                 );
                 shared.restore(claim, SlotState::Lost);
+                shared.counters.here().hold(Held::Lost);
                 Err(())
             }
         }
@@ -1422,13 +1548,21 @@ where
             // storage either, and a zero page never had any.
             SlotState::Lost | SlotState::Vacant | SlotState::Zero => {
                 match shared.slots.claim(index, state) {
-                    Ok(claim) => shared.release(claim),
+                    Ok(claim) => {
+                        match state {
+                            SlotState::Lost => shared.counters.here().unhold(Held::Lost),
+                            SlotState::Zero => shared.counters.here().unhold(Held::Zero),
+                            _ => {}
+                        }
+                        shared.release(claim);
+                    }
                     Err(_) => self.deferred.push(token),
                 }
             }
             SlotState::Stored(object) => match shared.slots.claim(index, state) {
                 Ok(claim) => {
                     shared.store.free_object(object);
+                    shared.counters.here().unhold(Held::of_ram(state));
                     shared.release(claim);
                 }
                 Err(_) => self.deferred.push(token),
@@ -1436,6 +1570,7 @@ where
             SlotState::Parked(frame) => match shared.slots.claim(index, state) {
                 Ok(claim) => {
                     shared.store.free_parked(frame);
+                    shared.counters.here().unhold(Held::of_ram(state));
                     shared.release(claim);
                 }
                 Err(_) => self.deferred.push(token),
@@ -1448,7 +1583,10 @@ where
                         .expect("a slot reads Disk only while a disk is attached");
                     let entry = disk.remove(key);
                     disk.backend.release(entry.token).await;
-                    shared.counters.here().disk_pages(-1);
+                    shared
+                        .counters
+                        .here()
+                        .unhold(Held::Disk(entry.encoding.bytes()));
                     shared.release(claim);
                 }
                 Err(_) => self.deferred.push(token),
@@ -1551,7 +1689,7 @@ where
             || shared.released.signal(),
         );
         if compacted.objects != 0 {
-            shared.counters.here().compacted(compacted.objects);
+            shared.counters.here().compacted(compacted.frames);
             tracing::debug!(
                 target: "helios_kernel::swap",
                 objects = compacted.objects,
@@ -1665,7 +1803,8 @@ where
                     };
                     let counters = shared.counters.here();
                     counters.written_back();
-                    counters.disk_pages(1);
+                    counters.unhold(Held::of_ram(state));
+                    counters.hold(Held::Disk(encoding.bytes()));
                     shared.restore(claim, SlotState::Disk(key));
                 }
                 Err(error) => {
@@ -1826,7 +1965,9 @@ where
         if self.page.chunks_exact(8).all(|word| word == [0; 8]) {
             let shared = &self.handle.shared;
             shared.restore(claim, SlotState::Zero);
-            shared.counters.here().page_out(Placement::Zero);
+            let counters = shared.counters.here();
+            counters.page_out(Placement::Zero);
+            counters.hold(Held::Zero);
             return Placed::Out;
         }
 
@@ -1847,7 +1988,9 @@ where
                 ) {
                     Ok(object) => {
                         shared.restore(claim, SlotState::Stored(object));
-                        shared.counters.here().page_out(Placement::Store);
+                        let counters = shared.counters.here();
+                        counters.page_out(Placement::Store);
+                        counters.hold(Held::Stored(len.get()));
                         return Placed::Out;
                     }
                     Err(StoreFull) => {
@@ -1893,7 +2036,7 @@ where
                 let shared = &self.handle.shared;
                 shared.restore(claim, SlotState::Disk(key));
                 let counters = shared.counters.here();
-                counters.disk_pages(1);
+                counters.hold(Held::Disk(encoding.bytes()));
                 counters.page_out(match encoding {
                     DiskEncoding::Raw => Placement::DiskRaw,
                     DiskEncoding::Lz4(_) => Placement::DiskCompressed,
@@ -1920,7 +2063,9 @@ where
         let shared = &self.handle.shared;
         let frame = self.store.park(&shared.store, &claim, &self.page);
         shared.restore(claim, SlotState::Parked(frame));
-        shared.counters.here().page_out(Placement::Parked);
+        let counters = shared.counters.here();
+        counters.page_out(Placement::Parked);
+        counters.hold(Held::Parked);
         Placed::Out
     }
 }

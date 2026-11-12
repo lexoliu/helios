@@ -825,3 +825,74 @@ fn a_fault_during_writeback_waits_for_the_slot_and_reads_the_disk() {
     assert_eq!(&harness.contents(*addr), bytes);
     harness.finish();
 }
+
+#[test]
+fn the_stats_say_what_each_tier_holds_and_where_each_fault_was_served() {
+    let mut harness = Harness::tiered();
+    let text = text_page(1);
+    let random = random_page(11);
+    let zero = harness.resident_with(1, vec![0_u8; PAGE]);
+    let stored_page = harness.resident_with(2, text.clone());
+    let disk_page = harness.resident_with(3, random.clone());
+    for addr in [zero, stored_page, disk_page] {
+        assert_eq!(harness.evict(addr), Ok(Placed::Out));
+    }
+    let object = stored(&harness, stored_page);
+
+    let stats = harness.handle.stats();
+    assert_eq!(stats.frames_released, 3);
+    assert_eq!((stats.zero.pages, stats.zero.pages_out), (1, 1));
+    assert_eq!(
+        (
+            stats.store.pages,
+            stats.store.payload_bytes,
+            stats.store.pages_out
+        ),
+        (1, object.len().get() as u64, 1)
+    );
+    assert_eq!(
+        stats.store.frames, 2,
+        "one frame holds the object and the spare is held beside it"
+    );
+    assert_eq!(stats.store.rejected_incompressible, 1);
+    let disk = stats.disk.expect("a disk is attached");
+    assert_eq!(
+        (
+            disk.pages,
+            disk.stored_bytes,
+            disk.pages_out_raw,
+            disk.pages_out_compressed
+        ),
+        (1, PAGE as u64, 1, 0)
+    );
+    assert_eq!(stats.policy, SwapPolicy::default());
+    assert_eq!(
+        stats.faults.zero.count + stats.faults.store.count + stats.faults.disk.count,
+        0
+    );
+
+    for addr in [zero, stored_page, disk_page] {
+        harness.fault(addr).expect("every tier faults back");
+    }
+    let stats = harness.handle.stats();
+    assert_eq!(
+        (
+            stats.zero.pages,
+            stats.store.pages,
+            stats.store.payload_bytes
+        ),
+        (0, 0, 0),
+        "the gauges fall as the pages come back"
+    );
+    let disk = stats.disk.expect("a disk is attached");
+    assert_eq!((disk.pages, disk.stored_bytes), (0, 0));
+    assert_eq!(
+        (
+            stats.faults.zero.count,
+            stats.faults.store.count,
+            stats.faults.disk.count
+        ),
+        (1, 1, 1)
+    );
+    harness.finish();
+}

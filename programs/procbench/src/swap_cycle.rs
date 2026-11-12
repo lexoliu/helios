@@ -23,10 +23,6 @@ use crate::{ChildSpec, ProcbenchError, READ_CHUNK_BYTES, wait_child};
 const PAGE_BYTES: usize = 4096;
 const PAGES_PER_MIB: u64 = (1024 * 1024 / PAGE_BYTES) as u64;
 
-/// How long an instance has to have been off every processor before the
-/// swap policy evicts it: `IDLE_SWAP_AFTER` in `kernel/src/memory/swap.rs`.
-const IDLE_SWAP_AFTER: Duration = Duration::from_secs(10);
-
 /// How often the swap policy runs: `SWAP_TICK` in
 /// `kernel/src/memory/swap.rs`. The hog loop runs once per tick.
 const SWAP_TICK: Duration = Duration::from_millis(500);
@@ -124,18 +120,31 @@ fn fill_page(seed: u64, index: u64, page: &mut [u8]) {
 /// The swap counters at one instant.
 #[derive(Clone, Copy)]
 struct Counters {
+    /// Pages detached into a tier: the page is out of memory, whichever
+    /// tier holds it.
     pages_out: u64,
+    /// Faults resolved, over every tier.
     pages_in: u64,
+}
+
+impl Counters {
+    fn of(swap: &stats::Swap) -> Self {
+        let faults = &swap.faults;
+        Self {
+            pages_out: swap.frames_released,
+            pages_in: faults.zero.count
+                + faults.store.count
+                + faults.parked.count
+                + faults.disk.count,
+        }
+    }
 }
 
 fn swap_counters() -> Result<Counters, ProcbenchError> {
     let swap = stats::snapshot()
         .swap
         .ok_or(ProcbenchError::SwapUnavailable)?;
-    Ok(Counters {
-        pages_out: swap.pages_out,
-        pages_in: swap.pages_in,
-    })
+    Ok(Counters::of(&swap))
 }
 
 /// A buffer the parent holds and keeps touching, so it is never idle.
@@ -195,7 +204,13 @@ fn has_line(output: &[u8]) -> bool {
 
 pub(crate) async fn swap_cycle(options: Options, child: ChildSpec) -> Result<(), ProcbenchError> {
     let child_pages = options.mib * PAGES_PER_MIB;
-    let baseline = swap_counters()?;
+    let swap = stats::snapshot()
+        .swap
+        .ok_or(ProcbenchError::SwapUnavailable)?;
+    let baseline = Counters::of(&swap);
+    // How long an instance has to have been off every processor before the
+    // policy evicts it, as the kernel reports it.
+    let idle_after = Duration::from_nanos(swap.policy.idle_after);
 
     let child = ChildSpec {
         path: child.path,
@@ -233,7 +248,7 @@ pub(crate) async fn swap_cycle(options: Options, child: ChildSpec) -> Result<(),
     let expected_eviction = SWAP_TICK * u32::try_from(batches).expect("batch count fits u32");
     let deadline = DEADLINE_FACTOR * expected_eviction;
     let mut eviction_started: Option<Instant> = None;
-    task::sleep(IDLE_SWAP_AFTER).await;
+    task::sleep(idle_after).await;
 
     let mut hog = Hog {
         chunks: Vec::new(),
@@ -243,7 +258,12 @@ pub(crate) async fn swap_cycle(options: Options, child: ChildSpec) -> Result<(),
     loop {
         hog.touch().await;
         let sample = stats::snapshot();
-        let swap = sample.swap.ok_or(ProcbenchError::SwapUnavailable)?;
+        let swap = Counters::of(
+            sample
+                .swap
+                .as_ref()
+                .ok_or(ProcbenchError::SwapUnavailable)?,
+        );
         let evicted = swap.pages_out.saturating_sub(baseline.pages_out);
         if evicted >= child_pages {
             break;

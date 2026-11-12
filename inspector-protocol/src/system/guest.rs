@@ -579,13 +579,54 @@ fn convert_device(device: host_stats::GrantedDevice) -> stats::GrantedDevice {
 
 fn convert_swap(swap: host_stats::Swap) -> stats::Swap {
     stats::Swap {
-        backend: swap.backend,
-        capacity_bytes: swap.capacity_bytes,
-        used_bytes: swap.used_bytes,
-        pages_out: swap.pages_out,
-        pages_in: swap.pages_in,
-        faults_served: swap.faults_served,
-        mean_fault_latency: swap.mean_fault_latency,
+        disk: swap.disk.map(|disk| stats::SwapDisk {
+            backend: disk.backend,
+            capacity_bytes: disk.capacity_bytes,
+            stored_bytes: disk.stored_bytes,
+            pages: disk.pages,
+            pages_out_raw: disk.pages_out_raw,
+            pages_out_compressed: disk.pages_out_compressed,
+            written_back: disk.written_back,
+            pages_lost: disk.pages_lost,
+        }),
+        zero: stats::SwapZero {
+            pages: swap.zero.pages,
+            pages_out: swap.zero.pages_out,
+        },
+        store: stats::SwapStore {
+            limit_bytes: swap.store.limit_bytes,
+            frames: swap.store.frames,
+            pages: swap.store.pages,
+            payload_bytes: swap.store.payload_bytes,
+            parked_pages: swap.store.parked_pages,
+            pages_out: swap.store.pages_out,
+            rejected_incompressible: swap.store.rejected_incompressible,
+            rejected_full: swap.store.rejected_full,
+            put_back: swap.store.put_back,
+            compacted_frames: swap.store.compacted_frames,
+        },
+        faults: stats::SwapFaults {
+            zero: convert_swap_fault_source(swap.faults.zero),
+            store: convert_swap_fault_source(swap.faults.store),
+            parked: convert_swap_fault_source(swap.faults.parked),
+            disk: convert_swap_fault_source(swap.faults.disk),
+            contended_waits: swap.faults.contended_waits,
+        },
+        frames_released: swap.frames_released,
+        policy: stats::SwapPolicy {
+            idle_after: swap.policy.idle_after,
+            store_limit_percent: swap.policy.store_limit_percent,
+            store_accept_percent: swap.policy.store_accept_percent,
+            accept_granules: swap.policy.accept_granules,
+            writeback: swap.policy.writeback,
+        },
+    }
+}
+
+fn convert_swap_fault_source(source: host_stats::SwapFaultSource) -> stats::SwapFaultSource {
+    stats::SwapFaultSource {
+        count: source.count,
+        mean_wait: source.mean_wait,
     }
 }
 
@@ -623,6 +664,7 @@ fn convert_memory_balloon(balloon: host_stats::MemoryBalloon) -> stats::MemoryBa
         target_bytes: balloon.target_bytes,
         actual_bytes: balloon.actual_bytes,
         reported_bytes: balloon.reported_bytes,
+        reported_bytes_total: balloon.reported_bytes_total,
     }
 }
 

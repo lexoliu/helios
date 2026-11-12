@@ -111,7 +111,7 @@ use alloc::vec::Vec;
 use core::num::NonZeroU32;
 use core::ptr::{self, NonNull};
 use core::slice;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use helios_hal::cpu::current_processor;
 use helios_hal::pmm::PhysFrame;
@@ -222,9 +222,17 @@ pub(super) struct StoreFrames {
     /// The most frames the table holds, which is the user pool's.
     capacity: u32,
     dirty: ReturnStack,
+    /// Frames the store holds from the pool, the spare included: the owner's
+    /// count, published for observers. Written only by the owner.
+    held: AtomicUsize,
 }
 
 impl StoreFrames {
+    /// Frames the store holds from the pool, the spare included. Any task.
+    pub(super) fn held_frames(&self) -> usize {
+        self.held.load(Ordering::Relaxed)
+    }
+
     /// A table for up to `max_frames` frames: the number the user pool
     /// holds, since the store can never exceed it.
     pub(super) fn new(max_frames: usize) -> Self {
@@ -238,6 +246,7 @@ impl StoreFrames {
                 .collect(),
             capacity,
             dirty: ReturnStack::new(),
+            held: AtomicUsize::new(0),
         }
     }
 
@@ -571,6 +580,7 @@ impl Store {
         };
         self.spare = Some(index);
         self.held += 1;
+        shared.held.store(self.held, Ordering::Relaxed);
         Ok(())
     }
 
@@ -1088,5 +1098,6 @@ impl Store {
         self.frames[raw as usize] = OwnerFrame::default();
         self.free_indices.push(raw);
         self.held -= 1;
+        shared.held.store(self.held, Ordering::Relaxed);
     }
 }

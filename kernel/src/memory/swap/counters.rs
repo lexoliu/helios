@@ -24,6 +24,8 @@ use core::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use crossbeam_utils::CachePadded;
 use helios_hal::cpu::current_processor;
 
+use super::slot::SlotState;
+
 /// Where a page came back from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum FaultSource {
@@ -53,10 +55,46 @@ pub(super) struct CounterBlock {
     rejected_full: AtomicU64,
     contended_waits: AtomicU64,
     written_back: AtomicU64,
-    compacted: AtomicU64,
-    /// Pages on the disk: a gauge, as a delta.
+    /// Frames compaction emptied.
+    compacted_frames: AtomicU64,
+    /// What each tier holds, as gauges: deltas of this processor's own
+    /// placements and releases.
+    zero_pages: AtomicI64,
+    store_pages: AtomicI64,
+    store_payload_bytes: AtomicI64,
+    parked_pages: AtomicI64,
     disk_pages: AtomicI64,
+    disk_bytes: AtomicI64,
+    lost_pages: AtomicI64,
     faults: [FaultCounter; 4],
+}
+
+/// What a slot holds, for the gauges.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Held {
+    Zero,
+    /// An LZ4 block of this many bytes in the store.
+    Stored(usize),
+    Parked,
+    /// An extent of this many bytes on the disk.
+    Disk(usize),
+    Lost,
+}
+
+impl Held {
+    /// What a settled RAM-tier slot holds.
+    ///
+    /// # Panics
+    ///
+    /// If `state` is not `Zero`, `Stored` or `Parked`.
+    pub(super) fn of_ram(state: SlotState) -> Self {
+        match state {
+            SlotState::Zero => Self::Zero,
+            SlotState::Stored(object) => Self::Stored(object.len().get()),
+            SlotState::Parked(_) => Self::Parked,
+            other => unreachable!("{other:?} is not a RAM-tier slot"),
+        }
+    }
 }
 
 /// Where an evicted page went.
@@ -104,13 +142,44 @@ impl CounterBlock {
         self.written_back.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Objects the store moved between its frames.
-    pub(super) fn compacted(&self, objects: usize) {
-        self.compacted.fetch_add(objects as u64, Ordering::Relaxed);
+    /// Frames compaction emptied and gave back to the pool.
+    pub(super) fn compacted(&self, frames: usize) {
+        self.compacted_frames
+            .fetch_add(frames as u64, Ordering::Relaxed);
     }
 
-    pub(super) fn disk_pages(&self, delta: i64) {
-        self.disk_pages.fetch_add(delta, Ordering::Relaxed);
+    /// A slot began to hold `held`.
+    pub(super) fn hold(&self, held: Held) {
+        self.account(held, 1);
+    }
+
+    /// A slot stopped holding `held`.
+    pub(super) fn unhold(&self, held: Held) {
+        self.account(held, -1);
+    }
+
+    fn account(&self, held: Held, sign: i64) {
+        let add =
+            |gauge: &AtomicI64, amount: i64| gauge.fetch_add(sign * amount, Ordering::Relaxed);
+        match held {
+            Held::Zero => {
+                add(&self.zero_pages, 1);
+            }
+            Held::Stored(bytes) => {
+                add(&self.store_pages, 1);
+                add(&self.store_payload_bytes, bytes as i64);
+            }
+            Held::Parked => {
+                add(&self.parked_pages, 1);
+            }
+            Held::Disk(bytes) => {
+                add(&self.disk_pages, 1);
+                add(&self.disk_bytes, bytes as i64);
+            }
+            Held::Lost => {
+                add(&self.lost_pages, 1);
+            }
+        }
     }
 
     /// A fault from `source` was resolved after `wait_nanos`.
@@ -139,13 +208,20 @@ pub(super) struct Totals {
     pub(super) rejected_full: u64,
     pub(super) contended_waits: u64,
     pub(super) written_back: u64,
-    pub(super) compacted: u64,
+    pub(super) compacted_frames: u64,
+    pub(super) zero_pages: u64,
+    pub(super) store_pages: u64,
+    pub(super) store_payload_bytes: u64,
+    pub(super) parked_pages: u64,
     pub(super) disk_pages: u64,
+    pub(super) disk_bytes: u64,
+    pub(super) lost_pages: u64,
     pub(super) faults_zero: u64,
     pub(super) faults_store: u64,
     pub(super) faults_parked: u64,
     pub(super) faults_disk: u64,
-    pub(super) fault_wait_nanos: u64,
+    /// Time guests waited, by [`FaultSource`].
+    pub(super) fault_wait_nanos: [u64; 4],
 }
 
 impl Totals {
@@ -161,6 +237,11 @@ impl Totals {
     /// Faults resolved from any tier.
     pub(super) fn faults(&self) -> u64 {
         self.faults_zero + self.faults_store + self.faults_parked + self.faults_disk
+    }
+
+    /// Time guests waited, over every source.
+    pub(super) fn total_fault_wait_nanos(&self) -> u64 {
+        self.fault_wait_nanos.iter().sum()
     }
 }
 
@@ -185,7 +266,7 @@ impl Counters {
 
     pub(super) fn totals(&self) -> Totals {
         let mut totals = Totals::default();
-        let mut disk_pages = 0_i64;
+        let mut gauges = [0_i64; 7];
         for block in &self.blocks {
             let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
             totals.pages_out_zero += load(&block.pages_out_zero);
@@ -198,8 +279,18 @@ impl Counters {
             totals.rejected_full += load(&block.rejected_full);
             totals.contended_waits += load(&block.contended_waits);
             totals.written_back += load(&block.written_back);
-            totals.compacted += load(&block.compacted);
-            disk_pages += block.disk_pages.load(Ordering::Relaxed);
+            totals.compacted_frames += load(&block.compacted_frames);
+            for (gauge, counter) in gauges.iter_mut().zip([
+                &block.zero_pages,
+                &block.store_pages,
+                &block.store_payload_bytes,
+                &block.parked_pages,
+                &block.disk_pages,
+                &block.disk_bytes,
+                &block.lost_pages,
+            ]) {
+                *gauge += counter.load(Ordering::Relaxed);
+            }
             for (source, field) in [
                 (FaultSource::Zero, &mut totals.faults_zero),
                 (FaultSource::Store, &mut totals.faults_store),
@@ -208,10 +299,21 @@ impl Counters {
             ] {
                 let counter = &block.faults[source as usize];
                 *field += load(&counter.count);
-                totals.fault_wait_nanos += load(&counter.wait_nanos);
+                totals.fault_wait_nanos[source as usize] += load(&counter.wait_nanos);
             }
         }
-        totals.disk_pages = u64::try_from(disk_pages).unwrap_or(0);
+        // Gauges are sums of per-processor deltas read without a barrier, so
+        // a read while a page moves between processors can come out a page
+        // short. A negative sum is that skew and reads as empty.
+        let [zero, store, payload, parked, disk, disk_bytes, lost] =
+            gauges.map(|gauge| gauge.max(0).cast_unsigned());
+        totals.zero_pages = zero;
+        totals.store_pages = store;
+        totals.store_payload_bytes = payload;
+        totals.parked_pages = parked;
+        totals.disk_pages = disk;
+        totals.disk_bytes = disk_bytes;
+        totals.lost_pages = lost;
         totals
     }
 }

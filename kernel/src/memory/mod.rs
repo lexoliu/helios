@@ -75,10 +75,10 @@ pub use reservations::{
     ReservationLookup, ReservationTracker, SwapEntry, VaCursor, ranges_outside, validate_range,
 };
 pub use swap::{
-    AGE_BATCH_PAGES, InstalledAddressSpace, SWAP_TICK, SwapDisabled, SwapFaultError, SwapHandle,
-    SwapLeafFormat, SwapPolicy, SwapPolicyError, SwapSpace, SwapStats, SwapVmHooks, disable_swap,
-    install_swap, install_swap_hooks, installed_swap_handle, installed_swap_hooks, swap_vm_hooks,
-    swapped_token,
+    AGE_BATCH_PAGES, InstalledAddressSpace, SWAP_TICK, SwapDisabled, SwapDiskStats, SwapFaultError,
+    SwapFaultSource, SwapFaultStats, SwapHandle, SwapLeafFormat, SwapPolicy, SwapPolicyError,
+    SwapSpace, SwapStats, SwapStoreStats, SwapVmHooks, SwapZeroStats, disable_swap, install_swap,
+    install_swap_hooks, installed_swap_handle, installed_swap_hooks, swap_vm_hooks, swapped_token,
 };
 pub use user::{
     UserHeapStats, UserMemoryPool, allocate_user_frame_uninit_on, allocate_user_frame_zeroed,
