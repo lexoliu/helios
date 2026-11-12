@@ -14,7 +14,16 @@
 {% if report.pins.baseline_wasmtime_revision %}
 | Vendored Wasmtime, baseline | `{{ report.pins.baseline_wasmtime_revision }}` |
 {% endif %}
+{% if report.pins.guest_isa %}
+| Guest code ISA level | `{{ report.pins.guest_isa.describe() }}` |
+{% endif %}
+{% if report.pins.baseline_guest_isa %}
+| Guest code ISA level, baseline | `{{ report.pins.baseline_guest_isa.describe() }}` |
+{% endif %}
 | Wasmtime on Linux | `{{ report.pins.wasmtime_linux_release }}` |
+{% if report.pins.linux_wasmtime_inferred_isa_flags is not none %}
+| Wasmtime on Linux, inferred ISA flags | `{{ report.pins.linux_wasmtime_inferred_isa_flags | join(", ") }}` |
+{% endif %}
 | Fedora image | `{{ report.pins.fedora_image_url }}` (`{{ report.pins.fedora_image_sha256 }}`) |
 | QEMU | `{{ report.pins.qemu_version }}` |
 | Guest | {{ report.pins.vcpus }} vCPUs, {{ report.pins.memory }} (Helios) / {{ report.pins.linux_vm_memory }} (Linux), `{{ report.pins.net_backend }}` network, inspector RPC over `{{ report.pins.rpc_transport or "unrecorded" }}`, {{ report.pins.devices | join(", ") }} |

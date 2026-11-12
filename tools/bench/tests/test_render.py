@@ -82,6 +82,9 @@ def test_docs_gate_and_pins_render(baseline_report: Report, regressed_report: Re
     assert "**regression**" in gate and "**Blocking**" in gate
     pins = render_pins(baseline_report)
     assert "b83d18c8558b6d32fb0c0727d1c6a32639842c49" in pins
+    assert "| Guest code ISA level | `x86-64-v4+vbmi+bitalg` |" in pins
+    assert "| Wasmtime on Linux, inferred ISA flags | `has_avx, has_avx2, has_avx512f, has_sse3` |" in pins
+    assert "baseline" not in pins.split("Guest code ISA level")[1].split("\n")[0]
 
 
 def test_plots_write_one_svg_per_class_and_the_headline(tmp_path: Path, baseline_report: Report) -> None:

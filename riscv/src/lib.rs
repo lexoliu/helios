@@ -1035,6 +1035,8 @@ fn shared_debug_state(
                 hart_count,
                 riscv::register::time::read64(),
                 payload,
+                // The RISC-V `Cpu` answers no feature probe (`native_feature_probe`).
+                helios_kernel::GuestIsa::for_build_target(None),
             )
         })
         .clone()

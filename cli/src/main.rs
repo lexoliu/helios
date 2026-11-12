@@ -10,7 +10,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 use ed25519_dalek::{SecretKey, SigningKey, VerifyingKey};
 use fatfs::{FatType, FileSystem, FormatVolumeOptions, FsOptions};
 use helios_artifact::bootfs::{self, WriteEntry};
-use helios_artifact::{TrailerError, cwasm_target_supports_wasm_simd, sign_payload_with_key};
+use helios_artifact::{
+    CwasmTarget, IsaLevelError, TrailerError, cwasm_target_isa_levels,
+    cwasm_target_supports_wasm_simd, sign_payload_with_key,
+};
 use helios_compiler_support::{AotCompileHint, CompileError, precompile_artifact};
 use helios_profdata::{
     FetchedProfile, KERNEL_PROFILE_ARTIFACT, KERNEL_PROFILE_ASSET, KERNEL_PROFILE_WORKFLOW,
@@ -63,6 +66,8 @@ enum AotError {
         source: io::Error,
     },
     #[error("{0}")]
+    IsaLevel(#[from] IsaLevelError),
+    #[error("{0}")]
     Compile(#[from] CompileError),
     #[error("failed to sign AOT payload: {source}")]
     Sign {
@@ -97,6 +102,8 @@ enum CompilerPluginError {
         #[source]
         source: io::Error,
     },
+    #[error("{0}")]
+    IsaLevel(#[from] IsaLevelError),
     #[error("{0}")]
     Compile(#[from] CompileError),
     #[error("failed to sign compiler plugin output: {source}")]
@@ -166,6 +173,8 @@ enum PrebuildError {
     WasmBuild(#[from] WasmBuildError),
     #[error("{0}")]
     Bootfs(#[from] BootfsError),
+    #[error("{0}")]
+    IsaLevel(#[from] IsaLevelError),
     #[error("{0}")]
     Compile(#[from] CompileError),
     #[error("failed to create {path}: {source}")]
@@ -722,6 +731,9 @@ struct AotCommand {
     output: PathBuf,
     #[arg(long)]
     target: String,
+    /// The ISA level to compile for, one of the target's defined levels.
+    #[arg(long)]
+    isa_level: String,
     #[arg(long, default_value = "performance")]
     hint: Hint,
     #[arg(long)]
@@ -732,6 +744,9 @@ struct AotCommand {
 struct CompilerPluginCommand {
     #[arg(long)]
     target: String,
+    /// The ISA level to compile for, one of the target's defined levels.
+    #[arg(long)]
+    isa_level: String,
     #[arg(long, default_value = "performance")]
     hint: Hint,
 }
@@ -874,7 +889,8 @@ struct BootBuild<'a> {
     cargo: &'a Path,
     profile: &'a str,
     out_dir: &'a Path,
-    target: &'a str,
+    /// The level every boot artifact is compiled for: the target's floor.
+    target: &'a CwasmTarget<'a>,
     root_signing_key: &'a SigningKey,
     workspace_root: &'a WorkspaceRoot,
 }
@@ -923,7 +939,8 @@ fn run_aot(command: AotCommand) -> Result<(), AotError> {
         path: command.input.display().to_string(),
         source,
     })?;
-    let payload = precompile_artifact(&wasm, &command.target, command.hint.into())?.bytes;
+    let target = CwasmTarget::new(&command.target, &command.isa_level)?;
+    let payload = precompile_artifact(&wasm, &target, command.hint.into())?.bytes;
     let signed = sign_payload_with_key(&payload, &root_signing_key)
         .map_err(|source| AotError::Sign { source })?;
     fs::write(&command.output, signed).map_err(|source| AotError::WriteOutput {
@@ -946,7 +963,8 @@ fn run_compiler_plugin(command: CompilerPluginCommand) -> Result<(), CompilerPlu
     io::stdin()
         .read_to_end(&mut wasm)
         .map_err(|source| CompilerPluginError::ReadStdin { source })?;
-    let payload = precompile_artifact(&wasm, &command.target, command.hint.into())?.bytes;
+    let target = CwasmTarget::new(&command.target, &command.isa_level)?;
+    let payload = precompile_artifact(&wasm, &target, command.hint.into())?.bytes;
     let signed = sign_payload_with_key(&payload, &root_signing_key)
         .map_err(|source| CompilerPluginError::Sign { source })?;
     io::stdout()
@@ -990,12 +1008,13 @@ fn run_kernel_prebuild(
     )?;
     let init_cwasm = command.out_dir.join("init_component.cwasm");
     let init_component_bytes = encode_component(&init_component)?;
-    let init_payload = precompile_artifact(
-        &init_component_bytes,
-        &command.target,
-        Hint::Performance.into(),
-    )?
-    .bytes;
+    // The boot payload stays at the floor level: every processor the target
+    // supports satisfies it. Only the in-kernel compiler follows the
+    // processor's own level.
+    let floor = cwasm_target_isa_levels(&command.target).floor();
+    let target = CwasmTarget::new(&command.target, floor.name())?;
+    let init_payload =
+        precompile_artifact(&init_component_bytes, &target, Hint::Performance.into())?.bytes;
     let init_signed = sign_payload_with_key(&init_payload, &root_signing_key)
         .map_err(|source| PrebuildError::SignInit { source })?;
     fs::write(&init_cwasm, init_signed).map_err(|source| PrebuildError::Write {
@@ -1007,7 +1026,7 @@ fn run_kernel_prebuild(
         cargo: &command.cargo,
         profile: &command.profile,
         out_dir: &command.out_dir,
-        target: &command.target,
+        target: &target,
         root_signing_key: &root_signing_key,
         workspace_root: &workspace_root,
     };
@@ -1704,9 +1723,13 @@ fn build_boot_program_assets(
             .into());
         }
     }
-    reject_selected_target_mismatches(&external_artifacts, build.target, selected_programs)?;
+    reject_selected_target_mismatches(
+        &external_artifacts,
+        build.target.triple(),
+        selected_programs,
+    )?;
     external_artifacts.retain(|artifact| {
-        artifact.supports_target(build.target)
+        artifact.supports_target(build.target.triple())
             && selected_programs
                 .as_ref()
                 .is_none_or(|selected| selected.contains(&artifact.command))

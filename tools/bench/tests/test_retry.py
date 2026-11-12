@@ -168,7 +168,7 @@ def suite(options: RunOptions, manifest, monkeypatch, report: Report) -> Report:
     monkeypatch.setattr(runner, "kernel_pgo_uncovered", lambda *args: None)
     monkeypatch.setattr(runner, "collect_hardware", lambda lane: report.hardware)
     monkeypatch.setattr(
-        runner, "collect_pins", lambda lane, workloads, kernel_build, baseline, helios_run: report.pins
+        runner, "collect_pins", lambda lane, workloads, kernel_build, baseline, sides: report.pins
     )
     return run_suite(options, manifest)
 
