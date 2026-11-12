@@ -1576,16 +1576,14 @@ jobs:
             libglib2.0-dev libpixman-1-dev libslirp-dev zlib1g-dev \
             libepoxy-dev libdrm-dev libgbm-dev libvulkan-dev \
             mesa-vulkan-drivers libegl-mesa0
-          # The kernel modules that give a GPU-less runner a render node
-          # (vgem) for QEMU's EGL context and the udmabuf device a guest
-          # blob reaches the host through. The runner's azure kernel has
-          # no linux-modules-extra package; its one modules package is
-          # expected to carry both, and modinfo names the one it lacks.
-          modinfo -n vgem udmabuf
+          # vgem gives a GPU-less runner the render node QEMU's EGL
+          # context opens; the azure kernel's own modules package carries
+          # it. No udmabuf: QEMU needs it for blobs only when neither virgl
+          # nor rutabaga backs the device (hw/display/virtio-gpu.c), and
+          # virgl hands guest blobs to virglrenderer as iovecs.
           sudo modprobe vgem
-          sudo modprobe udmabuf
-          sudo chmod 666 /dev/kvm /dev/udmabuf /dev/dri/renderD*
-          ls -la /dev/kvm /dev/udmabuf /dev/dri
+          sudo chmod 666 /dev/kvm /dev/dri/renderD*
+          ls -la /dev/kvm /dev/dri
           # lavapipe is the only Vulkan driver this runner can enumerate;
           # naming it keeps the loader from probing the hardware ones.
           icd=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json
