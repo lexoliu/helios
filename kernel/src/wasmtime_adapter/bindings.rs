@@ -122,6 +122,13 @@ pub mod display {
                     crate::wasmtime_adapter::component_host::DisplayHandle,
                 "helios:system/display.surface":
                     crate::wasmtime_adapter::component_host::SurfaceHandle,
+                // A blob surface names a `gpu.blob`, which is the gpu
+                // bindings' resource: one type for one handle, whichever
+                // interface the guest passes it through.
+                "helios:system/gpu":
+                    crate::wasmtime_adapter::bindings::gpu::bindings::helios::system::gpu,
+                "helios:system/memory":
+                    crate::wasmtime_adapter::bindings::gpu::bindings::helios::system::memory,
             },
             require_store_data_send: true,
         });
@@ -220,8 +227,8 @@ pub mod gpu {
                 "helios:system/gpu.[method]context.fences": store | trappable,
                 // Everything that reaches the display engine is an
                 // `async func` in the WIT and is generated against the
-                // store on its own account. What is left — claiming,
-                // reading back where a buffer landed, dropping a handle
+                // store on its own account. What is left — opening,
+                // reading back a blob's resource id, dropping a handle
                 // — is store bookkeeping and answers without waiting.
                 default: trappable,
             },

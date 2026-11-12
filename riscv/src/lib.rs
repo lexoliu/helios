@@ -140,7 +140,7 @@ pub(crate) fn count_virtio_mmio_devices(fdt: &Fdt<'_>, expected: DeviceType) -> 
 use core::arch::{asm, global_asm};
 use core::num::{NonZeroU32, NonZeroUsize};
 use core::ops::Range;
-use core::sync::atomic::{AtomicUsize, Ordering, compiler_fence};
+use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering, compiler_fence};
 
 use arrayvec::ArrayVec;
 use fdt::Fdt;
@@ -461,6 +461,32 @@ extern "Rust" fn helios_current_processor() -> ProcessorId {
     }
 }
 
+/// The supervisor timer and external interrupt enables cleared on the
+/// hart that took them, and put back as they were when dropped. Only the
+/// software interrupt, the wake, stays enabled meanwhile; the rest stays
+/// pending in `sip`. `sie` is the hart's own register, so the value is
+/// not `Send`; it leaves `sstatus.SIE` alone.
+pub struct RiscvWakeOnlyMask {
+    timer: bool,
+    external: bool,
+    _processor_local: core::marker::PhantomData<*mut ()>,
+}
+
+impl Drop for RiscvWakeOnlyMask {
+    fn drop(&mut self) {
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: restores the bits read when the mask was raised.
+        unsafe {
+            if self.timer {
+                riscv::register::sie::set_stimer();
+            }
+            if self.external {
+                riscv::register::sie::set_sext();
+            }
+        }
+    }
+}
+
 impl Cpu for RiscvCpu {
     // SBI `set_timer` programs this hart's one-shot comparator.
     const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
@@ -475,6 +501,51 @@ impl Cpu for RiscvCpu {
 
     fn park_current(&self) {
         riscv::asm::wfi();
+    }
+
+    type WakeOnlyMask = RiscvWakeOnlyMask;
+
+    fn mask_to_wake_only(&self) -> RiscvWakeOnlyMask {
+        // The wake is the supervisor software interrupt; the timer and the
+        // external interrupt (every device) are taken out of `sie`, so
+        // they stay pending in `sip` and a `wfi` neither ends on them nor
+        // delivers them. The shootdown is an SBI call that needs no
+        // supervisor interrupt on this hart.
+        let sie = riscv::register::sie::read();
+        let (timer, external) = (sie.stimer(), sie.sext());
+        // SAFETY: both bits are put back when the guard drops.
+        unsafe {
+            riscv::register::sie::clear_stimer();
+            riscv::register::sie::clear_sext();
+        }
+        compiler_fence(Ordering::SeqCst);
+        RiscvWakeOnlyMask {
+            timer,
+            external,
+            _processor_local: core::marker::PhantomData,
+        }
+    }
+
+    fn park_wake_only(&self, word: &AtomicU8, held: u8) {
+        assert!(
+            !riscv::register::sstatus::read().sie(),
+            "RISC-V park_wake_only was entered with supervisor interrupts enabled, before the \
+             enable set was narrowed"
+        );
+        // A `wfi` ends on any pending interrupt that `sie` enables,
+        // whatever `sstatus.SIE` says, so a wake raised between the test
+        // below and the `wfi` completes it at once.
+        let mask = self.mask_to_wake_only();
+        while word.load(Ordering::Acquire) == held {
+            riscv::asm::wfi();
+            // The wait leaves the software interrupt pending: taking it
+            // runs the trap handler that clears it. Nothing else is
+            // enabled in `sie`, so nothing else is taken in the window.
+            // SAFETY: the window is closed again on the next line.
+            unsafe { riscv::interrupt::supervisor::enable() };
+            riscv::interrupt::supervisor::disable();
+        }
+        drop(mask);
     }
 
     fn start_processor(&self, hart: ProcessorId) {

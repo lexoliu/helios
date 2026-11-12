@@ -117,16 +117,20 @@ async fn watch_requester<Reply, Output>(
     .await
 }
 
-/// Condemns the compile's instance because its requester is gone, and
-/// interrupts every store of it, so the kill reaches each one wherever it is:
-/// running wasm, or parked in a call.
-pub(super) fn condemn_abandoned_compile(
+/// Condemns the compile's instance for `reason` (its requester is gone, or a
+/// store of it trapped), and interrupts every store of it, so the kill reaches
+/// each one wherever it is: running wasm, or parked in a call.
+///
+/// The first condemnation's reason stands: a later one is
+/// [`KillOutcome::AlreadyStopping`].
+pub(super) fn condemn_compile(
     registry: &InstanceRegistry,
     interrupts: &GuestInterrupts,
     instance: InstanceId,
+    reason: KillReason,
     now_nanos: u64,
 ) -> KillOutcome {
-    let outcome = registry.request_kill(instance, KillReason::RequesterGone, now_nanos);
+    let outcome = registry.request_kill(instance, reason, now_nanos);
     interrupts.interrupt_instance(instance);
     outcome
 }
@@ -276,7 +280,13 @@ mod tests {
                     (
                         move || {
                             condemnations.fetch_add(1, Ordering::SeqCst);
-                            condemn_abandoned_compile(&registry, interrupts, id, 0);
+                            condemn_compile(
+                                &registry,
+                                interrupts,
+                                id,
+                                KillReason::RequesterGone,
+                                0,
+                            );
                         },
                         body.run(),
                     )
@@ -337,7 +347,13 @@ mod tests {
                 move || {
                     (
                         move || {
-                            condemn_abandoned_compile(&registry, interrupts, id, 0);
+                            condemn_compile(
+                                &registry,
+                                interrupts,
+                                id,
+                                KillReason::RequesterGone,
+                                0,
+                            );
                         },
                         body.run(),
                     )

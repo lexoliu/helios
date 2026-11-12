@@ -7,7 +7,7 @@ use core::arch::{asm, global_asm};
 use core::cell::UnsafeCell;
 use core::num::NonZeroUsize;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -18,8 +18,8 @@ use helios_hal::boot::{
     usable_region_segments,
 };
 use helios_hal::cpu::{
-    Cpu, GUEST_STACK_LIMIT_OFFSET, HardwarePerfCounters, Instant, ProcessorId, Timebase,
-    TimerInterrupt,
+    ControlFlowIntegrity, Cpu, GUEST_STACK_LIMIT_OFFSET, HardwarePerfCounters, Instant,
+    ProcessorId, ReturnAddressSigning, Timebase, TimerInterrupt,
 };
 use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
@@ -72,6 +72,15 @@ const PAGE_PXN: u64 = 1 << 53;
 const PAGE_UXN: u64 = 1 << 54;
 const MAIR_DEVICE_ATTR_INDEX_SHIFT: u64 = PAGE_ATTR_DEVICE_INDEX * 8;
 const MAIR_DEVICE_NGNRNE: u64 = 0x00;
+/// The MAIR index a write-combined mapping selects: Normal memory,
+/// inner and outer non-cacheable, which lets stores gather and merge
+/// without any cache holding them — what a host renderer means by
+/// write-combining.
+const PAGE_ATTR_NORMAL_NC_INDEX: u64 = 6;
+const MAIR_NORMAL_NC_ATTR_INDEX_SHIFT: u64 = PAGE_ATTR_NORMAL_NC_INDEX * 8;
+/// `0b0100_0100`: Normal memory, outer non-cacheable, inner
+/// non-cacheable (Arm ARM D19.2 "MAIR_EL1", the `Attr<n>` encoding).
+const MAIR_NORMAL_NON_CACHEABLE: u64 = 0x44;
 const PL011_DATA: usize = 0x000;
 const PL011_FLAG: usize = 0x018;
 const PL011_FLAG_RXFE: u32 = 1 << 4;
@@ -168,6 +177,7 @@ mod vmm;
 pub use vmm::Aarch64UserAddressSpace;
 mod balloon;
 mod block;
+mod cfi;
 mod device;
 mod entropy;
 mod gic;
@@ -366,6 +376,13 @@ struct Aarch64ProcessorSlot {
 struct Aarch64PlatformState {
     processors: Box<[Aarch64ProcessorSlot]>,
     timebase: Timebase,
+    /// How a failed return-address authentication shows on every
+    /// processor, probed on the bootstrap processor before any other starts
+    /// and never written again (`cfi`).
+    return_address_signing: ReturnAddressSigning,
+    /// The key every processor installs, held only while the secondaries
+    /// start (`cfi`).
+    instruction_key: cfi::SharedInstructionKey,
     debug_state: Once<debug_state::RuntimeState>,
     gic: Once<gic::Gic>,
 }
@@ -411,6 +428,8 @@ impl Aarch64PlatformState {
         Box::leak(Box::new(Self {
             processors,
             timebase,
+            return_address_signing: cfi::bootstrap_capability(),
+            instruction_key: cfi::SharedInstructionKey::new(),
             debug_state: Once::new(),
             gic: Once::new(),
         }))
@@ -574,6 +593,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
         "Limine bootloader does not support the required base protocol revision"
     );
     install_exception_vectors();
+    install_memory_attributes();
     let handoff = limine_boot_handoff();
     let physical_memory_offset = physical_memory_offset();
     // The firmware description comes up before anything else, because
@@ -693,6 +713,17 @@ extern "C" fn aarch64_kernel_main() -> ! {
         machine_generation,
     );
     debug_state.install_root_entropy(root_entropy.clone());
+    // Every function this processor ran up to here has returned, and the
+    // one still live, this one, never does, so none holds a return address
+    // that the enable would make unauthenticatable. The key is drawn here
+    // because this is the earliest point the DRBG is seeded on every
+    // supported configuration, and everything after it is signed.
+    // SAFETY: `SCTLR_EL1.EnIA` is clear, no secondary has started, and
+    // `aarch64_kernel_main` is `-> !`.
+    unsafe {
+        cfi::install_bootstrap_key(&platform_state.instruction_key, &root_entropy);
+        cfi::enable_instruction_key_a();
+    }
     // The calendar is read once, here, before any component can ask
     // what time it is. The processor's timer carries wall time forward
     // from that reading; only a machine restore re-reads it, which the
@@ -899,6 +930,9 @@ extern "C" fn aarch64_kernel_main() -> ! {
     ) {
         cpu.start_processor(processor);
     }
+    // Each secondary read the key before it set `started`, and
+    // `start_processor` returned only after that, so nothing reads it again.
+    platform_state.instruction_key.wipe();
 
     helios_kernel::run_component_host_processor_forever(
         cpu,
@@ -922,6 +956,22 @@ pub struct Aarch64Cpu {
 #[unsafe(no_mangle)]
 extern "Rust" fn helios_current_processor() -> ProcessorId {
     current_processor_runtime().logical_id()
+}
+
+/// The GIC CPU interface's priority mask raised so that only the wake
+/// SGI gets through, on the processor that took it, and put back to the
+/// value it replaced when dropped. Every other interrupt stays pending in
+/// the GIC meanwhile. The mask is the processor's own register, so the
+/// value is not `Send`; it leaves PSTATE.I alone.
+pub struct Aarch64WakeOnlyMask {
+    previous: u8,
+    _processor_local: core::marker::PhantomData<*mut ()>,
+}
+
+impl Drop for Aarch64WakeOnlyMask {
+    fn drop(&mut self) {
+        gic::restore_priority_mask(self.previous);
+    }
 }
 
 impl Cpu for Aarch64Cpu {
@@ -954,6 +1004,48 @@ impl Cpu for Aarch64Cpu {
         }
         // SAFETY: restores exactly the mask state the caller had.
         unsafe { write_daif(daif) };
+    }
+
+    type WakeOnlyMask = Aarch64WakeOnlyMask;
+
+    fn mask_to_wake_only(&self) -> Aarch64WakeOnlyMask {
+        Aarch64WakeOnlyMask {
+            previous: gic::raise_priority_mask_to_wake_only(),
+            _processor_local: core::marker::PhantomData,
+        }
+    }
+
+    fn park_wake_only(&self, word: &AtomicU8, held: u8) {
+        let runtime = current_processor_runtime();
+        assert!(
+            read_daif() & DAIF_IRQ_MASKED != 0,
+            "AArch64 park_wake_only was entered with IRQ unmasked, before the priority mask \
+             was in place"
+        );
+        // Only the wake SGI is more urgent than the mask, so every device
+        // interrupt and the timer stay pending in the GIC while the
+        // processor waits. WFI ends on a pending interrupt the CPU
+        // interface signals even while PSTATE.I is set, and the word is
+        // tested with IRQ masked first, so a wake raised after the test
+        // completes the wait instead of being slept through.
+        let mask = self.mask_to_wake_only();
+        while word.load(Ordering::Acquire) == held {
+            if !runtime.wake_pending.swap(false, Ordering::AcqRel) {
+                // SAFETY: `wfi` has no operands and touches no memory.
+                unsafe {
+                    asm!("wfi", options(nomem, nostack, preserves_flags));
+                }
+            }
+            // The wake SGI the wait ended on is still pending: taking it
+            // acknowledges it, and the wait would otherwise end at once
+            // forever. The mask above admits nothing else.
+            take_pending_irq();
+        }
+        drop(mask);
+        // The wake the loop took, or one that raced it, leaves its latch
+        // set; `park_current` would take it as a wake for work it does
+        // not have.
+        runtime.wake_pending.store(false, Ordering::Release);
     }
 
     fn start_processor(&self, processor: ProcessorId) {
@@ -1010,6 +1102,14 @@ impl Cpu for Aarch64Cpu {
 
     fn has_lazy_commit_virtual_memory(&self) -> bool {
         true
+    }
+
+    /// Every processor signs and authenticates its return addresses: a
+    /// processor without FEAT_PAuth does not boot (`cfi`).
+    fn control_flow_integrity(&self) -> ControlFlowIntegrity {
+        ControlFlowIntegrity {
+            return_addresses: Some(self.state.return_address_signing),
+        }
     }
 
     unsafe fn zero_memory(&self, ptr: NonNull<u8>, size: usize) {
@@ -1198,6 +1298,22 @@ unsafe extern "C" fn aarch64_secondary_main(mp_info: &MpInfo) -> ! {
     );
     let state = unsafe { &*state };
     let slot = state.processor_slot_by_mpidr(mp_info.mpidr);
+    // Everything this processor ran up to here has returned, and the one
+    // function still live, this one, never does. The key is installed
+    // before `started` is set, so `start_processor` returns for this
+    // processor only after its enable, and the bootstrap processor wipes the
+    // shared key only after every secondary has read it.
+    // SAFETY: `SCTLR_EL1.EnIA` is clear on this processor, the bootstrap
+    // processor published the key before it started this one, and
+    // `aarch64_secondary_main` is `-> !`.
+    unsafe {
+        cfi::install_secondary_key(
+            state.return_address_signing,
+            &state.instruction_key,
+            mp_info.mpidr,
+        );
+        cfi::enable_instruction_key_a();
+    }
     activate_processor_runtime(&slot.runtime);
     state.gic().attach_current_processor(mp_info.mpidr);
 
@@ -1249,6 +1365,7 @@ fn prepare_current_processor() {
         asm!("msr cpacr_el1, {cpacr}", cpacr = in(reg) cpacr, options(nomem, nostack, preserves_flags));
         asm!("isb", options(nostack, preserves_flags));
     }
+    install_memory_attributes();
     enable_pmu_for_current_processor();
     install_exception_vectors();
 }
@@ -1285,6 +1402,13 @@ extern "C" fn aarch64_handle_sync_exception(
     frame: *mut SyncTrapFrame,
 ) {
     let exception_class = (esr_el1 >> 26) & 0x3f;
+    // A failed return-address authentication is never the runtime's: a
+    // guest cannot form a native return address, so it is a corrupted host
+    // stack or a compiler bug. It is refused before anything below can
+    // claim the fault as a page fault.
+    // SAFETY: the entry wrote a complete frame at `frame`, and nothing else
+    // touches it while this handler runs.
+    cfi::refuse_authentication_failure(esr_el1, far_el1, unsafe { (*frame).elr });
     let (cause, faulting_address) = match exception_class {
         0b100000 | 0b100001 => (KernelExceptionCause::InstructionFault, Some(far_el1)),
         0b100100 | 0b100101 => (KernelExceptionCause::DataFault, Some(far_el1)),
@@ -1499,6 +1623,27 @@ fn read_daif() -> u64 {
 unsafe fn write_daif(daif: u64) {
     unsafe {
         asm!("msr daif, {daif}", daif = in(reg) daif, options(nomem, nostack, preserves_flags));
+    }
+}
+
+/// `DAIF.I`: set while IRQ is masked.
+const DAIF_IRQ_MASKED: u64 = 1 << 7;
+
+/// Opens an interrupt window for exactly the interrupts the priority
+/// mask admits, and closes it again: a pending IRQ is taken before the
+/// `isb` completes, so the handler has run by the time IRQ is masked
+/// once more.
+fn take_pending_irq() {
+    // SAFETY: the caller's priority mask admits only the wake SGI,
+    // whose handler needs nothing the caller holds; the window is
+    // closed before the asm ends.
+    unsafe {
+        asm!(
+            "msr daifclr, #0x2",
+            "isb",
+            "msr daifset, #0x2",
+            options(nomem, nostack, preserves_flags)
+        );
     }
 }
 
@@ -1737,13 +1882,25 @@ fn read_ttbr1_el1() -> usize {
     value & PAGE_ADDRESS_MASK as usize
 }
 
-fn install_device_memory_attribute() {
+/// Programs the two MAIR indexes this backend owns on the calling
+/// processor: [`PAGE_ATTR_DEVICE_INDEX`] as Device-nGnRnE and
+/// [`PAGE_ATTR_NORMAL_NC_INDEX`] as Normal non-cacheable.
+///
+/// Called on every processor during its bring-up, before it maps
+/// anything with either index — the bootstrap processor at the top of
+/// its entry point, every secondary in `prepare_current_processor` — so
+/// each processor decodes a leaf's attribute index the same way. The
+/// other six indexes keep what the loader programmed, index 0 among
+/// them, which every ordinary mapping uses.
+fn install_memory_attributes() {
     let mair: u64;
     unsafe {
         asm!("mrs {mair}, mair_el1", mair = out(reg) mair, options(nomem, nostack, preserves_flags));
     }
-    let mask = 0xff << MAIR_DEVICE_ATTR_INDEX_SHIFT;
-    let mair = (mair & !mask) | (MAIR_DEVICE_NGNRNE << MAIR_DEVICE_ATTR_INDEX_SHIFT);
+    let mask = (0xff << MAIR_DEVICE_ATTR_INDEX_SHIFT) | (0xff << MAIR_NORMAL_NC_ATTR_INDEX_SHIFT);
+    let mair = (mair & !mask)
+        | (MAIR_DEVICE_NGNRNE << MAIR_DEVICE_ATTR_INDEX_SHIFT)
+        | (MAIR_NORMAL_NON_CACHEABLE << MAIR_NORMAL_NC_ATTR_INDEX_SHIFT);
     unsafe {
         asm!("msr mair_el1, {mair}", mair = in(reg) mair, options(nomem, nostack, preserves_flags));
         asm!("isb", options(nostack, preserves_flags));
@@ -1755,7 +1912,6 @@ fn map_mmio_page(
     physical_memory_offset: usize,
     handoff: &LimineBootHandoff,
 ) {
-    install_device_memory_attribute();
     let virtual_address = mmio_virtual_base(physical_address, physical_memory_offset);
     let block_virtual = virtual_address & !(MMIO_BLOCK_BYTES - 1);
     let block_physical = physical_address & !(MMIO_BLOCK_BYTES - 1);

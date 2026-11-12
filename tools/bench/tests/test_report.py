@@ -90,7 +90,7 @@ def test_failure_records_become_failed_cells(tmp_path, baseline_report: Report) 
         ' "error": "TcpErrorKind::Timeout: TCP read timed out"}\n',
         encoding="utf-8",
     )
-    raw = read_side_jsonl(path, warmup_discard=1)
+    raw = read_side_jsonl(path, Side.HELIOS, "vsock", warmup_discard=1)
     assert raw.cells["tcp-throughput"].failure == "TcpErrorKind::Timeout: TCP read timed out"
     assert raw.cells["tcp-throughput"].iterations == []
 
