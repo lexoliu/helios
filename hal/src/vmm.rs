@@ -277,7 +277,8 @@ pub trait SwapBackend: Send + Sync + 'static {
 
     /// Restore previously swapped-out bytes into `dst`. After this
     /// returns successfully, the token is no longer valid (the
-    /// storage may be reclaimed).
+    /// storage may be reclaimed) and must not be passed to
+    /// [`Self::release`].
     ///
     /// Only a successful `swap_in` consumes the token. One that fails,
     /// or is dropped before it resolves, leaves the token valid and its
@@ -294,10 +295,12 @@ pub trait SwapBackend: Send + Sync + 'static {
     ///
     /// This is the path an instance's death takes: the pages it had
     /// swapped out are never coming back, and holding their extents
-    /// would leak the swap device one dead instance at a time. Releasing
-    /// a token that `swap_in` already consumed is not an error, so a
-    /// caller racing a fault against a teardown does not have to
-    /// serialise them.
+    /// would leak the swap device one dead instance at a time.
+    ///
+    /// A token is released at most once, and never after a successful
+    /// `swap_in` consumed it: its storage may already belong to another
+    /// page, so an implementation does not check for this and a caller
+    /// serialises a fault against a teardown of the same page.
     fn release<'a>(&'a self, token: Self::Token) -> impl Future<Output = ()> + Send + 'a;
 }
 
