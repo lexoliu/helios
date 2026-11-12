@@ -52,6 +52,12 @@ def build_cell(
     the host moved by say the order, not the system, set the number.
     """
     config = stats_config(thresholds)
+    clocks = {iteration.clock for iteration in iterations}
+    if len(clocks) > 1:
+        raise ValueError(
+            f"a {side} cell pools iterations timed with different clocks "
+            f"({sorted(str(clock) for clock in clocks)}), which are not one series"
+        )
     ordered = sorted(iterations, key=lambda iteration: (iteration.round, iteration.index))
     by_round: dict[int, list[Iteration]] = {}
     for iteration in ordered:
@@ -102,6 +108,7 @@ def build_cell(
     return Cell(
         side=side,
         iterations=ordered,
+        clock=next(iter(clocks), None),
         cold=cold,
         warm=warm,
         rejected=bool(reasons),

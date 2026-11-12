@@ -85,6 +85,14 @@ if [[ -n "${HELIOS_WORKLOAD_BENCH_VM_MEMORY:-}" ]]; then
     command+=(--memory "${HELIOS_WORKLOAD_BENCH_VM_MEMORY}")
 fi
 
+# How the host backs guest RAM. The Fedora baseline's is preallocated
+# (`guest_ram_backend` in fedora_qemu_baseline.py), so a comparison boots
+# Helios with `prealloc` too: otherwise only Helios pays a host page
+# fault on the first touch of every page (#491).
+if [[ -n "${HELIOS_WORKLOAD_BENCH_GUEST_RAM:-}" ]]; then
+    command+=(--guest-ram "${HELIOS_WORKLOAD_BENCH_GUEST_RAM}")
+fi
+
 # The inspector requires the profile's native accelerator when nobody
 # names one, so a host that means to measure the emulator has to say so.
 # Naming it here also puts the accelerator in the run record every

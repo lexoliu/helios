@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from helios_bench import REPO_ROOT, TOOLS_BENCH_ROOT, WASI_APPS_ROOT
 from helios_bench.wasi_apps import fedora_baseline
@@ -46,6 +46,27 @@ def validate_rounds(rounds: int) -> int:
             "rounds, at least 2, so each side goes first as often as it goes second"
         )
     return rounds
+
+
+def validate_guest_memory(lane: Lane) -> Lane:
+    """The two guests of a lane get one memory size, unless the lane says why not (#491).
+
+    A guest with more memory than the other is a different machine, so a
+    lane whose fields differ without a stated reason is refused, and so is
+    a reason left behind on a lane whose fields agree.
+    """
+    if lane.memory != lane.linux_vm_memory and lane.memory_differs_because is None:
+        raise ValueError(
+            f"lane {lane.name!r} gives the Helios guest memory = {lane.memory!r} and the Linux "
+            f"guest linux_vm_memory = {lane.linux_vm_memory!r}: the two columns compare alike "
+            "only on equal guests, so set them equal or state memory_differs_because"
+        )
+    if lane.memory == lane.linux_vm_memory and lane.memory_differs_because is not None:
+        raise ValueError(
+            f"lane {lane.name!r} states memory_differs_because, and memory and linux_vm_memory "
+            f"are both {lane.memory!r}"
+        )
+    return lane
 
 
 class SidedFact(BaseModel):
@@ -85,6 +106,11 @@ class Lane(BaseModel):
     vcpus: int = Field(ge=1)
     memory: str
     linux_vm_memory: str
+    # Why the lane gives its two guests different memory sizes. The two
+    # columns compare alike only on equal guests, so a lane that sets
+    # `memory` and `linux_vm_memory` apart says why, and one that keeps
+    # them equal has nothing to say (#491).
+    memory_differs_because: str | None = None
     net_backend: str
     net_host: str
     devices: list[str]
@@ -101,6 +127,10 @@ class Lane(BaseModel):
     @classmethod
     def rounds_are_even(cls, rounds: int | None) -> int | None:
         return None if rounds is None else validate_rounds(rounds)
+
+    @model_validator(mode="after")
+    def guests_have_equal_memory(self) -> Lane:
+        return validate_guest_memory(self)
 
     @property
     def qemu_binary(self) -> str:
