@@ -54,8 +54,8 @@ use zeroize::Zeroize;
 const FIELD_FPAC: u8 = 0b0100;
 
 /// `ESR_ELx.EC` is bits `[31:26]`.
-const ESR_EC_SHIFT: usize = 26;
-const ESR_EC_MASK: usize = 0x3f;
+pub(crate) const ESR_EC_SHIFT: usize = 26;
+pub(crate) const ESR_EC_MASK: usize = 0x3f;
 /// `ESR_ELx.EC` of a failed FEAT_FPAC authentication (`ESR_ELx_EC_FPAC` in
 /// Linux `arch/arm64/include/asm/esr.h`).
 const ESR_EC_FPAC: usize = 0x1c;
