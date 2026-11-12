@@ -317,6 +317,54 @@ where
         self.activity.instance()
     }
 
+    /// The user pool, installed during boot before any program runs.
+    pub(super) fn user_pool() -> &'static crate::UserMemoryPool {
+        crate::memory::installed_user_memory_pool()
+            .expect("the user memory pool is installed before any program runs")
+    }
+
+    /// Asks the shared OOM path to cover `requested_bytes` of user memory
+    /// for this instance, which is never its own victim.
+    pub(super) fn request_user_memory_oom_kill(&self, requested_bytes: u64) {
+        crate::wasmtime_adapter::store::request_oom_kill(
+            &self.runtime_state,
+            &self.runtime_state.instance_registry(),
+            &self.cpu,
+            self.instance().id(),
+            crate::MemoryPool::User,
+            usize::try_from(requested_bytes).unwrap_or(usize::MAX),
+        );
+    }
+
+    /// Captures the stack window into this instance's charged pages and
+    /// arms the unwind phase `armed` builds from them, or answers the
+    /// errno the call returns with the phase still `Idle`.
+    ///
+    /// A pool that cannot hold the window asks the OOM killer for user
+    /// memory and answers `NOMEM`; see [`arm_unwind`].
+    pub(super) fn begin_unwind(
+        &mut self,
+        window: StackWindow,
+        prepare: impl FnOnce() -> i32,
+        armed: impl FnOnce(ChargedPages) -> WasixAsyncifyPhase,
+    ) -> Result<(), i32> {
+        match arm_unwind(
+            &mut self.asyncify.phase,
+            Self::user_pool(),
+            self.activity.instance(),
+            window,
+            prepare,
+            armed,
+        ) {
+            Ok(()) => Ok(()),
+            Err(UnwindRefusal::Errno(errno)) => Err(errno),
+            Err(UnwindRefusal::OutOfMemory { requested_bytes }) => {
+                self.request_user_memory_oom_kill(requested_bytes);
+                Err(p1::errno::NOMEM)
+            }
+        }
+    }
+
     /// The handle the code driving this store accounts its processor
     /// turns through. Taken before the store is borrowed for the call;
     /// see [`crate::component::GuestTurns::drive`].

@@ -1,4 +1,5 @@
 use super::*;
+use crate::{FrameReservation, PagedBytes, UserMemoryPool};
 
 pub(super) struct Preview1IovLayout {
     pub(super) iovs: Preview1Iovs,
@@ -211,6 +212,184 @@ pub(super) fn preview1_read_memory(
     // as the borrow of `memory` lasts.
     let source = unsafe { core::slice::from_raw_parts((memory.base as *const u8).add(start), len) };
     Ok(source.to_vec())
+}
+
+/// Bytes in one user-pool frame: the unit a page capture is charged in.
+const CAPTURE_PAGE_BYTES: usize = helios_hal::pmm::PhysFrame::SIZE;
+
+/// A page of zeros, which a snapshot compares a source page against to
+/// leave it a hole.
+const ZERO_PAGE: [u8; CAPTURE_PAGE_BYTES] = [0; CAPTURE_PAGE_BYTES];
+
+/// Guest bytes copied into user-pool frames and charged to the instance
+/// that asked for the copy.
+///
+/// # Concurrency
+///
+/// - Until it is shared, a `ChargedPages` has one owner: the task driving
+///   the store that captured it. That owner may still patch it with
+///   [`Self::patch`].
+/// - Once it is wrapped in a [`SharedPages`], nothing writes it. Any
+///   number of processors read it through `&self` with no
+///   synchronisation (a [`PagedBytes`] read walks the tree and copies), which
+///   is what lets a stored checkpoint, an in-flight rewind and a fork
+///   child hold one copy.
+/// - The last holder to drop it, on whichever processor that is, frees
+///   the frames on that processor and, after them, releases the charge,
+///   so the bytes leave the capturing instance's footprint when the
+///   frames go back to the pool. The charge holds the instance's registry
+///   entry, so it never outlives it.
+pub(super) struct ChargedPages {
+    pub(super) data: PagedBytes,
+    pub(super) charge: crate::UserMemoryCharge,
+}
+
+/// A captured copy several holders read and none writes.
+pub(super) type SharedPages = triomphe::Arc<ChargedPages>;
+
+impl ChargedPages {
+    /// Charges `instance` for every frame `data` holds, index nodes
+    /// included: a kill of the instance returns them all.
+    fn new(data: PagedBytes, instance: &crate::RegisteredInstance) -> Self {
+        let charge = instance.charge_user_memory(data.frames() * CAPTURE_PAGE_BYTES as u64);
+        Self { data, charge }
+    }
+
+    /// Overwrites `bytes.len()` bytes at `at`, which must lie inside a page
+    /// this copy already holds, so the write takes no frame. Only before the
+    /// copy is shared.
+    pub(super) fn patch(&mut self, pool: &'static UserMemoryPool, at: u64, bytes: &[u8]) {
+        let end = at + bytes.len() as u64;
+        let mut frames = FrameReservation::take(pool, self.data.frames_to_commit(at..end))
+            .expect("an empty reservation is always granted");
+        debug_assert_eq!(
+            frames.available(),
+            0,
+            "a patch lies inside pages already captured"
+        );
+        let mut done = 0;
+        self.data.write(at, bytes.len(), &mut frames, |run| {
+            run.copy_from_slice(&bytes[done..done + run.len()]);
+            done += run.len();
+        });
+    }
+}
+
+/// Why guest bytes were not captured into pages.
+#[derive(Debug, Error)]
+pub(super) enum PageCaptureError {
+    /// The range is not inside the guest's memory.
+    #[error("the captured range lies outside guest memory: {0}")]
+    OutOfBounds(ProgramExecError),
+    /// The user pool refused the frames. Nothing is held: what the
+    /// capture had taken is back in the pool.
+    #[error("the user pool could not hold {requested_bytes} bytes of captured pages: {source}")]
+    OutOfMemory {
+        /// What the capture needed when the pool refused: the OOM request
+        /// for the pool, so the killer covers the whole footprint.
+        requested_bytes: u64,
+        #[source]
+        source: crate::FrameShortage,
+    },
+}
+
+/// Copies the `len` guest bytes at `ptr` into pages charged to
+/// `instance`, whole and in order: a stack window.
+///
+/// The frames are reserved first, so a shortfall answers with nothing
+/// copied and nothing held.
+pub(super) fn capture_window(
+    pool: &'static UserMemoryPool,
+    instance: &crate::RegisteredInstance,
+    memory: Preview1Memory,
+    ptr: GuestAddress,
+    len: usize,
+) -> Result<ChargedPages, PageCaptureError> {
+    let start = preview1_memory_start(memory, ptr, len).map_err(PageCaptureError::OutOfBounds)?;
+    let mut data = PagedBytes::new(pool);
+    let needed = data.frames_to_commit(0..len as u64);
+    let mut frames =
+        FrameReservation::take(pool, needed).map_err(|source| PageCaptureError::OutOfMemory {
+            requested_bytes: needed * CAPTURE_PAGE_BYTES as u64,
+            source,
+        })?;
+    // SAFETY: the bounds check above proves `start..start + len` lies
+    // inside the guest's linear memory, which stays mapped for the
+    // duration of this call.
+    let source = unsafe { core::slice::from_raw_parts((memory.base as *const u8).add(start), len) };
+    let mut done = 0;
+    data.write(0, len, &mut frames, |run| {
+        // Every byte of the run, because a whole page arrives from the
+        // pool uninitialised: the runs are consecutive and sum to `len`.
+        run.copy_from_slice(&source[done..done + run.len()]);
+        done += run.len();
+    });
+    debug_assert_eq!(done, len, "the runs cover the whole window");
+    Ok(ChargedPages::new(data, instance))
+}
+
+/// Copies all of `memory` into pages charged to `instance`, page by page,
+/// leaving every all-zero page a hole.
+///
+/// Each non-zero page reserves what it needs just before it is copied, so
+/// the frames held are those of the non-zero pages and their index, and a
+/// shortfall at any page drops what was taken so far and answers with
+/// nothing held. The length is the memory's, so holes read back as zeros.
+pub(super) fn capture_memory_sparse(
+    pool: &'static UserMemoryPool,
+    instance: &crate::RegisteredInstance,
+    memory: Preview1Memory,
+) -> Result<ChargedPages, PageCaptureError> {
+    let mut data = PagedBytes::new(pool);
+    let mut at = 0;
+    while at < memory.len {
+        let run = CAPTURE_PAGE_BYTES.min(memory.len - at);
+        // SAFETY: `at..at + run` lies inside `memory`, a guest memory view
+        // that stays mapped for the duration of this call.
+        let source =
+            unsafe { core::slice::from_raw_parts((memory.base as *const u8).add(at), run) };
+        if source != &ZERO_PAGE[..run] {
+            let range = at as u64..(at + run) as u64;
+            let needed = data.frames_to_commit(range);
+            let mut frames = FrameReservation::take(pool, needed).map_err(|shortage| {
+                PageCaptureError::OutOfMemory {
+                    requested_bytes: (data.frames() + needed) * CAPTURE_PAGE_BYTES as u64,
+                    source: shortage,
+                }
+            })?;
+            let mut done = 0;
+            data.write(at as u64, run, &mut frames, |chunk| {
+                // Every byte of the chunk, as in `capture_window`.
+                chunk.copy_from_slice(&source[done..done + chunk.len()]);
+                done += chunk.len();
+            });
+        }
+        at += run;
+    }
+    drop(data.set_len(memory.len as u64));
+    Ok(ChargedPages::new(data, instance))
+}
+
+/// Writes `pages` into guest memory at `ptr`, page runs straight from the
+/// frames into the destination: no intermediate buffer holds them.
+pub(super) fn restore_pages(
+    pages: &PagedBytes,
+    memory: Preview1Memory,
+    ptr: GuestAddress,
+) -> Result<(), ProgramExecError> {
+    let len = usize::try_from(pages.len()).map_err(|_| ProgramExecError {
+        kind: ProgramExecErrorKind::InvalidBinary,
+        detail: ProgramExecErrorDetail::GuestMemoryAccessOverflow,
+    })?;
+    let start = preview1_memory_start(memory, ptr, len)?;
+    // SAFETY: the bounds check above proves `start..start + len` lies
+    // inside the guest memory view captured for this call, and nothing else
+    // reaches the destination while the rewind restores it.
+    let destination =
+        unsafe { core::slice::from_raw_parts_mut((memory.base as *mut u8).add(start), len) };
+    let copied = pages.read(0, destination);
+    debug_assert_eq!(copied, len, "the pages hold exactly the captured length");
+    Ok(())
 }
 
 pub(super) fn preview1_read_memory_into(

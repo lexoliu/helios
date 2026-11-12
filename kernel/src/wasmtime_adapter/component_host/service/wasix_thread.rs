@@ -795,6 +795,12 @@ where
         if wasix_call_asyncify_stop_rewind(caller).await != p1::errno::SUCCESS {
             return p1::errno::NOTSUP;
         }
+        if let Some(errno) = caller.data_mut().asyncify.rewind_failure.take() {
+            // The pool could not hold the checkpoint: the call returns
+            // the refusal instead of a value that names a checkpoint
+            // nobody stored.
+            return errno;
+        }
         let Some(memory) = p1_memory(caller) else {
             return p1::errno::FAULT;
         };
@@ -811,49 +817,46 @@ where
     if stack_lower >= stack_pointer || stack_pointer > stack_upper {
         return p1::errno::INVAL;
     }
-    let memory_stack_len = match usize::try_from(stack_upper - stack_pointer) {
-        Ok(len) => len,
-        Err(_) => return p1::errno::OVERFLOW,
-    };
-    let memory_stack = match p1_read_memory(
-        caller,
-        memory,
-        GuestAddress::wasm32(stack_pointer),
-        memory_stack_len,
-    ) {
-        Ok(stack) => stack,
-        Err(_) => return p1::errno::FAULT,
-    };
     let unwind_stack_begin = match stack_lower.checked_add(WASIX_ASYNCIFY_DATA_SIZE) {
         Some(begin) if begin <= stack_pointer => begin,
         _ => return p1::errno::OVERFLOW,
     };
     let stack_lower_address = GuestAddress::wasm32(stack_lower);
-    let status = p1_write_u32(caller, memory, stack_lower_address, unwind_stack_begin)
-        .max(p1_write_u32(
-            caller,
+    // The window is copied into charged pages before anything is written
+    // to the guest or the unwind starts, so a pool that cannot hold it
+    // answers `NOMEM` with the phase still `Idle`.
+    let armed = caller.data_mut().begin_unwind(
+        StackWindow {
             memory,
-            stack_lower_address.offset(4),
             stack_pointer,
-        ))
-        .max(p1_write_u64(
-            caller,
-            memory,
-            GuestAddress::wasm32(ret_value),
-            0,
-        ));
-    if status != p1::errno::SUCCESS {
-        return status;
+            stack_upper,
+        },
+        || {
+            preview1_write_u32(memory, stack_lower_address, unwind_stack_begin)
+                .max(preview1_write_u32(
+                    memory,
+                    stack_lower_address.offset(4),
+                    stack_pointer,
+                ))
+                .max(preview1_write_memory(
+                    memory,
+                    GuestAddress::wasm32(ret_value),
+                    &0_u64.to_le_bytes(),
+                ))
+        },
+        |memory_stack| WasixAsyncifyPhase::Capturing {
+            snapshot,
+            ret_value,
+            stack_lower,
+            stack_upper,
+            unwind_stack_begin,
+            memory_stack,
+            stack_pointer,
+        },
+    );
+    if let Err(errno) = armed {
+        return errno;
     }
-    caller.data_mut().asyncify.phase = WasixAsyncifyPhase::Capturing {
-        snapshot,
-        ret_value,
-        stack_lower,
-        stack_upper,
-        unwind_stack_begin,
-        memory_stack,
-        stack_pointer,
-    };
     wasix_call_asyncify_start_unwind(caller, stack_lower).await
 }
 
