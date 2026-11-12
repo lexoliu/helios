@@ -186,22 +186,42 @@
       "class": "compute",
       "headline": false,
       "runner": "helios-aot",
-      "description": "Compiler-plugin AOT timing for the curl wasm artifact against `wasmtime compile` of the same input.",
+      "description": "The compiler plugin (Cranelift built to wasm, compiler-plugin/) compiling curl.wasm for the Helios kernel target with the performance hint and the kernel's compiler worker count: in the Helios kernel, and under Wasmtime on Linux through helios-compiler-host. Native `wasmtime compile` of the same input is the reference.",
       "wasm_path": "artifacts/wasi-tools/curl.wasm",
       "remote_path": "/aot-bench-curl-input.wasm",
       "destination_path": "/aot-bench-curl-output.cwasm",
+      "matched_metrics": [
+        "compiler_workers"
+      ],
       "uncompared": {
-        "linux_native": "The in-guest AOT compile is already a compile; `wasmtime compile` on Linux is the native equivalent, so the Linux + Wasmtime column is the comparison."
+        "linux_native": "Native `wasmtime compile` is Cranelift built natively, a different program from the wasm compiler the other two columns run: it is the reference for what compiling curl.wasm costs outside wasm, not a parity check."
       },
       "counterparts": {
-        "linux_native": null,
-        "linux_wasmtime": {
+        "linux_native": {
           "program": "{wasmtime}",
           "args": [
             "compile",
             "-o",
-            "{workdir}/aot-curl-output.cwasm",
+            "{workdir}/aot-curl-native.cwasm",
             "{guest:artifacts/wasi-tools/curl.wasm}"
+          ]
+        },
+        "linux_wasmtime": {
+          "resident": true,
+          "program": "{native_bin}/helios-compiler-host",
+          "args": [
+            "--plugin",
+            "{compiler_plugin}",
+            "--input",
+            "{guest:artifacts/wasi-tools/curl.wasm}",
+            "--output",
+            "{workdir}/aot-curl-output.cwasm",
+            "--target",
+            "{compiler_target}",
+            "--hint",
+            "performance",
+            "--workers",
+            "{compiler_workers}"
           ]
         }
       }
@@ -778,7 +798,7 @@
       "program": "{tcp_throughput}",
       "args": [
         "{host_tcp_host}",
-        "{host_tcp_port}",
+        "{host_tcp_upload_port}",
         "67108864",
         "up"
       ],
@@ -803,7 +823,7 @@
           ],
           "args": [
             "{host_tcp_host}",
-            "{host_tcp_port}",
+            "{host_tcp_upload_port}",
             "67108864",
             "up",
             "--label",

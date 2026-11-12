@@ -12,6 +12,8 @@ mod component;
 use component::*;
 mod shard;
 use shard::*;
+mod identifiers;
+use identifiers::*;
 
 extern crate alloc;
 
@@ -29,16 +31,17 @@ use helios_hal::cpu::{Cpu, HardwarePerfCounters, current_processor};
 use helios_hal::io::IoError;
 use helios_netstack::{
     DEFAULT_HOP_LIMIT, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DNS_PORT, DhcpClientMessage,
-    DhcpDnsServers, DhcpMessageType, DhcpPacket, DhcpServerMessage, DnsQuestionWriter,
+    DhcpDnsServers, DhcpMessageType, DhcpPacket, DhcpServerMessage, DnsQuery, DnsQuestionWriter,
     DnsRecordType, DnsResponse, EthernetFrame, EthernetProtocol, FlowTuple, IcmpEchoKey,
     IcmpEchoReply, Icmpv4Packet, Icmpv6Packet, InterfaceEventMark, IpAddress, IpCidr, IpProtocol,
-    Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6Packet, MAX_OUTBOUND_FRAMES,
-    NeighborCache, NeighborEntry, NetworkInterface as NetworkDevice, OutboundBatchStatus, Route,
-    RouteTable, RxChecksumOffload, RxDrain, RxFrame, SegmentationOffload, Stack, StackConfig,
-    StackError, StackEvent, StackInstant, TcpCloseKind, TcpConnectState, TcpConnectTerminalError,
-    TcpEndpoint, TcpListenBacklog, TcpPacket, TcpReadIntoState, TcpReadState,
-    TcpReceiveDiagnostics, TcpSendState, TcpStackCounters, UdpEgress, UdpEndpoint, UdpPacket,
-    UdpPayload, UdpSocketBinding, UdpSocketError, flow_hash,
+    Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6AddressEntry, Ipv6Cidr, Ipv6Packet,
+    IsnSecret, MAX_OUTBOUND_FRAMES, NeighborCache, NeighborEntry,
+    NetworkInterface as NetworkDevice, OutboundBatchStatus, Route, RouteTable, RxChecksumOffload,
+    RxDrain, RxFrame, SegmentationOffload, Stack, StackConfig, StackError, StackEvent,
+    StackInstant, TcpCloseKind, TcpConnectState, TcpConnectTerminalError, TcpEndpoint,
+    TcpListenBacklog, TcpPacket, TcpReadIntoState, TcpReadState, TcpReceiveDiagnostics,
+    TcpSendState, TcpStackCounters, UdpEgress, UdpEndpoint, UdpPacket, UdpPayload,
+    UdpSocketBinding, UdpSocketError, flow_hash,
 };
 use spin::{Mutex as SpinMutex, RwLock as SpinRwLock};
 
@@ -48,8 +51,9 @@ use crate::{
     Ipv4Cidr as KernelIpv4Cidr, Ipv4Route as KernelIpv4Route, MacAddress, NetworkAdminBackend,
     NetworkBridgeRequest, NetworkControlError, NetworkErrorDetail, NetworkIpAddress, NetworkPortId,
     PingError, PingErrorKind, PingReply, ProfileSink, ProgressMark, ProgressSignal,
-    RegisteredTcpReadBuffer, TcpAccepted, TcpError, TcpErrorKind, TcpListener, TcpReadProgress,
-    TcpWriteProgress, Timer, UdpBinding, UdpDatagram, UdpError, UdpErrorKind, UptimeClock,
+    RegisteredTcpReadBuffer, RootEntropyHandle, TcpAccepted, TcpError, TcpErrorKind, TcpListener,
+    TcpReadProgress, TcpWriteProgress, Timer, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
+    UptimeClock,
 };
 use triomphe::Arc;
 
@@ -72,6 +76,11 @@ const INTERNAL_DHCP_SOCKET_INDEX: usize = 0;
 const INTERNAL_UDP_RESERVED_SLOTS: usize = 1;
 const LOCAL_NETWORK_PORT: NetworkPortId = NetworkPortId::new(0);
 const DHCP_RETRANSMIT_NANOS: u64 = 1_000_000_000;
+/// REQUESTs an INIT-REBOOT client sends before giving the lease up and
+/// starting over from DISCOVER. RFC 2131 section 3.2 leaves the count
+/// to the client; with the retransmission interval above, four tries
+/// is the few seconds a server on the same link needs to answer.
+const DHCP_REBOOT_ATTEMPTS: u32 = 4;
 const MAX_TCP_STREAM_HANDLES: usize = 256;
 const MAX_TCP_LISTENER_HANDLES: usize = 64;
 const MAX_UDP_SOCKET_HANDLES: usize = 256;
@@ -184,7 +193,7 @@ struct NetworkIpv4AddressTable {
 
 #[derive(Clone, Debug)]
 struct NetworkIpv6AddressTable {
-    entries: Vec<Ipv6Cidr>,
+    entries: Vec<Ipv6AddressEntry>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -371,7 +380,7 @@ impl NetworkControlPlane {
             .replace_ipv4_addresses(self.ipv4_addresses.load_full().entries.iter().copied());
         shard
             .stack
-            .replace_ipv6_addresses(self.ipv6_addresses.load_full().entries.iter().copied());
+            .replace_ipv6_address_entries(self.ipv6_addresses.load_full().entries.iter().copied());
         shard
             .stack
             .replace_ipv6_dns_servers(self.ipv6_dns_servers.load_full().entries.iter().copied());
@@ -407,7 +416,7 @@ impl NetworkControlPlane {
             }));
         self.ipv6_addresses
             .store(StdArc::new(NetworkIpv6AddressTable {
-                entries: shard.stack.ipv6_addresses().collect(),
+                entries: shard.stack.ipv6_address_entries().collect(),
             }));
         self.ipv6_dns_servers
             .store(StdArc::new(NetworkIpv6DnsServers {
@@ -472,7 +481,12 @@ impl NetworkControlPlane {
     }
 
     fn list_ipv6_addresses(&self) -> Vec<Ipv6Cidr> {
-        self.ipv6_addresses.load_full().entries.clone()
+        self.ipv6_addresses
+            .load_full()
+            .entries
+            .iter()
+            .map(Ipv6AddressEntry::cidr)
+            .collect()
     }
 
     fn list_ipv4_addresses(&self) -> Vec<KernelIpv4Cidr> {
@@ -629,6 +643,7 @@ where
         clock: UptimeClock,
         timer: Timer<CpuImpl>,
         device: DeviceImpl,
+        root_entropy: RootEntropyHandle,
     ) -> Self {
         let transaction_id = cpu.now().ticks() as u32;
         let capabilities = device.capabilities();
@@ -666,7 +681,12 @@ where
         } else {
             SegmentationOffload::none()
         };
-        let stack_config = StackConfig::new(mac, max_frame_len)
+        // The key of the initial sequence number function (RFC 6528) is
+        // drawn once, here, and shared by every shard's stack, so a
+        // flow's number does not depend on which shard opens it.
+        let mut isn_key = [0_u8; IsnSecret::BYTES];
+        root_entropy.fill(&mut isn_key);
+        let stack_config = StackConfig::new(mac, max_frame_len, IsnSecret::from_bytes(isn_key))
             .with_rx_budget(rx_poll_budget)
             .with_rx_checksum_offload(rx_checksum_offload)
             .with_tx_checksum_offload(tx_checksum_offload)
@@ -675,7 +695,13 @@ where
         let stack_rx_budget = Stack::new(stack_config).config().rx_budget;
         let state = NetworkShardSet::new(shard_count, |index| {
             let staggered_xid = transaction_id.wrapping_add(index as u32);
-            NetworkShard::new(stack_config, staggered_xid, index, shard_count)
+            NetworkShard::new(
+                stack_config,
+                staggered_xid,
+                index,
+                shard_count,
+                root_entropy.clone(),
+            )
         });
         Self {
             inner: Arc::new(NetworkServiceInner {
@@ -757,7 +783,7 @@ where
         let identifier = self
             .inner
             .state
-            .with_mut(NetworkShard::next_icmp_echo_identifier);
+            .with_mut(NetworkShard::draw_icmp_echo_identifier);
         let mut sequence: u16 = 0;
         // Every candidate shares the caller's deadline, exactly as the
         // connect walk does: a destination that is unreachable in one
@@ -1540,6 +1566,7 @@ pub(crate) mod fixture {
                 crate::test_support::test_uptime_clock(),
                 crate::test_support::test_timer(cpu),
                 device,
+                crate::test_support::test_root_entropy(),
             );
             let fixture = Self {
                 service,
@@ -1740,7 +1767,7 @@ mod tests {
     use helios_netstack::{
         ArpOperation, ArpPacket, ETHERNET_FRAME_BYTES, EthernetFrame, EthernetProtocol,
         IcmpEchoKey, Icmpv4Packet, Icmpv6Packet, IpAddress, IpCidr, IpProtocol, Ipv4Address,
-        Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6Packet, MAX_OUTBOUND_FRAMES,
+        Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6Packet, IsnSecret, MAX_OUTBOUND_FRAMES,
         NeighborEntry, NeighborState, Route, StackConfig, StackInstant, TCP_RECEIVE_WINDOW_BYTES,
         TcpEndpoint, TcpFlags, TcpHeader, TcpListenBacklog, TcpPacket, TransportChecksum,
         UdpEndpoint, UdpPacket, UdpPayload, UdpSocketBinding, internet_checksum,
@@ -1751,14 +1778,17 @@ mod tests {
     use futures_lite::future::{block_on, poll_once};
     use helios_netstack::RxFrame;
 
-    use crate::test_support::{RecordingNetworkInterface, RecordingSmpCpu, TestCpu};
+    use crate::test_support::{
+        RecordingNetworkInterface, RecordingSmpCpu, TestCpu, test_root_entropy,
+    };
 
     use super::{
-        AddressAttemptError, DhcpClientState, DhcpDnsServers, DhcpMessageType, DhcpServerMessage,
-        HandleSlab, NETWORK_BUSY_POLL_ROUNDS, NETWORK_TX_BATCH_FRAMES, NetworkIpAddress,
-        NetworkPollBudget, NetworkPollProgress, NetworkPollScope, NetworkPollSource,
-        NetworkPollState, NetworkPumpAction, NetworkPumpCadence, NetworkShard, ReplicaHandle,
-        TcpListenerId, TcpReadProgress, UdpSocketId, icmp_echo_payload, limit_udp_datagram_bytes,
+        AddressAttemptError, DHCP_REBOOT_ATTEMPTS, DHCP_RETRANSMIT_NANOS, DhcpClientState,
+        DhcpDnsServers, DhcpMessageType, DhcpServerMessage, DnsQueryPair, HandleSlab,
+        NETWORK_BUSY_POLL_ROUNDS, NETWORK_TX_BATCH_FRAMES, NetworkIpAddress, NetworkPollBudget,
+        NetworkPollProgress, NetworkPollScope, NetworkPollSource, NetworkPollState,
+        NetworkPumpAction, NetworkPumpCadence, NetworkShard, ReplicaHandle, TcpListenerId,
+        TcpReadProgress, UdpSocketId, icmp_echo_payload, limit_udp_datagram_bytes,
         map_ipv4_address, parse_ipv6, receive_pair_order,
     };
 
@@ -1974,7 +2004,12 @@ mod tests {
     }
 
     fn test_stack_config() -> StackConfig {
-        StackConfig::new([0x02, 0, 0, 0, 0, 1], ETHERNET_FRAME_BYTES).with_rx_budget(8)
+        StackConfig::new(
+            [0x02, 0, 0, 0, 0, 1],
+            ETHERNET_FRAME_BYTES,
+            IsnSecret::from_bytes([0x5a; IsnSecret::BYTES]),
+        )
+        .with_rx_budget(8)
     }
 
     /// The first datagram slot a replicated bind may take: the DHCP
@@ -1990,7 +2025,7 @@ mod tests {
     }
 
     fn test_network_shard() -> NetworkShard {
-        NetworkShard::new(test_stack_config(), 1, 0, 1)
+        NetworkShard::new(test_stack_config(), 1, 0, 1, test_root_entropy())
     }
 
     /// Installs one shard's replica of a bound datagram socket and
@@ -2021,6 +2056,97 @@ mod tests {
             )
             .expect("test TCP listener should bind");
         TcpListenerId(ReplicaHandle::new(slot).get())
+    }
+
+    /// A restored machine may be on another network, so a bound client
+    /// asks the link to confirm its lease (INIT-REBOOT) and keeps the
+    /// address while it waits; a client with no lease has nothing to ask
+    /// about.
+    #[test]
+    fn a_restored_machine_asks_the_link_to_confirm_its_lease() {
+        let mut shard = test_network_shard();
+        let lease = Ipv4Cidr::new(Ipv4Address::new([192, 0, 2, 10]), 24);
+
+        assert_eq!(
+            shard.begin_lease_revalidation(9, StackInstant::from_nanos(1)),
+            Ok(false),
+            "a client still looking for an address has no lease to confirm"
+        );
+
+        shard
+            .stack
+            .add_ipv4_address(lease)
+            .expect("test address should be accepted");
+        shard.dhcp = DhcpClientState::Bound;
+        assert_eq!(
+            shard.begin_lease_revalidation(9, StackInstant::from_nanos(1)),
+            Ok(true)
+        );
+        assert_eq!(
+            shard.dhcp,
+            DhcpClientState::Rebooting {
+                transaction_id: 9,
+                requested_ip: lease.address(),
+                attempts: 1,
+                last_sent: StackInstant::from_nanos(1),
+            }
+        );
+        assert_eq!(
+            shard.stack.ipv4_addresses().count(),
+            1,
+            "the address stays in use until the link answers"
+        );
+        let frame = shard
+            .stack
+            .take_outbound()
+            .expect("a DHCP REQUEST frame should be queued");
+        let ethernet = EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
+        let ipv4 = Ipv4Packet::parse(ethernet.payload).expect("IPv4 packet should parse");
+        let udp = UdpPacket::parse(ipv4.payload).expect("UDP datagram should parse");
+        assert_eq!(udp.destination_port, helios_netstack::DHCP_SERVER_PORT);
+        // The requested-IP option (50) names the old lease, and the
+        // server-identifier option (54) is absent: any server may answer.
+        assert!(
+            udp.payload
+                .windows(6)
+                .any(|option| option == [50, 4, 192, 0, 2, 10])
+        );
+        assert!(!udp.payload.windows(2).any(|option| option == [54, 4]));
+    }
+
+    /// A link that never confirms the lease leaves the client no reason
+    /// to trust it: after the retries it starts over as a NAK would.
+    #[test]
+    fn an_unconfirmed_lease_is_given_up_after_the_retries() {
+        let mut shard = test_network_shard();
+        shard
+            .stack
+            .add_ipv4_address(Ipv4Cidr::new(Ipv4Address::new([192, 0, 2, 10]), 24))
+            .expect("test address should be accepted");
+        shard.dhcp = DhcpClientState::Bound;
+        shard
+            .begin_lease_revalidation(9, StackInstant::from_nanos(0))
+            .expect("the first REQUEST is built");
+
+        for attempt in 2..=DHCP_REBOOT_ATTEMPTS {
+            let now = StackInstant::from_nanos(u64::from(attempt) * DHCP_RETRANSMIT_NANOS);
+            shard.retransmit_dhcp(now).expect("a retry is sent");
+            assert!(
+                matches!(
+                    shard.dhcp,
+                    DhcpClientState::Rebooting { attempts, .. } if attempts == attempt
+                ),
+                "attempt {attempt}: {:?}",
+                shard.dhcp
+            );
+        }
+        assert_eq!(shard.stack.ipv4_addresses().count(), 1);
+
+        let now =
+            StackInstant::from_nanos(u64::from(DHCP_REBOOT_ATTEMPTS + 1) * DHCP_RETRANSMIT_NANOS);
+        shard.retransmit_dhcp(now).expect("the exchange ends");
+        assert_eq!(shard.dhcp, DhcpClientState::Init { transaction_id: 10 });
+        assert_eq!(shard.stack.ipv4_addresses().count(), 0);
     }
 
     /// A link that comes back is not the link that went away: the lease,
@@ -2128,6 +2254,25 @@ mod tests {
         }
     }
 
+    /// RFC 2131 §3.2: an INIT-REBOOT REQUEST names no server, so any
+    /// server on the link may answer it, and only the `xid` ties the
+    /// answer to the exchange.
+    #[test]
+    fn a_rebooting_client_takes_a_reply_to_its_exchange_from_any_server() {
+        let server = Ipv4Address::new([192, 0, 2, 1]);
+        let rebooting = DhcpClientState::Rebooting {
+            transaction_id: 7,
+            requested_ip: Ipv4Address::new([192, 0, 2, 10]),
+            attempts: 1,
+            last_sent: StackInstant::from_nanos(0),
+        };
+        for message_type in [DhcpMessageType::Ack, DhcpMessageType::Nak] {
+            assert!(rebooting.accepts_reply(&dhcp_reply(message_type, 7, Some(server))));
+            assert!(rebooting.accepts_reply(&dhcp_reply(message_type, 7, None)));
+            assert!(!rebooting.accepts_reply(&dhcp_reply(message_type, 8, Some(server))));
+        }
+    }
+
     #[test]
     fn parse_ipv6_accepts_compressed_numeric_hosts() {
         assert_eq!(
@@ -2162,6 +2307,7 @@ mod tests {
                 443,
                 49_152,
                 helios_netstack::DEFAULT_HOP_LIMIT,
+                StackInstant::from_nanos(0),
             )
             .expect("IPv6 TCP connect should allocate a socket");
         state
@@ -2208,6 +2354,7 @@ mod tests {
                 443,
                 49_152,
                 helios_netstack::DEFAULT_HOP_LIMIT,
+                StackInstant::from_nanos(0),
             )
             .expect("IPv6 TCP connect should allocate a socket");
         state
@@ -2277,6 +2424,7 @@ mod tests {
                 443,
                 49_152,
                 helios_netstack::DEFAULT_HOP_LIMIT,
+                StackInstant::from_nanos(0),
             )
             .expect("IPv6 TCP connect should allocate a socket");
         state
@@ -2392,7 +2540,7 @@ mod tests {
         });
         let key = IcmpEchoKey {
             destination: IpAddress::Ipv4(remote),
-            identifier: state.next_icmp_echo_identifier(),
+            identifier: state.draw_icmp_echo_identifier(),
             sequence: 1,
         };
         let payload = icmp_echo_payload();
@@ -2843,7 +2991,13 @@ mod tests {
         let cpu = RecordingSmpCpu::new(0, 2);
         let control = super::NetworkControlPlane::new();
         let state = super::NetworkShardSet::new(2, |index| {
-            NetworkShard::new(test_stack_config(), 1 + index as u32, index, 2)
+            NetworkShard::new(
+                test_stack_config(),
+                1 + index as u32,
+                index,
+                2,
+                test_root_entropy(),
+            )
         });
         // A bound datagram socket is replicated: the same slot on every
         // shard, with the receive path deciding which replica gets a
@@ -2958,11 +3112,17 @@ mod tests {
         let cpu = RecordingSmpCpu::new(0, 2);
         let control = super::NetworkControlPlane::new();
         let state = super::NetworkShardSet::new(2, |index| {
-            NetworkShard::new(test_stack_config(), 1 + index as u32, index, 2)
+            NetworkShard::new(
+                test_stack_config(),
+                1 + index as u32,
+                index,
+                2,
+                test_root_entropy(),
+            )
         });
         // The port the connection is opened on is the one whose replies
         // hash back to the owning shard, exactly as
-        // `allocate_tcp_local_port_for` picks it.
+        // `open_ephemeral_tcp_connect` picks it.
         let local_port = (49_152..u16::MAX)
             .find(|local_port| {
                 super::shard_idx_for_flow(
@@ -3304,7 +3464,13 @@ mod tests {
         let owner = 1;
         let cpu = RecordingSmpCpu::new(0, 2);
         let state = super::NetworkShardSet::new(2, |index| {
-            NetworkShard::new(test_stack_config(), 1 + index as u32, index, 2)
+            NetworkShard::new(
+                test_stack_config(),
+                1 + index as u32,
+                index,
+                2,
+                test_root_entropy(),
+            )
         });
 
         let stream = {
@@ -3462,6 +3628,7 @@ mod tests {
             crate::test_support::test_uptime_clock(),
             crate::test_support::test_timer(cpu),
             device,
+            test_root_entropy(),
         )
     }
 
@@ -3746,6 +3913,7 @@ mod tests {
             crate::test_support::test_uptime_clock(),
             crate::test_support::test_timer(cpu),
             device,
+            test_root_entropy(),
         )
     }
 
@@ -3901,7 +4069,13 @@ mod tests {
         for shard_count in [1usize, 2, 3, 4, 8] {
             let mut previous_end = None;
             for shard_idx in 0..shard_count {
-                let shard = NetworkShard::new(test_stack_config(), 1, shard_idx, shard_count);
+                let mut shard = NetworkShard::new(
+                    test_stack_config(),
+                    1,
+                    shard_idx,
+                    shard_count,
+                    test_root_entropy(),
+                );
                 let (first, last) = shard.ephemeral_window();
                 assert!(first <= last);
                 match previous_end {
@@ -3909,18 +4083,391 @@ mod tests {
                     Some(previous) => assert_eq!(first, previous + 1),
                 }
                 previous_end = Some(last);
+                let walk: Vec<u16> = shard.ephemeral_walk().collect();
                 assert_eq!(
-                    shard.advance_ephemeral_port(last),
-                    first,
-                    "the walk wraps inside its own window"
+                    walk.len(),
+                    usize::from(last - first) + 1,
+                    "a walk tries every port of its window"
                 );
-                assert_eq!(
-                    shard.ephemeral_port_attempts(),
-                    usize::from(last - first) + 1
+                assert!(
+                    walk.iter().all(|port| (first..=last).contains(port)),
+                    "a walk stays inside its own window"
                 );
             }
             assert_eq!(previous_end, Some(super::EPHEMERAL_PORT_END));
         }
+    }
+
+    /// An ephemeral port is not the next number after the last one: a
+    /// sender who saw one connection's port could otherwise name the
+    /// next. Ports come from the root generator, so a run of draws is
+    /// neither ascending nor repeating.
+    #[test]
+    fn ephemeral_ports_are_not_handed_out_in_order() {
+        let mut shard = test_network_shard();
+        let ports: Vec<u16> = (0..32)
+            .map(|_| {
+                shard
+                    .allocate_udp_local_port()
+                    .expect("the window has free ports")
+            })
+            .collect();
+        assert!(
+            ports
+                .windows(2)
+                .any(|pair| pair[1] != pair[0].wrapping_add(1)),
+            "consecutive draws were sequential: {ports:?}"
+        );
+        let mut distinct = ports.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert!(
+            distinct.len() > 1,
+            "draws from a 16384 port window were all one port: {ports:?}"
+        );
+        let (first, last) = shard.ephemeral_window();
+        assert!(ports.iter().all(|port| (first..=last).contains(port)));
+    }
+
+    /// A port a socket already holds is never handed out again, however
+    /// the walk starts.
+    #[test]
+    fn an_ephemeral_port_in_use_is_never_returned() {
+        let mut shard = test_network_shard();
+        let mut taken = Vec::new();
+        for _ in 0..64 {
+            let port = shard
+                .allocate_udp_local_port()
+                .expect("the window has free ports");
+            assert!(!taken.contains(&port), "{port} was handed out while bound");
+            shard
+                .stack
+                .open_udp(UdpSocketBinding::wildcard(port))
+                .expect("the port the allocator returned binds");
+            taken.push(port);
+        }
+    }
+
+    const CONNECT_REMOTE_PORT: u16 = 443;
+
+    fn connect_local() -> Ipv6Address {
+        Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1])
+    }
+
+    fn connect_remote() -> Ipv6Address {
+        Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2])
+    }
+
+    /// A shard set whose every shard has the local address and a
+    /// reachable neighbour, so a connect opened on any of them emits
+    /// its SYN.
+    fn connect_shard_set(shard_count: usize) -> super::NetworkShardSet {
+        super::NetworkShardSet::new(shard_count, |index| {
+            let mut shard = NetworkShard::new(
+                test_stack_config(),
+                1 + index as u32,
+                index,
+                shard_count,
+                test_root_entropy(),
+            );
+            shard
+                .stack
+                .add_ipv6_address(Ipv6Cidr::new(connect_local(), 64))
+                .expect("test address should be accepted");
+            shard.stack.learn_neighbor(NeighborEntry {
+                ip: IpAddress::Ipv6(connect_remote()),
+                mac: [0x02, 0, 0, 0, 0, 2],
+                state: NeighborState::Reachable,
+                updated_at: StackInstant::from_nanos(0),
+            });
+            shard
+        })
+    }
+
+    fn connect_request() -> super::TcpConnectRequest {
+        super::TcpConnectRequest {
+            local: IpAddress::Ipv6(connect_local()),
+            destination: IpAddress::Ipv6(connect_remote()),
+            port: CONNECT_REMOTE_PORT,
+            hop_limit: helios_netstack::DEFAULT_HOP_LIMIT,
+            opened_at: StackInstant::from_nanos(0),
+        }
+    }
+
+    /// Opens a connection from `local_port` on `shard` and leaves it
+    /// non-closed, so it holds its four-tuple the way a TIME-WAIT
+    /// socket does.
+    fn hold_four_tuple(shard: &mut NetworkShard, local_port: u16) {
+        let request = connect_request();
+        shard
+            .start_tcp_connect(
+                request.local,
+                request.destination,
+                request.port,
+                local_port,
+                request.hop_limit,
+                request.opened_at,
+            )
+            .expect("a free four-tuple should open");
+    }
+
+    /// The source port of every SYN this shard has queued.
+    fn queued_syn_source_ports(shard: &mut NetworkShard) -> Vec<u16> {
+        shard
+            .stack
+            .drive_tcp(StackInstant::from_nanos(1))
+            .expect("TCP SYNs should be queued");
+        let mut ports = Vec::new();
+        while let Some(frame) = shard.stack.take_outbound() {
+            let ethernet =
+                EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
+            let ipv6 = Ipv6Packet::parse(ethernet.payload).expect("IPv6 packet should parse");
+            let tcp = TcpPacket::parse(ipv6.payload).expect("TCP packet should parse");
+            assert!(tcp.flags.contains(TcpFlags::SYN));
+            ports.push(tcp.source_port);
+        }
+        ports
+    }
+
+    /// Issue #788: a walk that starts on ports whose four-tuple to this
+    /// remote a lingering connection still holds takes the next
+    /// candidate instead of failing the connect.
+    #[test]
+    fn an_ephemeral_connect_skips_a_port_whose_four_tuple_is_held() {
+        const HELD: u16 = 3;
+        let state = connect_shard_set(1);
+        let mut shard = state.shard_at(0).lock();
+        let (first, last) = shard.ephemeral_window();
+        for offset in 0..HELD {
+            hold_four_tuple(&mut shard, first + offset);
+        }
+        let walk = super::EphemeralWalk::starting_at(first, last, 0);
+
+        shard
+            .open_tcp_connect_along_own_flows(walk, connect_request(), 1)
+            .expect("an in-use candidate is not a failure")
+            .expect("the candidate after the held ones opens");
+
+        let mut ports = queued_syn_source_ports(&mut shard);
+        ports.sort_unstable();
+        let expected: Vec<u16> = (first..=first + HELD).collect();
+        assert_eq!(
+            ports, expected,
+            "the new connection takes the first port after the held run"
+        );
+    }
+
+    /// A connect that does not name its port keeps succeeding as
+    /// four-tuples to one remote accumulate, and never reuses a port.
+    #[test]
+    fn repeated_ephemeral_connects_to_one_remote_never_collide() {
+        const CONNECTS: usize = 100;
+        let state = connect_shard_set(2);
+        let mut ports = Vec::new();
+        for _ in 0..CONNECTS {
+            let stream = state
+                .open_ephemeral_tcp_connect(0, connect_request())
+                .expect("every connect finds a port");
+            let owner = state.shard_idx_for_handle(stream);
+            ports.extend(queued_syn_source_ports(&mut state.shard_at(owner).lock()));
+        }
+        let mut distinct = ports.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(ports.len(), CONNECTS);
+        assert_eq!(
+            distinct.len(),
+            CONNECTS,
+            "a local port was handed out twice"
+        );
+    }
+
+    /// The ports of `first..=first + 63` that hash to the accepting
+    /// shard 0 and to the other shard of a two-shard set.
+    fn split_by_owner(first: u16) -> (Vec<u16>, Vec<u16>) {
+        (first..first + 64).partition(|port| {
+            super::shard_idx_for_flow(
+                IpAddress::Ipv6(connect_local()),
+                *port,
+                IpAddress::Ipv6(connect_remote()),
+                CONNECT_REMOTE_PORT,
+                2,
+            ) == 0
+        })
+    }
+
+    /// Candidates that hash to another shard are tried on that shard,
+    /// in walk order, once no candidate of the accepting shard opens.
+    #[test]
+    fn an_ephemeral_connect_falls_to_a_foreign_shard_candidate() {
+        let first = super::EPHEMERAL_PORT_START;
+        let state = connect_shard_set(2);
+        let (own, foreign) = split_by_owner(first);
+        assert!(foreign.len() >= 2, "the fixture needs two foreign ports");
+        for port in &own {
+            hold_four_tuple(&mut state.shard_at(0).lock(), *port);
+        }
+        hold_four_tuple(&mut state.shard_at(1).lock(), foreign[0]);
+        let walk = super::EphemeralWalk::starting_at(first, first + 63, 0);
+
+        let own_flow = state
+            .shard_at(0)
+            .lock()
+            .open_tcp_connect_along_own_flows(walk, connect_request(), 2)
+            .expect("an in-use candidate is not a failure");
+        assert!(own_flow.is_none(), "every own-shard candidate is held");
+        let stream = state
+            .open_tcp_connect_along_foreign_flows(walk, 0, connect_request())
+            .expect("the second foreign candidate opens");
+
+        assert_eq!(state.shard_idx_for_handle(stream), 1);
+        let mut ports = queued_syn_source_ports(&mut state.shard_at(1).lock());
+        ports.sort_unstable();
+        let mut expected = Vec::from([foreign[0], foreign[1]]);
+        expected.sort_unstable();
+        assert_eq!(ports, expected);
+    }
+
+    /// Only a window with every candidate in use fails the connect.
+    #[test]
+    fn an_ephemeral_connect_fails_only_when_every_candidate_is_held() {
+        let first = super::EPHEMERAL_PORT_START;
+        let state = connect_shard_set(2);
+        let (own, foreign) = split_by_owner(first);
+        for port in &own {
+            hold_four_tuple(&mut state.shard_at(0).lock(), *port);
+        }
+        for port in &foreign {
+            hold_four_tuple(&mut state.shard_at(1).lock(), *port);
+        }
+        let walk = super::EphemeralWalk::starting_at(first, first + 63, 0);
+
+        let own_flow = state
+            .shard_at(0)
+            .lock()
+            .open_tcp_connect_along_own_flows(walk, connect_request(), 2)
+            .expect("an in-use candidate is not a failure");
+        assert!(own_flow.is_none());
+        let error = state
+            .open_tcp_connect_along_foreign_flows(walk, 0, connect_request())
+            .err()
+            .expect("no candidate is free");
+        assert_eq!(error.detail, crate::NetworkErrorDetail::TcpNoEphemeralPorts);
+    }
+
+    /// A port the program bound is one attempt: its conflict is
+    /// reported as a start failure, never walked past.
+    #[test]
+    fn a_bound_port_whose_four_tuple_is_held_reports_the_conflict() {
+        let mut shard = test_network_shard();
+        shard
+            .stack
+            .add_ipv6_address(Ipv6Cidr::new(connect_local(), 64))
+            .expect("test address should be accepted");
+        let request = connect_request();
+        hold_four_tuple(&mut shard, 50_000);
+
+        let conflict = shard
+            .start_tcp_connect(
+                request.local,
+                request.destination,
+                request.port,
+                50_000,
+                request.hop_limit,
+                request.opened_at,
+            )
+            .err()
+            .expect("the held four-tuple cannot open twice");
+
+        assert!(matches!(conflict, super::TcpConnectStartError::PortInUse));
+        assert_eq!(
+            conflict.into_tcp_error().detail,
+            crate::NetworkErrorDetail::TcpConnectStartFailed
+        );
+    }
+
+    /// A lookup's two question ids differ and are nonzero, and
+    /// successive lookups are not counted up.
+    #[test]
+    fn dns_query_ids_are_random_and_distinct_within_a_lookup() {
+        let mut shard = test_network_shard();
+        let pairs: Vec<DnsQueryPair> = (0..32).map(|_| shard.draw_dns_query_pair()).collect();
+        for pair in &pairs {
+            assert_ne!(pair.a, pair.aaaa);
+            assert_ne!(pair.a, 0);
+            assert_ne!(pair.aaaa, 0);
+        }
+        let ids: Vec<u16> = pairs.iter().flat_map(|pair| [pair.a, pair.aaaa]).collect();
+        assert!(
+            ids.windows(2)
+                .any(|pair| pair[1] != pair[0].wrapping_add(1)),
+            "ids were handed out in order: {ids:?}"
+        );
+    }
+
+    /// An echo identifier is nonzero, and successive pings are not
+    /// counted up.
+    #[test]
+    fn icmp_echo_identifiers_are_random_and_nonzero() {
+        let mut shard = test_network_shard();
+        let identifiers: Vec<u16> = (0..32).map(|_| shard.draw_icmp_echo_identifier()).collect();
+        assert!(identifiers.iter().all(|&identifier| identifier != 0));
+        assert!(
+            identifiers
+                .windows(2)
+                .any(|pair| pair[1] != pair[0].wrapping_add(1)),
+            "identifiers were handed out in order: {identifiers:?}"
+        );
+    }
+
+    /// Every draw maps to two different nonzero ids, the edges of both
+    /// ranges included.
+    #[test]
+    fn a_dns_query_pair_never_repeats_an_id_or_uses_zero() {
+        let last = DnsQueryPair::IDS - 1;
+        for first in [0, 1, last / 2, last - 1, last] {
+            for second in [0, 1, last / 2, last - 1] {
+                let pair = DnsQueryPair::from_draws(first, second);
+                assert_ne!(pair.a, pair.aaaa, "draws {first}, {second}");
+                assert_ne!(pair.a, 0);
+                assert_ne!(pair.aaaa, 0);
+            }
+        }
+        assert_eq!(
+            DnsQueryPair::from_draws(last, 0),
+            DnsQueryPair {
+                a: u16::MAX,
+                aaaa: 1
+            }
+        );
+    }
+
+    /// The initial sequence number key is drawn once for the whole
+    /// service, so every shard's stack agrees on a flow's number.
+    #[test]
+    fn every_shard_shares_one_sequence_number_key() {
+        let service = test_network_service();
+        let local = TcpEndpoint {
+            address: IpAddress::Ipv4(Ipv4Address::new([192, 0, 2, 10])),
+            port: 49_152,
+        };
+        let remote = TcpEndpoint {
+            address: IpAddress::Ipv4(Ipv4Address::new([198, 51, 100, 7])),
+            port: 443,
+        };
+        let now = StackInstant::from_nanos(1_000_000);
+        let sequences: Vec<u32> = (0..service.inner.state.shard_count())
+            .map(|index| {
+                service
+                    .inner
+                    .state
+                    .shard_at(index)
+                    .lock()
+                    .stack
+                    .tcp_initial_sequence(local, remote, now)
+            })
+            .collect();
+        assert!(sequences.windows(2).all(|pair| pair[0] == pair[1]));
     }
 
     /// A listener retired the way its owner retires it gives its port
@@ -3987,7 +4534,13 @@ mod tests {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([198, 51, 100, 20]);
         let state = super::NetworkShardSet::new(3, |index| {
-            NetworkShard::new(test_stack_config(), 1 + index as u32, index, 3)
+            NetworkShard::new(
+                test_stack_config(),
+                1 + index as u32,
+                index,
+                3,
+                test_root_entropy(),
+            )
         });
         let listener = TcpListenerId(ReplicaHandle::new(FIRST_TEST_LISTENER_SLOT).get());
         state
@@ -4134,7 +4687,13 @@ mod tests {
     fn shard_arrivals_deduplicate_within_one_receive_batch() {
         let cpu = RecordingSmpCpu::new(0, 4);
         let state = super::NetworkShardSet::new(4, |index| {
-            NetworkShard::new(test_stack_config(), 1 + index as u32, index, 4)
+            NetworkShard::new(
+                test_stack_config(),
+                1 + index as u32,
+                index,
+                4,
+                test_root_entropy(),
+            )
         });
         let mut arrivals = super::ShardArrivals::new();
         arrivals.record(2);
@@ -4170,7 +4729,13 @@ mod tests {
         let peer = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
         let router = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]);
         let state = super::NetworkShardSet::new(2, |index| {
-            NetworkShard::new(test_stack_config(), 1 + index as u32, index, 2)
+            NetworkShard::new(
+                test_stack_config(),
+                1 + index as u32,
+                index,
+                2,
+                test_root_entropy(),
+            )
         });
         let socket = UdpSocketId(ReplicaHandle::new(FIRST_TEST_UDP_SLOT).get());
         state

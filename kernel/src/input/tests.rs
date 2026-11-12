@@ -236,8 +236,10 @@ fn a_claimed_device_relays_whole_reports_in_order() {
 
     let mut context = Context::from_waker(Waker::noop());
     let burst = match events.poll_burst(&mut context) {
-        Poll::Ready(burst) => burst,
-        Poll::Pending => panic!("two reports were committed, so a read has to find them"),
+        Poll::Ready(Some(burst)) => burst,
+        Poll::Ready(None) | Poll::Pending => {
+            panic!("two reports were committed, so a read has to find them")
+        }
     };
     assert_eq!(
         burst.as_slice(),
@@ -301,8 +303,8 @@ fn a_full_queue_drops_a_whole_report_and_counts_one() {
     // with the `SYN_REPORT` that closed it.
     let mut context = Context::from_waker(Waker::noop());
     let burst = match events.poll_burst(&mut context) {
-        Poll::Ready(burst) => burst,
-        Poll::Pending => panic!("a full queue has events in it"),
+        Poll::Ready(Some(burst)) => burst,
+        Poll::Ready(None) | Poll::Pending => panic!("a full queue has events in it"),
     };
     assert_eq!(burst.len(), EVENT_QUEUE_DEPTH);
     assert!(
@@ -338,8 +340,8 @@ fn a_reader_that_catches_up_is_served_again() {
     poll_until_parked(drain_input_events(&follow_up, &shared));
 
     let burst = match events.poll_burst(&mut context) {
-        Poll::Ready(burst) => burst,
-        Poll::Pending => panic!("a drained queue accepts the next report"),
+        Poll::Ready(Some(burst)) => burst,
+        Poll::Ready(None) | Poll::Pending => panic!("a drained queue accepts the next report"),
     };
     assert_eq!(burst[0], InputEvent::new(codes::EV_KEY, codes::KEY_B, 1));
     assert_eq!(service.snapshot()[0].lost_reports, 1);
@@ -390,6 +392,102 @@ fn a_release_throws_away_what_its_owner_never_read() {
         matches!(events.poll_burst(&mut context), Poll::Pending),
         "the new owner is not handed the last owner's keystrokes"
     );
+}
+
+/// A stream outlives nothing: once its claim is let go the reader ends,
+/// after it has read what was already queued for it.
+#[test]
+fn a_reader_ends_when_its_claim_is_released() {
+    let device = ScriptedDevice::new(KEYBOARD, key_report(codes::KEY_A, 1).to_vec());
+    let (shared, _requests) = device_channels(0, device.capabilities().clone());
+    let service = InputService::from_devices(Arc::new(one(shared.clone())));
+    let claim = service
+        .claim(KEYBOARD, test_caps::input())
+        .expect("the device is free");
+    let mut events = claim.events();
+    let mut context = Context::from_waker(Waker::noop());
+    assert!(matches!(events.poll_burst(&mut context), Poll::Pending));
+
+    poll_until_parked(drain_input_events(&device, &shared));
+    drop(claim);
+
+    assert!(
+        matches!(events.poll_burst(&mut context), Poll::Ready(Some(_))),
+        "what was queued before the release is still the reader's"
+    );
+    assert!(
+        matches!(events.poll_burst(&mut context), Poll::Ready(None)),
+        "the reader ends once its claim is gone and its queue is empty"
+    );
+}
+
+/// A reader kept past its claim never sees the next owner's input: the
+/// next claim's reports go to its own queue, and the old reader only
+/// ends.
+#[test]
+fn a_stale_reader_never_sees_the_next_claims_events() {
+    let device = ScriptedDevice::new(KEYBOARD, key_report(codes::KEY_A, 1).to_vec());
+    let (shared, _requests) = device_channels(0, device.capabilities().clone());
+    let service = InputService::from_devices(Arc::new(one(shared.clone())));
+    let first = service
+        .claim(KEYBOARD, test_caps::input())
+        .expect("the device is free");
+    let mut stale = first.events();
+    drop(first);
+
+    let second = service
+        .claim(KEYBOARD, test_caps::input())
+        .expect("a released device is free");
+    let mut fresh = second.events();
+    poll_until_parked(drain_input_events(&device, &shared));
+
+    let mut context = Context::from_waker(Waker::noop());
+    assert!(
+        matches!(stale.poll_burst(&mut context), Poll::Ready(None)),
+        "the first claim's reader ends without reading the second claim's report"
+    );
+    let burst = match fresh.poll_burst(&mut context) {
+        Poll::Ready(Some(burst)) => burst,
+        Poll::Ready(None) | Poll::Pending => panic!("the second claim is owed the report"),
+    };
+    assert_eq!(
+        burst.as_slice(),
+        &[
+            InputEvent::new(codes::EV_KEY, codes::KEY_A, 1),
+            InputEvent::new(codes::EV_SYN, codes::SYN_REPORT, 0),
+        ],
+        "the second claim sees the whole report"
+    );
+}
+
+/// An indicator request queued under a claim that is then released fails
+/// its check, however long the device sits unclaimed.
+#[test]
+fn an_indicator_request_queued_before_release_is_dropped() {
+    let device = ScriptedDevice::new(KEYBOARD, Vec::new());
+    let (shared, requests) = device_channels(0, device.capabilities().clone());
+    let service = InputService::from_devices(Arc::new(one(shared.clone())));
+    let claim = service
+        .claim(KEYBOARD, test_caps::input())
+        .expect("the device is free");
+    let leds = claim.leds();
+
+    let mut sent = pin!(leds.set_led(codes::LED_CAPSL, true));
+    let mut context = Context::from_waker(Waker::noop());
+    assert!(sent.as_mut().poll(&mut context).is_pending());
+    drop(claim);
+
+    let served = pin!(super::owner::serve_indicators(&device, &shared, &requests));
+    block_on(async {
+        match futures::future::select(sent, served).await {
+            futures::future::Either::Left((answer, _)) => {
+                assert_eq!(answer, Err(InputServiceError::Closed));
+            }
+            futures::future::Either::Right(((), _)) => panic!("the server never ends"),
+        }
+    });
+
+    assert!(device.leds().is_empty(), "nothing reached the device");
 }
 
 /// An indicator change reaches the device, and one made under a claim

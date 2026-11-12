@@ -83,6 +83,23 @@ impl HostFileSystem for HostedFileSystem {
         None
     }
 
+    /// The host OS is called directly: no session to drop and no cache
+    /// of ours to flush.
+    fn after_machine_restore(
+        &self,
+        _restore: helios_kernel::HostShareRestore,
+    ) -> impl core::future::Future<Output = ()> + Send + '_ {
+        core::future::ready(())
+    }
+
+    /// The host OS is called directly: there is no 9p session for a VMM
+    /// to see, so a snapshot has nothing to wait for.
+    fn prepare_snapshot(&self) -> impl core::future::Future<Output = ()> + Send + '_ {
+        core::future::ready(())
+    }
+
+    fn snapshot_finished(&self) {}
+
     fn stat_path(
         &self,
         path: &str,

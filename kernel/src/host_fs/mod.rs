@@ -15,5 +15,5 @@ mod unsupported;
 
 pub use cache::HostFsCacheStats;
 pub use client::{HostFsClient, HostFsTransport};
-pub use share::{HOST_SHARE_GUEST_MOUNT_PATH, HOST_SHARE_MOUNT_TAG, guest_host_share_path};
+pub use share::{HOST_SHARE_GUEST_MOUNT_PATH, HOST_SHARE_MOUNT_TAG};
 pub use unsupported::UnsupportedHostFileSystem;
