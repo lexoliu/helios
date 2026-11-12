@@ -500,6 +500,16 @@ struct RecordingInterfaceState {
     /// Every frame the transmit ring took, headers and payload joined,
     /// in the order it took them.
     transmitted: spin::Mutex<alloc::vec::Vec<alloc::vec::Vec<u8>>>,
+    /// The refusal [`RecordingNetworkInterface::refuse_transmit_payloads`]
+    /// scripted, answered by every payload request until
+    /// [`RecordingNetworkInterface::release_transmit_space`] clears it.
+    payload_refusal: spin::Mutex<Option<helios_hal::io::IoError>>,
+    /// The generation a space waiter marks, which only moves forward.
+    /// The counter is what a mark carries; the signal is what parks and
+    /// wakes, and is raised after the counter moves.
+    space: AtomicU64,
+    /// Wakes whatever is parked on the transmit memory.
+    space_signal: crate::ProgressSignal,
 }
 
 impl RecordingNetworkInterface {
@@ -529,8 +539,34 @@ impl RecordingNetworkInterface {
                 device_signal: crate::ProgressSignal::new(),
                 accept_transmissions,
                 transmitted: spin::Mutex::new(alloc::vec::Vec::new()),
+                payload_refusal: spin::Mutex::new(None),
+                space: AtomicU64::new(0),
+                space_signal: crate::ProgressSignal::new(),
             }),
         }
+    }
+
+    /// Makes every transmit payload request answer `error` until
+    /// [`Self::release_transmit_space`], the way a transmit arena with
+    /// every page held does. The interface then reports itself short of
+    /// space, as a refused allocation leaves a pool.
+    pub(crate) fn refuse_transmit_payloads(&self, error: helios_hal::io::IoError) {
+        *self.inner.payload_refusal.lock() = Some(error);
+    }
+
+    /// Gives the transmit memory back, as a free on any processor does:
+    /// the scripted refusal is cleared and the space signal raised, with
+    /// no shard arrival and no queue event.
+    pub(crate) fn release_transmit_space(&self) {
+        *self.inner.payload_refusal.lock() = None;
+        self.raise_space_signal();
+    }
+
+    /// Raises the space signal and leaves the refusal as it is, for a
+    /// test that wants a waiter woken into a second refusal.
+    pub(crate) fn raise_space_signal(&self) {
+        self.inner.space.fetch_add(1, Ordering::AcqRel);
+        self.inner.space_signal.signal();
     }
 
     /// The frames the transmit ring has taken since the interface was
@@ -603,12 +639,37 @@ impl helios_netstack::NetworkInterface for RecordingNetworkInterface {
     type TxPayload = alloc::vec::Vec<u8>;
 
     fn transmit_payload(&self, bytes: usize) -> helios_hal::io::IoResult<Self::TxPayload> {
-        Ok(alloc::vec![0; bytes])
+        match *self.inner.payload_refusal.lock() {
+            Some(error) => Err(error),
+            None => Ok(alloc::vec![0; bytes]),
+        }
     }
 
-    /// Heap memory is never being replenished.
-    async fn transmit_payload_ready(&self) -> helios_hal::io::IoResult<()> {
-        Ok(())
+    fn want_transmit_space(&self) -> helios_hal::dma::DmaSpaceMark {
+        self.transmit_space_mark()
+    }
+
+    fn transmit_space_mark(&self) -> helios_hal::dma::DmaSpaceMark {
+        helios_hal::dma::DmaSpaceMark::new(self.inner.space.load(Ordering::Acquire))
+    }
+
+    fn transmit_space_changed(
+        &self,
+        mark: helios_hal::dma::DmaSpaceMark,
+    ) -> impl core::future::Future<Output = ()> + Send + '_ {
+        // Armed here, as a driver must. The counter moves before the
+        // signal is raised, so a raise that lands after this mark moves
+        // the signal and a raise that landed before it moved the counter.
+        let armed = self.inner.space_signal.mark();
+        async move {
+            if self.inner.space.load(Ordering::Acquire) == mark.get() {
+                self.inner.space_signal.changed(armed).await;
+            }
+        }
+    }
+
+    fn transmit_short_of_space(&self) -> bool {
+        self.inner.payload_refusal.lock().is_some()
     }
 
     fn mac_address(&self) -> [u8; 6] {

@@ -62,6 +62,25 @@ impl DeviceAddress {
     }
 }
 
+/// A sample of a [`DmaMemory`]'s space signal.
+///
+/// The signal is a generation that only moves forward: a mark names the
+/// generation a waiter saw, and [`DmaMemory::space_changed`] resolves once
+/// the signal has been raised after it. The value means something only to
+/// the memory that produced it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DmaSpaceMark(u64);
+
+impl DmaSpaceMark {
+    pub const fn new(generation: u64) -> Self {
+        Self(generation)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// What kind of address a [`DmaMemory`] hands to a device.
 ///
 /// This decides whether a driver has to negotiate an access-platform
@@ -87,8 +106,8 @@ pub enum DmaError {
         address: usize,
         bytes: usize,
     },
-    /// Nothing reachable is free now, and more is on its way: await
-    /// [`DmaMemory::replenished`] and ask again. (FreeBSD busdma's
+    /// Nothing reachable is free now, and more is on its way: wait as
+    /// [`DmaMemory::want_space`] says and ask again. (FreeBSD busdma's
     /// deferred load, `EINPROGRESS`.)
     #[error("the device's memory is being replenished; {bytes} bytes were not available")]
     Replenishing { bytes: usize },
@@ -236,13 +255,67 @@ pub trait DmaMemory: Send + Sync + 'static {
     /// space, that the device may use as `access` says.
     ///
     /// A refusal that clears with time is [`DmaError::Replenishing`]; one
-    /// that does not is [`DmaError::Exhausted`].
+    /// that does not is [`DmaError::Exhausted`]. Both are waited out the
+    /// same way: see [`DmaMemory::want_space`].
     fn allocate(&self, layout: Layout, access: DmaAccess) -> Result<Self::Buffer, DmaError>;
 
-    /// Resolves once an allocation refused with
-    /// [`DmaError::Replenishing`] may succeed, or with the reason none
-    /// will.
-    fn replenished(&self) -> impl Future<Output = Result<(), DmaError>> + Send + '_;
+    /// Declares that the caller was refused and will wait for space, and
+    /// returns the signal's generation as of that declaration.
+    ///
+    /// # Waiting for space
+    ///
+    /// After [`DmaError::Replenishing`] or [`DmaError::Exhausted`] the
+    /// caller:
+    ///
+    /// 1. calls `want_space`, which marks the memory starved, samples the
+    ///    signal and orders both before whatever the caller does next;
+    /// 2. asks for the allocation once more, which is the test the
+    ///    declaration armed;
+    /// 3. only if that is refused too, parks on
+    ///    [`DmaMemory::space_changed`] with the mark from step 1.
+    ///
+    /// Memory freed, a chunk published or a growth refused after step 1
+    /// has moved the generation past the mark, so the park returns at
+    /// once; memory freed before step 1 is found by step 2. Neither can
+    /// be slept through.
+    ///
+    /// # Concurrency
+    ///
+    /// Any task on any processor may call this. The signal is raised by
+    /// whoever returns memory or ends a growth attempt, which includes an
+    /// interrupt handler on any processor: raising it is non-blocking,
+    /// takes no lock and allocates nothing. It is raised only while some
+    /// caller is starved, so a pool nobody is waiting on pays no wake.
+    /// A pool that never refuses has nothing to declare and returns the
+    /// generation unchanged.
+    fn want_space(&self) -> DmaSpaceMark;
+
+    /// Resolves once memory was freed, a chunk published, or a growth
+    /// refused after `mark`.
+    ///
+    /// Resolving says an allocation is worth asking for again, not that
+    /// it will succeed: the answer may be [`DmaError::Exhausted`] where it
+    /// was [`DmaError::Replenishing`], and another caller may take the
+    /// space first. A pool that never refuses resolves at once.
+    fn space_changed(&self, mark: DmaSpaceMark) -> impl Future<Output = ()> + Send + '_;
+
+    /// Whether an allocation was refused and nothing has come back since:
+    /// a writability hint for a caller that has not asked for memory
+    /// itself. A pool that never refuses answers `false`.
+    ///
+    /// Only a hint, never a reservation: the next allocation is the
+    /// authority.
+    fn short_of_space(&self) -> bool;
+
+    /// Samples the signal's generation without declaring a wait, for a
+    /// readiness waiter that asks for no memory.
+    ///
+    /// Taken before the state the waiter inspects, exactly as the mark of
+    /// [`DmaMemory::want_space`] is, and waited on with
+    /// [`DmaMemory::space_changed`]. It does not mark the memory starved,
+    /// so a free with no allocator waiting still raises nothing: pair it
+    /// with [`DmaMemory::short_of_space`], which is set only by a refusal.
+    fn space_mark(&self) -> DmaSpaceMark;
 
     /// The address a device has to issue to reach `bytes`.
     ///

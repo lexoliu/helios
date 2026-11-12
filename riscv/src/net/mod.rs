@@ -6,6 +6,7 @@ use core::num::NonZeroU32;
 use fdt::Fdt;
 use fdt::node::FdtNode;
 use helios_hal::cpu::Cpu;
+use helios_hal::dma::DmaSpaceMark;
 use helios_hal::io::IoError;
 use helios_hal::watchdog::Watchdog;
 use helios_kernel::{
@@ -224,10 +225,23 @@ impl NetworkDevice for VirtioNetworkDevice {
         self.inner.transmit_payload(bytes)
     }
 
-    fn transmit_payload_ready(
+    fn want_transmit_space(&self) -> DmaSpaceMark {
+        self.inner.want_transmit_space()
+    }
+
+    fn transmit_space_mark(&self) -> DmaSpaceMark {
+        self.inner.transmit_space_mark()
+    }
+
+    fn transmit_space_changed(
         &self,
-    ) -> impl core::future::Future<Output = Result<(), IoError>> + Send + '_ {
-        self.inner.transmit_payload_ready()
+        mark: DmaSpaceMark,
+    ) -> impl core::future::Future<Output = ()> + Send + '_ {
+        self.inner.transmit_space_changed(mark)
+    }
+
+    fn transmit_short_of_space(&self) -> bool {
+        self.inner.transmit_short_of_space()
     }
 
     fn mac_address(&self) -> [u8; 6] {

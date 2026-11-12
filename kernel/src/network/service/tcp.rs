@@ -57,6 +57,17 @@ pub(super) enum TcpReadIntoProgress {
     Eof,
 }
 
+/// Whether `error` is the interface's transmit memory refusing a piece,
+/// whether it is still on its way or cannot grow: the two refusals a
+/// write waits out on one signal.
+fn is_transmit_memory_refusal(error: &TcpError) -> bool {
+    matches!(
+        error.detail,
+        NetworkErrorDetail::TransmitMemoryReplenishing
+            | NetworkErrorDetail::TransmitMemoryExhausted
+    )
+}
+
 /// The kernel-side reading of a netstack close kind.
 ///
 /// A gracefully closed connection is end-of-stream and has no error;
@@ -203,13 +214,15 @@ where
     /// at a time. The timeout covers the whole write, not each piece.
     ///
     /// A piece that fails with
-    /// [`NetworkErrorDetail::TransmitMemoryReplenishing`] is drawn again
-    /// once the interface says its memory is back, and one that fails
-    /// with [`NetworkErrorDetail::TransmitMemoryExhausted`] is drawn
-    /// again once queued payloads have left the wire: the write is held
-    /// back, as it is by a full send queue, and fails only by its
-    /// deadline. An iterator therefore yields the same piece again after
-    /// either failure, as [`crate::TcpPayloadPieces`] does.
+    /// [`NetworkErrorDetail::TransmitMemoryReplenishing`] or
+    /// [`NetworkErrorDetail::TransmitMemoryExhausted`] holds the write
+    /// back, as a full send queue does, and the write fails only by its
+    /// deadline or with the stream's own close error. The write declares
+    /// its wait ([`NetworkDevice::want_transmit_space`]), draws the
+    /// piece again, and parks on the interface's space signal only if that
+    /// is refused too; see [`Self::wait_for_transmit_space`]. An iterator
+    /// therefore yields the same piece again after either failure, as
+    /// [`crate::TcpPayloadPieces`] does.
     pub async fn tcp_write_all<Pieces>(
         &self,
         stream: TcpStreamId,
@@ -227,90 +240,75 @@ where
             let Some(piece) = pieces.next() else {
                 return Ok(());
             };
-            match piece {
-                Ok(piece) => {
-                    self.execute_tcp_write_until(stream, piece, deadline_nanos)
-                        .await?;
+            let piece = match piece {
+                Err(refusal) if is_transmit_memory_refusal(&refusal) => {
+                    // Declared before the piece is drawn again: memory
+                    // that comes back after this point moves the signal
+                    // past `space`, and memory that came back before it
+                    // is found by this draw.
+                    let space = self.inner.device.want_transmit_space();
+                    let Some(piece) = pieces.next() else {
+                        return Ok(());
+                    };
+                    match piece {
+                        Err(refusal) if is_transmit_memory_refusal(&refusal) => {
+                            self.wait_for_transmit_space(stream, wait, space, deadline_nanos)
+                                .await?;
+                            continue;
+                        }
+                        piece => piece,
+                    }
                 }
-                Err(TcpError {
-                    detail: NetworkErrorDetail::TransmitMemoryReplenishing,
-                    ..
-                }) => {
-                    self.wait_for_replenished_transmit_memory(wait, deadline_nanos)
-                        .await?;
-                }
-                Err(TcpError {
-                    detail: NetworkErrorDetail::TransmitMemoryExhausted,
-                    ..
-                }) => self.wait_for_transmit_memory(wait, deadline_nanos).await?,
-                Err(error) => return Err(error),
-            }
+                piece => piece,
+            };
+            self.execute_tcp_write_until(stream, piece?, deadline_nanos)
+                .await?;
         }
     }
 
-    /// Holds a write back until the interface says its transmit memory is
-    /// back, or the write's deadline passes. Memory the interface then
-    /// says cannot grow is waited out as
-    /// [`Self::wait_for_transmit_memory`] waits.
-    async fn wait_for_replenished_transmit_memory(
+    /// Holds a write back until transmit memory may be available again,
+    /// the stream can no longer send, or the write's deadline passes.
+    ///
+    /// `space` is what [`NetworkDevice::want_transmit_space`] returned
+    /// before the draw that was refused again, and `wait` was sampled
+    /// before the first one. In order:
+    ///
+    /// 1. the stack is driven, which reaps the local transmit completions
+    ///    and takes the ACKs that release queued payloads;
+    /// 2. a send side that is closed ends the write with its close error,
+    ///    so a reset is not waited out;
+    /// 3. the park: the interface's space signal after `space`, raced
+    ///    against the stream's shard, its queue pair's event and the next
+    ///    protocol timer — memory comes back through the first on any
+    ///    processor, and through the others once the payload's segment is
+    ///    acknowledged or its descriptor reaped;
+    /// 4. a deadline that has passed is the write's timeout.
+    async fn wait_for_transmit_space(
         &self,
+        stream: TcpStreamId,
         wait: NetworkWait,
+        space: DmaSpaceMark,
         deadline_nanos: u64,
     ) -> Result<(), TcpError> {
-        const TIMED_OUT: TcpError = TcpError {
-            kind: TcpErrorKind::Timeout,
-            detail: NetworkErrorDetail::TcpWriteTimeout,
-        };
-        let now_nanos = self.now_nanos();
-        if now_nanos >= deadline_nanos {
-            return Err(TIMED_OUT);
+        self.drive_tcp().await?;
+        if let TcpWriteProgress::Closed(error) = self.tcp_send_room(stream)? {
+            return Err(error);
         }
-        let mut ready = core::pin::pin!(self.inner.device.transmit_payload_ready());
-        let mut deadline = core::pin::pin!(
-            self.inner
-                .timer
-                .sleep_for(Duration::from_nanos(deadline_nanos - now_nanos))
-        );
-        let answer = core::future::poll_fn(|cx| {
-            if let Poll::Ready(answer) = ready.as_mut().poll(cx) {
-                return Poll::Ready(Some(answer));
+        let mut changed = core::pin::pin!(self.inner.device.transmit_space_changed(space));
+        let mut progress = core::pin::pin!(self.wait_for_tcp_progress(wait, deadline_nanos));
+        core::future::poll_fn(|cx| {
+            if changed.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(());
             }
-            if deadline.as_mut().poll(cx).is_ready() {
-                return Poll::Ready(None);
-            }
-            Poll::Pending
+            progress.as_mut().poll(cx)
         })
         .await;
-        match answer {
-            Some(Ok(())) => Ok(()),
-            Some(Err(IoError::Exhausted)) => {
-                self.wait_for_transmit_memory(wait, deadline_nanos).await
-            }
-            Some(Err(error)) => Err(TcpError {
-                kind: TcpErrorKind::from_io(error),
-                detail: NetworkErrorDetail::TcpWriteQueueFailed,
-            }),
-            None => Err(TIMED_OUT),
-        }
-    }
-
-    /// Holds a write back until payloads already queued have left the
-    /// wire and given their memory back, or its deadline passes.
-    async fn wait_for_transmit_memory(
-        &self,
-        wait: NetworkWait,
-        deadline_nanos: u64,
-    ) -> Result<(), TcpError> {
-        // Driving the stack reaps the transmit completions that return
-        // the memory.
-        self.drive_tcp().await?;
         if self.now_nanos() >= deadline_nanos {
             return Err(TcpError {
                 kind: TcpErrorKind::Timeout,
                 detail: NetworkErrorDetail::TcpWriteTimeout,
             });
         }
-        self.wait_for_tcp_progress(wait, deadline_nanos).await;
         Ok(())
     }
 
@@ -395,10 +393,23 @@ where
     /// is a send side that cannot take bytes again — the answer that
     /// resolves a parked `ready` instead of letting it sleep through the
     /// close.
+    ///
+    /// `Pending` also covers an interface whose transmit memory is short
+    /// ([`NetworkDevice::transmit_short_of_space`]): the memory is the
+    /// interface's, so every stream on it reports the same until some
+    /// comes back. The hint is read after the send queue is, and `Closed`
+    /// is never hidden by it.
     pub fn tcp_send_room(&self, stream: TcpStreamId) -> Result<TcpWriteProgress, TcpError> {
-        self.inner
+        let room = self
+            .inner
             .state
-            .with_handle(stream, |state| state.tcp_send_room(stream))
+            .with_handle(stream, |state| state.tcp_send_room(stream))?;
+        Ok(match room {
+            TcpWriteProgress::Room(_) if self.inner.device.transmit_short_of_space() => {
+                TcpWriteProgress::Pending
+            }
+            room => room,
+        })
     }
 
     /// Queues what `bytes` gives `stream`'s send queue and publishes it
@@ -477,9 +488,15 @@ where
     /// reset — another processor drains between the probe and the park
     /// resolves the wait rather than being slept through. The drive in
     /// between is what consumes the segments that change the answer.
+    ///
+    /// Transmit memory is part of the answer ([`Self::tcp_send_room`]), so
+    /// the park also ends when the interface's space signal is raised. Its
+    /// mark is taken with the shard wait, before the probe: memory that
+    /// comes back after the hint was read has moved the signal past it.
     pub async fn tcp_write_ready(&self, stream: TcpStreamId) -> Result<(), TcpError> {
         loop {
             let wait = self.shard_wait_for_handle(stream);
+            let space = self.inner.device.transmit_space_mark();
             if !matches!(self.tcp_send_room(stream)?, TcpWriteProgress::Pending) {
                 return Ok(());
             }
@@ -487,7 +504,15 @@ where
             if !matches!(self.tcp_send_room(stream)?, TcpWriteProgress::Pending) {
                 return Ok(());
             }
-            self.wait_for_tcp_progress(wait, u64::MAX).await;
+            let mut changed = core::pin::pin!(self.inner.device.transmit_space_changed(space));
+            let mut progress = core::pin::pin!(self.wait_for_tcp_progress(wait, u64::MAX));
+            core::future::poll_fn(|cx| {
+                if changed.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(());
+                }
+                progress.as_mut().poll(cx)
+            })
+            .await;
         }
     }
 

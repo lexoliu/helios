@@ -21,6 +21,7 @@
 
 use core::future::Future;
 
+use helios_hal::dma::DmaSpaceMark;
 use helios_hal::io::IoError;
 use helios_kernel::{InterfaceEventMark, NetworkDevice, PacketBuffer, RxFrame};
 
@@ -41,8 +42,21 @@ impl NetworkDevice for HostedNetworkDevice {
         match *self {}
     }
 
-    fn transmit_payload_ready(&self) -> impl Future<Output = Result<(), IoError>> + Send + '_ {
+    fn want_transmit_space(&self) -> DmaSpaceMark {
+        match *self {}
+    }
+
+    fn transmit_space_mark(&self) -> DmaSpaceMark {
+        match *self {}
+    }
+
+    fn transmit_space_changed(&self, mark: DmaSpaceMark) -> impl Future<Output = ()> + Send + '_ {
+        let _ = mark;
         core::future::ready(match *self {})
+    }
+
+    fn transmit_short_of_space(&self) -> bool {
+        match *self {}
     }
 
     fn mac_address(&self) -> [u8; 6] {

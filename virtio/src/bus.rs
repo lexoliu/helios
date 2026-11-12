@@ -1,8 +1,9 @@
 use alloc::alloc::{alloc_zeroed, dealloc};
 use core::alloc::Layout;
+use core::future::Future;
 use core::ptr::NonNull;
 
-use helios_hal::dma::{DeviceAddress, DmaAddressing, DmaBuffer, DmaError, DmaMemory};
+use helios_hal::dma::{DeviceAddress, DmaAddressing, DmaBuffer, DmaError, DmaMemory, DmaSpaceMark};
 use helios_hal::io::{IoError, IoResult};
 use helios_hal::iommu::{DmaAccess, DmaTranslation};
 use helios_hal::mmio;
@@ -146,9 +147,20 @@ impl DmaMemory for IdentityDmaPool {
     }
 
     /// Heap memory is never being replenished: an allocation either
-    /// succeeds or is refused for good.
-    async fn replenished(&self) -> Result<(), DmaError> {
-        Ok(())
+    /// succeeds or is refused for good, so there is no space to wait for
+    /// and a wait resolves at once.
+    fn want_space(&self) -> DmaSpaceMark {
+        DmaSpaceMark::new(0)
+    }
+
+    async fn space_changed(&self, _mark: DmaSpaceMark) {}
+
+    fn short_of_space(&self) -> bool {
+        false
+    }
+
+    fn space_mark(&self) -> DmaSpaceMark {
+        DmaSpaceMark::new(0)
     }
 
     fn device_range(&self, bytes: &[u8]) -> Result<DeviceAddress, DmaError> {
@@ -199,9 +211,20 @@ impl DmaMemory for OffsetDmaPool {
     }
 
     /// Heap memory is never being replenished: an allocation either
-    /// succeeds or is refused for good.
-    async fn replenished(&self) -> Result<(), DmaError> {
-        Ok(())
+    /// succeeds or is refused for good, so there is no space to wait for
+    /// and a wait resolves at once.
+    fn want_space(&self) -> DmaSpaceMark {
+        DmaSpaceMark::new(0)
+    }
+
+    async fn space_changed(&self, _mark: DmaSpaceMark) {}
+
+    fn short_of_space(&self) -> bool {
+        false
+    }
+
+    fn space_mark(&self) -> DmaSpaceMark {
+        DmaSpaceMark::new(0)
     }
 
     /// The device sees physical addresses, so a run named by one is
@@ -309,8 +332,20 @@ impl<P: DmaMemory> DmaMemory for PlatformDmaPool<P> {
         self.translated(self.inner.allocate(layout, access)?)
     }
 
-    async fn replenished(&self) -> Result<(), DmaError> {
-        self.inner.replenished().await
+    fn want_space(&self) -> DmaSpaceMark {
+        self.inner.want_space()
+    }
+
+    fn space_changed(&self, mark: DmaSpaceMark) -> impl Future<Output = ()> + Send + '_ {
+        self.inner.space_changed(mark)
+    }
+
+    fn short_of_space(&self) -> bool {
+        self.inner.short_of_space()
+    }
+
+    fn space_mark(&self) -> DmaSpaceMark {
+        self.inner.space_mark()
     }
 
     /// The whole slice has to sit inside one window of the translation.

@@ -15,7 +15,7 @@ use core::cell::UnsafeCell;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use helios_hal::dma::{DeviceAddress, DmaAddressing, DmaBuffer, DmaError, DmaMemory};
+use helios_hal::dma::{DeviceAddress, DmaAddressing, DmaBuffer, DmaError, DmaMemory, DmaSpaceMark};
 use helios_hal::io::{IoError, IoResult};
 use helios_hal::iommu::DmaAccess;
 use spin::Mutex;
@@ -716,8 +716,18 @@ impl DmaMemory for WindowDmaPool {
         self.carve(layout, access, Lifetime::PerRequest)
     }
 
-    async fn replenished(&self) -> Result<(), DmaError> {
-        Ok(())
+    fn want_space(&self) -> DmaSpaceMark {
+        DmaSpaceMark::new(0)
+    }
+
+    async fn space_changed(&self, _mark: DmaSpaceMark) {}
+
+    fn short_of_space(&self) -> bool {
+        false
+    }
+
+    fn space_mark(&self) -> DmaSpaceMark {
+        DmaSpaceMark::new(0)
     }
 
     /// Arena memory translates into the window, and a slice that starts
@@ -933,8 +943,18 @@ impl DmaMemory for ConfinedDmaPool {
         self.carve(layout, access, Lifetime::PerRequest)
     }
 
-    async fn replenished(&self) -> Result<(), DmaError> {
-        Ok(())
+    fn want_space(&self) -> DmaSpaceMark {
+        DmaSpaceMark::new(0)
+    }
+
+    async fn space_changed(&self, _mark: DmaSpaceMark) {}
+
+    fn short_of_space(&self) -> bool {
+        false
+    }
+
+    fn space_mark(&self) -> DmaSpaceMark {
+        DmaSpaceMark::new(0)
     }
 
     fn device_range(&self, bytes: &[u8]) -> Result<DeviceAddress, DmaError> {

@@ -33,7 +33,7 @@ use core::ops::Range;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crossbeam_utils::CachePadded;
 
-use helios_hal::dma::{DmaBuffer, DmaMemory};
+use helios_hal::dma::{DmaBuffer, DmaMemory, DmaSpaceMark};
 use helios_hal::io::{IoError, IoResult};
 use helios_hal::iommu::DmaAccess;
 use helios_netstack::{
@@ -2201,9 +2201,9 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
     /// `Bytes::from_owner`.
     ///
     /// The payload lives for one write and is read, never written, by the
-    /// device. A refusal that clears with time is
-    /// [`IoError::Replenishing`], which
-    /// [`VirtioNetDevice::transmit_payload_ready`] resolves.
+    /// device. A refusal, [`IoError::Replenishing`] or
+    /// [`IoError::Exhausted`], is waited out through
+    /// [`VirtioNetDevice::want_transmit_space`].
     pub fn transmit_payload(&self, bytes: usize) -> IoResult<TransportBuffer<T>> {
         let layout =
             Layout::from_size_align(bytes, PAYLOAD_ALIGNMENT).map_err(|_| IoError::OutOfBounds)?;
@@ -2214,11 +2214,28 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             .allocate(layout, DmaAccess::READ)?)
     }
 
-    /// Resolves once [`VirtioNetDevice::transmit_payload`] may succeed
-    /// after it answered [`IoError::Replenishing`], or with the reason it
-    /// will not.
-    pub async fn transmit_payload_ready(&self) -> IoResult<()> {
-        Ok(self.transport.bus().dma().replenished().await?)
+    /// The bus memory's [`DmaMemory::want_space`], for a caller whose
+    /// [`VirtioNetDevice::transmit_payload`] was refused.
+    pub fn want_transmit_space(&self) -> DmaSpaceMark {
+        self.transport.bus().dma().want_space()
+    }
+
+    /// The bus memory's [`DmaMemory::space_mark`].
+    pub fn transmit_space_mark(&self) -> DmaSpaceMark {
+        self.transport.bus().dma().space_mark()
+    }
+
+    /// The bus memory's [`DmaMemory::space_changed`].
+    pub fn transmit_space_changed(
+        &self,
+        mark: DmaSpaceMark,
+    ) -> impl Future<Output = ()> + Send + '_ {
+        self.transport.bus().dma().space_changed(mark)
+    }
+
+    /// The bus memory's [`DmaMemory::short_of_space`].
+    pub fn transmit_short_of_space(&self) -> bool {
+        self.transport.bus().dma().short_of_space()
     }
 
     /// Immediate zero-copy TX: headers are copied into the descriptor

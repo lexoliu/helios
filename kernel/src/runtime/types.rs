@@ -886,8 +886,11 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
     /// A piece is drawn only once the one before it is queued, so a lazy
     /// iterator ([`TcpPayloadPieces`]) holds one piece of transmit memory
     /// beyond the send queue at a time. The timeout covers the whole
-    /// write, not each piece; the first piece that fails to allocate ends
-    /// the write with its error.
+    /// write, not each piece. A piece refused for want of transmit memory
+    /// is not an error of the write: the write is held back, as it is by
+    /// a full send queue, and the same piece is drawn again once memory
+    /// may be available. It ends with the stream's close error or its
+    /// timeout; any other piece failure ends it at once.
     fn tcp_write_all<'a, Pieces>(
         &'a self,
         stream: Self::TcpStream,
