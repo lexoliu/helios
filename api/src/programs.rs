@@ -192,6 +192,14 @@ impl Child {
         self.inner.stdin(data)
     }
 
+    /// Bytes of the user pool the child's memory holds right now; a
+    /// swapped-out page does not count, and an exited child, or any child
+    /// on the hosted backend, answers 0. A snapshot, possibly stale by the
+    /// time it is read.
+    pub fn resident_bytes(&self) -> u64 {
+        self.inner.resident_bytes()
+    }
+
     /// Await child completion.
     pub async fn wait(self) -> Result<ExitStatus, SpawnError> {
         self.inner.wait().await

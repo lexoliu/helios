@@ -20,7 +20,7 @@ use crate::io::{ByteReader, ByteWriter};
 use crate::wasmtime_adapter::component_host::{StoreData, deliver_kill};
 use crate::{
     ComponentHostNetwork, ComponentRuntimeState, ComponentStoreData, HostFileSystem,
-    KernelHeapHeadroom, MemoryPool, OomKillOutcome, ProgramOutOfMemory,
+    KernelHeapHeadroom, MemoryPool, OomKillOutcome, ProgramOutOfMemory, UserResidency,
     allow_instance_resource_growth, heap_stats, monotonic_nanos, user_heap_stats,
 };
 
@@ -160,11 +160,14 @@ where
             balloon.request_deflate();
         }
         let requester = self.instance().id();
+        // Before the registry's lock, never under it: see `UserResidency`.
+        let residency = user_residency();
         let decision = self.instance_registry.condemn_for_oom(
             requester,
             pool,
             requested_bytes as u64,
             monotonic_nanos(&self.cpu),
+            &residency,
         );
         let condemned = decision.condemned;
         match decision.outcome {
@@ -178,6 +181,7 @@ where
                 victim_id = ?victim.id,
                 victim_name = %victim.name,
                 victim_memory_bytes = victim.memory_bytes,
+                victim_user_bytes = victim.user_bytes,
                 victim_kernel_bytes = victim.kernel_bytes,
                 victim_policy = ?victim.policy,
                 score = victim.score,
@@ -206,6 +210,40 @@ where
                 "OOM killer found no eligible victim — requester takes the grow failure"
             ),
         }
+    }
+}
+
+/// What each instance holds of the user pool, for an OOM or kill
+/// decision about to be made against the instance registry.
+///
+/// On bare metal every page the runtime commits for an instance comes
+/// out of the installed address space, so that is what answers. Under
+/// `wasmtime-host` the runtime's memories are host allocations the user
+/// pool never served: no instance holds any of the pool, and no kill
+/// gives any of it back.
+pub(crate) fn user_residency() -> UserResidency {
+    #[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]
+    {
+        UserResidency::of_installed_address_space()
+    }
+    #[cfg(not(all(target_os = "none", feature = "wasmtime-bare-metal")))]
+    {
+        UserResidency::default()
+    }
+}
+
+/// What `child` holds of the user pool right now: the same account as
+/// [`user_residency`], asked for one owner, with the same answer under
+/// `wasmtime-host`.
+pub(crate) fn child_resident_bytes(child: &crate::ChildHandle) -> u64 {
+    #[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]
+    {
+        child.resident_bytes(crate::ResidencyVmHooks::installed())
+    }
+    #[cfg(not(all(target_os = "none", feature = "wasmtime-bare-metal")))]
+    {
+        let _ = child;
+        0
     }
 }
 

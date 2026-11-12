@@ -9,6 +9,7 @@ pub mod debugger {
                 "helios:system/programs.[method]child.stdin": store | trappable,
                 "helios:system/programs.[method]child.stdout": store | trappable,
                 "helios:system/programs.[method]child.stderr": store | trappable,
+                "helios:system/programs.[method]child.resident-bytes": store | trappable,
                 default: async | store | trappable
             },
             exports: { default: async },
@@ -39,6 +40,7 @@ pub mod program {
                 "helios:system/programs.[method]child.stdin": store | trappable,
                 "helios:system/programs.[method]child.stdout": store | trappable,
                 "helios:system/programs.[method]child.stderr": store | trappable,
+                "helios:system/programs.[method]child.resident-bytes": store | trappable,
                 default: async | store | trappable
             },
             exports: { default: async },

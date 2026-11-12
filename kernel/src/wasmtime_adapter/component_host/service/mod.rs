@@ -442,6 +442,14 @@ impl ChildHandle {
         self.exit.take()
     }
 
+    /// Bytes of the child's user memory a frame currently backs,
+    /// through the address space `hooks` name: the account the OOM
+    /// killer ranks owners by. A child that has exited owns nothing, so
+    /// it answers 0.
+    pub fn resident_bytes(&self, hooks: &crate::ResidencyVmHooks) -> u64 {
+        hooks.bytes_of_owner(crate::MemoryOwner::new(self.instance_id.raw()))
+    }
+
     /// Await child exit. Consumes the handle.
     pub async fn wait(mut self) -> Result<ChildExit, ProgramExecError> {
         match self.exit.take() {
@@ -2514,6 +2522,30 @@ mod tests {
     type TestDescriptorTable = Preview1DescriptorTable<TestNet>;
     type TestSpawnFdSnapshot = WasixSpawnFdSnapshot<TestNet>;
     type TestSocketDescriptor = WasixSocketDescriptor<TestNet>;
+
+    /// A hook table whose only live entry reports `owner` pages of 4 KiB,
+    /// so the figure shows which owner the handle asked about.
+    const OWNER_SCALED_HOOKS: crate::ResidencyVmHooks = crate::ResidencyVmHooks {
+        user_residency: || unreachable!("resident-bytes never walks every owner"),
+        owner_resident_bytes: |owner| owner * 4096,
+    };
+
+    fn test_child(instance: u64) -> ChildHandle {
+        ChildHandle {
+            instance_id: crate::InstanceId::from_raw(instance),
+            signal_state: WasixSignalState::new(),
+            stdin: None,
+            stdout: None,
+            stderr: None,
+            exit: None,
+        }
+    }
+
+    #[test]
+    fn a_child_reports_the_resident_bytes_of_its_own_instance() {
+        assert_eq!(test_child(7).resident_bytes(&OWNER_SCALED_HOOKS), 7 * 4096);
+        assert_eq!(test_child(0).resident_bytes(&OWNER_SCALED_HOOKS), 0);
+    }
 
     #[test]
     fn preview1_program_linked_imports_match_manifest() {
