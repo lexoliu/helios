@@ -349,7 +349,7 @@ pub(super) fn fill_random(
     memory: &SharedMemory,
     entropy: &Mutex<crate::EntropyPool>,
     root: &crate::RootEntropy,
-    ptr: u32,
+    ptr: GuestAddress,
     len: u32,
 ) -> i32 {
     let mut bytes = alloc::vec![0_u8; len as usize];
@@ -357,35 +357,39 @@ pub(super) fn fill_random(
     write_shared_memory(memory, ptr, &bytes).map_or(p1::errno::FAULT, |_| p1::errno::SUCCESS)
 }
 
-pub(super) fn try_read_u32(memory: &SharedMemory, ptr: u32) -> Result<u32, ProgramExecError> {
+pub(super) fn try_read_u32(
+    memory: &SharedMemory,
+    ptr: GuestAddress,
+) -> Result<u32, ProgramExecError> {
     let bytes = read_shared_memory(memory, ptr, 4)?;
     Ok(u32::from_le_bytes(bytes.try_into().unwrap_or_else(|_| {
         panic!("u32 read must return 4 bytes")
     })))
 }
 
-pub(super) fn write_u32(memory: &SharedMemory, ptr: u32, value: u32) -> i32 {
+pub(super) fn write_u32(memory: &SharedMemory, ptr: GuestAddress, value: u32) -> i32 {
     write_shared_memory(memory, ptr, &value.to_le_bytes())
         .map_or(p1::errno::FAULT, |_| p1::errno::SUCCESS)
 }
 
-pub(super) fn write_u64(memory: &SharedMemory, ptr: u32, value: u64) -> i32 {
+pub(super) fn write_u64(memory: &SharedMemory, ptr: GuestAddress, value: u64) -> i32 {
     write_shared_memory(memory, ptr, &value.to_le_bytes())
         .map_or(p1::errno::FAULT, |_| p1::errno::SUCCESS)
 }
 
 pub(super) fn read_shared_memory(
     memory: &SharedMemory,
-    ptr: u32,
+    ptr: GuestAddress,
     len: u32,
 ) -> Result<Vec<u8>, ProgramExecError> {
     let data = memory.data();
-    let start = ptr as usize;
-    let len = len as usize;
-    let end = start.checked_add(len).ok_or(ProgramExecError {
+    let overflow = || ProgramExecError {
         kind: ProgramExecErrorKind::InvalidBinary,
         detail: ProgramExecErrorDetail::GuestMemoryAccessOverflow,
-    })?;
+    };
+    let start = usize::try_from(ptr.raw()).map_err(|_| overflow())?;
+    let len = len as usize;
+    let end = start.checked_add(len).ok_or_else(overflow)?;
     if end > data.len() {
         tracing::error!(
             start,
@@ -410,15 +414,16 @@ pub(super) fn read_shared_memory(
 
 pub(super) fn write_shared_memory(
     memory: &SharedMemory,
-    ptr: u32,
+    ptr: GuestAddress,
     bytes: &[u8],
 ) -> Result<(), ProgramExecError> {
     let data = memory.data();
-    let start = ptr as usize;
-    let end = start.checked_add(bytes.len()).ok_or(ProgramExecError {
+    let overflow = || ProgramExecError {
         kind: ProgramExecErrorKind::InvalidBinary,
         detail: ProgramExecErrorDetail::GuestMemoryAccessOverflow,
-    })?;
+    };
+    let start = usize::try_from(ptr.raw()).map_err(|_| overflow())?;
+    let end = start.checked_add(bytes.len()).ok_or_else(overflow)?;
     if end > data.len() {
         tracing::error!(
             start,
