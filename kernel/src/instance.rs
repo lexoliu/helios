@@ -105,6 +105,9 @@ pub enum KillReason {
     SupervisorRestart,
     /// Asked for by an operator, through the inspector.
     Operator,
+    /// The request the instance exists to serve was abandoned by its
+    /// requester, so nothing is waiting for what it computes.
+    RequesterGone,
 }
 
 /// What came of a request to stop an instance.
@@ -123,12 +126,14 @@ const KILL_FLAG_NONE: u8 = 0;
 const KILL_FLAG_OOM: u8 = 1;
 const KILL_FLAG_SUPERVISOR: u8 = 2;
 const KILL_FLAG_OPERATOR: u8 = 3;
+const KILL_FLAG_REQUESTER_GONE: u8 = 4;
 
 const fn encode_kill_reason(reason: KillReason) -> u8 {
     match reason {
         KillReason::OutOfMemory => KILL_FLAG_OOM,
         KillReason::SupervisorRestart => KILL_FLAG_SUPERVISOR,
         KillReason::Operator => KILL_FLAG_OPERATOR,
+        KillReason::RequesterGone => KILL_FLAG_REQUESTER_GONE,
     }
 }
 
@@ -137,6 +142,7 @@ const fn decode_kill_flag(value: u8) -> Option<KillReason> {
         KILL_FLAG_OOM => Some(KillReason::OutOfMemory),
         KILL_FLAG_SUPERVISOR => Some(KillReason::SupervisorRestart),
         KILL_FLAG_OPERATOR => Some(KillReason::Operator),
+        KILL_FLAG_REQUESTER_GONE => Some(KillReason::RequesterGone),
         _ => None,
     }
 }

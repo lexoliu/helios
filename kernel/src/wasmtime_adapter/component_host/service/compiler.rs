@@ -1065,6 +1065,7 @@ mod tests {
             crate::KillReason::OutOfMemory,
             crate::KillReason::SupervisorRestart,
             crate::KillReason::Operator,
+            crate::KillReason::RequesterGone,
         ] {
             let fixture = CompileFixture::new();
             let (store, _drive) = fixture.open_store();

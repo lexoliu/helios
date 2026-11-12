@@ -26,6 +26,8 @@ pub(super) use surface::add_surface_to_linker;
 mod audio;
 pub use audio::PlaybackHandle;
 pub(super) use audio::add_audio_to_linker;
+mod compile_session;
+use compile_session::*;
 mod compiler;
 use compiler::*;
 mod exec;
@@ -127,6 +129,21 @@ struct CompilerCallInput<'a> {
     wasm: &'a Bytes,
     hint: AotCompileHint,
     profile: bool,
+}
+
+/// What one compile session takes from its requester: the compiler plugin's
+/// artifact, the input, and how to compile it.
+struct CompileJob {
+    compiler_payload: Bytes,
+    wasm: Bytes,
+    hint: AotCompileHint,
+    profile: bool,
+}
+
+/// How a compile's body ended, with the phase timestamps it filled in.
+struct CompileEnd {
+    result: Result<(Vec<u8>, CompilerThreadReports), ProgramExecError>,
+    phases: CompilerPhaseTimestamps,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1776,7 +1793,7 @@ where
         hint: AotCompileHint,
         profile: bool,
     ) -> Result<Vec<u8>, ProgramExecError> {
-        let mut phases = CompilerPhaseTimestamps {
+        let phases = CompilerPhaseTimestamps {
             processor: if profile {
                 helios_hal::cpu::current_processor().id()
             } else {
@@ -1790,17 +1807,91 @@ where
             ..CompilerPhaseTimestamps::default()
         };
         let compiler_artifact = self.read_compiler_plugin_artifact(exec_context)?;
-        let compiler_payload = trusted_bootfs_payload(&compiler_artifact)?;
-        let (payload, thread_reports) = self
-            .invoke_compiler_core_module(
-                exec_context,
-                compiler_payload,
-                wasm,
-                hint,
-                profile,
-                &mut phases,
-            )
-            .await?;
+        let job = CompileJob {
+            compiler_payload: trusted_bootfs_payload(&compiler_artifact)?,
+            wasm: wasm.clone(),
+            hint,
+            profile,
+        };
+        // The compile runs in a task of its own, whichever route asked for
+        // it, and this call holds only the receiving half of its reply: the
+        // compile outlives a requester that stops waiting, and stops itself
+        // when that happens (`run_compile_session`).
+        let (reply, artifact) = futures::channel::oneshot::channel();
+        exec_context.spawner.spawn_detached({
+            let service = self.clone();
+            let exec_context = exec_context.clone();
+            async move {
+                service
+                    .compile_session(&exec_context, job, phases, reply)
+                    .await;
+            }
+        });
+        match artifact.await {
+            Ok(result) => result,
+            Err(_) => Err(ProgramExecError {
+                kind: ProgramExecErrorKind::Internal,
+                detail: ProgramExecErrorDetail::CompileSessionEnded,
+            }),
+        }
+    }
+
+    /// The compile session task: waits for the compile slot, runs the compile
+    /// with the slot held until every worker is joined, condemns the compile
+    /// if its requester leaves, and replies with the signed artifact.
+    async fn compile_session(
+        &self,
+        exec_context: &ProgramExecContext<CpuImpl, Net, HostFs>,
+        job: CompileJob,
+        phases: CompilerPhaseTimestamps,
+        reply: futures::channel::oneshot::Sender<Result<Vec<u8>, ProgramExecError>>,
+    ) {
+        let profile = job.profile;
+        run_compile_session(
+            &self.inner.compile_slot,
+            reply,
+            || {
+                let started_at = exec_context
+                    .runtime_state
+                    .uptime_nanos(exec_context.cpu.now().ticks());
+                let instance = exec_context.instance_registry.register_with_policy(
+                    "compiler-plugin",
+                    started_at,
+                    crate::OomPolicy::KernelPlugin,
+                );
+                let condemn = {
+                    let registry = exec_context.instance_registry.clone();
+                    let interrupts = self.inner.engine.interrupts().clone();
+                    let cpu = exec_context.cpu.clone();
+                    let runtime_state = exec_context.runtime_state.clone();
+                    let id = instance.id();
+                    move || {
+                        condemn_abandoned_compile(
+                            &registry,
+                            &interrupts,
+                            id,
+                            runtime_state.uptime_nanos(cpu.now().ticks()),
+                        );
+                    }
+                };
+                (
+                    condemn,
+                    self.run_compile(exec_context, job, instance, phases),
+                )
+            },
+            |end| Self::sign_compiled(exec_context, profile, end),
+        )
+        .await;
+    }
+
+    /// Signs what a finished compile produced and reports its phases.
+    fn sign_compiled(
+        exec_context: &ProgramExecContext<CpuImpl, Net, HostFs>,
+        profile: bool,
+        end: CompileEnd,
+    ) -> Result<Vec<u8>, ProgramExecError> {
+        let CompileEnd { result, mut phases } = end;
+        let (payload, thread_reports) = result?;
         let signed =
             cwasm::sign_trusted_artifact_payload(&payload).map_err(map_artifact_trust_error)?;
         phases.signed_ns = if profile {
@@ -1826,23 +1917,39 @@ where
         Ok(signed)
     }
 
-    async fn invoke_compiler_core_module(
+    /// The compile proper, run with the compile slot held: the plugin's call,
+    /// then the join of every worker task the plugin spawned, so the slot is
+    /// never released while one still runs on the plugin's memory.
+    async fn run_compile(
         &self,
         exec_context: &ProgramExecContext<CpuImpl, Net, HostFs>,
-        compiler_payload: Bytes,
-        wasm: &Bytes,
-        hint: AotCompileHint,
-        profile: bool,
-        phases: &mut CompilerPhaseTimestamps,
-    ) -> Result<(Vec<u8>, CompilerThreadReports), ProgramExecError> {
-        let _compile_slot = self.inner.compile_slot.acquire().await;
+        job: CompileJob,
+        instance: crate::RegisteredInstance,
+        mut phases: CompilerPhaseTimestamps,
+    ) -> CompileEnd {
+        let CompileJob {
+            compiler_payload,
+            wasm,
+            hint,
+            profile,
+        } = job;
         phases.slot_acquired_ns = if profile {
             monotonic_nanos(&exec_context.cpu)
         } else {
             0
         };
         let result = self
-            .invoke_compiler_inner(exec_context, &compiler_payload, wasm, hint, profile, phases)
+            .invoke_compiler_inner(
+                exec_context,
+                &compiler_payload,
+                instance,
+                CompilerCallInput {
+                    wasm: &wasm,
+                    hint,
+                    profile,
+                },
+                &mut phases,
+            )
             .await;
         let thread_reports = self.await_compiler_thread_tasks().await;
         phases.tasks_joined_ns = if profile {
@@ -1865,7 +1972,10 @@ where
             );
             *self.inner.compiler_plugin.lock() = None;
         }
-        result.map(|payload| (payload, thread_reports))
+        CompileEnd {
+            result: result.map(|payload| (payload, thread_reports)),
+            phases,
+        }
     }
 
     async fn await_compiler_thread_tasks(&self) -> CompilerThreadReports {
@@ -1899,11 +2009,15 @@ where
         &self,
         exec_context: &ProgramExecContext<CpuImpl, Net, HostFs>,
         compiler_payload: &Bytes,
-        wasm: &Bytes,
-        hint: AotCompileHint,
-        profile: bool,
+        compiler_instance: crate::RegisteredInstance,
+        input: CompilerCallInput<'_>,
         phases: &mut CompilerPhaseTimestamps,
     ) -> Result<Vec<u8>, ProgramExecError> {
+        let CompilerCallInput {
+            wasm,
+            hint,
+            profile,
+        } = input;
         let (plugin, plugin_cached) = self
             .ensure_compiler_plugin(exec_context, compiler_payload)
             .await?;
@@ -1914,14 +2028,6 @@ where
             0
         };
         let engine = self.inner.engine.raw();
-        let started_at = exec_context
-            .runtime_state
-            .uptime_nanos(exec_context.cpu.now().ticks());
-        let compiler_instance = exec_context.instance_registry.register_with_policy(
-            "compiler-plugin",
-            started_at,
-            crate::OomPolicy::KernelPlugin,
-        );
         let store_data = CompilerCoreStore::new(CompilerCompileContext {
             cpu: exec_context.cpu.clone(),
             spawner: exec_context.spawner.clone(),
