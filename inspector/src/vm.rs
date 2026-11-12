@@ -7027,10 +7027,12 @@ mod tests {
     /// through, so only the x86 profile attaches it.
     #[test]
     fn only_the_x86_profile_attaches_the_vm_generation_id() {
-        assert!(X86_64_VM_PROFILE.vm_generation_id);
-        assert!(!AARCH64_VIRT_HVF_PROFILE.vm_generation_id);
-        assert!(!AARCH64_VIRT_TCG_PROFILE.vm_generation_id);
-        assert!(!RISCV64_VM_PROFILE.vm_generation_id);
+        const {
+            assert!(X86_64_VM_PROFILE.vm_generation_id);
+            assert!(!AARCH64_VIRT_HVF_PROFILE.vm_generation_id);
+            assert!(!AARCH64_VIRT_TCG_PROFILE.vm_generation_id);
+            assert!(!RISCV64_VM_PROFILE.vm_generation_id);
+        }
         assert_eq!(
             rendered(configure_vm_generation_id),
             ["-device", "vmgenid,guid=auto"]
