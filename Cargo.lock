@@ -1827,7 +1827,7 @@ dependencies = [
  "arrayvec",
  "fdt",
  "helios-hal",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
