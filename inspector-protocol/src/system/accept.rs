@@ -97,7 +97,7 @@ mod tests {
 
     use super::{Connection, Listener, SessionFault, serve_sessions};
     use crate::error::DispatchError;
-    use crate::system::server::Dispatcher;
+    use crate::system::server::{Dispatcher, Invocations};
     use crate::transport::Client;
     use crate::wire::{Frame, write_frame};
 
@@ -118,6 +118,7 @@ mod tests {
 
         async fn dispatch(
             &self,
+            _invocations: &Invocations,
             _instance: &str,
             _func: &str,
             _payload: &[u8],

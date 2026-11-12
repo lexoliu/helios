@@ -1760,7 +1760,10 @@ impl NetworkShard {
             .open_tcp_connect(local, remote, initial_sequence)
             .map_err(|error| match error {
                 StackError::AddressInUse => TcpConnectStartError::PortInUse,
-                _ => TcpConnectStartError::Failed(START_FAILED),
+                other => TcpConnectStartError::Failed(map_tcp_open_error(
+                    other,
+                    NetworkErrorDetail::TcpConnectStartFailed,
+                )),
             })?;
         // Applied before the connect loop drives the stack, so the SYN itself
         // already carries the caller's TTL.
@@ -1827,10 +1830,7 @@ impl NetworkShard {
                 },
                 backlog,
             )
-            .map_err(|_| TcpError {
-                kind: TcpErrorKind::Unavailable,
-                detail: NetworkErrorDetail::TcpListenStartFailed,
-            })?;
+            .map_err(|error| map_tcp_open_error(error, NetworkErrorDetail::TcpListenStartFailed))?;
         // Accepted children inherit the listener's hop limit inside the
         // stack, so their SYN-ACK carries it as well.
         self.stack
