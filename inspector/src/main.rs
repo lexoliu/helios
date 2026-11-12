@@ -231,6 +231,10 @@ pub(crate) enum Switch {
     Off,
 }
 
+/// The longest idle delay `--idle-after-ms` takes: the guest's policy holds
+/// the delay as whole nanoseconds in a `u64` (`swap-policy.idle-after`).
+pub(crate) const MAX_IDLE_AFTER_MS: u64 = u64::MAX / 1_000_000;
+
 /// Which of the guest's swap settings to change.
 ///
 /// A setting left out keeps the value in force, so the command with no
@@ -239,7 +243,11 @@ pub(crate) enum Switch {
 pub(crate) struct SwapCommand {
     /// How long, in milliseconds, an instance has to have been off every
     /// processor before moderate memory pressure evicts it.
-    #[arg(long = "idle-after-ms", value_name = "MS")]
+    #[arg(
+        long = "idle-after-ms",
+        value_name = "MS",
+        value_parser = clap::value_parser!(u64).range(..=MAX_IDLE_AFTER_MS)
+    )]
     pub(crate) idle_after_ms: Option<u64>,
 
     /// The share of the user pool the compressed store may take, 0 to 100.

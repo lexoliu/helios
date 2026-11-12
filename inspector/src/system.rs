@@ -166,7 +166,7 @@ impl SwapCommand {
             // The guest counts in nanoseconds, the flag in milliseconds.
             idle_after: self
                 .idle_after_ms
-                .map_or(current.idle_after, |ms| ms.saturating_mul(1_000_000)),
+                .map_or(current.idle_after, |ms| ms * 1_000_000),
             store_limit_percent: self
                 .store_limit_percent
                 .unwrap_or(current.store_limit_percent),
@@ -704,6 +704,21 @@ mod tests {
         assert_eq!(policy.store_limit_percent, 25);
         assert_eq!(policy.store_accept_percent, 80);
         assert_eq!(policy.accept_granules, 48);
+    }
+
+    #[test]
+    fn an_idle_delay_past_the_guests_nanosecond_clock_is_refused() {
+        let longest = crate::MAX_IDLE_AFTER_MS;
+        let command = swap_command(&["--idle-after-ms", &longest.to_string()]);
+        assert_eq!(
+            command.overlay(policy_in_force()).idle_after,
+            longest * 1_000_000
+        );
+        let too_long = (longest + 1).to_string();
+        assert!(
+            SwapLine::try_parse_from(["swap", "--idle-after-ms", too_long.as_str()]).is_err(),
+            "a delay past u64 nanoseconds must not parse"
+        );
     }
 
     #[test]
