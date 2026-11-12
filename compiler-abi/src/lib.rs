@@ -15,9 +15,9 @@
 //! its owner returns it through [`HELIOS_COMPILER_FREE`] with the layout it
 //! was allocated with.
 //!
-//! - The caller owns the three request buffers it allocates through
-//!   [`HELIOS_COMPILER_ALLOC`]: the wasm input, the target string and the
-//!   [`CompilerRequestHeader`]. It frees each after [`HELIOS_COMPILER_COMPILE`]
+//! - The caller owns the four request buffers it allocates through
+//!   [`HELIOS_COMPILER_ALLOC`]: the wasm input, the target string, the ISA
+//!   level name and the [`CompilerRequestHeader`]. It frees each after [`HELIOS_COMPILER_COMPILE`]
 //!   returns, on every path that leaves the plugin instance alive.
 //! - The plugin allocates the three response buffers: the
 //!   [`CompilerResponseHeader`], the precompiled output and the diagnostic.
@@ -34,7 +34,7 @@
 //! | Buffer | `len` | `align` |
 //! | --- | --- | --- |
 //! | request header | [`CompilerRequestHeader::SIZE`] | [`CompilerRequestHeader::ALIGN`] |
-//! | wasm input, target string | their byte length | 1 |
+//! | wasm input, target string, ISA level name | their byte length | 1 |
 //! | response header | [`CompilerResponseHeader::SIZE`] | [`CompilerResponseHeader::ALIGN`] |
 //! | precompiled output, diagnostic | the `len` field of the response header | 1 |
 //!
@@ -56,11 +56,13 @@
 
 use thiserror::Error;
 
-/// Version 3 carries `hint`, `status` and `output_kind` as plain `u32`,
-/// states the ownership and layout contract above, and retires hint value 0:
-/// the plugin compiles with Cranelift only, so `Balanced` and `Performance`
-/// are the only hints, and 0 is an [`UnknownDiscriminant`] like any other.
-pub const HELIOS_COMPILER_ABI_VERSION: u32 = 3;
+/// Version 2 carries `hint`, `status` and `output_kind` as plain `u32` and
+/// states the ownership and layout contract above. Version 3 adds the target's
+/// ISA level name to the request header as a fourth caller-owned request
+/// buffer. Version 4 retires hint value 0: the plugin compiles with Cranelift
+/// only, so `Balanced` and `Performance` are the only hints, and 0 is an
+/// [`UnknownDiscriminant`] like any other.
+pub const HELIOS_COMPILER_ABI_VERSION: u32 = 4;
 
 pub const HELIOS_COMPILER_ALLOC: &str = "helios_compiler_alloc";
 pub const HELIOS_COMPILER_FREE: &str = "helios_compiler_free";
@@ -236,6 +238,10 @@ wire_header! {
         wasm_len,
         target_ptr,
         target_len,
+        /// The name of the target's ISA level
+        /// (`helios_artifact::IsaLevel::name`) the artifact is compiled for.
+        isa_level_ptr,
+        isa_level_len,
         /// `HELIOS_COMPILER_REQUEST_*` bits.
         flags,
     }
@@ -327,8 +333,8 @@ mod tests {
     }
 
     #[test]
-    fn header_sizes_are_seven_words() {
-        assert_eq!(CompilerRequestHeader::SIZE, 28);
+    fn header_sizes_are_word_multiples() {
+        assert_eq!(CompilerRequestHeader::SIZE, 36);
         assert_eq!(CompilerResponseHeader::SIZE, 28);
         assert_eq!(CompilerRequestHeader::ALIGN, 4);
         assert_eq!(CompilerResponseHeader::ALIGN, 4);
@@ -343,11 +349,18 @@ mod tests {
             wasm_len: 12,
             target_ptr: 0x2000,
             target_len: 8,
+            isa_level_ptr: 0x3000,
+            isa_level_len: 6,
             flags: HELIOS_COMPILER_REQUEST_PROFILE,
         };
         let bytes = header.to_bytes();
         assert_eq!(&bytes[..4], &3_u32.to_le_bytes());
         assert_eq!(&bytes[4..8], &1_u32.to_le_bytes());
+        assert_eq!(&bytes[24..28], &0x3000_u32.to_le_bytes());
+        assert_eq!(
+            &bytes[32..36],
+            &HELIOS_COMPILER_REQUEST_PROFILE.to_le_bytes()
+        );
         assert_eq!(CompilerRequestHeader::from_bytes(&bytes), header);
     }
 

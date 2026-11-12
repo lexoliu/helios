@@ -46,6 +46,7 @@ use core::arch::global_asm;
 use core::arch::x86_64::{__cpuid, __cpuid_count, _rdrand64_step, _rdtsc};
 use core::ops::Range;
 use core::sync::atomic::{AtomicU8, Ordering, compiler_fence};
+use helios_artifact::{ProbeAnswers, cwasm_target_isa_levels};
 use helios_hal::boot::{BootMemoryMap, BootReservedRanges, usable_region_segments};
 use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase, TimerInterrupt, current_processor};
 use helios_hal::critical_section::ProcessorIdentity;
@@ -228,7 +229,13 @@ fn x86_kernel_main() -> ! {
     let timebase = Timebase::new(detect_tsc_frequency_hz());
     let tsc_base = read_tsc();
     let payload = helios_kernel::BootPayload::from_boot_modules(&handoff.modules);
-    let debug_state = debug_state::RuntimeState::new(timebase, processor_count, 0, payload);
+    let debug_state = debug_state::RuntimeState::new(
+        timebase,
+        processor_count,
+        0,
+        payload,
+        helios_kernel::GuestIsa::for_build_target(Some(detect_x86_native_feature)),
+    );
     // Every processor's periodic timer samples the instruction it
     // interrupted while instruction sampling runs
     // (`smp::handle_local_timer_interrupt`).
@@ -1132,6 +1139,18 @@ extern "C" fn secondary_start_rust(
     // The same page-attribute table the bootstrap processor runs with,
     // before this processor can touch a write-combined mapping.
     memory_type::program_page_attribute_table();
+    // Guest code is compiled once for the ISA level the bootstrap processor
+    // satisfies and runs on any processor, so every processor must answer
+    // every level feature the same way. XCR0 is programmed, which the AVX
+    // answers depend on.
+    let isa_answers = probe_isa_answers();
+    assert_eq!(
+        isa_answers,
+        boot.isa_answers(),
+        "x86 processor with initial APIC ID {} answers the ISA level features differently from \
+         the bootstrap processor; Helios requires every processor to offer the same features",
+        __cpuid(1).ebx >> 24
+    );
     let runtime = unsafe { &*runtime };
     smp::activate_runtime(runtime);
     smp::current_runtime().attach_local_apic();
@@ -1155,6 +1174,14 @@ extern "C" fn secondary_start_rust(
         .unwrap_or_else(|| panic!("x86 secondary started before program service installation"));
     smp::current_runtime().install_program_service(program_service);
     run_current_processor(cpu, kernel, debug_state)
+}
+
+/// What `detect_x86_native_feature` answers for every ISA level feature on
+/// the executing processor.
+pub(crate) fn probe_isa_answers() -> ProbeAnswers {
+    cwasm_target_isa_levels("x86_64-unknown-none")
+        .probe_answers(detect_x86_native_feature)
+        .unwrap_or_else(|error| panic!("x86 native feature probe is incomplete: {error}"))
 }
 
 fn detect_x86_native_feature(feature: &str) -> Option<bool> {

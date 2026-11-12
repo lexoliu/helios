@@ -12,6 +12,8 @@ wasmparser = "0.245.0"
 wasmtime = { path = "../../wasmtime/crates/wasmtime", default-features = false, features = ["all-arch", "component-model", "component-model-async-compile", "cranelift", "gc-null", "parallel-compilation", "std", "threads"] }
 
 [dev-dependencies]
+cranelift-codegen = { path = "../../wasmtime/cranelift/codegen", features = ["disas", "timing", "x86"] }
+cranelift-reader = { path = "../../wasmtime/cranelift/reader" }
 wasmtime = { path = "../../wasmtime/crates/wasmtime", default-features = false, features = ["all-arch", "component-model", "component-model-async", "component-model-async-compile", "cranelift", "gc-null", "parallel-compilation", "runtime", "std", "threads"] }
 
 [lints]

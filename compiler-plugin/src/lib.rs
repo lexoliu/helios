@@ -2,6 +2,7 @@ use std::sync::Once;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
+use helios_artifact::CwasmTarget;
 use helios_compiler_abi::{
     CompileHint, CompilerRequestHeader, CompilerResponseHeader, CompilerStatus,
     HELIOS_COMPILER_ABI_VERSION, HELIOS_COMPILER_REQUEST_PROFILE, OutputKind,
@@ -114,7 +115,7 @@ pub unsafe extern "C" fn helios_compiler_compile(request_ptr: u32, request_len: 
 
 struct CompileRequest<'a> {
     wasm: &'a [u8],
-    target: &'a str,
+    target: CwasmTarget<'a>,
     hint: AotCompileHint,
     profile: bool,
 }
@@ -141,6 +142,10 @@ unsafe fn read_request<'a>(
     let target = unsafe { slice_from_abi(header.target_ptr, header.target_len) };
     let target = core::str::from_utf8(target)
         .map_err(|error| format!("compiler target triple is not UTF-8: {error}"))?;
+    let isa_level = unsafe { slice_from_abi(header.isa_level_ptr, header.isa_level_len) };
+    let isa_level = core::str::from_utf8(isa_level)
+        .map_err(|error| format!("compiler ISA level is not UTF-8: {error}"))?;
+    let target = compile_target(target, isa_level)?;
     let hint = match CompileHint::try_from(header.hint).map_err(|error| error.to_string())? {
         CompileHint::Balanced => AotCompileHint::Balanced,
         CompileHint::Performance => AotCompileHint::Performance,
@@ -151,6 +156,13 @@ unsafe fn read_request<'a>(
         hint,
         profile: header.flags & HELIOS_COMPILER_REQUEST_PROFILE != 0,
     })
+}
+
+/// Names the level `isa_level` of `triple`'s chain; an unknown level's
+/// diagnostic lists the levels the target defines.
+fn compile_target<'a>(triple: &'a str, isa_level: &str) -> Result<CwasmTarget<'a>, String> {
+    CwasmTarget::new(triple, isa_level)
+        .map_err(|error| format!("invalid compiler ISA level for target {triple}: {error}"))
 }
 
 /// The bytes a `(ptr, len)` pair of the compiler ABI names; a zero length is
@@ -173,10 +185,10 @@ fn compile(request: CompileRequest<'_>) -> u32 {
     let started = request.profile.then(Instant::now);
     let memory_pages_before = request.profile.then(compiler_memory_pages);
     let result = if request.profile {
-        precompile_artifact_profiled(request.wasm, request.target, request.hint)
+        precompile_artifact_profiled(request.wasm, &request.target, request.hint)
             .map(|(artifact, profile)| (artifact, Some(profile)))
     } else {
-        precompile_artifact(request.wasm, request.target, request.hint)
+        precompile_artifact(request.wasm, &request.target, request.hint)
             .map(|artifact| (artifact, None))
     };
     match result {
@@ -346,4 +358,27 @@ fn hand_over(bytes: Vec<u8>) -> (u32, u32) {
     add_outstanding(len);
     let ptr = Box::into_raw(boxed) as *mut u8;
     (ptr as u32, len as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compile_target;
+
+    #[test]
+    fn an_unknown_isa_level_is_rejected_naming_the_defined_levels() {
+        let error = compile_target("x86_64-unknown-none", "x86-64-v9")
+            .expect_err("a level the target does not define is refused");
+        assert!(error.contains("x86-64-v9"), "{error}");
+        assert!(
+            error.contains("x86-64-v3, x86-64-v4, x86-64-v4+vbmi+bitalg"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_defined_isa_level_is_accepted() {
+        let target = compile_target("aarch64-unknown-none", "aarch64-lse-fp16-dotprod")
+            .expect("a defined level is accepted");
+        assert_eq!(target.level().name(), "aarch64-lse-fp16-dotprod");
+    }
 }

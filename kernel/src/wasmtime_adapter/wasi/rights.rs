@@ -135,6 +135,58 @@ impl<'d, K, R> Granted<'d, K, R> {
     }
 }
 
+/// Proof of both bases of a hard link, checked together: the source base
+/// may be read and the destination base may have its entries changed.
+///
+/// A link makes the source's object reachable through the destination, so
+/// it is a second name with the destination's rights. A destination that
+/// can write must therefore not be fed by a source the caller could not
+/// have opened for writing; only [`Granted::link_into`] makes one.
+pub(crate) struct LinkGrant<'s, 'd> {
+    source: Granted<'s, Directory, Read>,
+    destination: Granted<'d, Directory, Mutate>,
+}
+
+impl<'s> Granted<'s, Directory, Read> {
+    /// Pairs this source base with a destination base. Refuses with
+    /// `NotPermitted` when the destination holds `WRITE` and the source
+    /// does not: the link would otherwise make a file writable that the
+    /// caller could only read.
+    pub(crate) fn link_into<'d>(
+        self,
+        destination: Granted<'d, Directory, Mutate>,
+    ) -> FsOpResult<LinkGrant<'s, 'd>> {
+        let writable = destination
+            .descriptor()
+            .flags
+            .contains(fs_types::DescriptorFlags::WRITE);
+        if writable
+            && !self
+                .descriptor()
+                .flags
+                .contains(fs_types::DescriptorFlags::WRITE)
+        {
+            return Err(fs_types::ErrorCode::NotPermitted);
+        }
+        Ok(LinkGrant {
+            source: self,
+            destination,
+        })
+    }
+}
+
+impl<'s, 'd> LinkGrant<'s, 'd> {
+    /// The source base.
+    pub(crate) fn source(&self) -> &'s FsDescriptor {
+        self.source.descriptor()
+    }
+
+    /// The destination base.
+    pub(crate) fn destination(&self) -> &'d FsDescriptor {
+        self.destination.descriptor()
+    }
+}
+
 impl FsDescriptor {
     /// Proves this descriptor names a `K` and holds `R`: the kind is tested
     /// first, then the right, and each refusal is the one its marker names.
