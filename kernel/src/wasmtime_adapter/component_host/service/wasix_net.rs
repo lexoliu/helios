@@ -2387,7 +2387,7 @@ where
     HostFs: crate::HostFileSystem,
 {
     let namespace = p1_namespace(caller);
-    wasi_fs::read(&namespace, file, offset, count)
+    wasi_fs::read(&namespace, p1_grant(file)?, offset, count)
         .await
         .map_err(p1_errno_from_fs)
 }

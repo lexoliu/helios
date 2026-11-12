@@ -43,6 +43,22 @@ pub(crate) const WAKE_SGI: IntId = IntId::sgi(0);
 /// settings give each interrupt the highest non-secure priority.
 const PRIORITY_MASK_ALL: u8 = 0xff;
 
+/// The priority of every interrupt but the wake SGI: the timer PPI and
+/// each device interrupt are given this, and the wake SGI keeps the
+/// highest non-secure priority every interrupt starts at
+/// ([`arm_gic::gicv3::HIGHEST_NS_PRIORITY`], 0x80). The two differ in
+/// bit 5, which every implementation carries (a GICv3 implements at
+/// least the top four bits of a non-secure priority), so a priority
+/// mask between them separates the wake from everything else.
+const DEVICE_PRIORITY: u8 = 0xa0;
+
+/// The priority mask that lets only the wake SGI through. The CPU
+/// interface signals an interrupt only when its priority is numerically
+/// below the mask, so a mask equal to [`DEVICE_PRIORITY`] passes the
+/// wake SGI at 0x80 and nothing at [`DEVICE_PRIORITY`] or below it in
+/// urgency.
+const WAKE_ONLY_PRIORITY_MASK: u8 = DEVICE_PRIORITY;
+
 /// Affinity bits of `MPIDR_EL1`: Aff0..Aff2 in the low word and Aff3 in
 /// bits 32..40. `GICR_TYPER.Affinity` is reported in the same shape.
 const MPIDR_AFFINITY_MASK: u64 = 0x0000_00ff_00ff_ffff;
@@ -120,6 +136,13 @@ impl Gic {
             gic.init_cpu(index);
             GicCpuInterface::enable_group1(true);
             GicCpuInterface::set_priority_mask(PRIORITY_MASK_ALL);
+            gic.set_interrupt_priority(VIRTUAL_TIMER_PPI, Some(index), DEVICE_PRIORITY)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "AArch64 GIC could not set the priority of {VIRTUAL_TIMER_PPI:?} on \
+                         redistributor {index}: {error}"
+                    )
+                });
             for intid in [VIRTUAL_TIMER_PPI, WAKE_SGI] {
                 gic.enable_interrupt(intid, Some(index), true)
                     .unwrap_or_else(|error| {
@@ -137,6 +160,10 @@ impl Gic {
     /// enables it with the trigger mode the device tree declared.
     pub(crate) fn enable_device_interrupt(&self, intid: IntId, trigger: Trigger, mpidr: u64) {
         self.with_registers(|gic| {
+            gic.set_interrupt_priority(intid, None, DEVICE_PRIORITY)
+                .unwrap_or_else(|error| {
+                    panic!("AArch64 GIC could not set the priority of {intid:?}: {error}")
+                });
             gic.distributor()
                 .set_routing(intid, Some(mpidr & MPIDR_AFFINITY_MASK))
                 .unwrap_or_else(|error| panic!("AArch64 GIC could not route {intid:?}: {error}"));
@@ -197,6 +224,32 @@ pub(crate) fn send_wake(mpidr: u64) {
         SgiTargetGroup::CurrentGroup1,
     )
     .unwrap_or_else(|error| panic!("AArch64 GIC could not send the wake SGI: {error}"));
+}
+
+/// Lets only the wake SGI through the calling processor's CPU
+/// interface, and answers the mask it replaced.
+///
+/// Every other interrupt the distributor routes here stays pending in
+/// the GIC until [`restore_priority_mask`] lifts the mask. The mask is a
+/// register private to the running processor, so no lock is needed.
+pub(crate) fn raise_priority_mask_to_wake_only() -> u8 {
+    let previous = GicCpuInterface::get_priority_mask();
+    GicCpuInterface::set_priority_mask(WAKE_ONLY_PRIORITY_MASK);
+    // The mask has to be in force before the caller unmasks IRQ or waits.
+    // SAFETY: `isb` takes no operands and touches no memory.
+    unsafe {
+        core::arch::asm!("isb", options(nomem, nostack, preserves_flags));
+    }
+    previous
+}
+
+/// Puts back the mask [`raise_priority_mask_to_wake_only`] replaced.
+pub(crate) fn restore_priority_mask(previous: u8) {
+    GicCpuInterface::set_priority_mask(previous);
+    // SAFETY: `isb` takes no operands and touches no memory.
+    unsafe {
+        core::arch::asm!("isb", options(nomem, nostack, preserves_flags));
+    }
 }
 
 /// Acknowledges the highest priority pending interrupt, if any.

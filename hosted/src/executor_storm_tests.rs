@@ -69,6 +69,9 @@ fn processor_thread(
             let executor =
                 Executor::new(ProgressCounter::new(), machine.processor_count(), processor);
             let timer = executor.timer(cpu.clone());
+            // A deadline the executor arms fires its interrupt step on
+            // this thread, so the timer is installed as boot installs it.
+            cpu.install_timer(timer.clone());
             both_up.wait();
 
             if storm {

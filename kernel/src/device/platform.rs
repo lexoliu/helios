@@ -173,7 +173,7 @@ pub(crate) mod test_hooks {
     use alloc::alloc::{Layout, alloc_zeroed, dealloc};
     use alloc::vec::Vec;
     use core::cell::RefCell;
-    use helios_hal::device::{DeviceRegion, DmaPlacement};
+    use helios_hal::device::{DeviceRegion, DeviceRegionAttributes, DmaPlacement};
     use helios_hal::iommu::PhysicalRange;
     use helios_hal::pmm::PhysFrame;
     use helios_hal::vmm::{AddressSpaceError, PageFlags, VirtAddr, VirtRange};
@@ -184,7 +184,10 @@ pub(crate) mod test_hooks {
         Allocated(PhysicalRange),
         Freed(PhysicalRange),
         SubstituteMemory(VirtRange, PhysicalRange),
-        SubstituteDevice(VirtRange),
+        /// A device's own range shown at `VirtRange`, under the access
+        /// rules it was shown with: what decides the memory type the
+        /// page-table entries carry.
+        SubstituteDevice(VirtRange, DeviceRegionAttributes),
         Restore(VirtRange),
         Withdraw(VirtRange),
     }
@@ -291,7 +294,7 @@ pub(crate) mod test_hooks {
         if region.physical.bytes as usize != virt.byte_len {
             return Err(AddressSpaceError::Misaligned);
         }
-        record_shootdown(MappingChange::SubstituteDevice(virt));
+        record_shootdown(MappingChange::SubstituteDevice(virt, region.attributes));
         Ok(())
     }
 

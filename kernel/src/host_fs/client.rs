@@ -3615,6 +3615,84 @@ mod tests {
         assert_eq!(client.inner.fids.live_count(), 1, "only the new root fid");
     }
 
+    /// The reactions task with its host-share step over a real client,
+    /// and every other step doing nothing.
+    struct HostShareSteps {
+        client: HostFsClient<FakeTransport, ManualClockCpu>,
+    }
+
+    impl crate::machine::ReactionSteps for HostShareSteps {
+        fn reread_wall_clock(&mut self) -> impl Future<Output = ()> + '_ {
+            core::future::ready(())
+        }
+
+        fn reset_host_share(&mut self, restore: HostShareRestore) -> impl Future<Output = ()> + '_ {
+            self.client.after_machine_restore(restore)
+        }
+
+        fn revalidate_lease(&mut self) -> impl Future<Output = ()> + '_ {
+            core::future::ready(())
+        }
+
+        fn resynchronise_balloon(&mut self) -> impl Future<Output = ()> + '_ {
+            core::future::ready(())
+        }
+    }
+
+    /// The 9p device was reset: its server has forgotten the session and
+    /// every fid. Once the reset is recorded, the reactions task drops
+    /// the session, so the next operation sends `Tversion` and `Tattach`
+    /// and asks the server again rather than serving what was cached.
+    #[test]
+    fn a_reset_host_share_device_makes_the_next_operation_attach_again() {
+        use core::task::{Context, Poll, Waker};
+
+        use crate::machine::{MachineGeneration, ResetDevice, react_forever};
+
+        let Fixture {
+            client, transport, ..
+        } = fixture(P9_REQUESTED_MSIZE, FakeFault::default());
+        block_on(client.stat_path_impl("/alpha")).expect("stat before");
+        {
+            let log = transport.log();
+            assert_eq!((log.versions, log.attaches, log.getattrs), (1, 1, 1));
+        }
+
+        let generation = MachineGeneration::new(None);
+        let mut context = Context::from_waker(Waker::noop());
+        let mut reactions = pin!(react_forever(
+            &generation,
+            HostShareSteps {
+                client: client.clone(),
+            }
+        ));
+        assert_eq!(reactions.as_mut().poll(&mut context), Poll::Pending);
+        assert!(
+            client.inner.session.get().is_some(),
+            "nothing is dropped before a reset"
+        );
+
+        generation.record_device_reset(ResetDevice::HostShare);
+        assert_eq!(reactions.as_mut().poll(&mut context), Poll::Pending);
+        assert_eq!(
+            client.inner.session.get(),
+            None,
+            "the reactions task dropped the session"
+        );
+
+        block_on(client.stat_path_impl("/alpha")).expect("stat after");
+        let log = transport.log();
+        assert_eq!(
+            (log.versions, log.attaches),
+            (2, 2),
+            "the next operation sends Tversion and Tattach"
+        );
+        assert_eq!(
+            log.getattrs, 2,
+            "attributes cached before the reset are not served"
+        );
+    }
+
     #[test]
     fn a_restore_that_kept_the_server_flushes_the_cache_and_clunks_the_parked_fid() {
         let Fixture {
