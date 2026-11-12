@@ -138,11 +138,12 @@ jobs:
 
   # The collection a `profile_format` change spends in place of dev's
   # profile: the same workflow `bench-suite.yml` calls, on this run's
-  # commit, uploaded under the stable artifact name.
+  # commit, uploaded under the stable artifact name. `smoke-x86-64` is its
+  # only reader, so a run that skips that lane (a draft) skips this too.
   kernel-profile:
     name: kernel-profile
     needs: changes
-    if: needs.changes.outputs.profile_format == 'true'
+    if: needs.changes.outputs.profile_format == 'true' && contains(fromJSON(needs.changes.outputs.lanes), 'smoke-x86-64')
     permissions:
       contents: read
     uses: ./.github/workflows/kernel-profile.yml
