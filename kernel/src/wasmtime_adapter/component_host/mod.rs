@@ -61,6 +61,7 @@ const TRACING_INSTANCE: &str = "helios:system/tracing@0.1.0";
 const PROFILING_INSTANCE: &str = "helios:system/profiling@0.1.0";
 const INSTANCES_INSTANCE: &str = "helios:system/instances@0.1.0";
 const SNAPSHOT_INSTANCE: &str = "helios:system/snapshot@0.1.0";
+const SWAP_INSTANCE: &str = "helios:system/swap@0.1.0";
 /// The share of the machine's free memory the compiled-component cache
 /// may hold.
 ///
@@ -1810,6 +1811,7 @@ where
     service::add_gpu_to_linker(linker)?;
     service::add_audio_to_linker(linker)?;
     add_instances_to_linker(linker)?;
+    add_swap_to_linker(linker)?;
     add_snapshot_to_linker(linker)?;
     add_tracing_to_linker(linker)?;
     debugger_profiling::add_to_linker(linker)?;
@@ -3642,6 +3644,57 @@ where
         },))
     })?;
     Ok(())
+}
+
+fn add_swap_to_linker<CpuImpl, Net, HostFs>(
+    linker: &mut Linker<StoreData<CpuImpl, Net, HostFs>>,
+) -> wasmtime::Result<()>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    HostFs: crate::HostFileSystem,
+{
+    let mut instance = linker.instance(SWAP_INSTANCE)?;
+    instance.func_wrap(
+        "set-policy",
+        |caller, (policy,): (debugger_wit::stats::SwapPolicy,)| {
+            let outcome = match caller.data().runtime_state.swap() {
+                None => Err(debugger_wit::swap::PolicyError::Unavailable),
+                Some(swap) => swap
+                    .set_policy(convert_swap_policy(policy))
+                    .map_err(convert_swap_policy_error),
+            };
+            Ok((outcome,))
+        },
+    )?;
+    Ok(())
+}
+
+fn convert_swap_policy(policy: debugger_wit::stats::SwapPolicy) -> crate::SwapPolicy {
+    crate::SwapPolicy {
+        idle_after: core::time::Duration::from_nanos(policy.idle_after),
+        store_limit_percent: policy.store_limit_percent,
+        store_accept_percent: policy.store_accept_percent,
+        accept_granules: policy.accept_granules,
+        writeback: policy.writeback,
+    }
+}
+
+fn convert_swap_policy_error(error: crate::SwapPolicyError) -> debugger_wit::swap::PolicyError {
+    match error {
+        crate::SwapPolicyError::StoreLimitPercent(_) => {
+            debugger_wit::swap::PolicyError::StoreLimitPercent
+        }
+        crate::SwapPolicyError::StoreAcceptPercent(_) => {
+            debugger_wit::swap::PolicyError::StoreAcceptPercent
+        }
+        crate::SwapPolicyError::AcceptGranules(_) => {
+            debugger_wit::swap::PolicyError::AcceptGranules
+        }
+        crate::SwapPolicyError::IdleAfter(delay) => unreachable!(
+            "an idle delay of {delay:?} came from whole nanoseconds in a u64, which the clock holds"
+        ),
+    }
 }
 
 fn add_snapshot_to_linker<CpuImpl, Net, HostFs>(

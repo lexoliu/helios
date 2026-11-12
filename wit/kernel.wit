@@ -30,6 +30,7 @@ world debugger{
   import helios:system/sync@0.1.0;
   import helios:system/serial@0.1.0;
   import helios:system/instances@0.1.0;
+  import helios:system/swap@0.1.0;
   import helios:system/snapshot@0.1.0;
   import helios:system/display@0.1.0;
   import helios:system/input@0.1.0;
@@ -75,6 +76,7 @@ world remote-system {
   export helios:system/sync@0.1.0;
   export helios:system/serial@0.1.0;
   export helios:system/instances@0.1.0;
+  export helios:system/swap@0.1.0;
 }
 
 /// World a kernel plugin that drives one device outside the virtio

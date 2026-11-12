@@ -1059,6 +1059,11 @@ where
         assert!(installed, "swap was installed more than once");
     }
 
+    /// The machine's swap, if its backend brought one up.
+    pub fn swap(&self) -> Option<crate::SwapHandle> {
+        self.inner.swap.get().cloned()
+    }
+
     /// Publishes the machine's vsock link.
     ///
     /// Called from the backend that brought the device up, before any
