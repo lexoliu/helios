@@ -581,14 +581,13 @@ where
 /// each group by name, with the mount points inside it.
 pub(crate) async fn read_directory<HostFs>(
     namespace: &Namespace<HostFs>,
-    descriptor: &FsDescriptor,
+    directory: Granted<'_, Directory, Read>,
 ) -> FsOpResult<Vec<fs_types::DirectoryEntry>>
 where
     HostFs: crate::HostFileSystem,
 {
-    require_directory(descriptor)?;
     let mut entries: Vec<fs_types::DirectoryEntry> = namespace
-        .list(&descriptor.path)
+        .list(&directory.descriptor().path)
         .await
         .map_err(fs_error_code)?
         .into_iter()
@@ -686,18 +685,16 @@ where
 /// Links within one mount; across two, `cross-device`.
 pub(crate) async fn link_at<HostFs>(
     namespace: &Namespace<HostFs>,
-    source_base: &FsDescriptor,
+    link: LinkGrant<'_, '_>,
     source_path: &str,
-    destination_base: Granted<'_, Directory, Mutate>,
     destination_path: &str,
     now: u64,
 ) -> FsOpResult<()>
 where
     HostFs: crate::HostFileSystem,
 {
-    require_directory(source_base)?;
-    let source = child_path(source_base, source_path)?;
-    let destination = child_path(destination_base.descriptor(), destination_path)?;
+    let source = child_path(link.source(), source_path)?;
+    let destination = child_path(link.destination(), destination_path)?;
     namespace
         .link(&source, &destination, now)
         .await
@@ -1093,7 +1090,7 @@ async fn list_owned<HostFs>(
 where
     HostFs: crate::HostFileSystem,
 {
-    read_directory(&namespace, &descriptor).await
+    read_directory(&namespace, descriptor.grant()?).await
 }
 
 pub(super) fn directory_producer<HostFs>(
@@ -1558,9 +1555,8 @@ where
         })?;
         Ok(self::link_at(
             &namespace,
-            &source_base,
+            source_base.grant()?.link_into(destination_base.grant()?)?,
             &source_path,
-            destination_base.grant()?,
             &destination_path,
             now,
         )
