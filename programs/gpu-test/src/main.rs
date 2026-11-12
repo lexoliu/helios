@@ -1,8 +1,8 @@
 //! `gpu-test`: drives the machine's 3D engine and reports what it did.
 //!
 //! It is the guest side of the 3D path's acceptance evidence. It opens
-//! the engine, reads the device's capability sets, opens a two-ring
-//! virgl context, retires a fence on each ring, makes a host blob the
+//! the engine, reads the device's capability sets, opens a virgl
+//! context, retires a fence on its ring, makes a host blob the
 //! renderer allocates and a guest blob of its own pages, writes both
 //! and reads them back, and then starts a second copy of itself that
 //! opens the engine and retires a fence while this one still holds its
@@ -39,11 +39,14 @@ use thiserror::Error;
 /// renderer.
 const VIRGL_CAPSETS: [u32; 2] = [2, 1];
 
-/// The rings the context is opened with: ring 0, the CPU timeline, and
-/// one more, so a fence is retired on a ring of each kind.
-const RINGS: u8 = 2;
+/// The rings the context is opened with: ring 0 alone. A virgl context
+/// refuses a fence on any other ring (`vrend_decode_ctx_submit_fence` in
+/// virglrenderer's `src/vrend/vrend_decode.c`), and QEMU then never
+/// answers the command; the further rings are Venus's, bound to a device
+/// queue through the Venus protocol.
+const RINGS: u8 = 1;
 
-/// The fence every submission carries: the first point on each ring.
+/// The fence every submission carries: the first point on its ring.
 const FENCE: u64 = 1;
 
 /// The size of the command buffer and of both blobs: one page.

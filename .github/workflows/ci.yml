@@ -1609,8 +1609,8 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
-  # The 3D path against a real renderer: `gpu-test` opens a two-ring
-  # context, fences on both rings, maps a host blob and a guest blob,
+  # The 3D path against a real renderer: `gpu-test` opens a virgl
+  # context, retires a fence on it, maps a host blob and a guest blob,
   # and runs a second instance beside the first, on a `virtio-gpu-gl`
   # device with Venus whose host renders through lavapipe (#505).
   # Ubuntu 24.04's QEMU 8.2 has no Venus (it arrived in 9.2) and its
@@ -1754,6 +1754,9 @@ jobs:
         working-directory: helios
         run: cargo build -p helios-inspector
       - name: Run gpu-test against Venus
+        # The debug build and the boot take a few minutes; a fence the
+        # host never retires otherwise holds the step until the job's limit.
+        timeout-minutes: 20
         shell: bash
         working-directory: helios
         run: |
@@ -1778,10 +1781,9 @@ jobs:
           grep -Fqx gpu-ok venus-smoke.out
           # What the device negotiated, on the kernel's boot line.
           grep -aFq '3d=virgl blob=on context-init=on' "$runtime/debug-serial.log"
-          # Each step the program reports: both rings' fences, both
+          # Each step the program reports: the context's fence, both
           # blobs written and read back, and the second instance.
-          for line in 'gpu-test:opened' \
-              'gpu-test:fence ring=0' 'gpu-test:fence ring=1' \
+          for line in 'gpu-test:opened' 'gpu-test:fence ring=0' \
               'gpu-test:host-blob ok' 'gpu-test:guest-blob ok' \
               'gpu-test:instances=2'; do
             grep -Fq "$line" venus-smoke.out
@@ -1793,5 +1795,6 @@ jobs:
           name: smoke-x86-64-venus-runtime
           path: |
             smoke-runtime/*/*.log
+            helios/venus-smoke.out
           if-no-files-found: warn
           retention-days: 7
