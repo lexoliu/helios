@@ -441,13 +441,9 @@ impl DiskLayout {
         if capacity_blocks == 0 {
             return Err(CacheLayoutError::TooSmall);
         }
-        // A segment carries whole logical blocks, so a cache block takes
-        // as many segments as it takes pieces of that size.
-        let segment_bytes = (geometry.max_segment_bytes as usize / logical_block_bytes).max(1)
-            * logical_block_bytes;
-        let segments_per_block = CACHE_BLOCK_BYTES.div_ceil(segment_bytes);
-        let run_blocks =
-            (geometry.max_segments as usize / segments_per_block).clamp(1, MAX_RUN_BLOCKS);
+        // One request carries `max_transfer_bytes` through one contiguous
+        // run of the driver's memory, however many pages it is made of.
+        let run_blocks = (geometry.max_transfer_bytes / CACHE_BLOCK_BYTES).clamp(1, MAX_RUN_BLOCKS);
         let optimal_bytes = (geometry.opt_io_blocks as usize).saturating_mul(logical_block_bytes);
         let readahead_blocks = ((optimal_bytes / CACHE_BLOCK_BYTES) as u64)
             .clamp(1, run_blocks as u64)

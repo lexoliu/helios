@@ -29,14 +29,24 @@
 //!
 //! # Memory the device reaches
 //!
-//! Nothing the device reads or writes lives in a submitting future. The
-//! control bytes of every request are copied into its per-descriptor
-//! control slot, carved from the device's DMA memory when the queue is
-//! built (Linux's per-tag request PDU, `blk_mq` `cmd_size`), and every
-//! data segment is translated through the device's DMA memory when the
-//! chain is written: a segment the device cannot reach is refused, its
-//! buffer completed with the error and handed back, before any
-//! descriptor names it.
+//! Nothing the device reads or writes lives in a submitting future, and
+//! nothing it reads or writes is a caller's memory. The control bytes of
+//! every request are copied into its per-descriptor control slot, carved
+//! from the device's DMA memory when the queue is built (Linux's per-tag
+//! request PDU, `blk_mq` `cmd_size`). The data of a request travels
+//! through one contiguous *transfer run* the driver draws from the
+//! device's DMA memory for that request alone, and the chain names
+//! nothing else. A write's bytes are copied into the run by
+//! [`BlockBuffer::fill`] before the request reaches the ring; a read's are
+//! copied out by [`BlockBuffer::deliver`] when the device answered whole,
+//! before the buffer is completed, so a caller never sees a byte of a
+//! read the device did not finish writing and a device never reaches a
+//! caller's memory. The run goes back where the request finishes. A
+//! request the memory cannot serve yet waits for space
+//! ([`DmaMemory::want_space`]) before it takes a slot of the ring.
+//! This is a bounce buffer, as Linux's swiotlb makes of a streaming
+//! mapping and Xen's blkfront of the pages it grants an untrusted
+//! backend.
 //!
 //! # Concurrency contract
 //!
@@ -61,6 +71,18 @@
 //! state is what hands it from one to the next. A request never migrates
 //! between queues: the queue is chosen when the chain is written and the
 //! request finishes on that same queue.
+//!
+//! The transfer run follows the same ownership. Its allocation and the
+//! `fill` of a write run in the submitting task, on its processor, before
+//! the ring lock is taken, and the allocation is lock-free on the
+//! memories of the kernel's arenas; the space wait is the
+//! [`DmaMemory::want_space`] protocol, with the signal armed before the
+//! allocation is asked again. The run parks in the request slot beside
+//! the buffer. `deliver`, `complete` and the free of the run happen in
+//! `finish`, with no lock of the driver held, in the interrupt handler or
+//! in whichever task drained the answer: a copy into request-owned
+//! memory, then a wait-free free that raises the memory's signal only
+//! while some submitter is starved.
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -240,7 +262,7 @@ enum ReqType {
 /// the answer while it is pending or detached, and read by the waiter
 /// once it is complete. The state word, and the ring lock the submitter
 /// and the drainer hold, order those accesses.
-struct RequestBody<B> {
+struct RequestBody<T: VirtioTransport, B> {
     kind: ReqType,
     /// Where the chain's response bytes sit in the queue's control slot
     /// of the same identifier.
@@ -251,25 +273,29 @@ struct RequestBody<B> {
     /// Payload bytes the device must write for a read to be whole.
     expected: usize,
     buffer: Option<B>,
+    /// The contiguous run of the device's own memory the chain names for
+    /// a data request: the device reads a write's bytes from it and
+    /// writes a read's into it. Freed where the request finishes.
+    transfer: Option<TransportBuffer<T>>,
     /// Payload bytes the device wrote, once the request is finished.
     result: IoResult<usize>,
 }
 
 /// One request the driver handed the device, in the slot its chain's
 /// descriptor identifier names.
-struct Request<B> {
+struct Request<T: VirtioTransport, B> {
     state: AtomicU8,
     /// The waiter's, while it is parked on a pending request.
     waker: AtomicWaker,
-    body: UnsafeCell<RequestBody<B>>,
+    body: UnsafeCell<RequestBody<T, B>>,
 }
 
 // SAFETY: `body` is touched by one context at a time, as the slot's state
 // and the ring lock decide (see `RequestBody`); every other field is
 // atomic.
-unsafe impl<B: Send> Sync for Request<B> {}
+unsafe impl<T: VirtioTransport, B: Send> Sync for Request<T, B> {}
 
-impl<B> Request<B> {
+impl<T: VirtioTransport, B> Request<T, B> {
     fn idle() -> Self {
         Self {
             state: AtomicU8::new(IDLE),
@@ -280,6 +306,7 @@ impl<B> Request<B> {
                 id: [0; BLOCK_ID_BYTES],
                 expected: 0,
                 buffer: None,
+                transfer: None,
                 result: Ok(0),
             }),
         }
@@ -293,7 +320,7 @@ struct BlockQueue<T: VirtioTransport, B> {
     /// drains on the drainer's behalf as it lets go.
     drain_pending: AtomicBool,
     /// One slot per descriptor identifier the ring hands out.
-    requests: Box<[Request<B>]>,
+    requests: Box<[Request<T, B>]>,
     /// The header, the segment list, the identifier and the status byte
     /// of every request in flight, one control slot per descriptor
     /// identifier, in memory the device reaches.
@@ -318,7 +345,7 @@ impl<T: VirtioTransport, B> BlockQueue<T, B> {
         self.available.notify_all();
     }
 
-    fn request(&self, id: u16) -> &Request<B> {
+    fn request(&self, id: u16) -> &Request<T, B> {
         self.requests.get(usize::from(id)).unwrap_or_else(|| {
             panic!(
                 "virtio-blk descriptor {id} is outside the {}-slot request table",
@@ -390,17 +417,14 @@ struct RequestLimits {
     write_zeroes_segments: usize,
 }
 
-/// The data runs of one request: the addresses and lengths of the
-/// caller's segments, cut at the device's segment size. Each is
-/// translated to a device address when the chain is written.
-type DataRuns = ArrayVec<(usize, usize), MAX_CHAIN_BUFFERS>;
-
 /// What one request asks of the device, besides the caller's buffer.
 struct Command {
     kind: ReqType,
     sector: u64,
     deallocate: ArrayVec<BlkDeallocate, DEALLOCATE_SEGMENTS>,
-    runs: DataRuns,
+    /// Bytes a data request transfers; zero for every other kind. The
+    /// chain names them as slices of the request's transfer run.
+    len: usize,
 }
 
 impl Command {
@@ -409,15 +433,15 @@ impl Command {
             kind,
             sector: 0,
             deallocate: ArrayVec::new(),
-            runs: ArrayVec::new(),
+            len: 0,
         }
     }
 
-    /// Buffers the chain carries: the header, the payload and the status
-    /// byte.
-    fn buffers(&self) -> usize {
+    /// Buffers the chain carries: the header, the payload, cut into
+    /// pieces of `stride` bytes, and the status byte.
+    fn buffers(&self, stride: usize) -> usize {
         let payload = match self.kind {
-            ReqType::In | ReqType::Out => self.runs.len(),
+            ReqType::In | ReqType::Out => self.len.div_ceil(stride),
             ReqType::GetId => 1,
             ReqType::Discard | ReqType::WriteZeroes => 1,
             ReqType::Flush => 0,
@@ -803,16 +827,27 @@ impl<T: VirtioTransport, C: QueueAffinity, B: BlockBuffer> VirtioBlockDevice<T, 
         let features = negotiate(&transport, RING_FEATURES | BLK_FEATURES)?;
 
         let DeviceConfig {
-            geometry,
+            mut geometry,
             limits,
             writeback,
         } = read_config(&transport, features)?;
+        // A request carries one contiguous run of the device's own
+        // memory, so no request is longer than the longest run that
+        // memory serves, however much the device would take.
+        let logical_block_bytes = geometry.logical_block_bytes;
+        let memory_bytes =
+            transport.bus().dma().max_run_bytes() / logical_block_bytes * logical_block_bytes;
+        if memory_bytes == 0 {
+            return Err(IoError::InvalidDeviceConfig(
+                "virtio-blk's DMA memory cannot serve a run of one logical block",
+            ));
+        }
+        geometry.max_transfer_bytes = geometry.max_transfer_bytes.min(memory_bytes);
         let RequestLimits {
             data_segments,
             segment_bytes,
             ..
         } = limits;
-        let logical_block_bytes = geometry.logical_block_bytes;
         let capacity_blocks = geometry.capacity_blocks;
 
         let mut capabilities = BlockDeviceCapabilities::empty();
@@ -1098,36 +1133,6 @@ impl<T: VirtioTransport, C: QueueAffinity, B: BlockBuffer> VirtioBlockDevice<T, 
         self.limits.segment_bytes / block_bytes * block_bytes
     }
 
-    /// Cuts `buffer` into the data segments one request carries, and
-    /// answers them with their total length. A buffer that needs more
-    /// segments than one request carries is refused.
-    fn data_runs(&self, buffer: &B) -> IoResult<(DataRuns, usize)> {
-        let stride = self.segment_stride();
-        let mut runs = DataRuns::new();
-        let mut total = 0_usize;
-        for segment in buffer.segments() {
-            let mut address = segment.cast::<u8>().as_ptr() as usize;
-            let mut len = segment.len();
-            if len == 0 {
-                return Err(IoError::InvalidBufferLength {
-                    required_multiple: self.geometry.logical_block_bytes,
-                    actual: 0,
-                });
-            }
-            while len != 0 {
-                let take = len.min(stride);
-                if runs.len() == self.limits.data_segments {
-                    return Err(IoError::OutOfBounds);
-                }
-                runs.push((address, take));
-                address += take;
-                len -= take;
-                total = total.checked_add(take).ok_or(IoError::OutOfBounds)?;
-            }
-        }
-        Ok((runs, total))
-    }
-
     /// Checks a data request against the handle's rights and the device,
     /// and builds its command.
     fn data_command(
@@ -1144,17 +1149,65 @@ impl<T: VirtioTransport, C: QueueAffinity, B: BlockBuffer> VirtioBlockDevice<T, 
         if !rights.contains(required) {
             return Err(IoError::PermissionDenied);
         }
-        let (runs, len) = self.data_runs(buffer)?;
+        let len = buffer.len();
         validate_request(rights, self.geometry, block_id, len, required)?;
         if kind == ReqType::Out && self.readonly {
             return Err(IoError::ReadOnly);
+        }
+        // Refused before any memory is taken: no run serves more.
+        if len > self.geometry.max_transfer_bytes {
+            return Err(IoError::OutOfBounds);
         }
         Ok(Command {
             kind,
             sector: self.sector_of(block_id),
             deallocate: ArrayVec::new(),
-            runs,
+            len,
         })
+    }
+
+    /// Draws the contiguous run of the device's memory `command`
+    /// transfers through, waiting for space while the memory is short.
+    ///
+    /// A refusal that clears with time ([`DmaError::Exhausted`] or
+    /// [`DmaError::Replenishing`]) is waited out with the protocol of
+    /// [`DmaMemory::want_space`]: the wait is declared, the allocation is
+    /// asked again, and only a second refusal parks on the signal, so a
+    /// free that lands between the refusal and the declaration is found
+    /// by the second ask and one after it moves the signal past the mark.
+    /// The state of the device is tested before every ask, so a device
+    /// that stopped ends the wait. Any other refusal ends the request at
+    /// once.
+    ///
+    /// No lock of the driver is held, and the run is not zeroed: a write
+    /// fills it whole and a read is accepted only whole.
+    async fn take_run(&self, command: &Command) -> IoResult<TransportBuffer<T>> {
+        let dma = self.transport.bus().dma();
+        let layout = Layout::from_size_align(command.len, PhysFrame::SIZE)
+            .map_err(|_| IoError::OutOfBounds)?;
+        let waitable = |error: &DmaError| {
+            matches!(
+                error,
+                DmaError::Exhausted { .. } | DmaError::Replenishing { .. }
+            )
+        };
+        loop {
+            if self.state.load(Ordering::SeqCst) != RUNNING {
+                return Err(IoError::DeviceFault);
+            }
+            match dma.allocate_overwritten(layout, READ_WRITE) {
+                Ok(run) => return Ok(run),
+                Err(error) if waitable(&error) => {}
+                Err(error) => return Err(error.into()),
+            }
+            let mark = dma.want_space();
+            match dma.allocate_overwritten(layout, READ_WRITE) {
+                Ok(run) => return Ok(run),
+                Err(error) if waitable(&error) => {}
+                Err(error) => return Err(error.into()),
+            }
+            dma.space_changed(mark).await;
+        }
     }
 
     /// Submits a data request, or refuses it with its buffer completed.
@@ -1244,11 +1297,34 @@ impl<T: VirtioTransport, C: QueueAffinity, B: BlockBuffer> VirtioBlockDevice<T, 
     /// parks until a chain or a slot is freed. `buffer` stays with this
     /// future until the device has the request, so dropping the future
     /// before then drops it uncompleted.
+    ///
+    /// A data request first draws its transfer run ([`Self::take_run`])
+    /// and, for a write, fills it, both before any lock is taken, so the
+    /// copy of up to a run never runs under the ring lock the interrupt
+    /// handler tries. The run is the request's from the moment the chain
+    /// is written, and is dropped with the request wherever it gives up
+    /// before that.
     async fn issue(&self, command: Command, buffer: Option<B>) -> RequestWaiter<'_, T, C, B> {
         let queue_index = self.cpu.current_processor() % self.queues.len();
         let queue = &self.queues[queue_index];
-        let buffers = command.buffers();
+        let stride = self.segment_stride();
+        let buffers = command.buffers(stride);
         let mut buffer = buffer;
+        let mut transfer = None;
+        if command.len != 0 {
+            match self.take_run(&command).await {
+                Ok(mut run) => {
+                    if command.kind == ReqType::Out {
+                        buffer
+                            .as_mut()
+                            .expect("a virtio-blk write carries a buffer")
+                            .fill(&mut run.as_mut()[..command.len]);
+                    }
+                    transfer = Some(run);
+                }
+                Err(error) => return RequestWaiter::refused(self, error, buffer),
+            }
+        }
         let mut announced = false;
         let outcome = loop {
             // Armed before the ring is tested: a release that lands in
@@ -1271,18 +1347,28 @@ impl<T: VirtioTransport, C: QueueAffinity, B: BlockBuffer> VirtioBlockDevice<T, 
                     let body = unsafe { &mut *request.body.get() };
                     body.kind = command.kind;
                     body.expected = match command.kind {
-                        ReqType::In => command.runs.iter().map(|&(_, len)| len).sum(),
+                        ReqType::In => command.len,
                         _ => 0,
                     };
                     body.buffer = buffer.take();
+                    body.transfer = transfer.take();
                     body.result = Ok(0);
                     // SAFETY: the ring is held and the request slot of
                     // `id`, the identifier the chain will be headed by,
                     // is idle, which is the ownership of its control
-                    // slot `write_chain` asks for. The runs are the
-                    // buffer's, which the request slot now owns.
-                    match unsafe { write_chain(&mut ring, &self.transport, &queue.slots, &command) }
-                    {
+                    // slot `write_chain` asks for. The transfer run is
+                    // the request slot's own memory, which nobody but
+                    // the device reads or writes from here.
+                    match unsafe {
+                        write_chain(
+                            &mut ring,
+                            &self.transport,
+                            &queue.slots,
+                            &command,
+                            stride,
+                            &mut body.transfer,
+                        )
+                    } {
                         Ok((token, response)) => {
                             assert_eq!(
                                 token, id,
@@ -1297,6 +1383,10 @@ impl<T: VirtioTransport, C: QueueAffinity, B: BlockBuffer> VirtioBlockDevice<T, 
                             break Ok(id);
                         }
                         Err(error) => {
+                            // The device never saw the chain: the run
+                            // goes back to this task, which drops it
+                            // once the ring is let go.
+                            transfer = body.transfer.take();
                             let buffer = body.buffer.take();
                             self.unlock(queue, ring);
                             break Err((error, buffer));
@@ -1321,6 +1411,9 @@ impl<T: VirtioTransport, C: QueueAffinity, B: BlockBuffer> VirtioBlockDevice<T, 
         if announced {
             queue.blocked.fetch_sub(1, Ordering::SeqCst);
         }
+        // Still ours only when the request gave up before the device had
+        // it; a request the device holds took the run with it.
+        drop(transfer);
         match outcome {
             Ok(id) => RequestWaiter {
                 device: self,
@@ -1430,8 +1523,21 @@ impl<T: VirtioTransport, C: QueueAffinity, B: BlockBuffer> VirtioBlockDevice<T, 
         });
         body.result = result;
         if let Some(buffer) = body.buffer.as_mut() {
+            // A read is handed to its buffer only when the device wrote
+            // every byte of it, and before the buffer is completed, so
+            // whatever publishes the buffer on completion publishes
+            // bytes of the caller's own memory. A failed or short read
+            // delivers nothing.
+            if result.is_ok()
+                && body.kind == ReqType::In
+                && let Some(run) = body.transfer.as_ref()
+            {
+                buffer.deliver(&run.as_ref()[..body.expected]);
+            }
             buffer.complete(result.map(drop));
         }
+        // The request is over: the device touches the run no more.
+        drop(body.transfer.take());
         self.counters.count(body.kind);
         match request
             .state
@@ -1498,6 +1604,9 @@ impl<T: VirtioTransport, C: QueueAffinity, B: BlockBuffer> VirtioBlockDevice<T, 
             if let Some(buffer) = body.buffer.as_mut() {
                 buffer.complete(Err(IoError::DeviceFault));
             }
+            // The reset device touches the run no more, and nothing is
+            // delivered from it.
+            drop(body.transfer.take());
             match request.state.compare_exchange(
                 PENDING,
                 COMPLETE,
@@ -1521,44 +1630,42 @@ impl<T: VirtioTransport, C: QueueAffinity, B: BlockBuffer> VirtioBlockDevice<T, 
 
 /// Writes one request's chain: the header, and for discard and
 /// write-zeroes the segment list, copied into the control slot of the
-/// identifier the chain will be headed by; the payload runs, translated
-/// to device addresses; and the response bytes, the status last, back in
-/// the control slot. Answers the identifier and where the response bytes
-/// are.
+/// identifier the chain will be headed by; the payload, as the pieces of
+/// `stride` bytes of the request's transfer run, named in place and
+/// translated to device addresses; and the response bytes, the status
+/// last, back in the control slot. Answers the identifier and where the
+/// response bytes are. The chain names no memory but the control slot's
+/// and `transfer`'s.
 ///
 /// # Safety
 ///
 /// The caller holds `ring` and owns the control slot of
-/// [`VirtQueue::next_free_descriptor`]: its request slot is idle. Every
-/// run is memory the caller's request slot owns, which nobody but the
+/// [`VirtQueue::next_free_descriptor`]: its request slot is idle.
+/// `transfer` is the request slot's own memory, which nobody but the
 /// device reads or writes until the request is finished.
 unsafe fn write_chain<T: VirtioTransport>(
     ring: &mut VirtQueue<T>,
     transport: &T,
     slots: &ControlSlots<TransportBuffer<T>>,
     command: &Command,
+    stride: usize,
+    transfer: &mut Option<TransportBuffer<T>>,
 ) -> IoResult<(u16, ResponseSpan)> {
     let header = BlkReq::new(command.kind, command.sector);
     let mut parts: ArrayVec<Part<'_>, MAX_CHAIN_BUFFERS> = ArrayVec::new();
     parts.push(Part::Request(as_bytes(&header)));
+    let pieces = (0..command.len)
+        .step_by(stride)
+        .map(|start| start..command.len.min(start + stride));
     match command.kind {
         ReqType::Out => {
-            for &(address, len) in &command.runs {
-                // SAFETY: the run is part of the buffer the slot owns,
-                // which the contract leaves unwritten until it completes.
-                parts.push(Part::Read(unsafe {
-                    core::slice::from_raw_parts(address as *const u8, len)
-                }));
+            for range in pieces {
+                parts.push(Part::LentRead { buffer: 0, range });
             }
         }
         ReqType::In => {
-            for &(address, len) in &command.runs {
-                // SAFETY: the run is part of the buffer the slot owns,
-                // which the contract leaves to the device alone until it
-                // completes.
-                parts.push(Part::Write(unsafe {
-                    core::slice::from_raw_parts_mut(address as *mut u8, len)
-                }));
+            for range in pieces {
+                parts.push(Part::LentWrite { buffer: 0, range });
             }
         }
         ReqType::GetId => parts.push(Part::Response(BLOCK_ID_BYTES)),
@@ -1574,7 +1681,7 @@ unsafe fn write_chain<T: VirtioTransport>(
     unsafe { slots.prime_response(head, STATUS_UNWRITTEN) };
     // SAFETY: as above; the caller's request slot being idle is the
     // ownership `submit_parts` asks for.
-    unsafe { ring.submit_parts(transport, slots, &parts, &mut ()) }
+    unsafe { ring.submit_parts(transport, slots, &parts, transfer) }
 }
 
 impl<T: VirtioTransport, C: QueueAffinity, B> Drop for VirtioBlockDevice<T, C, B> {
@@ -1701,10 +1808,11 @@ fn read_config<T: VirtioTransport>(
             physical_block_exp,
             min_io_blocks,
             opt_io_blocks,
-            // What one request this driver builds can carry, which is
-            // fewer than the device allows once the chain bound applies.
-            max_segments: u32::try_from(data_segments).unwrap_or(u32::MAX),
-            max_segment_bytes: u32::try_from(segment_bytes).unwrap_or(u32::MAX),
+            // What the device and this driver's chain bound carry in one
+            // request: `data_segments` pieces of whole blocks. The driver
+            // lowers it to the longest run of its memory once it has one.
+            max_transfer_bytes: data_segments
+                .saturating_mul(segment_bytes / logical_block_bytes * logical_block_bytes),
             capacity_blocks,
         },
         limits: RequestLimits {

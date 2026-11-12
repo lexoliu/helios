@@ -259,6 +259,37 @@ pub trait DmaMemory: Send + Sync + 'static {
     /// same way: see [`DmaMemory::want_space`].
     fn allocate(&self, layout: Layout, access: DmaAccess) -> Result<Self::Buffer, DmaError>;
 
+    /// [`DmaMemory::allocate`] without zeroing the memory: its bytes are
+    /// unspecified.
+    ///
+    /// The caller, or the device it hands the run to, writes every byte
+    /// before anything reads it. A run the caller fills before a device
+    /// reads it, or that the device must write whole before the caller
+    /// accepts it, is such a run; zeroing it first is a pass over the
+    /// memory that cannot change an outcome. The refusals, the waiting
+    /// and the contiguity are [`DmaMemory::allocate`]'s.
+    ///
+    /// # Concurrency
+    ///
+    /// As [`DmaMemory::allocate`].
+    fn allocate_overwritten(
+        &self,
+        layout: Layout,
+        access: DmaAccess,
+    ) -> Result<Self::Buffer, DmaError>;
+
+    /// The longest run [`DmaMemory::allocate`] can ever serve, in bytes:
+    /// the largest contiguous piece the memory is made of. A request for
+    /// more is refused with [`DmaError::TooLarge`] whatever else is free.
+    /// A fact of the memory, not of any consumer; a driver publishes the
+    /// transfers it carries below it.
+    ///
+    /// # Concurrency
+    ///
+    /// Any task on any processor may call this; the answer never changes
+    /// while the memory lives.
+    fn max_run_bytes(&self) -> usize;
+
     /// Declares that the caller was refused and will wait for space, and
     /// returns the signal's generation as of that declaration.
     ///

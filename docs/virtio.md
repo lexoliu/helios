@@ -433,12 +433,14 @@ not use natively:
 Requests are pipelined: each queue keeps up to 128 chains in flight, each
 with its own `InFlight` slot, and a submitter that finds the ring full
 drains what the device published and parks on the device notification
-rather than failing. A request may be scattered across several of the
-caller's buffers (`read_vectored`, `write_vectored`), one segment each up
-to `SIZE_MAX`; transfers longer than `SEG_MAX × SIZE_MAX`, or than the
-chain bound the driver reports as `max_segments`, are split into
-whole-block requests, and every read checks the used length against what
-it asked for.
+rather than failing. The device never reaches a caller's memory: each data
+request travels through one contiguous run of the device's own DMA memory,
+which the driver fills from the caller's buffer before a write and copies
+into it after a read the device answered whole. The chain names that run in
+pieces of at most `SIZE_MAX`; a request longer than the geometry's
+`max_transfer_bytes` (the device's `SEG_MAX × SIZE_MAX`, the driver's chain
+bound and the longest run its memory serves, whichever is least) is
+refused, and every read checks the used length against what it asked for.
 
 `VIRTIO_BLK_T_GET_ID` is what tells disks apart. A VM hands the guest the
 image its firmware booted from, the scratch disk the kernel owns and any

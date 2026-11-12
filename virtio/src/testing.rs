@@ -8,12 +8,15 @@
 //! tests can assert on them and can play the device side by writing into
 //! the rings directly.
 
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::alloc::Layout;
 use core::cell::UnsafeCell;
+use core::future::poll_fn;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::task::{Poll, Waker};
 
 use helios_hal::dma::{DeviceAddress, DmaAddressing, DmaBuffer, DmaError, DmaMemory, DmaSpaceMark};
 use helios_hal::io::{IoError, IoResult};
@@ -761,6 +764,20 @@ impl DmaMemory for WindowDmaPool {
         self.carve(layout, access, Lifetime::PerRequest)
     }
 
+    /// The arena is carved once and never reused, so its bytes are
+    /// zero here as well; the contract promises nothing about them.
+    fn allocate_overwritten(
+        &self,
+        layout: Layout,
+        access: DmaAccess,
+    ) -> Result<Self::Buffer, DmaError> {
+        self.carve(layout, access, Lifetime::PerRequest)
+    }
+
+    fn max_run_bytes(&self) -> usize {
+        self.arena_len()
+    }
+
     fn want_space(&self) -> DmaSpaceMark {
         DmaSpaceMark::new(0)
     }
@@ -808,7 +825,11 @@ impl DmaMemory for WindowDmaPool {
 
 /// How much memory a [`ConfinedDmaPool`] carves buffers from. Every
 /// driver test's rings, slots and caller buffers fit in it.
-const CONFINED_ARENA_BYTES: usize = 4 << 20;
+pub(crate) const CONFINED_ARENA_BYTES: usize = 4 << 20;
+
+/// What a [`ConfinedDmaPool`] writes into memory that
+/// [`DmaMemory::allocate_overwritten`] leaves unspecified.
+pub(crate) const UNSPECIFIED_BYTE: u8 = 0xa5;
 
 /// Where the storage behind a [`ConfinedDmaPool`] lives and how much has
 /// been handed out.
@@ -821,6 +842,23 @@ struct ConfinedArena {
     /// already given back.
     released: Mutex<Vec<(usize, usize)>>,
     allocations: AllocationLog,
+    /// Per-request allocations not dropped yet.
+    live_requests: AtomicUsize,
+    /// Most per-request allocations that may be live at once;
+    /// `usize::MAX` is no limit. A refused allocation is
+    /// [`DmaError::Exhausted`].
+    request_limit: AtomicUsize,
+    /// The space signal's generation: moves forward whenever a
+    /// per-request allocation is dropped.
+    space: AtomicU64,
+    /// Tasks parked on the signal.
+    space_waiters: Mutex<Vec<Waker>>,
+    /// Runs once, right after the pool decides to refuse an allocation
+    /// and before it answers: whatever a free or a signal can do between
+    /// a refusal and the caller's declaration that it will wait.
+    on_refusal: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// An error every per-request allocation is refused with.
+    refusal: Mutex<Option<DmaError>>,
 }
 
 /// A DMA pool that reaches only the memory it handed out.
@@ -848,6 +886,9 @@ pub(crate) struct ConfinedDmaBuffer {
     len: usize,
     /// Where the buffer reports itself released when it drops.
     arena: Arc<ConfinedArena>,
+    /// Whether it is a per-request allocation, which counts against the
+    /// pool's request limit and raises its space signal when dropped.
+    per_request: bool,
 }
 
 impl Drop for ConfinedDmaBuffer {
@@ -856,6 +897,14 @@ impl Drop for ConfinedDmaBuffer {
             .released
             .lock()
             .push((self.ptr.as_ptr() as usize, self.len));
+        if self.per_request {
+            self.arena.live_requests.fetch_sub(1, Ordering::SeqCst);
+            self.arena.space.fetch_add(1, Ordering::SeqCst);
+            let waiters = core::mem::take(&mut *self.arena.space_waiters.lock());
+            for waiter in waiters {
+                waiter.wake();
+            }
+        }
     }
 }
 
@@ -873,8 +922,34 @@ impl ConfinedDmaPool {
                 next: AtomicUsize::new(0),
                 released: Mutex::new(Vec::new()),
                 allocations: AllocationLog::default(),
+                live_requests: AtomicUsize::new(0),
+                request_limit: AtomicUsize::new(usize::MAX),
+                space: AtomicU64::new(0),
+                space_waiters: Mutex::new(Vec::new()),
+                on_refusal: Mutex::new(None),
+                refusal: Mutex::new(None),
             }),
         }
+    }
+
+    /// Per-request allocations that were not dropped yet.
+    pub(crate) fn live_requests(&self) -> usize {
+        self.arena.live_requests.load(Ordering::SeqCst)
+    }
+
+    /// Lets `more` per-request allocations through beyond the ones live
+    /// now, and refuses the next with [`DmaError::Exhausted`] until one
+    /// of them is dropped.
+    pub(crate) fn admit_only(&self, more: usize) {
+        self.arena
+            .request_limit
+            .store(self.live_requests() + more, Ordering::SeqCst);
+    }
+
+    /// Runs `hook` once, right after the pool next decides to refuse an
+    /// allocation and before it answers the caller.
+    pub(crate) fn on_refusal(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.arena.on_refusal.lock() = Some(Box::new(hook));
     }
 
     fn base(&self) -> usize {
@@ -891,12 +966,20 @@ impl ConfinedDmaPool {
 
     /// Whether `bytes` lies wholly inside memory this pool handed out.
     pub(crate) fn reaches(&self, bytes: &[u8]) -> bool {
-        let start = bytes.as_ptr() as usize;
+        self.reaches_range(bytes.as_ptr() as u64, bytes.len())
+    }
+
+    /// Whether the `len` bytes at device address `address`, which is the
+    /// host address here, lie wholly inside memory this pool handed out.
+    pub(crate) fn reaches_range(&self, address: u64, len: usize) -> bool {
+        let start = address as usize;
         let handed_out = self.base() + self.arena.next.load(Ordering::SeqCst);
-        start >= self.base()
-            && start
-                .checked_add(bytes.len())
-                .is_some_and(|end| end <= handed_out)
+        start >= self.base() && start.checked_add(len).is_some_and(|end| end <= handed_out)
+    }
+
+    /// Refuses every per-request allocation from now on with `error`.
+    pub(crate) fn refuse_requests_with(&self, error: DmaError) {
+        *self.arena.refusal.lock() = Some(error);
     }
 
     /// Whether any of the `len` bytes at device address `address` belong
@@ -944,27 +1027,67 @@ impl ConfinedDmaPool {
         layout: Layout,
         access: DmaAccess,
         lifetime: Lifetime,
+        poison: bool,
     ) -> Result<ConfinedDmaBuffer, DmaError> {
         let exhausted = DmaError::Exhausted {
             bytes: layout.size(),
         };
+        let per_request = lifetime == Lifetime::PerRequest;
+        if per_request {
+            if let Some(error) = *self.arena.refusal.lock() {
+                return Err(error);
+            }
+            let limit = self.arena.request_limit.load(Ordering::SeqCst);
+            let admitted =
+                self.arena
+                    .live_requests
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |live| {
+                        (live < limit).then_some(live + 1)
+                    });
+            if admitted.is_err() {
+                self.refuse();
+                return Err(exhausted);
+            }
+        }
         let align = layout.align().max(1);
         let mut offset = 0;
-        self.arena
+        let carved = self
+            .arena
             .next
             .try_update(Ordering::SeqCst, Ordering::SeqCst, |next| {
                 offset = next.next_multiple_of(align);
                 let end = offset.checked_add(layout.size())?;
                 (end <= self.arena.storage.len() - PAGE_ALIGNMENT).then_some(end)
-            })
-            .map_err(|_| exhausted)?;
+            });
+        if carved.is_err() {
+            if per_request {
+                self.arena.live_requests.fetch_sub(1, Ordering::SeqCst);
+            }
+            return Err(exhausted);
+        }
         let ptr = NonNull::new((self.base() + offset) as *mut u8).ok_or(exhausted)?;
+        if poison {
+            // SAFETY: the bump allocator just handed this task `layout.size()`
+            // bytes of the arena, which nothing else names yet. The poison
+            // is what an unspecified byte looks like: a test that reads one
+            // sees it.
+            unsafe { ptr.as_ptr().write_bytes(UNSPECIFIED_BYTE, layout.size()) };
+        }
         self.arena.allocations.record(lifetime, access, layout);
         Ok(ConfinedDmaBuffer {
             ptr,
             len: layout.size(),
             arena: self.arena.clone(),
+            per_request,
         })
+    }
+
+    /// Runs the refusal hook, once.
+    fn refuse(&self) {
+        let hook = self.arena.on_refusal.lock().take();
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     /// Every allocation the pool served, in order.
@@ -981,25 +1104,59 @@ impl DmaMemory for ConfinedDmaPool {
         layout: Layout,
         access: DmaAccess,
     ) -> Result<Self::Buffer, DmaError> {
-        self.carve(layout, access, Lifetime::Resident)
+        self.carve(layout, access, Lifetime::Resident, false)
     }
 
     fn allocate(&self, layout: Layout, access: DmaAccess) -> Result<Self::Buffer, DmaError> {
-        self.carve(layout, access, Lifetime::PerRequest)
+        self.carve(layout, access, Lifetime::PerRequest, false)
+    }
+
+    /// The memory comes back poisoned with [`UNSPECIFIED_BYTE`], so a
+    /// driver that lets a byte it never wrote reach a caller or a device
+    /// fails the test that looks.
+    fn allocate_overwritten(
+        &self,
+        layout: Layout,
+        access: DmaAccess,
+    ) -> Result<Self::Buffer, DmaError> {
+        self.carve(layout, access, Lifetime::PerRequest, true)
+    }
+
+    fn max_run_bytes(&self) -> usize {
+        self.arena.storage.len() - PAGE_ALIGNMENT
     }
 
     fn want_space(&self) -> DmaSpaceMark {
-        DmaSpaceMark::new(0)
+        DmaSpaceMark::new(self.arena.space.load(Ordering::SeqCst))
     }
 
-    async fn space_changed(&self, _mark: DmaSpaceMark) {}
+    async fn space_changed(&self, mark: DmaSpaceMark) {
+        poll_fn(|context| {
+            let changed = || self.arena.space.load(Ordering::SeqCst) > mark.get();
+            if changed() {
+                return Poll::Ready(());
+            }
+            self.arena
+                .space_waiters
+                .lock()
+                .push(context.waker().clone());
+            // Tested again once parked: a drop between the two tests
+            // found no waiter to wake.
+            if changed() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+    }
 
     fn short_of_space(&self) -> bool {
         false
     }
 
     fn space_mark(&self) -> DmaSpaceMark {
-        DmaSpaceMark::new(0)
+        DmaSpaceMark::new(self.arena.space.load(Ordering::SeqCst))
     }
 
     fn device_range(&self, bytes: &[u8]) -> Result<DeviceAddress, DmaError> {

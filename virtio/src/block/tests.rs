@@ -1,8 +1,8 @@
 use super::*;
 
 use crate::testing::{
-    Allocation, ConfinedDmaBuffer, ConfinedDmaPool, ConfinedTransport, FakeAffinity, FakeTransport,
-    FakeTransportConfig, Lifetime,
+    Allocation, CONFINED_ARENA_BYTES, ConfinedDmaBuffer, ConfinedDmaPool, ConfinedTransport,
+    FakeAffinity, FakeTransport, FakeTransportConfig, Lifetime,
 };
 use crate::transport::VirtioFeatures;
 use alloc::sync::Arc;
@@ -17,16 +17,38 @@ use spin::Mutex as SpinMutex;
 /// A device with 2 MiB of capacity in 512-byte sectors.
 const TEST_CAPACITY_SECTORS: u32 = 4096;
 
-/// What a [`TestBuffer`] heard from the driver.
+/// One thing the driver did to a [`TestBuffer`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Heard {
+    /// Asked for a write's bytes, with the state of the ring and the
+    /// count of kicks at that moment.
+    Filled { in_flight: usize, kicks: usize },
+    /// Handed a read's bytes.
+    Delivered(Vec<u8>),
+    /// Told the request's outcome.
+    Completed(IoResult<()>),
+}
+
+/// What a [`TestBuffer`] heard from the driver, in order.
 #[derive(Default)]
 struct Probe {
-    completions: SpinMutex<Vec<IoResult<()>>>,
+    heard: SpinMutex<Vec<Heard>>,
     drops: AtomicUsize,
 }
 
 impl Probe {
+    fn heard(&self) -> Vec<Heard> {
+        self.heard.lock().clone()
+    }
+
     fn completions(&self) -> Vec<IoResult<()>> {
-        self.completions.lock().clone()
+        self.heard()
+            .into_iter()
+            .filter_map(|heard| match heard {
+                Heard::Completed(result) => Some(result),
+                _ => None,
+            })
+            .collect()
     }
 
     fn drops(&self) -> usize {
@@ -46,6 +68,9 @@ struct TestBuffer {
     device_memory: Option<ConfinedDmaBuffer>,
     probe: Option<Arc<Probe>>,
     answered: Option<AnswerFlag>,
+    /// Runs inside [`BlockBuffer::fill`], where the test looks at the
+    /// device from the point of view of the driver's copy.
+    on_fill: Option<Box<dyn Fn() -> Heard + Send>>,
 }
 
 // SAFETY: the buffer owns its bytes, either as a boxed slice or as the
@@ -73,7 +98,22 @@ impl TestBuffer {
             device_memory: None,
             probe: None,
             answered: None,
+            on_fill: None,
         }
+    }
+
+    /// `bytes` as host memory.
+    fn host_filled(bytes: &[u8]) -> Self {
+        let mut buffer = Self::host(bytes.len());
+        buffer.as_mut().copy_from_slice(bytes);
+        buffer
+    }
+
+    /// Has the buffer record what `look` answers when the driver asks it
+    /// for a write's bytes.
+    fn looking_when_filled(mut self, look: impl Fn() -> Heard + Send + 'static) -> Self {
+        self.on_fill = Some(Box::new(look));
+        self
     }
 
     fn filled(device: &TestDevice, bytes: &[u8]) -> Self {
@@ -117,13 +157,27 @@ impl Drop for TestBuffer {
 }
 
 impl BlockBuffer for TestBuffer {
-    fn segments(&self) -> impl Iterator<Item = NonNull<[u8]>> + '_ {
-        core::iter::once(self.bytes)
+    fn len(&self) -> usize {
+        self.bytes().len()
+    }
+
+    fn fill(&mut self, to: &mut [u8]) {
+        if let (Some(probe), Some(look)) = (&self.probe, &self.on_fill) {
+            probe.heard.lock().push(look());
+        }
+        to.copy_from_slice(self.bytes());
+    }
+
+    fn deliver(&mut self, from: &[u8]) {
+        if let Some(probe) = &self.probe {
+            probe.heard.lock().push(Heard::Delivered(from.to_vec()));
+        }
+        self.as_mut().copy_from_slice(from);
     }
 
     fn complete(&mut self, result: IoResult<()>) {
         if let Some(probe) = &self.probe {
-            probe.completions.lock().push(result);
+            probe.heard.lock().push(Heard::Completed(result));
         }
         if let Some(answered) = self.answered.take() {
             answered.raise();
@@ -144,6 +198,7 @@ impl OwnedBlockBuffer for TestBuffer {
             device_memory: Some(memory),
             probe: None,
             answered: None,
+            on_fill: None,
         }
     }
 }
@@ -273,8 +328,10 @@ fn a_plain_device_reports_sector_geometry_and_one_queue() {
             physical_block_exp: 0,
             min_io_blocks: 0,
             opt_io_blocks: 0,
-            max_segments: 1,
-            max_segment_bytes: u32::MAX,
+            // The device states no limit, so its one segment would carry
+            // `u32::MAX` bytes in whole sectors; the pool's run is the
+            // shorter, and is what a request is bounded by.
+            max_transfer_bytes: CONFINED_ARENA_BYTES,
             capacity_blocks: TEST_CAPACITY_SECTORS as usize,
         }
     );
@@ -303,8 +360,8 @@ fn topology_and_block_size_are_read_into_the_geometry() {
             physical_block_exp: 1,
             min_io_blocks: 2,
             opt_io_blocks: 8,
-            max_segments: 4,
-            max_segment_bytes: 16384,
+            // Four segments of 16 KiB.
+            max_transfer_bytes: 4 * 16384,
             // 4096 512-byte sectors are 512 blocks of 4 KiB.
             capacity_blocks: 512,
         }
@@ -617,16 +674,98 @@ fn a_buffer_is_cut_at_the_segment_size_and_refused_past_one_request() {
         answered(block_on(poll_once(write.as_mut())).expect("the write has completed"));
     assert_eq!(result, Ok(()));
 
-    // Twice that needs four segments, more than one request carries:
-    // refused, with the buffer told why, and nothing reaches the device.
-    let kicks = device.object().transport.kick_count();
+    // Twice that is longer than the 2048 bytes one request carries:
+    // refused before any memory is taken, with the buffer told why, and
+    // nothing reaches the device.
+    assert_eq!(device.geometry().max_transfer_bytes, 2048);
+    let pool = device.object().transport.pool().clone();
+    let (kicks, allocations) = (
+        device.object().transport.kick_count(),
+        pool.allocations().len(),
+    );
     let probe = Arc::new(Probe::default());
-    let (result, _buffer) = answered(block_on(
+    let (result, buffer) = answered(block_on(
         device.write(0, TestBuffer::probed(&device, 4096, &probe)),
     ));
     assert_eq!(result, Err(IoError::OutOfBounds));
     assert_eq!(probe.completions(), [Err(IoError::OutOfBounds)]);
+    assert_eq!(probe.drops(), 0, "the refused buffer comes back");
+    drop(buffer);
     assert_eq!(device.object().transport.kick_count(), kicks);
+    assert_eq!(
+        pool.allocations().len(),
+        allocations + 1,
+        "only the test's own buffer was allocated; the refused request took no run"
+    );
+}
+
+/// The published bound is the least of the device's, the chain's and the
+/// longest run the driver's memory serves.
+#[test]
+fn a_request_is_bounded_by_the_longest_run_the_memory_serves() {
+    let transport = FakeTransport::with_dma(
+        FakeTransportConfig {
+            device_type: DeviceType::Block,
+            offered_features: VirtioFeatures::VERSION_1.bits() | BLK_F_SEG_MAX,
+            queue_size: 8,
+            supports_queue_reset: false,
+            absent_queues: &[],
+        },
+        ConfinedDmaPool::new(256 * 1024),
+    );
+    transport.set_config_u32(CFG_CAPACITY_LOW, TEST_CAPACITY_SECTORS);
+    transport.set_config_u32(CFG_SEG_MAX, 6);
+    let memory_bytes = transport.pool().max_run_bytes();
+    let device = VirtioBlockDevice::<_, _, TestBuffer>::new(transport, FakeAffinity::<1>)
+        .expect("block device should initialize")
+        .into_resource(BlockDeviceRights::READ | BlockDeviceRights::WRITE);
+
+    // Six segments of nearly 4 GiB each are far more than 256 KiB.
+    assert_eq!(memory_bytes, 256 * 1024);
+    assert_eq!(device.geometry().max_transfer_bytes, memory_bytes);
+}
+
+/// A refusal of the run that waiting cannot clear ends the request at
+/// once, with the buffer completed with the error and handed back, and
+/// the device never sees it.
+#[test]
+fn a_run_the_memory_cannot_serve_refuses_the_request_with_its_buffer() {
+    for (refusal, error) in [
+        (
+            DmaError::TooLarge {
+                bytes: 512,
+                limit: 256,
+            },
+            IoError::OutOfBounds,
+        ),
+        (
+            DmaError::InvalidLength {
+                bytes: 512,
+                required_multiple: 1024,
+            },
+            IoError::InvalidBufferLength {
+                required_multiple: 1024,
+                actual: 512,
+            },
+        ),
+    ] {
+        let device = device();
+        device
+            .object()
+            .transport
+            .pool()
+            .refuse_requests_with(refusal);
+        let kicks = device.object().transport.kick_count();
+        let probe = Arc::new(Probe::default());
+        let (result, buffer) = answered(block_on(
+            device.write(0, TestBuffer::host(512).with_probe(&probe)),
+        ));
+        assert_eq!(result, Err(error));
+        assert_eq!(probe.heard(), [Heard::Completed(Err(error))]);
+        assert_eq!(probe.drops(), 0, "the buffer comes back");
+        drop(buffer);
+        assert_eq!(device.object().transport.kick_count(), kicks);
+    }
 }
 
 #[test]
@@ -646,7 +785,10 @@ fn the_header_and_the_status_travel_in_the_requests_own_slot() {
             "descriptor at {address:#x} is outside the control slots"
         );
     }
-    assert_eq!(chain[1].0, payload, "the payload is the caller's buffer");
+    assert_ne!(
+        chain[1].0, payload,
+        "the payload is the driver's own run, never the caller's buffer"
+    );
     assert_eq!(request_of(&device, 0), header(ReqType::In, 0));
 }
 
@@ -712,26 +854,55 @@ fn rings_and_control_slots_are_resident() {
     );
 }
 
+/// A buffer no device reaches, host memory or another device's, is a
+/// buffer like any other: the driver copies through memory of its own,
+/// and every data descriptor of the chain resolves inside the device's
+/// pool.
 #[test]
-fn a_buffer_the_device_cannot_reach_is_refused_and_handed_back() {
-    // A segment outside the device's memory is refused before any
-    // descriptor is written. A buffer from another device's memory has
-    // the right type but not the right provenance, which is what host
-    // memory, a stack array or a future's frame would have too.
+fn host_memory_round_trips_through_the_drivers_own_run() {
     let device = device();
-    let kicks = device.object().transport.kick_count();
-    for foreign in [
-        TestBuffer::in_pool(&ConfinedDmaPool::new(4096), 512),
-        TestBuffer::host(512),
-    ] {
-        let probe = Arc::new(Probe::default());
-        let (result, buffer) = answered(block_on(device.read(0, foreign.with_probe(&probe))));
-        assert_eq!(result, Err(IoError::DeviceFault));
-        assert_eq!(probe.completions(), [Err(IoError::DeviceFault)]);
-        assert_eq!(probe.drops(), 0, "nothing was published, so it comes back");
-        drop(buffer);
+    let pool = device.object().transport.pool().clone();
+    let payload = [0x3c_u8; 1024];
+    let write_buffer = TestBuffer::host_filled(&payload);
+    let host_address = write_buffer.device_address();
+    let mut write = pin!(device.write(5, write_buffer));
+    assert!(block_on(poll_once(write.as_mut())).is_none());
+
+    let mut expected = header(ReqType::Out, 5);
+    expected.extend_from_slice(&payload);
+    assert_eq!(
+        request_of(&device, 0),
+        expected,
+        "the device reads the bytes"
+    );
+    let chain = ring(&device).device_chain(0);
+    assert_eq!(chain.len(), 3, "header, data, status");
+    for &(address, len, _) in &chain {
+        assert!(
+            pool.reaches_range(address, len as usize),
+            "descriptor at {address:#x} is outside the device's memory"
+        );
     }
-    assert_eq!(device.object().transport.kick_count(), kicks);
+    assert_ne!(chain[1].0, host_address, "the data is not the caller's");
+    complete(&device, 0, &[0]);
+    let (result, _buffer) =
+        answered(block_on(poll_once(write.as_mut())).expect("the write has completed"));
+    assert_eq!(result, Ok(()));
+
+    // Another device's memory is as foreign as the host's.
+    for foreign in [
+        TestBuffer::host(1024),
+        TestBuffer::in_pool(&ConfinedDmaPool::new(8192), 1024),
+    ] {
+        let token = next_token(&device);
+        let mut read = pin!(device.read(5, foreign));
+        assert!(block_on(poll_once(read.as_mut())).is_none());
+        complete(&device, token, &read_response(0x7e, 1024));
+        let (result, buffer) =
+            answered(block_on(poll_once(read.as_mut())).expect("the read has completed"));
+        assert_eq!(result, Ok(()));
+        assert_eq!(buffer.bytes(), [0x7e_u8; 1024]);
+    }
 }
 
 #[test]
@@ -895,42 +1066,48 @@ fn a_readonly_device_refuses_writes() {
     assert_eq!(result, Err(IoError::ReadOnly));
 }
 
+/// A waiter that is gone changes nothing about a read: the driver still
+/// delivers the answer into the buffer it parked, before it completes
+/// and drops it, and the run the device wrote is its own to free then.
 #[test]
-fn a_dropped_waiter_leaves_the_request_to_finish_and_release_its_buffer() {
+fn a_dropped_waiter_still_has_its_read_delivered_before_the_buffer_goes() {
     let device = device();
     let pool = device.object().transport.pool().clone();
     let probe = Arc::new(Probe::default());
     let token = next_token(&device);
-    let abandoned = TestBuffer::probed(&device, 512, &probe);
-    let abandoned_bytes = (abandoned.device_address(), 512);
     {
-        let mut read = pin!(device.read(4, abandoned));
+        let mut read = pin!(device.read(4, TestBuffer::host(512).with_probe(&probe)));
         assert!(block_on(poll_once(read.as_mut())).is_none());
     }
     // The task is gone, but the device still has the request: the driver
-    // keeps the buffer it may still write into.
+    // keeps the buffer, and the run the device writes.
+    let (run_address, run_len, _) = ring(&device).device_chain(token)[1];
     assert_eq!(probe.drops(), 0);
-    assert!(probe.completions().is_empty());
+    assert!(probe.heard().is_empty());
     assert!(
-        !pool.is_released(abandoned_bytes.0, abandoned_bytes.1),
-        "the buffer of a dropped read is still the device's"
+        !pool.is_released(run_address, run_len as usize),
+        "the run of a dropped read is still the device's"
     );
 
     // The device answers with nobody waiting, into memory that is still
-    // the request's. The interrupt finishes the request: the buffer hears
-    // the answer, and goes.
+    // the request's. The interrupt finishes the request: the buffer is
+    // handed the bytes, hears the answer, and goes.
     {
         let ring = ring(&device);
         let written = pool.respond_into_live_memory(&ring, token, &read_response(0x44, 512));
         ring.device_complete(token, written);
     }
     device.handle_interrupt();
-    assert_eq!(probe.completions(), [Ok(())]);
+    assert_eq!(
+        probe.heard(),
+        [Heard::Delivered(vec![0x44; 512]), Heard::Completed(Ok(()))]
+    );
     assert_eq!(probe.drops(), 1);
     assert!(
-        pool.is_released(abandoned_bytes.0, abandoned_bytes.1),
-        "the device's answer is what frees the dropped read's buffer"
+        pool.is_released(run_address, run_len as usize),
+        "the device's answer is what frees the dropped read's run"
     );
+    assert_eq!(pool.live_requests(), 0);
     assert_eq!(device.request_counts().reads, 1);
 
     // The slot is free again: the next request goes straight through.
@@ -1155,8 +1332,7 @@ fn test_geometry() -> BlockGeometry {
         physical_block_exp: 0,
         min_io_blocks: 0,
         opt_io_blocks: 0,
-        max_segments: 1,
-        max_segment_bytes: u32::MAX,
+        max_transfer_bytes: u32::MAX as usize,
         capacity_blocks: 8,
     }
 }
@@ -1361,8 +1537,7 @@ impl BlockDevice for MemoryBlockDevice {
             physical_block_exp: 0,
             min_io_blocks: 0,
             opt_io_blocks: 0,
-            max_segments: 1,
-            max_segment_bytes: u32::MAX,
+            max_transfer_bytes: u32::MAX as usize,
             capacity_blocks: self.blocks.lock().len() / self.block_size,
         }
     }
@@ -1708,4 +1883,301 @@ fn a_swap_in_dropped_mid_read_leaves_the_token_valid() {
         expected
     );
     assert_eq!(backend.state.lock().available_blocks(), 4);
+}
+
+/// Counts the times a task was woken.
+#[derive(Default)]
+struct Wakes(AtomicUsize);
+
+impl Wakes {
+    fn count(&self) -> usize {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+impl alloc::task::Wake for Wakes {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// Polls `future` once, as a task that `wakes` counts the wake-ups of.
+fn poll_counting<F: Future>(future: Pin<&mut F>, wakes: &Arc<Wakes>) -> Poll<F::Output> {
+    let waker = core::task::Waker::from(Arc::clone(wakes));
+    future.poll(&mut Context::from_waker(&waker))
+}
+
+/// A read's response whose status byte is `status`.
+fn read_response_with_status(byte: u8, len: usize, status: u8) -> Vec<u8> {
+    let mut response = vec![byte; len];
+    response.push(status);
+    response
+}
+
+fn live_runs(device: &TestDevice) -> usize {
+    device.object().transport.pool().live_requests()
+}
+
+#[test]
+fn a_read_is_delivered_whole_before_it_is_completed() {
+    let device = device();
+    let probe = Arc::new(Probe::default());
+    let mut read = pin!(device.read(0, TestBuffer::host(1024).with_probe(&probe)));
+    assert!(block_on(poll_once(read.as_mut())).is_none());
+    assert!(
+        probe.heard().is_empty(),
+        "nothing is delivered before the answer"
+    );
+
+    complete(&device, 0, &read_response(0x9d, 1024));
+
+    // The bytes reach the buffer before the buffer is told the request is
+    // over, because completing it is what publishes it to its consumers.
+    assert_eq!(
+        probe.heard(),
+        [Heard::Delivered(vec![0x9d; 1024]), Heard::Completed(Ok(())),]
+    );
+    let (result, buffer) =
+        answered(block_on(poll_once(read.as_mut())).expect("the read has completed"));
+    assert_eq!(result, Ok(()));
+    assert_eq!(buffer.bytes(), [0x9d_u8; 1024]);
+}
+
+#[test]
+fn a_failed_or_short_read_delivers_nothing() {
+    // The device answers with an error status after writing the payload.
+    let device = device();
+    let probe = Arc::new(Probe::default());
+    let mut read = pin!(device.read(0, TestBuffer::host(512).with_probe(&probe)));
+    assert!(block_on(poll_once(read.as_mut())).is_none());
+    complete(&device, 0, &read_response_with_status(0x41, 512, 1));
+    assert_eq!(probe.heard(), [Heard::Completed(Err(IoError::DeviceFault))]);
+    let (result, buffer) =
+        answered(block_on(poll_once(read.as_mut())).expect("the read has completed"));
+    assert_eq!(result, Err(IoError::DeviceFault));
+    assert_eq!(
+        buffer.bytes(),
+        [0_u8; 512],
+        "the caller's bytes are untouched"
+    );
+
+    // The device claims success but only filled half of the chain.
+    let device = device_with(0, |_| {});
+    let probe = Arc::new(Probe::default());
+    let mut read = pin!(device.read(0, TestBuffer::host(1024).with_probe(&probe)));
+    assert!(block_on(poll_once(read.as_mut())).is_none());
+    {
+        let ring = ring(&device);
+        ring.device_respond(0, &read_response(0x42, 1024));
+        ring.device_complete(0, 513);
+    }
+    device.handle_interrupt();
+    assert_eq!(probe.heard(), [Heard::Completed(Err(IoError::DeviceFault))]);
+    let (result, buffer) =
+        answered(block_on(poll_once(read.as_mut())).expect("the read has completed"));
+    assert_eq!(result, Err(IoError::DeviceFault));
+    assert_eq!(
+        buffer.bytes(),
+        [0_u8; 1024],
+        "the caller's bytes are untouched"
+    );
+}
+
+#[test]
+fn the_bytes_of_a_write_are_copied_before_the_chain_is_published() {
+    let device = device();
+    let observer = device.clone();
+    let probe = Arc::new(Probe::default());
+    let kicks = device.object().transport.kick_count();
+    let buffer = TestBuffer::host_filled(&[0x61; 512])
+        .with_probe(&probe)
+        .looking_when_filled(move || Heard::Filled {
+            // Looked at from inside the copy: the ring is free for this
+            // to take, so the copy holds no lock of the driver.
+            in_flight: ring(&observer).in_flight_chains(),
+            kicks: observer.object().transport.kick_count(),
+        });
+    let mut write = pin!(device.write(1, buffer));
+
+    assert!(block_on(poll_once(write.as_mut())).is_none());
+
+    assert_eq!(
+        probe.heard(),
+        [Heard::Filled {
+            in_flight: 0,
+            kicks
+        }]
+    );
+    assert_eq!(ring(&device).in_flight_chains(), 1);
+    assert_eq!(device.object().transport.kick_count(), kicks + 1);
+}
+
+#[test]
+fn a_request_parks_until_a_run_comes_back_and_then_takes_it() {
+    let device = device();
+    let pool = device.object().transport.pool().clone();
+    pool.admit_only(1);
+    let first_token = next_token(&device);
+    let mut first = pin!(device.read(0, TestBuffer::host(512)));
+    assert!(block_on(poll_once(first.as_mut())).is_none());
+    assert_eq!(live_runs(&device), 1);
+    let second_token = next_token(&device);
+    let kicks = device.object().transport.kick_count();
+
+    let wakes = Arc::new(Wakes::default());
+    let mut second = pin!(device.read(1, TestBuffer::host(512)));
+    assert!(poll_counting(second.as_mut(), &wakes).is_pending());
+    assert_eq!(live_runs(&device), 1, "the second request holds no run");
+    assert_eq!(
+        ring(&device).in_flight_chains(),
+        1,
+        "and no slot of the ring"
+    );
+    assert_eq!(device.object().transport.kick_count(), kicks);
+    assert_eq!(wakes.count(), 0, "it is parked, not spinning");
+
+    // The first answer frees the run, which wakes the parked request.
+    complete(&device, first_token, &read_response(0x01, 512));
+    assert_eq!(wakes.count(), 1);
+    let (result, _) =
+        answered(block_on(poll_once(first.as_mut())).expect("the first read has completed"));
+    assert_eq!(result, Ok(()));
+
+    assert!(poll_counting(second.as_mut(), &wakes).is_pending());
+    assert_eq!(
+        ring(&device).in_flight_chains(),
+        1,
+        "the second chain is issued"
+    );
+    assert_eq!(device.object().transport.kick_count(), kicks + 1);
+    complete(&device, second_token, &read_response(0x02, 512));
+    let (result, buffer) = answered(block_on(poll_once(second.as_mut())).expect("done"));
+    assert_eq!(result, Ok(()));
+    assert_eq!(buffer.bytes(), [0x02_u8; 512]);
+    assert_eq!(live_runs(&device), 0);
+}
+
+/// The run is freed after the allocation was refused and before the
+/// caller declared that it would wait: the declaration's mark is already
+/// past the free, so parking on it alone would sleep forever. Only asking
+/// again after the declaration finds the run.
+#[test]
+fn a_run_freed_between_the_refusal_and_the_wait_is_not_slept_through() {
+    let device = device();
+    let pool = device.object().transport.pool().clone();
+    pool.admit_only(1);
+    let first_token = next_token(&device);
+    // Nobody waits for the first read, so its slot is free again the
+    // moment it is answered.
+    drop(block_on(device.submit_read(0, TestBuffer::host(512))));
+    assert_eq!(live_runs(&device), 1);
+    let observer = device.clone();
+    pool.on_refusal(move || complete(&observer, first_token, &read_response(0x21, 512)));
+    let kicks = device.object().transport.kick_count();
+
+    let mut second = pin!(device.read(1, TestBuffer::host(512)));
+    assert!(
+        block_on(poll_once(second.as_mut())).is_none(),
+        "the second read is with the device, unanswered"
+    );
+
+    assert_eq!(
+        ring(&device).in_flight_chains(),
+        1,
+        "the second chain was issued in the same poll, not parked"
+    );
+    assert_eq!(device.object().transport.kick_count(), kicks + 1);
+    assert_eq!(live_runs(&device), 1, "the first run went, the second came");
+}
+
+/// Every way a request ends gives its run back to the memory it came
+/// from.
+#[test]
+fn every_way_a_request_ends_gives_its_run_back() {
+    // Answered and collected, a read and a write.
+    let device = device();
+    let mut read = pin!(device.read(0, TestBuffer::host(512)));
+    assert!(block_on(poll_once(read.as_mut())).is_none());
+    assert_eq!(live_runs(&device), 1, "a request in flight holds its run");
+    complete(&device, 0, &read_response(1, 512));
+    assert_eq!(
+        live_runs(&device),
+        0,
+        "the answer frees it, before collection"
+    );
+    drop(answered(block_on(poll_once(read.as_mut())).expect("done")));
+    let token = next_token(&device);
+    let mut write = pin!(device.write(0, TestBuffer::host(512)));
+    assert!(block_on(poll_once(write.as_mut())).is_none());
+    assert_eq!(live_runs(&device), 1);
+    complete(&device, token, &[0]);
+    assert_eq!(live_runs(&device), 0);
+    drop(answered(block_on(poll_once(write.as_mut())).expect("done")));
+
+    // Answered with an error status, and answered short.
+    let device = device_with(0, |_| {});
+    let mut read = pin!(device.read(0, TestBuffer::host(512)));
+    assert!(block_on(poll_once(read.as_mut())).is_none());
+    complete(&device, 0, &read_response_with_status(1, 512, 1));
+    assert_eq!(live_runs(&device), 0);
+    drop(answered(block_on(poll_once(read.as_mut())).expect("done")));
+    let token = next_token(&device);
+    let mut read = pin!(device.read(0, TestBuffer::host(1024)));
+    assert!(block_on(poll_once(read.as_mut())).is_none());
+    {
+        let ring = ring(&device);
+        ring.device_respond(token, &read_response(2, 1024));
+        ring.device_complete(token, 513);
+    }
+    device.handle_interrupt();
+    assert_eq!(live_runs(&device), 0);
+    drop(answered(block_on(poll_once(read.as_mut())).expect("done")));
+
+    // The waiter went before the answer.
+    let device = device_with(0, |_| {});
+    let token = next_token(&device);
+    drop(block_on(device.submit_read(0, TestBuffer::host(512))));
+    assert_eq!(
+        live_runs(&device),
+        1,
+        "a detached request still holds its run"
+    );
+    complete(&device, token, &read_response(3, 512));
+    assert_eq!(live_runs(&device), 0);
+
+    // The submission went while it waited for room in the ring, holding
+    // its run.
+    let device = device_with(0, |_| {});
+    let first = block_on(device.submit_read(0, TestBuffer::host(512)));
+    let second = block_on(device.submit_read(1, TestBuffer::host(512)));
+    {
+        let mut third = pin!(device.submit_read(2, TestBuffer::host(512)));
+        assert!(block_on(poll_once(third.as_mut())).is_none());
+        assert_eq!(
+            live_runs(&device),
+            3,
+            "the third holds a run while it waits"
+        );
+    }
+    assert_eq!(
+        live_runs(&device),
+        2,
+        "dropping the submission gives it back"
+    );
+    drop((first, second));
+
+    // The device broke the used-ring contract: every request in flight,
+    // awaited or not, is failed with its run.
+    let device = device_with(0, |_| {});
+    let waiter = block_on(device.submit_read(0, TestBuffer::host(512)));
+    drop(block_on(device.submit_write(1, TestBuffer::host(512))));
+    assert_eq!(live_runs(&device), 2);
+    let stray = next_token(&device);
+    ring(&device).device_complete(stray, 1);
+    device.handle_interrupt();
+    assert_eq!(live_runs(&device), 0);
+    drop(answered(block_on(waiter)));
+    // A stopped device is refused before any run is drawn.
+    drop(answered(block_on(device.read(2, TestBuffer::host(512)))));
+    assert_eq!(live_runs(&device), 0);
 }

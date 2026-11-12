@@ -1,4 +1,4 @@
-use alloc::alloc::{alloc_zeroed, dealloc};
+use alloc::alloc::{alloc, alloc_zeroed, dealloc};
 use core::alloc::Layout;
 use core::future::Future;
 use core::ptr::NonNull;
@@ -8,6 +8,7 @@ use helios_hal::dma::{DeviceAddress, DmaAddressing, DmaBuffer, DmaError, DmaMemo
 use helios_hal::io::{IoError, IoResult};
 use helios_hal::iommu::{DmaAccess, DmaTranslation};
 use helios_hal::mmio;
+use helios_hal::pmm::PhysFrame;
 
 pub trait DeviceBus: Send + Sync + 'static {
     type DmaPool: DmaMemory;
@@ -128,6 +129,28 @@ impl<P> MmioBus<P> {
     }
 }
 
+/// The largest run the kernel heap can be asked for: `isize::MAX` rounded
+/// down to a page, the most [`Layout`] accepts at page alignment.
+const HEAP_RUN_BYTES: usize = isize::MAX as usize & !(PhysFrame::SIZE - 1);
+
+impl IdentityDmaPool {
+    fn carve(&self, layout: Layout, zeroed: bool) -> Result<IdentityDmaBuffer, DmaError> {
+        // SAFETY: the callers pass non-zero-sized layouts, as the
+        // allocator requires.
+        let ptr = unsafe {
+            if zeroed {
+                alloc_zeroed(layout)
+            } else {
+                alloc(layout)
+            }
+        };
+        let ptr = NonNull::new(ptr).ok_or(DmaError::Exhausted {
+            bytes: layout.size(),
+        })?;
+        Ok(IdentityDmaBuffer { ptr, layout })
+    }
+}
+
 impl DmaMemory for IdentityDmaPool {
     type Buffer = IdentityDmaBuffer;
 
@@ -140,11 +163,21 @@ impl DmaMemory for IdentityDmaPool {
     }
 
     fn allocate(&self, layout: Layout, _access: DmaAccess) -> Result<Self::Buffer, DmaError> {
-        let ptr = unsafe { alloc_zeroed(layout) };
-        let ptr = NonNull::new(ptr).ok_or(DmaError::Exhausted {
-            bytes: layout.size(),
-        })?;
-        Ok(IdentityDmaBuffer { ptr, layout })
+        self.carve(layout, true)
+    }
+
+    /// The heap's allocation, without the pass that zeroes it.
+    fn allocate_overwritten(
+        &self,
+        layout: Layout,
+        _access: DmaAccess,
+    ) -> Result<Self::Buffer, DmaError> {
+        self.carve(layout, false)
+    }
+
+    /// One heap allocation: as long as a layout can describe.
+    fn max_run_bytes(&self) -> usize {
+        HEAP_RUN_BYTES
     }
 
     /// Heap memory has no signal for space coming back: a refusal is not
@@ -185,19 +218,17 @@ impl DmaMemory for IdentityDmaPool {
     }
 }
 
-impl DmaMemory for OffsetDmaPool {
-    type Buffer = OffsetDmaBuffer;
-
-    fn allocate_resident(
-        &self,
-        layout: Layout,
-        access: DmaAccess,
-    ) -> Result<Self::Buffer, DmaError> {
-        self.allocate(layout, access)
-    }
-
-    fn allocate(&self, layout: Layout, _access: DmaAccess) -> Result<Self::Buffer, DmaError> {
-        let ptr = unsafe { alloc_zeroed(layout) };
+impl OffsetDmaPool {
+    fn carve(&self, layout: Layout, zeroed: bool) -> Result<OffsetDmaBuffer, DmaError> {
+        // SAFETY: the callers pass non-zero-sized layouts, as the
+        // allocator requires.
+        let ptr = unsafe {
+            if zeroed {
+                alloc_zeroed(layout)
+            } else {
+                alloc(layout)
+            }
+        };
         let ptr = NonNull::new(ptr).ok_or(DmaError::Exhausted {
             bytes: layout.size(),
         })?;
@@ -215,6 +246,37 @@ impl DmaMemory for OffsetDmaPool {
             layout,
             physical_address,
         })
+    }
+}
+
+impl DmaMemory for OffsetDmaPool {
+    type Buffer = OffsetDmaBuffer;
+
+    fn allocate_resident(
+        &self,
+        layout: Layout,
+        access: DmaAccess,
+    ) -> Result<Self::Buffer, DmaError> {
+        self.allocate(layout, access)
+    }
+
+    fn allocate(&self, layout: Layout, _access: DmaAccess) -> Result<Self::Buffer, DmaError> {
+        self.carve(layout, true)
+    }
+
+    /// The heap's allocation, without the pass that zeroes it.
+    fn allocate_overwritten(
+        &self,
+        layout: Layout,
+        _access: DmaAccess,
+    ) -> Result<Self::Buffer, DmaError> {
+        self.carve(layout, false)
+    }
+
+    /// One heap allocation, contiguous in physical memory through the
+    /// linear offset: as long as a layout can describe.
+    fn max_run_bytes(&self) -> usize {
+        HEAP_RUN_BYTES
     }
 
     /// Heap memory has no signal for space coming back: a refusal is not
@@ -343,6 +405,21 @@ impl<P: DmaMemory> DmaMemory for PlatformDmaPool<P> {
 
     fn allocate(&self, layout: Layout, access: DmaAccess) -> Result<Self::Buffer, DmaError> {
         self.translated(self.inner.allocate(layout, access)?)
+    }
+
+    fn allocate_overwritten(
+        &self,
+        layout: Layout,
+        access: DmaAccess,
+    ) -> Result<Self::Buffer, DmaError> {
+        self.translated(self.inner.allocate_overwritten(layout, access)?)
+    }
+
+    /// What the wrapped memory serves: the translation maps what the
+    /// inner pool hands out, and refuses a run it cannot map contiguously
+    /// when the run is translated.
+    fn max_run_bytes(&self) -> usize {
+        self.inner.max_run_bytes()
     }
 
     fn want_space(&self) -> DmaSpaceMark {

@@ -4,8 +4,10 @@
 //! Every block device the kernel drives carries [`BlockPages`], so one
 //! device type serves the block cache and the scratch disk alike. Every
 //! byte a request carries is memory its disk allocated
-//! ([`BlockDevice::memory`]), never the kernel heap, so the device reaches
-//! it in place. The memory of a request is either the request's own — a
+//! ([`BlockDevice::memory`]), never the kernel heap; the driver copies it
+//! to and from memory of its own for the device ([`BlockBuffer::fill`] and
+//! [`BlockBuffer::deliver`]), so the device never reaches the buffer
+//! itself. The memory of a request is either the request's own — a
 //! scratch or swap buffer its holder fills or reads, a page the cache
 //! staged for a write — or the block cache's entries, whose pages the
 //! cache allocated from the same disk and which the request holds through
@@ -71,7 +73,7 @@ pub struct BlockPages<Memory> {
 // while the buffer lives; nothing in it is tied to a thread.
 unsafe impl<Memory: Send> Send for BlockPages<Memory> {}
 // SAFETY: a shared buffer only reads: its byte view reads memory it owns,
-// and its segments are addresses, not accesses.
+// and its pages are addresses, not accesses.
 unsafe impl<Memory: Sync> Sync for BlockPages<Memory> {}
 
 /// The first byte of `memory`, taken from the buffer's own pointer so a
@@ -144,17 +146,54 @@ impl<Memory> Drop for BlockPages<Memory> {
     }
 }
 
-impl<Memory: DmaBuffer> BlockBuffer for BlockPages<Memory> {
-    fn segments(&self) -> impl Iterator<Item = NonNull<[u8]>> + '_ {
-        let owned = self
-            .owned
-            .as_ref()
-            .map(|memory| NonNull::slice_from_raw_parts(start(memory), memory.len()));
-        let pages = self
-            .pages
-            .iter()
-            .map(|page| NonNull::slice_from_raw_parts(*page, CACHE_BLOCK_BYTES));
-        owned.into_iter().chain(pages)
+/// The request's memory laid end to end: the buffer's own run, then the
+/// cache pages of a cache request in block order.
+///
+/// Concurrency contract: the buffer has one owner at a time and no request
+/// holds it while `fill` or `deliver` run, so neither synchronises with
+/// anything: `fill` runs in the submitting task before the device is given
+/// the request, `deliver` in the driver's completion path, which is the
+/// device's interrupt handler or the task that drained the answer. Both
+/// are copies into or out of memory the request owns or holds through its
+/// entries' state words, and take no lock and allocate nothing.
+impl<Memory: DmaBuffer + AsRef<[u8]> + AsMut<[u8]>> BlockBuffer for BlockPages<Memory> {
+    fn len(&self) -> usize {
+        self.owned.as_ref().map_or(0, DmaBuffer::len) + self.pages.len() * CACHE_BLOCK_BYTES
+    }
+
+    fn fill(&mut self, to: &mut [u8]) {
+        debug_assert_eq!(to.len(), self.len(), "a write is filled whole");
+        let (own, pages) = to.split_at_mut(self.owned.as_ref().map_or(0, DmaBuffer::len));
+        if let Some(memory) = &self.owned {
+            own.copy_from_slice(memory.as_ref());
+        }
+        let (blocks, _) = pages.as_chunks_mut::<CACHE_BLOCK_BYTES>();
+        for (page, to) in self.pages.iter().zip(blocks) {
+            // SAFETY: the page is a cache entry's the run holds, or one
+            // the request staged, so nothing writes it while the request
+            // carries it, and it is a whole cache block.
+            to.copy_from_slice(unsafe {
+                core::slice::from_raw_parts(page.as_ptr(), CACHE_BLOCK_BYTES)
+            });
+        }
+    }
+
+    fn deliver(&mut self, from: &[u8]) {
+        debug_assert_eq!(from.len(), self.len(), "a read is delivered whole");
+        let (own, pages) = from.split_at(self.owned.as_ref().map_or(0, DmaBuffer::len));
+        if let Some(memory) = &mut self.owned {
+            memory.as_mut().copy_from_slice(own);
+        }
+        let (blocks, _) = pages.as_chunks::<CACHE_BLOCK_BYTES>();
+        for (page, from) in self.pages.iter().zip(blocks) {
+            // SAFETY: the page is a cache entry's the run holds locked for
+            // this read, which no reader sees before `complete` publishes
+            // it, so this is the only access; it is a whole cache block.
+            unsafe {
+                core::slice::from_raw_parts_mut(page.as_ptr(), CACHE_BLOCK_BYTES)
+                    .copy_from_slice(from);
+            }
+        }
     }
 
     fn complete(&mut self, result: IoResult<()>) {

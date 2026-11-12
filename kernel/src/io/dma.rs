@@ -18,7 +18,7 @@
 //!
 //! | Operation | Runs | Synchronisation |
 //! |---|---|---|
-//! | allocate, one bitmap word or fewer (up to 64 pages) | task context, any processor | Lock-free: a CAS on the chunk's state word to enter, then a CAS on one bitmap word. |
+//! | allocate, one bitmap word or fewer (up to 64 pages) | task context, any processor | Lock-free: a CAS on the chunk's state word to enter, then a CAS on one bitmap word. [`DmaArena::allocate_overwritten`] is the same without the zeroing pass over the run. |
 //! | allocate, a run spanning bitmap words | task context, any processor | The arena's `runs` spin lock, which only these allocations take, so two of them cannot livelock. The bits are still claimed by CAS, so a concurrent single-word claim or a free composes without it. No interrupt handler reaches the lock. |
 //! | free (the drop of an [`ArenaBuffer`]) | any processor, task context or interrupt handler | Wait-free: atomics of the buffer's own chunk only. No lock, no wake. |
 //! | [`DmaArena::device_range`] | task context, any processor | Lock-free: an Acquire load of the window table, a hash, and a short probe. |
@@ -547,6 +547,15 @@ impl Drop for WindowTables {
     }
 }
 
+/// What the pages of a run hold when an allocation returns it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fill {
+    /// Zeroes.
+    Zeroed,
+    /// Whatever the pages held: the caller writes every byte first.
+    Unspecified,
+}
+
 /// The memory one device reaches.
 pub struct DmaArena<S: ChunkSource> {
     chunk_bytes: usize,
@@ -657,6 +666,36 @@ impl<S: ChunkSource> DmaArena<S> {
     ///
     /// Task context only.
     pub fn allocate(&self, class: ChunkClass, layout: Layout) -> Result<ArenaBuffer, DmaError> {
+        self.take(class, layout, Fill::Zeroed)
+    }
+
+    /// [`DmaArena::allocate`] without the pass that zeroes the pages: the
+    /// run holds whatever its pages held, which may be bytes a device
+    /// wrote after the run before went back.
+    ///
+    /// The caller writes every byte of the run before anything reads it:
+    /// a transfer run is filled whole before a device reads it, or is
+    /// accepted only after a device wrote it whole. The out-of-band
+    /// metadata never lives in the pages, so stale bytes in them reach
+    /// nothing the allocator reads.
+    ///
+    /// Concurrency contract as [`DmaArena::allocate`]: task context, any
+    /// processor, lock-free within one bitmap word.
+    pub fn allocate_overwritten(
+        &self,
+        class: ChunkClass,
+        layout: Layout,
+    ) -> Result<ArenaBuffer, DmaError> {
+        self.take(class, layout, Fill::Unspecified)
+    }
+
+    /// The longest run an allocation can be: one chunk, which a run never
+    /// spans.
+    pub fn max_run_bytes(&self) -> usize {
+        self.chunk_bytes
+    }
+
+    fn take(&self, class: ChunkClass, layout: Layout, fill: Fill) -> Result<ArenaBuffer, DmaError> {
         let bytes = layout.size();
         if bytes == 0 {
             return Err(DmaError::InvalidLength {
@@ -687,7 +726,7 @@ impl<S: ChunkSource> DmaArena<S> {
             if slot != first {
                 hint.store(slot as u32, Ordering::Relaxed);
             }
-            return Ok(self.buffer(chunk, first_page, pages, bytes));
+            return Ok(self.buffer(chunk, first_page, pages, bytes, fill));
         }
         Err(DmaError::Exhausted { bytes })
     }
@@ -779,14 +818,24 @@ impl<S: ChunkSource> DmaArena<S> {
         first_page
     }
 
-    fn buffer(&self, chunk: &Chunk, first_page: usize, pages: usize, bytes: usize) -> ArenaBuffer {
+    fn buffer(
+        &self,
+        chunk: &Chunk,
+        first_page: usize,
+        pages: usize,
+        bytes: usize,
+        fill: Fill,
+    ) -> ArenaBuffer {
         let offset = first_page * PAGE_BYTES;
         let base = chunk.base.load(Ordering::Relaxed);
         let ptr = ptr::with_exposed_provenance_mut::<u8>(base + offset);
-        // SAFETY: the bitmap gave this task the run, which lies inside the
-        // chunk the source lent, so nothing else holds a reference to it.
-        // The device may write it, which a byte write tolerates.
-        unsafe { ptr.write_bytes(0, pages * PAGE_BYTES) };
+        if fill == Fill::Zeroed {
+            // SAFETY: the bitmap gave this task the run, which lies inside
+            // the chunk the source lent, so nothing else holds a reference
+            // to it. The device may write it, which a byte write
+            // tolerates.
+            unsafe { ptr.write_bytes(0, pages * PAGE_BYTES) };
+        }
         ArenaBuffer {
             ptr: NonNull::new(ptr).expect("a chunk's pages are never at address zero"),
             len: bytes,
@@ -1151,6 +1200,36 @@ mod tests {
             .expect("the page again");
         assert_eq!(again.as_ptr(), address, "the freed page is the first fit");
         assert!(again.as_ref().iter().all(|&byte| byte == 0));
+    }
+
+    #[test]
+    fn an_overwritten_allocation_leaves_the_pages_as_the_device_left_them() {
+        let (arena, _) = arena(4 * PAGE_BYTES, &[ChunkClass::ReadWrite], 1);
+        let mut buffer = arena
+            .allocate(ChunkClass::ReadWrite, pages(2))
+            .expect("two pages");
+        buffer.as_mut().fill(0xaa);
+        let address = buffer.as_ptr();
+        drop(buffer);
+
+        let again = arena
+            .allocate_overwritten(ChunkClass::ReadWrite, pages(2))
+            .expect("the pages again");
+        assert_eq!(again.as_ptr(), address, "the freed pages are the first fit");
+        assert_eq!(again.len(), 2 * PAGE_BYTES);
+        assert!(
+            again.as_ref().iter().all(|&byte| byte == 0xaa),
+            "an overwritten allocation does not pay for a zeroing pass"
+        );
+        drop(again);
+
+        // The zeroing allocation still zeroes what the other left.
+        let zeroed = arena
+            .allocate(ChunkClass::ReadWrite, pages(2))
+            .expect("the pages once more");
+        assert_eq!(zeroed.as_ptr(), address);
+        assert!(zeroed.as_ref().iter().all(|&byte| byte == 0));
+        assert_eq!(arena.max_run_bytes(), 4 * PAGE_BYTES);
     }
 
     #[test]
