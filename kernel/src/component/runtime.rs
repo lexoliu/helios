@@ -629,10 +629,6 @@ where
         &self.execution_context.filesystem
     }
 
-    pub(crate) fn filesystem_mut(&mut self) -> &mut FileSystem {
-        &mut self.execution_context.filesystem
-    }
-
     pub(crate) fn arguments(&self) -> &[String] {
         &self.execution_context.arguments
     }
@@ -691,9 +687,9 @@ where
         self.entropy.secure_u64(self.runtime_state.root_entropy())
     }
 
-    pub(crate) fn insecure_random_bytes(&mut self, len: usize) -> Vec<u8> {
+    pub(crate) fn fill_insecure_random(&mut self, buffer: &mut [u8]) {
         self.entropy
-            .insecure_bytes(self.runtime_state.root_entropy(), len)
+            .fill_insecure(self.runtime_state.root_entropy(), buffer);
     }
 
     pub(crate) fn insecure_random_u64(&mut self) -> u64 {

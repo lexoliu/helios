@@ -94,6 +94,8 @@ pub(crate) mod errno {
     /// `__WASI_ERRNO_MFILE`: the process has no free descriptor number
     /// below its descriptor limit.
     pub(crate) const MFILE: i32 = 33;
+    /// `__WASI_ERRNO_MSGSIZE`: a datagram larger than the protocol can carry.
+    pub(crate) const MSGSIZE: i32 = 35;
     /// `__WASI_ERRNO_NAMETOOLONG`: filename too long.
     pub(crate) const NAMETOOLONG: i32 = 37;
     pub(crate) const NETDOWN: i32 = 38;

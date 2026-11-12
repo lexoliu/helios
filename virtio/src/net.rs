@@ -2508,58 +2508,86 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             tx_payloads,
         } = &mut *state;
         let mut submitted = 0usize;
-        for frame in frames {
-            let checksum = frame.checksum.map(TxChecksumMeta::from);
-            let gso = frame.segmentation.map(TxGsoMeta::from);
-            if checksum.is_some() {
-                assert!(
-                    self.tx_checksum_negotiated,
-                    "checksum-offload frame submitted without negotiated VIRTIO_NET_F_CSUM"
-                );
-            }
-            if let Some(gso) = gso {
-                self.assert_segmentation_negotiated(gso);
-            }
-            let payload = frame.payload.filter(|payload| !payload.is_empty());
-            // A frame is one buffer (the slot-resident prefix) plus one
-            // more when it carries a scatter payload. Asking the ring
-            // rather than counting descriptors is what lets an indirect
-            // chain cost a single ring slot instead of two.
-            let buffers = if payload.is_some() { 2 } else { 1 };
-            if !tx_queue.has_room_for(buffers) {
-                break;
-            }
-            let token = tx_queue.next_free_descriptor();
-            let token_index = usize::from(token);
-            assert!(
-                !tx_in_flight.get(token_index),
-                "virtio net TX descriptor {token} is still in flight"
-            );
-            let slot = tx_slot_buffer(tx_buffers.as_mut(), *tx_buffer_len, token_index);
-            let prefix_len = write_tx_payload(slot, self.header_len, frame.bytes, checksum, gso)?;
-            let prefix: &[u8] = &slot[..prefix_len];
-            let submitted_token = match payload {
-                Some(payload) => {
-                    tx_queue.submit_read_only_chain_deferred(&self.transport, &[prefix, payload])?
+        // Placing a frame can fail after earlier frames of the batch are
+        // already on the ring. Those frames must reach the device whatever
+        // happens, so a failure leaves this block through `placed` and lands
+        // on the publish below instead of returning past it.
+        let placed: IoResult<()> = 'place: {
+            for frame in frames {
+                let checksum = frame.checksum.map(TxChecksumMeta::from);
+                let gso = frame.segmentation.map(TxGsoMeta::from);
+                if checksum.is_some() {
+                    assert!(
+                        self.tx_checksum_negotiated,
+                        "checksum-offload frame submitted without negotiated VIRTIO_NET_F_CSUM"
+                    );
                 }
-                None => tx_queue.submit_read_only_deferred(&self.transport, prefix)?,
-            };
-            assert_eq!(
-                submitted_token, token,
-                "virtio net TX descriptor allocation moved while scatter frame was prepared"
-            );
-            tx_in_flight.set(token_index);
-            // The device now owns the descriptor and reads the payload
-            // in place; the handle stays here until it hands the
-            // descriptor back.
-            tx_payloads[token_index] = payload.cloned();
-            submitted += 1;
-        }
+                if let Some(gso) = gso {
+                    self.assert_segmentation_negotiated(gso);
+                }
+                let payload = frame.payload.filter(|payload| !payload.is_empty());
+                // A frame is one buffer (the slot-resident prefix) plus one
+                // more when it carries a scatter payload. Asking the ring
+                // rather than counting descriptors is what lets an indirect
+                // chain cost a single ring slot instead of two.
+                let buffers = if payload.is_some() { 2 } else { 1 };
+                if !tx_queue.has_room_for(buffers) {
+                    break;
+                }
+                let token = tx_queue.next_free_descriptor();
+                let token_index = usize::from(token);
+                assert!(
+                    !tx_in_flight.get(token_index),
+                    "virtio net TX descriptor {token} is still in flight"
+                );
+                let slot = tx_slot_buffer(tx_buffers.as_mut(), *tx_buffer_len, token_index);
+                let prefix_len =
+                    match write_tx_payload(slot, self.header_len, frame.bytes, checksum, gso) {
+                        Ok(len) => len,
+                        Err(error) => break 'place Err(error),
+                    };
+                let prefix: &[u8] = &slot[..prefix_len];
+                let submission = match payload {
+                    Some(payload) => tx_queue
+                        .submit_read_only_chain_deferred(&self.transport, &[prefix, payload]),
+                    None => tx_queue.submit_read_only_deferred(&self.transport, prefix),
+                };
+                let submitted_token = match submission {
+                    Ok(token) => token,
+                    Err(error) => break 'place Err(error),
+                };
+                assert_eq!(
+                    submitted_token, token,
+                    "virtio net TX descriptor allocation moved while scatter frame was prepared"
+                );
+                tx_in_flight.set(token_index);
+                // The device now owns the descriptor and reads the payload
+                // in place; the handle stays here until it hands the
+                // descriptor back.
+                tx_payloads[token_index] = payload.cloned();
+                submitted += 1;
+            }
+            Ok(())
+        };
         if submitted != 0 {
             tx_queue.publish();
             tx_queue.notify(&self.transport);
         }
-        Ok(Some(submitted))
+        match placed {
+            Ok(()) => Ok(Some(submitted)),
+            // The published frames are accepted and reported as such; the
+            // frame that failed is left to the caller's next pass, where it
+            // heads its batch and returns its error with nothing in flight.
+            Err(error) if submitted != 0 => {
+                tracing::warn!(
+                    %error,
+                    submitted,
+                    "virtio-net transmit batch stopped at a frame that could not be placed"
+                );
+                Ok(Some(submitted))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Samples the counters a queue pair's waiter races against: the
@@ -4556,6 +4584,64 @@ mod tests {
             .expect("the transmit ring is uncontended in tests");
         assert_eq!(submitted, 1);
         token
+    }
+
+    /// A batch whose second frame cannot be placed: the first is already
+    /// on the ring, so it is published and reported as accepted rather
+    /// than left in flight behind an error, and the frame that failed
+    /// reports its own error on the next pass, where it heads the batch.
+    #[test]
+    fn a_batch_that_fails_partway_publishes_the_frames_already_placed() {
+        let harness = NetHarness::new(0);
+        let (token, oversized) = {
+            let state = harness.device.queue_pairs[0]
+                .tx_state
+                .try_lock()
+                .expect("test transmit state is uncontended");
+            (
+                state.tx_queue.next_free_descriptor(),
+                alloc::vec![0x44_u8; state.tx_buffer_len],
+            )
+        };
+        let good = [0x33_u8; 54];
+        let frame = |bytes| helios_netstack::TxFrameRef {
+            bytes,
+            payload: None,
+            checksum: None,
+            segmentation: None,
+        };
+
+        let accepted = harness
+            .device
+            .try_transmit_scatter_immediate_on_pair(0, &[frame(&good), frame(&oversized)])
+            .expect("the placed frame is reported, not the one that failed")
+            .expect("the transmit ring is uncontended in tests");
+        assert_eq!(accepted, 1);
+        assert!(
+            matches!(
+                harness
+                    .device
+                    .try_transmit_scatter_immediate_on_pair(0, &[frame(&oversized)]),
+                Err(IoError::InvalidBufferLength { .. })
+            ),
+            "the frame that failed returns its error once nothing is in flight behind it"
+        );
+
+        complete_tx(&harness, token);
+        let reclaimed = harness
+            .device
+            .reclaim_transmit_completions_immediate_on_pair(0, 8)
+            .expect("the completion is well formed")
+            .expect("the transmit ring is uncontended in tests");
+        assert_eq!(reclaimed, 1);
+        let state = harness.device.queue_pairs[0]
+            .tx_state
+            .try_lock()
+            .expect("uncontended");
+        assert!(
+            !state.tx_in_flight.get(usize::from(token)),
+            "the first frame completed and its descriptor was released"
+        );
     }
 
     fn complete_tx(harness: &NetHarness, token: u16) {

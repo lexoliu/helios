@@ -1290,6 +1290,27 @@ where
         self.receive_queued_bytes
     }
 
+    /// Data this side still owes the peer, in bytes: what has been sent
+    /// and not yet acknowledged, plus what is queued and not yet sent. A
+    /// SYN or FIN in flight counts as one byte, as it does in sequence
+    /// space.
+    pub fn send_queued_bytes(&self) -> u64 {
+        let unsent = self
+            .transmit_queue
+            .as_ref()
+            .map_or(0, |queue| queue.queued_bytes as u64);
+        u64::from(self.bytes_in_flight) + unsent
+    }
+
+    /// Whether the retransmission timer is armed: a sent segment awaits
+    /// acknowledgement, and [`Self::next_deadline_nanos`] includes its
+    /// retransmission deadline.
+    pub fn retransmission_timer_armed(&self) -> bool {
+        self.in_flight
+            .as_ref()
+            .is_some_and(|in_flight| in_flight.front().is_some())
+    }
+
     /// Data held in the out-of-order reassembly queue, in bytes.
     pub fn out_of_order_queued_bytes(&self) -> usize {
         self.out_of_order_queued_bytes
@@ -3169,6 +3190,16 @@ where
         }
         !self.transmit_queue_is_empty()
             || (matches!(self.state, TcpState::FinWait1 | TcpState::LastAck) && !self.fin_queued)
+    }
+
+    /// Whether the socket holds bytes, or a FIN, that
+    /// [`TcpSocket::take_transmit_segment`] could still put on the wire.
+    ///
+    /// Taking a segment moves it into flight, so a caller that has to
+    /// secure somewhere to send it first asks this before taking: a
+    /// `false` answer means a take cannot produce a segment.
+    pub fn has_pending_transmit(&self) -> bool {
+        self.has_persist_pending_data()
     }
 
     fn arm_persist_timer_if_needed(&mut self, now_nanos: u64) {

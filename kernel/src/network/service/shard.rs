@@ -195,12 +195,11 @@ pub(super) struct NetworkShard {
     pub(super) tcp_streams: HandleSlab<helios_netstack::SocketId, MAX_TCP_STREAM_HANDLES>,
     pub(super) tcp_listeners: HandleSlab<TcpListenerState, MAX_TCP_LISTENER_HANDLES>,
     pub(super) udp_sockets: HandleSlab<UdpSocketState, MAX_UDP_SOCKET_HANDLES>,
-    pub(super) dhcp: DhcpClientState,
+    /// The DHCP client. Only the default shard's is ever driven: the
+    /// exchange is broadcast at a moment when the interface has no
+    /// address to hash a flow with, so it demuxes there.
+    pub(super) dhcp: DhcpClient,
     pub(super) dns_servers: DhcpDnsServers,
-    /// Identifier stamped on the next ICMP echo request. ICMP frames
-    /// carry no port, so every one of them is demultiplexed onto shard
-    /// 0 and this counter is that shard's alone.
-    pub(super) next_icmp_echo_identifier: u16,
 }
 
 /// One shard's stack and the per-shard words beside it.
@@ -1035,6 +1034,7 @@ impl NetworkShard {
             slot, INTERNAL_DHCP_SOCKET_INDEX,
             "DHCP internal UDP socket slot changed"
         );
+        let dhcp = DhcpClient::new(stack.config().mac, transaction_id);
         Self {
             stack,
             shard_idx,
@@ -1043,9 +1043,8 @@ impl NetworkShard {
             tcp_streams: HandleSlab::new(),
             tcp_listeners: HandleSlab::new(),
             udp_sockets,
-            dhcp: DhcpClientState::Init { transaction_id },
+            dhcp,
             dns_servers: DhcpDnsServers::new(),
-            next_icmp_echo_identifier: 1,
         }
     }
 
@@ -1072,6 +1071,25 @@ impl NetworkShard {
 
     pub(super) fn is_configured(&self) -> bool {
         self.stack.primary_ipv4_address().is_some()
+    }
+
+    /// Drives the shard's TCP timers and hands the control plane what
+    /// the drive told it.
+    ///
+    /// Driving queues ARP and neighbor-discovery requests, and a
+    /// connection that closed on a timer leaves its closure behind, so a
+    /// shard that sends without ever receiving still owes the control
+    /// plane its events. Every place that drives a shard's stack goes
+    /// through here, the way a receive goes through
+    /// [`NetworkShardSet::dispatch_rx_frame`].
+    pub(super) fn drive_tcp(
+        &mut self,
+        now: StackInstant,
+        control: &NetworkControlPlane,
+    ) -> Result<(), StackError> {
+        let driven = self.stack.drive_tcp(now);
+        self.drain_control_events(control);
+        driven
     }
 
     pub(super) fn drain_control_events(&mut self, control: &NetworkControlPlane) {
@@ -1195,6 +1213,6 @@ impl NetworkShard {
         self.clear_ipv4_routes();
         self.stack.restart_ipv6_autoconfig();
         self.dns_servers.clear();
-        self.dhcp = DhcpClientState::Init { transaction_id };
+        self.dhcp.restart(transaction_id);
     }
 }

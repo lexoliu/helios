@@ -15,7 +15,7 @@ where
     pub(super) interrupts: Arc<GuestInterrupts>,
     activity: crate::InstanceActivity,
     pub(super) parent_instance_id: Option<crate::InstanceId>,
-    pub(super) filesystem: DebugFileSystem<HostRuntimeState<CpuImpl, Net, HostFs>, HostFs>,
+    pub(super) filesystem: Namespace<HostFs>,
     pub(super) clock: crate::KernelClock<CpuImpl, HostRuntimeState<CpuImpl, Net, HostFs>>,
     pub(super) wall_clock_cap: Option<crate::SetWallClockCap>,
     pub(super) cwd: Option<Preview1Cwd>,
@@ -78,7 +78,7 @@ where
         read_serial: crate::SerialReader,
         write_serial: crate::DebugSerialWriter,
         imported_memory: Option<SharedMemory>,
-        filesystem: Option<DebugFileSystemSnapshot>,
+        filesystem: Option<Namespace<HostFs>>,
         descriptors: Option<Preview1DescriptorTable<Net>>,
         signal_state: WasixSignalState,
         thread_signals: WasixSignalState,
@@ -87,10 +87,7 @@ where
         wasix_abi: bool,
         threads: WasixImageThreads<CpuImpl, Net, HostFs>,
     ) -> Self {
-        let filesystem = filesystem.map_or_else(
-            || DebugFileSystem::new(runtime_state.clone()),
-            |snapshot| DebugFileSystem::from_snapshot(runtime_state.clone(), snapshot),
-        );
+        let filesystem = filesystem.unwrap_or_else(|| runtime_state.root_namespace().descend());
         let entropy = crate::EntropyPool::derive(runtime_state.root_entropy(), instance.id().raw());
         let descriptors =
             descriptors.unwrap_or_else(|| Preview1DescriptorTable::from_authority(&authority));
@@ -242,16 +239,16 @@ where
             .map_or(p1::errno::NOTCAPABLE, |_| p1::errno::SUCCESS)
     }
 
-    pub(super) fn require_spawn_authority(&self) -> i32 {
+    pub(super) fn require_spawn_authority(&self) -> Result<SpawnAuthority, i32> {
         self.authority
             .derive_spawn_authority()
-            .map_or(p1::errno::NOTCAPABLE, |_| p1::errno::SUCCESS)
+            .map_err(|_| p1::errno::NOTCAPABLE)
     }
 
-    pub(super) fn require_exec_authority(&self) -> i32 {
+    pub(super) fn require_exec_authority(&self) -> Result<ExecAuthority, i32> {
         self.authority
             .derive_exec_authority()
-            .map_or(p1::errno::NOTCAPABLE, |_| p1::errno::SUCCESS)
+            .map_err(|_| p1::errno::NOTCAPABLE)
     }
 
     pub(super) fn require_fork_authority(&self) -> i32 {
@@ -360,10 +357,7 @@ where
         if let Some(stop) = self.signals().owed_stop() {
             return Err(stop);
         }
-        if let Some(reason) = self.activity.pending_kill() {
-            return Err(wasmtime::Error::from(crate::InstanceKilled { reason }));
-        }
-        Ok(wasmtime::InterruptAction::Yield)
+        crate::wasmtime_adapter::preemption::kill_or_yield(self.activity.pending_kill())
     }
 
     /// Deliver stdout/stderr bytes to a kernel-served sink, or hand
@@ -440,7 +434,7 @@ where
             Poll::Ready(Ok(Ok(exit))) => {
                 let code = exit.exit_code;
                 if let Some(filesystem) = exit.filesystem {
-                    self.filesystem.replace_with_snapshot(filesystem);
+                    self.filesystem.adopt_root_layer(filesystem);
                 }
                 self.children[index].completed = Some(code);
                 self.children[index].exit = None;
@@ -471,7 +465,7 @@ where
         }
     }
 
-    pub(super) async fn read_stdin(&mut self, max_bytes: usize) -> Bytes {
+    pub(super) async fn read_stdin(&mut self, max_bytes: u32) -> Bytes {
         let descriptor = self.descriptors.get_mut(0);
         let Some(Preview1Descriptor::Stdin { carry }) = descriptor else {
             return Bytes::new();
@@ -480,11 +474,7 @@ where
             match &self.output_mode {
                 OutputMode::Serial => loop {
                     let wait = self.write_serial.wait_for_debug_serial_input();
-                    (self.read_serial)(
-                        &mut self.serial_read_buffer,
-                        u32::try_from(max_bytes)
-                            .unwrap_or_else(|_| panic!("stdin read capacity exceeds u32")),
-                    );
+                    (self.read_serial)(&mut self.serial_read_buffer, max_bytes);
                     if !self.serial_read_buffer.is_empty() {
                         *carry = Bytes::copy_from_slice(&self.serial_read_buffer);
                         break;
@@ -499,7 +489,7 @@ where
                 }
             }
         }
-        take_preview1_carry(carry, max_bytes)
+        take_preview1_carry(carry, max_bytes as usize)
     }
 
     /// Probe stdin for `poll_oneoff`/`epoll_wait` without blocking.
@@ -632,8 +622,8 @@ where
             .ok_or(p1::errno::NOTCAPABLE)
     }
 
-    pub(super) fn chdir(&mut self, path: &str) -> i32 {
-        let cwd = match self.resolve_cwd_target(path) {
+    pub(super) async fn chdir(&mut self, path: &str) -> i32 {
+        let cwd = match self.resolve_cwd_target(path).await {
             Ok(cwd) => cwd,
             Err(errno) => return errno,
         };
@@ -657,29 +647,35 @@ where
         )
     }
 
-    pub(super) fn resolve_cwd_target(&self, path: &str) -> Result<Preview1Cwd, i32> {
-        let (guest_name, source_path, flags) = if path.starts_with('/') {
+    pub(super) async fn resolve_cwd_target(&self, path: &str) -> Result<Preview1Cwd, i32> {
+        let (guest_name, base, suffix) = if path.starts_with('/') {
             let guest_name =
                 crate::resolve_absolute_path(path).map_err(p1_errno_from_component_path)?;
-            let (source_path, flags) = self.resolve_absolute_guest_path(&guest_name)?;
-            (guest_name, source_path, flags)
+            let (base, suffix) = self.resolve_absolute_guest_base(&guest_name)?;
+            (guest_name, base, suffix)
         } else {
             let cwd = self.cwd.as_ref().ok_or(p1::errno::NOTCAPABLE)?;
             let guest_name = crate::resolve_child_path(&cwd.guest_name, path)
                 .map_err(p1_errno_from_component_path)?;
-            let source_path = crate::resolve_child_path(&cwd.descriptor.path, path)
-                .map_err(p1_errno_from_component_path)?;
-            (guest_name, source_path, cwd.descriptor.flags)
+            (guest_name, cwd.descriptor.clone(), path.to_owned())
         };
+        let source_path =
+            crate::resolve_child_path(&base.path, &suffix).map_err(p1_errno_from_component_path)?;
+        let flags = base.flags;
 
         if !flags.contains(fs_types::DescriptorFlags::READ) {
             return Err(p1::errno::NOTCAPABLE);
         }
-        let stat = self
-            .filesystem
-            .stat(&source_path)
-            .map_err(p1_errno_from_fs)?;
-        if !matches!(stat.type_, fs_types::DescriptorType::Directory) {
+        // chdir follows a symbolic link to the directory it names, inside
+        // the directory the path was resolved against.
+        let metadata = wasi_fs::stat_path(
+            &self.filesystem,
+            &source_path,
+            crate::Follow::Within(&base.path),
+        )
+        .await
+        .map_err(p1_errno_from_fs)?;
+        if metadata.kind != helios_hal::fs::NodeKind::Directory {
             return Err(p1::errno::NOTDIR);
         }
         Ok(Preview1Cwd {
@@ -689,6 +685,7 @@ where
                 kind: FsNodeKind::Directory,
                 flags,
                 identity: None,
+                mount: None,
             },
         })
     }
@@ -817,8 +814,8 @@ where
              -> i32 {
                 fill_random(
                     caller.data().memory(),
-                    &caller.data().shared.entropy,
-                    caller.data().runtime_state.root_entropy(),
+                    &caller.data().context.shared.entropy,
+                    caller.data().context.runtime_state.root_entropy(),
                     GuestAddress::wasm32(ptr as u32),
                     len as u32,
                 )
@@ -842,7 +839,7 @@ where
                 write_u64(
                     caller.data().memory(),
                     GuestAddress::wasm32(ptr as u32),
-                    crate::monotonic_nanos(&caller.data().cpu),
+                    crate::monotonic_nanos(&caller.data().context.cpu),
                 )
             },
         )
@@ -895,7 +892,7 @@ where
              count: i32,
              size: i32|
              -> i32 {
-                let thread_count = compiler_plugin_worker_threads(&caller.data().cpu);
+                let thread_count = compiler_plugin_worker_threads(&caller.data().context.cpu);
                 let env_len = compiler_rayon_env_len(thread_count);
                 let memory = caller.data().memory();
                 let first = write_u32(memory, GuestAddress::wasm32(count as u32), 1);
@@ -958,8 +955,8 @@ where
             "wasi",
             "thread-spawn",
             |caller: Caller<'_, CompilerCoreStore<CpuImpl, Net, HostFs>>, start_arg: i32| -> i32 {
-                let store_data = caller.data().clone();
-                let next = store_data.shared.next_thread_id.try_update(
+                let context = caller.data().context.clone();
+                let next = context.shared.next_thread_id.try_update(
                     AtomicOrdering::Relaxed,
                     AtomicOrdering::Relaxed,
                     |value| (value <= 0x1fff_fffe).then_some(value + 1),
@@ -968,51 +965,47 @@ where
                     return -1;
                 };
                 let thread_id = previous + 1;
-                let instance_pre = store_data
+                let instance_pre = context
                     .shared
                     .instance_pre
                     .get()
                     .unwrap_or_else(|| panic!("compiler thread-spawn called before instance pre"))
                     .clone();
-                let spawner = store_data.spawner.clone();
-                let shared = store_data.shared.clone();
-                let spawned_ns = crate::monotonic_nanos(&store_data.cpu);
+                let spawner = context.spawner.clone();
+                let shared = context.shared.clone();
+                let spawned_ns = crate::monotonic_nanos(&context.cpu);
                 let task = spawner.spawn(async move {
-                    let started_ns = crate::monotonic_nanos(&store_data.cpu);
+                    let started_ns = crate::monotonic_nanos(&context.cpu);
                     let processor = helios_hal::cpu::current_processor().id();
-                    let mut store =
-                        wasmtime::Store::new(instance_pre.module().engine(), store_data);
-                    let _interrupts = configure_compiler_core_store(&mut store);
-                    let thread_started_ticks = store.data().cpu.now().ticks();
-                    let (result, instantiated_ns) = match instance_pre
-                        .instantiate_async(&mut store)
+                    // The worker's own store, accounted and driven like the
+                    // compile's main store and every program's.
+                    let mut store = wasmtime::Store::new(
+                        instance_pre.module().engine(),
+                        CompilerCoreStore::new(context),
+                    );
+                    let drive = configure_compiler_core_store(&mut store);
+                    let (result, instantiated_ns) = match drive
+                        .instantiate(&mut store, &instance_pre)
                         .await
                     {
                         Ok(instance) => {
                             let start = instance
                                 .get_typed_func::<(i32, i32), ()>(&mut store, "wasi_thread_start");
-                            let instantiated_ns = crate::monotonic_nanos(&store.data().cpu);
+                            let instantiated_ns = crate::monotonic_nanos(&store.data().context.cpu);
                             let result = match start {
                                 Ok(start) => {
-                                    start.call_async(&mut store, (thread_id, start_arg)).await
+                                    drive.call(&mut store, &start, (thread_id, start_arg)).await
                                 }
                                 Err(error) => Err(error),
                             };
                             (result, instantiated_ns)
                         }
                         Err(error) => {
-                            let instantiated_ns = crate::monotonic_nanos(&store.data().cpu);
+                            let instantiated_ns = crate::monotonic_nanos(&store.data().context.cpu);
                             (Err(error), instantiated_ns)
                         }
                     };
-                    let finished_ns = crate::monotonic_nanos(&store.data().cpu);
-                    let thread_elapsed = store
-                        .data()
-                        .cpu
-                        .now()
-                        .ticks()
-                        .saturating_sub(thread_started_ticks);
-                    store.data().record_user_ticks(thread_elapsed);
+                    let finished_ns = crate::monotonic_nanos(&store.data().context.cpu);
                     if let Err(error) = result {
                         tracing::error!(thread_id, "compiler plugin thread failed: {error:#}");
                     }
@@ -1956,15 +1949,15 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    let mut bytes = vec![0; len as usize];
-    let store = caller.data_mut();
-    store
-        .entropy
-        .fill_secure(store.runtime_state.root_entropy(), &mut bytes);
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    p1_write_memory(caller, memory, GuestAddress::wasm32(ptr), &bytes)
+    let store = caller.data_mut();
+    p1_fill_random(memory, GuestAddress::wasm32(ptr), len, |chunk| {
+        store
+            .entropy
+            .fill_secure(store.runtime_state.root_entropy(), chunk);
+    })
 }
 
 pub(super) fn p1_record_kernel_profile<CpuImpl, Net, HostFs>(
@@ -2054,72 +2047,11 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    if let Some(Preview1Descriptor::File {
-        descriptor,
-        offset,
-        fdflags,
-    }) = caller.data().descriptors.get(fd)
-    {
-        let descriptor = descriptor.clone();
-        if crate::guest_host_share_path(&descriptor.path).is_none() {
-            let current_offset = *offset;
-            let fdflags = *fdflags;
-            let layout = match p1_read_iovs_with_byte_len(caller, memory, iovs, iovs_len) {
-                Ok(layout) => layout,
-                Err(errno) => return errno,
-            };
-            let byte_len = layout.byte_len;
-            let written = match u32::try_from(byte_len) {
-                Ok(written) => written,
-                Err(_) => return p1::errno::OVERFLOW,
-            };
-            let ranges = match p1_iovs_memory_ranges(memory, &layout.iovs) {
-                Ok(ranges) => ranges,
-                Err(errno) => return errno,
-            };
-            let memory_base = memory.base as *const u8;
-            let now_nanos = caller.data().now_nanos();
-            let write_result = if fdflags & P1_FDFLAG_APPEND != 0 {
-                caller.data_mut().filesystem.append_with(
-                    &descriptor,
-                    byte_len,
-                    now_nanos,
-                    |destination| {
-                        copy_preview1_ranges_to_slice(memory_base, &ranges, destination);
-                    },
-                )
-            } else {
-                let write_offset: usize = match current_offset.try_into() {
-                    Ok(offset) => offset,
-                    Err(_) => return p1::errno::OVERFLOW,
-                };
-                caller.data_mut().filesystem.write_at_with(
-                    &descriptor,
-                    write_offset,
-                    byte_len,
-                    now_nanos,
-                    |destination| {
-                        copy_preview1_ranges_to_slice(memory_base, &ranges, destination);
-                    },
-                )
-            };
-            if let Err(error) = write_result {
-                return p1_errno_from_fs(error);
-            }
-            let Some(Preview1Descriptor::File { offset, .. }) =
-                caller.data_mut().descriptors.get_mut(fd)
-            else {
-                panic!("Preview1 descriptor disappeared during direct file write");
-            };
-            *offset = current_offset.saturating_add(byte_len as u64);
-            return p1_write_u32(caller, memory, nwritten, written);
-        }
-    }
-    let bytes = match p1_read_iovs_to_bytes(caller, memory, iovs, iovs_len) {
-        Ok(bytes) => bytes,
+    let layout = match p1_read_iovs_with_byte_len(memory, iovs, iovs_len) {
+        Ok(layout) => layout,
         Err(errno) => return errno,
     };
-    let written = match p1_write_descriptor(caller, fd, &bytes).await {
+    let written = match p1_write_descriptor(caller, fd, memory, &layout).await {
         Ok(written) => written,
         Err(errno) => return errno,
     };
@@ -2166,7 +2098,7 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let layout = match p1_read_iovs_with_byte_len(caller, memory, iovs, iovs_len) {
+    let layout = match p1_read_iovs_with_byte_len(memory, iovs, iovs_len) {
         Ok(layout) => layout,
         Err(errno) => return errno,
     };
@@ -2177,7 +2109,7 @@ where
             return p1_write_iovs_from_bytes(caller, memory, layout.iovs, &bytes, nread);
         }
         Some(Preview1Descriptor::PipeRead { .. }) => {
-            let bytes = match caller.data_mut().read_pipe(fd, capacity).await {
+            let bytes = match caller.data_mut().read_pipe(fd, capacity as usize).await {
                 Ok(bytes) => bytes,
                 Err(errno) => return errno,
             };
@@ -2188,40 +2120,13 @@ where
         }) => {
             let descriptor = descriptor.clone();
             let offset = *offset;
-            let bytes = if let Some(host_path) =
-                crate::guest_host_share_path(&descriptor.path).map(ToOwned::to_owned)
-            {
-                let service = match caller.data().filesystem.host_service() {
-                    Ok(service) => service,
-                    Err(error) => return p1_errno_from_fs(error),
-                };
-                let max_bytes = match u32::try_from(capacity) {
-                    Ok(max_bytes) => max_bytes,
-                    Err(_) => return p1::errno::OVERFLOW,
-                };
-                match service.read_file_range(&host_path, offset, max_bytes).await {
-                    Ok(bytes) => Bytes::from(bytes),
-                    Err(error) => {
-                        return p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(
-                            error,
-                        ));
-                    }
-                }
-            } else {
-                match caller
-                    .data()
-                    .filesystem
-                    .read_file_chunk(&descriptor, offset, capacity)
-                {
+            let namespace = p1_namespace(caller);
+            let bytes =
+                match wasi_fs::read(&namespace, &descriptor, offset, capacity as usize).await {
                     Ok(bytes) => bytes,
                     Err(error) => return p1_errno_from_fs(error),
-                }
-            };
-            if let Some(Preview1Descriptor::File { offset, .. }) =
-                caller.data_mut().descriptors.get_mut(fd)
-            {
-                *offset = offset.saturating_add(bytes.len() as u64);
-            }
+                };
+            p1_set_file_offset(caller, fd, offset.saturating_add(bytes.len() as u64));
             return p1_write_iovs_from_bytes(caller, memory, layout.iovs, &bytes, nread);
         }
         _ => {}
@@ -2430,45 +2335,78 @@ where
     else {
         return p1::errno::BADF;
     };
-    let (identity, stat_value) = match p1_stat_absolute_path(caller, &path).await {
+    let (identity, stat_value) = match p1_stat_absolute_path(caller, &path, crate::Follow::No).await
+    {
         Ok(stat) => stat,
         Err(errno) => return errno,
     };
     p1_write_filestat(caller, stat, identity, stat_value)
 }
 
-/// Resolves a guest-absolute path to its object identity and descriptor stat.
-///
-/// Host-share paths take the async 9p route so `st_dev`/`st_ino`, link count,
-/// and timestamps all come from the host's own `Rgetattr`; embedded paths read
-/// the in-memory node, whose identity is allocated once per object.
+/// Resolves a guest-absolute path through the store's namespace to its
+/// object identity and descriptor stat, following a final symbolic link
+/// when `follow` is set.
 pub(super) async fn p1_stat_absolute_path<CpuImpl, Net, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     path: &str,
+    follow: crate::Follow<'_>,
 ) -> Result<(crate::ObjectIdentity, fs_types::DescriptorStat), i32>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    if let Some(host_path) = crate::guest_host_share_path(path).map(ToOwned::to_owned) {
-        let service = caller
-            .data()
-            .filesystem
-            .host_service()
-            .map_err(p1_errno_from_fs)?;
-        let metadata = service.stat_path(&host_path).await.map_err(|error| {
-            p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(error))
-        })?;
-        let stat = p1_descriptor_stat_from_host_metadata(&metadata);
-        return Ok((metadata.identity, stat));
-    }
-    let filesystem = &caller.data().filesystem;
-    let identity = filesystem
-        .identity_at_path(path)
+    let namespace = p1_namespace(caller);
+    let metadata = wasi_fs::stat_path(&namespace, path, follow)
+        .await
         .map_err(p1_errno_from_fs)?;
-    let stat = filesystem.stat(path).map_err(p1_errno_from_fs)?;
-    Ok((identity, stat))
+    Ok((
+        crate::object_identity(&metadata),
+        wasi_fs::descriptor_stat(&metadata),
+    ))
+}
+
+/// The namespace the store's filesystem calls resolve through, owned so a
+/// call can await on it while the store stays borrowable.
+pub(super) fn p1_namespace<CpuImpl, Net, HostFs>(
+    caller: &Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+) -> Namespace<HostFs>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    HostFs: crate::HostFileSystem,
+{
+    caller.data().filesystem.clone()
+}
+
+/// The filesystem descriptor behind a preview1 descriptor: an open file or
+/// directory, or a preopen.
+pub(super) fn p1_fs_descriptor<Net: ComponentHostNetwork>(
+    descriptor: Option<&Preview1Descriptor<Net>>,
+) -> Option<&FsDescriptor> {
+    match descriptor {
+        Some(Preview1Descriptor::Preopen { descriptor, .. })
+        | Some(Preview1Descriptor::File { descriptor, .. }) => Some(descriptor),
+        _ => None,
+    }
+}
+
+/// Moves the offset of the open file `fd` after one of its own reads or
+/// writes.
+fn p1_set_file_offset<CpuImpl, Net, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+    fd: i32,
+    next: u64,
+) where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    HostFs: crate::HostFileSystem,
+{
+    let Some(Preview1Descriptor::File { offset, .. }) = caller.data_mut().descriptors.get_mut(fd)
+    else {
+        panic!("Preview1 file descriptor {fd} disappeared during its own operation");
+    };
+    *offset = next;
 }
 
 pub(super) async fn p1_fd_filestat_set_size<CpuImpl, Net, HostFs>(
@@ -2486,32 +2424,11 @@ where
         return p1::errno::BADF;
     };
     let descriptor = descriptor.clone();
-    if let Some(host_path) = crate::guest_host_share_path(&descriptor.path).map(ToOwned::to_owned) {
-        if !descriptor.flags.contains(fs_types::DescriptorFlags::WRITE) {
-            return p1::errno::NOTCAPABLE;
-        }
-        let service = match caller.data().filesystem.host_service() {
-            Ok(service) => service,
-            Err(error) => return p1_errno_from_fs(error),
-        };
-        return service
-            .set_file_size(&host_path, size)
-            .await
-            .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
-            .map_or_else(p1_errno_from_fs, |_| {
-                caller
-                    .data_mut()
-                    .filesystem
-                    .invalidate_host_subtree(&descriptor.path);
-                p1::errno::SUCCESS
-            });
-    }
+    let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
-    caller
-        .data_mut()
-        .filesystem
-        .set_size(&descriptor, size, now_nanos)
-        .map_or_else(p1_errno_from_fs, |_| p1::errno::SUCCESS)
+    wasi_fs::set_size(&namespace, &descriptor, size, now_nanos)
+        .await
+        .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
 
 pub(super) async fn p1_fd_filestat_set_times<CpuImpl, Net, HostFs>(
@@ -2526,12 +2443,26 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    let (Some(Preview1Descriptor::File { descriptor, .. })
-    | Some(Preview1Descriptor::Preopen { descriptor, .. })) = caller.data().descriptors.get(fd)
+    let Some(path) = p1_descriptor_path(caller.data().descriptors.get(fd)).map(ToOwned::to_owned)
     else {
         return p1::errno::BADF;
     };
-    let descriptor = descriptor.clone();
+    p1_set_times_at_path(caller, &path, atim, mtim, fstflags).await
+}
+
+/// Backs `fd_filestat_set_times` and `path_filestat_set_times`.
+async fn p1_set_times_at_path<CpuImpl, Net, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+    absolute: &str,
+    atim: u64,
+    mtim: u64,
+    fstflags: u16,
+) -> i32
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    HostFs: crate::HostFileSystem,
+{
     let now_nanos = caller.data().system_time_nanos();
     let access = p1_timestamp_from_fstflags(
         fstflags,
@@ -2547,28 +2478,10 @@ where
         mtim,
         now_nanos,
     );
-    if let Some(host_path) = crate::guest_host_share_path(&descriptor.path).map(ToOwned::to_owned) {
-        let service = match caller.data().filesystem.host_service() {
-            Ok(service) => service,
-            Err(error) => return p1_errno_from_fs(error),
-        };
-        return service
-            .set_times(&host_path, access, modified)
-            .await
-            .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
-            .map_or_else(p1_errno_from_fs, |_| {
-                caller
-                    .data_mut()
-                    .filesystem
-                    .invalidate_host_subtree(&descriptor.path);
-                p1::errno::SUCCESS
-            });
-    }
-    caller
-        .data_mut()
-        .filesystem
-        .set_times(&descriptor, access, modified, now_nanos)
-        .map_or_else(p1_errno_from_fs, |_| p1::errno::SUCCESS)
+    let namespace = p1_namespace(caller);
+    wasi_fs::set_times(&namespace, absolute, access, modified, now_nanos)
+        .await
+        .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
 
 pub(super) fn p1_fd_advise<CpuImpl, Net, HostFs>(
@@ -2607,48 +2520,18 @@ where
         return p1::errno::BADF;
     };
     let descriptor = descriptor.clone();
-    if let Some(host_path) = crate::guest_host_share_path(&descriptor.path).map(ToOwned::to_owned) {
-        if !descriptor.flags.contains(fs_types::DescriptorFlags::WRITE) {
-            return p1::errno::NOTCAPABLE;
-        }
-        let service = match caller.data().filesystem.host_service() {
-            Ok(service) => service,
-            Err(error) => return p1_errno_from_fs(error),
-        };
-        let current = match service.stat_path(&host_path).await {
-            Ok(metadata) => metadata.size,
-            Err(error) => {
-                return p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(error));
-            }
-        };
-        if end <= current {
-            return p1::errno::SUCCESS;
-        }
-        return service
-            .set_file_size(&host_path, end)
-            .await
-            .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
-            .map_or_else(p1_errno_from_fs, |_| {
-                caller
-                    .data_mut()
-                    .filesystem
-                    .invalidate_host_subtree(&descriptor.path);
-                p1::errno::SUCCESS
-            });
-    }
-    let current = match caller.data().filesystem.stat(&descriptor.path) {
-        Ok(stat) => stat.size,
+    let namespace = p1_namespace(caller);
+    let current = match wasi_fs::stat_path(&namespace, &descriptor.path, crate::Follow::No).await {
+        Ok(metadata) => metadata.size,
         Err(error) => return p1_errno_from_fs(error),
     };
     if end <= current {
         return p1::errno::SUCCESS;
     }
     let now_nanos = caller.data().now_nanos();
-    caller
-        .data_mut()
-        .filesystem
-        .set_size(&descriptor, end, now_nanos)
-        .map_or_else(p1_errno_from_fs, |_| p1::errno::SUCCESS)
+    wasi_fs::set_size(&namespace, &descriptor, end, now_nanos)
+        .await
+        .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
 
 pub(super) async fn p1_fd_datasync<CpuImpl, Net, HostFs>(
@@ -2660,7 +2543,7 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    p1_fd_sync_impl(caller, fd).await
+    p1_fd_sync_impl(caller, fd, true).await
 }
 
 pub(super) async fn p1_fd_sync<CpuImpl, Net, HostFs>(
@@ -2672,19 +2555,17 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    p1_fd_sync_impl(caller, fd).await
+    p1_fd_sync_impl(caller, fd, false).await
 }
 
-/// Backs `fd_sync` and `fd_datasync`.
-///
-/// A descriptor on the host share is flushed with a real 9p `Tfsync`; 9p has
-/// no separate data-only barrier, so both entry points map to it. Descriptors
-/// on the embedded filesystem, on stdio, and on `/dev/null` have no
-/// write-back stage to flush, so success there is an accurate answer and not
-/// a silent skip.
+/// Backs `fd_sync` and `fd_datasync`: a filesystem object is made durable
+/// by the filesystem that serves it. Stdio, pipes and `/dev/null` have no
+/// write-back stage to flush, so success there is an accurate answer and
+/// not a silent skip.
 async fn p1_fd_sync_impl<CpuImpl, Net, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     fd: i32,
+    data_only: bool,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
@@ -2694,20 +2575,13 @@ where
     let Some(descriptor) = caller.data().descriptors.get(fd) else {
         return p1::errno::BADF;
     };
-    let host_path = p1_descriptor_path(Some(descriptor))
-        .and_then(crate::guest_host_share_path)
-        .map(ToOwned::to_owned);
-    let Some(host_path) = host_path else {
+    let Some(descriptor) = p1_fs_descriptor(Some(descriptor)).cloned() else {
         return p1::errno::SUCCESS;
     };
-    let service = match caller.data().filesystem.host_service() {
-        Ok(service) => service,
-        Err(error) => return p1_errno_from_fs(error),
-    };
-    match service.sync_file(&host_path).await {
-        Ok(()) => p1::errno::SUCCESS,
-        Err(error) => p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(error)),
-    }
+    let namespace = p1_namespace(caller);
+    wasi_fs::sync(&namespace, &descriptor, data_only)
+        .await
+        .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
 
 pub(super) async fn p1_fd_pread<CpuImpl, Net, HostFs>(
@@ -2726,42 +2600,20 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let layout =
-        match p1_read_iovs_with_byte_len(caller, memory, GuestAddress::wasm32(iovs), iovs_len) {
-            Ok(layout) => layout,
-            Err(errno) => return errno,
-        };
-    let capacity = layout.byte_len;
+    let layout = match p1_read_iovs_with_byte_len(memory, GuestAddress::wasm32(iovs), iovs_len) {
+        Ok(layout) => layout,
+        Err(errno) => return errno,
+    };
     let Some(Preview1Descriptor::File { descriptor, .. }) = caller.data().descriptors.get(fd)
     else {
         return p1::errno::BADF;
     };
-    let bytes = if let Some(host_path) =
-        crate::guest_host_share_path(&descriptor.path).map(ToOwned::to_owned)
+    let descriptor = descriptor.clone();
+    let namespace = p1_namespace(caller);
+    let bytes = match wasi_fs::read(&namespace, &descriptor, offset, layout.byte_len as usize).await
     {
-        let service = match caller.data().filesystem.host_service() {
-            Ok(service) => service,
-            Err(error) => return p1_errno_from_fs(error),
-        };
-        let max_bytes = match u32::try_from(capacity) {
-            Ok(max_bytes) => max_bytes,
-            Err(_) => return p1::errno::OVERFLOW,
-        };
-        match service.read_file_range(&host_path, offset, max_bytes).await {
-            Ok(bytes) => Bytes::from(bytes),
-            Err(error) => {
-                return p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(error));
-            }
-        }
-    } else {
-        match caller
-            .data()
-            .filesystem
-            .read_file_chunk(descriptor, offset, capacity)
-        {
-            Ok(bytes) => bytes,
-            Err(error) => return p1_errno_from_fs(error),
-        }
+        Ok(bytes) => bytes,
+        Err(error) => return p1_errno_from_fs(error),
     };
     p1_write_iovs_from_bytes(
         caller,
@@ -2789,54 +2641,90 @@ where
         return p1::errno::FAULT;
     };
     let nwritten = GuestAddress::wasm32(nwritten);
-    let bytes = match p1_read_iovs_to_bytes(caller, memory, GuestAddress::wasm32(iovs), iovs_len) {
-        Ok(bytes) => bytes,
+    let layout = match p1_read_iovs_with_byte_len(memory, GuestAddress::wasm32(iovs), iovs_len) {
+        Ok(layout) => layout,
         Err(errno) => return errno,
     };
-    let Some(Preview1Descriptor::File { descriptor, .. }) = caller.data().descriptors.get(fd)
-    else {
-        return p1::errno::BADF;
-    };
-    let offset: usize = match offset.try_into() {
-        Ok(offset) => offset,
-        Err(_) => return p1::errno::OVERFLOW,
-    };
-    let descriptor = descriptor.clone();
-    if let Some(host_path) = crate::guest_host_share_path(&descriptor.path).map(ToOwned::to_owned) {
-        if !descriptor.flags.contains(fs_types::DescriptorFlags::WRITE) {
-            return p1::errno::NOTCAPABLE;
-        }
-        let service = match caller.data().filesystem.host_service() {
-            Ok(service) => service,
-            Err(error) => return p1_errno_from_fs(error),
-        };
-        if let Err(error) = service.write_file(&host_path, offset as u64, &bytes).await {
-            return p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(error));
-        }
-        caller
-            .data_mut()
-            .filesystem
-            .invalidate_host_subtree(&descriptor.path);
-        let written = match u32::try_from(bytes.len()) {
-            Ok(written) => written,
-            Err(_) => return p1::errno::OVERFLOW,
-        };
-        return p1_write_u32(caller, memory, nwritten, written);
-    }
-    let now_nanos = caller.data().now_nanos();
-    if let Err(error) =
-        caller
-            .data_mut()
-            .filesystem
-            .write_at(&descriptor, offset, &bytes, now_nanos)
-    {
-        return p1_errno_from_fs(error);
-    }
-    let written = match u32::try_from(bytes.len()) {
+    let written = match p1_write_file(caller, fd, memory, &layout, Some(offset)).await {
         Ok(written) => written,
-        Err(_) => return p1::errno::OVERFLOW,
+        Err(errno) => return errno,
     };
     p1_write_u32(caller, memory, nwritten, written)
+}
+
+/// Writes the bytes `layout` names in guest memory to the file `fd`,
+/// gathered straight into the filesystem's destination: at `at` when
+/// given (`fd_pwrite`, which leaves the offset alone), else at the
+/// descriptor's offset or, in append mode, at the end of the file, moving
+/// the offset past them.
+async fn p1_write_file<CpuImpl, Net, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+    fd: i32,
+    memory: Preview1Memory,
+    layout: &Preview1IovLayout,
+    at: Option<u64>,
+) -> Result<u32, i32>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    HostFs: crate::HostFileSystem,
+{
+    let Some(Preview1Descriptor::File {
+        descriptor,
+        offset,
+        fdflags,
+    }) = caller.data().descriptors.get(fd)
+    else {
+        return Err(p1::errno::BADF);
+    };
+    let position = match at {
+        Some(at) => WritePosition::At(at),
+        None if fdflags & P1_FDFLAG_APPEND != 0 => WritePosition::End,
+        None => WritePosition::At(*offset),
+    };
+    let descriptor = descriptor.clone();
+    let mut gather = Preview1Gather::new(memory, layout)?;
+    let namespace = p1_namespace(caller);
+    let now_nanos = caller.data().now_nanos();
+    let (end, written) = {
+        let file = wasi_fs::writable_file(&namespace, &descriptor).map_err(p1_errno_from_fs)?;
+        let mut file = ResolvedFileChunks {
+            file: &file,
+            now_nanos,
+        };
+        p1_write_gathered(&mut gather, position, &mut file)
+            .await
+            .map_err(p1_errno_from_fs)?
+    };
+    if at.is_none() {
+        // After an append the offset is the end of the file the write
+        // reached, which another writer may have moved meanwhile.
+        p1_set_file_offset(caller, fd, end);
+    }
+    Ok(written)
+}
+
+/// A resolved file as what a gathered write lands in: each chunk goes
+/// straight from guest memory into the file system's own destination.
+struct ResolvedFileChunks<'file, 'namespace, HostFs: crate::HostFileSystem> {
+    file: &'file crate::vfs::Resolved<'namespace, HostFs>,
+    now_nanos: u64,
+}
+
+impl<HostFs: crate::HostFileSystem> Preview1ChunkedFile for ResolvedFileChunks<'_, '_, HostFs> {
+    type Refusal = fs_types::ErrorCode;
+
+    async fn land(
+        &mut self,
+        gather: &mut Preview1Gather,
+        position: WritePosition,
+        len: usize,
+    ) -> Result<u64, fs_types::ErrorCode> {
+        wasi_fs::write_resolved_with(self.file, position, len, self.now_nanos, |destination| {
+            gather.fill(destination)
+        })
+        .await
+    }
 }
 
 pub(super) async fn p1_fd_readdir<CpuImpl, Net, HostFs>(
@@ -2853,39 +2741,11 @@ where
     HostFs: crate::HostFileSystem,
 {
     let (buf, bufused) = (GuestAddress::wasm32(buf), GuestAddress::wasm32(bufused));
-    let Some(path) = p1_descriptor_path(caller.data().descriptors.get(fd)) else {
+    let Some(descriptor) = p1_fs_descriptor(caller.data().descriptors.get(fd)).cloned() else {
         return p1::errno::BADF;
     };
-    if let Some(host_path) = crate::guest_host_share_path(path).map(ToOwned::to_owned) {
-        let directory_path = path.to_owned();
-        let service = match caller.data().filesystem.host_service() {
-            Ok(service) => service,
-            Err(error) => return p1_errno_from_fs(error),
-        };
-        // The whole listing is mirrored, so the bound is the mirror's.
-        let entries = match service
-            .read_dir(
-                &host_path,
-                crate::wasmtime_adapter::wasi::GUEST_DIRECTORY_MIRROR_LIMIT,
-            )
-            .await
-        {
-            Ok(entries) => entries,
-            Err(error) => {
-                return p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(error));
-            }
-        };
-        caller
-            .data_mut()
-            .filesystem
-            .seed_host_directory_entries(&directory_path, entries);
-        let entries = match caller.data().filesystem.read_directory(&directory_path) {
-            Ok(entries) => entries,
-            Err(error) => return p1_errno_from_fs(error),
-        };
-        return p1_fd_readdir_entries(caller, entries, buf, buf_len, cookie, bufused);
-    }
-    let entries = match caller.data().filesystem.read_directory(path) {
+    let namespace = p1_namespace(caller);
+    let entries = match wasi_fs::read_directory(&namespace, &descriptor).await {
         Ok(entries) => entries,
         Err(error) => return p1_errno_from_fs(error),
     };
@@ -3001,26 +2861,10 @@ where
         0 => 0,
         1 => current,
         2 => {
-            if let Some(host_path) =
-                crate::guest_host_share_path(&descriptor.path).map(ToOwned::to_owned)
-            {
-                let service = match caller.data().filesystem.host_service() {
-                    Ok(service) => service,
-                    Err(error) => return p1_errno_from_fs(error),
-                };
-                match service.stat_path(&host_path).await {
-                    Ok(metadata) => metadata.size,
-                    Err(error) => {
-                        return p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(
-                            error,
-                        ));
-                    }
-                }
-            } else {
-                match caller.data().filesystem.stat(&descriptor.path) {
-                    Ok(stat) => stat.size,
-                    Err(error) => return p1_errno_from_fs(error),
-                }
+            let namespace = p1_namespace(caller);
+            match wasi_fs::stat_path(&namespace, &descriptor.path, crate::Follow::No).await {
+                Ok(metadata) => metadata.size,
+                Err(error) => return p1_errno_from_fs(error),
             }
         }
         _ => return p1::errno::INVAL,
@@ -3223,151 +3067,19 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    if base.kind != FsNodeKind::Directory {
-        return Err(p1::errno::NOTDIR);
-    }
-    let absolute =
-        crate::resolve_child_path(&base.path, path).map_err(p1_errno_from_component_path)?;
-    if let Some(host_path) = crate::guest_host_share_path(&absolute).map(ToOwned::to_owned) {
-        return p1_open_host_descriptor_resolved(
-            caller,
-            base,
-            absolute,
-            host_path,
-            open_flags,
-            descriptor_flags,
-        )
-        .await;
-    }
+    let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
-    caller
-        .data_mut()
-        .filesystem
-        .open_at(
-            base,
-            path_flags,
-            path,
-            open_flags,
-            descriptor_flags,
-            now_nanos,
-        )
-        .map_err(p1_errno_from_fs)
-}
-
-pub(super) async fn p1_open_host_descriptor_resolved<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
-    base: &FsDescriptor,
-    absolute: String,
-    host_path: String,
-    open_flags: fs_types::OpenFlags,
-    descriptor_flags: fs_types::DescriptorFlags,
-) -> Result<FsDescriptor, i32>
-where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
-{
-    let service = caller
-        .data()
-        .filesystem
-        .host_service()
-        .map_err(p1_errno_from_fs)?;
-    let metadata = service.stat_path(&host_path).await;
-    // Host files are never materialised in kernel memory on open: `fd_read`
-    // and `fd_pread` pull bounded ranges over 9p on demand.
-    let (kind, identity, descriptor_flags) = match metadata {
-        Ok(metadata) => {
-            let kind = crate::wasmtime_adapter::wasi::host_metadata_node_kind(&metadata);
-            if open_flags.contains(fs_types::OpenFlags::EXCLUSIVE)
-                && open_flags.contains(fs_types::OpenFlags::CREATE)
-            {
-                return Err(p1::errno::EXIST);
-            }
-            if open_flags.contains(fs_types::OpenFlags::DIRECTORY) && kind != FsNodeKind::Directory
-            {
-                return Err(p1::errno::NOTDIR);
-            }
-            if !open_flags.contains(fs_types::OpenFlags::DIRECTORY) && kind == FsNodeKind::Directory
-            {
-                return Err(p1::errno::ISDIR);
-            }
-            let descriptor_flags = crate::wasmtime_adapter::wasi::effective_open_descriptor_flags(
-                base.flags,
-                descriptor_flags,
-                kind,
-            )
-            .map_err(p1_errno_from_fs)?;
-            if open_flags.contains(fs_types::OpenFlags::TRUNCATE) {
-                if kind != FsNodeKind::File {
-                    return Err(p1::errno::ISDIR);
-                }
-                if !base
-                    .flags
-                    .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
-                {
-                    return Err(p1::errno::ROFS);
-                }
-                service
-                    .truncate_file(&host_path)
-                    .await
-                    .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
-                    .map_err(p1_errno_from_fs)?;
-            }
-            if kind != FsNodeKind::File {
-                // The whole listing is mirrored, so the bound is the mirror's.
-                let entries = service
-                    .read_dir(
-                        &host_path,
-                        crate::wasmtime_adapter::wasi::GUEST_DIRECTORY_MIRROR_LIMIT,
-                    )
-                    .await
-                    .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
-                    .map_err(p1_errno_from_fs)?;
-                caller
-                    .data_mut()
-                    .filesystem
-                    .seed_host_directory_entries(&absolute, entries);
-            }
-            (kind, metadata.identity, descriptor_flags)
-        }
-        Err(error) => {
-            let error = crate::wasmtime_adapter::wasi::map_host_fs_error(error);
-            if !matches!(error, fs_types::ErrorCode::NoEntry)
-                || !open_flags.contains(fs_types::OpenFlags::CREATE)
-            {
-                return Err(p1_errno_from_fs(error));
-            }
-            if !base
-                .flags
-                .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
-            {
-                return Err(p1::errno::ROFS);
-            }
-            service
-                .create_file(&host_path)
-                .await
-                .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
-                .map_err(p1_errno_from_fs)?;
-            let metadata = service
-                .stat_path(&host_path)
-                .await
-                .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
-                .map_err(p1_errno_from_fs)?;
-            let descriptor_flags = crate::wasmtime_adapter::wasi::effective_open_descriptor_flags(
-                base.flags,
-                descriptor_flags,
-                FsNodeKind::File,
-            )
-            .map_err(p1_errno_from_fs)?;
-            (FsNodeKind::File, metadata.identity, descriptor_flags)
-        }
-    };
-    Ok(FsDescriptor {
-        path: absolute,
-        kind,
-        flags: descriptor_flags,
-        identity: Some(identity),
-    })
+    wasi_fs::open_at(
+        &namespace,
+        base,
+        path_flags,
+        path,
+        open_flags,
+        descriptor_flags,
+        now_nanos,
+    )
+    .await
+    .map_err(p1_errno_from_fs)
 }
 
 pub(super) async fn p1_path_create_directory<CpuImpl, Net, HostFs>(
@@ -3388,48 +3100,21 @@ where
         Ok(path) => path,
         Err(_) => return p1::errno::FAULT,
     };
-    let (descriptor, path, absolute) = match caller.data().resolve_preview1_path(fd, &path) {
+    let (base, path, _) = match caller.data().resolve_preview1_path(fd, &path) {
         Ok(resolved) => resolved,
         Err(errno) => return errno,
     };
-    if let Some(host_path) = crate::guest_host_share_path(&absolute) {
-        if descriptor.kind != FsNodeKind::Directory {
-            return p1::errno::NOTDIR;
-        }
-        if !descriptor
-            .flags
-            .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
-        {
-            return p1::errno::ROFS;
-        }
-        let service = match caller.data().filesystem.host_service() {
-            Ok(service) => service,
-            Err(error) => return p1_errno_from_fs(error),
-        };
-        return service
-            .create_directory(host_path)
-            .await
-            .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
-            .map_or_else(p1_errno_from_fs, |_| {
-                caller
-                    .data_mut()
-                    .filesystem
-                    .invalidate_host_subtree(&absolute);
-                p1::errno::SUCCESS
-            });
-    }
+    let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
-    caller
-        .data_mut()
-        .filesystem
-        .create_directory_at(&descriptor, &path, now_nanos)
-        .map_or_else(p1_errno_from_fs, |_| p1::errno::SUCCESS)
+    wasi_fs::create_directory_at(&namespace, &base, &path, now_nanos)
+        .await
+        .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
 
 pub(super) async fn p1_path_filestat_get<CpuImpl, Net, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     fd: i32,
-    _flags: u32,
+    flags: u32,
     path: u32,
     path_len: u32,
     stat: u32,
@@ -3447,7 +3132,7 @@ where
         Ok(path) => path,
         Err(_) => return p1::errno::FAULT,
     };
-    let (_, _, absolute) = match caller.data().resolve_preview1_path(fd, &path) {
+    let (base, _, absolute) = match caller.data().resolve_preview1_path(fd, &path) {
         Ok(resolved) => resolved,
         Err(errno) => return errno,
     };
@@ -3459,7 +3144,8 @@ where
             p1_null_device_stat(),
         );
     }
-    let (identity, stat_value) = match p1_stat_absolute_path(caller, &absolute).await {
+    let follow = wasi_fs::follow_within(&base, p1_path_flags(flags));
+    let (identity, stat_value) = match p1_stat_absolute_path(caller, &absolute, follow).await {
         Ok(stat) => stat,
         Err(errno) => return errno,
     };
@@ -3496,43 +3182,7 @@ where
         Ok(resolved) => resolved,
         Err(errno) => return errno,
     };
-    let now_nanos = caller.data().system_time_nanos();
-    let access = p1_timestamp_from_fstflags(
-        fstflags,
-        P1_FSTFLAG_ATIM,
-        P1_FSTFLAG_ATIM_NOW,
-        atim,
-        now_nanos,
-    );
-    let modified = p1_timestamp_from_fstflags(
-        fstflags,
-        P1_FSTFLAG_MTIM,
-        P1_FSTFLAG_MTIM_NOW,
-        mtim,
-        now_nanos,
-    );
-    if let Some(host_path) = crate::guest_host_share_path(&absolute).map(ToOwned::to_owned) {
-        let service = match caller.data().filesystem.host_service() {
-            Ok(service) => service,
-            Err(error) => return p1_errno_from_fs(error),
-        };
-        return service
-            .set_times(&host_path, access, modified)
-            .await
-            .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
-            .map_or_else(p1_errno_from_fs, |_| {
-                caller
-                    .data_mut()
-                    .filesystem
-                    .invalidate_host_subtree(&absolute);
-                p1::errno::SUCCESS
-            });
-    }
-    caller
-        .data_mut()
-        .filesystem
-        .set_times_at_path(&absolute, access, modified, now_nanos)
-        .map_or_else(p1_errno_from_fs, |_| p1::errno::SUCCESS)
+    p1_set_times_at_path(caller, &absolute, atim, mtim, fstflags).await
 }
 
 #[expect(
@@ -3571,62 +3221,27 @@ where
     if status != p1::errno::SUCCESS {
         return status;
     }
-    let (source_base, old_path, source_absolute) =
-        match caller.data().resolve_preview1_path(old_fd, &old_path) {
-            Ok(resolved) => resolved,
-            Err(errno) => return errno,
-        };
-    let (destination_base, new_path, destination_absolute) =
+    let (source_base, old_path, _) = match caller.data().resolve_preview1_path(old_fd, &old_path) {
+        Ok(resolved) => resolved,
+        Err(errno) => return errno,
+    };
+    let (destination_base, new_path, _) =
         match caller.data().resolve_preview1_path(new_fd, &new_path) {
             Ok(resolved) => resolved,
             Err(errno) => return errno,
         };
-    if source_base.kind != FsNodeKind::Directory || destination_base.kind != FsNodeKind::Directory {
-        return p1::errno::NOTDIR;
-    }
-    let source_host = crate::guest_host_share_path(&source_absolute);
-    let destination_host = crate::guest_host_share_path(&destination_absolute);
-    if source_host.is_some() || destination_host.is_some() {
-        if !destination_base
-            .flags
-            .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
-        {
-            return p1::errno::ROFS;
-        }
-        let Some(source_host) = source_host else {
-            return p1::errno::XDEV;
-        };
-        let Some(destination_host) = destination_host else {
-            return p1::errno::XDEV;
-        };
-        let service = match caller.data().filesystem.host_service() {
-            Ok(service) => service,
-            Err(error) => return p1_errno_from_fs(error),
-        };
-        return service
-            .hard_link(source_host, destination_host)
-            .await
-            .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
-            .map_or_else(p1_errno_from_fs, |_| {
-                caller
-                    .data_mut()
-                    .filesystem
-                    .invalidate_host_subtree(&destination_absolute);
-                p1::errno::SUCCESS
-            });
-    }
+    let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
-    caller
-        .data_mut()
-        .filesystem
-        .link_at(
-            &source_base,
-            &old_path,
-            &destination_base,
-            &new_path,
-            now_nanos,
-        )
-        .map_or_else(p1_errno_from_fs, |_| p1::errno::SUCCESS)
+    wasi_fs::link_at(
+        &namespace,
+        &source_base,
+        &old_path,
+        &destination_base,
+        &new_path,
+        now_nanos,
+    )
+    .await
+    .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
 
 pub(super) async fn p1_path_readlink<CpuImpl, Net, HostFs>(
@@ -3654,37 +3269,16 @@ where
     if status != p1::errno::SUCCESS {
         return status;
     }
-    let (base, path, absolute) = match caller.data().resolve_preview1_path(fd, &path) {
+    let (base, path, _) = match caller.data().resolve_preview1_path(fd, &path) {
         Ok(resolved) => resolved,
         Err(errno) => return errno,
     };
-    let payload = if let Some(host_path) = crate::guest_host_share_path(&absolute) {
-        if base.kind != FsNodeKind::Directory {
-            return p1::errno::NOTDIR;
-        }
-        let service = match caller.data().filesystem.host_service() {
-            Ok(service) => service,
-            Err(error) => return p1_errno_from_fs(error),
-        };
-        let payload = match service.read_link(host_path).await {
-            Ok(payload) => payload,
-            Err(error) => {
-                return p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(error));
-            }
-        };
-        if let Err(error) =
-            crate::wasmtime_adapter::wasi::resolve_symlink_payload(&absolute, &payload)
-        {
-            return p1_errno_from_fs(error);
-        }
-        payload
-    } else {
-        match caller.data().filesystem.readlink_at(&base, &path) {
-            Ok(payload) => payload,
-            Err(error) => return p1_errno_from_fs(error),
-        }
+    let namespace = p1_namespace(caller);
+    let target = match wasi_fs::readlink_at(&namespace, &base, &path).await {
+        Ok(target) => target,
+        Err(error) => return p1_errno_from_fs(error),
     };
-    let bytes = payload.as_bytes();
+    let bytes = target.as_bytes();
     let copied = (buf_len as usize).min(bytes.len());
     let status = p1_write_memory(caller, memory, GuestAddress::wasm32(buf), &bytes[..copied]);
     if status != p1::errno::SUCCESS {
@@ -3715,38 +3309,14 @@ where
         Ok(path) => path,
         Err(_) => return p1::errno::FAULT,
     };
-    let (base, path, absolute) = match caller.data().resolve_preview1_path(fd, &path) {
+    let (base, path, _) = match caller.data().resolve_preview1_path(fd, &path) {
         Ok(resolved) => resolved,
         Err(errno) => return errno,
     };
-    if let Some(host_path) = crate::guest_host_share_path(&absolute) {
-        if !base
-            .flags
-            .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
-        {
-            return p1::errno::ROFS;
-        }
-        let service = match caller.data().filesystem.host_service() {
-            Ok(service) => service,
-            Err(error) => return p1_errno_from_fs(error),
-        };
-        return service
-            .remove(host_path, true)
-            .await
-            .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
-            .map_or_else(p1_errno_from_fs, |_| {
-                caller
-                    .data_mut()
-                    .filesystem
-                    .invalidate_host_subtree(&absolute);
-                p1::errno::SUCCESS
-            });
-    }
-    caller
-        .data_mut()
-        .filesystem
-        .remove_directory_at(&base, &path)
-        .map_or_else(p1_errno_from_fs, |_| p1::errno::SUCCESS)
+    let namespace = p1_namespace(caller);
+    wasi_fs::remove_directory_at(&namespace, &base, &path)
+        .await
+        .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
 
 pub(super) async fn p1_path_rename<CpuImpl, Net, HostFs>(
@@ -3776,65 +3346,27 @@ where
         Ok(path) => path,
         Err(_) => return p1::errno::FAULT,
     };
-    let (source_base, old_path, source_absolute) =
-        match caller.data().resolve_preview1_path(old_fd, &old_path) {
-            Ok(resolved) => resolved,
-            Err(errno) => return errno,
-        };
-    let (destination_base, new_path, destination_absolute) =
+    let (source_base, old_path, _) = match caller.data().resolve_preview1_path(old_fd, &old_path) {
+        Ok(resolved) => resolved,
+        Err(errno) => return errno,
+    };
+    let (destination_base, new_path, _) =
         match caller.data().resolve_preview1_path(new_fd, &new_path) {
             Ok(resolved) => resolved,
             Err(errno) => return errno,
         };
-    if source_base.kind != FsNodeKind::Directory || destination_base.kind != FsNodeKind::Directory {
-        return p1::errno::NOTDIR;
-    }
-    let source_host = crate::guest_host_share_path(&source_absolute).map(ToOwned::to_owned);
-    let destination_host =
-        crate::guest_host_share_path(&destination_absolute).map(ToOwned::to_owned);
-    if source_host.is_some() || destination_host.is_some() {
-        if !source_base
-            .flags
-            .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
-            || !destination_base
-                .flags
-                .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
-        {
-            return p1::errno::ROFS;
-        }
-        let Some(source_host) = source_host else {
-            return p1::errno::XDEV;
-        };
-        let Some(destination_host) = destination_host else {
-            return p1::errno::XDEV;
-        };
-        let service = match caller.data().filesystem.host_service() {
-            Ok(service) => service,
-            Err(error) => return p1_errno_from_fs(error),
-        };
-        return service
-            .rename(&source_host, &destination_host)
-            .await
-            .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
-            .map_or_else(p1_errno_from_fs, |_| {
-                let filesystem = &mut caller.data_mut().filesystem;
-                filesystem.invalidate_host_subtree(&source_absolute);
-                filesystem.invalidate_host_subtree(&destination_absolute);
-                p1::errno::SUCCESS
-            });
-    }
+    let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
-    caller
-        .data_mut()
-        .filesystem
-        .rename_at(
-            &source_base,
-            &old_path,
-            &destination_base,
-            &new_path,
-            now_nanos,
-        )
-        .map_or_else(p1_errno_from_fs, |_| p1::errno::SUCCESS)
+    wasi_fs::rename_at(
+        &namespace,
+        &source_base,
+        &old_path,
+        &destination_base,
+        &new_path,
+        now_nanos,
+    )
+    .await
+    .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
 
 pub(super) async fn p1_path_symlink<CpuImpl, Net, HostFs>(
@@ -3853,8 +3385,7 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let old_path = match p1_read_path(caller, memory, GuestAddress::wasm32(old_path), old_path_len)
-    {
+    let target = match p1_read_path(caller, memory, GuestAddress::wasm32(old_path), old_path_len) {
         Ok(path) => path,
         Err(_) => return p1::errno::FAULT,
     };
@@ -3867,46 +3398,15 @@ where
     if status != p1::errno::SUCCESS {
         return status;
     }
-    let (base, new_path, absolute) = match caller.data().resolve_preview1_path(fd, &new_path) {
+    let (base, new_path, _) = match caller.data().resolve_preview1_path(fd, &new_path) {
         Ok(resolved) => resolved,
         Err(errno) => return errno,
     };
-    if let Err(error) = crate::wasmtime_adapter::wasi::resolve_symlink_payload(&absolute, &old_path)
-    {
-        return p1_errno_from_fs(error);
-    }
-    if let Some(host_path) = crate::guest_host_share_path(&absolute) {
-        if base.kind != FsNodeKind::Directory {
-            return p1::errno::NOTDIR;
-        }
-        if !base
-            .flags
-            .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
-        {
-            return p1::errno::ROFS;
-        }
-        let service = match caller.data().filesystem.host_service() {
-            Ok(service) => service,
-            Err(error) => return p1_errno_from_fs(error),
-        };
-        return service
-            .symlink(&old_path, host_path)
-            .await
-            .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
-            .map_or_else(p1_errno_from_fs, |_| {
-                caller
-                    .data_mut()
-                    .filesystem
-                    .invalidate_host_subtree(&absolute);
-                p1::errno::SUCCESS
-            });
-    }
+    let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
-    caller
-        .data_mut()
-        .filesystem
-        .symlink_at(&base, &new_path, &old_path, now_nanos)
-        .map_or_else(p1_errno_from_fs, |_| p1::errno::SUCCESS)
+    wasi_fs::symlink_at(&namespace, &base, &target, &new_path, now_nanos)
+        .await
+        .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
 
 pub(super) async fn p1_path_unlink_file<CpuImpl, Net, HostFs>(
@@ -3927,38 +3427,14 @@ where
         Ok(path) => path,
         Err(_) => return p1::errno::FAULT,
     };
-    let (base, path, absolute) = match caller.data().resolve_preview1_path(fd, &path) {
+    let (base, path, _) = match caller.data().resolve_preview1_path(fd, &path) {
         Ok(resolved) => resolved,
         Err(errno) => return errno,
     };
-    if let Some(host_path) = crate::guest_host_share_path(&absolute) {
-        if !base
-            .flags
-            .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
-        {
-            return p1::errno::ROFS;
-        }
-        let service = match caller.data().filesystem.host_service() {
-            Ok(service) => service,
-            Err(error) => return p1_errno_from_fs(error),
-        };
-        return service
-            .remove(host_path, false)
-            .await
-            .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
-            .map_or_else(p1_errno_from_fs, |_| {
-                caller
-                    .data_mut()
-                    .filesystem
-                    .invalidate_host_subtree(&absolute);
-                p1::errno::SUCCESS
-            });
-    }
-    caller
-        .data_mut()
-        .filesystem
-        .unlink_file_at(&base, &path)
-        .map_or_else(p1_errno_from_fs, |_| p1::errno::SUCCESS)
+    let namespace = p1_namespace(caller);
+    wasi_fs::unlink_file_at(&namespace, &base, &path)
+        .await
+        .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
 
 /// How much console input one stdin readiness probe pulls into the carry.
@@ -4025,11 +3501,16 @@ where
         return p1::errno::FAULT;
     };
 
+    let (monotonic_now, system_now) =
+        (caller.data().now_nanos(), caller.data().system_time_nanos());
+    let max_subscriptions = p1_subscription_limit(caller.data().descriptors.limit);
     let parsed = match p1_read_subscriptions(
-        caller,
         memory,
         GuestAddress::wasm32(subscriptions),
         nsubscriptions,
+        max_subscriptions,
+        monotonic_now,
+        system_now,
     ) {
         Ok(parsed) => parsed,
         Err(errno) => return errno,
@@ -4202,33 +3683,43 @@ fn p1_clock_progress(userdata: u64, deadline_nanos: u64, now: u64) -> P1ClockPro
     P1ClockProgress::Waiting(Duration::from_nanos(deadline_nanos - now))
 }
 
-fn p1_read_subscriptions<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+/// The most subscriptions one `poll_oneoff` takes for a process whose
+/// descriptor table admits `limit` descriptors. Linux `poll` refuses an
+/// `nfds` above `RLIMIT_NOFILE` with `EINVAL`, and wasi-libc's `poll` turns
+/// each `pollfd` into at most two subscriptions (read and write) plus one
+/// clock for the timeout.
+fn p1_subscription_limit(limit: DescriptorLimit) -> usize {
+    limit.get().saturating_mul(2).saturating_add(1)
+}
+
+/// Decodes the `nsubscriptions` subscriptions at `subscriptions`, anchoring
+/// clock timeouts at `monotonic_now` / `system_now`. A count above
+/// `max_subscriptions` is `EINVAL`, and the array must lie inside `memory`;
+/// both are checked before anything is collected for it.
+fn p1_read_subscriptions(
     memory: Preview1Memory,
     subscriptions: GuestAddress,
     nsubscriptions: u32,
-) -> Result<Vec<P1Subscription>, i32>
-where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
-{
+    max_subscriptions: usize,
+    monotonic_now: u64,
+    system_now: u64,
+) -> Result<Vec<P1Subscription>, i32> {
+    if nsubscriptions as usize > max_subscriptions {
+        return Err(p1::errno::INVAL);
+    }
     let mut parsed = Vec::with_capacity(nsubscriptions as usize);
     for index in 0..nsubscriptions {
         let subscription_ptr =
             subscriptions.offset(u64::from(index) * u64::from(P1_SUBSCRIPTION_SIZE));
-        let userdata =
-            p1_try_read_u64(caller, memory, subscription_ptr).map_err(|_| p1::errno::FAULT)?;
-        let event_type = p1_try_read_u8(caller, memory, subscription_ptr.offset(8))
-            .map_err(|_| p1::errno::FAULT)?;
+        let userdata = u64::from_le_bytes(p1_read_array(memory, subscription_ptr)?);
+        let [event_type] = p1_read_array(memory, subscription_ptr.offset(8))?;
         parsed.push(match event_type {
             P1_EVENTTYPE_CLOCK => {
-                let clock_id = p1_try_read_u32(caller, memory, subscription_ptr.offset(16))
-                    .map_err(|_| p1::errno::FAULT)?;
-                let timeout = p1_try_read_u64(caller, memory, subscription_ptr.offset(24))
-                    .map_err(|_| p1::errno::FAULT)?;
-                let flags = p1_try_read_u16(caller, memory, subscription_ptr.offset(40))
-                    .map_err(|_| p1::errno::FAULT)?;
+                let clock_id =
+                    u32::from_le_bytes(p1_read_array(memory, subscription_ptr.offset(16))?);
+                let timeout =
+                    u64::from_le_bytes(p1_read_array(memory, subscription_ptr.offset(24))?);
+                let flags = u16::from_le_bytes(p1_read_array(memory, subscription_ptr.offset(40))?);
                 if !matches!(clock_id, 0 | 1) {
                     P1Subscription::Failed {
                         userdata,
@@ -4237,11 +3728,7 @@ where
                     }
                 } else {
                     let monotonic = clock_id == 1;
-                    let now = if monotonic {
-                        caller.data().now_nanos()
-                    } else {
-                        caller.data().system_time_nanos()
-                    };
+                    let now = if monotonic { monotonic_now } else { system_now };
                     // Relative timeouts are anchored once, here, so a
                     // subscription cannot restart its countdown every time
                     // the wait loop re-probes.
@@ -4258,8 +3745,7 @@ where
                 }
             }
             P1_EVENTTYPE_FD_READ | P1_EVENTTYPE_FD_WRITE => {
-                let fd = p1_try_read_u32(caller, memory, subscription_ptr.offset(16))
-                    .map_err(|_| p1::errno::FAULT)? as i32;
+                let fd = i32::from_le_bytes(p1_read_array(memory, subscription_ptr.offset(16))?);
                 P1Subscription::Fd {
                     userdata,
                     event_type,
@@ -4461,15 +3947,12 @@ where
         GuestAddress::wasm32(ro_flags),
     );
     let iovs_started = p1_kernel_profile_start(caller.data());
-    let layout = match p1_read_iovs_with_byte_len(caller, memory, ri_data, ri_data_len) {
+    let layout = match p1_read_iovs_with_byte_len(memory, ri_data, ri_data_len) {
         Ok(layout) => layout,
         Err(errno) => return errno,
     };
     p1_record_optional_kernel_profile(caller.data(), "sock_recv_iovs", iovs_started);
-    let capacity = match layout.byte_len_u32() {
-        Ok(capacity) => capacity,
-        Err(errno) => return errno,
-    };
+    let capacity = layout.byte_len;
     let fdflags = match caller.data().descriptors.fdflags(fd) {
         Ok(fdflags) => fdflags,
         Err(errno) => return errno,
@@ -4608,29 +4091,27 @@ where
         GuestAddress::wasm32(si_data),
         GuestAddress::wasm32(so_datalen),
     );
-    let layout = match p1_read_iovs_with_byte_len(caller, memory, si_data, si_data_len) {
-        Ok(layout) => layout,
-        Err(errno) => return errno,
-    };
-    let ranges = match p1_iovs_memory_ranges(memory, &layout.iovs) {
-        Ok(ranges) => ranges,
+    let mut gather = match p1_read_iovs_with_byte_len(memory, si_data, si_data_len)
+        .and_then(|layout| Preview1Gather::new(memory, &layout))
+    {
+        Ok(gather) => gather,
         Err(errno) => return errno,
     };
     let descriptor = caller.data().descriptors.get(fd).cloned();
     if let Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { writer, .. })) = descriptor
     {
-        let written = match layout.byte_len_u32() {
-            Ok(written) => written,
-            Err(errno) => return errno,
-        };
         let fdflags = match caller.data().descriptors.fdflags(fd) {
             Ok(fdflags) => fdflags,
             Err(errno) => return errno,
         };
-        let bytes = preview1_ranges_to_vec(memory.base as *const u8, &ranges, layout.byte_len);
-        if let Err(errno) = p1_send_to_socketpair(&writer, bytes, fdflags).await {
-            return errno;
-        }
+        let mut stream = Preview1SocketpairStream {
+            writer: &writer,
+            fdflags,
+        };
+        let written = match p1_send_gathered(&mut gather, &mut stream).await {
+            Ok(written) => written,
+            Err(errno) => return errno,
+        };
         return p1_write_u32(caller, memory, so_datalen, written);
     }
     let Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Connected {
@@ -4658,19 +4139,16 @@ where
     } else {
         u64::MAX
     };
-    let written = match layout.byte_len_u32() {
+    let mut stream = Preview1TcpStream {
+        service: &service,
+        stream: stream.id(),
+        timeout,
+        fdflags,
+    };
+    let written = match p1_send_gathered(&mut gather, &mut stream).await {
         Ok(written) => written,
         Err(errno) => return errno,
     };
-    // The guest is parked in this call until it returns, so its iovecs
-    // stay as they are while the write draws them one send buffer at a
-    // time, straight into transmit memory.
-    let pieces = service.tcp_payload_pieces(layout.byte_len, |offset, piece| {
-        copy_preview1_ranges_window(memory.base as *const u8, &ranges, offset, piece);
-    });
-    if let Err(error) = service.tcp_write_all(stream.id(), pieces, timeout).await {
-        return p1_errno_from_tcp_error_for_fdflags(error, fdflags);
-    }
     p1_write_u32(caller, memory, so_datalen, written)
 }
 
@@ -4801,6 +4279,58 @@ pub(super) async fn p1_send_to_socketpair(
     writer.write(bytes).await.map_err(|_| p1::errno::IO)
 }
 
+/// A socketpair's writer half, which a gathered send takes one chunk at a
+/// time ([`p1_send_to_socketpair`]).
+pub(super) struct Preview1SocketpairStream<'a> {
+    pub(super) writer: &'a crate::ByteWriter,
+    pub(super) fdflags: u16,
+}
+
+impl Preview1ChunkedStream for Preview1SocketpairStream<'_> {
+    async fn send(&mut self, gather: &mut Preview1Gather, len: usize) -> Result<(), i32> {
+        let chunk = gather.next_chunk().unwrap_or_default();
+        debug_assert_eq!(chunk.len(), len, "a chunk is as long as the loop asked");
+        p1_send_to_socketpair(self.writer, chunk, self.fdflags).await
+    }
+}
+
+/// A connected TCP stream, which a gathered send takes one chunk at a time
+/// straight from guest memory into transmit memory.
+///
+/// A chunk is drawn through [`crate::ComponentNetworkService::tcp_payload_pieces`]:
+/// its fill closure runs once per piece, after that piece's transmit memory
+/// was obtained, and a piece refused for want of transmit memory is drawn
+/// again without the closure having run. The gather is therefore only
+/// advanced by bytes that have somewhere to go, which is what lets a
+/// sequential gather feed the write. An empty chunk sends one empty payload.
+pub(super) struct Preview1TcpStream<'a, Net: crate::ComponentNetworkService> {
+    pub(super) service: &'a Net,
+    pub(super) stream: Net::TcpStream,
+    pub(super) timeout: u64,
+    pub(super) fdflags: u16,
+}
+
+impl<Net: crate::ComponentNetworkService> Preview1ChunkedStream for Preview1TcpStream<'_, Net> {
+    async fn send(&mut self, gather: &mut Preview1Gather, len: usize) -> Result<(), i32> {
+        // The guest is parked in this call until it returns, so its iovecs
+        // stay as they are while the write draws them one send buffer at a
+        // time.
+        let written = if len == 0 {
+            self.service
+                .tcp_write_all_bytes(self.stream, Bytes::new(), self.timeout)
+                .await
+        } else {
+            let pieces = self
+                .service
+                .tcp_payload_pieces(len, |_, piece| gather.fill(piece));
+            self.service
+                .tcp_write_all(self.stream, pieces, self.timeout)
+                .await
+        };
+        written.map_err(|error| p1_errno_from_tcp_error_for_fdflags(error, self.fdflags))
+    }
+}
+
 /// Write one chunk to stdout/stderr, respecting the descriptor's
 /// blocking mode.
 ///
@@ -4879,13 +4409,19 @@ pub(super) enum RoutedOutput {
 pub(super) async fn p1_write_descriptor<CpuImpl, Net, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     fd: i32,
-    bytes: &[u8],
+    memory: Preview1Memory,
+    layout: &Preview1IovLayout,
 ) -> Result<u32, i32>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
+    // A file takes the guest's bytes straight into its own destination;
+    // every other sink takes them gathered, one bounded chunk at a time.
+    if let Some(Preview1Descriptor::File { .. }) = caller.data().descriptors.get(fd) {
+        return p1_write_file(caller, fd, memory, layout, None).await;
+    }
     // A descriptor whose sink is a bounded channel blocks the guest while
     // that channel is full, unless the guest asked for non-blocking IO —
     // then it gets `EAGAIN` and keeps its bytes, as POSIX requires.
@@ -4894,6 +4430,40 @@ where
         .descriptors
         .fdflags(fd)
         .is_ok_and(p1_fdflags_nonblocking);
+    let mut gather = Preview1Gather::new(memory, layout)?;
+    let mut written = 0_u32;
+    // An empty write still reaches the sink once.
+    loop {
+        let chunk = gather.next_chunk().unwrap_or_default();
+        let taken = match p1_write_sink_chunk(caller, fd, &chunk, nonblocking).await {
+            Ok(taken) => taken,
+            // What an earlier chunk wrote stands; the guest meets the
+            // refusal on its next call.
+            Err(_) if written > 0 => break,
+            Err(errno) => return Err(errno),
+        };
+        // A count above `u32::MAX` cannot arise: the iovecs' sum fits it.
+        written += taken;
+        if gather.remaining() == 0 || (taken as usize) < chunk.len() {
+            break;
+        }
+    }
+    Ok(written)
+}
+
+/// One chunk of a gathered write to the non-file descriptor `fd`, and how
+/// many of its bytes the sink took.
+async fn p1_write_sink_chunk<CpuImpl, Net, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+    fd: i32,
+    bytes: &[u8],
+    nonblocking: bool,
+) -> Result<u32, i32>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    HostFs: crate::HostFileSystem,
+{
     match caller.data().descriptors.get(fd) {
         Some(Preview1Descriptor::Stdout) => {
             p1_write_stdio(
@@ -4944,79 +4514,6 @@ where
         Some(Preview1Descriptor::NullDevice) => {
             u32::try_from(bytes.len()).map_err(|_| p1::errno::OVERFLOW)
         }
-        Some(Preview1Descriptor::File { .. }) => {
-            let Some(Preview1Descriptor::File {
-                descriptor,
-                offset,
-                fdflags,
-            }) = caller.data().descriptors.get(fd)
-            else {
-                return Err(p1::errno::BADF);
-            };
-            let current_offset = *offset;
-            let descriptor = descriptor.clone();
-            let next_offset = current_offset.saturating_add(bytes.len() as u64);
-            if let Some(host_path) =
-                crate::guest_host_share_path(&descriptor.path).map(ToOwned::to_owned)
-            {
-                if !descriptor.flags.contains(fs_types::DescriptorFlags::WRITE) {
-                    return Err(p1::errno::NOTCAPABLE);
-                }
-                let service = caller
-                    .data()
-                    .filesystem
-                    .host_service()
-                    .map_err(p1_errno_from_fs)?;
-                let host_offset = if fdflags & P1_FDFLAG_APPEND != 0 {
-                    service
-                        .stat_path(&host_path)
-                        .await
-                        .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
-                        .map_err(p1_errno_from_fs)?
-                        .size
-                } else {
-                    current_offset
-                };
-                service
-                    .write_file(&host_path, host_offset, bytes)
-                    .await
-                    .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
-                    .map_err(p1_errno_from_fs)?;
-                caller
-                    .data_mut()
-                    .filesystem
-                    .invalidate_host_subtree(&descriptor.path);
-                let Some(Preview1Descriptor::File { offset, .. }) =
-                    caller.data_mut().descriptors.get_mut(fd)
-                else {
-                    panic!("Preview1 descriptor disappeared during host write");
-                };
-                *offset = next_offset;
-                return u32::try_from(bytes.len()).map_err(|_| p1::errno::OVERFLOW);
-            }
-            let now_nanos = caller.data().now_nanos();
-            let write_offset: usize = current_offset.try_into().map_err(|_| p1::errno::OVERFLOW)?;
-            if fdflags & P1_FDFLAG_APPEND != 0 {
-                caller
-                    .data_mut()
-                    .filesystem
-                    .append(&descriptor, bytes, now_nanos)
-                    .map_err(p1_errno_from_fs)?;
-            } else {
-                caller
-                    .data_mut()
-                    .filesystem
-                    .write_at(&descriptor, write_offset, bytes, now_nanos)
-                    .map_err(p1_errno_from_fs)?;
-            }
-            let Some(Preview1Descriptor::File { offset, .. }) =
-                caller.data_mut().descriptors.get_mut(fd)
-            else {
-                panic!("Preview1 descriptor disappeared during write");
-            };
-            *offset = next_offset;
-            u32::try_from(bytes.len()).map_err(|_| p1::errno::OVERFLOW)
-        }
         Some(_) => Err(p1::errno::BADF),
         None => Err(p1::errno::BADF),
     }
@@ -5025,7 +4522,7 @@ where
 pub(super) async fn p1_read_descriptor<CpuImpl, Net, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     fd: i32,
-    capacity: usize,
+    capacity: u32,
 ) -> Result<Bytes, i32>
 where
     CpuImpl: Cpu + Clone,
@@ -5035,7 +4532,7 @@ where
     match caller.data().descriptors.get(fd) {
         Some(Preview1Descriptor::Stdin { .. }) => Ok(caller.data_mut().read_stdin(capacity).await),
         Some(Preview1Descriptor::PipeRead { .. }) => {
-            caller.data_mut().read_pipe(fd, capacity).await
+            caller.data_mut().read_pipe(fd, capacity as usize).await
         }
         Some(Preview1Descriptor::Event(event)) => {
             if capacity < 8 {
@@ -5049,33 +4546,11 @@ where
         }) => {
             let descriptor = descriptor.clone();
             let offset = *offset;
-            let bytes = if let Some(host_path) =
-                crate::guest_host_share_path(&descriptor.path).map(ToOwned::to_owned)
-            {
-                let service = caller
-                    .data()
-                    .filesystem
-                    .host_service()
-                    .map_err(p1_errno_from_fs)?;
-                let max_bytes = u32::try_from(capacity).map_err(|_| p1::errno::OVERFLOW)?;
-                service
-                    .read_file_range(&host_path, offset, max_bytes)
-                    .await
-                    .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
-                    .map_err(p1_errno_from_fs)?
-                    .into()
-            } else {
-                caller
-                    .data()
-                    .filesystem
-                    .read_file_chunk(&descriptor, offset, capacity)
-                    .map_err(p1_errno_from_fs)?
-            };
-            if let Some(Preview1Descriptor::File { offset, .. }) =
-                caller.data_mut().descriptors.get_mut(fd)
-            {
-                *offset = offset.saturating_add(bytes.len() as u64);
-            }
+            let namespace = p1_namespace(caller);
+            let bytes = wasi_fs::read(&namespace, &descriptor, offset, capacity as usize)
+                .await
+                .map_err(p1_errno_from_fs)?;
+            p1_set_file_offset(caller, fd, offset.saturating_add(bytes.len() as u64));
             Ok(bytes)
         }
         Some(_) => Err(p1::errno::BADF),
@@ -5311,9 +4786,71 @@ mod tests {
                 kind: FsNodeKind::File,
                 flags: fs_types::DescriptorFlags::READ,
                 identity: None,
+                mount: None,
             },
             offset: 0,
             fdflags: 0,
+        }
+    }
+
+    /// `path_open(O_TRUNC)` against a preopen that may read and change its
+    /// directory but not write file data is refused, whatever rights the
+    /// guest asks for, and leaves the file as it was.
+    #[test]
+    fn path_open_truncate_without_write_authority_leaves_the_file_untouched() {
+        use futures_lite::future::block_on;
+
+        let namespace: crate::Namespace<crate::UnsupportedHostFileSystem> =
+            crate::Namespace::new(crate::MountTable::new(
+                crate::BootFs::new(crate::EmbeddedBootFs::new(&[], &[]), crate::BOOT_DEVICE),
+                1,
+            ));
+        let owner = FsDescriptor {
+            path: "/".into(),
+            kind: FsNodeKind::Directory,
+            flags: fs_types::DescriptorFlags::READ
+                | fs_types::DescriptorFlags::WRITE
+                | fs_types::DescriptorFlags::MUTATE_DIRECTORY,
+            identity: None,
+            mount: None,
+        };
+        let file = block_on(wasi_fs::open_at(
+            &namespace,
+            &owner,
+            fs_types::PathFlags::empty(),
+            "notes.txt",
+            fs_types::OpenFlags::CREATE,
+            fs_types::DescriptorFlags::READ | fs_types::DescriptorFlags::WRITE,
+            1,
+        ))
+        .expect("the owner creates the file");
+        block_on(wasi_fs::write(
+            &namespace,
+            &file,
+            helios_hal::fs::WritePosition::At(0),
+            "日本語 한국어".as_bytes(),
+            2,
+        ))
+        .expect("the owner writes the file");
+
+        let preopen = FsDescriptor {
+            flags: fs_types::DescriptorFlags::READ | fs_types::DescriptorFlags::MUTATE_DIRECTORY,
+            ..owner
+        };
+        for rights in [P1_RIGHT_FD_READ | P1_RIGHT_FD_WRITE, P1_RIGHT_FD_READ] {
+            let opened = block_on(wasi_fs::open_at(
+                &namespace,
+                &preopen,
+                fs_types::PathFlags::empty(),
+                "notes.txt",
+                p1_open_flags(8),
+                p1_descriptor_flags(rights, 0),
+                3,
+            ));
+            assert!(matches!(opened, Err(fs_types::ErrorCode::ReadOnly)));
+            let contents =
+                block_on(wasi_fs::read(&namespace, &file, 0, 64)).expect("the owner reads back");
+            assert_eq!(contents.as_ref(), "日本語 한국어".as_bytes());
         }
     }
 
@@ -5485,7 +5022,7 @@ mod tests {
     /// closes its stream straight from `WasixOwnedTcpStream::drop` and
     /// never went through that drain. Its FIN therefore sat in the
     /// queue until the pump's park expired, which on a guest with
-    /// nothing else to send is `DHCP_RETRANSMIT_NANOS` — a second of
+    /// nothing else to send is `CONFIGURATION_POLL_NANOS` — a second of
     /// silence the peer spends holding an established connection
     /// (#231). This asks the park, not the wire: the previous test
     /// already proves the FIN is queued, and what was wrong was when it
@@ -5987,5 +5524,432 @@ mod tests {
             drive_wasix_call(&activity, &signal_state, call).expect_err("the call is stopped");
         assert!(error.downcast_ref::<crate::InstanceKilled>().is_none());
         assert_eq!(preview1_exit_status(&error, None), Some(130));
+    }
+
+    fn memory_of(bytes: &[u8]) -> Preview1Memory {
+        Preview1Memory {
+            base: bytes.as_ptr() as usize,
+            len: bytes.len(),
+        }
+    }
+
+    fn iovec_table(entries: &[(u32, u32)]) -> Vec<u8> {
+        entries
+            .iter()
+            .flat_map(|(ptr, len)| ptr.to_le_bytes().into_iter().chain(len.to_le_bytes()))
+            .collect()
+    }
+
+    /// `random_get` with a length no memory could hold is refused before
+    /// anything is drawn or allocated for it, and a length that fits is
+    /// filled in full through the fixed-size chunk.
+    #[test]
+    fn random_get_refuses_a_length_beyond_guest_memory_before_drawing() {
+        let mut guest = vec![0_u8; 3 * P1_RANDOM_CHUNK_BYTES];
+        let memory = Preview1Memory {
+            base: guest.as_mut_ptr() as usize,
+            len: guest.len(),
+        };
+        let mut draws = 0;
+        for (ptr, len) in [(0, u32::MAX), (16, u32::MAX), (u32::MAX, 1), (u32::MAX, 0)] {
+            let status = p1_fill_random(memory, GuestAddress::wasm32(ptr), len, |_| draws += 1);
+            assert_eq!(status, p1::errno::FAULT, "random_get({ptr}, {len})");
+        }
+        assert_eq!(draws, 0, "a refused length draws no entropy");
+
+        let wanted = guest.len() - 5;
+        let mut drawn = Vec::new();
+        let status = p1_fill_random(memory, GuestAddress::wasm32(5), wanted as u32, |chunk| {
+            drawn.push(chunk.len());
+            chunk.fill(0xA5);
+        });
+        assert_eq!(status, p1::errno::SUCCESS);
+        assert_eq!(
+            drawn,
+            [
+                P1_RANDOM_CHUNK_BYTES,
+                P1_RANDOM_CHUNK_BYTES,
+                P1_RANDOM_CHUNK_BYTES - 5
+            ],
+            "each pass draws exactly the bytes it writes"
+        );
+        assert!(guest[..5].iter().all(|byte| *byte == 0));
+        assert!(guest[5..].iter().all(|byte| *byte == 0xA5));
+    }
+
+    /// `poll_oneoff` refuses a subscription count above what the process's
+    /// descriptor limit admits (`EINVAL`) before anything is collected for
+    /// it, and an array that does not lie in guest memory (`EFAULT`).
+    #[test]
+    fn poll_oneoff_refuses_a_subscription_count_beyond_its_bounds() {
+        assert_eq!(p1_subscription_limit(DescriptorLimit::DEFAULT), 2049);
+        let guest = vec![0_u8; 4 * P1_SUBSCRIPTION_SIZE as usize];
+        let memory = memory_of(&guest);
+        let max = p1_subscription_limit(DescriptorLimit::new(1));
+        assert_eq!(max, 3);
+        for count in [u32::MAX, 4] {
+            assert_eq!(
+                p1_read_subscriptions(memory, GuestAddress::wasm32(0), count, max, 0, 0).err(),
+                Some(p1::errno::INVAL),
+                "poll_oneoff count {count} over a bound of {max}",
+            );
+        }
+        let max = p1_subscription_limit(DescriptorLimit::new(1 << 20));
+        for (ptr, count) in [(0, 5), (16, 4), (u32::MAX, 1)] {
+            assert_eq!(
+                p1_read_subscriptions(memory, GuestAddress::wasm32(ptr), count, max, 0, 0).err(),
+                Some(p1::errno::FAULT),
+                "poll_oneoff subscriptions at {ptr}, count {count}",
+            );
+        }
+        let subscriptions = p1_read_subscriptions(memory, GuestAddress::wasm32(0), 4, max, 0, 0)
+            .expect("four subscriptions fit");
+        assert_eq!(subscriptions.len(), 4);
+    }
+
+    /// Vectored I/O refuses an iovec count above `IOV_MAX` (`EINVAL`) and
+    /// validates the iovec array and every buffer against guest memory
+    /// (`EFAULT`) before anything is gathered.
+    #[test]
+    fn vectored_io_refuses_iovecs_guest_memory_cannot_hold() {
+        let guest = vec![0_u8; 4096];
+        let memory = memory_of(&guest);
+        let table_at = |table: &[u8]| {
+            let mut guest = guest.clone();
+            guest[..table.len()].copy_from_slice(table);
+            guest
+        };
+        // More iovecs than `IOV_MAX`.
+        for count in [u32::MAX, P1_IOV_MAX as u32 + 1] {
+            assert_eq!(
+                p1_read_iovs_with_byte_len(memory, GuestAddress::wasm32(0), count).err(),
+                Some(p1::errno::INVAL)
+            );
+        }
+        // The array does not fit.
+        assert_eq!(
+            p1_read_iovs_with_byte_len(memory, GuestAddress::wasm32(0), P1_IOV_MAX as u32).err(),
+            Some(p1::errno::FAULT)
+        );
+        // A buffer lies outside memory.
+        let table = table_at(&iovec_table(&[(0, 16), (4090, u32::MAX)]));
+        assert_eq!(
+            p1_read_iovs_with_byte_len(memory_of(&table), GuestAddress::wasm32(0), 2).err(),
+            Some(p1::errno::FAULT)
+        );
+        // Overlapping buffers may add up to more than memory holds: nothing
+        // is sized by the total, so that is a valid transfer.
+        let table = table_at(&iovec_table(&[(0, 4096), (0, 4096)]));
+        let layout = p1_read_iovs_with_byte_len(memory_of(&table), GuestAddress::wasm32(0), 2)
+            .expect("overlapping buffers are valid");
+        assert_eq!(layout.byte_len, 8192);
+        // Overlapping buffers that fit are a valid transfer.
+        let table = table_at(&iovec_table(&[(64, 2048), (1024, 1024)]));
+        let layout = p1_read_iovs_with_byte_len(memory_of(&table), GuestAddress::wasm32(0), 2)
+            .expect("buffers that fit are valid");
+        assert_eq!(layout.byte_len, 3072);
+    }
+
+    /// Iovecs that overlap may sum past what a 32-bit byte count holds
+    /// (#806): that is refused with `EINVAL` as `readv` does, so the layout
+    /// a read takes its capacity from always fits the `u32` `read_stdin`
+    /// takes.
+    #[test]
+    fn iovecs_summing_past_u32_are_refused_not_converted() {
+        let table = iovec_table(&[(0, 0x8000_0000), (0, 0x8000_0000)]);
+        let memory = Preview1Memory {
+            base: table.as_ptr() as usize,
+            // Linear memory of 4 GiB: each buffer is inside it, and only
+            // the iovec table, which is real, is ever read.
+            len: 1 << 32,
+        };
+        assert_eq!(
+            p1_read_iovs_with_byte_len(memory, GuestAddress::wasm32(0), 2).err(),
+            Some(p1::errno::INVAL)
+        );
+    }
+
+    /// A gathered write copies guest memory in chunks no larger than
+    /// [`P1_IO_CHUNK_BYTES`], in iovec order, across overlapping and empty
+    /// iovecs, and hands the sink every byte once.
+    #[test]
+    fn gathered_writes_move_in_bounded_chunks() {
+        use futures_lite::future::block_on;
+
+        let guest: Vec<u8> = (0..3 * P1_IO_CHUNK_BYTES)
+            .map(|index| index as u8)
+            .collect();
+        let table = iovec_table(&[(0, 150_000), (7, 0), (50_000, 40_000)]);
+        let table_at = guest.len() - table.len();
+        let mut memory = guest.clone();
+        memory[table_at..].copy_from_slice(&table);
+        let memory = memory_of(&memory);
+        let layout = p1_read_iovs_with_byte_len(memory, GuestAddress::wasm32(table_at as u32), 3)
+            .expect("iovecs fit");
+        let expected: Vec<u8> = guest[..150_000]
+            .iter()
+            .chain(&guest[50_000..90_000])
+            .copied()
+            .collect();
+        let mut gather = Preview1Gather::new(memory, &layout).expect("buffers fit");
+        let mut stream = RecordingStream::accepting(usize::MAX);
+        let sent =
+            block_on(p1_send_gathered(&mut gather, &mut stream)).expect("every chunk is taken");
+        let chunks = stream.chunks;
+        assert_eq!(sent as usize, expected.len());
+        assert!(chunks.len() > 1);
+        assert!(chunks.iter().all(|chunk| chunk.len() <= P1_IO_CHUNK_BYTES));
+        assert_eq!(chunks.concat(), expected);
+    }
+
+    /// A sink that refuses after taking some chunks leaves them written:
+    /// the count of what went is the result, and a refusal before any
+    /// went is the error.
+    #[test]
+    fn a_refusal_after_some_chunks_reports_what_went() {
+        use futures_lite::future::block_on;
+
+        let guest = vec![1_u8; 3 * P1_IO_CHUNK_BYTES];
+        let table = iovec_table(&[(0, (3 * P1_IO_CHUNK_BYTES) as u32)]);
+        let mut memory = guest.clone();
+        memory[..table.len()].copy_from_slice(&table);
+        let memory = memory_of(&memory);
+        let layout = p1_read_iovs_with_byte_len(memory, GuestAddress::wasm32(0), 1).expect("fits");
+
+        let mut gather = Preview1Gather::new(memory, &layout).expect("fits");
+        let sent = block_on(p1_send_gathered(
+            &mut gather,
+            &mut RecordingStream::accepting(1),
+        ));
+        assert_eq!(sent, Ok(P1_IO_CHUNK_BYTES as u32));
+
+        let mut gather = Preview1Gather::new(memory, &layout).expect("fits");
+        let sent = block_on(p1_send_gathered(
+            &mut gather,
+            &mut RecordingStream::accepting(0),
+        ));
+        assert_eq!(sent, Err(p1::errno::AGAIN));
+    }
+
+    /// An empty transfer still reaches the sink once, as an empty write.
+    #[test]
+    fn an_empty_gathered_write_reaches_the_sink_once() {
+        use futures_lite::future::block_on;
+
+        let guest = vec![0_u8; 64];
+        let memory = memory_of(&guest);
+        let layout = p1_read_iovs_with_byte_len(memory, GuestAddress::wasm32(0), 0).expect("empty");
+        let mut gather = Preview1Gather::new(memory, &layout).expect("empty");
+        let mut stream = RecordingStream::accepting(usize::MAX);
+        let sent = block_on(p1_send_gathered(&mut gather, &mut stream));
+        assert_eq!(sent, Ok(0));
+        assert_eq!(stream.chunks.iter().map(Vec::len).collect::<Vec<_>>(), [0]);
+    }
+
+    /// A stream for [`p1_send_gathered`] that records every chunk it was
+    /// handed.
+    struct RecordingStream {
+        chunks: Vec<Vec<u8>>,
+        /// How many more chunks it takes before it refuses one.
+        accepts: usize,
+    }
+
+    impl RecordingStream {
+        fn accepting(accepts: usize) -> Self {
+            Self {
+                chunks: Vec::new(),
+                accepts,
+            }
+        }
+    }
+
+    impl Preview1ChunkedStream for RecordingStream {
+        async fn send(&mut self, gather: &mut Preview1Gather, len: usize) -> Result<(), i32> {
+            let mut chunk = vec![0; len];
+            gather.fill(&mut chunk);
+            self.chunks.push(chunk);
+            if self.accepts == 0 {
+                return Err(p1::errno::AGAIN);
+            }
+            self.accepts -= 1;
+            Ok(())
+        }
+    }
+
+    /// Guest memory of `len` payload bytes followed by one iovec naming
+    /// them, and the layout that iovec decodes to.
+    fn one_iovec(len: usize) -> (Vec<u8>, Preview1IovLayout) {
+        let mut guest: Vec<u8> = (0..len).map(|index| index as u8).collect();
+        guest.extend(iovec_table(&[(0, len as u32)]));
+        let layout =
+            p1_read_iovs_with_byte_len(memory_of(&guest), GuestAddress::wasm32(len as u32), 1)
+                .expect("the iovec fits");
+        (guest, layout)
+    }
+
+    /// A datagram's payload is gathered whole, across its buffers and past
+    /// the size of a stream chunk, and one byte more than the protocol
+    /// carries is `EMSGSIZE` with nothing taken.
+    #[test]
+    fn a_datagram_is_gathered_whole_or_refused() {
+        let max = P1_IO_CHUNK_BYTES + 7;
+        let mut guest: Vec<u8> = (0..max + 1).map(|index| index as u8).collect();
+        let table = guest.len() as u32;
+        guest.extend(iovec_table(&[(0, 9), (9, max as u32 - 9), (max as u32, 1)]));
+        let memory = memory_of(&guest);
+
+        let whole = p1_read_iovs_with_byte_len(memory, GuestAddress::wasm32(table), 2)
+            .expect("the iovecs fit");
+        let mut gather = Preview1Gather::new(memory, &whole).expect("buffers fit");
+        assert_eq!(gather.datagram(max).as_deref(), Ok(&guest[..max]));
+        assert_eq!(gather.remaining(), 0);
+
+        let over = p1_read_iovs_with_byte_len(memory, GuestAddress::wasm32(table), 3)
+            .expect("the iovecs fit");
+        let mut gather = Preview1Gather::new(memory, &over).expect("buffers fit");
+        assert_eq!(gather.datagram(max), Err(p1::errno::MSGSIZE));
+        assert_eq!(gather.remaining(), max + 1);
+    }
+
+    /// A file for [`p1_write_gathered`] to land chunks in, which records
+    /// where each was asked to go.
+    struct ChunkedFile {
+        bytes: Vec<u8>,
+        positions: Vec<WritePosition>,
+        /// How many more chunks land before the file refuses one.
+        accepts: usize,
+        /// What another writer appends after the first chunk landed.
+        other_writer: &'static [u8],
+    }
+
+    impl ChunkedFile {
+        fn new(bytes: &[u8], accepts: usize) -> Self {
+            Self {
+                bytes: bytes.to_vec(),
+                positions: Vec::new(),
+                accepts,
+                other_writer: b"",
+            }
+        }
+    }
+
+    impl Preview1ChunkedFile for ChunkedFile {
+        type Refusal = i32;
+
+        async fn land(
+            &mut self,
+            gather: &mut Preview1Gather,
+            position: WritePosition,
+            len: usize,
+        ) -> Result<u64, i32> {
+            if self.positions.len() == 1 {
+                self.bytes.extend_from_slice(self.other_writer);
+            }
+            self.positions.push(position);
+            if self.accepts == 0 {
+                return Err(p1::errno::IO);
+            }
+            self.accepts -= 1;
+            let at = match position {
+                WritePosition::End => self.bytes.len(),
+                WritePosition::At(at) => at as usize,
+            };
+            if self.bytes.len() < at + len {
+                self.bytes.resize(at + len, 0);
+            }
+            gather.fill(&mut self.bytes[at..at + len]);
+            Ok((at + len) as u64)
+        }
+    }
+
+    /// Every chunk of an append goes to the end the file has when the
+    /// chunk arrives, so bytes another writer appended between two chunks
+    /// are still there afterwards.
+    #[test]
+    fn a_chunked_append_never_lands_on_another_writers_bytes() {
+        use futures_lite::future::block_on;
+
+        let len = 2 * P1_IO_CHUNK_BYTES + 10;
+        let (guest, layout) = one_iovec(len);
+        let mut gather = Preview1Gather::new(memory_of(&guest), &layout).expect("buffers fit");
+        let mut file = ChunkedFile::new(b"head", usize::MAX);
+        file.other_writer = b"other";
+        let landed = block_on(p1_write_gathered(
+            &mut gather,
+            WritePosition::End,
+            &mut file,
+        ));
+        let expected: Vec<u8> = b"head"
+            .iter()
+            .chain(&guest[..P1_IO_CHUNK_BYTES])
+            .chain(b"other")
+            .chain(&guest[P1_IO_CHUNK_BYTES..len])
+            .copied()
+            .collect();
+        assert_eq!(landed, Ok((expected.len() as u64, len as u32)));
+        assert_eq!(file.positions, [WritePosition::End; 3]);
+        assert!(file.bytes == expected, "the other writer's bytes survive");
+    }
+
+    /// A positioned write's chunks follow one another from the position
+    /// it was given.
+    #[test]
+    fn a_chunked_positioned_write_continues_where_the_last_chunk_ended() {
+        use futures_lite::future::block_on;
+
+        let len = 2 * P1_IO_CHUNK_BYTES + 10;
+        let (guest, layout) = one_iovec(len);
+        let mut gather = Preview1Gather::new(memory_of(&guest), &layout).expect("buffers fit");
+        let mut file = ChunkedFile::new(&[0xEE; 16], usize::MAX);
+        let landed = block_on(p1_write_gathered(
+            &mut gather,
+            WritePosition::At(3),
+            &mut file,
+        ));
+        assert_eq!(landed, Ok((3 + len as u64, len as u32)));
+        assert_eq!(
+            file.positions,
+            [
+                WritePosition::At(3),
+                WritePosition::At(3 + P1_IO_CHUNK_BYTES as u64),
+                WritePosition::At(3 + 2 * P1_IO_CHUNK_BYTES as u64),
+            ]
+        );
+        assert_eq!(file.bytes[..3], [0xEE; 3]);
+        assert!(file.bytes[3..] == guest[..len]);
+    }
+
+    /// A file that refuses a chunk after taking some leaves a short write
+    /// that ends where the last landed chunk did; a refusal of the first
+    /// chunk is the error, and an empty write reaches the file once.
+    #[test]
+    fn a_refused_file_chunk_is_a_short_write() {
+        use futures_lite::future::block_on;
+
+        let (guest, layout) = one_iovec(3 * P1_IO_CHUNK_BYTES);
+        let write = |accepts: usize| {
+            let mut gather = Preview1Gather::new(memory_of(&guest), &layout).expect("buffers fit");
+            let mut file = ChunkedFile::new(b"", accepts);
+            let landed = block_on(p1_write_gathered(
+                &mut gather,
+                WritePosition::At(0),
+                &mut file,
+            ));
+            (landed, file.positions.len())
+        };
+        let two = 2 * P1_IO_CHUNK_BYTES;
+        assert_eq!(write(2), (Ok((two as u64, two as u32)), 3));
+        assert_eq!(write(0), (Err(p1::errno::IO), 1));
+
+        let (guest, layout) = one_iovec(0);
+        let mut gather = Preview1Gather::new(memory_of(&guest), &layout).expect("empty");
+        let mut file = ChunkedFile::new(b"four", usize::MAX);
+        let landed = block_on(p1_write_gathered(
+            &mut gather,
+            WritePosition::End,
+            &mut file,
+        ));
+        assert_eq!(landed, Ok((4, 0)));
+        assert_eq!(file.positions, [WritePosition::End]);
     }
 }

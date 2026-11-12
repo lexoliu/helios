@@ -1,5 +1,7 @@
 mod fs;
 pub(crate) use fs::*;
+#[cfg(test)]
+mod fs_tests;
 pub(in crate::wasmtime_adapter) mod net;
 pub(crate) use net::*;
 mod stream;
@@ -22,21 +24,16 @@ pub use net::{
 extern crate alloc;
 
 use alloc::borrow::ToOwned;
-use alloc::string::{String, ToString};
-use alloc::vec;
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 use core::mem::MaybeUninit;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
-use crate::{
-    AuthorityDomain, ComponentOutputMode, ComponentOutputRoute, ComponentOutputStreamKind,
-    EmbeddedBootFs, HostFsErrorKind, ObjectIdentity,
-};
-use bytes::{Bytes, BytesMut};
+use crate::{ComponentOutputMode, ComponentOutputRoute, ComponentOutputStreamKind, ObjectIdentity};
+use bytes::Bytes;
 use futures::channel::oneshot;
-use hashbrown::HashMap;
 use helios_hal::cpu::Cpu;
 use helios_netstack::Ipv6Address;
 use spin::Mutex;
@@ -68,10 +65,7 @@ const DEFAULT_WASI_TCP_LISTEN_BACKLOG: u16 = 128;
 const DEFAULT_WASI_TCP_KEEP_ALIVE_IDLE_NANOS: u64 = 7_200_000_000_000;
 const DEFAULT_WASI_TCP_KEEP_ALIVE_INTERVAL_NANOS: u64 = 75_000_000_000;
 const DEFAULT_WASI_TCP_KEEP_ALIVE_COUNT: u32 = 9;
-const MAX_WASI_UDP_DATAGRAM_BYTES: usize = u16::MAX as usize;
-const MAX_SYMLINK_DEPTH: usize = 16;
-/// 9p `QTDIR`: the qid type bit that marks a host-share object as a directory.
-pub(crate) const P9_QID_TYPE_DIRECTORY: u8 = 0x80;
+pub(crate) const MAX_WASI_UDP_DATAGRAM_BYTES: usize = u16::MAX as usize;
 
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 #[error("guest requested wasi preview2 exit code {code}")]
@@ -101,6 +95,8 @@ impl Preview3GuestExit {
 pub(crate) enum WasiAdapterTrap {
     #[error("random byte length exceeds usize")]
     RandomLengthOverflow,
+    #[error("the kernel heap cannot serve a random byte list of {len} bytes")]
+    RandomBytesUnavailable { len: u64 },
     #[error("file read offset overflowed u64")]
     FileReadOffsetOverflow,
     #[error("file write offset does not fit into usize")]
@@ -252,32 +248,25 @@ impl<T> core::error::Error for TrappableError<T> {}
 #[cfg(test)]
 mod tests {
     use crate::test_support::{TestNetworkService, TestSocketRetirement};
-    use alloc::boxed::Box;
+
     use alloc::collections::BTreeSet;
     use alloc::string::String;
     use alloc::vec;
 
-    use crate::{
-        AuthorityDomain, ComponentHostFilesystemState, EmbeddedBootDirectory, EmbeddedBootFile,
-        EmbeddedBootFs, ObjectIdentity, UnsupportedHostFileSystem,
-    };
+    use crate::{AuthorityDomain, ObjectIdentity};
     use bytes::Bytes;
     use futures_lite::future::block_on;
-
-    use crate::wasmtime_adapter::component_host::ProgramSource;
-    use crate::wasmtime_adapter::cwasm::{self, UntrustedCwasm};
 
     use super::{
         DEFAULT_WASI_TCP_HOP_LIMIT, DEFAULT_WASI_TCP_KEEP_ALIVE_COUNT,
         DEFAULT_WASI_TCP_KEEP_ALIVE_IDLE_NANOS, DEFAULT_WASI_TCP_KEEP_ALIVE_INTERVAL_NANOS,
-        DEFAULT_WASI_TCP_LISTEN_BACKLOG, DebugFileSystem, FileContents, FsDescriptor, FsNodeKind,
-        P2ResolveAddressStream, TcpSocket, UdpSocket, WasiTcpIpAddress, WasiTcpSocketAddress,
-        WasiTcpSocketFamily, WasiUdpSocketAddress, WasiUdpSocketError, WasiUdpSocketFamily,
-        format_p3_tcp_socket_address, format_p3_udp_socket_address, fs_types,
-        has_wasi_network_rights, http, ip_name_lookup, map_p3_dns_error, map_p3_tcp_error,
-        map_p3_udp_family, map_p3_udp_socket_error, parse_p3_tcp_socket_address,
-        parse_p3_udp_socket_address, preview3, socket_types, stdin_is_terminal,
-        wasi_tcp_bind_rights, wasi_udp_bind_rights,
+        DEFAULT_WASI_TCP_LISTEN_BACKLOG, P2ResolveAddressStream, TcpSocket, UdpSocket,
+        WasiTcpIpAddress, WasiTcpSocketAddress, WasiTcpSocketFamily, WasiUdpSocketAddress,
+        WasiUdpSocketError, WasiUdpSocketFamily, format_p3_tcp_socket_address,
+        format_p3_udp_socket_address, has_wasi_network_rights, http, ip_name_lookup,
+        map_p3_dns_error, map_p3_tcp_error, map_p3_udp_family, map_p3_udp_socket_error,
+        parse_p3_tcp_socket_address, parse_p3_udp_socket_address, preview3, socket_types,
+        stdin_is_terminal, wasi_tcp_bind_rights, wasi_udp_bind_rights,
     };
 
     const fn tcp4(octets: [u8; 4], port: u16) -> WasiTcpSocketAddress {
@@ -294,38 +283,32 @@ mod tests {
         }
     }
 
-    #[derive(Clone)]
-    struct TestRuntimeState;
-
-    impl ComponentHostFilesystemState<UnsupportedHostFileSystem> for TestRuntimeState {
-        fn host_filesystem_service(&self) -> Option<UnsupportedHostFileSystem> {
-            None
-        }
-
-        fn bootfs(&self) -> Option<EmbeddedBootFs> {
-            None
+    #[test]
+    fn a_random_length_the_address_space_cannot_hold_traps_without_filling() {
+        // Both exceed `isize::MAX`, the most a single allocation can span, so
+        // the reservation refuses them on every host without allocating.
+        for len in [u64::MAX, isize::MAX as u64 + 1] {
+            let mut filled = false;
+            let error = super::random_bytes(len, |_| filled = true)
+                .expect_err("a list larger than the address space cannot be built");
+            assert_eq!(
+                error.downcast_ref::<super::WasiAdapterTrap>(),
+                Some(&super::WasiAdapterTrap::RandomBytesUnavailable { len })
+            );
+            assert!(!filled, "fill ran for an unservable length {len}");
         }
     }
 
-    type TestFileSystem = DebugFileSystem<TestRuntimeState, UnsupportedHostFileSystem>;
-
-    fn test_filesystem() -> TestFileSystem {
-        DebugFileSystem::new(TestRuntimeState)
-    }
-
-    fn test_bootfs() -> EmbeddedBootFs {
-        let directories = Box::leak(Box::new([EmbeddedBootDirectory::new("bin/empty", 43)]));
-        let files = Box::leak(Box::new([EmbeddedBootFile::new("bin/tool", b"tool", 42)]));
-        EmbeddedBootFs::new(directories, files)
-    }
-
-    fn readonly_root_descriptor() -> FsDescriptor {
-        FsDescriptor {
-            path: "/".into(),
-            kind: FsNodeKind::Directory,
-            flags: fs_types::DescriptorFlags::READ,
-            identity: Some(ObjectIdentity::new(AuthorityDomain::GUEST_BOOTFS, 1)),
-        }
+    #[test]
+    fn a_small_random_length_is_filled_once_to_exactly_that_length() {
+        let mut calls = 0_u32;
+        let bytes = super::random_bytes(37, |buffer| {
+            calls += 1;
+            buffer.fill(0xa5);
+        })
+        .expect("a small list is served");
+        assert_eq!(bytes, vec![0xa5_u8; 37]);
+        assert_eq!(calls, 1);
     }
 
     #[test]
@@ -973,370 +956,6 @@ mod tests {
         opens - closes
     }
 
-    #[test]
-    fn create_directory_adds_node() {
-        let mut filesystem = test_filesystem();
-        let root = filesystem.root_descriptor();
-
-        filesystem
-            .create_directory_at(&root, "tmp", 7)
-            .expect("directory creation must succeed");
-
-        let node = filesystem
-            .get_node("/tmp")
-            .expect("directory node must exist after creation");
-        assert_eq!(node.kind, FsNodeKind::Directory);
-        assert_eq!(node.modified_nanos, 7);
-    }
-
-    #[test]
-    fn create_directory_rejects_existing_path() {
-        let mut filesystem = test_filesystem();
-        let root = filesystem.root_descriptor();
-
-        filesystem
-            .create_directory_at(&root, "tmp", 1)
-            .expect("initial directory creation must succeed");
-
-        let error = filesystem
-            .create_directory_at(&root, "tmp", 2)
-            .expect_err("creating the same directory twice must fail");
-        assert!(matches!(error, fs_types::ErrorCode::Exist));
-    }
-
-    #[test]
-    fn bootfs_seed_adds_readonly_programs() {
-        let mut filesystem = test_filesystem();
-        filesystem.seed_bootfs(test_bootfs());
-
-        let program = filesystem
-            .get_node("/bin/tool")
-            .expect("bootfs program must be present");
-        assert_eq!(program.kind, FsNodeKind::File);
-        assert!(program.readonly);
-        assert_eq!(program.modified_nanos, 42);
-
-        let directory = filesystem
-            .get_node("/bin")
-            .expect("bootfs program directory must be present");
-        assert_eq!(directory.kind, FsNodeKind::Directory);
-        assert!(directory.readonly);
-
-        let empty = filesystem
-            .get_node("/bin/empty")
-            .expect("bootfs empty directory must be present");
-        assert_eq!(empty.kind, FsNodeKind::Directory);
-        assert!(empty.readonly);
-        assert_eq!(empty.modified_nanos, 43);
-    }
-
-    #[test]
-    fn readonly_bootfs_file_rejects_writes() {
-        let mut filesystem = test_filesystem();
-        filesystem.seed_bootfs(test_bootfs());
-        let root = filesystem.root_descriptor();
-
-        let descriptor = filesystem
-            .open_at(
-                &root,
-                fs_types::PathFlags::empty(),
-                "bin/tool",
-                fs_types::OpenFlags::empty(),
-                fs_types::DescriptorFlags::WRITE,
-                0,
-            )
-            .expect("opening readonly bootfs file must succeed for lookup");
-
-        let error = filesystem
-            .write_at(&descriptor, 0, b"x", 1)
-            .expect_err("readonly bootfs file must reject writes");
-        assert!(matches!(error, fs_types::ErrorCode::ReadOnly));
-    }
-
-    /// A cwasm signed by a key the kernel does not trust: it parses as
-    /// an artifact, and only a signature check tells it apart.
-    fn foreign_signed_cwasm() -> &'static [u8] {
-        let signed = helios_artifact::sign_payload_with_secret_key_bytes(b"payload", &[7; 32])
-            .expect("signing a test payload must succeed");
-        Box::leak(signed.into_boxed_slice())
-    }
-
-    /// A filesystem whose bootfs carries `foreign_signed_cwasm` at
-    /// `/bin/prog`.
-    fn filesystem_with_bootfs_cwasm() -> TestFileSystem {
-        let mut filesystem = test_filesystem();
-        let files = Box::leak(Box::new([EmbeddedBootFile::new(
-            "bin/prog",
-            foreign_signed_cwasm(),
-            42,
-        )]));
-        filesystem.seed_bootfs(EmbeddedBootFs::new(&[], files));
-        filesystem
-    }
-
-    fn program_source(filesystem: &TestFileSystem, path: &str) -> ProgramSource {
-        ProgramSource::from_file(
-            filesystem
-                .read_program_file(path)
-                .expect("program file must be readable"),
-        )
-    }
-
-    #[test]
-    fn bootfs_cwasm_loads_without_signature_verification() {
-        let filesystem = filesystem_with_bootfs_cwasm();
-
-        let ProgramSource::BootfsArtifact(bytes) = program_source(&filesystem, "/bin/prog") else {
-            panic!("a bootfs cwasm must classify as a bootfs artifact");
-        };
-        // The signature would not verify, so accepting it proves the
-        // bootfs path pays no verification.
-        assert!(cwasm::verify_signed_artifact(UntrustedCwasm::new(bytes.as_slice())).is_err());
-        let trusted =
-            cwasm::trust_bootfs_artifact(&bytes).expect("a bootfs artifact loads unverified");
-        assert_eq!(trusted.payload(), b"payload");
-    }
-
-    #[test]
-    fn guest_written_cwasm_must_verify() {
-        let mut filesystem = filesystem_with_bootfs_cwasm();
-        let root = filesystem.root_descriptor();
-        filesystem
-            .create_directory_at(&root, "tmp", 1)
-            .expect("creating /tmp must succeed");
-
-        // The bytes of a bootfs artifact, copied by a guest through an
-        // ordinary WASI write: the copy has no bootfs provenance.
-        let copied = filesystem
-            .read_program_file("/bin/prog")
-            .expect("bootfs program must be readable")
-            .as_slice()
-            .to_vec();
-        let descriptor = filesystem
-            .open_at(
-                &root,
-                fs_types::PathFlags::empty(),
-                "tmp/copy",
-                fs_types::OpenFlags::CREATE,
-                fs_types::DescriptorFlags::READ | fs_types::DescriptorFlags::WRITE,
-                2,
-            )
-            .expect("creating a guest file must succeed");
-        filesystem
-            .write_at(&descriptor, 0, &copied, 3)
-            .expect("writing a guest file must succeed");
-        let ProgramSource::SignedArtifact(bytes) = program_source(&filesystem, "/tmp/copy") else {
-            panic!("a guest-written cwasm must classify as a signed artifact");
-        };
-        assert!(matches!(
-            cwasm::verify_signed_artifact(UntrustedCwasm::new(&bytes)),
-            Err(cwasm::ArtifactTrustError::Trailer(
-                helios_artifact::TrailerError::UntrustedSigner
-            ))
-        ));
-
-        // A kernel-signed artifact with one signature byte flipped, as
-        // `write_program_file` would store it, is refused too.
-        let mut tampered = cwasm::sign_trusted_artifact_payload(b"payload")
-            .expect("signing with the trusted root must succeed");
-        let last_signature_byte = tampered.len() - 13;
-        tampered[last_signature_byte] ^= 1;
-        filesystem
-            .write_program_file("/tmp/tampered", &tampered, 4)
-            .expect("writing a program file must succeed");
-        let ProgramSource::SignedArtifact(bytes) = program_source(&filesystem, "/tmp/tampered")
-        else {
-            panic!("a guest-written cwasm must classify as a signed artifact");
-        };
-        assert!(matches!(
-            cwasm::verify_signed_artifact(UntrustedCwasm::new(&bytes)),
-            Err(cwasm::ArtifactTrustError::Trailer(
-                helios_artifact::TrailerError::InvalidPayloadSignature
-            ))
-        ));
-
-        // What the in-kernel compiler writes is signed by the trusted
-        // root, and that is what lets a guest exec it from anywhere.
-        let signed = cwasm::sign_trusted_artifact_payload(b"payload")
-            .expect("signing with the trusted root must succeed");
-        filesystem
-            .write_program_file("/tmp/compiled", &signed, 5)
-            .expect("writing a program file must succeed");
-        let ProgramSource::SignedArtifact(bytes) = program_source(&filesystem, "/tmp/compiled")
-        else {
-            panic!("a guest-written cwasm must classify as a signed artifact");
-        };
-        let trusted = cwasm::verify_signed_artifact(UntrustedCwasm::new(&bytes))
-            .expect("a kernel-signed artifact must verify");
-        assert_eq!(trusted.payload(), b"payload");
-    }
-
-    #[test]
-    fn writing_a_bootfs_node_drops_its_provenance() {
-        let mut filesystem = filesystem_with_bootfs_cwasm();
-        let root = filesystem.root_descriptor();
-        // Bootfs nodes are read-only, so no guest reaches this state;
-        // lifting the flag here shows provenance does not rest on it:
-        // every write path stores written bytes, whatever the node held.
-        let bootfs_bytes = |filesystem: &TestFileSystem| {
-            matches!(
-                filesystem.read_program_file("/bin/prog"),
-                Ok(FileContents::Bootfs(_))
-            )
-        };
-        let make_writable = |filesystem: &TestFileSystem| {
-            let mut state = filesystem.snapshot.inner.lock();
-            let node = state.node_mut("/bin/prog").expect("bootfs node must exist");
-            node.readonly = false;
-        };
-        make_writable(&filesystem);
-        assert!(bootfs_bytes(&filesystem));
-        let descriptor = filesystem
-            .open_at(
-                &root,
-                fs_types::PathFlags::empty(),
-                "bin/prog",
-                fs_types::OpenFlags::empty(),
-                fs_types::DescriptorFlags::READ | fs_types::DescriptorFlags::WRITE,
-                1,
-            )
-            .expect("opening the node for writing must succeed");
-        filesystem
-            .write_at(&descriptor, 0, b"p", 2)
-            .expect("writing the node must succeed");
-        assert!(!bootfs_bytes(&filesystem));
-        assert!(matches!(
-            program_source(&filesystem, "/bin/prog"),
-            ProgramSource::SignedArtifact(_)
-        ));
-
-        let mut replaced = filesystem_with_bootfs_cwasm();
-        make_writable(&replaced);
-        replaced
-            .write_program_file("/bin/prog", foreign_signed_cwasm(), 2)
-            .expect("replacing the node must succeed");
-        assert!(!bootfs_bytes(&replaced));
-
-        let mut resized = filesystem_with_bootfs_cwasm();
-        make_writable(&resized);
-        let root = resized.root_descriptor();
-        let descriptor = resized
-            .open_at(
-                &root,
-                fs_types::PathFlags::empty(),
-                "bin/prog",
-                fs_types::OpenFlags::empty(),
-                fs_types::DescriptorFlags::READ | fs_types::DescriptorFlags::WRITE,
-                1,
-            )
-            .expect("opening the node for writing must succeed");
-        let length = resized
-            .read_program_file("/bin/prog")
-            .expect("bootfs program must be readable")
-            .as_slice()
-            .len() as u64;
-        resized
-            .set_size(&descriptor, length, 2)
-            .expect("resizing the node must succeed");
-        assert!(!bootfs_bytes(&resized));
-    }
-
-    #[test]
-    fn open_at_rejects_descriptor_right_widening() {
-        let mut filesystem = test_filesystem();
-        filesystem.seed_bootfs(test_bootfs());
-        let root = readonly_root_descriptor();
-
-        let error = match filesystem.open_at(
-            &root,
-            fs_types::PathFlags::empty(),
-            "bin/tool",
-            fs_types::OpenFlags::empty(),
-            fs_types::DescriptorFlags::READ | fs_types::DescriptorFlags::WRITE,
-            0,
-        ) {
-            Ok(_) => panic!("open_at must not grant write through a read-only base descriptor"),
-            Err(error) => error,
-        };
-        assert!(matches!(error, fs_types::ErrorCode::ReadOnly));
-    }
-
-    #[test]
-    fn opening_existing_directory_without_directory_flag_fails() {
-        let mut filesystem = test_filesystem();
-        let root = filesystem.root_descriptor();
-
-        filesystem
-            .create_directory_at(&root, "tmp", 1)
-            .expect("directory creation must succeed");
-
-        let error = match filesystem.open_at(
-            &root,
-            fs_types::PathFlags::empty(),
-            "tmp",
-            fs_types::OpenFlags::CREATE,
-            fs_types::DescriptorFlags::WRITE,
-            2,
-        ) {
-            Ok(_) => panic!("opening an existing directory as a file must fail"),
-            Err(error) => error,
-        };
-        assert!(matches!(error, fs_types::ErrorCode::IsDirectory));
-    }
-
-    fn host_metadata(identity: ObjectIdentity, qid_type: u8) -> crate::HostMetadata {
-        crate::HostMetadata {
-            identity,
-            qid_path: identity.local(),
-            qid_type,
-            mode: 0o100_644,
-            size: 17,
-            link_count: 2,
-            access_nanos: 3_000_000_004,
-            modified_nanos: 5_000_000_006,
-            status_nanos: 7_000_000_008,
-        }
-    }
-
-    /// Host-share stat must carry the host's real timestamps and link count.
-    ///
-    /// They used to be reported as absent and `1`, which makes `make`, `rsync`,
-    /// and every other mtime-driven tool treat a shared file as ageless.
-    #[test]
-    fn host_stat_reports_host_timestamps_and_link_count() {
-        let identity = ObjectIdentity::new(AuthorityDomain::HOST_SHARE_9P, 4242);
-
-        let stat = super::descriptor_stat_from_host_metadata(&host_metadata(identity, 0));
-
-        assert!(matches!(stat.type_, fs_types::DescriptorType::RegularFile));
-        assert_eq!(stat.link_count, 2);
-        assert_eq!(stat.size, 17);
-        let access = stat
-            .data_access_timestamp
-            .expect("host stat must report an access timestamp");
-        let modified = stat
-            .data_modification_timestamp
-            .expect("host stat must report a modification timestamp");
-        let status = stat
-            .status_change_timestamp
-            .expect("host stat must report a status timestamp");
-        assert_eq!((access.seconds, access.nanoseconds), (3, 4));
-        assert_eq!((modified.seconds, modified.nanoseconds), (5, 6));
-        assert_eq!((status.seconds, status.nanoseconds), (7, 8));
-    }
-
-    #[test]
-    fn host_directory_metadata_maps_to_a_directory_descriptor_type() {
-        let identity = ObjectIdentity::new(AuthorityDomain::HOST_SHARE_9P, 9);
-
-        let stat = super::descriptor_stat_from_host_metadata(&host_metadata(
-            identity,
-            super::P9_QID_TYPE_DIRECTORY,
-        ));
-
-        assert!(matches!(stat.type_, fs_types::DescriptorType::Directory));
-    }
-
     /// `st_dev`/`st_ino` are derived from object identity, so neither half may
     /// be zero for a host-share file: programs de-duplicate by that pair.
     #[test]
@@ -1351,514 +970,6 @@ mod tests {
             AuthorityDomain::GUEST_BOOTFS.raw(),
             "the host share must not share a device id with bootfs"
         );
-    }
-
-    /// Embedded nodes need the same guarantee: a distinct, nonzero inode per
-    /// object within one device.
-    #[test]
-    fn embedded_nodes_report_nonzero_distinct_inodes() {
-        let mut filesystem = test_filesystem();
-        filesystem.seed_bootfs(test_bootfs());
-
-        let root = filesystem
-            .identity_at_path("/")
-            .expect("root identity must resolve");
-        let program = filesystem
-            .identity_at_path("/bin/tool")
-            .expect("bootfs program identity must resolve");
-
-        assert_eq!(root.domain(), AuthorityDomain::GUEST_BOOTFS);
-        assert_eq!(program.domain(), root.domain());
-        assert_ne!(root.local(), 0);
-        assert_ne!(program.local(), 0);
-        assert_ne!(root.local(), program.local());
-    }
-
-    #[test]
-    fn descriptors_carry_stable_object_identity() {
-        let mut filesystem = test_filesystem();
-        filesystem.seed_bootfs(test_bootfs());
-        let root = filesystem.root_descriptor();
-
-        let first = filesystem
-            .open_at(
-                &root,
-                fs_types::PathFlags::empty(),
-                "bin/tool",
-                fs_types::OpenFlags::empty(),
-                fs_types::DescriptorFlags::READ,
-                0,
-            )
-            .expect("first open must succeed");
-        let second = filesystem
-            .open_at(
-                &root,
-                fs_types::PathFlags::empty(),
-                "bin/tool",
-                fs_types::OpenFlags::empty(),
-                fs_types::DescriptorFlags::READ,
-                0,
-            )
-            .expect("second open must succeed");
-
-        assert_eq!(first.identity, second.identity);
-    }
-
-    #[test]
-    fn rename_preserves_object_identity_local_part() {
-        let mut filesystem = test_filesystem();
-        let root = filesystem.root_descriptor();
-        let descriptor = filesystem
-            .open_at(
-                &root,
-                fs_types::PathFlags::empty(),
-                "tmp",
-                fs_types::OpenFlags::CREATE,
-                fs_types::DescriptorFlags::WRITE,
-                1,
-            )
-            .expect("file creation must succeed");
-        filesystem
-            .write_at(&descriptor, 0, b"data", 1)
-            .expect("file write must succeed");
-        let before = filesystem
-            .metadata_hash("/tmp")
-            .expect("metadata hash before rename must succeed");
-
-        filesystem
-            .rename_at(&root, "tmp", &root, "renamed", 2)
-            .expect("rename must succeed");
-        let after = filesystem
-            .metadata_hash("/renamed")
-            .expect("metadata hash after rename must succeed");
-
-        assert_eq!(before.lower, after.lower);
-    }
-
-    #[test]
-    fn rename_rejects_cross_authority_domain() {
-        let mut filesystem = test_filesystem();
-        let root = filesystem.root_descriptor();
-        let other_domain = FsDescriptor {
-            path: "/".into(),
-            kind: FsNodeKind::Directory,
-            flags: fs_types::DescriptorFlags::READ
-                | fs_types::DescriptorFlags::WRITE
-                | fs_types::DescriptorFlags::MUTATE_DIRECTORY,
-            identity: Some(ObjectIdentity::new(AuthorityDomain::HOST_SHARE_9P, 1)),
-        };
-        let descriptor = filesystem
-            .open_at(
-                &root,
-                fs_types::PathFlags::empty(),
-                "tmp",
-                fs_types::OpenFlags::CREATE,
-                fs_types::DescriptorFlags::WRITE,
-                1,
-            )
-            .expect("file creation must succeed");
-        filesystem
-            .write_at(&descriptor, 0, b"data", 1)
-            .expect("file write must succeed");
-
-        let error = filesystem
-            .rename_at(&root, "tmp", &other_domain, "tmp", 2)
-            .expect_err("rename across authority domains must fail");
-
-        assert!(matches!(error, fs_types::ErrorCode::NotPermitted));
-    }
-
-    #[test]
-    fn rename_rejects_unresolvable_authority_domain() {
-        let mut filesystem = test_filesystem();
-        let root = filesystem.root_descriptor();
-        let stale = FsDescriptor {
-            path: "/stale".into(),
-            kind: FsNodeKind::Directory,
-            flags: fs_types::DescriptorFlags::READ
-                | fs_types::DescriptorFlags::WRITE
-                | fs_types::DescriptorFlags::MUTATE_DIRECTORY,
-            identity: None,
-        };
-        let descriptor = filesystem
-            .open_at(
-                &root,
-                fs_types::PathFlags::empty(),
-                "tmp",
-                fs_types::OpenFlags::CREATE,
-                fs_types::DescriptorFlags::WRITE,
-                1,
-            )
-            .expect("file creation must succeed");
-        filesystem
-            .write_at(&descriptor, 0, b"data", 1)
-            .expect("file write must succeed");
-
-        let error = filesystem
-            .rename_at(&root, "tmp", &stale, "tmp", 2)
-            .expect_err("rename through an unresolvable domain must fail");
-
-        assert!(matches!(error, fs_types::ErrorCode::NoEntry));
-    }
-
-    #[test]
-    fn hardlink_preserves_identity_and_shared_contents() {
-        let mut filesystem = test_filesystem();
-        let root = filesystem.root_descriptor();
-        let original = filesystem
-            .open_at(
-                &root,
-                fs_types::PathFlags::empty(),
-                "tmp",
-                fs_types::OpenFlags::CREATE,
-                fs_types::DescriptorFlags::READ | fs_types::DescriptorFlags::WRITE,
-                1,
-            )
-            .expect("file creation must succeed");
-        filesystem
-            .write_at(&original, 0, b"data", 1)
-            .expect("write must succeed");
-        filesystem
-            .link_at(&root, "tmp", &root, "alias", 2)
-            .expect("hardlink must succeed");
-        let alias = filesystem
-            .open_at(
-                &root,
-                fs_types::PathFlags::empty(),
-                "alias",
-                fs_types::OpenFlags::empty(),
-                fs_types::DescriptorFlags::READ,
-                2,
-            )
-            .expect("alias open must succeed");
-
-        assert_eq!(original.identity, alias.identity);
-        assert_eq!(
-            filesystem
-                .stat("/tmp")
-                .expect("stat must succeed")
-                .link_count,
-            2
-        );
-
-        filesystem
-            .write_at(&original, 0, b"bolt", 3)
-            .expect("linked write must succeed");
-        assert_eq!(
-            filesystem
-                .read_file_chunk(&alias, 0, 4)
-                .expect("alias read must succeed")
-                .as_ref(),
-            b"bolt"
-        );
-    }
-
-    #[test]
-    fn hardlink_resolves_preopen_identity_without_widening_rights() {
-        let mut filesystem = test_filesystem();
-        let mut root = filesystem.root_descriptor();
-        root.identity = None;
-        let original = filesystem
-            .open_at(
-                &root,
-                fs_types::PathFlags::empty(),
-                "tmp",
-                fs_types::OpenFlags::CREATE,
-                fs_types::DescriptorFlags::READ | fs_types::DescriptorFlags::WRITE,
-                1,
-            )
-            .expect("file creation must succeed");
-        filesystem
-            .write_at(&original, 0, b"data", 1)
-            .expect("write must succeed");
-
-        filesystem
-            .link_at(&root, "tmp", &root, "alias", 2)
-            .expect("preopen-like root descriptor must resolve to its stable identity");
-        let alias = filesystem
-            .open_at(
-                &root,
-                fs_types::PathFlags::empty(),
-                "alias",
-                fs_types::OpenFlags::empty(),
-                fs_types::DescriptorFlags::READ,
-                2,
-            )
-            .expect("alias open must succeed");
-
-        assert_eq!(original.identity, alias.identity);
-        assert!(!alias.flags.contains(fs_types::DescriptorFlags::WRITE));
-    }
-
-    #[test]
-    fn set_size_resizes_all_links_without_widening_descriptor_rights() {
-        let mut filesystem = test_filesystem();
-        let root = filesystem.root_descriptor();
-        let original = filesystem
-            .open_at(
-                &root,
-                fs_types::PathFlags::empty(),
-                "tmp",
-                fs_types::OpenFlags::CREATE,
-                fs_types::DescriptorFlags::READ | fs_types::DescriptorFlags::WRITE,
-                1,
-            )
-            .expect("file creation must succeed");
-        filesystem
-            .write_at(&original, 0, b"data", 2)
-            .expect("write must succeed");
-        filesystem
-            .link_at(&root, "tmp", &root, "alias", 3)
-            .expect("hardlink must succeed");
-        filesystem
-            .set_size(&original, 6, 4)
-            .expect("set-size must grow the file");
-
-        let alias = filesystem
-            .open_at(
-                &root,
-                fs_types::PathFlags::empty(),
-                "alias",
-                fs_types::OpenFlags::empty(),
-                fs_types::DescriptorFlags::READ,
-                4,
-            )
-            .expect("alias open must succeed");
-        assert_eq!(
-            filesystem
-                .read_file_chunk(&alias, 0, 6)
-                .expect("alias read must succeed")
-                .as_ref(),
-            b"data\0\0"
-        );
-        assert_eq!(filesystem.stat("/tmp").expect("stat must succeed").size, 6);
-
-        let read_only = FsDescriptor {
-            path: "/tmp".into(),
-            kind: FsNodeKind::File,
-            flags: fs_types::DescriptorFlags::READ,
-            identity: original.identity,
-        };
-        let error = filesystem
-            .set_size(&read_only, 1, 5)
-            .expect_err("set-size through a read-only descriptor must fail");
-        assert!(matches!(error, fs_types::ErrorCode::ReadOnly));
-    }
-
-    #[test]
-    fn set_times_updates_stat_and_metadata_hash() {
-        let mut filesystem = test_filesystem();
-        let root = filesystem.root_descriptor();
-        let descriptor = filesystem
-            .open_at(
-                &root,
-                fs_types::PathFlags::empty(),
-                "tmp",
-                fs_types::OpenFlags::CREATE,
-                fs_types::DescriptorFlags::READ | fs_types::DescriptorFlags::WRITE,
-                1,
-            )
-            .expect("file creation must succeed");
-        let before = filesystem
-            .metadata_hash("/tmp")
-            .expect("metadata hash before set-times must succeed");
-
-        filesystem
-            .set_times(&descriptor, Some(11), Some(17), 19)
-            .expect("set-times must succeed");
-        let stat = filesystem.stat("/tmp").expect("stat must succeed");
-        assert_eq!(
-            stat.data_access_timestamp
-                .expect("access timestamp must exist")
-                .nanoseconds,
-            11
-        );
-        assert_eq!(
-            stat.data_modification_timestamp
-                .expect("modified timestamp must exist")
-                .nanoseconds,
-            17
-        );
-        assert_eq!(
-            stat.status_change_timestamp
-                .expect("status timestamp must exist")
-                .nanoseconds,
-            19
-        );
-        let after = filesystem
-            .metadata_hash("/tmp")
-            .expect("metadata hash after set-times must succeed");
-        assert_ne!(before.upper, after.upper);
-    }
-
-    #[test]
-    fn hardlink_rejects_directory_and_cross_domain() {
-        let mut filesystem = test_filesystem();
-        let root = filesystem.root_descriptor();
-        filesystem
-            .create_directory_at(&root, "dir", 1)
-            .expect("directory creation must succeed");
-        filesystem
-            .open_at(
-                &root,
-                fs_types::PathFlags::empty(),
-                "tmp",
-                fs_types::OpenFlags::CREATE,
-                fs_types::DescriptorFlags::READ,
-                1,
-            )
-            .expect("file creation must succeed");
-        let other_domain = FsDescriptor {
-            path: "/".into(),
-            kind: FsNodeKind::Directory,
-            flags: fs_types::DescriptorFlags::READ
-                | fs_types::DescriptorFlags::WRITE
-                | fs_types::DescriptorFlags::MUTATE_DIRECTORY,
-            identity: Some(ObjectIdentity::new(AuthorityDomain::HOST_SHARE_9P, 1)),
-        };
-
-        let directory_error = filesystem
-            .link_at(&root, "dir", &root, "dir-link", 1)
-            .expect_err("hardlinking directories must fail");
-        assert!(matches!(directory_error, fs_types::ErrorCode::NotPermitted));
-
-        let file_error = filesystem
-            .link_at(&root, "tmp", &other_domain, "tool", 1)
-            .expect_err("hardlink across authority domains must fail");
-        assert!(matches!(file_error, fs_types::ErrorCode::NotPermitted));
-    }
-
-    #[test]
-    fn hardlink_rejects_unresolvable_authority_domain() {
-        let mut filesystem = test_filesystem();
-        let root = filesystem.root_descriptor();
-        let stale = FsDescriptor {
-            path: "/stale".into(),
-            kind: FsNodeKind::Directory,
-            flags: fs_types::DescriptorFlags::READ
-                | fs_types::DescriptorFlags::WRITE
-                | fs_types::DescriptorFlags::MUTATE_DIRECTORY,
-            identity: None,
-        };
-        filesystem
-            .open_at(
-                &root,
-                fs_types::PathFlags::empty(),
-                "tmp",
-                fs_types::OpenFlags::CREATE,
-                fs_types::DescriptorFlags::READ,
-                1,
-            )
-            .expect("file creation must succeed");
-
-        let error = filesystem
-            .link_at(&root, "tmp", &stale, "alias", 1)
-            .expect_err("hardlink through an unresolvable domain must fail");
-
-        assert!(matches!(error, fs_types::ErrorCode::NoEntry));
-    }
-
-    #[test]
-    fn symlink_payload_is_read_without_normalization() {
-        let mut filesystem = test_filesystem();
-        let root = filesystem.root_descriptor();
-        filesystem
-            .symlink_at(&root, "tool-link", "bin/tool", 1)
-            .expect("symlink creation must succeed");
-
-        assert_eq!(
-            filesystem
-                .readlink_at(&root, "tool-link")
-                .expect("readlink must succeed"),
-            "bin/tool"
-        );
-        match filesystem
-            .stat("/tool-link")
-            .expect("symlink stat must succeed")
-            .type_
-        {
-            fs_types::DescriptorType::SymbolicLink => {}
-            _ => panic!("symlink stat must report symbolic-link type"),
-        }
-    }
-
-    #[test]
-    fn readlink_payload_validation_rejects_host_absolute_and_parent_escape() {
-        assert!(matches!(
-            super::resolve_symlink_payload("/host/link", "/Users/lexoliu/private"),
-            Err(fs_types::ErrorCode::NotPermitted)
-        ));
-        assert!(matches!(
-            super::resolve_symlink_payload("/host/link", "share/../../private"),
-            Err(fs_types::ErrorCode::NotPermitted)
-        ));
-        assert_eq!(
-            super::resolve_symlink_payload("/host/link", "share/target")
-                .expect("confined relative payload should resolve"),
-            "/host/share/target"
-        );
-    }
-
-    #[test]
-    fn symlink_rejects_rooted_and_parent_escape_payloads() {
-        let mut filesystem = test_filesystem();
-        let root = filesystem.root_descriptor();
-
-        let absolute = filesystem
-            .symlink_at(&root, "absolute", "/bin/tool", 1)
-            .expect_err("absolute symlink payload must be rejected");
-        assert!(matches!(absolute, fs_types::ErrorCode::NotPermitted));
-
-        let parent = filesystem
-            .symlink_at(&root, "escape", "../bin/tool", 1)
-            .expect_err("parent escape symlink payload must be rejected");
-        assert!(matches!(parent, fs_types::ErrorCode::NotPermitted));
-    }
-
-    #[test]
-    fn symlink_follow_is_confined_and_loop_limited() {
-        let mut filesystem = test_filesystem();
-        filesystem.seed_bootfs(test_bootfs());
-        let root = filesystem.root_descriptor();
-        filesystem
-            .symlink_at(&root, "tool-link", "bin/tool", 1)
-            .expect("symlink creation must succeed");
-        let opened = filesystem
-            .open_at(
-                &root,
-                fs_types::PathFlags::SYMLINK_FOLLOW,
-                "tool-link",
-                fs_types::OpenFlags::empty(),
-                fs_types::DescriptorFlags::READ,
-                1,
-            )
-            .expect("symlink follow must open target");
-        assert_eq!(
-            filesystem
-                .read_file_chunk(&opened, 0, 4)
-                .expect("target read must succeed")
-                .as_ref(),
-            b"tool"
-        );
-
-        filesystem
-            .symlink_at(&root, "loop-a", "loop-b", 1)
-            .expect("loop symlink a must be created");
-        filesystem
-            .symlink_at(&root, "loop-b", "loop-a", 1)
-            .expect("loop symlink b must be created");
-        let error = match filesystem.open_at(
-            &root,
-            fs_types::PathFlags::SYMLINK_FOLLOW,
-            "loop-a",
-            fs_types::OpenFlags::empty(),
-            fs_types::DescriptorFlags::READ,
-            1,
-        ) {
-            Ok(_) => panic!("symlink loop must be rejected"),
-            Err(error) => error,
-        };
-        assert!(matches!(error, fs_types::ErrorCode::Loop));
     }
 
     #[test]

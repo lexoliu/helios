@@ -22,7 +22,11 @@ pub fn resolve_child_path(base: &str, child: &str) -> Result<String, ComponentFs
     let mut output =
         String::with_capacity(base.len().saturating_add(child.len()).saturating_add(1));
     push_absolute_segments(base, &mut output)?;
-    push_relative_segments(child, &mut output)?;
+    // `..` may climb back through what `child` added, across any mount it
+    // entered, but never above `base`: a descriptor-relative path stays
+    // inside the directory the descriptor names.
+    let floor = output.len();
+    push_relative_segments(child, Some(floor), &mut output)?;
     Ok(finalize_absolute_path(output))
 }
 
@@ -78,16 +82,32 @@ fn push_absolute_segments(path: &str, output: &mut String) -> Result<(), Compone
     if !path.starts_with('/') {
         return Err(ComponentFsPathError::InvalidBasePath);
     }
-    push_relative_segments(path, output)
+    // An absolute path names what it names: authority checks compare it
+    // segment by segment, so it is never normalized through `..`.
+    push_relative_segments(path, None, output)
 }
 
-fn push_relative_segments(path: &str, output: &mut String) -> Result<(), ComponentFsPathError> {
+/// Appends `path`'s segments to `output`, resolving `.` lexically. With a
+/// `floor`, `..` removes the last segment but none of the first `floor`
+/// bytes of `output`; without one, `..` is refused.
+fn push_relative_segments(
+    path: &str,
+    floor: Option<usize>,
+    output: &mut String,
+) -> Result<(), ComponentFsPathError> {
     for segment in path.split('/') {
         if segment.is_empty() || segment == "." {
             continue;
         }
         if segment == ".." {
-            return Err(ComponentFsPathError::NotPermitted);
+            if floor.is_none_or(|floor| output.len() <= floor) {
+                return Err(ComponentFsPathError::NotPermitted);
+            }
+            let parent = output
+                .rfind('/')
+                .expect("every pushed segment starts with /");
+            output.truncate(parent);
+            continue;
         }
         output.push('/');
         output.push_str(segment);
@@ -104,6 +124,8 @@ fn finalize_absolute_path(path: String) -> String {
 
 #[cfg(test)]
 mod tests {
+    use alloc::string::String;
+
     use super::{
         ComponentFsPathError, directory_prefix, path_is_within_directory, resolve_absolute_path,
         resolve_child_path, resolve_guest_path, strip_directory_prefix,
@@ -123,6 +145,19 @@ mod tests {
             .expect_err("child path resolution must not accept parent traversal");
 
         assert_eq!(error, ComponentFsPathError::NotPermitted);
+    }
+
+    #[test]
+    fn child_path_resolution_climbs_back_through_its_own_segments() {
+        assert_eq!(
+            resolve_child_path("/sandbox", "a/b/../../c/./d/.."),
+            Ok(String::from("/sandbox/c"))
+        );
+        assert_eq!(resolve_child_path("/", "a/.."), Ok(String::from("/")));
+        assert_eq!(
+            resolve_child_path("/sandbox", "a/../.."),
+            Err(ComponentFsPathError::NotPermitted)
+        );
     }
 
     #[test]

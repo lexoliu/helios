@@ -105,6 +105,9 @@ pub enum KillReason {
     SupervisorRestart,
     /// Asked for by an operator, through the inspector.
     Operator,
+    /// The request the instance exists to serve was abandoned by its
+    /// requester, so nothing is waiting for what it computes.
+    RequesterGone,
 }
 
 /// What came of a request to stop an instance.
@@ -123,12 +126,14 @@ const KILL_FLAG_NONE: u8 = 0;
 const KILL_FLAG_OOM: u8 = 1;
 const KILL_FLAG_SUPERVISOR: u8 = 2;
 const KILL_FLAG_OPERATOR: u8 = 3;
+const KILL_FLAG_REQUESTER_GONE: u8 = 4;
 
 const fn encode_kill_reason(reason: KillReason) -> u8 {
     match reason {
         KillReason::OutOfMemory => KILL_FLAG_OOM,
         KillReason::SupervisorRestart => KILL_FLAG_SUPERVISOR,
         KillReason::Operator => KILL_FLAG_OPERATOR,
+        KillReason::RequesterGone => KILL_FLAG_REQUESTER_GONE,
     }
 }
 
@@ -137,6 +142,7 @@ const fn decode_kill_flag(value: u8) -> Option<KillReason> {
         KILL_FLAG_OOM => Some(KillReason::OutOfMemory),
         KILL_FLAG_SUPERVISOR => Some(KillReason::SupervisorRestart),
         KILL_FLAG_OPERATOR => Some(KillReason::Operator),
+        KILL_FLAG_REQUESTER_GONE => Some(KillReason::RequesterGone),
         _ => None,
     }
 }
@@ -1006,12 +1012,42 @@ pub struct InstanceActivity {
 impl InstanceActivity {
     /// Open a store's accounting over `instance`, charging it
     /// `store_kernel_heap_bytes` of kernel heap until this owner drops.
+    ///
+    /// The store's turns name `instance` as the owner of the user memory
+    /// committed during them.
     pub fn new(instance: RegisteredInstance, store_kernel_heap_bytes: u64) -> Self {
+        let memory_owner = MemoryOwner::new(instance.id().raw());
+        Self::with_memory_owner(instance, store_kernel_heap_bytes, memory_owner)
+    }
+
+    /// As [`Self::new`], for a store whose turns name no owner for the
+    /// user memory committed during them: it is accounted to `instance`
+    /// for time and kernel heap, and its pages are never the swap
+    /// policy's to evict ([`MemoryOwner::NONE`]). The compiler
+    /// plugin's stores are such: they run over memory that belongs to the
+    /// cached plugin runtime, which the kernel reads without a
+    /// pre-fault.
+    pub fn without_memory_owner(
+        instance: RegisteredInstance,
+        store_kernel_heap_bytes: u64,
+    ) -> Self {
+        Self::with_memory_owner(instance, store_kernel_heap_bytes, MemoryOwner::NONE)
+    }
+
+    fn with_memory_owner(
+        instance: RegisteredInstance,
+        store_kernel_heap_bytes: u64,
+        memory_owner: MemoryOwner,
+    ) -> Self {
         let store_charge = instance.charge_kernel_heap(store_kernel_heap_bytes);
         let clock = Arc::new(CachePadded::new(StoreClock::new()));
         instance.entry().stores.lock().live.push(clock.clone());
         Self {
-            turns: StoreTurns { instance, clock },
+            turns: StoreTurns {
+                instance,
+                clock,
+                memory_owner,
+            },
             _store_charge: store_charge,
         }
     }
@@ -1069,6 +1105,10 @@ impl Drop for InstanceActivity {
 pub struct StoreTurns {
     instance: RegisteredInstance,
     clock: Arc<CachePadded<StoreClock>>,
+    /// Who owns the user memory committed while a turn of this store is
+    /// open. Set when the activity is opened: an ordinary store names its
+    /// instance, a compiler store names none.
+    memory_owner: MemoryOwner,
 }
 
 impl StoreTurns {
@@ -1099,8 +1139,9 @@ impl StoreTurns {
 
     /// Put the store on the executing processor as of `now_nanos`.
     ///
-    /// Until the turn ends, user memory this processor commits is the
-    /// instance's: see [`ProcessorTurn`].
+    /// Until the turn ends, user memory this processor commits belongs to
+    /// the owner this store's activity was opened with: see
+    /// [`ProcessorTurn`].
     pub fn begin(&self, now_nanos: u64) -> ProcessorTurn<'_> {
         let word = self.clock.word.load(Ordering::Relaxed);
         // Turns of one store cannot nest: the driver holds the store by
@@ -1113,10 +1154,7 @@ impl StoreTurns {
         );
         // The owner scope is entered before the clock is marked, so a
         // processor without identity fails before the store is on it.
-        let owner = enter_user_memory_owner(
-            current_processor(),
-            MemoryOwner::new(self.instance.id().raw()),
-        );
+        let owner = enter_user_memory_owner(current_processor(), self.memory_owner);
         self.clock.word.store(
             ON_PROCESSOR | now_nanos.saturating_sub(word),
             Ordering::Release,
@@ -1131,7 +1169,9 @@ impl StoreTurns {
 
 /// One open turn of a store on the executing processor.
 ///
-/// It names the instance as the owner of the user memory the processor
+/// It names the store's memory owner (its instance, unless the activity
+/// was opened [`InstanceActivity::without_memory_owner`]) as the owner of
+/// the user memory the processor
 /// commits for as long as it is open, and restores whatever owner was
 /// named before when it ends. That covers the guest's synchronous host
 /// calls too: what such a call commits in the user address space is the
