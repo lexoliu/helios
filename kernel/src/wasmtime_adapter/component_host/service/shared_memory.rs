@@ -352,9 +352,14 @@ pub(super) fn fill_random(
     ptr: GuestAddress,
     len: u32,
 ) -> i32 {
-    let mut bytes = alloc::vec![0_u8; len as usize];
-    entropy.lock().fill_secure(root, &mut bytes);
-    write_shared_memory(memory, ptr, &bytes).map_or(p1::errno::FAULT, |_| p1::errno::SUCCESS)
+    let data = memory.data();
+    let view = Preview1Memory {
+        base: data.as_ptr().cast::<u8>() as usize,
+        len: data.len(),
+    };
+    p1_fill_random(view, ptr, len, |chunk| {
+        entropy.lock().fill_secure(root, chunk);
+    })
 }
 
 pub(super) fn try_read_u32(

@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::fs::File;
 use std::io;
+use std::num::NonZeroUsize;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::symlink;
 use std::os::unix::process::CommandExt as _;
@@ -183,6 +184,14 @@ pub(crate) enum VmConfigError {
     SharedDirMissing { path: String },
     #[error("aarch64-virt-hvf requires an aarch64 host; pass --accel tcg explicitly for TCG")]
     HvfNeedsAarch64Host,
+    #[error(
+        "--guest-ram prealloc populates guest RAM with one thread per host processor, and the \
+         host's available parallelism could not be read: {source}"
+    )]
+    PreallocThreads {
+        #[source]
+        source: io::Error,
+    },
     #[error("{0}")]
     WorkspaceRoot(#[from] WorkspaceRootError),
 }
@@ -813,16 +822,6 @@ impl VmRendererConfig {
     /// of the range QEMU's `docs/system/devices/virtio/virtio-gpu.rst`
     /// gives for Venus ("typically between 256M and 8G").
     const DEFAULT_HOSTMEM: &'static str = "256M";
-
-    /// The id of the memory backend the guest's RAM is made of.
-    ///
-    /// A guest blob reaches the host as a dmabuf QEMU builds out of the
-    /// RAM block's file descriptor (`virtio_gpu_create_udmabuf` in
-    /// `hw/display/virtio-gpu-udmabuf.c`, which gives up on a block with
-    /// none), and a blob scanout of one needs that dmabuf, so a renderer
-    /// session's RAM is a shared memfd rather than QEMU's anonymous
-    /// default.
-    const RAM_BACKEND_ID: &'static str = "helios-ram";
 }
 
 /// How a profile exposes the guest's keyboard, tablet and mouse.
@@ -1279,6 +1278,57 @@ enum VmIommuProfile {
     VirtioIommuPci,
 }
 
+/// How the host backs the guest's RAM — `--guest-ram`.
+///
+/// QEMU maps guest RAM lazily, so the guest's first store to each page
+/// takes a host page fault, and only a guest booted that way pays it.
+/// The Fedora baseline the benchmarks compare against boots with its RAM
+/// preallocated (`guest_ram_backend` in
+/// `tools/wasi-apps/fedora_qemu_baseline.py`), and a comparison between a
+/// guest that faults its memory in and one that does not measures the
+/// host's fault path as much as either kernel (#491).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum VmGuestRam {
+    /// QEMU's own default: anonymous memory mapped on first touch.
+    #[default]
+    Lazy,
+    /// A `memory-backend-ram` populated before the first guest
+    /// instruction, wired as the machine's memory backend.
+    Prealloc,
+}
+
+/// The `-object` id of the guest RAM backend, which the machine
+/// names as its memory backend. It is the id the Fedora baseline gives
+/// its own (`GUEST_RAM_ID` in `tools/wasi-apps/fedora_qemu_baseline.py`),
+/// so the two guests' backends render alike.
+const GUEST_RAM_ID: &str = "guest-ram";
+
+/// The guest RAM backing a session boots with, resolved against the
+/// host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "backing", rename_all = "kebab-case")]
+pub(crate) enum ResolvedGuestRam {
+    Lazy,
+    Prealloc {
+        /// The threads QEMU populates the range with: one per host
+        /// processor this process may run on, the rule the Fedora
+        /// baseline applies with `os.cpu_count()`.
+        prealloc_threads: NonZeroUsize,
+    },
+}
+
+impl ResolvedGuestRam {
+    fn resolve(guest_ram: VmGuestRam) -> Result<Self, VmConfigError> {
+        match guest_ram {
+            VmGuestRam::Lazy => Ok(Self::Lazy),
+            VmGuestRam::Prealloc => std::thread::available_parallelism()
+                .map(|prealloc_threads| Self::Prealloc { prealloc_threads })
+                .map_err(|source| VmConfigError::PreallocThreads { source }),
+        }
+    }
+}
+
 /// The host display backend QEMU opens for the session.
 ///
 /// `none` is the default and what every existing lane boots: the
@@ -1431,6 +1481,8 @@ pub(crate) struct VmConfigFile {
     #[serde(default)]
     pub(crate) memory: Option<String>,
     #[serde(default)]
+    pub(crate) guest_ram: Option<VmGuestRam>,
+    #[serde(default)]
     pub(crate) bios: Option<String>,
     #[serde(default)]
     pub(crate) baud: Option<u32>,
@@ -1579,6 +1631,13 @@ pub(crate) struct VmCommand {
 
     #[arg(long)]
     memory: Option<String>,
+
+    /// How the host backs guest RAM: `lazy`, QEMU's default, faults
+    /// each page in on the guest's first store to it; `prealloc` makes
+    /// it a `memory-backend-ram` populated before the guest runs, the
+    /// backing the Fedora benchmark baseline boots with.
+    #[arg(long, value_enum)]
+    guest_ram: Option<VmGuestRam>,
 
     #[arg(long)]
     bios: Option<String>,
@@ -2047,6 +2106,7 @@ struct ResolvedVmCommand {
     no_build: bool,
     smp: u16,
     memory: String,
+    guest_ram: ResolvedGuestRam,
     bios: Option<String>,
     baud: u32,
     cpu: Option<String>,
@@ -2478,6 +2538,8 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
         .memory
         .or(file.memory)
         .unwrap_or_else(|| profile.default_memory.to_owned());
+    let guest_ram =
+        ResolvedGuestRam::resolve(command.guest_ram.or(file.guest_ram).unwrap_or_default())?;
     let bios = command
         .bios
         .or(file.bios)
@@ -2621,6 +2683,7 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
         no_build: command.no_build,
         smp,
         memory,
+        guest_ram,
         bios,
         baud,
         cpu,
@@ -3199,6 +3262,7 @@ fn connect_and_run(
                 release: command.build.kind.optimised(),
                 smp: command.smp,
                 memory: command.memory.clone(),
+                guest_ram: command.guest_ram,
                 cpu: command.cpu.clone(),
                 accel: command.accel.clone(),
                 rpc_transport: command.rpc_transport,
@@ -5080,11 +5144,15 @@ impl VmRuntime {
         if let Some(qmp) = qmp_endpoint(command, socket_dir.path())? {
             qemu.arg("-qmp").arg(qmp);
         }
-        configure_machine(&mut qemu, command);
+        qemu.arg("-machine")
+            .arg(machine_options(command).to_string());
         for accel in &command.accel {
             qemu.arg("-accel").arg(accel);
         }
         qemu.arg("-m").arg(&command.memory);
+        if let Some(backend) = guest_ram_backend(command) {
+            qemu.arg("-object").arg(backend.to_string());
+        }
         qemu.arg("-smp").arg(command.smp.to_string());
         if command.serial_stdio {
             qemu.arg("-serial").arg("stdio");
@@ -5847,32 +5915,8 @@ fn configure_entropy_device(
     qemu.arg("-device").arg(device.to_string());
 }
 
-/// Attaches the machine's translation unit.
-///
-/// The unit is itself a virtio-PCI function, but it is never one of its
-/// own endpoints: it publishes its request and event rings at physical
-/// addresses, so it is created without the platform-access property its
-/// endpoints carry.
 /// The `-machine` option list this session boots, which is the ACPI
 /// variant only when `--acpi` asked for it and the profile has one.
-/// The machine and its RAM: a renderer session's RAM is a shared memfd
-/// backend of the session's memory size, for the reason
-/// [`VmRendererConfig::RAM_BACKEND_ID`] gives; every other session keeps
-/// QEMU's default RAM.
-fn configure_machine(qemu: &mut Command, command: &ResolvedVmCommand) {
-    let mut machine = QemuOptions::new(machine(command));
-    if command.renderer.is_some() {
-        let mut backend = QemuOptions::new("memory-backend-memfd");
-        backend
-            .set("id", VmRendererConfig::RAM_BACKEND_ID)
-            .set("size", &command.memory)
-            .set("share", "on");
-        qemu.arg("-object").arg(backend.to_string());
-        machine.set("memory-backend", VmRendererConfig::RAM_BACKEND_ID);
-    }
-    qemu.arg("-machine").arg(machine.to_string());
-}
-
 fn machine(command: &ResolvedVmCommand) -> &'static str {
     if command.acpi {
         return command.profile.acpi_machine.unwrap_or_else(|| {
@@ -5882,6 +5926,58 @@ fn machine(command: &ResolvedVmCommand) -> &'static str {
     command.profile.machine
 }
 
+/// The `-machine` argument: the profile's machine, naming the guest RAM
+/// backend as its memory when the session has one, as the Fedora
+/// baseline wires its own.
+fn machine_options(command: &ResolvedVmCommand) -> QemuOptions {
+    let mut options = QemuOptions::new(machine(command));
+    if guest_ram_backend(command).is_some() {
+        options.set("memory-backend", GUEST_RAM_ID);
+    }
+    options
+}
+
+/// The `-object` guest RAM is made of, when it is not QEMU's anonymous
+/// default, and QEMU requires its size to match `-m`.
+///
+/// A renderer session's RAM is a shared memfd: a guest blob reaches the
+/// host as a dmabuf QEMU builds out of the RAM block's file descriptor
+/// (`virtio_gpu_create_udmabuf` in `hw/display/virtio-gpu-udmabuf.c`,
+/// which gives up on a block with none), and a blob scanout of one needs
+/// that dmabuf. `--guest-ram prealloc` populates the backend before the
+/// first guest instruction.
+fn guest_ram_backend(command: &ResolvedVmCommand) -> Option<QemuOptions> {
+    let prealloc_threads = match command.guest_ram {
+        ResolvedGuestRam::Lazy => None,
+        ResolvedGuestRam::Prealloc { prealloc_threads } => Some(prealloc_threads),
+    };
+    let renderer = command.renderer.is_some();
+    if !renderer && prealloc_threads.is_none() {
+        return None;
+    }
+    let mut backend = QemuOptions::new(if renderer {
+        "memory-backend-memfd"
+    } else {
+        "memory-backend-ram"
+    });
+    backend.set("id", GUEST_RAM_ID).set("size", &command.memory);
+    if renderer {
+        backend.set("share", "on");
+    }
+    if let Some(prealloc_threads) = prealloc_threads {
+        backend
+            .set("prealloc", "on")
+            .set("prealloc-threads", prealloc_threads);
+    }
+    Some(backend)
+}
+
+/// Attaches the machine's translation unit.
+///
+/// The unit is itself a virtio-PCI function, but it is never one of its
+/// own endpoints: it publishes its request and event rings at physical
+/// addresses, so it is created without the platform-access property its
+/// endpoints carry.
 fn configure_iommu(
     qemu: &mut Command,
     iommu: Option<VmIommuProfile>,
@@ -7736,6 +7832,7 @@ mod tests {
             no_build: true,
             smp: None,
             memory: None,
+            guest_ram: None,
             bios: None,
             baud: DEFAULT_BAUD,
             cpu: None,
@@ -7799,6 +7896,7 @@ mod tests {
             no_build: true,
             smp: None,
             memory: None,
+            guest_ram: None,
             bios: None,
             baud: DEFAULT_BAUD,
             cpu: None,
@@ -7905,30 +8003,95 @@ mod tests {
     }
 
     /// A renderer session's RAM is a shared memfd of the session's own
-    /// size, named as the machine's memory backend; any other session's
-    /// machine is the profile's alone.
+    /// size, named as the machine's memory backend, and preallocated
+    /// as well when `--guest-ram prealloc` asked for it.
     #[test]
     fn a_renderer_session_s_ram_is_a_shared_memfd() {
         let mut command = watchdog_test_command(VmArch::X86_64);
-        let plain = rendered(|qemu| configure_machine(qemu, &command));
-        assert_eq!(plain, ["-machine", machine(&command)]);
-
         command.renderer = Some(VmRendererConfig {
             kind: VmGpuRenderer::Gl,
             hostmem: VmRendererConfig::DEFAULT_HOSTMEM.to_owned(),
         });
-        let backed = rendered(|qemu| configure_machine(qemu, &command));
         assert_eq!(
-            backed,
-            [
-                "-object".to_owned(),
-                format!(
-                    "memory-backend-memfd,id=helios-ram,size={},share=on",
-                    command.memory
-                ),
-                "-machine".to_owned(),
-                format!("{},memory-backend=helios-ram", machine(&command)),
-            ]
+            machine_options(&command).to_string(),
+            format!("{},memory-backend=guest-ram", machine(&command))
+        );
+        assert_eq!(
+            guest_ram_backend(&command)
+                .expect("a renderer session has a backend")
+                .to_string(),
+            format!(
+                "memory-backend-memfd,id=guest-ram,size={},share=on",
+                command.memory
+            )
+        );
+
+        let prealloc_threads = NonZeroUsize::new(4).expect("four is non-zero");
+        command.guest_ram = ResolvedGuestRam::Prealloc { prealloc_threads };
+        assert_eq!(
+            guest_ram_backend(&command)
+                .expect("a renderer session has a backend")
+                .to_string(),
+            format!(
+                "memory-backend-memfd,id=guest-ram,size={},share=on,prealloc=on,prealloc-threads=4",
+                command.memory
+            )
+        );
+    }
+
+    /// `--guest-ram prealloc` backs guest RAM exactly as the Fedora
+    /// baseline does: a `memory-backend-ram` the size of `-m`,
+    /// populated by one thread per host processor, named by the machine
+    /// as its memory backend (#491).
+    #[test]
+    fn preallocated_guest_ram_is_the_machines_memory_backend() {
+        let tempdir =
+            tempfile::tempdir().expect("temporary directory for VM config resolution must exist");
+        let config = tempdir.path().join("missing-vm.json");
+
+        let lazy = resolve(VmCommand {
+            config: Some(config.clone()),
+            ..minimal_command()
+        })
+        .expect("a default session resolves");
+        assert_eq!(lazy.guest_ram, ResolvedGuestRam::Lazy);
+        assert_eq!(
+            machine_options(&lazy).to_string(),
+            X86_64_VM_PROFILE.machine
+        );
+        assert_eq!(guest_ram_backend(&lazy), None);
+
+        let resolved = resolve(VmCommand {
+            config: Some(config),
+            memory: Some("2G".to_owned()),
+            guest_ram: Some(VmGuestRam::Prealloc),
+            ..minimal_command()
+        })
+        .expect("a preallocated session resolves");
+        let threads = std::thread::available_parallelism()
+            .expect("the test host reports its parallelism")
+            .get();
+        assert_eq!(
+            resolved.guest_ram,
+            ResolvedGuestRam::Prealloc {
+                prealloc_threads: NonZeroUsize::new(threads).expect("parallelism is non-zero"),
+            }
+        );
+        assert_eq!(
+            machine_options(&resolved).to_string(),
+            "q35,memory-backend=guest-ram"
+        );
+        assert_eq!(
+            guest_ram_backend(&resolved)
+                .expect("a preallocated session has a backend")
+                .to_string(),
+            format!(
+                "memory-backend-ram,id=guest-ram,size=2G,prealloc=on,prealloc-threads={threads}"
+            )
+        );
+        assert_eq!(
+            serde_json::to_value(resolved.guest_ram).expect("the backing serialises"),
+            serde_json::json!({"backing": "prealloc", "prealloc_threads": threads})
         );
     }
 
@@ -8049,6 +8212,7 @@ mod tests {
             no_build: true,
             smp: None,
             memory: None,
+            guest_ram: None,
             bios: None,
             baud: DEFAULT_BAUD,
             cpu: None,
@@ -8189,6 +8353,7 @@ mod tests {
             no_build: true,
             smp: profile.default_smp,
             memory: profile.default_memory.to_owned(),
+            guest_ram: ResolvedGuestRam::Lazy,
             bios: profile.default_bios.map(str::to_owned),
             baud: DEFAULT_BAUD,
             cpu: profile.default_cpu.map(str::to_owned),
@@ -8402,6 +8567,7 @@ mod tests {
             no_build: true,
             smp: profile.default_smp,
             memory: profile.default_memory.to_owned(),
+            guest_ram: ResolvedGuestRam::Lazy,
             bios: profile.default_bios.map(str::to_owned),
             baud: DEFAULT_BAUD,
             cpu: profile.default_cpu.map(str::to_owned),
