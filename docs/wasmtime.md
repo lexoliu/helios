@@ -315,8 +315,9 @@ Sv48 rather than falling back to a profile the compiled code does not match.
 
 Swap (#25) rides on the same reservations but needs a second piece from each
 backend: a not-present page-table encoding that carries a swap token, installed
-as a `SwapVmHooks` table. Only aarch64 has that today; riscv64 and x86_64 call
-`disable_swap(SwapDisabled::NoSwapHooks)` until they do.
+as a `SwapVmHooks` table. aarch64 and riscv64 have that today (riscv64 keeps the
+token in an RSW bit of an invalid Sv48 leaf); x86_64 calls
+`disable_swap(SwapDisabled::NoSwapHooks)` until it does.
 
 ## Fiber stacks
 

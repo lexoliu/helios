@@ -871,7 +871,6 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
             for (source, route) in device::publish_grants(&fdt, debug_state.device_grants()) {
                 interrupts.attach_device(source, route);
             }
-            helios_kernel::disable_swap(helios_kernel::SwapDisabled::NoSwapHooks);
             interrupts
         })
     });
