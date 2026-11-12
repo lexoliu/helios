@@ -38,10 +38,14 @@ use helios_hal::balloon::{MemoryBalloon, MemoryStat, MemoryStatTag};
 use helios_hal::io::{IoError, IoResult};
 
 use crate::bus::{DeviceBus, DmaPool};
-use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate_with};
-use crate::inflight::{InFlight, await_completion, submit_chain};
+use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate_with, renegotiate};
+use crate::inflight::{
+    InFlight, await_completion, drain_to_idle, reinitialize_posted, reinitialize_requests,
+    submit_chain,
+};
 use crate::notify::Notify;
 use crate::queue::{MAX_CHAIN_BUFFERS, VirtQueue};
+use crate::resume::{DeviceReset, QuiesceError, ReinitError, driver_ok};
 use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
 
 /// Page size the balloon protocol counts in (virtio 1.2 §5.5.6). It is
@@ -179,6 +183,16 @@ impl<T: VirtioTransport> BalloonQueue<T> {
         self.interrupts.notify_all();
     }
 
+    /// Waits for every request the device owns on this queue.
+    fn quiesce(
+        &self,
+        transport: &T,
+        index: u16,
+        expired: &mut impl FnMut() -> bool,
+    ) -> Result<(), QuiesceError> {
+        drain_to_idle(&self.inflight, &self.queue, transport, index, expired)
+    }
+
     fn shutdown(&mut self, transport: &T) {
         self.queue.get_mut().shutdown(transport);
     }
@@ -192,6 +206,9 @@ pub struct VirtioBalloonDevice<T: VirtioTransport> {
     stats: Option<BalloonQueue<T>>,
     free_page: Option<BalloonQueue<T>>,
     reporting: Option<BalloonQueue<T>>,
+    /// Where the optional queues sit, which the offered features fixed at
+    /// bring-up and a re-initialisation re-checks.
+    layout: QueueLayout,
     /// Wakes tasks parked on a configuration change.
     config_changes: Notify,
     features: NegotiatedFeatures,
@@ -244,6 +261,7 @@ impl<T: VirtioTransport> VirtioBalloonDevice<T> {
             stats,
             free_page,
             reporting,
+            layout,
             config_changes: Notify::new(),
             features,
             actual_pages: AtomicU32::new(0),
@@ -317,6 +335,75 @@ impl<T: VirtioTransport> VirtioBalloonDevice<T> {
                 self.reporting.as_ref(),
             ])
             .flatten()
+    }
+
+    /// Waits for every request the device owns to complete, so the device
+    /// may be reset. See [`crate::resume`] for the contract; `expired`
+    /// says when the caller's deadline has passed.
+    ///
+    /// The inflate, deflate, free-page and reporting queues carry
+    /// requests the device answers as it reads them. The statistics queue
+    /// is not waited on: its buffer is posted for the device to use when
+    /// it next wants statistics, which may be never.
+    pub fn quiesce(&self, mut expired: impl FnMut() -> bool) -> Result<(), QuiesceError> {
+        self.inflate
+            .quiesce(&self.transport, INFLATE_QUEUE_INDEX, &mut expired)?;
+        self.deflate
+            .quiesce(&self.transport, DEFLATE_QUEUE_INDEX, &mut expired)?;
+        if let (Some(queue), Some(index)) = (&self.free_page, self.layout.free_page) {
+            queue.quiesce(&self.transport, index, &mut expired)?;
+        }
+        if let (Some(queue), Some(index)) = (&self.reporting, self.layout.reporting) {
+            queue.quiesce(&self.transport, index, &mut expired)?;
+        }
+        Ok(())
+    }
+
+    /// Brings a reset device back with the features it had, after
+    /// [`Self::quiesce`].
+    ///
+    /// A reset balloon holds nothing: whatever the host had reclaimed was
+    /// given back or lost with it, so `actual` is reported as zero. The
+    /// returned [`DeviceReset`] tells the balloon's owner that the frames
+    /// it had inflated are no longer held by the host and that the target
+    /// is to be read again; the runs it handed over are its own records,
+    /// not the driver's. A waiting statistics request is released empty
+    /// so its task posts a fresh buffer.
+    pub fn reinitialize(&self) -> Result<DeviceReset, ReinitError> {
+        let device = DeviceType::MemoryBalloon;
+        renegotiate(&self.transport, self.features)?;
+        // The queue indices follow what the device offers, and the
+        // driver's rings were built for one layout.
+        if QueueLayout::from_offered(self.transport.device_features()) != self.layout {
+            return Err(ReinitError::DeviceChanged {
+                device,
+                what: "queue layout",
+            });
+        }
+        reinitialize_requests(
+            &self.inflate.inflight,
+            &self.inflate.queue,
+            &self.transport,
+            INFLATE_QUEUE_INDEX,
+        )?;
+        reinitialize_requests(
+            &self.deflate.inflight,
+            &self.deflate.queue,
+            &self.transport,
+            DEFLATE_QUEUE_INDEX,
+        )?;
+        if let (Some(queue), Some(index)) = (&self.free_page, self.layout.free_page) {
+            reinitialize_requests(&queue.inflight, &queue.queue, &self.transport, index)?;
+        }
+        if let (Some(queue), Some(index)) = (&self.reporting, self.layout.reporting) {
+            reinitialize_requests(&queue.inflight, &queue.queue, &self.transport, index)?;
+        }
+        if let (Some(queue), Some(index)) = (&self.stats, self.layout.stats) {
+            reinitialize_posted(&queue.inflight, &queue.queue, &self.transport, index)?;
+        }
+        driver_ok(&self.transport);
+        self.set_actual(0);
+        Ok(DeviceReset { device })
     }
 
     /// Waits for the device to change its configuration space.
@@ -636,6 +723,8 @@ mod tests {
         F_STATS_VQ, FREE_PAGE_CMD_ID_STOP, QueueLayout, VirtioBalloonDevice,
     };
     use crate::bus::DmaBuffer;
+    use crate::features::RenegotiateError;
+    use crate::resume::{DeviceReset, QuiesceError, ReinitError};
     use crate::testing::{FakeTransport, FakeTransportConfig, WindowDmaBuffer, WindowDmaPool};
     use crate::transport::{DeviceType, VirtioFeatures, VirtioTransport};
     use alloc::vec::Vec;
@@ -1106,5 +1195,158 @@ mod tests {
         device.transport.raise_interrupt(CONFIG_CHANGE_INTERRUPT);
         device.handle_interrupt();
         assert_eq!(block_on(poll_once(changed.as_mut())), Some(()));
+    }
+
+    #[test]
+    fn quiesce_waits_for_inflate_and_deflate_but_not_for_the_statistics_buffer() {
+        let dma = arena();
+        let device = device_with(ALL_BALLOON_FEATURES, dma.clone());
+        let mut inflated = Pages::new(&dma, 1);
+        let mut deflated = Pages::new(&dma, 1);
+        let mut inflate_ranges = [inflated.range(1)];
+        let mut deflate_ranges = [deflated.range(1)];
+        let mut inflate = pin!(device.inflate(&mut inflate_ranges));
+        let mut deflate = pin!(device.deflate(&mut deflate_ranges));
+        assert!(block_on(poll_once(inflate.as_mut())).is_none());
+        assert!(block_on(poll_once(deflate.as_mut())).is_none());
+        // The statistics buffer sits with the device until it asks.
+        let stats = [MemoryStat {
+            tag: MemoryStatTag::Free,
+            value: 7,
+        }];
+        let mut submit = pin!(device.submit_stats(&stats));
+        assert!(block_on(poll_once(submit.as_mut())).is_none());
+
+        let mut answers = [(0_u16, 0_u16), (1, 0)].into_iter();
+        let mut passes = 0;
+        device
+            .quiesce(|| {
+                passes += 1;
+                if let Some((queue, token)) = answers.next() {
+                    complete(&device, queue, token);
+                }
+                false
+            })
+            .expect("the device answers inside the deadline");
+        assert_eq!(passes, 2, "one pass per queue that had a request");
+
+        assert_eq!(block_on(poll_once(inflate.as_mut())), Some(Ok(())));
+        assert_eq!(block_on(poll_once(deflate.as_mut())), Some(Ok(())));
+        assert!(
+            block_on(poll_once(submit.as_mut())).is_none(),
+            "the statistics buffer is still posted"
+        );
+    }
+
+    #[test]
+    fn quiesce_gives_up_when_the_deadline_passes() {
+        let dma = arena();
+        let device = device_with(ALL_BALLOON_FEATURES, dma.clone());
+        let mut pages = Pages::new(&dma, 1);
+        let mut ranges = [pages.range(1)];
+        let mut inflate = pin!(device.inflate(&mut ranges));
+        assert!(block_on(poll_once(inflate.as_mut())).is_none());
+
+        assert_eq!(
+            device.quiesce(|| true),
+            Err(QuiesceError::RequestsStillInFlight {
+                device: DeviceType::MemoryBalloon,
+                queue: 0,
+                count: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn a_reset_balloon_reports_nothing_held_and_serves_requests_again() {
+        let dma = arena();
+        let device = device_with(ALL_BALLOON_FEATURES, dma.clone());
+        device.set_actual(512);
+        let mut pages = Pages::new(&dma, 1);
+        let mut ranges = [pages.range(1)];
+        let mut inflate = pin!(device.inflate(&mut ranges));
+        assert!(block_on(poll_once(inflate.as_mut())).is_none());
+        let stats = [MemoryStat {
+            tag: MemoryStatTag::Free,
+            value: 7,
+        }];
+        let mut submit = pin!(device.submit_stats(&stats));
+        assert!(block_on(poll_once(submit.as_mut())).is_none());
+        device
+            .quiesce(|| {
+                complete(&device, 0, 0);
+                false
+            })
+            .expect("the device answers inside the deadline");
+
+        device.transport.reset_behind_the_driver();
+        assert_eq!(
+            device.reinitialize(),
+            Ok(DeviceReset {
+                device: DeviceType::MemoryBalloon
+            })
+        );
+
+        assert_eq!(device.actual_pages(), 0);
+        assert_eq!(
+            device.transport.read_config_u32(CONFIG_ACTUAL),
+            0,
+            "the device is told it holds nothing"
+        );
+        assert_eq!(block_on(poll_once(inflate.as_mut())), Some(Ok(())));
+        assert_eq!(
+            block_on(poll_once(submit.as_mut())),
+            Some(Ok(())),
+            "a statistics request the device will never answer is released, not parked for ever"
+        );
+        // Five queues, each programmed at bring-up and again after the
+        // reset, at the same memory.
+        let programmed = device.transport.programmed_queues();
+        assert_eq!(programmed.len(), 10);
+        for queue in 0..5_u16 {
+            let runs: Vec<_> = programmed
+                .iter()
+                .filter(|programming| programming.index == queue)
+                .collect();
+            assert_eq!(runs.len(), 2);
+            assert_eq!(runs[0], runs[1]);
+        }
+        let mut again = Pages::new(&dma, 1);
+        let mut ranges = [again.range(1)];
+        let mut inflate = pin!(device.inflate(&mut ranges));
+        assert!(block_on(poll_once(inflate.as_mut())).is_none());
+        complete(&device, 0, 0);
+        assert_eq!(block_on(poll_once(inflate.as_mut())), Some(Ok(())));
+    }
+
+    #[test]
+    fn a_device_that_offers_fewer_features_after_the_reset_is_refused() {
+        let device = device();
+        device.transport.withdraw_features(F_MUST_TELL_HOST);
+
+        assert_eq!(
+            device.reinitialize(),
+            Err(ReinitError::Renegotiate(
+                RenegotiateError::FeatureWithdrawn {
+                    device: DeviceType::MemoryBalloon,
+                    bit: 0,
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn a_device_whose_queues_moved_after_the_reset_is_refused() {
+        let device = device_with(VirtioFeatures::VERSION_1.bits() | F_PAGE_REPORTING, arena());
+        // A feature that puts a queue ahead of the reporting queue.
+        device.transport.offer_features(F_STATS_VQ);
+
+        assert_eq!(
+            device.reinitialize(),
+            Err(ReinitError::DeviceChanged {
+                device: DeviceType::MemoryBalloon,
+                what: "queue layout",
+            })
+        );
     }
 }

@@ -327,6 +327,32 @@ where
     Ok(())
 }
 
+/// Re-programs a queue whose chains are buffers posted for the device to
+/// answer whenever it chooses, on a reset device.
+///
+/// The chains are gone with the device, so their waiters are released
+/// with nothing written, to post a fresh buffer instead of parking for
+/// ever on one that will never be answered.
+pub(crate) fn reinitialize_posted<T, const N: usize>(
+    inflight: &InFlight<N>,
+    queue: &AsyncMutex<VirtQueue<T>>,
+    transport: &T,
+    queue_index: u16,
+) -> Result<(), ReinitError>
+where
+    T: VirtioTransport,
+{
+    let mut ring = queue.try_lock().ok_or(ReinitError::QueueBusy {
+        device: transport.device_type(),
+        queue: queue_index,
+    })?;
+    ring.reinitialize_discarding(transport)?;
+    drop(ring);
+    inflight.recover();
+    inflight.abandon_pending();
+    Ok(())
+}
+
 /// Places one chain in the ring and claims its completion slot.
 ///
 /// This is the submission half of the shape every request/response
