@@ -1,7 +1,7 @@
 //! The LLVM raw profile (`.profraw`) container, written from the sections
 //! the linker laid out.
 //!
-//! The format is the one `llvm-profdata` reads: a 16-field header followed by
+//! The format is the one `llvm-profdata` reads: a 19-field header followed by
 //! the `__llvm_prf_data`, `__llvm_prf_cnts` and `__llvm_prf_names` bytes
 //! verbatim, each group padded to eight bytes. Nothing in a record needs
 //! rewriting on the way out — since raw version 8 a record's counter pointer
@@ -19,12 +19,12 @@ use super::{LlvmProfileError, ProfileSection};
 /// `__llvm_profile_raw_version`, the version word LLVM's own runtime would
 /// have written, and [`RawProfile::new`] refuses to write a byte until that
 /// word matches this constant. On the pinned toolchain (`rust-toolchain.toml`,
-/// `nightly-2026-06-15`, `rustc -vV` reports LLVM 22.1.6) the symbol reads
-/// `0x0100_0000_0000_000a`: version 10, with the IR-instrumentation variant
-/// bit set. Ten is `INSTR_PROF_RAW_VERSION` in LLVM's
+/// `nightly-2026-11-03`, `rustc -vV` reports LLVM 23.1.5) the symbol reads
+/// `0x0100_0000_0000_000b`: version 11, with the IR-instrumentation variant
+/// bit set. Eleven is `INSTR_PROF_RAW_VERSION` in LLVM's
 /// `llvm/include/llvm/ProfileData/InstrProfData.inc`, and it is what fixes
-/// the header below at sixteen fields.
-pub const RAW_PROFILE_VERSION: u64 = 10;
+/// the header below at nineteen fields and the data record at 72 bytes.
+pub const RAW_PROFILE_VERSION: u64 = 11;
 
 /// `VARIANT_MASK_IR_PROF`: the profile came from IR-level instrumentation,
 /// which is what `-C profile-generate` asks rustc for.
@@ -46,16 +46,19 @@ const MAGIC: u64 = (255 << 56)
 /// value sites, but the header field names the format's own limit.
 const VALUE_KIND_LAST: u64 = 2;
 
-/// Size of one `__llvm_profile_data` record on a 64-bit target: six pointer
-/// or 64-bit fields, three 32-bit fields, padded to eight.
-const DATA_RECORD_LEN: u64 = 64;
+/// Size of one `__llvm_profile_data` record on a 64-bit target: seven pointer
+/// or 64-bit fields, two 32-bit fields, four 16-bit fields (three value-site
+/// counts and `OffloadDeviceWaveSize`), padded to eight. Measured as the
+/// `__llvm_prf_data` section size over the function count of a program built
+/// with `-C profile-generate` on the pinned toolchain.
+const DATA_RECORD_LEN: u64 = 72;
 
 /// Size of one profile counter.
 const COUNTER_LEN: u64 = 8;
 
 /// Number of `u64` fields in the raw-profile header, in the order
 /// [`RawProfile::header`] writes them.
-const HEADER_FIELDS: usize = 16;
+const HEADER_FIELDS: usize = 19;
 
 /// Byte length of the raw-profile header.
 const HEADER_LEN: u64 = HEADER_FIELDS as u64 * 8;
@@ -276,6 +279,12 @@ impl<'a> RawProfile<'a> {
             // NumBitmapBytes, PaddingBytesAfterBitmapBytes.
             0,
             0,
+            // NumUniformCounters, PaddingBytesAfterUniformCounters and
+            // UniformCountersDelta: the section is only emitted for GPU
+            // offload instrumentation.
+            0,
+            0,
+            0,
             self.names.len(),
             // CountersDelta and BitmapDelta are measured from the data
             // section, and the reader walks both down one record at a time.
@@ -288,7 +297,7 @@ impl<'a> RawProfile<'a> {
             VALUE_KIND_LAST,
         ];
         let mut header = [0u8; HEADER_LEN as usize];
-        for (slot, field) in header.chunks_exact_mut(8).zip(fields) {
+        for (slot, field) in header.as_chunks_mut::<8>().0.iter_mut().zip(fields) {
             slot.copy_from_slice(&field.to_le_bytes());
         }
         header
@@ -359,14 +368,15 @@ mod tests {
         assert_eq!(field(&bytes, 5), 3, "counters");
         assert_eq!(field(&bytes, 6), 0, "padding after counters");
         assert_eq!(field(&bytes, 7), 0, "bitmap bytes");
-        assert_eq!(field(&bytes, 9), names.len() as u64);
+        assert_eq!(field(&bytes, 9), 0, "uniform counters");
+        assert_eq!(field(&bytes, 12), names.len() as u64);
         assert_eq!(
-            field(&bytes, 10),
+            field(&bytes, 13),
             (counters.as_ptr().addr() as u64).wrapping_sub(data.as_ptr().addr() as u64),
             "counters delta"
         );
-        assert_eq!(field(&bytes, 12), names.as_ptr().addr() as u64);
-        assert_eq!(field(&bytes, 15), VALUE_KIND_LAST);
+        assert_eq!(field(&bytes, 15), names.as_ptr().addr() as u64);
+        assert_eq!(field(&bytes, 18), VALUE_KIND_LAST);
     }
 
     #[test]

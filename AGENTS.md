@@ -24,7 +24,7 @@ never depends on anything above it.
 | Backends | `aarch64/`, `riscv/`, `x86/`, `hosted/` | Boot, trap, IRQ, timer, MMIO, UART, virtio transport and SMP wiring, and nothing else. `hosted/` runs the same kernel on the host OS under the same restriction. |
 | Kernel image | the root crate `helios` (`src/`) | The binary that links whichever backend the target selects, and runs `hosted` on the host. |
 | User space | `api/`, `api-macro/`, `programs/*`, `venus/` | The userland SDK and the wasm programs, kernel plugins included: `init`, `debugger`, `http-client`, `date`, `ping`, `perf`, `oob-load`. `compiler-plugin/` is the in-kernel compiler, a kernel plugin built by the host tools. `venus/` is the Venus wire protocol a program's GPU driver links: the hand-written sinks and the encoders generated at build time. |
-| Host tools | `inspector/`, `inspector-protocol/`, `cli/`, `compiler-support/`, `profdata/`, `venus-gen/`, `workspace-root/` | `std` crates that boot, build and observe a guest. `inspector-protocol/` is the WIT RPC contract between the inspector and the guest debugger. `profdata/` is the kernel profile's header check and fetched-profile store, shared by `cli/` and `inspector/`. `venus-gen/` generates `venus/`'s encoders from the pinned venus-protocol registry. |
+| Host tools | `inspector/`, `inspector-protocol/`, `cli/`, `compiler-support/`, `compiler-host/`, `profdata/`, `venus-gen/`, `workspace-root/` | `std` crates that boot, build and observe a guest. `inspector-protocol/` is the WIT RPC contract between the inspector and the guest debugger. `profdata/` is the kernel profile's header check and fetched-profile store, shared by `cli/` and `inspector/`. `venus-gen/` generates `venus/`'s encoders from the pinned venus-protocol registry. `compiler-host/` runs the compiler plugin under Wasmtime on Linux, the bench's Linux + Wasmtime column of `aot-curl`. |
 
 The rules that follow from the table:
 
@@ -459,8 +459,8 @@ red lane names the surface that broke:
 
 | Lane | Runner | What it proves |
 | --- | --- | --- |
-| `check-host`, `check-aarch64`, `check-riscv`, `check-x86` | `ubuntu-24.04` | Every surface compiles. |
-| `lint-fmt`, `lint-host`, `lint-aarch64`, `lint-riscv`, `lint-x86` | `ubuntu-24.04` | Formatting, the `deny.toml` bans, and clippy at `-D warnings`. |
+| `check-host` | `ubuntu-24.04` | The host surfaces compile. |
+| `lint-fmt`, `lint-host`, `lint-aarch64`, `lint-riscv`, `lint-x86` | `ubuntu-24.04` | Formatting, the `deny.toml` bans, and clippy at `-D warnings`; a bare-metal lint lane is also that target's compile check, since clippy builds the packages `check-target` checks. |
 | `test-units`, `test-embedded-debugger` | `ubuntu-24.04` | Unit tests and the embedded debugger. |
 | `smoke-x86-64` | `ubuntu-24.04`, `--accel kvm` | Boot, shell, CPython, the in-kernel compiler, a trapped OOB load, curl over virtio-net, the raw serial captures. |
 | `smoke-riscv64` | `ubuntu-24.04`, `--accel tcg` | Boot, shell, CPython, a trapped OOB load, the inspector RPC over vsock, curl over virtio-net. |
@@ -472,6 +472,11 @@ nightly against `dev` and on `workflow_dispatch` for any ref, never on a
 pull request, because one unpaired run is no performance evidence (§3.6)
 and the lane is the heaviest job there is. A failed nightly run files a
 `bench`/`bug` issue, or comments on the one already open.
+
+A pull request runs only the lanes whose surfaces its change touches
+(`.github/ci-lanes.json`), and a draft runs `lint-fmt` alone until it is
+marked ready for review. Only the host lanes keep a Rust cache, and only
+a `dev` push writes it.
 
 Every lane runs on a Linux runner. macOS runners are not used: their queue
 dominates the run and nothing Helios ships targets macOS. Every boot in CI

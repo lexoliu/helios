@@ -3,12 +3,14 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::fmt;
+use core::hash::Hasher;
 use core::mem::MaybeUninit;
 
 use arrayvec::ArrayVec;
 use bytes::{Bytes, BytesMut};
 use heapless::Deque;
 use heapless::binary_heap::{BinaryHeap, Min};
+use siphasher::sip::SipHasher24;
 
 use crate::address::lifetime_deadline;
 use crate::{
@@ -30,17 +32,15 @@ pub const MAX_NEIGHBORS: usize = 128;
 pub const MAX_OUTBOUND_FRAMES: usize = 32;
 pub const MAX_STACK_EVENTS: usize = 64;
 pub const MAX_UDP_RX: usize = 64;
-/// Echo replies retained until a waiter claims them.
+/// Echo exchanges remembered: requests sent and not yet answered, so a
+/// reply or an ICMP error quoting one can be told from a forgery, and
+/// answers kept until a waiter claims them.
 ///
 /// A ping has one request outstanding at a time, so this only has to
-/// absorb replies that raced past their waiter's deadline plus any
-/// unsolicited ones the link delivers. The oldest is evicted once the
-/// buffer fills.
-pub const MAX_ICMP_ECHO_REPLIES: usize = 8;
-/// Echo requests remembered until answered, so an ICMP error quoting one
-/// can be told from a forgery: as many exchanges as replies are banked
-/// for. The oldest is forgotten once the table fills.
-const MAX_ICMP_ECHO_REQUESTS: usize = MAX_ICMP_ECHO_REPLIES;
+/// absorb the requests an abandoned candidate left behind and the
+/// replies that raced past their waiter's deadline. The oldest
+/// exchange is forgotten once the table fills.
+pub const MAX_ICMP_ECHO_EXCHANGES: usize = 8;
 pub const MAX_UDP_SOCKETS: usize = 256;
 pub const MAX_IPV4_MULTICAST_MEMBERSHIPS: usize = 64;
 pub const MAX_PATH_MTU_ENTRIES: usize = 128;
@@ -365,20 +365,60 @@ pub struct IcmpEchoKey {
     pub sequence: u16,
 }
 
-/// An echo request this stack put on the wire and has not seen answered.
+/// The data an echo request carried, as its length and a digest.
+///
+/// RFC 792 and RFC 4443 have the replier return the request's data
+/// unchanged, so a reply is compared with this. The digest is SipHash-2-4
+/// under the all-zero key, which `siphasher` already provides for the
+/// initial sequence numbers; it only detects a reply whose data is not
+/// the request's, and the request's data is not a secret, so it needs no
+/// key and holds no copy of the bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct IcmpEchoRequest {
+struct IcmpEchoPayload {
+    len: usize,
+    digest: u64,
+}
+
+impl IcmpEchoPayload {
+    fn of(bytes: &[u8]) -> Self {
+        let mut hasher = SipHasher24::new();
+        hasher.write(bytes);
+        Self {
+            len: bytes.len(),
+            digest: hasher.finish(),
+        }
+    }
+}
+
+/// An echo request this stack put on the wire: unanswered until a reply
+/// carrying its identifier, sequence and data arrives from the peer,
+/// then answered until a waiter claims the reply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct IcmpEchoExchange {
     path: PathMtuKey,
     identifier: u16,
     sequence: u16,
+    payload: IcmpEchoPayload,
+    answered: bool,
 }
 
-/// A received echo reply, held until the waiter for its key claims it.
+impl IcmpEchoExchange {
+    /// Whether this exchange is the one `key` names: the pinged host,
+    /// identifier and sequence.
+    fn is(&self, key: IcmpEchoKey) -> bool {
+        self.path.destination == key.destination
+            && self.identifier == key.identifier
+            && self.sequence == key.sequence
+    }
+}
+
+/// The answer to one echo request, held until the waiter for its key
+/// claims it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IcmpEchoReply {
     pub key: IcmpEchoKey,
-    /// Length of the echoed data, which a caller compares against the
-    /// payload it sent.
+    /// Length of the echoed data, which equals the length of the payload
+    /// the request carried.
     pub payload_bytes: u16,
 }
 
@@ -2394,14 +2434,13 @@ where
     events: Deque<StackEvent, MAX_STACK_EVENTS>,
     udp: UdpSocketSlab,
     udp_rx: Deque<UdpQueuedReceive, MAX_UDP_RX>,
-    /// Echo replies observed on this shard's receive path, oldest
-    /// first. ICMP frames carry no port, so every one of them lands on
-    /// shard 0 and this buffer belongs to that shard alone.
-    icmp_echo_replies: ArrayVec<IcmpEchoReply, MAX_ICMP_ECHO_REPLIES>,
-    /// Echo requests sent from this shard and not yet answered, oldest
-    /// first, held so a path-MTU error quoting one can be believed
-    /// (RFC 5927 section 4.1).
-    icmp_echo_requests: ArrayVec<IcmpEchoRequest, MAX_ICMP_ECHO_REQUESTS>,
+    /// Echo requests sent from this shard, oldest first, each marked
+    /// once its reply arrives. An unanswered one is what a reply or a
+    /// path-MTU error quoting it has to match to be believed
+    /// (RFC 5927 section 4.1); an answered one waits for its waiter.
+    /// ICMP frames carry no port, so every reply lands on shard 0 and
+    /// this table belongs to that shard alone.
+    icmp_echo_exchanges: ArrayVec<IcmpEchoExchange, MAX_ICMP_ECHO_EXCHANGES>,
     udp_rx_counts: [u8; MAX_UDP_SOCKETS],
     tcp_accept: Deque<TcpQueuedAccept, MAX_TCP_ACCEPT>,
     tcp_listener_queues: TcpListenerQueues,
@@ -2790,8 +2829,7 @@ where
             events: Deque::new(),
             udp: UdpSocketSlab::new(),
             udp_rx: Deque::new(),
-            icmp_echo_replies: ArrayVec::new(),
-            icmp_echo_requests: ArrayVec::new(),
+            icmp_echo_exchanges: ArrayVec::new(),
             udp_rx_counts: [0; MAX_UDP_SOCKETS],
             tcp_accept: Deque::new(),
             tcp_listener_queues: TcpListenerQueues::new(),
@@ -4416,11 +4454,7 @@ where
             frame.set_len(offset);
             Ok(payload.len())
         })?;
-        self.record_icmp_echo_request(IcmpEchoRequest {
-            path,
-            identifier,
-            sequence,
-        });
+        self.record_icmp_echo_request(path, identifier, sequence, payload);
         Ok(sent)
     }
 
@@ -4489,24 +4523,44 @@ where
             frame.set_len(offset);
             Ok(payload.len())
         })?;
-        self.record_icmp_echo_request(IcmpEchoRequest {
-            path,
-            identifier,
-            sequence,
-        });
+        self.record_icmp_echo_request(path, identifier, sequence, payload);
         Ok(sent)
     }
 
     /// Remembers an echo request that went on the wire, forgetting the
-    /// oldest once the table is full.
-    fn record_icmp_echo_request(&mut self, request: IcmpEchoRequest) {
-        if self.icmp_echo_requests.contains(&request) {
+    /// oldest exchange once the table is full. Sending a key again
+    /// replaces the exchange that held it.
+    fn record_icmp_echo_request(
+        &mut self,
+        path: PathMtuKey,
+        identifier: u16,
+        sequence: u16,
+        payload: &[u8],
+    ) {
+        let exchange = IcmpEchoExchange {
+            path,
+            identifier,
+            sequence,
+            payload: IcmpEchoPayload::of(payload),
+            answered: false,
+        };
+        let key = IcmpEchoKey {
+            destination: path.destination,
+            identifier,
+            sequence,
+        };
+        if let Some(held) = self
+            .icmp_echo_exchanges
+            .iter_mut()
+            .find(|held| held.path == path && held.is(key))
+        {
+            *held = exchange;
             return;
         }
-        if self.icmp_echo_requests.is_full() {
-            self.icmp_echo_requests.remove(0);
+        if self.icmp_echo_exchanges.is_full() {
+            self.icmp_echo_exchanges.remove(0);
         }
-        self.icmp_echo_requests.push(request);
+        self.icmp_echo_exchanges.push(exchange);
     }
 
     /// Whether the echo request `identifier`/`sequence` an ICMP error
@@ -4518,39 +4572,43 @@ where
         identifier: u16,
         sequence: u16,
     ) -> bool {
-        self.icmp_echo_requests.contains(&IcmpEchoRequest {
-            path,
-            identifier,
-            sequence,
+        self.icmp_echo_exchanges.iter().any(|exchange| {
+            !exchange.answered
+                && exchange.path == path
+                && exchange.identifier == identifier
+                && exchange.sequence == sequence
         })
     }
 
-    /// Claims the reply to one outstanding echo exchange, if it has
-    /// arrived. A reply nobody is waiting for ages out of the buffer
-    /// rather than being reported to the next caller.
+    /// Claims the answer to one echo exchange, if it has arrived. An
+    /// answer nobody claims is forgotten when newer exchanges push it
+    /// out of the table, never reported to a later caller.
     pub fn take_icmp_echo_reply(&mut self, key: IcmpEchoKey) -> Option<IcmpEchoReply> {
         let index = self
-            .icmp_echo_replies
+            .icmp_echo_exchanges
             .iter()
-            .position(|reply| reply.key == key)?;
-        Some(self.icmp_echo_replies.remove(index))
+            .position(|exchange| exchange.answered && exchange.is(key))?;
+        let exchange = self.icmp_echo_exchanges.remove(index);
+        Some(IcmpEchoReply {
+            key,
+            payload_bytes: u16::try_from(exchange.payload.len).unwrap_or(u16::MAX),
+        })
     }
 
-    /// Banks a received echo reply for whichever waiter owns its key. The
-    /// request it answers is no longer in flight.
-    fn record_icmp_echo_reply(&mut self, key: IcmpEchoKey, payload_bytes: usize) {
-        self.icmp_echo_requests.retain(|request| {
-            request.path.destination != key.destination
-                || request.identifier != key.identifier
-                || request.sequence != key.sequence
-        });
-        if self.icmp_echo_replies.is_full() {
-            self.icmp_echo_replies.remove(0);
+    /// Marks the request `key` names as answered, when `payload` is the
+    /// data it carried. Any other reply is dropped and changes nothing:
+    /// a reply nobody asked for, one repeated after the first, or one
+    /// whose data is not the request's, none of which proves the peer
+    /// answered.
+    fn record_icmp_echo_reply(&mut self, key: IcmpEchoKey, payload: &[u8]) {
+        let payload = IcmpEchoPayload::of(payload);
+        if let Some(exchange) = self
+            .icmp_echo_exchanges
+            .iter_mut()
+            .find(|exchange| !exchange.answered && exchange.is(key) && exchange.payload == payload)
+        {
+            exchange.answered = true;
         }
-        self.icmp_echo_replies.push(IcmpEchoReply {
-            key,
-            payload_bytes: u16::try_from(payload_bytes).unwrap_or(u16::MAX),
-        });
     }
 
     /// Sends an IPv6 datagram from the source address the routing table
@@ -5816,7 +5874,7 @@ where
                         identifier: echo.identifier,
                         sequence: echo.sequence,
                     },
-                    echo.payload.len(),
+                    echo.payload,
                 );
             }
             Icmpv6Packet::EchoRequest(_) => {}
@@ -5852,7 +5910,7 @@ where
                         identifier: echo.identifier,
                         sequence: echo.sequence,
                     },
-                    echo.payload.len(),
+                    echo.payload,
                 );
             }
             Icmpv4Packet::EchoRequest(_) => {}
@@ -9299,6 +9357,254 @@ mod tests {
         assert_eq!(stack.path_mtu.get(key), Some(1280));
     }
 
+    /// A stack with one resolved peer, for the echo exchange tests, in
+    /// either address family.
+    struct EchoFixture {
+        stack: Stack,
+        local: IpAddress,
+        peer: IpAddress,
+    }
+
+    impl EchoFixture {
+        fn new(local: IpAddress, peer: IpAddress) -> Self {
+            let mut stack = Stack::new(StackConfig::new(
+                LOCAL_MAC,
+                crate::ETHERNET_FRAME_BYTES,
+                TEST_ISN_SECRET,
+            ));
+            match local {
+                IpAddress::Ipv4(local) => stack
+                    .add_ipv4_address(Ipv4Cidr::new(local, 24))
+                    .expect("test address should be accepted"),
+                IpAddress::Ipv6(local) => stack
+                    .add_ipv6_address(Ipv6Cidr::new(local, 64))
+                    .expect("test address should be accepted"),
+            }
+            stack.learn_neighbor(NeighborEntry {
+                ip: peer,
+                mac: PEER_MAC,
+                state: NeighborState::Reachable,
+                updated_at: StackInstant::from_nanos(0),
+            });
+            Self { stack, local, peer }
+        }
+
+        /// One fixture per address family, boxed because a `Stack` is
+        /// large and two of them by value overflow a test thread's stack.
+        fn both() -> [Box<Self>; 2] {
+            [
+                Box::new(Self::new(
+                    IpAddress::Ipv4(Ipv4Address::new([192, 0, 2, 10])),
+                    IpAddress::Ipv4(Ipv4Address::new([192, 0, 2, 20])),
+                )),
+                Box::new(Self::new(
+                    IpAddress::Ipv6(Ipv6Address::new([
+                        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ])),
+                    IpAddress::Ipv6(Ipv6Address::new([
+                        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+                    ])),
+                )),
+            ]
+        }
+
+        fn key(&self, identifier: u16, sequence: u16) -> IcmpEchoKey {
+            IcmpEchoKey {
+                destination: self.peer,
+                identifier,
+                sequence,
+            }
+        }
+
+        fn send_request(&mut self, identifier: u16, sequence: u16, payload: &[u8]) {
+            let sent = self
+                .stack
+                .send_icmp_echo_request(
+                    self.peer,
+                    identifier,
+                    sequence,
+                    payload,
+                    1,
+                    StackInstant::from_nanos(1),
+                )
+                .expect("echo request should be queued");
+            assert_eq!(sent, payload.len());
+            self.stack
+                .take_outbound()
+                .expect("echo request frame should be queued");
+        }
+
+        /// Delivers an echo reply from the peer, as the link would.
+        fn receive_reply(&mut self, identifier: u16, sequence: u16, payload: &[u8]) {
+            let mut frame = [0u8; crate::ETHERNET_FRAME_BYTES];
+            let icmp_len = Icmpv4Packet::HEADER_LEN + payload.len();
+            let mut offset = match (self.peer, self.local) {
+                (IpAddress::Ipv4(peer), IpAddress::Ipv4(local)) => {
+                    let mut offset = EthernetFrame::encode_header(
+                        &mut frame,
+                        LOCAL_MAC,
+                        PEER_MAC,
+                        EthernetProtocol::Ipv4,
+                    )
+                    .expect("test Ethernet header should fit");
+                    offset += Ipv4Packet::encode_header(
+                        &mut frame[offset..],
+                        peer,
+                        local,
+                        crate::IpProtocol::Icmp,
+                        icmp_len,
+                        1,
+                        64,
+                    )
+                    .expect("test IPv4 header should fit");
+                    offset
+                }
+                (IpAddress::Ipv6(peer), IpAddress::Ipv6(local)) => {
+                    let mut offset = EthernetFrame::encode_header(
+                        &mut frame,
+                        LOCAL_MAC,
+                        PEER_MAC,
+                        EthernetProtocol::Ipv6,
+                    )
+                    .expect("test Ethernet header should fit");
+                    offset += Ipv6Packet::encode_header(
+                        &mut frame[offset..],
+                        peer,
+                        local,
+                        crate::IpProtocol::Icmpv6,
+                        icmp_len,
+                        64,
+                    )
+                    .expect("test IPv6 header should fit");
+                    offset
+                }
+                _ => panic!("fixture addresses share one family"),
+            };
+            // Echo reply: type 0 (ICMPv4) or 129 (ICMPv6), code 0, then
+            // the identifier, sequence and the data the request carried.
+            let icmp = &mut frame[offset..offset + icmp_len];
+            icmp.fill(0);
+            icmp[4..6].copy_from_slice(&identifier.to_be_bytes());
+            icmp[6..8].copy_from_slice(&sequence.to_be_bytes());
+            icmp[Icmpv4Packet::HEADER_LEN..].copy_from_slice(payload);
+            let checksum = match (self.peer, self.local) {
+                (IpAddress::Ipv6(peer), IpAddress::Ipv6(local)) => {
+                    icmp[0] = 129;
+                    crate::icmpv6_checksum(peer, local, icmp)
+                }
+                _ => crate::internet_checksum(icmp),
+            };
+            icmp[2..4].copy_from_slice(&checksum.to_be_bytes());
+            offset += icmp_len;
+            self.stack
+                .receive_frame(&frame[..offset], StackInstant::from_nanos(2))
+                .expect("the echo reply should be accepted");
+        }
+    }
+
+    #[test]
+    fn an_echo_reply_with_no_outstanding_request_is_not_banked() {
+        for mut fixture in EchoFixture::both() {
+            let key = fixture.key(7, 1);
+            fixture.receive_reply(7, 1, &[0x5a; 56]);
+            assert_eq!(fixture.stack.take_icmp_echo_reply(key), None);
+        }
+    }
+
+    #[test]
+    fn an_echo_reply_that_arrives_before_its_request_is_not_claimed_by_it() {
+        for mut fixture in EchoFixture::both() {
+            let key = fixture.key(7, 1);
+            let payload = [0x5a; 56];
+            fixture.receive_reply(7, 1, &payload);
+            fixture.send_request(7, 1, &payload);
+            assert_eq!(
+                fixture.stack.take_icmp_echo_reply(key),
+                None,
+                "a reply that predates the request does not answer it"
+            );
+            // The request is still outstanding and its own reply works.
+            fixture.receive_reply(7, 1, &payload);
+            assert!(fixture.stack.take_icmp_echo_reply(key).is_some());
+        }
+    }
+
+    #[test]
+    fn an_echo_reply_with_other_data_is_not_banked_and_leaves_the_request_outstanding() {
+        for mut fixture in EchoFixture::both() {
+            let key = fixture.key(7, 1);
+            let payload = [0x5a; 56];
+            fixture.send_request(7, 1, &payload);
+            let mut altered = payload;
+            altered[55] ^= 1;
+            fixture.receive_reply(7, 1, &altered);
+            fixture.receive_reply(7, 1, &payload[..55]);
+            fixture.receive_reply(7, 1, &[0x5a; 57]);
+            assert_eq!(fixture.stack.take_icmp_echo_reply(key), None);
+
+            fixture.receive_reply(7, 1, &payload);
+            let reply = fixture
+                .stack
+                .take_icmp_echo_reply(key)
+                .expect("the genuine reply is still accepted");
+            assert_eq!(reply.key, key);
+            assert_eq!(usize::from(reply.payload_bytes), payload.len());
+        }
+    }
+
+    #[test]
+    fn an_echo_reply_answers_its_request_once() {
+        for mut fixture in EchoFixture::both() {
+            let key = fixture.key(7, 1);
+            let payload = [0x5a; 56];
+            fixture.send_request(7, 1, &payload);
+            fixture.receive_reply(7, 1, &payload);
+            // A repeated reply finds no request left to answer.
+            fixture.receive_reply(7, 1, &payload);
+            let reply = fixture
+                .stack
+                .take_icmp_echo_reply(key)
+                .expect("the matching reply is claimable");
+            assert_eq!(reply.key, key);
+            assert_eq!(usize::from(reply.payload_bytes), payload.len());
+            assert_eq!(fixture.stack.take_icmp_echo_reply(key), None);
+            fixture.receive_reply(7, 1, &payload);
+            assert_eq!(fixture.stack.take_icmp_echo_reply(key), None);
+        }
+    }
+
+    #[test]
+    fn an_echo_reply_for_another_peer_identifier_or_sequence_is_not_banked() {
+        for mut fixture in EchoFixture::both() {
+            let key = fixture.key(7, 1);
+            let payload = [0x5a; 56];
+            fixture.send_request(7, 1, &payload);
+            fixture.receive_reply(8, 1, &payload);
+            fixture.receive_reply(7, 2, &payload);
+            assert_eq!(fixture.stack.take_icmp_echo_reply(key), None);
+        }
+    }
+
+    #[test]
+    fn the_oldest_echo_exchange_is_forgotten_once_the_table_is_full() {
+        for mut fixture in EchoFixture::both() {
+            let payload = [0x5a; 16];
+            let first = u16::try_from(MAX_ICMP_ECHO_EXCHANGES).unwrap() + 1;
+            for sequence in 1..=first {
+                fixture.send_request(7, sequence, &payload);
+            }
+            fixture.receive_reply(7, 1, &payload);
+            assert_eq!(fixture.stack.take_icmp_echo_reply(fixture.key(7, 1)), None);
+            fixture.receive_reply(7, first, &payload);
+            assert!(
+                fixture
+                    .stack
+                    .take_icmp_echo_reply(fixture.key(7, first))
+                    .is_some()
+            );
+        }
+    }
+
     #[test]
     fn icmp_port_unreachable_does_not_close_established_tcp() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
@@ -10053,11 +10359,11 @@ mod tests {
         let seeded = u16::from_be_bytes([datagram[6], datagram[7]]);
         let device_sum = {
             let mut sum = u32::from(seeded);
-            let mut chunks = datagram.chunks_exact(2);
-            for chunk in chunks.by_ref() {
-                sum += u32::from(u16::from_be_bytes([chunk[0], chunk[1]]));
+            let (words, remainder) = datagram.as_chunks::<2>();
+            for &word in words {
+                sum += u32::from(u16::from_be_bytes(word));
             }
-            if let [last] = chunks.remainder() {
+            if let [last] = remainder {
                 sum += u32::from(*last) << 8;
             }
             // The seeded field itself was included once in the loop; the
