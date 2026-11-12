@@ -5,13 +5,46 @@ at `../wasmtime/crates/wasmtime`.
 
 ## Required revision
 
-The local checkout must be at (branch `helios/release-48.0.8`):
+The local checkout must be at (branch `helios/stack-reserve`):
 
 ```text
-1c4b1742798208727174d61d80bee099cfd62876
+bfef55eef6028848178814532dd41587fdaa8187
 ```
 
-That revision is `helios/next-solver-bindgen` at
+That revision is `helios/release-48.0.8` at
+`1c4b1742798208727174d61d80bee099cfd62876` plus six additive commits, which
+let an embedder that commits fiber stacks lazily commit the stack host code
+needs before anything touches it (#535):
+
+- A store keeps a reserve limit beside its real stack limit and publishes
+  the higher of the two, so the resumable check compiled code already makes
+  fails at a stack pointer between them. `Store::stack_reserve_callback`
+  installs the embedder's answer: called with the stack pointer, it commits
+  what host code needs below it and returns the new limit. It runs from
+  `stack_limit_interrupt` before the interrupt callback, and at a wasm entry
+  whose stack pointer is already below the limit. The limit is kept per
+  fiber. An error from the callback ends the call.
+- Cranelift functions can declare `resumable_stack_limit`: a prologue check
+  for a frame above a threshold that calls a `preserve_all` function with
+  `vmctx` and the frame's lowest address instead of trapping, after the
+  frame record is set up and before a byte of the frame is touched. x86-64,
+  AArch64 and RISC-V 64 emit it; s390x and Pulley refuse a function that
+  declares it.
+- `Config::stack_limit_large_frame(Some(threshold))` sets that check on
+  every compiled function, reading the limit from the place
+  `stack_limit_location` names. It is a tunable compared exactly when a
+  module is loaded. `Engine::new` refuses it without stack-limit
+  interruption, under Winch, and with a collector other than the null one.
+
+Helios needs it because wasm descends a lazily committed fiber stack
+without faulting, and a host call from the bottom, or a frame larger than
+what is committed past the limit, then ran on stack nothing had committed.
+The kernel's callback is `install_stack_reserve` in
+`kernel/src/wasmtime_adapter/store.rs`, and the threshold is
+`helios_artifact::CWASM_STACK_LIMIT_LARGE_FRAME`, set by the kernel engine
+and by every producer of a cwasm.
+
+`helios/release-48.0.8` is `helios/next-solver-bindgen` at
 `18b428e6becfb6138b877a3fe70afb08bf5724ba` merged with upstream's `v48.0.8`
 tag (`7b6c29ec3e9a49c97da231665cbd8eead9ccbda0`), which brings in the 48.0.x
 point releases and their security fixes (#503). The release removed every
@@ -349,10 +382,16 @@ the `StackCreator` installed by `kernel/src/wasmtime_adapter/fiber_stack.rs`.
 A stack is one slot of the arena in `kernel/src/memory/fiber_stack.rs`:
 `[guard][stack]` inside one reservation of
 `total_stacks × (64 KiB + COMPONENT_ASYNC_STACK_SIZE)` of user address space,
-with only the top page committed when the stack is created, through the user
-pool's fallible path (a typed out-of-memory when the pool is exhausted), and
-every page below it committed by the page-fault handler that touches it,
-together with any gap between it and the committed range. The handler takes
+with only its top `FIBER_STACK_ENTRY_RESERVE` (16 KiB) committed when the
+stack is created, through the user pool's fallible path (a typed
+out-of-memory when the pool is exhausted). As the guest descends, the
+runtime's stack-reserve callback commits `FIBER_STACK_HOST_RESERVE` (64 KiB)
+below the stack pointer it checked, and `FIBER_STACK_COMMIT_STEP` (16 KiB)
+beyond that, through the same fallible path, so host code called from a
+guest frame runs on committed stack; a function whose frame exceeds
+`CWASM_STACK_LIMIT_LARGE_FRAME` asks before it allocates the frame. A page
+below the committed range that is touched all the same is committed by the
+page-fault handler, together with any gap up to that range. The handler takes
 its frames according to the context it interrupted: through the user pool's
 ordinary path when that context had interrupts enabled, because it then holds
 no pool lock and may wait for another processor's, and from the
