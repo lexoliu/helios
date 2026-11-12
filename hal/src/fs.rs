@@ -216,7 +216,7 @@ bitflags! {
     }
 }
 
-/// Where [`FileSystem::write_with`] puts its bytes.
+/// Where [`FileSystem::prepare_write`] puts its bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WritePosition {
     /// At this offset, zero-filling any gap past the end of the file.
@@ -224,6 +224,103 @@ pub enum WritePosition {
     /// At the end of the file as the filesystem sees it when the write
     /// arrives.
     End,
+}
+
+/// What a [`PreparedWrite::submit`] leaves of its write.
+#[derive(Debug, PartialEq, Eq)]
+pub enum WriteProgress<W> {
+    /// The round landed and bytes remain: the next round, staged and
+    /// waiting for its own submit.
+    More(W),
+    /// Every byte landed; the write began at this offset.
+    Done(u64),
+}
+
+/// A write [`FileSystem::prepare_write`] staged.
+///
+/// A write lands in rounds. Each round stages [`Self::staged_len`] bytes
+/// of the write in the filesystem's own destination, and its submit
+/// fills and sends exactly those. A filesystem that keeps its bytes in
+/// memory stages the whole write in one round; one that sends them
+/// elsewhere bounds a round by the destinations it can hold at once,
+/// never by the write's length, so a write larger than that lands in
+/// several rounds over one prepare. The rounds' lengths sum to the
+/// prepared length, and the rounds land in order at consecutive offsets.
+///
+/// Dropping a prepared write before its submit releases what it staged
+/// and leaves the file as it was: the bytes of earlier rounds have
+/// landed, this round's have not. Dropping a submit's future part way
+/// may leave part of its round written.
+///
+/// Concurrency: a prepared write is owned by the task that prepared it
+/// and is moved, never shared; it may be submitted on another
+/// processor. Two writes to one file staged at once land in whatever
+/// order their submits do.
+pub trait PreparedWrite: Send + Sized {
+    /// The bytes the next submit takes: all of the write's remaining
+    /// bytes, or the most this filesystem stages in one round.
+    fn staged_len(&self) -> usize;
+
+    /// Fills this round and sends it.
+    ///
+    /// `fill` runs before this returns, never from the future, so it
+    /// may read memory that is valid only until the next await (a
+    /// guest's) and need not be `Send`. It is called once for each of the
+    /// round's destination regions, in write order, with the region's
+    /// offset from the start of the whole write; the regions cover the
+    /// round's [`Self::staged_len`] bytes exactly. A round refused before
+    /// its bytes are needed does not run it.
+    fn submit<F>(self, fill: F) -> impl Future<Output = FsResult<WriteProgress<Self>>> + Send
+    where
+        F: FnMut(usize, &mut [u8]);
+}
+
+/// The write of a filesystem that refuses every write before it is
+/// staged.
+impl PreparedWrite for core::convert::Infallible {
+    fn staged_len(&self) -> usize {
+        match *self {}
+    }
+
+    fn submit<F>(self, fill: F) -> impl Future<Output = FsResult<WriteProgress<Self>>> + Send
+    where
+        F: FnMut(usize, &mut [u8]),
+    {
+        // Not `async fn`: that would carry `fill`, which need not be
+        // `Send`, into the future.
+        drop(fill);
+        async move { match self {} }
+    }
+}
+
+/// Writes `len` bytes at `position` and resolves with the offset they
+/// landed at, staging them through [`FileSystem::prepare_write`] and
+/// landing every round.
+///
+/// `source` copies the bytes of the write that start at its first
+/// argument into its second, straight into the filesystem's destination,
+/// so a write copies its bytes once. It runs between awaits, never
+/// across one, and once per destination region; the memory it reads must
+/// stay valid for the whole call.
+pub async fn write_with<F, S>(
+    fs: &F,
+    path: FsPath<'_>,
+    position: WritePosition,
+    len: usize,
+    now: u64,
+    mut source: S,
+) -> FsResult<u64>
+where
+    F: FileSystem,
+    S: FnMut(usize, &mut [u8]),
+{
+    let mut write = fs.prepare_write(path, position, len, now).await?;
+    loop {
+        match write.submit(&mut source).await? {
+            WriteProgress::More(next) => write = next,
+            WriteProgress::Done(landed) => return Ok(landed),
+        }
+    }
 }
 
 /// Where a directory listing resumes.
@@ -342,27 +439,26 @@ pub trait FileSystem: Clone + Send + Sync + 'static {
         max_bytes: usize,
     ) -> impl Future<Output = FsResult<Bytes>> + Send + 'a;
 
-    /// Writes `len` bytes at `position` and resolves with the offset they
-    /// landed at.
+    /// The write [`Self::prepare_write`] stages.
+    type Write<'a>: PreparedWrite
+    where
+        Self: 'a;
+
+    /// Stages a write of `len` bytes at `position`: everything the write
+    /// needs before its bytes (resolving the file, an append's offset,
+    /// the destination the bytes go into) is done here, and the bytes
+    /// themselves go in through [`PreparedWrite::submit`].
     ///
-    /// The filesystem supplies the destination and `fill` writes the bytes
-    /// into it, so a write copies its bytes once: a filesystem that keeps
-    /// them in memory hands `fill` the file's own storage, and one that
-    /// sends them elsewhere hands it the buffer it sends. `fill` runs at
-    /// most once and before this returns, never from the future, so it may
-    /// read memory that is valid only for this call (a guest's) and need
-    /// not be `Send`. A write refused before its bytes are needed does not
-    /// run it.
-    fn write_with<'a, F>(
+    /// A filesystem that keeps its bytes in memory resolves at once; one
+    /// that sends them elsewhere awaits whatever its destination needs
+    /// first. A write refused here has run no filler.
+    fn prepare_write<'a>(
         &'a self,
         path: FsPath<'a>,
         position: WritePosition,
         len: usize,
         now: u64,
-        fill: F,
-    ) -> impl Future<Output = FsResult<u64>> + Send + 'a
-    where
-        F: FnOnce(&mut [u8]);
+    ) -> impl Future<Output = FsResult<Self::Write<'a>>> + Send + 'a;
 
     /// Truncates or zero-extends a regular file to `size` bytes.
     fn set_size<'a>(

@@ -15,7 +15,7 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
-use core::future::Future;
+use core::convert::Infallible;
 
 use bytes::Bytes;
 use helios_hal::fs::{
@@ -368,6 +368,8 @@ const fn entry_inode(index: usize) -> u64 {
 }
 
 impl FileSystem for BootFs {
+    type Write<'a> = Infallible;
+
     async fn stat(&self, path: FsPath<'_>) -> FsResult<Metadata> {
         self.index.metadata(path)
     }
@@ -402,18 +404,14 @@ impl FileSystem for BootFs {
         Ok(Bytes::from_static(&contents[offset..end]))
     }
 
-    fn write_with<'a, F>(
-        &'a self,
-        _: FsPath<'a>,
+    async fn prepare_write(
+        &self,
+        _: FsPath<'_>,
         _: WritePosition,
         _: usize,
         _: u64,
-        _: F,
-    ) -> impl Future<Output = FsResult<u64>> + Send + 'a
-    where
-        F: FnOnce(&mut [u8]),
-    {
-        core::future::ready(Err(FsError::ReadOnly))
+    ) -> FsResult<Infallible> {
+        Err(FsError::ReadOnly)
     }
 
     async fn set_size(&self, _: FsPath<'_>, _: u64, _: u64) -> FsResult<()> {
@@ -618,12 +616,13 @@ mod tests {
         let past_end = block_on(fs.read_at(path("lib/runtime.component"), 99, 3)).expect("reads");
         assert!(past_end.is_empty());
         assert_eq!(
-            block_on(fs.write_with(
+            block_on(helios_hal::fs::write_with(
+                &fs,
                 path("etc/config.txt"),
                 WritePosition::At(0),
                 1,
                 0,
-                |_| panic!("a refused write needs no bytes"),
+                |_, _| panic!("a refused write needs no bytes"),
             )),
             Err(FsError::ReadOnly)
         );

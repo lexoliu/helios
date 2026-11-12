@@ -1,0 +1,19 @@
+package helios:system@0.1.0;
+
+/// Types shared by the filters `tracing` and `profiling` take.
+///
+/// A filter holds a list of prefixes. The list is bounded so that what the
+/// kernel keeps and matches against every event is bounded before a guest
+/// sends it. The kernel checks the bounds before it copies any prefix out
+/// of the caller's memory, and a filter that exceeds one is refused whole.
+interface filters {
+  /// Why a filter was refused. The payload is the limit that was
+  /// exceeded, so a caller can report it without knowing the kernel's
+  /// constants.
+  variant filter-error {
+    /// A prefix list held more entries than the limit, which is 8.
+    too-many-prefixes(u32),
+    /// A prefix was longer, in bytes, than the limit, which is 128.
+    prefix-too-long(u32),
+  }
+}

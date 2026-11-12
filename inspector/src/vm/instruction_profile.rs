@@ -73,6 +73,9 @@ fn refusal_reason(refusal: InstructionProfileError) -> &'static str {
         InstructionProfileError::NotCaptured => {
             "this architecture's backend does not sample instruction addresses (only x86-64 does)"
         }
+        InstructionProfileError::Denied => {
+            "the session does not hold the right to observe the machine"
+        }
     }
 }
 
