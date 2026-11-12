@@ -48,8 +48,9 @@ pub use entropy::{
 };
 pub use fiber_stack::{
     FIBER_STACK_GUARD_BYTES, FiberStack, FiberStackArenaStats, FiberStackError, FiberStackVmHooks,
-    StackFault, claim_fiber_stack, fiber_stack_arena_stats, fiber_stack_demand_commits_on,
-    install_fiber_stack_arena, install_fiber_stack_hooks, resolve_stack_fault,
+    InterruptedContext, StackFault, claim_fiber_stack, fiber_stack_arena_stats,
+    fiber_stack_demand_commits_on, install_fiber_stack_arena, install_fiber_stack_hooks,
+    resolve_stack_fault,
 };
 #[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]
 pub(crate) use fiber_stack::{fiber_parking, parked_fibers};

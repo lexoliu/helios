@@ -1,52 +1,62 @@
-//! The frames a page-fault handler is allowed to allocate.
+//! The frames a fiber-stack fault may take without waiting on the user
+//! pool.
 //!
-//! A demand-committed fiber stack faults on first touch by
-//! construction, and resolving that fault means putting a physical
-//! frame behind the page. The fault runs on the faulting stack's own
-//! processor, inside whatever the interrupted code was doing — and
-//! kernel host calls run on fiber stacks, so the interrupted code may
-//! hold the user-memory pool's lock, or the kernel heap's, or the frame
-//! slab's. Asking any of them for a frame from there would spin on a
-//! word only the interrupted context can clear, and masking interrupts
-//! does nothing for an exception.
+//! A fiber-stack fault is served according to the context it interrupted
+//! (see [`super::fiber_stack`]). When that context had interrupts
+//! enabled it holds none of the pool's locks, because every one of them
+//! masks its holder's interrupts while it is held, so the fault takes its
+//! frames through the pool's ordinary blocking path and this reserve is
+//! not touched. When the context had interrupts masked it may be holding
+//! a pool lock — kernel host calls run on fiber stacks, and the kernel
+//! heap grows out of the pool from inside the global allocator — and
+//! asking the pool for a frame from there would spin on a word only the
+//! interrupted context can clear. Those faults, and only those, take
+//! their frames from this small per-processor reserve, which no lock
+//! guards.
 //!
-//! So the fault path takes its frame from a small per-processor reserve
-//! that no lock guards against another processor, and the reserve is
-//! refilled from the pool through a non-blocking attempt
-//! ([`UserMemoryPool::try_allocate_frame_on`](super::UserMemoryPool)) —
-//! free unless the faulting context itself holds the pool. The reserve
-//! therefore has to carry a fault only across the bounded stack growth
-//! that lock-holding code does; an unbounded growth such as CPython's
-//! recursion holds no lock, so every one of its thousands of faults
-//! refills successfully.
+//! The reserve is refilled through the pool's ordinary blocking path,
+//! and only where nothing is held: [`top_up`], which the executor loop
+//! calls on every iteration, and the end of a fiber-stack fault that was
+//! served from the pool. A refill waits out another processor's pool
+//! critical section like any allocation does, so contention on the pool
+//! never leaves the reserve short. Only exhaustion of the pool does, and
+//! a refill that the pool refuses stops quietly: the frames are not owed
+//! to anyone yet, and a masked fault that needs one panics naming what
+//! the reserve held.
+//!
+//! The reserve therefore has to carry a masked fault only across the
+//! bounded stack growth that interrupt-masking code does between two
+//! refills: the global allocator's growth into the user pool, a virtio
+//! completion waking a listener, a host call's own frames.
 //!
 //! # Concurrency contract
 //!
 //! One shard per processor, each on its own cache line, and every word
 //! in a shard is written by its own processor:
 //!
-//! - [`take_frame`] runs on the owning processor, in fault context,
-//!   with that processor's interrupts masked by the exception entry.
-//! - [`top_up`] runs on the owning processor outside fault context: the
-//!   executor loop calls it on every iteration and stack creation calls
-//!   it once more.
+//! - [`take_frame`] runs on the owning processor, in fault context, only
+//!   for a fault whose interrupted context had interrupts masked. It is
+//!   lock-free and never touches the pool.
+//! - [`top_up`] runs on the owning processor outside any pool lock: the
+//!   executor loop calls it on every iteration, and the fault path calls
+//!   it after it has served a fault from the pool. It takes the pool's
+//!   blocking path.
 //! - [`configure_processors`] runs once, on the bootstrap processor,
 //!   before any secondary is started.
 //!
 //! A shard is a lock-free stack — one atomic head, pushed and popped
 //! with compare-and-swap — and not a locked list, because the one
-//! concurrency it does see is its own processor interrupting itself.
-//! Stack creation pops a shard from a fiber stack, and a fiber stack
-//! faults on first touch, so a pop can be interrupted mid-operation by
-//! the very fault that needs the shard: a lock there would be held by
-//! the context the fault interrupted, and spinning on it would never
-//! end. With compare-and-swap the interrupted pop simply loses its
-//! exchange and retries. The same shape carries a foreign push, should
-//! one ever arrive. The ABA case the pattern is known for needs a frame
-//! to leave the list and come back between a load and its exchange; a
-//! frame leaves only into a mapping and returns only through the pool
-//! on a stack release, and neither happens inside a fault on the
-//! processor that loaded it.
+//! concurrency it does see is its own processor interrupting itself: a
+//! pop or a push can be interrupted mid-operation by a fault that needs
+//! the same shard, and a lock there would be held by the context the
+//! fault interrupted, which spinning on it would never end. With
+//! compare-and-swap the interrupted operation simply loses its exchange
+//! and retries. The same shape carries a foreign push, should one ever
+//! arrive. The ABA case the pattern is known for needs a frame to leave
+//! the list and come back between a load and its exchange; a frame leaves
+//! only into a mapping and returns only through the pool on a stack
+//! release, and neither happens inside a fault on the processor that
+//! loaded it.
 //!
 //! The free list is threaded through the frames themselves, exactly as
 //! [`super::frame_slab`] does, so the reserve allocates nothing of its
@@ -65,25 +75,24 @@ use helios_hal::cpu::ProcessorId;
 use helios_hal::pmm::PhysFrame;
 use spin::Once;
 
-use super::user::{allocate_user_frame_zeroed_on, try_allocate_user_frame_zeroed_on};
+use super::user::allocate_user_frame_zeroed_on;
 
 /// Frames one processor's reserve holds when it is full.
 ///
-/// The reserve exists for the faults a *lock-holding* path takes, and
-/// those are bounded by the stack that path uses: the global
+/// The reserve exists for the faults an *interrupt-masking* path takes,
+/// and those are bounded by the stack that path uses: the global
 /// allocator's growth into the user pool, a virtio completion waking a
 /// listener, a host call's own frames. Sixty-four pages is a quarter of
-/// a megabyte per processor and far more stack than any of them touch.
-/// A path that is not holding a lock refills on the way through and
+/// a megabyte per processor and far more stack than any of them touch. A
+/// path that runs with interrupts enabled is served from the pool and
 /// never draws the reserve down at all.
-const RESERVE_CAPACITY: usize = 64;
+pub(super) const RESERVE_CAPACITY: usize = 64;
 
-/// The level below which a fault refills the reserve.
+/// The level below which a refill tops the reserve up.
 ///
-/// Refilling in one batch rather than one frame at a time is what keeps
-/// the lock attempts proportional to the reserve rather than to the
-/// number of faults: a stack that grows by two thousand pages takes the
-/// pool lock about sixty times, not two thousand.
+/// Refilling in one batch rather than one frame at a time keeps the
+/// pool's lock acquisitions proportional to the reserve rather than to
+/// the number of faults.
 const RESERVE_LOW_WATER: usize = 32;
 
 struct FreeFrame {
@@ -223,48 +232,21 @@ pub(crate) fn is_configured() -> bool {
     RESERVE.shards.get().is_some()
 }
 
-/// One zeroed frame for the page-fault handler running on `processor`.
-///
-/// Pops the reserve, then refills it when it has fallen below its
-/// low-water mark, so the common case is one pop and nothing else. A
-/// pop that finds the reserve empty refills first and retries.
-///
-/// # Panics
-///
-/// When the reserve is empty and the pool refuses a non-blocking
-/// refill. That is the pool's lock being held by the very context this
-/// fault interrupted, and it means a lock-holding path grew its stack
-/// by more than [`RESERVE_CAPACITY`] pages — the invariant this reserve
-/// rests on. Failing here names it; there is no correct way to wait.
-pub(crate) fn take_frame(processor: ProcessorId) -> NonNull<u8> {
-    let shard = RESERVE.shard(processor);
-    if let Some(frame) = shard.pop() {
-        if shard.len() < RESERVE_LOW_WATER {
-            try_refill(shard, processor);
-        }
-        return frame;
-    }
-    try_refill(shard, processor);
-    shard.pop().unwrap_or_else(|| {
-        panic!(
-            "processor {} exhausted its {RESERVE_CAPACITY}-frame page-fault reserve and the user \
-             memory pool refused a lock-free refill: a path holding the pool lock grew its stack \
-             by more than the reserve holds",
-            processor.id()
-        )
-    })
+/// One zeroed frame for a fiber-stack fault on `processor` whose
+/// interrupted context had interrupts masked, or `None` when the reserve
+/// is empty. Lock-free: it never touches the user pool.
+pub(crate) fn take_frame(processor: ProcessorId) -> Option<NonNull<u8>> {
+    RESERVE.shard(processor).pop()
 }
 
-/// Refills `processor`'s reserve from outside fault context.
+/// Refills `processor`'s reserve through the pool's blocking path.
 ///
-/// The executor loop calls this on every iteration and stack creation
-/// calls it once more, so the reserve is normally full before any fault
-/// reaches it. Unlike [`take_frame`]'s refill this may wait on the
-/// pool's lock, because the caller is not inside a fault and holds
-/// nothing. A pool that cannot serve the request leaves the reserve
-/// where it is: the frames are not owed to anyone yet, and a program
-/// that needs one will fail its own allocation with the typed
-/// out-of-memory error it already handles.
+/// Callers hold nothing and run with no pool lock held by the context
+/// they interrupted: the executor loop, and the end of a fiber-stack
+/// fault that was itself served from the pool. Waiting on the pool's
+/// locks is therefore safe, and only another processor's critical
+/// section — which waits for nothing — can delay it. A pool that cannot
+/// serve the request leaves the reserve where it is.
 pub(crate) fn top_up(processor: ProcessorId) {
     // The executor calls this on every iteration on every processor, so
     // the full reserve — which is the steady state — has to cost one
@@ -277,9 +259,9 @@ pub(crate) fn top_up(processor: ProcessorId) {
         return;
     }
     // The only path that draws on the reserve is the fiber-stack
-    // arena's fault handler, so until the arena exists the reserve holds
-    // nothing: frames parked here are frames the user pool cannot hand a
-    // program.
+    // arena's masked-fault path, so until the arena exists the reserve
+    // holds nothing: frames parked here are frames the user pool cannot
+    // hand a program.
     if !super::fiber_stack::arena_installed() {
         return;
     }
@@ -294,26 +276,6 @@ pub(crate) fn top_up(processor: ProcessorId) {
     }
 }
 
-/// Fills `shard` as far as the pool will go without waiting.
-///
-/// Runs in fault context, so nothing here may wait on a lock: the
-/// pool is asked through its non-blocking path, and a shard that
-/// refuses a push is a broken invariant rather than a frame to hand
-/// back through the pool's locked free path.
-fn try_refill(shard: &ReserveShard, processor: ProcessorId) {
-    while shard.len() < RESERVE_CAPACITY {
-        let Some(frame) = try_allocate_user_frame_zeroed_on(processor) else {
-            return;
-        };
-        assert!(
-            shard.push(frame),
-            "processor {} found its page-fault frame reserve full underneath a refill it was \
-             running itself: something other than the owning processor pushed to it",
-            processor.id()
-        );
-    }
-}
-
 /// Frames the reserve is holding across every processor, in bytes.
 pub fn reserved_bytes() -> usize {
     RESERVE.shards.get().map_or(0, |shards| {
@@ -323,7 +285,7 @@ pub fn reserved_bytes() -> usize {
 
 const _: () = {
     // The low-water mark has to leave a batch worth taking behind it,
-    // or a fault below the mark would take the pool lock for one frame
+    // or a refill below the mark would take the pool lock for one frame
     // and be back below the mark on the very next fault.
     assert!(RESERVE_LOW_WATER < RESERVE_CAPACITY);
     assert!(RESERVE_CAPACITY - RESERVE_LOW_WATER >= RESERVE_CAPACITY / 2);

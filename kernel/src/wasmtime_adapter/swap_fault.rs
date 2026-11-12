@@ -21,7 +21,8 @@ use wasmtime::BlockOnCurrentFiberError;
 
 use crate::kernel_exception::{KernelException, dispatch_native_trap};
 use crate::memory::{
-    StackFault, SwapFaultError, installed_swap_handle, resolve_stack_fault, swapped_token,
+    InterruptedContext, StackFault, SwapFaultError, installed_swap_handle, resolve_stack_fault,
+    swapped_token,
 };
 
 /// Reads the page at `addr` back in, blocking the fiber this is called
@@ -91,12 +92,14 @@ pub enum UserPageFault {
 }
 
 /// Classifies a fault at `addr` in the order every backend uses: the fiber
-/// stack arena first, because it resolves with no lock and no allocation,
-/// then the swap entry.
+/// stack arena first, because it resolves from the user pool without
+/// touching the swap tables, then the swap entry.
 ///
-/// Lock-free and safe to call from trap context.
-pub fn classify_user_page_fault(addr: VirtAddr) -> UserPageFault {
-    let stack_fault = resolve_stack_fault(addr);
+/// `interrupted` is what the backend's entry saved of the context the
+/// fault interrupted; see [`InterruptedContext`]. Safe to call from trap
+/// context: it waits only as [`resolve_stack_fault`] does.
+pub fn classify_user_page_fault(addr: VirtAddr, interrupted: InterruptedContext) -> UserPageFault {
+    let stack_fault = resolve_stack_fault(addr, interrupted);
     if stack_fault == StackFault::Committed {
         return UserPageFault::Resolved;
     }
