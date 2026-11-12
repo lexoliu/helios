@@ -56,11 +56,12 @@ use crate::wasmtime_adapter::{WasmtimeCompiledComponent, WasmtimeCompiledCoreMod
 use crate::wasmtime_adapter::{
     WasmtimePrecompiledKind,
     wasi::{
-        DebugFileSystem, DebugFileSystemSnapshot, FileContents, FsDescriptor, FsNodeKind,
-        WasiImportSet, bindings::filesystem::types as fs_types, preview1 as p1,
+        self as wasi_fs, FsDescriptor, FsNodeKind, WasiImportSet,
+        bindings::filesystem::types as fs_types, preview1 as p1,
     },
 };
 use crate::{BootfsBytes, GuestAddress, ProgramExecErrorDetail, RuntimeMessage};
+use crate::{FileContents, MemoryFs, Namespace};
 use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -78,6 +79,7 @@ use helios_compiler_abi::{
     HELIOS_COMPILER_FREE, HELIOS_COMPILER_INITIALIZE, HELIOS_COMPILER_OUTSTANDING_BYTES,
     HELIOS_COMPILER_PTHREAD_SELF_OFFSET,
 };
+use helios_hal::fs::WritePosition;
 use helios_hal::watchdog::Watchdog;
 use smallvec::SmallVec;
 use thiserror::Error;
@@ -120,6 +122,16 @@ type Preview1IovRanges = SmallVec<[(usize, usize); 8]>;
 type CompilerThreadTasks = SmallVec<[crate::JoinHandle<CompilerThreadReport>; 8]>;
 type CompilerThreadReports = SmallVec<[CompilerThreadReport; 8]>;
 type CompilerPluginHandle<CpuImpl, Net, HostFs> = Arc<CompilerPluginRuntime<CpuImpl, Net, HostFs>>;
+
+/// What [`UserProgramService::aot`] produced.
+pub(crate) struct AotArtifact {
+    /// The signed `cwasm` artifact.
+    pub(crate) signed: Vec<u8>,
+    /// The worker count the compiler plugin was told to compile with
+    /// (`compiler_plugin_worker_threads`), reported so a caller comparing
+    /// this compile with another can hold the count fixed.
+    pub(crate) worker_threads: u32,
+}
 
 #[derive(Clone, Copy, Default)]
 struct CompilerPhaseTimestamps {
@@ -192,11 +204,15 @@ where
 /// Distinct from [`ProgramExecContext`], which is the host the program
 /// runs *in*, and from [`ChildStdio`], which is how the caller talks to
 /// it once it is running.
-pub(super) struct ProgramLaunch<Net: ComponentHostNetwork> {
+pub(super) struct ProgramLaunch<Net: ComponentHostNetwork, HostFs: crate::HostFileSystem> {
     argv: ProgramArgv,
     env: LaunchEnvironment,
     authority: ProcessAuthority,
-    filesystem: Option<DebugFileSystemSnapshot>,
+    /// The namespace the program runs in: the launcher's own tree when it
+    /// shares it, or a tree descending from the launcher's. `None` for a
+    /// program the kernel launches, which runs in a tree descending from
+    /// the root namespace.
+    filesystem: Option<Namespace<HostFs>>,
     /// Inherited preview1 descriptors. Only core modules have a
     /// descriptor table; a component ignores one.
     descriptors: Option<Preview1DescriptorTable<Net>>,
@@ -207,7 +223,7 @@ pub(super) struct ProgramLaunch<Net: ComponentHostNetwork> {
     timeline: phases::Timeline,
 }
 
-impl<Net: ComponentHostNetwork> ProgramLaunch<Net> {
+impl<Net: ComponentHostNetwork, HostFs: crate::HostFileSystem> ProgramLaunch<Net, HostFs> {
     /// A launch that inherits nothing: no descriptors, no signal
     /// dispositions. `env` is the caller's environment; the kernel owns
     /// `HELIOS_PROCESS_ID` and replaces any entry for it (see
@@ -216,7 +232,7 @@ impl<Net: ComponentHostNetwork> ProgramLaunch<Net> {
         argv: ProgramArgv,
         env: Vec<(String, String)>,
         authority: ProcessAuthority,
-        filesystem: Option<DebugFileSystemSnapshot>,
+        filesystem: Option<Namespace<HostFs>>,
     ) -> Self {
         Self {
             argv,
@@ -328,11 +344,11 @@ struct ProgramComponent {
     _code: CodeRegistration,
 }
 
-struct ProgramSpawnRequest<Net: ComponentHostNetwork> {
+struct ProgramSpawnRequest<Net: ComponentHostNetwork, HostFs: crate::HostFileSystem> {
     argv: ProgramArgv,
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
-    filesystem: Option<DebugFileSystemSnapshot>,
+    filesystem: Option<Namespace<HostFs>>,
     descriptors: Option<Preview1DescriptorTable<Net>>,
     signal_state: WasixSignalState,
     signal_dispositions: Vec<WasixSignalDisposition>,
@@ -353,21 +369,21 @@ pub(crate) enum ProgramSource {
 }
 
 impl ProgramSource {
-    /// Classifies a program read from the in-memory filesystem by the
-    /// provenance its node carries.
+    /// Classifies a program file by the provenance the filesystem layer
+    /// that produced its bytes gave them.
     pub(crate) fn from_file(contents: FileContents) -> Self {
         match contents {
-            FileContents::Bootfs(bytes) if cwasm::is_cwasm(bytes.as_slice()) => {
+            FileContents::Boot(bytes) if cwasm::is_cwasm(bytes.as_slice()) => {
                 Self::BootfsArtifact(bytes)
             }
-            FileContents::Bootfs(bytes) => Self::RawWasm(bytes.to_bytes()),
+            FileContents::Boot(bytes) => Self::RawWasm(bytes.to_bytes()),
             FileContents::Written(bytes) => Self::from_untrusted(bytes),
         }
     }
 
     /// Classifies bytes no boot payload vouches for: a file a guest
-    /// wrote, or one read from the host share.
-    pub(crate) fn from_untrusted(bytes: Bytes) -> Self {
+    /// wrote, on whichever mount, or one a host shared.
+    fn from_untrusted(bytes: Bytes) -> Self {
         if cwasm::is_cwasm(&bytes) {
             Self::SignedArtifact(bytes)
         } else {
@@ -448,7 +464,7 @@ impl ChildHandle {
 pub struct ChildExit {
     pub instance_id: crate::InstanceId,
     pub exit_code: u32,
-    filesystem: Option<DebugFileSystemSnapshot>,
+    filesystem: Option<MemoryFs>,
 }
 
 pub fn install_program_service<CpuImpl, Net, HostFs, WatchdogImpl>(
@@ -1216,7 +1232,7 @@ where
         exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
         source: ProgramSource,
         hint: Option<AotCompileHint>,
-        launch: ProgramLaunch<Net>,
+        launch: ProgramLaunch<Net, HostFs>,
     ) -> Result<ChildHandle, ProgramExecError> {
         super::emit_program_stage_marker(exec_context.write_serial, "program:spawn-begin");
         let executable = self
@@ -1242,7 +1258,7 @@ where
         exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
         source: ProgramSource,
         hint: Option<AotCompileHint>,
-        mut launch: ProgramLaunch<Net>,
+        mut launch: ProgramLaunch<Net, HostFs>,
         output_mode: OutputMode,
         stdio: ChildStdio,
     ) -> Result<ChildHandle, ProgramExecError> {
@@ -1267,7 +1283,7 @@ where
         &self,
         exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
         executable: ProgramExecutable<CpuImpl, Net, HostFs>,
-        launch: ProgramLaunch<Net>,
+        launch: ProgramLaunch<Net, HostFs>,
     ) -> Result<ChildHandle, ProgramExecError> {
         let (stdin_writer, stdin_reader) = crate::byte_channel();
         let (stdout_writer, stdout_reader) = crate::byte_channel();
@@ -1293,7 +1309,7 @@ where
         &self,
         exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
         executable: ProgramExecutable<CpuImpl, Net, HostFs>,
-        launch: ProgramLaunch<Net>,
+        launch: ProgramLaunch<Net, HostFs>,
         output_mode: OutputMode,
         stdio: ChildStdio,
     ) -> Result<ChildHandle, ProgramExecError> {
@@ -1405,7 +1421,7 @@ where
         source: ProgramSource,
         hint: Option<AotCompileHint>,
         stdin: Vec<u8>,
-        launch: ProgramLaunch<Net>,
+        launch: ProgramLaunch<Net, HostFs>,
     ) -> Result<ExecResult, ProgramExecError> {
         self.exec_buffered_with_snapshot(exec_context, source, hint, stdin, launch)
             .await
@@ -1418,8 +1434,8 @@ where
         source: ProgramSource,
         hint: Option<AotCompileHint>,
         stdin: Vec<u8>,
-        launch: ProgramLaunch<Net>,
-    ) -> Result<(ExecResult, Option<DebugFileSystemSnapshot>), ProgramExecError> {
+        launch: ProgramLaunch<Net, HostFs>,
+    ) -> Result<(ExecResult, Option<MemoryFs>), ProgramExecError> {
         let executable = self
             .load_executable(
                 &exec_context,
@@ -1439,8 +1455,8 @@ where
         exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
         executable: ProgramExecutable<CpuImpl, Net, HostFs>,
         stdin: Vec<u8>,
-        launch: ProgramLaunch<Net>,
-    ) -> Result<(ExecResult, Option<DebugFileSystemSnapshot>), ProgramExecError> {
+        launch: ProgramLaunch<Net, HostFs>,
+    ) -> Result<(ExecResult, Option<MemoryFs>), ProgramExecError> {
         let mut child = self.spawn_loaded(exec_context, executable, launch)?;
 
         // Feed stdin in one shot, then close the writer to signal EOF.
@@ -1494,9 +1510,14 @@ where
         wasm: &Bytes,
         hint: AotCompileHint,
         profile: bool,
-    ) -> Result<Vec<u8>, ProgramExecError> {
-        self.compile_raw_component_to_signed_artifact(exec_context, wasm, hint, profile)
-            .await
+    ) -> Result<AotArtifact, ProgramExecError> {
+        let signed = self
+            .compile_raw_component_to_signed_artifact(exec_context, wasm, hint, profile)
+            .await?;
+        Ok(AotArtifact {
+            signed,
+            worker_threads: compiler_plugin_worker_threads(&exec_context.cpu),
+        })
     }
 
     async fn load_executable(
@@ -2576,18 +2597,34 @@ mod tests {
     }
 
     #[test]
+    fn a_name_too_long_is_name_too_long_in_every_wasi_layer() {
+        let code =
+            crate::wasmtime_adapter::wasi::fs_error_code(helios_hal::fs::FsError::NameTooLong);
+
+        // Preview 2 and 3 return the code itself; preview 1 and WASIX
+        // answer its errno.
+        assert!(matches!(code, fs_types::ErrorCode::NameTooLong));
+        assert_eq!(
+            p1_errno_from_fs(fs_types::ErrorCode::NameTooLong),
+            p1::errno::NAMETOOLONG
+        );
+    }
+
+    #[test]
     fn null_device_open_is_confined_to_authorized_path_resolution() {
         let root = FsDescriptor {
             path: "/".into(),
             kind: FsNodeKind::Directory,
             flags: fs_types::DescriptorFlags::READ,
             identity: None,
+            mount: None,
         };
         let work = FsDescriptor {
             path: "/work".into(),
             kind: FsNodeKind::Directory,
             flags: fs_types::DescriptorFlags::READ,
             identity: None,
+            mount: None,
         };
 
         assert_eq!(
@@ -2636,6 +2673,7 @@ mod tests {
                 kind: FsNodeKind::File,
                 flags: fs_types::DescriptorFlags::WRITE,
                 identity: None,
+                mount: None,
             },
             offset: 0,
             fdflags: 0,
@@ -2808,6 +2846,7 @@ mod tests {
                 kind: FsNodeKind::File,
                 flags: fs_types::DescriptorFlags::WRITE,
                 identity: None,
+                mount: None,
             },
             offset: 0,
             fdflags: 0,
@@ -2848,6 +2887,7 @@ mod tests {
                 kind: FsNodeKind::File,
                 flags: fs_types::DescriptorFlags::READ,
                 identity: None,
+                mount: None,
             },
             offset: 0,
             fdflags: P1_FDFLAG_NONBLOCK,
@@ -2950,6 +2990,7 @@ mod tests {
                 kind: FsNodeKind::Directory,
                 flags: fs_types::DescriptorFlags::READ,
                 identity: None,
+                mount: None,
             },
         };
 
@@ -3068,6 +3109,7 @@ mod tests {
                 kind: FsNodeKind::File,
                 flags: fs_types::DescriptorFlags::READ,
                 identity: None,
+                mount: None,
             },
             offset: 0,
             fdflags: 0,
@@ -3078,6 +3120,7 @@ mod tests {
                 kind: FsNodeKind::File,
                 flags: fs_types::DescriptorFlags::READ,
                 identity: None,
+                mount: None,
             },
             offset: 0,
             fdflags: 0,
@@ -3116,6 +3159,7 @@ mod tests {
                             kind: FsNodeKind::Directory,
                             flags: fs_types::DescriptorFlags::READ,
                             identity: None,
+                            mount: None,
                         },
                     },
                     false,
@@ -3144,6 +3188,7 @@ mod tests {
                 kind: FsNodeKind::Directory,
                 flags: fs_types::DescriptorFlags::READ,
                 identity: None,
+                mount: None,
             },
         };
         let mut authority = ProcessAuthority::empty();
@@ -3186,6 +3231,7 @@ mod tests {
                             kind: FsNodeKind::Directory,
                             flags: fs_types::DescriptorFlags::READ,
                             identity: None,
+                            mount: None,
                         },
                     },
                     false,
@@ -3199,6 +3245,7 @@ mod tests {
                     kind: FsNodeKind::Directory,
                     flags: fs_types::DescriptorFlags::READ,
                     identity: None,
+                    mount: None,
                 },
             }),
         };
@@ -3222,6 +3269,7 @@ mod tests {
                             kind: FsNodeKind::Directory,
                             flags: fs_types::DescriptorFlags::READ,
                             identity: None,
+                            mount: None,
                         },
                     },
                     false,

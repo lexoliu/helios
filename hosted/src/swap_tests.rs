@@ -7,16 +7,36 @@
 //! host page cache and is not evidence about swap on a real target.
 
 use std::path::Path;
+use std::sync::OnceLock;
 
+use helios_hal::cpu::ProcessorId;
 use helios_hal::vmm::{
     AddressSpace, PageAge, PageFlags, SwapBackend, SwapToken, Translation, VirtAddr, VirtRange,
 };
-use helios_kernel::{MemoryOwner, enter_user_memory_owner};
+use helios_kernel::{
+    MemoryOwner, UserMemoryPool, configure_user_memory_owner_processors, enter_user_memory_owner,
+    install_user_memory_pool,
+};
 
 use crate::swap::FileSwapBackend;
 use crate::vmm::HostedAddressSpace;
 
 const PAGE: usize = 4096;
+
+/// The machine these tests run on: one processor, the owner table that
+/// attributes commits to it, and the user pool the shared swap core takes
+/// its frames from and the owner table is carved out of.
+///
+/// The pool is process-global and installed once, so the first test in a
+/// process builds it and the rest share it. Any test that swaps a page
+/// out, wherever it lives, runs on this machine.
+pub(crate) fn machine() {
+    static POOL: OnceLock<&'static UserMemoryPool> = OnceLock::new();
+    crate::cpu::set_current_processor(ProcessorId::new(0));
+    let pool =
+        POOL.get_or_init(|| install_user_memory_pool(crate::test_pool::single_node_machine(1)));
+    configure_user_memory_owner_processors(pool);
+}
 
 fn block_on<F: Future>(future: F) -> F::Output {
     futures_lite::future::block_on(future)
@@ -70,7 +90,7 @@ fn commit_owned(address_space: &HostedAddressSpace, range: VirtRange, owner: Mem
 
 #[test]
 fn a_swapped_page_comes_back_with_its_bytes_and_its_flags() {
-    helios_kernel::configure_user_memory_owner_processors(crate::test_pool::single_processor_pool());
+    machine();
     let address_space = HostedAddressSpace::new();
     let backend = swap_file("round-trip");
     let range = address_space.reserve(PAGE).expect("reserve");
@@ -109,7 +129,7 @@ fn a_swapped_page_comes_back_with_its_bytes_and_its_flags() {
 
 #[test]
 fn a_swapped_page_is_still_writable_after_it_comes_back() {
-    helios_kernel::configure_user_memory_owner_processors(crate::test_pool::single_processor_pool());
+    machine();
     let address_space = HostedAddressSpace::new();
     let range = address_space.reserve(PAGE).expect("reserve");
     commit_owned(&address_space, range, MemoryOwner::new(2));
@@ -130,7 +150,7 @@ fn a_swapped_page_is_still_writable_after_it_comes_back() {
 
 #[test]
 fn only_the_owner_s_pages_are_offered_to_a_pass() {
-    helios_kernel::configure_user_memory_owner_processors(crate::test_pool::single_processor_pool());
+    machine();
     let address_space = HostedAddressSpace::new();
     let mine = address_space.reserve(2 * PAGE).expect("reserve");
     let theirs = address_space.reserve(PAGE).expect("reserve");
@@ -157,7 +177,7 @@ fn only_the_owner_s_pages_are_offered_to_a_pass() {
 
 #[test]
 fn a_pass_that_says_stop_stops_the_scan() {
-    helios_kernel::configure_user_memory_owner_processors(crate::test_pool::single_processor_pool());
+    machine();
     let address_space = HostedAddressSpace::new();
     let range = address_space.reserve(4 * PAGE).expect("reserve");
     commit_owned(&address_space, range, MemoryOwner::new(9));
@@ -177,7 +197,7 @@ fn a_pass_that_says_stop_stops_the_scan() {
 /// on this backend.
 #[test]
 fn hosted_reports_every_page_hot_because_it_cannot_measure_age() {
-    helios_kernel::configure_user_memory_owner_processors(crate::test_pool::single_processor_pool());
+    machine();
     let address_space = HostedAddressSpace::new();
     let range = address_space.reserve(2 * PAGE).expect("reserve");
     commit_owned(&address_space, range, MemoryOwner::new(11));
@@ -193,7 +213,7 @@ fn hosted_reports_every_page_hot_because_it_cannot_measure_age() {
 
 #[test]
 fn releasing_a_reservation_surrenders_the_tokens_it_still_held() {
-    helios_kernel::configure_user_memory_owner_processors(crate::test_pool::single_processor_pool());
+    machine();
     let address_space = HostedAddressSpace::new();
     let range = address_space.reserve(2 * PAGE).expect("reserve");
     commit_owned(&address_space, range, MemoryOwner::new(3));
@@ -230,7 +250,7 @@ fn releasing_a_reservation_surrenders_the_tokens_it_still_held() {
 
 #[test]
 fn decommitting_a_range_surrenders_the_tokens_inside_it() {
-    helios_kernel::configure_user_memory_owner_processors(crate::test_pool::single_processor_pool());
+    machine();
     let address_space = HostedAddressSpace::new();
     let range = address_space.reserve(2 * PAGE).expect("reserve");
     commit_owned(&address_space, range, MemoryOwner::new(4));
@@ -257,7 +277,7 @@ fn decommitting_a_range_surrenders_the_tokens_inside_it() {
 
 #[test]
 fn committing_over_a_swapped_page_surrenders_its_token() {
-    helios_kernel::configure_user_memory_owner_processors(crate::test_pool::single_processor_pool());
+    machine();
     let address_space = HostedAddressSpace::new();
     let range = address_space.reserve(PAGE).expect("reserve");
     commit_owned(&address_space, range, MemoryOwner::new(5));
@@ -279,7 +299,7 @@ fn committing_over_a_swapped_page_surrenders_its_token() {
 
 #[test]
 fn swapping_a_page_that_is_not_committed_is_refused() {
-    helios_kernel::configure_user_memory_owner_processors(crate::test_pool::single_processor_pool());
+    machine();
     let address_space = HostedAddressSpace::new();
     let range = address_space.reserve(PAGE).expect("reserve");
     let mut page = vec![0_u8; PAGE];
@@ -294,7 +314,7 @@ fn swapping_a_page_that_is_not_committed_is_refused() {
 
 #[test]
 fn a_page_buffer_of_the_wrong_size_is_refused() {
-    helios_kernel::configure_user_memory_owner_processors(crate::test_pool::single_processor_pool());
+    machine();
     let address_space = HostedAddressSpace::new();
     let range = address_space.reserve(PAGE).expect("reserve");
     commit_owned(&address_space, range, MemoryOwner::new(6));
@@ -304,5 +324,31 @@ fn a_page_buffer_of_the_wrong_size_is_refused() {
             .swap_out_page(range.start, token(61), &mut short)
             .is_err()
     );
+    address_space.release(range).expect("release");
+}
+
+/// The shared core takes its frame from the user pool on the way out (the
+/// host page is copied into it, then read) and again on the way back, and
+/// gives each back; a page that goes out and returns must leave the pool
+/// as it found it, or every cycle would leak a frame.
+#[test]
+fn a_swap_cycle_leaves_the_user_pool_as_it_found_it() {
+    machine();
+    let address_space = HostedAddressSpace::new();
+    let range = address_space.reserve(PAGE).expect("reserve");
+    commit_owned(&address_space, range, MemoryOwner::new(12));
+    fill(range, 0x21);
+    let before = helios_kernel::user_heap_stats().allocated_bytes;
+
+    let mut page = vec![0_u8; PAGE];
+    address_space
+        .swap_out_page(range.start, token(71), &mut page)
+        .expect("swap out");
+    address_space
+        .swap_in_page(range.start, &page)
+        .expect("swap in");
+
+    assert_eq!(helios_kernel::user_heap_stats().allocated_bytes, before);
+    check(range, 0x21);
     address_space.release(range).expect("release");
 }

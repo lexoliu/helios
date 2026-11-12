@@ -38,7 +38,8 @@ pub use dhcp::{
     DhcpOptionBuffer, DhcpOptionWriter, DhcpPacket, DhcpServerMessage, MAX_DHCP_DNS_SERVERS,
 };
 pub use dns::{
-    DNS_MAX_ADDRESS_RECORDS, DNS_PORT, DnsMessage, DnsQuestionWriter, DnsRecordType, DnsResponse,
+    DNS_MAX_ADDRESS_RECORDS, DNS_MAX_CNAME_CHAIN, DNS_PORT, DnsMessage, DnsQuery,
+    DnsQuestionWriter, DnsRecordType, DnsResponse,
 };
 pub use hash::{
     FlowHash, FlowTuple, RSS_INDIRECTION_ENTRIES, RSS_KEY_BYTES, STANDARD_RSS_KEY, flow_hash,
@@ -60,7 +61,7 @@ pub use packet::{
 };
 pub use stack::{
     DEFAULT_TCP_LISTEN_BACKLOG, DhcpLease, DnsQueryId, IcmpEchoKey, IcmpEchoReply,
-    Ipv4MulticastMembership, MAX_ICMP_ECHO_REPLIES, MAX_IPV4_MULTICAST_MEMBERSHIPS,
+    Ipv4MulticastMembership, MAX_ICMP_ECHO_EXCHANGES, MAX_IPV4_MULTICAST_MEMBERSHIPS,
     MAX_OUTBOUND_FRAMES, MAX_UDP_RX, MAX_UDP_SOCKETS, NeighborCache, NeighborEntry, NeighborState,
     OutboundBatchStatus, Route, RouteTable, RxChecksumOffload, SocketId, Stack, StackConfig,
     StackEvent, StackInstant, TcpAccept, TcpCloseOutcome, TcpConnectState, TcpConnectTerminalError,
@@ -845,6 +846,13 @@ pub enum StackError {
     /// A socket address set overlaps an existing socket.
     #[error("network socket address is already in use")]
     AddressInUse,
+    /// The TCP socket slab has no free slot.
+    ///
+    /// Closed sockets keep their slot until the close finishes, `TIME-WAIT`
+    /// included, and a listener's half-open children hold slots too, so a
+    /// caller can meet this whatever it holds itself.
+    #[error("TCP socket slab is full")]
+    TcpSocketsExhausted,
     /// A listen backlog value cannot be represented by the stack.
     #[error("TCP listen backlog is invalid")]
     InvalidListenBacklog,

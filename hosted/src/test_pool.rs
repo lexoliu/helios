@@ -15,21 +15,28 @@ use helios_kernel::{NodeRun, UserMemoryPool};
 /// Host memory the pool owns: room for a few processors' tables.
 const POOL_BYTES: usize = 16 << 20;
 
-/// A leaked one-processor pool over fresh host memory, as a test
-/// process's machine is.
-pub(crate) fn single_processor_pool() -> &'static UserMemoryPool {
+/// A one-node pool for `processors` processors over fresh host memory,
+/// primed by processor 0, as a test process's machine is. The memory is
+/// leaked, which is the life a pool's memory has; the pool itself is the
+/// caller's to leak or install.
+pub(crate) fn single_node_machine(processors: usize) -> UserMemoryPool {
     let layout = Layout::from_size_align(POOL_BYTES, POOL_BYTES).expect("a pool-sized layout");
-    // SAFETY: the layout has a non-zero size; the block is leaked, which
-    // is the life the pool's memory has.
+    // SAFETY: the layout has a non-zero size; the block is leaked.
     let start = unsafe { alloc(layout) } as usize;
     assert!(start != 0, "the host would not lend {POOL_BYTES} bytes");
-    Box::leak(Box::new(UserMemoryPool::new(
-        &SingleNode::new(1),
+    UserMemoryPool::new(
+        &SingleNode::new(processors),
         ProcessorId::new(0),
         &[NodeRun {
             start,
             end: start + POOL_BYTES,
             node: NodeId::FIRST,
         }],
-    )))
+    )
+}
+
+/// A leaked [`single_node_machine`], for a test that names a pool
+/// without installing it as the machine's.
+pub(crate) fn single_node_pool(processors: usize) -> &'static UserMemoryPool {
+    Box::leak(Box::new(single_node_machine(processors)))
 }

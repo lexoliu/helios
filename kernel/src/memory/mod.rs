@@ -77,18 +77,18 @@ pub use reservations::{
     ReservationLookup, ReservationTracker, SwapEntry, VaCursor, ranges_outside, validate_range,
 };
 pub use swap::{
-    IDLE_SWAP_AFTER, SWAP_BATCH_BYTES, SWAP_TICK, SwapDisabled, SwapFaultError, SwapHandle,
-    SwapStats, SwapVmHooks, disable_swap, install_swap, install_swap_hooks, installed_swap_handle,
-    installed_swap_hooks, swapped_token,
+    AGE_BATCH_PAGES, IDLE_SWAP_AFTER, InstalledAddressSpace, SWAP_BATCH_BYTES, SWAP_TICK,
+    SwapDisabled, SwapFaultError, SwapHandle, SwapLeafFormat, SwapSpace, SwapStats, SwapVmHooks,
+    disable_swap, install_swap, install_swap_hooks, installed_swap_handle, installed_swap_hooks,
+    swap_vm_hooks, swapped_token,
 };
 pub use user::{
     MemoryNodeStats, UserHeapStats, UserMemoryPool, allocate_user_frame_uninit_on,
     allocate_user_frame_uninit_on_node, allocate_user_frame_zeroed, allocate_user_frame_zeroed_on,
     allocate_user_run_zeroed_on, deallocate_user_frame, deallocate_user_frame_on,
-    deallocate_user_run_on, largest_servable_user_bytes, locality, user_frame_node,
-    user_heap_stats, user_node_stats,
+    deallocate_user_run_on, install_user_memory_pool, largest_servable_user_bytes, locality,
+    user_frame_node, user_heap_stats, user_node_stats,
 };
 pub(crate) use user::{
-    install_user_memory_pool, lend_user_memory_to_kernel_heap, user_memory_pool,
-    user_pool_available_bytes,
+    lend_user_memory_to_kernel_heap, user_memory_pool, user_pool_available_bytes,
 };

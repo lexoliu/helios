@@ -87,14 +87,14 @@ const VARIANT_MASK_IR_PROF: u64 = 1 << 56;
 /// toolchain.
 ///
 /// Read from the toolchain rather than guessed at: on the pinned nightly
-/// (`rust-toolchain.toml`, `nightly-2026-06-15`, `rustc -vV` reports LLVM
-/// 22.1.6) `llvm-profdata merge` writes the word `0x0100_0000_0000_000d`
-/// — version 13, with the IR-instrumentation variant bit. Thirteen is
+/// (`rust-toolchain.toml`, `nightly-2026-11-03`, `rustc -vV` reports LLVM
+/// 23.1.5) `llvm-profdata merge` writes the word `0x0100_0000_0000_000e`
+/// — version 14, with the IR-instrumentation variant bit. Fourteen is
 /// `IndexedInstrProf::ProfVersion::CurrentVersion` in LLVM's
 /// `llvm/include/llvm/ProfileData/InstrProf.h`. A toolchain bump that
 /// moves the format therefore refuses the old artifact by name instead of
 /// handing rustc a profile it reads as garbage.
-const INDEXED_PROFILE_VERSION: u64 = 13;
+const INDEXED_PROFILE_VERSION: u64 = 14;
 
 /// Bytes of an indexed profile the header check needs: the magic and the
 /// version word.

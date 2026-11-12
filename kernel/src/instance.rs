@@ -921,11 +921,12 @@ impl KernelHeapCharge {
 impl Drop for KernelHeapCharge {
     fn drop(&mut self) {
         let bytes = self.bytes;
-        let _ = self.instance.entry().kernel_bytes.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |charged| Some(charged.saturating_sub(bytes)),
-        );
+        self.instance
+            .entry()
+            .kernel_bytes
+            .update(Ordering::AcqRel, Ordering::Acquire, |charged| {
+                charged.saturating_sub(bytes)
+            });
     }
 }
 

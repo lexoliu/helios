@@ -828,7 +828,7 @@ impl UserHeapStats {
 }
 
 /// Leaks `pool` and publishes it as the machine's user pool.
-pub(crate) fn install_user_memory_pool(pool: UserMemoryPool) -> &'static UserMemoryPool {
+pub fn install_user_memory_pool(pool: UserMemoryPool) -> &'static UserMemoryPool {
     let pool: &'static UserMemoryPool = Box::leak(Box::new(pool));
     USER_MEMORY_POOL
         .compare_exchange(
