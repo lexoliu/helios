@@ -144,6 +144,7 @@ use core::sync::atomic::{AtomicUsize, Ordering, compiler_fence};
 
 use arrayvec::ArrayVec;
 use fdt::Fdt;
+use helios_firmware::{DeviceTreeNuma, ProcessorIdentities};
 use helios_hal::boot::{BootMemoryKind, BootMemoryRegion, BootReservedRanges, usable_node_regions};
 use helios_hal::cpu::{
     Cpu, GUEST_STACK_LIMIT_OFFSET, Instant, ProcessorId, Timebase, TimerInterrupt,
@@ -151,7 +152,7 @@ use helios_hal::cpu::{
 };
 use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::memory::MemoryRegion;
-use helios_hal::numa::{NumaTopology, SingleNode};
+use helios_hal::numa::NumaTopology;
 use helios_hal::serial::ByteSerial;
 use helios_hal::{DeviceInventory, DmaModel, ProcessorStartupPolicy, ProcessorTopology};
 use helios_kernel::{
@@ -671,9 +672,10 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     // allocator is primed with below.
     let initrd = initrd_range(&fdt);
     let allocator_window = allocator_window();
-    // No devicetree NUMA description is read yet: every hart and all of
-    // memory sit on one node.
-    let numa = SingleNode::new(hart_count);
+    // A tree without `numa-node-id` describes one node holding every hart
+    // and all of memory.
+    let numa = DeviceTreeNuma::new(&fdt, HartIds { harts: hart_count })
+        .unwrap_or_else(|error| panic!("FDT NUMA description refused: {error}"));
     let memory_regions = collect_memory_regions(&fdt, allocator_window.clone(), &initrd, &numa);
     let current_hart = ProcessorId::new(hart_id as u16);
     let bootstrap_processor = remember_bootstrap_hart(hart_id);
@@ -1016,6 +1018,23 @@ fn initrd_range(fdt: &Fdt<'_>) -> Range<usize> {
         "FDT /chosen initrd range {start:#x}..{end:#x} is empty or reversed"
     );
     start..end
+}
+
+/// The firmware identity of each processor. A hart's [`ProcessorId`] is its
+/// hart id (`run_hart`), and a devicetree cpu node's `reg` is the hart id
+/// too, so the mapping is the identity.
+struct HartIds {
+    harts: usize,
+}
+
+impl ProcessorIdentities for HartIds {
+    fn processor_count(&self) -> usize {
+        self.harts
+    }
+
+    fn hardware_id(&self, processor: ProcessorId) -> u64 {
+        u64::from(processor.id())
+    }
 }
 
 /// Capacity for the allocator regions: a devicetree carries one `memory`

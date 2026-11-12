@@ -12,6 +12,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use arm_gic::IntId;
+use helios_firmware::ProcessorIdentities;
 use helios_hal::boot::{
     BootFirmwareTables, BootHandoff, BootKernelImage, BootMemoryKind, BootMemoryMap,
     BootMemoryRegion, BootModule, BootModules, BootReservedRanges, FirmwareKind,
@@ -23,7 +24,7 @@ use helios_hal::cpu::{
 };
 use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
-use helios_hal::numa::SingleNode;
+use helios_hal::numa::NumaTopology;
 use helios_hal::serial::ByteSerial;
 use helios_hal::{
     DeviceInventory, DmaModel, Platform, ProcessorStartupPolicy, ProcessorTopology, align_up,
@@ -372,31 +373,7 @@ struct Aarch64PlatformState {
 
 impl Aarch64PlatformState {
     fn from_limine_mp(timebase: Timebase) -> &'static Self {
-        let response = MP_REQUEST
-            .response()
-            .unwrap_or_else(|| panic!("Limine did not provide an AArch64 MP response"));
-        let cpus = response.cpus();
-        assert!(
-            !cpus.is_empty(),
-            "Limine AArch64 MP response did not describe any CPU"
-        );
-        let bootstrap_mpidr = response.bsp_mpidr;
-        let bootstrap = cpus
-            .iter()
-            .copied()
-            .find(|cpu| cpu.mpidr == bootstrap_mpidr)
-            .unwrap_or_else(|| {
-                panic!("Limine AArch64 MP response omitted bootstrap MPIDR {bootstrap_mpidr:#x}")
-            });
-        let mut ordered = Vec::with_capacity(cpus.len());
-        ordered.push(bootstrap);
-        for &cpu in cpus {
-            if cpu.mpidr != bootstrap_mpidr {
-                ordered.push(cpu);
-            }
-        }
-        let processors = ordered
-            .into_iter()
+        let processors = limine_processors()
             .enumerate()
             .map(|(index, mp_info)| {
                 let logical_id = u16::try_from(index)
@@ -515,6 +492,82 @@ fn aarch64_processor_count() -> usize {
     processor_count
 }
 
+/// The processors Limine started, in [`ProcessorId`] order: the bootstrap
+/// processor first, then the rest in the order Limine lists them. Read
+/// straight from the MP response, so it answers before the heap exists.
+fn limine_processors() -> impl Iterator<Item = &'static MpInfo> {
+    let response = MP_REQUEST
+        .response()
+        .unwrap_or_else(|| panic!("Limine did not provide an AArch64 MP response"));
+    let cpus = response.cpus();
+    assert!(
+        !cpus.is_empty(),
+        "Limine AArch64 MP response did not describe any CPU"
+    );
+    let bootstrap_mpidr = response.bsp_mpidr;
+    let bootstrap = cpus
+        .iter()
+        .copied()
+        .find(|cpu| cpu.mpidr == bootstrap_mpidr)
+        .unwrap_or_else(|| {
+            panic!("Limine AArch64 MP response omitted bootstrap MPIDR {bootstrap_mpidr:#x}")
+        });
+    core::iter::once(bootstrap).chain(
+        cpus.iter()
+            .copied()
+            .filter(move |cpu| cpu.mpidr != bootstrap_mpidr),
+    )
+}
+
+/// Each processor's firmware identity: the affinity bits of its
+/// `MPIDR_EL1`, which is what a device tree cpu node's `reg` holds
+/// (`Documentation/devicetree/bindings/arm/cpus.yaml`). Answered from the
+/// MP response in [`limine_processors`] order, the order the processor
+/// table is later built in, because the description is read before the
+/// heap the table lives in exists.
+struct LimineProcessorIdentities;
+
+impl ProcessorIdentities for LimineProcessorIdentities {
+    fn processor_count(&self) -> usize {
+        aarch64_processor_count()
+    }
+
+    fn hardware_id(&self, processor: ProcessorId) -> u64 {
+        let index = usize::from(processor.id());
+        let entry = limine_processors().nth(index).unwrap_or_else(|| {
+            panic!("AArch64 processor {index} is beyond the Limine MP response")
+        });
+        entry.mpidr & platform::MPIDR_AFFINITY_MASK
+    }
+}
+
+/// Seeds the kernel's bootstrap allocator with Limine's usable memory,
+/// each region on the node the firmware's NUMA description places it.
+struct PrimeBootstrapAllocator<'h> {
+    handoff: &'h LimineBootHandoff,
+    physical_memory_offset: usize,
+}
+
+impl platform::NumaConsumer for PrimeBootstrapAllocator<'_> {
+    type Output = ();
+
+    fn consume<Numa: NumaTopology>(self, numa: &Numa) {
+        let reserved_ranges = boot_reserved_ranges(self.handoff);
+        let memory_regions = self.handoff.memory_map.regions().flat_map(|region| {
+            // SAFETY: Limine's usable entries are RAM nothing else owns,
+            // mapped in the higher-half direct map at
+            // `physical_memory_offset`, and the kernel image is reserved
+            // out.
+            unsafe {
+                usable_node_regions(region, &reserved_ranges, self.physical_memory_offset, numa)
+            }
+        });
+        // Limine hands control to the bootstrap processor, which the
+        // processor table lists first.
+        helios_kernel::prime_bootstrap_allocator(memory_regions, numa, ProcessorId::new(0));
+    }
+}
+
 struct Aarch64InterruptOps;
 
 impl helios_hal::critical_section::InterruptOps for Aarch64InterruptOps {
@@ -588,20 +641,15 @@ extern "C" fn aarch64_kernel_main() -> ! {
     let debug_serial = DebugSerial::map(console, physical_memory_offset, &handoff);
     debug_serial.init();
     DEBUG_SERIAL_BASE.store(debug_serial.base, Ordering::Release);
-    let processor_count = aarch64_processor_count();
-    let reserved_ranges = boot_reserved_ranges(&handoff);
-    // No firmware NUMA description is read yet: every processor and all
-    // of memory sit on one node.
-    let numa = SingleNode::new(processor_count);
-    let memory_regions = handoff.memory_map.regions().flat_map(|region| {
-        // SAFETY: Limine's usable entries are RAM nothing else owns,
-        // mapped in the higher-half direct map at `physical_memory_offset`,
-        // and the kernel image is reserved out.
-        unsafe { usable_node_regions(region, &reserved_ranges, physical_memory_offset, &numa) }
-    });
-    // Limine hands control to the bootstrap processor, which the
-    // processor table lists first.
-    helios_kernel::prime_bootstrap_allocator(memory_regions, &numa, ProcessorId::new(0));
+    tables
+        .with_numa(
+            LimineProcessorIdentities,
+            PrimeBootstrapAllocator {
+                handoff: &handoff,
+                physical_memory_offset,
+            },
+        )
+        .unwrap_or_else(|error| panic!("AArch64 NUMA discovery failed: {error}"));
     let payload = helios_kernel::BootPayload::from_boot_modules(&handoff.modules);
     // The rest of the description needs the heap: the ACPI path has to
     // interpret AML to reach a device's `_CRS`.

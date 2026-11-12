@@ -23,6 +23,8 @@
 use core::fmt;
 
 use arm_gic::{IntId, Trigger};
+use helios_firmware::{DeviceTreeNuma, FirmwareNumaError, ProcessorIdentities};
+use helios_hal::numa::{NumaTopology, SingleNode};
 use thiserror::Error;
 
 use crate::LimineBootHandoff;
@@ -179,7 +181,7 @@ impl GicDescription {
 /// Affinity bits of `MPIDR_EL1`: Aff0..Aff2 in the low word and Aff3 in
 /// bits 32..40. The MADT reports a processor's MPIDR in the same shape,
 /// but firmware is not required to zero the bits outside them.
-const MPIDR_AFFINITY_MASK: u64 = 0x0000_00ff_00ff_ffff;
+pub(crate) const MPIDR_AFFINITY_MASK: u64 = 0x0000_00ff_00ff_ffff;
 
 /// Where the description came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -276,6 +278,19 @@ pub(crate) enum PlatformError {
     DeviceTreeMissing(&'static str),
     #[error(transparent)]
     Acpi(#[from] AcpiError),
+    #[error("the device tree's NUMA description is refused: {0}")]
+    Numa(#[from] FirmwareNumaError),
+}
+
+/// What the bootstrap processor does with the machine's NUMA description.
+///
+/// Each firmware path describes locality with a type of its own and the
+/// consumer is generic over it, so [`PlatformTables::with_numa`] hands the
+/// description over instead of returning one type for both paths.
+pub(crate) trait NumaConsumer {
+    type Output;
+
+    fn consume<Numa: NumaTopology>(self, numa: &Numa) -> Self::Output;
 }
 
 /// The firmware tables Limine handed this kernel.
@@ -313,6 +328,30 @@ impl PlatformTables {
         match self {
             Self::DeviceTree(fdt) => dt::console(fdt),
             Self::Acpi(tables) => Ok(acpi::console(tables)?),
+        }
+    }
+
+    /// The machine's NUMA description, handed to `consumer`.
+    ///
+    /// `identities` maps each processor to the affinity bits of its
+    /// `MPIDR_EL1`. Neither path allocates, so this runs before the heap
+    /// exists, which is when the bootstrap allocator needs the
+    /// description: a device tree is read in place by
+    /// [`DeviceTreeNuma`], and the ACPI path describes one node.
+    pub(crate) fn with_numa<Identities, Consumer>(
+        &self,
+        identities: Identities,
+        consumer: Consumer,
+    ) -> Result<Consumer::Output, PlatformError>
+    where
+        Identities: ProcessorIdentities,
+        Consumer: NumaConsumer,
+    {
+        match self {
+            Self::DeviceTree(fdt) => Ok(consumer.consume(&DeviceTreeNuma::new(fdt, identities)?)),
+            // The SRAT/SLIT reader is not wired yet: every processor and
+            // all of memory sit on one node.
+            Self::Acpi(_) => Ok(consumer.consume(&SingleNode::new(identities.processor_count()))),
         }
     }
 

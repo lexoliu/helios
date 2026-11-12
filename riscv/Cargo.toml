@@ -20,6 +20,7 @@ riscv-rt = { version = "0.17.1", features = ["s-mode"] }
 sbi-rt = { version = "0.0.3", features = ["legacy"]}
 sbi-spec = { version = "0.0.7", default-features = false }
 spin = { version = "0.12.3", default-features = false, features = ["mutex", "once", "spin_mutex"] }
+helios-firmware.workspace = true
 helios-hal.workspace = true
 i6300esb.workspace = true
 helios-kernel = { workspace = true, default-features = false, features = ["wasmtime-bare-metal"] }

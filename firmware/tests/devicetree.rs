@@ -4,7 +4,7 @@
 use fdt::Fdt;
 use helios_firmware::{DeviceTreeNuma, FirmwareNumaError, ProcessorIdentities};
 use helios_hal::cpu::ProcessorId;
-use helios_hal::numa::{MAX_NODES, MemoryAffinity, NodeDistance, NodeId, NumaTopology};
+use helios_hal::numa::{MAX_NODES, MemoryAffinity, NodeDistance, NodeId, NumaTopology, SingleNode};
 
 const FDT_BEGIN_NODE: u32 = 1;
 const FDT_END_NODE: u32 = 2;
@@ -334,6 +334,76 @@ fn no_numa_properties_is_one_node() {
             node: NodeId::FIRST
         }]
     );
+}
+
+#[test]
+fn a_tree_without_numa_properties_answers_exactly_as_single_node() {
+    let tree = root(
+        1,
+        vec![
+            cpus(vec![cpu(0, None), cpu(1, None)]),
+            memory32(0x4000_0000, 0x1000_0000, None),
+            memory32(0x8000_0000, 0x1000_0000, None),
+        ],
+    );
+    let bytes = blob(&tree);
+    let fdt = Fdt::new(&bytes).unwrap();
+    let numa = DeviceTreeNuma::new(&fdt, Ids(vec![0, 1])).unwrap();
+    let single = SingleNode::new(2);
+    assert_eq!(numa.node_count(), single.node_count());
+    assert_eq!(numa.processor_count(), single.processor_count());
+    for processor in 0..2 {
+        let processor = ProcessorId::new(processor);
+        assert_eq!(
+            numa.processor_node(processor),
+            single.processor_node(processor)
+        );
+    }
+    assert_eq!(
+        numa.distance(NodeId::FIRST, NodeId::FIRST),
+        single.distance(NodeId::FIRST, NodeId::FIRST)
+    );
+    assert_eq!(memory_of(&numa), memory_of(&single));
+}
+
+/// The shape QEMU's `virt` board emits under `-numa`: two address cells
+/// for an MPIDR `reg`, a `cpu-map` beside the cpu nodes, and a backend
+/// that lists the bootstrap processor first.
+#[test]
+fn mpidr_keyed_cpus_beside_a_cpu_map_map_in_the_backends_order() {
+    let mpidr_cpu = |mpidr: u32, id: u32| {
+        node(&format!("cpu@{mpidr:x}"))
+            .string("device_type", "cpu")
+            .cells("reg", &[0, mpidr])
+            .cells("numa-node-id", &[id])
+    };
+    let cpu_map = node("cpu-map").child(node("socket0").child(node("cluster0")));
+    let cpus = node("cpus")
+        .cells("#address-cells", &[2])
+        .cells("#size-cells", &[0])
+        .child(mpidr_cpu(0x0, 0))
+        .child(mpidr_cpu(0x1, 0))
+        .child(mpidr_cpu(0x100, 1))
+        .child(mpidr_cpu(0x101, 1))
+        .child(cpu_map);
+    let tree = root(
+        1,
+        vec![
+            cpus,
+            memory32(0x4000_0000, 0x4000_0000, Some(0)),
+            memory32(0x8000_0000, 0x4000_0000, Some(1)),
+            distance_map(&[[0, 1, 20]]),
+        ],
+    );
+    let bytes = blob(&tree);
+    let fdt = Fdt::new(&bytes).unwrap();
+    let numa = DeviceTreeNuma::new(&fdt, Ids(vec![0x100, 0x0, 0x1, 0x101])).unwrap();
+    assert_eq!(numa.node_count(), 2);
+    let nodes: Vec<_> = (0..4)
+        .map(|processor| numa.processor_node(ProcessorId::new(processor)).index())
+        .collect();
+    assert_eq!(nodes, vec![1, 0, 0, 1]);
+    assert_eq!(numa.distance(NodeId::new(1), NodeId::new(0)).get(), 20);
 }
 
 fn refusal(tree: Node, ids: Vec<u64>) -> FirmwareNumaError {
