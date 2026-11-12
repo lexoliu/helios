@@ -27,6 +27,7 @@ jobs:
         include:
           - name: check-host
             command: just check-host
+            rust-cache: true
           - name: check-aarch64
             command: just check-target aarch64-unknown-none helios-aarch64
           - name: check-riscv
@@ -35,13 +36,15 @@ jobs:
             command: just check-target x86_64-unknown-none helios-x86
           - name: test-embedded-debugger
             command: just test-embedded-debugger
+            rust-cache: true
           # `just lint` runs these five gates back to back locally; CI
           # splits them so a lint failure names the surface it came from
-          # and each lane keeps its own build cache.
+          # and each host lane keeps its own build cache.
           - name: lint-fmt
             command: just fmt-check && just deny-check
           - name: lint-host
             command: just clippy-host && just clippy-programs
+            rust-cache: true
           - name: lint-aarch64
             command: just clippy-target aarch64-unknown-none helios-aarch64
           - name: lint-riscv
@@ -50,6 +53,7 @@ jobs:
             command: just clippy-target x86_64-unknown-none helios-x86
           - name: test-units
             command: just test-units
+            rust-cache: true
     steps:
       - uses: actions/checkout@v4
         with:
@@ -80,10 +84,17 @@ jobs:
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         working-directory: helios
         run: tools/wasi-apps/build.sh
+      # Only the host lanes nearly every pull request runs keep a Rust
+      # cache, and only a `dev` push writes it: the repository's cache
+      # quota holds these four and nothing more, and a pull request's
+      # entry is restorable from its own merge ref alone. Every other
+      # lane, workflow and action builds cold.
       - uses: Swatinem/rust-cache@v2
+        if: matrix.rust-cache
         with:
           workspaces: helios
           key: ${{ matrix.name }}
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
       - uses: astral-sh/setup-uv@v6
       - name: ${{ matrix.name }}
         working-directory: helios
@@ -125,10 +136,6 @@ jobs:
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         working-directory: helios
         run: tools/wasi-apps/build.sh
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: helios
-          key: smoke-riscv64
       - name: Build inspector
         working-directory: helios
         run: cargo build --release -p helios-inspector
@@ -442,10 +449,6 @@ jobs:
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         working-directory: helios
         run: tools/wasi-apps/build.sh
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: helios
-          key: smoke-aarch64
       - name: Build inspector
         working-directory: helios
         run: cargo build --release -p helios-inspector
@@ -611,10 +614,6 @@ jobs:
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         working-directory: helios
         run: tools/wasi-apps/build.sh
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: helios
-          key: smoke-x86-64
       - name: Build inspector
         working-directory: helios
         run: cargo build --release -p helios-inspector -p helios-desktop-text-check
@@ -1529,10 +1528,6 @@ jobs:
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         working-directory: helios
         run: tools/wasi-apps/build.sh
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: helios
-          key: bench-${{ matrix.name }}
       - name: Install inferno flamegraph renderer
         run: cargo install inferno --locked
       # The guest image, its bootfs and the inspector are built here so

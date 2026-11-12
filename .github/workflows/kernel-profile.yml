@@ -136,7 +136,6 @@ jobs:
       - uses: ./helios/.github/actions/bench-host
         with:
           checkout-path: ${{ env.CHECKOUT_PATH }}
-          rust-cache-key: kernel-profile
           network-tools: "true"
           bench-tooling: "true"
       - uses: ./helios/.github/actions/collect-kernel-profile
