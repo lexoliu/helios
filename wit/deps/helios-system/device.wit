@@ -62,6 +62,9 @@ interface device {
     /// Memory the device exposes and the processor may treat as RAM: a
     /// framebuffer, an option ROM, a prefetchable aperture.
     normal,
+    /// Memory the processor may treat as RAM but must not cache: stores
+    /// may merge and reach it in any order until a fence drains them.
+    write-combining,
   }
 
   /// One of the device's physical ranges, as the platform described it.

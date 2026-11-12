@@ -14,8 +14,8 @@ use core::pin::pin;
 use futures::channel::oneshot;
 use futures_lite::future::block_on;
 use helios_hal::display::{
-    CursorImage, DisplayDevice, DisplayError, DisplayMode, DisplayResult, FramebufferId,
-    PixelFormat, Point, Rect, ScanoutId, ScanoutInfo, ScanoutList,
+    BlobId, BlobScanout, CursorImage, DisplayDevice, DisplayError, DisplayMode, DisplayResult,
+    FramebufferId, PixelFormat, Point, Rect, ScanoutId, ScanoutInfo, ScanoutList,
 };
 use helios_hal::io::IoError;
 use helios_hal::pmm::PhysFrameRange;
@@ -25,11 +25,12 @@ use triomphe::Arc;
 use crate::buffer::Buffer;
 use crate::component::ProviderReceiver;
 use crate::device::test_hooks;
+use crate::gpu::ScanoutHold;
 use crate::process::test_caps;
 use crate::test_support::TestCpu;
 
 use super::owner::{display_channels, serve_control};
-use super::service::{ControlRequest, DisplayService, DisplayShared};
+use super::service::{ControlRequest, DisplayService, DisplayShared, SurfaceSource};
 use super::{DisplayOwnership, DisplayServiceError};
 
 /// A mode whose frame is a whole number of pages.
@@ -54,6 +55,8 @@ enum Call {
     HideCursor(ScanoutId),
     MoveCursor(ScanoutId, Point),
     Destroy(FramebufferId),
+    SetScanoutBlob(ScanoutId, BlobScanout),
+    FlushBlob(BlobId, Rect),
 }
 
 /// The receiving end of a `CreateSurface` reply.
@@ -172,6 +175,16 @@ impl DisplayDevice for FakeDisplay {
         _source: Rect,
     ) -> DisplayResult<()> {
         self.record(Call::SetScanout(scanout, framebuffer));
+        Ok(())
+    }
+
+    async fn set_scanout_blob(&self, scanout: ScanoutId, layout: BlobScanout) -> DisplayResult<()> {
+        self.record(Call::SetScanoutBlob(scanout, layout));
+        Ok(())
+    }
+
+    async fn flush_blob(&self, blob: BlobId, region: Rect) -> DisplayResult<()> {
+        self.record(Call::FlushBlob(blob, region));
         Ok(())
     }
 
@@ -391,7 +404,7 @@ fn a_surface_is_attached_when_it_is_created_and_a_present_flushes_it() {
             .control(
                 ControlRequest::Present {
                     generation,
-                    framebuffer,
+                    surface: SurfaceSource::Framebuffer(framebuffer),
                     region,
                     vsync: vsync.clone(),
                     reply,
@@ -415,6 +428,97 @@ fn a_surface_is_attached_when_it_is_created_and_a_present_flushes_it() {
             Call::SetScanout(ScanoutId::new(0), FramebufferId::new(1)),
             Call::Flush(FramebufferId::new(1), region),
         ]
+    );
+}
+
+/// A blob reaches its scanout once, through the blob scanout command, and
+/// every present after that is one flush of the blob's changed region.
+/// Releasing the claim blanks the output and destroys nothing: the blob
+/// is the gpu path's.
+#[test]
+fn a_blob_surface_is_scanned_out_once_and_each_present_flushes_the_blob() {
+    test_hooks::install();
+    let (shared, control, _cursor) = display_channels();
+    let device = FakeDisplay::new();
+    let mut ownership = claimed(&shared);
+
+    let blob = BlobId::new(7);
+    let layout = BlobScanout {
+        blob,
+        mode: SMALL,
+        format: PixelFormat::Bgrx8888,
+        offset: 0,
+        // One row of `SMALL` at four bytes a pixel, unpadded.
+        stride: SMALL.width * 4,
+    };
+    let scanout = ScanoutId::new(0);
+    let surface = SurfaceSource::Blob { blob, scanout };
+    // The gpu path's record of the blob, which the surface holds.
+    let held_blob = Arc::new(crate::gpu::BlobShared::new(
+        blob,
+        Arc::new(crate::exec::Notify::new()),
+    ));
+    let region = Rect::of(SMALL);
+    with_server(&device, &shared, &control, async {
+        let claim = ownership.claim_ref().expect("the claim is held");
+        let (generation, sender) = (claim.generation(), claim.sender());
+        let (reply, answer) = oneshot::channel();
+        sender
+            .control(
+                ControlRequest::CreateBlobSurface {
+                    generation,
+                    scanout,
+                    layout,
+                    hold: ScanoutHold::new(&held_blob),
+                    reply,
+                },
+                answer,
+            )
+            .await
+            .expect("the fake display agrees");
+
+        let vsync = Arc::new(super::SequenceSignal::new());
+        for expected in 1..=2 {
+            let (reply, answer) = oneshot::channel();
+            let token = sender
+                .control(
+                    ControlRequest::Present {
+                        generation,
+                        surface,
+                        region,
+                        vsync: vsync.clone(),
+                        reply,
+                    },
+                    answer,
+                )
+                .await
+                .expect("the fake display agrees");
+            assert_eq!(token.sequence, expected);
+        }
+        assert!(
+            held_blob.is_scanned_out(),
+            "the surface holds the blob while it shows it"
+        );
+
+        ownership.release();
+        crate::yield_now().await;
+        crate::yield_now().await;
+    });
+    assert!(
+        !held_blob.is_scanned_out(),
+        "the release lets the blob go, after blanking its scanout"
+    );
+
+    assert_eq!(
+        device.calls(),
+        alloc::vec![
+            Call::SetScanoutBlob(scanout, layout),
+            Call::FlushBlob(blob, region),
+            Call::FlushBlob(blob, region),
+            Call::HideCursor(scanout),
+            Call::Blank(scanout),
+        ],
+        "one scanout, one flush per present, and no destroy on release"
     );
 }
 
@@ -668,7 +772,7 @@ fn a_frame_buffer_the_engine_would_not_release_stays_pinned() {
             .sender()
             .control_oneway(ControlRequest::DestroySurface {
                 generation: claim.generation(),
-                framebuffer: first,
+                surface: SurfaceSource::Framebuffer(first),
             })
             .await
             .expect("the owner task is serving");

@@ -126,6 +126,23 @@ def test_alternation_is_not_defined_with_a_paired_run_or_a_missing_side(tmp_path
         )
 
 
+#: What the serial line adds to a Helios launch's host-side round trip in
+#: these fixtures; the aarch64-hvf lane's compared value leaves it out.
+SERIAL_TRANSPORT_MS = 12.5
+
+
+def timings(side: Side, value: float) -> dict:
+    """The timing fields of one iteration record whose launch took ``value``.
+
+    A Helios program launch carries the inspector's host-side round trip,
+    the launch plus the transport, and the kernel's own launch duration;
+    a Linux one carries the in-guest time alone.
+    """
+    if side in runner.HELIOS_SIDES:
+        return {"runner": "program", "elapsed_ms": value + SERIAL_TRANSPORT_MS, "launch_elapsed_ms": value}
+    return {"elapsed_ms": value}
+
+
 def write_round(tmp_path: Path, number: int, side: Side, workload: str, values: list[float]) -> None:
     out_dir = tmp_path / f"round-{number}" / runner.SIDE_OUT[side]
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -136,7 +153,7 @@ def write_round(tmp_path: Path, number: int, side: Side, workload: str, values: 
                 "type": "iteration",
                 "workload": workload,
                 "iteration": index,
-                "elapsed_ms": value,
+                **timings(side, value),
                 "metrics": {},
             }
         )

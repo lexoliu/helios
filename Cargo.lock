@@ -1862,6 +1862,7 @@ version = "0.1.0"
 dependencies = [
  "acpi",
  "arm-gic",
+ "arm-sysregs",
  "bytes",
  "critical-section",
  "fdt",
@@ -1874,6 +1875,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tracing",
  "triomphe",
+ "zeroize",
 ]
 
 [[package]]

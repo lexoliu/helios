@@ -27,6 +27,10 @@ Noise floor from `{{ report.control.workload }}` before and after the suite: {{ 
 {{ m.row(workload, sides) }}
 {% endfor %}
 
+{% for note in clock_notes(report, workloads, sides) %}
+- {{ SIDE_LABELS[note.side] }} compared on {{ CLOCK_LABELS[note.clock] if note.clock else "an unrecorded clock" }}{% if note.unlaunched %}, being no program launch: no `exec` reply carries a launch duration{% endif %}: {% for name in note.workloads %}`{{ name }}`{{ ", " if not loop.last }}{% endfor %}
+
+{% endfor %}
 {% for workload in workloads %}
 {% for side, reason in workload.failures.items() %}
 - `{{ workload.name }}` failed on {{ SIDE_LABELS[side] }}: {{ reason }}
