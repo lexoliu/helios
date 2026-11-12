@@ -4,6 +4,8 @@ extern crate alloc;
 
 pub mod bootfs;
 
+use alloc::format;
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
@@ -63,7 +65,11 @@ pub fn cwasm_target_guest_stack_limit_offset(target: &str) -> Option<i32> {
 /// Returns the ISA flags shared by host prebuilds and in-kernel compilation.
 pub fn cwasm_target_cranelift_flags(target: &str) -> &'static [&'static str] {
     if target.starts_with("aarch64-") {
-        return &["has_lse", "has_fp16"];
+        // `sign_return_address` signs the return address of every function
+        // that sets up a frame, with HINT-space instructions that do nothing
+        // on a processor that does not enforce them. `has_pauth` is not
+        // enabled: it would allow the non-HINT forms.
+        return &["has_lse", "has_fp16", "sign_return_address"];
     }
     if target.starts_with("x86_64-") {
         return &[
@@ -90,6 +96,49 @@ pub fn cwasm_target_cranelift_flags(target: &str) -> &'static [&'static str] {
         ];
     }
     &[]
+}
+
+/// The code protection the machine code of a cwasm artifact carries.
+///
+/// It is part of an artifact's compatibility: the compiler records it in the
+/// artifact's version string through [`Self::module_version`], and the kernel
+/// engine, which requires the protection [`cwasm_target_code_protection`]
+/// names for its target, refuses an artifact whose string differs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CwasmCodeProtection {
+    /// Every function that sets up a frame signs its return address and
+    /// authenticates it before returning.
+    pub return_addresses_signed: bool,
+}
+
+impl CwasmCodeProtection {
+    /// Code that carries no protection.
+    pub const NONE: Self = Self {
+        return_addresses_signed: false,
+    };
+
+    /// The version string a Wasmtime engine records in, and requires of, an
+    /// artifact with this protection, given the string it uses without one
+    /// (`wasmtime`). `None` means the engine keeps its default strategy, so
+    /// an unprotected artifact is byte-identical to one built before the
+    /// protection was recorded.
+    ///
+    /// The string is a compatibility key compared for byte equality, not a
+    /// document.
+    pub fn module_version(self, wasmtime: &str) -> Option<String> {
+        self.return_addresses_signed
+            .then(|| format!("{wasmtime}+return-address-signing"))
+    }
+}
+
+/// The code protection every Cranelift-compiled cwasm artifact for `target`
+/// carries, derived from [`cwasm_target_cranelift_flags`] so the two cannot
+/// drift apart.
+pub fn cwasm_target_code_protection(target: &str) -> CwasmCodeProtection {
+    CwasmCodeProtection {
+        return_addresses_signed: cwasm_target_cranelift_flags(target)
+            .contains(&"sign_return_address"),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -296,7 +345,66 @@ impl fmt::Display for SignatureAlgorithm {
 
 #[cfg(test)]
 mod tests {
-    use super::{GUEST_STACK_LIMIT_OFFSET, cwasm_target_guest_stack_limit_offset};
+    use super::{
+        CwasmCodeProtection, GUEST_STACK_LIMIT_OFFSET, cwasm_target_code_protection,
+        cwasm_target_cranelift_flags, cwasm_target_guest_stack_limit_offset,
+    };
+
+    #[test]
+    fn aarch64_targets_sign_return_addresses_and_others_do_not() {
+        for target in [
+            "aarch64-unknown-none",
+            "aarch64-apple-darwin",
+            "aarch64-unknown-linux-gnu",
+        ] {
+            assert_eq!(
+                cwasm_target_code_protection(target),
+                CwasmCodeProtection {
+                    return_addresses_signed: true
+                },
+                "{target}"
+            );
+        }
+        for target in [
+            "x86_64-unknown-none",
+            "x86_64-unknown-linux-gnu",
+            "riscv64gc-unknown-none-elf",
+        ] {
+            assert_eq!(
+                cwasm_target_code_protection(target),
+                CwasmCodeProtection::NONE,
+                "{target}"
+            );
+        }
+    }
+
+    /// Only the HINT-space signing flag is enabled: `has_pauth` would allow
+    /// non-HINT instructions the kernel's feature probe does not answer for,
+    /// and the B key is not the one the kernel enables.
+    #[test]
+    fn aarch64_flags_sign_with_the_hint_forms_and_key_a_only() {
+        let flags = cwasm_target_cranelift_flags("aarch64-unknown-none");
+        assert!(flags.contains(&"sign_return_address"), "{flags:?}");
+        assert!(!flags.contains(&"has_pauth"), "{flags:?}");
+        assert!(
+            !flags.contains(&"sign_return_address_with_bkey"),
+            "{flags:?}"
+        );
+        assert!(!flags.contains(&"sign_return_address_all"), "{flags:?}");
+    }
+
+    #[test]
+    fn no_protection_keeps_the_default_version_strategy() {
+        assert_eq!(CwasmCodeProtection::NONE.module_version("48"), None);
+        assert_eq!(
+            CwasmCodeProtection {
+                return_addresses_signed: true
+            }
+            .module_version("48")
+            .as_deref(),
+            Some("48+return-address-signing")
+        );
+    }
 
     /// Every bare-metal kernel target reads the processor's word; a hosted
     /// target keeps the limit in the store.

@@ -223,6 +223,8 @@ pub enum ProgramExecErrorDetail {
     CompilerAllocationFailed,
     #[error("compiler plugin thread pointer overflowed")]
     CompilerThreadPointerOverflow,
+    #[error("the compile session ended without a result")]
+    CompileSessionEnded,
     #[error("guest memory access overflowed")]
     GuestMemoryAccessOverflow,
     #[error("guest memory access is out of bounds")]
@@ -288,6 +290,7 @@ impl ProgramExecErrorDetail {
             Self::CompilerRejectedInput => "compiler plugin rejected the input",
             Self::CompilerAllocationFailed => "compiler plugin allocation failed",
             Self::CompilerThreadPointerOverflow => "compiler plugin thread pointer overflowed",
+            Self::CompileSessionEnded => "the compile session ended without a result",
             Self::GuestMemoryAccessOverflow => "guest memory access overflowed",
             Self::GuestMemoryAccessOutOfBounds => "guest memory access is out of bounds",
             Self::GuestMemoryTypeMismatch => "guest memory value has an invalid type",
