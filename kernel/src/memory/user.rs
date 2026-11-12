@@ -3,15 +3,19 @@ extern crate alloc;
 use alloc::boxed::Box;
 use core::alloc::Layout;
 use core::future::Future;
+use core::ops::Range;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
+use crossbeam_utils::CachePadded;
 use helios_hal::cpu::ProcessorId;
 use helios_hal::pmm::{
     FrameAllocError, FrameAllocStats, PhysFrame, PhysFrameAllocator, PhysFrameRange,
 };
 
 use crate::ProgramOutOfMemory;
+use crate::exec::{ProgressMark, ProgressSignal};
+use crate::io::{ChunkSource, LentChunk};
 use crate::memory::frame_pool::FramePool;
 use crate::memory::frame_slab::FrameSlabCache;
 use crate::memory::irq_safe::IrqSafeMutex;
@@ -29,6 +33,18 @@ pub struct UserMemoryPool {
     /// Frames shown to a free-page consumer. The memory is still the
     /// pool's to hand out; its contents are not.
     reported: ReportedFrames,
+    /// The lowest address and one past the highest address of the regions
+    /// [`Self::initialize`] was given: every block the pool lends lies in
+    /// between. Written once, before the pool is shared.
+    span_start: AtomicUsize,
+    span_end: AtomicUsize,
+    /// A borrower was refused a chunk and waits for memory to come back,
+    /// and nothing has come back since. Written by a refused borrower
+    /// (`want_chunk`) and cleared by the one free that wins the `swap`.
+    /// Alone on its line: every free on every processor reads it.
+    chunk_wanted: CachePadded<AtomicBool>,
+    /// Raised past a waiter's mark by the free that clears `chunk_wanted`.
+    returned_signal: ProgressSignal,
 }
 
 impl UserMemoryPool {
@@ -38,6 +54,10 @@ impl UserMemoryPool {
             frame_slab: FrameSlabCache::new(),
             total_bytes: AtomicUsize::new(0),
             reported: ReportedFrames::new(),
+            span_start: AtomicUsize::new(0),
+            span_end: AtomicUsize::new(0),
+            chunk_wanted: CachePadded::new(AtomicBool::new(false)),
+            returned_signal: ProgressSignal::new(),
         }
     }
 
@@ -49,6 +69,58 @@ impl UserMemoryPool {
         self.total_bytes.store(total, Ordering::Release);
         for &(start, end) in regions {
             self.reported.cover(start, end);
+        }
+        let start = regions.iter().map(|&(start, _)| start).min().unwrap_or(0);
+        let end = regions.iter().map(|&(_, end)| end).max().unwrap_or(0);
+        self.span_start.store(start, Ordering::Release);
+        self.span_end.store(end, Ordering::Release);
+    }
+
+    /// The kernel addresses every block the pool lends lies in.
+    pub fn span(&self) -> Range<usize> {
+        self.span_start.load(Ordering::Acquire)..self.span_end.load(Ordering::Acquire)
+    }
+
+    /// After a refused [`Self::lend_chunk`]: marks the pool wanted, so the
+    /// next free raises the return signal, and samples that signal.
+    ///
+    /// The caller lends once more and only if that is refused too parks on
+    /// [`Self::chunk_returned`] with the mark. Wait-free.
+    ///
+    /// Needs no fence, unlike an arena's `want_space`. The lend takes the
+    /// buddy lock, and on failure each frame-slab shard's lock in turn
+    /// (`allocate_raw`), and every free runs inside one of those locks
+    /// before the check of `chunk_wanted` that follows it (see
+    /// [`Self::note_returned`]). Either the free's section precedes the
+    /// lend's on that lock, and the lend sees the memory; or the lend's
+    /// section precedes the free's, the flag store precedes the lend, and
+    /// the lock's release/acquire hands it to the free, whose check then
+    /// sees it.
+    pub fn want_chunk(&self) -> ProgressMark {
+        let mark = self.returned_signal.mark();
+        self.chunk_wanted.store(true, Ordering::Relaxed);
+        mark
+    }
+
+    /// Resolves once memory came back to the pool after `mark`.
+    ///
+    /// Resolving says a lend is worth asking for again, not that it will
+    /// succeed.
+    pub fn chunk_returned(&self, mark: ProgressMark) -> impl Future<Output = ()> + Send + '_ {
+        self.returned_signal.changed(mark)
+    }
+
+    /// The gate at the end of every free: raises the return signal when a
+    /// borrower waits for memory.
+    ///
+    /// One relaxed load of a line only a refused borrower writes. Wait-free
+    /// without a waiter, and otherwise one interrupt-safe broadcast, so it
+    /// is safe in an interrupt handler on any processor.
+    fn note_returned(&self) {
+        if self.chunk_wanted.load(Ordering::Relaxed)
+            && self.chunk_wanted.swap(false, Ordering::AcqRel)
+        {
+            self.returned_signal.signal();
         }
     }
 
@@ -75,7 +147,7 @@ impl UserMemoryPool {
     /// check and the frame slab. The block's contents are unspecified:
     /// memory the pool showed to a free-page consumer may have been
     /// discarded, and a lender zeroes what it hands on.
-    pub fn lend_chunk(&self, bytes: usize) -> Option<(usize, usize)> {
+    pub(crate) fn lend_chunk(&self, bytes: usize) -> Option<(usize, usize)> {
         debug_assert!(bytes.is_power_of_two(), "a lend is one buddy block");
         let layout = Layout::from_size_align(bytes, bytes).ok()?;
         let (ptr, size) = self.allocate_raw(layout, None).ok()?;
@@ -91,7 +163,7 @@ impl UserMemoryPool {
     ///
     /// `start..end` is exactly the range the lend returned, and nothing
     /// refers to it any more.
-    pub fn take_back(&self, start: usize, end: usize) {
+    pub(crate) fn take_back(&self, start: usize, end: usize) {
         let bytes = end - start;
         debug_assert!(bytes.is_power_of_two(), "a lend is one buddy block");
         let ptr = NonNull::new(core::ptr::with_exposed_provenance_mut::<u8>(start))
@@ -319,12 +391,50 @@ impl UserMemoryPool {
                 None => self.frame_slab.deallocate(ptr, total_frames),
             };
             if cached {
+                self.note_returned();
                 return;
             }
         }
         self.heap.with(|heap| unsafe {
             heap.deallocate(ptr, buddy_allocation_size(layout));
         });
+        self.note_returned();
+    }
+}
+
+/// The user memory pool as an arena's [`ChunkSource`]: a chunk is one buddy
+/// block lent by [`UserMemoryPool::lend_chunk`] and given back by
+/// [`UserMemoryPool::take_back`].
+#[derive(Clone, Copy)]
+pub struct UserPoolChunks(&'static UserMemoryPool);
+
+impl UserPoolChunks {
+    pub const fn new(pool: &'static UserMemoryPool) -> Self {
+        Self(pool)
+    }
+}
+
+impl ChunkSource for UserPoolChunks {
+    fn lend(&self, bytes: usize) -> Option<LentChunk> {
+        let (start, end) = self.0.lend_chunk(bytes)?;
+        Some(LentChunk::new(start, end - start))
+    }
+
+    fn take_back(&self, chunk: LentChunk) {
+        self.0
+            .take_back(chunk.start(), chunk.start() + chunk.bytes());
+    }
+
+    fn span(&self) -> Range<usize> {
+        self.0.span()
+    }
+
+    fn want_chunk(&self) -> ProgressMark {
+        self.0.want_chunk()
+    }
+
+    fn chunk_returned(&self, mark: ProgressMark) -> impl Future<Output = ()> + Send + '_ {
+        self.0.chunk_returned(mark)
     }
 }
 
@@ -950,5 +1060,79 @@ mod tests {
             pool.lend_chunk(chunk_bytes).is_some(),
             "the returned block serves the next lend"
         );
+    }
+
+    #[test]
+    fn a_wanted_chunk_is_signalled_by_the_next_free_and_only_then() {
+        let pool = pool(4 * 1024 * 1024);
+        let frame = Layout::from_size_align(PhysFrame::SIZE, PhysFrame::SIZE).expect("frame");
+        let run = Layout::from_size_align(4 * PhysFrame::SIZE, PhysFrame::SIZE).expect("run");
+        let frames = [
+            pool.allocate_zeroed(frame).expect("a frame"),
+            pool.allocate_zeroed(frame).expect("a frame"),
+            pool.allocate_zeroed(frame).expect("a frame"),
+        ];
+        let blocks = [
+            pool.allocate_zeroed(run).expect("a run"),
+            pool.allocate_zeroed(run).expect("a run"),
+        ];
+
+        // Nobody wants a chunk: a free raises nothing.
+        let start = pool.returned_signal.mark();
+        pool.deallocate_bytes(frames[0], frame);
+        assert_eq!(pool.returned_signal.mark(), start, "a free with no waiter");
+
+        // One refused borrower: the next free, a slab-cached single frame,
+        // raises the signal once, and a second free finds the flag clear.
+        let mark = pool.want_chunk();
+        assert_eq!(mark, start);
+        pool.deallocate_bytes(frames[1], frame);
+        assert_eq!(
+            pool.frame_slab.cached_bytes(),
+            2 * PhysFrame::SIZE,
+            "the frames were cached by the slab, not freed to the buddy heap"
+        );
+        assert_eq!(
+            pool.returned_signal.mark().generation(),
+            mark.generation() + 1
+        );
+        pool.deallocate_bytes(frames[2], frame);
+        assert_eq!(
+            pool.returned_signal.mark().generation(),
+            mark.generation() + 1,
+            "one signal per wait"
+        );
+
+        // The same for a free that goes to the buddy heap.
+        let mark = pool.want_chunk();
+        pool.deallocate_bytes(blocks[0], run);
+        assert_eq!(
+            pool.returned_signal.mark().generation(),
+            mark.generation() + 1
+        );
+        pool.deallocate_bytes(blocks[1], run);
+        assert_eq!(
+            pool.returned_signal.mark().generation(),
+            mark.generation() + 1
+        );
+    }
+
+    #[test]
+    fn the_pool_serves_as_an_arenas_chunk_source() {
+        let pool: &'static UserMemoryPool = Box::leak(Box::new(pool(4 * 1024 * 1024)));
+        let source = UserPoolChunks::new(pool);
+        let chunk_bytes = 64 * 1024;
+        let span = source.span();
+        let chunk = source.lend(chunk_bytes).expect("the pool has room");
+        assert_eq!(chunk.bytes(), chunk_bytes);
+        assert_eq!(chunk.start() % chunk_bytes, 0);
+        assert!(
+            span.contains(&chunk.start()) && span.contains(&(chunk.start() + chunk_bytes - 1)),
+            "a lent chunk lies inside the span {span:x?}"
+        );
+        let mark = source.want_chunk();
+        source.take_back(chunk);
+        block_on(source.chunk_returned(mark));
+        assert!(source.lend(chunk_bytes).is_some());
     }
 }

@@ -30,7 +30,10 @@ pub use console::RecordingConsole;
 pub use debug_serial::{
     DebugConsole, DebugSerialAccess, DebugSerialInterrupt, DebugSerialWriter, read_debug_serial,
 };
-pub use dma::{ArenaBuffer, ArenaStats, ChunkClass, ChunkSource, DmaArena, LentChunk};
+pub use dma::{
+    ArenaBuffer, ArenaStats, ChunkClass, ChunkDomain, ChunkGrowth, ChunkSource, DmaArena,
+    DmaArenas, Elastic, Fixed, GrowthDemand, LentChunk,
+};
 pub use interrupts::{
     ExternalInterruptHandler, ExternalInterruptRoutes, MAX_BLOCK_DEVICES, MAX_DEVICE_INTERRUPTS,
     MAX_INPUT_DEVICES, MAX_NETWORK_INTERRUPTS, wake_queue_owners,

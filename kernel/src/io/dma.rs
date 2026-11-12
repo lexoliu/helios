@@ -10,7 +10,7 @@
 //! A device can write any page its domain maps, at any time, freed pages
 //! included. A free list threaded through freed pages would let a faulty
 //! device model redirect the allocator. Everything the allocator reads to
-//! decide anything (the bitmaps, the state words, the window table) is on
+//! decide anything (the bitmaps, the state words, the chunk map) is on
 //! the kernel heap, so a device that scribbles on its own free pages
 //! corrupts bytes the next [`DmaArena::allocate`] zeroes anyway.
 //!
@@ -23,14 +23,37 @@
 //! | free (the drop of an [`ArenaBuffer`]) | any processor, task context or interrupt handler | No lock. Atomics of the buffer's own chunk, then a `SeqCst` fence and a relaxed load of the arena's `starved` flag. Only while an allocator is starved, one `swap` of that flag, and its winner raises the space signal: one IRQ-safe broadcast per starvation episode. |
 //! | [`DmaArena::want_space`] | task context, any processor | Wait-free: samples the space signal, stores `starved`, `SeqCst` fence. |
 //! | [`DmaArena::space_changed`], [`DmaArena::space_mark`], [`DmaArena::short_of_space`] | task context, any processor | Lock-free: an acquire load, and for `space_changed` a park on the space signal. |
-//! | [`DmaArena::device_range`] | task context, any processor | Lock-free: an Acquire load of the window table, a hash, and a short probe. |
-//! | [`DmaArena::adopt`] | task context | The arena's `grow` async mutex: the only writer of the window table and of the chunk headers. |
+//! | [`DmaArena::device_range`] | task context, any processor | Lock-free: two Acquire loads, the chunk map's root and one leaf entry. |
+//! | growth inside an allocation | the allocating task, any processor | `grow.try_lock()`: when another task holds it the allocation answers [`DmaError::Replenishing`]. Under the guard: the source's lend (the pool's IRQ-safe lock), [`ChunkDomain::map`] (no arena lock), and publication by Release stores. No await is held. |
+//! | [`DmaArena::reserve`] | task context | The arena's `grow` async mutex, which is the only writer of the chunk map and of the chunk headers. |
+//! | [`DmaArena::retire_empty`] | the maintenance task | `grow.lock().await`; a `swap` of each empty-set word (AcqRel); a CAS of the chunk's state word (Acquire); the chunk map store (Release); [`ChunkDomain::unmap`]; the source's take-back (the pool's IRQ-safe lock). No await inside the guard. |
+//! | release of `grow` | whoever held it | The gated wake: the lock is released, then a `SeqCst` fence, a relaxed load of `starved`, and the `swap` winner raises the space signal. An allocation whose own lend the source refused releases without it: the wake would only reach that allocator, whose own `want_space` set the flag, and consume the flag it is about to park on. |
+//! | a refused lend inside an allocation | the allocating task | A Release `fetch_or` of the class's bit in `refused`, then the growth policy's kick ([`ChunkGrowth::refused`], one interrupt-safe signal for [`Elastic`]). |
+//! | [`DmaArenas::grow_refused`] | the maintenance task | [`ChunkSource::want_chunk`] first (arm), then for each arena that has a bit set: `grow.lock().await`, an AcqRel `swap` of `refused`, one growth per set class. The pass samples the demand signal ([`DmaArenas::demand_mark`]) before it reads the bits. |
 //!
 //! No interrupt handler allocates: every handler that touches DMA memory
 //! only frees it. A buffer holds a pointer to its chunk header and nothing
 //! else of the arena, so its drop cannot reach a lock. The header holds a
 //! pointer to the arena's [`SpaceWaiters`], which is all the drop reaches
 //! beyond its own chunk.
+//!
+//! # Growth and retirement
+//!
+//! A [`ChunkGrowth`] policy says which classes an allocation that finds no
+//! room grows by lending a chunk ([`Elastic`] grows all of them, [`Fixed`]
+//! only [`ChunkClass::Resident`]). A chunk is published in this order: the
+//! domain maps it, its header is written, its chunk map entry is stored
+//! (Release), and its state word is stored (Release) with the class and a
+//! count of zero, which is what lets the first allocator enter it. A chunk
+//! with no page in use is noted in the empty set by the free that emptied
+//! it; [`DmaArena::retire_empty`], which only an [`Elastic`] arena has,
+//! turns a noted chunk into a retired one by a CAS of its state word from
+//! "this class, no pages" to `RETIRING`, then removes its map entry, unmaps
+//! it and gives it back to the source. The CAS and [`Chunk::enter`] are on
+//! the same word, so exactly one of an allocator and a retirement wins a
+//! chunk. The header of a retired chunk is reused by a later publication
+//! and its class is part of the state word, so an allocator that read the
+//! chunk before it was reused for another class fails its CAS.
 //!
 //! # Waiting for space
 //!
@@ -55,15 +78,21 @@
 //! processors that allocate from the chunk (usually one, through its hint)
 //! and by whichever processor frees into it. Each processor's allocation
 //! hints sit on a line of their own and are written only by tasks running
-//! on that processor. The chunk count is written only under `grow`.
+//! on that processor. The published chunk count and the growth counters
+//! share one line and are written only under `grow`, by whichever task
+//! holds it. A chunk map leaf is written only under `grow` too, and read
+//! by every processor that resolves an address.
 
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::alloc::Layout;
 use core::fmt;
 use core::future::Future;
 use core::mem::ManuallyDrop;
+use core::ops::{Deref, DerefMut, Range};
 use core::ptr::{self, NonNull};
 use core::sync::atomic::{
     AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence,
@@ -72,6 +101,7 @@ use core::sync::atomic::{
 use crossbeam_utils::CachePadded;
 use helios_hal::cpu::current_processor;
 use helios_hal::dma::{DeviceAddress, DmaBuffer, DmaError, DmaSpaceMark};
+use helios_hal::iommu::DmaAccess;
 use helios_hal::pmm::PhysFrame;
 
 use crate::exec::{Mutex, MutexGuard, ProgressMark, ProgressSignal};
@@ -92,32 +122,27 @@ const SEGMENT_COUNT: usize = 16;
 
 const MAX_CHUNKS: usize = FIRST_SEGMENT_CHUNKS * ((1 << SEGMENT_COUNT) - 1);
 
-/// Slots in a new window table.
-const INITIAL_WINDOW_SLOTS: usize = 16;
-
-/// `2^64` divided by the golden ratio: the multiplier of Fibonacci hashing
-/// (Knuth, TAOCP vol. 3, 6.4), which spreads consecutive chunk numbers
-/// across the table.
-const FIBONACCI_MULTIPLIER: u64 = 0x9E37_79B9_7F4A_7C15;
+/// Chunks one leaf of the chunk map describes.
+const LEAF_CHUNKS: usize = 512;
 
 /// The pages in use in a chunk's state word.
 const COUNT_MASK: u64 = u32::MAX as u64;
 
-/// The chunk is being emptied for reclaim: nothing new is allocated from
-/// it.
-const DRAINING: u64 = 1 << 32;
-
 /// The chunk is being retired: it is empty and nothing may enter it.
 const RETIRING: u64 = 1 << 33;
 
-/// The flags that refuse an allocation.
-const REFUSING: u64 = DRAINING | RETIRING;
+/// Where the chunk's [`ChunkClass`] index sits in its state word.
+const CLASS_SHIFT: u32 = 34;
+
+/// The class bits of a chunk's state word.
+const CLASS_MASK: u64 = 0b11 << CLASS_SHIFT;
 
 /// A block of memory lent to an arena.
 ///
-/// `start` is the kernel address of the first byte, which is also the
-/// block's physical address: the key the arena's window table is indexed
-/// by.
+/// `start` is the kernel address of the first byte: the key the arena's
+/// chunk map is indexed by. It is not necessarily the block's physical
+/// address, because a backend may reach RAM through an offset map; the
+/// [`ChunkDomain`] turns it into whatever address its device needs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LentChunk {
     start: usize,
@@ -145,6 +170,122 @@ pub trait ChunkSource: Send + Sync + 'static {
 
     /// Gives a chunk back. Its pages are free and no domain maps it.
     fn take_back(&self, chunk: LentChunk);
+
+    /// The kernel addresses every chunk this source lends lies in.
+    ///
+    /// Fixed for the life of the source: an arena sizes its chunk map from
+    /// it.
+    fn span(&self) -> Range<usize>;
+
+    /// After a refused lend: marks the source wanted, and samples its
+    /// return signal.
+    ///
+    /// The caller lends once more before it parks on
+    /// [`ChunkSource::chunk_returned`] with the mark (AGENTS.md §4: arm,
+    /// then test, then park). The source raises the signal for the next
+    /// chunk to come back after the mark, whichever of its borrowers gave
+    /// it back.
+    fn want_chunk(&self) -> ProgressMark;
+
+    /// Resolves once memory came back to the source after `mark`.
+    ///
+    /// Resolving says a lend is worth asking for again, not that it will
+    /// succeed.
+    fn chunk_returned(&self, mark: ProgressMark) -> impl Future<Output = ()> + Send + '_;
+}
+
+/// How one device reaches a chunk.
+///
+/// Called only by the holder of an arena's `grow` guard, so a domain's
+/// calls for one arena never overlap.
+pub trait ChunkDomain: Send + Sync + 'static {
+    /// The device address of `chunk`'s first byte, which is page aligned,
+    /// reachable with `access` rights.
+    ///
+    /// Called before the chunk is published; a refusal gives the chunk
+    /// back to its source.
+    fn map(&self, chunk: LentChunk, access: DmaAccess) -> Result<DeviceAddress, DmaError>;
+
+    /// The device stops reaching `chunk`, which `device` addressed.
+    ///
+    /// Called after the chunk's map entry left the chunk map and before
+    /// the chunk goes back to the source. A refusal leaves the chunk with
+    /// the arena for good, because the device may still reach it.
+    fn unmap(&self, chunk: LentChunk, device: DeviceAddress) -> Result<(), DmaError>;
+}
+
+/// Which allocations an arena answers by lending a chunk.
+pub trait ChunkGrowth: Send + Sync + 'static {
+    /// Whether an allocation of `class` that finds no room lends a chunk.
+    fn grows(&self, class: ChunkClass) -> bool;
+
+    /// The source refused a lend that an allocation asked for: wake
+    /// whoever retries growth.
+    ///
+    /// Called by the allocating task after it set the arena's `refused`
+    /// bit. Wait-free and interrupt-safe.
+    fn refused(&self);
+}
+
+/// What wakes the maintenance pass when an allocation was refused a
+/// chunk. One per [`DmaArenas`], shared by its arenas.
+pub struct GrowthDemand {
+    /// Raised by an allocator after it set its arena's `refused` bit.
+    kick: ProgressSignal,
+}
+
+impl GrowthDemand {
+    pub const fn new() -> Self {
+        Self {
+            kick: ProgressSignal::new(),
+        }
+    }
+}
+
+impl Default for GrowthDemand {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Grows every class. The maintenance pass retires its empty chunks and
+/// retries the growth a refusal left undone.
+///
+/// For the network, host-share and control devices.
+#[derive(Clone)]
+pub struct Elastic(Arc<GrowthDemand>);
+
+impl Elastic {
+    pub fn new(demand: Arc<GrowthDemand>) -> Self {
+        Self(demand)
+    }
+}
+
+impl ChunkGrowth for Elastic {
+    fn grows(&self, _class: ChunkClass) -> bool {
+        true
+    }
+
+    fn refused(&self) {
+        self.0.kick.signal();
+    }
+}
+
+/// Grows [`ChunkClass::Resident`] only. A request class is filled by
+/// [`DmaArena::reserve`] alone and its chunks never retire.
+///
+/// For disks, whose request memory is derived from the device. A refused
+/// resident growth happens at bring-up and is fatal to the driver, and
+/// nobody retries a fixed arena's growth, so there is nothing to wake.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Fixed;
+
+impl ChunkGrowth for Fixed {
+    fn grows(&self, class: ChunkClass) -> bool {
+        class == ChunkClass::Resident
+    }
+
+    fn refused(&self) {}
 }
 
 /// What a chunk's pages may be used for, and so which allocations are
@@ -162,6 +303,8 @@ pub enum ChunkClass {
 impl ChunkClass {
     const COUNT: usize = 3;
 
+    const ALL: [Self; Self::COUNT] = [Self::Resident, Self::Read, Self::ReadWrite];
+
     const fn index(self) -> usize {
         match self {
             Self::Resident => 0,
@@ -169,13 +312,38 @@ impl ChunkClass {
             Self::ReadWrite => 2,
         }
     }
+
+    /// The class in its place in a chunk's state word.
+    const fn state_bits(self) -> u64 {
+        (self.index() as u64) << CLASS_SHIFT
+    }
+
+    /// The class a state word holds.
+    const fn of_state(state: u64) -> Self {
+        match (state & CLASS_MASK) >> CLASS_SHIFT {
+            0 => Self::Resident,
+            1 => Self::Read,
+            _ => Self::ReadWrite,
+        }
+    }
+
+    /// What the device may do with a chunk of this class. A read-only
+    /// resident class does not exist yet.
+    const fn access(self) -> DmaAccess {
+        match self {
+            Self::Read => DmaAccess::READ,
+            Self::Resident | Self::ReadWrite => DmaAccess::READ.union(DmaAccess::WRITE),
+        }
+    }
 }
 
 /// A snapshot of an arena's occupancy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ArenaStats {
-    /// Chunks the arena holds.
+    /// Live chunks the arena holds: published and not retired.
     pub chunks: usize,
+    /// The live chunks of each class, indexed Resident, Read, ReadWrite.
+    pub chunks_by_class: [usize; ChunkClass::COUNT],
     /// Pages in all of them.
     pub pages: usize,
     /// Pages handed out and not yet freed.
@@ -185,6 +353,10 @@ pub struct ArenaStats {
     /// Chunks recorded in the empty set. Every chunk with no page in use
     /// is in it; one that has been re-entered since may be too.
     pub noted_empty_chunks: usize,
+    /// Chunks published since the arena was built.
+    pub grown: u64,
+    /// Chunks given back to the source since the arena was built.
+    pub returned: u64,
 }
 
 /// What an allocator refused for space waits on, and what a free checks.
@@ -201,10 +373,35 @@ struct SpaceWaiters {
     space: ProgressSignal,
 }
 
+impl SpaceWaiters {
+    /// Raises the space signal when an allocator is starved.
+    ///
+    /// Called after the caller's update that an allocator may be waiting
+    /// for: a free's bitmap and count, or the release of `grow`. The fence
+    /// orders that update before the load of `starved`, and pairs with the
+    /// fence in [`DmaArena::want_space`]: either this load sees `starved`,
+    /// or the waiter's second attempt sees the update. The `swap` makes
+    /// one caller per starvation episode the signaller, and happens before
+    /// the generation moves, so a waiter that still sees the stale flag
+    /// parks on a mark the increment then passes.
+    ///
+    /// Wait-free without a starved allocator, and otherwise one
+    /// interrupt-safe broadcast; safe in an interrupt handler on any
+    /// processor.
+    fn wake_if_starved(&self) {
+        fence(Ordering::SeqCst);
+        if self.starved.load(Ordering::Relaxed) && self.starved.swap(false, Ordering::AcqRel) {
+            self.space.signal();
+        }
+    }
+}
+
 /// One chunk's out-of-band record, type-stable for the life of the arena.
 ///
-/// The state word holds the pages in use in its low 32 bits and the
-/// `DRAINING` and `RETIRING` flags above them.
+/// The state word holds the pages in use in its low 32 bits, the
+/// `RETIRING` flag above them, and the chunk's [`ChunkClass`] in bits 34
+/// and 35. A header is reused by a later chunk, so a reader that expects a
+/// class compares it in the same CAS that checks the flag and the count.
 struct Chunk {
     state: CachePadded<AtomicU64>,
     /// One bit per page. The bits past the chunk's last page are set for
@@ -216,8 +413,6 @@ struct Chunk {
     base: AtomicUsize,
     /// The device's address of the first byte. Written like `base`.
     device: AtomicU64,
-    /// The index of the chunk's [`ChunkClass`]. Written like `base`.
-    class: AtomicU8,
     /// The word of the arena's empty set holding this chunk's bit.
     empty_word: NonNull<AtomicU64>,
     empty_bit: u64,
@@ -248,7 +443,6 @@ impl Chunk {
             pages: pages as u32,
             base: AtomicUsize::new(0),
             device: AtomicU64::new(0),
-            class: AtomicU8::new(0),
             empty_word,
             empty_bit,
             waiters,
@@ -256,11 +450,13 @@ impl Chunk {
     }
 
     /// Reserves `pages` of the chunk's capacity, or refuses when the chunk
-    /// is draining, retiring or cannot hold them.
-    fn enter(&self, pages: usize) -> bool {
+    /// is retiring, is not of the class `class_bits` holds, or cannot hold
+    /// them.
+    fn enter(&self, pages: usize, class_bits: u64) -> bool {
         let mut state = self.state.load(Ordering::Relaxed);
         loop {
-            if state & REFUSING != 0 || (state & COUNT_MASK) as usize + pages > self.pages as usize
+            if state & (RETIRING | CLASS_MASK) != class_bits
+                || (state & COUNT_MASK) as usize + pages > self.pages as usize
             {
                 return false;
             }
@@ -294,26 +490,12 @@ impl Chunk {
 
     /// Raises the arena's space signal when an allocator is starved.
     ///
-    /// Called after the free's bitmap and count updates. The fence orders
-    /// them before the load of `starved`, and pairs with the fence in
-    /// [`DmaArena::want_space`]: either this load sees `starved`, or the
-    /// waiter's second allocation sees the freed pages. The `swap` makes
-    /// one free per starvation episode the signaller, and happens before
-    /// the generation moves, so a waiter that still sees the stale flag
-    /// parks on a mark the increment then passes.
-    ///
-    /// Wait-free without a starved allocator, and otherwise one
-    /// interrupt-safe broadcast; safe in an interrupt handler on any
-    /// processor.
+    /// Called after the free's bitmap and count updates; see
+    /// [`SpaceWaiters::wake_if_starved`] for the protocol.
     fn wake_starved(&self) {
-        fence(Ordering::SeqCst);
         // SAFETY: the arena that owns the waiters outlives every live
         // page: it panics, leaking them, otherwise.
-        let waiters = unsafe { self.waiters.as_ref() };
-        if waiters.starved.load(Ordering::Relaxed) && waiters.starved.swap(false, Ordering::AcqRel)
-        {
-            waiters.space.signal();
-        }
+        unsafe { self.waiters.as_ref() }.wake_if_starved();
     }
 
     fn note_empty(&self) {
@@ -489,134 +671,178 @@ fn locate(slot: usize) -> (usize, usize) {
     (segment, slot - FIRST_SEGMENT_CHUNKS * ((1 << segment) - 1))
 }
 
-/// One entry of the window table.
-struct WindowSlot {
-    /// The chunk number, or `0` for an empty slot. A chunk is aligned to
-    /// its own size and is never at address zero, so its number is never
-    /// `0`.
-    key: AtomicUsize,
-    device: AtomicU64,
+/// What a task holds while it is the arena's only writer of the chunk map,
+/// the chunk headers and the retired-slot list. Dropping it releases the
+/// lock and then raises the space signal when an allocator is starved:
+/// whoever was refused with [`DmaError::Replenishing`] while it was held
+/// asks again, whatever the holder did.
+struct GrowGuard<'a> {
+    state: ManuallyDrop<MutexGuard<'a, GrowState>>,
+    waiters: &'a SpaceWaiters,
 }
 
-/// One open-addressed table of chunk windows. A table is filled and then
-/// replaced by a larger one; the replaced table is kept, so a reader that
-/// loaded it keeps a valid view.
-struct WindowTable {
-    slots: Box<[WindowSlot]>,
-    entries: AtomicUsize,
-    /// The table this one replaced, owned so it outlives every reader.
-    _previous: Option<Box<WindowTable>>,
+/// What `grow` guards besides the right to write.
+struct GrowState {
+    /// Slots of retired chunks, whose headers the next publication reuses.
+    retired_slots: Vec<u32>,
 }
 
-impl WindowTable {
-    fn new(slots: usize) -> Self {
-        debug_assert!(slots.is_power_of_two());
-        Self {
-            slots: (0..slots)
-                .map(|_| WindowSlot {
-                    key: AtomicUsize::new(0),
-                    device: AtomicU64::new(0),
-                })
-                .collect(),
-            entries: AtomicUsize::new(0),
-            _previous: None,
-        }
-    }
+impl Deref for GrowGuard<'_> {
+    type Target = GrowState;
 
-    fn first_probe(&self, key: usize) -> usize {
-        let shift = u64::BITS - self.slots.len().ilog2();
-        ((key as u64).wrapping_mul(FIBONACCI_MULTIPLIER) >> shift) as usize
-    }
-
-    /// Records a window. Only the table's single writer calls this, and
-    /// the table has a free slot because it is never more than half full.
-    fn place(&self, key: usize, device: u64) {
-        let mask = self.slots.len() - 1;
-        let mut at = self.first_probe(key);
-        while self.slots[at].key.load(Ordering::Relaxed) != 0 {
-            at = (at + 1) & mask;
-        }
-        let slot = &self.slots[at];
-        slot.device.store(device, Ordering::Relaxed);
-        slot.key.store(key, Ordering::Release);
-        self.entries.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn lookup(&self, key: usize) -> Option<u64> {
-        let mask = self.slots.len() - 1;
-        let mut at = self.first_probe(key);
-        loop {
-            let slot = &self.slots[at];
-            match slot.key.load(Ordering::Acquire) {
-                found if found == key => return Some(slot.device.load(Ordering::Relaxed)),
-                0 => return None,
-                _ => at = (at + 1) & mask,
-            }
-        }
+    fn deref(&self) -> &GrowState {
+        &self.state
     }
 }
 
-/// Chunk number to the device's address of the chunk, with lock-free
-/// readers and a single writer.
-///
-/// A reader loads the current table once. The chunk it looks for was
-/// inserted before the buffer it holds a slice of was allocated, so any
-/// table it can load holds that chunk. A doubling therefore never needs to
-/// wait for readers: the doubled table is complete before it is published
-/// and the old ones are kept until the arena drops. Their sizes form a
-/// geometric series, so together they take at most as much as the final
-/// table.
-struct WindowTables {
-    current: AtomicPtr<WindowTable>,
-}
-
-impl WindowTables {
-    fn new() -> Self {
-        Self {
-            current: AtomicPtr::new(Box::into_raw(Box::new(WindowTable::new(
-                INITIAL_WINDOW_SLOTS,
-            )))),
-        }
-    }
-
-    fn lookup(&self, key: usize) -> Option<u64> {
-        // SAFETY: the pointer is always a live table: a replaced table is
-        // owned by its replacement and nothing is freed before `drop`.
-        unsafe { &*self.current.load(Ordering::Acquire) }.lookup(key)
-    }
-
-    /// Inserts a window, doubling the table first when it would pass half
-    /// full. The `grow` guard makes the caller the only writer.
-    fn insert(&self, _grow: &MutexGuard<'_, ()>, key: usize, device: u64) {
-        let current = self.current.load(Ordering::Relaxed);
-        // SAFETY: as in `lookup`.
-        let table = unsafe { &*current };
-        if (table.entries.load(Ordering::Relaxed) + 1) * 2 <= table.slots.len() {
-            table.place(key, device);
-            return;
-        }
-        let mut doubled = WindowTable::new(table.slots.len() * 2);
-        for slot in table.slots.iter() {
-            let key = slot.key.load(Ordering::Relaxed);
-            if key != 0 {
-                doubled.place(key, slot.device.load(Ordering::Relaxed));
-            }
-        }
-        doubled.place(key, device);
-        // SAFETY: `current` came from `Box::into_raw` and is replaced
-        // below, so the doubled table takes over its ownership. The old
-        // table does not move: it stays in its own allocation.
-        doubled._previous = Some(unsafe { Box::from_raw(current) });
-        self.current
-            .store(Box::into_raw(Box::new(doubled)), Ordering::Release);
+impl DerefMut for GrowGuard<'_> {
+    fn deref_mut(&mut self) -> &mut GrowState {
+        &mut self.state
     }
 }
 
-impl Drop for WindowTables {
+impl GrowGuard<'_> {
+    /// Releases the lock without the wake, for an allocation whose own
+    /// growth the source refused.
+    ///
+    /// The wake would only reach the allocator itself: it set `starved`
+    /// (through [`DmaArena::want_space`]) before this attempt, and its
+    /// release would consume the flag and raise the signal past the mark
+    /// the allocator is about to park on, so it would never park. Whoever
+    /// was refused with [`DmaError::Replenishing`] meanwhile is woken by
+    /// the release that follows the retry the `refused` bit and the kick
+    /// start, or by a free.
+    fn release_silently(self) {
+        let mut guard = ManuallyDrop::new(self);
+        // SAFETY: the guard is never used or dropped again, so the lock
+        // guard is dropped exactly once, here.
+        unsafe { ManuallyDrop::drop(&mut guard.state) };
+    }
+}
+
+impl Drop for GrowGuard<'_> {
     fn drop(&mut self) {
-        // SAFETY: the pointer came from `Box::into_raw` and `&mut self`
-        // excludes every reader.
-        drop(unsafe { Box::from_raw(*self.current.get_mut()) });
+        // SAFETY: the lock guard is dropped exactly once, here, and not
+        // used again. It goes first: a waiter this wake releases asks for
+        // the lock at once, and would find it held and park again.
+        unsafe { ManuallyDrop::drop(&mut self.state) };
+        self.waiters.wake_if_starved();
+    }
+}
+
+/// One leaf of the chunk map: the entries of [`LEAF_CHUNKS`] consecutive
+/// chunk numbers.
+struct Leaf {
+    /// The chunk's device address with bit 0 set, or `0` for no chunk.
+    /// A chunk's device address is page aligned, so bit 0 is free.
+    entries: [AtomicU64; LEAF_CHUNKS],
+}
+
+/// The kernel address of a chunk to the device's address of it, with
+/// lock-free readers and a single writer.
+///
+/// A two-level direct map over the chunk number relative to the source's
+/// span. The root is a fixed array sized from the span at construction. A
+/// leaf is allocated under `grow` and published (Release) into the root,
+/// and is freed only when the arena drops, so a reader never meets a freed
+/// leaf. Removing a chunk is one store, and the memory is bounded by the
+/// span, not by how often chunks come and go.
+struct ChunkMap {
+    chunk_bytes: usize,
+    /// The chunk number of the span's first byte.
+    first: usize,
+    root: Box<[AtomicPtr<Leaf>]>,
+}
+
+impl ChunkMap {
+    fn new(span: Range<usize>, chunk_bytes: usize) -> Self {
+        assert!(
+            span.start < span.end,
+            "a chunk source's span {span:x?} is empty"
+        );
+        let first = span.start / chunk_bytes;
+        let last = (span.end - 1) / chunk_bytes;
+        Self {
+            chunk_bytes,
+            first,
+            root: (0..(last - first) / LEAF_CHUNKS + 1)
+                .map(|_| AtomicPtr::new(ptr::null_mut()))
+                .collect(),
+        }
+    }
+
+    /// The leaf and the entry of the chunk `address` lies in, or `None`
+    /// for an address outside the span.
+    fn position(&self, address: usize) -> Option<(usize, usize)> {
+        let number = (address / self.chunk_bytes).checked_sub(self.first)?;
+        let leaf = number / LEAF_CHUNKS;
+        (leaf < self.root.len()).then_some((leaf, number % LEAF_CHUNKS))
+    }
+
+    /// The device's address of the first byte of the chunk `address` lies
+    /// in.
+    fn lookup(&self, address: usize) -> Option<u64> {
+        let (leaf, entry) = self.position(address)?;
+        let leaf = self.root[leaf].load(Ordering::Acquire);
+        if leaf.is_null() {
+            return None;
+        }
+        // SAFETY: a published leaf is live until the arena drops.
+        let entry = unsafe { &*leaf }.entries[entry].load(Ordering::Acquire);
+        (entry != 0).then_some(entry & !1)
+    }
+
+    /// Records the chunk at `address`, allocating its leaf first when it
+    /// is the first chunk of its leaf.
+    fn insert(&self, _grow: &GrowGuard<'_>, address: usize, device: u64) {
+        let (leaf, entry) = self
+            .position(address)
+            .unwrap_or_else(|| panic!("a chunk at {address:#x} lies outside its source's span"));
+        debug_assert!(
+            device & 1 == 0,
+            "a chunk's device address {device:#x} is not page aligned"
+        );
+        let mut at = self.root[leaf].load(Ordering::Relaxed);
+        if at.is_null() {
+            at = Box::into_raw(Box::new(Leaf {
+                entries: core::array::from_fn(|_| AtomicU64::new(0)),
+            }));
+            self.root[leaf].store(at, Ordering::Release);
+        }
+        // SAFETY: the leaf is live until the arena drops.
+        let slot = &unsafe { &*at }.entries[entry];
+        debug_assert!(
+            slot.load(Ordering::Relaxed) == 0,
+            "the chunk at {address:#x} is already in the chunk map"
+        );
+        slot.store(device | 1, Ordering::Release);
+    }
+
+    /// Forgets the chunk at `address`.
+    fn remove(&self, _grow: &GrowGuard<'_>, address: usize) {
+        let (leaf, entry) = self
+            .position(address)
+            .unwrap_or_else(|| panic!("a chunk at {address:#x} lies outside its source's span"));
+        let leaf = self.root[leaf].load(Ordering::Relaxed);
+        assert!(
+            !leaf.is_null(),
+            "the chunk at {address:#x} was never in the chunk map"
+        );
+        // SAFETY: the leaf is live until the arena drops.
+        unsafe { &*leaf }.entries[entry].store(0, Ordering::Release);
+    }
+}
+
+impl Drop for ChunkMap {
+    fn drop(&mut self) {
+        for leaf in &mut self.root {
+            let leaf = *leaf.get_mut();
+            if !leaf.is_null() {
+                // SAFETY: the pointer came from `Box::into_raw` in
+                // `insert`, and `&mut self` excludes every reader.
+                drop(unsafe { Box::from_raw(leaf) });
+            }
+        }
     }
 }
 
@@ -629,37 +855,77 @@ enum Fill {
     Unspecified,
 }
 
+/// What `grow` writes besides the chunk map and the headers: the chunk
+/// slots published and the counters. One line, written only under `grow`.
+struct GrowCounters {
+    /// Chunk slots published: the headers a scan walks. A retired chunk's
+    /// slot stays counted until a later publication reuses it.
+    slots: AtomicUsize,
+    /// Chunks published, reused slots included.
+    grown: AtomicU64,
+    /// Chunks given back to the source.
+    returned: AtomicU64,
+}
+
+/// Why one growth did not publish a chunk.
+enum GrowError {
+    /// The source refused the lend.
+    Refused,
+    /// The domain refused the map; the chunk went back to the source.
+    Domain(DmaError),
+}
+
+/// What one allocation asks of the chunks.
+struct Want {
+    class: ChunkClass,
+    pages: usize,
+    align_pages: usize,
+    bytes: usize,
+    fill: Fill,
+}
+
 /// The memory one device reaches.
-pub struct DmaArena<S: ChunkSource> {
+///
+/// `D` maps and unmaps its chunks, and `G` says which allocations lend a
+/// chunk for it.
+pub struct DmaArena<S: ChunkSource, D: ChunkDomain, G: ChunkGrowth> {
     chunk_bytes: usize,
     pages_per_chunk: usize,
     /// The chunk table. A segment is allocated and published (Release)
     /// under `grow` and freed only when the arena drops.
     segments: [AtomicPtr<Segment>; SEGMENT_COUNT],
-    /// Chunks published. Written only under `grow`.
-    chunks: CachePadded<AtomicUsize>,
-    windows: WindowTables,
+    counters: CachePadded<GrowCounters>,
+    /// One bit per class whose lend the source refused to an allocation
+    /// and that nobody has retried since. Set by an allocator (Release),
+    /// swapped to zero by [`DmaArenas::grow_refused`]. On a line of its
+    /// own, because allocators on every processor write it while the
+    /// source is dry.
+    refused: CachePadded<AtomicU8>,
+    map: ChunkMap,
     /// Per processor and class, the slot of the chunk the last allocation
     /// there came from.
     hints: Box<[CachePadded<[AtomicU32; ChunkClass::COUNT]>]>,
     /// Serialises the allocations that span bitmap words.
     runs: spin::Mutex<()>,
-    /// Serialises the writers of the chunk table and the window table.
-    grow: Mutex<()>,
+    /// Serialises the writers of the chunk table and the chunk map.
+    grow: Mutex<GrowState>,
     /// Boxed so its address is stable for the chunk headers that point at
     /// it. Not dropped when the arena drops with a live page, so the
     /// buffers that outlive the panic still reach it.
     waiters: ManuallyDrop<Box<CachePadded<SpaceWaiters>>>,
     source: S,
+    domain: D,
+    growth: G,
 }
 
-impl<S: ChunkSource> DmaArena<S> {
+impl<S: ChunkSource, D: ChunkDomain, G: ChunkGrowth> DmaArena<S, D, G> {
     /// An arena with no chunks, for `processors` processors, whose chunks
-    /// are `chunk_bytes` each.
+    /// are `chunk_bytes` each. [`DmaArena::reserve`] fills it, and
+    /// `growth` decides which allocations fill it further.
     ///
     /// `chunk_bytes` is a power of two and at least a page, and at least
     /// as large as the largest run the arena will be asked for.
-    pub fn new(source: S, chunk_bytes: usize, processors: usize) -> Self {
+    pub fn new(source: S, domain: D, growth: G, chunk_bytes: usize, processors: usize) -> Self {
         assert!(
             chunk_bytes.is_power_of_two() && chunk_bytes >= PAGE_BYTES,
             "a DMA chunk is a power of two of at least a page, not {chunk_bytes} bytes"
@@ -672,18 +938,43 @@ impl<S: ChunkSource> DmaArena<S> {
             chunk_bytes,
             pages_per_chunk: chunk_bytes / PAGE_BYTES,
             segments: core::array::from_fn(|_| AtomicPtr::new(ptr::null_mut())),
-            chunks: CachePadded::new(AtomicUsize::new(0)),
-            windows: WindowTables::new(),
+            counters: CachePadded::new(GrowCounters {
+                slots: AtomicUsize::new(0),
+                grown: AtomicU64::new(0),
+                returned: AtomicU64::new(0),
+            }),
+            refused: CachePadded::new(AtomicU8::new(0)),
+            map: ChunkMap::new(source.span(), chunk_bytes),
             hints: (0..processors)
                 .map(|_| CachePadded::new(core::array::from_fn(|_| AtomicU32::new(0))))
                 .collect(),
             runs: spin::Mutex::new(()),
-            grow: Mutex::new(()),
+            grow: Mutex::new(GrowState {
+                retired_slots: Vec::new(),
+            }),
             waiters: ManuallyDrop::new(Box::new(CachePadded::new(SpaceWaiters {
                 starved: AtomicBool::new(false),
                 space: ProgressSignal::new(),
             }))),
             source,
+            domain,
+            growth,
+        }
+    }
+
+    /// The `grow` guard, when nobody holds it.
+    fn try_grow(&self) -> Option<GrowGuard<'_>> {
+        self.grow.try_lock().map(|state| GrowGuard {
+            state: ManuallyDrop::new(state),
+            waiters: &self.waiters,
+        })
+    }
+
+    /// The `grow` guard, waiting for its holder.
+    async fn lock_grow(&self) -> GrowGuard<'_> {
+        GrowGuard {
+            state: ManuallyDrop::new(self.grow.lock().await),
+            waiters: &self.waiters,
         }
     }
 
@@ -731,16 +1022,40 @@ impl<S: ChunkSource> DmaArena<S> {
         self.chunk_bytes
     }
 
-    /// Adds a chunk the device already reaches at `device`.
+    /// Lends, maps and publishes `chunks` chunks of `class`, so a
+    /// request class has the memory its device's requests need before the
+    /// first one is made.
     ///
-    /// The chunk is `chunk_bytes` long and aligned to its own size. It
-    /// becomes allocatable only after its window is published, so a buffer
-    /// from it always resolves in [`DmaArena::device_range`].
-    pub async fn adopt(&self, chunk: LentChunk, device: DeviceAddress, class: ChunkClass) {
-        let grow = self.grow.lock().await;
+    /// A refusal leaves the chunks already published in place. Task
+    /// context; waits for the `grow` lock.
+    pub async fn reserve(&self, class: ChunkClass, chunks: usize) -> Result<(), DmaError> {
+        let mut grow = self.lock_grow().await;
+        for _ in 0..chunks {
+            self.grow_one(&mut grow, class)
+                .map_err(|error| match error {
+                    GrowError::Refused => DmaError::Exhausted {
+                        bytes: self.chunk_bytes,
+                    },
+                    GrowError::Domain(error) => error,
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Lends one chunk, maps it for `class`, and publishes it. Returns the
+    /// slot it was published in.
+    ///
+    /// The guard makes the caller the only writer. The chunk is allocatable
+    /// only once published, so a buffer from it always resolves in
+    /// [`DmaArena::device_range`].
+    fn grow_one(&self, grow: &mut GrowGuard<'_>, class: ChunkClass) -> Result<usize, GrowError> {
+        let chunk = self
+            .source
+            .lend(self.chunk_bytes)
+            .ok_or(GrowError::Refused)?;
         assert_eq!(
             chunk.bytes, self.chunk_bytes,
-            "a chunk of {} bytes was adopted by an arena of {}-byte chunks",
+            "a source lent {} bytes to an arena of {}-byte chunks",
             chunk.bytes, self.chunk_bytes
         );
         assert!(
@@ -749,13 +1064,32 @@ impl<S: ChunkSource> DmaArena<S> {
             chunk.start,
             self.chunk_bytes
         );
-        let key = chunk.start / self.chunk_bytes;
-        assert!(
-            self.windows.lookup(key).is_none(),
-            "the chunk at {:#x} was adopted twice",
-            chunk.start
-        );
-        let slot = self.chunks.load(Ordering::Relaxed);
+        let device = match self.domain.map(chunk, class.access()) {
+            Ok(device) => device,
+            Err(error) => {
+                self.source.take_back(chunk);
+                return Err(GrowError::Domain(error));
+            }
+        };
+        Ok(self.publish(grow, class, chunk, device))
+    }
+
+    /// Makes a mapped chunk allocatable, in this order: the header's
+    /// address fields, the chunk map entry, the state word with the class
+    /// and a count of zero, the empty-set bit, and for a new slot the
+    /// slot count. Each of the Release stores is what the reader that
+    /// follows it Acquires, so whoever finds the chunk finds it whole.
+    fn publish(
+        &self,
+        grow: &mut GrowGuard<'_>,
+        class: ChunkClass,
+        chunk: LentChunk,
+        device: DeviceAddress,
+    ) -> usize {
+        let (slot, new_slot) = match grow.retired_slots.pop() {
+            Some(slot) => (slot as usize, false),
+            None => (self.counters.slots.load(Ordering::Relaxed), true),
+        };
         assert!(
             slot < MAX_CHUNKS,
             "a DMA arena holds at most {MAX_CHUNKS} chunks"
@@ -774,10 +1108,14 @@ impl<S: ChunkSource> DmaArena<S> {
         let header = &unsafe { &*segment }.chunks[position];
         header.base.store(chunk.start, Ordering::Relaxed);
         header.device.store(device.get(), Ordering::Relaxed);
-        header.class.store(class.index() as u8, Ordering::Relaxed);
-        self.windows.insert(&grow, key, device.get());
+        self.map.insert(grow, chunk.start, device.get());
+        header.state.store(class.state_bits(), Ordering::Release);
         header.note_empty();
-        self.chunks.store(slot + 1, Ordering::Release);
+        if new_slot {
+            self.counters.slots.store(slot + 1, Ordering::Release);
+        }
+        self.counters.grown.fetch_add(1, Ordering::Relaxed);
+        slot
     }
 
     /// Zeroed pages for `layout`, from a chunk of `class`.
@@ -832,24 +1170,68 @@ impl<S: ChunkSource> DmaArena<S> {
             });
         }
         let align_pages = layout.align().div_ceil(PAGE_BYTES);
-        let hint = self.hint(class);
-        let first = hint.load(Ordering::Relaxed) as usize;
-        let chunks = self.chunks.load(Ordering::Acquire);
-        for step in 0..chunks {
-            let slot = (first + step) % chunks;
-            let chunk = self.chunk(slot);
-            if usize::from(chunk.class.load(Ordering::Relaxed)) != class.index() {
-                continue;
+        let want = Want {
+            class,
+            pages,
+            align_pages,
+            bytes,
+            fill,
+        };
+        if let Some(buffer) = self.find(&want) {
+            return Ok(buffer);
+        }
+        if !self.growth.grows(class) {
+            return Err(DmaError::Exhausted { bytes });
+        }
+        // One growth at a time. The holder wakes whoever was refused here
+        // when it lets go, unless its own lend was refused: that release
+        // is silent (`GrowGuard::release_silently`).
+        let Some(mut grow) = self.try_grow() else {
+            return Err(DmaError::Replenishing { bytes });
+        };
+        loop {
+            // A growth or a free may have landed while the lock was out of
+            // reach.
+            if let Some(buffer) = self.find(&want) {
+                return Ok(buffer);
             }
-            let Some(first_page) = self.claim(chunk, pages, align_pages) else {
+            match self.grow_one(&mut grow, class) {
+                Ok(slot) => {
+                    let hint = self.hint(class);
+                    hint.store(slot as u32, Ordering::Relaxed);
+                }
+                Err(GrowError::Refused) => {
+                    // The bit first, then the kick: the maintenance pass
+                    // samples the kick before it reads the bits.
+                    self.refused.fetch_or(1 << class.index(), Ordering::Release);
+                    self.growth.refused();
+                    grow.release_silently();
+                    return Err(DmaError::Exhausted { bytes });
+                }
+                Err(GrowError::Domain(error)) => return Err(error),
+            }
+        }
+    }
+
+    /// Claims the run `want` describes from a published chunk of its class,
+    /// starting at the executing processor's hint.
+    fn find(&self, want: &Want) -> Option<ArenaBuffer> {
+        let hint = self.hint(want.class);
+        let first = hint.load(Ordering::Relaxed) as usize;
+        let slots = self.counters.slots.load(Ordering::Acquire);
+        for step in 0..slots {
+            let slot = (first + step) % slots;
+            let chunk = self.chunk(slot);
+            let Some(first_page) = self.claim(chunk, want.class, want.pages, want.align_pages)
+            else {
                 continue;
             };
             if slot != first {
                 hint.store(slot as u32, Ordering::Relaxed);
             }
-            return Ok(self.buffer(chunk, first_page, pages, bytes, fill));
+            return Some(self.buffer(chunk, first_page, want.pages, want.bytes, want.fill));
         }
-        Err(DmaError::Exhausted { bytes })
+        None
     }
 
     /// The address a device has to issue to reach `bytes`.
@@ -863,7 +1245,7 @@ impl<S: ChunkSource> DmaArena<S> {
             address,
             bytes: bytes.len(),
         };
-        let Some(device) = self.windows.lookup(address / self.chunk_bytes) else {
+        let Some(device) = self.map.lookup(address) else {
             return Err(unreachable);
         };
         let offset = address % self.chunk_bytes;
@@ -875,16 +1257,26 @@ impl<S: ChunkSource> DmaArena<S> {
 
     /// The arena's occupancy now.
     pub fn stats(&self) -> ArenaStats {
-        let chunks = self.chunks.load(Ordering::Acquire);
+        let slots = self.counters.slots.load(Ordering::Acquire);
         let mut stats = ArenaStats {
-            chunks,
-            pages: chunks * self.pages_per_chunk,
+            chunks: 0,
+            chunks_by_class: [0; ChunkClass::COUNT],
+            pages: 0,
             pages_in_use: 0,
             empty_chunks: 0,
             noted_empty_chunks: 0,
+            grown: self.counters.grown.load(Ordering::Relaxed),
+            returned: self.counters.returned.load(Ordering::Relaxed),
         };
-        for slot in 0..chunks {
-            let in_use = self.chunk(slot).pages_in_use();
+        for slot in 0..slots {
+            let state = self.chunk(slot).state.load(Ordering::Acquire);
+            if state & RETIRING != 0 {
+                continue;
+            }
+            let in_use = (state & COUNT_MASK) as usize;
+            stats.chunks += 1;
+            stats.chunks_by_class[ChunkClass::of_state(state).index()] += 1;
+            stats.pages += self.pages_per_chunk;
             stats.pages_in_use += in_use;
             stats.empty_chunks += usize::from(in_use == 0);
         }
@@ -923,8 +1315,14 @@ impl<S: ChunkSource> DmaArena<S> {
 
     /// Claims `pages` in `chunk`: enters it, then takes the bits. A
     /// refusal leaves the chunk as it was.
-    fn claim(&self, chunk: &Chunk, pages: usize, align_pages: usize) -> Option<usize> {
-        if !chunk.enter(pages) {
+    fn claim(
+        &self,
+        chunk: &Chunk,
+        class: ChunkClass,
+        pages: usize,
+        align_pages: usize,
+    ) -> Option<usize> {
+        if !chunk.enter(pages, class.state_bits()) {
             return None;
         }
         let first_page = if pages <= WORD_PAGES {
@@ -968,18 +1366,240 @@ impl<S: ChunkSource> DmaArena<S> {
     }
 }
 
-impl<S: ChunkSource> Drop for DmaArena<S> {
-    /// Gives every chunk back to the source.
+impl<S: ChunkSource, D: ChunkDomain> DmaArena<S, D, Elastic> {
+    /// Gives back the chunks with no page in use, keeping `retained` empty
+    /// chunks of each request class, and returns how many it gave back.
+    ///
+    /// Walks the empty set, which every free that emptied a chunk noted
+    /// in. A chunk an allocation entered since is skipped: its next free
+    /// notes it again. A retained chunk is noted again for the next pass.
+    /// [`ChunkClass::Resident`] chunks never retire. Only an [`Elastic`]
+    /// arena has this, so a disk arena cannot be shrunk.
+    ///
+    /// A retired chunk leaves in this order: its chunk map entry, so no new
+    /// buffer resolves in it; the domain's unmap; the source's take-back.
+    /// A domain that refuses the unmap keeps the chunk, which the device
+    /// may still reach, and the arena never gives it back.
+    ///
+    /// Maintenance task context; waits for the `grow` lock.
+    pub async fn retire_empty(&self, retained: usize) -> usize {
+        let mut grow = self.lock_grow().await;
+        let mut kept = [0_usize; ChunkClass::COUNT];
+        let mut retired = 0;
+        for (index, segment) in self.segments.iter().enumerate() {
+            let segment = segment.load(Ordering::Acquire);
+            if segment.is_null() {
+                continue;
+            }
+            // SAFETY: the segment is live until the arena drops.
+            let segment = unsafe { &*segment };
+            for (word_index, word) in segment.empty.iter().enumerate() {
+                let mut noted = word.swap(0, Ordering::AcqRel);
+                while noted != 0 {
+                    let position = word_index * WORD_PAGES + noted.trailing_zeros() as usize;
+                    noted &= noted - 1;
+                    let chunk = &segment.chunks[position];
+                    let slot = FIRST_SEGMENT_CHUNKS * ((1 << index) - 1) + position;
+                    if self.retire(&mut grow, chunk, slot, retained, &mut kept) {
+                        retired += 1;
+                    }
+                }
+            }
+        }
+        retired
+    }
+
+    /// Retries the growth an allocation was refused, one chunk for each
+    /// class whose `refused` bit is set, and says whether a lend stayed
+    /// refused.
+    ///
+    /// A bit is cleared before its retry, so a refusal that lands during
+    /// the retry sets it again; a retry the source refuses sets it again
+    /// too, without waking anyone, because the caller learns it from the
+    /// answer and parks on the source. A domain that refuses the map is
+    /// logged and its bit stays clear: no retry changes that answer.
+    ///
+    /// Maintenance task context; waits for the `grow` lock.
+    async fn grow_refused(&self) -> bool {
+        if self.refused.load(Ordering::Acquire) == 0 {
+            return false;
+        }
+        let mut grow = self.lock_grow().await;
+        let bits = self.refused.swap(0, Ordering::AcqRel);
+        let mut stayed = false;
+        for class in ChunkClass::ALL {
+            let bit = 1 << class.index();
+            if bits & bit == 0 {
+                continue;
+            }
+            match self.grow_one(&mut grow, class) {
+                Ok(_) => {}
+                Err(GrowError::Refused) => {
+                    self.refused.fetch_or(bit, Ordering::Release);
+                    stayed = true;
+                }
+                Err(GrowError::Domain(error)) => tracing::error!(
+                    ?class,
+                    %error,
+                    "a DMA domain refused to map a chunk the arena retried for"
+                ),
+            }
+        }
+        stayed
+    }
+
+    /// Retires the chunk `chunk` of slot `slot` when it is empty and past
+    /// the retained count of its class. Whether it did.
+    fn retire(
+        &self,
+        grow: &mut GrowGuard<'_>,
+        chunk: &Chunk,
+        slot: usize,
+        retained: usize,
+        kept: &mut [usize; ChunkClass::COUNT],
+    ) -> bool {
+        let state = chunk.state.load(Ordering::Acquire);
+        let class = ChunkClass::of_state(state);
+        if state & RETIRING != 0 || class == ChunkClass::Resident || state & COUNT_MASK != 0 {
+            return false;
+        }
+        if kept[class.index()] < retained {
+            kept[class.index()] += 1;
+            chunk.note_empty();
+            return false;
+        }
+        // An allocation that entered since the load makes this fail, and
+        // the free that empties the chunk again notes it again.
+        if chunk
+            .state
+            .compare_exchange(
+                state,
+                state | RETIRING,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        let base = chunk.base.load(Ordering::Relaxed);
+        let device = DeviceAddress::new(chunk.device.load(Ordering::Relaxed));
+        self.map.remove(grow, base);
+        let lent = LentChunk::new(base, self.chunk_bytes);
+        if let Err(error) = self.domain.unmap(lent, device) {
+            tracing::error!(
+                chunk = format_args!("{base:#x}"),
+                %error,
+                "a DMA domain refused to unmap a retired chunk; the arena keeps it"
+            );
+            return false;
+        }
+        self.source.take_back(lent);
+        grow.retired_slots.push(slot as u32);
+        self.counters.returned.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+}
+
+/// The elastic arenas that share one chunk source, and what the
+/// maintenance pass does for them.
+///
+/// Built mutably on the bootstrap processor, one arena per device, and then
+/// moved into the maintenance task: one owner, no lock. An arena is shared
+/// with its driver through the `Arc` it returns.
+pub struct DmaArenas<S: ChunkSource + Clone, D: ChunkDomain> {
+    source: S,
+    demand: Arc<GrowthDemand>,
+    arenas: Vec<Arc<DmaArena<S, D, Elastic>>>,
+}
+
+impl<S: ChunkSource + Clone, D: ChunkDomain> DmaArenas<S, D> {
+    pub fn new(source: S) -> Self {
+        Self {
+            source,
+            demand: Arc::new(GrowthDemand::new()),
+            arenas: Vec::new(),
+        }
+    }
+
+    /// Builds and registers an elastic arena of `chunk_bytes` chunks for
+    /// `processors` processors. Bring-up only.
+    pub fn arena(
+        &mut self,
+        domain: D,
+        chunk_bytes: usize,
+        processors: usize,
+    ) -> Arc<DmaArena<S, D, Elastic>> {
+        let arena = Arc::new(DmaArena::new(
+            self.source.clone(),
+            domain,
+            Elastic::new(self.demand.clone()),
+            chunk_bytes,
+            processors,
+        ));
+        self.arenas.push(arena.clone());
+        arena
+    }
+
+    /// Samples the demand signal, which an allocation refused a chunk
+    /// raises after it set its arena's `refused` bit.
+    ///
+    /// The maintenance pass takes it before [`DmaArenas::grow_refused`]
+    /// reads the bits, so a refusal that lands after the read moves the
+    /// signal past the mark.
+    pub fn demand_mark(&self) -> ProgressMark {
+        self.demand.kick.mark()
+    }
+
+    /// Resolves once an allocation was refused a chunk after `mark`.
+    pub fn demand_changed(&self, mark: ProgressMark) -> impl Future<Output = ()> + Send + '_ {
+        self.demand.kick.changed(mark)
+    }
+
+    /// Every arena's [`DmaArena::retire_empty`], one after another. Returns
+    /// the chunks given back.
+    pub async fn retire_empty(&self, retained: usize) -> usize {
+        let mut retired = 0;
+        for arena in &self.arenas {
+            retired += arena.retire_empty(retained).await;
+        }
+        retired
+    }
+
+    /// Retries the growth refused allocations left undone.
+    ///
+    /// Marks the source wanted first, so a chunk that comes back after this
+    /// call moves the source's return signal past the mark the answer
+    /// carries; then, for each arena, one growth of each class whose
+    /// `refused` bit is set, under that arena's `grow`. `Some(mark)` when a
+    /// lend stayed refused: the caller parks on
+    /// [`ChunkSource::chunk_returned`] with it. Each retry is the test the
+    /// mark was armed before.
+    ///
+    /// Maintenance task context.
+    pub async fn grow_refused(&self) -> Option<ProgressMark> {
+        let mark = self.source.want_chunk();
+        let mut stayed = false;
+        for arena in &self.arenas {
+            stayed |= arena.grow_refused().await;
+        }
+        stayed.then_some(mark)
+    }
+}
+
+impl<S: ChunkSource, D: ChunkDomain, G: ChunkGrowth> Drop for DmaArena<S, D, G> {
+    /// Unmaps every live chunk and gives it back to the source.
     ///
     /// A page still live means a driver outlived its device's memory, and
     /// the device may be writing it: the arena panics. It leaks its chunk
     /// table first, so the buffers that outlive the panic still free into
-    /// valid headers, and it gives no chunk back.
+    /// valid headers, and it gives no chunk back. A retired chunk is
+    /// already back and is skipped.
     fn drop(&mut self) {
-        let chunks = *self.chunks.get_mut();
+        let slots = *self.counters.slots.get_mut();
         let mut live_pages = 0;
         let mut live_chunks = 0;
-        for slot in 0..chunks {
+        for slot in 0..slots {
             let in_use = self.chunk(slot).pages_in_use();
             live_pages += in_use;
             live_chunks += usize::from(in_use != 0);
@@ -987,18 +1607,29 @@ impl<S: ChunkSource> Drop for DmaArena<S> {
         assert!(
             live_pages == 0,
             "a DMA arena was dropped with {live_pages} live pages in {live_chunks} of its \
-             {chunks} chunks"
+             {slots} chunks"
         );
-        for slot in 0..chunks {
-            let base = self.chunk(slot).base.load(Ordering::Relaxed);
-            self.source
-                .take_back(LentChunk::new(base, self.chunk_bytes));
+        for slot in 0..slots {
+            let chunk = self.chunk(slot);
+            if chunk.state.load(Ordering::Relaxed) & RETIRING != 0 {
+                continue;
+            }
+            let lent = LentChunk::new(chunk.base.load(Ordering::Relaxed), self.chunk_bytes);
+            let device = DeviceAddress::new(chunk.device.load(Ordering::Relaxed));
+            match self.domain.unmap(lent, device) {
+                Ok(()) => self.source.take_back(lent),
+                Err(error) => tracing::error!(
+                    chunk = format_args!("{:#x}", lent.start()),
+                    %error,
+                    "a DMA domain refused to unmap a chunk of a dropped arena; it is not given back"
+                ),
+            }
         }
         for segment in &mut self.segments {
             let segment = *segment.get_mut();
             if !segment.is_null() {
                 // SAFETY: the pointer came from `Box::into_raw` in
-                // `adopt`, and no page is live, so no header is read
+                // `publish`, and no page is live, so no header is read
                 // again.
                 drop(unsafe { Box::from_raw(segment) });
             }
@@ -1084,10 +1715,11 @@ impl Drop for ArenaBuffer {
 #[cfg(test)]
 mod tests {
     use alloc::alloc::{alloc_zeroed, dealloc};
-    use alloc::sync::Arc;
+    use alloc::sync::{Arc, Weak};
     use alloc::vec;
     use alloc::vec::Vec;
     use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::Mutex as StdMutex;
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
@@ -1098,80 +1730,240 @@ mod tests {
     use super::*;
     use crate::test_processor_identity;
 
-    #[derive(Default)]
-    struct ChunkCounts {
-        lent: AtomicUsize,
-        returned: AtomicUsize,
+    /// `2^64` divided by the golden ratio, as a source of test noise.
+    const NOISE_MULTIPLIER: u64 = 0x9E37_79B9_7F4A_7C15;
+
+    /// What a source or a domain did to a chunk, by the chunk's address.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Event {
+        Lend(usize),
+        Map(usize),
+        Unmap(usize),
+        TakeBack(usize),
     }
 
-    /// Aligned host blocks, each followed by a guard region the arena never
-    /// owns, so a test can build a slice that runs past a chunk's end
-    /// without leaving allocated memory.
-    struct HeapChunks {
-        counts: Arc<ChunkCounts>,
+    /// One aligned host block of `capacity` chunks, lent out one chunk at
+    /// a time, followed by a guard chunk the arena never owns, so a test
+    /// can build a slice that runs past the last chunk's end without
+    /// leaving allocated memory. A chunk returned is not freed to the
+    /// host: the block lives as long as the source does.
+    struct Region {
+        layout: Layout,
+        base: usize,
+        chunk_bytes: usize,
+        lent: Vec<AtomicBool>,
+        mapped: Vec<AtomicBool>,
+        lends: AtomicUsize,
+        returns: AtomicUsize,
+        log: StdMutex<Vec<Event>>,
+        /// Raised for every chunk that comes back.
+        returned: ProgressSignal,
     }
 
-    impl HeapChunks {
-        fn layout(bytes: usize) -> Layout {
-            Layout::from_size_align(bytes * 2, bytes).expect("chunk layout")
+    impl Region {
+        fn slot(&self, start: usize) -> usize {
+            assert!(
+                start >= self.base && (start - self.base).is_multiple_of(self.chunk_bytes),
+                "{start:#x} is not a chunk of this region"
+            );
+            (start - self.base) / self.chunk_bytes
         }
     }
 
-    impl ChunkSource for HeapChunks {
-        fn lend(&self, bytes: usize) -> Option<LentChunk> {
+    impl Drop for Region {
+        fn drop(&mut self) {
+            // SAFETY: `new` allocated the block with this layout.
+            unsafe { dealloc(ptr::with_exposed_provenance_mut(self.base), self.layout) };
+        }
+    }
+
+    #[derive(Clone)]
+    struct TestSource(Arc<Region>);
+
+    impl TestSource {
+        fn new(chunk_bytes: usize, capacity: usize) -> Self {
+            let layout = Layout::from_size_align(chunk_bytes * (capacity + 1), chunk_bytes)
+                .expect("region layout");
             // SAFETY: the layout is not zero-sized.
-            let ptr = unsafe { alloc_zeroed(Self::layout(bytes)) };
-            if ptr.is_null() {
-                return None;
-            }
-            self.counts.lent.fetch_add(1, Ordering::Relaxed);
-            Some(LentChunk::new(ptr.expose_provenance(), bytes))
+            let block = unsafe { alloc_zeroed(layout) };
+            assert!(!block.is_null(), "host memory");
+            Self(Arc::new(Region {
+                layout,
+                base: block.expose_provenance(),
+                chunk_bytes,
+                lent: (0..capacity).map(|_| AtomicBool::new(false)).collect(),
+                mapped: (0..capacity).map(|_| AtomicBool::new(false)).collect(),
+                lends: AtomicUsize::new(0),
+                returns: AtomicUsize::new(0),
+                log: StdMutex::new(Vec::new()),
+                returned: ProgressSignal::new(),
+            }))
+        }
+
+        fn lends(&self) -> usize {
+            self.0.lends.load(Ordering::SeqCst)
+        }
+
+        fn returns(&self) -> usize {
+            self.0.returns.load(Ordering::SeqCst)
+        }
+
+        fn log(&self) -> Vec<Event> {
+            self.0.log.lock().expect("the log").clone()
+        }
+
+        fn record(&self, event: Event) {
+            self.0.log.lock().expect("the log").push(event);
+        }
+
+        /// Whether the chunk holding `address` is lent right now.
+        fn is_lent(&self, address: usize) -> bool {
+            let slot = (address - self.0.base) / self.0.chunk_bytes;
+            self.0.lent[slot].load(Ordering::SeqCst)
+        }
+
+        /// The kernel address of the first byte of chunk `slot`.
+        fn chunk_start(&self, slot: usize) -> usize {
+            self.0.base + slot * self.0.chunk_bytes
+        }
+    }
+
+    impl ChunkSource for TestSource {
+        fn lend(&self, bytes: usize) -> Option<LentChunk> {
+            assert_eq!(bytes, self.0.chunk_bytes, "a lend of the wrong size");
+            let slot = (0..self.0.lent.len()).find(|&slot| {
+                self.0.lent[slot]
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            })?;
+            self.0.lends.fetch_add(1, Ordering::SeqCst);
+            let start = self.chunk_start(slot);
+            self.record(Event::Lend(start));
+            Some(LentChunk::new(start, bytes))
         }
 
         fn take_back(&self, chunk: LentChunk) {
-            self.counts.returned.fetch_add(1, Ordering::Relaxed);
-            // SAFETY: `lend` allocated this block with this layout.
-            unsafe {
-                dealloc(
-                    ptr::with_exposed_provenance_mut(chunk.start()),
-                    Self::layout(chunk.bytes()),
-                )
-            };
+            let slot = self.0.slot(chunk.start());
+            assert!(
+                !self.0.mapped[slot].load(Ordering::SeqCst),
+                "the chunk at {:#x} went back while a domain still mapped it",
+                chunk.start()
+            );
+            assert!(
+                self.0.lent[slot].swap(false, Ordering::SeqCst),
+                "the chunk at {:#x} went back without being lent",
+                chunk.start()
+            );
+            self.0.returns.fetch_add(1, Ordering::SeqCst);
+            self.record(Event::TakeBack(chunk.start()));
+            self.0.returned.signal();
+        }
+
+        fn span(&self) -> Range<usize> {
+            self.0.base..self.0.base + self.0.lent.len() * self.0.chunk_bytes
+        }
+
+        fn want_chunk(&self) -> ProgressMark {
+            self.0.returned.mark()
+        }
+
+        fn chunk_returned(&self, mark: ProgressMark) -> impl Future<Output = ()> + Send + '_ {
+            self.0.returned.changed(mark)
         }
     }
 
-    /// The device's address of the chunk in slot `slot`: not the host
-    /// address, and not contiguous with its neighbours.
-    fn device_of(slot: usize, chunk_bytes: usize) -> u64 {
-        0x8000_0000_0000 + (slot * chunk_bytes * 4) as u64
+    /// The device's address of the chunk at `start`: not the host address.
+    fn device_of(start: usize) -> u64 {
+        0x8000_0000_0000 + start as u64
     }
 
-    /// An arena of one chunk per entry of `classes`.
+    /// Maps each chunk at `device_of` its address, and checks the arena's
+    /// state at every call: a chunk is not in the chunk map while the
+    /// domain maps or unmaps it.
+    struct TestDomain<G: ChunkGrowth> {
+        source: TestSource,
+        arena: Weak<TestArena<G>>,
+        /// Class of the last map, per request: what the arena asked for.
+        accesses: StdMutex<Vec<DmaAccess>>,
+    }
+
+    type TestArena<G> = DmaArena<TestSource, TestDomain<G>, G>;
+
+    impl<G: ChunkGrowth> TestDomain<G> {
+        /// The arena, unless it is being dropped.
+        fn arena(&self) -> Option<Arc<TestArena<G>>> {
+            self.arena.upgrade()
+        }
+    }
+
+    impl<G: ChunkGrowth> ChunkDomain for TestDomain<G> {
+        fn map(&self, chunk: LentChunk, access: DmaAccess) -> Result<DeviceAddress, DmaError> {
+            if let Some(arena) = self.arena() {
+                assert_eq!(
+                    arena.map.lookup(chunk.start()),
+                    None,
+                    "the chunk at {:#x} resolved before the domain mapped it",
+                    chunk.start()
+                );
+            }
+            self.accesses.lock().expect("accesses").push(access);
+            self.source.0.mapped[self.source.0.slot(chunk.start())].store(true, Ordering::SeqCst);
+            self.source.record(Event::Map(chunk.start()));
+            Ok(DeviceAddress::new(device_of(chunk.start())))
+        }
+
+        fn unmap(&self, chunk: LentChunk, device: DeviceAddress) -> Result<(), DmaError> {
+            assert_eq!(device.get(), device_of(chunk.start()));
+            if let Some(arena) = self.arena() {
+                assert_eq!(
+                    arena.map.lookup(chunk.start()),
+                    None,
+                    "the chunk at {:#x} still resolved when the domain unmapped it",
+                    chunk.start()
+                );
+            }
+            self.source.0.mapped[self.source.0.slot(chunk.start())].store(false, Ordering::SeqCst);
+            self.source.record(Event::Unmap(chunk.start()));
+            Ok(())
+        }
+    }
+
+    /// An arena with no chunk, over a source of `capacity` chunks.
+    fn empty_arena<G: ChunkGrowth>(
+        chunk_bytes: usize,
+        capacity: usize,
+        growth: G,
+        processors: usize,
+    ) -> (Arc<TestArena<G>>, TestSource) {
+        let source = TestSource::new(chunk_bytes, capacity);
+        let arena = Arc::new_cyclic(|weak| {
+            DmaArena::new(
+                source.clone(),
+                TestDomain {
+                    source: source.clone(),
+                    arena: weak.clone(),
+                    accesses: StdMutex::new(Vec::new()),
+                },
+                growth,
+                chunk_bytes,
+                processors,
+            )
+        });
+        (arena, source)
+    }
+
+    /// A [`Fixed`] arena of one chunk per entry of `classes`, over a source
+    /// that has no other.
     fn arena(
         chunk_bytes: usize,
         classes: &[ChunkClass],
         processors: usize,
-    ) -> (DmaArena<HeapChunks>, Arc<ChunkCounts>) {
-        let counts = Arc::new(ChunkCounts::default());
-        let source = HeapChunks {
-            counts: counts.clone(),
-        };
-        let arena = DmaArena::new(
-            HeapChunks {
-                counts: counts.clone(),
-            },
-            chunk_bytes,
-            processors,
-        );
-        for (slot, &class) in classes.iter().enumerate() {
-            let chunk = source.lend(chunk_bytes).expect("host memory");
-            block_on(arena.adopt(
-                chunk,
-                DeviceAddress::new(device_of(slot, chunk_bytes)),
-                class,
-            ));
+    ) -> (Arc<TestArena<Fixed>>, TestSource) {
+        let (arena, source) = empty_arena(chunk_bytes, classes.len(), Fixed, processors);
+        for &class in classes {
+            block_on(arena.reserve(class, 1)).expect("host memory");
         }
-        (arena, counts)
+        (arena, source)
     }
 
     fn pages(count: usize) -> Layout {
@@ -1180,8 +1972,10 @@ mod tests {
 
     /// The bits set in every bitmap, less the padding past each chunk's
     /// last page.
-    fn bitmap_pages_in_use<S: ChunkSource>(arena: &DmaArena<S>) -> usize {
-        (0..arena.stats().chunks)
+    fn bitmap_pages_in_use<S: ChunkSource, D: ChunkDomain, G: ChunkGrowth>(
+        arena: &DmaArena<S, D, G>,
+    ) -> usize {
+        (0..arena.counters.slots.load(Ordering::Acquire))
             .map(|slot| {
                 let chunk = arena.chunk(slot);
                 let set: usize = chunk
@@ -1194,7 +1988,10 @@ mod tests {
             .sum()
     }
 
-    fn chunk_range<S: ChunkSource>(arena: &DmaArena<S>, slot: usize) -> (usize, usize) {
+    fn chunk_range<S: ChunkSource, D: ChunkDomain, G: ChunkGrowth>(
+        arena: &DmaArena<S, D, G>,
+        slot: usize,
+    ) -> (usize, usize) {
         let base = arena.chunk(slot).base.load(Ordering::Relaxed);
         (base, base + arena.chunk_bytes())
     }
@@ -1382,21 +2179,6 @@ mod tests {
     }
 
     #[test]
-    fn a_draining_chunk_takes_no_new_page() {
-        let (arena, _) = arena(4 * PAGE_BYTES, &[ChunkClass::ReadWrite], 1);
-        arena.chunk(0).state.fetch_or(DRAINING, Ordering::Relaxed);
-        assert_eq!(
-            arena.allocate(ChunkClass::ReadWrite, pages(1)).unwrap_err(),
-            DmaError::Exhausted { bytes: PAGE_BYTES }
-        );
-        assert_eq!(arena.stats().pages_in_use, 0, "a refusal leaves no count");
-        arena.chunk(0).state.fetch_and(!DRAINING, Ordering::Relaxed);
-        arena
-            .allocate(ChunkClass::ReadWrite, pages(1))
-            .expect("the chunk serves again");
-    }
-
-    #[test]
     fn device_range_refuses_what_is_not_inside_one_chunk_of_this_arena() {
         let chunk_bytes = 4 * PAGE_BYTES;
         let (arena, _) = arena(chunk_bytes, &[ChunkClass::ReadWrite; 2], 1);
@@ -1414,7 +2196,7 @@ mod tests {
         let offset = buffer.as_ptr() as usize - base;
         assert_eq!(
             buffer.device_address().get(),
-            device_of(0, chunk_bytes) + offset as u64
+            device_of(base) + offset as u64
         );
 
         // The heap.
@@ -1450,7 +2232,7 @@ mod tests {
         assert_eq!(
             arena.device_range(whole),
             Ok(DeviceAddress::new(
-                device_of(0, chunk_bytes) + (chunk_bytes - PAGE_BYTES) as u64
+                device_of(base) + (chunk_bytes - PAGE_BYTES) as u64
             ))
         );
         assert_eq!(
@@ -1468,7 +2250,7 @@ mod tests {
         const ROUNDS: usize = 3000;
         const CHUNKS: usize = 8;
         let chunk_bytes = 256 * PAGE_BYTES;
-        let (arena, counts) = arena(chunk_bytes, &[ChunkClass::ReadWrite; CHUNKS], THREADS);
+        let (arena, source) = arena(chunk_bytes, &[ChunkClass::ReadWrite; CHUNKS], THREADS);
 
         let (senders, receivers): (Vec<_>, Vec<_>) = (0..THREADS)
             .map(|_| mpsc::channel::<(ArenaBuffer, u8)>())
@@ -1487,7 +2269,7 @@ mod tests {
                             "a buffer's bytes were written by someone else"
                         );
                     };
-                    let mut random = (me as u64 + 1).wrapping_mul(FIBONACCI_MULTIPLIER);
+                    let mut random = (me as u64 + 1).wrapping_mul(NOISE_MULTIPLIER);
                     let mut sent = 0;
                     while sent < ROUNDS {
                         for received in receiver.try_iter() {
@@ -1540,64 +2322,117 @@ mod tests {
             "every chunk that went empty is in the empty set"
         );
         for slot in 0..CHUNKS {
-            assert_eq!(arena.chunk(slot).state.load(Ordering::Acquire), 0);
+            assert_eq!(
+                arena.chunk(slot).state.load(Ordering::Acquire),
+                ChunkClass::ReadWrite.state_bits(),
+                "a chunk's state is its class and a count of zero"
+            );
         }
         drop(arena);
-        assert_eq!(counts.returned.load(Ordering::Relaxed), CHUNKS);
+        assert_eq!(source.returns(), CHUNKS);
     }
 
     #[test]
-    fn a_reader_racing_a_doubling_never_misses_a_live_chunk() {
-        const LIVE: usize = 8;
-        const TOTAL: usize = 4096;
-        let device = |key: usize| 0x1000 * key as u64;
-        let windows = WindowTables::new();
-        let grow = Mutex::new(());
-        let grow = block_on(grow.lock());
-        for key in 1..=LIVE {
-            windows.insert(&grow, key, device(key));
-        }
+    fn chunk_map_readers_racing_leaf_publication_never_miss_a_live_chunk() {
+        const CHUNK: usize = PAGE_BYTES;
+        // Two keys to a leaf: the second insert into a leaf must find the
+        // leaf the first one published.
+        const STEP: usize = LEAF_CHUNKS / 2;
+        const KEYS: usize = 128;
+        let address = |key: usize| (1 + key * STEP) * CHUNK;
+        let device = |key: usize| 0x1000 * (key as u64 + 1);
+        let map = ChunkMap::new(CHUNK..address(KEYS), CHUNK);
+        assert_eq!(map.root.len(), KEYS / 2, "a root sized from the span");
 
+        let published = AtomicUsize::new(0);
         let stop = AtomicBool::new(false);
         let passes = AtomicUsize::new(0);
-        thread::scope(|scope| {
-            for _ in 0..4 {
-                scope.spawn(|| {
-                    loop {
-                        for key in 1..=LIVE {
-                            assert_eq!(
-                                windows.lookup(key),
-                                Some(device(key)),
-                                "a live chunk went missing during a doubling"
-                            );
+        with_grow(|grow| {
+            thread::scope(|scope| {
+                for _ in 0..4 {
+                    scope.spawn(|| {
+                        loop {
+                            let live = published.load(Ordering::Acquire);
+                            for key in 0..live {
+                                assert_eq!(
+                                    map.lookup(address(key)),
+                                    Some(device(key)),
+                                    "a live chunk went missing while a leaf was published"
+                                );
+                            }
+                            passes.fetch_add(1, Ordering::Relaxed);
+                            if stop.load(Ordering::Relaxed) {
+                                break;
+                            }
                         }
-                        passes.fetch_add(1, Ordering::Relaxed);
-                        if stop.load(Ordering::Relaxed) {
-                            break;
-                        }
+                    });
+                }
+                // The writer waits for a reader's pass after each insert: a
+                // scheduler that starts the readers late would otherwise
+                // finish every publication before the first lookup.
+                for key in 0..KEYS - 1 {
+                    let seen = passes.load(Ordering::Relaxed);
+                    map.insert(grow, address(key), device(key));
+                    published.store(key + 1, Ordering::Release);
+                    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                    while passes.load(Ordering::Relaxed) == seen {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "no reader finished a pass: they stopped on a failed lookup"
+                        );
+                        thread::yield_now();
                     }
-                });
-            }
-            // The inserts double the table nine times, from 16 slots to
-            // 8192. The writer waits for a reader's pass after each batch:
-            // a scheduler that starts the readers late would otherwise let
-            // every doubling finish before the first lookup.
-            let keys: Vec<usize> = (LIVE + 1..=TOTAL).collect();
-            for batch in keys.chunks(64) {
-                let seen = passes.load(Ordering::Relaxed);
-                for &key in batch {
-                    windows.insert(&grow, key, device(key));
                 }
-                while passes.load(Ordering::Relaxed) == seen {
-                    thread::yield_now();
-                }
+                stop.store(true, Ordering::Relaxed);
+            });
+            for key in 0..KEYS - 1 {
+                assert_eq!(map.lookup(address(key)), Some(device(key)));
+                assert_eq!(
+                    map.lookup(address(key) + CHUNK - 1),
+                    Some(device(key)),
+                    "an address anywhere in the chunk resolves to it"
+                );
             }
-            stop.store(true, Ordering::Relaxed);
+            assert_eq!(map.lookup(address(KEYS - 1)), None);
         });
-        for key in 1..=TOTAL {
-            assert_eq!(windows.lookup(key), Some(device(key)));
-        }
-        assert_eq!(windows.lookup(TOTAL + 1), None);
+    }
+
+    #[test]
+    fn a_returned_chunk_no_longer_resolves() {
+        const CHUNK: usize = 4 * PAGE_BYTES;
+        let map = ChunkMap::new(CHUNK..CHUNK * 8, CHUNK);
+        with_grow(|grow| {
+            map.insert(grow, 2 * CHUNK, 0x7000);
+            map.insert(grow, 3 * CHUNK, 0x8000);
+            assert_eq!(map.lookup(2 * CHUNK + 5), Some(0x7000));
+            map.remove(grow, 2 * CHUNK);
+            assert_eq!(map.lookup(2 * CHUNK + 5), None, "the removed chunk");
+            assert_eq!(map.lookup(3 * CHUNK), Some(0x8000), "its neighbour stays");
+            // A chunk goes in again at another address after a removal.
+            map.insert(grow, 2 * CHUNK, 0x9000);
+            assert_eq!(map.lookup(2 * CHUNK), Some(0x9000));
+            // Outside the span nothing resolves.
+            assert_eq!(map.lookup(CHUNK - 1), None);
+            assert_eq!(map.lookup(CHUNK * 8), None);
+            assert_eq!(map.lookup(0), None);
+        });
+    }
+
+    /// Runs `body` holding a `grow` guard of a lock of its own, for the
+    /// tests of the chunk map alone.
+    fn with_grow<R>(body: impl FnOnce(&GrowGuard<'_>) -> R) -> R {
+        let lock = Mutex::new(GrowState {
+            retired_slots: Vec::new(),
+        });
+        let waiters = SpaceWaiters {
+            starved: AtomicBool::new(false),
+            space: ProgressSignal::new(),
+        };
+        let guard = GrowGuard {
+            state: ManuallyDrop::new(block_on(lock.lock())),
+            waiters: &waiters,
+        };
+        body(&guard)
     }
 
     #[test]
@@ -1612,13 +2447,13 @@ mod tests {
 
     #[test]
     fn a_page_that_outlives_its_arena_frees_into_a_chunk_the_panic_left_alone() {
-        let (arena, counts) = arena(4 * PAGE_BYTES, &[ChunkClass::ReadWrite], 1);
+        let (arena, source) = arena(4 * PAGE_BYTES, &[ChunkClass::ReadWrite], 1);
         let mut page = arena
             .allocate(ChunkClass::ReadWrite, pages(1))
             .expect("a page");
         assert!(catch_unwind(AssertUnwindSafe(move || drop(arena))).is_err());
         assert_eq!(
-            counts.returned.load(Ordering::Relaxed),
+            source.returns(),
             0,
             "a chunk with a live page is not given back"
         );
@@ -1633,21 +2468,21 @@ mod tests {
     /// Allocates one page by the space protocol: on a refusal, arm, ask
     /// again, and park only if refused again. `parked` counts the threads
     /// between the second refusal and their wake.
-    fn allocate_waiting<S: ChunkSource>(
-        arena: &DmaArena<S>,
+    fn allocate_waiting<S: ChunkSource, D: ChunkDomain, G: ChunkGrowth>(
+        arena: &DmaArena<S, D, G>,
         parked: &AtomicUsize,
         about_to_park: impl Fn(),
     ) -> ArenaBuffer {
         loop {
             match arena.allocate(ChunkClass::ReadWrite, pages(1)) {
                 Ok(buffer) => return buffer,
-                Err(DmaError::Exhausted { .. }) => {}
+                Err(DmaError::Exhausted { .. } | DmaError::Replenishing { .. }) => {}
                 Err(other) => panic!("{other}"),
             }
             let mark = arena.want_space();
             match arena.allocate(ChunkClass::ReadWrite, pages(1)) {
                 Ok(buffer) => return buffer,
-                Err(DmaError::Exhausted { .. }) => {}
+                Err(DmaError::Exhausted { .. } | DmaError::Replenishing { .. }) => {}
                 Err(other) => panic!("{other}"),
             }
             parked.fetch_add(1, Ordering::SeqCst);
@@ -1660,7 +2495,6 @@ mod tests {
     #[test]
     fn a_refused_allocator_parks_and_a_free_on_another_thread_releases_it() {
         let (arena, _) = arena(4 * PAGE_BYTES, &[ChunkClass::ReadWrite], 1);
-        let arena = Arc::new(arena);
         let held: Vec<_> = (0..4)
             .map(|_| {
                 arena
@@ -1751,7 +2585,6 @@ mod tests {
         const FREERS: usize = 2;
         const ROUNDS: usize = 3000;
         let (arena, _) = arena(4 * PAGE_BYTES, &[ChunkClass::ReadWrite], WAITERS);
-        let arena = Arc::new(arena);
         let parked = Arc::new(AtomicUsize::new(0));
         let finished = Arc::new(AtomicUsize::new(0));
 
@@ -1803,7 +2636,7 @@ mod tests {
 
     #[test]
     fn dropping_an_idle_arena_gives_every_chunk_back() {
-        let (arena, counts) = arena(4 * PAGE_BYTES, &[ChunkClass::Read; 20], 1);
+        let (arena, source) = arena(4 * PAGE_BYTES, &[ChunkClass::Read; 20], 1);
         assert_eq!(
             arena.stats().chunks,
             20,
@@ -1812,7 +2645,540 @@ mod tests {
         let page = arena.allocate(ChunkClass::Read, pages(2)).expect("a page");
         drop(page);
         drop(arena);
-        assert_eq!(counts.lent.load(Ordering::Relaxed), 20);
-        assert_eq!(counts.returned.load(Ordering::Relaxed), 20);
+        assert_eq!(source.lends(), 20);
+        assert_eq!(source.returns(), 20);
+    }
+
+    fn elastic(chunk_bytes: usize, capacity: usize, processors: usize) -> ElasticArena {
+        empty_arena(
+            chunk_bytes,
+            capacity,
+            Elastic::new(Arc::new(GrowthDemand::new())),
+            processors,
+        )
+    }
+
+    type ElasticArena = (Arc<TestArena<Elastic>>, TestSource);
+
+    #[test]
+    fn growth_maps_a_chunk_before_it_can_be_allocated() {
+        let (arena, source) = elastic(4 * PAGE_BYTES, 4, 1);
+        assert_eq!(arena.stats().chunks, 0, "an elastic arena starts empty");
+        let buffer = arena
+            .allocate(ChunkClass::ReadWrite, pages(1))
+            .expect("the allocation grows the arena");
+        let start = source.chunk_start(0);
+        // The domain hooks assert that the chunk did not resolve at `Map`.
+        assert_eq!(source.log(), [Event::Lend(start), Event::Map(start)]);
+        assert_eq!(buffer.as_ptr() as usize, start);
+        assert_eq!(buffer.device_address().get(), device_of(start));
+        assert_eq!(
+            arena.device_range(buffer.as_ref()),
+            Ok(buffer.device_address())
+        );
+        assert_eq!(
+            arena.stats().chunks_by_class,
+            [0, 0, 1],
+            "a read-write allocation grows a read-write chunk"
+        );
+        assert_eq!(arena.stats().grown, 1);
+        let accesses = arena.domain.accesses.lock().expect("accesses").clone();
+        assert_eq!(accesses, [DmaAccess::READ | DmaAccess::WRITE]);
+    }
+
+    #[test]
+    fn retirement_unmaps_after_the_map_entry_goes_and_before_the_chunk_goes_back() {
+        let (arena, source) = elastic(4 * PAGE_BYTES, 4, 1);
+        let buffer = arena
+            .allocate(ChunkClass::ReadWrite, pages(1))
+            .expect("the allocation grows the arena");
+        let start = source.chunk_start(0);
+        // SAFETY: the source's block outlives the arena, so the chunk's
+        // first byte is live host memory whether or not it is lent.
+        let first_byte = unsafe { core::slice::from_raw_parts(start as *const u8, 1) };
+        assert!(arena.device_range(first_byte).is_ok());
+        assert_eq!(
+            block_on(arena.retire_empty(0)),
+            0,
+            "a chunk with a page in use stays"
+        );
+        drop(buffer);
+
+        assert_eq!(block_on(arena.retire_empty(0)), 1);
+        // The domain hook asserts that the chunk was refused by the map at
+        // `Unmap`, and the source that it was unmapped at `TakeBack`.
+        assert_eq!(
+            source.log(),
+            [
+                Event::Lend(start),
+                Event::Map(start),
+                Event::Unmap(start),
+                Event::TakeBack(start)
+            ]
+        );
+        assert!(matches!(
+            arena.device_range(first_byte),
+            Err(DmaError::Unreachable { .. })
+        ));
+        let stats = arena.stats();
+        assert_eq!((stats.chunks, stats.grown, stats.returned), (0, 1, 1));
+        assert!(!source.is_lent(start));
+    }
+
+    #[test]
+    fn an_allocation_racing_a_retirement_never_gets_a_page_of_a_returned_chunk() {
+        const ALLOCATORS: usize = 4;
+        const RETIREMENTS: usize = 5000;
+        let (arena, source) = elastic(16 * PAGE_BYTES, 4, ALLOCATORS + 1);
+        let stop = AtomicBool::new(false);
+        let retirements = AtomicUsize::new(0);
+        thread::scope(|scope| {
+            for me in 0..ALLOCATORS {
+                let (arena, source, stop) = (&arena, &source, &stop);
+                scope.spawn(move || {
+                    test_processor_identity::set(ProcessorId::new(me as u16));
+                    let mut done = 0_usize;
+                    while !stop.load(Ordering::SeqCst) {
+                        let buffer = match arena.allocate(ChunkClass::ReadWrite, pages(1)) {
+                            Ok(buffer) => buffer,
+                            Err(DmaError::Replenishing { .. } | DmaError::Exhausted { .. }) => {
+                                thread::yield_now();
+                                continue;
+                            }
+                            Err(other) => panic!("{other}"),
+                        };
+                        let address = buffer.as_ptr() as usize;
+                        assert!(
+                            source.is_lent(address),
+                            "an allocation was served from a chunk already returned"
+                        );
+                        assert_eq!(
+                            arena.device_range(buffer.as_ref()),
+                            Ok(buffer.device_address()),
+                            "a held page stopped resolving"
+                        );
+                        thread::yield_now();
+                        assert!(
+                            source.is_lent(address),
+                            "a held page's chunk was returned under it"
+                        );
+                        drop(buffer);
+                        done += 1;
+                        // Leave the chunk empty long enough for the
+                        // retiring thread to find it so.
+                        thread::sleep(Duration::from_micros(50));
+                    }
+                    assert!(done > 0, "an allocator never got a page");
+                });
+            }
+            scope.spawn(|| {
+                test_processor_identity::set(ProcessorId::new(ALLOCATORS as u16));
+                let deadline = std::time::Instant::now() + LOST_WAKE_TIMEOUT;
+                while retirements.load(Ordering::Relaxed) < RETIREMENTS
+                    && std::time::Instant::now() < deadline
+                {
+                    retirements.fetch_add(block_on(arena.retire_empty(0)), Ordering::Relaxed);
+                    thread::yield_now();
+                }
+                stop.store(true, Ordering::SeqCst);
+            });
+        });
+        assert!(
+            retirements.load(Ordering::Relaxed) >= RETIREMENTS,
+            "the retiring thread raced too few allocations to mean anything"
+        );
+        assert_eq!(arena.stats().pages_in_use, 0);
+        block_on(arena.retire_empty(0));
+        assert_eq!(arena.stats().chunks, 0);
+        assert_eq!(source.lends(), source.returns());
+    }
+
+    #[test]
+    fn retained_empty_chunks_stay() {
+        let (arena, source) = elastic(4 * PAGE_BYTES, 4, 1);
+        block_on(arena.reserve(ChunkClass::ReadWrite, 3)).expect("host memory");
+        assert_eq!(block_on(arena.retire_empty(1)), 2);
+        assert_eq!(arena.stats().chunks, 1);
+        assert_eq!(block_on(arena.retire_empty(0)), 1);
+        assert_eq!(arena.stats().chunks, 0);
+        assert_eq!(source.returns(), 3);
+    }
+
+    #[test]
+    fn retained_empty_chunks_are_counted_per_class() {
+        let (arena, _) = elastic(4 * PAGE_BYTES, 6, 1);
+        block_on(arena.reserve(ChunkClass::ReadWrite, 3)).expect("host memory");
+        block_on(arena.reserve(ChunkClass::Read, 2)).expect("host memory");
+        block_on(arena.reserve(ChunkClass::Resident, 1)).expect("host memory");
+        assert_eq!(
+            block_on(arena.retire_empty(1)),
+            3,
+            "two read-write and one read chunk go, one of each stays"
+        );
+        assert_eq!(arena.stats().chunks_by_class, [1, 1, 1]);
+        assert_eq!(
+            block_on(arena.retire_empty(0)),
+            2,
+            "a resident chunk never retires"
+        );
+        assert_eq!(arena.stats().chunks_by_class, [1, 0, 0]);
+    }
+
+    #[test]
+    fn a_free_on_another_thread_empties_a_chunk_and_the_next_pass_returns_it() {
+        let (arena, source) = elastic(4 * PAGE_BYTES, 4, 1);
+        let buffer = arena
+            .allocate(ChunkClass::ReadWrite, pages(1))
+            .expect("the allocation grows the arena");
+        assert_eq!(block_on(arena.retire_empty(0)), 0);
+        // The pass consumed the chunk's empty-set bit while it was in use.
+        assert_eq!(arena.stats().noted_empty_chunks, 0);
+        thread::spawn(move || drop(buffer))
+            .join()
+            .expect("the freeing thread finished");
+        assert_eq!(
+            arena.stats().noted_empty_chunks,
+            1,
+            "the free that emptied the chunk noted it"
+        );
+        assert_eq!(block_on(arena.retire_empty(0)), 1);
+        assert_eq!(source.returns(), 1);
+    }
+
+    #[test]
+    fn a_contended_growth_answers_replenishing_and_the_release_wakes_the_waiter() {
+        let (arena, _) = elastic(4 * PAGE_BYTES, 2, 1);
+        let mut grow = arena.try_grow().expect("nobody holds the lock");
+        assert_eq!(
+            arena.allocate(ChunkClass::ReadWrite, pages(1)).unwrap_err(),
+            DmaError::Replenishing { bytes: PAGE_BYTES },
+            "a dry class whose growth is held answers Replenishing"
+        );
+
+        let (parking, parked_signal) = mpsc::channel();
+        let (done, finished) = mpsc::channel();
+        let waiter = {
+            let arena = arena.clone();
+            thread::spawn(move || {
+                test_processor_identity::set(ProcessorId::new(0));
+                let parked = AtomicUsize::new(0);
+                let page = allocate_waiting(&arena, &parked, || {
+                    parking.send(()).expect("the test is listening");
+                });
+                done.send(()).expect("the test is listening");
+                drop(page);
+            })
+        };
+        parked_signal
+            .recv_timeout(LOST_WAKE_TIMEOUT)
+            .expect("the allocator was told to wait for the growth");
+        assert!(
+            finished.recv_timeout(Duration::from_millis(50)).is_err(),
+            "the allocator found a page before the growth published one"
+        );
+
+        arena
+            .grow_one(&mut grow, ChunkClass::ReadWrite)
+            .unwrap_or_else(|_| panic!("the source has a chunk"));
+        drop(grow);
+        finished
+            .recv_timeout(LOST_WAKE_TIMEOUT)
+            .expect("the release of `grow` did not wake the parked allocator");
+        waiter.join().expect("the waiter finished");
+    }
+
+    #[test]
+    fn a_refused_growth_wakes_replenishing_waiters_who_then_learn_exhausted() {
+        let (arena, source) = elastic(4 * PAGE_BYTES, 1, 1);
+        // The source has nothing left to lend.
+        let taken = source.lend(4 * PAGE_BYTES).expect("the one chunk");
+        let mut grow = arena.try_grow().expect("nobody holds the lock");
+
+        let (parking, parked_signal) = mpsc::channel();
+        let (done, finished) = mpsc::channel();
+        let waiter = {
+            let arena = arena.clone();
+            thread::spawn(move || {
+                test_processor_identity::set(ProcessorId::new(0));
+                let ask = || arena.allocate(ChunkClass::ReadWrite, pages(1)).map(drop);
+                assert_eq!(ask(), Err(DmaError::Replenishing { bytes: PAGE_BYTES }));
+                let mark = arena.want_space();
+                assert_eq!(ask(), Err(DmaError::Replenishing { bytes: PAGE_BYTES }));
+                parking.send(()).expect("the test is listening");
+                block_on(arena.space_changed(mark));
+                done.send(ask()).expect("the test is listening");
+            })
+        };
+        parked_signal
+            .recv_timeout(LOST_WAKE_TIMEOUT)
+            .expect("the allocator was told to wait for the growth");
+
+        assert!(matches!(
+            arena.grow_one(&mut grow, ChunkClass::ReadWrite),
+            Err(GrowError::Refused)
+        ));
+        drop(grow);
+        assert_eq!(
+            finished
+                .recv_timeout(LOST_WAKE_TIMEOUT)
+                .expect("a refused growth did not wake the parked allocator"),
+            Err(DmaError::Exhausted { bytes: PAGE_BYTES }),
+            "once the lock is free the refusal is the allocation's own"
+        );
+        waiter.join().expect("the waiter finished");
+        source.take_back(taken);
+    }
+
+    #[test]
+    fn a_reused_header_serves_only_its_new_class() {
+        let (arena, _) = elastic(4 * PAGE_BYTES, 4, 1);
+        block_on(arena.reserve(ChunkClass::ReadWrite, 1)).expect("host memory");
+        assert_eq!(block_on(arena.retire_empty(0)), 1);
+        block_on(arena.reserve(ChunkClass::Read, 1)).expect("host memory");
+        assert_eq!(
+            arena.counters.slots.load(Ordering::Relaxed),
+            1,
+            "the retired header was reused, not a new slot"
+        );
+        assert_eq!(arena.stats().chunks_by_class, [0, 1, 0]);
+
+        let (read_start, read_end) = chunk_range(&arena, 0);
+        let page = arena
+            .allocate(ChunkClass::ReadWrite, pages(1))
+            .expect("the arena grows a read-write chunk");
+        assert!(
+            !(read_start..read_end).contains(&(page.as_ptr() as usize)),
+            "a read-write page came out of the chunk that reused a read-write header"
+        );
+        assert_eq!(arena.stats().chunks_by_class, [0, 1, 1]);
+    }
+
+    #[test]
+    fn dropping_an_arena_gives_back_only_its_live_chunks() {
+        let (arena, source) = elastic(4 * PAGE_BYTES, 4, 1);
+        block_on(arena.reserve(ChunkClass::ReadWrite, 3)).expect("host memory");
+        assert_eq!(block_on(arena.retire_empty(2)), 1);
+        assert_eq!((source.lends(), source.returns()), (3, 1));
+        drop(arena);
+        assert_eq!(
+            source.returns(),
+            3,
+            "the arena gave back exactly lent minus returned"
+        );
+    }
+
+    #[test]
+    fn a_fixed_arena_never_lends_for_a_request_class() {
+        let (arena, source) = empty_arena(4 * PAGE_BYTES, 4, Fixed, 1);
+        block_on(arena.reserve(ChunkClass::ReadWrite, 1)).expect("host memory");
+        let held: Vec<_> = (0..4)
+            .map(|_| {
+                arena
+                    .allocate(ChunkClass::ReadWrite, pages(1))
+                    .expect("a page of the reserved chunk")
+            })
+            .collect();
+        let lends = source.lends();
+        assert_eq!(
+            arena.allocate(ChunkClass::ReadWrite, pages(1)).unwrap_err(),
+            DmaError::Exhausted { bytes: PAGE_BYTES }
+        );
+        assert_eq!(source.lends(), lends, "a refusal lent nothing");
+
+        let resident = arena
+            .allocate(ChunkClass::Resident, pages(1))
+            .expect("a resident allocation still grows");
+        assert_eq!(source.lends(), lends + 1);
+        assert_eq!(arena.stats().chunks_by_class, [1, 0, 1]);
+        drop((held, resident));
+    }
+
+    #[test]
+    fn a_refused_allocator_is_not_woken_by_its_own_attempt() {
+        let (arena, source) = elastic(4 * PAGE_BYTES, 1, 1);
+        let _taken = source.lend(4 * PAGE_BYTES).expect("the one chunk");
+        let refused = DmaError::Exhausted { bytes: PAGE_BYTES };
+        assert_eq!(
+            arena.allocate(ChunkClass::ReadWrite, pages(1)).unwrap_err(),
+            refused
+        );
+        let mark = arena.want_space();
+        assert_eq!(
+            arena.allocate(ChunkClass::ReadWrite, pages(1)).unwrap_err(),
+            refused
+        );
+        assert_eq!(
+            arena.space_mark(),
+            mark,
+            "the second attempt raised the signal its caller parks on"
+        );
+        assert!(arena.short_of_space(), "the arena is still armed");
+    }
+
+    type SharedArenas = DmaArenas<TestSource, TestDomain<Elastic>>;
+
+    /// Two elastic arenas of one source of `capacity` chunks.
+    fn shared(
+        chunk_bytes: usize,
+        capacity: usize,
+        processors: usize,
+    ) -> (Arc<SharedArenas>, [Arc<TestArena<Elastic>>; 2], TestSource) {
+        let source = TestSource::new(chunk_bytes, capacity);
+        let mut arenas = DmaArenas::new(source.clone());
+        let domain = || TestDomain {
+            source: source.clone(),
+            arena: Weak::new(),
+            accesses: StdMutex::new(Vec::new()),
+        };
+        let first = arenas.arena(domain(), chunk_bytes, processors);
+        let second = arenas.arena(domain(), chunk_bytes, processors);
+        (Arc::new(arenas), [first, second], source)
+    }
+
+    #[test]
+    fn a_refused_growth_retries_when_the_source_takes_a_chunk_back() {
+        let (arenas, [x, y], source) = shared(4 * PAGE_BYTES, 2, 2);
+        // X takes the whole source.
+        let held: Vec<_> = (0..8)
+            .map(|_| {
+                x.allocate(ChunkClass::ReadWrite, pages(1))
+                    .expect("a page of X")
+            })
+            .collect();
+        assert_eq!(source.lends(), 2);
+
+        // Y is refused: its bit is set and the demand signal moved.
+        let before = arenas.demand_mark();
+        assert_eq!(
+            y.allocate(ChunkClass::ReadWrite, pages(1)).unwrap_err(),
+            DmaError::Exhausted { bytes: PAGE_BYTES }
+        );
+        assert_ne!(arenas.demand_mark(), before, "the refusal raised the kick");
+        assert_eq!(
+            y.refused.load(Ordering::Acquire),
+            1 << ChunkClass::ReadWrite.index()
+        );
+
+        let (parking, parked_signal) = mpsc::channel();
+        let (maintaining, maintenance_parked) = mpsc::channel();
+        let (done, finished) = mpsc::channel();
+        let waiter = {
+            let y = y.clone();
+            thread::spawn(move || {
+                test_processor_identity::set(ProcessorId::new(1));
+                let parked = AtomicUsize::new(0);
+                let page = allocate_waiting(&y, &parked, || {
+                    parking.send(()).expect("the test is listening");
+                });
+                done.send(()).expect("the test is listening");
+                drop(page);
+            })
+        };
+        parked_signal
+            .recv_timeout(LOST_WAKE_TIMEOUT)
+            .expect("Y's allocator was refused at a dry source");
+
+        let maintenance = {
+            let (arenas, source) = (arenas.clone(), source.clone());
+            thread::spawn(move || {
+                test_processor_identity::set(ProcessorId::new(0));
+                let mark = block_on(arenas.grow_refused())
+                    .expect("Y's lend stays refused while X holds the source");
+                maintaining.send(()).expect("the test is listening");
+                block_on(source.chunk_returned(mark));
+                assert!(
+                    block_on(arenas.grow_refused()).is_none(),
+                    "the retry after a chunk came back grew Y"
+                );
+            })
+        };
+        maintenance_parked
+            .recv_timeout(LOST_WAKE_TIMEOUT)
+            .expect("the maintenance pass retried and learned the lend stayed refused");
+        assert!(
+            finished.recv_timeout(Duration::from_millis(50)).is_err(),
+            "Y's allocator found a page while the source was dry"
+        );
+
+        drop(held);
+        assert_eq!(block_on(x.retire_empty(0)), 2);
+        finished
+            .recv_timeout(LOST_WAKE_TIMEOUT)
+            .expect("a chunk that came back did not reach the refused allocator");
+        waiter.join().expect("the waiter finished");
+        maintenance.join().expect("the maintenance pass finished");
+        assert_eq!(y.stats().chunks_by_class, [0, 0, 1]);
+    }
+
+    #[test]
+    fn no_allocator_stays_parked_while_the_arena_or_the_source_has_room() {
+        const WAITERS: usize = 6;
+        const FREERS: usize = 2;
+        const ROUNDS: usize = 1500;
+        // Chunks of four pages, three of them for two arenas: either one
+        // can take them all, so each is refused while the other holds
+        // them, and the loop below is what moves them.
+        let (arenas, arena, source) = shared(4 * PAGE_BYTES, 3, WAITERS + 1);
+        let parked = Arc::new(AtomicUsize::new(0));
+        let finished = Arc::new(AtomicUsize::new(0));
+
+        let (senders, receivers): (Vec<_>, Vec<_>) =
+            (0..FREERS).map(|_| mpsc::channel::<ArenaBuffer>()).unzip();
+        let freers: Vec<_> = receivers
+            .into_iter()
+            .map(|receiver| thread::spawn(move || receiver.into_iter().for_each(drop)))
+            .collect();
+        let waiters: Vec<_> = (0..WAITERS)
+            .map(|me| {
+                let (arena, parked, finished) =
+                    (arena[me % 2].clone(), parked.clone(), finished.clone());
+                let to_free = senders[me % FREERS].clone();
+                thread::spawn(move || {
+                    test_processor_identity::set(ProcessorId::new(me as u16));
+                    for _ in 0..ROUNDS {
+                        let page = allocate_waiting(&arena, &parked, || {});
+                        to_free.send(page).expect("the freer is alive");
+                    }
+                    finished.fetch_add(1, Ordering::SeqCst);
+                })
+            })
+            .collect();
+        drop(senders);
+        let maintenance = {
+            let (arenas, finished) = (arenas.clone(), finished.clone());
+            thread::spawn(move || {
+                test_processor_identity::set(ProcessorId::new(WAITERS as u16));
+                while finished.load(Ordering::SeqCst) < WAITERS {
+                    block_on(arenas.grow_refused());
+                    block_on(arenas.retire_empty(0));
+                    thread::yield_now();
+                }
+            })
+        };
+
+        let deadline = std::time::Instant::now() + LOST_WAKE_TIMEOUT;
+        while finished.load(Ordering::SeqCst) < WAITERS && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            finished.load(Ordering::SeqCst),
+            WAITERS,
+            "{} allocators are parked with {} of {} chunks lent: a wake was lost",
+            parked.load(Ordering::SeqCst),
+            source.lends() - source.returns(),
+            3
+        );
+        for waiter in waiters {
+            waiter.join().expect("a waiter finished");
+        }
+        maintenance.join().expect("the maintenance loop finished");
+        for freer in freers {
+            freer.join().expect("a freer finished");
+        }
+        for arena in &arena {
+            assert_eq!(arena.stats().pages_in_use, 0);
+        }
+        block_on(arenas.retire_empty(0));
+        assert_eq!(source.lends(), source.returns());
     }
 }
