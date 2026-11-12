@@ -2303,13 +2303,11 @@ where
                 Err(errno) => return errno,
             };
             let timeout = wasix_effective_socket_timeout(send_timeout, fdflags);
-            // A datagram goes out whole, so it is gathered whole: a
-            // payload the protocol cannot carry is refused before any
-            // kernel memory is held for it.
-            if gather.remaining() > crate::wasmtime_adapter::wasi::MAX_WASI_UDP_DATAGRAM_BYTES {
-                return p1::errno::MSGSIZE;
-            }
-            let bytes = gather.next_chunk().unwrap_or_default();
+            let bytes =
+                match gather.datagram(crate::wasmtime_adapter::wasi::MAX_WASI_UDP_DATAGRAM_BYTES) {
+                    Ok(bytes) => bytes,
+                    Err(errno) => return errno,
+                };
             let sent = match service
                 .udp_send_address(socket, address, port, &bytes, timeout)
                 .await

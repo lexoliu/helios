@@ -413,6 +413,19 @@ impl Preview1Gather {
         self.fill(&mut chunk);
         Some(chunk)
     }
+
+    /// Everything still held, in one piece, for a datagram that can carry
+    /// at most `max` bytes. A datagram goes out whole, so a payload the
+    /// protocol cannot carry is `EMSGSIZE` before any kernel memory is
+    /// held for it.
+    pub(super) fn datagram(&mut self, max: usize) -> Result<Vec<u8>, i32> {
+        if self.remaining > max {
+            return Err(p1::errno::MSGSIZE);
+        }
+        let mut payload = vec![0; self.remaining];
+        self.fill(&mut payload);
+        Ok(payload)
+    }
 }
 
 /// Sends everything `gather` still holds through `send`, one chunk at a

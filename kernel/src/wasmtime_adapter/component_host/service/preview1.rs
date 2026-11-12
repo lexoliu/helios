@@ -3714,12 +3714,6 @@ fn p1_read_subscriptions(
     if nsubscriptions as usize > max_subscriptions {
         return Err(p1::errno::INVAL);
     }
-    p1_checked_guest_array(
-        memory.len,
-        subscriptions,
-        nsubscriptions as usize,
-        P1_SUBSCRIPTION_SIZE as usize,
-    )?;
     let mut parsed = Vec::with_capacity(nsubscriptions as usize);
     for index in 0..nsubscriptions {
         let subscription_ptr =
@@ -5523,18 +5517,28 @@ mod tests {
         assert_eq!(draws, 0, "a refused length draws no entropy");
 
         let wanted = guest.len() - 5;
+        let mut drawn = Vec::new();
         let status = p1_fill_random(memory, GuestAddress::wasm32(5), wanted as u32, |chunk| {
-            assert!(chunk.len() <= P1_RANDOM_CHUNK_BYTES);
+            drawn.push(chunk.len());
             chunk.fill(0xA5);
         });
         assert_eq!(status, p1::errno::SUCCESS);
+        assert_eq!(
+            drawn,
+            [
+                P1_RANDOM_CHUNK_BYTES,
+                P1_RANDOM_CHUNK_BYTES,
+                P1_RANDOM_CHUNK_BYTES - 5
+            ],
+            "each pass draws exactly the bytes it writes"
+        );
         assert!(guest[..5].iter().all(|byte| *byte == 0));
         assert!(guest[5..].iter().all(|byte| *byte == 0xA5));
     }
 
     /// `poll_oneoff` refuses a subscription count above what the process's
-    /// descriptor limit admits (`EINVAL`) and an array that cannot lie in
-    /// guest memory (`EFAULT`), both before the subscriptions are collected.
+    /// descriptor limit admits (`EINVAL`) before anything is collected for
+    /// it, and an array that does not lie in guest memory (`EFAULT`).
     #[test]
     fn poll_oneoff_refuses_a_subscription_count_beyond_its_bounds() {
         assert_eq!(p1_subscription_limit(DescriptorLimit::DEFAULT), 2049);
@@ -5719,6 +5723,30 @@ mod tests {
             p1_read_iovs_with_byte_len(memory_of(&guest), GuestAddress::wasm32(len as u32), 1)
                 .expect("the iovec fits");
         (guest, layout)
+    }
+
+    /// A datagram's payload is gathered whole, across its buffers and past
+    /// the size of a stream chunk, and one byte more than the protocol
+    /// carries is `EMSGSIZE` with nothing taken.
+    #[test]
+    fn a_datagram_is_gathered_whole_or_refused() {
+        let max = P1_IO_CHUNK_BYTES + 7;
+        let mut guest: Vec<u8> = (0..max + 1).map(|index| index as u8).collect();
+        let table = guest.len() as u32;
+        guest.extend(iovec_table(&[(0, 9), (9, max as u32 - 9), (max as u32, 1)]));
+        let memory = memory_of(&guest);
+
+        let whole = p1_read_iovs_with_byte_len(memory, GuestAddress::wasm32(table), 2)
+            .expect("the iovecs fit");
+        let mut gather = Preview1Gather::new(memory, &whole).expect("buffers fit");
+        assert_eq!(gather.datagram(max).as_deref(), Ok(&guest[..max]));
+        assert_eq!(gather.remaining(), 0);
+
+        let over = p1_read_iovs_with_byte_len(memory, GuestAddress::wasm32(table), 3)
+            .expect("the iovecs fit");
+        let mut gather = Preview1Gather::new(memory, &over).expect("buffers fit");
+        assert_eq!(gather.datagram(max), Err(p1::errno::MSGSIZE));
+        assert_eq!(gather.remaining(), max + 1);
     }
 
     /// A file for [`p1_write_gathered`] to land chunks in, which records
