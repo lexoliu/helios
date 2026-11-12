@@ -257,3 +257,87 @@ where
          retains the range on a free list); got {translation:?}"
     );
 }
+
+/// Runs two closures at the same time and returns when both are done.
+///
+/// `hal` is `no_std` and cannot spawn a thread itself, so a backend whose
+/// test environment has threads supplies them here.
+pub trait Concurrently {
+    /// Run `first` and `second` in parallel and wait for both.
+    fn join<A, B>(&self, first: A, second: B)
+    where
+        A: FnOnce() + Send,
+        B: FnOnce() + Send;
+}
+
+/// Passes through every iteration of the commit and decommit loops of
+/// [`run_concurrent_conformance`].
+const RACE_ITERATIONS: usize = 2000;
+
+/// Run the conformance checks that need two threads in one address space.
+///
+/// Today that is a `commit` racing a `decommit` of the same range: a
+/// range's tracker record and its translations are one state, so however
+/// the two interleave, the range ends up either committed with every
+/// page translating, or uncommitted, never recorded as committed with its
+/// translations gone.
+pub fn run_concurrent_conformance<F, A, C>(fresh: F, concurrently: &C)
+where
+    F: Fn() -> A,
+    A: AddressSpace,
+    C: Concurrently,
+{
+    commit_races_decommit(&fresh, concurrently);
+}
+
+fn commit_races_decommit<F, A, C>(fresh: F, concurrently: &C)
+where
+    F: Fn() -> A,
+    A: AddressSpace,
+    C: Concurrently,
+{
+    let address_space = fresh();
+    let range = address_space.reserve(pages(8)).expect("reserve");
+    let flags = PageFlags::READ | PageFlags::WRITE;
+    concurrently.join(
+        || {
+            for _ in 0..RACE_ITERATIONS {
+                match address_space.commit(range, flags) {
+                    Ok(()) | Err(AddressSpaceError::Overlap) => {}
+                    Err(error) => panic!("commit racing a decommit failed: {error:?}"),
+                }
+            }
+        },
+        || {
+            for _ in 0..RACE_ITERATIONS {
+                match address_space.decommit(range) {
+                    Ok(()) | Err(AddressSpaceError::NotCommitted) => {}
+                    Err(error) => panic!("decommit racing a commit failed: {error:?}"),
+                }
+            }
+        },
+    );
+
+    // Whichever side won the last round, the tracker and the translations
+    // must agree: a range the tracker holds committed (a commit over it
+    // overlaps) has to translate on every page.
+    match address_space.commit(range, flags) {
+        Ok(()) => {}
+        Err(AddressSpaceError::Overlap) => {
+            for index in 0..8 {
+                let page = VirtAddr::new(range.start.raw() + pages(index));
+                assert!(
+                    matches!(address_space.translate(page), Translation::Committed { .. }),
+                    "the range is recorded committed but page {index} does not translate"
+                );
+            }
+        }
+        Err(error) => panic!("commit after the race failed: {error:?}"),
+    }
+    address_space
+        .decommit(range)
+        .expect("decommit after the race");
+    address_space
+        .release(range)
+        .expect("release after the race");
+}

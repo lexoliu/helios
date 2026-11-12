@@ -919,6 +919,28 @@ mod tests {
     }
 
     #[test]
+    fn passes_hal_concurrent_conformance_suite() {
+        use helios_hal::vmm_test_harness::{Concurrently, run_concurrent_conformance};
+
+        struct Threads;
+        impl Concurrently for Threads {
+            fn join<A, B>(&self, first: A, second: B)
+            where
+                A: FnOnce() + Send,
+                B: FnOnce() + Send,
+            {
+                std::thread::scope(|scope| {
+                    let first = scope.spawn(first);
+                    let second = scope.spawn(second);
+                    first.join().expect("first racer panicked");
+                    second.join().expect("second racer panicked");
+                });
+            }
+        }
+        run_concurrent_conformance(HostedAddressSpace::new, &Threads);
+    }
+
+    #[test]
     fn relocate_preserves_committed_bytes() {
         use helios_hal::vmm::AddressSpace;
         let address_space = HostedAddressSpace::new();
