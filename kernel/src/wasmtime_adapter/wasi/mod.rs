@@ -27,7 +27,6 @@ extern crate alloc;
 
 use alloc::borrow::ToOwned;
 use alloc::string::String;
-use alloc::vec;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 use core::mem::MaybeUninit;
@@ -68,7 +67,7 @@ const DEFAULT_WASI_TCP_LISTEN_BACKLOG: u16 = 128;
 const DEFAULT_WASI_TCP_KEEP_ALIVE_IDLE_NANOS: u64 = 7_200_000_000_000;
 const DEFAULT_WASI_TCP_KEEP_ALIVE_INTERVAL_NANOS: u64 = 75_000_000_000;
 const DEFAULT_WASI_TCP_KEEP_ALIVE_COUNT: u32 = 9;
-const MAX_WASI_UDP_DATAGRAM_BYTES: usize = u16::MAX as usize;
+pub(crate) const MAX_WASI_UDP_DATAGRAM_BYTES: usize = u16::MAX as usize;
 
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 #[error("guest requested wasi preview2 exit code {code}")]
@@ -98,6 +97,8 @@ impl Preview3GuestExit {
 pub(crate) enum WasiAdapterTrap {
     #[error("random byte length exceeds usize")]
     RandomLengthOverflow,
+    #[error("the kernel heap cannot serve a random byte list of {len} bytes")]
+    RandomBytesUnavailable { len: u64 },
     #[error("file read offset overflowed u64")]
     FileReadOffsetOverflow,
     #[error("file write offset does not fit into usize")]
@@ -282,6 +283,34 @@ mod tests {
             address: crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new(octets)),
             port,
         }
+    }
+
+    #[test]
+    fn a_random_length_the_address_space_cannot_hold_traps_without_filling() {
+        // Both exceed `isize::MAX`, the most a single allocation can span, so
+        // the reservation refuses them on every host without allocating.
+        for len in [u64::MAX, isize::MAX as u64 + 1] {
+            let mut filled = false;
+            let error = super::random_bytes(len, |_| filled = true)
+                .expect_err("a list larger than the address space cannot be built");
+            assert_eq!(
+                error.downcast_ref::<super::WasiAdapterTrap>(),
+                Some(&super::WasiAdapterTrap::RandomBytesUnavailable { len })
+            );
+            assert!(!filled, "fill ran for an unservable length {len}");
+        }
+    }
+
+    #[test]
+    fn a_small_random_length_is_filled_once_to_exactly_that_length() {
+        let mut calls = 0_u32;
+        let bytes = super::random_bytes(37, |buffer| {
+            calls += 1;
+            buffer.fill(0xa5);
+        })
+        .expect("a small list is served");
+        assert_eq!(bytes, vec![0xa5_u8; 37]);
+        assert_eq!(calls, 1);
     }
 
     #[test]

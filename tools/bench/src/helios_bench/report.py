@@ -474,6 +474,13 @@ class WorkloadResult(BaseModel):
     headline: bool
     description: str
     throughput_bytes: int | None
+    matched_metrics: tuple[str, ...] = Field(
+        default=(),
+        description=(
+            "metrics the manifest holds equal across the compared columns: conditions the "
+            "comparison runs at, never measurements the gate judges"
+        ),
+    )
     cells: dict[Side, Cell]
     failures: dict[Side, str] = Field(
         default_factory=dict,

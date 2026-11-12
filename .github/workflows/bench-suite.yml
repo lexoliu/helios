@@ -59,7 +59,7 @@ on:
         type: boolean
         default: false
   pull_request:
-    types: [opened, synchronize, reopened, labeled]
+    types: [opened, synchronize, reopened, labeled, ready_for_review]
   push:
     branches: [dev]
     tags: ["v*"]
@@ -88,9 +88,66 @@ env:
   HELIOS_NET_BRIDGE: helios-br0
 
 jobs:
+  # Without the `bench` label a pull request runs only `tooling`'s own
+  # checks: the tools/bench lint and tests, the committed README and docs
+  # sections, and the native counterparts' build. These are the files they
+  # read; a pull request that touches none of them, or is a draft, skips
+  # `tooling` and with it the run (#844). Marking a draft ready runs them.
+  changes:
+    name: changes
+    if: >-
+      github.event_name == 'pull_request'
+      && github.event.action != 'labeled'
+      && !contains(github.event.pull_request.labels.*.name, 'bench')
+      && !github.event.pull_request.draft
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      tooling: ${{ steps.filter.outputs.tooling }}
+    steps:
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          # The workflows and actions the tests parse, the bench tooling
+          # and the workload table it reads, the sections `render check`
+          # compares, and everything `helios-compiler-host`'s release
+          # build reads: the workspace manifests, lockfile, toolchain,
+          # Wasmtime pin and the crates it builds from.
+          filters: |
+            tooling:
+              - '.github/**'
+              - 'tools/bench/**'
+              - 'tools/wasi-apps/**'
+              - 'README.md'
+              - 'docs/benchmarks.md'
+              - 'docs/benchmarks/**'
+              - 'docs/wasmtime.md'
+              - '**/Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - '.cargo/**'
+              - 'compiler-host/**'
+              - 'compiler-abi/**'
+              - 'compiler-support/**'
+              - 'artifact/**'
+              - 'hal/**'
+
   tooling:
     name: tooling
-    if: github.event.action != 'labeled' || github.event.label.name == 'bench'
+    needs: changes
+    # A labelled pull request, a push and a dispatch always run it; an
+    # unlabelled pull request only when `changes` found one of its inputs.
+    # A label other than `bench` runs nothing.
+    if: >-
+      !cancelled()
+      && (github.event_name != 'pull_request'
+          || (github.event.action == 'labeled' && github.event.label.name == 'bench')
+          || (github.event.action != 'labeled'
+              && (contains(github.event.pull_request.labels.*.name, 'bench')
+                  || needs.changes.outputs.tooling == 'true')))
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     outputs:
@@ -266,12 +323,6 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-zigbuild
-      # The host tool links the Wasmtime fork, a release build this job
-      # would otherwise repeat from nothing on every run.
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: helios
-          key: bench-native
       - name: Build the native counterparts
         working-directory: helios
         run: tools/bench/native/build.sh x86_64
