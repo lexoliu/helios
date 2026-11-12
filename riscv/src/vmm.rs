@@ -1634,7 +1634,9 @@ fn flush_tlb_pages(start: usize, pages: usize) {
 }
 
 fn page_flags_to_pte(flags: PageFlags) -> Result<u64, AddressSpaceError> {
-    if flags.is_empty() {
+    // Write without read is a reserved encoding: every access through
+    // such a leaf faults, and the spurious-fault retry would loop on it.
+    if flags.is_empty() || (flags.contains(PageFlags::WRITE) && !flags.contains(PageFlags::READ)) {
         return Err(AddressSpaceError::InvalidFlags);
     }
     let mut pte = 0u64;
