@@ -25,8 +25,17 @@
 //! What a client hands back is not a message either — its windows when
 //! it dies, one window when it drops the resource, one window when it
 //! cancels a `create` the compositor was told about: each is a drop, a
-//! drop cannot await room in a queue, so the identities go on an
-//! unbounded return queue and the supervisor is signalled.
+//! drop cannot await room in a queue, so the identities go on a return
+//! queue and the supervisor is signalled.
+//!
+//! A window handed back leaves the desktop at once but stays counted, in
+//! the registry's [`MAX_LIVE_SURFACES`] and in the creating instance's
+//! [`MAX_INSTANCE_SURFACES`], until the supervisor's drain has ended the
+//! compositor's view of it and told the compositor. That is what bounds
+//! the return queue: at most [`MAX_LIVE_SURFACES`] identities are
+//! outstanding, so the queue has room for every one of them and a push
+//! never fails. The drain holds a [`ReturnedSurface`] for each identity it
+//! took and the slot comes back when that guard drops.
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::task::{Context, Poll};
@@ -145,7 +154,17 @@ pub struct SurfaceShared {
     published: Notify,
     /// Cleared when the client drops the surface, and when the
     /// compositor dies under it.
+    ///
+    /// Written by whichever processor takes the window off the desktop.
     alive: AtomicBool,
+    /// Set while the window was handed back and the drain has not yet
+    /// processed it. Set (before `alive` is cleared) by the processor
+    /// handing it back, under the registry's lock; cleared by the
+    /// processor running the drain, or the supervisor retiring the
+    /// compositor, under the same lock. Read by the creating instance's
+    /// processor, which counts the window against its bound until this is
+    /// clear.
+    undrained: AtomicBool,
     /// Events handed to the client's reader.
     delivered: AtomicU64,
     /// Reports dropped because the client had not kept up.
@@ -164,6 +183,15 @@ impl SurfaceShared {
     /// Whether this surface is still on the desktop.
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Acquire)
+    }
+
+    /// Whether this surface still counts against its creator's
+    /// [`MAX_INSTANCE_SURFACES`]: it is on the desktop, or it was handed
+    /// back and the drain has not processed it yet.
+    pub fn holds_slot(&self) -> bool {
+        // `undrained` is set before `alive` is cleared, so a window
+        // between the two states is never seen as neither.
+        self.alive.load(Ordering::Acquire) || self.undrained.load(Ordering::Acquire)
     }
 
     /// Take this surface off the desktop, from either end.
@@ -281,6 +309,36 @@ impl ReturnedSurfaces {
     }
 }
 
+/// One window the drain took off the return queue and has not finished
+/// with.
+///
+/// The window's slot, in the registry and in its creator, stays counted
+/// for as long as this lives. Dropping it releases the slot, so the drain
+/// holds it until the compositor's view of the window ended and the
+/// compositor was told, and a drain that fails part-way releases the
+/// windows it never reached the way a dead compositor's windows are.
+#[must_use = "the window's slot is released when this drops, which is after the drain finished with it"]
+pub struct ReturnedSurface {
+    id: SurfaceId,
+    service: SurfaceService,
+}
+
+impl ReturnedSurface {
+    pub const fn id(&self) -> SurfaceId {
+        self.id
+    }
+
+    /// The compositor's view of this window ended and the compositor was
+    /// told; its slot comes back.
+    pub fn drained(self) {}
+}
+
+impl Drop for ReturnedSurface {
+    fn drop(&mut self) {
+        self.service.settle(self.id);
+    }
+}
+
 /// One `create` the kernel forwards to the compositor.
 pub struct SurfaceCreate {
     pub id: SurfaceId,
@@ -304,15 +362,30 @@ pub enum SurfaceRequest {
     },
 }
 
+/// The windows the registry counts, behind one lock so that handing a
+/// window back moves it between the two without a moment in which it is
+/// counted in neither.
+struct Desk {
+    /// Windows on the desktop.
+    live: Vec<Arc<SurfaceShared>>,
+    /// Windows handed back and not yet processed by the drain: off the
+    /// desktop, still counted. Capacity is the registry's bound, which
+    /// `register` keeps `live` and this within together.
+    returned: ArrayVec<Arc<SurfaceShared>, MAX_LIVE_SURFACES>,
+}
+
 /// The registry every side of the surface path shares.
 struct SurfaceRegistry {
     next_id: AtomicU64,
-    live: Mutex<Vec<Arc<SurfaceShared>>>,
+    desk: Mutex<Desk>,
     /// Which instance the kernel provisioned as the compositor. Zero
     /// until the supervisor has one, which is also what makes `deliver`
     /// refuse everybody before there is a desktop.
     compositor: AtomicU64,
-    /// Windows dying clients handed back, waiting for the supervisor.
+    /// Windows clients handed back, waiting for the supervisor. Each entry
+    /// holds at least one identity that is in `desk.returned`, and
+    /// `register` keeps those at most [`MAX_LIVE_SURFACES`], so a queue of
+    /// that many entries always has room.
     returned: ConcurrentQueue<ReturnedSurfaces>,
     /// Raised once per client handed back.
     returns: Notify,
@@ -338,9 +411,12 @@ impl SurfaceService {
         Self {
             inner: Arc::new(SurfaceRegistry {
                 next_id: AtomicU64::new(1),
-                live: Mutex::new(Vec::new()),
+                desk: Mutex::new(Desk {
+                    live: Vec::new(),
+                    returned: ArrayVec::new(),
+                }),
                 compositor: AtomicU64::new(0),
-                returned: ConcurrentQueue::unbounded(),
+                returned: ConcurrentQueue::bounded(MAX_LIVE_SURFACES),
                 returns: Notify::new(),
                 created: AtomicU64::new(0),
             }),
@@ -363,11 +439,22 @@ impl SurfaceService {
     /// Called when the plugin dies. The clients keep their frame buffers
     /// and the views of them — those are theirs — and learn the surface
     /// is `gone` from the next call they make on it.
+    ///
+    /// The windows still waiting on the return queue are the dead
+    /// compositor's too: it holds nothing of them any more and the next
+    /// one never knew them, so their slots come back here rather than
+    /// waiting for a drain that has no view to end. A window the drain
+    /// already took releases its own slot when the drain lets go of it.
     pub fn retire_compositor(&self) {
         self.inner.compositor.store(0, Ordering::Release);
-        let live = core::mem::take(&mut *self.inner.live.lock());
+        let live = core::mem::take(&mut self.inner.desk.lock().live);
         for surface in &live {
             surface.retire();
+        }
+        while let Ok(entry) = self.inner.returned.pop() {
+            for id in entry.ids {
+                self.settle(id);
+            }
         }
     }
 
@@ -384,16 +471,26 @@ impl SurfaceService {
 
     /// How many windows are on the desktop right now.
     pub fn live(&self) -> usize {
-        self.inner.live.lock().len()
+        self.inner.desk.lock().live.len()
+    }
+
+    /// How many windows were handed back and are still counted because
+    /// the drain has not processed them.
+    pub fn undrained(&self) -> usize {
+        self.inner.desk.lock().returned.len()
     }
 
     /// Mint a window of `geometry` and put it in the registry.
+    ///
+    /// Refused with `TooManySurfaces` while the windows on the desktop
+    /// and the ones handed back and not yet drained fill
+    /// [`MAX_LIVE_SURFACES`].
     pub fn register(
         &self,
         geometry: SurfaceGeometry,
     ) -> Result<Arc<SurfaceShared>, SurfaceServiceError> {
-        let mut live = self.inner.live.lock();
-        if live.len() >= MAX_LIVE_SURFACES {
+        let mut desk = self.inner.desk.lock();
+        if desk.live.len() + desk.returned.len() >= MAX_LIVE_SURFACES {
             return Err(SurfaceServiceError::TooManySurfaces);
         }
         let id = SurfaceId(self.inner.next_id.fetch_add(1, Ordering::AcqRel));
@@ -403,20 +500,22 @@ impl SurfaceService {
             events: ConcurrentQueue::bounded(SURFACE_EVENT_QUEUE_DEPTH),
             published: Notify::new(),
             alive: AtomicBool::new(true),
+            undrained: AtomicBool::new(false),
             delivered: AtomicU64::new(0),
             lost_reports: AtomicU64::new(0),
         });
-        live.push(shared.clone());
+        desk.live.push(shared.clone());
         self.inner.created.fetch_add(1, Ordering::AcqRel);
         Ok(shared)
     }
 
-    /// Take one window off the desktop and out of the registry.
+    /// Take one window off the desktop and out of the registry, for a
+    /// window the compositor holds nothing of: it frees its slot at once.
     pub fn unregister(&self, id: SurfaceId) {
-        let mut live = self.inner.live.lock();
-        if let Some(index) = live.iter().position(|surface| surface.id == id) {
-            let surface = live.swap_remove(index);
-            drop(live);
+        let mut desk = self.inner.desk.lock();
+        if let Some(index) = desk.live.iter().position(|surface| surface.id == id) {
+            let surface = desk.live.swap_remove(index);
+            drop(desk);
             surface.retire();
         }
     }
@@ -424,8 +523,9 @@ impl SurfaceService {
     /// The window `id` names, while it is on the desktop.
     pub fn lookup(&self, id: SurfaceId) -> Option<Arc<SurfaceShared>> {
         self.inner
-            .live
+            .desk
             .lock()
+            .live
             .iter()
             .find(|surface| surface.id == id)
             .cloned()
@@ -435,29 +535,83 @@ impl SurfaceService {
     /// which ends the compositor's view of each and tells the compositor
     /// it is gone.
     ///
-    /// Never waits and never fails: the queue is unbounded because the
-    /// alternative is a drop that has to park, and a drop cannot. A
-    /// window the compositor was never told about, or has already been
-    /// told is gone, costs it one `destroy` of an identity it does not
-    /// hold, which it ignores.
-    pub fn return_surfaces(&self, returned: ReturnedSurfaces) {
-        for id in &returned.ids {
-            self.unregister(*id);
+    /// Never waits and never fails, because a drop cannot park. The
+    /// windows leave the desktop at once but stay counted until the drain
+    /// has processed them, so the return queue's capacity of
+    /// [`MAX_LIVE_SURFACES`] entries always has room: a push that fails is
+    /// a broken invariant and panics.
+    ///
+    /// An identity that is not on the desktop — already retired with a
+    /// compositor that died, or never registered — is dropped from the
+    /// entry: nothing is left of it to count or to drain. A window the
+    /// compositor was never told about costs it one `destroy` of an
+    /// identity it does not hold, which it ignores.
+    pub fn return_surfaces(&self, mut returned: ReturnedSurfaces) {
+        let mut retired = ArrayVec::<Arc<SurfaceShared>, MAX_INSTANCE_SURFACES>::new();
+        {
+            let mut desk = self.inner.desk.lock();
+            returned.ids.retain(|id| {
+                let Some(index) = desk.live.iter().position(|surface| surface.id == *id) else {
+                    return false;
+                };
+                let surface = desk.live.swap_remove(index);
+                // Before `retire` clears `alive`, so the creator never
+                // sees the window as neither on the desktop nor counted.
+                surface.undrained.store(true, Ordering::Release);
+                desk.returned.push(surface.clone());
+                retired.push(surface);
+                true
+            });
         }
-        self.inner
-            .returned
-            .push(returned)
-            .unwrap_or_else(|_| panic!("the surface return queue is never closed"));
+        for surface in &retired {
+            surface.retire();
+        }
+        if returned.ids.is_empty() {
+            return;
+        }
+        self.inner.returned.push(returned).unwrap_or_else(|_| {
+            panic!(
+                "the surface return queue is full or closed: the registry counts every handed-back \
+                 window until it is drained, so at most {MAX_LIVE_SURFACES} entries are outstanding"
+            )
+        });
         self.inner.returns.notify_all();
     }
 
-    /// Everything handed back since the last drain.
-    pub fn take_returned(&self) -> Vec<ReturnedSurfaces> {
+    /// Everything handed back since the last drain, one guard per window.
+    ///
+    /// Each window stays counted until its guard drops.
+    pub fn take_returned(&self) -> Vec<ReturnedSurface> {
         let mut returned = Vec::new();
         while let Ok(entry) = self.inner.returned.pop() {
-            returned.push(entry);
+            returned.extend(entry.ids.into_iter().map(|id| ReturnedSurface {
+                id,
+                service: self.clone(),
+            }));
         }
         returned
+    }
+
+    /// Release the slot of one handed-back window the drain finished with.
+    fn settle(&self, id: SurfaceId) {
+        let surface = {
+            let mut desk = self.inner.desk.lock();
+            let index = desk
+                .returned
+                .iter()
+                .position(|surface| surface.id == id)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "surface {} was settled but is not counted as handed back: \
+                         each handed-back window is settled exactly once",
+                        id.raw()
+                    )
+                });
+            let surface = desk.returned.swap_remove(index);
+            surface.undrained.store(false, Ordering::Release);
+            surface
+        };
+        drop(surface);
     }
 
     /// A waiter on the return queue, armed before its first look.
