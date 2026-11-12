@@ -19,7 +19,7 @@ use bytes::Bytes;
 use crate::{
     ClockAuthorityRights, DeviceClassRights, DiagnosticAuthorityRights, DirectoryAuthorityRights,
     LinkAuthorityRights, NetworkAuthorityRights, ProcessAuthority, ProcessAuthorityError,
-    TerminalAuthorityRights,
+    SettingsAuthorityRights, TerminalAuthorityRights,
 };
 use crate::{
     ComponentCache, ComponentOutputMode, ComponentOutputRoute, ComponentOutputStreamKind,
@@ -917,6 +917,20 @@ macro_rules! impl_authority_conversion {
                             .map_err(map_process_authority_error)?;
                         authority.grant_diagnostic_rights(rights);
                     }
+                    $bindings::helios::system::programs::CapabilityGrant::Settings(settings) => {
+                        let mut rights = SettingsAuthorityRights::empty();
+                        for right in settings.rights {
+                            rights |= match right {
+                                $bindings::helios::system::programs::SettingsRight::Write => {
+                                    SettingsAuthorityRights::WRITE
+                                }
+                            };
+                        }
+                        let rights = caller_authority
+                            .derive_settings_rights(rights)
+                            .map_err(map_process_authority_error)?;
+                        authority.grant_settings_rights(rights);
+                    }
                 }
             }
             Ok(authority)
@@ -1004,13 +1018,14 @@ mod authority_tests {
     use crate::{
         ClockAuthorityRights, DeviceClassRights, DiagnosticAuthorityRights,
         DirectoryAuthorityRights, DirectoryPreopen, LinkAuthorityRights, NetworkAuthorityRights,
-        ProcessAuthority, ProcessAuthorityRights, TerminalAuthorityRights,
+        ProcessAuthority, ProcessAuthorityRights, SettingsAuthorityRights, TerminalAuthorityRights,
     };
 
     use program_wit::programs::{
         CapabilityGrant, ClockGrant, ClockRight, DeviceClass, DeviceGrant, DiagnosticsGrant,
         DiagnosticsRight, DirectoryGrant, FilesystemRight, LinkGrant, LinkRight, NetworkGrant,
-        NetworkRight, ProcessGrant, ProcessRight, TerminalGrant, TerminalRight,
+        NetworkRight, ProcessGrant, ProcessRight, SettingsGrant, SettingsRight, TerminalGrant,
+        TerminalRight,
     };
 
     fn directory_grant(
@@ -1053,6 +1068,10 @@ mod authority_tests {
         CapabilityGrant::Diagnostics(DiagnosticsGrant { rights })
     }
 
+    fn settings_grant(rights: Vec<SettingsRight>) -> CapabilityGrant {
+        CapabilityGrant::Settings(SettingsGrant { rights })
+    }
+
     #[test]
     fn empty_grants_create_zero_child_authority() {
         let child = build_program_child_authority(&ProcessAuthority::root(), Vec::new())
@@ -1067,6 +1086,7 @@ mod authority_tests {
         assert!(child.device_class_rights().is_empty());
         assert!(child.granted_devices().is_empty());
         assert!(child.diagnostic_rights().is_empty());
+        assert!(child.settings_rights().is_empty());
         assert!(child.cwd().is_none());
     }
 
@@ -1120,6 +1140,62 @@ mod authority_tests {
             child.diagnostic_rights(),
             DiagnosticAuthorityRights::OBSERVE_MACHINE
         );
+    }
+
+    #[test]
+    fn settings_grant_derives_from_caller_authority() {
+        let mut caller = ProcessAuthority::empty();
+        caller.grant_settings_rights(SettingsAuthorityRights::WRITE);
+
+        let child = build_program_child_authority(
+            &caller,
+            vec![settings_grant(vec![SettingsRight::Write])],
+        )
+        .expect("a caller holding the right may hand it on");
+
+        assert_eq!(child.settings_rights(), SettingsAuthorityRights::WRITE);
+    }
+
+    #[test]
+    fn settings_grant_exceeding_caller_is_refused() {
+        let error = build_program_child_authority(
+            &ProcessAuthority::root(),
+            vec![settings_grant(vec![SettingsRight::Write])],
+        )
+        .expect_err("root authority holds no settings right to hand on");
+        assert_eq!(error.kind, crate::ProgramExecErrorKind::PermissionDenied);
+
+        let mut observer = ProcessAuthority::empty();
+        observer.grant_diagnostic_rights(DiagnosticAuthorityRights::OBSERVE_MACHINE);
+        let error = build_program_child_authority(
+            &observer,
+            vec![settings_grant(vec![SettingsRight::Write])],
+        )
+        .expect_err("the observe right is no settings right");
+        assert_eq!(error.kind, crate::ProgramExecErrorKind::PermissionDenied);
+
+        let error = build_program_child_authority(
+            &ProcessAuthority::root(),
+            vec![settings_grant(Vec::new())],
+        )
+        .expect_err("an empty settings grant is a mistake");
+        assert_eq!(error.kind, crate::ProgramExecErrorKind::PermissionDenied);
+    }
+
+    /// The inspector session's shell configures the machine through
+    /// programs the debugger launches, so the debugger holds the right it
+    /// hands on.
+    #[test]
+    fn debugger_authority_hands_the_settings_right_to_what_it_launches() {
+        let debugger = super::debugger_authority();
+
+        let child = build_program_child_authority(
+            &debugger,
+            vec![settings_grant(vec![SettingsRight::Write])],
+        )
+        .expect("the debugger holds the settings right");
+
+        assert_eq!(child.settings_rights(), SettingsAuthorityRights::WRITE);
     }
 
     #[test]
@@ -1598,7 +1674,9 @@ fn map_process_authority_error(error: ProcessAuthorityError) -> crate::ProgramEx
         | ProcessAuthorityError::DeviceNameTooLong
         | ProcessAuthorityError::TooManyDeviceGrants
         | ProcessAuthorityError::EmptyDiagnosticRights
-        | ProcessAuthorityError::DiagnosticGrantExceedsAuthority(_) => {
+        | ProcessAuthorityError::DiagnosticGrantExceedsAuthority(_)
+        | ProcessAuthorityError::EmptySettingsRights
+        | ProcessAuthorityError::SettingsGrantExceedsAuthority(_) => {
             crate::ProgramExecErrorKind::PermissionDenied
         }
     };
@@ -1643,16 +1721,19 @@ where
 }
 
 /// The authority the embedded debugger runs with: everything `root`
-/// grants, plus every device class and the machine-observation right.
+/// grants, plus every device class, the machine-observation right and
+/// the settings-write right.
 /// The debugger claims no device itself; it holds the classes because a
 /// program can be handed only what its launcher holds, and the inspector
 /// session runs desktop, input and audio programs through it. It holds
 /// the observation right for the same reason: the inspector session
-/// runs `perf` through it.
+/// runs `perf` through it. The settings-write right is held for the
+/// shell it launches, whose programs configure the machine.
 fn debugger_authority() -> ProcessAuthority {
     let mut authority = ProcessAuthority::root();
     authority.grant_device_classes(DeviceClassRights::all());
     authority.grant_diagnostic_rights(DiagnosticAuthorityRights::OBSERVE_MACHINE);
+    authority.grant_settings_rights(SettingsAuthorityRights::WRITE);
     authority
 }
 

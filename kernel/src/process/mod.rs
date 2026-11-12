@@ -23,8 +23,9 @@ pub use authority::{
     JoinAuthority, LinkAuthorityRights, LinkSourceCap, LinkTargetDirectoryCap, MulticastCap,
     NetworkAdminCap, NetworkAuthorityRights, NetworkCap, ObserveMachineCap, PrivilegedBindCap,
     ProcessAuthority, ProcessAuthorityError, ProcessAuthorityRights, SetWallClockCap,
-    SignalAuthority, SpawnAuthority, SymlinkCreateCap, SymlinkReadCap, TcpCap,
-    TerminalAuthorityRights, TerminalInputCap, TerminalOutputCap, TtyControlCap, UdpCap,
+    SettingsAuthorityRights, SignalAuthority, SpawnAuthority, SymlinkCreateCap, SymlinkReadCap,
+    TcpCap, TerminalAuthorityRights, TerminalInputCap, TerminalOutputCap, TtyControlCap, UdpCap,
+    WriteSettingsCap,
 };
 pub(crate) use descriptor::FreeDescriptorSlots;
 pub use descriptor::{

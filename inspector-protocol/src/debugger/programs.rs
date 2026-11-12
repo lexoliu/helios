@@ -112,6 +112,7 @@ mod guest {
                         host_programs::root_process_grant(),
                         host_programs::all_device_classes_grant(),
                         host_programs::observe_machine_grant(),
+                        host_programs::write_settings_grant(),
                     ],
                 })
                 .await

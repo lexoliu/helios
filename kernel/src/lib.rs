@@ -207,10 +207,10 @@ pub use process::{
     NetworkAuthorityRights, NetworkCap, ObserveMachineCap, PrivilegedBindCap, ProcessAuthority,
     ProcessAuthorityError, ProcessAuthorityRights, ProcessId, ProcessMemoryIdentity, ProcessRecord,
     ProcessState, ProcessTable, ProcessTableError, ProgramExecError, ProgramExecErrorDetail,
-    ProgramExecErrorKind, ProgramOutOfMemory, RuntimeMessage, SetWallClockCap, SignalAuthority,
-    SpawnAuthority, SymlinkCreateCap, SymlinkReadCap, TcpCap, TerminalAuthorityRights,
-    TerminalInputCap, TerminalOutputCap, ThreadId, ThreadRecord, ThreadState, ThreadTable,
-    ThreadTableError, TtyControlCap, UdpCap,
+    ProgramExecErrorKind, ProgramOutOfMemory, RuntimeMessage, SetWallClockCap,
+    SettingsAuthorityRights, SignalAuthority, SpawnAuthority, SymlinkCreateCap, SymlinkReadCap,
+    TcpCap, TerminalAuthorityRights, TerminalInputCap, TerminalOutputCap, ThreadId, ThreadRecord,
+    ThreadState, ThreadTable, ThreadTableError, TtyControlCap, UdpCap, WriteSettingsCap,
 };
 pub use profiling::{
     CodeAttribution, InstructionProfile, InstructionProfileError, InstructionSampler,

@@ -2998,6 +2998,7 @@ mod tests {
             crate::DeviceClassRights::DISPLAY | crate::DeviceClassRights::AUDIO,
         );
         parent.grant_diagnostic_rights(crate::DiagnosticAuthorityRights::OBSERVE_MACHINE);
+        parent.grant_settings_rights(crate::SettingsAuthorityRights::WRITE);
 
         let child = wasix_proc_spawn_inherited_non_directory_authority(&parent);
 
@@ -3023,6 +3024,10 @@ mod tests {
         assert_eq!(
             child.diagnostic_rights(),
             crate::DiagnosticAuthorityRights::OBSERVE_MACHINE
+        );
+        assert_eq!(
+            child.settings_rights(),
+            crate::SettingsAuthorityRights::WRITE
         );
         assert!(parent.contains_authority(&child));
     }

@@ -2208,6 +2208,10 @@ pub(super) fn wasix_proc_spawn_inherited_non_directory_authority(
     // The observation right follows the shell the same way: the programs
     // a launcher runs through `dash` observe the machine as it does.
     authority.grant_diagnostic_rights(parent.diagnostic_rights());
+    // The settings-write right follows the shell the same way: the
+    // programs a launcher runs through `dash` configure the machine as
+    // it does.
+    authority.grant_settings_rights(parent.settings_rights());
     authority
 }
 

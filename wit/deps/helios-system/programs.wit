@@ -143,6 +143,19 @@ interface programs {
     rights: list<diagnostics-right>,
   }
 
+  /// A right over the machine-wide settings. Reading a setting needs
+  /// none; a program that holds none cannot change one.
+  enum settings-right {
+    /// Change the machine-wide settings.
+    write,
+  }
+
+  record settings-grant {
+    /// Settings rights granted to the child. These must be a subset of
+    /// the caller's settings authority.
+    rights: list<settings-right>,
+  }
+
   variant capability-grant {
     directory(directory-grant),
     network(network-grant),
@@ -152,6 +165,7 @@ interface programs {
     link(link-grant),
     device(device-grant),
     diagnostics(diagnostics-grant),
+    settings(settings-grant),
   }
 
   record spawn-request {

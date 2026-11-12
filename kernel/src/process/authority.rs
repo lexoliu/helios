@@ -97,6 +97,19 @@ bitflags! {
     }
 }
 
+bitflags! {
+    /// What an instance may do to the machine-wide settings. Reading a
+    /// setting needs no right.
+    ///
+    /// A class of its own beside the diagnostics rights: observing the
+    /// machine and configuring it are separate powers, and an observer
+    /// has no reason to hold the second.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct SettingsAuthorityRights: u8 {
+        const WRITE = 1 << 0;
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DirectoryPreopen {
     source_path: String,
@@ -191,6 +204,21 @@ impl ObserveMachineCap {
     }
 }
 
+/// Proof, checked on the owning task, that the instance may change the
+/// machine-wide settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WriteSettingsCap(SettingsAuthorityRights);
+
+impl WriteSettingsCap {
+    pub const fn required_rights() -> SettingsAuthorityRights {
+        SettingsAuthorityRights::WRITE
+    }
+
+    pub const fn rights(self) -> SettingsAuthorityRights {
+        self.0
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TerminalInputCap(TerminalAuthorityRights);
 
@@ -241,6 +269,7 @@ pub struct ProcessAuthority {
     /// registry's own capacity, because the registry cannot publish more.
     devices: ArrayVec<DeviceName, MAX_GRANTS>,
     diagnostics: DiagnosticAuthorityRights,
+    settings: SettingsAuthorityRights,
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -285,6 +314,10 @@ pub enum ProcessAuthorityError {
     EmptyDiagnosticRights,
     #[error("diagnostic grant exceeds caller authority: {0:?}")]
     DiagnosticGrantExceedsAuthority(DiagnosticAuthorityRights),
+    #[error("settings grant rights must not be empty")]
+    EmptySettingsRights,
+    #[error("settings grant exceeds caller authority: {0:?}")]
+    SettingsGrantExceedsAuthority(SettingsAuthorityRights),
 }
 
 impl DirectoryPreopen {
@@ -412,13 +445,15 @@ impl ProcessAuthority {
             device_classes: DeviceClassRights::empty(),
             devices: ArrayVec::new_const(),
             diagnostics: DiagnosticAuthorityRights::empty(),
+            settings: SettingsAuthorityRights::empty(),
         }
     }
 
-    /// Every right except the device and diagnostic ones. The kernel adds
-    /// the device classes, named devices and diagnostic rights a component
-    /// needs where it starts that component, so no program inherits a
-    /// claim or the machine's diagnostics through this value.
+    /// Every right except the device, diagnostic and settings ones. The
+    /// kernel adds the device classes, named devices, diagnostic and
+    /// settings rights a component needs where it starts that component,
+    /// so no program inherits a claim, the machine's diagnostics or its
+    /// settings through this value.
     pub fn root() -> Self {
         let mut authority = Self::empty();
         authority.insert_directory_preopen(
@@ -525,6 +560,14 @@ impl ProcessAuthority {
 
     pub fn grant_diagnostic_rights(&mut self, rights: DiagnosticAuthorityRights) {
         self.diagnostics |= rights;
+    }
+
+    pub fn settings_rights(&self) -> SettingsAuthorityRights {
+        self.settings
+    }
+
+    pub fn grant_settings_rights(&mut self, rights: SettingsAuthorityRights) {
+        self.settings |= rights;
     }
 
     pub fn grant_device_classes(&mut self, rights: DeviceClassRights) {
@@ -780,6 +823,24 @@ impl ProcessAuthority {
             .map(ObserveMachineCap)
     }
 
+    pub fn derive_settings_rights(
+        &self,
+        rights: SettingsAuthorityRights,
+    ) -> Result<SettingsAuthorityRights, ProcessAuthorityError> {
+        if rights.is_empty() {
+            return Err(ProcessAuthorityError::EmptySettingsRights);
+        }
+        if !self.settings.contains(rights) {
+            return Err(ProcessAuthorityError::SettingsGrantExceedsAuthority(rights));
+        }
+        Ok(rights)
+    }
+
+    pub fn derive_write_settings_cap(&self) -> Result<WriteSettingsCap, ProcessAuthorityError> {
+        self.derive_settings_rights(WriteSettingsCap::required_rights())
+            .map(WriteSettingsCap)
+    }
+
     pub fn derive_device_class_rights(
         &self,
         rights: DeviceClassRights,
@@ -860,6 +921,7 @@ impl ProcessAuthority {
             && self.link.contains(child.link)
             && self.device_classes.contains(child.device_classes)
             && self.diagnostics.contains(child.diagnostics)
+            && self.settings.contains(child.settings)
             && child
                 .devices
                 .iter()
@@ -944,7 +1006,8 @@ mod tests {
     use super::{
         ClockAuthorityRights, DeviceClassRights, DiagnosticAuthorityRights,
         DirectoryAuthorityRights, LinkAuthorityRights, NetworkAuthorityRights, ProcessAuthority,
-        ProcessAuthorityError, ProcessAuthorityRights, TerminalAuthorityRights,
+        ProcessAuthorityError, ProcessAuthorityRights, SettingsAuthorityRights,
+        TerminalAuthorityRights,
     };
     use crate::device::{DeviceName, MAX_GRANTS};
 
@@ -1254,6 +1317,7 @@ mod tests {
         child.grant_link_rights(LinkAuthorityRights::SOURCE);
         child.grant_device_classes(DeviceClassRights::DISPLAY);
         child.grant_diagnostic_rights(DiagnosticAuthorityRights::OBSERVE_MACHINE);
+        child.grant_settings_rights(SettingsAuthorityRights::WRITE);
         child
             .grant_device(device_name("pci:0000:00:04.0"))
             .expect("one named device fits");
@@ -1261,6 +1325,7 @@ mod tests {
         let mut parent = parent;
         parent.grant_device_classes(DeviceClassRights::all());
         parent.grant_diagnostic_rights(DiagnosticAuthorityRights::OBSERVE_MACHINE);
+        parent.grant_settings_rights(SettingsAuthorityRights::WRITE);
         parent
             .grant_device(device_name("pci:0000:00:04.0"))
             .expect("one named device fits");
@@ -1289,7 +1354,61 @@ mod tests {
         diagnostics_less_parent
             .grant_device(device_name("pci:0000:00:04.0"))
             .expect("one named device fits");
+        diagnostics_less_parent.grant_settings_rights(SettingsAuthorityRights::WRITE);
         assert!(!diagnostics_less_parent.contains_authority(&child));
+
+        let mut settings_less_parent = ProcessAuthority::root();
+        settings_less_parent.grant_device_classes(DeviceClassRights::all());
+        settings_less_parent.grant_diagnostic_rights(DiagnosticAuthorityRights::OBSERVE_MACHINE);
+        settings_less_parent
+            .grant_device(device_name("pci:0000:00:04.0"))
+            .expect("one named device fits");
+        assert!(!settings_less_parent.contains_authority(&child));
+    }
+
+    #[test]
+    fn settings_grant_must_be_subset_of_caller_authority() {
+        let mut parent = ProcessAuthority::empty();
+        parent.grant_settings_rights(SettingsAuthorityRights::WRITE);
+
+        assert_eq!(
+            parent
+                .derive_settings_rights(SettingsAuthorityRights::WRITE)
+                .expect("caller may derive a right it holds"),
+            SettingsAuthorityRights::WRITE
+        );
+        assert_eq!(
+            parent
+                .derive_settings_rights(SettingsAuthorityRights::empty())
+                .expect_err("an empty settings grant is a mistake"),
+            ProcessAuthorityError::EmptySettingsRights
+        );
+        assert!(parent.derive_write_settings_cap().is_ok());
+
+        let holder_less = ProcessAuthority::empty();
+        assert_eq!(
+            holder_less
+                .derive_settings_rights(SettingsAuthorityRights::WRITE)
+                .expect_err("a caller without the right must not hand it on"),
+            ProcessAuthorityError::SettingsGrantExceedsAuthority(SettingsAuthorityRights::WRITE)
+        );
+        assert!(matches!(
+            holder_less.derive_write_settings_cap(),
+            Err(ProcessAuthorityError::SettingsGrantExceedsAuthority(_))
+        ));
+
+        // The observe right is a separate power: holding it grants no
+        // write.
+        let mut observer = ProcessAuthority::empty();
+        observer.grant_diagnostic_rights(DiagnosticAuthorityRights::OBSERVE_MACHINE);
+        assert!(observer.derive_write_settings_cap().is_err());
+    }
+
+    #[test]
+    fn root_authority_holds_no_settings_rights() {
+        let root = ProcessAuthority::root();
+        assert_eq!(root.settings_rights(), SettingsAuthorityRights::empty());
+        assert!(root.derive_write_settings_cap().is_err());
     }
 
     #[test]
