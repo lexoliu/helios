@@ -778,7 +778,7 @@
       "program": "{tcp_throughput}",
       "args": [
         "{host_tcp_host}",
-        "{host_tcp_port}",
+        "{host_tcp_upload_port}",
         "67108864",
         "up"
       ],
@@ -803,7 +803,7 @@
           ],
           "args": [
             "{host_tcp_host}",
-            "{host_tcp_port}",
+            "{host_tcp_upload_port}",
             "67108864",
             "up",
             "--label",

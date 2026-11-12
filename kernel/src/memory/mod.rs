@@ -3,6 +3,8 @@
 //! `irq_safe` carries the lock every allocator here is built on: an
 //! interrupt handler allocates, so the lock that guards an allocator
 //! has to mask interrupts while it is held.
+//! `compressed` is the compressed page pool, the in-memory tier a page
+//! goes to before a disk.
 //! `pmm` exposes the kernel's physical-frame allocator wrapper.
 //! `fiber_stack` owns the arena the runtime's async stacks are committed
 //! out of one page-fault at a time, and `frame_reserve` holds the frames
@@ -18,6 +20,7 @@
 //! domains.
 
 mod balloon;
+mod compressed;
 mod entropy;
 mod fiber_stack;
 mod frame_pool;
@@ -34,6 +37,10 @@ mod swap;
 mod user;
 
 pub use balloon::{BalloonHandle, BalloonStats, FREE_PAGE_REPORT_INTERVAL, install_memory_balloon};
+pub use compressed::{
+    COMPRESSED_PAGE_BYTES, CompressRefusal, CompressedPage, CompressedPool, CompressedPoolError,
+    CompressedPoolStats, DEFAULT_COMPRESSION_LEVEL, DEFAULT_POOL_PERCENT, INCOMPRESSIBLE_BYTES,
+};
 pub use entropy::{
     ENTROPY_RESEED_INTERVAL, EntropyPool, EntropySources, HardwareEntropySource,
     NoCryptographicEntropy, NoEntropyDevice, ROOT_ENTROPY_MATERIAL_BYTES, RootEntropy,
