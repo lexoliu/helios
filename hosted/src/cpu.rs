@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::thread;
 
 use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase, TimerInterrupt};
@@ -64,6 +65,20 @@ impl Cpu for HostedCpu {
 
     fn park_current(&self) {
         thread::park();
+    }
+
+    fn park_wake_only(&self, word: &AtomicU8, held: u8) {
+        // A hosted processor is a thread and its only interrupt sources
+        // are unparks: the timer thread's and `wake_processor`'s. Nothing
+        // here delivers device code to a parked thread, so "every source
+        // but the wake" is the parked thread itself, which runs nothing
+        // when an unpark ends the park and the word is unchanged. A
+        // store made before the unpark that ends the wait is seen
+        // through the park's own acquire, and an unpark that lands
+        // before the park leaves a token the park consumes.
+        while word.load(Ordering::Acquire) == held {
+            thread::park();
+        }
     }
 
     fn start_processor(&self, processor: ProcessorId) {

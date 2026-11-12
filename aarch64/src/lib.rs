@@ -7,7 +7,7 @@ use core::arch::{asm, global_asm};
 use core::cell::UnsafeCell;
 use core::num::NonZeroUsize;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -950,6 +950,35 @@ impl Cpu for Aarch64Cpu {
         unsafe { write_daif(daif) };
     }
 
+    fn park_wake_only(&self, word: &AtomicU8, held: u8) {
+        let runtime = current_processor_runtime();
+        assert!(
+            read_daif() & DAIF_IRQ_MASKED != 0,
+            "AArch64 park_wake_only was entered with IRQ unmasked, before the priority mask \
+             was in place"
+        );
+        // Only the wake SGI is more urgent than the mask, so every device
+        // interrupt and the timer stay pending in the GIC while the
+        // processor waits. WFI ends on a pending interrupt the CPU
+        // interface signals even while PSTATE.I is set, and the word is
+        // tested with IRQ masked first, so a wake raised after the test
+        // completes the wait instead of being slept through.
+        let previous = gic::raise_priority_mask_to_wake_only();
+        while word.load(Ordering::Acquire) == held {
+            if !runtime.wake_pending.swap(false, Ordering::AcqRel) {
+                // SAFETY: `wfi` has no operands and touches no memory.
+                unsafe {
+                    asm!("wfi", options(nomem, nostack, preserves_flags));
+                }
+            }
+            // The wake SGI the wait ended on is still pending: taking it
+            // acknowledges it, and the wait would otherwise end at once
+            // forever. The mask above admits nothing else.
+            take_pending_irq();
+        }
+        gic::restore_priority_mask(previous);
+    }
+
     fn start_processor(&self, processor: ProcessorId) {
         self.state.start_processor(processor);
     }
@@ -1533,6 +1562,27 @@ fn read_daif() -> u64 {
 unsafe fn write_daif(daif: u64) {
     unsafe {
         asm!("msr daif, {daif}", daif = in(reg) daif, options(nomem, nostack, preserves_flags));
+    }
+}
+
+/// `DAIF.I`: set while IRQ is masked.
+const DAIF_IRQ_MASKED: u64 = 1 << 7;
+
+/// Opens an interrupt window for exactly the interrupts the priority
+/// mask admits, and closes it again: a pending IRQ is taken before the
+/// `isb` completes, so the handler has run by the time IRQ is masked
+/// once more.
+fn take_pending_irq() {
+    // SAFETY: the caller's priority mask admits only the wake SGI,
+    // whose handler needs nothing the caller holds; the window is
+    // closed before the asm ends.
+    unsafe {
+        asm!(
+            "msr daifclr, #0x2",
+            "isb",
+            "msr daifset, #0x2",
+            options(nomem, nostack, preserves_flags)
+        );
     }
 }
 

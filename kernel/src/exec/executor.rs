@@ -1541,6 +1541,10 @@ mod tests {
 
         fn park_current(&self) {}
 
+        fn park_wake_only(&self, _word: &core::sync::atomic::AtomicU8, _held: u8) {
+            panic!("this test platform never freezes")
+        }
+
         fn start_processor(&self, _processor: ProcessorId) {}
 
         fn wake_processor(&self, _processor: ProcessorId) {}
@@ -1630,6 +1634,10 @@ mod tests {
             );
             self.nanos
                 .fetch_add(self.park_advance.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+
+        fn park_wake_only(&self, _word: &core::sync::atomic::AtomicU8, _held: u8) {
+            panic!("this test platform never freezes")
         }
 
         fn start_processor(&self, _processor: ProcessorId) {}

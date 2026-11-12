@@ -1,4 +1,5 @@
 use core::ptr::NonNull;
+use core::sync::atomic::AtomicU8;
 use core::time::Duration;
 
 use strength_reduce::StrengthReducedU64;
@@ -294,6 +295,42 @@ pub trait Cpu: Send + Sync + 'static {
     /// hosted mode. The contract is only "stop burning CPU until woken", not any
     /// stronger fairness guarantee.
     fn park_current(&self);
+
+    /// Parks the current processor until `word` no longer reads `held`,
+    /// with every interrupt source masked except the ones that carry no
+    /// driver or task code: the wake [`Cpu::wake_processor`] raises and
+    /// the cross-processor maintenance IPIs (a TLB shootdown).
+    ///
+    /// This is what lets a machine hold a processor still while another
+    /// one works alone: no device interrupt, timer tick or doorbell
+    /// reaches the parked processor, so nothing it would run can touch
+    /// state the working processor owns. It is a hardware property (a
+    /// priority mask that lets only the wake class through, a supervisor
+    /// interrupt-enable set restricted to the software interrupt), and it
+    /// names no consumer.
+    ///
+    /// # Contract
+    ///
+    /// * The caller has masked interrupts on this processor
+    ///   ([`crate::critical_section::LocalInterruptsMasked`]) before it
+    ///   announces to anyone that it is parked, and holds nothing a wake
+    ///   handler needs. Because the interrupt flag is already clear, no
+    ///   handler can run between the announcement and the finer mask
+    ///   this call installs. The call enables interrupts only while the
+    ///   finer mask is in place, to take the wake, and leaves the flag
+    ///   as it found it.
+    /// * `word` is tested with `Acquire` after the finer mask is in place
+    ///   and again after every wake, so a store another processor made
+    ///   before it called [`Cpu::wake_processor`] is seen by the time
+    ///   this returns. The test comes before the wait on every backend,
+    ///   and a wake raised between them stays pending and completes the
+    ///   wait, so a store made between the test and the wait is not lost.
+    /// * A wake that does not change `word` is absorbed and the wait
+    ///   resumes; the call returns only when the word has changed.
+    /// * The finer mask is lifted before it returns. Interrupts that were
+    ///   held off by it then arrive when the caller's own mask drops, as
+    ///   ordinary interrupts.
+    fn park_wake_only(&self, word: &AtomicU8, held: u8);
 
     /// Starts execution on a secondary processor.
     ///

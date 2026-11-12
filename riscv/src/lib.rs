@@ -140,7 +140,7 @@ pub(crate) fn count_virtio_mmio_devices(fdt: &Fdt<'_>, expected: DeviceType) -> 
 use core::arch::{asm, global_asm};
 use core::num::{NonZeroU32, NonZeroUsize};
 use core::ops::Range;
-use core::sync::atomic::{AtomicUsize, Ordering, compiler_fence};
+use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering, compiler_fence};
 
 use arrayvec::ArrayVec;
 use fdt::Fdt;
@@ -475,6 +475,47 @@ impl Cpu for RiscvCpu {
 
     fn park_current(&self) {
         riscv::asm::wfi();
+    }
+
+    fn park_wake_only(&self, word: &AtomicU8, held: u8) {
+        assert!(
+            !riscv::register::sstatus::read().sie(),
+            "RISC-V park_wake_only was entered with supervisor interrupts enabled, before the \
+             enable set was narrowed"
+        );
+        // The wake is the supervisor software interrupt; the timer and the
+        // external interrupt (every device) are taken out of `sie`, so
+        // they stay pending in `sip` and a `wfi` neither ends on them nor
+        // delivers them. A `wfi` ends on any pending interrupt that
+        // `sie` enables, whatever `sstatus.SIE` says, so a wake raised
+        // between the test below and the `wfi` completes it at once.
+        let sie = riscv::register::sie::read();
+        let (timer, external) = (sie.stimer(), sie.sext());
+        // SAFETY: both bits are put back below before this returns.
+        unsafe {
+            riscv::register::sie::clear_stimer();
+            riscv::register::sie::clear_sext();
+        }
+        compiler_fence(Ordering::SeqCst);
+        while word.load(Ordering::Acquire) == held {
+            riscv::asm::wfi();
+            // The wait leaves the software interrupt pending: taking it
+            // runs the trap handler that clears it. Nothing else is
+            // enabled in `sie`, so nothing else is taken in the window.
+            // SAFETY: the window is closed again on the next line.
+            unsafe { riscv::interrupt::supervisor::enable() };
+            riscv::interrupt::supervisor::disable();
+        }
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: restores the bits read above.
+        unsafe {
+            if timer {
+                riscv::register::sie::set_stimer();
+            }
+            if external {
+                riscv::register::sie::set_sext();
+            }
+        }
     }
 
     fn start_processor(&self, hart: ProcessorId) {

@@ -327,6 +327,10 @@ mod tests {
             panic!("test CPU should not park")
         }
 
+        fn park_wake_only(&self, _word: &core::sync::atomic::AtomicU8, _held: u8) {
+            panic!("test CPU should not park")
+        }
+
         fn start_processor(&self, _processor: ProcessorId) {
             panic!("test CPU should not start processors")
         }
