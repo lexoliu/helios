@@ -368,10 +368,6 @@ pub struct VirtioSndDevice<T: VirtioTransport> {
     /// The stream commands submitted and not yet collected, whose
     /// acknowledgement updates `records`.
     commands: Journal<StreamChange, { CONTROL_QUEUE_SIZE as usize }>,
-    /// How many periods each stream has submitted and its writers have
-    /// not yet collected: the streams a quiesce has to release for the
-    /// device to complete them.
-    queued: [AtomicU32; MAX_STREAMS],
     /// Set once a restore command timed out and the device is lost.
     lost: Lost,
     /// How many of each kind of item the device presented at bring-up,
@@ -517,7 +513,6 @@ impl<T: VirtioTransport> VirtioSndDevice<T> {
             period_bytes: [const { AtomicU32::new(0) }; MAX_STREAMS],
             records: SpinMutex::new([StreamRecord::UNCONFIGURED; MAX_STREAMS]),
             commands: Journal::new(),
-            queued: [const { AtomicU32::new(0) }; MAX_STREAMS],
             lost: Lost::new(),
             counts,
             features,
@@ -704,10 +699,14 @@ impl<T: VirtioTransport> VirtioSndDevice<T> {
     /// released: `PCM_RELEASE` requires it to complete all pending I/O
     /// messages (virtio 1.2 §5.14.6.6.5.1), while `PCM_STOP` only changes
     /// the stream's state and a device may hold a period until its clock
-    /// reaches it. So every stream that holds periods is stopped, if it
+    /// reaches it. So every prepared or running stream is stopped, if it
     /// was running, and released, and remembered: [`Self::reinitialize`]
-    /// drives it back to the phase it was in. The event ring is not
-    /// waited on, and the receive queue is never posted.
+    /// drives it back to the phase it was in. Every such stream is
+    /// released, not only one with a period outstanding, because no count
+    /// a writer keeps can say which periods the device still holds once a
+    /// writer is cancelled, and a release with nothing pending completes
+    /// at once. The event ring is not waited on, and the receive queue is
+    /// never posted.
     pub fn quiesce(&self, mut expired: impl FnMut() -> bool) -> Result<(), QuiesceError> {
         drain_to_idle(
             &self.control_inflight,
@@ -721,9 +720,7 @@ impl<T: VirtioTransport> VirtioSndDevice<T> {
         for index in 0..MAX_STREAMS {
             let stream = StreamId::new(index as u32);
             let phase = self.records.lock()[index].phase;
-            if self.queued[index].load(Ordering::Acquire) == 0
-                || !matches!(phase, StreamPhase::Prepared | StreamPhase::Running)
-            {
+            if !matches!(phase, StreamPhase::Prepared | StreamPhase::Running) {
                 continue;
             }
             if phase == StreamPhase::Running {
@@ -1071,16 +1068,10 @@ impl<T: VirtioTransport> PlaybackDevice for VirtioSndDevice<T> {
                 &mut [&mut status],
             )
             .await?;
-            // Counted in the poll that published the period, so a freeze
-            // finds the count and the period together.
-            let queued = &self.queued[stream.index() as usize];
-            queued.fetch_add(1, Ordering::AcqRel);
-            let written = await_completion(&self.tx_inflight, &self.tx, token, || {
+            await_completion(&self.tx_inflight, &self.tx, token, || {
                 self.completions.notified()
             })
-            .await;
-            queued.fetch_sub(1, Ordering::AcqRel);
-            written?
+            .await?
         };
         if (written as usize) < XFER_STATUS_BYTES {
             // The device returned the chain without saying what it did
