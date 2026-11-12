@@ -2,7 +2,6 @@
 --enable-kvm
 --enable-slirp
 --enable-opengl
---enable-gbm
 --enable-virglrenderer
 --disable-docs
 --disable-gtk

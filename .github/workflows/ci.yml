@@ -1704,6 +1704,9 @@ jobs:
           # The flags live in a file the cache key hashes.
           mapfile -t flags < "${GITHUB_WORKSPACE}/helios/.github/qemu/x86_64-venus-configure.args"
           ./configure --prefix="${QEMU_PREFIX}" "${flags[@]}"
+          # QEMU has no --enable-gbm: meson probes gbm as optional once
+          # OpenGL is on, and egl-headless needs it to open the render node.
+          grep -E '^#define CONFIG_GBM\b' build/config-host.h
           ninja -C build install
       - name: Put the pinned QEMU and virglrenderer in use
         run: |
