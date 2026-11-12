@@ -3857,7 +3857,8 @@ pub(super) fn p1_errno_from_program_exec_error(error: &ProgramExecError) -> i32 
         ProgramExecErrorKind::PermissionDenied => p1::errno::NOTCAPABLE,
         ProgramExecErrorKind::OutOfMemory => p1::errno::NOMEM,
         ProgramExecErrorKind::Unavailable => p1::errno::NOTSUP,
-        ProgramExecErrorKind::Internal => p1::errno::IO,
+        ProgramExecErrorKind::Internal | ProgramExecErrorKind::Io => p1::errno::IO,
+        ProgramExecErrorKind::NotFound => p1::errno::NOENT,
     }
 }
 

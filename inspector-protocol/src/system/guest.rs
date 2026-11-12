@@ -553,6 +553,8 @@ fn convert_launch_error_kind(kind: host_programs::ExecErrorKind) -> programs::Ex
         host_programs::ExecErrorKind::OutOfMemory => programs::ExecErrorKind::OutOfMemory,
         host_programs::ExecErrorKind::Unavailable => programs::ExecErrorKind::Unavailable,
         host_programs::ExecErrorKind::Internal => programs::ExecErrorKind::Internal,
+        host_programs::ExecErrorKind::NotFound => programs::ExecErrorKind::NotFound,
+        host_programs::ExecErrorKind::Io => programs::ExecErrorKind::Io,
     }
 }
 
