@@ -307,6 +307,32 @@ jobs:
             shell -c 'echo ok' 2>&1 > boot-smoke.out | tee "$runtime/inspector.log"
           cat boot-smoke.out
           grep -Fqx ok boot-smoke.out
+      # Verified boot needs no TPM (#602): the payload the boot above
+      # ran, with one byte of its signed body inverted, is refused on
+      # its signature before anything in it is read.
+      - name: Refuse a tampered boot payload
+        timeout-minutes: 10
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          check=tools/measured-boot-check.sh
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/tampered"
+          mkdir -p "$runtime"
+          "$check" tamper target/kernel-prebuild/riscv64gc-unknown-none-elf/kernel-release/helios-bootfs \
+            "$runtime/helios-bootfs"
+          if ./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
+            --accel tcg \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --bootfs "$runtime/helios-bootfs" \
+            --boot-program dash --boot-program debugger --no-compiler-plugin \
+            shell -c 'echo ok' > "$runtime/shell.out" 2> "$runtime/inspector.log"; then
+            echo 'the inspector booted a payload whose signature does not match'
+            exit 1
+          fi
+          cat "$runtime/inspector.log"
+          "$check" refused "$runtime/debug-serial.log"
       - name: Seed the wall clock from the goldfish RTC
         timeout-minutes: 5
         shell: bash
