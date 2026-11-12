@@ -1,7 +1,7 @@
 extern crate alloc;
 
 use acpi::platform::{AcpiPlatform, ProcessorState};
-use acpi::{AcpiTables, Handler, PciAddress, PhysicalMapping};
+use acpi::{AcpiTables, Handler, PciAddress, RawPhysicalMapping};
 use alloc::alloc::{Layout, alloc_zeroed};
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -1426,18 +1426,22 @@ impl Handler for PhysicalOffsetAcpiHandler {
         &self,
         physical_address: usize,
         size: usize,
-    ) -> PhysicalMapping<Self, T> {
+    ) -> RawPhysicalMapping<T> {
         ensure_hhdm_range_mapped(self.physical_memory_offset, physical_address, size);
-        PhysicalMapping {
-            physical_start: physical_address,
-            virtual_start: self.physical_to_virtual(physical_address),
-            region_length: size,
-            mapped_length: size,
-            handler: self.clone(),
+        // SAFETY: the direct map now covers the whole range at its one
+        // fixed offset, and nothing ever unmaps it, so the address stays
+        // valid for as long as the mapping is used.
+        unsafe {
+            RawPhysicalMapping::new(
+                physical_address,
+                self.physical_to_virtual(physical_address),
+                size,
+                size,
+            )
         }
     }
 
-    fn unmap_physical_region<T>(_region: &PhysicalMapping<Self, T>) {}
+    unsafe fn unmap_physical_region<T>(&self, _region: RawPhysicalMapping<T>) {}
 
     fn read_u8(&self, address: usize) -> u8 {
         unsafe { (address as *const u8).read_volatile() }
@@ -1534,18 +1538,6 @@ impl Handler for PhysicalOffsetAcpiHandler {
 
     fn sleep(&self, milliseconds: u64) {
         self.stall(milliseconds.saturating_mul(1_000));
-    }
-
-    fn create_mutex(&self) -> acpi::Handle {
-        panic!("AML mutex creation is unsupported in the x86 ACPI handler")
-    }
-
-    fn acquire(&self, _mutex: acpi::Handle, _timeout: u16) -> Result<(), acpi::aml::AmlError> {
-        panic!("AML mutex acquisition is unsupported in the x86 ACPI handler")
-    }
-
-    fn release(&self, _mutex: acpi::Handle) {
-        panic!("AML mutex release is unsupported in the x86 ACPI handler")
     }
 }
 

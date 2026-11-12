@@ -4,16 +4,18 @@ version = 4
 
 [[package]]
 name = "acpi"
-version = "6.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b763acdc1d85c36d61acf97a59938f23202d0e8efe45e8759de10c02db242744"
+version = "7.0.0-pre1"
+source = "git+https://github.com/lexoliu/acpi?branch=fix%2Fsrat-slit-accessors#568d62dd22b375c74e9d7ff684901b09c715db36"
 dependencies = [
  "bit_field",
  "bitflags 2.13.1",
  "byteorder",
+ "lock_api",
  "log",
  "pci_types",
+ "smallvec",
  "spinning_top",
+ "static_assertions",
 ]
 
 [[package]]
@@ -2052,6 +2054,7 @@ dependencies = [
 name = "helios-firmware"
 version = "0.1.0"
 dependencies = [
+ "acpi",
  "arrayvec",
  "fdt",
  "helios-hal",
@@ -2407,6 +2410,7 @@ dependencies = [
  "bitflags 2.13.1",
  "bytes",
  "critical-section",
+ "helios-firmware",
  "helios-hal",
  "helios-kernel",
  "helios-virtio",

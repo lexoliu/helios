@@ -13,6 +13,7 @@ const NODE_NAME_CAPACITY: usize = 64;
 pub struct NodeName(ArrayString<NODE_NAME_CAPACITY>);
 
 impl NodeName {
+    #[cfg(feature = "devicetree")]
     pub(crate) fn new(name: &str) -> Self {
         let mut end = name.len().min(NODE_NAME_CAPACITY);
         while !name.is_char_boundary(end) {
@@ -79,4 +80,50 @@ pub enum FirmwareNumaError {
         first: u32,
         second: u32,
     },
+    #[error(
+        "SRAT proximity domain {domain} is one distinct domain too many; at most {limit} are \
+         supported"
+    )]
+    TooManyProximityDomains { domain: u32, limit: usize },
+    #[error(
+        "SRAT memory affinity for proximity domain {domain}: range at {base:#x} of {length:#x} \
+         bytes overflows the address space"
+    )]
+    SratMemoryRangeOverflow { domain: u32, base: u64, length: u64 },
+    #[error("the SRAT keys processors by ACPI processor UID and there is no MADT to map them")]
+    MadtMissing,
+    #[error("processor {processor} has MPIDR {mpidr:#x} but no MADT GICC entry names it")]
+    ProcessorWithoutGicc { processor: u16, mpidr: u64 },
+    #[error(
+        "processor {processor} (hardware id {hardware_id:#x}, SRAT key {key:#x}) has no enabled \
+         SRAT affinity entry"
+    )]
+    ProcessorWithoutAffinity {
+        processor: u16,
+        hardware_id: u64,
+        key: u64,
+    },
+    #[error(
+        "processor {processor} (SRAT key {key:#x}) has enabled SRAT affinity entries in both \
+         proximity domain {first} and {second}"
+    )]
+    ProcessorAffinityConflict {
+        processor: u16,
+        key: u64,
+        first: u32,
+        second: u32,
+    },
+    #[error(
+        "the SLIT names {localities} localities but its {length} bytes do not hold the \
+         {localities}x{localities} matrix"
+    )]
+    SlitTruncated { localities: u64, length: u32 },
+    #[error("the SLIT gives locality {locality} distance {distance} to itself; it must be 10")]
+    SlitDiagonal { locality: u32, distance: u8 },
+    #[error("the SLIT gives localities {from} to {to} distance {distance}; remote must exceed 10")]
+    SlitNotRemote { from: u32, to: u32, distance: u8 },
+    #[error(
+        "SRAT proximity domain {domain} is beyond the {localities} localities the SLIT describes"
+    )]
+    SlitMissingDomain { domain: u32, localities: u64 },
 }

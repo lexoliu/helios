@@ -35,12 +35,13 @@ use acpi::sdt::fadt::Fadt;
 use acpi::sdt::madt::{Madt, MadtEntry};
 use acpi::sdt::spcr::Spcr;
 use acpi::sdt::{SdtHeader, Signature};
-use acpi::{AcpiTables, Handle, Handler, PciAddress, PhysicalMapping};
+use acpi::{AcpiTables, Handle, Handler, PciAddress, RawPhysicalMapping};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use arm_gic::Trigger;
 use core::str::FromStr;
+use helios_firmware::{AcpiNuma, FirmwareNumaError, GiccUidKey, ProcessorIdentities};
 use helios_hal::cpu::Timebase;
 use thiserror::Error;
 
@@ -83,6 +84,11 @@ pub(crate) enum AcpiError {
     #[error("the {0} device's _CRS declares no {1}")]
     ResourceMissing(String, &'static str),
     #[error(
+        "the {0} device's _CRS interrupt descriptor lists {1} interrupts; a _CRS descriptor \
+         lists exactly one"
+    )]
+    InterruptCount(String, usize),
+    #[error(
         "global system interrupt {0} is below the first shared peripheral interrupt; only SPIs \
          can be routed to a processor"
     )]
@@ -108,6 +114,23 @@ pub(super) fn open(rsdp: usize) -> Result<AcpiPlatformTables, AcpiError> {
     let tables =
         unsafe { AcpiTables::from_rsdp(handler.clone(), rsdp) }.map_err(AcpiError::Tables)?;
     Ok(AcpiPlatformTables { tables, handler })
+}
+
+/// The machine's NUMA description from the SRAT and SLIT, each processor
+/// keyed by the ACPI processor UID its MADT GICC entry pairs with its
+/// MPIDR.
+///
+/// Allocation-free, so this runs before the kernel has a heap: every
+/// table is read in place through its mapping.
+pub(super) fn numa<Identities: ProcessorIdentities>(
+    tables: &AcpiPlatformTables,
+    identities: Identities,
+) -> Result<
+    AcpiNuma<Aarch64AcpiHandler, Identities, GiccUidKey<Aarch64AcpiHandler>>,
+    FirmwareNumaError,
+> {
+    let key = GiccUidKey::new(&tables.tables)?;
+    AcpiNuma::new(&tables.tables, identities, key)
 }
 
 /// The console the firmware was redirecting to, from the SPCR.
@@ -258,17 +281,7 @@ fn load_namespace(
     // the PM1 blocks are absent and map to an empty system-IO address
     // that the register block never touches. Constructing them is what
     // the interpreter's `Store` opcode needs to exist; nothing here
-    // reads or writes them.
-    // The `acpi` crate's interpreter takes its register block as an
-    // `Arc`, and `FixedRegisters` is neither `Send` nor `Sync` because
-    // it owns raw firmware mappings. That is exactly right here: the
-    // interpreter, its registers and every object it builds live and
-    // die on the bootstrap processor inside `describe`.
-    #[expect(
-        clippy::arc_with_non_send_sync,
-        reason = "the interpreter's constructor takes an Arc and the whole interpreter is \
-                  single-threaded, so the reference count is never shared across processors"
-    )]
+    // reads or writes them. The interpreter takes the block as an `Arc`.
     let registers =
         Arc::new(FixedRegisters::new(&fadt, tables.handler.clone()).map_err(AcpiError::Tables)?);
     let dsdt = tables.tables.dsdt().map_err(AcpiError::Tables)?;
@@ -294,7 +307,7 @@ fn load_table(
             .handler
             .map_physical_region::<u8>(table.phys_address, table.length as usize);
         core::slice::from_raw_parts(
-            mapping.virtual_start.as_ptr().add(header_bytes),
+            mapping.virtual_start().as_ptr().add(header_bytes),
             table.length as usize - header_bytes,
         )
     };
@@ -372,10 +385,16 @@ fn memory_and_interrupt_resource(
             _ => None,
         })
         .ok_or_else(|| AcpiError::ResourceMissing(alloc::format!("{device}"), "interrupt"))?;
+    let &[gsiv] = irq.irqs.as_slice() else {
+        return Err(AcpiError::InterruptCount(
+            alloc::format!("{device}"),
+            irq.irqs.len(),
+        ));
+    };
     Ok((
         region,
         SpiInterrupt {
-            number: spi_from_gsiv(irq.irq)?,
+            number: spi_from_gsiv(gsiv)?,
             trigger: match &irq.trigger {
                 resource::InterruptTrigger::Edge => Trigger::Edge,
                 resource::InterruptTrigger::Level => Trigger::Level,
@@ -435,17 +454,21 @@ impl Handler for Aarch64AcpiHandler {
         &self,
         physical_address: usize,
         size: usize,
-    ) -> PhysicalMapping<Self, T> {
-        PhysicalMapping {
-            physical_start: physical_address,
-            virtual_start: self.physical_to_virtual(physical_address),
-            region_length: size,
-            mapped_length: size,
-            handler: self.clone(),
+    ) -> RawPhysicalMapping<T> {
+        // SAFETY: the address is in the direct map at its one fixed
+        // offset, which nothing ever unmaps, so it stays valid for as
+        // long as the mapping is used.
+        unsafe {
+            RawPhysicalMapping::new(
+                physical_address,
+                self.physical_to_virtual(physical_address),
+                size,
+                size,
+            )
         }
     }
 
-    fn unmap_physical_region<T>(_region: &PhysicalMapping<Self, T>) {}
+    unsafe fn unmap_physical_region<T>(&self, _region: RawPhysicalMapping<T>) {}
 
     fn read_u8(&self, address: usize) -> u8 {
         unsafe { (address as *const u8).read_volatile() }

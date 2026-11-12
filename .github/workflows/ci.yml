@@ -719,6 +719,31 @@ jobs:
           grep -aF 'NUMA topology nodes=2 distances=10,20;20,10' "$runtime/debug-serial.log"
           grep -aF 'NUMA node node=0' "$runtime/debug-serial.log" | grep -aF 'processors=0-1'
           grep -aF 'NUMA node node=1' "$runtime/debug-serial.log" | grep -aF 'processors=2-3'
+      - name: Boot aarch64 guest on two NUMA nodes from ACPI
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+          HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          # The same machine as the boot above, described by the SRAT, the
+          # SLIT and the MADT's GICC entries instead of `numa-node-id` and
+          # the distance map (#516).
+          set -o pipefail
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/acpi-numa"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G --acpi \
+            --accel tcg --smp 4 --numa-nodes 2 --numa-distance 20 \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger --no-compiler-plugin \
+            shell -c 'echo ok' 2>&1 > boot-acpi-numa.out | tee "$runtime/inspector.log"
+          cat boot-acpi-numa.out
+          grep -Fqx ok boot-acpi-numa.out
+          grep -F 'platform described by acpi' "$runtime/inspector.log"
+          grep -aF 'NUMA topology nodes=2 distances=10,20;20,10' "$runtime/debug-serial.log"
+          grep -aF 'NUMA node node=0' "$runtime/debug-serial.log" | grep -aF 'processors=0-1'
+          grep -aF 'NUMA node node=1' "$runtime/debug-serial.log" | grep -aF 'processors=2-3'
       # The same guest under the same accelerator as the device-tree
       # boot above, described the other way. ACPI carries no counterpart
       # to `/chosen/rng-seed`, so this boot's seed comes from the CPU's
@@ -923,6 +948,30 @@ jobs:
           grep -aF 'mount source online serial="src-a"' "$runtime/debug-serial.log" | grep -aF 'read_only=false'
           grep -aF 'mount source online serial="src-b"' "$runtime/debug-serial.log" | grep -aF 'read_only=true'
           grep -aF 'block device identified as the kernel scratch disk serial="helios-data"' "$runtime/debug-serial.log"
+      - name: Boot x86-64 guest on two NUMA nodes
+        timeout-minutes: 5
+        shell: bash
+        working-directory: helios
+        run: |
+          # Every other boot describes one node, so nothing else reads the
+          # SRAT or the SLIT from real ACPI tables (#516). `-smp
+          # 4,sockets=2,cores=2` gives processors 0-3 APIC ids 0-3 in MADT
+          # order, and `-numa node,cpus=` puts 0-1 on node 0 and 2-3 on
+          # node 1. The kernel prints the layout it placed memory and
+          # processors by; the log carries colour escapes, hence `-a`.
+          set -o pipefail
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/numa"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            --accel kvm --smp 4 --numa-nodes 2 --numa-distance 20 \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger --no-compiler-plugin \
+            shell -c 'echo ok' 2>&1 > boot-numa.out | tee "$runtime/inspector.log"
+          cat boot-numa.out
+          grep -Fqx ok boot-numa.out
+          grep -aF 'NUMA topology nodes=2 distances=10,20;20,10' "$runtime/debug-serial.log"
+          grep -aF 'NUMA node node=0' "$runtime/debug-serial.log" | grep -aF 'processors=0-1'
+          grep -aF 'NUMA node node=1' "$runtime/debug-serial.log" | grep -aF 'processors=2-3'
       - name: Run the coreutils applets through dash
         timeout-minutes: 5
         shell: bash

@@ -40,12 +40,15 @@ mod debug_state {
     >;
 }
 
+use acpi::sdt::madt::{Madt, MadtEntry};
+use acpi::{AcpiTables, PhysicalMapping};
 use alloc::sync::Arc;
 use core::arch::asm;
 use core::arch::global_asm;
 use core::arch::x86_64::{__cpuid, __cpuid_count, _rdrand64_step, _rdtsc};
 use core::ops::Range;
 use core::sync::atomic::{AtomicU8, Ordering, compiler_fence};
+use helios_firmware::{AcpiNuma, LocalApicKey, ProcessorIdentities};
 use helios_hal::boot::{
     BootMemoryMap, BootReservedRanges, usable_node_regions, usable_region_segments,
 };
@@ -53,7 +56,7 @@ use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase, TimerInterrupt, curre
 use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
 use helios_hal::memory::MemoryRegion;
-use helios_hal::numa::SingleNode;
+use helios_hal::numa::NumaTopology;
 use helios_hal::serial::ByteSerial;
 use helios_hal::watchdog::Watchdog;
 use helios_hal::{
@@ -202,10 +205,15 @@ fn x86_kernel_main() -> ! {
         .tables
         .acpi_rsdp
         .unwrap_or_else(|| panic!("Limine handoff did not include an ACPI RSDP address"));
-    let processor_count = processor_count(rsdp_address, physical_memory_offset);
-    // No firmware NUMA description is read yet: every processor and all
-    // of memory sit on one node.
-    let numa = SingleNode::new(processor_count);
+    // The MADT and the SRAT/SLIT are read in place before the bootstrap
+    // allocator is primed: the processor count and each processor's and
+    // each memory range's node size its per-processor and per-node
+    // structures.
+    let acpi_tables = pre_heap_acpi_tables(rsdp_address, physical_memory_offset);
+    let processors = MadtProcessors::new(&acpi_tables);
+    let processor_count = processors.processor_count();
+    let numa = AcpiNuma::new(&acpi_tables, processors, LocalApicKey)
+        .unwrap_or_else(|error| panic!("x86 NUMA discovery failed: {error}"));
     let pool = helios_kernel::prime_bootstrap_allocator(
         boot_memory_regions(
             &handoff,
@@ -643,40 +651,71 @@ fn install_pci_devices<WatchdogImpl>(
     );
 }
 
-/// Counts usable processors from the MADT. Runs before the bootstrap
-/// allocator is primed (the count sizes the allocator's per-processor
-/// structures), so it must not allocate: iterate MADT entries directly
-/// instead of building `AcpiPlatform` processor info.
-fn processor_count(rsdp_address: usize, physical_memory_offset: usize) -> usize {
-    use acpi::sdt::madt::{Madt, MadtEntry};
-
-    const LAPIC_ENABLED: u32 = 1 << 0;
-    const LAPIC_ONLINE_CAPABLE: u32 = 1 << 1;
-    const LAPIC_USABLE: u32 = LAPIC_ENABLED | LAPIC_ONLINE_CAPABLE;
-
+/// The ACPI tables, opened before the bootstrap allocator is primed.
+/// Nothing read through them may allocate: MADT and SRAT entries are
+/// walked in place rather than collected into `AcpiPlatform`.
+fn pre_heap_acpi_tables(
+    rsdp_address: usize,
+    physical_memory_offset: usize,
+) -> AcpiTables<smp::PhysicalOffsetAcpiHandler> {
     let handler = smp::PhysicalOffsetAcpiHandler {
         physical_memory_offset,
         tsc_base: 0,
         timebase: Timebase::new(1),
     };
-    let tables =
-        unsafe { acpi::AcpiTables::from_rsdp(handler, rsdp_address) }.unwrap_or_else(|error| {
-            panic!("failed to parse ACPI tables for processor count: {error:?}")
-        });
-    let madt = tables
-        .find_table::<Madt>()
-        .unwrap_or_else(|| panic!("ACPI tables did not expose an MADT"));
-    let count = madt
-        .get()
-        .entries()
-        .filter(|entry| match entry {
-            MadtEntry::LocalApic(apic) => apic.flags & LAPIC_USABLE != 0,
-            MadtEntry::LocalX2Apic(apic) => apic.flags & LAPIC_USABLE != 0,
-            _ => false,
+    unsafe { AcpiTables::from_rsdp(handler, rsdp_address) }
+        .unwrap_or_else(|error| panic!("failed to parse ACPI tables before the heap: {error:?}"))
+}
+
+/// The MADT Processor Local APIC and Local x2APIC structures' flags:
+/// bit 0 Enabled, bit 1 Online Capable (ACPI 6.5, Local APIC Flags).
+const LAPIC_ENABLED: u32 = 1 << 0;
+const LAPIC_ONLINE_CAPABLE: u32 = 1 << 1;
+const LAPIC_USABLE: u32 = LAPIC_ENABLED | LAPIC_ONLINE_CAPABLE;
+
+/// Each usable processor's local APIC id, in MADT entry order: the order
+/// `smp` numbers processors in, whose first entry is the bootstrap
+/// processor. Read in place, so it answers before the heap exists.
+struct MadtProcessors {
+    madt: PhysicalMapping<smp::PhysicalOffsetAcpiHandler, Madt>,
+}
+
+impl MadtProcessors {
+    fn new(tables: &AcpiTables<smp::PhysicalOffsetAcpiHandler>) -> Self {
+        let madt = tables
+            .find_table::<Madt>()
+            .unwrap_or_else(|| panic!("ACPI tables did not expose an MADT"));
+        let processors = Self { madt };
+        assert!(
+            processors.apic_ids().next().is_some(),
+            "MADT did not list any usable processors"
+        );
+        processors
+    }
+
+    fn apic_ids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.madt.get().entries().filter_map(|entry| match entry {
+            MadtEntry::LocalApic(apic) if apic.flags & LAPIC_USABLE != 0 => {
+                Some(u32::from(apic.apic_id))
+            }
+            MadtEntry::LocalX2Apic(apic) if apic.flags & LAPIC_USABLE != 0 => Some(apic.x2apic_id),
+            _ => None,
         })
-        .count();
-    assert!(count > 0, "MADT did not list any usable processors");
-    count
+    }
+}
+
+impl ProcessorIdentities for MadtProcessors {
+    fn processor_count(&self) -> usize {
+        self.apic_ids().count()
+    }
+
+    fn hardware_id(&self, processor: ProcessorId) -> u64 {
+        let index = usize::from(processor.id());
+        self.apic_ids()
+            .nth(index)
+            .map(u64::from)
+            .unwrap_or_else(|| panic!("the MADT names no usable processor {index}"))
+    }
 }
 
 fn boot_reserved_ranges(handoff: &boot::LimineBootHandoff) -> BootReservedRanges {
@@ -735,13 +774,13 @@ fn reserve_wakeup_page(
 }
 
 /// The usable memory the kernel may own, each region on its node.
-fn boot_memory_regions<'n>(
+fn boot_memory_regions<'n, Numa: NumaTopology>(
     handoff: &boot::LimineBootHandoff,
     physical_memory_offset: usize,
     reserved_ranges: &BootReservedRanges,
     excluded: Option<Range<usize>>,
-    numa: &'n SingleNode,
-) -> impl Iterator<Item = MemoryRegion> + use<'n> {
+    numa: &'n Numa,
+) -> impl Iterator<Item = MemoryRegion> + use<'n, Numa> {
     let mut reserved_ranges = reserved_ranges.clone();
     if let Some(excluded) = excluded {
         reserved_ranges.reserve(excluded);
@@ -759,12 +798,12 @@ fn boot_memory_regions<'n>(
 /// It is exactly what the bootstrap allocator was primed with: every
 /// buffer a driver hands to a device is a kernel heap allocation, so a
 /// domain that maps these runs reaches every buffer and nothing else.
-fn dma_capable_ranges(
+fn dma_capable_ranges<Numa: NumaTopology>(
     handoff: &boot::LimineBootHandoff,
     physical_memory_offset: usize,
     reserved_ranges: &BootReservedRanges,
     excluded: Option<Range<usize>>,
-    numa: &SingleNode,
+    numa: &Numa,
 ) -> alloc::vec::Vec<helios_hal::iommu::PhysicalRange> {
     boot_memory_regions(
         handoff,

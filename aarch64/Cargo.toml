@@ -8,7 +8,7 @@ default = ["embedded-debugger"]
 embedded-debugger = ["helios-kernel/embedded-debugger"]
 
 [dependencies]
-acpi = "6.1.1"
+acpi = { workspace = true, features = ["aml"] }
 arm-gic = "0.9.1"
 # The ID, key and control registers return-address signing programs. `arm-gic`
 # pins its sysreg subcrates to exactly 0.4.0, so this stays at that version.
@@ -16,7 +16,7 @@ arm-sysregs = { version = "0.4.0", default-features = false, features = ["el1"] 
 bytes = { version = "1.12.1", default-features = false }
 critical-section = { version = "1.2.0", features = ["restore-state-usize"] }
 fdt = { version = "0.1.5", default-features = false }
-helios-firmware.workspace = true
+helios-firmware = { workspace = true, features = ["acpi", "devicetree"] }
 helios-hal.workspace = true
 helios-kernel = { workspace = true, default-features = false, features = ["wasmtime-bare-metal"] }
 helios-virtio.workspace = true

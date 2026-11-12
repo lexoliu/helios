@@ -32,8 +32,11 @@ helios-venus-gen = { path = "venus-gen", default-features = false }
 helios-virtio = { path = "virtio" }
 helios-workspace-root = { path = "workspace-root" }
 helios-x86 = { path = "x86" }
-helios-firmware = { path = "firmware" }
+helios-firmware = { path = "firmware", default-features = false }
 i6300esb = { path = "i6300esb" }
+# The published 6.1.1 and 7.0.0-pre1 misread the SRAT's memory length above
+# 4 GiB and every multi-locality SLIT; the fork's branch carries the fixes.
+acpi = { git = "https://github.com/lexoliu/acpi", branch = "fix/srat-slit-accessors", default-features = false }
 crossbeam-utils = { version = "0.8.23", default-features = false }
 tracing = { version = "0.1.44",  default-features = false }
 wit-bindgen = { version = "0.61.1", default-features = false }

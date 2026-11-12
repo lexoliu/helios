@@ -23,8 +23,9 @@
 use core::fmt;
 
 use arm_gic::{IntId, Trigger};
+pub(crate) use helios_firmware::MPIDR_AFFINITY_MASK;
 use helios_firmware::{DeviceTreeNuma, FirmwareNumaError, ProcessorIdentities};
-use helios_hal::numa::{NumaTopology, SingleNode};
+use helios_hal::numa::NumaTopology;
 use thiserror::Error;
 
 use crate::LimineBootHandoff;
@@ -178,11 +179,6 @@ impl GicDescription {
     }
 }
 
-/// Affinity bits of `MPIDR_EL1`: Aff0..Aff2 in the low word and Aff3 in
-/// bits 32..40. The MADT reports a processor's MPIDR in the same shape,
-/// but firmware is not required to zero the bits outside them.
-pub(crate) const MPIDR_AFFINITY_MASK: u64 = 0x0000_00ff_00ff_ffff;
-
 /// Where the description came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PlatformSource {
@@ -278,7 +274,7 @@ pub(crate) enum PlatformError {
     DeviceTreeMissing(&'static str),
     #[error(transparent)]
     Acpi(#[from] AcpiError),
-    #[error("the device tree's NUMA description is refused: {0}")]
+    #[error("the firmware's NUMA description is refused: {0}")]
     Numa(#[from] FirmwareNumaError),
 }
 
@@ -337,7 +333,8 @@ impl PlatformTables {
     /// `MPIDR_EL1`. Neither path allocates, so this runs before the heap
     /// exists, which is when the bootstrap allocator needs the
     /// description: a device tree is read in place by
-    /// [`DeviceTreeNuma`], and the ACPI path describes one node.
+    /// [`DeviceTreeNuma`], and the SRAT, SLIT and MADT in place by
+    /// [`acpi::numa`].
     pub(crate) fn with_numa<Identities, Consumer>(
         &self,
         identities: Identities,
@@ -349,9 +346,7 @@ impl PlatformTables {
     {
         match self {
             Self::DeviceTree(fdt) => Ok(consumer.consume(&DeviceTreeNuma::new(fdt, identities)?)),
-            // The SRAT/SLIT reader is not wired yet: every processor and
-            // all of memory sit on one node.
-            Self::Acpi(_) => Ok(consumer.consume(&SingleNode::new(identities.processor_count()))),
+            Self::Acpi(tables) => Ok(consumer.consume(&acpi::numa(tables, identities)?)),
         }
     }
 

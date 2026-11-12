@@ -7,9 +7,18 @@
 
 #![no_std]
 
+#[cfg(feature = "acpi")]
+mod acpi;
+#[cfg(feature = "devicetree")]
 mod devicetree;
 mod error;
 
+#[cfg(feature = "acpi")]
+pub use self::acpi::{
+    AcpiMemory, AcpiNuma, GiccUidKey, LocalApicKey, MPIDR_AFFINITY_MASK, SratProcessor,
+    SratProcessorKey,
+};
+#[cfg(feature = "devicetree")]
 pub use devicetree::{DeviceTreeMemory, DeviceTreeNuma};
 pub use error::{FirmwareNumaError, NodeName};
 
