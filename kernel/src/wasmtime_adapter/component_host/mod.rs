@@ -518,7 +518,10 @@ macro_rules! impl_program_bindings {
                 });
                 async move {
                     let (service, context, caller_authority, cpu) = snapshot?;
-                    let launch = phases::Trace::begin(cpu, "exec", &request.path);
+                    // Read before anything else the call does, so the
+                    // reported duration covers the whole launch.
+                    let clock = phases::LaunchClock::arrive(&cpu);
+                    let launch = phases::Trace::begin_timed(cpu, "exec", &request.path, &clock);
                     let Some(service) = service else {
                         launch.refused(ProgramExecErrorKind::Unavailable);
                         return Ok(Err($bindings::helios::system::programs::ExecError {
@@ -592,11 +595,13 @@ macro_rules! impl_program_bindings {
                         // the mark itself.
                         Err(error) => launch.exit_error(error),
                     }
-                    launch.record(LaunchPhase::Reply);
+                    let launch_nanos = launch.replied(&clock);
                     // The guard stays armed: it drops here and emits
                     // the line — `reply` included — for an exec the
                     // run task does not own emission.
-                    Ok(executed.map($convert_result).map_err($convert_error))
+                    Ok(executed
+                        .map(|result| $convert_result(result, launch_nanos))
+                        .map_err($convert_error))
                 }
             }
 
@@ -3309,7 +3314,10 @@ fn convert_launch_error(error: crate::ProgramExecError) -> debugger_wit::program
     }
 }
 
-fn convert_launch_result(result: crate::ExecResult) -> debugger_wit::programs::ExecResult {
+fn convert_launch_result(
+    result: crate::ExecResult,
+    launch_nanos: u64,
+) -> debugger_wit::programs::ExecResult {
     debugger_wit::programs::ExecResult {
         instance_id: result.instance_id.raw(),
         exit_code: result.exit_code,
@@ -3317,6 +3325,7 @@ fn convert_launch_result(result: crate::ExecResult) -> debugger_wit::programs::E
             stdout: result.output.stdout,
             stderr: result.output.stderr,
         },
+        launch_nanos,
     }
 }
 
@@ -3350,7 +3359,10 @@ fn convert_program_launch_error(
     }
 }
 
-fn convert_program_launch_result(result: crate::ExecResult) -> program_wit::programs::ExecResult {
+fn convert_program_launch_result(
+    result: crate::ExecResult,
+    launch_nanos: u64,
+) -> program_wit::programs::ExecResult {
     program_wit::programs::ExecResult {
         instance_id: result.instance_id.raw(),
         exit_code: result.exit_code,
@@ -3358,6 +3370,7 @@ fn convert_program_launch_result(result: crate::ExecResult) -> program_wit::prog
             stdout: result.output.stdout,
             stderr: result.output.stderr,
         },
+        launch_nanos,
     }
 }
 

@@ -111,6 +111,7 @@ async fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>,
                         stdout: result.output.stdout,
                         stderr: result.output.stderr,
                     },
+                    launch_nanos: result.launch_nanos,
                 })
                 .map_err(|error| programs::ExecError {
                     kind: convert_launch_error_kind(error.kind),

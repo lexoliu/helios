@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 use clap::{Args as ClapArgs, ValueEnum};
 use helios_inspector_protocol::RpcError;
 use helios_inspector_protocol::debugger::filesystem as debugger_fs;
-use helios_inspector_protocol::system::programs::{self as system_programs, ExecErrorKind};
+use helios_inspector_protocol::system::programs::{
+    self as system_programs, ExecErrorKind, ExecResult,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::programs::ProgramError;
@@ -514,6 +516,10 @@ pub(crate) struct VmProvenance {
     pub(crate) release: bool,
     pub(crate) smp: u16,
     pub(crate) memory: String,
+    /// How the host backed that memory: a guest whose RAM is faulted in
+    /// on first touch pays host page faults a preallocated one does not
+    /// (#491).
+    pub(crate) guest_ram: crate::vm::ResolvedGuestRam,
     pub(crate) cpu: Option<String>,
     pub(crate) accel: Vec<String>,
     /// The transport the inspector RPC that every workload is timed
@@ -549,7 +555,15 @@ enum JsonlRecord<'a> {
         headline: bool,
         runner: WorkloadRunner,
         iteration: u16,
+        /// The host-side round trip: an `Instant` around the RPC, so the
+        /// transport the RPC rode is inside it.
         elapsed_ms: f64,
+        /// The launch's own duration as the kernel measured it, from the
+        /// `exec` reply's `launch-nanos`: no transport is inside it (#491).
+        /// Absent for a workload that is not a program launch — an AOT
+        /// compile answers no `exec` reply.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        launch_elapsed_ms: Option<f64>,
         /// Secondary measurements the workload printed as `bench.<name>=<number>`.
         metrics: BTreeMap<String, f64>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -791,6 +805,7 @@ async fn measure_workload(
             runner: workload.runner,
             iteration,
             elapsed_ms: output.elapsed_ms,
+            launch_elapsed_ms: output.launch_elapsed_ms,
             metrics: parse_metrics(&output.stdout)?,
             throughput_bytes: workload.throughput_bytes,
             throughput_mib_per_second: throughput_mib_per_second(
@@ -808,6 +823,9 @@ async fn measure_workload(
 #[derive(Debug)]
 struct WorkloadOutput {
     elapsed_ms: f64,
+    /// The kernel's own duration of the launch, for a workload that is
+    /// one; see [`JsonlRecord::Iteration`].
+    launch_elapsed_ms: Option<f64>,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
 }
@@ -903,6 +921,17 @@ async fn run_shell_workload(
         source,
     })?;
     let elapsed_ms = elapsed_millis(started);
+    launched_output(workload, elapsed_ms, output)
+}
+
+/// What one launched workload iteration produced: the host-side round
+/// trip the caller timed beside the launch duration the kernel reported,
+/// or the failure a non-zero exit is.
+fn launched_output(
+    workload: &Workload,
+    elapsed_ms: f64,
+    output: ExecResult,
+) -> Result<WorkloadOutput, WorkloadBenchError> {
     if output.exit_code != 0 {
         write_guest_output(workload, &output.output.stdout, &output.output.stderr)?;
         return Err(WorkloadBenchError::WorkloadExited {
@@ -913,6 +942,7 @@ async fn run_shell_workload(
     }
     Ok(WorkloadOutput {
         elapsed_ms,
+        launch_elapsed_ms: Some(millis_of(Duration::from_nanos(output.launch_nanos))),
         stdout: output.output.stdout,
         stderr: output.output.stderr,
     })
@@ -948,19 +978,7 @@ async fn run_program_workload(
             source,
         })?;
     let elapsed_ms = elapsed_millis(started);
-    if output.exit_code != 0 {
-        write_guest_output(workload, &output.output.stdout, &output.output.stderr)?;
-        return Err(WorkloadBenchError::WorkloadExited {
-            workload: workload.name.clone(),
-            exit_code: output.exit_code,
-            stderr: quoted_stderr(&output.output.stderr),
-        });
-    }
-    Ok(WorkloadOutput {
-        elapsed_ms,
-        stdout: output.output.stdout,
-        stderr: output.output.stderr,
-    })
+    launched_output(workload, elapsed_ms, output)
 }
 
 async fn run_aot_workload(
@@ -1020,6 +1038,9 @@ async fn run_aot_workload(
     })?;
     Ok(WorkloadOutput {
         elapsed_ms: elapsed_millis(started),
+        // An AOT compile is no program launch: `programs.aot` answers no
+        // `exec` reply, so the host clock is the only one it has.
+        launch_elapsed_ms: None,
         stdout: Vec::new(),
         stderr: Vec::new(),
     })
@@ -1847,6 +1868,7 @@ mod tests {
             &vcpus,
             std::future::ready(Ok(WorkloadOutput {
                 elapsed_ms: 24.375,
+                launch_elapsed_ms: Some(21.5),
                 stdout: b"process-startup:ok\n".to_vec(),
                 stderr: Vec::new(),
             })),
@@ -1877,6 +1899,7 @@ mod tests {
             runner: WorkloadRunner::Shell,
             iteration: 2,
             elapsed_ms: 30.125_5,
+            launch_elapsed_ms: None,
             metrics: BTreeMap::new(),
             throughput_bytes: None,
             throughput_mib_per_second: None,
@@ -1901,6 +1924,76 @@ mod tests {
             encoded.contains("\"elapsed_ms\":30.1255"),
             "the record must carry the fractional milliseconds, got {encoded}"
         );
+    }
+
+    /// A launched iteration carries both clocks: the host-side round
+    /// trip it timed, and the kernel's own launch duration from the
+    /// `exec` reply, in milliseconds (#491).
+    #[test]
+    fn a_launched_iteration_records_the_kernels_launch_duration() {
+        let workload = timeout_test_workload("process-startup");
+        let output = launched_output(
+            &workload,
+            31.25,
+            ExecResult {
+                instance_id: 7,
+                exit_code: 0,
+                output: system_programs::ExecOutput {
+                    stdout: b"process-startup:ok\n".to_vec(),
+                    stderr: Vec::new(),
+                },
+                launch_nanos: 8_312_500,
+            },
+        )
+        .expect("a zero exit is an iteration");
+        assert_eq!(output.elapsed_ms, 31.25);
+        assert_eq!(output.launch_elapsed_ms, Some(8.3125));
+
+        let record = JsonlRecord::Iteration {
+            workload: "process-startup",
+            class: WorkloadClass::Startup,
+            headline: true,
+            runner: WorkloadRunner::Program,
+            iteration: 2,
+            elapsed_ms: output.elapsed_ms,
+            launch_elapsed_ms: output.launch_elapsed_ms,
+            metrics: BTreeMap::new(),
+            throughput_bytes: None,
+            throughput_mib_per_second: None,
+            stdout: stream_validation(&workload, &output.stdout, false),
+            stderr: stream_validation(&workload, &output.stderr, false),
+            validation: ValidationSummary { ok: true },
+        };
+        let encoded: serde_json::Value =
+            serde_json::to_value(&record).expect("the record must serialise");
+        assert_eq!(encoded["elapsed_ms"], 31.25);
+        assert_eq!(encoded["launch_elapsed_ms"], 8.3125);
+    }
+
+    /// An iteration that is no program launch keeps only the host clock:
+    /// the record leaves the launch field out rather than inventing one.
+    #[test]
+    fn an_iteration_without_a_launch_omits_the_launch_clock() {
+        let workload = timeout_test_workload("aot-curl");
+        let record = JsonlRecord::Iteration {
+            workload: "aot-curl",
+            class: WorkloadClass::Compute,
+            headline: false,
+            runner: WorkloadRunner::HeliosAot,
+            iteration: 1,
+            elapsed_ms: 90.5,
+            launch_elapsed_ms: None,
+            metrics: BTreeMap::new(),
+            throughput_bytes: None,
+            throughput_mib_per_second: None,
+            stdout: stream_validation(&workload, &[], false),
+            stderr: stream_validation(&workload, &[], false),
+            validation: ValidationSummary { ok: true },
+        };
+        let encoded: serde_json::Value =
+            serde_json::to_value(&record).expect("the record must serialise");
+        assert_eq!(encoded["elapsed_ms"], 90.5);
+        assert!(encoded.get("launch_elapsed_ms").is_none(), "got {encoded}");
     }
 
     /// The median of an even sample is the mean of the two middle values,
