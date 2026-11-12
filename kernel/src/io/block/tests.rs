@@ -107,7 +107,9 @@ struct DiskState {
     max_segments: u32,
     serial: &'static str,
     read_only: bool,
-    fail_reads: bool,
+    /// While set, every read the disk is asked for fails, as a device
+    /// that develops a fault after it was mounted.
+    fail_reads: AtomicBool,
     /// A logical block whose writes the device refuses.
     fail_writes_at: Option<usize>,
     /// Mirrors a device whose write cache is never committed: reads
@@ -137,8 +139,13 @@ impl MemoryDisk {
         bytes.fill(0);
         bytes[..image.len()].copy_from_slice(image);
         state.read_only = true;
-        state.fail_reads = fail_reads;
+        *state.fail_reads.get_mut() = fail_reads;
         Self::from(state)
+    }
+
+    /// Makes every later read fail, or succeed again.
+    pub(crate) fn fail_reads(&self, fail: bool) {
+        self.state.fail_reads.store(fail, Ordering::SeqCst);
     }
 
     fn build(serial: &'static str, block_bytes: usize, blocks: usize) -> DiskState {
@@ -156,7 +163,7 @@ impl MemoryDisk {
             max_segments: 32,
             serial,
             read_only: false,
-            fail_reads: false,
+            fail_reads: AtomicBool::new(false),
             fail_writes_at: None,
             corrupt_readback: false,
             queue: Mutex::new(Queue::default()),
@@ -299,7 +306,7 @@ impl MemoryDisk {
         let blocks: usize =
             bufs.iter().map(|buf| buf.len()).sum::<usize>() / self.state.block_bytes;
         self.state.log.lock().push(Op::Read(block_id, blocks));
-        if self.state.fail_reads {
+        if self.state.fail_reads.load(Ordering::SeqCst) {
             return Err(IoError::DeviceFault);
         }
         let bytes = self.state.bytes.lock();
@@ -1408,7 +1415,7 @@ fn a_read_only_disk_refuses_writes_before_reaching_the_device() {
 #[test]
 fn a_failed_read_is_reported_and_a_later_read_retries() {
     let mut state = MemoryDisk::build("images", CACHE_BLOCK_BYTES, 16);
-    state.fail_reads = true;
+    *state.fail_reads.get_mut() = true;
     let disk = MemoryDisk::from(state);
     let cache = cache_over(&disk, 16, 1);
     let view = cache.disk(0);

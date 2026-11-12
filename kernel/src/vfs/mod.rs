@@ -43,7 +43,7 @@ mod request;
 mod root;
 mod storage;
 
-pub use erofs::{DiskImage, ErofsError, ErofsFs};
+pub use erofs::{DiskImage, ErofsError, ErofsFs, ReaderError};
 pub use host::HostShare;
 pub use memory::MemoryFs;
 pub use request::{

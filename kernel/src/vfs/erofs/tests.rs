@@ -351,6 +351,51 @@ fn corrupted_builder_images_fail_with_typed_errors() {
     assert_corruptions_fail(&built(Compression::None));
 }
 
+/// The block cache's own error for a read the device refused.
+fn is_device_fault(error: &super::ReaderError) -> bool {
+    matches!(
+        error,
+        erofs_rs::Error::Image(BlockCacheError::Device(IoError::DeviceFault))
+    )
+}
+
+#[test]
+fn a_device_fault_after_mount_reaches_the_reader_as_the_device_error() {
+    let disk = MemoryDisk::holding(SERIAL, &built(Compression::None), false);
+    let fs = mount_on(&disk).expect("the image mounts");
+    let reader = fs.reader();
+    let big_inode = block_on(reader.lookup("/big.bin")).unwrap().unwrap();
+    let many = block_on(reader.lookup("/many")).unwrap().unwrap();
+    let file = reader.open_inode_file(big_inode).unwrap();
+
+    // Neither the file's data nor the directory's entries were read
+    // before the fault, so both reads reach the device.
+    disk.fail_reads(true);
+    let mut buffer = [0; 4096];
+    match block_on(file.read_at(&mut buffer, 0)) {
+        Err(error) => assert!(
+            is_device_fault(&error),
+            "a file read reports the device fault, not {error}"
+        ),
+        Ok(read) => panic!("a file read on a faulted disk returned {read} bytes"),
+    }
+    match block_on(reader.read_dir_inode(many)) {
+        Err(error) => assert!(
+            is_device_fault(&error),
+            "a directory listing reports the device fault, not {error}"
+        ),
+        Ok(_) => panic!("a directory listing on a faulted disk succeeded"),
+    }
+    assert_eq!(read_all(&fs, "big.bin"), Err(FsError::Io));
+    assert_eq!(list(&fs, "many"), Err(FsError::Io));
+
+    // The fault is the device's, not the image's: once the device reads
+    // again, so does the filesystem.
+    disk.fail_reads(false);
+    assert_eq!(read_all(&fs, "big.bin").unwrap(), big());
+    assert_eq!(list(&fs, "many").unwrap().len(), MANY_FILES);
+}
+
 /// The storage of a machine whose one disk is a [`MemoryDisk`].
 #[derive(Clone, Copy)]
 struct MemoryStorage;

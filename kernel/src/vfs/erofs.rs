@@ -22,7 +22,6 @@
 
 extern crate alloc;
 
-use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::future::Future;
@@ -62,9 +61,16 @@ pub enum ErofsError {
         "the superblock checksum is {stored:#010x} but the superblock's bytes give {computed:#010x}"
     )]
     Checksum { stored: u32, computed: u32 },
+    /// Everything the reader refused other than a failed disk read, which
+    /// arrives as [`ErofsError::Device`] instead.
     #[error("the image is not a valid EROFS image: {0}")]
-    Format(erofs_rs::Error),
+    Format(ReaderError),
 }
+
+/// What the reader answers over a mount-source disk: its own account of
+/// the image, or the block cache's error for a read that failed
+/// ([`erofs_rs::Error::Image`]).
+pub type ReaderError = erofs_rs::Error<BlockCacheError>;
 
 /// A mount-source disk as the reader sees it: bytes at offsets.
 pub struct DiskImage<Device> {
@@ -75,29 +81,20 @@ impl<Device> AsyncImage for DiskImage<Device>
 where
     Device: BlockDevice<Buffer = BlockPages>,
 {
-    async fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> erofs_rs::Result<()> {
+    type Error = BlockCacheError;
+
+    async fn read_exact_at(
+        &self,
+        buf: &mut [u8],
+        offset: u64,
+    ) -> erofs_rs::Result<(), BlockCacheError> {
         if buf.is_empty() {
             return Ok(());
         }
-        self.disk.read_at(offset, buf).await.map_err(|error| {
-            tracing::warn!(
-                %error,
-                serial = ?self.disk.serial(),
-                offset,
-                len = buf.len(),
-                "EROFS image read failed"
-            );
-            match error {
-                BlockCacheError::ByteRangeOutOfRange {
-                    offset,
-                    len,
-                    capacity_bytes,
-                } => erofs_rs::Error::OutOfRange(offset.saturating_add(len as u64), capacity_bytes),
-                error => {
-                    erofs_rs::Error::CorruptedData(format!("disk read at byte {offset}: {error}"))
-                }
-            }
-        })
+        self.disk
+            .read_at(offset, buf)
+            .await
+            .map_err(erofs_rs::Error::Image)
     }
 }
 
@@ -128,14 +125,13 @@ where
     /// checksum when the image carries one, and mounts it as `device`.
     pub async fn mount(disk: CachedDisk<Device>, device: DeviceId) -> Result<Self, ErofsError> {
         let serial = disk.serial();
-        // The superblock is read once through the cache before the reader
-        // sees it, so a disk that cannot be read fails with the cache's
-        // own error rather than the reader's account of it.
-        let mut header = [0; CHECKSUM_FIELD.end];
-        disk.read_at(SUPER_BLOCK_OFFSET, &mut header).await?;
-        let reader = EroFS::new(DiskImage { disk: disk.clone() })
-            .await
-            .map_err(ErofsError::Format)?;
+        let reader =
+            EroFS::new(DiskImage { disk: disk.clone() })
+                .await
+                .map_err(|error| match error {
+                    erofs_rs::Error::Image(error) => ErofsError::Device(error),
+                    error => ErofsError::Format(error),
+                })?;
         let super_block = reader.super_block();
         if super_block
             .feature_compat_flags()
@@ -188,13 +184,24 @@ where
     }
 
     /// What an operation answers for a reader error: the structural
-    /// answers the reader gives in so many words, and an I/O error for
-    /// everything that means the image or the disk is bad, which is
-    /// logged with the reader's account first.
-    fn fs_error(&self, error: erofs_rs::Error) -> FsError {
+    /// answers the reader gives in so many words, and an I/O error for a
+    /// disk read that failed and for everything that means the image is
+    /// bad, each logged first with its own account.
+    fn fs_error(&self, error: ReaderError) -> FsError {
         match error {
             erofs_rs::Error::PathNotFound(_) => FsError::NoEntry,
             erofs_rs::Error::NotADirectory(_) => FsError::NotDirectory,
+            erofs_rs::Error::Image(error) => {
+                // Every block cache error on a read means the disk did not
+                // deliver the bytes: a device fault, a range the image
+                // points past the disk's end, or a disk aborted under it.
+                tracing::warn!(
+                    %error,
+                    serial = ?self.inner.serial,
+                    "EROFS image read failed"
+                );
+                FsError::Io
+            }
             error => {
                 tracing::warn!(
                     %error,
