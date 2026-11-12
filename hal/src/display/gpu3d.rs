@@ -394,12 +394,21 @@ pub trait Gpu3d: Send + Sync + 'static {
     /// The pages in [`BlobRequest::backing`], where there are any, stay
     /// the caller's: the device only reads and writes them, and only
     /// between this call and [`Gpu3d::destroy_blob`].
+    ///
+    /// [`Gpu3dError::Transport`] means the request may have reached the
+    /// device: it may hold the blob and every page of the backing, and
+    /// the caller has no handle to release it by.
     fn create_blob<'a>(
         &'a self,
         request: BlobRequest<'a>,
     ) -> impl Future<Output = Gpu3dResult<BlobId>> + Send + 'a;
 
     /// Releases a blob and hands any backing pages back.
+    ///
+    /// The pages are the caller's again only when this resolves `Ok`.
+    /// Any error leaves the device free to keep reading and writing
+    /// them, and [`Gpu3dError::Transport`] in particular means the
+    /// request may never have reached it.
     fn destroy_blob(&self, blob: BlobId) -> impl Future<Output = Gpu3dResult<()>> + Send + '_;
 
     /// Places a blob's host storage in the engine's host-visible
@@ -445,10 +454,16 @@ pub trait Gpu3d: Send + Sync + 'static {
     /// implementation that took a slice would be one that had already
     /// copied a guest's pages into its own.
     ///
-    /// The future resolves when the device has taken the buffer, which
-    /// is not when the renderer has finished with it: that is what
-    /// `fence` is for, and it is delivered on [`Gpu3d::fences`]. The
-    /// caller keeps the pages until then.
+    /// The future resolves once the device has answered the command,
+    /// and the answer to a fenced command comes only after `fence` has
+    /// passed: the renderer has finished reading the buffer by then,
+    /// and a caller may release its pages on any answer other than
+    /// [`Gpu3dError::Transport`]. The fence is also delivered on
+    /// [`Gpu3d::fences`].
+    ///
+    /// [`Gpu3dError::Transport`] means no answer was obtained: the
+    /// device may still hold the buffer and may read it at any later
+    /// time, so the caller must never release its pages.
     ///
     /// A submission the device refuses still signals its fence, so a
     /// reader of the fence stream never waits for a point the device

@@ -68,6 +68,9 @@ clippy-host:
         --cargo cargo
     export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
     export HELIOS_KERNEL_ROOT_SECRET_KEY="${out_dir}/helios-root-secret.key"
+    # `helios-venus` generates its protocol module from the pinned
+    # venus-protocol inputs when it builds.
+    cargo run -p helios-cli --quiet -- venus-protocol-fetch
     cargo clippy \
         --workspace --all-targets \
         --exclude helios \
@@ -78,7 +81,7 @@ clippy-host:
         --exclude helios-init --exclude helios-input-test \
         --exclude helios-oob-load --exclude helios-perf \
         --exclude helios-ping --exclude helios-procbench \
-        --exclude helios-sched-tasks \
+        --exclude helios-sched-tasks --exclude helios-surface-test \
         -- -D warnings
 
 # Clippy each guest program on its own, denying warnings.
@@ -91,7 +94,7 @@ clippy-programs:
     for package in helios-audio-test helios-compositor helios-date helios-debugger helios-display-test helios-gpu-test \
         helios-http-client \
         helios-init helios-input-test helios-oob-load helios-perf helios-ping \
-        helios-procbench helios-sched-tasks; do
+        helios-procbench helios-sched-tasks helios-surface-test; do
         cargo clippy -p "${package}" --all-targets -- -D warnings
     done
 
@@ -119,6 +122,11 @@ test-units:
     # The host tools: QEMU arguments, network plans, the image audit, the
     # signature trailer, the profile store, the root keypair.
     cargo nextest run -p helios-inspector -p helios-artifact -p helios-profdata -p helios-cli -p helios-compiler-support
+    # The Venus protocol is generated from pinned venus-protocol inputs that
+    # the CLI fetches and hash-verifies; the parity test then compares the
+    # generated encoders with the pinned Mesa generator's output.
+    cargo run -p helios-cli --quiet -- venus-protocol-fetch
+    cargo nextest run -p helios-venus -p helios-venus-gen
     cargo nextest run -p helios-kernel --test hal_layering
     # The hosted backend boots the same kernel on the host OS; its tests
     # cover the memory-policy density checks and the OOM killer, and

@@ -1,6 +1,8 @@
 import re
 from pathlib import Path
 
+import pytest
+
 from helios_bench import REPO_ROOT
 from helios_bench.manifest import (
     Lane,
@@ -15,7 +17,7 @@ from helios_bench.workloads import load_workloads
 
 def test_manifest_lanes_are_complete() -> None:
     manifest = load_manifest()
-    assert {lane.name for lane in manifest.lanes} == {"x86-64-kvm"}
+    assert {lane.name for lane in manifest.lanes} == {"x86-64-kvm", "aarch64-hvf"}
     for lane in manifest.lanes:
         assert isinstance(lane, Lane)
         assert lane.runner_label.startswith("helios-bench-")
@@ -102,16 +104,24 @@ def test_native_counterparts_exist_for_every_native_bin_reference() -> None:
                     assert Path(value).name in sources, value
 
 
-def test_the_suite_measures_one_lane() -> None:
-    """One architecture, on purpose.
+def test_the_workflow_measures_one_lane() -> None:
+    """One architecture in CI, on purpose.
 
     Nearly everything this suite measures lives in the cross-platform
     kernel, and no hosted GitHub Arm runner exposes `/dev/kvm`, so a
-    second lane would repeat the first through an interpreter. An Arm
-    number comes from a dedicated machine, by hand.
+    second workflow lane would repeat the first through an interpreter.
+    The Arm lane has no hosted runner: it is run by hand on a dedicated
+    machine and never enters the workflow matrix.
     """
     manifest = load_manifest()
-    assert [lane.name for lane in manifest.lanes] == ["x86-64-kvm"]
+    scheduled = [lane.name for lane in manifest.lanes if lane.shared_runner is not None]
+    assert scheduled == ["x86-64-kvm"]
+    by_hand = manifest.lane("aarch64-hvf")
+    assert by_hand.accelerator == "hvf"
+    assert by_hand.rpc_transport == "serial"
+    assert by_hand.runs_on(advisory=True) == by_hand.runner_label
+    with pytest.raises(SystemExit):
+        by_hand.github_matrix_entry()
     lane = manifest.lane("x86-64-kvm")
     assert lane.accelerator == "kvm"
     assert lane.rpc_transport == "vsock"

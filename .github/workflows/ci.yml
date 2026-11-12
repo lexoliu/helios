@@ -17,39 +17,114 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Decides which lanes a change needs, so a lane runs only when the
+  # change touches what it reads (#687). `.github/ci-lanes.json` maps each
+  # lane to the surfaces it reads; the filters below name those surfaces
+  # by path. A skipped lane reports as skipped, which a required check
+  # counts as passing; no ruleset on `dev` requires a lane of this
+  # workflow. A dispatch and a push to `dev` run every lane.
+  changes:
+    name: changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      # JSON array of the lane names to run.
+      lanes: ${{ steps.select.outputs.lanes }}
+      # JSON array of {name, command} for the legs of the `checks` matrix.
+      checks: ${{ steps.select.outputs.checks }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/ci-lanes.json
+          sparse-checkout-cone-mode: false
+      - uses: dorny/paths-filter@v4
+        id: filter
+        if: github.event_name == 'pull_request'
+        with:
+          # `shared` is everything no narrower surface claims, so a new
+          # top-level path runs every lane until a surface claims it;
+          # `docs/**` and Markdown run none, except the Wasmtime pin
+          # the CI checkout reads.
+          predicate-quantifier: some-with-excludes
+          filters: |
+            shared:
+              - '**'
+              - '!aarch64/**'
+              - '!riscv/**'
+              - '!x86/**'
+              - '!hosted/**'
+              - '!inspector/**'
+              - '!inspector-protocol/**'
+              - '!cli/**'
+              - '!compiler-support/**'
+              - '!profdata/**'
+              - '!workspace-root/**'
+              - '!programs/**'
+              - '!api/**'
+              - '!api-macro/**'
+              - '!compiler-plugin/**'
+              - '!docs/**'
+              - '!**/*.md'
+            pin:
+              - 'docs/wasmtime.md'
+            aarch64:
+              - 'aarch64/**'
+            riscv:
+              - 'riscv/**'
+            x86:
+              - 'x86/**'
+            hosted:
+              - 'hosted/**'
+            host_tools:
+              - 'inspector/**'
+              - 'inspector-protocol/**'
+              - 'cli/**'
+              - 'compiler-support/**'
+              - 'profdata/**'
+              - 'workspace-root/**'
+            programs:
+              - 'programs/**'
+              - 'api/**'
+              - 'api-macro/**'
+              - 'compiler-plugin/**'
+      - id: select
+        env:
+          CHANGED: ${{ steps.filter.outputs.changes || 'null' }}
+        run: |
+          set -euo pipefail
+          lanes="$(jq -c --argjson changed "${CHANGED}" '
+            to_entries
+            | map(select($changed == null
+                or (.value.surfaces + ["shared", "pin"]
+                    | any(. as $surface | $changed | index($surface)))))
+            | map(.key)' .github/ci-lanes.json)"
+          checks="$(jq -c --argjson lanes "${lanes}" '
+            to_entries
+            | map(select(.value.command and (.key as $name | $lanes | index($name))))
+            | map({name: .key, command: .value.command})' .github/ci-lanes.json)"
+          echo "lanes=${lanes}" >> "$GITHUB_OUTPUT"
+          echo "checks=${checks}" >> "$GITHUB_OUTPUT"
+          echo "${lanes}"
+
   checks:
     name: ${{ matrix.name }}
+    needs: changes
+    # An empty matrix is an error, not a skip.
+    if: needs.changes.outputs.checks != '[]'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: check-host
-            command: just check-host
-          - name: check-aarch64
-            command: just check-target aarch64-unknown-none helios-aarch64
-          - name: check-riscv
-            command: just check-target riscv64gc-unknown-none-elf helios-riscv
-          - name: check-x86
-            command: just check-target x86_64-unknown-none helios-x86
-          - name: test-embedded-debugger
-            command: just test-embedded-debugger
-          # `just lint` runs these five gates back to back locally; CI
-          # splits them so a lint failure names the surface it came from
-          # and each lane keeps its own build cache.
-          - name: lint-fmt
-            command: just fmt-check && just deny-check
-          - name: lint-host
-            command: just clippy-host && just clippy-programs
-          - name: lint-aarch64
-            command: just clippy-target aarch64-unknown-none helios-aarch64
-          - name: lint-riscv
-            command: just clippy-target riscv64gc-unknown-none-elf helios-riscv
-          - name: lint-x86
-            command: just clippy-target x86_64-unknown-none helios-x86
-          - name: test-units
-            command: just test-units
+        # The legs and their commands live in `.github/ci-lanes.json`
+        # beside the surfaces each reads; `changes` keeps the ones this
+        # change needs. `just lint` runs its gates back to back locally;
+        # CI splits them so a lint failure names the surface it came from
+        # and each lane keeps its own build cache.
+        include: ${{ fromJSON(needs.changes.outputs.checks) }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -84,12 +159,15 @@ jobs:
         with:
           workspaces: helios
           key: ${{ matrix.name }}
+      - uses: astral-sh/setup-uv@v6
       - name: ${{ matrix.name }}
         working-directory: helios
         run: ${{ matrix.command }}
 
   smoke-riscv64:
     name: smoke-riscv64
+    needs: changes
+    if: contains(fromJSON(needs.changes.outputs.lanes), 'smoke-riscv64')
     runs-on: ubuntu-24.04
     timeout-minutes: 300
     steps:
@@ -309,6 +387,35 @@ jobs:
             smoke-runtime/*/*.log
           if-no-files-found: warn
           retention-days: 7
+      # Each boot above rebuilds the bootfs for its own `--boot-program`
+      # selection, so what the target directory holds now is the last
+      # boot's subset. A build with no selection is the superset every
+      # workload class boots from; the kernel is not relinked.
+      - name: Build the full guest image
+        id: guest-image
+        # A lane that failed before it built the inspector has nothing
+        # to build an image with.
+        if: always() && hashFiles('helios/target/release/helios-inspector') != ''
+        working-directory: helios
+        run: ./target/release/helios-inspector vm --arch riscv64 --release build
+      # The image a `--no-build` boot needs on another host, laid out as
+      # the paths under `target/` the inspector reads: unpacked into
+      # `target/`, it is the whole installation (docs/boot.md). The
+      # manifest and the key files are not part of it: nothing on the
+      # `--no-build` path reads them, and the manifest records this
+      # runner's absolute paths. The root key pair is generated per
+      # build, so the signing key the kernel carries belongs to this
+      # image alone.
+      - name: Upload the guest image
+        if: always() && steps.guest-image.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: helios-guest-riscv64
+          path: |
+            helios/target/riscv64gc-unknown-none-elf/kernel-release/helios
+            helios/target/kernel-prebuild/riscv64gc-unknown-none-elf/kernel-release/helios-bootfs
+          if-no-files-found: error
+          retention-days: 90
 
   # A native Arm Linux runner under multi-threaded TCG. This lane is a
   # functional check, not a performance surface: `ubuntu-24.04-arm`
@@ -330,6 +437,8 @@ jobs:
   # boot needs, which the inspector finds through the prefix.
   smoke-aarch64:
     name: smoke-aarch64
+    needs: changes
+    if: contains(fromJSON(needs.changes.outputs.lanes), 'smoke-aarch64')
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 300
     env:
@@ -359,7 +468,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.QEMU_PREFIX }}
-          key: qemu-${{ env.QEMU_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+          # The configure flags are part of the key: a build made with
+          # other flags is a different install (#687).
+          key: qemu-${{ env.QEMU_VERSION }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/.github/qemu/aarch64-configure.args') }}
       - name: Build the pinned QEMU
         if: steps.qemu-cache.outputs.cache-hit != 'true'
         run: |
@@ -372,14 +483,9 @@ jobs:
           # aarch64-softmmu is the only target this lane boots, and the
           # inspector's default network backend is `user`, which has been
           # external libslirp since 8.0.
-          ./configure \
-            --prefix="${QEMU_PREFIX}" \
-            --target-list=aarch64-softmmu \
-            --enable-slirp \
-            --disable-docs \
-            --disable-gtk \
-            --disable-sdl \
-            --disable-vnc
+          # The flags live in a file the cache key hashes.
+          mapfile -t flags < "${GITHUB_WORKSPACE}/helios/.github/qemu/aarch64-configure.args"
+          ./configure --prefix="${QEMU_PREFIX}" "${flags[@]}"
           ninja -C build install
       - name: Put the pinned QEMU on PATH
         run: |
@@ -493,9 +599,40 @@ jobs:
             smoke-runtime/*/*.log
           if-no-files-found: warn
           retention-days: 7
+      # Each boot above rebuilds the bootfs for its own `--boot-program`
+      # selection, so what the target directory holds now is the last
+      # boot's subset. A build with no selection is the superset every
+      # workload class boots from; the kernel is not relinked.
+      - name: Build the full guest image
+        id: guest-image
+        # A lane that failed before it built the inspector has nothing
+        # to build an image with.
+        if: always() && hashFiles('helios/target/release/helios-inspector') != ''
+        working-directory: helios
+        run: ./target/release/helios-inspector vm --arch aarch64 --release build
+      # The image a `--no-build` boot needs on another host, laid out as
+      # the paths under `target/` the inspector reads: unpacked into
+      # `target/`, it is the whole installation (docs/boot.md). The
+      # manifest and the key files are not part of it: nothing on the
+      # `--no-build` path reads them, and the manifest records this
+      # runner's absolute paths. The root key pair is generated per
+      # build, so the signing key the kernel carries belongs to this
+      # image alone.
+      - name: Upload the guest image
+        if: always() && steps.guest-image.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: helios-guest-aarch64
+          path: |
+            helios/target/aarch64-unknown-none/kernel-release/helios
+            helios/target/kernel-prebuild/aarch64-unknown-none/kernel-release/helios-bootfs
+          if-no-files-found: error
+          retention-days: 90
 
   smoke-x86-64:
     name: smoke-x86-64
+    needs: changes
+    if: contains(fromJSON(needs.changes.outputs.lanes), 'smoke-x86-64')
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -587,12 +724,18 @@ jobs:
           # backend installs every function it finds rather than the
           # first (#301). This is the only x86-64 KVM boot that carries
           # them; the developer machines have no KVM.
+          # Two `--disk` images ride on it too: every disk with a serial
+          # other than the scratch disk's is a mount source, and
+          # `helios-data` stays the scratch disk beside them (#510).
+          truncate -s 64M "$runtime/src-a.img" "$runtime/src-b.img"
           ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
             --accel kvm \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --qemu-arg -device --qemu-arg virtio-keyboard-pci \
             --qemu-arg -device --qemu-arg virtio-mouse-pci \
             --qemu-arg -device --qemu-arg virtio-tablet-pci \
+            --disk "$runtime/src-a.img,serial=src-a" \
+            --disk "$runtime/src-b.img,serial=src-b,readonly" \
             --boot-program dash --boot-program debugger --no-compiler-plugin \
             shell -c 'echo ok' 2>&1 > boot-smoke.out | tee "$runtime/inspector.log"
           cat boot-smoke.out
@@ -601,6 +744,11 @@ jobs:
           # has, and `debug-serial.log` is the host's raw copy of it.
           grep -F 'virtio-input online' "$runtime/debug-serial.log"
           test "$(grep -cF 'virtio-input online' "$runtime/debug-serial.log")" -eq 3
+          # The log carries the console's colour escapes, so these read
+          # it as text (`-a`) to print the matching line.
+          grep -aF 'mount source online serial="src-a"' "$runtime/debug-serial.log" | grep -aF 'read_only=false'
+          grep -aF 'mount source online serial="src-b"' "$runtime/debug-serial.log" | grep -aF 'read_only=true'
+          grep -aF 'block device identified as the kernel scratch disk serial="helios-data"' "$runtime/debug-serial.log"
       - name: Run the coreutils applets through dash
         shell: bash
         working-directory: helios
@@ -1113,8 +1261,9 @@ jobs:
             --qemu-trace trace:virtio_gpu_update_cursor \
             --qemu-trace-log "$runtime/qemu-trace.log" \
             --boot-program dash --boot-program debugger \
-            --boot-program compositor \
+            --boot-program compositor --boot-program surface-test \
             screendump \
+              --run /bin/surface-test --run-wait-seconds 60 \
               --input tools/desktop/desktop-probe.input --input-interval-ms 150 \
               --settle-seconds 20 "$captures/compositor.png" \
             2>&1 | tee "$runtime/inspector.log"
@@ -1127,6 +1276,13 @@ jobs:
             "$runtime/inspector.log"
           grep -Eq 'compositor:frame sequence=[0-9]+ regions=[0-9]+ cursor=[0-9]+,[0-9]+' \
             "$runtime/inspector.log"
+          # The first client window the desktop ever saw: surface-test
+          # asked for one, drew a frame and gave it back, and each of its
+          # three lines is evidence that part of the surface path ran —
+          # a missing one is a call the compositor did not survive.
+          grep -Fq 'surface-test:created' "$runtime/inspector.log"
+          grep -Fq 'surface-test:committed' "$runtime/inspector.log"
+          grep -Fq 'surface-test:destroyed' "$runtime/inspector.log"
           # Where the terminal put its top-left cell, read from the
           # guest's own line rather than assumed: the layout is the
           # desktop's business, and a check that guessed it would be
@@ -1318,6 +1474,36 @@ jobs:
             smoke-runtime/*/*.log
           if-no-files-found: warn
           retention-days: 7
+      # Each boot above rebuilds the bootfs for its own `--boot-program`
+      # selection, so what the target directory holds now is the last
+      # boot's subset. A build with no selection is the superset every
+      # workload class boots from; the kernel, built against the fetched
+      # profile, is not relinked.
+      - name: Build the full guest image
+        id: guest-image
+        # A lane that failed before it built the inspector has nothing
+        # to build an image with.
+        if: always() && hashFiles('helios/target/release/helios-inspector') != ''
+        working-directory: helios
+        run: ./target/release/helios-inspector vm --arch x86-64 --release build
+      # The image a `--no-build` boot needs on another host, laid out as
+      # the paths under `target/` the inspector reads: unpacked into
+      # `target/`, it is the whole installation (docs/boot.md). The
+      # manifest and the key files are not part of it: nothing on the
+      # `--no-build` path reads them, and the manifest records this
+      # runner's absolute paths. The root key pair is generated per
+      # build, so the signing key the kernel carries belongs to this
+      # image alone.
+      - name: Upload the guest image
+        if: always() && steps.guest-image.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: helios-guest-x86-64
+          path: |
+            helios/target/x86_64-unknown-none/profile-use/helios
+            helios/target/kernel-prebuild/x86_64-unknown-none/profile-use/helios-bootfs
+          if-no-files-found: error
+          retention-days: 90
 
   bench:
     name: bench-${{ matrix.name }}

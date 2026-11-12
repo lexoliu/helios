@@ -1,10 +1,14 @@
 use std::sync::Arc;
 
 use crate::Error;
-use crate::transport_io;
+use crate::transport_io::{self, EndpointReader, EndpointWriter};
 use helios_api::serial;
-use helios_api::vsock::{self, VsockListener};
+use helios_api::vsock::{self, VsockListener, VsockStream};
 use helios_inspector_protocol::VSOCK_RPC_PORT;
+use helios_inspector_protocol::system::{
+    self,
+    accept::{Connection, Listener, SessionFault},
+};
 
 /// Connections the listener queues while the debugger is serving one.
 ///
@@ -35,17 +39,47 @@ async fn serve_over_vsock(guest_cid: u64) -> Result<(), Error> {
     listener.set_timeout(vsock::NO_DEADLINE);
     println!("debugger listening on vsock cid {guest_cid} port {VSOCK_RPC_PORT}");
 
-    loop {
-        let stream = Arc::new(listener.accept().await.map_err(Error::VsockTransport)?);
-        let (read, write) = transport_io::split(Arc::clone(&stream), Arc::clone(&stream));
-        // One session at a time: the protocol multiplexes its own
-        // invocations, so a second transport would be a second view of
-        // the same machine rather than more concurrency.
-        let outcome = helios_inspector_protocol::system::serve(read, write).await;
-        if let Err(error) = stream.close().await {
+    // A session that fails is the peer's fault and ends with a report;
+    // only the listener failing to accept ends the debugger.
+    match system::serve_listener(VsockSessions(listener), report_session_fault).await {
+        Ok(never) => match never {},
+        Err(error) => Err(Error::VsockTransport(error)),
+    }
+}
+
+fn report_session_fault(fault: SessionFault) {
+    match fault {
+        SessionFault::Failed(error) => println!("debugger vsock session ended: {error}"),
+        SessionFault::CloseFailed(error) => {
             println!("debugger vsock session could not be closed: {error}");
         }
-        outcome.map_err(Error::from)?;
+    }
+}
+
+/// The vsock listener as the accept loop's source of connections.
+struct VsockSessions(VsockListener);
+
+impl Listener for VsockSessions {
+    type Connection = VsockConnection;
+    type Error = std::io::Error;
+
+    async fn accept(&mut self) -> std::io::Result<VsockConnection> {
+        Ok(VsockConnection(Arc::new(self.0.accept().await?)))
+    }
+}
+
+struct VsockConnection(Arc<VsockStream>);
+
+impl Connection for VsockConnection {
+    type Read = EndpointReader<VsockStream>;
+    type Write = EndpointWriter<VsockStream>;
+
+    fn halves(&mut self) -> (Self::Read, Self::Write) {
+        transport_io::split(Arc::clone(&self.0), Arc::clone(&self.0))
+    }
+
+    async fn close(self) -> std::io::Result<()> {
+        self.0.close().await
     }
 }
 
@@ -61,7 +95,5 @@ async fn serve_over_serial() -> Result<(), Error> {
             .ok_or(Error::MissingSerialCapability)?,
     );
     let (read, write) = transport_io::split(read_port, write_port);
-    helios_inspector_protocol::system::serve(read, write)
-        .await
-        .map_err(Error::from)
+    system::serve(read, write).await.map_err(Error::from)
 }

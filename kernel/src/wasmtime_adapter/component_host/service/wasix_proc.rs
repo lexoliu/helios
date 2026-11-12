@@ -1025,7 +1025,8 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let path = match p1_read_path(caller, memory, path, path_len) {
+    let stat = GuestAddress::wasm32(stat);
+    let path = match p1_read_path(caller, memory, GuestAddress::wasm32(path), path_len) {
         Ok(path) => path,
         Err(_) => return p1::errno::FAULT,
     };
@@ -1088,7 +1089,7 @@ where
         Ok(fd) => fd,
         Err(errno) => return errno,
     };
-    p1_write_u32(caller, memory, ret_fd, duplicated)
+    p1_write_u32(caller, memory, GuestAddress::wasm32(ret_fd), duplicated)
 }
 
 pub(super) fn wasix_fd_dup2<CpuImpl, Net, HostFs>(
@@ -1110,7 +1111,7 @@ where
         Ok(fd) => fd,
         Err(errno) => return errno,
     };
-    p1_write_u32(caller, memory, ret_fd, duplicated)
+    p1_write_u32(caller, memory, GuestAddress::wasm32(ret_fd), duplicated)
 }
 
 pub(super) fn wasix_fd_pipe<CpuImpl, Net, HostFs>(
@@ -1148,11 +1149,11 @@ where
             return errno;
         }
     };
-    let status = p1_write_u32(caller, memory, ret_fd1, read_fd);
+    let status = p1_write_u32(caller, memory, GuestAddress::wasm32(ret_fd1), read_fd);
     if status != p1::errno::SUCCESS {
         return status;
     }
-    p1_write_u32(caller, memory, ret_fd2, write_fd)
+    p1_write_u32(caller, memory, GuestAddress::wasm32(ret_fd2), write_fd)
 }
 
 pub(super) fn wasix_fd_event<CpuImpl, Net, HostFs>(
@@ -1182,7 +1183,7 @@ where
         Ok(fd) => fd,
         Err(errno) => return errno,
     };
-    p1_write_u32(caller, memory, ret_fd, fd)
+    p1_write_u32(caller, memory, GuestAddress::wasm32(ret_fd), fd)
 }
 
 pub(super) fn wasix_tty_get<CpuImpl, Net, HostFs>(
@@ -1202,7 +1203,7 @@ where
         return p1::errno::FAULT;
     };
     let tty = caller.data().tty_state;
-    write_wasix_tty_state(caller, memory, state, tty)
+    write_wasix_tty_state(caller, memory, GuestAddress::wasm32(state), tty)
 }
 
 pub(super) fn wasix_tty_set<CpuImpl, Net, HostFs>(
@@ -1221,7 +1222,7 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let tty = match read_wasix_tty_state(caller, memory, state) {
+    let tty = match read_wasix_tty_state(caller, memory, GuestAddress::wasm32(state)) {
         Ok(tty) => tty,
         Err(errno) => return errno,
     };
@@ -1261,7 +1262,7 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let opened = match p1_try_read_u32(caller, memory, opened_fd) {
+    let opened = match p1_try_read_u32(caller, memory, GuestAddress::wasm32(opened_fd)) {
         Ok(opened) => opened,
         Err(_) => return p1::errno::FAULT,
     };
@@ -1293,7 +1294,7 @@ where
     } else {
         0
     };
-    p1_write_u16(caller, memory, ret_flags, flags)
+    p1_write_u16(caller, memory, GuestAddress::wasm32(ret_flags), flags)
 }
 
 pub(super) fn wasix_fd_fdflags_set<CpuImpl, Net, HostFs>(
@@ -1336,6 +1337,7 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
+    let (path, path_len) = (GuestAddress::wasm32(path), GuestAddress::wasm32(path_len));
     let capacity = match p1_try_read_u32(caller, memory, path_len) {
         Ok(capacity) => capacity,
         Err(_) => return p1::errno::FAULT,
@@ -1360,7 +1362,7 @@ where
         return status;
     }
     if capacity > needed {
-        return preview1_write_memory(memory, path.saturating_add(needed), &[0]);
+        return preview1_write_memory(memory, path.offset(u64::from(needed)), &[0]);
     }
     p1::errno::SUCCESS
 }
@@ -1405,8 +1407,8 @@ where
             detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
         }));
     };
-    let callback =
-        p1_read_path(caller, memory, callback, callback_len).map_err(wasmtime::Error::new)?;
+    let callback = p1_read_path(caller, memory, GuestAddress::wasm32(callback), callback_len)
+        .map_err(wasmtime::Error::new)?;
     caller.data_mut().signal_callback = Some(callback);
     Ok(())
 }
@@ -1427,7 +1429,7 @@ where
         Ok(pid) => pid,
         Err(_) => return p1::errno::OVERFLOW,
     };
-    p1_write_u32(caller, memory, ret_pid, pid)
+    p1_write_u32(caller, memory, GuestAddress::wasm32(ret_pid), pid)
 }
 
 pub(super) fn wasix_proc_parent<CpuImpl, Net, HostFs>(
@@ -1457,7 +1459,7 @@ where
         },
         None => 0,
     };
-    p1_write_u32(caller, memory, ret_pid, parent)
+    p1_write_u32(caller, memory, GuestAddress::wasm32(ret_pid), parent)
 }
 
 pub(super) fn wasix_proc_signal<CpuImpl, Net, HostFs>(
@@ -1510,17 +1512,10 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
+    let buf = GuestAddress::wasm32(buf);
     let dispositions = caller.data().signal_dispositions.clone();
     for (index, disposition) in dispositions.iter().enumerate() {
-        let Ok(index) = u32::try_from(index) else {
-            return p1::errno::OVERFLOW;
-        };
-        let Some(offset) = index
-            .checked_mul(WASIX_SIGNAL_DISPOSITION_SIZE)
-            .and_then(|offset| buf.checked_add(offset))
-        else {
-            return p1::errno::OVERFLOW;
-        };
+        let offset = buf.offset(index as u64 * u64::from(WASIX_SIGNAL_DISPOSITION_SIZE));
         let action = match disposition.action {
             WasixSignalDispositionAction::Default => WASIX_SIGNAL_DISPOSITION_DEFAULT,
             WasixSignalDispositionAction::Ignore => WASIX_SIGNAL_DISPOSITION_IGNORE,
@@ -1528,13 +1523,13 @@ where
         let status = p1_write_u8(
             caller,
             memory,
-            offset + WASIX_SIGNAL_DISPOSITION_SIGNAL_OFFSET,
+            offset.offset(u64::from(WASIX_SIGNAL_DISPOSITION_SIGNAL_OFFSET)),
             disposition.signal,
         )
         .max(p1_write_u8(
             caller,
             memory,
-            offset + WASIX_SIGNAL_DISPOSITION_ACTION_OFFSET,
+            offset.offset(u64::from(WASIX_SIGNAL_DISPOSITION_ACTION_OFFSET)),
             action,
         ));
         if status != p1::errno::SUCCESS {
@@ -1559,7 +1554,7 @@ where
     let Ok(len) = u32::try_from(caller.data().signal_dispositions.len()) else {
         return p1::errno::OVERFLOW;
     };
-    p1_write_u32(caller, memory, ret_size, len)
+    p1_write_u32(caller, memory, GuestAddress::wasm32(ret_size), len)
 }
 
 pub(super) fn wasix_proc_raise_interval<CpuImpl, Net, HostFs>(
@@ -1654,7 +1649,7 @@ where
         let Ok(pid) = u32::try_from(value) else {
             return p1::errno::OVERFLOW;
         };
-        return p1_write_u32(caller, memory, ret_pid, pid);
+        return p1_write_u32(caller, memory, GuestAddress::wasm32(ret_pid), pid);
     }
     let status = caller.data().require_fork_authority();
     if status != p1::errno::SUCCESS {
@@ -1677,7 +1672,12 @@ where
         Ok(len) => len,
         Err(_) => return p1::errno::OVERFLOW,
     };
-    let memory_stack = match p1_read_memory(caller, memory, stack_pointer, memory_stack_len) {
+    let memory_stack = match p1_read_memory(
+        caller,
+        memory,
+        GuestAddress::wasm32(stack_pointer),
+        memory_stack_len,
+    ) {
         Ok(stack) => stack,
         Err(_) => return p1::errno::FAULT,
     };
@@ -1685,16 +1685,14 @@ where
         Some(begin) if begin <= stack_pointer => begin,
         _ => return p1::errno::OVERFLOW,
     };
-    let status = p1_write_u32(caller, memory, ret_pid, 0);
+    let status = p1_write_u32(caller, memory, GuestAddress::wasm32(ret_pid), 0);
     if status != p1::errno::SUCCESS {
         return status;
     }
-    let status = p1_write_u32(caller, memory, stack_lower, unwind_stack_begin).max(p1_write_u32(
-        caller,
-        memory,
-        stack_lower + 4,
-        stack_pointer,
-    ));
+    let stack_lower_address = GuestAddress::wasm32(stack_lower);
+    let status = p1_write_u32(caller, memory, stack_lower_address, unwind_stack_begin).max(
+        p1_write_u32(caller, memory, stack_lower_address.offset(4), stack_pointer),
+    );
     if status != p1::errno::SUCCESS {
         return status;
     }
@@ -1825,15 +1823,15 @@ where
         .map_err(wasmtime::Error::new)
         .inspect_err(|error| launch_exit_error(&trace, error))?;
     let argv = ProgramArgv::from_caller(&prepared.guest_name, argv);
-    let mut environment = match env {
+    let environment = match env {
         Some((ptr, len)) => wasix_read_exec_string(caller, memory, ptr, len)
             .map(|value| wasix_split_environment(&value))
             .unwrap_or_default(),
         None => caller.data().environment.clone(),
     };
-    let process_id = caller.data().instance().id().raw().to_string();
-    environment.retain(|(name, _)| name.as_str() != HELIOS_PROCESS_ID_ENV);
-    environment.push((HELIOS_PROCESS_ID_ENV.into(), process_id));
+    // The replacement keeps this instance, so it keeps this instance's id.
+    let environment =
+        LaunchEnvironment::from_guest(environment).into_process_env(caller.data().instance().id());
     let service = caller
         .data()
         .runtime_state
@@ -2138,7 +2136,7 @@ where
         // The child marked the launch's terminal on the error it returned.
         Err(errno) => return errno,
     };
-    wasix_write_process_handles(caller, memory, ret_handles, result)
+    wasix_write_process_handles(caller, memory, GuestAddress::wasm32(ret_handles), result)
 }
 
 pub(super) fn wasix_proc_spawn_preopen_authority<CpuImpl, Net, HostFs>(
@@ -2417,11 +2415,15 @@ where
         Some(snapshot) => (Some(snapshot.authority), Some(snapshot.descriptors)),
         None => (None, None),
     };
-    let signal_dispositions =
-        match wasix_read_signal_dispositions(caller, memory, signals, signals_len) {
-            Ok(dispositions) => dispositions,
-            Err(errno) => return launch_exit_errno(&trace, errno),
-        };
+    let signal_dispositions = match wasix_read_signal_dispositions(
+        caller,
+        memory,
+        GuestAddress::wasm32(signals),
+        signals_len,
+    ) {
+        Ok(dispositions) => dispositions,
+        Err(errno) => return launch_exit_errno(&trace, errno),
+    };
     let result = match wasix_spawn_child(
         caller,
         prepared,
@@ -2441,7 +2443,7 @@ where
         // The child marked the launch's terminal on the error it returned.
         Err(errno) => return errno,
     };
-    p1_write_u32(caller, memory, ret_pid, result.pid)
+    p1_write_u32(caller, memory, GuestAddress::wasm32(ret_pid), result.pid)
 }
 
 pub(super) async fn wasix_proc_join<CpuImpl, Net, HostFs>(
@@ -2482,6 +2484,7 @@ where
     if flags & !WASIX_JOIN_FLAGS_SUPPORTED != 0 {
         return p1::errno::INVAL;
     }
+    let (pid, ret_status) = (GuestAddress::wasm32(pid), GuestAddress::wasm32(ret_status));
     let requested_pid = match wasix_read_option_pid(caller, memory, pid) {
         Ok(pid) => pid,
         Err(errno) => return errno,
@@ -2571,7 +2574,12 @@ where
         Ok(len) => len,
         Err(_) => return p1::errno::OVERFLOW,
     };
-    let memory_stack = match p1_read_memory(caller, memory, stack_pointer, memory_stack_len) {
+    let memory_stack = match p1_read_memory(
+        caller,
+        memory,
+        GuestAddress::wasm32(stack_pointer),
+        memory_stack_len,
+    ) {
         Ok(stack) => stack,
         Err(_) => return p1::errno::FAULT,
     };
@@ -2579,12 +2587,10 @@ where
         Some(begin) if begin <= stack_pointer => begin,
         _ => return p1::errno::OVERFLOW,
     };
-    let status = p1_write_u32(caller, memory, stack_lower, unwind_stack_begin).max(p1_write_u32(
-        caller,
-        memory,
-        stack_lower + 4,
-        stack_pointer,
-    ));
+    let stack_lower_address = GuestAddress::wasm32(stack_lower);
+    let status = p1_write_u32(caller, memory, stack_lower_address, unwind_stack_begin).max(
+        p1_write_u32(caller, memory, stack_lower_address.offset(4), stack_pointer),
+    );
     if status != p1::errno::SUCCESS {
         return status;
     }
@@ -2862,12 +2868,10 @@ where
         authority: caller.data().authority.clone(),
         cwd: caller.data().cwd.clone(),
     };
+    let fd_ops = GuestAddress::wasm32(fd_ops);
     for index in 0..fd_ops_len {
-        let offset = index
-            .checked_mul(WASIX_PROC_SPAWN_FD_OP_SIZE)
-            .and_then(|offset| fd_ops.checked_add(offset))
-            .ok_or(p1::errno::OVERFLOW)?;
-        wasix_apply_spawn_fd_op(caller, memory, &mut snapshot, offset).await?;
+        let op = fd_ops.offset(u64::from(index) * u64::from(WASIX_PROC_SPAWN_FD_OP_SIZE));
+        wasix_apply_spawn_fd_op(caller, memory, &mut snapshot, op).await?;
     }
     Ok(snapshot)
 }
@@ -2876,16 +2880,17 @@ pub(super) async fn wasix_apply_spawn_fd_op<CpuImpl, Net, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     memory: Preview1Memory,
     snapshot: &mut WasixSpawnFdSnapshot<Net>,
-    op: u32,
+    op: GuestAddress,
 ) -> Result<(), i32>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    let cmd = p1_try_read_u8(caller, memory, op + WASIX_PROC_SPAWN_FD_OP_CMD_OFFSET)
+    let field = |offset: u32| op.offset(u64::from(offset));
+    let cmd = p1_try_read_u8(caller, memory, field(WASIX_PROC_SPAWN_FD_OP_CMD_OFFSET))
         .map_err(|_| p1::errno::FAULT)?;
-    let fd = p1_try_read_u32(caller, memory, op + WASIX_PROC_SPAWN_FD_OP_FD_OFFSET)
+    let fd = p1_try_read_u32(caller, memory, field(WASIX_PROC_SPAWN_FD_OP_FD_OFFSET))
         .map_err(|_| p1::errno::FAULT)?;
     let fd = i32::try_from(fd).map_err(|_| p1::errno::OVERFLOW)?;
     match cmd {
@@ -2899,13 +2904,13 @@ where
         }
         WASIX_PROC_SPAWN_FD_OP_DUP2 => {
             let source_fd =
-                p1_try_read_u32(caller, memory, op + WASIX_PROC_SPAWN_FD_OP_SRC_FD_OFFSET)
+                p1_try_read_u32(caller, memory, field(WASIX_PROC_SPAWN_FD_OP_SRC_FD_OFFSET))
                     .map_err(|_| p1::errno::FAULT)?;
             let source_fd = i32::try_from(source_fd).map_err(|_| p1::errno::OVERFLOW)?;
             let fdflagsext = p1_try_read_u16(
                 caller,
                 memory,
-                op + WASIX_PROC_SPAWN_FD_OP_FDFLAGSEXT_OFFSET,
+                field(WASIX_PROC_SPAWN_FD_OP_FDFLAGSEXT_OFFSET),
             )
             .map_err(|_| p1::errno::FAULT)?;
             let close_on_exec = wasix_close_on_exec_flag(fdflagsext)?;
@@ -2915,11 +2920,15 @@ where
                 .map(drop)
         }
         WASIX_PROC_SPAWN_FD_OP_CHDIR => {
-            let path_ptr = p1_try_read_u32(caller, memory, op + WASIX_PROC_SPAWN_FD_OP_PATH_OFFSET)
-                .map_err(|_| p1::errno::FAULT)?;
-            let path_len =
-                p1_try_read_u32(caller, memory, op + WASIX_PROC_SPAWN_FD_OP_PATH_LEN_OFFSET)
+            let path_ptr =
+                p1_try_read_u32(caller, memory, field(WASIX_PROC_SPAWN_FD_OP_PATH_OFFSET))
                     .map_err(|_| p1::errno::FAULT)?;
+            let path_len = p1_try_read_u32(
+                caller,
+                memory,
+                field(WASIX_PROC_SPAWN_FD_OP_PATH_LEN_OFFSET),
+            )
+            .map_err(|_| p1::errno::FAULT)?;
             let path = wasix_read_exec_string(caller, memory, path_ptr, path_len)
                 .map_err(|_| p1::errno::FAULT)?;
             wasix_apply_spawn_chdir(caller.data(), snapshot, fd, &path)
@@ -2927,37 +2936,45 @@ where
         WASIX_PROC_SPAWN_FD_OP_FCHDIR => wasix_apply_spawn_fchdir(snapshot, fd),
         WASIX_PROC_SPAWN_FD_OP_OPEN => {
             let source_fd =
-                p1_try_read_u32(caller, memory, op + WASIX_PROC_SPAWN_FD_OP_SRC_FD_OFFSET)
+                p1_try_read_u32(caller, memory, field(WASIX_PROC_SPAWN_FD_OP_SRC_FD_OFFSET))
                     .map_err(|_| p1::errno::FAULT)?;
             let source_fd = i32::try_from(source_fd).map_err(|_| p1::errno::OVERFLOW)?;
-            let path_ptr = p1_try_read_u32(caller, memory, op + WASIX_PROC_SPAWN_FD_OP_PATH_OFFSET)
-                .map_err(|_| p1::errno::FAULT)?;
-            let path_len =
-                p1_try_read_u32(caller, memory, op + WASIX_PROC_SPAWN_FD_OP_PATH_LEN_OFFSET)
+            let path_ptr =
+                p1_try_read_u32(caller, memory, field(WASIX_PROC_SPAWN_FD_OP_PATH_OFFSET))
                     .map_err(|_| p1::errno::FAULT)?;
-            let dirflags =
-                p1_try_read_u32(caller, memory, op + WASIX_PROC_SPAWN_FD_OP_DIRFLAGS_OFFSET)
+            let path_len = p1_try_read_u32(
+                caller,
+                memory,
+                field(WASIX_PROC_SPAWN_FD_OP_PATH_LEN_OFFSET),
+            )
+            .map_err(|_| p1::errno::FAULT)?;
+            let dirflags = p1_try_read_u32(
+                caller,
+                memory,
+                field(WASIX_PROC_SPAWN_FD_OP_DIRFLAGS_OFFSET),
+            )
+            .map_err(|_| p1::errno::FAULT)?;
+            let oflags =
+                p1_try_read_u16(caller, memory, field(WASIX_PROC_SPAWN_FD_OP_OFLAGS_OFFSET))
                     .map_err(|_| p1::errno::FAULT)?;
-            let oflags = p1_try_read_u16(caller, memory, op + WASIX_PROC_SPAWN_FD_OP_OFLAGS_OFFSET)
-                .map_err(|_| p1::errno::FAULT)?;
             let rights = p1_try_read_u64(
                 caller,
                 memory,
-                op + WASIX_PROC_SPAWN_FD_OP_RIGHTS_BASE_OFFSET,
+                field(WASIX_PROC_SPAWN_FD_OP_RIGHTS_BASE_OFFSET),
             )
             .map_err(|_| p1::errno::FAULT)?;
             let fdflags =
-                p1_try_read_u16(caller, memory, op + WASIX_PROC_SPAWN_FD_OP_FDFLAGS_OFFSET)
+                p1_try_read_u16(caller, memory, field(WASIX_PROC_SPAWN_FD_OP_FDFLAGS_OFFSET))
                     .map_err(|_| p1::errno::FAULT)?;
             let fdflagsext = p1_try_read_u16(
                 caller,
                 memory,
-                op + WASIX_PROC_SPAWN_FD_OP_FDFLAGSEXT_OFFSET,
+                field(WASIX_PROC_SPAWN_FD_OP_FDFLAGSEXT_OFFSET),
             )
             .map_err(|_| p1::errno::FAULT)?;
             let close_on_exec = wasix_close_on_exec_flag(fdflagsext)?;
-            let path =
-                p1_read_path(caller, memory, path_ptr, path_len).map_err(|_| p1::errno::FAULT)?;
+            let path = p1_read_path(caller, memory, GuestAddress::wasm32(path_ptr), path_len)
+                .map_err(|_| p1::errno::FAULT)?;
             wasix_apply_spawn_open(
                 caller,
                 snapshot,
@@ -2997,6 +3014,8 @@ where
     if !p1_file_fdflags_supported(fdflags) {
         return Err(p1::errno::INVAL);
     }
+    // Refuse a target past the descriptor limit before the file is opened.
+    snapshot.descriptors.target_index(fd)?;
     let (base, relative_path) = wasix_spawn_resolve_open_base(snapshot, source_fd, path)?;
     let descriptor = p1_open_descriptor_resolved(
         caller,
@@ -3423,8 +3442,7 @@ where
         launch_exit_errno(trace, *errno);
     })?;
     let argv = ProgramArgv::from_caller(&prepared.guest_name, argv);
-    let mut environment = environment.unwrap_or_else(|| caller.data().environment.clone());
-    environment.retain(|(name, _)| name.as_str() != HELIOS_PROCESS_ID_ENV);
+    let environment = environment.unwrap_or_else(|| caller.data().environment.clone());
     let runtime_state = caller.data().runtime_state.clone();
     let service = runtime_state.wait_for_program_service().await;
     let exec_context = caller.data().exec_context();
@@ -3438,7 +3456,7 @@ where
             None,
             ProgramLaunch {
                 argv,
-                env: environment,
+                env: LaunchEnvironment::from_guest(environment),
                 authority,
                 filesystem,
                 descriptors,
@@ -3532,7 +3550,7 @@ where
 pub(super) fn wasix_write_process_handles<CpuImpl, Net, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     memory: Preview1Memory,
-    ret_handles: u32,
+    ret_handles: GuestAddress,
     result: WasixSpawnResult,
 ) -> i32
 where
@@ -3544,19 +3562,19 @@ where
         .max(wasix_write_option_fd(
             caller,
             memory,
-            ret_handles + WASIX_PROCESS_HANDLES_STDIN_OFFSET,
+            ret_handles.offset(u64::from(WASIX_PROCESS_HANDLES_STDIN_OFFSET)),
             result.stdin_fd,
         ))
         .max(wasix_write_option_fd(
             caller,
             memory,
-            ret_handles + WASIX_PROCESS_HANDLES_STDOUT_OFFSET,
+            ret_handles.offset(u64::from(WASIX_PROCESS_HANDLES_STDOUT_OFFSET)),
             result.stdout_fd,
         ))
         .max(wasix_write_option_fd(
             caller,
             memory,
-            ret_handles + WASIX_PROCESS_HANDLES_STDERR_OFFSET,
+            ret_handles.offset(u64::from(WASIX_PROCESS_HANDLES_STDERR_OFFSET)),
             result.stderr_fd,
         ))
 }
@@ -3564,7 +3582,7 @@ where
 pub(super) fn wasix_write_option_fd<T>(
     caller: &mut Caller<'_, T>,
     memory: Preview1Memory,
-    ptr: u32,
+    ptr: GuestAddress,
     fd: Option<u32>,
 ) -> i32 {
     let status = p1_write_u8(
@@ -3583,7 +3601,7 @@ pub(super) fn wasix_write_option_fd<T>(
     p1_write_u32(
         caller,
         memory,
-        ptr + WASIX_OPTION_UNION_U32_OFFSET,
+        ptr.offset(u64::from(WASIX_OPTION_UNION_U32_OFFSET)),
         fd.unwrap_or(0),
     )
 }
@@ -3591,7 +3609,7 @@ pub(super) fn wasix_write_option_fd<T>(
 pub(super) fn wasix_write_join_nothing<CpuImpl, Net, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     memory: Preview1Memory,
-    ret_status: u32,
+    ret_status: GuestAddress,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
@@ -3601,7 +3619,7 @@ where
     p1_write_u8(caller, memory, ret_status, WASIX_JOIN_STATUS_NOTHING).max(p1_write_u16(
         caller,
         memory,
-        ret_status + WASIX_JOIN_STATUS_UNION_OFFSET,
+        ret_status.offset(u64::from(WASIX_JOIN_STATUS_UNION_OFFSET)),
         0,
     ))
 }
@@ -3609,8 +3627,8 @@ where
 pub(super) fn wasix_write_join_exit<CpuImpl, Net, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     memory: Preview1Memory,
-    pid_ptr: u32,
-    ret_status: u32,
+    pid_ptr: GuestAddress,
+    ret_status: GuestAddress,
     pid: u32,
     code: u32,
 ) -> i32
@@ -3624,7 +3642,7 @@ where
         .max(p1_write_u32(
             caller,
             memory,
-            pid_ptr + WASIX_OPTION_UNION_U32_OFFSET,
+            pid_ptr.offset(u64::from(WASIX_OPTION_UNION_U32_OFFSET)),
             pid,
         ))
         .max(p1_write_u8(
@@ -3636,7 +3654,7 @@ where
         .max(p1_write_u16(
             caller,
             memory,
-            ret_status + WASIX_JOIN_STATUS_UNION_OFFSET,
+            ret_status.offset(u64::from(WASIX_JOIN_STATUS_UNION_OFFSET)),
             errno,
         ))
 }
@@ -3650,7 +3668,7 @@ pub(super) fn wasix_read_exec_string<T>(
     if len == 0 {
         return Ok(String::new());
     }
-    p1_read_memory(caller, memory, ptr, len as usize).and_then(|mut bytes| {
+    p1_read_memory(caller, memory, GuestAddress::wasm32(ptr), len as usize).and_then(|mut bytes| {
         while bytes.last().is_some_and(|byte| *byte == 0) {
             bytes.pop();
         }
@@ -3695,34 +3713,31 @@ pub(super) fn wasix_nonempty_line_count(value: &str) -> usize {
 pub(super) fn wasix_read_signal_dispositions<T>(
     caller: &mut Caller<'_, T>,
     memory: Preview1Memory,
-    ptr: u32,
+    ptr: GuestAddress,
     len: u32,
 ) -> Result<Vec<WasixSignalDisposition>, i32> {
     if len == 0 {
-        if ptr == 0 {
+        if ptr == GuestAddress::wasm32(0) {
             return Ok(Vec::new());
         }
         return Err(p1::errno::INVAL);
     }
-    if ptr == 0 {
+    if ptr == GuestAddress::wasm32(0) {
         return Err(p1::errno::FAULT);
     }
     let mut dispositions = Vec::new();
     for index in 0..len {
-        let offset = index
-            .checked_mul(WASIX_SIGNAL_DISPOSITION_SIZE)
-            .and_then(|offset| ptr.checked_add(offset))
-            .ok_or(p1::errno::OVERFLOW)?;
+        let offset = ptr.offset(u64::from(index) * u64::from(WASIX_SIGNAL_DISPOSITION_SIZE));
         let signal = p1_try_read_u8(
             caller,
             memory,
-            offset + WASIX_SIGNAL_DISPOSITION_SIGNAL_OFFSET,
+            offset.offset(u64::from(WASIX_SIGNAL_DISPOSITION_SIGNAL_OFFSET)),
         )
         .map_err(|_| p1::errno::FAULT)?;
         let action = p1_try_read_u8(
             caller,
             memory,
-            offset + WASIX_SIGNAL_DISPOSITION_ACTION_OFFSET,
+            offset.offset(u64::from(WASIX_SIGNAL_DISPOSITION_ACTION_OFFSET)),
         )
         .map_err(|_| p1::errno::FAULT)?;
         dispositions.push(wasix_signal_disposition_from_raw(signal, action)?);
@@ -3748,61 +3763,66 @@ pub(super) fn wasix_signal_disposition_from_raw(
 pub(super) fn read_wasix_tty_state<T>(
     caller: &mut Caller<'_, T>,
     memory: Preview1Memory,
-    ptr: u32,
+    ptr: GuestAddress,
 ) -> Result<WasixTtyState, i32> {
     Ok(WasixTtyState {
         cols: p1_try_read_u32(caller, memory, ptr).map_err(|_| p1::errno::FAULT)?,
-        rows: p1_try_read_u32(caller, memory, ptr + 4).map_err(|_| p1::errno::FAULT)?,
-        width: p1_try_read_u32(caller, memory, ptr + 8).map_err(|_| p1::errno::FAULT)?,
-        height: p1_try_read_u32(caller, memory, ptr + 12).map_err(|_| p1::errno::FAULT)?,
-        stdin_tty: p1_read_wasix_bool(caller, memory, ptr + 16)?,
-        stdout_tty: p1_read_wasix_bool(caller, memory, ptr + 17)?,
-        stderr_tty: p1_read_wasix_bool(caller, memory, ptr + 18)?,
-        echo: p1_read_wasix_bool(caller, memory, ptr + 19)?,
-        line_buffered: p1_read_wasix_bool(caller, memory, ptr + 20)?,
-        line_feeds: p1_read_wasix_bool(caller, memory, ptr + 21)?,
+        rows: p1_try_read_u32(caller, memory, ptr.offset(4)).map_err(|_| p1::errno::FAULT)?,
+        width: p1_try_read_u32(caller, memory, ptr.offset(8)).map_err(|_| p1::errno::FAULT)?,
+        height: p1_try_read_u32(caller, memory, ptr.offset(12)).map_err(|_| p1::errno::FAULT)?,
+        stdin_tty: p1_read_wasix_bool(caller, memory, ptr.offset(16))?,
+        stdout_tty: p1_read_wasix_bool(caller, memory, ptr.offset(17))?,
+        stderr_tty: p1_read_wasix_bool(caller, memory, ptr.offset(18))?,
+        echo: p1_read_wasix_bool(caller, memory, ptr.offset(19))?,
+        line_buffered: p1_read_wasix_bool(caller, memory, ptr.offset(20))?,
+        line_feeds: p1_read_wasix_bool(caller, memory, ptr.offset(21))?,
     })
 }
 
 pub(super) fn write_wasix_tty_state<T>(
     caller: &mut Caller<'_, T>,
     memory: Preview1Memory,
-    ptr: u32,
+    ptr: GuestAddress,
     state: WasixTtyState,
 ) -> i32 {
     p1_write_u32(caller, memory, ptr, state.cols)
-        .max(p1_write_u32(caller, memory, ptr + 4, state.rows))
-        .max(p1_write_u32(caller, memory, ptr + 8, state.width))
-        .max(p1_write_u32(caller, memory, ptr + 12, state.height))
+        .max(p1_write_u32(caller, memory, ptr.offset(4), state.rows))
+        .max(p1_write_u32(caller, memory, ptr.offset(8), state.width))
+        .max(p1_write_u32(caller, memory, ptr.offset(12), state.height))
         .max(p1_write_wasix_bool(
             caller,
             memory,
-            ptr + 16,
+            ptr.offset(16),
             state.stdin_tty,
         ))
         .max(p1_write_wasix_bool(
             caller,
             memory,
-            ptr + 17,
+            ptr.offset(17),
             state.stdout_tty,
         ))
         .max(p1_write_wasix_bool(
             caller,
             memory,
-            ptr + 18,
+            ptr.offset(18),
             state.stderr_tty,
         ))
-        .max(p1_write_wasix_bool(caller, memory, ptr + 19, state.echo))
         .max(p1_write_wasix_bool(
             caller,
             memory,
-            ptr + 20,
+            ptr.offset(19),
+            state.echo,
+        ))
+        .max(p1_write_wasix_bool(
+            caller,
+            memory,
+            ptr.offset(20),
             state.line_buffered,
         ))
         .max(p1_write_wasix_bool(
             caller,
             memory,
-            ptr + 21,
+            ptr.offset(21),
             state.line_feeds,
         ))
 }
