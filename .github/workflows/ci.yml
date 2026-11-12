@@ -17,83 +17,141 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Whether the change touches what fixes the kernel profile's format
-  # (the profdata header check, the guest's raw writer) or the compiler
-  # that reads it. The profile every x86-64 lane spends is the newest one
-  # collected on dev, by the compiler dev pinned then; a pull request that
-  # moves any of these cannot read it, and dev cannot collect another
-  # until the pull request merges (#731). Only a pull request is asked:
-  # a push to dev is what `kernel-profile.yml` collects on, and a
-  # dispatch has no change to speak of.
-  profile-format:
-    name: profile-format
+  # Decides which lanes a change needs, so a lane runs only when the
+  # change touches what it reads (#687). `.github/ci-lanes.json` maps each
+  # lane to the surfaces it reads; the filters below name those surfaces
+  # by path. A skipped lane reports as skipped, which a required check
+  # counts as passing; no ruleset on `dev` requires a lane of this
+  # workflow. A dispatch and a push to `dev` run every lane.
+  #
+  # It also says whether the change touches what fixes the kernel
+  # profile's format (the profdata header check, the guest's raw writer)
+  # or the compiler that reads it. The profile every x86-64 lane spends is
+  # the newest one collected on dev, by the compiler dev pinned then; a
+  # pull request that moves any of these cannot read it, and dev cannot
+  # collect another until the pull request merges (#731). Only a pull
+  # request is asked: a push to dev is what `kernel-profile.yml` collects
+  # on, and a dispatch has no change to speak of.
+  changes:
+    name: changes
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     permissions:
       contents: read
       pull-requests: read
     outputs:
-      changed: ${{ steps.diff.outputs.changed }}
+      # JSON array of the lane names to run.
+      lanes: ${{ steps.select.outputs.lanes }}
+      # JSON array of {name, command} for the legs of the `checks` matrix.
+      checks: ${{ steps.select.outputs.checks }}
+      # `true` when the change moves the kernel profile's format or the
+      # compiler that reads it; `kernel-profile` then collects this run's.
+      profile_format: ${{ steps.filter.outputs.profile_format || 'false' }}
     steps:
-      - name: List what the pull request touches
-        id: diff
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/ci-lanes.json
+          sparse-checkout-cone-mode: false
+      - uses: dorny/paths-filter@v4
+        id: filter
+        if: github.event_name == 'pull_request'
+        with:
+          # `shared` is everything no narrower surface claims, so a new
+          # top-level path runs every lane until a surface claims it;
+          # `docs/**` and Markdown run none, except the Wasmtime pin
+          # the CI checkout reads.
+          predicate-quantifier: some-with-excludes
+          filters: |
+            shared:
+              - '**'
+              - '!aarch64/**'
+              - '!riscv/**'
+              - '!x86/**'
+              - '!hosted/**'
+              - '!inspector/**'
+              - '!inspector-protocol/**'
+              - '!cli/**'
+              - '!compiler-support/**'
+              - '!profdata/**'
+              - '!workspace-root/**'
+              - '!programs/**'
+              - '!api/**'
+              - '!api-macro/**'
+              - '!compiler-plugin/**'
+              - '!docs/**'
+              - '!**/*.md'
+            pin:
+              - 'docs/wasmtime.md'
+            aarch64:
+              - 'aarch64/**'
+            riscv:
+              - 'riscv/**'
+            x86:
+              - 'x86/**'
+            hosted:
+              - 'hosted/**'
+            host_tools:
+              - 'inspector/**'
+              - 'inspector-protocol/**'
+              - 'cli/**'
+              - 'compiler-support/**'
+              - 'profdata/**'
+              - 'workspace-root/**'
+            programs:
+              - 'programs/**'
+              - 'api/**'
+              - 'api-macro/**'
+              - 'compiler-plugin/**'
+            profile_format:
+              - 'rust-toolchain.toml'
+              - 'profdata/**'
+              - 'kernel/src/profiling/**'
+      - id: select
         env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          PULL_REQUEST: ${{ github.event.pull_request.number }}
+          CHANGED: ${{ steps.filter.outputs.changes || 'null' }}
         run: |
-          changed=false
-          if [ -n "${PULL_REQUEST}" ]; then
-            if gh api --paginate "repos/${GH_REPO}/pulls/${PULL_REQUEST}/files" --jq '.[].filename' \
-              | grep -Eq '^(rust-toolchain\.toml$|profdata/|kernel/src/profiling/)'; then
-              changed=true
-            fi
-          fi
-          echo "changed=${changed}" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          lanes="$(jq -c --argjson changed "${CHANGED}" '
+            to_entries
+            | map(select($changed == null
+                or (.value.surfaces + ["shared", "pin"]
+                    | any(. as $surface | $changed | index($surface)))))
+            | map(.key)' .github/ci-lanes.json)"
+          checks="$(jq -c --argjson lanes "${lanes}" '
+            to_entries
+            | map(select(.value.command and (.key as $name | $lanes | index($name))))
+            | map({name: .key, command: .value.command})' .github/ci-lanes.json)"
+          echo "lanes=${lanes}" >> "$GITHUB_OUTPUT"
+          echo "checks=${checks}" >> "$GITHUB_OUTPUT"
+          echo "${lanes}"
 
-  # The collection a `profile-format` change spends in place of dev's
+  # The collection a `profile_format` change spends in place of dev's
   # profile: the same workflow `bench-suite.yml` calls, on this run's
   # commit, uploaded under the stable artifact name.
   kernel-profile:
     name: kernel-profile
-    needs: profile-format
-    if: needs.profile-format.outputs.changed == 'true'
+    needs: changes
+    if: needs.changes.outputs.profile_format == 'true'
     permissions:
       contents: read
     uses: ./.github/workflows/kernel-profile.yml
 
   checks:
     name: ${{ matrix.name }}
+    needs: changes
+    # An empty matrix is an error, not a skip.
+    if: needs.changes.outputs.checks != '[]'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: check-host
-            command: just check-host
-          - name: check-aarch64
-            command: just check-target aarch64-unknown-none helios-aarch64
-          - name: check-riscv
-            command: just check-target riscv64gc-unknown-none-elf helios-riscv
-          - name: check-x86
-            command: just check-target x86_64-unknown-none helios-x86
-          - name: test-embedded-debugger
-            command: just test-embedded-debugger
-          # `just lint` runs these five gates back to back locally; CI
-          # splits them so a lint failure names the surface it came from
-          # and each lane keeps its own build cache.
-          - name: lint-fmt
-            command: just fmt-check && just deny-check
-          - name: lint-host
-            command: just clippy-host && just clippy-programs
-          - name: lint-aarch64
-            command: just clippy-target aarch64-unknown-none helios-aarch64
-          - name: lint-riscv
-            command: just clippy-target riscv64gc-unknown-none-elf helios-riscv
-          - name: lint-x86
-            command: just clippy-target x86_64-unknown-none helios-x86
-          - name: test-units
-            command: just test-units
+        # The legs and their commands live in `.github/ci-lanes.json`
+        # beside the surfaces each reads; `changes` keeps the ones this
+        # change needs. `just lint` runs its gates back to back locally;
+        # CI splits them so a lint failure names the surface it came from
+        # and each lane keeps its own build cache.
+        include: ${{ fromJSON(needs.changes.outputs.checks) }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -135,6 +193,8 @@ jobs:
 
   smoke-riscv64:
     name: smoke-riscv64
+    needs: changes
+    if: contains(fromJSON(needs.changes.outputs.lanes), 'smoke-riscv64')
     runs-on: ubuntu-24.04
     timeout-minutes: 300
     steps:
@@ -404,6 +464,8 @@ jobs:
   # boot needs, which the inspector finds through the prefix.
   smoke-aarch64:
     name: smoke-aarch64
+    needs: changes
+    if: contains(fromJSON(needs.changes.outputs.lanes), 'smoke-aarch64')
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 300
     env:
@@ -433,7 +495,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.QEMU_PREFIX }}
-          key: qemu-${{ env.QEMU_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+          # The configure flags are part of the key: a build made with
+          # other flags is a different install (#687).
+          key: qemu-${{ env.QEMU_VERSION }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/.github/qemu/aarch64-configure.args') }}
       - name: Build the pinned QEMU
         if: steps.qemu-cache.outputs.cache-hit != 'true'
         run: |
@@ -446,14 +510,9 @@ jobs:
           # aarch64-softmmu is the only target this lane boots, and the
           # inspector's default network backend is `user`, which has been
           # external libslirp since 8.0.
-          ./configure \
-            --prefix="${QEMU_PREFIX}" \
-            --target-list=aarch64-softmmu \
-            --enable-slirp \
-            --disable-docs \
-            --disable-gtk \
-            --disable-sdl \
-            --disable-vnc
+          # The flags live in a file the cache key hashes.
+          mapfile -t flags < "${GITHUB_WORKSPACE}/helios/.github/qemu/aarch64-configure.args"
+          ./configure --prefix="${QEMU_PREFIX}" "${flags[@]}"
           ninja -C build install
       - name: Put the pinned QEMU on PATH
         run: |
@@ -599,8 +658,8 @@ jobs:
 
   smoke-x86-64:
     name: smoke-x86-64
-    needs: [profile-format, kernel-profile]
-    if: ${{ !cancelled() && needs.profile-format.result == 'success' && (needs.kernel-profile.result == 'success' || needs.kernel-profile.result == 'skipped') }}
+    needs: [changes, kernel-profile]
+    if: ${{ !cancelled() && needs.changes.result == 'success' && contains(fromJSON(needs.changes.outputs.lanes), 'smoke-x86-64') && (needs.kernel-profile.result == 'success' || needs.kernel-profile.result == 'skipped') }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -671,7 +730,7 @@ jobs:
       # label, so the fetch comes before the build. Reading the artifact
       # is what the job's `actions: read` is for.
       - name: Fetch the kernel profile
-        if: needs.profile-format.outputs.changed != 'true'
+        if: needs.changes.outputs.profile_format != 'true'
         working-directory: helios
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -682,7 +741,7 @@ jobs:
       # change merges (#731). The run collects its own, and the lane
       # spends that one: the same fetch, naming the run.
       - name: Fetch this run's kernel profile
-        if: needs.profile-format.outputs.changed == 'true'
+        if: needs.changes.outputs.profile_format == 'true'
         working-directory: helios
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -1230,8 +1289,9 @@ jobs:
             --qemu-trace trace:virtio_gpu_update_cursor \
             --qemu-trace-log "$runtime/qemu-trace.log" \
             --boot-program dash --boot-program debugger \
-            --boot-program compositor \
+            --boot-program compositor --boot-program surface-test \
             screendump \
+              --run /bin/surface-test --run-wait-seconds 60 \
               --input tools/desktop/desktop-probe.input --input-interval-ms 150 \
               --settle-seconds 20 "$captures/compositor.png" \
             2>&1 | tee "$runtime/inspector.log"
@@ -1244,6 +1304,13 @@ jobs:
             "$runtime/inspector.log"
           grep -Eq 'compositor:frame sequence=[0-9]+ regions=[0-9]+ cursor=[0-9]+,[0-9]+' \
             "$runtime/inspector.log"
+          # The first client window the desktop ever saw: surface-test
+          # asked for one, drew a frame and gave it back, and each of its
+          # three lines is evidence that part of the surface path ran —
+          # a missing one is a call the compositor did not survive.
+          grep -Fq 'surface-test:created' "$runtime/inspector.log"
+          grep -Fq 'surface-test:committed' "$runtime/inspector.log"
+          grep -Fq 'surface-test:destroyed' "$runtime/inspector.log"
           # Where the terminal put its top-left cell, read from the
           # guest's own line rather than assumed: the layout is the
           # desktop's business, and a check that guessed it would be
@@ -1468,8 +1535,8 @@ jobs:
 
   bench:
     name: bench-${{ matrix.name }}
-    needs: [profile-format, kernel-profile]
-    if: ${{ !cancelled() && needs.profile-format.result == 'success' && (needs.kernel-profile.result == 'success' || needs.kernel-profile.result == 'skipped') }}
+    needs: [changes, kernel-profile]
+    if: ${{ !cancelled() && needs.changes.result == 'success' && (needs.kernel-profile.result == 'success' || needs.kernel-profile.result == 'skipped') }}
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -1599,7 +1666,7 @@ jobs:
       # label, so the fetch comes before the build. Reading the artifact
       # is what the job's `actions: read` is for.
       - name: Fetch the kernel profile
-        if: needs.profile-format.outputs.changed != 'true'
+        if: needs.changes.outputs.profile_format != 'true'
         working-directory: helios
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -1610,7 +1677,7 @@ jobs:
       # change merges (#731). The run collects its own, and the lane
       # spends that one: the same fetch, naming the run.
       - name: Fetch this run's kernel profile
-        if: needs.profile-format.outputs.changed == 'true'
+        if: needs.changes.outputs.profile_format == 'true'
         working-directory: helios
         env:
           GITHUB_TOKEN: ${{ github.token }}
