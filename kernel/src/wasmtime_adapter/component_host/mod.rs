@@ -1827,10 +1827,7 @@ where
     // that loses the kill reason (OOM vs supervisor restart). Any other
     // interruption ends a time slice, and the guest yields.
     store.interrupt_callback(|caller| {
-        if let Some(reason) = caller.data().pending_kill() {
-            return Err(wasmtime::Error::from(crate::InstanceKilled { reason }));
-        }
-        Ok(wasmtime::InterruptAction::Yield)
+        crate::wasmtime_adapter::preemption::kill_or_yield(caller.data().pending_kill())
     });
     let interrupts = engine
         .interrupts()

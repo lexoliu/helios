@@ -121,6 +121,14 @@ type CompilerThreadTasks = SmallVec<[crate::JoinHandle<CompilerThreadReport>; 8]
 type CompilerThreadReports = SmallVec<[CompilerThreadReport; 8]>;
 type CompilerPluginHandle<CpuImpl, Net, HostFs> = Arc<CompilerPluginRuntime<CpuImpl, Net, HostFs>>;
 
+/// What one call into the compiler plugin compiles, and how.
+#[derive(Clone, Copy)]
+struct CompilerCallInput<'a> {
+    wasm: &'a Bytes,
+    hint: AotCompileHint,
+    profile: bool,
+}
+
 #[derive(Clone, Copy, Default)]
 struct CompilerPhaseTimestamps {
     processor: u16,
@@ -1896,8 +1904,9 @@ where
         profile: bool,
         phases: &mut CompilerPhaseTimestamps,
     ) -> Result<Vec<u8>, ProgramExecError> {
-        let (plugin, plugin_cached) =
-            self.ensure_compiler_plugin(exec_context, compiler_payload)?;
+        let (plugin, plugin_cached) = self
+            .ensure_compiler_plugin(exec_context, compiler_payload)
+            .await?;
         phases.plugin_cached = plugin_cached;
         phases.plugin_ready_ns = if profile {
             monotonic_nanos(&exec_context.cpu)
@@ -1913,31 +1922,32 @@ where
             started_at,
             crate::OomPolicy::KernelPlugin,
         );
-        let store_data = CompilerCoreStore {
+        let store_data = CompilerCoreStore::new(CompilerCompileContext {
             cpu: exec_context.cpu.clone(),
             spawner: exec_context.spawner.clone(),
             runtime_state: exec_context.runtime_state.clone(),
-            instance: Arc::new(compiler_instance),
+            instance: compiler_instance,
             shared: plugin.shared.clone(),
-            preview1_descriptors: CompilerPreview1Descriptors::new(),
             write_serial: exec_context.write_serial,
             _marker: core::marker::PhantomData,
-        };
+        });
         let mut store = wasmtime::Store::new(engine, store_data);
-        let _interrupts = configure_compiler_core_store(&mut store);
-        let instance = plugin
-            .instance_pre
-            .instantiate_async(&mut store)
+        let drive = configure_compiler_core_store(&mut store);
+        let instance = drive
+            .instantiate(&mut store, &plugin.instance_pre)
             .await
             .map_err(map_program_runtime_error)?;
         let tls_base = plugin.main_thread_tls_base;
         set_compiler_tls_base(&mut store, &instance, tls_base)?;
-        let pthread_self_offset = instance
-            .get_typed_func::<(), i32>(&mut store, HELIOS_COMPILER_PTHREAD_SELF_OFFSET)
-            .map_err(map_program_runtime_error)?
-            .call_async(&mut store, ())
-            .await
-            .map_err(map_program_runtime_error)? as u32;
+        let pthread_self_offset = {
+            let pthread_self_offset = instance
+                .get_typed_func::<(), i32>(&mut store, HELIOS_COMPILER_PTHREAD_SELF_OFFSET)
+                .map_err(map_program_runtime_error)?;
+            drive
+                .call(&mut store, &pthread_self_offset, ())
+                .await
+                .map_err(map_program_runtime_error)? as u32
+        };
         let thread_pointer = tls_base
             .checked_add(pthread_self_offset)
             .ok_or(ProgramExecError {
@@ -1947,8 +1957,8 @@ where
         let initialize = instance
             .get_typed_func::<i32, ()>(&mut store, HELIOS_COMPILER_INITIALIZE)
             .map_err(map_program_runtime_error)?;
-        initialize
-            .call_async(&mut store, thread_pointer as i32)
+        drive
+            .call(&mut store, &initialize, thread_pointer as i32)
             .await
             .map_err(map_program_runtime_error)?;
         let exports = CompilerExports {
@@ -1971,15 +1981,18 @@ where
             0
         };
         let outstanding_before =
-            compiler_outstanding_bytes(&mut store, &exports.outstanding).await?;
+            compiler_outstanding_bytes(&drive, &mut store, &exports.outstanding).await?;
         let mut allocations = CompilerAllocations::new();
         let outcome = Self::call_compiler(
+            &drive,
             &mut store,
             &exports,
             &mut allocations,
-            wasm,
-            hint,
-            profile,
+            CompilerCallInput {
+                wasm,
+                hint,
+                profile,
+            },
             phases,
         )
         .await;
@@ -1990,9 +2003,11 @@ where
         // comes before the compile's own result: it says the plugin's memory
         // can no longer be trusted, which is what discards the runtime.
         let result = outcome?;
-        allocations.release(&mut store, &exports.free).await?;
+        allocations
+            .release(&drive, &mut store, &exports.free)
+            .await?;
         let outstanding_after =
-            compiler_outstanding_bytes(&mut store, &exports.outstanding).await?;
+            compiler_outstanding_bytes(&drive, &mut store, &exports.outstanding).await?;
         ensure_compiler_buffers_returned(outstanding_before, outstanding_after)?;
         result
     }
@@ -2002,23 +2017,28 @@ where
     /// `allocations` and releases them according to the returned
     /// [`CompilerCallOutcome`].
     async fn call_compiler(
+        drive: &CompilerStoreDrive<CpuImpl>,
         store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, HostFs>>,
         exports: &CompilerExports,
         allocations: &mut CompilerAllocations,
-        wasm: &Bytes,
-        hint: AotCompileHint,
-        profile: bool,
+        input: CompilerCallInput<'_>,
         phases: &mut CompilerPhaseTimestamps,
     ) -> CompilerCallOutcome {
+        let CompilerCallInput {
+            wasm,
+            hint,
+            profile,
+        } = input;
         let target = env!("HELIOS_BUILD_TARGET").as_bytes();
         let wasm_ptr = allocations
-            .alloc(&mut *store, &exports.alloc, wasm.len(), 1)
+            .alloc(drive, &mut *store, &exports.alloc, wasm.len(), 1)
             .await?;
         let target_ptr = allocations
-            .alloc(&mut *store, &exports.alloc, target.len(), 1)
+            .alloc(drive, &mut *store, &exports.alloc, target.len(), 1)
             .await?;
         let request_ptr = allocations
             .alloc(
+                drive,
                 &mut *store,
                 &exports.alloc,
                 CompilerRequestHeader::SIZE,
@@ -2058,35 +2078,27 @@ where
             return Ok(Err(error));
         }
         phases.input_done_ns = if profile {
-            monotonic_nanos(&store.data().cpu)
+            monotonic_nanos(&store.data().context.cpu)
         } else {
             0
         };
         phases.compile_started_ns = if profile {
-            monotonic_nanos(&store.data().cpu)
+            monotonic_nanos(&store.data().context.cpu)
         } else {
             0
         };
-        let compile_started = store.data().cpu.now().ticks();
-        let response_ptr = exports
-            .compile
-            .call_async(
+        let response_ptr = drive
+            .call(
                 &mut *store,
+                &exports.compile,
                 (request_ptr as i32, CompilerRequestHeader::SIZE as i32),
             )
             .await;
         phases.compile_returned_ns = if profile {
-            monotonic_nanos(&store.data().cpu)
+            monotonic_nanos(&store.data().context.cpu)
         } else {
             0
         };
-        let compile_elapsed = store
-            .data()
-            .cpu
-            .now()
-            .ticks()
-            .saturating_sub(compile_started);
-        store.data().record_user_ticks(compile_elapsed);
         let response_ptr = response_ptr.map_err(map_program_runtime_error)? as u32;
         Ok(accept_compiler_response(
             store.data(),
@@ -2114,14 +2126,19 @@ where
     /// it forever after. The cached `wasmtime::Module`, `InstancePre`
     /// and 512 MiB `SharedMemory` are stable across calls; per-call work
     /// drops to a fresh `wasmtime::Store` and `instance_pre.instantiate`.
-    fn ensure_compiler_plugin(
+    ///
+    /// Called only with the compile slot held, which is what makes the
+    /// build exclusive: nothing else builds or discards the cached runtime
+    /// between the check below and the store at the end, so the cache's
+    /// lock is never held across the build's awaits.
+    async fn ensure_compiler_plugin(
         &self,
         exec_context: &ProgramExecContext<CpuImpl, Net, HostFs>,
         compiler_payload: &Bytes,
     ) -> Result<(CompilerPluginHandle<CpuImpl, Net, HostFs>, bool), ProgramExecError> {
-        let mut slot = self.inner.compiler_plugin.lock();
-        if let Some(plugin) = slot.as_ref() {
-            return Ok((plugin.clone(), true));
+        let cached = self.inner.compiler_plugin.lock().clone();
+        if let Some(plugin) = cached {
+            return Ok((plugin, true));
         }
 
         // The compiler plugin is a precompiled core module; a component
@@ -2178,16 +2195,15 @@ where
             scratch_started_at,
             crate::OomPolicy::KernelPlugin,
         );
-        let scratch_store_data = CompilerCoreStore {
+        let scratch_store_data = CompilerCoreStore::new(CompilerCompileContext {
             cpu: exec_context.cpu.clone(),
             spawner: exec_context.spawner.clone(),
             runtime_state: exec_context.runtime_state.clone(),
-            instance: Arc::new(scratch_instance),
+            instance: scratch_instance,
             shared: shared.clone(),
-            preview1_descriptors: CompilerPreview1Descriptors::new(),
             write_serial: exec_context.write_serial,
             _marker: core::marker::PhantomData,
-        };
+        });
         let mut scratch_store = wasmtime::Store::new(engine, scratch_store_data);
         define_compiler_shared_memory(&mut linker, &scratch_store, &module, shared_memory)?;
 
@@ -2196,9 +2212,10 @@ where
                 .instantiate_pre(&module)
                 .map_err(map_program_runtime_error)?,
         );
-        let scratch_interrupts = configure_compiler_core_store(&mut scratch_store);
-        let scratch_instance = instance_pre
-            .instantiate(&mut scratch_store)
+        let scratch_drive = configure_compiler_core_store(&mut scratch_store);
+        let scratch_instance = scratch_drive
+            .instantiate(&mut scratch_store, &instance_pre)
+            .await
             .map_err(map_program_runtime_error)?;
         let main_thread_tls_base = compiler_tls_base(&mut scratch_store, &scratch_instance)?;
         if main_thread_tls_base == 0 {
@@ -2208,7 +2225,7 @@ where
                 detail: ProgramExecErrorDetail::CompilerPluginInvalid,
             });
         }
-        drop(scratch_interrupts);
+        drop(scratch_drive);
         drop(scratch_store);
         shared.instance_pre.call_once(|| instance_pre.clone());
 
@@ -2219,7 +2236,7 @@ where
             main_thread_tls_base,
             _code: code,
         });
-        *slot = Some(plugin.clone());
+        *self.inner.compiler_plugin.lock() = Some(plugin.clone());
         Ok((plugin, false))
     }
 }
