@@ -10,6 +10,8 @@ mod audio;
 mod bootfs;
 mod buffer;
 mod component;
+#[cfg(feature = "wasmtime-runtime")]
+mod control_flow;
 mod device;
 mod display;
 mod embedded;
