@@ -18,12 +18,16 @@ use std::fs::File;
 use std::future::Future;
 use std::io::{self, Read as _, Seek as _, SeekFrom};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+#[cfg(unix)]
+use std::path::Path;
 use std::rc::Rc;
 use std::time::Instant;
 
 use executor_core::LocalExecutor;
 use executor_core::async_task::{AsyncTask, spawn_local};
 use futures_lite::stream::{Stream, once_future};
+#[cfg(unix)]
+use http_kit_io::DialUnix;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use http_kit_io::splice::{FilledPipe, Pipe, Spliced};
 use http_kit_io::{
@@ -135,6 +139,21 @@ impl Dial for HeliosNet {
                 _socket: socket,
             },
         })
+    }
+}
+
+/// `wasi:sockets` has no Unix-domain sockets, so every dial is refused as
+/// [`io::ErrorKind::Unsupported`]. The trait is asked for only where the
+/// crate is built for a Unix host.
+#[cfg(unix)]
+impl DialUnix for HeliosNet {
+    type UnixConnection = TcpConnection;
+
+    async fn connect_unix(&self, _path: &Path) -> io::Result<TcpConnection> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "wasi:sockets has no Unix-domain sockets",
+        ))
     }
 }
 
