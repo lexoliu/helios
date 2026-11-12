@@ -5,9 +5,12 @@
 //! role. The child fills a region with a per-page pattern and blocks on
 //! its stdin. The parent waits out the idle threshold, then holds a
 //! growing allocation that it keeps touching, so the child is the only
-//! eviction candidate, until the swap-out counter covers the child's
-//! pages. It then wakes the child, which verifies every byte, and
-//! requires the swap-in counter to cover them as well.
+//! eviction candidate, until the child reports no resident bytes of its
+//! own (`child.resident-bytes`; the machine-wide swap-out counter also
+//! counts other instances' pages and the child's pages outside the
+//! region, so it only feeds the deadline and the metrics). It then wakes
+//! the child, which verifies every byte, and requires the swap-in
+//! counter to cover the region's pages as well.
 
 use std::hint::black_box;
 use std::io::{self, Read as _, Write as _};
@@ -244,10 +247,13 @@ pub(crate) async fn swap_cycle(options: Options, child: ChildSpec) -> Result<(),
         hog.touch().await;
         let sample = stats::snapshot();
         let swap = sample.swap.ok_or(ProcbenchError::SwapUnavailable)?;
-        let evicted = swap.pages_out.saturating_sub(baseline.pages_out);
-        if evicted >= child_pages {
+        // The machine-wide counter also moves for the parent's and other
+        // instances' pages, so only the child's own figure ends the wait.
+        let resident_bytes = handle.resident_bytes();
+        if resident_bytes == 0 {
             break;
         }
+        let evicted = swap.pages_out.saturating_sub(baseline.pages_out);
         // A fail-fast guard against driving the machine into the OOM band
         // when swap never starts; it is not an estimate of pressure.
         if swap.pages_out == baseline.pages_out
@@ -268,6 +274,7 @@ pub(crate) async fn swap_cycle(options: Options, child: ChildSpec) -> Result<(),
         {
             return Err(ProcbenchError::SwapOutDeadline {
                 waited: started.elapsed(),
+                resident_bytes,
                 pages_out: swap.pages_out,
                 baseline_pages_out: baseline.pages_out,
                 child_pages,

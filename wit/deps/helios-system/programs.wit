@@ -255,6 +255,20 @@ interface programs {
 
     /// Await child completion and return its exit status.
     wait: async func() -> result<exit-status, spawn-error>;
+
+    /// Bytes of the child's user memory that a frame currently backs.
+    /// A page that swap has moved out does not count, and neither does
+    /// a region substituted by a device or shared mapping. A child that
+    /// has exited answers 0.
+    ///
+    /// The figure is a snapshot: the child, or swap, may have changed it
+    /// by the time the caller reads it. One call sums the child's
+    /// committed regions under the address space's reservation lock, so
+    /// its cost grows with the number of regions the child holds; poll
+    /// it at the cadence of the work it gates, not in a tight loop. A
+    /// platform without swap has no per-owner figure and traps the
+    /// caller.
+    resident-bytes: func() -> u64;
   }
 
   /// Spawn a new program and return a handle for streaming its IO.

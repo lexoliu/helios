@@ -18,8 +18,9 @@
 //! - `swap-cycle [--mib <n>] [--seed <n>] [--corrupt-page <index>] <procbench>`
 //!   has a child of this same program (the `swap-child` role, started by the
 //!   command itself) fill a patterned region and idle, evicts it by holding
-//!   the machine under a busy allocation, and requires every byte back and
-//!   the swap-in counter to cover them (`swap_cycle.rs`).
+//!   the machine under a busy allocation until the child has nothing
+//!   resident, and requires every byte back and the swap-in counter to cover
+//!   the region (`swap_cycle.rs`).
 //!
 //! `tools/bench/native/procbench.c` is the Linux counterpart with the same
 //! subcommands and the same output lines.
@@ -100,11 +101,11 @@ enum ProcbenchError {
         baseline_pages_out: u64,
     },
     #[error(
-        "swap moved {} of the child's {child_pages} pages out in {waited:?} (pages_out {pages_out}, baseline {baseline_pages_out}, hog {hog_bytes} bytes)",
-        pages_out.saturating_sub(*baseline_pages_out)
+        "{resident_bytes} bytes of the child's {child_pages} pages were still resident after {waited:?} (pages_out {pages_out} from baseline {baseline_pages_out}, hog {hog_bytes} bytes)"
     )]
     SwapOutDeadline {
         waited: std::time::Duration,
+        resident_bytes: u64,
         pages_out: u64,
         baseline_pages_out: u64,
         child_pages: u64,
