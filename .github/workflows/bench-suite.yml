@@ -266,12 +266,6 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-zigbuild
-      # The host tool links the Wasmtime fork, a release build this job
-      # would otherwise repeat from nothing on every run.
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: helios
-          key: bench-native
       - name: Build the native counterparts
         working-directory: helios
         run: tools/bench/native/build.sh x86_64
