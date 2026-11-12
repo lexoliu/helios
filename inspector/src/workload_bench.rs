@@ -393,6 +393,10 @@ pub(crate) struct WorkloadBenchCommand {
     #[arg(long)]
     host_tcp_port: Option<u16>,
 
+    /// Host TCP port of the sink that raw TCP upload workloads write to.
+    #[arg(long)]
+    host_tcp_upload_port: Option<u16>,
+
     /// Host TCP echo port visible from inside the VM for round-trip latency workloads.
     #[arg(long)]
     host_tcp_echo_port: Option<u16>,
@@ -1194,6 +1198,12 @@ fn render_helios_template(
             .ok_or_else(|| missing("--host-tcp-port", "host TCP"))?;
         rendered = rendered.replace("{host_tcp_port}", &port.to_string());
     }
+    if rendered.contains("{host_tcp_upload_port}") {
+        let port = command
+            .host_tcp_upload_port
+            .ok_or_else(|| missing("--host-tcp-upload-port", "host TCP upload"))?;
+        rendered = rendered.replace("{host_tcp_upload_port}", &port.to_string());
+    }
     if workload.requires_host_tcp_echo
         && (command.host_tcp_host.is_none() || command.host_tcp_echo_port.is_none())
     {
@@ -1612,6 +1622,7 @@ mod tests {
             host_http_url: None,
             host_tcp_host: None,
             host_tcp_port: None,
+            host_tcp_upload_port: None,
             host_tcp_echo_port: None,
             keep_going: false,
             profile_output: None,
@@ -1677,6 +1688,7 @@ mod tests {
             host_http_url: None,
             host_tcp_host: None,
             host_tcp_port: None,
+            host_tcp_upload_port: None,
             host_tcp_echo_port: None,
             keep_going: false,
             profile_output: None,
@@ -1765,6 +1777,7 @@ mod tests {
             host_http_url: None,
             host_tcp_host: None,
             host_tcp_port: None,
+            host_tcp_upload_port: None,
             host_tcp_echo_port: None,
             keep_going: false,
             profile_output: None,
@@ -1830,6 +1843,7 @@ mod tests {
             host_http_url: None,
             host_tcp_host: None,
             host_tcp_port: None,
+            host_tcp_upload_port: None,
             host_tcp_echo_port: None,
             keep_going: false,
             profile_output: None,
