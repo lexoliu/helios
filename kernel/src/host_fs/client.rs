@@ -21,6 +21,24 @@
 //!   own error; its fids are of the old era, which the allocator
 //!   recognises and ignores, and it caches nothing afterwards. The next
 //!   operation establishes a new session.
+//! * A VMM snapshot needs the share released: QEMU refuses to snapshot
+//!   a guest whose 9p root fid is attached. [`HostFsClient::prepare_snapshot`]
+//!   therefore closes a gate that every operation passes once, on entry
+//!   and for its whole duration, and waits for the operations already
+//!   inside to leave. Operations arriving at a closed gate park on the
+//!   gate's release signal; none fails. With nothing in flight it
+//!   clunks every pooled fid and the root fid, and the session stays
+//!   unpublished. The gate opens again exactly when
+//!   [`HostFsClient::snapshot_finished`] runs (the source machine
+//!   resumes) or a machine restore reaches
+//!   [`HostFileSystem::after_machine_restore`] (the restored copy); the
+//!   parked operations then race for the establishment lock, and the
+//!   one that wins attaches the session for all of them. Both signals
+//!   are armed before the state they announce is read, so neither a
+//!   release nor the last operation leaving can be missed. The gate is
+//!   taken by the public operations only, never by the helpers they
+//!   call, so an operation never waits on a gate it is itself holding
+//!   open. The clunks the hold sends are not operations.
 //! * Each operation owns its tags and fids: a tag for the lifetime of
 //!   one message, a fid for the lifetime of the operation, both handed
 //!   out by allocators behind a spin mutex that is taken only to
@@ -46,7 +64,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use bytes::BytesMut;
 use core::future::Future;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use helios_hal::cpu::{Cpu, HardwarePerfCounters};
 use helios_hal::io::IoError;
 use objectpool::{Pool, ReusableObject};
@@ -57,7 +75,7 @@ use triomphe::Arc;
 use super::cache::{CachedAttributes, HostFsCache, HostFsCacheStats, PooledReadFid};
 use crate::{
     AuthorityDomain, HostDirEntry, HostDirLimit, HostFileSystem, HostFsError, HostFsErrorKind,
-    HostMetadata, HostShareRestore, ObjectIdentity, ProfileSink, RawMutex,
+    HostMetadata, HostShareRestore, Notify, ObjectIdentity, ProfileSink, RawMutex,
 };
 
 /// The msize this client asks for. The server answers with its own
@@ -109,6 +127,13 @@ const P9_SETATTR_ATIME_SET: u32 = 0x0000_0080;
 const P9_SETATTR_MTIME_SET: u32 = 0x0000_0100;
 const P9_QTDIR: u8 = 0x80;
 const P9_HEADER_LEN: usize = 7;
+/// Most path elements one `Twalk` names: `MAXWELEM` in the 9P2000
+/// `walk(5)` definition and `P9_MAXWELEM` in Linux's
+/// `include/net/9p/9p.h`, which servers (QEMU's `P9_MAXWELEM`) enforce.
+const P9_MAXWELEM: u16 = 16;
+/// Bytes a `Twalk` carries before its names:
+/// `size[4] type[1] tag[2] fid[4] newfid[4] nwname[2]`.
+const P9_TWALK_FIXED_LEN: usize = P9_HEADER_LEN + 4 + 4 + 2;
 /// Byte offsets of the `Rgetattr` fields, measured from the start of the
 /// message (the 7-byte `size[4] type[1] tag[2]` header included). 9P2000.L
 /// fixes this layout, so the reply is parsed by offset instead of by a
@@ -234,6 +259,22 @@ impl Session {
     /// Response buffer size for a reply that may fill a whole message.
     fn message_len(self) -> usize {
         usize::try_from(self.msize).expect("a 9p msize fits in usize")
+    }
+
+    /// The name bytes one `Twalk` may carry, length prefixes included.
+    fn walk_name_budget(self) -> usize {
+        self.message_len() - P9_TWALK_FIXED_LEN
+    }
+
+    /// `value` as a string field of a request under this session, or
+    /// [`HostFsError::NameTooLong`] when the wire cannot carry it.
+    fn string<'a>(self, value: &'a str) -> Result<P9Str<'a>, HostFsError> {
+        P9Str::new(value, self.msize)
+    }
+
+    /// `path` as a walk under this session, every element checked.
+    fn path<'a>(self, path: &'a str) -> Result<P9Path<'a>, HostFsError> {
+        P9Path::new(path, self.msize)
     }
 }
 
@@ -417,6 +458,102 @@ impl Drop for Handle<'_> {
     }
 }
 
+/// The bit of [`SnapshotGate::state`] that says the share is held.
+const GATE_HELD: usize = 1;
+/// What one operation inside the gate adds to [`SnapshotGate::state`],
+/// above the held bit.
+const GATE_ONE_OPERATION: usize = 2;
+
+/// Lets operations through until a snapshot hold closes it.
+///
+/// One word carries the held bit and the number of operations inside,
+/// so an operation entering and the hold closing are ordered by a single
+/// compare-exchange: an operation either got in before the bit was set,
+/// and is counted for the drain, or sees the bit and parks. Entering and
+/// leaving are lock-free; the two [`Notify`]s are broadcasts, each
+/// armed before the word is read.
+struct SnapshotGate {
+    /// Bit 0 is [`GATE_HELD`]; the rest counts operations inside.
+    state: AtomicUsize,
+    /// Fired when the last operation leaves a held gate.
+    drained: Notify,
+    /// Fired when a held gate opens.
+    released: Notify,
+}
+
+impl SnapshotGate {
+    fn new() -> Self {
+        Self {
+            state: AtomicUsize::new(0),
+            drained: Notify::new(),
+            released: Notify::new(),
+        }
+    }
+
+    /// Waits for the gate to be open and enters it. Any task may call it.
+    async fn enter(&self) -> GateEntry<'_> {
+        loop {
+            let released = self.released.notified();
+            let state = self.state.load(Ordering::Acquire);
+            if state & GATE_HELD == 0 {
+                if self
+                    .state
+                    .compare_exchange_weak(
+                        state,
+                        state + GATE_ONE_OPERATION,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    return GateEntry { gate: self };
+                }
+                continue;
+            }
+            released.await;
+        }
+    }
+
+    /// Closes the gate and waits for every operation inside to leave.
+    /// Closing a closed gate only waits for the drain again.
+    async fn close_and_drain(&self) {
+        self.state.fetch_or(GATE_HELD, Ordering::AcqRel);
+        loop {
+            let drained = self.drained.notified();
+            if self.state.load(Ordering::Acquire) >> 1 == 0 {
+                return;
+            }
+            drained.await;
+        }
+    }
+
+    /// Opens the gate, reporting whether it was closed.
+    fn open(&self) -> bool {
+        let was_held = self.state.fetch_and(!GATE_HELD, Ordering::AcqRel) & GATE_HELD != 0;
+        if was_held {
+            self.released.notify_all();
+        }
+        was_held
+    }
+}
+
+/// One operation inside the gate; leaving it is dropping it.
+struct GateEntry<'a> {
+    gate: &'a SnapshotGate,
+}
+
+impl Drop for GateEntry<'_> {
+    fn drop(&mut self) {
+        let before = self
+            .gate
+            .state
+            .fetch_sub(GATE_ONE_OPERATION, Ordering::AcqRel);
+        if before == GATE_HELD | GATE_ONE_OPERATION {
+            self.gate.drained.notify_all();
+        }
+    }
+}
+
 /// The clock and hardware-counter readings a profiled span is
 /// measured between.
 #[derive(Clone, Copy)]
@@ -437,6 +574,8 @@ struct ClientInner<Transport: HostFsTransport, CpuImpl: Cpu + Clone> {
     /// network service for its `kernel;network;` phases.
     profiles: ProfileSink,
     session: SessionCell,
+    /// Closed for the length of a VMM snapshot; see the module docs.
+    gate: SnapshotGate,
     tags: HandleAllocator,
     fids: HandleAllocator,
     cache: HostFsCache,
@@ -466,6 +605,7 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         Self {
             inner: Arc::new(ClientInner {
                 session: SessionCell::new(),
+                gate: SnapshotGate::new(),
                 tags: HandleAllocator::new(
                     depth,
                     u32::from(P9_NOTAG),
@@ -510,6 +650,45 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
             parked_fids = forgotten.len(),
             "9p session dropped: the server no longer knows it"
         );
+    }
+
+    /// Gives the share back to the host for a VMM snapshot and keeps it
+    /// given back.
+    ///
+    /// The gate closes first, so no operation starts from here on, and
+    /// the call waits for those already inside to finish. The session
+    /// lock is taken only after the drain, because an operation inside
+    /// may itself be waiting for it to establish the session. With the
+    /// client quiet, every pooled read fid and then the root fid are
+    /// clunked, which is what lifts QEMU's snapshot blocker, and the
+    /// session is left unpublished. The hold ends in
+    /// [`Self::snapshot_finished`] or in a machine restore. A caller
+    /// that abandons this future after the gate closed leaves the hold
+    /// in force; ending it is still one of those two.
+    pub async fn prepare_snapshot(&self) {
+        self.inner.gate.close_and_drain().await;
+        let _establishing = self.inner.session.establishing.lock().await;
+        let Some(session) = self.inner.session.get() else {
+            tracing::info!("9p snapshot hold taken with no session attached");
+            return;
+        };
+        self.inner.session.unpublish();
+        let parked = self.inner.cache.clear();
+        let parked_fids = parked.len();
+        for fid in parked {
+            self.clunk_value(fid).await;
+        }
+        self.clunk_value(session.root_fid).await;
+        tracing::info!(parked_fids, "9p session released for a snapshot");
+    }
+
+    /// Ends the hold [`Self::prepare_snapshot`] took, because the
+    /// snapshot is over and this machine runs on. A no-op when no hold
+    /// is in force.
+    pub fn snapshot_finished(&self) {
+        if self.inner.gate.open() {
+            tracing::info!("9p snapshot hold ended: the share attaches again on next use");
+        }
     }
 
     /// Forgets every cached answer without touching the session, for a
@@ -581,16 +760,19 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         );
     }
 
-    /// Runs `operation` under its `kernel;hostfs;<phase>` counter:
-    /// count is the call itself, nanos the whole wall-clock span and
-    /// bytes whatever payload `payload` reads off the result — zero
-    /// for an operation that moves none.
+    /// Runs `operation` as one public host-share operation: inside the
+    /// snapshot gate for its whole duration, and under its
+    /// `kernel;hostfs;<phase>` counter. Count is the call itself, nanos
+    /// the whole wall-clock span and bytes whatever payload `payload`
+    /// reads off the result — zero for an operation that moves none.
+    /// Time parked at a closed gate is not part of the span.
     async fn profiled<T>(
         &self,
         phase: &'static str,
         operation: impl Future<Output = Result<T, HostFsError>> + Send,
         payload: impl FnOnce(&T) -> usize + Send,
     ) -> Result<T, HostFsError> {
+        let _inside = self.inner.gate.enter().await;
         let start = self.profile_start();
         let result = operation.await;
         if let Some(start) = start {
@@ -621,13 +803,15 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         let root = self.inner.fids.allocate()?;
         let mount_tag = self.inner.transport.mount_tag().to_owned();
         let root_fid = root.value();
+        let user = P9Str::new("root", msize)?;
+        let mount = P9Str::new(&mount_tag, msize)?;
         self.transact(
             P9Message::Attach,
             move |body| {
                 push_u32(body, root_fid);
                 push_u32(body, P9_NOFID);
-                push_string(body, "root");
-                push_string(body, &mount_tag);
+                push_string(body, user);
+                push_string(body, mount);
                 push_u32(body, P9_NOUID);
             },
             P9_SMALL_REPLY_LEN,
@@ -649,6 +833,7 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
     /// `Tversion` is the one message that carries `NOTAG`: it resets the
     /// session, so no other request may be outstanding when it runs.
     async fn version(&self) -> Result<u32, HostFsError> {
+        let dialect = P9Str::new(P9_VERSION, P9_REQUESTED_MSIZE)?;
         let response = self
             .exchange(
                 P9_NOTAG,
@@ -656,7 +841,7 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
                 P9_DEFAULT_REQUEST_BODY_BYTES,
                 |body| {
                     push_u32(body, P9_REQUESTED_MSIZE);
-                    push_string(body, P9_VERSION);
+                    push_string(body, dialect);
                 },
                 P9_RVERSION_LEN,
             )
@@ -781,38 +966,96 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
     /// an ordinary path here: the caller always receives a fid it owns
     /// and clunks, and the session's root fid is never opened or
     /// clunked by an operation.
+    ///
+    /// A `Twalk` names at most [`P9_MAXWELEM`] elements and must fit the
+    /// msize, so a longer path is walked in steps: the first from the
+    /// root fid, each later one from the fid the previous step
+    /// produced, in place (`newfid` equal to `fid`, which 9p allows).
+    /// Every element is checked before the first message is sent, so a
+    /// name the wire cannot carry fails without touching the server.
     async fn walk(&self, session: Session, path: &str) -> Result<Handle<'_>, HostFsError> {
+        let path = session.path(path)?;
         let target = self.inner.fids.allocate()?;
-        let segment_count = path_segment_count(path);
-        let parent_fid = session.root_fid;
         let new_fid = target.value();
+        let budget = session.walk_name_budget();
+        let mut segments = path.segments().peekable();
+        let mut parent_fid = session.root_fid;
+        loop {
+            // How many of the remaining elements this step takes: as
+            // many as `MAXWELEM` and the message size allow. A single
+            // element always fits, because a string is bounded by half
+            // the payload a message carries.
+            let mut count = 0_u16;
+            let mut name_bytes = 0_usize;
+            for segment in segments.clone() {
+                let cost = segment.wire_len();
+                if count == P9_MAXWELEM || name_bytes + cost > budget {
+                    break;
+                }
+                count += 1;
+                name_bytes += cost;
+            }
+            let step = self
+                .walk_step(
+                    parent_fid,
+                    new_fid,
+                    count,
+                    name_bytes,
+                    segments.by_ref().take(usize::from(count)),
+                )
+                .await;
+            if let Err(error) = step {
+                if parent_fid == new_fid {
+                    // An earlier step attached `new_fid`; a failed step
+                    // leaves it where that step put it, and the server
+                    // still holds it.
+                    self.clunk(target).await;
+                }
+                // A first step that fails leaves `new_fid` unattached
+                // (2000.L: "if any walked element doesn't exist the
+                // final fid is not set"), so dropping the handle is
+                // enough.
+                return Err(error);
+            }
+            if segments.peek().is_none() {
+                return Ok(target);
+            }
+            parent_fid = new_fid;
+        }
+    }
+
+    /// One `Twalk` of `count` elements totalling `name_bytes` encoded
+    /// bytes, which must all be walked.
+    async fn walk_step<'a>(
+        &self,
+        parent_fid: u32,
+        new_fid: u32,
+        count: u16,
+        name_bytes: usize,
+        names: impl Iterator<Item = P9Str<'a>>,
+    ) -> Result<(), HostFsError> {
         let response = self
-            .transact(
+            .transact_with_capacity(
                 P9Message::Walk,
+                P9_TWALK_FIXED_LEN - P9_HEADER_LEN + name_bytes,
                 |body| {
                     push_u32(body, parent_fid);
                     push_u32(body, new_fid);
-                    push_u16(
-                        body,
-                        u16::try_from(segment_count).expect("walk segment count overflowed u16"),
-                    );
-                    for segment in path_segments(path) {
-                        push_string(body, segment);
+                    push_u16(body, count);
+                    for name in names {
+                        push_string(body, name);
                     }
                 },
                 P9_RWALK_LEN,
             )
             .await?;
         let walked = read_u16_le(&response, P9_HEADER_LEN)?;
-        if usize::from(walked) != segment_count {
-            // The server walked part of the path; the remaining segment
-            // doesn't exist. 9p leaves `new_fid` unattached in this case
-            // per the 2000.L spec ("if any walked element doesn't exist
-            // the final fid is not set"), so there is nothing to clunk —
-            // dropping the handle is enough.
+        if walked != count {
+            // The server walked part of the path; the remaining element
+            // doesn't exist.
             return Err(HostFsError::Transport(IoError::NotFound));
         }
-        Ok(target)
+        Ok(())
     }
 
     /// Releases a fid on both sides: `Tclunk` for the server, the
@@ -1259,6 +1502,7 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
     async fn create_directory_impl(&self, path: &str) -> Result<(), HostFsError> {
         let (parent, name) = split_parent_name(path)?;
         let session = self.session().await?;
+        let name = session.string(name)?;
         let directory = self.walk(session, parent).await?;
         let fid = directory.value();
         let result = self
@@ -1282,6 +1526,7 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
     async fn create_file_impl(&self, path: &str) -> Result<(), HostFsError> {
         let (parent, name) = split_parent_name(path)?;
         let session = self.session().await?;
+        let name = session.string(name)?;
         let directory = self.walk(session, parent).await?;
         let fid = directory.value();
         let result = self
@@ -1444,6 +1689,7 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
     async fn remove_impl(&self, path: &str, directory: bool) -> Result<(), HostFsError> {
         let (parent, name) = split_parent_name(path)?;
         let session = self.session().await?;
+        let name = session.string(name)?;
         let dir = self.walk(session, parent).await?;
         let fid = dir.value();
         let flags = if directory { P9_DOTL_AT_REMOVEDIR } else { 0 };
@@ -1468,6 +1714,10 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         let (source_parent, source_name) = split_parent_name(source)?;
         let (destination_parent, destination_name) = split_parent_name(destination)?;
         let session = self.session().await?;
+        let source_name = session.string(source_name)?;
+        let destination_name = session.string(destination_name)?;
+        session.path(source_parent)?;
+        session.path(destination_parent)?;
         let source_dir = self.walk(session, source_parent).await?;
         let destination_dir = match self.walk(session, destination_parent).await {
             Ok(fid) => fid,
@@ -1501,6 +1751,9 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
     async fn hard_link_impl(&self, source: &str, destination: &str) -> Result<(), HostFsError> {
         let (destination_parent, destination_name) = split_parent_name(destination)?;
         let session = self.session().await?;
+        let destination_name = session.string(destination_name)?;
+        session.path(source)?;
+        session.path(destination_parent)?;
         let source_file = self.walk(session, source).await?;
         let destination_dir = match self.walk(session, destination_parent).await {
             Ok(fid) => fid,
@@ -1536,6 +1789,8 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
     async fn symlink_impl(&self, target: &str, link_path: &str) -> Result<(), HostFsError> {
         let (parent, name) = split_parent_name(link_path)?;
         let session = self.session().await?;
+        let name = session.string(name)?;
+        let target = session.string(target)?;
         let directory = self.walk(session, parent).await?;
         let fid = directory.value();
         let result = self
@@ -1588,6 +1843,18 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFileSystem
             HostShareRestore::ServerKept => self.flush_cache().await,
             HostShareRestore::SessionLost => self.reset_session_forgotten().await,
         }
+        // A restored copy never sees `snapshot-finished`: its machine
+        // generation advancing is what ends a hold taken before the
+        // snapshot, after the session state above is settled.
+        self.snapshot_finished();
+    }
+
+    async fn prepare_snapshot(&self) {
+        HostFsClient::prepare_snapshot(self).await;
+    }
+
+    fn snapshot_finished(&self) {
+        HostFsClient::snapshot_finished(self);
     }
 
     async fn stat_path<'a>(&'a self, path: &'a str) -> Result<HostMetadata, HostFsError> {
@@ -1725,12 +1992,8 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFileSystem
     }
 }
 
-fn path_segments(path: &str) -> impl Iterator<Item = &str> {
+fn path_segments(path: &str) -> impl Iterator<Item = &str> + Clone {
     path.split('/').filter(|segment| !segment.is_empty())
-}
-
-fn path_segment_count(path: &str) -> usize {
-    path_segments(path).count()
 }
 
 fn split_parent_name(path: &str) -> Result<(&str, &str), HostFsError> {
@@ -1801,11 +2064,105 @@ fn push_u64(buf: &mut BytesMut, value: u64) {
     buf.extend_from_slice(&value.to_le_bytes());
 }
 
-fn push_string(buf: &mut BytesMut, value: &str) {
-    let len = u16::try_from(value.len()).expect("9p string field exceeded u16::MAX");
-    push_u16(buf, len);
-    buf.extend_from_slice(value.as_bytes());
+fn push_string(buf: &mut BytesMut, value: P9Str<'_>) {
+    push_u16(buf, value.len());
+    buf.extend_from_slice(value.as_str().as_bytes());
 }
+
+mod wire_string {
+    //! The two guest-supplied shapes a request's string fields take, built
+    //! only through a check that the wire can carry them. The fields are
+    //! private, so an encoder holding a [`P9Str`] has no length left to
+    //! verify.
+
+    use super::{HostFsError, P9_MAX_FIXED_HEADER_BYTES, path_segments};
+
+    /// The longest string field a request under `msize` carries.
+    ///
+    /// A string is `len[2]` plus bytes, so no field exceeds `u16::MAX`.
+    /// The message-size bound is half of what follows the fixed prefix
+    /// ([`P9_MAX_FIXED_HEADER_BYTES`], the longest any message has): the
+    /// messages that carry two strings (`Tattach`, `Tsymlink`,
+    /// `Trenameat`) then fit whatever the pair.
+    pub(super) fn max_string_len(msize: u32) -> u16 {
+        let by_message = msize.saturating_sub(P9_MAX_FIXED_HEADER_BYTES) / 2;
+        u16::try_from(by_message).unwrap_or(u16::MAX)
+    }
+
+    /// A string field of a request: at most `max_string_len` bytes.
+    #[derive(Clone, Copy)]
+    pub(super) struct P9Str<'a> {
+        value: &'a str,
+        len: u16,
+    }
+
+    impl<'a> P9Str<'a> {
+        /// `value` as a string field of a message no longer than `msize`.
+        pub(super) fn new(value: &'a str, msize: u32) -> Result<Self, HostFsError> {
+            let max_len = max_string_len(msize);
+            match u16::try_from(value.len()) {
+                Ok(len) if len <= max_len => Ok(Self { value, len }),
+                _ => Err(HostFsError::NameTooLong {
+                    len: value.len(),
+                    max_len: usize::from(max_len),
+                }),
+            }
+        }
+
+        pub(super) fn as_str(self) -> &'a str {
+            self.value
+        }
+
+        /// The `len[2]` prefix the field is sent with.
+        pub(super) fn len(self) -> u16 {
+            self.len
+        }
+
+        /// What the field occupies on the wire: prefix and bytes.
+        pub(super) fn wire_len(self) -> usize {
+            2 + usize::from(self.len)
+        }
+    }
+
+    /// A path whose every element is a [`P9Str`] under one msize.
+    #[derive(Clone, Copy)]
+    pub(super) struct P9Path<'a> {
+        path: &'a str,
+    }
+
+    impl<'a> P9Path<'a> {
+        /// `path` as a walk under `msize`, or the first element the wire
+        /// cannot carry.
+        pub(super) fn new(path: &'a str, msize: u32) -> Result<Self, HostFsError> {
+            for segment in path_segments(path) {
+                P9Str::new(segment, msize)?;
+            }
+            Ok(Self { path })
+        }
+
+        /// The path's elements, in order.
+        pub(super) fn segments(self) -> impl Iterator<Item = P9Str<'a>> + Clone {
+            path_segments(self.path).map(|value| P9Str {
+                value,
+                // `new` checked every element against `max_string_len`,
+                // which is at most `u16::MAX`.
+                len: value.len() as u16,
+            })
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn string_bound_follows_the_message_size() {
+            assert_eq!(max_string_len(u32::MAX), u16::MAX);
+            assert_eq!(max_string_len(8192), (8192 - 23) / 2);
+        }
+    }
+}
+use wire_string::{P9Path, P9Str};
 
 fn read_u8(buf: &[u8], offset: usize) -> Result<u8, HostFsError> {
     buf.get(offset)
@@ -1890,9 +2247,11 @@ fn append_read_payload(response: &[u8], output: &mut Vec<u8>) -> Result<usize, H
 
 #[cfg(test)]
 mod tests {
+    use super::wire_string::max_string_len;
     use super::*;
     use crate::test_support::ManualClockCpu;
-    use futures_lite::future::{block_on, zip};
+    use core::pin::pin;
+    use futures_lite::future::{block_on, poll_once, zip};
 
     #[test]
     fn p9_setattr_times_uses_specific_timestamp_flags() {
@@ -1915,7 +2274,7 @@ mod tests {
         let segments = path_segments("/alpha//beta/gamma/").collect::<alloc::vec::Vec<_>>();
 
         assert_eq!(segments, ["alpha", "beta", "gamma"]);
-        assert_eq!(path_segment_count("/alpha//beta/gamma/"), 3);
+        assert_eq!(path_segments("/alpha//beta/gamma/").count(), 3);
     }
 
     #[test]
@@ -2057,6 +2416,8 @@ mod tests {
         corrupt_tag: bool,
         /// How `Treaddir` is answered, when not with an empty batch.
         readdir: ReaddirFault,
+        /// Answer every `Twalk` past this many with `Rlerror`.
+        refuse_walks_after: Option<usize>,
     }
 
     /// A misbehaving answer to `Treaddir`.
@@ -2109,11 +2470,16 @@ mod tests {
         peak_outstanding: usize,
         read_counts: Vec<u32>,
         clunked: Vec<u32>,
+        /// The type of every request, in arrival order.
+        types: Vec<u8>,
+        /// `(fid, newfid, nwname)` of every `Twalk`, in arrival order.
+        walk_requests: Vec<(u32, u32, u16)>,
     }
 
     impl ServerLog {
         /// Counts one arriving request by its message type.
         fn record(&mut self, ty: u8) {
+            self.types.push(ty);
             let counter = match ty {
                 P9_TVERSION => &mut self.versions,
                 P9_TATTACH => &mut self.attaches,
@@ -2165,6 +2531,12 @@ mod tests {
             let ty = request[4];
             let tag = u16::from_le_bytes([request[5], request[6]]);
             let body = &request[P9_HEADER_LEN..];
+            assert!(
+                request.len() <= self.inner.msize as usize,
+                "a {} byte request exceeds the {} byte msize",
+                request.len(),
+                self.inner.msize
+            );
             {
                 let mut log = self.log();
                 assert!(
@@ -2185,7 +2557,13 @@ mod tests {
                 tag
             };
             let mut reply = Vec::new();
-            if self.inner.fault.fail_type == Some(ty) {
+            let walk_refused = ty == P9_TWALK
+                && self
+                    .inner
+                    .fault
+                    .refuse_walks_after
+                    .is_some_and(|after| self.log().walks > after);
+            if self.inner.fault.fail_type == Some(ty) || walk_refused {
                 // Rlerror carries a Linux errno; ENOENT will do.
                 reply.extend_from_slice(&2_u32.to_le_bytes());
                 return frame(P9_RLERROR, reply_tag, &reply);
@@ -2201,6 +2579,11 @@ mod tests {
                 P9_TATTACH => reply.extend_from_slice(&qid(P9_QTDIR, 1)),
                 P9_TWALK => {
                     let names = u16::from_le_bytes([body[8], body[9]]);
+                    self.log().walk_requests.push((
+                        u32::from_le_bytes([body[0], body[1], body[2], body[3]]),
+                        u32::from_le_bytes([body[4], body[5], body[6], body[7]]),
+                        names,
+                    ));
                     reply.extend_from_slice(&names.to_le_bytes());
                     for index in 0..names {
                         reply.extend_from_slice(&qid(0, u64::from(index) + 2));
@@ -2464,6 +2847,174 @@ mod tests {
         );
     }
 
+    /// The `Twalk`s the server saw for a stat of a path of `depth`
+    /// single-letter components, and the session's root fid.
+    fn walks_for_depth(depth: usize) -> (u32, Vec<(u32, u32, u16)>) {
+        let client = client(P9_REQUESTED_MSIZE, FakeFault::default());
+        let transport = client.inner.transport.clone();
+        let path = (0..depth).fold(String::new(), |path, _| path + "/a");
+
+        block_on(client.stat_path_impl(&path)).expect("every step of the walk succeeds");
+
+        assert_eq!(
+            client.inner.fids.live_count(),
+            1,
+            "only the session root fid survives the stat"
+        );
+        let root = client
+            .inner
+            .session
+            .get()
+            .expect("the stat opened a session");
+        let walks = transport.log().walk_requests.clone();
+        (root.root_fid, walks)
+    }
+
+    #[test]
+    fn a_walk_past_maxwelem_is_split_across_twalks_chained_from_the_new_fid() {
+        let (root, walks) = walks_for_depth(0);
+        let target = walks[0].1;
+        assert_eq!(walks, [(root, target, 0)], "an empty path clones the root");
+
+        let (root, walks) = walks_for_depth(16);
+        let target = walks[0].1;
+        assert_eq!(walks, [(root, target, 16)], "MAXWELEM names fit one Twalk");
+
+        let (root, walks) = walks_for_depth(17);
+        let target = walks[0].1;
+        assert_eq!(walks, [(root, target, 16), (target, target, 1)]);
+
+        let (root, walks) = walks_for_depth(40);
+        let target = walks[0].1;
+        assert_eq!(
+            walks,
+            [
+                (root, target, 16),
+                (target, target, 16),
+                (target, target, 8)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_later_twalk_that_fails_clunks_the_fid_an_earlier_one_attached() {
+        let client = client(
+            P9_REQUESTED_MSIZE,
+            FakeFault {
+                refuse_walks_after: Some(1),
+                ..FakeFault::default()
+            },
+        );
+        let transport = client.inner.transport.clone();
+        let path = (0..20).fold(String::new(), |path, _| path + "/a");
+
+        block_on(client.stat_path_impl(&path)).expect_err("the second Twalk is refused");
+
+        let log = transport.log();
+        let target = log.walk_requests[0].1;
+        assert_eq!(log.walks, 2, "the refused Twalk was the second one sent");
+        assert_eq!(
+            log.clunked,
+            [target],
+            "the fid the first Twalk attached is clunked once"
+        );
+        assert_eq!(client.inner.fids.live_count(), 1);
+        assert_eq!(client.inner.tags.live_count(), 0);
+    }
+
+    #[test]
+    fn a_walk_whose_names_overflow_the_msize_is_split_by_size() {
+        let client = client(P9_MIN_MSIZE, FakeFault::default());
+        let transport = client.inner.transport.clone();
+        // Two of these fill one Twalk of the 8192-byte msize
+        // (2 * (2 + 4084) = 8172 <= 8192 - 17) and a third does not.
+        let name = "n".repeat(usize::from(max_string_len(P9_MIN_MSIZE)));
+        let path = alloc::format!("/{name}/{name}/{name}");
+
+        block_on(client.stat_path_impl(&path)).expect("the walk succeeds across two Twalks");
+
+        let log = transport.log();
+        let counts = log
+            .walk_requests
+            .iter()
+            .map(|walk| walk.2)
+            .collect::<Vec<_>>();
+        assert_eq!(counts, [2, 1]);
+    }
+
+    #[test]
+    fn a_name_the_wire_cannot_carry_is_refused_before_anything_is_sent() {
+        let client = client(P9_REQUESTED_MSIZE, FakeFault::default());
+        let transport = client.inner.transport.clone();
+        let longest = "a".repeat(usize::from(u16::MAX));
+        let too_long = "a".repeat(usize::from(u16::MAX) + 1);
+
+        block_on(client.session()).expect("the session opens");
+        let sent_by_the_handshake = transport.log().types.clone();
+        assert_eq!(sent_by_the_handshake, [P9_TVERSION, P9_TATTACH]);
+
+        // The name of a created file, a walked component, both names of
+        // a rename and a symlink's target are all string fields.
+        let results = [
+            block_on(client.create_file_impl(&alloc::format!("/dir/{too_long}"))),
+            block_on(client.create_directory_impl(&alloc::format!("/{too_long}"))),
+            block_on(client.remove_impl(&alloc::format!("/{too_long}"), false)),
+            block_on(client.stat_path_impl(&alloc::format!("/dir/{too_long}/leaf"))).map(|_| ()),
+            block_on(client.rename_impl("/a", &alloc::format!("/{too_long}"))),
+            block_on(client.rename_impl(&alloc::format!("/{too_long}/b"), "/a")),
+            block_on(client.hard_link_impl("/a", &alloc::format!("/{too_long}"))),
+            block_on(client.hard_link_impl(&alloc::format!("/{too_long}"), "/a")),
+            block_on(client.symlink_impl(&too_long, "/link")),
+            block_on(client.symlink_impl("/target", &alloc::format!("/{too_long}"))),
+        ];
+        for result in results {
+            let error = result.expect_err("a 65536-byte name cannot be encoded");
+            assert!(
+                matches!(
+                    error,
+                    HostFsError::NameTooLong {
+                        len: 65_536,
+                        max_len: 65_535
+                    }
+                ),
+                "{error:?}"
+            );
+            assert_eq!(error.kind(), HostFsErrorKind::NameTooLong);
+        }
+
+        assert_eq!(
+            transport.log().types,
+            sent_by_the_handshake,
+            "no refused name put a request on the wire"
+        );
+        assert_eq!(client.inner.fids.live_count(), 1);
+
+        // The longest name the format holds is still carried.
+        block_on(client.create_file_impl(&alloc::format!("/dir/{longest}")))
+            .expect("a 65535-byte name fits");
+        assert!(transport.log().types.contains(&P9_TLCREATE));
+    }
+
+    #[test]
+    fn a_name_is_bounded_by_the_negotiated_msize() {
+        let client = client(P9_MIN_MSIZE, FakeFault::default());
+        let transport = client.inner.transport.clone();
+        let longest = usize::from(max_string_len(P9_MIN_MSIZE));
+
+        let error =
+            block_on(client.create_file_impl(&alloc::format!("/{}", "a".repeat(longest + 1))))
+                .expect_err("the request would not fit the msize");
+        assert!(
+            matches!(error, HostFsError::NameTooLong { len, max_len } if len == longest + 1 && max_len == longest),
+            "{error:?}"
+        );
+        assert!(!transport.log().types.contains(&P9_TLCREATE));
+
+        block_on(client.create_file_impl(&alloc::format!("/{}", "a".repeat(longest))))
+            .expect("the longest name the msize allows is carried");
+        assert!(transport.log().types.contains(&P9_TLCREATE));
+    }
+
     #[test]
     fn the_negotiated_msize_bounds_every_read() {
         let granted = 16_384;
@@ -2616,6 +3167,133 @@ mod tests {
         assert_eq!(fids.live_count(), 1);
         drop(after);
         assert_eq!(fids.live_count(), 0);
+    }
+
+    #[test]
+    fn a_snapshot_hold_releases_the_root_fid_parks_operations_and_attaches_once_on_finish() {
+        let Fixture {
+            client, transport, ..
+        } = fixture(P9_REQUESTED_MSIZE, FakeFault::default());
+
+        block_on(async {
+            client.stat_path("/alpha").await.expect("stat before");
+            client.read_file("/alpha").await.expect("read before");
+            let root_fid = client
+                .inner
+                .session
+                .get()
+                .expect("the session is attached")
+                .root_fid;
+
+            let clunked_before = transport.log().clunked.len();
+            client.prepare_snapshot().await;
+            {
+                let log = transport.log();
+                assert!(
+                    log.clunked.contains(&root_fid),
+                    "the root fid is clunked, which lifts the VMM's snapshot blocker"
+                );
+                assert_eq!(
+                    log.clunked.len() - clunked_before,
+                    2,
+                    "the pooled read fid and the root fid"
+                );
+            }
+            assert_eq!(client.inner.session.get(), None);
+            assert_eq!(client.inner.fids.live_count(), 0, "no fid is left");
+
+            // Two operations issued during the hold: neither fails and
+            // neither reaches the server.
+            let walks_before = transport.log().walks;
+            let mut first = pin!(client.stat_path("/beta"));
+            let mut second = pin!(client.read_dir("/", TEST_DIR_LIMIT));
+            assert!(poll_once(first.as_mut()).await.is_none());
+            assert!(poll_once(second.as_mut()).await.is_none());
+            assert_eq!(transport.log().walks, walks_before);
+            assert_eq!(transport.log().attaches, 1, "no attach during the hold");
+
+            client.snapshot_finished();
+            let (first, second) = zip(first, second).await;
+            first.expect("the parked stat completes after the finish");
+            second.expect("the parked listing completes after the finish");
+        });
+
+        let log = transport.log();
+        assert_eq!(
+            (log.versions, log.attaches),
+            (2, 2),
+            "the session is attached exactly once more, for both parked operations"
+        );
+        drop(log);
+        assert_eq!(client.inner.fids.live_count(), 1, "only the new root fid");
+    }
+
+    #[test]
+    fn a_machine_restore_ends_a_snapshot_hold() {
+        let Fixture {
+            client, transport, ..
+        } = fixture(P9_REQUESTED_MSIZE, FakeFault::default());
+
+        block_on(async {
+            client.stat_path("/alpha").await.expect("stat before");
+            client.prepare_snapshot().await;
+            let mut parked = pin!(client.stat_path("/beta"));
+            assert!(poll_once(parked.as_mut()).await.is_none());
+
+            client
+                .after_machine_restore(HostShareRestore::SessionLost)
+                .await;
+            parked.await.expect("the parked stat completes");
+            // The source's `snapshot-finished` arriving after the restore
+            // reaction must not disturb the new session.
+            client.snapshot_finished();
+            client.stat_path("/gamma").await.expect("stat after");
+        });
+
+        let log = transport.log();
+        assert_eq!((log.versions, log.attaches), (2, 2));
+    }
+
+    #[test]
+    fn preparing_a_snapshot_waits_for_the_operation_in_flight() {
+        let Fixture {
+            client, transport, ..
+        } = fixture(P9_REQUESTED_MSIZE, FakeFault::default());
+
+        block_on(async {
+            let mut operation = pin!(client.stat_path("/alpha"));
+            assert!(
+                poll_once(operation.as_mut()).await.is_none(),
+                "the fake server answers after a yield, so the operation is in flight"
+            );
+
+            let mut prepare = pin!(client.prepare_snapshot());
+            let mut polls = 0;
+            let outcome = loop {
+                if let Some(outcome) = poll_once(operation.as_mut()).await {
+                    break outcome;
+                }
+                assert!(
+                    poll_once(prepare.as_mut()).await.is_none(),
+                    "prepare finished while an operation was still in flight"
+                );
+                assert!(
+                    !transport.log().clunked.contains(&0),
+                    "the root fid is not clunked under an operation in flight"
+                );
+                polls += 1;
+                assert!(polls < 100, "the operation never completed");
+            };
+            outcome.expect("the operation in flight completes, it is not failed");
+
+            prepare.await;
+        });
+
+        let log = transport.log();
+        assert_eq!(log.clunked.len(), 2, "the operation's fid and the root fid");
+        drop(log);
+        assert_eq!(client.inner.session.get(), None);
+        assert_eq!(client.inner.fids.live_count(), 0);
     }
 
     #[test]

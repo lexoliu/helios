@@ -44,6 +44,8 @@ pub mod programs;
 pub mod serial;
 #[cfg(feature = "settings")]
 pub mod settings;
+#[cfg(feature = "snapshot")]
+pub mod snapshot;
 #[cfg(feature = "stats")]
 pub mod stats;
 #[cfg(feature = "surface")]

@@ -1005,6 +1005,12 @@ where
 
     /// The root DRBG every instance pool is derived from.
     pub fn root_entropy(&self) -> &RootEntropy {
+        self.root_entropy_handle()
+    }
+
+    /// The shared handle to the root DRBG, cloned by a subsystem that
+    /// keeps drawing from it after construction.
+    pub fn root_entropy_handle(&self) -> &RootEntropyHandle {
         self.inner
             .root_entropy
             .get()

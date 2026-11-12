@@ -843,8 +843,10 @@ monitor socket with both guest images already built. The inspector puts
 own under `$XDG_RUNTIME_DIR` and links it as `<runtime>/sockets`; see
 `docs/debug-serial.md`.
 
-`bench-suite.yml` runs a pull request in paired mode against
-`github.event.pull_request.base.sha`, and `workflow_dispatch` takes a
+`bench-suite.yml` runs a pull request in paired mode against the `dev`
+commit it is merged against (the first parent of the merge commit the
+run checks out, not the event's `base.sha`, which is the tip `dev` had
+when the pull request was opened), and `workflow_dispatch` takes a
 `baseline_ref` input. An advisory dispatch with an explicit baseline is
 revision acceptance: it runs only `helios` and `helios_baseline`, with
 all workloads, warm iterations, before/after compute controls, and the
@@ -878,7 +880,7 @@ its warm series. Ordinary measurements isolate these listeners; explicit
 `--reuse-host-listeners` is reserved for reconnect diagnosis and marks the
 report as unsuitable for performance acceptance.
 
-The `bench-x86-64-linux` lane of `ci.yml` is unchanged except that the
+The `bench-x86-64-linux` lane of `bench-lane.yml` is unchanged except that the
 inspector now writes the host CPU model into the `run` record it emits,
 so a comparison between two of its runs can tell one machine from two.
 
