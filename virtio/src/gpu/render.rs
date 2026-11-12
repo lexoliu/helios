@@ -867,8 +867,17 @@ impl<T: VirtioTransport> VirtioGpuDevice<T> {
             });
         }
         let request = encode_set_scanout_blob(scanout, layout);
-        self.display_command(&request, RequestSubject::scanout_blob(scanout, layout.blob))
-            .await
+        // The blob replaces whatever frame buffer the scanout showed, so
+        // that one is shown no longer and may be destroyed. Nothing
+        // replays the blob itself: a device holding blobs refuses
+        // reinitialization.
+        self.acknowledged_command(
+            &request,
+            &[],
+            super::GpuChange::Scanout(scanout, None),
+            RequestSubject::scanout_blob(scanout, layout.blob),
+        )
+        .await
     }
 
     /// `RESOURCE_FLUSH` on a blob: the scanouts showing it re-read
