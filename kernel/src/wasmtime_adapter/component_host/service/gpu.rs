@@ -1278,7 +1278,7 @@ pub(crate) mod test_store {
 
     /// The serial port the fixture's writer names: the store data has
     /// to carry one, and nothing the tests do is about what it writes.
-    struct DiscardPort;
+    pub(crate) struct DiscardPort;
 
     impl helios_hal::serial::ByteSerial for DiscardPort {
         fn try_read_byte(&self) -> Option<u8> {

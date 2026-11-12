@@ -752,6 +752,19 @@ impl PhysFrameAllocator for UserMemoryPool {
         self.deallocate_bytes(ptr, frame_layout(range.frame_count));
     }
 
+    fn deallocate_reported(&self, range: PhysFrameRange) {
+        if range.is_empty() {
+            return;
+        }
+        // Marked while the run is still the caller's: once it is on a
+        // free list another processor may allocate it, and that
+        // allocation has to find the mark. The mark lives on the node
+        // the run lies on, the one `deallocate` returns it to.
+        let node = self.locality.node_of_address(range.start.phys_addr());
+        self.owning_pool(node).reported.mark(range);
+        PhysFrameAllocator::deallocate(self, range);
+    }
+
     fn stats(&self, node: NodeId) -> FrameAllocStats {
         let heap = self.stats_on(node);
         FrameAllocStats {
@@ -1658,5 +1671,45 @@ mod tests {
             node_1.total_bytes.load(Ordering::Acquire),
             before - 64 * 1024
         );
+    }
+
+    /// A run handed back through `deallocate_reported` is one whose
+    /// contents something outside the guest may have dropped, so it
+    /// carries the reported mark from the moment it is free: it counts
+    /// as reported on the node it lies on and on no other, and the next
+    /// caller to be handed it, on the uninit path included, gets zeroes.
+    #[test]
+    fn a_run_returned_reported_is_zeroed_when_it_is_handed_out_again() {
+        let (pool, ranges) = two_nodes();
+        let node = NodeId::new(1);
+        let free_before = PhysFrameAllocator::stats(&pool, node).free_frames();
+
+        let run = PhysFrameAllocator::allocate(&pool, node, 16, false).expect("a 16-frame run");
+        assert_eq!(node_of(&ranges, frame_ptr(run)), 1);
+        unsafe {
+            core::ptr::write_bytes(run.start.phys_addr() as *mut u8, 0xc3, run.byte_size());
+        }
+        PhysFrameAllocator::deallocate_reported(&pool, run);
+        let stats = PhysFrameAllocator::stats(&pool, node);
+        assert_eq!(stats.free_frames(), free_before, "the run is free again");
+        assert_eq!(stats.reported_frames, run.frame_count);
+        assert_eq!(
+            PhysFrameAllocator::stats(&pool, NodeId::new(0)).reported_frames,
+            0,
+            "the mark is kept by the node the run lies on"
+        );
+
+        let layout =
+            Layout::from_size_align(run.byte_size(), PhysFrame::SIZE).expect("frame layout");
+        let (ptr, size) = pool
+            .allocate_uninit(P1, layout)
+            .expect("the returned run is free");
+        assert_eq!(ptr.as_ptr() as usize, run.start.phys_addr());
+        assert_eq!(
+            tail_byte(ptr.as_ptr() as usize, size),
+            0,
+            "the run is zeroed on reuse"
+        );
+        assert_eq!(PhysFrameAllocator::stats(&pool, node).reported_frames, 0);
     }
 }

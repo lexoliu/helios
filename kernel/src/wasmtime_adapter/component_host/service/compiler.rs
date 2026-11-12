@@ -1,4 +1,5 @@
 use super::*;
+use crate::wasmtime_adapter::preemption::kill_or_yield;
 use crate::{RawMutex, RawMutexLease};
 use helios_compiler_abi::{CompilerStatus, OutputKind, UnknownDiscriminant};
 
@@ -75,6 +76,7 @@ pub(super) struct CompilerExports {
 
 /// The bytes the plugin counts as owned across the interface right now.
 pub(super) async fn compiler_outstanding_bytes<CpuImpl, Net, HostFs>(
+    drive: &CompilerStoreDrive<CpuImpl>,
     store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, HostFs>>,
     outstanding: &wasmtime::TypedFunc<(), i32>,
 ) -> Result<u32, ProgramExecError>
@@ -83,8 +85,8 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    outstanding
-        .call_async(&mut *store, ())
+    drive
+        .call(store, outstanding, ())
         .await
         .map(|bytes| bytes as u32)
         .map_err(map_program_runtime_error)
@@ -160,6 +162,7 @@ impl CompilerAllocations {
     /// zero-length buffer is pointer 0 and is not allocated.
     pub(super) async fn alloc<CpuImpl, Net, HostFs>(
         &mut self,
+        drive: &CompilerStoreDrive<CpuImpl>,
         store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, HostFs>>,
         alloc: &wasmtime::TypedFunc<(i32, i32), i32>,
         len: usize,
@@ -173,7 +176,7 @@ impl CompilerAllocations {
         if len == 0 {
             return Ok(0);
         }
-        let ptr = compiler_alloc(store, alloc, len, align).await?;
+        let ptr = compiler_alloc(drive, store, alloc, len, align).await?;
         self.buffers.push(PluginBuffer { ptr, len, align });
         Ok(ptr)
     }
@@ -190,6 +193,7 @@ impl CompilerAllocations {
     /// Returns every recorded buffer to the plugin.
     pub(super) async fn release<CpuImpl, Net, HostFs>(
         self,
+        drive: &CompilerStoreDrive<CpuImpl>,
         store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, HostFs>>,
         free: &wasmtime::TypedFunc<(i32, i32, i32), ()>,
     ) -> Result<(), ProgramExecError>
@@ -199,19 +203,24 @@ impl CompilerAllocations {
         HostFs: crate::HostFileSystem,
     {
         for buffer in self.buffers {
-            free.call_async(
-                &mut *store,
-                (buffer.ptr as i32, buffer.len as i32, buffer.align as i32),
-            )
-            .await
-            .map_err(map_program_runtime_error)?;
+            drive
+                .call(
+                    store,
+                    free,
+                    (buffer.ptr as i32, buffer.len as i32, buffer.align as i32),
+                )
+                .await
+                .map_err(map_program_runtime_error)?;
         }
         Ok(())
     }
 }
 
+/// What every store of one compile shares: the platform handles, the
+/// compile's instance and the plugin runtime's shared state. A worker store
+/// is built from a clone of its parent's context.
 #[derive(Clone)]
-pub(super) struct CompilerCoreStore<CpuImpl, Net, HostFs>
+pub(super) struct CompilerCompileContext<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
@@ -220,14 +229,31 @@ where
     pub(super) cpu: CpuImpl,
     pub(super) spawner: crate::Spawner<CpuImpl>,
     pub(super) runtime_state: HostRuntimeState<CpuImpl, Net, HostFs>,
-    pub(super) instance: Arc<crate::RegisteredInstance>,
+    pub(super) instance: crate::RegisteredInstance,
     pub(super) shared: Arc<CompilerCoreShared<CompilerCoreStore<CpuImpl, Net, HostFs>>>,
-    pub(super) preview1_descriptors: CompilerPreview1Descriptors,
     pub(super) write_serial: crate::DebugSerialWriter,
     pub(super) _marker: core::marker::PhantomData<fn() -> HostFs>,
 }
 
-#[derive(Clone)]
+/// One compiler store's data: the compile's context, and what belongs to
+/// this store alone and is therefore not `Clone`, its accounting and its
+/// descriptors.
+///
+/// The accounting names no owner for the user memory its turns commit: the
+/// plugin's memory belongs to the cached runtime, not to the compile's
+/// instance or to the requester, and the kernel reads it without a
+/// pre-fault, so it is never the swap policy's to evict.
+pub(super) struct CompilerCoreStore<CpuImpl, Net, HostFs>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    HostFs: crate::HostFileSystem,
+{
+    pub(super) context: CompilerCompileContext<CpuImpl, Net, HostFs>,
+    pub(super) preview1_descriptors: CompilerPreview1Descriptors,
+    activity: crate::InstanceActivity,
+}
+
 pub(super) struct CompilerPreview1Descriptors {
     pub(super) stdout_open: bool,
     pub(super) stderr_open: bool,
@@ -291,19 +317,44 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    pub(super) fn memory(&self) -> &SharedMemory {
-        &self.shared.memory
+    /// A store of `context`'s compile, with its own accounting over the
+    /// compile's instance.
+    pub(super) fn new(context: CompilerCompileContext<CpuImpl, Net, HostFs>) -> Self {
+        let activity = crate::InstanceActivity::without_memory_owner(
+            context.instance.clone(),
+            crate::store_kernel_heap_bytes(size_of::<Self>()),
+        );
+        Self {
+            context,
+            preview1_descriptors: CompilerPreview1Descriptors::new(),
+            activity,
+        }
     }
 
-    pub(super) fn record_user_ticks(&self, ticks: u64) {
-        if self.runtime_state.profiling_enabled() {
-            self.runtime_state.record_profile_stack_parts(
-                ProfileScope::User,
-                "user;",
-                self.instance.name(),
-                ticks,
-            );
-        }
+    pub(super) fn memory(&self) -> &SharedMemory {
+        &self.context.shared.memory
+    }
+
+    /// The handle the code driving this store accounts its processor
+    /// turns through. Taken before the store is borrowed for the call;
+    /// see [`crate::component::GuestTurns::drive`].
+    fn guest_turns(
+        &self,
+    ) -> crate::component::GuestTurns<CpuImpl, HostRuntimeState<CpuImpl, Net, HostFs>, ()> {
+        crate::component::GuestTurns::new(
+            self.activity.turns(),
+            self.context.cpu.clone(),
+            self.context.runtime_state.clone(),
+            (),
+        )
+    }
+
+    /// The interrupt callback: a pending kill of the compile's instance
+    /// traps, and any other interruption is the end of a time slice, on
+    /// which the store yields. It is the decision every store makes
+    /// ([`kill_or_yield`]).
+    fn on_interrupt(&self) -> wasmtime::Result<wasmtime::InterruptAction> {
+        kill_or_yield(self.activity.pending_kill())
     }
 }
 
@@ -365,7 +416,7 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    let thread_count = compiler_plugin_worker_threads(&caller.data().cpu);
+    let thread_count = compiler_plugin_worker_threads(&caller.data().context.cpu);
     let memory = caller.data().memory();
     let environ = GuestAddress::wasm32(environ);
     let pointer_status = write_u32(memory, environ, buf);
@@ -410,30 +461,80 @@ pub(super) fn write_decimal(memory: &SharedMemory, ptr: GuestAddress, mut value:
     write_shared_memory(memory, ptr, &digits[..len]).map_or(-1, |_| len as i32)
 }
 
-/// Installs the compiler store's interrupt callback and registers the
-/// store for kills, for as long as the returned registration lives.
+/// The route every call into one compiler store goes through: the store
+/// registered for kills and for the end of a time slice, whose calls are
+/// published as their processor's running store and accounted one
+/// processor turn per poll, exactly as a program's are.
 ///
-/// The compiler is never preempted: its calls are not driven through
-/// [`crate::wasmtime_adapter::preemption::StoreInterrupts::drive`], so no
-/// processor's running slot ever names it, and what interrupts it is a kill
-/// of its instance. The callback traps that kill, and resumes the compile when it
-/// finds none.
+/// Every call into a compiler store, the compile's main thread and each
+/// worker alike, is made through [`Self::call`] or [`Self::instantiate`], so
+/// the end of a processor's guest time slice makes the guest yield to the
+/// executor and a kill of the compile's instance ends the call, including
+/// one parked in `memory.atomic.wait`.
+///
+/// # Concurrency
+///
+/// Owned by the task that drives the store; see
+/// [`crate::wasmtime_adapter::preemption`] for the contract of the running
+/// slots and the kill table, and [`crate::component::GuestTurns`] for the
+/// turns. Nothing here takes a lock of its own.
+pub(super) struct CompilerStoreDrive<CpuImpl: Cpu> {
+    interrupts: crate::wasmtime_adapter::preemption::StoreInterrupts<CpuImpl>,
+}
+
+impl<CpuImpl: Cpu + Clone> CompilerStoreDrive<CpuImpl> {
+    /// Calls `func` on `store` under the drive.
+    pub(super) async fn call<Net, HostFs, Params, Results>(
+        &self,
+        store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, HostFs>>,
+        func: &wasmtime::TypedFunc<Params, Results>,
+        params: Params,
+    ) -> wasmtime::Result<Results>
+    where
+        Net: ComponentHostNetwork,
+        HostFs: crate::HostFileSystem,
+        Params: wasmtime::WasmParams + Sync,
+        Results: wasmtime::WasmResults + Sync,
+    {
+        let turns = store.data().guest_turns();
+        self.interrupts
+            .drive(turns.drive(func.call_async(&mut *store, params)))
+            .await
+    }
+
+    /// Instantiates `instance_pre` on `store` under the drive.
+    pub(super) async fn instantiate<Net, HostFs>(
+        &self,
+        store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, HostFs>>,
+        instance_pre: &InstancePre<CompilerCoreStore<CpuImpl, Net, HostFs>>,
+    ) -> wasmtime::Result<wasmtime::Instance>
+    where
+        Net: ComponentHostNetwork,
+        HostFs: crate::HostFileSystem,
+    {
+        let turns = store.data().guest_turns();
+        self.interrupts
+            .drive(turns.drive(instance_pre.instantiate_async(&mut *store)))
+            .await
+    }
+}
+
+/// Installs the compiler store's interrupt callback and registers the
+/// store for kills, for as long as the returned drive lives.
 pub(super) fn configure_compiler_core_store<CpuImpl, Net, HostFs>(
     store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, HostFs>>,
-) -> crate::wasmtime_adapter::preemption::StoreInterrupts<CpuImpl>
+) -> CompilerStoreDrive<CpuImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    store.interrupt_callback(|caller| {
-        if let Some(reason) = caller.data().instance.pending_kill() {
-            return Err(wasmtime::Error::from(crate::InstanceKilled { reason }));
-        }
-        Ok(wasmtime::InterruptAction::Continue)
-    });
-    let interrupts = store.data().shared.interrupts.clone();
-    interrupts.register(store.data().instance.id(), store, store.data().cpu.clone())
+    store.interrupt_callback(|caller| caller.data().on_interrupt());
+    let interrupts = store.data().context.shared.interrupts.clone();
+    let instance = store.data().context.instance.id();
+    CompilerStoreDrive {
+        interrupts: interrupts.register(instance, store, store.data().context.cpu.clone()),
+    }
 }
 
 pub(super) fn compiler_tls_base<CpuImpl, Net, HostFs>(
@@ -485,6 +586,7 @@ where
 }
 
 pub(super) async fn compiler_alloc<CpuImpl, Net, HostFs>(
+    drive: &CompilerStoreDrive<CpuImpl>,
     store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, HostFs>>,
     alloc: &wasmtime::TypedFunc<(i32, i32), i32>,
     len: usize,
@@ -495,8 +597,8 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    let ptr = alloc
-        .call_async(&mut *store, (len as i32, align as i32))
+    let ptr = drive
+        .call(store, alloc, (len as i32, align as i32))
         .await
         .map_err(map_program_runtime_error)?;
     if ptr == 0 {
@@ -606,10 +708,10 @@ where
         });
     }
     if !diagnostic.is_empty() {
-        store.write_serial.emit(&diagnostic);
+        store.context.write_serial.emit(&diagnostic);
     }
     phases.diagnostic_done_ns = if profile {
-        monotonic_nanos(&store.cpu)
+        monotonic_nanos(&store.context.cpu)
     } else {
         0
     };
@@ -619,7 +721,7 @@ where
         header.precompiled_len,
     )?;
     phases.response_done_ns = if profile {
-        monotonic_nanos(&store.cpu)
+        monotonic_nanos(&store.context.cpu)
     } else {
         0
     };
@@ -679,7 +781,7 @@ where
         // and this host function is synchronous, so its diagnostics go
         // to the console the way a kernel record does: handed to the
         // port's owner rather than waiting for the port.
-        caller.data().write_serial.emit(&bytes);
+        caller.data().context.write_serial.emit(&bytes);
         written = written.saturating_add(len);
     }
     write_u32(memory, GuestAddress::wasm32(nwritten), written)
@@ -819,5 +921,226 @@ mod tests {
         assert_eq!(second_wakes.count(), 1, "the first waiter is woken");
         assert_eq!(third_wakes.count(), 0, "only one waiter is woken");
         assert!(second.as_mut().poll(&mut second_context).is_ready());
+    }
+
+    type FixtureStore = CompilerCoreStore<
+        crate::test_support::TestCpu,
+        crate::test_support::TestNetworkService,
+        crate::UnsupportedHostFileSystem,
+    >;
+
+    /// A compile's context on the fixtures a kernel unit test carries, the
+    /// engine its stores run on and the interrupt routes of that engine.
+    struct CompileFixture {
+        engine: wasmtime::Engine,
+        interrupts: SharedArc<crate::wasmtime_adapter::preemption::GuestInterrupts>,
+        registry: crate::InstanceRegistry,
+        instance: crate::RegisteredInstance,
+        context: CompilerCompileContext<
+            crate::test_support::TestCpu,
+            crate::test_support::TestNetworkService,
+            crate::UnsupportedHostFileSystem,
+        >,
+    }
+
+    impl CompileFixture {
+        fn new() -> Self {
+            use crate::test_support::TestCpu;
+            use crate::wasmtime_adapter::component_host::service::test_store::DiscardPort;
+            use crate::wasmtime_adapter::engine::build_component_engine_for_platform;
+            use crate::wasmtime_adapter::preemption::GuestInterrupts;
+
+            let cpu = TestCpu::with_entropy(0x5a);
+            let engine = build_component_engine_for_platform(&cpu)
+                .expect("the component engine builds on the test platform");
+            let interrupts = SharedArc::new(GuestInterrupts::new(1, cpu.timebase()));
+            let runtime_state: HostRuntimeState<
+                TestCpu,
+                crate::test_support::TestNetworkService,
+                crate::UnsupportedHostFileSystem,
+            > = crate::RuntimeState::new(cpu.timebase(), 1, 0, crate::BootPayload::for_tests());
+            runtime_state.install_root_entropy(triomphe::Arc::new(
+                crate::RootEntropy::from_platform(
+                    &cpu,
+                    None,
+                    None,
+                    crate::MachineGeneration::new(None),
+                )
+                .expect("the fixture CPU has an entropy source"),
+            ));
+            let executor = crate::Executor::new(
+                helios_hal::watchdog::ProgressCounter::new(),
+                crate::test_support::single_node_pool(1),
+                helios_hal::cpu::ProcessorId::new(0),
+            );
+            let registry = crate::InstanceRegistry::new();
+            let instance = registry.register("compiler-plugin", 0);
+            let memory = SharedMemory::new(&engine, wasmtime::MemoryType::shared(1, 1))
+                .expect("the engine enables shared memories");
+            let shared = Arc::new(CompilerCoreShared {
+                memory,
+                entropy: Mutex::new(crate::EntropyPool::derive(runtime_state.root_entropy(), 0)),
+                instance_pre: spin::Once::new(),
+                next_thread_id: AtomicI32::new(0),
+                thread_tasks: Mutex::new(Vec::new()),
+                interrupts: interrupts.clone(),
+            });
+            let context = CompilerCompileContext {
+                cpu,
+                spawner: executor.spawner(cpu),
+                runtime_state,
+                instance: instance.clone(),
+                shared,
+                write_serial: crate::DebugSerialWriter::of::<DiscardPort>(),
+                _marker: core::marker::PhantomData,
+            };
+            Self {
+                engine,
+                interrupts,
+                registry,
+                instance,
+                context,
+            }
+        }
+
+        /// A store of the compile, registered and driven the way the
+        /// compile's main store and each worker store are.
+        fn open_store(
+            &self,
+        ) -> (
+            wasmtime::Store<FixtureStore>,
+            CompilerStoreDrive<crate::test_support::TestCpu>,
+        ) {
+            let mut store =
+                wasmtime::Store::new(&self.engine, CompilerCoreStore::new(self.context.clone()));
+            let drive = configure_compiler_core_store(&mut store);
+            (store, drive)
+        }
+    }
+
+    /// Every call into a compiler store is its processor's running store
+    /// while it is polled, which is what lets a processor's timer tick
+    /// interrupt it at the end of its slice; the store leaves the slot when
+    /// the poll returns.
+    #[test]
+    fn a_compiler_call_is_its_processors_running_store() {
+        let fixture = CompileFixture::new();
+        let (mut store, drive) = fixture.open_store();
+        let processor = helios_hal::cpu::current_processor();
+        let running_during_call = SharedArc::new(core::sync::atomic::AtomicBool::new(false));
+        let observed = running_during_call.clone();
+        let interrupts = fixture.interrupts.clone();
+        let probe = wasmtime::Func::wrap(&mut store, move || {
+            observed.store(interrupts.is_running_a_store(processor), Ordering::SeqCst);
+        })
+        .typed::<(), ()>(&store)
+        .expect("the probe is a () -> () function");
+
+        assert!(!fixture.interrupts.is_running_a_store(processor));
+        block_on(drive.call(&mut store, &probe, ())).expect("the probe returns");
+
+        assert!(
+            running_during_call.load(Ordering::SeqCst),
+            "the store is the processor's running store during its call"
+        );
+        assert!(
+            !fixture.interrupts.is_running_a_store(processor),
+            "and no longer once the call returns"
+        );
+    }
+
+    /// The end of a time slice makes a compiler store's guest yield, and a
+    /// kill traps it with the reason it was condemned for: the decision the
+    /// component store and the preview1 store make.
+    #[test]
+    fn a_compiler_interruption_without_a_kill_yields() {
+        let fixture = CompileFixture::new();
+        let (store, _drive) = fixture.open_store();
+        assert!(matches!(
+            store.data().on_interrupt(),
+            Ok(wasmtime::InterruptAction::Yield)
+        ));
+
+        for reason in [
+            crate::KillReason::OutOfMemory,
+            crate::KillReason::SupervisorRestart,
+            crate::KillReason::Operator,
+            crate::KillReason::RequesterGone,
+        ] {
+            let fixture = CompileFixture::new();
+            let (store, _drive) = fixture.open_store();
+            fixture
+                .registry
+                .request_kill(fixture.instance.id(), reason, 0);
+            let Err(error) = store.data().on_interrupt() else {
+                panic!("a condemned instance's guest traps at its next check");
+            };
+            assert_eq!(
+                error.downcast_ref::<crate::InstanceKilled>(),
+                Some(&crate::InstanceKilled { reason })
+            );
+        }
+    }
+
+    /// Records that the value holding it was dropped.
+    struct DropFlag(SharedArc<core::sync::atomic::AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A worker parked where the plugin's wait parks it, in an async host
+    /// future that nothing resolves, is ended by a kill of the compile's
+    /// instance: its turn wakes, drops the call, and the call reports the
+    /// kill. Without the drive the call stays pending for ever.
+    #[test]
+    fn a_kill_ends_a_parked_compiler_worker() {
+        let fixture = CompileFixture::new();
+        // A worker is a store of its own over the compile's instance.
+        let (mut worker, drive) = fixture.open_store();
+        let dropped = SharedArc::new(core::sync::atomic::AtomicBool::new(false));
+        let flag = dropped.clone();
+        let parked = wasmtime::Func::wrap_async(
+            &mut worker,
+            move |_: wasmtime::Caller<'_, FixtureStore>, (): ()| {
+                let guard = DropFlag(flag.clone());
+                Box::new(async move {
+                    let _guard = guard;
+                    core::future::pending::<()>().await;
+                })
+            },
+        )
+        .typed::<(), ()>(&worker)
+        .expect("the parked wait is a () -> () function");
+        let wakes = SharedArc::new(WakeCount::default());
+        let waker = Waker::from(wakes.clone());
+        let mut context = Context::from_waker(&waker);
+        let mut call = pin!(drive.call(&mut worker, &parked, ()));
+
+        assert!(call.as_mut().poll(&mut context).is_pending());
+        assert!(!dropped.load(Ordering::SeqCst));
+
+        assert_eq!(
+            fixture
+                .registry
+                .request_kill(fixture.instance.id(), crate::KillReason::Operator, 0),
+            crate::KillOutcome::Requested
+        );
+        assert_eq!(wakes.count(), 1, "the condemnation wakes the parked turn");
+        match call.as_mut().poll(&mut context) {
+            Poll::Ready(Err(error)) => assert_eq!(
+                error.downcast_ref::<crate::InstanceKilled>(),
+                Some(&crate::InstanceKilled {
+                    reason: crate::KillReason::Operator
+                })
+            ),
+            other => panic!("the kill ends the parked worker's call, got {other:?}"),
+        }
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the worker unwound past its parked host future"
+        );
     }
 }

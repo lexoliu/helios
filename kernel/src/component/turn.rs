@@ -380,6 +380,50 @@ mod tests {
         );
     }
 
+    /// A store opened without a memory owner (a compiler store) is
+    /// accounted to its instance, and its turn names no owner for the
+    /// memory it commits, nested in the turn of a store that does.
+    #[test]
+    fn a_turn_of_an_unowned_store_names_no_memory_owner() {
+        configure_user_memory_owner_processors(crate::test_support::single_node_pool(1));
+        let processor = current_processor();
+        let registry = InstanceRegistry::new();
+        let requester = registry.register("requester", 0);
+        let compiler = registry.register("compiler", 0);
+        let requester_activity = InstanceActivity::new(requester.clone(), 0);
+        let compiler_activity = InstanceActivity::without_memory_owner(compiler, 0);
+        let cpu = ManualClockCpu::new();
+        let requester_owner = MemoryOwner::new(requester.id().raw());
+
+        let compiler_turns = GuestTurns::new(
+            compiler_activity.turns(),
+            cpu.clone(),
+            TestRuntimeState::default(),
+            (),
+        );
+        let mut compiler_turns = Some(compiler_turns);
+        let call = poll_fn(move |_| {
+            assert_eq!(current_user_memory_owner(processor), requester_owner);
+            let compiler_call = poll_fn(|_| {
+                assert_eq!(current_user_memory_owner(processor), MemoryOwner::NONE);
+                Poll::Ready(Ok::<(), InstanceKilled>(()))
+            });
+            let compiler_turns = compiler_turns.take().expect("the compiler runs once");
+            let mut compiler_call = pin!(compiler_turns.drive(compiler_call));
+            assert_eq!(poll_once(compiler_call.as_mut()), Poll::Ready(Ok(())));
+            assert_eq!(current_user_memory_owner(processor), requester_owner);
+            Poll::Ready(Ok::<(), InstanceKilled>(()))
+        });
+        let turns = GuestTurns::new(
+            requester_activity.turns(),
+            cpu,
+            TestRuntimeState::default(),
+            (),
+        );
+        let mut driven = pin!(turns.drive(call));
+        assert_eq!(poll_once(driven.as_mut()), Poll::Ready(Ok(())));
+    }
+
     /// The processor's user-memory owner is the instance for the whole
     /// turn, synchronous host calls included, and whatever it was before
     /// once the turn ends. A turn of another store inside it — a host

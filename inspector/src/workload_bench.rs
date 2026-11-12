@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 use clap::{Args as ClapArgs, ValueEnum};
 use helios_inspector_protocol::RpcError;
 use helios_inspector_protocol::debugger::filesystem as debugger_fs;
-use helios_inspector_protocol::system::programs::{self as system_programs, ExecErrorKind};
+use helios_inspector_protocol::system::programs::{
+    self as system_programs, ExecErrorKind, ExecResult,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::programs::ProgramError;
@@ -440,6 +442,13 @@ pub(crate) struct WorkloadBenchCommand {
     #[arg(long)]
     pub(crate) llvm_raw_profile_output: Option<PathBuf>,
 
+    /// Diagnosis: write the guest's network counters to stderr before the
+    /// first iteration of each workload, after every iteration and after
+    /// the last. The samples are taken outside every iteration's measured interval; the JSONL on
+    /// stdout is unchanged.
+    #[arg(long)]
+    pub(crate) network_counters: bool,
+
     /// Seconds one workload iteration may take before the run fails it.
     #[arg(long, default_value_t = DEFAULT_WORKLOAD_TIMEOUT_SECONDS)]
     pub(crate) workload_timeout_seconds: u32,
@@ -517,6 +526,10 @@ pub(crate) struct VmProvenance {
     pub(crate) release: bool,
     pub(crate) smp: u16,
     pub(crate) memory: String,
+    /// How the host backed that memory: a guest whose RAM is faulted in
+    /// on first touch pays host page faults a preallocated one does not
+    /// (#491).
+    pub(crate) guest_ram: crate::vm::ResolvedGuestRam,
     pub(crate) cpu: Option<String>,
     pub(crate) accel: Vec<String>,
     /// The transport the inspector RPC that every workload is timed
@@ -552,7 +565,15 @@ enum JsonlRecord<'a> {
         headline: bool,
         runner: WorkloadRunner,
         iteration: u16,
+        /// The host-side round trip: an `Instant` around the RPC, so the
+        /// transport the RPC rode is inside it.
         elapsed_ms: f64,
+        /// The launch's own duration as the kernel measured it, from the
+        /// `exec` reply's `launch-nanos`: no transport is inside it (#491).
+        /// Absent for a workload that is not a program launch — an AOT
+        /// compile answers no `exec` reply.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        launch_elapsed_ms: Option<f64>,
         /// Secondary measurements the workload printed as `bench.<name>=<number>`.
         metrics: BTreeMap<String, f64>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -735,6 +756,10 @@ async fn measure_workload(
     vcpus: &VcpuStateCapture,
 ) -> Result<Vec<f64>, WorkloadBenchError> {
     let mut elapsed_ms = Vec::new();
+    // Untimed: both samples sit outside every iteration's interval.
+    if command.network_counters {
+        write_guest_network_counters(client, workload, "before", vcpus).await;
+    }
     for iteration in 1..=command.iterations {
         let attempt = match workload.runner {
             WorkloadRunner::Shell => {
@@ -771,14 +796,26 @@ async fn measure_workload(
         let output = match attempt {
             Ok(output) => output,
             Err(error) => {
-                write_guest_network_counters(client, workload, iteration, vcpus).await;
+                write_guest_network_counters(
+                    client,
+                    workload,
+                    &format!("iteration {iteration}"),
+                    vcpus,
+                )
+                .await;
                 return Err(error);
             }
         };
         let validation = match validate_output(workload, &output.stdout, &output.stderr) {
             Ok(validation) => validation,
             Err(source) => {
-                write_guest_network_counters(client, workload, iteration, vcpus).await;
+                write_guest_network_counters(
+                    client,
+                    workload,
+                    &format!("iteration {iteration}"),
+                    vcpus,
+                )
+                .await;
                 return Err(WorkloadBenchError::Validation {
                     workload: workload.name.clone(),
                     iteration,
@@ -794,6 +831,7 @@ async fn measure_workload(
             runner: workload.runner,
             iteration,
             elapsed_ms: output.elapsed_ms,
+            launch_elapsed_ms: output.launch_elapsed_ms,
             metrics: workload_metrics(&output)?,
             throughput_bytes: workload.throughput_bytes,
             throughput_mib_per_second: throughput_mib_per_second(
@@ -804,6 +842,20 @@ async fn measure_workload(
             stderr: stream_validation(workload, &output.stderr, workload.stderr_empty),
             validation,
         })?;
+        // Untimed: the iteration's interval closed when its runner returned
+        // (`elapsed_millis(started)`), before this request is sent.
+        if command.network_counters {
+            write_guest_network_counters(
+                client,
+                workload,
+                &format!("after iteration {iteration}"),
+                vcpus,
+            )
+            .await;
+        }
+    }
+    if command.network_counters {
+        write_guest_network_counters(client, workload, "after", vcpus).await;
     }
     Ok(elapsed_ms)
 }
@@ -811,6 +863,9 @@ async fn measure_workload(
 #[derive(Debug)]
 struct WorkloadOutput {
     elapsed_ms: f64,
+    /// The kernel's own duration of the launch, for a workload that is
+    /// one; see [`JsonlRecord::Iteration`].
+    launch_elapsed_ms: Option<f64>,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     /// Measurements the guest returned in its reply rather than printed:
@@ -909,6 +964,17 @@ async fn run_shell_workload(
         source,
     })?;
     let elapsed_ms = elapsed_millis(started);
+    launched_output(workload, elapsed_ms, output)
+}
+
+/// What one launched workload iteration produced: the host-side round
+/// trip the caller timed beside the launch duration the kernel reported,
+/// or the failure a non-zero exit is.
+fn launched_output(
+    workload: &Workload,
+    elapsed_ms: f64,
+    output: ExecResult,
+) -> Result<WorkloadOutput, WorkloadBenchError> {
     if output.exit_code != 0 {
         write_guest_output(workload, &output.output.stdout, &output.output.stderr)?;
         return Err(WorkloadBenchError::WorkloadExited {
@@ -919,6 +985,7 @@ async fn run_shell_workload(
     }
     Ok(WorkloadOutput {
         elapsed_ms,
+        launch_elapsed_ms: Some(millis_of(Duration::from_nanos(output.launch_nanos))),
         stdout: output.output.stdout,
         stderr: output.output.stderr,
         reported: BTreeMap::new(),
@@ -955,20 +1022,7 @@ async fn run_program_workload(
             source,
         })?;
     let elapsed_ms = elapsed_millis(started);
-    if output.exit_code != 0 {
-        write_guest_output(workload, &output.output.stdout, &output.output.stderr)?;
-        return Err(WorkloadBenchError::WorkloadExited {
-            workload: workload.name.clone(),
-            exit_code: output.exit_code,
-            stderr: quoted_stderr(&output.output.stderr),
-        });
-    }
-    Ok(WorkloadOutput {
-        elapsed_ms,
-        stdout: output.output.stdout,
-        stderr: output.output.stderr,
-        reported: BTreeMap::new(),
-    })
+    launched_output(workload, elapsed_ms, output)
 }
 
 async fn run_aot_workload(
@@ -1029,6 +1083,9 @@ async fn run_aot_workload(
     })?;
     Ok(WorkloadOutput {
         elapsed_ms,
+        // An AOT compile is no program launch: `programs.aot` answers no
+        // `exec` reply, so the host clock is the only one it has.
+        launch_elapsed_ms: None,
         stdout: Vec::new(),
         stderr: Vec::new(),
         // The worker count the kernel's compiler plugin ran with, which the
@@ -1432,10 +1489,9 @@ fn write_guest_output(
 async fn write_guest_network_counters(
     client: &mut crate::serial::RpcClient,
     workload: &Workload,
-    iteration: u16,
+    when: &str,
     vcpus: &VcpuStateCapture,
 ) {
-    use std::io::Write as _;
     let sample = guest_step_under_deadline(
         "network counters",
         NETWORK_COUNTER_DEADLINE_SECONDS,
@@ -1443,55 +1499,76 @@ async fn write_guest_network_counters(
         async { Ok::<_, WorkloadBenchError>(crate::system::fetch_stats(client).await?) },
     )
     .await;
-    let mut sink = std::io::stderr().lock();
-    let _ = writeln!(
-        sink,
-        "--- workload {} iteration {iteration} network counters ---",
-        workload.name
+    render_network_counters(
+        &mut std::io::stderr().lock(),
+        &workload.name,
+        when,
+        sample.map(|sample| sample.network),
     );
+}
+
+/// Writes one network-counter block. `when` names the sample's place in
+/// the run (`iteration 3`, `before`, `after`) and appears in both marker
+/// lines so a log of many blocks stays greppable.
+fn render_network_counters(
+    sink: &mut impl std::io::Write,
+    workload: &str,
+    when: &str,
+    sample: Result<Option<helios_inspector_protocol::system::stats::Network>, WorkloadBenchError>,
+) {
+    let _ = writeln!(sink, "--- workload {workload} {when} network counters ---");
     match sample {
-        Ok(sample) => match sample.network {
-            Some(network) if !network.queues.is_empty() => {
-                for queue in network.queues {
-                    let _ = writeln!(
-                        sink,
-                        "shard {} rx={} tx={} irq={} refused={} device-refused={} \
-                         sockets={} shut-sockets={} window-bytes={} queued={} ooo={} \
-                         peer-rexmit={} dup-acks={} pool-stalls={} pool-free={} acks={} \
-                         window-updates={} retransmits={}",
-                        queue.id,
-                        queue.rx_frames,
-                        queue.tx_frames,
-                        queue.interrupts,
-                        queue.rx_refused_frames,
-                        queue.rx_device_refusals,
-                        queue.tcp_sockets,
-                        queue.tcp_receive_backpressured_sockets,
-                        queue.tcp_receive_window_bytes,
-                        queue.receive_queued_bytes,
-                        queue.out_of_order_queued_bytes,
-                        queue.peer_retransmits_received,
-                        queue.duplicate_acks_requested,
-                        queue.rx_pool_stalls,
-                        queue.rx_pool_free,
-                        queue.tcp_acks_sent,
-                        queue.tcp_window_updates_sent,
-                        queue.tcp_retransmits_sent,
-                    );
-                }
+        Ok(Some(network)) if !network.queues.is_empty() => {
+            for queue in network.queues {
+                let _ = writeln!(
+                    sink,
+                    "shard {} rx={} tx={} irq={} refused={} device-refused={} \
+                     sockets={} orphan-sockets={} orphan-fin-wait-1={} orphan-fin-wait-2={} \
+                     orphan-closing={} orphan-last-ack={} orphan-time-wait={} \
+                     orphan-other-state={} orphan-retransmit-armed={} \
+                     orphan-send-queued={} shut-sockets={} \
+                     window-bytes={} queued={} ooo={} peer-rexmit={} dup-acks={} \
+                     pool-stalls={} pool-free={} acks={} window-updates={} retransmits={}",
+                    queue.id,
+                    queue.rx_frames,
+                    queue.tx_frames,
+                    queue.interrupts,
+                    queue.rx_refused_frames,
+                    queue.rx_device_refusals,
+                    queue.tcp_sockets,
+                    queue.tcp_orphan_sockets,
+                    queue.tcp_orphan_fin_wait_1,
+                    queue.tcp_orphan_fin_wait_2,
+                    queue.tcp_orphan_closing,
+                    queue.tcp_orphan_last_ack,
+                    queue.tcp_orphan_time_wait,
+                    queue.tcp_orphan_other_state,
+                    queue.tcp_orphan_retransmit_armed,
+                    queue.tcp_orphan_send_queued_bytes,
+                    queue.tcp_receive_backpressured_sockets,
+                    queue.tcp_receive_window_bytes,
+                    queue.receive_queued_bytes,
+                    queue.out_of_order_queued_bytes,
+                    queue.peer_retransmits_received,
+                    queue.duplicate_acks_requested,
+                    queue.rx_pool_stalls,
+                    queue.rx_pool_free,
+                    queue.tcp_acks_sent,
+                    queue.tcp_window_updates_sent,
+                    queue.tcp_retransmits_sent,
+                );
             }
-            Some(_) | None => {
-                let _ = writeln!(sink, "the guest reports no network device");
-            }
-        },
+        }
+        Ok(Some(_) | None) => {
+            let _ = writeln!(sink, "the guest reports no network device");
+        }
         Err(error) => {
             let _ = writeln!(sink, "the guest did not answer: {error}");
         }
     }
     let _ = writeln!(
         sink,
-        "--- end of workload {} iteration {iteration} network counters ---",
-        workload.name
+        "--- end of workload {workload} {when} network counters ---"
     );
 }
 
@@ -1622,6 +1699,7 @@ mod tests {
             user_profile_output: None,
             perf_metrics_output: None,
             llvm_raw_profile_output: None,
+            network_counters: false,
             workload_timeout_seconds: DEFAULT_WORKLOAD_TIMEOUT_SECONDS,
         };
         let workloads = select_workloads(&command).expect("manifest must parse");
@@ -1687,6 +1765,7 @@ mod tests {
             user_profile_output: None,
             perf_metrics_output: None,
             llvm_raw_profile_output: None,
+            network_counters: false,
             workload_timeout_seconds: DEFAULT_WORKLOAD_TIMEOUT_SECONDS,
         };
         let workloads = select_workloads(&command).expect("manifest must parse");
@@ -1695,6 +1774,73 @@ mod tests {
                 .iter()
                 .all(|workload| workload.class == WorkloadClass::Net)
         );
+    }
+
+    #[derive(clap::Parser)]
+    struct ParseWorkloadBench {
+        #[command(flatten)]
+        command: WorkloadBenchCommand,
+    }
+
+    #[test]
+    fn network_counters_flag_is_off_unless_given() {
+        use clap::Parser as _;
+        let off = ParseWorkloadBench::try_parse_from(["workload-bench"]).expect("defaults parse");
+        assert!(!off.command.network_counters);
+        let on = ParseWorkloadBench::try_parse_from(["workload-bench", "--network-counters"])
+            .expect("the flag parses");
+        assert!(on.command.network_counters);
+    }
+
+    #[test]
+    fn network_counter_block_names_workload_and_moment_and_carries_orphans() {
+        use helios_inspector_protocol::system::stats::{Network, NetworkQueue};
+        let queue = NetworkQueue {
+            id: 3,
+            rx_frames: 0,
+            tx_frames: 0,
+            interrupts: 0,
+            rx_refused_frames: 0,
+            rx_device_refusals: 0,
+            tcp_acks_sent: 0,
+            tcp_window_updates_sent: 0,
+            tcp_retransmits_sent: 0,
+            tcp_sockets: 9,
+            tcp_orphan_sockets: 7,
+            tcp_orphan_send_queued_bytes: 123_456,
+            tcp_orphan_fin_wait_1: 1,
+            tcp_orphan_fin_wait_2: 2,
+            tcp_orphan_closing: 3,
+            tcp_orphan_last_ack: 4,
+            tcp_orphan_time_wait: 5,
+            tcp_orphan_other_state: 6,
+            tcp_orphan_retransmit_armed: 8,
+            tcp_receive_backpressured_sockets: 0,
+            tcp_receive_window_bytes: 0,
+            receive_queued_bytes: 0,
+            out_of_order_queued_bytes: 0,
+            peer_retransmits_received: 0,
+            duplicate_acks_requested: 0,
+            rx_pool_stalls: 0,
+            rx_pool_free: 0,
+        };
+        let mut block = Vec::new();
+        render_network_counters(
+            &mut block,
+            "tcp-upload",
+            "before",
+            Ok(Some(Network {
+                queues: vec![queue],
+            })),
+        );
+        let block = String::from_utf8(block).expect("the block is text");
+        assert!(block.starts_with("--- workload tcp-upload before network counters ---\n"));
+        assert!(block.contains(
+            "sockets=9 orphan-sockets=7 orphan-fin-wait-1=1 orphan-fin-wait-2=2 \
+             orphan-closing=3 orphan-last-ack=4 orphan-time-wait=5 orphan-other-state=6 \
+             orphan-retransmit-armed=8 orphan-send-queued=123456 "
+        ));
+        assert!(block.ends_with("--- end of workload tcp-upload before network counters ---\n"));
     }
 
     #[test]
@@ -1719,6 +1865,7 @@ mod tests {
             user_profile_output: None,
             perf_metrics_output: None,
             llvm_raw_profile_output: None,
+            network_counters: false,
             workload_timeout_seconds: DEFAULT_WORKLOAD_TIMEOUT_SECONDS,
         };
         let workloads = select_workloads(&command).expect("manifest must parse");
@@ -1760,6 +1907,7 @@ mod tests {
     fn reported_metrics_join_the_printed_ones_and_never_replace_them() {
         let output = |stdout: &[u8]| WorkloadOutput {
             elapsed_ms: 1.0,
+            launch_elapsed_ms: None,
             stdout: stdout.to_vec(),
             stderr: Vec::new(),
             reported: BTreeMap::from([(COMPILER_WORKERS_METRIC.to_owned(), 3.0)]),
@@ -1802,6 +1950,7 @@ mod tests {
             user_profile_output: None,
             perf_metrics_output: None,
             llvm_raw_profile_output: None,
+            network_counters: false,
             workload_timeout_seconds,
         }
     }
@@ -1892,6 +2041,7 @@ mod tests {
             &vcpus,
             std::future::ready(Ok(WorkloadOutput {
                 elapsed_ms: 24.375,
+                launch_elapsed_ms: Some(21.5),
                 stdout: b"process-startup:ok\n".to_vec(),
                 stderr: Vec::new(),
                 reported: BTreeMap::new(),
@@ -1923,6 +2073,7 @@ mod tests {
             runner: WorkloadRunner::Shell,
             iteration: 2,
             elapsed_ms: 30.125_5,
+            launch_elapsed_ms: None,
             metrics: BTreeMap::new(),
             throughput_bytes: None,
             throughput_mib_per_second: None,
@@ -1947,6 +2098,76 @@ mod tests {
             encoded.contains("\"elapsed_ms\":30.1255"),
             "the record must carry the fractional milliseconds, got {encoded}"
         );
+    }
+
+    /// A launched iteration carries both clocks: the host-side round
+    /// trip it timed, and the kernel's own launch duration from the
+    /// `exec` reply, in milliseconds (#491).
+    #[test]
+    fn a_launched_iteration_records_the_kernels_launch_duration() {
+        let workload = timeout_test_workload("process-startup");
+        let output = launched_output(
+            &workload,
+            31.25,
+            ExecResult {
+                instance_id: 7,
+                exit_code: 0,
+                output: system_programs::ExecOutput {
+                    stdout: b"process-startup:ok\n".to_vec(),
+                    stderr: Vec::new(),
+                },
+                launch_nanos: 8_312_500,
+            },
+        )
+        .expect("a zero exit is an iteration");
+        assert_eq!(output.elapsed_ms, 31.25);
+        assert_eq!(output.launch_elapsed_ms, Some(8.3125));
+
+        let record = JsonlRecord::Iteration {
+            workload: "process-startup",
+            class: WorkloadClass::Startup,
+            headline: true,
+            runner: WorkloadRunner::Program,
+            iteration: 2,
+            elapsed_ms: output.elapsed_ms,
+            launch_elapsed_ms: output.launch_elapsed_ms,
+            metrics: BTreeMap::new(),
+            throughput_bytes: None,
+            throughput_mib_per_second: None,
+            stdout: stream_validation(&workload, &output.stdout, false),
+            stderr: stream_validation(&workload, &output.stderr, false),
+            validation: ValidationSummary { ok: true },
+        };
+        let encoded: serde_json::Value =
+            serde_json::to_value(&record).expect("the record must serialise");
+        assert_eq!(encoded["elapsed_ms"], 31.25);
+        assert_eq!(encoded["launch_elapsed_ms"], 8.3125);
+    }
+
+    /// An iteration that is no program launch keeps only the host clock:
+    /// the record leaves the launch field out rather than inventing one.
+    #[test]
+    fn an_iteration_without_a_launch_omits_the_launch_clock() {
+        let workload = timeout_test_workload("aot-curl");
+        let record = JsonlRecord::Iteration {
+            workload: "aot-curl",
+            class: WorkloadClass::Compute,
+            headline: false,
+            runner: WorkloadRunner::HeliosAot,
+            iteration: 1,
+            elapsed_ms: 90.5,
+            launch_elapsed_ms: None,
+            metrics: BTreeMap::new(),
+            throughput_bytes: None,
+            throughput_mib_per_second: None,
+            stdout: stream_validation(&workload, &[], false),
+            stderr: stream_validation(&workload, &[], false),
+            validation: ValidationSummary { ok: true },
+        };
+        let encoded: serde_json::Value =
+            serde_json::to_value(&record).expect("the record must serialise");
+        assert_eq!(encoded["elapsed_ms"], 90.5);
+        assert!(encoded.get("launch_elapsed_ms").is_none(), "got {encoded}");
     }
 
     /// The median of an even sample is the mean of the two middle values,

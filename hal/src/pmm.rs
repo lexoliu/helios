@@ -126,9 +126,10 @@ pub struct FrameAllocStats {
     /// Largest contiguous free run, in frames. Used by the kernel
     /// pressure monitor to decide when to invoke compaction.
     pub largest_free_run: usize,
-    /// Free frames currently shown to a free-page consumer through
-    /// [`PhysFrameAllocator::free_runs`]. They are still the guest's to
-    /// allocate; their contents are not.
+    /// Free frames marked *reported*: shown to a free-page consumer
+    /// through [`PhysFrameAllocator::free_runs`], or returned through
+    /// [`PhysFrameAllocator::deallocate_reported`]. They are still the
+    /// guest's to allocate; their contents are not.
     pub reported_frames: usize,
 }
 
@@ -220,6 +221,29 @@ pub trait PhysFrameAllocator: Send + Sync + 'static {
     /// TLB shootdown has completed. Returning a still-mapped frame is a
     /// use-after-free.
     fn deallocate(&self, range: PhysFrameRange);
+
+    /// Return frames to the node they came from already marked
+    /// *reported*.
+    ///
+    /// [`PhysFrameAllocator::deallocate`] returns frames whose contents
+    /// are still what the guest wrote. This returns frames whose contents
+    /// the guest can no longer vouch for, because something outside it
+    /// held them and was entitled to discard them — a host that took
+    /// them through a memory balloon and then forgot it had them. They
+    /// carry the same mark as a run [`PhysFrameAllocator::free_runs`]
+    /// visited: a later [`PhysFrameAllocator::allocate`] of any of them
+    /// zeroes it whatever the caller asked for, and until then they count
+    /// in [`FrameAllocStats::reported_frames`].
+    ///
+    /// Concurrency: callable from any processor, like every method here.
+    /// The mark is set while the caller still owns the frames and before
+    /// they reach a free list, so no allocation on another processor can
+    /// be handed one of them unmarked.
+    ///
+    /// # Safety contract (logical, not `unsafe`)
+    /// The one [`PhysFrameAllocator::deallocate`] states: no live mapping
+    /// references any frame in `range`.
+    fn deallocate_reported(&self, range: PhysFrameRange);
 
     fn stats(&self, node: NodeId) -> FrameAllocStats;
 }

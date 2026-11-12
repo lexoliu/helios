@@ -851,7 +851,9 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
                 entropy::install(&kernel, &entropy, root_entropy.clone());
                 interrupts.attach_entropy(entropy);
             }
-            if let Some(balloon) = balloon::install(&kernel, &fdt) {
+            if let Some(balloon) =
+                balloon::install(&kernel, &fdt, debug_state.machine_generation_handle())
+            {
                 debug_state.install_memory_balloon(balloon.handle.clone());
                 interrupts.attach_balloon(balloon);
             }

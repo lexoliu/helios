@@ -1,64 +1,5 @@
 use super::*;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum DhcpClientState {
-    Init {
-        transaction_id: u32,
-    },
-    Selecting {
-        transaction_id: u32,
-        last_sent: StackInstant,
-    },
-    Requesting {
-        transaction_id: u32,
-        requested_ip: Ipv4Address,
-        server_identifier: Ipv4Address,
-        last_sent: StackInstant,
-    },
-    /// INIT-REBOOT (RFC 2131 section 3.2): the interface holds an
-    /// address from before a machine restore and has asked any server
-    /// on the link to confirm it.
-    Rebooting {
-        transaction_id: u32,
-        requested_ip: Ipv4Address,
-        /// REQUESTs sent so far, the first included.
-        attempts: u32,
-        last_sent: StackInstant,
-    },
-    Bound,
-}
-
-impl DhcpClientState {
-    /// Whether `message` is a reply to the request this client has
-    /// outstanding.
-    ///
-    /// RFC 2131 §4.3.2 and §4.4.1 (table 4) make DHCPACK and DHCPNAK
-    /// meaningful only in REQUESTING, RENEWING, REBINDING and REBOOTING,
-    /// and require a client to discard a message whose `xid` is not its
-    /// own; §3.1 has the selected server alone answer the REQUEST, and a
-    /// server's NAK carries its server identifier (§4.3.2, table 3).
-    /// This client has no RENEWING or REBINDING state (a lease is never
-    /// renewed). `Requesting` accepts a reply from the server it
-    /// selected. `Rebooting` selected none: its INIT-REBOOT REQUEST
-    /// carries no server identifier and any server on the link may
-    /// confirm or refuse the address (§3.2, §4.3.2), so the `xid` alone
-    /// decides. `Bound` never accepts one.
-    pub(super) fn accepts_reply(&self, message: &DhcpServerMessage) -> bool {
-        match *self {
-            Self::Requesting {
-                transaction_id,
-                server_identifier,
-                ..
-            } => {
-                message.transaction_id == transaction_id
-                    && message.server_identifier == Some(server_identifier)
-            }
-            Self::Rebooting { transaction_id, .. } => message.transaction_id == transaction_id,
-            Self::Init { .. } | Self::Selecting { .. } | Self::Bound => false,
-        }
-    }
-}
-
 impl<CpuImpl, DeviceImpl> NetworkService<CpuImpl, DeviceImpl>
 where
     CpuImpl: Cpu + Clone,
@@ -306,25 +247,22 @@ where
     /// message. Live TCP is left alone: a connection keeps working if
     /// the lease is confirmed. Resolves once the REQUEST has
     /// been handed to the device; the packet pumps carry the exchange
-    /// on from there.
+    /// on from there, retransmitting it on the client's own deadline.
     pub(super) async fn revalidate_lease(&self) {
         let now_nanos = self.now_nanos();
         let transaction_id = next_transaction_id(now_nanos as u32);
-        let sent = self
-            .inner
-            .state
-            .shard_for_default()
-            .lock()
-            .begin_lease_revalidation(transaction_id, StackInstant::from_nanos(now_nanos));
-        match sent {
-            Ok(true) => {
-                tracing::info!("machine restored: re-validating the DHCP lease");
-                if let Err(error) = self.drive_network(NetworkPollSource::Configuration).await {
-                    tracing::warn!(?error, "the lease re-validation could not be sent");
-                }
-            }
-            Ok(false) => {}
-            Err(error) => tracing::warn!(?error, "the lease re-validation could not be built"),
+        let begun = self.inner.state.with_mut(|state| {
+            state.begin_lease_revalidation(transaction_id, StackInstant::from_nanos(now_nanos))
+        });
+        if !begun {
+            return;
+        }
+        tracing::info!("machine restored: re-validating the DHCP lease");
+        // The configuration duty runs the client, which queues the
+        // REQUEST that is due, and submitting it puts it on the device.
+        self.drive_interface_configuration();
+        if let Err(error) = self.drive_network(NetworkPollSource::Configuration).await {
+            tracing::warn!(?error, "the lease re-validation could not be sent");
         }
     }
 
@@ -343,29 +281,29 @@ where
                 .await
                 .map_err(|_| NetworkControlError::BackendFault)?;
             let now = StackInstant::from_nanos(self.now_nanos());
-            let next = self.inner.state.with_mut(|state| {
-                state.drive_dhcp(now)?;
-                if state.is_configured() {
+            let (next, drive) = self.inner.state.with_mut(|state| {
+                let drive = state.drive_dhcp(now);
+                if drive.lease_changed || state.is_configured() {
                     self.inner.control.publish_from_shard(state);
                 }
-                Ok(state.stack.primary_ipv4_address().map(map_ipv4_cidr))
-            })?;
-            if let Some(cidr) = next {
+                (state.stack.primary_ipv4_address().map(map_ipv4_cidr), drive)
+            });
+            if drive.lease_changed || next.is_some() {
                 self.synchronize_control_plane();
+            }
+            drive.result?;
+            if let Some(cidr) = next {
                 return Ok(cidr);
             }
             self.drive_network(NetworkPollSource::Configuration)
                 .await
                 .map_err(|_| NetworkControlError::BackendFault)?;
             // This walk has no caller deadline of its own; a dropped
-            // DISCOVER is retried at the client's retransmission
-            // interval, and an offer that lands sooner wakes it through
+            // DISCOVER is retried when the client's next deadline
+            // passes, and an offer that lands sooner wakes it through
             // the shard.
-            self.wait_for_shard_progress(
-                wait,
-                self.progress_wait(Duration::from_nanos(DHCP_RETRANSMIT_NANOS)),
-            )
-            .await;
+            self.wait_for_shard_progress(wait, self.progress_wait(self.configuration_wait()))
+                .await;
         }
     }
 }
@@ -851,8 +789,38 @@ where
     }
 }
 
+/// What one [`NetworkShard::drive_dhcp`] did.
+#[must_use]
+pub(super) struct DhcpDrive {
+    /// Whether the drive installed or removed a lease on the shard,
+    /// which is when the control plane has to be told: an address
+    /// installed has to reach it, and an address removed has to leave
+    /// it, or the next `synchronize_shard` puts the old one back. It is
+    /// reported even when a later step failed, because the shard has
+    /// already changed.
+    pub(super) lease_changed: bool,
+    /// The first step that failed. The drive stops there, and the next
+    /// one takes up the messages and deadlines it left.
+    pub(super) result: Result<(), NetworkControlError>,
+}
+
 impl NetworkShard {
-    pub(super) fn drive_dhcp(&mut self, now: StackInstant) -> Result<(), NetworkControlError> {
+    /// Hands the DHCP client every server message that has arrived and
+    /// whatever is due at `now`, and applies what it asks for.
+    pub(super) fn drive_dhcp(&mut self, now: StackInstant) -> DhcpDrive {
+        let mut lease_changed = false;
+        let result = self.run_dhcp(now, &mut lease_changed);
+        DhcpDrive {
+            lease_changed,
+            result,
+        }
+    }
+
+    fn run_dhcp(
+        &mut self,
+        now: StackInstant,
+        lease_changed: &mut bool,
+    ) -> Result<(), NetworkControlError> {
         let socket = self.internal_udp_socket(INTERNAL_DHCP_SOCKET_INDEX, DHCP_CLIENT_PORT);
         while let Some(datagram) = self
             .stack
@@ -864,186 +832,139 @@ impl NetworkShard {
             else {
                 continue;
             };
-            match (self.dhcp, message.message_type) {
-                (DhcpClientState::Selecting { transaction_id, .. }, DhcpMessageType::Offer)
-                    if message.transaction_id == transaction_id =>
-                {
-                    let server_identifier = message
-                        .server_identifier
-                        .ok_or(NetworkControlError::BackendFault)?;
-                    self.send_dhcp_request(
-                        transaction_id,
-                        message.your_ip,
-                        server_identifier,
-                        now,
-                    )?;
-                    self.dhcp = DhcpClientState::Requesting {
-                        transaction_id,
-                        requested_ip: message.your_ip,
-                        server_identifier,
-                        last_sent: now,
-                    };
+            let action = self.dhcp.on_message(now, &message);
+            self.apply_dhcp_action(action, now, lease_changed)?;
+        }
+        // A step that moves the client on can owe a message at once: the
+        // DISCOVER after a lease was removed, say. It is asked until it
+        // has nothing due.
+        loop {
+            let action = self.dhcp.poll(now);
+            if action == DhcpAction::None {
+                return Ok(());
+            }
+            self.apply_dhcp_action(action, now, lease_changed)?;
+        }
+    }
+
+    /// Does what the DHCP client asked for, and records in
+    /// `lease_changed` when that touched the lease this shard holds.
+    fn apply_dhcp_action(
+        &mut self,
+        action: DhcpAction,
+        now: StackInstant,
+        lease_changed: &mut bool,
+    ) -> Result<(), NetworkControlError> {
+        match action {
+            DhcpAction::None => Ok(()),
+            DhcpAction::Send(transmit) => self.send_dhcp_transmit(transmit, now),
+            DhcpAction::Install { lease, replaces } => {
+                *lease_changed = true;
+                if let Some(replaced) = replaces {
+                    self.remove_dhcp_lease(&replaced);
                 }
-                (DhcpClientState::Requesting { .. }, DhcpMessageType::Ack)
-                    if self.dhcp.accepts_reply(&message) =>
-                {
-                    self.bind_lease(message)?;
+                if let Err(error) = self.install_dhcp_lease(&lease) {
+                    // Whatever part of the lease went in comes back out,
+                    // and the client, which believes itself bound, is
+                    // told it holds nothing and starts over.
+                    self.remove_dhcp_lease(&lease);
+                    self.dhcp.lease_not_installed(now);
+                    return Err(error);
                 }
-                (DhcpClientState::Rebooting { requested_ip, .. }, DhcpMessageType::Ack)
-                    if self.dhcp.accepts_reply(&message) =>
-                {
-                    if message.your_ip != requested_ip {
-                        // The server granted another address: the one
-                        // held from before the restore is not ours.
-                        self.stack.clear_ipv4_addresses();
-                    }
-                    self.bind_lease(message)?;
-                }
-                // A refused INIT-REBOOT means the address held from
-                // before the restore is not ours (RFC 2131 §3.2, step 3).
-                (
-                    DhcpClientState::Requesting { .. } | DhcpClientState::Rebooting { .. },
-                    DhcpMessageType::Nak,
-                ) if self.dhcp.accepts_reply(&message) => {
-                    self.stack.clear_ipv4_addresses();
-                    self.dhcp = DhcpClientState::Init {
-                        transaction_id: next_transaction_id(message.transaction_id),
-                    };
-                }
-                (state, message_type) => {
-                    tracing::debug!(
-                        ?state,
-                        ?message_type,
-                        transaction_id = message.transaction_id,
-                        "dropped DHCP message that is not a reply to the outstanding exchange"
-                    );
-                }
+                Ok(())
+            }
+            DhcpAction::Remove(lease) => {
+                *lease_changed = true;
+                self.remove_dhcp_lease(&lease);
+                Ok(())
             }
         }
+    }
 
-        if let DhcpClientState::Init { transaction_id } = self.dhcp {
-            self.send_dhcp_discover(transaction_id, now)?;
-            self.dhcp = DhcpClientState::Selecting {
-                transaction_id,
-                last_sent: now,
-            };
-        } else {
-            self.retransmit_dhcp(now)?;
+    /// Configures what a lease names: its address with the connected
+    /// route that comes with it, its default route and its resolvers.
+    fn install_dhcp_lease(&mut self, lease: &DhcpLease) -> Result<(), NetworkControlError> {
+        self.stack
+            .add_ipv4_address(lease.address)
+            .map_err(|_| NetworkControlError::InvalidAddress)?;
+        if let Some(router) = lease.router {
+            self.set_default_ipv4_gateway(map_ipv4_address(router))?;
         }
+        self.dns_servers = lease.dns_servers.clone();
         Ok(())
     }
 
-    /// Applies an ACK: the address, gateway and resolvers it carries
-    /// become the interface's configuration, and the client is bound.
-    fn bind_lease(&mut self, message: DhcpServerMessage) -> Result<(), NetworkControlError> {
-        let prefix_len = message
-            .subnet_mask
-            .map(ipv4_mask_prefix_len)
-            .transpose()?
-            .ok_or(NetworkControlError::InvalidAddress)?;
-        self.stack
-            .add_ipv4_address(Ipv4Cidr::new(message.your_ip, prefix_len))
-            .map_err(|_| NetworkControlError::InvalidAddress)?;
-        if let Some(router) = message.router {
-            self.set_default_ipv4_gateway(map_ipv4_address(router))?;
+    /// Takes back what a lease configured: its address with the
+    /// connected route that came with it, its default route and its
+    /// resolvers. Addresses and routes somebody else configured stay.
+    fn remove_dhcp_lease(&mut self, lease: &DhcpLease) {
+        self.stack.remove_ipv4_address(lease.address);
+        if let Some(router) = lease.router {
+            self.stack.routes_mut().remove(Route {
+                destination: IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::UNSPECIFIED, 0)),
+                gateway: Some(IpAddress::Ipv4(router)),
+                expires_at: None,
+            });
         }
         self.dns_servers.clear();
-        self.dns_servers.extend(message.dns_servers);
-        self.dhcp = DhcpClientState::Bound;
-        Ok(())
     }
 
     /// Starts INIT-REBOOT for the lease the interface holds, after a
     /// machine restore that may have moved it to another network.
     ///
-    /// Returns whether a question was sent: only a client that is bound
-    /// holds a lease to ask about, and one that is not has an exchange
+    /// Returns whether a question was begun: only a client that holds a
+    /// lease has one to ask about, and one that does not has an exchange
     /// of its own under way, which already asks the link for an address.
-    /// The address stays in use until the server answers or the retries
-    /// run out ([`DHCP_REBOOT_ATTEMPTS`]).
+    /// The REQUEST itself leaves with the next DHCP drive, which also
+    /// retransmits it and, when nobody answers, ends the lease; the
+    /// address stays in use until then.
     pub(super) fn begin_lease_revalidation(
         &mut self,
         transaction_id: u32,
         now: StackInstant,
-    ) -> Result<bool, NetworkControlError> {
-        if self.dhcp != DhcpClientState::Bound {
-            return Ok(false);
-        }
-        let Some(lease) = self.stack.primary_ipv4_address() else {
-            return Ok(false);
-        };
-        let requested_ip = lease.address();
-        self.send_dhcp_init_reboot(transaction_id, requested_ip, now)?;
-        self.dhcp = DhcpClientState::Rebooting {
-            transaction_id,
-            requested_ip,
-            attempts: 1,
-            last_sent: now,
-        };
-        Ok(true)
+    ) -> bool {
+        self.dhcp.revalidate(now, transaction_id)
     }
 
-    pub(super) fn send_dhcp_init_reboot(
+    /// Queues one client message, and tells the client when a unicast
+    /// one could not leave yet because the server's hardware address is
+    /// still being resolved: the ARP request went out in its place.
+    fn send_dhcp_transmit(
         &mut self,
-        transaction_id: u32,
-        requested_ip: Ipv4Address,
+        transmit: DhcpTransmit,
         now: StackInstant,
     ) -> Result<(), NetworkControlError> {
-        let message =
-            DhcpClientMessage::init_reboot(transaction_id, self.stack.config().mac, requested_ip);
-        self.send_dhcp_message(message, transaction_id as u16, now)
-    }
-
-    pub(super) fn send_dhcp_discover(
-        &mut self,
-        transaction_id: u32,
-        now: StackInstant,
-    ) -> Result<(), NetworkControlError> {
-        let message = DhcpClientMessage::discover(transaction_id, self.stack.config().mac);
-        self.send_dhcp_message(message, transaction_id as u16, now)
-    }
-
-    pub(super) fn send_dhcp_request(
-        &mut self,
-        transaction_id: u32,
-        requested_ip: Ipv4Address,
-        server_identifier: Ipv4Address,
-        now: StackInstant,
-    ) -> Result<(), NetworkControlError> {
-        let message = DhcpClientMessage::request(
-            transaction_id,
-            self.stack.config().mac,
-            requested_ip,
-            server_identifier,
-        );
-        self.send_dhcp_message(message, transaction_id as u16, now)
-    }
-
-    pub(super) fn send_dhcp_message(
-        &mut self,
-        message: DhcpClientMessage,
-        identification: u16,
-        now: StackInstant,
-    ) -> Result<(), NetworkControlError> {
+        let DhcpTransmit {
+            message,
+            destination,
+        } = transmit;
         let mut payload = [0u8; 548];
         let len = message
             .encode(&mut payload)
             .ok_or(NetworkControlError::BackendFault)?;
-        self.stack
+        let destination_address = match destination {
+            DhcpDestination::Broadcast => Ipv4Address::BROADCAST,
+            DhcpDestination::Server(server) => server,
+        };
+        let queued = self
+            .stack
             .send_udp_ipv4_from(
-                Ipv4Address::UNSPECIFIED,
-                Ipv4Address::BROADCAST,
+                message.client_ip,
+                destination_address,
                 UdpEgress {
                     source_port: DHCP_CLIENT_PORT,
                     destination_port: DHCP_SERVER_PORT,
                     payload: &payload[..len],
                     hop_limit: DEFAULT_HOP_LIMIT,
                 },
-                identification,
+                message.transaction_id as u16,
                 now,
             )
-            .map(|_| ())
-            .map_err(|_| NetworkControlError::BackendFault)
+            .map_err(|_| NetworkControlError::BackendFault)?;
+        if queued == 0 {
+            self.dhcp.retry_unresolved(now);
+        }
+        Ok(())
     }
 
     /// Identifier for the next echo exchange this shard starts, drawn

@@ -9,6 +9,7 @@
 
 use std::fmt;
 
+use super::ResolvedGuestRam;
 use super::qemu::QemuOptions;
 use super::qmp::{SizeError, parse_size};
 
@@ -132,13 +133,17 @@ impl NumaMachine {
     }
 
     /// Every QEMU argument after `-smp`, in the order they are passed.
-    pub(crate) fn arguments(&self) -> Vec<String> {
+    ///
+    /// The nodes' backends are the machine's whole RAM, so each is backed
+    /// the way `guest_ram` asks.
+    pub(crate) fn arguments(&self, guest_ram: ResolvedGuestRam) -> Vec<String> {
         let mut arguments = Vec::new();
         for node in 0..self.nodes {
             let mut backend = QemuOptions::new("memory-backend-ram");
             backend
                 .set("id", backend_id(node))
                 .set("size", ByteSize(self.node_bytes));
+            guest_ram.populate(&mut backend);
             arguments.push("-object".to_owned());
             arguments.push(backend.to_string());
         }
@@ -234,7 +239,9 @@ impl fmt::Display for ByteSize {
 
 #[cfg(test)]
 mod tests {
-    use super::{NumaError, NumaMachine};
+    use std::num::NonZeroUsize;
+
+    use super::{NumaError, NumaMachine, ResolvedGuestRam};
 
     fn two_node(distance: Option<u8>) -> NumaMachine {
         NumaMachine::resolve(Some(2), distance, 4, "2G")
@@ -247,7 +254,7 @@ mod tests {
         let machine = two_node(Some(20));
         assert_eq!(machine.smp(), "4,sockets=2,cores=2,threads=1");
         assert_eq!(
-            machine.arguments(),
+            machine.arguments(ResolvedGuestRam::Lazy),
             [
                 "-object",
                 "memory-backend-ram,id=helios-node0,size=1G",
@@ -268,13 +275,12 @@ mod tests {
     #[test]
     fn no_distance_emits_no_table() {
         let machine = two_node(None);
+        let arguments = machine.arguments(ResolvedGuestRam::Lazy);
         assert!(
-            machine
-                .arguments()
+            arguments
                 .iter()
                 .all(|argument| !argument.starts_with("dist")),
-            "{:?}",
-            machine.arguments()
+            "{arguments:?}"
         );
     }
 
@@ -284,7 +290,7 @@ mod tests {
             .expect("three nodes divide six processors and 3G")
             .expect("a node count is a machine");
         let pairs: Vec<_> = machine
-            .arguments()
+            .arguments(ResolvedGuestRam::Lazy)
             .into_iter()
             .filter(|argument| argument.starts_with("dist"))
             .collect();
@@ -299,8 +305,29 @@ mod tests {
             .expect("a node count is a machine");
         assert!(
             machine
-                .arguments()
+                .arguments(ResolvedGuestRam::Lazy)
                 .contains(&"memory-backend-ram,id=helios-node0,size=768M".to_owned())
+        );
+    }
+
+    /// The node backends are the machine's whole RAM, so a preallocated
+    /// backing is set on every one of them.
+    #[test]
+    fn preallocated_guest_ram_backs_every_node() {
+        let guest_ram = ResolvedGuestRam::Prealloc {
+            prealloc_threads: NonZeroUsize::new(8).expect("eight is non-zero"),
+        };
+        let backends: Vec<_> = two_node(None)
+            .arguments(guest_ram)
+            .into_iter()
+            .filter(|argument| argument.starts_with("memory-backend-ram"))
+            .collect();
+        assert_eq!(
+            backends,
+            [
+                "memory-backend-ram,id=helios-node0,size=1G,prealloc=on,prealloc-threads=8",
+                "memory-backend-ram,id=helios-node1,size=1G,prealloc=on,prealloc-threads=8",
+            ]
         );
     }
 
