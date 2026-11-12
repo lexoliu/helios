@@ -1,4 +1,4 @@
-//! The first program the kernel runs.
+//! Brings up a process tree from the boot image's configuration.
 //!
 //! Init mounts what the boot image's `/etc/fstab` names, lists the root
 //! and every mount it made, prints `/init.txt`, and runs `/etc/rc` with
