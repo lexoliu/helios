@@ -1266,7 +1266,6 @@ pub(crate) mod test_store {
     use crate::gpu::Gpu3dService;
     use crate::isa::GuestIsa;
     use crate::test_support::{TestCpu, TestNetworkService};
-    use crate::wasmtime_adapter::wasi::DebugFileSystem;
     use crate::{
         Executor, InstanceRegistry, ProcessAuthority, TaskFunding, UnsupportedHostFileSystem,
     };
@@ -1385,7 +1384,7 @@ pub(crate) mod test_store {
             registry,
             instance,
             None,
-            DebugFileSystem::new(runtime_state),
+            runtime_state.root_namespace().descend(),
             Vec::new(),
             Vec::new(),
             authority,

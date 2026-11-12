@@ -18,7 +18,6 @@ publish = false
 
 [workspace.dependencies]
 helios-hal = { path = "hal" }
-helios-api = { path = "api" }
 helios-artifact = { path = "artifact" }
 helios-compiler-abi = { path = "compiler-abi" }
 helios-compiler-support = { path = "compiler-support" }
@@ -34,7 +33,6 @@ helios-virtio = { path = "virtio" }
 helios-workspace-root = { path = "workspace-root" }
 helios-x86 = { path = "x86" }
 i6300esb = { path = "i6300esb" }
-helios = { path = "." }
 crossbeam-utils = { version = "0.8.23", default-features = false }
 tracing = { version = "0.1.44",  default-features = false }
 wit-bindgen = { version = "0.61.1", default-features = false }
