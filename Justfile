@@ -82,6 +82,7 @@ clippy-host:
         --exclude helios-oob-load --exclude helios-perf \
         --exclude helios-ping --exclude helios-procbench \
         --exclude helios-sched-tasks --exclude helios-surface-test \
+        --exclude helios-sysctl \
         -- -D warnings
 
 # Clippy each guest program on its own, denying warnings.
@@ -94,7 +95,7 @@ clippy-programs:
     for package in helios-audio-test helios-compositor helios-date helios-debugger helios-display-test helios-gpu-test \
         helios-http-client \
         helios-init helios-input-test helios-oob-load helios-perf helios-ping \
-        helios-procbench helios-sched-tasks helios-surface-test; do
+        helios-procbench helios-sched-tasks helios-surface-test helios-sysctl; do
         cargo clippy -p "${package}" --all-targets -- -D warnings
     done
 
@@ -119,6 +120,9 @@ test-units:
     # capture check that links it.
     cargo nextest run -p helios-compositor-render -p helios-desktop-text-check
     cargo nextest run -p helios-inspector-protocol --lib
+    # A guest program's pure parts (argument and value parsing, output
+    # lines) run on the host.
+    cargo nextest run -p helios-sysctl
     # The host tools: QEMU arguments, network plans, the image audit, the
     # signature trailer, the profile store, the root keypair.
     cargo nextest run -p helios-inspector -p helios-artifact -p helios-profdata -p helios-cli -p helios-compiler-support
