@@ -38,6 +38,30 @@
 //!   host share, network), one for the entropy reseed task. Both are
 //!   level-triggered, so a burst of advances is one wake, and the consumer
 //!   reads [`MachineGeneration::current`] after waking.
+//!
+//! # Device resets
+//!
+//! A device that was reset and brought back by its driver has forgotten
+//! state a kernel service keeps elsewhere: the 9p server its session, the
+//! balloon the frames it was given. That is not a generation advance —
+//! nothing was duplicated, and no random stream needs a rekey — but its
+//! consumers are the same reactions task, so the machine generation
+//! records it beside the advances.
+//!
+//! - [`MachineGeneration::record_device_reset`] is one `Release`
+//!   increment of that device's reset count, then the reactions
+//!   [`Notify`]; it takes no lock and is callable from any processor and
+//!   any context. Its caller is whoever re-initialised the device, which
+//!   does so on one processor while the machine is frozen.
+//! - [`MachineGeneration::device_resets`] is one `Acquire` load per
+//!   device: lock-free, for a service that must not talk to a device it
+//!   has not yet resynchronised with.
+//! - The counts live in their own cache-padded block, written only by a
+//!   recording processor, rarely, so a draw's block is never invalidated
+//!   by one.
+//! - The counts only increase, so a consumer compares them with the ones
+//!   it last handled, exactly as it does the generation, and a burst of
+//!   resets is one wake and one reaction.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -88,6 +112,51 @@ impl AdvanceCause {
     }
 }
 
+/// A device whose reset a kernel service reacts to beyond its driver.
+///
+/// Only devices that leave state behind in the kernel are named: every
+/// other driver restores what its device lost on its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResetDevice {
+    /// The virtio 9p device carrying the host share. Its server has
+    /// forgotten the session and every fid in it.
+    HostShare,
+    /// The memory balloon. It holds no frame the guest inflated into it
+    /// and remembers no free page the guest reported.
+    MemoryBalloon,
+}
+
+/// How many times each [`ResetDevice`] has been reset since boot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeviceResets {
+    pub host_share: u64,
+    pub memory_balloon: u64,
+}
+
+impl DeviceResets {
+    /// The counts a machine boots with.
+    pub const BOOT: Self = Self {
+        host_share: 0,
+        memory_balloon: 0,
+    };
+}
+
+/// Written by a processor recording a reset, read by the reactions task
+/// and the balloon service.
+struct DeviceResetWords {
+    host_share: AtomicU64,
+    memory_balloon: AtomicU64,
+}
+
+impl DeviceResetWords {
+    fn count(&self, device: ResetDevice) -> &AtomicU64 {
+        match device {
+            ResetDevice::HostShare => &self.host_share,
+            ResetDevice::MemoryBalloon => &self.memory_balloon,
+        }
+    }
+}
+
 /// Written by the processor holding the advance lock, read by every draw.
 struct GenerationWords {
     counter: AtomicU64,
@@ -116,11 +185,14 @@ pub struct UnhandledAdvances {
     /// The kernel restored itself from a hibernate image since the last
     /// call, whatever advanced the generation after that.
     pub image_restored: bool,
+    /// Every device reset recorded so far.
+    pub device_resets: DeviceResets,
 }
 
 pub struct MachineGeneration {
     window: Option<GenerationIdWindow>,
     words: CachePadded<GenerationWords>,
+    resets: CachePadded<DeviceResetWords>,
     advance_lock: IrqSafeMutex<LatestAdvance>,
     reactions: Notify,
     entropy_wake: Notify,
@@ -142,6 +214,10 @@ impl MachineGeneration {
                 counter: AtomicU64::new(0),
                 seen_low: AtomicU64::new(low),
                 seen_high: AtomicU64::new(high),
+            }),
+            resets: CachePadded::new(DeviceResetWords {
+                host_share: AtomicU64::new(0),
+                memory_balloon: AtomicU64::new(0),
             }),
             advance_lock: IrqSafeMutex::new(LatestAdvance {
                 cause: [0; 16],
@@ -219,7 +295,29 @@ impl MachineGeneration {
         self.advance_lock.with(|latest| UnhandledAdvances {
             generation: self.current(),
             image_restored: core::mem::take(&mut latest.image_restored_unhandled),
+            device_resets: self.device_resets(),
         })
+    }
+
+    /// Records that `device` was reset and brought back, and wakes the
+    /// reactions task.
+    ///
+    /// Called by whatever re-initialised the device, with the proof its
+    /// driver returned, before the machine thaws: a service that reads
+    /// [`Self::device_resets`] before it next talks to the device then
+    /// sees the reset before anything it sends could reach the device
+    /// that forgot.
+    pub fn record_device_reset(&self, device: ResetDevice) {
+        self.resets.count(device).fetch_add(1, Ordering::Release);
+        self.reactions.notify_one_coalesced();
+    }
+
+    /// Every device reset recorded so far.
+    pub fn device_resets(&self) -> DeviceResets {
+        DeviceResets {
+            host_share: self.resets.host_share.load(Ordering::Acquire),
+            memory_balloon: self.resets.memory_balloon.load(Ordering::Acquire),
+        }
     }
 
     /// Completes when the machine generation has advanced since the
@@ -381,5 +479,39 @@ mod tests {
         assert_eq!(reactions.as_mut().poll(&mut context), Poll::Ready(()));
         let mut entropy = pin!(generation.entropy_wake().notified());
         assert_eq!(entropy.as_mut().poll(&mut context), Poll::Ready(()));
+    }
+
+    /// A device reset is counted and wakes the reactions, but nothing
+    /// was duplicated: the generation stays and no random stream rekeys.
+    #[test]
+    fn a_device_reset_wakes_the_reactions_and_advances_nothing() {
+        use core::future::Future;
+        use core::pin::pin;
+        use core::task::{Context, Poll, Waker};
+
+        use super::{DeviceResets, ResetDevice};
+
+        let generation = MachineGeneration::new(None);
+        generation.record_device_reset(ResetDevice::MemoryBalloon);
+        generation.record_device_reset(ResetDevice::MemoryBalloon);
+        generation.record_device_reset(ResetDevice::HostShare);
+
+        let mut context = Context::from_waker(Waker::noop());
+        let mut reactions = pin!(generation.reactions().notified());
+        assert_eq!(reactions.as_mut().poll(&mut context), Poll::Ready(()));
+        let mut entropy = pin!(generation.entropy_wake().notified());
+        assert_eq!(entropy.as_mut().poll(&mut context), Poll::Pending);
+
+        let pending = generation.take_unhandled();
+        assert_eq!(pending.generation, Generation::BOOT);
+        assert!(!pending.image_restored);
+        assert_eq!(
+            pending.device_resets,
+            DeviceResets {
+                host_share: 1,
+                memory_balloon: 2,
+            }
+        );
+        assert_eq!(generation.device_resets(), pending.device_resets);
     }
 }

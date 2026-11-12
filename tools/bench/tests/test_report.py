@@ -90,7 +90,7 @@ def test_failure_records_become_failed_cells(tmp_path, baseline_report: Report) 
         ' "error": "TcpErrorKind::Timeout: TCP read timed out"}\n',
         encoding="utf-8",
     )
-    raw = read_side_jsonl(path, warmup_discard=1)
+    raw = read_side_jsonl(path, Side.HELIOS, "vsock", warmup_discard=1)
     assert raw.cells["tcp-throughput"].failure == "TcpErrorKind::Timeout: TCP read timed out"
     assert raw.cells["tcp-throughput"].iterations == []
 
@@ -124,6 +124,20 @@ def test_a_report_written_before_the_rpc_transport_was_recorded_still_loads(
     loaded = load_report(path)
     assert loaded.pins.rpc_transport is None
     assert "inspector RPC over `unrecorded`" in render_pins(loaded)
+
+
+def test_a_report_written_before_matched_metrics_was_recorded_still_loads(
+    tmp_path: Path, baseline_report: Report
+) -> None:
+    """A baseline run's report may predate the field (#849): it reads as having none."""
+    path = tmp_path / "report.json"
+    save_report(baseline_report, path)
+    raw = json.loads(path.read_text())
+    for workload in raw["workloads"]:
+        workload.pop("matched_metrics", None)
+    path.write_text(json.dumps(raw))
+    loaded = load_report(path)
+    assert all(workload.matched_metrics == () for workload in loaded.workloads)
 
 
 AOT_CURL = {

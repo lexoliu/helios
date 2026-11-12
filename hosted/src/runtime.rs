@@ -10,6 +10,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase};
 use helios_hal::memory::MemoryRegion;
 use helios_hal::{DeviceInventory, DmaModel, Platform, ProcessorStartupPolicy, ProcessorTopology};
+use helios_kernel::Timer;
 
 use crate::config::HostedConfig;
 use crate::console::HostedConsole;
@@ -153,6 +154,15 @@ pub(crate) struct HostedMachine {
 struct ProcessorSlot {
     thread: OnceLock<Thread>,
     started: AtomicBool,
+    /// This processor's kernel timer, published once its own
+    /// `helios_kernel::init` has run, so the timer interrupt can advance
+    /// it.
+    timer: OnceLock<Timer<HostedCpu>>,
+    /// Set by the timer thread when this processor's deadline has
+    /// passed, before it unparks the processor: the timer interrupt this
+    /// processor has not yet taken. The processor takes it where it
+    /// wakes from [`HostedCpu::park_current`].
+    timer_interrupt_pending: AtomicBool,
 }
 
 struct HeapReservation {
@@ -272,6 +282,33 @@ impl HostedMachine {
         }
     }
 
+    pub(crate) fn install_timer(&self, processor: ProcessorId, timer: Timer<HostedCpu>) {
+        self.slot(processor).timer.set(timer).unwrap_or_else(|_| {
+            panic!(
+                "processor {} timer was installed more than once",
+                processor.id()
+            )
+        });
+    }
+
+    /// Runs the timer's interrupt step on `processor` if its deadline has
+    /// passed since it last took one, the way a bare-metal backend's timer
+    /// interrupt handler does. Called on that processor's own thread.
+    pub(crate) fn take_timer_interrupt(&self, processor: ProcessorId) {
+        let slot = self.slot(processor);
+        if slot.timer_interrupt_pending.swap(false, Ordering::AcqRel) {
+            slot.timer
+                .get()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "processor {} timer interrupted before the kernel timer was installed",
+                        processor.id()
+                    )
+                })
+                .handle_interrupt();
+        }
+    }
+
     pub(crate) fn set_deadline(&self, processor: ProcessorId, deadline: Instant) {
         let _ = self.timer_tx.send(TimerCommand {
             processor,
@@ -341,6 +378,7 @@ fn spawn_processor_thread(
                 .with_dma_model(DmaModel::Translated)
                 .with_devices(devices);
             let kernel = helios_kernel::init(platform);
+            cpu.install_timer(kernel.timer());
             let debug_state = shared_debug_state(&machine);
             if processor == machine.bootstrap_processor() {
                 init_serial();
@@ -449,6 +487,8 @@ impl ProcessorSlot {
         Self {
             thread: OnceLock::new(),
             started: AtomicBool::new(false),
+            timer: OnceLock::new(),
+            timer_interrupt_pending: AtomicBool::new(false),
         }
     }
 }
@@ -511,7 +551,15 @@ fn fire_expired_deadlines(machine: &HostedMachine, deadlines: &mut [Option<Insta
             && d <= now
         {
             *deadline = None;
-            machine.wake_processor(ProcessorId::new(slot as u16));
+            let processor = ProcessorId::new(slot as u16);
+            // Published before the unpark: the unpark's token outlives a
+            // processor that is not parked yet, so the park it reaches
+            // returns at once and finds the flag.
+            machine
+                .slot(processor)
+                .timer_interrupt_pending
+                .store(true, Ordering::Release);
+            machine.wake_processor(processor);
         }
     }
 }
