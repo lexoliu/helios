@@ -1006,10 +1006,14 @@ where
                         }
                     };
                     let finished_ns = crate::monotonic_nanos(&store.data().context.cpu);
-                    if let Err(error) = result {
+                    // A trap here is the compile's: the other stores are told
+                    // by the condemnation, and the requester gets this error.
+                    let trap = result.err().and_then(|error| {
                         tracing::error!(thread_id, "compiler plugin thread failed: {error:#}");
-                    }
+                        store.data().context.condemn_for_store_end(error)
+                    });
                     CompilerThreadReport {
+                        trap,
                         thread_id,
                         processor,
                         spawned_ns,
