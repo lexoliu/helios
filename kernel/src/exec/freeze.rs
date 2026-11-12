@@ -140,6 +140,7 @@ use core::time::Duration;
 use crossbeam_utils::CachePadded;
 use helios_hal::cpu::{Cpu, ProcessorId, current_processor};
 use helios_hal::critical_section::LocalInterruptsMasked;
+use helios_hal::watchdog::{NoWatchdog, Watchdog};
 use triomphe::Arc as NoWeakArc;
 
 use crate::exec::executor::{Executor, ExecutorGroup};
@@ -384,8 +385,19 @@ impl<CpuImpl: Cpu + Clone> Drop for Hold<CpuImpl> {
 /// value is `!Send` and the work done while it is held is synchronous:
 /// the freezer's processor polls no task but the one that holds it, so
 /// that task must not yield.
+///
+/// # The hardware watchdog
+///
+/// The kernel's watchdog supervisor is a task, and no task but the
+/// holder's runs while the machine is frozen, so the watchdog is not
+/// petted for as long as the machine is held. A holder that keeps the
+/// machine frozen for longer than the watchdog's timeout (writing a
+/// hibernation image of a large guest is the case) must pet it with
+/// [`FrozenMachine::pet_watchdog`], the operation the supervisor
+/// performs, at least once per timeout, or the hardware resets the
+/// machine.
 #[must_use = "the machine stays frozen until this is dropped"]
-pub struct FrozenMachine<CpuImpl: Cpu + Clone> {
+pub struct FrozenMachine<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog = NoWatchdog> {
     // Field order is the thaw order: the secondaries are released first,
     // and this processor's mask is lifted last.
     _hold: Hold<CpuImpl>,
@@ -393,20 +405,28 @@ pub struct FrozenMachine<CpuImpl: Cpu + Clone> {
     /// The mask is this processor's register state, whatever a backend's
     /// own type for it says.
     _processor_local: PhantomData<*mut ()>,
+    watchdog: WatchdogImpl,
 }
 
-impl<CpuImpl: Cpu + Clone> FrozenMachine<CpuImpl> {
+impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog> FrozenMachine<CpuImpl, WatchdogImpl> {
     /// Releases every processor and lifts this processor's mask.
     pub fn thaw(self) {
         drop(self);
+    }
+
+    /// Pets the hardware watchdog, as the kernel's watchdog supervisor
+    /// does while the machine runs. See the type's documentation.
+    pub fn pet_watchdog(&self) {
+        self.watchdog.pet();
     }
 }
 
 impl Executor {
     /// Freezes every processor at a scheduler boundary.
     ///
-    /// `timer` is this processor's, `arrival_deadline` is how long the
-    /// caller lets the other processors take to reach a boundary, and
+    /// `timer` is this processor's, `watchdog` is the one the answer lets
+    /// its holder pet, `arrival_deadline` is how long the caller lets the
+    /// other processors take to reach a boundary, and
     /// `interrupt_guests` asks the runtime that runs guests to end the
     /// time slice of each guest that is running now (it is how a
     /// processor inside wasm reaches a boundary before its slice ends).
@@ -421,12 +441,13 @@ impl Executor {
     ///
     /// The future is `!Send`: it records the processor it first runs on
     /// as the freezer, and runs only there.
-    pub async fn freeze<CpuImpl: Cpu + Clone>(
+    pub async fn freeze<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog>(
         &self,
         timer: &Timer<CpuImpl>,
+        watchdog: WatchdogImpl,
         arrival_deadline: Duration,
         interrupt_guests: impl FnOnce(),
-    ) -> Result<FrozenMachine<CpuImpl>, FreezeError> {
+    ) -> Result<FrozenMachine<CpuImpl, WatchdogImpl>, FreezeError> {
         // Held for the whole future, and moved into the answer at its
         // end, so that the future is `!Send` (a value that nothing uses
         // later is not kept across an await, and would not count): the
@@ -508,6 +529,7 @@ impl Executor {
             _hold: hold,
             _mask: mask,
             _processor_local: processor_local,
+            watchdog,
         })
     }
 

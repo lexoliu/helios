@@ -912,14 +912,20 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> Kernel<CpuImpl, Watch
     /// so a processor inside wasm reaches a boundary at its next check
     /// and not at the end of its slice. The concurrency contract, and
     /// what the caller may do while the machine is held, are in
-    /// `exec::freeze`.
+    /// `exec::freeze`. The answer pets this kernel's hardware watchdog on
+    /// request, which a hold longer than the watchdog's timeout needs.
     pub async fn freeze(
         &self,
         arrival_deadline: Duration,
         interrupt_guests: impl FnOnce(),
-    ) -> Result<FrozenMachine<CpuImpl>, FreezeError> {
+    ) -> Result<FrozenMachine<CpuImpl, WatchdogImpl>, FreezeError> {
         self.executor
-            .freeze(&self.timer, arrival_deadline, interrupt_guests)
+            .freeze(
+                &self.timer,
+                self.watchdog.clone(),
+                arrival_deadline,
+                interrupt_guests,
+            )
             .await
     }
 
