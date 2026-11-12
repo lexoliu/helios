@@ -28,6 +28,9 @@
 //! | [`DmaArena::reserve`] | task context | The arena's `grow` async mutex, which is the only writer of the chunk map and of the chunk headers. |
 //! | [`DmaArena::retire_empty`] | the maintenance task | `grow.lock().await`; a `swap` of each empty-set word (AcqRel); a CAS of the chunk's state word (Acquire); the chunk map store (Release); [`ChunkDomain::unmap`]; the source's take-back (the pool's IRQ-safe lock). No await inside the guard. |
 //! | release of `grow` | whoever held it | The gated wake: the lock is released, then a `SeqCst` fence, a relaxed load of `starved`, and the `swap` winner raises the space signal. An allocation whose own lend the source refused releases without it: the wake would only reach that allocator, whose own `want_space` set the flag, and consume the flag it is about to park on. |
+//! | fragment allocation (an allocation of a request class under one page) | task context, the executing processor's row | One CAS on that processor's row (`frags`), which only that processor's tasks and the detach write, so it is uncontended except against a detach. A new run is claimed like any run of pages, then installed over the row by a Release CAS. |
+//! | fragment free (the drop of an [`ArenaBuffer`] that is a fragment) | any processor, task context or interrupt handler | No lock. One `fetch_sub(1, AcqRel)` of its run's count in the chunk header; the subtraction that reaches zero frees the run's pages as a page free does (bitmap, state word, the gated wake). Wait-free. |
+//! | detach of an idle run (first step of [`DmaArena::retire_empty`]) | the maintenance task, under `grow` | A load of the row (Acquire), a load of the run's count (Acquire), a CAS of the row to empty (Acquire), then `fetch_sub(unspent, AcqRel)` of the count. |
 //! | a refused lend inside an allocation | the allocating task | A Release `fetch_or` of the class's bit in `refused`, then the growth policy's kick ([`ChunkGrowth::refused`], one interrupt-safe signal for [`Elastic`]). |
 //! | [`DmaArenas::grow_refused`] | the maintenance task | [`ChunkSource::want_chunk`] first (arm), then for each arena that has a bit set: `grow.lock().await`, an AcqRel `swap` of `refused`, one growth per set class. The pass samples the demand signal ([`DmaArenas::demand_mark`]) before it reads the bits. |
 //!
@@ -55,6 +58,29 @@
 //! and its class is part of the state word, so an allocator that read the
 //! chunk before it was reused for another class fails its CAS.
 //!
+//! # Fragments
+//!
+//! An allocation of a request class ([`ChunkClass::Read`] or
+//! [`ChunkClass::ReadWrite`]) under one page, aligned to at most a page,
+//! is a **fragment**: it is carved from a **run** of [`FRAGMENT_RUN_PAGES`]
+//! pages that the executing processor caches in its row of `frags`, one row
+//! per class. The row is one word packing the run (chunk slot and run
+//! index), the byte offset the next fragment starts after, and the bias the
+//! row still holds (see [`RunRow`]); a carve is one CAS of that word. A run
+//! is claimed from the chunks like a run of pages, so it is a run of pages
+//! for the bitmap, the state word and the retirement CAS, and a chunk that
+//! caches a run is in use. A page or more takes the page path and never
+//! touches a row. So does an allocation under a page when its row needs a
+//! new run and no chunk has one free whole: it takes a free page, and the
+//! arena grows for a run only when no page is free either. A fragment is
+//! zeroed by [`DmaArena::allocate`] for its length only.
+//!
+//! Each run has a count in its chunk header, out of band like the bitmap
+//! (see [`Chunk`]'s `fragment_refs`). Whoever drops the count to zero frees
+//! the run's pages. [`DmaArena::retire_empty`] first detaches the rows
+//! whose run has no outstanding fragment, because a cached run would
+//! otherwise pin its chunk for as long as its processor stays idle.
+//!
 //! # Waiting for space
 //!
 //! A caller refused with [`DmaError::Exhausted`] calls
@@ -78,7 +104,14 @@
 //! processors that allocate from the chunk (usually one, through its hint)
 //! and by whichever processor frees into it. Each processor's allocation
 //! hints sit on a line of their own and are written only by tasks running
-//! on that processor. The published chunk count and the growth counters
+//! on that processor. So are its fragment rows, one padded block for both
+//! classes: a row is written by the tasks running on its processor (a
+//! carve, a new run), by the maintenance task's detach, and by the arena's
+//! drop. A run's count is written by the processor that starts the run, by
+//! whichever processor drops one of its fragments, and by the detach; the
+//! counts of one chunk share lines, because they are out of band and
+//! neighbouring runs are rarely dropped at the same time. The published
+//! chunk count and the growth counters
 //! share one line and are written only under `grow`, by whichever task
 //! holds it. A chunk map leaf is written only under `grow` too, and read
 //! by every processor that resolves an address.
@@ -136,6 +169,50 @@ const CLASS_SHIFT: u32 = 34;
 
 /// The class bits of a chunk's state word.
 const CLASS_MASK: u64 = 0b11 << CLASS_SHIFT;
+
+/// Pages in one fragment run: 32 KiB, Linux's `PAGE_FRAG_CACHE_MAX_SIZE`.
+/// A chunk smaller than this has one run of the whole chunk.
+const FRAGMENT_RUN_PAGES: usize = 8;
+
+/// Bytes in a run of [`FRAGMENT_RUN_PAGES`] pages, the longest a run is.
+const FRAGMENT_RUN_BYTES: usize = FRAGMENT_RUN_PAGES * PAGE_BYTES;
+
+/// The count a run starts with, and so the bias its row holds: more than
+/// the most fragments a run can carve. Each fragment spends one unit; the
+/// units still held are the row's, and are given up when the row lets go
+/// of the run.
+const BIAS: u32 = 1 << 16;
+
+// A fragment is at least a byte, so a run carves at most
+// `FRAGMENT_RUN_BYTES` of them, and a row never spends its last unit: it
+// always holds at least one, and a live row is never the empty word.
+const _: () = assert!((FRAGMENT_RUN_BYTES as u64) < BIAS as u64);
+
+/// Bits of a row for the bias still held: `BIAS` itself must be
+/// representable.
+const HELD_BITS: u32 = BIAS.ilog2() + 1;
+
+/// Bits of a row for the byte offset inside the run: the offset after the
+/// last carve is `FRAGMENT_RUN_BYTES`, which must be representable.
+const OFFSET_BITS: u32 = FRAGMENT_RUN_BYTES.ilog2() + 1;
+
+/// Bits of a row for the chunk slot: slots are below [`MAX_CHUNKS`].
+const SLOT_BITS: u32 = (MAX_CHUNKS - 1).ilog2() + 1;
+
+/// Bits of a row for the run index: what is left of the word. It bounds a
+/// chunk to [`MAX_RUNS_PER_CHUNK`] runs, 128 MiB of 32 KiB runs.
+const RUN_BITS: u32 = u64::BITS - HELD_BITS - OFFSET_BITS - SLOT_BITS;
+
+/// Runs a chunk may have, which a row's run index can name.
+const MAX_RUNS_PER_CHUNK: usize = 1 << RUN_BITS;
+
+const OFFSET_SHIFT: u32 = HELD_BITS;
+const RUN_SHIFT: u32 = OFFSET_SHIFT + OFFSET_BITS;
+const SLOT_SHIFT: u32 = RUN_SHIFT + RUN_BITS;
+
+/// Request classes that cache fragments: [`ChunkClass::Read`] and
+/// [`ChunkClass::ReadWrite`].
+const FRAGMENT_CLASSES: usize = 2;
 
 /// A block of memory lent to an arena.
 ///
@@ -313,6 +390,16 @@ impl ChunkClass {
         }
     }
 
+    /// The class's place in a processor's fragment rows, or `None` for the
+    /// class that serves whole pages only.
+    const fn fragment_index(self) -> Option<usize> {
+        match self {
+            Self::Resident => None,
+            Self::Read => Some(0),
+            Self::ReadWrite => Some(1),
+        }
+    }
+
     /// The class in its place in a chunk's state word.
     const fn state_bits(self) -> u64 {
         (self.index() as u64) << CLASS_SHIFT
@@ -346,7 +433,8 @@ pub struct ArenaStats {
     pub chunks_by_class: [usize; ChunkClass::COUNT],
     /// Pages in all of them.
     pub pages: usize,
-    /// Pages handed out and not yet freed.
+    /// Pages handed out and not yet freed. A run a processor caches for
+    /// fragments counts whole until its row lets go of it.
     pub pages_in_use: usize,
     /// Chunks with no page in use.
     pub empty_chunks: usize,
@@ -419,6 +507,55 @@ struct Chunk {
     /// The arena's space waiters, which a free checks after it gives its
     /// pages back.
     waiters: NonNull<SpaceWaiters>,
+    /// Pages in one fragment run of this chunk: [`FRAGMENT_RUN_PAGES`], or
+    /// the whole chunk when it is smaller.
+    run_pages: u32,
+    /// One count for each place a fragment run can start, indexed by the
+    /// run's first page divided by `run_pages`. Out of band, like the
+    /// bitmap. A count is meaningful while its run is claimed in the
+    /// bitmap and is zero otherwise.
+    ///
+    /// The count of a run is the units its row still holds plus the
+    /// fragments not yet dropped. Starting the run stores [`BIAS`], all of it
+    /// the row's. A carve moves one unit from the row to the fragment and
+    /// does not touch the count. A fragment's drop subtracts 1
+    /// (`fetch_sub`, AcqRel). When the row lets go of the run, which it
+    /// does by one CAS of the row, whoever won that CAS subtracts the units
+    /// it saw the row still hold (`fetch_sub`, AcqRel): the detach, or the
+    /// owner when it replaces a run that cannot take the next fragment.
+    /// Whichever subtraction finds the count equal to what it subtracts is
+    /// the one that reached zero, and frees the run's pages as a page free
+    /// does.
+    ///
+    /// Why exactly one subtraction frees the run, and none too early. Let
+    /// `H` be the units the row holds (zero once it let go) and `F` the
+    /// fragments outstanding. The count is `H + F` at every instant except
+    /// between a row's CAS and its subtraction, when it is larger by the
+    /// units about to go, never smaller: the CAS comes first, so no instant
+    /// undercounts. A carve needs the row to hold at least two units and
+    /// leaves one, so while the row holds the run `H >= 1` and the count is
+    /// at least 1; a fragment's drop therefore cannot reach zero while the
+    /// row holds the run, and nobody frees it early. The row lets go once
+    /// for each time the run was installed in it, because the CAS that
+    /// replaces its word is the only way a word leaves and the word names
+    /// exactly the units that installation holds (a later installation of
+    /// the same run that happens to make an equal word holds units of its
+    /// own, which the equal word names as well), so the units are
+    /// subtracted once. After that `H` is zero and the count is `F`; no
+    /// fragment is carved from a run the row no longer holds, so only
+    /// subtractions of 1 lower it, each atomic, and it passes through zero
+    /// once. The single subtraction that finds it so (the previous value
+    /// equals what it subtracts) is the freer: the last fragment's drop
+    /// when the row let go first, the row's subtraction when every
+    /// fragment was dropped first.
+    ///
+    /// Orderings: the subtractions are `AcqRel`, so the one that reaches
+    /// zero sees every fragment's last use of its bytes before the pages
+    /// go back through the bitmap's Release. The starting store is
+    /// `Relaxed`: the owner's Release CAS that installs the run in its row
+    /// publishes it to the detach's Acquire load, and the bitmap's Acquire
+    /// claim orders it after the previous use's last subtraction.
+    fragment_refs: Box<[AtomicU32]>,
 }
 
 impl Chunk {
@@ -428,6 +565,7 @@ impl Chunk {
         empty_bit: u64,
         waiters: NonNull<SpaceWaiters>,
     ) -> Self {
+        let run_pages = FRAGMENT_RUN_PAGES.min(pages);
         let words = pages.div_ceil(WORD_PAGES);
         let padding = if pages.is_multiple_of(WORD_PAGES) {
             0
@@ -446,6 +584,32 @@ impl Chunk {
             empty_word,
             empty_bit,
             waiters,
+            run_pages: run_pages as u32,
+            fragment_refs: (0..pages / run_pages).map(|_| AtomicU32::new(0)).collect(),
+        }
+    }
+
+    /// Gives the pages of a run back: clears the bits, leaves the state
+    /// word, and wakes a starved allocator. What the drop of a run of pages
+    /// does, and what the subtraction that frees a fragment run does.
+    fn free_pages(&self, first_page: usize, pages: usize) {
+        self.release(first_page, pages);
+        self.leave(pages);
+        self.wake_starved();
+    }
+
+    /// Subtracts `units` from the count of the run that starts at
+    /// `first_page`, and frees the run when that took the count to zero.
+    /// See `fragment_refs` for why exactly one subtraction does.
+    fn put_run_refs(&self, first_page: usize, units: u32) {
+        let count = &self.fragment_refs[first_page / self.run_pages as usize];
+        let before = count.fetch_sub(units, Ordering::AcqRel);
+        debug_assert!(
+            before >= units,
+            "a fragment run's count went below zero: {before} less {units}"
+        );
+        if before == units {
+            self.free_pages(first_page, self.run_pages as usize);
         }
     }
 
@@ -637,6 +801,74 @@ const fn start_mask(align_pages: usize) -> u64 {
         bit += align_pages;
     }
     mask
+}
+
+/// What a fragment row holds while it caches a run, decoded.
+///
+/// The row is one `AtomicU64`, from the low bits up: `held` in
+/// [`HELD_BITS`], `offset` in [`OFFSET_BITS`], `run` in [`RUN_BITS`], and
+/// `slot` in the rest ([`SLOT_BITS`]). Each width is the smallest that names
+/// every value its field takes: [`BIAS`], the run's byte length
+/// ([`FRAGMENT_RUN_BYTES`]), the runs of a chunk ([`MAX_RUNS_PER_CHUNK`],
+/// what is left of the word), and the chunk slots ([`MAX_CHUNKS`]). A row
+/// that caches a run always holds a unit, so a live row is never the empty
+/// word, which means no run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RunRow {
+    /// The slot of the run's chunk.
+    slot: usize,
+    /// The run's index in its chunk: its first page over the run's pages.
+    run: usize,
+    /// Bytes of the run the carves so far span, alignment padding
+    /// included: where the next fragment may start.
+    offset: usize,
+    /// Units of the run's count the row still holds.
+    held: u32,
+}
+
+impl RunRow {
+    /// The word of a row that caches no run.
+    const EMPTY: u64 = 0;
+
+    const fn mask(bits: u32) -> u64 {
+        (1 << bits) - 1
+    }
+
+    fn pack(self) -> u64 {
+        debug_assert!(self.slot < MAX_CHUNKS && self.run < MAX_RUNS_PER_CHUNK);
+        debug_assert!(self.offset <= FRAGMENT_RUN_BYTES && (1..=BIAS).contains(&self.held));
+        (self.slot as u64) << SLOT_SHIFT
+            | (self.run as u64) << RUN_SHIFT
+            | (self.offset as u64) << OFFSET_SHIFT
+            | u64::from(self.held)
+    }
+
+    /// The run a word caches, or `None` for the empty word.
+    fn unpack(word: u64) -> Option<Self> {
+        (word != Self::EMPTY).then(|| Self {
+            slot: (word >> SLOT_SHIFT) as usize,
+            run: ((word >> RUN_SHIFT) & Self::mask(RUN_BITS)) as usize,
+            offset: ((word >> OFFSET_SHIFT) & Self::mask(OFFSET_BITS)) as usize,
+            held: (word & Self::mask(HELD_BITS)) as u32,
+        })
+    }
+}
+
+/// One processor's cache of the run it carves fragments from, for one
+/// request class: a [`RunRow`] word, empty when it caches nothing.
+///
+/// Written by CAS only: by the tasks running on the processor, and by the
+/// maintenance task's detach.
+struct FragmentCache {
+    row: AtomicU64,
+}
+
+impl FragmentCache {
+    const fn new() -> Self {
+        Self {
+            row: AtomicU64::new(RunRow::EMPTY),
+        }
+    }
 }
 
 /// A segment of the chunk table: headers, and the bits that note which of
@@ -855,6 +1087,16 @@ enum Fill {
     Unspecified,
 }
 
+/// The pages a buffer owns, or shares as a fragment.
+#[derive(Clone, Copy)]
+struct Run {
+    first_page: usize,
+    pages: usize,
+    /// Whether the buffer is one fragment of the run, which other
+    /// fragments share, and not the run itself.
+    fragment: bool,
+}
+
 /// What `grow` writes besides the chunk map and the headers: the chunk
 /// slots published and the counters. One line, written only under `grow`.
 struct GrowCounters {
@@ -873,15 +1115,6 @@ enum GrowError {
     Refused,
     /// The domain refused the map; the chunk went back to the source.
     Domain(DmaError),
-}
-
-/// What one allocation asks of the chunks.
-struct Want {
-    class: ChunkClass,
-    pages: usize,
-    align_pages: usize,
-    bytes: usize,
-    fill: Fill,
 }
 
 /// The memory one device reaches.
@@ -905,6 +1138,12 @@ pub struct DmaArena<S: ChunkSource, D: ChunkDomain, G: ChunkGrowth> {
     /// Per processor and class, the slot of the chunk the last allocation
     /// there came from.
     hints: Box<[CachePadded<[AtomicU32; ChunkClass::COUNT]>]>,
+    /// Per processor and request class, the run its fragments are carved
+    /// from, indexed by [`ChunkClass::fragment_index`].
+    frags: Box<[CachePadded<[FragmentCache; FRAGMENT_CLASSES]>]>,
+    /// Pages in a fragment run: [`FRAGMENT_RUN_PAGES`], or the whole chunk
+    /// when it is smaller.
+    run_pages: usize,
     /// Serialises the allocations that span bitmap words.
     runs: spin::Mutex<()>,
     /// Serialises the writers of the chunk table and the chunk map.
@@ -934,6 +1173,11 @@ impl<S: ChunkSource, D: ChunkDomain, G: ChunkGrowth> DmaArena<S, D, G> {
             chunk_bytes / PAGE_BYTES <= u32::MAX as usize,
             "a DMA chunk of {chunk_bytes} bytes has more pages than its state word counts"
         );
+        let run_pages = FRAGMENT_RUN_PAGES.min(chunk_bytes / PAGE_BYTES);
+        assert!(
+            chunk_bytes / PAGE_BYTES / run_pages <= MAX_RUNS_PER_CHUNK,
+            "a DMA chunk of {chunk_bytes} bytes has more fragment runs than a row names"
+        );
         Self {
             chunk_bytes,
             pages_per_chunk: chunk_bytes / PAGE_BYTES,
@@ -948,6 +1192,10 @@ impl<S: ChunkSource, D: ChunkDomain, G: ChunkGrowth> DmaArena<S, D, G> {
             hints: (0..processors)
                 .map(|_| CachePadded::new(core::array::from_fn(|_| AtomicU32::new(0))))
                 .collect(),
+            frags: (0..processors)
+                .map(|_| CachePadded::new(core::array::from_fn(|_| FragmentCache::new())))
+                .collect(),
+            run_pages,
             runs: spin::Mutex::new(()),
             grow: Mutex::new(GrowState {
                 retired_slots: Vec::new(),
@@ -1169,16 +1417,35 @@ impl<S: ChunkSource, D: ChunkDomain, G: ChunkGrowth> DmaArena<S, D, G> {
                 limit: self.chunk_bytes,
             });
         }
+        if bytes < PAGE_BYTES
+            && layout.align() <= PAGE_BYTES
+            && let Some(cache) = self.fragment_cache(class)
+        {
+            return self.take_fragment(cache, class, layout, fill);
+        }
         let align_pages = layout.align().div_ceil(PAGE_BYTES);
-        let want = Want {
-            class,
+        let (slot, first_page) = self.locate(class, pages, align_pages, bytes)?;
+        let run = Run {
+            first_page,
             pages,
-            align_pages,
-            bytes,
-            fill,
+            fragment: false,
         };
-        if let Some(buffer) = self.find(&want) {
-            return Ok(buffer);
+        Ok(self.buffer(self.chunk(slot), run, first_page * PAGE_BYTES, bytes, fill))
+    }
+
+    /// Claims a run of `pages` pages aligned to `align_pages` from a chunk
+    /// of `class`, growing the arena when none has room and its policy
+    /// grows the class. Returns the chunk's slot and the run's first page.
+    /// `bytes` is what the caller asked for, which a refusal names.
+    fn locate(
+        &self,
+        class: ChunkClass,
+        pages: usize,
+        align_pages: usize,
+        bytes: usize,
+    ) -> Result<(usize, usize), DmaError> {
+        if let Some(found) = self.find(class, pages, align_pages) {
+            return Ok(found);
         }
         if !self.growth.grows(class) {
             return Err(DmaError::Exhausted { bytes });
@@ -1192,8 +1459,8 @@ impl<S: ChunkSource, D: ChunkDomain, G: ChunkGrowth> DmaArena<S, D, G> {
         loop {
             // A growth or a free may have landed while the lock was out of
             // reach.
-            if let Some(buffer) = self.find(&want) {
-                return Ok(buffer);
+            if let Some(found) = self.find(class, pages, align_pages) {
+                return Ok(found);
             }
             match self.grow_one(&mut grow, class) {
                 Ok(slot) => {
@@ -1213,25 +1480,139 @@ impl<S: ChunkSource, D: ChunkDomain, G: ChunkGrowth> DmaArena<S, D, G> {
         }
     }
 
-    /// Claims the run `want` describes from a published chunk of its class,
-    /// starting at the executing processor's hint.
-    fn find(&self, want: &Want) -> Option<ArenaBuffer> {
-        let hint = self.hint(want.class);
+    /// Claims a run of `pages` pages aligned to `align_pages` from a
+    /// published chunk of `class`, starting at the executing processor's
+    /// hint. Returns the chunk's slot and the run's first page.
+    fn find(&self, class: ChunkClass, pages: usize, align_pages: usize) -> Option<(usize, usize)> {
+        let hint = self.hint(class);
         let first = hint.load(Ordering::Relaxed) as usize;
         let slots = self.counters.slots.load(Ordering::Acquire);
         for step in 0..slots {
             let slot = (first + step) % slots;
-            let chunk = self.chunk(slot);
-            let Some(first_page) = self.claim(chunk, want.class, want.pages, want.align_pages)
-            else {
+            let Some(first_page) = self.claim(self.chunk(slot), class, pages, align_pages) else {
                 continue;
             };
             if slot != first {
                 hint.store(slot as u32, Ordering::Relaxed);
             }
-            return Some(self.buffer(chunk, first_page, want.pages, want.bytes, want.fill));
+            return Some((slot, first_page));
         }
         None
+    }
+
+    /// The executing processor's fragment row for `class`, or `None` for
+    /// the class that serves whole pages only.
+    fn fragment_cache(&self, class: ChunkClass) -> Option<&FragmentCache> {
+        let index = class.fragment_index()?;
+        let processor = current_processor().id() as usize;
+        let row = self.frags.get(processor).unwrap_or_else(|| {
+            panic!(
+                "processor {processor} has no fragment row among the DMA arena's {}",
+                self.frags.len()
+            )
+        });
+        Some(&row[index])
+    }
+
+    /// A fragment of `layout` (under a page, aligned to at most one) from
+    /// the run `cache` holds, or from a new run when it holds none or the
+    /// fragment does not fit what is left of it.
+    ///
+    /// Task context, on the processor that owns `cache`: only its tasks
+    /// install a run in it, so the one CAS it races is a detach's, which
+    /// can only empty the row.
+    fn take_fragment(
+        &self,
+        cache: &FragmentCache,
+        class: ChunkClass,
+        layout: Layout,
+        fill: Fill,
+    ) -> Result<ArenaBuffer, DmaError> {
+        let bytes = layout.size();
+        let mut row = cache.row.load(Ordering::Acquire);
+        while let Some(held) = RunRow::unpack(row) {
+            // The run starts on a page, which `layout` is aligned within.
+            let at = held.offset.next_multiple_of(layout.align());
+            if at + bytes > self.run_pages * PAGE_BYTES {
+                break;
+            }
+            debug_assert!(held.held >= 2, "a row spent the last unit of its run");
+            let carved = RunRow {
+                offset: at + bytes,
+                held: held.held - 1,
+                ..held
+            };
+            // Spends a unit and moves the offset. A success hands the
+            // fragment one unit of a count the row held a unit of, which
+            // keeps the run alive. Relaxed: nothing is published, and the
+            // word's release sequence is the installing CAS's.
+            match cache.row.compare_exchange_weak(
+                row,
+                carved.pack(),
+                Ordering::Relaxed,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    let first_page = held.run * self.run_pages;
+                    return Ok(self.fragment(held.slot, first_page, at, bytes, fill));
+                }
+                Err(now) => row = now,
+            }
+        }
+
+        // No run, or the run cannot take this fragment: start a new one.
+        // `row` is what the install below expects to replace.
+        let (slot, first_page) = match self.find(class, self.run_pages, self.run_pages) {
+            Some(run) => run,
+            None => {
+                // No chunk has a whole run free. A free page is all this
+                // allocation needs, so it is served as a page and the row
+                // keeps what it has: a fragment never fails for want of a
+                // run while a page is free. Only when no page is free
+                // either is the arena asked to grow, and then for a run.
+                if let Some((slot, first_page)) = self.find(class, 1, 1) {
+                    let page = Run {
+                        first_page,
+                        pages: 1,
+                        fragment: false,
+                    };
+                    let offset = first_page * PAGE_BYTES;
+                    return Ok(self.buffer(self.chunk(slot), page, offset, bytes, fill));
+                }
+                self.locate(class, self.run_pages, self.run_pages, bytes)?
+            }
+        };
+        let run = first_page / self.run_pages;
+        self.chunk(slot).fragment_refs[run].store(BIAS, Ordering::Relaxed);
+        let first = RunRow {
+            slot,
+            run,
+            offset: bytes,
+            held: BIAS - 1,
+        };
+        let mut expected = row;
+        let replaced = loop {
+            // Release: publishes the starting count to the detach.
+            match cache.row.compare_exchange(
+                expected,
+                first.pack(),
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break expected,
+                // A detach emptied the row after `row` was read, and it
+                // took the units of the old run with it.
+                Err(now) => expected = now,
+            }
+        };
+        // The old run's unspent units are given up now that the row has let
+        // go of it. A detach that won the race already did, and the word it
+        // left is the empty one.
+        if let Some(old) = RunRow::unpack(replaced) {
+            self.chunk(old.slot)
+                .put_run_refs(old.run * self.run_pages, old.held);
+        }
+        Ok(self.fragment(slot, first_page, 0, bytes, fill))
     }
 
     /// The address a device has to issue to reach `bytes`.
@@ -1313,6 +1694,42 @@ impl<S: ChunkSource, D: ChunkDomain, G: ChunkGrowth> DmaArena<S, D, G> {
         &unsafe { &*self.segments[index].load(Ordering::Acquire) }.chunks[position]
     }
 
+    /// Empties every fragment row whose run has no outstanding fragment,
+    /// so an idle processor's cached run does not pin its chunk.
+    ///
+    /// A run is idle when its count equals the units the row holds. The
+    /// count cannot fall below them, and a carve changes the row, so the
+    /// CAS that empties it fails if a fragment was carved since the load,
+    /// and succeeds only on the word the check was made against; either
+    /// way the subtraction that follows is correct for the word it won (see
+    /// `Chunk::fragment_refs`). Idle runs only, so a busy processor keeps
+    /// its run.
+    ///
+    /// Maintenance task context: `grow` is held, so the chunks of a row's
+    /// run are not retired or reused while it looks at them. They cannot
+    /// be anyway, a run in a row being in use.
+    fn detach_idle_runs(&self, _grow: &GrowGuard<'_>) {
+        for caches in self.frags.iter() {
+            for cache in caches.iter() {
+                let word = cache.row.load(Ordering::Acquire);
+                let Some(held) = RunRow::unpack(word) else {
+                    continue;
+                };
+                let chunk = self.chunk(held.slot);
+                if chunk.fragment_refs[held.run].load(Ordering::Acquire) != held.held {
+                    continue;
+                }
+                if cache
+                    .row
+                    .compare_exchange(word, RunRow::EMPTY, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    chunk.put_run_refs(held.run * self.run_pages, held.held);
+                }
+            }
+        }
+    }
+
     /// Claims `pages` in `chunk`: enters it, then takes the bits. A
     /// refusal leaves the chunk as it was.
     fn claim(
@@ -1337,23 +1754,55 @@ impl<S: ChunkSource, D: ChunkDomain, G: ChunkGrowth> DmaArena<S, D, G> {
         first_page
     }
 
-    fn buffer(
+    /// A fragment of `bytes` at byte `at` of the run that starts at
+    /// `first_page` of the chunk in `slot`. Zeroes the `bytes` and no more.
+    fn fragment(
         &self,
-        chunk: &Chunk,
+        slot: usize,
         first_page: usize,
-        pages: usize,
+        at: usize,
         bytes: usize,
         fill: Fill,
     ) -> ArenaBuffer {
-        let offset = first_page * PAGE_BYTES;
+        let run = Run {
+            first_page,
+            pages: self.run_pages,
+            fragment: true,
+        };
+        self.buffer(
+            self.chunk(slot),
+            run,
+            first_page * PAGE_BYTES + at,
+            bytes,
+            fill,
+        )
+    }
+
+    /// The buffer for `bytes` at byte `offset` of `chunk`, in `run`. A run
+    /// of pages is zeroed whole; a fragment, which shares its run, is
+    /// zeroed for its `bytes`.
+    fn buffer(
+        &self,
+        chunk: &Chunk,
+        run: Run,
+        offset: usize,
+        bytes: usize,
+        fill: Fill,
+    ) -> ArenaBuffer {
+        let Run {
+            first_page,
+            pages,
+            fragment,
+        } = run;
         let base = chunk.base.load(Ordering::Relaxed);
         let ptr = ptr::with_exposed_provenance_mut::<u8>(base + offset);
         if fill == Fill::Zeroed {
+            let zeroed = if fragment { bytes } else { pages * PAGE_BYTES };
             // SAFETY: the bitmap gave this task the run, which lies inside
-            // the chunk the source lent, so nothing else holds a reference
-            // to it. The device may write it, which a byte write
-            // tolerates.
-            unsafe { ptr.write_bytes(0, pages * PAGE_BYTES) };
+            // the chunk the source lent, and a fragment's bytes are its
+            // own inside it, so nothing else holds a reference to them.
+            // The device may write them, which a byte write tolerates.
+            unsafe { ptr.write_bytes(0, zeroed) };
         }
         ArenaBuffer {
             ptr: NonNull::new(ptr).expect("a chunk's pages are never at address zero"),
@@ -1362,6 +1811,7 @@ impl<S: ChunkSource, D: ChunkDomain, G: ChunkGrowth> DmaArena<S, D, G> {
             chunk: NonNull::from(chunk),
             first_page: first_page as u32,
             pages: pages as u32,
+            fragment,
         }
     }
 }
@@ -1381,9 +1831,14 @@ impl<S: ChunkSource, D: ChunkDomain> DmaArena<S, D, Elastic> {
     /// A domain that refuses the unmap keeps the chunk, which the device
     /// may still reach, and the arena never gives it back.
     ///
+    /// First it detaches the fragment rows whose run has no outstanding
+    /// fragment, which frees those runs and notes their chunks.
+    ///
     /// Maintenance task context; waits for the `grow` lock.
     pub async fn retire_empty(&self, retained: usize) -> usize {
         let mut grow = self.lock_grow().await;
+        // Before the walk, so a run this frees notes its chunk in time.
+        self.detach_idle_runs(&grow);
         let mut kept = [0_usize; ChunkClass::COUNT];
         let mut retired = 0;
         for (index, segment) in self.segments.iter().enumerate() {
@@ -1597,6 +2052,15 @@ impl<S: ChunkSource, D: ChunkDomain, G: ChunkGrowth> Drop for DmaArena<S, D, G> 
     /// already back and is skipped.
     fn drop(&mut self) {
         let slots = *self.counters.slots.get_mut();
+        // A cached run is not a live page: the rows let go of theirs, which
+        // frees the runs that have no outstanding fragment.
+        for cache in self.frags.iter().flat_map(|caches| caches.iter()) {
+            let word = cache.row.swap(RunRow::EMPTY, Ordering::Acquire);
+            if let Some(held) = RunRow::unpack(word) {
+                self.chunk(held.slot)
+                    .put_run_refs(held.run * self.run_pages, held.held);
+            }
+        }
         let mut live_pages = 0;
         let mut live_chunks = 0;
         for slot in 0..slots {
@@ -1640,7 +2104,8 @@ impl<S: ChunkSource, D: ChunkDomain, G: ChunkGrowth> Drop for DmaArena<S, D, G> 
     }
 }
 
-/// Pages a driver holds. Dropping it frees them.
+/// Pages a driver holds, or a fragment of a run of them. Dropping it frees
+/// them, or gives its share of the run back.
 ///
 /// The drop reaches only the atomics of the buffer's chunk and the arena's
 /// space waiters, so it takes no lock and is safe from an interrupt handler
@@ -1651,8 +2116,12 @@ pub struct ArenaBuffer {
     len: usize,
     device: DeviceAddress,
     chunk: NonNull<Chunk>,
+    /// The first page of the buffer's run, which a fragment shares.
     first_page: u32,
     pages: u32,
+    /// The buffer is one fragment of its run, not the run: its drop
+    /// subtracts from the run's count instead of freeing the pages.
+    fragment: bool,
 }
 
 // SAFETY: the buffer owns its pages exclusively, and its chunk header is
@@ -1706,9 +2175,11 @@ impl Drop for ArenaBuffer {
         // SAFETY: the arena keeps its chunk headers alive for as long as a
         // page is live: it panics, leaking them, otherwise.
         let chunk = unsafe { self.chunk.as_ref() };
-        chunk.release(self.first_page as usize, self.pages as usize);
-        chunk.leave(self.pages as usize);
-        chunk.wake_starved();
+        if self.fragment {
+            chunk.put_run_refs(self.first_page as usize, 1);
+        } else {
+            chunk.free_pages(self.first_page as usize, self.pages as usize);
+        }
     }
 }
 
@@ -2278,10 +2749,13 @@ mod tests {
                         random ^= random << 13;
                         random ^= random >> 7;
                         random ^= random << 17;
+                        // At least two pages, less the noise, so every
+                        // buffer is a run of pages: a buffer under a page is
+                        // a fragment, and the fragment tests cover those.
                         let run = if random.is_multiple_of(16) {
                             70
                         } else {
-                            1 + (random >> 8) as usize % 9
+                            2 + (random >> 8) as usize % 8
                         };
                         let bytes = run * PAGE_BYTES - (random >> 20) as usize % 100;
                         let layout = Layout::from_size_align(bytes, 1).expect("layout");
@@ -3180,5 +3654,396 @@ mod tests {
         }
         block_on(arenas.retire_empty(0));
         assert_eq!(source.lends(), source.returns());
+    }
+
+    fn fragment_layout(bytes: usize, align: usize) -> Layout {
+        Layout::from_size_align(bytes, align).expect("layout")
+    }
+
+    /// The fragment row of `processor` for `class`, decoded.
+    fn row_of<S: ChunkSource, D: ChunkDomain, G: ChunkGrowth>(
+        arena: &DmaArena<S, D, G>,
+        processor: usize,
+        class: ChunkClass,
+    ) -> Option<RunRow> {
+        let index = class.fragment_index().expect("a request class");
+        RunRow::unpack(arena.frags[processor][index].row.load(Ordering::SeqCst))
+    }
+
+    /// The count of the run `run` of the chunk in `slot`.
+    fn run_count<S: ChunkSource, D: ChunkDomain, G: ChunkGrowth>(
+        arena: &DmaArena<S, D, G>,
+        slot: usize,
+        run: usize,
+    ) -> u32 {
+        arena.chunk(slot).fragment_refs[run].load(Ordering::SeqCst)
+    }
+
+    #[test]
+    fn a_row_packs_every_field_at_its_widest() {
+        let widest = RunRow {
+            slot: MAX_CHUNKS - 1,
+            run: MAX_RUNS_PER_CHUNK - 1,
+            offset: FRAGMENT_RUN_BYTES,
+            held: BIAS,
+        };
+        assert_eq!(RunRow::unpack(widest.pack()), Some(widest));
+        let narrowest = RunRow {
+            slot: 0,
+            run: 0,
+            offset: 0,
+            held: 1,
+        };
+        assert_eq!(RunRow::unpack(narrowest.pack()), Some(narrowest));
+        assert_eq!(RunRow::unpack(RunRow::EMPTY), None);
+        assert_eq!(HELD_BITS + OFFSET_BITS + RUN_BITS + SLOT_BITS, u64::BITS);
+    }
+
+    #[test]
+    fn fragments_share_a_run() {
+        let (arena, _) = arena(16 * PAGE_BYTES, &[ChunkClass::ReadWrite], 1);
+        let layout = fragment_layout(100, 64);
+        let first = arena
+            .allocate(ChunkClass::ReadWrite, layout)
+            .expect("a fragment");
+        let second = arena
+            .allocate(ChunkClass::ReadWrite, layout)
+            .expect("another fragment");
+
+        let (a, b) = (first.as_ptr() as usize, second.as_ptr() as usize);
+        assert_eq!((a % 64, b % 64), (0, 0), "a fragment is aligned as asked");
+        assert!(a + 100 <= b || b + 100 <= a, "the fragments overlap");
+        let (base, _) = chunk_range(&arena, 0);
+        for start in [a, b] {
+            assert!(
+                (base..base + FRAGMENT_RUN_BYTES).contains(&start),
+                "{start:#x} is outside the first run"
+            );
+        }
+        assert_eq!(first.len(), 100);
+        assert_eq!(
+            arena.device_range(first.as_ref()),
+            Ok(first.device_address())
+        );
+        assert_eq!(arena.stats().pages_in_use, FRAGMENT_RUN_PAGES);
+        assert_eq!(bitmap_pages_in_use(&arena), FRAGMENT_RUN_PAGES);
+        assert_eq!(
+            run_count(&arena, 0, 0),
+            BIAS,
+            "the row's units and the fragments' make the starting count"
+        );
+        let row = row_of(&arena, 0, ChunkClass::ReadWrite).expect("the row caches the run");
+        assert_eq!(row.held, BIAS - 2, "each fragment spent a unit");
+    }
+
+    #[test]
+    fn a_run_is_freed_when_its_last_fragment_drops_on_another_thread() {
+        let (arena, _) = elastic(16 * PAGE_BYTES, 2, 1);
+        let layout = fragment_layout(3000, 1);
+        let mut old: Vec<_> = (0..10)
+            .map(|_| {
+                arena
+                    .allocate(ChunkClass::ReadWrite, layout)
+                    .expect("a fragment")
+            })
+            .collect();
+        assert_eq!(arena.stats().pages_in_use, FRAGMENT_RUN_PAGES);
+
+        // The eleventh does not fit what is left of the run, so a new run
+        // replaces it in the row and the old one's unspent units go.
+        let eleventh = arena
+            .allocate(ChunkClass::ReadWrite, layout)
+            .expect("a fragment of a new run");
+        assert_eq!(arena.stats().pages_in_use, 2 * FRAGMENT_RUN_PAGES);
+        assert_eq!(run_count(&arena, 0, 0), 10, "only the fragments' units");
+        drop(eleventh);
+        block_on(arena.retire_empty(1));
+        assert_eq!(
+            arena.stats().pages_in_use,
+            FRAGMENT_RUN_PAGES,
+            "the idle run went with its row"
+        );
+
+        let last = old.pop().expect("ten fragments");
+        thread::spawn(move || drop(old))
+            .join()
+            .expect("the drop finished");
+        assert_eq!(
+            arena.stats().pages_in_use,
+            FRAGMENT_RUN_PAGES,
+            "a run with a fragment left is not freed"
+        );
+        thread::spawn(move || drop(last))
+            .join()
+            .expect("the drop finished");
+        assert_eq!(arena.stats().pages_in_use, 0);
+        assert_eq!(bitmap_pages_in_use(&arena), 0);
+        assert_eq!(run_count(&arena, 0, 0), 0);
+    }
+
+    #[test]
+    fn a_page_or_more_bypasses_the_cache() {
+        let (arena, _) = elastic(16 * PAGE_BYTES, 2, 1);
+        let page = arena
+            .allocate(ChunkClass::ReadWrite, fragment_layout(PAGE_BYTES, 1))
+            .expect("a page");
+        let more = arena
+            .allocate(ChunkClass::ReadWrite, fragment_layout(5000, 1))
+            .expect("two pages");
+        let aligned = arena
+            .allocate(ChunkClass::ReadWrite, fragment_layout(100, 2 * PAGE_BYTES))
+            .expect("a page aligned past one");
+        assert_eq!(row_of(&arena, 0, ChunkClass::ReadWrite), None);
+        assert_eq!(arena.stats().pages_in_use, 4);
+        assert!((0..2).all(|run| run_count(&arena, 0, run) == 0));
+        assert_eq!(aligned.as_ptr() as usize % (2 * PAGE_BYTES), 0);
+
+        // Resident memory is whole pages for every length.
+        let resident = arena
+            .allocate(ChunkClass::Resident, fragment_layout(100, 1))
+            .expect("a resident page");
+        assert_eq!(arena.stats().pages_in_use, 5);
+        assert_eq!(row_of(&arena, 0, ChunkClass::Read), None);
+
+        // One byte under a page is the largest fragment.
+        let fragment = arena
+            .allocate(ChunkClass::ReadWrite, fragment_layout(PAGE_BYTES - 1, 1))
+            .expect("a fragment");
+        let row = row_of(&arena, 0, ChunkClass::ReadWrite).expect("the row caches a run");
+        assert_eq!(row.offset, PAGE_BYTES - 1);
+        drop((page, more, aligned, resident, fragment));
+    }
+
+    #[test]
+    fn an_allocation_under_a_page_takes_a_page_when_no_run_is_free() {
+        // One reserved chunk of two runs, which never grows for this class.
+        let (arena, _) = arena(16 * PAGE_BYTES, &[ChunkClass::ReadWrite], 1);
+        let (base, _) = chunk_range(&arena, 0);
+        let first_run = arena
+            .allocate(ChunkClass::ReadWrite, pages(FRAGMENT_RUN_PAGES))
+            .expect("the first run's pages");
+        let in_second_run = arena
+            .allocate(ChunkClass::ReadWrite, pages(1))
+            .expect("a page");
+        assert_eq!(
+            in_second_run.as_ptr() as usize,
+            base + FRAGMENT_RUN_BYTES,
+            "the page is in the second run, so neither run is free whole"
+        );
+
+        let small = arena
+            .allocate(ChunkClass::ReadWrite, fragment_layout(100, 1))
+            .expect("a page serves an allocation no run is free for");
+        assert_eq!(small.len(), 100);
+        assert_eq!(small.as_ptr() as usize % PAGE_BYTES, 0);
+        assert!(small.as_ref().iter().all(|&byte| byte == 0));
+        assert_eq!(row_of(&arena, 0, ChunkClass::ReadWrite), None);
+        assert_eq!(arena.stats().pages_in_use, FRAGMENT_RUN_PAGES + 2);
+        assert!((0..2).all(|run| run_count(&arena, 0, run) == 0));
+
+        // Its drop frees the page, and a run that is free whole again is
+        // cached by the next one.
+        drop((small, in_second_run));
+        assert_eq!(arena.stats().pages_in_use, FRAGMENT_RUN_PAGES);
+        let fragment = arena
+            .allocate(ChunkClass::ReadWrite, fragment_layout(100, 1))
+            .expect("a fragment");
+        let row = row_of(&arena, 0, ChunkClass::ReadWrite).expect("the row caches the run");
+        assert_eq!(row.run, 1);
+        assert_eq!(arena.stats().pages_in_use, 2 * FRAGMENT_RUN_PAGES);
+        drop((first_run, fragment));
+    }
+
+    #[test]
+    fn an_idle_cached_run_does_not_pin_its_chunk() {
+        let (arena, source) = elastic(16 * PAGE_BYTES, 2, 1);
+        let fragment = arena
+            .allocate(ChunkClass::ReadWrite, fragment_layout(100, 1))
+            .expect("a fragment");
+        assert_eq!(
+            block_on(arena.retire_empty(0)),
+            0,
+            "a chunk with a live fragment stays"
+        );
+        assert!(
+            row_of(&arena, 0, ChunkClass::ReadWrite).is_some(),
+            "a run with a fragment outstanding is not idle"
+        );
+
+        drop(fragment);
+        assert_eq!(
+            arena.stats().pages_in_use,
+            FRAGMENT_RUN_PAGES,
+            "the row still caches the run"
+        );
+        assert_eq!(block_on(arena.retire_empty(0)), 1);
+        assert_eq!(row_of(&arena, 0, ChunkClass::ReadWrite), None);
+        assert_eq!(arena.stats().chunks, 0);
+        assert_eq!(source.returns(), 1);
+    }
+
+    #[test]
+    fn fragments_carved_and_freed_on_other_threads_while_rows_detach_leave_every_count_exact() {
+        const THREADS: usize = 4;
+        const ROUNDS: usize = 4000;
+        const ALIGNS: [usize; 4] = [1, 8, 64, 512];
+        let (arena, source) = elastic(32 * PAGE_BYTES, 8, THREADS + 1);
+
+        let (senders, receivers): (Vec<_>, Vec<_>) = (0..THREADS)
+            .map(|_| mpsc::channel::<(ArenaBuffer, u8)>())
+            .unzip();
+        let all_sent = AtomicUsize::new(0);
+        thread::scope(|scope| {
+            for (me, receiver) in receivers.into_iter().enumerate() {
+                let (arena, all_sent) = (&arena, &all_sent);
+                let next = senders[(me + 1) % THREADS].clone();
+                scope.spawn(move || {
+                    test_processor_identity::set(ProcessorId::new(me as u16));
+                    let check = |(buffer, tag): (ArenaBuffer, u8)| {
+                        assert!(
+                            buffer.as_ref().iter().all(|&byte| byte == tag),
+                            "a fragment's bytes were written by someone else"
+                        );
+                    };
+                    let mut random = (me as u64 + 1).wrapping_mul(NOISE_MULTIPLIER);
+                    let mut sent = 0;
+                    while sent < ROUNDS {
+                        for received in receiver.try_iter() {
+                            check(received);
+                        }
+                        random ^= random << 13;
+                        random ^= random >> 7;
+                        random ^= random << 17;
+                        let bytes = 1 + (random >> 8) as usize % 3000;
+                        let align = ALIGNS[(random >> 32) as usize % ALIGNS.len()];
+                        let layout = fragment_layout(bytes, align);
+                        match arena.allocate(ChunkClass::ReadWrite, layout) {
+                            Ok(mut buffer) => {
+                                assert_eq!(buffer.as_ptr() as usize % align, 0);
+                                assert!(
+                                    buffer.as_ref().iter().all(|&byte| byte == 0),
+                                    "a fragment came back dirty"
+                                );
+                                let tag = 1 + (sent % 250) as u8;
+                                buffer.as_mut().fill(tag);
+                                if random.is_multiple_of(8) {
+                                    thread::yield_now();
+                                }
+                                next.send((buffer, tag)).expect("the receiver is alive");
+                                sent += 1;
+                            }
+                            Err(DmaError::Exhausted { .. } | DmaError::Replenishing { .. }) => {
+                                thread::yield_now();
+                            }
+                            Err(other) => panic!("{other}"),
+                        }
+                    }
+                    all_sent.fetch_add(1, Ordering::AcqRel);
+                    while all_sent.load(Ordering::Acquire) < THREADS {
+                        for received in receiver.try_iter() {
+                            check(received);
+                        }
+                        thread::yield_now();
+                    }
+                    for received in receiver.try_iter() {
+                        check(received);
+                    }
+                });
+            }
+            // The detach: every idle row, and the chunks that frees, while
+            // the carvers run.
+            scope.spawn(|| {
+                test_processor_identity::set(ProcessorId::new(THREADS as u16));
+                while all_sent.load(Ordering::Acquire) < THREADS {
+                    block_on(arena.retire_empty(0));
+                    thread::yield_now();
+                }
+            });
+        });
+        drop(senders);
+
+        // Every fragment is dropped; what is left is the runs the rows
+        // cache.
+        block_on(arena.retire_empty(0));
+        let stats = arena.stats();
+        assert_eq!(stats.pages_in_use, 0);
+        assert_eq!(
+            bitmap_pages_in_use(&arena),
+            0,
+            "a run was freed twice or never"
+        );
+        assert_eq!(stats.chunks, 0, "a cached run still pins a chunk");
+        for slot in 0..arena.counters.slots.load(Ordering::Acquire) {
+            for run in 0..arena.chunk(slot).fragment_refs.len() {
+                assert_eq!(run_count(&arena, slot, run), 0, "slot {slot} run {run}");
+            }
+        }
+        for processor in 0..=THREADS {
+            assert_eq!(row_of(&arena, processor, ChunkClass::ReadWrite), None);
+        }
+        assert_eq!(source.lends(), source.returns());
+    }
+
+    #[test]
+    fn a_fragment_after_its_run_was_reused_reads_zero() {
+        let (arena, _) = elastic(16 * PAGE_BYTES, 2, 1);
+        let mut first = arena
+            .allocate(ChunkClass::ReadWrite, fragment_layout(100, 1))
+            .expect("a fragment");
+        let (base, _) = chunk_range(&arena, 0);
+        first.as_mut().fill(0xaa);
+        let address = first.as_ptr();
+        drop(first);
+        // Frees the idle run and keeps the chunk.
+        assert_eq!(block_on(arena.retire_empty(1)), 0);
+        assert_eq!(arena.stats().pages_in_use, 0);
+        // The device wrote the whole run after the free.
+        // SAFETY: the source's block outlives the arena, so the chunk is
+        // live host memory, and no buffer of the arena covers the run.
+        unsafe {
+            ptr::with_exposed_provenance_mut::<u8>(base).write_bytes(0xaa, FRAGMENT_RUN_BYTES)
+        };
+
+        let again = arena
+            .allocate(ChunkClass::ReadWrite, fragment_layout(100, 1))
+            .expect("a fragment of the reused run");
+        assert_eq!(again.as_ptr(), address, "the run was reused");
+        assert!(again.as_ref().iter().all(|&byte| byte == 0));
+        drop(again);
+
+        assert_eq!(block_on(arena.retire_empty(1)), 0);
+        // SAFETY: as above.
+        unsafe {
+            ptr::with_exposed_provenance_mut::<u8>(base).write_bytes(0xaa, FRAGMENT_RUN_BYTES)
+        };
+        let overwritten = arena
+            .allocate_overwritten(ChunkClass::ReadWrite, fragment_layout(100, 1))
+            .expect("a fragment of the reused run");
+        assert!(
+            overwritten.as_ref().iter().all(|&byte| byte == 0xaa),
+            "an overwritten fragment is not zeroed"
+        );
+    }
+
+    #[test]
+    fn dropping_an_arena_gives_back_the_run_its_row_caches() {
+        let (arena, source) = arena(4 * PAGE_BYTES, &[ChunkClass::Read], 1);
+        let fragment = arena
+            .allocate(ChunkClass::Read, fragment_layout(1, 1))
+            .expect("a fragment");
+        drop(fragment);
+        assert_eq!(arena.stats().pages_in_use, 4, "the run is the whole chunk");
+        drop(arena);
+        assert_eq!(source.returns(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "dropped with 4 live pages in 1 of its 1 chunks")]
+    fn dropping_an_arena_with_a_live_fragment_panics() {
+        let (arena, _) = arena(4 * PAGE_BYTES, &[ChunkClass::Read], 1);
+        let _fragment = arena
+            .allocate(ChunkClass::Read, fragment_layout(1, 1))
+            .expect("a fragment");
+        drop(arena);
     }
 }
