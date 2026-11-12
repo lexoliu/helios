@@ -50,7 +50,10 @@
 //!
 //! Every operation is lock-free on the reader side and allocation-free on
 //! both. A reader is a timer interrupt, which runs with the local
-//! processor's interrupts masked and never waits for anything.
+//! processor's interrupts masked and never waits for anything, or the
+//! freeze's walk ([`GuestInterrupts::interrupt_running`]), which is task
+//! context and masks the local processor's interrupts itself for the
+//! length of the walk.
 //!
 //! Reclamation: a handle the owner publishes is valid until the poll
 //! that published it returns, and nothing past that. A reader on another
@@ -97,6 +100,7 @@ use core::task::{Context, Poll};
 
 use crossbeam_utils::CachePadded;
 use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase, current_processor};
+use helios_hal::critical_section::with_local_interrupts_masked;
 use pin_project_lite::pin_project;
 use slab::Slab;
 use spin::Mutex;
@@ -184,7 +188,12 @@ impl GuestInterrupts {
     /// host code is not reached, because it is not running and reaches
     /// the executor on its own.
     pub fn interrupt_running(&self) {
-        self.running.interrupt_all();
+        // A reader runs with the local processor's interrupts masked, so
+        // that an interrupt handler never lands between its increment of
+        // `readers` and its decrement, which an owner on another
+        // processor would spin through (module docs, "Reclamation"). This
+        // caller is a task, so it masks them itself.
+        with_local_interrupts_masked(|| self.running.interrupt_all());
     }
 
     /// Interrupts every live store of `instance`, wherever it is: running
