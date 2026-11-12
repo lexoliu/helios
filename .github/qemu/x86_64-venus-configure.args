@@ -1,0 +1,10 @@
+--target-list=x86_64-softmmu
+--enable-kvm
+--enable-slirp
+--enable-opengl
+--enable-gbm
+--enable-virglrenderer
+--disable-docs
+--disable-gtk
+--disable-sdl
+--disable-vnc
