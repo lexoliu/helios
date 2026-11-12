@@ -774,7 +774,13 @@ extern "C" fn aarch64_kernel_main() -> ! {
         );
         routes.set_entropy(entropy.interrupt, entropy.device);
     }
-    if let Some(balloon) = balloon::install(&kernel, &platform, physical_memory_offset, &handoff) {
+    if let Some(balloon) = balloon::install(
+        &kernel,
+        &platform,
+        physical_memory_offset,
+        &handoff,
+        debug_state.machine_generation_handle(),
+    ) {
         gic.enable_device_interrupt(
             balloon.interrupt,
             balloon.trigger,
