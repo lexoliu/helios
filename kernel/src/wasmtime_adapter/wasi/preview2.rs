@@ -493,26 +493,17 @@ where
         Ok(Ok(self.table.push(Box::new(stream) as DynOutputStream)?))
     }
 
-    /// Backs `set-times` and `set-times-at`.
-    async fn set_times_at_absolute_path(
+    /// The access time, the modification time and the current time, in
+    /// nanoseconds, that `set-times` and `set-times-at` hand the operation.
+    fn p2_timestamps(
         &mut self,
-        namespace: Namespace<HostFs>,
-        absolute: String,
         data_access_timestamp: p2fs::NewTimestamp,
         data_modification_timestamp: p2fs::NewTimestamp,
-    ) -> core::result::Result<(), p2fs::ErrorCode> {
+    ) -> core::result::Result<(Option<u64>, Option<u64>, u64), p2fs::ErrorCode> {
         let now_nanos = self.system_time_nanos();
         let access_nanos = p2_new_timestamp_nanos(data_access_timestamp, now_nanos)?;
         let modified_nanos = p2_new_timestamp_nanos(data_modification_timestamp, now_nanos)?;
-        super::set_times(
-            &namespace,
-            &absolute,
-            access_nanos,
-            modified_nanos,
-            now_nanos,
-        )
-        .await
-        .map_err(error_code_from_p3)
+        Ok((access_nanos, modified_nanos, now_nanos))
     }
 }
 
@@ -1276,18 +1267,26 @@ where
         data_access_timestamp: p2fs::NewTimestamp,
         data_modification_timestamp: p2fs::NewTimestamp,
     ) -> Result<core::result::Result<(), p2fs::ErrorCode>> {
-        let (descriptor, namespace) = match self.p2_descriptor(&descriptor) {
-            Ok(target) => target,
-            Err(error) => return Ok(Err(error)),
-        };
-        Ok(self
-            .set_times_at_absolute_path(
-                namespace,
-                descriptor.path,
-                data_access_timestamp,
-                data_modification_timestamp,
+        let target = self
+            .p2_descriptor(&descriptor)
+            .and_then(|(descriptor, namespace)| {
+                let (access_nanos, modified_nanos, now) =
+                    self.p2_timestamps(data_access_timestamp, data_modification_timestamp)?;
+                Ok((descriptor, namespace, access_nanos, modified_nanos, now))
+            });
+        Ok(async {
+            let (descriptor, namespace, access_nanos, modified_nanos, now) = target?;
+            super::set_times(
+                &namespace,
+                descriptor.grant_touch().map_err(error_code_from_p3)?,
+                access_nanos,
+                modified_nanos,
+                now,
             )
-            .await)
+            .await
+            .map_err(error_code_from_p3)
+        }
+        .await)
     }
 
     async fn read(
@@ -1433,22 +1432,24 @@ where
         let target = self
             .p2_descriptor(&descriptor)
             .and_then(|(base, namespace)| {
-                super::child_path(&base, &path)
-                    .map(|absolute| (absolute, namespace))
-                    .map_err(error_code_from_p3)
+                let (access_nanos, modified_nanos, now) =
+                    self.p2_timestamps(data_access_timestamp, data_modification_timestamp)?;
+                Ok((base, namespace, access_nanos, modified_nanos, now))
             });
-        let (absolute, namespace) = match target {
-            Ok(target) => target,
-            Err(error) => return Ok(Err(error)),
-        };
-        Ok(self
-            .set_times_at_absolute_path(
-                namespace,
-                absolute,
-                data_access_timestamp,
-                data_modification_timestamp,
+        Ok(async {
+            let (base, namespace, access_nanos, modified_nanos, now) = target?;
+            super::set_times_at(
+                &namespace,
+                base.grant().map_err(error_code_from_p3)?,
+                &path,
+                access_nanos,
+                modified_nanos,
+                now,
             )
-            .await)
+            .await
+            .map_err(error_code_from_p3)
+        }
+        .await)
     }
 
     async fn link_at(

@@ -2461,21 +2461,29 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    let Some(path) = p1_descriptor_path(caller.data().descriptors.get(fd)).map(ToOwned::to_owned)
-    else {
+    let Some(descriptor) = p1_fs_descriptor(caller.data().descriptors.get(fd)).cloned() else {
         return p1::errno::BADF;
     };
-    p1_set_times_at_path(caller, &path, atim, mtim, fstflags).await
+    let target = match descriptor.grant_touch() {
+        Ok(target) => target,
+        Err(error) => return p1_errno_from_fs(error),
+    };
+    let (access, modified, now_nanos) = p1_set_times_arguments(caller, atim, mtim, fstflags);
+    let namespace = p1_namespace(caller);
+    wasi_fs::set_times(&namespace, target, access, modified, now_nanos)
+        .await
+        .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
 
-/// Backs `fd_filestat_set_times` and `path_filestat_set_times`.
-async fn p1_set_times_at_path<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
-    absolute: &str,
+/// The access time, the modification time and the current time, in
+/// nanoseconds, that `fstflags` asks `fd_filestat_set_times` and
+/// `path_filestat_set_times` to set.
+fn p1_set_times_arguments<CpuImpl, Net, HostFs>(
+    caller: &Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     atim: u64,
     mtim: u64,
     fstflags: u16,
-) -> i32
+) -> (Option<u64>, Option<u64>, u64)
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
@@ -2496,10 +2504,7 @@ where
         mtim,
         now_nanos,
     );
-    let namespace = p1_namespace(caller);
-    wasi_fs::set_times(&namespace, absolute, access, modified, now_nanos)
-        .await
-        .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
+    (access, modified, now_nanos)
 }
 
 pub(super) fn p1_fd_advise<CpuImpl, Net, HostFs>(
@@ -3186,11 +3191,19 @@ where
         Ok(path) => path,
         Err(_) => return p1::errno::FAULT,
     };
-    let (_, _, absolute) = match caller.data().resolve_preview1_path(fd, &path) {
+    let (base, path, _) = match caller.data().resolve_preview1_path(fd, &path) {
         Ok(resolved) => resolved,
         Err(errno) => return errno,
     };
-    p1_set_times_at_path(caller, &absolute, atim, mtim, fstflags).await
+    let granted = match p1_grant(&base) {
+        Ok(granted) => granted,
+        Err(errno) => return errno,
+    };
+    let (access, modified, now_nanos) = p1_set_times_arguments(caller, atim, mtim, fstflags);
+    let namespace = p1_namespace(caller);
+    wasi_fs::set_times_at(&namespace, granted, &path, access, modified, now_nanos)
+        .await
+        .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
 
 #[expect(
@@ -4798,6 +4811,118 @@ mod tests {
             .expect("the owner reads back");
             assert_eq!(contents.as_ref(), "日本語 한국어".as_bytes());
         }
+    }
+
+    /// A namespace with one file, `/data`, and the time it was last
+    /// modified.
+    fn namespace_with_file() -> crate::Namespace<crate::UnsupportedHostFileSystem> {
+        use futures_lite::future::block_on;
+
+        let namespace = crate::Namespace::new(crate::MountTable::new(
+            crate::BootFs::new(crate::EmbeddedBootFs::new(&[], &[]), crate::BOOT_DEVICE),
+            1,
+        ));
+        let owner = FsDescriptor {
+            path: "/".into(),
+            kind: FsNodeKind::Directory,
+            flags: fs_types::DescriptorFlags::READ
+                | fs_types::DescriptorFlags::WRITE
+                | fs_types::DescriptorFlags::MUTATE_DIRECTORY,
+            identity: None,
+            mount: None,
+        };
+        block_on(wasi_fs::open_at(
+            &namespace,
+            &owner,
+            fs_types::PathFlags::empty(),
+            "data",
+            fs_types::OpenFlags::CREATE,
+            fs_types::DescriptorFlags::READ,
+            1,
+        ))
+        .expect("the owner creates the file");
+        namespace
+    }
+
+    fn modified_nanos(namespace: &crate::Namespace<crate::UnsupportedHostFileSystem>) -> u64 {
+        futures_lite::future::block_on(wasi_fs::stat_path(namespace, "/data", crate::Follow::No))
+            .expect("the file exists")
+            .modified_nanos
+    }
+
+    /// `fd_filestat_set_times` is decided by the rights the descriptor was
+    /// opened with: `FD_FILESTAT_SET_TIMES` gives the file `write`, and
+    /// reading alone gives it nothing to retime with.
+    #[test]
+    fn fd_filestat_set_times_needs_the_set_times_right() {
+        use futures_lite::future::block_on;
+
+        let namespace = namespace_with_file();
+        let before = modified_nanos(&namespace);
+        let file = |rights| FsDescriptor {
+            flags: p1_descriptor_flags(rights, 0),
+            ..match regular_file() {
+                Preview1Descriptor::File { descriptor, .. } => descriptor,
+                _ => unreachable!("regular_file is a file"),
+            }
+        };
+
+        let reader = file(P1_RIGHT_FD_READ);
+        assert!(matches!(
+            reader.grant_touch().err(),
+            Some(fs_types::ErrorCode::ReadOnly)
+        ));
+        assert_eq!(modified_nanos(&namespace), before);
+
+        let retimer = file(P1_RIGHT_FD_FILESTAT_SET_TIMES);
+        block_on(wasi_fs::set_times(
+            &namespace,
+            retimer
+                .grant_touch()
+                .expect("FD_FILESTAT_SET_TIMES gives write"),
+            None,
+            Some(77),
+            78,
+        ))
+        .expect("the descriptor with the right sets the times");
+        assert_eq!(modified_nanos(&namespace), 77);
+    }
+
+    /// `path_filestat_set_times` is decided by the base: reading a
+    /// directory gives no right to retime below it, and the right to create
+    /// below it does.
+    #[test]
+    fn path_filestat_set_times_is_decided_by_the_base() {
+        use futures_lite::future::block_on;
+
+        let namespace = namespace_with_file();
+        let before = modified_nanos(&namespace);
+        let base = |rights| FsDescriptor {
+            path: "/".into(),
+            kind: FsNodeKind::Directory,
+            flags: p1_descriptor_flags(rights, 0),
+            identity: None,
+            mount: None,
+        };
+
+        let reader = base(P1_RIGHT_FD_READDIR);
+        assert_eq!(
+            p1_grant::<wasi_fs::Directory, wasi_fs::Retime>(&reader).err(),
+            Some(p1::errno::ROFS)
+        );
+        assert_eq!(modified_nanos(&namespace), before);
+
+        let creator = base(P1_RIGHT_PATH_CREATE_FILE);
+        block_on(wasi_fs::set_times_at(
+            &namespace,
+            p1_grant(&creator).expect("PATH_CREATE_FILE gives mutate-directory"),
+            "data",
+            None,
+            Some(88),
+            89,
+        ))
+        .expect("the base with the right sets the times");
+        assert_eq!(modified_nanos(&namespace), 88);
     }
 
     fn connected_socket_entry<Net: ComponentHostNetwork>(

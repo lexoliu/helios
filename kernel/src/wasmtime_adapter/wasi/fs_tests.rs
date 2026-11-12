@@ -9,8 +9,8 @@ use helios_hal::fs::{FileSystemRights, NodeKind, WritePosition};
 use super::{
     FsDescriptor, FsNodeKind, Granted, Kind, RegularFile, Right, Write, create_directory_at,
     fs_types, link_at, metadata_hash, open_at, read, read_program_file, readlink_at,
-    remove_directory_at, rename_at, set_size, set_times, stat_at, stat_path, symlink_at,
-    unlink_file_at, write_program_file,
+    remove_directory_at, rename_at, set_size, set_times, set_times_at, stat_at, stat_path,
+    symlink_at, unlink_file_at, write_program_file,
 };
 use crate::wasmtime_adapter::component_host::ProgramSource;
 use crate::wasmtime_adapter::cwasm::{self, UntrustedCwasm};
@@ -396,11 +396,17 @@ fn set_size_resizes_all_links_without_widening_descriptor_rights() {
 #[test]
 fn set_times_updates_stat_and_metadata_hash() {
     let namespace = namespace();
-    create_file(&namespace, "tmp", b"");
+    let file = create_file(&namespace, "tmp", b"");
     let before = metadata_hash(&block_on(stat_path(&namespace, "/tmp", Follow::No)).expect("stat"));
 
-    block_on(set_times(&namespace, "/tmp", Some(11), Some(17), 19))
-        .expect("set-times must succeed");
+    block_on(set_times(
+        &namespace,
+        file.grant_touch().expect("a file opened for writing"),
+        Some(11),
+        Some(17),
+        19,
+    ))
+    .expect("set-times must succeed");
     let metadata = block_on(stat_path(&namespace, "/tmp", Follow::No)).expect("stat must succeed");
     assert_eq!(metadata.access_nanos, 11);
     assert_eq!(metadata.modified_nanos, 17);
@@ -995,16 +1001,10 @@ fn a_read_only_base_renames_nothing_on_the_host_share() {
 
     let from_read_only =
         block_on(async { rename_at(&namespace, ro.grant()?, "old", rw.grant()?, "new", 1).await });
-    assert!(matches!(
-        from_read_only,
-        Err(fs_types::ErrorCode::ReadOnly)
-    ));
+    assert!(matches!(from_read_only, Err(fs_types::ErrorCode::ReadOnly)));
     let into_read_only =
         block_on(async { rename_at(&namespace, rw.grant()?, "old", ro.grant()?, "new", 1).await });
-    assert!(matches!(
-        into_read_only,
-        Err(fs_types::ErrorCode::ReadOnly)
-    ));
+    assert!(matches!(into_read_only, Err(fs_types::ErrorCode::ReadOnly)));
 }
 
 #[test]
@@ -1017,5 +1017,149 @@ fn a_read_only_base_unlinks_nothing_on_the_host_share() {
     assert!(matches!(reached, Err(fs_types::ErrorCode::Unsupported)));
 
     let refused = block_on(async { unlink_file_at(&namespace, ro.grant()?, "old").await });
+    assert!(matches!(refused, Err(fs_types::ErrorCode::ReadOnly)));
+}
+
+/// The times `/tmp` shows, as `(access, modified)`.
+fn times_of(namespace: &TestNamespace, path: &str) -> (u64, u64) {
+    let metadata = block_on(stat_path(namespace, path, Follow::No)).expect("stat must succeed");
+    (metadata.access_nanos, metadata.modified_nanos)
+}
+
+#[test]
+fn set_times_needs_write_on_the_descriptor() {
+    let namespace = namespace();
+    let file = create_file(&namespace, "tmp", b"");
+    let before = times_of(&namespace, "/tmp");
+    let read_only = FsDescriptor {
+        flags: fs_types::DescriptorFlags::READ,
+        ..file.clone()
+    };
+
+    let refused = read_only.grant_touch().err();
+    assert!(matches!(refused, Some(fs_types::ErrorCode::ReadOnly)));
+    assert_eq!(times_of(&namespace, "/tmp"), before);
+
+    let writer = FsDescriptor {
+        flags: fs_types::DescriptorFlags::WRITE,
+        ..file
+    };
+    block_on(set_times(
+        &namespace,
+        writer
+            .grant_touch()
+            .expect("a writable file may be retimed"),
+        Some(11),
+        Some(17),
+        19,
+    ))
+    .expect("a descriptor with write sets the times");
+    assert_eq!(times_of(&namespace, "/tmp"), (11, 17));
+
+    // A directory is retimed by the right to change it, not by `write`.
+    block_on(create_directory_at(&namespace, held(&root()), "dir", 1)).expect("creates /dir");
+    let directory = |flags| directory_holding("/dir", flags);
+    assert!(matches!(
+        directory(fs_types::DescriptorFlags::READ | fs_types::DescriptorFlags::WRITE)
+            .grant_touch()
+            .err(),
+        Some(fs_types::ErrorCode::ReadOnly)
+    ));
+    let mutator = directory(fs_types::DescriptorFlags::MUTATE_DIRECTORY);
+    block_on(set_times(
+        &namespace,
+        mutator.grant_touch().expect("a mutable directory"),
+        Some(23),
+        Some(29),
+        31,
+    ))
+    .expect("a directory descriptor with mutate-directory sets the times");
+    assert_eq!(times_of(&namespace, "/dir"), (23, 29));
+}
+
+#[test]
+fn set_times_asks_the_host_only_with_the_right() {
+    let namespace = namespace();
+    mount_unreachable_host(&namespace, "/mnt");
+    let file = |flags| FsDescriptor {
+        path: String::from("/mnt/a/file"),
+        kind: FsNodeKind::File,
+        flags,
+        ..root()
+    };
+
+    let reached = block_on(async {
+        set_times(
+            &namespace,
+            file(fs_types::DescriptorFlags::WRITE).grant_touch()?,
+            Some(1),
+            Some(2),
+            3,
+        )
+        .await
+    });
+    assert!(matches!(reached, Err(fs_types::ErrorCode::Unsupported)));
+
+    let refused = block_on(async {
+        set_times(
+            &namespace,
+            file(fs_types::DescriptorFlags::READ).grant_touch()?,
+            Some(1),
+            Some(2),
+            3,
+        )
+        .await
+    });
+    assert!(matches!(refused, Err(fs_types::ErrorCode::ReadOnly)));
+}
+
+#[test]
+fn set_times_at_needs_write_or_mutate_on_the_base() {
+    let namespace = namespace();
+    create_file(&namespace, "tmp", b"");
+    let before = times_of(&namespace, "/tmp");
+    let base = |flags| directory_holding("/", flags);
+
+    let refused = block_on(async {
+        set_times_at(
+            &namespace,
+            readonly_root().grant()?,
+            "tmp",
+            Some(11),
+            Some(17),
+            19,
+        )
+        .await
+    });
+    assert!(matches!(refused, Err(fs_types::ErrorCode::ReadOnly)));
+    assert_eq!(times_of(&namespace, "/tmp"), before);
+
+    for (flags, times) in [
+        (fs_types::DescriptorFlags::WRITE, (11, 17)),
+        (fs_types::DescriptorFlags::MUTATE_DIRECTORY, (23, 29)),
+    ] {
+        let base = base(flags);
+        block_on(set_times_at(
+            &namespace,
+            held(&base),
+            "tmp",
+            Some(times.0),
+            Some(times.1),
+            31,
+        ))
+        .expect("a base with write or mutate-directory sets the times");
+        assert_eq!(times_of(&namespace, "/tmp"), times);
+    }
+
+    // On the host share the refusal also comes before any request.
+    mount_unreachable_host(&namespace, "/mnt");
+    let (rw, ro) = host_bases();
+    let reached = block_on(async {
+        set_times_at(&namespace, rw.grant()?, "file", Some(1), Some(2), 3).await
+    });
+    assert!(matches!(reached, Err(fs_types::ErrorCode::Unsupported)));
+    let refused = block_on(async {
+        set_times_at(&namespace, ro.grant()?, "file", Some(1), Some(2), 3).await
+    });
     assert!(matches!(refused, Err(fs_types::ErrorCode::ReadOnly)));
 }

@@ -2,9 +2,9 @@
 //!
 //! A descriptor's rights are plain flags, and a flag nobody tests is a right
 //! nobody enforces. The operations in `fs.rs` therefore take a [`Granted`]
-//! instead of the descriptor: a value that only [`FsDescriptor::grant`] can
-//! make, and that it makes only after testing the kind and the right it
-//! names. A surface that forwards a call
+//! instead of the descriptor: a value that only [`FsDescriptor::grant`] and
+//! [`FsDescriptor::grant_touch`] can make, and that they make only after
+//! testing the kind and the right it names. A surface that forwards a call
 //! has to mint the proof to make the call, and an operation cannot skip the
 //! test because it never sees bare flags.
 //!
@@ -22,7 +22,7 @@ mod sealed {
 /// A right an operation needs from a descriptor.
 pub(crate) trait Right: sealed::Sealed {
     /// Holding any one of these grants the right.
-    const ANY_OF: fs_types::DescriptorFlags;
+    const ANY_OF: &'static [fs_types::DescriptorFlags];
     /// What the operation answers a descriptor without it.
     const REFUSED: fs_types::ErrorCode;
 }
@@ -41,31 +41,55 @@ pub(crate) enum Read {}
 pub(crate) enum Write {}
 /// The right to change a directory's entries.
 pub(crate) enum Mutate {}
+/// What changing the times of an object below a directory needs: its
+/// `write` or its `mutate-directory`.
+pub(crate) enum Retime {}
+/// What changing the times of a descriptor's own object needs, which depends
+/// on its kind: see [`FsDescriptor::grant_touch`].
+pub(crate) enum Touch {}
 
 /// A descriptor that names a directory.
 pub(crate) enum Directory {}
 /// A descriptor that names a regular file.
 pub(crate) enum RegularFile {}
+/// A descriptor of any kind.
+pub(crate) enum AnyKind {}
 
 impl sealed::Sealed for Read {}
 impl sealed::Sealed for Write {}
 impl sealed::Sealed for Mutate {}
+impl sealed::Sealed for Retime {}
 impl sealed::Sealed for Directory {}
 impl sealed::Sealed for RegularFile {}
+impl sealed::Sealed for AnyKind {}
 
 impl Right for Read {
-    const ANY_OF: fs_types::DescriptorFlags = fs_types::DescriptorFlags::READ;
+    const ANY_OF: &'static [fs_types::DescriptorFlags] = &[fs_types::DescriptorFlags::READ];
     const REFUSED: fs_types::ErrorCode = fs_types::ErrorCode::NotPermitted;
 }
 
 impl Right for Write {
-    const ANY_OF: fs_types::DescriptorFlags = fs_types::DescriptorFlags::WRITE;
+    const ANY_OF: &'static [fs_types::DescriptorFlags] = &[fs_types::DescriptorFlags::WRITE];
     const REFUSED: fs_types::ErrorCode = fs_types::ErrorCode::ReadOnly;
 }
 
 impl Right for Mutate {
-    const ANY_OF: fs_types::DescriptorFlags = fs_types::DescriptorFlags::MUTATE_DIRECTORY;
+    const ANY_OF: &'static [fs_types::DescriptorFlags] =
+        &[fs_types::DescriptorFlags::MUTATE_DIRECTORY];
     const REFUSED: fs_types::ErrorCode = fs_types::ErrorCode::ReadOnly;
+}
+
+impl Right for Retime {
+    const ANY_OF: &'static [fs_types::DescriptorFlags] = &[
+        fs_types::DescriptorFlags::WRITE,
+        fs_types::DescriptorFlags::MUTATE_DIRECTORY,
+    ];
+    const REFUSED: fs_types::ErrorCode = fs_types::ErrorCode::ReadOnly;
+}
+
+impl Kind for AnyKind {
+    const KIND: Option<FsNodeKind> = None;
+    const MISMATCH: fs_types::ErrorCode = fs_types::ErrorCode::Invalid;
 }
 
 impl Kind for Directory {
@@ -80,8 +104,8 @@ impl Kind for RegularFile {
 
 /// Proof that a descriptor names a `K` and holds the right `R`.
 ///
-/// Only [`FsDescriptor::grant`] makes one: its field is private to this
-/// module. It borrows the descriptor the call
+/// Only [`FsDescriptor::grant`] and [`FsDescriptor::grant_touch`] make one:
+/// its field is private to this module. It borrows the descriptor the call
 /// cloned at entry, so a later `fd_fdstat_set_rights` narrows the table
 /// entry and applies from the next call.
 pub(crate) struct Granted<'d, K, R> {
@@ -118,8 +142,23 @@ impl FsDescriptor {
         if K::KIND.is_some_and(|kind| kind != self.kind) {
             return Err(K::MISMATCH);
         }
-        if !self.flags.intersects(R::ANY_OF) {
+        if !R::ANY_OF.iter().any(|right| self.flags.contains(*right)) {
             return Err(R::REFUSED);
+        }
+        Ok(Granted::new(self))
+    }
+
+    /// Proves this descriptor may have its own times changed: a directory
+    /// needs `mutate-directory`, every other object needs `write`. The
+    /// refusal is `read-only`.
+    pub(crate) fn grant_touch(&self) -> FsOpResult<Granted<'_, AnyKind, Touch>> {
+        let needed = if self.kind == FsNodeKind::Directory {
+            fs_types::DescriptorFlags::MUTATE_DIRECTORY
+        } else {
+            fs_types::DescriptorFlags::WRITE
+        };
+        if !self.flags.contains(needed) {
+            return Err(fs_types::ErrorCode::ReadOnly);
         }
         Ok(Granted::new(self))
     }

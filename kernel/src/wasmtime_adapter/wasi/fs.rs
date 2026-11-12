@@ -508,8 +508,45 @@ where
         .map_err(fs_error_code)
 }
 
-/// Sets the times of the object `absolute` names; `None` leaves one alone.
+/// Sets the times of the object `target` names; `None` leaves one alone.
 pub(crate) async fn set_times<HostFs>(
+    namespace: &Namespace<HostFs>,
+    target: Granted<'_, AnyKind, Touch>,
+    access_nanos: Option<u64>,
+    modified_nanos: Option<u64>,
+    now: u64,
+) -> FsOpResult<()>
+where
+    HostFs: crate::HostFileSystem,
+{
+    set_times_of(
+        namespace,
+        &target.descriptor().path,
+        access_nanos,
+        modified_nanos,
+        now,
+    )
+    .await
+}
+
+/// Sets the times of the object at `path` below `base`; `None` leaves one
+/// alone.
+pub(crate) async fn set_times_at<HostFs>(
+    namespace: &Namespace<HostFs>,
+    base: Granted<'_, Directory, Retime>,
+    path: &str,
+    access_nanos: Option<u64>,
+    modified_nanos: Option<u64>,
+    now: u64,
+) -> FsOpResult<()>
+where
+    HostFs: crate::HostFileSystem,
+{
+    let absolute = child_path(base.descriptor(), path)?;
+    set_times_of(namespace, &absolute, access_nanos, modified_nanos, now).await
+}
+
+async fn set_times_of<HostFs>(
     namespace: &Namespace<HostFs>,
     absolute: &str,
     access_nanos: Option<u64>,
@@ -1378,7 +1415,7 @@ where
             })?;
         Ok(self::set_times(
             &namespace,
-            &descriptor.path,
+            descriptor.grant_touch()?,
             access_nanos,
             modified_nanos,
             now,
@@ -1469,22 +1506,23 @@ where
         data_access_timestamp: fs_types::NewTimestamp,
         data_modification_timestamp: fs_types::NewTimestamp,
     ) -> Result<(), FsError> {
-        let (absolute, namespace, access_nanos, modified_nanos, now) =
+        let (base, namespace, access_nanos, modified_nanos, now) =
             accessor.with(|mut access| {
                 let now = access.get().system_time_nanos();
                 let access_nanos = p3_new_timestamp_nanos(data_access_timestamp, now)?;
                 let modified_nanos = p3_new_timestamp_nanos(data_modification_timestamp, now)?;
                 let (base, namespace) = descriptor_in(access.get(), &descriptor)?;
-                let absolute = child_path(&base, &path)?;
-                Ok::<_, fs_types::ErrorCode>((
-                    absolute,
-                    namespace,
-                    access_nanos,
-                    modified_nanos,
-                    now,
-                ))
+                Ok::<_, fs_types::ErrorCode>((base, namespace, access_nanos, modified_nanos, now))
             })?;
-        Ok(self::set_times(&namespace, &absolute, access_nanos, modified_nanos, now).await?)
+        Ok(self::set_times_at(
+            &namespace,
+            base.grant()?,
+            &path,
+            access_nanos,
+            modified_nanos,
+            now,
+        )
+        .await?)
     }
 
     async fn link_at(
