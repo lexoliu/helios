@@ -813,8 +813,12 @@ fn an_event_round_trips_through_its_wire_bytes() {
 }
 
 /// Plays the device for a driver that is polling it: answers the one
-/// control command the driver has outstanding, or else the oldest
-/// period, and records the control request it read.
+/// control command the driver has outstanding, and records the control
+/// request it read. The oldest period is completed only once a
+/// `PCM_RELEASE` has been seen, because that is the command the
+/// specification makes complete pending I/O messages
+/// (virtio 1.2 §5.14.6.6.5.1) and QEMU's `PCM_STOP` only changes the
+/// stream's state.
 fn play_device(device: &VirtioSndDevice<FakeTransport>, requests: &mut Vec<Vec<u8>>) {
     let control = device
         .control
@@ -824,6 +828,12 @@ fn play_device(device: &VirtioSndDevice<FakeTransport>, requests: &mut Vec<Vec<u
     if let Some(&token) = control.first() {
         requests.push(control_request(device, token));
         answer_control(device, token, &S_OK.to_le_bytes());
+        return;
+    }
+    if !requests
+        .iter()
+        .any(|request| command_of(request) == R_PCM_RELEASE)
+    {
         return;
     }
     let tx = device
@@ -849,11 +859,11 @@ fn running_stream_and_a_period(device: &VirtioSndDevice<FakeTransport>) -> Vec<u
     alloc::vec![0x5a_u8; params().period_bytes as usize]
 }
 
-/// A quiesce stops a running stream, which is what lets the device
-/// complete the period it holds, and the period's writer still gets its
-/// answer afterwards.
+/// A quiesce releases a running stream that holds a period, which is
+/// what makes the device complete it (stopping alone does not), and the
+/// period's writer still gets its answer afterwards.
 #[test]
-fn quiesce_stops_a_running_stream_and_waits_for_its_periods() {
+fn quiesce_releases_a_running_stream_and_waits_for_its_periods() {
     let device = device();
     let period = running_stream_and_a_period(&device);
     let mut write = pin!(device.write(STREAM, &period));
@@ -867,8 +877,8 @@ fn quiesce_stops_a_running_stream_and_waits_for_its_periods() {
         })
         .expect("the device answers inside the deadline");
 
-    assert_eq!(requests.len(), 1);
-    assert_eq!(command_of(&requests[0]), R_PCM_STOP);
+    let commands: Vec<u32> = requests.iter().map(|request| command_of(request)).collect();
+    assert_eq!(commands, [R_PCM_STOP, R_PCM_RELEASE]);
     assert_eq!(
         block_on(poll_once(write.as_mut())),
         Some(Ok(helios_hal::audio::XferStatus { latency_bytes: 0 })),
@@ -1001,4 +1011,164 @@ fn a_refused_command_leaves_no_record_to_restore() {
         })
         .expect("a device with nothing to restore comes back");
     assert!(requests.is_empty());
+}
+
+/// Quiesces, resets the device behind the driver and re-initialises it,
+/// answering every command, and returns the commands it was asked to
+/// restore.
+fn quiesce_and_reinitialize(device: &VirtioSndDevice<FakeTransport>) -> Vec<u32> {
+    let mut ignored = Vec::new();
+    device
+        .quiesce(|| {
+            play_device(device, &mut ignored);
+            false
+        })
+        .expect("the device answers inside the deadline");
+    device.transport.reset_behind_the_driver();
+    let mut requests = Vec::new();
+    let _reset = device
+        .reinitialize(|| {
+            play_device(device, &mut requests);
+            false
+        })
+        .expect("the device comes back");
+    requests.iter().map(|request| command_of(request)).collect()
+}
+
+/// The machine froze after the task decided to send a command and before
+/// the command reached the device, with the task parked for room in the
+/// ring. The record holds only what the device acknowledged, so the
+/// command is not replayed; the device has never heard of it, and the
+/// task's own submission after the thaw is the one that counts.
+#[test]
+fn a_command_that_never_reached_the_device_is_not_replayed() {
+    let device = device();
+    // Fill the control ring with queries nobody has answered.
+    let mut parked = Vec::new();
+    while device
+        .control
+        .try_lock()
+        .expect("a parked driver does not hold the control queue lock")
+        .has_room_for(2)
+    {
+        let mut query = alloc::boxed::Box::pin(device.jacks());
+        assert!(block_on(poll_once(query.as_mut())).is_none());
+        parked.push(query);
+    }
+    let mut set = pin!(device.set_params(STREAM, params()));
+    assert!(
+        block_on(poll_once(set.as_mut())).is_none(),
+        "no room in the ring, so the command was not submitted"
+    );
+
+    assert_eq!(quiesce_and_reinitialize(&device), [], "nothing to restore");
+
+    // The thaw: the queries collect their answers, and the parked
+    // command goes out on the re-programmed ring and is acknowledged.
+    for query in &mut parked {
+        let _ = block_on(poll_once(query.as_mut()));
+    }
+    let in_flight = device
+        .control
+        .try_lock()
+        .expect("a parked driver does not hold the control queue lock")
+        .device_in_flight_heads();
+    assert!(in_flight.is_empty(), "the command was not submitted yet");
+    assert!(block_on(poll_once(set.as_mut())).is_none());
+    let token = device
+        .control
+        .try_lock()
+        .expect("a parked driver does not hold the control queue lock")
+        .device_in_flight_heads()[0];
+    answer_control(&device, token, &S_OK.to_le_bytes());
+    assert_eq!(block_on(poll_once(set.as_mut())), Some(Ok(())));
+    assert_eq!(device.records.lock()[0].params, Some(params()));
+}
+
+/// A command the device answered while the machine was freezing is in
+/// the record even though its caller has not run since: the quiesce
+/// reaped the answer for it.
+#[test]
+fn a_command_answered_during_the_freeze_is_replayed_once() {
+    let device = device();
+    let mut set = pin!(device.set_params(STREAM, params()));
+    let token = pending_control(&device, set.as_mut());
+    answer_control(&device, token, &S_OK.to_le_bytes());
+    assert_eq!(
+        device.records.lock()[0].params,
+        None,
+        "nobody has seen the answer yet"
+    );
+
+    assert_eq!(quiesce_and_reinitialize(&device), [R_PCM_SET_PARAMS]);
+
+    assert_eq!(
+        block_on(poll_once(set.as_mut())),
+        Some(Ok(())),
+        "the waiter still gets its answer"
+    );
+    assert_eq!(
+        device.records.lock()[0].params,
+        Some(params()),
+        "and applying it again changes nothing"
+    );
+}
+
+/// The same for a refusal: the quiesce reaps it, and the record never
+/// held the command, so a reset device is not told about it.
+#[test]
+fn a_command_refused_during_the_freeze_is_not_replayed() {
+    let device = device();
+    let mut set = pin!(device.set_params(STREAM, params()));
+    let token = pending_control(&device, set.as_mut());
+    answer_control(&device, token, &S_IO_ERR.to_le_bytes());
+
+    assert_eq!(quiesce_and_reinitialize(&device), []);
+
+    assert!(matches!(
+        block_on(poll_once(set.as_mut())),
+        Some(Err(AudioError::DeviceIo))
+    ));
+}
+
+/// A restore command that outlived its deadline is still the device's,
+/// so the device is lost: a second attempt is an error, not a panic.
+#[test]
+fn a_device_lost_by_a_timed_out_restore_is_refused_afterwards() {
+    let device = device();
+    let _ = running_stream_and_a_period(&device);
+    assert!(matches!(
+        device.reinitialize(|| true),
+        Err(ReinitError::RestoreTimedOut { .. })
+    ));
+    assert_eq!(
+        device.reinitialize(|| false),
+        Err(ReinitError::DeviceLost {
+            device: DeviceType::Sound
+        })
+    );
+}
+
+/// A re-initialisation that fails leaves the device FAILED and every
+/// command after it failing fast, instead of parking for a completion
+/// that will never come.
+#[test]
+fn a_failed_reinitialization_fails_the_commands_that_follow() {
+    let device = device();
+    device.transport.set_config_u32(super::CONFIG_STREAMS, 2);
+    assert!(matches!(
+        device.reinitialize(|| false),
+        Err(ReinitError::DeviceChanged { .. })
+    ));
+    assert!(
+        device
+            .transport
+            .status()
+            .contains(crate::transport::DeviceStatus::FAILED)
+    );
+
+    assert_eq!(
+        block_on(poll_once(device.prepare(STREAM))),
+        Some(Err(AudioError::Transport(IoError::DeviceFault)))
+    );
 }
