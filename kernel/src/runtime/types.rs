@@ -1167,6 +1167,24 @@ pub trait HostFileSystem: Clone + Send + 'static {
         restore: HostShareRestore,
     ) -> impl Future<Output = ()> + Send + '_;
 
+    /// Releases the host share so the VMM may snapshot the machine, and
+    /// holds it released: resolves once every operation in flight has
+    /// finished and the share's session and fids are returned to the
+    /// host. Operations issued from the moment this is called wait
+    /// rather than fail, until the hold ends through
+    /// [`Self::snapshot_finished`] or a machine restore reaches
+    /// [`Self::after_machine_restore`]. Calling it while the hold is
+    /// already in force is harmless. An implementation with no session
+    /// has nothing to release and resolves at once.
+    fn prepare_snapshot(&self) -> impl Future<Output = ()> + Send + '_;
+
+    /// Ends a hold taken by [`Self::prepare_snapshot`] because the
+    /// snapshot is over and this machine, the source, runs on. Waiting
+    /// operations resume and the session is attached again. A no-op when
+    /// no hold is in force, which is the case once a machine restore has
+    /// already ended it.
+    fn snapshot_finished(&self);
+
     fn stat_path<'a>(
         &'a self,
         path: &'a str,
