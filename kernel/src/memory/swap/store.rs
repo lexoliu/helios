@@ -84,14 +84,6 @@
 //! to `limit * accept_percent / 100` frames of objects: the hysteresis keeps
 //! it from flapping at the boundary.
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the eviction ladder that drives the store is the next stage"
-    )
-)]
-
 extern crate alloc;
 
 use alloc::boxed::Box;
@@ -247,7 +239,10 @@ impl StoreFrames {
 
     /// Frees the granules of an object whose slot the caller holds the claim
     /// on, and queues its frame for the owner. Any processor.
-    pub(super) fn free_object(&self, object: StoredObject) {
+    ///
+    /// Returns whether this free queued the frame, which is when the owner
+    /// has a drain to do.
+    pub(super) fn free_object(&self, object: StoredObject) -> bool {
         let frame = self.frame(object.frame());
         let first = object.first().raw();
         let granules = object_granules(object.len().get());
@@ -255,25 +250,27 @@ impl StoreFrames {
         frame
             .occupied
             .fetch_and(!run_mask(first, granules), Ordering::AcqRel);
-        self.mark_dirty(object.frame());
+        self.mark_dirty(object.frame())
     }
 
     /// Frees a parked page's frame and queues it for the owner. Any
-    /// processor.
-    pub(super) fn free_parked(&self, index: StoreFrameIndex) {
+    /// processor. Returns whether this free queued the frame.
+    pub(super) fn free_parked(&self, index: StoreFrameIndex) -> bool {
         let frame = self.frame(index);
         frame.starts.fetch_and(!1, Ordering::AcqRel);
         frame.occupied.fetch_and(!FULL, Ordering::AcqRel);
-        self.mark_dirty(index);
+        self.mark_dirty(index)
     }
 
     /// Queues the frame for the owner's next drain, once however many
-    /// frees land before it.
-    pub(super) fn mark_dirty(&self, index: StoreFrameIndex) {
+    /// frees land before it. Returns whether this call queued it.
+    pub(super) fn mark_dirty(&self, index: StoreFrameIndex) -> bool {
         let frame = self.frame(index);
-        if !frame.dirty_queued.swap(true, Ordering::AcqRel) {
+        let queued = !frame.dirty_queued.swap(true, Ordering::AcqRel);
+        if queued {
             self.dirty.push(self, nonzero(index));
         }
+        queued
     }
 
     /// The LZ4 block of an object, for the holder of the claim on `slot`.
@@ -328,7 +325,20 @@ impl StoreFrames {
         unsafe { slice::from_raw_parts(frame.bytes(), PhysFrame::SIZE) }
     }
 
+    /// A frame's bytes, for a test that corrupts a stored object.
+    #[cfg(test)]
+    pub(super) fn frame_bytes(&self, index: StoreFrameIndex) -> *mut u8 {
+        self.frame(index).bytes()
+    }
+
     /// The slot a frame's parked page belongs to, as its raw index.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "writeback and compaction, the next commit, read the reverse map"
+        )
+    )]
     pub(super) fn parked_slot(&self, index: StoreFrameIndex) -> u32 {
         self.frame(index).parked_slot.load(Ordering::Acquire)
     }
@@ -339,6 +349,13 @@ impl StoreFrames {
     }
 
     /// The first granule of each object in a frame, as a bitmap.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "writeback and compaction, the next commit, walk a frame's objects"
+        )
+    )]
     pub(super) fn starts(&self, index: StoreFrameIndex) -> u64 {
         self.frame(index).starts.load(Ordering::Acquire)
     }
@@ -454,11 +471,13 @@ impl Store {
         self.held - usize::from(self.spare.is_some())
     }
 
+    #[cfg(test)]
     pub(super) fn has_spare(&self) -> bool {
         self.spare.is_some()
     }
 
     /// The spare frame, if one is held.
+    #[cfg(test)]
     pub(super) fn spare(&self) -> Option<StoreFrameIndex> {
         self.spare
     }
@@ -693,6 +712,15 @@ impl Store {
         }
         if bucket.is_empty() {
             self.non_empty &= !(1 << run);
+        }
+    }
+
+    /// Gives the spare back to the pool, so a test can check the pool is as
+    /// it was found.
+    #[cfg(test)]
+    pub(super) fn release_spare(&mut self, shared: &StoreFrames) {
+        if let Some(index) = self.spare.take() {
+            self.release(shared, index);
         }
     }
 

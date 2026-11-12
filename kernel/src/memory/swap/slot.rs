@@ -158,13 +158,6 @@ pub(super) struct StoredObject {
     len: CompressedLen,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "only the store uses it, and the eviction ladder that drives the store is the next stage"
-    )
-)]
 impl StoreFrameIndex {
     /// The frame at `raw` in the store's frame table, or `None` for index
     /// 0 (unused) or one the slot word cannot carry.
@@ -180,13 +173,6 @@ impl StoreFrameIndex {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "only the store uses it, and the eviction ladder that drives the store is the next stage"
-    )
-)]
 impl Granule {
     /// The granule at `raw`, or `None` past the end of a frame.
     pub(super) fn new(raw: usize) -> Option<Self> {
@@ -198,13 +184,6 @@ impl Granule {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "only the store uses it, and the eviction ladder that drives the store is the next stage"
-    )
-)]
 impl CompressedLen {
     /// Bytes of the compressed block, without its header.
     pub(super) fn get(self) -> usize {
@@ -212,13 +191,6 @@ impl CompressedLen {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "only the store uses it, and the eviction ladder that drives the store is the next stage"
-    )
-)]
 impl StoredObject {
     pub(super) fn new(frame: StoreFrameIndex, first: Granule, len: CompressedLen) -> Self {
         Self { frame, first, len }
@@ -245,24 +217,10 @@ impl StoredObject {
 /// because a 64-granule object saves nothing; that bound comes from the
 /// frame size.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the eviction ladder that consults the gate is the next stage"
-    )
-)]
 pub(super) struct Gate {
     accept_granules: u8,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the eviction ladder that consults the gate is the next stage"
-    )
-)]
 impl Gate {
     /// A gate that accepts objects of up to `accept_granules` granules, or
     /// `None` outside `1..`[`GRANULES_PER_FRAME`].

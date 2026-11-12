@@ -607,9 +607,9 @@ unsafe fn range_bytes<'a>(range: PhysFrameRange) -> &'a mut [u8] {
 #[cfg(test)]
 mod tests {
     use super::{
-        BalloonHandle, BalloonService, INFLATE_RUN_FRAMES, MemoryBalloon, MemoryStat,
-        MemoryStatTag, PRESSURE_FLOOR_DIVISOR, PhysFrame, PhysFrameAllocator,
-        publish_stats_forever,
+        BalloonHandle, BalloonService, INFLATE_RUN_FRAMES, MIN_REPORT_RUN_FRAMES, MemoryBalloon,
+        MemoryStat, MemoryStatTag, PRESSURE_FLOOR_DIVISOR, PhysFrame, PhysFrameAllocator,
+        REPORT_RUNS_PER_PASS, publish_stats_forever,
     };
     use crate::memory::user::UserMemoryPool;
     use alloc::boxed::Box;
@@ -645,6 +645,7 @@ mod tests {
         actual: AtomicU32,
         deflate_on_oom: bool,
         inflated_frames: Mutex<Vec<usize>>,
+        inflated_ranges: Mutex<Vec<core::ops::Range<usize>>>,
         deflated_frames: Mutex<Vec<usize>>,
         published: Mutex<Vec<MemoryStat>>,
         /// Requests answered before the queue starts failing, so a test
@@ -717,6 +718,13 @@ mod tests {
 
         async fn inflate(&self, ranges: &mut [&mut [u8]]) -> Result<(), IoError> {
             self.inner.inflated_frames.lock().push(frames_of(ranges));
+            self.inner
+                .inflated_ranges
+                .lock()
+                .extend(ranges.iter().map(|range| {
+                    let start = range.as_ptr() as usize;
+                    start..start + range.len()
+                }));
             Ok(())
         }
 
@@ -1016,6 +1024,76 @@ mod tests {
             !poll_once(core::pin::pin!(handle.shared.work.notified())),
             "three raises of the same level-triggered signal owe one wake"
         );
+    }
+
+    /// Whether `frame`, the first byte of a frame, lies in any of `ranges`.
+    fn covers(ranges: &[core::ops::Range<usize>], frame: usize) -> bool {
+        ranges.iter().any(|range| range.contains(&frame))
+    }
+
+    /// Compressed-store frames are allocated from the user pool, so the
+    /// balloon, which takes only free runs, never reaches them: asking for
+    /// the whole machine inflates within the floor, no inflated range holds a
+    /// store frame, and the store still reads back what it holds.
+    #[test]
+    fn inflation_never_takes_a_compressed_store_frame() {
+        use crate::memory::swap::test_pool::{HeldStoreFrames, serialise};
+
+        let _turn = serialise();
+        let pool = crate::memory::user::installed_user_memory_pool().expect("the test pool");
+        let store = HeldStoreFrames::new(24);
+        let total = PhysFrameAllocator::stats(pool).total_frames;
+        let floor = total / PRESSURE_FLOOR_DIVISOR;
+        let device = FakeBalloon::new(false);
+        let (mut service, _handle) = service(pool, device.clone());
+
+        device.set_target_pages(u32::try_from(total).expect("frame count fits a u32"));
+        block_on(service.adjust());
+
+        assert!(service.held_frames() > 0, "the balloon inflated");
+        assert!(
+            free_frames(pool) >= floor,
+            "inflation stays above the floor"
+        );
+        let inflated = device.inner.inflated_ranges.lock().clone();
+        for &frame in store.addresses() {
+            assert!(
+                !covers(&inflated, frame),
+                "the balloon holds the store frame at {frame:#x}"
+            );
+        }
+        device.set_target_pages(0);
+        block_on(service.adjust());
+        assert_eq!(service.held_frames(), 0);
+    }
+
+    /// A free-page reporting pass names free runs only, so it never names a
+    /// frame the store holds.
+    #[test]
+    fn a_reporting_pass_never_names_a_compressed_store_frame() {
+        use crate::memory::swap::test_pool::{HeldStoreFrames, serialise};
+
+        let _turn = serialise();
+        let pool = crate::memory::user::installed_user_memory_pool().expect("the test pool");
+        let store = HeldStoreFrames::new(24);
+        let mut named = Vec::new();
+        let count = block_on(PhysFrameAllocator::free_runs(
+            pool,
+            MIN_REPORT_RUN_FRAMES,
+            REPORT_RUNS_PER_PASS,
+            |run| {
+                let start = run.start.phys_addr();
+                named.push(start..start + run.byte_size());
+                async {}
+            },
+        ));
+        assert!(count > 0, "the pool has free runs to name");
+        for &frame in store.addresses() {
+            assert!(
+                !covers(&named, frame),
+                "a reporting pass named the store frame at {frame:#x}"
+            );
+        }
     }
 
     /// The configuration-change future is what the service parks on, so

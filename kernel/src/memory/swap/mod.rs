@@ -4,24 +4,61 @@
 //!
 //! # Shape
 //!
-//! One task owns the device. It holds the [`SwapBackend`], the table of
-//! backend tokens of the pages the device holds, and the single
-//! page-sized staging buffer that every transfer goes through, and it is
-//! the only thing that ever talks to the swap device. Callers reach it
-//! through [`SwapHandle`], which is a queue plus a notification: a page
-//! fault pushes a request and waits, a teardown pushes tokens to release
-//! and does not.
+//! A swapped-out page is in one of three tiers, tried in this order when
+//! the page leaves memory:
 //!
-//! What a page-table entry's token names is a slot of the shared
-//! [`slot`] table, one atomic word per swapped page that says where its
-//! bytes are. The owner reserves slots, and claims one for the length of
-//! a transfer; the claim protocol and its concurrency contract are in
-//! that module.
+//! 1. **Zero.** A page of zeros has no storage at all: its slot says so.
+//! 2. **The compressed store** ([`store`]): the page, LZ4-compressed, in a
+//!    frame of the user pool shared with other compressed pages. A page
+//!    takes it when it compresses to the policy's bound and the store is
+//!    under its limit.
+//! 3. **The swap device**, when one is attached: the compressed block if
+//!    the page compressed well enough but the store was full, the raw page
+//!    otherwise.
+//!
+//! A page that none of them takes goes back into memory. A page whose
+//! device write is refused is parked, raw, in the store's spare frame, so a
+//! detached page always has somewhere to go that needs no allocation and no
+//! device.
+//!
+//! What a page-table entry's token names is a slot of the shared [`slot`]
+//! table, one atomic word per swapped page that says which tier holds its
+//! bytes. The claim protocol and its concurrency contract are in that
+//! module.
+//!
+//! **One task owns eviction.** It holds the optional disk, the table of
+//! backend tokens of the pages the disk holds, the store's allocator, and
+//! the single page-sized staging buffer that every transfer goes through,
+//! and it is the only thing that ever talks to the swap device. Callers
+//! reach it through [`SwapHandle`]: a teardown pushes tokens to release
+//! and does not wait, and a fault on a disk page pushes a request and waits.
+//!
+//! **A fault on a page the RAM tiers hold is resolved where it is taken**,
+//! on the faulting processor, with no queue: it claims the slot word,
+//! decompresses straight into the frame the address space is about to map,
+//! and reinstates it ([`SwapHandle::fault_in`]). Compression is CPU work
+//! with no device behind it, so there is nothing for an owner task to
+//! serialise.
 //!
 //! Serialising device access through one task is deliberate. There is one
 //! scratch disk, the transfers are page-sized, and a single owner means
 //! the backend tokens need no lock and the staging buffer needs no
 //! allocation per fault.
+//!
+//! # Concurrency contract
+//!
+//! | Operation | Where | Synchronisation |
+//! | --- | --- | --- |
+//! | Fault on a zero, stored or parked page | Faulting processor | Lock-free claim of the slot word; the address space's reservation lock inside `swap_in_page`. No await between claim and release. |
+//! | Fault on a disk page | Owner task, through the queue | Owner-only state |
+//! | Wait on a reserved or claimed slot | Faulting processor | [`ProgressSignal`]: mark before the test, then wait for a change |
+//! | Eviction, compression, store allocation, orphan release, store drain | Owner task | Owner-only state, plus claims on slot words |
+//! | [`SwapHandle::stats`] | Any | Relaxed sums of per-processor counters |
+//! | [`SwapHandle::set_policy`] | Any | Relaxed stores to the settings |
+//!
+//! Nothing here is reachable from an interrupt handler or from trap
+//! context: the fault entry classifies the address and redirects to the
+//! trampoline, and the resolution runs on the fiber afterwards.
 //!
 //! # Who blocks where
 //!
@@ -72,11 +109,11 @@
 //!
 //! Two more properties keep a page that has just come back from being
 //! taken straight out again. A reinstated page is mapped with its
-//! access flag set, so it reads as hot for a full aging cycle and the
-//! `Red` phase — which takes only cold pages — passes over it; and an
+//! access flag set, so it reads as hot for a full aging cycle and both
+//! phases — which take only cold pages — pass over it; and an
 //! instance that has just taken a fault or made a host call is by
-//! definition not ten seconds idle, so the `Yellow` phase, which
-//! ignores age, has no claim on it either. That is what makes
+//! definition not idle for the policy's `idle_after`, so the `Yellow`
+//! phase has no claim on it either. That is what makes
 //! [`SwapHandle::ensure_present`] a sound contract for kernel paths:
 //! the pages it faults in stay in until the host call that asked for
 //! them has finished with them.
@@ -84,14 +121,19 @@
 //! # Order against the balloon
 //!
 //! Both this and the memory balloon (`super::balloon`) read the same
-//! [`PressureLevel`]. Swap acts first: at `Yellow` it evicts idle
-//! instances, which costs a fault later, while the balloon at that point
-//! only reports free pages to the host. At `Red` the balloon is already
-//! forbidden to inflate past its floor and deflates on demand from the
-//! out-of-memory path, so the ordering under pressure is: give the host
-//! back nothing, swap cold pages out, and only then let the OOM killer
-//! condemn an instance. A swap-out pass that frees nothing is what
-//! hands the decision on.
+//! [`PressureLevel`]. Swap acts first: at `Yellow` it evicts the cold
+//! pages of idle instances, which costs a fault later, while the balloon at
+//! that point only reports free pages to the host. At `Red` the balloon is
+//! already forbidden to inflate past its floor and deflates on demand from
+//! the out-of-memory path, so the ordering under pressure is: give the host
+//! back nothing, swap cold pages out, and let the out-of-memory path act
+//! when a grow still fails. That path (`wasmtime_adapter::store`) acts on a
+//! failed grow independently of swap; a swap pass is one way memory comes
+//! free before it does, not a stage the killer waits on.
+//!
+//! Frames the compressed store holds are allocated from the same pool the
+//! balloon and free-page reporting draw on, so neither can reach them:
+//! compression only ever shows as more free frames.
 
 extern crate alloc;
 
@@ -99,7 +141,7 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU8, Ordering};
 use core::time::Duration;
 
 use concurrent_queue::ConcurrentQueue;
@@ -108,41 +150,42 @@ use helios_hal::pmm::PhysFrame;
 use helios_hal::vmm::{
     AddressSpaceError, PageAge, PageFlags, SwapBackend, SwapToken, VirtAddr, VirtRange,
 };
+use lz4_flex::block::{CompressTable, compress_into_with_table, decompress_into};
 use slab::Slab;
 use spin::Once;
 use thiserror::Error;
 
 use crate::exec::Spawner;
-use crate::exec::{PressureLevel, monotonic_nanos};
+use crate::exec::{PressureLevel, ProgressMark, ProgressSignal, monotonic_nanos, yield_now};
 use crate::instance::{InstanceId, InstanceRegistry, OffProcessor};
 use crate::{Notify, Timer};
 
 use super::owner::MemoryOwner;
 use super::user::user_heap_stats;
 
+mod counters;
 mod hooks;
 mod leaf;
+mod policy;
 mod slot;
 mod space;
 mod stack;
 mod store;
 
+use counters::{Counters, FaultSource, Placement, Totals};
+use policy::PolicyCells;
 use slot::{Claim, DiskKey, SlotAllocator, SlotIndex, SlotState, SlotTable};
+use store::{Limits, Store, StoreFrames, StoreFull};
 
 pub use hooks::{InstalledAddressSpace, swap_vm_hooks};
 pub use leaf::{AGE_BATCH_PAGES, SwapLeafFormat};
+pub use policy::{SwapPolicy, SwapPolicyError};
 pub use space::SwapSpace;
-
-/// How long an instance has to have been off every processor before a
-/// `Yellow` pass will evict it. Ten seconds is long enough that an
-/// instance between two guest calls is never mistaken for an idle one,
-/// and short enough that a shell left open for a minute pays for itself.
-pub const IDLE_SWAP_AFTER: Duration = Duration::from_secs(10);
 
 /// Bytes one pass moves before it re-reads the pressure level. A pass
 /// holds no lock across its transfers, but it does hold the swap device,
 /// so it stops often enough for a fault to overtake it.
-pub const SWAP_BATCH_BYTES: usize = 2 * 1024 * 1024;
+const SWAP_BATCH_BYTES: usize = 2 * 1024 * 1024;
 
 /// How often the policy re-reads pressure when nothing else wakes it.
 pub const SWAP_TICK: Duration = Duration::from_millis(500);
@@ -184,10 +227,10 @@ pub enum SwapDisabled {
 pub enum SwapFaultError {
     #[error("no swap backend is configured on this platform")]
     NotConfigured,
-    #[error("swap map has no entry for the token the page table carried")]
-    UnknownToken,
     #[error("the swap backend could not read the page back")]
     Backend,
+    #[error("the user pool had no frame to bring the page back into")]
+    OutOfFrames,
     #[error("the address space refused to reinstate the page")]
     AddressSpace,
     #[error("the page's contents were lost: neither memory nor the swap backend holds them")]
@@ -313,8 +356,19 @@ struct SwapShared {
     /// One word per swapped-out page: where its bytes are. Shared, with
     /// the concurrency contract in [`slot`].
     slots: SlotTable,
-    counters: SwapCounters,
+    /// The compressed store's frames: shared so a fault on any processor
+    /// can read and free an object. The allocator is the owner's.
+    store: StoreFrames,
+    /// Raised whenever a slot a fault may be waiting on is published, put
+    /// back or freed, and whenever the owner finishes placing a page.
+    released: ProgressSignal,
+    policy: PolicyCells,
+    counters: Counters,
+    /// The address space's swap surface, which the fault path reaches
+    /// without the owner.
+    hooks: &'static SwapVmHooks,
     backend: &'static str,
+    capacity_bytes: u64,
     /// Reads the time a fault is issued and the time it completes, so
     /// both ends of its latency come from one clock.
     clock: SwapClock,
@@ -335,16 +389,6 @@ impl SwapClock {
     }
 }
 
-#[derive(Default)]
-struct SwapCounters {
-    capacity_bytes: AtomicU64,
-    used_bytes: AtomicU64,
-    pages_out: AtomicU64,
-    pages_in: AtomicU64,
-    faults_served: AtomicU64,
-    fault_latency_total_nanos: AtomicU64,
-}
-
 struct SwapFaultRequest {
     addr: VirtAddr,
     reply: Arc<SwapFaultReply>,
@@ -355,7 +399,7 @@ struct SwapFaultRequest {
 
 const FAULT_PENDING: u8 = 0;
 const FAULT_RESOLVED: u8 = 1;
-const FAULT_UNKNOWN_TOKEN: u8 = 2;
+const FAULT_OUT_OF_FRAMES: u8 = 2;
 const FAULT_BACKEND: u8 = 3;
 const FAULT_ADDRESS_SPACE: u8 = 4;
 const FAULT_PAGE_LOST: u8 = 5;
@@ -389,7 +433,7 @@ impl SwapFaultReply {
         match self.outcome.load(Ordering::Acquire) {
             FAULT_PENDING => None,
             FAULT_RESOLVED => Some(Ok(())),
-            FAULT_UNKNOWN_TOKEN => Some(Err(SwapFaultError::UnknownToken)),
+            FAULT_OUT_OF_FRAMES => Some(Err(SwapFaultError::OutOfFrames)),
             FAULT_BACKEND => Some(Err(SwapFaultError::Backend)),
             FAULT_ADDRESS_SPACE => Some(Err(SwapFaultError::AddressSpace)),
             FAULT_PAGE_LOST => Some(Err(SwapFaultError::PageLost)),
@@ -403,19 +447,102 @@ impl SwapFaultReply {
 /// than this has a problem swap cannot fix.
 const MAX_INFLIGHT_FAULTS: usize = 256;
 
+/// What one look at a faulting page's slot led to.
+enum Step {
+    /// The page is present, or no entry names a swap slot any more.
+    Done,
+    /// Something moved under the look: read the entry again.
+    Again,
+    /// The slot is held by another path. Waits for a change after the mark,
+    /// which was taken before the slot was read.
+    Wait(ProgressMark),
+    /// The page is on the disk, which only the owner reads. The token is the
+    /// entry's, and the key is where the slot says its backend token is.
+    Disk(SwapToken, DiskKey),
+    Failed(SwapFaultError),
+}
+
+/// What the fill of a RAM-tier reinstatement copies or decodes from. Built
+/// on the faulting processor around the claim it holds.
+struct RamFill<'a> {
+    frames: &'a StoreFrames,
+    claim: &'a Claim,
+    state: SlotState,
+}
+
+impl RamFill<'_> {
+    /// Writes the page's bytes into `page`, which is one frame.
+    ///
+    /// # Panics
+    ///
+    /// If a stored object does not decode to exactly one page. The kernel is
+    /// the only writer of the store, so a block that fails to decode, or
+    /// decodes short, means the store's bookkeeping or its memory is
+    /// corrupt, which is never masked.
+    fn write(&self, page: &mut [u8]) {
+        match self.state {
+            SlotState::Zero => page.fill(0),
+            SlotState::Stored(object) => {
+                let block = self.frames.payload(object, self.claim);
+                match decompress_into(block, page) {
+                    Ok(len) if len == PhysFrame::SIZE => {}
+                    outcome => panic!(
+                        "swap slot {} holds a store object (frame {}, granule {}, {} bytes) that \
+                         decodes to {outcome:?} instead of one page",
+                        self.claim.index().raw(),
+                        object.frame().raw(),
+                        object.first().raw(),
+                        object.len().get(),
+                    ),
+                }
+            }
+            SlotState::Parked(frame) => {
+                page.copy_from_slice(self.frames.parked_page(frame, self.claim));
+            }
+            other => unreachable!("a RAM-tier fill was built for the settled state {other:?}"),
+        }
+    }
+}
+
+impl SwapShared {
+    /// Ends a claim by putting a settled word back, and tells the faults
+    /// waiting on the slot.
+    fn restore(&self, claim: Claim, state: SlotState) {
+        self.slots.publish(claim, state);
+        self.released.signal();
+    }
+
+    /// Ends a claim by giving the slot's index back, and tells the faults
+    /// waiting on it.
+    fn release(&self, claim: Claim) {
+        self.slots.free(claim);
+        self.released.signal();
+    }
+}
+
 impl SwapHandle {
-    fn new(backend: &'static str, capacity_bytes: u64, clock: SwapClock) -> Self {
-        let counters = SwapCounters::default();
-        counters
-            .capacity_bytes
-            .store(capacity_bytes, Ordering::Release);
+    fn new(
+        backend: &'static str,
+        capacity_bytes: u64,
+        clock: SwapClock,
+        hooks: &'static SwapVmHooks,
+        processors: usize,
+    ) -> Self {
+        // The store can never hold more frames than the pool has.
+        let pool_frames = user_heap_stats().total_bytes / PhysFrame::SIZE;
         Self {
             shared: Arc::new(SwapShared {
                 faults: ConcurrentQueue::bounded(MAX_INFLIGHT_FAULTS),
                 work: Notify::new(),
                 slots: SlotTable::new(),
-                counters,
+                store: StoreFrames::new(pool_frames),
+                released: ProgressSignal::new(),
+                policy: PolicyCells::new(SwapPolicy::default())
+                    .expect("the default policy is within its ranges"),
+                counters: Counters::new(processors),
+                hooks,
                 backend,
+                capacity_bytes,
                 clock,
             }),
         }
@@ -423,22 +550,34 @@ impl SwapHandle {
 
     /// What swap is holding right now.
     pub fn stats(&self) -> SwapStats {
-        let counters = &self.shared.counters;
-        let faults_served = counters.faults_served.load(Ordering::Acquire);
-        let latency_total = counters.fault_latency_total_nanos.load(Ordering::Acquire);
+        let totals = self.shared.counters.totals();
+        let faults = totals.faults();
         SwapStats {
             backend: self.shared.backend,
-            capacity_bytes: counters.capacity_bytes.load(Ordering::Acquire),
-            used_bytes: counters.used_bytes.load(Ordering::Acquire),
-            pages_out: counters.pages_out.load(Ordering::Acquire),
-            pages_in: counters.pages_in.load(Ordering::Acquire),
-            faults_served,
-            mean_fault_latency_nanos: latency_total.checked_div(faults_served).unwrap_or(0),
+            capacity_bytes: self.shared.capacity_bytes,
+            used_bytes: totals.disk_pages * PhysFrame::SIZE as u64,
+            pages_out: totals.pages_out(),
+            pages_in: faults,
+            faults_served: faults,
+            mean_fault_latency_nanos: totals.fault_wait_nanos.checked_div(faults).unwrap_or(0),
         }
     }
 
-    /// Reads the page at `addr` back into memory, waiting for the swap
-    /// device.
+    /// The settings in force.
+    pub fn policy(&self) -> SwapPolicy {
+        self.shared.policy.load()
+    }
+
+    /// Replaces the settings. The policy reads them once per decision, so a
+    /// change takes effect at the next one.
+    pub fn set_policy(&self, policy: SwapPolicy) -> Result<(), SwapPolicyError> {
+        self.shared.policy.set(policy)?;
+        self.poke();
+        Ok(())
+    }
+
+    /// Brings the page at `addr` back into memory, waiting only when its
+    /// bytes are on the swap device or another path holds its slot.
     ///
     /// This is what the page-fault trampoline blocks the faulting fiber
     /// on, and what [`Self::ensure_present`] calls per page.
@@ -449,15 +588,37 @@ impl SwapHandle {
     /// instruction is retried either way, and if the entry has since been
     /// released or decommitted the retry takes a fresh fault that the
     /// fault entry classifies again.
+    ///
+    /// A page in a RAM tier is resolved right here, on the calling
+    /// processor, with no await between claiming its slot and releasing it
+    /// (see the module's concurrency contract).
     pub async fn fault_in(&self, addr: VirtAddr) -> Result<(), SwapFaultError> {
         // A fault reports the address the instruction touched, not the
         // page it lives in; everything below this point works in pages.
         let addr = addr.page_floor();
+        let issued_nanos = self.shared.clock.now_nanos();
+        loop {
+            match self.step(addr, issued_nanos) {
+                Step::Done => return Ok(()),
+                Step::Again => {}
+                Step::Wait(mark) => self.shared.released.changed(mark).await,
+                Step::Disk(..) => return self.fault_via_owner(addr, issued_nanos).await,
+                Step::Failed(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Queues a fault on a disk page for the owner and waits for its reply.
+    async fn fault_via_owner(
+        &self,
+        addr: VirtAddr,
+        issued_nanos: u64,
+    ) -> Result<(), SwapFaultError> {
         let reply = Arc::new(SwapFaultReply::new());
         let request = SwapFaultRequest {
             addr,
             reply: reply.clone(),
-            issued_nanos: self.shared.clock.now_nanos(),
+            issued_nanos,
         };
         if self.shared.faults.push(request).is_err() {
             // The queue is full or closed. Either way nothing will ever
@@ -474,6 +635,132 @@ impl SwapHandle {
         }
     }
 
+    /// One look at the slot the entry at `addr` names, resolving the page if
+    /// a RAM tier holds it. The owner runs this too, for the faults it is
+    /// handed.
+    fn step(&self, addr: VirtAddr, issued_nanos: u64) -> Step {
+        let shared = &*self.shared;
+        let Some(token) = (shared.hooks.swapped_token)(addr) else {
+            return Step::Done;
+        };
+        let index = SlotIndex::from_token(token).unwrap_or_else(|| {
+            panic!(
+                "the entry at {:#x} carries swap token {token:?}, past the slot table",
+                addr.raw()
+            )
+        });
+        // Armed before the slot is read: a path that publishes it after the
+        // read still lands after the mark.
+        let mark = shared.released.mark();
+        let state = shared.slots.state(index);
+        match state {
+            SlotState::Zero | SlotState::Stored(_) | SlotState::Parked(_) => {
+                self.resolve_in_place(addr, token, index, state, issued_nanos)
+            }
+            SlotState::Disk(key) => Step::Disk(token, key),
+            SlotState::Lost => Step::Failed(SwapFaultError::PageLost),
+            SlotState::Reserved | SlotState::Claimed => {
+                shared.counters.here().contended_wait();
+                Step::Wait(mark)
+            }
+            SlotState::Free { .. } | SlotState::Vacant => {
+                // The slot was freed after the entry was read, which means
+                // the entry was consumed: read it again. If it still names
+                // the slot, a live entry references a slot with no page
+                // behind it.
+                assert!(
+                    (shared.hooks.swapped_token)(addr) != Some(token),
+                    "the entry at {:#x} carries swap token {token:?}, whose slot reads {state:?}",
+                    addr.raw()
+                );
+                Step::Again
+            }
+        }
+    }
+
+    /// Reinstates a page a RAM tier holds: claims the slot, decodes straight
+    /// into the frame the address space maps, and releases the storage.
+    ///
+    /// The claim is held across no await.
+    fn resolve_in_place(
+        &self,
+        addr: VirtAddr,
+        token: SwapToken,
+        index: SlotIndex,
+        state: SlotState,
+        issued_nanos: u64,
+    ) -> Step {
+        let shared = &*self.shared;
+        let Ok(claim) = shared.slots.claim(index, state) else {
+            return Step::Again;
+        };
+        let fill = RamFill {
+            frames: &shared.store,
+            claim: &claim,
+            state,
+        };
+        let mut context = &fill;
+        let result = (shared.hooks.swap_in_page)(
+            addr,
+            token,
+            (&raw mut context).cast::<()>(),
+            |context, page| {
+                // SAFETY: `context` is the reference above, alive for this
+                // call and reached from nowhere else.
+                let fill = unsafe { *context.cast::<&RamFill<'_>>() };
+                fill.write(page);
+            },
+        );
+        match result {
+            Ok(()) => {
+                let (source, frame_queued) = match state {
+                    SlotState::Zero => (FaultSource::Zero, false),
+                    SlotState::Stored(object) => {
+                        (FaultSource::Store, shared.store.free_object(object))
+                    }
+                    SlotState::Parked(frame) => {
+                        (FaultSource::Parked, shared.store.free_parked(frame))
+                    }
+                    other => unreachable!("a RAM-tier claim was taken from {other:?}"),
+                };
+                shared.release(claim);
+                shared.counters.here().fault(
+                    source,
+                    shared.clock.now_nanos().saturating_sub(issued_nanos),
+                );
+                if frame_queued {
+                    // The owner drains the frame, and gives it back to the
+                    // pool if this was its last object.
+                    shared.work.notify_one_coalesced();
+                }
+                Step::Done
+            }
+            Err(AddressSpaceError::NotSwapped | AddressSpaceError::SwapTokenChanged) => {
+                // The entry moved under the claim: its storage is intact,
+                // and whichever path consumed the entry frees the slot.
+                // That may be the orphan drain, which deferred the token
+                // because this claim held it.
+                shared.restore(claim, state);
+                shared.work.notify_one_coalesced();
+                Step::Again
+            }
+            Err(AddressSpaceError::OutOfFrames) => {
+                shared.restore(claim, state);
+                Step::Failed(SwapFaultError::OutOfFrames)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "helios_kernel::swap",
+                    addr = addr.raw(),
+                    ?error,
+                    "the address space refused to reinstate a page from a RAM tier"
+                );
+                shared.restore(claim, state);
+                Step::Failed(SwapFaultError::AddressSpace)
+            }
+        }
+    }
+
     /// Reads back every swapped-out page in `range`.
     ///
     /// Kernel code that touches user memory directly — a host call
@@ -483,9 +770,7 @@ impl SwapHandle {
     /// there is fatal by design; pre-faulting is how those paths stay
     /// correct.
     pub async fn ensure_present(&self, range: VirtRange) -> Result<(), SwapFaultError> {
-        let Some(hooks) = installed_swap_hooks() else {
-            return Ok(());
-        };
+        let hooks = self.shared.hooks;
         let mut addr = range.start.page_floor().raw();
         let end = range.end().raw();
         while addr < end {
@@ -582,7 +867,13 @@ where
         timebase: cpu.timebase(),
         now_ticks: hooks.now_ticks,
     };
-    let handle = SwapHandle::new(backend_name, capacity_bytes, clock);
+    let handle = SwapHandle::new(
+        backend_name,
+        capacity_bytes,
+        clock,
+        hooks,
+        cpu.processor_count(),
+    );
     let mut published = false;
     HANDLE.call_once(|| {
         published = true;
@@ -590,18 +881,13 @@ where
     });
     assert!(published, "swap backend installed more than once");
 
-    let service = SwapService {
-        backend,
-        handle: handle.clone(),
+    let service = SwapService::new(
+        Some(Disk::new(backend)),
+        handle.clone(),
         hooks,
         registry,
         cpu,
-        slots: SlotAllocator::new(),
-        disk: DiskEntries::new(),
-        deferred: Vec::new(),
-        page: vec![0_u8; PhysFrame::SIZE].into_boxed_slice(),
-        report: SwapReport::default(),
-    };
+    );
     spawner.spawn_local_detached(async move {
         service.run(timer).await;
     });
@@ -614,32 +900,52 @@ where
     handle
 }
 
-/// Slot → backend token, for the pages the swap backend holds.
-///
-/// Owner-only: the slot word says a page is on disk and under which key,
-/// and the owner is the only task that talks to the backend, so the tokens
-/// live here instead of in the shared table.
-struct DiskEntries<Token> {
-    entries: Slab<Token>,
+/// How a page's bytes are laid out in the extent the backend holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DiskEncoding {
+    /// The whole page.
+    Raw,
+    /// An LZ4 block of this many bytes, which the backend must be asked for
+    /// by exactly that length.
+    Lz4(slot::CompressedLen),
 }
 
-impl<Token: Copy> DiskEntries<Token> {
-    fn new() -> Self {
+/// What the owner knows about a page on the disk: the backend's token for
+/// its extent and how the extent is encoded.
+#[derive(Clone, Copy)]
+struct DiskEntry<Token> {
+    token: Token,
+    encoding: DiskEncoding,
+}
+
+/// The attached swap device and, for each page it holds, where.
+///
+/// Owner-only: the slot word says a page is on the disk and under which key,
+/// and the owner is the only task that talks to the backend, so the tokens
+/// live here instead of in the shared table.
+struct Disk<Backend: SwapBackend> {
+    backend: Backend,
+    entries: Slab<DiskEntry<Backend::Token>>,
+}
+
+impl<Backend: SwapBackend> Disk<Backend> {
+    fn new(backend: Backend) -> Self {
         Self {
+            backend,
             entries: Slab::new(),
         }
     }
 
-    fn insert(&mut self, token: Token) -> DiskKey {
-        let key = self.entries.insert(token);
+    fn insert(&mut self, token: Backend::Token, encoding: DiskEncoding) -> DiskKey {
+        let key = self.entries.insert(DiskEntry { token, encoding });
         DiskKey::new(u32::try_from(key).expect("more disk-resident pages than a slot word keys"))
     }
 
-    fn get(&self, key: DiskKey) -> Token {
+    fn get(&self, key: DiskKey) -> DiskEntry<Backend::Token> {
         self.entries[key.raw() as usize]
     }
 
-    fn remove(&mut self, key: DiskKey) -> Token {
+    fn remove(&mut self, key: DiskKey) -> DiskEntry<Backend::Token> {
         self.entries.remove(key.raw() as usize)
     }
 }
@@ -656,7 +962,9 @@ enum Landed {
 }
 
 struct SwapService<Backend: SwapBackend, CpuImpl> {
-    backend: Backend,
+    /// The swap device, if one is attached. Without one, a page that no RAM
+    /// tier takes stays in memory.
+    disk: Option<Disk<Backend>>,
     handle: SwapHandle,
     hooks: &'static SwapVmHooks,
     registry: InstanceRegistry,
@@ -664,7 +972,9 @@ struct SwapService<Backend: SwapBackend, CpuImpl> {
     /// The owner's half of slot allocation. The words are in
     /// [`SwapShared::slots`].
     slots: SlotAllocator,
-    disk: DiskEntries<Backend::Token>,
+    /// The owner's half of the compressed store: where every frame is, by
+    /// how much room it has. The frames are in [`SwapShared::store`].
+    store: Store,
     /// Orphaned tokens whose slot was claimed when the drain met them,
     /// retried at the top of the next pass.
     ///
@@ -674,9 +984,17 @@ struct SwapService<Backend: SwapBackend, CpuImpl> {
     /// resolve: the claimant's reinstatement fails because the entry is
     /// gone, and it puts the word back.
     deferred: Vec<SwapToken>,
-    /// The one staging buffer every transfer goes through. Owning it
+    /// The one staging buffer every transfer goes through: the page a
+    /// detach copies out, and the page a raw disk read lands in. Owning it
     /// here is what keeps the fault path allocation-free.
     page: Box<[u8]>,
+    /// The LZ4 block of the page being placed, and the buffer a compressed
+    /// disk read lands in.
+    block: Box<[u8]>,
+    /// Where a compressed disk read is decoded to, before it is mapped.
+    decoded: Box<[u8]>,
+    /// The compressor's hash table, reused for every page.
+    table: Box<CompressTable>,
     /// What the last summary line reported, so the next one can report
     /// the difference. See [`SWAP_REPORT_INTERVAL`].
     report: SwapReport,
@@ -686,9 +1004,16 @@ struct SwapService<Backend: SwapBackend, CpuImpl> {
 #[derive(Clone, Copy, Default)]
 struct SwapReport {
     at_nanos: u64,
-    pages_in: u64,
-    pages_out: u64,
-    fault_latency_total_nanos: u64,
+    totals: Totals,
+}
+
+/// What became of a page the pass detached.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Placed {
+    /// The page is out of memory, in a tier.
+    Out,
+    /// No tier took the page and it is resident again.
+    Kept,
 }
 
 impl<Backend, CpuImpl> SwapService<Backend, CpuImpl>
@@ -696,8 +1021,36 @@ where
     Backend: SwapBackend,
     CpuImpl: Cpu + Clone,
 {
+    fn new(
+        disk: Option<Disk<Backend>>,
+        handle: SwapHandle,
+        hooks: &'static SwapVmHooks,
+        registry: InstanceRegistry,
+        cpu: CpuImpl,
+    ) -> Self {
+        Self {
+            disk,
+            handle,
+            hooks,
+            registry,
+            cpu,
+            slots: SlotAllocator::new(),
+            store: Store::new(),
+            deferred: Vec::new(),
+            page: vec![0_u8; PhysFrame::SIZE].into_boxed_slice(),
+            block: vec![0_u8; lz4_flex::block::get_maximum_output_size(PhysFrame::SIZE)]
+                .into_boxed_slice(),
+            decoded: vec![0_u8; PhysFrame::SIZE].into_boxed_slice(),
+            table: Box::default(),
+            report: SwapReport::default(),
+        }
+    }
+
     async fn run(mut self, timer: Timer<CpuImpl>) -> ! {
         loop {
+            // Frames the faults emptied go back to the pool before anything
+            // else asks the pool for one.
+            self.store.drain(&self.handle.shared.store);
             // Faults first: a blocked fiber is a guest that has stopped,
             // while a swap-out pass is work that can wait a tick.
             self.serve_faults().await;
@@ -715,7 +1068,7 @@ where
 
     async fn serve_faults(&mut self) {
         while let Ok(request) = self.handle.shared.faults.pop() {
-            let outcome = self.swap_in(request.addr).await;
+            let outcome = self.swap_in(request.addr, request.issued_nanos).await;
             // From the fault's issue, not from the moment this loop got
             // to it: the guest has been stopped the whole time.
             let elapsed = self
@@ -724,11 +1077,6 @@ where
                 .clock
                 .now_nanos()
                 .saturating_sub(request.issued_nanos);
-            let counters = &self.handle.shared.counters;
-            counters.faults_served.fetch_add(1, Ordering::AcqRel);
-            counters
-                .fault_latency_total_nanos
-                .fetch_add(elapsed, Ordering::AcqRel);
             match outcome {
                 Ok(()) => {
                     tracing::debug!(
@@ -747,7 +1095,7 @@ where
                         "swap in failed"
                     );
                     request.reply.settle(match error {
-                        SwapFaultError::UnknownToken => FAULT_UNKNOWN_TOKEN,
+                        SwapFaultError::OutOfFrames => FAULT_OUT_OF_FRAMES,
                         SwapFaultError::AddressSpace => FAULT_ADDRESS_SPACE,
                         SwapFaultError::PageLost => FAULT_PAGE_LOST,
                         SwapFaultError::NotConfigured | SwapFaultError::Backend => FAULT_BACKEND,
@@ -764,33 +1112,49 @@ where
         if now.saturating_sub(self.report.at_nanos) < SWAP_REPORT_INTERVAL.as_nanos() as u64 {
             return;
         }
-        let counters = &self.handle.shared.counters;
         let current = SwapReport {
             at_nanos: now,
-            pages_in: counters.pages_in.load(Ordering::Acquire),
-            pages_out: counters.pages_out.load(Ordering::Acquire),
-            fault_latency_total_nanos: counters.fault_latency_total_nanos.load(Ordering::Acquire),
+            totals: self.handle.shared.counters.totals(),
         };
-        let pages_in = current.pages_in - self.report.pages_in;
-        let pages_out = current.pages_out - self.report.pages_out;
+        let (before, after) = (self.report.totals, current.totals);
+        let pages_in = after.faults() - before.faults();
+        let pages_out = after.pages_out() - before.pages_out();
         // A quiet interval is the normal case and says nothing worth a
         // line; the window it would have covered rolls into the next.
         if pages_in == 0 && pages_out == 0 {
             return;
         }
-        let latency = current.fault_latency_total_nanos - self.report.fault_latency_total_nanos;
+        let latency = after.fault_wait_nanos - before.fault_wait_nanos;
         self.report = current;
         tracing::info!(
             target: "helios_kernel::swap",
             pages_in,
             pages_out,
+            out_zero = after.pages_out_zero - before.pages_out_zero,
+            out_store = after.pages_out_store - before.pages_out_store,
+            out_disk_raw = after.pages_out_disk_raw - before.pages_out_disk_raw,
+            out_disk_compressed =
+                after.pages_out_disk_compressed - before.pages_out_disk_compressed,
+            out_parked = after.pages_out_parked - before.pages_out_parked,
+            put_back = after.put_back - before.put_back,
+            rejected_incompressible =
+                after.rejected_incompressible - before.rejected_incompressible,
+            rejected_full = after.rejected_full - before.rejected_full,
+            in_zero = after.faults_zero - before.faults_zero,
+            in_store = after.faults_store - before.faults_store,
+            in_parked = after.faults_parked - before.faults_parked,
+            in_disk = after.faults_disk - before.faults_disk,
+            contended_waits = after.contended_waits - before.contended_waits,
             mean_fault_latency_nanos = latency.checked_div(pages_in).unwrap_or(0),
-            used_bytes = counters.used_bytes.load(Ordering::Acquire),
+            disk_pages = after.disk_pages,
+            store_frames = self.store.frames(),
             "swap active"
         );
     }
 
-    async fn swap_in(&mut self, addr: VirtAddr) -> Result<(), SwapFaultError> {
+    /// Resolves a fault the queue handed the owner: a page on the disk, or
+    /// a page whose slot changed hands since the fault looked.
+    async fn swap_in(&mut self, addr: VirtAddr, issued_nanos: u64) -> Result<(), SwapFaultError> {
         // A request exists only for an address whose entry carried a token
         // when the fault was taken (the backend's fault entry checks
         // `swapped_token` before it enters the trampoline, and
@@ -801,46 +1165,38 @@ where
         // retried instruction takes the fault again and a fresh fault is
         // classified from scratch, so succeeding cannot loop.
         loop {
-            let Some(token) = (self.hooks.swapped_token)(addr) else {
-                return Ok(());
-            };
-            match self.swap_in_token(addr, token).await? {
-                Landed::Resolved => return Ok(()),
-                Landed::Stale => {}
+            match self.handle.step(addr, issued_nanos) {
+                Step::Done => return Ok(()),
+                Step::Again => {}
+                Step::Wait(mark) => self.handle.shared.released.changed(mark).await,
+                Step::Disk(token, key) => {
+                    match self.swap_in_disk(addr, token, key, issued_nanos).await? {
+                        Landed::Resolved => return Ok(()),
+                        Landed::Stale => {}
+                    }
+                }
+                Step::Failed(error) => return Err(error),
             }
         }
     }
 
-    /// Reads the page at `addr` back from the backend, given the token its
-    /// entry carried when the caller read it.
+    /// Reads the page at `addr` back from the disk, given the token its
+    /// entry carried and the key its slot said.
     ///
     /// The slot is claimed for the whole transfer. The address space
     /// reinstates the page only while its entry still carries `token`, so a
     /// token that went stale is refused there and never maps another
     /// page's bytes.
-    async fn swap_in_token(
+    async fn swap_in_disk(
         &mut self,
         addr: VirtAddr,
         token: SwapToken,
+        key: DiskKey,
+        issued_nanos: u64,
     ) -> Result<Landed, SwapFaultError> {
-        let Some(index) = SlotIndex::from_token(token) else {
-            return Err(SwapFaultError::UnknownToken);
-        };
-        let key = match self.handle.shared.slots.state(index) {
-            SlotState::Disk(key) => key,
-            SlotState::Lost => return Err(SwapFaultError::PageLost),
-            SlotState::Free { .. } | SlotState::Vacant => {
-                return Err(SwapFaultError::UnknownToken);
-            }
-            other => panic!(
-                "swap slot {} holds {other:?}, which the owner's disk fault path cannot serve: \
-                 it is the owner's own transient state, or a RAM-tier page no pass places yet",
-                index.raw()
-            ),
-        };
-        let claim = self
-            .handle
-            .shared
+        let index = SlotIndex::from_token(token).expect("a step only hands out valid tokens");
+        let shared = &self.handle.shared;
+        let claim = shared
             .slots
             .claim(index, SlotState::Disk(key))
             .unwrap_or_else(|found| {
@@ -850,39 +1206,69 @@ where
                     index.raw()
                 )
             });
+        let disk = self
+            .disk
+            .as_mut()
+            .expect("a slot reads Disk only while a disk is attached");
+        let entry = disk.get(key);
         // A failed read leaves the extent with the backend and the slot
-        // with the page-table entry, exactly as they were.
-        if let Err(error) = self
-            .backend
-            .swap_in(self.disk.get(key), &mut self.page)
-            .await
-        {
+        // with the page-table entry, exactly as they were. The backend
+        // wants a buffer of exactly the length it stored.
+        let read = match entry.encoding {
+            DiskEncoding::Raw => &mut self.page[..],
+            DiskEncoding::Lz4(len) => &mut self.block[..len.get()],
+        };
+        if let Err(error) = disk.backend.swap_in(entry.token, read).await {
             tracing::warn!(
                 target: "helios_kernel::swap",
                 addr = addr.raw(),
                 %error,
                 "swap backend could not read a page back"
             );
-            self.handle
-                .shared
-                .slots
-                .publish(claim, SlotState::Disk(key));
+            shared.restore(claim, SlotState::Disk(key));
             return Err(SwapFaultError::Backend);
         }
         // The backend has consumed the extent, so the token is dead and
-        // the staging buffer holds the page's only copy.
-        self.disk.remove(key);
+        // the buffer holds the page's only copy.
+        disk.remove(key);
+        shared.counters.here().disk_pages(-1);
+        if let DiskEncoding::Lz4(len) = entry.encoding {
+            // The device is outside the kernel's integrity boundary: a block
+            // that does not decode to one page is a failed read of this
+            // page, not a corrupt kernel. The block is put back as it was.
+            match decompress_into(&self.block[..len.get()], &mut self.decoded) {
+                Ok(PhysFrame::SIZE) => {}
+                outcome => {
+                    tracing::error!(
+                        target: "helios_kernel::swap",
+                        addr = addr.raw(),
+                        index = index.raw(),
+                        ?outcome,
+                        "a compressed page read back from the swap backend does not decode to \
+                         one page"
+                    );
+                    // Back on the disk as it was: the next fault fails the
+                    // same way, which is what the device holds. A refused
+                    // rehome marks the page lost, which its own fault reports.
+                    let _ = self.rehome(claim, addr, entry.encoding).await;
+                    return Err(SwapFaultError::Backend);
+                }
+            }
+        }
         // The address space reads the flags the page had out of its own
-        // bookkeeping, fills a fresh frame from the staging buffer, and
-        // only publishes the mapping once the bytes are there.
-        match self.reinstate(addr, token) {
+        // bookkeeping, fills a fresh frame from the buffer, and only
+        // publishes the mapping once the bytes are there.
+        let source = match entry.encoding {
+            DiskEncoding::Raw => &self.page[..],
+            DiskEncoding::Lz4(_) => &self.decoded[..],
+        };
+        match reinstate(self.hooks, addr, token, source) {
             Ok(()) => {
-                self.handle.shared.slots.free(claim);
-                let counters = &self.handle.shared.counters;
-                counters.pages_in.fetch_add(1, Ordering::AcqRel);
-                counters
-                    .used_bytes
-                    .fetch_sub(PhysFrame::SIZE as u64, Ordering::AcqRel);
+                shared.release(claim);
+                shared.counters.here().fault(
+                    FaultSource::Disk,
+                    shared.clock.now_nanos().saturating_sub(issued_nanos),
+                );
                 Ok(Landed::Resolved)
             }
             Err(AddressSpaceError::NotSwapped) => {
@@ -890,15 +1276,14 @@ where
                 // flight: its range was decommitted or released, which
                 // queued the token. The extent is already consumed, so the
                 // slot has no storage left, and the orphan drain frees it.
-                self.handle.shared.slots.publish(claim, SlotState::Vacant);
-                self.release_extent_bytes();
+                shared.restore(claim, SlotState::Vacant);
                 Ok(Landed::Resolved)
             }
             Err(AddressSpaceError::SwapTokenChanged) => {
                 // The entry at `addr` carries another token than the one
                 // read, so the slot just claimed holds some other page. Its
-                // bytes are in the staging buffer: give them back to where
-                // they were and let the caller read the entry again.
+                // bytes are in the buffer: give them back to where they were
+                // and let the caller read the entry again.
                 tracing::debug!(
                     target: "helios_kernel::swap",
                     addr = addr.raw(),
@@ -907,9 +1292,7 @@ where
                 );
                 // A refused rehome loses that other page, which its own
                 // fault reports; it is no failure of this one.
-                if self.rehome(claim, addr).await.is_err() {
-                    self.release_extent_bytes();
-                }
+                let _ = self.rehome(claim, addr, entry.encoding).await;
                 Ok(Landed::Stale)
             }
             Err(error) => {
@@ -919,56 +1302,43 @@ where
                     ?error,
                     "the address space refused to reinstate a page; returning it to the swap backend"
                 );
-                if self.rehome(claim, addr).await.is_err() {
-                    self.release_extent_bytes();
-                }
-                Err(SwapFaultError::AddressSpace)
+                let _ = self.rehome(claim, addr, entry.encoding).await;
+                Err(match error {
+                    AddressSpaceError::OutOfFrames => SwapFaultError::OutOfFrames,
+                    _ => SwapFaultError::AddressSpace,
+                })
             }
         }
     }
 
-    /// Takes one page off the bytes the backend holds, for a page whose
-    /// extent is gone.
-    fn release_extent_bytes(&self) {
-        self.handle
-            .shared
-            .counters
-            .used_bytes
-            .fetch_sub(PhysFrame::SIZE as u64, Ordering::AcqRel);
-    }
-
-    /// Reinstates the page in the staging buffer at `addr`, which must
-    /// still carry `token` in its page-table entry.
-    fn reinstate(&self, addr: VirtAddr, token: SwapToken) -> Result<(), AddressSpaceError> {
-        let mut source: &[u8] = &self.page;
-        (self.hooks.swap_in_page)(
-            addr,
-            token,
-            (&raw mut source).cast::<()>(),
-            |context, page| {
-                // SAFETY: `context` is `source` above, alive for this call and
-                // reached from nowhere else.
-                let source = unsafe { *context.cast::<&[u8]>() };
-                page.copy_from_slice(source);
-            },
-        )
-    }
-
-    /// Writes the staging buffer, which holds the only copy of the page
-    /// whose slot `claim` holds, back to the backend under that same slot.
+    /// Writes the buffer a disk read left the page in, which holds the only
+    /// copy of the page whose slot `claim` holds, back to the disk under that
+    /// same slot and in the encoding it came in.
     ///
-    /// When the backend refuses too, the page's bytes exist nowhere: the
-    /// slot is marked lost and stays reserved, so no other page can be
-    /// handed it and a fault on it fails rather than reading a stale
-    /// token, until the owning address space's teardown releases it.
-    async fn rehome(&mut self, claim: Claim, addr: VirtAddr) -> Result<(), ()> {
-        match self.backend.swap_out(&self.page).await {
+    /// When the disk refuses too, the page's bytes exist nowhere: the slot is
+    /// marked lost and stays reserved, so no other page can be handed it and
+    /// a fault on it fails rather than reading a stale token, until the
+    /// owning address space's teardown releases it.
+    async fn rehome(
+        &mut self,
+        claim: Claim,
+        addr: VirtAddr,
+        encoding: DiskEncoding,
+    ) -> Result<(), ()> {
+        let disk = self
+            .disk
+            .as_mut()
+            .expect("a page is rehomed only after a read from the disk");
+        let bytes = match encoding {
+            DiskEncoding::Raw => &self.page[..],
+            DiskEncoding::Lz4(len) => &self.block[..len.get()],
+        };
+        let shared = &self.handle.shared;
+        match disk.backend.swap_out(bytes).await {
             Ok(token) => {
-                let key = self.disk.insert(token);
-                self.handle
-                    .shared
-                    .slots
-                    .publish(claim, SlotState::Disk(key));
+                let key = disk.insert(token, encoding);
+                shared.counters.here().disk_pages(1);
+                shared.restore(claim, SlotState::Disk(key));
                 Ok(())
             }
             Err(error) => {
@@ -979,7 +1349,7 @@ where
                     %error,
                     "swapped-out page lost: the swap backend refused it back and no other copy exists"
                 );
-                self.handle.shared.slots.publish(claim, SlotState::Lost);
+                shared.restore(claim, SlotState::Lost);
                 Err(())
             }
         }
@@ -1013,8 +1383,8 @@ where
         let Some(index) = SlotIndex::from_token(token) else {
             return;
         };
-        let table = &self.handle.shared.slots;
-        let state = table.state(index);
+        let shared = &self.handle.shared;
+        let state = shared.slots.state(index);
         match state {
             // Already free, or never handed out: the entry was consumed
             // by a reinstatement that freed it. Nothing to release.
@@ -1028,26 +1398,42 @@ where
             // A fault holds the slot. It will lose its reinstatement, the
             // entry being gone, and put the word back; retry then.
             SlotState::Claimed => self.deferred.push(token),
-            // A lost page holds no extent and no `used_bytes`: both were
-            // given up when it was lost, and only its slot is released.
-            // A vacant one holds no storage either.
-            SlotState::Lost | SlotState::Vacant => match table.claim(index, state) {
-                Ok(claim) => table.free(claim),
-                Err(_) => self.deferred.push(token),
-            },
-            SlotState::Disk(key) => match table.claim(index, state) {
+            // A lost page holds no extent: its bytes were given up when it
+            // was lost, and only its slot is released. A vacant one holds no
+            // storage either, and a zero page never had any.
+            SlotState::Lost | SlotState::Vacant | SlotState::Zero => {
+                match shared.slots.claim(index, state) {
+                    Ok(claim) => shared.release(claim),
+                    Err(_) => self.deferred.push(token),
+                }
+            }
+            SlotState::Stored(object) => match shared.slots.claim(index, state) {
                 Ok(claim) => {
-                    let backend_token = self.disk.remove(key);
-                    self.backend.release(backend_token).await;
-                    self.release_extent_bytes();
-                    self.handle.shared.slots.free(claim);
+                    shared.store.free_object(object);
+                    shared.release(claim);
                 }
                 Err(_) => self.deferred.push(token),
             },
-            SlotState::Zero | SlotState::Stored(_) | SlotState::Parked(_) => panic!(
-                "swap slot {} holds {state:?}, which no pass places yet",
-                index.raw()
-            ),
+            SlotState::Parked(frame) => match shared.slots.claim(index, state) {
+                Ok(claim) => {
+                    shared.store.free_parked(frame);
+                    shared.release(claim);
+                }
+                Err(_) => self.deferred.push(token),
+            },
+            SlotState::Disk(key) => match shared.slots.claim(index, state) {
+                Ok(claim) => {
+                    let disk = self
+                        .disk
+                        .as_mut()
+                        .expect("a slot reads Disk only while a disk is attached");
+                    let entry = disk.remove(key);
+                    disk.backend.release(entry.token).await;
+                    shared.counters.here().disk_pages(-1);
+                    shared.release(claim);
+                }
+                Err(_) => self.deferred.push(token),
+            },
         }
     }
 
@@ -1064,7 +1450,8 @@ where
         }
 
         let now = monotonic_nanos(&self.cpu);
-        let idle_after = IDLE_SWAP_AFTER.as_nanos() as u64;
+        let idle_after = u64::try_from(self.handle.shared.policy.load().idle_after.as_nanos())
+            .expect("a published policy holds an idle delay that fits the nanosecond clock");
         let mut candidates = self.registry.idle_instances(now, idle_after);
         // Largest resident first: one pass over the biggest idle
         // instance frees more than several passes over small ones, and
@@ -1078,9 +1465,7 @@ where
             if moved >= SWAP_BATCH_BYTES {
                 break;
             }
-            moved += self
-                .evict_owner(*id, SWAP_BATCH_BYTES - moved, EvictionAge::Any)
-                .await;
+            moved += self.evict_owner(*id, SWAP_BATCH_BYTES - moved).await;
         }
 
         if pressure != PressureLevel::Red {
@@ -1093,11 +1478,8 @@ where
             return;
         }
 
-        // Red: ten seconds of idleness was not enough of a bar. Drop it
-        // to "not on a processor right now" and take only the pages the
-        // hardware has not seen since the last pass. A pass that frees
-        // nothing is the signal the OOM killer acts on — it is not this
-        // task's job to condemn anything.
+        // Red: the idle delay was not enough of a bar. Drop it to "not on
+        // a processor right now"; the pages taken are cold either way.
         //
         // The bar stays at "not executing" rather than dropping to
         // "anything": while an instance is on a processor it may be
@@ -1113,9 +1495,7 @@ where
             if moved >= SWAP_BATCH_BYTES {
                 break;
             }
-            moved += self
-                .evict_owner(id, SWAP_BATCH_BYTES - moved, EvictionAge::ColdOnly)
-                .await;
+            moved += self.evict_owner(id, SWAP_BATCH_BYTES - moved).await;
         }
         tracing::debug!(
             target: "helios_kernel::swap",
@@ -1124,8 +1504,8 @@ where
         );
     }
 
-    /// Swaps up to `budget` bytes of `instance`'s pages out, and reports
-    /// how many bytes actually left memory.
+    /// Swaps up to `budget` bytes of `instance`'s cold pages out, and
+    /// reports how many bytes actually left memory.
     ///
     /// The plan is a scan taken once, and the instance was off every
     /// processor when it was nominated; neither is true for long. Each
@@ -1137,18 +1517,12 @@ where
     /// device write runs with the page already out, and a turn that
     /// begins then meets a swapped page the way it would after any
     /// earlier pass.
-    async fn evict_owner(
-        &mut self,
-        instance: InstanceId,
-        budget: usize,
-        age: EvictionAge,
-    ) -> usize {
+    async fn evict_owner(&mut self, instance: InstanceId, budget: usize) -> usize {
         let owner = MemoryOwner::new(instance.raw());
         let mut plan = EvictionPlan {
             pages: Vec::new(),
             remaining: budget,
             visits_left: SCAN_BUDGET_PAGES,
-            age,
         };
         (self.hooks.scan_committed_pages)(
             owner.raw(),
@@ -1171,9 +1545,14 @@ where
                 break;
             }
             match self.swap_out(instance, addr).await {
-                Ok(()) => moved += PhysFrame::SIZE,
+                Ok(Placed::Out) => moved += PhysFrame::SIZE,
+                // No tier took the page; the next one may be compressible.
+                Ok(Placed::Kept) => {}
                 Err(()) => break,
             }
+            // Compression is CPU work with no await in it, and a batch is
+            // hundreds of pages: give the processor back between pages.
+            yield_now().await;
         }
         if moved != 0 {
             tracing::debug!(
@@ -1187,7 +1566,21 @@ where
     }
 
     /// Swaps out the page at `addr`, which belongs to `instance`.
-    async fn swap_out(&mut self, instance: InstanceId, addr: VirtAddr) -> Result<(), ()> {
+    ///
+    /// `Err` ends the instance's part of the pass: the pool has no frame for
+    /// the spare, the slot table is full, or the page could not be detached
+    /// (the instance began a turn, or its range went away).
+    async fn swap_out(&mut self, instance: InstanceId, addr: VirtAddr) -> Result<Placed, ()> {
+        // Every detached page needs a placement that cannot fail, which is
+        // the spare frame: held before the detach, so a failure of the pool
+        // here costs nothing, and after it would cost the page.
+        if self.store.ensure_spare(&self.handle.shared.store).is_err() {
+            tracing::debug!(
+                target: "helios_kernel::swap",
+                "the user pool has no frame for the store's spare; ending the pass"
+            );
+            return Err(());
+        }
         // The index has to exist before the page can be detached: the
         // page-table entry carries it, and the entry has to be in place
         // before the frame goes back to the pool.
@@ -1221,7 +1614,7 @@ where
                     ?error,
                     "page could not be detached for swap-out"
                 );
-                self.handle.shared.slots.free(claim);
+                self.handle.shared.release(claim);
                 return Err(());
             }
             Err(refused) => {
@@ -1232,68 +1625,153 @@ where
                     %refused,
                     "instance cannot be held off the processors; leaving its pages"
                 );
-                self.handle.shared.slots.free(claim);
+                self.handle.shared.release(claim);
                 return Err(());
             }
         }
         // From here the page is not present and its entry points at a
-        // reserved slot. A guest faulting on it in this window queues a
-        // request that this same loop serves, and it only gets there
-        // after this function returns, so the gap is never observed.
-        match self.backend.swap_out(&self.page).await {
-            Ok(token) => {
-                let key = self.disk.insert(token);
-                self.handle
-                    .shared
-                    .slots
-                    .publish(claim, SlotState::Disk(key));
+        // reserved slot. A guest faulting on it in this window waits for
+        // the slot to be placed (`Step::Wait`); the placement signals it.
+        Ok(self.place(claim, addr).await)
+    }
+
+    /// Finds the detached page in the staging buffer a destination, down the
+    /// ladder: zero, the compressed store, the disk, and last resort back
+    /// into memory or parked.
+    ///
+    /// The spare frame was ensured before the detach, so every path out of
+    /// here leaves the page somewhere: none of them allocates.
+    async fn place(&mut self, claim: Claim, addr: VirtAddr) -> Placed {
+        let policy = self.handle.shared.policy.load();
+
+        // A page of zeros has no storage. The scan reads whole words.
+        if self.page.chunks_exact(8).all(|word| word == [0; 8]) {
+            let shared = &self.handle.shared;
+            shared.restore(claim, SlotState::Zero);
+            shared.counters.here().page_out(Placement::Zero);
+            return Placed::Out;
+        }
+
+        // Rejection is decided after compressing: the encoder needs room for
+        // the worst case up front and cannot stop early.
+        let block_len = compress_into_with_table(&self.page, &mut self.block, &mut self.table)
+            .expect("the block buffer holds the worst-case output of one page");
+        let mut encoding = DiskEncoding::Raw;
+        match policy.gate().accept(block_len) {
+            Some(len) => {
+                let limits = Limits {
+                    pool_frames: user_heap_stats().total_bytes / PhysFrame::SIZE,
+                    limit_percent: policy.store_limit_percent,
+                    accept_percent: policy.store_accept_percent,
+                };
+                let shared = &self.handle.shared;
+                match self.store.allocate(
+                    &shared.store,
+                    claim.index(),
+                    &self.block[..block_len],
+                    len,
+                    limits,
+                ) {
+                    Ok(object) => {
+                        shared.restore(claim, SlotState::Stored(object));
+                        shared.counters.here().page_out(Placement::Store);
+                        return Placed::Out;
+                    }
+                    Err(StoreFull) => {
+                        // The page compresses well enough to be worth
+                        // keeping; the disk gets it compressed.
+                        shared.counters.here().rejected_full();
+                        encoding = DiskEncoding::Lz4(len);
+                    }
+                }
+            }
+            None => self.handle.shared.counters.here().rejected_incompressible(),
+        }
+
+        let token = claim.index().token();
+        let Some(disk) = self.disk.as_mut() else {
+            // Nowhere to put it: back into memory, from the staging buffer,
+            // which holds the page's only copy.
+            return match reinstate(self.hooks, addr, token, &self.page) {
+                Ok(()) => {
+                    let shared = &self.handle.shared;
+                    shared.release(claim);
+                    shared.counters.here().put_back();
+                    Placed::Kept
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "helios_kernel::swap",
+                        addr = addr.raw(),
+                        ?error,
+                        "the address space refused a page that no tier took; parking it"
+                    );
+                    self.park(claim)
+                }
+            };
+        };
+        let bytes = match encoding {
+            DiskEncoding::Raw => &self.page[..],
+            DiskEncoding::Lz4(len) => &self.block[..len.get()],
+        };
+        match disk.backend.swap_out(bytes).await {
+            Ok(backend_token) => {
+                let key = disk.insert(backend_token, encoding);
+                let shared = &self.handle.shared;
+                shared.restore(claim, SlotState::Disk(key));
+                let counters = shared.counters.here();
+                counters.disk_pages(1);
+                counters.page_out(match encoding {
+                    DiskEncoding::Raw => Placement::DiskRaw,
+                    DiskEncoding::Lz4(_) => Placement::DiskCompressed,
+                });
+                Placed::Out
             }
             Err(error) => {
                 tracing::warn!(
                     target: "helios_kernel::swap",
                     addr = addr.raw(),
                     %error,
-                    "swap backend refused a page; putting it back"
+                    "swap backend refused a page; parking it"
                 );
-                // The staging buffer holds the page's only copy. The index
-                // is released only once the page is resident again.
-                match self.reinstate(addr, handle) {
-                    Ok(()) => {
-                        self.handle.shared.slots.free(claim);
-                        return Err(());
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            target: "helios_kernel::swap",
-                            addr = addr.raw(),
-                            ?error,
-                            "the address space refused a page put back after a refused write; \
-                             offering it to the swap backend again"
-                        );
-                        // The backend may have taken the write this time,
-                        // which makes this a completed swap-out; if not,
-                        // the page is lost and says so.
-                        self.rehome(claim, addr).await?;
-                    }
-                }
+                self.park(claim)
             }
         }
-        let counters = &self.handle.shared.counters;
-        counters.pages_out.fetch_add(1, Ordering::AcqRel);
-        counters
-            .used_bytes
-            .fetch_add(PhysFrame::SIZE as u64, Ordering::AcqRel);
-        Ok(())
+    }
+
+    /// Places the page in the staging buffer in the store's spare frame, raw.
+    ///
+    /// This is the placement of last resort. It allocates nothing and asks
+    /// no device, and the spare was ensured before the page was detached.
+    fn park(&mut self, claim: Claim) -> Placed {
+        let shared = &self.handle.shared;
+        let frame = self.store.park(&shared.store, &claim, &self.page);
+        shared.restore(claim, SlotState::Parked(frame));
+        shared.counters.here().page_out(Placement::Parked);
+        Placed::Out
     }
 }
 
-/// Which pages an eviction pass is allowed to take.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum EvictionAge {
-    /// Everything: the owner is idle, so nothing it holds is hot.
-    Any,
-    /// Only pages the hardware has not touched since the last scan.
-    ColdOnly,
+/// Reinstates the page in `source` at `addr`, which must still carry `token`
+/// in its page-table entry.
+fn reinstate(
+    hooks: &SwapVmHooks,
+    addr: VirtAddr,
+    token: SwapToken,
+    source: &[u8],
+) -> Result<(), AddressSpaceError> {
+    let mut source = source;
+    (hooks.swap_in_page)(
+        addr,
+        token,
+        (&raw mut source).cast::<()>(),
+        |context, page| {
+            // SAFETY: `context` is `source` above, alive for this call and
+            // reached from nowhere else.
+            let source = unsafe { *context.cast::<&[u8]>() };
+            page.copy_from_slice(source);
+        },
+    )
 }
 
 struct EvictionPlan {
@@ -1302,7 +1780,6 @@ struct EvictionPlan {
     /// Pages this pass may still look at. A scan that finds nothing
     /// cold must still end.
     visits_left: usize,
-    age: EvictionAge,
 }
 
 impl EvictionPlan {
@@ -1316,11 +1793,11 @@ impl EvictionPlan {
             return false;
         }
         self.visits_left -= 1;
-        let take = match self.age {
-            EvictionAge::Any => true,
-            EvictionAge::ColdOnly => age == PageAge::Cold,
-        };
-        if take {
+        // Cold only, at every pressure level: a page the hardware has seen
+        // since the last scan is in use, and a page that no tier takes is put
+        // back hot, so taking hot pages would hand the same ones to every
+        // pass.
+        if age == PageAge::Cold {
             self.pages.push(addr);
             self.remaining -= PhysFrame::SIZE;
         }
@@ -1352,7 +1829,9 @@ mod stack_tests;
 #[cfg(test)]
 mod store_tests;
 #[cfg(test)]
-mod test_pool;
+pub(crate) mod test_pool;
+#[cfg(test)]
+mod tier_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1372,7 +1851,8 @@ mod tests {
     /// the service loop into a spin inside a single `poll`.
     #[test]
     fn a_poke_releases_one_wait_and_the_next_one_parks() {
-        let handle = SwapHandle::new("test", 0, test_clock());
+        let _turn = test_pool::serialise();
+        let handle = SwapHandle::new("test", 0, test_clock(), &service_tests::TEST_HOOKS, 1);
 
         handle.poke();
         assert!(
@@ -1393,17 +1873,16 @@ mod tests {
     }
 
     #[test]
-    fn an_idle_plan_takes_every_page_until_the_budget_runs_out() {
+    fn a_plan_stops_the_scan_once_the_budget_is_spent() {
         let mut plan = EvictionPlan {
             pages: Vec::new(),
             remaining: 2 * PhysFrame::SIZE,
             visits_left: SCAN_BUDGET_PAGES,
-            age: EvictionAge::Any,
         };
-        assert!(plan.consider(VirtAddr::new(0x1000), PageAge::Hot));
-        assert!(plan.consider(VirtAddr::new(0x2000), PageAge::Hot));
+        assert!(plan.consider(VirtAddr::new(0x1000), PageAge::Cold));
+        assert!(plan.consider(VirtAddr::new(0x2000), PageAge::Cold));
         assert!(
-            !plan.consider(VirtAddr::new(0x3000), PageAge::Hot),
+            !plan.consider(VirtAddr::new(0x3000), PageAge::Cold),
             "a full plan must stop the scan"
         );
         assert_eq!(plan.pages.len(), 2);
@@ -1415,7 +1894,6 @@ mod tests {
             pages: Vec::new(),
             remaining: 8 * PhysFrame::SIZE,
             visits_left: SCAN_BUDGET_PAGES,
-            age: EvictionAge::ColdOnly,
         };
         plan.consider(VirtAddr::new(0x1000), PageAge::Hot);
         plan.consider(VirtAddr::new(0x2000), PageAge::Cold);
@@ -1434,7 +1912,6 @@ mod tests {
             pages: Vec::new(),
             remaining: usize::MAX,
             visits_left: 3,
-            age: EvictionAge::ColdOnly,
         };
         assert!(plan.consider(VirtAddr::new(0x1000), PageAge::Hot));
         assert!(plan.consider(VirtAddr::new(0x2000), PageAge::Hot));
