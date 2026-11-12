@@ -368,6 +368,17 @@ pub(crate) fn test_profile_sink() -> crate::ProfileSink {
     )
 }
 
+/// The proof that an instance may observe the whole machine, derived
+/// the way a kernel host function derives it: from an authority that was
+/// granted the right.
+pub(crate) fn test_observe_machine_cap() -> crate::ObserveMachineCap {
+    let mut authority = crate::ProcessAuthority::empty();
+    authority.grant_diagnostic_rights(crate::DiagnosticAuthorityRights::OBSERVE_MACHINE);
+    authority
+        .derive_observe_machine_cap()
+        .expect("an authority granted the right derives its proof")
+}
+
 /// The uptime clock a test service reads, at a 1 GHz timebase whose
 /// origin is the boot tick, so a tick is a nanosecond and a test can
 /// state deadlines in either.
@@ -408,7 +419,7 @@ impl crate::component::ComponentRuntimeState for TestRuntimeState {
         0
     }
 
-    fn record_console_text(&self, _: u64, _: &str) {}
+    fn record_console_text(&self, _: u64, _: Option<crate::InstanceId>, _: &str) {}
 
     fn root_entropy(&self) -> &crate::RootEntropy {
         panic!("the network test runtime state has no root entropy")
@@ -455,7 +466,7 @@ impl crate::component::ComponentRuntimeState for TestRuntimeState {
     fn record_profile_stack_nanos(&self, _: crate::ProfileScope, _: alloc::string::String, _: u64) {
     }
 
-    fn record_profile_stack_parts_nanos(&self, _: crate::ProfileScope, _: &str, _: &str, _: u64) {}
+    fn record_user_profile(&self, _: crate::InstanceId, _: &str, _: u64) {}
 
     fn record_perf_metric_parts(
         &self,
