@@ -515,7 +515,9 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libudev-dev just cmake ninja-build \
             python3-venv pkg-config flex bison \
-            libglib2.0-dev libpixman-1-dev libslirp-dev libfdt-dev zlib1g-dev
+            libglib2.0-dev libpixman-1-dev libslirp-dev libfdt-dev zlib1g-dev \
+            swtpm
+          swtpm --version
           # Recorded rather than required: the accelerator is picked by
           # capability and today's Arm runners publish no KVM node.
           ls -la /dev/kvm || echo 'no /dev/kvm on this runner'
@@ -652,6 +654,145 @@ jobs:
           # rather than something that quietly starts or stops being
           # true.
           ! grep -qF 'device grant published' "$runtime/inspector.log"
+      # Measured boot (#602): the kernel's signing seed is sealed in the
+      # TPM to the boot chain. The ACPI description is the boot whose
+      # measured input repeats (PCR 9 holds the kernel and the payload),
+      # so the retention check runs here: two boots of one payload on
+      # one TPM state directory, the first provisions and seals a seed,
+      # the second unseals it, and the public half of the derived key is
+      # the same. The second boot is handed the payload the first booted
+      # by path, so both measure the same bytes whether or not a rebuild
+      # reproduces them. Whether it also skips recompiling needs the
+      # persisted cwasm of #579.
+      - name: Keep the kernel signing key across measured ACPI boots
+        timeout-minutes: 20
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+          HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          set -o pipefail
+          check=tools/measured-boot-check.sh
+          state="$RUNNER_TEMP/tpm-state-aarch64-acpi"
+          rm -rf "$state"
+          boot() {
+            runtime="$GITHUB_WORKSPACE/smoke-runtime-measured/$1"
+            shift
+            mkdir -p "$runtime"
+            ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G --acpi \
+              --accel tcg --tpm swtpm --tpm-state "$state" \
+              --runtime-dir "$runtime" --keep-runtime-dir "$@" \
+              shell -c 'echo ok' 2>&1 > "$runtime/shell.out" | tee "$runtime/inspector.log"
+            grep -Fqx ok "$runtime/shell.out"
+          }
+          boot acpi-retention-1 --boot-program dash --boot-program debugger --no-compiler-plugin
+          cp target/kernel-prebuild/aarch64-unknown-none/kernel-release/helios-bootfs \
+            "$GITHUB_WORKSPACE/smoke-runtime-measured/helios-bootfs.retained"
+          first="$("$check" settled "$GITHUB_WORKSPACE/smoke-runtime-measured/acpi-retention-1/debug-serial.log" provisioned-and-sealed empty)"
+          boot acpi-retention-2 --bootfs "$GITHUB_WORKSPACE/smoke-runtime-measured/helios-bootfs.retained" \
+            --boot-program dash --boot-program debugger --no-compiler-plugin
+          second="$("$check" settled "$GITHUB_WORKSPACE/smoke-runtime-measured/acpi-retention-2/debug-serial.log" unsealed none)"
+          echo "signer: first boot $first, second boot $second"
+          test "$first" = "$second"
+          echo "$first" > "$RUNNER_TEMP/tpm-signer-aarch64-acpi"
+      # One byte of the payload's signed body is inverted. The kernel
+      # refuses the payload on its signature before it measures or
+      # parses it, so the guest never reaches the debugger and the
+      # inspector reports the panic.
+      - name: Refuse a tampered boot payload
+        timeout-minutes: 10
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+          HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          check=tools/measured-boot-check.sh
+          runtime="$GITHUB_WORKSPACE/smoke-runtime-measured/acpi-tampered"
+          mkdir -p "$runtime"
+          "$check" tamper "$GITHUB_WORKSPACE/smoke-runtime-measured/helios-bootfs.retained" \
+            "$runtime/helios-bootfs"
+          if ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G --acpi \
+            --accel tcg --tpm swtpm \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --bootfs "$runtime/helios-bootfs" \
+            --boot-program dash --boot-program debugger --no-compiler-plugin \
+            shell -c 'echo ok' > "$runtime/shell.out" 2> "$runtime/inspector.log"; then
+            echo 'the inspector booted a payload whose signature does not match'
+            exit 1
+          fi
+          cat "$runtime/inspector.log"
+          "$check" refused "$runtime/debug-serial.log"
+      # A different boot program set is a different payload, signed by
+      # the same build root, so it verifies and PCR 9 differs. The TPM
+      # state the retention step left is sealed to the old measurement:
+      # it is reported as changed state, a new seed replaces it, and the
+      # key is not the one of the two boots before.
+      - name: Reseal the kernel signing key after a changed payload
+        timeout-minutes: 10
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+          HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          set -o pipefail
+          check=tools/measured-boot-check.sh
+          runtime="$GITHUB_WORKSPACE/smoke-runtime-measured/acpi-changed"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G --acpi \
+            --accel tcg --tpm swtpm --tpm-state "$RUNNER_TEMP/tpm-state-aarch64-acpi" \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger --boot-program date \
+            --no-compiler-plugin \
+            shell -c 'echo ok' 2>&1 > "$runtime/shell.out" | tee "$runtime/inspector.log"
+          grep -Fqx ok "$runtime/shell.out"
+          changed="$("$check" settled "$runtime/debug-serial.log" provisioned-and-sealed state-changed)"
+          retained="$(cat "$RUNNER_TEMP/tpm-signer-aarch64-acpi")"
+          echo "signer: retained $retained, after the change $changed"
+          test "$changed" != "$retained"
+      # Booted from the device tree, QEMU's `virt` writes a fresh
+      # `/chosen/rng-seed` and `kaslr-seed` into the blob at every boot,
+      # and Limine measures the blob into PCR 9, so PCR 9 never repeats
+      # (#602). A sealed seed cannot survive a reboot here, and that is
+      # the sealing policy working: the second boot of one payload on
+      # one TPM state directory must report changed state, provision a
+      # new seed, and derive a different key, where the ACPI boots
+      # above retain it.
+      - name: Detect changed state across measured device-tree boots
+        timeout-minutes: 20
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+          HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          set -o pipefail
+          check=tools/measured-boot-check.sh
+          state="$RUNNER_TEMP/tpm-state-aarch64-dt"
+          rm -rf "$state"
+          boot() {
+            runtime="$GITHUB_WORKSPACE/smoke-runtime-measured/$1"
+            mkdir -p "$runtime"
+            ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G \
+              --accel tcg --tpm swtpm --tpm-state "$state" \
+              --runtime-dir "$runtime" --keep-runtime-dir \
+              --boot-program dash --boot-program debugger --no-compiler-plugin \
+              shell -c 'echo ok' 2>&1 > "$runtime/shell.out" | tee "$runtime/inspector.log"
+            grep -Fqx ok "$runtime/shell.out"
+            grep -F 'platform described by device-tree' "$runtime/inspector.log"
+          }
+          boot dt-1
+          first="$("$check" settled "$GITHUB_WORKSPACE/smoke-runtime-measured/dt-1/debug-serial.log" provisioned-and-sealed empty)"
+          boot dt-2
+          second="$("$check" settled "$GITHUB_WORKSPACE/smoke-runtime-measured/dt-2/debug-serial.log" provisioned-and-sealed state-changed)"
+          echo "signer: first boot $first, second boot $second"
+          test "$first" != "$second"
       - name: Upload the inspector runtime directories
         if: failure()
         uses: actions/upload-artifact@v4
@@ -659,6 +800,7 @@ jobs:
           name: smoke-aarch64-runtime
           path: |
             smoke-runtime/*/*.log
+            smoke-runtime-measured/*/*.log
           if-no-files-found: warn
           retention-days: 7
       # Each boot above rebuilds the bootfs for its own `--boot-program`
@@ -722,8 +864,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libudev-dev just cmake ninja-build \
-            qemu-system-x86 ovmf
+            qemu-system-x86 ovmf swtpm
           qemu-system-x86_64 --version
+          swtpm --version
           # The inspector picks the accelerator by capability; this only
           # fixes the permissions on the node when the runner has one.
           if [ -e /dev/kvm ]; then
@@ -831,6 +974,93 @@ jobs:
           grep -aF 'mount source online serial="src-a"' "$runtime/debug-serial.log" | grep -aF 'read_only=false'
           grep -aF 'mount source online serial="src-b"' "$runtime/debug-serial.log" | grep -aF 'read_only=true'
           grep -aF 'block device identified as the kernel scratch disk serial="helios-data"' "$runtime/debug-serial.log"
+      # The kernel's signing seed is sealed in the TPM to the measured
+      # boot chain (#602). Two boots of one payload on one TPM state
+      # directory: the first provisions and seals a seed, the second
+      # unseals it, and the public half of the key the seed derives is
+      # the same in both. The second boot is handed the payload the
+      # first one booted by path, so the two measure the same bytes
+      # whether or not a rebuild reproduces them. Whether the second
+      # boot also skips recompiling needs the persisted cwasm of #579.
+      - name: Keep the kernel signing key across measured boots
+        timeout-minutes: 15
+        shell: bash
+        working-directory: helios
+        run: |
+          set -o pipefail
+          check=tools/measured-boot-check.sh
+          state="$RUNNER_TEMP/tpm-state-x86-64"
+          rm -rf "$state"
+          boot() {
+            runtime="$GITHUB_WORKSPACE/smoke-runtime-measured/$1"
+            shift
+            mkdir -p "$runtime"
+            ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+              --accel kvm --tpm swtpm --tpm-state "$state" \
+              --runtime-dir "$runtime" --keep-runtime-dir "$@" \
+              shell -c 'echo ok' 2>&1 > "$runtime/shell.out" | tee "$runtime/inspector.log"
+            grep -Fqx ok "$runtime/shell.out"
+          }
+          boot retention-1 --boot-program dash --boot-program debugger --no-compiler-plugin
+          cp target/kernel-prebuild/x86_64-unknown-none/profile-use/helios-bootfs \
+            "$GITHUB_WORKSPACE/smoke-runtime-measured/helios-bootfs.retained"
+          first="$("$check" settled "$GITHUB_WORKSPACE/smoke-runtime-measured/retention-1/debug-serial.log" provisioned-and-sealed empty)"
+          boot retention-2 --bootfs "$GITHUB_WORKSPACE/smoke-runtime-measured/helios-bootfs.retained" \
+            --boot-program dash --boot-program debugger --no-compiler-plugin
+          second="$("$check" settled "$GITHUB_WORKSPACE/smoke-runtime-measured/retention-2/debug-serial.log" unsealed none)"
+          echo "signer: first boot $first, second boot $second"
+          test "$first" = "$second"
+          echo "$first" > "$RUNNER_TEMP/tpm-signer-x86-64"
+      # One byte of the payload's signed body is inverted. The kernel
+      # refuses the payload on its signature before it measures or
+      # parses it, so the guest never reaches the debugger and the
+      # inspector reports the panic.
+      - name: Refuse a tampered boot payload
+        timeout-minutes: 10
+        shell: bash
+        working-directory: helios
+        run: |
+          check=tools/measured-boot-check.sh
+          runtime="$GITHUB_WORKSPACE/smoke-runtime-measured/tampered"
+          mkdir -p "$runtime"
+          "$check" tamper "$GITHUB_WORKSPACE/smoke-runtime-measured/helios-bootfs.retained" \
+            "$runtime/helios-bootfs"
+          if ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            --accel kvm --tpm swtpm \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --bootfs "$runtime/helios-bootfs" \
+            --boot-program dash --boot-program debugger --no-compiler-plugin \
+            shell -c 'echo ok' > "$runtime/shell.out" 2> "$runtime/inspector.log"; then
+            echo 'the inspector booted a payload whose signature does not match'
+            exit 1
+          fi
+          cat "$runtime/inspector.log"
+          "$check" refused "$runtime/debug-serial.log"
+      # A different boot program set is a different payload, signed by
+      # the same build root, so it verifies and PCR 9 differs. The TPM
+      # state the retention step left is sealed to the old measurement:
+      # it is reported as changed state, a new seed replaces it, and the
+      # key is not the one of the two boots before.
+      - name: Reseal the kernel signing key after a changed payload
+        timeout-minutes: 10
+        shell: bash
+        working-directory: helios
+        run: |
+          set -o pipefail
+          check=tools/measured-boot-check.sh
+          runtime="$GITHUB_WORKSPACE/smoke-runtime-measured/changed"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            --accel kvm --tpm swtpm --tpm-state "$RUNNER_TEMP/tpm-state-x86-64" \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger --boot-program date \
+            --no-compiler-plugin \
+            shell -c 'echo ok' 2>&1 > "$runtime/shell.out" | tee "$runtime/inspector.log"
+          grep -Fqx ok "$runtime/shell.out"
+          changed="$("$check" settled "$runtime/debug-serial.log" provisioned-and-sealed state-changed)"
+          retained="$(cat "$RUNNER_TEMP/tpm-signer-x86-64")"
+          echo "signer: retained $retained, after the change $changed"
+          test "$changed" != "$retained"
       - name: Run the coreutils applets through dash
         timeout-minutes: 5
         shell: bash
@@ -1569,6 +1799,7 @@ jobs:
           # rather than as console output.
           path: |
             smoke-runtime/*/*.log
+            smoke-runtime-measured/*/*.log
           if-no-files-found: warn
           retention-days: 7
       # Each boot above rebuilds the bootfs for its own `--boot-program`

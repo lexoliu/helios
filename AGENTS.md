@@ -464,9 +464,9 @@ red lane names the surface that broke:
 | `check-host` | `ubuntu-24.04` | The host surfaces compile. |
 | `lint-fmt`, `lint-host`, `lint-aarch64`, `lint-riscv`, `lint-x86` | `ubuntu-24.04` | Formatting, the `deny.toml` bans, and clippy at `-D warnings`; a bare-metal lint lane is also that target's compile check, since clippy builds the packages `check-target` checks. |
 | `test-units`, `test-embedded-debugger` | `ubuntu-24.04` | Unit tests and the embedded debugger. |
-| `smoke-x86-64` | `ubuntu-24.04`, `--accel kvm` | Boot, shell, CPython, the in-kernel compiler, a trapped OOB load, curl over virtio-net, the raw serial captures. |
+| `smoke-x86-64` | `ubuntu-24.04`, `--accel kvm` | Boot, shell, CPython, the in-kernel compiler, a trapped OOB load, curl over virtio-net, the raw serial captures; under `swtpm`, the kernel's signing key kept across two boots, resealed after a changed payload, and a tampered payload refused. |
 | `smoke-riscv64` | `ubuntu-24.04`, `--accel tcg` | Boot, shell, CPython, a trapped OOB load, the inspector RPC over vsock, curl over virtio-net. |
-| `smoke-aarch64` | `ubuntu-24.04-arm`, `--accel tcg` | Boot from the device tree and from ACPI, against a pinned upstream QEMU the lane builds and caches, because Ubuntu 24.04's QEMU asserts in its emulated GICv3 under multi-threaded TCG. |
+| `smoke-aarch64` | `ubuntu-24.04-arm`, `--accel tcg` | Boot from the device tree and from ACPI; under `swtpm`, the kernel's signing key kept across two ACPI boots, resealed after a changed payload, changed state detected across device-tree boots, and a tampered payload refused. Runs against a pinned upstream QEMU the lane builds and caches, because Ubuntu 24.04's QEMU asserts in its emulated GICv3 under multi-threaded TCG. |
 | `bench-x86-64-linux` | `ubuntu-24.04`, `--accel kvm`, multi-queue tap | The workload benchmarks of §3.6, with the negotiated virtio-net features reported. |
 
 The bench lane is the exception: it lives in `bench-lane.yml` and runs
