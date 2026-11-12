@@ -138,14 +138,17 @@ pub use instance::{
     StoreTurns, allow_instance_resource_growth,
 };
 pub use io::{
-    BlockInstallError, BlockSelfCheckError, BlockService, BlockStats, ByteReadWait, ByteReader,
-    ByteWriteWait, ByteWriter, ClosedPeer, DebugConsole, DebugSerialAccess, DebugSerialInterrupt,
-    DebugSerialWriter, ExternalInterruptHandler, ExternalInterruptRoutes, IommuDomains,
-    IommuEndpointStats, IommuReport, IommuStats, MAX_BLOCK_DEVICES, MAX_DEVICE_INTERRUPTS,
-    MAX_INPUT_DEVICES, MAX_IOMMU_ENDPOINTS, MAX_NETWORK_INTERRUPTS, PanicSerial, PollKey,
-    PollRegistration, PollRegistry, PollRegistryError, PollSourceKind, RecordingConsole,
-    SCRATCH_DISK_SERIAL, SerialReader, TryRead, TryWrite, byte_channel, emit_panic_report,
-    install_block_devices, read_debug_serial, read_serial, try_read_serial, wake_queue_owners,
+    BlockCache, BlockCacheError, BlockCacheLimits, BlockInstallError, BlockMut, BlockPages,
+    BlockRef, BlockRouteError, BlockSelfCheckError, BlockService, BlockStats, ByteReadWait,
+    ByteReader, ByteWriteWait, ByteWriter, CACHE_BLOCK_BYTES, CacheLayoutError, CachedDisk,
+    CachedDiskStats, ClosedPeer, DebugConsole, DebugSerialAccess, DebugSerialInterrupt,
+    DebugSerialWriter, DiskRefusal, DiskRole, ExternalInterruptHandler, ExternalInterruptRoutes,
+    IommuDomains, IommuEndpointStats, IommuReport, IommuStats, MAX_BLOCK_DEVICES,
+    MAX_DEVICE_INTERRUPTS, MAX_INPUT_DEVICES, MAX_IOMMU_ENDPOINTS, MAX_NETWORK_INTERRUPTS,
+    PanicSerial, PollKey, PollRegistration, PollRegistry, PollRegistryError, PollSourceKind,
+    RecordingConsole, SCRATCH_DISK_SERIAL, ScratchDisk, ScratchDiskStats, SerialReader, TryRead,
+    TryWrite, admit_block_devices, byte_channel, emit_panic_report, install_block_devices,
+    read_debug_serial, read_serial, try_read_serial, wake_queue_owners,
 };
 pub use kernel_exception::{
     KernelException, KernelExceptionCause, KernelExceptionDispatch, KernelNativeTrapHandler,
@@ -154,10 +157,12 @@ pub use kernel_exception::{
 pub use machine::{AdvanceCause, Generation, MachineGeneration, MachineGenerationHandle};
 pub use memory::{
     AccessibilityPlan, BalloonHandle, BalloonStats, BootMemoryPlan, BootRegionSplitter,
-    CommittedRegion, CommittedRemoval, Decommitted, ENTROPY_RESEED_INTERVAL, EntropyPool,
-    EntropySources, FIBER_STACK_GUARD_BYTES, FREE_PAGE_REPORT_INTERVAL, FiberStack,
-    FiberStackArenaStats, FiberStackError, FiberStackVmHooks, HardwareEntropySource,
-    IDLE_SWAP_AFTER, KERNEL_HEAP_BOOTSTRAP_BYTES, KERNEL_HEAP_GROWTH_CHUNK_BYTES,
+    COMPRESSED_PAGE_BYTES, CommittedRegion, CommittedRemoval, CompressRefusal, CompressedPage,
+    CompressedPool, CompressedPoolError, CompressedPoolStats, DEFAULT_COMPRESSION_LEVEL,
+    DEFAULT_POOL_PERCENT, Decommitted, ENTROPY_RESEED_INTERVAL, EntropyPool, EntropySources,
+    FIBER_STACK_GUARD_BYTES, FREE_PAGE_REPORT_INTERVAL, FiberStack, FiberStackArenaStats,
+    FiberStackError, FiberStackVmHooks, HardwareEntropySource, IDLE_SWAP_AFTER,
+    INCOMPRESSIBLE_BYTES, KERNEL_HEAP_BOOTSTRAP_BYTES, KERNEL_HEAP_GROWTH_CHUNK_BYTES,
     KERNEL_HEAP_MAX_BOOT_FRACTION, KERNEL_HEAP_MIN_RESERVE_BYTES, KERNEL_HEAP_RESERVE_FRACTION,
     KernelPhysFrameAllocator, MemoryOwner, NoCryptographicEntropy, NoEntropyDevice,
     ROOT_ENTROPY_MATERIAL_BYTES, RegionShares, ReleasedReservation, ReservationLookup,
