@@ -3887,7 +3887,7 @@ version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "597fda855abe96a6a39b2beeca3ee15de3a73c8ed3ff3432778fd2f1db400fcd"
 dependencies = [
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
