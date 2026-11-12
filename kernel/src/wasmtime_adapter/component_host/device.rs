@@ -149,6 +149,7 @@ fn to_wit_region(region: &DeviceRegion) -> device_wit::Region {
         kind: match region.attributes.kind {
             MemoryKind::Device => device_wit::MemoryKind::Device,
             MemoryKind::Normal => device_wit::MemoryKind::Normal,
+            MemoryKind::WriteCombining => device_wit::MemoryKind::WriteCombining,
         },
         writable: region.attributes.writable,
         prefetchable: region.attributes.prefetchable,

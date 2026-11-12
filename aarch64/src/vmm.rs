@@ -873,11 +873,14 @@ impl Aarch64UserAddressSpace {
     /// reordering, gathering and early write acknowledgement that make a
     /// register file misbehave. A prefetchable region — a framebuffer,
     /// an aperture — is real memory behind a bus window and says so, so
-    /// it keeps the normal cacheable attributes.
+    /// it keeps the normal cacheable attributes. Write-combining memory
+    /// selects index 6, Normal non-cacheable: stores may gather, and no
+    /// cache holds a line another agent reads without snooping.
     fn device_pte(&self, attributes: DeviceRegionAttributes) -> u64 {
         let index = match attributes.kind {
             MemoryKind::Device => crate::PAGE_ATTR_DEVICE_INDEX,
             MemoryKind::Normal => ATTR_NORMAL,
+            MemoryKind::WriteCombining => crate::PAGE_ATTR_NORMAL_NC_INDEX,
         };
         let access = if attributes.writable {
             AP_KERNEL_RW

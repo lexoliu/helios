@@ -19,7 +19,7 @@ pub(crate) use authority::test_caps;
 pub use authority::{
     AudioClaimCap, ClockAuthorityRights, CompileAuthority, DeviceClassRights, DeviceGrantClaimCap,
     DiagnosticAuthorityRights, DirectoryAuthorityRights, DirectoryCap, DirectoryPreopen,
-    DisplayClaimCap, DnsCap, ExecAuthority, ForkAuthority, GpuClaimCap, InputClaimCap,
+    DisplayClaimCap, DnsCap, ExecAuthority, ForkAuthority, GpuOpenCap, InputClaimCap,
     JoinAuthority, LinkAuthorityRights, LinkSourceCap, LinkTargetDirectoryCap,
     MountAuthorityRights, MountCap, MulticastCap, NetworkAdminCap, NetworkAuthorityRights,
     NetworkCap, ObserveMachineCap, PrivilegedBindCap, ProcessAuthority, ProcessAuthorityError,
