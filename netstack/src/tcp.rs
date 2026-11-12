@@ -1290,6 +1290,27 @@ where
         self.receive_queued_bytes
     }
 
+    /// Data this side still owes the peer, in bytes: what has been sent
+    /// and not yet acknowledged, plus what is queued and not yet sent. A
+    /// SYN or FIN in flight counts as one byte, as it does in sequence
+    /// space.
+    pub fn send_queued_bytes(&self) -> u64 {
+        let unsent = self
+            .transmit_queue
+            .as_ref()
+            .map_or(0, |queue| queue.queued_bytes as u64);
+        u64::from(self.bytes_in_flight) + unsent
+    }
+
+    /// Whether the retransmission timer is armed: a sent segment awaits
+    /// acknowledgement, and [`Self::next_deadline_nanos`] includes its
+    /// retransmission deadline.
+    pub fn retransmission_timer_armed(&self) -> bool {
+        self.in_flight
+            .as_ref()
+            .is_some_and(|in_flight| in_flight.front().is_some())
+    }
+
     /// Data held in the out-of-order reassembly queue, in bytes.
     pub fn out_of_order_queued_bytes(&self) -> usize {
         self.out_of_order_queued_bytes
@@ -2832,9 +2853,16 @@ where
             .wrapping_add(u32::try_from(payload_len).unwrap_or(u32::MAX));
         let drained_segments = self.drain_contiguous_out_of_order();
         self.refresh_advertised_window();
-        if drained_segments == 0 {
+        // Duplicate acknowledgements owed for a hole all carry the old
+        // `receive_next`. Once it advances they would repeat the new one
+        // and read to the peer as a loss report for data it has not lost,
+        // so the advance settles them to the single immediate
+        // acknowledgement of RFC 5681 §4.2.
+        let settles_duplicates = payload_len != 0 && self.pending_acks > 1;
+        if drained_segments == 0 && !settles_duplicates {
             self.note_inbound_payload(now_nanos);
         } else {
+            self.pending_acks = 0;
             self.request_ack();
         }
         Ok(payload_len != 0 || drained_segments != 0)
@@ -3160,6 +3188,16 @@ where
         }
         !self.transmit_queue_is_empty()
             || (matches!(self.state, TcpState::FinWait1 | TcpState::LastAck) && !self.fin_queued)
+    }
+
+    /// Whether the socket holds bytes, or a FIN, that
+    /// [`TcpSocket::take_transmit_segment`] could still put on the wire.
+    ///
+    /// Taking a segment moves it into flight, so a caller that has to
+    /// secure somewhere to send it first asks this before taking: a
+    /// `false` answer means a take cannot produce a segment.
+    pub fn has_pending_transmit(&self) -> bool {
+        self.has_persist_pending_data()
     }
 
     fn arm_persist_timer_if_needed(&mut self, now_nanos: u64) {
@@ -7031,6 +7069,95 @@ mod tests {
             acknowledgements += 1;
         }
         assert_eq!(acknowledgements, 4);
+    }
+
+    /// An established socket that has received peer data up to 201 and
+    /// owes no acknowledgement.
+    fn socket_with_receive_next_201() -> TcpSocket<BbrV3> {
+        let mut socket = established_socket();
+        let payload = [0u8; 100];
+        let _ = deliver_segment(
+            &mut socket,
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 101,
+                acknowledgement: 8,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+                options: TcpOptions::empty(),
+                payload: &payload,
+            },
+            1,
+        );
+        while socket.pending_ack().is_some() {
+            socket.mark_ack_queued();
+        }
+        socket
+    }
+
+    fn deliver_payload_at(socket: &mut TcpSocket<BbrV3>, sequence: u32, now_nanos: u64) {
+        let payload = [0u8; 100];
+        let _ = deliver_segment(
+            socket,
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence,
+                acknowledgement: 8,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+                options: TcpOptions::empty(),
+                payload: &payload,
+            },
+            now_nanos,
+        );
+    }
+
+    /// Filling the hole settles the duplicates owed for it to the one
+    /// acknowledgement of the advance, so the peer never counts them.
+    #[test]
+    fn filling_the_hole_settles_owed_duplicate_acks_to_one() {
+        let mut socket = socket_with_receive_next_201();
+        for index in 0..4u32 {
+            deliver_payload_at(&mut socket, 301 + index * 100, 2 + u64::from(index));
+        }
+        assert_eq!(socket.pending_ack_count(), 4);
+
+        deliver_payload_at(&mut socket, 201, 10);
+
+        assert_eq!(socket.pending_ack_count(), 1);
+        let header = socket.pending_ack().expect("the advance owes an ACK");
+        assert_eq!(header.acknowledgement, 701);
+    }
+
+    /// A segment that advances `receive_next` without reaching the next
+    /// queued segment owes one immediate acknowledgement; the hole that
+    /// remains owes one more per segment arriving ahead of it.
+    #[test]
+    fn partly_filled_hole_owes_one_ack_then_one_per_later_segment() {
+        let mut socket = socket_with_receive_next_201();
+        for index in 0..3u32 {
+            deliver_payload_at(&mut socket, 401 + index * 100, 2 + u64::from(index));
+        }
+        assert_eq!(socket.pending_ack_count(), 3);
+
+        deliver_payload_at(&mut socket, 201, 10);
+
+        assert_eq!(socket.pending_ack_count(), 1);
+        let header = socket.pending_ack().expect("the advance owes an ACK");
+        assert_eq!(header.acknowledgement, 301);
+
+        deliver_payload_at(&mut socket, 701, 11);
+        deliver_payload_at(&mut socket, 801, 12);
+        assert_eq!(socket.pending_ack_count(), 3);
+        let mut acknowledgements = 0;
+        while let Some(header) = socket.pending_ack() {
+            assert_eq!(header.acknowledgement, 301);
+            socket.mark_ack_queued();
+            acknowledgements += 1;
+        }
+        assert_eq!(acknowledgements, 3);
     }
 
     /// The queue of owed acknowledgements is bounded: a peer that keeps
