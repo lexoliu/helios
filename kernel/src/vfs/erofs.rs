@@ -24,7 +24,7 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::future::Future;
+use core::convert::Infallible;
 
 use bytes::{Bytes, BytesMut};
 use crc::{CRC_32_ISCSI, Crc};
@@ -340,18 +340,16 @@ where
         Ok(buffer.freeze())
     }
 
-    fn write_with<'a, F>(
-        &'a self,
-        _: FsPath<'a>,
+    type Write<'a> = Infallible;
+
+    async fn prepare_write(
+        &self,
+        _: FsPath<'_>,
         _: WritePosition,
         _: usize,
         _: u64,
-        _: F,
-    ) -> impl Future<Output = FsResult<u64>> + Send + 'a
-    where
-        F: FnOnce(&mut [u8]),
-    {
-        core::future::ready(Err(FsError::ReadOnly))
+    ) -> FsResult<Infallible> {
+        Err(FsError::ReadOnly)
     }
 
     async fn set_size(&self, _: FsPath<'_>, _: u64, _: u64) -> FsResult<()> {

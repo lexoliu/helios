@@ -8,6 +8,7 @@ use core::ptr;
 
 use crate::InstanceId;
 use bytes::Bytes;
+use helios_hal::fs::{WritePosition, WriteProgress};
 use helios_hal::io::IoError;
 use thiserror::Error;
 
@@ -1169,7 +1170,82 @@ pub enum HostShareRestore {
     SessionLost,
 }
 
+/// A host-share write [`HostFileSystem::prepare_write`] staged.
+///
+/// A write lands in rounds: each round's destinations are staged before
+/// its bytes, filled synchronously, and then sent. An implementation
+/// bounds a round by the destinations it can hold at once (the 9p
+/// client's request pool), never by the write's length; the rounds'
+/// lengths sum to the prepared length and land in order at consecutive
+/// offsets.
+///
+/// Dropping a staged or filled write before its submit returns what it
+/// holds (its destinations, its open file) and leaves the file as it
+/// was: the rounds already submitted have landed, this one has not.
+/// Dropping a submit's future part way may leave part of its round
+/// written.
+///
+/// Concurrency: a staged write is owned by the task that prepared it and
+/// moved, never shared; for its whole life it counts as an operation in
+/// flight on the share, so a snapshot hold waits for it.
+pub trait HostWrite: Send + Sized {
+    /// The round once its bytes are in.
+    type Filled: HostFilledWrite<Next = Self>;
+
+    /// The bytes this round stages.
+    fn staged_len(&self) -> usize;
+
+    /// Writes this round's bytes into its destinations. `fill` is called
+    /// once per destination region, in write order, with the region's
+    /// offset from the start of the whole write; the regions cover
+    /// [`Self::staged_len`] bytes exactly.
+    fn fill<F>(self, fill: F) -> Self::Filled
+    where
+        F: FnMut(usize, &mut [u8]);
+}
+
+/// A round of a [`HostWrite`] whose bytes are in, ready to send.
+pub trait HostFilledWrite: Send + Sized {
+    /// The staged write the next round continues as.
+    type Next;
+
+    /// Sends the round in order, checking that the host took every byte
+    /// of it, and resolves with the next round staged or, after the last,
+    /// the offset the whole write began at.
+    fn submit(self) -> impl Future<Output = Result<WriteProgress<Self::Next>, HostFsError>> + Send;
+}
+
+/// The write of a host filesystem that refuses every write before it is
+/// staged.
+impl HostWrite for core::convert::Infallible {
+    type Filled = Self;
+
+    fn staged_len(&self) -> usize {
+        match *self {}
+    }
+
+    fn fill<F>(self, _: F) -> Self
+    where
+        F: FnMut(usize, &mut [u8]),
+    {
+        match self {}
+    }
+}
+
+impl HostFilledWrite for core::convert::Infallible {
+    type Next = Self;
+
+    async fn submit(self) -> Result<WriteProgress<Self>, HostFsError> {
+        match self {}
+    }
+}
+
 pub trait HostFileSystem: Clone + Send + Sync + 'static {
+    /// The write [`Self::prepare_write`] stages.
+    type Write<'a>: HostWrite
+    where
+        Self: 'a;
+
     /// How this filesystem's caches have been serving the kernel, or
     /// `None` from an implementation that caches nothing.
     fn cache_stats(&self) -> Option<crate::HostFsCacheStats>;
@@ -1224,20 +1300,17 @@ pub trait HostFileSystem: Clone + Send + Sync + 'static {
         offset: u64,
         max_bytes: u32,
     ) -> impl Future<Output = Result<Vec<u8>, HostFsError>> + Send + 'a;
-    fn write_file<'a>(
+    /// Stages a write of `len` bytes to `path` at `position`: opens the
+    /// file, resolves where the bytes land (an append reads the host's
+    /// current end of file, so concurrent growth is not overwritten) and
+    /// readies the destinations the first round of bytes goes into.
+    /// Nothing reaches the file until [`HostFilledWrite::submit`].
+    fn prepare_write<'a>(
         &'a self,
         path: &'a str,
-        offset: u64,
-        bytes: &'a [u8],
-    ) -> impl Future<Output = Result<(), HostFsError>> + Send + 'a;
-    /// Appends to the end of `path`, resolving the current end of file on the
-    /// host so concurrent growth is not overwritten. Resolves with the offset
-    /// the bytes were written at.
-    fn append_file<'a>(
-        &'a self,
-        path: &'a str,
-        bytes: &'a [u8],
-    ) -> impl Future<Output = Result<u64, HostFsError>> + Send + 'a;
+        position: WritePosition,
+        len: usize,
+    ) -> impl Future<Output = Result<Self::Write<'a>, HostFsError>> + Send + 'a;
     /// Flushes host-side buffers for `path` (9p `Tfsync`).
     fn sync_file<'a>(
         &'a self,

@@ -1,14 +1,15 @@
 use std::ffi::CString;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{self as unix_fs, MetadataExt};
+use std::os::unix::fs::{self as unix_fs, FileExt, MetadataExt};
 use std::path::{Component, Path, PathBuf};
 
+use helios_hal::fs::{WritePosition, WriteProgress};
 use helios_hal::io::IoError;
 use helios_kernel::{
-    AuthorityDomain, HostDirEntry, HostDirLimit, HostFileSystem, HostFsError, HostMetadata,
-    ObjectIdentity,
+    AuthorityDomain, HostDirEntry, HostDirLimit, HostFileSystem, HostFilledWrite, HostFsError,
+    HostMetadata, HostWrite, ObjectIdentity,
 };
 
 /// Host-OS backed filesystem for the hosted backend.
@@ -77,6 +78,8 @@ where
 }
 
 impl HostFileSystem for HostedFileSystem {
+    type Write<'a> = HostedWrite;
+
     /// The hosted backend calls the host OS directly, which does its own
     /// caching; there is no 9p session in front of it to cache for.
     fn cache_stats(&self) -> Option<helios_kernel::HostFsCacheStats> {
@@ -136,26 +139,14 @@ impl HostFileSystem for HostedFileSystem {
         })
     }
 
-    fn write_file(
+    fn prepare_write(
         &self,
         path: &str,
-        offset: u64,
-        bytes: &[u8],
-    ) -> impl core::future::Future<Output = Result<(), HostFsError>> + Send + '_ {
-        let bytes = bytes.to_vec();
+        position: WritePosition,
+        len: usize,
+    ) -> impl core::future::Future<Output = Result<HostedWrite, HostFsError>> + Send + '_ {
         blocking_path(self.resolve(path), move |path| {
-            write_file_impl(&path, offset, &bytes)
-        })
-    }
-
-    fn append_file(
-        &self,
-        path: &str,
-        bytes: &[u8],
-    ) -> impl core::future::Future<Output = Result<u64, HostFsError>> + Send + '_ {
-        let bytes = bytes.to_vec();
-        blocking_path(self.resolve(path), move |path| {
-            append_file_impl(&path, &bytes)
+            open_for_write(&path, position, len)
         })
     }
 
@@ -325,28 +316,87 @@ fn read_file_range_impl(path: &Path, offset: u64, max_bytes: u32) -> Result<Vec<
     Ok(buf)
 }
 
-fn write_file_impl(path: &Path, offset: u64, bytes: &[u8]) -> Result<(), HostFsError> {
-    use std::io::{Seek, SeekFrom, Write};
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .open(path)
-        .map_err(map_io_error)?;
-    file.seek(SeekFrom::Start(offset)).map_err(map_io_error)?;
-    file.write_all(bytes).map_err(map_io_error)?;
-    Ok(())
+/// A write to a host file, staged by opening it: an append opens it with
+/// `O_APPEND`, so the host OS positions the bytes at its end of file when
+/// they arrive.
+///
+/// The destination is the buffer handed to the host OS's write, and the
+/// write lands in one round of its whole length: the hosted backend runs
+/// the kernel for development on the host itself, with no request pool to
+/// bound a round by.
+pub struct HostedWrite {
+    file: fs::File,
+    position: WritePosition,
+    bytes: Vec<u8>,
 }
 
-fn append_file_impl(path: &Path, bytes: &[u8]) -> Result<u64, HostFsError> {
-    use std::io::Write;
-    let mut file = fs::OpenOptions::new()
-        .append(true)
-        .open(path)
-        .map_err(map_io_error)?;
-    // `O_APPEND` positions the write at the end of file itself; the length
-    // read here is only reported back so callers can track the stream offset.
-    let offset = file.metadata().map_err(map_io_error)?.len();
-    file.write_all(bytes).map_err(map_io_error)?;
-    Ok(offset)
+/// A [`HostedWrite`] whose bytes are in.
+pub struct FilledHostedWrite {
+    write: HostedWrite,
+}
+
+fn open_for_write(
+    path: &Path,
+    position: WritePosition,
+    len: usize,
+) -> Result<HostedWrite, HostFsError> {
+    let mut options = fs::OpenOptions::new();
+    match position {
+        WritePosition::At(_) => options.write(true),
+        WritePosition::End => options.append(true),
+    };
+    let file = options.open(path).map_err(map_io_error)?;
+    Ok(HostedWrite {
+        file,
+        position,
+        bytes: vec![0; len],
+    })
+}
+
+impl HostWrite for HostedWrite {
+    type Filled = FilledHostedWrite;
+
+    fn staged_len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    fn fill<F>(mut self, mut fill: F) -> FilledHostedWrite
+    where
+        F: FnMut(usize, &mut [u8]),
+    {
+        fill(0, &mut self.bytes);
+        FilledHostedWrite { write: self }
+    }
+}
+
+impl HostFilledWrite for FilledHostedWrite {
+    type Next = HostedWrite;
+
+    async fn submit(self) -> Result<WriteProgress<HostedWrite>, HostFsError> {
+        let HostedWrite {
+            mut file,
+            position,
+            bytes,
+        } = self.write;
+        blocking::unblock(move || {
+            let landed = match position {
+                WritePosition::At(offset) => {
+                    file.write_all_at(&bytes, offset).map_err(map_io_error)?;
+                    offset
+                }
+                WritePosition::End => {
+                    // `O_APPEND` positions the write at the end of file
+                    // itself; the length read here is only reported back
+                    // so callers can track the stream offset.
+                    let offset = file.metadata().map_err(map_io_error)?.len();
+                    file.write_all(&bytes).map_err(map_io_error)?;
+                    offset
+                }
+            };
+            Ok(WriteProgress::Done(landed))
+        })
+        .await
+    }
 }
 
 fn sync_file_impl(path: &Path) -> Result<(), HostFsError> {
@@ -414,7 +464,8 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use helios_kernel::HostFileSystem;
+    use helios_hal::fs::{WritePosition, WriteProgress};
+    use helios_kernel::{HostFileSystem, HostFilledWrite, HostFsError, HostWrite};
 
     use super::HostedFileSystem;
 
@@ -501,20 +552,97 @@ mod tests {
             std::fs::write(root.path().join("log"), b"first").expect("seed file must be written");
             let filesystem = filesystem(&root);
 
-            let offset = filesystem
-                .append_file("log", b"-second")
+            let offset = append(&filesystem, "log", b"-second")
                 .await
                 .expect("append must succeed");
             assert_eq!(offset, b"first".len() as u64);
 
-            filesystem
-                .append_file("log", b"-third")
+            append(&filesystem, "log", b"-third")
                 .await
                 .expect("second append must succeed");
 
             let contents = std::fs::read(root.path().join("log")).expect("file must be readable");
             assert_eq!(contents, b"first-second-third");
         });
+    }
+
+    /// A positional write lands at its offset, and one prepared but
+    /// dropped before its submit leaves the file as it was.
+    #[test]
+    fn hosted_filesystem_writes_at_an_offset_and_a_dropped_write_changes_nothing() {
+        run_hosted_fs_test(async {
+            let root = test_root();
+            std::fs::write(root.path().join("data"), b"0123456789")
+                .expect("seed file must be written");
+            let filesystem = filesystem(&root);
+
+            let staged = filesystem
+                .prepare_write("data", WritePosition::At(3), 4)
+                .await
+                .expect("write must be staged");
+            drop(staged);
+            assert_eq!(
+                std::fs::read(root.path().join("data")).expect("file must be readable"),
+                b"0123456789"
+            );
+
+            let staged = filesystem
+                .prepare_write("data", WritePosition::At(3), 4)
+                .await
+                .expect("write must be staged");
+            assert_eq!(staged.staged_len(), 4);
+            let landed = staged
+                .fill(|at, destination| {
+                    destination.copy_from_slice(&b"abcd"[at..at + destination.len()]);
+                })
+                .submit()
+                .await
+                .expect("write must land");
+            assert!(matches!(landed, WriteProgress::Done(3)));
+            assert_eq!(
+                std::fs::read(root.path().join("data")).expect("file must be readable"),
+                b"012abcd789"
+            );
+        });
+    }
+
+    /// A write to a path the host does not have fails while it is being
+    /// staged, before any bytes are asked for.
+    #[test]
+    fn hosted_filesystem_refuses_a_write_to_a_missing_file_when_staging_it() {
+        run_hosted_fs_test(async {
+            let root = test_root();
+            let filesystem = filesystem(&root);
+
+            let error = filesystem
+                .prepare_write("missing", WritePosition::At(0), 4)
+                .await
+                .map(drop)
+                .expect_err("a missing file cannot be written");
+            assert_eq!(error.kind(), helios_kernel::HostFsErrorKind::NoEntry);
+        });
+    }
+
+    /// Appends `bytes` to `path` through the staged write, resolving with
+    /// the offset they landed at.
+    async fn append(
+        filesystem: &HostedFileSystem,
+        path: &str,
+        bytes: &[u8],
+    ) -> Result<u64, HostFsError> {
+        let staged = filesystem
+            .prepare_write(path, WritePosition::End, bytes.len())
+            .await?;
+        match staged
+            .fill(|at, destination| {
+                destination.copy_from_slice(&bytes[at..at + destination.len()]);
+            })
+            .submit()
+            .await?
+        {
+            WriteProgress::Done(landed) => Ok(landed),
+            WriteProgress::More(_) => panic!("a hosted write lands in one round"),
+        }
     }
 
     /// `fd_sync` must reach the host rather than report success without

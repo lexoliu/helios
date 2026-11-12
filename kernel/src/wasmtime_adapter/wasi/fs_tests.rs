@@ -8,9 +8,10 @@ use helios_hal::fs::{FileSystemRights, NodeKind, WritePosition};
 
 use super::{
     FsDescriptor, FsNodeKind, Granted, Kind, RegularFile, Right, Write, create_directory_at,
-    fs_types, link_at, metadata_hash, open_at, read, read_program_file, readlink_at,
-    remove_directory_at, rename_at, set_size, set_times, set_times_at, stat_at, stat_path,
-    symlink_at, unlink_file_at, write_program_file,
+    fs_types, link_at, metadata_hash, open_at, read, read_directory, read_program_file,
+    read_stream_target, readlink_at, remove_directory_at, rename_at, set_size, set_times,
+    set_times_at, stat_at, stat_path, symlink_at, unlink_file_at, write_program_file,
+    write_stream_target,
 };
 use crate::wasmtime_adapter::component_host::ProgramSource;
 use crate::wasmtime_adapter::cwasm::{self, UntrustedCwasm};
@@ -313,15 +314,7 @@ fn rename_into_a_missing_directory_fails() {
 fn hardlink_preserves_identity_and_shared_contents() {
     let namespace = namespace();
     let original = create_file(&namespace, "tmp", b"data");
-    block_on(link_at(
-        &namespace,
-        &root(),
-        "tmp",
-        held(&root()),
-        "alias",
-        2,
-    ))
-    .expect("hardlink must succeed");
+    link(&namespace, &root(), "tmp", &root(), "alias").expect("hardlink must succeed");
     let alias = open(
         &namespace,
         &root(),
@@ -355,15 +348,7 @@ fn hardlink_preserves_identity_and_shared_contents() {
 fn set_size_resizes_all_links_without_widening_descriptor_rights() {
     let namespace = namespace();
     let original = create_file(&namespace, "tmp", b"data");
-    block_on(link_at(
-        &namespace,
-        &root(),
-        "tmp",
-        held(&root()),
-        "alias",
-        3,
-    ))
-    .expect("hardlink must succeed");
+    link(&namespace, &root(), "tmp", &root(), "alias").expect("hardlink must succeed");
     block_on(set_size(&namespace, held(&original), 6, 4)).expect("set-size must grow the file");
 
     let alias = open(
@@ -423,26 +408,12 @@ fn hardlink_rejects_directory_and_cross_mount() {
         .expect("directory creation must succeed");
     create_file(&namespace, "tmp", b"");
 
-    let directory_error = block_on(link_at(
-        &namespace,
-        &root(),
-        "dir",
-        held(&root()),
-        "dir-link",
-        1,
-    ))
-    .expect_err("hardlinking directories must fail");
+    let directory_error = link(&namespace, &root(), "dir", &root(), "dir-link")
+        .expect_err("hardlinking directories must fail");
     assert!(matches!(directory_error, fs_types::ErrorCode::NotPermitted));
 
-    let file_error = block_on(link_at(
-        &namespace,
-        &root(),
-        "tmp",
-        held(&root()),
-        "mnt/tmp",
-        1,
-    ))
-    .expect_err("hardlink across mounts must fail");
+    let file_error = link(&namespace, &root(), "tmp", &root(), "mnt/tmp")
+        .expect_err("hardlink across mounts must fail");
     assert!(matches!(file_error, fs_types::ErrorCode::CrossDevice));
 }
 
@@ -1221,4 +1192,241 @@ fn a_read_only_base_creates_or_truncates_nothing_in_memory() {
         assert!(matches!(refused, Err(fs_types::ErrorCode::ReadOnly)));
     }
     assert_eq!(read_all(&namespace, &notes), "日本語 한국어".as_bytes());
+}
+
+/// Links `source_path` below `source` to `destination_path` below
+/// `destination`, minting the proof the way every surface does.
+fn link(
+    namespace: &TestNamespace,
+    source: &FsDescriptor,
+    source_path: &str,
+    destination: &FsDescriptor,
+    destination_path: &str,
+) -> Result<(), fs_types::ErrorCode> {
+    block_on(async {
+        let proof = source.grant()?.link_into(destination.grant()?)?;
+        link_at(namespace, proof, source_path, destination_path, 1).await
+    })
+}
+
+fn list(
+    namespace: &TestNamespace,
+    directory: &FsDescriptor,
+) -> Result<alloc::vec::Vec<fs_types::DirectoryEntry>, fs_types::ErrorCode> {
+    block_on(async { read_directory(namespace, directory.grant()?).await })
+}
+
+fn missing(namespace: &TestNamespace, path: &str) -> bool {
+    matches!(
+        block_on(stat_path(namespace, path, Follow::No)),
+        Err(fs_types::ErrorCode::NoEntry)
+    )
+}
+
+const SECRET: &str = "秘密の文書 비밀 문서 机密文件";
+
+/// `/a/secret` holding [`SECRET`], and an empty `/b`, on the root layer.
+fn secret_in_a() -> TestNamespace {
+    let namespace = namespace();
+    for name in ["a", "b"] {
+        block_on(create_directory_at(&namespace, held(&root()), name, 1))
+            .expect("directory creation must succeed");
+    }
+    create_file(&namespace, "a/secret", SECRET.as_bytes());
+    namespace
+}
+
+#[test]
+fn a_link_needs_the_read_right_on_its_source() {
+    let namespace = secret_in_a();
+    let write_only = fs_types::DescriptorFlags::WRITE | fs_types::DescriptorFlags::MUTATE_DIRECTORY;
+    let source = directory_holding("/a", write_only);
+    let destination = directory_holding("/b", root().flags);
+
+    let refused = link(&namespace, &source, "secret", &destination, "copy");
+    assert!(
+        matches!(refused, Err(fs_types::ErrorCode::NotPermitted)),
+        "a link from a base that cannot be read must be refused, got {refused:?}"
+    );
+    assert!(missing(&namespace, "/b/copy"));
+}
+
+#[test]
+fn a_link_cannot_make_a_read_only_file_writable() {
+    let namespace = secret_in_a();
+    let read = fs_types::DescriptorFlags::READ;
+    let read_only = directory_holding("/a", read);
+    let read_write = directory_holding("/b", root().flags);
+
+    let refused = link(&namespace, &read_only, "secret", &read_write, "copy");
+    assert!(
+        matches!(refused, Err(fs_types::ErrorCode::NotPermitted)),
+        "a read-only source must not feed a writable destination, got {refused:?}"
+    );
+    assert!(missing(&namespace, "/b/copy"));
+    let secret = open(
+        &namespace,
+        &root(),
+        "a/secret",
+        fs_types::OpenFlags::empty(),
+        read,
+    )
+    .expect("the secret still opens");
+    assert_eq!(read_all(&namespace, &secret), SECRET.as_bytes());
+
+    // The same refusal before any request reaches a host share.
+    let host_namespace = namespace_with_host();
+    let (rw, ro) = host_bases();
+    let reached = link(&host_namespace, &rw, "secret", &rw, "copy");
+    assert!(matches!(reached, Err(fs_types::ErrorCode::Unsupported)));
+    let refused = link(&host_namespace, &ro, "secret", &rw, "copy");
+    assert!(
+        matches!(refused, Err(fs_types::ErrorCode::NotPermitted)),
+        "the host share must not be asked, got {refused:?}"
+    );
+
+    // A destination that cannot write takes a read-only source, and a
+    // writable source feeds a writable destination.
+    let no_write = directory_holding("/b", read | fs_types::DescriptorFlags::MUTATE_DIRECTORY);
+    link(&namespace, &read_only, "secret", &no_write, "view").expect("read-only to no-write");
+    let writable = directory_holding("/a", root().flags);
+    link(&namespace, &writable, "secret", &read_write, "copy").expect("read-write to read-write");
+    let copy = open(
+        &namespace,
+        &root(),
+        "b/copy",
+        fs_types::OpenFlags::empty(),
+        read,
+    )
+    .expect("the copy opens");
+    assert_eq!(read_all(&namespace, &copy), SECRET.as_bytes());
+}
+
+#[test]
+fn a_link_needs_mutate_on_its_destination() {
+    let namespace = secret_in_a();
+    let source = directory_holding("/a", root().flags);
+    let destination = directory_holding(
+        "/b",
+        fs_types::DescriptorFlags::READ | fs_types::DescriptorFlags::WRITE,
+    );
+
+    let refused = link(&namespace, &source, "secret", &destination, "copy");
+    assert!(matches!(refused, Err(fs_types::ErrorCode::ReadOnly)));
+    assert!(missing(&namespace, "/b/copy"));
+}
+
+fn namespace_with_host() -> TestNamespace {
+    let namespace = namespace();
+    mount_unreachable_host(&namespace, "/mnt");
+    namespace
+}
+
+#[test]
+fn listing_a_directory_needs_the_read_right() {
+    let namespace = secret_in_a();
+    let mutate_only = fs_types::DescriptorFlags::MUTATE_DIRECTORY;
+    let readable = directory_holding("/a", fs_types::DescriptorFlags::READ);
+    let names: alloc::vec::Vec<_> = list(&namespace, &readable)
+        .expect("a readable directory lists")
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect();
+    assert_eq!(names, ["secret"]);
+    let refused = list(&namespace, &directory_holding("/a", mutate_only));
+    assert!(
+        matches!(refused, Err(fs_types::ErrorCode::NotPermitted)),
+        "listing without the read right must be refused, got {:?}",
+        refused.map(|entries| entries.len())
+    );
+
+    let host_namespace = namespace_with_host();
+    let (rw, _) = host_bases();
+    let reached = list(&host_namespace, &rw);
+    assert!(matches!(reached, Err(fs_types::ErrorCode::Unsupported)));
+    let refused = list(&host_namespace, &directory_holding("/mnt/a", mutate_only));
+    assert!(
+        matches!(refused, Err(fs_types::ErrorCode::NotPermitted)),
+        "the host share must not be listed, got {:?}",
+        refused.map(|entries| entries.len())
+    );
+}
+
+#[test]
+fn reads_need_the_read_right_on_every_backing() {
+    let namespace = namespace_with_host();
+    mount_memory(&namespace, "/memory");
+    let on_root = create_file(&namespace, "root-file", SECRET.as_bytes());
+    let in_memory = create_file(&namespace, "memory/file", SECRET.as_bytes());
+    let on_host = FsDescriptor {
+        path: String::from("/mnt/file"),
+        ..on_root.clone()
+    };
+
+    for file in [&on_root, &in_memory, &on_host] {
+        let write_only = FsDescriptor {
+            flags: fs_types::DescriptorFlags::WRITE,
+            ..file.clone()
+        };
+        let read_only = FsDescriptor {
+            flags: fs_types::DescriptorFlags::READ,
+            ..file.clone()
+        };
+        let path = &file.path;
+
+        let refused = block_on(async { read(&namespace, write_only.grant()?, 0, 64).await });
+        assert!(
+            matches!(refused, Err(fs_types::ErrorCode::NotPermitted)),
+            "reading {path} without the right must be refused, got {:?}",
+            refused.map(|bytes| bytes.len())
+        );
+        let refused = write_only
+            .grant()
+            .and_then(|file| read_stream_target(&namespace, file));
+        assert!(
+            matches!(refused, Err(fs_types::ErrorCode::NotPermitted)),
+            "a read stream on {path} needs the right"
+        );
+        let refused = read_only
+            .grant()
+            .and_then(|file| write_stream_target(&namespace, file));
+        assert!(
+            matches!(refused, Err(fs_types::ErrorCode::ReadOnly)),
+            "a write stream on {path} needs the right"
+        );
+    }
+
+    // The control: with the right, the host share is the one that answers.
+    let readable = FsDescriptor {
+        flags: fs_types::DescriptorFlags::READ,
+        ..on_host
+    };
+    let reached = block_on(async { read(&namespace, readable.grant()?, 0, 64).await });
+    assert!(matches!(reached, Err(fs_types::ErrorCode::Unsupported)));
+}
+
+#[test]
+fn a_create_lands_on_the_mount_that_owns_the_new_entry() {
+    let namespace = namespace();
+    let fs = MountedFs::Memory(MemoryFs::new(namespace.table().allocate_device()));
+    let cap = crate::ProcessAuthority::root()
+        .derive_mount_cap("/mnt")
+        .expect("root may mount anywhere");
+    block_on(namespace.mount(&cap, fs, FileSystemRights::READ)).expect("mount must succeed");
+
+    let created = open(
+        &namespace,
+        &root(),
+        "mnt/new",
+        fs_types::OpenFlags::CREATE,
+        fs_types::DescriptorFlags::READ,
+    );
+    assert!(matches!(created, Err(fs_types::ErrorCode::ReadOnly)));
+    let directory = block_on(create_directory_at(&namespace, held(&root()), "mnt/d", 1));
+    assert!(matches!(directory, Err(fs_types::ErrorCode::ReadOnly)));
+    let symlink = block_on(symlink_at(&namespace, held(&root()), "target", "mnt/l", 1));
+    assert!(matches!(symlink, Err(fs_types::ErrorCode::ReadOnly)));
+    for name in ["new", "d", "l"] {
+        assert!(missing(&namespace, &alloc::format!("/mnt/{name}")));
+    }
 }

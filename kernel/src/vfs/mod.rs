@@ -44,12 +44,12 @@ mod root;
 mod storage;
 
 pub use erofs::{DiskImage, ErofsError, ErofsFs, ReaderError};
-pub use host::HostShare;
-pub use memory::MemoryFs;
+pub use host::{HostShare, HostShareWrite};
+pub use memory::{MemoryFs, MemoryWrite};
 pub use request::{
     AttachedStorage, MountRequestError, MountSource, request_mount, request_unmount,
 };
-pub use root::RootFs;
+pub use root::{RootFs, RootWrite};
 pub use storage::{NoDisks, Storage, UnsupportedStorage};
 
 use alloc::borrow::{Cow, ToOwned};
@@ -59,6 +59,7 @@ use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::cmp::Ordering;
 use core::future::Future;
+use core::marker::PhantomData;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use core::task::{Context, Poll};
@@ -68,7 +69,7 @@ use crossbeam_utils::CachePadded;
 use helios_hal::cpu::current_processor;
 use helios_hal::fs::{
     DeviceId, DirCookie, DirEntry, FileSystem, FileSystemRights, FsError, FsPath, FsResult,
-    Metadata, NodeKind, OpenFlags, WritePosition,
+    Metadata, NodeKind, OpenFlags, PreparedWrite, WritePosition, WriteProgress,
 };
 use thiserror::Error;
 use triomphe::Arc;
@@ -114,6 +115,8 @@ macro_rules! mount_kinds {
         }
 
         impl<S: Storage> FileSystem for MountedFs<S> {
+            type Write<'a> = MountedWrite<'a, S>;
+
             async fn stat(&self, path: FsPath<'_>) -> FsResult<Metadata> {
                 match self { $(Self::$kind(fs) => fs.stat(path).await,)+ }
             }
@@ -131,24 +134,17 @@ macro_rules! mount_kinds {
                 match self { $(Self::$kind(fs) => fs.read_at(path, offset, max_bytes).await,)+ }
             }
 
-            fn write_with<'a, F>(
+            async fn prepare_write<'a>(
                 &'a self,
                 path: FsPath<'a>,
                 position: WritePosition,
                 len: usize,
                 now: u64,
-                fill: F,
-            ) -> impl Future<Output = FsResult<u64>> + Send + 'a
-            where
-                F: FnOnce(&mut [u8]),
-            {
-                // Each kind runs `fill` in this call, so the dispatch must
-                // too: the arms' futures are carried in one enum rather
-                // than awaited in an async body that would hold `fill`.
+            ) -> FsResult<MountedWrite<'a, S>> {
                 match self {
-                    $(Self::$kind(fs) => MountedWrite::$kind {
-                        future: fs.write_with(path, position, len, now, fill),
-                    },)+
+                    $(Self::$kind(fs) => {
+                        fs.prepare_write(path, position, len, now).await.map(MountedWrite::$kind)
+                    })+
                 }
             }
 
@@ -221,28 +217,81 @@ macro_rules! mount_kinds {
             }
         }
 
-        pin_project_lite::pin_project! {
-            /// The write future of whichever kind a [`MountedFs`] holds.
-            #[project = MountedWriteProjection]
-            enum MountedWrite<$($kind),+> {
-                $($kind { #[pin] future: $kind },)+
+        /// A write staged by whichever kind a [`MountedFs`] holds.
+        pub enum MountedWrite<'a, S: Storage> {
+            $($kind(<$fs as FileSystem>::Write<'a>),)+
+        }
+
+        impl<'a, S: Storage> PreparedWrite for MountedWrite<'a, S> {
+            fn staged_len(&self) -> usize {
+                match self { $(Self::$kind(write) => write.staged_len(),)+ }
+            }
+
+            #[expect(
+                unreachable_code,
+                reason = "the boot image refuses every write, so its staged write is `Infallible` and its arm is never reached"
+            )]
+            fn submit<F>(
+                self,
+                fill: F,
+            ) -> impl Future<Output = FsResult<WriteProgress<Self>>> + Send
+            where
+                F: FnMut(usize, &mut [u8]),
+            {
+                // Each kind runs `fill` in this call, so the dispatch must
+                // too: the arms' futures are carried in one enum rather
+                // than awaited in an async body that would hold `fill`.
+                match self {
+                    $(Self::$kind(write) => MountedSubmit::$kind {
+                        future: write.submit(fill),
+                        marker: PhantomData,
+                    },)+
+                }
             }
         }
 
-        impl<$($kind: Future<Output = FsResult<u64>>),+> Future for MountedWrite<$($kind),+> {
-            type Output = FsResult<u64>;
+        pin_project_lite::pin_project! {
+            /// The submit future of whichever kind a [`MountedWrite`]
+            /// holds, resolving with the next round as a `W`. The marker
+            /// is pinned only so the projection moves no field by value.
+            #[project = MountedSubmitProjection]
+            enum MountedSubmit<W, $($kind),+> {
+                $($kind { #[pin] future: $kind, #[pin] marker: PhantomData<fn() -> W> },)+
+            }
+        }
 
+        impl<'a, S: Storage, $($kind),+> Future
+            for MountedSubmit<MountedWrite<'a, S>, $($kind),+>
+        where
+            $($kind: Future<Output = FsResult<WriteProgress<<$fs as FileSystem>::Write<'a>>>>,)+
+        {
+            type Output = FsResult<WriteProgress<MountedWrite<'a, S>>>;
+
+            #[expect(
+                unreachable_code,
+                reason = "the boot image refuses every write, so its staged write is `Infallible` and its arm is never reached"
+            )]
             fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
                 match self.project() {
-                    $(MountedWriteProjection::$kind { future } => future.poll(cx),)+
+                    $(MountedSubmitProjection::$kind { future, .. } => {
+                        future.poll(cx).map(|progress| {
+                            progress.map(|progress| match progress {
+                                WriteProgress::More(write) => {
+                                    WriteProgress::More(MountedWrite::$kind(write))
+                                }
+                                WriteProgress::Done(landed) => WriteProgress::Done(landed),
+                            })
+                        })
+                    })+
                 }
             }
         }
     };
 }
 
-/// Writes `data` at `position` through [`FileSystem::write_with`], and
-/// resolves with the offset it landed at: the filesystem tests' write.
+/// Writes `data` at `position` through [`helios_hal::fs::write_with`],
+/// and resolves with the offset it landed at: the filesystem tests'
+/// write.
 #[cfg(test)]
 pub(crate) async fn write_bytes<F: FileSystem>(
     fs: &F,
@@ -251,8 +300,8 @@ pub(crate) async fn write_bytes<F: FileSystem>(
     data: &[u8],
     now: u64,
 ) -> FsResult<u64> {
-    fs.write_with(path, position, data.len(), now, |destination| {
-        destination.copy_from_slice(data)
+    helios_hal::fs::write_with(fs, path, position, data.len(), now, |at, destination| {
+        destination.copy_from_slice(&data[at..at + destination.len()]);
     })
     .await
 }

@@ -2748,9 +2748,15 @@ impl<StorageImpl: crate::Storage> Preview1ChunkedFile for ResolvedFileChunks<'_,
         position: WritePosition,
         len: usize,
     ) -> Result<u64, fs_types::ErrorCode> {
-        wasi_fs::write_resolved_with(self.file, position, len, self.now_nanos, |destination| {
-            gather.fill(destination)
-        })
+        // The regions arrive in write order and cover the chunk exactly,
+        // which is the order `gather` hands its bytes out in.
+        wasi_fs::write_resolved_with(
+            self.file,
+            position,
+            len,
+            self.now_nanos,
+            |_, destination| gather.fill(destination),
+        )
         .await
     }
 }
@@ -2773,7 +2779,11 @@ where
         return p1::errno::BADF;
     };
     let namespace = p1_namespace(caller);
-    let entries = match wasi_fs::read_directory(&namespace, &descriptor).await {
+    let directory = match p1_grant(&descriptor) {
+        Ok(directory) => directory,
+        Err(errno) => return errno,
+    };
+    let entries = match wasi_fs::read_directory(&namespace, directory).await {
         Ok(entries) => entries,
         Err(error) => return p1_errno_from_fs(error),
     };
@@ -3272,20 +3282,17 @@ where
         };
     let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
-    let destination = match p1_grant(&destination_base) {
-        Ok(destination) => destination,
+    let link = match p1_grant(&source_base).and_then(|source| {
+        source
+            .link_into(p1_grant(&destination_base)?)
+            .map_err(p1_errno_from_fs)
+    }) {
+        Ok(link) => link,
         Err(errno) => return errno,
     };
-    wasi_fs::link_at(
-        &namespace,
-        &source_base,
-        &old_path,
-        destination,
-        &new_path,
-        now_nanos,
-    )
-    .await
-    .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
+    wasi_fs::link_at(&namespace, link, &old_path, &new_path, now_nanos)
+        .await
+        .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
 
 pub(super) async fn p1_path_readlink<CpuImpl, Net, StorageImpl>(

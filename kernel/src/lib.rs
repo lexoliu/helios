@@ -127,8 +127,8 @@ pub use helios_netstack::{
     RxFrame, RxFrameOffload, SegmentationOffload, TxFrameRef,
 };
 pub use host_fs::{
-    HOST_SHARE_GUEST_MOUNT_PATH, HOST_SHARE_MOUNT_TAG, HostFsCacheStats, HostFsClient,
-    HostFsTransport, UnsupportedHostFileSystem,
+    FilledHostFsWrite, HOST_SHARE_GUEST_MOUNT_PATH, HOST_SHARE_MOUNT_TAG, HostFsCacheStats,
+    HostFsClient, HostFsTransport, HostFsWrite, UnsupportedHostFileSystem,
 };
 pub use input::{
     DeviceIndex, EVENT_QUEUE_DEPTH, EventBurst, InputClaim, InputDeviceSnapshot, InputEvents,
@@ -224,11 +224,11 @@ pub use profiling::{
 pub use runtime::{
     AuthorityDomain, ComponentHostNetwork, ComponentNetworkService, ComponentNetworkState,
     DnsError, DnsErrorKind, ExecOutput, ExecResult, HostDirEntry, HostDirLimit, HostFileSystem,
-    HostFsError, HostFsErrorKind, HostMetadata, HostShareRestore, Ipv4Address, NetworkErrorDetail,
-    NetworkHandle, NetworkIpAddress, NetworkPacketPump, ObjectIdentity, PingError, PingErrorKind,
-    PingReply, RegisteredTcpReadBuffer, RuntimeState, SocketReadiness, TcpAccepted, TcpError,
-    TcpErrorKind, TcpListener, TcpReadProgress, TcpWriteProgress, UdpBinding, UdpDatagram,
-    UdpError, UdpErrorKind,
+    HostFilledWrite, HostFsError, HostFsErrorKind, HostMetadata, HostShareRestore, HostWrite,
+    Ipv4Address, NetworkErrorDetail, NetworkHandle, NetworkIpAddress, NetworkPacketPump,
+    ObjectIdentity, PingError, PingErrorKind, PingReply, RegisteredTcpReadBuffer, RuntimeState,
+    SocketReadiness, TcpAccepted, TcpError, TcpErrorKind, TcpListener, TcpReadProgress,
+    TcpWriteProgress, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
 };
 pub use surface::{
     MAX_INSTANCE_SURFACES, MAX_LIVE_SURFACES, ReturnedSurface, ReturnedSurfaces,
@@ -238,10 +238,11 @@ pub use surface::{
 };
 pub use vfs::{
     AttachedStorage, BOOT_DEVICE, DiskImage, ErofsError, ErofsFs, FileContents, Follow, HeldPath,
-    HostShare, MAX_MOUNTS, MAX_SYMLINK_DEPTH, MemoryFs, MountError, MountHold, MountRequestError,
-    MountSource, MountTable, MountedFs, Namespace, NoDisks, ROOT_LAYER_DEVICE, ReaderError,
-    Resolved, RootFs, Storage, UnsupportedStorage, object_identity, request_mount, request_unmount,
-    symlink_target, within_directory,
+    HostShare, HostShareWrite, MAX_MOUNTS, MAX_SYMLINK_DEPTH, MemoryFs, MemoryWrite, MountError,
+    MountHold, MountRequestError, MountSource, MountTable, MountedFs, MountedWrite, Namespace,
+    NoDisks, ROOT_LAYER_DEVICE, ReaderError, Resolved, RootFs, RootWrite, Storage,
+    UnsupportedStorage, object_identity, request_mount, request_unmount, symlink_target,
+    within_directory,
 };
 pub use vsock::{
     ComponentHostVsockService, MAX_VSOCK_BACKLOG, MAX_VSOCK_CONNECTIONS, MAX_VSOCK_LISTENERS,
