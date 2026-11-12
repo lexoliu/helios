@@ -50,7 +50,10 @@
 //!
 //! Every operation is lock-free on the reader side and allocation-free on
 //! both. A reader is a timer interrupt, which runs with the local
-//! processor's interrupts masked and never waits for anything.
+//! processor's interrupts masked and never waits for anything, or the
+//! freeze's walk ([`GuestInterrupts::interrupt_running`]), which is task
+//! context and masks the local processor's interrupts itself for the
+//! length of the walk.
 //!
 //! Reclamation: a handle the owner publishes is valid until the poll
 //! that published it returns, and nothing past that. A reader on another
@@ -97,12 +100,13 @@ use core::task::{Context, Poll};
 
 use crossbeam_utils::CachePadded;
 use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase, current_processor};
+use helios_hal::critical_section::with_local_interrupts_masked;
 use pin_project_lite::pin_project;
 use slab::Slab;
 use spin::Mutex;
 use wasmtime::{Store, StoreInterruptHandle};
 
-use crate::{GUEST_TIME_SLICE, InstanceId};
+use crate::{GUEST_TIME_SLICE, InstanceId, KillReason};
 
 /// The interrupt routes into every store of one engine.
 pub struct GuestInterrupts {
@@ -171,6 +175,41 @@ impl GuestInterrupts {
         self.running.interrupt_overdue(now);
     }
 
+    /// Interrupts every guest, on any processor, that is running now,
+    /// however long it has run.
+    ///
+    /// The freeze barrier calls it so that a guest in the middle of wasm
+    /// reaches the executor at its next function-entry or loop-header
+    /// check, instead of at the end of its slice. It makes the same
+    /// request [`Self::preempt_overdue`] does of each store a processor's
+    /// slot names, so the store's callback runs the same yield (or
+    /// condemnation), with the same lock-free, allocation-free, IPI-free
+    /// walk. It is callable from task context on any processor. A guest
+    /// that is suspended or in host code is not reached, because it is
+    /// not running and reaches the executor on its own; one that resumes
+    /// before its processor stops is preempted at the end of its slice,
+    /// like any other.
+    pub fn interrupt_running(&self) {
+        // A reader runs with the local processor's interrupts masked, so
+        // that an interrupt handler never lands between its increment of
+        // `readers` and its decrement, which an owner on another
+        // processor would spin through (module docs, "Reclamation"). This
+        // caller is a task, so it masks them itself.
+        with_local_interrupts_masked(|| self.running.interrupt_all());
+    }
+
+    /// Whether a guest call is being polled on `processor` right now, as
+    /// the running slot says.
+    #[cfg(test)]
+    pub(crate) fn is_running_a_store(&self, processor: ProcessorId) -> bool {
+        !self
+            .running
+            .slot(processor)
+            .target
+            .load(Ordering::Acquire)
+            .is_null()
+    }
+
     /// Interrupts every live store of `instance`, wherever it is: running
     /// on a processor, suspended on its fiber, or in host code.
     ///
@@ -183,6 +222,28 @@ impl GuestInterrupts {
                 target.handle.interrupt();
             }
         }
+    }
+}
+
+/// What an interrupted guest does once its store has nothing to deliver
+/// but a condemnation: it traps a pending kill of its instance, and
+/// otherwise yields to the executor, because an interruption that is not a
+/// kill is the end of a time slice or a freeze's request
+/// ([`GuestInterrupts::interrupt_running`]), and both ask the guest to give
+/// up its processor.
+///
+/// Every store's interrupt callback ends in this decision, so a kill reaches
+/// a running guest the same way whichever store it runs on, and no store
+/// resumes a guest the tick or the freeze asked to give up its processor.
+///
+/// Runs in the store's own host context, on its own processor, and reads
+/// only the `pending_kill` its caller loaded: no lock, no allocation.
+pub(crate) fn kill_or_yield(
+    pending_kill: Option<KillReason>,
+) -> wasmtime::Result<wasmtime::InterruptAction> {
+    match pending_kill {
+        Some(reason) => Err(wasmtime::Error::from(crate::InstanceKilled { reason })),
+        None => Ok(wasmtime::InterruptAction::Yield),
     }
 }
 
@@ -318,6 +379,19 @@ impl<Target: Interruptible> RunningSlots<Target> {
     /// Interrupts every published target that has run for at least one
     /// slice by `now`.
     fn interrupt_overdue(&self, now: Instant) {
+        self.interrupt_where(|started| now.ticks().saturating_sub(started) >= self.slice_ticks);
+    }
+
+    /// Interrupts every published target, however long it has run.
+    fn interrupt_all(&self) {
+        self.interrupt_where(|_| true);
+    }
+
+    /// Interrupts every published target whose `started` tick `due`
+    /// accepts. The reader protocol of the module docs covers the walk,
+    /// whichever caller's policy decides.
+    #[inline]
+    fn interrupt_where(&self, due: impl Fn(u64) -> bool) {
         for slot in &self.slots {
             // An idle processor costs one load; the counted path below
             // runs only for a slot that names a target.
@@ -328,8 +402,7 @@ impl<Target: Interruptible> RunningSlots<Target> {
             let target = slot.target.load(Ordering::SeqCst);
             if !target.is_null() {
                 let started = slot.started.load(Ordering::Acquire);
-                let overdue = now.ticks().saturating_sub(started) >= self.slice_ticks;
-                if overdue && slot.target.load(Ordering::Relaxed) == target {
+                if due(started) && slot.target.load(Ordering::Relaxed) == target {
                     // SAFETY: `readers` counts this walk, and the owner
                     // that loaded `target` into the slot does not return
                     // from the withdrawal of `target` until `readers` is
@@ -528,6 +601,37 @@ mod tests {
         drop(first_run);
         slots.interrupt_overdue(Instant::new(10_000));
         interrupted(4);
+        assert_eq!(violations.load(Ordering::Relaxed), 0);
+    }
+
+    /// A freeze interrupts every running target on every processor at
+    /// once, whatever each one's run length, and no target whose run has
+    /// ended.
+    #[test]
+    fn interrupting_every_running_guest_ignores_how_long_each_has_run() {
+        let slots = RunningSlots::new(3, 1_000_000);
+        let (count, violations) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let first = Recorder::new(&count, &violations);
+        let third = Recorder::new(&count, &violations);
+
+        slots.interrupt_all();
+        assert_eq!(count.load(Ordering::Relaxed), 0, "no guest is running");
+
+        let first_run = slots.publish(ProcessorId::new(0), &first, Instant::new(7));
+        let third_run = slots.publish(ProcessorId::new(2), &third, Instant::new(8));
+        slots.interrupt_all();
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            2,
+            "both runs are younger than a slice and both are interrupted"
+        );
+
+        drop(third_run);
+        slots.interrupt_all();
+        assert_eq!(count.load(Ordering::Relaxed), 3);
+        drop(first_run);
+        slots.interrupt_all();
+        assert_eq!(count.load(Ordering::Relaxed), 3);
         assert_eq!(violations.load(Ordering::Relaxed), 0);
     }
 

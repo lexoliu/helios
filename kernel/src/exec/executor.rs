@@ -19,6 +19,7 @@ use helios_hal::watchdog::ProgressCounter;
 use spin::Once;
 use triomphe::Arc as NoWeakArc;
 
+use crate::exec::freeze::FreezeBarrier;
 use crate::exec::idle::{
     IDLE_POLL_GROW_START, IDLE_POLL_MAX, IdleOutcome, IdleState, ProcessorIdle,
 };
@@ -107,13 +108,16 @@ const _: () = assert!(align_of::<CachePadded<AtomicUsize>>() >= 64);
 /// that, each global push would invalidate the line every scheduler
 /// dereferences. The wake cursor is written by every global push that
 /// wakes a processor.
-struct ExecutorGroup {
+pub(super) struct ExecutorGroup {
     local_ready: Box<[CachePadded<ReadyShared>]>,
     /// One cache line per processor: written only by the owner on its
     /// way into and out of idle, read by every processor that queues
     /// work for it. The wake handshake it serves is in `idle`'s
     /// module docs.
     idle: Box<[CachePadded<ProcessorIdle>]>,
+    /// The words a freeze shares, read by every processor at every
+    /// scheduler boundary. The contract is in `freeze`'s module docs.
+    pub(super) freeze: FreezeBarrier,
     task_arenas: Box<[NoWeakArc<TaskArena>]>,
     global_ready: GlobalReadyQueue,
     global_wake_cursor: CachePadded<AtomicUsize>,
@@ -712,8 +716,8 @@ pub struct Spawner<CpuImpl: Cpu + Clone> {
 /// inbox, so the executor is `!Sync`: one thread drives it, and the list
 /// needs no lock. It is `Send`, because a list owns its tasks.
 pub struct Executor {
-    group: NoWeakArc<ExecutorGroup>,
-    owner_processor: ProcessorId,
+    pub(super) group: NoWeakArc<ExecutorGroup>,
+    pub(super) owner_processor: ProcessorId,
     local_queue_index: usize,
     processor_count: usize,
     progress: ProgressCounter,
@@ -878,6 +882,9 @@ impl Executor {
         let local_ready = &self.group.local_ready[self.local_queue_index];
 
         while stats.runnable_count() < READY_BATCH_TASKS {
+            // A scheduler boundary: between tasks, with nothing polled.
+            // One `Relaxed` load unless a freeze holds the machine.
+            self.group.freeze.checkpoint(timer.cpu());
             let (first, second) = if local_ready.ready.load(Ordering::Relaxed) != 0 {
                 (ReadySource::Local, ReadySource::Global)
             } else {
@@ -936,7 +943,11 @@ impl Executor {
         if limit != 0 {
             loop {
                 let now = cpu.now();
-                if self.has_ready_work() || root_ready() || timer.is_due(now) {
+                if self.has_ready_work()
+                    || root_ready()
+                    || timer.is_due(now)
+                    || self.freeze_requested_of_this_processor()
+                {
                     idle.store(IdleState::Running);
                     return IdleOutcome::Polled {
                         polled_ticks: now.ticks() - started.ticks(),
@@ -955,7 +966,11 @@ impl Executor {
         // module doc.
         idle.store(IdleState::Parked);
         let now = cpu.now();
-        if self.has_ready_work() || root_ready() || timer.is_due(now) {
+        if self.has_ready_work()
+            || root_ready()
+            || timer.is_due(now)
+            || self.freeze_requested_of_this_processor()
+        {
             idle.store(IdleState::Running);
             return IdleOutcome::Polled {
                 polled_ticks: now.ticks() - started.ticks(),
@@ -1426,6 +1441,7 @@ fn executor_group(configured_processors: usize) -> NoWeakArc<ExecutorGroup> {
             NoWeakArc::new(ExecutorGroup {
                 local_ready: local_ready.into_boxed_slice(),
                 idle: idle.into_boxed_slice(),
+                freeze: FreezeBarrier::new(configured_processors),
                 task_arenas: task_arenas.into_boxed_slice(),
                 global_ready: GlobalReadyQueue::new(),
                 global_wake_cursor: CachePadded::new(AtomicUsize::new(0)),
@@ -1533,6 +1549,16 @@ mod tests {
 
         fn park_current(&self) {}
 
+        type WakeOnlyMask = ();
+
+        fn mask_to_wake_only(&self) {
+            panic!("this test platform never freezes")
+        }
+
+        fn park_wake_only(&self, _word: &core::sync::atomic::AtomicU8, _held: u8) {
+            panic!("this test platform never freezes")
+        }
+
         fn start_processor(&self, _processor: ProcessorId) {}
 
         fn wake_processor(&self, _processor: ProcessorId) {}
@@ -1622,6 +1648,16 @@ mod tests {
             );
             self.nanos
                 .fetch_add(self.park_advance.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+
+        type WakeOnlyMask = ();
+
+        fn mask_to_wake_only(&self) {
+            panic!("this test platform never freezes")
+        }
+
+        fn park_wake_only(&self, _word: &core::sync::atomic::AtomicU8, _held: u8) {
+            panic!("this test platform never freezes")
         }
 
         fn start_processor(&self, _processor: ProcessorId) {}
