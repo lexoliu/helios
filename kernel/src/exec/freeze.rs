@@ -418,12 +418,22 @@ impl Executor {
     /// machine, and [`FreezeError::ProcessorDidNotArrive`] when a
     /// processor has not reached a boundary within `arrival_deadline`.
     /// The machine is running in both cases.
+    ///
+    /// The future is `!Send`: it records the processor it first runs on
+    /// as the freezer, and runs only there.
     pub async fn freeze<CpuImpl: Cpu + Clone>(
         &self,
         timer: &Timer<CpuImpl>,
         arrival_deadline: Duration,
         interrupt_guests: impl FnOnce(),
     ) -> Result<FrozenMachine<CpuImpl>, FreezeError> {
+        // Held for the whole future, and moved into the answer at its
+        // end, so that the future is `!Send` (a value that nothing uses
+        // later is not kept across an await, and would not count): the
+        // freezer is the processor that polls this first, and its task
+        // must stay on that processor's own queue (`spawn_local`), never
+        // in the global queue another processor could pop it from.
+        let processor_local = PhantomData::<*mut ()>;
         let barrier = &self.group.freeze;
         let cpu = timer.cpu();
         let freezer = current_processor();
@@ -497,7 +507,7 @@ impl Executor {
         Ok(FrozenMachine {
             _hold: hold,
             _mask: mask,
-            _processor_local: PhantomData,
+            _processor_local: processor_local,
         })
     }
 
