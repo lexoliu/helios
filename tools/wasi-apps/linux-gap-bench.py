@@ -1509,6 +1509,8 @@ def run_linux(
     native_bin_dir: Path | None,
     control_workload: dict | None,
     keep_going: bool,
+    compiler_plugin_wasm: Path | None,
+    compiler: runner.CompilerRequest,
 ) -> tuple[Path | None, Path | None, dict]:
     return run_fedora_qemu_linux(
         repo_root(),
@@ -1537,6 +1539,8 @@ def run_linux(
         native_bin_dir=native_bin_dir,
         control_workload=control_workload,
         keep_going=keep_going,
+        compiler_plugin_wasm=compiler_plugin_wasm,
+        compiler=compiler,
     )
 
 
@@ -1595,6 +1599,22 @@ def parse_jsonl(path: Path | None) -> tuple[dict, dict[str, dict]]:
             if record["type"] == "summary":
                 summaries[record["workload"]] = record
     return run_record, summaries
+
+
+def guest_isa_level_name(run_record: dict) -> str:
+    """The ISA level name a Helios side's `run` record says its guest compiled for.
+
+    The record's `level` and `extras` are the name split at its `+`
+    (`IsaLevel::base_name` and `IsaLevel::extras` in `artifact/src/isa.rs`), so
+    joining them gives the exact name the kernel sends the compiler plugin.
+    """
+    guest_isa = run_record.get("guest_isa")
+    if guest_isa is None:
+        raise SystemExit(
+            "the Helios run record carries no `guest_isa`, so the ISA level the Linux compile asks for "
+            "is not known"
+        )
+    return "+".join([guest_isa["level"], *guest_isa["extras"]])
 
 
 def parse_linux_jsonl(path: Path | None) -> dict[str, dict]:
@@ -2615,7 +2635,35 @@ def build_parser() -> argparse.ArgumentParser:
         "--native-bin-dir",
         type=Path,
         default=None,
-        help="Static Linux binaries from tools/bench/native/build.sh; defaults to artifacts/bench-native/<guest-arch>.",
+        help="Linux binaries from tools/bench/native/build.sh; defaults to artifacts/bench-native/<guest-arch>.",
+    )
+    parser.add_argument(
+        "--compiler-plugin-wasm",
+        type=Path,
+        default=None,
+        help=(
+            "The compiler plugin's core module (kernel-prebuild's compiler_plugin.wasm) that a "
+            "Linux counterpart naming {compiler_plugin} hosts."
+        ),
+    )
+    parser.add_argument(
+        "--compiler-target",
+        default=None,
+        help="The Helios kernel target triple a counterpart naming {compiler_target} compiles for.",
+    )
+    parser.add_argument(
+        "--compiler-isa-level",
+        default=None,
+        help=(
+            "The name of the ISA level the Helios guest compiled for, such as x86-64-v4+vbmi+bitalg, "
+            "that a counterpart naming {compiler_isa_level} compiles for."
+        ),
+    )
+    parser.add_argument(
+        "--compiler-workers",
+        type=int,
+        default=None,
+        help="The kernel's compiler worker count a counterpart naming {compiler_workers} compiles with.",
     )
     parser.add_argument("--linux-vm-qemu-bin", default=None)
     parser.add_argument(
@@ -3052,6 +3100,16 @@ def main() -> None:
                 helios_jsonl = error.log
                 profile_failure = error
         if not args.skip_linux:
+            compiler_isa_level = args.compiler_isa_level
+            if not args.skip_helios:
+                # The level is the processor's, so the Linux compile asks for
+                # the one this invocation's Helios guest just reported.
+                if compiler_isa_level is not None:
+                    raise SystemExit(
+                        "--compiler-isa-level names the level of a run that does not time Helios; "
+                        "this run times it, and the Linux compile follows the level its guest reports"
+                    )
+                compiler_isa_level = guest_isa_level_name(parse_jsonl(helios_jsonl)[0])
             linux_json, wasmtime_linux_json, linux_provenance = run_linux(
                 args.manifest,
                 out_dir,
@@ -3079,6 +3137,8 @@ def main() -> None:
                 args.native_bin_dir,
                 control_workload,
                 args.keep_going,
+                args.compiler_plugin_wasm,
+                runner.CompilerRequest(args.compiler_target, args.compiler_workers, compiler_isa_level),
             )
         if args.wasmtime_profile_workload:
             wasmtime_profiles = run_wasmtime_profiles(

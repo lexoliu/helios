@@ -150,3 +150,97 @@ def test_a_report_written_before_the_rpc_transport_was_recorded_still_loads(
     loaded = load_report(path)
     assert loaded.pins.rpc_transport is None
     assert "inspector RPC over `unrecorded`" in render_pins(loaded)
+
+
+AOT_CURL = {
+    "name": "aot-curl",
+    "class": "compute",
+    "headline": False,
+    "description": "the compiler plugin compiling curl.wasm",
+    "matched_metrics": ["compiler_workers"],
+    "uncompared": {"linux_native": "native `wasmtime compile` is the reference"},
+}
+
+
+def aot_iterations(center: float, seed: int, workers: float | None) -> list:
+    from conftest import iterations
+
+    measured = iterations(center, center * 0.02, seed)
+    for iteration in measured:
+        iteration.metrics = {} if workers is None else {"compiler_workers": workers}
+    return measured
+
+
+def aot_cells(helios_workers: float | None, linux_workers: float | None) -> dict:
+    from conftest import THRESHOLDS
+
+    from helios_bench.assemble import build_cell
+
+    return {
+        Side.HELIOS: build_cell(Side.HELIOS, aot_iterations(250.0, 3, helios_workers), THRESHOLDS),
+        Side.LINUX_WASMTIME: build_cell(
+            Side.LINUX_WASMTIME, aot_iterations(240.0, 4, linux_workers), THRESHOLDS
+        ),
+        Side.LINUX_NATIVE: build_cell(Side.LINUX_NATIVE, aot_iterations(100.0, 5, None), THRESHOLDS),
+    }
+
+
+def test_a_measured_uncompared_cell_is_a_reference_with_its_note(baseline_report: Report) -> None:
+    from helios_bench.assemble import build_workload, check_matched_metrics
+    from helios_bench.render import render_tables
+
+    cells = aot_cells(3.0, 3.0)
+    check_matched_metrics(AOT_CURL, cells)
+    workload = build_workload(AOT_CURL, cells, 0.01)
+    assert [comparison.against for comparison in workload.comparisons] == [Side.LINUX_WASMTIME]
+    assert Side.LINUX_NATIVE in workload.cells
+
+    report = baseline_report.model_copy(update={"workloads": [workload]})
+    text = render_tables(report)
+    row = next(line for line in text.splitlines() if line.startswith("| `aot-curl`"))
+    columns = [column.strip() for column in row.strip("|").split("|")]
+    assert len(columns) == 6, columns
+    _, helios, wasmtime, native, vs_wasmtime, vs_native = columns
+    # The native median is printed beside the others, and nothing is
+    # divided by it.
+    assert "[" in helios and "[" in wasmtime and "[" in native
+    assert vs_wasmtime != "n/a"
+    assert vs_native == "n/a"
+    assert (
+        "`aot-curl` is not compared on Native Linux (shown as a reference): "
+        "native `wasmtime compile` is the reference"
+    ) in text
+
+
+def test_matched_metrics_that_differ_stop_assembly() -> None:
+    from helios_bench.assemble import check_matched_metrics
+
+    with pytest.raises(SystemExit) as error:
+        check_matched_metrics(AOT_CURL, aot_cells(3.0, 4.0))
+    message = str(error.value)
+    assert "aot-curl" in message and "compiler_workers" in message
+    assert "helios: [3.0]" in message and "linux_wasmtime: [4.0]" in message
+
+
+def test_a_matched_metric_one_side_did_not_report_stops_assembly() -> None:
+    from helios_bench.assemble import check_matched_metrics
+
+    with pytest.raises(SystemExit) as error:
+        check_matched_metrics(AOT_CURL, aot_cells(3.0, None))
+    assert "linux_wasmtime iterations" in str(error.value)
+
+
+def test_compiler_pins_round_trip_and_render(tmp_path: Path, baseline_report: Report) -> None:
+    pins = baseline_report.pins.model_copy(
+        update={"compiler_plugin_wasm": "a1" * 32, "compiler_host": "b2" * 32}
+    )
+    report = baseline_report.model_copy(update={"pins": pins})
+    path = tmp_path / "report.json"
+    save_report(report, path)
+    loaded = load_report(path)
+    assert loaded.pins.compiler_plugin_wasm == "a1" * 32
+    assert loaded.pins.compiler_host == "b2" * 32
+    text = render_pins(loaded)
+    assert f"| Compiler plugin `compiler_plugin.wasm` | `{'a1' * 32}` |" in text
+    assert f"| `helios-compiler-host` | `{'b2' * 32}` |" in text
+    assert "Compiler plugin" not in render_pins(baseline_report)

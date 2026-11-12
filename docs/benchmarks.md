@@ -70,7 +70,7 @@ reason under the table the cell is missing from.
 | fs | `fs-smallfiles`, `fs-readstream` | coreutils on the embedded filesystem root | `coreutils-wasi.wasm` under `wasmtime run --dir` | ext4 in the guest |
 | compute | `quickjs-loop`, `cpython-json`, `cpython-regex`, `wasm-simd-lanes` | interpreter or SIMD loops | same wasm | native QuickJS/CPython/NEON-or-SSE probe |
 | compute | `cpython-startup`, `cpython-import-json` | the CPython row decomposed — interpreter start-up alone, then start-up plus `import json` over the host share | same wasm | native CPython |
-| compute | `aot-curl` | compiler plugin AOT of `curl.wasm` | `wasmtime compile` of the same input | uncompared (`wasmtime compile` is the native equivalent of the in-guest step) |
+| compute | `aot-curl` | compiler plugin AOT of `curl.wasm` for the kernel target, performance hint, the kernel's worker count | the same compiler plugin under Wasmtime on Linux (`helios-compiler-host`), the same input, target, ISA level (the one the Helios guest reports), hint and worker count | `wasmtime compile` of the same input (a reference, uncompared) |
 
 `headline: true` marks the rows the README table and the regression gate
 carry. Every compared row is a parity check, not a claim: Helios running
@@ -843,8 +843,10 @@ monitor socket with both guest images already built. The inspector puts
 own under `$XDG_RUNTIME_DIR` and links it as `<runtime>/sockets`; see
 `docs/debug-serial.md`.
 
-`bench-suite.yml` runs a pull request in paired mode against
-`github.event.pull_request.base.sha`, and `workflow_dispatch` takes a
+`bench-suite.yml` runs a pull request in paired mode against the `dev`
+commit it is merged against (the first parent of the merge commit the
+run checks out, not the event's `base.sha`, which is the tip `dev` had
+when the pull request was opened), and `workflow_dispatch` takes a
 `baseline_ref` input. An advisory dispatch with an explicit baseline is
 revision acceptance: it runs only `helios` and `helios_baseline`, with
 all workloads, warm iterations, before/after compute controls, and the

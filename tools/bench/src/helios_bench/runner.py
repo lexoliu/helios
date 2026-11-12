@@ -58,10 +58,12 @@ from helios_bench.report import (
 )
 from helios_bench.sources import (
     SIDE_CONTROL_JSONL,
+    SIDE_JSONL,
     RawCell,
     RawSide,
     read_control,
     read_optional_side,
+    read_side_jsonl,
 )
 from helios_bench.wasi_apps import gap_bench, workload_runner
 from helios_bench.workloads import load_workloads, select_workloads
@@ -71,6 +73,12 @@ NATIVE_BUILD = REPO_ROOT / "tools" / "bench" / "native" / "build.sh"
 NATIVE_ARTIFACTS = REPO_ROOT / "artifacts" / "bench-native"
 BOOT_ARTIFACTS = WASI_APPS_ROOT / "boot-artifacts.toml"
 CARGO_TARGETS = {"aarch64": "aarch64-unknown-none", "x86-64": "x86_64-unknown-none"}
+# What `helios-cli kernel-prebuild` names the compiler plugin's core module
+# beside the `compiler_plugin.cwasm` it precompiles from it.
+COMPILER_PLUGIN_WASM = "compiler_plugin.wasm"
+# The host that runs that module under Wasmtime on Linux, one of the native
+# counterparts `tools/bench/native/build.sh` builds.
+COMPILER_HOST = "helios-compiler-host"
 HELIOS_OUT = "helios"
 HELIOS_BASELINE_OUT = "helios-baseline"
 HELIOS_BASELINE_REBUILD_OUT = "helios-baseline-rebuild"
@@ -84,6 +92,11 @@ LINUX_SIDES = {Side.LINUX_NATIVE, Side.LINUX_WASMTIME}
 # pairing varies the candidate.
 RELEASE_BUILD = "release"
 PROFILE_USE_BUILD = "profile-use"
+# The `target/<triple>/` and `target/kernel-prebuild/<triple>/` directory
+# each build lands in: its cargo profile (`KernelBuildProfile::directory` in
+# inspector/src/vm.rs). A plain release image is the `kernel-release`
+# profile.
+KERNEL_BUILD_DIRECTORIES = {RELEASE_BUILD: "kernel-release", PROFILE_USE_BUILD: "profile-use"}
 # Architectures whose `--release` kernel is built against the profile the
 # latest release published (docs/pgo.md, #226). On those there is no plain
 # release kernel: the inspector compiles one with `-C profile-use` and its
@@ -216,6 +229,12 @@ class RunOptions:
     # this checkout's profile-guided release kernel against its plain one;
     # with a baseline commit, that commit's plain kernel.
     plain_baseline: bool = False
+    # The name of the ISA level a counterpart naming `{compiler_isa_level}`
+    # compiles for, such as `x86-64-v4+vbmi+bitalg`, for a run that does not
+    # time the `helios` side. A run that does takes it from that side's own
+    # `run` record, because the level is the processor's and the CI runner's
+    # CPU model changes from run to run; the two together are refused.
+    compiler_isa_level: str | None = None
     # Whether the first Helios pass ends with an untimed second boot of
     # every unit that takes the kernel profile, the flamegraph and the perf
     # metrics the report publishes (#747). No timed boot ever runs with the
@@ -347,10 +366,38 @@ class PlannedCommand:
     #: times, for the host gate to bracket; None for a step that times nothing.
     side: str | None = None
     round: int | None = None
+    #: The directory of a Helios invocation's output whose `run` record
+    #: names the ISA level this invocation's compile asks for. The record
+    #: exists only once that invocation has run, so the flag is appended
+    #: when this one starts (`resolved`), not when the plan is made.
+    isa_level_source: Path | None = None
+
+    def resolved(self) -> list[str]:
+        """The argv to run: ``argv`` plus the ISA level read from the Helios
+        record this invocation follows."""
+        if self.isa_level_source is None:
+            return self.argv
+        return [*self.argv, "--compiler-isa-level", guest_isa_level_name(self.isa_level_source)]
 
     def shell(self) -> str:
         exports = " ".join(f"{key}={shlex.quote(value)}" for key, value in sorted(self.env.items()))
         return f"{exports} {shlex.join(self.argv)}".strip()
+
+
+def guest_isa_level_name(helios_out: Path) -> str:
+    """The ISA level name the Helios guest compiled for, from its `run` record.
+
+    The driver owns the reading of the record: its `level` and `extras` are
+    the level name split at its `+`, and it joins them back.
+    """
+    path = helios_out / SIDE_JSONL[Side.HELIOS]
+    if not path.is_file():
+        raise SystemExit(
+            f"{path} does not exist, so the ISA level of the Helios guest is not known: the Helios "
+            "invocation must run before the Linux one, or pass --compiler-isa-level to a run that "
+            "does not time the helios side"
+        )
+    return gap_bench().guest_isa_level_name(read_side_jsonl(path, 0).run)
 
 
 def git_sha() -> str:
@@ -463,12 +510,25 @@ def round_out_root(options: RunOptions, number: int) -> Path:
 
 
 def linux_command(
-    options: RunOptions, common: list[str], out_root: Path, description: str, number: int
+    options: RunOptions,
+    common: list[str],
+    out_root: Path,
+    description: str,
+    number: int,
+    isa_level_source: Path | None,
 ) -> PlannedCommand:
-    """The driver invocation that times both Linux counterparts in the pinned Fedora guest."""
+    """The driver invocation that times both Linux counterparts in the pinned Fedora guest.
+
+    ``isa_level_source`` is the output directory of a Helios invocation that
+    runs before this one, whose guest's ISA level the Linux compile asks for;
+    None for a run that does not time the `helios` side, which names the
+    level itself with ``--compiler-isa-level`` or has the driver refuse a
+    counterpart that needs it.
+    """
     lane = options.lane
     return PlannedCommand(
         description=f"{description} in the pinned Fedora guest",
+        isa_level_source=isa_level_source,
         argv=[
             *common,
             "--skip-helios",
@@ -485,6 +545,20 @@ def linux_command(
             *[argument for name in options.skip_linux_workloads for argument in ("--skip-workload", name)],
             "--native-bin-dir",
             str(NATIVE_ARTIFACTS / lane.guest_arch),
+            # The compile the Helios column's plugin does: the module it
+            # runs, the kernel's target and the kernel's worker count, for
+            # a counterpart hosting that plugin.
+            "--compiler-plugin-wasm",
+            str(compiler_plugin_wasm(lane, options.kernel_build)),
+            "--compiler-target",
+            CARGO_TARGETS[lane.helios_arch],
+            "--compiler-workers",
+            str(lane.compiler_workers),
+            *(
+                ["--compiler-isa-level", options.compiler_isa_level]
+                if options.compiler_isa_level is not None
+                else []
+            ),
             "--out-dir",
             str(out_root / LINUX_OUT),
         ],
@@ -533,7 +607,17 @@ def plan(options: RunOptions, manifest: Manifest, workloads: list[dict]) -> list
             )
         if options.sides & LINUX_SIDES:
             side_commands.append(
-                linux_command(options, common, out_root, f"{label}time every counterpart", number)
+                linux_command(
+                    options,
+                    common,
+                    out_root,
+                    f"{label}time every counterpart",
+                    number,
+                    # Round 1 times Helios first, so its record exists before
+                    # any Linux invocation starts, even one of an even round,
+                    # which runs ahead of its own round's Helios.
+                    round_out_root(options, 1) / HELIOS_OUT if Side.HELIOS in options.sides else None,
+                )
             )
         # Consecutive rounds swap which side goes first: Helios on the odd
         # rounds, Linux on the even ones.
@@ -653,8 +737,9 @@ def execute_gated(command: PlannedCommand, gate: HostGateRecorder) -> None:
 def execute(command: PlannedCommand) -> None:
     env = os.environ.copy()
     env.update(command.env)
-    print(f"==> {command.description}\n    {command.shell()}", flush=True)
-    subprocess.run(command.argv, cwd=command.cwd, env=env, check=True)
+    argv = command.resolved()
+    print(f"==> {command.description}\n    {replace(command, argv=argv).shell()}", flush=True)
+    subprocess.run(argv, cwd=command.cwd, env=env, check=True)
 
 
 def wasm_artifact_digests(workloads: list[dict]) -> dict[str, str]:
@@ -791,6 +876,16 @@ def missing_prebuilt_files(options: RunOptions, workloads: list[dict]) -> list[s
             path = NATIVE_ARTIFACTS / lane.guest_arch / name
             if not path.is_file():
                 missing.append(f"{path} (native counterpart)")
+        runner = workload_runner()
+        hosts_plugin = any(
+            runner.uses_placeholder(workload, side.value, runner.COMPILER_PLUGIN_PLACEHOLDER)
+            for workload in workloads
+            if workload["name"] not in options.skip_linux_workloads
+            for side in options.sides & LINUX_SIDES
+        )
+        plugin = compiler_plugin_wasm(lane, options.kernel_build)
+        if hosts_plugin and not plugin.is_file():
+            missing.append(f"{plugin} (the compiler plugin the helios-bootfs was precompiled from)")
     return missing
 
 
@@ -844,14 +939,34 @@ def kernel_pgo_uncovered(
     return int(match.group(1)), int(match.group(2))
 
 
-def bootfs_cwasm_digests(lane: Lane, kernel_build: str) -> dict[str, str]:
-    """SHA256 of the signed cwasm files the Helios guest loaded.
+def kernel_prebuild_dir(lane: Lane, kernel_build: str) -> Path:
+    """Where the candidate's `kernel-prebuild` wrote its payload.
 
     Under the candidate's own build directory: the inspector's prebuild
     writes beside the kernel it prebuilds for, so a PGO candidate's
-    bootfs is not in the plain release directory.
+    bootfs is not in the plain release directory. The directory is the
+    build's cargo profile, which for a plain release build is not the
+    build's own name.
     """
-    prebuild = REPO_ROOT / "target" / "kernel-prebuild" / CARGO_TARGETS[lane.helios_arch] / kernel_build
+    return (
+        REPO_ROOT
+        / "target"
+        / "kernel-prebuild"
+        / CARGO_TARGETS[lane.helios_arch]
+        / KERNEL_BUILD_DIRECTORIES[kernel_build]
+    )
+
+
+def compiler_plugin_wasm(lane: Lane, kernel_build: str) -> Path:
+    """The compiler plugin's core module the candidate's prebuild
+    precompiled into its bootfs, which the Linux + Wasmtime column of
+    `aot-curl` hosts directly, so both columns run one plugin build."""
+    return kernel_prebuild_dir(lane, kernel_build) / COMPILER_PLUGIN_WASM
+
+
+def bootfs_cwasm_digests(lane: Lane, kernel_build: str) -> dict[str, str]:
+    """SHA256 of the signed cwasm files the Helios guest loaded."""
+    prebuild = kernel_prebuild_dir(lane, kernel_build)
     if not prebuild.is_dir():
         return {}
     return {path.name: sha256_of(path) for path in sorted(prebuild.glob("*.cwasm"))}
@@ -891,6 +1006,38 @@ def collect_pins(
     helios = sides.get(Side.HELIOS)
     helios_baseline = sides.get(Side.HELIOS_BASELINE)
     linux_wasmtime = sides.get(Side.LINUX_WASMTIME)
+def compiler_pins(lane: Lane, workloads: list[dict], kernel_build: str) -> tuple[str | None, str | None]:
+    """The digests of the compiler plugin build and of the
+    `helios-compiler-host` the selection's workloads hosted it with, each
+    None when no selected workload names it or it is not on disk."""
+    runner = workload_runner()
+    plugin = compiler_plugin_wasm(lane, kernel_build)
+    host = NATIVE_ARTIFACTS / lane.guest_arch / COMPILER_HOST
+    plugin_digest = (
+        sha256_of(plugin) if runner.needs_compiler_plugin(workloads) and plugin.is_file() else None
+    )
+    host_named = any(
+        f"{{native_bin}}/{COMPILER_HOST}" in template
+        for workload in workloads
+        for side in LINUX_SIDES
+        for template in runner.counterpart_templates(workload, side.value)
+    )
+    host_digest = sha256_of(host) if host_named and host.is_file() else None
+    return plugin_digest, host_digest
+
+
+def collect_pins(
+    lane: Lane,
+    workloads: list[dict],
+    kernel_build: str,
+    baseline: Baseline | None,
+    sides: dict[Side, RawSide],
+) -> Pins:
+    image_url, image_sha256 = fedora_image(lane.guest_arch)
+    plugin_digest, host_digest = compiler_pins(lane, workloads, kernel_build)
+    helios = sides.get(Side.HELIOS)
+    helios_baseline = sides.get(Side.HELIOS_BASELINE)
+    linux_wasmtime = sides.get(Side.LINUX_WASMTIME)
     wasmtime_revision = vendored_wasmtime_pin().revision
     linux_release = wasmtime_linux_release(lane.guest_arch)
     return Pins(
@@ -918,6 +1065,8 @@ def collect_pins(
         devices=lane.devices,
         wasm_artifacts=wasm_artifact_digests(workloads),
         bootfs_cwasm=bootfs_cwasm_digests(lane, kernel_build),
+        compiler_plugin_wasm=plugin_digest,
+        compiler_host=host_digest,
     )
 
 
@@ -1391,6 +1540,11 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
         raise SystemExit(
             "--prebuilt builds nothing, and a paired run builds its second Helios image: "
             "drop --prebuilt or the pairing options"
+        )
+    if options.compiler_isa_level is not None and Side.HELIOS in options.sides:
+        raise SystemExit(
+            "--compiler-isa-level names the level of a run that does not time the helios side; "
+            "this run times it, and the Linux compile follows the level its guest reports"
         )
     workload_manifest = load_workloads()
     workloads = select_workloads(workload_manifest, options.workload_names)

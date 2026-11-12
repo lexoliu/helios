@@ -7,6 +7,8 @@ This runner resolves one of them into a command line, executes it for the
 requested number of iterations, times only the child (never this
 interpreter), parses the ``bench.<name>=<value>`` lines it prints, and
 writes the same JSONL record shapes as the inspector's ``workload-bench``.
+A counterpart marked ``"resident": true`` is instead started once, untimed,
+and timed per request it answers (``ResidentCounterpart``).
 
 Subcommands:
 
@@ -24,10 +26,12 @@ import argparse
 import json
 import os
 import re
+import selectors
 import shlex
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -55,7 +59,16 @@ LINUX_TOOLS = {
 
 HTTP_LARGE_PAYLOAD_FILE = "payload-64m.bin"
 NATIVE_BIN_DIR = "native"
+# Where the host driver puts the compiler plugin's core module in the guest,
+# relative to the repo root there; `{compiler_plugin}` renders to it.
+COMPILER_PLUGIN_FILE = "compiler_plugin.wasm"
+COMPILER_PLUGIN_PLACEHOLDER = "{compiler_plugin}"
+WASMTIME_PLACEHOLDER = "{wasmtime}"
 WASMTIME_RUN_PLACEHOLDER = "{wasmtime_run}"
+# The one request a resident counterpart answers, one per iteration.
+RESIDENT_REQUEST = b"compile\n"
+RESIDENT_READY = "ready"
+RESIDENT_COMPILED = "compiled"
 GUEST_PATH_PATTERN = re.compile(r"\{(guest|cwasm):([^}]+)\}")
 REPO_ROOT_PATH_PATTERN = re.compile(r"\{repo_root\}/([^:\s]+)")
 
@@ -70,11 +83,24 @@ class HostEndpoints:
 
 
 @dataclass(frozen=True)
+class CompilerRequest:
+    """What the Helios column's compile asks the compiler plugin for: the
+    kernel's target triple, the name of the ISA level the Helios guest
+    compiled for and the kernel's worker count, so a counterpart hosting the
+    same plugin asks for the same compile."""
+
+    target: str | None = None
+    workers: int | None = None
+    isa_level: str | None = None
+
+
+@dataclass(frozen=True)
 class RenderContext:
     repo_root: Path
     wasmtime_bin: str
     hosts: HostEndpoints
     workdir: Path
+    compiler: CompilerRequest = CompilerRequest()
 
 
 def repo_root() -> Path:
@@ -197,14 +223,58 @@ def needs_native_bin(workloads: list[dict]) -> bool:
     )
 
 
+def needs_compiler_plugin(workloads: list[dict]) -> bool:
+    return any(
+        uses_placeholder(workload, side, COMPILER_PLUGIN_PLACEHOLDER)
+        for workload in workloads
+        for side in SIDES
+    )
+
+
+def uses_wasmtime(workload: dict, side: str) -> bool:
+    """Whether ``side``'s counterpart runs the stock ``wasmtime`` CLI."""
+    spec = counterpart(workload, side)
+    if spec is None:
+        return False
+    return "wasm_path" in spec or any(
+        uses_placeholder(workload, side, placeholder)
+        for placeholder in (WASMTIME_PLACEHOLDER, WASMTIME_RUN_PLACEHOLDER)
+    )
+
+
+def wasmtime_users(workloads: list[dict]) -> list[dict]:
+    """The workloads any side of which runs the stock ``wasmtime`` CLI."""
+    return [workload for workload in workloads if any(uses_wasmtime(workload, side) for side in SIDES)]
+
+
+def is_resident(workload: dict, side: str) -> bool:
+    """Whether ``side``'s counterpart is one process answering a request per
+    iteration rather than one process per iteration."""
+    spec = counterpart(workload, side)
+    return spec is not None and bool(spec.get("resident"))
+
+
 def render(template: str, context: RenderContext, workload: dict) -> str:
     rendered = template
     for placeholder, value in LINUX_TOOLS.items():
         rendered = rendered.replace(placeholder, value)
     rendered = rendered.replace("{native_bin}", str(context.repo_root / NATIVE_BIN_DIR))
-    rendered = rendered.replace("{wasmtime}", context.wasmtime_bin)
+    rendered = rendered.replace(COMPILER_PLUGIN_PLACEHOLDER, str(context.repo_root / COMPILER_PLUGIN_FILE))
+    rendered = rendered.replace(WASMTIME_PLACEHOLDER, context.wasmtime_bin)
     rendered = rendered.replace("{repo_root}", str(context.repo_root))
     rendered = rendered.replace("{workdir}", str(context.workdir))
+    if "{compiler_target}" in rendered:
+        if not context.compiler.target:
+            raise SystemExit(f"workload {workload['name']} requires --compiler-target")
+        rendered = rendered.replace("{compiler_target}", context.compiler.target)
+    if "{compiler_isa_level}" in rendered:
+        if not context.compiler.isa_level:
+            raise SystemExit(f"workload {workload['name']} requires --compiler-isa-level")
+        rendered = rendered.replace("{compiler_isa_level}", context.compiler.isa_level)
+    if "{compiler_workers}" in rendered:
+        if context.compiler.workers is None:
+            raise SystemExit(f"workload {workload['name']} requires --compiler-workers")
+        rendered = rendered.replace("{compiler_workers}", str(context.compiler.workers))
 
     def guest_path(match: re.Match[str]) -> str:
         path = context.repo_root / match.group(2)
@@ -372,6 +442,113 @@ def run_once(
     return elapsed_ms, metrics
 
 
+class ResidentCounterpart:
+    """One long-lived counterpart that answers a request line per iteration.
+
+    The Helios column times one RPC to a guest that was booted, untimed,
+    before iteration 1. This is the Linux shape of the same thing: the child
+    starts and announces it is ready before iteration 1, untimed, and each
+    iteration is timed from writing the request line to reading the
+    answer line, on the clock ``run_once`` uses. The child's stderr is
+    drained on a thread so a chatty child never blocks, and it is quoted
+    when the child fails.
+    """
+
+    def __init__(self, workload: dict, argv: list[str], env: dict[str, str]) -> None:
+        self._workload = workload
+        self._process = subprocess.Popen(
+            argv,
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self._stderr = bytearray()
+        self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
+        self._stderr_thread.start()
+        self._selector = selectors.DefaultSelector()
+        self._selector.register(self._process.stdout, selectors.EVENT_READ)
+        self._pending = b""
+
+    def _drain_stderr(self) -> None:
+        for chunk in iter(lambda: self._process.stderr.read1(65536), b""):
+            self._stderr.extend(chunk)
+
+    def _fail(self, message: str) -> WorkloadFailed:
+        self._process.kill()
+        self._process.wait()
+        self._stderr_thread.join()
+        sys.stderr.buffer.write(bytes(self._stderr))
+        return WorkloadFailed(f"workload {self._workload['name']} {message}{quoted_stderr(bytes(self._stderr))}")
+
+    def _read_line(self, timeout_seconds: float | None) -> dict:
+        deadline = time.monotonic() + timeout_seconds if timeout_seconds else None
+        while b"\n" not in self._pending:
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                raise self._fail(f"exceeded its share of this side's budget ({timeout_seconds:.0f}s)")
+            if not self._selector.select(remaining):
+                continue
+            chunk = os.read(self._process.stdout.fileno(), 65536)
+            if not chunk:
+                code = self._process.wait()
+                raise self._fail(f"exited with code {code} before it answered")
+            self._pending += chunk
+        line, _, self._pending = self._pending.partition(b"\n")
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise self._fail(f"answered a line that is not JSON: {line!r}") from error
+        if not isinstance(message, dict):
+            raise self._fail(f"answered a line that is not a JSON object: {line!r}")
+        return message
+
+    def _expect(self, message: dict, kind: str) -> dict:
+        if message.get("type") != kind:
+            raise self._fail(f"answered {message!r} where a {kind!r} line was due")
+        return message
+
+    def wait_ready(self, timeout_seconds: float | None) -> None:
+        self._expect(self._read_line(timeout_seconds), RESIDENT_READY)
+
+    def request(self, timeout_seconds: float | None) -> tuple[float, dict[str, float]]:
+        started = time.perf_counter_ns()
+        try:
+            self._process.stdin.write(RESIDENT_REQUEST)
+            self._process.stdin.flush()
+        except BrokenPipeError as error:
+            code = self._process.wait()
+            raise self._fail(f"exited with code {code} before it read its request") from error
+        reply = self._read_line(timeout_seconds)
+        elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000
+        metrics = self._expect(reply, RESIDENT_COMPILED).get("metrics", {})
+        if not isinstance(metrics, dict) or not all(
+            isinstance(value, (int, float)) and not isinstance(value, bool) for value in metrics.values()
+        ):
+            raise self._fail(f"answered metrics that are not a map of numbers: {metrics!r}")
+        return elapsed_ms, {name: float(value) for name, value in metrics.items()}
+
+    def close(self, timeout_seconds: float | None) -> None:
+        """Ends the request stream; the child must then exit 0."""
+        self._process.stdin.close()
+        try:
+            code = self._process.wait(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired as error:
+            raise self._fail("did not exit after its request stream ended") from error
+        self._stderr_thread.join()
+        self._selector.close()
+        if code != 0:
+            sys.stderr.buffer.write(bytes(self._stderr))
+            raise WorkloadFailed(
+                f"workload {self._workload['name']} exited with code {code}{quoted_stderr(bytes(self._stderr))}"
+            )
+
+
+def remaining_seconds(deadline: float | None) -> float | None:
+    """What is left of a workload's budget, never less than a second."""
+    return max(1.0, deadline - time.monotonic()) if deadline else None
+
+
 def median(values: list[float]) -> float:
     ordered = sorted(values)
     lower = (len(ordered) - 1) // 2
@@ -434,7 +611,18 @@ def run_workloads(
             elapsed: list[float] = []
             failure: str | None = None
             deadline = time.monotonic() + share if share else None
+            resident = None
+            if is_resident(workload, side):
+                try:
+                    resident = ResidentCounterpart(workload, argv, env)
+                    resident.wait_ready(remaining_seconds(deadline))
+                except WorkloadFailed as error:
+                    if not keep_going:
+                        raise SystemExit(str(error)) from error
+                    failure = str(error)
             for iteration in range(1, iterations + 1):
+                if failure is not None:
+                    break
                 # On Helios every iteration is a freshly spawned process, so
                 # a workload naming its scratch after the process gets a new
                 # name each time. Here one process runs them all, and
@@ -443,8 +631,12 @@ def run_workloads(
                 # that had nothing wrong with it.
                 env["HELIOS_PROCESS_ID"] = f"{os.getpid()}-{iteration}"
                 try:
-                    remaining = max(1.0, deadline - time.monotonic()) if deadline else None
-                    elapsed_ms, metrics = run_once(workload, argv, env, remaining)
+                    if resident is not None:
+                        elapsed_ms, metrics = resident.request(remaining_seconds(deadline))
+                        if iteration == iterations:
+                            resident.close(remaining_seconds(deadline))
+                    else:
+                        elapsed_ms, metrics = run_once(workload, argv, env, remaining_seconds(deadline))
                 except WorkloadFailed as error:
                     if not keep_going:
                         raise SystemExit(str(error)) from error
@@ -544,6 +736,20 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--host-tcp-upload-port", type=int)
     run_parser.add_argument("--host-tcp-echo-port", type=int)
     run_parser.add_argument(
+        "--compiler-target",
+        help="the target triple the Helios column's compiler plugin compiles for ({compiler_target})",
+    )
+    run_parser.add_argument(
+        "--compiler-isa-level",
+        help="the name of the ISA level the Helios guest's compiler plugin compiled for, such as "
+        "x86-64-v4+vbmi+bitalg ({compiler_isa_level})",
+    )
+    run_parser.add_argument(
+        "--compiler-workers",
+        type=int,
+        help="the worker count the Helios column's compiler plugin compiles with ({compiler_workers})",
+    )
+    run_parser.add_argument(
         "--keep-going",
         action="store_true",
         help="record a workload that fails as a failure record and continue with the next one",
@@ -581,6 +787,7 @@ def main() -> None:
                 args.host_tcp_echo_port,
             ),
             workdir=Path(tempfile.mkdtemp(prefix="helios-bench-")),
+            compiler=CompilerRequest(args.compiler_target, args.compiler_workers, args.compiler_isa_level),
         )
         run_workloads(
             args.manifest,

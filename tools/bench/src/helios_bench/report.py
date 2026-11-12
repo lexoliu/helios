@@ -424,6 +424,21 @@ class Pins(BaseModel):
     bootfs_cwasm: dict[str, str] = Field(
         description="bootfs asset -> sha256 of the signed cwasm Helios loaded"
     )
+    compiler_plugin_wasm: str | None = Field(
+        default=None,
+        description=(
+            "sha256 of the compiler plugin's core module both `aot-curl` columns ran: Helios "
+            "through the bootfs cwasm precompiled from it, Linux + Wasmtime directly; None when "
+            "the run selected no workload that hosts it"
+        ),
+    )
+    compiler_host: str | None = Field(
+        default=None,
+        description=(
+            "sha256 of the `helios-compiler-host` binary the Linux + Wasmtime column hosted the "
+            "plugin with, built from this checkout against `wasmtime_revision`"
+        ),
+    )
     asymmetries: list[Asymmetry] = Field(
         default_factory=list,
         description="what still differs between the Helios and Linux columns by construction (#491)",

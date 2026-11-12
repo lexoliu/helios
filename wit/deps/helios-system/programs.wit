@@ -182,6 +182,10 @@ interface programs {
 
   record aot-result {
     destination-path: string,
+    /// How many worker threads the compiler plugin was told to compile
+    /// with: the kernel-role processor count, which it reads as
+    /// `RAYON_NUM_THREADS`.
+    worker-threads: u32,
   }
 
   record exec-output {

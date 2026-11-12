@@ -1031,6 +1031,7 @@ def copy_guest_files(
     wasmtime_linux_archive: Path | None,
     workloads: list[dict],
     native_bin_dir: Path | None,
+    compiler_plugin_wasm: Path | None = None,
 ) -> None:
     ssh(
         repo_root,
@@ -1102,6 +1103,14 @@ def copy_guest_files(
             port,
             f"chmod 0755 {shlex.quote(f'{REMOTE_ROOT}/{runner.NATIVE_BIN_DIR}')}/*",
             timeout=30,
+        )
+    if compiler_plugin_wasm is not None:
+        copy_path_to_guest(
+            repo_root,
+            key,
+            port,
+            compiler_plugin_wasm,
+            f"{REMOTE_ROOT}/{runner.COMPILER_PLUGIN_FILE}",
         )
 
 
@@ -1190,6 +1199,7 @@ def runner_command(
     wasmtime_bin: str | None = None,
     keep_going: bool = False,
     side_timeout_seconds: int | None = None,
+    compiler: runner.CompilerRequest | None = None,
 ) -> str:
     command = [
         "python3",
@@ -1221,6 +1231,12 @@ def runner_command(
         # budget this side's ssh call is given, so a hung workload becomes
         # one failed cell instead of the loss of every cell on the side.
         command.extend(["--side-timeout-seconds", str(side_timeout_seconds)])
+    if compiler is not None and compiler.target is not None:
+        command.extend(["--compiler-target", compiler.target])
+    if compiler is not None and compiler.isa_level is not None:
+        command.extend(["--compiler-isa-level", compiler.isa_level])
+    if compiler is not None and compiler.workers is not None:
+        command.extend(["--compiler-workers", str(compiler.workers)])
     if host_http_url:
         command.extend(["--host-http-url", host_http_url])
     if host_tcp_host:
@@ -1300,6 +1316,8 @@ def run_fedora_qemu_linux(
     native_bin_dir: Path | None = None,
     control_workload: dict | None = None,
     keep_going: bool = False,
+    compiler_plugin_wasm: Path | None = None,
+    compiler: runner.CompilerRequest | None = None,
 ) -> tuple[Path | None, Path | None, dict]:
     guest_arch = guest_arch or host_arch()
     accel = accel or default_accel(guest_arch)
@@ -1319,6 +1337,39 @@ def run_fedora_qemu_linux(
                 "the selected workloads need the native counterparts; build them with "
                 f"tools/bench/native/build.sh {guest_arch} and pass --native-bin-dir"
             )
+    compiler_plugin_wasm = resolve_optional_path(repo_root, compiler_plugin_wasm)
+    if runner.needs_compiler_plugin(workloads):
+        if compiler_plugin_wasm is None or not compiler_plugin_wasm.is_file():
+            raise SystemExit(
+                "the selected workloads host the compiler plugin; pass --compiler-plugin-wasm with the "
+                f"compiler_plugin.wasm the Helios side's kernel-prebuild wrote (got {compiler_plugin_wasm})"
+            )
+    else:
+        compiler_plugin_wasm = None
+    compiler = compiler or runner.CompilerRequest()
+    for placeholder, value, flag in (
+        ("{compiler_target}", compiler.target, "--compiler-target"),
+        ("{compiler_isa_level}", compiler.isa_level, "--compiler-isa-level"),
+        ("{compiler_workers}", compiler.workers, "--compiler-workers"),
+    ):
+        users = [
+            workload["name"]
+            for workload in workloads
+            for side in runner.SIDES
+            if runner.uses_placeholder(workload, side, placeholder)
+        ]
+        if users and value is None:
+            raise SystemExit(f"workloads {sorted(set(users))} name {placeholder}; pass {flag}")
+    # The stock `wasmtime` CLI is provisioned for whichever side runs it:
+    # `aot-curl`'s reference is a native-column `wasmtime compile`.
+    stock_wasmtime_workloads = [
+        *(workload for workload in provisioned_native if runner.uses_wasmtime(workload, "linux_native")),
+        *(
+            workload
+            for workload in [*wasmtime_workloads, *runner.workloads_with_counterpart(controls, "linux_wasmtime")]
+            if wasmtime_workloads and runner.uses_wasmtime(workload, "linux_wasmtime")
+        ),
+    ]
     asset_dir = resolve_asset_dir(repo_root, asset_dir)
     asset_dir.mkdir(parents=True, exist_ok=True)
     wasmtime_linux_bin = resolve_optional_path(repo_root, wasmtime_linux_bin)
@@ -1336,7 +1387,7 @@ def run_fedora_qemu_linux(
         else None
     )
     staged_wasmtime_release = None
-    if wasmtime_workloads and wasmtime_linux_bin is None and wasmtime_linux_archive is None:
+    if stock_wasmtime_workloads and wasmtime_linux_bin is None and wasmtime_linux_archive is None:
         wasmtime_linux_bin = stage_wasmtime_linux_bin(repo_root, asset_dir, guest_arch)
         staged_wasmtime_release = wasmtime_linux_release(guest_arch)[0]
     key = ensure_private_key(repo_root, asset_dir)
@@ -1362,9 +1413,13 @@ def run_fedora_qemu_linux(
         "block": blk_device,
         "quickjs_required": quickjs_required,
         "native_simd_probe_required": simd_probe_required,
-        "wasmtime_linux_required": bool(wasmtime_workloads),
-        "wasmtime_linux_workloads": [workload["name"] for workload in wasmtime_workloads],
+        "wasmtime_linux_required": bool(stock_wasmtime_workloads),
+        # The workloads that ran the stock CLI, on whichever side.
+        "wasmtime_linux_workloads": sorted({workload["name"] for workload in stock_wasmtime_workloads}),
     }
+    if compiler_plugin_wasm is not None:
+        provenance["compiler_plugin_wasm"] = str(compiler_plugin_wasm)
+        provenance["compiler_plugin_wasm_sha256"] = file_sha256(compiler_plugin_wasm)
     if quickjs_source_archive is not None:
         provenance["quickjs_source_archive"] = str(quickjs_source_archive)
     if staged_wasmtime_release is not None:
@@ -1401,6 +1456,7 @@ def run_fedora_qemu_linux(
             wasmtime_linux_archive,
             workloads,
             native_bin_dir,
+            compiler_plugin_wasm,
         )
         ensure_provisioned(
             repo_root,
@@ -1414,7 +1470,7 @@ def run_fedora_qemu_linux(
             linux_cpu_features(repo_root, key, port, quickjs_policy, simd_probe_required)
         )
         wasmtime_bin = None
-        if wasmtime_workloads:
+        if stock_wasmtime_workloads:
             provenance["wasmtime_linux"] = ensure_wasmtime_linux(
                 repo_root,
                 key,
@@ -1440,6 +1496,7 @@ def run_fedora_qemu_linux(
                     bin_path,
                     keep_going,
                     setup_timeout_seconds,
+                    compiler,
                 ),
                 timeout=setup_timeout_seconds,
             )
@@ -1458,18 +1515,24 @@ def run_fedora_qemu_linux(
 
         native_jsonl = None
         if native_workloads:
-            native_jsonl = time_side_with_control("linux_native", native_workloads, "linux-native", None)
+            native_jsonl = time_side_with_control(
+                "linux_native", native_workloads, "linux-native", wasmtime_bin
+            )
         wasmtime_jsonl = None
         if wasmtime_workloads:
             # Compile every module once up front so the timed iterations
-            # load precompiled code, the way Helios loads its cwasm.
-            ssh(
-                repo_root,
-                key,
-                port,
-                precompile_command([*wasmtime_workloads, *controls], wasmtime_bin),
-                timeout=setup_timeout_seconds,
-            )
+            # load precompiled code, the way Helios loads its cwasm. A
+            # selection whose Linux + Wasmtime column hosts its own runtime
+            # (`helios-compiler-host`) has nothing for the stock CLI to
+            # precompile.
+            if wasmtime_bin is not None:
+                ssh(
+                    repo_root,
+                    key,
+                    port,
+                    precompile_command([*wasmtime_workloads, *controls], wasmtime_bin),
+                    timeout=setup_timeout_seconds,
+                )
             wasmtime_jsonl = time_side_with_control(
                 "linux_wasmtime", wasmtime_workloads, "linux-wasmtime", wasmtime_bin
             )
