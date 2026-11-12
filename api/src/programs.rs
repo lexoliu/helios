@@ -192,9 +192,10 @@ impl Child {
         self.inner.stdin(data)
     }
 
-    /// Bytes of the child's user memory a frame currently backs; a
-    /// swapped-out page does not count and an exited child answers 0.
-    /// A snapshot, possibly stale by the time it is read.
+    /// Bytes of the user pool the child's memory holds right now; a
+    /// swapped-out page does not count, and an exited child, or any child
+    /// on the hosted backend, answers 0. A snapshot, possibly stale by the
+    /// time it is read.
     pub fn resident_bytes(&self) -> u64 {
         self.inner.resident_bytes()
     }
