@@ -10,10 +10,14 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  # A pull request's newer push supersedes its older run. A `dev` push
-  # runs to completion: merges land faster than a run finishes, and a
-  # completed `dev` run is the only writer of the host lanes' caches.
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  # Only a new head cancels: a pull request's `synchronize` supersedes
+  # the older run. `opened`, `reopened` and `ready_for_review` carry the
+  # head a run is already building and queue behind it, because a run
+  # cancelled before its matrix expands leaves a failed check named after
+  # the unexpanded expression that nothing replaces. A `dev` push runs to
+  # completion: merges land faster than a run finishes, and a completed
+  # `dev` run is the only writer of the host lanes' caches.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.event.action == 'synchronize' }}
 
 permissions:
   contents: read
