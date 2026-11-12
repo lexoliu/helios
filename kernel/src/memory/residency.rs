@@ -73,10 +73,7 @@ impl UserResidency {
     /// memories then come from an address space nothing can ask, and
     /// any answer would be a guess.
     pub fn of_installed_address_space() -> Self {
-        let hooks = HOOKS.get().unwrap_or_else(|| {
-            panic!("user residency asked for before the backend installed its residency hooks")
-        });
-        (hooks.user_residency)()
+        (ResidencyVmHooks::installed().user_residency)()
     }
 
     /// What `owner` holds of the user pool.
@@ -118,13 +115,40 @@ impl FromIterator<(MemoryOwner, u64)> for UserResidency {
 pub struct ResidencyVmHooks {
     /// One walk of the installed address space.
     pub user_residency: fn() -> UserResidency,
+    /// What one owner holds, from the address space's own per-owner
+    /// account: it takes the reservation lock once and does not walk
+    /// the other owners. Exact as of the call, like a walk.
+    pub owner_resident_bytes: fn(u64) -> u64,
+}
+
+impl ResidencyVmHooks {
+    /// The table the backend installed with [`install_residency_hooks`].
+    ///
+    /// Panics when no backend has installed one: the runtime's linear
+    /// memories then come from an address space nothing can ask, and
+    /// any answer would be a guess.
+    pub fn installed() -> &'static Self {
+        HOOKS.get().copied().unwrap_or_else(|| {
+            panic!("user residency asked for before the backend installed its residency hooks")
+        })
+    }
+
+    /// What `owner` holds of the user pool right now.
+    pub fn bytes_of_owner(&self, owner: MemoryOwner) -> u64 {
+        (self.owner_resident_bytes)(owner.raw())
+    }
 }
 
 /// The residency table for `S`, generated once for every backend.
 pub const fn residency_vm_hooks<S: InstalledAddressSpace>() -> ResidencyVmHooks {
     ResidencyVmHooks {
         user_residency: installed_user_residency::<S>,
+        owner_resident_bytes: installed_owner_resident_bytes::<S>,
     }
+}
+
+fn installed_owner_resident_bytes<S: InstalledAddressSpace>(owner: u64) -> u64 {
+    S::installed().owned_resident_bytes(owner)
 }
 
 fn installed_user_residency<S: InstalledAddressSpace>() -> UserResidency {

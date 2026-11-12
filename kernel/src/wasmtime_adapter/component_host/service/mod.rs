@@ -443,12 +443,11 @@ impl ChildHandle {
     }
 
     /// Bytes of the child's user memory a frame currently backs,
-    /// through the address space `hooks` name: the figure the OOM
-    /// policy ranks owners by. A child that has exited owns nothing, so
+    /// through the address space `hooks` name: the account the OOM
+    /// killer ranks owners by. A child that has exited owns nothing, so
     /// it answers 0.
-    pub fn resident_bytes(&self, hooks: &crate::SwapVmHooks) -> u64 {
-        let owner = crate::MemoryOwner::new(self.instance_id.raw());
-        (hooks.owned_resident_bytes)(owner.raw())
+    pub fn resident_bytes(&self, hooks: &crate::ResidencyVmHooks) -> u64 {
+        hooks.bytes_of_owner(crate::MemoryOwner::new(self.instance_id.raw()))
     }
 
     /// Await child exit. Consumes the handle.
@@ -2526,14 +2525,9 @@ mod tests {
 
     /// A hook table whose only live entry reports `owner` pages of 4 KiB,
     /// so the figure shows which owner the handle asked about.
-    const OWNER_SCALED_HOOKS: crate::SwapVmHooks = crate::SwapVmHooks {
-        swap_out_page: |_, _, _| unreachable!("resident-bytes never swaps"),
-        swap_in_page: |_, _| unreachable!("resident-bytes never swaps"),
-        swapped_token: |_| None,
-        scan_committed_pages: |_, _, _| 0,
-        owned_resident_bytes: |owner| owner * 4096,
-        drain_orphaned_swap_tokens: |_, _| 0,
-        now_ticks: || 0,
+    const OWNER_SCALED_HOOKS: crate::ResidencyVmHooks = crate::ResidencyVmHooks {
+        user_residency: || unreachable!("resident-bytes never walks every owner"),
+        owner_resident_bytes: |owner| owner * 4096,
     };
 
     fn test_child(instance: u64) -> ChildHandle {

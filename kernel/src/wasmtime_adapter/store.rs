@@ -232,6 +232,21 @@ pub(crate) fn user_residency() -> UserResidency {
     }
 }
 
+/// What `child` holds of the user pool right now: the same account as
+/// [`user_residency`], asked for one owner, with the same answer under
+/// `wasmtime-host`.
+pub(crate) fn child_resident_bytes(child: &crate::ChildHandle) -> u64 {
+    #[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]
+    {
+        child.resident_bytes(crate::ResidencyVmHooks::installed())
+    }
+    #[cfg(not(all(target_os = "none", feature = "wasmtime-bare-metal")))]
+    {
+        let _ = child;
+        0
+    }
+}
+
 impl<CpuImpl, RuntimeStateImpl, FileSystem> IoView
     for ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem, ResourceTable, wasmtime::Memory>
 where

@@ -291,21 +291,12 @@ macro_rules! impl_program_bindings {
                 mut access: Access<'_, U, Self>,
                 child: wasmtime::component::Resource<ChildHandle>,
             ) -> wasmtime::Result<u64> {
-                // A platform without swap installs no hook table and has no
-                // per-owner residency to report; answering 0 there would
-                // tell the caller the child is evicted.
-                let hooks = crate::installed_swap_hooks().ok_or_else(|| {
-                    wasmtime::Error::msg(
-                        "child.resident-bytes needs the address space's swap hooks, \
-                         and this platform installed none",
-                    )
-                })?;
                 let handle = access
                     .get()
                     .table
                     .get(&child)
                     .map_err(wasmtime::Error::from)?;
-                Ok(handle.resident_bytes(hooks))
+                Ok(super::store::child_resident_bytes(handle))
             }
 
             #[allow(unused_mut)]

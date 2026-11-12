@@ -265,9 +265,8 @@ interface programs {
     /// by the time the caller reads it. One call sums the child's
     /// committed regions under the address space's reservation lock, so
     /// its cost grows with the number of regions the child holds; poll
-    /// it at the cadence of the work it gates, not in a tight loop. A
-    /// platform without swap has no per-owner figure and traps the
-    /// caller.
+    /// it at the cadence of the work it gates, not in a tight loop. The
+    /// figure is exact on every platform, with or without swap.
     resident-bytes: func() -> u64;
   }
 
