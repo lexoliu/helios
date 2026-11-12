@@ -821,6 +821,12 @@ where
     persist_timer: Option<TcpPersistTimer>,
     persist_probe: Option<TcpPersistProbe>,
     next_pacing_send_nanos: Option<u64>,
+    /// While set, the socket has something to send and no link-layer
+    /// address to send it to, and this is when the stack asks again. It
+    /// replaces the pacing deadline in [`Self::next_deadline_nanos`]: a
+    /// pacing deadline that has already passed would wake the socket's
+    /// writer again and again for a segment nothing can address.
+    resolution_retry_nanos: Option<u64>,
     delayed_ack_deadline_nanos: Option<u64>,
     time_wait_deadline_nanos: Option<u64>,
     unacked_receive_segments: u8,
@@ -1007,6 +1013,7 @@ where
             persist_timer: None,
             persist_probe: None,
             next_pacing_send_nanos: None,
+            resolution_retry_nanos: None,
             delayed_ack_deadline_nanos: None,
             time_wait_deadline_nanos: None,
             unacked_receive_segments: 0,
@@ -1453,6 +1460,26 @@ where
         now_nanos: u64,
         budget: TcpSegmentBudget,
     ) -> Option<TcpTransmitSegment> {
+        self.take_resolved_transmit_segment(now_nanos, budget, || Some(()))
+            .map(|(segment, ())| segment)
+    }
+
+    /// [`Self::take_transmit_segment`] for a caller that must know where
+    /// the segment goes before the socket gives it up.
+    ///
+    /// `resolve` runs once the socket has found a segment it would take,
+    /// and before it takes it: it answers with whatever the caller needs
+    /// to send the segment (a link-layer address) or `None` when it has
+    /// none. On `None` the socket changes nothing — the bytes stay in the
+    /// transmit queue, the send sequence does not move and no segment is
+    /// recorded in flight — and the call returns `None`. A segment taken
+    /// is therefore always one the caller can send.
+    pub fn take_resolved_transmit_segment<Hop>(
+        &mut self,
+        now_nanos: u64,
+        budget: TcpSegmentBudget,
+        mut resolve: impl FnMut() -> Option<Hop>,
+    ) -> Option<(TcpTransmitSegment, Hop)> {
         self.arm_persist_timer_if_needed(now_nanos);
         let local = self.local?;
         let remote = self.remote?;
@@ -1480,18 +1507,20 @@ where
             self.state,
             TcpState::Established | TcpState::CloseWait | TcpState::FinWait1 | TcpState::LastAck
         ) && !self.fin_queued
-            && let Some(segment) = self.take_data_segment(
-                local,
-                remote,
+            && let Some(taken) = self.take_data_segment(
+                (local, remote),
                 available_window,
                 budget,
                 now_nanos,
                 persist_probe,
+                &mut resolve,
             )
         {
-            return Some(segment);
+            return Some(taken);
         }
 
+        // A data segment `resolve` refused leaves its bytes queued, and a
+        // FIN waits behind them.
         if !self.transmit_queue_is_empty() {
             return None;
         }
@@ -1501,7 +1530,12 @@ where
         }
 
         if let Some(persist_probe) = persist_probe.filter(|probe| probe.fin) {
-            return self.take_fin_segment(local, remote, now_nanos, true, persist_probe.sequence);
+            let hop = resolve()?;
+            self.resolution_retry_nanos = None;
+            return Some((
+                self.take_fin_segment(local, remote, now_nanos, true, persist_probe.sequence)?,
+                hop,
+            ));
         }
 
         if self.peer_receive_window == 0 {
@@ -1509,7 +1543,23 @@ where
             return None;
         }
 
-        self.take_fin_segment(local, remote, now_nanos, false, self.send_next)
+        let hop = resolve()?;
+        self.resolution_retry_nanos = None;
+        Some((
+            self.take_fin_segment(local, remote, now_nanos, false, self.send_next)?,
+            hop,
+        ))
+    }
+
+    /// Records that the segment this socket would send has no link-layer
+    /// address to go to yet, and that the stack asks for one again at
+    /// `retry_nanos`.
+    ///
+    /// Until the socket takes a segment again, `retry_nanos` is its
+    /// transmit deadline in place of the pacing deadline, which a stalled
+    /// pacing clock leaves in the past.
+    pub fn await_resolution(&mut self, retry_nanos: u64) {
+        self.resolution_retry_nanos = Some(retry_nanos);
     }
 
     fn take_fin_segment(
@@ -1571,6 +1621,15 @@ where
     }
 
     pub fn expire_timers(&mut self, now_nanos: u64) {
+        // The wait for a link-layer address is over; whether the socket
+        // still has anything to send is for the drive that follows to
+        // find, and it re-arms the wait if the address is still missing.
+        if self
+            .resolution_retry_nanos
+            .is_some_and(|deadline| now_nanos >= deadline)
+        {
+            self.resolution_retry_nanos = None;
+        }
         if self
             .delayed_ack_deadline_nanos
             .is_some_and(|deadline| now_nanos >= deadline)
@@ -1596,14 +1655,17 @@ where
                 )
             })
         });
-        let pacing_deadline = self
-            .next_pacing_send_nanos
-            .filter(|_| !self.transmit_queue_is_empty());
+        // A socket waiting for a link-layer address cannot send at its
+        // pacing time, so the time it asks again stands in for it.
+        let transmit_deadline = self.resolution_retry_nanos.or_else(|| {
+            self.next_pacing_send_nanos
+                .filter(|_| !self.transmit_queue_is_empty())
+        });
         let persist_deadline = self.persist_timer.map(TcpPersistTimer::deadline_nanos);
         min_deadline(
             min_deadline(
                 min_deadline(
-                    min_deadline(rto_deadline, pacing_deadline),
+                    min_deadline(rto_deadline, transmit_deadline),
                     persist_deadline,
                 ),
                 self.delayed_ack_deadline_nanos,
@@ -1612,15 +1674,18 @@ where
         )
     }
 
-    fn take_data_segment(
+    /// Takes the next data segment, or `None` when there is none to take
+    /// or `resolve` has no next hop for it. `resolve` is asked only once
+    /// the segment is certain, and nothing is taken before it answers.
+    fn take_data_segment<Hop>(
         &mut self,
-        local: TcpEndpoint,
-        remote: TcpEndpoint,
+        (local, remote): (TcpEndpoint, TcpEndpoint),
         available: usize,
         budget: TcpSegmentBudget,
         now_nanos: u64,
         persist_probe: Option<TcpPersistProbe>,
-    ) -> Option<TcpTransmitSegment> {
+        resolve: &mut impl FnMut() -> Option<Hop>,
+    ) -> Option<(TcpTransmitSegment, Hop)> {
         if self
             .next_pacing_send_nanos
             .is_some_and(|deadline| now_nanos < deadline)
@@ -1658,9 +1723,11 @@ where
                 .max(maximum_segment),
             None => maximum_segment,
         };
-        if burst_limit == 0 {
+        if burst_limit == 0 || self.transmit_queue_is_empty() {
             return None;
         }
+        let hop = resolve()?;
+        self.resolution_retry_nanos = None;
         let mut payload = if is_persist_probe {
             self.transmit_queue.as_ref()?.front()?.slice(..1)
         } else {
@@ -1726,16 +1793,19 @@ where
             self.schedule_next_pacing_send(sequence_len, now_nanos);
         }
         self.note_ack_emitted();
-        Some(TcpTransmitSegment {
-            local,
-            remote,
-            header,
-            options,
-            payload,
-            sequence_len,
-            segment_bytes: maximum_segment as u32,
-            retransmission: false,
-        })
+        Some((
+            TcpTransmitSegment {
+                local,
+                remote,
+                header,
+                options,
+                payload,
+                sequence_len,
+                segment_bytes: maximum_segment as u32,
+                retransmission: false,
+            },
+            hop,
+        ))
     }
 
     pub fn pending_retransmission(&self, now_nanos: u64) -> Option<TcpTransmitSegment> {
@@ -2268,6 +2338,7 @@ where
         self.persist_timer = None;
         self.persist_probe = None;
         self.next_pacing_send_nanos = None;
+        self.resolution_retry_nanos = None;
         self.delayed_ack_deadline_nanos = None;
         self.time_wait_deadline_nanos = None;
         self.unacked_receive_segments = 0;

@@ -3917,6 +3917,302 @@ mod tests {
         )
     }
 
+    /// The address family a resolution test runs over.
+    #[derive(Clone, Copy)]
+    enum ResolutionFamily {
+        Ipv4,
+        Ipv6,
+    }
+
+    /// What one transmitted frame was, as far as the resolution tests
+    /// care.
+    #[derive(Clone, Debug)]
+    enum Wire {
+        /// An ARP request or a Neighbor Solicitation.
+        Resolution,
+        Tcp {
+            flags: TcpFlags,
+            payload: Vec<u8>,
+        },
+        Other,
+    }
+
+    impl ResolutionFamily {
+        const LOCAL_V4: Ipv4Address = Ipv4Address::new([192, 0, 2, 10]);
+        const PEER_V4: Ipv4Address = Ipv4Address::new([192, 0, 2, 20]);
+        /// The device's own address, which every frame a test injects is
+        /// addressed to.
+        const LOCAL_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 1];
+
+        fn local(self) -> IpAddress {
+            match self {
+                Self::Ipv4 => IpAddress::Ipv4(Self::LOCAL_V4),
+                Self::Ipv6 => IpAddress::Ipv6(connect_local()),
+            }
+        }
+
+        fn peer(self) -> IpAddress {
+            match self {
+                Self::Ipv4 => IpAddress::Ipv4(Self::PEER_V4),
+                Self::Ipv6 => IpAddress::Ipv6(connect_remote()),
+            }
+        }
+
+        fn configure(self, shard: &mut NetworkShard) {
+            match self {
+                Self::Ipv4 => shard
+                    .stack
+                    .add_ipv4_address(Ipv4Cidr::new(Self::LOCAL_V4, 24)),
+                Self::Ipv6 => shard
+                    .stack
+                    .add_ipv6_address(Ipv6Cidr::new(connect_local(), 64)),
+            }
+            .expect("test address should be accepted");
+        }
+
+        /// The peer's answer to a request for its link-layer address: an
+        /// ARP reply or a solicited Neighbor Advertisement.
+        fn resolution_reply(self) -> Vec<u8> {
+            let mut frame = [0; ETHERNET_FRAME_BYTES];
+            let len = match self {
+                Self::Ipv4 => {
+                    let offset = EthernetFrame::encode_header(
+                        &mut frame,
+                        Self::LOCAL_MAC,
+                        PEER_MAC,
+                        EthernetProtocol::Arp,
+                    )
+                    .expect("test Ethernet header should fit");
+                    offset
+                        + ArpPacket {
+                            operation: ArpOperation::Reply,
+                            sender_hardware: PEER_MAC,
+                            sender_protocol: Self::PEER_V4,
+                            target_hardware: Self::LOCAL_MAC,
+                            target_protocol: Self::LOCAL_V4,
+                        }
+                        .encode(&mut frame[offset..])
+                        .expect("test ARP reply should fit")
+                }
+                Self::Ipv6 => {
+                    let mut body = [0u8; Icmpv6Packet::NEIGHBOR_MESSAGE_LEN];
+                    Icmpv6Packet::encode_neighbor_advertisement(
+                        &mut body,
+                        connect_remote(),
+                        connect_local(),
+                        connect_remote(),
+                        PEER_MAC,
+                    )
+                    .expect("test Neighbor Advertisement should fit");
+                    let mut offset = EthernetFrame::encode_header(
+                        &mut frame,
+                        Self::LOCAL_MAC,
+                        PEER_MAC,
+                        EthernetProtocol::Ipv6,
+                    )
+                    .expect("test Ethernet header should fit");
+                    offset += Ipv6Packet::encode_header(
+                        &mut frame[offset..],
+                        connect_remote(),
+                        connect_local(),
+                        IpProtocol::Icmpv6,
+                        body.len(),
+                        255,
+                    )
+                    .expect("test IPv6 header should fit");
+                    frame[offset..offset + body.len()].copy_from_slice(&body);
+                    offset + body.len()
+                }
+            };
+            frame[..len].to_vec()
+        }
+
+        /// A segment from the peer to the device.
+        fn tcp_from_peer(self, header: TcpHeader) -> Vec<u8> {
+            let (frame, len) = match self {
+                Self::Ipv4 => ipv4_tcp_frame(Self::PEER_V4, Self::LOCAL_V4, header, &[]),
+                Self::Ipv6 => ipv6_tcp_frame(connect_remote(), connect_local(), header),
+            };
+            frame[..len].to_vec()
+        }
+
+        fn classify(self, frame: &[u8]) -> Wire {
+            let Some(ethernet) = EthernetFrame::parse(frame) else {
+                return Wire::Other;
+            };
+            let tcp = match self {
+                Self::Ipv4 => {
+                    if ethernet.protocol == EthernetProtocol::Arp {
+                        return Wire::Resolution;
+                    }
+                    let Some(ipv4) = Ipv4Packet::parse(ethernet.payload) else {
+                        return Wire::Other;
+                    };
+                    (ipv4.protocol == IpProtocol::Tcp).then(|| TcpPacket::parse(ipv4.payload))
+                }
+                Self::Ipv6 => {
+                    let Some(ipv6) = Ipv6Packet::parse(ethernet.payload) else {
+                        return Wire::Other;
+                    };
+                    if ipv6.next_header == IpProtocol::Icmpv6 {
+                        return Wire::Resolution;
+                    }
+                    (ipv6.next_header == IpProtocol::Tcp).then(|| TcpPacket::parse(ipv6.payload))
+                }
+            };
+            match tcp.flatten() {
+                Some(tcp) => Wire::Tcp {
+                    flags: tcp.flags,
+                    payload: tcp.payload.to_vec(),
+                },
+                None => Wire::Other,
+            }
+        }
+    }
+
+    /// Issue #809, the sequence the first connection of a boot takes: a
+    /// connect whose flow hashes to a shard other than the default one
+    /// asks for the peer's address from that shard, the reply is
+    /// learned on the default shard, and the connection's own shard
+    /// receives its SYN-ACK. The request that shard made is its own
+    /// business and must not reach the control plane, where it would
+    /// replace the resolved neighbour on every shard.
+    fn a_pending_resolution_on_another_shard_leaves_the_resolved_neighbor(
+        family: ResolutionFamily,
+    ) {
+        const PEER_PORT: u16 = 80;
+        const LOCAL_SEQUENCE: u32 = 7;
+        const PEER_SEQUENCE: u32 = 100;
+        const OWNER: usize = 1;
+
+        let device = RecordingNetworkInterface::accepting_transmissions(2);
+        let service = test_network_service_smp(2, device.clone());
+        let state = &service.inner.state;
+        assert_eq!(state.shard_count(), 2);
+        for idx in 0..2 {
+            family.configure(&mut state.shard_at(idx).lock());
+        }
+        service
+            .inner
+            .control
+            .publish_from_shard(&state.shard_at(0).lock());
+        let local_port = (49_152..u16::MAX)
+            .find(|port| {
+                super::shard_idx_for_flow(family.local(), *port, family.peer(), PEER_PORT, 2)
+                    == OWNER
+            })
+            .expect("some ephemeral port hashes to the second shard");
+        let socket = {
+            let mut shard = state.shard_at(OWNER).lock();
+            let socket = shard
+                .stack
+                .open_tcp_connect(
+                    TcpEndpoint {
+                        address: family.local(),
+                        port: local_port,
+                    },
+                    TcpEndpoint {
+                        address: family.peer(),
+                        port: PEER_PORT,
+                    },
+                    LOCAL_SEQUENCE,
+                )
+                .expect("the test connection should allocate a socket");
+            shard.insert_tcp_stream(socket);
+            socket
+        };
+
+        // One interface-scope poll, and what it put on the wire.
+        let mut seen = 0;
+        let mut poll = || {
+            block_on(service.poll_network_once(NetworkPollSource::Tcp))
+                .expect("the poll should drive the device");
+            let frames = device.transmitted_frames();
+            let new = frames[seen..]
+                .iter()
+                .map(|frame| family.classify(frame))
+                .collect::<Vec<_>>();
+            seen = frames.len();
+            new
+        };
+
+        let wire = poll();
+        assert!(
+            wire.iter().any(|wire| matches!(wire, Wire::Resolution)),
+            "the shard asks for the peer's address: {wire:?}"
+        );
+        assert!(
+            !wire.iter().any(|wire| matches!(wire, Wire::Tcp { .. })),
+            "nothing is sent before the address is known: {wire:?}"
+        );
+
+        // The reply lands on the default shard. The next poll learns it,
+        // and the one after hands it to the connection's shard.
+        device.deliver_on(0, &family.resolution_reply());
+        let wire = [poll(), poll()].concat();
+        assert!(
+            wire.iter().any(|wire| matches!(
+                wire,
+                Wire::Tcp { flags, .. } if flags.contains(TcpFlags::SYN)
+            )),
+            "the SYN leaves once the address is known: {wire:?}"
+        );
+
+        device.deliver_on(
+            0,
+            &family.tcp_from_peer(TcpHeader {
+                source_port: PEER_PORT,
+                destination_port: local_port,
+                sequence: PEER_SEQUENCE,
+                acknowledgement: LOCAL_SEQUENCE.wrapping_add(1),
+                flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                window_size: u16::MAX,
+            }),
+        );
+        poll();
+
+        state
+            .shard_at(OWNER)
+            .lock()
+            .stack
+            .tcp_send(socket, b"hello")
+            .expect("data should queue on the established socket");
+        let wire = poll();
+
+        for idx in 0..2 {
+            let shard = state.shard_at(idx).lock();
+            assert!(
+                shard.stack.neighbors().any(|entry| {
+                    entry.ip == family.peer()
+                        && entry.mac == PEER_MAC
+                        && entry.state == NeighborState::Reachable
+                }),
+                "shard {idx} lost the peer's resolved address"
+            );
+        }
+        assert!(
+            wire.iter().any(|wire| matches!(
+                wire,
+                Wire::Tcp { payload, .. } if payload == b"hello"
+            )),
+            "the poll sends the data: {wire:?}"
+        );
+        assert!(
+            !wire.iter().any(|wire| matches!(wire, Wire::Resolution)),
+            "the poll asks for nothing the shards already know: {wire:?}"
+        );
+    }
+
+    #[test]
+    fn a_pending_ipv4_resolution_on_another_shard_leaves_the_resolved_neighbor() {
+        a_pending_resolution_on_another_shard_leaves_the_resolved_neighbor(ResolutionFamily::Ipv4);
+    }
+
+    #[test]
+    fn a_pending_ipv6_resolution_on_another_shard_leaves_the_resolved_neighbor() {
+        a_pending_resolution_on_another_shard_leaves_the_resolved_neighbor(ResolutionFamily::Ipv6);
+    }
+
     /// The receive rule and the placement rule have to agree, or a
     /// socket is opened on a shard its own frames never reach.
     #[test]
