@@ -56,6 +56,20 @@ impl HostedConfig {
         }
     }
 
+    /// A configuration for a test that boots processors itself: `bootfs`
+    /// is the payload `kernel-prebuild` wrote, and the rest is the
+    /// environment's defaults, which tests never override.
+    #[cfg(test)]
+    pub(crate) fn for_test(processor_count: usize, bootfs: PathBuf) -> Self {
+        Self {
+            processor_count,
+            bootstrap_processor: ProcessorId::new(0),
+            heap_bytes: DEFAULT_HEAP_BYTES,
+            init_wasi_root: None,
+            bootfs,
+        }
+    }
+
     pub fn processor_count(&self) -> usize {
         self.processor_count
     }

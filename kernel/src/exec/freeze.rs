@@ -1,0 +1,498 @@
+//! Holding the whole machine still at a scheduler boundary.
+//!
+//! A freeze stops every processor at a point where no task is being
+//! polled, no timer is firing and no interrupt can reach a driver, and
+//! lets one processor, the freezer's, work alone from there. Hibernation
+//! takes its image at that point, and the virtio drivers' `quiesce` and
+//! `reinitialize` run at it: their contract is that they run on one
+//! processor while every other is parked and no task is polled.
+//!
+//! # Concurrency contract
+//!
+//! One requester, the *freezer*, runs [`Executor::freeze`] on its
+//! processor. Every other processor is a *secondary*. The freezer never
+//! waits on a lock: it publishes a word, wakes the secondaries and awaits
+//! their arrival, and a secondary parks on the word.
+//!
+//! State, each word with one writer:
+//!
+//! * `phase` (`Running`, `Freezing`, `Frozen`, `Thawing`), one cache
+//!   line, written only by the freezer. The freezer takes it from
+//!   `Running` with a compare-and-swap, so a second requester sees
+//!   [`FreezeError::AlreadyFreezing`] and writes nothing.
+//! * `hold`, in the same line, written only by the freezer: bit 0 is set
+//!   while a freeze holds the secondaries and the other seven bits count
+//!   freezes. The count makes every held value differ from the one
+//!   before it, so a secondary that parked against one freeze never
+//!   mistakes the next for the same.
+//! * `freezer`, in the same line, written only by the freezer before it
+//!   sets `hold`.
+//! * one arrival word per processor, each on a line of its own and
+//!   written only by its processor: the `hold` value the processor parked
+//!   against, or zero (`hold` has bit 0 set whenever it is held, so a
+//!   held value is never zero).
+//!
+//! The freezer:
+//!
+//! 1. takes `phase` from `Running` to `Freezing`, publishes `freezer`,
+//!    then `hold` (`Release`);
+//! 2. asks the guests that are running to stop, which ends each at its
+//!    next function entry or loop header and returns it to the executor
+//!    (the caller supplies that, because the scheduler knows nothing of
+//!    the runtime that runs guests);
+//! 3. wakes every secondary, whatever it is doing: a secondary that is
+//!    running reads `hold` at its next boundary, and one that is idle,
+//!    polling or parked is brought back to its run loop. The wake is
+//!    unconditional, and does not consult the idle state, because a
+//!    processor that is polling has not published `Parked` and a wake it
+//!    is owed would otherwise be skipped;
+//! 4. awaits, with the wait armed before each test of the arrival words,
+//!    until every secondary's word equals `hold`, or until
+//!    [`FREEZE_ARRIVAL_DEADLINE`] passes. A secondary that has not
+//!    arrived by then is polling one task for longer than four time
+//!    slices, which is a defect, and the freeze fails naming the lowest
+//!    such processor: `hold` is cleared, the secondaries that did arrive
+//!    are woken, `phase` returns to `Running`, and nothing stays held;
+//! 5. after its last await, and from there with no await until it
+//!    thaws, masks interrupts on its own processor, sets `phase` to
+//!    `Frozen` and returns a [`FrozenMachine`]. The freezer's processor
+//!    polls no task but the one that holds that value, because that task
+//!    does not yield; the value is not `Send`, so it cannot be carried to
+//!    another processor, and a task that yields while holding it breaks
+//!    the contract (the processor's next boundary reports it).
+//!
+//! A secondary reaches a boundary before every attempt to pop a task in
+//! `Executor::run_until_stalled_with_stats` (so also on a pass that finds
+//! its queues empty, and between the tasks of a batch) and before the
+//! root future is polled in `Kernel::run_local_future`
+//! (`FreezeBarrier::checkpoint`). A pass that fires a timer before it
+//! reaches the boundary does so while the freeze is still `Freezing`:
+//! the freezer counts the processor as arrived only once it has parked,
+//! so nothing fires after the machine is `Frozen`. At a boundary it reads
+//! `hold` with one `Relaxed` load and, when it is set,
+//!
+//! 1. masks interrupts on its own processor, so that from here to the
+//!    end of the freeze no handler can run (a handler is what a driver's
+//!    interrupt path is);
+//! 2. publishes its arrival word and broadcasts the freezer's wait, then
+//!    wakes the freezer's processor. That wake is as unconditional as the
+//!    freezer's: the freezer may be parked, and the notification wakes
+//!    its task through the scheduler, which wakes a processor only when
+//!    it has published `Parked`;
+//! 3. parks in [`Cpu::park_wake_only`], which narrows the interrupt mask
+//!    to the wake IPI and the TLB-shootdown IPI before it waits on
+//!    `hold`.
+//!
+//! The arrival is published before the processor parks but after its
+//! interrupts are masked, so there is no instant at which the freezer
+//! counts it and a handler can still run on it; and the wait is entered
+//! with the mask already narrowed, so no device interrupt is taken while
+//! the processor waits. A secondary leaves only when `hold` changes. It
+//! then clears its arrival word, so a later freeze never counts it as
+//! arrived before it has parked.
+//!
+//! The freezer thaws (`FrozenMachine` dropped, or a failed freeze) in
+//! order: `phase` to `Thawing`, `hold` to its released value, a wake to
+//! every secondary, and then a wait, a hardware-synchronisation spin
+//! bounded by IPI latency, until no secondary's arrival word still equals
+//! the held value, so that each has left its park. Last, `phase` returns
+//! to `Running` and the freezer's own interrupts are unmasked.
+//!
+//! No wake is lost:
+//!
+//! * freezer to secondary: `hold` is stored `Release` before the wake,
+//!   and every secondary tests it `Acquire` after its masks are in
+//!   place, so a secondary either sees the new value or has the wake
+//!   pending when it waits (each backend's `park_wake_only` states how);
+//!   an IPI that finds the secondary running is taken as an interrupt and
+//!   changes nothing, because the boundary reads `hold` itself;
+//! * secondary to freezer: the arrival word is stored `Release` before the
+//!   broadcast, the freezer's wait is armed before it reads the words,
+//!   and the wake to the freezer's processor is sent after, so the
+//!   freezer is either woken or finds the word on its next read;
+//! * release: `hold` changes before the wake, the park tests it after
+//!   every wake, so a secondary that has not yet parked returns at once.
+//!
+//! Work queued while the machine is frozen is queued and nothing more: a
+//! processor whose run loop has published nothing but `Running` is never
+//! sent a scheduler wake for it, and every processor drains its queues
+//! when it leaves the freeze.
+
+use alloc::boxed::Box;
+use core::future::poll_fn;
+use core::pin::pin;
+use core::sync::atomic::{AtomicU8, AtomicU16, Ordering};
+use core::task::Poll;
+use core::time::Duration;
+
+use crossbeam_utils::CachePadded;
+use helios_hal::cpu::{Cpu, ProcessorId, current_processor};
+use helios_hal::critical_section::LocalInterruptsMasked;
+use triomphe::Arc as NoWeakArc;
+
+use crate::exec::executor::{Executor, ExecutorGroup};
+use crate::exec::sync::Notify;
+use crate::exec::timer::{GUEST_TIME_SLICE, Timer};
+
+/// How long a secondary may take to reach a boundary after the freezer
+/// asks.
+///
+/// This is a cooperative-scheduling bound, not a hardware one: every task
+/// yields within a time slice, a guest is interrupted out of wasm at the
+/// end of its slice, and a processor needs a few of them to notice the
+/// request. A secondary still inside one task after four slices is a task
+/// that does not yield, and the freeze names it.
+pub const FREEZE_ARRIVAL_DEADLINE: Duration = GUEST_TIME_SLICE.saturating_mul(4);
+
+/// `hold` is held while this bit is set.
+const HELD: u8 = 1;
+
+/// The arrival word of a processor that is not parked against a freeze.
+const NOT_ARRIVED: u8 = 0;
+
+/// Freezes in `hold`'s high seven bits.
+const GENERATIONS: u8 = 1 << 7;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum Phase {
+    Running = 0,
+    Freezing = 1,
+    Frozen = 2,
+    Thawing = 3,
+}
+
+impl Phase {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::Running,
+            1 => Self::Freezing,
+            2 => Self::Frozen,
+            3 => Self::Thawing,
+            _ => panic!("freeze phase {value} was never published"),
+        }
+    }
+}
+
+/// Why a freeze did not happen. The machine is running, every processor
+/// released, in both cases.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum FreezeError {
+    /// Another freeze holds the machine, or is releasing it.
+    #[error("the machine is already being frozen")]
+    AlreadyFreezing,
+    /// A processor was still inside one task when the arrival deadline
+    /// passed.
+    #[error(
+        "processor {} did not reach a scheduler boundary within {FREEZE_ARRIVAL_DEADLINE:?}",
+        processor.id()
+    )]
+    ProcessorDidNotArrive {
+        /// The lowest-numbered processor that had not arrived.
+        processor: ProcessorId,
+    },
+}
+
+/// The words every processor shares for a freeze. The contract is in the
+/// module documentation.
+pub(crate) struct FreezeBarrier {
+    control: CachePadded<Control>,
+    arrivals: Box<[CachePadded<AtomicU8>]>,
+    /// Broadcast by a secondary after it publishes its arrival; the
+    /// freezer is the only waiter.
+    arrived: Notify,
+}
+
+/// The freezer's words, on one line: read by every processor at every
+/// boundary, written only by the freezer.
+struct Control {
+    phase: AtomicU8,
+    hold: AtomicU8,
+    freezer: AtomicU16,
+}
+
+impl FreezeBarrier {
+    pub(crate) fn new(processors: usize) -> Self {
+        Self {
+            control: CachePadded::new(Control {
+                phase: AtomicU8::new(Phase::Running as u8),
+                hold: AtomicU8::new(0),
+                freezer: AtomicU16::new(0),
+            }),
+            arrivals: (0..processors)
+                .map(|_| CachePadded::new(AtomicU8::new(NOT_ARRIVED)))
+                .collect(),
+            arrived: Notify::new(),
+        }
+    }
+
+    /// Whether a freeze holds the machine. The run loop's whole cost: one
+    /// `Relaxed` load. A boundary that misses a freeze published a moment
+    /// ago takes it at the next one, which is within a task, and the
+    /// freezer's wake brings an idle processor back to its loop.
+    #[inline(always)]
+    pub(crate) fn requested(&self) -> bool {
+        self.control.hold.load(Ordering::Relaxed) & HELD != 0
+    }
+
+    /// Whether a freeze holds the machine and `processor` is not the one
+    /// that asked: the idle loop's reason to return to its run loop.
+    pub(crate) fn requested_of(&self, processor: ProcessorId) -> bool {
+        self.requested() && self.control.freezer.load(Ordering::Acquire) != processor.id()
+    }
+
+    /// A scheduler boundary: the processor polls no task, fires no timer
+    /// and holds nothing a handler needs. A secondary parks here for as
+    /// long as a freeze holds it.
+    #[inline(always)]
+    pub(crate) fn checkpoint<CpuImpl: Cpu>(&self, cpu: &CpuImpl) {
+        if self.requested() {
+            self.arrive(cpu);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn arrive<CpuImpl: Cpu>(&self, cpu: &CpuImpl) {
+        let processor = current_processor();
+        let hold = &self.control.hold;
+        let mut held = hold.load(Ordering::Acquire);
+        if held & HELD == 0 {
+            return;
+        }
+        if self.control.freezer.load(Ordering::Relaxed) == processor.id() {
+            self.freezer_boundary();
+            return;
+        }
+        // From the arrival to the end of the freeze no handler runs here.
+        let _masked = LocalInterruptsMasked::new();
+        let arrival = &self.arrivals[usize::from(processor.id())];
+        loop {
+            let freezer = ProcessorId::new(self.control.freezer.load(Ordering::Relaxed));
+            arrival.store(held, Ordering::Release);
+            self.arrived.notify_all();
+            cpu.wake_processor(freezer);
+            cpu.park_wake_only(hold, held);
+            arrival.store(NOT_ARRIVED, Ordering::Release);
+            held = hold.load(Ordering::Acquire);
+            if held & HELD == 0 {
+                return;
+            }
+        }
+    }
+
+    /// The freezer's own processor reached a boundary. While it awaits
+    /// its secondaries it runs ordinary tasks, and passes. Once
+    /// `Frozen` the task that holds the machine has yielded, which the
+    /// contract forbids.
+    #[cold]
+    fn freezer_boundary(&self) {
+        if Phase::from_u8(self.control.phase.load(Ordering::Acquire)) == Phase::Frozen {
+            tracing::error!(
+                processor = current_processor().id(),
+                "a task yielded while the machine was frozen; the freezer's processor is \
+                 polling tasks again with every other processor parked"
+            );
+            debug_assert!(
+                false,
+                "a task yielded while holding the frozen machine; the machine must be thawed \
+                 before the freezer's task awaits"
+            );
+        }
+    }
+
+    /// The lowest-numbered secondary that has not parked against `held`.
+    fn first_missing(&self, freezer: ProcessorId, held: u8) -> Option<ProcessorId> {
+        self.arrivals
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != usize::from(freezer.id()))
+            .find(|(_, arrival)| arrival.load(Ordering::Acquire) != held)
+            .map(|(index, _)| {
+                ProcessorId::new(u16::try_from(index).expect("processor index fits a ProcessorId"))
+            })
+    }
+
+    /// Releases the secondaries, in the order of the module
+    /// documentation, and returns once every one has left its park.
+    fn release<CpuImpl: Cpu>(&self, cpu: &CpuImpl, freezer: ProcessorId, held: u8) {
+        self.control
+            .phase
+            .store(Phase::Thawing as u8, Ordering::Release);
+        self.control.hold.store(held & !HELD, Ordering::Release);
+        for index in 0..self.arrivals.len() {
+            if index != usize::from(freezer.id()) {
+                cpu.wake_processor(processor_at(index));
+            }
+        }
+        for (index, arrival) in self.arrivals.iter().enumerate() {
+            if index == usize::from(freezer.id()) {
+                continue;
+            }
+            // A secondary that parked is a few instructions from leaving
+            // once `hold` changes; one that never arrived is not waited
+            // for, and finds `hold` released when it does.
+            while arrival.load(Ordering::Acquire) == held {
+                core::hint::spin_loop();
+            }
+        }
+        self.control
+            .phase
+            .store(Phase::Running as u8, Ordering::Release);
+    }
+}
+
+fn processor_at(index: usize) -> ProcessorId {
+    ProcessorId::new(u16::try_from(index).expect("processor index fits a ProcessorId"))
+}
+
+/// A freeze that has set `hold` and has not released it: what a dropped
+/// future or a returned guard releases.
+struct Hold<CpuImpl: Cpu + Clone> {
+    group: NoWeakArc<ExecutorGroup>,
+    cpu: CpuImpl,
+    freezer: ProcessorId,
+    held: u8,
+}
+
+impl<CpuImpl: Cpu + Clone> Drop for Hold<CpuImpl> {
+    fn drop(&mut self) {
+        self.group
+            .freeze
+            .release(&self.cpu, self.freezer, self.held);
+    }
+}
+
+/// The machine, held still. Every processor but this one is parked at a
+/// scheduler boundary with its interrupts held off, no task is polled on
+/// any of them, no timer fires, and this processor's interrupts are
+/// masked: the caller works alone until it drops the value.
+///
+/// Dropping it, or [`FrozenMachine::thaw`], releases the machine. The
+/// value is `!Send` and the work done while it is held is synchronous:
+/// the freezer's processor polls no task but the one that holds it, so
+/// that task must not yield.
+#[must_use = "the machine stays frozen until this is dropped"]
+pub struct FrozenMachine<CpuImpl: Cpu + Clone> {
+    // Field order is the thaw order: the secondaries are released first,
+    // and this processor's interrupts are unmasked last.
+    _hold: Hold<CpuImpl>,
+    _masked: LocalInterruptsMasked,
+}
+
+impl<CpuImpl: Cpu + Clone> FrozenMachine<CpuImpl> {
+    /// Releases every processor and unmasks this one.
+    pub fn thaw(self) {
+        drop(self);
+    }
+}
+
+impl Executor {
+    /// Freezes every processor at a scheduler boundary.
+    ///
+    /// `timer` is this processor's, `interrupt_guests` asks the runtime
+    /// that runs guests to end the time slice of each guest that is
+    /// running now (it is how a processor inside wasm reaches a boundary
+    /// before its slice ends). The contract is in the module
+    /// documentation.
+    ///
+    /// # Errors
+    ///
+    /// [`FreezeError::AlreadyFreezing`] when another freeze holds the
+    /// machine, and [`FreezeError::ProcessorDidNotArrive`] when a
+    /// processor is still inside one task after
+    /// [`FREEZE_ARRIVAL_DEADLINE`]. The machine is running in both cases.
+    pub async fn freeze<CpuImpl: Cpu + Clone>(
+        &self,
+        timer: &Timer<CpuImpl>,
+        interrupt_guests: impl FnOnce(),
+    ) -> Result<FrozenMachine<CpuImpl>, FreezeError> {
+        let barrier = &self.group.freeze;
+        let cpu = timer.cpu();
+        let freezer = current_processor();
+
+        barrier
+            .control
+            .phase
+            .compare_exchange(
+                Phase::Running as u8,
+                Phase::Freezing as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map_err(|_| FreezeError::AlreadyFreezing)?;
+        let generation = ((barrier.control.hold.load(Ordering::Relaxed) >> 1) + 1) % GENERATIONS;
+        let held = (generation << 1) | HELD;
+        barrier
+            .control
+            .freezer
+            .store(freezer.id(), Ordering::Relaxed);
+        barrier.control.hold.store(held, Ordering::Release);
+        // From here a drop, whether of the guard or of this future,
+        // releases the machine.
+        let hold = Hold {
+            group: self.group.clone(),
+            cpu: cpu.clone(),
+            freezer,
+            held,
+        };
+
+        interrupt_guests();
+        for index in 0..barrier.arrivals.len() {
+            if index != usize::from(freezer.id()) {
+                cpu.wake_processor(processor_at(index));
+            }
+        }
+
+        let deadline = cpu
+            .now()
+            .saturating_add(cpu.timebase().duration_to_ticks(FREEZE_ARRIVAL_DEADLINE));
+        let mut expiry = pin!(timer.sleep_until(deadline));
+        let mut arrival = barrier.arrived.waiter();
+        let arrived = poll_fn(|context| {
+            loop {
+                let Some(missing) = barrier.first_missing(freezer, held) else {
+                    return Poll::Ready(Ok(()));
+                };
+                if expiry.as_mut().poll(context).is_ready() {
+                    return Poll::Ready(Err(FreezeError::ProcessorDidNotArrive {
+                        processor: missing,
+                    }));
+                }
+                // The waiter is armed before `first_missing` reads, and
+                // re-armed each time it completes.
+                match barrier.arrived.poll_notified(context, &mut arrival) {
+                    Poll::Ready(()) => {}
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+        })
+        .await;
+        arrived?;
+
+        // No await from here: this processor polls nothing else until the
+        // guard is dropped.
+        let masked = LocalInterruptsMasked::new();
+        barrier
+            .control
+            .phase
+            .store(Phase::Frozen as u8, Ordering::Release);
+        Ok(FrozenMachine {
+            _hold: hold,
+            _masked: masked,
+        })
+    }
+
+    /// A scheduler boundary of this processor's run loop; see
+    /// [`FreezeBarrier::checkpoint`].
+    #[inline(always)]
+    pub(crate) fn freeze_checkpoint<CpuImpl: Cpu + Clone>(&self, cpu: &CpuImpl) {
+        self.group.freeze.checkpoint(cpu);
+    }
+
+    /// Whether a freeze that this processor did not ask for is holding
+    /// the machine.
+    pub(crate) fn freeze_requested_of_this_processor(&self) -> bool {
+        self.group.freeze.requested_of(self.owner_processor)
+    }
+}
