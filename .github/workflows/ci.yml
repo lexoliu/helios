@@ -541,7 +541,9 @@ jobs:
       # `--no-build` path reads them, and the manifest records this
       # runner's absolute paths. The root key pair is generated per
       # build, so the signing key the kernel carries belongs to this
-      # image alone.
+      # image alone. The compiler plugin's core module rides along: the
+      # bench's Linux + Wasmtime column runs the build the bootfs
+      # precompiled (tools/bench/native/build.sh, compiler-host/).
       - name: Upload the guest image
         if: always() && steps.guest-image.outcome == 'success'
         uses: actions/upload-artifact@v4
@@ -550,6 +552,7 @@ jobs:
           path: |
             helios/target/aarch64-unknown-none/kernel-release/helios
             helios/target/kernel-prebuild/aarch64-unknown-none/kernel-release/helios-bootfs
+            helios/target/kernel-prebuild/aarch64-unknown-none/kernel-release/compiler_plugin.wasm
           if-no-files-found: error
           retention-days: 90
 
@@ -1396,7 +1399,9 @@ jobs:
       # `--no-build` path reads them, and the manifest records this
       # runner's absolute paths. The root key pair is generated per
       # build, so the signing key the kernel carries belongs to this
-      # image alone.
+      # image alone. The compiler plugin's core module rides along: the
+      # bench's Linux + Wasmtime column runs the build the bootfs
+      # precompiled (tools/bench/native/build.sh, compiler-host/).
       - name: Upload the guest image
         if: always() && steps.guest-image.outcome == 'success'
         uses: actions/upload-artifact@v4
@@ -1405,6 +1410,7 @@ jobs:
           path: |
             helios/target/x86_64-unknown-none/profile-use/helios
             helios/target/kernel-prebuild/x86_64-unknown-none/profile-use/helios-bootfs
+            helios/target/kernel-prebuild/x86_64-unknown-none/profile-use/compiler_plugin.wasm
           if-no-files-found: error
           retention-days: 90
 
