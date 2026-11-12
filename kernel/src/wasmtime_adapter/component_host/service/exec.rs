@@ -1990,7 +1990,8 @@ pub(super) fn map_program_runtime_error(error: wasmtime::Error) -> ProgramExecEr
             // program's own caller did wrong.
             crate::KillReason::SupervisorRestart
             | crate::KillReason::Operator
-            | crate::KillReason::RequesterGone => ProgramExecErrorKind::Internal,
+            | crate::KillReason::RequesterGone
+            | crate::KillReason::StoreFailed => ProgramExecErrorKind::Internal,
         };
         return ProgramExecError {
             kind,
