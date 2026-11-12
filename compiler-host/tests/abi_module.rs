@@ -6,10 +6,14 @@ use std::io::{BufRead, BufReader, Write};
 use std::num::NonZeroU32;
 use std::process::{Command, Stdio};
 
+use helios_artifact::IsaLevelError;
 use helios_compiler_abi::{CompileHint, CompilerStatus, OutputKind};
 use helios_compiler_host::{Compiled, CompilerHost, CompilerHostError, on_wasm_thread};
 
 const TARGET: &str = "x86_64-unknown-none";
+/// A level `TARGET` defines whose name carries `+` extras, which the request
+/// must carry whole.
+const ISA_LEVEL: &str = "x86-64-v4+vbmi+bitalg";
 
 fn stand_in() -> Vec<u8> {
     wat::parse_str(include_str!("fixtures/abi.wat")).expect("the stand-in plugin assembles")
@@ -29,7 +33,7 @@ fn compile_all(
         let mut host = CompilerHost::new(&plugin, workers)?;
         Ok(inputs
             .iter()
-            .map(|input| host.compile(input, TARGET, CompileHint::Performance))
+            .map(|input| host.compile(input, TARGET, ISA_LEVEL, CompileHint::Performance))
             .collect())
     })?
 }
@@ -39,6 +43,7 @@ fn echoed(workers: u32, input: &[u8]) -> Vec<u8> {
     let mut expected = (CompileHint::Performance as u32).to_le_bytes().to_vec();
     expected.extend_from_slice(format!("RAYON_NUM_THREADS={workers}\0").as_bytes());
     expected.extend_from_slice(TARGET.as_bytes());
+    expected.extend_from_slice(ISA_LEVEL.as_bytes());
     expected.extend_from_slice(input);
     expected
 }
@@ -62,6 +67,23 @@ fn compiles_run_the_kernels_call_sequence_on_a_resident_runtime() {
 }
 
 #[test]
+fn an_isa_level_the_target_does_not_define_is_refused_before_the_plugin_runs() {
+    let plugin = stand_in();
+    let result = on_wasm_thread(move || -> Result<_, CompilerHostError> {
+        let mut host = CompilerHost::new(&plugin, workers(1))?;
+        host.compile(b"curl", TARGET, "x86-64-v9", CompileHint::Performance)
+    })
+    .expect("the driver thread runs");
+    match result {
+        Err(CompilerHostError::IsaLevel(IsaLevelError::UnknownLevel { name, defined })) => {
+            assert_eq!(name, "x86-64-v9");
+            assert!(defined.contains(ISA_LEVEL), "{defined}");
+        }
+        other => panic!("expected an unknown ISA level, got {other:?}"),
+    }
+}
+
+#[test]
 fn a_rejected_request_carries_the_plugins_diagnostic() {
     let results =
         compile_all(stand_in(), workers(2), vec![Vec::new()]).expect("the stand-in is hosted");
@@ -80,7 +102,7 @@ fn a_response_in_another_abi_version_is_refused() {
         compile_all(stand_in(), workers(2), vec![vec![2]]).expect("the stand-in is hosted");
     match results.into_iter().next().expect("one result") {
         Err(CompilerHostError::AbiMismatch { found, expected }) => {
-            assert_eq!((found, expected), (99, 2));
+            assert_eq!((found, expected), (99, 3));
         }
         other => panic!("expected an ABI mismatch, got {other:?}"),
     }
@@ -181,6 +203,8 @@ fn the_resident_binary_answers_one_line_per_request() {
             .args([
                 "--target",
                 TARGET,
+                "--isa-level",
+                ISA_LEVEL,
                 "--hint",
                 "performance",
                 "--workers",
