@@ -20,8 +20,9 @@
 //! preferred timing is a better answer than the geometry the host
 //! happens to have published. The 3D features — `VIRTIO_GPU_F_VIRGL`,
 //! `VIRTIO_GPU_F_RESOURCE_BLOB`, `VIRTIO_GPU_F_CONTEXT_INIT`,
-//! `VIRTIO_GPU_F_RESOURCE_UUID` — are asked for only where the device
-//! offers them, and the rendering half they open up lives in
+//! `VIRTIO_GPU_F_RESOURCE_UUID`, `VIRTIO_GPU_F_BLOB_ALIGNMENT` — are
+//! asked for only where the device offers them, and the rendering half
+//! they open up lives in
 //! [`render`]. A device that offers no renderer negotiates exactly what
 //! a 2D-only driver did, which is what the boot line's `3d=none` says.
 //!
@@ -55,8 +56,9 @@ use async_lock::Mutex as AsyncMutex;
 use spin::Mutex;
 
 use helios_hal::display::{
-    CursorImage, DisplayError, DisplayMode, DisplayResult, FramebufferId, MAX_BACKING_RANGES,
-    MAX_SCANOUTS, PixelFormat, Point, Rect, ScanoutId, ScanoutInfo, ScanoutList,
+    BlobId, BlobScanout, CursorImage, DisplayError, DisplayMode, DisplayResult, FramebufferId,
+    MAX_BACKING_RANGES, MAX_SCANOUTS, PixelFormat, Point, Rect, ScanoutId, ScanoutInfo,
+    ScanoutList,
 };
 use helios_hal::io::{IoError, IoResult};
 use helios_hal::iommu::PhysicalRange;
@@ -113,6 +115,9 @@ const CONFIG_EVENTS_READ: usize = 0;
 const CONFIG_EVENTS_CLEAR: usize = 4;
 const CONFIG_NUM_SCANOUTS: usize = 8;
 const CONFIG_NUM_CAPSETS: usize = 12;
+/// `blob_alignment`, present only under `VIRTIO_GPU_F_BLOB_ALIGNMENT`
+/// (Linux `include/uapi/linux/virtio_gpu.h`).
+const CONFIG_BLOB_ALIGNMENT: usize = 16;
 
 /// `VIRTIO_GPU_EVENT_DISPLAY`: the set of scanouts changed.
 const EVENT_DISPLAY: u32 = 1 << 0;
@@ -355,6 +360,10 @@ enum GpuChange {
 struct RequestSubject {
     scanout: Option<ScanoutId>,
     framebuffer: Option<FramebufferId>,
+    /// A blob a scanout is pointed at or flushed from. A resource id
+    /// like a frame buffer's, named apart so a refusal says which table
+    /// the caller has to look in.
+    blob: Option<BlobId>,
 }
 
 impl RequestSubject {
@@ -362,20 +371,21 @@ impl RequestSubject {
         Self {
             scanout: None,
             framebuffer: None,
+            blob: None,
         }
     }
 
     const fn scanout(scanout: ScanoutId) -> Self {
         Self {
             scanout: Some(scanout),
-            framebuffer: None,
+            ..Self::none()
         }
     }
 
     const fn framebuffer(framebuffer: FramebufferId) -> Self {
         Self {
-            scanout: None,
             framebuffer: Some(framebuffer),
+            ..Self::none()
         }
     }
 
@@ -383,6 +393,22 @@ impl RequestSubject {
         Self {
             scanout: Some(scanout),
             framebuffer: Some(framebuffer),
+            blob: None,
+        }
+    }
+
+    const fn blob(blob: BlobId) -> Self {
+        Self {
+            blob: Some(blob),
+            ..Self::none()
+        }
+    }
+
+    const fn scanout_blob(scanout: ScanoutId, blob: BlobId) -> Self {
+        Self {
+            scanout: Some(scanout),
+            framebuffer: None,
+            blob: Some(blob),
         }
     }
 }
@@ -412,8 +438,8 @@ pub struct VirtioGpuDevice<T: VirtioTransport> {
     /// Next context id to hand out. Context zero is the device's own
     /// "no context", so the counter starts at one and never reuses.
     next_context: AtomicU32,
-    /// The renderer contexts this device holds, and where each one's
-    /// completion timeline has reached.
+    /// The renderer contexts this device holds, and where each of their
+    /// rings has reached.
     contexts: Mutex<render::ContextRecords>,
     /// The blob resources this device holds, and where in the aperture
     /// each mapped one sits.
@@ -426,6 +452,13 @@ pub struct VirtioGpuDevice<T: VirtioTransport> {
     /// mapped. Absent on a device that publishes no such window, which
     /// is every device with no renderer.
     host_visible: Option<PhysicalRange>,
+    /// The alignment every blob size is rounded to: what the device
+    /// publishes under `VIRTIO_GPU_F_BLOB_ALIGNMENT`, and one — no
+    /// requirement — on a device that does not offer it.
+    blob_alignment: u64,
+    /// The alignment every aperture offset and placement is rounded to:
+    /// the larger of [`render::APERTURE_ALIGN`] and the blob alignment.
+    aperture_align: u64,
     /// What the device has acknowledged, which a reset device has to be
     /// told again. A spin lock held for a copy or one update, never
     /// across a call into a queue.
@@ -489,6 +522,21 @@ impl<T: VirtioTransport> VirtioGpuDevice<T> {
             ));
         }
         let capset_count = transport.read_config_u32(CONFIG_NUM_CAPSETS);
+        // Without the feature the device states no alignment, and the
+        // specification then imposes none: a blob is asked for at the
+        // size its caller gave.
+        let blob_alignment = if features.device(render::GPU_FEATURE_BLOB_ALIGNMENT) {
+            let published = transport.read_config_u32(CONFIG_BLOB_ALIGNMENT);
+            if !published.is_power_of_two() {
+                return Err(IoError::InvalidDeviceConfig(
+                    "virtio-gpu publishes a blob alignment that is not a power of two",
+                ));
+            }
+            u64::from(published)
+        } else {
+            1
+        };
+        let aperture_align = blob_alignment.max(render::APERTURE_ALIGN);
 
         transport.set_status(
             DeviceStatus::ACKNOWLEDGE
@@ -521,6 +569,8 @@ impl<T: VirtioTransport> VirtioGpuDevice<T> {
             blobs: Mutex::new(ArrayVec::new()),
             fences_signalled: Notify::new(),
             host_visible,
+            blob_alignment,
+            aperture_align,
             restorable: Mutex::new(Restorable::new()),
             commands: Journal::new(),
             cursor_commands: Journal::new(),
@@ -1243,6 +1293,14 @@ impl<T: VirtioTransport> helios_hal::display::DisplayDevice for VirtioGpuDevice<
         .await
     }
 
+    async fn set_scanout_blob(&self, scanout: ScanoutId, layout: BlobScanout) -> DisplayResult<()> {
+        self.scanout_blob(scanout, layout).await
+    }
+
+    async fn flush_blob(&self, blob: BlobId, region: Rect) -> DisplayResult<()> {
+        self.flush_blob_region(blob, region).await
+    }
+
     async fn blank_scanout(&self, scanout: ScanoutId) -> DisplayResult<()> {
         // virtio-gpu spells "show nothing" as a `SET_SCANOUT` naming the
         // reserved resource id and an empty rectangle (virtio 1.2
@@ -1623,6 +1681,12 @@ fn check_response(response: &[u8], expected: u32, subject: RequestSubject) -> Di
                 ..
             },
         ) => DisplayError::UnknownFramebuffer(framebuffer),
+        (
+            RESP_ERR_INVALID_RESOURCE_ID,
+            RequestSubject {
+                blob: Some(blob), ..
+            },
+        ) => DisplayError::UnknownBlob(blob),
         (code, _) => DisplayError::UnexpectedResponse { code },
     })
 }

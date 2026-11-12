@@ -4,11 +4,11 @@
 //! the 2D half owns scanouts and a cursor plane, this half owns what a
 //! host renderer needs to be driven: the capability sets the host
 //! publishes, the contexts a guest opens against one of them, the blob
-//! resources a context works on, and the fences that say a submission
-//! has been consumed.
+//! resources a context works on, and the fences that say the work
+//! before a point on one of a context's rings has been consumed.
 //!
 //! Nothing here interprets a byte. A capability set is read out of the
-//! device and handed on; a command buffer is put on the wire exactly as
+//! device and handed on; a command stream is put on the wire exactly as
 //! the guest wrote it. The driver's whole job is to move those bytes,
 //! to place a host allocation in the engine's aperture when asked, and
 //! to say when a fence has passed.
@@ -21,17 +21,34 @@
 //! shared-memory region [`SHM_ID_HOST_VISIBLE`], and this module hands
 //! out offsets inside it. A device that publishes no such region maps
 //! nothing, and says so, rather than being handed an address it does
-//! not answer on.
+//! not answer on. The region a mapping is reported as carries the
+//! memory type the host's `map_info` answer names.
+//!
+//! # Blob sizes
+//!
+//! A device that offers `VIRTIO_GPU_F_BLOB_ALIGNMENT` publishes the
+//! alignment every blob size and every aperture offset must have in its
+//! configuration space, and the driver rounds both to it. A device that
+//! does not — QEMU's, among them — states no requirement, and the
+//! specification then imposes none: the size is asked for as the
+//! caller gave it, which is what Linux (`verify_blob` checks the
+//! alignment only under the feature) and Mesa (`blob_alignment = 1`
+//! unless the kernel reports one) do too.
 //!
 //! # Fences
 //!
-//! A fenced command is answered by the device only once its fence has
-//! passed (virtio 1.2 §5.7.6.6), so the used-ring completion *is* the
-//! fence signal and there is no second path to keep in step with it.
-//! [`super::VirtioGpuDevice::submit`] records the fence on its
-//! context's timeline the moment the completion arrives — before the
-//! response code is looked at, so a command the device refuses still
-//! retires its fence — and wakes every reader of that timeline.
+//! Every fenced command carries `VIRTIO_GPU_FLAG_INFO_RING_IDX` and the
+//! ring it is a point on, so the device creates a *context* fence: one
+//! the host retires against that context's ring alone, never against a
+//! device-wide timeline another context also advances. A fenced command
+//! is answered by the device only once its fence has passed (virtio
+//! 1.2 §5.7.6.6), so the used-ring completion *is* the fence signal and
+//! there is no second path to keep in step with it.
+//! [`super::VirtioGpuDevice::submit`] records the fence on its context's
+//! ring the moment the completion arrives — before the response code is
+//! looked at, so a command the device refuses still retires its fence —
+//! and wakes every reader. An unfenced command carries neither flag and
+//! is answered as soon as the host has processed it.
 //!
 //! # Concurrency contract
 //!
@@ -39,10 +56,12 @@
 //! processor. Commands go up the same shared control queue the 2D half
 //! uses, through the same `submit_chain` / `await_completion` pair, so
 //! the queue lock is held only long enough to publish a chain and never
-//! across an await. The context table and the blob table are spin
-//! mutexes over fixed arrays, taken for a lookup or an insertion and
-//! never held across an await; the fence notification is a broadcast,
-//! armed by a reader before it re-reads the timeline it is following.
+//! across an await; a submission reports through its `posted` callback
+//! the moment its chain is in the ring, outside that lock. The context
+//! table and the blob table are spin mutexes over fixed arrays, taken
+//! for a lookup or an insertion and never held across an await; the
+//! fence notification is a broadcast, armed by a reader before it
+//! re-reads the ring it is following.
 
 use core::sync::atomic::Ordering;
 
@@ -50,17 +69,21 @@ use arrayvec::ArrayVec;
 
 use helios_hal::device::{DeviceRegion, DeviceRegionAttributes};
 use helios_hal::display::{
-    BlobId, BlobMemory, BlobRequest, BlobUsage, CapsetId, CapsetInfo, CapsetList, ContextId,
-    ContextName, FenceId, Gpu3d, Gpu3dError, Gpu3dResult, MAX_BACKING_RANGES, MAX_CONTEXT_NAME,
+    BlobCaching, BlobId, BlobMemory, BlobRequest, BlobScanout, BlobUsage, CapsetId, CapsetInfo,
+    CapsetList, CommandStream, ContextId, ContextName, DisplayError, DisplayResult, FenceId,
+    FramebufferId, Gpu3d, Gpu3dError, Gpu3dResult, Gpu3dTable, MAX_BACKING_RANGES,
+    MAX_CONTEXT_NAME, MAX_RINGS, Rect, RingCount, RingIndex, ScanoutId, Submission,
 };
 use helios_hal::io::IoError;
 use helios_hal::iommu::PhysicalRange;
 
+use crate::inflight::{await_completion, submit_chain_with_payload};
 use crate::transport::VirtioTransport;
 
 use super::{
     CTRL_HEADER_BYTES, MemEntryError, RESP_ERR_OUT_OF_MEMORY, RESP_ERR_UNSPEC, RESP_OK_NODATA,
-    VirtioGpuDevice, encode_mem_entries, write_header,
+    RequestSubject, VirtioGpuDevice, encode_mem_entries, encode_resource_flush, wire_format,
+    write_header, write_rect,
 };
 
 /// `VIRTIO_GPU_F_VIRGL`: the device carries a host renderer, and every
@@ -73,8 +96,13 @@ pub(super) const GPU_FEATURE_RESOURCE_UUID: u64 = 1 << 2;
 /// the guest's, or both, rather than a 2D surface.
 pub(super) const GPU_FEATURE_RESOURCE_BLOB: u64 = 1 << 3;
 /// `VIRTIO_GPU_F_CONTEXT_INIT`: a context names the renderer it is for
-/// when it is created, instead of every context being virgl's.
+/// when it is created, and its fences may name a ring.
 pub(super) const GPU_FEATURE_CONTEXT_INIT: u64 = 1 << 4;
+/// `VIRTIO_GPU_F_BLOB_ALIGNMENT`: the device publishes, in
+/// `virtio_gpu_config.blob_alignment`, the alignment every blob size and
+/// every mapping offset must have (Linux
+/// `include/uapi/linux/virtio_gpu.h`).
+pub(super) const GPU_FEATURE_BLOB_ALIGNMENT: u64 = 1 << 5;
 
 /// `VIRTIO_GPU_SHM_ID_UNDEFINED`: no region (virtio 1.2 §5.7.4). Named
 /// so the id a driver must never ask for is written down beside the
@@ -94,25 +122,25 @@ const _: () = assert!(
     "the host-visible aperture id is not the undefined id"
 );
 
-/// Contexts one device holds at once.
+/// Contexts one device holds at once, across every instance that renders.
 ///
-/// One kernel plugin owns the renderer and opens a context per thing it
-/// is driving — a Vulkan device, a media session — so the bound is what
-/// keeps the table a value rather than an allocation whose size a guest
-/// chooses.
-pub(super) const MAX_CONTEXTS: usize = 8;
+/// The kernel's own machine-wide bound is what a caller meets first;
+/// this is what keeps the driver's table a value rather than an
+/// allocation whose size a guest chooses.
+pub(super) const MAX_CONTEXTS: usize = 32;
 
-/// Blob resources one device holds at once.
-pub(super) const MAX_BLOBS: usize = 64;
+/// Blob resources one device holds at once, across every instance.
+pub(super) const MAX_BLOBS: usize = 128;
 
-/// Alignment every aperture offset is rounded to.
+/// Alignment every aperture offset is rounded to, at the least.
 ///
 /// The aperture is mapped into a guest's address space by the kernel,
 /// at whatever granule that address space changes mappings at, and the
 /// driver does not know which. 64 KiB is the largest granule any
 /// Helios target maps at, so an offset aligned to it is aligned for
 /// every one of them; a smaller alignment would hand back a region
-/// whose first page carried another blob's bytes.
+/// whose first page carried another blob's bytes. A device whose own
+/// blob alignment is larger raises it.
 pub(super) const APERTURE_ALIGN: u64 = 64 << 10;
 
 /// Bytes one submission carries.
@@ -127,11 +155,18 @@ pub(super) const MAX_COMMAND_BYTES: u64 = 4 << 20;
 /// `VIRTIO_GPU_FLAG_FENCE`: the device answers this command only once
 /// its fence has passed.
 pub(super) const CTRL_FLAG_FENCE: u32 = 1 << 0;
+/// `VIRTIO_GPU_FLAG_INFO_RING_IDX`: the header's `ring_idx` names the
+/// context ring the fence is a point on.
+pub(super) const CTRL_FLAG_INFO_RING_IDX: u32 = 1 << 1;
+/// Where `ring_idx` sits in `struct virtio_gpu_ctrl_hdr`: after the
+/// type, the flags, the fence id and the context id.
+pub(super) const CTRL_RING_IDX_OFFSET: usize = 20;
 
 /// Command codes of the 3D block (virtio 1.2 §5.7.6.7).
 pub(super) const CMD_GET_CAPSET_INFO: u32 = 0x0108;
 pub(super) const CMD_GET_CAPSET: u32 = 0x0109;
 pub(super) const CMD_RESOURCE_CREATE_BLOB: u32 = 0x010c;
+pub(super) const CMD_SET_SCANOUT_BLOB: u32 = 0x010d;
 pub(super) const CMD_CTX_CREATE: u32 = 0x0200;
 pub(super) const CMD_CTX_DESTROY: u32 = 0x0201;
 pub(super) const CMD_CTX_ATTACH_RESOURCE: u32 = 0x0202;
@@ -175,6 +210,11 @@ pub(super) const RESP_MAP_INFO_BYTES: usize = CTRL_HEADER_BYTES + 8;
 /// `struct virtio_gpu_resource_unmap_blob`: a resource id and its
 /// padding.
 const UNMAP_BLOB_BYTES: usize = CTRL_HEADER_BYTES + 8;
+/// `struct virtio_gpu_set_scanout_blob`: a rectangle, the scanout and
+/// resource ids, the frame's width, height and format, padding, and
+/// four strides and four offsets of which a single-plane frame uses the
+/// first.
+pub(super) const SET_SCANOUT_BLOB_BYTES: usize = CTRL_HEADER_BYTES + 16 + 24 + 16 + 16;
 
 /// `VIRTIO_GPU_BLOB_MEM_*`: whose memory a blob's storage is.
 pub(super) const BLOB_MEM_GUEST: u32 = 0x0001;
@@ -182,21 +222,28 @@ pub(super) const BLOB_MEM_HOST3D: u32 = 0x0002;
 pub(super) const BLOB_MEM_HOST3D_GUEST: u32 = 0x0003;
 
 /// `VIRTIO_GPU_MAP_CACHE_*`: how the host requires a mapped blob to be
-/// accessed. The kernel maps the aperture as ordinary memory, so a host
-/// that requires anything else is refused rather than mapped wrongly.
-const MAP_CACHE_NONE: u32 = 0x0000;
-pub(super) const MAP_CACHE_CACHED: u32 = 0x0001;
+/// accessed, in the low four bits (`VIRTIO_GPU_MAP_CACHE_MASK`) of the
+/// `map_info` answer. `NONE` states no requirement, and an ordinary
+/// cacheable mapping meets it.
+const MAP_CACHE_MASK: u32 = 0x0f;
+const MAP_CACHE_NONE: u32 = 0x00;
+pub(super) const MAP_CACHE_CACHED: u32 = 0x01;
+pub(super) const MAP_CACHE_UNCACHED: u32 = 0x02;
+pub(super) const MAP_CACHE_WC: u32 = 0x03;
 
-/// One context the device holds, and where its completion timeline has
+/// One context the device holds, and where each of its rings has
 /// reached.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ContextRecord {
     pub(super) id: ContextId,
     /// The renderer this context speaks to.
     pub(super) capset: CapsetId,
-    /// The highest fence the device has retired on it. Increasing, so a
-    /// reader that passes back what it last saw never misses one.
-    pub(super) signalled: FenceId,
+    /// How many rings it was created with.
+    pub(super) rings: RingCount,
+    /// The highest fence the device has retired on each ring. Increasing
+    /// per ring, so a reader that passes back what it last saw never
+    /// misses one; the entries past `rings` stay at the start.
+    pub(super) signalled: [FenceId; MAX_RINGS],
 }
 
 /// One blob the device holds, and where it sits in the aperture.
@@ -204,9 +251,12 @@ pub(super) struct ContextRecord {
 pub(super) struct BlobRecord {
     pub(super) id: BlobId,
     pub(super) context: ContextId,
-    /// How many bytes the resource covers, rounded up to the alignment
-    /// every aperture offset takes.
-    pub(super) bytes: u64,
+    /// How many bytes the device was asked for: the caller's size
+    /// rounded up to the device's blob alignment.
+    pub(super) size: u64,
+    /// How many bytes a placement takes in the aperture: `size` rounded
+    /// up to the alignment every aperture offset takes.
+    pub(super) span: u64,
     pub(super) usage: BlobUsage,
     /// Where in the aperture it is placed, once it has been mapped.
     pub(super) placed_at: Option<u64>,
@@ -244,7 +294,7 @@ impl<T: VirtioTransport> VirtioGpuDevice<T> {
     }
 
     /// The record for `blob`.
-    fn blob_record(&self, blob: BlobId) -> Gpu3dResult<BlobRecord> {
+    pub(super) fn blob_record(&self, blob: BlobId) -> Gpu3dResult<BlobRecord> {
         if !self.renders() {
             return Err(Gpu3dError::Unsupported);
         }
@@ -256,22 +306,23 @@ impl<T: VirtioTransport> VirtioGpuDevice<T> {
             .ok_or(Gpu3dError::UnknownBlob(blob))
     }
 
-    /// Records that `fence` has retired on `context` and wakes every
-    /// reader of that timeline.
+    /// Records that `fence` has retired on `context`'s `ring` and wakes
+    /// every reader.
     ///
     /// Called on the completion of a fenced command whatever the device
     /// answered, so a reader is never left waiting for a point the
     /// device has already decided will not come.
-    fn retire_fence(&self, context: ContextId, fence: FenceId) {
+    fn retire_fence(&self, context: ContextId, ring: RingIndex, fence: FenceId) {
         {
             let mut contexts = self.contexts.lock();
             let Some(record) = contexts.iter_mut().find(|record| record.id == context) else {
                 return;
             };
-            if fence <= record.signalled {
+            let signalled = &mut record.signalled[ring.index()];
+            if fence <= *signalled {
                 return;
             }
-            record.signalled = fence;
+            *signalled = fence;
         }
         // Outside the lock: a waker runs executor code, and no executor
         // may be entered from inside a spin mutex.
@@ -281,14 +332,14 @@ impl<T: VirtioTransport> VirtioGpuDevice<T> {
     /// Reserves a span of the host-visible aperture for `blob` and
     /// records where it landed, under the one lock hold.
     ///
-    /// First fit over the blobs already placed, at
-    /// [`APERTURE_ALIGN`]. The set is bounded by [`MAX_BLOBS`], so the
-    /// scan is bounded too, and a caller that has filled the aperture
-    /// is told rather than handed an overlapping offset. The record is
-    /// written before the lock is let go — reserve and record are the
-    /// same critical section — so a `map_blob` that starts while this
-    /// one's device round trip is still in flight already sees the span
-    /// as taken, and two calls can never be handed the same offset.
+    /// First fit over the blobs already placed, at the aperture's
+    /// alignment. The set is bounded by [`MAX_BLOBS`], so the scan is
+    /// bounded too, and a caller that has filled the aperture is told
+    /// rather than handed an overlapping offset. The record is written
+    /// before the lock is let go — reserve and record are the same
+    /// critical section — so a `map_blob` that starts while this one's
+    /// device round trip is still in flight already sees the span as
+    /// taken, and two calls can never be handed the same offset.
     fn reserve_aperture(&self, blob: BlobId, bytes: u64) -> Gpu3dResult<u64> {
         let aperture = self.host_visible.ok_or(Gpu3dError::ApertureExhausted)?;
         let mut blobs = self.blobs.lock();
@@ -310,12 +361,12 @@ impl<T: VirtioTransport> VirtioGpuDevice<T> {
             }
             let clash = blobs
                 .iter()
-                .filter_map(|record| record.placed_at.map(|at| (at, record.bytes)))
+                .filter_map(|record| record.placed_at.map(|at| (at, record.span)))
                 .find(|(at, held)| candidate < at + held && *at < end);
             match clash {
                 Some((at, held)) => {
                     candidate = (at + held)
-                        .checked_next_multiple_of(APERTURE_ALIGN)
+                        .checked_next_multiple_of(self.aperture_align)
                         .ok_or(Gpu3dError::ApertureExhausted)?;
                 }
                 None => {
@@ -384,7 +435,7 @@ impl<T: VirtioTransport> Gpu3d for VirtioGpuDevice<T> {
                 // table holds. Answering with the ones that were read
                 // would be wrong in a way a caller cannot see.
                 return Err(Gpu3dError::TooMany {
-                    resource: "capability sets",
+                    table: Gpu3dTable::Capsets,
                     limit: capsets.capacity(),
                 });
             }
@@ -422,9 +473,21 @@ impl<T: VirtioTransport> Gpu3d for VirtioGpuDevice<T> {
         Ok((written as usize) - CTRL_HEADER_BYTES)
     }
 
-    async fn create_context(&self, capset: CapsetId, name: ContextName) -> Gpu3dResult<ContextId> {
+    async fn create_context(
+        &self,
+        capset: CapsetId,
+        rings: RingCount,
+        name: ContextName,
+    ) -> Gpu3dResult<ContextId> {
         if !self.renders() {
             return Err(Gpu3dError::Unsupported);
+        }
+        // A context of more than the CPU ring names its fences by ring,
+        // and only a device that negotiated context-init reads the
+        // header's ring index; on any other, every fence would land on
+        // one device-wide timeline whatever ring it named.
+        if rings != RingCount::ONE && !self.context_init_supported() {
+            return Err(Gpu3dError::InvalidParameter);
         }
         // Which capability sets exist is the caller's to know — it read
         // them — and a context type the host does not speak is refused
@@ -441,14 +504,15 @@ impl<T: VirtioTransport> Gpu3d for VirtioGpuDevice<T> {
             let mut contexts = self.contexts.lock();
             if contexts.is_full() {
                 return Err(Gpu3dError::TooMany {
-                    resource: "contexts",
+                    table: Gpu3dTable::Contexts,
                     limit: MAX_CONTEXTS,
                 });
             }
             contexts.push(ContextRecord {
                 id: context,
                 capset,
-                signalled: FenceId::START,
+                rings,
+                signalled: [FenceId::START; MAX_RINGS],
             });
         }
         let request = encode_ctx_create(context, capset, &name, self.context_init_supported());
@@ -482,7 +546,7 @@ impl<T: VirtioTransport> Gpu3d for VirtioGpuDevice<T> {
         )
         .await?;
         // Only once the renderer has let it go: until then a fence may
-        // still retire on this timeline.
+        // still retire on one of its rings.
         self.contexts.lock().retain(|held| held.id != context);
         Ok(())
     }
@@ -504,33 +568,42 @@ impl<T: VirtioTransport> Gpu3d for VirtioGpuDevice<T> {
         if !request.is_coherent() {
             return Err(Gpu3dError::InvalidBlob);
         }
+        let size = request
+            .size
+            .checked_next_multiple_of(self.blob_alignment)
+            .ok_or(Gpu3dError::InvalidBlob)?;
+        // A guest-backed blob's pages are the resource, so the size the
+        // device is told must not reach past them once it is rounded.
+        if request.memory.is_guest_backed() && size > request.backing_bytes() {
+            return Err(Gpu3dError::InvalidBlob);
+        }
+        let span = size
+            .checked_next_multiple_of(self.aperture_align)
+            .ok_or(Gpu3dError::InvalidBlob)?;
         let entries = encode_mem_entries(request.backing).map_err(|error| match error {
             MemEntryError::Empty => Gpu3dError::InvalidBlob,
             MemEntryError::Unrepresentable => IoError::DeviceFault.into(),
         })?;
-        let bytes = request
-            .size
-            .checked_next_multiple_of(APERTURE_ALIGN)
-            .ok_or(Gpu3dError::InvalidBlob)?;
 
         let blob = BlobId::new(self.next_resource.fetch_add(1, Ordering::Relaxed));
         {
             let mut blobs = self.blobs.lock();
             if blobs.is_full() {
                 return Err(Gpu3dError::TooMany {
-                    resource: "blobs",
+                    table: Gpu3dTable::Blobs,
                     limit: MAX_BLOBS,
                 });
             }
             blobs.push(BlobRecord {
                 id: blob,
                 context,
-                bytes,
+                size,
+                span,
                 usage: request.usage,
                 placed_at: None,
             });
         }
-        let create = encode_create_blob(blob, &request, request.backing.len());
+        let create = encode_create_blob(blob, &request, size, request.backing.len());
         let mut response = [0_u8; CTRL_HEADER_BYTES];
         let inputs: [&[u8]; 2] = [&create, &entries];
         let inputs = if entries.is_empty() {
@@ -563,10 +636,8 @@ impl<T: VirtioTransport> Gpu3d for VirtioGpuDevice<T> {
             // whatever the renderer put there next.
             return Err(Gpu3dError::NotMappable(blob));
         }
-        let request = super::encode_resource_only(
-            super::CMD_RESOURCE_UNREF,
-            helios_hal::display::FramebufferId::new(blob.raw()),
-        );
+        let request =
+            super::encode_resource_only(super::CMD_RESOURCE_UNREF, FramebufferId::new(blob.raw()));
         let mut response = [0_u8; CTRL_HEADER_BYTES];
         self.render_command(
             &[&request],
@@ -588,7 +659,7 @@ impl<T: VirtioTransport> Gpu3d for VirtioGpuDevice<T> {
         // Chosen and recorded under the one lock hold, before the device
         // is told, so a `map_blob` running at the same time is handed a
         // different span rather than this one.
-        let offset = self.reserve_aperture(blob, record.bytes)?;
+        let offset = self.reserve_aperture(blob, record.span)?;
 
         let request = encode_map_blob(blob, offset);
         let mut response = [0_u8; RESP_MAP_INFO_BYTES];
@@ -609,22 +680,21 @@ impl<T: VirtioTransport> Gpu3d for VirtioGpuDevice<T> {
                 .try_into()
                 .expect("a four-byte window of a fixed-size response"),
         );
-        if map_info != MAP_CACHE_NONE && map_info != MAP_CACHE_CACHED {
-            // The host wants this span accessed uncached or
-            // write-combining, and the kernel maps the aperture as
-            // ordinary memory. Mapping it anyway would be a silent
-            // disagreement about coherency between the renderer and
-            // whoever reads the blob.
+        let Some(caching) = decode_map_caching(map_info) else {
+            // A caching mode the specification gives no meaning to: the
+            // placement is taken back rather than shown under a guess.
             self.unmap_blob_at(blob).await?;
-            return Err(Gpu3dError::UnsupportedCaching { map_info });
-        }
+            return Err(Gpu3dError::UnknownCaching { map_info });
+        };
+        let attributes = match caching {
+            BlobCaching::Cached => DeviceRegionAttributes::PREFETCHABLE_MEMORY,
+            BlobCaching::Uncached => DeviceRegionAttributes::UNCACHED_MEMORY,
+            BlobCaching::WriteCombining => DeviceRegionAttributes::WRITE_COMBINING_MEMORY,
+        };
+        debug_assert_eq!(attributes.kind, caching.memory_kind());
         Ok(DeviceRegion::new(
-            PhysicalRange::new(aperture.start + offset, record.bytes),
-            // Normal memory, not a register file: the bytes behind a
-            // mapped blob are a renderer's buffer, with no read side
-            // effects and nothing that ordering rules have to be
-            // relaxed for.
-            DeviceRegionAttributes::PREFETCHABLE_MEMORY,
+            PhysicalRange::new(aperture.start + offset, record.span),
+            attributes,
         ))
     }
 
@@ -646,32 +716,65 @@ impl<T: VirtioTransport> Gpu3d for VirtioGpuDevice<T> {
             .await
     }
 
-    async fn submit(
-        &self,
-        context: ContextId,
-        commands: PhysicalRange,
-        fence: FenceId,
-    ) -> Gpu3dResult<()> {
-        let record = self.context_record(context)?;
-        if commands.bytes == 0 || commands.bytes > MAX_COMMAND_BYTES {
-            return Err(Gpu3dError::CommandBufferLength {
-                bytes: commands.bytes,
+    async fn submit<'a, Posted>(
+        &'a self,
+        submission: Submission<'a>,
+        posted: &'a mut Posted,
+    ) -> Gpu3dResult<()>
+    where
+        Posted: FnMut() + Send,
+    {
+        let record = self.context_record(submission.context)?;
+        if !record.rings.contains(submission.ring) {
+            return Err(Gpu3dError::UnknownRing {
+                context: record.id,
+                ring: submission.ring,
             });
         }
-        let request = encode_submit_3d(record.id, commands.bytes, fence);
+        let bytes = submission.commands.bytes();
+        if bytes == 0 || bytes > MAX_COMMAND_BYTES {
+            return Err(Gpu3dError::CommandBufferLength { bytes });
+        }
+        let request = encode_submit_3d(record.id, bytes, submission.ring, submission.fence);
         let mut response = [0_u8; CTRL_HEADER_BYTES];
-        // The guest's pages go on the wire by address: the device reads
-        // the buffer where the guest wrote it, and this driver never
-        // holds a copy of a command stream.
-        let taken = self
-            .control_exchange_with_payload(&[&request], Some(commands), &mut [&mut response])
-            .await;
+        // The guest's pages go on the wire by address and a short stream
+        // from where the caller holds it: the device reads the bytes
+        // where they were written, and this driver never holds a copy of
+        // a command stream.
+        let (inline, payload): (&[u8], Option<PhysicalRange>) = match submission.commands {
+            CommandStream::Pages(range) => (&[], Some(range)),
+            CommandStream::Inline(bytes) => (bytes, None),
+        };
+        let inputs: [&[u8]; 2] = [&request, inline];
+        let inputs = if inline.is_empty() {
+            &inputs[..1]
+        } else {
+            &inputs[..]
+        };
+        let token = submit_chain_with_payload(
+            &self.control_inflight,
+            &self.control,
+            &self.transport,
+            inputs,
+            payload,
+            &mut [&mut response],
+        )
+        .await?;
+        // The chain is in the ring and the device notified: the caller
+        // may let its next command follow this one.
+        posted();
+        let taken = await_completion(&self.control_inflight, &self.control, token, || {
+            self.completions.notified()
+        })
+        .await;
         // The fence is retired before the answer is read, and whatever
         // the answer is: a fenced command is completed only once its
         // fence has passed, so the completion *is* the signal, and a
-        // reader of this context's timeline must not be left waiting on
-        // a command the device refused.
-        self.retire_fence(record.id, fence);
+        // reader of this ring must not be left waiting on a command the
+        // device refused.
+        if let Some(fence) = submission.fence {
+            self.retire_fence(record.id, submission.ring, fence);
+        }
         let written = taken?;
         if (written as usize) < CTRL_HEADER_BYTES {
             return Err(IoError::DeviceFault.into());
@@ -679,15 +782,24 @@ impl<T: VirtioTransport> Gpu3d for VirtioGpuDevice<T> {
         check_render_response(&response, RESP_OK_NODATA, RenderSubject::context(record.id))
     }
 
-    async fn fences(&self, context: ContextId, after: FenceId) -> Gpu3dResult<FenceId> {
+    async fn fences(
+        &self,
+        context: ContextId,
+        ring: RingIndex,
+        after: FenceId,
+    ) -> Gpu3dResult<FenceId> {
         loop {
-            // Armed before the timeline is read, so a fence that
-            // retires between the read and the park is observed by this
-            // future rather than slept through.
+            // Armed before the ring is read, so a fence that retires
+            // between the read and the park is observed by this future
+            // rather than slept through.
             let notified = self.fences_signalled.notified();
             let record = self.context_record(context)?;
-            if record.signalled > after {
-                return Ok(record.signalled);
+            if !record.rings.contains(ring) {
+                return Err(Gpu3dError::UnknownRing { context, ring });
+            }
+            let signalled = record.signalled[ring.index()];
+            if signalled > after {
+                return Ok(signalled);
             }
             notified.await;
         }
@@ -695,11 +807,12 @@ impl<T: VirtioTransport> Gpu3d for VirtioGpuDevice<T> {
 }
 
 impl<T: VirtioTransport> VirtioGpuDevice<T> {
-    /// Whether a context may name the renderer it is for.
+    /// Whether a context may name the renderer it is for, and its fences
+    /// a ring.
     ///
-    /// Without `VIRTIO_GPU_F_CONTEXT_INIT` every context is virgl's, so
-    /// the field stays zero and a caller asking for anything else is
-    /// refused before the command is built.
+    /// Without `VIRTIO_GPU_F_CONTEXT_INIT` every context is virgl's with
+    /// one timeline, so the field stays zero and a caller asking for
+    /// anything else is refused before the command is built.
     fn context_init_supported(&self) -> bool {
         self.features.device(GPU_FEATURE_CONTEXT_INIT)
     }
@@ -729,6 +842,80 @@ impl<T: VirtioTransport> VirtioGpuDevice<T> {
         Ok(())
     }
 
+    /// `SET_SCANOUT_BLOB`: points a scanout at a frame inside a blob.
+    ///
+    /// The layout is checked against the size the device was asked for,
+    /// which is the size it checks against too, so a frame that does not
+    /// fit is refused here with the numbers that say why rather than by
+    /// the device with an unspecified error.
+    pub(super) async fn scanout_blob(
+        &self,
+        scanout: ScanoutId,
+        layout: BlobScanout,
+    ) -> DisplayResult<()> {
+        if !self.features.device(GPU_FEATURE_RESOURCE_BLOB) {
+            return Err(DisplayError::BlobScanoutUnsupported);
+        }
+        let record = self.blob_display_record(layout.blob)?;
+        if !layout.fits_in(record.size) {
+            return Err(DisplayError::BlobLayout {
+                width: layout.mode.width,
+                height: layout.mode.height,
+                offset: layout.offset,
+                stride: layout.stride,
+                blob_bytes: record.size,
+            });
+        }
+        let request = encode_set_scanout_blob(scanout, layout);
+        // The blob replaces whatever frame buffer the scanout showed, so
+        // that one is shown no longer and may be destroyed. Nothing
+        // replays the blob itself: a device holding blobs refuses
+        // reinitialization.
+        self.acknowledged_command(
+            &request,
+            &[],
+            super::GpuChange::Scanout(scanout, None),
+            RequestSubject::scanout_blob(scanout, layout.blob),
+        )
+        .await
+    }
+
+    /// `RESOURCE_FLUSH` on a blob: the scanouts showing it re-read
+    /// `region`. There is no transfer first, because the blob's bytes
+    /// are already the device's.
+    pub(super) async fn flush_blob_region(&self, blob: BlobId, region: Rect) -> DisplayResult<()> {
+        if !self.features.device(GPU_FEATURE_RESOURCE_BLOB) {
+            return Err(DisplayError::BlobScanoutUnsupported);
+        }
+        let record = self.blob_display_record(blob)?;
+        let request = encode_resource_flush(FramebufferId::new(record.id.raw()), region);
+        self.display_command(&request, RequestSubject::blob(record.id))
+            .await
+    }
+
+    /// The blob record a display command names, in the display's error
+    /// vocabulary.
+    fn blob_display_record(&self, blob: BlobId) -> DisplayResult<BlobRecord> {
+        self.blobs
+            .lock()
+            .iter()
+            .find(|record| record.id == blob)
+            .copied()
+            .ok_or(DisplayError::UnknownBlob(blob))
+    }
+
+    /// One display-half command on a blob, answered with no data.
+    async fn display_command(&self, request: &[u8], subject: RequestSubject) -> DisplayResult<()> {
+        let mut response = [0_u8; CTRL_HEADER_BYTES];
+        let written = self
+            .control_exchange(&[request], &mut [&mut response])
+            .await?;
+        if (written as usize) < CTRL_HEADER_BYTES {
+            return Err(IoError::DeviceFault.into());
+        }
+        super::check_response(&response, RESP_OK_NODATA, subject)
+    }
+
     /// `CTX_ATTACH_RESOURCE` and `CTX_DETACH_RESOURCE` share a body.
     async fn context_resource(
         &self,
@@ -756,16 +943,31 @@ impl<T: VirtioTransport> VirtioGpuDevice<T> {
 /// The 3D bits are asked for only where the device offers a renderer:
 /// blob resources and context types are the renderer's vocabulary, and
 /// a driver that negotiated them against a device with no host renderer
-/// would have told it to expect commands nothing will ever send. A
-/// device that offers no `VIRTIO_GPU_F_VIRGL` therefore negotiates
-/// exactly what it negotiated before this half of the driver existed.
+/// would have told it to expect commands nothing will ever send. The
+/// blob alignment is asked for only with the blob resources it is the
+/// alignment of. A device that offers no `VIRTIO_GPU_F_VIRGL` therefore
+/// negotiates exactly what a 2D-only driver does.
 pub(super) const fn wanted_features(offered: u64, base: u64) -> u64 {
     let mut wanted = base | (offered & GPU_FEATURE_RESOURCE_UUID);
     if offered & GPU_FEATURE_VIRGL != 0 {
         wanted |=
             GPU_FEATURE_VIRGL | (offered & (GPU_FEATURE_RESOURCE_BLOB | GPU_FEATURE_CONTEXT_INIT));
+        if offered & GPU_FEATURE_RESOURCE_BLOB != 0 {
+            wanted |= offered & GPU_FEATURE_BLOB_ALIGNMENT;
+        }
     }
     wanted
+}
+
+/// The caching mode a `map_info` answer names, or `None` for one the
+/// specification defines no meaning for.
+pub(super) const fn decode_map_caching(map_info: u32) -> Option<BlobCaching> {
+    match map_info & MAP_CACHE_MASK {
+        MAP_CACHE_NONE | MAP_CACHE_CACHED => Some(BlobCaching::Cached),
+        MAP_CACHE_UNCACHED => Some(BlobCaching::Uncached),
+        MAP_CACHE_WC => Some(BlobCaching::WriteCombining),
+        _ => None,
+    }
 }
 
 fn encode_get_capset_info(index: u32) -> [u8; GET_CAPSET_INFO_BYTES] {
@@ -789,7 +991,9 @@ fn encode_get_capset(id: CapsetId, version: u32) -> [u8; GET_CAPSET_BYTES] {
 /// The context type goes in `context_init` only where the device
 /// negotiated `VIRTIO_GPU_F_CONTEXT_INIT`; without it the field is
 /// reserved and every context is virgl's, which is what the caller has
-/// already been told by the capability set it selected.
+/// already been told by the capability set it selected. The ring count
+/// does not travel: the device creates a ring's timeline the first time
+/// a fence names it.
 fn encode_ctx_create(
     context: ContextId,
     capset: CapsetId,
@@ -797,7 +1001,7 @@ fn encode_ctx_create(
     context_init: bool,
 ) -> [u8; CTX_CREATE_BYTES] {
     let mut bytes = [0_u8; CTX_CREATE_BYTES];
-    write_render_header(&mut bytes, CMD_CTX_CREATE, 0, FenceId::START, context);
+    write_render_header(&mut bytes, CMD_CTX_CREATE, context);
     let body = &mut bytes[CTRL_HEADER_BYTES..];
     body[0..4].copy_from_slice(&(name.len() as u32).to_le_bytes());
     if context_init {
@@ -811,23 +1015,33 @@ fn encode_ctx_create(
 /// else.
 fn encode_context_only(command: u32, context: ContextId) -> [u8; CTRL_HEADER_BYTES] {
     let mut bytes = [0_u8; CTRL_HEADER_BYTES];
-    write_render_header(&mut bytes, command, 0, FenceId::START, context);
+    write_render_header(&mut bytes, command, context);
     bytes
 }
 
 fn encode_ctx_resource(command: u32, context: ContextId, blob: BlobId) -> [u8; CTX_RESOURCE_BYTES] {
     let mut bytes = [0_u8; CTX_RESOURCE_BYTES];
-    write_render_header(&mut bytes, command, 0, FenceId::START, context);
+    write_render_header(&mut bytes, command, context);
     bytes[CTRL_HEADER_BYTES..CTRL_HEADER_BYTES + 4].copy_from_slice(&blob.raw().to_le_bytes());
     bytes
 }
 
-fn encode_submit_3d(context: ContextId, length: u64, fence: FenceId) -> [u8; SUBMIT_3D_BYTES] {
+/// `SUBMIT_3D`: a fenced one names its ring and its fence and asks for
+/// a context fence; an unfenced one carries neither flag.
+fn encode_submit_3d(
+    context: ContextId,
+    length: u64,
+    ring: RingIndex,
+    fence: Option<FenceId>,
+) -> [u8; SUBMIT_3D_BYTES] {
     let mut bytes = [0_u8; SUBMIT_3D_BYTES];
-    write_render_header(&mut bytes, CMD_SUBMIT_3D, CTRL_FLAG_FENCE, fence, context);
+    write_render_header(&mut bytes, CMD_SUBMIT_3D, context);
+    if let Some(fence) = fence {
+        write_fence(&mut bytes, ring, fence);
+    }
     bytes[CTRL_HEADER_BYTES..CTRL_HEADER_BYTES + 4].copy_from_slice(
         &u32::try_from(length)
-            .expect("a command buffer is bounded by MAX_COMMAND_BYTES")
+            .expect("a command stream is bounded by MAX_COMMAND_BYTES")
             .to_le_bytes(),
     );
     bytes
@@ -836,16 +1050,11 @@ fn encode_submit_3d(context: ContextId, length: u64, fence: FenceId) -> [u8; SUB
 fn encode_create_blob(
     blob: BlobId,
     request: &BlobRequest<'_>,
+    size: u64,
     entries: usize,
 ) -> [u8; CREATE_BLOB_BYTES] {
     let mut bytes = [0_u8; CREATE_BLOB_BYTES];
-    write_render_header(
-        &mut bytes,
-        CMD_RESOURCE_CREATE_BLOB,
-        0,
-        FenceId::START,
-        request.context,
-    );
+    write_render_header(&mut bytes, CMD_RESOURCE_CREATE_BLOB, request.context);
     let body = &mut bytes[CTRL_HEADER_BYTES..];
     body[0..4].copy_from_slice(&blob.raw().to_le_bytes());
     body[4..8].copy_from_slice(&wire_blob_memory(request.memory).to_le_bytes());
@@ -855,8 +1064,8 @@ fn encode_create_blob(
             .expect("the range count is bounded by MAX_BACKING_RANGES")
             .to_le_bytes(),
     );
-    body[16..24].copy_from_slice(&request.host_id.to_le_bytes());
-    body[24..32].copy_from_slice(&request.size.to_le_bytes());
+    body[16..24].copy_from_slice(&request.blob_id.to_le_bytes());
+    body[24..32].copy_from_slice(&size.to_le_bytes());
     bytes
 }
 
@@ -876,20 +1085,41 @@ fn encode_unmap_blob(blob: BlobId) -> [u8; UNMAP_BLOB_BYTES] {
     bytes
 }
 
-/// `struct virtio_gpu_ctrl_hdr` for a 3D command: the type, the flags,
-/// the fence the device answers after, and the context the command
-/// belongs to.
-pub(super) fn write_render_header(
-    bytes: &mut [u8],
-    command: u32,
-    flags: u32,
-    fence: FenceId,
-    context: ContextId,
-) {
+/// `struct virtio_gpu_set_scanout_blob`: the whole frame as the source
+/// rectangle, and one plane whose stride and offset are the layout's.
+pub(super) fn encode_set_scanout_blob(
+    scanout: ScanoutId,
+    layout: BlobScanout,
+) -> [u8; SET_SCANOUT_BLOB_BYTES] {
+    let mut bytes = [0_u8; SET_SCANOUT_BLOB_BYTES];
+    write_header(&mut bytes, CMD_SET_SCANOUT_BLOB);
+    write_rect(&mut bytes[CTRL_HEADER_BYTES..], Rect::of(layout.mode));
+    let body = &mut bytes[CTRL_HEADER_BYTES + 16..];
+    body[0..4].copy_from_slice(&scanout.index().to_le_bytes());
+    body[4..8].copy_from_slice(&layout.blob.raw().to_le_bytes());
+    body[8..12].copy_from_slice(&layout.mode.width.to_le_bytes());
+    body[12..16].copy_from_slice(&layout.mode.height.to_le_bytes());
+    body[16..20].copy_from_slice(&wire_format(layout.format).to_le_bytes());
+    // `padding` at 20..24; then `strides[4]` and `offsets[4]`, of which
+    // a single-plane frame fills the first of each.
+    body[24..28].copy_from_slice(&layout.stride.to_le_bytes());
+    body[40..44].copy_from_slice(&layout.offset.to_le_bytes());
+    bytes
+}
+
+/// `struct virtio_gpu_ctrl_hdr` for a 3D command: the type and the
+/// context the command belongs to, with no fence.
+pub(super) fn write_render_header(bytes: &mut [u8], command: u32, context: ContextId) {
     bytes[0..4].copy_from_slice(&command.to_le_bytes());
-    bytes[4..8].copy_from_slice(&flags.to_le_bytes());
-    bytes[8..16].copy_from_slice(&fence.raw().to_le_bytes());
     bytes[16..20].copy_from_slice(&context.raw().to_le_bytes());
+}
+
+/// Marks a header fenced at `fence` on `ring`: the fence flag, the ring
+/// flag, the fence id and the ring index.
+fn write_fence(bytes: &mut [u8], ring: RingIndex, fence: FenceId) {
+    bytes[4..8].copy_from_slice(&(CTRL_FLAG_FENCE | CTRL_FLAG_INFO_RING_IDX).to_le_bytes());
+    bytes[8..16].copy_from_slice(&fence.raw().to_le_bytes());
+    bytes[CTRL_RING_IDX_OFFSET] = ring.raw();
 }
 
 const fn wire_blob_memory(memory: BlobMemory) -> u32 {

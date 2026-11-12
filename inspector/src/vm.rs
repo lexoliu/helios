@@ -99,6 +99,8 @@ pub(crate) enum VmError {
 pub(crate) enum VmConfigError {
     #[error("--release and --kernel-debug cannot be used together")]
     ReleaseWithKernelDebug,
+    #[error("renderer_hostmem sizes a renderer's aperture, and the VM config names no renderer")]
+    RendererHostmemWithoutRenderer,
     #[error(
         "--profile-generate builds its own optimised kernel and cannot be combined with \
          --release, --debug or --kernel-debug"
@@ -673,6 +675,24 @@ impl VmArch {
             Self::X86_64 => &X86_64_VM_PROFILE,
         }
     }
+
+    /// The cargo arguments that rebuild the standard crates this
+    /// architecture's kernel is compiled against, or none when the
+    /// precompiled ones are used.
+    ///
+    /// The aarch64 kernel is compiled with `-Zbranch-protection=pac-ret`
+    /// (`.cargo/config.toml`), which rustc treats as a target modifier: it
+    /// refuses to link a crate built with the flag against a `core`,
+    /// `alloc` or `compiler_builtins` built without it, and the sysroot
+    /// ships only the latter. Every kernel build for the architecture
+    /// passes these, so the Justfile's `build_std_flag` is the same
+    /// argument.
+    fn build_std_arguments(self) -> &'static [&'static str] {
+        match self {
+            Self::Aarch64 => &["-Zbuild-std=core,alloc"],
+            Self::Riscv64 | Self::X86_64 => &[],
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -804,6 +824,26 @@ pub(crate) enum VmGpuRenderer {
     #[value(name = "virtio-gpu-rutabaga")]
     #[serde(rename = "virtio-gpu-rutabaga")]
     Rutabaga,
+}
+
+/// A renderer a session asked for, and what the machine around it needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VmRendererConfig {
+    kind: VmGpuRenderer,
+    /// The size of the host-visible aperture a mappable blob is placed
+    /// in, in QEMU's size syntax (`256M`, `4G`): the most renderer
+    /// memory the guest can map at once.
+    hostmem: String,
+}
+
+impl VmRendererConfig {
+    /// The aperture a session gets when it names a renderer and no size.
+    /// QEMU's own `hostmem` default is zero (`DEFINE_PROP_SIZE("hostmem",
+    /// …, 0)` in `hw/display/virtio-gpu.c`), which leaves no aperture at
+    /// all, so a renderer session always names one; 256M is the low end
+    /// of the range QEMU's `docs/system/devices/virtio/virtio-gpu.rst`
+    /// gives for Venus ("typically between 256M and 8G").
+    const DEFAULT_HOSTMEM: &'static str = "256M";
 }
 
 /// How a profile exposes the guest's keyboard, tablet and mouse.
@@ -1280,7 +1320,7 @@ pub(crate) enum VmGuestRam {
     Prealloc,
 }
 
-/// The `-object` id of the preallocated RAM backend, which the machine
+/// The `-object` id of the guest RAM backend, which the machine
 /// names as its memory backend. It is the id the Fedora baseline gives
 /// its own (`GUEST_RAM_ID` in `tools/wasi-apps/fedora_qemu_baseline.py`),
 /// so the two guests' backends render alike.
@@ -1309,40 +1349,55 @@ impl ResolvedGuestRam {
                 .map_err(|source| VmConfigError::PreallocThreads { source }),
         }
     }
+}
 
-    /// The id of the `-object` the machine takes as its memory backend,
-    /// when the backing is not QEMU's default.
-    fn backend_id(self) -> Option<&'static str> {
-        match self {
-            Self::Lazy => None,
-            Self::Prealloc { .. } => Some(GUEST_RAM_ID),
+/// What a session's guest RAM is made of: the kind of `-object` and how
+/// it is populated. One backend carries it on an ordinary machine, and
+/// each node's backend on a NUMA machine.
+///
+/// A renderer session's RAM is a shared memfd: a guest blob reaches the
+/// host as a dmabuf QEMU builds out of the RAM block's file descriptor
+/// (`virtio_gpu_create_udmabuf` in `hw/display/virtio-gpu-udmabuf.c`,
+/// which gives up on a block with none), and a blob scanout of one needs
+/// that dmabuf. `--guest-ram prealloc` populates the backend before the
+/// first guest instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GuestRamBacking {
+    shared_memfd: bool,
+    guest_ram: ResolvedGuestRam,
+}
+
+impl GuestRamBacking {
+    fn of(command: &ResolvedVmCommand) -> Self {
+        Self {
+            shared_memfd: command.renderer.is_some(),
+            guest_ram: command.guest_ram,
         }
     }
 
-    /// The `-object` that backs guest RAM, when the backing is not
-    /// QEMU's default; `memory` is the `-m` size, which QEMU requires the
-    /// backend to match.
-    fn backend(self, memory: &str) -> Option<QemuOptions> {
-        let id = self.backend_id()?;
-        let mut backend = QemuOptions::new("memory-backend-ram");
-        backend.set("id", id).set("size", memory);
-        self.populate(&mut backend);
-        Some(backend)
+    /// Whether this is what QEMU gives a machine that names no backend:
+    /// anonymous memory, mapped lazily.
+    fn is_qemu_default(self) -> bool {
+        !self.shared_memfd && self.guest_ram == ResolvedGuestRam::Lazy
     }
 
-    /// Sets on a `memory-backend-ram` the options that back it this way:
-    /// nothing for QEMU's default, a population before the guest runs
-    /// for a preallocated one. A NUMA machine's node backends take them
-    /// as the single backend does.
-    fn populate(self, backend: &mut QemuOptions) {
-        match self {
-            Self::Lazy => {}
-            Self::Prealloc { prealloc_threads } => {
-                backend
-                    .set("prealloc", "on")
-                    .set("prealloc-threads", prealloc_threads);
-            }
+    /// The `-object` named `id` that backs `size` of guest RAM this way.
+    fn backend(self, id: impl std::fmt::Display, size: impl std::fmt::Display) -> QemuOptions {
+        let mut backend = QemuOptions::new(if self.shared_memfd {
+            "memory-backend-memfd"
+        } else {
+            "memory-backend-ram"
+        });
+        backend.set("id", id).set("size", size);
+        if self.shared_memfd {
+            backend.set("share", "on");
         }
+        if let ResolvedGuestRam::Prealloc { prealloc_threads } = self.guest_ram {
+            backend
+                .set("prealloc", "on")
+                .set("prealloc-threads", prealloc_threads);
+        }
+        backend
     }
 }
 
@@ -1561,6 +1616,8 @@ pub(crate) struct VmConfigFile {
     pub(crate) display: Option<VmDisplayBackend>,
     #[serde(default)]
     pub(crate) renderer: Option<VmGpuRenderer>,
+    #[serde(default)]
+    pub(crate) renderer_hostmem: Option<String>,
     #[serde(default)]
     pub(crate) audiodev: Option<String>,
     #[serde(default)]
@@ -1824,6 +1881,16 @@ pub(crate) struct VmCommand {
     /// with is refused by QEMU rather than swapped for another.
     #[arg(long, value_enum)]
     renderer: Option<VmGpuRenderer>,
+
+    /// The size of the renderer's host-visible aperture, the device's
+    /// `hostmem`, in QEMU's size syntax (`256M`, `4G`); 256M when a
+    /// renderer is named without one.
+    ///
+    /// A renderer session's guest RAM is also a shared memfd backend of
+    /// `--memory` bytes, which Venus needs to import guest-memory blobs;
+    /// memfd is a Linux host facility.
+    #[arg(long, value_name = "SIZE", requires = "renderer")]
+    renderer_hostmem: Option<String>,
 
     /// Host audio backend the guest's sound device plays into:
     /// `none`, `wav:<path>`, or a backend of this host's own.
@@ -2156,7 +2223,7 @@ struct ResolvedVmCommand {
     iommu: bool,
     desktop: bool,
     display: VmDisplayBackend,
-    renderer: Option<VmGpuRenderer>,
+    renderer: Option<VmRendererConfig>,
     audiodev: VmAudioDev,
     virtio_devices: VirtioDeviceProfile,
     rpc_transport: VmRpcTransport,
@@ -2660,7 +2727,15 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
             arch: arch_label(arch),
         });
     }
-    let renderer = command.renderer.or(file.renderer);
+    let hostmem = command.renderer_hostmem.or(file.renderer_hostmem);
+    let renderer = match (command.renderer.or(file.renderer), hostmem) {
+        (Some(kind), hostmem) => Some(VmRendererConfig {
+            kind,
+            hostmem: hostmem.unwrap_or_else(|| VmRendererConfig::DEFAULT_HOSTMEM.to_owned()),
+        }),
+        (None, None) => None,
+        (None, Some(_)) => return Err(VmConfigError::RendererHostmemWithoutRenderer),
+    };
     // A named renderer is a property of the desktop's display device,
     // so asking for one is asking for the desktop it lives on.
     let desktop = command.desktop || file.desktop.unwrap_or(false) || renderer.is_some();
@@ -3015,6 +3090,7 @@ fn cargo_build_command(repo_root: &Path, build: KernelBuildProfile) -> Command {
 /// the target its link arguments and ISA features.
 fn kernel_build_command(repo_root: &Path, command: &KernelBuildSpec) -> Command {
     let mut cargo = cargo_build_command(repo_root, command.kind);
+    cargo.args(command.profile.arch.build_std_arguments());
     // The guest build alone moves. The host tools compiled beside it
     // read no profile and are looked up beside the running inspector,
     // so they stay in the two directories a host build ever uses
@@ -5154,8 +5230,11 @@ impl VmRuntime {
             Some(qemu_net) => qemu_net.command(&command.qemu_bin),
             None => Command::new(&command.qemu_bin),
         };
-        qemu.arg("-display")
-            .arg(command.display.token(command.renderer));
+        qemu.arg("-display").arg(
+            command
+                .display
+                .token(command.renderer.as_ref().map(|renderer| renderer.kind)),
+        );
         if let Some(monitor) = monitor_endpoint(command, socket_dir.path())? {
             qemu.arg("-monitor").arg(monitor);
         } else {
@@ -5324,11 +5403,12 @@ impl VmRuntime {
         configure_entropy_device(&mut qemu, command.profile.entropy, command.virtio_devices);
         configure_balloon(&mut qemu, command.profile.balloon, command.virtio_devices);
         if command.desktop {
-            let display = match command.renderer {
-                Some(renderer) => command.profile.display.with_renderer(renderer),
-                None => command.profile.display,
-            };
-            configure_display(&mut qemu, display, command.virtio_devices);
+            configure_display(
+                &mut qemu,
+                command.profile.display,
+                command.renderer.as_ref(),
+                command.virtio_devices,
+            );
             configure_input(&mut qemu, command.profile.input, command.virtio_devices);
         }
         configure_sound(
@@ -5931,12 +6011,6 @@ fn configure_entropy_device(
     qemu.arg("-device").arg(device.to_string());
 }
 
-/// Attaches the machine's translation unit.
-///
-/// The unit is itself a virtio-PCI function, but it is never one of its
-/// own endpoints: it publishes its request and event rings at physical
-/// addresses, so it is created without the platform-access property its
-/// endpoints carry.
 /// The `-machine` option list this session boots, which is the ACPI
 /// variant only when `--acpi` asked for it and the profile has one.
 fn machine(command: &ResolvedVmCommand) -> &'static str {
@@ -5958,10 +6032,10 @@ fn configure_cpus_and_memory(qemu: &mut Command, command: &ResolvedVmCommand) {
     match &command.numa {
         Some(numa) => {
             qemu.arg("-smp").arg(numa.smp());
-            qemu.args(numa.arguments(command.guest_ram));
+            qemu.args(numa.arguments(GuestRamBacking::of(command)));
         }
         None => {
-            if let Some(backend) = command.guest_ram.backend(&command.memory) {
+            if let Some(backend) = guest_ram_backend(command) {
                 qemu.arg("-object").arg(backend.to_string());
             }
             qemu.arg("-smp").arg(command.smp.to_string());
@@ -5970,7 +6044,7 @@ fn configure_cpus_and_memory(qemu: &mut Command, command: &ResolvedVmCommand) {
 }
 
 /// The `-machine` argument: the profile's machine, naming the guest RAM
-/// backend as its memory when `--guest-ram` asked for one, as the Fedora
+/// backend as its memory when the session has one, as the Fedora
 /// baseline wires its own.
 ///
 /// A NUMA machine names none: its RAM is its nodes' backends
@@ -5978,14 +6052,26 @@ fn configure_cpus_and_memory(qemu: &mut Command, command: &ResolvedVmCommand) {
 /// backend, so the backing is set on each of them instead.
 fn machine_options(command: &ResolvedVmCommand) -> QemuOptions {
     let mut options = QemuOptions::new(machine(command));
-    if command.numa.is_none()
-        && let Some(id) = command.guest_ram.backend_id()
-    {
-        options.set("memory-backend", id);
+    if command.numa.is_none() && guest_ram_backend(command).is_some() {
+        options.set("memory-backend", GUEST_RAM_ID);
     }
     options
 }
 
+/// The single `-object` an ordinary machine's guest RAM is made of, when
+/// it is not QEMU's anonymous default; QEMU requires its size to match
+/// `-m`. See [`GuestRamBacking`] for what decides it.
+fn guest_ram_backend(command: &ResolvedVmCommand) -> Option<QemuOptions> {
+    let backing = GuestRamBacking::of(command);
+    (!backing.is_qemu_default()).then(|| backing.backend(GUEST_RAM_ID, &command.memory))
+}
+
+/// Attaches the machine's translation unit.
+///
+/// The unit is itself a virtio-PCI function, but it is never one of its
+/// own endpoints: it publishes its request and event rings at physical
+/// addresses, so it is created without the platform-access property its
+/// endpoints carry.
 fn configure_iommu(
     qemu: &mut Command,
     iommu: Option<VmIommuProfile>,
@@ -6072,7 +6158,16 @@ fn configure_vsock_device(
 /// then be that adapter's rather than the guest's. A capture of a
 /// display device the guest never drove is worse than no capture: it
 /// looks exactly like one the guest failed to draw into.
-fn configure_display(qemu: &mut Command, display: VmDisplayProfile, queues: VirtioDeviceProfile) {
+fn configure_display(
+    qemu: &mut Command,
+    display: VmDisplayProfile,
+    renderer: Option<&VmRendererConfig>,
+    queues: VirtioDeviceProfile,
+) {
+    let display = match renderer {
+        Some(renderer) => display.with_renderer(renderer.kind),
+        None => display,
+    };
     if display.is_pci() {
         qemu.arg("-vga").arg("none");
     }
@@ -6084,22 +6179,17 @@ fn configure_display(qemu: &mut Command, display: VmDisplayProfile, queues: Virt
         VmDisplayProfile::RutabagaMmio => "virtio-gpu-rutabaga-device",
         VmDisplayProfile::RutabagaPci => "virtio-gpu-rutabaga-pci",
     });
-    match display {
-        VmDisplayProfile::Mmio | VmDisplayProfile::Pci => {}
-        VmDisplayProfile::GlMmio | VmDisplayProfile::GlPci => {
-            // Venus through virglrenderer; blob resources are what the
-            // renderer's own memory moves through, and `hostmem` is the
-            // aperture a host-visible blob is placed into.
-            device.set("venus", "on");
-            device.set("blob", "on");
-            device.set("hostmem", "256M");
-        }
-        VmDisplayProfile::RutabagaMmio | VmDisplayProfile::RutabagaPci => {
-            device.set("venus", "on");
+    if let Some(renderer) = renderer {
+        // Venus on either renderer, and gfxstream beside it on
+        // rutabaga; blob resources are what the renderer's own memory
+        // moves through, and `hostmem` is the aperture a host-visible
+        // blob is placed into.
+        device.set("venus", "on");
+        if renderer.kind == VmGpuRenderer::Rutabaga {
             device.set("gfxstream-vulkan", "on");
-            device.set("blob", "on");
-            device.set("hostmem", "256M");
         }
+        device.set("blob", "on");
+        device.set("hostmem", &renderer.hostmem);
     }
     apply_transport(display.is_pci(), queues, &mut device);
     qemu.arg("-device").arg(device.to_string());
@@ -6447,6 +6537,7 @@ mod tests {
             rendered(|qemu| configure_display(
                 qemu,
                 VmDisplayProfile::Mmio,
+                None,
                 VirtioDeviceProfile::default()
             )),
             ["-device", "virtio-gpu-device"]
@@ -6455,10 +6546,18 @@ mod tests {
             rendered(|qemu| configure_display(
                 qemu,
                 VmDisplayProfile::Pci,
+                None,
                 VirtioDeviceProfile::default()
             )),
             ["-vga", "none", "-device", "virtio-gpu-pci"]
         );
+    }
+
+    fn renderer(kind: VmGpuRenderer, hostmem: &str) -> VmRendererConfig {
+        VmRendererConfig {
+            kind,
+            hostmem: hostmem.to_owned(),
+        }
     }
 
     /// A renderer the session asked for changes which device the
@@ -6470,18 +6569,23 @@ mod tests {
         assert_eq!(
             rendered(|qemu| configure_display(
                 qemu,
-                VmDisplayProfile::GlMmio,
+                VmDisplayProfile::Mmio,
+                Some(&renderer(VmGpuRenderer::Gl, "4G")),
                 VirtioDeviceProfile::default()
             )),
             [
                 "-device",
-                "virtio-gpu-gl-device,venus=on,blob=on,hostmem=256M"
+                "virtio-gpu-gl-device,venus=on,blob=on,hostmem=4G"
             ]
         );
         assert_eq!(
             rendered(|qemu| configure_display(
                 qemu,
-                VmDisplayProfile::RutabagaPci,
+                VmDisplayProfile::Pci,
+                Some(&renderer(
+                    VmGpuRenderer::Rutabaga,
+                    VmRendererConfig::DEFAULT_HOSTMEM
+                )),
                 VirtioDeviceProfile::default()
             )),
             [
@@ -7299,6 +7403,42 @@ mod tests {
         }
     }
 
+    /// The aarch64 kernel's `-Zbranch-protection` forbids the precompiled
+    /// `core`, `alloc` and `compiler_builtins`, so every aarch64 kernel
+    /// build rebuilds them and no other architecture's does.
+    #[test]
+    fn only_the_aarch64_kernel_rebuilds_the_standard_crates() {
+        assert_eq!(
+            VmArch::Aarch64.build_std_arguments(),
+            ["-Zbuild-std=core,alloc"]
+        );
+        assert!(VmArch::Riscv64.build_std_arguments().is_empty());
+        assert!(VmArch::X86_64.build_std_arguments().is_empty());
+
+        let root = Path::new("/checkout");
+        for arch in [VmArch::Aarch64, VmArch::Riscv64, VmArch::X86_64] {
+            for kind in [
+                KernelBuildProfile::Debug,
+                KernelBuildProfile::Release,
+                KernelBuildProfile::ProfileGenerate,
+            ] {
+                let build = KernelBuildSpec {
+                    profile: arch.profile(),
+                    kind,
+                    profile_use: None,
+                    boot_programs: Vec::new(),
+                    no_compiler_plugin: true,
+                };
+                let arguments = cargo_arguments(&kernel_build_command(root, &build));
+                assert_eq!(
+                    arguments.contains(&"-Zbuild-std=core,alloc".to_owned()),
+                    arch == VmArch::Aarch64,
+                    "{arch:?} {kind:?}: {arguments:?}"
+                );
+            }
+        }
+    }
+
     /// A named profile and the release profile are both `profile-use`
     /// builds, and one cargo profile is one output directory: without a
     /// directory of its own the named build overwrites the release
@@ -7856,6 +7996,7 @@ mod tests {
             desktop: false,
             display: None,
             renderer: None,
+            renderer_hostmem: None,
             audiodev: None,
             network: default_network_args(),
             command: None,
@@ -7921,6 +8062,7 @@ mod tests {
             desktop: false,
             display: None,
             renderer: None,
+            renderer_hostmem: None,
             audiodev: None,
             network: default_network_args(),
             command: None,
@@ -7946,6 +8088,91 @@ mod tests {
     /// virtio-iommu can only confine PCI endpoints, so asking for it on
     /// a machine whose virtio devices are memory-mapped is refused
     /// rather than quietly ignored.
+    /// A renderer session's aperture is the size it named, or the
+    /// default when it named none; a size with no renderer to give it
+    /// to is refused rather than dropped.
+    #[test]
+    fn a_renderer_s_aperture_is_sized_only_for_a_renderer() {
+        let tempdir =
+            tempfile::tempdir().expect("temporary directory for VM config resolution must exist");
+        let config = tempdir.path().join("missing-vm.json");
+
+        let error = resolve(VmCommand {
+            renderer_hostmem: Some("1G".to_owned()),
+            config: Some(config.clone()),
+            ..minimal_command()
+        })
+        .expect_err("an aperture without a renderer sizes nothing");
+        assert!(matches!(
+            error,
+            VmConfigError::RendererHostmemWithoutRenderer
+        ));
+
+        let resolved = resolve(VmCommand {
+            renderer: Some(VmGpuRenderer::Gl),
+            config: Some(config.clone()),
+            ..minimal_command()
+        })
+        .expect("a renderer resolves");
+        assert_eq!(
+            resolved.renderer,
+            Some(VmRendererConfig {
+                kind: VmGpuRenderer::Gl,
+                hostmem: VmRendererConfig::DEFAULT_HOSTMEM.to_owned(),
+            })
+        );
+        assert!(resolved.desktop, "a renderer lives on the desktop's GPU");
+
+        let resolved = resolve(VmCommand {
+            renderer: Some(VmGpuRenderer::Gl),
+            renderer_hostmem: Some("4G".to_owned()),
+            config: Some(config),
+            ..minimal_command()
+        })
+        .expect("a sized renderer resolves");
+        assert_eq!(
+            resolved.renderer.map(|renderer| renderer.hostmem),
+            Some("4G".to_owned())
+        );
+    }
+
+    /// A renderer session's RAM is a shared memfd of the session's own
+    /// size, named as the machine's memory backend, and preallocated
+    /// as well when `--guest-ram prealloc` asked for it.
+    #[test]
+    fn a_renderer_session_s_ram_is_a_shared_memfd() {
+        let mut command = watchdog_test_command(VmArch::X86_64);
+        command.renderer = Some(VmRendererConfig {
+            kind: VmGpuRenderer::Gl,
+            hostmem: VmRendererConfig::DEFAULT_HOSTMEM.to_owned(),
+        });
+        assert_eq!(
+            machine_options(&command).to_string(),
+            format!("{},memory-backend=guest-ram", machine(&command))
+        );
+        assert_eq!(
+            guest_ram_backend(&command)
+                .expect("a renderer session has a backend")
+                .to_string(),
+            format!(
+                "memory-backend-memfd,id=guest-ram,size={},share=on",
+                command.memory
+            )
+        );
+
+        let prealloc_threads = NonZeroUsize::new(4).expect("four is non-zero");
+        command.guest_ram = ResolvedGuestRam::Prealloc { prealloc_threads };
+        assert_eq!(
+            guest_ram_backend(&command)
+                .expect("a renderer session has a backend")
+                .to_string(),
+            format!(
+                "memory-backend-memfd,id=guest-ram,size={},share=on,prealloc=on,prealloc-threads=4",
+                command.memory
+            )
+        );
+    }
+
     /// `--guest-ram prealloc` backs guest RAM exactly as the Fedora
     /// baseline does: a `memory-backend-ram` the size of `-m`,
     /// populated by one thread per host processor, named by the machine
@@ -7966,7 +8193,7 @@ mod tests {
             machine_options(&lazy).to_string(),
             X86_64_VM_PROFILE.machine
         );
-        assert_eq!(lazy.guest_ram.backend(&lazy.memory), None);
+        assert_eq!(guest_ram_backend(&lazy), None);
 
         let resolved = resolve(VmCommand {
             config: Some(config),
@@ -7989,9 +8216,7 @@ mod tests {
             "q35,memory-backend=guest-ram"
         );
         assert_eq!(
-            resolved
-                .guest_ram
-                .backend(&resolved.memory)
+            guest_ram_backend(&resolved)
                 .expect("a preallocated session has a backend")
                 .to_string(),
             format!(
@@ -8298,6 +8523,7 @@ mod tests {
             desktop: false,
             display: None,
             renderer: None,
+            renderer_hostmem: None,
             audiodev: None,
             network: default_network_args(),
             command: None,
@@ -8357,6 +8583,7 @@ mod tests {
         let status = std::process::Command::new("cargo")
             .current_dir(repo_root()?)
             .arg("build")
+            .args(arch.build_std_arguments())
             .arg("--target")
             .arg(arch.profile().cargo_target)
             .arg("--bin")

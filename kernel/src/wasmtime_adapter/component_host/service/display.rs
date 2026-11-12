@@ -36,7 +36,8 @@ use core::task::{Context, Poll};
 
 use futures::channel::oneshot;
 use helios_hal::display::{
-    CursorImage, DisplayMode, FramebufferId, PixelFormat, Point, Rect, ScanoutId,
+    BlobId, BlobScanout, CursorImage, DisplayMode, FramebufferId, PixelFormat, Point, Rect,
+    ScanoutId,
 };
 use triomphe::Arc;
 use wasmtime::StoreContextMut;
@@ -49,8 +50,11 @@ use crate::ComponentHostNetwork;
 use crate::buffer::{Buffer, Span, ViewId};
 use crate::display::{
     ControlRequest, CursorRequest, DisplaySender, DisplayServiceError, SequenceSignal,
+    SurfaceSource,
 };
+use crate::gpu::ScanoutHold;
 use crate::wasmtime_adapter::bindings::display::bindings::helios::system::display as display_wit;
+use crate::wasmtime_adapter::component_host::BlobHandle;
 
 use super::super::{PendingReply, StoreData, guest_memory, view_trap};
 
@@ -97,10 +101,13 @@ pub struct SurfaceHandle {
     scanout: ScanoutId,
     mode: DisplayMode,
     format: PixelFormat,
-    framebuffer: FramebufferId,
+    /// What the scanout reads: a frame buffer this surface made, or a
+    /// renderer's blob.
+    source: SurfaceSource,
     /// The frame buffer's view in the compositor's memory, ended when
-    /// the surface is dropped.
-    view: ViewId,
+    /// the surface is dropped. A blob surface shows nothing: the blob's
+    /// bytes are wherever the gpu path put them.
+    view: Option<ViewId>,
     /// The cursor plane's own resource and frame buffer, once this
     /// surface has been given a pointer image. A compositor that never
     /// sets one pays nothing for the plane existing. The buffer is shown
@@ -121,6 +128,8 @@ fn to_wit_error(error: DisplayServiceError) -> display_wit::Error {
         DisplayServiceError::TooManySurfaces => display_wit::Error::TooManySurfaces,
         DisplayServiceError::BadSpan(_) => display_wit::Error::BadSpan,
         DisplayServiceError::OutOfMemory => display_wit::Error::OutOfMemory,
+        DisplayServiceError::NoBlobScanout => display_wit::Error::NoBlobScanout,
+        DisplayServiceError::StaleBlob => display_wit::Error::StaleBlob,
         // A display owner that has stopped serving is a machine on its
         // way down. There is nothing a compositor can do about it that
         // it would not also do about a device fault.
@@ -256,16 +265,16 @@ fn spawn_display_cleanup<CpuImpl>(
     spawner: &crate::InstanceSpawner<CpuImpl>,
     sender: DisplaySender,
     generation: u64,
-    framebuffers: [Option<FramebufferId>; 2],
+    surfaces: [Option<SurfaceSource>; 2],
 ) where
     CpuImpl: helios_hal::cpu::Cpu + Clone,
 {
     let spawned = spawner.try_spawn_detached(async move {
-        for framebuffer in framebuffers.into_iter().flatten() {
+        for surface in surfaces.into_iter().flatten() {
             if let Err(error) = sender
                 .control_oneway(ControlRequest::DestroySurface {
                     generation,
-                    framebuffer,
+                    surface,
                 })
                 .await
             {
@@ -395,7 +404,9 @@ where
         let surface = self.table.delete(handle)?;
         // The span is the compositor's ordinary memory again from here,
         // whether or not it still holds the display.
-        self.views.end(surface.view).map_err(view_trap)?;
+        if let Some(view) = surface.view {
+            self.views.end(view).map_err(view_trap)?;
+        }
         // The resources go back through the owner task, which blanks the
         // output before it drops them; the run stays pinned until it
         // has, because the owner task's record holds it. A surface
@@ -410,8 +421,11 @@ where
         let sender = claim.sender();
         let generation = surface.generation;
         let requests = [
-            Some(surface.framebuffer),
-            surface.cursor.as_ref().map(|(id, _)| *id),
+            Some(surface.source),
+            surface
+                .cursor
+                .as_ref()
+                .map(|(id, _)| SurfaceSource::Framebuffer(*id)),
         ];
         spawn_display_cleanup(self.spawner(), sender, generation, requests);
         Ok(())
@@ -638,7 +652,12 @@ where
         // resource does.
         let cleanup = sender.clone();
         let mut pending = PendingReply::new(answer, move |framebuffer| {
-            spawn_display_cleanup(&spawner, cleanup, generation, [Some(framebuffer), None]);
+            spawn_display_cleanup(
+                &spawner,
+                cleanup,
+                generation,
+                [Some(SurfaceSource::Framebuffer(framebuffer)), None],
+            );
         });
         let queued = sender
             .control_oneway(ControlRequest::CreateSurface {
@@ -666,8 +685,8 @@ where
                 scanout,
                 mode,
                 format,
-                framebuffer,
-                view,
+                source: SurfaceSource::Framebuffer(framebuffer),
+                view: Some(view),
                 cursor: None,
                 vsync: Arc::new(SequenceSignal::new()),
             })
@@ -685,7 +704,7 @@ where
                 if let Err(closed) = sender
                     .control_oneway(ControlRequest::DestroySurface {
                         generation,
-                        framebuffer,
+                        surface: SurfaceSource::Framebuffer(framebuffer),
                     })
                     .await
                 {
@@ -699,6 +718,81 @@ where
                 Ok(Err(to_wit_error(error)))
             }
         }
+    }
+
+    async fn create_from_blob(
+        accessor: &Accessor<U, Self>,
+        handle: Resource<DisplayHandle>,
+        scanout: u32,
+        mode: display_wit::Mode,
+        format: display_wit::PixelFormat,
+        blob: Resource<BlobHandle>,
+        offset: u32,
+        stride: u32,
+    ) -> wasmtime::Result<Result<Resource<SurfaceHandle>, display_wit::Error>> {
+        let (generation, sender) = match accessor.with(|access| claim_of(access, &handle))? {
+            Ok(pair) => pair,
+            Err(error) => return Ok(Err(error)),
+        };
+        let scanout = ScanoutId::new(scanout);
+        let mode = from_wit_mode(mode);
+        let format = from_wit_format(format);
+        // The blob has to be one this instance's open gpu session holds:
+        // a handle that outlived its session names a resource the
+        // session's end already destroyed. The scanout's hold is taken
+        // in the same step, so a release that starts after it — the
+        // handle dropped, the session ended — leaves the blob alone
+        // until the scanout has let go.
+        let named = accessor.with(
+            |mut access| -> wasmtime::Result<Result<(BlobId, ScanoutHold), DisplayServiceError>> {
+                let data = access.get();
+                let blob = data.table.get(&blob)?;
+                if !data.device.gpu().is_current(blob.session) {
+                    return Ok(Err(DisplayServiceError::StaleBlob));
+                }
+                Ok(Ok((blob.id, ScanoutHold::new(&blob.shared))))
+            },
+        )?;
+        let (blob, hold) = match named {
+            Ok(named) => named,
+            Err(error) => return Ok(Err(to_wit_error(error))),
+        };
+        let layout = BlobScanout {
+            blob,
+            mode,
+            format,
+            offset,
+            stride,
+        };
+        let (reply, answer) = oneshot::channel();
+        let shown = sender
+            .control(
+                ControlRequest::CreateBlobSurface {
+                    generation,
+                    scanout,
+                    layout,
+                    hold,
+                    reply,
+                },
+                answer,
+            )
+            .await;
+        if let Err(error) = shown {
+            return Ok(Err(to_wit_error(error)));
+        }
+        let surface = accessor.with(|mut access| {
+            access.get().table.push(SurfaceHandle {
+                generation,
+                scanout,
+                mode,
+                format,
+                source: SurfaceSource::Blob { blob, scanout },
+                view: None,
+                cursor: None,
+                vsync: Arc::new(SequenceSignal::new()),
+            })
+        })?;
+        Ok(Ok(surface))
     }
 
     fn changed(
@@ -896,7 +990,7 @@ where
         let data = accessor.get();
         let surface = data.table.get(&handle)?;
         let generation = surface.generation;
-        let framebuffer = surface.framebuffer;
+        let source = surface.source;
         let mode = surface.mode;
         let vsync = surface.vsync.clone();
         let region = from_wit_rect(region);
@@ -924,7 +1018,7 @@ where
                 .control(
                     ControlRequest::Present {
                         generation,
-                        framebuffer,
+                        surface: source,
                         region,
                         vsync,
                         reply,
