@@ -46,22 +46,86 @@ const HOG_STEP_BYTES: usize = 8 * 1024 * 1024;
 /// Defaults of the options the usage line documents.
 const DEFAULT_MIB: u64 = 64;
 const DEFAULT_SEED: u64 = 0x5eed_5eed_5eed_5eed;
+/// Random pages, which reach only the disk: the content the workload had
+/// before the compressed store.
+const DEFAULT_CONTENT: Content = Content::Random;
 
 /// The child's first stdout line is `filled=<pages>`; its last is
 /// `verified=<pages>`.
 const FILLED_PREFIX: &str = "filled=";
 const VERIFIED_PREFIX: &str = "verified=";
 
+/// Real text the text pages are windows of: this program's own source.
+const TEXT: &[u8] = include_bytes!("main.rs");
+
+/// How far the text window moves from one page to the next, in bytes. It is
+/// prime, so the windows of neighbouring pages differ and the starting
+/// offsets do not fall into a short cycle.
+const TEXT_STRIDE: usize = 509;
+
+const _: () = assert!(
+    TEXT.len() > PAGE_BYTES,
+    "the source must hold at least one page of text"
+);
+
+/// What the child's pages hold, which decides the tier each one lands in:
+/// pages of zeros take no storage, text compresses into the compressed
+/// store, and random words compress to nothing and go to the disk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Content {
+    /// SplitMix64 output, which LZ4 cannot compress.
+    Random,
+    /// Windows of [`TEXT`], each page tagged with its index.
+    Text,
+    Zero,
+    /// A third of each, in page order.
+    Mixed,
+}
+
+impl Content {
+    const NAMES: [(&'static str, Self); 4] = [
+        ("random", Self::Random),
+        ("text", Self::Text),
+        ("zero", Self::Zero),
+        ("mixed", Self::Mixed),
+    ];
+
+    fn parse(raw: &str) -> Result<Self, ProcbenchError> {
+        Self::NAMES
+            .iter()
+            .find_map(|&(name, content)| (name == raw).then_some(content))
+            .ok_or(ProcbenchError::Usage)
+    }
+
+    fn name(self) -> &'static str {
+        Self::NAMES
+            .iter()
+            .find_map(|&(name, content)| (content == self).then_some(name))
+            .expect("every content has a name")
+    }
+
+    /// The content of page `index`: itself, or for a mix the third the
+    /// index falls in.
+    fn of_page(self, index: u64) -> Self {
+        match self {
+            Self::Mixed => [Self::Random, Self::Text, Self::Zero][(index % 3) as usize],
+            single => single,
+        }
+    }
+}
+
 /// The parent's options.
 pub(crate) struct Options {
     mib: u64,
     seed: u64,
     corrupt_page: Option<u64>,
+    content: Content,
 }
 
 impl Options {
-    /// Parses `[--mib <n>] [--seed <n>] [--corrupt-page <index>]`, and
-    /// leaves the iterator at the first argument that is not an option.
+    /// Parses `[--mib <n>] [--seed <n>] [--corrupt-page <index>]
+    /// [--content random|text|zero|mixed]`, and leaves the iterator at the
+    /// first argument that is not an option.
     pub(crate) fn parse(
         args: &mut std::iter::Peekable<impl Iterator<Item = String>>,
     ) -> Result<Self, ProcbenchError> {
@@ -69,8 +133,13 @@ impl Options {
             mib: DEFAULT_MIB,
             seed: DEFAULT_SEED,
             corrupt_page: None,
+            content: DEFAULT_CONTENT,
         };
         while let Some(flag) = args.next_if(|argument| argument.starts_with("--")) {
+            if flag == "--content" {
+                options.content = Content::parse(&args.next().ok_or(ProcbenchError::Usage)?)?;
+                continue;
+            }
             let value = parse_u64(args.next())?;
             match flag.as_str() {
                 "--mib" if value > 0 => options.mib = value,
@@ -108,12 +177,29 @@ impl SplitMix64 {
     }
 }
 
-/// Writes page `index`'s pattern: SplitMix64 seeded with `seed ^ index`,
-/// laid out as little-endian words.
-fn fill_page(seed: u64, index: u64, page: &mut [u8]) {
-    let mut generator = SplitMix64(seed ^ index);
-    for word in page.chunks_exact_mut(size_of::<u64>()) {
-        word.copy_from_slice(&generator.next().to_le_bytes());
+/// Writes page `index`'s bytes for `content`.
+///
+/// Random pages are SplitMix64 seeded with `seed ^ index`, laid out as
+/// little-endian words. Text pages are a window of [`TEXT`] that moves by
+/// [`TEXT_STRIDE`] per page, with the page's index in its first eight bytes
+/// so that no two pages are alike and a page that comes back as another's is
+/// caught. A zero page is zeros, which is all there is to check.
+fn fill_page(content: Content, seed: u64, index: u64, page: &mut [u8]) {
+    match content.of_page(index) {
+        Content::Random => {
+            let mut generator = SplitMix64(seed ^ index);
+            for word in page.chunks_exact_mut(size_of::<u64>()) {
+                word.copy_from_slice(&generator.next().to_le_bytes());
+            }
+        }
+        Content::Text => {
+            let windows = TEXT.len() - PAGE_BYTES + 1;
+            let start = (index as usize).wrapping_mul(TEXT_STRIDE) % windows;
+            page.copy_from_slice(&TEXT[start..start + PAGE_BYTES]);
+            page[..size_of::<u64>()].copy_from_slice(&index.to_le_bytes());
+        }
+        Content::Zero => page.fill(0),
+        Content::Mixed => unreachable!("`of_page` resolves a mix to one of its thirds"),
     }
 }
 
@@ -221,6 +307,7 @@ pub(crate) async fn swap_cycle(options: Options, child: ChildSpec) -> Result<(),
             options
                 .corrupt_page
                 .map_or_else(|| "-".to_owned(), |page| page.to_string()),
+            options.content.name().to_owned(),
         ],
     };
     let handle = child.spawn().await?;
@@ -335,7 +422,7 @@ pub(crate) async fn swap_cycle(options: Options, child: ChildSpec) -> Result<(),
     Ok(())
 }
 
-/// The `swap-child` role: `swap-child <mib> <seed> <corrupt-page|->`.
+/// The `swap-child` role: `swap-child <mib> <seed> <corrupt-page|-> <content>`.
 pub(crate) async fn swap_child(args: impl Iterator<Item = String>) -> Result<(), ProcbenchError> {
     let mut args = args;
     let mib = parse_u64(args.next())?;
@@ -344,6 +431,7 @@ pub(crate) async fn swap_child(args: impl Iterator<Item = String>) -> Result<(),
         "-" => None,
         raw => Some(parse_u64(Some(raw.to_owned()))?),
     };
+    let content = Content::parse(&args.next().ok_or(ProcbenchError::Usage)?)?;
     let pages = mib * PAGES_PER_MIB;
     let bytes = usize::try_from(pages * PAGE_BYTES as u64).expect("region fits usize");
 
@@ -353,7 +441,7 @@ pub(crate) async fn swap_child(args: impl Iterator<Item = String>) -> Result<(),
         .map_err(|_| ProcbenchError::HogAllocation { bytes })?;
     region.resize(bytes, 0);
     for (index, page) in region.chunks_exact_mut(PAGE_BYTES).enumerate() {
-        fill_page(seed, index as u64, page);
+        fill_page(content, seed, index as u64, page);
     }
     if let Some(page) = corrupt_page {
         // `Options::parse` bounds the index by the page count.
@@ -377,7 +465,7 @@ pub(crate) async fn swap_child(args: impl Iterator<Item = String>) -> Result<(),
 
     let mut expected = [0u8; PAGE_BYTES];
     for (index, page) in region.chunks_exact(PAGE_BYTES).enumerate() {
-        fill_page(seed, index as u64, &mut expected);
+        fill_page(content, seed, index as u64, &mut expected);
         if let Some(offset) = page.iter().zip(&expected).position(|(a, e)| a != e) {
             return Err(ProcbenchError::PageMismatch {
                 page: index as u64,
