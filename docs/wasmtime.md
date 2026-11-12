@@ -5,13 +5,31 @@ at `../wasmtime/crates/wasmtime`.
 
 ## Required revision
 
-The local checkout must be at (branch `helios/next-solver-bindgen`):
+The local checkout must be at (branch `helios/release-48.0.8`):
 
 ```text
-18b428e6becfb6138b877a3fe70afb08bf5724ba
+1c4b1742798208727174d61d80bee099cfd62876
 ```
 
-That revision is `helios/stack-limit-percpu` at
+That revision is `helios/next-solver-bindgen` at
+`18b428e6becfb6138b877a3fe70afb08bf5724ba` merged with upstream's `v48.0.8`
+tag (`7b6c29ec3e9a49c97da231665cbd8eead9ccbda0`), which brings in the 48.0.x
+point releases and their security fixes (#503). The release removed every
+preemption point inside a bulk operation for fuel and epochs, which are now
+charged and checked once before it. Stack-limit
+interruption keeps the rule below: compiled code takes no check before a
+bulk operation, and the `memory_copy` and `memory_fill` libcalls deliver a
+request between their chunks.
+
+The branch reverts one upstream commit of that release line,
+bytecodealliance/wasmtime#13887 (cc0044044), which split `current_thread`
+into an inline fast path and a cold slow path. Under Helios the split costs
+more than it saves: a paired run on x86-64 under KVM whose two sides differ
+only in that commit measured `hostcall-loop` at 256 ms with it and 211 ms
+without, and `sched-tasks` at 117 ms against 106 ms, with the compute
+control flat (run 43203149211).
+
+`helios/next-solver-bindgen` is `helios/stack-limit-percpu` at
 `1ed7678a8ee4f57cbe4a4e89ade7f7fda6092055` plus upstream
 bytecodealliance/wasmtime#14193 (30dddb655), which spells out the type
 arguments of `with_getter` and `Access::new` in the code `bindgen!`
@@ -218,13 +236,13 @@ lives in one place, `.github/actions/checkout-wasmtime/action.yml`, and every
 workflow that needs the workspace to resolve uses that action. Update the pin
 there and the revision here in the same change.
 
-This revision is based on upstream Wasmtime commit:
+This revision is based on upstream Wasmtime `v48.0.8`:
 
 ```text
-2fb59986ce75a005e0d12fd4637f2e772bb659fd
+7b6c29ec3e9a49c97da231665cbd8eead9ccbda0
 ```
 
-It corresponds to Wasmtime 48.0.0-dev and requires Rust 1.95 or newer. Helios
+It corresponds to Wasmtime 48.0.8 and requires Rust 1.95 or newer. Helios
 pins `nightly-2026-11-03` in `rust-toolchain.toml` for Rust 1.101 and installs all
 host, bare-metal, and WASI targets used by the workspace.
 
