@@ -897,6 +897,10 @@ mod network {
             [2, 0, 0, 0, 0, 1]
         }
 
+        fn revalidate_lease(&self) -> impl Future<Output = ()> + Send + '_ {
+            core::future::ready(())
+        }
+
         fn ipv4_cidr(
             &self,
         ) -> impl core::future::Future<Output = Option<crate::Ipv4Cidr>> + Send + '_ {

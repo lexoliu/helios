@@ -138,26 +138,34 @@ pub use instance::{
     StoreTurns, allow_instance_resource_growth,
 };
 pub use io::{
-    BlockInstallError, BlockSelfCheckError, BlockService, BlockStats, ByteReadWait, ByteReader,
-    ByteWriteWait, ByteWriter, ClosedPeer, DebugConsole, DebugSerialAccess, DebugSerialInterrupt,
-    DebugSerialWriter, ExternalInterruptHandler, ExternalInterruptRoutes, IommuDomains,
-    IommuEndpointStats, IommuReport, IommuStats, MAX_BLOCK_DEVICES, MAX_DEVICE_INTERRUPTS,
-    MAX_INPUT_DEVICES, MAX_IOMMU_ENDPOINTS, MAX_NETWORK_INTERRUPTS, PanicSerial, PollKey,
-    PollRegistration, PollRegistry, PollRegistryError, PollSourceKind, RecordingConsole,
-    SCRATCH_DISK_SERIAL, SerialReader, TryRead, TryWrite, byte_channel, emit_panic_report,
-    install_block_devices, read_debug_serial, read_serial, try_read_serial, wake_queue_owners,
+    BlockCache, BlockCacheError, BlockCacheLimits, BlockInstallError, BlockMut, BlockPages,
+    BlockRef, BlockRouteError, BlockSelfCheckError, BlockService, BlockStats, ByteReadWait,
+    ByteReader, ByteWriteWait, ByteWriter, CACHE_BLOCK_BYTES, CacheLayoutError, CachedDisk,
+    CachedDiskStats, ClosedPeer, DebugConsole, DebugSerialAccess, DebugSerialInterrupt,
+    DebugSerialWriter, DiskRefusal, DiskRole, ExternalInterruptHandler, ExternalInterruptRoutes,
+    IommuDomains, IommuEndpointStats, IommuReport, IommuStats, MAX_BLOCK_DEVICES,
+    MAX_DEVICE_INTERRUPTS, MAX_INPUT_DEVICES, MAX_IOMMU_ENDPOINTS, MAX_NETWORK_INTERRUPTS,
+    PanicSerial, PollKey, PollRegistration, PollRegistry, PollRegistryError, PollSourceKind,
+    RecordingConsole, SCRATCH_DISK_SERIAL, ScratchDisk, ScratchDiskStats, SerialReader, TryRead,
+    TryWrite, admit_block_devices, byte_channel, emit_panic_report, install_block_devices,
+    read_debug_serial, read_serial, try_read_serial, wake_queue_owners,
 };
 pub use kernel_exception::{
     KernelException, KernelExceptionCause, KernelExceptionDispatch, KernelNativeTrapHandler,
     dispatch_native_trap, install_native_trap_handler,
 };
-pub use machine::{AdvanceCause, Generation, MachineGeneration, MachineGenerationHandle};
+pub use machine::{
+    AdvanceCause, Generation, MachineGeneration, MachineGenerationHandle, UnhandledAdvances,
+    install_generation_reactions,
+};
 pub use memory::{
     AccessibilityPlan, BalloonHandle, BalloonStats, BootMemoryPlan, BootRegionSplitter,
-    CommittedRegion, CommittedRemoval, Decommitted, ENTROPY_RESEED_INTERVAL, EntropyPool,
-    EntropySources, FIBER_STACK_GUARD_BYTES, FREE_PAGE_REPORT_INTERVAL, FiberStack,
-    FiberStackArenaStats, FiberStackError, FiberStackVmHooks, HardwareEntropySource,
-    IDLE_SWAP_AFTER, KERNEL_HEAP_BOOTSTRAP_BYTES, KERNEL_HEAP_GROWTH_CHUNK_BYTES,
+    COMPRESSED_PAGE_BYTES, CommittedRegion, CommittedRemoval, CompressRefusal, CompressedPage,
+    CompressedPool, CompressedPoolError, CompressedPoolStats, DEFAULT_COMPRESSION_LEVEL,
+    DEFAULT_POOL_PERCENT, Decommitted, ENTROPY_RESEED_INTERVAL, EntropyPool, EntropySources,
+    FIBER_STACK_GUARD_BYTES, FREE_PAGE_REPORT_INTERVAL, FiberStack, FiberStackArenaStats,
+    FiberStackError, FiberStackVmHooks, HardwareEntropySource, IDLE_SWAP_AFTER,
+    INCOMPRESSIBLE_BYTES, KERNEL_HEAP_BOOTSTRAP_BYTES, KERNEL_HEAP_GROWTH_CHUNK_BYTES,
     KERNEL_HEAP_MAX_BOOT_FRACTION, KERNEL_HEAP_MIN_RESERVE_BYTES, KERNEL_HEAP_RESERVE_FRACTION,
     KernelPhysFrameAllocator, MemoryOwner, NoCryptographicEntropy, NoEntropyDevice,
     ROOT_ENTROPY_MATERIAL_BYTES, RegionShares, ReleasedReservation, ReservationLookup,
@@ -188,18 +196,18 @@ pub use network::{
     validate_http_path_with_query, validate_http_status_code,
 };
 pub use process::{
-    AudioClaimCap, ClockAuthorityRights, DescriptorEntry, DescriptorId, DescriptorTable,
-    DescriptorTableError, DeviceClassRights, DeviceGrantClaimCap, DirectoryAuthorityRights,
-    DirectoryCap, DirectoryPreopen, DisplayClaimCap, DnsCap, ExecAuthority, ForkAuthority,
-    FutexKey, FutexTable, FutexWaitRegistration, GpuClaimCap, GuestAddress, InputClaimCap,
-    JoinAuthority, LinkAuthorityRights, LinkSourceCap, LinkTargetDirectoryCap, MulticastCap,
-    NetworkAdminCap, NetworkAuthorityRights, NetworkCap, PrivilegedBindCap, ProcessAuthority,
-    ProcessAuthorityError, ProcessAuthorityRights, ProcessId, ProcessMemoryIdentity, ProcessRecord,
-    ProcessState, ProcessTable, ProcessTableError, ProgramExecError, ProgramExecErrorDetail,
-    ProgramExecErrorKind, ProgramOutOfMemory, RuntimeMessage, SetWallClockCap, SignalAuthority,
-    SpawnAuthority, SymlinkCreateCap, SymlinkReadCap, TcpCap, TerminalAuthorityRights,
-    TerminalInputCap, TerminalOutputCap, ThreadId, ThreadRecord, ThreadState, ThreadTable,
-    ThreadTableError, TtyControlCap, UdpCap,
+    AudioClaimCap, ClockAuthorityRights, DescriptorEntry, DescriptorId, DescriptorLimit,
+    DescriptorTable, DescriptorTableError, DeviceClassRights, DeviceGrantClaimCap,
+    DirectoryAuthorityRights, DirectoryCap, DirectoryPreopen, DisplayClaimCap, DnsCap,
+    ExecAuthority, ForkAuthority, FutexKey, FutexTable, FutexWaitRegistration, GpuClaimCap,
+    GuestAddress, InputClaimCap, JoinAuthority, LinkAuthorityRights, LinkSourceCap,
+    LinkTargetDirectoryCap, MulticastCap, NetworkAdminCap, NetworkAuthorityRights, NetworkCap,
+    PrivilegedBindCap, ProcessAuthority, ProcessAuthorityError, ProcessAuthorityRights, ProcessId,
+    ProcessMemoryIdentity, ProcessRecord, ProcessState, ProcessTable, ProcessTableError,
+    ProgramExecError, ProgramExecErrorDetail, ProgramExecErrorKind, ProgramOutOfMemory,
+    RuntimeMessage, SetWallClockCap, SignalAuthority, SpawnAuthority, SymlinkCreateCap,
+    SymlinkReadCap, TcpCap, TerminalAuthorityRights, TerminalInputCap, TerminalOutputCap, ThreadId,
+    ThreadRecord, ThreadState, ThreadTable, ThreadTableError, TtyControlCap, UdpCap,
 };
 pub use profiling::{
     CodeAttribution, InstructionProfile, InstructionProfileError, InstructionSampler,
@@ -210,11 +218,11 @@ pub use profiling::{
 pub use runtime::{
     AuthorityDomain, ComponentHostFilesystemState, ComponentHostNetwork, ComponentNetworkService,
     ComponentNetworkState, DnsError, DnsErrorKind, ExecOutput, ExecResult, HostDirEntry,
-    HostDirLimit, HostFileSystem, HostFsError, HostFsErrorKind, HostMetadata, Ipv4Address,
-    NetworkErrorDetail, NetworkHandle, NetworkIpAddress, NetworkPacketPump, ObjectIdentity,
-    PingError, PingErrorKind, PingReply, RegisteredTcpReadBuffer, RuntimeState, SocketReadiness,
-    TcpAccepted, TcpError, TcpErrorKind, TcpListener, TcpReadProgress, TcpWriteProgress,
-    UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
+    HostDirLimit, HostFileSystem, HostFsError, HostFsErrorKind, HostMetadata, HostShareRestore,
+    Ipv4Address, NetworkErrorDetail, NetworkHandle, NetworkIpAddress, NetworkPacketPump,
+    ObjectIdentity, PingError, PingErrorKind, PingReply, RegisteredTcpReadBuffer, RuntimeState,
+    SocketReadiness, TcpAccepted, TcpError, TcpErrorKind, TcpListener, TcpReadProgress,
+    TcpWriteProgress, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
 };
 pub use surface::{
     MAX_INSTANCE_SURFACES, MAX_LIVE_SURFACES, ReturnedSurface, ReturnedSurfaces,
