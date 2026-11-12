@@ -57,8 +57,28 @@
 //!   (its pusher cleared the last bits and was slow to queue) finds the index
 //!   dead, or live again as another frame, and is harmless in both cases.
 //!
+//! - **Walking a frame** ([`Store::claim_next`]) and **compaction**
+//!   ([`Store::compact`]) run on the owner task only, and take the claim on
+//!   each object's slot before touching it. The object's header names its
+//!   slot, and the slot word names the object; an object is acted on only
+//!   when the two agree and the claim's compare-and-swap succeeds, so an
+//!   object a fault holds, or has just freed, is skipped. The owner is the
+//!   only writer of object bytes, so nothing reads bytes while they change.
+//!   Compaction is synchronous with no await; writeback holds each claim
+//!   across the device write, which is what keeps a fault on that page
+//!   waiting on the slot rather than racing the move.
+//!
 //! The store holds no lock and does not wait. Nothing in it is reachable from
 //! an interrupt handler or from trap context.
+//!
+//! # Age
+//!
+//! Objects are, by construction, untouched since they were stored, because
+//! any access faults them out, so the order frames were first filled in is
+//! recency order. The owner keeps the frames that hold objects or a parked
+//! page in a list in that order (`oldest` to `newest`), which writeback works
+//! from the front. A frame takes its place when it is first filled, and
+//! leaves when it is released.
 //!
 //! The frame table's entries are not cache-line padded, for the reason the
 //! slot words are not: no processor owns one, and padding would cost
@@ -100,7 +120,7 @@ use thiserror::Error;
 
 use super::slot::{
     Claim, CompressedLen, GRANULE_BYTES, GRANULES_PER_FRAME, Granule, OBJECT_HEADER_BYTES,
-    SlotIndex, StoreFrameIndex, StoredObject, object_granules,
+    SlotIndex, SlotState, SlotTable, StoreFrameIndex, StoredObject, object_granules,
 };
 use super::stack::{Chain, Links, ReturnStack};
 use crate::memory::user::{allocate_user_frame_uninit_on, deallocate_user_frame_on};
@@ -167,6 +187,11 @@ struct StoreFrame {
     /// The slot of the page parked in this frame. Written by the owner.
     parked_slot: AtomicU32,
 }
+
+/// The waste at which compaction starts, as a percentage of the granules the
+/// store's frames hold. An engineering constant, not an operator setting: it
+/// trades the copy work of a pass against the frames it frees.
+pub(super) const COMPACT_WASTE_PERCENT: usize = 25;
 
 impl StoreFrame {
     const fn new() -> Self {
@@ -332,15 +357,32 @@ impl StoreFrames {
     }
 
     /// The slot a frame's parked page belongs to, as its raw index.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "writeback and compaction, the next commit, read the reverse map"
-        )
-    )]
     pub(super) fn parked_slot(&self, index: StoreFrameIndex) -> u32 {
         self.frame(index).parked_slot.load(Ordering::Acquire)
+    }
+
+    /// The slot an object's header names: the reverse map from an object to
+    /// the page it holds.
+    ///
+    /// The caller is the owner and `first` is a granule the frame's `starts`
+    /// marked, so the bytes are an object's, or a freed object's, which stay
+    /// until the owner reuses them.
+    fn header_slot(&self, index: StoreFrameIndex, first: usize) -> SlotIndex {
+        // SAFETY: `first` is below `GRANULES_PER_FRAME`, so a header lies
+        // inside the live frame, and only the owner writes object bytes.
+        let header = unsafe {
+            slice::from_raw_parts(
+                self.frame(index).bytes().add(first * GRANULE_BYTES),
+                OBJECT_HEADER_BYTES,
+            )
+        };
+        let raw = u32::from_le_bytes(header.try_into().expect("a four-byte header"));
+        SlotIndex::new(raw).unwrap_or_else(|| {
+            panic!(
+                "store frame {} granule {first} names slot {raw}, past the slot table",
+                index.raw()
+            )
+        })
     }
 
     /// The granules in use in a frame, as a bitmap.
@@ -349,13 +391,6 @@ impl StoreFrames {
     }
 
     /// The first granule of each object in a frame, as a bitmap.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "writeback and compaction, the next commit, walk a frame's objects"
-        )
-    )]
     pub(super) fn starts(&self, index: StoreFrameIndex) -> u64 {
         self.frame(index).starts.load(Ordering::Acquire)
     }
@@ -393,11 +428,11 @@ pub(super) struct Limits {
 }
 
 impl Limits {
-    fn limit_frames(&self) -> usize {
+    pub(super) fn limit_frames(&self) -> usize {
         self.pool_frames * usize::from(self.limit_percent) / 100
     }
 
-    fn accept_frames(&self) -> usize {
+    pub(super) fn accept_frames(&self) -> usize {
         self.limit_frames() * usize::from(self.accept_percent) / 100
     }
 }
@@ -423,6 +458,11 @@ struct OwnerFrame {
     bucket: Option<u8>,
     /// The frame's position in its bucket.
     position: u32,
+    /// The neighbours in the age list, as raw frame indices, `0` for none.
+    older: u32,
+    newer: u32,
+    /// Whether the frame is in the age list.
+    aged: bool,
 }
 
 /// The owner's half of the store: where every frame is, by how much room it
@@ -445,11 +485,30 @@ pub(super) struct Store {
     /// Whether the store is refusing until it is back under the accept
     /// level.
     refusing: bool,
+    /// The ends of the age list, as raw frame indices, `0` when it is empty.
+    oldest: u32,
+    newest: u32,
+    /// Frames in the age list.
+    aged: usize,
+}
+
+/// What a pass of [`Store::compact`] did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Compacted {
+    /// Objects moved.
+    pub(super) objects: usize,
+    /// Bytes of those objects, in whole granules.
+    pub(super) bytes: usize,
+    /// Frames the moves emptied and returned to the pool.
+    pub(super) frames: usize,
 }
 
 impl Store {
     pub(super) fn new() -> Self {
         Self {
+            oldest: 0,
+            newest: 0,
+            aged: 0,
             frames: Vec::from([OwnerFrame::default()]),
             buckets: (0..GRANULES_PER_FRAME).map(|_| Vec::new()).collect(),
             non_empty: 0,
@@ -508,8 +567,7 @@ impl Store {
         frame.base.store(bytes.as_ptr(), Ordering::Release);
         self.frames[raw as usize] = OwnerFrame {
             live: true,
-            bucket: None,
-            position: 0,
+            ..OwnerFrame::default()
         };
         self.spare = Some(index);
         self.held += 1;
@@ -564,6 +622,7 @@ impl Store {
                     .spare
                     .take()
                     .expect("a spare frame is held before every detach");
+                self.age_push(spare);
                 (spare, 0, 0)
             }
         };
@@ -626,6 +685,7 @@ impl Store {
         frame.starts.fetch_or(1, Ordering::AcqRel);
         frame.occupied.fetch_or(FULL, Ordering::AcqRel);
         self.rebucket(index, 0);
+        self.age_push(index);
         index
     }
 
@@ -715,6 +775,296 @@ impl Store {
         }
     }
 
+    /// Appends a frame that has just taken its first object, or its parked
+    /// page, to the age list.
+    fn age_push(&mut self, index: StoreFrameIndex) {
+        let raw = index.raw();
+        let newest = self.newest;
+        let entry = &mut self.frames[raw as usize];
+        debug_assert!(!entry.aged, "store frame {raw} is already in the age list");
+        *entry = OwnerFrame {
+            aged: true,
+            older: newest,
+            newer: 0,
+            ..*entry
+        };
+        if newest == 0 {
+            self.oldest = raw;
+        } else {
+            self.frames[newest as usize].newer = raw;
+        }
+        self.newest = raw;
+        self.aged += 1;
+    }
+
+    /// Takes a frame out of the age list, wherever it is. A frame that is
+    /// not in it is left alone.
+    fn age_unlink(&mut self, index: StoreFrameIndex) {
+        let raw = index.raw() as usize;
+        let OwnerFrame {
+            aged, older, newer, ..
+        } = self.frames[raw];
+        if !aged {
+            return;
+        }
+        if older == 0 {
+            self.oldest = newer;
+        } else {
+            self.frames[older as usize].newer = newer;
+        }
+        if newer == 0 {
+            self.newest = older;
+        } else {
+            self.frames[newer as usize].older = older;
+        }
+        let entry = &mut self.frames[raw];
+        entry.aged = false;
+        entry.older = 0;
+        entry.newer = 0;
+        self.aged -= 1;
+    }
+
+    /// Frames in the age list: those holding objects or a parked page.
+    pub(super) fn aged_frames(&self) -> usize {
+        self.aged
+    }
+
+    /// The oldest frame in the age list, moved to the newest end so that the
+    /// next call names the frame after it.
+    ///
+    /// Writeback works frames from the front. A frame it could not empty (an
+    /// object a fault held, a device that refused) goes to the back rather
+    /// than staying where the next pass would meet it first.
+    pub(super) fn rotate_oldest(&mut self) -> Option<StoreFrameIndex> {
+        let index = StoreFrameIndex::new(self.oldest)?;
+        self.age_unlink(index);
+        self.age_push(index);
+        Some(index)
+    }
+
+    /// How many frames the store would have to free to be at or under
+    /// `limits.accept_frames()`, when it is over its limit or refusing, which
+    /// is when writeback runs whatever the pressure.
+    pub(super) fn over_limit_by(&self, limits: Limits) -> Option<usize> {
+        let frames = self.object_frames();
+        if !self.refusing && frames <= limits.limit_frames() {
+            return None;
+        }
+        Some(frames.saturating_sub(limits.accept_frames())).filter(|&over| over > 0)
+    }
+
+    /// Takes the claim on the next object, or the parked page, of `frame` at
+    /// or after granule `*cursor` that no one else holds, and moves the
+    /// cursor past it.
+    ///
+    /// Returns the claim and the state it was taken from: `Stored` for an
+    /// object, `Parked` for a page. An object whose slot is held (a fault is
+    /// reading it) or has just been freed is passed over.
+    pub(super) fn claim_next(
+        &self,
+        shared: &StoreFrames,
+        slots: &SlotTable,
+        frame: StoreFrameIndex,
+        cursor: &mut usize,
+    ) -> Option<(Claim, SlotState)> {
+        let starts = shared.starts(frame);
+        if starts == 1 && shared.occupied(frame) == FULL {
+            // A parked page is a whole frame: one object at granule 0.
+            if *cursor != 0 {
+                return None;
+            }
+            *cursor = GRANULES_PER_FRAME;
+            let slot = SlotIndex::new(shared.parked_slot(frame))
+                .expect("a parked frame records the slot of its page");
+            let state = SlotState::Parked(frame);
+            return slots.claim(slot, state).ok().map(|claim| (claim, state));
+        }
+        while *cursor < GRANULES_PER_FRAME {
+            let remaining = starts >> *cursor;
+            if remaining == 0 {
+                break;
+            }
+            let first = *cursor + remaining.trailing_zeros() as usize;
+            *cursor = first + 1;
+            let slot = shared.header_slot(frame, first);
+            let state = slots.state(slot);
+            let SlotState::Stored(object) = state else {
+                continue;
+            };
+            if object.frame() != frame || object.first().raw() != first {
+                continue;
+            }
+            if let Ok(claim) = slots.claim(slot, state) {
+                return Some((claim, state));
+            }
+        }
+        None
+    }
+
+    /// Granules in use across the store's frames, the parked pages' included.
+    fn live_granules(&self, shared: &StoreFrames) -> usize {
+        self.frames
+            .iter()
+            .enumerate()
+            .skip(1)
+            .filter(|(_, frame)| frame.live)
+            .filter_map(|(raw, _)| StoreFrameIndex::new(raw as u32))
+            .filter(|&index| self.spare != Some(index))
+            .map(|index| shared.occupied(index).count_ones() as usize)
+            .sum()
+    }
+
+    /// The share of the granules the store's frames hold that no object
+    /// uses, as a percentage, given the granules in use.
+    fn waste_percent(&self, live: usize) -> usize {
+        let held = self.object_frames() * GRANULES_PER_FRAME;
+        if held == 0 {
+            return 0;
+        }
+        held.saturating_sub(live) * 100 / held
+    }
+
+    /// The store's waste as it stands, for a test to compare with the
+    /// threshold.
+    #[cfg(test)]
+    pub(super) fn waste_percent_now(&self, shared: &StoreFrames) -> usize {
+        self.waste_percent(self.live_granules(shared))
+    }
+
+    /// Moves objects out of the sparsest frames into the holes of others,
+    /// returning the frames that empties to the pool, while the store wastes
+    /// at least [`COMPACT_WASTE_PERCENT`] of its granules and `budget` bytes
+    /// of objects remain to move.
+    ///
+    /// `published` runs after each object's slot is published at its new
+    /// place, which is when a fault that found the slot held can go on.
+    ///
+    /// Synchronous: the owner task has no await in the pass. A frame that
+    /// cannot be emptied (an object a fault holds, no hole that fits, the
+    /// budget spent) ends the pass.
+    pub(super) fn compact(
+        &mut self,
+        shared: &StoreFrames,
+        slots: &SlotTable,
+        budget: usize,
+        mut published: impl FnMut(),
+    ) -> Compacted {
+        let mut done = Compacted::default();
+        let live = self.live_granules(shared);
+        while done.bytes + GRANULE_BYTES <= budget
+            && self.waste_percent(live) >= COMPACT_WASTE_PERCENT
+        {
+            let Some(source) = self.sparsest() else {
+                break;
+            };
+            if !self.empty_frame(
+                shared,
+                slots,
+                source,
+                budget - done.bytes,
+                &mut published,
+                &mut done,
+            ) {
+                break;
+            }
+        }
+        done
+    }
+
+    /// The frame to empty next: the one in the highest non-empty bucket, which
+    /// has the most contiguous room and so at most `64 - run` granules of
+    /// objects. A full frame (bucket 0) has nothing to gain.
+    fn sparsest(&self) -> Option<StoreFrameIndex> {
+        let top = self.non_empty.checked_ilog2()? as usize;
+        if top == 0 {
+            return None;
+        }
+        StoreFrameIndex::new(*self.buckets[top].last()?)
+    }
+
+    /// Moves what it can of `source`'s objects, up to `budget` bytes, into
+    /// the best-fitting holes of other frames, and releases the frame if that
+    /// emptied it. Returns whether it did.
+    fn empty_frame(
+        &mut self,
+        shared: &StoreFrames,
+        slots: &SlotTable,
+        source: StoreFrameIndex,
+        budget: usize,
+        published: &mut impl FnMut(),
+        done: &mut Compacted,
+    ) -> bool {
+        // Out of the buckets while it is emptied, so it is never its own
+        // destination.
+        self.unbucket(source);
+        let mut spent = 0;
+        let mut starts = shared.starts(source);
+        while starts != 0 {
+            let first = starts.trailing_zeros() as usize;
+            starts &= starts - 1;
+            let slot = shared.header_slot(source, first);
+            let state = slots.state(slot);
+            let SlotState::Stored(object) = state else {
+                continue;
+            };
+            if object.frame() != source || object.first().raw() != first {
+                continue;
+            }
+            let granules = object_granules(object.len().get());
+            if spent + granules * GRANULE_BYTES > budget {
+                break;
+            }
+            let Some((destination, at, occupied)) = self.best_fit(shared, granules) else {
+                break;
+            };
+            let Ok(claim) = slots.claim(slot, state) else {
+                continue;
+            };
+            let len = OBJECT_HEADER_BYTES + object.len().get();
+            // SAFETY: both runs lie inside their frames, which are live and
+            // distinct (the source is out of the buckets, so `best_fit` cannot
+            // name it); the destination run is free in the owner's view and
+            // only the owner sets bits; the source object is held by the
+            // claim, so no one frees or reads it as it is copied.
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    shared
+                        .frame(source)
+                        .bytes()
+                        .add(first * GRANULE_BYTES)
+                        .cast_const(),
+                    shared.frame(destination).bytes().add(at * GRANULE_BYTES),
+                    len,
+                );
+            }
+            let target = shared.frame(destination);
+            let mask = run_mask(at, granules);
+            target.starts.fetch_or(1 << at, Ordering::AcqRel);
+            target.occupied.fetch_or(mask, Ordering::AcqRel);
+            self.rebucket(destination, largest_free_run(occupied | mask));
+            let moved = StoredObject::new(
+                destination,
+                Granule::new(at).expect("a run found inside the frame"),
+                object.len(),
+            );
+            slots.publish(claim, SlotState::Stored(moved));
+            published();
+            shared.free_object(object);
+            spent += granules * GRANULE_BYTES;
+            done.objects += 1;
+            done.bytes += granules * GRANULE_BYTES;
+        }
+        let occupied = shared.occupied(source);
+        if occupied == 0 {
+            self.release(shared, source);
+            done.frames += 1;
+            true
+        } else {
+            self.rebucket(source, largest_free_run(occupied));
+            false
+        }
+    }
+
     /// Gives the spare back to the pool, so a test can check the pool is as
     /// it was found.
     #[cfg(test)]
@@ -727,6 +1077,7 @@ impl Store {
     /// Gives an empty frame back to the pool.
     fn release(&mut self, shared: &StoreFrames, index: StoreFrameIndex) {
         self.unbucket(index);
+        self.age_unlink(index);
         let raw = index.raw();
         let base = shared
             .frame(index)

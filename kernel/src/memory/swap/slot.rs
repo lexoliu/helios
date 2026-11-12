@@ -94,7 +94,7 @@ impl SlotIndex {
         Self::new(token.raw())
     }
 
-    fn new(raw: u32) -> Option<Self> {
+    pub(super) fn new(raw: u32) -> Option<Self> {
         if raw > MAX_SLOT_INDEX {
             return None;
         }

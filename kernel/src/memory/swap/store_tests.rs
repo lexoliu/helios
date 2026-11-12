@@ -9,10 +9,13 @@ use std::sync::MutexGuard;
 use helios_hal::pmm::PhysFrame;
 
 use super::slot::{
-    Claim, CompressedLen, GRANULES_PER_FRAME, Gate, SlotAllocator, SlotTable, StoreFrameIndex,
-    StoredObject, object_granules,
+    Claim, CompressedLen, GRANULES_PER_FRAME, Gate, SlotAllocator, SlotIndex, SlotState, SlotTable,
+    StoreFrameIndex, StoredObject, object_granules,
 };
-use super::store::{Limits, Store, StoreFrames, StoreFull, first_free_run, largest_free_run};
+use super::store::{
+    COMPACT_WASTE_PERCENT, Compacted, Limits, Store, StoreFrames, StoreFull, first_free_run,
+    largest_free_run,
+};
 use super::test_pool::{POOL_FRAMES, allocated_bytes, serialise};
 
 const PAGE: usize = PhysFrame::SIZE;
@@ -480,4 +483,261 @@ fn the_limit_refuses_and_the_hysteresis_holds_it_until_the_accept_level() {
 
     let spare_free: Vec<Put> = puts;
     fixture.finish(&spare_free);
+}
+
+/// An object a fault could take: its slot says where it is.
+struct Live {
+    slot: SlotIndex,
+    block: Vec<u8>,
+}
+
+impl Fixture {
+    /// Publishes a put's object in its slot, as the owner does when a page
+    /// is placed.
+    fn publish(&self, put: Put) -> Live {
+        let slot = put.claim.index();
+        self.slots.publish(put.claim, SlotState::Stored(put.object));
+        Live {
+            slot,
+            block: put.block,
+        }
+    }
+
+    /// Where a live object is now, which compaction may have changed.
+    fn object(&self, live: &Live) -> StoredObject {
+        match self.slots.state(live.slot) {
+            SlotState::Stored(object) => object,
+            other => panic!("slot {:?} reads {other:?}, not a store object", live.slot),
+        }
+    }
+
+    /// A fault consuming an object: claim, free, give the slot back.
+    fn fault_out(&self, live: &Live) {
+        let object = self.object(live);
+        let claim = self
+            .slots
+            .claim(live.slot, SlotState::Stored(object))
+            .expect("no one holds the slot");
+        self.frames.free_object(object);
+        self.slots.free(claim);
+    }
+
+    /// Reads an object back under a claim of its own and puts it as it was.
+    fn check(&self, live: &Live) {
+        let object = self.object(live);
+        let claim = self
+            .slots
+            .claim(live.slot, SlotState::Stored(object))
+            .expect("no one holds the slot");
+        assert_eq!(self.frames.payload(object, &claim), &live.block[..]);
+        self.slots.publish(claim, SlotState::Stored(object));
+    }
+
+    /// The objects as puts, for [`Fixture::finish`] to free.
+    fn puts(&self, lives: &[Live]) -> Vec<Put> {
+        lives
+            .iter()
+            .map(|live| {
+                let object = self.object(live);
+                Put {
+                    object,
+                    claim: self
+                        .slots
+                        .claim(live.slot, SlotState::Stored(object))
+                        .expect("no one holds the slot"),
+                    block: live.block.clone(),
+                }
+            })
+            .collect()
+    }
+}
+
+/// Test 12: compaction preserves every object's bytes and slot, skips a
+/// claimed slot, and gives the emptied frames back to the pool.
+#[test]
+fn compaction_moves_objects_keeping_bytes_and_slots_and_frees_frames() {
+    let mut fixture = Fixture::new();
+    // Eight frames of two 30-granule objects each, then one object freed
+    // from each of seven, which leaves seven frames at half use. The eighth
+    // frame keeps both, and one of them is held by a "fault".
+    let mut kept = Vec::new();
+    let mut freed = Vec::new();
+    for round in 0..8 {
+        let first = fixture.put(30, 2 * round);
+        let second = fixture.put(30, 2 * round + 1);
+        assert_eq!(first.object.frame(), second.object.frame());
+        kept.push(fixture.publish(first));
+        freed.push(fixture.publish(second));
+    }
+    let held = kept.remove(0);
+    let held_partner = freed.remove(0);
+    kept.push(held_partner);
+    for live in &freed {
+        fixture.fault_out(live);
+    }
+    fixture.store.drain(&fixture.frames);
+    assert_eq!(fixture.store.object_frames(), 8);
+    assert_eq!(
+        fixture.store.waste_percent_now(&fixture.frames),
+        (8 * 64 - 9 * 30) * 100 / (8 * 64)
+    );
+
+    let held_object = fixture.object(&held);
+    let held_claim = fixture
+        .slots
+        .claim(held.slot, SlotState::Stored(held_object))
+        .expect("no one holds the slot");
+    let allocated_before = allocated_bytes();
+    let mut published = 0;
+    let done = fixture
+        .store
+        .compact(&fixture.frames, &fixture.slots, usize::MAX, || {
+            published += 1;
+        });
+
+    // The seven single objects pair up into three frames, which is where
+    // the waste falls under the threshold, and the held frame is untouched.
+    assert_eq!(done.frames, 3, "compaction emptied three frames: {done:?}");
+    assert_eq!(done.objects, 3);
+    assert_eq!(done.objects, published, "each move was announced");
+    assert_eq!(done.bytes, done.objects * 30 * 64);
+    assert_eq!(fixture.store.object_frames(), 8 - done.frames);
+    assert_eq!(
+        allocated_before - allocated_bytes(),
+        done.frames * PAGE,
+        "the emptied frames went back to the pool"
+    );
+    assert!(
+        fixture.store.waste_percent_now(&fixture.frames) < COMPACT_WASTE_PERCENT,
+        "compaction stopped under the threshold"
+    );
+    // The held object did not move and reads as before, under its claim.
+    assert_eq!(fixture.slots.state(held.slot), SlotState::Claimed);
+    assert_eq!(
+        fixture.frames.payload(held_object, &held_claim),
+        &held.block[..]
+    );
+    fixture
+        .slots
+        .publish(held_claim, SlotState::Stored(held_object));
+    kept.push(held);
+    for live in &kept {
+        fixture.check(live);
+    }
+    let puts = fixture.puts(&kept);
+    fixture.finish(&puts);
+}
+
+/// A store that wastes less than the threshold is left alone.
+#[test]
+fn compaction_leaves_a_dense_store_alone() {
+    let mut fixture = Fixture::new();
+    let lives: Vec<Live> = (0..4)
+        .map(|seed| {
+            let put = fixture.put(30, seed);
+            fixture.publish(put)
+        })
+        .collect();
+    assert_eq!(
+        fixture.store.object_frames(),
+        2,
+        "two 30-granule objects fit a frame"
+    );
+    let done = fixture
+        .store
+        .compact(&fixture.frames, &fixture.slots, usize::MAX, || {
+            panic!("nothing is moved")
+        });
+    assert_eq!(done, Compacted::default());
+    for live in &lives {
+        fixture.check(live);
+    }
+    let puts = fixture.puts(&lives);
+    fixture.finish(&puts);
+}
+
+/// A pass moves no more than its budget.
+#[test]
+fn compaction_stops_at_its_budget() {
+    let mut fixture = Fixture::new();
+    let mut lives = Vec::new();
+    for round in 0..6 {
+        let first = fixture.put(30, 2 * round);
+        let second = fixture.put(30, 2 * round + 1);
+        lives.push(fixture.publish(first));
+        let second = fixture.publish(second);
+        fixture.fault_out(&second);
+    }
+    fixture.store.drain(&fixture.frames);
+    let done = fixture
+        .store
+        .compact(&fixture.frames, &fixture.slots, 30 * 64, || {});
+    assert_eq!(
+        done.objects, 1,
+        "one object's worth of budget moves one object"
+    );
+    assert_eq!(done.bytes, 30 * 64);
+    for live in &lives {
+        fixture.check(live);
+    }
+    let puts = fixture.puts(&lives);
+    fixture.finish(&puts);
+}
+
+/// Test 18, the store half: the frame filled first is the first in the age
+/// list, a frame that could not be emptied goes to the back, and the walk of
+/// a frame claims each object once.
+#[test]
+fn the_age_list_is_fill_order_and_a_frame_walk_claims_each_object_once() {
+    let mut fixture = Fixture::new();
+    // Three frames of one object each.
+    let lives: Vec<Live> = (0..3)
+        .map(|seed| {
+            let put = fixture.put(40, seed);
+            fixture.publish(put)
+        })
+        .collect();
+    let frames: Vec<StoreFrameIndex> = lives
+        .iter()
+        .map(|live| fixture.object(live).frame())
+        .collect();
+    assert_eq!(fixture.store.aged_frames(), 3);
+
+    assert_eq!(fixture.store.rotate_oldest(), Some(frames[0]));
+    assert_eq!(fixture.store.rotate_oldest(), Some(frames[1]));
+    assert_eq!(fixture.store.rotate_oldest(), Some(frames[2]));
+    assert_eq!(
+        fixture.store.rotate_oldest(),
+        Some(frames[0]),
+        "the list wraps: the oldest again"
+    );
+
+    let object = fixture.object(&lives[1]);
+    let mut cursor = 0;
+    let (claim, state) = fixture
+        .store
+        .claim_next(&fixture.frames, &fixture.slots, frames[1], &mut cursor)
+        .expect("the frame has an object");
+    assert_eq!(state, SlotState::Stored(object));
+    assert_eq!(claim.index(), lives[1].slot);
+    assert_eq!(fixture.slots.state(lives[1].slot), SlotState::Claimed);
+    assert!(
+        fixture
+            .store
+            .claim_next(&fixture.frames, &fixture.slots, frames[1], &mut cursor)
+            .is_none(),
+        "one object, claimed once"
+    );
+    fixture.slots.publish(claim, state);
+
+    // A frame emptied leaves the list.
+    fixture.fault_out(&lives[2]);
+    fixture.store.drain(&fixture.frames);
+    assert_eq!(fixture.store.aged_frames(), 2);
+    let rest = &lives[..2];
+    for live in rest {
+        fixture.check(live);
+    }
+    let puts = fixture.puts(rest);
+    fixture.finish(&puts);
 }

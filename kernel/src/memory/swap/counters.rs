@@ -52,6 +52,8 @@ pub(super) struct CounterBlock {
     rejected_incompressible: AtomicU64,
     rejected_full: AtomicU64,
     contended_waits: AtomicU64,
+    written_back: AtomicU64,
+    compacted: AtomicU64,
     /// Pages on the disk: a gauge, as a delta.
     disk_pages: AtomicI64,
     faults: [FaultCounter; 4],
@@ -97,6 +99,16 @@ impl CounterBlock {
         self.contended_waits.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A page moved from the store to the disk.
+    pub(super) fn written_back(&self) {
+        self.written_back.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Objects the store moved between its frames.
+    pub(super) fn compacted(&self, objects: usize) {
+        self.compacted.fetch_add(objects as u64, Ordering::Relaxed);
+    }
+
     pub(super) fn disk_pages(&self, delta: i64) {
         self.disk_pages.fetch_add(delta, Ordering::Relaxed);
     }
@@ -126,6 +138,8 @@ pub(super) struct Totals {
     pub(super) rejected_incompressible: u64,
     pub(super) rejected_full: u64,
     pub(super) contended_waits: u64,
+    pub(super) written_back: u64,
+    pub(super) compacted: u64,
     pub(super) disk_pages: u64,
     pub(super) faults_zero: u64,
     pub(super) faults_store: u64,
@@ -183,6 +197,8 @@ impl Counters {
             totals.rejected_incompressible += load(&block.rejected_incompressible);
             totals.rejected_full += load(&block.rejected_full);
             totals.contended_waits += load(&block.contended_waits);
+            totals.written_back += load(&block.written_back);
+            totals.compacted += load(&block.compacted);
             disk_pages += block.disk_pages.load(Ordering::Relaxed);
             for (source, field) in [
                 (FaultSource::Zero, &mut totals.faults_zero),

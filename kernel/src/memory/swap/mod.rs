@@ -21,6 +21,22 @@
 //! detached page always has somewhere to go that needs no allocation and no
 //! device.
 //!
+//! The store drains to the disk, and packs itself, on the same owner task:
+//!
+//! - **Writeback** works the store's frames oldest first, whole frames at a
+//!   time, writing each object to the disk still compressed (a parked page
+//!   raw). It runs when the store is over its limit, or refusing objects
+//!   under its hysteresis, at any pressure, down to the accept level, and
+//!   when pressure is still `Red` after a pass's eviction and compaction,
+//!   with what is left of the pass's batch.
+//! - **Compaction** runs at `Yellow` and above, when the store's frames waste
+//!   a quarter of their granules, and moves objects out of the sparsest
+//!   frames into the holes of others so that the frames they empty go back to
+//!   the pool. It takes the claim on each object it moves, as a fault does.
+//!
+//! Both are bounded by the batch the eviction pass has left, and both stop
+//! at the first fault queued for the owner.
+//!
 //! What a page-table entry's token names is a slot of the shared [`slot`]
 //! table, one atomic word per swapped page that says which tier holds its
 //! bytes. The claim protocol and its concurrency contract are in that
@@ -53,6 +69,7 @@
 //! | Fault on a disk page | Owner task, through the queue | Owner-only state |
 //! | Wait on a reserved or claimed slot | Faulting processor | [`ProgressSignal`]: mark before the test, then wait for a change |
 //! | Eviction, compression, store allocation, orphan release, store drain | Owner task | Owner-only state, plus claims on slot words |
+//! | Writeback, compaction | Owner task | A claim on each object's slot word, held across the device write (writeback) or the copy (compaction); a fault on that slot waits on [`ProgressSignal`] |
 //! | [`SwapHandle::stats`] | Any | Relaxed sums of per-processor counters |
 //! | [`SwapHandle::set_policy`] | Any | Relaxed stores to the settings |
 //!
@@ -174,7 +191,7 @@ mod store;
 
 use counters::{Counters, FaultSource, Placement, Totals};
 use policy::PolicyCells;
-use slot::{Claim, DiskKey, SlotAllocator, SlotIndex, SlotState, SlotTable};
+use slot::{Claim, DiskKey, SlotAllocator, SlotIndex, SlotState, SlotTable, StoreFrameIndex};
 use store::{Limits, Store, StoreFrames, StoreFull};
 
 pub use hooks::{InstalledAddressSpace, swap_vm_hooks};
@@ -1145,6 +1162,8 @@ where
             in_parked = after.faults_parked - before.faults_parked,
             in_disk = after.faults_disk - before.faults_disk,
             contended_waits = after.contended_waits - before.contended_waits,
+            written_back = after.written_back - before.written_back,
+            compacted = after.compacted - before.compacted,
             mean_fault_latency_nanos = latency.checked_div(pages_in).unwrap_or(0),
             disk_pages = after.disk_pages,
             store_frames = self.store.frames(),
@@ -1438,6 +1457,11 @@ where
     }
 
     async fn run_policy_pass(&mut self) {
+        // A store over its limit drains to disk whatever the pressure: the
+        // limit bounds what compression may take from the pool, and nothing
+        // else brings it back under.
+        self.write_back_over_limit().await;
+
         let pressure = current_pressure();
         if pressure == PressureLevel::Green {
             return;
@@ -1475,6 +1499,7 @@ where
                 idle_instances = candidates.len(),
                 "swapped idle instances out under yellow pressure"
             );
+            self.compact_and_write_back(moved).await;
             return;
         }
 
@@ -1502,6 +1527,159 @@ where
             bytes = moved,
             "swap pass under red pressure"
         );
+        self.compact_and_write_back(moved).await;
+    }
+
+    /// The rest of a pass that has moved `moved` bytes of its batch: compacts
+    /// the store if it wastes enough of its frames, then, if pressure is
+    /// still `Red`, writes the store's oldest frames to disk with what is
+    /// left of the batch.
+    ///
+    /// Compaction comes first because it frees frames with no device work and
+    /// may be all the pass needs.
+    async fn compact_and_write_back(&mut self, moved: usize) {
+        let mut remaining = SWAP_BATCH_BYTES.saturating_sub(moved);
+        if remaining == 0 || !self.handle.shared.faults.is_empty() {
+            return;
+        }
+        let shared = &*self.handle.shared;
+        let compacted = self.store.compact(
+            &shared.store,
+            &shared.slots,
+            remaining,
+            // A fault that found an object's slot held waits for this.
+            || shared.released.signal(),
+        );
+        if compacted.objects != 0 {
+            shared.counters.here().compacted(compacted.objects);
+            tracing::debug!(
+                target: "helios_kernel::swap",
+                objects = compacted.objects,
+                bytes = compacted.bytes,
+                frames = compacted.frames,
+                "compacted the swap store"
+            );
+        }
+        remaining = remaining.saturating_sub(compacted.bytes);
+        if current_pressure() == PressureLevel::Red {
+            let frames = remaining / PhysFrame::SIZE;
+            self.write_back(frames).await;
+        }
+    }
+
+    /// Writes the store down to its accept level if it is over its limit, or
+    /// refusing objects under the hysteresis.
+    async fn write_back_over_limit(&mut self) {
+        let policy = self.handle.shared.policy.load();
+        if self.disk.is_none() || !policy.writeback {
+            return;
+        }
+        let Some(over) = self.store.over_limit_by(store_limits(&policy)) else {
+            return;
+        };
+        let freed = self.write_back(over).await;
+        tracing::debug!(
+            target: "helios_kernel::swap",
+            frames = freed,
+            "wrote the swap store back to disk, over its limit"
+        );
+    }
+
+    /// Writes the store's oldest frames to disk, whole frames at a time,
+    /// until `frames` of them are back in the pool, or the store has no frame
+    /// it can empty, or a fault is queued. Returns the frames freed.
+    ///
+    /// Objects in the store are untouched since they were stored, because any
+    /// access faults them out, so the frame filled first is the coldest, and
+    /// writing every object in one frame frees exactly one frame: the
+    /// shortage is in frames, and a write of an object whose neighbours stay
+    /// frees none.
+    ///
+    /// Every frame is tried at most once, and a frame that is not emptied
+    /// goes to the back of the age list.
+    async fn write_back(&mut self, frames: usize) -> usize {
+        if self.disk.is_none() || !self.handle.shared.policy.load().writeback {
+            return 0;
+        }
+        let mut freed = 0;
+        for _ in 0..self.store.aged_frames() {
+            if freed >= frames || !self.handle.shared.faults.is_empty() {
+                break;
+            }
+            let Some(frame) = self.store.rotate_oldest() else {
+                break;
+            };
+            let proceed = self.write_back_frame(frame).await;
+            freed += self.store.drain(&self.handle.shared.store);
+            if !proceed {
+                break;
+            }
+            yield_now().await;
+        }
+        freed
+    }
+
+    /// Writes each object of `frame` that no fault holds to the disk, still
+    /// compressed, and a parked page raw. Returns whether the pass may go on:
+    /// `false` when the device refused a write or a fault is queued.
+    async fn write_back_frame(&mut self, frame: StoreFrameIndex) -> bool {
+        let shared = &*self.handle.shared;
+        let disk = self
+            .disk
+            .as_mut()
+            .expect("writeback runs only when a disk is attached");
+        let mut cursor = 0;
+        while let Some((claim, state)) =
+            self.store
+                .claim_next(&shared.store, &shared.slots, frame, &mut cursor)
+        {
+            // Checked after the claim is held and before the write begins: a
+            // fault queued meanwhile has a guest stopped behind it, and this
+            // object goes back as it was.
+            if !shared.faults.is_empty() {
+                shared.restore(claim, state);
+                return false;
+            }
+            let (bytes, encoding) = match state {
+                SlotState::Stored(object) => (
+                    shared.store.payload(object, &claim),
+                    DiskEncoding::Lz4(object.len()),
+                ),
+                SlotState::Parked(index) => {
+                    (shared.store.parked_page(index, &claim), DiskEncoding::Raw)
+                }
+                other => unreachable!("a store walk claimed a slot from {other:?}"),
+            };
+            // The claim is held across the write: a fault on this page waits
+            // on the slot, and the bytes cannot move or be freed under it.
+            let written = disk.backend.swap_out(bytes).await;
+            match written {
+                Ok(token) => {
+                    let key = disk.insert(token, encoding);
+                    // The frame is queued for the owner's drain, which the
+                    // caller runs once the frame's objects are done.
+                    match state {
+                        SlotState::Stored(object) => shared.store.free_object(object),
+                        SlotState::Parked(index) => shared.store.free_parked(index),
+                        _ => unreachable!("matched above"),
+                    };
+                    let counters = shared.counters.here();
+                    counters.written_back();
+                    counters.disk_pages(1);
+                    shared.restore(claim, SlotState::Disk(key));
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "helios_kernel::swap",
+                        %error,
+                        "swap backend refused a page written back from the store"
+                    );
+                    shared.restore(claim, state);
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// Swaps up to `budget` bytes of `instance`'s cold pages out, and
@@ -1659,18 +1837,13 @@ where
         let mut encoding = DiskEncoding::Raw;
         match policy.gate().accept(block_len) {
             Some(len) => {
-                let limits = Limits {
-                    pool_frames: user_heap_stats().total_bytes / PhysFrame::SIZE,
-                    limit_percent: policy.store_limit_percent,
-                    accept_percent: policy.store_accept_percent,
-                };
                 let shared = &self.handle.shared;
                 match self.store.allocate(
                     &shared.store,
                     claim.index(),
                     &self.block[..block_len],
                     len,
-                    limits,
+                    store_limits(&policy),
                 ) {
                     Ok(object) => {
                         shared.restore(claim, SlotState::Stored(object));
@@ -1749,6 +1922,17 @@ where
         shared.restore(claim, SlotState::Parked(frame));
         shared.counters.here().page_out(Placement::Parked);
         Placed::Out
+    }
+}
+
+/// The store's bounds under `policy`, against the pool as it is now: the
+/// pool's total shrinks when the kernel heap borrows from it, so the bounds
+/// are read for each decision.
+fn store_limits(policy: &SwapPolicy) -> Limits {
+    Limits {
+        pool_frames: user_heap_stats().total_bytes / PhysFrame::SIZE,
+        limit_percent: policy.store_limit_percent,
+        accept_percent: policy.store_accept_percent,
     }
 }
 

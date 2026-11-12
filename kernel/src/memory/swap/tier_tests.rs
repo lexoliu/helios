@@ -552,3 +552,276 @@ fn the_owner_serves_a_queued_fault_whose_page_became_a_ram_page() {
     assert_eq!(harness.contents(addr), original);
     harness.finish();
 }
+
+/// A page whose LZ4 block takes about 38 granules, so two never share a
+/// store frame: 2400 bytes of DRBG output, then zeroes.
+fn half_page(seed: u64) -> Vec<u8> {
+    let mut page = random_page(seed);
+    page[2400..].fill(0);
+    page
+}
+
+/// Evicts `count` half pages, each into a frame of its own, oldest first.
+fn evict_half_pages(harness: &mut Harness, count: usize) -> Vec<(VirtAddr, Vec<u8>)> {
+    let pages: Vec<(VirtAddr, Vec<u8>)> = (0..count)
+        .map(|number| {
+            let bytes = half_page(100 + number as u64);
+            (harness.resident_with(number + 1, bytes.clone()), bytes)
+        })
+        .collect();
+    for (addr, _) in &pages {
+        assert_eq!(harness.evict(*addr), Ok(Placed::Out));
+        assert!(matches!(
+            harness.slot(harness.index_of(*addr).expect("swapped out")),
+            SlotState::Stored(_)
+        ));
+    }
+    assert_eq!(harness.service.store.object_frames(), count);
+    pages
+}
+
+/// Test 18: writeback empties the oldest frame first and frees it, writing
+/// the compressed block to the disk.
+#[test]
+fn writeback_empties_the_oldest_frame_first_and_frees_it() {
+    let mut harness = Harness::tiered();
+    let pages = evict_half_pages(&mut harness, 4);
+    let allocated = allocated_bytes();
+
+    let freed = block_on(harness.service.write_back(1));
+    assert_eq!(freed, 1);
+    assert_eq!(harness.service.store.object_frames(), 3);
+    assert_eq!(
+        allocated - allocated_bytes(),
+        PAGE,
+        "the frame went back to the pool"
+    );
+
+    let token = harness.index_of(pages[0].0).expect("still swapped out");
+    let SlotState::Disk(key) = harness.slot(token) else {
+        panic!("the oldest page was written to the disk");
+    };
+    let disk = harness.service.disk.as_ref().expect("a disk");
+    assert!(matches!(disk.get(key).encoding, DiskEncoding::Lz4(_)));
+    let extents = harness.backend.extents();
+    assert_eq!(extents.len(), 1);
+    let mut restored = vec![0_u8; PAGE];
+    let len = decompress_into(&extents[0], &mut restored).expect("a compressed block");
+    assert_eq!(len, PAGE);
+    assert_eq!(
+        restored, pages[0].1,
+        "the disk holds the page's block, still compressed"
+    );
+    for (addr, _) in &pages[1..] {
+        let token = harness.index_of(*addr).expect("swapped out");
+        assert!(
+            matches!(harness.slot(token), SlotState::Stored(_)),
+            "the younger pages stayed in the store"
+        );
+    }
+    let totals = harness.handle.shared.counters.totals();
+    assert_eq!((totals.written_back, totals.disk_pages), (1, 1));
+
+    for (addr, bytes) in &pages {
+        harness.fault(*addr).expect("every page faults back");
+        assert_eq!(&harness.contents(*addr), bytes);
+    }
+    harness.finish();
+}
+
+/// A store over its limit is written down to its accept level whatever the
+/// pressure, and one that is not is left alone.
+#[test]
+fn a_store_over_its_limit_is_written_down_to_the_accept_level() {
+    let mut harness = Harness::tiered();
+    let pages = evict_half_pages(&mut harness, 5);
+
+    block_on(harness.service.write_back_over_limit());
+    assert_eq!(
+        harness.service.store.object_frames(),
+        5,
+        "a store under its limit is left alone"
+    );
+
+    // The pool has 4096 frames: 1% is 40 frames, which five frames are under.
+    // A limit of nothing puts the store over it, with an accept level of
+    // nothing too.
+    harness
+        .handle
+        .set_policy(SwapPolicy {
+            store_limit_percent: 0,
+            ..SwapPolicy::default()
+        })
+        .expect("a limit of nothing is in range");
+    block_on(harness.service.write_back_over_limit());
+    assert_eq!(harness.service.store.object_frames(), 0);
+    assert_eq!(harness.backend.extents().len(), 5);
+    let totals = harness.handle.shared.counters.totals();
+    assert_eq!(totals.written_back, 5);
+    for (addr, bytes) in &pages {
+        harness.fault(*addr).expect("every page faults back");
+        assert_eq!(&harness.contents(*addr), bytes);
+    }
+    harness.finish();
+}
+
+/// With writeback off, or no disk, nothing is written.
+#[test]
+fn writeback_off_or_without_a_disk_writes_nothing() {
+    let mut harness = Harness::tiered();
+    let pages = evict_half_pages(&mut harness, 2);
+    harness
+        .handle
+        .set_policy(SwapPolicy {
+            store_limit_percent: 0,
+            writeback: false,
+            ..SwapPolicy::default()
+        })
+        .expect("in range");
+    block_on(harness.service.write_back_over_limit());
+    assert_eq!(block_on(harness.service.write_back(2)), 0);
+    assert_eq!(harness.backend.extents().len(), 0);
+    for (addr, _) in &pages {
+        harness.fault(*addr).expect("faults back from the store");
+    }
+    harness.finish();
+
+    let mut harness = Harness::diskless();
+    let pages = evict_half_pages(&mut harness, 2);
+    assert_eq!(block_on(harness.service.write_back(2)), 0);
+    for (addr, _) in &pages {
+        harness.fault(*addr).expect("faults back from the store");
+    }
+    harness.finish();
+}
+
+/// An object a fault holds is passed over, its frame goes to the back of the
+/// age list, and the rest of the pass goes on.
+#[test]
+fn writeback_passes_over_an_object_a_fault_holds() {
+    let mut harness = Harness::tiered();
+    let pages = evict_half_pages(&mut harness, 3);
+    let token = harness.index_of(pages[0].0).expect("swapped out");
+    let index = SlotIndex::from_token(token).expect("a slot index");
+    let state = harness.slot(token);
+    let claim = harness
+        .handle
+        .shared
+        .slots
+        .claim(index, state)
+        .expect("no one holds the slot");
+
+    assert_eq!(block_on(harness.service.write_back(3)), 2);
+    assert_eq!(harness.service.store.object_frames(), 1);
+    assert_eq!(harness.slot(token), SlotState::Claimed);
+
+    harness.handle.shared.restore(claim, state);
+    assert_eq!(harness.slot(token), state, "the held object is as it was");
+    assert_eq!(block_on(harness.service.write_back(3)), 1);
+    assert_eq!(harness.service.store.object_frames(), 0);
+    for (addr, bytes) in &pages {
+        harness.fault(*addr).expect("every page faults back");
+        assert_eq!(&harness.contents(*addr), bytes);
+    }
+    harness.finish();
+}
+
+/// A refused write puts the object back as it was and ends the pass; the next
+/// pass writes it.
+#[test]
+fn a_refused_writeback_leaves_the_object_in_the_store() {
+    let mut harness = Harness::tiered();
+    let pages = evict_half_pages(&mut harness, 2);
+    harness.backend.refuse_writes(1);
+
+    assert_eq!(block_on(harness.service.write_back(2)), 0);
+    assert_eq!(harness.service.store.object_frames(), 2);
+    for (addr, _) in &pages {
+        let token = harness.index_of(*addr).expect("swapped out");
+        assert!(matches!(harness.slot(token), SlotState::Stored(_)));
+    }
+    assert_eq!(block_on(harness.service.write_back(2)), 2);
+    for (addr, bytes) in &pages {
+        harness.fault(*addr).expect("every page faults back");
+        assert_eq!(&harness.contents(*addr), bytes);
+    }
+    harness.finish();
+}
+
+/// A page parked after the disk refused it is written back raw once the disk
+/// takes writes again, and frees its frame.
+#[test]
+fn a_parked_page_is_written_back_raw() {
+    let mut harness = Harness::tiered();
+    let original = random_page(31);
+    let addr = harness.resident_with(1, original.clone());
+    harness.backend.refuse_writes(1);
+    assert_eq!(harness.evict(addr), Ok(Placed::Out));
+    let token = harness.index_of(addr).expect("swapped out");
+    assert!(matches!(harness.slot(token), SlotState::Parked(_)));
+
+    assert_eq!(block_on(harness.service.write_back(1)), 1);
+    let SlotState::Disk(key) = harness.slot(token) else {
+        panic!("the parked page went to the disk");
+    };
+    assert!(matches!(
+        harness
+            .service
+            .disk
+            .as_ref()
+            .expect("a disk")
+            .get(key)
+            .encoding,
+        DiskEncoding::Raw
+    ));
+    assert_eq!(harness.backend.extents(), core::slice::from_ref(&original));
+    harness.fault(addr).expect("faults back from the disk");
+    assert_eq!(harness.contents(addr), original);
+    harness.finish();
+}
+
+/// A fault on an object being written back waits for the write, then reads
+/// the page from the disk.
+#[test]
+fn a_fault_during_writeback_waits_for_the_slot_and_reads_the_disk() {
+    let mut harness = Harness::tiered();
+    let pages = evict_half_pages(&mut harness, 1);
+    let (addr, bytes) = &pages[0];
+    let token = harness.index_of(*addr).expect("swapped out");
+    let index = SlotIndex::from_token(token).expect("a slot index");
+    let state = harness.slot(token);
+    // The owner holds the claim, as it does across the device write.
+    let claim = harness
+        .handle
+        .shared
+        .slots
+        .claim(index, state)
+        .expect("no one holds the slot");
+    let handle = harness.handle.clone();
+    let mut fault = Box::pin(handle.fault_in(*addr));
+    assert!(
+        poll(&mut fault).is_none(),
+        "the fault waits on the claimed slot"
+    );
+
+    let key = {
+        let disk = harness.service.disk.as_mut().expect("a disk");
+        let backend_token =
+            block_on(disk.backend.swap_out(&bytes[..])).expect("the test disk takes the write");
+        disk.insert(backend_token, DiskEncoding::Raw)
+    };
+    let SlotState::Stored(object) = state else {
+        unreachable!("evicted into the store")
+    };
+    harness.handle.shared.store.free_object(object);
+    harness.handle.shared.restore(claim, SlotState::Disk(key));
+    harness.service.store.drain(&harness.handle.shared.store);
+
+    // Woken by the release, the fault finds the page on the disk and asks
+    // the owner, which reads it.
+    assert!(poll(&mut fault).is_none());
+    harness.serve();
+    assert_eq!(poll(&mut fault), Some(Ok(())));
+    assert_eq!(&harness.contents(*addr), bytes);
+    harness.finish();
+}
