@@ -1635,6 +1635,13 @@ pub(crate) struct VmCommand {
     #[arg(long, default_value_t = false)]
     no_compiler_plugin: bool,
 
+    /// The directory whose files the boot image carries beside the
+    /// programs: `init.txt`, and the `etc/fstab` and `etc/rc` init
+    /// reads. Defaults to `programs/init/bootfs`; a relative path is
+    /// relative to the repository root.
+    #[arg(long, value_name = "DIR")]
+    bootfs_root: Option<PathBuf>,
+
     /// Directory for VM sockets, logs, and generated boot artifacts.
     #[arg(long)]
     runtime_dir: Option<PathBuf>,
@@ -2148,6 +2155,8 @@ struct KernelBuildSpec {
     profile_use: Option<KernelProfileUse>,
     boot_programs: Vec<String>,
     no_compiler_plugin: bool,
+    /// The boot image's file tree, when not the prebuild's default.
+    bootfs_root: Option<PathBuf>,
 }
 
 /// Which profile a `profile-use` kernel reads, and what that makes of
@@ -2344,6 +2353,7 @@ fn resolve_build(
         profile_use,
         boot_programs,
         no_compiler_plugin,
+        bootfs_root: command.bootfs_root.clone(),
     })
 }
 
@@ -3045,6 +3055,9 @@ fn run_kernel_prebuild(command: &KernelBuildSpec) -> Result<(), VmBuildError> {
     }
     if command.no_compiler_plugin {
         prebuild.arg("--no-compiler-plugin");
+    }
+    if let Some(root) = &command.bootfs_root {
+        prebuild.arg("--bootfs-root").arg(root);
     }
     run_step("prebuilding kernel bootfs", &mut prebuild)?;
     Ok(())
@@ -7100,6 +7113,7 @@ mod tests {
             profile_use: None,
             boot_programs: Vec::new(),
             no_compiler_plugin: true,
+            bootfs_root: None,
         };
         let root = Path::new("/checkout");
         for kind in [
@@ -7666,6 +7680,7 @@ mod tests {
             enable_targets: Vec::new(),
             boot_programs: Vec::new(),
             no_compiler_plugin: false,
+            bootfs_root: None,
             runtime_dir: None,
             keep_runtime_dir: false,
             acpi: false,
@@ -7728,6 +7743,7 @@ mod tests {
             enable_targets: Vec::new(),
             boot_programs: Vec::new(),
             no_compiler_plugin: false,
+            bootfs_root: None,
             runtime_dir: None,
             keep_runtime_dir: false,
             acpi: false,
@@ -7901,6 +7917,7 @@ mod tests {
             enable_targets: Vec::new(),
             boot_programs: Vec::new(),
             no_compiler_plugin: false,
+            bootfs_root: None,
             runtime_dir: None,
             keep_runtime_dir: false,
             acpi: false,
@@ -8003,6 +8020,7 @@ mod tests {
             profile_use: None,
             boot_programs: vec!["debugger".to_owned()],
             no_compiler_plugin: true,
+            bootfs_root: None,
         };
         ResolvedVmCommand {
             profile,
@@ -8216,6 +8234,7 @@ mod tests {
             profile_use: None,
             boot_programs: Vec::new(),
             no_compiler_plugin: false,
+            bootfs_root: None,
         };
         ResolvedVmCommand {
             profile,
