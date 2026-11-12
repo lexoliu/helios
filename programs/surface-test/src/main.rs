@@ -72,7 +72,7 @@ async fn draw_once() -> Result<(), SurfaceTestError> {
         size.width, size.height
     );
 
-    for pixel in surface.pixels().chunks_exact_mut(BYTES_PER_PIXEL) {
+    for pixel in surface.pixels().as_chunks_mut::<BYTES_PER_PIXEL>().0 {
         pixel.copy_from_slice(&PIXEL);
     }
     surface.commit_all().await?;

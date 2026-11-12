@@ -146,6 +146,7 @@ async fn dispatch(
             let response = response
                 .map(|result| programs::AotResult {
                     destination_path: result.destination_path,
+                    worker_threads: result.worker_threads,
                 })
                 .map_err(|error| programs::ExecError {
                     kind: convert_launch_error_kind(error.kind),
