@@ -122,6 +122,10 @@ struct FlakyState {
     writes_to_refuse: u32,
     /// Every token passed to `release`, in call order.
     released: Vec<u64>,
+    /// The address of a page whose range the next successful read
+    /// decommits while it is in flight: the page-table entry is gone and
+    /// its token is queued for the drain by the time the read lands.
+    decommit_on_read: Option<usize>,
 }
 
 /// A backend whose reads and writes fail on demand. A failed read leaves
@@ -139,6 +143,10 @@ impl FlakyBackend {
 
     fn refuse_writes(&self, count: u32) {
         self.state.lock().unwrap().writes_to_refuse = count;
+    }
+
+    fn decommit_during_next_read(&self, addr: VirtAddr) {
+        self.state.lock().unwrap().decommit_on_read = Some(addr.raw());
     }
 
     fn released(&self) -> Vec<u64> {
@@ -180,6 +188,13 @@ impl SwapBackend for FlakyBackend {
         }
         let bytes = state.extents.remove(&token).expect("a live token");
         dst.copy_from_slice(&bytes);
+        if let Some(addr) = state.decommit_on_read.take() {
+            with_space(|space| {
+                if let Some(FakePage::Swapped(token)) = space.pages.remove(&addr) {
+                    space.orphans.push(token);
+                }
+            });
+        }
         Ok(())
     }
 
@@ -222,7 +237,9 @@ impl Harness {
             hooks: &TEST_HOOKS,
             registry: InstanceRegistry::new(),
             cpu: TestCpu::with_entropy(0),
-            map: SwapMap::new(),
+            slots: SlotAllocator::new(),
+            disk: DiskEntries::new(),
+            deferred: Vec::new(),
             page: vec![0_u8; PAGE].into_boxed_slice(),
             report: SwapReport::default(),
         };
@@ -252,6 +269,14 @@ impl Harness {
     /// The index the page-table entry carries, if the page is swapped.
     fn index_of(&self, addr: VirtAddr) -> Option<SwapToken> {
         (TEST_HOOKS.swapped_token)(addr)
+    }
+
+    /// What the shared slot table says about the slot a token names.
+    fn slot(&self, token: SwapToken) -> SlotState {
+        self.handle
+            .shared
+            .slots
+            .state(SlotIndex::from_token(token).expect("a token within the table"))
     }
 
     fn contents(&self, addr: VirtAddr) -> Vec<u8> {
@@ -514,4 +539,119 @@ fn fault_latency_counts_the_time_a_request_spent_queued() {
         stats.mean_fault_latency_nanos, 50_000,
         "latency runs from the request to its completion, queue included"
     );
+}
+
+#[test]
+fn a_stale_token_is_refused_and_the_fault_reads_the_entry_again() {
+    let mut harness = Harness::new();
+    let a = harness.resident(1, 0x11);
+    let b = harness.resident(2, 0x22);
+    let c = harness.resident(3, 0x33);
+    harness.evict(a).expect("evict a");
+    let stale = harness.index_of(a).expect("a is swapped");
+    harness.evict(b).expect("evict b");
+    harness.fault(a).expect("a comes back and frees its slot");
+    harness.evict(c).expect("evict c");
+    assert_eq!(
+        harness.index_of(c),
+        Some(stale),
+        "the slot a freed is reused for another page"
+    );
+    harness.evict(a).expect("evict a again");
+    let current = harness.index_of(a).expect("a is swapped again");
+    assert_ne!(current, stale, "a went out under another slot");
+
+    // A fault that read `stale` for `a` before all of that happened.
+    let landed = block_on(harness.service.swap_in_token(a, stale));
+    assert!(
+        matches!(landed, Ok(Landed::Stale)),
+        "the address space refuses a token that is not the entry's"
+    );
+    assert_eq!(
+        harness.index_of(c),
+        Some(stale),
+        "the slot's own page is where it was"
+    );
+    assert!(matches!(harness.slot(stale), SlotState::Disk(_)));
+
+    harness.fault(a).expect("the retry reads the entry again");
+    assert_eq!(
+        harness.contents(a),
+        pattern(0x11),
+        "a reads back its own bytes"
+    );
+    harness.fault(c).expect("c is unharmed");
+    assert_eq!(harness.contents(c), pattern(0x33));
+    harness.fault(b).expect("b is unharmed");
+    assert_eq!(harness.contents(b), pattern(0x22));
+}
+
+#[test]
+fn a_read_that_lands_after_the_range_was_decommitted_leaves_the_slot_for_the_drain() {
+    let mut harness = Harness::new();
+    let addr = harness.resident(1, 0x77);
+    harness.evict(addr).expect("evict");
+    let index = harness.index_of(addr).expect("swapped");
+    assert_eq!(harness.handle.stats().used_bytes, PAGE as u64);
+
+    harness.backend.decommit_during_next_read(addr);
+    assert_eq!(
+        harness.fault(addr),
+        Ok(()),
+        "a decommitted page is not a failed fault: the retried instruction classifies it afresh"
+    );
+    assert_eq!(harness.slot(index), SlotState::Vacant);
+    assert_eq!(harness.handle.stats().pages_in, 0, "nothing was reinstated");
+    assert_eq!(
+        harness.handle.stats().used_bytes,
+        0,
+        "the extent was consumed by the read"
+    );
+
+    block_on(harness.service.release_orphaned_tokens());
+    assert!(matches!(harness.slot(index), SlotState::Free { .. }));
+    assert_eq!(
+        harness.backend.released(),
+        Vec::<u64>::new(),
+        "the extent was consumed by the read and is not released again"
+    );
+    let next = harness.resident(2, 0x78);
+    harness.evict(next).expect("evict next");
+    assert_eq!(harness.index_of(next), Some(index), "the slot is reused");
+}
+
+#[test]
+fn an_orphan_that_meets_a_claimed_slot_is_kept_until_the_claim_resolves() {
+    let mut harness = Harness::new();
+    let addr = harness.resident(1, 0x55);
+    harness.evict(addr).expect("evict");
+    let index = harness.index_of(addr).expect("swapped");
+    let state = harness.slot(index);
+    let slot = SlotIndex::from_token(index).expect("in the table");
+    let claim = harness
+        .handle
+        .shared
+        .slots
+        .claim(slot, state)
+        .expect("nothing else holds the slot");
+
+    // The range is decommitted while a fault holds the slot.
+    with_space(|space| {
+        space.pages.remove(&addr.raw());
+    });
+    harness.teardown(index);
+    assert_eq!(harness.slot(index), SlotState::Claimed);
+    assert_eq!(harness.backend.released(), Vec::<u64>::new());
+
+    // The fault's reinstatement was refused, the entry being gone, and it
+    // put the word back.
+    harness.handle.shared.slots.publish(claim, state);
+    block_on(harness.service.release_orphaned_tokens());
+    assert_eq!(
+        harness.backend.released(),
+        vec![1],
+        "the kept orphan is released on the next pass, with no new one drained"
+    );
+    assert!(matches!(harness.slot(index), SlotState::Free { .. }));
+    assert_eq!(harness.handle.stats().used_bytes, 0);
 }
