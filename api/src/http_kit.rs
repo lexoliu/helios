@@ -24,6 +24,8 @@ use std::time::Instant;
 use executor_core::LocalExecutor;
 use executor_core::async_task::{AsyncTask, spawn_local};
 use futures_lite::stream::{Stream, once_future};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use http_kit_io::splice::{FilledPipe, Pipe, Spliced};
 use http_kit_io::{
     Answer, BufResult, Dial, IoBuf, IoBufMut, IoVectoredBuf, Read, ReadAhead, ReadOwned, Received,
     Resolve, SendFile, SpliceRead, SpliceWrite, Split, TcpOptions, Timer, Write,
@@ -306,7 +308,32 @@ impl ReadAhead for ReadHalf {
     }
 }
 
-impl SpliceRead for ReadHalf {}
+/// A connection's bytes cross the `wasi:sockets` streams, never a kernel
+/// descriptor a pipe could take them from, so it never splices and is
+/// forwarded by reading and writing.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn unsplicable() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "a wasi:sockets connection has no descriptor to splice",
+    )
+}
+
+impl SpliceRead for ReadHalf {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn can_splice(&self) -> bool {
+        false
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    async fn splice_to_pipe(
+        &mut self,
+        pipe: Pipe,
+        _max: usize,
+    ) -> Result<Spliced, (io::Error, Pipe)> {
+        Err((unsplicable(), pipe))
+    }
+}
 
 impl Write for WriteHalf {
     async fn write<B: IoBuf>(&mut self, buf: B) -> BufResult<usize, B> {
@@ -374,7 +401,17 @@ impl SendFile for WriteHalf {
     }
 }
 
-impl SpliceWrite for WriteHalf {}
+impl SpliceWrite for WriteHalf {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn can_splice(&self) -> bool {
+        false
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    async fn splice_from_pipe(&mut self, _filled: FilledPipe) -> io::Result<Pipe> {
+        Err(unsplicable())
+    }
+}
 
 impl Split for TcpConnection {
     type ReadHalf = ReadHalf;
@@ -437,9 +474,33 @@ impl SendFile for TcpConnection {
     }
 }
 
-impl SpliceRead for TcpConnection {}
+impl SpliceRead for TcpConnection {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn can_splice(&self) -> bool {
+        SpliceRead::can_splice(&self.reader)
+    }
 
-impl SpliceWrite for TcpConnection {}
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn splice_to_pipe(
+        &mut self,
+        pipe: Pipe,
+        max: usize,
+    ) -> impl Future<Output = Result<Spliced, (io::Error, Pipe)>> {
+        self.reader.splice_to_pipe(pipe, max)
+    }
+}
+
+impl SpliceWrite for TcpConnection {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn can_splice(&self) -> bool {
+        SpliceWrite::can_splice(&self.writer)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn splice_from_pipe(&mut self, filled: FilledPipe) -> impl Future<Output = io::Result<Pipe>> {
+        self.writer.splice_from_pipe(filled)
+    }
+}
 
 impl TcpOptions for TcpConnection {
     /// The Helios network stack has no Nagle algorithm: segments are sent as
