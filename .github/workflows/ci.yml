@@ -1586,7 +1586,8 @@ jobs:
           ls -la /dev/kvm /dev/dri
           # lavapipe is the only Vulkan driver this runner can enumerate;
           # naming it keeps the loader from probing the hardware ones.
-          icd=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+          # Mesa 25's package names the ICD without an architecture suffix.
+          icd=/usr/share/vulkan/icd.d/lvp_icd.json
           test -f "$icd"
           echo "VK_DRIVER_FILES=$icd" >> "$GITHUB_ENV"
       - name: Restore the pinned virglrenderer install prefix
