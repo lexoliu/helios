@@ -979,9 +979,10 @@ pub fn disable_swap(reason: SwapDisabled) {
 /// `Backend` names the type of that device, which the owner has to be
 /// compiled against; a platform with no device never builds one.
 ///
-/// The owner holds nothing bound to its processor: the swap backend runs any
-/// operation from any task on any processor, so it starts on the calling
-/// one and may be moved.
+/// The owner runs on the calling processor. Nothing ties the device to that
+/// processor: the swap backend runs any operation from any task on any
+/// processor, so the platform may bring its disk up and route the disk's
+/// interrupt anywhere.
 pub fn install_swap<CpuImpl, Backend>(
     spawner: Spawner<CpuImpl>,
     timer: Timer<CpuImpl>,

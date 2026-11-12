@@ -82,6 +82,14 @@ pub(crate) enum Content {
     Mixed,
 }
 
+/// What one page holds: a [`Content`] with the mix resolved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PageContent {
+    Random,
+    Text,
+    Zero,
+}
+
 impl Content {
     const NAMES: [(&'static str, Self); 4] = [
         ("random", Self::Random),
@@ -106,10 +114,14 @@ impl Content {
 
     /// The content of page `index`: itself, or for a mix the third the
     /// index falls in.
-    fn of_page(self, index: u64) -> Self {
+    fn of_page(self, index: u64) -> PageContent {
         match self {
-            Self::Mixed => [Self::Random, Self::Text, Self::Zero][(index % 3) as usize],
-            single => single,
+            Self::Random => PageContent::Random,
+            Self::Text => PageContent::Text,
+            Self::Zero => PageContent::Zero,
+            Self::Mixed => {
+                [PageContent::Random, PageContent::Text, PageContent::Zero][(index % 3) as usize]
+            }
         }
     }
 }
@@ -186,20 +198,19 @@ impl SplitMix64 {
 /// caught. A zero page is zeros, which is all there is to check.
 fn fill_page(content: Content, seed: u64, index: u64, page: &mut [u8]) {
     match content.of_page(index) {
-        Content::Random => {
+        PageContent::Random => {
             let mut generator = SplitMix64(seed ^ index);
             for word in page.chunks_exact_mut(size_of::<u64>()) {
                 word.copy_from_slice(&generator.next().to_le_bytes());
             }
         }
-        Content::Text => {
+        PageContent::Text => {
             let windows = TEXT.len() - PAGE_BYTES + 1;
             let start = (index as usize).wrapping_mul(TEXT_STRIDE) % windows;
             page.copy_from_slice(&TEXT[start..start + PAGE_BYTES]);
             page[..size_of::<u64>()].copy_from_slice(&index.to_le_bytes());
         }
-        Content::Zero => page.fill(0),
-        Content::Mixed => unreachable!("`of_page` resolves a mix to one of its thirds"),
+        PageContent::Zero => page.fill(0),
     }
 }
 
