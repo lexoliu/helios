@@ -5,13 +5,19 @@ at `../wasmtime/crates/wasmtime`.
 
 ## Required revision
 
-The local checkout must be at (branch `helios/stack-limit-percpu`):
+The local checkout must be at (branch `helios/next-solver-bindgen`):
 
 ```text
-1ed7678a8ee4f57cbe4a4e89ade7f7fda6092055
+18b428e6becfb6138b877a3fe70afb08bf5724ba
 ```
 
-That revision is `helios/parking-wait-cancel` at
+That revision is `helios/stack-limit-percpu` at
+`1ed7678a8ee4f57cbe4a4e89ade7f7fda6092055` plus upstream
+bytecodealliance/wasmtime#14193 (30dddb655), which spells out the type
+arguments of `with_getter` and `Access::new` in the code `bindgen!`
+generates; nightly's next-generation trait solver no longer infers them.
+
+`helios/stack-limit-percpu` is `helios/parking-wait-cancel` at
 `2fb47b20c7ff9a91b6dbc03062d1dd4dddab4969` plus four additive commits,
 which make each stack-limit interruption check one compare against the
 executing processor's own word (#465):
@@ -219,7 +225,7 @@ This revision is based on upstream Wasmtime commit:
 ```
 
 It corresponds to Wasmtime 48.0.0-dev and requires Rust 1.95 or newer. Helios
-pins `nightly-2026-06-15` in `rust-toolchain.toml` for Rust 1.98 and installs all
+pins `nightly-2026-11-03` in `rust-toolchain.toml` for Rust 1.101 and installs all
 host, bare-metal, and WASI targets used by the workspace.
 
 ## Patch series

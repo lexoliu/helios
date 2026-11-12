@@ -265,6 +265,11 @@ pub trait SwapBackend: Send + Sync + 'static {
     /// later resurrect them via `swap_in`. The implementation owns
     /// the lifecycle of the storage and decides eviction order on
     /// its own.
+    ///
+    /// A `swap_out` dropped before it resolves hands out no token, so
+    /// the storage it allocated stays the implementation's to reclaim:
+    /// it gives the storage back once no write the dropped call issued
+    /// can still land there, and never hands it to another page before.
     fn swap_out<'a>(
         &'a self,
         bytes: &'a [u8],
@@ -272,7 +277,14 @@ pub trait SwapBackend: Send + Sync + 'static {
 
     /// Restore previously swapped-out bytes into `dst`. After this
     /// returns successfully, the token is no longer valid (the
-    /// storage may be reclaimed).
+    /// storage may be reclaimed) and must not be passed to
+    /// [`Self::release`].
+    ///
+    /// Only a successful `swap_in` consumes the token. One that fails,
+    /// or is dropped before it resolves, leaves the token valid and its
+    /// storage intact: the caller still holds the token, so retrying or
+    /// releasing it later neither loses the page's only copy nor frees
+    /// storage that has gone to another page.
     fn swap_in<'a>(
         &'a self,
         token: Self::Token,
@@ -283,10 +295,12 @@ pub trait SwapBackend: Send + Sync + 'static {
     ///
     /// This is the path an instance's death takes: the pages it had
     /// swapped out are never coming back, and holding their extents
-    /// would leak the swap device one dead instance at a time. Releasing
-    /// a token that `swap_in` already consumed is not an error, so a
-    /// caller racing a fault against a teardown does not have to
-    /// serialise them.
+    /// would leak the swap device one dead instance at a time.
+    ///
+    /// A token is released at most once, and never after a successful
+    /// `swap_in` consumed it: its storage may already belong to another
+    /// page, so an implementation does not check for this and a caller
+    /// serialises a fault against a teardown of the same page.
     fn release<'a>(&'a self, token: Self::Token) -> impl Future<Output = ()> + Send + 'a;
 }
 
@@ -603,13 +617,17 @@ pub trait AddressSpace: Send + Sync + 'static {
 
     /// Detach the committed page at `addr` so its frame can be reused.
     ///
-    /// The page's bytes are copied into `out` (exactly one frame long,
-    /// caller-owned so the address space never hands a raw frame out),
-    /// the leaf entry becomes a not-present entry carrying `token`, and
-    /// the frame goes back to this address space's own pool. Per §3.4
-    /// the call invalidates the local TLB and shoots down every other
-    /// processor that has run in this space before it returns, so no
-    /// processor can still reach the frame afterwards.
+    /// The leaf entry becomes a not-present entry carrying `token`, the
+    /// local TLB is invalidated and every other processor that has run in
+    /// this space has acknowledged a shootdown (§3.5), and only then is
+    /// the page's frame read: its bytes are copied into `out` (exactly one
+    /// frame long, caller-owned so the address space never hands a raw
+    /// frame out) and the frame goes back to this address space's own
+    /// pool. Reading after the shootdown is what makes the copy complete:
+    /// a store from a processor that was still running in the space has
+    /// landed in the frame before the copy or faulted on the not-present
+    /// entry, and cannot land in a frame that has already been read. A
+    /// copy taken before the leaf is replaced loses such a store.
     ///
     /// The flags the page had are returned; [`Self::swap_in_page`]
     /// needs them to put the page back exactly as it was.

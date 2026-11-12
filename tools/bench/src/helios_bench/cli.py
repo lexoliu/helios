@@ -58,6 +58,7 @@ def command_run(args: argparse.Namespace) -> int:
         sides=sides,
         workload_names=args.workloads,
         iterations=args.iterations,
+        rounds=args.rounds,
         runner_label=args.runner_label,
         allow_busy_host=args.allow_busy_host,
         prebuilt=args.prebuilt,
@@ -236,6 +237,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--sides", default="helios,linux_native,linux_wasmtime")
     run.add_argument("--workload", dest="workloads", action="append", default=[])
     run.add_argument("--iterations", type=int)
+    run.add_argument(
+        "--rounds",
+        type=int,
+        help="alternating rounds (an even number): each round times both sides once and consecutive "
+        "rounds swap which goes first; overrides the lane's `rounds`",
+    )
     run.add_argument("--runner-label")
     run.add_argument("--allow-busy-host", action="store_true")
     run.add_argument(

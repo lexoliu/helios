@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from helios_bench import REPO_ROOT, TOOLS_BENCH_ROOT, WASI_APPS_ROOT
 from helios_bench.wasi_apps import fedora_baseline
@@ -34,6 +34,41 @@ class Statistics(BaseModel):
     bootstrap_seed: int
 
 
+def validate_rounds(rounds: int) -> int:
+    """A run of alternating rounds is an even number of them (#491).
+
+    Consecutive rounds swap which side goes first, so only an even count
+    gives each side the first slot as often as the second.
+    """
+    if rounds < 2 or rounds % 2 != 0:
+        raise ValueError(
+            f"rounds is {rounds}: alternating the order of the two sides needs an even number of "
+            "rounds, at least 2, so each side goes first as often as it goes second"
+        )
+    return rounds
+
+
+class SidedFact(BaseModel):
+    """One fact stated for each of the two columns."""
+
+    helios: str
+    linux: str
+
+
+class StatedAsymmetries(BaseModel):
+    """What still differs between a lane's two columns by construction (#491).
+
+    Facts fixed by the lane's own construction, stated once here so the
+    report's pins repeat them from the manifest instead of from prose
+    that could go stale. What a run can read (the Wasmtime revisions) is
+    not stated here: `helios_bench.asymmetries` reads it.
+    """
+
+    stack_limit_interruption: SidedFact = Field(
+        description="whether stack-limit interruption is compiled into each side's code"
+    )
+
+
 class Lane(BaseModel):
     name: str
     helios_arch: str
@@ -48,11 +83,27 @@ class Lane(BaseModel):
     qemu_version: str
     boot_timeout_seconds: int = Field(ge=1)
     vcpus: int = Field(ge=1)
+    # The worker count the kernel's compiler plugin runs with on this lane's
+    # guest, which the Linux + Wasmtime column of `aot-curl` is given.
+    compiler_workers: int = Field(ge=1)
     memory: str
     linux_vm_memory: str
     net_backend: str
     net_host: str
     devices: list[str]
+    # How many alternating rounds one run of the lane is: a round times both
+    # sides once, and consecutive rounds swap which goes first, so host
+    # drift between the two halves of a round lands on each column in turn.
+    # None is a single pass, Helios then Linux.
+    rounds: int | None = None
+    # What still differs between the lane's two columns by construction,
+    # for the lanes whose parity table states it beside the pins.
+    stated_asymmetries: StatedAsymmetries | None = None
+
+    @field_validator("rounds")
+    @classmethod
+    def rounds_are_even(cls, rounds: int | None) -> int | None:
+        return None if rounds is None else validate_rounds(rounds)
 
     @property
     def qemu_binary(self) -> str:

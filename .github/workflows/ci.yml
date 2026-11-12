@@ -8,7 +8,10 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # A pull request's newer push supersedes its older run. A `dev` push
+  # runs to completion: merges land faster than a run finishes, and a
+  # completed `dev` run is the only writer of the host lanes' caches.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -25,6 +28,15 @@ jobs:
   # reports as skipped, which a required check counts as passing; no
   # ruleset on `dev` requires a lane of this workflow. A dispatch and a
   # push to `dev` run every lane.
+  #
+  # It also says whether the change touches what fixes the kernel
+  # profile's format (the profdata header check, the guest's raw writer)
+  # or the compiler that reads it. The profile every x86-64 lane spends is
+  # the newest one collected on dev, by the compiler dev pinned then; a
+  # pull request that moves any of these cannot read it, and dev cannot
+  # collect another until the pull request merges (#731). Only a pull
+  # request is asked: a push to dev is what `kernel-profile.yml` collects
+  # on, and a dispatch has no change to speak of.
   changes:
     name: changes
     runs-on: ubuntu-24.04
@@ -35,8 +47,12 @@ jobs:
     outputs:
       # JSON array of the lane names to run.
       lanes: ${{ steps.select.outputs.lanes }}
-      # JSON array of {name, command} for the legs of the `checks` matrix.
+      # JSON array of {name, command, rust-cache} for the legs of the
+      # `checks` matrix.
       checks: ${{ steps.select.outputs.checks }}
+      # `true` when the change moves the kernel profile's format or the
+      # compiler that reads it; `kernel-profile` then collects this run's.
+      profile_format: ${{ steps.filter.outputs.profile_format || 'false' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -114,6 +130,10 @@ jobs:
               - '.github/qemu/virglrenderer-meson.args'
               - '.github/ci-lanes.json'
               - '.github/workflows/ci.yml'
+            profile_format:
+              - 'rust-toolchain.toml'
+              - 'profdata/**'
+              - 'kernel/src/profiling/**'
       - id: select
         env:
           CHANGED: ${{ steps.filter.outputs.changes || 'null' }}
@@ -128,10 +148,22 @@ jobs:
           checks="$(jq -c --argjson lanes "${lanes}" '
             to_entries
             | map(select(.value.command and (.key as $name | $lanes | index($name))))
-            | map({name: .key, command: .value.command})' .github/ci-lanes.json)"
+            | map({name: .key, command: .value.command,
+                   "rust-cache": (.value["rust-cache"] // false)})' .github/ci-lanes.json)"
           echo "lanes=${lanes}" >> "$GITHUB_OUTPUT"
           echo "checks=${checks}" >> "$GITHUB_OUTPUT"
           echo "${lanes}"
+
+  # The collection a `profile_format` change spends in place of dev's
+  # profile: the same workflow `bench-suite.yml` calls, on this run's
+  # commit, uploaded under the stable artifact name.
+  kernel-profile:
+    name: kernel-profile
+    needs: changes
+    if: needs.changes.outputs.profile_format == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/kernel-profile.yml
 
   checks:
     name: ${{ matrix.name }}
@@ -143,11 +175,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The legs and their commands live in `.github/ci-lanes.json`
-        # beside the surfaces each reads; `changes` keeps the ones this
-        # change needs. `just lint` runs its gates back to back locally;
-        # CI splits them so a lint failure names the surface it came from
-        # and each lane keeps its own build cache.
+        # The legs, their commands and whether each keeps a Rust cache
+        # live in `.github/ci-lanes.json` beside the surfaces each reads;
+        # `changes` keeps the ones this change needs. `just lint` runs its
+        # gates back to back locally; CI splits them so a lint failure
+        # names the surface it came from.
         include: ${{ fromJSON(needs.changes.outputs.checks) }}
     steps:
       - uses: actions/checkout@v4
@@ -179,10 +211,17 @@ jobs:
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         working-directory: helios
         run: tools/wasi-apps/build.sh
+      # Only the host lanes nearly every pull request runs keep a Rust
+      # cache, and only a `dev` push writes it: the repository's cache
+      # quota holds these four and nothing more, and a pull request's
+      # entry is restorable from its own merge ref alone. Every other
+      # lane, workflow and action builds cold.
       - uses: Swatinem/rust-cache@v2
+        if: matrix.rust-cache
         with:
           workspaces: helios
           key: ${{ matrix.name }}
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
       - uses: astral-sh/setup-uv@v6
       - name: ${{ matrix.name }}
         working-directory: helios
@@ -226,10 +265,6 @@ jobs:
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         working-directory: helios
         run: tools/wasi-apps/build.sh
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: helios
-          key: smoke-riscv64
       - name: Build inspector
         working-directory: helios
         run: cargo build --release -p helios-inspector
@@ -542,10 +577,6 @@ jobs:
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         working-directory: helios
         run: tools/wasi-apps/build.sh
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: helios
-          key: smoke-aarch64
       - name: Build inspector
         working-directory: helios
         run: cargo build --release -p helios-inspector
@@ -641,7 +672,9 @@ jobs:
       # `--no-build` path reads them, and the manifest records this
       # runner's absolute paths. The root key pair is generated per
       # build, so the signing key the kernel carries belongs to this
-      # image alone.
+      # image alone. The compiler plugin's core module rides along: the
+      # bench's Linux + Wasmtime column runs the build the bootfs
+      # precompiled (tools/bench/native/build.sh, compiler-host/).
       - name: Upload the guest image
         if: always() && steps.guest-image.outcome == 'success'
         uses: actions/upload-artifact@v4
@@ -650,13 +683,14 @@ jobs:
           path: |
             helios/target/aarch64-unknown-none/kernel-release/helios
             helios/target/kernel-prebuild/aarch64-unknown-none/kernel-release/helios-bootfs
+            helios/target/kernel-prebuild/aarch64-unknown-none/kernel-release/compiler_plugin.wasm
           if-no-files-found: error
           retention-days: 90
 
   smoke-x86-64:
     name: smoke-x86-64
-    needs: changes
-    if: contains(fromJSON(needs.changes.outputs.lanes), 'smoke-x86-64')
+    needs: [changes, kernel-profile]
+    if: ${{ !cancelled() && needs.changes.result == 'success' && contains(fromJSON(needs.changes.outputs.lanes), 'smoke-x86-64') && (needs.kernel-profile.result == 'success' || needs.kernel-profile.result == 'skipped') }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -713,10 +747,6 @@ jobs:
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         working-directory: helios
         run: tools/wasi-apps/build.sh
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: helios
-          key: smoke-x86-64
       - name: Build inspector
         working-directory: helios
         run: cargo build --release -p helios-inspector -p helios-desktop-text-check
@@ -727,10 +757,22 @@ jobs:
       # label, so the fetch comes before the build. Reading the artifact
       # is what the job's `actions: read` is for.
       - name: Fetch the kernel profile
+        if: needs.changes.outputs.profile_format != 'true'
         working-directory: helios
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: cargo run --release -p helios-cli -- profile-fetch
+      # A change to what fixes the profile's format or to the compiler
+      # that reads it leaves the default branch's profile unreadable to
+      # this tree, and nothing on that branch can replace it before the
+      # change merges (#731). The run collects its own, and the lane
+      # spends that one: the same fetch, naming the run.
+      - name: Fetch this run's kernel profile
+        if: needs.changes.outputs.profile_format == 'true'
+        working-directory: helios
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: cargo run --release -p helios-cli -- profile-fetch --run "${{ github.run_id }}"
       - name: Boot x86-64 guest
         shell: bash
         working-directory: helios
@@ -1517,7 +1559,9 @@ jobs:
       # `--no-build` path reads them, and the manifest records this
       # runner's absolute paths. The root key pair is generated per
       # build, so the signing key the kernel carries belongs to this
-      # image alone.
+      # image alone. The compiler plugin's core module rides along: the
+      # bench's Linux + Wasmtime column runs the build the bootfs
+      # precompiled (tools/bench/native/build.sh, compiler-host/).
       - name: Upload the guest image
         if: always() && steps.guest-image.outcome == 'success'
         uses: actions/upload-artifact@v4
@@ -1526,6 +1570,7 @@ jobs:
           path: |
             helios/target/x86_64-unknown-none/profile-use/helios
             helios/target/kernel-prebuild/x86_64-unknown-none/profile-use/helios-bootfs
+            helios/target/kernel-prebuild/x86_64-unknown-none/profile-use/compiler_plugin.wasm
           if-no-files-found: error
           retention-days: 90
 

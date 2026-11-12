@@ -449,7 +449,12 @@ impl<T: VirtioTransport> VirtioBalloonDevice<T> {
             return Err(IoError::OutOfBounds);
         }
         let mut encoded = [0_u8; STATS_PER_REPLY * STAT_BYTES];
-        for (entry, stat) in encoded.chunks_exact_mut(STAT_BYTES).zip(stats) {
+        for (entry, stat) in encoded
+            .as_chunks_mut::<STAT_BYTES>()
+            .0
+            .iter_mut()
+            .zip(stats)
+        {
             entry[..2].copy_from_slice(&stat_tag(stat.tag).to_le_bytes());
             entry[2..].copy_from_slice(&stat.value.to_le_bytes());
         }
@@ -832,8 +837,10 @@ mod tests {
             .expect("the driver parked without the queue lock")
             .device_request(0);
         let pfns: Vec<u32> = chain
-            .chunks_exact(4)
-            .map(|word| u32::from_le_bytes(word.try_into().expect("four bytes")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&word| u32::from_le_bytes(word))
             .collect();
         assert_eq!(
             pfns,

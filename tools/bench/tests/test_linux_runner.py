@@ -379,3 +379,179 @@ def test_a_workload_named_after_its_process_gets_a_new_name_each_iteration(tmp_p
     records = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines() if line.strip()]
     assert [record["type"] for record in records].count("iteration") == 3
     assert not [record for record in records if record["type"] == "failure"]
+
+
+def test_the_aot_curl_host_renders_the_helios_columns_compile(context) -> None:
+    runner = workload_runner()
+    workload = runner.selected_workload(load_workloads(), "aot-curl")
+    compiling = runner.RenderContext(
+        repo_root=context.repo_root,
+        wasmtime_bin=context.wasmtime_bin,
+        hosts=context.hosts,
+        workdir=context.workdir,
+        compiler=runner.CompilerRequest("x86_64-unknown-none", 3),
+    )
+    assert runner.is_resident(workload, "linux_wasmtime")
+    assert not runner.is_resident(workload, "linux_native")
+    argv = runner.counterpart_command(workload, "linux_wasmtime", compiling)
+    assert argv == [
+        str(GUEST_ROOT / "native/helios-compiler-host"),
+        "--plugin",
+        str(GUEST_ROOT / "compiler_plugin.wasm"),
+        "--input",
+        str(GUEST_ROOT / "artifacts/wasi-tools/curl.wasm"),
+        "--output",
+        "/tmp/work/aot-curl-output.cwasm",
+        "--target",
+        "x86_64-unknown-none",
+        "--hint",
+        "performance",
+        "--workers",
+        "3",
+    ]
+    native = runner.counterpart_command(workload, "linux_native", compiling)
+    assert native[:2] == [str(GUEST_ROOT / "tools/wasmtime"), "compile"]
+
+
+def test_a_compile_request_the_run_was_not_given_is_refused(context) -> None:
+    runner = workload_runner()
+    workload = runner.selected_workload(load_workloads(), "aot-curl")
+    with pytest.raises(SystemExit) as error:
+        runner.counterpart_command(workload, "linux_wasmtime", context)
+    assert "--compiler-target" in str(error.value)
+    workers_only = runner.RenderContext(
+        repo_root=context.repo_root,
+        wasmtime_bin=context.wasmtime_bin,
+        hosts=context.hosts,
+        workdir=context.workdir,
+        compiler=runner.CompilerRequest("x86_64-unknown-none", None),
+    )
+    with pytest.raises(SystemExit) as error:
+        runner.counterpart_command(workload, "linux_wasmtime", workers_only)
+    assert "--compiler-workers" in str(error.value)
+
+
+def test_the_stock_wasmtime_cli_is_provisioned_for_the_native_reference() -> None:
+    """`aot-curl`'s native column runs `wasmtime compile`, so the guest needs
+    the CLI for that side even though its Linux + Wasmtime column does not
+    run it."""
+    runner = workload_runner()
+    workload = runner.selected_workload(load_workloads(), "aot-curl")
+    assert runner.uses_wasmtime(workload, "linux_native")
+    assert not runner.uses_wasmtime(workload, "linux_wasmtime")
+    assert runner.wasmtime_users([workload]) == [workload]
+    assert runner.needs_compiler_plugin([workload])
+    quickjs = runner.selected_workload(load_workloads(), "quickjs-loop")
+    assert runner.uses_wasmtime(quickjs, "linux_wasmtime")
+    assert not runner.uses_wasmtime(quickjs, "linux_native")
+    assert not runner.needs_compiler_plugin([quickjs])
+
+
+def test_the_guest_runner_parses_the_compile_request_the_host_driver_passes() -> None:
+    baseline = fedora_baseline()
+    runner = workload_runner()
+    command = baseline.runner_command(
+        11,
+        [{"name": "aot-curl"}],
+        None,
+        None,
+        None,
+        None,
+        None,
+        "linux-wasmtime.jsonl",
+        "linux_wasmtime",
+        "/home/bench/helios/tools/wasmtime",
+        True,
+        5400,
+        runner.CompilerRequest("aarch64-unknown-none", 3),
+    )
+    args = runner.build_parser().parse_args(shlex.split(command)[2:])
+    assert (args.compiler_target, args.compiler_workers) == ("aarch64-unknown-none", 3)
+
+
+def resident_manifest(tmp_path: Path, die_after: int | None) -> Path:
+    child = [
+        sys.executable,
+        str(Path(__file__).with_name("resident_child.py")),
+        "--workers",
+        "{compiler_workers}",
+    ]
+    if die_after is not None:
+        child.extend(["--die-after", str(die_after)])
+    manifest = {
+        "schema_version": 2,
+        "control_workload": "resident-host",
+        "workloads": [
+            {
+                "name": "resident-host",
+                "class": "compute",
+                "headline": False,
+                "runner": "helios-aot",
+                "description": "a resident counterpart answering one request per iteration",
+                "counterparts": {
+                    "linux_native": None,
+                    "linux_wasmtime": {"resident": True, "program": child[0], "args": child[1:]},
+                },
+            }
+        ],
+    }
+    path = tmp_path / "workloads.json"
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    return path
+
+
+def run_resident(tmp_path: Path, die_after: int | None) -> tuple[subprocess.CompletedProcess, list[dict]]:
+    out = tmp_path / "linux-wasmtime.jsonl"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(guest_runner_path()),
+            "--manifest",
+            str(resident_manifest(tmp_path, die_after)),
+            "--repo-root",
+            str(tmp_path),
+            "run",
+            "--side",
+            "linux_wasmtime",
+            "--iterations",
+            "4",
+            "--out",
+            str(out),
+            "--keep-going",
+            "--side-timeout-seconds",
+            "60",
+            "--compiler-workers",
+            "3",
+            "--workload",
+            "resident-host",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    records = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return completed, records
+
+
+def test_a_resident_counterpart_is_timed_once_per_request(tmp_path) -> None:
+    completed, records = run_resident(tmp_path, die_after=None)
+    assert completed.returncode == 0, completed.stderr
+    iterations = [record for record in records if record["type"] == "iteration"]
+    assert [record["iteration"] for record in iterations] == [1, 2, 3, 4]
+    assert all(record["elapsed_ms"] > 0 for record in iterations)
+    assert all(record["metrics"] == {"compiler_workers": 3.0} for record in iterations)
+    assert iterations[0]["command"][-2:] == ["--workers", "3"]
+    (summary,) = [record for record in records if record["type"] == "summary"]
+    assert summary["iterations"] == 4
+
+
+def test_a_resident_counterpart_that_dies_becomes_a_failed_cell(tmp_path) -> None:
+    completed, records = run_resident(tmp_path, die_after=2)
+    assert completed.returncode == 0, completed.stderr
+    assert [record["type"] for record in records if "workload" in record] == [
+        "iteration",
+        "iteration",
+        "failure",
+    ]
+    failure = records[-1]
+    assert "exited with code 3" in failure["error"]
+    assert "stand-in host failed on purpose" in failure["error"]
