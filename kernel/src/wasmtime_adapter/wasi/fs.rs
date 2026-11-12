@@ -3343,6 +3343,7 @@ pub(crate) fn map_host_fs_error(error: crate::HostFsError) -> fs_types::ErrorCod
         HostFsErrorKind::NotEmpty => fs_types::ErrorCode::NotEmpty,
         HostFsErrorKind::ReadOnly => fs_types::ErrorCode::ReadOnly,
         HostFsErrorKind::Unsupported => fs_types::ErrorCode::Unsupported,
+        HostFsErrorKind::NameTooLong => fs_types::ErrorCode::NameTooLong,
         HostFsErrorKind::Io => fs_types::ErrorCode::Io,
     }
 }

@@ -68,6 +68,8 @@ spin = { version = "0.9.8", default-features = false, features = ["mutex", "once
 wasmparser = { version = "0.245.0", default-features = false, features = ["component-model"] }
 talc = { version = "=5.1.0", default-features = false, features = ["counters"] }
 frame-alloc = { version = "=0.1.0", default-features = false, features = ["stats"] }
+# The fork makes `CompressContext` available without `std` (paddor/zrip#106).
+zrip = { git = "https://github.com/lexoliu/zrip", branch = "compress-context-alloc", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 critical-section = { version = "1.2.0", features = ["std"] }

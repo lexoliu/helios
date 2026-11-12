@@ -846,6 +846,13 @@ pub enum StackError {
     /// A socket address set overlaps an existing socket.
     #[error("network socket address is already in use")]
     AddressInUse,
+    /// The TCP socket slab has no free slot.
+    ///
+    /// Closed sockets keep their slot until the close finishes, `TIME-WAIT`
+    /// included, and a listener's half-open children hold slots too, so a
+    /// caller can meet this whatever it holds itself.
+    #[error("TCP socket slab is full")]
+    TcpSocketsExhausted,
     /// A listen backlog value cannot be represented by the stack.
     #[error("TCP listen backlog is invalid")]
     InvalidListenBacklog,

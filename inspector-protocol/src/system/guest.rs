@@ -5,7 +5,8 @@ use helios_api::{
 };
 
 use crate::error::DispatchError;
-use crate::system::server::{self, Dispatcher};
+use crate::system::accept;
+use crate::system::server::{self, Dispatcher, Invocations};
 
 use super::bindings::helios::system::{instances, profiling, programs, stats, tracing};
 use super::methods::{
@@ -15,10 +16,11 @@ use super::methods::{
     PROFILING_SET_INSTRUCTION_SAMPLING, PROGRAMS_AOT, PROGRAMS_EXEC, PROGRAMS_INSTANCE,
     STATS_INSTANCE, STATS_SNAPSHOT, TRACING_INSTANCE, TRACING_RECENT, TRACING_SET_TARGET_ENABLED,
 };
-use crate::debugger::{filesystem, programs as debugger_programs};
+use crate::debugger::{filesystem, programs as debugger_programs, snapshot as debugger_snapshot};
 
 /// The embedded debugger's dispatcher: every method it exposes,
 /// answered out of the guest's own system interfaces.
+#[derive(Clone, Copy)]
 struct SystemDispatcher;
 
 impl Dispatcher for SystemDispatcher {
@@ -28,11 +30,12 @@ impl Dispatcher for SystemDispatcher {
 
     async fn dispatch(
         &self,
+        invocations: &Invocations,
         instance: &str,
         func: &str,
         payload: &[u8],
     ) -> Result<Vec<u8>, DispatchError> {
-        dispatch(instance, func, payload).await
+        dispatch(invocations, instance, func, payload).await
     }
 }
 
@@ -44,6 +47,19 @@ where
     W: AsyncWrite + Unpin,
 {
     server::serve(read, write, SystemDispatcher).await
+}
+
+/// Accepts connections from `listener` and serves each one with the
+/// embedded debugger's dispatcher, ending only when the listener fails.
+/// See [`accept::serve_sessions`].
+pub async fn serve_listener<L>(
+    listener: L,
+    report: impl FnMut(accept::SessionFault),
+) -> Result<core::convert::Infallible, L::Error>
+where
+    L: accept::Listener,
+{
+    accept::serve_sessions(listener, SystemDispatcher, report).await
 }
 
 fn supports_request(instance: &str, func: &str) -> bool {
@@ -66,9 +82,15 @@ fn supports_request(instance: &str, func: &str) -> bool {
             | (PROFILING_INSTANCE, PROFILING_RAW_PROFILE_READ)
     ) || filesystem::supports(instance, func)
         || debugger_programs::supports(instance, func)
+        || debugger_snapshot::supports(instance, func)
 }
 
-async fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>, DispatchError> {
+async fn dispatch(
+    invocations: &Invocations,
+    instance: &str,
+    func: &str,
+    payload: &[u8],
+) -> Result<Vec<u8>, DispatchError> {
     match (instance, func) {
         (PROGRAMS_INSTANCE, PROGRAMS_EXEC) => {
             let request =
@@ -315,6 +337,9 @@ async fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>,
         _ if filesystem::supports(instance, func) => filesystem::dispatch(func, payload).await,
         _ if debugger_programs::supports(instance, func) => {
             debugger_programs::dispatch(func, payload).await
+        }
+        _ if debugger_snapshot::supports(instance, func) => {
+            debugger_snapshot::dispatch(invocations, func, payload).await
         }
         _ => unreachable!("supports_request must reject unsupported methods before dispatch"),
     }

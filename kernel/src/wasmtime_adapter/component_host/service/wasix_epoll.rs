@@ -73,7 +73,7 @@ where
         Ok(fd) => fd,
         Err(errno) => return errno,
     };
-    p1_write_u32(caller, memory, ret_fd, fd)
+    p1_write_u32(caller, memory, GuestAddress::wasm32(ret_fd), fd)
 }
 
 pub(super) fn wasix_epoll_ctl<CpuImpl, Net, HostFs>(
@@ -102,7 +102,7 @@ where
         let Some(memory) = p1_memory(caller) else {
             return p1::errno::FAULT;
         };
-        match wasix_read_epoll_event(caller, memory, event, fd) {
+        match wasix_read_epoll_event(caller, memory, GuestAddress::wasm32(event), fd) {
             Ok(event) => Some(event),
             Err(errno) => return errno,
         }
@@ -198,15 +198,9 @@ where
         p1_wait_step(&timer, &mut wait, remaining).await;
     };
 
+    let events = GuestAddress::wasm32(events);
     for (index, event) in ready.iter().enumerate() {
-        let offset = match (index as u32).checked_mul(WASIX_EPOLL_EVENT_SIZE) {
-            Some(offset) => offset,
-            None => return p1::errno::OVERFLOW,
-        };
-        let event_ptr = match events.checked_add(offset) {
-            Some(event_ptr) => event_ptr,
-            None => return p1::errno::OVERFLOW,
-        };
+        let event_ptr = events.offset(index as u64 * u64::from(WASIX_EPOLL_EVENT_SIZE));
         let status = wasix_write_epoll_event(caller, memory, event_ptr, event);
         if status != p1::errno::SUCCESS {
             return status;
@@ -216,7 +210,7 @@ where
         Ok(returned) => returned,
         Err(_) => return p1::errno::OVERFLOW,
     };
-    p1_write_u32(caller, memory, ret_nevents, returned)
+    p1_write_u32(caller, memory, GuestAddress::wasm32(ret_nevents), returned)
 }
 
 pub(super) fn poll_epoll_wait_targets(
@@ -267,19 +261,35 @@ where
 pub(super) fn wasix_read_epoll_event<T>(
     caller: &mut Caller<'_, T>,
     memory: Preview1Memory,
-    ptr: u32,
+    ptr: GuestAddress,
     fd: i32,
 ) -> Result<EpollInterest, i32> {
     let events = p1_try_read_u32(caller, memory, ptr).map_err(|_| p1::errno::FAULT)?;
     let user_data = EpollUserData {
-        ptr: p1_try_read_u32(caller, memory, ptr + WASIX_EPOLL_EVENT_DATA_OFFSET)
-            .map_err(|_| p1::errno::FAULT)?,
-        fd: p1_try_read_u32(caller, memory, ptr + WASIX_EPOLL_EVENT_DATA_FD_OFFSET)
-            .map_err(|_| p1::errno::FAULT)?,
-        data1: p1_try_read_u32(caller, memory, ptr + WASIX_EPOLL_EVENT_DATA1_OFFSET)
-            .map_err(|_| p1::errno::FAULT)?,
-        data2: p1_try_read_u64(caller, memory, ptr + WASIX_EPOLL_EVENT_DATA2_OFFSET)
-            .map_err(|_| p1::errno::FAULT)?,
+        ptr: p1_try_read_u32(
+            caller,
+            memory,
+            ptr.offset(u64::from(WASIX_EPOLL_EVENT_DATA_OFFSET)),
+        )
+        .map_err(|_| p1::errno::FAULT)?,
+        fd: p1_try_read_u32(
+            caller,
+            memory,
+            ptr.offset(u64::from(WASIX_EPOLL_EVENT_DATA_FD_OFFSET)),
+        )
+        .map_err(|_| p1::errno::FAULT)?,
+        data1: p1_try_read_u32(
+            caller,
+            memory,
+            ptr.offset(u64::from(WASIX_EPOLL_EVENT_DATA1_OFFSET)),
+        )
+        .map_err(|_| p1::errno::FAULT)?,
+        data2: p1_try_read_u64(
+            caller,
+            memory,
+            ptr.offset(u64::from(WASIX_EPOLL_EVENT_DATA2_OFFSET)),
+        )
+        .map_err(|_| p1::errno::FAULT)?,
     };
     Ok(EpollInterest {
         fd,
@@ -291,44 +301,44 @@ pub(super) fn wasix_read_epoll_event<T>(
 pub(super) fn wasix_write_epoll_event<T>(
     caller: &mut Caller<'_, T>,
     memory: Preview1Memory,
-    ptr: u32,
+    ptr: GuestAddress,
     event: &EpollInterest,
 ) -> i32 {
     p1_write_u32(caller, memory, ptr, event.events)
         .max(p1_write_u32(
             caller,
             memory,
-            ptr + WASIX_EPOLL_EVENT_PADDING_OFFSET,
+            ptr.offset(u64::from(WASIX_EPOLL_EVENT_PADDING_OFFSET)),
             0,
         ))
         .max(p1_write_u32(
             caller,
             memory,
-            ptr + WASIX_EPOLL_EVENT_DATA_OFFSET,
+            ptr.offset(u64::from(WASIX_EPOLL_EVENT_DATA_OFFSET)),
             event.data.ptr,
         ))
         .max(p1_write_u32(
             caller,
             memory,
-            ptr + WASIX_EPOLL_EVENT_DATA_FD_OFFSET,
+            ptr.offset(u64::from(WASIX_EPOLL_EVENT_DATA_FD_OFFSET)),
             event.data.fd,
         ))
         .max(p1_write_u32(
             caller,
             memory,
-            ptr + WASIX_EPOLL_EVENT_DATA1_OFFSET,
+            ptr.offset(u64::from(WASIX_EPOLL_EVENT_DATA1_OFFSET)),
             event.data.data1,
         ))
         .max(p1_write_u32(
             caller,
             memory,
-            ptr + WASIX_EPOLL_EVENT_DATA_PADDING_OFFSET,
+            ptr.offset(u64::from(WASIX_EPOLL_EVENT_DATA_PADDING_OFFSET)),
             0,
         ))
         .max(p1_write_u64(
             caller,
             memory,
-            ptr + WASIX_EPOLL_EVENT_DATA2_OFFSET,
+            ptr.offset(u64::from(WASIX_EPOLL_EVENT_DATA2_OFFSET)),
             event.data.data2,
         ))
 }

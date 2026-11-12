@@ -250,7 +250,7 @@ impl<T: 'static> StreamProducer<T> for InputEventStreamProducer {
             return Poll::Ready(Ok(StreamResult::Cancelled));
         }
         match self.events.poll_burst(cx) {
-            Poll::Ready(burst) => {
+            Poll::Ready(Some(burst)) => {
                 let events: Vec<Self::Item> = burst
                     .into_iter()
                     .map(|event| input_wit::InputEvent {
@@ -262,6 +262,10 @@ impl<T: 'static> StreamProducer<T> for InputEventStreamProducer {
                 destination.set_buffer(VecBuffer::from(events));
                 Poll::Ready(Ok(StreamResult::Completed))
             }
+            // The claim this stream was opened under is gone. A reader
+            // that ended is how the program learns that without polling
+            // for it.
+            Poll::Ready(None) => Poll::Ready(Ok(StreamResult::Dropped)),
             Poll::Pending => Poll::Pending,
         }
     }

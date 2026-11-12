@@ -1183,6 +1183,7 @@ def runner_command(
     host_http_url: str | None,
     host_tcp_host: str | None,
     host_tcp_port: int | None,
+    host_tcp_upload_port: int | None,
     host_tcp_echo_port: int | None,
     output_name: str,
     side: str,
@@ -1222,12 +1223,15 @@ def runner_command(
         command.extend(["--side-timeout-seconds", str(side_timeout_seconds)])
     if host_http_url:
         command.extend(["--host-http-url", host_http_url])
-    if host_tcp_host and host_tcp_port is not None:
-        command.extend(["--host-tcp-host", host_tcp_host, "--host-tcp-port", str(host_tcp_port)])
-    if host_tcp_host and host_tcp_echo_port is not None:
-        if host_tcp_port is None:
-            command.extend(["--host-tcp-host", host_tcp_host])
-        command.extend(["--host-tcp-echo-port", str(host_tcp_echo_port)])
+    if host_tcp_host:
+        command.extend(["--host-tcp-host", host_tcp_host])
+        for flag, value in (
+            ("--host-tcp-port", host_tcp_port),
+            ("--host-tcp-upload-port", host_tcp_upload_port),
+            ("--host-tcp-echo-port", host_tcp_echo_port),
+        ):
+            if value is not None:
+                command.extend([flag, str(value)])
     return shlex.join(command)
 
 
@@ -1286,6 +1290,7 @@ def run_fedora_qemu_linux(
     host_http_url: str | None,
     host_tcp_host: str | None,
     host_tcp_port: int | None,
+    host_tcp_upload_port: int | None,
     host_tcp_echo_port: int | None,
     quickjs_source_archive: Path | None = None,
     wasmtime_linux_bin: Path | None = None,
@@ -1428,6 +1433,7 @@ def run_fedora_qemu_linux(
                     host_http_url,
                     host_tcp_host,
                     host_tcp_port,
+                    host_tcp_upload_port,
                     host_tcp_echo_port,
                     output_name,
                     side,
