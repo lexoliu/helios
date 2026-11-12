@@ -2502,8 +2502,17 @@ pub struct TcpStackCounters {
     pub window_updates_sent: u64,
     /// Segments retransmitted, by timer or by fast retransmit.
     pub retransmits_sent: u64,
-    /// Connections this stack currently holds.
+    /// Connections this stack currently holds, orphans included: an
+    /// orphan keeps its slot in the socket slab until the sweep reclaims
+    /// it, and the count walks that slab.
     pub sockets: u32,
+    /// How many of `sockets` are orphans: closed by their owner while the
+    /// stack still runs out the connection (FIN exchange, retransmission,
+    /// `TIME-WAIT`).
+    pub orphan_sockets: u32,
+    /// What those orphans still owe their peers, in bytes: sent and
+    /// unacknowledged plus queued and unsent.
+    pub orphan_send_queued_bytes: u64,
     /// How many of them have a full receive queue and are refusing
     /// segments. A count that stays nonzero while `sockets` is zero is a
     /// leaked window, and the stack will refuse frames for ever.
@@ -2789,6 +2798,8 @@ where
     /// What this stack's TCP layer has sent and what it is advertising.
     pub fn tcp_counters(&self) -> TcpStackCounters {
         let mut sockets = 0u32;
+        let mut orphan_sockets = 0u32;
+        let mut orphan_send_queued_bytes = 0u64;
         let mut receive_window_bytes = 0u64;
         let mut receive_queued_bytes = 0u64;
         let mut out_of_order_queued_bytes = 0u64;
@@ -2798,6 +2809,11 @@ where
                 continue;
             };
             sockets += 1;
+            if self.tcp_orphans.contains(index) {
+                orphan_sockets += 1;
+                orphan_send_queued_bytes =
+                    orphan_send_queued_bytes.saturating_add(socket.send_queued_bytes());
+            }
             receive_window_bytes = receive_window_bytes
                 .saturating_add(u64::from(socket.advertised_receive_window_bytes()));
             receive_queued_bytes =
@@ -2810,6 +2826,8 @@ where
             window_updates_sent: self.tcp_transmit_counters.window_updates_sent,
             retransmits_sent: self.tcp_transmit_counters.retransmits_sent,
             sockets,
+            orphan_sockets,
+            orphan_send_queued_bytes,
             receive_backpressured_sockets: self.tcp_receive_backpressured_count as u32,
             receive_window_bytes,
             receive_queued_bytes,
@@ -11725,6 +11743,99 @@ mod tests {
                 .open_tcp_connect(local_endpoint, remote_endpoint, 99)
                 .is_ok(),
             "and its local port is free again"
+        );
+    }
+
+    /// An orphan that still owes its peer data is counted, with that
+    /// data, until the sweep reclaims it; `sockets` counts it throughout.
+    #[test]
+    fn tcp_counters_report_orphans_with_their_queued_data_until_swept() {
+        const PAYLOAD: &[u8] = &[0x5a; 100];
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let (mut stack, socket) = open_established_tcp_stack(local, peer);
+
+        let live = stack.tcp_counters();
+        assert_eq!((live.sockets, live.orphan_sockets), (1, 0));
+        assert_eq!(live.orphan_send_queued_bytes, 0);
+
+        assert_eq!(stack.tcp_send(socket, PAYLOAD), Ok(PAYLOAD.len()));
+        assert_eq!(
+            stack.close_tcp_socket(socket, StackInstant::from_nanos(2)),
+            Ok(TcpCloseOutcome::Finishing)
+        );
+        let orphaned = stack.tcp_counters();
+        assert_eq!(
+            (orphaned.sockets, orphaned.orphan_sockets),
+            (1, 1),
+            "an orphan keeps its slot, so `sockets` still counts it"
+        );
+        assert!(
+            orphaned.orphan_send_queued_bytes >= PAYLOAD.len() as u64,
+            "the unsent payload is still owed: {orphaned:?}"
+        );
+
+        stack
+            .drive_tcp(StackInstant::from_nanos(2))
+            .expect("the close should queue the data and a FIN");
+        while take_tcp_segment(&mut stack).is_some() {}
+        assert!(
+            stack.tcp_counters().orphan_send_queued_bytes > 0,
+            "sent but unacknowledged data is still owed"
+        );
+
+        // The FIN follows the data's acknowledgement. This side's data
+        // starts at sequence 8 (see `open_established_tcp_stack`).
+        let (ack, ack_len) = tcp_segment(
+            peer,
+            local,
+            TcpHeader {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 101,
+                acknowledgement: 8 + PAYLOAD.len() as u32,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+            },
+        );
+        stack
+            .receive_tcp(
+                IpAddress::Ipv4(peer),
+                IpAddress::Ipv4(local),
+                &Bytes::copy_from_slice(&ack[..ack_len]),
+                RxFrameOffload::none(),
+                StackInstant::from_nanos(3),
+            )
+            .expect("the peer's acknowledgement should be accepted");
+        stack
+            .drive_tcp(StackInstant::from_nanos(3))
+            .expect("the acknowledged data should release the FIN");
+        let (flags, fin_sequence, _) =
+            take_tcp_segment(&mut stack).expect("the close owes its peer a FIN");
+        assert!(flags.contains(TcpFlags::FIN));
+
+        let time_wait_started = 3;
+        deliver_peer_fin(
+            &mut stack,
+            local,
+            peer,
+            fin_sequence.wrapping_add(1),
+            time_wait_started,
+        );
+        stack
+            .drive_tcp(StackInstant::from_nanos(
+                time_wait_started + crate::tcp::TCP_TIME_WAIT_NANOS,
+            ))
+            .expect("the 2MSL timer should expire");
+        let swept = stack.tcp_counters();
+        assert_eq!(
+            (
+                swept.sockets,
+                swept.orphan_sockets,
+                swept.orphan_send_queued_bytes
+            ),
+            (0, 0, 0),
+            "a swept orphan leaves the counters"
         );
     }
 

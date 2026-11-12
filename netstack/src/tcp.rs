@@ -1272,6 +1272,18 @@ where
         self.receive_queued_bytes
     }
 
+    /// Data this side still owes the peer, in bytes: what has been sent
+    /// and not yet acknowledged, plus what is queued and not yet sent. A
+    /// SYN or FIN in flight counts as one byte, as it does in sequence
+    /// space.
+    pub fn send_queued_bytes(&self) -> u64 {
+        let unsent = self
+            .transmit_queue
+            .as_ref()
+            .map_or(0, |queue| queue.queued_bytes as u64);
+        u64::from(self.bytes_in_flight) + unsent
+    }
+
     /// Data held in the out-of-order reassembly queue, in bytes.
     pub fn out_of_order_queued_bytes(&self) -> usize {
         self.out_of_order_queued_bytes

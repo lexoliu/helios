@@ -177,8 +177,14 @@ interface stats {
     tcp-window-updates-sent: u64,
     /// Segments this shard retransmitted, by timer or fast retransmit.
     tcp-retransmits-sent: u64,
-    /// Connections this shard holds.
+    /// Connections this shard holds, orphans included.
     tcp-sockets: u32,
+    /// How many of `tcp-sockets` are orphans: closed by their owner while
+    /// the stack still runs out the connection.
+    tcp-orphan-sockets: u32,
+    /// What those orphans still owe their peers, in bytes: sent and
+    /// unacknowledged plus queued and unsent.
+    tcp-orphan-send-queued-bytes: u64,
     /// How many of them are refusing segments for want of receive room.
     /// Nonzero while `tcp-sockets` is zero is a leaked window: the shard
     /// refuses frames with no socket left that could relieve it.

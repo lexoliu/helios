@@ -206,6 +206,12 @@ if [[ "${HELIOS_WORKLOAD_BENCH_KEEP_GOING:-0}" == "1" ]]; then
     command+=(--keep-going)
 fi
 
+# Diagnosis: the guest's network counters on stderr before each workload's
+# first iteration and after its last, outside every measured interval.
+if [[ "${HELIOS_WORKLOAD_BENCH_NETWORK_COUNTERS:-0}" == "1" ]]; then
+    command+=(--network-counters)
+fi
+
 if [[ -n "${HELIOS_WORKLOAD_BENCH_PROFILE_OUTPUT:-}" ]]; then
     command+=(--profile-output "${HELIOS_WORKLOAD_BENCH_PROFILE_OUTPUT}")
 fi

@@ -4279,6 +4279,8 @@ macro_rules! convert_network_stats {
                         tcp_window_updates_sent: queue.tcp_window_updates_sent,
                         tcp_retransmits_sent: queue.tcp_retransmits_sent,
                         tcp_sockets: queue.tcp_sockets,
+                        tcp_orphan_sockets: queue.tcp_orphan_sockets,
+                        tcp_orphan_send_queued_bytes: queue.tcp_orphan_send_queued_bytes,
                         tcp_receive_backpressured_sockets: queue.tcp_receive_backpressured_sockets,
                         tcp_receive_window_bytes: queue.tcp_receive_window_bytes,
                         receive_queued_bytes: queue.receive_queued_bytes,

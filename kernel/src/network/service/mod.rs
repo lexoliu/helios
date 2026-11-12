@@ -232,8 +232,14 @@ pub struct NetworkQueueStats {
     pub tcp_window_updates_sent: u64,
     /// Segments this shard retransmitted, by timer or fast retransmit.
     pub tcp_retransmits_sent: u64,
-    /// Connections this shard holds.
+    /// Connections this shard holds, orphans included.
     pub tcp_sockets: u32,
+    /// How many of `tcp_sockets` are orphans: closed by their owner while
+    /// the stack still runs out the connection.
+    pub tcp_orphan_sockets: u32,
+    /// What those orphans still owe their peers, in bytes: sent and
+    /// unacknowledged plus queued and unsent.
+    pub tcp_orphan_send_queued_bytes: u64,
     /// How many of them are refusing segments for want of receive room.
     /// Nonzero with `tcp_sockets` at zero is a leaked window: the shard
     /// will refuse frames with no socket left that could relieve it.
@@ -727,6 +733,8 @@ where
                         tcp_window_updates_sent: tcp.window_updates_sent,
                         tcp_retransmits_sent: tcp.retransmits_sent,
                         tcp_sockets: tcp.sockets,
+                        tcp_orphan_sockets: tcp.orphan_sockets,
+                        tcp_orphan_send_queued_bytes: tcp.orphan_send_queued_bytes,
                         tcp_receive_backpressured_sockets: tcp.receive_backpressured_sockets,
                         tcp_receive_window_bytes: tcp.receive_window_bytes,
                         receive_queued_bytes: tcp.receive_queued_bytes,
