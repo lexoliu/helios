@@ -2,7 +2,6 @@ use crate::ComponentHostNetwork;
 use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
 use alloc::string::String;
-use alloc::vec;
 use alloc::vec::Vec;
 
 use helios_hal::cpu::Cpu;
@@ -1682,10 +1681,7 @@ where
     HostFs: crate::HostFileSystem,
 {
     fn get_random_bytes(&mut self, len: u64) -> Result<Vec<u8>> {
-        let len = super::random_len(len)?;
-        let mut bytes = vec![0_u8; len];
-        self.fill_secure_random(&mut bytes);
-        Ok(bytes)
+        super::random_bytes(len, |bytes| self.fill_secure_random(bytes))
     }
 
     fn get_random_u64(&mut self) -> Result<u64> {
@@ -1701,7 +1697,7 @@ where
     HostFs: crate::HostFileSystem,
 {
     fn get_insecure_random_bytes(&mut self, len: u64) -> Result<Vec<u8>> {
-        Ok(self.insecure_random_bytes(super::random_len(len)?))
+        super::random_bytes(len, |bytes| self.fill_insecure_random(bytes))
     }
 
     fn get_insecure_random_u64(&mut self) -> Result<u64> {
