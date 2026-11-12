@@ -213,6 +213,10 @@ pub enum ProgramExecErrorDetail {
     ImportedSharedMemoryBudgetExceeded,
     #[error("compiler plugin ABI version mismatch")]
     CompilerAbiMismatch,
+    #[error("compiler plugin sent an unknown ABI value: {0}")]
+    CompilerAbiValueInvalid(helios_compiler_abi::UnknownDiscriminant),
+    #[error("compiler plugin buffers were not all returned after a compile")]
+    CompilerBuffersOutstanding,
     #[error("compiler plugin rejected the input")]
     CompilerRejectedInput,
     #[error("compiler plugin allocation failed")]
@@ -275,6 +279,12 @@ impl ProgramExecErrorDetail {
                 "imported shared memory exceeds the user-memory budget"
             }
             Self::CompilerAbiMismatch => "compiler plugin ABI version mismatch",
+            // The field and value are in the error's `Display` and the
+            // kernel log; `as_str` has no storage to format them into.
+            Self::CompilerAbiValueInvalid(_) => "compiler plugin sent an unknown ABI value",
+            Self::CompilerBuffersOutstanding => {
+                "compiler plugin buffers were not all returned after a compile"
+            }
             Self::CompilerRejectedInput => "compiler plugin rejected the input",
             Self::CompilerAllocationFailed => "compiler plugin allocation failed",
             Self::CompilerThreadPointerOverflow => "compiler plugin thread pointer overflowed",

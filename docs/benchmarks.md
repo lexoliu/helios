@@ -368,6 +368,35 @@ scoped kernel profile (`helios-*.kernel.folded`), so a diagnosis that
 needs a counter the table cut, or the baseline's counters at all, reads
 them from the artifact instead of re-running the lane.
 
+Those artifacts do not come from the boots that are timed (#747). The
+scoped profiler and the counters stamp every span of the guest, which is
+inside every iteration they would time, and the Linux guests carry nothing
+like them, so no timed boot runs with either: the control and workload
+boots are asked for no kernel profile, no perf metrics and no other
+profile output, whatever the caller's environment names. Once every timed
+boot and control of the first pass has finished, each Helios image boots
+every unit it finished a second time (the same image, the same workloads,
+the same iteration count, so the counters cover what the timed boots ran),
+and that profile boot writes the kernel profile and the perf metrics under
+the timed boot's names. Nothing it records is a timing: its own JSONL is
+kept under `profile-boot/` and no reader looks there, and the medians,
+verdicts, retakes and noise floors read only the timed boots'
+`helios-*.jsonl`. `profile-boot.json` beside each image's `helios.jsonl`
+records which units it booted and which failed, and the driver's
+`summary.json` and `report.md` say that the profile artifacts came from
+that boot. The instruction sampler is not part of it: it stays on the timed
+boots, where it is opt-in and makes the run a diagnosis (below). The
+retake, reconfirm and retry passes take no profile boot, since the
+artifacts are the first pass's.
+
+A profile boot that fails does not discard what was timed: the records are
+already written, the remaining units still get theirs under `--keep-going`,
+and the run then fails, naming the units whose kernel profile and perf
+metrics are missing. `helios-bench run --no-profile-boot` (the driver's
+`--helios-no-profile-boot`) skips the second boot, for a run that only
+wants timings. The profile boot adds one more boot of every unit, with all
+its iterations, to each image's share of the side's budget.
+
 On request, each x86-64 boot also writes an instruction-level profile,
 `helios-*.pc.folded`: every boot of the run's own image and, in a paired
 run, every boot of the baseline image beside it, so the artifact carries
@@ -385,7 +414,7 @@ but the extra interrupts (and, under KVM, the extra timer exits) on every
 processor cost time the medians would carry, as does the kernel task that
 drains the samples every 20 ms. Sampling therefore has its own control
 (`helios:system/profiling.set-instruction-sampling`), separate from the
-scoped profiler every lane boot enables. The inspector starts it only when
+scoped profiler, which only the profile boot enables. The inspector starts it only when
 `--instruction-profile-output` is given, for the duration of the workload,
 and stops it before reading the samples. `linux-gap-bench.py` passes the
 option only when `HELIOS_BENCH_INSTRUCTION_PROFILE=1`, and `bench-suite.yml`
@@ -548,7 +577,8 @@ what the one below it cannot see.
 - **Per side.** `--helios-side-timeout-seconds` bounds the whole Helios
   side, and every boot inside it shares it out as the run goes: one boot
   per class (or, paired, one per workload per image), plus the control
-  workload before and after for each image. Nothing is reserved off the
+  workload before and after for each image, plus one profile boot per
+  unit per image (above) unless `--no-profile-boot`. Nothing is reserved off the
   front — the builds happen before the budget starts, and the control
   boots are counted among the boots rather than set aside at the
   per-boot cap, which is what made run 33997256902 refuse all
@@ -609,6 +639,17 @@ or a developer's own arm64 box, taken by hand with the same harness
 (`helios-bench run --lane …` against a lane added to `manifest.toml` for
 that machine), never from hosted CI. AGENTS.md §3.5's arm64 baseline is
 that kind of measurement.
+
+A host that must not compile anything runs `helios-bench run --lane
+aarch64-hvf --prebuilt`. The kernel image and `helios-bootfs` come from CI's
+`helios-guest-aarch64` artifact, unpacked so they land at
+`target/aarch64-unknown-none/kernel-release/helios` and
+`target/kernel-prebuild/aarch64-unknown-none/kernel-release/helios-bootfs`;
+`target/release/helios-inspector`, `target/release/helios-cli` and
+`artifacts/bench-native/aarch64/` are copied from the machine that built
+them. The run then builds nothing, and lists every file it reads that is
+missing before it boots a guest. It cannot be paired with a baseline, whose
+second image has to be built.
 
 ### The RPC the numbers are taken around
 
@@ -802,8 +843,10 @@ monitor socket with both guest images already built. The inspector puts
 own under `$XDG_RUNTIME_DIR` and links it as `<runtime>/sockets`; see
 `docs/debug-serial.md`.
 
-`bench-suite.yml` runs a pull request in paired mode against
-`github.event.pull_request.base.sha`, and `workflow_dispatch` takes a
+`bench-suite.yml` runs a pull request in paired mode against the `dev`
+commit it is merged against (the first parent of the merge commit the
+run checks out, not the event's `base.sha`, which is the tip `dev` had
+when the pull request was opened), and `workflow_dispatch` takes a
 `baseline_ref` input. An advisory dispatch with an explicit baseline is
 revision acceptance: it runs only `helios` and `helios_baseline`, with
 all workloads, warm iterations, before/after compute controls, and the
@@ -837,7 +880,7 @@ its warm series. Ordinary measurements isolate these listeners; explicit
 `--reuse-host-listeners` is reserved for reconnect diagnosis and marks the
 report as unsuitable for performance acceptance.
 
-The `bench-x86-64-linux` lane of `ci.yml` is unchanged except that the
+The `bench-x86-64-linux` lane of `bench-lane.yml` is unchanged except that the
 inspector now writes the host CPU model into the `run` record it emits,
 so a comparison between two of its runs can tell one machine from two.
 

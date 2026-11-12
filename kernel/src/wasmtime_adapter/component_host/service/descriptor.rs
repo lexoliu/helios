@@ -191,6 +191,10 @@ pub(super) struct Preview1Cwd {
 pub(super) struct Preview1DescriptorTable<Net: ComponentHostNetwork> {
     pub(super) entries: Vec<Option<Preview1DescriptorEntry<Net>>>,
     pub(super) free: FreeDescriptorSlots,
+    /// Descriptor numbers at or past this are never handed out or accepted.
+    /// The table's owner assigns it; `from_entries` starts at the default
+    /// and `clone_for_exec` and `Clone` carry it to the child.
+    pub(super) limit: DescriptorLimit,
 }
 
 #[derive(Clone)]
@@ -1202,7 +1206,11 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
                 free.release(index);
             }
         }
-        Self { entries, free }
+        Self {
+            entries,
+            free,
+            limit: DescriptorLimit::DEFAULT,
+        }
     }
 
     pub(super) fn get(&self, fd: i32) -> Option<&Preview1Descriptor<Net>> {
@@ -1247,9 +1255,20 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
     }
 
     pub(super) fn insert_entry(&mut self, entry: Preview1DescriptorEntry<Net>) -> Result<u32, i32> {
-        let index = self.allocate_slot_index();
+        let index = self.allocate_slot_index()?;
         self.entries[index] = Some(entry);
         u32::try_from(index).map_err(|_| p1::errno::OVERFLOW)
+    }
+
+    /// The slot a guest-named descriptor number `fd` denotes as the target
+    /// of a dup2, renumber or spawn action: `BADF` when it is negative or
+    /// at or past the limit. Every caller that accepts a number checks it
+    /// here before touching the table.
+    pub(super) fn target_index(&self, fd: i32) -> Result<usize, i32> {
+        usize::try_from(fd)
+            .ok()
+            .filter(|index| self.limit.admits(*index))
+            .ok_or(p1::errno::BADF)
     }
 
     pub(super) fn dup(&mut self, fd: i32) -> Result<u32, i32> {
@@ -1259,6 +1278,7 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
     }
 
     pub(super) fn dup_to(&mut self, fd: i32, to_fd: i32, close_on_exec: bool) -> Result<u32, i32> {
+        self.target_index(to_fd)?;
         let mut entry = self.get_entry(fd).cloned().ok_or(p1::errno::BADF)?;
         entry.close_on_exec = close_on_exec;
         self.insert_entry_at(to_fd, entry)
@@ -1278,7 +1298,7 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
         fd: i32,
         entry: Preview1DescriptorEntry<Net>,
     ) -> Result<u32, i32> {
-        let to = usize::try_from(fd).map_err(|_| p1::errno::BADF)?;
+        let to = self.target_index(fd)?;
         if self.entries.len() <= to {
             let previous_len = self.entries.len();
             self.entries.resize_with(to + 1, || None);
@@ -1347,7 +1367,7 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
     }
 
     pub(super) fn clone_for_exec(&self) -> Self {
-        Self::from_entries(
+        let mut table = Self::from_entries(
             self.entries
                 .iter()
                 .map(|entry| match entry {
@@ -1355,7 +1375,9 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
                     _ => entry.clone(),
                 })
                 .collect(),
-        )
+        );
+        table.limit = self.limit;
+        table
     }
 
     pub(super) fn close(&mut self, fd: i32) -> i32 {
@@ -1369,15 +1391,27 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
             .map_or(p1::errno::BADF, |_| p1::errno::SUCCESS)
     }
 
-    pub(super) fn allocate_slot_index(&mut self) -> usize {
+    /// The lowest free descriptor number below the limit, or `MFILE`;
+    /// nothing is allocated on failure.
+    pub(super) fn allocate_slot_index(&mut self) -> Result<usize, i32> {
         while let Some(index) = self.free.allocate() {
+            if !self.limit.admits(index) {
+                // The heap pops the lowest number, so every other free
+                // number is at or past the limit too. Keep this one free
+                // for when the limit is raised.
+                self.free.release(index);
+                break;
+            }
             if self.entries.get(index).is_some_and(Option::is_none) {
-                return index;
+                return Ok(index);
             }
         }
         let index = self.entries.len();
+        if !self.limit.admits(index) {
+            return Err(p1::errno::MFILE);
+        }
         self.entries.push(None);
-        index
+        Ok(index)
     }
 
     pub(super) fn get_owned_entry(
@@ -1399,7 +1433,7 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
     }
 
     pub(super) fn renumber(&mut self, from: i32, to: i32) -> i32 {
-        let Ok(to) = usize::try_from(to) else {
+        let Ok(to) = self.target_index(to) else {
             return p1::errno::BADF;
         };
         let Ok((from, mut entry)) = self.get_owned_entry(from) else {

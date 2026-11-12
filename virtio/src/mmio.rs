@@ -1,6 +1,6 @@
 use core::ptr::NonNull;
 
-use helios_hal::fs::BlockDeviceRights;
+use helios_hal::fs::{BlockBuffer, BlockDeviceRights};
 use helios_hal::io::IoResult;
 
 use crate::balloon::VirtioBalloonDevice;
@@ -15,7 +15,7 @@ use crate::snd::{VirtioSndDevice, report_snd_online};
 use crate::transport::VirtioMmioTransport;
 use crate::vsock::VirtioVsockDevice;
 
-pub type VirtioMmioBlockDevice<C> = VirtioBlockResource<VirtioMmioTransport<MmioBus>, C>;
+pub type VirtioMmioBlockDevice<C, B> = VirtioBlockResource<VirtioMmioTransport<MmioBus>, C, B>;
 pub type VirtioMmioNetDevice = VirtioNetDevice<VirtioMmioTransport<MmioBus>>;
 pub type VirtioMmio9pDevice = Virtio9pDevice<VirtioMmioTransport<MmioBus>>;
 pub type VirtioMmioRngDevice = VirtioRngDevice<VirtioMmioTransport<MmioBus>>;
@@ -37,12 +37,12 @@ pub type VirtioMmioSndDevice = VirtioSndDevice<VirtioMmioTransport<MmioBus>>;
 /// `header..header+mmio_size` must refer to a valid, permanently mapped VirtIO
 /// MMIO register block for a block device, and no other code may violate the
 /// transport's register access invariants while the returned driver is alive.
-pub unsafe fn block_from_mmio<C: QueueAffinity>(
+pub unsafe fn block_from_mmio<C: QueueAffinity, B: BlockBuffer>(
     header: NonNull<u8>,
     mmio_size: usize,
     cpu: C,
     rights: BlockDeviceRights,
-) -> IoResult<VirtioMmioBlockDevice<C>> {
+) -> IoResult<VirtioMmioBlockDevice<C, B>> {
     let bus = unsafe { MmioBus::new(header, mmio_size, IdentityDmaPool) }?;
     let transport = VirtioMmioTransport::new(bus)?;
     VirtioBlockDevice::new_resource(transport, cpu, rights)
@@ -55,13 +55,13 @@ pub unsafe fn block_from_mmio<C: QueueAffinity>(
 /// # Safety
 ///
 /// Same as [`block_from_mmio`].
-pub unsafe fn block_from_mmio_with_dma<C: QueueAffinity, P: DmaPool>(
+pub unsafe fn block_from_mmio_with_dma<C: QueueAffinity, P: DmaPool, B: BlockBuffer>(
     header: NonNull<u8>,
     mmio_size: usize,
     dma: P,
     cpu: C,
     rights: BlockDeviceRights,
-) -> IoResult<VirtioBlockResource<VirtioMmioTransport<MmioBus<P>>, C>> {
+) -> IoResult<VirtioBlockResource<VirtioMmioTransport<MmioBus<P>>, C, B>> {
     let bus = unsafe { MmioBus::new(header, mmio_size, dma) }?;
     let transport = VirtioMmioTransport::new(bus)?;
     VirtioBlockDevice::new_resource(transport, cpu, rights)

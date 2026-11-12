@@ -23,8 +23,8 @@ never depends on anything above it.
 | Kernel | `kernel/` | Every piece of hardware-independent runtime logic: executor, timer, memory and OOM, instance registry, component host, Wasmtime adapter, network service, host-fs client, every WIT service. `#![no_std]`, generic over `Cpu`. The user payload is not linked into the kernel: it arrives as a boot module (`docs/boot.md`). |
 | Backends | `aarch64/`, `riscv/`, `x86/`, `hosted/` | Boot, trap, IRQ, timer, MMIO, UART, virtio transport and SMP wiring, and nothing else. `hosted/` runs the same kernel on the host OS under the same restriction. |
 | Kernel image | the root crate `helios` (`src/`) | The binary that links whichever backend the target selects, and runs `hosted` on the host. |
-| User space | `api/`, `api-macro/`, `programs/*` | The userland SDK and the wasm programs, kernel plugins included: `init`, `debugger`, `http-client`, `date`, `ping`, `perf`, `oob-load`. `compiler-plugin/` is the in-kernel compiler, a kernel plugin built by the host tools. |
-| Host tools | `inspector/`, `inspector-protocol/`, `cli/`, `compiler-support/`, `profdata/`, `workspace-root/` | `std` crates that boot, build and observe a guest. `inspector-protocol/` is the WIT RPC contract between the inspector and the guest debugger. `profdata/` is the kernel profile's header check and fetched-profile store, shared by `cli/` and `inspector/`. |
+| User space | `api/`, `api-macro/`, `programs/*`, `venus/` | The userland SDK and the wasm programs, kernel plugins included: `init`, `debugger`, `http-client`, `date`, `ping`, `perf`, `oob-load`. `compiler-plugin/` is the in-kernel compiler, a kernel plugin built by the host tools. `venus/` is the Venus wire protocol a program's GPU driver links: the hand-written sinks and the encoders generated at build time. |
+| Host tools | `inspector/`, `inspector-protocol/`, `cli/`, `compiler-support/`, `profdata/`, `venus-gen/`, `workspace-root/` | `std` crates that boot, build and observe a guest. `inspector-protocol/` is the WIT RPC contract between the inspector and the guest debugger. `profdata/` is the kernel profile's header check and fetched-profile store, shared by `cli/` and `inspector/`. `venus-gen/` generates `venus/`'s encoders from the pinned venus-protocol registry. |
 
 The rules that follow from the table:
 
@@ -467,6 +467,12 @@ red lane names the surface that broke:
 | `smoke-aarch64` | `ubuntu-24.04-arm`, `--accel tcg` | Boot from the device tree and from ACPI, against a pinned upstream QEMU the lane builds and caches, because Ubuntu 24.04's QEMU asserts in its emulated GICv3 under multi-threaded TCG. |
 | `bench-x86-64-linux` | `ubuntu-24.04`, `--accel kvm`, multi-queue tap | The workload benchmarks of §3.6, with the negotiated virtio-net features reported. |
 
+The bench lane is the exception: it lives in `bench-lane.yml` and runs
+nightly against `dev` and on `workflow_dispatch` for any ref, never on a
+pull request, because one unpaired run is no performance evidence (§3.6)
+and the lane is the heaviest job there is. A failed nightly run files a
+`bench`/`bug` issue, or comments on the one already open.
+
 Every lane runs on a Linux runner. macOS runners are not used: their queue
 dominates the run and nothing Helios ships targets macOS. Every boot in CI
 names its accelerator explicitly, per §5.
@@ -503,8 +509,8 @@ nobody edits a version or a changelog by hand.
   block. Evidence in the PR body is concrete:
   the run id, the lane, the median, the negotiated feature line, the log
   line that proved the diagnosis.
-- A change to the Wasmtime fork, to a CI runner or lane, to this file, or to
-  anything that publishes is discussed with a maintainer before it is made.
+- A change to the Wasmtime fork, to a CI runner or lane, or to anything that
+  publishes is discussed with a maintainer before it is made.
 
 ## 9. Working in parallel
 
