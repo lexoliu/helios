@@ -34,6 +34,13 @@ impl HostFileSystem for UnsupportedHostFileSystem {
         core::future::ready(())
     }
 
+    /// No session, so nothing to release for a snapshot.
+    fn prepare_snapshot(&self) -> impl core::future::Future<Output = ()> + Send + '_ {
+        core::future::ready(())
+    }
+
+    fn snapshot_finished(&self) {}
+
     fn stat_path(
         &self,
         _path: &str,
