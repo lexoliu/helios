@@ -1436,6 +1436,7 @@ fn map_fs_error_to_program_exec(error: FsErrorCode) -> crate::ProgramExecError {
         | FsErrorCode::IllegalByteSequence
         | FsErrorCode::Invalid
         | FsErrorCode::Overflow => crate::ProgramExecErrorKind::InvalidPath,
+        FsErrorCode::InsufficientMemory => crate::ProgramExecErrorKind::OutOfMemory,
         _ => crate::ProgramExecErrorKind::Internal,
     };
     crate::ProgramExecError {
@@ -4713,6 +4714,16 @@ mod tests {
     /// heartbeat its phase is over; the only thing that ends one is its
     /// guard going out of scope.
     const PHASES_PAST_THE_SHARE: usize = crate::TASK_ARENA_MIN_BYTES / 64 + 1;
+
+    /// An exec whose program image the user pool could not hold is a
+    /// memory failure.
+    #[test]
+    fn exec_maps_a_refused_frame_to_out_of_memory() {
+        let memory = super::map_fs_error_to_program_exec(
+            crate::wasmtime_adapter::wasi::bindings::filesystem::types::ErrorCode::InsufficientMemory,
+        );
+        assert_eq!(memory.kind, crate::ProgramExecErrorKind::OutOfMemory);
+    }
 
     /// The heartbeat only writes in debug builds, and where it writes is
     /// not what these tests are about, so the port it reaches drops

@@ -138,6 +138,13 @@ pub enum FsError {
     NameTooLong,
     #[error("operation not supported by this filesystem")]
     Unsupported,
+    /// The filesystem's storage budget is exhausted: the data would not fit.
+    #[error("no space left on the filesystem")]
+    NoSpace,
+    /// The memory that would hold the data is exhausted: the backing pool
+    /// refused a frame the filesystem asked for.
+    #[error("the memory that would hold the data is exhausted")]
+    OutOfMemory,
     #[error("input/output error")]
     Io,
 }

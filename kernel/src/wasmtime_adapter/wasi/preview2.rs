@@ -3369,6 +3369,24 @@ mod tests {
     };
     use super::{FsDescriptor, FsNodeKind, p3fs};
 
+    /// Both exhaustion errors survive the p3-to-p2 step, so a p2 stream's
+    /// `filesystem-error-code` tells the budget from the pool.
+    #[test]
+    fn storage_exhaustion_reaches_the_p2_error_codes() {
+        use helios_hal::fs::FsError;
+
+        let code =
+            |error| super::error_code_from_p3(crate::wasmtime_adapter::wasi::fs_error_code(error));
+        assert!(matches!(
+            code(FsError::NoSpace),
+            super::p2fs::ErrorCode::InsufficientSpace
+        ));
+        assert!(matches!(
+            code(FsError::OutOfMemory),
+            super::p2fs::ErrorCode::InsufficientMemory
+        ));
+    }
+
     #[test]
     fn p2_empty_stdin_signals_eof_instead_of_starving_blocking_read() {
         let mut stream = EmptyInputStream;
