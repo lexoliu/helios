@@ -43,6 +43,7 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 use core::alloc::Layout;
 use core::future::Future;
 use core::ptr::NonNull;
@@ -250,6 +251,25 @@ impl UserMemoryPool {
             .iter()
             .map(|processor| self.off_node[usize::from(processor.id())].load(Ordering::Relaxed))
             .sum()
+    }
+
+    /// One reading per node, in node order, for the statistics sample.
+    ///
+    /// Every field is a read under the lock [`Self::stats_on`] already
+    /// takes, or a relaxed counter load.
+    pub fn node_stats(&self) -> Vec<MemoryNodeStats> {
+        (0..self.locality.node_count())
+            .map(|index| {
+                let node = NodeId::new(index);
+                let heap = self.stats_on(node);
+                MemoryNodeStats {
+                    node,
+                    total_bytes: heap.total_bytes,
+                    available_bytes: heap.available_bytes(),
+                    off_node_allocations: self.off_node_allocations(node),
+                }
+            })
+            .collect()
     }
 
     pub fn allocate_zeroed(&self, layout: Layout) -> Result<NonNull<u8>, ProgramOutOfMemory> {
@@ -652,6 +672,19 @@ pub struct UserHeapStats {
     pub allocated_bytes: usize,
 }
 
+/// One node's share of the user pool, as the statistics sample reports
+/// it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemoryNodeStats {
+    pub node: NodeId,
+    /// Usable bytes the node's pool was seeded with.
+    pub total_bytes: usize,
+    /// Bytes the node's pool can still hand out, cached frames included.
+    pub available_bytes: usize,
+    /// Allocations the node's processors had served by another node.
+    pub off_node_allocations: u64,
+}
+
 /// The largest power of two not greater than `value`, or `0` for `0`.
 fn previous_power_of_two(value: usize) -> usize {
     if value == 0 {
@@ -721,6 +754,12 @@ pub fn locality() -> &'static Locality {
 
 pub fn user_heap_stats() -> UserHeapStats {
     user_memory_pool().stats()
+}
+
+/// Every node's share of the user pool; see
+/// [`UserMemoryPool::node_stats`].
+pub fn user_node_stats() -> Vec<MemoryNodeStats> {
+    user_memory_pool().node_stats()
 }
 
 /// User memory the pool can still hand out, or nothing at all before
@@ -1286,6 +1325,34 @@ mod tests {
         );
         assert_eq!(pool.off_node_allocations(NodeId::new(0)), 0);
         assert_eq!(pool.off_node_allocations(NodeId::new(1)), 0);
+    }
+
+    #[test]
+    fn node_stats_report_each_node_in_order() {
+        let (pool, _ranges) = two_nodes();
+        let before = pool.node_stats();
+        assert_eq!(before.len(), 2);
+        assert_eq!(
+            before
+                .iter()
+                .map(|node| node.node.index())
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
+        for (index, node) in before.iter().enumerate() {
+            let heap = pool.stats_on(NodeId::new(index));
+            assert_eq!(node.total_bytes, heap.total_bytes);
+            assert_eq!(node.available_bytes, heap.available_bytes());
+            assert_eq!(node.off_node_allocations, 0);
+        }
+
+        let _held = exhaust(&pool, NodeId::new(0));
+        let _spilled = pool.allocate_zeroed_on(P0, frame_layout(1)).expect("frame");
+        let after = pool.node_stats();
+        assert_eq!(after[0].available_bytes, 0);
+        assert_eq!(after[0].off_node_allocations, 1);
+        assert_eq!(after[1].off_node_allocations, 0);
+        assert!(after[1].available_bytes < before[1].available_bytes);
     }
 
     #[test]

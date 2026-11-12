@@ -167,7 +167,7 @@ pub use memory::{
     FiberStackError, FiberStackVmHooks, HardwareEntropySource, IDLE_SWAP_AFTER,
     INCOMPRESSIBLE_BYTES, KERNEL_HEAP_BOOTSTRAP_BYTES, KERNEL_HEAP_GROWTH_CHUNK_BYTES,
     KERNEL_HEAP_MAX_BOOT_FRACTION, KERNEL_HEAP_MIN_RESERVE_BYTES, KERNEL_HEAP_RESERVE_FRACTION,
-    Locality, MemoryOwner, NoCryptographicEntropy, NoEntropyDevice, NodeRun,
+    Locality, MemoryNodeStats, MemoryOwner, NoCryptographicEntropy, NoEntropyDevice, NodeRun,
     ROOT_ENTROPY_MATERIAL_BYTES, RegionShares, ReleasedReservation, ReservationLookup,
     ReservationTracker, RootEntropy, RootEntropyHandle, SWAP_BATCH_BYTES, SWAP_TICK, StackFault,
     SwapDisabled, SwapEntry, SwapFaultError, SwapHandle, SwapStats, SwapVmHooks,
@@ -182,7 +182,7 @@ pub use memory::{
     install_swap_hooks, installed_swap_handle, installed_swap_hooks, kernel_reserve_for,
     largest_servable_user_bytes, page_fault_frame_reserve_bytes, ranges_outside,
     resolve_stack_fault, seed_root_entropy, swapped_token, task_arena_bytes_for, user_frame_node,
-    user_heap_stats, user_mapping_kernel_heap_bytes, validate_range,
+    user_heap_stats, user_mapping_kernel_heap_bytes, user_node_stats, validate_range,
 };
 pub use network::{
     HTTP_FORBIDDEN_FIELD_NAMES, HTTP_MAX_FIELD_SECTION_BYTES, HTTP_MAX_FIELD_VALUE_BYTES, HttpBody,

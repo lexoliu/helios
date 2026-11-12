@@ -26,7 +26,7 @@ use crate::{
     KillReason, ProgramExecError, ProgramExecErrorDetail, ProgramExecErrorKind, RawMutex,
     RawMutexGuardResource, RawMutexResource, RawRwLock, RawRwLockReadGuardResource,
     RawRwLockResource, RawRwLockWriteGuardResource, SerialPortResource, elapsed_millis,
-    largest_servable_user_bytes, machine_memory, monotonic_nanos, user_heap_stats,
+    largest_servable_user_bytes, machine_memory, monotonic_nanos, user_heap_stats, user_node_stats,
 };
 use helios_hal::cpu::Cpu;
 use spin::Mutex;
@@ -4422,6 +4422,26 @@ macro_rules! convert_swap_stats {
     };
 }
 
+/// Maps the user pool's per-node readings onto one binding set's
+/// `memory-node` records, for the same reason [`convert_block_stats`]
+/// exists.
+macro_rules! convert_memory_node_stats {
+    ($bindings:path, $nodes:expr) => {{
+        use $bindings as stats_bindings;
+        $nodes
+            .into_iter()
+            .map(|node: crate::MemoryNodeStats| stats_bindings::MemoryNode {
+                id: u32::try_from(node.node.index()).expect("node index does not fit into u32"),
+                total_bytes: u64::try_from(node.total_bytes)
+                    .expect("node memory does not fit into u64"),
+                available_bytes: u64::try_from(node.available_bytes)
+                    .expect("free node memory does not fit into u64"),
+                off_node_allocations: node.off_node_allocations,
+            })
+            .collect::<alloc::vec::Vec<_>>()
+    }};
+}
+
 /// The machine's memory, not the kernel heap's.
 ///
 /// The two domains draw on the same physical memory — the kernel heap
@@ -4450,6 +4470,7 @@ fn convert_sample(sample: StatsSample) -> debugger_wit::stats::Sample {
             total_bytes,
             available_bytes,
             pressure: convert_memory_pressure(total_bytes, available_bytes),
+            nodes: convert_memory_node_stats!(debugger_wit::stats, user_node_stats()),
         },
         block: convert_block_stats!(debugger_wit::stats, sample.block),
         iommu: convert_iommu_stats!(debugger_wit::stats, sample.iommu),
@@ -4486,6 +4507,7 @@ fn convert_program_sample(sample: StatsSample) -> program_wit::stats::Sample {
             total_bytes,
             available_bytes,
             pressure: convert_program_memory_pressure(total_bytes, available_bytes),
+            nodes: convert_memory_node_stats!(program_wit::stats, user_node_stats()),
         },
         block: convert_block_stats!(program_wit::stats, sample.block),
         iommu: convert_iommu_stats!(program_wit::stats, sample.iommu),
@@ -4700,6 +4722,52 @@ mod tests {
     };
     use crate::test_support::TestCpu;
     use crate::{Executor, InstanceSpawner, TaskCapacityError, TaskFunding, Timer};
+
+    /// Both binding sets get the same field mapping, node by node, in
+    /// node order.
+    #[test]
+    fn memory_nodes_convert_field_for_field_in_both_worlds() {
+        let readings = || {
+            alloc::vec![
+                crate::MemoryNodeStats {
+                    node: helios_hal::numa::NodeId::new(0),
+                    total_bytes: 4096,
+                    available_bytes: 1024,
+                    off_node_allocations: 7,
+                },
+                crate::MemoryNodeStats {
+                    node: helios_hal::numa::NodeId::new(1),
+                    total_bytes: 0,
+                    available_bytes: 0,
+                    off_node_allocations: 0,
+                },
+            ]
+        };
+        let debugger = convert_memory_node_stats!(super::debugger_wit::stats, readings());
+        let program = convert_memory_node_stats!(super::program_wit::stats, readings());
+        assert_eq!(debugger.len(), 2);
+        assert_eq!(program.len(), 2);
+        assert_eq!(
+            (
+                debugger[0].id,
+                debugger[0].total_bytes,
+                debugger[0].available_bytes,
+                debugger[0].off_node_allocations
+            ),
+            (0, 4096, 1024, 7)
+        );
+        assert_eq!(
+            (
+                program[0].id,
+                program[0].total_bytes,
+                program[0].available_bytes,
+                program[0].off_node_allocations
+            ),
+            (0, 4096, 1024, 7)
+        );
+        assert_eq!((debugger[1].id, program[1].id), (1, 1));
+        assert_eq!(debugger[1].total_bytes, 0);
+    }
 
     #[test]
     fn a_zero_stats_period_is_the_callers_error() {

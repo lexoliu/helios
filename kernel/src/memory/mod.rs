@@ -79,11 +79,11 @@ pub use swap::{
     installed_swap_hooks, swapped_token,
 };
 pub use user::{
-    UserHeapStats, UserMemoryPool, allocate_user_frame_uninit_on,
+    MemoryNodeStats, UserHeapStats, UserMemoryPool, allocate_user_frame_uninit_on,
     allocate_user_frame_uninit_on_node, allocate_user_frame_zeroed, allocate_user_frame_zeroed_on,
     allocate_user_run_zeroed_on, deallocate_user_frame, deallocate_user_frame_on,
     deallocate_user_run_on, largest_servable_user_bytes, locality, user_frame_node,
-    user_heap_stats,
+    user_heap_stats, user_node_stats,
 };
 pub(crate) use user::{
     install_user_memory_pool, lend_user_memory_to_kernel_heap, user_memory_pool,

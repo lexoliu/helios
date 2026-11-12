@@ -31,6 +31,20 @@ interface stats {
     utilization: list<processor>,
   }
 
+  /// One node's share of the user pool.
+  record memory-node {
+    /// The node, as the boot line numbers it.
+    id: u32,
+    /// Usable bytes this node's pool was seeded with.
+    total-bytes: u64,
+    /// Bytes this node's pool can still hand out, its processors'
+    /// cached frames included.
+    available-bytes: u64,
+    /// Allocations requested by this node's processors and served from
+    /// another node, since boot.
+    off-node-allocations: u64,
+  }
+
   /// The machine's memory, across both of the kernel's allocation
   /// domains.
   ///
@@ -44,6 +58,11 @@ interface stats {
     /// Bytes neither domain has handed out.
     available-bytes: u64,
     pressure: memory-pressure,
+    /// One entry per node, a node without memory included. A machine
+    /// with no NUMA description has one node. The user pool alone is
+    /// divided, so these do not sum to the machine totals above: the
+    /// kernel heap's share is not attributed to a node.
+    nodes: list<memory-node>,
   }
 
   /// The block device the kernel owns, as it identified it at boot.
