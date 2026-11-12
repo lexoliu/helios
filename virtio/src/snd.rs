@@ -834,7 +834,11 @@ impl<T: VirtioTransport> VirtioSndDevice<T> {
             queue
                 .restock(
                     &self.transport,
-                    slots.chunks_exact_mut(EVENT_BYTES),
+                    slots
+                        .as_chunks_mut::<EVENT_BYTES>()
+                        .0
+                        .iter_mut()
+                        .map(|slot| slot.as_mut_slice()),
                     slot_for_token,
                 )
                 .map_err(|error| ReinitError::Restore {
