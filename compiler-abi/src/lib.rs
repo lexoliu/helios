@@ -354,7 +354,7 @@ mod tests {
             flags: HELIOS_COMPILER_REQUEST_PROFILE,
         };
         let bytes = header.to_bytes();
-        assert_eq!(&bytes[..4], &3_u32.to_le_bytes());
+        assert_eq!(&bytes[..4], &HELIOS_COMPILER_ABI_VERSION.to_le_bytes());
         assert_eq!(&bytes[4..8], &1_u32.to_le_bytes());
         assert_eq!(&bytes[24..28], &0x3000_u32.to_le_bytes());
         assert_eq!(

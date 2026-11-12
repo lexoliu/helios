@@ -102,7 +102,10 @@ fn a_response_in_another_abi_version_is_refused() {
         compile_all(stand_in(), workers(2), vec![vec![2]]).expect("the stand-in is hosted");
     match results.into_iter().next().expect("one result") {
         Err(CompilerHostError::AbiMismatch { found, expected }) => {
-            assert_eq!((found, expected), (99, 3));
+            assert_eq!(
+                (found, expected),
+                (99, helios_compiler_abi::HELIOS_COMPILER_ABI_VERSION)
+            );
         }
         other => panic!("expected an ABI mismatch, got {other:?}"),
     }

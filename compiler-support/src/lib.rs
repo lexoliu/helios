@@ -1,7 +1,6 @@
 use helios_artifact::{
     CWASM_MEMORY_GUARD_SIZE, CWASM_MEMORY_RESERVATION, CwasmTarget, cwasm_target_code_protection,
-    cwasm_target_guest_stack_limit_offset,
-    cwasm_target_supports_wasm_simd,
+    cwasm_target_guest_stack_limit_offset, cwasm_target_supports_wasm_simd,
 };
 use std::cell::{Cell, RefCell};
 use std::env;
@@ -539,7 +538,9 @@ fn build_engine_config(
 #[cfg(test)]
 mod tests {
     use super::{AotCompileHint, CwasmTarget, build_engine_config, precompile_artifact};
-    use helios_artifact::{CwasmCodeProtection, cwasm_target_isa_levels};
+    #[cfg(target_arch = "x86_64")]
+    use helios_artifact::CwasmCodeProtection;
+    use helios_artifact::cwasm_target_isa_levels;
     #[cfg(target_arch = "x86_64")]
     use wasmtime::{Engine, Module, ModuleVersionStrategy};
 
