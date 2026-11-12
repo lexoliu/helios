@@ -99,6 +99,9 @@ struct ScriptedDevice {
     /// Set once `start` has been called, so a test can assert that no
     /// period reached the device before the clock ran.
     started: AtomicU32,
+    /// How many times `set_params` has been called, so a test can assert
+    /// the device was never configured.
+    configured: AtomicU32,
     /// Events the drain will be handed, most recent last.
     events: Mutex<Vec<AudioResult<AudioEvent>>>,
     /// How many bytes the device claims to still hold when it takes a
@@ -140,6 +143,7 @@ impl ScriptedDevice {
             in_flight: AtomicU32::new(0),
             high_water: AtomicU32::new(0),
             started: AtomicU32::new(0),
+            configured: AtomicU32::new(0),
             events: Mutex::new(Vec::new()),
             latency_bytes: 0,
             start_error: None,
@@ -179,6 +183,7 @@ impl PlaybackDevice for ScriptedDevice {
     }
 
     async fn set_params(&self, _stream: StreamId, _params: PcmParams) -> AudioResult<()> {
+        self.configured.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 
@@ -429,6 +434,63 @@ fn dying_hands_the_stream_back_through_the_playback_task() {
         other.claim(&service, 0, test_caps::audio()).is_ok(),
         "the stream is free once the device has been stopped and the pages given back"
     );
+}
+
+/// A negotiation sitting in the inbox when its claim is let go is
+/// dropped rather than served: the generation advances on release, not
+/// only on the next claim, so the device is never configured for a
+/// claim that is already gone — and no second claim is needed to make
+/// that so.
+#[test]
+fn a_negotiation_queued_before_release_is_dropped() {
+    test_hooks::install();
+    let (service, inboxes) = service_of(&[playback_stream(0)]);
+    let mut audio = AudioOwnership::new();
+    audio
+        .claim(&service, 0, test_caps::audio())
+        .expect("the stream is free");
+    let (ring, params) = audio.negotiate(TONE).expect("the device takes this format");
+    let sender = audio
+        .claim_ref()
+        .expect("the claim was just taken")
+        .sender();
+
+    // The request lands in the inbox before the playback task runs and
+    // before the claim is let go.
+    let mut pending = pin!(sender.negotiate(params, ring));
+    assert!(
+        block_on(poll_once(pending.as_mut())).is_none(),
+        "the negotiation is queued and unanswered"
+    );
+    audio.release();
+
+    let device = ScriptedDevice::new(topology(&[playback_stream(0)]));
+    let timer = crate::test_support::test_timer(TestCpu::without_entropy());
+    let inbox = &inboxes[0];
+    block_on(async {
+        let served = pin!(serve_playback(&device, stream_of(&service), inbox, &timer));
+        let settle = async {
+            assert_eq!(
+                pending.await.err(),
+                Some(AudioServiceError::Closed),
+                "the dead claim's negotiation is dropped, not served"
+            );
+            for _ in 0..3 {
+                yield_now().await;
+            }
+        };
+        match select(pin!(settle), served).await {
+            Either::Left(((), _)) => {}
+            Either::Right(((), _)) => panic!("the playback task never ends on its own"),
+        }
+    });
+
+    assert_eq!(
+        device.configured.load(Ordering::Acquire),
+        0,
+        "the device was never configured for a claim that had ended"
+    );
+    assert_eq!(device.started.load(Ordering::Acquire), 0);
 }
 
 /// The device is never handed more than [`PERIODS_IN_FLIGHT`] periods
