@@ -122,6 +122,9 @@ test-units:
     # The host tools: QEMU arguments, network plans, the image audit, the
     # signature trailer, the profile store, the root keypair.
     cargo nextest run -p helios-inspector -p helios-artifact -p helios-profdata -p helios-cli -p helios-compiler-support
+    # The compiler plugin the prebuild above built, hosted under Wasmtime on
+    # this host the way the bench's Linux + Wasmtime column hosts it.
+    HELIOS_COMPILER_PLUGIN_WASM="${out_dir}/compiler_plugin.wasm" cargo nextest run -p helios-compiler-host
     # The Venus protocol is generated from pinned venus-protocol inputs that
     # the CLI fetches and hash-verifies; the parity test then compares the
     # generated encoders with the pinned Mesa generator's output.
