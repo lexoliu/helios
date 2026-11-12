@@ -61,7 +61,7 @@ pub fn trust_bootfs_artifact(bytes: &crate::BootfsBytes) -> TrustedCwasm<'_> {
 pub(crate) fn sign_bootfs_image_for_tests(body: Vec<u8>) -> Vec<u8> {
     helios_artifact::bootfs::sign_image_with_secret_key_bytes(
         body,
-        &generated::TRUSTED_ROOT_SIGNING_KEY,
+        generated::TRUSTED_ROOT_SIGNING_KEY,
     )
 }
 
@@ -77,7 +77,7 @@ pub(crate) fn sign_bootfs_image_for_tests(body: Vec<u8>) -> Vec<u8> {
 pub(crate) fn sign_artifact_with_build_root_for_tests(payload: &[u8]) -> Vec<u8> {
     helios_artifact::sign_payload_with_secret_key_bytes(
         payload,
-        &generated::TRUSTED_ROOT_SIGNING_KEY,
+        generated::TRUSTED_ROOT_SIGNING_KEY,
     )
     .expect("signing a test payload must succeed")
 }
@@ -107,8 +107,10 @@ pub fn trusted_root_public_keys() -> &'static [[u8; 32]] {
 
 mod generated {
     include!(concat!(env!("OUT_DIR"), "/trusted_roots.rs"));
-    // The build root's secret signs test payloads only; no kernel image
-    // carries it.
+    /// The build root's secret, read from the file `kernel-prebuild`
+    /// wrote. It signs test payloads only: it exists in a test build and
+    /// no kernel image reads the variable or carries the key.
     #[cfg(test)]
-    include!(concat!(env!("OUT_DIR"), "/trusted_signing_key.rs"));
+    pub(super) static TRUSTED_ROOT_SIGNING_KEY: &[u8; 32] =
+        include_bytes!(env!("HELIOS_KERNEL_ROOT_SECRET_KEY"));
 }

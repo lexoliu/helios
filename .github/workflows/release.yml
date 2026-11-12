@@ -144,10 +144,41 @@ jobs:
         with:
           limine-dir: ${{ github.workspace }}/limine
           output: ${{ github.workspace }}/profiles/helios-kernel.profdata
+      # The key the released kernel trusts and its boot payload is signed
+      # with (docs/boot.md). It lives in the runner's temporary directory,
+      # outside the checkout and every build directory, so no artifact or
+      # cache can pick it up, and the last step removes it. The profile
+      # collection above keeps the keys its own builds generated.
+      - name: Install the release signing key
+        env:
+          HELIOS_BOOTFS_ROOT_KEY: ${{ secrets.HELIOS_BOOTFS_ROOT_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${HELIOS_BOOTFS_ROOT_KEY}" ]; then
+            echo "::error::the repository secret HELIOS_BOOTFS_ROOT_KEY is empty or not set; a release cannot sign its boot payload without it"
+            exit 1
+          fi
+          key="${RUNNER_TEMP}/helios-bootfs-root.key"
+          # Created owner-only before a byte is written, so the key is
+          # never on disk under the runner's umask.
+          install -m 600 /dev/null "${key}"
+          if ! printf '%s' "${HELIOS_BOOTFS_ROOT_KEY}" | base64 -d > "${key}" 2>/dev/null; then
+            rm -f "${key}"
+            echo "::error::the repository secret HELIOS_BOOTFS_ROOT_KEY is not valid base64; it holds the base64 of the 32 raw key bytes"
+            exit 1
+          fi
+          if [ "$(wc -c < "${key}")" -ne 32 ]; then
+            rm -f "${key}"
+            echo "::error::the repository secret HELIOS_BOOTFS_ROOT_KEY does not decode to 32 bytes; it holds the base64 of the 32 raw key bytes"
+            exit 1
+          fi
+          echo "HELIOS_ROOT_KEY_FILE=${key}" >> "${GITHUB_ENV}"
       - name: Build the released kernel against the profile
         working-directory: helios
-        run: just kernel-pgo-use x86-64 "$GITHUB_WORKSPACE/profiles/helios-kernel.profdata"
-      - name: Attach the profile and the profile-guided kernel to the release
+        run: |
+          just kernel-pgo-use x86-64 "$GITHUB_WORKSPACE/profiles/helios-kernel.profdata" \
+            --root-secret-key "${HELIOS_ROOT_KEY_FILE}"
+      - name: Attach the profile, the profile-guided kernel and its boot payload to the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -165,8 +196,18 @@ jobs:
             vm --arch x86-64 --profile-use "$GITHUB_WORKSPACE/profiles/helios-kernel.profdata" \
             kernel-path)"
           cp "$kernel" assets/helios-kernel-x86-64
+          # The payload the build above signed with the release key: the
+          # kernel trusts that key's public half and nothing else.
+          bootfs="$(cd helios && cargo run -p helios-inspector --quiet -- \
+            vm --arch x86-64 --profile-use "$GITHUB_WORKSPACE/profiles/helios-kernel.profdata" \
+            bootfs-path)"
+          cp "$bootfs" assets/helios-bootfs-x86-64
           gh release upload "${RELEASE_TAG}" \
             assets/helios-kernel.profdata \
             assets/helios-kernel-x86-64 \
+            assets/helios-bootfs-x86-64 \
             --clobber --repo "${GITHUB_REPOSITORY}"
+      - name: Remove the release signing key
+        if: always()
+        run: rm -f "${HELIOS_ROOT_KEY_FILE:-${RUNNER_TEMP}/helios-bootfs-root.key}"
 

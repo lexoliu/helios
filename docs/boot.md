@@ -27,6 +27,17 @@ prebuild root key. The init component, the compiler plugin and every
 boot program inside it are bare Wasmtime artifacts with no per-artifact
 signature trailer: the footer vouches for them as a whole.
 
+The root key never lives in the repository or in an image. A development
+build generates it in its own prebuild directory and embeds its public
+half in the kernel. A release names its key with `--root-secret-key
+<file>` (on `helios-cli kernel-prebuild` and on the inspector's `vm`,
+which forwards it): the file is read in place, and the release workflow
+writes it from the repository secret `HELIOS_BOOTFS_ROOT_KEY`, the base64
+of the 32 raw key bytes, to a file in the runner's temporary directory
+and removes it after the upload. The signed payload ships beside the
+kernel as the release asset `helios-bootfs-x86-64`, located with
+`vm … bootfs-path`.
+
 The kernel reads it with `BootPayload::parse`, the single entry on every
 backend. It hashes the body once, verifies the footer against the
 trusted root public keys embedded in the kernel image, and only then

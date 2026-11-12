@@ -77,6 +77,10 @@ enum KeyError {
         "{path} is a secret key with mode {mode:03o}; it must be readable by its owner alone (600)"
     )]
     SecretKeyExposed { path: String, mode: u32 },
+    #[error(
+        "--root-secret-key {path} is not a file; the key a release signs with is never generated"
+    )]
+    SuppliedKeyMissing { path: String },
 }
 
 /// The mode a secret key file is created with: its owner reads and writes
@@ -653,6 +657,14 @@ struct KernelPrebuildCommand {
     boot_artifacts_manifest: PathBuf,
     #[arg(long = "no-compiler-plugin", default_value_t = false)]
     no_compiler_plugin: bool,
+    /// Sign the payload with the 32-byte Ed25519 secret in this file
+    /// instead of the key generated in `--out-dir`.
+    ///
+    /// The file is read in place and nothing secret is written to
+    /// `--out-dir`; a release build names the key its workflow
+    /// installed.
+    #[arg(long, value_name = "PATH")]
+    root_secret_key: Option<PathBuf>,
 }
 
 #[derive(Parser)]
@@ -818,9 +830,18 @@ fn run_kernel_prebuild(
         source,
     })?;
 
-    let root_secret_path = command.out_dir.join(ROOT_SECRET_FILE);
     let root_public_path = command.out_dir.join(ROOT_PUBLIC_FILE);
-    let root_signing_key = ensure_root_keypair(&root_secret_path, &root_public_path)?;
+    let (root_secret_path, root_signing_key) = match &command.root_secret_key {
+        Some(supplied) => (
+            supplied.clone(),
+            supplied_root_keypair(supplied, &root_public_path)?,
+        ),
+        None => {
+            let generated = command.out_dir.join(ROOT_SECRET_FILE);
+            let key = ensure_root_keypair(&generated, &root_public_path)?;
+            (generated, key)
+        }
+    };
 
     let init_manifest = workspace_root.join(&command.init_manifest);
     let bootfs_root = workspace_root.join(&command.bootfs_root);
@@ -2082,20 +2103,44 @@ fn ensure_root_keypair(
             })?;
         signing_key
     };
-    // The public key always lands next to the secret: it is the copy the
-    // kernel verifies against, and a secret that outlived its public half
-    // would otherwise sign artifacts nothing can check. The write is
-    // skipped when the bytes already match — a kernel build tracks the
-    // file through `cargo:rerun-if-changed`, and an untouched mtime is
-    // what keeps a payload-only prebuild from recompiling it.
-    let public_bytes = VerifyingKey::from(&signing_key).to_bytes();
+    write_root_public_key(&signing_key, root_public_path)?;
+    Ok(signing_key)
+}
+
+/// The root key a release names: read in place, never generated and never
+/// copied, so the only file holding the secret is the one the caller owns.
+fn supplied_root_keypair(
+    root_secret_path: &Path,
+    root_public_path: &Path,
+) -> Result<SigningKey, KeyError> {
+    if !root_secret_path.is_file() {
+        return Err(KeyError::SuppliedKeyMissing {
+            path: root_secret_path.display().to_string(),
+        });
+    }
+    let signing_key = read_signing_key(root_secret_path)?;
+    write_root_public_key(&signing_key, root_public_path)?;
+    Ok(signing_key)
+}
+
+/// The public key always lands in the prebuild directory: it is the copy
+/// the kernel verifies against, and a secret that outlived its public half
+/// would otherwise sign artifacts nothing can check. The write is
+/// skipped when the bytes already match — a kernel build tracks the
+/// file through `cargo:rerun-if-changed`, and an untouched mtime is
+/// what keeps a payload-only prebuild from recompiling it.
+fn write_root_public_key(
+    signing_key: &SigningKey,
+    root_public_path: &Path,
+) -> Result<(), KeyError> {
+    let public_bytes = VerifyingKey::from(signing_key).to_bytes();
     if fs::read(root_public_path).ok().as_deref() != Some(public_bytes.as_slice()) {
         fs::write(root_public_path, public_bytes).map_err(|source| KeyError::Write {
             path: root_public_path.display().to_string(),
             source,
         })?;
     }
-    Ok(signing_key)
+    Ok(())
 }
 
 fn read_signing_key(path: &Path) -> Result<SigningKey, KeyError> {
@@ -2569,6 +2614,67 @@ mod tests {
         assert!(
             matches!(error, KeyError::SecretKeyExposed { mode: 0o644, .. }),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn a_supplied_root_secret_signs_and_nothing_secret_is_written_beside_the_public_key() {
+        let keys = tempfile::tempdir().expect("a directory for the release key");
+        let out_dir = tempfile::tempdir().expect("a prebuild directory");
+        let supplied = keys.path().join("release.key");
+        fs::write(&supplied, [7_u8; 32]).expect("a key file");
+        fs::set_permissions(&supplied, fs::Permissions::from_mode(SECRET_KEY_MODE))
+            .expect("an owner-only mode");
+        let public = out_dir.path().join(ROOT_PUBLIC_FILE);
+
+        let key = supplied_root_keypair(&supplied, &public).expect("the supplied key is read");
+
+        let expected = VerifyingKey::from(&SigningKey::from_bytes(&[7_u8; 32])).to_bytes();
+        assert_eq!(fs::read(&public).expect("the public half"), expected);
+        let signed = bootfs::sign_image(bootfs::write_image(&[]), &key);
+        let footer_start = signed.len() - bootfs::SIGNATURE_FOOTER_BYTES;
+        // Magic, footer version and algorithm precede the signer's key.
+        let signer_offset = footer_start + 8 + 4 + 4;
+        assert_eq!(
+            &signed[signer_offset..signer_offset + 32],
+            expected.as_slice()
+        );
+        let written: Vec<_> = fs::read_dir(out_dir.path())
+            .expect("the prebuild directory")
+            .map(|entry| entry.expect("an entry").file_name())
+            .collect();
+        assert_eq!(written, [std::ffi::OsString::from(ROOT_PUBLIC_FILE)]);
+    }
+
+    #[test]
+    fn a_missing_supplied_root_secret_is_refused_naming_its_path() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let supplied = dir.path().join("absent.key");
+        let error = supplied_root_keypair(&supplied, &dir.path().join("root.pub"))
+            .expect_err("a key that is not there is never generated");
+        assert!(
+            matches!(&error, KeyError::SuppliedKeyMissing { path } if path == &supplied.display().to_string()),
+            "{error}"
+        );
+        assert!(!supplied.exists(), "nothing was generated at the path");
+    }
+
+    #[test]
+    fn a_supplied_root_secret_others_can_read_is_refused_with_its_mode() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let supplied = dir.path().join("release.key");
+        fs::write(&supplied, [7_u8; 32]).expect("a key file");
+        fs::set_permissions(&supplied, fs::Permissions::from_mode(0o640)).expect("a wider mode");
+        let public = dir.path().join("root.pub");
+        let error =
+            supplied_root_keypair(&supplied, &public).expect_err("a group-readable key is refused");
+        assert!(
+            matches!(error, KeyError::SecretKeyExposed { mode: 0o640, .. }),
+            "{error}"
+        );
+        assert!(
+            !public.exists(),
+            "no public half is written for a refused key"
         );
     }
 

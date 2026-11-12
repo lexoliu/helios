@@ -424,9 +424,11 @@ does.
 
 Before a change is complete, run the recipes for every surface it can
 affect. `just check-target` and `just test-units` run `helios-cli
-kernel-prebuild` themselves and export the two trusted-root key files it
-writes as `HELIOS_KERNEL_ROOT_PUBLIC_KEY` and `HELIOS_KERNEL_ROOT_SECRET_KEY`,
-the only prebuild outputs the kernel build tracks; the `helios-bootfs`
+kernel-prebuild` themselves and export the trusted-root public key file it
+writes as `HELIOS_KERNEL_ROOT_PUBLIC_KEY`, the only prebuild output the
+kernel build tracks; a recipe that compiles the kernel's tests also exports
+`HELIOS_KERNEL_ROOT_SECRET_KEY`, which only a test build reads and no
+kernel image is given; the `helios-bootfs`
 payload it also writes is loaded at boot, never compiled in, so changing
 the boot programs never relinks the kernel. The `check-target` set is the
 backends the diff can reach: a change in `hal/`, a library crate, a shared

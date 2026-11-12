@@ -129,6 +129,12 @@ pub(crate) enum VmConfigError {
     WithoutKernelProfileOnPlainTarget { arch: &'static str },
     #[error("{0}")]
     WorkloadSelection(#[from] WorkloadSelectionError),
+    #[error("--root-secret-key {path} cannot be made absolute: {source}")]
+    RootSecretKeyPath {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
     #[error("failed to read inspector VM config {path}: {source}")]
     ReadConfig {
         path: String,
@@ -1650,6 +1656,14 @@ pub(crate) struct VmCommand {
     #[arg(long)]
     bootfs: Option<PathBuf>,
 
+    /// Sign the boot payload with the Ed25519 secret in this file, and
+    /// embed its public half in the kernel, instead of the key a
+    /// development build generates in its own build directory. A
+    /// release names the key its workflow installed; the file is read
+    /// in place and never copied into the build directory.
+    #[arg(long, value_name = "PATH")]
+    root_secret_key: Option<PathBuf>,
+
     #[arg(long)]
     socket: Option<PathBuf>,
 
@@ -1907,6 +1921,14 @@ enum VmSessionCommand {
     /// refuse two checkouts whose guest images turn out to be the same
     /// build, which the comparison between them could say nothing about.
     KernelPath,
+    /// Print the signed `helios-bootfs` payload this checkout would boot
+    /// with that kernel, and stop there.
+    ///
+    /// The payload is the one `kernel-prebuild` wrote for the same
+    /// build, resolved as a boot resolves it: `--bootfs` or the config
+    /// file's `bootfs` if named, else the build's prebuild directory. A
+    /// release uses it to attach the payload its kernel trusts.
+    BootfsPath,
     /// Provision the privileged host state a network backend needs.
     NetSetup(NetSetupCommand),
     /// Remove the host state `net-setup` provisioned.
@@ -2269,6 +2291,14 @@ pub(crate) fn run(mut command: VmCommand) -> Result<(), VmError> {
             println!("{}", kernel.display());
             return Ok(());
         }
+        Some(VmSessionCommand::BootfsPath) => {
+            let file = load_config_file(command.config.as_deref())?;
+            let build = resolve_build(&command, &file, None)?;
+            let bootfs = resolve_bootfs_path(command.bootfs, file.bootfs, &build)
+                .map_err(VmConfigError::from)?;
+            println!("{}", bootfs.display());
+            return Ok(());
+        }
         session => command.command = session,
     }
     let command = resolve(command)?;
@@ -2303,6 +2333,10 @@ struct KernelBuildSpec {
     profile_use: Option<KernelProfileUse>,
     boot_programs: Vec<String>,
     no_compiler_plugin: bool,
+    /// The release signing key a build was told to use, absolute. `None`
+    /// is a development build, whose key `kernel-prebuild` generates in
+    /// the build's own prebuild directory.
+    root_secret_key: Option<PathBuf>,
 }
 
 /// Which profile a `profile-use` kernel reads, and what that makes of
@@ -2493,12 +2527,25 @@ fn resolve_build(
         }
     }
     let no_compiler_plugin = command.no_compiler_plugin || file.no_compiler_plugin.unwrap_or(false);
+    // Absolute, because the prebuild and the kernel build each run in the
+    // workspace root rather than the directory the inspector was invoked in.
+    let root_secret_key = command
+        .root_secret_key
+        .as_deref()
+        .map(|path| {
+            std::path::absolute(path).map_err(|source| VmConfigError::RootSecretKeyPath {
+                path: path.display().to_string(),
+                source,
+            })
+        })
+        .transpose()?;
     Ok(KernelBuildSpec {
         profile,
         kind,
         profile_use,
         boot_programs,
         no_compiler_plugin,
+        root_secret_key,
     })
 }
 
@@ -2568,6 +2615,20 @@ fn resolve_kernel_path(
     }
 }
 
+/// The `helios-bootfs` payload a session boots: an explicit path from the
+/// command line or the config file, else the one `kernel-prebuild` wrote
+/// for the resolved build.
+fn resolve_bootfs_path(
+    explicit: Option<PathBuf>,
+    configured: Option<PathBuf>,
+    build: &KernelBuildSpec,
+) -> Result<PathBuf, WorkspaceRootError> {
+    match explicit.or(configured) {
+        Some(bootfs) => Ok(bootfs),
+        None => bootfs_path(build),
+    }
+}
+
 fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
     let file = load_config_file(command.config.as_deref())?;
     let session_command: Option<ResolvedVmSessionCommand> = command.command.take().map(Into::into);
@@ -2580,10 +2641,7 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
         .or(file.qemu_bin)
         .unwrap_or_else(|| PathBuf::from(profile.qemu_bin));
     let kernel = resolve_kernel_path(command.kernel, file.kernel, &build)?;
-    let bootfs = match command.bootfs.or(file.bootfs) {
-        Some(bootfs) => bootfs,
-        None => bootfs_path(&build)?,
-    };
+    let bootfs = resolve_bootfs_path(command.bootfs, file.bootfs, &build)?;
     let smp = command.smp.or(file.smp).unwrap_or(profile.default_smp);
     let memory = command
         .memory
@@ -2985,16 +3043,7 @@ fn build_vm(command: &KernelBuildSpec) -> Result<(), VmBuildError> {
         None => format!("building {} kernel", arch_label(command.profile.arch)),
     };
     let mut kernel_build = kernel_build_command(&repo_root, command);
-    let prebuild_dir = kernel_prebuild_dir(command)?;
-    kernel_build
-        .env(
-            "HELIOS_KERNEL_ROOT_PUBLIC_KEY",
-            prebuild_dir.join("helios-root-public.key"),
-        )
-        .env(
-            "HELIOS_KERNEL_ROOT_SECRET_KEY",
-            prebuild_dir.join("helios-root-secret.key"),
-        )
+    export_trusted_root_public_key(&mut kernel_build, command)?
         .arg("--target")
         .arg(command.profile.cargo_target)
         .arg("--bin")
@@ -3223,8 +3272,25 @@ fn run_kernel_prebuild(command: &KernelBuildSpec) -> Result<(), VmBuildError> {
     if command.no_compiler_plugin {
         prebuild.arg("--no-compiler-plugin");
     }
+    if let Some(secret) = &command.root_secret_key {
+        prebuild.arg("--root-secret-key").arg(secret);
+    }
     run_step("prebuilding kernel bootfs", &mut prebuild)?;
     Ok(())
+}
+
+/// Points a kernel image build at the public half of the root key
+/// `kernel-prebuild` wrote for `build`. An image carries the public key
+/// alone: the secret never reaches a kernel build, so a release key cannot
+/// land under `target/`.
+fn export_trusted_root_public_key<'a>(
+    kernel_build: &'a mut Command,
+    build: &KernelBuildSpec,
+) -> Result<&'a mut Command, WorkspaceRootError> {
+    Ok(kernel_build.env(
+        "HELIOS_KERNEL_ROOT_PUBLIC_KEY",
+        kernel_prebuild_dir(build)?.join("helios-root-public.key"),
+    ))
 }
 
 fn connect_and_run(
@@ -6287,6 +6353,7 @@ impl From<VmSessionCommand> for ResolvedVmSessionCommand {
             VmSessionCommand::Profile(command) => Self::Profile(command),
             VmSessionCommand::Build
             | VmSessionCommand::KernelPath
+            | VmSessionCommand::BootfsPath
             | VmSessionCommand::NetSetup(_)
             | VmSessionCommand::NetTeardown(_) => {
                 unreachable!(
@@ -7396,6 +7463,7 @@ mod tests {
             profile_use: None,
             boot_programs: Vec::new(),
             no_compiler_plugin: true,
+            root_secret_key: None,
         };
         let root = Path::new("/checkout");
         for kind in [
@@ -7442,6 +7510,7 @@ mod tests {
                     profile_use: None,
                     boot_programs: Vec::new(),
                     no_compiler_plugin: true,
+                    root_secret_key: None,
                 };
                 let arguments = cargo_arguments(&kernel_build_command(root, &build));
                 assert_eq!(
@@ -7955,6 +8024,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_kernel_image_build_is_given_the_public_root_key_and_never_the_secret() {
+        let mut build = KernelBuildSpec {
+            profile: &X86_64_VM_PROFILE,
+            kind: KernelBuildProfile::Release,
+            profile_use: None,
+            boot_programs: Vec::new(),
+            no_compiler_plugin: false,
+            root_secret_key: Some(PathBuf::from("/run/release/root.key")),
+        };
+        for root_secret_key in [None, build.root_secret_key.clone()] {
+            build.root_secret_key = root_secret_key;
+            let mut cargo = Command::new("cargo");
+            export_trusted_root_public_key(&mut cargo, &build)
+                .expect("workspace root must resolve");
+            let public = kernel_prebuild_dir(&build)
+                .expect("workspace root must resolve")
+                .join("helios-root-public.key");
+            let envs: Vec<_> = cargo.get_envs().collect();
+            assert_eq!(
+                envs,
+                [(
+                    std::ffi::OsStr::new("HELIOS_KERNEL_ROOT_PUBLIC_KEY"),
+                    Some(public.as_os_str())
+                )]
+            );
+        }
+    }
+
     fn minimal_command() -> VmCommand {
         VmCommand {
             rpc_transport: None,
@@ -7970,6 +8068,7 @@ mod tests {
             qemu_bin: None,
             kernel: None,
             bootfs: None,
+            root_secret_key: None,
             socket: None,
             serial_stdio: false,
             serial_pty: false,
@@ -8036,6 +8135,7 @@ mod tests {
             qemu_bin: None,
             kernel: None,
             bootfs: None,
+            root_secret_key: None,
             socket: None,
             serial_stdio: false,
             serial_pty: false,
@@ -8470,6 +8570,7 @@ mod tests {
             qemu_bin: None,
             kernel: None,
             bootfs: None,
+            root_secret_key: None,
             socket: None,
             serial_stdio: false,
             serial_pty: false,
@@ -8566,8 +8667,9 @@ mod tests {
                 .arg("helios-cli"),
         )?;
         run_kernel_prebuild(&command.build)?;
-        let prebuild_dir = kernel_prebuild_dir(&command.build)?;
-        let status = std::process::Command::new("cargo")
+        let mut cargo = std::process::Command::new("cargo");
+        export_trusted_root_public_key(&mut cargo, &command.build)?;
+        let status = cargo
             .current_dir(repo_root()?)
             .arg("build")
             .args(arch.build_std_arguments())
@@ -8575,14 +8677,6 @@ mod tests {
             .arg(arch.profile().cargo_target)
             .arg("--bin")
             .arg(arch.profile().kernel_artifact_name)
-            .env(
-                "HELIOS_KERNEL_ROOT_PUBLIC_KEY",
-                prebuild_dir.join("helios-root-public.key"),
-            )
-            .env(
-                "HELIOS_KERNEL_ROOT_SECRET_KEY",
-                prebuild_dir.join("helios-root-secret.key"),
-            )
             .env("HELIOS_WATCHDOG_SELF_TEST", "1")
             .env("HELIOS_WATCHDOG_TIMEOUT_SECS", WATCHDOG_TIMEOUT_SECS)
             .env(
@@ -8605,6 +8699,7 @@ mod tests {
             profile_use: None,
             boot_programs: vec!["debugger".to_owned()],
             no_compiler_plugin: true,
+            root_secret_key: None,
         };
         ResolvedVmCommand {
             profile,
@@ -8820,6 +8915,7 @@ mod tests {
             profile_use: None,
             boot_programs: Vec::new(),
             no_compiler_plugin: false,
+            root_secret_key: None,
         };
         ResolvedVmCommand {
             profile,
