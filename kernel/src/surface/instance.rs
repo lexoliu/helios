@@ -103,10 +103,16 @@ impl Drop for PendingSurface {
 pub struct SurfaceOwnership {
     /// The windows this instance owns, and the ones it is creating.
     ///
-    /// An entry whose window is no longer alive has already left the
-    /// desktop — handed back by a create that did not finish, or retired
-    /// with a compositor that died — and is pruned rather than counted
-    /// or handed back again.
+    /// A window handed back — by a create that did not finish, a resource
+    /// drop, or this instance's death — stays here, and counted, until
+    /// the compositor's supervisor has drained it
+    /// ([`SurfaceShared::holds_slot`]); it is never handed back a second
+    /// time. An entry that holds no slot any more — drained, or retired
+    /// with a compositor that died — is pruned.
+    ///
+    /// Written only by this instance's processor. The per-window state it
+    /// reads is written by the processor that hands the window back and
+    /// the one that drains it.
     held: ArrayVec<Arc<SurfaceShared>, MAX_INSTANCE_SURFACES>,
     /// The views this instance holds of somebody else's windows, which
     /// is the compositor's half and empty on everybody else.
@@ -125,9 +131,13 @@ impl SurfaceOwnership {
         }
     }
 
-    /// How many windows this instance owns or is creating right now.
+    /// How many windows this instance owns, is creating, or handed back
+    /// and the drain has not yet processed.
     pub fn held(&self) -> usize {
-        self.held.iter().filter(|shared| shared.is_alive()).count()
+        self.held
+            .iter()
+            .filter(|shared| shared.holds_slot())
+            .count()
     }
 
     /// Pin a frame buffer for a window of `geometry` and register the
@@ -175,7 +185,7 @@ impl SurfaceOwnership {
     /// longer takes the buffer leaves nothing shown, and the window goes
     /// back to the compositor's supervisor through the pending window's
     /// own drop, so the compositor ends its view and is told the window
-    /// is gone.
+    /// is gone. Its slot stays counted until that drain is done.
     pub fn show(
         &mut self,
         views: &mut ViewTable,
@@ -185,7 +195,6 @@ impl SurfaceOwnership {
         match views.show_buffer(memory, pending.span, &pending.buffer, None) {
             Ok(view) => Ok((pending.settle(), view)),
             Err(error) => {
-                self.forget(pending.id());
                 drop(pending);
                 Err(error.into())
             }
@@ -220,9 +229,9 @@ impl SurfaceOwnership {
     /// Never waits and never fails, so a resource drop can call it. The
     /// view at the client's span is the caller's to end first; the
     /// frame buffer stays pinned for as long as the compositor's view of
-    /// it does.
+    /// it does. The window stays counted against this instance until the
+    /// drain has processed it.
     pub fn release(&mut self, registry: &SurfaceService, id: SurfaceId) {
-        self.forget(id);
         registry.return_surfaces(ReturnedSurfaces::one(id));
     }
 
@@ -283,35 +292,37 @@ impl SurfaceOwnership {
         }
     }
 
-    /// Drop every window that has already left the desktop.
+    /// Drop every window that holds no slot any more.
     ///
-    /// A create the client cancelled handed its window back from the
-    /// pending window's drop, which had no store to remove the entry
-    /// from; a compositor that died retired every window under it. Both
-    /// are off the desktop already, and neither is the compositor's to
-    /// be told about again.
+    /// A window the supervisor drained after the client cancelled its
+    /// create — which had no store to remove the entry from — or after
+    /// the resource dropped, and one retired with a compositor that
+    /// died, is off the desktop and finished with.
     fn prune(&mut self) {
-        self.held.retain(|shared| shared.is_alive());
+        self.held.retain(|shared| shared.holds_slot());
     }
 
-    /// Hand this client's windows to the compositor's supervisor, if
-    /// there are any to hand.
+    /// Hand this client's windows still on the desktop to the
+    /// compositor's supervisor, if there are any to hand.
+    ///
+    /// A window already handed back is not handed back again: the
+    /// supervisor has it, and its slot is the drain's to release.
     fn hand_back(&mut self) {
-        self.prune();
-        if self.held.is_empty() {
-            // No window of this instance's own is on the desktop. What
-            // the store may still hold is views of somebody else's
-            // windows, which its view table withdraws on its own.
-            return;
-        }
         let Some(service) = self.service.as_ref() else {
             return;
         };
         let ids = self
             .held
-            .drain(..)
+            .iter()
+            .filter(|shared| shared.is_alive())
             .map(|shared| shared.id())
             .collect::<ArrayVec<SurfaceId, MAX_INSTANCE_SURFACES>>();
+        if ids.is_empty() {
+            // No window of this instance's own is on the desktop. What
+            // the store may still hold is views of somebody else's
+            // windows, which its view table withdraws on its own.
+            return;
+        }
         service.return_surfaces(ReturnedSurfaces { ids });
     }
 }

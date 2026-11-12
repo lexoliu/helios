@@ -148,8 +148,9 @@ where
         let registry = self.runtime_state.surface_service();
         // The client's span is its ordinary memory again once the drop
         // returns. The window comes off the desktop here too, and goes
-        // to the compositor's supervisor on the unbounded return queue —
-        // the provider queue is bounded, and a destroy it had no room
+        // to the compositor's supervisor on the return queue, which the
+        // registry's count keeps from ever being full — the provider
+        // queue is bounded, and a destroy it had no room
         // for would leave the compositor's view, and the run behind it,
         // in place for good. The supervisor ends that view and tells the
         // compositor; the frame buffer stays pinned until then, because
