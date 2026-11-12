@@ -26,6 +26,15 @@ jobs:
   # by path. A skipped lane reports as skipped, which a required check
   # counts as passing; no ruleset on `dev` requires a lane of this
   # workflow. A dispatch and a push to `dev` run every lane.
+  #
+  # It also says whether the change touches what fixes the kernel
+  # profile's format (the profdata header check, the guest's raw writer)
+  # or the compiler that reads it. The profile every x86-64 lane spends is
+  # the newest one collected on dev, by the compiler dev pinned then; a
+  # pull request that moves any of these cannot read it, and dev cannot
+  # collect another until the pull request merges (#731). Only a pull
+  # request is asked: a push to dev is what `kernel-profile.yml` collects
+  # on, and a dispatch has no change to speak of.
   changes:
     name: changes
     runs-on: ubuntu-24.04
@@ -39,6 +48,9 @@ jobs:
       # JSON array of {name, command, rust-cache} for the legs of the
       # `checks` matrix.
       checks: ${{ steps.select.outputs.checks }}
+      # `true` when the change moves the kernel profile's format or the
+      # compiler that reads it; `kernel-profile` then collects this run's.
+      profile_format: ${{ steps.filter.outputs.profile_format || 'false' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -94,6 +106,10 @@ jobs:
               - 'api/**'
               - 'api-macro/**'
               - 'compiler-plugin/**'
+            profile_format:
+              - 'rust-toolchain.toml'
+              - 'profdata/**'
+              - 'kernel/src/profiling/**'
       - id: select
         env:
           CHANGED: ${{ steps.filter.outputs.changes || 'null' }}
@@ -113,6 +129,17 @@ jobs:
           echo "lanes=${lanes}" >> "$GITHUB_OUTPUT"
           echo "checks=${checks}" >> "$GITHUB_OUTPUT"
           echo "${lanes}"
+
+  # The collection a `profile_format` change spends in place of dev's
+  # profile: the same workflow `bench-suite.yml` calls, on this run's
+  # commit, uploaded under the stable artifact name.
+  kernel-profile:
+    name: kernel-profile
+    needs: changes
+    if: needs.changes.outputs.profile_format == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/kernel-profile.yml
 
   checks:
     name: ${{ matrix.name }}
@@ -638,8 +665,8 @@ jobs:
 
   smoke-x86-64:
     name: smoke-x86-64
-    needs: changes
-    if: contains(fromJSON(needs.changes.outputs.lanes), 'smoke-x86-64')
+    needs: [changes, kernel-profile]
+    if: ${{ !cancelled() && needs.changes.result == 'success' && contains(fromJSON(needs.changes.outputs.lanes), 'smoke-x86-64') && (needs.kernel-profile.result == 'success' || needs.kernel-profile.result == 'skipped') }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -706,10 +733,22 @@ jobs:
       # label, so the fetch comes before the build. Reading the artifact
       # is what the job's `actions: read` is for.
       - name: Fetch the kernel profile
+        if: needs.changes.outputs.profile_format != 'true'
         working-directory: helios
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: cargo run --release -p helios-cli -- profile-fetch
+      # A change to what fixes the profile's format or to the compiler
+      # that reads it leaves the default branch's profile unreadable to
+      # this tree, and nothing on that branch can replace it before the
+      # change merges (#731). The run collects its own, and the lane
+      # spends that one: the same fetch, naming the run.
+      - name: Fetch this run's kernel profile
+        if: needs.changes.outputs.profile_format == 'true'
+        working-directory: helios
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: cargo run --release -p helios-cli -- profile-fetch --run "${{ github.run_id }}"
       - name: Boot x86-64 guest
         shell: bash
         working-directory: helios

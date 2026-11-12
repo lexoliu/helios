@@ -10053,11 +10053,11 @@ mod tests {
         let seeded = u16::from_be_bytes([datagram[6], datagram[7]]);
         let device_sum = {
             let mut sum = u32::from(seeded);
-            let mut chunks = datagram.chunks_exact(2);
-            for chunk in chunks.by_ref() {
-                sum += u32::from(u16::from_be_bytes([chunk[0], chunk[1]]));
+            let (words, remainder) = datagram.as_chunks::<2>();
+            for &word in words {
+                sum += u32::from(u16::from_be_bytes(word));
             }
-            if let [last] = chunks.remainder() {
+            if let [last] = remainder {
                 sum += u32::from(*last) << 8;
             }
             // The seeded field itself was included once in the loop; the
