@@ -18,6 +18,7 @@ mod runtime;
 mod swap;
 #[cfg(test)]
 mod swap_tests;
+mod timer_tests;
 mod vmm;
 
 pub use device::{

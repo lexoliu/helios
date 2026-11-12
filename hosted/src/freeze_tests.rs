@@ -139,6 +139,7 @@ fn boot() -> TestMachine {
                 // dropped and a task may borrow it for good.
                 let kernel: &'static Kernel<HostedCpu> =
                     Box::leak(Box::new(helios_kernel::init(platform)));
+                cpu.install_timer(kernel.timer());
                 if processor == machine.bootstrap_processor() {
                     for other in (0..machine.processor_count())
                         .map(|other| ProcessorId::new(u16::try_from(other).unwrap()))

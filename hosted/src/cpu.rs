@@ -5,6 +5,8 @@ use std::thread;
 use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase, TimerInterrupt};
 use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
 
+use helios_kernel::Timer;
+
 use crate::runtime::HostedMachine;
 
 /// Hosted CPU adapter that exposes one OS thread as one logical processor.
@@ -21,6 +23,13 @@ impl HostedCpu {
     pub fn new(processor: ProcessorId, machine: Arc<HostedMachine>) -> Self {
         set_current_processor(processor);
         Self { processor, machine }
+    }
+
+    /// Publishes this processor's kernel timer, built from the kernel its
+    /// `helios_kernel::init` returned, so the timer interrupt can advance
+    /// it. Once per processor, before it parks.
+    pub fn install_timer(&self, timer: Timer<HostedCpu>) {
+        self.machine.install_timer(self.processor, timer);
     }
 }
 
@@ -64,7 +73,13 @@ impl Cpu for HostedCpu {
     }
 
     fn park_current(&self) {
+        // The timer thread's expiry is this processor's timer interrupt:
+        // it sets the pending flag, then unparks. An expiry before this
+        // park leaves the unpark token, so the park returns at once and
+        // the flag is found below; one during it ends it the same way.
+        // Either way the interrupt step runs here, on the owner.
         thread::park();
+        self.machine.take_timer_interrupt(self.processor);
     }
 
     fn park_wake_only(&self, word: &AtomicU8, held: u8) {
