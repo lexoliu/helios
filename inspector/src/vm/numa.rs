@@ -121,8 +121,8 @@ impl NumaMachine {
         }))
     }
 
-    /// The `-smp` value: one socket per node, so `-numa cpu,socket-id`
-    /// can place a whole node's processors, and no SMT.
+    /// The `-smp` value: one socket per node, so a node's processors are
+    /// one contiguous run of indexes, and no SMT.
     pub(crate) fn smp(&self) -> String {
         let total = u32::from(self.nodes) * u32::from(self.cpus_per_node);
         format!(
@@ -144,13 +144,10 @@ impl NumaMachine {
         }
         for node in 0..self.nodes {
             let mut options = QemuOptions::new("node");
-            options.set("nodeid", node).set("memdev", backend_id(node));
-            arguments.push("-numa".to_owned());
-            arguments.push(options.to_string());
-        }
-        for node in 0..self.nodes {
-            let mut options = QemuOptions::new("cpu");
-            options.set("node-id", node).set("socket-id", node);
+            options
+                .set("nodeid", node)
+                .set("memdev", backend_id(node))
+                .set("cpus", self.processors(node));
             arguments.push("-numa".to_owned());
             arguments.push(options.to_string());
         }
@@ -168,6 +165,36 @@ impl NumaMachine {
             }
         }
         arguments
+    }
+
+    /// The processor indexes of `node`, as `-numa node,cpus=` takes them.
+    ///
+    /// Processors are placed by index because that is the one form every
+    /// machine accepts: `-numa cpu` names a topology property, and which
+    /// one exists differs by machine (`socket-id` on `pc` and the Arm
+    /// `virt`, only `core-id` on the RISC-V `virt`).
+    fn processors(&self, node: u16) -> ProcessorRange {
+        let first = u32::from(node) * u32::from(self.cpus_per_node);
+        ProcessorRange {
+            first,
+            last: first + u32::from(self.cpus_per_node) - 1,
+        }
+    }
+}
+
+/// An inclusive run of processor indexes, a single index when it holds one.
+struct ProcessorRange {
+    first: u32,
+    last: u32,
+}
+
+impl fmt::Display for ProcessorRange {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.first == self.last {
+            write!(formatter, "{}", self.first)
+        } else {
+            write!(formatter, "{}-{}", self.first, self.last)
+        }
     }
 }
 
@@ -227,13 +254,9 @@ mod tests {
                 "-object",
                 "memory-backend-ram,id=helios-node1,size=1G",
                 "-numa",
-                "node,nodeid=0,memdev=helios-node0",
+                "node,nodeid=0,memdev=helios-node0,cpus=0-1",
                 "-numa",
-                "node,nodeid=1,memdev=helios-node1",
-                "-numa",
-                "cpu,node-id=0,socket-id=0",
-                "-numa",
-                "cpu,node-id=1,socket-id=1",
+                "node,nodeid=1,memdev=helios-node1,cpus=2-3",
                 "-numa",
                 "dist,src=0,dst=1,val=20",
                 "-numa",
