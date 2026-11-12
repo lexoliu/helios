@@ -5074,7 +5074,7 @@ mod tests {
     fn window_update_at_snd_una_retires_probe_and_keeps_stream_intact() {
         let mut socket = established_socket();
         let _ = deliver_segment(&mut socket, peer_ack(8, 0), TCP_INITIAL_RTO_NANOS + 1);
-        assert_eq!(socket.queue_send(b"abc"), 3);
+        assert_eq!(socket.queue_send_bytes(&mut Bytes::from_static(b"abc")), 3);
         let deadline = TCP_INITIAL_RTO_NANOS + 2 + socket.retransmission_timer.timeout_nanos();
         assert_eq!(
             socket.take_transmit_segment(
@@ -5099,7 +5099,7 @@ mod tests {
             .expect("opened window should transmit queued data normally");
         assert_eq!(first.header.sequence, 8);
         delivered.extend_from_slice(&first.payload);
-        assert_eq!(socket.queue_send(b"def"), 3);
+        assert_eq!(socket.queue_send_bytes(&mut Bytes::from_static(b"def")), 3);
         let second = socket
             // Past the pacing interval the first segment scheduled.
             .take_transmit_segment(
@@ -5130,7 +5130,7 @@ mod tests {
         let _ = deliver_segment(&mut socket, peer_ack(8, 0), TCP_INITIAL_RTO_NANOS + 1);
         socket.send_unacknowledged = u32::MAX;
         socket.send_next = u32::MAX;
-        assert_eq!(socket.queue_send(b"abc"), 3);
+        assert_eq!(socket.queue_send_bytes(&mut Bytes::from_static(b"abc")), 3);
         let deadline = TCP_INITIAL_RTO_NANOS + 2 + socket.retransmission_timer.timeout_nanos();
         assert_eq!(
             socket.take_transmit_segment(
