@@ -242,10 +242,12 @@ fn x86_kernel_main() -> ! {
         .install_capture(smp::instruction_sample_capture(handoff.kernel.virtual_base));
     let boot = smp::build_boot_context(
         rsdp_address,
-        physical_memory_offset,
+        smp::PhysicalOffsetAcpiHandler {
+            physical_memory_offset,
+            tsc_base,
+            timebase,
+        },
         wakeup_page,
-        tsc_base,
-        timebase,
         debug_state.clone(),
         xcr0,
         pool,

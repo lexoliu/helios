@@ -331,27 +331,20 @@ pub(crate) struct PhysicalOffsetAcpiHandler {
 
 pub(crate) fn build_boot_context(
     rsdp_address: usize,
-    physical_memory_offset: usize,
+    handler: PhysicalOffsetAcpiHandler,
     wakeup_page: Option<Range<usize>>,
-    tsc_base: u64,
-    timebase: Timebase,
     debug_state: debug_state::RuntimeState,
     xcr0: Xcr0,
     pool: &UserMemoryPool,
 ) -> &'static BootContext {
-    let tsc_hz = timebase.frequency();
-    let handler = PhysicalOffsetAcpiHandler {
-        physical_memory_offset,
-        tsc_base,
-        timebase,
-    };
+    let tsc_hz = handler.timebase.frequency();
     let tables = unsafe { AcpiTables::from_rsdp(handler.clone(), rsdp_address) }
         .unwrap_or_else(|error| panic!("failed to parse ACPI tables: {error:?}"));
-    let watchdog = crate::watchdog::discover(&tables, physical_memory_offset);
+    let watchdog = crate::watchdog::discover(&tables, handler.physical_memory_offset);
     // Probed before the MADT is consumed: the I/O APIC's destination
     // encoding depends on which local-APIC mode the machine runs.
     let apic_mode = LocalApicMode::probe();
-    let io_apic = crate::ioapic::discover(&tables, physical_memory_offset, apic_mode);
+    let io_apic = crate::ioapic::discover(&tables, handler.physical_memory_offset, apic_mode);
     let platform = AcpiPlatform::new(tables, handler.clone())
         .unwrap_or_else(|error| panic!("failed to construct ACPI platform info: {error:?}"));
     let processor_info = platform
@@ -375,10 +368,8 @@ pub(crate) fn build_boot_context(
         let (apic_id, stack_top) = match usize::from(processor.id()).checked_sub(1) {
             None => (processor_info.boot_processor.local_apic_id, 0),
             Some(application) => {
-                let application_processor = application_processors
-                    .iter()
-                    .nth(application)
-                    .unwrap_or_else(|| {
+                let application_processor =
+                    application_processors.get(application).unwrap_or_else(|| {
                         panic!("the MADT names no application processor {application}")
                     });
                 assert!(
@@ -397,7 +388,7 @@ pub(crate) fn build_boot_context(
             apic_id,
             runtime: ProcessorRuntime {
                 anchor: ProcessorAnchor::new(processor.id()),
-                physical_memory_offset,
+                physical_memory_offset: handler.physical_memory_offset,
                 tsc_hz,
                 apic_mode,
                 wasmtime_tls: WasmtimeTlsSlots::new(),
@@ -433,7 +424,7 @@ pub(crate) fn build_boot_context(
             physical_start: wakeup_page.start,
             virtual_start: wakeup_page
                 .start
-                .checked_add(physical_memory_offset)
+                .checked_add(handler.physical_memory_offset)
                 .unwrap_or_else(|| panic!("x86 wakeup page virtual address overflow")),
         })
     } else {
@@ -441,9 +432,9 @@ pub(crate) fn build_boot_context(
     };
     publish_anchor_identities(&processors);
     let platform = Arc::new(X86PlatformState {
-        tsc_base,
-        timebase,
-        physical_memory_offset,
+        tsc_base: handler.tsc_base,
+        timebase: handler.timebase,
+        physical_memory_offset: handler.physical_memory_offset,
         debug_state,
         watchdog,
         io_apic,
