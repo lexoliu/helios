@@ -1,0 +1,82 @@
+name: Affected lanes
+
+# Which of `ci.yml`'s lanes a diff reaches. `lexoliu/affected-crates`
+# compares the package graphs of the base and the head and reports the
+# workspace packages the diff affects (the packages owning a changed file and
+# every package depending on one) through `.github/affected-rules.toml`,
+# which maps the paths outside every package: prose selects nothing, the
+# toolchain and the CI machinery select everything, and a path no rule names
+# selects everything too. `.github/scripts/ci_lanes.py` then reads
+# `.github/ci-lanes.toml`, where each lane's trigger set is defined.
+#
+# The diff runs from the merge-base of `base` and HEAD. A pull request
+# passes its base branch as fetched here (`origin/<base>`): the checkout is
+# the merge of the head into that branch's current tip, and the event's own
+# base sha can sit commits behind it. A `dev` push passes the commit before
+# the push. An empty base is no diff, and every lane runs.
+
+on:
+  workflow_call:
+    inputs:
+      base:
+        description: >-
+          Revision the diff is measured from, through its merge-base with
+          HEAD. Empty selects every lane.
+        type: string
+        required: false
+        default: ""
+    outputs:
+      lanes:
+        description: JSON object naming every lane of the table, `true` when it runs.
+        value: ${{ jobs.affected.outputs.lanes }}
+      matrix:
+        description: JSON list of the selected lanes the `lanes` matrix job runs.
+        value: ${{ jobs.affected.outputs.matrix }}
+      prebuild:
+        description: >-
+          JSON list of `{target, save-cache}`, one per kernel-prebuild
+          target the selected lanes read.
+        value: ${{ jobs.affected.outputs.prebuild }}
+
+permissions:
+  contents: read
+
+jobs:
+  affected:
+    name: Affected lanes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      lanes: ${{ steps.select.outputs.lanes }}
+      matrix: ${{ steps.select.outputs.matrix }}
+      prebuild: ${{ steps.select.outputs.prebuild }}
+    steps:
+      # The tool runs at the workspace root and checks the base revision out
+      # beside it, and both need the history, so the checkout is complete
+      # and sits at the root rather than under `helios/`.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # `cargo metadata` resolves the workspace's `../wasmtime` path
+      # dependency, so the pinned tree goes beside the checkout, where a
+      # base revision checked out next to it resolves the same path.
+      - uses: ./.github/actions/checkout-wasmtime
+        with:
+          path: wasmtime-pin
+      - name: Put the pinned Wasmtime tree beside the checkout
+        run: mv "$GITHUB_WORKSPACE/wasmtime-pin" "$GITHUB_WORKSPACE/../wasmtime"
+      - name: Select the affected packages
+        id: report
+        uses: lexoliu/affected-crates@v0.0.1
+        with:
+          base: ${{ inputs.base }}
+          rules: .github/affected-rules.toml
+          locked: "true"
+      - uses: astral-sh/setup-uv@v6
+      - name: Test the lane selection
+        run: uv run --with pytest pytest -q .github/scripts
+      - name: Select the lanes
+        id: select
+        env:
+          AFFECTED_REPORT: ${{ steps.report.outputs.report }}
+        run: uv run .github/scripts/ci_lanes.py --lanes .github/ci-lanes.toml

@@ -1,0 +1,58 @@
+name: Stage the WASI tooling artifacts
+description: >-
+  Restores the `artifacts/` trees `tools/wasi-apps/build.sh` stages (the
+  CPython root, the Rust WASI tools, the WASIX artifacts) from the Actions
+  cache, and on a miss installs what the script needs and runs it. Every job
+  that boots a guest or packs a full boot payload reads them; the cache key
+  lives here so every workflow restores the same entry.
+
+  The key hashes what the staged files are made from and nothing else. The
+  script and the crates it builds live under `tools/wasi-apps/`, each crate
+  with its own lockfile; `curl` and `tcp-throughput` build `helios-api` (and
+  through it `helios-api-macro` and `wit/`) by path, which inherits
+  `wit-bindgen` from the root manifest's `[workspace.dependencies]`; the
+  toolchain file pins the compiler they are built with. The workspace
+  lockfile reaches the artifacts only through `helios-branch-hints`, which
+  the script builds and runs only when a branch profile is recorded under
+  `tools/wasi-apps/branch-profiles/`, so it enters the key only then.
+inputs:
+  checkout-path:
+    description: Directory the Helios checkout is in, relative to the workspace.
+    required: false
+    default: helios
+runs:
+  using: composite
+  steps:
+    - name: Restore WASI tooling artifacts
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: |
+          ${{ inputs.checkout-path }}/artifacts/wasi-tools
+          ${{ inputs.checkout-path }}/artifacts/python3-root
+          ${{ inputs.checkout-path }}/artifacts/wasix
+        key: wasi-artifacts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles(format('{0}/tools/wasi-apps/**', inputs.checkout-path), format('{0}/api/**', inputs.checkout-path), format('{0}/api-macro/**', inputs.checkout-path), format('{0}/wit/**', inputs.checkout-path), format('{0}/Cargo.toml', inputs.checkout-path), format('{0}/rust-toolchain.toml', inputs.checkout-path), format('{0}/tools/branch-hints/**', inputs.checkout-path), format('{0}/.github/actions/wasi-artifacts/action.yml', inputs.checkout-path)) }}-${{ hashFiles(format('{0}/tools/wasi-apps/branch-profiles/**', inputs.checkout-path)) != '' && hashFiles(format('{0}/Cargo.lock', inputs.checkout-path)) || 'no-branch-profiles' }}
+    # QuickJS is built with zig's clang through CMake and Ninja; wasm-tools
+    # converts, validates and strips every staged module.
+    - name: Install the staging tools
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends cmake ninja-build
+    - if: steps.cache.outputs.cache-hit != 'true'
+      uses: taiki-e/install-action@v2
+      with:
+        tool: wasm-tools
+    # Zig's own compilation cache is not kept: the QuickJS module it builds
+    # is what the entry above caches.
+    - if: steps.cache.outputs.cache-hit != 'true'
+      uses: mlugg/setup-zig@v2
+      with:
+        version: 0.13.0
+        use-cache: false
+    - name: Stage WASI tooling artifacts
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      working-directory: ${{ inputs.checkout-path }}
+      run: tools/wasi-apps/build.sh

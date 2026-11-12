@@ -1,0 +1,67 @@
+# Determinator rules for `affected.yml`, read by `lexoliu/affected-crates`.
+#
+# A changed file under a package's directory already belongs to that package
+# (the determinator's ancestor matching), and the report adds every package
+# that depends on it. These rules only map what lies outside every package,
+# plus the repository-level configuration the determinator's shipped
+# defaults get wrong for this workspace. Custom rules are applied before the
+# defaults, which already send the root `Cargo.toml` to every package and
+# leave `Cargo.lock` to the package-graph comparison.
+#
+# A path no rule names that resolves only to the root `helios` package by
+# directory, without being one of its sources (`src/main.rs` and the files
+# beside it), is reported as unmatched, and an unmatched path selects every
+# lane. That fallback covers the scripts, staging and bench tooling under
+# `tools/` outside its packages and the WASIX artifacts committed under
+# `artifacts/`: the lanes run them or pack them into the boot payload, so a
+# change there selects everything. A glob's `*` crosses `/` here, so a rule
+# for "the files directly in `tools/`" would also swallow the packages
+# under it; the fallback draws that line exactly.
+
+# The toolchain, cargo's configuration and the lint, format, dependency and
+# test-runner configuration apply to every crate a lane builds. The defaults
+# mark `clippy.toml` and `rustfmt.toml` as changing nothing.
+[[path-rule]]
+globs = [
+    "rust-toolchain.toml",
+    ".cargo/**",
+    "clippy.toml",
+    "rustfmt.toml",
+    ".rustfmt.toml",
+    "deny.toml",
+    ".config/**",
+]
+mark-changed = "all"
+
+# The recipes every lane runs, the CI machinery that runs them (workflows,
+# composite actions, the scripts they call, the lane table), and this file.
+# A change here can rewrite what any run does.
+[[path-rule]]
+globs = ["Justfile", ".github/**"]
+mark-changed = "all"
+
+# The WIT worlds live outside every package and are read at compile time by
+# the three crates whose bindgen and `include_str!` name `../wit`:
+# `kernel/src/wasmtime_adapter/` (the host bindings and the WASI P3 package
+# sources), `api/src/bindings.rs` (the guest SDK every program builds on) and
+# `inspector-protocol/src/system/bindings.rs`. Every other reader reaches
+# them through one of these, so the report's reverse dependencies cover it.
+[[path-rule]]
+globs = ["wit/**"]
+mark-changed = ["helios-kernel", "helios-api", "helios-inspector-protocol"]
+
+# The riscv64 target's linker scripts, named by `.cargo/config.toml`'s
+# `[target.riscv64gc-unknown-none-elf]` rustflags. They are read when the
+# riscv64 kernel image links, and that image is the riscv64 backend's.
+[[path-rule]]
+globs = ["link.x", "memory.x"]
+mark-changed = ["helios-riscv"]
+
+# Prose outside every package selects nothing: the docs tree and top-level
+# markdown, `AGENTS.md` (the contributor contract) and its `CLAUDE.md`
+# symlink included. A markdown file inside a package still selects that
+# package (the tool keeps the owner of a file a mark-nothing rule matched),
+# because `include_str!` and `#![doc]` may compile it into the crate.
+[[path-rule]]
+globs = ["docs/**", "*.md", "LICENSE*"]
+mark-changed = []

@@ -5,27 +5,73 @@ repo_root := justfile_directory()
 # Default profile directory used by `kernel-prebuild --profile`.
 default_profile := "debug"
 
-# Generate the kernel-prebuild manifest for `target` and run `cargo check` against it.
-# helios-kernel is checked with the feature set the bare-metal backends select,
-# not its host defaults: `wasmtime-host` on a `target_os = "none"` target is a
-# configuration no backend ever builds, and wasmtime's pooling allocator needs
-# the custom-virtual-memory ABI that only `wasmtime-bare-metal` turns on.
-# Usage: just check-target riscv64gc-unknown-none-elf helios-riscv
-check-target target package:
+# Where `kernel-prebuild` writes each target's outputs.
+prebuild_root := repo_root / "target" / "kernel-prebuild"
+
+# This justfile, for a recipe that calls another and reads what it prints.
+just := quote(just_executable()) + " --justfile " + quote(justfile())
+
+# Run `helios-cli kernel-prebuild` for `target` and stamp its directory with
+# the tree it was built from (`_prebuild-source`), so the directory can be
+# handed to a recipe on another machine through `HELIOS_PREBUILT`. CI's
+# prebuild job runs this once per target for every lane of the run.
+# Usage: just prebuild x86_64-unknown-none
+prebuild target:
     #!/usr/bin/env bash
     set -euo pipefail
-    out_dir="{{repo_root}}/target/kernel-prebuild/{{target}}/{{default_profile}}"
+    out_dir="{{prebuild_root}}/{{target}}/{{default_profile}}"
     cargo run -p helios-cli --quiet -- kernel-prebuild \
         --out-dir "${out_dir}" \
         --target "{{target}}" \
         --profile "{{default_profile}}" \
         --cargo cargo
-    export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
-    export HELIOS_KERNEL_ROOT_SECRET_KEY="${out_dir}/helios-root-secret.key"
-    cargo check -p helios-kernel \
-        --no-default-features --features wasmtime-bare-metal,embedded-debugger \
-        --target "{{target}}"
-    cargo check -p "{{package}}" --target "{{target}}"
+    {{just}} _prebuild-source "{{target}}" > "${out_dir}/prebuild-source"
+
+# The stamp a prebuild of `target` from this tree carries: the commit,
+# marked dirty when a tracked file differs from it, and the target.
+_prebuild-source target:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    commit="$(git -C "{{repo_root}}" rev-parse HEAD)"
+    if [[ -n "$(git -C "{{repo_root}}" status --porcelain --untracked-files=no)" ]]; then
+        commit="${commit}-dirty"
+    fi
+    printf '%s %s\n' "${commit}" "{{target}}"
+
+# Print the directory holding the kernel-prebuild outputs for `target`
+# (`host` names the toolchain's host). Without `HELIOS_PREBUILT` the prebuild
+# runs here first. With it, the outputs are the ones under
+# `$HELIOS_PREBUILT/<target>` that another machine built, and they are
+# refused unless their stamp names this tree's commit and this target and
+# this tree has no change to a tracked file: the kernel embeds the root keys
+# and the hosted tests boot the payload, so outputs from any other tree
+# would be tested in its place.
+_prebuilt target:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    target="{{target}}"
+    if [[ "${target}" == host ]]; then
+        target="$(rustc -vV | sed -n 's/^host: //p')"
+        if [[ -z "${target}" ]]; then
+            echo "failed to detect rust host target" >&2
+            exit 1
+        fi
+    fi
+    if [[ -z "${HELIOS_PREBUILT:-}" ]]; then
+        {{just}} prebuild "${target}" >&2
+        printf '%s\n' "{{prebuild_root}}/${target}/{{default_profile}}"
+        exit 0
+    fi
+    dir="${HELIOS_PREBUILT}/${target}"
+    expected="$({{just}} _prebuild-source "${target}")"
+    found="$(cat "${dir}/prebuild-source")"
+    if [[ "${expected}" == *-dirty* || "${found}" != "${expected}" ]]; then
+        echo "HELIOS_PREBUILT: ${dir} was built from \"${found}\" and this tree is \"${expected}\"" >&2
+        git -C "{{repo_root}}" status --short --untracked-files=no >&2
+        echo "unset HELIOS_PREBUILT to build the outputs from this tree" >&2
+        exit 1
+    fi
+    printf '%s\n' "${dir}"
 
 # Every clippy and rustfmt gate CI enforces.
 lint:
@@ -59,13 +105,7 @@ clippy-host:
     # in its `std` backend, which is a hard conflict. Those backends are
     # covered by `clippy-target` and the guest programs by
     # `clippy-programs`.
-    target="$(rustc -vV | sed -n 's/^host: //p')"
-    out_dir="{{repo_root}}/target/kernel-prebuild/${target}/{{default_profile}}"
-    cargo run -p helios-cli --quiet -- kernel-prebuild \
-        --out-dir "${out_dir}" \
-        --target "${target}" \
-        --profile "{{default_profile}}" \
-        --cargo cargo
+    out_dir="$({{just}} _prebuilt host)"
     export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
     export HELIOS_KERNEL_ROOT_SECRET_KEY="${out_dir}/helios-root-secret.key"
     # `helios-venus` generates its protocol module from the pinned
@@ -102,13 +142,7 @@ clippy-programs:
 test-units:
     #!/usr/bin/env bash
     set -euo pipefail
-    target="$(rustc -vV | sed -n 's/^host: //p')"
-    out_dir="{{repo_root}}/target/kernel-prebuild/${target}/{{default_profile}}"
-    cargo run -p helios-cli --quiet -- kernel-prebuild \
-        --out-dir "${out_dir}" \
-        --target "${target}" \
-        --profile "{{default_profile}}" \
-        --cargo cargo
+    out_dir="$({{just}} _prebuilt host)"
     export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
     export HELIOS_KERNEL_ROOT_SECRET_KEY="${out_dir}/helios-root-secret.key"
     cargo nextest run -p helios-hal -p helios-virtio -p helios-netstack -p helios-kernel --lib
@@ -134,23 +168,22 @@ test-units:
     HELIOS_BOOTFS="${out_dir}/helios-bootfs" cargo nextest run -p helios-hosted
     python3 "{{repo_root}}/x86/tests/interrupt_state.py"
 
-# Generate the kernel-prebuild manifest for `target` and run `cargo clippy`
-# against it, denying warnings.
+# Run `cargo clippy` for a bare-metal `target` and its backend `package`
+# against the kernel-prebuild outputs, denying warnings. It compiles exactly
+# what a `cargo check` of the same two invocations would, so it is also the
+# target's compile check.
 # Usage: just clippy-target riscv64gc-unknown-none-elf helios-riscv
 clippy-target target package:
     #!/usr/bin/env bash
     set -euo pipefail
-    out_dir="{{repo_root}}/target/kernel-prebuild/{{target}}/{{default_profile}}"
-    cargo run -p helios-cli --quiet -- kernel-prebuild \
-        --out-dir "${out_dir}" \
-        --target "{{target}}" \
-        --profile "{{default_profile}}" \
-        --cargo cargo
+    out_dir="$({{just}} _prebuilt "{{target}}")"
     export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
     export HELIOS_KERNEL_ROOT_SECRET_KEY="${out_dir}/helios-root-secret.key"
-    # Two invocations, for the same reason `check-target` uses explicit
-    # features: cargo would otherwise unify helios-kernel's host defaults with
-    # the backend's `wasmtime-bare-metal` selection.
+    # Two invocations, with helios-kernel on the feature set the bare-metal
+    # backends select rather than its host defaults: one invocation would
+    # unify the two, `wasmtime-host` on a `target_os = "none"` target is a
+    # configuration no backend ever builds, and wasmtime's pooling allocator
+    # needs the custom-virtual-memory ABI only `wasmtime-bare-metal` turns on.
     cargo clippy \
         -p helios-kernel --no-default-features \
         --features wasmtime-bare-metal,embedded-debugger \
@@ -187,26 +220,19 @@ kernel-pgo-use arch profile:
 # Equivalent of AGENTS §7 required checks. Run before declaring a change complete.
 check-all:
     just check-host
-    just check-target aarch64-unknown-none helios-aarch64
-    just check-target riscv64gc-unknown-none-elf helios-riscv
-    just check-target x86_64-unknown-none helios-x86
+    just clippy-target aarch64-unknown-none helios-aarch64
+    just clippy-target riscv64gc-unknown-none-elf helios-riscv
+    just clippy-target x86_64-unknown-none helios-x86
     just test-embedded-debugger
 
+# Each package is checked on its own, so with its own feature resolution,
+# which the workspace-wide `clippy-host` unifies away.
+#
 # Quick host-only check.
 check-host:
     #!/usr/bin/env bash
     set -euo pipefail
-    target="$(rustc -vV | sed -n 's/^host: //p')"
-    if [[ -z "${target}" ]]; then
-        echo "failed to detect rust host target" >&2
-        exit 1
-    fi
-    out_dir="{{repo_root}}/target/kernel-prebuild/${target}/{{default_profile}}"
-    cargo run -p helios-cli --quiet -- kernel-prebuild \
-        --out-dir "${out_dir}" \
-        --target "${target}" \
-        --profile "{{default_profile}}" \
-        --cargo cargo
+    out_dir="$({{just}} _prebuilt host)"
     export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
     export HELIOS_KERNEL_ROOT_SECRET_KEY="${out_dir}/helios-root-secret.key"
     cargo check -p helios-kernel
@@ -218,17 +244,7 @@ check-host:
 test-embedded-debugger:
     #!/usr/bin/env bash
     set -euo pipefail
-    target="$(rustc -vV | sed -n 's/^host: //p')"
-    if [[ -z "${target}" ]]; then
-        echo "failed to detect rust host target" >&2
-        exit 1
-    fi
-    out_dir="{{repo_root}}/target/kernel-prebuild/${target}/{{default_profile}}"
-    cargo run -p helios-cli --quiet -- kernel-prebuild \
-        --out-dir "${out_dir}" \
-        --target "${target}" \
-        --profile "{{default_profile}}" \
-        --cargo cargo
+    out_dir="$({{just}} _prebuilt host)"
     export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
     export HELIOS_KERNEL_ROOT_SECRET_KEY="${out_dir}/helios-root-secret.key"
     export HELIOS_BOOTFS="${out_dir}/helios-bootfs"

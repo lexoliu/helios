@@ -79,13 +79,13 @@ root:
 just check-host
 
 # AArch64 bare-metal backend
-just check-target aarch64-unknown-none helios-aarch64
+just clippy-target aarch64-unknown-none helios-aarch64
 
 # RISC-V 64 bare-metal backend
-just check-target riscv64gc-unknown-none-elf helios-riscv
+just clippy-target riscv64gc-unknown-none-elf helios-riscv
 
 # x86_64 bare-metal backend
-just check-target x86_64-unknown-none helios-x86
+just clippy-target x86_64-unknown-none helios-x86
 
 # Full local verification sweep
 just check-all

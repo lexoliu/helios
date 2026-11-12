@@ -1,0 +1,55 @@
+name: PR cache cleanup
+
+# A pull request's caches live on `refs/pull/<N>/merge`, and only that pull
+# request can restore them, yet they count against the repository's 10 GB
+# Actions cache quota until GitHub's 7-day expiry or its LRU eviction reaches
+# them, and eviction takes `dev`'s entries, the ones every pull request
+# restores, as readily as stale ones. Build caches are written on `dev`
+# pushes alone; what a pull request still saves (a WASI-artifact or QEMU
+# entry its own change keyed anew) is deleted the moment it closes, merged or
+# not.
+#
+# `pull_request_target`, so a pull request from a fork gets a token that may
+# delete caches. This workflow never checks out or runs the pull request's
+# code: it reads the event payload and calls the cache API.
+on:
+  pull_request_target:
+    types: [closed]
+
+permissions:
+  actions: write
+
+jobs:
+  cleanup:
+    name: Delete pull request caches
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Delete caches on the pull request's refs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          set -euo pipefail
+          refs=("refs/pull/${PR_NUMBER}/merge" "refs/pull/${PR_NUMBER}/head")
+          # A same-repository head branch may hold caches from its own push
+          # runs. The integration branches are never touched.
+          if [ "${HEAD_REPO}" = "${GH_REPO}" ] && [ "${HEAD_REF}" != dev ] && [ "${HEAD_REF}" != main ]; then
+            refs+=("refs/heads/${HEAD_REF}")
+          fi
+          deleted=0
+          for ref in "${refs[@]}"; do
+            ids="$(gh cache list --ref "${ref}" --limit 1000 --json id --jq '.[].id')"
+            for id in ${ids}; do
+              # Another run may have deleted it in the meantime.
+              if gh cache delete "${id}"; then
+                deleted=$((deleted + 1))
+              else
+                echo "::warning::could not delete cache ${id} on ${ref}"
+              fi
+            done
+          done
+          echo "deleted ${deleted} cache entries for #${PR_NUMBER}"

@@ -1,0 +1,194 @@
+# Every lane of `ci.yml`, what it builds, and so which changes it runs for.
+#
+# `affected.yml` asks `lexoliu/affected-crates` (with `affected-rules.toml`)
+# which workspace packages a diff affects: the packages owning a changed file
+# plus every package that depends on one, or `workspace` when the diff can
+# reach anywhere. `.github/scripts/ci_lanes.py` then selects each lane from
+# this table, and a lane that is not selected starts no runner.
+#
+# A lane runs when the report is `workspace`, or when an affected package is
+# in the lane's trigger set:
+#
+# - `packages`: the packages the lane's commands name (`-p`, the program
+#   list `kernel-prebuild` walks), not their dependencies, because a changed
+#   dependency already reaches the report through every package above it.
+#   `"any"` is every package, and an `@name` entry expands `[groups]`.
+# - `all-except`: every workspace member but these, for a lane that builds
+#   `--workspace --exclude`.
+# - `direct`: packages that select the lane only when a changed file is
+#   theirs. The root `helios` package depends on every backend and on
+#   `helios-hosted`, so the report names it for any change below them, and
+#   listing it under `packages` would run every architecture's lane for one
+#   architecture's change.
+#
+# A lane with a `command` runs in the `lanes` matrix job, on `ubuntu-24.04`,
+# with these settings:
+#
+# - `prebuild`: the target whose `helios-cli kernel-prebuild` outputs the
+#   lane reads. The `prebuild` job builds them once per target and the lane
+#   downloads them as `HELIOS_PREBUILT` (Justfile, `_prebuilt`).
+# - `cache`: the `Swatinem/rust-cache` shared key. Lanes share a key only
+#   when they compile the same units; `save-cache = false` makes a lane that
+#   compiles a subset of another's restore that lane's entry without
+#   writing it. Entries are written on `dev` pushes alone.
+# - `apt`, `tools`, `uv`: the Ubuntu packages (beside `just`), the
+#   `taiki-e/install-action` tools and the `uv` install the command needs.
+#
+# A lane without a `command` is a job of its own in `ci.yml`, named as here.
+
+# The kernel-prebuild jobs (`ci.yml`, `prebuild`). Each target's job
+# compiles the same host tool, but `kernel-prebuild` compiles the guest
+# programs into a directory under that target's out dir
+# (`target/kernel-prebuild/<target>/debug/*-target`), so their entries
+# differ and only one job writes the shared key: the host target's, which
+# most lanes read.
+[prebuild]
+cache = "prebuild"
+cache-writer = "x86_64-unknown-linux-gnu"
+
+[groups]
+# What `helios-cli kernel-prebuild` packs into the default `helios-bootfs`
+# (cli/src/main.rs, `run_kernel_prebuild`): the tool itself, `init`, the
+# compiler plugin and every program under `programs/`. The WASI artifacts
+# it packs as well come from `tools/wasi-apps/`, which selects every lane,
+# and `helios-branch-hints` rewrites them when a branch profile is recorded.
+bootfs = [
+    "helios-cli",
+    "helios-branch-hints",
+    "helios-init",
+    "helios-compiler-plugin",
+    "helios-audio-test",
+    "helios-compositor",
+    "helios-date",
+    "helios-debugger",
+    "helios-display-test",
+    "helios-gpu-test",
+    "helios-http-client",
+    "helios-input-test",
+    "helios-oob-load",
+    "helios-perf",
+    "helios-ping",
+    "helios-procbench",
+    "helios-sched-tasks",
+]
+
+# rustfmt over every workspace package and the `deny.toml` bans over the
+# whole lockfile: any package change can fail either.
+[[lane]]
+name = "lint-fmt"
+command = "just fmt-check && just deny-check"
+packages = "any"
+tools = ["cargo-deny"]
+
+# Each package on its own, so its own feature resolution: the workspace-wide
+# clippy below unifies features across every member and never compiles,
+# among others, `helios-api` with only `display,input` or Wasmtime with only
+# what `helios-hosted` asks for.
+[[lane]]
+name = "check-host"
+command = "just check-host"
+packages = [
+    "helios-kernel",
+    "helios-hosted",
+    "helios-inspector",
+    "helios-compositor-render",
+    "helios-desktop-text-check",
+]
+prebuild = "x86_64-unknown-linux-gnu"
+apt = ["libudev-dev"]
+cache = "check-host"
+
+# `clippy-host` is `--workspace` without these four, and `clippy-programs`
+# lints the programs that one leaves out.
+[[lane]]
+name = "lint-host"
+command = "just clippy-host && just clippy-programs"
+all-except = ["helios", "helios-aarch64", "helios-riscv", "helios-x86"]
+prebuild = "x86_64-unknown-linux-gnu"
+apt = ["libudev-dev"]
+cache = "lint-host"
+
+[[lane]]
+name = "lint-aarch64"
+command = "just clippy-target aarch64-unknown-none helios-aarch64"
+packages = ["helios-kernel", "helios-aarch64"]
+prebuild = "aarch64-unknown-none"
+cache = "lint-aarch64"
+
+[[lane]]
+name = "lint-riscv"
+command = "just clippy-target riscv64gc-unknown-none-elf helios-riscv"
+packages = ["helios-kernel", "helios-riscv"]
+prebuild = "riscv64gc-unknown-none-elf"
+cache = "lint-riscv"
+
+[[lane]]
+name = "lint-x86"
+command = "just clippy-target x86_64-unknown-none helios-x86"
+packages = ["helios-kernel", "helios-x86"]
+prebuild = "x86_64-unknown-none"
+cache = "lint-x86"
+
+# The packages the recipe tests, `helios-x86` for the interrupt-state check
+# it runs over `x86/src`, and the boot payload the hosted tests boot.
+[[lane]]
+name = "test-units"
+command = "just test-units"
+packages = [
+    "helios-hal",
+    "helios-virtio",
+    "helios-netstack",
+    "helios-kernel",
+    "helios-workspace-root",
+    "helios-compositor-render",
+    "helios-desktop-text-check",
+    "helios-inspector-protocol",
+    "helios-inspector",
+    "helios-artifact",
+    "helios-profdata",
+    "helios-cli",
+    "helios-compiler-support",
+    "helios-venus",
+    "helios-venus-gen",
+    "helios-hosted",
+    "helios-x86",
+    "@bootfs",
+]
+prebuild = "x86_64-unknown-linux-gnu"
+apt = ["libudev-dev"]
+tools = ["nextest"]
+uv = true
+cache = "test-units"
+
+# The `helios-hosted` build `test-units` also runs, filtered to the
+# embedded-debugger tests, so it reads that lane's cache entry.
+[[lane]]
+name = "test-embedded-debugger"
+command = "just test-embedded-debugger"
+packages = ["helios-hosted", "@bootfs"]
+prebuild = "x86_64-unknown-linux-gnu"
+tools = ["nextest"]
+cache = "test-units"
+save-cache = false
+
+# The smoke and bench lanes build the release inspector, the target's kernel
+# image (the root package over its backend) and a bootfs per boot.
+[[lane]]
+name = "smoke-x86-64"
+packages = ["helios-x86", "helios-inspector", "helios-desktop-text-check", "@bootfs"]
+direct = ["helios"]
+
+[[lane]]
+name = "smoke-riscv64"
+packages = ["helios-riscv", "helios-inspector", "@bootfs"]
+direct = ["helios"]
+
+[[lane]]
+name = "smoke-aarch64"
+packages = ["helios-aarch64", "helios-inspector", "@bootfs"]
+direct = ["helios"]
+
+[[lane]]
+name = "bench-x86-64-linux"
+packages = ["helios-x86", "helios-inspector", "@bootfs"]
+direct = ["helios"]

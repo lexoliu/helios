@@ -1,14 +1,22 @@
 name: CI
 
 on:
+  # No `edited` or `labeled`: a run on the same commit replaces the one before
+  # it in the checks a pull request shows, so a title edit would rerun the
+  # whole set for nothing.
   pull_request:
+    types: [opened, reopened, synchronize]
   push:
     branches: [dev]
   workflow_dispatch:
 
+# A pull request cancels its superseded run. A `dev` push queues instead: it
+# is the run that writes the build caches every pull request restores, and a
+# writer cancelled mid-save leaves the next runs nothing to restore. The group
+# still drops a queued run a newer push supersedes.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -16,40 +24,39 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+# Which lane runs is data: `.github/ci-lanes.toml` names each lane's trigger
+# set, `affected` evaluates it against the diff, and a lane it leaves out
+# starts no runner. `CI result` is the one check that summarises the run.
+#
+# Build caches (`Swatinem/rust-cache`) are written by `dev` pushes alone, one
+# entry per set of compiled units (the lane table's `cache`), and a pull
+# request restores `dev`'s entries without writing any of its own, so the
+# entries a pull request needs are the ones the quota keeps.
 jobs:
-  checks:
-    name: ${{ matrix.name }}
+  affected:
+    name: Affected lanes
+    uses: ./.github/workflows/affected.yml
+    with:
+      base: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || github.event_name == 'push' && github.event.before || '' }}
+
+  # `helios-cli kernel-prebuild`, once per target a selected lane reads. Its
+  # outputs are the root key pair the kernel build embeds and the
+  # `helios-bootfs` payload the hosted tests boot; each lane downloads its
+  # target's set instead of compiling the prebuild tool and every guest
+  # program itself (`HELIOS_PREBUILT`, Justfile `_prebuilt`). The smoke and
+  # bench lanes are not among them: every boot there prebuilds its own
+  # `--boot-program` selection in the release profile, through the
+  # inspector's build path that the lane is testing.
+  prebuild:
+    name: prebuild ${{ matrix.prebuild.target }}
+    needs: affected
+    if: needs.affected.outputs.prebuild != '[]'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: check-host
-            command: just check-host
-          - name: check-aarch64
-            command: just check-target aarch64-unknown-none helios-aarch64
-          - name: check-riscv
-            command: just check-target riscv64gc-unknown-none-elf helios-riscv
-          - name: check-x86
-            command: just check-target x86_64-unknown-none helios-x86
-          - name: test-embedded-debugger
-            command: just test-embedded-debugger
-          # `just lint` runs these five gates back to back locally; CI
-          # splits them so a lint failure names the surface it came from
-          # and each lane keeps its own build cache.
-          - name: lint-fmt
-            command: just fmt-check && just deny-check
-          - name: lint-host
-            command: just clippy-host && just clippy-programs
-          - name: lint-aarch64
-            command: just clippy-target aarch64-unknown-none helios-aarch64
-          - name: lint-riscv
-            command: just clippy-target riscv64gc-unknown-none-elf helios-riscv
-          - name: lint-x86
-            command: just clippy-target x86_64-unknown-none helios-x86
-          - name: test-units
-            command: just test-units
+        prebuild: ${{ fromJSON(needs.affected.outputs.prebuild) }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -59,38 +66,93 @@ jobs:
         run: |
           sudo rm -f /etc/apt/sources.list.d/google-chrome*
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libudev-dev just cmake ninja-build
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: wasm-tools,cargo-deny,nextest
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: 0.13.0
-      - name: Restore WASI tooling artifacts
-        id: artifact-cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            helios/artifacts/wasi-tools
-            helios/artifacts/python3-root
-            helios/artifacts/wasix
-          key: wasi-artifacts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/tools/wasi-apps/**', 'helios/Cargo.lock') }}
-      - name: Stage WASI tooling artifacts
-        if: steps.artifact-cache.outputs.cache-hit != 'true'
-        working-directory: helios
-        run: tools/wasi-apps/build.sh
+          sudo apt-get install -y --no-install-recommends just
+      # The default boot payload packs every staged artifact.
+      - uses: ./helios/.github/actions/wasi-artifacts
+      # Every target's job compiles the same host tool, and each compiles the
+      # guest programs into its own target's out dir, so the host target's
+      # job alone writes the shared entry (`ci-lanes.toml`, `[prebuild]`).
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: helios
-          key: ${{ matrix.name }}
-      - uses: astral-sh/setup-uv@v6
-      - name: ${{ matrix.name }}
+          shared-key: prebuild
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' && matrix.prebuild['save-cache'] }}
+      - name: Prebuild ${{ matrix.prebuild.target }}
         working-directory: helios
-        run: ${{ matrix.command }}
+        run: just prebuild ${{ matrix.prebuild.target }}
+      # What the lanes read, and the stamp that ties it to this commit. The
+      # root key pair is generated per prebuild, like the one every guest
+      # image of this workflow carries, and dies with the run.
+      - name: Upload the prebuild outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-prebuild-${{ matrix.prebuild.target }}
+          path: |
+            helios/target/kernel-prebuild/${{ matrix.prebuild.target }}/debug/helios-root-public.key
+            helios/target/kernel-prebuild/${{ matrix.prebuild.target }}/debug/helios-root-secret.key
+            helios/target/kernel-prebuild/${{ matrix.prebuild.target }}/debug/helios-bootfs
+            helios/target/kernel-prebuild/${{ matrix.prebuild.target }}/debug/prebuild-source
+          if-no-files-found: error
+          retention-days: 1
+
+  # The check, lint and unit-test lanes: one `just` command each, defined
+  # with its trigger set in `.github/ci-lanes.toml`. `just lint` runs the
+  # lint gates back to back locally; CI splits them so a failure names the
+  # surface it came from and each lane keeps its own build cache. A
+  # bare-metal target's compile check is its clippy lane: both recipes ran
+  # the same two invocations, and clippy reports every error the check did.
+  lanes:
+    name: ${{ matrix.lane.name }}
+    needs: [affected, prebuild]
+    if: ${{ !cancelled() && needs.affected.result == 'success' && needs.affected.outputs.matrix != '[]' && (needs.prebuild.result == 'success' || needs.prebuild.result == 'skipped') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: ${{ fromJSON(needs.affected.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: helios
+      - uses: ./helios/.github/actions/checkout-wasmtime
+      - name: Install host dependencies
+        env:
+          PACKAGES: ${{ matrix.lane.apt }}
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/google-chrome*
+          sudo apt-get update
+          # Word splitting is the point: the lane names a list.
+          # shellcheck disable=SC2086
+          sudo apt-get install -y --no-install-recommends just ${PACKAGES}
+      - if: matrix.lane.tools != ''
+        uses: taiki-e/install-action@v2
+        with:
+          tool: ${{ matrix.lane.tools }}
+      - if: matrix.lane.uv
+        uses: astral-sh/setup-uv@v6
+      - if: matrix.lane.cache != ''
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: helios
+          shared-key: ${{ matrix.lane.cache }}
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' && matrix.lane['save-cache'] }}
+      - if: matrix.lane.prebuild != ''
+        name: Download the ${{ matrix.lane.prebuild }} prebuild
+        uses: actions/download-artifact@v4
+        with:
+          name: kernel-prebuild-${{ matrix.lane.prebuild }}
+          path: ${{ runner.temp }}/kernel-prebuild/${{ matrix.lane.prebuild }}
+      - name: ${{ matrix.lane.name }}
+        working-directory: helios
+        env:
+          HELIOS_PREBUILT: ${{ matrix.lane.prebuild != '' && format('{0}/kernel-prebuild', runner.temp) || '' }}
+        run: ${{ matrix.lane.command }}
 
   smoke-riscv64:
     name: smoke-riscv64
+    needs: affected
+    if: fromJSON(needs.affected.outputs.lanes)['smoke-riscv64']
     runs-on: ubuntu-24.04
     timeout-minutes: 300
     steps:
@@ -103,32 +165,15 @@ jobs:
           sudo rm -f /etc/apt/sources.list.d/google-chrome*
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libudev-dev just cmake ninja-build \
+            libudev-dev just \
             qemu-system-misc opensbi
           qemu-system-riscv64 --version
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: wasm-tools
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: 0.13.0
-      - name: Restore WASI tooling artifacts
-        id: artifact-cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            helios/artifacts/wasi-tools
-            helios/artifacts/python3-root
-            helios/artifacts/wasix
-          key: wasi-artifacts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/tools/wasi-apps/**', 'helios/Cargo.lock') }}
-      - name: Stage WASI tooling artifacts
-        if: steps.artifact-cache.outputs.cache-hit != 'true'
-        working-directory: helios
-        run: tools/wasi-apps/build.sh
+      - uses: ./helios/.github/actions/wasi-artifacts
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: helios
-          key: smoke-riscv64
+          shared-key: smoke-riscv64
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
       - name: Build inspector
         working-directory: helios
         run: cargo build --release -p helios-inspector
@@ -356,10 +401,13 @@ jobs:
   # has no emulator at all, and a package from a later Ubuntu or from
   # Debian trixie would pull its own glibc onto the runner. So the lane
   # builds a pinned upstream release once and caches the install prefix
-  # by version. The tarball also installs the EDK2 blobs the aarch64
-  # boot needs, which the inspector finds through the prefix.
+  # by version and by the build script that configures it. The tarball
+  # also installs the EDK2 blobs the aarch64 boot needs, which the
+  # inspector finds through the prefix.
   smoke-aarch64:
     name: smoke-aarch64
+    needs: affected
+    if: fromJSON(needs.affected.outputs.lanes)['smoke-aarch64']
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 300
     env:
@@ -378,7 +426,7 @@ jobs:
           sudo rm -f /etc/apt/sources.list.d/google-chrome*
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libudev-dev just cmake ninja-build \
+            libudev-dev just ninja-build \
             python3-venv pkg-config flex bison \
             libglib2.0-dev libpixman-1-dev libslirp-dev libfdt-dev zlib1g-dev
           # Recorded rather than required: the accelerator is picked by
@@ -389,28 +437,10 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.QEMU_PREFIX }}
-          key: qemu-${{ env.QEMU_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+          key: qemu-${{ env.QEMU_VERSION }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/.github/scripts/build-qemu.sh') }}
       - name: Build the pinned QEMU
         if: steps.qemu-cache.outputs.cache-hit != 'true'
-        run: |
-          set -euo pipefail
-          tarball="qemu-${QEMU_VERSION}.tar.xz"
-          curl -fsSLO "https://download.qemu.org/${tarball}"
-          echo "${QEMU_SHA256}  ${tarball}" | sha256sum -c -
-          tar xf "${tarball}"
-          cd "qemu-${QEMU_VERSION}"
-          # aarch64-softmmu is the only target this lane boots, and the
-          # inspector's default network backend is `user`, which has been
-          # external libslirp since 8.0.
-          ./configure \
-            --prefix="${QEMU_PREFIX}" \
-            --target-list=aarch64-softmmu \
-            --enable-slirp \
-            --disable-docs \
-            --disable-gtk \
-            --disable-sdl \
-            --disable-vnc
-          ninja -C build install
+        run: helios/.github/scripts/build-qemu.sh "${QEMU_VERSION}" "${QEMU_SHA256}" "${QEMU_PREFIX}"
       - name: Put the pinned QEMU on PATH
         run: |
           echo "${QEMU_PREFIX}/bin" >> "$GITHUB_PATH"
@@ -418,34 +448,17 @@ jobs:
         run: |
           command -v qemu-system-aarch64
           qemu-system-aarch64 --version
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: wasm-tools
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: 0.13.0
       - name: Stage Limine bootloader share
         run: |
           git clone --depth 1 --branch v11.x-binary \
             https://github.com/limine-bootloader/limine "$GITHUB_WORKSPACE/limine"
           make -C "$GITHUB_WORKSPACE/limine"
-      - name: Restore WASI tooling artifacts
-        id: artifact-cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            helios/artifacts/wasi-tools
-            helios/artifacts/python3-root
-            helios/artifacts/wasix
-          key: wasi-artifacts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/tools/wasi-apps/**', 'helios/Cargo.lock') }}
-      - name: Stage WASI tooling artifacts
-        if: steps.artifact-cache.outputs.cache-hit != 'true'
-        working-directory: helios
-        run: tools/wasi-apps/build.sh
+      - uses: ./helios/.github/actions/wasi-artifacts
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: helios
-          key: smoke-aarch64
+          shared-key: smoke-aarch64
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
       - name: Build inspector
         working-directory: helios
         run: cargo build --release -p helios-inspector
@@ -555,6 +568,8 @@ jobs:
 
   smoke-x86-64:
     name: smoke-x86-64
+    needs: affected
+    if: fromJSON(needs.affected.outputs.lanes)['smoke-x86-64']
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -578,7 +593,7 @@ jobs:
           sudo rm -f /etc/apt/sources.list.d/google-chrome*
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libudev-dev just cmake ninja-build \
+            libudev-dev just \
             qemu-system-x86 ovmf
           qemu-system-x86_64 --version
           # The inspector picks the accelerator by capability; this only
@@ -587,34 +602,17 @@ jobs:
             sudo chmod 666 /dev/kvm
             ls -la /dev/kvm
           fi
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: wasm-tools
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: 0.13.0
       - name: Stage Limine bootloader share
         run: |
           git clone --depth 1 --branch v11.x-binary \
             https://github.com/limine-bootloader/limine "$GITHUB_WORKSPACE/limine"
           make -C "$GITHUB_WORKSPACE/limine"
-      - name: Restore WASI tooling artifacts
-        id: artifact-cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            helios/artifacts/wasi-tools
-            helios/artifacts/python3-root
-            helios/artifacts/wasix
-          key: wasi-artifacts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/tools/wasi-apps/**', 'helios/Cargo.lock') }}
-      - name: Stage WASI tooling artifacts
-        if: steps.artifact-cache.outputs.cache-hit != 'true'
-        working-directory: helios
-        run: tools/wasi-apps/build.sh
+      - uses: ./helios/.github/actions/wasi-artifacts
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: helios
-          key: smoke-x86-64
+          shared-key: smoke-x86-64
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
       - name: Build inspector
         working-directory: helios
         run: cargo build --release -p helios-inspector -p helios-desktop-text-check
@@ -1410,6 +1408,8 @@ jobs:
 
   bench:
     name: bench-${{ matrix.name }}
+    needs: affected
+    if: fromJSON(needs.affected.outputs.lanes)['bench-x86-64-linux']
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -1488,7 +1488,7 @@ jobs:
           sudo rm -f /etc/apt/sources.list.d/google-chrome*
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libudev-dev just cmake ninja-build \
+            libudev-dev just \
             qemu-system-x86 ovmf \
             iproute2 nftables dnsmasq-base
           # GitHub's x86-64 runners expose /dev/kvm; the inspector picks
@@ -1497,34 +1497,22 @@ jobs:
             sudo chmod 666 /dev/kvm
             ls -la /dev/kvm
           fi
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: wasm-tools
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: 0.13.0
       - name: Stage Limine bootloader share
         run: |
           git clone --depth 1 --branch v11.x-binary \
             https://github.com/limine-bootloader/limine "$GITHUB_WORKSPACE/limine"
           make -C "$GITHUB_WORKSPACE/limine"
-      - name: Restore WASI tooling artifacts
-        id: artifact-cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            helios/artifacts/wasi-tools
-            helios/artifacts/python3-root
-            helios/artifacts/wasix
-          key: wasi-artifacts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/tools/wasi-apps/**', 'helios/Cargo.lock') }}
-      - name: Stage WASI tooling artifacts
-        if: steps.artifact-cache.outputs.cache-hit != 'true'
-        working-directory: helios
-        run: tools/wasi-apps/build.sh
+      - uses: ./helios/.github/actions/wasi-artifacts
+      # The lane builds what `smoke-x86-64` builds (the release inspector and
+      # helios-cli, the profile-use x86-64 image, release bootfs payloads)
+      # with the two host tools in one invocation rather than two, so it
+      # reads that lane's entry and writes none: a 1.5 GB entry of its own
+      # would not fit `dev`'s set in the quota.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: helios
-          key: bench-${{ matrix.name }}
+          shared-key: smoke-x86-64
+          save-if: false
       - name: Install inferno flamegraph renderer
         run: cargo install inferno --locked
       # The guest image, its bootfs and the inspector are built here so
@@ -1705,3 +1693,38 @@ jobs:
           name: perf-baselines-${{ matrix.name }}
           path: helios/target/perf-baselines/ci-${{ matrix.name }}/**
           if-no-files-found: warn
+
+  # The one check that summarises the run. A lane the diff does not reach is
+  # skipped and passes; any other outcome fails, and so does an `affected`
+  # that did not succeed, because then which lanes the change needs is
+  # unknown and every skip below means nothing.
+  result:
+    name: CI result
+    needs: [affected, prebuild, lanes, smoke-riscv64, smoke-aarch64, smoke-x86-64, bench]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every lane to have passed or been left out
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          status=0
+          affected="$(jq -r '.affected.result' <<<"${NEEDS}")"
+          if [ "${affected}" != success ]; then
+            echo "::error::affected finished as ${affected}, so which lanes this change needs is unknown"
+            status=1
+          fi
+          while read -r job result; do
+            case "${result}" in
+              success | skipped) ;;
+              *)
+                # `prebuild` and `lanes` are matrices: the red entry among
+                # their checks names the target or the lane.
+                echo "::error::${job} finished as ${result}"
+                status=1
+                ;;
+            esac
+          done < <(jq -r 'to_entries[] | select(.key != "affected") | "\(.key) \(.value.result)"' <<<"${NEEDS}")
+          exit "${status}"

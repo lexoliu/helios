@@ -140,7 +140,7 @@ memory ID 0 for the physical address ranges, and MUST NOT use `start` or
 virtio-mem is **not reachable from this host at all** (`depends on LINUX`).
 On a Linux host it would be available for aarch64 `virt` and x86 `pc` and
 absent for riscv64 `virt`, so it could never cover the full target matrix
-`just check-target` gates on.
+`just clippy-target` gates on.
 
 virtio-pmem **is** reachable, but only on x86. It instantiates cleanly on
 macOS once the machine has a memory-device slot — the first attempt
