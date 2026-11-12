@@ -2582,6 +2582,20 @@ mod tests {
     }
 
     #[test]
+    fn a_name_too_long_is_name_too_long_in_every_wasi_layer() {
+        let code =
+            crate::wasmtime_adapter::wasi::fs_error_code(helios_hal::fs::FsError::NameTooLong);
+
+        // Preview 2 and 3 return the code itself; preview 1 and WASIX
+        // answer its errno.
+        assert!(matches!(code, fs_types::ErrorCode::NameTooLong));
+        assert_eq!(
+            p1_errno_from_fs(fs_types::ErrorCode::NameTooLong),
+            p1::errno::NAMETOOLONG
+        );
+    }
+
+    #[test]
     fn null_device_open_is_confined_to_authorized_path_resolution() {
         let root = FsDescriptor {
             path: "/".into(),

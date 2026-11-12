@@ -67,6 +67,7 @@ pub(crate) fn fs_error_from_host(error: HostFsError) -> FsError {
         HostFsErrorKind::NotEmpty => FsError::NotEmpty,
         HostFsErrorKind::ReadOnly => FsError::ReadOnly,
         HostFsErrorKind::Unsupported => FsError::Unsupported,
+        HostFsErrorKind::NameTooLong => FsError::NameTooLong,
         HostFsErrorKind::Io => FsError::Io,
     }
 }
@@ -295,10 +296,21 @@ impl<H: HostFileSystem> FileSystem for HostShare<H> {
 
 #[cfg(test)]
 mod tests {
-    use helios_hal::fs::NodeKind;
+    use helios_hal::fs::{FsError, NodeKind};
 
-    use super::{P9_QID_TYPE_DIRECTORY, metadata_from_host};
-    use crate::{AuthorityDomain, HostMetadata, ObjectIdentity, object_identity};
+    use super::{P9_QID_TYPE_DIRECTORY, fs_error_from_host, metadata_from_host};
+    use crate::{AuthorityDomain, HostFsError, HostMetadata, ObjectIdentity, object_identity};
+
+    /// A name the host share's wire cannot carry stays "name too long"
+    /// through the mount, rather than collapsing into an I/O error.
+    #[test]
+    fn a_name_the_host_share_cannot_carry_is_name_too_long() {
+        let error = HostFsError::NameTooLong {
+            len: 65_536,
+            max_len: 65_535,
+        };
+        assert_eq!(fs_error_from_host(error), FsError::NameTooLong);
+    }
 
     fn host_metadata(identity: ObjectIdentity, qid_type: u8) -> HostMetadata {
         HostMetadata {

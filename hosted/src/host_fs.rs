@@ -92,6 +92,14 @@ impl HostFileSystem for HostedFileSystem {
         core::future::ready(())
     }
 
+    /// The host OS is called directly: there is no 9p session for a VMM
+    /// to see, so a snapshot has nothing to wait for.
+    fn prepare_snapshot(&self) -> impl core::future::Future<Output = ()> + Send + '_ {
+        core::future::ready(())
+    }
+
+    fn snapshot_finished(&self) {}
+
     fn stat_path(
         &self,
         path: &str,

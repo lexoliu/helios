@@ -133,6 +133,9 @@ pub enum FsError {
     Overflow,
     #[error("name is not valid UTF-8")]
     IllegalByteSequence,
+    /// A name longer than the filesystem can store or carry.
+    #[error("file name too long")]
+    NameTooLong,
     #[error("operation not supported by this filesystem")]
     Unsupported,
     #[error("input/output error")]

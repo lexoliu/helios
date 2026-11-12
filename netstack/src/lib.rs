@@ -8,6 +8,7 @@ mod congestion;
 mod dhcp;
 mod dns;
 mod hash;
+mod isn;
 mod ndp;
 mod packet;
 mod stack;
@@ -43,6 +44,7 @@ pub use hash::{
     FlowHash, FlowTuple, RSS_INDIRECTION_ENTRIES, RSS_KEY_BYTES, STANDARD_RSS_KEY, flow_hash,
     rss_indirection_entry, toeplitz,
 };
+pub use isn::{IsnSecret, initial_sequence_number};
 pub use ndp::{
     AdvertisedAddress, Ipv6DnsServers, Ipv6RouterConfiguration, MAX_ADVERTISED_PREFIXES,
     MAX_IPV6_DNS_SERVERS, MAX_ROUTER_SOLICITATIONS, NeighborDiscovery, OnLinkPrefix,

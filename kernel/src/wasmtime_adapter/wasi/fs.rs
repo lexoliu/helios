@@ -108,6 +108,7 @@ pub(crate) fn fs_error_code(error: VfsError) -> fs_types::ErrorCode {
         VfsError::Invalid => fs_types::ErrorCode::Invalid,
         VfsError::Overflow => fs_types::ErrorCode::Overflow,
         VfsError::IllegalByteSequence => fs_types::ErrorCode::IllegalByteSequence,
+        VfsError::NameTooLong => fs_types::ErrorCode::NameTooLong,
         VfsError::Unsupported => fs_types::ErrorCode::Unsupported,
         VfsError::Io => fs_types::ErrorCode::Io,
     }

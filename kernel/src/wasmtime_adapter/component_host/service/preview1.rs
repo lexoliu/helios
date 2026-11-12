@@ -4608,6 +4608,7 @@ pub(super) fn p1_errno_from_fs(error: fs_types::ErrorCode) -> i32 {
         fs_types::ErrorCode::Io => p1::errno::IO,
         fs_types::ErrorCode::IsDirectory => p1::errno::ISDIR,
         fs_types::ErrorCode::Loop => p1::errno::LOOP,
+        fs_types::ErrorCode::NameTooLong => p1::errno::NAMETOOLONG,
         fs_types::ErrorCode::NoEntry => p1::errno::NOENT,
         fs_types::ErrorCode::NotDirectory => p1::errno::NOTDIR,
         fs_types::ErrorCode::NotEmpty => p1::errno::NOTEMPTY,
