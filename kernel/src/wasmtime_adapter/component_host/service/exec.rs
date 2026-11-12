@@ -60,7 +60,7 @@ where
     pub(super) env: Vec<(String, String)>,
     pub(super) executable: ProgramExecutable<CpuImpl, Net, HostFs>,
     pub(super) authority: ProcessAuthority,
-    pub(super) filesystem: Option<DebugFileSystemSnapshot>,
+    pub(super) filesystem: Option<Namespace<HostFs>>,
     pub(super) descriptors: Option<Preview1DescriptorTable<Net>>,
     pub(super) signal_state: WasixSignalState,
     pub(super) signal_dispositions: Vec<WasixSignalDisposition>,
@@ -152,7 +152,7 @@ pub(super) struct WasixProcessSnapshot<Net: ComponentHostNetwork> {
     pub(super) memory: Vec<u8>,
     pub(super) memory_pages: u32,
     pub(super) descriptors: Preview1DescriptorTable<Net>,
-    pub(super) filesystem: DebugFileSystemSnapshot,
+    pub(super) filesystem: MemoryFs,
     pub(super) authority: ProcessAuthority,
     pub(super) cwd: Option<Preview1Cwd>,
     pub(super) arguments: Vec<String>,
@@ -176,7 +176,17 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    runtime_state.bootfs()?.file_bytes(path)
+    let inside = path
+        .strip_prefix('/')
+        .expect("a boot artifact is named by an absolute guest path");
+    let path = helios_hal::fs::FsPath::new(inside)
+        .expect("a boot artifact path is a normalized filesystem path");
+    runtime_state
+        .root_namespace()
+        .table()
+        .boot()
+        .file_contents(path)
+        .ok()
 }
 
 impl<Net: ComponentHostNetwork> WasixAsyncifyState<Net> {
@@ -197,7 +207,7 @@ pub(super) async fn run_program_executable<CpuImpl, Net, HostFs>(
     argv: ProgramArgv,
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
-    filesystem: Option<DebugFileSystemSnapshot>,
+    filesystem: Option<Namespace<HostFs>>,
     descriptors: Option<Preview1DescriptorTable<Net>>,
     signal_state: WasixSignalState,
     signal_dispositions: Vec<WasixSignalDisposition>,
@@ -302,7 +312,7 @@ pub(super) async fn run_program_core_module<CpuImpl, Net, HostFs>(
     argv: ProgramArgv,
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
-    filesystem: Option<DebugFileSystemSnapshot>,
+    filesystem: Option<Namespace<HostFs>>,
     descriptors: Option<Preview1DescriptorTable<Net>>,
     signal_state: WasixSignalState,
     signal_dispositions: Vec<WasixSignalDisposition>,
@@ -556,7 +566,7 @@ pub(super) async fn run_program_core_module_with_restore<CpuImpl, Net, HostFs>(
     argv: ProgramArgv,
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
-    filesystem: Option<DebugFileSystemSnapshot>,
+    filesystem: Option<Namespace<HostFs>>,
     signal_state: WasixSignalState,
     spawner: crate::InstanceSpawner<CpuImpl>,
     progress: helios_hal::watchdog::ProgressCounter,
@@ -833,7 +843,7 @@ where
         Ok(()) => CoreModuleRunCompletion::Exit(Ok(ChildExit {
             instance_id: run.instance_id,
             exit_code: 0,
-            filesystem: Some(store.data().filesystem.snapshot()),
+            filesystem: Some(store.data().filesystem.root_layer()),
         })),
         // Main's call stopped because a spawned thread ended the process;
         // the process ends the way that thread's call ended it: it exits
@@ -846,7 +856,7 @@ where
                 WasixProcessEnd::Exit(code) => CoreModuleRunCompletion::Exit(Ok(ChildExit {
                     instance_id: run.instance_id,
                     exit_code: code,
-                    filesystem: Some(store.data().filesystem.snapshot()),
+                    filesystem: Some(store.data().filesystem.root_layer()),
                 })),
                 WasixProcessEnd::Exec(replacement) => CoreModuleRunCompletion::Exec(replacement),
                 WasixProcessEnd::Fail(failure) => CoreModuleRunCompletion::Exit(Err(failure)),
@@ -860,7 +870,7 @@ where
                 CoreModuleRunCompletion::Exit(end.map(|exit_code| ChildExit {
                     instance_id: run.instance_id,
                     exit_code,
-                    filesystem: Some(store.data().filesystem.snapshot()),
+                    filesystem: Some(store.data().filesystem.root_layer()),
                 }))
             }
         }
@@ -983,7 +993,7 @@ pub(super) async fn run_program_component<CpuImpl, Net, HostFs>(
     argv: ProgramArgv,
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
-    filesystem: Option<DebugFileSystemSnapshot>,
+    filesystem: Option<Namespace<HostFs>>,
     _signal_state: WasixSignalState,
     spawner: crate::InstanceSpawner<CpuImpl>,
     progress: helios_hal::watchdog::ProgressCounter,
@@ -1019,12 +1029,8 @@ where
     let store_prepare_started = profile_runtime_state
         .profiling_enabled()
         .then(|| profile_cpu.now().ticks());
-    let filesystem = match filesystem {
-        Some(snapshot) => {
-            DebugFileSystem::from_snapshot(exec_context.runtime_state.clone(), snapshot)
-        }
-        None => DebugFileSystem::new(exec_context.runtime_state.clone()),
-    };
+    let filesystem =
+        filesystem.unwrap_or_else(|| exec_context.runtime_state.root_namespace().descend());
     let (mut store, interrupts) = crate::wasmtime_adapter::store_with_state(
         engine,
         StoreData::<CpuImpl, Net, HostFs>::new(
@@ -1071,9 +1077,9 @@ where
         );
     }
     let instance = instance.inspect(|instance| {
-        // The device path needs to know where this instance's linear
-        // memory landed before it can place a device window in it, and
-        // this is the first moment the runtime can say.
+        // Every call that shows a view checks its span against this
+        // instance's linear memory, so the store records the memory's
+        // handle here, the first moment the runtime can name it.
         crate::wasmtime_adapter::component_host::record_linear_memory(&mut store, instance);
     });
     let executor = instance.and_then(|instance| {
@@ -1173,7 +1179,7 @@ where
                 kind: ProgramExecErrorKind::InvalidBinary,
                 detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
             })?;
-            let unwind_stack_finish = preview1_read_u32(memory, stack_lower)?;
+            let unwind_stack_finish = preview1_read_u32(memory, GuestAddress::wasm32(stack_lower))?;
             if unwind_stack_finish < unwind_stack_begin || unwind_stack_finish > stack_pointer {
                 return Err(ProgramExecError {
                     kind: ProgramExecErrorKind::InvalidBinary,
@@ -1187,7 +1193,8 @@ where
                         detail: ProgramExecErrorDetail::StackBoundsInvalid,
                     }
                 })?;
-            let rewind_stack = preview1_read_memory(memory, unwind_stack_begin, unwind_len)?;
+            let rewind_stack =
+                preview1_read_memory(memory, GuestAddress::wasm32(unwind_stack_begin), unwind_len)?;
             wasix_call_instance_func0(store, interrupts, instance, "asyncify_stop_unwind").await?;
 
             let hash = wasix_next_stack_hash(store);
@@ -1209,7 +1216,9 @@ where
                     kind: ProgramExecErrorKind::InvalidBinary,
                     detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
                 })?;
-                if preview1_write_memory(memory, snapshot, &snapshot_bytes) != p1::errno::SUCCESS {
+                if preview1_write_memory(memory, GuestAddress::wasm32(snapshot), &snapshot_bytes)
+                    != p1::errno::SUCCESS
+                {
                     return Err(ProgramExecError {
                         kind: ProgramExecErrorKind::InvalidBinary,
                         detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
@@ -1289,7 +1298,7 @@ where
                 kind: ProgramExecErrorKind::InvalidBinary,
                 detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
             })?;
-            let unwind_stack_finish = preview1_read_u32(memory, stack_lower)?;
+            let unwind_stack_finish = preview1_read_u32(memory, GuestAddress::wasm32(stack_lower))?;
             if unwind_stack_finish < unwind_stack_begin || unwind_stack_finish > stack_pointer {
                 return Err(ProgramExecError {
                     kind: ProgramExecErrorKind::InvalidBinary,
@@ -1303,7 +1312,8 @@ where
                         detail: ProgramExecErrorDetail::StackBoundsInvalid,
                     }
                 })?;
-            let rewind_stack = preview1_read_memory(memory, unwind_stack_begin, unwind_len)?;
+            let rewind_stack =
+                preview1_read_memory(memory, GuestAddress::wasm32(unwind_stack_begin), unwind_len)?;
             wasix_call_instance_func0(store, interrupts, instance, "asyncify_stop_unwind").await?;
             let child_pid = spawn_wasix_fork_child(
                 store,
@@ -1330,7 +1340,9 @@ where
                     kind: ProgramExecErrorKind::InvalidBinary,
                     detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
                 })?;
-                if preview1_write_memory(memory, ret_pid, &snapshot_bytes) != p1::errno::SUCCESS {
+                if preview1_write_memory(memory, GuestAddress::wasm32(ret_pid), &snapshot_bytes)
+                    != p1::errno::SUCCESS
+                {
                     return Err(ProgramExecError {
                         kind: ProgramExecErrorKind::InvalidBinary,
                         detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
@@ -1364,7 +1376,7 @@ where
                 kind: ProgramExecErrorKind::InvalidBinary,
                 detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
             })?;
-            let unwind_stack_finish = preview1_read_u32(memory, stack_lower)?;
+            let unwind_stack_finish = preview1_read_u32(memory, GuestAddress::wasm32(stack_lower))?;
             if unwind_stack_finish < unwind_stack_begin || unwind_stack_finish > stack_pointer {
                 return Err(ProgramExecError {
                     kind: ProgramExecErrorKind::InvalidBinary,
@@ -1378,7 +1390,8 @@ where
                         detail: ProgramExecErrorDetail::StackBoundsInvalid,
                     }
                 })?;
-            let rewind_stack = preview1_read_memory(memory, unwind_stack_begin, unwind_len)?;
+            let rewind_stack =
+                preview1_read_memory(memory, GuestAddress::wasm32(unwind_stack_begin), unwind_len)?;
             wasix_call_instance_func0(store, interrupts, instance, "asyncify_stop_unwind").await?;
             let snapshot = wasix_capture_process_snapshot(
                 store,
@@ -1442,7 +1455,9 @@ where
         kind: ProgramExecErrorKind::InvalidBinary,
         detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
     })?;
-    if preview1_write_memory(memory, stack_pointer, &memory_stack) != p1::errno::SUCCESS {
+    if preview1_write_memory(memory, GuestAddress::wasm32(stack_pointer), &memory_stack)
+        != p1::errno::SUCCESS
+    {
         return Err(ProgramExecError {
             kind: ProgramExecErrorKind::InvalidBinary,
             detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
@@ -1477,11 +1492,16 @@ where
         kind: ProgramExecErrorKind::InvalidBinary,
         detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
     })?;
-    let status = preview1_write_u32(memory, stack_lower, rewind_stack_end)
-        .max(preview1_write_u32(memory, stack_lower + 4, stack_upper))
+    let stack_lower_address = GuestAddress::wasm32(stack_lower);
+    let status = preview1_write_u32(memory, stack_lower_address, rewind_stack_end)
+        .max(preview1_write_u32(
+            memory,
+            stack_lower_address.offset(4),
+            stack_upper,
+        ))
         .max(preview1_write_memory(
             memory,
-            rewind_stack_begin,
+            GuestAddress::wasm32(rewind_stack_begin),
             &rewind_stack,
         ));
     if status != p1::errno::SUCCESS {
@@ -1551,7 +1571,7 @@ where
         memory: memory_bytes,
         memory_pages,
         descriptors: store.data().descriptors.clone(),
-        filesystem: store.data().filesystem.snapshot(),
+        filesystem: store.data().filesystem.root_layer(),
         authority: store.data().authority.clone(),
         cwd: store.data().cwd.clone(),
         arguments: store.data().arguments.clone(),
@@ -1728,7 +1748,7 @@ where
             argv,
             environment,
             store.data().authority.clone(),
-            Some(store.data().filesystem.snapshot()),
+            Some(store.data().filesystem.clone()),
         ),
         output_mode,
         ChildStdio {

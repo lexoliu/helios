@@ -10,9 +10,10 @@ package helios:system@0.1.0;
 /// time, and everything it creates is released when it lets go or dies.
 ///
 /// Pixels never travel through the kernel. A surface's frame buffer is
-/// pinned, physically contiguous memory placed inside the claiming
-/// instance's own linear memory, and those same pages are what backs the
-/// device's resource. A compositor writes a frame with ordinary stores
+/// pinned, physically contiguous memory shown at pages of the claiming
+/// instance's own linear memory that the instance chose, and those same
+/// frames are what backs the device's resource. A compositor writes a
+/// frame with ordinary stores, `memory.copy` and `memory.fill` included,
 /// and calls `present`; the kernel turns that into the two commands the
 /// display engine needs — copy the dirty rectangle into the device's
 /// copy of the resource, then tell the scanouts showing it to re-read —
@@ -23,6 +24,8 @@ package helios:system@0.1.0;
 /// `move-cursor` moves it and does nothing else, so pointer motion costs
 /// no pixels and never waits on a repaint.
 interface display {
+  use memory.{span};
+
   /// Why a request was refused.
   enum error {
     /// This machine has no display device, or the kernel never brought
@@ -43,9 +46,9 @@ interface display {
     out-of-bounds,
     /// This claim already holds as many surfaces as it may.
     too-many-surfaces,
-    /// The part of this instance's linear memory the kernel devotes to
-    /// display frame buffers has no room left.
-    window-exhausted,
+    /// The span is not whole pages inside this instance's memory, is not
+    /// the length the frame needs, or overlaps something already shown.
+    bad-span,
     /// The frame buffer could not be pinned: the machine has no
     /// contiguous run of that size left, or the instance's own memory
     /// accounting refused it.
@@ -127,31 +130,18 @@ interface display {
     presented-nanos: u64,
   }
 
-  /// Where a surface's frame buffer landed in this instance's linear
-  /// memory.
-  record placement {
-    /// Byte offset of the frame buffer.
-    offset: u64,
-    /// How many bytes of linear memory it covers, which is the frame
-    /// rounded up to whole pages.
-    length: u64,
-  }
-
   /// One frame buffer on one scanout.
   ///
-  /// The bytes at `buffer` are the device's backing store, not a staging
-  /// copy: what is written there is what the display engine reads when
-  /// `present` names it. Rows are `width * 4` bytes, top row first, no
-  /// padding between them.
+  /// The bytes at the span it was created with are the device's backing
+  /// store, not a staging copy: what is written there is what the
+  /// display engine reads when `present` names it. Rows are `width * 4`
+  /// bytes, top row first, no padding between them.
   ///
   /// Dropping the surface takes it off its scanout and hands the
-  /// device's resource back. The pages themselves stay with the claim —
-  /// a compositor builds its surfaces once — and go back to the
-  /// instance's pool when the display is released.
+  /// device's resource back; the span is ordinary zeroed memory again
+  /// once the drop returns, and the frames go back to the instance's
+  /// pool when the display engine has let go of them.
   resource surface {
-    /// Where this surface's frame buffer sits in linear memory.
-    buffer: func() -> placement;
-
     /// The mode the surface was created at.
     resolution: func() -> mode;
 
@@ -211,9 +201,14 @@ interface display {
     /// the display engine scales it onto the output.
     modes: async func(scanout: u32) -> result<list<mode>, error>;
 
-    /// Create a frame buffer of `mode` in `format` and point `scanout`
-    /// at it.
-    create: async func(scanout: u32, %mode: mode, format: pixel-format) -> result<surface, error>;
+    /// Create a frame buffer of `mode` in `format`, show it at `buffer`
+    /// and point `scanout` at it.
+    ///
+    /// `buffer` is `width * height * 4` bytes rounded up to whole wasm
+    /// pages. What those pages held is discarded; the frame starts
+    /// zeroed. A call that does not return a surface — refused, or
+    /// cancelled by the caller — shows nothing at `buffer`.
+    create: async func(scanout: u32, %mode: mode, format: pixel-format, buffer: span) -> result<surface, error>;
 
     /// Every change to the device's set of outputs, from now on.
     changed: func() -> stream<display-change>;

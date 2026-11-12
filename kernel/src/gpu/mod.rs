@@ -10,9 +10,9 @@
 //! * [`service`] is how everything else reaches those tasks: a claim
 //!   word, two bounded queues, and the signal a claim's release travels
 //!   on. No trait object and no lock crosses that boundary.
-//! * [`instance`] is the claiming instance's side: the pinned pages its
-//!   command buffers and guest blobs live in, and the windows the host's
-//!   own storage is mapped into, both inside its own linear memory.
+//! * [`instance`] is the claiming instance's side: the claim, and the set
+//!   of views its command buffers, guest blobs and aperture placements
+//!   are shown through, which ends when the claim does.
 //!
 //! # What the kernel does not do
 //!
@@ -23,24 +23,28 @@
 //!
 //! # Where the memory is
 //!
-//! Nowhere the kernel owns. A command buffer is pinned, physically
-//! contiguous pages committed from the claiming instance's own pool into
-//! its own linear memory, so writing one is ordinary stores and
-//! submitting it is one message. A mapped host-3D blob is not this
-//! machine's memory at all: it is a window the display engine decodes,
-//! placed in the same instance's linear memory through the mechanism a
-//! granted device's registers are mapped through.
+//! Nowhere the kernel owns. A command buffer or a guest blob's storage
+//! is a [`crate::Buffer`] pinned from the claiming instance's own pool
+//! and shown at a span of its linear memory the instance chose, so
+//! writing one is ordinary stores and submitting it is one message. A
+//! mapped host-3D blob is not this machine's memory at all: it is a
+//! region of the aperture the display engine decodes, shown at a span
+//! of the same instance's linear memory the way a granted device's
+//! registers are.
 //!
 //! # Concurrency contract
 //!
 //! Stated per part: [`service`] for the claim word and the queues,
-//! [`owner`] for the tasks, [`crate::pins`] for the arena. The one rule
-//! that spans them is the release: a claim is let go by a drop, which
-//! cannot await anything, so the renderer is neither held nor free until
-//! the owner task has taken the resources back — and the memory itself
-//! is handed to that task rather than freed by the drop, because the
-//! host renderer may still be reading a guest blob when the instance
-//! dies.
+//! [`owner`] for the tasks, [`crate::buffer`] for the buffers and views.
+//! The one rule that spans them is the release: a claim is let go by a
+//! drop, which cannot await anything, so the renderer is neither held
+//! nor free until the owner task has taken the resources back. The
+//! memory takes care of itself: every request that has the device read
+//! a buffer — a blob's creation, a submission — carries a reference to
+//! it, the owner task's record of a guest blob holds one until the
+//! device has destroyed the blob, and so a run goes back to the pool
+//! only after the renderer has stopped reading it, on whichever
+//! processor drops the last reference.
 
 mod instance;
 mod owner;
@@ -51,25 +55,21 @@ mod tests;
 use helios_hal::display::Gpu3dError;
 use thiserror::Error;
 
-use crate::pins::{PinError, PinnedArena};
+use crate::buffer::{BufferError, ViewError};
 
-/// Pinned runs one 3D claim may hold at once.
+/// Views one 3D claim is budgeted in its store's view table.
 ///
-/// A run per command buffer, a run per guest-backed blob and a window
-/// per mapped host blob, for the contexts one plugin drives. The bound
-/// is what keeps the arena a value on the store's own stack rather than
-/// an allocation whose size a guest chooses.
-pub const MAX_GPU_PINS: usize = 32;
+/// A view per command buffer, per guest-backed blob and per aperture
+/// placement, for the contexts one plugin drives. It is this path's
+/// share of [`crate::MAX_VIEWS`], which is what keeps the table an
+/// allocation of a size the kernel chose.
+pub const MAX_GPU_VIEWS: usize = 32;
 
 /// Contexts one claim may open at once.
 pub const MAX_GPU_CONTEXTS: usize = 8;
 
 /// Blobs one claim may hold at once.
 pub const MAX_GPU_BLOBS: usize = 32;
-
-/// The arena one 3D claim pins its command buffers and maps its host
-/// blobs in.
-pub type GpuPins = PinnedArena<MAX_GPU_PINS>;
 
 pub use instance::Gpu3dOwnership;
 pub use owner::install_gpu3d_device;
@@ -115,9 +115,12 @@ pub enum Gpu3dServiceError {
     /// This claim already holds as many blobs as it may.
     #[error("a 3D claim holds at most {MAX_GPU_BLOBS} blobs")]
     TooManyBlobs,
+    /// This claim already shows [`MAX_GPU_VIEWS`] things in the
+    /// instance's memory, or the store holds as many views as it may.
+    #[error("a 3D claim shows at most {MAX_GPU_VIEWS} buffers in its instance's memory")]
+    TooManyViews,
     /// The blob's parameters do not describe a resource this engine can
-    /// create, or it is being mapped or unmapped in a state it is not
-    /// in.
+    /// create, or it names a context or blob this claim does not hold.
     #[error("the blob request does not describe a resource this engine can create")]
     InvalidBlob,
     /// The engine's host-visible aperture has no room left.
@@ -130,10 +133,24 @@ pub enum Gpu3dServiceError {
     /// not come after the last one this context submitted.
     #[error("a fence must come after every fence this context has already submitted")]
     FenceNotIncreasing,
-    /// The instance's 3D window has no room left.
-    #[error("this instance's 3D window has no room left")]
-    WindowExhausted,
-    /// The memory could not be pinned or mapped.
+    /// The span is not whole pages inside the instance's memory, is not
+    /// the length the request needs, or overlaps something already
+    /// shown.
+    #[error("nothing can be shown at that span: {0}")]
+    BadSpan(ViewError),
+    /// A span was given for a blob with no pages of its own, or left
+    /// out for one that has them.
+    #[error("a blob takes a span exactly when it has pages of its own")]
+    BlobSpanMismatch,
+    /// The blob's host storage is already shown in the instance's
+    /// memory.
+    #[error("the blob is already mapped")]
+    AlreadyMapped,
+    /// The blob's host storage is not shown in the instance's memory.
+    #[error("the blob is not mapped")]
+    NotMapped,
+    /// The memory could not be pinned, or a span could not be given its
+    /// memory back.
     #[error("no contiguous run of memory left for a command buffer")]
     OutOfMemory,
     /// The display engine failed rather than refused.
@@ -145,20 +162,43 @@ pub enum Gpu3dServiceError {
     Closed,
 }
 
-impl From<PinError> for Gpu3dServiceError {
-    fn from(error: PinError) -> Self {
+/// A buffer the pool refused, in the vocabulary a plugin acts on.
+impl From<BufferError> for Gpu3dServiceError {
+    fn from(error: BufferError) -> Self {
         match error {
-            // A command buffer of no bytes is not a command buffer, and
-            // neither is a blob of none.
-            PinError::EmptyRun => Self::InvalidBlob,
-            PinError::TooManyRuns => Self::TooManyBlobs,
-            PinError::WindowExhausted => Self::WindowExhausted,
-            PinError::OutOfMemory => Self::OutOfMemory,
-            // A 3D claim asks for a second view of somebody else's run
-            // only when it maps a window the display engine published,
-            // and an address space that refuses one has been handed a
-            // region the engine described wrongly.
-            PinError::ShareRefused => Self::DeviceFault,
+            // A blob of no bytes is not a blob, and one whose size no
+            // address space can describe is not one the device accepts.
+            BufferError::Empty | BufferError::TooLarge => Self::InvalidBlob,
+            BufferError::OutOfMemory => Self::OutOfMemory,
+            // The address space refused a run the kernel described
+            // correctly: a wiring fault rather than a shortage.
+            BufferError::AddressSpace(_) => Self::DeviceFault,
+        }
+    }
+}
+
+/// A view the store refused, in the vocabulary a plugin acts on.
+impl From<ViewError> for Gpu3dServiceError {
+    fn from(error: ViewError) -> Self {
+        match error {
+            ViewError::NoUnsharedMemory
+            | ViewError::Misaligned
+            | ViewError::OutOfBounds { .. }
+            | ViewError::WrongLength { .. }
+            | ViewError::Overlap => Self::BadSpan(error),
+            ViewError::TooManyViews => Self::TooManyViews,
+            ViewError::OutOfMemory { .. } => Self::OutOfMemory,
+            // An aperture placement the engine published off a frame
+            // boundary is the engine describing it wrongly, and an
+            // address space that refuses a span the table checked is a
+            // wiring fault.
+            ViewError::UnalignedRegion | ViewError::AddressSpace(_) => Self::DeviceFault,
+            // A claim ends only views it recorded, through a path that
+            // never converts the answer: the claim and the store's views
+            // disagree.
+            ViewError::NotShown => {
+                panic!("a 3D claim's view answered {error}, which only a kernel defect produces")
+            }
         }
     }
 }

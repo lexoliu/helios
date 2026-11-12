@@ -99,6 +99,14 @@ use crate::{Notify, Timer};
 use super::owner::MemoryOwner;
 use super::user::user_heap_stats;
 
+mod hooks;
+mod leaf;
+mod space;
+
+pub use hooks::{InstalledAddressSpace, swap_vm_hooks};
+pub use leaf::{AGE_BATCH_PAGES, SwapLeafFormat};
+pub use space::SwapSpace;
+
 /// How long an instance has to have been off every processor before a
 /// `Yellow` pass will evict it. Ten seconds is long enough that an
 /// instance between two guest calls is never mistaken for an idle one,
@@ -185,8 +193,8 @@ pub struct SwapStats {
 /// Same shape and reason as `crate::runtime_memory`'s hook table: the
 /// kernel is not generic over the address space (there is exactly one
 /// per machine, chosen at link time), and a `dyn AddressSpace` would put
-/// a vtable on the page-fault path. The backend builds one `&'static`
-/// table and installs it at boot.
+/// a vtable on the page-fault path. The backend generates one `&'static`
+/// table with [`swap_vm_hooks`] and installs it at boot.
 ///
 /// The enumeration hooks take a context pointer and a plain function
 /// rather than a closure, because a function pointer cannot be generic.
@@ -1043,10 +1051,11 @@ where
             );
             return Err(());
         };
-        // Detaching copies the page into our buffer, files the entry,
-        // hands the frame back and shoots the TLB down, all under the
-        // address space's own lock — so nothing can write the page
-        // between the copy and the unmapping.
+        // Detaching files the entry, replaces the leaf, shoots the TLB
+        // down on every processor and only then copies the page into our
+        // buffer and hands the frame back, all under the address space's
+        // own lock: a store from a processor that was still running the
+        // instance has landed in the frame before the copy, or faulted.
         if let Err(error) = (self.hooks.swap_out_page)(addr, handle, &mut self.page) {
             tracing::debug!(
                 target: "helios_kernel::swap",
@@ -1156,6 +1165,8 @@ fn current_pressure() -> PressureLevel {
 
 #[cfg(test)]
 mod service_tests;
+#[cfg(test)]
+mod space_tests;
 
 #[cfg(test)]
 mod tests {

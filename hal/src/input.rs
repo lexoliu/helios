@@ -252,7 +252,7 @@ pub struct EventTypeCodes {
 /// afterwards. The fields are private because the invariants are: an
 /// event type appears at most once, and so does an absolute axis, which
 /// is what lets a consumer trust a single lookup.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InputCapabilities {
     name: ArrayString<MAX_DEVICE_STRING_BYTES>,
     serial: ArrayString<MAX_DEVICE_STRING_BYTES>,

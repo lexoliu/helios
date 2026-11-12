@@ -1,13 +1,5 @@
 /// Virtio 9p mount tag used by backends to identify the host share device.
 pub const HOST_SHARE_MOUNT_TAG: &str = helios_hal::fs::HOST_SHARE_MOUNT_TAG;
 
+/// Where the kernel mounts the host share in every namespace.
 pub const HOST_SHARE_GUEST_MOUNT_PATH: &str = "/host";
-
-pub fn guest_host_share_path(path: &str) -> Option<&str> {
-    if path == HOST_SHARE_GUEST_MOUNT_PATH {
-        return Some("/");
-    }
-
-    path.strip_prefix("/host/")
-        .map(|suffix| if suffix.is_empty() { "/" } else { suffix })
-}

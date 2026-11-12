@@ -1,0 +1,47 @@
+{
+  "check-host": {
+    "command": "just check-host",
+    "rust-cache": true,
+    "surfaces": ["hosted", "host_tools", "programs"]
+  },
+  "test-embedded-debugger": {
+    "command": "just test-embedded-debugger",
+    "rust-cache": true,
+    "surfaces": ["hosted", "host_tools", "programs"]
+  },
+  "lint-fmt": {
+    "command": "just fmt-check && just deny-check",
+    "surfaces": ["aarch64", "riscv", "x86", "hosted", "host_tools", "programs"]
+  },
+  "lint-host": {
+    "command": "just clippy-host && just clippy-programs",
+    "rust-cache": true,
+    "surfaces": ["hosted", "host_tools", "programs"]
+  },
+  "lint-aarch64": {
+    "command": "just clippy-target aarch64-unknown-none helios-aarch64",
+    "surfaces": ["aarch64"]
+  },
+  "lint-riscv": {
+    "command": "just clippy-target riscv64gc-unknown-none-elf helios-riscv",
+    "surfaces": ["riscv"]
+  },
+  "lint-x86": {
+    "command": "just clippy-target x86_64-unknown-none helios-x86",
+    "surfaces": ["x86"]
+  },
+  "test-units": {
+    "command": "just test-units",
+    "rust-cache": true,
+    "surfaces": ["x86", "hosted", "host_tools", "programs"]
+  },
+  "smoke-riscv64": {
+    "surfaces": ["riscv", "host_tools", "programs"]
+  },
+  "smoke-aarch64": {
+    "surfaces": ["aarch64", "host_tools", "programs"]
+  },
+  "smoke-x86-64": {
+    "surfaces": ["x86", "host_tools", "programs"]
+  }
+}
