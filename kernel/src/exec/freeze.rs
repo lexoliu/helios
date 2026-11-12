@@ -47,12 +47,16 @@
 //!    processor that is polling has not published `Parked` and a wake it
 //!    is owed would otherwise be skipped;
 //! 4. awaits, with the wait armed before each test of the arrival words,
-//!    until every secondary's word equals `hold`, or until
-//!    [`FREEZE_ARRIVAL_DEADLINE`] passes. A secondary that has not
-//!    arrived by then is polling one task for longer than four time
-//!    slices, which is a defect, and the freeze fails naming the lowest
-//!    such processor: `hold` is cleared, the secondaries that did arrive
-//!    are woken, `phase` returns to `Running`, and nothing stays held;
+//!    until every secondary's word equals `hold`, or until the arrival
+//!    deadline the caller gave passes. The freeze does not decide how
+//!    long a processor may take: a wall-clock bound cannot tell a
+//!    descheduled virtual processor from a task that does not yield, and
+//!    neither can a progress counter, so the caller's policy (what it
+//!    knows of its host, and what a failed freeze costs it) sets the
+//!    bound. A secondary that has not arrived by then fails the freeze,
+//!    which names the lowest such processor: `hold` is cleared, the
+//!    secondaries that did arrive are woken, `phase` returns to
+//!    `Running`, and nothing stays held;
 //! 5. after its last await, and from there with no await until it
 //!    thaws, narrows the interrupt mask of its own processor to the wake
 //!    and shootdown IPIs ([`Cpu::mask_to_wake_only`], the mask the
@@ -140,17 +144,7 @@ use triomphe::Arc as NoWeakArc;
 
 use crate::exec::executor::{Executor, ExecutorGroup};
 use crate::exec::sync::Notify;
-use crate::exec::timer::{GUEST_TIME_SLICE, Timer};
-
-/// How long a secondary may take to reach a boundary after the freezer
-/// asks.
-///
-/// This is a cooperative-scheduling bound, not a hardware one: every task
-/// yields within a time slice, a guest is interrupted out of wasm at the
-/// end of its slice, and a processor needs a few of them to notice the
-/// request. A secondary still inside one task after four slices is a task
-/// that does not yield, and the freeze names it.
-pub const FREEZE_ARRIVAL_DEADLINE: Duration = GUEST_TIME_SLICE.saturating_mul(4);
+use crate::exec::timer::Timer;
 
 /// `hold` is held while this bit is set.
 const HELD: u8 = 1;
@@ -189,10 +183,13 @@ pub enum FreezeError {
     /// Another freeze holds the machine, or is releasing it.
     #[error("the machine is already being frozen")]
     AlreadyFreezing,
-    /// A processor was still inside one task when the arrival deadline
-    /// passed.
+    /// A processor had not reached a scheduler boundary within the
+    /// arrival deadline the caller gave. It may be inside a task that does
+    /// not yield or simply not scheduled by its host; the freeze cannot
+    /// tell the two apart, and the caller's deadline is its policy for
+    /// both.
     #[error(
-        "processor {} did not reach a scheduler boundary within {FREEZE_ARRIVAL_DEADLINE:?}",
+        "processor {} did not reach a scheduler boundary within the caller's arrival deadline",
         processor.id()
     )]
     ProcessorDidNotArrive {
@@ -403,21 +400,23 @@ impl<CpuImpl: Cpu + Clone> FrozenMachine<CpuImpl> {
 impl Executor {
     /// Freezes every processor at a scheduler boundary.
     ///
-    /// `timer` is this processor's, `interrupt_guests` asks the runtime
-    /// that runs guests to end the time slice of each guest that is
-    /// running now (it is how a processor inside wasm reaches a boundary
-    /// before its slice ends). The contract is in the module
-    /// documentation.
+    /// `timer` is this processor's, `arrival_deadline` is how long the
+    /// caller lets the other processors take to reach a boundary, and
+    /// `interrupt_guests` asks the runtime that runs guests to end the
+    /// time slice of each guest that is running now (it is how a
+    /// processor inside wasm reaches a boundary before its slice ends).
+    /// The contract is in the module documentation.
     ///
     /// # Errors
     ///
     /// [`FreezeError::AlreadyFreezing`] when another freeze holds the
     /// machine, and [`FreezeError::ProcessorDidNotArrive`] when a
-    /// processor is still inside one task after
-    /// [`FREEZE_ARRIVAL_DEADLINE`]. The machine is running in both cases.
+    /// processor has not reached a boundary within `arrival_deadline`.
+    /// The machine is running in both cases.
     pub async fn freeze<CpuImpl: Cpu + Clone>(
         &self,
         timer: &Timer<CpuImpl>,
+        arrival_deadline: Duration,
         interrupt_guests: impl FnOnce(),
     ) -> Result<FrozenMachine<CpuImpl>, FreezeError> {
         let barrier = &self.group.freeze;
@@ -459,7 +458,7 @@ impl Executor {
 
         let deadline = cpu
             .now()
-            .saturating_add(cpu.timebase().duration_to_ticks(FREEZE_ARRIVAL_DEADLINE));
+            .saturating_add(cpu.timebase().duration_to_ticks(arrival_deadline));
         let mut expiry = pin!(timer.sleep_until(deadline));
         let mut arrival = barrier.arrived.waiter();
         let arrived = poll_fn(|context| {

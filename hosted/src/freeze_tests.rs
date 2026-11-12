@@ -36,6 +36,17 @@ const PROCESSORS: usize = 4;
 /// wake-up, which would otherwise hang the test.
 const PATIENCE: Duration = Duration::from_secs(20);
 
+/// The arrival deadline of a freeze that is expected to succeed. A
+/// processor thread of this test host can be descheduled for far longer
+/// than a slice by the other test processes sharing its cores, and a
+/// deadline that fires on that would fail a freeze nothing is wrong with.
+const ARRIVAL_DEADLINE: Duration = Duration::from_secs(10);
+
+/// The arrival deadline of the freeze whose held processor never
+/// arrives at all: it only has to outlast the other processors'
+/// arrival, so the error names the held one.
+const NEVER_ARRIVES_DEADLINE: Duration = Duration::from_millis(500);
+
 type Job = Box<dyn FnOnce(&'static Kernel<HostedCpu>) + Send>;
 
 struct TestMachine {
@@ -242,7 +253,7 @@ fn a_freeze_polls_no_task_and_fires_no_timer_and_a_thaw_runs_every_queued_task()
     machine.on(0, move |kernel| {
         kernel.spawn_local_detached(async move {
             let frozen = kernel
-                .freeze(|| {})
+                .freeze(ARRIVAL_DEADLINE, || {})
                 .await
                 .expect("a machine that yields freezes");
             let fired = || -> usize {
@@ -321,11 +332,11 @@ fn a_task_that_never_yields_fails_the_freeze_naming_its_processor() {
     let outcome_release = release.clone();
     machine.on(0, move |kernel| {
         kernel.spawn_local_detached(async move {
-            let outcome = kernel.freeze(|| {}).await.map(drop);
+            let outcome = kernel.freeze(NEVER_ARRIVES_DEADLINE, || {}).await.map(drop);
             report.send(outcome).unwrap();
             // The spinner ends, and the machine freezes again.
             outcome_release.store(true, Ordering::Release);
-            let again = kernel.freeze(|| {}).await.map(drop);
+            let again = kernel.freeze(ARRIVAL_DEADLINE, || {}).await.map(drop);
             report.send(again).unwrap();
         });
     });
@@ -349,11 +360,14 @@ fn a_second_freeze_is_refused_while_the_machine_is_held() {
     let (report, reports) = bounded(1);
     machine.on(0, move |kernel| {
         kernel.spawn_local_detached(async move {
-            let first = kernel.freeze(|| {}).await.expect("the first freeze holds");
+            let first = kernel
+                .freeze(ARRIVAL_DEADLINE, || {})
+                .await
+                .expect("the first freeze holds");
             // Refused on its first poll: the task does not yield.
-            let second = kernel.freeze(|| {}).await.map(drop);
+            let second = kernel.freeze(ARRIVAL_DEADLINE, || {}).await.map(drop);
             first.thaw();
-            let third = kernel.freeze(|| {}).await.map(drop);
+            let third = kernel.freeze(ARRIVAL_DEADLINE, || {}).await.map(drop);
             report.send((second, third)).unwrap();
         });
     });
@@ -397,7 +411,7 @@ fn a_thousand_freezes_under_load_lose_no_wake() {
             let started = polls(&loop_progress);
             let mut failure = None;
             for cycle in 0..CYCLES {
-                let frozen = match kernel.freeze(|| {}).await {
+                let frozen = match kernel.freeze(ARRIVAL_DEADLINE, || {}).await {
                     Ok(frozen) => frozen,
                     Err(error) => {
                         failure = Some(format!("freeze {cycle} failed: {error}"));

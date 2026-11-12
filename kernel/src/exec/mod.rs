@@ -33,7 +33,7 @@ pub use executor::{
     Executor, ExecutorRunStats, InstanceSpawner, JoinHandle, LocalJoinHandle, READY_BATCH_TASKS,
     Spawner, TaskCapacityError, TaskFunding,
 };
-pub use freeze::{FREEZE_ARRIVAL_DEADLINE, FreezeError, FrozenMachine};
+pub use freeze::{FreezeError, FrozenMachine};
 pub use idle::IdleOutcome;
 pub use in_flight::InFlight;
 pub use observer::{
