@@ -36,13 +36,15 @@ use core::task::{Context, Poll};
 
 use futures::channel::oneshot;
 use helios_hal::display::{
-    CursorImage, DisplayMode, FramebufferId, PixelFormat, Point, Rect, ScanoutId, ScanoutList,
+    BlobId, BlobScanout, CursorImage, DisplayMode, FramebufferId, PixelFormat, Point, Rect,
+    ScanoutId, ScanoutList,
 };
 use triomphe::Arc;
 
 use crate::buffer::Buffer;
 use crate::component::{ProviderError, ProviderSender};
 use crate::exec::{Notify, NotifyWaiter};
+use crate::gpu::ScanoutHold;
 use crate::process::DisplayClaimCap;
 
 use super::DisplayServiceError;
@@ -159,6 +161,23 @@ impl SequenceSignal {
     }
 }
 
+/// What a surface's pixels are read out of.
+///
+/// Two kinds, because the display engine scans out two kinds of
+/// resource: a frame buffer the kernel created over the compositor's
+/// own pages, which a present copies into before it flushes, and a
+/// renderer's blob, which is already the device's and is only flushed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SurfaceSource {
+    Framebuffer(FramebufferId),
+    /// A blob on one scanout: one blob may be shown on several, one
+    /// surface each.
+    Blob {
+        blob: BlobId,
+        scanout: ScanoutId,
+    },
+}
+
 /// Work for the task that owns the display engine's control queue.
 ///
 /// Every variant carries the claim generation it was made under. A
@@ -186,13 +205,26 @@ pub(crate) enum ControlRequest {
         backing: Buffer,
         reply: oneshot::Sender<Result<FramebufferId, DisplayServiceError>>,
     },
+    /// Point `scanout` at a frame read straight out of a renderer's blob.
+    ///
+    /// The blob is the gpu path's, and stays its: the display owner
+    /// never destroys it. `hold` keeps the gpu path from destroying it
+    /// while the scanout shows it; the owner task's record drops the
+    /// hold only once the scanout has been blanked.
+    CreateBlobSurface {
+        generation: u64,
+        scanout: ScanoutId,
+        layout: BlobScanout,
+        hold: ScanoutHold,
+        reply: oneshot::Sender<Result<(), DisplayServiceError>>,
+    },
     DestroySurface {
         generation: u64,
-        framebuffer: FramebufferId,
+        surface: SurfaceSource,
     },
     Present {
         generation: u64,
-        framebuffer: FramebufferId,
+        surface: SurfaceSource,
         region: Rect,
         vsync: Arc<SequenceSignal>,
         reply: oneshot::Sender<Result<FrameToken, DisplayServiceError>>,
@@ -218,6 +250,7 @@ impl ControlRequest {
             Self::Scanouts { generation, .. }
             | Self::Modes { generation, .. }
             | Self::CreateSurface { generation, .. }
+            | Self::CreateBlobSurface { generation, .. }
             | Self::DestroySurface { generation, .. }
             | Self::Present { generation, .. }
             | Self::CreateCursor { generation, .. }

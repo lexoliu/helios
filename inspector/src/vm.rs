@@ -94,6 +94,8 @@ pub(crate) enum VmError {
 pub(crate) enum VmConfigError {
     #[error("--release and --kernel-debug cannot be used together")]
     ReleaseWithKernelDebug,
+    #[error("renderer_hostmem sizes a renderer's aperture, and the VM config names no renderer")]
+    RendererHostmemWithoutRenderer,
     #[error(
         "--profile-generate builds its own optimised kernel and cannot be combined with \
          --release, --debug or --kernel-debug"
@@ -783,6 +785,36 @@ pub(crate) enum VmGpuRenderer {
     Rutabaga,
 }
 
+/// A renderer a session asked for, and what the machine around it needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VmRendererConfig {
+    kind: VmGpuRenderer,
+    /// The size of the host-visible aperture a mappable blob is placed
+    /// in, in QEMU's size syntax (`256M`, `4G`): the most renderer
+    /// memory the guest can map at once.
+    hostmem: String,
+}
+
+impl VmRendererConfig {
+    /// The aperture a session gets when it names a renderer and no size.
+    /// QEMU's own `hostmem` default is zero (`DEFINE_PROP_SIZE("hostmem",
+    /// …, 0)` in `hw/display/virtio-gpu.c`), which leaves no aperture at
+    /// all, so a renderer session always names one; 256M is the low end
+    /// of the range QEMU's `docs/system/devices/virtio/virtio-gpu.rst`
+    /// gives for Venus ("typically between 256M and 8G").
+    const DEFAULT_HOSTMEM: &'static str = "256M";
+
+    /// The id of the memory backend the guest's RAM is made of.
+    ///
+    /// A guest blob reaches the host as a dmabuf QEMU builds out of the
+    /// RAM block's file descriptor (`virtio_gpu_create_udmabuf` in
+    /// `hw/display/virtio-gpu-udmabuf.c`, which gives up on a block with
+    /// none), and a blob scanout of one needs that dmabuf, so a renderer
+    /// session's RAM is a shared memfd rather than QEMU's anonymous
+    /// default.
+    const RAM_BACKEND_ID: &'static str = "helios-ram";
+}
+
 /// How a profile exposes the guest's keyboard, tablet and mouse.
 ///
 /// The three arrive together because they are one desktop's input: the
@@ -1443,6 +1475,8 @@ pub(crate) struct VmConfigFile {
     #[serde(default)]
     pub(crate) renderer: Option<VmGpuRenderer>,
     #[serde(default)]
+    pub(crate) renderer_hostmem: Option<String>,
+    #[serde(default)]
     pub(crate) audiodev: Option<String>,
     #[serde(default)]
     pub(crate) network: VmNetworkFile,
@@ -1680,6 +1714,16 @@ pub(crate) struct VmCommand {
     /// with is refused by QEMU rather than swapped for another.
     #[arg(long, value_enum)]
     renderer: Option<VmGpuRenderer>,
+
+    /// The size of the renderer's host-visible aperture, the device's
+    /// `hostmem`, in QEMU's size syntax (`256M`, `4G`); 256M when a
+    /// renderer is named without one.
+    ///
+    /// A renderer session's guest RAM is also a shared memfd backend of
+    /// `--memory` bytes, which Venus needs to import guest-memory blobs;
+    /// memfd is a Linux host facility.
+    #[arg(long, value_name = "SIZE", requires = "renderer")]
+    renderer_hostmem: Option<String>,
 
     /// Host audio backend the guest's sound device plays into:
     /// `none`, `wav:<path>`, or a backend of this host's own.
@@ -2007,7 +2051,7 @@ struct ResolvedVmCommand {
     iommu: bool,
     desktop: bool,
     display: VmDisplayBackend,
-    renderer: Option<VmGpuRenderer>,
+    renderer: Option<VmRendererConfig>,
     audiodev: VmAudioDev,
     virtio_devices: VirtioDeviceProfile,
     rpc_transport: VmRpcTransport,
@@ -2502,7 +2546,15 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
             arch: arch_label(arch),
         });
     }
-    let renderer = command.renderer.or(file.renderer);
+    let hostmem = command.renderer_hostmem.or(file.renderer_hostmem);
+    let renderer = match (command.renderer.or(file.renderer), hostmem) {
+        (Some(kind), hostmem) => Some(VmRendererConfig {
+            kind,
+            hostmem: hostmem.unwrap_or_else(|| VmRendererConfig::DEFAULT_HOSTMEM.to_owned()),
+        }),
+        (None, None) => None,
+        (None, Some(_)) => return Err(VmConfigError::RendererHostmemWithoutRenderer),
+    };
     // A named renderer is a property of the desktop's display device,
     // so asking for one is asking for the desktop it lives on.
     let desktop = command.desktop || file.desktop.unwrap_or(false) || renderer.is_some();
@@ -4992,8 +5044,11 @@ impl VmRuntime {
             Some(qemu_net) => qemu_net.command(&command.qemu_bin),
             None => Command::new(&command.qemu_bin),
         };
-        qemu.arg("-display")
-            .arg(command.display.token(command.renderer));
+        qemu.arg("-display").arg(
+            command
+                .display
+                .token(command.renderer.as_ref().map(|renderer| renderer.kind)),
+        );
         if let Some(monitor) = monitor_endpoint(command, socket_dir.path())? {
             qemu.arg("-monitor").arg(monitor);
         } else {
@@ -5002,7 +5057,7 @@ impl VmRuntime {
         if let Some(qmp) = qmp_endpoint(command, socket_dir.path())? {
             qemu.arg("-qmp").arg(qmp);
         }
-        qemu.arg("-machine").arg(machine(command));
+        configure_machine(&mut qemu, command);
         for accel in &command.accel {
             qemu.arg("-accel").arg(accel);
         }
@@ -5155,11 +5210,12 @@ impl VmRuntime {
         configure_entropy_device(&mut qemu, command.profile.entropy, command.virtio_devices);
         configure_balloon(&mut qemu, command.profile.balloon, command.virtio_devices);
         if command.desktop {
-            let display = match command.renderer {
-                Some(renderer) => command.profile.display.with_renderer(renderer),
-                None => command.profile.display,
-            };
-            configure_display(&mut qemu, display, command.virtio_devices);
+            configure_display(
+                &mut qemu,
+                command.profile.display,
+                command.renderer.as_ref(),
+                command.virtio_devices,
+            );
             configure_input(&mut qemu, command.profile.input, command.virtio_devices);
         }
         configure_sound(
@@ -5722,6 +5778,24 @@ fn configure_entropy_device(
 /// endpoints carry.
 /// The `-machine` option list this session boots, which is the ACPI
 /// variant only when `--acpi` asked for it and the profile has one.
+/// The machine and its RAM: a renderer session's RAM is a shared memfd
+/// backend of the session's memory size, for the reason
+/// [`VmRendererConfig::RAM_BACKEND_ID`] gives; every other session keeps
+/// QEMU's default RAM.
+fn configure_machine(qemu: &mut Command, command: &ResolvedVmCommand) {
+    let mut machine = QemuOptions::new(machine(command));
+    if command.renderer.is_some() {
+        let mut backend = QemuOptions::new("memory-backend-memfd");
+        backend
+            .set("id", VmRendererConfig::RAM_BACKEND_ID)
+            .set("size", &command.memory)
+            .set("share", "on");
+        qemu.arg("-object").arg(backend.to_string());
+        machine.set("memory-backend", VmRendererConfig::RAM_BACKEND_ID);
+    }
+    qemu.arg("-machine").arg(machine.to_string());
+}
+
 fn machine(command: &ResolvedVmCommand) -> &'static str {
     if command.acpi {
         return command.profile.acpi_machine.unwrap_or_else(|| {
@@ -5817,7 +5891,16 @@ fn configure_vsock_device(
 /// then be that adapter's rather than the guest's. A capture of a
 /// display device the guest never drove is worse than no capture: it
 /// looks exactly like one the guest failed to draw into.
-fn configure_display(qemu: &mut Command, display: VmDisplayProfile, queues: VirtioDeviceProfile) {
+fn configure_display(
+    qemu: &mut Command,
+    display: VmDisplayProfile,
+    renderer: Option<&VmRendererConfig>,
+    queues: VirtioDeviceProfile,
+) {
+    let display = match renderer {
+        Some(renderer) => display.with_renderer(renderer.kind),
+        None => display,
+    };
     if display.is_pci() {
         qemu.arg("-vga").arg("none");
     }
@@ -5829,22 +5912,17 @@ fn configure_display(qemu: &mut Command, display: VmDisplayProfile, queues: Virt
         VmDisplayProfile::RutabagaMmio => "virtio-gpu-rutabaga-device",
         VmDisplayProfile::RutabagaPci => "virtio-gpu-rutabaga-pci",
     });
-    match display {
-        VmDisplayProfile::Mmio | VmDisplayProfile::Pci => {}
-        VmDisplayProfile::GlMmio | VmDisplayProfile::GlPci => {
-            // Venus through virglrenderer; blob resources are what the
-            // renderer's own memory moves through, and `hostmem` is the
-            // aperture a host-visible blob is placed into.
-            device.set("venus", "on");
-            device.set("blob", "on");
-            device.set("hostmem", "256M");
-        }
-        VmDisplayProfile::RutabagaMmio | VmDisplayProfile::RutabagaPci => {
-            device.set("venus", "on");
+    if let Some(renderer) = renderer {
+        // Venus on either renderer, and gfxstream beside it on
+        // rutabaga; blob resources are what the renderer's own memory
+        // moves through, and `hostmem` is the aperture a host-visible
+        // blob is placed into.
+        device.set("venus", "on");
+        if renderer.kind == VmGpuRenderer::Rutabaga {
             device.set("gfxstream-vulkan", "on");
-            device.set("blob", "on");
-            device.set("hostmem", "256M");
         }
+        device.set("blob", "on");
+        device.set("hostmem", &renderer.hostmem);
     }
     apply_transport(display.is_pci(), queues, &mut device);
     qemu.arg("-device").arg(device.to_string());
@@ -6147,6 +6225,7 @@ mod tests {
             rendered(|qemu| configure_display(
                 qemu,
                 VmDisplayProfile::Mmio,
+                None,
                 VirtioDeviceProfile::default()
             )),
             ["-device", "virtio-gpu-device"]
@@ -6155,10 +6234,18 @@ mod tests {
             rendered(|qemu| configure_display(
                 qemu,
                 VmDisplayProfile::Pci,
+                None,
                 VirtioDeviceProfile::default()
             )),
             ["-vga", "none", "-device", "virtio-gpu-pci"]
         );
+    }
+
+    fn renderer(kind: VmGpuRenderer, hostmem: &str) -> VmRendererConfig {
+        VmRendererConfig {
+            kind,
+            hostmem: hostmem.to_owned(),
+        }
     }
 
     /// A renderer the session asked for changes which device the
@@ -6170,18 +6257,23 @@ mod tests {
         assert_eq!(
             rendered(|qemu| configure_display(
                 qemu,
-                VmDisplayProfile::GlMmio,
+                VmDisplayProfile::Mmio,
+                Some(&renderer(VmGpuRenderer::Gl, "4G")),
                 VirtioDeviceProfile::default()
             )),
             [
                 "-device",
-                "virtio-gpu-gl-device,venus=on,blob=on,hostmem=256M"
+                "virtio-gpu-gl-device,venus=on,blob=on,hostmem=4G"
             ]
         );
         assert_eq!(
             rendered(|qemu| configure_display(
                 qemu,
-                VmDisplayProfile::RutabagaPci,
+                VmDisplayProfile::Pci,
+                Some(&renderer(
+                    VmGpuRenderer::Rutabaga,
+                    VmRendererConfig::DEFAULT_HOSTMEM
+                )),
                 VirtioDeviceProfile::default()
             )),
             [
@@ -7552,6 +7644,7 @@ mod tests {
             desktop: false,
             display: None,
             renderer: None,
+            renderer_hostmem: None,
             audiodev: None,
             network: default_network_args(),
             command: None,
@@ -7613,6 +7706,7 @@ mod tests {
             desktop: false,
             display: None,
             renderer: None,
+            renderer_hostmem: None,
             audiodev: None,
             network: default_network_args(),
             command: None,
@@ -7638,6 +7732,82 @@ mod tests {
     /// virtio-iommu can only confine PCI endpoints, so asking for it on
     /// a machine whose virtio devices are memory-mapped is refused
     /// rather than quietly ignored.
+    /// A renderer session's aperture is the size it named, or the
+    /// default when it named none; a size with no renderer to give it
+    /// to is refused rather than dropped.
+    #[test]
+    fn a_renderer_s_aperture_is_sized_only_for_a_renderer() {
+        let tempdir =
+            tempfile::tempdir().expect("temporary directory for VM config resolution must exist");
+        let config = tempdir.path().join("missing-vm.json");
+
+        let error = resolve(VmCommand {
+            renderer_hostmem: Some("1G".to_owned()),
+            config: Some(config.clone()),
+            ..minimal_command()
+        })
+        .expect_err("an aperture without a renderer sizes nothing");
+        assert!(matches!(
+            error,
+            VmConfigError::RendererHostmemWithoutRenderer
+        ));
+
+        let resolved = resolve(VmCommand {
+            renderer: Some(VmGpuRenderer::Gl),
+            config: Some(config.clone()),
+            ..minimal_command()
+        })
+        .expect("a renderer resolves");
+        assert_eq!(
+            resolved.renderer,
+            Some(VmRendererConfig {
+                kind: VmGpuRenderer::Gl,
+                hostmem: VmRendererConfig::DEFAULT_HOSTMEM.to_owned(),
+            })
+        );
+        assert!(resolved.desktop, "a renderer lives on the desktop's GPU");
+
+        let resolved = resolve(VmCommand {
+            renderer: Some(VmGpuRenderer::Gl),
+            renderer_hostmem: Some("4G".to_owned()),
+            config: Some(config),
+            ..minimal_command()
+        })
+        .expect("a sized renderer resolves");
+        assert_eq!(
+            resolved.renderer.map(|renderer| renderer.hostmem),
+            Some("4G".to_owned())
+        );
+    }
+
+    /// A renderer session's RAM is a shared memfd of the session's own
+    /// size, named as the machine's memory backend; any other session's
+    /// machine is the profile's alone.
+    #[test]
+    fn a_renderer_session_s_ram_is_a_shared_memfd() {
+        let mut command = watchdog_test_command(VmArch::X86_64);
+        let plain = rendered(|qemu| configure_machine(qemu, &command));
+        assert_eq!(plain, ["-machine", machine(&command)]);
+
+        command.renderer = Some(VmRendererConfig {
+            kind: VmGpuRenderer::Gl,
+            hostmem: VmRendererConfig::DEFAULT_HOSTMEM.to_owned(),
+        });
+        let backed = rendered(|qemu| configure_machine(qemu, &command));
+        assert_eq!(
+            backed,
+            [
+                "-object".to_owned(),
+                format!(
+                    "memory-backend-memfd,id=helios-ram,size={},share=on",
+                    command.memory
+                ),
+                "-machine".to_owned(),
+                format!("{},memory-backend=helios-ram", machine(&command)),
+            ]
+        );
+    }
+
     #[test]
     fn a_writable_share_needs_a_directory_to_export() {
         let tempdir =
@@ -7785,6 +7955,7 @@ mod tests {
             desktop: false,
             display: None,
             renderer: None,
+            renderer_hostmem: None,
             audiodev: None,
             network: default_network_args(),
             command: None,

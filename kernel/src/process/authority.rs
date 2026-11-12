@@ -149,7 +149,7 @@ macro_rules! typed_device_class_cap {
 
 typed_device_class_cap!(DisplayClaimCap, DeviceClassRights::DISPLAY);
 typed_device_class_cap!(InputClaimCap, DeviceClassRights::INPUT);
-typed_device_class_cap!(GpuClaimCap, DeviceClassRights::GPU);
+typed_device_class_cap!(GpuOpenCap, DeviceClassRights::GPU);
 typed_device_class_cap!(AudioClaimCap, DeviceClassRights::AUDIO);
 
 /// Proof that the instance was granted one named device. The name is
@@ -742,9 +742,9 @@ impl ProcessAuthority {
             .map(InputClaimCap)
     }
 
-    pub fn derive_gpu_claim_cap(&self) -> Result<GpuClaimCap, ProcessAuthorityError> {
-        self.derive_device_class_rights(GpuClaimCap::required_rights())
-            .map(GpuClaimCap)
+    pub fn derive_gpu_open_cap(&self) -> Result<GpuOpenCap, ProcessAuthorityError> {
+        self.derive_device_class_rights(GpuOpenCap::required_rights())
+            .map(GpuOpenCap)
     }
 
     pub fn derive_audio_claim_cap(&self) -> Result<AudioClaimCap, ProcessAuthorityError> {
@@ -816,7 +816,7 @@ impl ProcessAuthority {
 #[cfg(test)]
 pub(crate) mod test_caps {
     use super::{
-        AudioClaimCap, DeviceClassRights, DeviceGrantClaimCap, DisplayClaimCap, GpuClaimCap,
+        AudioClaimCap, DeviceClassRights, DeviceGrantClaimCap, DisplayClaimCap, GpuOpenCap,
         InputClaimCap, ProcessAuthority,
     };
     use crate::device::DeviceName;
@@ -839,9 +839,9 @@ pub(crate) mod test_caps {
             .expect("the authority holds the input class")
     }
 
-    pub(crate) fn gpu() -> GpuClaimCap {
+    pub(crate) fn gpu() -> GpuOpenCap {
         holding(DeviceClassRights::GPU)
-            .derive_gpu_claim_cap()
+            .derive_gpu_open_cap()
             .expect("the authority holds the GPU class")
     }
 
@@ -1248,7 +1248,7 @@ mod tests {
         assert!(parent.derive_display_claim_cap().is_ok());
         assert!(parent.derive_input_claim_cap().is_ok());
         assert!(matches!(
-            parent.derive_gpu_claim_cap(),
+            parent.derive_gpu_open_cap(),
             Err(ProcessAuthorityError::DeviceClassGrantExceedsAuthority(_))
         ));
         assert!(matches!(
@@ -1312,7 +1312,7 @@ mod tests {
         assert!(root.granted_devices().is_empty());
         assert!(root.derive_display_claim_cap().is_err());
         assert!(root.derive_input_claim_cap().is_err());
-        assert!(root.derive_gpu_claim_cap().is_err());
+        assert!(root.derive_gpu_open_cap().is_err());
         assert!(root.derive_audio_claim_cap().is_err());
     }
 }

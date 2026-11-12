@@ -583,7 +583,7 @@ mod tests {
 
         assert!(authority.derive_display_claim_cap().is_ok());
         assert!(authority.derive_input_claim_cap().is_ok());
-        assert!(authority.derive_gpu_claim_cap().is_err());
+        assert!(authority.derive_gpu_open_cap().is_err());
         assert!(authority.derive_audio_claim_cap().is_err());
         assert!(authority.granted_devices().is_empty());
         assert!(

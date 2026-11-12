@@ -183,6 +183,9 @@ fn x86_kernel_main() -> ! {
     smp::install_bootstrap_anchor();
     // The one place COM1 is configured; see `serial_uart_init`.
     serial_uart_init();
+    // Before anything can map device memory write-combined; every
+    // secondary processor programs the same table on its own way in.
+    memory_type::program_page_attribute_table();
     let xcr0 = extended_state::enable_on_bootstrap_processor();
     assert!(
         boot::base_revision_supported(),
@@ -1024,6 +1027,9 @@ extern "C" fn secondary_start_rust(
     // configured it before it woke anyone, and configuring it again is
     // destructive rather than idempotent. See `serial_uart_init`.
     extended_state::enable_on_secondary_processor(boot.xcr0());
+    // The same page-attribute table the bootstrap processor runs with,
+    // before this processor can touch a write-combined mapping.
+    memory_type::program_page_attribute_table();
     let runtime = unsafe { &*runtime };
     smp::activate_runtime(runtime);
     smp::current_runtime().attach_local_apic();
