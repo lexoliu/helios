@@ -77,12 +77,19 @@ impl<W: RegisterWindow, C: Clock> Tis<W, C> {
         Ok(seen)
     }
 
-    async fn burst(&mut self, also: u32, state: &'static str) -> Result<usize, TransportError> {
+    /// Waits for a non-zero burst count while every bit of `with` is set.
+    ///
+    /// `burstCount` stands on its own: `stsValid` qualifies `dataAvail`
+    /// and `Expect`, not the count, and a TPM that has just reached
+    /// `commandReady` reports a count with `stsValid` clear (QEMU
+    /// `tpm_tis_common.c`, the idle-to-ready transition; Linux's
+    /// `get_burstcount` reads the count alone).
+    async fn burst(&mut self, with: u32, state: &'static str) -> Result<usize, TransportError> {
         let mut burst = 0;
         wait_until(&mut self.window, &self.clock, state, TIMEOUT_D, |window| {
             let status = window.read_u32(STS);
             burst = burst_count(status);
-            status & (STS_VALID | also) == STS_VALID | also && burst != 0
+            status & with == with && burst != 0
         })
         .await?;
         Ok(burst)
@@ -129,7 +136,10 @@ impl<W: RegisterWindow, C: Clock> Tis<W, C> {
         let mut read = 0;
         while read < into.len() {
             let burst = self
-                .burst(STS_DATA_AVAIL, "TPM_STS.dataAvail with a burst count")
+                .burst(
+                    STS_VALID | STS_DATA_AVAIL,
+                    "TPM_STS.dataAvail with a burst count",
+                )
                 .await?;
             let end = into.len().min(read + burst);
             for byte in &mut into[read..end] {

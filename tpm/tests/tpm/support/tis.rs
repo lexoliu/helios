@@ -120,9 +120,12 @@ impl<K: Core> TisModel<K> {
                 self.not_ready_reads += 1;
                 STS_VALID
             }
+            // As QEMU's `tpm_tis_common.c` leaves the register on the
+            // idle-to-ready transition: `commandReady` and a burst count,
+            // `stsValid` clear until the first byte arrives.
             State::Ready => {
                 self.burst_left = self.burst;
-                STS_VALID | STS_COMMAND_READY | ((self.burst as u32) << 8)
+                STS_COMMAND_READY | ((self.burst as u32) << 8)
             }
             State::Reception => {
                 self.burst_left = self.burst;
