@@ -8,7 +8,10 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # A pull request's newer push supersedes its older run. A `dev` push
+  # runs to completion: merges land faster than a run finishes, and a
+  # completed `dev` run is the only writer of the host lanes' caches.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
