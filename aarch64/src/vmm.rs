@@ -1117,11 +1117,23 @@ impl AddressSpace for Aarch64UserAddressSpace {
         validate_range(virt)?;
         let mut state = self.state.lock();
         let removed = state.record_decommit(virt)?;
+        // The unmap pass skips every page that has no pool frame to give
+        // back: a substituted part, whose frames are not the pool's, and a
+        // swapped page, whose leaf `discard` clears. An invalid leaf
+        // anywhere else is still refused.
+        let mut frameless = removed.substituted.clone();
+        frameless.extend(
+            removed
+                .swapped
+                .iter()
+                .map(|entry| VirtRange::new(entry.addr, PAGE)),
+        );
+        frameless.sort_by_key(|part| part.start.raw());
         self.swap.discard(self, removed.swapped);
         // A substitution inside the range is dropped without freeing the
         // run's frames, as a withdraw would.
         self.drop_substituted_parts(&removed.substituted);
-        self.decommit_mapped_outside(virt, &removed.substituted)?;
+        self.decommit_mapped_outside(virt, &frameless)?;
         Ok(())
     }
 
