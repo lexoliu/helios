@@ -48,6 +48,7 @@ pub(crate) fn has_balloon_device(fdt: &Fdt<'_>) -> bool {
 pub(crate) fn install<WatchdogImpl>(
     kernel: &helios_kernel::Kernel<crate::RiscvCpu, WatchdogImpl>,
     fdt: &Fdt<'_>,
+    generation: helios_kernel::MachineGenerationHandle,
 ) -> Option<BalloonInterrupt>
 where
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
@@ -70,7 +71,7 @@ where
             panic!("failed to initialize virtio-balloon device at {base:#x}: {error}")
         });
     let device = Arc::new(device);
-    let handle = helios_kernel::install_memory_balloon(kernel, device.clone());
+    let handle = helios_kernel::install_memory_balloon(kernel, device.clone(), generation);
     tracing::info!("virtio balloon online irq={}", source.0.get());
     Some(BalloonInterrupt {
         source,

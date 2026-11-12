@@ -225,6 +225,14 @@ interface programs {
     instance-id: instance-id,
     exit-code: u32,
     output: exec-output,
+    /// The launch's own duration in nanoseconds on the kernel's
+    /// monotonic clock: from the `exec` call's arrival in the kernel
+    /// to its result being in hand (the child exited and both output
+    /// pipes drained), the interval the launch-phase timeline brackets
+    /// from `rpc-arrival` to `reply`. Nothing outside the guest is
+    /// inside it, so a caller across a transport reads the launch
+    /// without the transport.
+    launch-nanos: u64,
   }
 
   record exit-status {

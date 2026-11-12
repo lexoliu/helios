@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::fs::File;
 use std::io;
+use std::num::NonZeroUsize;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::symlink;
 use std::os::unix::process::CommandExt as _;
@@ -181,6 +182,14 @@ pub(crate) enum VmConfigError {
     SharedDirMissing { path: String },
     #[error("aarch64-virt-hvf requires an aarch64 host; pass --accel tcg explicitly for TCG")]
     HvfNeedsAarch64Host,
+    #[error(
+        "--guest-ram prealloc populates guest RAM with one thread per host processor, and the \
+         host's available parallelism could not be read: {source}"
+    )]
+    PreallocThreads {
+        #[source]
+        source: io::Error,
+    },
     #[error("{0}")]
     WorkspaceRoot(#[from] WorkspaceRootError),
 }
@@ -1263,6 +1272,84 @@ enum VmIommuProfile {
     VirtioIommuPci,
 }
 
+/// How the host backs the guest's RAM — `--guest-ram`.
+///
+/// QEMU maps guest RAM lazily, so the guest's first store to each page
+/// takes a host page fault, and only a guest booted that way pays it.
+/// The Fedora baseline the benchmarks compare against boots with its RAM
+/// preallocated (`guest_ram_backend` in
+/// `tools/wasi-apps/fedora_qemu_baseline.py`), and a comparison between a
+/// guest that faults its memory in and one that does not measures the
+/// host's fault path as much as either kernel (#491).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum VmGuestRam {
+    /// QEMU's own default: anonymous memory mapped on first touch.
+    #[default]
+    Lazy,
+    /// A `memory-backend-ram` populated before the first guest
+    /// instruction, wired as the machine's memory backend.
+    Prealloc,
+}
+
+/// The `-object` id of the preallocated RAM backend, which the machine
+/// names as its memory backend. It is the id the Fedora baseline gives
+/// its own (`GUEST_RAM_ID` in `tools/wasi-apps/fedora_qemu_baseline.py`),
+/// so the two guests' backends render alike.
+const GUEST_RAM_ID: &str = "guest-ram";
+
+/// The guest RAM backing a session boots with, resolved against the
+/// host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "backing", rename_all = "kebab-case")]
+pub(crate) enum ResolvedGuestRam {
+    Lazy,
+    Prealloc {
+        /// The threads QEMU populates the range with: one per host
+        /// processor this process may run on, the rule the Fedora
+        /// baseline applies with `os.cpu_count()`.
+        prealloc_threads: NonZeroUsize,
+    },
+}
+
+impl ResolvedGuestRam {
+    fn resolve(guest_ram: VmGuestRam) -> Result<Self, VmConfigError> {
+        match guest_ram {
+            VmGuestRam::Lazy => Ok(Self::Lazy),
+            VmGuestRam::Prealloc => std::thread::available_parallelism()
+                .map(|prealloc_threads| Self::Prealloc { prealloc_threads })
+                .map_err(|source| VmConfigError::PreallocThreads { source }),
+        }
+    }
+
+    /// The id of the `-object` the machine takes as its memory backend,
+    /// when the backing is not QEMU's default.
+    fn backend_id(self) -> Option<&'static str> {
+        match self {
+            Self::Lazy => None,
+            Self::Prealloc { .. } => Some(GUEST_RAM_ID),
+        }
+    }
+
+    /// The `-object` that backs guest RAM, when the backing is not
+    /// QEMU's default; `memory` is the `-m` size, which QEMU requires the
+    /// backend to match.
+    fn backend(self, memory: &str) -> Option<QemuOptions> {
+        match self {
+            Self::Lazy => None,
+            Self::Prealloc { prealloc_threads } => {
+                let mut backend = QemuOptions::new("memory-backend-ram");
+                backend
+                    .set("id", GUEST_RAM_ID)
+                    .set("size", memory)
+                    .set("prealloc", "on")
+                    .set("prealloc-threads", prealloc_threads);
+                Some(backend)
+            }
+        }
+    }
+}
+
 /// The host display backend QEMU opens for the session.
 ///
 /// `none` is the default and what every existing lane boots: the
@@ -1415,6 +1502,8 @@ pub(crate) struct VmConfigFile {
     #[serde(default)]
     pub(crate) memory: Option<String>,
     #[serde(default)]
+    pub(crate) guest_ram: Option<VmGuestRam>,
+    #[serde(default)]
     pub(crate) bios: Option<String>,
     #[serde(default)]
     pub(crate) baud: Option<u32>,
@@ -1561,6 +1650,13 @@ pub(crate) struct VmCommand {
 
     #[arg(long)]
     memory: Option<String>,
+
+    /// How the host backs guest RAM: `lazy`, QEMU's default, faults
+    /// each page in on the guest's first store to it; `prealloc` makes
+    /// it a `memory-backend-ram` populated before the guest runs, the
+    /// backing the Fedora benchmark baseline boots with.
+    #[arg(long, value_enum)]
+    guest_ram: Option<VmGuestRam>,
 
     #[arg(long)]
     bios: Option<String>,
@@ -2019,6 +2115,7 @@ struct ResolvedVmCommand {
     no_build: bool,
     smp: u16,
     memory: String,
+    guest_ram: ResolvedGuestRam,
     bios: Option<String>,
     baud: u32,
     cpu: Option<String>,
@@ -2450,6 +2547,8 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
         .memory
         .or(file.memory)
         .unwrap_or_else(|| profile.default_memory.to_owned());
+    let guest_ram =
+        ResolvedGuestRam::resolve(command.guest_ram.or(file.guest_ram).unwrap_or_default())?;
     let bios = command
         .bios
         .or(file.bios)
@@ -2585,6 +2684,7 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
         no_build: command.no_build,
         smp,
         memory,
+        guest_ram,
         bios,
         baud,
         cpu,
@@ -3163,6 +3263,7 @@ fn connect_and_run(
                 release: command.build.kind.optimised(),
                 smp: command.smp,
                 memory: command.memory.clone(),
+                guest_ram: command.guest_ram,
                 cpu: command.cpu.clone(),
                 accel: command.accel.clone(),
                 rpc_transport: command.rpc_transport,
@@ -5072,11 +5173,15 @@ impl VmRuntime {
         if let Some(qmp) = qmp_endpoint(command, socket_dir.path())? {
             qemu.arg("-qmp").arg(qmp);
         }
-        qemu.arg("-machine").arg(machine(command));
+        qemu.arg("-machine")
+            .arg(machine_options(command).to_string());
         for accel in &command.accel {
             qemu.arg("-accel").arg(accel);
         }
         qemu.arg("-m").arg(&command.memory);
+        if let Some(backend) = command.guest_ram.backend(&command.memory) {
+            qemu.arg("-object").arg(backend.to_string());
+        }
         qemu.arg("-smp").arg(command.smp.to_string());
         if command.serial_stdio {
             qemu.arg("-serial").arg("stdio");
@@ -5853,6 +5958,17 @@ fn machine(command: &ResolvedVmCommand) -> &'static str {
         });
     }
     command.profile.machine
+}
+
+/// The `-machine` argument: the profile's machine, naming the guest RAM
+/// backend as its memory when `--guest-ram` asked for one, as the Fedora
+/// baseline wires its own.
+fn machine_options(command: &ResolvedVmCommand) -> QemuOptions {
+    let mut options = QemuOptions::new(machine(command));
+    if let Some(id) = command.guest_ram.backend_id() {
+        options.set("memory-backend", id);
+    }
+    options
 }
 
 fn configure_iommu(
@@ -7691,6 +7807,7 @@ mod tests {
             no_build: true,
             smp: None,
             memory: None,
+            guest_ram: None,
             bios: None,
             baud: DEFAULT_BAUD,
             cpu: None,
@@ -7753,6 +7870,7 @@ mod tests {
             no_build: true,
             smp: None,
             memory: None,
+            guest_ram: None,
             bios: None,
             baud: DEFAULT_BAUD,
             cpu: None,
@@ -7809,6 +7927,64 @@ mod tests {
     /// virtio-iommu can only confine PCI endpoints, so asking for it on
     /// a machine whose virtio devices are memory-mapped is refused
     /// rather than quietly ignored.
+    /// `--guest-ram prealloc` backs guest RAM exactly as the Fedora
+    /// baseline does: a `memory-backend-ram` the size of `-m`,
+    /// populated by one thread per host processor, named by the machine
+    /// as its memory backend (#491).
+    #[test]
+    fn preallocated_guest_ram_is_the_machines_memory_backend() {
+        let tempdir =
+            tempfile::tempdir().expect("temporary directory for VM config resolution must exist");
+        let config = tempdir.path().join("missing-vm.json");
+
+        let lazy = resolve(VmCommand {
+            config: Some(config.clone()),
+            ..minimal_command()
+        })
+        .expect("a default session resolves");
+        assert_eq!(lazy.guest_ram, ResolvedGuestRam::Lazy);
+        assert_eq!(
+            machine_options(&lazy).to_string(),
+            X86_64_VM_PROFILE.machine
+        );
+        assert_eq!(lazy.guest_ram.backend(&lazy.memory), None);
+
+        let resolved = resolve(VmCommand {
+            config: Some(config),
+            memory: Some("2G".to_owned()),
+            guest_ram: Some(VmGuestRam::Prealloc),
+            ..minimal_command()
+        })
+        .expect("a preallocated session resolves");
+        let threads = std::thread::available_parallelism()
+            .expect("the test host reports its parallelism")
+            .get();
+        assert_eq!(
+            resolved.guest_ram,
+            ResolvedGuestRam::Prealloc {
+                prealloc_threads: NonZeroUsize::new(threads).expect("parallelism is non-zero"),
+            }
+        );
+        assert_eq!(
+            machine_options(&resolved).to_string(),
+            "q35,memory-backend=guest-ram"
+        );
+        assert_eq!(
+            resolved
+                .guest_ram
+                .backend(&resolved.memory)
+                .expect("a preallocated session has a backend")
+                .to_string(),
+            format!(
+                "memory-backend-ram,id=guest-ram,size=2G,prealloc=on,prealloc-threads={threads}"
+            )
+        );
+        assert_eq!(
+            serde_json::to_value(resolved.guest_ram).expect("the backing serialises"),
+            serde_json::json!({"backing": "prealloc", "prealloc_threads": threads})
+        );
+    }
+
     #[test]
     fn a_writable_share_needs_a_directory_to_export() {
         let tempdir =
@@ -7926,6 +8102,7 @@ mod tests {
             no_build: true,
             smp: None,
             memory: None,
+            guest_ram: None,
             bios: None,
             baud: DEFAULT_BAUD,
             cpu: None,
@@ -8065,6 +8242,7 @@ mod tests {
             no_build: true,
             smp: profile.default_smp,
             memory: profile.default_memory.to_owned(),
+            guest_ram: ResolvedGuestRam::Lazy,
             bios: profile.default_bios.map(str::to_owned),
             baud: DEFAULT_BAUD,
             cpu: profile.default_cpu.map(str::to_owned),
@@ -8278,6 +8456,7 @@ mod tests {
             no_build: true,
             smp: profile.default_smp,
             memory: profile.default_memory.to_owned(),
+            guest_ram: ResolvedGuestRam::Lazy,
             bios: profile.default_bios.map(str::to_owned),
             baud: DEFAULT_BAUD,
             cpu: profile.default_cpu.map(str::to_owned),

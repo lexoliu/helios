@@ -193,6 +193,13 @@ impl PhysFrameAllocator for KernelPhysFrameAllocator {
         });
     }
 
+    fn deallocate_reported(&self, range: PhysFrameRange) {
+        // Marked while the run is still the caller's, so an allocation
+        // on another processor that is handed it finds the mark.
+        self.reported.mark(range);
+        self.deallocate(range);
+    }
+
     fn stats(&self) -> FrameAllocStats {
         let (total, used) = self.heap.with(|heap| {
             let cached = self.slab.cached_bytes();
