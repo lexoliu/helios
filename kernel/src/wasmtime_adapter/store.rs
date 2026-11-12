@@ -9,8 +9,8 @@ extern crate alloc;
 use alloc::boxed::Box;
 
 use helios_hal::cpu::Cpu;
-use wasmtime::ResourceLimiter;
 use wasmtime::component::ResourceTable;
+use wasmtime::{ResourceLimiter, Trap};
 use wasmtime_wasi_io::IoView;
 use wasmtime_wasi_io::bytes::Bytes;
 use wasmtime_wasi_io::poll::Pollable;
@@ -20,9 +20,64 @@ use crate::io::{ByteReader, ByteWriter};
 use crate::wasmtime_adapter::component_host::{StoreData, deliver_kill};
 use crate::{
     ComponentHostNetwork, ComponentRuntimeState, ComponentStoreData, HostFileSystem,
-    KernelHeapHeadroom, MemoryPool, OomKillOutcome, ProgramOutOfMemory,
+    KernelHeapHeadroom, MemoryPool, OomKillOutcome, ProgramOutOfMemory, StackReserveError,
     allow_instance_resource_growth, heap_stats, monotonic_nanos, user_heap_stats,
 };
+
+/// What the runtime's stack-reserve callback answers for the kernel's
+/// commit of the stack below a guest stack pointer.
+///
+/// A commit is the runtime asking for memory, so a refusal takes the
+/// path a refused grow takes. A pool that cannot back the reserve asks the
+/// OOM killer to cover the bytes it could not give (`condemn`, called with
+/// that shortfall) and ends the guest's call with the typed
+/// [`ProgramOutOfMemory`], which the program service classifies as running
+/// out of memory. The guest unwinds from the libcall that asked, in
+/// ordinary context, never from a fault. A stack with no room left for the
+/// reserve is a stack overflow, the trap a guest that recurses past its
+/// stack takes.
+pub(crate) fn answer_stack_reserve(
+    committed: Result<usize, StackReserveError>,
+    condemn: impl FnOnce(usize),
+) -> wasmtime::Result<usize> {
+    match committed {
+        Ok(limit) => Ok(limit),
+        Err(StackReserveError::Overflow { .. }) => Err(Trap::StackOverflow.into()),
+        Err(StackReserveError::OutOfMemory(shortfall)) => {
+            condemn(shortfall.requested_bytes);
+            Err(shortfall.into())
+        }
+    }
+}
+
+/// Installs the stack-reserve callback on a store whose guest runs on a
+/// fiber stack of the arena.
+///
+/// A machine with a fiber-stack arena commits each fiber's stack ahead of
+/// the guest: the runtime calls back from a guest stack-limit check that
+/// falls below the stack's reserve limit and at a guest entry, so host
+/// code never meets an uncommitted stack page. Only a backend with the
+/// arena has one (the hosted build runs guests on ordinary thread
+/// stacks), and a store there gets no callback.
+///
+/// `condemn` is given the store's data and the bytes the user pool could
+/// not back. A store with an OOM-kill route asks the killer to cover
+/// them; one without leaves the guest's own typed failure, which ends it
+/// and returns its memory to the pool, as the whole answer.
+pub(crate) fn install_stack_reserve<T: 'static>(
+    store: &mut wasmtime::Store<T>,
+    condemn: impl Fn(&T, usize) + Send + Sync + 'static,
+) {
+    if !crate::memory::fiber_stack_arena_installed() {
+        return;
+    }
+    store.stack_reserve_callback(move |caller, sp| {
+        answer_stack_reserve(
+            crate::memory::commit_fiber_stack_reserve(sp),
+            |requested_bytes| condemn(caller.data(), requested_bytes),
+        )
+    });
+}
 
 impl<CpuImpl, Net, HostFs> ResourceLimiter for StoreData<CpuImpl, Net, HostFs>
 where
@@ -151,7 +206,7 @@ where
     /// post-mortem analysis can trace which instance was sacrificed for
     /// which grow request, and which requests were absorbed by a kill
     /// that had already happened.
-    fn request_oom_kill_for_growth(&self, pool: MemoryPool, requested_bytes: usize) {
+    pub(crate) fn request_oom_kill_for_growth(&self, pool: MemoryPool, requested_bytes: usize) {
         // VIRTIO_BALLOON_F_DEFLATE_ON_OOM: memory the host is holding is
         // reclaimed before memory a program is using. The balloon task
         // does the deflating, so this only asks; the requester still

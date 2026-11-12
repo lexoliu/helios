@@ -62,6 +62,29 @@ pub fn cwasm_target_guest_stack_limit_offset(target: &str) -> Option<i32> {
     (os == Some("none")).then_some(GUEST_STACK_LIMIT_OFFSET)
 }
 
+/// The frame size above which compiled code checks the stack in the
+/// function's prologue, before the frame is allocated.
+///
+/// The stack-limit checks the kernel's guests make otherwise run after the
+/// prologue has allocated and probed the frame, so a frame much larger than
+/// what the kernel has committed past the limit touches memory it has not
+/// committed. A function whose frame (fixed frame, clobber saves, outgoing
+/// arguments and frame setup area) exceeds this threshold compares the
+/// lowest address of its frame with the limit first, and the kernel commits
+/// the stack below it before any byte of the frame is written. A smaller
+/// frame is covered by the host reserve the kernel keeps committed under
+/// every checked stack pointer (`FIBER_STACK_HOST_RESERVE`), which is
+/// sized with this number in it: the reserve less this threshold is what
+/// host code called from a guest function may use.
+///
+/// 16 KiB is the size chosen in helios#535: a smaller one puts the prologue
+/// check on more functions, a larger one needs a larger reserve. The
+/// compiler and the kernel engine both set it, and Wasmtime refuses a
+/// `cwasm` compiled with another threshold, or with none, when it is
+/// loaded. A Winch compile cannot carry it, so the kernel engine refuses
+/// its output.
+pub const CWASM_STACK_LIMIT_LARGE_FRAME: u32 = 16 * 1024;
+
 /// Returns the ISA flags shared by host prebuilds and in-kernel compilation.
 pub fn cwasm_target_cranelift_flags(target: &str) -> &'static [&'static str] {
     if target.starts_with("aarch64-") {

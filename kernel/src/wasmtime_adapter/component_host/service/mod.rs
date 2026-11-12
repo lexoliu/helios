@@ -883,6 +883,8 @@ fn report_fiber_stack_demand_commits<CpuImpl: Cpu>(cpu: &CpuImpl) {
         released_eager_bytes = stats.released_eager_bytes,
         reserve_bytes = crate::page_fault_frame_reserve_bytes(),
         demand_committed_pages = stats.demand_committed_pages,
+        reserve_commits = stats.reserve_commits,
+        reserve_committed_pages = stats.reserve_committed_pages,
         "fiber stack arena totals for this boot"
     );
 }
@@ -2707,6 +2709,53 @@ mod tests {
             validate_preview1_program_import("wasi_unstable", import)
                 .expect("wasi_unstable imports should validate as preview1");
         }
+    }
+
+    /// A stack-reserve commit the user pool refuses ends the guest's call
+    /// with the pool's refusal, and the program service classifies that as
+    /// running out of memory, whatever context the runtime wraps it in. The
+    /// adapter asks the OOM killer to cover the bytes the pool could not
+    /// give.
+    #[test]
+    fn a_refused_stack_reserve_ends_the_call_as_out_of_memory() {
+        use crate::wasmtime_adapter::store::answer_stack_reserve;
+        use core::sync::atomic::{AtomicUsize, Ordering};
+
+        let engine = crate::wasmtime_adapter::engine::build_component_engine_for_platform(
+            &crate::test_support::TestCpu::without_entropy(),
+        )
+        .expect("the component engine builds on the test platform");
+        let mut store = wasmtime::Store::new(&engine, ());
+        let condemned_for = Arc::new(AtomicUsize::new(0));
+        let seen = condemned_for.clone();
+        store.stack_reserve_callback(move |_context, _sp| {
+            let shortfall = crate::ProgramOutOfMemory {
+                requested_bytes: 4096,
+                available_bytes: 0,
+                pool_bytes: 1 << 20,
+                reserved_bytes: 0,
+            };
+            answer_stack_reserve(
+                Err(crate::StackReserveError::OutOfMemory(shortfall)),
+                |requested_bytes| seen.store(requested_bytes, Ordering::Relaxed),
+            )
+        });
+        let host = wasmtime::Func::wrap(&mut store, || {});
+
+        let error = futures_lite::future::block_on(host.call_async(&mut store, &[], &mut []))
+            .expect_err("the entry into wasm asks for the reserve, and the pool refuses it");
+
+        assert_eq!(
+            condemned_for.load(Ordering::Relaxed),
+            4096,
+            "the OOM killer was asked to cover the refused bytes"
+        );
+        let error = map_program_runtime_error(error);
+        assert_eq!(
+            error.kind,
+            ProgramExecErrorKind::OutOfMemory,
+            "a refused reserve is the same out-of-memory a refused grow is: {error:?}"
+        );
     }
 
     #[test]

@@ -26,6 +26,42 @@ use thiserror::Error;
 /// from here.
 pub const COMPONENT_ASYNC_STACK_SIZE: usize = 8 * 1024 * 1024;
 
+/// The bytes the kernel keeps committed below every guest stack pointer
+/// the runtime has checked (`R`).
+///
+/// Host code runs below the guest frame that called it and meets no check
+/// of its own: a call into a host function, a libcall such as
+/// `memory.grow`, a trap handler. At each guest stack-limit check that
+/// falls below the stack's reserve limit, and at each entry into wasm, the
+/// runtime asks the kernel to commit this many bytes below the stack
+/// pointer it checked. A guest frame of at most
+/// `helios_artifact::CWASM_STACK_LIMIT_LARGE_FRAME` (`S`) may sit between
+/// that pointer and the host code, so host code may use `R - S` less the
+/// entry path's own frames. 64 KiB covers the 28,672 bytes measured for the
+/// deepest host path of the smoke and bench boots (helios#535) with a page
+/// of measurement resolution, the commit path itself, and the paths that
+/// run below a guest stack pointer and were not measured (x86 trap
+/// capture, the swap trampoline).
+pub const FIBER_STACK_HOST_RESERVE: usize = 64 * 1024;
+
+/// The bytes a fresh fiber stack commits when the kernel hands it out (`H`).
+///
+/// Host code runs from the top of the stack down to the first guest entry
+/// (fiber start, instantiation, the pooling allocator) before any guest
+/// check commits the reserve, and that span measured at most 8,192 bytes
+/// (helios#535). 16 KiB is that plus a page of measurement resolution,
+/// rounded up to a multiple of [`FIBER_STACK_COMMIT_STEP`].
+pub const FIBER_STACK_ENTRY_RESERVE: usize = 16 * 1024;
+
+/// The bytes committed beyond [`FIBER_STACK_HOST_RESERVE`] each time the
+/// runtime asks the kernel to commit below a stack pointer (`G`).
+///
+/// It trades trips through the runtime's slow path against committed
+/// memory: a descent commits `G` ahead of its reserve, so it takes one trip
+/// per `G` of depth. 16 KiB is one trip per four pages, the same size as
+/// [`FIBER_STACK_ENTRY_RESERVE`] (helios#535).
+pub const FIBER_STACK_COMMIT_STEP: usize = 16 * 1024;
+
 /// How many component instances the kernel serves at once.
 ///
 /// This is kernel policy and belongs here for the same reason

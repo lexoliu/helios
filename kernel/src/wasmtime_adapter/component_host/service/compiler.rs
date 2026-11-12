@@ -530,6 +530,10 @@ where
     HostFs: crate::HostFileSystem,
 {
     store.interrupt_callback(|caller| caller.data().on_interrupt());
+    // The compiler's store has no OOM-kill route: a stack reserve the
+    // pool cannot back ends the compile with its typed out-of-memory
+    // failure, and the plugin's owner discards or restarts it.
+    crate::wasmtime_adapter::store::install_stack_reserve(store, |_, _| {});
     let interrupts = store.data().context.shared.interrupts.clone();
     let instance = store.data().context.instance.id();
     CompilerStoreDrive {

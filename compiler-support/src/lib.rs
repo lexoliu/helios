@@ -1,6 +1,6 @@
 use helios_artifact::{
-    CWASM_MEMORY_GUARD_SIZE, CWASM_MEMORY_RESERVATION, CwasmCodeProtection,
-    cwasm_target_code_protection, cwasm_target_cranelift_flags,
+    CWASM_MEMORY_GUARD_SIZE, CWASM_MEMORY_RESERVATION, CWASM_STACK_LIMIT_LARGE_FRAME,
+    CwasmCodeProtection, cwasm_target_code_protection, cwasm_target_cranelift_flags,
     cwasm_target_guest_stack_limit_offset, cwasm_target_supports_wasm_simd,
 };
 use std::cell::{Cell, RefCell};
@@ -541,6 +541,17 @@ fn build_engine_config(target: &str, hint: AotCompileHint, worker_count: usize) 
     // for the other one.
     if let Some(offset) = cwasm_target_guest_stack_limit_offset(target) {
         config.stack_limit_location(StackLimitLocation::PerProcessor { offset });
+    }
+    // A function with a large frame checks the stack in its prologue, which
+    // the kernel engine requires of every artifact it loads (Wasmtime
+    // compares the threshold exactly). Winch's prologue check does not
+    // resume, so Wasmtime refuses the threshold with it: a `Fast` artifact
+    // carries none and the kernel engine refuses to load it. The threshold
+    // is only valid with the null collector, which is the one collector this
+    // build has (`gc-null` is the only collector feature in the workspace,
+    // so `Collector::Auto` resolves to it).
+    if hint != AotCompileHint::Fast {
+        config.stack_limit_large_frame(Some(CWASM_STACK_LIMIT_LARGE_FRAME));
     }
     // Wasmtime validates `max_wasm_stack <= async_stack_size`; keep the async
     // fiber stack comfortably above the wasm stack limit with host headroom.

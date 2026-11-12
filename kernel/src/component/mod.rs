@@ -47,7 +47,8 @@ pub use retire::{
 pub use runtime::{
     COMPONENT_ASYNC_STACK_SIZE, ComponentOutputMode, ComponentOutputRoute, ComponentOutputSink,
     ComponentOutputStreamKind, ComponentRuntimeState, ComponentStoreData, DeadlinePollable,
-    InstanceKilled, LocalOutputSink, MAX_CONCURRENT_INSTANCES, MAX_CORE_INSTANCES_PER_COMPONENT,
+    FIBER_STACK_COMMIT_STEP, FIBER_STACK_ENTRY_RESERVE, FIBER_STACK_HOST_RESERVE, InstanceKilled,
+    LocalOutputSink, MAX_CONCURRENT_INSTANCES, MAX_CORE_INSTANCES_PER_COMPONENT,
     MAX_MEMORIES_PER_COMPONENT, MAX_POOLED_ADDRESS_SPACE, MAX_POOLED_USER_MEMORY,
     MAX_TABLES_PER_COMPONENT, store_kernel_heap_bytes, wait_until_runtime_deadline,
 };

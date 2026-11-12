@@ -5,6 +5,7 @@ pub use crate::component::{
     MAX_MEMORIES_PER_COMPONENT, MAX_POOLED_ADDRESS_SPACE, MAX_POOLED_USER_MEMORY,
     MAX_TABLES_PER_COMPONENT,
 };
+use crate::component::{FIBER_STACK_COMMIT_STEP, FIBER_STACK_HOST_RESERVE};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AotCompileHint {
@@ -81,11 +82,24 @@ pub fn build_component_engine_config(target: &str) -> Config {
     if let Some(offset) = helios_artifact::cwasm_target_guest_stack_limit_offset(target) {
         config.stack_limit_location(StackLimitLocation::PerProcessor { offset });
     }
+    // A function with a frame above the threshold checks the stack in its
+    // prologue, before the frame is allocated, so the kernel commits the
+    // stack below it first (`FIBER_STACK_HOST_RESERVE`). Every producer of a
+    // cwasm sets the same threshold and Wasmtime refuses an artifact
+    // compiled with another. The threshold needs the null collector, which
+    // is the one collector this build has (`gc-null` is the only collector
+    // feature in the workspace, so `Collector::Auto` resolves to it).
+    config.stack_limit_large_frame(Some(helios_artifact::CWASM_STACK_LIMIT_LARGE_FRAME));
     // The stack size is kernel policy, not a runtime knob: see
     // `COMPONENT_ASYNC_STACK_SIZE` for why it is what it is and who
     // pays for it. Both the guest wasm call stack and the host Rust
-    // async frames driving it run on it.
-    config.max_wasm_stack(COMPONENT_ASYNC_STACK_SIZE);
+    // async frames driving it run on it, so the guest's share is the
+    // stack less what the kernel keeps for host code under the deepest
+    // guest frame: the host reserve and the step committed beyond it,
+    // the same sum at which a reserve commit answers a stack overflow.
+    config.max_wasm_stack(
+        COMPONENT_ASYNC_STACK_SIZE - FIBER_STACK_HOST_RESERVE - FIBER_STACK_COMMIT_STEP,
+    );
     config.async_stack_size(COMPONENT_ASYNC_STACK_SIZE);
     config
 }

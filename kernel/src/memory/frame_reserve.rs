@@ -262,7 +262,7 @@ pub(crate) fn top_up(processor: ProcessorId) {
     // arena's masked-fault path, so until the arena exists the reserve
     // holds nothing: frames parked here are frames the user pool cannot
     // hand a program.
-    if !super::fiber_stack::arena_installed() {
+    if !super::fiber_stack::fiber_stack_arena_installed() {
         return;
     }
     while shard.len() < RESERVE_CAPACITY {

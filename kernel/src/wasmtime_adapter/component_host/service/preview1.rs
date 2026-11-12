@@ -1041,6 +1041,9 @@ where
     // the call that drives this store is polled, and signals and kills
     // reach the guest at its interrupt checks.
     store.interrupt_callback(|mut caller| caller.data_mut().on_interrupt());
+    // A program store has no OOM-kill route: a stack reserve the pool
+    // cannot back ends the program with its typed out-of-memory failure.
+    crate::wasmtime_adapter::store::install_stack_reserve(store, |_, _| {});
     let interrupts = store.data().interrupts.clone();
     let instance = store.data().instance().id();
     let registration = interrupts.register(instance, store, store.data().cpu.clone());
