@@ -80,9 +80,48 @@ fn a_response_in_another_abi_version_is_refused() {
         compile_all(stand_in(), workers(2), vec![vec![2]]).expect("the stand-in is hosted");
     match results.into_iter().next().expect("one result") {
         Err(CompilerHostError::AbiMismatch { found, expected }) => {
-            assert_eq!((found, expected), (99, 1));
+            assert_eq!((found, expected), (99, 2));
         }
         other => panic!("expected an ABI mismatch, got {other:?}"),
+    }
+}
+
+/// A response whose enumerated field names no variant is refused with the
+/// field's name, and the buffers the host adopted from it were still freed:
+/// otherwise the outstanding-bytes check would fail first.
+#[test]
+fn an_unknown_status_is_refused_after_its_buffers_are_freed() {
+    let results =
+        compile_all(stand_in(), workers(2), vec![vec![3]]).expect("the stand-in is hosted");
+    match results.into_iter().next().expect("one result") {
+        Err(CompilerHostError::UnknownDiscriminant(unknown)) => {
+            assert_eq!((unknown.field, unknown.value), ("status", 77));
+        }
+        other => panic!("expected an unknown status, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_unknown_output_kind_is_refused_after_its_buffers_are_freed() {
+    let results =
+        compile_all(stand_in(), workers(2), vec![vec![4]]).expect("the stand-in is hosted");
+    match results.into_iter().next().expect("one result") {
+        Err(CompilerHostError::UnknownDiscriminant(unknown)) => {
+            assert_eq!((unknown.field, unknown.value), ("output_kind", 55));
+        }
+        other => panic!("expected an unknown output kind, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_count_left_off_its_starting_level_fails_the_compile() {
+    let results =
+        compile_all(stand_in(), workers(2), vec![vec![5]]).expect("the stand-in is hosted");
+    match results.into_iter().next().expect("one result") {
+        Err(CompilerHostError::BuffersOutstanding { before, after }) => {
+            assert_eq!((before, after), (0, 7));
+        }
+        other => panic!("expected outstanding bytes, got {other:?}"),
     }
 }
 

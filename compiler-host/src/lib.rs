@@ -33,7 +33,8 @@ use std::time::Instant;
 use helios_compiler_abi::{
     CompileHint, CompilerRequestHeader, CompilerResponseHeader, CompilerStatus,
     HELIOS_COMPILER_ABI_VERSION, HELIOS_COMPILER_ALLOC, HELIOS_COMPILER_COMPILE,
-    HELIOS_COMPILER_INITIALIZE, HELIOS_COMPILER_PTHREAD_SELF_OFFSET, OutputKind,
+    HELIOS_COMPILER_FREE, HELIOS_COMPILER_INITIALIZE, HELIOS_COMPILER_OUTSTANDING_BYTES,
+    HELIOS_COMPILER_PTHREAD_SELF_OFFSET, OutputKind, UnknownDiscriminant,
 };
 use helios_compiler_support::{AotCompileHint, MAX_WASM_STACK, codegen_config};
 use thiserror::Error;
@@ -112,8 +113,12 @@ pub enum CompilerHostError {
     Memory(#[from] GuestMemoryAccess),
     #[error("the compiler plugin answered ABI version {found}, expected {expected}")]
     AbiMismatch { found: u32, expected: u32 },
-    #[error("the compiler plugin answered an unknown {field} {value}")]
-    UnknownResponseValue { field: &'static str, value: u32 },
+    #[error("the compiler plugin's response carries a value this ABI does not define: {0}")]
+    UnknownDiscriminant(#[from] UnknownDiscriminant),
+    #[error(
+        "the compiler plugin owns {after} bytes across the interface after the compile's buffers were freed, but {before} before the request was allocated"
+    )]
+    BuffersOutstanding { before: u32, after: u32 },
     #[error("the compiler plugin rejected the request with {status:?}: {diagnostic}")]
     Rejected {
         status: CompilerStatus,
@@ -377,66 +382,91 @@ impl PluginRuntime {
                 export: HELIOS_COMPILER_INITIALIZE,
                 source,
             })?;
-        let alloc = typed_func::<(i32, i32), i32>(&mut store, &instance, HELIOS_COMPILER_ALLOC)?;
-        let compile =
-            typed_func::<(i32, i32), i32>(&mut store, &instance, HELIOS_COMPILER_COMPILE)?;
+        let exports = Exports {
+            alloc: typed_func(&mut store, &instance, HELIOS_COMPILER_ALLOC)?,
+            free: typed_func(&mut store, &instance, HELIOS_COMPILER_FREE)?,
+            compile: typed_func(&mut store, &instance, HELIOS_COMPILER_COMPILE)?,
+            outstanding: typed_func(&mut store, &instance, HELIOS_COMPILER_OUTSTANDING_BYTES)?,
+        };
 
+        let outstanding_before = outstanding_bytes(&mut store, &exports.outstanding)?;
+        let mut allocations = Allocations::default();
+        let outcome =
+            self.call_compiler(&mut store, &exports, &mut allocations, wasm, target, hint);
+        // A call into the plugin that failed leaves its allocator in an
+        // unknown state, so nothing is freed and the memory dies with the
+        // runtime; every other end returns the call's allocations. A release
+        // that fails, or leaves the plugin's count off its starting level,
+        // comes before the compile's own result: it says the plugin's memory
+        // can no longer be trusted.
+        let result = outcome?;
+        allocations.release(&mut store, &exports.free)?;
+        let outstanding_after = outstanding_bytes(&mut store, &exports.outstanding)?;
+        if outstanding_after != outstanding_before {
+            return Err(CompilerHostError::BuffersOutstanding {
+                before: outstanding_before,
+                after: outstanding_after,
+            });
+        }
+        result
+    }
+
+    /// `call_compiler`: allocates the three request buffers, writes the
+    /// request, calls `compile`, and copies the response out. The outer
+    /// `Err` is a failed call into the plugin, after which nothing is freed;
+    /// every other end is the inner `Result`, and the call's `allocations`
+    /// are released.
+    fn call_compiler(
+        &self,
+        store: &mut Store<PluginState>,
+        exports: &Exports,
+        allocations: &mut Allocations,
+        wasm: &[u8],
+        target: &str,
+        hint: CompileHint,
+    ) -> Result<Result<Compiled, CompilerHostError>, CompilerHostError> {
         let target = target.as_bytes();
-        let request_len = size_of::<CompilerRequestHeader>();
-        let wasm_ptr = guest_alloc(&mut store, &alloc, wasm.len(), 1)?;
-        let target_ptr = guest_alloc(&mut store, &alloc, target.len(), 1)?;
-        let request_ptr = guest_alloc(
-            &mut store,
-            &alloc,
-            request_len,
-            align_of::<CompilerRequestHeader>(),
+        let wasm_ptr = allocations.alloc(&mut *store, &exports.alloc, wasm.len(), 1)?;
+        let target_ptr = allocations.alloc(&mut *store, &exports.alloc, target.len(), 1)?;
+        let request_ptr = allocations.alloc(
+            &mut *store,
+            &exports.alloc,
+            CompilerRequestHeader::SIZE,
+            CompilerRequestHeader::ALIGN,
         )?;
-        let memory = self.shared.memory.clone();
-        memory::write(&memory, wasm_ptr, wasm)?;
-        memory::write(&memory, target_ptr, target)?;
-        let request = encode_request(RequestFields {
-            hint,
-            wasm_ptr,
-            wasm_len: guest_len(wasm.len())?,
-            target_ptr,
-            target_len: guest_len(target.len())?,
-            // `profile: false`, as the bench's AOT request is.
-            flags: 0,
-        });
-        memory::write(&memory, request_ptr, &request)?;
-
-        let response_ptr = compile
-            .call(&mut store, (request_ptr as i32, request_len as i32))
+        // From here to the response, only host-side work can fail apart from
+        // the `compile` call itself, so a failure is the inner `Err`.
+        let memory = &self.shared.memory;
+        let written = (|| -> Result<(), CompilerHostError> {
+            let request = CompilerRequestHeader {
+                abi_version: HELIOS_COMPILER_ABI_VERSION,
+                hint: u32::from(hint),
+                wasm_ptr,
+                wasm_len: guest_len(wasm.len())?,
+                target_ptr,
+                target_len: guest_len(target.len())?,
+                // `profile: false`, as the bench's AOT request is.
+                flags: 0,
+            };
+            memory::write(memory, wasm_ptr, wasm)?;
+            memory::write(memory, target_ptr, target)?;
+            memory::write(memory, request_ptr, &request.to_bytes())?;
+            Ok(())
+        })();
+        if let Err(error) = written {
+            return Ok(Err(error));
+        }
+        let response_ptr = exports
+            .compile
+            .call(
+                &mut *store,
+                (request_ptr as i32, CompilerRequestHeader::SIZE as i32),
+            )
             .map_err(|source| CompilerHostError::Call {
                 export: HELIOS_COMPILER_COMPILE,
                 source,
             })? as u32;
-        let response = decode_response(&memory::read(
-            &memory,
-            response_ptr,
-            size_of::<CompilerResponseHeader>(),
-        )?)?;
-        let diagnostic = memory::read(
-            &memory,
-            response.diagnostic_ptr,
-            response.diagnostic_len as usize,
-        )?;
-        if response.status != CompilerStatus::Ok {
-            return Err(CompilerHostError::Rejected {
-                status: response.status,
-                diagnostic: String::from_utf8_lossy(&diagnostic).into_owned(),
-            });
-        }
-        let output = memory::read(
-            &memory,
-            response.precompiled_ptr,
-            response.precompiled_len as usize,
-        )?;
-        Ok(Compiled {
-            output,
-            kind: response.output_kind,
-            diagnostic,
-        })
+        Ok(accept_response(memory, allocations, response_ptr))
     }
 
     /// Joins every thread the last compile spawned, the threads those
@@ -539,22 +569,154 @@ where
         .map_err(|source| CompilerHostError::Export { name, source })
 }
 
-fn guest_alloc(
+/// The compiler plugin's exports one call uses.
+struct Exports {
+    alloc: TypedFunc<(i32, i32), i32>,
+    free: TypedFunc<(i32, i32, i32), ()>,
+    compile: TypedFunc<(i32, i32), i32>,
+    outstanding: TypedFunc<(), i32>,
+}
+
+/// The bytes the plugin counts as owned across the interface right now.
+fn outstanding_bytes(
     store: &mut Store<PluginState>,
-    alloc: &TypedFunc<(i32, i32), i32>,
+    outstanding: &TypedFunc<(), i32>,
+) -> Result<u32, CompilerHostError> {
+    outstanding
+        .call(&mut *store, ())
+        .map(|bytes| bytes as u32)
+        .map_err(|source| CompilerHostError::Call {
+            export: HELIOS_COMPILER_OUTSTANDING_BYTES,
+            source,
+        })
+}
+
+/// A buffer in the plugin's memory, with the layout it was allocated with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PluginBuffer {
+    ptr: u32,
     len: usize,
     align: usize,
-) -> Result<u32, CompilerHostError> {
-    let ptr = alloc
-        .call(&mut *store, (guest_len(len)? as i32, align as i32))
-        .map_err(|source| CompilerHostError::Call {
-            export: HELIOS_COMPILER_ALLOC,
-            source,
-        })?;
-    if ptr == 0 {
-        return Err(CompilerHostError::AllocationFailed { len });
+}
+
+/// The plugin allocations of one compile call: the three request buffers the
+/// host allocates and the three response buffers the plugin hands over (the
+/// ownership table is in `helios_compiler_abi`). They are freed together by
+/// [`Self::release`], which is reached only when every call into the plugin
+/// returned; a call that trapped never reaches it.
+#[derive(Default)]
+#[must_use = "the plugin's allocations leak unless released"]
+struct Allocations {
+    buffers: Vec<PluginBuffer>,
+}
+
+impl Allocations {
+    /// Allocates a request buffer through the plugin and records it. A
+    /// zero-length buffer is pointer 0 and is not allocated.
+    fn alloc(
+        &mut self,
+        store: &mut Store<PluginState>,
+        alloc: &TypedFunc<(i32, i32), i32>,
+        len: usize,
+        align: usize,
+    ) -> Result<u32, CompilerHostError> {
+        if len == 0 {
+            return Ok(0);
+        }
+        let ptr = alloc
+            .call(&mut *store, (guest_len(len)? as i32, align as i32))
+            .map_err(|source| CompilerHostError::Call {
+                export: HELIOS_COMPILER_ALLOC,
+                source,
+            })?;
+        if ptr == 0 {
+            return Err(CompilerHostError::AllocationFailed { len });
+        }
+        let ptr = ptr as u32;
+        self.buffers.push(PluginBuffer { ptr, len, align });
+        Ok(ptr)
     }
-    Ok(ptr as u32)
+
+    /// Takes ownership of a buffer the plugin handed over in its response. A
+    /// zero-length buffer is pointer 0 and was never allocated.
+    fn adopt(&mut self, ptr: u32, len: usize, align: usize) {
+        if len != 0 {
+            self.buffers.push(PluginBuffer { ptr, len, align });
+        }
+    }
+
+    /// Returns every recorded buffer to the plugin.
+    fn release(
+        self,
+        store: &mut Store<PluginState>,
+        free: &TypedFunc<(i32, i32, i32), ()>,
+    ) -> Result<(), CompilerHostError> {
+        for buffer in self.buffers {
+            free.call(
+                &mut *store,
+                (buffer.ptr as i32, buffer.len as i32, buffer.align as i32),
+            )
+            .map_err(|source| CompilerHostError::Call {
+                export: HELIOS_COMPILER_FREE,
+                source,
+            })?;
+        }
+        Ok(())
+    }
+}
+
+/// Everything the host does with a response once `compile` returned, which is
+/// host-side work only: no call into the plugin is made here, so every
+/// failure leaves the instance intact and the caller frees the call's
+/// allocations. The response buffers are adopted as soon as the header's
+/// layout is known to be this ABI's, before anything else can fail, so a
+/// rejected or malformed response is freed too.
+fn accept_response(
+    memory: &SharedMemory,
+    allocations: &mut Allocations,
+    response_ptr: u32,
+) -> Result<Compiled, CompilerHostError> {
+    let bytes: [u8; CompilerResponseHeader::SIZE] =
+        memory::read(memory, response_ptr, CompilerResponseHeader::SIZE)?
+            .try_into()
+            .expect("the read returned exactly the header's size");
+    let header = CompilerResponseHeader::from_bytes(&bytes);
+    if header.abi_version != HELIOS_COMPILER_ABI_VERSION {
+        return Err(CompilerHostError::AbiMismatch {
+            found: header.abi_version,
+            expected: HELIOS_COMPILER_ABI_VERSION,
+        });
+    }
+    allocations.adopt(
+        response_ptr,
+        CompilerResponseHeader::SIZE,
+        CompilerResponseHeader::ALIGN,
+    );
+    allocations.adopt(header.diagnostic_ptr, header.diagnostic_len as usize, 1);
+    allocations.adopt(header.precompiled_ptr, header.precompiled_len as usize, 1);
+    let status = CompilerStatus::try_from(header.status)?;
+    let kind = OutputKind::try_from(header.output_kind)?;
+    let diagnostic = memory::read(
+        memory,
+        header.diagnostic_ptr,
+        header.diagnostic_len as usize,
+    )?;
+    if status != CompilerStatus::Ok {
+        return Err(CompilerHostError::Rejected {
+            status,
+            diagnostic: String::from_utf8_lossy(&diagnostic).into_owned(),
+        });
+    }
+    let output = memory::read(
+        memory,
+        header.precompiled_ptr,
+        header.precompiled_len as usize,
+    )?;
+    Ok(Compiled {
+        output,
+        kind,
+        diagnostic,
+    })
 }
 
 /// A length the plugin's `i32` ABI can carry.
@@ -562,95 +724,4 @@ fn guest_len(len: usize) -> Result<u32, CompilerHostError> {
     i32::try_from(len)
         .map(|len| len as u32)
         .map_err(|_| CompilerHostError::TooLarge { size: len })
-}
-
-struct RequestFields {
-    hint: CompileHint,
-    wasm_ptr: u32,
-    wasm_len: u32,
-    target_ptr: u32,
-    target_len: u32,
-    flags: u32,
-}
-
-/// The request header's bytes in the plugin's linear memory: the
-/// `#[repr(C)]` `CompilerRequestHeader`, whose seven `u32` fields lie in
-/// declaration order with no padding, each little-endian as wasm memory is.
-fn encode_request(fields: RequestFields) -> [u8; size_of::<CompilerRequestHeader>()] {
-    let words = [
-        HELIOS_COMPILER_ABI_VERSION,
-        fields.hint as u32,
-        fields.wasm_ptr,
-        fields.wasm_len,
-        fields.target_ptr,
-        fields.target_len,
-        fields.flags,
-    ];
-    let mut bytes = [0; size_of::<CompilerRequestHeader>()];
-    for (chunk, word) in bytes.chunks_exact_mut(4).zip(words) {
-        chunk.copy_from_slice(&word.to_le_bytes());
-    }
-    bytes
-}
-
-const _: () = assert!(size_of::<CompilerRequestHeader>() == 7 * 4);
-const _: () = assert!(size_of::<CompilerResponseHeader>() == 7 * 4);
-
-struct Response {
-    status: CompilerStatus,
-    output_kind: OutputKind,
-    precompiled_ptr: u32,
-    precompiled_len: u32,
-    diagnostic_ptr: u32,
-    diagnostic_len: u32,
-}
-
-/// Decodes `CompilerResponseHeader` word by word, so a value the plugin
-/// writes that no variant names is an error rather than an invalid enum.
-fn decode_response(bytes: &[u8]) -> Result<Response, CompilerHostError> {
-    let word = |index: usize| {
-        let start = index * 4;
-        u32::from_le_bytes(
-            bytes[start..start + 4]
-                .try_into()
-                .expect("a response word is four bytes"),
-        )
-    };
-    let abi_version = word(0);
-    if abi_version != HELIOS_COMPILER_ABI_VERSION {
-        return Err(CompilerHostError::AbiMismatch {
-            found: abi_version,
-            expected: HELIOS_COMPILER_ABI_VERSION,
-        });
-    }
-    let status = match word(1) {
-        0 => CompilerStatus::Ok,
-        1 => CompilerStatus::InvalidRequest,
-        2 => CompilerStatus::InvalidInput,
-        3 => CompilerStatus::CompileFailed,
-        value => {
-            return Err(CompilerHostError::UnknownResponseValue {
-                field: "status",
-                value,
-            });
-        }
-    };
-    let output_kind = match word(2) {
-        0 => OutputKind::CoreModule,
-        1 => OutputKind::Component,
-        value => {
-            return Err(CompilerHostError::UnknownResponseValue {
-                field: "output kind",
-                value,
-            });
-        }
-    };
-    Ok(Response {
-        status,
-        output_kind,
-        precompiled_ptr: word(3),
-        precompiled_len: word(4),
-        diagnostic_ptr: word(5),
-        diagnostic_len: word(6),
-    })
 }
