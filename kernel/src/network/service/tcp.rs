@@ -420,7 +420,7 @@ where
     /// reset on the outbound queue, and neither puts a frame anywhere a
     /// shard's own arrival signal would see. Without the kick the
     /// segment waits for the pump's next park to expire — up to
-    /// `DHCP_RETRANSMIT_NANOS` on a guest with nothing else to send —
+    /// `CONFIGURATION_POLL_NANOS` on a guest with nothing else to send —
     /// so a peer learns of the close a second after the guest made it.
     /// The kick belongs here rather than at the call sites: #232 put it
     /// on the component host's retirement drain, and the owners that
@@ -718,7 +718,7 @@ where
             //
             // Left to the packet pump instead, the segment waits for
             // the pump's next wake, and an idle pump parks for
-            // `DHCP_RETRANSMIT_NANOS`. A request/response exchange then
+            // `CONFIGURATION_POLL_NANOS`. A request/response exchange then
             // pays a second per round trip, which is #158: 5000 echo
             // round trips could not finish inside the benchmark's 180 s
             // iteration deadline.

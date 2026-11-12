@@ -1991,11 +1991,13 @@ pub(super) fn map_program_runtime_error(error: wasmtime::Error) -> ProgramExecEr
         tracing::error!(?error, reason = ?killed.reason, "program instance was killed");
         let kind = match killed.reason {
             crate::KillReason::OutOfMemory => ProgramExecErrorKind::OutOfMemory,
-            // Both are somebody outside the program deciding it should
-            // stop, which is nothing the program's own caller did wrong.
-            crate::KillReason::SupervisorRestart | crate::KillReason::Operator => {
-                ProgramExecErrorKind::Internal
-            }
+            // Each is somebody outside the program deciding it should
+            // stop, or nobody waiting for it any more, which is nothing the
+            // program's own caller did wrong.
+            crate::KillReason::SupervisorRestart
+            | crate::KillReason::Operator
+            | crate::KillReason::RequesterGone
+            | crate::KillReason::StoreFailed => ProgramExecErrorKind::Internal,
         };
         return ProgramExecError {
             kind,
