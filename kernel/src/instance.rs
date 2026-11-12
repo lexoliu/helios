@@ -618,7 +618,7 @@ impl InstanceRegistry {
         // its way out and must not be revived.
         entry
             .handle_count
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 (count != 0).then(|| count + 1)
             })
             .ok()?;
