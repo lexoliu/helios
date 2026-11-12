@@ -63,16 +63,19 @@ def stub_inspector(path: Path, kernel: Path) -> None:
 def host(tmp_path, monkeypatch) -> dict[str, Path]:
     """Where a prebuilt run would find everything, none of it present yet."""
     target = tmp_path / "target"
+    prebuild = target / "kernel-prebuild" / "aarch64-unknown-none" / "kernel-release"
     paths = {
         "inspector": tmp_path / "bin" / "helios-inspector",
         "cli": tmp_path / "bin" / "helios-cli",
         "kernel": target / "aarch64-unknown-none" / "kernel-release" / "helios",
-        "bootfs": target / "kernel-prebuild" / "aarch64-unknown-none" / "kernel-release" / "helios-bootfs",
+        "bootfs": prebuild / "helios-bootfs",
+        "plugin": prebuild / "compiler_plugin.wasm",
         "native": tmp_path / "native",
     }
     monkeypatch.setenv("HELIOS_INSPECTOR_BIN", str(paths["inspector"]))
     monkeypatch.setenv("HELIOS_CLI_BIN", str(paths["cli"]))
     monkeypatch.setattr(runner, "NATIVE_ARTIFACTS", paths["native"])
+    monkeypatch.setattr(runner, "compiler_plugin_wasm", lambda lane, kernel_build: paths["plugin"])
     return paths
 
 
@@ -82,11 +85,12 @@ def test_the_error_lists_every_missing_path(tmp_path, host) -> None:
     workloads = load_workloads()["workloads"]
     natives = runner.native_counterparts(options, workloads)
     assert "hello" in natives and "procbench" in natives
+    assert "helios-compiler-host" in natives
 
     with pytest.raises(SystemExit) as error:
         require_prebuilt(options, workloads)
     message = str(error.value)
-    for path in (host["cli"], host["kernel"], host["bootfs"]):
+    for path in (host["cli"], host["kernel"], host["bootfs"], host["plugin"]):
         assert str(path) in message
     for name in natives:
         assert str(host["native"] / "aarch64" / name) in message
@@ -99,8 +103,8 @@ def test_nothing_is_missing_once_everything_is_in_place(tmp_path, host) -> None:
     host["cli"].chmod(0o755)
     options = options_for(tmp_path, prebuilt=True)
     workloads = load_workloads()["workloads"]
-    for path in (host["kernel"], host["bootfs"]):
-        path.parent.mkdir(parents=True)
+    for path in (host["kernel"], host["bootfs"], host["plugin"]):
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("", encoding="utf-8")
     (host["native"] / "aarch64").mkdir(parents=True)
     for name in runner.native_counterparts(options, workloads):
@@ -115,3 +119,22 @@ def test_a_missing_inspector_is_listed_with_the_paths_it_would_have_answered(tmp
     assert any(str(host["cli"]) in line for line in missing)
     assert any("kernel image and helios-bootfs" in line for line in missing)
     assert not any("native" in line for line in missing)
+    assert not any("compiler plugin" in line for line in missing)
+
+
+def test_a_run_that_skips_the_plugin_host_does_not_need_the_plugin(tmp_path, host) -> None:
+    options = options_for(tmp_path, prebuilt=True, sides=frozenset({Side.LINUX_NATIVE}))
+    missing = missing_prebuilt_files(options, load_workloads()["workloads"])
+    assert not any("compiler plugin" in line for line in missing)
+    assert not any("helios-compiler-host" in line for line in missing)
+
+
+def test_the_linux_plan_asks_for_the_helios_columns_compile(tmp_path) -> None:
+    options = options_for(tmp_path, prebuilt=True)
+    commands = plan(options, load_manifest(), load_workloads()["workloads"])
+    (linux,) = [c for c in commands if "--skip-helios" in c.argv]
+    parsed = gap_bench().build_parser().parse_args(linux.argv[2:])
+    assert parsed.compiler_target == "aarch64-unknown-none"
+    assert parsed.compiler_workers == options.lane.compiler_workers
+    assert parsed.compiler_plugin_wasm == runner.compiler_plugin_wasm(options.lane, options.kernel_build)
+    assert parsed.compiler_plugin_wasm.name == "compiler_plugin.wasm"

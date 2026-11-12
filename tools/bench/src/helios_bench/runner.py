@@ -67,6 +67,12 @@ NATIVE_BUILD = REPO_ROOT / "tools" / "bench" / "native" / "build.sh"
 NATIVE_ARTIFACTS = REPO_ROOT / "artifacts" / "bench-native"
 BOOT_ARTIFACTS = WASI_APPS_ROOT / "boot-artifacts.toml"
 CARGO_TARGETS = {"aarch64": "aarch64-unknown-none", "x86-64": "x86_64-unknown-none"}
+# What `helios-cli kernel-prebuild` names the compiler plugin's core module
+# beside the `compiler_plugin.cwasm` it precompiles from it.
+COMPILER_PLUGIN_WASM = "compiler_plugin.wasm"
+# The host that runs that module under Wasmtime on Linux, one of the native
+# counterparts `tools/bench/native/build.sh` builds.
+COMPILER_HOST = "helios-compiler-host"
 HELIOS_OUT = "helios"
 HELIOS_BASELINE_OUT = "helios-baseline"
 HELIOS_BASELINE_REBUILD_OUT = "helios-baseline-rebuild"
@@ -80,6 +86,11 @@ LINUX_SIDES = {Side.LINUX_NATIVE, Side.LINUX_WASMTIME}
 # pairing varies the candidate.
 RELEASE_BUILD = "release"
 PROFILE_USE_BUILD = "profile-use"
+# The `target/<triple>/` and `target/kernel-prebuild/<triple>/` directory
+# each build lands in: its cargo profile (`KernelBuildProfile::directory` in
+# inspector/src/vm.rs). A plain release image is the `kernel-release`
+# profile.
+KERNEL_BUILD_DIRECTORIES = {RELEASE_BUILD: "kernel-release", PROFILE_USE_BUILD: "profile-use"}
 # Architectures whose `--release` kernel is built against the profile the
 # latest release published (docs/pgo.md, #226). On those there is no plain
 # release kernel: the inspector compiles one with `-C profile-use` and its
@@ -472,6 +483,15 @@ def plan(options: RunOptions, manifest: Manifest, workloads: list[dict]) -> list
                     ],
                     "--native-bin-dir",
                     str(NATIVE_ARTIFACTS / lane.guest_arch),
+                    # The compile the Helios column's plugin does: the
+                    # module it runs, the kernel's target and the kernel's
+                    # worker count, for a counterpart hosting that plugin.
+                    "--compiler-plugin-wasm",
+                    str(compiler_plugin_wasm(lane, options.kernel_build)),
+                    "--compiler-target",
+                    CARGO_TARGETS[lane.helios_arch],
+                    "--compiler-workers",
+                    str(lane.compiler_workers),
                     "--out-dir",
                     str(options.out_dir / LINUX_OUT),
                 ],
@@ -722,6 +742,16 @@ def missing_prebuilt_files(options: RunOptions, workloads: list[dict]) -> list[s
             path = NATIVE_ARTIFACTS / lane.guest_arch / name
             if not path.is_file():
                 missing.append(f"{path} (native counterpart)")
+        runner = workload_runner()
+        hosts_plugin = any(
+            runner.uses_placeholder(workload, side.value, runner.COMPILER_PLUGIN_PLACEHOLDER)
+            for workload in workloads
+            if workload["name"] not in options.skip_linux_workloads
+            for side in options.sides & LINUX_SIDES
+        )
+        plugin = compiler_plugin_wasm(lane, options.kernel_build)
+        if hosts_plugin and not plugin.is_file():
+            missing.append(f"{plugin} (the compiler plugin the helios-bootfs was precompiled from)")
     return missing
 
 
@@ -775,21 +805,62 @@ def kernel_pgo_uncovered(
     return int(match.group(1)), int(match.group(2))
 
 
-def bootfs_cwasm_digests(lane: Lane, kernel_build: str) -> dict[str, str]:
-    """SHA256 of the signed cwasm files the Helios guest loaded.
+def kernel_prebuild_dir(lane: Lane, kernel_build: str) -> Path:
+    """Where the candidate's `kernel-prebuild` wrote its payload.
 
     Under the candidate's own build directory: the inspector's prebuild
     writes beside the kernel it prebuilds for, so a PGO candidate's
-    bootfs is not in the plain release directory.
+    bootfs is not in the plain release directory. The directory is the
+    build's cargo profile, which for a plain release build is not the
+    build's own name.
     """
-    prebuild = REPO_ROOT / "target" / "kernel-prebuild" / CARGO_TARGETS[lane.helios_arch] / kernel_build
+    return (
+        REPO_ROOT
+        / "target"
+        / "kernel-prebuild"
+        / CARGO_TARGETS[lane.helios_arch]
+        / KERNEL_BUILD_DIRECTORIES[kernel_build]
+    )
+
+
+def compiler_plugin_wasm(lane: Lane, kernel_build: str) -> Path:
+    """The compiler plugin's core module the candidate's prebuild
+    precompiled into its bootfs, which the Linux + Wasmtime column of
+    `aot-curl` hosts directly, so both columns run one plugin build."""
+    return kernel_prebuild_dir(lane, kernel_build) / COMPILER_PLUGIN_WASM
+
+
+def bootfs_cwasm_digests(lane: Lane, kernel_build: str) -> dict[str, str]:
+    """SHA256 of the signed cwasm files the Helios guest loaded."""
+    prebuild = kernel_prebuild_dir(lane, kernel_build)
     if not prebuild.is_dir():
         return {}
     return {path.name: sha256_of(path) for path in sorted(prebuild.glob("*.cwasm"))}
 
 
+def compiler_pins(lane: Lane, workloads: list[dict], kernel_build: str) -> tuple[str | None, str | None]:
+    """The digests of the compiler plugin build and of the
+    `helios-compiler-host` the selection's workloads hosted it with, each
+    None when no selected workload names it or it is not on disk."""
+    runner = workload_runner()
+    plugin = compiler_plugin_wasm(lane, kernel_build)
+    host = NATIVE_ARTIFACTS / lane.guest_arch / COMPILER_HOST
+    plugin_digest = (
+        sha256_of(plugin) if runner.needs_compiler_plugin(workloads) and plugin.is_file() else None
+    )
+    host_named = any(
+        f"{{native_bin}}/{COMPILER_HOST}" in template
+        for workload in workloads
+        for side in LINUX_SIDES
+        for template in runner.counterpart_templates(workload, side.value)
+    )
+    host_digest = sha256_of(host) if host_named and host.is_file() else None
+    return plugin_digest, host_digest
+
+
 def collect_pins(lane: Lane, workloads: list[dict], kernel_build: str, baseline: Baseline | None) -> Pins:
     image_url, image_sha256 = fedora_image(lane.guest_arch)
+    plugin_digest, host_digest = compiler_pins(lane, workloads, kernel_build)
     return Pins(
         wasmtime_revision=vendored_wasmtime_pin().revision,
         baseline_wasmtime_revision=baseline.wasmtime.revision if baseline is not None else None,
@@ -805,6 +876,8 @@ def collect_pins(lane: Lane, workloads: list[dict], kernel_build: str, baseline:
         devices=lane.devices,
         wasm_artifacts=wasm_artifact_digests(workloads),
         bootfs_cwasm=bootfs_cwasm_digests(lane, kernel_build),
+        compiler_plugin_wasm=plugin_digest,
+        compiler_host=host_digest,
     )
 
 
