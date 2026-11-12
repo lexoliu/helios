@@ -158,6 +158,21 @@ def read_side_jsonl(
     return RawSide(run=run, cells=cells)
 
 
+def read_run_record(path: Path) -> dict:
+    """The `run` record of a side's JSONL, its iteration records left unread."""
+    run: dict = {}
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            if record["type"] == "run":
+                run = record
+    if not run:
+        raise SystemExit(f"{path}: no run record")
+    return run
+
+
 def read_optional_side(
     out_dir: Path,
     side: Side,

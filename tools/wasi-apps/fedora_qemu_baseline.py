@@ -1233,6 +1233,8 @@ def runner_command(
         command.extend(["--side-timeout-seconds", str(side_timeout_seconds)])
     if compiler is not None and compiler.target is not None:
         command.extend(["--compiler-target", compiler.target])
+    if compiler is not None and compiler.isa_level is not None:
+        command.extend(["--compiler-isa-level", compiler.isa_level])
     if compiler is not None and compiler.workers is not None:
         command.extend(["--compiler-workers", str(compiler.workers)])
     if host_http_url:
@@ -1347,6 +1349,7 @@ def run_fedora_qemu_linux(
     compiler = compiler or runner.CompilerRequest()
     for placeholder, value, flag in (
         ("{compiler_target}", compiler.target, "--compiler-target"),
+        ("{compiler_isa_level}", compiler.isa_level, "--compiler-isa-level"),
         ("{compiler_workers}", compiler.workers, "--compiler-workers"),
     ):
         users = [

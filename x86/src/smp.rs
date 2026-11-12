@@ -11,6 +11,7 @@ use core::num::NonZeroUsize;
 use core::ops::Range;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+use helios_artifact::ProbeAnswers;
 use helios_hal::cpu::{GUEST_STACK_LIMIT_OFFSET, ProcessorId, Timebase};
 use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::watchdog::Watchdog;
@@ -292,6 +293,9 @@ impl ProcessorRuntime {
 pub(crate) struct BootContext {
     platform: Arc<X86PlatformState>,
     xcr0: Xcr0,
+    /// The bootstrap processor's answer to every ISA level feature, taken
+    /// after it programmed XCR0. Immutable; each secondary compares its own.
+    isa_answers: ProbeAnswers,
 }
 
 pub(crate) struct X86PlatformState {
@@ -456,7 +460,11 @@ pub(crate) fn build_boot_context(
     if let Some(wakeup_page) = platform.wakeup_page.as_ref() {
         prepare_wakeup_page(&platform, wakeup_page);
     }
-    let context = Box::leak(Box::new(BootContext { platform, xcr0 }));
+    let context = Box::leak(Box::new(BootContext {
+        platform,
+        xcr0,
+        isa_answers: crate::probe_isa_answers(),
+    }));
     context
         .platform
         .boot_context
@@ -742,6 +750,12 @@ impl BootContext {
     /// [`crate::extended_state::enable_on_secondary_processor`].
     pub(crate) fn xcr0(&self) -> Xcr0 {
         self.xcr0
+    }
+
+    /// The bootstrap processor's ISA level feature answers; see
+    /// [`crate::probe_isa_answers`].
+    pub(crate) fn isa_answers(&self) -> ProbeAnswers {
+        self.isa_answers
     }
 
     pub(crate) fn bootstrap_runtime(&self) -> &ProcessorRuntime {
