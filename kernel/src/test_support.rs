@@ -82,6 +82,16 @@ impl Cpu for TestCpu {
 
     fn park_current(&self) {}
 
+    type WakeOnlyMask = ();
+
+    fn mask_to_wake_only(&self) {
+        panic!("this test platform never freezes")
+    }
+
+    fn park_wake_only(&self, _: &core::sync::atomic::AtomicU8, _: u8) {
+        panic!("this test platform never freezes")
+    }
+
     fn start_processor(&self, _: ProcessorId) {}
 
     fn wake_processor(&self, _: ProcessorId) {}
@@ -191,6 +201,16 @@ impl Cpu for ManualClockCpu {
 
     fn park_current(&self) {}
 
+    type WakeOnlyMask = ();
+
+    fn mask_to_wake_only(&self) {
+        panic!("this test platform never freezes")
+    }
+
+    fn park_wake_only(&self, _: &core::sync::atomic::AtomicU8, _: u8) {
+        panic!("this test platform never freezes")
+    }
+
     fn start_processor(&self, _: ProcessorId) {}
 
     fn wake_processor(&self, _: ProcessorId) {}
@@ -295,6 +315,16 @@ impl Cpu for RecordingSmpCpu {
 
     fn park_current(&self) {
         self.base.park_current();
+    }
+
+    type WakeOnlyMask = <TestCpu as Cpu>::WakeOnlyMask;
+
+    fn mask_to_wake_only(&self) -> Self::WakeOnlyMask {
+        self.base.mask_to_wake_only()
+    }
+
+    fn park_wake_only(&self, word: &core::sync::atomic::AtomicU8, held: u8) {
+        self.base.park_wake_only(word, held);
     }
 
     fn start_processor(&self, processor: ProcessorId) {

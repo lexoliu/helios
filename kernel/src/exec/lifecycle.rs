@@ -53,6 +53,16 @@
 //!   processor the initiator ran on when it took the transition, which
 //!   takes over the departing processor's pending timers and is woken
 //!   for any global work already queued.
+//! - A freeze (`freeze`'s module docs) and a transition exclude each
+//!   other through the same lock: the freezer takes it before it holds
+//!   any processor and keeps it until the thaw is done, so a freeze
+//!   counts a settled online set and a transition never runs a step
+//!   against a parked processor. A transition requested during a freeze
+//!   waits for the thaw; the holder of a [`crate::FrozenMachine`] cannot
+//!   request one, since it must not await. A processor's first bring-up
+//!   at boot is the one join outside the lock, and it ends at the
+//!   freeze's join checkpoint, which holds it when a freeze has already
+//!   counted the online set without it.
 
 extern crate alloc;
 
@@ -64,7 +74,7 @@ use helios_hal::cpu::{Cpu, ProcessorId, current_processor};
 use helios_hal::watchdog::Watchdog;
 
 use super::executor::{ExecutorGroup, PinnedTasks, machine_executor_group};
-use super::sync::{Notify, RawMutex};
+use super::sync::{Notify, RawMutex, RawMutexLease};
 use crate::Kernel;
 
 /// The kernel's online set: one bit per possible processor.
@@ -286,6 +296,13 @@ impl ProcessorLifecycles {
             })
     }
 
+    /// Takes the lock that serialises transitions. An offline or online
+    /// holds it from its request to the target's settled state, and a
+    /// freeze holds it from before it sets `hold` until its thaw is done.
+    pub(crate) async fn lock_transitions(&self) -> RawMutexLease<'_> {
+        self.transition.lock().await
+    }
+
     /// Whether `processor` has been asked to go offline. `SeqCst`: the
     /// parker half of the request handshake, read after the processor
     /// has published `Parked`.
@@ -379,7 +396,7 @@ impl<CpuImpl: Cpu + Clone> ProcessorControl<CpuImpl> {
         if processor == self.cpu.bootstrap_processor() {
             return Err(OfflineError::Bootstrap { processor });
         }
-        let _transition = self.group.lifecycle().transition.lock().await;
+        let _transition = self.group.lifecycle().lock_transitions().await;
         // Read after the lock: the task may have resumed elsewhere.
         let successor = current_processor();
         if successor == processor {
@@ -421,7 +438,7 @@ impl<CpuImpl: Cpu + Clone> ProcessorControl<CpuImpl> {
                 possible: self.group.possible_processors(),
             });
         }
-        let _transition = self.group.lifecycle().transition.lock().await;
+        let _transition = self.group.lifecycle().lock_transitions().await;
         let cell = self.group.lifecycle().cell(processor);
         match cell.state() {
             LifecycleState::Absent => {
@@ -615,6 +632,10 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> Kernel<CpuImpl, Watch
         );
         STEPS.online(self);
         cell.publish(LifecycleState::Online);
+        // This first bring-up is the one join no transition lock covers:
+        // a freeze that began while it ran either counts this processor
+        // or holds it here, before it fires a timer or polls a task.
+        self.executor.freeze_join_checkpoint(&self.cpu);
     }
 
     /// Runs a pending offline request for this processor: the teardown,
@@ -655,6 +676,9 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> Kernel<CpuImpl, Watch
             processor.id()
         );
         STEPS.online(self);
+        // No join checkpoint: the initiator holds the transition lock
+        // until this publish, so no freeze has set `hold`, and one that
+        // starts after it counts this processor, already online.
         cell.publish(LifecycleState::Online);
         tracing::info!(processor = processor.id(), "Processor back online");
     }

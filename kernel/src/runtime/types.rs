@@ -1152,8 +1152,8 @@ impl HostFsError {
     }
 }
 
-/// What a machine restore did to the host share, as far as the kernel
-/// can tell from the restore's cause.
+/// What a machine restore or a device reset did to the host share, as far
+/// as the kernel can tell from its cause.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostShareRestore {
     /// The host's 9p server is the one the session was attached to and
@@ -1163,8 +1163,9 @@ pub enum HostShareRestore {
     ServerKept,
     /// The server no longer knows the session or any fid in it, because
     /// the kernel came back from an image taken before the server saw
-    /// them. The session is dropped without a `Tclunk`, and the next
-    /// operation attaches again.
+    /// them, or because the virtio 9p device itself was reset
+    /// ([`crate::ResetDevice::HostShare`]). The session is dropped
+    /// without a `Tclunk`, and the next operation attaches again.
     SessionLost,
 }
 
@@ -1173,7 +1174,8 @@ pub trait HostFileSystem: Clone + Send + Sync + 'static {
     /// `None` from an implementation that caches nothing.
     fn cache_stats(&self) -> Option<crate::HostFsCacheStats>;
 
-    /// Brings the filesystem's own state in line with a machine restore:
+    /// Brings the filesystem's own state in line with a machine restore
+    /// or a reset of its device:
     /// an implementation with a session and caches drops what `restore`
     /// says is stale, and one with neither does nothing. Called by the
     /// machine-generation reactions task, never concurrently with

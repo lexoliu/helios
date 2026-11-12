@@ -10,6 +10,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase};
 use helios_hal::memory::MemoryRegion;
 use helios_hal::{DeviceInventory, DmaModel, Platform, ProcessorStartupPolicy, ProcessorTopology};
+use helios_kernel::Timer;
 
 use crate::config::HostedConfig;
 use crate::console::HostedConsole;
@@ -159,11 +160,16 @@ struct ProcessorSlot {
     /// `restart_processor` does.
     run: Mutex<SlotRun>,
     restarted: Condvar,
+    /// This processor's kernel timer, installed once its own
+    /// `helios_kernel::init` has run, so the timer interrupt can advance
+    /// it. Written once by the processor's own thread and read only by
+    /// it: only the owner runs its interrupt step.
+    timer: OnceLock<Timer<HostedCpu>>,
     /// The processor's timer interrupt, raised by the timer thread when
-    /// the processor's deadline expires and taken by the processor in
-    /// `park_current`. It is a level, not a count: expiries before the
-    /// processor takes it are one interrupt, as with a hardware
-    /// comparator.
+    /// the processor's deadline expires, before it unparks the
+    /// processor, and taken by the processor in `park_current`. It is a
+    /// level, not a count: expiries before the processor takes it are
+    /// one interrupt, as with a hardware comparator.
     timer_interrupt: AtomicBool,
 }
 
@@ -303,6 +309,10 @@ impl HostedMachine {
     }
 
     /// Raises `processor`'s timer interrupt and wakes it to take it.
+    ///
+    /// The level is published before the unpark: the unpark's token
+    /// outlives a processor that is not parked yet, so the park it
+    /// reaches returns at once and finds the level.
     fn raise_timer_interrupt(&self, processor: ProcessorId) {
         self.slot(processor)
             .timer_interrupt
@@ -310,12 +320,31 @@ impl HostedMachine {
         self.wake_processor(processor);
     }
 
-    /// Takes `processor`'s pending timer interrupt, if the timer thread
-    /// raised one.
-    pub(crate) fn take_timer_interrupt(&self, processor: ProcessorId) -> bool {
-        self.slot(processor)
-            .timer_interrupt
-            .swap(false, Ordering::Acquire)
+    /// Installs `processor`'s kernel timer. Called once, on the
+    /// processor's own thread, after its `helios_kernel::init`.
+    pub(crate) fn install_timer(&self, processor: ProcessorId, timer: Timer<HostedCpu>) {
+        self.slot(processor).timer.set(timer).unwrap_or_else(|_| {
+            panic!(
+                "processor {} timer was installed more than once",
+                processor.id()
+            )
+        });
+    }
+
+    /// Runs the timer's interrupt step on `processor` if the timer thread
+    /// raised its interrupt since it last took one, the way a bare-metal
+    /// backend's timer interrupt handler does. Called on that processor's
+    /// own thread. Before the timer is installed the level stays raised
+    /// and is taken at the first park after the install, as a masked
+    /// comparator's interrupt is taken once it is unmasked.
+    pub(crate) fn take_timer_interrupt(&self, processor: ProcessorId) {
+        let slot = self.slot(processor);
+        let Some(timer) = slot.timer.get() else {
+            return;
+        };
+        if slot.timer_interrupt.swap(false, Ordering::AcqRel) {
+            timer.handle_interrupt();
+        }
     }
 
     pub(crate) fn wake_processor(&self, processor: ProcessorId) {
@@ -559,6 +588,7 @@ impl ProcessorSlot {
             started: AtomicBool::new(false),
             run: Mutex::new(SlotRun::Running),
             restarted: Condvar::new(),
+            timer: OnceLock::new(),
             timer_interrupt: AtomicBool::new(false),
         }
     }

@@ -428,10 +428,13 @@ Expected output contains:
 - `tools/wasi-apps/curl` uses `helios_api::http` (`wasi:http/client`)
   instead of host libc sockets, so it runs correctly inside helios. The
   kernel forwards each request to the `http-client` kernel plugin
-  (`programs/http-client`), which speaks HTTP/1.1 over `helios:system/net`;
-  the plugin must be provisioned (`--boot-program http-client`) or
-  `wasi:http/client` reports `configuration-error`. `https://` returns the
-  typed `TLS-protocol-error` until the TLS transport lands.
+  (`programs/http-client`), which hosts zenwave's native backend over
+  `helios_api::http_kit` (`wasi:sockets` and the monotonic clock); the
+  plugin must be provisioned (`--boot-program http-client`) or
+  `wasi:http/client` reports `configuration-error`. `https://` runs rustls
+  against the Mozilla roots compiled in (`webpki-roots`), checking validity
+  against `wasi:clocks/wall-clock`; an untrusted, expired or mismatched
+  certificate is the typed `TLS-certificate-error`.
 - `tools/wasi-apps/extract-webc-wasm.pl` extracts the single raw wasm atom
   from the pinned Wasmer WEBc images. The build script validates both WEBc
   and raw wasm SHA-256 digests before staging.

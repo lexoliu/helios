@@ -393,6 +393,14 @@ impl PhysFrameAllocator for UserMemoryPool {
         self.deallocate_with_processor(ptr, frame_layout(range.frame_count), None);
     }
 
+    fn deallocate_reported(&self, range: PhysFrameRange) {
+        // Marked while the run is still the caller's: once it is on a
+        // free list another processor may allocate it, and that
+        // allocation has to find the mark.
+        self.reported.mark(range);
+        PhysFrameAllocator::deallocate(self, range);
+    }
+
     fn stats(&self) -> FrameAllocStats {
         let heap = UserMemoryPool::stats(self);
         FrameAllocStats {
@@ -915,6 +923,39 @@ mod tests {
             tail_byte(ptr.as_ptr() as usize, size),
             0,
             "user memory the host may have discarded is zeroed on reuse"
+        );
+        assert_eq!(PhysFrameAllocator::stats(&pool).reported_frames, 0);
+    }
+
+    /// A run handed back through `deallocate_reported` is one whose
+    /// contents something outside the guest may have dropped, so it
+    /// carries the reported mark from the moment it is free: it counts
+    /// as reported, and the next caller to be handed it, on the uninit
+    /// path included, gets zeroes.
+    #[test]
+    fn a_run_returned_reported_is_zeroed_when_it_is_handed_out_again() {
+        let pool = pool(4 * 1024 * 1024);
+        let free_before = PhysFrameAllocator::stats(&pool).free_frames();
+
+        let run = PhysFrameAllocator::allocate(&pool, 16, false).expect("a 16-frame run");
+        unsafe {
+            core::ptr::write_bytes(run.start.phys_addr() as *mut u8, 0xc3, run.byte_size());
+        }
+        PhysFrameAllocator::deallocate_reported(&pool, run);
+        let stats = PhysFrameAllocator::stats(&pool);
+        assert_eq!(stats.free_frames(), free_before, "the run is free again");
+        assert_eq!(stats.reported_frames, run.frame_count);
+
+        let layout =
+            Layout::from_size_align(run.byte_size(), PhysFrame::SIZE).expect("frame layout");
+        let (ptr, size) = pool
+            .allocate_uninit_with_processor(layout, None)
+            .expect("the returned run is free");
+        assert_eq!(ptr.as_ptr() as usize, run.start.phys_addr());
+        assert_eq!(
+            tail_byte(ptr.as_ptr() as usize, size),
+            0,
+            "the run is zeroed on reuse"
         );
         assert_eq!(PhysFrameAllocator::stats(&pool).reported_frames, 0);
     }

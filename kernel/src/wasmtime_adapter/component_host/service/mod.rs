@@ -804,6 +804,14 @@ where
 {
     spawn_network_packet_pump(&kernel, &debug_state);
     let topology = kernel.topology();
+    // Every backend's bootstrap processor reaches here only after starting
+    // its secondaries, and a backend enables its mechanisms on a processor
+    // before `start_processor` returns for it, so the line follows every
+    // processor's enable.
+    if helios_hal::cpu::current_processor() == topology.bootstrap_processor {
+        crate::control_flow::ReturnAddressCoverage::of(&cpu, env!("HELIOS_BUILD_TARGET"))
+            .log(topology.configured_processors);
+    }
     match component_host_processor_role(
         helios_hal::cpu::current_processor(),
         topology.configured_processors,
@@ -1235,6 +1243,17 @@ where
             .engine
             .interrupts()
             .preempt_overdue(self.inner.clock_cpu.now());
+    }
+
+    /// Interrupts every guest that is running on any processor now,
+    /// however long it has run: what a freeze passes as its
+    /// `interrupt_guests`, so a processor inside wasm reaches a
+    /// scheduler boundary at its next check.
+    ///
+    /// Like [`Self::preempt_overdue_guests`] it takes no lock, allocates
+    /// nothing and sends no IPI.
+    pub fn interrupt_running_guests(&self) {
+        self.inner.engine.interrupts().interrupt_running();
     }
 
     /// Interrupts every store of `instance`, so a kill whose flag is set
@@ -1887,10 +1906,11 @@ where
                     let runtime_state = exec_context.runtime_state.clone();
                     let id = instance.id();
                     move || {
-                        condemn_abandoned_compile(
+                        condemn_compile(
                             &registry,
                             &interrupts,
                             id,
+                            crate::KillReason::RequesterGone,
                             runtime_state.uptime_nanos(cpu.now().ticks()),
                         );
                     }
@@ -1972,7 +1992,11 @@ where
                 &mut phases,
             )
             .await;
-        let thread_reports = self.await_compiler_thread_tasks().await;
+        // A failure of the main thread has condemned the compile
+        // (`end_main_part`), so the workers parked in the pool end and are
+        // joined; the first trap's error is the one reported.
+        let mut thread_reports = self.await_compiler_thread_tasks().await;
+        let result = first_trap_wins(result, &mut thread_reports);
         phases.tasks_joined_ns = if profile {
             monotonic_nanos(&exec_context.cpu)
         } else {
@@ -2048,16 +2072,51 @@ where
         } else {
             0
         };
-        let engine = self.inner.engine.raw();
-        let store_data = CompilerCoreStore::new(CompilerCompileContext {
+        let context = CompilerCompileContext {
             cpu: exec_context.cpu.clone(),
             spawner: exec_context.spawner.clone(),
             runtime_state: exec_context.runtime_state.clone(),
             instance: compiler_instance,
+            registry: exec_context.instance_registry.clone(),
             shared: plugin.shared.clone(),
             write_serial: exec_context.write_serial,
             _marker: core::marker::PhantomData,
-        });
+        };
+        // The main thread's part ends here, before the workers are joined, so
+        // a failure condemns the compile while they can still be ended.
+        let result = self
+            .run_main_thread(
+                exec_context,
+                &plugin,
+                context.clone(),
+                CompilerCallInput {
+                    wasm,
+                    hint,
+                    profile,
+                },
+                phases,
+            )
+            .await;
+        context.end_main_part(result)
+    }
+
+    /// The compile's main thread: its store, the plugin's initialisation and
+    /// the `compile` call, whose rayon workers run on stores of their own.
+    async fn run_main_thread(
+        &self,
+        exec_context: &ProgramExecContext<CpuImpl, Net, HostFs>,
+        plugin: &CompilerPluginHandle<CpuImpl, Net, HostFs>,
+        context: CompilerCompileContext<CpuImpl, Net, HostFs>,
+        input: CompilerCallInput<'_>,
+        phases: &mut CompilerPhaseTimestamps,
+    ) -> Result<Vec<u8>, ProgramExecError> {
+        let CompilerCallInput {
+            wasm,
+            hint,
+            profile,
+        } = input;
+        let engine = self.inner.engine.raw();
+        let store_data = CompilerCoreStore::new(context);
         let mut store = wasmtime::Store::new(engine, store_data);
         let drive = configure_compiler_core_store(&mut store);
         let instance = drive
@@ -2327,6 +2386,7 @@ where
             spawner: exec_context.spawner.clone(),
             runtime_state: exec_context.runtime_state.clone(),
             instance: scratch_instance,
+            registry: exec_context.instance_registry.clone(),
             shared: shared.clone(),
             write_serial: exec_context.write_serial,
             _marker: core::marker::PhantomData,

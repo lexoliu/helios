@@ -2,7 +2,8 @@
 //!
 //! `executor` and `task` carry the per-CPU run-queue executor and
 //! its task-spawning surface. `idle` holds the per-processor
-//! haltpoll handshake behind `Executor::park_until_work`. `sync`
+//! haltpoll handshake behind `Executor::park_until_work`. `freeze`
+//! holds every processor at a scheduler boundary. `sync`
 //! provides async-aware mutex /
 //! rwlock / notify primitives. `timer` exposes the timing wheel and
 //! the Sleep future. `time` provides the kernel monotonic clock.
@@ -11,6 +12,7 @@
 
 mod compaction;
 mod executor;
+mod freeze;
 mod idle;
 mod in_flight;
 mod lifecycle;
@@ -33,6 +35,7 @@ pub use executor::{
     Executor, ExecutorRunStats, InstanceSpawner, JoinHandle, LocalJoinHandle, PinnedTasks,
     READY_BATCH_TASKS, Spawner, TaskCapacityError, TaskFunding,
 };
+pub use freeze::{FreezeError, FrozenMachine};
 pub use idle::IdleOutcome;
 pub use in_flight::InFlight;
 pub use lifecycle::{

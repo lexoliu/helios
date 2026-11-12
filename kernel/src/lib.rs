@@ -10,6 +10,8 @@ mod audio;
 mod bootfs;
 mod buffer;
 mod component;
+#[cfg(feature = "wasmtime-runtime")]
+mod control_flow;
 mod device;
 mod display;
 mod embedded;
@@ -101,18 +103,18 @@ pub use embedded::{BootPayload, EmbeddedComponent, EmbeddedInit};
 pub use exec::{
     CompactionBudget, CompactionPolicy, CompactionReport, CompactionTarget, Compactor,
     DEFAULT_PERF_METRIC_CAPACITY, DEFAULT_PROFILE_STACK_CAPACITY, DEFAULT_TRACE_HISTORY_CAPACITY,
-    Executor, ExecutorRunStats, FoldedProfileSample, GUEST_TIME_SLICE, IdleOutcome,
-    InstanceSpawner, JoinHandle, KernelClock, LocalJoinHandle, Mutex, MutexGuard, Notified, Notify,
-    NotifyWaiter, OfflineError, OfflineRefusal, OnlineError, OnlineSet, OwnedRawMutexLease,
-    OwnedRawRwLockReadLease, OwnedRawRwLockWriteLease, PerfMetricFilter, PerfMetricHistory,
-    PerfMetricSample, PerfSample, PinnedTasks, PressureLevel, ProcessorControl, ProfileFilter,
-    ProfileHistory, ProfileScope, ProfileSink, ProgressChanged, ProgressMark, ProgressSignal,
-    RawMutex, RawMutexLease, RawRwLock, RawRwLockReadLease, RawRwLockWriteLease, ReadyLink, RwLock,
-    RwLockReadGuard, RwLockWriteGuard, Sleep, Spawner, StatsSample, TaskCapacityError, TaskFunding,
-    Timer, TraceEvent, TraceField, TraceFilter, TraceHistory, TraceLevel, TraceValue, UptimeClock,
-    YieldNow, elapsed_millis, matches_perf_metric_filter, matches_profile_filter,
-    matches_trace_filter, monotonic_nanos, online_processor_count, parse_console_text,
-    wall_clock_offset_nanos, yield_now,
+    Executor, ExecutorRunStats, FoldedProfileSample, FreezeError, FrozenMachine, GUEST_TIME_SLICE,
+    IdleOutcome, InstanceSpawner, JoinHandle, KernelClock, LocalJoinHandle, Mutex, MutexGuard,
+    Notified, Notify, NotifyWaiter, OfflineError, OfflineRefusal, OnlineError, OnlineSet,
+    OwnedRawMutexLease, OwnedRawRwLockReadLease, OwnedRawRwLockWriteLease, PerfMetricFilter,
+    PerfMetricHistory, PerfMetricSample, PerfSample, PinnedTasks, PressureLevel, ProcessorControl,
+    ProfileFilter, ProfileHistory, ProfileScope, ProfileSink, ProgressChanged, ProgressMark,
+    ProgressSignal, RawMutex, RawMutexLease, RawRwLock, RawRwLockReadLease, RawRwLockWriteLease,
+    ReadyLink, RwLock, RwLockReadGuard, RwLockWriteGuard, Sleep, Spawner, StatsSample,
+    TaskCapacityError, TaskFunding, Timer, TraceEvent, TraceField, TraceFilter, TraceHistory,
+    TraceLevel, TraceValue, UptimeClock, YieldNow, elapsed_millis, matches_perf_metric_filter,
+    matches_profile_filter, matches_trace_filter, monotonic_nanos, online_processor_count,
+    parse_console_text, wall_clock_offset_nanos, yield_now,
 };
 pub use gpu::{
     ContextRecord, Gpu3dClaim, Gpu3dOwnership, Gpu3dSender, Gpu3dService, Gpu3dServiceError,
@@ -157,8 +159,8 @@ pub use kernel_exception::{
     dispatch_native_trap, install_native_trap_handler,
 };
 pub use machine::{
-    AdvanceCause, Generation, MachineGeneration, MachineGenerationHandle, UnhandledAdvances,
-    install_generation_reactions,
+    AdvanceCause, DeviceResets, Generation, MachineGeneration, MachineGenerationHandle,
+    ResetDevice, UnhandledAdvances, install_generation_reactions,
 };
 pub use memory::{
     AGE_BATCH_PAGES, AccessibilityPlan, BalloonHandle, BalloonStats, BootMemoryPlan,
@@ -913,6 +915,36 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> Kernel<CpuImpl, Watch
         self.timer.sleep_for(duration)
     }
 
+    /// Holds every online processor still at a scheduler boundary, from
+    /// this one, until the returned [`FrozenMachine`] is dropped. An
+    /// offline or online in flight finishes first, and none runs until
+    /// the thaw.
+    ///
+    /// `arrival_deadline` is how long the caller lets the other
+    /// processors take to reach a boundary: its policy for a host that
+    /// may deschedule a processor, and for a task that does not yield.
+    /// `interrupt_guests` asks the runtime that runs guests to interrupt
+    /// each one that is running now (`GuestInterrupts::interrupt_running`),
+    /// so a processor inside wasm reaches a boundary at its next check
+    /// and not at the end of its slice. The concurrency contract, and
+    /// what the caller may do while the machine is held, are in
+    /// `exec::freeze`. The answer pets this kernel's hardware watchdog on
+    /// request, which a hold longer than the watchdog's timeout needs.
+    pub async fn freeze(
+        &self,
+        arrival_deadline: Duration,
+        interrupt_guests: impl FnOnce(),
+    ) -> Result<FrozenMachine<CpuImpl, WatchdogImpl>, FreezeError> {
+        self.executor
+            .freeze(
+                &self.timer,
+                self.watchdog.clone(),
+                arrival_deadline,
+                interrupt_guests,
+            )
+            .await
+    }
+
     pub fn run_until_stalled(&self) -> usize {
         self.run_until_stalled_with_stats().progress_count()
     }
@@ -981,6 +1013,9 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> Kernel<CpuImpl, Watch
         let mut task = core::pin::pin!(self.spawn_local(future));
 
         loop {
+            // The root future is polled outside the ready queues, so it
+            // has a scheduler boundary of its own.
+            self.executor.freeze_checkpoint(&self.cpu);
             parker.clear();
             match task.as_mut().poll(&mut context) {
                 Poll::Ready(output) => return output,

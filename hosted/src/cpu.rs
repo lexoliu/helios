@@ -1,5 +1,6 @@
-use std::cell::RefCell;
+use std::marker::PhantomData;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::thread;
 
 use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase, TimerInterrupt, current_processor};
@@ -32,41 +33,17 @@ impl HostedCpu {
     /// `helios_kernel::init`, the way the bare-metal backends install
     /// theirs; an interrupt raised before that stays pending.
     pub fn install_timer(&self, timer: Timer<HostedCpu>) {
-        PROCESSOR_TIMER.with(|slot| {
-            let previous = slot.borrow_mut().replace(timer);
-            assert!(
-                previous.is_none(),
-                "hosted processor timer was installed more than once"
-            );
-        });
-    }
-
-    /// Delivers a pending timer interrupt to the calling processor: runs
-    /// the installed timer's interrupt step if the machine raised one.
-    ///
-    /// A hosted processor is a thread and cannot be preempted, so an
-    /// interrupt is taken where the thread yields control to the
-    /// machine, which is [`Cpu::park_current`].
-    fn take_timer_interrupt(&self) {
-        PROCESSOR_TIMER.with(|slot| {
-            let slot = slot.borrow();
-            let Some(timer) = slot.as_ref() else {
-                return;
-            };
-            if self.machine.take_timer_interrupt(current_processor()) {
-                timer.handle_interrupt();
-            }
-        });
+        self.machine.install_timer(current_processor(), timer);
     }
 }
 
-thread_local! {
-    /// This thread's processor timer, installed by
-    /// [`HostedCpu::install_timer`]. Only the processor's own thread runs
-    /// its interrupt step, so it lives with the thread rather than in
-    /// the shared machine.
-    static PROCESSOR_TIMER: RefCell<Option<Timer<HostedCpu>>> = const { RefCell::new(None) };
+/// The wake-only mask of a hosted processor: nothing to restore, and
+/// bound to the thread that took it like the register state it stands for.
+pub struct HostedWakeOnlyMask {
+    _processor_local: PhantomData<*mut ()>,
+}
 
+thread_local! {
     /// This thread's logical processor, seeded when the thread's
     /// [`HostedCpu`] is built and read by the identity contract below.
     static CURRENT_PROCESSOR: core::cell::Cell<Option<ProcessorId>> =
@@ -108,13 +85,41 @@ impl Cpu for HostedCpu {
     /// Parks until woken, taking the processor's timer interrupt on the
     /// way in and on the way out: one raised while it ran is handled
     /// before it sleeps, and one that woke it is handled before it
-    /// returns. A raise between the check and the park leaves its unpark
-    /// token, so the park returns at once and the interrupt is taken on
-    /// the way out.
+    /// returns. The timer thread raises the interrupt before it unparks,
+    /// so a raise between the check and the park leaves its unpark
+    /// token, the park returns at once and the interrupt is taken on the
+    /// way out. Either way the interrupt step runs here, on the owner.
     fn park_current(&self) {
-        self.take_timer_interrupt();
+        let processor = current_processor();
+        self.machine.take_timer_interrupt(processor);
         thread::park();
-        self.take_timer_interrupt();
+        self.machine.take_timer_interrupt(processor);
+    }
+
+    type WakeOnlyMask = HostedWakeOnlyMask;
+
+    fn mask_to_wake_only(&self) -> HostedWakeOnlyMask {
+        // A hosted processor is a thread whose only interrupt sources are
+        // unparks, and none of them runs device code on a thread that is
+        // not parked: the timer thread's expiry sets a flag that the
+        // owner's `park_current` acts on. There is no register to narrow.
+        HostedWakeOnlyMask {
+            _processor_local: PhantomData,
+        }
+    }
+
+    fn park_wake_only(&self, word: &AtomicU8, held: u8) {
+        // A hosted processor is a thread and its only interrupt sources
+        // are unparks: the timer thread's and `wake_processor`'s. Nothing
+        // here delivers device code to a parked thread, so "every source
+        // but the wake" is the parked thread itself, which runs nothing
+        // when an unpark ends the park and the word is unchanged. A
+        // store made before the unpark that ends the wait is seen
+        // through the park's own acquire, and an unpark that lands
+        // before the park leaves a token the park consumes.
+        while word.load(Ordering::Acquire) == held {
+            thread::park();
+        }
     }
 
     fn start_processor(&self, processor: ProcessorId) {
