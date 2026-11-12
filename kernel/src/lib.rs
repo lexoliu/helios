@@ -30,6 +30,7 @@ mod runtime;
 mod surface;
 #[cfg(test)]
 mod test_support;
+mod vfs;
 mod vsock;
 #[cfg(feature = "wasmtime-runtime")]
 pub(crate) mod wasmtime_adapter;
@@ -59,10 +60,7 @@ pub use audio::{
     FEEDBACK_QUEUE_DEPTH, Feedback, FeedbackBurst, FeedbackReader, PERIOD_MICROS,
     PERIODS_IN_FLIGHT, PeriodRing, PeriodWriter, PlaybackFormat, install_audio_device,
 };
-pub use bootfs::{
-    BootDirectory, BootDirectoryEntry, BootDirectoryHandleExt, BootFile, BootfsBytes,
-    EmbeddedBootDirectory, EmbeddedBootFile, EmbeddedBootFs,
-};
+pub use bootfs::{BootFs, BootfsBytes, EmbeddedBootDirectory, EmbeddedBootFile, EmbeddedBootFs};
 pub use buffer::{
     BYTES_PER_PIXEL, Buffer, BufferError, GuestMemory, MAX_VIEWS, Span, ViewError, ViewGroup,
     ViewId, ViewTable, WASM_PAGE_BYTES,
@@ -127,7 +125,7 @@ pub use helios_netstack::{
 };
 pub use host_fs::{
     HOST_SHARE_GUEST_MOUNT_PATH, HOST_SHARE_MOUNT_TAG, HostFsCacheStats, HostFsClient,
-    HostFsTransport, UnsupportedHostFileSystem, guest_host_share_path,
+    HostFsTransport, UnsupportedHostFileSystem,
 };
 pub use input::{
     DeviceIndex, EVENT_QUEUE_DEPTH, EventBurst, InputClaim, InputDeviceSnapshot, InputEvents,
@@ -205,13 +203,14 @@ pub use process::{
     DirectoryAuthorityRights, DirectoryCap, DirectoryPreopen, DisplayClaimCap, DnsCap,
     ExecAuthority, ForkAuthority, FutexKey, FutexTable, FutexWaitRegistration, GpuClaimCap,
     GuestAddress, InputClaimCap, JoinAuthority, LinkAuthorityRights, LinkSourceCap,
-    LinkTargetDirectoryCap, MulticastCap, NetworkAdminCap, NetworkAuthorityRights, NetworkCap,
-    PrivilegedBindCap, ProcessAuthority, ProcessAuthorityError, ProcessAuthorityRights, ProcessId,
-    ProcessMemoryIdentity, ProcessRecord, ProcessState, ProcessTable, ProcessTableError,
-    ProgramExecError, ProgramExecErrorDetail, ProgramExecErrorKind, ProgramOutOfMemory,
-    RuntimeMessage, SetWallClockCap, SignalAuthority, SpawnAuthority, SymlinkCreateCap,
-    SymlinkReadCap, TcpCap, TerminalAuthorityRights, TerminalInputCap, TerminalOutputCap, ThreadId,
-    ThreadRecord, ThreadState, ThreadTable, ThreadTableError, TtyControlCap, UdpCap,
+    LinkTargetDirectoryCap, MountAuthorityRights, MountCap, MulticastCap, NetworkAdminCap,
+    NetworkAuthorityRights, NetworkCap, PrivilegedBindCap, ProcessAuthority, ProcessAuthorityError,
+    ProcessAuthorityRights, ProcessId, ProcessMemoryIdentity, ProcessRecord, ProcessState,
+    ProcessTable, ProcessTableError, ProgramExecError, ProgramExecErrorDetail,
+    ProgramExecErrorKind, ProgramOutOfMemory, RuntimeMessage, SetWallClockCap, SignalAuthority,
+    SpawnAuthority, SymlinkCreateCap, SymlinkReadCap, TcpCap, TerminalAuthorityRights,
+    TerminalInputCap, TerminalOutputCap, ThreadId, ThreadRecord, ThreadState, ThreadTable,
+    ThreadTableError, TtyControlCap, UdpCap, UnmountCap,
 };
 pub use profiling::{
     CodeAttribution, InstructionProfile, InstructionProfileError, InstructionSampler,
@@ -220,19 +219,25 @@ pub use profiling::{
     WasmFunctionSample,
 };
 pub use runtime::{
-    AuthorityDomain, ComponentHostFilesystemState, ComponentHostNetwork, ComponentNetworkService,
-    ComponentNetworkState, DnsError, DnsErrorKind, ExecOutput, ExecResult, HostDirEntry,
-    HostDirLimit, HostFileSystem, HostFsError, HostFsErrorKind, HostMetadata, HostShareRestore,
-    Ipv4Address, NetworkErrorDetail, NetworkHandle, NetworkIpAddress, NetworkPacketPump,
-    ObjectIdentity, PingError, PingErrorKind, PingReply, RegisteredTcpReadBuffer, RuntimeState,
-    SocketReadiness, TcpAccepted, TcpError, TcpErrorKind, TcpListener, TcpReadProgress,
-    TcpWriteProgress, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
+    AuthorityDomain, ComponentHostNetwork, ComponentNetworkService, ComponentNetworkState,
+    DnsError, DnsErrorKind, ExecOutput, ExecResult, HostDirEntry, HostDirLimit, HostFileSystem,
+    HostFsError, HostFsErrorKind, HostMetadata, HostShareRestore, Ipv4Address, NetworkErrorDetail,
+    NetworkHandle, NetworkIpAddress, NetworkPacketPump, ObjectIdentity, PingError, PingErrorKind,
+    PingReply, RegisteredTcpReadBuffer, RuntimeState, SocketReadiness, TcpAccepted, TcpError,
+    TcpErrorKind, TcpListener, TcpReadProgress, TcpWriteProgress, UdpBinding, UdpDatagram,
+    UdpError, UdpErrorKind,
 };
 pub use surface::{
     MAX_INSTANCE_SURFACES, MAX_LIVE_SURFACES, ReturnedSurface, ReturnedSurfaces,
     SURFACE_EVENT_QUEUE_DEPTH, SURFACE_REQUEST_QUEUE_DEPTH, SurfaceCreate, SurfaceEvents,
     SurfaceGeometry, SurfaceId, SurfaceOwnership, SurfaceRect, SurfaceRequest, SurfaceService,
     SurfaceServiceError, SurfaceShared,
+};
+pub use vfs::{
+    BOOT_DEVICE, FileContents, Follow, HeldPath, HostShare, MAX_MOUNTS, MAX_SYMLINK_DEPTH,
+    MemoryFs, MountError, MountHold, MountRequestError, MountSource, MountTable, MountedFs,
+    Namespace, ROOT_LAYER_DEVICE, Resolved, RootFs, object_identity, request_mount,
+    request_unmount, symlink_target, within_directory,
 };
 pub use vsock::{
     ComponentHostVsockService, MAX_VSOCK_BACKLOG, MAX_VSOCK_CONNECTIONS, MAX_VSOCK_LISTENERS,
