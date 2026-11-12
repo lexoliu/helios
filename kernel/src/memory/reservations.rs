@@ -197,10 +197,16 @@ impl ReservationTracker {
     }
 
     /// Validates that `virt` lies inside a reservation and is fully
-    /// covered by committed regions.
+    /// covered by committed regions or swapped-out pages.
+    ///
+    /// A swapped-out page is committed memory whose frame is on loan to
+    /// the swap backend, so it counts here exactly as it does in
+    /// [`Self::accessibility_plan`] and [`Self::check_substitutable`]:
+    /// a protection change or a decommit reaches it, and the entry keeps
+    /// the page's flags and token.
     pub fn ensure_committed(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
         let reservation = self.find(virt)?;
-        if !committed_regions_cover(&reservation.committed, virt) {
+        if !committed_or_swapped_cover(&reservation.committed, &reservation.swapped, virt) {
             return Err(AddressSpaceError::NotCommitted);
         }
         Ok(())
@@ -443,6 +449,10 @@ impl ReservationTracker {
 
     /// Splits `virt` into already-committed sub-ranges (to re-protect)
     /// and uncommitted gaps (to commit).
+    ///
+    /// A swapped-out page is committed: it is planned for a protection
+    /// change, never for a commit, which would replace its contents with
+    /// a zero page and orphan its token.
     pub fn accessibility_plan(
         &self,
         virt: VirtRange,
@@ -455,27 +465,19 @@ impl ReservationTracker {
         let mut cursor = virt.start.raw();
         let end = virt.end().raw();
         while cursor < end {
-            if let Some(region) = reservation
-                .committed
-                .iter()
-                .find(|region| region.range.contains(VirtAddr::new(cursor)))
-                .copied()
+            if let Some(next) =
+                committed_extent_end(&reservation.committed, &reservation.swapped, cursor)
             {
-                let next = region.range.end().raw().min(end);
+                let next = next.min(end);
                 plan.protect
                     .push(VirtRange::new(VirtAddr::new(cursor), next - cursor));
                 cursor = next;
                 continue;
             }
-            let next_committed_start = reservation
-                .committed
-                .iter()
-                .filter_map(|region| {
-                    let start = region.range.start.raw();
-                    (cursor < start && start < end).then_some(start)
-                })
-                .min()
-                .unwrap_or(end);
+            let next_committed_start =
+                next_committed_extent_start(&reservation.committed, &reservation.swapped, cursor)
+                    .filter(|start| *start < end)
+                    .unwrap_or(end);
             plan.commit.push(VirtRange::new(
                 VirtAddr::new(cursor),
                 next_committed_start - cursor,
@@ -744,19 +746,41 @@ fn range_intersection(a: VirtRange, b: VirtRange) -> Option<VirtRange> {
     (start < end).then(|| VirtRange::new(VirtAddr::new(start), end - start))
 }
 
-fn committed_regions_cover(regions: &[CommittedRegion], range: VirtRange) -> bool {
-    let mut cursor = range.start.raw();
-    let end = range.end().raw();
-    while cursor < end {
-        let Some(region) = regions
+/// Where the committed extent containing `cursor` ends: the end of the
+/// committed region holding it, or the end of its page when it is a
+/// swapped-out one. `None` when `cursor` is uncommitted.
+///
+/// This is the one definition of "committed" the tracker's coverage
+/// checks and its accessibility plan share.
+fn committed_extent_end(
+    regions: &[CommittedRegion],
+    swapped: &[SwapEntry],
+    cursor: usize,
+) -> Option<usize> {
+    let addr = VirtAddr::new(cursor);
+    if let Some(region) = regions.iter().find(|region| region.range.contains(addr)) {
+        Some(region.range.end().raw())
+    } else {
+        swapped
             .iter()
-            .find(|region| region.range.contains(VirtAddr::new(cursor)))
-        else {
-            return false;
-        };
-        cursor = region.range.end().raw().min(end);
+            .any(|entry| entry.addr == addr)
+            .then_some(cursor + PhysFrame::SIZE)
     }
-    true
+}
+
+/// The start of the nearest committed extent above `cursor`, a region
+/// or a swapped-out page, if any.
+fn next_committed_extent_start(
+    regions: &[CommittedRegion],
+    swapped: &[SwapEntry],
+    cursor: usize,
+) -> Option<usize> {
+    regions
+        .iter()
+        .map(|region| region.range.start.raw())
+        .chain(swapped.iter().map(|entry| entry.addr.raw()))
+        .filter(|start| cursor < *start)
+        .min()
 }
 
 /// Whether every page of `range` is inside a committed region or is a
@@ -769,14 +793,10 @@ fn committed_or_swapped_cover(
     let mut cursor = range.start.raw();
     let end = range.end().raw();
     while cursor < end {
-        let addr = VirtAddr::new(cursor);
-        if let Some(region) = regions.iter().find(|region| region.range.contains(addr)) {
-            cursor = region.range.end().raw().min(end);
-        } else if swapped.iter().any(|entry| entry.addr == addr) {
-            cursor += PhysFrame::SIZE;
-        } else {
+        let Some(next) = committed_extent_end(regions, swapped, cursor) else {
             return false;
-        }
+        };
+        cursor = next.min(end);
     }
     true
 }
@@ -992,6 +1012,84 @@ mod tests {
         let plan = tracker.accessibility_plan(range(0x1_0000, 4)).unwrap();
         assert_eq!(plan.protect, [range(0x1_1000, 1)]);
         assert_eq!(plan.commit, [range(0x1_0000, 1), range(0x1_2000, 2)]);
+    }
+
+    #[test]
+    fn a_swapped_page_is_committed_to_the_plan_and_to_protect() {
+        let mut tracker = tracker_with_reservation(0x1_0000, 4);
+        tracker
+            .record_commit(
+                range(0x1_0000, 4),
+                PageFlags::READ | PageFlags::WRITE,
+                MemoryOwner::NONE,
+            )
+            .unwrap();
+        let token = SwapToken::new(7).unwrap();
+        tracker
+            .record_swap_out(VirtAddr::new(0x1_1000), token)
+            .unwrap();
+
+        let plan = tracker.accessibility_plan(range(0x1_0000, 4)).unwrap();
+        assert!(
+            plan.commit.is_empty(),
+            "a commit over the swapped page would replace its contents"
+        );
+        assert_eq!(
+            plan.protect.iter().map(|r| r.byte_len).sum::<usize>(),
+            4 * PAGE
+        );
+
+        tracker.ensure_committed(range(0x1_0000, 4)).unwrap();
+        tracker
+            .record_protect(range(0x1_0000, 4), PageFlags::READ)
+            .unwrap();
+        let entry = tracker.swap_entry(VirtAddr::new(0x1_1000)).unwrap();
+        assert_eq!(entry.token, token);
+        assert_eq!(entry.flags, PageFlags::READ, "the entry follows a protect");
+
+        tracker.take_swap_entry(VirtAddr::new(0x1_1000)).unwrap();
+        let regions = tracker.committed_intersections(range(0x1_0000, 4)).unwrap();
+        assert!(regions.iter().all(|region| region.flags == PageFlags::READ));
+    }
+
+    #[test]
+    fn decommit_reaches_a_swapped_page_and_returns_its_entry() {
+        let mut tracker = tracker_with_reservation(0x1_0000, 3);
+        tracker
+            .record_commit(range(0x1_0000, 3), PageFlags::READ, MemoryOwner::NONE)
+            .unwrap();
+        let token = SwapToken::new(9).unwrap();
+        tracker
+            .record_swap_out(VirtAddr::new(0x1_1000), token)
+            .unwrap();
+        let decommitted = tracker.record_decommit(range(0x1_0000, 3)).unwrap();
+        assert_eq!(
+            decommitted
+                .swapped
+                .iter()
+                .map(|e| e.token)
+                .collect::<Vec<_>>(),
+            [token]
+        );
+        assert_eq!(tracker.swapped_pages(), 0);
+        assert_eq!(
+            tracker.lookup(VirtAddr::new(0x1_1000)),
+            ReservationLookup::Reserved
+        );
+    }
+
+    #[test]
+    fn the_plan_commits_only_the_uncommitted_gaps_around_a_swapped_page() {
+        let mut tracker = tracker_with_reservation(0x1_0000, 5);
+        tracker
+            .record_commit(range(0x1_2000, 1), PageFlags::READ, MemoryOwner::NONE)
+            .unwrap();
+        tracker
+            .record_swap_out(VirtAddr::new(0x1_2000), SwapToken::new(3).unwrap())
+            .unwrap();
+        let plan = tracker.accessibility_plan(range(0x1_0000, 5)).unwrap();
+        assert_eq!(plan.protect, [range(0x1_2000, 1)]);
+        assert_eq!(plan.commit, [range(0x1_0000, 2), range(0x1_3000, 2)]);
     }
 
     #[test]

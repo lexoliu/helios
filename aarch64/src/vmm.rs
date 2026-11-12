@@ -393,7 +393,17 @@ impl Aarch64UserAddressSpace {
         Ok(entry)
     }
 
-    fn protect_4k_no_flush(&self, virt: usize, flags: u64) -> Result<u64, AddressSpaceError> {
+    /// Rewrites the permissions of the leaf at `virt`, returning the entry
+    /// it replaced, or `None` when the leaf is a swap entry.
+    ///
+    /// A swap leaf carries only its token: the page's flags live in the
+    /// reservation tracker's swap entry, which a protect updates, and
+    /// swap-in maps the page with them. The leaf stays as it is.
+    fn protect_4k_no_flush(
+        &self,
+        virt: usize,
+        flags: u64,
+    ) -> Result<Option<u64>, AddressSpaceError> {
         let l0 = self.root();
         let l0_index = (virt >> 39) & 0x1ff;
         let l0_entry = unsafe { l0.add(l0_index).read_volatile() };
@@ -417,7 +427,11 @@ impl Aarch64UserAddressSpace {
         let entry_ptr = unsafe { l3.add(l3_index) };
         let entry = unsafe { entry_ptr.read_volatile() };
         if entry & VALID == 0 {
-            return Err(AddressSpaceError::NotCommitted);
+            return if swap_descriptor_token(entry).is_some() {
+                Ok(None)
+            } else {
+                Err(AddressSpaceError::NotCommitted)
+            };
         }
         let phys = entry & PT_ADDR_MASK;
         // The memory type is not a permission: a substituted device
@@ -427,7 +441,7 @@ impl Aarch64UserAddressSpace {
         unsafe {
             entry_ptr.write_volatile(new_descriptor);
         }
-        Ok(entry)
+        Ok(Some(entry))
     }
 
     fn translate_4k(&self, virt: usize) -> Option<u64> {
@@ -597,8 +611,14 @@ impl Aarch64UserAddressSpace {
         }
     }
 
-    fn rollback_partial_protect(&self, start: usize, old_entries: &[u64]) {
+    /// Puts back the leaves the forward pass rewrote. `old_entries` holds
+    /// one slot per page from `start`; a swap leaf the pass left alone is
+    /// `None` and is not touched.
+    fn rollback_partial_protect(&self, start: usize, old_entries: &[Option<u64>]) {
         for (page, entry) in old_entries.iter().copied().enumerate().rev() {
+            let Some(entry) = entry else {
+                continue;
+            };
             let virt = start + page * PAGE;
             self.replace_4k(virt, entry).unwrap_or_else(|error| {
                 panic!("Aarch64 AddressSpace::protect rollback failed at {virt:#x}: {error}")
@@ -906,8 +926,13 @@ impl Aarch64UserAddressSpace {
     ) -> Result<(), AddressSpaceError> {
         let pte_flags = page_flags_to_pte(flags)?;
         state.ensure_committed(virt)?;
+        // Pages the pass walked, a swap leaf it skipped included: the
+        // flush covers the whole walked run, and an invalidation of a page
+        // whose leaf did not change is harmless.
         let mut protected_pages = 0;
-        let mut old_entries = Vec::new();
+        // One slot per walked page: the entry the pass replaced, `None`
+        // for a swap leaf it left alone.
+        let mut old_entries: Vec<Option<u64>> = Vec::new();
         for offset in (0..virt.byte_len).step_by(PAGE) {
             match self.protect_4k_no_flush(virt.start.raw() + offset, pte_flags) {
                 Ok(entry) => old_entries.push(entry),
@@ -1092,11 +1117,23 @@ impl AddressSpace for Aarch64UserAddressSpace {
         validate_range(virt)?;
         let mut state = self.state.lock();
         let removed = state.record_decommit(virt)?;
+        // The unmap pass skips every page that has no pool frame to give
+        // back: a substituted part, whose frames are not the pool's, and a
+        // swapped page, whose leaf `discard` clears. An invalid leaf
+        // anywhere else is still refused.
+        let mut frameless = removed.substituted.clone();
+        frameless.extend(
+            removed
+                .swapped
+                .iter()
+                .map(|entry| VirtRange::new(entry.addr, PAGE)),
+        );
+        frameless.sort_by_key(|part| part.start.raw());
         self.swap.discard(self, removed.swapped);
         // A substitution inside the range is dropped without freeing the
         // run's frames, as a withdraw would.
         self.drop_substituted_parts(&removed.substituted);
-        self.decommit_mapped_outside(virt, &removed.substituted)?;
+        self.decommit_mapped_outside(virt, &frameless)?;
         Ok(())
     }
 
