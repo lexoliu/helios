@@ -820,7 +820,9 @@ where
     retransmission_timer: TcpRetransmissionTimer,
     persist_timer: Option<TcpPersistTimer>,
     persist_probe: Option<TcpPersistProbe>,
-    next_pacing_send_nanos: Option<u64>,
+    /// What the pacing rate has been charged for; `None` while the
+    /// controller reports no rate.
+    pacing: Option<TcpPacingBudget>,
     delayed_ack_deadline_nanos: Option<u64>,
     time_wait_deadline_nanos: Option<u64>,
     unacked_receive_segments: u8,
@@ -1006,7 +1008,7 @@ where
             retransmission_timer: TcpRetransmissionTimer::new(),
             persist_timer: None,
             persist_probe: None,
-            next_pacing_send_nanos: None,
+            pacing: None,
             delayed_ack_deadline_nanos: None,
             time_wait_deadline_nanos: None,
             unacked_receive_segments: 0,
@@ -1361,6 +1363,13 @@ where
         self.peer_max_segment_size
     }
 
+    /// Bytes sent and not yet acknowledged, for tests that compare what
+    /// a drive marked in flight with what it queued.
+    #[cfg(test)]
+    pub(crate) const fn bytes_in_flight(&self) -> u32 {
+        self.bytes_in_flight
+    }
+
     pub const fn peer_window_scale(&self) -> u8 {
         self.peer_window_scale
     }
@@ -1618,7 +1627,8 @@ where
             })
         });
         let pacing_deadline = self
-            .next_pacing_send_nanos
+            .pacing
+            .map(TcpPacingBudget::drained_at_nanos)
             .filter(|_| !self.transmit_queue_is_empty());
         let persist_deadline = self.persist_timer.map(TcpPersistTimer::deadline_nanos);
         min_deadline(
@@ -1642,11 +1652,7 @@ where
         now_nanos: u64,
         persist_probe: Option<TcpPersistProbe>,
     ) -> Option<TcpTransmitSegment> {
-        if self
-            .next_pacing_send_nanos
-            .is_some_and(|deadline| now_nanos < deadline)
-            && persist_probe.is_none()
-        {
+        if persist_probe.is_none() && self.pacing.is_some_and(|pacing| !pacing.is_open(now_nanos)) {
             return None;
         }
         let options = self.timestamped_options(now_nanos);
@@ -1657,6 +1663,10 @@ where
         if payload_mtu == 0 {
             return None;
         }
+        // The segment size the pacing budget is sized in: what a full
+        // segment on this path carries, whatever the window leaves
+        // room for right now.
+        let pacing_segment = self.peer_max_segment_size.min(payload_mtu);
         // Coalescing is on only when the interface asked for a frame
         // wider than one wire segment; otherwise the socket emits
         // exactly one segment per call, as it always has.
@@ -1744,7 +1754,7 @@ where
                     .expect("TCP in-flight queue is full");
                 offset += chunk_len;
             }
-            self.schedule_next_pacing_send(sequence_len, now_nanos);
+            self.charge_pacing(sequence_len, pacing_segment, now_nanos);
         }
         self.note_ack_emitted();
         Some(TcpTransmitSegment {
@@ -2288,7 +2298,7 @@ where
         self.pending_pmtu_retransmit_sequence = None;
         self.persist_timer = None;
         self.persist_probe = None;
-        self.next_pacing_send_nanos = None;
+        self.pacing = None;
         self.delayed_ack_deadline_nanos = None;
         self.time_wait_deadline_nanos = None;
         self.unacked_receive_segments = 0;
@@ -3118,11 +3128,26 @@ where
         congestion_window.min(receive_window) as usize
     }
 
-    fn schedule_next_pacing_send(&mut self, bytes: u32, now_nanos: u64) {
-        self.next_pacing_send_nanos = self
-            .congestion
-            .pacing_rate()
-            .map(|rate| now_nanos.saturating_add(pacing_interval_nanos(bytes, rate)));
+    /// Charges the pacing budget for `bytes` just sent. `segment` is the
+    /// payload of a full segment on this path, which sizes the burst
+    /// allowance.
+    fn charge_pacing(&mut self, bytes: u32, segment: usize, now_nanos: u64) {
+        self.pacing = self.congestion.pacing_rate().map(|rate| {
+            let (paid_until_nanos, burst_end_nanos) = match self.pacing {
+                Some(pacing) if now_nanos < pacing.paid_until_nanos => {
+                    (pacing.paid_until_nanos, pacing.burst_end_nanos)
+                }
+                _ => (
+                    now_nanos,
+                    now_nanos.saturating_add(pacing_burst_allowance_nanos(segment, rate)),
+                ),
+            };
+            TcpPacingBudget {
+                paid_until_nanos: paid_until_nanos
+                    .saturating_add(pacing_interval_nanos(bytes, rate)),
+                burst_end_nanos,
+            }
+        });
     }
 
     fn timestamped_options(&self, now_nanos: u64) -> TcpHeaderOptions {
@@ -3320,6 +3345,53 @@ fn pacing_interval_nanos(bytes: u32, rate: crate::PacingRate) -> u64 {
     ((u64::from(bytes) * 1_000_000_000) / rate.bytes_per_second()).max(1)
 }
 
+/// Longest stretch of line time one pass may send ahead of the pacing
+/// rate: one millisecond, the quantum Linux sizes a TSO burst to
+/// (`sk_pacing_rate >> sk_pacing_shift`, with `sk_pacing_shift` 10, in
+/// `tcp_tso_autosize`).
+const TCP_PACING_BURST_NANOS: u64 = 1_000_000;
+
+/// Segments a burst may never be smaller than: `tcp_min_tso_segs` in
+/// Linux's `tcp_tso_autosize`, so a low rate still sends in pairs.
+const TCP_PACING_MIN_BURST_SEGMENTS: u32 = 2;
+
+/// How far ahead of the pacing rate a socket may send: a millisecond
+/// of line time, but never less than two segments' worth.
+fn pacing_burst_allowance_nanos(segment: usize, rate: crate::PacingRate) -> u64 {
+    let minimum_bytes = u32::try_from(segment)
+        .unwrap_or(u32::MAX)
+        .saturating_mul(TCP_PACING_MIN_BURST_SEGMENTS);
+    TCP_PACING_BURST_NANOS.max(pacing_interval_nanos(minimum_bytes, rate))
+}
+
+/// A socket's pacing budget: what the rate has been charged for.
+///
+/// Sending `n` bytes at rate `r` pays for `n / r` of line time, so
+/// `paid_until_nanos` is the instant the bytes sent so far would have
+/// finished leaving at the rate. A burst starts only once everything
+/// sent has been paid for (`now >= paid_until_nanos`, so idle time
+/// banks no credit) and runs while `paid_until_nanos` is below
+/// `burst_end_nanos`, one burst allowance past the instant it started.
+/// The socket then waits for the debt to drain before the next burst,
+/// so a pass emits a burst rather than a segment, and the bytes sent
+/// by any instant exceed rate times time by at most one allowance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TcpPacingBudget {
+    paid_until_nanos: u64,
+    burst_end_nanos: u64,
+}
+
+impl TcpPacingBudget {
+    fn is_open(self, now_nanos: u64) -> bool {
+        now_nanos >= self.paid_until_nanos || self.paid_until_nanos < self.burst_end_nanos
+    }
+
+    /// The instant a socket that has used its burst may send again.
+    fn drained_at_nanos(self) -> u64 {
+        self.paid_until_nanos
+    }
+}
+
 fn min_deadline(left: Option<u64>, right: Option<u64>) -> Option<u64> {
     match (left, right) {
         (Some(left), Some(right)) => Some(left.min(right)),
@@ -3459,11 +3531,18 @@ mod tests {
     }
 
     fn established_fixed_pacing_socket(rate: PacingRate) -> TcpSocket<FixedPacing> {
+        established_fixed_pacing_socket_with_window(16, rate)
+    }
+
+    fn established_fixed_pacing_socket_with_window(
+        window_bytes: u32,
+        rate: PacingRate,
+    ) -> TcpSocket<FixedPacing> {
         let mut socket = TcpSocket::connect(
             endpoint(49152),
             peer(80),
             7,
-            FixedPacing::new(CongestionWindow::new(16), Some(rate)),
+            FixedPacing::new(CongestionWindow::new(window_bytes), Some(rate)),
         );
         socket.mark_syn_queued(0);
         let _ = deliver_segment(
@@ -5631,73 +5710,120 @@ mod tests {
 
     #[test]
     fn pacing_rate_delays_next_data_segment() {
+        // Four payload bytes a segment at 1000 B/s: 4 ms of line time a
+        // segment and, at two segments, an 8 ms burst allowance.
         let mut socket = established_fixed_pacing_socket(PacingRate::from_bytes_per_second(1_000));
-        assert_eq!(socket.queue_send(b"abcdefgh"), 8);
-        let first = socket
-            .take_transmit_segment(
-                TCP_INITIAL_RTO_NANOS + 1,
-                TcpSegmentBudget::wire_segments(usize::MAX),
-            )
-            .expect("first paced segment should transmit immediately");
-        assert_eq!(first.payload.as_ref(), b"abcdefgh");
-        assert_eq!(socket.queue_send(b"ijkl"), 4);
+        let start = TCP_INITIAL_RTO_NANOS + 1;
+        assert_eq!(socket.queue_send(b"abcdefghijkl"), 12);
+        for expected in [b"abcd", b"efgh"] {
+            let segment = socket
+                .take_transmit_segment(start, FOUR_BYTE_SEGMENTS)
+                .expect("the burst allowance covers two segments");
+            assert_eq!(segment.payload.as_ref(), expected);
+        }
+        assert_eq!(socket.next_deadline_nanos(), Some(start + 8_000_000));
         assert_eq!(
-            socket.next_deadline_nanos(),
-            Some(TCP_INITIAL_RTO_NANOS + 1 + 8_000_000)
-        );
-        assert_eq!(
-            socket.take_transmit_segment(
-                TCP_INITIAL_RTO_NANOS + 2,
-                TcpSegmentBudget::wire_segments(usize::MAX)
-            ),
-            None
+            socket.take_transmit_segment(start + 1, FOUR_BYTE_SEGMENTS),
+            None,
+            "the burst is spent and its line time is not yet paid back"
         );
 
-        let second = socket
-            .take_transmit_segment(
-                TCP_INITIAL_RTO_NANOS + 1 + 8_000_000,
-                TcpSegmentBudget::wire_segments(usize::MAX),
-            )
-            .expect("paced deadline should release the next segment");
-        assert_eq!(second.payload.as_ref(), b"ijkl");
+        let third = socket
+            .take_transmit_segment(start + 8_000_000, FOUR_BYTE_SEGMENTS)
+            .expect("paying the burst back releases the next one");
+        assert_eq!(third.payload.as_ref(), b"ijkl");
+    }
+
+    /// One segment carries four payload bytes: a bare header and no
+    /// options.
+    const FOUR_BYTE_SEGMENTS: TcpSegmentBudget =
+        TcpSegmentBudget::wire_segments(TcpPacket::MIN_HEADER_LEN + 4);
+
+    #[test]
+    fn a_pacing_burst_is_a_millisecond_and_never_under_two_segments() {
+        let rate = PacingRate::from_bytes_per_second(1_000_000_000);
+        // 1 ms at 1 GB/s is 1,000,000 bytes, far over two segments.
+        assert_eq!(pacing_burst_allowance_nanos(1460, rate), 1_000_000);
+        // At 1000 B/s a millisecond is one byte, so two 4-byte segments
+        // (8 ms) set the allowance.
+        let slow = PacingRate::from_bytes_per_second(1_000);
+        assert_eq!(pacing_burst_allowance_nanos(4, slow), 8_000_000);
+    }
+
+    #[test]
+    fn a_paced_socket_sends_a_burst_then_holds_the_average_rate() {
+        // 1 MB/s with full-size segments: 1 ms is 1000 bytes, under two
+        // segments, so the allowance is two segments.
+        let mut socket = established_fixed_pacing_socket_with_window(
+            u32::from(u16::MAX),
+            PacingRate::from_bytes_per_second(1_000_000),
+        );
+        let mss = socket.peer_max_segment_size();
+        let payload = alloc::vec![0x5a; 8 * 1024];
+        assert_eq!(socket.queue_send(&payload), payload.len());
+        let budget = TcpSegmentBudget::wire_segments(usize::MAX);
+        let start = TCP_INITIAL_RTO_NANOS + 1;
+        let mut sent = 0usize;
+        let mut sent_by_pass = alloc::vec::Vec::new();
+        // Every 100 us for 20 ms.
+        for step in 0..200u64 {
+            let now = start + step * 100_000;
+            let before = sent;
+            while let Some(segment) = socket.take_transmit_segment(now, budget) {
+                sent += segment.payload.len();
+                // Keep the window and the in-flight queue open.
+                let _ = deliver_segment(
+                    &mut socket,
+                    peer_ack(
+                        segment.header.sequence.wrapping_add(segment.sequence_len),
+                        u16::MAX,
+                    ),
+                    now,
+                );
+            }
+            if sent != before {
+                sent_by_pass.push(sent - before);
+            }
+            let elapsed = now - start;
+            // 1 MB/s is one byte per 1000 ns. Bytes sent never exceed
+            // rate x time by more than one burst.
+            assert!(
+                sent as u64 <= elapsed / 1_000 + 2 * mss as u64,
+                "{sent} bytes by {elapsed} ns is over the rate plus one burst"
+            );
+        }
+        // Whole bursts, each after the previous one's line time has
+        // been paid back, until the 8 KiB payload is out.
+        assert_eq!(sent_by_pass, [2 * mss, 2 * mss, 8 * 1024 - 4 * mss]);
     }
 
     #[test]
     fn paced_close_waits_for_queued_data_before_fin() {
         let mut socket = established_fixed_pacing_socket(PacingRate::from_bytes_per_second(1_000));
+        let start = TCP_INITIAL_RTO_NANOS + 1;
         assert_eq!(socket.queue_send(b"abcdefgh"), 8);
-        let first = socket
-            .take_transmit_segment(
-                TCP_INITIAL_RTO_NANOS + 1,
-                TcpSegmentBudget::wire_segments(usize::MAX),
-            )
-            .expect("first paced segment should transmit immediately");
-        assert_eq!(first.payload.as_ref(), b"abcdefgh");
+        for expected in [b"abcd", b"efgh"] {
+            let segment = socket
+                .take_transmit_segment(start, FOUR_BYTE_SEGMENTS)
+                .expect("the burst allowance covers two segments");
+            assert_eq!(segment.payload.as_ref(), expected);
+        }
         assert_eq!(socket.queue_send(b"ijkl"), 4);
 
         socket.close_send();
         assert_eq!(socket.state(), TcpState::FinWait1);
         assert_eq!(
-            socket.take_transmit_segment(
-                TCP_INITIAL_RTO_NANOS + 2,
-                TcpSegmentBudget::wire_segments(usize::MAX)
-            ),
+            socket.take_transmit_segment(start + 1, FOUR_BYTE_SEGMENTS),
             None
         );
 
         let second = socket
-            .take_transmit_segment(
-                TCP_INITIAL_RTO_NANOS + 1 + 8_000_000,
-                TcpSegmentBudget::wire_segments(usize::MAX),
-            )
+            .take_transmit_segment(start + 8_000_000, FOUR_BYTE_SEGMENTS)
             .expect("paced data must be transmitted before FIN");
         assert_eq!(second.payload.as_ref(), b"ijkl");
 
         let fin = socket
-            .take_transmit_segment(
-                TCP_INITIAL_RTO_NANOS + 1 + 12_000_000,
-                TcpSegmentBudget::wire_segments(usize::MAX),
-            )
+            .take_transmit_segment(start + 12_000_000, FOUR_BYTE_SEGMENTS)
             .expect("FIN should follow drained queued data");
         assert!(fin.payload.is_empty());
         assert!(fin.header.flags.contains(TcpFlags::FIN));
