@@ -116,6 +116,8 @@ struct FlakyState {
     extents: BTreeMap<u64, Vec<u8>>,
     reads_to_fail: u32,
     writes_to_refuse: u32,
+    /// Every token passed to `release`, in call order.
+    released: Vec<u64>,
 }
 
 /// A backend whose reads and writes fail on demand. A failed read leaves
@@ -133,6 +135,10 @@ impl FlakyBackend {
 
     fn refuse_writes(&self, count: u32) {
         self.state.lock().unwrap().writes_to_refuse = count;
+    }
+
+    fn released(&self) -> Vec<u64> {
+        self.state.lock().unwrap().released.clone()
     }
 
     fn extents(&self) -> Vec<Vec<u8>> {
@@ -186,7 +192,12 @@ impl SwapBackend for FlakyBackend {
     }
 
     async fn release(&self, token: Self::Token) {
-        self.state.lock().unwrap().extents.remove(&token);
+        let mut state = self.state.lock().unwrap();
+        state.released.push(token);
+        state
+            .extents
+            .remove(&token)
+            .expect("a release only ever names a token that swap_in has not consumed");
     }
 }
 
@@ -439,6 +450,35 @@ fn a_failed_put_back_that_the_backend_then_accepts_leaves_the_page_swapped_out()
     assert!(harness.index_of(addr).is_some());
     harness.fault(addr).expect("fault");
     assert_eq!(harness.contents(addr), pattern(0xa0));
+}
+
+#[test]
+fn teardown_releases_a_swapped_out_page_once_and_never_a_swapped_in_one() {
+    let mut harness = Harness::new();
+    let back = harness.resident(1, 0xc0);
+    let out = harness.resident(2, 0xc1);
+    harness.evict(back).expect("evict the page that returns");
+    harness.evict(out).expect("evict the page that stays out");
+    let back_index = harness.index_of(back).expect("swapped out");
+    let out_index = harness.index_of(out).expect("swapped out");
+    harness.fault(back).expect("swap the first page back in");
+    assert_eq!(harness.backend.released(), Vec::<u64>::new());
+
+    // The address space's teardown hands over the index of every page it
+    // ever swapped out, the swapped-in one included.
+    harness.teardown(back_index);
+    assert_eq!(
+        harness.backend.released(),
+        Vec::<u64>::new(),
+        "a token swap_in consumed is never released"
+    );
+    harness.teardown(out_index);
+    harness.teardown(out_index);
+    assert_eq!(
+        harness.backend.released(),
+        vec![2],
+        "the page still out is released once, under its own token"
+    );
 }
 
 #[test]

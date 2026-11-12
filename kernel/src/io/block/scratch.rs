@@ -17,13 +17,18 @@ extern crate alloc;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use helios_hal::cpu::Cpu;
 use helios_hal::dma::DmaError;
 use helios_hal::fs::{
     BlockDevice, BlockDeviceCapabilities, BlockGeometry, BlockQueueTopology, BlockRange,
     BlockSerial, IoError, IoResult, OwnedBlockBuffer,
 };
+use helios_hal::vmm::SwapBackend;
 
-use crate::memory::RootEntropyHandle;
+use crate::Timer;
+use crate::exec::Spawner;
+use crate::instance::InstanceRegistry;
+use crate::memory::{RootEntropyHandle, SwapDisabled, SwapHandle, disable_swap, install_swap};
 
 /// Bytes the boot self-check round-trips through the device.
 const SELF_CHECK_BYTES: usize = 4096;
@@ -106,6 +111,79 @@ impl ScratchDiskStats {
             flushes: self.counters.flushes.load(Ordering::Relaxed),
             discards: self.counters.discards.load(Ordering::Relaxed),
             write_zeroes: self.counters.write_zeroes.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Puts swap on the scratch disk, behind the self-check's blocks, and
+/// returns its handle for the backend to publish in its runtime state.
+///
+/// The self-check owns the last blocks of the device and has already run
+/// by the time this is called; everything before them is swap's. Swap is
+/// not persistence, a token is meaningless across a boot, so the whole
+/// extent is handed out fresh every time.
+///
+/// `make` builds the [`SwapBackend`] over the disk from its first block
+/// and block count, which keeps this crate from depending on the driver
+/// crate that supplies the backend. A disk with no room for swap, or one
+/// the backend refuses, leaves the machine without swap and says why in
+/// the boot log; the machine still boots, because the disk is a
+/// convenience and not a requirement.
+///
+/// The task is local to the calling processor, because the disk's
+/// completions are (see [`install_swap`]).
+pub fn install_scratch_swap<CpuImpl, Device, Backend, Error, Make>(
+    registry: InstanceRegistry,
+    scratch: ScratchDisk<Device>,
+    spawner: Spawner<CpuImpl>,
+    timer: Timer<CpuImpl>,
+    cpu: CpuImpl,
+    backend_name: &'static str,
+    make: Make,
+) -> Option<SwapHandle>
+where
+    CpuImpl: Cpu + Clone + Send + Sync + 'static,
+    Device: BlockDevice,
+    Backend: SwapBackend,
+    Error: core::fmt::Display,
+    Make: FnOnce(ScratchDisk<Device>, usize, usize) -> Result<Backend, Error>,
+{
+    let block_bytes = scratch.geometry().logical_block_bytes;
+    let swap_blocks = scratch.swap_blocks();
+    if swap_blocks == 0 {
+        disable_swap(SwapDisabled::NoSwapDevice);
+        return None;
+    }
+    let backend = match make(scratch, 0, swap_blocks) {
+        Ok(backend) => backend,
+        Err(error) => {
+            tracing::warn!(
+                target: "helios_kernel::swap",
+                %error,
+                "scratch disk cannot back swap"
+            );
+            disable_swap(SwapDisabled::NoSwapDevice);
+            return None;
+        }
+    };
+    match install_swap(
+        spawner,
+        timer,
+        cpu,
+        registry,
+        backend,
+        backend_name,
+        (swap_blocks * block_bytes) as u64,
+    ) {
+        Ok(handle) => Some(handle),
+        Err(error) => {
+            tracing::warn!(
+                target: "helios_kernel::swap",
+                %error,
+                "scratch disk could not supply swap's staging page"
+            );
+            disable_swap(SwapDisabled::NoSwapDevice);
+            None
         }
     }
 }

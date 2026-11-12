@@ -479,6 +479,8 @@ pub enum NetworkErrorDetail {
     TcpClosedUnexpectedly,
     #[error("no ephemeral TCP ports are available")]
     TcpNoEphemeralPorts,
+    #[error("no TCP socket slots are available")]
+    TcpNoSocketSlots,
     #[error("UDP send timed out")]
     UdpSendTimeout,
     #[error("UDP receive timed out")]
@@ -563,6 +565,7 @@ impl NetworkErrorDetail {
             Self::TcpReceiveFailed => "TCP receive failed",
             Self::TcpClosedUnexpectedly => "TCP stream closed unexpectedly",
             Self::TcpNoEphemeralPorts => "no ephemeral TCP ports are available",
+            Self::TcpNoSocketSlots => "no TCP socket slots are available",
             Self::UdpSendTimeout => "UDP send timed out",
             Self::UdpReceiveTimeout => "UDP receive timed out",
             Self::UdpPortInUse => "UDP local port is already in use",
