@@ -1,10 +1,12 @@
 pub use crate::io::{IoError, IoResult};
 
 use crate::resource::{KernelResource, ResourceRights};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use bitflags::bitflags;
 use core::future::Future;
 use core::ptr::NonNull;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 bitflags! {
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -342,10 +344,45 @@ pub trait BlockBuffer: Send + 'static {
     fn complete(&mut self, result: IoResult<()>);
 }
 
+/// A flag the buffer of one request raises once the request is over: the
+/// device answered it, or the driver refused it, so nothing of it can
+/// still reach the device's blocks. It is raised whether or not a task
+/// still waits, which is what lets the holder of a dropped submission's
+/// storage learn when that storage is safe to reuse.
+///
+/// Concurrency contract: one buffer raises the flag, from the contexts
+/// [`BlockBuffer::complete`] runs in, with a single release store; any
+/// number of clones on any processor read it lock-free.
+#[derive(Clone, Debug, Default)]
+pub struct AnswerFlag(Arc<AtomicBool>);
+
+impl AnswerFlag {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Marks the request answered.
+    pub fn raise(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    /// Whether the request is over. Once this answers `true`, everything
+    /// the device did for the request happened before.
+    pub fn is_raised(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
 /// A [`BlockBuffer`] whose bytes belong to the buffer itself, so its
 /// holder fills and reads them: a scratch page, as opposed to a cache's
 /// own blocks.
 pub trait OwnedBlockBuffer: BlockBuffer + Sized {
+    /// Has the buffer raise `flag` in [`BlockBuffer::complete`], after
+    /// whatever else completing it does. A buffer dropped uncompleted —
+    /// its submission dropped before the device accepted it — never
+    /// raises it.
+    fn raise_on_answer(&mut self, flag: AnswerFlag);
+
     /// A buffer of `len` zero bytes, or `None` when one buffer cannot
     /// carry that many.
     fn zeroed(len: usize) -> Option<Self>;

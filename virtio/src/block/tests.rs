@@ -34,6 +34,7 @@ impl Probe {
 struct TestBuffer {
     bytes: NonNull<[u8]>,
     probe: Option<Arc<Probe>>,
+    answered: Option<AnswerFlag>,
 }
 
 // SAFETY: the buffer owns its bytes; the pointer is the boxed slice's.
@@ -45,6 +46,7 @@ impl TestBuffer {
         Self {
             bytes: NonNull::new(bytes).expect("a box is never null"),
             probe: None,
+            answered: None,
         }
     }
 
@@ -85,10 +87,17 @@ impl BlockBuffer for TestBuffer {
         if let Some(probe) = &self.probe {
             probe.completions.lock().push(result);
         }
+        if let Some(answered) = self.answered.take() {
+            answered.raise();
+        }
     }
 }
 
 impl OwnedBlockBuffer for TestBuffer {
+    fn raise_on_answer(&mut self, flag: AnswerFlag) {
+        self.answered = Some(flag);
+    }
+
     fn zeroed(len: usize) -> Option<Self> {
         Some(Self::new(len))
     }
@@ -798,7 +807,7 @@ fn test_geometry() -> BlockGeometry {
 
 /// A block device backed by host memory, for the swap backend tests. It
 /// carries a request out as it is submitted, and answers it at once
-/// unless told to stall.
+/// unless told to hold its answers.
 struct MemoryBlockDevice {
     blocks: SpinMutex<Vec<u8>>,
     block_size: usize,
@@ -807,31 +816,45 @@ struct MemoryBlockDevice {
     /// Each submission first parks once, as one waiting for room in a
     /// full queue does, before the device takes the request.
     queue_full: AtomicBool,
-    /// Each waiter parks once before it hands the answer over, as one
-    /// whose request the device has not answered yet does.
-    answers_late: AtomicBool,
+    /// Requests are kept unanswered in `held` until
+    /// [`MemoryBlockDevice::answer_held`], as a device that has not got
+    /// to them yet keeps them.
+    hold_answers: AtomicBool,
+    held: SpinMutex<Vec<HeldRequest>>,
+}
+
+/// Where a [`MemoryBlockDevice`] request's answer meets its waiter.
+#[derive(Default)]
+struct AnswerSlot {
+    completion: Option<BlockCompletion<TestBuffer>>,
+    waker: Option<core::task::Waker>,
+}
+
+/// A request the device has taken and not answered. Its buffer is the
+/// device's until then, whether or not the waiter is still there.
+struct HeldRequest {
+    buffer: TestBuffer,
+    result: IoResult<()>,
+    slot: Arc<SpinMutex<AnswerSlot>>,
 }
 
 /// The waiter of a [`MemoryBlockDevice`] request.
 struct MemoryWaiter {
-    completion: Option<BlockCompletion<TestBuffer>>,
-    late: bool,
+    slot: Arc<SpinMutex<AnswerSlot>>,
 }
 
 impl Future for MemoryWaiter {
     type Output = BlockCompletion<TestBuffer>;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if self.late {
-            self.late = false;
-            cx.waker().wake_by_ref();
-            return Poll::Pending;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut slot = self.slot.lock();
+        match slot.completion.take() {
+            Some(completion) => Poll::Ready(completion),
+            None => {
+                slot.waker = Some(cx.waker().clone());
+                Poll::Pending
+            }
         }
-        Poll::Ready(
-            self.completion
-                .take()
-                .expect("a memory waiter is polled after its answer"),
-        )
     }
 }
 
@@ -843,7 +866,8 @@ impl MemoryBlockDevice {
             flushes: AtomicU64::new(0),
             fail_reads: false,
             queue_full: AtomicBool::new(false),
-            answers_late: AtomicBool::new(false),
+            hold_answers: AtomicBool::new(false),
+            held: SpinMutex::new(Vec::new()),
         }
     }
 
@@ -851,8 +875,28 @@ impl MemoryBlockDevice {
         self.queue_full.store(stall, Ordering::Relaxed);
     }
 
-    fn stall_answers(&self, stall: bool) {
-        self.answers_late.store(stall, Ordering::Relaxed);
+    fn hold_answers(&self, hold: bool) {
+        self.hold_answers.store(hold, Ordering::Relaxed);
+    }
+
+    /// Answers every held request: its buffer is completed, and the
+    /// answer goes to its waiter, or is dropped with the buffer when the
+    /// waiter is gone.
+    fn answer_held(&self) {
+        let held = core::mem::take(&mut *self.held.lock());
+        for HeldRequest {
+            mut buffer,
+            result,
+            slot,
+        } in held
+        {
+            buffer.complete(result);
+            let mut slot = slot.lock();
+            slot.completion = Some(BlockCompletion { result, buffer });
+            if let Some(waker) = slot.waker.take() {
+                waker.wake();
+            }
+        }
     }
 
     async fn wait_for_room(&self) {
@@ -873,11 +917,18 @@ impl MemoryBlockDevice {
     }
 
     fn answer(&self, mut buffer: TestBuffer, result: IoResult<()>) -> MemoryWaiter {
-        buffer.complete(result);
-        MemoryWaiter {
-            completion: Some(BlockCompletion { result, buffer }),
-            late: self.answers_late.load(Ordering::Relaxed),
+        let slot = Arc::new(SpinMutex::new(AnswerSlot::default()));
+        if self.hold_answers.load(Ordering::Relaxed) {
+            self.held.lock().push(HeldRequest {
+                buffer,
+                result,
+                slot: Arc::clone(&slot),
+            });
+        } else {
+            buffer.complete(result);
+            slot.lock().completion = Some(BlockCompletion { result, buffer });
         }
+        MemoryWaiter { slot }
     }
 }
 
@@ -1009,7 +1060,7 @@ fn swap_extents_are_reused_and_coalesced() {
     block_on(backend.swap_in(second, &mut restored)).expect("swap-in of the middle extent");
     block_on(backend.swap_in(first, &mut restored)).expect("swap-in of the first extent");
     {
-        let state = backend.state.lock();
+        let mut state = backend.state.lock();
         assert_eq!(state.available_blocks(), 4);
         assert_eq!(
             state.free.len(),
@@ -1021,7 +1072,7 @@ fn swap_extents_are_reused_and_coalesced() {
     let mut restored = vec![0_u8; 2048];
     block_on(backend.swap_in(third, &mut restored)).expect("swap-in of the last extent");
     assert_eq!(restored, vec![3_u8; 2048]);
-    let state = backend.state.lock();
+    let mut state = backend.state.lock();
     assert_eq!(state.free.len(), 1);
     assert_eq!(state.available_blocks(), 8);
 }
@@ -1046,7 +1097,7 @@ fn a_swap_out_dropped_before_the_device_has_its_write_gives_the_extent_back() {
         );
     }
 
-    let state = backend.state.lock();
+    let mut state = backend.state.lock();
     assert_eq!(
         state.available_blocks(),
         4,
@@ -1056,10 +1107,10 @@ fn a_swap_out_dropped_before_the_device_has_its_write_gives_the_extent_back() {
 }
 
 #[test]
-fn a_swap_out_dropped_while_the_device_holds_its_write_keeps_the_extent() {
+fn a_swap_out_dropped_while_the_device_holds_its_write_gives_the_extent_back_once_answered() {
     let backend = VirtioBlockSwapBackend::from_entire_device(MemoryBlockDevice::new(512, 4))
         .expect("swap backend should initialize");
-    backend.device.stall_answers(true);
+    backend.device.hold_answers(true);
     let page = vec![9_u8; 1024];
 
     {
@@ -1075,9 +1126,30 @@ fn a_swap_out_dropped_while_the_device_holds_its_write_keeps_the_extent() {
         2,
         "blocks an abandoned write may still reach are not handed to another page"
     );
-    backend.device.stall_answers(false);
-    let next = block_on(backend.swap_out(&[1_u8; 1024])).expect("the rest still serves");
-    assert_ne!(next.start_block, 0, "the held extent is not reused");
+    backend.device.hold_answers(false);
+    let other = block_on(backend.swap_out(&[1_u8; 1024])).expect("the rest still serves");
+    assert_eq!(
+        other.start_block, 2,
+        "the extent of the unanswered write is not reused"
+    );
+    let mut restored = vec![0_u8; 1024];
+    block_on(backend.swap_in(other, &mut restored)).expect("swap-in of the other page");
+
+    backend.device.answer_held();
+    let mut state = backend.state.lock();
+    assert_eq!(
+        state.available_blocks(),
+        4,
+        "once the device answered the abandoned write, its extent is free again"
+    );
+    assert_eq!(state.free.len(), 1);
+    assert!(state.abandoned.is_empty());
+    drop(state);
+    let reused = block_on(backend.swap_out(&[2_u8; 1024])).expect("swap-out after the answer");
+    assert_eq!(
+        reused.start_block, 0,
+        "the answered write's extent is handed out again"
+    );
 }
 
 #[test]
@@ -1086,7 +1158,7 @@ fn a_swap_in_dropped_mid_read_leaves_the_token_valid() {
         .expect("swap backend should initialize");
     let page: Vec<u8> = (0..1024_u32).map(|byte| byte as u8).collect();
     let token = block_on(backend.swap_out(&page)).expect("swap-out should succeed");
-    backend.device.stall_answers(true);
+    backend.device.hold_answers(true);
 
     let mut restored = vec![0_u8; page.len()];
     {
@@ -1102,7 +1174,8 @@ fn a_swap_in_dropped_mid_read_leaves_the_token_valid() {
         "the extent of a page a dropped swap-in never read back stays allocated"
     );
 
-    backend.device.stall_answers(false);
+    backend.device.answer_held();
+    backend.device.hold_answers(false);
     let mut restored = vec![0_u8; page.len()];
     block_on(backend.swap_in(token, &mut restored)).expect("the token is still valid");
     assert_eq!(restored, page);
