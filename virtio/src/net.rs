@@ -1868,6 +1868,14 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             self.repost_rx_buffer(pair_idx, state, slot_index)?;
             return Err(IoError::DeviceFault);
         }
+        // A chain is copied into a reassembly buffer of
+        // `max_receive_frame_len` bytes, so its head is bounded by that
+        // limit like every tail is. A one-buffer frame stays in its
+        // slot, whose size already bounded it above.
+        if buffers > 1 && !self.frame_bytes_fit(0, used_len - self.header_len) {
+            self.refuse_rx_chain(pair_idx, state, slot_index, buffers - 1)?;
+            return Err(IoError::DeviceFault);
+        }
         let offload = match self.rx_offload(header) {
             Ok(offload) => offload,
             Err(error) => {
@@ -1946,10 +1954,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             let (slot_index, position) = Self::complete_rx_slot(state, token);
             let used_len = used_len as usize;
             let slot = &self.queue_pairs[pair_idx].rx_slots[usize::from(slot_index)];
-            let fits = used_len <= self.rx_buffer_len
-                && assembled
-                    .checked_add(used_len)
-                    .is_some_and(|end| end <= self.max_receive_frame_len);
+            let fits = used_len <= self.rx_buffer_len && self.frame_bytes_fit(assembled, used_len);
             if position != expected_position || !fits {
                 // The chain is refused whole: this buffer goes back
                 // together with the `buffers - 1 - index` tails still
@@ -1966,6 +1971,14 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         state.rx_queue.publish();
         state.rx_queue.notify(&self.transport);
         Ok(assembled)
+    }
+
+    /// Whether `added` more payload bytes keep a frame of `assembled`
+    /// bytes within the reassembly buffer, `max_receive_frame_len`.
+    fn frame_bytes_fit(&self, assembled: usize, added: usize) -> bool {
+        assembled
+            .checked_add(added)
+            .is_some_and(|end| end <= self.max_receive_frame_len)
     }
 
     /// Gives a refused mergeable chain back to the device whole: the
@@ -3252,6 +3265,34 @@ mod tests {
         assert_eq!(frame.bytes.len(), head.len() + tail.len());
         assert_eq!(&frame.bytes[..head.len()], &head[..]);
         assert_eq!(&frame.bytes[head.len()..], &tail[..]);
+    }
+
+    /// A head whose payload alone exceeds the frame limit is refused as
+    /// a device fault, like an oversized tail, instead of indexing past
+    /// the reassembly buffer; its tails go back with it.
+    #[test]
+    fn an_oversized_head_is_refused_and_its_chain_returned() {
+        let harness = NetHarness::new(NET_FEATURE_MRG_RXBUF);
+        let limit = harness.device.max_receive_frame_len();
+        // One mergeable page is 4096 bytes, so a head can carry more
+        // than the frame limit without exceeding its slot.
+        let oversized_head = vec![0x91_u8; limit + 1];
+        assert!(oversized_head.len() + harness.device.header_len <= RX_PAGE_BYTES);
+        let tail = vec![0x92_u8; 100];
+
+        expect_device_fault(harness.deliver_chain(
+            0,
+            RxDeviceHeader::default(),
+            &[&oversized_head, &tail],
+        ));
+
+        let head = vec![0x93_u8; 1000];
+        harness.complete_chain(2, RxDeviceHeader::default(), &[&head, &tail]);
+        let frame = harness
+            .receive()
+            .expect("the refused chain left a real head at the front of the used ring")
+            .expect("the well-formed chain behind them is delivered");
+        assert_eq!(frame.bytes.len(), head.len() + tail.len());
     }
 
     /// The per-frame checksum report is what the stack decides trust

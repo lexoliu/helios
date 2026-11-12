@@ -2,11 +2,18 @@
 //!
 //! This is the whole of what a rendering plugin sees of the machine's
 //! 3D engine, and none of it interprets what the plugin sends. A
-//! command buffer is the plugin's own pinned pages; `submit` names a
-//! run of them and the kernel hands the device their physical address.
-//! A capability set is the renderer's bytes, carried whole. A host-3D
-//! blob's storage is the renderer's, placed in the instance's linear
-//! memory through the host-visible aperture.
+//! command buffer is a buffer pinned from the plugin's own pool and
+//! shown at the span it named; `submit` names a run of it and the kernel
+//! hands the device its physical address. A capability set is the
+//! renderer's bytes, carried whole. A host-3D blob's storage is the
+//! renderer's, shown at a span of the instance's linear memory through
+//! the host-visible aperture.
+//!
+//! A call that waits on the owner task — `create-blob`, `map-blob` —
+//! checks its span first and shows anything only in its last step, after
+//! its last wait and in the same step that records the handle owning the
+//! view, so a call the plugin stops waiting for shows nothing; what the
+//! device made for it goes back through a [`PendingReply`].
 //!
 //! The claim lives in the instance's store, so it is single-owned: the
 //! resource handles a plugin holds carry the claim generation to check
@@ -17,11 +24,12 @@
 //! # Concurrency contract
 //!
 //! Every call here runs on the task that owns the store, so the claim
-//! and its arena need no lock; a context's last-submitted fence is a
-//! `Cell` for the same reason. What is shared is the two queues into
-//! the owner tasks, which carry their own synchronisation, and the
-//! fence signal each context was created with, which the submit server
-//! publishes every retired fence to.
+//! and the view table need no lock, and every view is shown and ended by
+//! that task alone; a context's last-submitted fence is a `Cell` for the
+//! same reason. What is shared is the two queues into the owner tasks,
+//! which carry their own synchronisation, the buffers, whose counts are
+//! atomic, and the fence signal each context was created with, which
+//! the submit server publishes every retired fence to.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -30,6 +38,7 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 
 use futures::channel::oneshot;
+use helios_hal::device::DeviceRegion;
 use helios_hal::display::{
     BlobId, BlobMemory, BlobUsage, CapsetId, ContextId, ContextName, FenceId, MAX_CONTEXT_NAME,
 };
@@ -42,12 +51,12 @@ use wasmtime::component::{
 };
 
 use crate::ComponentHostNetwork;
+use crate::buffer::{Buffer, GuestMemory, Span, ViewError, ViewGroup, ViewId, ViewTable};
 use crate::display::SequenceSignal;
 use crate::gpu::{BlobSpec, Gpu3dRequest, Gpu3dSender, Gpu3dServiceError, SubmitRequest};
-use crate::pins::PinnedRun;
 use crate::wasmtime_adapter::bindings::gpu::bindings::helios::system::gpu as gpu_wit;
 
-use super::super::StoreData;
+use super::super::{PendingReply, StoreData, guest_memory, view_trap};
 
 /// Register `helios:system/gpu` in a linker.
 ///
@@ -91,20 +100,28 @@ pub struct ContextHandle {
 }
 
 /// One pinned command buffer, as its store records it.
+///
+/// Its view is in the claim's set, so a release ends it; the handle's
+/// own drop ends it only while the claim it was made under lives.
 pub struct CommandBufferHandle {
     pub(crate) generation: u64,
-    pub(crate) frame: PinnedRun,
+    pub(crate) buffer: Buffer,
+    pub(crate) view: ViewId,
 }
 
 /// One blob resource, as its store records it.
+///
+/// Both views are in the claim's set, for the reason a command buffer's
+/// is.
 pub struct BlobHandle {
     pub(crate) generation: u64,
     pub(crate) id: BlobId,
-    /// The pinned pages backing it, for the guest-backed kinds.
-    pub(crate) backing: Option<PinnedRun>,
-    /// The aperture placement the instance mapped, once `map-blob` has
-    /// put one there.
-    pub(crate) mapped: Option<PinnedRun>,
+    /// The view of the instance's buffer backing it, for the
+    /// guest-backed kinds.
+    pub(crate) backing: Option<ViewId>,
+    /// The view of its aperture placement, once `map-blob` has put one
+    /// there.
+    pub(crate) mapped: Option<ViewId>,
 }
 
 fn to_wit_error(error: Gpu3dServiceError) -> gpu_wit::Error {
@@ -117,11 +134,16 @@ fn to_wit_error(error: Gpu3dServiceError) -> gpu_wit::Error {
         Gpu3dServiceError::UnsupportedContext => gpu_wit::Error::UnsupportedContext,
         Gpu3dServiceError::TooManyContexts => gpu_wit::Error::TooManyContexts,
         Gpu3dServiceError::TooManyBlobs => gpu_wit::Error::TooManyBlobs,
+        Gpu3dServiceError::TooManyViews => gpu_wit::Error::TooManyViews,
         Gpu3dServiceError::InvalidBlob => gpu_wit::Error::InvalidBlob,
         Gpu3dServiceError::ApertureExhausted => gpu_wit::Error::ApertureExhausted,
         Gpu3dServiceError::OutOfBounds => gpu_wit::Error::OutOfBounds,
         Gpu3dServiceError::FenceNotIncreasing => gpu_wit::Error::StaleFence,
-        Gpu3dServiceError::WindowExhausted => gpu_wit::Error::WindowExhausted,
+        Gpu3dServiceError::BadSpan(_) | Gpu3dServiceError::BlobSpanMismatch => {
+            gpu_wit::Error::BadSpan
+        }
+        Gpu3dServiceError::AlreadyMapped => gpu_wit::Error::AlreadyMapped,
+        Gpu3dServiceError::NotMapped => gpu_wit::Error::NotMapped,
         Gpu3dServiceError::OutOfMemory => gpu_wit::Error::OutOfMemory,
         // An owner that has stopped serving is a machine on its way
         // down. There is nothing a plugin can do about it that it would
@@ -152,11 +174,8 @@ fn from_wit_blob_usage(usage: gpu_wit::BlobUsage) -> BlobUsage {
     flags
 }
 
-const fn to_wit_placement(frame: PinnedRun) -> gpu_wit::Placement {
-    gpu_wit::Placement {
-        offset: frame.offset,
-        length: frame.bytes,
-    }
+const fn span(at: gpu_wit::Span) -> Span {
+    Span::new(at.offset, at.length)
 }
 
 /// The WIT string into the fixed-size label the device carries.
@@ -191,23 +210,24 @@ where
     }
 
     /// The physical run `offset`/`length` name inside `commands`,
-    /// checked against `generation` — the live claim's.
+    /// checked against `generation` — the live claim's — and the buffer
+    /// it lies in, for the request to hold while the device reads it.
     ///
-    /// A buffer pinned under an older claim names a run the arena may
-    /// already have handed to whoever holds the engine now, so the
-    /// refusal is the WIT's answer for a dead claim, not a bounds one.
+    /// A buffer pinned under an older claim was shown in a set the
+    /// release has already ended, so the refusal is the WIT's answer for
+    /// a dead claim, not a bounds one.
     pub(crate) fn command_range(
         &mut self,
         commands: &Resource<CommandBufferHandle>,
         offset: u64,
         length: u64,
         generation: u64,
-    ) -> wasmtime::Result<Result<PhysicalRange, gpu_wit::Error>> {
-        let buffer = self.table.get(commands)?;
-        if buffer.generation != generation {
+    ) -> wasmtime::Result<Result<(Buffer, PhysicalRange), gpu_wit::Error>> {
+        let commands = self.table.get(commands)?;
+        if commands.generation != generation {
             return Ok(Err(gpu_wit::Error::NotClaimed));
         }
-        // The submission is a run of the buffer's own pinned pages: the
+        // The submission is a run of the buffer's own pages: the
         // physical run is what the device reads, and it has to lie
         // inside the run the buffer covers. An empty run is the
         // device's to refuse, not ours: its fence still has to retire,
@@ -216,11 +236,160 @@ where
         let Some(end) = offset.checked_add(length) else {
             return Ok(Err(gpu_wit::Error::OutOfBounds));
         };
-        if end > buffer.frame.bytes {
+        if end > commands.buffer.bytes() {
             return Ok(Err(gpu_wit::Error::OutOfBounds));
         }
-        let physical = buffer.frame.physical();
-        Ok(Ok(PhysicalRange::new(physical.start + offset, length)))
+        let physical = commands.buffer.physical();
+        Ok(Ok((
+            commands.buffer.clone(),
+            PhysicalRange::new(physical.start + offset, length),
+        )))
+    }
+
+    /// End `view`, one of the claim's set, if the claim made under
+    /// `generation` still holds the engine.
+    ///
+    /// A handle that outlived its claim names a view the release already
+    /// ended with the rest of the set, and ending it again would be a
+    /// view the table never made.
+    fn end_claim_view(&mut self, generation: u64, view: ViewId) -> wasmtime::Result<()> {
+        if self
+            .device
+            .gpu()
+            .claim_ref()
+            .is_ok_and(|claim| claim.generation() == generation)
+        {
+            self.views.end(view).map_err(view_trap)?;
+        }
+        Ok(())
+    }
+
+    /// Show something in the set of the claim made under `generation`,
+    /// which is the last step of every call that shows a view.
+    ///
+    /// The claim may have been let go, or let go and taken again, while
+    /// the call was waiting on the owner task; a view in a later claim's
+    /// set would outlive the handle that names it.
+    fn show_in_claim(
+        &mut self,
+        generation: u64,
+        show: impl FnOnce(&mut ViewTable, ViewGroup) -> Result<ViewId, ViewError>,
+    ) -> Result<ViewId, Gpu3dServiceError> {
+        if self.device.gpu().claim_ref()?.generation() != generation {
+            return Err(Gpu3dServiceError::NotClaimed);
+        }
+        let group = self.device.gpu().room_for_view(&self.views)?;
+        Ok(show(&mut self.views, group)?)
+    }
+
+    /// Check `at` of `memory` for an object of `bytes`, and the claim's
+    /// room for one more view: the early half of every call that shows
+    /// a view, run before anything is pinned or the owner task is told
+    /// anything, so a span the table would refuse costs nothing.
+    fn check_claim_span(
+        &self,
+        memory: GuestMemory,
+        at: Span,
+        bytes: u64,
+    ) -> Result<(), Gpu3dServiceError> {
+        self.device.gpu().room_for_view(&self.views)?;
+        self.views.validate(memory, at, bytes)?;
+        Ok(())
+    }
+
+    /// Check `at` as [`Self::check_claim_span`] does, then pin a buffer
+    /// of `bytes` for showing there.
+    ///
+    /// Called inside the host call, so the run is charged to the calling
+    /// instance's pool. Nothing is shown.
+    fn pin_claim_buffer(
+        &self,
+        memory: GuestMemory,
+        at: Span,
+        bytes: u64,
+    ) -> Result<Buffer, Gpu3dServiceError> {
+        self.check_claim_span(memory, at, bytes)?;
+        Ok(Buffer::pinned(bytes)?)
+    }
+}
+
+/// The calling instance's linear memory, read through `access`.
+fn memory_of<U, CpuImpl, Net, HostFs>(
+    access: &mut Access<'_, U, HasSelf<StoreData<CpuImpl, Net, HostFs>>>,
+) -> Result<GuestMemory, Gpu3dServiceError>
+where
+    U: 'static,
+    CpuImpl: helios_hal::cpu::Cpu + Clone,
+    Net: ComponentHostNetwork,
+    HostFs: crate::HostFileSystem,
+{
+    let linear_memory = access.get().linear_memory;
+    Ok(guest_memory(linear_memory, &*access)?)
+}
+
+/// The calling instance's memory in the last step of a call whose early
+/// half already read it.
+///
+/// # Panics
+///
+/// Panics when the store has no unshared memory: the handle is recorded
+/// once, when the instance is built, and the early half of the call
+/// already found it.
+fn checked_memory<U, CpuImpl, Net, HostFs>(
+    access: &mut Access<'_, U, HasSelf<StoreData<CpuImpl, Net, HostFs>>>,
+) -> GuestMemory
+where
+    U: 'static,
+    CpuImpl: helios_hal::cpu::Cpu + Clone,
+    Net: ComponentHostNetwork,
+    HostFs: crate::HostFileSystem,
+{
+    memory_of(access).expect("a store whose memory took the span in the call's first step has one")
+}
+
+/// Tell the owner task to let go of something this claim made, without
+/// the store and without waiting.
+///
+/// A resource drop and a host call the guest stopped waiting for are
+/// both synchronous here and the engine is not, so the work is handed to
+/// a task rather than awaited. It cannot be lost for good: if the task
+/// cannot be spawned, or the instance dies before it runs, the claim's
+/// own release lets go of everything the claim made.
+fn spawn_gpu_cleanup<CpuImpl>(
+    spawner: &crate::InstanceSpawner<CpuImpl>,
+    sender: Gpu3dSender,
+    request: Gpu3dRequest,
+) where
+    CpuImpl: helios_hal::cpu::Cpu + Clone,
+{
+    let spawned = spawner.try_spawn_detached(async move {
+        if let Err(error) = sender.control_oneway(request).await {
+            tracing::warn!(
+                target: "helios_kernel::gpu",
+                %error,
+                "a resource could not be handed back to the 3D owner"
+            );
+        }
+    });
+    if let Err(error) = spawned {
+        // The task arena is full. Nothing is leaked — the claim's own
+        // release lets go of the same resource — but the engine holds it
+        // until then, and that is worth saying.
+        tracing::warn!(
+            target: "helios_kernel::gpu",
+            %error,
+            "a resource stays with the 3D engine until the claim ends"
+        );
+    }
+}
+
+/// An `UnmapBlob` nobody waits for the answer to.
+fn unmap_request(generation: u64, blob: BlobId) -> Gpu3dRequest {
+    let (reply, _) = oneshot::channel();
+    Gpu3dRequest::UnmapBlob {
+        generation,
+        blob,
+        reply,
     }
 }
 
@@ -240,7 +409,7 @@ where
         let Ok(cap) = self.process_authority().derive_gpu_claim_cap() else {
             return Ok(Err(gpu_wit::Error::Unavailable));
         };
-        if let Err(error) = self.device.claim_gpu(&service, cap) {
+        if let Err(error) = self.device.claim_gpu(&service, &mut self.views, cap) {
             return Ok(Err(to_wit_error(error)));
         }
         let generation = self
@@ -268,16 +437,19 @@ where
     fn drop(&mut self, handle: Resource<GpuHandle>) -> wasmtime::Result<()> {
         let handle = self.table.delete(handle)?;
         // Dropping the handle is a plugin saying it is done, and it
-        // costs exactly what dying costs: every context and blob
-        // released, every mapping undone and every page handed back
-        // before the engine is offered to anyone else.
+        // costs exactly what dying costs: every view of the claim ended,
+        // every context and blob released and every aperture placement
+        // undone before the engine is offered to anyone else.
         if self
             .device
             .gpu()
             .claim_ref()
             .is_ok_and(|claim| claim.generation() == handle.generation)
         {
-            self.device.gpu_mut().release();
+            self.device
+                .gpu_mut()
+                .release(&mut self.views)
+                .map_err(view_trap)?;
         }
         Ok(())
     }
@@ -301,33 +473,14 @@ where
             return Ok(());
         }
         let sender = claim.sender();
-        let generation = context.generation;
-        let id = context.id;
-        let spawned = self.spawner().try_spawn_detached(async move {
-            if let Err(error) = sender
-                .control_oneway(Gpu3dRequest::DestroyContext {
-                    generation,
-                    context: id,
-                })
-                .await
-            {
-                tracing::warn!(
-                    target: "helios_kernel::gpu",
-                    %error,
-                    "a dropped context could not be handed back to the 3D owner"
-                );
-            }
-        });
-        if let Err(error) = spawned {
-            // The task arena is full. Nothing is leaked — the claim's
-            // own release destroys the same context — but the engine
-            // holds it until then, and that is worth saying.
-            tracing::warn!(
-                target: "helios_kernel::gpu",
-                %error,
-                "a dropped context stays with the 3D engine until the claim ends"
-            );
-        }
+        spawn_gpu_cleanup(
+            self.spawner(),
+            sender,
+            Gpu3dRequest::DestroyContext {
+                generation: context.generation,
+                context: context.id,
+            },
+        );
         Ok(())
     }
 }
@@ -338,36 +491,12 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    fn buffer(
-        &mut self,
-        handle: Resource<CommandBufferHandle>,
-    ) -> wasmtime::Result<gpu_wit::Placement> {
-        let buffer = self.table.get(&handle)?;
-        // `buffer` cannot say `not-claimed` — the WIT signature carries
-        // no result — so a handle that outlived its claim is a trap:
-        // the run it would name may already back the next claim's
-        // buffers.
-        self.gpu_sender(buffer.generation)
-            .map_err(|error| wasmtime::Error::msg(alloc::format!("{error}")))?;
-        Ok(to_wit_placement(buffer.frame))
-    }
-
     fn drop(&mut self, handle: Resource<CommandBufferHandle>) -> wasmtime::Result<()> {
-        let buffer = self.table.delete(handle)?;
-        // The pages are this instance's own and nothing of the
-        // device's: a dropped buffer's run goes back to the arena at
-        // once. A buffer that outlived the claim goes back with the
-        // release that already happened, which is the same call — the
-        // arena may already be gone, and `unpin` on it is a no-op then.
-        if self
-            .device
-            .gpu()
-            .claim_ref()
-            .is_ok_and(|claim| claim.generation() == buffer.generation)
-        {
-            self.device.gpu_mut().unpin(buffer.frame);
-        }
-        Ok(())
+        let commands = self.table.delete(handle)?;
+        // The span is the instance's ordinary memory again at once. The
+        // run goes back to the pool when the last submission still
+        // naming it has been answered, because each one holds it.
+        self.end_claim_view(commands.generation, commands.view)
     }
 }
 
@@ -377,26 +506,16 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    fn buffer(
-        &mut self,
-        handle: Resource<BlobHandle>,
-    ) -> wasmtime::Result<Option<gpu_wit::Placement>> {
-        let blob = self.table.get(&handle)?;
-        // As for `command-buffer.buffer`: a stale handle names a run
-        // that is no longer this claim's, and the infallible signature
-        // leaves a trap as the only refusal.
-        self.gpu_sender(blob.generation)
-            .map_err(|error| wasmtime::Error::msg(alloc::format!("{error}")))?;
-        Ok(blob.backing.map(to_wit_placement))
-    }
-
     fn drop(&mut self, handle: Resource<BlobHandle>) -> wasmtime::Result<()> {
         let blob = self.table.delete(handle)?;
-        // The instance's views go back first — the engine may still be
-        // decoding the aperture — and then the device is told through
-        // the owner task, which unmaps a still-placed blob before it
-        // destroys it. A blob dropped by an instance that no longer
-        // holds the engine has already had all of that done for it.
+        // The instance's views end first — a span still showing the
+        // aperture once the owner task takes the blob out of it would
+        // name whatever the engine places there next — and then the
+        // device is told through the owner task, which unmaps a
+        // still-placed blob before it destroys it and drops its
+        // reference to the blob's buffer after. A blob dropped by an
+        // instance that no longer holds the engine has already had all
+        // of that done for it.
         let Ok(claim) = self.device.gpu().claim_ref() else {
             return Ok(());
         };
@@ -404,36 +523,17 @@ where
             return Ok(());
         }
         let sender = claim.sender();
-        if let Some(mapped) = blob.mapped {
-            self.device.gpu_mut().unpin(mapped);
+        for view in [blob.mapped, blob.backing].into_iter().flatten() {
+            self.views.end(view).map_err(view_trap)?;
         }
-        if let Some(backing) = blob.backing {
-            self.device.gpu_mut().unpin(backing);
-        }
-        let generation = blob.generation;
-        let id = blob.id;
-        let spawned = self.spawner().try_spawn_detached(async move {
-            if let Err(error) = sender
-                .control_oneway(Gpu3dRequest::DestroyBlob {
-                    generation,
-                    blob: id,
-                })
-                .await
-            {
-                tracing::warn!(
-                    target: "helios_kernel::gpu",
-                    %error,
-                    "a dropped blob could not be handed back to the 3D owner"
-                );
-            }
-        });
-        if let Err(error) = spawned {
-            tracing::warn!(
-                target: "helios_kernel::gpu",
-                %error,
-                "a dropped blob stays with the 3D engine until the claim ends"
-            );
-        }
+        spawn_gpu_cleanup(
+            self.spawner(),
+            sender,
+            Gpu3dRequest::DestroyBlob {
+                generation: blob.generation,
+                blob: blob.id,
+            },
+        );
         Ok(())
     }
 }
@@ -685,67 +785,140 @@ where
         usage: gpu_wit::BlobUsage,
         size: u64,
         host_id: u64,
+        buffer: Option<gpu_wit::Span>,
     ) -> wasmtime::Result<Result<Resource<BlobHandle>, gpu_wit::Error>> {
         let (generation, sender) = match accessor.with(|access| claim_of(access, &handle))? {
             Ok(pair) => pair,
             Err(error) => return Ok(Err(error)),
         };
-        let context_id = accessor.with(|mut access| -> wasmtime::Result<ContextId> {
-            Ok(access.get().table.get(&context)?.id)
-        })?;
+        let (context_id, spawner) = accessor.with(
+            |mut access| -> wasmtime::Result<(ContextId, crate::InstanceSpawner<CpuImpl>)> {
+                let data = access.get();
+                Ok((data.table.get(&context)?.id, data.spawner().clone()))
+            },
+        )?;
         let memory_kind = from_wit_blob_memory(memory);
-        // A guest-backed blob's pages are the instance's own, committed
+        // A guest-backed blob's pages are the instance's own, pinned
         // before the device is asked: the resource the device creates
-        // names their physical run directly. A host-3D blob has no
-        // backing to pin.
-        let backing = match memory_kind {
-            BlobMemory::Host3d => None,
-            BlobMemory::Guest | BlobMemory::Host3dGuest => Some(
-                match accessor.with(|mut access| access.get().device.gpu_mut().pin(size)) {
-                    Ok(frame) => frame,
-                    Err(error) => return Ok(Err(to_wit_error(error))),
-                },
-            ),
-        };
-        let (reply, answer) = oneshot::channel();
-        let blob = sender
-            .control(
-                Gpu3dRequest::CreateBlob {
-                    generation,
-                    spec: BlobSpec {
-                        context: context_id,
-                        memory: memory_kind,
-                        usage: from_wit_blob_usage(usage),
-                        size,
-                        host_id,
-                        backing: backing.map(|frame| frame.backing),
-                    },
-                    reply,
-                },
-                answer,
-            )
-            .await;
-        let id = match blob {
-            Ok(id) => id,
-            Err(error) => {
-                // Nothing of the device's names these pages, so they go
-                // straight back rather than waiting for a release that
-                // will never come.
-                if let Some(frame) = backing {
-                    accessor.with(|mut access| access.get().device.gpu_mut().unpin(frame));
+        // names their physical run directly. The span is checked first,
+        // so a span the table would refuse costs neither a run nor a
+        // request, and the pages are shown only in the call's last step,
+        // after the device has answered. A host-3D blob has no pages to
+        // pin and takes no span.
+        let backing = match (memory_kind, buffer) {
+            (BlobMemory::Host3d, None) => None,
+            (BlobMemory::Guest | BlobMemory::Host3dGuest, Some(at)) => {
+                if size == 0 {
+                    return Ok(Err(gpu_wit::Error::InvalidBlob));
                 }
-                return Ok(Err(to_wit_error(error)));
+                let at = span(at);
+                let pinned = accessor.with(|mut access| {
+                    let memory = memory_of(&mut access)?;
+                    access.get().pin_claim_buffer(memory, at, size)
+                });
+                match pinned {
+                    Ok(buffer) => Some((at, buffer)),
+                    Err(error) => return Ok(Err(to_wit_error(error))),
+                }
+            }
+            (BlobMemory::Host3d, Some(_)) | (BlobMemory::Guest | BlobMemory::Host3dGuest, None) => {
+                return Ok(Err(to_wit_error(Gpu3dServiceError::BlobSpanMismatch)));
             }
         };
-        let resource = accessor.with(|mut access| {
-            access.get().table.push(BlobHandle {
+        let (reply, answer) = oneshot::channel();
+        // A blob the device makes for a call that is dropped before its
+        // last step goes back the way a dropped blob handle's does.
+        let cleanup = sender.clone();
+        let mut pending = PendingReply::new(answer, move |blob| {
+            spawn_gpu_cleanup(
+                &spawner,
+                cleanup,
+                Gpu3dRequest::DestroyBlob { generation, blob },
+            );
+        });
+        let queued = sender
+            .control_oneway(Gpu3dRequest::CreateBlob {
+                generation,
+                spec: BlobSpec {
+                    context: context_id,
+                    memory: memory_kind,
+                    usage: from_wit_blob_usage(usage),
+                    size,
+                    host_id,
+                    backing: backing.as_ref().map(|(_, buffer)| buffer.clone()),
+                },
+                reply,
+            })
+            .await;
+        let id = match queued {
+            Ok(()) => pending.reply(Gpu3dServiceError::Closed).await,
+            Err(error) => Err(error),
+        };
+        let id = match id {
+            Ok(id) => id,
+            // Nothing of the device's names these pages and nothing
+            // showed them, so the run goes back with this call's
+            // reference.
+            Err(error) => return Ok(Err(to_wit_error(error))),
+        };
+
+        // The last step, and the only one that shows anything: the view
+        // of the blob's pages and the handle that owns it are recorded
+        // together, with no wait in between that a cancellation could
+        // land in.
+        let recorded = accessor.with(|mut access| {
+            let shown = match &backing {
+                None => Ok(None),
+                Some((at, buffer)) => {
+                    let memory = checked_memory(&mut access);
+                    access
+                        .get()
+                        .show_in_claim(generation, |views, group| {
+                            views.show_buffer(memory, *at, buffer, Some(group))
+                        })
+                        .map(Some)
+                }
+            };
+            let backing = match shown {
+                Ok(view) => view,
+                Err(error) => return Ok(Err(error)),
+            };
+            let resource = access.get().table.push(BlobHandle {
                 generation,
                 id,
                 backing,
                 mapped: None,
-            })
+            })?;
+            Ok::<_, wasmtime::Error>(Ok(resource))
         })?;
-        Ok(Ok(resource))
+        match recorded {
+            Ok(resource) => {
+                pending.keep();
+                Ok(Ok(resource))
+            }
+            Err(error) => {
+                // The span was taken while the device was creating the
+                // blob, or the claim ended. The blob goes back before the
+                // refusal does; the pending reply stays armed across the
+                // wait, so a call dropped in it still hands the blob
+                // back, and a send that completed is never repeated.
+                if let Err(closed) = sender
+                    .control_oneway(Gpu3dRequest::DestroyBlob {
+                        generation,
+                        blob: id,
+                    })
+                    .await
+                {
+                    tracing::warn!(
+                        target: "helios_kernel::gpu",
+                        %closed,
+                        "a blob whose span was taken could not be handed back to the 3D owner"
+                    );
+                }
+                pending.keep();
+                Ok(Err(to_wit_error(error)))
+            }
+        }
     }
 }
 
@@ -760,26 +933,37 @@ where
     async fn commands(
         accessor: &Accessor<U, Self>,
         handle: Resource<ContextHandle>,
-        bytes: u64,
+        buffer: gpu_wit::Span,
     ) -> wasmtime::Result<Result<Resource<CommandBufferHandle>, gpu_wit::Error>> {
         let generation = match accessor.with(|access| context_claim(access, &handle))? {
             Ok((generation, _, _)) => generation,
             Err(error) => return Ok(Err(error)),
         };
-        if bytes == 0 {
-            return Ok(Err(gpu_wit::Error::OutOfBounds));
-        }
-        let frame = match accessor.with(|mut access| access.get().device.gpu_mut().pin(bytes)) {
-            Ok(frame) => frame,
-            Err(error) => return Ok(Err(to_wit_error(error))),
-        };
-        let resource = accessor.with(|mut access| {
-            access
-                .get()
-                .table
-                .push(CommandBufferHandle { generation, frame })
-        })?;
-        Ok(Ok(resource))
+        // A command buffer is as long as the span it is shown at: the
+        // span is the only size the call carries.
+        let at = span(buffer);
+        // Nothing is awaited here, so the buffer is pinned, shown and
+        // recorded in the handle that owns the view in one step.
+        accessor.with(|mut access| {
+            let shown = memory_of(&mut access).and_then(|memory| {
+                let data = access.get();
+                let buffer = data.pin_claim_buffer(memory, at, at.length)?;
+                let view = data.show_in_claim(generation, |views, group| {
+                    views.show_buffer(memory, at, &buffer, Some(group))
+                })?;
+                Ok((buffer, view))
+            });
+            let (buffer, view) = match shown {
+                Ok(shown) => shown,
+                Err(error) => return Ok(Err(to_wit_error(error))),
+            };
+            let resource = access.get().table.push(CommandBufferHandle {
+                generation,
+                buffer,
+                view,
+            })?;
+            Ok(Ok(resource))
+        })
     }
 
     async fn submit(
@@ -799,7 +983,7 @@ where
             Ok(values) => values,
             Err(error) => return Ok(Err(error)),
         };
-        let range = match accessor.with(|mut access| {
+        let (buffer, range) = match accessor.with(|mut access| {
             access
                 .get()
                 .command_range(&commands, offset, length, generation)
@@ -813,6 +997,7 @@ where
                 SubmitRequest::Submit {
                     generation,
                     context,
+                    buffer,
                     commands: range,
                     fence: FenceId::new(fence),
                     fences,
@@ -929,58 +1114,98 @@ where
     async fn map_blob(
         accessor: &Accessor<U, Self>,
         handle: Resource<BlobHandle>,
-    ) -> wasmtime::Result<Result<gpu_wit::Placement, gpu_wit::Error>> {
+        at: gpu_wit::Span,
+    ) -> wasmtime::Result<Result<(), gpu_wit::Error>> {
         let (generation, blob, sender) =
             match accessor.with(|access| blob_claim(access, &handle))? {
                 Ok(values) => values,
                 Err(error) => return Ok(Err(error)),
             };
+        let at = span(at);
+        // A blob shown once is refused a second span here, before the
+        // device is asked; the owner task's record refuses a second
+        // placement that raced this check. The span is checked here too,
+        // for everything but its length — the placement's size is the
+        // device's answer — so a span the table would refuse never
+        // costs the renderer an aperture slot.
+        let checked = accessor.with(
+            |mut access| -> wasmtime::Result<Result<crate::InstanceSpawner<CpuImpl>, _>> {
+                if access.get().table.get(&handle)?.mapped.is_some() {
+                    return Ok(Err(Gpu3dServiceError::AlreadyMapped));
+                }
+                let checked = memory_of(&mut access).and_then(|memory| {
+                    let data = access.get();
+                    data.check_claim_span(memory, at, at.length)?;
+                    Ok(data.spawner().clone())
+                });
+                Ok(checked)
+            },
+        )?;
+        let spawner = match checked {
+            Ok(spawner) => spawner,
+            Err(error) => return Ok(Err(to_wit_error(error))),
+        };
         let (reply, answer) = oneshot::channel();
-        let region = match sender
-            .control(
-                Gpu3dRequest::MapBlob {
-                    generation,
-                    blob,
-                    reply,
-                },
-                answer,
-            )
-            .await
-        {
+        // A placement the device makes for a call that is dropped before
+        // its last step goes back out of the aperture: a placed blob the
+        // guest cannot reach is a slot the renderer holds for nothing.
+        let cleanup = sender.clone();
+        let mut pending = PendingReply::new(answer, move |_: DeviceRegion| {
+            spawn_gpu_cleanup(&spawner, cleanup, unmap_request(generation, blob));
+        });
+        let queued = sender
+            .control_oneway(Gpu3dRequest::MapBlob {
+                generation,
+                blob,
+                reply,
+            })
+            .await;
+        let region = match queued {
+            Ok(()) => pending.reply(Gpu3dServiceError::Closed).await,
+            Err(error) => Err(error),
+        };
+        let region = match region {
             Ok(region) => region,
             Err(error) => return Ok(Err(to_wit_error(error))),
         };
-        // The device has placed the blob's storage in the aperture;
-        // now the instance's own mapping of it lands in its window. If
-        // the window cannot take it, the aperture placement is handed
-        // back before the refusal is reported — a placed blob the
-        // guest cannot reach is a slot the renderer is holding for
-        // nothing.
-        let frame = match accessor.with(|mut access| access.get().device.gpu_mut().map_blob(region))
-        {
-            Ok(frame) => frame,
+
+        // The last step, and the only one that shows anything: the view
+        // of the placement and the handle's record of it are made
+        // together, with no wait in between that a cancellation could
+        // land in.
+        let recorded = accessor.with(|mut access| {
+            let memory = checked_memory(&mut access);
+            let data = access.get();
+            let view = match data.show_in_claim(generation, |views, group| {
+                views.show_device(memory, at, region, Some(group))
+            }) {
+                Ok(view) => view,
+                Err(error) => return Ok(Err(error)),
+            };
+            data.table.get_mut(&handle)?.mapped = Some(view);
+            Ok::<_, wasmtime::Error>(Ok(()))
+        })?;
+        match recorded {
+            Ok(()) => {
+                pending.keep();
+                Ok(Ok(()))
+            }
             Err(error) => {
-                let (reply, answer) = oneshot::channel();
-                let _ = sender
-                    .control(
-                        Gpu3dRequest::UnmapBlob {
-                            generation,
-                            blob,
-                            reply,
-                        },
-                        answer,
-                    )
-                    .await;
-                return Ok(Err(to_wit_error(error)));
+                // The span was taken while the device was placing the
+                // blob, or the claim ended. The placement goes back
+                // before the refusal does, with the pending reply armed
+                // across the wait for the reason `create-blob` gives.
+                if let Err(closed) = sender.control_oneway(unmap_request(generation, blob)).await {
+                    tracing::warn!(
+                        target: "helios_kernel::gpu",
+                        %closed,
+                        "a placement whose span was taken could not be handed back to the 3D owner"
+                    );
+                }
+                pending.keep();
+                Ok(Err(to_wit_error(error)))
             }
-        };
-        let placement = to_wit_placement(frame);
-        accessor.with(|mut access| {
-            if let Ok(blob) = access.get().table.get_mut(&handle) {
-                blob.mapped = Some(frame);
-            }
-        });
-        Ok(Ok(placement))
+        }
     }
 
     async fn unmap_blob(
@@ -992,23 +1217,19 @@ where
                 Ok(values) => values,
                 Err(error) => return Ok(Err(error)),
             };
-        // The instance's own mapping goes first — a guest that can no
-        // longer reach the storage cannot be racing the engine for it —
-        // and the aperture placement is handed back after.
-        let frame = accessor.with(|mut access| {
+        // The instance's view ends first — a guest that can no longer
+        // reach the storage cannot be racing the engine for it — and the
+        // aperture placement is handed back after.
+        let ended = accessor.with(|mut access| -> wasmtime::Result<bool> {
             let data = access.get();
-            let mapped = data
-                .table
-                .get_mut(&handle)
-                .ok()
-                .and_then(|blob| blob.mapped.take());
-            if let Some(frame) = mapped {
-                data.device.gpu_mut().unpin(frame);
-            }
-            mapped
-        });
-        if frame.is_none() {
-            return Ok(Err(gpu_wit::Error::InvalidBlob));
+            let Some(view) = data.table.get_mut(&handle)?.mapped.take() else {
+                return Ok(false);
+            };
+            data.views.end(view).map_err(view_trap)?;
+            Ok(true)
+        })?;
+        if !ended {
+            return Ok(Err(gpu_wit::Error::NotMapped));
         }
         let (reply, answer) = oneshot::channel();
         Ok(sender

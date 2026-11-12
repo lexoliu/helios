@@ -2,217 +2,49 @@
 //!
 //! A lease is what the registry hands the supervisor that provisions a
 //! driver: it carries the grant, the relay the device's interrupts
-//! arrive on, and the mapping state of the one owner that currently has
-//! it. Everything the owner can reach the device through is recorded
-//! here, so the kernel can prove — by walking one structure — that the
-//! device is unreachable again once the owner dies.
+//! arrive on, and what the one owner that currently has it can reach
+//! the device through. Everything the owner can reach the device through
+//! is recorded here, so the kernel can prove — by walking one structure
+//! — that the device is unreachable again once the owner lets go.
 //!
 //! # Where a device appears in its owner's memory
 //!
 //! Helios owns the user address space, so a granted region does not need
-//! a call per register: the kernel maps the device's own frames inside
-//! the owner's linear-memory reservation and a register access becomes
-//! an ordinary load or store. The mappings go at the top of that
-//! reservation, in the [`DeviceWindow`], above everything the owner's
-//! memory can ever grow to; the owner's growth limit is capped below the
-//! window so a `memory.grow` can never land on a register file.
+//! a call per register: the kernel shows the device's own frames at a
+//! span of the owner's linear memory the owner chose, and a register
+//! access becomes an ordinary load or store. A ring the driver pins is a
+//! [`Buffer`] shown the same way. Both are views in the owner's
+//! [`ViewTable`], in one [`ViewGroup`] the lease names, and both end
+//! together when the grant does: a span the owner chose is inside its
+//! memory's current size, so nothing the owner grows can land on it.
 //!
 //! # Concurrency contract
 //!
-//! A lease is owned by one task — the supervisor that provisioned the
-//! driver, and through it the driver's own store — and is never shared,
-//! so its mapping state needs no lock. The relay it points at *is*
-//! shared with interrupt context and carries its own synchronisation.
-//! Every mapping change goes through the address space, which
-//! invalidates the local translation cache and shoots down every other
-//! processor that has run in the space before it returns.
+//! A lease is owned by one task — the task running the owner's store —
+//! and is never shared, so its state needs no lock. The relay it points
+//! at *is* shared with interrupt context and carries its own
+//! synchronisation. The views are the store's and change only on that
+//! same task; the buffers behind the rings are shared with nothing but
+//! those views, and the last of the two to let go frees the run on
+//! whichever task that is.
 
 use arrayvec::ArrayVec;
 use helios_hal::device::DmaPlacement;
-use helios_hal::pmm::PhysFrame;
-use helios_hal::vmm::{PageFlags, VirtAddr, VirtRange};
 use triomphe::Arc;
+
+use crate::buffer::{Buffer, GuestMemory, Span, ViewError, ViewGroup, ViewId, ViewTable};
 
 use super::grant::{DeviceGrant, GrantError, MAX_GRANT_REGIONS};
 use super::interrupt::{InterruptRelay, InterruptStats};
-use super::platform::device_vm_hooks;
-
-/// Bytes at the top of a granted owner's linear-memory reservation the
-/// kernel keeps for that owner's device.
-///
-/// Sized to hold every region a device exposes plus the rings a driver
-/// pins for it: a 16 MiB aperture and a few megabytes of descriptors is
-/// the large end of what non-virtio hardware asks for, and the window
-/// costs an owner nothing it can use, because the memory it displaces
-/// sits above the four gigabytes a 32-bit instance can address anyway on
-/// every reservation the kernel builds.
-pub const DEVICE_WINDOW_BYTES: u64 = 64 << 20;
 
 /// Buffers one owner may pin for its device at once.
 pub const MAX_DMA_BUFFERS: usize = 16;
 
-/// Bytes immediately below the device window the kernel keeps for the
-/// frame buffers of an instance that holds the display.
-///
-/// A display frame buffer wants exactly what a granted device's ring
-/// wants — pinned, physically contiguous pages at a fixed offset in the
-/// instance's own linear memory, above everything the instance can grow
-/// into — so it is the same mechanism with its own window rather than a
-/// second cursor into one arena. Sized for the large end of what a
-/// compositor asks a single machine's display engine for: a handful of
-/// surfaces at 4K in a 32-bit format, whose frames are 33 MiB each. The
-/// window costs an instance nothing until it claims the display, and
-/// the growth cap that keeps a `memory.grow` off it lasts exactly as
-/// long as the claim.
-pub const DISPLAY_WINDOW_BYTES: u64 = 256 << 20;
-
-/// Bytes of a linear-memory reservation the kernel keeps for the client
-/// windows of an instance that draws on the desktop.
-///
-/// A compositor surface wants what a display frame buffer wants —
-/// pinned, physically contiguous pages at a fixed offset in an
-/// instance's own linear memory, above everything the instance can grow
-/// into — so it is the same mechanism with its own window rather than a
-/// second cursor into the display's arena. The window carries two
-/// different things depending on which side of the surface path the
-/// instance is on: a client's own frame buffers, or the compositor's
-/// views of every client's. Sized for the compositor's case, which is
-/// the larger: sixty-four windows of the sizes a desktop hands out. It
-/// costs an instance nothing until it asks for its first surface.
-pub const SURFACE_WINDOW_BYTES: u64 = 256 << 20;
-/// Bytes immediately below the display window the kernel keeps for the
-/// period buffers of an instance that holds a playback stream.
-///
-/// A sound stream's period buffers want exactly what a display's frame
-/// buffers want — pinned, physically contiguous pages at a fixed offset
-/// in the instance's own linear memory, above everything the instance
-/// can grow into — so it is the same mechanism with a window of its
-/// own rather than a second cursor into one arena. Sized well past what
-/// a stream asks for: the widest format the playback contract names, at
-/// its highest rate and its largest channel count, is about a megabyte
-/// of periods, and the rest is room for an instance that renegotiates
-/// its format many times over. The window costs an instance nothing
-/// until it claims a stream.
-pub const AUDIO_WINDOW_BYTES: u64 = 8 << 20;
-
-/// Bytes of a linear-memory reservation the kernel keeps for the
-/// renderer state of an instance that drives the machine's 3D engine.
-///
-/// It carries two things a rendering plugin needs inside its own linear
-/// memory and above everything it can grow into: the command buffers it
-/// writes and the guest-backed blobs it creates, both pinned pages of
-/// its own; and the host-visible windows the display engine places its
-/// own storage in, which are not this machine's memory at all. Sized
-/// for the large end of what a Vulkan translation layer asks for — a
-/// handful of staging buffers and a host-visible heap — and it costs an
-/// instance nothing until it claims the 3D engine.
-pub const GPU_WINDOW_BYTES: u64 = 256 << 20;
-
-/// The part of one owner's linear memory the kernel devotes to its
-/// device.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DeviceWindow {
-    /// Where the owner's linear memory starts in the address space.
-    base: VirtAddr,
-    /// Byte offset of the window within that linear memory.
-    offset: u64,
-    /// How long the window is.
-    bytes: u64,
-}
-
-impl DeviceWindow {
-    /// The window at the top of a `reservation_bytes`-long linear-memory
-    /// reservation based at `base`.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the reservation is too small to carry a window. Every
-    /// reservation the kernel builds is four gigabytes; a smaller one is
-    /// a configuration the device path was never designed against, and
-    /// placing the window inside addressable memory would let the owner
-    /// grow over its own device.
-    pub fn top_of(base: VirtAddr, reservation_bytes: u64) -> Self {
-        assert!(
-            reservation_bytes > DEVICE_WINDOW_BYTES,
-            "a linear-memory reservation of {reservation_bytes} bytes cannot carry a \
-             {DEVICE_WINDOW_BYTES}-byte device window"
-        );
-        Self {
-            base,
-            offset: reservation_bytes - DEVICE_WINDOW_BYTES,
-            bytes: DEVICE_WINDOW_BYTES,
-        }
-    }
-
-    /// The window of `bytes` immediately below this one.
-    ///
-    /// The two never overlap and neither moves, so an instance that
-    /// holds a device *and* the display maps each into its own span and
-    /// caps its growth below the lower of them.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the reservation cannot carry both windows, for the
-    /// same reason [`Self::top_of`] panics: placing a window inside
-    /// addressable memory would let the owner grow over its own device.
-    pub fn below(self, bytes: u64) -> Self {
-        let offset = self
-            .offset
-            .checked_sub(bytes)
-            .expect("a linear-memory reservation carries every window the kernel places in it");
-        Self {
-            base: self.base,
-            offset,
-            bytes,
-        }
-    }
-
-    /// The offset the window starts at, which is also the highest the
-    /// owner's memory may grow to.
-    pub const fn offset(&self) -> u64 {
-        self.offset
-    }
-
-    pub const fn bytes(&self) -> u64 {
-        self.bytes
-    }
-
-    /// The address a `bytes`-long span at `offset` within the window
-    /// occupies.
-    ///
-    /// `offset` counts from the start of the window, not from the start
-    /// of the owner's linear memory: the window's own offset is what
-    /// turns one into the other, and forgetting it would map the device
-    /// over the owner's data.
-    pub(crate) fn range_at(&self, offset: u64, bytes: u64) -> VirtRange {
-        assert!(
-            offset + bytes <= self.bytes,
-            "a span of {bytes} bytes at {offset} runs past the device window"
-        );
-        let start = self.base.raw() as u64 + self.offset + offset;
-        VirtRange::new(
-            VirtAddr::new(usize::try_from(start).expect("a window sits inside the address space")),
-            usize::try_from(bytes).expect("a window span fits the address space"),
-        )
-    }
-}
-
-/// Where one of a device's regions ended up in its owner's memory.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MappedRegion {
-    /// Byte offset in the owner's linear memory.
-    pub offset: u64,
-    /// How many bytes of it the region covers.
-    pub bytes: u64,
-}
-
 /// One pinned, physically contiguous buffer the device reads and writes
-/// directly.
+/// directly, as its owner is told about it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DmaBuffer {
-    /// Byte offset in the owner's linear memory.
-    pub offset: u64,
-    /// How long the buffer is.
+    /// How long the buffer is: the span it is shown at.
     pub bytes: u64,
     /// The address the device has to issue to reach it, which is a
     /// physical address on a machine with no translation unit in the
@@ -220,23 +52,28 @@ pub struct DmaBuffer {
     pub device_address: u64,
 }
 
-/// One pinned buffer as the lease records it.
-///
-/// The alignment is the lease's business and not the driver's: a
-/// contiguous run is one allocation, and releasing it needs the size
-/// and alignment it was made with.
+/// One region shown in the owner's memory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct PinnedBuffer {
-    buffer: DmaBuffer,
-    align: u64,
+struct ShownRegion {
+    view: ViewId,
+    bytes: u64,
+}
+
+/// One pinned buffer as the lease records it: the device's attachment
+/// to the run, held until the grant ends.
+struct PinnedDma {
+    /// Held, never read: this reference is what keeps the run pinned
+    /// while the device may still address it.
+    _attachment: Buffer,
+    descriptor: DmaBuffer,
 }
 
 /// What one owner's hold on one device has cost, for the stats panel.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GrantStats {
-    /// Regions currently mapped into the owner's memory.
+    /// Regions currently shown in the owner's memory.
     pub mapped_regions: u32,
-    /// Bytes of those mappings.
+    /// Bytes of those regions.
     pub mapped_bytes: u64,
     /// Buffers currently pinned for the device.
     pub dma_buffers: u32,
@@ -274,31 +111,31 @@ impl PublishedDevice {
 
 /// One owner's exclusive hold on one device.
 ///
-/// Dropping a lease reclaims everything the owner could reach the device
-/// through and returns the device to the registry, so an owner that is
-/// killed rather than shut down cleanly still leaves the device free for
-/// its replacement.
+/// Letting go is [`Self::end_views`], which ends every view the owner
+/// had of the device, followed by dropping the lease. Dropping a lease
+/// without ending its views first is the path a dying store takes: its view table has already
+/// withdrawn every view by then — the table is dropped before the
+/// store's device state — so what is left is masking every source,
+/// releasing every ring and returning the device to the registry, and
+/// an owner that is killed rather than shut down cleanly still leaves
+/// the device free for its replacement.
 pub struct GrantLease {
     device: Arc<PublishedDevice>,
-    window: DeviceWindow,
-    /// Where each of the grant's regions landed, by region index.
-    regions: [Option<MappedRegion>; MAX_GRANT_REGIONS],
-    /// Bump cursor into the window. Regions and buffers are handed out
-    /// in the order they are asked for and released together, because a
-    /// driver builds its rings once and holds them for as long as it
-    /// holds the device.
-    cursor: u64,
-    buffers: ArrayVec<PinnedBuffer, MAX_DMA_BUFFERS>,
+    /// The set every view of this device in the owner's memory belongs
+    /// to.
+    views: ViewGroup,
+    /// Where each of the grant's regions is shown, by region index.
+    regions: [Option<ShownRegion>; MAX_GRANT_REGIONS],
+    buffers: ArrayVec<PinnedDma, MAX_DMA_BUFFERS>,
     pinned_bytes: u64,
 }
 
 impl GrantLease {
-    pub(super) fn new(device: Arc<PublishedDevice>, window: DeviceWindow) -> Self {
+    pub(super) fn new(device: Arc<PublishedDevice>, views: ViewGroup) -> Self {
         Self {
             device,
-            window,
+            views,
             regions: [const { None }; MAX_GRANT_REGIONS],
-            cursor: 0,
             buffers: ArrayVec::new(),
             pinned_bytes: 0,
         }
@@ -312,50 +149,56 @@ impl GrantLease {
         &self.device.relay
     }
 
-    pub const fn window(&self) -> DeviceWindow {
-        self.window
+    /// The set the owner's views of this device belong to.
+    pub const fn views(&self) -> ViewGroup {
+        self.views
     }
 
-    /// Map the grant's `index`-th region into the owner's memory, or
-    /// report where it already is.
+    /// Show the grant's `index`-th region at `at` of the owner's memory,
+    /// for as long as the grant lives.
     ///
-    /// Mapping is what a driver does once per region during its own
-    /// bring-up, so asking twice is answered rather than refused: a
-    /// driver that lost track of an offset is not a driver that has
-    /// corrupted anything.
-    pub fn map_region(&mut self, index: usize) -> Result<MappedRegion, GrantError> {
+    /// `at` is the region's size rounded up to whole wasm pages. A
+    /// region is shown once: asking again is refused rather than
+    /// answered, because the second span would be a second path to the
+    /// same registers that the owner's allocator believes is free.
+    pub fn map_region(
+        &mut self,
+        index: usize,
+        views: &mut ViewTable,
+        memory: GuestMemory,
+        at: Span,
+    ) -> Result<(), GrantError> {
         let region = *self
             .device
             .grant
             .regions()
             .get(index)
             .ok_or(GrantError::NoSuchRegion)?;
-        if let Some(mapped) = self.regions[index] {
-            return Ok(mapped);
+        if self.regions[index].is_some() {
+            return Err(GrantError::RegionAlreadyMapped);
         }
-        let granule = self.granule();
-        let bytes =
-            ((region.frame_count() as u64) * (PhysFrame::SIZE as u64)).next_multiple_of(granule);
-        let offset = self.carve(bytes, granule)?;
-        let virt = self.window.range_at(offset, bytes);
-        (device_vm_hooks().map_device)(virt, region)?;
-        let mapped = MappedRegion {
-            offset: self.window.offset + offset,
-            bytes,
-        };
-        self.regions[index] = Some(mapped);
-        Ok(mapped)
+        let view = views.show_device(memory, at, region, Some(self.views))?;
+        self.regions[index] = Some(ShownRegion {
+            view,
+            bytes: region.physical.bytes,
+        });
+        Ok(())
     }
 
-    /// Pin a physically contiguous buffer the device can reach, inside
-    /// the owner's memory.
+    /// Pin a physically contiguous buffer the device can reach, as long
+    /// as `at` and aligned to `align`, and show it there, zeroed.
     ///
-    /// The buffer counts against the grant's budget and against the
-    /// owner's own memory accounting: the pages come from the user pool,
-    /// so a driver that pins more than the machine can spare is killed
-    /// like any other instance that asked for too much.
-    pub fn dma_alloc(&mut self, bytes: u64, align: u64) -> Result<DmaBuffer, GrantError> {
-        if bytes == 0 {
+    /// The buffer counts against the grant's budget and is charged to
+    /// the owner's own pool, so a driver cannot pin more than the kernel
+    /// budgeted for its device.
+    pub fn dma_alloc(
+        &mut self,
+        align: u64,
+        views: &mut ViewTable,
+        memory: GuestMemory,
+        at: Span,
+    ) -> Result<DmaBuffer, GrantError> {
+        if at.length == 0 {
             return Err(GrantError::EmptyRequest);
         }
         if align == 0 || !align.is_power_of_two() {
@@ -365,60 +208,53 @@ impl GrantLease {
             return Err(GrantError::BudgetExhausted);
         }
         let budget = self.device.grant.dma();
-        let granule = self.granule();
-        // `bytes` came from the driver, so the rounding is checked: an
-        // unchecked one wraps in a release build and would answer a
-        // request for most of the address space with a buffer of a few
-        // bytes, which the driver would then hand to the hardware.
-        let bytes = bytes
-            .checked_next_multiple_of(granule)
-            .ok_or(GrantError::WindowExhausted)?;
-        // The sum is checked for the same reason: with something already
-        // pinned, a request near the top of the range overflows it.
+        // The sum is checked: with something already pinned, a span near
+        // the top of the range overflows it.
         if self
             .pinned_bytes
-            .checked_add(bytes)
+            .checked_add(at.length)
             .is_none_or(|pinned| pinned > budget.byte_budget)
         {
             return Err(GrantError::BudgetExhausted);
         }
-        let align = align.max(granule);
-        let offset = self.carve(bytes, align)?;
-        let virt = self.window.range_at(offset, bytes);
-        let first = (device_vm_hooks().commit_contiguous)(
-            virt,
-            PageFlags::READ | PageFlags::WRITE,
+        // The span is checked before anything is pinned, so a driver
+        // that names the wrong pages costs the machine nothing.
+        views.validate(memory, at, at.length)?;
+        let buffer = Buffer::allocate(
+            at.length,
             DmaPlacement {
                 align,
                 limit: budget.capability.address_limit(),
             },
         )?;
-        let physical = first.phys_addr() as u64;
-        if !budget.capability.can_reach(physical, bytes) {
+        let physical = buffer.physical();
+        if !budget.capability.can_reach(physical.start, physical.bytes) {
             // The address space handed back a run the device cannot
             // address. Nothing is salvageable from a buffer at the wrong
-            // end of memory, and leaving it committed would leak it.
-            (device_vm_hooks().release_contiguous)(virt, align)?;
+            // end of memory; dropping it gives it back.
             return Err(GrantError::Unreachable);
         }
         let device_address = budget
             .capability
             .translation
-            .device_range(physical, bytes)
+            .device_range(physical.start, physical.bytes)
             .map_err(|_| GrantError::Unreachable)?;
-        let buffer = DmaBuffer {
-            offset: self.window.offset + offset,
-            bytes,
+        views.show_buffer(memory, at, &buffer, Some(self.views))?;
+        let descriptor = DmaBuffer {
+            bytes: physical.bytes,
             device_address,
         };
-        self.buffers.push(PinnedBuffer { buffer, align });
-        self.pinned_bytes += bytes;
-        Ok(buffer)
+        self.pinned_bytes += physical.bytes;
+        self.buffers.push(PinnedDma {
+            _attachment: buffer,
+            descriptor,
+        });
+        Ok(descriptor)
     }
 
     /// The buffers currently pinned for the device.
     pub fn dma_buffers(&self) -> impl Iterator<Item = DmaBuffer> + '_ {
-        self.buffers.iter().map(|pinned| pinned.buffer)
+        self.buffers.iter().map(|pinned| pinned.descriptor)
     }
 
     pub fn stats(&self) -> GrantStats {
@@ -436,74 +272,29 @@ impl GrantLease {
         }
     }
 
-    /// Take the device back: mask every source, unmap every region,
-    /// release every pinned buffer, and return the device to the
-    /// registry.
+    /// End every view the owner has of the device, which is the first
+    /// half of taking it back: dropping the lease afterwards masks
+    /// every source, releases every pinned buffer and returns the
+    /// device to the registry.
     ///
-    /// Called explicitly by a supervisor that is restarting its driver
-    /// and by [`Drop`] otherwise, so the two paths cannot diverge.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the address space refuses to undo a mapping. The
-    /// kernel cannot then prove the dead owner has lost its last path to
-    /// the device's registers, and continuing would hand that path to
-    /// whoever the next owner is.
-    pub fn reclaim(self) {
-        drop(self);
-    }
-
-    /// The smallest unit the address space can change a mapping at,
-    /// which is what every region and buffer is aligned and sized to.
-    fn granule(&self) -> u64 {
-        let granule = (device_vm_hooks().mapping_granule)();
-        assert!(
-            granule >= PhysFrame::SIZE as u64 && granule.is_power_of_two(),
-            "an address space maps at a power-of-two granule of at least one frame, not {granule}"
-        );
-        granule
-    }
-
-    /// Carve `bytes` at `align` out of the window.
-    fn carve(&mut self, bytes: u64, align: u64) -> Result<u64, GrantError> {
-        let start = self
-            .cursor
-            .checked_next_multiple_of(align)
-            .ok_or(GrantError::WindowExhausted)?;
-        let end = start
-            .checked_add(bytes)
-            .ok_or(GrantError::WindowExhausted)?;
-        if end > self.window.bytes {
-            return Err(GrantError::WindowExhausted);
-        }
-        self.cursor = end;
-        Ok(start)
+    /// Called by a supervisor that is restarting its driver and by a
+    /// driver letting go. Fails only when a view cannot be ended for
+    /// want of memory to put back, in which case the lease is still
+    /// whole: the owner is out of memory, and its death takes the same
+    /// path with nothing left to allocate.
+    pub fn end_views(&self, views: &mut ViewTable) -> Result<(), ViewError> {
+        views.end_group(self.views)
     }
 }
 
 impl Drop for GrantLease {
     fn drop(&mut self) {
         self.device.relay.quiesce();
-        for mapped in self.regions.iter().flatten() {
-            let offset = mapped.offset - self.window.offset;
-            let virt = self.window.range_at(offset, mapped.bytes);
-            (device_vm_hooks().unmap_device)(virt).unwrap_or_else(|error| {
-                panic!(
-                    "device {} kept a mapping the address space would not undo: {error}",
-                    self.device.grant.name()
-                )
-            });
-        }
-        for pinned in &self.buffers {
-            let offset = pinned.buffer.offset - self.window.offset;
-            let virt = self.window.range_at(offset, pinned.buffer.bytes);
-            (device_vm_hooks().release_contiguous)(virt, pinned.align).unwrap_or_else(|error| {
-                panic!(
-                    "device {} kept a pinned buffer the address space would not release: {error}",
-                    self.device.grant.name()
-                )
-            });
-        }
+        let buffers = self.buffers.len();
+        // The device's attachment to every ring goes here; a ring whose
+        // view is somehow still live keeps its run until that view ends,
+        // so nothing the owner can still reach is freed.
+        self.buffers.clear();
         self.device
             .claimed
             .store(false, core::sync::atomic::Ordering::Release);
@@ -511,7 +302,7 @@ impl Drop for GrantLease {
             target: "helios_kernel::device",
             device = %self.device.grant.name(),
             regions = self.regions.iter().flatten().count(),
-            buffers = self.buffers.len(),
+            buffers,
             "device grant reclaimed"
         );
     }
