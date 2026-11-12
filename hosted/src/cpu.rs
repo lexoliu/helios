@@ -1,8 +1,12 @@
+use std::marker::PhantomData;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::thread;
 
 use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase, TimerInterrupt};
 use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
+
+use helios_kernel::Timer;
 
 use crate::runtime::HostedMachine;
 
@@ -21,6 +25,19 @@ impl HostedCpu {
         set_current_processor(processor);
         Self { processor, machine }
     }
+
+    /// Publishes this processor's kernel timer, built from the kernel its
+    /// `helios_kernel::init` returned, so the timer interrupt can advance
+    /// it. Once per processor, before it parks.
+    pub fn install_timer(&self, timer: Timer<HostedCpu>) {
+        self.machine.install_timer(self.processor, timer);
+    }
+}
+
+/// The wake-only mask of a hosted processor: nothing to restore, and
+/// bound to the thread that took it like the register state it stands for.
+pub struct HostedWakeOnlyMask {
+    _processor_local: PhantomData<*mut ()>,
 }
 
 thread_local! {
@@ -63,7 +80,39 @@ impl Cpu for HostedCpu {
     }
 
     fn park_current(&self) {
+        // The timer thread's expiry is this processor's timer interrupt:
+        // it sets the pending flag, then unparks. An expiry before this
+        // park leaves the unpark token, so the park returns at once and
+        // the flag is found below; one during it ends it the same way.
+        // Either way the interrupt step runs here, on the owner.
         thread::park();
+        self.machine.take_timer_interrupt(self.processor);
+    }
+
+    type WakeOnlyMask = HostedWakeOnlyMask;
+
+    fn mask_to_wake_only(&self) -> HostedWakeOnlyMask {
+        // A hosted processor is a thread whose only interrupt sources are
+        // unparks, and none of them runs device code on a thread that is
+        // not parked: the timer thread's expiry sets a flag that the
+        // owner's `park_current` acts on. There is no register to narrow.
+        HostedWakeOnlyMask {
+            _processor_local: PhantomData,
+        }
+    }
+
+    fn park_wake_only(&self, word: &AtomicU8, held: u8) {
+        // A hosted processor is a thread and its only interrupt sources
+        // are unparks: the timer thread's and `wake_processor`'s. Nothing
+        // here delivers device code to a parked thread, so "every source
+        // but the wake" is the parked thread itself, which runs nothing
+        // when an unpark ends the park and the word is unchanged. A
+        // store made before the unpark that ends the wait is seen
+        // through the park's own acquire, and an unpark that lands
+        // before the park leaves a token the park consumes.
+        while word.load(Ordering::Acquire) == held {
+            thread::park();
+        }
     }
 
     fn start_processor(&self, processor: ProcessorId) {
