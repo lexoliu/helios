@@ -11,12 +11,14 @@
 
 #![cfg(test)]
 
-use helios_hal::vmm::{NoSwap, SwapBackend};
+use helios_hal::vmm::{AddressSpace, NoSwap, PageFlags, SwapBackend, SwapToken, VirtAddr};
 use helios_kernel::{
-    InstanceActivity, InstanceRegistry, KernelHeapHeadroom, KillOutcome, KillReason, MemoryPool,
-    OOM_RECLAIM_GRACE, OomKillOutcome, OomPolicy, store_kernel_heap_bytes,
-    user_mapping_kernel_heap_bytes,
+    InstanceActivity, InstanceRegistry, KernelHeapHeadroom, KillOutcome, KillReason, MemoryOwner,
+    MemoryPool, OOM_RECLAIM_GRACE, OomKillOutcome, OomPolicy, RegisteredInstance, UserResidency,
+    enter_user_memory_owner, store_kernel_heap_bytes, user_mapping_kernel_heap_bytes,
 };
+
+use crate::vmm::HostedAddressSpace;
 
 /// A store value's own size, standing in for the wasmtime store the
 /// kernel really allocates. The exact number does not matter to these
@@ -29,11 +31,29 @@ fn test_store_charge() -> u64 {
     store_kernel_heap_bytes(TEST_STORE_BYTES)
 }
 
+/// The owner an instance's commits are attributed to.
+fn owner_of(instance: &RegisteredInstance) -> MemoryOwner {
+    MemoryOwner::new(instance.id().raw())
+}
+
+/// A residency in which each of `instances` holds every byte of its
+/// linear memory: nothing swapped out, nothing shown from elsewhere.
+fn fully_resident(instances: &[&RegisteredInstance]) -> UserResidency {
+    instances
+        .iter()
+        .map(|instance| (owner_of(instance), instance.memory_bytes()))
+        .collect()
+}
+
 #[test]
 fn pick_skips_instances_with_zero_memory() {
     let registry = InstanceRegistry::new();
-    let _idle = registry.register("idle", 0);
-    assert!(registry.pick_oom_victim(MemoryPool::User).is_none());
+    let idle = registry.register("idle", 0);
+    assert!(
+        registry
+            .pick_oom_victim(MemoryPool::User, &fully_resident(&[&idle]))
+            .is_none()
+    );
 }
 
 #[test]
@@ -45,7 +65,7 @@ fn pick_chooses_largest_consumer_when_costs_match() {
     large.set_memory_bytes(512 * 1024 * 1024);
 
     let victim = registry
-        .pick_oom_victim(MemoryPool::User)
+        .pick_oom_victim(MemoryPool::User, &fully_resident(&[&small, &large]))
         .expect("a victim is available");
     assert_eq!(victim.id, large.id());
 }
@@ -61,7 +81,7 @@ fn pick_prefers_low_restart_cost_per_byte() {
     plugin.set_memory_bytes(512 * 1024 * 1024);
 
     let victim = registry
-        .pick_oom_victim(MemoryPool::User)
+        .pick_oom_victim(MemoryPool::User, &fully_resident(&[&user, &plugin]))
         .expect("a victim is available");
     assert_eq!(victim.id, user.id());
 }
@@ -77,27 +97,32 @@ fn system_components_are_never_oom_victims() {
     system.set_memory_bytes(1024 * 1024 * 1024);
 
     assert!(
-        registry.pick_oom_victim(MemoryPool::User).is_none(),
+        registry
+            .pick_oom_victim(MemoryPool::User, &fully_resident(&[&system]))
+            .is_none(),
         "a system component holding every byte is still not a victim"
     );
 
     // A user program with a sliver of memory is, and stays, the pick.
     let user = registry.register_with_policy("user", 0, OomPolicy::UserProgram);
     user.set_memory_bytes(1024 * 1024);
+    let residency = fully_resident(&[&system, &user]);
 
     let victim = registry
-        .pick_oom_victim(MemoryPool::User)
+        .pick_oom_victim(MemoryPool::User, &residency)
         .expect("a victim is available");
     assert_eq!(victim.id, user.id());
 
     // Once that user program is condemned there is no one left to
     // condemn: the requester takes the grow failure instead.
     assert_eq!(
-        registry.request_kill(victim.id, KillReason::OutOfMemory, 0),
+        registry.request_kill(victim.id, KillReason::OutOfMemory, 0, &residency),
         KillOutcome::Requested
     );
     assert!(
-        registry.pick_oom_victim(MemoryPool::User).is_none(),
+        registry
+            .pick_oom_victim(MemoryPool::User, &residency)
+            .is_none(),
         "with every user instance condemned the killer must run out of victims, \
          not fall through to the kernel's own components"
     );
@@ -110,7 +135,12 @@ fn request_kill_flips_flag_observable_to_pending_kill() {
     instance.set_memory_bytes(128 * 1024 * 1024);
     assert_eq!(instance.pending_kill(), None);
 
-    let outcome = registry.request_kill(instance.id(), KillReason::OutOfMemory, 0);
+    let outcome = registry.request_kill(
+        instance.id(),
+        KillReason::OutOfMemory,
+        0,
+        &fully_resident(&[&instance]),
+    );
     assert_eq!(outcome, KillOutcome::Requested);
     assert_eq!(instance.pending_kill(), Some(KillReason::OutOfMemory));
 }
@@ -120,15 +150,16 @@ fn request_kill_is_idempotent() {
     let registry = InstanceRegistry::new();
     let instance = registry.register("victim", 0);
     instance.set_memory_bytes(64 * 1024 * 1024);
+    let residency = fully_resident(&[&instance]);
 
     assert_eq!(
-        registry.request_kill(instance.id(), KillReason::OutOfMemory, 0),
+        registry.request_kill(instance.id(), KillReason::OutOfMemory, 0, &residency),
         KillOutcome::Requested
     );
     // Second call returns false — the kill is already in progress —
     // and the recorded reason is the original one.
     assert_eq!(
-        registry.request_kill(instance.id(), KillReason::SupervisorRestart, 10),
+        registry.request_kill(instance.id(), KillReason::SupervisorRestart, 10, &residency),
         KillOutcome::AlreadyStopping
     );
     assert_eq!(instance.pending_kill(), Some(KillReason::OutOfMemory));
@@ -141,19 +172,20 @@ fn condemned_instances_are_excluded_from_subsequent_picks() {
     let small = registry.register("small", 0);
     big.set_memory_bytes(512 * 1024 * 1024);
     small.set_memory_bytes(64 * 1024 * 1024);
+    let residency = fully_resident(&[&big, &small]);
 
     let first = registry
-        .pick_oom_victim(MemoryPool::User)
+        .pick_oom_victim(MemoryPool::User, &residency)
         .expect("first victim");
     assert_eq!(first.id, big.id());
     assert_eq!(
-        registry.request_kill(first.id, KillReason::OutOfMemory, 0),
+        registry.request_kill(first.id, KillReason::OutOfMemory, 0, &residency),
         KillOutcome::Requested
     );
 
     // big is now condemned; the next pick must move on to small.
     let second = registry
-        .pick_oom_victim(MemoryPool::User)
+        .pick_oom_victim(MemoryPool::User, &residency)
         .expect("second victim");
     assert_eq!(second.id, small.id());
 }
@@ -164,7 +196,12 @@ fn kill_supervisor_restart_decodes_correctly() {
     let instance = registry.register("plugin", 0);
     instance.set_memory_bytes(1);
     assert_eq!(
-        registry.request_kill(instance.id(), KillReason::SupervisorRestart, 0),
+        registry.request_kill(
+            instance.id(),
+            KillReason::SupervisorRestart,
+            0,
+            &fully_resident(&[&instance])
+        ),
         KillOutcome::Requested
     );
     assert_eq!(instance.pending_kill(), Some(KillReason::SupervisorRestart));
@@ -194,6 +231,7 @@ fn one_shortfall_condemns_only_the_victims_that_cover_it() {
             instance
         })
         .collect();
+    let residency = fully_resident(&victims.iter().collect::<Vec<_>>());
 
     // Every instance retries its refused grow; none of them is torn down
     // in between, which is exactly the state the storm ran in.
@@ -201,7 +239,13 @@ fn one_shortfall_condemns_only_the_victims_that_cover_it() {
     let mut awaiting = 0_usize;
     for _ in 0..INSTANCES {
         match registry
-            .condemn_for_oom(requester.id(), MemoryPool::User, REQUESTED_BYTES, 0)
+            .condemn_for_oom(
+                requester.id(),
+                MemoryPool::User,
+                REQUESTED_BYTES,
+                0,
+                &residency,
+            )
             .outcome
         {
             OomKillOutcome::Condemned(_) => condemned += 1,
@@ -240,8 +284,10 @@ fn reclaimed_memory_leaves_the_ledger() {
     victim.set_memory_bytes(8 * 1024 * 1024);
     let survivor = registry.register("survivor", 0);
     survivor.set_memory_bytes(4 * 1024 * 1024);
+    let residency = fully_resident(&[&victim, &survivor]);
 
-    let decision = registry.condemn_for_oom(requester.id(), MemoryPool::User, 1024 * 1024, 0);
+    let decision =
+        registry.condemn_for_oom(requester.id(), MemoryPool::User, 1024 * 1024, 0, &residency);
     assert!(matches!(decision.outcome, OomKillOutcome::Condemned(_)));
     assert_eq!(decision.condemned.pending_bytes, 8 * 1024 * 1024);
 
@@ -253,7 +299,9 @@ fn reclaimed_memory_leaves_the_ledger() {
     );
 
     // A shortfall after the reclaim is a fresh decision again.
-    let decision = registry.condemn_for_oom(requester.id(), MemoryPool::User, 1024 * 1024, 0);
+    let residency = fully_resident(&[&survivor]);
+    let decision =
+        registry.condemn_for_oom(requester.id(), MemoryPool::User, 1024 * 1024, 0, &residency);
     assert!(matches!(
         decision.outcome,
         OomKillOutcome::Condemned(victim) if victim.id == survivor.id()
@@ -276,24 +324,41 @@ fn a_condemnation_stops_covering_when_its_grace_expires() {
     stuck.set_memory_bytes(8 * 1024 * 1024);
     let next = registry.register("next", 0);
     next.set_memory_bytes(4 * 1024 * 1024);
+    let residency = fully_resident(&[&stuck, &next]);
 
-    let decision = registry.condemn_for_oom(requester.id(), MemoryPool::User, REQUESTED_BYTES, 0);
+    let decision = registry.condemn_for_oom(
+        requester.id(),
+        MemoryPool::User,
+        REQUESTED_BYTES,
+        0,
+        &residency,
+    );
     assert!(matches!(
         decision.outcome,
         OomKillOutcome::Condemned(victim) if victim.id == stuck.id()
     ));
 
     // Inside the window the condemned bytes still cover the request.
-    let decision =
-        registry.condemn_for_oom(requester.id(), MemoryPool::User, REQUESTED_BYTES, grace - 1);
+    let decision = registry.condemn_for_oom(
+        requester.id(),
+        MemoryPool::User,
+        REQUESTED_BYTES,
+        grace - 1,
+        &residency,
+    );
     assert_eq!(decision.outcome, OomKillOutcome::AwaitingReclaim);
     assert_eq!(decision.condemned.pending_bytes, 8 * 1024 * 1024);
     assert_eq!(decision.condemned.stale_bytes, 0);
 
     // The window expires and the victim is still holding its memory:
     // the next victim is condemned rather than waiting forever.
-    let decision =
-        registry.condemn_for_oom(requester.id(), MemoryPool::User, REQUESTED_BYTES, grace);
+    let decision = registry.condemn_for_oom(
+        requester.id(),
+        MemoryPool::User,
+        REQUESTED_BYTES,
+        grace,
+        &residency,
+    );
     assert!(matches!(
         decision.outcome,
         OomKillOutcome::Condemned(victim) if victim.id == next.id()
@@ -308,7 +373,11 @@ fn a_condemnation_stops_covering_when_its_grace_expires() {
     // Stale is not forgotten: the instance stays condemned and is never
     // picked a second time.
     assert_eq!(stuck.pending_kill(), Some(KillReason::OutOfMemory));
-    assert!(registry.pick_oom_victim(MemoryPool::User).is_none());
+    assert!(
+        registry
+            .pick_oom_victim(MemoryPool::User, &residency)
+            .is_none()
+    );
 }
 
 /// The requester is not condemned to serve its own grow, and no smaller
@@ -322,7 +391,13 @@ fn the_requester_is_never_its_own_victim() {
     let small = registry.register("small", 0);
     small.set_memory_bytes(1024 * 1024);
 
-    let decision = registry.condemn_for_oom(requester.id(), MemoryPool::User, 1024 * 1024, 0);
+    let decision = registry.condemn_for_oom(
+        requester.id(),
+        MemoryPool::User,
+        1024 * 1024,
+        0,
+        &fully_resident(&[&requester, &small]),
+    );
     assert_eq!(decision.outcome, OomKillOutcome::NoVictim);
     assert_eq!(requester.pending_kill(), None);
     assert_eq!(small.pending_kill(), None);
@@ -354,6 +429,9 @@ fn a_spawner_condemned_mid_turn_ends_its_turn_and_stays_on_the_ledger() {
             child
         })
         .collect();
+    let mut everyone: Vec<_> = children.iter().collect();
+    everyone.push(&spawner);
+    let residency = fully_resident(&everyone);
 
     let activity = InstanceActivity::new(spawner.clone(), test_store_charge());
     let turns = activity.turns();
@@ -361,12 +439,24 @@ fn a_spawner_condemned_mid_turn_ends_its_turn_and_stays_on_the_ledger() {
 
     // Two children's grows are refused. The first condemns the spawner,
     // the second is covered by the ledger and condemns nothing further.
-    let first = registry.condemn_for_oom(children[0].id(), MemoryPool::User, REQUESTED_BYTES, 20);
+    let first = registry.condemn_for_oom(
+        children[0].id(),
+        MemoryPool::User,
+        REQUESTED_BYTES,
+        20,
+        &residency,
+    );
     assert!(
         matches!(first.outcome, OomKillOutcome::Condemned(victim) if victim.id == spawner.id()),
         "the spawner is the highest-scoring victim"
     );
-    let second = registry.condemn_for_oom(children[1].id(), MemoryPool::User, REQUESTED_BYTES, 21);
+    let second = registry.condemn_for_oom(
+        children[1].id(),
+        MemoryPool::User,
+        REQUESTED_BYTES,
+        21,
+        &residency,
+    );
     assert_eq!(second.outcome, OomKillOutcome::AwaitingReclaim);
     assert_eq!(turns.pending_kill(), Some(KillReason::OutOfMemory));
 
@@ -506,18 +596,19 @@ fn a_kernel_heap_shortfall_condemns_the_largest_kernel_footprint() {
 
     assert!(hog.memory_bytes() > threaded.memory_bytes());
     assert!(threaded.kernel_heap_bytes() > hog.kernel_heap_bytes());
+    let residency = fully_resident(&[&hog, &threaded]);
 
     let user_victim = registry
-        .pick_oom_victim(MemoryPool::User)
+        .pick_oom_victim(MemoryPool::User, &residency)
         .expect("a user-pool victim is available");
     assert_eq!(
         user_victim.id,
         hog.id(),
-        "a user-pool shortfall still ranks by linear memory"
+        "a user-pool shortfall still ranks by what each holds of the user pool"
     );
 
     let kernel_victim = registry
-        .pick_oom_victim(MemoryPool::Kernel)
+        .pick_oom_victim(MemoryPool::Kernel, &residency)
         .expect("a kernel-heap victim is available");
     assert_eq!(
         kernel_victim.id,
@@ -565,9 +656,15 @@ fn the_ledger_counts_the_pool_the_shortfall_is_in() {
         kernel_bytes < MEMORY_BYTES,
         "the two pools are different numbers"
     );
+    let residency = fully_resident(&[&victim]);
 
-    let decision =
-        registry.condemn_for_oom(requester.id(), MemoryPool::Kernel, kernel_bytes / 2, 0);
+    let decision = registry.condemn_for_oom(
+        requester.id(),
+        MemoryPool::Kernel,
+        kernel_bytes / 2,
+        0,
+        &residency,
+    );
     assert!(
         matches!(decision.outcome, OomKillOutcome::Condemned(ref chosen) if chosen.id == victim.id())
     );
@@ -587,8 +684,144 @@ fn the_ledger_counts_the_pool_the_shortfall_is_in() {
 
     // The kernel-heap bytes already condemned cover a second shortfall
     // of the same size, so no second live instance is condemned.
-    let second = registry.condemn_for_oom(requester.id(), MemoryPool::Kernel, kernel_bytes / 2, 0);
+    let second = registry.condemn_for_oom(
+        requester.id(),
+        MemoryPool::Kernel,
+        kernel_bytes / 2,
+        0,
+        &residency,
+    );
     assert_eq!(second.outcome, OomKillOutcome::AwaitingReclaim);
+}
+
+/// Issue #801. An instance whose pages the swap policy has mostly
+/// written out holds few user-pool frames, so killing it returns almost
+/// nothing. Ranked by its linear-memory size it was the victim anyway,
+/// and the ledger then counted its whole size as memory on its way back:
+/// `covers` reported the shortfall met while next to nothing came back,
+/// and later grows were refused until the grace period ran out.
+///
+/// Ranked by what each instance holds of the pool, the smaller, resident
+/// instance is condemned, and the ledger counts what its death returns.
+#[test]
+fn a_mostly_swapped_out_instance_is_ranked_by_what_its_death_returns() {
+    const MIB: u64 = 1024 * 1024;
+
+    let registry = InstanceRegistry::new();
+    let requester = registry.register("requester", 0);
+    let idle = registry.register("/bin/idle-and-swapped", 0);
+    idle.set_memory_bytes(512 * MIB);
+    let busy = registry.register("/bin/resident", 0);
+    busy.set_memory_bytes(64 * MIB);
+    // 504 MiB of the idle instance's memory is in swap.
+    let residency: UserResidency = [(owner_of(&idle), 8 * MIB), (owner_of(&busy), 64 * MIB)]
+        .into_iter()
+        .collect();
+
+    let decision =
+        registry.condemn_for_oom(requester.id(), MemoryPool::User, 32 * MIB, 0, &residency);
+    let OomKillOutcome::Condemned(victim) = decision.outcome else {
+        panic!("a resident instance was there to condemn: {decision:?}");
+    };
+    assert_eq!(
+        victim.id,
+        busy.id(),
+        "the resident instance returns the most"
+    );
+    assert_eq!(victim.user_bytes, 64 * MIB);
+    assert_eq!(victim.memory_bytes, 64 * MIB);
+    assert_eq!(decision.condemned.pending_bytes, 64 * MIB);
+
+    // A shortfall the resident instance's death does not cover takes the
+    // swapped-out one too, and the ledger grows by what it holds, not by
+    // what it once grew to.
+    let decision =
+        registry.condemn_for_oom(requester.id(), MemoryPool::User, 70 * MIB, 0, &residency);
+    let OomKillOutcome::Condemned(victim) = decision.outcome else {
+        panic!("the swapped-out instance was left to condemn: {decision:?}");
+    };
+    assert_eq!(victim.id, idle.id());
+    assert_eq!(victim.user_bytes, 8 * MIB);
+    assert_eq!(victim.memory_bytes, 512 * MIB);
+    assert_eq!(
+        registry.condemned_memory(MemoryPool::User, 0).pending_bytes,
+        72 * MIB
+    );
+    assert!(
+        !registry
+            .condemned_memory(MemoryPool::User, 0)
+            .covers(80 * MIB),
+        "the two deaths return 72 MiB, and the ledger must not claim more"
+    );
+}
+
+/// The same decision against a real address space: pages are committed
+/// in each instance's owner scope, most of the large instance's are
+/// swapped out, and the residency is the address space's own account.
+#[test]
+fn the_address_space_s_account_condemns_the_resident_instance() {
+    const PAGE: usize = 4096;
+    const LARGE_PAGES: usize = 16;
+    const SWAPPED_PAGES: usize = 14;
+    const SMALL_PAGES: usize = 4;
+
+    crate::swap_tests::machine();
+    let address_space = HostedAddressSpace::new();
+    let registry = InstanceRegistry::new();
+    let requester = registry.register("requester", 0);
+    let large = registry.register("/bin/large-and-swapped", 0);
+    let small = registry.register("/bin/small-and-resident", 0);
+
+    let commit = |instance: &RegisteredInstance, pages: usize| {
+        let range = address_space.reserve(pages * PAGE).expect("reserve");
+        let _scope =
+            enter_user_memory_owner(helios_hal::cpu::ProcessorId::new(0), owner_of(instance));
+        address_space
+            .commit(range, PageFlags::READ | PageFlags::WRITE)
+            .expect("commit");
+        instance.set_memory_bytes((pages * PAGE) as u64);
+        range
+    };
+    let large_range = commit(&large, LARGE_PAGES);
+    let small_range = commit(&small, SMALL_PAGES);
+
+    let mut page = vec![0_u8; PAGE];
+    for index in 0..SWAPPED_PAGES {
+        let token = SwapToken::new(index as u32 + 1).expect("non-zero token");
+        address_space
+            .swap_out_page(
+                VirtAddr::new(large_range.start.raw() + index * PAGE),
+                token,
+                &mut page,
+            )
+            .expect("swap out");
+    }
+
+    let residency = UserResidency::of_address_space(&address_space);
+    assert_eq!(
+        residency.bytes_of(owner_of(&large)),
+        ((LARGE_PAGES - SWAPPED_PAGES) * PAGE) as u64
+    );
+    assert_eq!(
+        residency.bytes_of(owner_of(&small)),
+        (SMALL_PAGES * PAGE) as u64
+    );
+    assert!(large.memory_bytes() > small.memory_bytes());
+
+    let decision =
+        registry.condemn_for_oom(requester.id(), MemoryPool::User, PAGE as u64, 0, &residency);
+    assert!(
+        matches!(decision.outcome, OomKillOutcome::Condemned(ref victim) if victim.id == small.id()),
+        "the resident instance is the one whose death returns the most: {decision:?}"
+    );
+    assert_eq!(
+        decision.condemned.pending_bytes,
+        (SMALL_PAGES * PAGE) as u64
+    );
+    assert_eq!(large.pending_kill(), None);
+
+    address_space.release(large_range).expect("release");
+    address_space.release(small_range).expect("release");
 }
 
 #[test]

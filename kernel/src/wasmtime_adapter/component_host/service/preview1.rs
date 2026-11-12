@@ -5841,7 +5841,12 @@ mod tests {
         assert!(driven.as_mut().poll(&mut cx).is_pending());
         signal_state.raise(9);
         assert_eq!(
-            registry.request_kill(instance.id(), crate::KillReason::Operator, 0),
+            registry.request_kill(
+                instance.id(),
+                crate::KillReason::Operator,
+                0,
+                &crate::UserResidency::default()
+            ),
             crate::KillOutcome::Requested
         );
         assert!(
@@ -5969,7 +5974,12 @@ mod tests {
         let call = core::future::poll_fn(move |_| {
             sender.raise(2);
             assert_eq!(
-                registry.request_kill(instance.id(), crate::KillReason::Operator, 0),
+                registry.request_kill(
+                    instance.id(),
+                    crate::KillReason::Operator,
+                    0,
+                    &crate::UserResidency::default()
+                ),
                 crate::KillOutcome::Requested
             );
             core::task::Poll::Ready(Ok(()))

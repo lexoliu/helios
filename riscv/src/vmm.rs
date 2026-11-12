@@ -80,9 +80,11 @@ use helios_kernel::runtime_memory::{
     default_memory_image_new, default_page_size,
 };
 use helios_kernel::{
-    FiberStackVmHooks, MemoryOwner, ReservationLookup, ReservationTracker, VaCursor,
-    allocate_user_frame_zeroed_on, allocate_user_run_zeroed_on, deallocate_user_frame_on,
-    deallocate_user_run_on, install_fiber_stack_hooks, ranges_outside, validate_range,
+    FiberStackVmHooks, InstalledAddressSpace, MemoryOwner, ReservationLookup, ReservationTracker,
+    ResidencyVmHooks, VaCursor, allocate_user_frame_zeroed_on, allocate_user_run_zeroed_on,
+    current_user_memory_owner, deallocate_user_frame_on, deallocate_user_run_on,
+    install_fiber_stack_hooks, install_residency_hooks, ranges_outside, residency_vm_hooks,
+    validate_range,
 };
 use spin::{Mutex, Once};
 
@@ -800,8 +802,11 @@ impl RiscvUserAddressSpace {
 
         // This backend has no swap, so committing over the range can
         // never orphan a swap extent; the assertion keeps that true if
-        // swap reaches this architecture (#25).
-        let orphaned = state.record_commit(virt, flags, MemoryOwner::NONE)?;
+        // swap reaches this architecture (#25). The region is the
+        // instance's whose turn this hart is in: the OOM killer ranks an
+        // instance by what it holds of the pool.
+        let owner = current_user_memory_owner(crate::current_hart_id());
+        let orphaned = state.record_commit(virt, flags, owner)?;
         debug_assert!(orphaned.is_empty());
         Ok(())
     }
@@ -1159,7 +1164,32 @@ impl AddressSpace for RiscvUserAddressSpace {
         }
         Ok(())
     }
+
+    /// Every committed page is resident: this backend has no swap.
+    fn owned_resident_bytes(&self, owner: u64) -> u64 {
+        self.state
+            .lock()
+            .owned_resident_bytes(MemoryOwner::new(owner))
+    }
+
+    fn visit_owned_resident_bytes<Visit>(&self, mut visit: Visit)
+    where
+        Visit: FnMut(u64, u64),
+    {
+        self.state
+            .lock()
+            .visit_owned_resident_bytes(|owner, bytes| visit(owner.raw(), bytes));
+    }
 }
+
+impl InstalledAddressSpace for RiscvUserAddressSpace {
+    fn installed() -> &'static Self {
+        user_as()
+    }
+}
+
+/// The kernel's view of how much of the user pool each instance holds.
+static RISCV_RESIDENCY_HOOKS: ResidencyVmHooks = residency_vm_hooks::<RiscvUserAddressSpace>();
 
 /// Invalidate `pages` translations starting at `start` on this hart and
 /// on every other hart in the system.
@@ -1240,6 +1270,7 @@ const _: () = {
 /// runtime engine is constructed.
 pub fn install_runtime_memory_hooks() {
     runtime_memory::install_hooks(&RISCV_VMM_HOOKS);
+    install_residency_hooks(&RISCV_RESIDENCY_HOOKS);
     install_fiber_stack_hooks(&RISCV_FIBER_STACK_HOOKS);
 }
 
