@@ -50,13 +50,12 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use arrayvec::ArrayVec;
-use async_lock::Mutex as AsyncMutex;
 use atomic_waker::AtomicWaker;
 use core::cell::UnsafeCell;
 use core::cmp;
 use core::future::Future;
 use core::hint::spin_loop;
-use core::mem::{size_of, size_of_val};
+use core::mem::{ManuallyDrop, size_of, size_of_val};
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering, fence};
 use core::task::{Context, Poll};
@@ -65,8 +64,9 @@ use spin::{Mutex, MutexGuard};
 
 use helios_hal::cpu::{Cpu, current_processor};
 use helios_hal::fs::{
-    BlockBuffer, BlockCompletion, BlockDevice, BlockDeviceCapabilities, BlockDeviceRights,
-    BlockGeometry, BlockQueueTopology, BlockRange, BlockSerial, OwnedBlockBuffer,
+    AnswerFlag, BlockBuffer, BlockCompletion, BlockDevice, BlockDeviceCapabilities,
+    BlockDeviceRights, BlockGeometry, BlockQueueTopology, BlockRange, BlockSerial,
+    OwnedBlockBuffer,
 };
 use helios_hal::io::{IoError, IoResult};
 use helios_hal::resource::KernelResource;
@@ -417,9 +417,24 @@ pub struct VirtioBlockResource<T: VirtioTransport, C: QueueAffinity, B> {
     resource: KernelResource<VirtioBlockDevice<T, C, B>, BlockDeviceRights>,
 }
 
+/// A [`SwapBackend`] over a run of blocks on a [`BlockDevice`].
+///
+/// Concurrency contract: every operation may run from any task on any
+/// processor, concurrently. The extent free list sits behind a spin lock
+/// held only for a first-fit scan or a release, never across an `.await`.
+/// Only the backend's own operations, and the drop of a swap-out it
+/// abandoned, take it — all in task context, never from an interrupt —
+/// so it masks nothing. Being synchronous is what lets a dropped
+/// swap-out give its extent back from `Drop`.
+///
+/// The one thing the device's completion path touches is the
+/// [`AnswerFlag`] of a swap-out's write, raised lock-free by the
+/// write's buffer. An extent whose swap-out was dropped with the write
+/// in flight waits on that flag, and the allocator reclaims it on its
+/// next scan once the flag is up.
 pub struct VirtioBlockSwapBackend<D: BlockDevice> {
     device: D,
-    state: AsyncMutex<VirtioBlockSwapState>,
+    state: Mutex<VirtioBlockSwapState>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -461,12 +476,101 @@ pub enum VirtioBlockSwapError {
 #[derive(Default)]
 struct VirtioBlockSwapState {
     free: Vec<SwapExtent>,
+    /// Extents of dropped swap-outs whose writes may still be in flight.
+    abandoned: Vec<AbandonedWrite>,
 }
 
 #[derive(Clone, Copy)]
 struct SwapExtent {
     start_block: usize,
     block_count: usize,
+}
+
+impl VirtioBlockSwapToken {
+    fn extent(self) -> SwapExtent {
+        SwapExtent {
+            start_block: self.start_block,
+            block_count: self.block_count,
+        }
+    }
+}
+
+/// An extent a swap-out has allocated and whose write the device does
+/// not have yet. Dropping it gives the extent back: no request of the
+/// swap-out can reach those blocks.
+struct AllocatedExtent<'a> {
+    state: &'a Mutex<VirtioBlockSwapState>,
+    token: VirtioBlockSwapToken,
+}
+
+impl<'a> AllocatedExtent<'a> {
+    /// The device has taken the write, whose buffer raises `answer`.
+    fn submitted(self, answer: AnswerFlag) -> SubmittedExtent<'a> {
+        let this = ManuallyDrop::new(self);
+        SubmittedExtent {
+            state: this.state,
+            token: this.token,
+            answer: Some(answer),
+        }
+    }
+}
+
+impl Drop for AllocatedExtent<'_> {
+    fn drop(&mut self) {
+        self.state.lock().release(self.token.extent());
+    }
+}
+
+/// An extent whose swap-out write the device has taken and whose answer
+/// the swap-out has not collected.
+///
+/// The device may still write these blocks after the swap-out is
+/// dropped, and virtio-blk orders no two in-flight requests, so an
+/// extent handed to another page before the abandoned write is answered
+/// could have that page's write land first and the abandoned one over
+/// it. Dropping this files the extent as an [`AbandonedWrite`], which
+/// the allocator reclaims once the write's buffer has raised its flag.
+struct SubmittedExtent<'a> {
+    state: &'a Mutex<VirtioBlockSwapState>,
+    token: VirtioBlockSwapToken,
+    /// `None` once the swap-out collected the answer itself.
+    answer: Option<AnswerFlag>,
+}
+
+impl SubmittedExtent<'_> {
+    /// The device answered the write: the token goes to the caller, or,
+    /// when the write failed, the extent goes back.
+    fn answered(
+        mut self,
+        result: IoResult<()>,
+    ) -> Result<VirtioBlockSwapToken, VirtioBlockSwapError> {
+        self.answer = None;
+        match result {
+            Ok(()) => Ok(self.token),
+            Err(error) => {
+                self.state.lock().release(self.token.extent());
+                Err(error.into())
+            }
+        }
+    }
+}
+
+impl Drop for SubmittedExtent<'_> {
+    fn drop(&mut self) {
+        if let Some(answer) = self.answer.take() {
+            self.state.lock().abandon(AbandonedWrite {
+                extent: self.token.extent(),
+                answer,
+            });
+        }
+    }
+}
+
+/// The extent of a swap-out dropped while the device held its write,
+/// held until the write's buffer raises `answer`.
+struct AbandonedWrite {
+    extent: SwapExtent,
+    answer: AnswerFlag,
 }
 
 /// virtio 1.2 §5.2.6: `struct virtio_blk_req` header.
@@ -1618,11 +1722,12 @@ impl<D: BlockDevice> VirtioBlockSwapBackend<D> {
 
         Ok(Self {
             device,
-            state: AsyncMutex::new(VirtioBlockSwapState {
+            state: Mutex::new(VirtioBlockSwapState {
                 free: Vec::from([SwapExtent {
                     start_block,
                     block_count,
                 }]),
+                abandoned: Vec::new(),
             }),
         })
     }
@@ -1632,10 +1737,10 @@ impl<D: BlockDevice> VirtioBlockSwapBackend<D> {
         Self::new(device, 0, block_count)
     }
 
-    async fn allocate_token(
+    fn allocate_extent(
         &self,
         byte_len: usize,
-    ) -> Result<VirtioBlockSwapToken, VirtioBlockSwapError> {
+    ) -> Result<AllocatedExtent<'_>, VirtioBlockSwapError> {
         if byte_len == 0 {
             return Err(VirtioBlockSwapError::EmptyPayload);
         }
@@ -1644,7 +1749,7 @@ impl<D: BlockDevice> VirtioBlockSwapBackend<D> {
             return Err(VirtioBlockSwapError::InvalidBlockSize);
         }
         let block_count = byte_len.div_ceil(block_size);
-        let mut state = self.state.lock().await;
+        let mut state = self.state.lock();
         let start_block =
             state
                 .allocate(block_count)
@@ -1652,23 +1757,24 @@ impl<D: BlockDevice> VirtioBlockSwapBackend<D> {
                     requested_blocks: block_count,
                     available_blocks: state.available_blocks(),
                 })?;
-        Ok(VirtioBlockSwapToken {
-            start_block,
-            block_count,
-            byte_len,
+        Ok(AllocatedExtent {
+            state: &self.state,
+            token: VirtioBlockSwapToken {
+                start_block,
+                block_count,
+                byte_len,
+            },
         })
     }
 
-    async fn release_token(&self, token: VirtioBlockSwapToken) {
-        self.state.lock().await.release(SwapExtent {
-            start_block: token.start_block,
-            block_count: token.block_count,
-        });
+    fn release_token(&self, token: VirtioBlockSwapToken) {
+        self.state.lock().release(token.extent());
     }
 }
 
 impl VirtioBlockSwapState {
     fn allocate(&mut self, requested_blocks: usize) -> Option<usize> {
+        self.reclaim_answered();
         let index = self
             .free
             .iter()
@@ -1706,7 +1812,31 @@ impl VirtioBlockSwapState {
         }
     }
 
-    fn available_blocks(&self) -> usize {
+    /// Files the extent of a swap-out dropped with its write in flight,
+    /// or frees it when the write was answered meanwhile.
+    fn abandon(&mut self, write: AbandonedWrite) {
+        if write.answer.is_raised() {
+            self.release(write.extent);
+        } else {
+            self.abandoned.push(write);
+        }
+    }
+
+    /// Frees every abandoned extent whose write the device has answered.
+    fn reclaim_answered(&mut self) {
+        let mut index = 0;
+        while index < self.abandoned.len() {
+            if self.abandoned[index].answer.is_raised() {
+                let write = self.abandoned.swap_remove(index);
+                self.release(write.extent);
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    fn available_blocks(&mut self) -> usize {
+        self.reclaim_answered();
         self.free.iter().map(|extent| extent.block_count).sum()
     }
 }
@@ -1882,21 +2012,34 @@ where
     /// write it will hand the same bytes back, and nothing in swap has to
     /// outlive the kernel. A flush per page would buy durability nobody
     /// wants at the price of a host fsync on every page evicted.
+    ///
+    /// Dropped before the device has the write, the swap-out gives its
+    /// extent back at once. Dropped after, it gives the extent back once
+    /// the device has answered the write and never before, because the
+    /// device may still write those blocks and virtio-blk orders no two
+    /// in-flight requests.
     async fn swap_out(&self, bytes: &[u8]) -> Result<Self::Token, Self::Error> {
-        let token = self.allocate_token(bytes.len()).await?;
-        if let Err(error) = self.write_extent(token, bytes).await {
-            self.release_token(token).await;
-            return Err(error);
-        }
-        Ok(token)
+        let extent = self.allocate_extent(bytes.len())?;
+        let mut buffer = self.extent_buffer(extent.token)?;
+        buffer.copy_from(bytes);
+        let answer = AnswerFlag::new();
+        buffer.raise_on_answer(answer.clone());
+        let waiter = self
+            .device
+            .submit_write(extent.token.start_block, buffer)
+            .await;
+        let extent = extent.submitted(answer);
+        extent.answered(waiter.await.result)
     }
 
     /// Reads a swapped-out page back into `dst` and frees its extent.
     ///
     /// The device fills a buffer of its own, which is copied into `dst`
     /// once it answered. The extent is released only once the page is
-    /// back: a failed read leaves the token valid so the caller can try
-    /// again rather than losing the only copy of the page.
+    /// back, with no await between the copy and the release: a failed
+    /// read, or a swap-in dropped before it resolves, leaves the token
+    /// valid and the extent allocated so the caller can try again rather
+    /// than losing the only copy of the page.
     async fn swap_in(&self, token: Self::Token, dst: &mut [u8]) -> Result<(), Self::Error> {
         if dst.len() != token.byte_len {
             return Err(VirtioBlockSwapError::InvalidDestination {
@@ -1908,12 +2051,12 @@ where
         let read = self.device.read(token.start_block, buffer).await;
         read.result?;
         read.buffer.copy_to(dst);
-        self.release_token(token).await;
+        self.release_token(token);
         Ok(())
     }
 
     async fn release(&self, token: Self::Token) {
-        self.release_token(token).await;
+        self.release_token(token);
     }
 }
 
@@ -1936,17 +2079,6 @@ where
                 len: token.byte_len,
             },
         )
-    }
-
-    async fn write_extent(
-        &self,
-        token: VirtioBlockSwapToken,
-        bytes: &[u8],
-    ) -> Result<(), VirtioBlockSwapError> {
-        let mut buffer = self.extent_buffer(token)?;
-        buffer.copy_from(bytes);
-        self.device.write(token.start_block, buffer).await.result?;
-        Ok(())
     }
 }
 
