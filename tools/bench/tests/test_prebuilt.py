@@ -18,7 +18,8 @@ ALL_SIDES = frozenset({Side.HELIOS, Side.LINUX_NATIVE, Side.LINUX_WASMTIME})
 
 def options_for(tmp_path: Path, prebuilt: bool, **overrides) -> RunOptions:
     return RunOptions(
-        lane=load_manifest().lane("aarch64-hvf"),
+        # One pass: these tests are about what a prebuilt plan builds, not about rounds.
+        lane=load_manifest().lane("aarch64-hvf").model_copy(update={"rounds": None}),
         out_dir=tmp_path / "out",
         advisory=True,
         sides=overrides.pop("sides", ALL_SIDES),

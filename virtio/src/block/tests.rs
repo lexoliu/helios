@@ -44,6 +44,7 @@ struct TestBuffer {
     /// `None` for host memory, which the buffer frees itself.
     device_memory: Option<ConfinedDmaBuffer>,
     probe: Option<Arc<Probe>>,
+    answered: Option<AnswerFlag>,
 }
 
 // SAFETY: the buffer owns its bytes, either as a boxed slice or as the
@@ -70,6 +71,7 @@ impl TestBuffer {
             bytes: NonNull::new(bytes).expect("a box is never null"),
             device_memory: None,
             probe: None,
+            answered: None,
         }
     }
 
@@ -122,17 +124,25 @@ impl BlockBuffer for TestBuffer {
         if let Some(probe) = &self.probe {
             probe.completions.lock().push(result);
         }
+        if let Some(answered) = self.answered.take() {
+            answered.raise();
+        }
     }
 }
 
 impl OwnedBlockBuffer for TestBuffer {
     type Memory = ConfinedDmaBuffer;
 
+    fn raise_on_answer(&mut self, flag: AnswerFlag) {
+        self.answered = Some(flag);
+    }
+
     fn owning(mut memory: ConfinedDmaBuffer) -> Self {
         Self {
             bytes: NonNull::from(memory.as_mut_slice()),
             device_memory: Some(memory),
             probe: None,
+            answered: None,
         }
     }
 }
@@ -994,14 +1004,58 @@ fn test_geometry() -> BlockGeometry {
 }
 
 /// A block device backed by host memory, for the swap backend tests. It
-/// answers every request as it is submitted, and hands out request
-/// memory from a confined pool of its own.
+/// carries a request out as it is submitted, answers it at once unless
+/// told to hold its answers, and hands out request memory from a confined
+/// pool of its own.
 struct MemoryBlockDevice {
     blocks: SpinMutex<Vec<u8>>,
     block_size: usize,
     memory: ConfinedDmaPool,
     flushes: AtomicU64,
     fail_reads: bool,
+    /// Each submission first parks once, as one waiting for room in a
+    /// full queue does, before the device takes the request.
+    queue_full: AtomicBool,
+    /// Requests are kept unanswered in `held` until
+    /// [`MemoryBlockDevice::answer_held`], as a device that has not got
+    /// to them yet keeps them.
+    hold_answers: AtomicBool,
+    held: SpinMutex<Vec<HeldRequest>>,
+}
+
+/// Where a [`MemoryBlockDevice`] request's answer meets its waiter.
+#[derive(Default)]
+struct AnswerSlot {
+    completion: Option<BufResult<(), TestBuffer>>,
+    waker: Option<core::task::Waker>,
+}
+
+/// A request the device has taken and not answered. Its buffer is the
+/// device's until then, whether or not the waiter is still there.
+struct HeldRequest {
+    buffer: TestBuffer,
+    result: IoResult<()>,
+    slot: Arc<SpinMutex<AnswerSlot>>,
+}
+
+/// The waiter of a [`MemoryBlockDevice`] request.
+struct MemoryWaiter {
+    slot: Arc<SpinMutex<AnswerSlot>>,
+}
+
+impl Future for MemoryWaiter {
+    type Output = BufResult<(), TestBuffer>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut slot = self.slot.lock();
+        match slot.completion.take() {
+            Some(completion) => Poll::Ready(completion),
+            None => {
+                slot.waker = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }
+    }
 }
 
 impl MemoryBlockDevice {
@@ -1014,6 +1068,43 @@ impl MemoryBlockDevice {
             memory: ConfinedDmaPool::new(64 * PhysFrame::SIZE),
             flushes: AtomicU64::new(0),
             fail_reads: false,
+            queue_full: AtomicBool::new(false),
+            hold_answers: AtomicBool::new(false),
+            held: SpinMutex::new(Vec::new()),
+        }
+    }
+
+    fn stall_submissions(&self, stall: bool) {
+        self.queue_full.store(stall, Ordering::Relaxed);
+    }
+
+    fn hold_answers(&self, hold: bool) {
+        self.hold_answers.store(hold, Ordering::Relaxed);
+    }
+
+    /// Answers every held request: its buffer is completed, and the
+    /// answer goes to its waiter, or is dropped with the buffer when the
+    /// waiter is gone.
+    fn answer_held(&self) {
+        let held = core::mem::take(&mut *self.held.lock());
+        for HeldRequest {
+            mut buffer,
+            result,
+            slot,
+        } in held
+        {
+            buffer.complete(result);
+            let mut slot = slot.lock();
+            slot.completion = Some(Self::answered(buffer, result));
+            if let Some(waker) = slot.waker.take() {
+                waker.wake();
+            }
+        }
+    }
+
+    async fn wait_for_room(&self) {
+        if self.queue_full.load(Ordering::Relaxed) {
+            futures_lite::future::yield_now().await;
         }
     }
 
@@ -1028,22 +1119,35 @@ impl MemoryBlockDevice {
         self.flushes.load(Ordering::Relaxed)
     }
 
-    fn answer(
-        mut buffer: TestBuffer,
-        result: IoResult<()>,
-    ) -> core::future::Ready<BufResult<(), TestBuffer>> {
-        buffer.complete(result);
-        core::future::ready(match result {
+    /// The answer a waiter resolves to: the buffer comes back whatever
+    /// the result was.
+    fn answered(buffer: TestBuffer, result: IoResult<()>) -> BufResult<(), TestBuffer> {
+        match result {
             Ok(()) => Ok(((), buffer)),
             Err(error) => Err(BufError::returned(error, buffer)),
-        })
+        }
+    }
+
+    fn answer(&self, mut buffer: TestBuffer, result: IoResult<()>) -> MemoryWaiter {
+        let slot = Arc::new(SpinMutex::new(AnswerSlot::default()));
+        if self.hold_answers.load(Ordering::Relaxed) {
+            self.held.lock().push(HeldRequest {
+                buffer,
+                result,
+                slot: Arc::clone(&slot),
+            });
+        } else {
+            buffer.complete(result);
+            slot.lock().completion = Some(Self::answered(buffer, result));
+        }
+        MemoryWaiter { slot }
     }
 }
 
 impl BlockDevice for MemoryBlockDevice {
     type Buffer = TestBuffer;
     type Memory = ConfinedDmaBuffer;
-    type Waiter<'a> = core::future::Ready<BufResult<(), TestBuffer>>;
+    type Waiter<'a> = MemoryWaiter;
 
     fn memory(&self, bytes: usize) -> IoResult<ConfinedDmaBuffer> {
         let layout =
@@ -1052,22 +1156,24 @@ impl BlockDevice for MemoryBlockDevice {
     }
 
     async fn submit_read(&self, block_id: usize, mut buffer: TestBuffer) -> Self::Waiter<'_> {
+        self.wait_for_room().await;
         if self.fail_reads {
-            return Self::answer(buffer, Err(IoError::DeviceFault));
+            return self.answer(buffer, Err(IoError::DeviceFault));
         }
         let offset = block_id * self.block_size;
         let len = buffer.as_ref().len();
         buffer
             .as_mut()
             .copy_from_slice(&self.blocks.lock()[offset..offset + len]);
-        Self::answer(buffer, Ok(()))
+        self.answer(buffer, Ok(()))
     }
 
     async fn submit_write(&self, block_id: usize, buffer: TestBuffer) -> Self::Waiter<'_> {
+        self.wait_for_room().await;
         let offset = block_id * self.block_size;
         let len = buffer.as_ref().len();
         self.blocks.lock()[offset..offset + len].copy_from_slice(buffer.as_ref());
-        Self::answer(buffer, Ok(()))
+        self.answer(buffer, Ok(()))
     }
 
     async fn flush(&self) -> IoResult<()> {
@@ -1199,7 +1305,7 @@ fn a_failed_swap_in_keeps_the_token_valid() {
     );
     assert!(refused.buffers.is_some(), "the staging page comes back");
     assert_eq!(
-        block_on(backend.state.lock()).available_blocks(),
+        backend.state.lock().available_blocks(),
         2,
         "the extent of a page that is still on the device must stay allocated"
     );
@@ -1213,7 +1319,7 @@ fn swap_extents_are_reused_and_coalesced() {
     let first = swapped(&backend, 1024, 1).expect("first swap-out");
     let second = swapped(&backend, 1024, 2).expect("second swap-out");
     let third = swapped(&backend, 2048, 3).expect("third swap-out");
-    assert_eq!(block_on(backend.state.lock()).available_blocks(), 0);
+    assert_eq!(backend.state.lock().available_blocks(), 0);
     assert_eq!(
         swapped(&backend, 512, 4),
         Err(VirtioBlockSwapError::OutOfSwap {
@@ -1225,7 +1331,7 @@ fn swap_extents_are_reused_and_coalesced() {
     restored(&backend, second, 1024).expect("swap-in of the middle extent");
     restored(&backend, first, 1024).expect("swap-in of the first extent");
     {
-        let state = block_on(backend.state.lock());
+        let mut state = backend.state.lock();
         assert_eq!(state.available_blocks(), 4);
         assert_eq!(
             state.free.len(),
@@ -1238,7 +1344,115 @@ fn swap_extents_are_reused_and_coalesced() {
         restored(&backend, third, 2048).expect("swap-in of the last extent"),
         vec![3_u8; 2048]
     );
-    let state = block_on(backend.state.lock());
+    let mut state = backend.state.lock();
     assert_eq!(state.free.len(), 1);
     assert_eq!(state.available_blocks(), 8);
+}
+
+#[test]
+fn a_swap_out_dropped_before_the_device_has_its_write_gives_the_extent_back() {
+    let backend = VirtioBlockSwapBackend::from_entire_device(MemoryBlockDevice::new(512, 4))
+        .expect("swap backend should initialize");
+    backend.device.stall_submissions(true);
+    let page = staged(&backend, 1024, 9);
+
+    {
+        let mut swap_out = pin!(backend.swap_out(page));
+        assert!(
+            block_on(poll_once(swap_out.as_mut())).is_none(),
+            "the submission parks for room in the queue"
+        );
+        assert_eq!(
+            backend.state.lock().available_blocks(),
+            2,
+            "the parked swap-out holds its extent"
+        );
+    }
+
+    let mut state = backend.state.lock();
+    assert_eq!(
+        state.available_blocks(),
+        4,
+        "a dropped swap-out whose write never reached the device leaks no extent"
+    );
+    assert_eq!(state.free.len(), 1);
+}
+
+#[test]
+fn a_swap_out_dropped_while_the_device_holds_its_write_gives_the_extent_back_once_answered() {
+    let backend = VirtioBlockSwapBackend::from_entire_device(MemoryBlockDevice::new(512, 4))
+        .expect("swap backend should initialize");
+    backend.device.hold_answers(true);
+    let page = staged(&backend, 1024, 9);
+
+    {
+        let mut swap_out = pin!(backend.swap_out(page));
+        assert!(
+            block_on(poll_once(swap_out.as_mut())).is_none(),
+            "the write is with the device, unanswered"
+        );
+    }
+
+    assert_eq!(
+        backend.state.lock().available_blocks(),
+        2,
+        "blocks an abandoned write may still reach are not handed to another page"
+    );
+    backend.device.hold_answers(false);
+    let other = swapped(&backend, 1024, 1).expect("the rest still serves");
+    assert_eq!(
+        other.start_block, 2,
+        "the extent of the unanswered write is not reused"
+    );
+    restored(&backend, other, 1024).expect("swap-in of the other page");
+
+    backend.device.answer_held();
+    let mut state = backend.state.lock();
+    assert_eq!(
+        state.available_blocks(),
+        4,
+        "once the device answered the abandoned write, its extent is free again"
+    );
+    assert_eq!(state.free.len(), 1);
+    assert!(state.abandoned.is_empty());
+    drop(state);
+    let reused = swapped(&backend, 1024, 2).expect("swap-out after the answer");
+    assert_eq!(
+        reused.start_block, 0,
+        "the answered write's extent is handed out again"
+    );
+}
+
+#[test]
+fn a_swap_in_dropped_mid_read_leaves_the_token_valid() {
+    let backend = VirtioBlockSwapBackend::from_entire_device(MemoryBlockDevice::new(512, 4))
+        .expect("swap backend should initialize");
+    let mut page = backend.buffer(1024).expect("staging buffer");
+    for (index, byte) in page.as_mut().iter_mut().enumerate() {
+        *byte = index as u8;
+    }
+    let expected = page.as_ref().to_vec();
+    let (token, _page) = block_on(backend.swap_out(page)).expect("swap-out should succeed");
+    backend.device.hold_answers(true);
+
+    {
+        let mut swap_in = pin!(backend.swap_in(token, staged(&backend, 1024, 0)));
+        assert!(
+            block_on(poll_once(swap_in.as_mut())).is_none(),
+            "the read is with the device, unanswered"
+        );
+    }
+    assert_eq!(
+        backend.state.lock().available_blocks(),
+        2,
+        "the extent of a page a dropped swap-in never read back stays allocated"
+    );
+
+    backend.device.answer_held();
+    backend.device.hold_answers(false);
+    assert_eq!(
+        restored(&backend, token, 1024).expect("the token is still valid"),
+        expected
+    );
+    assert_eq!(backend.state.lock().available_blocks(), 4);
 }

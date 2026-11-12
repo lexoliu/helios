@@ -1750,6 +1750,9 @@ dependencies = [
 [[package]]
 name = "helios-compiler-abi"
 version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.21",
+]
 
 [[package]]
 name = "helios-compiler-plugin"

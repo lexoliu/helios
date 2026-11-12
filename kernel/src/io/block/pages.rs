@@ -33,7 +33,7 @@ use arrayvec::ArrayVec;
 use core::ptr::NonNull;
 
 use helios_hal::dma::DmaBuffer;
-use helios_hal::fs::{BlockBuffer, BlockDevice, OwnedBlockBuffer};
+use helios_hal::fs::{AnswerFlag, BlockBuffer, BlockDevice, OwnedBlockBuffer};
 use helios_hal::io::IoResult;
 
 use super::cache::{CACHE_BLOCK_BYTES, CacheRun, MAX_RUN_BLOCKS};
@@ -61,6 +61,9 @@ pub struct BlockPages<Memory> {
     /// The cache blocks the request fills or writes, when the block cache
     /// issued it.
     run: Option<CacheRun<Memory>>,
+    /// Raised once the request is over, when the holder asked to learn
+    /// it (see [`OwnedBlockBuffer::raise_on_answer`]).
+    answered: Option<AnswerFlag>,
 }
 
 // SAFETY: the pages are the buffer's own memory or cache pages the run
@@ -86,6 +89,7 @@ impl<Memory: DmaBuffer> BlockPages<Memory> {
             staged: Vec::with_capacity(staged),
             owned: None,
             run: Some(run),
+            answered: None,
         }
     }
 
@@ -157,6 +161,9 @@ impl<Memory: DmaBuffer> BlockBuffer for BlockPages<Memory> {
         if let Some(run) = self.run.as_mut() {
             run.complete(result);
         }
+        if let Some(answered) = self.answered.take() {
+            answered.raise();
+        }
     }
 }
 
@@ -166,12 +173,17 @@ where
 {
     type Memory = Memory;
 
+    fn raise_on_answer(&mut self, flag: AnswerFlag) {
+        self.answered = Some(flag);
+    }
+
     fn owning(memory: Memory) -> Self {
         Self {
             pages: ArrayVec::new(),
             staged: Vec::new(),
             owned: Some(memory),
             run: None,
+            answered: None,
         }
     }
 }

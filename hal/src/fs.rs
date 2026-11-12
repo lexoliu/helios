@@ -2,10 +2,12 @@ pub use crate::io::{IoError, IoResult};
 
 use crate::dma::{BufResult, DmaBuffer};
 use crate::resource::{KernelResource, ResourceRights};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use bitflags::bitflags;
 use core::future::Future;
 use core::ptr::NonNull;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 bitflags! {
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -353,6 +355,35 @@ pub trait BlockBuffer: Send + 'static {
     fn complete(&mut self, result: IoResult<()>);
 }
 
+/// A flag the buffer of one request raises once the request is over: the
+/// device answered it, or the driver refused it, so nothing of it can
+/// still reach the device's blocks. It is raised whether or not a task
+/// still waits, which is what lets the holder of a dropped submission's
+/// storage learn when that storage is safe to reuse.
+///
+/// Concurrency contract: one buffer raises the flag, from the contexts
+/// [`BlockBuffer::complete`] runs in, with a single release store; any
+/// number of clones on any processor read it lock-free.
+#[derive(Clone, Debug, Default)]
+pub struct AnswerFlag(Arc<AtomicBool>);
+
+impl AnswerFlag {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Marks the request answered.
+    pub fn raise(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    /// Whether the request is over. Once this answers `true`, everything
+    /// the device did for the request happened before.
+    pub fn is_raised(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
 /// A [`BlockBuffer`] whose bytes belong to the buffer itself, so its
 /// holder fills and reads them through its byte views: a scratch or swap
 /// page, as opposed to a cache's own blocks.
@@ -367,6 +398,12 @@ pub trait OwnedBlockBuffer: BlockBuffer + AsRef<[u8]> + AsMut<[u8]> {
     /// [`BlockDevice::Memory`].
     type Memory;
 
+    /// Has the buffer raise `flag` in [`BlockBuffer::complete`], after
+    /// whatever else completing it does. A buffer dropped uncompleted —
+    /// its submission dropped before the device accepted it — never
+    /// raises it.
+    fn raise_on_answer(&mut self, flag: AnswerFlag);
+
     /// A request buffer whose bytes are all of `memory`'s.
     fn owning(memory: Self::Memory) -> Self;
 }
@@ -378,12 +415,14 @@ pub trait OwnedBlockBuffer: BlockBuffer + AsRef<[u8]> + AsMut<[u8]> {
 /// steps. Submission takes the buffer, waits only for room in the
 /// device's queue, and resolves to a waiter once the device has the
 /// request; the waiter resolves to the answer, which hands the buffer
-/// back whatever the answer was. Dropping the waiter detaches it and
-/// changes nothing about the request: the device still carries it out,
-/// the driver still completes the buffer (see [`BlockBuffer`]) and then
-/// drops it. The operations that carry no caller memory — flush,
-/// discard, write-zeroes, identification — are one future each, and
-/// dropping one in flight detaches it the same way.
+/// back whatever the answer was. Handing the device the request and
+/// resolving are one step, so a submission dropped before it resolves
+/// never reached the device and drops its buffer uncompleted. Dropping
+/// the waiter detaches it and changes nothing about the request: the
+/// device still carries it out, the driver still completes the buffer
+/// (see [`BlockBuffer`]) and then drops it. The operations that carry no
+/// caller memory — flush, discard, write-zeroes, identification — are
+/// one future each, and dropping one in flight detaches it the same way.
 ///
 /// A block request's failure always carries its buffer back
 /// ([`crate::dma::BufError::buffers`] is `Some`): a driver whose device
