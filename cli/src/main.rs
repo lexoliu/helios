@@ -983,7 +983,6 @@ fn run_kernel_prebuild(
         &command.profile,
         &command.out_dir,
         &init_manifest,
-        "init-target",
         "helios_init.wasm",
     )?;
     let init_cwasm = command.out_dir.join("init_component.cwasm");
@@ -1881,7 +1880,6 @@ fn build_boot_program_asset(
         build.profile,
         build.out_dir,
         &manifest.manifest_path,
-        &format!("bootfs-{}-target", manifest.command),
         &manifest.artifact_name,
     )?;
     let component_bytes = encode_component(&wasm_path)?;
@@ -2045,12 +2043,18 @@ fn read_program_manifest(
     })
 }
 
+/// The target directory every `wasm32-wasip2` component program builds
+/// into. The programs are workspace members built with one profile
+/// environment and one `RUSTFLAGS`, so their shared dependencies compile
+/// once; each program is still its own `cargo build`, so its feature
+/// resolution and its `.wasm` are what a private directory would produce.
+const COMPONENT_PROGRAMS_TARGET_DIR: &str = "component-programs-target";
+
 fn build_component_program(
     cargo: &Path,
     profile: &str,
     out_dir: &Path,
     manifest_path: &Path,
-    target_dir_name: &str,
     artifact_name: &str,
 ) -> Result<PathBuf, WasmBuildError> {
     build_wasm_program(
@@ -2058,7 +2062,7 @@ fn build_component_program(
         profile,
         out_dir,
         manifest_path,
-        target_dir_name,
+        COMPONENT_PROGRAMS_TARGET_DIR,
         "wasm32-wasip2",
         artifact_name,
     )
