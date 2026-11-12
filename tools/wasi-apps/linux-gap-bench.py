@@ -1509,6 +1509,8 @@ def run_linux(
     native_bin_dir: Path | None,
     control_workload: dict | None,
     keep_going: bool,
+    compiler_plugin_wasm: Path | None,
+    compiler: runner.CompilerRequest,
 ) -> tuple[Path | None, Path | None, dict]:
     return run_fedora_qemu_linux(
         repo_root(),
@@ -1537,6 +1539,8 @@ def run_linux(
         native_bin_dir=native_bin_dir,
         control_workload=control_workload,
         keep_going=keep_going,
+        compiler_plugin_wasm=compiler_plugin_wasm,
+        compiler=compiler,
     )
 
 
@@ -2615,7 +2619,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--native-bin-dir",
         type=Path,
         default=None,
-        help="Static Linux binaries from tools/bench/native/build.sh; defaults to artifacts/bench-native/<guest-arch>.",
+        help="Linux binaries from tools/bench/native/build.sh; defaults to artifacts/bench-native/<guest-arch>.",
+    )
+    parser.add_argument(
+        "--compiler-plugin-wasm",
+        type=Path,
+        default=None,
+        help=(
+            "The compiler plugin's core module (kernel-prebuild's compiler_plugin.wasm) that a "
+            "Linux counterpart naming {compiler_plugin} hosts."
+        ),
+    )
+    parser.add_argument(
+        "--compiler-target",
+        default=None,
+        help="The Helios kernel target triple a counterpart naming {compiler_target} compiles for.",
+    )
+    parser.add_argument(
+        "--compiler-workers",
+        type=int,
+        default=None,
+        help="The kernel's compiler worker count a counterpart naming {compiler_workers} compiles with.",
     )
     parser.add_argument("--linux-vm-qemu-bin", default=None)
     parser.add_argument(
@@ -3079,6 +3103,8 @@ def main() -> None:
                 args.native_bin_dir,
                 control_workload,
                 args.keep_going,
+                args.compiler_plugin_wasm,
+                runner.CompilerRequest(args.compiler_target, args.compiler_workers),
             )
         if args.wasmtime_profile_workload:
             wasmtime_profiles = run_wasmtime_profiles(

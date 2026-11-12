@@ -48,6 +48,14 @@ qemu_version = "8.2.2"
 # KVM boots in seconds; a marker hang should fail fast.
 boot_timeout_seconds = 300
 vcpus = 4
+# The compiler plugin's worker count on a guest of `vcpus` processors: its
+# kernel-role processors, every processor but the one the embedded debugger
+# reserves for the system component
+# (kernel/src/wasmtime_adapter/component_host/topology.rs). The kernel
+# reports the count it used with every AOT result and the report refuses a
+# run whose Helios and Linux + Wasmtime columns differ, so this states the
+# count the Linux column asks for rather than deciding it.
+compiler_workers = 3
 # instance-startup-500 wants about 6.1 GiB of guest (docs/benchmarks.md).
 memory = "6G"
 linux_vm_memory = "4G"
@@ -75,6 +83,8 @@ boot_timeout_seconds = 300
 # The host's performance-core count: a vCPU thread that lands on an
 # efficiency core is a different machine, not a slower one.
 vcpus = 4
+# The kernel-role processors of a 4-processor guest, as on x86-64-kvm.
+compiler_workers = 3
 # One size for both guests, small enough that either fits an 8 GB host
 # with the host's own memory pressure normal.
 memory = "2G"

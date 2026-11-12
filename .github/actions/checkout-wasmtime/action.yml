@@ -15,5 +15,5 @@ runs:
     - uses: actions/checkout@v4
       with:
         repository: lexoliu/wasmtime
-        ref: 1ed7678a8ee4f57cbe4a4e89ade7f7fda6092055
+        ref: 18b428e6becfb6138b877a3fe70afb08bf5724ba
         path: ${{ inputs.path }}
