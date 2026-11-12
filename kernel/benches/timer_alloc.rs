@@ -30,9 +30,9 @@ use divan::counter::ItemsCount;
 use divan::{AllocProfiler, Bencher, black_box};
 use futures::task::noop_waker_ref;
 use helios_hal::cpu::{Cpu, HardwarePerfCounters, Instant, ProcessorId, Timebase, TimerInterrupt};
-use helios_hal::numa::SingleNode;
+use helios_hal::numa::{NodeId, SingleNode};
 use helios_hal::watchdog::ProgressCounter;
-use helios_kernel::{Executor, Locality, Timer};
+use helios_kernel::{Executor, NodeRun, Timer, UserMemoryPool};
 
 #[global_allocator]
 static ALLOC: AllocProfiler = AllocProfiler::system();
@@ -62,11 +62,27 @@ impl helios_hal::critical_section::LocalInterruptMask for BenchInterruptMask {
 helios_hal::critical_section::set_local_interrupt_mask_impl!(BenchInterruptMask);
 
 /// Processor 0's timer, as its executor builds it on a one-processor
-/// machine with no NUMA description. The locality is leaked: the kernel
-/// holds it for the machine's life, and the benchmark process is that.
+/// machine with no NUMA description. The pool is leaked over one
+/// naturally aligned host block: the kernel holds it for the machine's
+/// life, and the benchmark process is that.
 fn bench_timer() -> Timer<BenchCpu> {
-    let locality = Box::leak(Box::new(Locality::new(&SingleNode::new(1), &[])));
-    Executor::new(ProgressCounter::new(), locality, ProcessorId::new(0)).timer(BenchCpu::new())
+    const BLOCK_BYTES: usize = 64 << 20;
+    let layout =
+        core::alloc::Layout::from_size_align(BLOCK_BYTES, BLOCK_BYTES).expect("bench pool layout");
+    // SAFETY: a non-zero layout, leaked for the process's life.
+    let start = unsafe { alloc::alloc::alloc(layout) } as usize;
+    assert!(start != 0, "host allocation for the bench pool failed");
+    let runs = [NodeRun {
+        start,
+        end: start + BLOCK_BYTES,
+        node: NodeId::new(0),
+    }];
+    let pool = Box::leak(Box::new(UserMemoryPool::new(
+        &SingleNode::new(1),
+        ProcessorId::new(0),
+        &runs,
+    )));
+    Executor::new(ProgressCounter::new(), pool, ProcessorId::new(0)).timer(BenchCpu::new())
 }
 
 #[derive(Clone)]

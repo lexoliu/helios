@@ -8,7 +8,8 @@
 //! `fiber_stack` owns the arena the runtime's async stacks are committed
 //! out of one page-fault at a time, and `frame_reserve` holds the frames
 //! that fault path is allowed to allocate.
-//! `user` carries the per-program user-memory pool used by Wasmtime
+//! `per_processor` carves one block per processor out of memory of the
+//! node the processor is on. `user` carries the per-program user-memory pool used by Wasmtime
 //! linear memories, one buddy pool per NUMA node. `frame_slab` is the
 //! per-(processor, node) frame cache that backs it. `entropy` owns the boot-seeded root DRBG and the
 //! per-instance pools derived from it. `reservations` is the AddressSpace
@@ -29,6 +30,7 @@ mod irq_safe;
 mod locality;
 mod mapping_cost;
 mod owner;
+mod per_processor;
 mod policy;
 mod reported;
 mod reservations;
@@ -54,7 +56,7 @@ pub use fiber_stack::{
 pub(crate) use fiber_stack::{fiber_parking, parked_fibers};
 pub use frame_reserve::reserved_bytes as page_fault_frame_reserve_bytes;
 pub(crate) use frame_reserve::{
-    configure_processors as configure_frame_reserve_processors, top_up as top_up_frame_reserve,
+    configure as configure_frame_reserve, top_up as top_up_frame_reserve,
 };
 pub(crate) use irq_safe::IrqSafeMutex;
 pub use locality::{Locality, NodeRun};
@@ -63,6 +65,7 @@ pub use owner::{
     MemoryOwner, UserMemoryOwnerScope, UserMemoryOwners, configure_user_memory_owner_processors,
     current_user_memory_owner, enter_user_memory_owner,
 };
+pub use per_processor::{LocalMemory, LocalSlice, NodeLocalArena, NodeMemory, PerProcessor};
 pub use policy::{
     BootMemoryPlan, BootRegionSplitter, KERNEL_HEAP_BOOTSTRAP_BYTES,
     KERNEL_HEAP_GROWTH_CHUNK_BYTES, KERNEL_HEAP_MAX_BOOT_FRACTION, KERNEL_HEAP_MIN_RESERVE_BYTES,

@@ -4831,7 +4831,7 @@ mod tests {
             let cpu = TestCpu::without_entropy();
             let executor = Executor::new(
                 ProgressCounter::new(),
-                crate::test_support::single_node_locality(1),
+                crate::test_support::single_node_pool(1),
                 ProcessorId::new(0),
             );
             let instance = crate::InstanceRegistry::new().register("phase", 0);

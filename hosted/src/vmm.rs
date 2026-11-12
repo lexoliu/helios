@@ -1365,7 +1365,7 @@ mod tests {
     #[test]
     fn a_run_is_not_resident_memory_of_the_slot_it_is_shown_in() {
         use helios_kernel::{configure_user_memory_owner_processors, enter_user_memory_owner};
-        configure_user_memory_owner_processors(1);
+        configure_user_memory_owner_processors(crate::test_pool::single_processor_pool());
         let address_space = HostedAddressSpace::new();
         let owner = MemoryOwner::new(9);
         let _scope = enter_user_memory_owner(address_space.processor, owner);

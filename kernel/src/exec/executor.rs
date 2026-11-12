@@ -1,7 +1,6 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
-use alloc::vec::Vec;
 use core::alloc::Layout;
 use core::cell::UnsafeCell;
 use core::future::Future;
@@ -27,7 +26,9 @@ use crate::exec::idle::{
 use crate::exec::sync::Notify;
 use crate::exec::timer::Timer;
 use crate::instance::{InstanceHome, RegisteredInstance};
-use crate::memory::{Locality, task_arena_bytes_for};
+use crate::memory::{
+    LocalMemory, Locality, NodeMemory, PerProcessor, UserMemoryPool, task_arena_bytes_for,
+};
 
 type ReadyQueue = ConcurrentQueue<Runnable>;
 pub type JoinHandle<T> = Task<T>;
@@ -121,17 +122,30 @@ const _: () = assert!(align_of::<CachePadded<AtomicUsize>>() >= 64);
 /// single machine-wide queue every processor drained before nodes
 /// existed.
 struct ExecutorGroup {
-    local_queues: Box<[ReadyQueue]>,
-    local_ready_counts: Box<[CachePadded<AtomicUsize>]>,
-    /// One cache line per processor: written only by the owner on its
-    /// way into and out of idle, read by every processor that queues
-    /// work for it. The wake handshake it serves is in `idle`'s
-    /// module docs.
-    idle: Box<[CachePadded<ProcessorIdle>]>,
-    task_arenas: Box<[NoWeakArc<TaskArena>]>,
+    /// One block per processor, in memory of the processor's node.
+    processors: PerProcessor<ProcessorQueues>,
     /// Index: [`NodeId`].
     nodes: Box<[CachePadded<NodeQueue>]>,
     locality: &'static Locality,
+}
+
+/// What belongs to one processor: its local queue, the count of tasks
+/// on it, its idle state and its task arena.
+///
+/// The queue is pushed by any processor that wakes a local task the
+/// owner holds and popped by the owner alone. `ready` is written by
+/// whichever processor wakes such a task and polled by the owner on
+/// every run-loop pass, so it has a line of its own. `idle` is written
+/// only by the owner on its way into and out of idle and read by every
+/// processor that queues work for it; the wake handshake it serves is in
+/// `idle`'s module docs. The arena's header is the one shared
+/// allocation every future placed in it keeps a reference to; its bytes
+/// are in the owner's node's memory.
+struct ProcessorQueues {
+    queue: ReadyQueue,
+    ready: CachePadded<AtomicUsize>,
+    idle: CachePadded<ProcessorIdle>,
+    task_arena: NoWeakArc<TaskArena>,
 }
 
 /// One node's queue of global tasks whose home is that node.
@@ -269,7 +283,9 @@ enum BlockRegion {
 
 const BLOCK_REGION_COUNT: usize = 2;
 
-/// The arena's backing bytes, carved from the kernel heap at boot.
+/// The arena's backing bytes, carved at boot from the memory of the node
+/// the owning processor is on and never returned: the arena lives as
+/// long as the machine, like the group that holds it.
 ///
 /// There is no compile-time array behind an arena any more: how many
 /// tasks a processor can hold is a property of the machine's memory,
@@ -277,7 +293,6 @@ const BLOCK_REGION_COUNT: usize = 2;
 /// states it.
 struct ArenaBytes {
     ptr: NonNull<u8>,
-    len: usize,
 }
 
 /// The header a block carries while it sits on one of its region's free
@@ -335,33 +350,17 @@ unsafe impl Send for TaskArena {}
 unsafe impl<Fut: Send> Send for ArenaFuture<Fut> {}
 
 impl ArenaBytes {
-    fn new(len: usize) -> Self {
-        let layout = Self::layout(len);
-        // SAFETY: `layout` has a non-zero size: the caller has already
-        // asserted the arena spans at least two top blocks.
-        let ptr = unsafe { alloc::alloc::alloc(layout) };
-        let ptr = NonNull::new(ptr).unwrap_or_else(|| alloc::alloc::handle_alloc_error(layout));
-        Self { ptr, len }
-    }
-
-    fn layout(len: usize) -> Layout {
-        Layout::from_size_align(len, TASK_ARENA_ALIGN)
-            .unwrap_or_else(|error| panic!("a task arena of {len} bytes has no layout: {error}"))
+    /// `len` bytes carved from the node `local` is on.
+    fn carve<Source: NodeMemory>(len: usize, local: &LocalMemory<'_, Source>) -> Self {
+        let layout = Layout::from_size_align(len, TASK_ARENA_ALIGN)
+            .unwrap_or_else(|error| panic!("a task arena of {len} bytes has no layout: {error}"));
+        Self {
+            ptr: local.carve(layout),
+        }
     }
 
     fn ptr(&self) -> *mut u8 {
         self.ptr.as_ptr()
-    }
-}
-
-impl Drop for ArenaBytes {
-    fn drop(&mut self) {
-        // SAFETY: the pointer came from `alloc` under the same layout,
-        // and every task that held a block is gone: the arena is only
-        // dropped when the last `ArenaFuture` referencing it has been.
-        unsafe {
-            alloc::alloc::dealloc(self.ptr.as_ptr(), Self::layout(self.len));
-        }
     }
 }
 
@@ -533,14 +532,17 @@ impl TaskArena {
     ///
     /// The size comes from the boot memory plan, so a processor's task
     /// capacity moves with the machine's memory (#159).
-    fn new_shared(arena_bytes: usize) -> NoWeakArc<Self> {
+    fn new_shared<Source: NodeMemory>(
+        arena_bytes: usize,
+        local: &LocalMemory<'_, Source>,
+    ) -> NoWeakArc<Self> {
         let total_bytes = arena_bytes / TASK_ARENA_TOP_BYTES * TASK_ARENA_TOP_BYTES;
         assert!(
             total_bytes >= TASK_ARENA_KERNEL_RESERVE_BYTES + TASK_ARENA_TOP_BYTES,
             "a task arena of {arena_bytes} bytes cannot hold the kernel reserve and a share"
         );
         let share_bytes = total_bytes - TASK_ARENA_KERNEL_RESERVE_BYTES;
-        let bytes = ArenaBytes::new(total_bytes);
+        let bytes = ArenaBytes::carve(total_bytes, local);
         let base = bytes.ptr;
         NoWeakArc::new(Self {
             regions: CachePadded::new(UnsafeCell::new([
@@ -755,7 +757,6 @@ pub struct Spawner<CpuImpl: Cpu + Clone> {
     group: NoWeakArc<ExecutorGroup>,
     cpu: CpuImpl,
     owner_processor: ProcessorId,
-    local_queue_index: usize,
     progress: ProgressCounter,
     progress_notify: NoWeakArc<Notify>,
 }
@@ -766,7 +767,6 @@ pub struct Executor {
     /// The owner's node, whose queue this executor drains right after
     /// its local one.
     node: NodeId,
-    local_queue_index: usize,
     progress: ProgressCounter,
     progress_notify: NoWeakArc<Notify>,
 }
@@ -792,7 +792,7 @@ impl TimerOwner {
     /// the publisher half of the timer's wake handshake, after the
     /// publisher has lowered the timer's published deadline.
     pub(crate) fn is_parked(&self) -> bool {
-        self.group.needs_wake(usize::from(self.processor.id()))
+        self.group.needs_wake(self.processor)
     }
 }
 
@@ -825,7 +825,6 @@ struct LocalScheduler<CpuImpl: Cpu + Clone> {
     group: NoWeakArc<ExecutorGroup>,
     cpu: CpuImpl,
     owner_processor: ProcessorId,
-    local_queue_index: usize,
     progress: ProgressSignal,
 }
 
@@ -833,7 +832,6 @@ struct LocalSilentScheduler<CpuImpl: Cpu + Clone> {
     group: NoWeakArc<ExecutorGroup>,
     cpu: CpuImpl,
     owner_processor: ProcessorId,
-    local_queue_index: usize,
 }
 
 impl ExecutorRunStats {
@@ -859,18 +857,18 @@ impl ExecutorRunStats {
 }
 
 impl Executor {
-    /// The executor of `owner_processor` on the machine `locality`
+    /// The executor of `owner_processor` on the machine `pool`
     /// describes, which also says how many processors there are.
     ///
     /// Every processor's executor shares one group of queues, built by
-    /// the first call; every processor passes the machine's one
-    /// [`Locality`].
+    /// the first call from `pool`'s node memory; every processor passes
+    /// the machine's one pool.
     pub fn new(
         progress: ProgressCounter,
-        locality: &'static Locality,
+        pool: &'static UserMemoryPool,
         owner_processor: ProcessorId,
     ) -> Self {
-        Self::in_group(executor_group(locality), progress, owner_processor)
+        Self::in_group(executor_group(pool), progress, owner_processor)
     }
 
     fn in_group(
@@ -878,10 +876,9 @@ impl Executor {
         progress: ProgressCounter,
         owner_processor: ProcessorId,
     ) -> Self {
-        let local_queue_index = owner_processor.id() as usize;
-        let processor_count = group.local_queues.len();
+        let processor_count = group.processor_count();
         assert!(
-            local_queue_index < processor_count,
+            usize::from(owner_processor.id()) < processor_count,
             "executor owner processor {} is outside configured processor count {}",
             owner_processor.id(),
             processor_count
@@ -891,7 +888,6 @@ impl Executor {
             group,
             owner_processor,
             node,
-            local_queue_index,
             progress,
             progress_notify: NoWeakArc::new(Notify::new()),
         }
@@ -902,7 +898,6 @@ impl Executor {
             group: self.group.clone(),
             cpu,
             owner_processor: self.owner_processor,
-            local_queue_index: self.local_queue_index,
             progress: self.progress.clone(),
             progress_notify: self.progress_notify.clone(),
         }
@@ -944,7 +939,7 @@ impl Executor {
         timer: &Timer<CpuImpl>,
     ) -> ExecutorRunStats {
         let mut stats = ExecutorRunStats::default();
-        let local_ready_count = &self.group.local_ready_counts[self.local_queue_index];
+        let local_ready_count = &self.group.queues(self.owner_processor).ready;
         let own_node = ReadySource::Node(self.node);
         // The order starts with the owner's node itself.
         let remote_nodes = &self.group.locality.scheduling_order(self.node)[1..];
@@ -986,10 +981,10 @@ impl Executor {
         stats: &mut ExecutorRunStats,
     ) -> Option<(Runnable, ReadySource)> {
         let (queue, ready_count) = match source {
-            ReadySource::Local => (
-                &self.group.local_queues[self.local_queue_index],
-                &*self.group.local_ready_counts[self.local_queue_index],
-            ),
+            ReadySource::Local => {
+                let local = self.group.queues(self.owner_processor);
+                (&local.queue, &*local.ready)
+            }
             ReadySource::Node(node) => {
                 let node = &self.group.nodes[node.index()];
                 (&node.queue, &*node.ready)
@@ -1033,7 +1028,7 @@ impl Executor {
         root_ready: impl Fn() -> bool,
     ) -> IdleOutcome {
         let cpu = timer.cpu();
-        let idle = &self.group.idle[self.local_queue_index];
+        let idle = &self.group.queues(self.owner_processor).idle;
         let limit = idle.poll_limit_ticks();
         idle.store(IdleState::Polling);
         let started = cpu.now();
@@ -1090,7 +1085,11 @@ impl Executor {
     /// `SeqCst`: the parker half of the handshake in `idle`'s module
     /// docs.
     fn has_ready_work(&self) -> bool {
-        self.group.local_ready_counts[self.local_queue_index].load(Ordering::SeqCst) != 0
+        self.group
+            .queues(self.owner_processor)
+            .ready
+            .load(Ordering::SeqCst)
+            != 0
             || self
                 .group
                 .nodes
@@ -1121,16 +1120,7 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
     /// spawner was made: the arena's metadata is owner-only, and the
     /// owner is the processor doing the allocating.
     fn task_arena(&self, processor: ProcessorId) -> &NoWeakArc<TaskArena> {
-        self.group
-            .task_arenas
-            .get(processor.id() as usize)
-            .unwrap_or_else(|| {
-                panic!(
-                    "processor {} has no task arena among the {} the executor configured",
-                    processor.id(),
-                    self.group.task_arenas.len()
-                )
-            })
+        &self.group.queues(processor).task_arena
     }
 
     /// Places `future` in the task arena of `processor`, the one this
@@ -1225,7 +1215,6 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
             group: self.group.clone(),
             cpu: self.cpu.clone(),
             owner_processor: self.owner_processor,
-            local_queue_index: self.local_queue_index,
             progress: self.progress_signal(),
         }
     }
@@ -1235,7 +1224,6 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
             group: self.group.clone(),
             cpu: self.cpu.clone(),
             owner_processor: self.owner_processor,
-            local_queue_index: self.local_queue_index,
         }
     }
 
@@ -1446,7 +1434,7 @@ impl<CpuImpl: Cpu + Clone, Home: TaskHome> GlobalScheduler<CpuImpl, Home> {
                 if processor == current_processor {
                     continue;
                 }
-                if self.group.needs_wake(usize::from(processor.id())) {
+                if self.group.needs_wake(processor) {
                     self.cpu.wake_processor(processor);
                 }
                 return;
@@ -1458,13 +1446,12 @@ impl<CpuImpl: Cpu + Clone, Home: TaskHome> GlobalScheduler<CpuImpl, Home> {
 impl<CpuImpl: Cpu + Clone> LocalScheduler<CpuImpl> {
     #[inline]
     fn schedule(&self, runnable: Runnable) {
-        let queue = &self.group.local_queues[self.local_queue_index];
-        let ready_count = &self.group.local_ready_counts[self.local_queue_index];
-        let previous_ready = push_ready(queue, ready_count, runnable);
+        let local = self.group.queues(self.owner_processor);
+        let previous_ready = push_ready(&local.queue, &local.ready, runnable);
         self.progress.record();
         if should_wake_owner_processor(previous_ready)
             && current_processor() != self.owner_processor
-            && self.group.needs_wake(self.local_queue_index)
+            && self.group.needs_wake(self.owner_processor)
         {
             self.cpu.wake_processor(self.owner_processor);
         }
@@ -1474,12 +1461,11 @@ impl<CpuImpl: Cpu + Clone> LocalScheduler<CpuImpl> {
 impl<CpuImpl: Cpu + Clone> LocalSilentScheduler<CpuImpl> {
     #[inline]
     fn schedule(&self, runnable: Runnable) {
-        let queue = &self.group.local_queues[self.local_queue_index];
-        let ready_count = &self.group.local_ready_counts[self.local_queue_index];
-        let previous_ready = push_ready(queue, ready_count, runnable);
+        let local = self.group.queues(self.owner_processor);
+        let previous_ready = push_ready(&local.queue, &local.ready, runnable);
         if should_wake_owner_processor(previous_ready)
             && current_processor() != self.owner_processor
-            && self.group.needs_wake(self.local_queue_index)
+            && self.group.needs_wake(self.owner_processor)
         {
             self.cpu.wake_processor(self.owner_processor);
         }
@@ -1501,9 +1487,9 @@ pub(crate) fn executor_test_guard() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn executor_group(locality: &'static Locality) -> NoWeakArc<ExecutorGroup> {
+fn executor_group(pool: &'static UserMemoryPool) -> NoWeakArc<ExecutorGroup> {
     EXECUTOR_GROUP
-        .call_once(|| NoWeakArc::new(ExecutorGroup::new(locality)))
+        .call_once(|| NoWeakArc::new(ExecutorGroup::new(pool)))
         .clone()
 }
 
@@ -1511,23 +1497,22 @@ impl ExecutorGroup {
     /// One local queue, ready count, idle state and task arena per
     /// processor, and one queue per node, for the machine `locality`
     /// describes.
-    fn new(locality: &'static Locality) -> Self {
-        let processors = locality.processor_count();
-        assert!(processors != 0, "executor processor count must be non-zero");
+    fn new(pool: &'static UserMemoryPool) -> Self {
+        let locality = pool.locality();
+        assert!(
+            locality.processor_count() != 0,
+            "executor processor count must be non-zero"
+        );
         // Every processor's arena is the same share of the same
         // machine; what it holds is the machine's memory divided by
         // what a live instance costs an arena, not a constant.
         let arena_bytes = task_arena_bytes(crate::machine_usable_bytes());
-        let mut local_queues = Vec::with_capacity(processors);
-        let mut local_ready_counts = Vec::with_capacity(processors);
-        let mut idle = Vec::with_capacity(processors);
-        let mut task_arenas = Vec::with_capacity(processors);
-        for _ in 0..processors {
-            local_queues.push(ready_queue());
-            local_ready_counts.push(CachePadded::new(AtomicUsize::new(0)));
-            idle.push(CachePadded::new(ProcessorIdle::new()));
-            task_arenas.push(TaskArena::new_shared(arena_bytes));
-        }
+        let processors = PerProcessor::new(pool, |_, local| ProcessorQueues {
+            queue: ready_queue(),
+            ready: CachePadded::new(AtomicUsize::new(0)),
+            idle: CachePadded::new(ProcessorIdle::new()),
+            task_arena: TaskArena::new_shared(arena_bytes, local),
+        });
         let nodes = (0..locality.node_count())
             .map(|_| {
                 CachePadded::new(NodeQueue {
@@ -1538,25 +1523,27 @@ impl ExecutorGroup {
             })
             .collect();
         Self {
-            local_queues: local_queues.into_boxed_slice(),
-            local_ready_counts: local_ready_counts.into_boxed_slice(),
-            idle: idle.into_boxed_slice(),
-            task_arenas: task_arenas.into_boxed_slice(),
+            processors,
             nodes,
             locality,
         }
     }
 
     fn processor_count(&self) -> usize {
-        self.local_queues.len()
+        self.processors.len()
+    }
+
+    /// `processor`'s queue, ready count, idle state and task arena.
+    fn queues(&self, processor: ProcessorId) -> &ProcessorQueues {
+        self.processors.get(processor)
     }
 
     /// Whether `processor` must be sent a wake IPI for work just
     /// pushed. Called after the push. Returns true only when the
     /// target has published `Parked`; a `Polling` or `Running`
     /// processor sees the ready count itself.
-    fn needs_wake(&self, processor_index: usize) -> bool {
-        self.idle[processor_index].state() == IdleState::Parked
+    fn needs_wake(&self, processor: ProcessorId) -> bool {
+        self.queues(processor).idle.state() == IdleState::Parked
     }
 }
 
@@ -1646,8 +1633,10 @@ mod tests {
         should_wake_owner_processor, task_arena_bytes,
     };
     use crate::instance::{InstanceActivity, InstanceHome, InstanceRegistry};
-    use crate::memory::Locality;
-    use crate::test_support::{RecordingSmpCpu, TestMachine, single_node_locality};
+    use crate::memory::{PerProcessor, UserMemoryPool};
+    use crate::test_support::{
+        RecordingSmpCpu, TEST_POOL_NODE_BYTES, TestMachine, single_node_pool,
+    };
     use crate::{TaskFunding, test_processor_identity};
     use helios_hal::cpu::{
         Cpu, HardwarePerfCounters, Instant, ProcessorId, Timebase, TimerInterrupt,
@@ -1828,14 +1817,14 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_captures_are_narrower_than_spawner() {
-        assert!(size_of::<GlobalScheduler<TestCpu, FixedHome>>() < size_of::<Spawner<TestCpu>>());
+    fn scheduler_captures_are_no_wider_than_spawner() {
+        assert!(size_of::<GlobalScheduler<TestCpu, FixedHome>>() <= size_of::<Spawner<TestCpu>>());
         assert!(
             size_of::<GlobalScheduler<TestCpu, NoWeakArc<InstanceHome>>>()
-                < size_of::<Spawner<TestCpu>>()
+                <= size_of::<Spawner<TestCpu>>()
         );
         assert!(size_of::<LocalScheduler<TestCpu>>() <= size_of::<Spawner<TestCpu>>());
-        assert!(size_of::<LocalSilentScheduler<TestCpu>>() < size_of::<Spawner<TestCpu>>());
+        assert!(size_of::<LocalSilentScheduler<TestCpu>>() <= size_of::<Spawner<TestCpu>>());
         assert!(size_of::<LocalSilentScheduler<TestCpu>>() < size_of::<LocalScheduler<TestCpu>>());
     }
 
@@ -1844,7 +1833,7 @@ mod tests {
         let _serialized = super::executor_test_guard();
         let executor = Executor::new(
             ProgressCounter::new(),
-            single_node_locality(1),
+            single_node_pool(1),
             ProcessorId::new(0),
         );
         let timer = executor.timer(TestCpu::new());
@@ -1867,9 +1856,18 @@ mod tests {
     const TEST_ARENA_BYTES: usize = crate::memory::TASK_ARENA_MIN_BYTES;
     const TEST_SHARE_BYTES: usize = TEST_ARENA_BYTES - TASK_ARENA_KERNEL_RESERVE_BYTES;
 
+    /// A task arena of `bytes` carved from a test pool's memory, as the
+    /// executor carves its own.
+    fn test_arena(bytes: usize) -> NoWeakArc<TaskArena> {
+        let table = PerProcessor::new(single_node_pool(1), |_, local| {
+            TaskArena::new_shared(bytes, local)
+        });
+        table.get(ProcessorId::new(0)).clone()
+    }
+
     #[test]
     fn task_arena_reuses_blocks_released_around_pinned_tasks() {
-        let arena = TaskArena::new_shared(TEST_ARENA_BYTES);
+        let arena = test_arena(TEST_ARENA_BYTES);
         // An eternal task pins the arena non-empty for the whole test,
         // matching the boot-time pump/transport tasks in a real kernel.
         let pinned = TaskArena::allocate_kernel(&arena, [0_u8; 256]);
@@ -1894,7 +1892,7 @@ mod tests {
     /// with ~96% of the share free.
     #[test]
     fn freed_bytes_of_one_class_serve_a_different_class() {
-        let arena = TaskArena::new_shared(TEST_ARENA_BYTES);
+        let arena = test_arena(TEST_ARENA_BYTES);
         let large_bytes = TaskArena::class_bytes(TaskArena::block_class(size_of::<[u8; 8192]>()));
         let small_bytes = TaskArena::class_bytes(TaskArena::block_class(size_of::<[u8; 256]>()));
 
@@ -1931,7 +1929,7 @@ mod tests {
     /// so the bytes come back with no lock between the two processors.
     #[test]
     fn a_block_freed_off_the_owning_processor_comes_back_at_the_next_allocation() {
-        let arena = TaskArena::new_shared(TEST_ARENA_BYTES);
+        let arena = test_arena(TEST_ARENA_BYTES);
         let mut live = Vec::new();
         while let Ok(task) = TaskArena::allocate_instance(&arena, [0_u8; 4096]) {
             live.push(task);
@@ -1959,7 +1957,7 @@ mod tests {
     /// and the kernel's own tasks still have somewhere to go.
     #[test]
     fn instance_task_storm_is_refused_and_leaves_the_kernel_reserve_intact() {
-        let arena = TaskArena::new_shared(TEST_ARENA_BYTES);
+        let arena = test_arena(TEST_ARENA_BYTES);
         let block = TaskArena::class_bytes(TaskArena::block_class(size_of::<[u8; 4096]>()));
 
         let mut live = Vec::new();
@@ -1992,7 +1990,7 @@ mod tests {
     /// and no merge carries share bytes into it.
     #[test]
     fn the_reserve_is_never_consumed_by_instance_allocations() {
-        let arena = TaskArena::new_shared(TEST_ARENA_BYTES);
+        let arena = test_arena(TEST_ARENA_BYTES);
         let mut small = Vec::new();
         let mut large = Vec::new();
         // Interleave two classes, then drop every other small task, so
@@ -2032,7 +2030,7 @@ mod tests {
 
     #[test]
     fn instance_tasks_reclaim_the_share_when_their_instances_exit() {
-        let arena = TaskArena::new_shared(TEST_ARENA_BYTES);
+        let arena = test_arena(TEST_ARENA_BYTES);
         let mut live = Vec::new();
         while let Ok(task) = TaskArena::allocate_instance(&arena, [0_u8; 4096]) {
             live.push(task);
@@ -2053,7 +2051,7 @@ mod tests {
     /// task once one of them ends (#132).
     #[test]
     fn a_refused_instance_task_charges_nothing_to_the_share() {
-        let arena = TaskArena::new_shared(TEST_ARENA_BYTES);
+        let arena = test_arena(TEST_ARENA_BYTES);
         let mut live = Vec::new();
         while let Ok(task) = TaskArena::allocate_instance(&arena, [0_u8; 4096]) {
             live.push(task);
@@ -2082,7 +2080,7 @@ mod tests {
     /// the reserve's own buddy tree.
     #[test]
     fn released_kernel_reserve_blocks_never_reach_instance_tasks() {
-        let arena = TaskArena::new_shared(TEST_ARENA_BYTES);
+        let arena = test_arena(TEST_ARENA_BYTES);
         let mut live = Vec::new();
         while let Ok(task) = TaskArena::allocate_instance(&arena, [0_u8; 4096]) {
             live.push(task);
@@ -2101,8 +2099,8 @@ mod tests {
         /// What a QEMU `-m 2G` x86-64 guest's memory map came to (run
         /// 33943692491), and the same machine with four times it.
         const TWO_GIB_USABLE: usize = 1_977_962_496;
-        let small = TaskArena::new_shared(task_arena_bytes(TWO_GIB_USABLE));
-        let large = TaskArena::new_shared(task_arena_bytes(4 * TWO_GIB_USABLE));
+        let small = test_arena(task_arena_bytes(TWO_GIB_USABLE));
+        let large = test_arena(task_arena_bytes(4 * TWO_GIB_USABLE));
 
         let place_until_refused = |arena: &_| {
             let mut live = Vec::new();
@@ -2148,18 +2146,16 @@ mod tests {
         let cpu = RecordingSmpCpu::new(0, 2);
         let executor = Executor::new(
             ProgressCounter::new(),
-            single_node_locality(2),
+            single_node_pool(2),
             ProcessorId::new(1),
         );
         let spawner = executor.spawner(cpu.clone());
-        let idle = &executor.group.idle[1];
+        let queues = executor.group.queues(ProcessorId::new(1));
+        let idle = &queues.idle;
         let drain = || {
-            pop_ready(
-                &executor.group.local_queues[1],
-                &executor.group.local_ready_counts[1],
-            )
-            .expect("the runnable pushed for processor 1 is still queued")
-            .run();
+            pop_ready(&queues.queue, &queues.ready)
+                .expect("the runnable pushed for processor 1 is still queued")
+                .run();
         };
 
         // Parked: the push needs the IPI.
@@ -2191,11 +2187,11 @@ mod tests {
         let cpu = RecordingSmpCpu::new(0, 2);
         let executor = Executor::new(
             ProgressCounter::new(),
-            single_node_locality(2),
+            single_node_pool(2),
             ProcessorId::new(0),
         );
         let timer = executor.timer(cpu.clone());
-        let idle = &executor.group.idle[0];
+        let idle = &executor.group.queues(ProcessorId::new(0)).idle;
         let built = cpu.deadlines();
         assert_eq!(built.len(), 1);
         assert_eq!(built[0].0, ProcessorId::new(0));
@@ -2252,12 +2248,12 @@ mod tests {
         let cpu = RecordingSmpCpu::new(0, 1);
         let executor = Executor::new(
             ProgressCounter::new(),
-            single_node_locality(1),
+            single_node_pool(1),
             ProcessorId::new(0),
         );
         let timer = executor.timer(cpu.clone());
         let spawner = executor.spawner(cpu.clone());
-        let idle = &executor.group.idle[0];
+        let idle = &executor.group.queues(ProcessorId::new(0)).idle;
         let now = cpu.now().ticks();
         let tick = cpu
             .timebase()
@@ -2353,11 +2349,11 @@ mod tests {
         let cpu = SteppingClockCpu::new(1_000);
         let executor = Executor::new(
             ProgressCounter::new(),
-            single_node_locality(2),
+            single_node_pool(2),
             ProcessorId::new(0),
         );
         let timer = executor.timer(cpu.clone());
-        let idle = &executor.group.idle[0];
+        let idle = &executor.group.queues(ProcessorId::new(0)).idle;
         let grow_start = cpu.timebase().duration_to_ticks(IDLE_POLL_GROW_START);
         let max = cpu.timebase().duration_to_ticks(IDLE_POLL_MAX);
         assert_eq!(idle.poll_limit_ticks(), 0);
@@ -2397,7 +2393,7 @@ mod tests {
         cpu.forbid_park();
         let executor = Executor::new(
             ProgressCounter::new(),
-            single_node_locality(2),
+            single_node_pool(2),
             ProcessorId::new(0),
         );
         let timer = executor.timer(cpu.clone());
@@ -2406,7 +2402,10 @@ mod tests {
         let outcome = executor.park_until_work(&timer, || root_ready.load(Ordering::SeqCst));
 
         assert!(matches!(outcome, IdleOutcome::Polled { .. }));
-        assert_eq!(executor.group.idle[0].state(), IdleState::Running);
+        assert_eq!(
+            executor.group.queues(ProcessorId::new(0)).idle.state(),
+            IdleState::Running
+        );
     }
 
     /// The push that lands between the `Parked` store and the park is
@@ -2420,7 +2419,7 @@ mod tests {
         cpu.forbid_park();
         let executor = Executor::new(
             ProgressCounter::new(),
-            single_node_locality(2),
+            single_node_pool(2),
             ProcessorId::new(0),
         );
         let timer = executor.timer(cpu.clone());
@@ -2429,23 +2428,26 @@ mod tests {
         let outcome = executor.park_until_work(&timer, || false);
 
         assert!(matches!(outcome, IdleOutcome::Polled { .. }));
-        assert_eq!(executor.group.idle[0].state(), IdleState::Running);
+        assert_eq!(
+            executor.group.queues(ProcessorId::new(0)).idle.state(),
+            IdleState::Running
+        );
     }
 
     /// Two nodes, processor 0 on node 0 and processor 1 on node 1, remote
     /// at Linux's default distance.
-    fn two_nodes() -> &'static Locality {
+    fn two_nodes() -> &'static UserMemoryPool {
         TestMachine {
             processor_nodes: alloc::vec![0, 1],
             distances: alloc::vec![10, 20, 20, 10],
         }
-        .locality()
+        .pool(TEST_POOL_NODE_BYTES)
     }
 
     /// Three nodes, one processor each, with an asymmetric matrix: from
     /// node 0, node 2 is nearer than node 1, and from node 1, node 2 is
     /// nearer than node 0.
-    fn three_nodes() -> &'static Locality {
+    fn three_nodes() -> &'static UserMemoryPool {
         TestMachine {
             processor_nodes: alloc::vec![0, 1, 2],
             #[rustfmt::skip]
@@ -2455,15 +2457,15 @@ mod tests {
                 20, 20, 10,
             ],
         }
-        .locality()
+        .pool(TEST_POOL_NODE_BYTES)
     }
 
     /// The executor of `owner` over a group of its own for the machine
     /// `locality` describes, rather than over the process-wide group, so
     /// the test chooses the machine.
-    fn executor_on(locality: &'static Locality, owner: ProcessorId) -> Executor {
+    fn executor_on(pool: &'static UserMemoryPool, owner: ProcessorId) -> Executor {
         Executor::in_group(
-            NoWeakArc::new(ExecutorGroup::new(locality)),
+            NoWeakArc::new(ExecutorGroup::new(pool)),
             ProgressCounter::new(),
             owner,
         )
@@ -2538,15 +2540,15 @@ mod tests {
         let executor = executor_on(three_nodes(), ProcessorId::new(0));
         let cpu = RecordingSmpCpu::new(1, 3);
         let spawner = executor.spawner(cpu.clone());
-        let idle = &executor.group.idle;
-        idle[0].store(IdleState::Parked);
-        idle[2].store(IdleState::Parked);
+        let idle = |processor: u16| &executor.group.queues(ProcessorId::new(processor)).idle;
+        idle(0).store(IdleState::Parked);
+        idle(2).store(IdleState::Parked);
 
         spawner.spawn_detached(async {});
         assert_eq!(node_ready(&executor, 1), 1);
         assert_eq!(cpu.woken(), [ProcessorId::new(2)]);
 
-        idle[2].store(IdleState::Running);
+        idle(2).store(IdleState::Running);
         spawner.spawn_detached(async {});
         assert_eq!(
             cpu.woken(),

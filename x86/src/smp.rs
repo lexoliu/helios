@@ -14,7 +14,10 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering
 use helios_hal::cpu::{GUEST_STACK_LIMIT_OFFSET, ProcessorId, Timebase};
 use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::watchdog::Watchdog;
-use helios_kernel::{InstructionSampler, SampleCapture, Timer, WasmtimeTlsSlots};
+use helios_kernel::{
+    InstructionSampler, LocalMemory, PerProcessor, SampleCapture, Timer, UserMemoryPool,
+    WasmtimeTlsSlots,
+};
 use pci_types::ConfigRegionAccess;
 use spin::Once;
 use x86::apic::x2apic::X2APIC;
@@ -301,7 +304,9 @@ pub(crate) struct X86PlatformState {
     debug_state: debug_state::RuntimeState,
     watchdog: X86Watchdog,
     io_apic: IoApic,
-    processors: Box<[ProcessorSlot]>,
+    /// One slot per processor, in memory of the processor's node. Index:
+    /// logical processor id.
+    processors: PerProcessor<ProcessorSlot>,
     wakeup_page: Option<WakeupPage>,
     boot_context: AtomicPtr<BootContext>,
 }
@@ -332,6 +337,7 @@ pub(crate) fn build_boot_context(
     timebase: Timebase,
     debug_state: debug_state::RuntimeState,
     xcr0: Xcr0,
+    pool: &UserMemoryPool,
 ) -> &'static BootContext {
     let tsc_hz = timebase.frequency();
     let handler = PhysicalOffsetAcpiHandler {
@@ -353,60 +359,53 @@ pub(crate) fn build_boot_context(
         .as_ref()
         .unwrap_or_else(|| panic!("ACPI platform info did not expose processor topology"));
 
-    let mut processors =
-        alloc::vec::Vec::with_capacity(1 + processor_info.application_processors.len());
-    processors.push(ProcessorSlot {
-        apic_id: processor_info.boot_processor.local_apic_id,
-        runtime: ProcessorRuntime {
-            anchor: ProcessorAnchor::new(0),
-            physical_memory_offset,
-            tsc_hz,
-            apic_mode,
-            wasmtime_tls: WasmtimeTlsSlots::new(),
-            exception_idt: ProcessorIdt::new(),
-            segments: ProcessorSegments::new(
-                exception_stack(),
-                exception_stack(),
-                exception_stack(),
-            ),
-            interrupt_in_progress: AtomicBool::new(false),
-            probe_fault: AtomicUsize::new(0),
-            probe_frame: AtomicUsize::new(0),
-            watchdog: watchdog.clone(),
-            timer: Once::new(),
-            program_service: Once::new(),
-            device_interrupts: Once::new(),
-            local_timer_ready: AtomicBool::new(false),
-            instruction_sampler: debug_state.instruction_sampler(),
-            scheduler_tick_count: AtomicU32::new(0),
-            timer_sampling: AtomicBool::new(false),
-            samples_since_scheduler_tick: AtomicU32::new(0),
-            local_apic_attached: AtomicBool::new(false),
-            started: AtomicBool::new(false),
-            wake_pending: AtomicBool::new(false),
-        },
-        stack_top: 0,
-    });
-    for (index, processor) in processor_info.application_processors.iter().enumerate() {
-        assert!(
-            processor.state != ProcessorState::Disabled,
-            "ACPI exposed disabled application processor apic_id={}",
-            processor.local_apic_id
-        );
-        let stack = allocate_aligned_zeroed(KERNEL_STACK_BYTES, 16);
-        processors.push(ProcessorSlot {
-            apic_id: processor.local_apic_id,
+    let application_processors = &processor_info.application_processors;
+    assert_eq!(
+        pool.locality().processor_count(),
+        1 + application_processors.len(),
+        "the kernel was primed for {} processors and the MADT names {}",
+        pool.locality().processor_count(),
+        1 + application_processors.len()
+    );
+    // Each processor's slot, its exception stacks and, for a secondary,
+    // its kernel stack are carved from the memory of the node the
+    // processor is on. Processor 0 is the bootstrap processor, which
+    // keeps the stack the bootloader gave it.
+    let processors = PerProcessor::new(pool, |processor, local| {
+        let (apic_id, stack_top) = match usize::from(processor.id()).checked_sub(1) {
+            None => (processor_info.boot_processor.local_apic_id, 0),
+            Some(application) => {
+                let application_processor = application_processors
+                    .iter()
+                    .nth(application)
+                    .unwrap_or_else(|| {
+                        panic!("the MADT names no application processor {application}")
+                    });
+                assert!(
+                    application_processor.state != ProcessorState::Disabled,
+                    "ACPI exposed disabled application processor apic_id={}",
+                    application_processor.local_apic_id
+                );
+                let stack = carve_aligned_zeroed(local, KERNEL_STACK_BYTES, 16);
+                (
+                    application_processor.local_apic_id,
+                    stack + KERNEL_STACK_BYTES,
+                )
+            }
+        };
+        ProcessorSlot {
+            apic_id,
             runtime: ProcessorRuntime {
-                anchor: ProcessorAnchor::new((index + 1) as u16),
+                anchor: ProcessorAnchor::new(processor.id()),
                 physical_memory_offset,
                 tsc_hz,
                 apic_mode,
                 wasmtime_tls: WasmtimeTlsSlots::new(),
                 exception_idt: ProcessorIdt::new(),
                 segments: ProcessorSegments::new(
-                    exception_stack(),
-                    exception_stack(),
-                    exception_stack(),
+                    exception_stack(local),
+                    exception_stack(local),
+                    exception_stack(local),
                 ),
                 interrupt_in_progress: AtomicBool::new(false),
                 probe_fault: AtomicUsize::new(0),
@@ -424,9 +423,9 @@ pub(crate) fn build_boot_context(
                 started: AtomicBool::new(false),
                 wake_pending: AtomicBool::new(false),
             },
-            stack_top: stack + KERNEL_STACK_BYTES,
-        });
-    }
+            stack_top,
+        }
+    });
     let wakeup_page = if processors.len() > 1 {
         let wakeup_page =
             wakeup_page.unwrap_or_else(|| panic!("x86 SMP startup requires a wakeup page"));
@@ -440,8 +439,7 @@ pub(crate) fn build_boot_context(
     } else {
         None
     };
-    let mut processors = processors.into_boxed_slice();
-    publish_anchor_identities(&mut processors);
+    publish_anchor_identities(&processors);
     let platform = Arc::new(X86PlatformState {
         tsc_base,
         timebase,
@@ -469,12 +467,17 @@ pub(crate) fn build_boot_context(
 ///
 /// The identity has to be the runtime's final address — it is what
 /// [`current_runtime`] dereferences and what the critical section uses as its
-/// owner key — and a runtime that is still inside the `Vec` is one
-/// `into_boxed_slice` away from moving.
-fn publish_anchor_identities(processors: &mut [ProcessorSlot]) {
-    for slot in processors {
+/// owner key — and a runtime that is still being built is one move away from
+/// going elsewhere. A [`PerProcessor`] block never moves once it exists, but
+/// it is only shared once built, so the identity is stored through the
+/// anchor's atomic; no other processor is running yet to read it.
+fn publish_anchor_identities(processors: &PerProcessor<ProcessorSlot>) {
+    for (_, slot) in processors.iter() {
         let address = core::ptr::from_ref(&slot.runtime) as usize;
-        *slot.runtime.anchor.identity.get_mut() = address;
+        slot.runtime
+            .anchor
+            .identity
+            .store(address, Ordering::Relaxed);
     }
 }
 
@@ -745,7 +748,11 @@ impl BootContext {
     }
 
     pub(crate) fn bootstrap_runtime(&self) -> &ProcessorRuntime {
-        &self.platform.processors[0].runtime
+        &self
+            .platform
+            .processors
+            .get(self.platform.bootstrap_processor())
+            .runtime
     }
 }
 
@@ -798,7 +805,7 @@ impl X86PlatformState {
              processor is online; online mask {secondaries_online:#b}"
         );
         let routes: &'static DeviceInterruptRoutes = Box::leak(Box::new(routes));
-        for slot in self.processors.iter() {
+        for (_, slot) in self.processors.iter() {
             assert!(
                 slot.runtime.device_interrupts.get().is_none(),
                 "x86 device interrupt routes were installed more than once"
@@ -820,9 +827,7 @@ impl X86PlatformState {
     /// logical id. Used by the wake / TLB-shootdown IPI dispatch path
     /// to address a remote core through the local APIC ICR.
     pub(crate) fn apic_id_of(&self, processor: ProcessorId) -> Option<u32> {
-        self.processors
-            .get(processor.id() as usize)
-            .map(|slot| slot.apic_id)
+        self.processors.try_get(processor).map(|slot| slot.apic_id)
     }
 
     /// Publishes a wake for `processor` and answers with the local-APIC
@@ -833,7 +838,7 @@ impl X86PlatformState {
     /// test there, or takes an interrupt that is already pending when
     /// its halt begins; either way the wake is not lost.
     pub(crate) fn publish_wake(&self, processor: ProcessorId) -> Option<u32> {
-        let slot = self.processors.get(processor.id() as usize)?;
+        let slot = self.processors.try_get(processor)?;
         slot.runtime.wake_pending.store(true, Ordering::Release);
         Some(slot.apic_id)
     }
@@ -894,7 +899,7 @@ impl X86PlatformState {
 
     fn processor_slot(&self, processor: ProcessorId) -> &ProcessorSlot {
         self.processors
-            .get(processor.id() as usize)
+            .try_get(processor)
             .unwrap_or_else(|| panic!("x86 processor {} is out of range", processor.id()))
     }
 
@@ -1946,20 +1951,24 @@ unsafe impl FrameAllocator<Size4KiB> for DirectMappedFrameAllocator {
 }
 
 /// One exception or interrupt stack for one processor, as the byte
-/// range the TSS names the top of.
-fn exception_stack() -> Range<usize> {
-    let base = allocate_aligned_zeroed(EXCEPTION_STACK_BYTES, 16);
+/// range the TSS names the top of, in the memory of the node `local`
+/// is on.
+fn exception_stack(local: &LocalMemory<'_, UserMemoryPool>) -> Range<usize> {
+    let base = carve_aligned_zeroed(local, EXCEPTION_STACK_BYTES, 16);
     base..base + EXCEPTION_STACK_BYTES
 }
 
-fn allocate_aligned_zeroed(size: usize, align: usize) -> usize {
+/// `size` zeroed bytes aligned to `align`, carved from the node `local`
+/// is on, as an address. They are never returned.
+fn carve_aligned_zeroed(
+    local: &LocalMemory<'_, UserMemoryPool>,
+    size: usize,
+    align: usize,
+) -> usize {
     let layout = Layout::from_size_align(size, align).unwrap_or_else(|_| {
         panic!("failed to build aligned allocation layout size={size} align={align}")
     });
-    let pointer = unsafe { alloc_zeroed(layout) };
-    NonNull::new(pointer)
-        .unwrap_or_else(|| panic!("aligned allocation of {size} bytes failed"))
-        .as_ptr() as usize
+    local.carve_zeroed(layout).as_ptr() as usize
 }
 
 use helios_hal::{align_down, align_up};

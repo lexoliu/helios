@@ -70,7 +70,7 @@ fn commit_owned(address_space: &HostedAddressSpace, range: VirtRange, owner: Mem
 
 #[test]
 fn a_swapped_page_comes_back_with_its_bytes_and_its_flags() {
-    helios_kernel::configure_user_memory_owner_processors(1);
+    helios_kernel::configure_user_memory_owner_processors(crate::test_pool::single_processor_pool());
     let address_space = HostedAddressSpace::new();
     let backend = swap_file("round-trip");
     let range = address_space.reserve(PAGE).expect("reserve");
@@ -109,7 +109,7 @@ fn a_swapped_page_comes_back_with_its_bytes_and_its_flags() {
 
 #[test]
 fn a_swapped_page_is_still_writable_after_it_comes_back() {
-    helios_kernel::configure_user_memory_owner_processors(1);
+    helios_kernel::configure_user_memory_owner_processors(crate::test_pool::single_processor_pool());
     let address_space = HostedAddressSpace::new();
     let range = address_space.reserve(PAGE).expect("reserve");
     commit_owned(&address_space, range, MemoryOwner::new(2));
@@ -130,7 +130,7 @@ fn a_swapped_page_is_still_writable_after_it_comes_back() {
 
 #[test]
 fn only_the_owner_s_pages_are_offered_to_a_pass() {
-    helios_kernel::configure_user_memory_owner_processors(1);
+    helios_kernel::configure_user_memory_owner_processors(crate::test_pool::single_processor_pool());
     let address_space = HostedAddressSpace::new();
     let mine = address_space.reserve(2 * PAGE).expect("reserve");
     let theirs = address_space.reserve(PAGE).expect("reserve");
@@ -157,7 +157,7 @@ fn only_the_owner_s_pages_are_offered_to_a_pass() {
 
 #[test]
 fn a_pass_that_says_stop_stops_the_scan() {
-    helios_kernel::configure_user_memory_owner_processors(1);
+    helios_kernel::configure_user_memory_owner_processors(crate::test_pool::single_processor_pool());
     let address_space = HostedAddressSpace::new();
     let range = address_space.reserve(4 * PAGE).expect("reserve");
     commit_owned(&address_space, range, MemoryOwner::new(9));
@@ -177,7 +177,7 @@ fn a_pass_that_says_stop_stops_the_scan() {
 /// on this backend.
 #[test]
 fn hosted_reports_every_page_hot_because_it_cannot_measure_age() {
-    helios_kernel::configure_user_memory_owner_processors(1);
+    helios_kernel::configure_user_memory_owner_processors(crate::test_pool::single_processor_pool());
     let address_space = HostedAddressSpace::new();
     let range = address_space.reserve(2 * PAGE).expect("reserve");
     commit_owned(&address_space, range, MemoryOwner::new(11));
@@ -193,7 +193,7 @@ fn hosted_reports_every_page_hot_because_it_cannot_measure_age() {
 
 #[test]
 fn releasing_a_reservation_surrenders_the_tokens_it_still_held() {
-    helios_kernel::configure_user_memory_owner_processors(1);
+    helios_kernel::configure_user_memory_owner_processors(crate::test_pool::single_processor_pool());
     let address_space = HostedAddressSpace::new();
     let range = address_space.reserve(2 * PAGE).expect("reserve");
     commit_owned(&address_space, range, MemoryOwner::new(3));
@@ -230,7 +230,7 @@ fn releasing_a_reservation_surrenders_the_tokens_it_still_held() {
 
 #[test]
 fn decommitting_a_range_surrenders_the_tokens_inside_it() {
-    helios_kernel::configure_user_memory_owner_processors(1);
+    helios_kernel::configure_user_memory_owner_processors(crate::test_pool::single_processor_pool());
     let address_space = HostedAddressSpace::new();
     let range = address_space.reserve(2 * PAGE).expect("reserve");
     commit_owned(&address_space, range, MemoryOwner::new(4));
@@ -257,7 +257,7 @@ fn decommitting_a_range_surrenders_the_tokens_inside_it() {
 
 #[test]
 fn committing_over_a_swapped_page_surrenders_its_token() {
-    helios_kernel::configure_user_memory_owner_processors(1);
+    helios_kernel::configure_user_memory_owner_processors(crate::test_pool::single_processor_pool());
     let address_space = HostedAddressSpace::new();
     let range = address_space.reserve(PAGE).expect("reserve");
     commit_owned(&address_space, range, MemoryOwner::new(5));
@@ -279,7 +279,7 @@ fn committing_over_a_swapped_page_surrenders_its_token() {
 
 #[test]
 fn swapping_a_page_that_is_not_committed_is_refused() {
-    helios_kernel::configure_user_memory_owner_processors(1);
+    helios_kernel::configure_user_memory_owner_processors(crate::test_pool::single_processor_pool());
     let address_space = HostedAddressSpace::new();
     let range = address_space.reserve(PAGE).expect("reserve");
     let mut page = vec![0_u8; PAGE];
@@ -294,7 +294,7 @@ fn swapping_a_page_that_is_not_committed_is_refused() {
 
 #[test]
 fn a_page_buffer_of_the_wrong_size_is_refused() {
-    helios_kernel::configure_user_memory_owner_processors(1);
+    helios_kernel::configure_user_memory_owner_processors(crate::test_pool::single_processor_pool());
     let address_space = HostedAddressSpace::new();
     let range = address_space.reserve(PAGE).expect("reserve");
     commit_owned(&address_space, range, MemoryOwner::new(6));

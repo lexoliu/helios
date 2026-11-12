@@ -25,21 +25,21 @@
 //! - Each list's lock is an [`IrqSafeMutex`], which masks the local
 //!   processor's interrupts while held, because interrupt handlers
 //!   allocate. Drain callbacks run after the list is unlocked.
-//! - Each list is [`CachePadded`]. Its lock and counter are written by its
-//!   owning processor, and by a drainer under the lock.
+//! - Each processor's lists are one [`PerProcessor`] block: on a cache
+//!   line of their own and in memory of the processor's node. A list's
+//!   lock and counter are written by its owning processor, and by a
+//!   drainer under the lock.
 
-extern crate alloc;
-
-use alloc::boxed::Box;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use crossbeam_utils::CachePadded;
 use helios_hal::cpu::ProcessorId;
 use helios_hal::numa::NodeId;
 use helios_hal::pmm::PhysFrame;
 
 use super::IrqSafeMutex;
+use super::locality::Locality;
+use super::per_processor::{LocalSlice, NodeArenas, NodeMemory, PerProcessor};
 
 /// A list retains at most this fraction of its node's frames, shared out
 /// between the processors.
@@ -55,11 +55,15 @@ struct FrameList {
     cached_frames: AtomicUsize,
 }
 
+/// One processor's lists, one per node, in memory of its own node.
+struct FrameShard {
+    /// Index: [`NodeId`].
+    lists: LocalSlice<FrameList>,
+}
+
 pub(crate) struct FrameSlabCache {
-    processor_count: usize,
-    node_count: usize,
-    /// Index: `processor * node_count + node`.
-    lists: Box<[CachePadded<FrameList>]>,
+    /// Index: [`ProcessorId`].
+    shards: PerProcessor<FrameShard>,
 }
 
 unsafe impl Send for FrameList {}
@@ -139,19 +143,19 @@ impl FrameList {
 }
 
 impl FrameSlabCache {
-    pub(crate) fn new(processor_count: usize, node_count: usize) -> Self {
-        assert!(
-            processor_count != 0,
-            "frame slab requires at least one processor"
-        );
-        assert!(node_count != 0, "frame slab requires at least one node");
-        let lists = (0..processor_count * node_count)
-            .map(|_| CachePadded::new(FrameList::new()))
-            .collect();
+    /// One list per (processor, node) of the machine `locality`
+    /// describes, each processor's lists carved from its own node's
+    /// memory.
+    pub(crate) fn new<Source: NodeMemory>(
+        locality: &Locality,
+        arenas: &NodeArenas,
+        source: &Source,
+    ) -> Self {
+        let node_count = locality.node_count();
         Self {
-            processor_count,
-            node_count,
-            lists,
+            shards: PerProcessor::build(locality, arenas, source, |_, local| FrameShard {
+                lists: local.carve_slice(node_count, |_| FrameList::new()),
+            }),
         }
     }
 
@@ -185,15 +189,16 @@ impl FrameSlabCache {
 
     /// Empties every processor's list for `node` into `release`.
     pub(crate) fn drain(&self, node: NodeId, mut release: impl FnMut(NonNull<u8>)) {
-        for processor in 0..self.processor_count {
-            self.lists[self.index(processor, node)].drain(&mut release);
+        for (_, shard) in self.shards.iter() {
+            shard.list(node).drain(&mut release);
         }
     }
 
     /// Bytes of `node` cached across every processor.
     pub(crate) fn cached_bytes(&self, node: NodeId) -> usize {
-        (0..self.processor_count)
-            .map(|processor| self.lists[self.index(processor, node)].cached_frames())
+        self.shards
+            .iter()
+            .map(|(_, shard)| shard.list(node).cached_frames())
             .sum::<usize>()
             * PhysFrame::SIZE
     }
@@ -203,28 +208,24 @@ impl FrameSlabCache {
     fn list_capacity_frames(&self, node_total_frames: usize) -> usize {
         node_total_frames
             .div_ceil(SLAB_RETAIN_DIVISOR)
-            .div_ceil(self.processor_count)
+            .div_ceil(self.shards.len())
             .max(1)
     }
 
     fn list(&self, processor: ProcessorId, node: NodeId) -> &FrameList {
-        let processor = usize::from(processor.id());
-        assert!(
-            processor < self.processor_count,
-            "processor {processor} is outside the frame slab's {} processors",
-            self.processor_count
-        );
-        &self.lists[self.index(processor, node)]
+        self.shards.get(processor).list(node)
     }
+}
 
-    fn index(&self, processor: usize, node: NodeId) -> usize {
-        assert!(
-            node.index() < self.node_count,
-            "node {} is outside the frame slab's {} nodes",
-            node.index(),
-            self.node_count
-        );
-        processor * self.node_count + node.index()
+impl FrameShard {
+    fn list(&self, node: NodeId) -> &FrameList {
+        self.lists.get(node.index()).unwrap_or_else(|| {
+            panic!(
+                "node {} is outside the frame slab's {} nodes",
+                node.index(),
+                self.lists.len()
+            )
+        })
     }
 }
 
@@ -235,11 +236,20 @@ mod tests {
     use core::ptr::NonNull;
 
     use super::*;
+    use crate::test_support::{HostNodeMemory, TestMachine};
 
     #[repr(align(4096))]
     struct AlignedFrames([u8; PhysFrame::SIZE * 2]);
 
     const NODE_0: NodeId = NodeId::FIRST;
+
+    /// A cache for `processors` processors spread over `nodes` nodes.
+    fn cache(processors: usize, nodes: usize) -> FrameSlabCache {
+        let locality = TestMachine::round_robin(processors, nodes).locality();
+        let arenas = NodeArenas::new(nodes);
+        let memory = HostNodeMemory::new(nodes, 1 << 20);
+        FrameSlabCache::new(locality, &arenas, &memory)
+    }
 
     fn p(index: u16) -> ProcessorId {
         ProcessorId::new(index)
@@ -251,7 +261,7 @@ mod tests {
             AlignedFrames([0; PhysFrame::SIZE * 2]),
             AlignedFrames([0; PhysFrame::SIZE * 2]),
         ]);
-        let cache = FrameSlabCache::new(1, 1);
+        let cache = cache(1, 1);
         let total_frames = 3 * SLAB_RETAIN_DIVISOR;
         let base = backing.as_mut_ptr().cast::<u8>();
         for index in 0..3 {
@@ -303,7 +313,7 @@ mod tests {
         let mut backing = Box::new(std::array::from_fn::<_, 4, _>(|_| {
             AlignedFrames([0; PhysFrame::SIZE * 2])
         }));
-        let cache = FrameSlabCache::new(3, 1);
+        let cache = cache(3, 1);
         let base = backing.as_mut_ptr().cast::<u8>();
         let base_address = base as usize;
         let owners = std::array::from_fn::<_, 8, _>(|_| core::sync::atomic::AtomicBool::new(false));
@@ -361,7 +371,7 @@ mod tests {
 
     #[test]
     fn slab_reuses_single_frame() {
-        let cache = FrameSlabCache::new(2, 1);
+        let cache = cache(2, 1);
         let mut backing = Box::new(AlignedFrames([0; PhysFrame::SIZE * 2]));
         let ptr = NonNull::new(backing.0.as_mut_ptr()).expect("aligned frame pointer");
 
@@ -373,7 +383,7 @@ mod tests {
 
     #[test]
     fn slab_drains_cached_frames() {
-        let cache = FrameSlabCache::new(2, 1);
+        let cache = cache(2, 1);
         let mut backing = Box::new(AlignedFrames([0; PhysFrame::SIZE * 2]));
         let first = NonNull::new(backing.0.as_mut_ptr()).expect("first frame pointer");
         let second = NonNull::new(unsafe { backing.0.as_mut_ptr().add(PhysFrame::SIZE) })
@@ -392,7 +402,7 @@ mod tests {
 
     #[test]
     fn slab_drain_releases_after_unlocking_list() {
-        let cache = FrameSlabCache::new(1, 1);
+        let cache = cache(1, 1);
         let mut backing = Box::new(AlignedFrames([0; PhysFrame::SIZE * 2]));
         let first = NonNull::new(backing.0.as_mut_ptr()).expect("first frame pointer");
         let second = NonNull::new(unsafe { backing.0.as_mut_ptr().add(PhysFrame::SIZE) })
@@ -413,7 +423,7 @@ mod tests {
 
     #[test]
     fn slab_capacity_is_list_local() {
-        let cache = FrameSlabCache::new(2, 1);
+        let cache = cache(2, 1);
         let mut backing = Box::new(AlignedFrames([0; PhysFrame::SIZE * 2]));
         let first = NonNull::new(backing.0.as_mut_ptr()).expect("first frame pointer");
         let second = NonNull::new(unsafe { backing.0.as_mut_ptr().add(PhysFrame::SIZE) })
@@ -433,7 +443,7 @@ mod tests {
     #[test]
     fn a_frame_stays_on_the_list_of_its_own_node() {
         let node_1 = NodeId::new(1);
-        let cache = FrameSlabCache::new(2, 2);
+        let cache = cache(2, 2);
         let mut backing = Box::new(AlignedFrames([0; PhysFrame::SIZE * 2]));
         let frame = NonNull::new(backing.0.as_mut_ptr()).expect("aligned frame pointer");
 
@@ -453,7 +463,7 @@ mod tests {
     /// processor; a node with few frames still lets each list hold one.
     #[test]
     fn a_list_holds_its_share_of_its_own_node() {
-        let cache = FrameSlabCache::new(4, 2);
+        let cache = cache(4, 2);
         assert_eq!(cache.list_capacity_frames(64 * 1024), 256);
         assert_eq!(cache.list_capacity_frames(64), 1);
     }

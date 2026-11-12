@@ -61,6 +61,7 @@ use crate::memory::frame_pool::FramePool;
 use crate::memory::frame_slab::FrameSlabCache;
 use crate::memory::irq_safe::IrqSafeMutex;
 use crate::memory::locality::{Locality, NodeRun};
+use crate::memory::per_processor::{NodeArenas, NodeMemory, PerProcessor};
 use crate::memory::reported::{ReportedFrames, visit_free_runs};
 use crate::{MAX_BOOT_MEMORY_REGIONS, ProgramOutOfMemory};
 
@@ -70,8 +71,11 @@ pub struct UserMemoryPool {
     nodes: Box<[CachePadded<Option<NodePool>>]>,
     frame_slab: FrameSlabCache,
     /// Allocations each processor had served by a node other than its
-    /// own. Index: [`ProcessorId`].
-    off_node: Box<[CachePadded<AtomicU64>]>,
+    /// own.
+    off_node: PerProcessor<AtomicU64>,
+    /// Where per-processor structures are carved from, one arena per
+    /// node.
+    arenas: NodeArenas,
     /// Where each processor and each byte of the pool sits.
     locality: Locality,
     /// The processor that primed the pool. The kernel heap's boot share
@@ -117,7 +121,102 @@ impl NodePool {
     }
 }
 
+/// The nodes' buddies before the pool around them exists: the memory
+/// source the pool's own per-processor tables are carved with.
+struct NodeBuddies<'a> {
+    nodes: &'a [CachePadded<Option<NodePool>>],
+    locality: &'a Locality,
+}
+
+impl NodeMemory for NodeBuddies<'_> {
+    fn lend(&self, node: NodeId, bytes: usize) -> Option<usize> {
+        lend_from_nodes(self.nodes, self.locality, node, bytes, |_, pool| {
+            pool.heap.with(|heap| heap.allocate(bytes).ok())
+        })
+    }
+
+    unsafe fn give_back(&self, start: usize, bytes: usize) {
+        // SAFETY: the caller's contract is `return_to_nodes`'s.
+        unsafe { return_to_nodes(self.nodes, self.locality, start, bytes) };
+    }
+}
+
+/// Takes `bytes` for good from the first node of `node`'s memory order
+/// that `allocate` can serve, and stops counting them towards that
+/// node's pool, as a lend to the kernel heap does.
+fn lend_from_nodes(
+    nodes: &[CachePadded<Option<NodePool>>],
+    locality: &Locality,
+    node: NodeId,
+    bytes: usize,
+    mut allocate: impl FnMut(NodeId, &NodePool) -> Option<NonNull<u8>>,
+) -> Option<usize> {
+    debug_assert!(
+        bytes.is_power_of_two() && bytes >= PhysFrame::SIZE,
+        "a lend is one buddy block"
+    );
+    locality.memory_order(node).iter().find_map(|&candidate| {
+        let pool = nodes[candidate.index()].as_ref()?;
+        let ptr = allocate(candidate, pool)?;
+        pool.total_bytes.fetch_sub(bytes, Ordering::Release);
+        Some(ptr.as_ptr() as usize)
+    })
+}
+
+/// Puts `bytes` at `start`, part of a block [`lend_from_nodes`] answered,
+/// back in the node it lies on and counts them towards its pool again.
+///
+/// # Safety
+///
+/// The range is part of a block `lend_from_nodes` answered, aligned to
+/// its own size relative to that block, not returned before and no
+/// longer used by anything.
+unsafe fn return_to_nodes(
+    nodes: &[CachePadded<Option<NodePool>>],
+    locality: &Locality,
+    start: usize,
+    bytes: usize,
+) {
+    let node = locality.node_of_address(start);
+    let pool = nodes[node.index()]
+        .as_ref()
+        .unwrap_or_else(|| panic!("node {} owns user memory but has no pool", node.index()));
+    let ptr = NonNull::new(core::ptr::with_exposed_provenance_mut(start))
+        .unwrap_or_else(|| panic!("a returned lend is at address zero"));
+    // SAFETY: by this function's contract the range is part of a block
+    // this pool lent out and the lender no longer uses.
+    pool.heap
+        .with(|heap| unsafe { heap.deallocate(ptr, bytes) });
+    pool.total_bytes.fetch_add(bytes, Ordering::Release);
+}
+
+/// Per-processor tables come out of the pool's own nodes, lending from
+/// the nearest node with memory and draining cached frames first.
+impl NodeMemory for UserMemoryPool {
+    fn lend(&self, node: NodeId, bytes: usize) -> Option<usize> {
+        lend_from_nodes(&self.nodes, &self.locality, node, bytes, |node, pool| {
+            self.allocate_block(node, pool, bytes)
+        })
+    }
+
+    unsafe fn give_back(&self, start: usize, bytes: usize) {
+        // SAFETY: the caller's contract is `return_to_nodes`'s.
+        unsafe { return_to_nodes(&self.nodes, &self.locality, start, bytes) };
+    }
+}
+
 impl UserMemoryPool {
+    /// Bytes the per-processor arenas have taken out of the pool for
+    /// good: what [`PerProcessor`] tables and everything carved beside
+    /// them occupy.
+    pub fn per_processor_bytes(&self) -> usize {
+        self.arenas.lent_bytes()
+    }
+
+    pub(crate) fn arenas(&self) -> &NodeArenas {
+        &self.arenas
+    }
+
     /// A pool over `runs`, each on its node, for the machine `numa`
     /// describes, primed by `bootstrap`.
     ///
@@ -134,7 +233,7 @@ impl UserMemoryPool {
             "bootstrap processor {} is outside the NUMA description's {processor_count} processors",
             bootstrap.id()
         );
-        let nodes = (0..locality.node_count())
+        let nodes: Box<[CachePadded<Option<NodePool>>]> = (0..locality.node_count())
             .map(|index| {
                 let node = NodeId::new(index);
                 let regions: ArrayVec<(usize, usize), MAX_BOOT_MEMORY_REGIONS> = runs
@@ -145,12 +244,21 @@ impl UserMemoryPool {
                 CachePadded::new((!regions.is_empty()).then(|| NodePool::new(&regions)))
             })
             .collect();
+        // The pool's own per-processor tables are carved from the nodes'
+        // buddies directly: the pool they will live in does not exist
+        // yet, and there is nothing in any slab list to drain.
+        let arenas = NodeArenas::new(locality.node_count());
+        let buddies = NodeBuddies {
+            nodes: &nodes,
+            locality: &locality,
+        };
+        let frame_slab = FrameSlabCache::new(&locality, &arenas, &buddies);
+        let off_node = PerProcessor::build(&locality, &arenas, &buddies, |_, _| AtomicU64::new(0));
         Self {
             nodes,
-            frame_slab: FrameSlabCache::new(processor_count, locality.node_count()),
-            off_node: (0..processor_count)
-                .map(|_| CachePadded::new(AtomicU64::new(0)))
-                .collect(),
+            frame_slab,
+            off_node,
+            arenas,
             locality,
             bootstrap,
         }
@@ -249,7 +357,7 @@ impl UserMemoryPool {
         self.locality
             .processors_of(node)
             .iter()
-            .map(|processor| self.off_node[usize::from(processor.id())].load(Ordering::Relaxed))
+            .map(|&processor| self.off_node.get(processor).load(Ordering::Relaxed))
             .sum()
     }
 
@@ -452,7 +560,7 @@ impl UserMemoryPool {
     }
 
     fn count_off_node(&self, processor: ProcessorId) {
-        self.off_node[usize::from(processor.id())].fetch_add(1, Ordering::Relaxed);
+        self.off_node.get(processor).fetch_add(1, Ordering::Relaxed);
     }
 
     fn machine_out_of_memory(&self, requested_bytes: usize) -> ProgramOutOfMemory {

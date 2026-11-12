@@ -203,7 +203,7 @@ fn x86_kernel_main() -> ! {
     // No firmware NUMA description is read yet: every processor and all
     // of memory sit on one node.
     let numa = SingleNode::new(processor_count);
-    helios_kernel::prime_bootstrap_allocator(
+    let pool = helios_kernel::prime_bootstrap_allocator(
         boot_memory_regions(
             &handoff,
             physical_memory_offset,
@@ -245,6 +245,7 @@ fn x86_kernel_main() -> ! {
         timebase,
         debug_state.clone(),
         xcr0,
+        pool,
     );
     smp::activate_runtime(boot.bootstrap_runtime());
     // The local APIC is enabled once, here, and never re-attached on the

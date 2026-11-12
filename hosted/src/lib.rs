@@ -16,6 +16,7 @@ mod runtime;
 mod swap;
 #[cfg(test)]
 mod swap_tests;
+mod test_pool;
 mod vmm;
 
 pub use device::{

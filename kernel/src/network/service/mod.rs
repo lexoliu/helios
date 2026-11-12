@@ -633,8 +633,12 @@ where
     CpuImpl: Cpu + Clone,
     DeviceImpl: NetworkDevice,
 {
+    /// A service with one shard per processor, each carved from the
+    /// memory of its processor's node out of `pool`. `cpu` and `pool`
+    /// describe the same machine.
     pub fn new(
         cpu: CpuImpl,
+        pool: &crate::memory::UserMemoryPool,
         profiles: ProfileSink,
         clock: UptimeClock,
         timer: Timer<CpuImpl>,
@@ -663,7 +667,13 @@ where
         // are a follow-up. The `transaction_id` is staggered per
         // shard so DHCP DISCOVER messages from different shards do
         // not race over the same XID.
-        let shard_count = cpu.processor_count().max(1);
+        let shard_count = pool.locality().processor_count();
+        assert_eq!(
+            shard_count,
+            cpu.processor_count(),
+            "the platform reports {} processors and the NUMA description {shard_count}",
+            cpu.processor_count()
+        );
         // We probe the configured rx_budget once via a throwaway
         // Stack — every shard's Stack uses the same StackConfig so
         // the value is identical across shards.
@@ -683,7 +693,7 @@ where
             .with_direct_tx_dma(capabilities.direct_tx_dma)
             .with_segmentation_offload(segmentation);
         let stack_rx_budget = Stack::new(stack_config).config().rx_budget;
-        let state = NetworkShardSet::new(shard_count, |index| {
+        let state = NetworkShardSet::new(pool, |index| {
             let staggered_xid = transaction_id.wrapping_add(index as u32);
             NetworkShard::new(stack_config, staggered_xid, index, shard_count)
         });
@@ -1546,6 +1556,7 @@ pub(crate) mod fixture {
             let cpu = crate::test_support::TestCpu::without_entropy();
             let service = NetworkService::new(
                 cpu,
+                crate::test_support::single_node_pool(1),
                 crate::test_support::test_profile_sink(),
                 crate::test_support::test_uptime_clock(),
                 crate::test_support::test_timer(cpu),
@@ -2963,9 +2974,10 @@ mod tests {
         // cross-processor.
         let cpu = RecordingSmpCpu::new(0, 2);
         let control = super::NetworkControlPlane::new();
-        let state = super::NetworkShardSet::new(2, |index| {
-            NetworkShard::new(test_stack_config(), 1 + index as u32, index, 2)
-        });
+        let state =
+            super::NetworkShardSet::new(crate::test_support::single_node_pool(2), |index| {
+                NetworkShard::new(test_stack_config(), 1 + index as u32, index, 2)
+            });
         // A bound datagram socket is replicated: the same slot on every
         // shard, with the receive path deciding which replica gets a
         // given datagram.
@@ -3078,9 +3090,10 @@ mod tests {
         let owner = 1;
         let cpu = RecordingSmpCpu::new(0, 2);
         let control = super::NetworkControlPlane::new();
-        let state = super::NetworkShardSet::new(2, |index| {
-            NetworkShard::new(test_stack_config(), 1 + index as u32, index, 2)
-        });
+        let state =
+            super::NetworkShardSet::new(crate::test_support::single_node_pool(2), |index| {
+                NetworkShard::new(test_stack_config(), 1 + index as u32, index, 2)
+            });
         // The port the connection is opened on is the one whose replies
         // hash back to the owning shard, exactly as
         // `allocate_tcp_local_port_for` picks it.
@@ -3424,9 +3437,10 @@ mod tests {
         // pump depends on rather than a local one.
         let owner = 1;
         let cpu = RecordingSmpCpu::new(0, 2);
-        let state = super::NetworkShardSet::new(2, |index| {
-            NetworkShard::new(test_stack_config(), 1 + index as u32, index, 2)
-        });
+        let state =
+            super::NetworkShardSet::new(crate::test_support::single_node_pool(2), |index| {
+                NetworkShard::new(test_stack_config(), 1 + index as u32, index, 2)
+            });
 
         let stream = {
             let mut shard = state.shard_at(owner).lock();
@@ -3579,6 +3593,7 @@ mod tests {
         let cpu = TestCpu::without_entropy();
         super::NetworkService::new(
             cpu,
+            crate::test_support::single_node_pool(1),
             crate::test_support::test_profile_sink(),
             crate::test_support::test_uptime_clock(),
             crate::test_support::test_timer(cpu),
@@ -3863,6 +3878,7 @@ mod tests {
         let cpu = RecordingSmpCpu::new(0, processors);
         super::NetworkService::new(
             cpu.clone(),
+            crate::test_support::single_node_pool(processors),
             crate::test_support::test_profile_sink(),
             crate::test_support::test_uptime_clock(),
             crate::test_support::test_timer(cpu),
@@ -4107,9 +4123,10 @@ mod tests {
     fn accept_starts_at_the_callers_shard_and_visits_the_rest() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([198, 51, 100, 20]);
-        let state = super::NetworkShardSet::new(3, |index| {
-            NetworkShard::new(test_stack_config(), 1 + index as u32, index, 3)
-        });
+        let state =
+            super::NetworkShardSet::new(crate::test_support::single_node_pool(3), |index| {
+                NetworkShard::new(test_stack_config(), 1 + index as u32, index, 3)
+            });
         let listener = TcpListenerId(ReplicaHandle::new(FIRST_TEST_LISTENER_SLOT).get());
         state
             .install_replica(
@@ -4254,9 +4271,10 @@ mod tests {
     #[test]
     fn shard_arrivals_deduplicate_within_one_receive_batch() {
         let cpu = RecordingSmpCpu::new(0, 4);
-        let state = super::NetworkShardSet::new(4, |index| {
-            NetworkShard::new(test_stack_config(), 1 + index as u32, index, 4)
-        });
+        let state =
+            super::NetworkShardSet::new(crate::test_support::single_node_pool(4), |index| {
+                NetworkShard::new(test_stack_config(), 1 + index as u32, index, 4)
+            });
         let mut arrivals = super::ShardArrivals::new();
         arrivals.record(2);
         arrivals.record(2);
@@ -4290,9 +4308,10 @@ mod tests {
         let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         let peer = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
         let router = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]);
-        let state = super::NetworkShardSet::new(2, |index| {
-            NetworkShard::new(test_stack_config(), 1 + index as u32, index, 2)
-        });
+        let state =
+            super::NetworkShardSet::new(crate::test_support::single_node_pool(2), |index| {
+                NetworkShard::new(test_stack_config(), 1 + index as u32, index, 2)
+            });
         let socket = UdpSocketId(ReplicaHandle::new(FIRST_TEST_UDP_SLOT).get());
         state
             .install_replica(

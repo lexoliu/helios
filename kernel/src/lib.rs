@@ -167,7 +167,8 @@ pub use memory::{
     FiberStackError, FiberStackVmHooks, HardwareEntropySource, IDLE_SWAP_AFTER,
     INCOMPRESSIBLE_BYTES, KERNEL_HEAP_BOOTSTRAP_BYTES, KERNEL_HEAP_GROWTH_CHUNK_BYTES,
     KERNEL_HEAP_MAX_BOOT_FRACTION, KERNEL_HEAP_MIN_RESERVE_BYTES, KERNEL_HEAP_RESERVE_FRACTION,
-    Locality, MemoryNodeStats, MemoryOwner, NoCryptographicEntropy, NoEntropyDevice, NodeRun,
+    LocalMemory, LocalSlice, Locality, MemoryNodeStats, MemoryOwner, NoCryptographicEntropy,
+    NoEntropyDevice, NodeLocalArena, NodeMemory, NodeRun, PerProcessor,
     ROOT_ENTROPY_MATERIAL_BYTES, RegionShares, ReleasedReservation, ReservationLookup,
     ReservationTracker, RootEntropy, RootEntropyHandle, SWAP_BATCH_BYTES, SWAP_TICK, StackFault,
     SwapDisabled, SwapEntry, SwapFaultError, SwapHandle, SwapStats, SwapVmHooks,
@@ -1195,7 +1196,17 @@ where
     };
     // The bootstrap processor asserted above that the locality names
     // `topology.configured_processors`; secondaries start only after.
-    let executor = Executor::new(progress, memory::locality(), current_processor);
+    let executor = Executor::new(progress, memory::user_memory_pool(), current_processor);
+    if current_processor == topology.bootstrap_processor {
+        // Logged here and not with the memory policy: the task arenas,
+        // which are nearly all of it, exist only once the executor does.
+        // The tables built after this point (fiber-stack counters,
+        // network shards) are cache lines per processor.
+        tracing::info!(
+            "Per-processor memory per_processor_bytes={}",
+            memory::user_memory_pool().per_processor_bytes()
+        );
+    }
     let kernel = Kernel {
         timer: executor.timer(cpu.clone()),
         cpu,
@@ -1317,13 +1328,13 @@ where
     let pool =
         memory::install_user_memory_pool(memory::UserMemoryPool::new(numa, bootstrap, &user_runs));
     // The swap policy asks which instance a committed page belongs to,
-    // and the answer is per-processor; size that table with the pool it
-    // describes.
-    memory::configure_user_memory_owner_processors(processor_count);
+    // and the answer is per-processor; build that table out of the pool
+    // it describes.
+    memory::configure_user_memory_owner_processors(pool);
     // And the frames the page-fault path is allowed to take, which come
     // out of this same pool and are held per processor because a fault
     // may not wait on its lock.
-    memory::configure_frame_reserve_processors(processor_count);
+    memory::configure_frame_reserve(pool);
     pool
 }
 

@@ -7,18 +7,18 @@ use divan::counter::ItemsCount;
 use divan::{AllocProfiler, Bencher, black_box};
 use helios_hal::cpu::{Cpu, HardwarePerfCounters, Instant, ProcessorId, Timebase, TimerInterrupt};
 use helios_hal::fs::FileRights;
-use helios_hal::numa::SingleNode;
+use helios_hal::numa::{NodeId, SingleNode};
 use helios_hal::resource::KernelResource;
 use helios_hal::watchdog::ProgressCounter;
 use helios_kernel::SocketReadiness;
 use helios_kernel::{
     ComponentNetworkService, DescriptorId, DescriptorTable, DnsError, DnsErrorKind, Executor,
-    FutexKey, FutexTable, GuestAddress, Ipv4Address, Ipv4Cidr, Ipv4Route, Locality, MacAddress,
+    FutexKey, FutexTable, GuestAddress, Ipv4Address, Ipv4Cidr, Ipv4Route, MacAddress,
     NetworkAdminBackend, NetworkBridgeRequest, NetworkControlError, NetworkErrorDetail,
-    NetworkIpAddress, NetworkPortId, Notify, PingError, PingErrorKind, PingReply,
+    NetworkIpAddress, NetworkPortId, NodeRun, Notify, PingError, PingErrorKind, PingReply,
     ProcessMemoryIdentity, TcpAccepted, TcpError, TcpErrorKind, TcpListener, TcpReadProgress,
     TcpWriteProgress, TryRead, TryWrite, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
-    byte_channel,
+    UserMemoryPool, byte_channel,
 };
 use spin::{Mutex, Once};
 
@@ -83,11 +83,27 @@ impl helios_hal::critical_section::LocalInterruptMask for BenchInterruptMask {
 helios_hal::critical_section::set_local_interrupt_mask_impl!(BenchInterruptMask);
 
 /// Processor 0's executor on the one-processor machine this bench
-/// models, which has no NUMA description. The locality is leaked: the
-/// kernel holds it for the machine's life, and the bench process is that.
+/// models, which has no NUMA description. The pool is leaked over one
+/// naturally aligned host block: the kernel holds it for the machine's
+/// life, and the bench process is that.
 fn bench_executor() -> Executor {
-    let locality = Box::leak(Box::new(Locality::new(&SingleNode::new(1), &[])));
-    Executor::new(ProgressCounter::new(), locality, ProcessorId::new(0))
+    const BLOCK_BYTES: usize = 64 << 20;
+    let layout =
+        core::alloc::Layout::from_size_align(BLOCK_BYTES, BLOCK_BYTES).expect("bench pool layout");
+    // SAFETY: a non-zero layout, leaked for the process's life.
+    let start = unsafe { alloc::alloc::alloc(layout) } as usize;
+    assert!(start != 0, "host allocation for the bench pool failed");
+    let runs = [NodeRun {
+        start,
+        end: start + BLOCK_BYTES,
+        node: NodeId::new(0),
+    }];
+    let pool = Box::leak(Box::new(UserMemoryPool::new(
+        &SingleNode::new(1),
+        ProcessorId::new(0),
+        &runs,
+    )));
+    Executor::new(ProgressCounter::new(), pool, ProcessorId::new(0))
 }
 
 #[divan::bench(args = [16usize, 64, 256])]

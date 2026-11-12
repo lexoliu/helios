@@ -9,9 +9,9 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase, TimerInterrupt};
-use helios_hal::numa::{MemoryAffinity, NodeDistance, NodeId, NumaTopology, SingleNode};
+use helios_hal::numa::{MemoryAffinity, NodeDistance, NodeId, NumaTopology};
 
-use crate::memory::Locality;
+use crate::memory::{Locality, NodeRun, UserMemoryPool};
 
 /// The processor-local interrupt mask for the kernel's own unit tests.
 ///
@@ -129,20 +129,93 @@ impl Cpu for TestCpu {
 pub(crate) fn test_timer<CpuImpl: Cpu + Clone>(cpu: CpuImpl) -> crate::Timer<CpuImpl> {
     crate::Executor::new(
         helios_hal::watchdog::ProgressCounter::new(),
-        single_node_locality(cpu.processor_count()),
+        single_node_pool(cpu.processor_count()),
         helios_hal::cpu::current_processor(),
     )
     .timer(cpu)
 }
 
-/// The locality of a machine with `processors` processors and no NUMA
-/// description, as a backend that publishes none hands the kernel.
+/// Host memory each node of a test pool owns: enough for the per-processor
+/// tables and task arenas of a few processors, and for the largest arena
+/// the executor tests size, which is all the kernel's unit tests carve
+/// from it.
+pub(crate) const TEST_POOL_NODE_BYTES: usize = 256 << 20;
+
+/// A user pool over a machine of `processors` processors on one node.
 ///
-/// It is leaked, because the kernel holds the machine's locality for
-/// the machine's life, and a test process is that life. It describes no
-/// user memory: nothing that takes it allocates from a pool.
-pub(crate) fn single_node_locality(processors: usize) -> &'static Locality {
-    Box::leak(Box::new(Locality::new(&SingleNode::new(processors), &[])))
+/// One pool per processor count for the whole test process: a test that
+/// builds its executor or per-processor tables from it shares the host
+/// block with the others that do, instead of leaking one per call.
+pub(crate) fn single_node_pool(processors: usize) -> &'static UserMemoryPool {
+    static POOLS: std::sync::Mutex<Vec<(usize, &'static UserMemoryPool)>> =
+        std::sync::Mutex::new(Vec::new());
+    let mut pools = POOLS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((_, pool)) = pools.iter().find(|(count, _)| *count == processors) {
+        return pool;
+    }
+    let pool = TestMachine::round_robin(processors, 1).pool(TEST_POOL_NODE_BYTES);
+    pools.push((processors, pool));
+    pool
+}
+
+/// Node memory over one leaked, naturally aligned host block per node,
+/// lent from the bottom, recording what comes back.
+pub(crate) struct HostNodeMemory {
+    /// Per node: `(next, end)`.
+    nodes: core::cell::RefCell<Vec<(usize, usize)>>,
+    /// Every `(start, bytes)` given back.
+    returned: core::cell::RefCell<Vec<(usize, usize)>>,
+    /// Per node: where its block starts and ends.
+    regions: Vec<(usize, usize)>,
+}
+
+impl HostNodeMemory {
+    pub(crate) fn new(nodes: usize, bytes_per_node: usize) -> Self {
+        let regions: Vec<(usize, usize)> = (0..nodes)
+            .map(|_| {
+                let layout = core::alloc::Layout::from_size_align(bytes_per_node, bytes_per_node)
+                    .expect("host node memory layout");
+                // SAFETY: `layout` has a non-zero size; the block is
+                // leaked, which is the life a test machine's memory has.
+                let start = unsafe { alloc::alloc::alloc(layout) } as usize;
+                assert!(start != 0, "host allocation for node memory failed");
+                (start, start + bytes_per_node)
+            })
+            .collect();
+        Self {
+            nodes: core::cell::RefCell::new(regions.clone()),
+            returned: core::cell::RefCell::new(Vec::new()),
+            regions,
+        }
+    }
+
+    /// Per node, the block its memory is in.
+    pub(crate) fn regions(&self) -> &[(usize, usize)] {
+        &self.regions
+    }
+
+    pub(crate) fn returned(&self) -> Vec<(usize, usize)> {
+        self.returned.borrow().clone()
+    }
+}
+
+impl crate::memory::NodeMemory for HostNodeMemory {
+    fn lend(&self, node: NodeId, bytes: usize) -> Option<usize> {
+        let mut nodes = self.nodes.borrow_mut();
+        let (next, end) = &mut nodes[node.index()];
+        let start = next.next_multiple_of(bytes);
+        (start + bytes <= *end).then(|| {
+            *next = start + bytes;
+            start
+        })
+    }
+
+    unsafe fn give_back(&self, start: usize, bytes: usize) {
+        assert!(bytes.is_power_of_two(), "a piece is a power of two");
+        self.returned.borrow_mut().push((start, bytes));
+    }
 }
 
 /// A machine a test spells out: which node each processor is on and
@@ -155,8 +228,51 @@ pub(crate) struct TestMachine {
 }
 
 impl TestMachine {
-    /// The machine's locality, leaked as [`single_node_locality`]'s is,
-    /// with no user memory.
+    /// `processors` processors spread round-robin over `nodes` nodes,
+    /// every remote distance equal.
+    pub(crate) fn round_robin(processors: usize, nodes: usize) -> Self {
+        Self {
+            processor_nodes: (0..processors).map(|processor| processor % nodes).collect(),
+            distances: (0..nodes * nodes)
+                .map(|cell| {
+                    if cell / nodes == cell % nodes {
+                        NodeDistance::LOCAL.get()
+                    } else {
+                        NodeDistance::UNIFORM_REMOTE.get()
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    /// A user pool over this machine with `bytes_per_node` of host
+    /// memory on every node, leaked because the kernel holds the
+    /// machine's pool for the machine's life and a test process is that
+    /// life. Per-processor tables and executors carve from it.
+    pub(crate) fn pool(&self, bytes_per_node: usize) -> &'static UserMemoryPool {
+        let runs: Vec<NodeRun> = (0..self.node_count())
+            .map(|node| {
+                let layout = core::alloc::Layout::from_size_align(bytes_per_node, bytes_per_node)
+                    .expect("host pool layout");
+                // SAFETY: a non-zero layout, leaked for the test machine's life.
+                let start = unsafe { alloc::alloc::alloc(layout) } as usize;
+                assert!(start != 0, "host allocation for the test pool failed");
+                NodeRun {
+                    start,
+                    end: start + bytes_per_node,
+                    node: NodeId::new(node),
+                }
+            })
+            .collect();
+        Box::leak(Box::new(UserMemoryPool::new(
+            self,
+            ProcessorId::new(0),
+            &runs,
+        )))
+    }
+
+    /// The machine's locality, leaked like [`Self::pool`]'s pool, with
+    /// no user memory.
     pub(crate) fn locality(&self) -> &'static Locality {
         Box::leak(Box::new(Locality::new(self, &[])))
     }

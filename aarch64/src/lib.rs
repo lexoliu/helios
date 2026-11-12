@@ -10,7 +10,6 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use alloc::boxed::Box;
-use alloc::vec::Vec;
 use arm_gic::IntId;
 use helios_firmware::ProcessorIdentities;
 use helios_hal::boot::{
@@ -30,8 +29,8 @@ use helios_hal::{
     DeviceInventory, DmaModel, Platform, ProcessorStartupPolicy, ProcessorTopology, align_up,
 };
 use helios_kernel::{
-    DebugSerialAccess, DebugSerialInterrupt, KernelException, KernelExceptionCause, Timer,
-    WasmtimeTlsSlots,
+    DebugSerialAccess, DebugSerialInterrupt, KernelException, KernelExceptionCause, PerProcessor,
+    Timer, UserMemoryPool, WasmtimeTlsSlots,
 };
 use limine::BaseRevision;
 use limine::file::File;
@@ -365,26 +364,28 @@ struct Aarch64ProcessorSlot {
 }
 
 struct Aarch64PlatformState {
-    processors: Box<[Aarch64ProcessorSlot]>,
+    processors: PerProcessor<Aarch64ProcessorSlot>,
     timebase: Timebase,
     debug_state: Once<debug_state::RuntimeState>,
     gic: Once<gic::Gic>,
 }
 
 impl Aarch64PlatformState {
-    fn from_limine_mp(timebase: Timebase) -> &'static Self {
-        let processors = limine_processors()
-            .enumerate()
-            .map(|(index, mp_info)| {
-                let logical_id = u16::try_from(index)
-                    .unwrap_or_else(|_| panic!("AArch64 processor index {index} exceeds u16"));
-                Aarch64ProcessorSlot {
-                    mp_info,
-                    runtime: ProcessorRuntime::new(logical_id),
-                }
-            })
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
+    fn from_limine_mp(timebase: Timebase, pool: &UserMemoryPool) -> &'static Self {
+        assert_eq!(
+            pool.locality().processor_count(),
+            limine_processors().count(),
+            "the NUMA locality and Limine's MP response disagree on the processor count"
+        );
+        let processors = PerProcessor::new(pool, |processor, _| {
+            let index = usize::from(processor.id());
+            Aarch64ProcessorSlot {
+                mp_info: limine_processors()
+                    .nth(index)
+                    .unwrap_or_else(|| panic!("Limine's MP response has no processor {index}")),
+                runtime: ProcessorRuntime::new(processor.id()),
+            }
+        });
         Box::leak(Box::new(Self {
             processors,
             timebase,
@@ -423,16 +424,16 @@ impl Aarch64PlatformState {
     }
 
     fn bootstrap_mpidr(&self) -> u64 {
-        self.processors[0].mp_info.mpidr
+        self.processors.get(ProcessorId::new(0)).mp_info.mpidr
     }
 
     /// The MPIDR of every processor Limine started, bootstrap first.
     fn processor_mpidrs(&self) -> impl Iterator<Item = u64> + Clone + '_ {
-        self.processors.iter().map(|slot| slot.mp_info.mpidr)
+        self.processors.iter().map(|(_, slot)| slot.mp_info.mpidr)
     }
 
     fn bootstrap_runtime(&'static self) -> &'static ProcessorRuntime {
-        &self.processors[0].runtime
+        &self.processors.get(ProcessorId::new(0)).runtime
     }
 
     fn processor_count(&self) -> usize {
@@ -441,13 +442,14 @@ impl Aarch64PlatformState {
 
     fn processor_slot(&self, processor: ProcessorId) -> &Aarch64ProcessorSlot {
         self.processors
-            .get(processor.id() as usize)
+            .try_get(processor)
             .unwrap_or_else(|| panic!("AArch64 processor {} is out of range", processor.id()))
     }
 
     fn processor_slot_by_mpidr(&self, mpidr: u64) -> &Aarch64ProcessorSlot {
         self.processors
             .iter()
+            .map(|(_, slot)| slot)
             .find(|slot| slot.mp_info.mpidr == mpidr)
             .unwrap_or_else(|| panic!("AArch64 processor MPIDR {mpidr:#x} is unknown"))
     }
@@ -549,9 +551,9 @@ struct PrimeBootstrapAllocator<'h> {
 }
 
 impl platform::NumaConsumer for PrimeBootstrapAllocator<'_> {
-    type Output = ();
+    type Output = &'static UserMemoryPool;
 
-    fn consume<Numa: NumaTopology>(self, numa: &Numa) {
+    fn consume<Numa: NumaTopology>(self, numa: &Numa) -> &'static UserMemoryPool {
         let reserved_ranges = boot_reserved_ranges(self.handoff);
         let memory_regions = self.handoff.memory_map.regions().flat_map(|region| {
             // SAFETY: Limine's usable entries are RAM nothing else owns,
@@ -564,7 +566,7 @@ impl platform::NumaConsumer for PrimeBootstrapAllocator<'_> {
         });
         // Limine hands control to the bootstrap processor, which the
         // processor table lists first.
-        helios_kernel::prime_bootstrap_allocator(memory_regions, numa, ProcessorId::new(0));
+        helios_kernel::prime_bootstrap_allocator(memory_regions, numa, ProcessorId::new(0))
     }
 }
 
@@ -641,7 +643,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
     let debug_serial = DebugSerial::map(console, physical_memory_offset, &handoff);
     debug_serial.init();
     DEBUG_SERIAL_BASE.store(debug_serial.base, Ordering::Release);
-    tables
+    let pool = tables
         .with_numa(
             LimineProcessorIdentities,
             PrimeBootstrapAllocator {
@@ -657,7 +659,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
         .describe(console)
         .unwrap_or_else(|error| panic!("AArch64 platform description failed: {error}"));
     vmm::install_user_address_space(physical_memory_offset);
-    let platform_state = Aarch64PlatformState::from_limine_mp(timebase());
+    let platform_state = Aarch64PlatformState::from_limine_mp(timebase(), pool);
     activate_processor_runtime(platform_state.bootstrap_runtime());
 
     let cpu = Aarch64Cpu {
