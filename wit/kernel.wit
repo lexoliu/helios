@@ -8,6 +8,7 @@ world init {
   import helios:system/stats@0.1.0;
   import helios:system/tracing@0.1.0;
   import helios:system/profiling@0.1.0;
+  import helios:system/settings@0.1.0;
   import helios:system/sync@0.1.0;
   import helios:system/serial@0.1.0;
   import helios:system/display@0.1.0;
@@ -27,6 +28,7 @@ world debugger{
   import helios:system/stats@0.1.0;
   import helios:system/tracing@0.1.0;
   import helios:system/profiling@0.1.0;
+  import helios:system/settings@0.1.0;
   import helios:system/sync@0.1.0;
   import helios:system/serial@0.1.0;
   import helios:system/instances@0.1.0;

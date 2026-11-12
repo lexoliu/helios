@@ -1,0 +1,52 @@
+package helios:system@0.1.0;
+
+/// Machine-wide settings: the operator's values for limits the kernel
+/// enforces. A setting is the value new processes and new requests take;
+/// changing one never reaches into a process already running.
+interface settings {
+  /// What a setting's value measures.
+  enum unit {
+    /// A number of things: descriptor numbers, table entries.
+    count,
+    /// A length in bytes.
+    bytes,
+  }
+
+  /// A setting's value, in its unit.
+  variant value {
+    count(u64),
+    bytes(u64),
+  }
+
+  record setting {
+    /// The setting's name, `subsystem.name`.
+    name: string,
+    /// What the setting bounds, in one sentence.
+    description: string,
+    /// The value new processes and requests take now.
+    value: value,
+  }
+
+  /// Why `write` changed nothing.
+  variant write-error {
+    /// The caller does not hold the right to write settings.
+    denied,
+    /// No setting has that name.
+    unknown,
+    /// The value is not in the setting's unit, which is the payload.
+    unit-mismatch(unit),
+  }
+
+  /// Every setting, in the kernel's order. Needs no right.
+  %list: func() -> list<setting>;
+
+  /// The setting named `name`, or none when the kernel has none by that
+  /// name. Needs no right.
+  read: func(name: string) -> option<setting>;
+
+  /// Makes `value` the setting's value for every process and request
+  /// created from now on, and answers the value it replaced. Needs the
+  /// right to write settings; without it the call is refused before the
+  /// name is looked up.
+  write: func(name: string, value: value) -> result<value, write-error>;
+}

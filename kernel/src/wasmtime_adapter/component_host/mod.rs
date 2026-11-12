@@ -62,6 +62,7 @@ const STATS_INSTANCE: &str = "helios:system/stats@0.1.0";
 const NET_INSTANCE: &str = "helios:system/net@0.1.0";
 const TRACING_INSTANCE: &str = "helios:system/tracing@0.1.0";
 const PROFILING_INSTANCE: &str = "helios:system/profiling@0.1.0";
+const SETTINGS_INSTANCE: &str = "helios:system/settings@0.1.0";
 const INSTANCES_INSTANCE: &str = "helios:system/instances@0.1.0";
 /// The share of the machine's free memory the compiled-component cache
 /// may hold.
@@ -88,6 +89,7 @@ mod observation;
 mod pending;
 pub(crate) use pending::PendingReply;
 pub mod service;
+mod settings;
 mod topology;
 mod views;
 mod vsock;
@@ -1975,6 +1977,7 @@ where
     add_instances_to_linker(linker)?;
     add_tracing_to_linker(linker)?;
     debugger_profiling::add_to_linker(linker)?;
+    add_settings_to_linker(linker)?;
     Ok(())
 }
 
@@ -2176,6 +2179,7 @@ where
     service::add_audio_to_linker(linker)?;
     add_tracing_to_program_linker(linker)?;
     program_profiling::add_to_linker(linker)?;
+    add_settings_to_linker(linker)?;
     Ok(())
 }
 
@@ -3129,6 +3133,49 @@ where
             }
         };
         Ok((Ok(reader),))
+    })?;
+    Ok(())
+}
+
+/// Registers `helios:system/settings` for both worlds.
+///
+/// Unlike the interfaces above, nothing here is written against a world's
+/// generated types: the listing, a row and the value cross as the views in
+/// `settings`, which name the interface's records by their component model
+/// shape. One registration therefore serves the debugger and program
+/// worlds, and the whole interface is registered, so neither can
+/// instantiate against a missing function.
+fn add_settings_to_linker<CpuImpl, Net, HostFs>(
+    linker: &mut Linker<StoreData<CpuImpl, Net, HostFs>>,
+) -> wasmtime::Result<()>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    HostFs: crate::HostFileSystem,
+{
+    use settings::{SettingView, ValueView, WriteErrorView};
+    use wasmtime::AsContext;
+    use wasmtime::component::WasmStr;
+
+    let mut instance = linker.instance(SETTINGS_INSTANCE)?;
+    // Reads need no right; a write needs the right to write settings and is
+    // refused before the name is looked up. See `settings`.
+    instance.func_wrap("list", |caller, (): ()| {
+        Ok((settings::listing(caller.data()),))
+    })?;
+    // A name is compared where it sits in the caller's memory, so a
+    // guest-chosen string is not copied onto the kernel heap for UTF-8.
+    instance.func_wrap("read", |caller, (name,): (WasmStr,)| {
+        let name = name.to_str(caller.as_context())?;
+        let setting = settings::read(caller.data(), &name).map(SettingView::from);
+        Ok((setting,))
+    })?;
+    instance.func_wrap("write", |caller, (name, value): (WasmStr, ValueView)| {
+        let name = name.to_str(caller.as_context())?;
+        let replaced = settings::write(caller.data(), &name, value.into())
+            .map(ValueView::from)
+            .map_err(WriteErrorView::from);
+        Ok((replaced,))
     })?;
     Ok(())
 }
