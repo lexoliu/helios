@@ -68,15 +68,18 @@ fn open(
     open_flags: fs_types::OpenFlags,
     flags: fs_types::DescriptorFlags,
 ) -> Result<FsDescriptor, fs_types::ErrorCode> {
-    block_on(open_at(
-        namespace,
-        base,
-        fs_types::PathFlags::empty(),
-        path,
-        open_flags,
-        flags,
-        1,
-    ))
+    block_on(async {
+        open_at(
+            namespace,
+            base.grant()?,
+            fs_types::PathFlags::empty(),
+            path,
+            open_flags,
+            flags,
+            1,
+        )
+        .await
+    })
 }
 
 fn create_file(namespace: &TestNamespace, path: &str, bytes: &[u8]) -> FsDescriptor {
@@ -254,15 +257,7 @@ fn rename_preserves_object_identity_local_part() {
     create_file(&namespace, "tmp", b"data");
     let before = metadata_hash(&block_on(stat_path(&namespace, "/tmp", Follow::No)).expect("stat"));
 
-    block_on(rename_at(
-        &namespace,
-        held(&root()),
-        "tmp",
-        held(&root()),
-        "renamed",
-        2,
-    ))
-    .expect("rename must succeed");
+    rename(&namespace, &root(), "tmp", &root(), "renamed").expect("rename must succeed");
     let after =
         metadata_hash(&block_on(stat_path(&namespace, "/renamed", Follow::No)).expect("stat"));
 
@@ -275,15 +270,8 @@ fn rename_across_mounts_is_cross_device() {
     mount_memory(&namespace, "/mnt");
     create_file(&namespace, "tmp", b"data");
 
-    let error = block_on(rename_at(
-        &namespace,
-        held(&root()),
-        "tmp",
-        held(&root()),
-        "mnt/tmp",
-        2,
-    ))
-    .expect_err("rename across mounts must fail");
+    let error = rename(&namespace, &root(), "tmp", &root(), "mnt/tmp")
+        .expect_err("rename across mounts must fail");
 
     assert!(matches!(error, fs_types::ErrorCode::CrossDevice));
 }
@@ -297,15 +285,8 @@ fn rename_into_a_missing_directory_fails() {
     };
     create_file(&namespace, "tmp", b"data");
 
-    let error = block_on(rename_at(
-        &namespace,
-        held(&root()),
-        "tmp",
-        held(&stale),
-        "tmp",
-        2,
-    ))
-    .expect_err("rename into a directory that does not exist must fail");
+    let error = rename(&namespace, &root(), "tmp", &stale, "tmp")
+        .expect_err("rename into a directory that does not exist must fail");
 
     assert!(matches!(error, fs_types::ErrorCode::NoEntry));
 }
@@ -430,7 +411,8 @@ fn symlink_target_is_read_without_normalization() {
     .expect("symlink creation must succeed");
 
     assert_eq!(
-        block_on(readlink_at(&namespace, &root(), "tool-link")).expect("readlink must succeed"),
+        block_on(readlink_at(&namespace, held(&root()), "tool-link"))
+            .expect("readlink must succeed"),
         "bin/tool"
     );
     assert_eq!(
@@ -496,7 +478,7 @@ fn symlink_follow_is_confined_and_loop_limited() {
     .expect("symlink creation must succeed");
     let opened = block_on(open_at(
         &namespace,
-        &root(),
+        held(&root()),
         fs_types::PathFlags::SYMLINK_FOLLOW,
         "tool-link",
         fs_types::OpenFlags::empty(),
@@ -512,7 +494,7 @@ fn symlink_follow_is_confined_and_loop_limited() {
         .expect("loop symlink b must be created");
     let error = block_on(open_at(
         &namespace,
-        &root(),
+        held(&root()),
         fs_types::PathFlags::SYMLINK_FOLLOW,
         "loop-a",
         fs_types::OpenFlags::empty(),
@@ -711,25 +693,11 @@ fn the_base_itself_is_never_removed_renamed_or_replaced_through_it() {
             Err(fs_types::ErrorCode::Invalid)
         ));
         assert!(matches!(
-            block_on(rename_at(
-                &namespace,
-                held(&work()),
-                path,
-                held(&root()),
-                "moved",
-                1
-            )),
+            rename(&namespace, &work(), path, &root(), "moved"),
             Err(fs_types::ErrorCode::Invalid)
         ));
         assert!(matches!(
-            block_on(rename_at(
-                &namespace,
-                held(&root()),
-                "bob",
-                held(&work()),
-                path,
-                1
-            )),
+            rename(&namespace, &root(), "bob", &work(), path),
             Err(fs_types::ErrorCode::Invalid)
         ));
     }
@@ -749,7 +717,7 @@ fn a_link_at_the_base_does_not_lead_out_of_it() {
     for path in [".", ""] {
         let opened = block_on(open_at(
             &namespace,
-            &work(),
+            held(&work()),
             fs_types::PathFlags::SYMLINK_FOLLOW,
             path,
             fs_types::OpenFlags::DIRECTORY,
@@ -760,7 +728,7 @@ fn a_link_at_the_base_does_not_lead_out_of_it() {
         assert!(matches!(
             block_on(stat_at(
                 &namespace,
-                &work(),
+                held(&work()),
                 fs_types::PathFlags::SYMLINK_FOLLOW,
                 path
             )),
@@ -775,7 +743,7 @@ fn a_link_at_the_base_does_not_lead_out_of_it() {
     // The parent, whose floor holds both, still follows it.
     let followed = block_on(open_at(
         &namespace,
-        &root(),
+        held(&root()),
         fs_types::PathFlags::SYMLINK_FOLLOW,
         "work",
         fs_types::OpenFlags::DIRECTORY,
@@ -863,14 +831,7 @@ fn a_directory_holding_a_mount_point_is_busy() {
         );
         assert!(
             matches!(
-                block_on(rename_at(
-                    &namespace,
-                    held(&root()),
-                    path,
-                    held(&root()),
-                    "z",
-                    1
-                )),
+                rename(&namespace, &root(), path, &root(), "z"),
                 Err(fs_types::ErrorCode::Busy)
             ),
             "renaming {source} must be refused as busy"
@@ -966,15 +927,17 @@ fn a_read_only_base_renames_nothing_on_the_host_share() {
     mount_unreachable_host(&namespace, "/mnt");
     let (rw, ro) = host_bases();
 
-    let reached =
-        block_on(async { rename_at(&namespace, rw.grant()?, "old", rw.grant()?, "new", 1).await });
+    let reached = rename(&namespace, &rw, "old", &rw, "new");
     assert!(matches!(reached, Err(fs_types::ErrorCode::Unsupported)));
 
-    let from_read_only =
-        block_on(async { rename_at(&namespace, ro.grant()?, "old", rw.grant()?, "new", 1).await });
+    // A source that may be read but not changed, into a destination that
+    // may change but not write: only the source's `mutate-directory` is
+    // missing.
+    let read = fs_types::DescriptorFlags::READ;
+    let no_write = directory_holding("/mnt/a", read | fs_types::DescriptorFlags::MUTATE_DIRECTORY);
+    let from_read_only = rename(&namespace, &ro, "old", &no_write, "new");
     assert!(matches!(from_read_only, Err(fs_types::ErrorCode::ReadOnly)));
-    let into_read_only =
-        block_on(async { rename_at(&namespace, rw.grant()?, "old", ro.grant()?, "new", 1).await });
+    let into_read_only = rename(&namespace, &rw, "old", &ro, "new");
     assert!(matches!(into_read_only, Err(fs_types::ErrorCode::ReadOnly)));
 }
 
@@ -1204,8 +1167,26 @@ fn link(
     destination_path: &str,
 ) -> Result<(), fs_types::ErrorCode> {
     block_on(async {
-        let proof = source.grant()?.link_into(destination.grant()?)?;
+        let proof = source.grant()?.alias_into(destination.grant()?)?;
         link_at(namespace, proof, source_path, destination_path, 1).await
+    })
+}
+
+/// Renames `source_path` below `source` to `destination_path` below
+/// `destination`, minting the proof the way every surface does.
+fn rename(
+    namespace: &TestNamespace,
+    source: &FsDescriptor,
+    source_path: &str,
+    destination: &FsDescriptor,
+    destination_path: &str,
+) -> Result<(), fs_types::ErrorCode> {
+    block_on(async {
+        let proof = source
+            .grant()?
+            .alias_into(destination.grant()?)?
+            .removing_source()?;
+        rename_at(namespace, proof, source_path, destination_path, 1).await
     })
 }
 
@@ -1314,6 +1295,183 @@ fn a_link_needs_mutate_on_its_destination() {
     let refused = link(&namespace, &source, "secret", &destination, "copy");
     assert!(matches!(refused, Err(fs_types::ErrorCode::ReadOnly)));
     assert!(missing(&namespace, "/b/copy"));
+}
+
+/// An in-memory mount at `/mnt` holding `/mnt/a/secret` ([`SECRET`]), a link
+/// `/mnt/a/pointer` to it and an empty `/mnt/b`.
+fn secret_on_a_memory_mount() -> TestNamespace {
+    let namespace = namespace();
+    mount_memory(&namespace, "/mnt");
+    for name in ["mnt/a", "mnt/b"] {
+        block_on(create_directory_at(&namespace, held(&root()), name, 1))
+            .expect("directory creation must succeed");
+    }
+    create_file(&namespace, "mnt/a/secret", SECRET.as_bytes());
+    block_on(symlink_at(
+        &namespace,
+        held(&directory_holding("/mnt/a", root().flags)),
+        "secret",
+        "pointer",
+        1,
+    ))
+    .expect("the link is created");
+    namespace
+}
+
+/// What `stat-at`, `readlink-at`, `open-at` and `metadata-hash-at` (which
+/// is `stat-at`) answer through `base`, as error codes.
+fn lookups_through(
+    namespace: &TestNamespace,
+    base: &FsDescriptor,
+) -> [Result<(), fs_types::ErrorCode>; 3] {
+    let stat = block_on(async {
+        stat_at(
+            namespace,
+            base.grant()?,
+            fs_types::PathFlags::empty(),
+            "secret",
+        )
+        .await
+        .map(drop)
+    });
+    let readlink = block_on(async {
+        readlink_at(namespace, base.grant()?, "pointer")
+            .await
+            .map(drop)
+    });
+    let open = open(
+        namespace,
+        base,
+        "secret",
+        fs_types::OpenFlags::empty(),
+        fs_types::DescriptorFlags::READ,
+    )
+    .map(drop);
+    [stat, readlink, open]
+}
+
+#[test]
+fn a_lookup_needs_the_read_right_on_its_base() {
+    let namespace = secret_on_a_memory_mount();
+    let readable = directory_holding("/mnt/a", fs_types::DescriptorFlags::READ);
+    let unreadable = directory_holding(
+        "/mnt/a",
+        fs_types::DescriptorFlags::WRITE | fs_types::DescriptorFlags::MUTATE_DIRECTORY,
+    );
+
+    // The control: a readable base looks everything up.
+    for answer in lookups_through(&namespace, &readable) {
+        assert!(
+            matches!(answer, Ok(())),
+            "a readable base looks up: {answer:?}"
+        );
+    }
+    for answer in lookups_through(&namespace, &unreadable) {
+        assert!(
+            matches!(answer, Err(fs_types::ErrorCode::NotPermitted)),
+            "a lookup through an unreadable base must be refused, got {answer:?}"
+        );
+    }
+
+    // On a host share the refusal comes before any request: the share
+    // answers every request `unsupported`, so any other code proves none
+    // was made.
+    let host_namespace = namespace_with_host();
+    let (rw, _) = host_bases();
+    for answer in lookups_through(&host_namespace, &rw) {
+        assert!(
+            matches!(answer, Err(fs_types::ErrorCode::Unsupported)),
+            "a readable base reaches the share, got {answer:?}"
+        );
+    }
+    let unreadable = directory_holding(
+        "/mnt/a",
+        fs_types::DescriptorFlags::WRITE | fs_types::DescriptorFlags::MUTATE_DIRECTORY,
+    );
+    for answer in lookups_through(&host_namespace, &unreadable) {
+        assert!(
+            matches!(answer, Err(fs_types::ErrorCode::NotPermitted)),
+            "a lookup through an unreadable base must be refused, got {answer:?}"
+        );
+    }
+}
+
+#[test]
+fn a_rename_needs_the_read_right_on_its_source() {
+    let namespace = secret_on_a_memory_mount();
+    let source = directory_holding(
+        "/mnt/a",
+        fs_types::DescriptorFlags::WRITE | fs_types::DescriptorFlags::MUTATE_DIRECTORY,
+    );
+    let destination = directory_holding("/mnt/b", root().flags);
+
+    let refused = rename(&namespace, &source, "secret", &destination, "moved");
+    assert!(
+        matches!(refused, Err(fs_types::ErrorCode::NotPermitted)),
+        "the rename must be refused, got {refused:?}"
+    );
+    assert!(missing(&namespace, "/mnt/b/moved"));
+    assert!(!missing(&namespace, "/mnt/a/secret"));
+
+    // The same refusal before any request reaches a host share.
+    let host_namespace = namespace_with_host();
+    let (rw, _) = host_bases();
+    let reached = rename(&host_namespace, &rw, "secret", &rw, "moved");
+    assert!(matches!(reached, Err(fs_types::ErrorCode::Unsupported)));
+    let unreadable = directory_holding("/mnt/a", source.flags);
+    let refused = rename(&host_namespace, &unreadable, "secret", &rw, "moved");
+    assert!(
+        matches!(refused, Err(fs_types::ErrorCode::NotPermitted)),
+        "the rename must be refused, got {refused:?}"
+    );
+}
+
+#[test]
+fn a_rename_cannot_make_a_read_only_file_writable() {
+    let namespace = secret_on_a_memory_mount();
+    let read = fs_types::DescriptorFlags::READ;
+    let mutate = fs_types::DescriptorFlags::MUTATE_DIRECTORY;
+    let read_only = directory_holding("/mnt/a", read | mutate);
+    let read_write = directory_holding("/mnt/b", root().flags);
+
+    let refused = rename(&namespace, &read_only, "secret", &read_write, "moved");
+    assert!(
+        matches!(refused, Err(fs_types::ErrorCode::NotPermitted)),
+        "the rename must be refused, got {refused:?}"
+    );
+    assert!(missing(&namespace, "/mnt/b/moved"));
+    assert!(!missing(&namespace, "/mnt/a/secret"));
+
+    // The same refusal before any request reaches a host share.
+    let host_namespace = namespace_with_host();
+    let refused = rename(
+        &host_namespace,
+        &directory_holding("/mnt/a", read | mutate),
+        "secret",
+        &directory_holding("/mnt/b", root().flags),
+        "moved",
+    );
+    assert!(
+        matches!(refused, Err(fs_types::ErrorCode::NotPermitted)),
+        "the rename must be refused, got {refused:?}"
+    );
+
+    // Bases of equal rights still rename, and so does a destination that
+    // cannot write.
+    let writable = directory_holding("/mnt/a", root().flags);
+    rename(&namespace, &writable, "secret", &read_write, "moved").expect("equal rights rename");
+    let no_write = directory_holding("/mnt/a", read | mutate);
+    rename(&namespace, &read_write, "moved", &no_write, "back").expect("a no-write destination");
+    assert!(missing(&namespace, "/mnt/b/moved"));
+    let back = open(
+        &namespace,
+        &root(),
+        "mnt/a/back",
+        fs_types::OpenFlags::empty(),
+        read,
+    )
+    .expect("the file arrives");
+    assert_eq!(read_all(&namespace, &back), SECRET.as_bytes());
 }
 
 fn namespace_with_host() -> TestNamespace {

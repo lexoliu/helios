@@ -1049,11 +1049,11 @@ where
             p1_null_device_stat(),
         );
     }
-    let follow = wasi_fs::follow_within(&base, p1_path_flags(flags));
-    let (identity, stat_value) = match p1_stat_absolute_path(caller, &absolute, follow).await {
-        Ok(stat) => stat,
-        Err(errno) => return errno,
-    };
+    let (identity, stat_value) =
+        match p1_stat_below(caller, &base, p1_path_flags(flags), &path).await {
+            Ok(stat) => stat,
+            Err(errno) => return errno,
+        };
     p1_write_filestat(caller, stat, identity, stat_value)
 }
 
