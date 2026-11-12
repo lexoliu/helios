@@ -17,7 +17,7 @@ pub enum ProgramExecErrorKind {
     InvalidPath,
     #[error("the requested operation is not allowed by process authority")]
     PermissionDenied,
-    #[error("the requested AOT hint is invalid for this input")]
+    #[error("the requested AOT hint is unsupported, or invalid for this input")]
     InvalidHint,
     #[error("the program exhausted its memory budget")]
     OutOfMemory,
@@ -161,6 +161,8 @@ pub enum ProgramExecErrorDetail {
     ChildExitAlreadyConsumed,
     #[error("compile hint is not allowed for precompiled artifacts")]
     HintNotAllowedForPrecompiledArtifact,
+    #[error("the fast AOT hint is not supported")]
+    UnsupportedAotHint,
     #[error("artifact payload is missing")]
     MissingArtifactPayload,
     #[error("artifact is not executable by the selected runtime")]
@@ -245,6 +247,7 @@ impl ProgramExecErrorDetail {
             Self::HintNotAllowedForPrecompiledArtifact => {
                 "compile hint is not allowed for precompiled artifacts"
             }
+            Self::UnsupportedAotHint => "the fast AOT hint is not supported",
             Self::MissingArtifactPayload => "artifact payload is missing",
             Self::InvalidRuntimeArtifact => "artifact is not executable by the selected runtime",
             Self::InvalidEntryPoint => "program entry point is missing or has an invalid type",

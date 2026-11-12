@@ -104,14 +104,14 @@
     (local $diagnostic i32)
     (local $response i32)
     ;; The host adopted the TLS block and initialised the thread pointer
-    ;; from it, and sent a version-2 header of the declared length.
+    ;; from it, and sent a version-3 header of the declared length.
     (if (i32.or
           (i32.ne (i32.load (i32.const 8)) (i32.add (global.get $tls_base) (i32.const 16)))
           (i32.or
             (i32.ne (local.get $request_len) (i32.const 28))
-            (i32.ne (i32.load (local.get $request)) (i32.const 2))))
+            (i32.ne (i32.load (local.get $request)) (i32.const 3))))
       (then
-        (return (call $respond (i32.const 2) (i32.const 1) (i32.const 0)
+        (return (call $respond (i32.const 3) (i32.const 1) (i32.const 0)
           (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)))))
     (local.set $hint (i32.load offset=4 (local.get $request)))
     (local.set $wasm (i32.load offset=8 (local.get $request)))
@@ -124,7 +124,7 @@
         ;; "empt" little-endian, then "y".
         (i32.store (local.get $diagnostic) (i32.const 0x74706d65))
         (i32.store8 offset=4 (local.get $diagnostic) (i32.const 0x79))
-        (return (call $respond (i32.const 2) (i32.const 3) (i32.const 0)
+        (return (call $respond (i32.const 3) (i32.const 3) (i32.const 0)
           (i32.const 0) (i32.const 0) (local.get $diagnostic) (i32.const 5)))))
     (local.set $first (i32.load8_u (local.get $wasm)))
     (if (i32.eq (local.get $first) (i32.const 2))
@@ -136,18 +136,18 @@
         (return (local.get $response))))
     (if (i32.eq (local.get $first) (i32.const 3))
       (then
-        (return (call $respond (i32.const 2) (i32.const 77) (i32.const 0)
+        (return (call $respond (i32.const 3) (i32.const 77) (i32.const 0)
           (call $alloc (i32.const 3) (i32.const 1)) (i32.const 3)
           (i32.const 0) (i32.const 0)))))
     (if (i32.eq (local.get $first) (i32.const 4))
       (then
-        (return (call $respond (i32.const 2) (i32.const 0) (i32.const 55)
+        (return (call $respond (i32.const 3) (i32.const 0) (i32.const 55)
           (call $alloc (i32.const 3) (i32.const 1)) (i32.const 3)
           (i32.const 0) (i32.const 0)))))
     (i32.atomic.store (i32.const 12) (i32.const 0))
     (if (i32.lt_s (call $spawn (i32.eq (local.get $first) (i32.const 1))) (i32.const 0))
       (then
-        (return (call $respond (i32.const 2) (i32.const 3) (i32.const 0)
+        (return (call $respond (i32.const 3) (i32.const 3) (i32.const 0)
           (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)))))
     ;; A thread told to trap never raises the flag, so only a healthy
     ;; one is waited for.
@@ -178,7 +178,7 @@
       (local.get $wasm)
       (local.get $wasm_len))
     (local.set $response
-      (call $respond (i32.const 2) (i32.const 0) (i32.const 0)
+      (call $respond (i32.const 3) (i32.const 0) (i32.const 0)
         (local.get $output) (local.get $output_len) (i32.const 0) (i32.const 0)))
     (if (i32.eq (local.get $first) (i32.const 5))
       (then (call $count (i32.const 7))))

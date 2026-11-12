@@ -56,9 +56,11 @@
 
 use thiserror::Error;
 
-/// Version 2 carries `hint`, `status` and `output_kind` as plain `u32` and
-/// states the ownership and layout contract above.
-pub const HELIOS_COMPILER_ABI_VERSION: u32 = 2;
+/// Version 3 carries `hint`, `status` and `output_kind` as plain `u32`,
+/// states the ownership and layout contract above, and retires hint value 0:
+/// the plugin compiles with Cranelift only, so `Balanced` and `Performance`
+/// are the only hints, and 0 is an [`UnknownDiscriminant`] like any other.
+pub const HELIOS_COMPILER_ABI_VERSION: u32 = 3;
 
 pub const HELIOS_COMPILER_ALLOC: &str = "helios_compiler_alloc";
 pub const HELIOS_COMPILER_FREE: &str = "helios_compiler_free";
@@ -79,7 +81,6 @@ pub struct UnknownDiscriminant {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompileHint {
-    Fast,
     Balanced,
     Performance,
 }
@@ -87,7 +88,6 @@ pub enum CompileHint {
 impl From<CompileHint> for u32 {
     fn from(hint: CompileHint) -> Self {
         match hint {
-            CompileHint::Fast => 0,
             CompileHint::Balanced => 1,
             CompileHint::Performance => 2,
         }
@@ -99,7 +99,6 @@ impl TryFrom<u32> for CompileHint {
 
     fn try_from(value: u32) -> Result<Self, Self::Error> {
         match value {
-            0 => Ok(Self::Fast),
             1 => Ok(Self::Balanced),
             2 => Ok(Self::Performance),
             value => Err(UnknownDiscriminant {
@@ -265,13 +264,22 @@ mod tests {
 
     #[test]
     fn hint_round_trips() {
-        for hint in [
-            CompileHint::Fast,
-            CompileHint::Balanced,
-            CompileHint::Performance,
-        ] {
+        for hint in [CompileHint::Balanced, CompileHint::Performance] {
             assert_eq!(CompileHint::try_from(u32::from(hint)), Ok(hint));
         }
+    }
+
+    /// Value 0 was the `Fast` hint; it decodes to the error any unknown value
+    /// does.
+    #[test]
+    fn the_retired_fast_hint_value_is_refused() {
+        assert_eq!(
+            CompileHint::try_from(0),
+            Err(UnknownDiscriminant {
+                field: "hint",
+                value: 0
+            })
+        );
     }
 
     #[test]
@@ -338,7 +346,7 @@ mod tests {
             flags: HELIOS_COMPILER_REQUEST_PROFILE,
         };
         let bytes = header.to_bytes();
-        assert_eq!(&bytes[..4], &2_u32.to_le_bytes());
+        assert_eq!(&bytes[..4], &3_u32.to_le_bytes());
         assert_eq!(&bytes[4..8], &1_u32.to_le_bytes());
         assert_eq!(CompilerRequestHeader::from_bytes(&bytes), header);
     }

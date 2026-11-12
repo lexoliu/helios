@@ -142,7 +142,6 @@ unsafe fn read_request<'a>(
     let target = core::str::from_utf8(target)
         .map_err(|error| format!("compiler target triple is not UTF-8: {error}"))?;
     let hint = match CompileHint::try_from(header.hint).map_err(|error| error.to_string())? {
-        CompileHint::Fast => AotCompileHint::Fast,
         CompileHint::Balanced => AotCompileHint::Balanced,
         CompileHint::Performance => AotCompileHint::Performance,
     };

@@ -2236,7 +2236,6 @@ where
         let header = CompilerRequestHeader {
             abi_version: HELIOS_COMPILER_ABI_VERSION,
             hint: u32::from(match hint {
-                AotCompileHint::Fast => CompilerAbiHint::Fast,
                 AotCompileHint::Balanced => CompilerAbiHint::Balanced,
                 AotCompileHint::Performance => CompilerAbiHint::Performance,
             }),

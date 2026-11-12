@@ -36,7 +36,7 @@ fn compile_all(
 
 /// What the stand-in answers a well-formed request with.
 fn echoed(workers: u32, input: &[u8]) -> Vec<u8> {
-    let mut expected = (CompileHint::Performance as u32).to_le_bytes().to_vec();
+    let mut expected = u32::from(CompileHint::Performance).to_le_bytes().to_vec();
     expected.extend_from_slice(format!("RAYON_NUM_THREADS={workers}\0").as_bytes());
     expected.extend_from_slice(TARGET.as_bytes());
     expected.extend_from_slice(input);
@@ -80,7 +80,7 @@ fn a_response_in_another_abi_version_is_refused() {
         compile_all(stand_in(), workers(2), vec![vec![2]]).expect("the stand-in is hosted");
     match results.into_iter().next().expect("one result") {
         Err(CompilerHostError::AbiMismatch { found, expected }) => {
-            assert_eq!((found, expected), (99, 2));
+            assert_eq!((found, expected), (99, 3));
         }
         other => panic!("expected an ABI mismatch, got {other:?}"),
     }

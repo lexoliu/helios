@@ -696,7 +696,6 @@ enum Commands {
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Hint {
-    Fast,
     Balanced,
     Performance,
 }
@@ -704,7 +703,6 @@ enum Hint {
 impl From<Hint> for AotCompileHint {
     fn from(value: Hint) -> Self {
         match value {
-            Hint::Fast => Self::Fast,
             Hint::Balanced => Self::Balanced,
             Hint::Performance => Self::Performance,
         }
