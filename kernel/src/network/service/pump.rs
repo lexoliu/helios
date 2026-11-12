@@ -640,6 +640,30 @@ impl NetworkShard {
                     last_sent: now,
                 };
             }
+            DhcpClientState::Rebooting {
+                transaction_id,
+                requested_ip,
+                attempts,
+                last_sent,
+            } if now.nanos().saturating_sub(last_sent.nanos()) >= DHCP_RETRANSMIT_NANOS => {
+                if attempts >= DHCP_REBOOT_ATTEMPTS {
+                    // Nobody on this link confirmed the lease, so it
+                    // cannot be assumed good: configuration starts over
+                    // exactly as a NAK would start it.
+                    self.stack.clear_ipv4_addresses();
+                    self.dhcp = DhcpClientState::Init {
+                        transaction_id: next_transaction_id(transaction_id),
+                    };
+                } else {
+                    self.send_dhcp_init_reboot(transaction_id, requested_ip, now)?;
+                    self.dhcp = DhcpClientState::Rebooting {
+                        transaction_id,
+                        requested_ip,
+                        attempts: attempts + 1,
+                        last_sent: now,
+                    };
+                }
+            }
             _ => {}
         }
         Ok(())

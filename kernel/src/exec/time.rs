@@ -1,8 +1,74 @@
+use core::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+
 use helios_hal::cpu::{Cpu, Timebase};
 use helios_hal::rtc::UnixSeconds;
 
 use crate::{ComponentRuntimeState, SetWallClockCap};
 
+/// The machine's wall-clock offset: nanoseconds between the monotonic
+/// clock and the Unix epoch.
+///
+/// # Concurrency contract
+///
+/// Lock-free. There is one writer at a time: the backend while it brings
+/// the machine up ([`Self::seed`]), and afterwards the machine-generation
+/// reactions task ([`Self::reseed`]). Readers, any processor and any
+/// context, do one `Acquire` load of the offset and never see a torn or
+/// half-published value. A reader that races a reseed sees the old offset
+/// or the new one.
+///
+/// The offset is signed because the kernel's monotonic clock starts at
+/// zero on a machine whose real-time clock was never set, which puts wall
+/// time behind uptime. It is 64 bits wide, which carries a calendar until
+/// the year 2262; a reading beyond that panics where it is taken.
+#[derive(Debug, Default)]
+pub struct WallClock {
+    offset_nanos: AtomicI64,
+    seeded: AtomicBool,
+}
+
+impl WallClock {
+    /// An unseeded clock, whose wall time is uptime.
+    pub const fn new() -> Self {
+        Self {
+            offset_nanos: AtomicI64::new(0),
+            seeded: AtomicBool::new(false),
+        }
+    }
+
+    /// The offset as of now, zero until a real-time clock has seeded it.
+    pub fn offset_nanos(&self) -> i64 {
+        self.offset_nanos.load(Ordering::Acquire)
+    }
+
+    /// Places the clock for the first time, at bring-up.
+    ///
+    /// Panics when it was already seeded: a second seed at boot is a
+    /// bring-up fault, and a later one belongs to [`Self::reseed`].
+    pub fn seed(&self, offset_nanos: i64) {
+        assert!(
+            !self.seeded.swap(true, Ordering::AcqRel),
+            "the wall clock was seeded more than once"
+        );
+        self.offset_nanos.store(offset_nanos, Ordering::Release);
+    }
+
+    /// Replaces the offset after the machine's calendar moved under the
+    /// kernel, as a restore does.
+    pub fn reseed(&self, offset_nanos: i64) {
+        self.seeded.store(true, Ordering::Release);
+        self.offset_nanos.store(offset_nanos, Ordering::Release);
+    }
+}
+
+/// A store's view of wall time.
+///
+/// Monotonic time and the machine's wall-clock offset are read live from
+/// the runtime state on every call, so a store opened before the machine
+/// was restored follows the calendar the restore re-read. What the store
+/// keeps for itself is only the adjustment a program holding
+/// [`SetWallClockCap`] made, which is local to the store and survives a
+/// reseed of the machine's offset.
 pub struct KernelClock<CpuImpl, RuntimeStateImpl>
 where
     CpuImpl: Cpu + Clone,
@@ -10,7 +76,11 @@ where
 {
     cpu: CpuImpl,
     runtime_state: RuntimeStateImpl,
-    wall_clock_offset_nanos: i128,
+    /// Nanoseconds this store adds on top of the machine's wall clock.
+    /// Zero unless a [`SetWallClockCap`] holder set the time. Wider than
+    /// the machine offset because a program chooses the time it sets, and
+    /// any `u64` of nanoseconds has to be representable.
+    local_adjust_nanos: i128,
 }
 
 impl<CpuImpl, RuntimeStateImpl> KernelClock<CpuImpl, RuntimeStateImpl>
@@ -18,19 +88,15 @@ where
     CpuImpl: Cpu + Clone,
     RuntimeStateImpl: ComponentRuntimeState,
 {
-    /// Opens a clock on the wall time the platform's real-time clock
-    /// set at boot.
+    /// Opens a clock on the machine's wall time.
     ///
-    /// The offset is taken from the runtime state rather than recomputed
-    /// here, so every store the kernel opens agrees on what the calendar
-    /// reads. A machine whose kernel found no real-time clock carries a
-    /// zero offset, and wall time there is uptime.
+    /// A machine whose kernel found no real-time clock carries a zero
+    /// offset, and wall time there is uptime.
     pub fn new(cpu: CpuImpl, runtime_state: RuntimeStateImpl) -> Self {
-        let wall_clock_offset_nanos = runtime_state.wall_clock_offset_nanos();
         Self {
             cpu,
             runtime_state,
-            wall_clock_offset_nanos,
+            local_adjust_nanos: 0,
         }
     }
 
@@ -39,7 +105,9 @@ where
     }
 
     pub fn system_time_nanos(&self) -> u64 {
-        let value = i128::from(self.monotonic_nanos()) + self.wall_clock_offset_nanos;
+        let value = i128::from(self.monotonic_nanos())
+            + self.runtime_state.wall_clock_offset_nanos()
+            + self.local_adjust_nanos;
         if value <= 0 {
             0
         } else {
@@ -48,7 +116,10 @@ where
     }
 
     pub fn set_system_time_nanos(&mut self, _: &SetWallClockCap, nanos: u64) {
-        self.wall_clock_offset_nanos = i128::from(nanos) - i128::from(self.monotonic_nanos());
+        let adjust = i128::from(nanos)
+            - i128::from(self.monotonic_nanos())
+            - self.runtime_state.wall_clock_offset_nanos();
+        self.local_adjust_nanos = adjust;
     }
 }
 
@@ -191,20 +262,25 @@ mod tests {
     /// clock.
     #[derive(Clone)]
     struct TestRuntimeState {
-        wall_clock_offset_nanos: i128,
+        wall_clock: alloc::sync::Arc<WallClock>,
     }
 
     impl TestRuntimeState {
-        const fn unseeded() -> Self {
+        fn unseeded() -> Self {
             Self {
-                wall_clock_offset_nanos: 0,
+                wall_clock: alloc::sync::Arc::new(WallClock::new()),
             }
         }
 
-        const fn seeded(wall_clock_offset_nanos: i128) -> Self {
-            Self {
-                wall_clock_offset_nanos,
-            }
+        fn seeded(wall_clock_offset_nanos: i64) -> Self {
+            let state = Self::unseeded();
+            state.wall_clock.seed(wall_clock_offset_nanos);
+            state
+        }
+
+        /// What a restore does to the machine's offset.
+        fn reseed(&self, wall_clock_offset_nanos: i64) {
+            self.wall_clock.reseed(wall_clock_offset_nanos);
         }
     }
 
@@ -214,7 +290,7 @@ mod tests {
         }
 
         fn wall_clock_offset_nanos(&self) -> i128 {
-            self.wall_clock_offset_nanos
+            i128::from(self.wall_clock.offset_nanos())
         }
 
         fn record_console_text(&self, _: u64, _: &str) {}
@@ -327,7 +403,10 @@ mod tests {
         static TICKS: AtomicU64 = AtomicU64::new(BOOT_MONOTONIC_NANOS);
         TICKS.store(BOOT_MONOTONIC_NANOS, Ordering::Release);
         let cpu = TestCpu::new(&TICKS);
-        let clock = KernelClock::new(cpu.clone(), TestRuntimeState::seeded(offset));
+        let clock = KernelClock::new(
+            cpu.clone(),
+            TestRuntimeState::seeded(i64::try_from(offset).expect("a test offset fits in i64")),
+        );
         assert_eq!(clock.system_time_nanos(), wall.as_nanos() as u64);
 
         // Wall time then advances exactly as the monotonic clock does.
@@ -336,6 +415,55 @@ mod tests {
             clock.system_time_nanos(),
             wall.as_nanos() as u64 + 5_000_000_000
         );
+    }
+
+    #[test]
+    fn a_store_opened_before_a_restore_follows_the_machine_offset_after_it() {
+        static TICKS: AtomicU64 = AtomicU64::new(4_000_000_000);
+        TICKS.store(4_000_000_000, Ordering::Release);
+        let cpu = TestCpu::new(&TICKS);
+        let state = TestRuntimeState::seeded(1_000_000_000_000);
+        let clock = KernelClock::new(cpu, state.clone());
+        assert_eq!(clock.system_time_nanos(), 1_004_000_000_000);
+
+        // The machine was stopped for a day; the real-time clock says so.
+        const DAY_NANOS: i64 = 86_400_000_000_000;
+        state.reseed(1_000_000_000_000 + DAY_NANOS);
+        assert_eq!(
+            clock.system_time_nanos(),
+            1_004_000_000_000 + DAY_NANOS as u64,
+            "an existing store jumps to the new real-time clock reading"
+        );
+    }
+
+    #[test]
+    fn a_store_local_wall_clock_adjustment_survives_a_reseed() {
+        static TICKS: AtomicU64 = AtomicU64::new(5);
+        TICKS.store(5, Ordering::Release);
+        let cpu = TestCpu::new(&TICKS);
+        let state = TestRuntimeState::seeded(1_000);
+        let mut clock = KernelClock::new(cpu.clone(), state.clone());
+        let mut other = KernelClock::new(cpu, state.clone());
+        let mut authority = crate::ProcessAuthority::empty();
+        authority.grant_clock_rights(ClockAuthorityRights::SET_WALL_CLOCK);
+        let cap = authority
+            .derive_set_wall_clock_cap()
+            .expect("root clock authority should derive set-wall-clock cap");
+
+        // The program sets its store 500 ns ahead of the machine.
+        clock.set_system_time_nanos(&cap, 1_005 + 500);
+        assert_eq!(clock.system_time_nanos(), 1_505);
+        assert_eq!(other.system_time_nanos(), 1_005, "other stores are unmoved");
+
+        state.reseed(9_000);
+        assert_eq!(
+            clock.system_time_nanos(),
+            9_005 + 500,
+            "the adjustment rides on the new machine offset"
+        );
+        assert_eq!(other.system_time_nanos(), 9_005);
+        other.set_system_time_nanos(&cap, u64::MAX);
+        assert_eq!(other.system_time_nanos(), u64::MAX);
     }
 
     #[test]
@@ -360,7 +488,10 @@ mod tests {
         static TICKS: AtomicU64 = AtomicU64::new(1_000_000_000);
         TICKS.store(1_000_000_000, Ordering::Release);
         let cpu = TestCpu::new(&TICKS);
-        let clock = KernelClock::new(cpu.clone(), TestRuntimeState::seeded(offset));
+        let clock = KernelClock::new(
+            cpu.clone(),
+            TestRuntimeState::seeded(i64::try_from(offset).expect("a test offset fits in i64")),
+        );
         assert_eq!(clock.system_time_nanos(), 0);
         cpu.set_ticks(5_000_000_000);
         assert_eq!(clock.system_time_nanos(), 2_000_000_000);
