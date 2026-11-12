@@ -433,19 +433,32 @@ not use natively:
 Requests are pipelined: each queue keeps up to 128 chains in flight, each
 with its own `InFlight` slot, and a submitter that finds the ring full
 drains what the device published and parks on the device notification
-rather than failing. Transfers longer than `SEG_MAX × SIZE_MAX` are split
-into whole-block requests, and every read checks the used length against
-what it asked for.
+rather than failing. A request may be scattered across several of the
+caller's buffers (`read_vectored`, `write_vectored`), one segment each up
+to `SIZE_MAX`; transfers longer than `SEG_MAX × SIZE_MAX`, or than the
+chain bound the driver reports as `max_segments`, are split into
+whole-block requests, and every read checks the used length against what
+it asked for.
 
-`VIRTIO_BLK_T_GET_ID` is what tells two disks apart. A VM hands the guest
-both the image its firmware booted from and the scratch disk the kernel
-owns, on the same bus and in an order nothing guarantees, so the kernel
-identifies its disk by the serial the inspector gives it —
-`helios-data` — and leaves every other disk untouched. The chosen disk is
-then proved before anything depends on it: a random 4 KiB pattern goes to
-its last blocks, is committed with a flush, read back and compared, and
-released with write-zeroes. A mismatch is a fatal boot error, and the
-result is visible in the boot log:
+`VIRTIO_BLK_T_GET_ID` is what tells disks apart. A VM hands the guest the
+image its firmware booted from, the scratch disk the kernel owns and any
+images it may mount, on the same bus and in an order nothing guarantees,
+so the kernel gives each disk a role by the serial it reports
+(`kernel/src/io/block/`):
+
+- `helios-data` is the scratch disk, the kernel's own, which backs swap;
+- any other serial names a mount source, which the kernel puts behind its
+  block cache, handed back to the backend typed as its device, where the
+  mount layer finds it by serial;
+- a disk with no serial — the boot image — is left untouched.
+
+A backend routes interrupts for at most `MAX_BLOCK_DEVICES` disks;
+`admit_block_devices` refuses the rest by name before they are brought up.
+
+The scratch disk is proved before anything depends on it: a random 4 KiB
+pattern goes to its last blocks, is committed with a flush, read back and
+compared, and released with write-zeroes. A mismatch is a fatal boot
+error, and the result is visible in the boot log:
 
 ```
 virtio-blk configured capacity_blocks=524288 block_bytes=512 queues=1 queue_depth=128
@@ -460,6 +473,34 @@ with `serial=helios-data`, backed by a `data.img` in the VM's runtime
 directory whose size `--data-disk-size` controls. `helios-inspector
 stats` shows the device the guest kernel ended up with, its geometry, its
 queues and the requests the kernel has issued.
+
+`--disk <image>,serial=<name>[,readonly]`, repeatable, attaches a raw
+image beside it on the same transport, with `readonly` passed to QEMU as
+`readonly=on` so the device negotiates `VIRTIO_BLK_F_RO`. The serial is
+at most 20 bytes, the length a virtio-blk identifier carries, and may not
+be `helios-data` or repeat another disk's. The guest logs each one as a
+`mount source online` line with its serial and size in cache blocks.
+
+The block cache in front of the mount sources reads and writes 4 KiB
+blocks. The task that needs a block issues the request itself, on its own
+processor's queue. A miss reads the device's optimal transfer
+(`opt_io_size`) ahead in the same scattered request, bounded by the
+segments one request carries and by Linux's 128 KiB default readahead
+window whatever the device claims, and contiguous dirty blocks are written
+back as one request. Write-back follows the order a filesystem's commit
+needs: blocks dirtied before a commit, a flush, the commit block, a flush;
+a commit that fails or is abandoned aborts the disk, which then refuses
+every write. Under yellow memory pressure its coldest blocks are
+compressed with zstd into the kernel's compressed page pool
+(`kernel/src/memory/compressed.rs`, bounded at 20% of memory as zswap
+is), so a later hit costs a decompression instead of a device read; a
+block that compresses to 88.5% of a page or more — the size zram calls
+incompressible — skips the pool and is dropped, written back first when
+dirty. A full pool evicts its coldest pages to make room, dropping clean
+ones and writing dirty ones back. Under red pressure every block nobody
+holds leaves the cache, dirty ones once written. Dirty blocks always
+reach the disk uncompressed. Its concurrency contract and the prior art
+it follows are in `kernel/src/io/block/cache.rs`.
 
 ## Confined DMA: virtio-iommu and `VIRTIO_F_ACCESS_PLATFORM`
 
