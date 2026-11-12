@@ -110,6 +110,10 @@ pub enum KillReason {
     /// The request the instance exists to serve was abandoned by its
     /// requester, so nothing is waiting for what it computes.
     RequesterGone,
+    /// A store of the instance failed, and the instance's other stores
+    /// cannot go on without it: the instance is one computation spread over
+    /// several stores, and a trap on one tells the others nothing.
+    StoreFailed,
 }
 
 /// What came of a request to stop an instance.
@@ -129,6 +133,7 @@ const KILL_FLAG_OOM: u8 = 1;
 const KILL_FLAG_SUPERVISOR: u8 = 2;
 const KILL_FLAG_OPERATOR: u8 = 3;
 const KILL_FLAG_REQUESTER_GONE: u8 = 4;
+const KILL_FLAG_STORE_FAILED: u8 = 5;
 
 const fn encode_kill_reason(reason: KillReason) -> u8 {
     match reason {
@@ -136,6 +141,7 @@ const fn encode_kill_reason(reason: KillReason) -> u8 {
         KillReason::SupervisorRestart => KILL_FLAG_SUPERVISOR,
         KillReason::Operator => KILL_FLAG_OPERATOR,
         KillReason::RequesterGone => KILL_FLAG_REQUESTER_GONE,
+        KillReason::StoreFailed => KILL_FLAG_STORE_FAILED,
     }
 }
 
@@ -145,6 +151,7 @@ const fn decode_kill_flag(value: u8) -> Option<KillReason> {
         KILL_FLAG_SUPERVISOR => Some(KillReason::SupervisorRestart),
         KILL_FLAG_OPERATOR => Some(KillReason::Operator),
         KILL_FLAG_REQUESTER_GONE => Some(KillReason::RequesterGone),
+        KILL_FLAG_STORE_FAILED => Some(KillReason::StoreFailed),
         _ => None,
     }
 }
