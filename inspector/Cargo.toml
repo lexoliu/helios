@@ -10,7 +10,6 @@ addr2line = { version = "0.26.1", default-features = false, features = ["std"] }
 askama = "0.15.6"
 async-channel = "2.5.0"
 async-io = "2.6.0"
-async-net = "2.0.0"
 async-signal = "0.2.13"
 # Runs the blocking QMP capture of a wedged guest off the executor thread.
 blocking = "1.7.0"

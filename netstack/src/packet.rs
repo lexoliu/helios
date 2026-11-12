@@ -734,7 +734,7 @@ impl<'a> TcpOptions<'a> {
                             options.sack_permitted = true;
                         }
                         5 if data.len().is_multiple_of(8) => {
-                            for block in data.chunks_exact(8) {
+                            for block in data.as_chunks::<8>().0 {
                                 options
                                     .sack_blocks
                                     .push(TcpSackBlock {
@@ -1188,8 +1188,10 @@ pub struct NdpRecursiveDnsServers<'a> {
 impl<'a> NdpRecursiveDnsServers<'a> {
     pub fn addresses(self) -> impl Iterator<Item = Ipv6Address> + 'a {
         self.addresses
-            .chunks_exact(16)
-            .map(|chunk| Ipv6Address::new(chunk.try_into().expect("16-byte chunk")))
+            .as_chunks::<16>()
+            .0
+            .iter()
+            .map(|&chunk| Ipv6Address::new(chunk))
     }
 }
 
