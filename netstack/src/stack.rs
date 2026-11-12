@@ -37,6 +37,10 @@ pub const MAX_UDP_RX: usize = 64;
 /// unsolicited ones the link delivers. The oldest is evicted once the
 /// buffer fills.
 pub const MAX_ICMP_ECHO_REPLIES: usize = 8;
+/// Echo requests remembered until answered, so an ICMP error quoting one
+/// can be told from a forgery: as many exchanges as replies are banked
+/// for. The oldest is forgotten once the table fills.
+const MAX_ICMP_ECHO_REQUESTS: usize = MAX_ICMP_ECHO_REPLIES;
 pub const MAX_UDP_SOCKETS: usize = 256;
 pub const MAX_IPV4_MULTICAST_MEMBERSHIPS: usize = 64;
 pub const MAX_PATH_MTU_ENTRIES: usize = 128;
@@ -106,6 +110,10 @@ pub struct StackConfig {
     pub mtu: usize,
     pub rx_budget: usize,
     pub rx_checksum_offload: RxChecksumOffload,
+    /// The per-boot key of the initial sequence number function
+    /// (RFC 6528). The embedding kernel draws it once and gives every
+    /// stack the same value.
+    pub isn_secret: crate::IsnSecret,
     /// Seed TCP/UDP transmit checksums with the pseudo-header sum and
     /// let the device finish them; enabled by the embedding kernel only
     /// when the interface negotiated transmit checksum offload.
@@ -235,7 +243,7 @@ pub struct RxChecksumOffload {
 }
 
 impl StackConfig {
-    pub const fn new(mac: EthernetAddress, mtu: usize) -> Self {
+    pub const fn new(mac: EthernetAddress, mtu: usize, isn_secret: crate::IsnSecret) -> Self {
         assert!(
             mtu >= MINIMUM_INTERFACE_FRAME_MTU,
             "MTU must hold a minimum IPv4 packet"
@@ -245,6 +253,7 @@ impl StackConfig {
             mtu,
             rx_budget: DEFAULT_POLL_BUDGET,
             rx_checksum_offload: RxChecksumOffload::none(),
+            isn_secret,
             tx_checksum_offload: false,
             direct_tx_dma: false,
             segmentation: SegmentationOffload::none(),
@@ -354,6 +363,14 @@ pub struct IcmpEchoKey {
     pub destination: IpAddress,
     pub identifier: u16,
     pub sequence: u16,
+}
+
+/// An echo request this stack put on the wire and has not seen answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct IcmpEchoRequest {
+    path: PathMtuKey,
+    identifier: u16,
+    sequence: u16,
 }
 
 /// A received echo reply, held until the waiter for its key claims it.
@@ -2381,6 +2398,10 @@ where
     /// first. ICMP frames carry no port, so every one of them lands on
     /// shard 0 and this buffer belongs to that shard alone.
     icmp_echo_replies: ArrayVec<IcmpEchoReply, MAX_ICMP_ECHO_REPLIES>,
+    /// Echo requests sent from this shard and not yet answered, oldest
+    /// first, held so a path-MTU error quoting one can be believed
+    /// (RFC 5927 section 4.1).
+    icmp_echo_requests: ArrayVec<IcmpEchoRequest, MAX_ICMP_ECHO_REQUESTS>,
     udp_rx_counts: [u8; MAX_UDP_SOCKETS],
     tcp_accept: Deque<TcpQueuedAccept, MAX_TCP_ACCEPT>,
     tcp_listener_queues: TcpListenerQueues,
@@ -2797,6 +2818,7 @@ where
             udp: UdpSocketSlab::new(),
             udp_rx: Deque::new(),
             icmp_echo_replies: ArrayVec::new(),
+            icmp_echo_requests: ArrayVec::new(),
             udp_rx_counts: [0; MAX_UDP_SOCKETS],
             tcp_accept: Deque::new(),
             tcp_listener_queues: TcpListenerQueues::new(),
@@ -3645,6 +3667,20 @@ where
         self.udp.take_pending_error(socket)
     }
 
+    /// The initial send sequence number for a connection between `local`
+    /// and `remote` opened at `now` (RFC 6528).
+    ///
+    /// An active open takes its `initial_sequence` from here, and a
+    /// passive open takes the same value for the same four-tuple.
+    pub fn tcp_initial_sequence(
+        &self,
+        local: TcpEndpoint,
+        remote: TcpEndpoint,
+        now: StackInstant,
+    ) -> u32 {
+        crate::initial_sequence_number(&self.config.isn_secret, local, remote, now)
+    }
+
     pub fn open_tcp_connect(
         &mut self,
         local: TcpEndpoint,
@@ -3652,6 +3688,7 @@ where
         initial_sequence: u32,
     ) -> Result<SocketId, StackError> {
         self.ensure_tcp_connect_unique(local, remote)?;
+        self.ensure_tcp_slot_free()?;
         let socket = TcpSocket::connect(local, remote, initial_sequence, self.congestion.clone());
         Ok(self.insert_tcp(socket))
     }
@@ -3665,6 +3702,7 @@ where
         if backlog.capacity() > MAX_TCP_ACCEPT {
             return Err(StackError::InvalidListenBacklog);
         }
+        self.ensure_tcp_slot_free()?;
         let socket = TcpSocket::listen(local, self.congestion.clone());
         let socket = self.insert_tcp(socket);
         self.tcp_listener_queues.insert(socket, backlog);
@@ -4407,13 +4445,14 @@ where
         let icmp_len = Icmpv4Packet::HEADER_LEN
             .checked_add(payload.len())
             .ok_or(StackError::PacketTooLarge)?;
+        let path = PathMtuKey::new(IpAddress::Ipv4(source), IpAddress::Ipv4(destination));
         self.ensure_path_packet_fits(
-            PathMtuKey::new(IpAddress::Ipv4(source), IpAddress::Ipv4(destination)),
+            path,
             EthernetFrame::HEADER_LEN + Ipv4Packet::MIN_HEADER_LEN,
             icmp_len,
         )?;
         let local_mac = self.config.mac;
-        self.queue_outbound_frame(|frame| {
+        let sent = self.queue_outbound_frame(|frame| {
             let storage = frame.storage_mut();
             let mut offset = EthernetFrame::encode_header(
                 storage,
@@ -4441,7 +4480,13 @@ where
             .ok_or(StackError::OutputQueueFull)?;
             frame.set_len(offset);
             Ok(payload.len())
-        })
+        })?;
+        self.record_icmp_echo_request(IcmpEchoRequest {
+            path,
+            identifier,
+            sequence,
+        });
+        Ok(sent)
     }
 
     fn send_icmpv6_echo_request(
@@ -4472,13 +4517,14 @@ where
         let icmp_len = Icmpv6Packet::ECHO_HEADER_LEN
             .checked_add(payload.len())
             .ok_or(StackError::PacketTooLarge)?;
+        let path = PathMtuKey::new(IpAddress::Ipv6(source), IpAddress::Ipv6(destination));
         self.ensure_path_packet_fits(
-            PathMtuKey::new(IpAddress::Ipv6(source), IpAddress::Ipv6(destination)),
+            path,
             EthernetFrame::HEADER_LEN + Ipv6Packet::HEADER_LEN,
             icmp_len,
         )?;
         let local_mac = self.config.mac;
-        self.queue_outbound_frame(|frame| {
+        let sent = self.queue_outbound_frame(|frame| {
             let storage = frame.storage_mut();
             let mut offset = EthernetFrame::encode_header(
                 storage,
@@ -4507,6 +4553,40 @@ where
             .ok_or(StackError::OutputQueueFull)?;
             frame.set_len(offset);
             Ok(payload.len())
+        })?;
+        self.record_icmp_echo_request(IcmpEchoRequest {
+            path,
+            identifier,
+            sequence,
+        });
+        Ok(sent)
+    }
+
+    /// Remembers an echo request that went on the wire, forgetting the
+    /// oldest once the table is full.
+    fn record_icmp_echo_request(&mut self, request: IcmpEchoRequest) {
+        if self.icmp_echo_requests.contains(&request) {
+            return;
+        }
+        if self.icmp_echo_requests.is_full() {
+            self.icmp_echo_requests.remove(0);
+        }
+        self.icmp_echo_requests.push(request);
+    }
+
+    /// Whether the echo request `identifier`/`sequence` an ICMP error
+    /// about `path` quotes is one this stack sent and has not seen
+    /// answered.
+    fn icmp_echo_request_outstanding(
+        &self,
+        path: PathMtuKey,
+        identifier: u16,
+        sequence: u16,
+    ) -> bool {
+        self.icmp_echo_requests.contains(&IcmpEchoRequest {
+            path,
+            identifier,
+            sequence,
         })
     }
 
@@ -4521,8 +4601,14 @@ where
         Some(self.icmp_echo_replies.remove(index))
     }
 
-    /// Banks a received echo reply for whichever waiter owns its key.
+    /// Banks a received echo reply for whichever waiter owns its key. The
+    /// request it answers is no longer in flight.
     fn record_icmp_echo_reply(&mut self, key: IcmpEchoKey, payload_bytes: usize) {
+        self.icmp_echo_requests.retain(|request| {
+            request.path.destination != key.destination
+                || request.identifier != key.identifier
+                || request.sequence != key.sequence
+        });
         if self.icmp_echo_replies.is_full() {
             self.icmp_echo_replies.remove(0);
         }
@@ -5659,9 +5745,7 @@ where
                 address: destination,
                 port: packet.destination_port,
             };
-            let initial_sequence = (now.nanos() as u32)
-                .wrapping_add(u32::from(packet.destination_port))
-                .wrapping_add(u32::from(packet.source_port));
+            let initial_sequence = self.tcp_initial_sequence(local, remote_endpoint, now);
             let listener_hop_limit = listener.hop_limit();
             let mut child = TcpSocket::accept(
                 local,
@@ -5868,6 +5952,9 @@ where
             IpAddress::Ipv4(quoted.source),
             IpAddress::Ipv4(quoted.destination),
         );
+        let Some(flow) = self.quoted_flow(quoted.protocol, key, quoted.payload) else {
+            return;
+        };
         let decreased = if next_hop_mtu == 0 {
             self.path_mtu.update_next_lower(key, quoted.total_len, now)
         } else {
@@ -5875,7 +5962,7 @@ where
                 .update_if_less(key, usize::from(next_hop_mtu), now)
         };
         if decreased {
-            self.mark_tcp_path_mtu_reduced(quoted.protocol, quoted.payload, key);
+            self.mark_tcp_path_mtu_reduced(flow);
         }
     }
 
@@ -5894,38 +5981,77 @@ where
             IpAddress::Ipv6(quoted.source),
             IpAddress::Ipv6(quoted.destination),
         );
+        let Some(flow) = self.quoted_flow(quoted.next_header, key, quoted.payload) else {
+            return;
+        };
         if self.path_mtu.update_if_less(key, mtu, now) {
-            self.mark_tcp_path_mtu_reduced(quoted.next_header, quoted.payload, key);
+            self.mark_tcp_path_mtu_reduced(flow);
         }
     }
 
-    fn mark_tcp_path_mtu_reduced(
-        &mut self,
+    /// The live flow the packet an ICMP error quotes belongs to, so the
+    /// error can be a reply to something this stack sent; `None` when
+    /// there is none (RFC 5927 section 4.1).
+    ///
+    /// A TCP segment must belong to a connection that has the quoted
+    /// sequence number in flight, a UDP datagram to a bound socket, and
+    /// an echo request to one this stack sent and has not seen answered.
+    /// A quote too short to carry what is checked matches nothing.
+    fn quoted_flow(
+        &self,
         protocol: crate::IpProtocol,
-        transport: &[u8],
         key: PathMtuKey,
-    ) {
-        if protocol != crate::IpProtocol::Tcp {
-            return;
+        transport: &[u8],
+    ) -> Option<QuotedFlow> {
+        match protocol {
+            crate::IpProtocol::Tcp => {
+                let packet = crate::TcpPacket::parse_quoted(transport)?;
+                let local = TcpEndpoint {
+                    address: key.source,
+                    port: packet.source_port,
+                };
+                let remote = TcpEndpoint {
+                    address: key.destination,
+                    port: packet.destination_port,
+                };
+                let index = self.tcp.find_endpoint(local, remote)?;
+                self.tcp
+                    .get(index)
+                    .unwrap_or_else(|| panic!("TCP endpoint index referenced a missing socket"))
+                    .sequence_in_flight(packet.sequence)
+                    .then_some(QuotedFlow {
+                        tcp_segment: Some((index, packet.sequence)),
+                    })
+            }
+            crate::IpProtocol::Udp => {
+                let ports = UdpPacket::parse_ports(transport)?;
+                // The quoted packet travelled from this stack to its
+                // peer, so the socket that owns it receives the reverse.
+                self.udp
+                    .socket_for_packet(key.destination, ports.destination, key.source, ports.source)
+                    .map(|_| QuotedFlow { tcp_segment: None })
+            }
+            crate::IpProtocol::Icmp => {
+                let echo = Icmpv4Packet::parse_quoted_echo_request(transport)?;
+                self.icmp_echo_request_outstanding(key, echo.identifier, echo.sequence)
+                    .then_some(QuotedFlow { tcp_segment: None })
+            }
+            crate::IpProtocol::Icmpv6 => {
+                let echo = Icmpv6Packet::parse_quoted_echo_request(transport)?;
+                self.icmp_echo_request_outstanding(key, echo.identifier, echo.sequence)
+                    .then_some(QuotedFlow { tcp_segment: None })
+            }
         }
-        let Some(packet) = crate::TcpPacket::parse_quoted(transport) else {
-            return;
-        };
-        let local = TcpEndpoint {
-            address: key.source,
-            port: packet.source_port,
-        };
-        let remote = TcpEndpoint {
-            address: key.destination,
-            port: packet.destination_port,
-        };
-        let Some(index) = self.tcp.find_endpoint(local, remote) else {
+    }
+
+    fn mark_tcp_path_mtu_reduced(&mut self, flow: QuotedFlow) {
+        let Some((index, sequence)) = flow.tcp_segment else {
             return;
         };
         self.tcp
             .get_mut(index)
             .unwrap_or_else(|| panic!("TCP PMTU endpoint index referenced a missing socket"))
-            .mark_path_mtu_reduced(packet.sequence);
+            .mark_path_mtu_reduced(sequence);
         self.schedule_tcp_timer(index);
     }
 
@@ -5961,6 +6087,19 @@ where
             .unwrap_or_else(|| panic!("TCP endpoint index referenced a missing socket"))
             .state()
             != crate::TcpState::SynSent
+        {
+            return;
+        }
+        // RFC 5927 section 4.1: only the SYN this connection has in
+        // flight can have drawn the error.
+        let Some(sequence) = error.sequence else {
+            return;
+        };
+        if !self
+            .tcp
+            .get(index)
+            .unwrap_or_else(|| panic!("TCP endpoint index referenced a missing socket"))
+            .sequence_in_flight(sequence)
         {
             return;
         }
@@ -6072,6 +6211,17 @@ where
         let id = self.tcp.insert(socket);
         self.schedule_tcp_timer(socket_index(id));
         id
+    }
+
+    /// Refuses an open the slab cannot hold. The slab's own panic stays
+    /// for a corrupt free list: a full slab is reachable by a guest, so
+    /// it is an error here, the way the inbound SYN path asks first.
+    fn ensure_tcp_slot_free(&self) -> Result<(), StackError> {
+        if self.tcp.has_free_slot() {
+            Ok(())
+        } else {
+            Err(StackError::TcpSocketsExhausted)
+        }
     }
 
     fn ensure_tcp_connect_unique(
@@ -6623,6 +6773,7 @@ impl IcmpDestinationUnreachable<'_> {
                 let ports = transport_ports(quoted.protocol, quoted.payload)?;
                 Some(IcmpTransportError {
                     protocol: quoted.protocol,
+                    sequence: quoted_tcp_sequence(quoted.protocol, quoted.payload),
                     kind: IcmpTransportErrorKind::from_ipv4_code(unreachable.code)?,
                     endpoint: IcmpQuotedEndpoint {
                         local: IpAddress::Ipv4(quoted.source),
@@ -6637,6 +6788,7 @@ impl IcmpDestinationUnreachable<'_> {
                 let ports = transport_ports(quoted.next_header, quoted.payload)?;
                 Some(IcmpTransportError {
                     protocol: quoted.next_header,
+                    sequence: quoted_tcp_sequence(quoted.next_header, quoted.payload),
                     kind: IcmpTransportErrorKind::from_ipv6_code(unreachable.code)?,
                     endpoint: IcmpQuotedEndpoint {
                         local: IpAddress::Ipv6(quoted.source),
@@ -6650,9 +6802,20 @@ impl IcmpDestinationUnreachable<'_> {
     }
 }
 
+/// The live flow an ICMP error's quoted packet belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct QuotedFlow {
+    /// The connection's socket index and the quoted segment's sequence
+    /// number, when the flow is a TCP connection.
+    tcp_segment: Option<(usize, u32)>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct IcmpTransportError {
     protocol: crate::IpProtocol,
+    /// The sequence number of the quoted TCP segment, `None` for any
+    /// other protocol or a quote too short to carry it.
+    sequence: Option<u32>,
     endpoint: IcmpQuotedEndpoint,
     kind: IcmpTransportErrorKind,
 }
@@ -6720,6 +6883,13 @@ impl IcmpTransportErrorKind {
             Self::PortUnreachable => TcpConnectTerminalError::RemotePortUnreachable,
             Self::CommunicationProhibited => TcpConnectTerminalError::RemoteCommunicationProhibited,
         }
+    }
+}
+
+fn quoted_tcp_sequence(protocol: crate::IpProtocol, payload: &[u8]) -> Option<u32> {
+    match protocol {
+        crate::IpProtocol::Tcp => Some(TcpPacket::parse_quoted(payload)?.sequence),
+        crate::IpProtocol::Udp | crate::IpProtocol::Icmp | crate::IpProtocol::Icmpv6 => None,
     }
 }
 
@@ -7203,6 +7373,7 @@ mod tests {
 
     const LOCAL_MAC: EthernetAddress = [0x02, 0, 0, 0, 0, 1];
     const PEER_MAC: EthernetAddress = [0x02, 0, 0, 0, 0, 2];
+    const TEST_ISN_SECRET: crate::IsnSecret = crate::IsnSecret::from_bytes([0x5a; 16]);
 
     fn tcp_segment(
         source: Ipv4Address,
@@ -7293,7 +7464,11 @@ mod tests {
     }
 
     fn open_established_tcp_stack(local: Ipv4Address, peer: Ipv4Address) -> (Stack, SocketId) {
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
             .expect("test address should be accepted");
@@ -7863,7 +8038,11 @@ mod tests {
     fn queued_tcp_ack_is_replaced_before_submission() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv4(peer),
             mac: PEER_MAC,
@@ -7943,8 +8122,11 @@ mod tests {
     fn an_out_of_order_burst_leaves_duplicate_acks_on_the_wire() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
-        let (mut stack, _socket) =
-            established_tcp_stack(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let (mut stack, _socket) = established_tcp_stack(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         let payload = [0u8; 100];
 
         let deliver = |stack: &mut Stack, sequence: u32, now: u64| {
@@ -8010,7 +8192,11 @@ mod tests {
     fn queued_tcp_ack_with_different_sequence_is_not_replaced() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv4(peer),
             mac: PEER_MAC,
@@ -8081,11 +8267,95 @@ mod tests {
         assert_eq!(second.sequence, next_sequence.sequence);
     }
 
+    /// The sequence number a listener's SYN-ACK carries for a SYN from
+    /// `peer:49152` to `local:8080` arriving at `now` nanoseconds, on a
+    /// stack keyed with `secret`.
+    fn passive_open_sequence(secret: crate::IsnSecret, now: u64) -> u32 {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            secret,
+        ));
+        stack.learn_neighbor(NeighborEntry {
+            ip: IpAddress::Ipv4(peer),
+            mac: PEER_MAC,
+            state: NeighborState::Reachable,
+            updated_at: StackInstant::from_nanos(0),
+        });
+        stack
+            .open_tcp_listen(
+                TcpEndpoint {
+                    address: IpAddress::Ipv4(Ipv4Address::UNSPECIFIED),
+                    port: 8080,
+                },
+                DEFAULT_TCP_LISTEN_BACKLOG,
+            )
+            .expect("wildcard TCP listener should allocate");
+        drive_passive_open_to_syn_ack(&mut stack, peer, local, 49152, now).sequence
+    }
+
+    #[test]
+    fn passive_open_sequence_is_the_keyed_function_of_the_four_tuple() {
+        let now = 8_000_000;
+        let local = TcpEndpoint {
+            address: IpAddress::Ipv4(Ipv4Address::new([192, 0, 2, 10])),
+            port: 8080,
+        };
+        let remote = TcpEndpoint {
+            address: IpAddress::Ipv4(Ipv4Address::new([192, 0, 2, 20])),
+            port: 49152,
+        };
+        let stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
+
+        assert_eq!(
+            passive_open_sequence(TEST_ISN_SECRET, now),
+            stack.tcp_initial_sequence(local, remote, StackInstant::from_nanos(now)),
+            "the passive open and the active open share one function"
+        );
+    }
+
+    #[test]
+    fn passive_open_sequence_depends_on_the_secret() {
+        let now = 8_000_000;
+        let other = crate::IsnSecret::from_bytes([0xa5; 16]);
+        assert_ne!(
+            passive_open_sequence(TEST_ISN_SECRET, now),
+            passive_open_sequence(other, now),
+            "two boots must not agree on a flow's sequence number"
+        );
+        // What the stack derived before the secret existed: the clock and
+        // the two ports, which anyone on the path can compute.
+        let unkeyed = (now as u32).wrapping_add(8080).wrapping_add(49152);
+        assert_ne!(passive_open_sequence(TEST_ISN_SECRET, now), unkeyed);
+        assert_ne!(passive_open_sequence(other, now), unkeyed);
+    }
+
+    #[test]
+    fn passive_open_sequence_advances_with_the_clock() {
+        let early = passive_open_sequence(TEST_ISN_SECRET, 4_000);
+        let late = passive_open_sequence(TEST_ISN_SECRET, 4_004_000);
+        assert_eq!(
+            late.wrapping_sub(early),
+            1_000,
+            "RFC 6528 clock term ticks once per four microseconds"
+        );
+    }
+
     #[test]
     fn tcp_connect_rejects_duplicate_four_tuple() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         let local = TcpEndpoint {
             address: IpAddress::Ipv4(local),
             port: 49152,
@@ -8108,7 +8378,11 @@ mod tests {
     #[test]
     fn tcp_listen_rejects_overlapping_address_sets() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
 
         stack
             .open_tcp_listen(
@@ -8136,7 +8410,11 @@ mod tests {
     fn tcp_connect_rejects_listener_address_overlap() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
 
         stack
             .open_tcp_listen(
@@ -8171,6 +8449,7 @@ mod tests {
         let (mut stack, socket, _, _) = open_pending_tcp_connect_stack(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
         ));
         let (mut syn_ack, syn_ack_len) = tcp_segment(
             peer,
@@ -8208,7 +8487,7 @@ mod tests {
     /// it summed.
     #[test]
     fn tcp_receive_trusts_a_device_validated_frame() {
-        let config = StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES)
+        let config = StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_ISN_SECRET)
             .with_rx_checksum_offload(RxChecksumOffload::new(false, true, false));
         let (mut stack, socket, local, peer) = open_pending_tcp_connect_stack(config);
         let (mut syn_ack, syn_ack_len) = corrupt_tcp_syn_ack(peer, local);
@@ -8234,7 +8513,7 @@ mod tests {
     /// those are verified in software like any other.
     #[test]
     fn tcp_receive_verifies_a_frame_the_device_did_not_validate() {
-        let config = StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES)
+        let config = StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_ISN_SECRET)
             .with_rx_checksum_offload(RxChecksumOffload::new(false, true, false));
         let (mut stack, socket, local, peer) = open_pending_tcp_connect_stack(config);
         let (syn_ack, syn_ack_len) = corrupt_tcp_syn_ack(peer, local);
@@ -8262,7 +8541,7 @@ mod tests {
     /// delivered even though a software verification would reject it.
     #[test]
     fn tcp_receive_completes_a_partial_checksum_frame() {
-        let config = StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES)
+        let config = StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_ISN_SECRET)
             .with_rx_checksum_offload(RxChecksumOffload::new(false, true, false));
         let (mut stack, socket, local, peer) = open_pending_tcp_connect_stack(config);
         let (mut syn_ack, syn_ack_len) = tcp_segment(
@@ -8312,7 +8591,7 @@ mod tests {
     /// and the frame is dropped.
     #[test]
     fn tcp_receive_drops_an_inconsistent_partial_checksum_frame() {
-        let config = StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES)
+        let config = StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_ISN_SECRET)
             .with_rx_checksum_offload(RxChecksumOffload::new(false, true, false));
         let (mut stack, socket, local, peer) = open_pending_tcp_connect_stack(config);
         let (mut syn_ack, syn_ack_len) = tcp_segment(
@@ -8472,7 +8751,11 @@ mod tests {
     fn tcp_connect_unacceptable_syn_ack_queues_reset_and_stays_pending() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
             .expect("test address should be accepted");
@@ -8535,7 +8818,7 @@ mod tests {
 
     #[test]
     fn tcp_connect_resets_stale_ack_then_retransmits_syn_and_establishes() {
-        let config = StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES);
+        let config = StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_ISN_SECRET);
         let (mut stack, socket, local, peer) = open_pending_tcp_connect_stack(config);
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -8619,7 +8902,11 @@ mod tests {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let router = Ipv4Address::new([192, 0, 2, 1]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
             .expect("test address should be accepted");
@@ -8666,7 +8953,11 @@ mod tests {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let router = Ipv4Address::new([192, 0, 2, 1]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
             .expect("test address should be accepted");
@@ -8713,7 +9004,11 @@ mod tests {
     fn tcp_rst_during_connect_survives_drive_as_terminal_error() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         let socket = stack
             .open_tcp_connect(
                 TcpEndpoint {
@@ -8760,11 +9055,325 @@ mod tests {
     }
 
     #[test]
+    fn icmp_unreachable_quoting_a_sequence_outside_the_syn_leaves_connect_pending() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let router = Ipv4Address::new([192, 0, 2, 1]);
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
+        let socket = stack
+            .open_tcp_connect(
+                TcpEndpoint {
+                    address: IpAddress::Ipv4(local),
+                    port: 49152,
+                },
+                TcpEndpoint {
+                    address: IpAddress::Ipv4(peer),
+                    port: 80,
+                },
+                7,
+            )
+            .expect("test TCP connect should allocate a socket");
+
+        // The ports match the live connect; the sequence number is one an
+        // off-path sender, who never saw the SYN, would have to guess.
+        for forged_sequence in [6, 8, 0x8000_0007] {
+            let (icmp, icmp_len) = ipv4_icmp_port_unreachable_for_tcp(
+                router,
+                local,
+                local,
+                peer,
+                TcpHeader {
+                    source_port: 49152,
+                    destination_port: 80,
+                    sequence: forged_sequence,
+                    acknowledgement: 0,
+                    flags: TcpFlags::SYN,
+                    window_size: u16::MAX,
+                },
+            );
+            stack
+                .receive_frame(&icmp[..icmp_len], StackInstant::from_nanos(1))
+                .expect("ICMPv4 unreachable should be handled");
+        }
+
+        assert_eq!(
+            stack.tcp_connect_state(socket),
+            Ok(TcpConnectState::Pending)
+        );
+    }
+
+    #[test]
+    fn ipv4_fragmentation_needed_for_an_address_pair_no_socket_owns_is_ignored() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let router = Ipv4Address::new([192, 0, 2, 1]);
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
+        let key = PathMtuKey::new(IpAddress::Ipv4(local), IpAddress::Ipv4(peer));
+        let (quoted_udp, quoted_udp_len) = ipv4_udp_frame(local, 49152, peer, 53, b"payload");
+        let (udp_icmp, udp_icmp_len) = ipv4_icmp_unreachable_for_udp_frame(
+            router,
+            local,
+            &quoted_udp[..quoted_udp_len],
+            Icmpv4DestinationUnreachableCode::FragmentationNeeded { next_hop_mtu: 576 },
+        );
+        let (tcp_icmp, tcp_icmp_len) = ipv4_icmp_unreachable_for_tcp(
+            router,
+            local,
+            local,
+            peer,
+            TcpHeader {
+                source_port: 49152,
+                destination_port: 80,
+                sequence: 8,
+                acknowledgement: 0,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+            },
+            Icmpv4DestinationUnreachableCode::FragmentationNeeded { next_hop_mtu: 576 },
+        );
+
+        for (icmp, icmp_len) in [(udp_icmp, udp_icmp_len), (tcp_icmp, tcp_icmp_len)] {
+            stack
+                .receive_frame(&icmp[..icmp_len], StackInstant::from_nanos(1))
+                .expect("ICMPv4 fragmentation-needed should be handled");
+        }
+
+        assert_eq!(stack.path_mtu.get(key), None);
+    }
+
+    #[test]
+    fn ipv4_fragmentation_needed_quoting_a_sequence_not_in_flight_is_ignored() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let router = Ipv4Address::new([192, 0, 2, 1]);
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
+        let _socket = stack
+            .open_tcp_connect(
+                TcpEndpoint {
+                    address: IpAddress::Ipv4(local),
+                    port: 49152,
+                },
+                TcpEndpoint {
+                    address: IpAddress::Ipv4(peer),
+                    port: 80,
+                },
+                7,
+            )
+            .expect("test TCP connect should allocate a socket");
+        let (icmp, icmp_len) = ipv4_icmp_unreachable_for_tcp(
+            router,
+            local,
+            local,
+            peer,
+            TcpHeader {
+                source_port: 49152,
+                destination_port: 80,
+                sequence: 5000,
+                acknowledgement: 0,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+            },
+            Icmpv4DestinationUnreachableCode::FragmentationNeeded { next_hop_mtu: 576 },
+        );
+
+        stack
+            .receive_frame(&icmp[..icmp_len], StackInstant::from_nanos(1))
+            .expect("ICMPv4 fragmentation-needed should be handled");
+
+        assert_eq!(
+            stack.path_mtu.get(PathMtuKey::new(
+                IpAddress::Ipv4(local),
+                IpAddress::Ipv4(peer)
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn ipv6_packet_too_big_for_an_address_pair_no_socket_owns_is_ignored() {
+        let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        let peer = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+        let router = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]);
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
+        stack
+            .add_ipv6_address(Ipv6Cidr::new(local, 64))
+            .expect("test address should be accepted");
+        let (quoted, quoted_len) = ipv6_udp_frame(local, 49152, peer, 53, b"payload");
+        let (icmp, icmp_len) =
+            ipv6_icmp_packet_too_big_for_frame(router, local, &quoted[..quoted_len], 1280);
+
+        stack
+            .receive_frame(&icmp[..icmp_len], StackInstant::from_nanos(1))
+            .expect("ICMPv6 Packet Too Big should be handled");
+
+        assert_eq!(
+            stack.path_mtu.get(PathMtuKey::new(
+                IpAddress::Ipv6(local),
+                IpAddress::Ipv6(peer)
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn fragmentation_needed_quoting_an_outstanding_echo_request_lowers_the_path_mtu() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let router = Ipv4Address::new([192, 0, 2, 1]);
+        let key = PathMtuKey::new(IpAddress::Ipv4(local), IpAddress::Ipv4(peer));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
+        stack.learn_neighbor(NeighborEntry {
+            ip: IpAddress::Ipv4(peer),
+            mac: PEER_MAC,
+            state: NeighborState::Reachable,
+            updated_at: StackInstant::from_nanos(0),
+        });
+        let sent = stack
+            .send_icmp_echo_request(
+                IpAddress::Ipv4(peer),
+                7,
+                1,
+                &[0x5a; 64],
+                3,
+                StackInstant::from_nanos(1),
+            )
+            .expect("echo request should be queued");
+        assert_eq!(sent, 64);
+        let request = stack
+            .take_outbound()
+            .expect("echo request should be queued");
+        // The same request with another sequence number: what a sender
+        // that never saw the real one would have to guess.
+        let mut forged = [0u8; crate::ETHERNET_FRAME_BYTES];
+        let request_len = request.as_slice().len();
+        forged[..request_len].copy_from_slice(request.as_slice());
+        let sequence_offset =
+            EthernetFrame::HEADER_LEN + Ipv4Packet::MIN_HEADER_LEN + Icmpv4Packet::HEADER_LEN - 1;
+        forged[sequence_offset] ^= 0x80;
+        let fragmentation_needed =
+            Icmpv4DestinationUnreachableCode::FragmentationNeeded { next_hop_mtu: 576 };
+
+        let (icmp, icmp_len) = ipv4_icmp_unreachable_for_udp_frame(
+            router,
+            local,
+            &forged[..request_len],
+            fragmentation_needed,
+        );
+        stack
+            .receive_frame(&icmp[..icmp_len], StackInstant::from_nanos(2))
+            .expect("ICMPv4 fragmentation-needed should be handled");
+        assert_eq!(stack.path_mtu.get(key), None);
+
+        let (icmp, icmp_len) = ipv4_icmp_unreachable_for_udp_frame(
+            router,
+            local,
+            request.as_slice(),
+            fragmentation_needed,
+        );
+        stack
+            .receive_frame(&icmp[..icmp_len], StackInstant::from_nanos(3))
+            .expect("ICMPv4 fragmentation-needed should be handled");
+        assert_eq!(stack.path_mtu.get(key), Some(576));
+    }
+
+    #[test]
+    fn packet_too_big_quoting_an_outstanding_echo_request_lowers_the_path_mtu() {
+        let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        let peer = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+        let router = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]);
+        let key = PathMtuKey::new(IpAddress::Ipv6(local), IpAddress::Ipv6(peer));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
+        stack
+            .add_ipv6_address(Ipv6Cidr::new(local, 64))
+            .expect("test address should be accepted");
+        stack.learn_neighbor(NeighborEntry {
+            ip: IpAddress::Ipv6(peer),
+            mac: PEER_MAC,
+            state: NeighborState::Reachable,
+            updated_at: StackInstant::from_nanos(0),
+        });
+        let sent = stack
+            .send_icmp_echo_request(
+                IpAddress::Ipv6(peer),
+                7,
+                1,
+                &[0x5a; 64],
+                0,
+                StackInstant::from_nanos(1),
+            )
+            .expect("echo request should be queued");
+        assert_eq!(sent, 64);
+        let request = stack
+            .take_outbound()
+            .expect("echo request should be queued");
+        let mut forged = [0u8; crate::ETHERNET_FRAME_BYTES];
+        let request_len = request.as_slice().len();
+        forged[..request_len].copy_from_slice(request.as_slice());
+        let sequence_offset =
+            EthernetFrame::HEADER_LEN + Ipv6Packet::HEADER_LEN + Icmpv6Packet::ECHO_HEADER_LEN - 1;
+        forged[sequence_offset] ^= 0x80;
+
+        let (icmp, icmp_len) =
+            ipv6_icmp_packet_too_big_for_frame(router, local, &forged[..request_len], 1280);
+        stack
+            .receive_frame(&icmp[..icmp_len], StackInstant::from_nanos(2))
+            .expect("ICMPv6 Packet Too Big should be handled");
+        assert_eq!(stack.path_mtu.get(key), None);
+
+        let (icmp, icmp_len) =
+            ipv6_icmp_packet_too_big_for_frame(router, local, request.as_slice(), 1280);
+        stack
+            .receive_frame(&icmp[..icmp_len], StackInstant::from_nanos(3))
+            .expect("ICMPv6 Packet Too Big should be handled");
+        assert_eq!(stack.path_mtu.get(key), Some(1280));
+    }
+
+    #[test]
     fn icmp_port_unreachable_does_not_close_established_tcp() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let router = Ipv4Address::new([192, 0, 2, 1]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
             .expect("test address should be accepted");
@@ -8829,7 +9438,11 @@ mod tests {
     fn udp_open_rejects_overlapping_address_sets() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
 
         stack
             .open_udp(UdpSocketBinding::wildcard(4040))
@@ -8862,7 +9475,11 @@ mod tests {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let first_peer = Ipv4Address::new([192, 0, 2, 20]);
         let second_peer = Ipv4Address::new([192, 0, 2, 30]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         let first = stack
             .open_udp(UdpSocketBinding::connected(
                 UdpEndpoint {
@@ -8932,7 +9549,11 @@ mod tests {
             Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         let peer_v6 =
             Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         let v4 = stack
             .open_udp(UdpSocketBinding::exact(UdpEndpoint {
                 address: IpAddress::Ipv4(local_v4),
@@ -8991,7 +9612,11 @@ mod tests {
             Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         let peer_v6 =
             Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         let socket = stack
             .open_udp(UdpSocketBinding::exact(UdpEndpoint {
                 address: IpAddress::Ipv4(local_v4),
@@ -9018,7 +9643,11 @@ mod tests {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let foreign = Ipv4Address::new([192, 0, 2, 11]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
             .expect("test address should be accepted");
@@ -9039,7 +9668,11 @@ mod tests {
     fn ipv4_udp_limited_broadcast_destination_is_delivered() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
             .expect("test address should be accepted");
@@ -9069,7 +9702,11 @@ mod tests {
     fn ipv4_udp_directed_broadcast_destination_is_delivered() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
             .expect("test address should be accepted");
@@ -9097,7 +9734,11 @@ mod tests {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let group = Ipv4Address::new([224, 0, 0, 251]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
             .expect("test address should be accepted");
@@ -9127,7 +9768,11 @@ mod tests {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let group = Ipv4Address::new([224, 0, 0, 251]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
             .expect("test address should be accepted");
@@ -9149,7 +9794,11 @@ mod tests {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let group = Ipv4Address::new([224, 0, 0, 251]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
             .expect("test address should be accepted");
@@ -9216,7 +9865,11 @@ mod tests {
         let other = Ipv4Address::new([192, 0, 2, 11]);
         let group = Ipv4Address::new([224, 0, 0, 251]);
         let unicast = Ipv4Address::new([192, 0, 2, 20]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
             .expect("test address should be accepted");
@@ -9241,7 +9894,11 @@ mod tests {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let group = Ipv4Address::new([224, 0, 0, 251]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
             .expect("test address should be accepted");
@@ -9267,7 +9924,11 @@ mod tests {
     fn udp_send_ipv4_multicast_uses_multicast_mac_without_neighbor() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let group = Ipv4Address::new([224, 0, 0, 251]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
             .expect("test address should be accepted");
@@ -9312,7 +9973,11 @@ mod tests {
     fn udp_send_stamps_the_socket_hop_limit_on_the_ipv4_header() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let group = Ipv4Address::new([224, 0, 0, 251]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
             .expect("test address should be accepted");
@@ -9349,7 +10014,11 @@ mod tests {
     fn accepted_connections_inherit_the_listener_hop_limit() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
             .expect("test address should be accepted");
@@ -9408,7 +10077,8 @@ mod tests {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let group = Ipv4Address::new([224, 0, 0, 251]);
         let mut stack = Stack::new(
-            StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES).with_tx_checksum_offload(true),
+            StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_ISN_SECRET)
+                .with_tx_checksum_offload(true),
         );
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -9561,7 +10231,7 @@ mod tests {
     #[test]
     fn bulk_tcp_data_is_scattered_when_the_device_reads_borrowed_bytes() {
         let (mut stack, socket) = established_tcp_stack(
-            StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES)
+            StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_ISN_SECRET)
                 .with_tx_checksum_offload(true)
                 .with_direct_tx_dma(true),
         );
@@ -9592,7 +10262,8 @@ mod tests {
     #[test]
     fn bulk_tcp_data_is_copied_when_the_device_cannot_read_borrowed_bytes() {
         let (mut stack, socket) = established_tcp_stack(
-            StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES).with_tx_checksum_offload(true),
+            StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_ISN_SECRET)
+                .with_tx_checksum_offload(true),
         );
         let payload = vec![0x5a_u8; TCP_SCATTER_MIN_PAYLOAD_BYTES];
         stack
@@ -9618,7 +10289,7 @@ mod tests {
     #[test]
     fn a_tso_interface_receives_one_coalesced_frame_with_gso_metadata() {
         let (mut stack, socket) = established_tcp_stack(
-            StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES)
+            StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_ISN_SECRET)
                 .with_tx_checksum_offload(true)
                 .with_segmentation_offload(tso_ipv4_offload()),
         );
@@ -9676,7 +10347,8 @@ mod tests {
     #[test]
     fn an_interface_without_segmentation_still_receives_mss_sized_frames() {
         let (mut stack, socket) = established_tcp_stack(
-            StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES).with_tx_checksum_offload(true),
+            StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_ISN_SECRET)
+                .with_tx_checksum_offload(true),
         );
         let payload: Vec<u8> = (0..40 * 1024).map(|index| index as u8).collect();
         stack
@@ -9710,7 +10382,7 @@ mod tests {
     #[test]
     fn a_coalesced_burst_still_retransmits_one_segment_at_a_time() {
         let (mut stack, socket) = established_tcp_stack(
-            StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES)
+            StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_ISN_SECRET)
                 .with_tx_checksum_offload(true)
                 .with_segmentation_offload(tso_ipv4_offload()),
         );
@@ -9749,7 +10421,7 @@ mod tests {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer_addr = Ipv4Address::new([192, 0, 2, 20]);
         let mut stack = Stack::new(
-            StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES)
+            StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_ISN_SECRET)
                 .with_tx_checksum_offload(true)
                 .with_direct_tx_dma(true),
         );
@@ -9825,7 +10497,11 @@ mod tests {
     fn udp_send_without_tx_offload_carries_no_metadata() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let group = Ipv4Address::new([224, 0, 0, 251]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
             .expect("test address should be accepted");
@@ -9853,7 +10529,11 @@ mod tests {
         let foreign =
             Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]);
         let peer = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .add_ipv6_address(Ipv6Cidr::new(local, 64))
             .expect("test address should be accepted");
@@ -9875,7 +10555,11 @@ mod tests {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let router = Ipv4Address::new([192, 0, 2, 1]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
             .expect("test address should be accepted");
@@ -9911,7 +10595,11 @@ mod tests {
         let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         let peer = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
         let router = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .add_ipv6_address(Ipv6Cidr::new(local, 64))
             .expect("test address should be accepted");
@@ -9947,7 +10635,11 @@ mod tests {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let router = Ipv4Address::new([192, 0, 2, 1]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
             .expect("test address should be accepted");
@@ -9986,7 +10678,11 @@ mod tests {
         let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         let peer = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
         let router = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .add_ipv6_address(Ipv6Cidr::new(local, 64))
             .expect("test address should be accepted");
@@ -10026,7 +10722,11 @@ mod tests {
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let other_peer = Ipv4Address::new([192, 0, 2, 30]);
         let router = Ipv4Address::new([192, 0, 2, 1]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
             .expect("test address should be accepted");
@@ -10057,7 +10757,11 @@ mod tests {
     fn udp_receive_rejects_bad_checksum() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         let socket = stack
             .open_udp(UdpSocketBinding::wildcard(4040))
             .expect("UDP socket should bind");
@@ -10080,7 +10784,7 @@ mod tests {
     fn udp_receive_trusts_a_device_validated_datagram() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
-        let config = StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES)
+        let config = StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_ISN_SECRET)
             .with_rx_checksum_offload(RxChecksumOffload::new(false, false, true));
         let mut stack = Stack::new(config);
         let socket = stack
@@ -10110,7 +10814,7 @@ mod tests {
     fn udp_receive_completes_a_partial_checksum_datagram() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
-        let config = StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES)
+        let config = StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_ISN_SECRET)
             .with_rx_checksum_offload(RxChecksumOffload::new(false, false, true));
         let mut stack = Stack::new(config);
         let socket = stack
@@ -10145,7 +10849,11 @@ mod tests {
     fn ipv4_udp_receive_accepts_zero_checksum() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         let socket = stack
             .open_udp(UdpSocketBinding::wildcard(4040))
             .expect("UDP socket should bind");
@@ -10174,7 +10882,7 @@ mod tests {
     fn ipv4_receive_trusts_configured_rx_header_checksum_offload() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
-        let config = StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES)
+        let config = StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_ISN_SECRET)
             .with_rx_checksum_offload(RxChecksumOffload::new(true, false, false));
         let mut stack = Stack::new(config);
         stack
@@ -10229,7 +10937,11 @@ mod tests {
 
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
             .expect("test address should be accepted");
@@ -10298,7 +11010,11 @@ mod tests {
 
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
             .expect("test address should be accepted");
@@ -10336,7 +11052,11 @@ mod tests {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let other = Ipv4Address::new([192, 0, 2, 99]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
             .expect("test address should be accepted");
@@ -10360,7 +11080,11 @@ mod tests {
     fn ipv4_reassembly_expires_from_the_stack_timer() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
             .expect("test address should be accepted");
@@ -10401,7 +11125,11 @@ mod tests {
     fn ipv4_reassembly_budget_counts_fragment_bookkeeping() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
             .expect("test address should be accepted");
@@ -10428,7 +11156,11 @@ mod tests {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let payload = b"fragmented-udp-payload";
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
             .expect("test address should be accepted");
@@ -10459,7 +11191,11 @@ mod tests {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let payload = b"fragmented-udp-payload";
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
             .expect("test address should be accepted");
@@ -10488,7 +11224,11 @@ mod tests {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let payload = b"fragmented-udp-payload";
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
             .expect("test address should be accepted");
@@ -10520,7 +11260,11 @@ mod tests {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let payload = b"fragmented-udp-payload";
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
             .expect("test address should be accepted");
@@ -10557,7 +11301,11 @@ mod tests {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let payload = b"fragmented-udp-payload";
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
             .expect("test address should be accepted");
@@ -10595,7 +11343,11 @@ mod tests {
     fn ipv6_udp_receive_rejects_zero_checksum() {
         let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         let peer = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         let socket = stack
             .open_udp(UdpSocketBinding::wildcard(4040))
             .expect("UDP socket should bind");
@@ -10619,7 +11371,11 @@ mod tests {
     fn ipv4_udp_to_closed_local_port_queues_icmp_port_unreachable() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
             .expect("test address should be accepted");
@@ -10670,7 +11426,11 @@ mod tests {
     fn udp_send_rejects_payload_larger_than_mtu() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
             .expect("test address should be accepted");
@@ -10704,7 +11464,11 @@ mod tests {
         let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         let peer = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
         let router = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .add_ipv6_address(Ipv6Cidr::new(local, 64))
             .expect("test address should be accepted");
@@ -10757,7 +11521,11 @@ mod tests {
     fn ipv6_udp_to_closed_local_port_queues_icmp_port_unreachable() {
         let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         let peer = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .add_ipv6_address(Ipv6Cidr::new(local, 64))
             .expect("test address should be accepted");
@@ -10808,7 +11576,11 @@ mod tests {
     fn udp_remove_socket_drops_queued_datagrams() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         let socket = stack
             .open_udp(UdpSocketBinding::wildcard(4040))
             .expect("UDP socket should bind");
@@ -10836,7 +11608,11 @@ mod tests {
     fn udp_full_socket_queue_does_not_starve_other_socket() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         let saturated = stack
             .open_udp(UdpSocketBinding::wildcard(4040))
             .expect("first UDP socket should bind");
@@ -10909,7 +11685,11 @@ mod tests {
     fn ipv4_receive_does_not_learn_the_source_mac() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
             .expect("test address should be accepted");
@@ -10958,7 +11738,11 @@ mod tests {
     fn tcp_unknown_syn_to_local_address_queues_reset_ack() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
             .expect("test address should be accepted");
@@ -11007,7 +11791,11 @@ mod tests {
     fn tcp_unknown_ack_to_local_address_queues_reset() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
             .expect("test address should be accepted");
@@ -11056,7 +11844,11 @@ mod tests {
     fn tcp_unknown_reset_does_not_answer_reset() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
             .expect("test address should be accepted");
@@ -11097,7 +11889,11 @@ mod tests {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let foreign = Ipv4Address::new([192, 0, 2, 11]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
             .expect("test address should be accepted");
@@ -11424,7 +12220,11 @@ mod tests {
             address: IpAddress::Ipv4(peer),
             port: 80,
         };
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
             .expect("test address should be accepted");
@@ -11921,12 +12721,140 @@ mod tests {
         );
     }
 
+    /// A slab that orphans fill is the stack's to report, not to panic
+    /// on: a close keeps its socket for the whole of `TIME-WAIT`, so a
+    /// guest that opens and closes faster than 2MSL drains reaches a
+    /// full slab through calls it is entitled to make.
+    #[test]
+    fn tcp_open_reports_a_full_slab_of_time_wait_orphans() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
+        stack.learn_neighbor(NeighborEntry {
+            ip: IpAddress::Ipv4(peer),
+            mac: PEER_MAC,
+            state: NeighborState::Reachable,
+            updated_at: StackInstant::from_nanos(0),
+        });
+        let remote_endpoint = TcpEndpoint {
+            address: IpAddress::Ipv4(peer),
+            port: 80,
+        };
+        let endpoint_for = |index: usize| TcpEndpoint {
+            address: IpAddress::Ipv4(local),
+            port: 40_000 + u16::try_from(index).expect("slab index fits a port offset"),
+        };
+        let receive = |stack: &mut Stack, port: u16, header: TcpHeader, now: u64| {
+            let (segment, len) = tcp_segment(
+                peer,
+                local,
+                TcpHeader {
+                    destination_port: port,
+                    ..header
+                },
+            );
+            stack
+                .receive_tcp(
+                    IpAddress::Ipv4(peer),
+                    IpAddress::Ipv4(local),
+                    &Bytes::copy_from_slice(&segment[..len]),
+                    RxFrameOffload::none(),
+                    StackInstant::from_nanos(now),
+                )
+                .expect("the peer's segment should be accepted");
+        };
+
+        for index in 0..MAX_TCP_SOCKETS {
+            let local_endpoint = endpoint_for(index);
+            let socket = stack
+                .open_tcp_connect(local_endpoint, remote_endpoint, 7)
+                .expect("a slot is free while the slab is filling");
+            receive(
+                &mut stack,
+                local_endpoint.port,
+                TcpHeader {
+                    source_port: 80,
+                    destination_port: 0,
+                    sequence: 100,
+                    acknowledgement: 8,
+                    flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                    window_size: u16::MAX,
+                },
+                1,
+            );
+            assert_eq!(
+                stack.close_tcp_socket(socket, StackInstant::from_nanos(2)),
+                Ok(TcpCloseOutcome::Finishing)
+            );
+            stack
+                .drive_tcp(StackInstant::from_nanos(2))
+                .expect("the close should queue a FIN");
+            let mut fin_sequence = None;
+            while let Some((flags, sequence, _)) = take_tcp_segment(&mut stack) {
+                if flags.contains(TcpFlags::FIN) {
+                    fin_sequence = Some(sequence);
+                }
+            }
+            receive(
+                &mut stack,
+                local_endpoint.port,
+                TcpHeader {
+                    source_port: 80,
+                    destination_port: 0,
+                    sequence: 101,
+                    acknowledgement: fin_sequence
+                        .expect("the close owes its peer a FIN")
+                        .wrapping_add(1),
+                    flags: TcpFlags::ACK.union(TcpFlags::FIN),
+                    window_size: u16::MAX,
+                },
+                3,
+            );
+            while stack.take_outbound().is_some() {}
+            while stack.take_event().is_some() {}
+        }
+
+        assert_eq!(
+            stack.open_tcp_connect(endpoint_for(MAX_TCP_SOCKETS), remote_endpoint, 7),
+            Err(StackError::TcpSocketsExhausted)
+        );
+        assert_eq!(
+            stack.open_tcp_listen(
+                TcpEndpoint {
+                    address: IpAddress::Ipv4(local),
+                    port: 8080,
+                },
+                TcpListenBacklog::try_new(1).expect("a backlog of one is representable"),
+            ),
+            Err(StackError::TcpSocketsExhausted)
+        );
+
+        stack
+            .drive_tcp(StackInstant::from_nanos(
+                3 + crate::tcp::TCP_TIME_WAIT_NANOS,
+            ))
+            .expect("the 2MSL timers should expire");
+        assert!(
+            stack
+                .open_tcp_connect(endpoint_for(MAX_TCP_SOCKETS), remote_endpoint, 7)
+                .is_ok(),
+            "the slots come back once TIME-WAIT drains"
+        );
+    }
+
     #[test]
     fn tcp_stack_accepts_replaceable_congestion_control() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let mut stack = Stack::new_with_congestion(
-            StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES),
+            StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_ISN_SECRET),
             NewReno::new(1460),
         );
 
@@ -11958,7 +12886,11 @@ mod tests {
     fn passive_open_queues_accepted_stream_after_handshake() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv4(peer),
             mac: PEER_MAC,
@@ -12033,7 +12965,11 @@ mod tests {
     fn closing_a_listener_resets_the_backlog_it_never_handed_out() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
             .expect("test address should be accepted");
@@ -12122,7 +13058,11 @@ mod tests {
     fn closing_a_listener_leaves_an_accepted_connection_alive() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
             .expect("test address should be accepted");
@@ -12195,7 +13135,11 @@ mod tests {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let first_peer = Ipv4Address::new([192, 0, 2, 20]);
         let second_peer = Ipv4Address::new([192, 0, 2, 21]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         for peer in [first_peer, second_peer] {
             stack.learn_neighbor(NeighborEntry {
                 ip: IpAddress::Ipv4(peer),
@@ -12309,7 +13253,11 @@ mod tests {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let first_peer = Ipv4Address::new([192, 0, 2, 20]);
         let second_peer = Ipv4Address::new([192, 0, 2, 21]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         for peer in [first_peer, second_peer] {
             stack.learn_neighbor(NeighborEntry {
                 ip: IpAddress::Ipv4(peer),
@@ -12365,7 +13313,11 @@ mod tests {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let first_peer = Ipv4Address::new([192, 0, 2, 20]);
         let second_peer = Ipv4Address::new([192, 0, 2, 21]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         for peer in [first_peer, second_peer] {
             stack.learn_neighbor(NeighborEntry {
                 ip: IpAddress::Ipv4(peer),
@@ -12438,7 +13390,11 @@ mod tests {
     fn tcp_exact_listener_accepts_syn() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv4(peer),
             mac: PEER_MAC,
@@ -12493,7 +13449,11 @@ mod tests {
     fn ipv4_tcp_fragments_reassemble_and_reach_listener() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
             .expect("test address should be accepted");
@@ -12551,7 +13511,11 @@ mod tests {
     fn tcp_read_reports_eof_after_fin_and_drained_payload() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         let socket = stack
             .open_tcp_connect(
                 TcpEndpoint {
@@ -12628,7 +13592,11 @@ mod tests {
     fn tcp_read_waits_for_missing_bytes_before_out_of_order_fin_eof() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         let socket = stack
             .open_tcp_connect(
                 TcpEndpoint {
@@ -12733,7 +13701,11 @@ mod tests {
     fn tcp_drive_piggybacks_ack_on_data_segment() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv4(peer),
             mac: PEER_MAC,
@@ -12816,7 +13788,11 @@ mod tests {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let router = Ipv4Address::new([192, 0, 2, 1]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
             .expect("test address should be accepted");
@@ -12866,6 +13842,14 @@ mod tests {
         let _ = stack
             .take_outbound()
             .expect("handshake ACK frame should be queued");
+        // The error has to quote a segment the connection has in flight.
+        assert_eq!(stack.tcp_send(socket, b"x"), Ok(1));
+        stack
+            .drive_tcp(StackInstant::from_nanos(2))
+            .expect("first data should be queued");
+        let _ = stack
+            .take_outbound()
+            .expect("first data frame should be queued");
         let (icmp, icmp_len) = ipv4_icmp_unreachable_for_tcp(
             router,
             local,
@@ -12882,23 +13866,30 @@ mod tests {
             Icmpv4DestinationUnreachableCode::FragmentationNeeded { next_hop_mtu: 576 },
         );
         stack
-            .receive_frame(&icmp[..icmp_len], StackInstant::from_nanos(2))
+            .receive_frame(&icmp[..icmp_len], StackInstant::from_nanos(3))
             .expect("ICMPv4 fragmentation-needed should update PMTU");
+        stack
+            .drive_tcp(StackInstant::from_nanos(3))
+            .expect("PMTU update should queue its eager retransmission");
+        while stack.take_outbound().is_some() {}
 
         let payload = [0u8; 1024];
         assert_eq!(stack.tcp_send(socket, &payload), Ok(payload.len()));
         stack
-            .drive_tcp(StackInstant::from_nanos(3))
+            .drive_tcp(StackInstant::from_nanos(4))
             .expect("PMTU-limited TCP data should be queued");
 
-        let frame = stack.take_outbound().expect("data frame should be queued");
-        let ethernet = EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
-        let ipv4 = Ipv4Packet::parse(ethernet.payload).expect("IPv4 packet should parse");
-        let data = TcpPacket::parse(ipv4.payload).expect("TCP packet should parse");
-        assert_eq!(
-            data.payload.len(),
-            576 - Ipv4Packet::MIN_HEADER_LEN - TcpPacket::MIN_HEADER_LEN - data.options.raw().len()
-        );
+        let cap = 576 - Ipv4Packet::MIN_HEADER_LEN - TcpPacket::MIN_HEADER_LEN;
+        let mut largest = 0;
+        while let Some(frame) = stack.take_outbound() {
+            let ethernet =
+                EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
+            let ipv4 = Ipv4Packet::parse(ethernet.payload).expect("IPv4 packet should parse");
+            let data = TcpPacket::parse(ipv4.payload).expect("TCP packet should parse");
+            assert!(data.payload.len() <= cap - data.options.raw().len());
+            largest = largest.max(data.payload.len() + data.options.raw().len());
+        }
+        assert_eq!(largest, cap);
     }
 
     #[test]
@@ -12906,7 +13897,11 @@ mod tests {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let router = Ipv4Address::new([192, 0, 2, 1]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
             .expect("test address should be accepted");
@@ -13012,7 +14007,11 @@ mod tests {
     fn tcp_drive_queues_delayed_ack_at_deadline() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv4(peer),
             mac: PEER_MAC,
@@ -13152,7 +14151,11 @@ mod tests {
     fn tcp_receive_backpressure_is_indexed() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         let socket = stack
             .open_tcp_connect(
                 TcpEndpoint {
@@ -13538,7 +14541,11 @@ mod tests {
 
     #[test]
     fn tcp_socket_slab_reuses_removed_slot() {
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         let first = stack
             .open_tcp_listen(
                 TcpEndpoint {
@@ -13584,7 +14591,11 @@ mod tests {
 
     #[test]
     fn tcp_socket_slab_clone_preserves_ids_and_independent_ownership() {
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         let first = stack
             .open_tcp_listen(
                 TcpEndpoint {
@@ -13738,7 +14749,11 @@ mod tests {
     }
 
     fn autoconfigured_stack() -> Stack {
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .configure_ipv6_link_local()
             .expect("link-local address should be accepted");
@@ -13751,7 +14766,11 @@ mod tests {
 
     #[test]
     fn ipv6_link_local_is_derived_from_the_interface_mac() {
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         let link_local = stack
             .configure_ipv6_link_local()
             .expect("link-local address should be accepted");
@@ -13776,7 +14795,11 @@ mod tests {
 
     #[test]
     fn ipv6_autoconfig_queues_router_solicitation_from_link_local() {
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .configure_ipv6_link_local()
             .expect("link-local address should be accepted");
@@ -13871,7 +14894,11 @@ mod tests {
 
     #[test]
     fn router_advertisement_with_modified_hop_limit_is_rejected() {
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .configure_ipv6_link_local()
             .expect("link-local address should be accepted");
@@ -13892,7 +14919,11 @@ mod tests {
     #[test]
     fn router_advertisement_from_global_source_is_rejected() {
         let global = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .configure_ipv6_link_local()
             .expect("link-local address should be accepted");
@@ -14036,7 +15067,11 @@ mod tests {
 
     #[test]
     fn an_autoconfigured_address_is_removed_with_its_route_when_its_valid_lifetime_ends() {
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .configure_ipv6_link_local()
             .expect("link-local address should be accepted");
@@ -14066,7 +15101,11 @@ mod tests {
 
     #[test]
     fn a_deprecated_address_is_not_chosen_as_a_source_while_another_qualifies() {
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .configure_ipv6_link_local()
             .expect("link-local address should be accepted");
@@ -14118,7 +15157,11 @@ mod tests {
 
     #[test]
     fn an_advertisement_updates_a_configured_address_under_the_two_hour_rule() {
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         let address = advertised_address(3, 3600, 86_400);
         stack.apply_ipv6_router_configuration(address_advertisement(address), seconds(0));
         assert_eq!(
@@ -14172,7 +15215,11 @@ mod tests {
 
     #[test]
     fn a_zero_valid_lifetime_follows_the_two_hour_rule_for_an_existing_address() {
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         let address = advertised_address(4, 3600, 86_400);
         stack.apply_ipv6_router_configuration(address_advertisement(address), seconds(0));
 
@@ -14200,7 +15247,11 @@ mod tests {
 
     #[test]
     fn a_flood_of_fresh_prefixes_leaves_the_table_when_their_lifetimes_end() {
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .configure_ipv6_link_local()
             .expect("link-local address should be accepted");
@@ -14242,7 +15293,11 @@ mod tests {
 
     #[test]
     fn router_advertisements_with_more_prefixes_than_the_table_holds_leave_the_stack_running() {
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         let local = Ipv4Address::new([192, 0, 2, 10]);
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -14295,7 +15350,11 @@ mod tests {
 
     #[test]
     fn an_advertised_prefix_route_expires_with_its_valid_lifetime() {
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .configure_ipv6_link_local()
             .expect("link-local address should be accepted");
@@ -14324,7 +15383,11 @@ mod tests {
 
     #[test]
     fn a_default_router_route_expires_and_is_refreshed_by_a_new_advertisement() {
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         let off_link = IpAddress::Ipv6(Ipv6Address::new([
             0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
         ]));
@@ -14350,7 +15413,11 @@ mod tests {
 
     #[test]
     fn an_advertisement_cannot_withdraw_a_route_the_kernel_configured() {
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         let default_route = Route {
             destination: IpCidr::Ipv6(Ipv6Cidr::new(Ipv6Address::UNSPECIFIED, 0)),
             gateway: Some(IpAddress::Ipv6(ROUTER_LINK_LOCAL)),
@@ -14371,7 +15438,11 @@ mod tests {
 
     #[test]
     fn repeated_dhcp_re_leases_do_not_grow_the_route_table() {
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         let gateway = Route {
             destination: IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::UNSPECIFIED, 0)),
             gateway: Some(IpAddress::Ipv4(Ipv4Address::new([10, 0, 0, 1]))),
@@ -14400,7 +15471,11 @@ mod tests {
 
     #[test]
     fn adding_an_address_to_a_full_table_returns_an_error_and_changes_nothing() {
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         // Fill the route table with local routes.
         for index in 0..MAX_ROUTES as u8 {
             stack
@@ -14424,7 +15499,11 @@ mod tests {
         assert_eq!(stack.routes().len(), MAX_ROUTES);
 
         // And a full address table.
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         let mut host = 0u8;
         while stack
             .add_ipv6_address(Ipv6Cidr::new(
@@ -14610,7 +15689,11 @@ mod tests {
 
     #[test]
     fn neighbor_advertisement_without_override_keeps_the_cached_address() {
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .configure_ipv6_link_local()
             .expect("link-local address should be accepted");
@@ -14849,7 +15932,11 @@ mod tests {
 
     /// A stack on `10.0.0.0/16` with a resolved default gateway.
     fn stack_with_resolved_gateway() -> Stack {
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(LOCAL_V4, 16))
             .expect("test address should be accepted");
