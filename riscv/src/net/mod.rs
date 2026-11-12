@@ -382,20 +382,24 @@ pub(crate) fn discover_plic_context(
 
 fn parse_plic_context(fdt: &Fdt<'_>, node: FdtNode<'_, '_>, hart_id: u16) -> Option<PlicContext> {
     let interrupts_extended = node.property("interrupts-extended")?;
-    let mut cells = interrupts_extended.value.chunks_exact(4);
+    let mut cells = interrupts_extended
+        .value
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&cell| u32::from_be_bytes(cell));
     let mut index = 0usize;
 
-    while let Some(phandle) = cells.next().map(read_be_u32) {
+    while let Some(phandle) = cells.next() {
         let controller = fdt.find_phandle(phandle).unwrap_or_else(|| {
             panic!("PLIC references unknown interrupt controller phandle {phandle}")
         });
         let interrupt_cells = controller.interrupt_cells().unwrap_or_else(|| {
             panic!("interrupt controller phandle {phandle} is missing #interrupt-cells")
         });
-        let spec =
-            read_be_u32(cells.next().unwrap_or_else(|| {
-                panic!("PLIC interrupts-extended truncated for phandle {phandle}")
-            }));
+        let spec = cells
+            .next()
+            .unwrap_or_else(|| panic!("PLIC interrupts-extended truncated for phandle {phandle}"));
         for _ in 1..interrupt_cells {
             let _ = cells.next().unwrap_or_else(|| {
                 panic!("PLIC interrupts-extended truncated extra cells for phandle {phandle}")

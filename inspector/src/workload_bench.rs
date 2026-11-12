@@ -22,6 +22,9 @@ const WORKLOAD_MANIFEST_SCHEMA_VERSION: u16 = 2;
 /// measurement, `bench.<name>=<number>`; the Linux runner parses the same
 /// lines so every side of the comparison carries the same metric names.
 const METRIC_LINE_PREFIX: &str = "bench.";
+/// The metric an AOT iteration records the compiler plugin's worker count
+/// under; `helios-compiler-host` reports the Linux side's under the same name.
+const COMPILER_WORKERS_METRIC: &str = "compiler_workers";
 
 /// How long one workload iteration may take before the run gives up on
 /// it.
@@ -806,7 +809,7 @@ async fn measure_workload(
             iteration,
             elapsed_ms: output.elapsed_ms,
             launch_elapsed_ms: output.launch_elapsed_ms,
-            metrics: parse_metrics(&output.stdout)?,
+            metrics: workload_metrics(&output)?,
             throughput_bytes: workload.throughput_bytes,
             throughput_mib_per_second: throughput_mib_per_second(
                 workload.throughput_bytes,
@@ -828,6 +831,9 @@ struct WorkloadOutput {
     launch_elapsed_ms: Option<f64>,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+    /// Measurements the guest returned in its reply rather than printed:
+    /// recorded beside the `bench.<name>=` lines the stdout carries.
+    reported: BTreeMap<String, f64>,
 }
 
 /// Runs one workload iteration under the run's per-iteration deadline.
@@ -945,6 +951,7 @@ fn launched_output(
         launch_elapsed_ms: Some(millis_of(Duration::from_nanos(output.launch_nanos))),
         stdout: output.output.stdout,
         stderr: output.output.stderr,
+        reported: BTreeMap::new(),
     })
 }
 
@@ -1031,18 +1038,25 @@ async fn run_aot_workload(
         workload: workload.name.clone(),
         source,
     })?;
-    outcome.map_err(|error| WorkloadBenchError::AotRefused {
+    let elapsed_ms = elapsed_millis(started);
+    let result = outcome.map_err(|error| WorkloadBenchError::AotRefused {
         workload: workload.name.clone(),
         kind: error.kind,
         detail: error.detail,
     })?;
     Ok(WorkloadOutput {
-        elapsed_ms: elapsed_millis(started),
+        elapsed_ms,
         // An AOT compile is no program launch: `programs.aot` answers no
         // `exec` reply, so the host clock is the only one it has.
         launch_elapsed_ms: None,
         stdout: Vec::new(),
         stderr: Vec::new(),
+        // The worker count the kernel's compiler plugin ran with, which the
+        // report holds equal to the Linux + Wasmtime column's.
+        reported: BTreeMap::from([(
+            COMPILER_WORKERS_METRIC.to_owned(),
+            f64::from(result.worker_threads),
+        )]),
     })
 }
 
@@ -1241,6 +1255,18 @@ fn parse_metrics(stdout: &[u8]) -> Result<BTreeMap<String, f64>, WorkloadOutputE
             return Err(WorkloadOutputError::DuplicateMetric {
                 name: name.to_owned(),
             });
+        }
+    }
+    Ok(metrics)
+}
+
+/// An iteration's metrics: the `bench.` lines its stdout printed and the
+/// measurements its reply carried, each name reported once.
+fn workload_metrics(output: &WorkloadOutput) -> Result<BTreeMap<String, f64>, WorkloadOutputError> {
+    let mut metrics = parse_metrics(&output.stdout)?;
+    for (name, value) in &output.reported {
+        if metrics.insert(name.clone(), *value).is_some() {
+            return Err(WorkloadOutputError::DuplicateMetric { name: name.clone() });
         }
     }
     Ok(metrics)
@@ -1751,6 +1777,25 @@ mod tests {
     }
 
     #[test]
+    fn reported_metrics_join_the_printed_ones_and_never_replace_them() {
+        let output = |stdout: &[u8]| WorkloadOutput {
+            elapsed_ms: 1.0,
+            launch_elapsed_ms: None,
+            stdout: stdout.to_vec(),
+            stderr: Vec::new(),
+            reported: BTreeMap::from([(COMPILER_WORKERS_METRIC.to_owned(), 3.0)]),
+        };
+        let metrics = workload_metrics(&output(b"bench.rtt_p50_us=12.5\n"))
+            .expect("distinct printed and reported metrics merge");
+        assert_eq!(metrics.get("rtt_p50_us"), Some(&12.5));
+        assert_eq!(metrics.get(COMPILER_WORKERS_METRIC), Some(&3.0));
+        assert!(matches!(
+            workload_metrics(&output(b"bench.compiler_workers=4\n")),
+            Err(WorkloadOutputError::DuplicateMetric { name }) if name == COMPILER_WORKERS_METRIC
+        ));
+    }
+
+    #[test]
     fn throughput_rate_uses_manifest_payload_bytes() {
         assert_eq!(
             throughput_mib_per_second(Some(64 * 1024 * 1024), 64.0),
@@ -1871,6 +1916,7 @@ mod tests {
                 launch_elapsed_ms: Some(21.5),
                 stdout: b"process-startup:ok\n".to_vec(),
                 stderr: Vec::new(),
+                reported: BTreeMap::new(),
             })),
         ))
         .expect("a workload that answers in time must not be failed");

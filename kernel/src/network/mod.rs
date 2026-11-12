@@ -88,6 +88,7 @@ where
             runtime_state.uptime_clock(),
             self.timer(),
             device,
+            runtime_state.root_entropy_handle().clone(),
         );
         runtime_state.install_network_service(service);
     }

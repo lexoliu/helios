@@ -50,13 +50,12 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use arrayvec::ArrayVec;
-use async_lock::Mutex as AsyncMutex;
 use atomic_waker::AtomicWaker;
 use core::cell::UnsafeCell;
 use core::cmp;
 use core::future::Future;
 use core::hint::spin_loop;
-use core::mem::{size_of, size_of_val};
+use core::mem::{ManuallyDrop, size_of, size_of_val};
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering, fence};
 use core::task::{Context, Poll};
@@ -65,16 +64,18 @@ use spin::{Mutex, MutexGuard};
 
 use helios_hal::cpu::{Cpu, current_processor};
 use helios_hal::fs::{
-    BlockBuffer, BlockCompletion, BlockDevice, BlockDeviceCapabilities, BlockDeviceRights,
-    BlockGeometry, BlockQueueTopology, BlockRange, BlockSerial, OwnedBlockBuffer,
+    AnswerFlag, BlockBuffer, BlockCompletion, BlockDevice, BlockDeviceCapabilities,
+    BlockDeviceRights, BlockGeometry, BlockQueueTopology, BlockRange, BlockSerial,
+    OwnedBlockBuffer,
 };
 use helios_hal::io::{IoError, IoResult};
 use helios_hal::resource::KernelResource;
 use helios_hal::vmm::SwapBackend;
 
-use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate};
+use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate, renegotiate};
 use crate::notify::Notify;
 use crate::queue::{MAX_CHAIN_BUFFERS, VirtQueue};
+use crate::resume::{DeviceReset, QuiesceError, ReinitError, Resumed, conclude, driver_ok, settle};
 use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
 
 /// virtio-blk addresses every request in 512-byte sectors regardless of
@@ -404,6 +405,8 @@ pub struct VirtioBlockDevice<T: VirtioTransport, C: QueueAffinity, B> {
     geometry: BlockGeometry,
     capabilities: BlockDeviceCapabilities,
     limits: RequestLimits,
+    /// Whether the device's write cache is write-back, as it reported.
+    writeback: bool,
     readonly: bool,
     counters: RequestCounters,
     /// [`RUNNING`], [`RESETTING`] or [`STOPPED`].
@@ -414,9 +417,24 @@ pub struct VirtioBlockResource<T: VirtioTransport, C: QueueAffinity, B> {
     resource: KernelResource<VirtioBlockDevice<T, C, B>, BlockDeviceRights>,
 }
 
+/// A [`SwapBackend`] over a run of blocks on a [`BlockDevice`].
+///
+/// Concurrency contract: every operation may run from any task on any
+/// processor, concurrently. The extent free list sits behind a spin lock
+/// held only for a first-fit scan or a release, never across an `.await`.
+/// Only the backend's own operations, and the drop of a swap-out it
+/// abandoned, take it — all in task context, never from an interrupt —
+/// so it masks nothing. Being synchronous is what lets a dropped
+/// swap-out give its extent back from `Drop`.
+///
+/// The one thing the device's completion path touches is the
+/// [`AnswerFlag`] of a swap-out's write, raised lock-free by the
+/// write's buffer. An extent whose swap-out was dropped with the write
+/// in flight waits on that flag, and the allocator reclaims it on its
+/// next scan once the flag is up.
 pub struct VirtioBlockSwapBackend<D: BlockDevice> {
     device: D,
-    state: AsyncMutex<VirtioBlockSwapState>,
+    state: Mutex<VirtioBlockSwapState>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -458,12 +476,101 @@ pub enum VirtioBlockSwapError {
 #[derive(Default)]
 struct VirtioBlockSwapState {
     free: Vec<SwapExtent>,
+    /// Extents of dropped swap-outs whose writes may still be in flight.
+    abandoned: Vec<AbandonedWrite>,
 }
 
 #[derive(Clone, Copy)]
 struct SwapExtent {
     start_block: usize,
     block_count: usize,
+}
+
+impl VirtioBlockSwapToken {
+    fn extent(self) -> SwapExtent {
+        SwapExtent {
+            start_block: self.start_block,
+            block_count: self.block_count,
+        }
+    }
+}
+
+/// An extent a swap-out has allocated and whose write the device does
+/// not have yet. Dropping it gives the extent back: no request of the
+/// swap-out can reach those blocks.
+struct AllocatedExtent<'a> {
+    state: &'a Mutex<VirtioBlockSwapState>,
+    token: VirtioBlockSwapToken,
+}
+
+impl<'a> AllocatedExtent<'a> {
+    /// The device has taken the write, whose buffer raises `answer`.
+    fn submitted(self, answer: AnswerFlag) -> SubmittedExtent<'a> {
+        let this = ManuallyDrop::new(self);
+        SubmittedExtent {
+            state: this.state,
+            token: this.token,
+            answer: Some(answer),
+        }
+    }
+}
+
+impl Drop for AllocatedExtent<'_> {
+    fn drop(&mut self) {
+        self.state.lock().release(self.token.extent());
+    }
+}
+
+/// An extent whose swap-out write the device has taken and whose answer
+/// the swap-out has not collected.
+///
+/// The device may still write these blocks after the swap-out is
+/// dropped, and virtio-blk orders no two in-flight requests, so an
+/// extent handed to another page before the abandoned write is answered
+/// could have that page's write land first and the abandoned one over
+/// it. Dropping this files the extent as an [`AbandonedWrite`], which
+/// the allocator reclaims once the write's buffer has raised its flag.
+struct SubmittedExtent<'a> {
+    state: &'a Mutex<VirtioBlockSwapState>,
+    token: VirtioBlockSwapToken,
+    /// `None` once the swap-out collected the answer itself.
+    answer: Option<AnswerFlag>,
+}
+
+impl SubmittedExtent<'_> {
+    /// The device answered the write: the token goes to the caller, or,
+    /// when the write failed, the extent goes back.
+    fn answered(
+        mut self,
+        result: IoResult<()>,
+    ) -> Result<VirtioBlockSwapToken, VirtioBlockSwapError> {
+        self.answer = None;
+        match result {
+            Ok(()) => Ok(self.token),
+            Err(error) => {
+                self.state.lock().release(self.token.extent());
+                Err(error.into())
+            }
+        }
+    }
+}
+
+impl Drop for SubmittedExtent<'_> {
+    fn drop(&mut self) {
+        if let Some(answer) = self.answer.take() {
+            self.state.lock().abandon(AbandonedWrite {
+                extent: self.token.extent(),
+                answer,
+            });
+        }
+    }
+}
+
+/// The extent of a swap-out dropped while the device held its write,
+/// held until the write's buffer raises `answer`.
+struct AbandonedWrite {
+    extent: SwapExtent,
+    answer: AnswerFlag,
 }
 
 /// virtio 1.2 §5.2.6: `struct virtio_blk_req` header.
@@ -660,89 +767,29 @@ impl<T: VirtioTransport, C: QueueAffinity, B: BlockBuffer> VirtioBlockDevice<T, 
 
         let features = negotiate(&transport, RING_FEATURES | BLK_FEATURES)?;
 
-        let capacity_sectors = u64::from(transport.read_config_u32(CFG_CAPACITY_LOW))
-            | (u64::from(transport.read_config_u32(CFG_CAPACITY_HIGH)) << 32);
-        let logical_block_bytes = if features.device(BLK_F_BLK_SIZE) {
-            usize::try_from(transport.read_config_u32(CFG_BLK_SIZE))
-                .map_err(|_| IoError::DeviceFault)?
-        } else {
-            SECTOR_SIZE
-        };
-        if logical_block_bytes == 0 || !logical_block_bytes.is_multiple_of(SECTOR_SIZE) {
-            return Err(IoError::InvalidDeviceConfig(
-                "virtio-blk logical block size is not a multiple of the 512-byte sector",
-            ));
-        }
-        let sectors_per_block = logical_block_bytes / SECTOR_SIZE;
-        let capacity_blocks = usize::try_from(capacity_sectors)
-            .map_err(|_| IoError::DeviceFault)?
-            / sectors_per_block;
-
-        let (physical_block_exp, min_io_blocks, opt_io_blocks) = if features.device(BLK_F_TOPOLOGY)
-        {
-            (
-                transport.read_config_u8(CFG_PHYSICAL_BLOCK_EXP),
-                u32::from(transport.read_config_u16(CFG_MIN_IO_SIZE)),
-                transport.read_config_u32(CFG_OPT_IO_SIZE),
-            )
-        } else {
-            (0, 0, 0)
-        };
-
-        // virtio 1.2 §5.2.5: a device that does not offer SEG_MAX states
-        // no limit of its own, and the driver has to pick one; a single
-        // data buffer is the only value that is correct for every device.
-        let device_segments = if features.device(BLK_F_SEG_MAX) {
-            transport.read_config_u32(CFG_SEG_MAX).max(1)
-        } else {
-            1
-        };
-        let data_segments = usize::try_from(device_segments)
-            .unwrap_or(usize::MAX)
-            .min(MAX_CHAIN_BUFFERS - 2);
-        let segment_bytes = if features.device(BLK_F_SIZE_MAX) {
-            let size_max = transport.read_config_u32(CFG_SIZE_MAX);
-            if size_max == 0 {
-                return Err(IoError::InvalidDeviceConfig(
-                    "virtio-blk offered SIZE_MAX with a zero maximum segment size",
-                ));
-            }
-            usize::try_from(size_max).unwrap_or(usize::MAX)
-        } else {
-            usize::try_from(u32::MAX).unwrap_or(usize::MAX)
-        };
-        if segment_bytes < logical_block_bytes {
-            return Err(IoError::InvalidDeviceConfig(
-                "virtio-blk cannot carry a whole logical block in one segment",
-            ));
-        }
+        let DeviceConfig {
+            geometry,
+            limits,
+            writeback,
+        } = read_config(&transport, features)?;
+        let RequestLimits {
+            data_segments,
+            segment_bytes,
+            ..
+        } = limits;
+        let logical_block_bytes = geometry.logical_block_bytes;
+        let capacity_blocks = geometry.capacity_blocks;
 
         let mut capabilities = BlockDeviceCapabilities::empty();
         if features.device(BLK_F_FLUSH) {
             capabilities |= BlockDeviceCapabilities::FLUSH;
         }
-        let (discard_sectors, discard_segments) = if features.device(BLK_F_DISCARD) {
+        if features.device(BLK_F_DISCARD) {
             capabilities |= BlockDeviceCapabilities::DISCARD;
-            deallocate_limits(
-                &transport,
-                CFG_MAX_DISCARD_SECTORS,
-                CFG_MAX_DISCARD_SEG,
-                "discard",
-            )?
-        } else {
-            (0, 0)
-        };
-        let (write_zeroes_sectors, write_zeroes_segments) = if features.device(BLK_F_WRITE_ZEROES) {
+        }
+        if features.device(BLK_F_WRITE_ZEROES) {
             capabilities |= BlockDeviceCapabilities::WRITE_ZEROES;
-            deallocate_limits(
-                &transport,
-                CFG_MAX_WRITE_ZEROES_SECTORS,
-                CFG_MAX_WRITE_ZEROES_SEG,
-                "write-zeroes",
-            )?
-        } else {
-            (0, 0)
-        };
+        }
 
         let queue_count = queue_count(&transport, &cpu, features);
         let mut queues = Vec::with_capacity(queue_count);
@@ -782,20 +829,7 @@ impl<T: VirtioTransport, C: QueueAffinity, B: BlockBuffer> VirtioBlockDevice<T, 
                 | DeviceStatus::DRIVER_OK,
         );
 
-        let geometry = BlockGeometry {
-            logical_block_bytes,
-            physical_block_exp,
-            min_io_blocks,
-            opt_io_blocks,
-            // What one request this driver builds can carry, which is
-            // fewer than the device allows once the chain bound applies.
-            max_segments: u32::try_from(data_segments).unwrap_or(u32::MAX),
-            max_segment_bytes: u32::try_from(segment_bytes).unwrap_or(u32::MAX),
-            capacity_blocks,
-        };
         let readonly = features.device(BLK_F_RO);
-        let writeback =
-            features.device(BLK_F_CONFIG_WCE) && transport.read_config_u8(CFG_WRITEBACK) != 0;
         tracing::info!(
             capacity_blocks,
             block_bytes = logical_block_bytes,
@@ -819,15 +853,8 @@ impl<T: VirtioTransport, C: QueueAffinity, B: BlockBuffer> VirtioBlockDevice<T, 
             features,
             geometry,
             capabilities,
-            limits: RequestLimits {
-                sectors_per_block,
-                data_segments,
-                segment_bytes,
-                discard_sectors,
-                discard_segments,
-                write_zeroes_sectors,
-                write_zeroes_segments,
-            },
+            limits,
+            writeback,
             readonly,
             counters: RequestCounters::default(),
             state: AtomicU8::new(RUNNING),
@@ -906,6 +933,124 @@ impl<T: VirtioTransport, C: QueueAffinity, B: BlockBuffer> VirtioBlockDevice<T, 
         for queue in self.queues.iter() {
             self.reap(queue);
         }
+    }
+
+    /// Waits for every request the device owns, on every queue, to
+    /// complete, so the device may be reset. See [`crate::resume`] for
+    /// the contract; `expired` says when the caller's deadline has
+    /// passed.
+    ///
+    /// Each answer is finished the way the interrupt path finishes it:
+    /// its buffer hears its result and its waiter is woken, so the waiter
+    /// finds a complete slot when the machine runs again. A device the
+    /// driver already stopped holds nothing.
+    pub fn quiesce(&self, mut expired: impl FnMut() -> bool) -> Result<(), QuiesceError> {
+        let device = DeviceType::Block;
+        for (index, queue) in self.queues.iter().enumerate() {
+            let index = u16::try_from(index).expect("queue indices were built from a u16");
+            settle(device, index, &mut expired, || {
+                if self.state.load(Ordering::SeqCst) != RUNNING {
+                    return Ok(0);
+                }
+                self.reap(queue);
+                queue
+                    .ring
+                    .try_lock()
+                    .map(|ring| ring.in_flight_chains())
+                    .ok_or(QuiesceError::QueueBusy {
+                        device,
+                        queue: index,
+                    })
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Brings a reset device back with the features it had, after
+    /// [`Self::quiesce`]: every queue is re-programmed at its ring with
+    /// fresh indices. Block keeps no state outside its rings, so there is
+    /// nothing else to restore; what the device reports about itself is
+    /// compared with what the driver brought up.
+    pub fn reinitialize(&self) -> Result<DeviceReset, ReinitError> {
+        if self.state.load(Ordering::SeqCst) != RUNNING {
+            return Err(ReinitError::StateNotRestorable {
+                device: DeviceType::Block,
+                what: "a device the driver stopped after it broke the used-ring contract",
+            });
+        }
+        conclude(&self.transport, self.restore(), |resumed| {
+            if resumed == Resumed::Failed {
+                // Nothing is in flight after a quiesce, so what has to
+                // stop is the next request: the driver refuses every
+                // one from here, and a submitter parked for room is woken
+                // to see that.
+                self.state.store(STOPPED, Ordering::SeqCst);
+                for queue in self.queues.iter() {
+                    queue.available.notify_all();
+                }
+            }
+        })
+    }
+
+    fn restore(&self) -> Result<DeviceReset, ReinitError> {
+        let device = DeviceType::Block;
+        renegotiate(&self.transport, self.features)?;
+        self.check_identity()?;
+        for (index, queue) in self.queues.iter().enumerate() {
+            let index = u16::try_from(index).expect("queue indices were built from a u16");
+            let mut ring = queue.ring.try_lock().ok_or(ReinitError::QueueBusy {
+                device,
+                queue: index,
+            })?;
+            ring.reinitialize(&self.transport)?;
+            drop(ring);
+            queue.drain_pending.store(false, Ordering::SeqCst);
+        }
+        driver_ok(&self.transport);
+        Ok(DeviceReset { device })
+    }
+
+    /// Compares what the device reports about itself with what the
+    /// driver brought up. A device is untrusted, and a disk of another
+    /// size is not the disk the image was taken against.
+    fn check_identity(&self) -> Result<(), ReinitError> {
+        let device = DeviceType::Block;
+        let changed = |what| ReinitError::DeviceChanged { device, what };
+        let found = read_config(&self.transport, self.features)
+            .map_err(|_| changed("its configuration space"))?;
+        let (was, now) = (&self.geometry, &found.geometry);
+        if now.logical_block_bytes != was.logical_block_bytes {
+            return Err(changed("logical block size"));
+        }
+        if now.capacity_blocks != was.capacity_blocks {
+            return Err(changed("capacity"));
+        }
+        if (now.physical_block_exp, now.min_io_blocks, now.opt_io_blocks)
+            != (was.physical_block_exp, was.min_io_blocks, was.opt_io_blocks)
+        {
+            return Err(changed("topology"));
+        }
+        let (was, now) = (&self.limits, &found.limits);
+        if (now.data_segments, now.segment_bytes) != (was.data_segments, was.segment_bytes) {
+            return Err(changed("segment limits"));
+        }
+        if (now.discard_sectors, now.discard_segments)
+            != (was.discard_sectors, was.discard_segments)
+        {
+            return Err(changed("discard limits"));
+        }
+        if (now.write_zeroes_sectors, now.write_zeroes_segments)
+            != (was.write_zeroes_sectors, was.write_zeroes_segments)
+        {
+            return Err(changed("write-zeroes limits"));
+        }
+        if found.writeback != self.writeback {
+            return Err(changed("write cache mode"));
+        }
+        if queue_count(&self.transport, &self.cpu, self.features) != self.queues.len() {
+            return Err(changed("queue count"));
+        }
+        Ok(())
     }
 
     /// The first sector of a logical block.
@@ -1402,6 +1547,127 @@ fn queue_count<T: VirtioTransport, C: QueueAffinity>(
     device_queues.clamp(1, cpu.processor_count().max(1))
 }
 
+/// Everything the device's configuration space says that the driver
+/// builds requests or reports geometry from.
+///
+/// Read once at bring-up and again after a reset, where the two are
+/// compared: a device that reports anything else is not the one the
+/// driver's requests were sized for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DeviceConfig {
+    geometry: BlockGeometry,
+    limits: RequestLimits,
+    writeback: bool,
+}
+
+/// Reads and validates the device's configuration space.
+fn read_config<T: VirtioTransport>(
+    transport: &T,
+    features: NegotiatedFeatures,
+) -> IoResult<DeviceConfig> {
+    let capacity_sectors = u64::from(transport.read_config_u32(CFG_CAPACITY_LOW))
+        | (u64::from(transport.read_config_u32(CFG_CAPACITY_HIGH)) << 32);
+    let logical_block_bytes = if features.device(BLK_F_BLK_SIZE) {
+        usize::try_from(transport.read_config_u32(CFG_BLK_SIZE))
+            .map_err(|_| IoError::DeviceFault)?
+    } else {
+        SECTOR_SIZE
+    };
+    if logical_block_bytes == 0 || !logical_block_bytes.is_multiple_of(SECTOR_SIZE) {
+        return Err(IoError::InvalidDeviceConfig(
+            "virtio-blk logical block size is not a multiple of the 512-byte sector",
+        ));
+    }
+    let sectors_per_block = logical_block_bytes / SECTOR_SIZE;
+    let capacity_blocks =
+        usize::try_from(capacity_sectors).map_err(|_| IoError::DeviceFault)? / sectors_per_block;
+
+    let (physical_block_exp, min_io_blocks, opt_io_blocks) = if features.device(BLK_F_TOPOLOGY) {
+        (
+            transport.read_config_u8(CFG_PHYSICAL_BLOCK_EXP),
+            u32::from(transport.read_config_u16(CFG_MIN_IO_SIZE)),
+            transport.read_config_u32(CFG_OPT_IO_SIZE),
+        )
+    } else {
+        (0, 0, 0)
+    };
+
+    // virtio 1.2 §5.2.5: a device that does not offer SEG_MAX states
+    // no limit of its own, and the driver has to pick one; a single
+    // data buffer is the only value that is correct for every device.
+    let device_segments = if features.device(BLK_F_SEG_MAX) {
+        transport.read_config_u32(CFG_SEG_MAX).max(1)
+    } else {
+        1
+    };
+    let data_segments = usize::try_from(device_segments)
+        .unwrap_or(usize::MAX)
+        .min(MAX_CHAIN_BUFFERS - 2);
+    let segment_bytes = if features.device(BLK_F_SIZE_MAX) {
+        let size_max = transport.read_config_u32(CFG_SIZE_MAX);
+        if size_max == 0 {
+            return Err(IoError::InvalidDeviceConfig(
+                "virtio-blk offered SIZE_MAX with a zero maximum segment size",
+            ));
+        }
+        usize::try_from(size_max).unwrap_or(usize::MAX)
+    } else {
+        usize::try_from(u32::MAX).unwrap_or(usize::MAX)
+    };
+    if segment_bytes < logical_block_bytes {
+        return Err(IoError::InvalidDeviceConfig(
+            "virtio-blk cannot carry a whole logical block in one segment",
+        ));
+    }
+
+    let (discard_sectors, discard_segments) = if features.device(BLK_F_DISCARD) {
+        deallocate_limits(
+            transport,
+            CFG_MAX_DISCARD_SECTORS,
+            CFG_MAX_DISCARD_SEG,
+            "discard",
+        )?
+    } else {
+        (0, 0)
+    };
+    let (write_zeroes_sectors, write_zeroes_segments) = if features.device(BLK_F_WRITE_ZEROES) {
+        deallocate_limits(
+            transport,
+            CFG_MAX_WRITE_ZEROES_SECTORS,
+            CFG_MAX_WRITE_ZEROES_SEG,
+            "write-zeroes",
+        )?
+    } else {
+        (0, 0)
+    };
+    let writeback =
+        features.device(BLK_F_CONFIG_WCE) && transport.read_config_u8(CFG_WRITEBACK) != 0;
+
+    Ok(DeviceConfig {
+        geometry: BlockGeometry {
+            logical_block_bytes,
+            physical_block_exp,
+            min_io_blocks,
+            opt_io_blocks,
+            // What one request this driver builds can carry, which is
+            // fewer than the device allows once the chain bound applies.
+            max_segments: u32::try_from(data_segments).unwrap_or(u32::MAX),
+            max_segment_bytes: u32::try_from(segment_bytes).unwrap_or(u32::MAX),
+            capacity_blocks,
+        },
+        limits: RequestLimits {
+            sectors_per_block,
+            data_segments,
+            segment_bytes,
+            discard_sectors,
+            discard_segments,
+            write_zeroes_sectors,
+            write_zeroes_segments,
+        },
+        writeback,
+    })
+}
+
 /// Reads the per-run and per-request limits of a deallocation request
 /// kind the device just claimed to support.
 fn deallocate_limits<T: VirtioTransport>(
@@ -1456,11 +1722,12 @@ impl<D: BlockDevice> VirtioBlockSwapBackend<D> {
 
         Ok(Self {
             device,
-            state: AsyncMutex::new(VirtioBlockSwapState {
+            state: Mutex::new(VirtioBlockSwapState {
                 free: Vec::from([SwapExtent {
                     start_block,
                     block_count,
                 }]),
+                abandoned: Vec::new(),
             }),
         })
     }
@@ -1470,10 +1737,10 @@ impl<D: BlockDevice> VirtioBlockSwapBackend<D> {
         Self::new(device, 0, block_count)
     }
 
-    async fn allocate_token(
+    fn allocate_extent(
         &self,
         byte_len: usize,
-    ) -> Result<VirtioBlockSwapToken, VirtioBlockSwapError> {
+    ) -> Result<AllocatedExtent<'_>, VirtioBlockSwapError> {
         if byte_len == 0 {
             return Err(VirtioBlockSwapError::EmptyPayload);
         }
@@ -1482,7 +1749,7 @@ impl<D: BlockDevice> VirtioBlockSwapBackend<D> {
             return Err(VirtioBlockSwapError::InvalidBlockSize);
         }
         let block_count = byte_len.div_ceil(block_size);
-        let mut state = self.state.lock().await;
+        let mut state = self.state.lock();
         let start_block =
             state
                 .allocate(block_count)
@@ -1490,23 +1757,24 @@ impl<D: BlockDevice> VirtioBlockSwapBackend<D> {
                     requested_blocks: block_count,
                     available_blocks: state.available_blocks(),
                 })?;
-        Ok(VirtioBlockSwapToken {
-            start_block,
-            block_count,
-            byte_len,
+        Ok(AllocatedExtent {
+            state: &self.state,
+            token: VirtioBlockSwapToken {
+                start_block,
+                block_count,
+                byte_len,
+            },
         })
     }
 
-    async fn release_token(&self, token: VirtioBlockSwapToken) {
-        self.state.lock().await.release(SwapExtent {
-            start_block: token.start_block,
-            block_count: token.block_count,
-        });
+    fn release_token(&self, token: VirtioBlockSwapToken) {
+        self.state.lock().release(token.extent());
     }
 }
 
 impl VirtioBlockSwapState {
     fn allocate(&mut self, requested_blocks: usize) -> Option<usize> {
+        self.reclaim_answered();
         let index = self
             .free
             .iter()
@@ -1544,7 +1812,31 @@ impl VirtioBlockSwapState {
         }
     }
 
-    fn available_blocks(&self) -> usize {
+    /// Files the extent of a swap-out dropped with its write in flight,
+    /// or frees it when the write was answered meanwhile.
+    fn abandon(&mut self, write: AbandonedWrite) {
+        if write.answer.is_raised() {
+            self.release(write.extent);
+        } else {
+            self.abandoned.push(write);
+        }
+    }
+
+    /// Frees every abandoned extent whose write the device has answered.
+    fn reclaim_answered(&mut self) {
+        let mut index = 0;
+        while index < self.abandoned.len() {
+            if self.abandoned[index].answer.is_raised() {
+                let write = self.abandoned.swap_remove(index);
+                self.release(write.extent);
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    fn available_blocks(&mut self) -> usize {
+        self.reclaim_answered();
         self.free.iter().map(|extent| extent.block_count).sum()
     }
 }
@@ -1562,6 +1854,17 @@ impl<T: VirtioTransport, C: QueueAffinity, B: BlockBuffer> VirtioBlockResource<T
 
     pub fn handle_interrupt(&self) {
         self.resource.object().handle_interrupt();
+    }
+
+    /// Waits for every request the device owns to complete. See
+    /// [`VirtioBlockDevice::quiesce`].
+    pub fn quiesce(&self, expired: impl FnMut() -> bool) -> Result<(), QuiesceError> {
+        self.object().quiesce(expired)
+    }
+
+    /// Brings a reset device back. See [`VirtioBlockDevice::reinitialize`].
+    pub fn reinitialize(&self) -> Result<DeviceReset, ReinitError> {
+        self.object().reinitialize()
     }
 
     /// The feature set the underlying device negotiated.
@@ -1709,21 +2012,34 @@ where
     /// write it will hand the same bytes back, and nothing in swap has to
     /// outlive the kernel. A flush per page would buy durability nobody
     /// wants at the price of a host fsync on every page evicted.
+    ///
+    /// Dropped before the device has the write, the swap-out gives its
+    /// extent back at once. Dropped after, it gives the extent back once
+    /// the device has answered the write and never before, because the
+    /// device may still write those blocks and virtio-blk orders no two
+    /// in-flight requests.
     async fn swap_out(&self, bytes: &[u8]) -> Result<Self::Token, Self::Error> {
-        let token = self.allocate_token(bytes.len()).await?;
-        if let Err(error) = self.write_extent(token, bytes).await {
-            self.release_token(token).await;
-            return Err(error);
-        }
-        Ok(token)
+        let extent = self.allocate_extent(bytes.len())?;
+        let mut buffer = self.extent_buffer(extent.token)?;
+        buffer.copy_from(bytes);
+        let answer = AnswerFlag::new();
+        buffer.raise_on_answer(answer.clone());
+        let waiter = self
+            .device
+            .submit_write(extent.token.start_block, buffer)
+            .await;
+        let extent = extent.submitted(answer);
+        extent.answered(waiter.await.result)
     }
 
     /// Reads a swapped-out page back into `dst` and frees its extent.
     ///
     /// The device fills a buffer of its own, which is copied into `dst`
     /// once it answered. The extent is released only once the page is
-    /// back: a failed read leaves the token valid so the caller can try
-    /// again rather than losing the only copy of the page.
+    /// back, with no await between the copy and the release: a failed
+    /// read, or a swap-in dropped before it resolves, leaves the token
+    /// valid and the extent allocated so the caller can try again rather
+    /// than losing the only copy of the page.
     async fn swap_in(&self, token: Self::Token, dst: &mut [u8]) -> Result<(), Self::Error> {
         if dst.len() != token.byte_len {
             return Err(VirtioBlockSwapError::InvalidDestination {
@@ -1735,12 +2051,12 @@ where
         let read = self.device.read(token.start_block, buffer).await;
         read.result?;
         read.buffer.copy_to(dst);
-        self.release_token(token).await;
+        self.release_token(token);
         Ok(())
     }
 
     async fn release(&self, token: Self::Token) {
-        self.release_token(token).await;
+        self.release_token(token);
     }
 }
 
@@ -1763,17 +2079,6 @@ where
                 len: token.byte_len,
             },
         )
-    }
-
-    async fn write_extent(
-        &self,
-        token: VirtioBlockSwapToken,
-        bytes: &[u8],
-    ) -> Result<(), VirtioBlockSwapError> {
-        let mut buffer = self.extent_buffer(token)?;
-        buffer.copy_from(bytes);
-        self.device.write(token.start_block, buffer).await.result?;
-        Ok(())
     }
 }
 
