@@ -1802,8 +1802,8 @@ mod tests {
         IcmpEchoKey, Icmpv4Packet, Icmpv6Packet, IpAddress, IpCidr, IpProtocol, Ipv4Address,
         Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6Packet, IsnSecret, MAX_OUTBOUND_FRAMES,
         NeighborEntry, NeighborState, Route, StackConfig, StackInstant, TCP_RECEIVE_WINDOW_BYTES,
-        TcpEndpoint, TcpFlags, TcpHeader, TcpListenBacklog, TcpPacket, TransportChecksum,
-        UdpEndpoint, UdpPacket, UdpPayload, UdpSocketBinding, internet_checksum,
+        TCP_TRANSMIT_BUFFER_BYTES, TcpEndpoint, TcpFlags, TcpHeader, TcpListenBacklog, TcpPacket,
+        TransportChecksum, UdpEndpoint, UdpPacket, UdpPayload, UdpSocketBinding, internet_checksum,
     };
 
     use alloc::vec::Vec;
@@ -1812,7 +1812,7 @@ mod tests {
     use helios_netstack::RxFrame;
 
     use crate::test_support::{
-        RecordingNetworkInterface, RecordingSmpCpu, TestCpu, test_root_entropy,
+        ManualClockCpu, RecordingNetworkInterface, RecordingSmpCpu, TestCpu, test_root_entropy,
     };
 
     use super::{
@@ -4244,6 +4244,132 @@ mod tests {
     #[test]
     fn a_pending_ipv6_resolution_on_another_shard_leaves_the_resolved_neighbor() {
         a_pending_resolution_on_another_shard_leaves_the_resolved_neighbor(ResolutionFamily::Ipv6);
+    }
+
+    /// Issue #847: a writer parked on a shut peer window sleeps until
+    /// the stack's next protocol deadline. The pacing time the last
+    /// send left behind is long past, and a deadline already past
+    /// would arm a zero timer and spin the writer through the stack
+    /// for as long as the window stays shut.
+    #[test]
+    fn a_writer_parked_on_a_closed_window_does_not_drive_the_stack_until_it_opens() {
+        const PEER_PORT: u16 = 80;
+        const LOCAL_PORT: u16 = 49_152;
+        const LOCAL_SEQUENCE: u32 = 7;
+        const PEER_SEQUENCE: u32 = 100;
+        const FIRST_WRITE: &[u8] = b"hello";
+        // The drives a connect, a send and a parked write take, with
+        // room over. A spinning writer passes it within one poll.
+        const DRIVES_UNTIL_PARKED: u64 = 8;
+        const SECOND: u64 = 1_000_000_000;
+        const HANDSHAKE_ROUND_TRIP: u64 = 10_000_000;
+
+        let family = ResolutionFamily::Ipv4;
+        let device = RecordingNetworkInterface::accepting_transmissions(1);
+        let cpu = ManualClockCpu::new();
+        let service = super::NetworkService::new(
+            cpu.clone(),
+            crate::test_support::test_profile_sink(),
+            crate::test_support::test_uptime_clock(),
+            crate::test_support::test_timer(cpu.clone()),
+            device.clone(),
+            test_root_entropy(),
+        );
+        let state = &service.inner.state;
+        family.configure(&mut state.shard_at(0).lock());
+        service
+            .inner
+            .control
+            .publish_from_shard(&state.shard_at(0).lock());
+        let stream = {
+            let mut shard = state.shard_at(0).lock();
+            let socket = shard
+                .stack
+                .open_tcp_connect(
+                    TcpEndpoint {
+                        address: family.local(),
+                        port: LOCAL_PORT,
+                    },
+                    TcpEndpoint {
+                        address: family.peer(),
+                        port: PEER_PORT,
+                    },
+                    LOCAL_SEQUENCE,
+                )
+                .expect("the test connection should allocate a socket");
+            shard.insert_tcp_stream(socket)
+        };
+        let poll = || {
+            block_on(service.poll_network_once(NetworkPollSource::Tcp))
+                .expect("the poll should drive the device");
+        };
+        let from_peer = |sequence_offset: u32, acknowledged: u32, flags, window_size| {
+            device.deliver_on(
+                0,
+                &family.tcp_from_peer(TcpHeader {
+                    source_port: PEER_PORT,
+                    destination_port: LOCAL_PORT,
+                    sequence: PEER_SEQUENCE.wrapping_add(sequence_offset),
+                    acknowledgement: LOCAL_SEQUENCE.wrapping_add(acknowledged),
+                    flags,
+                    window_size,
+                }),
+            );
+        };
+
+        poll();
+        device.deliver_on(0, &family.resolution_reply());
+        poll();
+        poll();
+        // The handshake's round trip is what gives the connection the
+        // pacing rate its sends are spaced by.
+        cpu.advance(HANDSHAKE_ROUND_TRIP);
+        from_peer(0, 1, TcpFlags::SYN.union(TcpFlags::ACK), u16::MAX);
+        poll();
+
+        // The peer takes the first write, then shuts its window, long
+        // after the pacing time that write set.
+        let mut first = Bytes::from_static(FIRST_WRITE);
+        service
+            .tcp_try_write(stream, &mut first)
+            .expect("the established stream should take a write");
+        cpu.advance(SECOND);
+        from_peer(1, 1 + FIRST_WRITE.len() as u32, TcpFlags::ACK, 0);
+        poll();
+
+        // A write that fills the send queue and has nowhere to send it.
+        let drives_before = device.receive_drains();
+        device.panic_past_receive_drains(drives_before + DRIVES_UNTIL_PARKED);
+        let writer = service.tcp_write_all_bytes(
+            stream,
+            Bytes::from(alloc::vec![0xa5; TCP_TRANSMIT_BUFFER_BYTES + 4096]),
+            u64::MAX,
+        );
+        let mut writer = core::pin::pin!(writer);
+        assert!(
+            block_on(poll_once(writer.as_mut())).is_none(),
+            "the write parks on the closed window"
+        );
+        let drives_parked = device.receive_drains() - drives_before;
+        assert!(drives_parked <= DRIVES_UNTIL_PARKED);
+        // The window opens: the wake the ACK raises is the one drive
+        // that sends again.
+        let frames_before = device.transmitted_frames().len();
+        from_peer(1, 1 + FIRST_WRITE.len() as u32, TcpFlags::ACK, u16::MAX);
+        assert!(block_on(poll_once(writer.as_mut())).is_none());
+        let wire = device.transmitted_frames()[frames_before..]
+            .iter()
+            .map(|frame| family.classify(frame))
+            .collect::<Vec<_>>();
+        assert!(
+            wire.iter()
+                .any(|wire| matches!(wire, Wire::Tcp { payload, .. } if !payload.is_empty())),
+            "the opened window releases the queued bytes: {wire:?}"
+        );
+        assert!(
+            device.receive_drains() - drives_before <= 2 * DRIVES_UNTIL_PARKED,
+            "the window opening costs a bounded number of drives"
+        );
     }
 
     /// The receive rule and the placement rule have to agree, or a
