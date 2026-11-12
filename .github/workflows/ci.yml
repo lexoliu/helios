@@ -1569,16 +1569,19 @@ jobs:
           sudo rm -f /etc/apt/sources.list.d/google-chrome*
           sudo apt-get update
           # The build dependencies of both pinned builds, Mesa's lavapipe
-          # as the host Vulkan driver, and the kernel modules that give a
-          # GPU-less runner a render node (vgem) for QEMU's EGL context
-          # and the udmabuf device a guest blob reaches the host through.
+          # as the host Vulkan driver.
           sudo apt-get install -y --no-install-recommends \
             libudev-dev just cmake ninja-build meson ovmf \
             python3-venv pkg-config flex bison \
             libglib2.0-dev libpixman-1-dev libslirp-dev zlib1g-dev \
             libepoxy-dev libdrm-dev libgbm-dev libvulkan-dev \
-            mesa-vulkan-drivers libegl-mesa0 \
-            "linux-modules-extra-$(uname -r)"
+            mesa-vulkan-drivers libegl-mesa0
+          # The kernel modules that give a GPU-less runner a render node
+          # (vgem) for QEMU's EGL context and the udmabuf device a guest
+          # blob reaches the host through. The runner's azure kernel has
+          # no linux-modules-extra package; its one modules package is
+          # expected to carry both, and modinfo names the one it lacks.
+          modinfo -n vgem udmabuf
           sudo modprobe vgem
           sudo modprobe udmabuf
           sudo chmod 666 /dev/kvm /dev/udmabuf /dev/dri/renderD*
