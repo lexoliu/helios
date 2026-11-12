@@ -783,7 +783,7 @@ where
         let identifier = self
             .inner
             .state
-            .with_mut(NetworkShard::next_icmp_echo_identifier);
+            .with_mut(NetworkShard::draw_icmp_echo_identifier);
         let mut sequence: u16 = 0;
         // Every candidate shares the caller's deadline, exactly as the
         // connect walk does: a destination that is unreachable in one
@@ -2540,7 +2540,7 @@ mod tests {
         });
         let key = IcmpEchoKey {
             destination: IpAddress::Ipv4(remote),
-            identifier: state.next_icmp_echo_identifier(),
+            identifier: state.draw_icmp_echo_identifier(),
             sequence: 1,
         };
         let payload = icmp_echo_payload();
@@ -4164,6 +4164,21 @@ mod tests {
             ids.windows(2)
                 .any(|pair| pair[1] != pair[0].wrapping_add(1)),
             "ids were handed out in order: {ids:?}"
+        );
+    }
+
+    /// An echo identifier is nonzero, and successive pings are not
+    /// counted up.
+    #[test]
+    fn icmp_echo_identifiers_are_random_and_nonzero() {
+        let mut shard = test_network_shard();
+        let identifiers: Vec<u16> = (0..32).map(|_| shard.draw_icmp_echo_identifier()).collect();
+        assert!(identifiers.iter().all(|&identifier| identifier != 0));
+        assert!(
+            identifiers
+                .windows(2)
+                .any(|pair| pair[1] != pair[0].wrapping_add(1)),
+            "identifiers were handed out in order: {identifiers:?}"
         );
     }
 
