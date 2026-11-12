@@ -484,7 +484,7 @@ def test_keep_going_preserves_failed_workload_logs(jobs):
 
 @pytest.mark.parametrize(
     ("filename", "job", "condition"),
-    [("ci.yml", "bench", "failure()"), ("bench-suite.yml", "suite", "always()")],
+    [("bench-lane.yml", "bench", "failure()"), ("bench-suite.yml", "suite", "always()")],
 )
 def test_benchmark_diagnostics_keep_symbols_but_not_kernels_or_keys(filename, job, condition, tmp_path):
     workflow = yaml.load((REPO_ROOT / ".github/workflows" / filename).read_text(), Loader=yaml.BaseLoader)
@@ -518,8 +518,8 @@ def test_benchmark_diagnostics_keep_symbols_but_not_kernels_or_keys(filename, jo
     assert not (set(kernels) | {key}) & matched
 
 
-def test_ci_preserves_the_built_kernel_before_starting_guests():
-    workflow = yaml.load((REPO_ROOT / ".github/workflows/ci.yml").read_text(), Loader=yaml.BaseLoader)
+def test_bench_lane_preserves_the_built_kernel_before_starting_guests():
+    workflow = yaml.load((REPO_ROOT / ".github/workflows/bench-lane.yml").read_text(), Loader=yaml.BaseLoader)
     steps = workflow["jobs"]["bench"]["steps"]
     names = [step.get("name") for step in steps]
     build = names.index("Build the Helios guest and inspector")
@@ -607,7 +607,7 @@ def _step_index(steps: list[dict], predicate) -> int:
 
 def test_every_vsock_boot_is_preceded_by_the_device_provisioning():
     """The device is provisioned by one action wherever a guest is booted
-    with `--rpc-transport vsock`: the riscv64 smoke step, CI's own bench
+    with `--rpc-transport vsock`: the riscv64 smoke step, the nightly bench
     lane, and `bench-host` for the suite and the PGO collection (#413)."""
     workflow = yaml.load((REPO_ROOT / ".github/workflows/ci.yml").read_text(), Loader=yaml.BaseLoader)
     smoke = workflow["jobs"]["smoke-riscv64"]["steps"]
@@ -619,12 +619,15 @@ def test_every_vsock_boot_is_preceded_by_the_device_provisioning():
     assert provision < boot
     assert "--rpc-transport vsock" in smoke[boot]["run"]
 
-    bench = workflow["jobs"]["bench"]["steps"]
+    lane_workflow = yaml.load(
+        (REPO_ROOT / ".github/workflows/bench-lane.yml").read_text(), Loader=yaml.BaseLoader
+    )
+    bench = lane_workflow["jobs"]["bench"]["steps"]
     provision = _step_index(bench, lambda step: step.get("uses") == VHOST_VSOCK_ACTION)
     run = _step_index(bench, lambda step: step.get("name") == "Run Helios workload benchmarks")
     assert provision < run
     assert bench[run]["env"]["HELIOS_WORKLOAD_BENCH_RPC_TRANSPORT"] == "${{ matrix.rpc-transport }}"
-    (lane,) = workflow["jobs"]["bench"]["strategy"]["matrix"]["include"]
+    (lane,) = lane_workflow["jobs"]["bench"]["strategy"]["matrix"]["include"]
     assert lane["rpc-transport"] == "vsock"
 
     host = yaml.load(

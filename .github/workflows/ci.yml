@@ -17,39 +17,114 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Decides which lanes a change needs, so a lane runs only when the
+  # change touches what it reads (#687). `.github/ci-lanes.json` maps each
+  # lane to the surfaces it reads; the filters below name those surfaces
+  # by path. A skipped lane reports as skipped, which a required check
+  # counts as passing; no ruleset on `dev` requires a lane of this
+  # workflow. A dispatch and a push to `dev` run every lane.
+  changes:
+    name: changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      # JSON array of the lane names to run.
+      lanes: ${{ steps.select.outputs.lanes }}
+      # JSON array of {name, command} for the legs of the `checks` matrix.
+      checks: ${{ steps.select.outputs.checks }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/ci-lanes.json
+          sparse-checkout-cone-mode: false
+      - uses: dorny/paths-filter@v4
+        id: filter
+        if: github.event_name == 'pull_request'
+        with:
+          # `shared` is everything no narrower surface claims, so a new
+          # top-level path runs every lane until a surface claims it;
+          # `docs/**` and Markdown run none, except the Wasmtime pin
+          # the CI checkout reads.
+          predicate-quantifier: some-with-excludes
+          filters: |
+            shared:
+              - '**'
+              - '!aarch64/**'
+              - '!riscv/**'
+              - '!x86/**'
+              - '!hosted/**'
+              - '!inspector/**'
+              - '!inspector-protocol/**'
+              - '!cli/**'
+              - '!compiler-support/**'
+              - '!profdata/**'
+              - '!workspace-root/**'
+              - '!programs/**'
+              - '!api/**'
+              - '!api-macro/**'
+              - '!compiler-plugin/**'
+              - '!docs/**'
+              - '!**/*.md'
+            pin:
+              - 'docs/wasmtime.md'
+            aarch64:
+              - 'aarch64/**'
+            riscv:
+              - 'riscv/**'
+            x86:
+              - 'x86/**'
+            hosted:
+              - 'hosted/**'
+            host_tools:
+              - 'inspector/**'
+              - 'inspector-protocol/**'
+              - 'cli/**'
+              - 'compiler-support/**'
+              - 'profdata/**'
+              - 'workspace-root/**'
+            programs:
+              - 'programs/**'
+              - 'api/**'
+              - 'api-macro/**'
+              - 'compiler-plugin/**'
+      - id: select
+        env:
+          CHANGED: ${{ steps.filter.outputs.changes || 'null' }}
+        run: |
+          set -euo pipefail
+          lanes="$(jq -c --argjson changed "${CHANGED}" '
+            to_entries
+            | map(select($changed == null
+                or (.value.surfaces + ["shared", "pin"]
+                    | any(. as $surface | $changed | index($surface)))))
+            | map(.key)' .github/ci-lanes.json)"
+          checks="$(jq -c --argjson lanes "${lanes}" '
+            to_entries
+            | map(select(.value.command and (.key as $name | $lanes | index($name))))
+            | map({name: .key, command: .value.command})' .github/ci-lanes.json)"
+          echo "lanes=${lanes}" >> "$GITHUB_OUTPUT"
+          echo "checks=${checks}" >> "$GITHUB_OUTPUT"
+          echo "${lanes}"
+
   checks:
     name: ${{ matrix.name }}
+    needs: changes
+    # An empty matrix is an error, not a skip.
+    if: needs.changes.outputs.checks != '[]'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: check-host
-            command: just check-host
-          - name: check-aarch64
-            command: just check-target aarch64-unknown-none helios-aarch64
-          - name: check-riscv
-            command: just check-target riscv64gc-unknown-none-elf helios-riscv
-          - name: check-x86
-            command: just check-target x86_64-unknown-none helios-x86
-          - name: test-embedded-debugger
-            command: just test-embedded-debugger
-          # `just lint` runs these five gates back to back locally; CI
-          # splits them so a lint failure names the surface it came from
-          # and each lane keeps its own build cache.
-          - name: lint-fmt
-            command: just fmt-check && just deny-check
-          - name: lint-host
-            command: just clippy-host && just clippy-programs
-          - name: lint-aarch64
-            command: just clippy-target aarch64-unknown-none helios-aarch64
-          - name: lint-riscv
-            command: just clippy-target riscv64gc-unknown-none-elf helios-riscv
-          - name: lint-x86
-            command: just clippy-target x86_64-unknown-none helios-x86
-          - name: test-units
-            command: just test-units
+        # The legs and their commands live in `.github/ci-lanes.json`
+        # beside the surfaces each reads; `changes` keeps the ones this
+        # change needs. `just lint` runs its gates back to back locally;
+        # CI splits them so a lint failure names the surface it came from
+        # and each lane keeps its own build cache.
+        include: ${{ fromJSON(needs.changes.outputs.checks) }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -91,6 +166,8 @@ jobs:
 
   smoke-riscv64:
     name: smoke-riscv64
+    needs: changes
+    if: contains(fromJSON(needs.changes.outputs.lanes), 'smoke-riscv64')
     runs-on: ubuntu-24.04
     timeout-minutes: 300
     steps:
@@ -360,6 +437,8 @@ jobs:
   # boot needs, which the inspector finds through the prefix.
   smoke-aarch64:
     name: smoke-aarch64
+    needs: changes
+    if: contains(fromJSON(needs.changes.outputs.lanes), 'smoke-aarch64')
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 300
     env:
@@ -389,7 +468,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.QEMU_PREFIX }}
-          key: qemu-${{ env.QEMU_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+          # The configure flags are part of the key: a build made with
+          # other flags is a different install (#687).
+          key: qemu-${{ env.QEMU_VERSION }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/.github/qemu/aarch64-configure.args') }}
       - name: Build the pinned QEMU
         if: steps.qemu-cache.outputs.cache-hit != 'true'
         run: |
@@ -402,14 +483,9 @@ jobs:
           # aarch64-softmmu is the only target this lane boots, and the
           # inspector's default network backend is `user`, which has been
           # external libslirp since 8.0.
-          ./configure \
-            --prefix="${QEMU_PREFIX}" \
-            --target-list=aarch64-softmmu \
-            --enable-slirp \
-            --disable-docs \
-            --disable-gtk \
-            --disable-sdl \
-            --disable-vnc
+          # The flags live in a file the cache key hashes.
+          mapfile -t flags < "${GITHUB_WORKSPACE}/helios/.github/qemu/aarch64-configure.args"
+          ./configure --prefix="${QEMU_PREFIX}" "${flags[@]}"
           ninja -C build install
       - name: Put the pinned QEMU on PATH
         run: |
@@ -555,6 +631,8 @@ jobs:
 
   smoke-x86-64:
     name: smoke-x86-64
+    needs: changes
+    if: contains(fromJSON(needs.changes.outputs.lanes), 'smoke-x86-64')
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -646,12 +724,18 @@ jobs:
           # backend installs every function it finds rather than the
           # first (#301). This is the only x86-64 KVM boot that carries
           # them; the developer machines have no KVM.
+          # Two `--disk` images ride on it too: every disk with a serial
+          # other than the scratch disk's is a mount source, and
+          # `helios-data` stays the scratch disk beside them (#510).
+          truncate -s 64M "$runtime/src-a.img" "$runtime/src-b.img"
           ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
             --accel kvm \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --qemu-arg -device --qemu-arg virtio-keyboard-pci \
             --qemu-arg -device --qemu-arg virtio-mouse-pci \
             --qemu-arg -device --qemu-arg virtio-tablet-pci \
+            --disk "$runtime/src-a.img,serial=src-a" \
+            --disk "$runtime/src-b.img,serial=src-b,readonly" \
             --boot-program dash --boot-program debugger --no-compiler-plugin \
             shell -c 'echo ok' 2>&1 > boot-smoke.out | tee "$runtime/inspector.log"
           cat boot-smoke.out
@@ -660,6 +744,11 @@ jobs:
           # has, and `debug-serial.log` is the host's raw copy of it.
           grep -F 'virtio-input online' "$runtime/debug-serial.log"
           test "$(grep -cF 'virtio-input online' "$runtime/debug-serial.log")" -eq 3
+          # The log carries the console's colour escapes, so these read
+          # it as text (`-a`) to print the matching line.
+          grep -aF 'mount source online serial="src-a"' "$runtime/debug-serial.log" | grep -aF 'read_only=false'
+          grep -aF 'mount source online serial="src-b"' "$runtime/debug-serial.log" | grep -aF 'read_only=true'
+          grep -aF 'block device identified as the kernel scratch disk serial="helios-data"' "$runtime/debug-serial.log"
       - name: Run the coreutils applets through dash
         shell: bash
         working-directory: helios
@@ -1172,8 +1261,9 @@ jobs:
             --qemu-trace trace:virtio_gpu_update_cursor \
             --qemu-trace-log "$runtime/qemu-trace.log" \
             --boot-program dash --boot-program debugger \
-            --boot-program compositor \
+            --boot-program compositor --boot-program surface-test \
             screendump \
+              --run /bin/surface-test --run-wait-seconds 60 \
               --input tools/desktop/desktop-probe.input --input-interval-ms 150 \
               --settle-seconds 20 "$captures/compositor.png" \
             2>&1 | tee "$runtime/inspector.log"
@@ -1186,6 +1276,13 @@ jobs:
             "$runtime/inspector.log"
           grep -Eq 'compositor:frame sequence=[0-9]+ regions=[0-9]+ cursor=[0-9]+,[0-9]+' \
             "$runtime/inspector.log"
+          # The first client window the desktop ever saw: surface-test
+          # asked for one, drew a frame and gave it back, and each of its
+          # three lines is evidence that part of the surface path ran —
+          # a missing one is a call the compositor did not survive.
+          grep -Fq 'surface-test:created' "$runtime/inspector.log"
+          grep -Fq 'surface-test:committed' "$runtime/inspector.log"
+          grep -Fq 'surface-test:destroyed' "$runtime/inspector.log"
           # Where the terminal put its top-left cell, read from the
           # guest's own line rather than assumed: the layout is the
           # desktop's business, and a check that guessed it would be
@@ -1407,301 +1504,3 @@ jobs:
             helios/target/kernel-prebuild/x86_64-unknown-none/profile-use/helios-bootfs
           if-no-files-found: error
           retention-days: 90
-
-  bench:
-    name: bench-${{ matrix.name }}
-    runs-on: ${{ matrix.runner }}
-    permissions:
-      contents: read
-      actions: read
-    # The lane builds the inspector and the guest, then boots once per
-    # workload class; a healthy run is around half an hour. The runner's
-    # own per-iteration deadline is what catches a hung workload, so
-    # this only has to catch a hang the runner cannot see — a build or a
-    # boot that never finishes — and it is set close enough to a real
-    # run that it does so in the same hour rather than three hours
-    # later.
-    timeout-minutes: 75
-    env:
-      HELIOS_NET_IFNAME: helios0
-      HELIOS_NET_BRIDGE: helios-br0
-      NET_BOOT_LOG: ${{ github.workspace }}/helios-bench-boot.log
-      BENCH_RUNTIME_DIR: ${{ github.workspace }}/bench-runtime
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: x86-64-linux
-            runner: ubuntu-24.04
-            helios-arch: x86-64
-            vm-memory: 2G
-            # Named rather than probed: a benchmark that quietly measured
-            # the emulator would be worse than no benchmark (#118), and
-            # this runner does publish /dev/kvm (probe run 33944339758).
-            accel: kvm
-            # The inspector RPC every row is timed around rides vsock,
-            # not the 16550 (#413); tools/bench/manifest.toml says the
-            # same for the suite's lane.
-            rpc-transport: vsock
-            # KVM boots in seconds; a marker hang should fail fast.
-            boot-timeout: "300"
-            # `instance-startup-100` gates this lane again. Neither
-            # thing that used to refuse it does now: the boot memory
-            # policy leaves all usable memory in the user pool and lets
-            # the kernel heap draw on it (#130), and the executor's task
-            # arena is a share of the machine rather than a fixed 1 MiB
-            # array (#159, #142), which on this 2 GiB guest is 7.25 MiB
-            # per processor against the ~8.5 KiB a live instance costs
-            # one. See docs/memory.md.
-            #
-            # `instance-startup-500` stays out, and for the machine
-            # rather than the executor: 500 instances want about 6.1 GiB
-            # of guest before the kernel's own baseline and this one has
-            # 2 GiB, so the cell would fail on memory whatever the arena
-            # holds. Measuring it needs a bigger guest, not a different
-            # kernel, and a failed cell is not something this lane is
-            # taught to tolerate.
-            workloads: >-
-              --skip-workload instance-startup-500
-            # Linux runners allow sudo, so the network workloads run over
-            # a multi-queue tap with vhost-net: the only host packet path
-            # on which the guest's virtio-net multiqueue, checksum and
-            # TSO paths exist at all. See docs/networking.md.
-            net-backend: tap
-            net-host: 10.77.0.1
-          # This is the only benchmark lane there is. Nearly everything
-          # a helios benchmark measures lives in the cross-platform
-          # kernel, so performance is single-architecture by decision,
-          # and x86-64 KVM is the one GitHub-hosted surface that can
-          # measure it: the Arm runners publish no /dev/kvm at all
-          # (`-accel kvm` there fails with "Could not access KVM kernel
-          # module", probe run 33944339758) and the macOS lane that used
-          # to stand in for them ran `"accel":["tcg"]` behind an HVF
-          # label (#118). aarch64 lanes in CI are functional smokes.
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          path: helios
-      - uses: ./helios/.github/actions/checkout-wasmtime
-      - name: Install host dependencies
-        run: |
-          sudo rm -f /etc/apt/sources.list.d/google-chrome*
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libudev-dev just cmake ninja-build \
-            qemu-system-x86 ovmf \
-            iproute2 nftables dnsmasq-base
-          # GitHub's x86-64 runners expose /dev/kvm; the inspector picks
-          # the accelerator by capability, this only fixes permissions.
-          if [ -e /dev/kvm ]; then
-            sudo chmod 666 /dev/kvm
-            ls -la /dev/kvm
-          fi
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: wasm-tools
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: 0.13.0
-      - name: Stage Limine bootloader share
-        run: |
-          git clone --depth 1 --branch v11.x-binary \
-            https://github.com/limine-bootloader/limine "$GITHUB_WORKSPACE/limine"
-          make -C "$GITHUB_WORKSPACE/limine"
-      - name: Restore WASI tooling artifacts
-        id: artifact-cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            helios/artifacts/wasi-tools
-            helios/artifacts/python3-root
-            helios/artifacts/wasix
-          key: wasi-artifacts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/tools/wasi-apps/**', 'helios/Cargo.lock') }}
-      - name: Stage WASI tooling artifacts
-        if: steps.artifact-cache.outputs.cache-hit != 'true'
-        working-directory: helios
-        run: tools/wasi-apps/build.sh
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: helios
-          key: bench-${{ matrix.name }}
-      - name: Install inferno flamegraph renderer
-        run: cargo install inferno --locked
-      # The guest image, its bootfs and the inspector are built here so
-      # the benchmark step below times guests rather than a cold cargo
-      # cache. Every class the driver then runs boots what this leaves in
-      # the target directory (#153), and the compile's cost is this
-      # step's own line in the job summary.
-      # Every x86-64 release build is built against the kernel profile
-      # the newest kernel-profile.yml run on the default branch uploaded
-      # (docs/pgo.md, #226, #313); the inspector refuses to build one
-      # without it rather than producing a plain kernel wearing a PGO
-      # label, so the fetch comes before the build. Reading the artifact
-      # is what the job's `actions: read` is for.
-      - name: Fetch the kernel profile
-        working-directory: helios
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: cargo run --release -p helios-cli -- profile-fetch
-      - name: Build the Helios guest and inspector
-        working-directory: helios
-        env:
-          HELIOS_WORKLOAD_BENCH_ARCH: ${{ matrix.helios-arch }}
-          HELIOS_WORKLOAD_BENCH_BUILD_ONLY: "1"
-        run: tools/wasi-apps/workload-bench.sh
-      - uses: astral-sh/setup-uv@v6
-      - name: Export benchmark function symbols
-        working-directory: helios/tools/bench
-        run: uv run helios-bench symbols --root ../.. --out-dir "$GITHUB_WORKSPACE/kernel-symbols"
-      - name: Preserve benchmark function symbols before boot
-        uses: actions/upload-artifact@v4
-        with:
-          name: bench-${{ matrix.name }}-kernel-symbols
-          path: kernel-symbols/**/*.symbols.json
-          if-no-files-found: error
-          retention-days: 7
-      - uses: ./helios/.github/actions/vhost-vsock
-      - name: Provision the multi-queue tap network backend
-        if: matrix.net-backend == 'tap'
-        working-directory: helios
-        run: |
-          # QEMU's vhost-net backend opens /dev/vhost-net itself; udev
-          # creates that node root:kvm mode 0660 and the runner account is
-          # not in the group, so without this QEMU warns four times, fails
-          # its tap client and asserts before the guest boots. The lane's
-          # pipeline status used to hide exactly that.
-          sudo modprobe vhost_net
-          sudo chmod 0666 /dev/vhost-net
-          ls -l /dev/vhost-net
-          ./target/release/helios-inspector vm net-setup \
-            --net-backend tap \
-            --net-ifname "${HELIOS_NET_IFNAME}" \
-            --net-bridge "${HELIOS_NET_BRIDGE}" \
-            --net-dhcp
-      - name: Run Helios workload benchmarks
-        working-directory: helios
-        env:
-          HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
-          HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
-          HELIOS_BOOT_SYNC_TIMEOUT_SECS: ${{ matrix.boot-timeout }}
-          HELIOS_WORKLOAD_BENCH_VM_MEMORY: ${{ matrix.vm-memory }}
-          HELIOS_WORKLOAD_BENCH_NET_BACKEND: ${{ matrix.net-backend }}
-          HELIOS_WORKLOAD_BENCH_RUNTIME_DIR: ${{ env.BENCH_RUNTIME_DIR }}
-          HELIOS_WORKLOAD_BENCH_ACCEL: ${{ matrix.accel }}
-          HELIOS_WORKLOAD_BENCH_RPC_TRANSPORT: ${{ matrix.rpc-transport }}
-          # No capture here. The network workloads are the only ones
-          # whose failure leaves nothing behind to read, but QEMU's
-          # netfilters attach to a single-queue netdev only, and this
-          # lane's whole point is a multi-queue tap — so a capture and
-          # this lane are mutually exclusive.
-          # `HELIOS_WORKLOAD_BENCH_NET_PCAP=1` takes one on any
-          # single-queue run; see docs/networking.md.
-        run: |
-          # Without this the step reports tee's status, not the
-          # command's, and a runner script that fails is invisible.
-          set -o pipefail
-          if [ "${{ matrix.net-backend }}" = tap ]; then
-            export HELIOS_WORKLOAD_BENCH_NET_IFNAME="${HELIOS_NET_IFNAME}"
-            export HELIOS_WORKLOAD_BENCH_NET_BRIDGE="${HELIOS_NET_BRIDGE}"
-            # One queue pair per host processor: the point of the tap
-            # backend is that the guest driver can actually fan out.
-            HELIOS_WORKLOAD_BENCH_NET_QUEUES="$(nproc)"
-            export HELIOS_WORKLOAD_BENCH_NET_QUEUES
-          fi
-          # The inspector echoes the guest's boot lines on stderr; the
-          # log is kept so the next step can record which virtio-net
-          # features this lane actually negotiated.
-          #
-          # The side budget is what bounds the lane: the per-class cap is
-          # what one healthy class may take, and this is what all of them
-          # together may take, inside the job's own 75 minutes.
-          python3 tools/wasi-apps/linux-gap-bench.py \
-            --arch ${{ matrix.helios-arch }} \
-            --skip-linux \
-            --allow-busy-host \
-            --helios-timeout-seconds 9000 \
-            --helios-side-timeout-seconds 3000 \
-            --helios-skip-build \
-            --helios-host-http-host ${{ matrix.net-host }} \
-            --helios-host-tcp-host ${{ matrix.net-host }} \
-            --out-dir target/perf-baselines/ci-${{ matrix.name }} \
-            ${{ matrix.workloads }} 2>&1 | tee "${NET_BOOT_LOG}"
-      - name: Report negotiated virtio-net features
-        if: always()
-        working-directory: helios
-        run: |
-          {
-            printf '### virtio-net feature set (%s)\n\n' '${{ matrix.name }}'
-            printf 'Backend: `%s`' '${{ matrix.net-backend }}'
-            if [ '${{ matrix.net-backend }}' = user ]; then
-              printf ' — single queue, no checksum or TSO offload; not\n'
-              printf 'comparable with the multi-queue tap lanes.'
-            fi
-            printf '\n\n```\n'
-            # One runtime subdirectory per workload class, so the logs
-            # are a level down from the directory the lane names.
-            find "${BENCH_RUNTIME_DIR}" -name '*.log' -print0 2>/dev/null \
-              | xargs -0 grep -h -e 'virtio-net online' -e 'virtio features negotiated' \
-                  "${NET_BOOT_LOG}" 2>/dev/null | sort -u \
-              || printf 'no virtio-net bring-up line was logged\n'
-            printf '```\n'
-          } >> "$GITHUB_STEP_SUMMARY"
-      # The same raw-capture check the smoke lanes run: the benchmark
-      # boots the guest twice per workload class, so this lane is where
-      # a rare byte loss on the debug serial shows up first (#102).
-      - name: Check the raw debug serial captures
-        if: always()
-        working-directory: helios
-        run: python3 tools/debug-serial-report.py "${BENCH_RUNTIME_DIR}"
-      # A bring-up failure leaves the inspector's one-line error and
-      # nothing else in the step log; the guest console and QEMU's own
-      # stderr live in the runtime directory, so collect it exactly as
-      # the smoke lanes do.
-      - name: Upload the inspector runtime directory
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: bench-${{ matrix.name }}-runtime
-          path: |
-            bench-runtime/**/*.log
-            bench-runtime/**/*.pcap
-            helios-bench-boot.log
-            kernel-symbols/**/*.symbols.json
-          if-no-files-found: warn
-      - name: Remove the tap network backend
-        if: always() && matrix.net-backend == 'tap'
-        working-directory: helios
-        run: |
-          ./target/release/helios-inspector vm net-teardown \
-            --net-backend tap \
-            --net-ifname "${HELIOS_NET_IFNAME}" \
-            --net-bridge "${HELIOS_NET_BRIDGE}"
-      - name: Summarize results
-        if: always()
-        working-directory: helios
-        run: |
-          python3 - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
-          import json
-          from pathlib import Path
-
-          out_dir = Path("target/perf-baselines/ci-${{ matrix.name }}")
-          print("### Helios workload medians (${{ matrix.name }})\n")
-          print("| workload | class | median (ms) | iterations (ms) |")
-          print("| --- | --- | --- | --- |")
-          for jsonl in sorted(out_dir.glob("helios*.jsonl")):
-              for line in jsonl.read_text().splitlines():
-                  row = json.loads(line)
-                  if row.get("type") != "summary":
-                      continue
-                  iters = ", ".join(f"{float(v):.3f}" for v in row.get("elapsed_ms", []))
-                  print(
-                      f"| {row['workload']} | {row['class']} "
-                      f"| {float(row['median_elapsed_ms']):.3f} | {iters} |"
-                  )
-          EOF
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: perf-baselines-${{ matrix.name }}
-          path: helios/target/perf-baselines/ci-${{ matrix.name }}/**
-          if-no-files-found: warn

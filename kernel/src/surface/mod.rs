@@ -62,9 +62,9 @@ use crate::buffer::{BufferError, ViewError};
 
 pub use instance::SurfaceOwnership;
 pub use service::{
-    MAX_INSTANCE_SURFACES, MAX_LIVE_SURFACES, ReturnedSurfaces, SURFACE_EVENT_QUEUE_DEPTH,
-    SURFACE_REQUEST_QUEUE_DEPTH, SurfaceCreate, SurfaceEvents, SurfaceGeometry, SurfaceId,
-    SurfaceRect, SurfaceRequest, SurfaceService, SurfaceShared,
+    MAX_INSTANCE_SURFACES, MAX_LIVE_SURFACES, ReturnedSurface, ReturnedSurfaces,
+    SURFACE_EVENT_QUEUE_DEPTH, SURFACE_REQUEST_QUEUE_DEPTH, SurfaceCreate, SurfaceEvents,
+    SurfaceGeometry, SurfaceId, SurfaceRect, SurfaceRequest, SurfaceService, SurfaceShared,
 };
 
 /// Why a surface request was refused.

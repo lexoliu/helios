@@ -1751,6 +1751,9 @@ dependencies = [
 [[package]]
 name = "helios-compiler-abi"
 version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.21",
+]
 
 [[package]]
 name = "helios-compiler-plugin"
@@ -2003,6 +2006,7 @@ dependencies = [
  "wasmparser 0.245.1",
  "wasmtime",
  "wasmtime-wasi-io",
+ "zrip",
 ]
 
 [[package]]
@@ -2096,6 +2100,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "helios-surface-test"
+version = "0.1.0"
+dependencies = [
+ "helios-api",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "helios-venus"
 version = "0.1.0"
 dependencies = [
@@ -2130,6 +2142,7 @@ version = "0.1.0"
 dependencies = [
  "arrayvec",
  "async-lock",
+ "atomic-waker",
  "bitflags 2.13.1",
  "bytes",
  "critical-section",
@@ -5443,4 +5456,35 @@ dependencies = [
  "crc32fast",
  "log",
  "simd-adler32",
+]
+
+[[package]]
+name = "zrip"
+version = "0.8.16"
+source = "git+https://github.com/lexoliu/zrip?branch=compress-context-alloc#d83abccf8e6ed53b77c4965886033c194806c678"
+dependencies = [
+ "zrip-core",
+ "zrip-decode",
+ "zrip-encode",
+]
+
+[[package]]
+name = "zrip-core"
+version = "0.11.1"
+source = "git+https://github.com/lexoliu/zrip?branch=compress-context-alloc#d83abccf8e6ed53b77c4965886033c194806c678"
+
+[[package]]
+name = "zrip-decode"
+version = "0.8.13"
+source = "git+https://github.com/lexoliu/zrip?branch=compress-context-alloc#d83abccf8e6ed53b77c4965886033c194806c678"
+dependencies = [
+ "zrip-core",
+]
+
+[[package]]
+name = "zrip-encode"
+version = "0.9.4"
+source = "git+https://github.com/lexoliu/zrip?branch=compress-context-alloc#d83abccf8e6ed53b77c4965886033c194806c678"
+dependencies = [
+ "zrip-core",
 ]
