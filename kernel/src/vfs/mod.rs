@@ -68,7 +68,8 @@ use thiserror::Error;
 use triomphe::Arc;
 
 use crate::{
-    AuthorityDomain, BootFs, BootfsBytes, HostFileSystem, MountCap, ObjectIdentity, UnmountCap,
+    AuthorityDomain, BootFs, BootfsBytes, HostFileSystem, MountCap, ObjectIdentity, StoragePayer,
+    UnmountCap,
 };
 
 /// Mounts one table holds besides its root.
@@ -102,12 +103,20 @@ macro_rules! mount_kinds {
         }
 
         impl<H: HostFileSystem> FileSystem for MountedFs<H> {
+            type Payer = StoragePayer;
+
             async fn stat(&self, path: FsPath<'_>) -> FsResult<Metadata> {
                 match self { $(Self::$kind(fs) => fs.stat(path).await,)+ }
             }
 
-            async fn open(&self, path: FsPath<'_>, flags: OpenFlags, now: u64) -> FsResult<Metadata> {
-                match self { $(Self::$kind(fs) => fs.open(path, flags, now).await,)+ }
+            async fn open(
+                &self,
+                path: FsPath<'_>,
+                flags: OpenFlags,
+                now: u64,
+                payer: &StoragePayer,
+            ) -> FsResult<Metadata> {
+                match self { $(Self::$kind(fs) => fs.open(path, flags, now, payer).await,)+ }
             }
 
             async fn read_at(
@@ -125,23 +134,30 @@ macro_rules! mount_kinds {
                 position: WritePosition,
                 len: usize,
                 now: u64,
+                payer: &'a StoragePayer,
                 fill: F,
             ) -> impl Future<Output = FsResult<u64>> + Send + 'a
             where
-                F: FnOnce(&mut [u8]),
+                F: FnMut(&mut [u8]),
             {
                 // Each kind runs `fill` in this call, so the dispatch must
                 // too: the arms' futures are carried in one enum rather
                 // than awaited in an async body that would hold `fill`.
                 match self {
                     $(Self::$kind(fs) => MountedWrite::$kind {
-                        future: fs.write_with(path, position, len, now, fill),
+                        future: fs.write_with(path, position, len, now, payer, fill),
                     },)+
                 }
             }
 
-            async fn set_size(&self, path: FsPath<'_>, size: u64, now: u64) -> FsResult<()> {
-                match self { $(Self::$kind(fs) => fs.set_size(path, size, now).await,)+ }
+            async fn set_size(
+                &self,
+                path: FsPath<'_>,
+                size: u64,
+                now: u64,
+                payer: &StoragePayer,
+            ) -> FsResult<()> {
+                match self { $(Self::$kind(fs) => fs.set_size(path, size, now, payer).await,)+ }
             }
 
             async fn set_times(
@@ -150,10 +166,12 @@ macro_rules! mount_kinds {
                 access_nanos: Option<u64>,
                 modified_nanos: Option<u64>,
                 now: u64,
+                payer: &StoragePayer,
             ) -> FsResult<()> {
                 match self {
                     $(Self::$kind(fs) => {
-                        fs.set_times(path, access_nanos, modified_nanos, now).await
+                        fs.set_times(path, access_nanos, modified_nanos, now, payer)
+                            .await
                     })+
                 }
             }
@@ -167,16 +185,21 @@ macro_rules! mount_kinds {
                 match self { $(Self::$kind(fs) => fs.read_dir(path, cookie, max_entries).await,)+ }
             }
 
-            async fn create_directory(&self, path: FsPath<'_>, now: u64) -> FsResult<()> {
-                match self { $(Self::$kind(fs) => fs.create_directory(path, now).await,)+ }
+            async fn create_directory(
+                &self,
+                path: FsPath<'_>,
+                now: u64,
+                payer: &StoragePayer,
+            ) -> FsResult<()> {
+                match self { $(Self::$kind(fs) => fs.create_directory(path, now, payer).await,)+ }
             }
 
-            async fn remove_directory(&self, path: FsPath<'_>) -> FsResult<()> {
-                match self { $(Self::$kind(fs) => fs.remove_directory(path).await,)+ }
+            async fn remove_directory(&self, path: FsPath<'_>, payer: &StoragePayer) -> FsResult<()> {
+                match self { $(Self::$kind(fs) => fs.remove_directory(path, payer).await,)+ }
             }
 
-            async fn unlink(&self, path: FsPath<'_>) -> FsResult<()> {
-                match self { $(Self::$kind(fs) => fs.unlink(path).await,)+ }
+            async fn unlink(&self, path: FsPath<'_>, payer: &StoragePayer) -> FsResult<()> {
+                match self { $(Self::$kind(fs) => fs.unlink(path, payer).await,)+ }
             }
 
             async fn rename(
@@ -184,16 +207,31 @@ macro_rules! mount_kinds {
                 source: FsPath<'_>,
                 destination: FsPath<'_>,
                 now: u64,
+                payer: &StoragePayer,
             ) -> FsResult<()> {
-                match self { $(Self::$kind(fs) => fs.rename(source, destination, now).await,)+ }
+                match self {
+                    $(Self::$kind(fs) => fs.rename(source, destination, now, payer).await,)+
+                }
             }
 
-            async fn link(&self, existing: FsPath<'_>, link: FsPath<'_>, now: u64) -> FsResult<()> {
-                match self { $(Self::$kind(fs) => fs.link(existing, link, now).await,)+ }
+            async fn link(
+                &self,
+                existing: FsPath<'_>,
+                link: FsPath<'_>,
+                now: u64,
+                payer: &StoragePayer,
+            ) -> FsResult<()> {
+                match self { $(Self::$kind(fs) => fs.link(existing, link, now, payer).await,)+ }
             }
 
-            async fn symlink(&self, target: &str, link: FsPath<'_>, now: u64) -> FsResult<()> {
-                match self { $(Self::$kind(fs) => fs.symlink(target, link, now).await,)+ }
+            async fn symlink(
+                &self,
+                target: &str,
+                link: FsPath<'_>,
+                now: u64,
+                payer: &StoragePayer,
+            ) -> FsResult<()> {
+                match self { $(Self::$kind(fs) => fs.symlink(target, link, now, payer).await,)+ }
             }
 
             async fn read_link(&self, path: FsPath<'_>) -> FsResult<String> {
@@ -238,9 +276,12 @@ pub(crate) async fn write_bytes<F: FileSystem>(
     position: WritePosition,
     data: &[u8],
     now: u64,
+    payer: &F::Payer,
 ) -> FsResult<u64> {
-    fs.write_with(path, position, data.len(), now, |destination| {
-        destination.copy_from_slice(data)
+    let mut written = 0;
+    fs.write_with(path, position, data.len(), now, payer, |run| {
+        run.copy_from_slice(&data[written..written + run.len()]);
+        written += run.len();
     })
     .await
 }
@@ -1220,18 +1261,27 @@ impl<H: HostFileSystem> Namespace<H> {
     /// Removes the empty directory `absolute`. A mount point, or a
     /// directory with a mount point below it, is in use:
     /// [`FsError::Busy`].
-    pub async fn remove_directory(&self, absolute: &str) -> FsResult<()> {
+    pub async fn remove_directory(&self, absolute: &str, payer: &StoragePayer) -> FsResult<()> {
         let resolved = self.resolve(absolute)?;
         if resolved.is_mount_root() || self.holds_mounts(absolute) {
             return Err(FsError::Busy);
         }
-        resolved.writable()?.remove_directory(resolved.path()).await
+        resolved
+            .writable()?
+            .remove_directory(resolved.path(), payer)
+            .await
     }
 
     /// Renames within one mount; across two, [`FsError::CrossDevice`]. A
     /// directory with a mount point below it stays where it is:
     /// [`FsError::Busy`].
-    pub async fn rename(&self, source: &str, destination: &str, now: u64) -> FsResult<()> {
+    pub async fn rename(
+        &self,
+        source: &str,
+        destination: &str,
+        now: u64,
+        payer: &StoragePayer,
+    ) -> FsResult<()> {
         if self.holds_mounts(source) {
             return Err(FsError::Busy);
         }
@@ -1245,12 +1295,18 @@ impl<H: HostFileSystem> Namespace<H> {
         }
         source
             .writable()?
-            .rename(source.path(), destination.path(), now)
+            .rename(source.path(), destination.path(), now, payer)
             .await
     }
 
     /// Links within one mount; across two, [`FsError::CrossDevice`].
-    pub async fn link(&self, existing: &str, link: &str, now: u64) -> FsResult<()> {
+    pub async fn link(
+        &self,
+        existing: &str,
+        link: &str,
+        now: u64,
+        payer: &StoragePayer,
+    ) -> FsResult<()> {
         let existing = self.resolve(existing)?;
         let link = self.resolve(link)?;
         if !existing.same_mount(&link) {
@@ -1261,7 +1317,7 @@ impl<H: HostFileSystem> Namespace<H> {
         }
         existing
             .writable()?
-            .link(existing.path(), link.path(), now)
+            .link(existing.path(), link.path(), now, payer)
             .await
     }
 

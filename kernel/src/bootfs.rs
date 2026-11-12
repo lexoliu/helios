@@ -24,6 +24,7 @@ use helios_hal::fs::{
 };
 use triomphe::Arc;
 
+use crate::StoragePayer;
 use crate::vfs::cmp_to_children;
 
 /// File bytes exactly as the boot payload supplied them.
@@ -368,11 +369,21 @@ const fn entry_inode(index: usize) -> u64 {
 }
 
 impl FileSystem for BootFs {
+    /// The boot image is read-only, so no mutation commits storage and the
+    /// payer is ignored.
+    type Payer = StoragePayer;
+
     async fn stat(&self, path: FsPath<'_>) -> FsResult<Metadata> {
         self.index.metadata(path)
     }
 
-    async fn open(&self, path: FsPath<'_>, flags: OpenFlags, _now: u64) -> FsResult<Metadata> {
+    async fn open(
+        &self,
+        path: FsPath<'_>,
+        flags: OpenFlags,
+        _now: u64,
+        _payer: &StoragePayer,
+    ) -> FsResult<Metadata> {
         let metadata = match self.index.metadata(path) {
             Ok(metadata) => metadata,
             Err(FsError::NoEntry) if flags.contains(OpenFlags::CREATE) => {
@@ -408,15 +419,16 @@ impl FileSystem for BootFs {
         _: WritePosition,
         _: usize,
         _: u64,
+        _: &'a StoragePayer,
         _: F,
     ) -> impl Future<Output = FsResult<u64>> + Send + 'a
     where
-        F: FnOnce(&mut [u8]),
+        F: FnMut(&mut [u8]),
     {
         core::future::ready(Err(FsError::ReadOnly))
     }
 
-    async fn set_size(&self, _: FsPath<'_>, _: u64, _: u64) -> FsResult<()> {
+    async fn set_size(&self, _: FsPath<'_>, _: u64, _: u64, _: &StoragePayer) -> FsResult<()> {
         Err(FsError::ReadOnly)
     }
 
@@ -426,6 +438,7 @@ impl FileSystem for BootFs {
         _: Option<u64>,
         _: Option<u64>,
         _: u64,
+        _: &StoragePayer,
     ) -> FsResult<()> {
         Err(FsError::ReadOnly)
     }
@@ -439,27 +452,27 @@ impl FileSystem for BootFs {
         self.index.read_dir(path, cookie, max_entries)
     }
 
-    async fn create_directory(&self, _: FsPath<'_>, _: u64) -> FsResult<()> {
+    async fn create_directory(&self, _: FsPath<'_>, _: u64, _: &StoragePayer) -> FsResult<()> {
         Err(FsError::ReadOnly)
     }
 
-    async fn remove_directory(&self, _: FsPath<'_>) -> FsResult<()> {
+    async fn remove_directory(&self, _: FsPath<'_>, _: &StoragePayer) -> FsResult<()> {
         Err(FsError::ReadOnly)
     }
 
-    async fn unlink(&self, _: FsPath<'_>) -> FsResult<()> {
+    async fn unlink(&self, _: FsPath<'_>, _: &StoragePayer) -> FsResult<()> {
         Err(FsError::ReadOnly)
     }
 
-    async fn rename(&self, _: FsPath<'_>, _: FsPath<'_>, _: u64) -> FsResult<()> {
+    async fn rename(&self, _: FsPath<'_>, _: FsPath<'_>, _: u64, _: &StoragePayer) -> FsResult<()> {
         Err(FsError::ReadOnly)
     }
 
-    async fn link(&self, _: FsPath<'_>, _: FsPath<'_>, _: u64) -> FsResult<()> {
+    async fn link(&self, _: FsPath<'_>, _: FsPath<'_>, _: u64, _: &StoragePayer) -> FsResult<()> {
         Err(FsError::ReadOnly)
     }
 
-    async fn symlink(&self, _: &str, _: FsPath<'_>, _: u64) -> FsResult<()> {
+    async fn symlink(&self, _: &str, _: FsPath<'_>, _: u64, _: &StoragePayer) -> FsResult<()> {
         Err(FsError::ReadOnly)
     }
 
@@ -492,6 +505,7 @@ mod tests {
     };
 
     use super::{BootFs, EmbeddedBootDirectory, EmbeddedBootFile, EmbeddedBootFs};
+    use crate::StoragePayer;
 
     const IMAGE: EmbeddedBootFs = EmbeddedBootFs::new(
         &[EmbeddedBootDirectory::new("empty", 7)],
@@ -617,22 +631,24 @@ mod tests {
         assert_eq!(read.as_ref(), b"nti");
         let past_end = block_on(fs.read_at(path("lib/runtime.component"), 99, 3)).expect("reads");
         assert!(past_end.is_empty());
+        let payer = StoragePayer::for_test();
         assert_eq!(
             block_on(fs.write_with(
                 path("etc/config.txt"),
                 WritePosition::At(0),
                 1,
                 0,
+                &payer,
                 |_| panic!("a refused write needs no bytes"),
             )),
             Err(FsError::ReadOnly)
         );
         assert_eq!(
-            block_on(fs.open(path("etc/new"), OpenFlags::CREATE, 0)).map(drop),
+            block_on(fs.open(path("etc/new"), OpenFlags::CREATE, 0, &payer)).map(drop),
             Err(FsError::ReadOnly)
         );
         assert_eq!(
-            block_on(fs.unlink(path("etc/config.txt"))),
+            block_on(fs.unlink(path("etc/config.txt"), &payer)),
             Err(FsError::ReadOnly)
         );
     }

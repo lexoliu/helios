@@ -37,6 +37,7 @@ use spin::Mutex;
 use triomphe::Arc;
 
 use super::cmp_to_children;
+use crate::StoragePayer;
 
 const ROOT_INODE: u64 = 1;
 
@@ -475,7 +476,7 @@ impl MemoryFs {
         position: WritePosition,
         len: usize,
         now: u64,
-        fill: impl FnOnce(&mut [u8]),
+        mut fill: impl FnMut(&mut [u8]),
     ) -> FsResult<u64> {
         let mut landed = 0;
         self.state.lock().edit_contents(path, now, |contents| {
@@ -498,11 +499,19 @@ impl MemoryFs {
 }
 
 impl FileSystem for MemoryFs {
+    type Payer = StoragePayer;
+
     async fn stat(&self, path: FsPath<'_>) -> FsResult<Metadata> {
         self.state.lock().metadata(self.device, path)
     }
 
-    async fn open(&self, path: FsPath<'_>, flags: OpenFlags, now: u64) -> FsResult<Metadata> {
+    async fn open(
+        &self,
+        path: FsPath<'_>,
+        flags: OpenFlags,
+        now: u64,
+        _payer: &StoragePayer,
+    ) -> FsResult<Metadata> {
         let mut state = self.state.lock();
         match state.inode(path) {
             Ok((_, inode)) => {
@@ -553,17 +562,24 @@ impl FileSystem for MemoryFs {
         position: WritePosition,
         len: usize,
         now: u64,
+        _payer: &'a StoragePayer,
         fill: F,
     ) -> impl Future<Output = FsResult<u64>> + Send + 'a
     where
-        F: FnOnce(&mut [u8]),
+        F: FnMut(&mut [u8]),
     {
         // The write is done here, under the lock; the future only reports
         // it, so it holds nothing of `fill`.
         core::future::ready(self.write_now(path, position, len, now, fill))
     }
 
-    async fn set_size(&self, path: FsPath<'_>, size: u64, now: u64) -> FsResult<()> {
+    async fn set_size(
+        &self,
+        path: FsPath<'_>,
+        size: u64,
+        now: u64,
+        _payer: &StoragePayer,
+    ) -> FsResult<()> {
         let size = usize::try_from(size).map_err(|_| FsError::Overflow)?;
         self.state.lock().edit_contents(path, now, |contents| {
             contents.resize(size, 0);
@@ -577,6 +593,7 @@ impl FileSystem for MemoryFs {
         access_nanos: Option<u64>,
         modified_nanos: Option<u64>,
         now: u64,
+        _payer: &StoragePayer,
     ) -> FsResult<()> {
         let mut state = self.state.lock();
         let inode = state.inode_mut(path)?;
@@ -617,26 +634,43 @@ impl FileSystem for MemoryFs {
             .collect())
     }
 
-    async fn create_directory(&self, path: FsPath<'_>, now: u64) -> FsResult<()> {
+    async fn create_directory(
+        &self,
+        path: FsPath<'_>,
+        now: u64,
+        _payer: &StoragePayer,
+    ) -> FsResult<()> {
         let mut state = self.state.lock();
         state.require_new_name(path)?;
         state.insert(path, NodeKind::Directory, Bytes::new(), now);
         Ok(())
     }
 
-    async fn remove_directory(&self, path: FsPath<'_>) -> FsResult<()> {
+    async fn remove_directory(&self, path: FsPath<'_>, _payer: &StoragePayer) -> FsResult<()> {
         self.remove(path, true, false)
     }
 
-    async fn unlink(&self, path: FsPath<'_>) -> FsResult<()> {
+    async fn unlink(&self, path: FsPath<'_>, _payer: &StoragePayer) -> FsResult<()> {
         self.remove(path, false, false)
     }
 
-    async fn rename(&self, source: FsPath<'_>, destination: FsPath<'_>, now: u64) -> FsResult<()> {
+    async fn rename(
+        &self,
+        source: FsPath<'_>,
+        destination: FsPath<'_>,
+        now: u64,
+        _payer: &StoragePayer,
+    ) -> FsResult<()> {
         self.rename_over(source, destination, now, false)
     }
 
-    async fn link(&self, existing: FsPath<'_>, link: FsPath<'_>, now: u64) -> FsResult<()> {
+    async fn link(
+        &self,
+        existing: FsPath<'_>,
+        link: FsPath<'_>,
+        now: u64,
+        _payer: &StoragePayer,
+    ) -> FsResult<()> {
         let mut state = self.state.lock();
         let (number, inode) = state.inode(existing)?;
         if inode.kind == NodeKind::Directory {
@@ -654,7 +688,13 @@ impl FileSystem for MemoryFs {
         Ok(())
     }
 
-    async fn symlink(&self, target: &str, link: FsPath<'_>, now: u64) -> FsResult<()> {
+    async fn symlink(
+        &self,
+        target: &str,
+        link: FsPath<'_>,
+        now: u64,
+        _payer: &StoragePayer,
+    ) -> FsResult<()> {
         let mut state = self.state.lock();
         state.require_new_name(link)?;
         state.insert(
@@ -699,7 +739,13 @@ mod tests {
     };
 
     use super::MemoryFs;
+    use crate::StoragePayer;
     use crate::vfs::write_bytes;
+
+    /// Who pays for what the tests write: no instance in particular.
+    fn payer() -> StoragePayer {
+        StoragePayer::for_test()
+    }
 
     fn path(path: &str) -> FsPath<'_> {
         FsPath::new(path).expect("test paths are valid")
@@ -720,41 +766,89 @@ mod tests {
     #[test]
     fn creates_writes_and_reads_back_positionally() {
         let fs = tree();
-        block_on(fs.open(path("f"), OpenFlags::CREATE, 5)).expect("creates");
+        block_on(fs.open(path("f"), OpenFlags::CREATE, 5, &payer())).expect("creates");
         assert_eq!(
-            block_on(write_bytes(&fs, path("f"), WritePosition::At(2), b"cd", 6)),
+            block_on(write_bytes(
+                &fs,
+                path("f"),
+                WritePosition::At(2),
+                b"cd",
+                6,
+                &payer()
+            )),
             Ok(2),
             "writes past the end"
         );
         // The filesystem hands its own storage to the filler.
         assert_eq!(
-            block_on(
-                fs.write_with(path("f"), WritePosition::End, 2, 7, |destination| {
+            block_on(fs.write_with(
+                path("f"),
+                WritePosition::End,
+                2,
+                7,
+                &payer(),
+                |destination| {
                     assert_eq!(destination, [0, 0]);
                     destination.copy_from_slice(b"ef");
-                })
-            ),
+                }
+            )),
             Ok(4)
         );
         let read = block_on(fs.read_at(path("f"), 0, 64)).expect("reads");
         assert_eq!(read.as_ref(), b"\0\0cdef");
         let stat = block_on(fs.stat(path("f"))).expect("stats");
         assert_eq!((stat.size, stat.modified_nanos), (6, 7));
-        block_on(fs.open(path("f"), OpenFlags::TRUNCATE, 8)).expect("truncates");
+        block_on(fs.open(path("f"), OpenFlags::TRUNCATE, 8, &payer())).expect("truncates");
         assert_eq!(block_on(fs.stat(path("f"))).expect("stats").size, 0);
+    }
+
+    /// The contract of `write_with`'s `fill`: runs in order whose lengths
+    /// sum to the write, each byte supplied once. This tree keeps a file in
+    /// one `Bytes`, so a write is one run however many pages it spans; a
+    /// store of pages calls `fill` once per page run, and the last
+    /// assertion is what changes with it.
+    #[test]
+    fn a_write_fills_consecutive_runs_that_sum_to_its_length() {
+        const LEN: usize = 2 * 4096 + 17;
+        let fs = tree();
+        block_on(fs.open(path("f"), OpenFlags::CREATE, 0, &payer())).expect("creates");
+        let mut runs = Vec::new();
+        let mut supplied = 0_usize;
+        assert_eq!(
+            block_on(
+                fs.write_with(path("f"), WritePosition::At(0), LEN, 1, &payer(), |run| {
+                    runs.push(run.len());
+                    for byte in run {
+                        *byte = (supplied % 251) as u8;
+                        supplied += 1;
+                    }
+                })
+            ),
+            Ok(0)
+        );
+        assert_eq!(runs.iter().sum::<usize>(), LEN);
+        assert_eq!(runs, [LEN], "one run: the file is a single buffer");
+        let read = block_on(fs.read_at(path("f"), 0, LEN)).expect("reads");
+        assert!(
+            read.iter()
+                .enumerate()
+                .all(|(index, byte)| *byte == (index % 251) as u8),
+            "the runs landed in order"
+        );
     }
 
     #[test]
     fn a_hard_link_shares_the_inode_until_the_last_name_goes() {
         let fs = tree();
-        block_on(fs.open(path("a"), OpenFlags::CREATE, 0)).expect("creates");
-        block_on(fs.link(path("a"), path("b"), 1)).expect("links");
+        block_on(fs.open(path("a"), OpenFlags::CREATE, 0, &payer())).expect("creates");
+        block_on(fs.link(path("a"), path("b"), 1, &payer())).expect("links");
         block_on(write_bytes(
             &fs,
             path("b"),
             WritePosition::At(0),
             b"shared",
             2,
+            &payer(),
         ))
         .expect("writes");
         assert_eq!(
@@ -768,27 +862,27 @@ mod tests {
             (a.link_count, a.id),
             (2, block_on(fs.stat(path("b"))).expect("stats").id)
         );
-        block_on(fs.unlink(path("a"))).expect("unlinks");
+        block_on(fs.unlink(path("a"), &payer())).expect("unlinks");
         assert_eq!(block_on(fs.stat(path("b"))).expect("stats").link_count, 1);
     }
 
     #[test]
     fn rename_moves_a_subtree_and_refuses_moving_into_itself() {
         let fs = tree();
-        block_on(fs.create_directory(path("d"), 0)).expect("creates");
-        block_on(fs.open(path("d/f"), OpenFlags::CREATE, 0)).expect("creates");
-        block_on(fs.create_directory(path("dx"), 0)).expect("creates a prefix sibling");
+        block_on(fs.create_directory(path("d"), 0, &payer())).expect("creates");
+        block_on(fs.open(path("d/f"), OpenFlags::CREATE, 0, &payer())).expect("creates");
+        block_on(fs.create_directory(path("dx"), 0, &payer())).expect("creates a prefix sibling");
         // Sorts between `d` and `d/f`.
-        block_on(fs.open(path("d.x"), OpenFlags::CREATE, 0)).expect("creates");
+        block_on(fs.open(path("d.x"), OpenFlags::CREATE, 0, &payer())).expect("creates");
         assert_eq!(
-            block_on(fs.rename(path("d"), path("d/inner"), 1)),
+            block_on(fs.rename(path("d"), path("d/inner"), 1, &payer())),
             Err(FsError::NotPermitted)
         );
-        block_on(fs.rename(path("d"), path("e"), 1)).expect("renames");
+        block_on(fs.rename(path("d"), path("e"), 1, &payer())).expect("renames");
         assert_eq!(names(&fs, ""), ["d.x", "dx", "e"]);
         assert_eq!(names(&fs, "e"), ["f"]);
         assert_eq!(
-            block_on(fs.remove_directory(path("e"))),
+            block_on(fs.remove_directory(path("e"), &payer())),
             Err(FsError::NotEmpty)
         );
     }
@@ -797,9 +891,9 @@ mod tests {
     fn listing_skips_grandchildren_and_resumes() {
         let fs = tree();
         for directory in ["a", "a/b", "c"] {
-            block_on(fs.create_directory(path(directory), 0)).expect("creates");
+            block_on(fs.create_directory(path(directory), 0, &payer())).expect("creates");
         }
-        block_on(fs.symlink("a", path("l"), 0)).expect("links");
+        block_on(fs.symlink("a", path("l"), 0, &payer())).expect("links");
         assert_eq!(names(&fs, ""), ["a", "c", "l"]);
         let first = block_on(fs.read_dir(FsPath::ROOT, DirCookie::START, 1)).expect("lists");
         let rest = block_on(fs.read_dir(FsPath::ROOT, first[0].next, 8)).expect("lists");

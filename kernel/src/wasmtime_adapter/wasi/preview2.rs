@@ -341,6 +341,9 @@ where
     runtime_state: HostRuntimeState<CpuImpl, Net, HostFs>,
     file: HeldPath<HostFs>,
     mode: WritePosition,
+    /// Who pays for what the stream writes: the writing instance,
+    /// captured when the stream was created.
+    payer: crate::StoragePayer,
     pending: Option<Bytes>,
     failure: Option<p2fs::ErrorCode>,
 }
@@ -400,12 +403,14 @@ where
         runtime_state: HostRuntimeState<CpuImpl, Net, HostFs>,
         file: HeldPath<HostFs>,
         mode: WritePosition,
+        payer: crate::StoragePayer,
     ) -> Self {
         Self {
             cpu,
             runtime_state,
             file,
             mode,
+            payer,
             pending: None,
             failure: None,
         }
@@ -426,7 +431,9 @@ where
             return;
         };
         let now = self.now_nanos();
-        match super::write_resolved(&self.file.resolved(), self.mode, &bytes, now).await {
+        match super::write_resolved(&self.file.resolved(), self.mode, &bytes, now, &self.payer)
+            .await
+        {
             Ok(end) => {
                 if let WritePosition::At(offset) = &mut self.mode {
                     *offset = end;
@@ -487,8 +494,13 @@ where
             Ok(file) => file,
             Err(error) => return Ok(Err(error)),
         };
-        let stream =
-            FileOutputStream::new(self.cpu.clone(), self.runtime_state.clone(), file, mode);
+        let stream = FileOutputStream::new(
+            self.cpu.clone(),
+            self.runtime_state.clone(),
+            file,
+            mode,
+            self.instance().storage_payer(),
+        );
         Ok(Ok(self.table.push(Box::new(stream) as DynOutputStream)?))
     }
 
@@ -1246,6 +1258,7 @@ where
     ) -> Result<core::result::Result<(), p2fs::ErrorCode>> {
         let target = self.p2_descriptor(&descriptor);
         let now = self.now_nanos();
+        let payer = self.instance().storage_payer();
         Ok(async {
             let (descriptor, namespace) = target?;
             super::set_size(
@@ -1253,6 +1266,7 @@ where
                 descriptor.grant().map_err(error_code_from_p3)?,
                 size,
                 now,
+                &payer,
             )
             .await
             .map_err(error_code_from_p3)
@@ -1273,6 +1287,7 @@ where
                     self.p2_timestamps(data_access_timestamp, data_modification_timestamp)?;
                 Ok((descriptor, namespace, access_nanos, modified_nanos, now))
             });
+        let payer = self.instance().storage_payer();
         Ok(async {
             let (descriptor, namespace, access_nanos, modified_nanos, now) = target?;
             super::set_times(
@@ -1281,6 +1296,7 @@ where
                 access_nanos,
                 modified_nanos,
                 now,
+                &payer,
             )
             .await
             .map_err(error_code_from_p3)
@@ -1316,6 +1332,7 @@ where
     ) -> Result<core::result::Result<u64, p2fs::ErrorCode>> {
         let target = self.p2_descriptor(&descriptor);
         let now = self.now_nanos();
+        let payer = self.instance().storage_payer();
         Ok(async {
             let (descriptor, namespace) = target?;
             super::write(
@@ -1324,6 +1341,7 @@ where
                 WritePosition::At(offset),
                 &buffer,
                 now,
+                &payer,
             )
             .await
             .map_err(error_code_from_p3)?;
@@ -1374,6 +1392,7 @@ where
     ) -> Result<core::result::Result<(), p2fs::ErrorCode>> {
         let target = self.p2_descriptor(&descriptor);
         let now = self.now_nanos();
+        let payer = self.instance().storage_payer();
         Ok(async {
             let (base, namespace) = target?;
             super::create_directory_at(
@@ -1381,6 +1400,7 @@ where
                 base.grant().map_err(error_code_from_p3)?,
                 &path,
                 now,
+                &payer,
             )
             .await
             .map_err(error_code_from_p3)
@@ -1435,6 +1455,7 @@ where
                     self.p2_timestamps(data_access_timestamp, data_modification_timestamp)?;
                 Ok((base, namespace, access_nanos, modified_nanos, now))
             });
+        let payer = self.instance().storage_payer();
         Ok(async {
             let (base, namespace, access_nanos, modified_nanos, now) = target?;
             super::set_times_at(
@@ -1444,6 +1465,7 @@ where
                 access_nanos,
                 modified_nanos,
                 now,
+                &payer,
             )
             .await
             .map_err(error_code_from_p3)
@@ -1468,6 +1490,7 @@ where
         let target = super::descriptor_pair_in(self, &source_descriptor, &destination_descriptor)
             .map_err(error_code_from_p3);
         let now = self.now_nanos();
+        let payer = self.instance().storage_payer();
         Ok(async {
             let (source_base, destination_base, namespace) = target?;
             super::link_at(
@@ -1477,6 +1500,7 @@ where
                 destination_base.grant().map_err(error_code_from_p3)?,
                 &destination_path,
                 now,
+                &payer,
             )
             .await
             .map_err(error_code_from_p3)
@@ -1494,6 +1518,7 @@ where
     ) -> Result<core::result::Result<Resource<FsDescriptor>, p2fs::ErrorCode>> {
         let target = self.p2_descriptor(&descriptor);
         let now = self.now_nanos();
+        let payer = self.instance().storage_payer();
         let opened = async {
             let (base, namespace) = target?;
             super::open_at(
@@ -1504,6 +1529,7 @@ where
                 open_flags_to_p3(open_flags),
                 descriptor_flags_to_p3(flags),
                 now,
+                &payer,
             )
             .await
             .map_err(error_code_from_p3)
@@ -1539,11 +1565,17 @@ where
         path: String,
     ) -> Result<core::result::Result<(), p2fs::ErrorCode>> {
         let target = self.p2_descriptor(&descriptor);
+        let payer = self.instance().storage_payer();
         Ok(async {
             let (base, namespace) = target?;
-            super::remove_directory_at(&namespace, base.grant().map_err(error_code_from_p3)?, &path)
-                .await
-                .map_err(error_code_from_p3)
+            super::remove_directory_at(
+                &namespace,
+                base.grant().map_err(error_code_from_p3)?,
+                &path,
+                &payer,
+            )
+            .await
+            .map_err(error_code_from_p3)
         }
         .await)
     }
@@ -1558,6 +1590,7 @@ where
         let target = super::descriptor_pair_in(self, &source_descriptor, &destination_descriptor)
             .map_err(error_code_from_p3);
         let now = self.now_nanos();
+        let payer = self.instance().storage_payer();
         Ok(async {
             let (source_base, destination_base, namespace) = target?;
             super::rename_at(
@@ -1567,6 +1600,7 @@ where
                 destination_base.grant().map_err(error_code_from_p3)?,
                 &destination_path,
                 now,
+                &payer,
             )
             .await
             .map_err(error_code_from_p3)
@@ -1589,6 +1623,7 @@ where
         }
         let target = self.p2_descriptor(&descriptor);
         let now = self.now_nanos();
+        let payer = self.instance().storage_payer();
         Ok(async {
             let (base, namespace) = target?;
             super::symlink_at(
@@ -1597,6 +1632,7 @@ where
                 &old_path,
                 &new_path,
                 now,
+                &payer,
             )
             .await
             .map_err(error_code_from_p3)
@@ -1610,11 +1646,17 @@ where
         path: String,
     ) -> Result<core::result::Result<(), p2fs::ErrorCode>> {
         let target = self.p2_descriptor(&descriptor);
+        let payer = self.instance().storage_payer();
         Ok(async {
             let (base, namespace) = target?;
-            super::unlink_file_at(&namespace, base.grant().map_err(error_code_from_p3)?, &path)
-                .await
-                .map_err(error_code_from_p3)
+            super::unlink_file_at(
+                &namespace,
+                base.grant().map_err(error_code_from_p3)?,
+                &path,
+                &payer,
+            )
+            .await
+            .map_err(error_code_from_p3)
         }
         .await)
     }
@@ -3429,6 +3471,7 @@ mod tests {
             p3fs::OpenFlags::CREATE | p3fs::OpenFlags::TRUNCATE,
             p3fs::DescriptorFlags::READ | p3fs::DescriptorFlags::WRITE,
             1,
+            &store.instance().storage_payer(),
         ))
         .expect("creating a file at the root must succeed");
         let write = |store: &mut test_store::TestStoreData,

@@ -7,20 +7,191 @@ use futures_lite::future::block_on;
 use helios_hal::fs::{FileSystemRights, NodeKind, WritePosition};
 
 use super::{
-    FsDescriptor, FsNodeKind, Granted, Kind, RegularFile, Right, Write, create_directory_at,
-    fs_types, link_at, metadata_hash, open_at, read, read_program_file, readlink_at,
-    remove_directory_at, rename_at, set_size, set_times, set_times_at, stat_at, stat_path,
-    symlink_at, unlink_file_at, write_program_file,
+    AnyKind, Directory, FsDescriptor, FsNodeKind, FsOpResult, Granted, Kind, Mutate, RegularFile,
+    Retime, Right, Touch, Write, fs_types, metadata_hash, read, read_program_file, readlink_at,
+    stat_at, stat_path,
 };
 use crate::wasmtime_adapter::component_host::ProgramSource;
 use crate::wasmtime_adapter::cwasm::{self, UntrustedCwasm};
 use crate::{
     AuthorityDomain, BOOT_DEVICE, BootFs, EmbeddedBootDirectory, EmbeddedBootFile, EmbeddedBootFs,
-    FileContents, Follow, HostShare, MemoryFs, MountTable, MountedFs, Namespace,
+    FileContents, Follow, HostShare, MemoryFs, MountTable, MountedFs, Namespace, StoragePayer,
     UnsupportedHostFileSystem, object_identity,
 };
 
 type TestNamespace = Namespace<UnsupportedHostFileSystem>;
+
+/// Who pays for what the tests write: no instance in particular, since
+/// these tests exercise the operations and not the accounting.
+fn payer() -> StoragePayer {
+    StoragePayer::for_test()
+}
+
+// The mutating operations of `super`, with the test payer supplied, so a
+// test reads as the operation it checks.
+
+async fn open_at(
+    namespace: &TestNamespace,
+    base: &FsDescriptor,
+    path_flags: fs_types::PathFlags,
+    path: &str,
+    open_flags: fs_types::OpenFlags,
+    requested: fs_types::DescriptorFlags,
+    now: u64,
+) -> FsOpResult<FsDescriptor> {
+    super::open_at(
+        namespace,
+        base,
+        path_flags,
+        path,
+        open_flags,
+        requested,
+        now,
+        &payer(),
+    )
+    .await
+}
+
+async fn write(
+    namespace: &TestNamespace,
+    file: Granted<'_, RegularFile, Write>,
+    position: WritePosition,
+    bytes: &[u8],
+    now: u64,
+) -> FsOpResult<u64> {
+    super::write(namespace, file, position, bytes, now, &payer()).await
+}
+
+async fn set_size(
+    namespace: &TestNamespace,
+    file: Granted<'_, RegularFile, Write>,
+    size: u64,
+    now: u64,
+) -> FsOpResult<()> {
+    super::set_size(namespace, file, size, now, &payer()).await
+}
+
+async fn set_times(
+    namespace: &TestNamespace,
+    target: Granted<'_, AnyKind, Touch>,
+    access_nanos: Option<u64>,
+    modified_nanos: Option<u64>,
+    now: u64,
+) -> FsOpResult<()> {
+    super::set_times(
+        namespace,
+        target,
+        access_nanos,
+        modified_nanos,
+        now,
+        &payer(),
+    )
+    .await
+}
+
+async fn set_times_at(
+    namespace: &TestNamespace,
+    base: Granted<'_, Directory, Retime>,
+    path: &str,
+    access_nanos: Option<u64>,
+    modified_nanos: Option<u64>,
+    now: u64,
+) -> FsOpResult<()> {
+    super::set_times_at(
+        namespace,
+        base,
+        path,
+        access_nanos,
+        modified_nanos,
+        now,
+        &payer(),
+    )
+    .await
+}
+
+async fn create_directory_at(
+    namespace: &TestNamespace,
+    base: Granted<'_, Directory, Mutate>,
+    path: &str,
+    now: u64,
+) -> FsOpResult<()> {
+    super::create_directory_at(namespace, base, path, now, &payer()).await
+}
+
+async fn remove_directory_at(
+    namespace: &TestNamespace,
+    base: Granted<'_, Directory, Mutate>,
+    path: &str,
+) -> FsOpResult<()> {
+    super::remove_directory_at(namespace, base, path, &payer()).await
+}
+
+async fn unlink_file_at(
+    namespace: &TestNamespace,
+    base: Granted<'_, Directory, Mutate>,
+    path: &str,
+) -> FsOpResult<()> {
+    super::unlink_file_at(namespace, base, path, &payer()).await
+}
+
+async fn rename_at(
+    namespace: &TestNamespace,
+    source_base: Granted<'_, Directory, Mutate>,
+    source_path: &str,
+    destination_base: Granted<'_, Directory, Mutate>,
+    destination_path: &str,
+    now: u64,
+) -> FsOpResult<()> {
+    super::rename_at(
+        namespace,
+        source_base,
+        source_path,
+        destination_base,
+        destination_path,
+        now,
+        &payer(),
+    )
+    .await
+}
+
+async fn link_at(
+    namespace: &TestNamespace,
+    source_base: &FsDescriptor,
+    source_path: &str,
+    destination_base: Granted<'_, Directory, Mutate>,
+    destination_path: &str,
+    now: u64,
+) -> FsOpResult<()> {
+    super::link_at(
+        namespace,
+        source_base,
+        source_path,
+        destination_base,
+        destination_path,
+        now,
+        &payer(),
+    )
+    .await
+}
+
+async fn symlink_at(
+    namespace: &TestNamespace,
+    base: Granted<'_, Directory, Mutate>,
+    target: &str,
+    path: &str,
+    now: u64,
+) -> FsOpResult<()> {
+    super::symlink_at(namespace, base, target, path, now, &payer()).await
+}
+
+async fn write_program_file(
+    namespace: &TestNamespace,
+    absolute: &str,
+    bytes: &[u8],
+    now: u64,
+) -> FsOpResult<()> {
+    super::write_program_file(namespace, absolute, bytes, now, &payer()).await
+}
 
 const IMAGE: EmbeddedBootFs = EmbeddedBootFs::new(
     &[
@@ -87,7 +258,7 @@ fn create_file(namespace: &TestNamespace, path: &str, bytes: &[u8]) -> FsDescrip
         fs_types::DescriptorFlags::READ | fs_types::DescriptorFlags::WRITE,
     )
     .expect("file creation must succeed");
-    block_on(super::write(
+    block_on(write(
         namespace,
         held(&descriptor),
         WritePosition::At(0),
@@ -165,7 +336,7 @@ fn writing_a_boot_image_file_writes_the_trees_own_copy() {
     )
     .expect("a boot image file opens for writing");
 
-    let end = block_on(super::write(
+    let end = block_on(write(
         &namespace,
         held(&descriptor),
         WritePosition::At(0),
@@ -340,7 +511,7 @@ fn hardlink_preserves_identity_and_shared_contents() {
         2
     );
 
-    block_on(super::write(
+    block_on(write(
         &namespace,
         held(&original),
         WritePosition::At(0),
@@ -675,7 +846,7 @@ fn writing_a_bootfs_node_drops_its_provenance() {
     // the file up first, and the copy's bytes are written bytes.
     let changes: [fn(&TestNamespace, &FsDescriptor) -> super::FsOpResult<()>; 3] = [
         |namespace, descriptor| {
-            block_on(super::write(
+            block_on(write(
                 namespace,
                 held(descriptor),
                 WritePosition::At(0),
@@ -851,7 +1022,7 @@ fn an_append_resolves_with_the_end_of_file_it_reached() {
         fs_types::DescriptorFlags::WRITE,
     )
     .expect("a second writer opens the file");
-    let end = block_on(super::write(
+    let end = block_on(write(
         &namespace,
         held(&other),
         WritePosition::At(3),
@@ -861,7 +1032,7 @@ fn an_append_resolves_with_the_end_of_file_it_reached() {
     .expect("the second writer extends the file");
     assert_eq!(end, 3 + "日本語".len() as u64);
 
-    let end = block_on(super::write(
+    let end = block_on(write(
         &namespace,
         held(&appender),
         WritePosition::End,

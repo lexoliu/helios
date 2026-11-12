@@ -42,7 +42,7 @@ use helios_hal::fs::{
 
 use super::memory::UpperView;
 use super::{FileContents, MemoryFs, read_all};
-use crate::BootFs;
+use crate::{BootFs, StoragePayer};
 
 /// A namespace's root: its own writable tree over the shared boot image.
 #[derive(Clone)]
@@ -226,21 +226,31 @@ impl RootFs {
 }
 
 impl FileSystem for RootFs {
+    type Payer = StoragePayer;
+
     async fn stat(&self, path: FsPath<'_>) -> FsResult<Metadata> {
         self.find(path).map(|found| found.metadata)
     }
 
-    async fn open(&self, path: FsPath<'_>, flags: OpenFlags, now: u64) -> FsResult<Metadata> {
+    async fn open(
+        &self,
+        path: FsPath<'_>,
+        flags: OpenFlags,
+        now: u64,
+        payer: &StoragePayer,
+    ) -> FsResult<Metadata> {
         match self.find(path) {
-            Ok(found) if found.layer == Layer::Upper => self.upper.open(path, flags, now).await,
+            Ok(found) if found.layer == Layer::Upper => {
+                self.upper.open(path, flags, now, payer).await
+            }
             Ok(_) if flags.contains(OpenFlags::TRUNCATE) => {
                 self.copy_up(path)?;
-                self.upper.open(path, flags, now).await
+                self.upper.open(path, flags, now, payer).await
             }
-            Ok(_) => self.lower.open(path, flags, now).await,
+            Ok(_) => self.lower.open(path, flags, now, payer).await,
             Err(FsError::NoEntry) if flags.contains(OpenFlags::CREATE) => {
                 self.creatable(path)?;
-                self.upper.open(path, flags, now).await
+                self.upper.open(path, flags, now, payer).await
             }
             Err(error) => Err(error),
         }
@@ -259,10 +269,11 @@ impl FileSystem for RootFs {
         position: WritePosition,
         len: usize,
         now: u64,
+        _payer: &'a StoragePayer,
         fill: F,
     ) -> impl Future<Output = FsResult<u64>> + Send + 'a
     where
-        F: FnOnce(&mut [u8]),
+        F: FnMut(&mut [u8]),
     {
         // The copy-up and the write are done here; the future only reports
         // them, so it holds nothing of `fill`.
@@ -272,9 +283,15 @@ impl FileSystem for RootFs {
         )
     }
 
-    async fn set_size(&self, path: FsPath<'_>, size: u64, now: u64) -> FsResult<()> {
+    async fn set_size(
+        &self,
+        path: FsPath<'_>,
+        size: u64,
+        now: u64,
+        payer: &StoragePayer,
+    ) -> FsResult<()> {
         self.copy_up(path)?;
-        self.upper.set_size(path, size, now).await
+        self.upper.set_size(path, size, now, payer).await
     }
 
     async fn set_times(
@@ -283,10 +300,11 @@ impl FileSystem for RootFs {
         access_nanos: Option<u64>,
         modified_nanos: Option<u64>,
         now: u64,
+        payer: &StoragePayer,
     ) -> FsResult<()> {
         self.copy_up(path)?;
         self.upper
-            .set_times(path, access_nanos, modified_nanos, now)
+            .set_times(path, access_nanos, modified_nanos, now, payer)
             .await
     }
 
@@ -325,12 +343,17 @@ impl FileSystem for RootFs {
         Ok(entries)
     }
 
-    async fn create_directory(&self, path: FsPath<'_>, now: u64) -> FsResult<()> {
+    async fn create_directory(
+        &self,
+        path: FsPath<'_>,
+        now: u64,
+        payer: &StoragePayer,
+    ) -> FsResult<()> {
         self.creatable(path)?;
-        self.upper.create_directory(path, now).await
+        self.upper.create_directory(path, now, payer).await
     }
 
-    async fn remove_directory(&self, path: FsPath<'_>) -> FsResult<()> {
+    async fn remove_directory(&self, path: FsPath<'_>, _payer: &StoragePayer) -> FsResult<()> {
         let Some((parent, _)) = path.split_last() else {
             return Err(FsError::NotPermitted);
         };
@@ -350,7 +373,7 @@ impl FileSystem for RootFs {
         self.upper.remove(path, true, whiteout)
     }
 
-    async fn unlink(&self, path: FsPath<'_>) -> FsResult<()> {
+    async fn unlink(&self, path: FsPath<'_>, _payer: &StoragePayer) -> FsResult<()> {
         let Some((parent, _)) = path.split_last() else {
             return Err(FsError::IsDirectory);
         };
@@ -365,7 +388,13 @@ impl FileSystem for RootFs {
         self.upper.remove(path, false, whiteout)
     }
 
-    async fn rename(&self, source: FsPath<'_>, destination: FsPath<'_>, now: u64) -> FsResult<()> {
+    async fn rename(
+        &self,
+        source: FsPath<'_>,
+        destination: FsPath<'_>,
+        now: u64,
+        _payer: &StoragePayer,
+    ) -> FsResult<()> {
         let found = self.find(source)?;
         if source == destination {
             return Ok(());
@@ -379,18 +408,30 @@ impl FileSystem for RootFs {
         self.upper.rename_over(source, destination, now, whiteout)
     }
 
-    async fn link(&self, existing: FsPath<'_>, link: FsPath<'_>, now: u64) -> FsResult<()> {
+    async fn link(
+        &self,
+        existing: FsPath<'_>,
+        link: FsPath<'_>,
+        now: u64,
+        payer: &StoragePayer,
+    ) -> FsResult<()> {
         if self.find(existing)?.metadata.kind == NodeKind::Directory {
             return Err(FsError::NotPermitted);
         }
         self.creatable(link)?;
         self.copy_up(existing)?;
-        self.upper.link(existing, link, now).await
+        self.upper.link(existing, link, now, payer).await
     }
 
-    async fn symlink(&self, target: &str, link: FsPath<'_>, now: u64) -> FsResult<()> {
+    async fn symlink(
+        &self,
+        target: &str,
+        link: FsPath<'_>,
+        now: u64,
+        payer: &StoragePayer,
+    ) -> FsResult<()> {
         self.creatable(link)?;
-        self.upper.symlink(target, link, now).await
+        self.upper.symlink(target, link, now, payer).await
     }
 
     async fn read_link(&self, path: FsPath<'_>) -> FsResult<String> {
@@ -427,7 +468,12 @@ mod tests {
 
     use super::RootFs;
     use crate::vfs::{FileContents, MemoryFs, write_bytes};
-    use crate::{BootFs, EmbeddedBootDirectory, EmbeddedBootFile, EmbeddedBootFs};
+    use crate::{BootFs, EmbeddedBootDirectory, EmbeddedBootFile, EmbeddedBootFs, StoragePayer};
+
+    /// Who pays for what the tests write: no instance in particular.
+    fn payer() -> StoragePayer {
+        StoragePayer::for_test()
+    }
 
     const IMAGE: EmbeddedBootFs = EmbeddedBootFs::new(
         &[EmbeddedBootDirectory::new("bin/empty", 43)],
@@ -468,7 +514,7 @@ mod tests {
     }
 
     fn write(fs: &RootFs, file: &str, position: WritePosition, data: &[u8], now: u64) -> u64 {
-        block_on(write_bytes(fs, path(file), position, data, now)).expect("writes")
+        block_on(write_bytes(fs, path(file), position, data, now, &payer())).expect("writes")
     }
 
     fn contents(fs: &RootFs, file: &str) -> Vec<u8> {
@@ -480,8 +526,8 @@ mod tests {
     #[test]
     fn the_root_merges_both_layers_in_every_batch_size() {
         let fs = root();
-        block_on(fs.create_directory(path("d"), 1)).expect("creates in the upper root");
-        block_on(fs.open(path("d/f"), OpenFlags::CREATE, 1)).expect("creates");
+        block_on(fs.create_directory(path("d"), 1, &payer())).expect("creates in the upper root");
+        block_on(fs.open(path("d/f"), OpenFlags::CREATE, 1, &payer())).expect("creates");
         for batch in [1, 2, 64] {
             assert_eq!(
                 listing(&fs, "", batch),
@@ -502,7 +548,7 @@ mod tests {
         write(&fs, "init.txt", WritePosition::At(0), b"J", 2);
         assert_eq!(contents(&fs, "init.txt"), b"Jello");
         assert_eq!(write(&fs, "init.txt", WritePosition::End, b"!", 3), 5);
-        block_on(fs.set_size(path("etc/motd"), 9, 4)).expect("truncates a copy");
+        block_on(fs.set_size(path("etc/motd"), 9, 4, &payer())).expect("truncates a copy");
         assert_eq!(contents(&fs, "etc/motd"), "日本語".as_bytes());
         let copy = block_on(fs.stat(path("init.txt"))).expect("stats");
         assert_ne!(copy.id, boot_id, "the copy is the upper tree's object");
@@ -523,17 +569,17 @@ mod tests {
     #[test]
     fn a_new_name_goes_into_a_boot_directory() {
         let fs = root();
-        block_on(fs.open(path("bin/new"), OpenFlags::CREATE, 1)).expect("creates");
-        block_on(fs.create_directory(path("bin/empty/inner"), 1)).expect("creates");
-        block_on(fs.symlink("tool", path("bin/alias"), 1)).expect("links");
+        block_on(fs.open(path("bin/new"), OpenFlags::CREATE, 1, &payer())).expect("creates");
+        block_on(fs.create_directory(path("bin/empty/inner"), 1, &payer())).expect("creates");
+        block_on(fs.symlink("tool", path("bin/alias"), 1, &payer())).expect("links");
         assert_eq!(listing(&fs, "bin", 1), ["alias", "empty", "new", "tool"]);
         assert_eq!(listing(&fs, "bin/empty", 8), ["inner"]);
         assert_eq!(
-            block_on(fs.create_directory(path("bin"), 1)),
+            block_on(fs.create_directory(path("bin"), 1, &payer())),
             Err(FsError::Exists)
         );
         assert_eq!(
-            block_on(fs.open(path("init.txt/x"), OpenFlags::CREATE, 1)).map(drop),
+            block_on(fs.open(path("init.txt/x"), OpenFlags::CREATE, 1, &payer())).map(drop),
             Err(FsError::NotDirectory)
         );
     }
@@ -542,38 +588,39 @@ mod tests {
     fn removing_a_boot_object_leaves_a_whiteout() {
         let fs = root();
         assert_eq!(
-            block_on(fs.remove_directory(path("bin"))),
+            block_on(fs.remove_directory(path("bin"), &payer())),
             Err(FsError::NotEmpty)
         );
-        block_on(fs.unlink(path("bin/tool"))).expect("removes a boot file");
+        block_on(fs.unlink(path("bin/tool"), &payer())).expect("removes a boot file");
         assert_eq!(
             block_on(fs.stat(path("bin/tool"))).map(drop),
             Err(FsError::NoEntry)
         );
         assert_eq!(listing(&fs, "bin", 1), ["empty"]);
-        block_on(fs.remove_directory(path("bin/empty"))).expect("removes a boot directory");
-        block_on(fs.remove_directory(path("bin"))).expect("now empty");
+        block_on(fs.remove_directory(path("bin/empty"), &payer()))
+            .expect("removes a boot directory");
+        block_on(fs.remove_directory(path("bin"), &payer())).expect("now empty");
         assert_eq!(listing(&fs, "", 8), ["etc", "init.txt"]);
 
         // A copied-up file removed is hidden too, not uncovered.
         write(&fs, "init.txt", WritePosition::At(0), b"J", 1);
-        block_on(fs.unlink(path("init.txt"))).expect("removes the copy");
+        block_on(fs.unlink(path("init.txt"), &payer())).expect("removes the copy");
         assert_eq!(
             block_on(fs.stat(path("init.txt"))).map(drop),
             Err(FsError::NoEntry)
         );
 
         // A name made where a whiteout is starts afresh.
-        block_on(fs.open(path("init.txt"), OpenFlags::CREATE, 2)).expect("creates");
+        block_on(fs.open(path("init.txt"), OpenFlags::CREATE, 2, &payer())).expect("creates");
         assert_eq!(contents(&fs, "init.txt"), b"");
     }
 
     #[test]
     fn a_directory_made_over_a_whiteout_shows_nothing_beneath() {
         let fs = root();
-        block_on(fs.unlink(path("etc/motd"))).expect("removes");
-        block_on(fs.remove_directory(path("etc"))).expect("removes");
-        block_on(fs.create_directory(path("etc"), 1)).expect("makes it again");
+        block_on(fs.unlink(path("etc/motd"), &payer())).expect("removes");
+        block_on(fs.remove_directory(path("etc"), &payer())).expect("removes");
+        block_on(fs.create_directory(path("etc"), 1, &payer())).expect("makes it again");
         assert_eq!(listing(&fs, "etc", 8), Vec::<String>::new());
         assert_eq!(
             block_on(fs.stat(path("etc/motd"))).map(drop),
@@ -584,41 +631,43 @@ mod tests {
     #[test]
     fn renaming_copies_a_boot_file_up_and_refuses_a_boot_directory() {
         let fs = root();
-        block_on(fs.rename(path("init.txt"), path("moved.txt"), 1)).expect("renames");
+        block_on(fs.rename(path("init.txt"), path("moved.txt"), 1, &payer())).expect("renames");
         assert_eq!(contents(&fs, "moved.txt"), b"hello");
         assert_eq!(
             block_on(fs.stat(path("init.txt"))).map(drop),
             Err(FsError::NoEntry)
         );
         assert_eq!(
-            block_on(fs.rename(path("bin"), path("sbin"), 1)),
+            block_on(fs.rename(path("bin"), path("sbin"), 1, &payer())),
             Err(FsError::CrossDevice)
         );
         // Copied up by the new name, `bin` still merges the image.
-        block_on(fs.open(path("bin/new"), OpenFlags::CREATE, 1)).expect("creates");
+        block_on(fs.open(path("bin/new"), OpenFlags::CREATE, 1, &payer())).expect("creates");
         assert_eq!(
-            block_on(fs.rename(path("bin"), path("sbin"), 1)),
+            block_on(fs.rename(path("bin"), path("sbin"), 1, &payer())),
             Err(FsError::CrossDevice)
         );
-        block_on(fs.rename(path("bin/tool"), path("bin/empty/tool"), 1)).expect("renames");
+        block_on(fs.rename(path("bin/tool"), path("bin/empty/tool"), 1, &payer()))
+            .expect("renames");
         assert_eq!(listing(&fs, "bin", 8), ["empty", "new"]);
         assert_eq!(contents(&fs, "bin/empty/tool"), b"tool");
 
-        block_on(fs.create_directory(path("d"), 1)).expect("creates");
-        block_on(fs.rename(path("d"), path("bin/d"), 1)).expect("an upper directory moves");
+        block_on(fs.create_directory(path("d"), 1, &payer())).expect("creates");
+        block_on(fs.rename(path("d"), path("bin/d"), 1, &payer()))
+            .expect("an upper directory moves");
     }
 
     #[test]
     fn a_hard_link_to_a_boot_file_copies_it_up() {
         let fs = root();
-        block_on(fs.link(path("etc/motd"), path("motd"), 1)).expect("links");
+        block_on(fs.link(path("etc/motd"), path("motd"), 1, &payer())).expect("links");
         let original = block_on(fs.stat(path("etc/motd"))).expect("stats");
         let link = block_on(fs.stat(path("motd"))).expect("stats");
         assert_eq!((original.id, original.link_count), (link.id, 2));
         write(&fs, "motd", WritePosition::At(0), "中文".as_bytes(), 2);
         assert_eq!(&contents(&fs, "etc/motd")[..6], "中文".as_bytes());
         assert_eq!(
-            block_on(fs.link(path("bin"), path("bin2"), 1)),
+            block_on(fs.link(path("bin"), path("bin2"), 1, &payer())),
             Err(FsError::NotPermitted)
         );
     }
@@ -628,8 +677,8 @@ mod tests {
         let lower = BootFs::new(IMAGE, DeviceId::new(1));
         let first = RootFs::new(MemoryFs::new(DeviceId::new(4)), lower.clone());
         let second = RootFs::new(MemoryFs::new(DeviceId::new(4)), lower);
-        block_on(first.open(path("mine"), OpenFlags::CREATE, 1)).expect("creates");
-        block_on(first.unlink(path("bin/tool"))).expect("removes");
+        block_on(first.open(path("mine"), OpenFlags::CREATE, 1, &payer())).expect("creates");
+        block_on(first.unlink(path("bin/tool"), &payer())).expect("removes");
         assert_eq!(
             block_on(second.stat(path("mine"))).map(drop),
             Err(FsError::NoEntry)

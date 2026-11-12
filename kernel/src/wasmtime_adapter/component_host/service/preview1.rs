@@ -2436,11 +2436,12 @@ where
     let descriptor = descriptor.clone();
     let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
+    let payer = caller.data().instance().storage_payer();
     let file = match p1_grant(&descriptor) {
         Ok(file) => file,
         Err(errno) => return errno,
     };
-    wasi_fs::set_size(&namespace, file, size, now_nanos)
+    wasi_fs::set_size(&namespace, file, size, now_nanos, &payer)
         .await
         .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
@@ -2466,7 +2467,8 @@ where
     };
     let (access, modified, now_nanos) = p1_set_times_arguments(caller, atim, mtim, fstflags);
     let namespace = p1_namespace(caller);
-    wasi_fs::set_times(&namespace, target, access, modified, now_nanos)
+    let payer = caller.data().instance().storage_payer();
+    wasi_fs::set_times(&namespace, target, access, modified, now_nanos, &payer)
         .await
         .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
@@ -2548,11 +2550,12 @@ where
         return p1::errno::SUCCESS;
     }
     let now_nanos = caller.data().now_nanos();
+    let payer = caller.data().instance().storage_payer();
     let file = match p1_grant(&descriptor) {
         Ok(file) => file,
         Err(errno) => return errno,
     };
-    wasi_fs::set_size(&namespace, file, end, now_nanos)
+    wasi_fs::set_size(&namespace, file, end, now_nanos, &payer)
         .await
         .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
@@ -2712,12 +2715,14 @@ where
     let mut gather = Preview1Gather::new(memory, layout)?;
     let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
+    let payer = caller.data().instance().storage_payer();
     let (end, written) = {
         let file =
             wasi_fs::writable_file(&namespace, p1_grant(&descriptor)?).map_err(p1_errno_from_fs)?;
         let mut file = ResolvedFileChunks {
             file: &file,
             now_nanos,
+            payer: &payer,
         };
         p1_write_gathered(&mut gather, position, &mut file)
             .await
@@ -2736,6 +2741,7 @@ where
 struct ResolvedFileChunks<'file, 'namespace, HostFs: crate::HostFileSystem> {
     file: &'file crate::vfs::Resolved<'namespace, HostFs>,
     now_nanos: u64,
+    payer: &'file crate::StoragePayer,
 }
 
 impl<HostFs: crate::HostFileSystem> Preview1ChunkedFile for ResolvedFileChunks<'_, '_, HostFs> {
@@ -2747,9 +2753,14 @@ impl<HostFs: crate::HostFileSystem> Preview1ChunkedFile for ResolvedFileChunks<'
         position: WritePosition,
         len: usize,
     ) -> Result<u64, fs_types::ErrorCode> {
-        wasi_fs::write_resolved_with(self.file, position, len, self.now_nanos, |destination| {
-            gather.fill(destination)
-        })
+        wasi_fs::write_resolved_with(
+            self.file,
+            position,
+            len,
+            self.now_nanos,
+            self.payer,
+            |destination| gather.fill(destination),
+        )
         .await
     }
 }
@@ -3096,6 +3107,7 @@ where
 {
     let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
+    let payer = caller.data().instance().storage_payer();
     wasi_fs::open_at(
         &namespace,
         base,
@@ -3104,6 +3116,7 @@ where
         open_flags,
         descriptor_flags,
         now_nanos,
+        &payer,
     )
     .await
     .map_err(p1_errno_from_fs)
@@ -3133,11 +3146,12 @@ where
     };
     let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
+    let payer = caller.data().instance().storage_payer();
     let granted = match p1_grant(&base) {
         Ok(granted) => granted,
         Err(errno) => return errno,
     };
-    wasi_fs::create_directory_at(&namespace, granted, &path, now_nanos)
+    wasi_fs::create_directory_at(&namespace, granted, &path, now_nanos, &payer)
         .await
         .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
@@ -3219,9 +3233,12 @@ where
     };
     let (access, modified, now_nanos) = p1_set_times_arguments(caller, atim, mtim, fstflags);
     let namespace = p1_namespace(caller);
-    wasi_fs::set_times_at(&namespace, granted, &path, access, modified, now_nanos)
-        .await
-        .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
+    let payer = caller.data().instance().storage_payer();
+    wasi_fs::set_times_at(
+        &namespace, granted, &path, access, modified, now_nanos, &payer,
+    )
+    .await
+    .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
 
 #[expect(
@@ -3271,6 +3288,7 @@ where
         };
     let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
+    let payer = caller.data().instance().storage_payer();
     let destination = match p1_grant(&destination_base) {
         Ok(destination) => destination,
         Err(errno) => return errno,
@@ -3282,6 +3300,7 @@ where
         destination,
         &new_path,
         now_nanos,
+        &payer,
     )
     .await
     .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
@@ -3357,11 +3376,12 @@ where
         Err(errno) => return errno,
     };
     let namespace = p1_namespace(caller);
+    let payer = caller.data().instance().storage_payer();
     let granted = match p1_grant(&base) {
         Ok(granted) => granted,
         Err(errno) => return errno,
     };
-    wasi_fs::remove_directory_at(&namespace, granted, &path)
+    wasi_fs::remove_directory_at(&namespace, granted, &path, &payer)
         .await
         .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
@@ -3404,6 +3424,7 @@ where
         };
     let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
+    let payer = caller.data().instance().storage_payer();
     let (source, destination) = match (p1_grant(&source_base), p1_grant(&destination_base)) {
         (Ok(source), Ok(destination)) => (source, destination),
         (Err(errno), _) | (_, Err(errno)) => return errno,
@@ -3415,6 +3436,7 @@ where
         destination,
         &new_path,
         now_nanos,
+        &payer,
     )
     .await
     .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
@@ -3455,11 +3477,12 @@ where
     };
     let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
+    let payer = caller.data().instance().storage_payer();
     let granted = match p1_grant(&base) {
         Ok(granted) => granted,
         Err(errno) => return errno,
     };
-    wasi_fs::symlink_at(&namespace, granted, &target, &new_path, now_nanos)
+    wasi_fs::symlink_at(&namespace, granted, &target, &new_path, now_nanos, &payer)
         .await
         .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
@@ -3487,11 +3510,12 @@ where
         Err(errno) => return errno,
     };
     let namespace = p1_namespace(caller);
+    let payer = caller.data().instance().storage_payer();
     let granted = match p1_grant(&base) {
         Ok(granted) => granted,
         Err(errno) => return errno,
     };
-    wasi_fs::unlink_file_at(&namespace, granted, &path)
+    wasi_fs::unlink_file_at(&namespace, granted, &path, &payer)
         .await
         .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
@@ -4840,6 +4864,7 @@ mod tests {
             identity: None,
             mount: None,
         };
+        let payer = crate::StoragePayer::for_test();
         let file = block_on(wasi_fs::open_at(
             &namespace,
             &owner,
@@ -4848,6 +4873,7 @@ mod tests {
             fs_types::OpenFlags::CREATE,
             fs_types::DescriptorFlags::READ | fs_types::DescriptorFlags::WRITE,
             1,
+            &payer,
         ))
         .expect("the owner creates the file");
         block_on(wasi_fs::write(
@@ -4856,6 +4882,7 @@ mod tests {
             helios_hal::fs::WritePosition::At(0),
             "日本語 한국어".as_bytes(),
             2,
+            &payer,
         ))
         .expect("the owner writes the file");
 
@@ -4872,6 +4899,7 @@ mod tests {
                 p1_open_flags(8),
                 p1_descriptor_flags(rights, 0),
                 3,
+                &payer,
             ));
             assert!(matches!(opened, Err(fs_types::ErrorCode::ReadOnly)));
             let contents = block_on(wasi_fs::read(
@@ -4911,6 +4939,7 @@ mod tests {
             fs_types::OpenFlags::CREATE,
             fs_types::DescriptorFlags::READ,
             1,
+            &crate::StoragePayer::for_test(),
         ))
         .expect("the owner creates the file");
         namespace
@@ -4955,6 +4984,7 @@ mod tests {
             None,
             Some(77),
             78,
+            &crate::StoragePayer::for_test(),
         ))
         .expect("the descriptor with the right sets the times");
         assert_eq!(modified_nanos(&namespace), 77);
@@ -4992,6 +5022,7 @@ mod tests {
             None,
             Some(88),
             89,
+            &crate::StoragePayer::for_test(),
         ))
         .expect("the base with the right sets the times");
         assert_eq!(modified_nanos(&namespace), 88);

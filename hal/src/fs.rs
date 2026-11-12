@@ -323,9 +323,20 @@ impl<'a> FsPath<'a> {
 /// Mutating operations take `now`, the caller's wall-clock time in
 /// nanoseconds since the Unix epoch, which a filesystem without a clock of
 /// its own stamps on what it changes; one that keeps its own time (a host
-/// share) ignores it. Symbolic links are never followed here: `stat`
-/// describes the link itself, and resolving a link is the caller's job.
+/// share) ignores it. They also take the [`FileSystem::Payer`] of the
+/// requester, so no mutation reaches a filesystem without naming who pays
+/// for the storage it commits. Symbolic links are never followed here:
+/// `stat` describes the link itself, and resolving a link is the caller's
+/// job.
 pub trait FileSystem: Clone + Send + Sync + 'static {
+    /// Who pays for storage a mutation commits. A filesystem whose
+    /// storage is not this machine's memory (a host share) ignores it.
+    ///
+    /// Every mutating operation takes one, because every one of them can
+    /// create an object on a layered filesystem (a copy-up), and the
+    /// object's creator is who the storage is attributed to.
+    type Payer: Send + Sync;
+
     /// Describes the object at `path` without following a final symbolic
     /// link.
     fn stat<'a>(&'a self, path: FsPath<'a>)
@@ -338,6 +349,7 @@ pub trait FileSystem: Clone + Send + Sync + 'static {
         path: FsPath<'a>,
         flags: OpenFlags,
         now: u64,
+        payer: &'a Self::Payer,
     ) -> impl Future<Output = FsResult<Metadata>> + Send + 'a;
 
     /// Reads at most `max_bytes` from `offset`. An empty result is end of
@@ -355,21 +367,31 @@ pub trait FileSystem: Clone + Send + Sync + 'static {
     /// The filesystem supplies the destination and `fill` writes the bytes
     /// into it, so a write copies its bytes once: a filesystem that keeps
     /// them in memory hands `fill` the file's own storage, and one that
-    /// sends them elsewhere hands it the buffer it sends. `fill` runs at
-    /// most once and before this returns, never from the future, so it may
-    /// read memory that is valid only for this call (a guest's) and need
-    /// not be `Send`. A write refused before its bytes are needed does not
-    /// run it.
+    /// sends them elsewhere hands it the buffer it sends.
+    ///
+    /// `fill` is called over consecutive runs, each a slice of the
+    /// destination, whose lengths sum to `len` and which come in order:
+    /// the first run takes the first bytes of the write. A filesystem
+    /// that keeps its storage in pages calls it once per page run; one
+    /// with a single buffer calls it once. A `fill` may rely on this: it
+    /// sees every byte of `len` exactly once, front to back, so it keeps
+    /// the count of bytes it has already supplied and reads its source
+    /// from there, and it may not assume a run's length or alignment.
+    /// Every call happens before this returns, never from the future, so
+    /// `fill` may read memory that is valid only for this call (a
+    /// guest's) and need not be `Send`. A write refused before its bytes
+    /// are needed does not call it.
     fn write_with<'a, F>(
         &'a self,
         path: FsPath<'a>,
         position: WritePosition,
         len: usize,
         now: u64,
+        payer: &'a Self::Payer,
         fill: F,
     ) -> impl Future<Output = FsResult<u64>> + Send + 'a
     where
-        F: FnOnce(&mut [u8]);
+        F: FnMut(&mut [u8]);
 
     /// Truncates or zero-extends a regular file to `size` bytes.
     fn set_size<'a>(
@@ -377,6 +399,7 @@ pub trait FileSystem: Clone + Send + Sync + 'static {
         path: FsPath<'a>,
         size: u64,
         now: u64,
+        payer: &'a Self::Payer,
     ) -> impl Future<Output = FsResult<()>> + Send + 'a;
 
     /// Sets the access and modification times; `None` leaves one as it is.
@@ -386,6 +409,7 @@ pub trait FileSystem: Clone + Send + Sync + 'static {
         access_nanos: Option<u64>,
         modified_nanos: Option<u64>,
         now: u64,
+        payer: &'a Self::Payer,
     ) -> impl Future<Output = FsResult<()>> + Send + 'a;
 
     /// Lists at most `max_entries` entries of the directory at `path`,
@@ -402,16 +426,22 @@ pub trait FileSystem: Clone + Send + Sync + 'static {
         &'a self,
         path: FsPath<'a>,
         now: u64,
+        payer: &'a Self::Payer,
     ) -> impl Future<Output = FsResult<()>> + Send + 'a;
 
     /// Removes an empty directory.
     fn remove_directory<'a>(
         &'a self,
         path: FsPath<'a>,
+        payer: &'a Self::Payer,
     ) -> impl Future<Output = FsResult<()>> + Send + 'a;
 
     /// Removes a non-directory name.
-    fn unlink<'a>(&'a self, path: FsPath<'a>) -> impl Future<Output = FsResult<()>> + Send + 'a;
+    fn unlink<'a>(
+        &'a self,
+        path: FsPath<'a>,
+        payer: &'a Self::Payer,
+    ) -> impl Future<Output = FsResult<()>> + Send + 'a;
 
     /// Moves `source` to `destination` within this filesystem.
     fn rename<'a>(
@@ -419,6 +449,7 @@ pub trait FileSystem: Clone + Send + Sync + 'static {
         source: FsPath<'a>,
         destination: FsPath<'a>,
         now: u64,
+        payer: &'a Self::Payer,
     ) -> impl Future<Output = FsResult<()>> + Send + 'a;
 
     /// Gives the non-directory at `existing` the further name `link`.
@@ -427,6 +458,7 @@ pub trait FileSystem: Clone + Send + Sync + 'static {
         existing: FsPath<'a>,
         link: FsPath<'a>,
         now: u64,
+        payer: &'a Self::Payer,
     ) -> impl Future<Output = FsResult<()>> + Send + 'a;
 
     /// Creates a symbolic link at `link` whose target text is `target`.
@@ -435,6 +467,7 @@ pub trait FileSystem: Clone + Send + Sync + 'static {
         target: &'a str,
         link: FsPath<'a>,
         now: u64,
+        payer: &'a Self::Payer,
     ) -> impl Future<Output = FsResult<()>> + Send + 'a;
 
     /// The target text of the symbolic link at `path`.

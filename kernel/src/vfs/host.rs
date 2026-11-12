@@ -21,7 +21,9 @@ use helios_hal::fs::{
     NodeKind, OpenFlags, WritePosition,
 };
 
-use crate::{HostDirLimit, HostFileSystem, HostFsError, HostFsErrorKind, HostMetadata};
+use crate::{
+    HostDirLimit, HostFileSystem, HostFsError, HostFsErrorKind, HostMetadata, StoragePayer,
+};
 
 /// 9p `QTDIR`: the qid type bit that marks a directory.
 const P9_QID_TYPE_DIRECTORY: u8 = 0x80;
@@ -92,6 +94,9 @@ fn metadata_from_host(metadata: &HostMetadata) -> Metadata {
 }
 
 impl<H: HostFileSystem> FileSystem for HostShare<H> {
+    /// The host share's storage is the host's, so the payer is ignored.
+    type Payer = StoragePayer;
+
     async fn stat(&self, path: FsPath<'_>) -> FsResult<Metadata> {
         self.client
             .stat_path(host_path(path))
@@ -100,7 +105,13 @@ impl<H: HostFileSystem> FileSystem for HostShare<H> {
             .map_err(fs_error_from_host)
     }
 
-    async fn open(&self, path: FsPath<'_>, flags: OpenFlags, _now: u64) -> FsResult<Metadata> {
+    async fn open(
+        &self,
+        path: FsPath<'_>,
+        flags: OpenFlags,
+        _now: u64,
+        _payer: &StoragePayer,
+    ) -> FsResult<Metadata> {
         let host = host_path(path);
         match self
             .client
@@ -156,13 +167,15 @@ impl<H: HostFileSystem> FileSystem for HostShare<H> {
         position: WritePosition,
         len: usize,
         _now: u64,
-        fill: F,
+        _payer: &'a StoragePayer,
+        mut fill: F,
     ) -> impl Future<Output = FsResult<u64>> + Send + 'a
     where
-        F: FnOnce(&mut [u8]),
+        F: FnMut(&mut [u8]),
     {
         // The bytes leave for the host after awaits `fill` may not live
-        // across, so they are gathered into the buffer the request sends.
+        // across, so they are gathered into the one buffer the request
+        // sends, and `fill` is called once over all of it.
         let mut data = vec![0; len];
         fill(&mut data);
         async move {
@@ -179,7 +192,13 @@ impl<H: HostFileSystem> FileSystem for HostShare<H> {
         }
     }
 
-    async fn set_size(&self, path: FsPath<'_>, size: u64, _now: u64) -> FsResult<()> {
+    async fn set_size(
+        &self,
+        path: FsPath<'_>,
+        size: u64,
+        _now: u64,
+        _payer: &StoragePayer,
+    ) -> FsResult<()> {
         self.client
             .set_file_size(host_path(path), size)
             .await
@@ -192,6 +211,7 @@ impl<H: HostFileSystem> FileSystem for HostShare<H> {
         access_nanos: Option<u64>,
         modified_nanos: Option<u64>,
         _now: u64,
+        _payer: &StoragePayer,
     ) -> FsResult<()> {
         self.client
             .set_times(host_path(path), access_nanos, modified_nanos)
@@ -231,42 +251,65 @@ impl<H: HostFileSystem> FileSystem for HostShare<H> {
             .collect())
     }
 
-    async fn create_directory(&self, path: FsPath<'_>, _now: u64) -> FsResult<()> {
+    async fn create_directory(
+        &self,
+        path: FsPath<'_>,
+        _now: u64,
+        _payer: &StoragePayer,
+    ) -> FsResult<()> {
         self.client
             .create_directory(host_path(path))
             .await
             .map_err(fs_error_from_host)
     }
 
-    async fn remove_directory(&self, path: FsPath<'_>) -> FsResult<()> {
+    async fn remove_directory(&self, path: FsPath<'_>, _payer: &StoragePayer) -> FsResult<()> {
         self.client
             .remove(host_path(path), true)
             .await
             .map_err(fs_error_from_host)
     }
 
-    async fn unlink(&self, path: FsPath<'_>) -> FsResult<()> {
+    async fn unlink(&self, path: FsPath<'_>, _payer: &StoragePayer) -> FsResult<()> {
         self.client
             .remove(host_path(path), false)
             .await
             .map_err(fs_error_from_host)
     }
 
-    async fn rename(&self, source: FsPath<'_>, destination: FsPath<'_>, _now: u64) -> FsResult<()> {
+    async fn rename(
+        &self,
+        source: FsPath<'_>,
+        destination: FsPath<'_>,
+        _now: u64,
+        _payer: &StoragePayer,
+    ) -> FsResult<()> {
         self.client
             .rename(host_path(source), host_path(destination))
             .await
             .map_err(fs_error_from_host)
     }
 
-    async fn link(&self, existing: FsPath<'_>, link: FsPath<'_>, _now: u64) -> FsResult<()> {
+    async fn link(
+        &self,
+        existing: FsPath<'_>,
+        link: FsPath<'_>,
+        _now: u64,
+        _payer: &StoragePayer,
+    ) -> FsResult<()> {
         self.client
             .hard_link(host_path(existing), host_path(link))
             .await
             .map_err(fs_error_from_host)
     }
 
-    async fn symlink(&self, target: &str, link: FsPath<'_>, _now: u64) -> FsResult<()> {
+    async fn symlink(
+        &self,
+        target: &str,
+        link: FsPath<'_>,
+        _now: u64,
+        _payer: &StoragePayer,
+    ) -> FsResult<()> {
         self.client
             .symlink(target, host_path(link))
             .await
@@ -298,8 +341,34 @@ impl<H: HostFileSystem> FileSystem for HostShare<H> {
 mod tests {
     use helios_hal::fs::{FsError, NodeKind};
 
-    use super::{P9_QID_TYPE_DIRECTORY, fs_error_from_host, metadata_from_host};
-    use crate::{AuthorityDomain, HostFsError, HostMetadata, ObjectIdentity, object_identity};
+    use futures_lite::future::block_on;
+    use helios_hal::fs::{FileSystem, FsPath, WritePosition};
+
+    use super::{HostShare, P9_QID_TYPE_DIRECTORY, fs_error_from_host, metadata_from_host};
+    use crate::{
+        AuthorityDomain, HostFsError, HostMetadata, ObjectIdentity, StoragePayer,
+        UnsupportedHostFileSystem, object_identity,
+    };
+
+    /// The host share gathers a write into one buffer for the request, so
+    /// `fill` is called once over all of it, before the request is awaited:
+    /// the share here refuses every request, and `fill` has run anyway.
+    #[test]
+    fn a_host_share_write_calls_fill_once_over_the_whole_write() {
+        let share = HostShare::new(UnsupportedHostFileSystem);
+        let payer = StoragePayer::for_test();
+        let mut runs = alloc::vec::Vec::new();
+        let write = share.write_with(
+            FsPath::new("file").expect("a valid path"),
+            WritePosition::At(0),
+            2 * 4096 + 17,
+            0,
+            &payer,
+            |run| runs.push(run.len()),
+        );
+        assert_eq!(runs, [2 * 4096 + 17], "fill ran once, before the await");
+        assert_eq!(block_on(write), Err(helios_hal::fs::FsError::Unsupported));
+    }
 
     /// A name the host share's wire cannot carry stays "name too long"
     /// through the mount, rather than collapsing into an I/O error.

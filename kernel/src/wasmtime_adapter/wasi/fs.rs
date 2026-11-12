@@ -15,7 +15,7 @@ use pin_project_lite::pin_project;
 
 use crate::{
     ComponentHostNetwork, FileContents, Follow, HeldPath, MountHold, Namespace, Resolved,
-    object_identity,
+    StoragePayer, object_identity,
 };
 
 use super::*;
@@ -193,6 +193,10 @@ fn require_directory(base: &FsDescriptor) -> FsOpResult<()> {
 /// `write` as well. Both rights are demanded whether or not the file
 /// exists, and before the path is resolved: a refused open reaches no
 /// filesystem and leaves it as it was.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the arguments are WASI `open-at`'s own (base, path flags, path, open flags, descriptor flags) plus the stamp and payer every mutation carries; grouping any of them would hide the contract"
+)]
 pub(crate) async fn open_at<HostFs>(
     namespace: &Namespace<HostFs>,
     base: &FsDescriptor,
@@ -201,6 +205,7 @@ pub(crate) async fn open_at<HostFs>(
     open_flags: fs_types::OpenFlags,
     requested: fs_types::DescriptorFlags,
     now: u64,
+    payer: &StoragePayer,
 ) -> FsOpResult<FsDescriptor>
 where
     HostFs: crate::HostFileSystem,
@@ -245,7 +250,7 @@ where
                     if existing.kind != NodeKind::File {
                         return Err(fs_types::ErrorCode::IsDirectory);
                     }
-                    (truncate_file(&resolved, rights, now).await?, flags)
+                    (truncate_file(&resolved, rights, now, payer).await?, flags)
                 }
             }
         }
@@ -257,7 +262,7 @@ where
                 return Err(fs_types::ErrorCode::Unsupported);
             }
             let flags = effective_open_descriptor_flags(base.flags, requested, FsNodeKind::File)?;
-            (create_file(&resolved, mutate, now).await?, flags)
+            (create_file(&resolved, mutate, now, payer).await?, flags)
         }
         Err(error) => return Err(fs_error_code(error)),
     };
@@ -277,6 +282,7 @@ async fn create_file<HostFs>(
     resolved: &Resolved<'_, HostFs>,
     _mutate: Granted<'_, Directory, Mutate>,
     now: u64,
+    payer: &StoragePayer,
 ) -> FsOpResult<Metadata>
 where
     HostFs: crate::HostFileSystem,
@@ -284,7 +290,7 @@ where
     resolved
         .writable()
         .map_err(fs_error_code)?
-        .open(resolved.path(), OpenFlags::CREATE, now)
+        .open(resolved.path(), OpenFlags::CREATE, now, payer)
         .await
         .map_err(fs_error_code)
 }
@@ -298,6 +304,7 @@ async fn truncate_file<HostFs>(
         Granted<'_, Directory, Write>,
     ),
     now: u64,
+    payer: &StoragePayer,
 ) -> FsOpResult<Metadata>
 where
     HostFs: crate::HostFileSystem,
@@ -305,7 +312,7 @@ where
     resolved
         .writable()
         .map_err(fs_error_code)?
-        .open(resolved.path(), OpenFlags::TRUNCATE, now)
+        .open(resolved.path(), OpenFlags::TRUNCATE, now, payer)
         .await
         .map_err(fs_error_code)
 }
@@ -438,11 +445,19 @@ pub(crate) async fn write<HostFs>(
     position: WritePosition,
     bytes: &[u8],
     now: u64,
+    payer: &StoragePayer,
 ) -> FsOpResult<u64>
 where
     HostFs: crate::HostFileSystem,
 {
-    write_resolved(&writable_file(namespace, file)?, position, bytes, now).await
+    write_resolved(
+        &writable_file(namespace, file)?,
+        position,
+        bytes,
+        now,
+        payer,
+    )
+    .await
 }
 
 /// The file `file` names, resolved for a write.
@@ -463,12 +478,15 @@ pub(crate) async fn write_resolved<HostFs>(
     position: WritePosition,
     bytes: &[u8],
     now: u64,
+    payer: &StoragePayer,
 ) -> FsOpResult<u64>
 where
     HostFs: crate::HostFileSystem,
 {
-    write_resolved_with(resolved, position, bytes.len(), now, |destination| {
-        destination.copy_from_slice(bytes)
+    let mut written = 0;
+    write_resolved_with(resolved, position, bytes.len(), now, payer, |run| {
+        run.copy_from_slice(&bytes[written..written + run.len()]);
+        written += run.len();
     })
     .await
 }
@@ -479,22 +497,24 @@ where
 /// filesystem sees it when the write arrives, so its end is the
 /// filesystem's answer, never the caller's idea of where the file ended.
 ///
-/// `fill` runs before this returns, so it may read guest memory; the
-/// future holds nothing of it.
+/// `fill` is called over consecutive runs, in order, whose lengths sum to
+/// `len`, and every call happens before this returns, so it may read
+/// guest memory; the future holds nothing of it.
 pub(crate) fn write_resolved_with<'r, HostFs, F>(
     resolved: &'r Resolved<'_, HostFs>,
     position: WritePosition,
     len: usize,
     now: u64,
+    payer: &'r StoragePayer,
     fill: F,
 ) -> impl Future<Output = FsOpResult<u64>> + Send + 'r
 where
     HostFs: crate::HostFileSystem,
-    F: FnOnce(&mut [u8]),
+    F: FnMut(&mut [u8]),
 {
     let write = resolved
         .writable()
-        .map(|fs| fs.write_with(resolved.path(), position, len, now, fill));
+        .map(|fs| fs.write_with(resolved.path(), position, len, now, payer, fill));
     async move {
         let landed = write.map_err(fs_error_code)?.await.map_err(fs_error_code)?;
         landed
@@ -508,6 +528,7 @@ pub(crate) async fn set_size<HostFs>(
     file: Granted<'_, RegularFile, Write>,
     size: u64,
     now: u64,
+    payer: &StoragePayer,
 ) -> FsOpResult<()>
 where
     HostFs: crate::HostFileSystem,
@@ -516,7 +537,7 @@ where
     resolved
         .writable()
         .map_err(fs_error_code)?
-        .set_size(resolved.path(), size, now)
+        .set_size(resolved.path(), size, now, payer)
         .await
         .map_err(fs_error_code)
 }
@@ -528,6 +549,7 @@ pub(crate) async fn set_times<HostFs>(
     access_nanos: Option<u64>,
     modified_nanos: Option<u64>,
     now: u64,
+    payer: &StoragePayer,
 ) -> FsOpResult<()>
 where
     HostFs: crate::HostFileSystem,
@@ -538,6 +560,7 @@ where
         access_nanos,
         modified_nanos,
         now,
+        payer,
     )
     .await
 }
@@ -551,12 +574,21 @@ pub(crate) async fn set_times_at<HostFs>(
     access_nanos: Option<u64>,
     modified_nanos: Option<u64>,
     now: u64,
+    payer: &StoragePayer,
 ) -> FsOpResult<()>
 where
     HostFs: crate::HostFileSystem,
 {
     let absolute = child_path(base.descriptor(), path)?;
-    set_times_of(namespace, &absolute, access_nanos, modified_nanos, now).await
+    set_times_of(
+        namespace,
+        &absolute,
+        access_nanos,
+        modified_nanos,
+        now,
+        payer,
+    )
+    .await
 }
 
 async fn set_times_of<HostFs>(
@@ -565,6 +597,7 @@ async fn set_times_of<HostFs>(
     access_nanos: Option<u64>,
     modified_nanos: Option<u64>,
     now: u64,
+    payer: &StoragePayer,
 ) -> FsOpResult<()>
 where
     HostFs: crate::HostFileSystem,
@@ -573,7 +606,7 @@ where
     resolved
         .writable()
         .map_err(fs_error_code)?
-        .set_times(resolved.path(), access_nanos, modified_nanos, now)
+        .set_times(resolved.path(), access_nanos, modified_nanos, now, payer)
         .await
         .map_err(fs_error_code)
 }
@@ -611,6 +644,7 @@ pub(crate) async fn create_directory_at<HostFs>(
     base: Granted<'_, Directory, Mutate>,
     path: &str,
     now: u64,
+    payer: &StoragePayer,
 ) -> FsOpResult<()>
 where
     HostFs: crate::HostFileSystem,
@@ -623,7 +657,7 @@ where
     resolved
         .writable()
         .map_err(fs_error_code)?
-        .create_directory(resolved.path(), now)
+        .create_directory(resolved.path(), now, payer)
         .await
         .map_err(fs_error_code)
 }
@@ -632,13 +666,14 @@ pub(crate) async fn remove_directory_at<HostFs>(
     namespace: &Namespace<HostFs>,
     base: Granted<'_, Directory, Mutate>,
     path: &str,
+    payer: &StoragePayer,
 ) -> FsOpResult<()>
 where
     HostFs: crate::HostFileSystem,
 {
     let absolute = child_below(base.descriptor(), path)?;
     namespace
-        .remove_directory(&absolute)
+        .remove_directory(&absolute, payer)
         .await
         .map_err(fs_error_code)
 }
@@ -647,6 +682,7 @@ pub(crate) async fn unlink_file_at<HostFs>(
     namespace: &Namespace<HostFs>,
     base: Granted<'_, Directory, Mutate>,
     path: &str,
+    payer: &StoragePayer,
 ) -> FsOpResult<()>
 where
     HostFs: crate::HostFileSystem,
@@ -659,7 +695,7 @@ where
     resolved
         .writable()
         .map_err(fs_error_code)?
-        .unlink(resolved.path())
+        .unlink(resolved.path(), payer)
         .await
         .map_err(fs_error_code)
 }
@@ -672,6 +708,7 @@ pub(crate) async fn rename_at<HostFs>(
     destination_base: Granted<'_, Directory, Mutate>,
     destination_path: &str,
     now: u64,
+    payer: &StoragePayer,
 ) -> FsOpResult<()>
 where
     HostFs: crate::HostFileSystem,
@@ -679,7 +716,7 @@ where
     let source = child_below(source_base.descriptor(), source_path)?;
     let destination = child_below(destination_base.descriptor(), destination_path)?;
     namespace
-        .rename(&source, &destination, now)
+        .rename(&source, &destination, now, payer)
         .await
         .map_err(fs_error_code)
 }
@@ -692,6 +729,7 @@ pub(crate) async fn link_at<HostFs>(
     destination_base: Granted<'_, Directory, Mutate>,
     destination_path: &str,
     now: u64,
+    payer: &StoragePayer,
 ) -> FsOpResult<()>
 where
     HostFs: crate::HostFileSystem,
@@ -700,7 +738,7 @@ where
     let source = child_path(source_base, source_path)?;
     let destination = child_path(destination_base.descriptor(), destination_path)?;
     namespace
-        .link(&source, &destination, now)
+        .link(&source, &destination, now, payer)
         .await
         .map_err(fs_error_code)
 }
@@ -713,6 +751,7 @@ pub(crate) async fn symlink_at<HostFs>(
     target: &str,
     path: &str,
     now: u64,
+    payer: &StoragePayer,
 ) -> FsOpResult<()>
 where
     HostFs: crate::HostFileSystem,
@@ -723,7 +762,7 @@ where
     resolved
         .writable()
         .map_err(fs_error_code)?
-        .symlink(target, resolved.path(), now)
+        .symlink(target, resolved.path(), now, payer)
         .await
         .map_err(fs_error_code)
 }
@@ -798,6 +837,7 @@ pub(crate) async fn write_program_file<HostFs>(
     absolute: &str,
     bytes: &[u8],
     now: u64,
+    payer: &StoragePayer,
 ) -> FsOpResult<()>
 where
     HostFs: crate::HostFileSystem,
@@ -808,10 +848,11 @@ where
         resolved.path(),
         OpenFlags::CREATE | OpenFlags::TRUNCATE,
         now,
+        payer,
     )
     .await
     .map_err(fs_error_code)?;
-    write_resolved(&resolved, WritePosition::At(0), bytes, now)
+    write_resolved(&resolved, WritePosition::At(0), bytes, now, payer)
         .await
         .map(drop)
 }
@@ -828,11 +869,12 @@ async fn write_chunk<HostFs>(
     mode: WritePosition,
     bytes: Vec<u8>,
     now: u64,
+    payer: StoragePayer,
 ) -> ChunkWriteResult
 where
     HostFs: crate::HostFileSystem,
 {
-    write_resolved(&held.resolved(), mode, &bytes, now).await?;
+    write_resolved(&held.resolved(), mode, &bytes, now, &payer).await?;
     Ok(bytes.len())
 }
 
@@ -967,7 +1009,10 @@ pin_project! {
         pub(super) getter: fn(&mut T) -> &mut StoreData<CpuImpl, Net, HostFs>,
         pub(super) held: HeldPath<HostFs>,
         pub(super) mode: WritePosition,
-        pub(super) start: fn(HeldPath<HostFs>, WritePosition, Vec<u8>, u64) -> Fut,
+        // Who pays for what the stream writes: the writing instance,
+        // captured when the stream was created.
+        pub(super) payer: StoragePayer,
+        pub(super) start: fn(HeldPath<HostFs>, WritePosition, Vec<u8>, u64, StoragePayer) -> Fut,
         #[pin]
         pub(super) pending: Option<Fut>,
         pub(super) result: Option<oneshot::Sender<FsOpResult<()>>>,
@@ -992,6 +1037,7 @@ pub(super) fn file_write_consumer<T, CpuImpl, Net, HostFs>(
     getter: fn(&mut T) -> &mut StoreData<CpuImpl, Net, HostFs>,
     held: HeldPath<HostFs>,
     mode: WritePosition,
+    payer: StoragePayer,
     result: oneshot::Sender<FsOpResult<()>>,
 ) -> FileWriteConsumer<
     T,
@@ -1010,6 +1056,7 @@ where
         getter,
         held,
         mode,
+        payer,
         start: write_chunk::<HostFs>,
         pending: None,
         result: Some(result),
@@ -1043,7 +1090,13 @@ where
                 return Poll::Ready(Ok(StreamResult::Completed));
             }
             let now = (*this.getter)(store.data_mut()).now_nanos();
-            let write = (*this.start)(this.held.clone(), *this.mode, bytes, now);
+            let write = (*this.start)(
+                this.held.clone(),
+                *this.mode,
+                bytes,
+                now,
+                this.payer.clone(),
+            );
             this.pending.set(Some(write));
         }
         let written = match this.pending.as_mut().as_pin_mut() {
@@ -1400,11 +1453,16 @@ where
         descriptor: Resource<FsDescriptor>,
         size: u64,
     ) -> Result<(), FsError> {
-        let (descriptor, namespace, now) = accessor.with(|mut access| {
+        let (descriptor, namespace, now, payer) = accessor.with(|mut access| {
             let (descriptor, namespace) = descriptor_in(access.get(), &descriptor)?;
-            Ok::<_, fs_types::ErrorCode>((descriptor, namespace, access.get().now_nanos()))
+            Ok::<_, fs_types::ErrorCode>((
+                descriptor,
+                namespace,
+                access.get().now_nanos(),
+                access.get().instance().storage_payer(),
+            ))
         })?;
-        Ok(self::set_size(&namespace, descriptor.grant()?, size, now).await?)
+        Ok(self::set_size(&namespace, descriptor.grant()?, size, now, &payer).await?)
     }
 
     async fn set_times(
@@ -1413,7 +1471,7 @@ where
         data_access_timestamp: fs_types::NewTimestamp,
         data_modification_timestamp: fs_types::NewTimestamp,
     ) -> Result<(), FsError> {
-        let (descriptor, namespace, access_nanos, modified_nanos, now) =
+        let (descriptor, namespace, access_nanos, modified_nanos, now, payer) =
             accessor.with(|mut access| {
                 let now = access.get().system_time_nanos();
                 let access_nanos = p3_new_timestamp_nanos(data_access_timestamp, now)?;
@@ -1425,6 +1483,7 @@ where
                     access_nanos,
                     modified_nanos,
                     now,
+                    access.get().instance().storage_payer(),
                 ))
             })?;
         Ok(self::set_times(
@@ -1433,6 +1492,7 @@ where
             access_nanos,
             modified_nanos,
             now,
+            &payer,
         )
         .await?)
     }
@@ -1475,11 +1535,16 @@ where
         descriptor: Resource<FsDescriptor>,
         path: String,
     ) -> Result<(), FsError> {
-        let (base, namespace, now) = accessor.with(|mut access| {
+        let (base, namespace, now, payer) = accessor.with(|mut access| {
             let (base, namespace) = descriptor_in(access.get(), &descriptor)?;
-            Ok::<_, fs_types::ErrorCode>((base, namespace, access.get().now_nanos()))
+            Ok::<_, fs_types::ErrorCode>((
+                base,
+                namespace,
+                access.get().now_nanos(),
+                access.get().instance().storage_payer(),
+            ))
         })?;
-        Ok(self::create_directory_at(&namespace, base.grant()?, &path, now).await?)
+        Ok(self::create_directory_at(&namespace, base.grant()?, &path, now, &payer).await?)
     }
 
     async fn stat(
@@ -1520,13 +1585,20 @@ where
         data_access_timestamp: fs_types::NewTimestamp,
         data_modification_timestamp: fs_types::NewTimestamp,
     ) -> Result<(), FsError> {
-        let (base, namespace, access_nanos, modified_nanos, now) =
+        let (base, namespace, access_nanos, modified_nanos, now, payer) =
             accessor.with(|mut access| {
                 let now = access.get().system_time_nanos();
                 let access_nanos = p3_new_timestamp_nanos(data_access_timestamp, now)?;
                 let modified_nanos = p3_new_timestamp_nanos(data_modification_timestamp, now)?;
                 let (base, namespace) = descriptor_in(access.get(), &descriptor)?;
-                Ok::<_, fs_types::ErrorCode>((base, namespace, access_nanos, modified_nanos, now))
+                Ok::<_, fs_types::ErrorCode>((
+                    base,
+                    namespace,
+                    access_nanos,
+                    modified_nanos,
+                    now,
+                    access.get().instance().storage_payer(),
+                ))
             })?;
         Ok(self::set_times_at(
             &namespace,
@@ -1535,6 +1607,7 @@ where
             access_nanos,
             modified_nanos,
             now,
+            &payer,
         )
         .await?)
     }
@@ -1547,17 +1620,24 @@ where
         destination_descriptor: Resource<FsDescriptor>,
         destination_path: String,
     ) -> Result<(), FsError> {
-        let (source_base, destination_base, namespace, now) = accessor.with(|mut access| {
-            let authority = access.get().process_authority();
-            if authority.derive_link_source_cap().is_err()
-                || authority.derive_link_target_directory_cap().is_err()
-            {
-                return Err(fs_types::ErrorCode::NotPermitted);
-            }
-            let (source, destination, namespace) =
-                descriptor_pair_in(access.get(), &source_descriptor, &destination_descriptor)?;
-            Ok((source, destination, namespace, access.get().now_nanos()))
-        })?;
+        let (source_base, destination_base, namespace, now, payer) =
+            accessor.with(|mut access| {
+                let authority = access.get().process_authority();
+                if authority.derive_link_source_cap().is_err()
+                    || authority.derive_link_target_directory_cap().is_err()
+                {
+                    return Err(fs_types::ErrorCode::NotPermitted);
+                }
+                let (source, destination, namespace) =
+                    descriptor_pair_in(access.get(), &source_descriptor, &destination_descriptor)?;
+                Ok((
+                    source,
+                    destination,
+                    namespace,
+                    access.get().now_nanos(),
+                    access.get().instance().storage_payer(),
+                ))
+            })?;
         Ok(self::link_at(
             &namespace,
             &source_base,
@@ -1565,6 +1645,7 @@ where
             destination_base.grant()?,
             &destination_path,
             now,
+            &payer,
         )
         .await?)
     }
@@ -1578,12 +1659,19 @@ where
         flags: fs_types::DescriptorFlags,
     ) -> Result<Resource<FsDescriptor>, FsError> {
         let profile = accessor.with(|mut access| component_fs_profile(access.get()));
-        let (base, namespace, now) = accessor.with(|mut access| {
+        let (base, namespace, now, payer) = accessor.with(|mut access| {
             let (base, namespace) = descriptor_in(access.get(), &descriptor)?;
-            Ok::<_, fs_types::ErrorCode>((base, namespace, access.get().now_nanos()))
+            Ok::<_, fs_types::ErrorCode>((
+                base,
+                namespace,
+                access.get().now_nanos(),
+                access.get().instance().storage_payer(),
+            ))
         })?;
-        let opened =
-            self::open_at(&namespace, &base, path_flags, &path, open_flags, flags, now).await?;
+        let opened = self::open_at(
+            &namespace, &base, path_flags, &path, open_flags, flags, now, &payer,
+        )
+        .await?;
         let result = accessor
             .with(|mut access| access.get().table.push(opened))
             .map_err(FsError::trap);
@@ -1615,9 +1703,11 @@ where
         descriptor: Resource<FsDescriptor>,
         path: String,
     ) -> Result<(), FsError> {
-        let (base, namespace) =
-            accessor.with(|mut access| descriptor_in(access.get(), &descriptor))?;
-        Ok(self::remove_directory_at(&namespace, base.grant()?, &path).await?)
+        let (base, namespace, payer) = accessor.with(|mut access| {
+            let (base, namespace) = descriptor_in(access.get(), &descriptor)?;
+            Ok::<_, fs_types::ErrorCode>((base, namespace, access.get().instance().storage_payer()))
+        })?;
+        Ok(self::remove_directory_at(&namespace, base.grant()?, &path, &payer).await?)
     }
 
     async fn rename_at(
@@ -1627,11 +1717,18 @@ where
         destination_descriptor: Resource<FsDescriptor>,
         destination_path: String,
     ) -> Result<(), FsError> {
-        let (source_base, destination_base, namespace, now) = accessor.with(|mut access| {
-            let (source, destination, namespace) =
-                descriptor_pair_in(access.get(), &source_descriptor, &destination_descriptor)?;
-            Ok::<_, fs_types::ErrorCode>((source, destination, namespace, access.get().now_nanos()))
-        })?;
+        let (source_base, destination_base, namespace, now, payer) =
+            accessor.with(|mut access| {
+                let (source, destination, namespace) =
+                    descriptor_pair_in(access.get(), &source_descriptor, &destination_descriptor)?;
+                Ok::<_, fs_types::ErrorCode>((
+                    source,
+                    destination,
+                    namespace,
+                    access.get().now_nanos(),
+                    access.get().instance().storage_payer(),
+                ))
+            })?;
         Ok(self::rename_at(
             &namespace,
             source_base.grant()?,
@@ -1639,6 +1736,7 @@ where
             destination_base.grant()?,
             &destination_path,
             now,
+            &payer,
         )
         .await?)
     }
@@ -1649,7 +1747,7 @@ where
         old_path: String,
         new_path: String,
     ) -> Result<(), FsError> {
-        let (base, namespace, now) = accessor.with(|mut access| {
+        let (base, namespace, now, payer) = accessor.with(|mut access| {
             if access
                 .get()
                 .process_authority()
@@ -1659,9 +1757,14 @@ where
                 return Err(fs_types::ErrorCode::NotPermitted);
             }
             let (base, namespace) = descriptor_in(access.get(), &descriptor)?;
-            Ok((base, namespace, access.get().now_nanos()))
+            Ok((
+                base,
+                namespace,
+                access.get().now_nanos(),
+                access.get().instance().storage_payer(),
+            ))
         })?;
-        Ok(self::symlink_at(&namespace, base.grant()?, &old_path, &new_path, now).await?)
+        Ok(self::symlink_at(&namespace, base.grant()?, &old_path, &new_path, now, &payer).await?)
     }
 
     async fn unlink_file_at(
@@ -1669,9 +1772,11 @@ where
         descriptor: Resource<FsDescriptor>,
         path: String,
     ) -> Result<(), FsError> {
-        let (base, namespace) =
-            accessor.with(|mut access| descriptor_in(access.get(), &descriptor))?;
-        Ok(self::unlink_file_at(&namespace, base.grant()?, &path).await?)
+        let (base, namespace, payer) = accessor.with(|mut access| {
+            let (base, namespace) = descriptor_in(access.get(), &descriptor)?;
+            Ok::<_, fs_types::ErrorCode>((base, namespace, access.get().instance().storage_payer()))
+        })?;
+        Ok(self::unlink_file_at(&namespace, base.grant()?, &path, &payer).await?)
     }
 
     async fn is_same_object(
@@ -1736,12 +1841,13 @@ where
     let resolved = descriptor_in(accessor.get(), &descriptor)
         .and_then(|(descriptor, namespace)| write_stream_target(&namespace, descriptor.grant()?));
     let getter = accessor.getter();
+    let payer = accessor.get().instance().storage_payer();
     match resolved {
         Ok(resolved) => {
             let (tx, rx) = oneshot::channel();
             data.pipe(
                 &mut accessor,
-                file_write_consumer(getter, resolved, mode, tx),
+                file_write_consumer(getter, resolved, mode, payer, tx),
             )?;
             transfer_outcome(&mut accessor, rx)
         }

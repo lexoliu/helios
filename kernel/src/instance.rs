@@ -296,6 +296,11 @@ struct InstanceEntry {
     /// registry's `entries` lock by victim ranking and condemnation,
     /// and by [`InstanceRegistry::snapshot`].
     held_user_bytes: AtomicU64,
+    /// The in-memory file storage this instance created. Inodes it
+    /// creates hold clones; the entry holds one for the instance's life
+    /// and hands it out through [`RegisteredInstance::storage_payer`].
+    /// See [`StorageShare`] for who writes it.
+    storage: Arc<StorageShare>,
     /// The processor time of every store this instance holds. The swap
     /// policy reads it to decide whether an instance has been idle long
     /// enough to evict; stats and profiles read the total.
@@ -371,6 +376,7 @@ impl InstanceRegistry {
             memory_bytes: AtomicU64::new(0),
             kernel_bytes: AtomicU64::new(0),
             held_user_bytes: AtomicU64::new(0),
+            storage: Arc::new(StorageShare::default()),
             stores: Mutex::new(StoreClocks::new(started_at)),
             policy,
             kill_flag: AtomicU8::new(KILL_FLAG_NONE),
@@ -835,6 +841,15 @@ impl RegisteredInstance {
         }
     }
 
+    /// The payer a filesystem mutation this instance requests carries.
+    pub fn storage_payer(&self) -> StoragePayer {
+        let entry = self.entry();
+        StoragePayer {
+            share: entry.storage.clone(),
+            requester: entry.id,
+        }
+    }
+
     /// Returns `Some(reason)` when the instance has been condemned by
     /// the OOM killer or a supervisor and the runtime should trap at
     /// the guest's next interrupt check.
@@ -906,6 +921,85 @@ impl Drop for UserMemoryCharge {
             Ordering::Acquire,
             |charged| charged.saturating_sub(bytes),
         );
+    }
+}
+
+/// The in-memory file storage one instance created, as a byte count.
+///
+/// Concurrency contract: lock-free. The count has no single writer: every
+/// filesystem mutation that commits or frees frames for an inode this
+/// instance created adds or subtracts them, relaxed, from any processor
+/// that holds that inode's tree lock. Commits are per write call, not per
+/// page, so the word is not cache-padded. A reader (the instance's
+/// registry entry, for stats) loads it relaxed and may see a value that
+/// is mid-update; nothing orders it against another word.
+///
+/// Inodes hold clones of the share, so it outlives the registry entry: a
+/// file whose creator has exited keeps its share balanced and nobody
+/// reads it. The filesystem's own budget never depended on the share, so
+/// no exit hook is needed.
+#[derive(Debug, Default)]
+pub struct StorageShare {
+    bytes: AtomicU64,
+}
+
+impl StorageShare {
+    /// Bytes of file storage attributed to the instance this share
+    /// belongs to.
+    pub fn bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
+    }
+
+    /// Attributes `bytes` more storage to the share's instance.
+    pub fn add(&self, bytes: u64) {
+        self.bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Returns `bytes` of storage the share's instance no longer holds.
+    pub fn sub(&self, bytes: u64) {
+        self.bytes.fetch_sub(bytes, Ordering::Relaxed);
+    }
+}
+
+/// Who pays for the storage a filesystem mutation commits: the
+/// [`hal::fs::FileSystem::Payer`] of every kernel filesystem kind.
+///
+/// It names the requester and carries the share of the instance a new
+/// inode is attributed to, so a filesystem that creates an object on this
+/// request (a create, a copy-up) records who created it.
+///
+/// Concurrency contract: immutable once built, `Send + Sync`, and cheap to
+/// clone (one `Arc` count). It is built per call from the store's data, or
+/// captured by a stream at its creation; it takes no lock and writes
+/// nothing itself. The share it holds is written by whoever commits frames
+/// (see [`StorageShare`]).
+///
+/// [`hal::fs::FileSystem::Payer`]: helios_hal::fs::FileSystem::Payer
+#[derive(Clone, Debug)]
+pub struct StoragePayer {
+    share: Arc<StorageShare>,
+    requester: InstanceId,
+}
+
+impl StoragePayer {
+    /// The instance on whose behalf the mutation runs.
+    pub const fn requester(&self) -> InstanceId {
+        self.requester
+    }
+
+    /// The share an inode this request creates is attributed to.
+    pub fn share(&self) -> &Arc<StorageShare> {
+        &self.share
+    }
+
+    /// A payer that belongs to no registry entry, for tests of code that
+    /// takes one and does not read it.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        Self {
+            share: Arc::new(StorageShare::default()),
+            requester: InstanceId::from_raw(0),
+        }
     }
 }
 

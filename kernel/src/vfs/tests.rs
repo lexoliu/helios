@@ -10,10 +10,15 @@ use super::{
 };
 use crate::{
     BootFs, ComponentFsPathError, EmbeddedBootDirectory, EmbeddedBootFile, EmbeddedBootFs,
-    MountCap, ProcessAuthority, UnsupportedHostFileSystem, resolve_child_path,
+    MountCap, ProcessAuthority, StoragePayer, UnsupportedHostFileSystem, resolve_child_path,
 };
 
 type TestNamespace = Namespace<UnsupportedHostFileSystem>;
+
+/// Who pays for what the tests write: no instance in particular.
+fn payer() -> StoragePayer {
+    StoragePayer::for_test()
+}
 
 const IMAGE: EmbeddedBootFs = EmbeddedBootFs::new(
     &[EmbeddedBootDirectory::new("mnt", 0)],
@@ -51,13 +56,14 @@ fn owner(namespace: &TestNamespace, absolute: &str) -> (String, String) {
 fn create(namespace: &TestNamespace, absolute: &str, bytes: &[u8]) {
     let resolved = namespace.resolve(absolute).expect("resolves");
     let fs = resolved.writable().expect("writable mount");
-    block_on(fs.open(resolved.path(), OpenFlags::CREATE, 1)).expect("creates");
+    block_on(fs.open(resolved.path(), OpenFlags::CREATE, 1, &payer())).expect("creates");
     block_on(super::write_bytes(
         fs,
         resolved.path(),
         WritePosition::At(0),
         bytes,
         1,
+        &payer(),
     ))
     .expect("writes");
 }
@@ -80,7 +86,7 @@ fn the_longest_mount_point_owns_a_path() {
             .expect("resolves")
             .writable()
             .expect("writable")
-            .create_directory(FsPath::new("data").expect("valid"), 1),
+            .create_directory(FsPath::new("data").expect("valid"), 1, &payer()),
     )
     .expect("creates the inner mount point");
     mount_memory(&namespace, "/mnt/data");
@@ -140,11 +146,11 @@ fn rename_and_link_across_mounts_are_refused_with_exdev() {
     create(&namespace, "/mnt/file", b"payload");
 
     assert_eq!(
-        block_on(namespace.rename("/mnt/file", "/file", 2)),
+        block_on(namespace.rename("/mnt/file", "/file", 2, &payer())),
         Err(FsError::CrossDevice)
     );
     assert_eq!(
-        block_on(namespace.link("/mnt/file", "/file", 2)),
+        block_on(namespace.link("/mnt/file", "/file", 2, &payer())),
         Err(FsError::CrossDevice)
     );
     // Nothing moved.
@@ -154,8 +160,8 @@ fn rename_and_link_across_mounts_are_refused_with_exdev() {
         Err(FsError::NoEntry)
     );
     // Within the mount, both work.
-    block_on(namespace.rename("/mnt/file", "/mnt/moved", 2)).expect("renames");
-    block_on(namespace.link("/mnt/moved", "/mnt/linked", 2)).expect("links");
+    block_on(namespace.rename("/mnt/file", "/mnt/moved", 2, &payer())).expect("renames");
+    block_on(namespace.link("/mnt/moved", "/mnt/linked", 2, &payer())).expect("links");
     assert_eq!(read(&namespace, "/mnt/linked"), b"payload");
 }
 
@@ -274,7 +280,7 @@ fn unmount_refuses_a_mount_with_mounts_below_it() {
             .expect("resolves")
             .writable()
             .expect("writable")
-            .create_directory(FsPath::new("inner").expect("valid"), 1),
+            .create_directory(FsPath::new("inner").expect("valid"), 1, &payer()),
     )
     .expect("creates");
     mount_memory(&namespace, "/mnt/inner");
@@ -430,12 +436,12 @@ fn a_symbolic_link_is_followed_across_mounts_only_when_asked() {
     mount_memory(&namespace, "/mnt");
     create(&namespace, "/mnt/target", b"followed");
     let resolved = namespace.resolve("/mnt/link").expect("resolves");
-    block_on(
-        resolved
-            .writable()
-            .expect("writable")
-            .symlink("target", resolved.path(), 1),
-    )
+    block_on(resolved.writable().expect("writable").symlink(
+        "target",
+        resolved.path(),
+        1,
+        &payer(),
+    ))
     .expect("links");
     let followed =
         block_on(namespace.resolve_following("/mnt/link", Follow::Within("/"))).expect("follows");

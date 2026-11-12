@@ -1406,13 +1406,19 @@ where
             detail: ProgramExecErrorDetail::ProgramArtifactDestinationNotGranted,
         }));
     }
-    let (namespace, now_nanos) = accessor.with(|mut access| {
+    let (namespace, now_nanos, payer) = accessor.with(|mut access| {
         let store_data = access.get();
-        (store_data.filesystem().clone(), store_data.now_nanos())
+        (
+            store_data.filesystem().clone(),
+            store_data.now_nanos(),
+            store_data.instance().storage_payer(),
+        )
     });
-    crate::wasmtime_adapter::wasi::write_program_file(&namespace, &absolute, bytes, now_nanos)
-        .await
-        .map_err(map_fs_error_to_program_exec)?;
+    crate::wasmtime_adapter::wasi::write_program_file(
+        &namespace, &absolute, bytes, now_nanos, &payer,
+    )
+    .await
+    .map_err(map_fs_error_to_program_exec)?;
     if profile {
         write_serial.emit_fmt(format_args!(
             "aot-write us={} bytes={}\n",
