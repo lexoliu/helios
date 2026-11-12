@@ -64,10 +64,11 @@ use core::ops::Range;
 use crossbeam_utils::CachePadded;
 use helios_hal::dma::{DmaBuffer, DmaMemory};
 use helios_hal::io::{IoError, IoResult};
-use helios_hal::iommu::PhysicalRange;
+use helios_hal::iommu::{DmaAccess, PhysicalRange};
 
 use super::{
-    ChainEntry, MAX_CHAIN_BUFFERS, TransportBuffer, VirtQueue, VirtqueueError, entry, foreign_entry,
+    ChainEntry, MAX_CHAIN_BUFFERS, READ_WRITE, TransportBuffer, VirtQueue, VirtqueueError, entry,
+    foreign_entry,
 };
 use crate::bus::DeviceBus;
 use crate::transport::VirtioTransport;
@@ -202,7 +203,13 @@ pub(crate) fn control_slots<T: VirtioTransport>(
     } else {
         let layout = Layout::from_size_align(stride * count, SLOT_ALIGNMENT)
             .map_err(|_| IoError::DeviceFault)?;
-        Some(transport.bus().dma().allocate_zeroed(layout)?)
+        // A slot with no response area is one the device only reads.
+        let access = if response == 0 {
+            DmaAccess::READ
+        } else {
+            READ_WRITE
+        };
+        Some(transport.bus().dma().allocate_resident(layout, access)?)
     };
     Ok(ControlSlots {
         buffer,
@@ -471,7 +478,7 @@ impl<B: DmaBuffer> SlotPool<B> {
         let layout = Layout::from_size_align(count * slot_bytes, SLOT_ALIGNMENT)
             .map_err(|_| IoError::DeviceFault)?;
         Ok(Self {
-            buffer: dma.allocate_zeroed(layout)?,
+            buffer: dma.allocate_resident(layout, READ_WRITE)?,
             slot_bytes,
             count,
         })

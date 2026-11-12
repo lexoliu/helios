@@ -83,6 +83,12 @@ impl NetworkDevice for VirtioNetworkDevice {
         self.inner.transmit_payload(bytes)
     }
 
+    fn transmit_payload_ready(
+        &self,
+    ) -> impl core::future::Future<Output = Result<(), IoError>> + Send + '_ {
+        self.inner.transmit_payload_ready()
+    }
+
     fn mac_address(&self) -> [u8; 6] {
         self.inner.mac_address()
     }

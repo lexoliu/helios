@@ -41,6 +41,10 @@ impl NetworkDevice for HostedNetworkDevice {
         match *self {}
     }
 
+    fn transmit_payload_ready(&self) -> impl Future<Output = Result<(), IoError>> + Send + '_ {
+        core::future::ready(match *self {})
+    }
+
     fn mac_address(&self) -> [u8; 6] {
         match *self {}
     }

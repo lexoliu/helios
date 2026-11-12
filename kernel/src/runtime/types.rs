@@ -154,9 +154,11 @@ pub enum PingErrorKind {
 impl PingErrorKind {
     pub const fn from_io(error: IoError) -> Self {
         match error {
-            IoError::Unsupported | IoError::PermissionDenied | IoError::ReadOnly => {
-                PingErrorKind::Unavailable
-            }
+            IoError::Unsupported
+            | IoError::PermissionDenied
+            | IoError::ReadOnly
+            | IoError::Replenishing
+            | IoError::Exhausted => PingErrorKind::Unavailable,
             IoError::NotFound
             | IoError::AlreadyExists
             | IoError::NotDirectory
@@ -255,9 +257,11 @@ pub enum DnsErrorKind {
 impl DnsErrorKind {
     pub const fn from_io(error: IoError) -> Self {
         match error {
-            IoError::Unsupported | IoError::PermissionDenied | IoError::ReadOnly => {
-                DnsErrorKind::Unavailable
-            }
+            IoError::Unsupported
+            | IoError::PermissionDenied
+            | IoError::ReadOnly
+            | IoError::Replenishing
+            | IoError::Exhausted => DnsErrorKind::Unavailable,
             IoError::NotFound
             | IoError::AlreadyExists
             | IoError::NotDirectory
@@ -309,7 +313,9 @@ impl TcpErrorKind {
     pub const fn from_io(error: IoError) -> Self {
         match error {
             IoError::PermissionDenied | IoError::ReadOnly => TcpErrorKind::PermissionDenied,
-            IoError::Unsupported => TcpErrorKind::Unavailable,
+            IoError::Unsupported | IoError::Replenishing | IoError::Exhausted => {
+                TcpErrorKind::Unavailable
+            }
             IoError::NotFound
             | IoError::AlreadyExists
             | IoError::NotDirectory
@@ -358,9 +364,11 @@ pub enum UdpErrorKind {
 impl UdpErrorKind {
     pub const fn from_io(error: IoError) -> Self {
         match error {
-            IoError::Unsupported | IoError::PermissionDenied | IoError::ReadOnly => {
-                UdpErrorKind::Unavailable
-            }
+            IoError::Unsupported
+            | IoError::PermissionDenied
+            | IoError::ReadOnly
+            | IoError::Replenishing
+            | IoError::Exhausted => UdpErrorKind::Unavailable,
             IoError::NotFound
             | IoError::AlreadyExists
             | IoError::NotDirectory
@@ -446,6 +454,15 @@ pub enum NetworkErrorDetail {
     TcpWriteTimeout,
     #[error("TCP write could not be queued")]
     TcpWriteQueueFailed,
+    /// The interface's transmit memory has none free now and more is on
+    /// its way. A write awaits it and asks again.
+    #[error("transmit memory is being replenished")]
+    TransmitMemoryReplenishing,
+    /// The interface's transmit memory cannot grow. A write waits for
+    /// queued payloads to leave the wire, as it does for a full send
+    /// queue.
+    #[error("transmit memory is exhausted")]
+    TransmitMemoryExhausted,
     #[error("TCP stream is no longer writable")]
     TcpNoLongerWritable,
     #[error("TCP read timed out")]
@@ -536,6 +553,8 @@ impl NetworkErrorDetail {
             Self::TcpListenerClosedUnexpectedly => "TCP listener closed unexpectedly",
             Self::TcpWriteTimeout => "TCP write timed out",
             Self::TcpWriteQueueFailed => "TCP write could not be queued",
+            Self::TransmitMemoryReplenishing => "transmit memory is being replenished",
+            Self::TransmitMemoryExhausted => "transmit memory is exhausted",
             Self::TcpNoLongerWritable => "TCP stream is no longer writable",
             Self::TcpReadTimeout => "TCP read timed out",
             Self::TcpConnectionReset => "TCP connection was reset by the peer",
@@ -1220,6 +1239,8 @@ impl HostFsError {
             | HostFsError::Transport(IoError::InvalidDeviceConfig(_))
             | HostFsError::Transport(IoError::OutOfBounds)
             | HostFsError::Transport(IoError::DeviceFault)
+            | HostFsError::Transport(IoError::Replenishing)
+            | HostFsError::Transport(IoError::Exhausted)
             | HostFsError::Protocol(_)
             | HostFsError::Utf8
             | HostFsError::DirectoryTooLarge { .. } => HostFsErrorKind::Io,

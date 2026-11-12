@@ -176,13 +176,22 @@ where
     }
 
     /// At least `bytes` of memory the interface transmits from in place.
+    ///
+    /// A refusal that clears with time is
+    /// [`NetworkErrorDetail::TransmitMemoryReplenishing`], and one that
+    /// does not is [`NetworkErrorDetail::TransmitMemoryExhausted`]; both
+    /// are what [`Self::tcp_write_all`] waits out.
     pub fn tcp_transmit_payload(&self, bytes: usize) -> Result<DeviceImpl::TxPayload, TcpError> {
         self.inner
             .device
             .transmit_payload(bytes)
-            .map_err(|_| TcpError {
+            .map_err(|error| TcpError {
                 kind: TcpErrorKind::Unavailable,
-                detail: NetworkErrorDetail::TcpWriteQueueFailed,
+                detail: match error {
+                    IoError::Replenishing => NetworkErrorDetail::TransmitMemoryReplenishing,
+                    IoError::Exhausted => NetworkErrorDetail::TransmitMemoryExhausted,
+                    _ => NetworkErrorDetail::TcpWriteQueueFailed,
+                },
             })
     }
 
@@ -192,20 +201,116 @@ where
     /// A piece is drawn only after the one before it is queued, so a lazy
     /// iterator holds one piece of transmit memory beyond the send queue
     /// at a time. The timeout covers the whole write, not each piece.
+    ///
+    /// A piece that fails with
+    /// [`NetworkErrorDetail::TransmitMemoryReplenishing`] is drawn again
+    /// once the interface says its memory is back, and one that fails
+    /// with [`NetworkErrorDetail::TransmitMemoryExhausted`] is drawn
+    /// again once queued payloads have left the wire: the write is held
+    /// back, as it is by a full send queue, and fails only by its
+    /// deadline. An iterator therefore yields the same piece again after
+    /// either failure, as [`crate::TcpPayloadPieces`] does.
     pub async fn tcp_write_all<Pieces>(
         &self,
         stream: TcpStreamId,
-        pieces: Pieces,
+        mut pieces: Pieces,
         timeout_nanos: u64,
     ) -> Result<(), TcpError>
     where
         Pieces: Iterator<Item = Result<Bytes, TcpError>>,
     {
         let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
-        for piece in pieces {
-            self.execute_tcp_write_until(stream, piece?, deadline_nanos)
-                .await?;
+        loop {
+            // Sampled before the piece is drawn, so a payload that leaves
+            // the wire between the refusal and the park releases it.
+            let wait = self.shard_wait_for_handle(stream);
+            let Some(piece) = pieces.next() else {
+                return Ok(());
+            };
+            match piece {
+                Ok(piece) => {
+                    self.execute_tcp_write_until(stream, piece, deadline_nanos)
+                        .await?;
+                }
+                Err(TcpError {
+                    detail: NetworkErrorDetail::TransmitMemoryReplenishing,
+                    ..
+                }) => {
+                    self.wait_for_replenished_transmit_memory(wait, deadline_nanos)
+                        .await?;
+                }
+                Err(TcpError {
+                    detail: NetworkErrorDetail::TransmitMemoryExhausted,
+                    ..
+                }) => self.wait_for_transmit_memory(wait, deadline_nanos).await?,
+                Err(error) => return Err(error),
+            }
         }
+    }
+
+    /// Holds a write back until the interface says its transmit memory is
+    /// back, or the write's deadline passes. Memory the interface then
+    /// says cannot grow is waited out as
+    /// [`Self::wait_for_transmit_memory`] waits.
+    async fn wait_for_replenished_transmit_memory(
+        &self,
+        wait: NetworkWait,
+        deadline_nanos: u64,
+    ) -> Result<(), TcpError> {
+        const TIMED_OUT: TcpError = TcpError {
+            kind: TcpErrorKind::Timeout,
+            detail: NetworkErrorDetail::TcpWriteTimeout,
+        };
+        let now_nanos = self.now_nanos();
+        if now_nanos >= deadline_nanos {
+            return Err(TIMED_OUT);
+        }
+        let mut ready = core::pin::pin!(self.inner.device.transmit_payload_ready());
+        let mut deadline = core::pin::pin!(
+            self.inner
+                .timer
+                .sleep_for(Duration::from_nanos(deadline_nanos - now_nanos))
+        );
+        let answer = core::future::poll_fn(|cx| {
+            if let Poll::Ready(answer) = ready.as_mut().poll(cx) {
+                return Poll::Ready(Some(answer));
+            }
+            if deadline.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(None);
+            }
+            Poll::Pending
+        })
+        .await;
+        match answer {
+            Some(Ok(())) => Ok(()),
+            Some(Err(IoError::Exhausted)) => {
+                self.wait_for_transmit_memory(wait, deadline_nanos).await
+            }
+            Some(Err(error)) => Err(TcpError {
+                kind: TcpErrorKind::from_io(error),
+                detail: NetworkErrorDetail::TcpWriteQueueFailed,
+            }),
+            None => Err(TIMED_OUT),
+        }
+    }
+
+    /// Holds a write back until payloads already queued have left the
+    /// wire and given their memory back, or its deadline passes.
+    async fn wait_for_transmit_memory(
+        &self,
+        wait: NetworkWait,
+        deadline_nanos: u64,
+    ) -> Result<(), TcpError> {
+        // Driving the stack reaps the transmit completions that return
+        // the memory.
+        self.drive_tcp().await?;
+        if self.now_nanos() >= deadline_nanos {
+            return Err(TcpError {
+                kind: TcpErrorKind::Timeout,
+                detail: NetworkErrorDetail::TcpWriteTimeout,
+            });
+        }
+        self.wait_for_tcp_progress(wait, deadline_nanos).await;
         Ok(())
     }
 

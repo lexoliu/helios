@@ -606,7 +606,19 @@ pub trait NetworkInterface: Clone + Send + Sync + 'static {
 
     /// Allocates a zeroed transmit payload buffer of `bytes` bytes the
     /// device can reach.
+    ///
+    /// [`helios_hal::io::IoError::Replenishing`] says the interface's
+    /// transmit memory has none free now and more is on its way: await
+    /// [`NetworkInterface::transmit_payload_ready`] and ask again.
+    /// [`helios_hal::io::IoError::Exhausted`] says it cannot grow, which a
+    /// write reports as back-pressure rather than as a failure.
     fn transmit_payload(&self, bytes: usize) -> IoResult<Self::TxPayload>;
+
+    /// Resolves once [`NetworkInterface::transmit_payload`] may succeed
+    /// after it answered [`helios_hal::io::IoError::Replenishing`], or with
+    /// the reason it will not. This is the interface's
+    /// [`helios_hal::dma::DmaMemory::replenished`].
+    fn transmit_payload_ready(&self) -> impl Future<Output = IoResult<()>> + Send + '_;
 
     /// Returns the hardware MAC address programmed for this interface.
     fn mac_address(&self) -> EthernetAddress;

@@ -19,8 +19,8 @@ use crate::features::NegotiatedFeatures;
 use crate::transport::VirtioTransport;
 
 use super::{
-    ChainEntry, DESCRIPTOR_BYTES, MAX_CHAIN_BUFFERS, RingCore, RingOps, TransportBuffer,
-    VirtqueueError, need_event,
+    ChainEntry, DESCRIPTOR_BYTES, MAX_CHAIN_BUFFERS, READ_WRITE, RingCore, RingOps,
+    TransportBuffer, VirtqueueError, need_event,
 };
 
 const DESC_FLAG_NEXT: u16 = 1;
@@ -76,13 +76,13 @@ impl<T: VirtioTransport> RingOps<T> for SplitRing<T> {
         let ring = Self {
             core: RingCore::new(dma, size, chain_limit, features)?,
             descriptors: dma
-                .allocate_zeroed(descriptor_layout)
+                .allocate_resident(descriptor_layout, READ_WRITE)
                 .map_err(|_| VirtqueueError::RingAllocation)?,
             driver_area: dma
-                .allocate_zeroed(driver_layout)
+                .allocate_resident(driver_layout, READ_WRITE)
                 .map_err(|_| VirtqueueError::RingAllocation)?,
             device_area: dma
-                .allocate_zeroed(device_layout)
+                .allocate_resident(device_layout, READ_WRITE)
                 .map_err(|_| VirtqueueError::RingAllocation)?,
             desc_shadow: alloc::vec![Descriptor::default(); usize::from(size)].into_boxed_slice(),
             avail_idx: 0,

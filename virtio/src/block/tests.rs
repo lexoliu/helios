@@ -1,8 +1,8 @@
 use super::*;
 
 use crate::testing::{
-    ConfinedDmaBuffer, ConfinedDmaPool, ConfinedTransport, FakeAffinity, FakeTransport,
-    FakeTransportConfig,
+    Allocation, ConfinedDmaBuffer, ConfinedDmaPool, ConfinedTransport, FakeAffinity, FakeTransport,
+    FakeTransportConfig, Lifetime,
 };
 use crate::transport::VirtioFeatures;
 use alloc::sync::Arc;
@@ -10,7 +10,8 @@ use alloc::vec;
 use core::pin::pin;
 use core::ptr::NonNull;
 use futures_lite::future::{block_on, poll_once};
-use helios_hal::dma::DmaBuffer;
+use helios_hal::dma::{DmaBuffer, DmaError};
+use helios_hal::iommu::DmaAccess;
 use spin::Mutex as SpinMutex;
 
 /// A device with 2 MiB of capacity in 512-byte sectors.
@@ -669,12 +670,46 @@ fn request_memory_is_the_devices_own_in_whole_blocks() {
     for bytes in [0, block + 1] {
         assert_eq!(
             device.memory(bytes).err(),
-            Some(IoError::InvalidBufferLength {
+            Some(DmaError::InvalidLength {
+                bytes,
                 required_multiple: block,
-                actual: bytes,
             })
         );
     }
+}
+
+/// Request memory is carried by a request and given back, and a request
+/// reads and writes it: a cache page is read into and written from.
+#[test]
+fn request_memory_is_per_request_and_read_write() {
+    let device = device();
+    let block = device.block_size();
+    let pool = device.object().transport.pool().clone();
+    let before = pool.allocations().len();
+    let _memory = device.memory(block).expect("one block of request memory");
+    let served = pool.allocations();
+    assert_eq!(
+        served[before..],
+        [Allocation {
+            lifetime: Lifetime::PerRequest,
+            access: DmaAccess::READ | DmaAccess::WRITE,
+            bytes: block,
+        }]
+    );
+}
+
+/// Rings and control slots are resident for the life of the device.
+#[test]
+fn rings_and_control_slots_are_resident() {
+    let device = device();
+    let served = device.object().transport.pool().allocations();
+    assert!(!served.is_empty(), "bring-up allocated device memory");
+    assert!(
+        served
+            .iter()
+            .all(|allocation| allocation.lifetime == Lifetime::Resident),
+        "bring-up allocates only resident memory: {served:?}"
+    );
 }
 
 #[test]
@@ -1149,10 +1184,14 @@ impl BlockDevice for MemoryBlockDevice {
     type Memory = ConfinedDmaBuffer;
     type Waiter<'a> = MemoryWaiter;
 
-    fn memory(&self, bytes: usize) -> IoResult<ConfinedDmaBuffer> {
+    fn memory(&self, bytes: usize) -> Result<ConfinedDmaBuffer, DmaError> {
         let layout =
-            Layout::from_size_align(bytes, PhysFrame::SIZE).map_err(|_| IoError::OutOfBounds)?;
-        self.memory.allocate_zeroed(layout)
+            Layout::from_size_align(bytes, PhysFrame::SIZE).map_err(|_| DmaError::TooLarge {
+                bytes,
+                limit: isize::MAX as usize & !(PhysFrame::SIZE - 1),
+            })?;
+        self.memory
+            .allocate(layout, DmaAccess::READ | DmaAccess::WRITE)
     }
 
     async fn submit_read(&self, block_id: usize, mut buffer: TestBuffer) -> Self::Waiter<'_> {

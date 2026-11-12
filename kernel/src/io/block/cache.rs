@@ -215,6 +215,7 @@ use arrayvec::ArrayVec;
 use crossbeam_utils::CachePadded;
 use helios_hal::cpu::current_processor;
 use helios_hal::dma::DmaBuffer;
+use helios_hal::dma::DmaError;
 use helios_hal::fs::{BlockDevice, BlockGeometry, BlockSerial};
 use helios_hal::io::{IoError, IoResult};
 use helios_hal::pmm::PhysFrame;
@@ -393,7 +394,7 @@ pub enum BlockCacheError {
     #[error("the device failed: {0}")]
     Device(IoError),
     #[error("the disk's memory refused a page: {0}")]
-    Memory(IoError),
+    Memory(DmaError),
 }
 
 /// Why a disk cannot be put behind the cache.
@@ -1655,7 +1656,7 @@ impl<Memory> CacheCore<Memory> {
 /// The parts of the cache that take pages from a disk's memory.
 impl<Device: BlockDevice> CacheShared<Device> {
     /// A zeroed page of `disk`'s memory, for one cache block.
-    fn new_page(&self, disk: usize) -> Result<Device::Memory, IoError> {
+    fn new_page(&self, disk: usize) -> Result<Device::Memory, DmaError> {
         let page = self.devices[disk].memory(CACHE_BLOCK_BYTES)?;
         self.pages.fetch_add(1, Ordering::Relaxed);
         Ok(page)
@@ -1667,7 +1668,7 @@ impl<Device: BlockDevice> CacheShared<Device> {
     ///
     /// Fails when the disk's memory refuses the page the entry needs; the
     /// entry goes back to the free list.
-    fn try_claim(&self, disk: usize, urgent: bool) -> Result<Option<u32>, IoError> {
+    fn try_claim(&self, disk: usize, urgent: bool) -> Result<Option<u32>, DmaError> {
         let Some((id, holder)) = self.take_entry(urgent) else {
             return Ok(None);
         };
@@ -1708,7 +1709,7 @@ impl<Device: BlockDevice> CacheShared<Device> {
         &self,
         disk: usize,
         id: u32,
-    ) -> Result<Option<Option<Device::Memory>>, IoError> {
+    ) -> Result<Option<Option<Device::Memory>>, DmaError> {
         let entry = self.entry(id);
         let mut current = entry.state.load(Ordering::Acquire);
         loop {
@@ -1770,7 +1771,7 @@ impl<Device: BlockDevice> CacheShared<Device> {
     /// next to it on its disk, as far as one request carries. Answers
     /// `None` when `seed` cannot be written now, and fails when the
     /// disk's memory refuses the page `seed`'s write is staged in.
-    fn start_write_run(&self, seed: u32) -> Result<Option<WriteRun<Device::Memory>>, IoError> {
+    fn start_write_run(&self, seed: u32) -> Result<Option<WriteRun<Device::Memory>>, DmaError> {
         if !self.try_take(seed, Take::Pin) {
             return Ok(None);
         }
@@ -1819,7 +1820,7 @@ impl<Device: BlockDevice> CacheShared<Device> {
     /// the page; the entry is left compressed.
     ///
     /// The caller holds a pin.
-    fn try_inflate(&self, disk: usize, id: u32) -> Result<bool, IoError> {
+    fn try_inflate(&self, disk: usize, id: u32) -> Result<bool, DmaError> {
         let entry = self.entry(id);
         let mut current = entry.state.load(Ordering::Acquire);
         loop {
@@ -2057,7 +2058,7 @@ impl<Device: BlockDevice> CacheShared<Device> {
     /// Starts the write-back of `seed` with its dirty neighbours, as one
     /// request, if it can be written now. Fails when the disk's memory
     /// refuses the page `seed`'s write is staged in.
-    fn start_write_back(&self, seed: u32) -> Result<Option<DevicePages<Device>>, IoError> {
+    fn start_write_back(&self, seed: u32) -> Result<Option<DevicePages<Device>>, DmaError> {
         Ok(self
             .start_write_run(seed)?
             .map(|run| self.write_pages(run, RunKind::WriteBack)))
@@ -2112,7 +2113,7 @@ where
     /// Fails only when the disk's memory refuses the page `seed`'s write
     /// is staged in, which leaves it dirty; a write the device fails is
     /// counted in the disk's error sequence, which the next sync reports.
-    async fn write_back(&self, seed: u32) -> Result<(), IoError> {
+    async fn write_back(&self, seed: u32) -> Result<(), DmaError> {
         if let Some(pages) = self.start_write_back(seed)? {
             let _ = self.write_run(pages).await;
         }
@@ -2138,7 +2139,7 @@ where
     /// Fails when a disk's memory refuses a page the claim needs: the
     /// entry's own, or the one an idle dirty compressed block's write-back
     /// is staged in.
-    async fn claim(&self, disk: usize) -> Result<u32, IoError> {
+    async fn claim(&self, disk: usize) -> Result<u32, DmaError> {
         loop {
             if let Some(id) = self.try_claim(disk, true)? {
                 return Ok(id);
@@ -2311,7 +2312,7 @@ where
     ///
     /// Fails when the disk's memory refuses the page the block's write is
     /// staged in; the block stays dirty and goes back in the set.
-    async fn settle(&self, disk: usize, id: u32) -> Result<(), IoError> {
+    async fn settle(&self, disk: usize, id: u32) -> Result<(), DmaError> {
         if !self.try_take(id, Take::Pin) {
             // Being recycled: it was clean.
             return Ok(());

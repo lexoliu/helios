@@ -37,10 +37,12 @@
 
 use core::alloc::Layout;
 use core::fmt;
+use core::future::Future;
 
 use thiserror::Error;
 
 use crate::io::{IoError, IoResult};
+use crate::iommu::DmaAccess;
 
 /// An address one device issues.
 ///
@@ -85,12 +87,41 @@ pub enum DmaError {
         address: usize,
         bytes: usize,
     },
+    /// Nothing reachable is free now, and more is on its way: await
+    /// [`DmaMemory::replenished`] and ask again. (FreeBSD busdma's
+    /// deferred load, `EINPROGRESS`.)
+    #[error("the device's memory is being replenished; {bytes} bytes were not available")]
+    Replenishing { bytes: usize },
+    /// The device's memory cannot grow: the budget it grows under is
+    /// spent, or the machine refused the memory. Not a device failure.
+    #[error("the device's memory is exhausted; {bytes} bytes were refused")]
+    Exhausted { bytes: usize },
+    /// A run larger than one contiguous piece of the device's memory.
+    #[error("{bytes} bytes exceed the {limit}-byte contiguous run the device's memory serves")]
+    TooLarge { bytes: usize, limit: usize },
+    /// A length the device cannot transfer: zero, or not a whole number
+    /// of the `required_multiple` bytes one of its transfer units holds.
+    #[error("length {bytes} is invalid; it must be a non-zero multiple of {required_multiple}")]
+    InvalidLength {
+        bytes: usize,
+        required_multiple: usize,
+    },
 }
 
 impl From<DmaError> for IoError {
     fn from(error: DmaError) -> Self {
         match error {
             DmaError::Unreachable { .. } => Self::DeviceFault,
+            DmaError::Replenishing { .. } => Self::Replenishing,
+            DmaError::Exhausted { .. } => Self::Exhausted,
+            DmaError::TooLarge { .. } => Self::OutOfBounds,
+            DmaError::InvalidLength {
+                bytes,
+                required_multiple,
+            } => Self::InvalidBufferLength {
+                required_multiple,
+                actual: bytes,
+            },
         }
     }
 }
@@ -164,6 +195,11 @@ impl<B, E: fmt::Display> fmt::Display for BufError<B, E> {
 /// The bytes are not inside the value: moving a buffer does not move the
 /// memory it names, so a chain described from a buffer stays valid after
 /// the buffer moves into the slot that parks it.
+///
+/// Dropping one never blocks, takes no lock, and never waits on another
+/// processor: a driver's completion path, which may be an interrupt
+/// handler on any processor, drops the buffers of requests nobody waits
+/// on.
 pub trait DmaBuffer: Send + Sync + 'static {
     /// The address the device has to issue to reach the first byte.
     fn device_address(&self) -> DeviceAddress;
@@ -186,7 +222,27 @@ pub trait DmaMemory: Send + Sync + 'static {
     /// flight.
     type Buffer: DmaBuffer + AsRef<[u8]> + AsMut<[u8]>;
 
-    fn allocate_zeroed(&self, layout: Layout) -> IoResult<Self::Buffer>;
+    /// Zeroed memory for the life of the device: rings, control slots,
+    /// receive and event buffers. It is never freed while the device
+    /// lives, and `access` is what the device may do with it.
+    fn allocate_resident(
+        &self,
+        layout: Layout,
+        access: DmaAccess,
+    ) -> Result<Self::Buffer, DmaError>;
+
+    /// Zeroed memory a request carries and gives back: payloads, block
+    /// pages, 9p messages. One run, contiguous in the device's address
+    /// space, that the device may use as `access` says.
+    ///
+    /// A refusal that clears with time is [`DmaError::Replenishing`]; one
+    /// that does not is [`DmaError::Exhausted`].
+    fn allocate(&self, layout: Layout, access: DmaAccess) -> Result<Self::Buffer, DmaError>;
+
+    /// Resolves once an allocation refused with
+    /// [`DmaError::Replenishing`] may succeed, or with the reason none
+    /// will.
+    fn replenished(&self) -> impl Future<Output = Result<(), DmaError>> + Send + '_;
 
     /// The address a device has to issue to reach `bytes`.
     ///

@@ -17,6 +17,7 @@ extern crate alloc;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use helios_hal::dma::DmaError;
 use helios_hal::fs::{
     BlockDevice, BlockDeviceCapabilities, BlockGeometry, BlockQueueTopology, BlockRange,
     BlockSerial, IoError, IoResult, OwnedBlockBuffer,
@@ -38,7 +39,7 @@ pub enum BlockSelfCheckError {
         block_bytes: usize,
     },
     #[error("scratch disk memory refused a {bytes}-byte self-check buffer: {error}")]
-    Buffer { bytes: usize, error: IoError },
+    Buffer { bytes: usize, error: DmaError },
     #[error("scratch disk write failed: {0}")]
     Write(IoError),
     #[error("scratch disk cache flush failed: {0}")]
@@ -247,7 +248,7 @@ where
     where
         Self: 'a;
 
-    fn memory(&self, bytes: usize) -> IoResult<Device::Memory> {
+    fn memory(&self, bytes: usize) -> Result<Device::Memory, DmaError> {
         self.device.memory(bytes)
     }
 

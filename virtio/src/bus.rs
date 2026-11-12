@@ -4,7 +4,7 @@ use core::ptr::NonNull;
 
 use helios_hal::dma::{DeviceAddress, DmaAddressing, DmaBuffer, DmaError, DmaMemory};
 use helios_hal::io::{IoError, IoResult};
-use helios_hal::iommu::DmaTranslation;
+use helios_hal::iommu::{DmaAccess, DmaTranslation};
 use helios_hal::mmio;
 
 pub trait DeviceBus: Send + Sync + 'static {
@@ -129,10 +129,26 @@ impl<P> MmioBus<P> {
 impl DmaMemory for IdentityDmaPool {
     type Buffer = IdentityDmaBuffer;
 
-    fn allocate_zeroed(&self, layout: Layout) -> IoResult<Self::Buffer> {
+    fn allocate_resident(
+        &self,
+        layout: Layout,
+        access: DmaAccess,
+    ) -> Result<Self::Buffer, DmaError> {
+        self.allocate(layout, access)
+    }
+
+    fn allocate(&self, layout: Layout, _access: DmaAccess) -> Result<Self::Buffer, DmaError> {
         let ptr = unsafe { alloc_zeroed(layout) };
-        let ptr = NonNull::new(ptr).ok_or(IoError::DeviceFault)?;
+        let ptr = NonNull::new(ptr).ok_or(DmaError::Exhausted {
+            bytes: layout.size(),
+        })?;
         Ok(IdentityDmaBuffer { ptr, layout })
+    }
+
+    /// Heap memory is never being replenished: an allocation either
+    /// succeeds or is refused for good.
+    async fn replenished(&self) -> Result<(), DmaError> {
+        Ok(())
     }
 
     fn device_range(&self, bytes: &[u8]) -> Result<DeviceAddress, DmaError> {
@@ -153,15 +169,39 @@ impl DmaMemory for IdentityDmaPool {
 impl DmaMemory for OffsetDmaPool {
     type Buffer = OffsetDmaBuffer;
 
-    fn allocate_zeroed(&self, layout: Layout) -> IoResult<Self::Buffer> {
+    fn allocate_resident(
+        &self,
+        layout: Layout,
+        access: DmaAccess,
+    ) -> Result<Self::Buffer, DmaError> {
+        self.allocate(layout, access)
+    }
+
+    fn allocate(&self, layout: Layout, _access: DmaAccess) -> Result<Self::Buffer, DmaError> {
         let ptr = unsafe { alloc_zeroed(layout) };
-        let ptr = NonNull::new(ptr).ok_or(IoError::DeviceFault)?;
-        let physical_address = self.translate(ptr.as_ptr())?;
+        let ptr = NonNull::new(ptr).ok_or(DmaError::Exhausted {
+            bytes: layout.size(),
+        })?;
+        let physical_address = self.translate(ptr.as_ptr()).map_err(|_| {
+            // SAFETY: `ptr` was allocated above with `layout` and is not
+            // used again.
+            unsafe { dealloc(ptr.as_ptr(), layout) };
+            DmaError::Unreachable {
+                address: ptr.as_ptr() as usize,
+                bytes: layout.size(),
+            }
+        })?;
         Ok(OffsetDmaBuffer {
             ptr,
             layout,
             physical_address,
         })
+    }
+
+    /// Heap memory is never being replenished: an allocation either
+    /// succeeds or is refused for good.
+    async fn replenished(&self) -> Result<(), DmaError> {
+        Ok(())
     }
 
     /// The device sees physical addresses, so a run named by one is
@@ -224,6 +264,25 @@ impl<P> PlatformDmaPool<P> {
     }
 }
 
+impl<P: DmaMemory> PlatformDmaPool<P> {
+    /// `inner` with the address the device issues for it.
+    fn translated(&self, inner: P::Buffer) -> Result<PlatformDmaBuffer<P::Buffer>, DmaError> {
+        let unreachable = DmaError::Unreachable {
+            address: inner.as_ptr() as usize,
+            bytes: inner.len(),
+        };
+        let bytes = u64::try_from(inner.len()).map_err(|_| unreachable)?;
+        let device_address = self
+            .translation
+            .device_range(inner.device_address().get(), bytes)
+            .map_err(|_| unreachable)?;
+        Ok(PlatformDmaBuffer {
+            inner,
+            device_address: DeviceAddress::new(device_address),
+        })
+    }
+}
+
 impl<P: Clone> Clone for PlatformDmaPool<P> {
     fn clone(&self) -> Self {
         Self {
@@ -238,16 +297,20 @@ impl<P: Copy> Copy for PlatformDmaPool<P> {}
 impl<P: DmaMemory> DmaMemory for PlatformDmaPool<P> {
     type Buffer = PlatformDmaBuffer<P::Buffer>;
 
-    fn allocate_zeroed(&self, layout: Layout) -> IoResult<Self::Buffer> {
-        let inner = self.inner.allocate_zeroed(layout)?;
-        let bytes = u64::try_from(inner.len()).map_err(|_| IoError::OutOfBounds)?;
-        let device_address = self
-            .translation
-            .device_range(inner.device_address().get(), bytes)?;
-        Ok(PlatformDmaBuffer {
-            inner,
-            device_address: DeviceAddress::new(device_address),
-        })
+    fn allocate_resident(
+        &self,
+        layout: Layout,
+        access: DmaAccess,
+    ) -> Result<Self::Buffer, DmaError> {
+        self.translated(self.inner.allocate_resident(layout, access)?)
+    }
+
+    fn allocate(&self, layout: Layout, access: DmaAccess) -> Result<Self::Buffer, DmaError> {
+        self.translated(self.inner.allocate(layout, access)?)
+    }
+
+    async fn replenished(&self) -> Result<(), DmaError> {
+        self.inner.replenished().await
     }
 
     /// The whole slice has to sit inside one window of the translation.
@@ -424,8 +487,7 @@ mod tests {
     use core::alloc::Layout;
 
     use helios_hal::dma::{DeviceAddress, DmaAddressing, DmaBuffer, DmaError, DmaMemory};
-    use helios_hal::io::IoError;
-    use helios_hal::iommu::{DmaTranslation, DmaWindow, IoVirtAddr};
+    use helios_hal::iommu::{DmaAccess, DmaTranslation, DmaWindow, IoVirtAddr};
 
     use super::{IdentityDmaPool, PlatformDmaPool};
 
@@ -435,7 +497,9 @@ mod tests {
     fn a_direct_platform_pool_hands_out_physical_addresses() {
         let pool = PlatformDmaPool::new(IdentityDmaPool, DmaTranslation::direct());
         let layout = Layout::from_size_align(256, 16).expect("layout");
-        let buffer = pool.allocate_zeroed(layout).expect("allocation succeeds");
+        let buffer = pool
+            .allocate(layout, DmaAccess::READ | DmaAccess::WRITE)
+            .expect("allocation succeeds");
 
         assert_eq!(pool.addressing(), DmaAddressing::Physical);
         assert_eq!(
@@ -461,7 +525,7 @@ mod tests {
         // name a physical address the pool will actually be asked for.
         let layout = Layout::from_size_align(4096, 4096).expect("layout");
         let reference = IdentityDmaPool
-            .allocate_zeroed(layout)
+            .allocate(layout, DmaAccess::READ | DmaAccess::WRITE)
             .expect("allocation succeeds");
         let physical = reference.device_address().get();
         let translation = DmaTranslation::confined()
@@ -497,7 +561,7 @@ mod tests {
     fn a_buffer_straddling_the_end_of_a_window_is_refused() {
         let layout = Layout::from_size_align(8192, 4096).expect("layout");
         let reference = IdentityDmaPool
-            .allocate_zeroed(layout)
+            .allocate(layout, DmaAccess::READ | DmaAccess::WRITE)
             .expect("allocation succeeds");
         let translation = DmaTranslation::confined()
             .with_window(DmaWindow {
@@ -532,9 +596,10 @@ mod tests {
         let pool = PlatformDmaPool::new(IdentityDmaPool, translation);
         let layout = Layout::from_size_align(64, 8).expect("layout");
 
-        assert_eq!(
-            pool.allocate_zeroed(layout).err(),
-            Some(IoError::OutOfBounds)
-        );
+        assert!(matches!(
+            pool.allocate(layout, DmaAccess::READ | DmaAccess::WRITE)
+                .err(),
+            Some(DmaError::Unreachable { bytes: 64, .. })
+        ));
     }
 }

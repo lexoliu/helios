@@ -1,6 +1,6 @@
 pub use crate::io::{IoError, IoResult};
 
-use crate::dma::{BufResult, DmaBuffer};
+use crate::dma::{BufResult, DmaBuffer, DmaError};
 use crate::resource::{KernelResource, ResourceRights};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -441,9 +441,7 @@ pub trait BlockDevice: Send + Sync {
     /// A run may be dropped in the device's interrupt handler: a request
     /// buffer that owns one is completed and, when nobody waits for it
     /// any more, dropped by the driver's completion path (see
-    /// [`BlockBuffer`]). Freeing it therefore never blocks, never takes a
-    /// lock an interrupt handler cannot take, and never waits on another
-    /// processor.
+    /// [`BlockBuffer`]). The drop contract is [`DmaBuffer`]'s.
     type Memory: DmaBuffer + AsRef<[u8]> + AsMut<[u8]>;
 
     /// Allocates `bytes` zeroed bytes this device can reach, as one run
@@ -453,10 +451,11 @@ pub trait BlockDevice: Send + Sync {
     /// A request carries a whole number of logical blocks, so a consumer
     /// asks for a non-zero multiple of
     /// [`BlockGeometry::logical_block_bytes`]; any other length is
-    /// refused with [`IoError::InvalidBufferLength`]. A refusal of the
-    /// memory itself is the device's [`crate::dma::DmaMemory`] answer,
-    /// handed to the caller that needed the bytes.
-    fn memory(&self, bytes: usize) -> IoResult<Self::Memory>;
+    /// refused with [`DmaError::InvalidLength`]. A refusal of the memory
+    /// itself is the device's [`crate::dma::DmaMemory`] answer, handed to
+    /// the caller that needed the bytes. The memory is requested as
+    /// `READ | WRITE`, because a block is read into and written from.
+    fn memory(&self, bytes: usize) -> Result<Self::Memory, DmaError>;
 
     /// A request the device has accepted, until its answer is collected.
     type Waiter<'a>: Future<Output = BufResult<(), Self::Buffer>> + Send + 'a

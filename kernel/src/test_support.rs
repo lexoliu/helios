@@ -606,6 +606,11 @@ impl helios_netstack::NetworkInterface for RecordingNetworkInterface {
         Ok(alloc::vec![0; bytes])
     }
 
+    /// Heap memory is never being replenished.
+    async fn transmit_payload_ready(&self) -> helios_hal::io::IoResult<()> {
+        Ok(())
+    }
+
     fn mac_address(&self) -> [u8; 6] {
         [0x02, 0, 0, 0, 0, 1]
     }

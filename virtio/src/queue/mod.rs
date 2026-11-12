@@ -31,7 +31,7 @@ use core::alloc::Layout;
 
 use alloc::boxed::Box;
 use helios_hal::io::{IoError, IoResult};
-use helios_hal::iommu::PhysicalRange;
+use helios_hal::iommu::{DmaAccess, PhysicalRange};
 
 use helios_hal::dma::{DmaBuffer, DmaError, DmaMemory};
 
@@ -41,6 +41,10 @@ use crate::transport::VirtioTransport;
 
 use packed::PackedRing;
 use split::SplitRing;
+
+/// What a device may do with memory it both reads and writes: rings, and
+/// every buffer whose direction is not one-way.
+pub(crate) const READ_WRITE: DmaAccess = DmaAccess::READ.union(DmaAccess::WRITE);
 
 /// The DMA buffer type a transport's bus hands out.
 pub type TransportBuffer<T> =
@@ -78,6 +82,8 @@ pub enum VirtqueueError {
     RingAllocation,
     #[error("{bytes} bytes at {address:#x} are not reachable by the device")]
     Unreachable { address: usize, bytes: usize },
+    #[error("the device's memory refused the buffer: {0}")]
+    Memory(DmaError),
     #[error("a control slot holds {capacity} bytes and the request needs {needed}")]
     ControlSlotOverflow { needed: usize, capacity: usize },
     #[error("a descriptor chain lists a readable buffer after a writable one")]
@@ -113,6 +119,7 @@ impl From<VirtqueueError> for IoError {
             VirtqueueError::RingAllocation | VirtqueueError::Unreachable { .. } => {
                 Self::DeviceFault
             }
+            VirtqueueError::Memory(error) => Self::from(error),
             VirtqueueError::ResetUnsupported => Self::Unsupported,
             VirtqueueError::UnexpectedUsedId { .. }
             | VirtqueueError::SpuriousCompletion
@@ -384,7 +391,7 @@ impl<B: DmaBuffer> RingCore<B> {
                 .map_err(|_| VirtqueueError::RingAllocation)?;
             Some(IndirectTables {
                 memory: dma
-                    .allocate_zeroed(layout)
+                    .allocate_resident(layout, DmaAccess::READ)
                     .map_err(|_| VirtqueueError::RingAllocation)?,
                 stride,
                 entries: chain_limit,
@@ -1199,12 +1206,12 @@ fn entry<P: DmaMemory>(
     Ok(ChainEntry {
         addr: dma
             .device_range(buffer)
-            .map_err(
-                |DmaError::Unreachable { address, bytes }| VirtqueueError::Unreachable {
-                    address,
-                    bytes,
-                },
-            )?
+            .map_err(|error| match error {
+                DmaError::Unreachable { address, bytes } => {
+                    VirtqueueError::Unreachable { address, bytes }
+                }
+                other => VirtqueueError::Memory(other),
+            })?
             .get(),
         len: u32::try_from(buffer.len()).map_err(|_| VirtqueueError::ChainTooLong {
             actual: buffer.len(),

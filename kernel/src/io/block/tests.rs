@@ -14,7 +14,7 @@ use core::task::{Context, Poll, Waker};
 
 use futures_lite::future::block_on;
 use helios_hal::cpu::ProcessorId;
-use helios_hal::dma::{BufError, BufResult, DeviceAddress, DmaBuffer};
+use helios_hal::dma::{BufError, BufResult, DeviceAddress, DmaBuffer, DmaError};
 use helios_hal::fs::{
     BlockBuffer, BlockDevice, BlockDeviceCapabilities, BlockGeometry, BlockQueueTopology,
     BlockRange, BlockSerial, IoError, IoResult,
@@ -427,19 +427,22 @@ impl BlockDevice for MemoryDisk {
     where
         Self: 'a;
 
-    fn memory(&self, bytes: usize) -> IoResult<DiskMemory> {
+    fn memory(&self, bytes: usize) -> Result<DiskMemory, DmaError> {
         let block_bytes = self.state.block_bytes;
         if bytes == 0 || !bytes.is_multiple_of(block_bytes) {
-            return Err(IoError::InvalidBufferLength {
+            return Err(DmaError::InvalidLength {
+                bytes,
                 required_multiple: block_bytes,
-                actual: bytes,
             });
         }
         if self.state.refuse_memory.load(Ordering::SeqCst) {
-            return Err(IoError::DeviceFault);
+            return Err(DmaError::Exhausted { bytes });
         }
         let layout =
-            Layout::from_size_align(bytes, PhysFrame::SIZE).map_err(|_| IoError::OutOfBounds)?;
+            Layout::from_size_align(bytes, PhysFrame::SIZE).map_err(|_| DmaError::TooLarge {
+                bytes,
+                limit: isize::MAX as usize & !(PhysFrame::SIZE - 1),
+            })?;
         // SAFETY: the layout is not zero-sized: `bytes` is a non-zero
         // multiple of the block size.
         let start = NonNull::new(unsafe { alloc_zeroed(layout) })
@@ -668,7 +671,7 @@ fn a_scratch_disk_whose_memory_refuses_the_self_check_buffer_fails_its_self_chec
         block_on(scratch.self_check(&root())),
         Err(BlockSelfCheckError::Buffer {
             bytes: 4096,
-            error: IoError::DeviceFault,
+            error: DmaError::Exhausted { bytes: 4096 },
         })
     );
     assert_eq!(scratch.stats().writes, 0);
@@ -1169,7 +1172,7 @@ fn a_miss_whose_page_the_disk_refuses_fails_and_holds_nothing() {
     block_on(async {
         assert_eq!(
             view.read(2).await.err(),
-            Some(BlockCacheError::Memory(IoError::DeviceFault))
+            Some(BlockCacheError::Memory(DmaError::Exhausted { bytes: 4096 }))
         );
     });
     assert_eq!(disk.reads(), 0, "nothing reaches the device without a page");
@@ -1203,7 +1206,7 @@ fn a_compressed_hit_whose_page_the_disk_refuses_fails_and_stays_compressed() {
     block_on(async {
         assert_eq!(
             view.read(3).await.err(),
-            Some(BlockCacheError::Memory(IoError::DeviceFault))
+            Some(BlockCacheError::Memory(DmaError::Exhausted { bytes: 4096 }))
         );
     });
     assert_eq!(cache.compressed_blocks(), 1);
@@ -1242,7 +1245,7 @@ fn an_overwrite_of_a_compressed_block_whose_page_the_disk_refuses_leaves_it_comp
     block_on(async {
         assert_eq!(
             view.overwrite(4).await.err(),
-            Some(BlockCacheError::Memory(IoError::DeviceFault))
+            Some(BlockCacheError::Memory(DmaError::Exhausted { bytes: 4096 }))
         );
     });
     assert_eq!(cache.compressed_blocks(), 1);
@@ -1266,7 +1269,7 @@ fn a_sync_whose_staging_page_the_disk_refuses_fails_and_keeps_the_block_dirty() 
     block_on(async {
         assert_eq!(
             view.sync().await,
-            Err(BlockCacheError::Memory(IoError::DeviceFault))
+            Err(BlockCacheError::Memory(DmaError::Exhausted { bytes: 4096 }))
         );
     });
     assert_eq!(disk.writes(), []);

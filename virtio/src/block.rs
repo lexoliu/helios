@@ -79,7 +79,7 @@ use crossbeam_utils::CachePadded;
 use spin::{Mutex, MutexGuard};
 
 use helios_hal::cpu::{Cpu, current_processor};
-use helios_hal::dma::{BufError, BufResult, DmaMemory};
+use helios_hal::dma::{BufError, BufResult, DmaError, DmaMemory};
 use helios_hal::fs::{
     AnswerFlag, BlockBuffer, BlockDevice, BlockDeviceCapabilities, BlockDeviceRights,
     BlockGeometry, BlockQueueTopology, BlockRange, BlockSerial, OwnedBlockBuffer,
@@ -93,7 +93,8 @@ use crate::bus::DeviceBus;
 use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate};
 use crate::notify::Notify;
 use crate::queue::{
-    ControlSlots, MAX_CHAIN_BUFFERS, Part, ResponseSpan, TransportBuffer, VirtQueue, control_slots,
+    ControlSlots, MAX_CHAIN_BUFFERS, Part, READ_WRITE, ResponseSpan, TransportBuffer, VirtQueue,
+    control_slots,
 };
 use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
 
@@ -497,6 +498,8 @@ pub enum VirtioBlockSwapError {
     InvalidDestination { expected: usize, actual: usize },
     #[error("swap block I/O failed: {0}")]
     Io(#[from] IoError),
+    #[error("swap staging memory was refused: {0}")]
+    Memory(#[from] DmaError),
 }
 
 #[derive(Default)]
@@ -1808,17 +1811,27 @@ impl<T: VirtioTransport, C: QueueAffinity, B: BlockBuffer> BlockDevice
 
     /// Memory from the transport's DMA pool, which is the memory this
     /// device's requests are translated against.
-    fn memory(&self, bytes: usize) -> IoResult<TransportBuffer<T>> {
+    fn memory(&self, bytes: usize) -> Result<TransportBuffer<T>, DmaError> {
         let logical_block_bytes = self.object().geometry.logical_block_bytes;
         if bytes == 0 || !bytes.is_multiple_of(logical_block_bytes) {
-            return Err(IoError::InvalidBufferLength {
+            return Err(DmaError::InvalidLength {
+                bytes,
                 required_multiple: logical_block_bytes,
-                actual: bytes,
             });
         }
+        // A size no layout can describe is larger than any run the
+        // address space holds; `isize::MAX` rounded down to the page is
+        // the most `Layout` accepts at this alignment.
         let layout =
-            Layout::from_size_align(bytes, PhysFrame::SIZE).map_err(|_| IoError::OutOfBounds)?;
-        self.object().transport.bus().dma().allocate_zeroed(layout)
+            Layout::from_size_align(bytes, PhysFrame::SIZE).map_err(|_| DmaError::TooLarge {
+                bytes,
+                limit: isize::MAX as usize & !(PhysFrame::SIZE - 1),
+            })?;
+        self.object()
+            .transport
+            .bus()
+            .dma()
+            .allocate(layout, READ_WRITE)
     }
 
     async fn submit_read(&self, block_id: usize, buffer: B) -> Self::Waiter<'_> {

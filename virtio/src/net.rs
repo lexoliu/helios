@@ -33,8 +33,9 @@ use core::ops::Range;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crossbeam_utils::CachePadded;
 
-use helios_hal::dma::DmaMemory;
+use helios_hal::dma::{DmaBuffer, DmaMemory};
 use helios_hal::io::{IoError, IoResult};
+use helios_hal::iommu::DmaAccess;
 use helios_netstack::{
     ChecksumOffload, DEFAULT_POLL_BUDGET, EventDeliveryCapabilities, FlowHash,
     InterfaceCapabilities, InterfaceEventMark, LinkState, QueueTopology, RSS_INDIRECTION_ENTRIES,
@@ -566,14 +567,54 @@ struct RxReturnedSlots {
     slots: SpinMutex<Vec<u16>>,
 }
 
-struct RxBufferSlot {
-    slot: u16,
-    returned: Arc<RxReturnedSlots>,
-    buffer: UnsafeCell<Box<[u8]>>,
+/// The memory one receive buffer's bytes live in, reached as a raw slice
+/// because which side may write it is decided by the receive ring, not by
+/// a borrow (see [`RxBufferSlot::buffer_ptr`]).
+trait RxStorage: Send + Sync + 'static {
+    /// The whole buffer.
+    fn bytes(&self) -> *mut [u8];
 }
 
-struct RxFrameOwner {
-    slot: Arc<RxBufferSlot>,
+/// A receive buffer the device writes: resident device memory.
+struct DeviceStorage<B>(B);
+
+impl<B: DmaBuffer> RxStorage for DeviceStorage<B> {
+    fn bytes(&self) -> *mut [u8] {
+        core::ptr::slice_from_raw_parts_mut(self.0.as_ptr(), self.0.len())
+    }
+}
+
+/// A buffer only the CPU touches: a reassembly buffer chains are copied
+/// into, which is never submitted to the device.
+struct HeapStorage(UnsafeCell<Box<[u8]>>);
+
+// SAFETY: access is serialised by the receive state's drain, as for every
+// `RxBufferSlot`; see `RxBufferSlot::buffer_ptr`.
+unsafe impl Send for HeapStorage {}
+// SAFETY: as above.
+unsafe impl Sync for HeapStorage {}
+
+impl RxStorage for HeapStorage {
+    fn bytes(&self) -> *mut [u8] {
+        // SAFETY: `UnsafeCell::get` yields a pointer to the owned `Box`,
+        // and `&raw mut` projects through it to the heap slice without
+        // ever materialising a reference to the box itself.
+        unsafe { &raw mut *(*self.0.get()) }
+    }
+}
+
+struct RxBufferSlot<S> {
+    slot: u16,
+    returned: Arc<RxReturnedSlots>,
+    buffer: S,
+}
+
+/// A receive slot of a queue pair's ring: resident memory the device
+/// writes frames into.
+type RxRingSlot<T> = RxBufferSlot<DeviceStorage<TransportBuffer<T>>>;
+
+struct RxFrameOwner<S> {
+    slot: Arc<RxBufferSlot<S>>,
     range: Range<usize>,
 }
 
@@ -587,7 +628,7 @@ struct RxFrameOwner {
 /// instead of dropping anything. Devices whose largest possible frame
 /// fits one receive slot never build a pool at all.
 struct RxReassemblyPool {
-    buffers: Box<[Arc<RxBufferSlot>]>,
+    buffers: Box<[Arc<RxBufferSlot<HeapStorage>>]>,
     /// Buffers not currently backing a delivered frame. A buffer returns
     /// here through the same owner drop that recycles receive slots.
     free: Arc<RxReturnedSlots>,
@@ -608,7 +649,7 @@ impl RxReassemblyPool {
             buffers.push(Arc::new(RxBufferSlot {
                 slot,
                 returned: free.clone(),
-                buffer: UnsafeCell::new(vec![0_u8; bytes].into_boxed_slice()),
+                buffer: HeapStorage(UnsafeCell::new(vec![0_u8; bytes].into_boxed_slice())),
             }));
             free.slots.lock().push(slot);
         }
@@ -643,7 +684,7 @@ impl RxReassemblyPool {
     /// The owner starts empty and the assembly sets its range, because
     /// how many bytes the chain came to is not known until it is
     /// copied.
-    fn take(&self) -> Option<RxFrameOwner> {
+    fn take(&self) -> Option<RxFrameOwner<HeapStorage>> {
         let slot = self.free.slots.lock().pop()?;
         Some(RxFrameOwner {
             slot: self.buffers[usize::from(slot)].clone(),
@@ -654,7 +695,7 @@ impl RxReassemblyPool {
 
 struct NetTxState<T: VirtioTransport> {
     tx_queue: VirtQueue<T>,
-    tx_buffers: Box<[u8]>,
+    tx_buffers: TransportBuffer<T>,
     tx_buffer_len: usize,
     tx_in_flight: DescriptorBitSet,
     /// Scatter payloads the device is reading in place, indexed by the
@@ -720,14 +761,12 @@ struct NetQueuePair<T: VirtioTransport> {
     interrupts: Notify,
     rx_state: AsyncMutex<NetRxState<T>>,
     rx_returned: Arc<RxReturnedSlots>,
-    rx_slots: Box<[Arc<RxBufferSlot>]>,
+    rx_slots: Box<[Arc<RxRingSlot<T>>]>,
     /// Present only when a frame can span more than one receive slot.
     rx_reassembly: Option<RxReassemblyPool>,
     tx_state: SpinMutex<NetTxState<T>>,
 }
 
-unsafe impl Send for RxBufferSlot {}
-unsafe impl Sync for RxBufferSlot {}
 unsafe impl<T: VirtioTransport> Send for NetQueuePair<T> {}
 unsafe impl<T: VirtioTransport> Sync for NetQueuePair<T> {}
 
@@ -808,8 +847,8 @@ struct NetControlState<T: VirtioTransport> {
     /// Scratch buffer for the next command's header + body bytes.
     /// Sized once at init to fit the largest fixed-shape command
     /// helios sends (currently `VQ_PAIRS_SET`, 4 bytes).
-    cmd_buffer: Box<[u8]>,
-    ack_buffer: Box<[u8]>,
+    cmd_buffer: TransportBuffer<T>,
+    ack_buffer: TransportBuffer<T>,
 }
 
 pub use helios_netstack::{RxDrain, RxFrame};
@@ -821,21 +860,24 @@ pub use helios_netstack::{RxDrain, RxFrame};
 // indexing (no aliasing) so the device as a whole is `Sync`.
 unsafe impl<T: VirtioTransport> Sync for VirtioNetDevice<T> {}
 
-impl AsRef<[u8]> for RxFrameOwner {
+impl<S: RxStorage> AsRef<[u8]> for RxFrameOwner<S> {
     fn as_ref(&self) -> &[u8] {
         &self.slot.buffer()[self.range.clone()]
     }
 }
 
-impl Drop for RxFrameOwner {
+impl<S> Drop for RxFrameOwner<S> {
     fn drop(&mut self) {
         self.slot.returned.slots.lock().push(self.slot.slot);
     }
 }
 
-impl RxBufferSlot {
+impl<S: RxStorage> RxBufferSlot<S> {
     fn buffer(&self) -> &[u8] {
-        unsafe { &*self.buffer.get() }
+        // SAFETY: the storage names its whole buffer for as long as the
+        // slot lives, and the caller reads it only while the slot belongs
+        // to the driver (see `buffer_ptr`).
+        unsafe { &*self.buffer.bytes() }
     }
 
     /// The receive buffer as a raw slice.
@@ -850,10 +892,7 @@ impl RxBufferSlot {
     /// build the mutable reference themselves and write down which
     /// half of that alternation they are in.
     fn buffer_ptr(&self) -> *mut [u8] {
-        // SAFETY: `UnsafeCell::get` yields a pointer to the owned
-        // `Box`, and `&raw mut` projects through it to the heap slice
-        // without ever materialising a reference to the box itself.
-        unsafe { &raw mut *(*self.buffer.get()) }
+        self.buffer.bytes()
     }
 }
 
@@ -1124,13 +1163,23 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             let rx_returned = Arc::new(RxReturnedSlots {
                 slots: SpinMutex::new(Vec::with_capacity(rx_buffer_count)),
             });
-            let mut rx_slots: Vec<Arc<RxBufferSlot>> = Vec::with_capacity(rx_buffer_count);
+            let mut rx_slots: Vec<Arc<RxRingSlot<T>>> = Vec::with_capacity(rx_buffer_count);
+            let rx_layout = Layout::from_size_align(rx_buffer_len, PAYLOAD_ALIGNMENT)
+                .map_err(|_| IoError::DeviceFault)?;
             for slot_index in 0..rx_buffer_count {
                 let slot = u16::try_from(slot_index).map_err(|_| IoError::DeviceFault)?;
+                // The device writes a receive slot for the life of the
+                // device and the driver recycles it, so it is resident
+                // and the device never reads it.
                 rx_slots.push(Arc::new(RxBufferSlot {
                     slot,
                     returned: rx_returned.clone(),
-                    buffer: UnsafeCell::new(vec![0_u8; rx_buffer_len].into_boxed_slice()),
+                    buffer: DeviceStorage(
+                        transport
+                            .bus()
+                            .dma()
+                            .allocate_resident(rx_layout, DmaAccess::WRITE)?,
+                    ),
                 }));
             }
             let mut rx_in_device = DescriptorBitSet::new(rx_buffer_count);
@@ -1170,13 +1219,20 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                 None
             };
             let tx_buffer_count = usize::from(tx_queue_size);
-            let tx_buffers = vec![
-                0_u8;
+            // One slab holds a fixed-width slot per descriptor. The driver
+            // fills a slot and the device only reads it, for the life of
+            // the device.
+            let tx_slab_layout = Layout::from_size_align(
                 tx_buffer_len
                     .checked_mul(tx_buffer_count)
-                    .ok_or(IoError::DeviceFault)?
-            ]
-            .into_boxed_slice();
+                    .ok_or(IoError::DeviceFault)?,
+                PAYLOAD_ALIGNMENT,
+            )
+            .map_err(|_| IoError::DeviceFault)?;
+            let tx_buffers = transport
+                .bus()
+                .dma()
+                .allocate_resident(tx_slab_layout, DmaAccess::READ)?;
             let tx_in_flight = DescriptorBitSet::new(tx_buffer_count);
             let tx_payloads = vec![None; tx_buffer_count].into_boxed_slice();
 
@@ -1238,8 +1294,20 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                 CONTROL_CHAIN_LIMIT,
                 features,
             )?;
-            let cmd_buffer = vec![0u8; CTRL_CMD_MAX_BYTES].into_boxed_slice();
-            let ack_buffer = vec![0u8; 1].into_boxed_slice();
+            // The command is read by the device and the acknowledgement
+            // written by it, both for the life of the device.
+            let cmd_layout = Layout::from_size_align(CTRL_CMD_MAX_BYTES, PAYLOAD_ALIGNMENT)
+                .map_err(|_| IoError::DeviceFault)?;
+            let ack_layout =
+                Layout::from_size_align(1, PAYLOAD_ALIGNMENT).map_err(|_| IoError::DeviceFault)?;
+            let cmd_buffer = transport
+                .bus()
+                .dma()
+                .allocate_resident(cmd_layout, DmaAccess::READ)?;
+            let ack_buffer = transport
+                .bus()
+                .dma()
+                .allocate_resident(ack_layout, DmaAccess::WRITE)?;
             Some(SpinMutex::new(NetControlState {
                 queue,
                 cmd_buffer,
@@ -1451,6 +1519,8 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             cmd_buffer,
             ack_buffer,
         } = &mut *state;
+        let cmd_buffer: &mut [u8] = cmd_buffer.as_mut();
+        let ack_buffer: &mut [u8] = ack_buffer.as_mut();
         let len = 2 + payload.len();
         assert!(
             len <= cmd_buffer.len(),
@@ -1939,7 +2009,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         state: &mut NetRxState<T>,
         head: RxChainHead,
         buffers: usize,
-        target: &Arc<RxBufferSlot>,
+        target: &Arc<RxBufferSlot<HeapStorage>>,
     ) -> IoResult<usize> {
         let head_slot = &self.queue_pairs[pair_idx].rx_slots[usize::from(head.slot)];
         let mut assembled = head.used_len - self.header_len;
@@ -2129,10 +2199,26 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
     /// the device owns before it is queued: the caller fills the buffer it
     /// was going to copy into anyway and freezes it with
     /// `Bytes::from_owner`.
+    ///
+    /// The payload lives for one write and is read, never written, by the
+    /// device. A refusal that clears with time is
+    /// [`IoError::Replenishing`], which
+    /// [`VirtioNetDevice::transmit_payload_ready`] resolves.
     pub fn transmit_payload(&self, bytes: usize) -> IoResult<TransportBuffer<T>> {
         let layout =
             Layout::from_size_align(bytes, PAYLOAD_ALIGNMENT).map_err(|_| IoError::OutOfBounds)?;
-        self.transport.bus().dma().allocate_zeroed(layout)
+        Ok(self
+            .transport
+            .bus()
+            .dma()
+            .allocate(layout, DmaAccess::READ)?)
+    }
+
+    /// Resolves once [`VirtioNetDevice::transmit_payload`] may succeed
+    /// after it answered [`IoError::Replenishing`], or with the reason it
+    /// will not.
+    pub async fn transmit_payload_ready(&self) -> IoResult<()> {
+        Ok(self.transport.bus().dma().replenished().await?)
     }
 
     /// Immediate zero-copy TX: headers are copied into the descriptor
@@ -2190,7 +2276,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                 !tx_in_flight.get(token_index),
                 "virtio net TX descriptor {token} is still in flight"
             );
-            let slot = tx_slot_buffer(tx_buffers, *tx_buffer_len, token_index);
+            let slot = tx_slot_buffer(tx_buffers.as_mut(), *tx_buffer_len, token_index);
             let prefix_len = write_tx_payload(slot, self.header_len, frame.bytes, checksum, gso)?;
             let prefix: &[u8] = &slot[..prefix_len];
             let submitted_token = match payload {
@@ -2609,9 +2695,11 @@ mod tests {
         VIRTIO_NET_HDR_GSO_TCPV4, VirtioNetDevice, VirtioNetHeader, read_max_virtqueue_pairs,
         write_tx_payload,
     };
-    use crate::testing::{FakeTransport, FakeTransportConfig};
+    use crate::testing::{Allocation, FakeTransport, FakeTransportConfig, Lifetime, WindowDmaPool};
     use crate::transport::{DeviceType, VirtioFeatures};
+    use helios_hal::dma::DmaBuffer;
     use helios_hal::io::IoError;
+    use helios_hal::iommu::DmaAccess;
     use helios_netstack::LinkState;
 
     /// One receive completion the fake device hands the driver: the
@@ -2926,6 +3014,70 @@ mod tests {
         assert!(!features.device(NET_FEATURE_MRG_RXBUF));
         assert!(!harness.device.guest_checksum_negotiated());
         assert!(!harness.device.mergeable_rx_buffers());
+    }
+
+    /// Every receive slot, the transmit slab and the control buffers are
+    /// resident device memory asked for at bring-up, each with the one
+    /// direction the device moves it; a transmit payload is per-request
+    /// memory the device only reads.
+    #[test]
+    fn slots_are_resident_and_a_transmit_payload_is_read_only_and_elastic() {
+        let pool = WindowDmaPool::new(4 << 20);
+        let transport = FakeTransport::with_dma(
+            FakeTransportConfig {
+                device_type: DeviceType::Network,
+                offered_features: VirtioFeatures::VERSION_1.bits(),
+                queue_size: 8,
+                supports_queue_reset: false,
+                absent_queues: &[],
+            },
+            pool.clone(),
+        );
+        let device = VirtioNetDevice::new(transport, QueuePairBudget::new(1))
+            .expect("fake virtio-net should initialize");
+
+        let bring_up = pool.allocations();
+        assert!(
+            bring_up
+                .iter()
+                .all(|allocation| allocation.lifetime == Lifetime::Resident),
+            "bring-up allocates only resident memory: {bring_up:?}"
+        );
+        let slots = |access| {
+            bring_up
+                .iter()
+                .filter(|allocation| {
+                    allocation.access == access && allocation.bytes == device.rx_buffer_len
+                })
+                .count()
+        };
+        assert_eq!(
+            slots(DmaAccess::WRITE),
+            8,
+            "one write-only receive slot per ring entry"
+        );
+        let tx_slab_bytes = DmaBuffer::len(&device.queue_pairs[0].tx_state.lock().tx_buffers);
+        assert_eq!(
+            bring_up
+                .iter()
+                .filter(|allocation| allocation.access == DmaAccess::READ
+                    && allocation.bytes == tx_slab_bytes)
+                .count(),
+            1,
+            "one read-only transmit slab"
+        );
+
+        let _payload = device
+            .transmit_payload(2048)
+            .expect("the device allocates a payload buffer");
+        assert_eq!(
+            pool.allocations().last(),
+            Some(&Allocation {
+                lifetime: Lifetime::PerRequest,
+                access: DmaAccess::READ,
+                bytes: 2048,
+            })
+        );
     }
 
     /// A frame that fits one buffer is handed over as a borrow of the

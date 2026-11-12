@@ -30,7 +30,7 @@ use crate::bus::DeviceBus;
 use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate};
 use crate::inflight::{InFlight, await_completion, submit_lent};
 use crate::notify::Notify;
-use crate::queue::{ControlSlots, Part, TransportBuffer, VirtQueue, control_slots};
+use crate::queue::{ControlSlots, Part, READ_WRITE, TransportBuffer, VirtQueue, control_slots};
 use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
 
 /// Alignment of a request or reply buffer a consumer allocates: a cache
@@ -155,7 +155,7 @@ impl<T: VirtioTransport> Virtio9pDevice<T> {
     pub fn buffer(&self, capacity: usize) -> IoResult<TransportBuffer<T>> {
         let layout = Layout::from_size_align(capacity, BUFFER_ALIGNMENT)
             .map_err(|_| IoError::OutOfBounds)?;
-        self.transport.bus().dma().allocate_zeroed(layout)
+        Ok(self.transport.bus().dma().allocate(layout, READ_WRITE)?)
     }
 
     /// Sends the first `request_len` bytes of `request` and lets the

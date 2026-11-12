@@ -1764,6 +1764,7 @@ mod tests {
     /// The peer's hardware address in the frames these tests build.
     const PEER_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 2];
 
+    use crate::{NetworkErrorDetail, TcpError, TcpErrorKind, TcpStreamId};
     use helios_netstack::{
         ArpOperation, ArpPacket, ETHERNET_FRAME_BYTES, EthernetFrame, EthernetProtocol,
         IcmpEchoKey, Icmpv4Packet, Icmpv6Packet, IpAddress, IpCidr, IpProtocol, Ipv4Address,
@@ -3335,66 +3336,10 @@ mod tests {
         /// The `tcp-latency` request: sixteen bytes, which every
         /// congestion window and send queue has room for.
         const REQUEST: &[u8] = b"0123456789abcdef";
-
-        let local = Ipv4Address::new([192, 0, 2, 10]);
-        let peer = Ipv4Address::new([192, 0, 2, 20]);
         let service = test_network_service();
         let state = &service.inner.state;
         let owner = super::DEFAULT_SHARD_IDX;
-
-        let stream = {
-            let mut shard = state.shard_at(owner).lock();
-            shard
-                .stack
-                .add_ipv4_address(Ipv4Cidr::new(local, 24))
-                .expect("test address should be accepted");
-            shard.stack.learn_neighbor(NeighborEntry {
-                ip: IpAddress::Ipv4(peer),
-                mac: PEER_MAC,
-                state: NeighborState::Reachable,
-                updated_at: StackInstant::from_nanos(0),
-            });
-            service.inner.control.publish_from_shard(&shard);
-            let socket = shard
-                .stack
-                .open_tcp_connect(
-                    TcpEndpoint {
-                        address: IpAddress::Ipv4(local),
-                        port: 49_152,
-                    },
-                    TcpEndpoint {
-                        address: IpAddress::Ipv4(peer),
-                        port: 7,
-                    },
-                    7,
-                )
-                .expect("the test connection should allocate a socket");
-            shard.insert_tcp_stream(socket)
-        };
-
-        let (syn_ack, syn_ack_len) = ipv4_tcp_frame(
-            peer,
-            local,
-            TcpHeader {
-                source_port: 7,
-                destination_port: 49_152,
-                sequence: 100,
-                acknowledgement: 8,
-                flags: TcpFlags::SYN.union(TcpFlags::ACK),
-                window_size: u16::MAX,
-            },
-            &[],
-        );
-        state
-            .shard_at(owner)
-            .lock()
-            .stack
-            .receive_frame(&syn_ack[..syn_ack_len], StackInstant::from_nanos(1))
-            .expect("the SYN-ACK should establish the connection");
-
-        // Everything the handshake owed is already queued; the frame
-        // this test is about is the one the write produces.
-        while state.shard_at(owner).lock().stack.take_outbound().is_some() {}
+        let stream = established_tcp_stream(&service);
 
         block_on(service.tcp_write_all_bytes(stream, Bytes::from_static(REQUEST), u64::MAX))
             .expect("a sixteen-byte write into an open window should complete");
@@ -3427,6 +3372,74 @@ mod tests {
             "the write must publish its own segment rather than leave it \
              for the packet pump's next wake"
         );
+    }
+
+    /// A piece the interface refused for want of transmit memory.
+    fn refused(detail: NetworkErrorDetail) -> Result<Bytes, TcpError> {
+        Err(TcpError {
+            kind: TcpErrorKind::Unavailable,
+            detail,
+        })
+    }
+
+    /// A piece refused while the interface replenishes its transmit memory
+    /// is drawn again once the interface says it is ready, and the write
+    /// completes with it.
+    #[test]
+    fn a_write_whose_transmit_memory_is_replenishing_draws_its_piece_again() {
+        const REQUEST: &[u8] = b"0123456789abcdef";
+        let service = test_network_service();
+        let stream = established_tcp_stream(&service);
+        let mut draws = 0_usize;
+        let pieces = core::iter::from_fn(|| {
+            draws += 1;
+            match draws {
+                1 | 2 => Some(refused(NetworkErrorDetail::TransmitMemoryReplenishing)),
+                3 => Some(Ok(Bytes::from_static(REQUEST))),
+                _ => None,
+            }
+        });
+
+        block_on(service.tcp_write_all(stream, pieces, u64::MAX))
+            .expect("a piece drawn again after a replenish should be written");
+
+        assert_eq!(
+            draws, 4,
+            "two refusals, the piece, and the end of the write"
+        );
+    }
+
+    /// Exhausted transmit memory holds the write back as a full send queue
+    /// does, so it fails only by its deadline and never as an error of its
+    /// own.
+    #[test]
+    fn a_write_whose_transmit_memory_is_exhausted_fails_only_by_its_deadline() {
+        let service = test_network_service();
+        let stream = established_tcp_stream(&service);
+        let pieces =
+            core::iter::repeat_with(|| refused(NetworkErrorDetail::TransmitMemoryExhausted));
+
+        let error = block_on(service.tcp_write_all(stream, pieces, 0))
+            .expect_err("a write that is never given memory cannot complete");
+
+        assert_eq!(error.kind, TcpErrorKind::Timeout);
+        assert_eq!(error.detail, NetworkErrorDetail::TcpWriteTimeout);
+    }
+
+    /// The deadline covers a replenish as well: memory that is always on
+    /// its way and never arrives ends the write when its time is up.
+    #[test]
+    fn a_write_whose_transmit_memory_keeps_replenishing_fails_by_its_deadline() {
+        let service = test_network_service();
+        let stream = established_tcp_stream(&service);
+        let pieces =
+            core::iter::repeat_with(|| refused(NetworkErrorDetail::TransmitMemoryReplenishing));
+
+        let error = block_on(service.tcp_write_all(stream, pieces, 0))
+            .expect_err("a write that is never given memory cannot complete");
+
+        assert_eq!(error.kind, TcpErrorKind::Timeout);
+        assert_eq!(error.detail, NetworkErrorDetail::TcpWriteTimeout);
     }
 
     /// The regression #107 describes: a socket that is only receiving
@@ -3610,6 +3623,72 @@ mod tests {
             block_on(poll_once(parked.as_mut())).is_none(),
             "a read that was never blocking the pump must not wake it"
         );
+    }
+
+    /// An established TCP connection to a reachable neighbour on the
+    /// default shard, with everything the handshake owed already taken
+    /// off its outbound queue.
+    fn established_tcp_stream(
+        service: &super::NetworkService<TestCpu, RecordingNetworkInterface>,
+    ) -> TcpStreamId {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let state = &service.inner.state;
+        let owner = super::DEFAULT_SHARD_IDX;
+
+        let stream = {
+            let mut shard = state.shard_at(owner).lock();
+            shard
+                .stack
+                .add_ipv4_address(Ipv4Cidr::new(local, 24))
+                .expect("test address should be accepted");
+            shard.stack.learn_neighbor(NeighborEntry {
+                ip: IpAddress::Ipv4(peer),
+                mac: PEER_MAC,
+                state: NeighborState::Reachable,
+                updated_at: StackInstant::from_nanos(0),
+            });
+            service.inner.control.publish_from_shard(&shard);
+            let socket = shard
+                .stack
+                .open_tcp_connect(
+                    TcpEndpoint {
+                        address: IpAddress::Ipv4(local),
+                        port: 49_152,
+                    },
+                    TcpEndpoint {
+                        address: IpAddress::Ipv4(peer),
+                        port: 7,
+                    },
+                    7,
+                )
+                .expect("the test connection should allocate a socket");
+            shard.insert_tcp_stream(socket)
+        };
+
+        let (syn_ack, syn_ack_len) = ipv4_tcp_frame(
+            peer,
+            local,
+            TcpHeader {
+                source_port: 7,
+                destination_port: 49_152,
+                sequence: 100,
+                acknowledgement: 8,
+                flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                window_size: u16::MAX,
+            },
+            &[],
+        );
+        state
+            .shard_at(owner)
+            .lock()
+            .stack
+            .receive_frame(&syn_ack[..syn_ack_len], StackInstant::from_nanos(1))
+            .expect("the SYN-ACK should establish the connection");
+
+        // Everything the handshake owed is already queued.
+        while state.shard_at(owner).lock().stack.take_outbound().is_some() {}
+        stream
     }
 
     /// A service over an interface that reports events and moves no

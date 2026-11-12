@@ -17,6 +17,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use helios_hal::dma::{DeviceAddress, DmaAddressing, DmaBuffer, DmaError, DmaMemory};
 use helios_hal::io::{IoError, IoResult};
+use helios_hal::iommu::DmaAccess;
 use spin::Mutex;
 
 use crate::bus::{DeviceBus, IdentityDmaPool};
@@ -533,6 +534,42 @@ impl<P: DmaMemory> VirtioTransport for FakeTransport<P> {
     }
 }
 
+/// How long an allocation of a test pool lives, as its caller asked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Lifetime {
+    /// [`DmaMemory::allocate_resident`]: for the life of the device.
+    Resident,
+    /// [`DmaMemory::allocate`]: carried by a request and given back.
+    PerRequest,
+}
+
+/// One allocation a test pool served: what a driver asked for, so a test
+/// can assert how long its memory lives and which way the device moves it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Allocation {
+    pub(crate) lifetime: Lifetime,
+    pub(crate) access: DmaAccess,
+    pub(crate) bytes: usize,
+}
+
+/// The allocations a test pool served, in order.
+#[derive(Default)]
+struct AllocationLog(Mutex<Vec<Allocation>>);
+
+impl AllocationLog {
+    fn record(&self, lifetime: Lifetime, access: DmaAccess, layout: Layout) {
+        self.0.lock().push(Allocation {
+            lifetime,
+            access,
+            bytes: layout.size(),
+        });
+    }
+
+    fn snapshot(&self) -> Vec<Allocation> {
+        self.0.lock().clone()
+    }
+}
+
 /// Where the device-visible window of a [`WindowDmaPool`] starts.
 ///
 /// Any value below 16 TiB keeps the window's 4 KiB frame numbers inside
@@ -549,6 +586,7 @@ struct WindowArena {
     /// reach, which lets a test build a slice that straddles the end.
     window: usize,
     next: AtomicUsize,
+    allocations: AllocationLog,
 }
 
 /// A DMA pool that carves its buffers — ring memory and the pages a
@@ -591,8 +629,14 @@ impl WindowDmaPool {
                 storage: alloc::vec![0; size + tail + PAGE_ALIGNMENT],
                 window: size,
                 next: AtomicUsize::new(0),
+                allocations: AllocationLog::default(),
             }),
         }
+    }
+
+    /// Every allocation the pool served, in order.
+    pub(crate) fn allocations(&self) -> Vec<Allocation> {
+        self.arena.allocations.snapshot()
     }
 
     /// A slice of real memory that starts `inside` bytes before the end
@@ -618,17 +662,23 @@ impl WindowDmaPool {
     pub(crate) fn pages(&self, pages: usize) -> WindowDmaBuffer {
         let layout = Layout::from_size_align(pages * PAGE_ALIGNMENT, PAGE_ALIGNMENT)
             .expect("a page count small enough for a test");
-        self.allocate_zeroed(layout)
+        self.allocate(layout, DmaAccess::READ | DmaAccess::WRITE)
             .expect("the test arena is large enough for its pages")
     }
 }
 
 const PAGE_ALIGNMENT: usize = 4096;
 
-impl DmaMemory for WindowDmaPool {
-    type Buffer = WindowDmaBuffer;
-
-    fn allocate_zeroed(&self, layout: Layout) -> IoResult<Self::Buffer> {
+impl WindowDmaPool {
+    fn carve(
+        &self,
+        layout: Layout,
+        access: DmaAccess,
+        lifetime: Lifetime,
+    ) -> Result<WindowDmaBuffer, DmaError> {
+        let exhausted = DmaError::Exhausted {
+            bytes: layout.size(),
+        };
         let base = self.arena_base();
         let mut offset = 0;
         let taken = self.arena.next.fetch_update(
@@ -640,13 +690,34 @@ impl DmaMemory for WindowDmaPool {
                 (end <= self.arena_len()).then_some(end)
             },
         );
-        taken.map_err(|_| IoError::DeviceFault)?;
-        let ptr = NonNull::new((base + offset) as *mut u8).ok_or(IoError::DeviceFault)?;
+        taken.map_err(|_| exhausted)?;
+        let ptr = NonNull::new((base + offset) as *mut u8).ok_or(exhausted)?;
+        self.arena.allocations.record(lifetime, access, layout);
         Ok(WindowDmaBuffer {
             ptr,
             len: layout.size(),
             device_address: DeviceAddress::new(DEVICE_WINDOW_BASE + offset as u64),
         })
+    }
+}
+
+impl DmaMemory for WindowDmaPool {
+    type Buffer = WindowDmaBuffer;
+
+    fn allocate_resident(
+        &self,
+        layout: Layout,
+        access: DmaAccess,
+    ) -> Result<Self::Buffer, DmaError> {
+        self.carve(layout, access, Lifetime::Resident)
+    }
+
+    fn allocate(&self, layout: Layout, access: DmaAccess) -> Result<Self::Buffer, DmaError> {
+        self.carve(layout, access, Lifetime::PerRequest)
+    }
+
+    async fn replenished(&self) -> Result<(), DmaError> {
+        Ok(())
     }
 
     /// Arena memory translates into the window, and a slice that starts
@@ -694,6 +765,7 @@ struct ConfinedArena {
     /// can ask afterwards whether a device wrote into memory its owner had
     /// already given back.
     released: Mutex<Vec<(usize, usize)>>,
+    allocations: AllocationLog,
 }
 
 /// A DMA pool that reaches only the memory it handed out.
@@ -745,6 +817,7 @@ impl ConfinedDmaPool {
                 storage: alloc::vec![0; size + PAGE_ALIGNMENT],
                 next: AtomicUsize::new(0),
                 released: Mutex::new(Vec::new()),
+                allocations: AllocationLog::default(),
             }),
         }
     }
@@ -757,7 +830,7 @@ impl ConfinedDmaPool {
     /// memory a caller hands a driver to read from or write into.
     pub(crate) fn buffer(&self, bytes: usize) -> ConfinedDmaBuffer {
         let layout = Layout::from_size_align(bytes, 16).expect("a buffer size a test can ask for");
-        self.allocate_zeroed(layout)
+        self.allocate(layout, DmaAccess::READ | DmaAccess::WRITE)
             .expect("the confined test arena has room for the buffer")
     }
 
@@ -810,10 +883,16 @@ impl ConfinedDmaPool {
     }
 }
 
-impl DmaMemory for ConfinedDmaPool {
-    type Buffer = ConfinedDmaBuffer;
-
-    fn allocate_zeroed(&self, layout: Layout) -> IoResult<Self::Buffer> {
+impl ConfinedDmaPool {
+    fn carve(
+        &self,
+        layout: Layout,
+        access: DmaAccess,
+        lifetime: Lifetime,
+    ) -> Result<ConfinedDmaBuffer, DmaError> {
+        let exhausted = DmaError::Exhausted {
+            bytes: layout.size(),
+        };
         let align = layout.align().max(1);
         let mut offset = 0;
         self.arena
@@ -823,13 +902,39 @@ impl DmaMemory for ConfinedDmaPool {
                 let end = offset.checked_add(layout.size())?;
                 (end <= self.arena.storage.len() - PAGE_ALIGNMENT).then_some(end)
             })
-            .map_err(|_| IoError::DeviceFault)?;
-        let ptr = NonNull::new((self.base() + offset) as *mut u8).ok_or(IoError::DeviceFault)?;
+            .map_err(|_| exhausted)?;
+        let ptr = NonNull::new((self.base() + offset) as *mut u8).ok_or(exhausted)?;
+        self.arena.allocations.record(lifetime, access, layout);
         Ok(ConfinedDmaBuffer {
             ptr,
             len: layout.size(),
             arena: self.arena.clone(),
         })
+    }
+
+    /// Every allocation the pool served, in order.
+    pub(crate) fn allocations(&self) -> Vec<Allocation> {
+        self.arena.allocations.snapshot()
+    }
+}
+
+impl DmaMemory for ConfinedDmaPool {
+    type Buffer = ConfinedDmaBuffer;
+
+    fn allocate_resident(
+        &self,
+        layout: Layout,
+        access: DmaAccess,
+    ) -> Result<Self::Buffer, DmaError> {
+        self.carve(layout, access, Lifetime::Resident)
+    }
+
+    fn allocate(&self, layout: Layout, access: DmaAccess) -> Result<Self::Buffer, DmaError> {
+        self.carve(layout, access, Lifetime::PerRequest)
+    }
+
+    async fn replenished(&self) -> Result<(), DmaError> {
+        Ok(())
     }
 
     fn device_range(&self, bytes: &[u8]) -> Result<DeviceAddress, DmaError> {
