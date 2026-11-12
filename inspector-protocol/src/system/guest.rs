@@ -5,6 +5,7 @@ use helios_api::{
 };
 
 use crate::error::DispatchError;
+use crate::system::accept;
 use crate::system::server::{self, Dispatcher};
 
 use super::bindings::helios::system::{filters, instances, profiling, programs, stats, tracing};
@@ -19,6 +20,7 @@ use crate::debugger::{filesystem, programs as debugger_programs};
 
 /// The embedded debugger's dispatcher: every method it exposes,
 /// answered out of the guest's own system interfaces.
+#[derive(Clone, Copy)]
 struct SystemDispatcher;
 
 impl Dispatcher for SystemDispatcher {
@@ -44,6 +46,19 @@ where
     W: AsyncWrite + Unpin,
 {
     server::serve(read, write, SystemDispatcher).await
+}
+
+/// Accepts connections from `listener` and serves each one with the
+/// embedded debugger's dispatcher, ending only when the listener fails.
+/// See [`accept::serve_sessions`].
+pub async fn serve_listener<L>(
+    listener: L,
+    report: impl FnMut(accept::SessionFault),
+) -> Result<core::convert::Infallible, L::Error>
+where
+    L: accept::Listener,
+{
+    accept::serve_sessions(listener, SystemDispatcher, report).await
 }
 
 fn supports_request(instance: &str, func: &str) -> bool {
