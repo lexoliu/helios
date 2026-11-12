@@ -64,6 +64,10 @@ rand_core = { version = "0.6.4", default-features = false }
 sha2 = { version = "0.10.9", default-features = false }
 smallvec = { version = "1.15.1", default-features = false }
 slab = { version = "0.4.12", default-features = false }
+# LZ4 block format for the compressed swap store. Without `alloc` the compress
+# table is an inline array, so compression allocates nothing; `safe-decode`
+# keeps the decoder free of `unsafe`.
+lz4_flex = { version = "0.14.0", default-features = false, features = ["safe-decode"] }
 spin = { version = "0.9.8", default-features = false, features = ["mutex", "once", "rwlock", "spin_mutex"] }
 wasmparser = { version = "0.245.0", default-features = false, features = ["component-model"] }
 talc = { version = "=5.1.0", default-features = false, features = ["counters"] }

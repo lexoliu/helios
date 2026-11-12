@@ -138,8 +138,10 @@ pub(crate) enum VmConfigError {
     },
     #[error("{0}")]
     NoNativeAccelerator(#[from] NoNativeAccelerator),
-    #[error("--data-disk-size must be greater than zero")]
+    #[error("--data-disk-size must be greater than zero; --no-data-disk boots without the disk")]
     ZeroDataDiskSize,
+    #[error("--no-data-disk and --data-disk-size contradict each other")]
+    DataDiskSizeWithoutDisk,
     #[error("{0}")]
     DiskSpec(#[from] DiskSpecError),
     #[error("--disk image {path} cannot be opened: {source}")]
@@ -1438,6 +1440,8 @@ pub(crate) struct VmConfigFile {
     pub(crate) keep_runtime_dir: Option<bool>,
     #[serde(default)]
     pub(crate) data_disk_size: Option<u64>,
+    #[serde(default)]
+    pub(crate) no_data_disk: Option<bool>,
     /// `--disk` entries, in the same `<image>,serial=<name>[,readonly]`
     /// form; the command line's are attached after these.
     #[serde(default)]
@@ -1577,6 +1581,11 @@ pub(crate) struct VmCommand {
     /// Size in bytes of the scratch disk every profile attaches.
     #[arg(long)]
     data_disk_size: Option<u64>,
+
+    /// Boot without the scratch disk, so the guest has no device to swap
+    /// to and keeps pages in RAM tiers alone.
+    #[arg(long, default_value_t = false)]
+    no_data_disk: bool,
 
     /// Attach a raw disk image the guest can mount, found by its serial:
     /// `<image>,serial=<name>[,readonly]`. Repeat for more disks.
@@ -1721,6 +1730,8 @@ enum VmSessionCommand {
     Stats,
     /// List the live program instances, and optionally stop one.
     Instances(crate::InstancesCommand),
+    /// Show the guest's swap policy, or change some of its settings.
+    Swap(crate::SwapCommand),
     Repl,
     AotBench(AotBenchCommand),
     WorkloadBench(WorkloadBenchCommand),
@@ -2009,7 +2020,8 @@ struct ResolvedVmCommand {
     accel: Vec<String>,
     shared_dir: Option<PathBuf>,
     shared_dir_access: HostShareAccess,
-    data_disk_bytes: u64,
+    /// The scratch disk's size, or `None` when it is left off.
+    data_disk_bytes: Option<u64>,
     /// `--disk` images, their paths canonical, in attach order.
     disks: Vec<VmDiskSpec>,
     gdb: Option<String>,
@@ -2459,13 +2471,19 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
         (true, Some(_)) => HostShareAccess::ReadWrite,
         (true, None) => return Err(VmConfigError::WritableShareWithoutDir),
     };
-    let data_disk_bytes = command
-        .data_disk_size
-        .or(file.data_disk_size)
-        .unwrap_or(DEFAULT_DATA_DISK_BYTES);
-    if data_disk_bytes == 0 {
-        return Err(VmConfigError::ZeroDataDiskSize);
-    }
+    let data_disk_size = command.data_disk_size.or(file.data_disk_size);
+    let data_disk_bytes = if command.no_data_disk || file.no_data_disk.unwrap_or(false) {
+        if data_disk_size.is_some() {
+            return Err(VmConfigError::DataDiskSizeWithoutDisk);
+        }
+        None
+    } else {
+        let bytes = data_disk_size.unwrap_or(DEFAULT_DATA_DISK_BYTES);
+        if bytes == 0 {
+            return Err(VmConfigError::ZeroDataDiskSize);
+        }
+        Some(bytes)
+    };
     let disks = resolve_disks(file.disk, command.disks)?;
     let gdb = command
         .gdb
@@ -5155,12 +5173,14 @@ impl VmRuntime {
         if let Some(boot_disk) = command.profile.boot_disk {
             configure_boot_disk(&mut qemu, boot_disk, &artifact, command.virtio_devices);
         }
-        configure_data_disk(
-            &mut qemu,
-            command.profile.data_disk,
-            &data_disk,
-            command.virtio_devices,
-        );
+        if let Some(data_disk) = &data_disk {
+            configure_data_disk(
+                &mut qemu,
+                command.profile.data_disk,
+                data_disk,
+                command.virtio_devices,
+            );
+        }
         configure_disks(
             &mut qemu,
             command.profile.data_disk,
@@ -5497,18 +5517,21 @@ fn repo_root() -> Result<PathBuf, WorkspaceRootError> {
 fn prepare_data_disk(
     command: &ResolvedVmCommand,
     runtime_dir: &Path,
-) -> Result<PathBuf, VmRuntimeError> {
+) -> Result<Option<PathBuf>, VmRuntimeError> {
+    let Some(bytes) = command.data_disk_bytes else {
+        return Ok(None);
+    };
     let image = runtime_dir.join("data.img");
     let file = fs::File::create(&image).map_err(|source| VmRuntimeError::CreateDataDisk {
         path: image.display().to_string(),
         source,
     })?;
-    file.set_len(command.data_disk_bytes)
+    file.set_len(bytes)
         .map_err(|source| VmRuntimeError::SizeDataDisk {
             path: image.display().to_string(),
             source,
         })?;
-    Ok(image)
+    Ok(Some(image))
 }
 
 fn configure_firmware(
@@ -5996,6 +6019,7 @@ impl From<VmSessionCommand> for ResolvedVmSessionCommand {
             VmSessionCommand::Instances(command) => {
                 Self::Session(SessionCommand::Instances(command))
             }
+            VmSessionCommand::Swap(command) => Self::Session(SessionCommand::Swap(command)),
             VmSessionCommand::Repl => Self::Session(SessionCommand::Repl),
             VmSessionCommand::AotBench(command) => Self::AotBench(command),
             VmSessionCommand::WorkloadBench(command) => Self::WorkloadBench(command),
@@ -7653,6 +7677,7 @@ mod tests {
             shared_dir: None,
             shared_dir_writable: false,
             data_disk_size: None,
+            no_data_disk: false,
             disks: Vec::new(),
             gdb: None,
             gdb_wait: false,
@@ -7679,6 +7704,27 @@ mod tests {
             network: default_network_args(),
             command: None,
         }
+    }
+
+    #[test]
+    fn no_data_disk_leaves_the_scratch_disk_off_and_refuses_a_size() {
+        let tempdir =
+            tempfile::tempdir().expect("temporary directory for VM config resolution must exist");
+        let mut command = minimal_command();
+        command.config = Some(tempdir.path().join("missing-vm.json"));
+        command.no_data_disk = true;
+        let resolved = resolve(command).expect("a VM without the scratch disk must resolve");
+        assert_eq!(resolved.data_disk_bytes, None);
+
+        let mut command = minimal_command();
+        command.config = Some(tempdir.path().join("missing-vm.json"));
+        command.no_data_disk = true;
+        command.data_disk_size = Some(1 << 20);
+        let error = resolve(command).expect_err("a size for a disk that is left off contradicts");
+        assert!(
+            matches!(error, VmConfigError::DataDiskSizeWithoutDisk),
+            "{error}"
+        );
     }
 
     #[test]
@@ -7715,6 +7761,7 @@ mod tests {
             shared_dir: None,
             shared_dir_writable: false,
             data_disk_size: None,
+            no_data_disk: false,
             disks: Vec::new(),
             gdb: None,
             gdb_wait: false,
@@ -7888,6 +7935,7 @@ mod tests {
             shared_dir: None,
             shared_dir_writable: false,
             data_disk_size: None,
+            no_data_disk: false,
             disks: Vec::new(),
             gdb: None,
             gdb_wait: false,
@@ -8028,7 +8076,7 @@ mod tests {
                 .collect(),
             shared_dir: None,
             shared_dir_access: HostShareAccess::ReadOnly,
-            data_disk_bytes: DEFAULT_DATA_DISK_BYTES,
+            data_disk_bytes: Some(DEFAULT_DATA_DISK_BYTES),
             disks: Vec::new(),
             gdb: None,
             gdb_wait: false,
@@ -8241,7 +8289,7 @@ mod tests {
                 .collect(),
             shared_dir: Some(repo_root().expect("workspace root must resolve")),
             shared_dir_access: HostShareAccess::ReadOnly,
-            data_disk_bytes: DEFAULT_DATA_DISK_BYTES,
+            data_disk_bytes: Some(DEFAULT_DATA_DISK_BYTES),
             disks: Vec::new(),
             gdb: None,
             gdb_wait: false,

@@ -8,6 +8,7 @@ pub mod profiling;
 pub mod programs;
 pub mod server;
 pub mod stats;
+pub mod swap;
 pub mod tracing;
 
 #[cfg(feature = "guest")]

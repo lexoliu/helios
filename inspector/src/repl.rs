@@ -27,7 +27,7 @@ use crate::serial::RpcClient;
 use crate::stats_tui;
 use crate::system::{self, SystemError};
 use crate::tui::TerminalError;
-use crate::{ShellCommand, TracingCommand};
+use crate::{ShellCommand, SwapCommand, TracingCommand};
 
 /// Why an interactive inspector session ended other than by the operator
 /// asking it to.
@@ -123,6 +123,8 @@ enum ReplBuiltin {
     Stats,
     /// Stream tracing events until interrupted.
     Tracing(TracingCommand),
+    /// Show the guest's swap policy, or change some of its settings.
+    Swap(SwapCommand),
     /// Clear the screen and move the cursor to the top-left corner.
     Clear,
     /// Leave the inspector.
@@ -136,7 +138,7 @@ pub fn run(mut client: RpcClient) -> Result<(), ReplError> {
     let mut terminal = InteractiveTerminal::new(Rc::clone(&editor));
 
     terminal.print(
-        "Helios inspector ready. Builtins: stats, tracing, clear, exit. Everything else runs in remote shell.\n",
+        "Helios inspector ready. Builtins: stats, tracing, swap, clear, exit. Everything else runs in remote shell.\n",
     )?;
 
     loop {
@@ -159,6 +161,9 @@ pub fn run(mut client: RpcClient) -> Result<(), ReplError> {
             }
             BuiltinParse::Builtin(BuiltinCommand::Tracing(command)) => {
                 runtime::block_on(system::stream_tracing_command(&mut client, &command))?;
+            }
+            BuiltinParse::Builtin(BuiltinCommand::Swap(command)) => {
+                runtime::block_on(system::run_swap(&client, &command))?;
             }
             BuiltinParse::Builtin(BuiltinCommand::Clear) => terminal.clear_screen()?,
             BuiltinParse::Builtin(BuiltinCommand::Exit) => return Ok(()),
@@ -265,6 +270,7 @@ enum BuiltinParse {
 enum BuiltinCommand {
     Stats,
     Tracing(TracingCommand),
+    Swap(SwapCommand),
     Clear,
     Exit,
 }
@@ -282,6 +288,7 @@ impl BuiltinCommand {
             Ok(cli) => BuiltinParse::Builtin(match cli.command {
                 ReplBuiltin::Stats => BuiltinCommand::Stats,
                 ReplBuiltin::Tracing(command) => BuiltinCommand::Tracing(command),
+                ReplBuiltin::Swap(command) => BuiltinCommand::Swap(command),
                 ReplBuiltin::Clear => BuiltinCommand::Clear,
                 ReplBuiltin::Exit | ReplBuiltin::Quit => BuiltinCommand::Exit,
             }),
@@ -499,6 +506,16 @@ mod tests {
                 assert_eq!(command.min_level.as_deref(), Some("debug"));
             }
             _ => panic!("tracing must stay a local builtin"),
+        }
+    }
+
+    #[test]
+    fn repl_intercepts_swap_builtin() {
+        match BuiltinCommand::parse("swap --writeback off --accept-granules 40") {
+            BuiltinParse::Builtin(BuiltinCommand::Swap(command)) => {
+                assert_eq!(command.accept_granules, Some(40));
+            }
+            _ => panic!("swap must stay a local builtin"),
         }
     }
 

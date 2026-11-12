@@ -135,8 +135,8 @@ pub use input::{
 pub use instance::{
     CondemnedMemory, InstanceActivity, InstanceId, InstanceProfileTotal, InstanceRegistry,
     InstanceSnapshot, KernelHeapCharge, KillOutcome, KillReason, MemoryPool, OOM_RECLAIM_GRACE,
-    OomKillDecision, OomKillOutcome, OomPolicy, OomVictim, ProcessorTurn, RegisteredInstance,
-    StoreTurns, allow_instance_resource_growth,
+    OffProcessor, OffProcessorRefused, OomKillDecision, OomKillOutcome, OomPolicy, OomVictim,
+    ProcessorTurn, RegisteredInstance, StoreTurns, allow_instance_resource_growth,
 };
 pub use io::{
     BlockCache, BlockCacheError, BlockCacheLimits, BlockInstallError, BlockMut, BlockPages,
@@ -148,8 +148,8 @@ pub use io::{
     MAX_DEVICE_INTERRUPTS, MAX_INPUT_DEVICES, MAX_IOMMU_ENDPOINTS, MAX_NETWORK_INTERRUPTS,
     PanicSerial, PollKey, PollRegistration, PollRegistry, PollRegistryError, PollSourceKind,
     RecordingConsole, SCRATCH_DISK_SERIAL, ScratchDisk, ScratchDiskStats, SerialReader, TryRead,
-    TryWrite, admit_block_devices, byte_channel, emit_panic_report, install_block_devices,
-    install_scratch_swap, read_debug_serial, read_serial, try_read_serial, wake_queue_owners,
+    TryWrite, admit_block_devices, attach_scratch_swap, byte_channel, emit_panic_report,
+    install_block_devices, read_debug_serial, read_serial, try_read_serial, wake_queue_owners,
 };
 pub use kernel_exception::{
     KernelException, KernelExceptionCause, KernelExceptionDispatch, KernelNativeTrapHandler,
@@ -166,13 +166,14 @@ pub use memory::{
     DEFAULT_COMPRESSION_LEVEL, DEFAULT_POOL_PERCENT, Decommitted, ENTROPY_RESEED_INTERVAL,
     EntropyPool, EntropySources, FIBER_STACK_GUARD_BYTES, FREE_PAGE_REPORT_INTERVAL, FiberStack,
     FiberStackArenaStats, FiberStackError, FiberStackVmHooks, HardwareEntropySource,
-    IDLE_SWAP_AFTER, INCOMPRESSIBLE_BYTES, InstalledAddressSpace, KERNEL_HEAP_BOOTSTRAP_BYTES,
+    INCOMPRESSIBLE_BYTES, InstalledAddressSpace, KERNEL_HEAP_BOOTSTRAP_BYTES,
     KERNEL_HEAP_GROWTH_CHUNK_BYTES, KERNEL_HEAP_MAX_BOOT_FRACTION, KERNEL_HEAP_MIN_RESERVE_BYTES,
     KERNEL_HEAP_RESERVE_FRACTION, KernelPhysFrameAllocator, MemoryOwner, NoCryptographicEntropy,
     NoEntropyDevice, ROOT_ENTROPY_MATERIAL_BYTES, RegionShares, ReleasedReservation,
-    ReservationLookup, ReservationTracker, RootEntropy, RootEntropyHandle, SWAP_BATCH_BYTES,
-    SWAP_TICK, StackFault, SwapDisabled, SwapEntry, SwapFaultError, SwapHandle, SwapLeafFormat,
-    SwapSpace, SwapStats, SwapVmHooks, TASK_ARENA_FRACTION, TASK_ARENA_MIN_BYTES,
+    ReservationLookup, ReservationTracker, RootEntropy, RootEntropyHandle, SWAP_TICK, StackFault,
+    SwapDisabled, SwapDiskPort, SwapDiskStats, SwapEntry, SwapFaultError, SwapFaultSource,
+    SwapFaultStats, SwapHandle, SwapLeafFormat, SwapPolicy, SwapPolicyError, SwapSpace, SwapStats,
+    SwapStoreStats, SwapVmHooks, SwapZeroStats, TASK_ARENA_FRACTION, TASK_ARENA_MIN_BYTES,
     USER_POOL_MIN_REGION_BYTES, UserHeapStats, UserMemoryOwnerScope, UserMemoryOwners,
     UserMemoryPool, VaCursor, allocate_user_frame_uninit_on, allocate_user_frame_zeroed,
     allocate_user_frame_zeroed_on, allocate_user_memory_pool, allocate_user_run_zeroed_on,

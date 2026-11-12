@@ -103,8 +103,8 @@ struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     /// The memory balloon the host resizes this guest through. Empty on
     /// a machine that gave the kernel none.
     balloon: Once<BalloonHandle>,
-    /// Swap, once a backend with a lazy-commit address space and a disk
-    /// to write to has brought it up. Empty everywhere else.
+    /// Swap, once a backend with a lazy-commit address space has brought
+    /// it up, with or without a disk. Empty everywhere else.
     swap: Once<crate::SwapHandle>,
     /// The machine's link to its host, once a backend brought a vsock
     /// device up. Empty on a machine with no vsock device, where the
@@ -1081,6 +1081,11 @@ where
             swap
         });
         assert!(installed, "swap was installed more than once");
+    }
+
+    /// The machine's swap, if its backend brought one up.
+    pub fn swap(&self) -> Option<crate::SwapHandle> {
+        self.inner.swap.get().cloned()
     }
 
     /// Publishes the machine's vsock link.

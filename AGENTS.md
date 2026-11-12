@@ -368,8 +368,9 @@ does.
 
 ## 5. Inspector surface
 
-- The inspector's commands are `shell`, `tracing`, `stats`, `repl` and `vm`.
-  `repl` treats `stats` and `tracing` as local shortcuts and forwards
+- The inspector's commands are `shell`, `tracing`, `stats`, `instances`,
+  `swap`, `repl` and `vm`.
+  `repl` treats `stats`, `tracing` and `swap` as local shortcuts and forwards
   everything else to the guest shell. `vm` boots the selected architecture
   under QEMU, waits for the guest debugger component, and then runs one of
   the session commands or a bench action: `aot-bench`, `workload-bench`,

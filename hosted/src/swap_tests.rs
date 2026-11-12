@@ -126,15 +126,60 @@ fn a_swapped_page_comes_back_with_its_bytes_and_its_flags() {
     let mut restored = vec![0_u8; PAGE];
     block_on(backend.swap_in(stored, &mut restored)).expect("backend swap in");
 
-    let recovered = address_space
-        .swap_in_page(range.start, &restored)
+    address_space
+        .swap_in_page(range.start, token(1), |frame| {
+            frame.copy_from_slice(&restored);
+        })
         .expect("swap in");
-    assert_eq!(recovered, token(1));
     check(range, 0x40);
     match address_space.translate(range.start) {
         Translation::Committed { flags, .. } => {
             assert_eq!(flags, PageFlags::READ | PageFlags::WRITE)
         }
+        other => panic!("expected the page back committed, got {other:?}"),
+    }
+    address_space.release(range).expect("release");
+}
+
+#[test]
+fn protecting_a_range_with_a_swapped_page_keeps_its_bytes_and_applies_the_flags() {
+    machine();
+    let address_space = HostedAddressSpace::new();
+    let backend = swap_file("protect-over-swapped");
+    let range = address_space.reserve(3 * PAGE).expect("reserve");
+    commit_owned(&address_space, range, MemoryOwner::new(6));
+    fill(range, 0x70);
+
+    let middle = VirtAddr::new(range.start.raw() + PAGE);
+    let mut page = vec![0_u8; PAGE];
+    address_space
+        .swap_out_page(middle, token(51), &mut page)
+        .expect("swap out the middle page");
+    let stored = block_on(backend.swap_out(&page)).expect("backend swap out");
+
+    address_space
+        .protect(range, PageFlags::READ)
+        .expect("a swapped page is committed, so protect reaches it");
+    assert_eq!(
+        address_space.swapped_token(middle),
+        Some(token(51)),
+        "a protect leaves the page swapped out"
+    );
+
+    let mut restored = vec![0_u8; PAGE];
+    block_on(backend.swap_in(stored, &mut restored)).expect("backend swap in");
+    address_space
+        .swap_in_page(middle, token(51), |frame| {
+            frame.copy_from_slice(&restored);
+        })
+        .expect("swap in");
+    check(range, 0x70);
+    match address_space.translate(middle) {
+        Translation::Committed { flags, .. } => assert_eq!(
+            flags,
+            PageFlags::READ,
+            "the page comes back with the flags the protect asked for"
+        ),
         other => panic!("expected the page back committed, got {other:?}"),
     }
     address_space.release(range).expect("release");
@@ -153,7 +198,7 @@ fn a_swapped_page_is_still_writable_after_it_comes_back() {
         .swap_out_page(range.start, token(2), &mut page)
         .expect("swap out");
     address_space
-        .swap_in_page(range.start, &page)
+        .swap_in_page(range.start, token(2), |frame| frame.copy_from_slice(&page))
         .expect("swap in");
 
     fill(range, 0x99);
@@ -289,6 +334,30 @@ fn decommitting_a_range_surrenders_the_tokens_inside_it() {
 }
 
 #[test]
+fn decommitting_a_range_with_a_swapped_page_in_the_middle_surrenders_its_token() {
+    machine();
+    let address_space = HostedAddressSpace::new();
+    let range = address_space.reserve(3 * PAGE).expect("reserve");
+    commit_owned(&address_space, range, MemoryOwner::new(7));
+    let mut page = vec![0_u8; PAGE];
+    address_space
+        .swap_out_page(
+            VirtAddr::new(range.start.raw() + PAGE),
+            token(61),
+            &mut page,
+        )
+        .expect("page out");
+
+    address_space
+        .decommit(range)
+        .expect("a swapped page is committed, so decommit reaches it");
+    let mut orphaned = Vec::new();
+    address_space.drain_orphaned_swap_tokens(|token| orphaned.push(token));
+    assert_eq!(orphaned, [token(61)]);
+    address_space.release(range).expect("release");
+}
+
+#[test]
 fn committing_over_a_swapped_page_surrenders_its_token() {
     machine();
     let address_space = HostedAddressSpace::new();
@@ -358,7 +427,7 @@ fn a_swap_cycle_leaves_the_user_pool_as_it_found_it() {
         .swap_out_page(range.start, token(71), &mut page)
         .expect("swap out");
     address_space
-        .swap_in_page(range.start, &page)
+        .swap_in_page(range.start, token(71), |frame| frame.copy_from_slice(&page))
         .expect("swap in");
 
     assert_eq!(helios_kernel::user_heap_stats().allocated_bytes, before);

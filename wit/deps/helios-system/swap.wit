@@ -1,0 +1,30 @@
+package helios:system@0.1.0;
+
+/// The settings that steer where the kernel swaps guest pages.
+///
+/// The policy in force is part of the `stats` swap record, so reading it
+/// needs no privilege; changing it is this interface, which only a
+/// privileged caller imports.
+interface swap {
+  use stats.{swap-policy};
+
+  /// Why a policy was not applied. Nothing changes when it is refused.
+  enum policy-error {
+    /// This machine runs without swap: its address space cannot fault a
+    /// swapped-out page back in.
+    unavailable,
+    /// The compressed store's limit is not a share of the user pool.
+    store-limit-percent,
+    /// The store's accept level is not a share of its limit.
+    store-accept-percent,
+    /// The acceptance bound is outside 1 to 63 granules.
+    accept-granules,
+  }
+
+  /// Replaces every setting at once.
+  ///
+  /// Each setting is read where a decision is taken, so a new policy
+  /// applies from the next decision: pages already in a tier stay where
+  /// they are until something moves them.
+  set-policy: func(policy: swap-policy) -> result<_, policy-error>;
+}

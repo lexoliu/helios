@@ -15,9 +15,12 @@
 //! - `stream <total> <child> [args..]` pushes `total` bytes through the child
 //!   and drains them from its stdout concurrently.
 //!
-//! - `swap-cycle [--mib <n>] [--seed <n>] [--corrupt-page <index>] <procbench>`
+//! - `swap-cycle [--mib <n>] [--seed <n>] [--corrupt-page <index>] [--content
+//!   random|text|zero|mixed] <procbench>`
 //!   has a child of this same program (the `swap-child` role, started by the
-//!   command itself) fill a patterned region and idle, evicts it by holding
+//!   command itself) fill a region (with random words, which only the disk
+//!   takes; text, which the compressed store takes; zeros, which take no
+//!   storage; or a third of each) and idle, evicts it by holding
 //!   the machine under a busy allocation, and requires every byte back and
 //!   the swap-in counter to cover them (`swap_cycle.rs`).
 //!
@@ -43,7 +46,7 @@ const READ_CHUNK_BYTES: usize = 64 * 1024;
 #[derive(Debug, Error)]
 enum ProcbenchError {
     #[error(
-        "usage: procbench startup <n> <child> [args..] | spawn-wait <n> <child> [args..] | pingpong <rounds> <bytes> <child> [args..] | stream <total-bytes> <child> [args..] | swap-cycle [--mib <n>] [--seed <n>] [--corrupt-page <index>] <procbench>"
+        "usage: procbench startup <n> <child> [args..] | spawn-wait <n> <child> [args..] | pingpong <rounds> <bytes> <child> [args..] | stream <total-bytes> <child> [args..] | swap-cycle [--mib <n>] [--seed <n>] [--corrupt-page <index>] [--content random|text|zero|mixed] <procbench>"
     )]
     Usage,
     #[error("unknown subcommand `{0}`")]

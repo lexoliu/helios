@@ -446,7 +446,9 @@ images it may mount, on the same bus and in an order nothing guarantees,
 so the kernel gives each disk a role by the serial it reports
 (`kernel/src/io/block/`):
 
-- `helios-data` is the scratch disk, the kernel's own, which backs swap;
+- `helios-data` is the scratch disk, the kernel's own, which backs swap's
+  disk tier. Swap itself runs without it, on the zero and compressed
+  tiers; the disk attaches when the block service brings it up;
 - any other serial names a mount source, which the kernel puts behind its
   block cache, handed back to the backend typed as its device, where the
   mount layer finds it by serial;
@@ -470,7 +472,9 @@ block device online, self check passed capacity_bytes=268435456 …
 Every inspector profile attaches that disk: `virtio-blk-device` on the
 MMIO platforms (aarch64, riscv64) and `virtio-blk-pci` on x86, always
 with `serial=helios-data`, backed by a `data.img` in the VM's runtime
-directory whose size `--data-disk-size` controls. `helios-inspector
+directory whose size `--data-disk-size` controls. `--no-data-disk` leaves
+it off, which boots a machine with no swap device: the swap tiers in RAM
+carry on alone. `helios-inspector
 stats` shows the device the guest kernel ended up with, its geometry, its
 queues and the requests the kernel has issued.
 

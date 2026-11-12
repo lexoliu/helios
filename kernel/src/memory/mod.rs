@@ -75,8 +75,9 @@ pub use reservations::{
     ReservationLookup, ReservationTracker, SwapEntry, VaCursor, ranges_outside, validate_range,
 };
 pub use swap::{
-    AGE_BATCH_PAGES, IDLE_SWAP_AFTER, InstalledAddressSpace, SWAP_BATCH_BYTES, SWAP_TICK,
-    SwapDisabled, SwapFaultError, SwapHandle, SwapLeafFormat, SwapSpace, SwapStats, SwapVmHooks,
+    AGE_BATCH_PAGES, InstalledAddressSpace, SWAP_TICK, SwapDisabled, SwapDiskPort, SwapDiskStats,
+    SwapFaultError, SwapFaultSource, SwapFaultStats, SwapHandle, SwapLeafFormat, SwapPolicy,
+    SwapPolicyError, SwapSpace, SwapStats, SwapStoreStats, SwapVmHooks, SwapZeroStats,
     disable_swap, install_swap, install_swap_hooks, installed_swap_handle, installed_swap_hooks,
     swap_vm_hooks, swapped_token,
 };

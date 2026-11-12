@@ -5,12 +5,13 @@ use std::fmt::Write as _;
 use std::io::Write as _;
 use std::time::Duration;
 
+use helios_inspector_protocol::system::swap::{self, PolicyError, SwapPolicy};
 use helios_inspector_protocol::system::{instances, stats, tracing};
 use nu_ansi_term::{Color, Style as AnsiStyle};
 
-use crate::TracingCommand;
 use crate::remote::{self, RemoteError};
 use crate::serial::RpcClient;
+use crate::{SwapCommand, Switch, TracingCommand};
 
 const LIVE_TRACING_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -35,6 +36,12 @@ pub enum SystemError {
     NoInstanceNamed { name: String },
     #[error("the guest refused to stop instance {id}: {reason}")]
     KillRefused { id: u64, reason: &'static str },
+    #[error(
+        "the guest has no swap: its stats report no swap record or the kernel refused the policy as unavailable"
+    )]
+    NoSwap,
+    #[error("the guest refused the swap policy: {error}")]
+    PolicyRefused { error: swap::PolicyError },
     #[error("the guest refused to enable the tracing target {target}: {detail}")]
     TargetRefused { target: String, detail: String },
     #[error("failed to render a guest tracing event: {source}")]
@@ -63,6 +70,8 @@ impl SystemError {
             Self::UnknownLevel { .. }
             | Self::NoInstanceNamed { .. }
             | Self::KillRefused { .. }
+            | Self::NoSwap
+            | Self::PolicyRefused { .. }
             | Self::TargetRefused { .. }
             | Self::Render { .. }
             | Self::Signals { .. }
@@ -147,6 +156,85 @@ pub async fn run_instances(
     kill(client, id).await?;
     writeln!(out, "killed instance {id}").map_err(|source| SystemError::Write { source })?;
     Ok(())
+}
+
+impl SwapCommand {
+    /// The policy that results from laying the given settings over
+    /// `current`; a setting left out keeps its value.
+    pub(crate) fn overlay(&self, current: SwapPolicy) -> SwapPolicy {
+        SwapPolicy {
+            // The guest counts in nanoseconds, the flag in milliseconds.
+            idle_after: self
+                .idle_after_ms
+                .map_or(current.idle_after, |ms| ms * 1_000_000),
+            store_limit_percent: self
+                .store_limit_percent
+                .unwrap_or(current.store_limit_percent),
+            store_accept_percent: self
+                .store_accept_percent
+                .unwrap_or(current.store_accept_percent),
+            accept_granules: self.accept_granules.unwrap_or(current.accept_granules),
+            writeback: self
+                .writeback
+                .map_or(current.writeback, |switch| switch == Switch::On),
+        }
+    }
+
+    /// Whether no setting was given, which asks only for the policy in
+    /// force.
+    pub(crate) fn is_query(&self) -> bool {
+        self.idle_after_ms.is_none()
+            && self.store_limit_percent.is_none()
+            && self.store_accept_percent.is_none()
+            && self.accept_granules.is_none()
+            && self.writeback.is_none()
+    }
+}
+
+/// The policy as the command prints it, one setting per line.
+fn render_swap_policy(policy: &SwapPolicy) -> String {
+    format!(
+        "idle-after: {} ms\nstore-limit-percent: {}\nstore-accept-percent: {}\naccept-granules: {}\nwriteback: {}\n",
+        policy.idle_after / 1_000_000,
+        policy.store_limit_percent,
+        policy.store_accept_percent,
+        policy.accept_granules,
+        if policy.writeback { "on" } else { "off" },
+    )
+}
+
+/// The policy in force, from a stats sample.
+async fn fetch_swap_policy(client: &RpcClient) -> Result<SwapPolicy, SystemError> {
+    let sample = fetch_stats(client).await?;
+    sample
+        .swap
+        .map(|swap| swap.policy)
+        .ok_or(SystemError::NoSwap)
+}
+
+/// Prints the swap policy in force, after applying the settings given.
+///
+/// With none given nothing is sent: the command is a read.
+pub async fn run_swap(client: &RpcClient, command: &SwapCommand) -> Result<(), SystemError> {
+    let mut policy = fetch_swap_policy(client).await?;
+    if !command.is_query() {
+        let wanted = command.overlay(policy);
+        let answer = remote::call(swap::set_policy(client, &wanted), "remote swap policy")
+            .await
+            .map_err(|source| SystemError::Fetch {
+                what: "remote swap policy",
+                source,
+            })?;
+        match answer {
+            Ok(()) => {}
+            Err(PolicyError::Unavailable) => return Err(SystemError::NoSwap),
+            Err(error) => return Err(SystemError::PolicyRefused { error }),
+        }
+        policy = wanted;
+    }
+    std::io::stdout()
+        .write_all(render_swap_policy(&policy).as_bytes())
+        .map_err(|source| SystemError::Write { source })
 }
 
 /// The identifier the instance registered under `name` holds.
@@ -566,7 +654,112 @@ impl EmittedEvents {
 mod tests {
     use helios_inspector_protocol::system::tracing::{Event, Field, Level, Value};
 
-    use super::{EmittedEvents, render_tracing_event, tracing_event_key};
+    use clap::Parser as _;
+    use helios_inspector_protocol::system::swap::SwapPolicy;
+
+    use super::{EmittedEvents, render_swap_policy, render_tracing_event, tracing_event_key};
+    use crate::{SwapCommand, Switch};
+
+    /// The command as its own command line parses it.
+    #[derive(clap::Parser)]
+    struct SwapLine {
+        #[command(flatten)]
+        command: SwapCommand,
+    }
+
+    fn swap_command(args: &[&str]) -> SwapCommand {
+        SwapLine::try_parse_from(std::iter::once("swap").chain(args.iter().copied()))
+            .expect("the swap flags parse")
+            .command
+    }
+
+    fn policy_in_force() -> SwapPolicy {
+        SwapPolicy {
+            idle_after: 30_000_000_000,
+            store_limit_percent: 25,
+            store_accept_percent: 80,
+            accept_granules: 48,
+            writeback: true,
+        }
+    }
+
+    #[test]
+    fn swap_without_flags_is_a_read() {
+        let command = swap_command(&[]);
+        assert!(command.is_query());
+        let current = policy_in_force();
+        assert_eq!(
+            render_swap_policy(&command.overlay(current)),
+            render_swap_policy(&current)
+        );
+    }
+
+    #[test]
+    fn swap_overlay_changes_only_the_given_settings() {
+        let command = swap_command(&["--idle-after-ms", "1500", "--writeback", "off"]);
+        assert!(!command.is_query());
+        let policy = command.overlay(policy_in_force());
+        assert_eq!(policy.idle_after, 1_500_000_000);
+        assert!(!policy.writeback);
+        assert_eq!(policy.store_limit_percent, 25);
+        assert_eq!(policy.store_accept_percent, 80);
+        assert_eq!(policy.accept_granules, 48);
+    }
+
+    #[test]
+    fn an_idle_delay_past_the_guests_nanosecond_clock_is_refused() {
+        let longest = crate::MAX_IDLE_AFTER_MS;
+        let command = swap_command(&["--idle-after-ms", &longest.to_string()]);
+        assert_eq!(
+            command.overlay(policy_in_force()).idle_after,
+            longest * 1_000_000
+        );
+        let too_long = (longest + 1).to_string();
+        assert!(
+            SwapLine::try_parse_from(["swap", "--idle-after-ms", too_long.as_str()]).is_err(),
+            "a delay past u64 nanoseconds must not parse"
+        );
+    }
+
+    #[test]
+    fn swap_overlay_takes_every_setting() {
+        let command = swap_command(&[
+            "--idle-after-ms",
+            "0",
+            "--store-limit-percent",
+            "100",
+            "--store-accept-percent",
+            "0",
+            "--accept-granules",
+            "63",
+            "--writeback",
+            "on",
+        ]);
+        assert_eq!(command.writeback, Some(Switch::On));
+        let policy = command.overlay(SwapPolicy {
+            writeback: false,
+            ..policy_in_force()
+        });
+        assert_eq!(
+            render_swap_policy(&policy),
+            "idle-after: 0 ms\nstore-limit-percent: 100\nstore-accept-percent: 0\naccept-granules: 63\nwriteback: on\n"
+        );
+    }
+
+    #[test]
+    fn swap_rejects_malformed_flags() {
+        for args in [
+            &["--writeback", "maybe"][..],
+            &["--accept-granules", "300"],
+            &["--idle-after-ms", "-1"],
+        ] {
+            assert!(
+                SwapLine::try_parse_from(std::iter::once("swap").chain(args.iter().copied()))
+                    .is_err(),
+                "{args:?} must not parse"
+            );
+        }
+    }
 
     #[test]
     fn tracing_render_omits_timestamp_and_message_prefix() {

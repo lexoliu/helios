@@ -99,25 +99,123 @@ interface stats {
     actual-bytes: u64,
     /// Bytes named to the host as free in the last reporting pass.
     reported-bytes: u64,
+    /// Bytes named to the host as free across every reporting pass
+    /// since boot; `reported-bytes` is overwritten by each pass and this
+    /// only grows.
+    reported-bytes-total: u64,
   }
 
-  /// Guest pages the kernel has moved out of memory, and what it cost
-  /// to bring them back.
+  /// Guest pages the kernel has moved out of memory, by the tier that
+  /// holds them, and what it cost to bring them back.
+  ///
+  /// A swapped-out page is a page of zeros (no storage), a compressed
+  /// page in a frame of the user pool, or a page on the swap device.
+  /// Gauges say what is held now; every other count is cumulative since
+  /// boot.
   record swap {
+    /// The swap device, absent while none is attached.
+    disk: option<swap-disk>,
+    zero: swap-zero,
+    store: swap-store,
+    faults: swap-faults,
+    /// Pages detached into a tier. A page put back is not counted. Net
+    /// reclaim is this less the store's frames less the pages faulted
+    /// back.
+    frames-released: u64,
+    /// The settings in force.
+    policy: swap-policy,
+  }
+
+  /// What the swap device holds.
+  record swap-disk {
     /// What the pages are written to.
     backend: string,
-    /// Bytes that store can hold.
+    /// Bytes that device can hold.
     capacity-bytes: u64,
-    /// Bytes of it currently holding pages.
-    used-bytes: u64,
-    /// Pages written out since boot.
+    /// Gauge: bytes handed to the device and still held.
+    stored-bytes: u64,
+    /// Gauge: pages on the device.
+    pages: u64,
+    /// Pages written out as they were.
+    pages-out-raw: u64,
+    /// Pages written out as compressed blocks.
+    pages-out-compressed: u64,
+    /// Objects moved from the compressed store to the device.
+    written-back: u64,
+    /// Gauge: pages whose bytes no tier holds any more.
+    pages-lost: u64,
+  }
+
+  /// Pages that were all zeros, which take no storage.
+  record swap-zero {
+    /// Gauge: zero pages swapped out.
+    pages: u64,
+    /// Zero pages swapped out since boot.
     pages-out: u64,
-    /// Pages read back in since boot.
-    pages-in: u64,
-    /// Guest faults resolved by reading a page back.
-    faults-served: u64,
-    /// Mean time a faulting guest waited, over every fault served.
-    mean-fault-latency: mono-nanos,
+  }
+
+  /// The compressed store. Its compression ratio is `pages / frames`,
+  /// its layout's efficiency `payload-bytes / (frames * 4096)`, and its
+  /// occupancy against its limit `frames * 4096 / limit-bytes`.
+  record swap-store {
+    /// The most the store may take of the user pool now.
+    limit-bytes: u64,
+    /// Gauge: user-pool frames the store holds.
+    frames: u64,
+    /// Gauge: compressed pages.
+    pages: u64,
+    /// Gauge: bytes of their compressed blocks.
+    payload-bytes: u64,
+    /// Gauge: raw pages parked after no other placement took them.
+    parked-pages: u64,
+    /// Pages compressed into the store.
+    pages-out: u64,
+    /// Pages that did not compress to the policy's bound.
+    rejected-incompressible: u64,
+    /// Compressible pages the store refused for its limit.
+    rejected-full: u64,
+    /// Pages no tier took, which stayed in memory.
+    put-back: u64,
+    /// Frames compaction emptied.
+    compacted-frames: u64,
+  }
+
+  /// Faults resolved by each tier. A fault's wait runs from the access
+  /// that took it to the page being mapped.
+  record swap-faults {
+    zero: swap-fault-source,
+    store: swap-fault-source,
+    parked: swap-fault-source,
+    disk: swap-fault-source,
+    /// Faults that found their page's slot held by another path and
+    /// waited for it.
+    contended-waits: u64,
+  }
+
+  /// Faults one tier resolved.
+  record swap-fault-source {
+    count: u64,
+    /// Mean time a faulting guest waited, over `count` faults.
+    mean-wait: mono-nanos,
+  }
+
+  /// The settings that steer the swap tiers.
+  record swap-policy {
+    /// How long an instance has to have been off every processor
+    /// before moderate memory pressure evicts it.
+    idle-after: mono-nanos,
+    /// The share of the user pool the compressed store may take, in
+    /// percent, at most 100. Zero keeps the store empty.
+    store-limit-percent: u8,
+    /// Once the store has refused a page for its limit, the share of
+    /// that limit it must be back down to before it takes pages again,
+    /// in percent, at most 100.
+    store-accept-percent: u8,
+    /// The most 64-byte granules a compressed page may take for the
+    /// store to accept it, 1 to 63.
+    accept-granules: u8,
+    /// Whether the store may write its oldest pages to the device.
+    writeback: bool,
   }
 
   /// How the in-kernel 9p client's caches have served the host share
@@ -295,8 +393,9 @@ interface stats {
     /// Absent on a machine that gave the kernel no memory balloon.
     balloon: option<memory-balloon>,
     /// Absent on a machine with no swap: one whose address space cannot
-    /// fault a swapped-out page back in, or that has no disk to write
-    /// pages to.
+    /// fault a swapped-out page back in. A machine with no disk still
+    /// swaps, to the compressed store, and reports it with `disk`
+    /// absent.
     swap: option<swap>,
     /// Absent on a machine with no host share, or one whose host
     /// filesystem is reached without a 9p session in front of it.

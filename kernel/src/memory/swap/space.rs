@@ -16,6 +16,13 @@
 //! reservation lock first: reservation lock then `orphans`, reservation
 //! lock then the pool.
 //!
+//! [`SwapSpace::swap_in_page`] is the exception to "runs with the lock held
+//! by the caller": it takes the lock itself, through the closure the
+//! backend passes, after it has allocated a frame and run the caller's
+//! `fill` on it. The pool's lock is taken and released before the
+//! reservation lock, so the order above still holds, and the reservation
+//! lock covers only the token check, the bookkeeping and the leaf write.
+//!
 //! [`SwapSpace::drain_orphaned_swap_tokens`] takes only `orphans`. Nothing here
 //! blocks, awaits or fans out to another processor beyond what a
 //! [`SwapLeafFormat::detach`] does for the shootdown it owes.
@@ -32,7 +39,8 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use core::ptr;
+use core::ops::DerefMut;
+use core::{ptr, slice};
 
 use helios_hal::cpu::current_processor;
 use helios_hal::pmm::PhysFrame;
@@ -101,44 +109,63 @@ impl SwapSpace {
         Ok(flags)
     }
 
-    /// Puts a swapped-out page back from `bytes`: fills a fresh frame
-    /// first and publishes the mapping second, so no processor sees a
-    /// half-restored page.
+    /// Puts a swapped-out page back, but only while its entry still
+    /// carries `expected`: allocates a fresh frame and has `fill` write
+    /// it with no lock held, then takes the reservation lock through
+    /// `lock`, checks the entry and publishes the mapping, so no
+    /// processor sees a half-restored page.
     ///
-    /// Returns the token the page carried. A refused reinstatement leaves
-    /// the page swapped out, in the tracker and in the leaf, and returns
-    /// the frame.
+    /// `lock` is the backend's own reservation lock. Passing it as a
+    /// closure is what lets this method decide, once for every backend,
+    /// that the fill runs before the lock is taken.
+    ///
+    /// A page with no swap entry returns
+    /// [`AddressSpaceError::NotSwapped`] and one whose entry carries
+    /// another token returns [`AddressSpaceError::SwapTokenChanged`]. A
+    /// refused reinstatement of any kind leaves the page swapped out, in
+    /// the tracker and in the leaf, and returns the frame.
     ///
     /// # Panics
     ///
-    /// If the tracker holds the page swapped out and the format says its
-    /// leaf does not carry that token: the two are written under one
-    /// lock, so they cannot disagree.
-    pub fn swap_in_page<F: SwapLeafFormat>(
+    /// If the tracker holds the page swapped out under `expected` and the
+    /// format says its leaf does not carry that token: the two are
+    /// written under one lock, so they cannot disagree.
+    pub fn swap_in_page<F, Lock, Guard, Fill>(
         &self,
-        tracker: &mut ReservationTracker,
         format: &F,
+        lock: Lock,
         addr: VirtAddr,
-        bytes: &[u8],
-    ) -> Result<SwapToken, AddressSpaceError> {
-        if bytes.len() != PhysFrame::SIZE {
-            return Err(AddressSpaceError::BadPageBuffer);
-        }
+        expected: SwapToken,
+        fill: Fill,
+    ) -> Result<(), AddressSpaceError>
+    where
+        F: SwapLeafFormat,
+        Lock: FnOnce() -> Guard,
+        Guard: DerefMut<Target = ReservationTracker>,
+        Fill: FnOnce(&mut [u8]),
+    {
         if !addr.is_page_aligned() {
             return Err(AddressSpaceError::Misaligned);
         }
-        let entry = tracker
-            .swap_entry(addr)
-            .ok_or(AddressSpaceError::NotSwapped)?;
-        // Not zeroed: the whole frame is overwritten below.
+        // Not zeroed: `fill` writes every byte of it.
         let frame = allocate_user_frame_uninit_on(current_processor())
             .map_err(|_| AddressSpaceError::OutOfFrames)?;
         // SAFETY: `frame` is one whole frame this call owns exclusively,
-        // `bytes` is exactly one page (checked above), and they cannot
-        // overlap.
-        unsafe {
-            ptr::copy_nonoverlapping(bytes.as_ptr(), frame.as_ptr(), PhysFrame::SIZE);
-        }
+        // and `fill` is bound to write every byte of it before anything
+        // reads it.
+        fill(unsafe { slice::from_raw_parts_mut(frame.as_ptr(), PhysFrame::SIZE) });
+        let mut guard = lock();
+        let tracker: &mut ReservationTracker = &mut guard;
+        let entry = match tracker.swap_entry(addr) {
+            Some(entry) if entry.token == expected => entry,
+            refused => {
+                deallocate_user_frame_on(current_processor(), frame);
+                return Err(match refused {
+                    Some(_) => AddressSpaceError::SwapTokenChanged,
+                    None => AddressSpaceError::NotSwapped,
+                });
+            }
+        };
         // The page counts as committed from here, which is what a format
         // that derives hardware state from the bookkeeping needs to see.
         let taken = tracker
@@ -146,7 +173,7 @@ impl SwapSpace {
             .expect("a swap entry the tracker just returned is still there under the same lock");
         debug_assert_eq!(taken, entry);
         match format.attach(tracker, addr, entry.token, frame, entry.flags) {
-            Ok(()) => Ok(entry.token),
+            Ok(()) => Ok(()),
             Err(AddressSpaceError::NotSwapped) => panic!(
                 "swap bookkeeping and the page table disagree at {:#x}: the tracker holds a swap \
                  entry for token {}, the leaf carries {:?}",

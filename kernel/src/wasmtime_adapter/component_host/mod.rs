@@ -60,6 +60,7 @@ const TRACING_INSTANCE: &str = "helios:system/tracing@0.1.0";
 const PROFILING_INSTANCE: &str = "helios:system/profiling@0.1.0";
 const INSTANCES_INSTANCE: &str = "helios:system/instances@0.1.0";
 const SNAPSHOT_INSTANCE: &str = "helios:system/snapshot@0.1.0";
+const SWAP_INSTANCE: &str = "helios:system/swap@0.1.0";
 /// The share of the machine's free memory the compiled-component cache
 /// may hold.
 ///
@@ -1764,6 +1765,7 @@ where
     service::add_gpu_to_linker(linker)?;
     service::add_audio_to_linker(linker)?;
     add_instances_to_linker(linker)?;
+    add_swap_to_linker(linker)?;
     add_snapshot_to_linker(linker)?;
     add_tracing_to_linker(linker)?;
     debugger_profiling::add_to_linker(linker)?;
@@ -3599,6 +3601,57 @@ where
     Ok(())
 }
 
+fn add_swap_to_linker<CpuImpl, Net, HostFs>(
+    linker: &mut Linker<StoreData<CpuImpl, Net, HostFs>>,
+) -> wasmtime::Result<()>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    HostFs: crate::HostFileSystem,
+{
+    let mut instance = linker.instance(SWAP_INSTANCE)?;
+    instance.func_wrap(
+        "set-policy",
+        |caller, (policy,): (debugger_wit::stats::SwapPolicy,)| {
+            let outcome = match caller.data().runtime_state.swap() {
+                None => Err(debugger_wit::swap::PolicyError::Unavailable),
+                Some(swap) => swap
+                    .set_policy(convert_swap_policy(policy))
+                    .map_err(convert_swap_policy_error),
+            };
+            Ok((outcome,))
+        },
+    )?;
+    Ok(())
+}
+
+fn convert_swap_policy(policy: debugger_wit::stats::SwapPolicy) -> crate::SwapPolicy {
+    crate::SwapPolicy {
+        idle_after: core::time::Duration::from_nanos(policy.idle_after),
+        store_limit_percent: policy.store_limit_percent,
+        store_accept_percent: policy.store_accept_percent,
+        accept_granules: policy.accept_granules,
+        writeback: policy.writeback,
+    }
+}
+
+fn convert_swap_policy_error(error: crate::SwapPolicyError) -> debugger_wit::swap::PolicyError {
+    match error {
+        crate::SwapPolicyError::StoreLimitPercent(_) => {
+            debugger_wit::swap::PolicyError::StoreLimitPercent
+        }
+        crate::SwapPolicyError::StoreAcceptPercent(_) => {
+            debugger_wit::swap::PolicyError::StoreAcceptPercent
+        }
+        crate::SwapPolicyError::AcceptGranules(_) => {
+            debugger_wit::swap::PolicyError::AcceptGranules
+        }
+        crate::SwapPolicyError::IdleAfter(delay) => unreachable!(
+            "an idle delay of {delay:?} came from whole nanoseconds in a u64, which the clock holds"
+        ),
+    }
+}
+
 fn add_snapshot_to_linker<CpuImpl, Net, HostFs>(
     linker: &mut Linker<StoreData<CpuImpl, Net, HostFs>>,
 ) -> wasmtime::Result<()>
@@ -4395,6 +4448,7 @@ macro_rules! convert_balloon_stats {
                 target_bytes: balloon.target_bytes,
                 actual_bytes: balloon.actual_bytes,
                 reported_bytes: balloon.reported_bytes,
+                reported_bytes_total: balloon.reported_bytes_total,
             }
         })
     };
@@ -4406,14 +4460,54 @@ macro_rules! convert_swap_stats {
     ($bindings:path, $swap:expr) => {
         $swap.map(|swap: crate::SwapStats| {
             use $bindings as stats_bindings;
+            let fault_source = |source: crate::SwapFaultSource| stats_bindings::SwapFaultSource {
+                count: source.count,
+                mean_wait: source.mean_wait_nanos,
+            };
             stats_bindings::Swap {
-                backend: alloc::string::String::from(swap.backend),
-                capacity_bytes: swap.capacity_bytes,
-                used_bytes: swap.used_bytes,
-                pages_out: swap.pages_out,
-                pages_in: swap.pages_in,
-                faults_served: swap.faults_served,
-                mean_fault_latency: swap.mean_fault_latency_nanos,
+                disk: swap.disk.map(|disk| stats_bindings::SwapDisk {
+                    backend: alloc::string::String::from(disk.backend),
+                    capacity_bytes: disk.capacity_bytes,
+                    stored_bytes: disk.stored_bytes,
+                    pages: disk.pages,
+                    pages_out_raw: disk.pages_out_raw,
+                    pages_out_compressed: disk.pages_out_compressed,
+                    written_back: disk.written_back,
+                    pages_lost: disk.pages_lost,
+                }),
+                zero: stats_bindings::SwapZero {
+                    pages: swap.zero.pages,
+                    pages_out: swap.zero.pages_out,
+                },
+                store: stats_bindings::SwapStore {
+                    limit_bytes: swap.store.limit_bytes,
+                    frames: swap.store.frames,
+                    pages: swap.store.pages,
+                    payload_bytes: swap.store.payload_bytes,
+                    parked_pages: swap.store.parked_pages,
+                    pages_out: swap.store.pages_out,
+                    rejected_incompressible: swap.store.rejected_incompressible,
+                    rejected_full: swap.store.rejected_full,
+                    put_back: swap.store.put_back,
+                    compacted_frames: swap.store.compacted_frames,
+                },
+                faults: stats_bindings::SwapFaults {
+                    zero: fault_source(swap.faults.zero),
+                    store: fault_source(swap.faults.store),
+                    parked: fault_source(swap.faults.parked),
+                    disk: fault_source(swap.faults.disk),
+                    contended_waits: swap.faults.contended_waits,
+                },
+                frames_released: swap.frames_released,
+                policy: stats_bindings::SwapPolicy {
+                    idle_after: u64::try_from(swap.policy.idle_after.as_nanos()).expect(
+                        "a published policy holds an idle delay that fits the nanosecond clock",
+                    ),
+                    store_limit_percent: swap.policy.store_limit_percent,
+                    store_accept_percent: swap.policy.store_accept_percent,
+                    accept_granules: swap.policy.accept_granules,
+                    writeback: swap.policy.writeback,
+                },
             }
         })
     };

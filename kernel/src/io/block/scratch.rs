@@ -17,17 +17,13 @@ extern crate alloc;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use helios_hal::cpu::Cpu;
 use helios_hal::fs::{
     BlockDevice, BlockDeviceCapabilities, BlockGeometry, BlockQueueTopology, BlockRange,
     BlockSerial, IoError, IoResult, OwnedBlockBuffer,
 };
 use helios_hal::vmm::SwapBackend;
 
-use crate::Timer;
-use crate::exec::Spawner;
-use crate::instance::InstanceRegistry;
-use crate::memory::{RootEntropyHandle, SwapDisabled, SwapHandle, disable_swap, install_swap};
+use crate::memory::{RootEntropyHandle, SwapDiskPort};
 
 /// Bytes the boot self-check round-trips through the device.
 const SELF_CHECK_BYTES: usize = 4096;
@@ -114,8 +110,11 @@ impl ScratchDiskStats {
     }
 }
 
-/// Puts swap on the scratch disk, behind the self-check's blocks, and
-/// returns its handle for the backend to publish in its runtime state.
+/// Attaches the scratch disk to swap, behind the self-check's blocks.
+///
+/// Swap is already running on its RAM tiers (see
+/// [`install_swap`](crate::memory::install_swap)); this
+/// gives its owner a device to put the pages those tiers do not take.
 ///
 /// The self-check owns the last blocks of the device and has already run
 /// by the time this is called; everything before them is swap's. Swap is
@@ -125,23 +124,15 @@ impl ScratchDiskStats {
 /// `make` builds the [`SwapBackend`] over the disk from its first block
 /// and block count, which keeps this crate from depending on the driver
 /// crate that supplies the backend. A disk with no room for swap, or one
-/// the backend refuses, leaves the machine without swap and says why in
-/// the boot log; the machine still boots, because the disk is a
-/// convenience and not a requirement.
-///
-/// The task is local to the calling processor, because the disk's
-/// completions are (see [`install_swap`]).
-pub fn install_scratch_swap<CpuImpl, Device, Backend, Error, Make>(
-    registry: InstanceRegistry,
+/// the backend refuses, leaves swap on its RAM tiers and says why in the
+/// boot log; the machine still boots, because the disk is a convenience and
+/// not a requirement.
+pub fn attach_scratch_swap<Device, Backend, Error, Make>(
+    port: SwapDiskPort<Backend>,
     scratch: ScratchDisk<Device>,
-    spawner: Spawner<CpuImpl>,
-    timer: Timer<CpuImpl>,
-    cpu: CpuImpl,
     backend_name: &'static str,
     make: Make,
-) -> Option<SwapHandle>
-where
-    CpuImpl: Cpu + Clone + Send + Sync + 'static,
+) where
     Device: BlockDevice,
     Backend: SwapBackend,
     Error: core::fmt::Display,
@@ -150,30 +141,20 @@ where
     let block_bytes = scratch.geometry().logical_block_bytes;
     let swap_blocks = scratch.swap_blocks();
     if swap_blocks == 0 {
-        disable_swap(SwapDisabled::NoSwapDevice);
-        return None;
+        tracing::warn!(
+            target: "helios_kernel::swap",
+            "scratch disk has no room for swap; swap stays on its RAM tiers"
+        );
+        return;
     }
-    let backend = match make(scratch, 0, swap_blocks) {
-        Ok(backend) => backend,
-        Err(error) => {
-            tracing::warn!(
-                target: "helios_kernel::swap",
-                %error,
-                "scratch disk cannot back swap"
-            );
-            disable_swap(SwapDisabled::NoSwapDevice);
-            return None;
-        }
-    };
-    Some(install_swap(
-        spawner,
-        timer,
-        cpu,
-        registry,
-        backend,
-        backend_name,
-        (swap_blocks * block_bytes) as u64,
-    ))
+    match make(scratch, 0, swap_blocks) {
+        Ok(backend) => port.attach(backend, backend_name, (swap_blocks * block_bytes) as u64),
+        Err(error) => tracing::warn!(
+            target: "helios_kernel::swap",
+            %error,
+            "scratch disk cannot back swap; swap stays on its RAM tiers"
+        ),
+    }
 }
 
 /// The disk the platform named [`super::SCRATCH_DISK_SERIAL`], typed as

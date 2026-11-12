@@ -27,6 +27,12 @@ type Aarch64VirtioBlockDevice = helios_virtio::VirtioBlockResource<
     helios_kernel::BlockPages,
 >;
 
+/// The swap device this backend attaches to swap: the scratch disk the
+/// kernel carves out of one of its block devices, behind its own
+/// self-check.
+pub(crate) type SwapDisk =
+    helios_virtio::VirtioBlockSwapBackend<helios_kernel::ScratchDisk<Aarch64VirtioBlockDevice>>;
+
 #[derive(Clone)]
 pub(crate) struct VirtioBlockDevice {
     inner: Aarch64VirtioBlockDevice,
@@ -51,8 +57,8 @@ pub(crate) fn count_block_devices(platform: &PlatformDescription) -> usize {
 }
 
 /// Brings up every block device on the platform bus and hands them to
-/// the kernel, which gives each the role its serial names and returns
-/// the scratch disk for swap.
+/// the kernel, which gives each the role its serial names and attaches
+/// the scratch disk to swap through `swap`.
 pub(crate) fn install<WatchdogImpl>(
     cpu: &Aarch64Cpu,
     kernel: &helios_kernel::Kernel<Aarch64Cpu, WatchdogImpl>,
@@ -60,7 +66,7 @@ pub(crate) fn install<WatchdogImpl>(
     physical_memory_offset: usize,
     handoff: &crate::LimineBootHandoff,
     debug_state: &RuntimeState,
-    root: helios_kernel::RootEntropyHandle,
+    swap: helios_kernel::SwapDiskPort<SwapDisk>,
 ) -> Vec<BlockInterrupt>
 where
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
@@ -71,28 +77,20 @@ where
         .map(|interrupt| interrupt.device.inner.clone())
         .collect();
     let state = debug_state.clone();
-    let spawner = kernel.spawner();
-    let timer = kernel.timer();
-    let swap_cpu = *cpu;
     // Nothing mounts a disk yet, so the mount sources' cache is held by
     // its reclaim task alone.
     helios_kernel::install_block_devices(
         kernel,
-        root,
+        debug_state.root_entropy_handle().clone(),
         devices,
         move |service, scratch, _mount_sources| {
             state.install_block_service(service);
-            if let Some(swap) = helios_kernel::install_scratch_swap(
-                state.instance_registry(),
+            helios_kernel::attach_scratch_swap(
+                swap,
                 scratch,
-                spawner,
-                timer,
-                swap_cpu,
                 "virtio-blk",
                 helios_virtio::VirtioBlockSwapBackend::new,
-            ) {
-                state.install_swap(swap);
-            }
+            );
         },
     );
     for interrupt in &discovered {

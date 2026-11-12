@@ -1,20 +1,21 @@
 use futures_io::{AsyncRead, AsyncWrite};
 use helios_api::{
     instances as host_instances, profiling as host_profiling, programs as host_programs,
-    stats as host_stats, tracing as host_tracing,
+    stats as host_stats, swap as host_swap, tracing as host_tracing,
 };
 
 use crate::error::DispatchError;
 use crate::system::accept;
 use crate::system::server::{self, Dispatcher, Invocations};
 
-use super::bindings::helios::system::{instances, profiling, programs, stats, tracing};
+use super::bindings::helios::system::{instances, profiling, programs, stats, swap, tracing};
 use super::methods::{
     INSTANCES_INSTANCE, INSTANCES_KILL, INSTANCES_SNAPSHOT, PROFILING_CLEAR, PROFILING_FOLDED,
     PROFILING_INSTANCE, PROFILING_INSTRUCTION_SAMPLES, PROFILING_METRICS,
     PROFILING_RAW_PROFILE_READ, PROFILING_RAW_PROFILE_SIZE, PROFILING_SET_ENABLED,
     PROFILING_SET_INSTRUCTION_SAMPLING, PROGRAMS_AOT, PROGRAMS_EXEC, PROGRAMS_INSTANCE,
-    STATS_INSTANCE, STATS_SNAPSHOT, TRACING_INSTANCE, TRACING_RECENT, TRACING_SET_TARGET_ENABLED,
+    STATS_INSTANCE, STATS_SNAPSHOT, SWAP_INSTANCE, SWAP_SET_POLICY, TRACING_INSTANCE,
+    TRACING_RECENT, TRACING_SET_TARGET_ENABLED,
 };
 use crate::debugger::{filesystem, programs as debugger_programs, snapshot as debugger_snapshot};
 
@@ -70,6 +71,7 @@ fn supports_request(instance: &str, func: &str) -> bool {
             | (STATS_INSTANCE, STATS_SNAPSHOT)
             | (INSTANCES_INSTANCE, INSTANCES_SNAPSHOT)
             | (INSTANCES_INSTANCE, INSTANCES_KILL)
+            | (SWAP_INSTANCE, SWAP_SET_POLICY)
             | (TRACING_INSTANCE, TRACING_RECENT)
             | (TRACING_INSTANCE, TRACING_SET_TARGET_ENABLED)
             | (PROFILING_INSTANCE, PROFILING_SET_ENABLED)
@@ -194,6 +196,26 @@ async fn dispatch(
             let answer = host_instances::kill(id).map_err(convert_kill_error);
             postcard::to_allocvec(&answer).map_err(|source| DispatchError::Encode {
                 operation: "instances.kill",
+                source,
+            })
+        }
+        (SWAP_INSTANCE, SWAP_SET_POLICY) => {
+            let policy = postcard::from_bytes::<stats::SwapPolicy>(payload).map_err(|source| {
+                DispatchError::Decode {
+                    operation: "swap.set-policy",
+                    source,
+                }
+            })?;
+            let answer = host_swap::set_policy(host_stats::SwapPolicy {
+                idle_after: policy.idle_after,
+                store_limit_percent: policy.store_limit_percent,
+                store_accept_percent: policy.store_accept_percent,
+                accept_granules: policy.accept_granules,
+                writeback: policy.writeback,
+            })
+            .map_err(convert_policy_error);
+            postcard::to_allocvec(&answer).map_err(|source| DispatchError::Encode {
+                operation: "swap.set-policy",
                 source,
             })
         }
@@ -596,13 +618,54 @@ fn convert_device(device: host_stats::GrantedDevice) -> stats::GrantedDevice {
 
 fn convert_swap(swap: host_stats::Swap) -> stats::Swap {
     stats::Swap {
-        backend: swap.backend,
-        capacity_bytes: swap.capacity_bytes,
-        used_bytes: swap.used_bytes,
-        pages_out: swap.pages_out,
-        pages_in: swap.pages_in,
-        faults_served: swap.faults_served,
-        mean_fault_latency: swap.mean_fault_latency,
+        disk: swap.disk.map(|disk| stats::SwapDisk {
+            backend: disk.backend,
+            capacity_bytes: disk.capacity_bytes,
+            stored_bytes: disk.stored_bytes,
+            pages: disk.pages,
+            pages_out_raw: disk.pages_out_raw,
+            pages_out_compressed: disk.pages_out_compressed,
+            written_back: disk.written_back,
+            pages_lost: disk.pages_lost,
+        }),
+        zero: stats::SwapZero {
+            pages: swap.zero.pages,
+            pages_out: swap.zero.pages_out,
+        },
+        store: stats::SwapStore {
+            limit_bytes: swap.store.limit_bytes,
+            frames: swap.store.frames,
+            pages: swap.store.pages,
+            payload_bytes: swap.store.payload_bytes,
+            parked_pages: swap.store.parked_pages,
+            pages_out: swap.store.pages_out,
+            rejected_incompressible: swap.store.rejected_incompressible,
+            rejected_full: swap.store.rejected_full,
+            put_back: swap.store.put_back,
+            compacted_frames: swap.store.compacted_frames,
+        },
+        faults: stats::SwapFaults {
+            zero: convert_swap_fault_source(swap.faults.zero),
+            store: convert_swap_fault_source(swap.faults.store),
+            parked: convert_swap_fault_source(swap.faults.parked),
+            disk: convert_swap_fault_source(swap.faults.disk),
+            contended_waits: swap.faults.contended_waits,
+        },
+        frames_released: swap.frames_released,
+        policy: stats::SwapPolicy {
+            idle_after: swap.policy.idle_after,
+            store_limit_percent: swap.policy.store_limit_percent,
+            store_accept_percent: swap.policy.store_accept_percent,
+            accept_granules: swap.policy.accept_granules,
+            writeback: swap.policy.writeback,
+        },
+    }
+}
+
+fn convert_swap_fault_source(source: host_stats::SwapFaultSource) -> stats::SwapFaultSource {
+    stats::SwapFaultSource {
+        count: source.count,
+        mean_wait: source.mean_wait,
     }
 }
 
@@ -640,6 +703,7 @@ fn convert_memory_balloon(balloon: host_stats::MemoryBalloon) -> stats::MemoryBa
         target_bytes: balloon.target_bytes,
         actual_bytes: balloon.actual_bytes,
         reported_bytes: balloon.reported_bytes,
+        reported_bytes_total: balloon.reported_bytes_total,
     }
 }
 
@@ -723,6 +787,15 @@ fn convert_kill_error(error: host_instances::KillError) -> instances::KillError 
     match error {
         host_instances::KillError::NoSuchInstance => instances::KillError::NoSuchInstance,
         host_instances::KillError::AlreadyStopping => instances::KillError::AlreadyStopping,
+    }
+}
+
+fn convert_policy_error(error: host_swap::PolicyError) -> swap::PolicyError {
+    match error {
+        host_swap::PolicyError::Unavailable => swap::PolicyError::Unavailable,
+        host_swap::PolicyError::StoreLimitPercent => swap::PolicyError::StoreLimitPercent,
+        host_swap::PolicyError::StoreAcceptPercent => swap::PolicyError::StoreAcceptPercent,
+        host_swap::PolicyError::AcceptGranules => swap::PolicyError::AcceptGranules,
     }
 }
 

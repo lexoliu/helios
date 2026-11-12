@@ -49,7 +49,7 @@ pub use cache::{
 };
 pub use pages::BlockPages;
 pub use scratch::{
-    BlockSelfCheckError, BlockStats, ScratchDisk, ScratchDiskStats, install_scratch_swap,
+    BlockSelfCheckError, BlockStats, ScratchDisk, ScratchDiskStats, attach_scratch_swap,
 };
 
 use crate::memory::{CompressedPool, RootEntropyHandle};

@@ -149,6 +149,8 @@ enum Command {
     Stats,
     /// List the live program instances, and optionally stop one.
     Instances(InstancesCommand),
+    /// Show the guest's swap policy, or change some of its settings.
+    Swap(SwapCommand),
     /// Start an interactive shell that forwards most input to the remote shell.
     Repl,
     /// Launch a local QEMU VM, wait for the debugger, and connect the inspector.
@@ -168,6 +170,8 @@ pub(crate) enum SessionCommand {
     Stats,
     /// List the live program instances, and optionally stop one.
     Instances(InstancesCommand),
+    /// Show the guest's swap policy, or change some of its settings.
+    Swap(SwapCommand),
     /// Start an interactive shell that forwards most input to the remote shell.
     Repl,
 }
@@ -220,6 +224,51 @@ pub(crate) struct InstancesCommand {
     kill_name: Option<String>,
 }
 
+/// An on/off setting spelled the way an operator types it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum Switch {
+    On,
+    Off,
+}
+
+/// The longest idle delay `--idle-after-ms` takes: the guest's policy holds
+/// the delay as whole nanoseconds in a `u64` (`swap-policy.idle-after`).
+pub(crate) const MAX_IDLE_AFTER_MS: u64 = u64::MAX / 1_000_000;
+
+/// Which of the guest's swap settings to change.
+///
+/// A setting left out keeps the value in force, so the command with no
+/// flags is a read of the policy.
+#[derive(Debug, Clone, Default, ClapArgs)]
+pub(crate) struct SwapCommand {
+    /// How long, in milliseconds, an instance has to have been off every
+    /// processor before moderate memory pressure evicts it.
+    #[arg(
+        long = "idle-after-ms",
+        value_name = "MS",
+        value_parser = clap::value_parser!(u64).range(..=MAX_IDLE_AFTER_MS)
+    )]
+    pub(crate) idle_after_ms: Option<u64>,
+
+    /// The share of the user pool the compressed store may take, 0 to 100.
+    #[arg(long, value_name = "PERCENT")]
+    pub(crate) store_limit_percent: Option<u8>,
+
+    /// The share of the store's limit it must fall back to before it takes
+    /// pages again after refusing one, 0 to 100.
+    #[arg(long, value_name = "PERCENT")]
+    pub(crate) store_accept_percent: Option<u8>,
+
+    /// The most 64-byte granules a compressed page may take to be accepted,
+    /// 1 to 63.
+    #[arg(long, value_name = "GRANULES")]
+    pub(crate) accept_granules: Option<u8>,
+
+    /// Whether the store may write its oldest pages to the swap device.
+    #[arg(long, value_enum, value_name = "on|off")]
+    pub(crate) writeback: Option<Switch>,
+}
+
 #[derive(Debug, Clone, ClapArgs)]
 pub(crate) struct TracingCommand {
     /// Maximum number of recent events kept in the incremental polling window.
@@ -251,6 +300,7 @@ fn main() -> Result<(), InspectorError> {
         Some(Command::Tracing(command)) => Some(SessionCommand::Tracing(command)),
         Some(Command::Stats) => Some(SessionCommand::Stats),
         Some(Command::Instances(command)) => Some(SessionCommand::Instances(command)),
+        Some(Command::Swap(command)) => Some(SessionCommand::Swap(command)),
         Some(Command::Repl) => Some(SessionCommand::Repl),
         None => None,
     };
@@ -328,6 +378,9 @@ pub(crate) fn run_connected(
         SessionCommand::Instances(command) => run_interruptible(async move {
             Ok(system::run_instances(&client, command.kill, command.kill_name.as_deref()).await?)
         }),
+        SessionCommand::Swap(command) => {
+            run_interruptible(async move { Ok(system::run_swap(&client, &command).await?) })
+        }
         SessionCommand::Repl => Ok(repl::run(client)?),
     }
 }

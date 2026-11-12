@@ -8,22 +8,20 @@
 //! the frame, the rollback of a refused reinstatement, the orphan queue
 //! and the ageing walk.
 
-use alloc::alloc::{Layout, alloc_zeroed};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, Once};
 
 use helios_hal::cpu::ProcessorId;
 use helios_hal::pmm::PhysFrame;
 use helios_hal::vmm::{AddressSpaceError, PageAge, PageFlags, SwapToken, VirtAddr, VirtRange};
 
+use super::test_pool::{allocated_bytes, serialise};
 use super::{AGE_BATCH_PAGES, SwapLeafFormat, SwapSpace};
 use crate::memory::{
-    MemoryOwner, ReservationTracker, allocate_user_frame_zeroed_on, allocate_user_memory_pool,
-    deallocate_user_frame_on, install_user_memory_pool, user_heap_stats,
+    MemoryOwner, ReservationTracker, allocate_user_frame_zeroed_on, deallocate_user_frame_on,
 };
 
 const PAGE: usize = PhysFrame::SIZE;
@@ -31,7 +29,6 @@ const PAGE: usize = PhysFrame::SIZE;
 /// virtual address, only the frames its leaves name.
 const BASE: usize = 0x4000_0000;
 const MODEL_PAGES: usize = 512;
-const POOL_BYTES: usize = 4 * 1024 * 1024;
 const OWNER: MemoryOwner = MemoryOwner::new(1);
 const RW: PageFlags = PageFlags::READ.union(PageFlags::WRITE);
 
@@ -51,30 +48,6 @@ fn page_addr(page: usize) -> VirtAddr {
 
 fn swap_word(token: SwapToken) -> u64 {
     SWAP_MARKER | (u64::from(token.raw()) << SWAP_TOKEN_SHIFT)
-}
-
-/// The tests share one process-global pool when run as threads, and read
-/// its accounting, so they take turns.
-fn serialise() -> MutexGuard<'static, ()> {
-    static TURN: Mutex<()> = Mutex::new(());
-    static POOL: Once = Once::new();
-    let guard = TURN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    POOL.call_once(|| {
-        let layout = Layout::from_size_align(POOL_BYTES, PAGE).expect("pool layout");
-        // Leaked on purpose: the pool is a `&'static` for the life of the
-        // test process.
-        // SAFETY: the layout has a non-zero size.
-        let base = unsafe { alloc_zeroed(layout) } as usize;
-        assert!(base != 0, "pool backing");
-        let pool = install_user_memory_pool(allocate_user_memory_pool());
-        pool.initialize(&[(base, base + POOL_BYTES)]);
-        pool.configure_processors(1);
-    });
-    guard
-}
-
-fn allocated_bytes() -> usize {
-    user_heap_stats().allocated_bytes
 }
 
 struct ModelFormat {
@@ -379,11 +352,8 @@ fn a_page_comes_back_with_its_bytes_flags_and_token() {
         .expect("swap out");
     let after_out = allocated_bytes();
 
-    let returned = space
-        .swap_in_page(&mut tracker, &format, page_addr(0), &out)
-        .expect("swap in");
+    swap_in(&space, &mut tracker, &format, page_addr(0), token(9), &out).expect("swap in");
 
-    assert_eq!(returned, token(9));
     assert_eq!(allocated_bytes(), after_out + PAGE, "one frame allocated");
     assert_eq!(read_page(format.frame_of(0)), out);
     assert_eq!(format.attached_flags.get(), Some(RW));
@@ -409,7 +379,7 @@ fn a_refused_reinstatement_leaves_the_page_swapped_and_returns_the_frame() {
         .set(Some(AddressSpaceError::OutOfFrames));
 
     assert_eq!(
-        space.swap_in_page(&mut tracker, &format, page_addr(0), &out),
+        swap_in(&space, &mut tracker, &format, page_addr(0), token(5), &out),
         Err(AddressSpaceError::OutOfFrames)
     );
 
@@ -427,9 +397,7 @@ fn a_refused_reinstatement_leaves_the_page_swapped_and_returns_the_frame() {
     assert_eq!(format.swapped_token(page_addr(0)), Some(token(5)));
 
     // And the rollback is complete enough that the retry succeeds.
-    space
-        .swap_in_page(&mut tracker, &format, page_addr(0), &out)
-        .expect("retry");
+    swap_in(&space, &mut tracker, &format, page_addr(0), token(5), &out).expect("retry");
     assert_eq!(read_page(format.frame_of(0)), out);
 }
 
@@ -444,14 +412,112 @@ fn swapping_in_a_page_the_tracker_does_not_hold_swapped_is_refused() {
     let held = allocated_bytes();
 
     assert_eq!(
-        space.swap_in_page(&mut tracker, &format, page_addr(0), &vec![0_u8; PAGE]),
+        swap_in(
+            &space,
+            &mut tracker,
+            &format,
+            page_addr(0),
+            token(1),
+            &vec![0_u8; PAGE]
+        ),
         Err(AddressSpaceError::NotSwapped)
     );
     assert_eq!(
         allocated_bytes(),
         held,
-        "no frame is taken for a refused page"
+        "the frame taken for a refused page went back to the pool"
     );
+}
+
+#[test]
+fn a_token_other_than_the_trackers_is_refused_and_changes_nothing() {
+    let _turn = serialise();
+    let (mut tracker, _) = reservation();
+    let format = ModelFormat::new();
+    let space = SwapSpace::new();
+    commit(&mut tracker, 0, 1);
+    format.map_frame(0, 0x55);
+    let mut out = vec![0_u8; PAGE];
+    space
+        .swap_out_page(&mut tracker, &format, page_addr(0), token(7), &mut out)
+        .expect("swap out");
+    let held = allocated_bytes();
+    let leaf = format.leaf(0);
+
+    assert_eq!(
+        swap_in(&space, &mut tracker, &format, page_addr(0), token(9), &out),
+        Err(AddressSpaceError::SwapTokenChanged)
+    );
+
+    assert_eq!(allocated_bytes(), held, "the frame went back to the pool");
+    assert_eq!(
+        tracker.swap_entry(page_addr(0)).map(|entry| entry.token),
+        Some(token(7)),
+        "the tracker still holds the page under its own token"
+    );
+    assert_eq!(format.leaf(0), leaf, "the leaf was not touched");
+    assert_eq!(tracker.owned_resident_bytes(OWNER), 0);
+
+    swap_in(&space, &mut tracker, &format, page_addr(0), token(7), &out)
+        .expect("the right token still succeeds");
+    assert_eq!(read_page(format.frame_of(0)), out);
+}
+
+#[test]
+fn the_fill_runs_before_the_lock_is_taken() {
+    let _turn = serialise();
+    let (mut tracker, _) = reservation();
+    let format = ModelFormat::new();
+    let space = SwapSpace::new();
+    commit(&mut tracker, 0, 1);
+    format.map_frame(0, 0x66);
+    let mut out = vec![0_u8; PAGE];
+    space
+        .swap_out_page(&mut tracker, &format, page_addr(0), token(3), &mut out)
+        .expect("swap out");
+
+    let locked = Cell::new(false);
+    let filled_before_lock = Cell::new(false);
+    space
+        .swap_in_page(
+            &format,
+            || {
+                locked.set(true);
+                &mut tracker
+            },
+            page_addr(0),
+            token(3),
+            |page| {
+                filled_before_lock.set(!locked.get());
+                page.copy_from_slice(&out);
+            },
+        )
+        .expect("swap in");
+
+    assert!(filled_before_lock.get(), "no lock is held while filling");
+    assert!(locked.get());
+    assert_eq!(read_page(format.frame_of(0)), out);
+}
+
+/// `swap_in_page` over a tracker the test already holds: the lock is the
+/// borrow.
+fn swap_in(
+    space: &SwapSpace,
+    tracker: &mut ReservationTracker,
+    format: &ModelFormat,
+    addr: VirtAddr,
+    expected: SwapToken,
+    bytes: &[u8],
+) -> Result<(), AddressSpaceError> {
+    space.swap_in_page(
+        format,
+        || tracker,
+        addr,
+        expected,
+        |page| {
+            page.copy_from_slice(bytes);
+        },
+    )
 }
 
 #[test]
@@ -470,7 +536,7 @@ fn a_leaf_that_disagrees_with_the_tracker_is_an_invariant_violation() {
     // The leaf now names another token than the tracker's entry.
     format.set_leaf(0, swap_word(token(6)));
 
-    let _ = space.swap_in_page(&mut tracker, &format, page_addr(0), &out);
+    let _ = swap_in(&space, &mut tracker, &format, page_addr(0), token(5), &out);
 }
 
 fn swapped_out_pages(
@@ -757,7 +823,14 @@ fn substituting_a_swapped_page_queues_its_token_and_keeps_the_new_leaf() {
     );
     assert_eq!(drained(&space), [token(1), token(2)]);
     assert_eq!(
-        space.swap_in_page(&mut tracker, &format, page_addr(0), &[0_u8; PAGE]),
+        swap_in(
+            &space,
+            &mut tracker,
+            &format,
+            page_addr(0),
+            token(1),
+            &[0_u8; PAGE]
+        ),
         Err(AddressSpaceError::NotSwapped),
         "a substituted page has nothing to swap back in"
     );
