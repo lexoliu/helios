@@ -241,12 +241,12 @@ fn sum_words(bytes: &[u8]) -> u32 {
 }
 
 fn sum_words_scalar(bytes: &[u8]) -> u32 {
-    let mut chunks = bytes.chunks_exact(2);
-    let mut sum = chunks
-        .by_ref()
-        .map(|chunk| u32::from(u16::from_be_bytes([chunk[0], chunk[1]])))
+    let (words, remainder) = bytes.as_chunks::<2>();
+    let mut sum = words
+        .iter()
+        .map(|&word| u32::from(u16::from_be_bytes(word)))
         .sum::<u32>();
-    if let [last] = chunks.remainder() {
+    if let [last] = remainder {
         sum += u32::from(*last) << 8;
     }
     sum
@@ -308,11 +308,11 @@ unsafe fn sum_words_neon(bytes: &[u8]) -> u32 {
     let mut sum = unsafe { vaddvq_u32(acc0).wrapping_add(vaddvq_u32(acc1)) };
 
     let tail = &bytes[offset..];
-    let mut chunks = tail.chunks_exact(2);
-    for chunk in chunks.by_ref() {
-        sum += u32::from(u16::from_be_bytes([chunk[0], chunk[1]]));
+    let (words, remainder) = tail.as_chunks::<2>();
+    for &word in words {
+        sum += u32::from(u16::from_be_bytes(word));
     }
-    if let [last] = chunks.remainder() {
+    if let [last] = remainder {
         sum += u32::from(*last) << 8;
     }
     sum

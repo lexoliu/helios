@@ -522,7 +522,7 @@ fn fill(pixels: &mut [u8], stride: usize, region: Region, colour: Colour) {
         let Some(strip) = pixels.get_mut(start..start + width) else {
             return;
         };
-        for pixel in strip.chunks_exact_mut(BYTES_PER_PIXEL) {
+        for pixel in strip.as_chunks_mut::<BYTES_PER_PIXEL>().0 {
             colour.write(pixel);
         }
     }

@@ -188,10 +188,14 @@ impl<'a> DhcpPacket<'a> {
                     router = Some(Ipv4Address::new(option.value[..4].try_into().ok()?));
                 }
                 OPTION_DNS_SERVER => {
-                    for chunk in option.value.chunks_exact(4).take(MAX_DHCP_DNS_SERVERS) {
-                        dns_servers
-                            .try_push(Ipv4Address::new(chunk.try_into().ok()?))
-                            .ok()?;
+                    for &chunk in option
+                        .value
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .take(MAX_DHCP_DNS_SERVERS)
+                    {
+                        dns_servers.try_push(Ipv4Address::new(chunk)).ok()?;
                     }
                 }
                 OPTION_LEASE_TIME if option.value.len() == 4 => {
