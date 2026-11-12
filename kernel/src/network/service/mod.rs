@@ -9,7 +9,6 @@ use tcp::*;
 mod udp;
 use udp::*;
 mod component;
-use component::*;
 mod shard;
 use shard::*;
 mod identifiers;
@@ -1823,8 +1822,9 @@ mod tests {
         ManualClockCpu, RecordingNetworkInterface, RecordingSmpCpu, TestCpu, test_root_entropy,
     };
 
+    use super::component::DnsQueryPair;
     use super::{
-        AddressAttemptError, DhcpDnsServers, DnsQueryPair, HandleSlab, NETWORK_BUSY_POLL_ROUNDS,
+        AddressAttemptError, DhcpDnsServers, HandleSlab, NETWORK_BUSY_POLL_ROUNDS,
         NETWORK_TX_BATCH_FRAMES, NetworkIpAddress, NetworkPollBudget, NetworkPollProgress,
         NetworkPollScope, NetworkPollSource, NetworkPollState, NetworkPumpAction,
         NetworkPumpCadence, NetworkShard, ReplicaHandle, TcpListenerId, TcpReadProgress,
