@@ -335,10 +335,11 @@ jobs:
         run: |
           set -o pipefail
           # A read-only disk with a serial other than the scratch disk's
-          # is a mount source; init mounts it from /etc/fstab and /etc/rc
-          # reads through it (#511).
+          # is a mount source. The session runs init, which mounts it from
+          # /etc/fstab; mounts belong to a process tree, so the reads run
+          # from /etc/rc, under init (#511).
           runtime="$GITHUB_WORKSPACE/smoke-runtime/erofs"
-          mkdir -p "$runtime/tree/docs" "$runtime/bootfs/etc"
+          mkdir -p "$runtime/tree/docs" "$runtime/bootfs/etc" "$runtime/bootfs/image"
           printf 'erofs:ok\n' > "$runtime/tree/hello.txt"
           printf '中文\n' > "$runtime/tree/docs/中文.txt"
           printf '日本語\n' > "$runtime/tree/docs/日本語.txt"
@@ -353,16 +354,20 @@ jobs:
             --bootfs-root "$runtime/bootfs" \
             --disk "$runtime/image.erofs,serial=erofs-smoke,readonly" \
             --boot-program dash --boot-program debugger \
-            --boot-program ls --boot-program cat \
+            --boot-program ls --boot-program cat --boot-program init \
             --no-compiler-plugin \
-            shell -c 'echo ok' 2>&1 > erofs-smoke.out | tee "$runtime/inspector.log"
+            shell -c init 2>&1 > erofs-smoke.out | tee "$runtime/inspector.log"
           cat erofs-smoke.out
-          grep -Fqx ok erofs-smoke.out
-          grep -aF 'helios init: mounted disk:erofs-smoke at /image' "$runtime/debug-serial.log"
-          grep -aF 'erofs:ok' "$runtime/debug-serial.log"
-          grep -aF '中文.txt' "$runtime/debug-serial.log"
-          grep -aF '日本語.txt' "$runtime/debug-serial.log"
-          grep -aF '한국어.txt' "$runtime/debug-serial.log"
+          grep -Fqx 'helios init: mounted disk:erofs-smoke at /image' erofs-smoke.out
+          grep -Fqx 'helios init: listing /image' erofs-smoke.out
+          grep -Fqx 'dir docs' erofs-smoke.out
+          grep -Fqx 'file hello.txt' erofs-smoke.out
+          # The rest is /etc/rc: cat and ls, children of init, reading
+          # through the mount.
+          grep -Fqx 'erofs:ok' erofs-smoke.out
+          grep -Fqx '中文.txt' erofs-smoke.out
+          grep -Fqx '日本語.txt' erofs-smoke.out
+          grep -Fqx '한국어.txt' erofs-smoke.out
       - name: Run CPython
         timeout-minutes: 5
         shell: bash
@@ -685,10 +690,11 @@ jobs:
         run: |
           set -o pipefail
           # A read-only disk with a serial other than the scratch disk's
-          # is a mount source; init mounts it from /etc/fstab and /etc/rc
-          # reads through it (#511).
+          # is a mount source. The session runs init, which mounts it from
+          # /etc/fstab; mounts belong to a process tree, so the reads run
+          # from /etc/rc, under init (#511).
           runtime="$GITHUB_WORKSPACE/smoke-runtime/erofs"
-          mkdir -p "$runtime/tree/docs" "$runtime/bootfs/etc"
+          mkdir -p "$runtime/tree/docs" "$runtime/bootfs/etc" "$runtime/bootfs/image"
           printf 'erofs:ok\n' > "$runtime/tree/hello.txt"
           printf '中文\n' > "$runtime/tree/docs/中文.txt"
           printf '日本語\n' > "$runtime/tree/docs/日本語.txt"
@@ -703,16 +709,20 @@ jobs:
             --bootfs-root "$runtime/bootfs" \
             --disk "$runtime/image.erofs,serial=erofs-smoke,readonly" \
             --boot-program dash --boot-program debugger \
-            --boot-program ls --boot-program cat \
+            --boot-program ls --boot-program cat --boot-program init \
             --no-compiler-plugin \
-            shell -c 'echo ok' 2>&1 > erofs-smoke.out | tee "$runtime/inspector.log"
+            shell -c init 2>&1 > erofs-smoke.out | tee "$runtime/inspector.log"
           cat erofs-smoke.out
-          grep -Fqx ok erofs-smoke.out
-          grep -aF 'helios init: mounted disk:erofs-smoke at /image' "$runtime/debug-serial.log"
-          grep -aF 'erofs:ok' "$runtime/debug-serial.log"
-          grep -aF '中文.txt' "$runtime/debug-serial.log"
-          grep -aF '日本語.txt' "$runtime/debug-serial.log"
-          grep -aF '한국어.txt' "$runtime/debug-serial.log"
+          grep -Fqx 'helios init: mounted disk:erofs-smoke at /image' erofs-smoke.out
+          grep -Fqx 'helios init: listing /image' erofs-smoke.out
+          grep -Fqx 'dir docs' erofs-smoke.out
+          grep -Fqx 'file hello.txt' erofs-smoke.out
+          # The rest is /etc/rc: cat and ls, children of init, reading
+          # through the mount.
+          grep -Fqx 'erofs:ok' erofs-smoke.out
+          grep -Fqx '中文.txt' erofs-smoke.out
+          grep -Fqx '日本語.txt' erofs-smoke.out
+          grep -Fqx '한국어.txt' erofs-smoke.out
       - name: Upload the inspector runtime directories
         if: failure()
         uses: actions/upload-artifact@v4
@@ -913,10 +923,11 @@ jobs:
         run: |
           set -o pipefail
           # A read-only disk with a serial other than the scratch disk's
-          # is a mount source; init mounts it from /etc/fstab and /etc/rc
-          # reads through it (#511).
+          # is a mount source. The session runs init, which mounts it from
+          # /etc/fstab; mounts belong to a process tree, so the reads run
+          # from /etc/rc, under init (#511).
           runtime="$GITHUB_WORKSPACE/smoke-runtime/erofs"
-          mkdir -p "$runtime/tree/docs" "$runtime/bootfs/etc"
+          mkdir -p "$runtime/tree/docs" "$runtime/bootfs/etc" "$runtime/bootfs/image"
           printf 'erofs:ok\n' > "$runtime/tree/hello.txt"
           printf '中文\n' > "$runtime/tree/docs/中文.txt"
           printf '日本語\n' > "$runtime/tree/docs/日本語.txt"
@@ -931,16 +942,20 @@ jobs:
             --bootfs-root "$runtime/bootfs" \
             --disk "$runtime/image.erofs,serial=erofs-smoke,readonly" \
             --boot-program dash --boot-program debugger \
-            --boot-program ls --boot-program cat \
+            --boot-program ls --boot-program cat --boot-program init \
             --no-compiler-plugin \
-            shell -c 'echo ok' 2>&1 > erofs-smoke.out | tee "$runtime/inspector.log"
+            shell -c init 2>&1 > erofs-smoke.out | tee "$runtime/inspector.log"
           cat erofs-smoke.out
-          grep -Fqx ok erofs-smoke.out
-          grep -aF 'helios init: mounted disk:erofs-smoke at /image' "$runtime/debug-serial.log"
-          grep -aF 'erofs:ok' "$runtime/debug-serial.log"
-          grep -aF '中文.txt' "$runtime/debug-serial.log"
-          grep -aF '日本語.txt' "$runtime/debug-serial.log"
-          grep -aF '한국어.txt' "$runtime/debug-serial.log"
+          grep -Fqx 'helios init: mounted disk:erofs-smoke at /image' erofs-smoke.out
+          grep -Fqx 'helios init: listing /image' erofs-smoke.out
+          grep -Fqx 'dir docs' erofs-smoke.out
+          grep -Fqx 'file hello.txt' erofs-smoke.out
+          # The rest is /etc/rc: cat and ls, children of init, reading
+          # through the mount.
+          grep -Fqx 'erofs:ok' erofs-smoke.out
+          grep -Fqx '中文.txt' erofs-smoke.out
+          grep -Fqx '日本語.txt' erofs-smoke.out
+          grep -Fqx '한국어.txt' erofs-smoke.out
       - name: Run CPython twice and record its launch phases
         timeout-minutes: 5
         shell: bash
