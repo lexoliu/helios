@@ -21,6 +21,24 @@
 //!   own error; its fids are of the old era, which the allocator
 //!   recognises and ignores, and it caches nothing afterwards. The next
 //!   operation establishes a new session.
+//! * A VMM snapshot needs the share released: QEMU refuses to snapshot
+//!   a guest whose 9p root fid is attached. [`HostFsClient::prepare_snapshot`]
+//!   therefore closes a gate that every operation passes once, on entry
+//!   and for its whole duration, and waits for the operations already
+//!   inside to leave. Operations arriving at a closed gate park on the
+//!   gate's release signal; none fails. With nothing in flight it
+//!   clunks every pooled fid and the root fid, and the session stays
+//!   unpublished. The gate opens again exactly when
+//!   [`HostFsClient::snapshot_finished`] runs (the source machine
+//!   resumes) or a machine restore reaches
+//!   [`HostFileSystem::after_machine_restore`] (the restored copy); the
+//!   parked operations then race for the establishment lock, and the
+//!   one that wins attaches the session for all of them. Both signals
+//!   are armed before the state they announce is read, so neither a
+//!   release nor the last operation leaving can be missed. The gate is
+//!   taken by the public operations only, never by the helpers they
+//!   call, so an operation never waits on a gate it is itself holding
+//!   open. The clunks the hold sends are not operations.
 //! * Each operation owns its tags and fids: a tag for the lifetime of
 //!   one message, a fid for the lifetime of the operation, both handed
 //!   out by allocators behind a spin mutex that is taken only to
@@ -46,7 +64,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use bytes::BytesMut;
 use core::future::Future;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use helios_hal::cpu::{Cpu, HardwarePerfCounters};
 use helios_hal::io::IoError;
 use objectpool::{Pool, ReusableObject};
@@ -57,7 +75,7 @@ use triomphe::Arc;
 use super::cache::{CachedAttributes, HostFsCache, HostFsCacheStats, PooledReadFid};
 use crate::{
     AuthorityDomain, HostDirEntry, HostDirLimit, HostFileSystem, HostFsError, HostFsErrorKind,
-    HostMetadata, HostShareRestore, ObjectIdentity, ProfileSink, RawMutex,
+    HostMetadata, HostShareRestore, Notify, ObjectIdentity, ProfileSink, RawMutex,
 };
 
 /// The msize this client asks for. The server answers with its own
@@ -417,6 +435,102 @@ impl Drop for Handle<'_> {
     }
 }
 
+/// The bit of [`SnapshotGate::state`] that says the share is held.
+const GATE_HELD: usize = 1;
+/// What one operation inside the gate adds to [`SnapshotGate::state`],
+/// above the held bit.
+const GATE_ONE_OPERATION: usize = 2;
+
+/// Lets operations through until a snapshot hold closes it.
+///
+/// One word carries the held bit and the number of operations inside,
+/// so an operation entering and the hold closing are ordered by a single
+/// compare-exchange: an operation either got in before the bit was set,
+/// and is counted for the drain, or sees the bit and parks. Entering and
+/// leaving are lock-free; the two [`Notify`]s are broadcasts, each
+/// armed before the word is read.
+struct SnapshotGate {
+    /// Bit 0 is [`GATE_HELD`]; the rest counts operations inside.
+    state: AtomicUsize,
+    /// Fired when the last operation leaves a held gate.
+    drained: Notify,
+    /// Fired when a held gate opens.
+    released: Notify,
+}
+
+impl SnapshotGate {
+    fn new() -> Self {
+        Self {
+            state: AtomicUsize::new(0),
+            drained: Notify::new(),
+            released: Notify::new(),
+        }
+    }
+
+    /// Waits for the gate to be open and enters it. Any task may call it.
+    async fn enter(&self) -> GateEntry<'_> {
+        loop {
+            let released = self.released.notified();
+            let state = self.state.load(Ordering::Acquire);
+            if state & GATE_HELD == 0 {
+                if self
+                    .state
+                    .compare_exchange_weak(
+                        state,
+                        state + GATE_ONE_OPERATION,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    return GateEntry { gate: self };
+                }
+                continue;
+            }
+            released.await;
+        }
+    }
+
+    /// Closes the gate and waits for every operation inside to leave.
+    /// Closing a closed gate only waits for the drain again.
+    async fn close_and_drain(&self) {
+        self.state.fetch_or(GATE_HELD, Ordering::AcqRel);
+        loop {
+            let drained = self.drained.notified();
+            if self.state.load(Ordering::Acquire) >> 1 == 0 {
+                return;
+            }
+            drained.await;
+        }
+    }
+
+    /// Opens the gate, reporting whether it was closed.
+    fn open(&self) -> bool {
+        let was_held = self.state.fetch_and(!GATE_HELD, Ordering::AcqRel) & GATE_HELD != 0;
+        if was_held {
+            self.released.notify_all();
+        }
+        was_held
+    }
+}
+
+/// One operation inside the gate; leaving it is dropping it.
+struct GateEntry<'a> {
+    gate: &'a SnapshotGate,
+}
+
+impl Drop for GateEntry<'_> {
+    fn drop(&mut self) {
+        let before = self
+            .gate
+            .state
+            .fetch_sub(GATE_ONE_OPERATION, Ordering::AcqRel);
+        if before == GATE_HELD | GATE_ONE_OPERATION {
+            self.gate.drained.notify_all();
+        }
+    }
+}
+
 /// The clock and hardware-counter readings a profiled span is
 /// measured between.
 #[derive(Clone, Copy)]
@@ -437,6 +551,8 @@ struct ClientInner<Transport: HostFsTransport, CpuImpl: Cpu + Clone> {
     /// network service for its `kernel;network;` phases.
     profiles: ProfileSink,
     session: SessionCell,
+    /// Closed for the length of a VMM snapshot; see the module docs.
+    gate: SnapshotGate,
     tags: HandleAllocator,
     fids: HandleAllocator,
     cache: HostFsCache,
@@ -466,6 +582,7 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         Self {
             inner: Arc::new(ClientInner {
                 session: SessionCell::new(),
+                gate: SnapshotGate::new(),
                 tags: HandleAllocator::new(
                     depth,
                     u32::from(P9_NOTAG),
@@ -510,6 +627,45 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
             parked_fids = forgotten.len(),
             "9p session dropped: the server no longer knows it"
         );
+    }
+
+    /// Gives the share back to the host for a VMM snapshot and keeps it
+    /// given back.
+    ///
+    /// The gate closes first, so no operation starts from here on, and
+    /// the call waits for those already inside to finish. The session
+    /// lock is taken only after the drain, because an operation inside
+    /// may itself be waiting for it to establish the session. With the
+    /// client quiet, every pooled read fid and then the root fid are
+    /// clunked, which is what lifts QEMU's snapshot blocker, and the
+    /// session is left unpublished. The hold ends in
+    /// [`Self::snapshot_finished`] or in a machine restore. A caller
+    /// that abandons this future after the gate closed leaves the hold
+    /// in force; ending it is still one of those two.
+    pub async fn prepare_snapshot(&self) {
+        self.inner.gate.close_and_drain().await;
+        let _establishing = self.inner.session.establishing.lock().await;
+        let Some(session) = self.inner.session.get() else {
+            tracing::info!("9p snapshot hold taken with no session attached");
+            return;
+        };
+        self.inner.session.unpublish();
+        let parked = self.inner.cache.clear();
+        let parked_fids = parked.len();
+        for fid in parked {
+            self.clunk_value(fid).await;
+        }
+        self.clunk_value(session.root_fid).await;
+        tracing::info!(parked_fids, "9p session released for a snapshot");
+    }
+
+    /// Ends the hold [`Self::prepare_snapshot`] took, because the
+    /// snapshot is over and this machine runs on. A no-op when no hold
+    /// is in force.
+    pub fn snapshot_finished(&self) {
+        if self.inner.gate.open() {
+            tracing::info!("9p snapshot hold ended: the share attaches again on next use");
+        }
     }
 
     /// Forgets every cached answer without touching the session, for a
@@ -581,16 +737,19 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         );
     }
 
-    /// Runs `operation` under its `kernel;hostfs;<phase>` counter:
-    /// count is the call itself, nanos the whole wall-clock span and
-    /// bytes whatever payload `payload` reads off the result — zero
-    /// for an operation that moves none.
+    /// Runs `operation` as one public host-share operation: inside the
+    /// snapshot gate for its whole duration, and under its
+    /// `kernel;hostfs;<phase>` counter. Count is the call itself, nanos
+    /// the whole wall-clock span and bytes whatever payload `payload`
+    /// reads off the result — zero for an operation that moves none.
+    /// Time parked at a closed gate is not part of the span.
     async fn profiled<T>(
         &self,
         phase: &'static str,
         operation: impl Future<Output = Result<T, HostFsError>> + Send,
         payload: impl FnOnce(&T) -> usize + Send,
     ) -> Result<T, HostFsError> {
+        let _inside = self.inner.gate.enter().await;
         let start = self.profile_start();
         let result = operation.await;
         if let Some(start) = start {
@@ -1588,6 +1747,18 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFileSystem
             HostShareRestore::ServerKept => self.flush_cache().await,
             HostShareRestore::SessionLost => self.reset_session_forgotten().await,
         }
+        // A restored copy never sees `snapshot-finished`: its machine
+        // generation advancing is what ends a hold taken before the
+        // snapshot, after the session state above is settled.
+        self.snapshot_finished();
+    }
+
+    async fn prepare_snapshot(&self) {
+        HostFsClient::prepare_snapshot(self).await;
+    }
+
+    fn snapshot_finished(&self) {
+        HostFsClient::snapshot_finished(self);
     }
 
     async fn stat_path<'a>(&'a self, path: &'a str) -> Result<HostMetadata, HostFsError> {
@@ -1892,7 +2063,8 @@ fn append_read_payload(response: &[u8], output: &mut Vec<u8>) -> Result<usize, H
 mod tests {
     use super::*;
     use crate::test_support::ManualClockCpu;
-    use futures_lite::future::{block_on, zip};
+    use core::pin::pin;
+    use futures_lite::future::{block_on, poll_once, zip};
 
     #[test]
     fn p9_setattr_times_uses_specific_timestamp_flags() {
@@ -2616,6 +2788,133 @@ mod tests {
         assert_eq!(fids.live_count(), 1);
         drop(after);
         assert_eq!(fids.live_count(), 0);
+    }
+
+    #[test]
+    fn a_snapshot_hold_releases_the_root_fid_parks_operations_and_attaches_once_on_finish() {
+        let Fixture {
+            client, transport, ..
+        } = fixture(P9_REQUESTED_MSIZE, FakeFault::default());
+
+        block_on(async {
+            client.stat_path("/alpha").await.expect("stat before");
+            client.read_file("/alpha").await.expect("read before");
+            let root_fid = client
+                .inner
+                .session
+                .get()
+                .expect("the session is attached")
+                .root_fid;
+
+            let clunked_before = transport.log().clunked.len();
+            client.prepare_snapshot().await;
+            {
+                let log = transport.log();
+                assert!(
+                    log.clunked.contains(&root_fid),
+                    "the root fid is clunked, which lifts the VMM's snapshot blocker"
+                );
+                assert_eq!(
+                    log.clunked.len() - clunked_before,
+                    2,
+                    "the pooled read fid and the root fid"
+                );
+            }
+            assert_eq!(client.inner.session.get(), None);
+            assert_eq!(client.inner.fids.live_count(), 0, "no fid is left");
+
+            // Two operations issued during the hold: neither fails and
+            // neither reaches the server.
+            let walks_before = transport.log().walks;
+            let mut first = pin!(client.stat_path("/beta"));
+            let mut second = pin!(client.read_dir("/", TEST_DIR_LIMIT));
+            assert!(poll_once(first.as_mut()).await.is_none());
+            assert!(poll_once(second.as_mut()).await.is_none());
+            assert_eq!(transport.log().walks, walks_before);
+            assert_eq!(transport.log().attaches, 1, "no attach during the hold");
+
+            client.snapshot_finished();
+            let (first, second) = zip(first, second).await;
+            first.expect("the parked stat completes after the finish");
+            second.expect("the parked listing completes after the finish");
+        });
+
+        let log = transport.log();
+        assert_eq!(
+            (log.versions, log.attaches),
+            (2, 2),
+            "the session is attached exactly once more, for both parked operations"
+        );
+        drop(log);
+        assert_eq!(client.inner.fids.live_count(), 1, "only the new root fid");
+    }
+
+    #[test]
+    fn a_machine_restore_ends_a_snapshot_hold() {
+        let Fixture {
+            client, transport, ..
+        } = fixture(P9_REQUESTED_MSIZE, FakeFault::default());
+
+        block_on(async {
+            client.stat_path("/alpha").await.expect("stat before");
+            client.prepare_snapshot().await;
+            let mut parked = pin!(client.stat_path("/beta"));
+            assert!(poll_once(parked.as_mut()).await.is_none());
+
+            client
+                .after_machine_restore(HostShareRestore::SessionLost)
+                .await;
+            parked.await.expect("the parked stat completes");
+            // The source's `snapshot-finished` arriving after the restore
+            // reaction must not disturb the new session.
+            client.snapshot_finished();
+            client.stat_path("/gamma").await.expect("stat after");
+        });
+
+        let log = transport.log();
+        assert_eq!((log.versions, log.attaches), (2, 2));
+    }
+
+    #[test]
+    fn preparing_a_snapshot_waits_for_the_operation_in_flight() {
+        let Fixture {
+            client, transport, ..
+        } = fixture(P9_REQUESTED_MSIZE, FakeFault::default());
+
+        block_on(async {
+            let mut operation = pin!(client.stat_path("/alpha"));
+            assert!(
+                poll_once(operation.as_mut()).await.is_none(),
+                "the fake server answers after a yield, so the operation is in flight"
+            );
+
+            let mut prepare = pin!(client.prepare_snapshot());
+            let mut polls = 0;
+            let outcome = loop {
+                if let Some(outcome) = poll_once(operation.as_mut()).await {
+                    break outcome;
+                }
+                assert!(
+                    poll_once(prepare.as_mut()).await.is_none(),
+                    "prepare finished while an operation was still in flight"
+                );
+                assert!(
+                    !transport.log().clunked.contains(&0),
+                    "the root fid is not clunked under an operation in flight"
+                );
+                polls += 1;
+                assert!(polls < 100, "the operation never completed");
+            };
+            outcome.expect("the operation in flight completes, it is not failed");
+
+            prepare.await;
+        });
+
+        let log = transport.log();
+        assert_eq!(log.clunked.len(), 2, "the operation's fid and the root fid");
+        drop(log);
+        assert_eq!(client.inner.session.get(), None);
+        assert_eq!(client.inner.fids.live_count(), 0);
     }
 
     #[test]

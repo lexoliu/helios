@@ -42,6 +42,8 @@ pub mod profiling;
 pub mod programs;
 #[cfg(feature = "serial")]
 pub mod serial;
+#[cfg(feature = "snapshot")]
+pub mod snapshot;
 #[cfg(feature = "stats")]
 pub mod stats;
 #[cfg(feature = "surface")]

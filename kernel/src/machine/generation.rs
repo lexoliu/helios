@@ -152,6 +152,12 @@ impl MachineGeneration {
         })
     }
 
+    /// Whether the VMM publishes a generation ID window, which is what
+    /// tells a restored copy of the machine that it is one.
+    pub fn has_window(&self) -> bool {
+        self.window.is_some()
+    }
+
     /// The generation as of the last observation, without looking at the
     /// window.
     pub fn current(&self) -> Generation {

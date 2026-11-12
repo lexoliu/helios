@@ -84,10 +84,15 @@ const RETIRED: PageTableFlags = PageTableFlags::BIT_9;
 /// through `OffsetPageTable::map_to` or `ensure_table`), or rewrite a
 /// leaf of a committed range (`protect`, `relocate`,
 /// `substitute_memory`, `restore`, `withdraw`,
-/// `ensure_accessible_subranges`, `decommit_committed_subranges`),
-/// takes `state` before its first check and holds it through its last
-/// table access and the matching tracker record; no helper it calls
-/// takes `state` again. The shape is "build under the lock", not
+/// `ensure_accessible_subranges`, `decommit_committed_subranges`), or
+/// that clears the leaves of a range it takes out of the tracker
+/// (`decommit`, `release`, `end_demand_commit`,
+/// `decommit_committed_subranges`), takes `state` before its first
+/// check and holds it through its last table access and the matching
+/// tracker record; for the clearing paths that is from the tracker
+/// update through the last leaf cleared, the shootdown and the frames
+/// freed behind it (and, for `release`, the return of the range to the
+/// free list). No helper it calls takes `state` again. The shape is "build under the lock", not
 /// "publish by compare-exchange": the lock already orders the tracker
 /// against the tables, so the check, the walk and the record are one
 /// critical section and there is no loser table to free, and the next
@@ -106,11 +111,10 @@ const RETIRED: PageTableFlags = PageTableFlags::BIT_9;
 /// which is sound because no intermediate table is freed while the
 /// address space lives, and the one leaf `commit_demand_page` writes
 /// belongs to a prepared demand-commit region only its fiber faults on;
-/// `allocate_run` and `free_run`, which change no translation; and the
-/// leaf clearing `decommit`, `release` and `end_demand_commit` do
-/// through `unmap_range`, `unmap_demand_pages` and
-/// `drop_substituted_leaves` after taking the range out of the tracker,
-/// which never touches an intermediate entry.
+/// and `allocate_run` and `free_run`, which change no translation.
+/// `unmap_range`, `unmap_demand_pages`, `drop_substituted_leaves` and
+/// `drop_substituted_parts` take no lock themselves and are only called
+/// with `state` held.
 pub struct X86UserAddressSpace {
     physical_memory_offset: usize,
     processor_count: usize,
@@ -257,9 +261,8 @@ impl X86UserAddressSpace {
                 continue;
             };
             // SAFETY: the pointer came from a completed walk of live
-            // tables, and the caller owns the range: it holds the
-            // reservation lock or has already taken the range out of
-            // the reservation tracker.
+            // tables, and the caller owns the range: it holds `state`
+            // from the tracker update that took the range out.
             let entry = unsafe { &mut *entry_ptr };
             if entry.is_unused() {
                 continue;
@@ -640,9 +643,8 @@ impl X86UserAddressSpace {
             let Some(leaf) = self.leaf_entry(virt.start.raw() + offset) else {
                 continue;
             };
-            // SAFETY: as in `unmap_range`: the caller owns the range,
-            // under the reservation lock or after taking the range out
-            // of the reservation tracker.
+            // SAFETY: as in `unmap_range`: the caller owns the range
+            // under `state`.
             let entry = unsafe { &mut *leaf };
             if !entry.is_unused() {
                 entry.set_unused();
@@ -734,7 +736,12 @@ impl AddressSpace for X86UserAddressSpace {
 
     fn release(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
         self.assert_smp_safe();
-        let released = self.state.lock().release(virt)?;
+        // One critical section from the tracker update through the last
+        // leaf cleared to the return of the range to the free list: a
+        // `commit` of the range cannot map it between the record and the
+        // unmap, and `reserve` cannot reuse it before its leaves are gone.
+        let mut state = self.state.lock();
+        let released = state.release(virt)?;
         // This backend has no swap, so a released reservation never holds a
         // swap token; the assertion keeps that true if swap ever reaches
         // this architecture (#25).
@@ -746,8 +753,7 @@ impl AddressSpace for X86UserAddressSpace {
                 self.unmap_range(region.range);
             }
         }
-
-        self.state.lock().push_free_range(virt);
+        state.push_free_range(virt);
         Ok(())
     }
 
@@ -927,7 +933,11 @@ impl AddressSpace for X86UserAddressSpace {
     fn decommit(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
         self.assert_smp_safe();
         validate_range(virt)?;
-        let removed = self.state.lock().record_decommit(virt)?;
+        // Held from the tracker update through the last leaf cleared, as
+        // in `release`: a concurrent `commit` of `virt` waits for the
+        // unmap instead of interleaving with it.
+        let mut state = self.state.lock();
+        let removed = state.record_decommit(virt)?;
         self.drop_substituted_parts(&removed.substituted);
         self.unmap_range(virt);
         Ok(())
@@ -1032,7 +1042,9 @@ impl AddressSpace for X86UserAddressSpace {
         if !virt.encloses(mapped) {
             return Err(AddressSpaceError::NotDemandCommit);
         }
-        let _ = self.state.lock().record_decommit(virt)?;
+        // Held through the unmap, as in `decommit`.
+        let mut state = self.state.lock();
+        let _ = state.record_decommit(virt)?;
         self.unmap_demand_pages(mapped);
         Ok(())
     }

@@ -19,9 +19,6 @@ jobs:
       # The workspace resolves `../wasmtime` at manifest time, so the
       # pinned tree must sit next to the checkout exactly as in CI.
       - uses: ./helios/.github/actions/checkout-wasmtime
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: helios
       # `cargo outdated` copies the manifests into a temporary directory
       # before resolving, which severs the `../wasmtime` path dependency.
       # `cargo upgrade --dry-run` resolves the real workspace in place and

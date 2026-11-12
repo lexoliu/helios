@@ -339,7 +339,6 @@ jobs:
           path: ${{ needs.tooling.outputs.baseline_fork_root }}/wasmtime
       - uses: ./helios/.github/actions/bench-host
         with:
-          rust-cache-key: bench-suite-${{ matrix.lane }}
           network-tools: ${{ matrix.net-backend == 'tap' }}
           guest-arch: ${{ matrix.guest-arch }}
           flamegraphs: "true"
@@ -590,7 +589,6 @@ jobs:
       - uses: ./helios/.github/actions/checkout-wasmtime
       - uses: ./helios/.github/actions/bench-host
         with:
-          rust-cache-key: suite-pgo
           network-tools: "true"
           flamegraphs: "true"
           inspector: "true"

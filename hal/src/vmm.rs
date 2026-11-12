@@ -265,6 +265,11 @@ pub trait SwapBackend: Send + Sync + 'static {
     /// later resurrect them via `swap_in`. The implementation owns
     /// the lifecycle of the storage and decides eviction order on
     /// its own.
+    ///
+    /// A `swap_out` dropped before it resolves hands out no token, so
+    /// the storage it allocated stays the implementation's to reclaim:
+    /// it gives the storage back once no write the dropped call issued
+    /// can still land there, and never hands it to another page before.
     fn swap_out<'a>(
         &'a self,
         bytes: &'a [u8],
@@ -273,6 +278,12 @@ pub trait SwapBackend: Send + Sync + 'static {
     /// Restore previously swapped-out bytes into `dst`. After this
     /// returns successfully, the token is no longer valid (the
     /// storage may be reclaimed).
+    ///
+    /// Only a successful `swap_in` consumes the token. One that fails,
+    /// or is dropped before it resolves, leaves the token valid and its
+    /// storage intact: the caller still holds the token, so retrying or
+    /// releasing it later neither loses the page's only copy nor frees
+    /// storage that has gone to another page.
     fn swap_in<'a>(
         &'a self,
         token: Self::Token,

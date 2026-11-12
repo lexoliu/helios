@@ -1,0 +1,25 @@
+package helios:system@0.1.0;
+
+/// Handing the machine's host share back to the VMM for a snapshot.
+///
+/// A VMM refuses to snapshot a guest whose 9p host share is attached.
+/// `prepare` releases the share and holds it released, and the hold ends
+/// when the machine generation advances (the copy restored from the
+/// snapshot) or `finished` is called (the machine that keeps running).
+interface snapshot {
+  /// What the kernel knows that the host needs before it takes the snapshot.
+  record prepared {
+    /// The machine has a VM generation ID, so a copy restored from the
+    /// snapshot learns that it is a copy.
+    has-generation-id: bool,
+  }
+
+  /// Waits for the host-share operations in flight to finish, returns the
+  /// share to the host and holds it there. Operations issued from the
+  /// moment this is called wait for the hold to end; none fails.
+  prepare: async func() -> prepared;
+
+  /// Ends the hold, for the machine that keeps running after the
+  /// snapshot. A no-op when no hold is in force.
+  finished: func();
+}
