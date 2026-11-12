@@ -2006,3 +2006,167 @@ fn a_device_that_never_answers_a_restore_command_times_out() {
         })
     );
 }
+
+/// A restore command that outlived its deadline is still the device's,
+/// so the device is lost: a second attempt is an error, not a panic.
+#[test]
+fn a_device_lost_by_a_timed_out_restore_is_refused_afterwards() {
+    let device = device();
+    create_framebuffer(&device, DisplayMode::new(64, 32));
+    assert!(matches!(
+        device.reinitialize(|| true),
+        Err(ReinitError::RestoreTimedOut { .. })
+    ));
+
+    assert_eq!(
+        device.reinitialize(|| false),
+        Err(ReinitError::DeviceLost {
+            device: DeviceType::Gpu
+        })
+    );
+}
+
+/// A re-initialisation that fails leaves the device FAILED and every
+/// command after it failing fast.
+#[test]
+fn a_failed_reinitialization_fails_the_commands_that_follow() {
+    let device = device();
+    device
+        .transport
+        .set_config_u32(super::CONFIG_NUM_SCANOUTS, 2);
+    assert!(matches!(
+        device.reinitialize(|| false),
+        Err(ReinitError::DeviceChanged { .. })
+    ));
+    assert!(
+        device
+            .transport
+            .status()
+            .contains(crate::transport::DeviceStatus::FAILED)
+    );
+
+    assert_eq!(
+        block_on(poll_once(device.scanouts())),
+        Some(Err(DisplayError::Transport(IoError::DeviceFault)))
+    );
+}
+
+/// A scanout that shows a resource would be left scanning out memory the
+/// device no longer references, and the record would replay a scanout of
+/// a resource that is never created again. The destroy is refused until
+/// the caller has blanked the scanout, and nothing reaches the device.
+#[test]
+fn a_frame_buffer_that_is_still_shown_cannot_be_destroyed() {
+    let device = device();
+    let (frame, cursor) = display_in_use(&device);
+
+    assert_eq!(
+        block_on(poll_once(device.destroy_framebuffer(frame))),
+        Some(Err(DisplayError::InvalidParameter)),
+        "on a scanout"
+    );
+    assert_eq!(
+        block_on(poll_once(device.destroy_framebuffer(cursor))),
+        Some(Err(DisplayError::InvalidParameter)),
+        "in the cursor plane"
+    );
+    assert!(
+        device
+            .control
+            .try_lock()
+            .expect("nothing is parked")
+            .device_in_flight_heads()
+            .is_empty()
+    );
+
+    // The record is intact, so a reset device still gets all of it back.
+    device.quiesce(|| false).expect("nothing is in flight");
+    device.transport.reset_behind_the_driver();
+    let mut requests = Vec::new();
+    let _reset = device
+        .reinitialize(|| {
+            play_device(&device, &mut requests);
+            false
+        })
+        .expect("the device comes back");
+    assert_eq!(requests.len(), 9);
+}
+
+/// The create was answered while the machine froze, and the attach had
+/// not gone out: the quiesce reaps the answer for the waiter, so the
+/// record holds the resource unbacked and the reset device is given
+/// just the resource. The thawed task then sends its own attach to a
+/// device that has the resource and accepts it.
+#[test]
+fn a_resource_created_but_not_yet_backed_is_restored_unbacked() {
+    let device = device();
+    let pages = backing(64);
+    let mode = DisplayMode::new(64, 32);
+    let mut create = pin!(device.create_framebuffer(mode, PixelFormat::Bgra8888, &pages));
+    let token = pending_control(&device, create.as_mut());
+    answer_control(&device, token, &header_response(RESP_OK_NODATA));
+
+    let mut ignored = Vec::new();
+    device
+        .quiesce(|| {
+            play_device(&device, &mut ignored);
+            false
+        })
+        .expect("the device answers inside the deadline");
+    device.transport.reset_behind_the_driver();
+    let mut requests = Vec::new();
+    let _reset = device
+        .reinitialize(|| {
+            play_device(&device, &mut requests);
+            false
+        })
+        .expect("the device comes back");
+    let commands: Vec<u32> = requests.iter().map(|r| command_of(r)).collect();
+    assert_eq!(commands, [CMD_RESOURCE_CREATE_2D], "no backing to attach");
+
+    // The thaw: the task's own attach goes out and is accepted.
+    let token = pending_control(&device, create.as_mut());
+    assert_eq!(
+        command_of(&control_request(&device, token)),
+        CMD_RESOURCE_ATTACH_BACKING
+    );
+    answer_control(&device, token, &header_response(RESP_OK_NODATA));
+    let frame = block_on(poll_once(create.as_mut()))
+        .expect("the attach is answered")
+        .expect("the frame buffer is created");
+    assert!(
+        device
+            .restorable
+            .lock()
+            .resources
+            .iter()
+            .any(|held| held.id == frame && held.backed)
+    );
+}
+
+/// A create the device refused while the machine froze never made a
+/// resource, so there is nothing to replay.
+#[test]
+fn a_resource_the_device_refused_during_the_freeze_is_not_restored() {
+    let device = device();
+    let pages = backing(64);
+    let mut create =
+        pin!(device.create_framebuffer(DisplayMode::new(64, 32), PixelFormat::Bgra8888, &pages));
+    let token = pending_control(&device, create.as_mut());
+    answer_control(&device, token, &header_response(RESP_ERR_OUT_OF_MEMORY));
+
+    device.quiesce(|| false).expect("the queue is drained");
+    device.transport.reset_behind_the_driver();
+    let mut requests = Vec::new();
+    let _reset = device
+        .reinitialize(|| {
+            play_device(&device, &mut requests);
+            false
+        })
+        .expect("the device comes back");
+    assert!(requests.is_empty());
+    assert_eq!(
+        block_on(poll_once(create.as_mut())),
+        Some(Err(DisplayError::OutOfMemory))
+    );
+}
