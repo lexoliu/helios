@@ -270,8 +270,10 @@ pub trait Concurrently {
         B: FnOnce() + Send;
 }
 
-/// Passes through every iteration of the commit and decommit loops of
-/// [`run_concurrent_conformance`].
+/// How many times each racer of [`run_concurrent_conformance`] runs its
+/// operation: enough rounds that, on a multi-core host, a `commit` lands
+/// between some `decommit`'s tracker update and its unmap if the backend
+/// lets it.
 const RACE_ITERATIONS: usize = 2000;
 
 /// Run the conformance checks that need two threads in one address space.
