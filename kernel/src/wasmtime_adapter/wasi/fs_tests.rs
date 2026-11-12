@@ -1163,3 +1163,62 @@ fn set_times_at_needs_write_or_mutate_on_the_base() {
     });
     assert!(matches!(refused, Err(fs_types::ErrorCode::ReadOnly)));
 }
+
+#[test]
+fn a_read_only_base_creates_or_truncates_nothing_before_asking_the_host() {
+    let namespace = namespace();
+    mount_unreachable_host(&namespace, "/mnt");
+    let (rw, ro) = host_bases();
+    let read = fs_types::DescriptorFlags::READ;
+
+    // The control: a base that may create and truncate reaches the share.
+    for open_flags in [fs_types::OpenFlags::CREATE, fs_types::OpenFlags::TRUNCATE] {
+        let reached = open(&namespace, &rw, "file", open_flags, read);
+        assert!(matches!(reached, Err(fs_types::ErrorCode::Unsupported)));
+    }
+
+    // Without the base's rights neither is asked of the host.
+    for open_flags in [fs_types::OpenFlags::CREATE, fs_types::OpenFlags::TRUNCATE] {
+        let refused = open(&namespace, &ro, "file", open_flags, read);
+        assert!(matches!(refused, Err(fs_types::ErrorCode::ReadOnly)));
+    }
+}
+
+#[test]
+fn a_read_only_base_creates_or_truncates_nothing_in_memory() {
+    let namespace = namespace();
+    mount_memory(&namespace, "/mnt");
+    let notes = create_file(&namespace, "mnt/notes", "日本語 한국어".as_bytes());
+    let read = fs_types::DescriptorFlags::READ;
+    let read_only = directory_holding("/mnt", read);
+    let no_write = directory_holding("/mnt", read | fs_types::DescriptorFlags::MUTATE_DIRECTORY);
+
+    // A new name, and an existing one: creating is refused either way.
+    for name in ["new", "notes"] {
+        let refused = open(
+            &namespace,
+            &read_only,
+            name,
+            fs_types::OpenFlags::CREATE,
+            read,
+        );
+        assert!(matches!(refused, Err(fs_types::ErrorCode::ReadOnly)));
+    }
+    assert!(matches!(
+        block_on(stat_path(&namespace, "/mnt/new", Follow::No)),
+        Err(fs_types::ErrorCode::NoEntry)
+    ));
+
+    // Truncating needs the base's `write` beside its `mutate-directory`.
+    for base in [&read_only, &no_write] {
+        let refused = open(
+            &namespace,
+            base,
+            "notes",
+            fs_types::OpenFlags::TRUNCATE,
+            read,
+        );
+        assert!(matches!(refused, Err(fs_types::ErrorCode::ReadOnly)));
+    }
+    assert_eq!(read_all(&namespace, &notes), "日本語 한국어".as_bytes());
+}

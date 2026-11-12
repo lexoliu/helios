@@ -188,8 +188,9 @@ fn require_directory(base: &FsDescriptor) -> FsOpResult<()> {
 /// writing, and the write itself is what fails. Creating changes the
 /// directory, so it needs `base`'s `mutate-directory` and a writable
 /// mount; truncating also changes the file's data, so it needs `base`'s
-/// `write` as well. Every right is checked before anything changes: a
-/// refused open leaves the filesystem as it was.
+/// `write` as well. Both rights are demanded whether or not the file
+/// exists, and before the path is resolved: a refused open reaches no
+/// filesystem and leaves it as it was.
 pub(crate) async fn open_at<HostFs>(
     namespace: &Namespace<HostFs>,
     base: &FsDescriptor,
@@ -203,6 +204,17 @@ where
     HostFs: crate::HostFileSystem,
 {
     require_directory(base)?;
+    // Every right the flags need is proved before the path is resolved, so a
+    // refusal reaches no filesystem, a host share included, and holds
+    // whether or not the file exists.
+    let truncate = open_flags
+        .contains(fs_types::OpenFlags::TRUNCATE)
+        .then(|| Ok::<_, fs_types::ErrorCode>((base.grant()?, base.grant()?)))
+        .transpose()?;
+    let create = open_flags
+        .contains(fs_types::OpenFlags::CREATE)
+        .then(|| base.grant())
+        .transpose()?;
     let absolute = child_path(base, path)?;
     let resolved = namespace
         .resolve_following(&absolute, follow_within(base, path_flags))
@@ -225,24 +237,23 @@ where
             }
             let flags =
                 effective_open_descriptor_flags(base.flags, requested, node_kind(existing.kind))?;
-            if !open_flags.contains(fs_types::OpenFlags::TRUNCATE) {
-                (existing, flags)
-            } else {
-                if existing.kind != NodeKind::File {
-                    return Err(fs_types::ErrorCode::IsDirectory);
+            match truncate {
+                None => (existing, flags),
+                Some(rights) => {
+                    if existing.kind != NodeKind::File {
+                        return Err(fs_types::ErrorCode::IsDirectory);
+                    }
+                    (truncate_file(&resolved, rights, now).await?, flags)
                 }
-                let rights = (base.grant()?, base.grant()?);
-                (truncate_file(&resolved, rights, now).await?, flags)
             }
         }
         Err(VfsError::NoEntry) => {
-            if !open_flags.contains(fs_types::OpenFlags::CREATE) {
+            let Some(mutate) = create else {
                 return Err(fs_types::ErrorCode::NoEntry);
-            }
+            };
             if open_flags.contains(fs_types::OpenFlags::DIRECTORY) {
                 return Err(fs_types::ErrorCode::Unsupported);
             }
-            let mutate = base.grant()?;
             let flags = effective_open_descriptor_flags(base.flags, requested, FsNodeKind::File)?;
             (create_file(&resolved, mutate, now).await?, flags)
         }
