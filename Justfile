@@ -137,6 +137,22 @@ test-units:
     HELIOS_BOOTFS="${out_dir}/helios-bootfs" cargo nextest run -p helios-hosted
     python3 "{{repo_root}}/x86/tests/interrupt_state.py"
 
+# Mount the EROFS images `mkfs.erofs` builds, intact and corrupted. Needs
+# erofs-utils on PATH; the `erofs-rs` builder's images run in test-units.
+test-erofs-mkfs:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    target="$(rustc -vV | sed -n 's/^host: //p')"
+    out_dir="{{repo_root}}/target/kernel-prebuild/${target}/{{default_profile}}"
+    cargo run -p helios-cli --quiet -- kernel-prebuild \
+        --out-dir "${out_dir}" \
+        --target "${target}" \
+        --profile "{{default_profile}}" \
+        --cargo cargo
+    export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
+    export HELIOS_KERNEL_ROOT_SECRET_KEY="${out_dir}/helios-root-secret.key"
+    cargo nextest run -p helios-kernel --lib --run-ignored ignored-only -E 'test(/^vfs::erofs::tests::mkfs::/)'
+
 # Generate the kernel-prebuild manifest for `target` and run `cargo clippy`
 # against it, denying warnings.
 # Usage: just clippy-target riscv64gc-unknown-none-elf helios-riscv
