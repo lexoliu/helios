@@ -22,7 +22,13 @@ def context():
     return runner.RenderContext(
         repo_root=GUEST_ROOT,
         wasmtime_bin=str(GUEST_ROOT / "tools/wasmtime"),
-        hosts=runner.HostEndpoints("http://10.0.2.2:80/payload.txt", "10.0.2.2", 5000, 5001),
+        hosts=runner.HostEndpoints(
+            "http://10.0.2.2:80/payload.txt",
+            "10.0.2.2",
+            tcp_port=5000,
+            tcp_upload_port=5002,
+            tcp_echo_port=5001,
+        ),
         workdir=Path("/tmp/work"),
     )
 
@@ -101,7 +107,7 @@ def test_tcp_rows_share_the_wasi_client_with_the_row_label(context) -> None:
     client = str(GUEST_ROOT / "artifacts/wasi-tools/wasi-tcp-throughput.wasm.cwasm")
     for name, tail in (
         ("tcp-throughput", ["10.0.2.2", "5000", "67108864", "--label", "tcp-throughput"]),
-        ("tcp-upload", ["10.0.2.2", "5000", "67108864", "up", "--label", "tcp-upload"]),
+        ("tcp-upload", ["10.0.2.2", "5002", "67108864", "up", "--label", "tcp-upload"]),
         ("wasix-tcp-throughput", ["10.0.2.2", "5000", "67108864", "--label", "wasix-tcp-throughput"]),
     ):
         workload = runner.selected_workload(load_workloads(), name)
@@ -171,6 +177,7 @@ def test_the_guest_runner_parses_the_command_the_host_driver_builds() -> None:
         "http://10.77.0.1:80/payload.txt",
         "10.77.0.1",
         5000,
+        5002,
         5001,
         "linux-native.jsonl",
         "linux_native",
@@ -187,6 +194,7 @@ def test_the_guest_runner_parses_the_command_the_host_driver_builds() -> None:
     assert args.keep_going is True
     assert args.side_timeout_seconds == 5400
     assert args.workloads == ["quickjs-loop", "hostcall-loop"]
+    assert (args.host_tcp_port, args.host_tcp_upload_port, args.host_tcp_echo_port) == (5000, 5002, 5001)
 
 
 def test_a_hung_workload_becomes_a_failed_cell_instead_of_holding_the_side() -> None:

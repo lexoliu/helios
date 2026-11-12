@@ -186,6 +186,14 @@ class RunInfo(BaseModel):
             "the cargo profile the `helios_baseline` kernel was built with, when the run was paired"
         ),
     )
+    prebuilt: bool = Field(
+        default=False,
+        description=(
+            "the host compiled nothing: the kernel, the tooling and the native counterparts were "
+            "put in place beforehand, so `helios_git_sha` is the checkout the run read its "
+            "manifests from, not a statement of what built them"
+        ),
+    )
     retaken: list[str] = Field(
         default_factory=list,
         description="headline workloads timed again on every Helios image after a dispersed first pass",

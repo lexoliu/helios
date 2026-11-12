@@ -798,10 +798,12 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         debug_state.install_root_entropy(root.clone());
         // The calendar is read once, on the bootstrap hart, before any
         // component can ask what time it is. The hart timer carries wall
-        // time forward from that reading; nothing re-synchronises it.
-        match rtc::discover(&fdt) {
+        // time forward from that reading; only a machine restore re-reads
+        // it, which the reactions task does with the same clock.
+        let rtc = rtc::discover(&fdt);
+        match &rtc {
             Some(rtc) => {
-                debug_state.seed_wall_clock(cpu.now().ticks(), &rtc);
+                debug_state.seed_wall_clock(cpu.now().ticks(), rtc);
             }
             None => {
                 tracing::warn!(
@@ -809,6 +811,7 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
                 );
             }
         }
+        helios_kernel::install_generation_reactions(&kernel, debug_state.clone(), rtc);
         root
     });
     // Only the bootstrap hart brings devices up, and it is the hart

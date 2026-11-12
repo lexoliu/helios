@@ -72,8 +72,15 @@ on:
 # dispatch. The event is part of the group because a push to `dev` runs
 # only `tooling`, and in one group with a dispatched measurement it
 # cancelled that measurement hours in (#318).
+#
+# A label other than `bench` runs nothing (`tooling` skips, and every
+# other job needs it) and takes a group of its own, so it cannot cancel a
+# measurement hours in (#687).
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  group: >-
+    ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}${{
+      github.event.action == 'labeled' && github.event.label.name != 'bench'
+      && format('-label-{0}', github.run_id) || '' }}
   cancel-in-progress: true
 
 permissions:
@@ -87,6 +94,7 @@ env:
 jobs:
   tooling:
     name: tooling
+    if: github.event.action != 'labeled' || github.event.label.name == 'bench'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     outputs:

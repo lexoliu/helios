@@ -53,6 +53,7 @@ def run_side(
         skip_build=False,
         control_workload=None,
         keep_going=True,
+        profile_boot=False,
     )
     return log, time.monotonic() - started
 
