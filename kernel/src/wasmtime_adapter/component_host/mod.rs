@@ -60,6 +60,7 @@ const NET_INSTANCE: &str = "helios:system/net@0.1.0";
 const TRACING_INSTANCE: &str = "helios:system/tracing@0.1.0";
 const PROFILING_INSTANCE: &str = "helios:system/profiling@0.1.0";
 const INSTANCES_INSTANCE: &str = "helios:system/instances@0.1.0";
+const SNAPSHOT_INSTANCE: &str = "helios:system/snapshot@0.1.0";
 /// The share of the machine's free memory the compiled-component cache
 /// may hold.
 ///
@@ -80,9 +81,13 @@ fn lower_bytes_to_vec(bytes: Bytes) -> Vec<u8> {
 
 mod device;
 pub(crate) use device::record_linear_memory;
+mod pending;
+pub(crate) use pending::PendingReply;
 pub mod service;
 mod topology;
+mod views;
 mod vsock;
+pub(crate) use views::{guest_memory, view_trap};
 
 pub use service::{
     BlobHandle, ChildExit, ChildHandle, ClientSurfaceHandle, CommandBufferHandle, ContextHandle,
@@ -113,6 +118,7 @@ pub type StoreData<CpuImpl, Net, HostFs> = ComponentStoreData<
     HostRuntimeState<CpuImpl, Net, HostFs>,
     crate::wasmtime_adapter::wasi::DebugFileSystem<HostRuntimeState<CpuImpl, Net, HostFs>, HostFs>,
     ResourceTable,
+    wasmtime::Memory,
 >;
 pub type OutputMode = ComponentOutputMode;
 pub type OutputRoute = ComponentOutputRoute;
@@ -1804,6 +1810,7 @@ where
     service::add_gpu_to_linker(linker)?;
     service::add_audio_to_linker(linker)?;
     add_instances_to_linker(linker)?;
+    add_snapshot_to_linker(linker)?;
     add_tracing_to_linker(linker)?;
     debugger_profiling::add_to_linker(linker)?;
     Ok(())
@@ -3634,6 +3641,46 @@ where
             KillOutcome::NoSuchInstance => Err(debugger_wit::instances::KillError::NoSuchInstance),
         },))
     })?;
+    Ok(())
+}
+
+fn add_snapshot_to_linker<CpuImpl, Net, HostFs>(
+    linker: &mut Linker<StoreData<CpuImpl, Net, HostFs>>,
+) -> wasmtime::Result<()>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    HostFs: crate::HostFileSystem,
+{
+    let mut instance = linker.instance(SNAPSHOT_INSTANCE)?;
+    instance.func_wrap_concurrent(
+        "prepare",
+        |accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>, (): ()| {
+            Box::pin(async move {
+                let (host_fs, has_generation_id) = accessor.with(|mut access| {
+                    let state = &access.get().runtime_state;
+                    (
+                        state.host_fs_service(),
+                        state.machine_generation().has_window(),
+                    )
+                });
+                // A machine with no host share has nothing to release.
+                if let Some(host_fs) = host_fs {
+                    host_fs.prepare_snapshot().await;
+                }
+                Ok::<_, wasmtime::Error>((debugger_wit::snapshot::Prepared { has_generation_id },))
+            })
+        },
+    )?;
+    instance.func_wrap(
+        "finished",
+        |caller: StoreContextMut<'_, StoreData<CpuImpl, Net, HostFs>>, (): ()| {
+            if let Some(host_fs) = caller.data().runtime_state.host_fs_service() {
+                host_fs.snapshot_finished();
+            }
+            Ok(())
+        },
+    )?;
     Ok(())
 }
 

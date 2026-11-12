@@ -3784,6 +3784,7 @@ where
         initial_sequence: u32,
     ) -> Result<SocketId, StackError> {
         self.ensure_tcp_connect_unique(local, remote)?;
+        self.ensure_tcp_slot_free()?;
         let socket = TcpSocket::connect(local, remote, initial_sequence, self.congestion.clone());
         Ok(self.insert_tcp(socket))
     }
@@ -3797,6 +3798,7 @@ where
         if backlog.capacity() > MAX_TCP_ACCEPT {
             return Err(StackError::InvalidListenBacklog);
         }
+        self.ensure_tcp_slot_free()?;
         let socket = TcpSocket::listen(local, self.congestion.clone());
         let socket = self.insert_tcp(socket);
         self.tcp_listener_queues.insert(socket, backlog);
@@ -6345,6 +6347,17 @@ where
         let id = self.tcp.insert(socket);
         self.schedule_tcp_timer(socket_index(id));
         id
+    }
+
+    /// Refuses an open the slab cannot hold. The slab's own panic stays
+    /// for a corrupt free list: a full slab is reachable by a guest, so
+    /// it is an error here, the way the inbound SYN path asks first.
+    fn ensure_tcp_slot_free(&self) -> Result<(), StackError> {
+        if self.tcp.has_free_slot() {
+            Ok(())
+        } else {
+            Err(StackError::TcpSocketsExhausted)
+        }
     }
 
     fn ensure_tcp_connect_unique(
@@ -12831,6 +12844,134 @@ mod tests {
                 .open_tcp_connect(local_endpoint, remote_endpoint, 99)
                 .is_ok(),
             "and its local port is free again"
+        );
+    }
+
+    /// A slab that orphans fill is the stack's to report, not to panic
+    /// on: a close keeps its socket for the whole of `TIME-WAIT`, so a
+    /// guest that opens and closes faster than 2MSL drains reaches a
+    /// full slab through calls it is entitled to make.
+    #[test]
+    fn tcp_open_reports_a_full_slab_of_time_wait_orphans() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
+        stack.learn_neighbor(NeighborEntry {
+            ip: IpAddress::Ipv4(peer),
+            mac: PEER_MAC,
+            state: NeighborState::Reachable,
+            updated_at: StackInstant::from_nanos(0),
+        });
+        let remote_endpoint = TcpEndpoint {
+            address: IpAddress::Ipv4(peer),
+            port: 80,
+        };
+        let endpoint_for = |index: usize| TcpEndpoint {
+            address: IpAddress::Ipv4(local),
+            port: 40_000 + u16::try_from(index).expect("slab index fits a port offset"),
+        };
+        let receive = |stack: &mut Stack, port: u16, header: TcpHeader, now: u64| {
+            let (segment, len) = tcp_segment(
+                peer,
+                local,
+                TcpHeader {
+                    destination_port: port,
+                    ..header
+                },
+            );
+            stack
+                .receive_tcp(
+                    IpAddress::Ipv4(peer),
+                    IpAddress::Ipv4(local),
+                    &Bytes::copy_from_slice(&segment[..len]),
+                    RxFrameOffload::none(),
+                    StackInstant::from_nanos(now),
+                )
+                .expect("the peer's segment should be accepted");
+        };
+
+        for index in 0..MAX_TCP_SOCKETS {
+            let local_endpoint = endpoint_for(index);
+            let socket = stack
+                .open_tcp_connect(local_endpoint, remote_endpoint, 7)
+                .expect("a slot is free while the slab is filling");
+            receive(
+                &mut stack,
+                local_endpoint.port,
+                TcpHeader {
+                    source_port: 80,
+                    destination_port: 0,
+                    sequence: 100,
+                    acknowledgement: 8,
+                    flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                    window_size: u16::MAX,
+                },
+                1,
+            );
+            assert_eq!(
+                stack.close_tcp_socket(socket, StackInstant::from_nanos(2)),
+                Ok(TcpCloseOutcome::Finishing)
+            );
+            stack
+                .drive_tcp(StackInstant::from_nanos(2))
+                .expect("the close should queue a FIN");
+            let mut fin_sequence = None;
+            while let Some((flags, sequence, _)) = take_tcp_segment(&mut stack) {
+                if flags.contains(TcpFlags::FIN) {
+                    fin_sequence = Some(sequence);
+                }
+            }
+            receive(
+                &mut stack,
+                local_endpoint.port,
+                TcpHeader {
+                    source_port: 80,
+                    destination_port: 0,
+                    sequence: 101,
+                    acknowledgement: fin_sequence
+                        .expect("the close owes its peer a FIN")
+                        .wrapping_add(1),
+                    flags: TcpFlags::ACK.union(TcpFlags::FIN),
+                    window_size: u16::MAX,
+                },
+                3,
+            );
+            while stack.take_outbound().is_some() {}
+            while stack.take_event().is_some() {}
+        }
+
+        assert_eq!(
+            stack.open_tcp_connect(endpoint_for(MAX_TCP_SOCKETS), remote_endpoint, 7),
+            Err(StackError::TcpSocketsExhausted)
+        );
+        assert_eq!(
+            stack.open_tcp_listen(
+                TcpEndpoint {
+                    address: IpAddress::Ipv4(local),
+                    port: 8080,
+                },
+                TcpListenBacklog::try_new(1).expect("a backlog of one is representable"),
+            ),
+            Err(StackError::TcpSocketsExhausted)
+        );
+
+        stack
+            .drive_tcp(StackInstant::from_nanos(
+                3 + crate::tcp::TCP_TIME_WAIT_NANOS,
+            ))
+            .expect("the 2MSL timers should expire");
+        assert!(
+            stack
+                .open_tcp_connect(endpoint_for(MAX_TCP_SOCKETS), remote_endpoint, 7)
+                .is_ok(),
+            "the slots come back once TIME-WAIT drains"
         );
     }
 

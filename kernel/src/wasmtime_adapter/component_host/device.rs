@@ -2,11 +2,11 @@
 //!
 //! This is the whole of what a user-mode driver sees of its hardware.
 //! Everything it does here is bookkeeping the kernel owns — claiming a
-//! device, mapping a region, pinning a buffer, acknowledging an
+//! device, showing a region, pinning a buffer, acknowledging an
 //! interrupt — and none of it is on the path a driver takes to a
 //! register. Registers are reached by loading and storing in the
-//! driver's own linear memory, at the offset `map-region` reports,
-//! because the kernel mapped the device's frames there.
+//! driver's own linear memory, at the span it gave `map-region`,
+//! because the kernel showed the device's frames there.
 //!
 //! The lease lives in the instance's store, so it is single-owned: the
 //! resource handles a driver holds carry the device's name to check
@@ -17,7 +17,8 @@
 //! # Concurrency contract
 //!
 //! Every call here runs on the task that owns the store, so the lease
-//! needs no lock. The interrupt stream is the one place another
+//! and the view table need no lock, and every span is substituted by
+//! that task alone. The interrupt stream is the one place another
 //! processor is involved: the relay is written from interrupt context
 //! and read here, and it carries its own synchronisation. The stream's
 //! producer arms its wake-up through the relay before it inspects the
@@ -32,19 +33,16 @@ use core::task::{Context, Poll};
 
 use helios_hal::cpu::Cpu;
 use helios_hal::device::{DeviceRegion, MemoryKind};
-use helios_hal::vmm::VirtAddr;
 use wasmtime::StoreContextMut;
 use wasmtime::component::{
     Access, Destination, HasSelf, Linker, Resource, StreamProducer, StreamReader, StreamResult,
 };
 
+use crate::buffer::{Span, ViewError};
 use crate::wasmtime_adapter::bindings::device::bindings::helios::system::device as device_wit;
-use crate::{
-    DeviceName, DmaBufferHandle, GrantError, GrantHandle, InterruptRelay, LinearMemory,
-    NotifyWaiter,
-};
+use crate::{DeviceName, DmaBufferHandle, GrantError, GrantHandle, InterruptRelay, NotifyWaiter};
 
-use super::StoreData;
+use super::{StoreData, guest_memory, view_trap};
 
 /// Register `helios:system/device` in a linker.
 ///
@@ -65,17 +63,18 @@ where
     device_wit::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, HostFs>>>(linker, |state| state)
 }
 
-/// Record where an instance's linear memory landed.
+/// Record the runtime's handle on an instance's linear memory.
 ///
 /// Called once, right after the instance is built, on every component
-/// the kernel runs. It is two numbers and no allocation, and doing it
-/// here is what lets a later `claim` be an ordinary host call: the base
-/// address a device window is measured from is already known by the
-/// time a driver asks for one.
+/// the kernel runs. Every call that later takes a span reads the
+/// memory's base and current size through this handle at the moment of
+/// the call.
 ///
-/// An instance whose component has no linear memory records nothing.
-/// It could not see a register even if it were given one, and its claim
-/// is refused when it makes one rather than here, where nobody asked.
+/// A component that lowers through a shared memory, or through more
+/// than one, records nothing: the runtime does not hand a shared memory
+/// back as an unshared one, and every span such an instance names is
+/// refused, because nothing may be shown in memory another processor
+/// is running code against.
 pub(crate) fn record_linear_memory<CpuImpl, Net, HostFs>(
     mut store: impl wasmtime::AsContextMut<Data = StoreData<CpuImpl, Net, HostFs>>,
     instance: &wasmtime::component::Instance,
@@ -84,23 +83,12 @@ pub(crate) fn record_linear_memory<CpuImpl, Net, HostFs>(
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    let Some(memory) = instance.get_default_memory(store.as_context_mut()) else {
-        return;
-    };
-    let data = memory.data(store.as_context());
-    let base = VirtAddr::new(data.as_ptr() as usize);
-    let bytes = data.len() as u64;
-    let mut context = store.as_context_mut();
-    let device = &mut context.data_mut().device;
-    device.set_memory(LinearMemory {
-        base,
-        // Every linear memory the kernel builds gets the one reservation
-        // profile the engine configures, and the compiled code depends
-        // on it, so this is the machine's answer rather than this
-        // instance's.
-        reservation_bytes: helios_artifact::CWASM_MEMORY_RESERVATION,
-    });
-    device.note_growth(bytes);
+    let memory = instance.get_default_memory(store.as_context_mut());
+    store.as_context_mut().data_mut().linear_memory = memory;
+}
+
+const fn span(at: device_wit::Span) -> Span {
+    Span::new(at.offset, at.length)
 }
 
 fn to_wit_error(error: GrantError) -> device_wit::Error {
@@ -108,23 +96,30 @@ fn to_wit_error(error: GrantError) -> device_wit::Error {
         GrantError::NotFound | GrantError::NameTooLong => device_wit::Error::NotFound,
         GrantError::AlreadyClaimed => device_wit::Error::AlreadyClaimed,
         GrantError::NoSuchRegion | GrantError::NoSuchInterrupt => device_wit::Error::NoSuchIndex,
-        GrantError::WindowExhausted => device_wit::Error::WindowExhausted,
-        GrantError::BudgetExhausted => device_wit::Error::BudgetExhausted,
+        GrantError::RegionAlreadyMapped => device_wit::Error::AlreadyMapped,
+        GrantError::View(error) if error.is_bad_span() => device_wit::Error::BadSpan,
+        // A store that holds as many views as it may is a driver asking
+        // for more than the kernel set aside for it.
+        GrantError::BudgetExhausted | GrantError::View(ViewError::TooManyViews) => {
+            device_wit::Error::BudgetExhausted
+        }
         GrantError::BadAlignment => device_wit::Error::BadAlignment,
         GrantError::EmptyRequest => device_wit::Error::EmptyRequest,
         GrantError::Unreachable => device_wit::Error::Unreachable,
         // Everything left is a defect a driver cannot do anything
         // about: a grant that was built wrong, a registry that was
-        // full, a backend that wired no platform surface. The driver is
-        // told its mapping failed, and the kernel's log says which.
+        // full, a backend that wired no platform surface, a pool with no
+        // run left, an address space that refused a span the kernel had
+        // checked. The driver is told its mapping failed, and the
+        // kernel's log says which.
         GrantError::TooManyRegions
         | GrantError::TooManyInterrupts
         | GrantError::RegionNotFrameAligned
         | GrantError::RegistryFull
         | GrantError::DuplicateName
         | GrantError::PlatformUnavailable
-        | GrantError::RegionAlreadyMapped
-        | GrantError::AddressSpace(_) => device_wit::Error::MappingFailed,
+        | GrantError::View(_)
+        | GrantError::Buffer(_) => device_wit::Error::MappingFailed,
     }
 }
 
@@ -182,7 +177,7 @@ where
             return Ok(Err(device_wit::Error::NotFound));
         };
         let registry = self.runtime_state.device_grants();
-        if let Err(error) = self.device.claim(registry, cap) {
+        if let Err(error) = self.device.claim(registry, cap, &mut self.views) {
             tracing::warn!(
                 target: "helios_kernel::device",
                 device = name.as_str(),
@@ -238,24 +233,6 @@ where
         Ok(lease.grant().regions().iter().map(to_wit_region).collect())
     }
 
-    fn map_region(
-        &mut self,
-        handle: Resource<GrantHandle>,
-        index: u32,
-    ) -> wasmtime::Result<Result<device_wit::Placement, device_wit::Error>> {
-        let device = *self.table.get(&handle)?.device();
-        let placed = self
-            .device
-            .lease_for_mut(&device)
-            .and_then(|lease| lease.map_region(index as usize));
-        Ok(placed
-            .map(|region| device_wit::Placement {
-                offset: region.offset,
-                length: region.bytes,
-            })
-            .map_err(to_wit_error))
-    }
-
     fn interrupt_count(&mut self, handle: Resource<GrantHandle>) -> wasmtime::Result<u32> {
         let device = *self.table.get(&handle)?.device();
         let lease = self.device.lease_for_mut(&device).map_err(stale(&device))?;
@@ -286,24 +263,6 @@ where
         self.with_relay(handle, |relay| relay.unmask(index as usize))
     }
 
-    fn dma_alloc(
-        &mut self,
-        handle: Resource<GrantHandle>,
-        bytes: u64,
-        align: u64,
-    ) -> wasmtime::Result<Result<Resource<DmaBufferHandle>, device_wit::Error>> {
-        let device = *self.table.get(&handle)?.device();
-        let buffer = self
-            .device
-            .lease_for_mut(&device)
-            .and_then(|lease| lease.dma_alloc(bytes, align));
-        let buffer = match buffer {
-            Ok(buffer) => buffer,
-            Err(error) => return Ok(Err(to_wit_error(error))),
-        };
-        Ok(Ok(self.table.push(DmaBufferHandle::new(device, buffer))?))
-    }
-
     fn confined(&mut self, handle: Resource<GrantHandle>) -> wasmtime::Result<bool> {
         let device = *self.table.get(&handle)?.device();
         let lease = self.device.lease_for_mut(&device).map_err(stale(&device))?;
@@ -313,15 +272,15 @@ where
     fn drop(&mut self, handle: Resource<GrantHandle>) -> wasmtime::Result<()> {
         let handle = self.table.delete(handle)?;
         // Dropping the handle is a driver saying it is done with the
-        // device, and it costs exactly what dying costs: every source
-        // masked, every region unmapped, every pin released, before the
-        // device is offered to anyone else.
+        // device, and it costs exactly what dying costs: every view of
+        // it ended, every source masked, every ring released, before
+        // the device is offered to anyone else.
         if self
             .device
             .lease()
             .is_some_and(|lease| lease.grant().name() == handle.device())
         {
-            self.device.release();
+            self.device.release(&mut self.views).map_err(view_trap)?;
         }
         Ok(())
     }
@@ -333,23 +292,15 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    fn offset(&mut self, handle: Resource<DmaBufferHandle>) -> wasmtime::Result<u64> {
-        Ok(self.table.get(&handle)?.buffer().offset)
-    }
-
-    fn length(&mut self, handle: Resource<DmaBufferHandle>) -> wasmtime::Result<u64> {
-        Ok(self.table.get(&handle)?.buffer().bytes)
-    }
-
     fn physical_address(&mut self, handle: Resource<DmaBufferHandle>) -> wasmtime::Result<u64> {
         Ok(self.table.get(&handle)?.buffer().device_address)
     }
 
     fn drop(&mut self, handle: Resource<DmaBufferHandle>) -> wasmtime::Result<()> {
-        // The pin belongs to the lease and is released with it, so
-        // dropping the handle only forgets the descriptor. A driver
-        // builds its rings once and holds them for as long as it holds
-        // the device.
+        // The ring belongs to the lease and is shown for as long as the
+        // grant lives, so dropping the handle only forgets the
+        // descriptor. A driver builds its rings once and holds them for
+        // as long as it holds the device.
         self.table.delete(handle)?;
         Ok(())
     }
@@ -488,6 +439,58 @@ where
         let device = *accessor.get().table.get(&handle)?.device();
         StreamReader::new(&mut accessor, InterruptStreamProducer::new(getter, device))
     }
+
+    fn map_region(
+        mut accessor: Access<'_, U, Self>,
+        handle: Resource<GrantHandle>,
+        index: u32,
+        at: device_wit::Span,
+    ) -> wasmtime::Result<Result<(), device_wit::Error>> {
+        let data = accessor.get();
+        let device = *data.table.get(&handle)?.device();
+        let linear_memory = data.linear_memory;
+        // Read now, at the call: the span is checked against the size
+        // the memory has at this moment, not when it was built.
+        let memory = guest_memory(linear_memory, &accessor);
+        let data = accessor.get();
+        let lease = match data.device.lease_for_mut(&device) {
+            Ok(lease) => lease,
+            Err(error) => return Ok(Err(to_wit_error(error))),
+        };
+        let memory = match memory {
+            Ok(memory) => memory,
+            Err(error) => return Ok(Err(to_wit_error(GrantError::View(error)))),
+        };
+        Ok(lease
+            .map_region(index as usize, &mut data.views, memory, span(at))
+            .map_err(to_wit_error))
+    }
+
+    fn dma_alloc(
+        mut accessor: Access<'_, U, Self>,
+        handle: Resource<GrantHandle>,
+        align: u64,
+        at: device_wit::Span,
+    ) -> wasmtime::Result<Result<Resource<DmaBufferHandle>, device_wit::Error>> {
+        let data = accessor.get();
+        let device = *data.table.get(&handle)?.device();
+        let linear_memory = data.linear_memory;
+        let memory = guest_memory(linear_memory, &accessor);
+        let data = accessor.get();
+        let lease = match data.device.lease_for_mut(&device) {
+            Ok(lease) => lease,
+            Err(error) => return Ok(Err(to_wit_error(error))),
+        };
+        let memory = match memory {
+            Ok(memory) => memory,
+            Err(error) => return Ok(Err(to_wit_error(GrantError::View(error)))),
+        };
+        let buffer = match lease.dma_alloc(align, &mut data.views, memory, span(at)) {
+            Ok(buffer) => buffer,
+            Err(error) => return Ok(Err(to_wit_error(error))),
+        };
+        Ok(Ok(data.table.push(DmaBufferHandle::new(device, buffer))?))
+    }
 }
 
 /// What a component sees when it calls `device.available` and
@@ -499,17 +502,14 @@ mod tests {
 
     use helios_hal::device::DmaCapability;
     use helios_hal::iommu::DmaTranslation;
-    use helios_hal::vmm::VirtAddr;
 
     use super::device_wit as contract;
     use crate::device::test_hooks;
     use crate::wasmtime_adapter::component_host::service::test_store;
-    use crate::{DeviceGrant, DeviceName, DmaBudget, LinearMemory, ProcessAuthority};
+    use crate::{DeviceGrant, DeviceName, DmaBudget, ProcessAuthority};
 
     const PUBLISHED: &str = "test:alpha";
     const OTHER: &str = "test:beta";
-    const RESERVATION_BYTES: u64 = 1 << 32;
-    const MEMORY_BASE: usize = 0x1_0000_0000;
 
     fn grant(name: &str) -> DeviceGrant {
         DeviceGrant::new(
@@ -529,17 +529,12 @@ mod tests {
     /// devices.
     fn store_under(authority: ProcessAuthority) -> test_store::TestStoreData {
         test_hooks::install();
-        let mut data = test_store::store_data_authorized(authority, |runtime_state| {
+        test_store::store_data_authorized(authority, |runtime_state| {
             runtime_state
                 .device_grants()
                 .publish([grant(PUBLISHED), grant(OTHER)])
                 .expect("discovery publishes once");
-        });
-        data.device.set_memory(LinearMemory {
-            base: VirtAddr::new(MEMORY_BASE),
-            reservation_bytes: RESERVATION_BYTES,
-        });
-        data
+        })
     }
 
     fn claim(data: &mut test_store::TestStoreData, name: &str) -> Result<(), contract::Error> {

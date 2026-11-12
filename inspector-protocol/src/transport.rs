@@ -13,7 +13,7 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, Re
 use tokio::sync::futures::Notified;
 use tokio::sync::{Mutex, Notify, mpsc};
 
-use crate::error::TransportError;
+use crate::error::{TransportError, WireError};
 use crate::wire::{Frame, read_frame, write_frame};
 
 /// Transport-level result with structured error provenance.
@@ -28,11 +28,80 @@ type ServeFuture = Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>>;
 type InvocationAccept<R, W> = Result<((), Outgoing<R, W>, Incoming<R, W>)>;
 const RAW_UPLOAD_CHUNK_BYTES: usize = 64 * 1024;
 
+/// Most undelivered inbound payload bytes one invocation holds before the
+/// peer is failed for it.
+///
+/// Every sender in the protocol emits frames of at most
+/// [`RAW_UPLOAD_CHUNK_BYTES`] (the guest's `RESPONSE_CHUNK_BYTES` in
+/// `system/server.rs` is the same 64 KiB), and the protocol has no
+/// per-invocation flow control, so a response of any size arrives as a
+/// burst of such frames. Every call in the protocol is read by
+/// `invoke_raw_chunked`, which drains a path in the same poll that its
+/// wake-up announces, so what an invocation holds is only what the single
+/// reader routes between a wake-up and the consumer's next poll. The bound
+/// is 256 chunks, 16 MiB: far above that lag, and far below what a peer
+/// that never reads its answer could otherwise make the host hold.
+const MAX_UNDELIVERED_BYTES: usize = 256 * RAW_UPLOAD_CHUNK_BYTES;
+
+/// Most distinct paths one invocation holds inbound state for.
+///
+/// `Incoming` and `Outgoing` are only ever built at the root path, so the
+/// root is the only path a peer has any reason to address; the guest's own
+/// request loop rejects every nested path outright.
+const MAX_INBOUND_PATHS: usize = 1;
+
+/// How an invocation failed, kept typed until a waiter observes it as an
+/// `io::Error`.
+enum Fault {
+    /// The remote's own message, or the reason the connection ended.
+    Remote(String),
+    /// The peer broke a limit of the wire format.
+    Wire(WireError),
+}
+
+impl Fault {
+    fn to_io(&self) -> io::Error {
+        match self {
+            Self::Remote(message) => io::Error::other(message.clone()),
+            Self::Wire(error) => error.clone().into(),
+        }
+    }
+}
+
 #[derive(Default)]
 struct InboundBuffers {
     chunks: HashMap<Vec<usize>, VecDeque<Bytes>>,
     closed: HashSet<Vec<usize>>,
-    error: Option<String>,
+    /// Payload bytes in `chunks`, which `MAX_UNDELIVERED_BYTES` bounds.
+    undelivered_bytes: usize,
+    error: Option<Fault>,
+}
+
+impl InboundBuffers {
+    /// Whether `path` is one this invocation already holds or has room
+    /// to hold.
+    fn admits_path(&self, path: &[usize]) -> bool {
+        let closed_only = self
+            .closed
+            .iter()
+            .filter(|closed| !self.chunks.contains_key(closed.as_slice()))
+            .count();
+        self.chunks.contains_key(path)
+            || self.closed.contains(path)
+            || self.chunks.len() + closed_only < MAX_INBOUND_PATHS
+    }
+
+    /// Fails the invocation with the peer's wire fault and releases
+    /// everything it was holding, so the failure is what the next reader
+    /// of any path finds. The first failure stands.
+    fn fail_wire(&mut self, error: WireError) {
+        if self.error.is_none() {
+            self.error = Some(Fault::Wire(error));
+        }
+        self.chunks.clear();
+        self.closed.clear();
+        self.undelivered_bytes = 0;
+    }
 }
 
 enum InvocationOwner<R, W> {
@@ -374,13 +443,32 @@ impl<R, W> Invocation<R, W> {
         invocation
     }
 
+    /// Files an inbound payload, or fails this invocation if the peer has
+    /// exceeded what one invocation may hold. Once the invocation has
+    /// failed, later frames for it are discarded: nobody is left to read
+    /// them, and they must not grow what is held.
     fn push_payload(&self, path: Vec<usize>, payload: Bytes) {
         {
             let mut inbound = self
                 .inbound
                 .lock()
                 .unwrap_or_else(|_| panic!("invocation inbound buffer mutex poisoned"));
-            inbound.chunks.entry(path).or_default().push_back(payload);
+            if inbound.error.is_some() {
+                return;
+            }
+            if !inbound.admits_path(&path) {
+                inbound.fail_wire(self.too_many_paths());
+            } else if inbound.undelivered_bytes + payload.len() > MAX_UNDELIVERED_BYTES {
+                let held = inbound.undelivered_bytes + payload.len();
+                inbound.fail_wire(WireError::InboundBacklogExceeded {
+                    invocation: self.id,
+                    held,
+                    max: MAX_UNDELIVERED_BYTES,
+                });
+            } else {
+                inbound.undelivered_bytes += payload.len();
+                inbound.chunks.entry(path).or_default().push_back(payload);
+            }
         }
         self.progress.notify_waiters();
     }
@@ -391,9 +479,23 @@ impl<R, W> Invocation<R, W> {
                 .inbound
                 .lock()
                 .unwrap_or_else(|_| panic!("invocation inbound buffer mutex poisoned"));
-            inbound.closed.insert(path);
+            if inbound.error.is_some() {
+                return;
+            }
+            if inbound.admits_path(&path) {
+                inbound.closed.insert(path);
+            } else {
+                inbound.fail_wire(self.too_many_paths());
+            }
         }
         self.progress.notify_waiters();
+    }
+
+    fn too_many_paths(&self) -> WireError {
+        WireError::TooManyInboundPaths {
+            invocation: self.id,
+            max: MAX_INBOUND_PATHS,
+        }
     }
 
     fn pop_payload(&self, path: &[usize]) -> Option<Bytes> {
@@ -405,6 +507,9 @@ impl<R, W> Invocation<R, W> {
         let chunk = queue.pop_front();
         if queue.is_empty() {
             inbound.chunks.remove(path);
+        }
+        if let Some(chunk) = &chunk {
+            inbound.undelivered_bytes -= chunk.len();
         }
         chunk
     }
@@ -461,7 +566,7 @@ impl<R, W> Invocation<R, W> {
                 .lock()
                 .unwrap_or_else(|_| panic!("invocation inbound buffer mutex poisoned"));
             if inbound.error.is_none() {
-                inbound.error = Some(message);
+                inbound.error = Some(Fault::Remote(message));
             }
         }
         self.progress.notify_waiters();
@@ -473,16 +578,17 @@ impl<R, W> Invocation<R, W> {
         if self.has_payload(path) || self.is_closed(path) {
             return Some(Ok(()));
         }
-        self.error_message()
-            .map(|message| Err(io::Error::other(message)))
+        self.failure().map(Err)
     }
 
-    fn error_message(&self) -> Option<String> {
+    /// The error a waiter observes once this invocation has failed.
+    fn failure(&self) -> Option<io::Error> {
         self.inbound
             .lock()
             .unwrap_or_else(|_| panic!("invocation inbound buffer mutex poisoned"))
             .error
-            .clone()
+            .as_ref()
+            .map(Fault::to_io)
     }
 }
 
@@ -639,8 +745,8 @@ where
             if self.invocation.is_closed(self.path.as_ref()) {
                 return Poll::Ready(Ok(()));
             }
-            if let Some(message) = self.invocation.error_message() {
-                return Poll::Ready(Err(io::Error::other(message)));
+            if let Some(error) = self.invocation.failure() {
+                return Poll::Ready(Err(error));
             }
 
             {
@@ -1195,15 +1301,16 @@ fn decode_path(path: &[u32]) -> io::Result<Vec<usize>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Client, RAW_UPLOAD_CHUNK_BYTES, Server};
+    use super::{Client, MAX_INBOUND_PATHS, MAX_UNDELIVERED_BYTES, RAW_UPLOAD_CHUNK_BYTES, Server};
+    use crate::error::WireError;
     use bytes::Bytes;
     use futures_lite::StreamExt as _;
     use futures_lite::future::poll_once;
     use futures_util::future::join;
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, DuplexStream, ReadHalf, WriteHalf};
     use tokio::sync::Notify;
     use tokio::time::{Duration, timeout};
-    use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
+    use tokio_util::compat::{Compat, TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
 
     /// How long the second of two concurrently held invocations may go
     /// unanswered. Long enough that a loaded machine does not fail it,
@@ -1979,5 +2086,242 @@ mod tests {
                 .unwrap_or_else(|error| panic!("failed to read the parked response: {error}"));
                 assert_eq!(response, b"answered");
             });
+    }
+
+    type TestRead = Compat<ReadHalf<DuplexStream>>;
+    type TestWrite = Compat<WriteHalf<DuplexStream>>;
+
+    /// A client wired to a raw peer the test drives frame by frame, the
+    /// way a misbehaving guest would.
+    struct RawPeer {
+        client: Client<TestRead, TestWrite>,
+        read: TestRead,
+        write: TestWrite,
+    }
+
+    impl RawPeer {
+        fn new() -> Self {
+            let (guest, host) = tokio::io::duplex(4096);
+            let (guest_read, guest_write) = tokio::io::split(guest);
+            let (host_read, host_write) = tokio::io::split(host);
+            Self {
+                client: Client::new(host_read.compat(), host_write.compat_write()),
+                read: guest_read.compat(),
+                write: guest_write.compat_write(),
+            }
+        }
+
+        /// Opens one invocation and answers its `Open` with an accept.
+        async fn open(
+            &mut self,
+            func: &str,
+            id: u32,
+        ) -> (
+            super::Outgoing<TestRead, TestWrite>,
+            super::Incoming<TestRead, TestWrite>,
+        ) {
+            let guest = async {
+                match super::read_frame(&mut self.read)
+                    .await
+                    .unwrap_or_else(|error| panic!("failed to read the {func} open: {error}"))
+                {
+                    Some(super::Frame::Open { invocation, .. }) => assert_eq!(invocation, id),
+                    other => panic!("unexpected {func} open frame: {other:?}"),
+                }
+                super::write_frame(&mut self.write, &super::Frame::Accept { invocation: id })
+                    .await
+                    .unwrap_or_else(|error| panic!("failed to accept {func}: {error}"));
+            };
+            let (opened, ()) = join(
+                self.client
+                    .open_invocation("transport:test", func, Bytes::new()),
+                guest,
+            )
+            .await;
+            opened.unwrap_or_else(|error| panic!("failed to open {func}: {error}"))
+        }
+    }
+
+    fn block_on_test<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap_or_else(|error| panic!("failed to build test runtime: {error}"))
+            .block_on(future)
+    }
+
+    /// Opens invocations 1 and 2, has the peer send `frames` on the first
+    /// and then a complete answer on the second, and gives back what the
+    /// second returned, what reading the first returned, and what the
+    /// first still holds.
+    fn fail_first_while_second_completes(
+        frames: impl IntoIterator<Item = super::Frame>,
+    ) -> (Vec<u8>, std::io::Error, (usize, usize)) {
+        block_on_test(async {
+            let mut peer = RawPeer::new();
+            let (_first_out, mut first) = peer.open("first", 1).await;
+            let (_second_out, mut second) = peer.open("second", 2).await;
+
+            let RawPeer { write, .. } = &mut peer;
+            let guest = async {
+                for frame in frames.into_iter().chain([
+                    super::Frame::Data {
+                        invocation: 2,
+                        path: Vec::new(),
+                        payload: b"alive".to_vec(),
+                    },
+                    super::Frame::Close {
+                        invocation: 2,
+                        path: Vec::new(),
+                    },
+                ]) {
+                    super::write_frame(write, &frame)
+                        .await
+                        .unwrap_or_else(|error| panic!("failed to write {frame:?}: {error}"));
+                }
+            };
+            let mut answer = Vec::new();
+            let consumer = timeout(CONCURRENT_DEADLINE, second.read_to_end(&mut answer));
+            let ((), consumed) = join(guest, consumer).await;
+            consumed
+                .unwrap_or_else(|_| panic!("the second invocation never completed"))
+                .unwrap_or_else(|error| panic!("the second invocation failed: {error}"));
+
+            let error = first
+                .read_to_end(&mut Vec::new())
+                .await
+                .expect_err("the flooded invocation must fail");
+            let inbound = first
+                .invocation
+                .inbound
+                .lock()
+                .unwrap_or_else(|_| panic!("inbound mutex poisoned"));
+            let held = (
+                inbound.chunks.len() + inbound.closed.len(),
+                inbound.undelivered_bytes,
+            );
+            drop(inbound);
+            (answer, error, held)
+        })
+    }
+
+    /// A peer that keeps sending an invocation nobody drains fails that
+    /// invocation once it holds the bound, releases what it held, and
+    /// leaves the other invocation on the connection untouched.
+    #[test]
+    fn a_flooded_path_fails_its_invocation_only() {
+        let frames =
+            (0..=MAX_UNDELIVERED_BYTES / RAW_UPLOAD_CHUNK_BYTES).map(|_| super::Frame::Data {
+                invocation: 1,
+                path: Vec::new(),
+                payload: vec![0; RAW_UPLOAD_CHUNK_BYTES],
+            });
+        let (answer, error, held) = fail_first_while_second_completes(frames);
+        assert_eq!(answer, b"alive");
+        assert_eq!(
+            WireError::from_io(&error),
+            Some(&WireError::InboundBacklogExceeded {
+                invocation: 1,
+                held: MAX_UNDELIVERED_BYTES + RAW_UPLOAD_CHUNK_BYTES,
+                max: MAX_UNDELIVERED_BYTES,
+            })
+        );
+        assert_eq!(held, (0, 0), "a failed invocation releases what it held");
+    }
+
+    /// A peer that addresses a fresh path in every frame fails its
+    /// invocation as soon as it exceeds the paths one may hold.
+    #[test]
+    fn endless_data_paths_fail_their_invocation_only() {
+        let frames = (0..1000_u32).map(|path| super::Frame::Data {
+            invocation: 1,
+            path: vec![path],
+            payload: vec![1],
+        });
+        let (answer, error, held) = fail_first_while_second_completes(frames);
+        assert_eq!(answer, b"alive");
+        assert_eq!(
+            WireError::from_io(&error),
+            Some(&WireError::TooManyInboundPaths {
+                invocation: 1,
+                max: MAX_INBOUND_PATHS,
+            })
+        );
+        assert_eq!(held, (0, 0), "a failed invocation releases what it held");
+    }
+
+    /// Closing paths without end holds state as much as sending on them.
+    #[test]
+    fn endless_close_paths_fail_their_invocation_only() {
+        let frames = (0..1000_u32).map(|path| super::Frame::Close {
+            invocation: 1,
+            path: vec![path],
+        });
+        let (answer, error, held) = fail_first_while_second_completes(frames);
+        assert_eq!(answer, b"alive");
+        assert_eq!(
+            WireError::from_io(&error),
+            Some(&WireError::TooManyInboundPaths {
+                invocation: 1,
+                max: MAX_INBOUND_PATHS,
+            })
+        );
+        assert_eq!(held, (0, 0), "a failed invocation releases what it held");
+    }
+
+    /// A consumer that reads a stream several times the bound at its own
+    /// pace never sees the error: the bound is on what is undelivered,
+    /// not on what an invocation carries over its life.
+    #[test]
+    fn a_consumer_draining_at_its_own_pace_never_hits_the_bound() {
+        block_on_test(async {
+            let mut peer = RawPeer::new();
+            let (_out, mut incoming) = peer.open("stream", 1).await;
+            let chunks = 3 * MAX_UNDELIVERED_BYTES / RAW_UPLOAD_CHUNK_BYTES;
+
+            let RawPeer { write, .. } = &mut peer;
+            let guest = async {
+                for _ in 0..chunks {
+                    super::write_frame(
+                        write,
+                        &super::Frame::Data {
+                            invocation: 1,
+                            path: Vec::new(),
+                            payload: vec![7; RAW_UPLOAD_CHUNK_BYTES],
+                        },
+                    )
+                    .await
+                    .unwrap_or_else(|error| panic!("failed to write a chunk: {error}"));
+                }
+                super::write_frame(
+                    write,
+                    &super::Frame::Close {
+                        invocation: 1,
+                        path: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap_or_else(|error| panic!("failed to write the close: {error}"));
+            };
+            let consumer = async {
+                let mut total = 0;
+                let mut buffer = vec![0; RAW_UPLOAD_CHUNK_BYTES];
+                loop {
+                    let read = incoming
+                        .read(&mut buffer)
+                        .await
+                        .unwrap_or_else(|error| panic!("the paced consumer failed: {error}"));
+                    if read == 0 {
+                        return total;
+                    }
+                    total += read;
+                    tokio::task::yield_now().await;
+                }
+            };
+            let ((), total) = timeout(CONCURRENT_DEADLINE * 6, join(guest, consumer))
+                .await
+                .unwrap_or_else(|_| panic!("the paced stream never completed"));
+            assert_eq!(total, chunks * RAW_UPLOAD_CHUNK_BYTES);
+        });
     }
 }

@@ -8,6 +8,7 @@ extern crate std;
 
 mod audio;
 mod bootfs;
+mod buffer;
 mod component;
 mod device;
 mod display;
@@ -23,7 +24,6 @@ mod log;
 mod machine;
 mod memory;
 mod network;
-mod pins;
 mod process;
 mod profiling;
 mod runtime;
@@ -38,7 +38,9 @@ pub use wasmtime_adapter::parking::{
     park_wasmtime_waiter, unpark_wasmtime_waiters, wasmtime_monotonic_nanos,
 };
 #[cfg(feature = "wasmtime-runtime")]
-pub use wasmtime_adapter::swap_fault::resolve_swap_fault_blocking;
+pub use wasmtime_adapter::swap_fault::{
+    UserPageFault, classify_user_page_fault, resolve_swap_fault_blocking, run_swap_fault_trampoline,
+};
 pub use wasmtime_adapter::tls::WasmtimeTlsSlots;
 
 #[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]
@@ -61,6 +63,10 @@ pub use bootfs::{
     BootDirectory, BootDirectoryEntry, BootDirectoryHandleExt, BootFile, BootfsBytes,
     EmbeddedBootDirectory, EmbeddedBootFile, EmbeddedBootFs,
 };
+pub use buffer::{
+    BYTES_PER_PIXEL, Buffer, BufferError, GuestMemory, MAX_VIEWS, Span, ViewError, ViewGroup,
+    ViewId, ViewTable, WASM_PAGE_BYTES,
+};
 pub(crate) use component::ComponentCache;
 pub use component::{
     COMPONENT_ASYNC_STACK_SIZE, CompiledComponent, ComponentExecContext, ComponentExecutor,
@@ -81,19 +87,17 @@ pub use component::{
     wait_until_runtime_deadline,
 };
 pub use device::{
-    AUDIO_WINDOW_BYTES, DEFAULT_DMA_BUDGET_BYTES, DEVICE_WINDOW_BYTES, DISPLAY_WINDOW_BYTES,
-    DeviceGrant, DeviceGrantRegistry, DeviceInterruptHooks, DeviceInterruptRoute, DeviceName,
-    DeviceOwnership, DeviceVmHooks, DeviceWindow, DmaBudget, DmaBuffer, DmaBufferHandle,
-    GPU_WINDOW_BYTES, GrantError, GrantHandle, GrantInterrupt, GrantLease, GrantStats,
-    GrantedDeviceSnapshot, InterruptEvent, InterruptRelay, InterruptStats, LinearMemory,
-    MAX_DEVICE_NAME, MAX_DMA_BUFFERS, MAX_GRANT_INTERRUPTS, MAX_GRANT_REGIONS, MAX_GRANTS,
-    MappedRegion, PublishedDevice, SURFACE_WINDOW_BYTES, install_device_interrupt_hooks,
-    install_device_vm_hooks,
+    DEFAULT_DMA_BUDGET_BYTES, DeviceGrant, DeviceGrantRegistry, DeviceInterruptHooks,
+    DeviceInterruptRoute, DeviceName, DeviceOwnership, DeviceVmHooks, DmaBudget, DmaBuffer,
+    DmaBufferHandle, GrantError, GrantHandle, GrantInterrupt, GrantLease, GrantStats,
+    GrantedDeviceSnapshot, InterruptEvent, InterruptRelay, InterruptStats, MAX_DEVICE_NAME,
+    MAX_DMA_BUFFERS, MAX_GRANT_INTERRUPTS, MAX_GRANT_REGIONS, MAX_GRANTS, PublishedDevice,
+    install_device_interrupt_hooks, install_device_vm_hooks,
 };
 pub use display::{
-    DisplayClaim, DisplayOwnership, DisplayPins, DisplaySender, DisplayService,
-    DisplayServiceError, FrameToken, MAX_CLAIMED_SCANOUTS, MAX_PINNED_FRAMES, PinnedFrame,
-    REQUEST_QUEUE_DEPTH, SequenceSignal, install_display_device,
+    DisplayClaim, DisplayOwnership, DisplaySender, DisplayService, DisplayServiceError, FrameToken,
+    MAX_CLAIMED_SCANOUTS, MAX_PINNED_FRAMES, REQUEST_QUEUE_DEPTH, SequenceSignal,
+    install_display_device,
 };
 pub use embedded::{BootPayload, EmbeddedComponent, EmbeddedInit};
 pub use exec::{
@@ -112,7 +116,7 @@ pub use exec::{
 };
 pub use gpu::{
     ContextRecord, Gpu3dClaim, Gpu3dOwnership, Gpu3dSender, Gpu3dService, Gpu3dServiceError,
-    GpuPins, MAX_GPU_BLOBS, MAX_GPU_CONTEXTS, MAX_GPU_PINS, install_gpu3d_device,
+    MAX_GPU_BLOBS, MAX_GPU_CONTEXTS, MAX_GPU_VIEWS, install_gpu3d_device,
 };
 pub use helios_hal::Platform;
 pub use helios_netstack::{
@@ -136,41 +140,52 @@ pub use instance::{
     StoreTurns, allow_instance_resource_growth,
 };
 pub use io::{
-    BlockInstallError, BlockSelfCheckError, BlockService, BlockStats, ByteReadWait, ByteReader,
-    ByteWriteWait, ByteWriter, ClosedPeer, DebugConsole, DebugSerialAccess, DebugSerialInterrupt,
-    DebugSerialWriter, ExternalInterruptHandler, ExternalInterruptRoutes, IommuDomains,
-    IommuEndpointStats, IommuReport, IommuStats, MAX_BLOCK_DEVICES, MAX_DEVICE_INTERRUPTS,
-    MAX_INPUT_DEVICES, MAX_IOMMU_ENDPOINTS, MAX_NETWORK_INTERRUPTS, PanicSerial, PollKey,
-    PollRegistration, PollRegistry, PollRegistryError, PollSourceKind, RecordingConsole,
-    SCRATCH_DISK_SERIAL, SerialReader, TryRead, TryWrite, byte_channel, emit_panic_report,
-    install_block_devices, read_debug_serial, read_serial, try_read_serial, wake_queue_owners,
+    BlockCache, BlockCacheError, BlockCacheLimits, BlockInstallError, BlockMut, BlockPages,
+    BlockRef, BlockRouteError, BlockSelfCheckError, BlockService, BlockStats, ByteReadWait,
+    ByteReader, ByteWriteWait, ByteWriter, CACHE_BLOCK_BYTES, CacheLayoutError, CachedDisk,
+    CachedDiskStats, ClosedPeer, DebugConsole, DebugSerialAccess, DebugSerialInterrupt,
+    DebugSerialWriter, DiskRefusal, DiskRole, ExternalInterruptHandler, ExternalInterruptRoutes,
+    IommuDomains, IommuEndpointStats, IommuReport, IommuStats, MAX_BLOCK_DEVICES,
+    MAX_DEVICE_INTERRUPTS, MAX_INPUT_DEVICES, MAX_IOMMU_ENDPOINTS, MAX_NETWORK_INTERRUPTS,
+    PanicSerial, PollKey, PollRegistration, PollRegistry, PollRegistryError, PollSourceKind,
+    RecordingConsole, SCRATCH_DISK_SERIAL, ScratchDisk, ScratchDiskStats, SerialReader, TryRead,
+    TryWrite, admit_block_devices, byte_channel, emit_panic_report, install_block_devices,
+    install_scratch_swap, read_debug_serial, read_serial, try_read_serial, wake_queue_owners,
 };
 pub use kernel_exception::{
     KernelException, KernelExceptionCause, KernelExceptionDispatch, KernelNativeTrapHandler,
     dispatch_native_trap, install_native_trap_handler,
 };
-pub use machine::{AdvanceCause, Generation, MachineGeneration, MachineGenerationHandle};
+pub use machine::{
+    AdvanceCause, Generation, MachineGeneration, MachineGenerationHandle, UnhandledAdvances,
+    install_generation_reactions,
+};
 pub use memory::{
-    AccessibilityPlan, BalloonHandle, BalloonStats, BootMemoryPlan, BootRegionSplitter,
-    CommittedRegion, ENTROPY_RESEED_INTERVAL, EntropyPool, EntropySources, FIBER_STACK_GUARD_BYTES,
-    FREE_PAGE_REPORT_INTERVAL, FiberStack, FiberStackArenaStats, FiberStackError,
-    FiberStackVmHooks, HardwareEntropySource, IDLE_SWAP_AFTER, KERNEL_HEAP_BOOTSTRAP_BYTES,
+    AGE_BATCH_PAGES, AccessibilityPlan, BalloonHandle, BalloonStats, BootMemoryPlan,
+    BootRegionSplitter, COMPRESSED_PAGE_BYTES, CommittedRegion, CommittedRemoval, CompressRefusal,
+    CompressedPage, CompressedPool, CompressedPoolError, CompressedPoolStats,
+    DEFAULT_COMPRESSION_LEVEL, DEFAULT_POOL_PERCENT, Decommitted, ENTROPY_RESEED_INTERVAL,
+    EntropyPool, EntropySources, FIBER_STACK_GUARD_BYTES, FREE_PAGE_REPORT_INTERVAL, FiberStack,
+    FiberStackArenaStats, FiberStackError, FiberStackVmHooks, HardwareEntropySource,
+    IDLE_SWAP_AFTER, INCOMPRESSIBLE_BYTES, InstalledAddressSpace, KERNEL_HEAP_BOOTSTRAP_BYTES,
     KERNEL_HEAP_GROWTH_CHUNK_BYTES, KERNEL_HEAP_MAX_BOOT_FRACTION, KERNEL_HEAP_MIN_RESERVE_BYTES,
     KERNEL_HEAP_RESERVE_FRACTION, KernelPhysFrameAllocator, MemoryOwner, NoCryptographicEntropy,
     NoEntropyDevice, ROOT_ENTROPY_MATERIAL_BYTES, RegionShares, ReleasedReservation,
     ReservationLookup, ReservationTracker, RootEntropy, RootEntropyHandle, SWAP_BATCH_BYTES,
-    SWAP_TICK, StackFault, SwapDisabled, SwapEntry, SwapFaultError, SwapHandle, SwapStats,
-    SwapVmHooks, TASK_ARENA_FRACTION, TASK_ARENA_MIN_BYTES, USER_POOL_MIN_REGION_BYTES,
-    UserHeapStats, UserMemoryOwnerScope, UserMemoryOwners, UserMemoryPool, VaCursor,
-    allocate_user_frame_uninit_on, allocate_user_frame_zeroed, allocate_user_frame_zeroed_on,
-    allocate_user_run_zeroed_on, claim_fiber_stack, configure_user_memory_owner_processors,
-    current_user_memory_owner, deallocate_user_frame, deallocate_user_frame_on,
-    deallocate_user_run_on, disable_swap, enter_user_memory_owner, fiber_stack_arena_stats,
-    fiber_stack_demand_commits_on, install_entropy_device, install_fiber_stack_arena,
-    install_fiber_stack_hooks, install_memory_balloon, install_swap, install_swap_hooks,
+    SWAP_TICK, StackFault, SwapDisabled, SwapEntry, SwapFaultError, SwapHandle, SwapLeafFormat,
+    SwapSpace, SwapStats, SwapVmHooks, TASK_ARENA_FRACTION, TASK_ARENA_MIN_BYTES,
+    USER_POOL_MIN_REGION_BYTES, UserHeapStats, UserMemoryOwnerScope, UserMemoryOwners,
+    UserMemoryPool, VaCursor, allocate_user_frame_uninit_on, allocate_user_frame_zeroed,
+    allocate_user_frame_zeroed_on, allocate_user_memory_pool, allocate_user_run_zeroed_on,
+    claim_fiber_stack, configure_user_memory_owner_processors, current_user_memory_owner,
+    deallocate_user_frame, deallocate_user_frame_on, deallocate_user_run_on, disable_swap,
+    enter_user_memory_owner, fiber_stack_arena_stats, fiber_stack_demand_commits_on,
+    install_entropy_device, install_fiber_stack_arena, install_fiber_stack_hooks,
+    install_memory_balloon, install_swap, install_swap_hooks, install_user_memory_pool,
     installed_swap_handle, installed_swap_hooks, kernel_reserve_for, largest_servable_user_bytes,
-    page_fault_frame_reserve_bytes, resolve_stack_fault, seed_root_entropy, swapped_token,
-    task_arena_bytes_for, user_heap_stats, user_mapping_kernel_heap_bytes, validate_range,
+    page_fault_frame_reserve_bytes, ranges_outside, resolve_stack_fault, seed_root_entropy,
+    swap_vm_hooks, swapped_token, task_arena_bytes_for, user_heap_stats,
+    user_mapping_kernel_heap_bytes, validate_range,
 };
 pub use network::{
     HTTP_FORBIDDEN_FIELD_NAMES, HTTP_MAX_FIELD_SECTION_BYTES, HTTP_MAX_FIELD_VALUE_BYTES, HttpBody,
@@ -183,20 +198,19 @@ pub use network::{
     SocketStack, TcpListenerId, TcpStreamId, UdpSocketId, validate_http_authority,
     validate_http_path_with_query, validate_http_status_code,
 };
-pub use pins::{BYTES_PER_PIXEL, PinError, PinnedArena, PinnedRun};
 pub use process::{
-    AudioClaimCap, ClockAuthorityRights, DescriptorEntry, DescriptorId, DescriptorTable,
-    DescriptorTableError, DeviceClassRights, DeviceGrantClaimCap, DirectoryAuthorityRights,
-    DirectoryCap, DirectoryPreopen, DisplayClaimCap, DnsCap, ExecAuthority, ForkAuthority,
-    FutexKey, FutexTable, FutexWaitRegistration, GpuClaimCap, GuestAddress, InputClaimCap,
-    JoinAuthority, LinkAuthorityRights, LinkSourceCap, LinkTargetDirectoryCap, MulticastCap,
-    NetworkAdminCap, NetworkAuthorityRights, NetworkCap, PrivilegedBindCap, ProcessAuthority,
-    ProcessAuthorityError, ProcessAuthorityRights, ProcessId, ProcessMemoryIdentity, ProcessRecord,
-    ProcessState, ProcessTable, ProcessTableError, ProgramExecError, ProgramExecErrorDetail,
-    ProgramExecErrorKind, ProgramOutOfMemory, RuntimeMessage, SetWallClockCap, SignalAuthority,
-    SpawnAuthority, SymlinkCreateCap, SymlinkReadCap, TcpCap, TerminalAuthorityRights,
-    TerminalInputCap, TerminalOutputCap, ThreadId, ThreadRecord, ThreadState, ThreadTable,
-    ThreadTableError, TtyControlCap, UdpCap,
+    AudioClaimCap, ClockAuthorityRights, DescriptorEntry, DescriptorId, DescriptorLimit,
+    DescriptorTable, DescriptorTableError, DeviceClassRights, DeviceGrantClaimCap,
+    DirectoryAuthorityRights, DirectoryCap, DirectoryPreopen, DisplayClaimCap, DnsCap,
+    ExecAuthority, ForkAuthority, FutexKey, FutexTable, FutexWaitRegistration, GpuClaimCap,
+    GuestAddress, InputClaimCap, JoinAuthority, LinkAuthorityRights, LinkSourceCap,
+    LinkTargetDirectoryCap, MulticastCap, NetworkAdminCap, NetworkAuthorityRights, NetworkCap,
+    PrivilegedBindCap, ProcessAuthority, ProcessAuthorityError, ProcessAuthorityRights, ProcessId,
+    ProcessMemoryIdentity, ProcessRecord, ProcessState, ProcessTable, ProcessTableError,
+    ProgramExecError, ProgramExecErrorDetail, ProgramExecErrorKind, ProgramOutOfMemory,
+    RuntimeMessage, SetWallClockCap, SignalAuthority, SpawnAuthority, SymlinkCreateCap,
+    SymlinkReadCap, TcpCap, TerminalAuthorityRights, TerminalInputCap, TerminalOutputCap, ThreadId,
+    ThreadRecord, ThreadState, ThreadTable, ThreadTableError, TtyControlCap, UdpCap,
 };
 pub use profiling::{
     CodeAttribution, InstructionProfile, InstructionProfileError, InstructionSampler,
@@ -207,17 +221,17 @@ pub use profiling::{
 pub use runtime::{
     AuthorityDomain, ComponentHostFilesystemState, ComponentHostNetwork, ComponentNetworkService,
     ComponentNetworkState, DnsError, DnsErrorKind, ExecOutput, ExecResult, HostDirEntry,
-    HostDirLimit, HostFileSystem, HostFsError, HostFsErrorKind, HostMetadata, Ipv4Address,
-    NetworkErrorDetail, NetworkHandle, NetworkIpAddress, NetworkPacketPump, ObjectIdentity,
-    PingError, PingErrorKind, PingReply, RegisteredTcpReadBuffer, RuntimeState, SocketReadiness,
-    TcpAccepted, TcpError, TcpErrorKind, TcpListener, TcpReadProgress, TcpWriteProgress,
-    UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
+    HostDirLimit, HostFileSystem, HostFsError, HostFsErrorKind, HostMetadata, HostShareRestore,
+    Ipv4Address, NetworkErrorDetail, NetworkHandle, NetworkIpAddress, NetworkPacketPump,
+    ObjectIdentity, PingError, PingErrorKind, PingReply, RegisteredTcpReadBuffer, RuntimeState,
+    SocketReadiness, TcpAccepted, TcpError, TcpErrorKind, TcpListener, TcpReadProgress,
+    TcpWriteProgress, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
 };
 pub use surface::{
-    MAX_INSTANCE_SURFACES, MAX_LIVE_SURFACES, ReturnedSurfaces, SURFACE_EVENT_QUEUE_DEPTH,
-    SURFACE_REQUEST_QUEUE_DEPTH, SurfaceCreate, SurfaceEvents, SurfaceGeometry, SurfaceId,
-    SurfaceOwnership, SurfaceRect, SurfaceRequest, SurfaceService, SurfaceServiceError,
-    SurfaceShared,
+    MAX_INSTANCE_SURFACES, MAX_LIVE_SURFACES, ReturnedSurface, ReturnedSurfaces,
+    SURFACE_EVENT_QUEUE_DEPTH, SURFACE_REQUEST_QUEUE_DEPTH, SurfaceCreate, SurfaceEvents,
+    SurfaceGeometry, SurfaceId, SurfaceOwnership, SurfaceRect, SurfaceRequest, SurfaceService,
+    SurfaceServiceError, SurfaceShared,
 };
 pub use vsock::{
     ComponentHostVsockService, MAX_VSOCK_BACKLOG, MAX_VSOCK_CONNECTIONS, MAX_VSOCK_LISTENERS,
