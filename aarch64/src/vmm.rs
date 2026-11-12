@@ -55,10 +55,10 @@ use helios_kernel::runtime_memory::{
 };
 use helios_kernel::{
     FiberStackVmHooks, InstalledAddressSpace, MemoryOwner, ReservationLookup, ReservationTracker,
-    SwapLeafFormat, SwapSpace, SwapVmHooks, VaCursor, allocate_user_frame_uninit_on,
-    allocate_user_run_zeroed_on, current_user_memory_owner, deallocate_user_frame_on,
-    deallocate_user_run_on, install_fiber_stack_hooks, ranges_outside, swap_vm_hooks,
-    validate_range,
+    ResidencyVmHooks, SwapLeafFormat, SwapSpace, SwapVmHooks, VaCursor,
+    allocate_user_frame_uninit_on, allocate_user_run_zeroed_on, current_user_memory_owner,
+    deallocate_user_frame_on, deallocate_user_run_on, install_fiber_stack_hooks,
+    install_residency_hooks, ranges_outside, residency_vm_hooks, swap_vm_hooks, validate_range,
 };
 use spin::{Mutex, Once};
 
@@ -1403,6 +1403,15 @@ impl AddressSpace for Aarch64UserAddressSpace {
             .owned_resident_bytes(MemoryOwner::new(owner))
     }
 
+    fn visit_owned_resident_bytes<Visit>(&self, mut visit: Visit)
+    where
+        Visit: FnMut(u64, u64),
+    {
+        self.state
+            .lock()
+            .visit_owned_resident_bytes(|owner, bytes| visit(owner.raw(), bytes));
+    }
+
     fn drain_orphaned_swap_tokens<Visit>(&self, visit: Visit) -> usize
     where
         Visit: FnMut(SwapToken),
@@ -1494,6 +1503,7 @@ pub fn install_user_address_space(physical_memory_offset: usize) {
     USER_AS.call_once(|| Aarch64UserAddressSpace::new(physical_memory_offset));
     runtime_memory::install_hooks(&AARCH64_VMM_HOOKS);
     helios_kernel::install_swap_hooks(&AARCH64_SWAP_HOOKS);
+    install_residency_hooks(&AARCH64_RESIDENCY_HOOKS);
     install_fiber_stack_hooks(&AARCH64_FIBER_STACK_HOOKS);
 }
 
@@ -1697,6 +1707,10 @@ const _: () = {
 /// The kernel's view of this backend's swap surface.
 pub static AARCH64_SWAP_HOOKS: SwapVmHooks =
     swap_vm_hooks::<Aarch64UserAddressSpace>(crate::read_counter);
+
+/// The kernel's view of how much of the user pool each instance holds.
+pub static AARCH64_RESIDENCY_HOOKS: ResidencyVmHooks =
+    residency_vm_hooks::<Aarch64UserAddressSpace>();
 
 /// The arena's address-space surface for this backend.
 ///

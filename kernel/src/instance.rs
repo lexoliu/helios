@@ -14,7 +14,7 @@ use slab::Slab;
 use spin::Mutex;
 use triomphe::Arc;
 
-use crate::memory::{MemoryOwner, UserMemoryOwnerScope, enter_user_memory_owner};
+use crate::memory::{MemoryOwner, UserMemoryOwnerScope, UserResidency, enter_user_memory_owner};
 use crate::user_mapping_kernel_heap_bytes;
 use crate::{Notify, NotifyWaiter};
 
@@ -172,7 +172,11 @@ pub const OOM_RECLAIM_GRACE: Duration = Duration::from_millis(500);
 /// instances rather than kept as a counter that could drift away from
 /// them. A condemnation records what the victim held in *both* pools,
 /// so a shortfall on either one is answered against the bytes that
-/// shortfall is actually waiting for.
+/// shortfall is actually waiting for. In the user pool that is what the
+/// victim held there ([`UserResidency`]), not its linear-memory size: a
+/// mostly swapped-out instance gives back only its resident pages, and
+/// counting the rest would report a shortfall covered that its death
+/// leaves open.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CondemnedMemory {
     /// Condemned within [`OOM_RECLAIM_GRACE`]: memory the killer still
@@ -231,8 +235,13 @@ pub struct OomVictim {
     pub name: String,
     /// The pool that ran out, and therefore the one `score` ranks.
     pub pool: MemoryPool,
-    /// User-pool bytes: the instance's wasm linear memory.
+    /// The instance's wasm linear-memory size: what it grew to, not
+    /// what it holds. Reported beside `user_bytes` so a log line shows
+    /// how much of the memory was out of the pool.
     pub memory_bytes: u64,
+    /// User-pool bytes the instance holds, and so what killing it gives
+    /// back to the pool: see [`UserResidency`].
+    pub user_bytes: u64,
     /// Kernel-heap bytes attributed to the instance.
     pub kernel_bytes: u64,
     pub policy: OomPolicy,
@@ -301,7 +310,8 @@ struct InstanceEntry {
     /// which for a parked or idle guest may be never.
     condemned: Notify,
     /// Monotonic nanoseconds at which the kill flag was set, and what
-    /// the instance held in each pool at that moment. Together they are
+    /// the instance held in each pool at that moment, the user pool as
+    /// the condemning caller's [`UserResidency`] saw it. Together they are
     /// this instance's entry in the condemned-memory ledger: what the
     /// killer expects back, and when it started expecting it. Both
     /// pools are recorded because either one can be the pool a later
@@ -392,11 +402,25 @@ impl InstanceRegistry {
     /// memory is on the condemned ledger ([`Self::condemned_memory`])
     /// rather than available to condemn again.
     ///
+    /// A user-pool candidate is ranked by what it holds in the pool,
+    /// read from `residency`: what killing it gives back. Its
+    /// linear-memory size would rank an instance the swap policy has
+    /// mostly written out as if killing it freed all of it.
+    ///
+    /// The residency is taken by the caller before this call, and the
+    /// registry never reaches the address space itself: its `entries`
+    /// lock and the address space's reservation lock are never held
+    /// together (see [`UserResidency`]'s concurrency contract).
+    ///
     /// This is victim selection on its own. The OOM killer's entry point
     /// is [`Self::condemn_for_oom`], which weighs the ledger against the
     /// request before it selects anything.
-    pub fn pick_oom_victim(&self, pool: MemoryPool) -> Option<OomVictim> {
-        best_victim(&self.inner.entries.lock(), pool)
+    pub fn pick_oom_victim(
+        &self,
+        pool: MemoryPool,
+        residency: &UserResidency,
+    ) -> Option<OomVictim> {
+        best_victim(&self.inner.entries.lock(), pool, residency)
     }
 
     /// Memory condemned out of `pool` and not yet reclaimed, as of
@@ -437,13 +461,17 @@ impl InstanceRegistry {
     ///
     /// Selection and condemnation happen under one lock, so two
     /// processors refusing a grow at the same moment cannot both
-    /// condemn against the same empty ledger.
+    /// condemn against the same empty ledger. `residency` is what ranks
+    /// a user-pool candidate and what its condemnation puts on the
+    /// user-pool ledger, whichever pool ran out; see
+    /// [`Self::pick_oom_victim`] for why it is taken before the lock.
     pub fn condemn_for_oom(
         &self,
         requester: InstanceId,
         pool: MemoryPool,
         requested_bytes: u64,
         now_nanos: u64,
+        residency: &UserResidency,
     ) -> OomKillDecision {
         let entries = self.inner.entries.lock();
         let mut condemned = condemned_ledger(&entries, pool, now_nanos);
@@ -460,16 +488,21 @@ impl InstanceRegistry {
         // program to feed the one already holding the most memory.
         // Other instances become the pick on later attempts as they
         // accumulate memory.
-        let victim = best_victim(&entries, pool).filter(|victim| victim.id != requester);
+        let victim = best_victim(&entries, pool, residency).filter(|victim| victim.id != requester);
         let Some(victim) = victim else {
             return OomKillDecision {
                 outcome: OomKillOutcome::NoVictim,
                 condemned,
             };
         };
-        let condemned_bytes =
-            condemn_entry(&entries, victim.id, KillReason::OutOfMemory, now_nanos)
-                .expect("victim selected under the registry lock must still be condemnable");
+        let condemned_bytes = condemn_entry(
+            &entries,
+            victim.id,
+            KillReason::OutOfMemory,
+            now_nanos,
+            residency,
+        )
+        .expect("victim selected under the registry lock must still be condemnable");
         condemned.pending_bytes = condemned
             .pending_bytes
             .saturating_add(condemned_bytes.of(pool));
@@ -490,6 +523,8 @@ impl InstanceRegistry {
     /// ledger, timestamped with `now_nanos`: whatever the reason for the
     /// kill, those bytes are on their way back and the OOM killer must
     /// not condemn a second instance for memory it is already getting.
+    /// Its user-pool bytes are what `residency` says it holds, taken
+    /// before the call as for [`Self::condemn_for_oom`].
     ///
     /// The registry records the condemnation and wakes every turn of the
     /// instance, and a turn whose call is suspended drops it (see
@@ -499,10 +534,16 @@ impl InstanceRegistry {
     /// instead of running on. The same holds for
     /// [`Self::condemn_for_oom`], and together they are what bounds the
     /// ledger's grace period: see [`OOM_RECLAIM_GRACE`].
-    pub fn request_kill(&self, id: InstanceId, reason: KillReason, now_nanos: u64) -> KillOutcome {
+    pub fn request_kill(
+        &self,
+        id: InstanceId,
+        reason: KillReason,
+        now_nanos: u64,
+        residency: &UserResidency,
+    ) -> KillOutcome {
         let entries = self.inner.entries.lock();
         let outcome = if entries.iter().any(|(_, entry)| entry.id == id) {
-            match condemn_entry(&entries, id, reason, now_nanos) {
+            match condemn_entry(&entries, id, reason, now_nanos, residency) {
                 Some(_) => KillOutcome::Requested,
                 None => KillOutcome::AlreadyStopping,
             }
@@ -613,14 +654,19 @@ impl Default for InstanceRegistry {
 /// Highest-scoring OOM candidate in `entries` for the pool that ran
 /// out.
 ///
-/// Called with the registry's `entries` lock held.
-fn best_victim(entries: &Slab<Box<InstanceEntry>>, pool: MemoryPool) -> Option<OomVictim> {
+/// Called with the registry's `entries` lock held; `residency` was
+/// taken before it.
+fn best_victim(
+    entries: &Slab<Box<InstanceEntry>>,
+    pool: MemoryPool,
+    residency: &UserResidency,
+) -> Option<OomVictim> {
     let mut best: Option<OomVictim> = None;
     for (_, entry) in entries.iter() {
-        let memory_bytes = entry.memory_bytes.load(Ordering::Acquire);
+        let user_bytes = entry.user_bytes(residency);
         let kernel_bytes = entry.kernel_heap_bytes();
         let pool_bytes = match pool {
-            MemoryPool::User => memory_bytes,
+            MemoryPool::User => user_bytes,
             MemoryPool::Kernel => kernel_bytes,
         };
         if pool_bytes == 0 {
@@ -642,7 +688,8 @@ fn best_victim(entries: &Slab<Box<InstanceEntry>>, pool: MemoryPool) -> Option<O
                     id: entry.id,
                     name: entry.name.clone(),
                     pool,
-                    memory_bytes,
+                    memory_bytes: entry.memory_bytes.load(Ordering::Acquire),
+                    user_bytes,
                     kernel_bytes,
                     policy: entry.policy,
                     score,
@@ -703,12 +750,14 @@ impl CondemnedBytes {
 /// gone or was already condemned.
 ///
 /// Called with the registry's `entries` lock held, which is what keeps
-/// the flag and its ledger entry from being observed out of step.
+/// the flag and its ledger entry from being observed out of step;
+/// `residency` was taken before it.
 fn condemn_entry(
     entries: &Slab<Box<InstanceEntry>>,
     id: InstanceId,
     reason: KillReason,
     now_nanos: u64,
+    residency: &UserResidency,
 ) -> Option<CondemnedBytes> {
     let entry = entries
         .iter()
@@ -719,7 +768,7 @@ fn condemn_entry(
         .compare_exchange(KILL_FLAG_NONE, encoded, Ordering::AcqRel, Ordering::Acquire)
         .ok()?;
     let condemned = CondemnedBytes {
-        user: entry.memory_bytes.load(Ordering::Acquire),
+        user: entry.user_bytes(residency),
         kernel: entry.kernel_heap_bytes(),
     };
     entry.condemned_at.store(now_nanos, Ordering::Release);
@@ -1161,6 +1210,13 @@ impl ProcessorTurn<'_> {
 }
 
 impl InstanceEntry {
+    /// User-pool bytes this instance holds, as `residency` saw them: the
+    /// pages its owner scope committed that are still resident, which is
+    /// what tearing it down returns to the pool.
+    fn user_bytes(&self, residency: &UserResidency) -> u64 {
+        residency.bytes_of(MemoryOwner::new(self.id.raw()))
+    }
+
     /// Kernel heap attributed to this instance.
     ///
     /// Two terms, because the kernel knows about its own allocations in

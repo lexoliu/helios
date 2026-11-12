@@ -3601,11 +3601,14 @@ where
         // The flag and the interruption are all this does: the victim
         // unwinds at its next check, and whoever owns it — a plugin
         // supervisor, or nobody — decides what happens after.
-        let outcome =
-            caller
-                .data()
-                .instance_registry
-                .request_kill(victim, KillReason::Operator, now);
+        // Before the registry's lock, never under it: see `UserResidency`.
+        let residency = super::store::user_residency();
+        let outcome = caller.data().instance_registry.request_kill(
+            victim,
+            KillReason::Operator,
+            now,
+            &residency,
+        );
         Ok((match outcome {
             KillOutcome::Requested => {
                 deliver_kill(&caller.data().runtime_state, victim);
