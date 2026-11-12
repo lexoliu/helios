@@ -59,7 +59,7 @@ on:
         type: boolean
         default: false
   pull_request:
-    types: [opened, synchronize, reopened, labeled]
+    types: [opened, synchronize, reopened, labeled, ready_for_review]
   push:
     branches: [dev]
     tags: ["v*"]
@@ -72,12 +72,19 @@ on:
 # A label other than `bench` runs nothing (`tooling` skips, and every
 # other job needs it) and takes a group of its own, so it cannot cancel a
 # measurement hours in (#687).
+#
+# Only a new head cancels: a push, a dispatch and a pull request's
+# `synchronize` supersede the older run of their group. `opened`,
+# `reopened`, `labeled` and `ready_for_review` carry a head a run may
+# already be measuring and queue behind it, because a run cancelled before
+# its matrix expands leaves a failed check named after the unexpanded
+# expression that nothing replaces.
 concurrency:
   group: >-
     ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}${{
       github.event.action == 'labeled' && github.event.label.name != 'bench'
       && format('-label-{0}', github.run_id) || '' }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name != 'pull_request' || github.event.action == 'synchronize' }}
 
 permissions:
   contents: read
@@ -88,9 +95,73 @@ env:
   HELIOS_NET_BRIDGE: helios-br0
 
 jobs:
+  # Without the `bench` label a pull request runs only `tooling`'s own
+  # checks: the tools/bench lint and tests, the committed README and docs
+  # sections, and the native counterparts' build. These are the files they
+  # read; a pull request that touches none of them, or is a draft, skips
+  # `tooling` and with it the run (#844). Marking a draft ready runs them.
+  # The job itself runs on every event that runs anything: a skipped
+  # ancestor fails the implicit `success()` of every job after `tooling`,
+  # so skipping it here would skip the profile collections of a dispatch
+  # and a push (#860). A label other than `bench` runs nothing, and nor do
+  # `opened` and `ready_for_review` on a pull request that carries
+  # `bench`: its `labeled` event measures that head, so the pair is not
+  # built twice. A new head (`synchronize`) and `reopened` still run.
+  changes:
+    name: changes
+    if: >-
+      (github.event.action != 'labeled' || github.event.label.name == 'bench')
+      && !((github.event.action == 'opened' || github.event.action == 'ready_for_review')
+      && contains(github.event.pull_request.labels.*.name, 'bench'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      # A push, a dispatch and a labelled pull request always run
+      # `tooling`; an unlabelled one only when the filter found one of its
+      # inputs, and a draft never (its filter is skipped).
+      tooling: >-
+        ${{ github.event_name != 'pull_request'
+            || contains(github.event.pull_request.labels.*.name, 'bench')
+            || steps.filter.outputs.tooling == 'true' }}
+    steps:
+      - uses: dorny/paths-filter@v4
+        id: filter
+        if: >-
+          github.event_name == 'pull_request'
+          && !contains(github.event.pull_request.labels.*.name, 'bench')
+          && !github.event.pull_request.draft
+        with:
+          # The workflows and actions the tests parse, the bench tooling
+          # and the workload table it reads, the sections `render check`
+          # compares, and everything `helios-compiler-host`'s release
+          # build reads: the workspace manifests, lockfile, toolchain,
+          # Wasmtime pin and the crates it builds from.
+          filters: |
+            tooling:
+              - '.github/**'
+              - 'tools/bench/**'
+              - 'tools/wasi-apps/**'
+              - 'README.md'
+              - 'docs/benchmarks.md'
+              - 'docs/benchmarks/**'
+              - 'docs/wasmtime.md'
+              - '**/Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - '.cargo/**'
+              - 'compiler-host/**'
+              - 'compiler-abi/**'
+              - 'compiler-support/**'
+              - 'artifact/**'
+              - 'hal/**'
+
   tooling:
     name: tooling
-    if: github.event.action != 'labeled' || github.event.label.name == 'bench'
+    needs: changes
+    if: needs.changes.outputs.tooling == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     outputs:
@@ -179,8 +250,12 @@ jobs:
           echo "pairing_ref=$pairing_ref" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
         with:
+          # Beside the Wasmtime fork, which helios-compiler-host builds
+          # against through the workspace's `../wasmtime` path.
+          path: helios
           # The matrix below resolves the pairing ref against history.
           fetch-depth: 0
+      - uses: ./helios/.github/actions/checkout-wasmtime
       - uses: astral-sh/setup-uv@v6
       # The collections' matrix, with every ref resolved to its commit:
       # `actions/checkout` reads a `ref` that is not forty hex digits as
@@ -199,6 +274,7 @@ jobs:
       # at the path the suite will build it from. `helios-bench
       # baseline-fork` reads the pin from the baseline commit.
       - id: columns
+        working-directory: helios
         env:
           CANDIDATE_SHA: ${{ github.sha }}
           PAIRING_REF: ${{ steps.mode.outputs.pairing_ref }}
@@ -239,24 +315,30 @@ jobs:
           fi
           echo "profile_columns=$columns" >> "$GITHUB_OUTPUT"
       - name: Lint and test tools/bench
-        working-directory: tools/bench
+        working-directory: helios/tools/bench
         run: |
           uv sync --quiet
           uv run ruff check .
           uv run ruff format --check .
           uv run pytest -q
       - id: lanes
-        working-directory: tools/bench
+        working-directory: helios/tools/bench
         run: |
           select="${{ github.event_name == 'workflow_dispatch' && inputs.lanes || 'all' }}"
           echo "matrix=$(uv run helios-bench lanes --select "$select" --format github-matrix)" >> "$GITHUB_OUTPUT"
       - name: Verify the committed README and docs sections match their run's report
-        working-directory: tools/bench
+        working-directory: helios/tools/bench
         run: uv run helios-bench render check
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.13.0
+      # helios-compiler-host is a glibc binary for the Fedora guest, linked
+      # through zig.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
       - name: Build the native counterparts
+        working-directory: helios
         run: tools/bench/native/build.sh x86_64
 
   # A paired run holds each column to a profile collected from the commit

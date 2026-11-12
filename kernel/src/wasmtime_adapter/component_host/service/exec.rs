@@ -60,7 +60,7 @@ where
     pub(super) env: Vec<(String, String)>,
     pub(super) executable: ProgramExecutable<CpuImpl, Net, HostFs>,
     pub(super) authority: ProcessAuthority,
-    pub(super) filesystem: Option<DebugFileSystemSnapshot>,
+    pub(super) filesystem: Option<Namespace<HostFs>>,
     pub(super) descriptors: DescriptorOrigin<Net>,
     pub(super) signal_state: WasixSignalState,
     pub(super) signal_dispositions: Vec<WasixSignalDisposition>,
@@ -152,7 +152,7 @@ pub(super) struct WasixProcessSnapshot<Net: ComponentHostNetwork> {
     pub(super) memory: Vec<u8>,
     pub(super) memory_pages: u32,
     pub(super) descriptors: Preview1DescriptorTable<Net>,
-    pub(super) filesystem: DebugFileSystemSnapshot,
+    pub(super) filesystem: MemoryFs,
     pub(super) authority: ProcessAuthority,
     pub(super) cwd: Option<Preview1Cwd>,
     pub(super) arguments: Vec<String>,
@@ -176,7 +176,17 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    runtime_state.bootfs()?.file_bytes(path)
+    let inside = path
+        .strip_prefix('/')
+        .expect("a boot artifact is named by an absolute guest path");
+    let path = helios_hal::fs::FsPath::new(inside)
+        .expect("a boot artifact path is a normalized filesystem path");
+    runtime_state
+        .root_namespace()
+        .table()
+        .boot()
+        .file_contents(path)
+        .ok()
 }
 
 impl<Net: ComponentHostNetwork> WasixAsyncifyState<Net> {
@@ -197,7 +207,7 @@ pub(super) async fn run_program_executable<CpuImpl, Net, HostFs>(
     argv: ProgramArgv,
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
-    filesystem: Option<DebugFileSystemSnapshot>,
+    filesystem: Option<Namespace<HostFs>>,
     descriptors: DescriptorOrigin<Net>,
     signal_state: WasixSignalState,
     signal_dispositions: Vec<WasixSignalDisposition>,
@@ -302,7 +312,7 @@ pub(super) async fn run_program_core_module<CpuImpl, Net, HostFs>(
     argv: ProgramArgv,
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
-    filesystem: Option<DebugFileSystemSnapshot>,
+    filesystem: Option<Namespace<HostFs>>,
     descriptors: DescriptorOrigin<Net>,
     signal_state: WasixSignalState,
     signal_dispositions: Vec<WasixSignalDisposition>,
@@ -556,7 +566,7 @@ pub(super) async fn run_program_core_module_with_restore<CpuImpl, Net, HostFs>(
     argv: ProgramArgv,
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
-    filesystem: Option<DebugFileSystemSnapshot>,
+    filesystem: Option<Namespace<HostFs>>,
     signal_state: WasixSignalState,
     spawner: crate::InstanceSpawner<CpuImpl>,
     progress: helios_hal::watchdog::ProgressCounter,
@@ -835,7 +845,7 @@ where
         Ok(()) => CoreModuleRunCompletion::Exit(Ok(ChildExit {
             instance_id: run.instance_id,
             exit_code: 0,
-            filesystem: Some(store.data().filesystem.snapshot()),
+            filesystem: Some(store.data().filesystem.root_layer()),
         })),
         // Main's call stopped because a spawned thread ended the process;
         // the process ends the way that thread's call ended it: it exits
@@ -848,7 +858,7 @@ where
                 WasixProcessEnd::Exit(code) => CoreModuleRunCompletion::Exit(Ok(ChildExit {
                     instance_id: run.instance_id,
                     exit_code: code,
-                    filesystem: Some(store.data().filesystem.snapshot()),
+                    filesystem: Some(store.data().filesystem.root_layer()),
                 })),
                 WasixProcessEnd::Exec(replacement) => CoreModuleRunCompletion::Exec(replacement),
                 WasixProcessEnd::Fail(failure) => CoreModuleRunCompletion::Exit(Err(failure)),
@@ -862,7 +872,7 @@ where
                 CoreModuleRunCompletion::Exit(end.map(|exit_code| ChildExit {
                     instance_id: run.instance_id,
                     exit_code,
-                    filesystem: Some(store.data().filesystem.snapshot()),
+                    filesystem: Some(store.data().filesystem.root_layer()),
                 }))
             }
         }
@@ -985,7 +995,7 @@ pub(super) async fn run_program_component<CpuImpl, Net, HostFs>(
     argv: ProgramArgv,
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
-    filesystem: Option<DebugFileSystemSnapshot>,
+    filesystem: Option<Namespace<HostFs>>,
     _signal_state: WasixSignalState,
     spawner: crate::InstanceSpawner<CpuImpl>,
     progress: helios_hal::watchdog::ProgressCounter,
@@ -1021,12 +1031,8 @@ where
     let store_prepare_started = profile_runtime_state
         .profiling_enabled()
         .then(|| profile_cpu.now().ticks());
-    let filesystem = match filesystem {
-        Some(snapshot) => {
-            DebugFileSystem::from_snapshot(exec_context.runtime_state.clone(), snapshot)
-        }
-        None => DebugFileSystem::new(exec_context.runtime_state.clone()),
-    };
+    let filesystem =
+        filesystem.unwrap_or_else(|| exec_context.runtime_state.root_namespace().descend());
     let (mut store, interrupts) = crate::wasmtime_adapter::store_with_state(
         engine,
         StoreData::<CpuImpl, Net, HostFs>::new(
@@ -1567,7 +1573,7 @@ where
         memory: memory_bytes,
         memory_pages,
         descriptors: store.data().descriptors.clone(),
-        filesystem: store.data().filesystem.snapshot(),
+        filesystem: store.data().filesystem.root_layer(),
         authority: store.data().authority.clone(),
         cwd: store.data().cwd.clone(),
         arguments: store.data().arguments.clone(),
@@ -1744,7 +1750,7 @@ where
             argv,
             environment,
             store.data().authority.clone(),
-            Some(store.data().filesystem.snapshot()),
+            Some(store.data().filesystem.clone()),
         ),
         output_mode,
         ChildStdio {
@@ -1987,11 +1993,13 @@ pub(super) fn map_program_runtime_error(error: wasmtime::Error) -> ProgramExecEr
         tracing::error!(?error, reason = ?killed.reason, "program instance was killed");
         let kind = match killed.reason {
             crate::KillReason::OutOfMemory => ProgramExecErrorKind::OutOfMemory,
-            // Both are somebody outside the program deciding it should
-            // stop, which is nothing the program's own caller did wrong.
-            crate::KillReason::SupervisorRestart | crate::KillReason::Operator => {
-                ProgramExecErrorKind::Internal
-            }
+            // Each is somebody outside the program deciding it should
+            // stop, or nobody waiting for it any more, which is nothing the
+            // program's own caller did wrong.
+            crate::KillReason::SupervisorRestart
+            | crate::KillReason::Operator
+            | crate::KillReason::RequesterGone
+            | crate::KillReason::StoreFailed => ProgramExecErrorKind::Internal,
         };
         return ProgramExecError {
             kind,

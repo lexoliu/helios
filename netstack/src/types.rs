@@ -24,6 +24,17 @@ impl Ipv4Address {
     pub const fn is_multicast(self) -> bool {
         self.0[0] >= 224 && self.0[0] <= 239
     }
+
+    /// `127.0.0.0/8`, the loopback network (RFC 1122 section 3.2.1.3).
+    pub const fn is_loopback(self) -> bool {
+        self.0[0] == 127
+    }
+
+    /// `240.0.0.0/4`, the reserved class E, which holds the limited
+    /// broadcast address too.
+    pub const fn is_class_e(self) -> bool {
+        self.0[0] >= 240
+    }
 }
 
 impl fmt::Debug for Ipv4Address {
@@ -175,11 +186,11 @@ impl Ipv6Address {
 
 impl fmt::Debug for Ipv6Address {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (index, chunk) in self.0.chunks_exact(2).enumerate() {
+        for (index, &chunk) in self.0.as_chunks::<2>().0.iter().enumerate() {
             if index != 0 {
                 f.write_str(":")?;
             }
-            write!(f, "{:x}", u16::from_be_bytes([chunk[0], chunk[1]]))?;
+            write!(f, "{:x}", u16::from_be_bytes(chunk))?;
         }
         Ok(())
     }

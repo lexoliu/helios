@@ -118,6 +118,7 @@ async fn dispatch(
                         stdout: result.output.stdout,
                         stderr: result.output.stderr,
                     },
+                    launch_nanos: result.launch_nanos,
                 })
                 .map_err(|error| programs::ExecError {
                     kind: convert_launch_error_kind(error.kind),
@@ -146,6 +147,7 @@ async fn dispatch(
             let response = response
                 .map(|result| programs::AotResult {
                     destination_path: result.destination_path,
+                    worker_threads: result.worker_threads,
                 })
                 .map_err(|error| programs::ExecError {
                     kind: convert_launch_error_kind(error.kind),
@@ -423,6 +425,15 @@ fn map_capability_grants_to_host(
                         .collect(),
                 })
             }
+            programs::CapabilityGrant::Mount(grant) => {
+                host_programs::CapabilityGrant::Mount(host_programs::MountGrant {
+                    rights: grant
+                        .rights
+                        .into_iter()
+                        .map(map_mount_right_to_host)
+                        .collect(),
+                })
+            }
             programs::CapabilityGrant::Device(grant) => {
                 host_programs::CapabilityGrant::Device(host_programs::DeviceGrant {
                     classes: grant
@@ -508,6 +519,13 @@ fn map_link_right_to_host(right: programs::LinkRight) -> host_programs::LinkRigh
         programs::LinkRight::TargetDirectory => host_programs::LinkRight::TargetDirectory,
         programs::LinkRight::SymlinkCreate => host_programs::LinkRight::SymlinkCreate,
         programs::LinkRight::SymlinkRead => host_programs::LinkRight::SymlinkRead,
+    }
+}
+
+fn map_mount_right_to_host(right: programs::MountRight) -> host_programs::MountRight {
+    match right {
+        programs::MountRight::Mount => host_programs::MountRight::Mount,
+        programs::MountRight::Unmount => host_programs::MountRight::Unmount,
     }
 }
 
@@ -647,6 +665,15 @@ fn convert_network(network: host_stats::Network) -> stats::Network {
                 tcp_window_updates_sent: queue.tcp_window_updates_sent,
                 tcp_retransmits_sent: queue.tcp_retransmits_sent,
                 tcp_sockets: queue.tcp_sockets,
+                tcp_orphan_sockets: queue.tcp_orphan_sockets,
+                tcp_orphan_send_queued_bytes: queue.tcp_orphan_send_queued_bytes,
+                tcp_orphan_fin_wait_1: queue.tcp_orphan_fin_wait_1,
+                tcp_orphan_fin_wait_2: queue.tcp_orphan_fin_wait_2,
+                tcp_orphan_closing: queue.tcp_orphan_closing,
+                tcp_orphan_last_ack: queue.tcp_orphan_last_ack,
+                tcp_orphan_time_wait: queue.tcp_orphan_time_wait,
+                tcp_orphan_other_state: queue.tcp_orphan_other_state,
+                tcp_orphan_retransmit_armed: queue.tcp_orphan_retransmit_armed,
                 tcp_receive_backpressured_sockets: queue.tcp_receive_backpressured_sockets,
                 tcp_receive_window_bytes: queue.tcp_receive_window_bytes,
                 receive_queued_bytes: queue.receive_queued_bytes,

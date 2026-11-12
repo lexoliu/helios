@@ -2,7 +2,8 @@
 //!
 //! `executor` and `task` carry the per-CPU run-queue executor and
 //! its task-spawning surface. `idle` holds the per-processor
-//! haltpoll handshake behind `Executor::park_until_work`. `sync`
+//! haltpoll handshake behind `Executor::park_until_work`. `freeze`
+//! holds every processor at a scheduler boundary. `sync`
 //! provides async-aware mutex /
 //! rwlock / notify primitives. `timer` exposes the timing wheel and
 //! the Sleep future. `time` provides the kernel monotonic clock.
@@ -11,10 +12,12 @@
 
 mod compaction;
 mod executor;
+mod freeze;
 mod idle;
 mod in_flight;
 mod observer;
 pub(crate) mod phases;
+mod ready;
 mod sync;
 mod task;
 mod time;
@@ -31,6 +34,7 @@ pub use executor::{
     Executor, ExecutorRunStats, InstanceSpawner, JoinHandle, LocalJoinHandle, READY_BATCH_TASKS,
     Spawner, TaskCapacityError, TaskFunding,
 };
+pub use freeze::{FreezeError, FrozenMachine};
 pub use idle::IdleOutcome;
 pub use in_flight::InFlight;
 pub use observer::{
@@ -41,6 +45,7 @@ pub use observer::{
     TraceEvent, TraceField, TraceFilter, TraceHistory, TraceLevel, TraceLog, TraceValue,
     matches_perf_metric_filter, matches_profile_filter, matches_trace_filter, parse_console_text,
 };
+pub use ready::ReadyLink;
 pub use sync::{
     Mutex, MutexGuard, Notified, Notify, NotifyWaiter, OwnedRawMutexLease, OwnedRawRwLockReadLease,
     OwnedRawRwLockWriteLease, ProgressChanged, ProgressMark, ProgressSignal, RawMutex,

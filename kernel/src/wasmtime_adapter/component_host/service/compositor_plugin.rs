@@ -261,7 +261,7 @@ where
             exec_context.instance_registry.clone(),
             instance,
             None,
-            DebugFileSystem::new(exec_context.runtime_state.clone()),
+            exec_context.runtime_state.root_namespace().descend(),
             alloc::vec![String::from(COMPOSITOR_PLUGIN_PATH)],
             Vec::new(),
             compositor_authority(),
@@ -586,7 +586,7 @@ mod tests {
 
         assert!(authority.derive_display_claim_cap().is_ok());
         assert!(authority.derive_input_claim_cap().is_ok());
-        assert!(authority.derive_gpu_claim_cap().is_err());
+        assert!(authority.derive_gpu_open_cap().is_err());
         assert!(authority.derive_audio_claim_cap().is_err());
         assert!(authority.granted_devices().is_empty());
         assert!(

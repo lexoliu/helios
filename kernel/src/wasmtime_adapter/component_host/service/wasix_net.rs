@@ -2072,14 +2072,11 @@ where
         GuestAddress::wasm32(ret_flags),
         GuestAddress::wasm32(ret_addr),
     );
-    let layout = match p1_read_iovs_with_byte_len(caller, memory, iovs, iovs_len) {
+    let layout = match p1_read_iovs_with_byte_len(memory, iovs, iovs_len) {
         Ok(layout) => layout,
         Err(errno) => return errno,
     };
-    let capacity = match layout.byte_len_u32() {
-        Ok(capacity) => capacity,
-        Err(errno) => return errno,
-    };
+    let capacity = layout.byte_len;
     let descriptor = caller.data().descriptors.get(fd).cloned();
     let authority = match wasix_sock_recv_authority(descriptor.as_ref()) {
         Ok(authority) => authority,
@@ -2234,8 +2231,10 @@ where
         return p1::errno::FAULT;
     };
     let (iovs, ret_size) = (GuestAddress::wasm32(iovs), GuestAddress::wasm32(ret_size));
-    let bytes = match p1_read_iovs_to_bytes(caller, memory, iovs, iovs_len) {
-        Ok(bytes) => bytes,
+    let mut gather = match p1_read_iovs_with_byte_len(memory, iovs, iovs_len)
+        .and_then(|layout| Preview1Gather::new(memory, &layout))
+    {
+        Ok(gather) => gather,
         Err(errno) => return errno,
     };
     let descriptor = caller.data().descriptors.get(fd).cloned();
@@ -2304,6 +2303,11 @@ where
                 Err(errno) => return errno,
             };
             let timeout = wasix_effective_socket_timeout(send_timeout, fdflags);
+            let bytes =
+                match gather.datagram(crate::wasmtime_adapter::wasi::MAX_WASI_UDP_DATAGRAM_BYTES) {
+                    Ok(bytes) => bytes,
+                    Err(errno) => return errno,
+                };
             let sent = match service
                 .udp_send_address(socket, address, port, &bytes, timeout)
                 .await
@@ -2330,16 +2334,20 @@ where
                 Err(errno) => return errno,
             };
             let timeout = wasix_effective_socket_timeout(options.send_timeout, fdflags);
-            let written = match u32::try_from(bytes.len()) {
-                Ok(written) => written,
-                Err(_) => return p1::errno::OVERFLOW,
-            };
-            if let Err(error) = service
-                .tcp_write_all_bytes(stream.id(), Bytes::from(bytes), timeout)
-                .await
+            let written = match p1_send_gathered(&mut gather, |chunk| {
+                let (service, stream) = (&service, stream.id());
+                async move {
+                    service
+                        .tcp_write_all_bytes(stream, Bytes::from(chunk), timeout)
+                        .await
+                        .map_err(|error| p1_errno_from_tcp_error_for_fdflags(error, fdflags))
+                }
+            })
+            .await
             {
-                return p1_errno_from_tcp_error_for_fdflags(error, fdflags);
-            }
+                Ok(written) => written,
+                Err(errno) => return errno,
+            };
             p1_write_u32(caller, memory, ret_size, written)
         }
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
@@ -2347,17 +2355,18 @@ where
         ))) => p1::errno::INVAL,
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(_))) => p1::errno::INVAL,
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { writer, .. })) => {
-            let written = match u32::try_from(bytes.len()) {
-                Ok(written) => written,
-                Err(_) => return p1::errno::OVERFLOW,
-            };
             let fdflags = match caller.data().descriptors.fdflags(fd) {
                 Ok(fdflags) => fdflags,
                 Err(errno) => return errno,
             };
-            if let Err(errno) = p1_send_to_socketpair(&writer, bytes, fdflags).await {
-                return errno;
-            }
+            let written = match p1_send_gathered(&mut gather, |chunk| {
+                p1_send_to_socketpair(&writer, chunk, fdflags)
+            })
+            .await
+            {
+                Ok(written) => written,
+                Err(errno) => return errno,
+            };
             p1_write_u32(caller, memory, ret_size, written)
         }
         Some(_) => p1::errno::NOTSOCK,
@@ -2377,25 +2386,9 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    if let Some(host_path) = crate::guest_host_share_path(&file.path).map(ToOwned::to_owned) {
-        let service = caller
-            .data()
-            .filesystem
-            .host_service()
-            .map_err(p1_errno_from_fs)?;
-        let max_bytes = u32::try_from(count).map_err(|_| p1::errno::OVERFLOW)?;
-        return service
-            .read_file_range(&host_path, offset, max_bytes)
-            .await
-            .map(Bytes::from)
-            .map_err(|error| {
-                p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(error))
-            });
-    }
-    caller
-        .data()
-        .filesystem
-        .read_file_chunk(file, offset, count)
+    let namespace = p1_namespace(caller);
+    wasi_fs::read(&namespace, p1_grant(file)?, offset, count)
+        .await
         .map_err(p1_errno_from_fs)
 }
 

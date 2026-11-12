@@ -10,6 +10,8 @@ mod audio;
 mod bootfs;
 mod buffer;
 mod component;
+#[cfg(feature = "wasmtime-runtime")]
+mod control_flow;
 mod device;
 mod display;
 mod embedded;
@@ -31,6 +33,7 @@ mod settings;
 mod surface;
 #[cfg(test)]
 mod test_support;
+mod vfs;
 mod vsock;
 #[cfg(feature = "wasmtime-runtime")]
 pub(crate) mod wasmtime_adapter;
@@ -39,7 +42,9 @@ pub use wasmtime_adapter::parking::{
     park_wasmtime_waiter, unpark_wasmtime_waiters, wasmtime_monotonic_nanos,
 };
 #[cfg(feature = "wasmtime-runtime")]
-pub use wasmtime_adapter::swap_fault::resolve_swap_fault_blocking;
+pub use wasmtime_adapter::swap_fault::{
+    UserPageFault, classify_user_page_fault, resolve_swap_fault_blocking, run_swap_fault_trampoline,
+};
 pub use wasmtime_adapter::tls::WasmtimeTlsSlots;
 
 #[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]
@@ -58,10 +63,7 @@ pub use audio::{
     FEEDBACK_QUEUE_DEPTH, Feedback, FeedbackBurst, FeedbackReader, PERIOD_MICROS,
     PERIODS_IN_FLIGHT, PeriodRing, PeriodWriter, PlaybackFormat, install_audio_device,
 };
-pub use bootfs::{
-    BootDirectory, BootDirectoryEntry, BootDirectoryHandleExt, BootFile, BootfsBytes,
-    EmbeddedBootDirectory, EmbeddedBootFile, EmbeddedBootFs,
-};
+pub use bootfs::{BootFs, BootfsBytes, EmbeddedBootDirectory, EmbeddedBootFile, EmbeddedBootFs};
 pub use buffer::{
     BYTES_PER_PIXEL, Buffer, BufferError, GuestMemory, MAX_VIEWS, Span, ViewError, ViewGroup,
     ViewId, ViewTable, WASM_PAGE_BYTES,
@@ -102,22 +104,23 @@ pub use embedded::{BootPayload, EmbeddedComponent, EmbeddedInit};
 pub use exec::{
     CompactionBudget, CompactionPolicy, CompactionReport, CompactionTarget, Compactor,
     DEFAULT_PERF_METRIC_CAPACITY, DEFAULT_PROFILE_STACK_CAPACITY, DEFAULT_TRACE_HISTORY_CAPACITY,
-    Executor, ExecutorRunStats, FoldedProfileSample, GUEST_TIME_SLICE, IdleOutcome,
-    InstanceSpawner, JoinHandle, KernelClock, LocalJoinHandle, MAX_FILTER_PREFIX_BYTES,
-    MAX_FILTER_PREFIXES, Mutex, MutexGuard, Notified, Notify, NotifyWaiter, ObservationScope,
-    OwnInstance, OwnedRawMutexLease, OwnedRawRwLockReadLease, OwnedRawRwLockWriteLease,
-    PerfMetricFilter, PerfMetricHistory, PerfMetricSample, PerfSample, PrefixSet, PrefixSetError,
-    PressureLevel, ProfileFilter, ProfileHistory, ProfileScope, ProfileSink, ProgressChanged,
-    ProgressMark, ProgressSignal, RawMutex, RawMutexLease, RawRwLock, RawRwLockReadLease,
-    RawRwLockWriteLease, RwLock, RwLockReadGuard, RwLockWriteGuard, Sleep, Spawner, StatsSample,
-    TaskCapacityError, TaskFunding, Timer, TraceEvent, TraceField, TraceFilter, TraceHistory,
-    TraceLevel, TraceLog, TraceValue, UptimeClock, YieldNow, elapsed_millis,
-    matches_perf_metric_filter, matches_profile_filter, matches_trace_filter, monotonic_nanos,
-    parse_console_text, wall_clock_offset_nanos, yield_now,
+    Executor, ExecutorRunStats, FoldedProfileSample, FreezeError, FrozenMachine, GUEST_TIME_SLICE,
+    IdleOutcome, InstanceSpawner, JoinHandle, KernelClock, LocalJoinHandle,
+    MAX_FILTER_PREFIX_BYTES, MAX_FILTER_PREFIXES, Mutex, MutexGuard, Notified, Notify,
+    NotifyWaiter, ObservationScope, OwnInstance, OwnedRawMutexLease, OwnedRawRwLockReadLease,
+    OwnedRawRwLockWriteLease, PerfMetricFilter, PerfMetricHistory, PerfMetricSample, PerfSample,
+    PrefixSet, PrefixSetError, PressureLevel, ProfileFilter, ProfileHistory, ProfileScope,
+    ProfileSink, ProgressChanged, ProgressMark, ProgressSignal, RawMutex, RawMutexLease, RawRwLock,
+    RawRwLockReadLease, RawRwLockWriteLease, ReadyLink, RwLock, RwLockReadGuard, RwLockWriteGuard,
+    Sleep, Spawner, StatsSample, TaskCapacityError, TaskFunding, Timer, TraceEvent, TraceField,
+    TraceFilter, TraceHistory, TraceLevel, TraceLog, TraceValue, UptimeClock, YieldNow,
+    elapsed_millis, matches_perf_metric_filter, matches_profile_filter, matches_trace_filter,
+    monotonic_nanos, parse_console_text, wall_clock_offset_nanos, yield_now,
 };
 pub use gpu::{
-    ContextRecord, Gpu3dClaim, Gpu3dOwnership, Gpu3dSender, Gpu3dService, Gpu3dServiceError,
-    MAX_GPU_BLOBS, MAX_GPU_CONTEXTS, MAX_GPU_VIEWS, install_gpu3d_device,
+    ContextRecord, ContextShared, Gpu3dOwnership, Gpu3dSender, Gpu3dService, Gpu3dServiceError,
+    Gpu3dSession, MAX_EXECUTE_BYTES, MAX_GPU_BLOBS, MAX_GPU_CONTEXTS, MAX_GPU_VIEWS,
+    MAX_MACHINE_GPU_BLOBS, MAX_MACHINE_GPU_CONTEXTS, RingTimeline, SessionId, install_gpu3d_device,
 };
 pub use helios_hal::Platform;
 pub use helios_netstack::{
@@ -126,8 +129,8 @@ pub use helios_netstack::{
     RxFrame, RxFrameOffload, SegmentationOffload, TxFrameRef,
 };
 pub use host_fs::{
-    HOST_SHARE_GUEST_MOUNT_PATH, HOST_SHARE_MOUNT_TAG, HostFsCacheStats, HostFsClient,
-    HostFsTransport, UnsupportedHostFileSystem, guest_host_share_path,
+    FilledHostFsWrite, HOST_SHARE_GUEST_MOUNT_PATH, HOST_SHARE_MOUNT_TAG, HostFsCacheStats,
+    HostFsClient, HostFsTransport, HostFsWrite, UnsupportedHostFileSystem,
 };
 pub use input::{
     DeviceIndex, EVENT_QUEUE_DEPTH, EventBurst, InputClaim, InputDeviceSnapshot, InputEvents,
@@ -151,41 +154,42 @@ pub use io::{
     PanicSerial, PollKey, PollRegistration, PollRegistry, PollRegistryError, PollSourceKind,
     RecordingConsole, SCRATCH_DISK_SERIAL, ScratchDisk, ScratchDiskStats, SerialReader, TryRead,
     TryWrite, admit_block_devices, byte_channel, emit_panic_report, install_block_devices,
-    read_debug_serial, read_serial, try_read_serial, wake_queue_owners,
+    install_scratch_swap, read_debug_serial, read_serial, try_read_serial, wake_queue_owners,
 };
 pub use kernel_exception::{
     KernelException, KernelExceptionCause, KernelExceptionDispatch, KernelNativeTrapHandler,
     dispatch_native_trap, install_native_trap_handler,
 };
 pub use machine::{
-    AdvanceCause, Generation, MachineGeneration, MachineGenerationHandle, UnhandledAdvances,
-    install_generation_reactions,
+    AdvanceCause, DeviceResets, Generation, MachineGeneration, MachineGenerationHandle,
+    ResetDevice, UnhandledAdvances, install_generation_reactions,
 };
 pub use memory::{
-    AccessibilityPlan, BalloonHandle, BalloonStats, BootMemoryPlan, BootRegionSplitter,
-    COMPRESSED_PAGE_BYTES, CommittedRegion, CommittedRemoval, CompressRefusal, CompressedPage,
-    CompressedPool, CompressedPoolError, CompressedPoolStats, DEFAULT_COMPRESSION_LEVEL,
-    DEFAULT_POOL_PERCENT, Decommitted, ENTROPY_RESEED_INTERVAL, EntropyPool, EntropySources,
-    FIBER_STACK_GUARD_BYTES, FREE_PAGE_REPORT_INTERVAL, FiberStack, FiberStackArenaStats,
-    FiberStackError, FiberStackVmHooks, HardwareEntropySource, IDLE_SWAP_AFTER,
-    INCOMPRESSIBLE_BYTES, KERNEL_HEAP_BOOTSTRAP_BYTES, KERNEL_HEAP_GROWTH_CHUNK_BYTES,
-    KERNEL_HEAP_MAX_BOOT_FRACTION, KERNEL_HEAP_MIN_RESERVE_BYTES, KERNEL_HEAP_RESERVE_FRACTION,
-    KernelPhysFrameAllocator, MemoryOwner, NoCryptographicEntropy, NoEntropyDevice,
-    ROOT_ENTROPY_MATERIAL_BYTES, RegionShares, ReleasedReservation, ReservationLookup,
-    ReservationTracker, RootEntropy, RootEntropyHandle, SWAP_BATCH_BYTES, SWAP_TICK, StackFault,
-    SwapDisabled, SwapEntry, SwapFaultError, SwapHandle, SwapStats, SwapVmHooks,
-    TASK_ARENA_FRACTION, TASK_ARENA_MIN_BYTES, USER_POOL_MIN_REGION_BYTES, UserHeapStats,
-    UserMemoryOwnerScope, UserMemoryOwners, UserMemoryPool, VaCursor,
-    allocate_user_frame_uninit_on, allocate_user_frame_zeroed, allocate_user_frame_zeroed_on,
-    allocate_user_run_zeroed_on, claim_fiber_stack, configure_user_memory_owner_processors,
-    current_user_memory_owner, deallocate_user_frame, deallocate_user_frame_on,
-    deallocate_user_run_on, disable_swap, enter_user_memory_owner, fiber_stack_arena_stats,
-    fiber_stack_demand_commits_on, install_entropy_device, install_fiber_stack_arena,
-    install_fiber_stack_hooks, install_memory_balloon, install_swap, install_swap_hooks,
+    AGE_BATCH_PAGES, AccessibilityPlan, BalloonHandle, BalloonStats, BootMemoryPlan,
+    BootRegionSplitter, COMPRESSED_PAGE_BYTES, CommittedRegion, CommittedRemoval, CompressRefusal,
+    CompressedPage, CompressedPool, CompressedPoolError, CompressedPoolStats,
+    DEFAULT_COMPRESSION_LEVEL, DEFAULT_POOL_PERCENT, Decommitted, ENTROPY_RESEED_INTERVAL,
+    EntropyPool, EntropySources, FIBER_STACK_GUARD_BYTES, FREE_PAGE_REPORT_INTERVAL, FiberStack,
+    FiberStackArenaStats, FiberStackError, FiberStackVmHooks, HardwareEntropySource,
+    IDLE_SWAP_AFTER, INCOMPRESSIBLE_BYTES, InstalledAddressSpace, KERNEL_HEAP_BOOTSTRAP_BYTES,
+    KERNEL_HEAP_GROWTH_CHUNK_BYTES, KERNEL_HEAP_MAX_BOOT_FRACTION, KERNEL_HEAP_MIN_RESERVE_BYTES,
+    KERNEL_HEAP_RESERVE_FRACTION, KernelPhysFrameAllocator, MemoryOwner, NoCryptographicEntropy,
+    NoEntropyDevice, ROOT_ENTROPY_MATERIAL_BYTES, RegionShares, ReleasedReservation,
+    ReservationLookup, ReservationTracker, RootEntropy, RootEntropyHandle, SWAP_BATCH_BYTES,
+    SWAP_TICK, StackFault, SwapDisabled, SwapEntry, SwapFaultError, SwapHandle, SwapLeafFormat,
+    SwapSpace, SwapStats, SwapVmHooks, TASK_ARENA_FRACTION, TASK_ARENA_MIN_BYTES,
+    USER_POOL_MIN_REGION_BYTES, UserHeapStats, UserMemoryOwnerScope, UserMemoryOwners,
+    UserMemoryPool, VaCursor, allocate_user_frame_uninit_on, allocate_user_frame_zeroed,
+    allocate_user_frame_zeroed_on, allocate_user_memory_pool, allocate_user_run_zeroed_on,
+    claim_fiber_stack, configure_user_memory_owner_processors, current_user_memory_owner,
+    deallocate_user_frame, deallocate_user_frame_on, deallocate_user_run_on, disable_swap,
+    enter_user_memory_owner, fiber_stack_arena_stats, fiber_stack_demand_commits_on,
+    install_entropy_device, install_fiber_stack_arena, install_fiber_stack_hooks,
+    install_memory_balloon, install_swap, install_swap_hooks, install_user_memory_pool,
     installed_swap_handle, installed_swap_hooks, kernel_reserve_for, largest_servable_user_bytes,
     page_fault_frame_reserve_bytes, ranges_outside, resolve_stack_fault, seed_root_entropy,
-    swapped_token, task_arena_bytes_for, user_heap_stats, user_mapping_kernel_heap_bytes,
-    validate_range,
+    swap_vm_hooks, swapped_token, task_arena_bytes_for, user_heap_stats,
+    user_mapping_kernel_heap_bytes, validate_range,
 };
 pub use network::{
     HTTP_FORBIDDEN_FIELD_NAMES, HTTP_MAX_FIELD_SECTION_BYTES, HTTP_MAX_FIELD_VALUE_BYTES, HttpBody,
@@ -199,19 +203,21 @@ pub use network::{
     validate_http_path_with_query, validate_http_status_code,
 };
 pub use process::{
-    AudioClaimCap, ClockAuthorityRights, DescriptorEntry, DescriptorId, DescriptorLimit,
-    DescriptorLimitSetting, DescriptorTable, DescriptorTableError, DeviceClassRights,
-    DeviceGrantClaimCap, DiagnosticAuthorityRights, DirectoryAuthorityRights, DirectoryCap,
-    DirectoryPreopen, DisplayClaimCap, DnsCap, ExecAuthority, ForkAuthority, FutexKey, FutexTable,
-    FutexWaitRegistration, GpuClaimCap, GuestAddress, InputClaimCap, JoinAuthority,
-    LinkAuthorityRights, LinkSourceCap, LinkTargetDirectoryCap, MulticastCap, NetworkAdminCap,
-    NetworkAuthorityRights, NetworkCap, ObserveMachineCap, PrivilegedBindCap, ProcessAuthority,
-    ProcessAuthorityError, ProcessAuthorityRights, ProcessId, ProcessMemoryIdentity, ProcessRecord,
-    ProcessState, ProcessTable, ProcessTableError, ProgramExecError, ProgramExecErrorDetail,
+    AudioClaimCap, ClockAuthorityRights, CompileAuthority, DescriptorEntry, DescriptorId,
+    DescriptorLimit, DescriptorLimitSetting, DescriptorTable, DescriptorTableError,
+    DeviceClassRights, DeviceGrantClaimCap, DiagnosticAuthorityRights, DirectoryAuthorityRights,
+    DirectoryCap, DirectoryPreopen, DisplayClaimCap, DnsCap, ExecAuthority, ForkAuthority,
+    FutexKey, FutexTable, FutexWaitRegistration, GpuOpenCap, GuestAddress, InputClaimCap,
+    JoinAuthority, LinkAuthorityRights, LinkSourceCap, LinkTargetDirectoryCap,
+    MountAuthorityRights, MountCap, MulticastCap, NetworkAdminCap, NetworkAuthorityRights,
+    NetworkCap, ObserveMachineCap, PrivilegedBindCap, ProcessAuthority, ProcessAuthorityError,
+    ProcessAuthorityRights, ProcessId, ProcessMemoryIdentity, ProcessRecord, ProcessState,
+    ProcessTable, ProcessTableError, ProgramExecError, ProgramExecErrorDetail,
     ProgramExecErrorKind, ProgramOutOfMemory, RuntimeMessage, SetWallClockCap,
     SettingsAuthorityRights, SignalAuthority, SpawnAuthority, SymlinkCreateCap, SymlinkReadCap,
     TcpCap, TerminalAuthorityRights, TerminalInputCap, TerminalOutputCap, ThreadId, ThreadRecord,
-    ThreadState, ThreadTable, ThreadTableError, TtyControlCap, UdpCap, WriteSettingsCap,
+    ThreadState, ThreadTable, ThreadTableError, TtyControlCap, UdpCap, UnmountCap,
+    WriteSettingsCap,
 };
 pub use profiling::{
     CodeAttribution, InstructionProfile, InstructionProfileError, InstructionSampler,
@@ -220,9 +226,9 @@ pub use profiling::{
     WasmFunctionSample,
 };
 pub use runtime::{
-    AuthorityDomain, ComponentHostFilesystemState, ComponentHostNetwork, ComponentNetworkService,
-    ComponentNetworkState, DnsError, DnsErrorKind, ExecOutput, ExecResult, HostDirEntry,
-    HostDirLimit, HostFileSystem, HostFsError, HostFsErrorKind, HostMetadata, HostShareRestore,
+    AuthorityDomain, ComponentHostNetwork, ComponentNetworkService, ComponentNetworkState,
+    DnsError, DnsErrorKind, ExecOutput, ExecResult, HostDirEntry, HostDirLimit, HostFileSystem,
+    HostFilledWrite, HostFsError, HostFsErrorKind, HostMetadata, HostShareRestore, HostWrite,
     Ipv4Address, NetworkErrorDetail, NetworkHandle, NetworkIpAddress, NetworkPacketPump,
     ObjectIdentity, PingError, PingErrorKind, PingReply, RegisteredTcpReadBuffer, RuntimeState,
     SocketReadiness, TcpAccepted, TcpError, TcpErrorKind, TcpListener, TcpReadProgress,
@@ -237,6 +243,13 @@ pub use surface::{
     SURFACE_EVENT_QUEUE_DEPTH, SURFACE_REQUEST_QUEUE_DEPTH, SurfaceCreate, SurfaceEvents,
     SurfaceGeometry, SurfaceId, SurfaceOwnership, SurfaceRect, SurfaceRequest, SurfaceService,
     SurfaceServiceError, SurfaceShared,
+};
+pub use vfs::{
+    BOOT_DEVICE, FileContents, Follow, HeldPath, HostShare, HostShareWrite, MAX_MOUNTS,
+    MAX_SYMLINK_DEPTH, MemoryFs, MemoryWrite, MountError, MountHold, MountRequestError,
+    MountSource, MountTable, MountedFs, MountedWrite, Namespace, ROOT_LAYER_DEVICE, Resolved,
+    RootFs, RootWrite, object_identity, request_mount, request_unmount, symlink_target,
+    within_directory,
 };
 pub use vsock::{
     ComponentHostVsockService, MAX_VSOCK_BACKLOG, MAX_VSOCK_CONNECTIONS, MAX_VSOCK_LISTENERS,
@@ -908,6 +921,34 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> Kernel<CpuImpl, Watch
         self.timer.sleep_for(duration)
     }
 
+    /// Holds every processor still at a scheduler boundary, from this
+    /// one, until the returned [`FrozenMachine`] is dropped.
+    ///
+    /// `arrival_deadline` is how long the caller lets the other
+    /// processors take to reach a boundary: its policy for a host that
+    /// may deschedule a processor, and for a task that does not yield.
+    /// `interrupt_guests` asks the runtime that runs guests to interrupt
+    /// each one that is running now (`GuestInterrupts::interrupt_running`),
+    /// so a processor inside wasm reaches a boundary at its next check
+    /// and not at the end of its slice. The concurrency contract, and
+    /// what the caller may do while the machine is held, are in
+    /// `exec::freeze`. The answer pets this kernel's hardware watchdog on
+    /// request, which a hold longer than the watchdog's timeout needs.
+    pub async fn freeze(
+        &self,
+        arrival_deadline: Duration,
+        interrupt_guests: impl FnOnce(),
+    ) -> Result<FrozenMachine<CpuImpl, WatchdogImpl>, FreezeError> {
+        self.executor
+            .freeze(
+                &self.timer,
+                self.watchdog.clone(),
+                arrival_deadline,
+                interrupt_guests,
+            )
+            .await
+    }
+
     pub fn run_until_stalled(&self) -> usize {
         self.run_until_stalled_with_stats().progress_count()
     }
@@ -972,6 +1013,9 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> Kernel<CpuImpl, Watch
         let mut task = core::pin::pin!(self.spawn_local(future));
 
         loop {
+            // The root future is polled outside the ready queues, so it
+            // has a scheduler boundary of its own.
+            self.executor.freeze_checkpoint(&self.cpu);
             parker.clear();
             match task.as_mut().poll(&mut context) {
                 Poll::Ready(output) => return output,

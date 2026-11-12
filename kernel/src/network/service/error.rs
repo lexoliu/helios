@@ -64,6 +64,19 @@ pub(super) fn map_tcp_connect_terminal_error(error: TcpConnectTerminalError) -> 
     }
 }
 
+/// Maps a refused TCP open. A full socket slab is a resource the guest
+/// can wait on, so it names that; any other refusal is the call's own
+/// `start_failed` detail.
+pub(super) fn map_tcp_open_error(error: StackError, start_failed: NetworkErrorDetail) -> TcpError {
+    TcpError {
+        kind: TcpErrorKind::Unavailable,
+        detail: match error {
+            StackError::TcpSocketsExhausted => NetworkErrorDetail::TcpNoSocketSlots,
+            _ => start_failed,
+        },
+    }
+}
+
 pub(super) fn map_udp_socket_error(error: UdpSocketError) -> UdpError {
     match error {
         UdpSocketError::RemotePortUnreachable => UdpError {
@@ -238,21 +251,6 @@ pub(super) fn require_local_network_port(port: NetworkPortId) -> Result<(), Netw
         Ok(())
     } else {
         Err(NetworkControlError::PortUnavailable)
-    }
-}
-
-pub(super) fn ipv4_mask_prefix_len(mask: Ipv4Address) -> Result<u8, NetworkControlError> {
-    let raw = u32::from_be_bytes(mask.octets());
-    let prefix_len = raw.leading_ones() as u8;
-    let expected = if prefix_len == 0 {
-        0
-    } else {
-        u32::MAX << (32 - prefix_len)
-    };
-    if raw == expected {
-        Ok(prefix_len)
-    } else {
-        Err(NetworkControlError::InvalidAddress)
     }
 }
 

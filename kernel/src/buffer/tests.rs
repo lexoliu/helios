@@ -251,7 +251,7 @@ fn a_device_region_is_shown_without_a_run() {
     assert_eq!(
         changes_since(before),
         [
-            MappingChange::SubstituteDevice(shown),
+            MappingChange::SubstituteDevice(shown, DeviceRegionAttributes::REGISTERS),
             MappingChange::Restore(shown)
         ]
     );

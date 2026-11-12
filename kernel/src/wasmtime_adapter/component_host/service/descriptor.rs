@@ -1179,6 +1179,7 @@ pub(super) fn preview1_cwd_from_authority(authority: &ProcessAuthority) -> Optio
             kind: FsNodeKind::Directory,
             flags: directory_authority_to_descriptor_flags(preopen.rights()),
             identity: None,
+            mount: None,
         },
     })
 }
@@ -1226,6 +1227,7 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
                 kind: FsNodeKind::Directory,
                 flags: directory_authority_to_descriptor_flags(preopen.rights()),
                 identity: None,
+                mount: None,
             };
             table.entries.push(Some(Preview1DescriptorEntry::new(
                 Preview1Descriptor::Preopen {
@@ -1954,10 +1956,4 @@ pub(super) fn p1_probe_descriptor<Net: ComponentHostNetwork>(
         (Some(_), _) => Err(p1::errno::INVAL),
         (None, _) => Err(p1::errno::BADF),
     }
-}
-
-pub(super) fn p1_descriptor_stat_from_host_metadata(
-    metadata: &crate::HostMetadata,
-) -> fs_types::DescriptorStat {
-    crate::wasmtime_adapter::wasi::descriptor_stat_from_host_metadata(metadata)
 }

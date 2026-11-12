@@ -56,6 +56,35 @@ TABLE_SIDE_ORDER = [
 #: The sides only a paired run measures.
 PAIRED_SIDES = frozenset({Side.HELIOS_BASELINE, Side.HELIOS_BASELINE_REBUILD})
 
+#: Every column a Helios image produces; the rest are the Linux guest's.
+HELIOS_SIDES = frozenset({Side.HELIOS, Side.HELIOS_BASELINE, Side.HELIOS_BASELINE_REBUILD})
+
+
+class Clock(StrEnum):
+    """What a row's compared `elapsed_ms` was timed with (#491).
+
+    `helios_bench.sources.compared_clock` is the one place a row's clock
+    is chosen.
+    """
+
+    #: The inspector's host-side `Instant` around the guest RPC: the
+    #: transport the RPC rode is inside every value.
+    HOST_ROUND_TRIP = "host-round-trip"
+    #: The kernel's own launch duration, the `exec` reply's
+    #: `launch-nanos`: from the launch call's arrival in the kernel to
+    #: its result being in hand, with no transport inside it.
+    KERNEL_LAUNCH = "kernel-launch"
+    #: `time.perf_counter_ns()` around `subprocess.run` inside the Linux
+    #: guest (`linux_workload_runner.py`).
+    GUEST_PROCESS = "guest-process"
+
+
+CLOCK_LABELS = {
+    Clock.HOST_ROUND_TRIP: "the host-side round trip of the inspector RPC",
+    Clock.KERNEL_LAUNCH: "the kernel's launch duration from the `exec` reply",
+    Clock.GUEST_PROCESS: "the in-guest time around the process",
+}
+
 
 class WorkloadClass(StrEnum):
     STARTUP = "startup"
@@ -355,6 +384,26 @@ class Asymmetry(BaseModel):
     linux: str
 
 
+class GuestRam(BaseModel, frozen=True):
+    """How the host backed one guest's RAM (#491).
+
+    A guest whose RAM QEMU maps lazily pays a host page fault on the
+    first touch of every page, and one whose RAM is preallocated does
+    not, so the two columns compare alike only when this is equal.
+    """
+
+    backing: Literal["lazy", "prealloc"]
+    size: str = Field(description="the guest's `-m` size, which a backend must match")
+    prealloc_threads: int | None = Field(
+        default=None, description="the threads QEMU populated a preallocated backend with"
+    )
+
+    def describe(self) -> str:
+        if self.backing == "lazy":
+            return f"{self.size}, mapped lazily"
+        return f"{self.size}, `memory-backend-ram` preallocated by {self.prealloc_threads} threads"
+
+
 class Pins(BaseModel):
     wasmtime_revision: str = Field(
         description="the Wasmtime fork revision the `helios` side was built against"
@@ -373,6 +422,20 @@ class Pins(BaseModel):
     vcpus: int
     memory: str
     linux_vm_memory: str
+    helios_guest_ram: GuestRam | None = Field(
+        default=None,
+        description=(
+            "how the `helios` guest's RAM was backed, as its inspector's run record states; "
+            "None for a report written before the field existed or a run without a Helios side"
+        ),
+    )
+    linux_guest_ram: GuestRam | None = Field(
+        default=None,
+        description=(
+            "how the Fedora guest's RAM was backed, from `guest_ram_backend` in "
+            "fedora_qemu_baseline.py; None for a report written before the field existed"
+        ),
+    )
     net_backend: str
     rpc_transport: Literal["serial", "vsock"] | None = Field(
         default=None,
@@ -388,6 +451,21 @@ class Pins(BaseModel):
     )
     bootfs_cwasm: dict[str, str] = Field(
         description="bootfs asset -> sha256 of the signed cwasm Helios loaded"
+    )
+    compiler_plugin_wasm: str | None = Field(
+        default=None,
+        description=(
+            "sha256 of the compiler plugin's core module both `aot-curl` columns ran: Helios "
+            "through the bootfs cwasm precompiled from it, Linux + Wasmtime directly; None when "
+            "the run selected no workload that hosts it"
+        ),
+    )
+    compiler_host: str | None = Field(
+        default=None,
+        description=(
+            "sha256 of the `helios-compiler-host` binary the Linux + Wasmtime column hosted the "
+            "plugin with, built from this checkout against `wasmtime_revision`"
+        ),
     )
     asymmetries: list[Asymmetry] = Field(
         default_factory=list,
@@ -410,7 +488,19 @@ class Iteration(BaseModel):
         description="the alternating round (#491) this launch was timed in; `index` counts within it",
     )
     index: int
-    elapsed_ms: float
+    elapsed_ms: float = Field(description="the compared value: what `clock` timed")
+    clock: Clock | None = Field(
+        default=None,
+        description="what `elapsed_ms` was timed with; None for a report written before the field existed",
+    )
+    host_elapsed_ms: float | None = Field(
+        default=None,
+        description="a Helios launch's host-side round trip, kept beside the value compared",
+    )
+    launch_elapsed_ms: float | None = Field(
+        default=None,
+        description="a Helios program launch's own duration as the kernel reported it",
+    )
     cold: bool
     metrics: dict[str, float]
 
@@ -433,6 +523,10 @@ class SeriesStats(BaseModel):
 class Cell(BaseModel):
     side: Side
     iterations: list[Iteration]
+    clock: Clock | None = Field(
+        default=None,
+        description="what every iteration's compared value was timed with; None when unrecorded",
+    )
     cold: SeriesStats
     warm: SeriesStats
     rejected: bool
@@ -459,6 +553,13 @@ class WorkloadResult(BaseModel):
     headline: bool
     description: str
     throughput_bytes: int | None
+    matched_metrics: tuple[str, ...] = Field(
+        default=(),
+        description=(
+            "metrics the manifest holds equal across the compared columns: conditions the "
+            "comparison runs at, never measurements the gate judges"
+        ),
+    )
     cells: dict[Side, Cell]
     failures: dict[Side, str] = Field(
         default_factory=dict,

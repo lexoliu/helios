@@ -302,9 +302,11 @@ where
             // What was queued becomes a segment on this shard's egress
             // while the lock is already held; nothing else has to run
             // for the write to reach the wire.
-            state.stack.drive_tcp(now).unwrap_or_else(|error| {
-                tracing::debug!(?error, "failed to drive TCP after stream write")
-            });
+            state
+                .drive_tcp(now, &self.inner.control)
+                .unwrap_or_else(|error| {
+                    tracing::debug!(?error, "failed to drive TCP after stream write")
+                });
             Ok(progress)
         })?;
         let (transmitted, _) = self
@@ -418,7 +420,7 @@ where
     /// reset on the outbound queue, and neither puts a frame anywhere a
     /// shard's own arrival signal would see. Without the kick the
     /// segment waits for the pump's next park to expire — up to
-    /// `DHCP_RETRANSMIT_NANOS` on a guest with nothing else to send —
+    /// `CONFIGURATION_POLL_NANOS` on a guest with nothing else to send —
     /// so a peer learns of the close a second after the guest made it.
     /// The kick belongs here rather than at the call sites: #232 put it
     /// on the component host's retirement drain, and the owners that
@@ -541,29 +543,33 @@ where
             detail: NetworkErrorDetail::NetworkServiceUnavailable,
         })?;
         let shard_count = self.inner.state.shard_count();
-        let local_port = if local_port == 0 {
-            // Allocating from this processor's own shard, preferring a
-            // port whose answers hash back to it, is what keeps a
-            // connection opened here from being received somewhere
-            // else. Ownership follows the hash either way.
+        let opened_at = StackInstant::from_nanos(self.now_nanos());
+        let stream = if local_port == 0 {
+            // Choosing the port and opening the connection are one
+            // step: a four-tuple a lingering connection still holds
+            // (TIME-WAIT included) can only be seen by opening, so the
+            // walk moves on at that conflict instead of failing.
+            self.inner.state.open_ephemeral_tcp_connect(
+                self.accepting_shard_idx(),
+                TcpConnectRequest {
+                    local,
+                    destination,
+                    port,
+                    hop_limit,
+                    opened_at,
+                },
+            )?
+        } else {
+            // A program-bound port is one attempt; a conflict is the
+            // program's to see.
+            let owner = shard_idx_for_flow(local, local_port, destination, port, shard_count);
             self.inner
                 .state
-                .shard_at(self.accepting_shard_idx())
+                .shard_at(owner)
                 .lock()
-                .allocate_tcp_local_port_for(local, destination, port, shard_count)?
-        } else {
-            local_port
+                .start_tcp_connect(local, destination, port, local_port, hop_limit, opened_at)
+                .map_err(TcpConnectStartError::into_tcp_error)?
         };
-        let owner = shard_idx_for_flow(local, local_port, destination, port, shard_count);
-        let opened_at = StackInstant::from_nanos(self.now_nanos());
-        let stream = self.inner.state.shard_at(owner).lock().start_tcp_connect(
-            local,
-            destination,
-            port,
-            local_port,
-            hop_limit,
-            opened_at,
-        )?;
 
         loop {
             // Sampled before the handshake state is inspected, so a SYN-ACK
@@ -712,7 +718,7 @@ where
             //
             // Left to the packet pump instead, the segment waits for
             // the pump's next wake, and an idle pump parks for
-            // `DHCP_RETRANSMIT_NANOS`. A request/response exchange then
+            // `CONFIGURATION_POLL_NANOS`. A request/response exchange then
             // pays a second per round trip, which is #158: 5000 echo
             // round trips could not finish inside the benchmark's 180 s
             // iteration deadline.
@@ -1443,8 +1449,7 @@ where
         // the pump's pair for a pump.
         let drive_tcp = |state: &mut NetworkShard| {
             state
-                .stack
-                .drive_tcp(now)
+                .drive_tcp(now, &self.inner.control)
                 .unwrap_or_else(|error| tracing::debug!(?error, "failed to drive TCP control"));
         };
         match scope {
@@ -1588,9 +1593,143 @@ where
     }
 }
 
+/// Why a connection could not be started on a shard.
+///
+/// A caller that chooses the local port tells the two apart: only
+/// [`Self::PortInUse`] is cured by another port. A program-bound port
+/// sees either as the same [`TcpError`].
+#[derive(Debug)]
+pub(super) enum TcpConnectStartError {
+    /// A listener holds the local port, or a non-closed socket
+    /// (TIME-WAIT included) holds the four-tuple.
+    PortInUse,
+    /// Anything another local port would not change.
+    Failed(TcpError),
+}
+
+impl TcpConnectStartError {
+    /// The error a caller that did not choose the port sees.
+    pub(super) fn into_tcp_error(self) -> TcpError {
+        match self {
+            Self::PortInUse => TcpError {
+                kind: TcpErrorKind::Unavailable,
+                detail: NetworkErrorDetail::TcpConnectStartFailed,
+            },
+            Self::Failed(error) => error,
+        }
+    }
+}
+
+/// What a connect without a bound port knows before it has one.
+#[derive(Clone, Copy)]
+pub(super) struct TcpConnectRequest {
+    pub(super) local: IpAddress,
+    pub(super) destination: IpAddress,
+    pub(super) port: u16,
+    pub(super) hop_limit: u8,
+    pub(super) opened_at: StackInstant,
+}
+
+impl TcpConnectRequest {
+    /// The shard the flow hashes to once it has `local_port`.
+    fn owner_of(&self, local_port: u16, shard_count: usize) -> usize {
+        shard_idx_for_flow(
+            self.local,
+            local_port,
+            self.destination,
+            self.port,
+            shard_count,
+        )
+    }
+
+    /// Opens the connection from `local_port` on `shard`, which must be
+    /// the flow's owner.
+    fn start_on(
+        &self,
+        shard: &mut NetworkShard,
+        local_port: u16,
+    ) -> Result<TcpStreamId, TcpConnectStartError> {
+        shard.start_tcp_connect(
+            self.local,
+            self.destination,
+            self.port,
+            local_port,
+            self.hop_limit,
+            self.opened_at,
+        )
+    }
+}
+
+impl NetworkShardSet {
+    /// Chooses an ephemeral port and opens the connection from it, as
+    /// one step, from the window of shard `accepting`.
+    ///
+    /// The window is walked once from a random start (RFC 6056
+    /// §3.3.1). Under one acquisition of the accepting shard's lock,
+    /// the candidates whose flow hashes back to it are tried first:
+    /// the connection is then also received on the processor that
+    /// opened it, with no cross-processor hop for its whole life. The
+    /// candidates that hash elsewhere are then tried on their owning
+    /// shards, in walk order, one lock at a time and none across an
+    /// await. A candidate in use ([`TcpConnectStartError::PortInUse`])
+    /// moves the walk on; any other failure ends it. Only a window with
+    /// every candidate in use fails with
+    /// [`NetworkErrorDetail::TcpNoEphemeralPorts`].
+    pub(super) fn open_ephemeral_tcp_connect(
+        &self,
+        accepting: usize,
+        request: TcpConnectRequest,
+    ) -> Result<TcpStreamId, TcpError> {
+        let shard_count = self.shard_count();
+        let walk = {
+            let mut shard = self.shard_at(accepting).lock();
+            let walk = shard.ephemeral_walk();
+            if let Some(stream) =
+                shard.open_tcp_connect_along_own_flows(walk, request, shard_count)?
+            {
+                return Ok(stream);
+            }
+            walk
+        };
+        self.open_tcp_connect_along_foreign_flows(walk, accepting, request)
+    }
+
+    /// The second half of [`Self::open_ephemeral_tcp_connect`]: the
+    /// candidates of `walk` that hash to a shard other than
+    /// `accepting`, each opened on its owner.
+    pub(super) fn open_tcp_connect_along_foreign_flows(
+        &self,
+        walk: EphemeralWalk,
+        accepting: usize,
+        request: TcpConnectRequest,
+    ) -> Result<TcpStreamId, TcpError> {
+        let shard_count = self.shard_count();
+        for candidate in walk {
+            let owner = request.owner_of(candidate, shard_count);
+            if owner == accepting {
+                // Already tried, and in use, under the accepting lock.
+                continue;
+            }
+            match request.start_on(&mut self.shard_at(owner).lock(), candidate) {
+                Ok(stream) => return Ok(stream),
+                Err(TcpConnectStartError::PortInUse) => {}
+                Err(TcpConnectStartError::Failed(error)) => return Err(error),
+            }
+        }
+        Err(TcpError {
+            kind: TcpErrorKind::Unavailable,
+            detail: NetworkErrorDetail::TcpNoEphemeralPorts,
+        })
+    }
+}
+
 impl NetworkShard {
     /// Opens a connection on this shard, which the caller has already
     /// established is the one the flow hashes to.
+    ///
+    /// A port a listener holds, or a four-tuple a non-closed socket
+    /// (TIME-WAIT included) holds, is [`TcpConnectStartError::PortInUse`]:
+    /// the only failure a different local port can cure.
     pub(super) fn start_tcp_connect(
         &mut self,
         local: IpAddress,
@@ -1599,12 +1738,13 @@ impl NetworkShard {
         local_port: u16,
         hop_limit: u8,
         now: StackInstant,
-    ) -> Result<TcpStreamId, TcpError> {
+    ) -> Result<TcpStreamId, TcpConnectStartError> {
+        const START_FAILED: TcpError = TcpError {
+            kind: TcpErrorKind::Unavailable,
+            detail: NetworkErrorDetail::TcpConnectStartFailed,
+        };
         if !self.is_tcp_local_port_free(local_port) {
-            return Err(TcpError {
-                kind: TcpErrorKind::Unavailable,
-                detail: NetworkErrorDetail::TcpConnectStartFailed,
-            });
+            return Err(TcpConnectStartError::PortInUse);
         }
         let local = TcpEndpoint {
             address: local,
@@ -1619,19 +1759,48 @@ impl NetworkShard {
         let socket = self
             .stack
             .open_tcp_connect(local, remote, initial_sequence)
-            .map_err(|_| TcpError {
-                kind: TcpErrorKind::Unavailable,
-                detail: NetworkErrorDetail::TcpConnectStartFailed,
+            .map_err(|error| match error {
+                StackError::AddressInUse => TcpConnectStartError::PortInUse,
+                other => TcpConnectStartError::Failed(map_tcp_open_error(
+                    other,
+                    NetworkErrorDetail::TcpConnectStartFailed,
+                )),
             })?;
         // Applied before the connect loop drives the stack, so the SYN itself
         // already carries the caller's TTL.
         self.stack
             .set_tcp_hop_limit(socket, hop_limit)
-            .map_err(|_| TcpError {
-                kind: TcpErrorKind::Unavailable,
-                detail: NetworkErrorDetail::TcpConnectStartFailed,
-            })?;
+            .map_err(|_| TcpConnectStartError::Failed(START_FAILED))?;
         Ok(self.insert_tcp_stream(socket))
+    }
+
+    /// Opens an ephemeral-port connection on this shard along `walk`,
+    /// the walk of this shard's own window.
+    ///
+    /// Only a candidate whose flow hashes to this shard is tried here,
+    /// which is what makes a connection opened on this processor also
+    /// received on it. A candidate that is in use is skipped; any other
+    /// failure is returned. `None` means no candidate of this shard
+    /// opened, and the caller tries the rest on their owning shards.
+    ///
+    /// Runs under this shard's lock, which the caller holds.
+    pub(super) fn open_tcp_connect_along_own_flows(
+        &mut self,
+        walk: EphemeralWalk,
+        request: TcpConnectRequest,
+        shard_count: usize,
+    ) -> Result<Option<TcpStreamId>, TcpError> {
+        for candidate in walk {
+            if request.owner_of(candidate, shard_count) != self.shard_idx {
+                continue;
+            }
+            match request.start_on(self, candidate) {
+                Ok(stream) => return Ok(Some(stream)),
+                Err(TcpConnectStartError::PortInUse) => {}
+                Err(TcpConnectStartError::Failed(error)) => return Err(error),
+            }
+        }
+        Ok(None)
     }
 
     /// Installs this shard's replica of a listener into `slot`.
@@ -1662,10 +1831,7 @@ impl NetworkShard {
                 },
                 backlog,
             )
-            .map_err(|_| TcpError {
-                kind: TcpErrorKind::Unavailable,
-                detail: NetworkErrorDetail::TcpListenStartFailed,
-            })?;
+            .map_err(|error| map_tcp_open_error(error, NetworkErrorDetail::TcpListenStartFailed))?;
         // Accepted children inherit the listener's hop limit inside the
         // stack, so their SYN-ACK carries it as well.
         self.stack
@@ -1938,40 +2104,6 @@ impl NetworkShard {
             }
         }
         Err(TcpError {
-            kind: TcpErrorKind::Unavailable,
-            detail: NetworkErrorDetail::TcpNoEphemeralPorts,
-        })
-    }
-
-    /// Allocates an ephemeral port for a flow to a known peer,
-    /// preferring one whose answers hash back to this shard.
-    ///
-    /// Ownership follows the hash whatever port is chosen, so this is
-    /// not a correctness requirement — it is what makes steering pay:
-    /// a connection opened on this processor is then also received on
-    /// it, with no cross-processor hop for its whole life. The walk is
-    /// bounded by the shard's own window, and falls back to the first
-    /// free port it saw, which the caller then places by its hash.
-    pub(super) fn allocate_tcp_local_port_for(
-        &mut self,
-        local: IpAddress,
-        remote: IpAddress,
-        remote_port: u16,
-        shard_count: usize,
-    ) -> Result<u16, TcpError> {
-        let mut fallback = None;
-        for candidate in self.ephemeral_walk() {
-            if !self.is_tcp_local_port_free(candidate) {
-                continue;
-            }
-            if shard_idx_for_flow(local, candidate, remote, remote_port, shard_count)
-                == self.shard_idx
-            {
-                return Ok(candidate);
-            }
-            fallback.get_or_insert(candidate);
-        }
-        fallback.ok_or(TcpError {
             kind: TcpErrorKind::Unavailable,
             detail: NetworkErrorDetail::TcpNoEphemeralPorts,
         })

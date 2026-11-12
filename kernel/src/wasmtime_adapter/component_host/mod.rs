@@ -17,9 +17,10 @@ use crate::wasmtime_adapter::wasi::net::ipv6_address_groups;
 use bytes::Bytes;
 
 use crate::{
-    ClockAuthorityRights, DeviceClassRights, DiagnosticAuthorityRights, DirectoryAuthorityRights,
-    LinkAuthorityRights, NetworkAuthorityRights, ProcessAuthority, ProcessAuthorityError,
-    SettingsAuthorityRights, TerminalAuthorityRights,
+    ClockAuthorityRights, CompileAuthority, DeviceClassRights, DiagnosticAuthorityRights,
+    DirectoryAuthorityRights, ExecAuthority, LinkAuthorityRights, NetworkAuthorityRights,
+    ProcessAuthority, ProcessAuthorityError, SettingsAuthorityRights, SpawnAuthority,
+    TerminalAuthorityRights,
 };
 use crate::{
     ComponentCache, ComponentOutputMode, ComponentOutputRoute, ComponentOutputStreamKind,
@@ -39,7 +40,6 @@ use wasmtime::component::{
 use wasmtime::{self, Engine, Store, StoreContextMut};
 
 use crate::exec::phases::{self, LaunchPhase};
-use crate::runtime::ComponentHostFilesystemState;
 use crate::wasmtime_adapter::bindings::debugger::bindings as debugger_bindings;
 use crate::wasmtime_adapter::bindings::program::bindings as program_bindings;
 use crate::wasmtime_adapter::config::AotCompileHint;
@@ -84,6 +84,7 @@ fn lower_bytes_to_vec(bytes: Bytes) -> Vec<u8> {
 }
 
 mod device;
+mod mounts;
 pub(crate) use device::record_linear_memory;
 mod filters;
 mod observation;
@@ -123,7 +124,7 @@ pub type HostRuntimeState<CpuImpl, Net, HostFs> =
 pub type StoreData<CpuImpl, Net, HostFs> = ComponentStoreData<
     CpuImpl,
     HostRuntimeState<CpuImpl, Net, HostFs>,
-    crate::wasmtime_adapter::wasi::DebugFileSystem<HostRuntimeState<CpuImpl, Net, HostFs>, HostFs>,
+    crate::Namespace<HostFs>,
     ResourceTable,
     wasmtime::Memory,
 >;
@@ -422,10 +423,14 @@ macro_rules! impl_program_bindings {
                         ProgramExecContext::from_store(access.get()),
                         access.get().process_authority().clone(),
                         access.get().cpu.clone(),
+                        // The child starts a tree of its own below the
+                        // caller's: it sees the caller's mounts, and its
+                        // own stay its own.
+                        access.get().filesystem().descend(),
                     ))
                 });
                 async move {
-                    let (service, context, caller_authority, cpu) = snapshot?;
+                    let (service, context, caller_authority, cpu, namespace) = snapshot?;
                     let mut launch = phases::Trace::begin(cpu, "spawn", &request.path);
                     let Some(service) = service else {
                         launch.refused(ProgramExecErrorKind::Unavailable);
@@ -434,10 +439,14 @@ macro_rules! impl_program_bindings {
                             detail: "program spawn is unavailable on this machine".to_owned(),
                         }));
                     };
-                    if let Err(error) = require_spawn_authority(&caller_authority) {
-                        launch.refused(error.kind);
-                        return Ok(Err($convert_error(error)));
-                    }
+                    let spawn_authority = match require_spawn_authority(&caller_authority) {
+                        Ok(authority) => authority,
+                        Err(error) => {
+                            launch.refused(error.kind);
+                            return Ok(Err($convert_error(error)));
+                        }
+                    };
+                    let compile_authority = CompileAuthority::from(&spawn_authority);
                     let child_authority =
                         match $build_authority(&caller_authority, request.capability_grants) {
                             Ok(authority) => authority,
@@ -467,6 +476,7 @@ macro_rules! impl_program_bindings {
                     launch.record_source_bytes(source.payload_len());
                     let spawned = match service
                         .spawn(
+                            &compile_authority,
                             context,
                             source,
                             None,
@@ -474,7 +484,7 @@ macro_rules! impl_program_bindings {
                                 ProgramArgv::launched(request.name, request.args),
                                 request.env,
                                 child_authority,
-                                None,
+                                Some(namespace),
                             )
                             .with_timeline(launch.timeline().for_task()),
                         )
@@ -522,11 +532,18 @@ macro_rules! impl_program_bindings {
                         ProgramExecContext::from_store(access.get()),
                         access.get().process_authority().clone(),
                         access.get().cpu.clone(),
+                        // The child starts a tree of its own below the
+                        // caller's: it sees the caller's mounts, and its
+                        // own stay its own.
+                        access.get().filesystem().descend(),
                     ))
                 });
                 async move {
-                    let (service, context, caller_authority, cpu) = snapshot?;
-                    let launch = phases::Trace::begin(cpu, "exec", &request.path);
+                    let (service, context, caller_authority, cpu, namespace) = snapshot?;
+                    // Read before anything else the call does, so the
+                    // reported duration covers the whole launch.
+                    let clock = phases::LaunchClock::arrive(&cpu);
+                    let launch = phases::Trace::begin_timed(cpu, "exec", &request.path, &clock);
                     let Some(service) = service else {
                         launch.refused(ProgramExecErrorKind::Unavailable);
                         return Ok(Err($bindings::helios::system::programs::ExecError {
@@ -534,10 +551,14 @@ macro_rules! impl_program_bindings {
                             detail: "program exec is unavailable on this machine".to_owned(),
                         }));
                     };
-                    if let Err(error) = require_exec_authority(&caller_authority) {
-                        launch.refused(error.kind);
-                        return Ok(Err($convert_error(error)));
-                    }
+                    let exec_authority = match require_exec_authority(&caller_authority) {
+                        Ok(authority) => authority,
+                        Err(error) => {
+                            launch.refused(error.kind);
+                            return Ok(Err($convert_error(error)));
+                        }
+                    };
+                    let compile_authority = CompileAuthority::from(&exec_authority);
                     let child_authority =
                         match $build_authority(&caller_authority, request.capability_grants) {
                             Ok(authority) => authority,
@@ -579,6 +600,7 @@ macro_rules! impl_program_bindings {
                     };
                     let executed = service
                         .exec_buffered(
+                            &compile_authority,
                             context,
                             source,
                             hint,
@@ -587,7 +609,7 @@ macro_rules! impl_program_bindings {
                                 ProgramArgv::launched(request.name, request.args),
                                 request.env,
                                 child_authority,
-                                None,
+                                Some(namespace),
                             )
                             .with_timeline(launch.timeline().clone()),
                         )
@@ -600,11 +622,13 @@ macro_rules! impl_program_bindings {
                         // the mark itself.
                         Err(error) => launch.exit_error(error),
                     }
-                    launch.record(LaunchPhase::Reply);
+                    let launch_nanos = launch.replied(&clock);
                     // The guard stays armed: it drops here and emits
                     // the line — `reply` included — for an exec the
                     // run task does not own emission.
-                    Ok(executed.map($convert_result).map_err($convert_error))
+                    Ok(executed
+                        .map(|result| $convert_result(result, launch_nanos))
+                        .map_err($convert_error))
                 }
             }
 
@@ -633,6 +657,10 @@ macro_rules! impl_program_bindings {
                             kind: $bindings::helios::system::programs::ExecErrorKind::Unavailable,
                             detail: "program AOT is unavailable on this machine".to_owned(),
                         }));
+                    };
+                    let compile_authority = match require_compile_authority(&caller_authority) {
+                        Ok(authority) => authority,
+                        Err(error) => return Ok(Err($convert_error(error))),
                     };
                     let source = match read_program_source(
                         accessor,
@@ -665,34 +693,21 @@ macro_rules! impl_program_bindings {
                             AotCompileHint::Performance
                         }
                     };
-                    let spawner = context.spawner();
-                    let (artifact_tx, artifact_rx) = futures::channel::oneshot::channel();
-                    spawner.spawn_detached({
-                        let service = service.clone();
-                        let context = context.clone();
-                        let profile = request.profile;
-                        async move {
-                            let result = service.aot(&context, &wasm, hint, profile).await;
-                            let _ = artifact_tx.send(result);
-                        }
-                    });
-                    let artifact = match artifact_rx.await {
-                        Ok(Ok(artifact)) => artifact,
-                        Ok(Err(error)) => return Ok(Err($convert_error(error))),
-                        Err(_) => {
-                            return Ok(Err($bindings::helios::system::programs::ExecError {
-                                kind: $bindings::helios::system::programs::ExecErrorKind::Internal,
-                                detail: "program AOT worker dropped before producing an artifact"
-                                    .to_owned(),
-                            }));
-                        }
+                    // The compile runs in its own session task, which stops
+                    // the compile when this call is dropped.
+                    let artifact = match service
+                        .aot(&compile_authority, &context, &wasm, hint, request.profile)
+                        .await
+                    {
+                        Ok(artifact) => artifact,
+                        Err(error) => return Ok(Err($convert_error(error))),
                     };
                     let write_cpu = context.cpu();
                     let write_serial = context.write_serial();
                     match write_program_artifact(
                         accessor,
                         &request.destination_path,
-                        &artifact,
+                        &artifact.signed,
                         &caller_authority,
                         &write_cpu,
                         write_serial,
@@ -711,6 +726,7 @@ macro_rules! impl_program_bindings {
                     }
                     Ok(Ok($bindings::helios::system::programs::AotResult {
                         destination_path: request.destination_path,
+                        worker_threads: artifact.worker_threads,
                     }))
                 }
             }
@@ -881,6 +897,23 @@ macro_rules! impl_authority_conversion {
                             .map_err(map_process_authority_error)?;
                         authority.grant_link_rights(rights);
                     }
+                    $bindings::helios::system::programs::CapabilityGrant::Mount(mount) => {
+                        let mut rights = crate::MountAuthorityRights::empty();
+                        for right in mount.rights {
+                            rights |= match right {
+                                $bindings::helios::system::programs::MountRight::Mount => {
+                                    crate::MountAuthorityRights::MOUNT
+                                }
+                                $bindings::helios::system::programs::MountRight::Unmount => {
+                                    crate::MountAuthorityRights::UNMOUNT
+                                }
+                            };
+                        }
+                        let rights = caller_authority
+                            .derive_mount_rights(rights)
+                            .map_err(map_process_authority_error)?;
+                        authority.grant_mount_rights(rights);
+                    }
                     $bindings::helios::system::programs::CapabilityGrant::Device(device) => {
                         let mut rights = DeviceClassRights::empty();
                         for class in device.classes {
@@ -946,20 +979,31 @@ impl_authority_conversion!(build_program_child_authority, program_bindings);
 
 fn require_spawn_authority(
     caller_authority: &ProcessAuthority,
-) -> Result<(), crate::ProgramExecError> {
+) -> Result<SpawnAuthority, crate::ProgramExecError> {
     caller_authority
         .derive_spawn_authority()
-        .map(drop)
         .map_err(map_process_authority_error)
 }
 
 fn require_exec_authority(
     caller_authority: &ProcessAuthority,
-) -> Result<(), crate::ProgramExecError> {
+) -> Result<ExecAuthority, crate::ProgramExecError> {
     caller_authority
         .derive_exec_authority()
-        .map(drop)
         .map_err(map_process_authority_error)
+}
+
+/// A compile may be started by a caller that may spawn or exec; a caller
+/// holding neither is refused as `spawn` and `exec` refuse it.
+fn require_compile_authority(
+    caller_authority: &ProcessAuthority,
+) -> Result<CompileAuthority, crate::ProgramExecError> {
+    match caller_authority.derive_spawn_authority() {
+        Ok(spawn) => Ok(CompileAuthority::from(&spawn)),
+        Err(_) => {
+            require_exec_authority(caller_authority).map(|exec| CompileAuthority::from(&exec))
+        }
+    }
 }
 
 impl_program_bindings!(
@@ -1015,8 +1059,9 @@ mod authority_tests {
     use alloc::vec::Vec;
 
     use super::{
-        build_program_child_authority, dns_network_rights, program_wit, require_exec_authority,
-        require_spawn_authority, tcp_connect_network_rights, udp_bind_network_rights,
+        build_program_child_authority, dns_network_rights, program_wit, require_compile_authority,
+        require_exec_authority, require_spawn_authority, tcp_connect_network_rights,
+        udp_bind_network_rights,
     };
     use crate::{
         ClockAuthorityRights, DeviceClassRights, DiagnosticAuthorityRights,
@@ -1482,6 +1527,25 @@ mod authority_tests {
         require_spawn_authority(&caller).expect("spawn authority should be accepted");
         require_exec_authority(&caller).expect("exec authority should be accepted");
     }
+
+    #[test]
+    fn aot_requires_a_process_right() {
+        let caller = ProcessAuthority::empty();
+        assert_eq!(
+            require_compile_authority(&caller)
+                .expect_err("aot must require a process right")
+                .kind,
+            crate::ProgramExecErrorKind::PermissionDenied
+        );
+
+        let mut caller = ProcessAuthority::empty();
+        caller.grant_process_rights(ProcessAuthorityRights::EXEC);
+        require_compile_authority(&caller).expect("an EXEC holder may start a compile");
+
+        let mut caller = ProcessAuthority::empty();
+        caller.grant_process_rights(ProcessAuthorityRights::SPAWN);
+        require_compile_authority(&caller).expect("a SPAWN holder may start a compile");
+    }
 }
 
 async fn read_program_source<T, CpuImpl, Net, HostFs>(
@@ -1496,44 +1560,17 @@ where
 {
     let absolute =
         crate::resolve_guest_path("/", path).map_err(map_component_fs_path_error_to_wasmtime)?;
-    if !authority.can_load_program(&absolute) {
+    let Some(floor) = authority.program_load_floor(&absolute) else {
         return Ok(Err(ProgramExecError {
             kind: ProgramExecErrorKind::PermissionDenied,
             detail: ProgramExecErrorDetail::ProgramSourceNotGranted,
         }));
-    }
-    let host_path = crate::guest_host_share_path(&absolute).map(str::to_owned);
-    if let Some(host_path) = host_path {
-        let host_service = accessor.with(|mut access| {
-            Ok::<_, wasmtime::Error>(access.get().runtime_state.host_filesystem_service())
-        })?;
-        let Some(host_service) = host_service else {
-            return Ok(Err(ProgramExecError {
-                kind: ProgramExecErrorKind::Unavailable,
-                detail: ProgramExecErrorDetail::HostFilesystemUnavailable,
-            }));
-        };
-        return Ok(host_service
-            .read_file(&host_path)
-            .await
-            .map(|bytes| ProgramSource::from_untrusted(bytes::Bytes::from(bytes)))
-            .map_err(|error| {
-                tracing::error!(path = %absolute, ?error, "failed to read program source");
-                ProgramExecError {
-                    kind: ProgramExecErrorKind::InvalidPath,
-                    detail: ProgramExecErrorDetail::FilesystemOperationFailed,
-                }
-            }));
-    }
-
-    accessor.with(|mut access| {
-        let contents = access
-            .get()
-            .filesystem()
-            .read_program_file(&absolute)
-            .map_err(map_fs_error_to_program_exec)?;
-        Ok::<_, wasmtime::Error>(Ok(ProgramSource::from_file(contents)))
-    })
+    };
+    let namespace = accessor.with(|mut access| access.get().filesystem().clone());
+    let contents = crate::wasmtime_adapter::wasi::read_program_file(&namespace, &absolute, floor)
+        .await
+        .map_err(map_fs_error_to_program_exec)?;
+    Ok(Ok(ProgramSource::from_file(contents)))
 }
 
 async fn write_program_artifact<T, CpuImpl, Net, HostFs>(
@@ -1563,70 +1600,21 @@ where
             detail: ProgramExecErrorDetail::ProgramArtifactDestinationNotGranted,
         }));
     }
-    let host_path = crate::guest_host_share_path(&absolute).map(str::to_owned);
-    if let Some(host_path) = host_path {
-        let host_service = accessor.with(|mut access| {
-            Ok::<_, wasmtime::Error>(access.get().runtime_state.host_filesystem_service())
-        })?;
-        let Some(host_service) = host_service else {
-            return Ok(Err(ProgramExecError {
-                kind: ProgramExecErrorKind::Unavailable,
-                detail: ProgramExecErrorDetail::HostFilesystemUnavailable,
-            }));
-        };
-        if let Err(truncate_error) = host_service.truncate_file(&host_path).await {
-            host_service
-                .create_file(&host_path)
-                .await
-                .map_err(|create_error| {
-                    tracing::error!(
-                        path = %absolute,
-                        ?truncate_error,
-                        ?create_error,
-                        "failed to prepare program artifact destination"
-                    );
-                    ProgramExecError {
-                        kind: ProgramExecErrorKind::InvalidPath,
-                        detail: ProgramExecErrorDetail::FilesystemOperationFailed,
-                    }
-                })?;
-        }
-        host_service
-            .write_file(&host_path, 0, bytes)
-            .await
-            .map_err(|error| {
-                tracing::error!(path = %absolute, ?error, "failed to write program artifact");
-                ProgramExecError {
-                    kind: ProgramExecErrorKind::InvalidPath,
-                    detail: ProgramExecErrorDetail::FilesystemOperationFailed,
-                }
-            })?;
-        if profile {
-            write_serial.emit_fmt(format_args!(
-                "aot-write us={} bytes={}\n",
-                crate::monotonic_nanos(cpu).saturating_sub(started_ns) / 1_000,
-                bytes.len(),
-            ));
-        }
-        return Ok(Ok(()));
-    }
-
-    accessor.with(|mut access| {
+    let (namespace, now_nanos) = accessor.with(|mut access| {
         let store_data = access.get();
-        let now_nanos = store_data.now_nanos();
-        store_data
-            .filesystem_mut()
-            .write_program_file(&absolute, bytes, now_nanos)
-            .map_err(map_fs_error_to_program_exec)?;
-        if profile {
-            write_serial.emit_fmt(format_args!(
-                "aot-write us={} bytes={}\n",
-                crate::monotonic_nanos(cpu).saturating_sub(started_ns) / 1_000,
-                bytes.len(),
-            ));
-        }
-        Ok::<_, wasmtime::Error>(Ok(()))
-    })
+        (store_data.filesystem().clone(), store_data.now_nanos())
+    });
+    crate::wasmtime_adapter::wasi::write_program_file(&namespace, &absolute, bytes, now_nanos)
+        .await
+        .map_err(map_fs_error_to_program_exec)?;
+    if profile {
+        write_serial.emit_fmt(format_args!(
+            "aot-write us={} bytes={}\n",
+            crate::monotonic_nanos(cpu).saturating_sub(started_ns) / 1_000,
+            bytes.len(),
+        ));
+    }
+    Ok(Ok(()))
 }
 
 fn map_fs_error_to_program_exec(error: FsErrorCode) -> crate::ProgramExecError {
@@ -1671,6 +1659,9 @@ fn map_process_authority_error(error: ProcessAuthorityError) -> crate::ProgramEx
         | ProcessAuthorityError::ProcessGrantExceedsAuthority(_)
         | ProcessAuthorityError::EmptyLinkRights
         | ProcessAuthorityError::LinkGrantExceedsAuthority(_)
+        | ProcessAuthorityError::EmptyMountRights
+        | ProcessAuthorityError::MountGrantExceedsAuthority(_)
+        | ProcessAuthorityError::MountPointOutsideAuthority(_)
         | ProcessAuthorityError::EmptyDeviceClassRights
         | ProcessAuthorityError::DeviceClassGrantExceedsAuthority(_)
         | ProcessAuthorityError::DeviceGrantExceedsAuthority(_)
@@ -1946,10 +1937,7 @@ where
     // that loses the kill reason (OOM vs supervisor restart). Any other
     // interruption ends a time slice, and the guest yields.
     store.interrupt_callback(|caller| {
-        if let Some(reason) = caller.data().pending_kill() {
-            return Err(wasmtime::Error::from(crate::InstanceKilled { reason }));
-        }
-        Ok(wasmtime::InterruptAction::Yield)
+        crate::wasmtime_adapter::preemption::kill_or_yield(caller.data().pending_kill())
     });
     let interrupts = engine
         .interrupts()
@@ -1966,6 +1954,7 @@ where
     HostFs: crate::HostFileSystem,
 {
     add_programs_to_linker(linker)?;
+    mounts::add_mounts_to_linker(linker)?;
     add_net_to_linker(linker)?;
     vsock::add_vsock_to_linker::<vsock::DebuggerVsock, _, _, _>(linker)?;
     add_stats_to_linker(linker)?;
@@ -2170,6 +2159,7 @@ where
     HostFs: crate::HostFileSystem,
 {
     add_programs_to_program_linker(linker)?;
+    mounts::add_mounts_to_program_linker(linker)?;
     add_net_to_program_linker(linker)?;
     vsock::add_vsock_to_linker::<vsock::ProgramVsock, _, _, _>(linker)?;
     add_stats_to_program_linker(linker)?;
@@ -3530,7 +3520,10 @@ fn convert_launch_error(error: crate::ProgramExecError) -> debugger_wit::program
     }
 }
 
-fn convert_launch_result(result: crate::ExecResult) -> debugger_wit::programs::ExecResult {
+fn convert_launch_result(
+    result: crate::ExecResult,
+    launch_nanos: u64,
+) -> debugger_wit::programs::ExecResult {
     debugger_wit::programs::ExecResult {
         instance_id: result.instance_id.raw(),
         exit_code: result.exit_code,
@@ -3538,6 +3531,7 @@ fn convert_launch_result(result: crate::ExecResult) -> debugger_wit::programs::E
             stdout: result.output.stdout,
             stderr: result.output.stderr,
         },
+        launch_nanos,
     }
 }
 
@@ -3571,7 +3565,10 @@ fn convert_program_launch_error(
     }
 }
 
-fn convert_program_launch_result(result: crate::ExecResult) -> program_wit::programs::ExecResult {
+fn convert_program_launch_result(
+    result: crate::ExecResult,
+    launch_nanos: u64,
+) -> program_wit::programs::ExecResult {
     program_wit::programs::ExecResult {
         instance_id: result.instance_id.raw(),
         exit_code: result.exit_code,
@@ -3579,6 +3576,7 @@ fn convert_program_launch_result(result: crate::ExecResult) -> program_wit::prog
             stdout: result.output.stdout,
             stderr: result.output.stderr,
         },
+        launch_nanos,
     }
 }
 
@@ -4563,6 +4561,15 @@ macro_rules! convert_network_stats {
                         tcp_window_updates_sent: queue.tcp_window_updates_sent,
                         tcp_retransmits_sent: queue.tcp_retransmits_sent,
                         tcp_sockets: queue.tcp_sockets,
+                        tcp_orphan_sockets: queue.tcp_orphan_sockets,
+                        tcp_orphan_send_queued_bytes: queue.tcp_orphan_send_queued_bytes,
+                        tcp_orphan_fin_wait_1: queue.tcp_orphan_fin_wait_1,
+                        tcp_orphan_fin_wait_2: queue.tcp_orphan_fin_wait_2,
+                        tcp_orphan_closing: queue.tcp_orphan_closing,
+                        tcp_orphan_last_ack: queue.tcp_orphan_last_ack,
+                        tcp_orphan_time_wait: queue.tcp_orphan_time_wait,
+                        tcp_orphan_other_state: queue.tcp_orphan_other_state,
+                        tcp_orphan_retransmit_armed: queue.tcp_orphan_retransmit_armed,
                         tcp_receive_backpressured_sockets: queue.tcp_receive_backpressured_sockets,
                         tcp_receive_window_bytes: queue.tcp_receive_window_bytes,
                         receive_queued_bytes: queue.receive_queued_bytes,

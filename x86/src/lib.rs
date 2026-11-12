@@ -45,7 +45,7 @@ use core::arch::asm;
 use core::arch::global_asm;
 use core::arch::x86_64::{__cpuid, __cpuid_count, _rdrand64_step, _rdtsc};
 use core::ops::Range;
-use core::sync::atomic::{Ordering, compiler_fence};
+use core::sync::atomic::{AtomicU8, Ordering, compiler_fence};
 use helios_hal::boot::{BootMemoryMap, BootReservedRanges, usable_region_segments};
 use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase, TimerInterrupt, current_processor};
 use helios_hal::critical_section::ProcessorIdentity;
@@ -183,6 +183,9 @@ fn x86_kernel_main() -> ! {
     smp::install_bootstrap_anchor();
     // The one place COM1 is configured; see `serial_uart_init`.
     serial_uart_init();
+    // Before anything can map device memory write-combined; every
+    // secondary processor programs the same table on its own way in.
+    memory_type::program_page_attribute_table();
     let xcr0 = extended_state::enable_on_bootstrap_processor();
     assert!(
         boot::base_revision_supported(),
@@ -552,7 +555,13 @@ fn install_pci_devices<WatchdogImpl>(
         tracing::info!("no virtio-gpu function on the PCI bus; this machine has no display");
     }
     if let Some(address) = balloon_function {
-        let handle = balloon::install(kernel, pci, address, physical_memory_offset);
+        let handle = balloon::install(
+            kernel,
+            pci,
+            address,
+            physical_memory_offset,
+            debug_state.machine_generation_handle(),
+        );
         debug_state.install_memory_balloon(handle);
     }
     if input_functions.is_empty() {
@@ -838,6 +847,51 @@ extern "Rust" fn helios_current_processor() -> ProcessorId {
     smp::current_processor()
 }
 
+/// Reads `CR8`, the local APIC's task-priority class.
+fn read_cr8() -> u64 {
+    let value: u64;
+    // SAFETY: reading CR8 has no side effect.
+    unsafe {
+        asm!("mov {}, cr8", out(reg) value, options(nomem, nostack, preserves_flags));
+    }
+    value
+}
+
+/// Writes `CR8`, the local APIC's task-priority class.
+///
+/// # Safety
+///
+/// The class decides which interrupts the processor takes: the caller
+/// restores the previous value before it relies on an interrupt that the
+/// new one withholds.
+unsafe fn write_cr8(value: u64) {
+    // SAFETY: forwarded to the caller.
+    unsafe {
+        asm!("mov cr8, {}", in(reg) value, options(nomem, nostack, preserves_flags));
+    }
+}
+
+/// `CR8` raised to [`exceptions::WAKE_ONLY_TASK_PRIORITY`] on the
+/// processor that took it, and put back to what it was when dropped.
+///
+/// The local APIC then holds every vector below class 14 pending (the
+/// timer, the device vectors, the APIC error) and still delivers the
+/// wake and shootdown IPIs, which sit in class 14. It leaves the
+/// interrupt flag alone. `CR8` is the processor's own register, so the
+/// value is not `Send`.
+pub(crate) struct X86WakeOnlyMask {
+    previous: u64,
+    _processor_local: core::marker::PhantomData<*mut ()>,
+}
+
+impl Drop for X86WakeOnlyMask {
+    fn drop(&mut self) {
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: restores the value read when the mask was raised.
+        unsafe { write_cr8(self.previous) };
+    }
+}
+
 impl Cpu for X86Cpu {
     // The local APIC timer runs in periodic mode at the scheduler tick;
     // `set_deadline` only starts it.
@@ -883,6 +937,55 @@ impl Cpu for X86Cpu {
         unsafe {
             core::arch::asm!("sti; hlt", options(nomem, nostack));
         }
+    }
+
+    type WakeOnlyMask = X86WakeOnlyMask;
+
+    fn mask_to_wake_only(&self) -> X86WakeOnlyMask {
+        // Raise the task-priority register so the local APIC holds every
+        // vector below class 14 pending: the timer, the device vectors,
+        // the APIC error. The wake and shootdown IPIs sit in class 14 and
+        // still get through (`exceptions::WAKE_INTERRUPT_VECTOR`).
+        // `mov cr8` is the 64-bit form of the TPR write and works in
+        // xAPIC and x2APIC mode alike.
+        let previous = read_cr8();
+        // SAFETY: CR8 is the task-priority register, and raising it only
+        // withholds interrupts; the guard puts the previous value back.
+        unsafe { write_cr8(exceptions::WAKE_ONLY_TASK_PRIORITY) };
+        compiler_fence(Ordering::SeqCst);
+        X86WakeOnlyMask {
+            previous,
+            _processor_local: core::marker::PhantomData,
+        }
+    }
+
+    fn park_wake_only(&self, word: &AtomicU8, held: u8) {
+        assert!(
+            !x86_64::instructions::interrupts::are_enabled(),
+            "x86 park_wake_only was entered with interrupts enabled, before the finer mask \
+             was in place"
+        );
+        let mask = self.mask_to_wake_only();
+        while word.load(Ordering::Acquire) == held {
+            // `sti; hlt` is atomic: a wake IPI already pending, or one
+            // that arrives during the halt, completes it, and the
+            // handler runs in the instruction shadow before `cli`.
+            // Nothing else can be taken, because the register above
+            // withholds it. The word was tested with interrupts masked,
+            // so a store made after the test raises a wake that this
+            // halt completes on.
+            //
+            // SAFETY: interrupts were masked on entry and are masked
+            // again before the next test.
+            unsafe {
+                core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+            }
+        }
+        drop(mask);
+        // The wake the loop took, or one that raced it, leaves its latch
+        // set; `park_current` would take it as a wake for work it does
+        // not have.
+        smp::current_runtime().take_wake_pending();
     }
 
     fn start_processor(&self, processor: ProcessorId) {
@@ -962,12 +1065,11 @@ fn x86_has_rdrand() -> bool {
 }
 
 fn fill_with_rdrand(buffer: &mut [u8]) {
-    let mut chunks = buffer.chunks_exact_mut(core::mem::size_of::<u64>());
-    for chunk in chunks.by_ref() {
-        chunk.copy_from_slice(&rdrand64().to_le_bytes());
+    let (words, remainder) = buffer.as_chunks_mut::<{ core::mem::size_of::<u64>() }>();
+    for word in words {
+        *word = rdrand64().to_le_bytes();
     }
 
-    let remainder = chunks.into_remainder();
     if !remainder.is_empty() {
         let word = rdrand64().to_le_bytes();
         remainder.copy_from_slice(&word[..remainder.len()]);
@@ -1027,6 +1129,9 @@ extern "C" fn secondary_start_rust(
     // configured it before it woke anyone, and configuring it again is
     // destructive rather than idempotent. See `serial_uart_init`.
     extended_state::enable_on_secondary_processor(boot.xcr0());
+    // The same page-attribute table the bootstrap processor runs with,
+    // before this processor can touch a write-combined mapping.
+    memory_type::program_page_attribute_table();
     let runtime = unsafe { &*runtime };
     smp::activate_runtime(runtime);
     smp::current_runtime().attach_local_apic();

@@ -161,6 +161,36 @@ impl<M> ProviderSender<M> {
     }
 }
 
+impl<M> ProviderSender<M> {
+    /// Wait until the queue has room for one message, or has closed.
+    ///
+    /// For a producer that has to decide what it sends in the same step
+    /// that sends it — a check against state the send itself changes —
+    /// and so sends with [`Self::try_send`] and parks here on
+    /// [`ProviderError::Full`] rather than parking inside a send with
+    /// the decision already made. Room is one permit per message the
+    /// receiver takes; a producer woken here that then sends nothing
+    /// passes its turn on with [`Self::pass_room`], so a producer parked
+    /// behind it is not left asleep beside a free slot.
+    pub async fn room(&self) {
+        loop {
+            // Armed before the queue is tested, for the reason `send`
+            // arms before its push.
+            let room = self.channel.room.notified();
+            if !self.channel.queue.is_full() || self.channel.queue.is_closed() {
+                return;
+            }
+            room.await;
+        }
+    }
+
+    /// Hand the turn [`Self::room`] gave this producer to the next one
+    /// parked there.
+    pub fn pass_room(&self) {
+        self.channel.room.notify_one();
+    }
+}
+
 impl<M> ProviderReceiver<M> {
     /// Await the next message, or `None` once the queue is closed and drained.
     pub async fn recv(&self) -> Option<M> {

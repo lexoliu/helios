@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
@@ -17,7 +18,17 @@ from helios_bench.gate import (
     GateRow,
     format_period,
 )
-from helios_bench.report import CLASS_LABELS, SIDE_LABELS, Report, Side, WorkloadClass
+from helios_bench.report import (
+    CLASS_LABELS,
+    CLOCK_LABELS,
+    HELIOS_SIDES,
+    SIDE_LABELS,
+    Clock,
+    Report,
+    Side,
+    WorkloadClass,
+    WorkloadResult,
+)
 
 TEMPLATES_ROOT = PACKAGE_ROOT / "templates"
 README_BEGIN = "<!-- helios-bench:begin run={run_id} -->"
@@ -58,6 +69,37 @@ def format_seconds(value: float) -> str:
     return f"{value:.0f} s"
 
 
+@dataclass(frozen=True)
+class ClockNote:
+    """Which clock one column's compared rows were timed with (#491)."""
+
+    side: Side
+    clock: Clock | None
+    workloads: list[str]
+    #: A Helios row on a serial lane that is still on the host clock,
+    #: because it is no program launch and has no launch duration.
+    unlaunched: bool
+
+
+def clock_notes(report: Report, workloads: list[WorkloadResult], sides: list[Side]) -> list[ClockNote]:
+    """Each column's rows grouped by the clock their compared value was read from."""
+    notes = []
+    for side in sides:
+        by_clock: dict[Clock | None, list[str]] = {}
+        for workload in workloads:
+            cell = workload.cells.get(side)
+            if cell is not None:
+                by_clock.setdefault(cell.clock, []).append(workload.name)
+        for clock, names in by_clock.items():
+            unlaunched = (
+                side in HELIOS_SIDES
+                and clock is Clock.HOST_ROUND_TRIP
+                and report.pins.rpc_transport == "serial"
+            )
+            notes.append(ClockNote(side=side, clock=clock, workloads=names, unlaunched=unlaunched))
+    return notes
+
+
 def environment() -> Environment:
     env = Environment(
         loader=FileSystemLoader(TEMPLATES_ROOT),
@@ -77,6 +119,8 @@ def environment() -> Environment:
     env.globals["Side"] = Side
     env.globals["SIDE_LABELS"] = SIDE_LABELS
     env.globals["CLASS_LABELS"] = CLASS_LABELS
+    env.globals["CLOCK_LABELS"] = CLOCK_LABELS
+    env.globals["clock_notes"] = clock_notes
     env.globals["WorkloadClass"] = WorkloadClass
     env.globals["GateKind"] = GateKind
     env.globals["GATE_TITLES"] = GATE_TITLES

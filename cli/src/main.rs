@@ -234,6 +234,22 @@ enum WasmBuildError {
     LoadCoreModule { path: String, report: String },
     #[error("failed to encode component {path}: {report}")]
     EncodeComponent { path: String, report: String },
+    #[error("failed to run `rustc {query}`: {source}")]
+    SpawnRustc {
+        query: &'static str,
+        #[source]
+        source: io::Error,
+    },
+    #[error("`rustc {query}` failed with status {status}")]
+    RustcFailed {
+        query: &'static str,
+        status: std::process::ExitStatus,
+    },
+    #[error(
+        "the toolchain has no llvm-ar at {path}; rust-toolchain.toml lists the \
+         llvm-tools component that ships it"
+    )]
+    LlvmArMissing { path: String },
 }
 
 /// Why the set of boot programs could not be resolved from the
@@ -569,6 +585,12 @@ enum ProfileFetchError {
     )]
     NoCollection { repository: String, branch: String },
     #[error(
+        "no unexpired {KERNEL_PROFILE_ARTIFACT} artifact from run {run} of {repository} among \
+         the newest {ARTIFACT_PAGE}; the run's own {KERNEL_PROFILE_WORKFLOW} collection has \
+         to have uploaded it first"
+    )]
+    NoRunCollection { repository: String, run: u64 },
+    #[error(
         "{url} answered HTTP {status} without a redirect; GitHub answers an artifact download \
          with a redirect to its object store"
     )]
@@ -758,12 +780,16 @@ struct ProfileFetchCommand {
     /// Release to take the profile from: the asset `release.yml` attached
     /// to it. Without it, the newest artifact a `kernel-profile.yml` run
     /// on the default branch uploaded.
-    #[arg(long, value_name = "TAG", conflicts_with = "branch")]
+    #[arg(long, value_name = "TAG", conflicts_with_all = ["branch", "run"])]
     tag: Option<String>,
     /// Branch whose newest collection to take, instead of the default
     /// branch's.
-    #[arg(long, value_name = "BRANCH")]
+    #[arg(long, value_name = "BRANCH", conflicts_with = "run")]
     branch: Option<String>,
+    /// Workflow run whose collection to take: the artifact that run
+    /// itself uploaded, for a lane that collected its own profile.
+    #[arg(long, value_name = "RUN_ID")]
+    run: Option<u64>,
     /// `owner/name` of the repository whose collections and releases carry
     /// the profile.
     #[arg(long, value_name = "REPOSITORY", default_value = RELEASE_REPOSITORY)]
@@ -957,7 +983,6 @@ fn run_kernel_prebuild(
         &command.profile,
         &command.out_dir,
         &init_manifest,
-        "init-target",
         "helios_init.wasm",
     )?;
     let init_cwasm = command.out_dir.join("init_component.cwasm");
@@ -1555,6 +1580,15 @@ fn build_compiler_plugin_asset(build: &BootBuild<'_>) -> Result<BootAsset, Bootf
             source,
         }
     })?;
+    // The exact module this run precompiled into the bootfs, at a path that
+    // does not depend on cargo's target-directory layout: the bench's Linux
+    // + Wasmtime column runs this file under `helios-compiler-host`, so both
+    // columns run one plugin build.
+    let wasm_output_path = build.out_dir.join("compiler_plugin.wasm");
+    fs::write(&wasm_output_path, &wasm).map_err(|source| BootfsError::Write {
+        path: wasm_output_path.display().to_string(),
+        source,
+    })?;
     let output_path = build.out_dir.join("compiler_plugin.cwasm");
     write_bootfs_artifact(&output_path, signed)?;
 
@@ -1846,7 +1880,6 @@ fn build_boot_program_asset(
         build.profile,
         build.out_dir,
         &manifest.manifest_path,
-        &format!("bootfs-{}-target", manifest.command),
         &manifest.artifact_name,
     )?;
     let component_bytes = encode_component(&wasm_path)?;
@@ -2010,12 +2043,18 @@ fn read_program_manifest(
     })
 }
 
+/// The target directory every `wasm32-wasip2` component program builds
+/// into. The programs are workspace members built with one profile
+/// environment and one `RUSTFLAGS`, so their shared dependencies compile
+/// once; each program is still its own `cargo build`, so its feature
+/// resolution and its `.wasm` are what a private directory would produce.
+const COMPONENT_PROGRAMS_TARGET_DIR: &str = "component-programs-target";
+
 fn build_component_program(
     cargo: &Path,
     profile: &str,
     out_dir: &Path,
     manifest_path: &Path,
-    target_dir_name: &str,
     artifact_name: &str,
 ) -> Result<PathBuf, WasmBuildError> {
     build_wasm_program(
@@ -2023,7 +2062,7 @@ fn build_component_program(
         profile,
         out_dir,
         manifest_path,
-        target_dir_name,
+        COMPONENT_PROGRAMS_TARGET_DIR,
         "wasm32-wasip2",
         artifact_name,
     )
@@ -2067,6 +2106,14 @@ fn build_wasm_program(
     }
     command.env_remove("CARGO_ENCODED_RUSTFLAGS");
     command.env("RUSTFLAGS", wasm_rustflags(target_triple));
+    // C code a program links (ring's, for one) is archived by `cc`, which
+    // falls back to the host's `ar` for a wasm target; that archive carries
+    // no symbol index wasm-ld can read, and the link then misses every C
+    // symbol. The toolchain's own llvm-ar writes one.
+    command.env(
+        format!("AR_{}", target_triple.replace('-', "_")),
+        toolchain_llvm_ar()?,
+    );
     let status = command
         .status()
         .map_err(|source| WasmBuildError::SpawnCargo {
@@ -2096,6 +2143,41 @@ fn build_wasm_program(
         artifact: artifact_name.to_owned(),
         source,
     })
+}
+
+/// The llvm-ar the toolchain's llvm-tools component installs beside
+/// rust-lld, in the host's directory of the sysroot.
+fn toolchain_llvm_ar() -> Result<PathBuf, WasmBuildError> {
+    let sysroot = rustc_print("--print=sysroot")?;
+    let host = rustc_print("--print=host-tuple")?;
+    let path = PathBuf::from(sysroot)
+        .join("lib/rustlib")
+        .join(host)
+        .join("bin/llvm-ar");
+    if path.is_file() {
+        Ok(path)
+    } else {
+        Err(WasmBuildError::LlvmArMissing {
+            path: path.display().to_string(),
+        })
+    }
+}
+
+/// What `rustc <query>` prints, without its trailing newline.
+fn rustc_print(query: &'static str) -> Result<String, WasmBuildError> {
+    let output = Command::new("rustc")
+        .arg(query)
+        .output()
+        .map_err(|source| WasmBuildError::SpawnRustc { query, source })?;
+    if !output.status.success() {
+        return Err(WasmBuildError::RustcFailed {
+            query,
+            status: output.status,
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_owned())
 }
 
 fn wasm_rustflags(target_triple: &str) -> String {
@@ -2204,143 +2286,6 @@ fn read_signing_key(path: &Path) -> Result<SigningKey, KeyError> {
     Ok(SigningKey::from_bytes(&secret_bytes))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_new_root_secret_is_readable_by_its_owner_alone() {
-        let dir = tempfile::tempdir().expect("a temporary directory");
-        let secret = dir.path().join(ROOT_SECRET_FILE);
-        ensure_root_keypair(&secret, &dir.path().join("root.pub")).expect("a new keypair");
-        let mode = fs::metadata(&secret)
-            .expect("the secret was written")
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, SECRET_KEY_MODE);
-    }
-
-    #[test]
-    fn a_root_secret_others_can_read_is_refused_with_its_mode() {
-        let dir = tempfile::tempdir().expect("a temporary directory");
-        let secret = dir.path().join(ROOT_SECRET_FILE);
-        fs::write(&secret, [7_u8; 32]).expect("a key file");
-        fs::set_permissions(&secret, fs::Permissions::from_mode(0o644)).expect("a wider mode");
-        let error = ensure_root_keypair(&secret, &dir.path().join("root.pub"))
-            .expect_err("a world-readable secret is refused");
-        assert!(
-            matches!(error, KeyError::SecretKeyExposed { mode: 0o644, .. }),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn every_shape_of_github_token_makes_a_header_line() {
-        for token in [
-            "ghs_0123456789abcdefghijklmnopqrstuvwxyzAB",
-            "github_pat_11AAAAAAA0_abcdefghijklmnopqrstuvwxyz",
-            "v1.1f699f1069f60c4d3e2b8a7c5d4e3f2a1b0c9d8e7f",
-        ] {
-            let line = bearer_header("GITHUB_TOKEN", token).expect("a token curl can carry");
-            assert_eq!(
-                line,
-                format!("header = \"Authorization: Bearer {token}\"\n")
-            );
-        }
-    }
-
-    #[test]
-    fn a_value_that_would_escape_the_header_line_is_refused() {
-        for value in [
-            "ghs_abc\"",
-            "ghs_abc\\",
-            "ghs_abc\nurl = evil",
-            "ghs_ab c",
-            "ghs_ab\u{e9}",
-        ] {
-            let error = bearer_header("GH_TOKEN", value)
-                .expect_err("a value that could end or escape the config line is not a token");
-            assert!(
-                matches!(
-                    error,
-                    ProfileFetchError::Token {
-                        variable: "GH_TOKEN"
-                    }
-                ),
-                "{error}"
-            );
-        }
-    }
-
-    #[test]
-    fn selected_target_mismatches_fail_fast() {
-        let mut artifact = test_artifact(
-            "simd-lanes",
-            "helios-wasix-conformance",
-            "0.1.0",
-            "tools/wasi-apps/wasix-tests",
-            Path::new("simd-lanes.wasm"),
-        );
-        artifact.targets.push("aarch64-unknown-none".to_owned());
-        let selected = Some(BTreeSet::from(["simd-lanes".to_owned()]));
-
-        let error =
-            reject_selected_target_mismatches(&[artifact], "riscv64gc-unknown-none-elf", &selected)
-                .expect_err("target-specific artifact must reject unsupported selected target");
-        assert!(
-            error.to_string().contains("simd-lanes supports"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn wasm_simd_requirement_gates_targets() {
-        let mut artifact = test_artifact(
-            "quickjs",
-            "quickjs-ng/quickjs",
-            "v0.14.0",
-            "https://github.com/quickjs-ng/quickjs",
-            Path::new("qjs.wasm"),
-        );
-        artifact.requires_wasm_simd = true;
-
-        assert!(artifact.supports_target("aarch64-unknown-none"));
-        assert!(artifact.supports_target("x86_64-unknown-none"));
-        assert!(artifact.supports_target("aarch64-apple-darwin"));
-        assert!(!artifact.supports_target("riscv64gc-unknown-none-elf"));
-
-        let selected = Some(BTreeSet::from(["quickjs".to_owned()]));
-        let error =
-            reject_selected_target_mismatches(&[artifact], "riscv64gc-unknown-none-elf", &selected)
-                .expect_err("simd-requiring artifact must reject riscv64 selection");
-        assert!(
-            error.to_string().contains("quickjs requires wasm SIMD"),
-            "unexpected error: {error}"
-        );
-    }
-
-    fn test_artifact(
-        command: &str,
-        package: &str,
-        version: &str,
-        source_url: &str,
-        source: &Path,
-    ) -> ExternalBootArtifact {
-        ExternalBootArtifact {
-            command: command.to_owned(),
-            package: package.to_owned(),
-            version: version.to_owned(),
-            source_url: source_url.to_owned(),
-            targets: Vec::new(),
-            requires_wasm_simd: false,
-            bootfs_path: format!("bin/{command}"),
-            source: source.to_owned(),
-            support_root: None,
-            support_bootfs_prefix: None,
-        }
-    }
-}
-
 /// GitHub's REST API, where a release's tag and its assets are read from.
 const GITHUB_API: &str = "https://api.github.com";
 
@@ -2435,7 +2380,7 @@ fn run_profile_fetch(
     let repository = &command.repository;
     let (fetched, profile) = match &command.tag {
         Some(tag) => fetch_release_asset(repository, tag)?,
-        None => fetch_collection_artifact(repository, command.branch.as_deref())?,
+        None => fetch_collection_artifact(repository, command.branch.as_deref(), command.run)?,
     };
     let path = store.profile_path(&fetched.key())?;
     let directory = path.parent().expect("a profile path names its key");
@@ -2494,14 +2439,17 @@ fn fetch_release_asset(
 
 /// The profile inside the newest unexpired collection artifact a run on
 /// `branch` uploaded, the default branch when none is named, and the
-/// record naming that run.
+/// record naming that run. With `run` it is that run's artifact instead,
+/// whatever branch it was on.
 fn fetch_collection_artifact(
     repository: &str,
     branch: Option<&str>,
+    run: Option<u64>,
 ) -> Result<(FetchedProfile, Vec<u8>), ProfileFetchError> {
-    let branch = match branch {
-        Some(branch) => branch.to_owned(),
-        None => default_branch(repository)?,
+    let branch = match (branch, run) {
+        (Some(branch), _) => branch.to_owned(),
+        (None, Some(_)) => String::new(),
+        (None, None) => default_branch(repository)?,
     };
     let url = format!(
         "{GITHUB_API}/repos/{repository}/actions/artifacts\
@@ -2515,11 +2463,20 @@ fn fetch_collection_artifact(
         .find(|artifact| {
             !artifact.expired
                 && artifact.name == KERNEL_PROFILE_ARTIFACT
-                && artifact.workflow_run.head_branch == branch
+                && match run {
+                    Some(run) => artifact.workflow_run.id == run,
+                    None => artifact.workflow_run.head_branch == branch,
+                }
         })
-        .ok_or_else(|| ProfileFetchError::NoCollection {
-            repository: repository.to_owned(),
-            branch: branch.clone(),
+        .ok_or_else(|| match run {
+            Some(run) => ProfileFetchError::NoRunCollection {
+                repository: repository.to_owned(),
+                run,
+            },
+            None => ProfileFetchError::NoCollection {
+                repository: repository.to_owned(),
+                branch: branch.clone(),
+            },
         })?;
     // The archive endpoint answers with a redirect to GitHub's object
     // store, whose signed URL refuses the token the API wanted, so the
@@ -2744,4 +2701,141 @@ fn bearer_header(variable: &'static str, token: &str) -> Result<String, ProfileF
         return Err(ProfileFetchError::Token { variable });
     }
     Ok(format!("header = \"Authorization: Bearer {token}\"\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_new_root_secret_is_readable_by_its_owner_alone() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let secret = dir.path().join(ROOT_SECRET_FILE);
+        ensure_root_keypair(&secret, &dir.path().join("root.pub")).expect("a new keypair");
+        let mode = fs::metadata(&secret)
+            .expect("the secret was written")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, SECRET_KEY_MODE);
+    }
+
+    #[test]
+    fn a_root_secret_others_can_read_is_refused_with_its_mode() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let secret = dir.path().join(ROOT_SECRET_FILE);
+        fs::write(&secret, [7_u8; 32]).expect("a key file");
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o644)).expect("a wider mode");
+        let error = ensure_root_keypair(&secret, &dir.path().join("root.pub"))
+            .expect_err("a world-readable secret is refused");
+        assert!(
+            matches!(error, KeyError::SecretKeyExposed { mode: 0o644, .. }),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn every_shape_of_github_token_makes_a_header_line() {
+        for token in [
+            "ghs_0123456789abcdefghijklmnopqrstuvwxyzAB",
+            "github_pat_11AAAAAAA0_abcdefghijklmnopqrstuvwxyz",
+            "v1.1f699f1069f60c4d3e2b8a7c5d4e3f2a1b0c9d8e7f",
+        ] {
+            let line = bearer_header("GITHUB_TOKEN", token).expect("a token curl can carry");
+            assert_eq!(
+                line,
+                format!("header = \"Authorization: Bearer {token}\"\n")
+            );
+        }
+    }
+
+    #[test]
+    fn a_value_that_would_escape_the_header_line_is_refused() {
+        for value in [
+            "ghs_abc\"",
+            "ghs_abc\\",
+            "ghs_abc\nurl = evil",
+            "ghs_ab c",
+            "ghs_ab\u{e9}",
+        ] {
+            let error = bearer_header("GH_TOKEN", value)
+                .expect_err("a value that could end or escape the config line is not a token");
+            assert!(
+                matches!(
+                    error,
+                    ProfileFetchError::Token {
+                        variable: "GH_TOKEN"
+                    }
+                ),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn selected_target_mismatches_fail_fast() {
+        let mut artifact = test_artifact(
+            "simd-lanes",
+            "helios-wasix-conformance",
+            "0.1.0",
+            "tools/wasi-apps/wasix-tests",
+            Path::new("simd-lanes.wasm"),
+        );
+        artifact.targets.push("aarch64-unknown-none".to_owned());
+        let selected = Some(BTreeSet::from(["simd-lanes".to_owned()]));
+
+        let error =
+            reject_selected_target_mismatches(&[artifact], "riscv64gc-unknown-none-elf", &selected)
+                .expect_err("target-specific artifact must reject unsupported selected target");
+        assert!(
+            error.to_string().contains("simd-lanes supports"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn wasm_simd_requirement_gates_targets() {
+        let mut artifact = test_artifact(
+            "quickjs",
+            "quickjs-ng/quickjs",
+            "v0.14.0",
+            "https://github.com/quickjs-ng/quickjs",
+            Path::new("qjs.wasm"),
+        );
+        artifact.requires_wasm_simd = true;
+
+        assert!(artifact.supports_target("aarch64-unknown-none"));
+        assert!(artifact.supports_target("x86_64-unknown-none"));
+        assert!(artifact.supports_target("aarch64-apple-darwin"));
+        assert!(!artifact.supports_target("riscv64gc-unknown-none-elf"));
+
+        let selected = Some(BTreeSet::from(["quickjs".to_owned()]));
+        let error =
+            reject_selected_target_mismatches(&[artifact], "riscv64gc-unknown-none-elf", &selected)
+                .expect_err("simd-requiring artifact must reject riscv64 selection");
+        assert!(
+            error.to_string().contains("quickjs requires wasm SIMD"),
+            "unexpected error: {error}"
+        );
+    }
+
+    fn test_artifact(
+        command: &str,
+        package: &str,
+        version: &str,
+        source_url: &str,
+        source: &Path,
+    ) -> ExternalBootArtifact {
+        ExternalBootArtifact {
+            command: command.to_owned(),
+            package: package.to_owned(),
+            version: version.to_owned(),
+            source_url: source_url.to_owned(),
+            targets: Vec::new(),
+            requires_wasm_simd: false,
+            bootfs_path: format!("bin/{command}"),
+            source: source.to_owned(),
+            support_root: None,
+            support_bootfs_prefix: None,
+        }
+    }
 }

@@ -6,16 +6,17 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use triomphe::Arc;
 
 use crate::{
-    BootPayload, DEFAULT_PERF_METRIC_CAPACITY, DEFAULT_PROFILE_STACK_CAPACITY,
-    DEFAULT_TRACE_HISTORY_CAPACITY, EmbeddedBootFs, EmbeddedComponent, FoldedProfileSample,
-    FutexKey, FutexTable, FutexWaitRegistration, HEAP_SIZE_CLASS_COUNT, HeapStats, InstanceId,
-    InstanceRegistry, InstructionSampler, Notify, PerfMetricFilter, PerfMetricHistory,
-    PerfMetricSample, PerfSample, ProfileFilter, ProfileScope, ProfileSink, Settings, StatsSample,
-    TraceEvent, TraceFilter, TraceLog,
+    BOOT_DEVICE, BootFs, BootPayload, DEFAULT_PERF_METRIC_CAPACITY, DEFAULT_PROFILE_STACK_CAPACITY,
+    DEFAULT_TRACE_HISTORY_CAPACITY, EmbeddedComponent, FoldedProfileSample, FutexKey, FutexTable,
+    FutexWaitRegistration, HEAP_SIZE_CLASS_COUNT, HOST_SHARE_GUEST_MOUNT_PATH, HeapStats,
+    HostShare, InstanceId, InstanceRegistry, InstructionSampler, MountTable, MountedFs, Namespace,
+    Notify, PerfMetricFilter, PerfMetricHistory, PerfMetricSample, PerfSample, ProfileFilter,
+    ProfileScope, ProfileSink, Settings, StatsSample, TraceEvent, TraceFilter, TraceLog,
 };
 use crate::{MachineGeneration, MachineGenerationHandle, RootEntropy, RootEntropyHandle};
 use crossbeam_utils::CachePadded;
 use helios_hal::cpu::{HardwarePerfCounterDelta, Timebase};
+use helios_hal::fs::FileSystemRights;
 use helios_hal::rtc::{RealTimeClock, UnixSeconds};
 use spin::{Mutex, Once};
 
@@ -26,7 +27,6 @@ use crate::ComponentHostVsockService;
 use crate::component::{ComponentRuntimeState, ProviderSlot};
 use crate::device::DeviceGrantRegistry;
 use crate::network::HttpExchange;
-use crate::runtime::types::ComponentHostFilesystemState;
 
 #[derive(Clone)]
 pub struct RuntimeState<ProgramService, NetworkService, HostFsService> {
@@ -116,7 +116,11 @@ struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     /// `argv0`, and the boot filesystem it carries — parsed from the
     /// boot module at bring-up.
     payload: BootPayload,
-    bootfs: Mutex<Option<EmbeddedBootFs>>,
+    /// The root namespace: the kernel's own process tree, which every
+    /// program's tree descends from. Its root is the payload's boot
+    /// filesystem; the host share joins its table once a backend installs
+    /// the 9p client.
+    namespace: Namespace<HostFsService>,
     tracing: TraceLog,
     /// The profile and perf histories, held as a handle rather than as
     /// fields so a subsystem this state owns can record into them
@@ -358,7 +362,10 @@ where
                 vsock_service: Once::new(),
                 futex_table: Mutex::new(FutexTable::new()),
                 payload,
-                bootfs: Mutex::new(Some(payload.bootfs())),
+                namespace: Namespace::new(MountTable::new(
+                    BootFs::new(payload.bootfs(), BOOT_DEVICE),
+                    processor_count,
+                )),
                 tracing: TraceLog::new(DEFAULT_TRACE_HISTORY_CAPACITY),
                 profiles: ProfileSink::new(
                     DEFAULT_PROFILE_STACK_CAPACITY,
@@ -1017,13 +1024,30 @@ where
             .unwrap_or_else(|| panic!("root entropy was used before the backend installed it"))
     }
 
+    /// Installs the host share's 9p client and mounts the share at
+    /// [`HOST_SHARE_GUEST_MOUNT_PATH`].
     pub fn install_host_fs_service(&self, service: HostFsService) {
         let mut slot = self.inner.host_fs_service.lock();
         assert!(
             slot.is_none(),
             "host-fs service was installed more than once"
         );
-        *slot = Some(service);
+        *slot = Some(service.clone());
+        self.inner
+            .namespace
+            .table()
+            .mount(
+                HOST_SHARE_GUEST_MOUNT_PATH,
+                MountedFs::Host(HostShare::new(service)),
+                FileSystemRights::READ | FileSystemRights::WRITE,
+            )
+            .unwrap_or_else(|error| panic!("host share mount failed at bring-up: {error}"));
+    }
+
+    /// The root namespace. A program the kernel launches runs in a tree
+    /// that descends from it ([`Namespace::descend`]).
+    pub fn root_namespace(&self) -> &Namespace<HostFsService> {
+        &self.inner.namespace
     }
 
     pub fn host_fs_service(&self) -> Option<HostFsService> {
@@ -1072,6 +1096,11 @@ where
         assert!(installed, "memory balloon was installed more than once");
     }
 
+    /// The memory balloon, when the platform gave this kernel one.
+    pub fn memory_balloon(&self) -> Option<BalloonHandle> {
+        self.inner.balloon.get().cloned()
+    }
+
     /// Publishes swap, once a backend has brought it up.
     pub fn install_swap(&self, swap: crate::SwapHandle) {
         let mut installed = false;
@@ -1116,10 +1145,6 @@ where
         self.inner.futex_table.lock().wake_all(key)
     }
 
-    pub fn bootfs(&self) -> Option<EmbeddedBootFs> {
-        *self.inner.bootfs.lock()
-    }
-
     /// The system component this payload carries, when this build would
     /// autostart one.
     pub fn system_component(&self) -> Option<EmbeddedComponent> {
@@ -1130,10 +1155,6 @@ where
     /// autostart.
     pub fn has_system_component(&self) -> bool {
         self.inner.payload.has_system_component()
-    }
-
-    pub fn retire_bootfs(&self) {
-        *self.inner.bootfs.lock() = None;
     }
 }
 
@@ -1193,7 +1214,7 @@ impl<ProgramService, NetworkService, HostFsService> ComponentRuntimeState
 where
     ProgramService: Clone + Send + 'static,
     NetworkService: crate::ComponentNetworkService,
-    HostFsService: Clone + Send + 'static,
+    HostFsService: Clone + Send + Sync + 'static,
 {
     fn retire_network_handles(&self, retired: &crate::SocketRetirementQueue) {
         if retired.is_empty() {
@@ -1222,7 +1243,7 @@ where
     }
 
     fn memory_balloon(&self) -> Option<BalloonHandle> {
-        self.inner.balloon.get().cloned()
+        RuntimeState::memory_balloon(self)
     }
 
     fn device_grants(&self) -> &DeviceGrantRegistry {
@@ -1274,22 +1295,6 @@ where
         sample: PerfSample,
     ) {
         RuntimeState::record_perf_metric_parts(self, scope, prefix, suffix, sample);
-    }
-}
-
-impl<ProgramService, NetworkService, HostFsService> ComponentHostFilesystemState<HostFsService>
-    for RuntimeState<ProgramService, NetworkService, HostFsService>
-where
-    ProgramService: Clone + Send + 'static,
-    NetworkService: Clone + Send + Sync + 'static,
-    HostFsService: crate::HostFileSystem,
-{
-    fn host_filesystem_service(&self) -> Option<HostFsService> {
-        self.host_fs_service()
-    }
-
-    fn bootfs(&self) -> Option<EmbeddedBootFs> {
-        RuntimeState::bootfs(self)
     }
 }
 

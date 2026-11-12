@@ -93,7 +93,11 @@ def test_coreutils_counterparts_run_one_exec_per_helios_exec() -> None:
 
 def test_native_counterparts_exist_for_every_native_bin_reference() -> None:
     manifest = load_workloads()
-    sources = {path.stem for path in (REPO_ROOT / "tools/bench/native").glob("*.c")}
+    native_root = REPO_ROOT / "tools/bench/native"
+    sources = {path.stem for path in native_root.glob("*.c")}
+    # The Rust tools `build.sh` builds alongside the C ones, by package.
+    sources.update(re.findall(r"cargo zigbuild .*-p (\S+)", (native_root / "build.sh").read_text()))
+    assert "helios-compiler-host" in sources
     for workload in manifest["workloads"]:
         for side in ("linux_native", "linux_wasmtime"):
             spec = workload["counterparts"][side]
@@ -102,6 +106,39 @@ def test_native_counterparts_exist_for_every_native_bin_reference() -> None:
             for value in [spec["program"], *spec.get("args", [])]:
                 if value.startswith("{native_bin}/"):
                     assert Path(value).name in sources, value
+
+
+def test_aot_curl_runs_the_compiler_plugin_on_both_compared_columns() -> None:
+    """#750: the Linux + Wasmtime column hosts the plugin the Helios column
+    runs, asking for the same compile; native `wasmtime compile` is the
+    reference beside them, never a comparison."""
+    workload = next(w for w in load_workloads()["workloads"] if w["name"] == "aot-curl")
+    native = workload["counterparts"]["linux_native"]
+    wasmtime = workload["counterparts"]["linux_wasmtime"]
+    assert native["program"] == "{wasmtime}" and native["args"][0] == "compile"
+    assert wasmtime["resident"] is True
+    assert wasmtime["program"] == "{native_bin}/helios-compiler-host"
+    args = wasmtime["args"]
+    flags = dict(zip(args[::2], args[1::2], strict=True))
+    assert flags == {
+        "--plugin": "{compiler_plugin}",
+        "--input": "{guest:artifacts/wasi-tools/curl.wasm}",
+        "--output": "{workdir}/aot-curl-output.cwasm",
+        "--target": "{compiler_target}",
+        "--hint": "performance",
+        "--workers": "{compiler_workers}",
+    }
+    # The input is the one the Helios column uploads.
+    assert flags["--input"] == "{guest:" + workload["wasm_path"] + "}"
+    assert set(workload["uncompared"]) == {"linux_native"}
+    assert workload["matched_metrics"] == ["compiler_workers"]
+
+
+def test_every_lane_states_its_compiler_worker_count() -> None:
+    """The kernel's kernel-role processors: every vCPU but the one the
+    embedded debugger reserves for the system component."""
+    for lane in load_manifest().lanes:
+        assert 1 <= lane.compiler_workers < lane.vcpus, lane.name
 
 
 def test_the_workflow_measures_one_lane() -> None:
@@ -128,3 +165,31 @@ def test_the_workflow_measures_one_lane() -> None:
     assert lane.github_matrix_entry()["rpc-transport"] == "vsock"
     assert lane.runs_on(advisory=True) == "ubuntu-24.04"
     assert lane.runs_on(advisory=False) == "helios-bench-x86-kvm"
+
+
+def lane_with(**overrides) -> dict:
+    """The aarch64-hvf lane as the manifest states it, with ``overrides``."""
+    return {**load_manifest().lane("aarch64-hvf").model_dump(), **overrides}
+
+
+def test_the_two_guests_of_a_lane_have_one_memory_size() -> None:
+    """Both columns compare alike only on equal guests (#491): a lane whose
+    memory fields differ without a stated reason fails at load, naming both."""
+    lane = load_manifest().lane("aarch64-hvf")
+    assert lane.memory == lane.linux_vm_memory
+    assert lane.memory_differs_because is None
+    with pytest.raises(ValueError, match=r"memory = '2G' and the Linux guest linux_vm_memory = '4G'"):
+        Lane.model_validate(lane_with(linux_vm_memory="4G"))
+    stated = Lane.model_validate(lane_with(linux_vm_memory="4G", memory_differs_because="a reason"))
+    assert stated.linux_vm_memory == "4G"
+
+
+def test_a_reason_for_unequal_memory_is_refused_on_equal_guests() -> None:
+    with pytest.raises(ValueError, match="states memory_differs_because"):
+        Lane.model_validate(lane_with(memory_differs_because="stale"))
+
+
+def test_a_lane_that_sets_its_guests_apart_says_why() -> None:
+    lane = load_manifest().lane("x86-64-kvm")
+    assert lane.memory != lane.linux_vm_memory
+    assert lane.memory_differs_because

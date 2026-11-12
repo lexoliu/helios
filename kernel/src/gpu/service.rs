@@ -11,11 +11,20 @@
 //! There is no vtable between a rendering plugin and the engine, and no
 //! lock around the device.
 //!
+//! # Sessions
+//!
+//! The renderer multiplexes contexts by itself, so nothing here is
+//! exclusive. An instance opens a [`Gpu3dSession`]; every message it
+//! sends carries the session's record, and the owner tasks file what
+//! the message made under it. A session ends when it is dropped — its
+//! instance let its last `gpu` handle go, or died — and what it made,
+//! and only that, is handed back.
+//!
 //! # Concurrency contract
 //!
 //! [`Gpu3dService`] is cloneable and every method on it may be called
-//! from any processor. `claim` is a compare-and-exchange on one word;
-//! the request queues are the kernel's bounded provider queues, whose
+//! from any processor. Opening a session is one counter increment; the
+//! request queues are the kernel's bounded provider queues, whose
 //! producers park on a permit-based notification rather than spinning.
 //!
 //! Two queues, because the work has two urgencies. Everything that
@@ -23,31 +32,49 @@
 //! between them — goes on the control queue, where a capset read of
 //! tens of kilobytes may take the device a while to answer. Command
 //! submissions go on the submit queue, so a submission never waits
-//! behind one of those reads. The fence a submission carries is retired
-//! by the submit server itself: the driver's completion is the signal,
-//! and it is published on the context's [`SequenceSignal`] the request
-//! carried, which is what a guest's `fences` stream reads.
+//! behind one of those reads. The submit queue's order is the order the
+//! device sees: the submit server posts one command at a time, popping
+//! the next only once the last is on the device's ring, and a producer
+//! checks a submission's fence against its ring and queues it in one
+//! step of the task that owns its store.
 //!
-//! A claim's release is not a message, for the reason the display's is
-//! not: the store that holds a claim is dropped by whatever kills its
-//! instance, and a drop cannot await a queue that is full. The release
-//! is one permit on a [`Notify`] the control server races against its
-//! inbox, and the claim word moves to [`ClaimState::RELEASING`] at the
-//! same moment, so nobody is handed the engine between the moment its
-//! last owner let go and the moment the renderer has actually given the
-//! resources back. The submit server may still be holding one: a
+//! A context's rings are [`RingTimeline`]s shared between the store that
+//! checks fences against them and the submit server that retires fences
+//! on them; the server is the only one that publishes, so every ring's
+//! stream is monotone.
+//!
+//! A session's end is not a message, for the reason the display's
+//! release is not: the store that holds a session is dropped by
+//! whatever kills its instance, and a drop cannot await a queue that is
+//! full. The end is a flag on the session's record and one permit on a
+//! [`Notify`] the control server races against its inbox. The submit
+//! server may still be holding one of the session's submissions: a
 //! request it already popped is in flight until the device answers it,
-//! and the release waits that count out — a chain parked for ring room
-//! otherwise publishes after `CTX_DESTROY`, naming a context the device
-//! has already forgotten.
+//! and the release does not start on that session until its count is
+//! zero — a chain parked for ring room otherwise publishes after
+//! `CTX_DESTROY`, naming a context the device has already forgotten.
+//! The release is pending work rather than a wait: the control server
+//! goes on serving every other session, and the drain to zero banks a
+//! permit on the same [`Notify`] that has it resume.
+//!
+//! A blob a scanout shows is held by that scanout: the surface carries a
+//! [`ScanoutHold`] on the blob's [`BlobShared`], and the blob is not
+//! destroyed — whether its handle was dropped or its session ended —
+//! until every hold is gone. The display path drops a hold only after it
+//! has blanked the scanout, so the device never scans out a resource
+//! that no longer exists; the hold's drop banks a permit that has the
+//! control server finish the release.
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use arrayvec::ArrayVec;
 use futures::channel::oneshot;
 use helios_hal::device::DeviceRegion;
 use helios_hal::display::{
     BlobId, BlobMemory, BlobUsage, CapsetId, CapsetList, ContextId, ContextName, FenceId,
+    RingCount, RingIndex,
 };
 use helios_hal::iommu::PhysicalRange;
 use triomphe::Arc;
@@ -56,12 +83,12 @@ use crate::buffer::Buffer;
 use crate::component::{ProviderError, ProviderSender};
 use crate::display::SequenceSignal;
 use crate::exec::Notify;
-use crate::process::GpuClaimCap;
+use crate::process::GpuOpenCap;
 
-use super::Gpu3dServiceError;
+use super::{Gpu3dServiceError, MAX_EXECUTE_BYTES};
 
-/// Requests one claim may have in flight on each queue before its next
-/// one waits for room.
+/// Requests the machine's sessions may have waiting on each queue
+/// before the next one waits for room.
 ///
 /// The same bound the display path sets, for the same reason: a plugin
 /// that has queued this many submissions is one the renderer has not
@@ -69,80 +96,315 @@ use super::Gpu3dServiceError;
 /// needs.
 pub const REQUEST_QUEUE_DEPTH: usize = crate::display::REQUEST_QUEUE_DEPTH;
 
-/// One renderer context a claim opened, as the store records it.
+/// Which session a request was made under.
 ///
-/// The fence signal is shared with the submit server, which publishes
-/// every fence that retires on this context to it; a `fences` stream
-/// the guest holds reads the same signal.
-pub struct ContextRecord {
+/// Counted up from one and never reused, so a handle that outlived its
+/// session can never name a later one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SessionId(u64);
+
+impl SessionId {
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+/// What the owner tasks and the session's store share about one session.
+pub(crate) struct SessionState {
+    pub(super) id: SessionId,
+    /// Set once, when the session is dropped. A request read after it is
+    /// set is dropped unanswered: its instance let the engine go.
+    pub(super) ended: AtomicBool,
+    /// Submissions of this session the submit server has popped and the
+    /// device has not finished with.
+    ///
+    /// Counted from the pop — before the session check — because a
+    /// release noticed between the two reads would otherwise see the
+    /// count still at zero and destroy a context underneath a chain the
+    /// device is about to take.
+    pub(super) submits_in_flight: AtomicU64,
+    /// The control server's wake-up. A drain to zero of an ended
+    /// session banks one permit on it, so the pending release resumes.
+    pub(super) release: Arc<Notify>,
+}
+
+impl SessionState {
+    pub(super) fn has_ended(&self) -> bool {
+        self.ended.load(Ordering::Acquire)
+    }
+
+    /// Whether the device still holds a submission of this session.
+    pub(super) fn is_draining(&self) -> bool {
+        self.submits_in_flight.load(Ordering::Acquire) != 0
+    }
+}
+
+/// What the owner task, the blob's handle and every scanout of it share
+/// about one blob.
+pub struct BlobShared {
+    id: BlobId,
+    /// Scanouts showing the blob right now.
+    scanouts: AtomicU64,
+    /// The control server's wake-up, banked when the last scanout lets
+    /// go, so a release the scanout held back resumes.
+    release: Arc<Notify>,
+}
+
+impl BlobShared {
+    pub(crate) fn new(id: BlobId, release: Arc<Notify>) -> Self {
+        Self {
+            id,
+            scanouts: AtomicU64::new(0),
+            release,
+        }
+    }
+
+    /// The virtio resource id the device knows the blob by.
+    pub const fn id(&self) -> BlobId {
+        self.id
+    }
+
+    /// Whether a scanout shows the blob.
+    pub fn is_scanned_out(&self) -> bool {
+        self.scanouts.load(Ordering::Acquire) != 0
+    }
+}
+
+/// One scanout's hold on a blob: the blob is not destroyed while it
+/// exists. Dropped by the display path once the scanout is blanked.
+pub struct ScanoutHold {
+    blob: Arc<BlobShared>,
+}
+
+impl ScanoutHold {
+    /// Hold the blob for one scanout of it.
+    ///
+    /// Taken in the store step that checks the blob's session is open,
+    /// so a release that starts afterwards sees the hold.
+    pub fn new(blob: &Arc<BlobShared>) -> Self {
+        blob.scanouts.fetch_add(1, Ordering::AcqRel);
+        Self { blob: blob.clone() }
+    }
+
+    /// The blob held.
+    pub fn blob(&self) -> BlobId {
+        self.blob.id
+    }
+}
+
+impl Drop for ScanoutHold {
+    fn drop(&mut self) {
+        if self.blob.scanouts.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.blob.release.notify_one();
+        }
+    }
+}
+
+/// One ring of one context: the fences the store has let onto it, and
+/// the fences the device has retired on it.
+///
+/// `submitted` is written by the task that owns the context's store,
+/// which checks every fence against it; `fences` is published by the
+/// submit server alone, so the stream a guest reads only ever moves
+/// forward.
+pub struct RingTimeline {
+    fences: SequenceSignal,
+    submitted: AtomicU64,
+}
+
+impl RingTimeline {
+    fn new() -> Self {
+        Self {
+            fences: SequenceSignal::new(),
+            submitted: AtomicU64::new(0),
+        }
+    }
+
+    /// Every fence retired on this ring, published as its raw value.
+    pub fn signal(&self) -> &SequenceSignal {
+        &self.fences
+    }
+
+    /// The newest fence the store has let onto this ring.
+    pub fn submitted(&self) -> u64 {
+        self.submitted.load(Ordering::Acquire)
+    }
+
+    /// Whether `fence` comes after every fence already let onto the
+    /// ring.
+    pub(crate) fn admits(&self, fence: FenceId) -> bool {
+        fence.raw() > self.submitted()
+    }
+
+    /// Record that `fence` is on its way to the device. Called in the
+    /// step that queued it, and only after [`Self::admits`] said yes.
+    pub(crate) fn record_submitted(&self, fence: FenceId) {
+        self.submitted.store(fence.raw(), Ordering::Release);
+    }
+
+    /// Retire `fence` on this ring, if it comes after what has already
+    /// been retired: the stream answers for every fence before the
+    /// newest, so it never moves back.
+    pub(super) fn retire(&self, fence: u64, nanos: u64) {
+        if fence > self.fences.sequence() {
+            self.fences.publish(fence, nanos);
+        }
+    }
+}
+
+/// What the store, the submit server and a guest's fence streams share
+/// about one context.
+pub struct ContextShared {
+    id: ContextId,
+    rings: RingCount,
+    timelines: Box<[RingTimeline]>,
+    /// Set once the device refused one of this context's commands after
+    /// its submission had resolved, or a submission the store had
+    /// accepted could not be posted. Every later call on the context
+    /// answers `device-fault`.
+    faulted: AtomicBool,
+}
+
+impl ContextShared {
+    pub(super) fn new(id: ContextId, rings: RingCount) -> Self {
+        Self {
+            id,
+            rings,
+            timelines: rings.rings().map(|_| RingTimeline::new()).collect(),
+            faulted: AtomicBool::new(false),
+        }
+    }
+
     /// The device-side context identifier.
-    pub id: ContextId,
+    pub const fn id(&self) -> ContextId {
+        self.id
+    }
+
+    /// How many rings the context was created with.
+    pub const fn rings(&self) -> RingCount {
+        self.rings
+    }
+
+    /// One of the context's rings, or `None` for a ring it does not
+    /// have.
+    pub fn timeline(&self, ring: RingIndex) -> Option<&RingTimeline> {
+        self.timelines.get(ring.index())
+    }
+
+    /// Whether the device has faulted this context.
+    pub fn is_faulted(&self) -> bool {
+        self.faulted.load(Ordering::Acquire)
+    }
+
+    /// Check a submission on `ring` carrying `fence` against this
+    /// context: refused `device-fault` once the device has faulted it,
+    /// `bad-ring` for a ring it was not created with, and `stale-fence`
+    /// for a fence that does not come after every fence already let onto
+    /// that ring. Each ring is its own timeline, so a fence is only ever
+    /// stale against its own ring.
+    ///
+    /// Nothing is recorded: the caller records the fence on the ring it
+    /// answers with ([`RingTimeline::record_submitted`]) in the step that
+    /// queues the submission.
+    pub(crate) fn admit(
+        &self,
+        ring: u8,
+        fence: Option<u64>,
+    ) -> Result<(RingIndex, Option<FenceId>, &RingTimeline), Gpu3dServiceError> {
+        if self.is_faulted() {
+            return Err(Gpu3dServiceError::DeviceFault);
+        }
+        let Some((ring, timeline)) = RingIndex::new(ring)
+            .and_then(|ring| self.timeline(ring).map(|timeline| (ring, timeline)))
+        else {
+            return Err(Gpu3dServiceError::BadRing);
+        };
+        let fence = fence.map(FenceId::new);
+        if let Some(fence) = fence
+            && !timeline.admits(fence)
+        {
+            return Err(Gpu3dServiceError::StaleFence);
+        }
+        Ok((ring, fence, timeline))
+    }
+
+    /// Fault the context and retire every ring up to the newest fence
+    /// let onto it.
+    ///
+    /// Retiring is the whole promise a faulted context still keeps: no
+    /// reader of any of its rings waits for a fence that will now never
+    /// be signalled. What the device made of the work before those
+    /// points is undefined; the pages it read stay referenced by their
+    /// requests until it answers each of them, so nothing it may still
+    /// read goes back to a pool.
+    pub(super) fn fault(&self, nanos: u64) {
+        self.faulted.store(true, Ordering::Release);
+        for timeline in &*self.timelines {
+            timeline.retire(timeline.submitted(), nanos);
+        }
+    }
+}
+
+/// One renderer context a session opened, as the store records it.
+pub struct ContextRecord {
     /// The renderer this context speaks to.
     pub capset: CapsetId,
-    /// Every fence retired on this context, published as its raw value.
-    pub fences: Arc<SequenceSignal>,
+    /// The context's identity, rings and fault state, shared with the
+    /// submit server.
+    pub shared: Arc<ContextShared>,
 }
 
 /// Work for the task that owns what the renderer holds.
-///
-/// Every variant carries the claim generation it was made under. A
-/// request that outlived its claim names a renderer its instance no
-/// longer holds, and serving it against whoever holds the engine now
-/// would let a dead plugin drive a live one's device.
 pub(crate) enum Gpu3dRequest {
     /// Every capability set the device carries, in its own order.
     Capsets {
-        generation: u64,
         reply: oneshot::Sender<Result<CapsetList, Gpu3dServiceError>>,
     },
-    /// The bytes of one capability set, at the newest version the host
-    /// speaks.
+    /// The bytes of one capability set at one version.
     Capset {
-        generation: u64,
         id: CapsetId,
+        version: u32,
         reply: oneshot::Sender<Result<Vec<u8>, Gpu3dServiceError>>,
     },
-    /// Open a renderer context of the type `capset` names.
+    /// Open a renderer context of the type `capset` names, with `rings`
+    /// rings.
     CreateContext {
-        generation: u64,
         capset: CapsetId,
+        rings: RingCount,
         name: ContextName,
         reply: oneshot::Sender<Result<ContextRecord, Gpu3dServiceError>>,
     },
     /// Let a context go. No reply: the store drops the handle and the
     /// renderer is told by the task that owns it.
-    DestroyContext { generation: u64, context: ContextId },
+    DestroyContext { context: ContextId },
     /// Create a blob resource.
     CreateBlob {
-        generation: u64,
         spec: BlobSpec,
-        reply: oneshot::Sender<Result<BlobId, Gpu3dServiceError>>,
+        reply: oneshot::Sender<Result<Arc<BlobShared>, Gpu3dServiceError>>,
     },
-    /// Let a blob go. A mapped blob is taken out of the aperture first.
-    DestroyBlob { generation: u64, blob: BlobId },
+    /// Let a blob go. A mapped blob is taken out of the aperture first;
+    /// a blob a scanout shows goes once the last scanout lets it go.
+    DestroyBlob { blob: BlobId },
     /// Place a blob's host storage in the engine's host-visible
-    /// aperture and report where it landed.
+    /// aperture and report where it landed, and how it is to be
+    /// reached.
     MapBlob {
-        generation: u64,
         blob: BlobId,
         reply: oneshot::Sender<Result<DeviceRegion, Gpu3dServiceError>>,
     },
     /// Take a blob back out of the aperture.
     UnmapBlob {
-        generation: u64,
         blob: BlobId,
         reply: oneshot::Sender<Result<(), Gpu3dServiceError>>,
     },
     /// Make a blob reachable from a context's command stream.
     AttachResource {
-        generation: u64,
         context: ContextId,
         blob: BlobId,
         reply: oneshot::Sender<Result<(), Gpu3dServiceError>>,
     },
     /// Take a blob back out of a context's command stream.
     DetachResource {
-        generation: u64,
         context: ContextId,
         blob: BlobId,
         reply: oneshot::Sender<Result<(), Gpu3dServiceError>>,
@@ -151,10 +413,10 @@ pub(crate) enum Gpu3dRequest {
 
 /// What one `CreateBlob` request describes.
 ///
-/// `backing` carries the claiming instance's own buffer for the
-/// guest-backed kinds and is absent for a host-3D blob, whose storage
-/// is the renderer's. The owner task's record of the blob keeps it for
-/// as long as the device does.
+/// `backing` carries the instance's own buffer for the guest-backed
+/// kinds and is absent for a host-3D blob, whose storage is the
+/// renderer's. The owner task's record of the blob keeps it for as long
+/// as the device does.
 pub(crate) struct BlobSpec {
     /// The renderer context the resource belongs to.
     pub(crate) context: ContextId,
@@ -164,100 +426,70 @@ pub(crate) struct BlobSpec {
     pub(crate) usage: BlobUsage,
     /// Its size in bytes.
     pub(crate) size: u64,
-    /// The host-side identifier the resource is shared under, or 0.
-    pub(crate) host_id: u64,
-    /// The claiming instance's own buffer, for the guest-backed kinds.
+    /// The `blob_id` the renderer names the host allocation by: zero
+    /// for a guest blob, the renderer's own object id otherwise.
+    pub(crate) blob_id: u64,
+    /// The instance's own buffer, for the guest-backed kinds.
     pub(crate) backing: Option<Buffer>,
 }
 
-impl Gpu3dRequest {
-    pub(crate) const fn generation(&self) -> u64 {
-        match self {
-            Self::Capsets { generation, .. }
-            | Self::Capset { generation, .. }
-            | Self::CreateContext { generation, .. }
-            | Self::DestroyContext { generation, .. }
-            | Self::CreateBlob { generation, .. }
-            | Self::DestroyBlob { generation, .. }
-            | Self::MapBlob { generation, .. }
-            | Self::UnmapBlob { generation, .. }
-            | Self::AttachResource { generation, .. }
-            | Self::DetachResource { generation, .. } => *generation,
-        }
-    }
-}
+/// An inline command stream, carried in the request itself.
+pub(crate) type InlineCommands = ArrayVec<u8, MAX_EXECUTE_BYTES>;
 
-/// Work for the task that serves the command streams.
-///
-/// The fence signal the context was created with travels with the
-/// submission: when the device has taken the command buffer the server
-/// publishes `fence` to it, whatever the device answered, because a
-/// fenced command's completion is the signal and a reader must not be
-/// left waiting on a command the device refused.
-pub(crate) enum SubmitRequest {
-    Submit {
-        generation: u64,
-        context: ContextId,
-        /// The command buffer the run below lies in, held until the
-        /// device has answered so its pages cannot go back to the pool
-        /// while the device may still be reading them.
+/// Where a submission's command stream is.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the inline stream is carried by value so a short execbuffer costs no allocation; \
+              the submit queue is bounded, so the size it adds per slot is a fixed cost"
+)]
+pub(crate) enum SubmitCommands {
+    /// A run of a command buffer the instance pinned.
+    Pages {
+        /// The buffer the run lies in, held until the device has
+        /// answered so its pages cannot go back to the pool while the
+        /// device may still be reading them.
         buffer: Buffer,
-        /// The run of `buffer` the device is to read the command stream
-        /// out of.
-        commands: PhysicalRange,
-        fence: FenceId,
-        fences: Arc<SequenceSignal>,
-        reply: oneshot::Sender<Result<(), Gpu3dServiceError>>,
+        /// The run of `buffer` the device reads the stream out of.
+        range: PhysicalRange,
     },
+    /// A short stream the request carries.
+    Inline(InlineCommands),
 }
 
-/// What the 3D engine's claim word holds.
-///
-/// Three states rather than two, for the reason the display's word has
-/// three: giving the resources back is asynchronous — contexts,
-/// blobs and aperture placements all have to be told back to the
-/// device — and until they have been, the engine is neither held by
-/// anybody nor free for anybody.
-pub(super) struct ClaimState;
-
-impl ClaimState {
-    /// Nobody holds the engine.
-    pub(super) const FREE: u8 = 0;
-    /// One instance holds it.
-    pub(super) const HELD: u8 = 1;
-    /// Its last owner let go and the owner task has not finished
-    /// handing the resources back.
-    pub(super) const RELEASING: u8 = 2;
+/// Work for the task that posts the command streams.
+pub(crate) struct SubmitRequest {
+    /// The context the stream is for, whose ring the fence retires on.
+    pub(crate) context: Arc<ContextShared>,
+    pub(crate) commands: SubmitCommands,
+    pub(crate) ring: RingIndex,
+    pub(crate) fence: Option<FenceId>,
+    /// Answered the moment the command is on the device's ring, or with
+    /// the refusal that kept it off.
+    pub(crate) reply: oneshot::Sender<Result<(), Gpu3dServiceError>>,
 }
 
-/// What every holder of the 3D engine shares with the tasks that own it.
+/// A request on the control queue and the session it was made under.
+pub(super) struct ControlMessage {
+    pub(super) session: Arc<SessionState>,
+    pub(super) request: Gpu3dRequest,
+}
+
+/// A request on the submit queue and the session it was made under.
+pub(super) struct SubmitMessage {
+    pub(super) session: Arc<SessionState>,
+    pub(super) request: SubmitRequest,
+}
+
+/// What every session shares with the tasks that own the engine.
 pub(super) struct Gpu3dShared {
-    pub(super) control: ProviderSender<Gpu3dRequest>,
-    pub(super) submit: ProviderSender<SubmitRequest>,
-    /// One of [`ClaimState`]'s three values.
-    pub(super) claim: AtomicU8,
-    /// Bumped by every successful claim and again when that claim is
-    /// let go, so a request that outlived its claim can be told from
-    /// one that did not whether or not another claim ever follows.
-    pub(super) generation: AtomicU64,
-    /// One permit per claim that has been let go.
-    pub(super) release: Notify,
-    /// Submissions the submit server has popped and the device has not
-    /// finished with.
-    ///
-    /// Counted from the pop — before the generation check — because a
-    /// release noticed between the two reads would otherwise see the
-    /// count still at zero and destroy a context underneath a chain
-    /// the device is about to take. The release path waits the count
-    /// out before it hands anything back.
-    pub(super) submits_in_flight: AtomicU64,
-    /// Raised every time `submits_in_flight` drains to nothing, so the
-    /// release path can wait for it.
-    ///
-    /// A progress signal rather than a permit: the waiter samples it
-    /// before it reads the count, so a drain that lands between the
-    /// two is not missed.
-    pub(super) submits_drained: crate::exec::ProgressSignal,
+    pub(super) control: ProviderSender<ControlMessage>,
+    pub(super) submit: ProviderSender<SubmitMessage>,
+    /// The control server's wake-up for pending releases: one permit per
+    /// session that has ended, per ended session's drain to zero, and
+    /// per blob whose last scanout let go.
+    pub(super) release: Arc<Notify>,
+    /// The last session id handed out.
+    pub(super) sessions: AtomicU64,
     /// Whether the device renders at all. Read once at bring-up and
     /// never again: a renderer is a property of the host's build, not
     /// of anything the machine does while it runs.
@@ -267,31 +499,37 @@ pub(super) struct Gpu3dShared {
 /// One submission the submit server has taken out of the queue and the
 /// device has not finished with.
 ///
-/// Held from the pop — before the generation check — until the device
-/// has answered, because the release path drains this count before it
-/// destroys a context: a submission still parked for ring room
+/// Held from the pop — before the session check — until the device has
+/// answered, because the release path drains its session's count before
+/// it destroys a context: a submission still parked for ring room
 /// publishes onto the control ring whenever the device takes it, and a
 /// context destroyed underneath one leaves the engine running a command
 /// stream against a context it has already torn down.
-/// A request the check drops still counted: between the pop and the
-/// check it was in flight like any other, and a release that noticed
-/// the claim's end in that window must still be able to wait it out.
-pub(super) struct InFlightSubmit<'a> {
-    shared: &'a Gpu3dShared,
+pub(super) struct InFlightSubmit {
+    session: Arc<SessionState>,
 }
 
-impl<'a> InFlightSubmit<'a> {
-    /// Count one more submission with the device.
-    pub(super) fn begin(shared: &'a Gpu3dShared) -> Self {
-        shared.submits_in_flight.fetch_add(1, Ordering::AcqRel);
-        Self { shared }
+impl InFlightSubmit {
+    /// Count one more of `session`'s submissions with the device.
+    pub(super) fn begin(session: Arc<SessionState>) -> Self {
+        session.submits_in_flight.fetch_add(1, Ordering::AcqRel);
+        Self { session }
     }
 }
 
-impl Drop for InFlightSubmit<'_> {
+impl Drop for InFlightSubmit {
     fn drop(&mut self) {
-        if self.shared.submits_in_flight.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.shared.submits_drained.signal();
+        if self
+            .session
+            .submits_in_flight
+            .fetch_sub(1, Ordering::AcqRel)
+            == 1
+            && self.session.has_ended()
+        {
+            // Read after the count: a session that ends after this read
+            // banks its own permit, so one of the two always wakes the
+            // release.
+            self.session.release.notify_one();
         }
     }
 }
@@ -308,87 +546,92 @@ impl Gpu3dService {
         Self { shared }
     }
 
-    /// Whether an instance holds the 3D engine right now.
-    pub fn is_claimed(&self) -> bool {
-        self.shared.claim.load(Ordering::Acquire) != ClaimState::FREE
-    }
-
     /// Whether this machine's display engine renders at all.
     pub fn renders(&self) -> bool {
         self.shared.renders
     }
 
-    /// Take exclusive ownership of the machine's 3D engine.
+    /// Open a session on the machine's 3D engine.
     ///
-    /// Refused when the device renders nothing — there is no renderer
-    /// to hold — when another instance holds it, and when the previous
-    /// owner's resources are still being handed back: the engine is
-    /// not free until the display engine says it is.
+    /// Refused only when the device renders nothing: there is no
+    /// renderer to open. Any number of sessions are open at once.
     ///
     /// `_cap` is the proof that the caller's authority names the GPU
     /// class; the check happened where the cap was derived.
-    pub fn claim(&self, _cap: GpuClaimCap) -> Result<Gpu3dClaim, Gpu3dServiceError> {
+    pub fn open(&self, _cap: GpuOpenCap) -> Result<Gpu3dSession, Gpu3dServiceError> {
         if !self.shared.renders {
             return Err(Gpu3dServiceError::NoRenderer);
         }
-        self.shared
-            .claim
-            .compare_exchange(
-                ClaimState::FREE,
-                ClaimState::HELD,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .map_err(|_| Gpu3dServiceError::AlreadyClaimed)?;
-        let generation = self.shared.generation.fetch_add(1, Ordering::AcqRel) + 1;
-        Ok(Gpu3dClaim {
+        let id = SessionId(self.shared.sessions.fetch_add(1, Ordering::Relaxed) + 1);
+        Ok(Gpu3dSession {
             shared: self.shared.clone(),
-            generation,
+            state: Arc::new(SessionState {
+                id,
+                ended: AtomicBool::new(false),
+                submits_in_flight: AtomicU64::new(0),
+                release: self.shared.release.clone(),
+            }),
         })
     }
 }
 
-/// One instance's hold on the machine's 3D engine.
+/// One instance's session on the machine's 3D engine.
 ///
-/// Dropping it — or dying while holding it — moves the claim word to
-/// [`ClaimState::RELEASING`] and wakes the owner task, which releases
-/// every context, blob and mapping this claim created before the engine
-/// is offered to anyone else.
-pub struct Gpu3dClaim {
+/// Dropping it — or dying while holding it — marks the session ended
+/// and wakes the owner task, which releases every context, blob and
+/// mapping this session created and nothing any other session did.
+pub struct Gpu3dSession {
     shared: Arc<Gpu3dShared>,
-    generation: u64,
+    state: Arc<SessionState>,
 }
 
-impl Gpu3dClaim {
-    pub const fn generation(&self) -> u64 {
-        self.generation
+impl Gpu3dSession {
+    pub fn id(&self) -> SessionId {
+        self.state.id
     }
 
-    /// A handle that can queue work for this claim.
+    /// A handle that can queue work for this session.
     ///
     /// Cheap and cloneable, so a host call that has to keep sending
     /// after it has given the store back carries one instead of
-    /// borrowing the claim. A sender that outlives its claim sends
-    /// requests the owner task drops, because they no longer name the
-    /// generation it is serving.
+    /// borrowing the session. A sender that outlives its session sends
+    /// requests the owner task drops.
     pub fn sender(&self) -> Gpu3dSender {
         Gpu3dSender {
             shared: self.shared.clone(),
-            generation: self.generation,
+            state: self.state.clone(),
         }
     }
 }
 
-/// The right to queue work for one claim.
+impl Drop for Gpu3dSession {
+    fn drop(&mut self) {
+        // Not a message: a drop cannot await room in a queue, and the
+        // instance this session belonged to may already be dead. The
+        // flag is what every request of the session is checked against,
+        // and the permit is what has the owner task sweep up after it.
+        self.state.ended.store(true, Ordering::Release);
+        self.shared.release.notify_one();
+    }
+}
+
+/// The right to queue work for one session.
 #[derive(Clone)]
 pub struct Gpu3dSender {
     shared: Arc<Gpu3dShared>,
-    generation: u64,
+    state: Arc<SessionState>,
 }
 
 impl Gpu3dSender {
-    pub const fn generation(&self) -> u64 {
-        self.generation
+    pub fn session(&self) -> SessionId {
+        self.state.id
+    }
+
+    fn message(&self, request: Gpu3dRequest) -> ControlMessage {
+        ControlMessage {
+            session: self.state.clone(),
+            request,
+        }
     }
 
     /// Queue `request` on the control queue and await its reply.
@@ -397,22 +640,16 @@ impl Gpu3dSender {
         request: Gpu3dRequest,
         reply: oneshot::Receiver<Result<T, Gpu3dServiceError>>,
     ) -> Result<T, Gpu3dServiceError> {
-        self.shared.control.send(request).await.map_err(closed)?;
+        self.shared
+            .control
+            .send(self.message(request))
+            .await
+            .map_err(closed)?;
         reply.await.map_err(|_| Gpu3dServiceError::Closed)?
     }
 
-    /// Queue `request` on the submit queue and await its reply.
-    pub(crate) async fn submit(
-        &self,
-        request: SubmitRequest,
-        reply: oneshot::Receiver<Result<(), Gpu3dServiceError>>,
-    ) -> Result<(), Gpu3dServiceError> {
-        self.shared.submit.send(request).await.map_err(closed)?;
-        reply.await.map_err(|_| Gpu3dServiceError::Closed)?
-    }
-
-    /// Tell the owner task about a resource this claim no longer wants,
-    /// without waiting for it to be gone.
+    /// Tell the owner task about a resource this session no longer
+    /// wants, without waiting for it to be gone.
     ///
     /// The display engine still has to be told, and telling it is the
     /// owner task's work; what the caller gets back is only that the
@@ -421,26 +658,41 @@ impl Gpu3dSender {
         &self,
         request: Gpu3dRequest,
     ) -> Result<(), Gpu3dServiceError> {
-        self.shared.control.send(request).await.map_err(closed)
-    }
-}
-
-impl Drop for Gpu3dClaim {
-    fn drop(&mut self) {
-        // The generation moves here, not only on the next claim: a
-        // request queued under this one and still sitting in an inbox
-        // must fail the generation check however long the engine then
-        // sits unclaimed — and on a machine that never renders again,
-        // that is the rest of the run.
-        self.shared.generation.fetch_add(1, Ordering::AcqRel);
-        // Not a message: a drop cannot await room in a queue, and the
-        // instance this claim belonged to may already be dead. One
-        // permit is enough, because there is exactly one claim to
-        // release and the owner clears the word once it has.
         self.shared
-            .claim
-            .store(ClaimState::RELEASING, Ordering::Release);
-        self.shared.release.notify_one();
+            .control
+            .send(self.message(request))
+            .await
+            .map_err(closed)
+    }
+
+    /// Queue `request` on the submit queue if there is room, without
+    /// waiting.
+    ///
+    /// A submission is checked against its ring and queued in one step,
+    /// so the queue's order is the order its fences were admitted in.
+    /// `Ok(false)` says the queue was full and `request` was dropped
+    /// unsent; the caller waits in [`Self::submit_room`], then checks
+    /// and builds it again.
+    pub(crate) fn try_submit(&self, request: SubmitRequest) -> Result<bool, Gpu3dServiceError> {
+        match self.shared.submit.try_send(SubmitMessage {
+            session: self.state.clone(),
+            request,
+        }) {
+            Ok(()) => Ok(true),
+            Err(ProviderError::Full) => Ok(false),
+            Err(error) => Err(closed(error)),
+        }
+    }
+
+    /// Wait until the submit queue has room.
+    pub(crate) async fn submit_room(&self) {
+        self.shared.submit.room().await;
+    }
+
+    /// Hand a turn [`Self::submit_room`] gave this caller to the next
+    /// producer parked there, when the caller then queued nothing.
+    pub(crate) fn pass_submit_room(&self) {
+        self.shared.submit.pass_room();
     }
 }
 
