@@ -651,7 +651,7 @@ impl<T: VirtioTransport> VirtioSndDevice<T> {
     /// change once the device has answered it, however that answer
     /// reaches this task. See [`crate::journal`].
     async fn acknowledged(&self, request: &[u8], change: StreamChange) -> AudioResult<()> {
-        let (sent, ticket) = self
+        let (sent, ticket, displaced) = self
             .commands
             .send(
                 &self.control_inflight,
@@ -663,6 +663,9 @@ impl<T: VirtioTransport> VirtioSndDevice<T> {
                 change,
             )
             .await?;
+        // The cancelled command this one's identifier belonged to was
+        // answered by the device: its change is the record's to take.
+        displaced.settle(Self::accepted, |change| self.apply(*change));
         // A command whose queue faulted stays filed: the device may still
         // write its answer buffer (see `crate::journal`).
         let reply = await_completion(&self.control, ticket, || self.completions.notified()).await?;

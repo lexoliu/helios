@@ -31,11 +31,19 @@
 //! [`DmaMemory`] when the command is sent, so it outlives the
 //! identifier for as long as the journal or the waiter holds the record.
 //! The device stops writing it when it completes the chain, and the
-//! table keeps a record until a later command is filed under the same
-//! identifier, which the completion table allows only once the device has
-//! returned it; a waiter whose queue faulted leaves its record filed for
-//! the same reason, so a device that broke the ring contract never
-//! writes into a buffer that was freed.
+//! table keeps a record until the waiter forgets it or a later command is
+//! filed under the same identifier. The completion table hands an
+//! identifier out again only once the device has completed its chain, so
+//! a record filed under it is by then answered: a waiter that was
+//! cancelled mid-flight left it behind, and the command may have been
+//! accepted. Filing the later command displaces that record, and
+//! [`Journal::send`] hands it back as a [`Displaced`] that the caller
+//! settles, with the rule it settles its own command by, before it awaits
+//! its own completion; dropping the record unsettled would lose an
+//! acknowledged change from the driver's record. A waiter whose queue
+//! faulted leaves its record filed, and its identifier is never handed out
+//! again, so a device that broke the ring contract never writes into a
+//! buffer that was freed.
 //!
 //! Concurrency contract: the table is a spin mutex over one slot per
 //! descriptor identifier, held for one slot update and never across a
@@ -115,6 +123,23 @@ impl<C, T: VirtioTransport> Sent<C, T> {
 /// The record filed under one descriptor identifier, if any.
 type Filed<C, T> = Option<Arc<Sent<C, T>>>;
 
+/// The record another command's filing displaced: its waiter is gone and
+/// the device answered it, so whoever files next settles it.
+#[must_use = "a displaced record holds an answer nobody has applied"]
+pub(crate) struct Displaced<C, T: VirtioTransport>(Filed<C, T>);
+
+impl<C, T: VirtioTransport> Displaced<C, T> {
+    /// Settles the displaced record, if there was one, as
+    /// [`Sent::settle`] does: the change applies only if `accepted`
+    /// approves the answer, and a record somebody settled already applies
+    /// nothing.
+    pub(crate) fn settle(self, accepted: impl Fn(&[u8]) -> bool, apply: impl Fn(&C)) {
+        if let Some(sent) = self.0 {
+            sent.settle(accepted, apply);
+        }
+    }
+}
+
 /// The commands a driver has submitted whose answers have not been
 /// collected, one slot per descriptor identifier of the queue they ride.
 pub(crate) struct Journal<C, T: VirtioTransport, const N: usize> {
@@ -134,7 +159,8 @@ impl<C, T: VirtioTransport, const N: usize> Journal<C, T, N> {
     /// `inputs` are copied into the chain's control slot. The chain is
     /// published and filed in the same poll, so a freeze finds either both
     /// or neither: a task parked before the chain went out has filed
-    /// nothing. Returns the record and the ticket the caller awaits.
+    /// nothing. Returns the record, the ticket the caller awaits and the
+    /// record the filing displaced, which the caller settles first.
     #[expect(
         clippy::too_many_arguments,
         reason = "a submission names the queue's completion table, ring, transport and control \
@@ -150,7 +176,7 @@ impl<C, T: VirtioTransport, const N: usize> Journal<C, T, N> {
         inputs: &[&[u8]],
         response_bytes: usize,
         change: C,
-    ) -> IoResult<(Arc<Sent<C, T>>, Ticket<'a, N>)> {
+    ) -> IoResult<(Arc<Sent<C, T>>, Ticket<'a, N>, Displaced<C, T>)> {
         let mut response = if response_bytes == 0 {
             None
         } else {
@@ -174,8 +200,8 @@ impl<C, T: VirtioTransport, const N: usize> Journal<C, T, N> {
             response,
             settled: Mutex::new(None),
         });
-        self.sent.lock()[usize::from(sent.token)] = Some(sent.clone());
-        Ok((sent, ticket))
+        let displaced = self.sent.lock()[usize::from(sent.token)].replace(sent.clone());
+        Ok((sent, ticket, Displaced(displaced)))
     }
 
     /// Settles every command the device has answered and nobody has

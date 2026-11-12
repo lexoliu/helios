@@ -715,7 +715,7 @@ impl<T: VirtioTransport> VirtioGpuDevice<T> {
     /// The command travels in its control slot and has no answer buffer,
     /// so a record whose queue faulted is forgotten like any other.
     async fn cursor_command(&self, request: &[u8], change: GpuChange) -> DisplayResult<()> {
-        let (sent, ticket) = self
+        let (sent, ticket, displaced) = self
             .cursor_commands
             .send(
                 &self.cursor_inflight,
@@ -727,6 +727,10 @@ impl<T: VirtioTransport> VirtioGpuDevice<T> {
                 change,
             )
             .await?;
+        // The cancelled cursor command this one's identifier belonged to
+        // was consumed by the device, which is all a cursor command's
+        // acknowledgement is.
+        displaced.settle(|_| true, |change| self.restorable.lock().apply(change));
         let completed =
             await_completion(&self.cursor, ticket, || self.completions.notified()).await;
         if completed.is_ok() {
@@ -811,7 +815,7 @@ impl<T: VirtioTransport> VirtioGpuDevice<T> {
         } else {
             &all_inputs[..]
         };
-        let (sent, ticket) = self
+        let (sent, ticket, displaced) = self
             .commands
             .send(
                 &self.control_inflight,
@@ -823,6 +827,11 @@ impl<T: VirtioTransport> VirtioGpuDevice<T> {
                 change,
             )
             .await?;
+        // The cancelled command this one's identifier belonged to was
+        // answered by the device: its change is the record's to take.
+        displaced.settle(Self::accepted, |change| {
+            self.restorable.lock().apply(change)
+        });
         // A command whose queue faulted stays filed: the device may still
         // write its answer buffer (see `crate::journal`).
         let reply = await_completion(&self.control, ticket, || self.completions.notified()).await?;

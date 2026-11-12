@@ -776,6 +776,80 @@ fn a_dropped_control_command_keeps_its_slot_until_the_device_completes_it() {
     assert!(device.control_inflight.is_idle(token));
 }
 
+/// Drops a `set_params` once it is with the device and lets the device
+/// answer it with `status`. Commands that run to completion then free
+/// the identifier the dropped one held, and the ring hands identifiers
+/// out in turn, so they are issued until the next one to be handed out
+/// is that identifier again. Hands back the device and that identifier.
+fn reused_identifier_after_a_cancelled_set_params(
+    status: u32,
+) -> (VirtioSndDevice<FakeTransport>, u16) {
+    /// More commands than the control ring has descriptors.
+    const TURNS: usize = 64;
+
+    let device = device();
+    let token = {
+        let mut dropped = pin!(device.set_params(STREAM, params()));
+        pending_control(&device, dropped.as_mut())
+    };
+    answer_control(&device, token, &status.to_le_bytes());
+    for _ in 0..TURNS {
+        let next = device
+            .control
+            .try_lock()
+            .expect("a parked driver does not hold the control queue lock")
+            .next_free_descriptor();
+        if next == token {
+            assert!(device.control_inflight.is_idle(token));
+            assert_eq!(
+                device.records.lock()[0].params,
+                None,
+                "nobody has applied the cancelled command's answer yet"
+            );
+            return (device, token);
+        }
+        let (_, outcome) = round_trip(&device, pin!(device.stop(STREAM)), S_OK);
+        assert_eq!(outcome, Ok(()));
+    }
+    panic!("the ring never handed the cancelled command's identifier out again");
+}
+
+/// A command whose waiter was cancelled and which the device then
+/// accepted still reaches the record when its identifier is reused: the
+/// command filed under the identifier next settles it.
+#[test]
+fn a_cancelled_command_the_device_accepted_is_recorded_when_its_identifier_is_reused() {
+    let (device, token) = reused_identifier_after_a_cancelled_set_params(S_OK);
+
+    let mut next = pin!(device.prepare(STREAM));
+    let second = pending_control(&device, next.as_mut());
+
+    assert_eq!(
+        token, second,
+        "the second command took the freed identifier"
+    );
+    assert_eq!(
+        device.records.lock()[0].params,
+        Some(params()),
+        "the cancelled command's change was displaced unsettled"
+    );
+}
+
+/// The same when the device refused it: the change is not applied.
+#[test]
+fn a_cancelled_command_the_device_refused_is_not_recorded_when_its_identifier_is_reused() {
+    let (device, token) = reused_identifier_after_a_cancelled_set_params(S_IO_ERR);
+
+    let mut next = pin!(device.prepare(STREAM));
+    let second = pending_control(&device, next.as_mut());
+
+    assert_eq!(
+        token, second,
+        "the second command took the freed identifier"
+    );
+    assert_eq!(device.records.lock()[0].params, None);
+}
+
 /// The same obligation on the bring-up path, where nothing waits on an
 /// interrupt and a status register left set therefore costs the bring-up
 /// nothing at all — and costs every asynchronous request afterwards
