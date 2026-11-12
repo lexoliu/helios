@@ -20,15 +20,36 @@
 //! |---|---|---|
 //! | allocate, one bitmap word or fewer (up to 64 pages) | task context, any processor | Lock-free: a CAS on the chunk's state word to enter, then a CAS on one bitmap word. [`DmaArena::allocate_overwritten`] is the same without the zeroing pass over the run. |
 //! | allocate, a run spanning bitmap words | task context, any processor | The arena's `runs` spin lock, which only these allocations take, so two of them cannot livelock. The bits are still claimed by CAS, so a concurrent single-word claim or a free composes without it. No interrupt handler reaches the lock. |
-//! | free (the drop of an [`ArenaBuffer`]) | any processor, task context or interrupt handler | Wait-free: atomics of the buffer's own chunk only. No lock, no wake. |
+//! | free (the drop of an [`ArenaBuffer`]) | any processor, task context or interrupt handler | No lock. Atomics of the buffer's own chunk, then a `SeqCst` fence and a relaxed load of the arena's `starved` flag. Only while an allocator is starved, one `swap` of that flag, and its winner raises the space signal: one IRQ-safe broadcast per starvation episode. |
+//! | [`DmaArena::want_space`] | task context, any processor | Wait-free: samples the space signal, stores `starved`, `SeqCst` fence. |
+//! | [`DmaArena::space_changed`], [`DmaArena::space_mark`], [`DmaArena::short_of_space`] | task context, any processor | Lock-free: an acquire load, and for `space_changed` a park on the space signal. |
 //! | [`DmaArena::device_range`] | task context, any processor | Lock-free: an Acquire load of the window table, a hash, and a short probe. |
 //! | [`DmaArena::adopt`] | task context | The arena's `grow` async mutex: the only writer of the window table and of the chunk headers. |
 //!
 //! No interrupt handler allocates: every handler that touches DMA memory
 //! only frees it. A buffer holds a pointer to its chunk header and nothing
-//! else of the arena, so its drop cannot reach a lock.
+//! else of the arena, so its drop cannot reach a lock. The header holds a
+//! pointer to the arena's [`SpaceWaiters`], which is all the drop reaches
+//! beyond its own chunk.
+//!
+//! # Waiting for space
+//!
+//! A caller refused with [`DmaError::Exhausted`] calls
+//! [`DmaArena::want_space`], allocates once more, and only if that is
+//! refused too parks on [`DmaArena::space_changed`] with the mark
+//! `want_space` returned. The protocol is Linux's `SOCK_NOSPACE` one: the
+//! waiter samples the signal, stores `starved`, fences, then tests; a free
+//! updates the bitmap, fences, then loads `starved`. Either the free sees
+//! `starved` and signals past the waiter's mark, or the waiter's fence
+//! comes after the free's bitmap update and its second allocation finds the
+//! page. A free with nobody starved raises nothing.
 //!
 //! # Cache lines
+//!
+//! The [`SpaceWaiters`] line is written by a refused allocator (`starved`,
+//! through `want_space`) and by whichever freeing processor wins the
+//! `swap` that clears it (`starved` and the signal's generation). A free
+//! with nobody starved only reads it.
 //!
 //! Each chunk's state word sits on its own line. It is written by the
 //! processors that allocate from the chunk (usually one, through its hint)
@@ -41,15 +62,19 @@ extern crate alloc;
 use alloc::boxed::Box;
 use core::alloc::Layout;
 use core::fmt;
+use core::future::Future;
+use core::mem::ManuallyDrop;
 use core::ptr::{self, NonNull};
-use core::sync::atomic::{AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{
+    AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence,
+};
 
 use crossbeam_utils::CachePadded;
 use helios_hal::cpu::current_processor;
-use helios_hal::dma::{DeviceAddress, DmaBuffer, DmaError};
+use helios_hal::dma::{DeviceAddress, DmaBuffer, DmaError, DmaSpaceMark};
 use helios_hal::pmm::PhysFrame;
 
-use crate::exec::{Mutex, MutexGuard};
+use crate::exec::{Mutex, MutexGuard, ProgressMark, ProgressSignal};
 
 /// Bytes in one page of an arena.
 const PAGE_BYTES: usize = PhysFrame::SIZE;
@@ -162,6 +187,20 @@ pub struct ArenaStats {
     pub noted_empty_chunks: usize,
 }
 
+/// What an allocator refused for space waits on, and what a free checks.
+///
+/// Lives on a cache line of its own, in a box the arena owns. A refused
+/// allocator writes `starved` (through [`DmaArena::want_space`]); a free
+/// reads it, and the one free that wins the `swap` that clears it writes
+/// `starved` and the signal's generation. The arena that owns it outlives
+/// every buffer, so a chunk header points at it for good.
+struct SpaceWaiters {
+    /// An allocator was refused and nothing has come back since.
+    starved: AtomicBool,
+    /// Raised past a waiter's mark by the free that clears `starved`.
+    space: ProgressSignal,
+}
+
 /// One chunk's out-of-band record, type-stable for the life of the arena.
 ///
 /// The state word holds the pages in use in its low 32 bits and the
@@ -182,10 +221,18 @@ struct Chunk {
     /// The word of the arena's empty set holding this chunk's bit.
     empty_word: NonNull<AtomicU64>,
     empty_bit: u64,
+    /// The arena's space waiters, which a free checks after it gives its
+    /// pages back.
+    waiters: NonNull<SpaceWaiters>,
 }
 
 impl Chunk {
-    fn new(pages: usize, empty_word: NonNull<AtomicU64>, empty_bit: u64) -> Self {
+    fn new(
+        pages: usize,
+        empty_word: NonNull<AtomicU64>,
+        empty_bit: u64,
+        waiters: NonNull<SpaceWaiters>,
+    ) -> Self {
         let words = pages.div_ceil(WORD_PAGES);
         let padding = if pages.is_multiple_of(WORD_PAGES) {
             0
@@ -204,6 +251,7 @@ impl Chunk {
             class: AtomicU8::new(0),
             empty_word,
             empty_bit,
+            waiters,
         }
     }
 
@@ -241,6 +289,30 @@ impl Chunk {
         );
         if (before & COUNT_MASK) as usize == pages {
             self.note_empty();
+        }
+    }
+
+    /// Raises the arena's space signal when an allocator is starved.
+    ///
+    /// Called after the free's bitmap and count updates. The fence orders
+    /// them before the load of `starved`, and pairs with the fence in
+    /// [`DmaArena::want_space`]: either this load sees `starved`, or the
+    /// waiter's second allocation sees the freed pages. The `swap` makes
+    /// one free per starvation episode the signaller, and happens before
+    /// the generation moves, so a waiter that still sees the stale flag
+    /// parks on a mark the increment then passes.
+    ///
+    /// Wait-free without a starved allocator, and otherwise one
+    /// interrupt-safe broadcast; safe in an interrupt handler on any
+    /// processor.
+    fn wake_starved(&self) {
+        fence(Ordering::SeqCst);
+        // SAFETY: the arena that owns the waiters outlives every live
+        // page: it panics, leaking them, otherwise.
+        let waiters = unsafe { self.waiters.as_ref() };
+        if waiters.starved.load(Ordering::Relaxed) && waiters.starved.swap(false, Ordering::AcqRel)
+        {
+            waiters.space.signal();
         }
     }
 
@@ -393,7 +465,7 @@ struct Segment {
 }
 
 impl Segment {
-    fn new(headers: usize, pages_per_chunk: usize) -> Self {
+    fn new(headers: usize, pages_per_chunk: usize, waiters: NonNull<SpaceWaiters>) -> Self {
         let empty: Box<[AtomicU64]> = (0..headers.div_ceil(WORD_PAGES))
             .map(|_| AtomicU64::new(0))
             .collect();
@@ -403,6 +475,7 @@ impl Segment {
                     pages_per_chunk,
                     NonNull::from(&empty[header / WORD_PAGES]),
                     1 << (header % WORD_PAGES),
+                    waiters,
                 )
             })
             .collect();
@@ -573,6 +646,10 @@ pub struct DmaArena<S: ChunkSource> {
     runs: spin::Mutex<()>,
     /// Serialises the writers of the chunk table and the window table.
     grow: Mutex<()>,
+    /// Boxed so its address is stable for the chunk headers that point at
+    /// it. Not dropped when the arena drops with a live page, so the
+    /// buffers that outlive the panic still reach it.
+    waiters: ManuallyDrop<Box<CachePadded<SpaceWaiters>>>,
     source: S,
 }
 
@@ -602,8 +679,51 @@ impl<S: ChunkSource> DmaArena<S> {
                 .collect(),
             runs: spin::Mutex::new(()),
             grow: Mutex::new(()),
+            waiters: ManuallyDrop::new(Box::new(CachePadded::new(SpaceWaiters {
+                starved: AtomicBool::new(false),
+                space: ProgressSignal::new(),
+            }))),
             source,
         }
+    }
+
+    /// Declares that the caller was refused and will wait for space, and
+    /// returns the space signal's generation as of that declaration.
+    ///
+    /// Marks the arena starved, so the next free raises the signal, and
+    /// fences. The caller then allocates once more, and only if that is
+    /// refused too parks on [`DmaArena::space_changed`] with the mark.
+    ///
+    /// Wait-free, task context, any processor.
+    pub fn want_space(&self) -> DmaSpaceMark {
+        let mark = self.space_mark();
+        self.waiters.starved.store(true, Ordering::Relaxed);
+        fence(Ordering::SeqCst);
+        mark
+    }
+
+    /// Resolves once a page was freed after `mark`, or a signal was
+    /// otherwise raised after it.
+    ///
+    /// Resolving says an allocation is worth asking for again, not that it
+    /// will succeed.
+    pub fn space_changed(&self, mark: DmaSpaceMark) -> impl Future<Output = ()> + Send + '_ {
+        self.waiters
+            .space
+            .changed(ProgressMark::from_generation(mark.get()))
+    }
+
+    /// Whether an allocation was refused and no page has come back since.
+    ///
+    /// Only a hint: the next allocation is the authority.
+    pub fn short_of_space(&self) -> bool {
+        self.waiters.starved.load(Ordering::Acquire)
+    }
+
+    /// Samples the space signal's generation without marking the arena
+    /// starved, for a waiter that asks for no memory.
+    pub fn space_mark(&self) -> DmaSpaceMark {
+        DmaSpaceMark::new(self.waiters.space.mark().generation())
     }
 
     /// Bytes in each chunk.
@@ -646,6 +766,7 @@ impl<S: ChunkSource> DmaArena<S> {
             segment = Box::into_raw(Box::new(Segment::new(
                 FIRST_SEGMENT_CHUNKS << index,
                 self.pages_per_chunk,
+                NonNull::from(&***self.waiters),
             )));
             self.segments[index].store(segment, Ordering::Release);
         }
@@ -882,13 +1003,18 @@ impl<S: ChunkSource> Drop for DmaArena<S> {
                 drop(unsafe { Box::from_raw(segment) });
             }
         }
+        // SAFETY: no page is live, so no header that points at the waiters
+        // is read again, and nothing drops them twice.
+        unsafe { ManuallyDrop::drop(&mut self.waiters) };
     }
 }
 
 /// Pages a driver holds. Dropping it frees them.
 ///
-/// The drop reaches only the atomics of the buffer's chunk, so it is
-/// wait-free and safe from an interrupt handler on any processor.
+/// The drop reaches only the atomics of the buffer's chunk and the arena's
+/// space waiters, so it takes no lock and is safe from an interrupt handler
+/// on any processor. It raises the space signal only while an allocator is
+/// starved.
 pub struct ArenaBuffer {
     ptr: NonNull<u8>,
     len: usize,
@@ -951,6 +1077,7 @@ impl Drop for ArenaBuffer {
         let chunk = unsafe { self.chunk.as_ref() };
         chunk.release(self.first_page as usize, self.pages as usize);
         chunk.leave(self.pages as usize);
+        chunk.wake_starved();
     }
 }
 
@@ -960,10 +1087,10 @@ mod tests {
     use alloc::sync::Arc;
     use alloc::vec;
     use alloc::vec::Vec;
-    use core::sync::atomic::AtomicBool;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::mpsc;
     use std::thread;
+    use std::time::Duration;
 
     use futures_lite::future::block_on;
     use helios_hal::cpu::ProcessorId;
@@ -1497,6 +1624,181 @@ mod tests {
         );
         page.as_mut().fill(1);
         drop(page);
+    }
+
+    /// How long a test waits for a parked thread before it calls the wake
+    /// lost. A wake that works arrives in microseconds.
+    const LOST_WAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// Allocates one page by the space protocol: on a refusal, arm, ask
+    /// again, and park only if refused again. `parked` counts the threads
+    /// between the second refusal and their wake.
+    fn allocate_waiting<S: ChunkSource>(
+        arena: &DmaArena<S>,
+        parked: &AtomicUsize,
+        about_to_park: impl Fn(),
+    ) -> ArenaBuffer {
+        loop {
+            match arena.allocate(ChunkClass::ReadWrite, pages(1)) {
+                Ok(buffer) => return buffer,
+                Err(DmaError::Exhausted { .. }) => {}
+                Err(other) => panic!("{other}"),
+            }
+            let mark = arena.want_space();
+            match arena.allocate(ChunkClass::ReadWrite, pages(1)) {
+                Ok(buffer) => return buffer,
+                Err(DmaError::Exhausted { .. }) => {}
+                Err(other) => panic!("{other}"),
+            }
+            parked.fetch_add(1, Ordering::SeqCst);
+            about_to_park();
+            block_on(arena.space_changed(mark));
+            parked.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn a_refused_allocator_parks_and_a_free_on_another_thread_releases_it() {
+        let (arena, _) = arena(4 * PAGE_BYTES, &[ChunkClass::ReadWrite], 1);
+        let arena = Arc::new(arena);
+        let held: Vec<_> = (0..4)
+            .map(|_| {
+                arena
+                    .allocate(ChunkClass::ReadWrite, pages(1))
+                    .expect("a page")
+            })
+            .collect();
+
+        let (parking, parked_signal) = mpsc::channel();
+        let (done, finished) = mpsc::channel();
+        let waiter = {
+            let arena = arena.clone();
+            thread::spawn(move || {
+                test_processor_identity::set(ProcessorId::new(0));
+                let parked = AtomicUsize::new(0);
+                let page = allocate_waiting(&arena, &parked, || {
+                    parking.send(()).expect("the test is listening");
+                });
+                done.send(()).expect("the test is listening");
+                drop(page);
+            })
+        };
+        parked_signal
+            .recv_timeout(LOST_WAKE_TIMEOUT)
+            .expect("the allocator was refused at a full arena");
+        assert!(arena.short_of_space(), "the refusal armed the arena");
+        assert!(
+            finished.recv_timeout(Duration::from_millis(50)).is_err(),
+            "the allocator found a page in a full arena"
+        );
+
+        // The free is on this thread, which never allocated.
+        let mut held = held.into_iter();
+        drop(held.next());
+        finished
+            .recv_timeout(LOST_WAKE_TIMEOUT)
+            .expect("a free on another thread did not release the parked allocator");
+        waiter.join().expect("the waiter finished");
+        assert!(!arena.short_of_space(), "the free cleared the flag");
+        drop(held);
+    }
+
+    #[test]
+    fn frees_with_nobody_starved_leave_the_space_signal_alone() {
+        let (arena, _) = arena(4 * PAGE_BYTES, &[ChunkClass::ReadWrite], 1);
+        let start = arena.space_mark();
+        for _ in 0..3 {
+            let page = arena
+                .allocate(ChunkClass::ReadWrite, pages(2))
+                .expect("pages");
+            drop(page);
+        }
+        assert_eq!(
+            arena.space_mark(),
+            start,
+            "a free raised an unwanted signal"
+        );
+        assert!(!arena.short_of_space());
+
+        // A refusal arms the arena; the first free after it signals once,
+        // and a second free in the same episode does not.
+        let held: Vec<_> = (0..2)
+            .map(|_| {
+                arena
+                    .allocate(ChunkClass::ReadWrite, pages(2))
+                    .expect("pages")
+            })
+            .collect();
+        assert!(arena.allocate(ChunkClass::ReadWrite, pages(1)).is_err());
+        let mark = arena.want_space();
+        assert!(arena.short_of_space());
+        let mut held = held.into_iter();
+        drop(held.next());
+        let after_first = arena.space_mark();
+        assert_eq!(
+            after_first.get(),
+            mark.get() + 1,
+            "the first free of an episode signals exactly once"
+        );
+        assert!(!arena.short_of_space());
+        drop(held.next());
+        assert_eq!(arena.space_mark(), after_first, "the episode was over");
+    }
+
+    #[test]
+    fn no_allocator_stays_parked_while_the_arena_has_a_free_page() {
+        const WAITERS: usize = 6;
+        const FREERS: usize = 2;
+        const ROUNDS: usize = 3000;
+        let (arena, _) = arena(4 * PAGE_BYTES, &[ChunkClass::ReadWrite], WAITERS);
+        let arena = Arc::new(arena);
+        let parked = Arc::new(AtomicUsize::new(0));
+        let finished = Arc::new(AtomicUsize::new(0));
+
+        // Each waiter hands what it allocated to a freeing thread, so every
+        // free is on a thread other than the one that waits for it.
+        let (senders, receivers): (Vec<_>, Vec<_>) =
+            (0..FREERS).map(|_| mpsc::channel::<ArenaBuffer>()).unzip();
+        let freers: Vec<_> = receivers
+            .into_iter()
+            .map(|receiver| thread::spawn(move || receiver.into_iter().for_each(drop)))
+            .collect();
+        let waiters: Vec<_> = (0..WAITERS)
+            .map(|me| {
+                let (arena, parked, finished) = (arena.clone(), parked.clone(), finished.clone());
+                let to_free = senders[me % FREERS].clone();
+                thread::spawn(move || {
+                    test_processor_identity::set(ProcessorId::new(me as u16));
+                    for _ in 0..ROUNDS {
+                        let page = allocate_waiting(&arena, &parked, || {});
+                        to_free.send(page).expect("the freer is alive");
+                    }
+                    finished.fetch_add(1, Ordering::SeqCst);
+                })
+            })
+            .collect();
+        drop(senders);
+
+        let deadline = std::time::Instant::now() + LOST_WAKE_TIMEOUT;
+        while finished.load(Ordering::SeqCst) < WAITERS && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let stats = arena.stats();
+        assert_eq!(
+            finished.load(Ordering::SeqCst),
+            WAITERS,
+            "{} allocators are parked while {} of {} pages are free: a wake was lost",
+            parked.load(Ordering::SeqCst),
+            stats.pages - stats.pages_in_use,
+            stats.pages
+        );
+        for waiter in waiters {
+            waiter.join().expect("a waiter finished");
+        }
+        for freer in freers {
+            freer.join().expect("a freer finished");
+        }
+        assert_eq!(arena.stats().pages_in_use, 0);
     }
 
     #[test]
