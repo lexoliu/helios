@@ -13,7 +13,7 @@ use alloc::vec::Vec;
 use core::alloc::Layout;
 use core::cell::UnsafeCell;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use helios_hal::io::{IoError, IoResult};
 use spin::Mutex;
@@ -205,6 +205,10 @@ struct FakeTransportLog {
     notification_data: Vec<u32>,
     programmed: Vec<QueueProgramming>,
     resets: Vec<u16>,
+    /// Whole-device resets the driver issued.
+    driver_resets: usize,
+    /// Whether the device drops `FEATURES_OK` from every status write.
+    refuse_features_ok: bool,
     acknowledged_interrupts: usize,
     /// Interrupt status register the next acknowledgement reads and
     /// clears, as a device would present it.
@@ -233,7 +237,10 @@ impl<const PROCESSORS: usize> crate::block::QueueAffinity for FakeAffinity<PROCE
 pub(crate) struct FakeTransport<P = IdentityDmaPool> {
     bus: HeapBus<P>,
     device_type: DeviceType,
-    offered_features: u64,
+    /// What the device offers right now. Atomic so a test can have the
+    /// device withdraw features between a reset and the driver's second
+    /// handshake.
+    offered_features: AtomicU64,
     queue_size: u16,
     supports_queue_reset: bool,
     absent_queues: &'static [u16],
@@ -273,7 +280,7 @@ impl<P: DmaPool> FakeTransport<P> {
         Self {
             bus: HeapBus::new(dma),
             device_type: config.device_type,
-            offered_features: config.offered_features,
+            offered_features: AtomicU64::new(config.offered_features),
             queue_size: config.queue_size,
             supports_queue_reset: config.supports_queue_reset,
             absent_queues: config.absent_queues,
@@ -292,6 +299,35 @@ impl<P: DmaPool> FakeTransport<P> {
         region: helios_hal::iommu::PhysicalRange,
     ) {
         self.shared_memory.lock().push((id, region));
+    }
+
+    /// Makes the device stop offering the features in `mask`, the way a
+    /// device model that changed under a resumed guest does.
+    pub(crate) fn withdraw_features(&self, mask: u64) {
+        self.offered_features.fetch_and(!mask, Ordering::Relaxed);
+    }
+
+    /// Makes the device offer the features in `mask` as well.
+    pub(crate) fn offer_features(&self, mask: u64) {
+        self.offered_features.fetch_or(mask, Ordering::Relaxed);
+    }
+
+    /// Makes the device clear `FEATURES_OK` when the driver sets it, the
+    /// way a device that dislikes the selection does.
+    pub(crate) fn refuse_features_ok(&self) {
+        self.log.lock().refuse_features_ok = true;
+    }
+
+    /// Plays the host resetting the device behind the driver's back: the
+    /// status the driver wrote is gone. The queue and feature state the
+    /// driver programmed is whatever the next handshake writes again.
+    pub(crate) fn reset_behind_the_driver(&self) {
+        self.log.lock().status = 0;
+    }
+
+    /// How many times the driver itself reset the device.
+    pub(crate) fn driver_reset_count(&self) -> usize {
+        self.log.lock().driver_resets
     }
 
     /// Ends the device configuration structure at `len` bytes, the way
@@ -363,9 +399,11 @@ impl<P: DmaPool> FakeTransport<P> {
     /// A pair with no block answers a size of zero, which is how a real
     /// device says it does not support the question.
     pub(crate) fn set_config_block(&self, select: u8, subsel: u8, payload: &[u8]) {
-        self.config_blocks
-            .lock()
-            .push((select, subsel, payload.to_vec()));
+        let mut blocks = self.config_blocks.lock();
+        blocks.retain(|(block_select, block_subsel, _)| {
+            (*block_select, *block_subsel) != (select, subsel)
+        });
+        blocks.push((select, subsel, payload.to_vec()));
     }
 
     /// Answers the currently selected pair, the way a device refills
@@ -420,7 +458,9 @@ impl<P: DmaPool> VirtioTransport for FakeTransport<P> {
     }
 
     fn reset(&self) {
-        self.log.lock().status = 0;
+        let mut log = self.log.lock();
+        log.status = 0;
+        log.driver_resets += 1;
     }
 
     fn status(&self) -> DeviceStatus {
@@ -428,11 +468,16 @@ impl<P: DmaPool> VirtioTransport for FakeTransport<P> {
     }
 
     fn set_status(&self, status: DeviceStatus) {
-        self.log.lock().status = status.bits();
+        let mut log = self.log.lock();
+        log.status = if log.refuse_features_ok {
+            (status - DeviceStatus::FEATURES_OK).bits()
+        } else {
+            status.bits()
+        };
     }
 
     fn device_features(&self) -> u64 {
-        self.offered_features
+        self.offered_features.load(Ordering::Relaxed)
     }
 
     fn set_driver_features(&self, features: u64) {
@@ -608,7 +653,7 @@ impl DmaPool for WindowDmaPool {
     fn allocate_zeroed(&self, layout: Layout) -> IoResult<Self::Buffer> {
         let base = self.arena_base();
         let mut offset = 0;
-        let taken = self.arena.next.fetch_update(
+        let taken = self.arena.next.try_update(
             core::sync::atomic::Ordering::SeqCst,
             core::sync::atomic::Ordering::SeqCst,
             |next| {

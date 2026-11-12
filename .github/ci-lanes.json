@@ -4,18 +4,6 @@
     "rust-cache": true,
     "surfaces": ["hosted", "host_tools", "programs"]
   },
-  "check-aarch64": {
-    "command": "just check-target aarch64-unknown-none helios-aarch64",
-    "surfaces": ["aarch64"]
-  },
-  "check-riscv": {
-    "command": "just check-target riscv64gc-unknown-none-elf helios-riscv",
-    "surfaces": ["riscv"]
-  },
-  "check-x86": {
-    "command": "just check-target x86_64-unknown-none helios-x86",
-    "surfaces": ["x86"]
-  },
   "test-embedded-debugger": {
     "command": "just test-embedded-debugger",
     "rust-cache": true,

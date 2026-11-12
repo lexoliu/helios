@@ -44,6 +44,7 @@ use spin::Mutex;
 
 use crate::notify::Notify;
 use crate::queue::VirtQueue;
+use crate::resume::{QuiesceError, ReinitError, Resumed, settle};
 use crate::transport::VirtioTransport;
 
 /// State of one descriptor identifier.
@@ -152,6 +153,50 @@ impl<const N: usize> InFlight<N> {
         self.faulted.load(Ordering::SeqCst)
     }
 
+    /// Lets the table serve requests again after the queue it fronts was
+    /// re-programmed on a reset device, which is what clears a fault.
+    fn recover(&self) {
+        let _slots = self.slots.lock();
+        self.faulted.store(false, Ordering::SeqCst);
+    }
+
+    /// Applies how a re-initialisation ended: the table serves requests
+    /// again only when the device is back, and otherwise fails every
+    /// request, parked or yet to come.
+    pub(crate) fn resume(&self, resumed: Resumed) {
+        match resumed {
+            Resumed::Back => self.recover(),
+            Resumed::Failed => self.fail(),
+        }
+    }
+
+    /// Finishes every request still pending with zero bytes written and
+    /// wakes its waiter.
+    ///
+    /// For a queue whose chains are buffers posted for the device to
+    /// answer whenever it chooses (a balloon's statistics buffer): when
+    /// the device is reset those chains are gone and will never be
+    /// answered, so their waiters are released to post a fresh one
+    /// instead of parking for ever.
+    pub(crate) fn abandon_pending(&self) {
+        for token in 0..N {
+            let waker = {
+                let mut slots = self.slots.lock();
+                match &mut slots[token] {
+                    slot @ Slot::Pending(_) => match core::mem::replace(slot, Slot::Complete(0)) {
+                        Slot::Pending(waker) => waker,
+                        Slot::Idle | Slot::Complete(_) => None,
+                    },
+                    Slot::Idle | Slot::Complete(_) => None,
+                }
+            };
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        }
+        self.available.notify_all();
+    }
+
     /// Claims `token` for the caller. Must be called while the queue
     /// lock that produced the token is still held, so no drain can
     /// observe the completion before the slot exists.
@@ -226,6 +271,94 @@ impl<const N: usize> InFlight<N> {
             panic!("virtio descriptor {token} is outside the {N}-slot completion table")
         })
     }
+}
+
+/// Reaps `queue` on behalf of every waiter until the device owns none of
+/// its chains, for a quiesce.
+///
+/// Each completion is recorded in `inflight` and its waiter woken, exactly
+/// as the wait path does, so nothing is lost between the reap and the
+/// waiter's next poll: the slot holds the answer until the waiter takes
+/// it, and the waker has already been run. See [`crate::resume`] for why
+/// the queue lock can only be taken here and never waited for.
+pub(crate) fn drain_to_idle<T, const N: usize>(
+    inflight: &InFlight<N>,
+    queue: &AsyncMutex<VirtQueue<T>>,
+    transport: &T,
+    queue_index: u16,
+    expired: &mut impl FnMut() -> bool,
+) -> Result<(), QuiesceError>
+where
+    T: VirtioTransport,
+{
+    let device = transport.device_type();
+    settle(device, queue_index, expired, || {
+        let mut ring = queue.try_lock().ok_or(QuiesceError::QueueBusy {
+            device,
+            queue: queue_index,
+        })?;
+        let drained = ring
+            .drain_used(|completed, len| inflight.complete(completed, len))
+            .map_err(|_| {
+                inflight.fail();
+                QuiesceError::DeviceFault {
+                    device,
+                    queue: queue_index,
+                }
+            })?;
+        let remaining = ring.in_flight_chains();
+        drop(ring);
+        inflight.note_released(drained);
+        Ok(remaining)
+    })
+}
+
+/// Re-programs the request queue `queue` fronts on a reset device.
+///
+/// The queue holds no chain: a quiesce drained it and nothing was
+/// submitted since. Completions already recorded in the driver's
+/// [`InFlight`] stay there for their waiters, and the table serves
+/// requests again only when the driver reports the whole
+/// re-initialisation through [`InFlight::resume`].
+pub(crate) fn reinitialize_requests<T>(
+    queue: &AsyncMutex<VirtQueue<T>>,
+    transport: &T,
+    queue_index: u16,
+) -> Result<(), ReinitError>
+where
+    T: VirtioTransport,
+{
+    let mut ring = queue.try_lock().ok_or(ReinitError::QueueBusy {
+        device: transport.device_type(),
+        queue: queue_index,
+    })?;
+    ring.reinitialize(transport)?;
+    Ok(())
+}
+
+/// Re-programs a queue whose chains are buffers posted for the device to
+/// answer whenever it chooses, on a reset device.
+///
+/// The chains are gone with the device, so their waiters are released
+/// with nothing written, to post a fresh buffer instead of parking for
+/// ever on one that will never be answered.
+pub(crate) fn reinitialize_posted<T, const N: usize>(
+    inflight: &InFlight<N>,
+    queue: &AsyncMutex<VirtQueue<T>>,
+    transport: &T,
+    queue_index: u16,
+) -> Result<(), ReinitError>
+where
+    T: VirtioTransport,
+{
+    let mut ring = queue.try_lock().ok_or(ReinitError::QueueBusy {
+        device: transport.device_type(),
+        queue: queue_index,
+    })?;
+    ring.reinitialize_discarding(transport)?;
+    drop(ring);
+    inflight.abandon_pending();
+    Ok(())
 }
 
 /// Places one chain in the ring and claims its completion slot.
@@ -451,6 +584,42 @@ mod tests {
             "an armed waiter sees its completion without parking again"
         );
         assert_eq!(inflight.take(1), Some(5));
+    }
+
+    #[test]
+    fn an_abandoned_request_is_released_with_nothing_written() {
+        let inflight: InFlight<4> = InFlight::new();
+        let waker = Waker::noop();
+
+        inflight.register(0);
+        inflight.register(2);
+        assert!(!inflight.arm(2, waker));
+        inflight.complete(0, 9);
+
+        inflight.abandon_pending();
+
+        assert_eq!(
+            inflight.take(0),
+            Some(9),
+            "an answer that already arrived is kept"
+        );
+        assert_eq!(
+            inflight.take(2),
+            Some(0),
+            "a request the device will never answer completes empty"
+        );
+        assert!(inflight.is_idle(1), "an unused slot is untouched");
+    }
+
+    #[test]
+    fn a_table_serves_requests_again_once_its_queue_was_re_programmed() {
+        let inflight: InFlight<2> = InFlight::new();
+        inflight.fail();
+        assert!(inflight.is_faulted());
+
+        inflight.recover();
+
+        assert!(!inflight.is_faulted());
     }
 
     #[test]
