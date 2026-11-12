@@ -1213,6 +1213,7 @@ where
     /// future resolving with its exit status.
     pub(super) async fn spawn(
         &self,
+        compile: &CompileAuthority,
         exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
         source: ProgramSource,
         hint: Option<AotCompileHint>,
@@ -1221,6 +1222,7 @@ where
         super::emit_program_stage_marker(exec_context.write_serial, "program:spawn-begin");
         let executable = self
             .load_executable(
+                compile,
                 &exec_context,
                 launch.argv.program_name(),
                 &source,
@@ -1239,6 +1241,7 @@ where
     /// rather than at every call site.
     async fn spawn_with_output_mode(
         &self,
+        compile: &CompileAuthority,
         exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
         source: ProgramSource,
         hint: Option<AotCompileHint>,
@@ -1249,6 +1252,7 @@ where
         super::emit_program_stage_marker(exec_context.write_serial, "program:spawn-begin");
         let executable = self
             .load_executable(
+                compile,
                 &exec_context,
                 launch.argv.program_name(),
                 &source,
@@ -1401,19 +1405,21 @@ where
     /// along with the exit code.
     pub(super) async fn exec_buffered(
         &self,
+        compile: &CompileAuthority,
         exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
         source: ProgramSource,
         hint: Option<AotCompileHint>,
         stdin: Vec<u8>,
         launch: ProgramLaunch<Net>,
     ) -> Result<ExecResult, ProgramExecError> {
-        self.exec_buffered_with_snapshot(exec_context, source, hint, stdin, launch)
+        self.exec_buffered_with_snapshot(compile, exec_context, source, hint, stdin, launch)
             .await
             .map(|(result, _)| result)
     }
 
     async fn exec_buffered_with_snapshot(
         &self,
+        compile: &CompileAuthority,
         exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
         source: ProgramSource,
         hint: Option<AotCompileHint>,
@@ -1422,6 +1428,7 @@ where
     ) -> Result<(ExecResult, Option<DebugFileSystemSnapshot>), ProgramExecError> {
         let executable = self
             .load_executable(
+                compile,
                 &exec_context,
                 launch.argv.program_name(),
                 &source,
@@ -1490,17 +1497,19 @@ where
 
     pub(crate) async fn aot(
         &self,
+        compile: &CompileAuthority,
         exec_context: &ProgramExecContext<CpuImpl, Net, HostFs>,
         wasm: &Bytes,
         hint: AotCompileHint,
         profile: bool,
     ) -> Result<Vec<u8>, ProgramExecError> {
-        self.compile_raw_component_to_signed_artifact(exec_context, wasm, hint, profile)
+        self.compile_raw_component_to_signed_artifact(compile, exec_context, wasm, hint, profile)
             .await
     }
 
     async fn load_executable(
         &self,
+        compile: &CompileAuthority,
         exec_context: &ProgramExecContext<CpuImpl, Net, HostFs>,
         program: &str,
         source: &ProgramSource,
@@ -1534,7 +1543,13 @@ where
                     .map_err(map_artifact_profile_error)?;
                 let hint = hint.unwrap_or(AotCompileHint::Performance);
                 let signed = self
-                    .compile_raw_component_to_signed_artifact(exec_context, wasm, hint, false)
+                    .compile_raw_component_to_signed_artifact(
+                        compile,
+                        exec_context,
+                        wasm,
+                        hint,
+                        false,
+                    )
                     .await?;
                 let signed = Bytes::from(signed);
                 trusted_signed_payload(&signed)?
@@ -1751,6 +1766,7 @@ where
 
     async fn compile_raw_component_to_signed_artifact(
         &self,
+        _: &CompileAuthority,
         exec_context: &ProgramExecContext<CpuImpl, Net, HostFs>,
         wasm: &Bytes,
         hint: AotCompileHint,

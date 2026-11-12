@@ -1772,14 +1772,17 @@ where
         .flatten()
         .unwrap_or_default();
     let mut trace = phases::Trace::begin(caller.data().cpu.clone(), "exec", &program);
-    let status = caller.data().require_exec_authority();
-    if status != p1::errno::SUCCESS {
-        trace.refused(ProgramExecErrorKind::PermissionDenied);
-        return Err(wasmtime::Error::new(ProgramExecError {
-            kind: ProgramExecErrorKind::PermissionDenied,
-            detail: ProgramExecErrorDetail::ProcessAuthorityDenied,
-        }));
-    }
+    let exec_authority = match caller.data().require_exec_authority() {
+        Ok(authority) => authority,
+        Err(_) => {
+            trace.refused(ProgramExecErrorKind::PermissionDenied);
+            return Err(wasmtime::Error::new(ProgramExecError {
+                kind: ProgramExecErrorKind::PermissionDenied,
+                detail: ProgramExecErrorDetail::ProcessAuthorityDenied,
+            }));
+        }
+    };
+    let compile_authority = CompileAuthority::from(&exec_authority);
     let prepared = match wasix_prepare_program(caller, memory, name, name_len).await {
         Ok(prepared) => prepared,
         Err(error) => {
@@ -1793,6 +1796,7 @@ where
     trace.disarm();
     wasix_exec_prepared_program(
         caller,
+        &compile_authority,
         memory,
         prepared,
         args,
@@ -1803,8 +1807,13 @@ where
     .await
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the compile authority is the one argument that must be spelled out so no exec reaches the compiler without a process right"
+)]
 pub(super) async fn wasix_exec_prepared_program<CpuImpl, Net, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+    compile: &CompileAuthority,
     memory: Preview1Memory,
     prepared: WasixPreparedProgram,
     args: u32,
@@ -1851,6 +1860,7 @@ where
     let write_serial = caller.data().write_serial;
     let executable = service
         .load_executable(
+            compile,
             &exec_context,
             argv.program_name(),
             &prepared.source,
@@ -1946,14 +1956,17 @@ where
         .flatten()
         .unwrap_or_default();
     let mut trace = phases::Trace::begin(caller.data().cpu.clone(), "exec", &program);
-    let status = caller.data().require_exec_authority();
-    if status != p1::errno::SUCCESS {
-        trace.refused(ProgramExecErrorKind::PermissionDenied);
-        return Err(wasmtime::Error::new(ProgramExecError {
-            kind: ProgramExecErrorKind::PermissionDenied,
-            detail: ProgramExecErrorDetail::ProcessAuthorityDenied,
-        }));
-    }
+    let exec_authority = match caller.data().require_exec_authority() {
+        Ok(authority) => authority,
+        Err(_) => {
+            trace.refused(ProgramExecErrorKind::PermissionDenied);
+            return Err(wasmtime::Error::new(ProgramExecError {
+                kind: ProgramExecErrorKind::PermissionDenied,
+                detail: ProgramExecErrorDetail::ProcessAuthorityDenied,
+            }));
+        }
+    };
+    let compile_authority = CompileAuthority::from(&exec_authority);
     let prepared = match wasix_prepare_program_with_search(
         caller,
         memory,
@@ -1976,6 +1989,7 @@ where
     trace.disarm();
     wasix_exec_prepared_program(
         caller,
+        &compile_authority,
         memory,
         prepared,
         args,
@@ -2064,10 +2078,11 @@ where
     };
     let program = phases::gated(|| argv.first().cloned().unwrap_or_default()).unwrap_or_default();
     let mut trace = phases::Trace::begin(caller.data().cpu.clone(), "spawn", &program);
-    let status = caller.data().require_spawn_authority();
-    if status != p1::errno::SUCCESS {
-        return launch_exit_errno(&trace, status);
-    }
+    let spawn_authority = match caller.data().require_spawn_authority() {
+        Ok(authority) => authority,
+        Err(status) => return launch_exit_errno(&trace, status),
+    };
+    let compile_authority = CompileAuthority::from(&spawn_authority);
     let chroot = match chroot {
         0 => false,
         1 => true,
@@ -2119,6 +2134,7 @@ where
     trace.record_source_bytes(prepared.source.payload_len());
     let result = match wasix_spawn_child(
         caller,
+        &compile_authority,
         prepared,
         argv,
         &mut trace,
@@ -2375,10 +2391,11 @@ where
     };
     let program = phases::gated(|| argv.first().cloned().unwrap_or_default()).unwrap_or_default();
     let mut trace = phases::Trace::begin(caller.data().cpu.clone(), "spawn", &program);
-    let status = caller.data().require_spawn_authority();
-    if status != p1::errno::SUCCESS {
-        return launch_exit_errno(&trace, status);
-    }
+    let spawn_authority = match caller.data().require_spawn_authority() {
+        Ok(authority) => authority,
+        Err(status) => return launch_exit_errno(&trace, status),
+    };
+    let compile_authority = CompileAuthority::from(&spawn_authority);
     let environment = if env == 0 && env_len == 0 {
         None
     } else {
@@ -2426,6 +2443,7 @@ where
     };
     let result = match wasix_spawn_child(
         caller,
+        &compile_authority,
         prepared,
         argv,
         &mut trace,
@@ -3421,6 +3439,7 @@ pub(super) fn wasix_search_path_candidate(
 /// errno untouched rather than reclassifying from the bare `i32`.
 pub(super) async fn wasix_spawn_child<CpuImpl, Net, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+    compile: &CompileAuthority,
     prepared: WasixPreparedProgram,
     argv: Vec<String>,
     trace: &mut phases::Trace<CpuImpl>,
@@ -3451,6 +3470,7 @@ where
     let launch_started = p1_kernel_profile_start(caller.data());
     let mut child = service
         .spawn_with_output_mode(
+            compile,
             exec_context,
             prepared.source,
             None,

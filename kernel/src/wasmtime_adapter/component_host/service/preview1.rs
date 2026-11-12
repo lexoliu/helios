@@ -242,16 +242,16 @@ where
             .map_or(p1::errno::NOTCAPABLE, |_| p1::errno::SUCCESS)
     }
 
-    pub(super) fn require_spawn_authority(&self) -> i32 {
+    pub(super) fn require_spawn_authority(&self) -> Result<SpawnAuthority, i32> {
         self.authority
             .derive_spawn_authority()
-            .map_or(p1::errno::NOTCAPABLE, |_| p1::errno::SUCCESS)
+            .map_err(|_| p1::errno::NOTCAPABLE)
     }
 
-    pub(super) fn require_exec_authority(&self) -> i32 {
+    pub(super) fn require_exec_authority(&self) -> Result<ExecAuthority, i32> {
         self.authority
             .derive_exec_authority()
-            .map_or(p1::errno::NOTCAPABLE, |_| p1::errno::SUCCESS)
+            .map_err(|_| p1::errno::NOTCAPABLE)
     }
 
     pub(super) fn require_fork_authority(&self) -> i32 {

@@ -17,8 +17,9 @@ use crate::wasmtime_adapter::wasi::net::ipv6_address_groups;
 use bytes::Bytes;
 
 use crate::{
-    ClockAuthorityRights, DeviceClassRights, DirectoryAuthorityRights, LinkAuthorityRights,
-    NetworkAuthorityRights, ProcessAuthority, ProcessAuthorityError, TerminalAuthorityRights,
+    ClockAuthorityRights, CompileAuthority, DeviceClassRights, DirectoryAuthorityRights,
+    ExecAuthority, LinkAuthorityRights, NetworkAuthorityRights, ProcessAuthority,
+    ProcessAuthorityError, SpawnAuthority, TerminalAuthorityRights,
 };
 use crate::{
     ComponentCache, ComponentOutputMode, ComponentOutputRoute, ComponentOutputStreamKind,
@@ -426,10 +427,14 @@ macro_rules! impl_program_bindings {
                             detail: "program spawn is unavailable on this machine".to_owned(),
                         }));
                     };
-                    if let Err(error) = require_spawn_authority(&caller_authority) {
-                        launch.refused(error.kind);
-                        return Ok(Err($convert_error(error)));
-                    }
+                    let spawn_authority = match require_spawn_authority(&caller_authority) {
+                        Ok(authority) => authority,
+                        Err(error) => {
+                            launch.refused(error.kind);
+                            return Ok(Err($convert_error(error)));
+                        }
+                    };
+                    let compile_authority = CompileAuthority::from(&spawn_authority);
                     let child_authority =
                         match $build_authority(&caller_authority, request.capability_grants) {
                             Ok(authority) => authority,
@@ -459,6 +464,7 @@ macro_rules! impl_program_bindings {
                     launch.record_source_bytes(source.payload_len());
                     let spawned = match service
                         .spawn(
+                            &compile_authority,
                             context,
                             source,
                             None,
@@ -526,10 +532,14 @@ macro_rules! impl_program_bindings {
                             detail: "program exec is unavailable on this machine".to_owned(),
                         }));
                     };
-                    if let Err(error) = require_exec_authority(&caller_authority) {
-                        launch.refused(error.kind);
-                        return Ok(Err($convert_error(error)));
-                    }
+                    let exec_authority = match require_exec_authority(&caller_authority) {
+                        Ok(authority) => authority,
+                        Err(error) => {
+                            launch.refused(error.kind);
+                            return Ok(Err($convert_error(error)));
+                        }
+                    };
+                    let compile_authority = CompileAuthority::from(&exec_authority);
                     let child_authority =
                         match $build_authority(&caller_authority, request.capability_grants) {
                             Ok(authority) => authority,
@@ -571,6 +581,7 @@ macro_rules! impl_program_bindings {
                     };
                     let executed = service
                         .exec_buffered(
+                            &compile_authority,
                             context,
                             source,
                             hint,
@@ -626,6 +637,10 @@ macro_rules! impl_program_bindings {
                             detail: "program AOT is unavailable on this machine".to_owned(),
                         }));
                     };
+                    let compile_authority = match require_compile_authority(&caller_authority) {
+                        Ok(authority) => authority,
+                        Err(error) => return Ok(Err($convert_error(error))),
+                    };
                     let source = match read_program_source(
                         accessor,
                         &request.source_path,
@@ -664,7 +679,9 @@ macro_rules! impl_program_bindings {
                         let context = context.clone();
                         let profile = request.profile;
                         async move {
-                            let result = service.aot(&context, &wasm, hint, profile).await;
+                            let result = service
+                                .aot(&compile_authority, &context, &wasm, hint, profile)
+                                .await;
                             let _ = artifact_tx.send(result);
                         }
                     });
@@ -908,20 +925,31 @@ impl_authority_conversion!(build_program_child_authority, program_bindings);
 
 fn require_spawn_authority(
     caller_authority: &ProcessAuthority,
-) -> Result<(), crate::ProgramExecError> {
+) -> Result<SpawnAuthority, crate::ProgramExecError> {
     caller_authority
         .derive_spawn_authority()
-        .map(drop)
         .map_err(map_process_authority_error)
 }
 
 fn require_exec_authority(
     caller_authority: &ProcessAuthority,
-) -> Result<(), crate::ProgramExecError> {
+) -> Result<ExecAuthority, crate::ProgramExecError> {
     caller_authority
         .derive_exec_authority()
-        .map(drop)
         .map_err(map_process_authority_error)
+}
+
+/// A compile may be started by a caller that may spawn or exec; a caller
+/// holding neither is refused as `spawn` and `exec` refuse it.
+fn require_compile_authority(
+    caller_authority: &ProcessAuthority,
+) -> Result<CompileAuthority, crate::ProgramExecError> {
+    match caller_authority.derive_spawn_authority() {
+        Ok(spawn) => Ok(CompileAuthority::from(&spawn)),
+        Err(_) => {
+            require_exec_authority(caller_authority).map(|exec| CompileAuthority::from(&exec))
+        }
+    }
 }
 
 impl_program_bindings!(
@@ -977,8 +1005,9 @@ mod authority_tests {
     use alloc::vec::Vec;
 
     use super::{
-        build_program_child_authority, dns_network_rights, program_wit, require_exec_authority,
-        require_spawn_authority, tcp_connect_network_rights, udp_bind_network_rights,
+        build_program_child_authority, dns_network_rights, program_wit, require_compile_authority,
+        require_exec_authority, require_spawn_authority, tcp_connect_network_rights,
+        udp_bind_network_rights,
     };
     use crate::{
         ClockAuthorityRights, DeviceClassRights, DirectoryAuthorityRights, DirectoryPreopen,
@@ -1324,6 +1353,25 @@ mod authority_tests {
         caller.grant_process_rights(ProcessAuthorityRights::SPAWN | ProcessAuthorityRights::EXEC);
         require_spawn_authority(&caller).expect("spawn authority should be accepted");
         require_exec_authority(&caller).expect("exec authority should be accepted");
+    }
+
+    #[test]
+    fn aot_requires_a_process_right() {
+        let caller = ProcessAuthority::empty();
+        assert_eq!(
+            require_compile_authority(&caller)
+                .expect_err("aot must require a process right")
+                .kind,
+            crate::ProgramExecErrorKind::PermissionDenied
+        );
+
+        let mut caller = ProcessAuthority::empty();
+        caller.grant_process_rights(ProcessAuthorityRights::EXEC);
+        require_compile_authority(&caller).expect("an EXEC holder may start a compile");
+
+        let mut caller = ProcessAuthority::empty();
+        caller.grant_process_rights(ProcessAuthorityRights::SPAWN);
+        require_compile_authority(&caller).expect("a SPAWN holder may start a compile");
     }
 }
 

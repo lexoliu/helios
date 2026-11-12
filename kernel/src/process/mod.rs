@@ -17,7 +17,7 @@ mod thread;
 #[cfg(test)]
 pub(crate) use authority::test_caps;
 pub use authority::{
-    AudioClaimCap, ClockAuthorityRights, DeviceClassRights, DeviceGrantClaimCap,
+    AudioClaimCap, ClockAuthorityRights, CompileAuthority, DeviceClassRights, DeviceGrantClaimCap,
     DirectoryAuthorityRights, DirectoryCap, DirectoryPreopen, DisplayClaimCap, DnsCap,
     ExecAuthority, ForkAuthority, GpuClaimCap, InputClaimCap, JoinAuthority, LinkAuthorityRights,
     LinkSourceCap, LinkTargetDirectoryCap, MulticastCap, NetworkAdminCap, NetworkAuthorityRights,
