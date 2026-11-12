@@ -29,6 +29,7 @@ use helios_hal::iommu::PhysicalRange;
 
 use crate::bus::{DeviceBus, DmaBuffer, DmaPool};
 use crate::features::NegotiatedFeatures;
+use crate::resume::ReinitError;
 use crate::transport::VirtioTransport;
 
 use packed::PackedRing;
@@ -198,6 +199,14 @@ impl InFlightHeads {
 
     fn clear(&mut self) {
         self.bits.fill(0);
+    }
+
+    /// How many chain heads the device owns.
+    fn count(&self) -> usize {
+        self.bits
+            .iter()
+            .map(|word| word.count_ones() as usize)
+            .sum()
     }
 
     fn insert(&mut self, id: u16) {
@@ -531,6 +540,9 @@ trait RingOps<T: VirtioTransport>: Sized {
 
     fn next_id(&self) -> u16;
 
+    /// Chains the device owns right now.
+    fn in_flight_chains(&self) -> usize;
+
     /// Drops every in-flight chain and re-programs the device-side queue
     /// after a [`VirtioTransport::reset_queue`].
     fn reprogram(&mut self, transport: &T, index: u16);
@@ -613,6 +625,13 @@ impl<T: VirtioTransport> Ring<T> {
         }
     }
 
+    fn in_flight_chains(&self) -> usize {
+        match self {
+            Self::Split(ring) => ring.in_flight_chains(),
+            Self::Packed(ring) => ring.in_flight_chains(),
+        }
+    }
+
     fn reprogram(&mut self, transport: &T, index: u16) {
         match self {
             Self::Split(ring) => ring.reprogram(transport, index),
@@ -643,6 +662,9 @@ pub(crate) fn negotiated_queue_size<T: VirtioTransport>(
 /// A virtqueue in whichever layout the device and driver agreed on.
 pub struct VirtQueue<T: VirtioTransport> {
     index: u16,
+    /// Descriptors in the ring, kept so a re-initialisation can check the
+    /// device still offers a queue this deep.
+    size: u16,
     features: NegotiatedFeatures,
     ring: Ring<T>,
     /// Set when the device broke the used-ring contract. A faulted queue
@@ -741,10 +763,75 @@ impl<T: VirtioTransport> VirtQueue<T> {
 
         Ok(Self {
             index,
+            size,
             features,
             ring,
             faulted: false,
         })
+    }
+
+    /// Chains the device owns right now.
+    ///
+    /// A chain stays counted from its submission until its completion is
+    /// popped, so this is what a quiesce waits to reach zero.
+    pub(crate) fn in_flight_chains(&self) -> usize {
+        self.ring.in_flight_chains()
+    }
+
+    /// Re-programs the queue on a device that was reset, at the memory it
+    /// already has, with fresh indices and every identifier back in the
+    /// pool.
+    ///
+    /// The device has dropped the queue along with everything else, so
+    /// this needs neither [`VIRTIO_F_RING_RESET`] nor a per-queue reset
+    /// register, and it works on both ring layouts. The caller has
+    /// renegotiated the features first and sets `DRIVER_OK` after the
+    /// last queue.
+    ///
+    /// Chains still in flight are abandoned: the device that owned them
+    /// is gone. A queue the driver drains to a stop first (a request
+    /// queue) is expected to have none, which is a contract this asserts;
+    /// use [`VirtQueue::reinitialize_discarding`] for a queue whose
+    /// in-flight chains are posted receive buffers.
+    ///
+    /// # Panics
+    ///
+    /// When a chain is still in flight. The caller quiesced the device, so
+    /// one that remains means a request was submitted after that.
+    ///
+    /// # Errors
+    ///
+    /// [`ReinitError::QueueShrunk`] when the device no longer offers a
+    /// queue as deep as this one: the ring memory cannot be programmed
+    /// at a smaller size.
+    ///
+    /// [`VIRTIO_F_RING_RESET`]: crate::transport::VirtioFeatures::RING_RESET
+    pub(crate) fn reinitialize(&mut self, transport: &T) -> Result<(), ReinitError> {
+        assert_eq!(
+            self.in_flight_chains(),
+            0,
+            "virtio queue {} was re-initialised with requests still in flight",
+            self.index
+        );
+        self.reinitialize_discarding(transport)
+    }
+
+    /// [`VirtQueue::reinitialize`] for a queue whose in-flight chains are
+    /// receive buffers the device owned: they are dropped, and the caller
+    /// posts its pool again from its own records.
+    pub(crate) fn reinitialize_discarding(&mut self, transport: &T) -> Result<(), ReinitError> {
+        let offered = transport.queue_max_size(self.index);
+        if offered < self.size {
+            return Err(ReinitError::QueueShrunk {
+                device: transport.device_type(),
+                queue: self.index,
+                size: self.size,
+                offered,
+            });
+        }
+        self.ring.reprogram(transport, self.index);
+        self.faulted = false;
+        Ok(())
     }
 
     /// The features this queue was built with.

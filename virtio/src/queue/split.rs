@@ -170,6 +170,10 @@ impl<T: VirtioTransport> RingOps<T> for SplitRing<T> {
         self.core.ids.peek()
     }
 
+    fn in_flight_chains(&self) -> usize {
+        self.core.in_flight.count()
+    }
+
     fn reprogram(&mut self, transport: &T, index: u16) {
         zero(&self.descriptors);
         zero(&self.driver_area);
