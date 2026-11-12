@@ -42,6 +42,8 @@ use super::{
     RESP_ERR_OUT_OF_MEMORY, RESP_OK_DISPLAY_INFO, RESP_OK_NODATA, VirtioGpuDevice,
     decode_display_info, decode_edid_preferred_mode, online_line,
 };
+use crate::features::RenegotiateError;
+use crate::resume::{DeviceReset, QuiesceError, ReinitError};
 use crate::testing::{FakeTransport, FakeTransportConfig};
 use crate::transport::{DeviceType, VirtioFeatures, VirtioTransport};
 
@@ -1796,4 +1798,437 @@ fn a_blob_larger_than_the_aperture_is_refused() {
     let refused = block_on(device.map_blob(blob));
 
     assert_eq!(refused.err(), Some(Gpu3dError::ApertureExhausted));
+}
+
+/// Plays the device for a driver that is polling it: answers the one
+/// control command (or else cursor update) it has outstanding, and
+/// records what it read.
+fn play_device(device: &VirtioGpuDevice<FakeTransport>, requests: &mut Vec<Vec<u8>>) {
+    let control = device
+        .control
+        .try_lock()
+        .expect("a polling driver does not hold the control queue lock")
+        .device_in_flight_heads();
+    if let Some(&token) = control.first() {
+        requests.push(control_request(device, token));
+        answer_control(device, token, &header_response(RESP_OK_NODATA));
+        return;
+    }
+    let cursor = device
+        .cursor
+        .try_lock()
+        .expect("a polling driver does not hold the cursor queue lock")
+        .device_in_flight_heads();
+    if let Some(&token) = cursor.first() {
+        requests.push(cursor_request(device, token));
+        answer_cursor(device, token);
+    }
+}
+
+/// A frame buffer on a scanout, with a pointer image on the cursor
+/// plane: everything a reset device has to be given back.
+fn display_in_use(device: &VirtioGpuDevice<FakeTransport>) -> (FramebufferId, FramebufferId) {
+    let mode = DisplayMode::new(64, 32);
+    let frame = create_framebuffer(device, mode);
+    let future = pin!(device.set_scanout(ScanoutId::new(0), frame, Rect::of(mode)));
+    let (_, outcome) = exchange(device, future, &header_response(RESP_OK_NODATA));
+    outcome.expect("the scanout is set");
+
+    let cursor = create_framebuffer(device, CursorImage::MODE);
+    let image = CursorImage {
+        framebuffer: cursor,
+        hotspot: Point::new(3, 5),
+    };
+    let mut set = pin!(device.set_cursor(ScanoutId::new(0), Point::new(400, 300), image));
+    let token = pending_control(device, set.as_mut());
+    answer_control(device, token, &header_response(RESP_OK_NODATA));
+    let token = pending_cursor(device, set.as_mut());
+    answer_cursor(device, token);
+    assert_eq!(block_on(poll_once(set.as_mut())), Some(Ok(())));
+    (frame, cursor)
+}
+
+#[test]
+fn quiesce_waits_for_the_commands_the_device_owns() {
+    let device = device();
+    let mut flush = pin!(device.scanouts());
+    let token = pending_control(&device, flush.as_mut());
+
+    let mut passes = 0;
+    device
+        .quiesce(|| {
+            passes += 1;
+            answer_control(
+                &device,
+                token,
+                &display_info_response(&[(Rect::new(0, 0, 1280, 800), true)]),
+            );
+            false
+        })
+        .expect("the device answers inside the deadline");
+    assert_eq!(passes, 1);
+    assert!(
+        block_on(poll_once(flush.as_mut())).is_some(),
+        "the completion reaped during the quiesce is still the caller's"
+    );
+}
+
+#[test]
+fn quiesce_gives_up_when_the_deadline_passes() {
+    let device = device();
+    let mut scanouts = pin!(device.scanouts());
+    pending_control(&device, scanouts.as_mut());
+
+    assert_eq!(
+        device.quiesce(|| true),
+        Err(QuiesceError::RequestsStillInFlight {
+            device: DeviceType::Gpu,
+            queue: 0,
+            count: 1,
+        })
+    );
+}
+
+#[test]
+fn a_reset_device_gets_its_resources_scanouts_and_cursor_back() {
+    let device = device();
+    let (frame, cursor) = display_in_use(&device);
+    device.quiesce(|| false).expect("nothing is in flight");
+
+    device.transport.reset_behind_the_driver();
+    let mut requests = Vec::new();
+    assert_eq!(
+        device.reinitialize(|| {
+            play_device(&device, &mut requests);
+            false
+        }),
+        Ok(DeviceReset {
+            device: DeviceType::Gpu
+        })
+    );
+
+    let commands: Vec<u32> = requests.iter().map(|r| command_of(r)).collect();
+    assert_eq!(
+        commands,
+        [
+            CMD_RESOURCE_CREATE_2D,
+            CMD_RESOURCE_ATTACH_BACKING,
+            CMD_TRANSFER_TO_HOST_2D,
+            CMD_RESOURCE_CREATE_2D,
+            CMD_RESOURCE_ATTACH_BACKING,
+            CMD_TRANSFER_TO_HOST_2D,
+            CMD_SET_SCANOUT,
+            CMD_RESOURCE_FLUSH,
+            CMD_UPDATE_CURSOR,
+        ]
+    );
+    assert_eq!(word_at(&requests[0], CTRL_HEADER_BYTES), frame.raw());
+    assert_eq!(word_at(&requests[3], CTRL_HEADER_BYTES), cursor.raw());
+    // The backing table is the one the caller's pages made.
+    let entry = CTRL_HEADER_BYTES + 8;
+    assert_eq!(word_at(&requests[1], CTRL_HEADER_BYTES + 4), 1);
+    assert_eq!(word_at(&requests[1], entry + 8), 64 * 4096);
+    assert_eq!(
+        word_at(&requests[6], CTRL_HEADER_BYTES + 8),
+        64,
+        "rect width"
+    );
+    assert_eq!(word_at(&requests[6], CTRL_HEADER_BYTES + 20), frame.raw());
+    assert_eq!(word_at(&requests[8], CTRL_HEADER_BYTES + 4), 400);
+    assert_eq!(word_at(&requests[8], CTRL_HEADER_BYTES + 16), cursor.raw());
+    assert_eq!(device.transport.driver_features(), device.features().bits());
+    assert_eq!(device.transport.driver_reset_count(), 2);
+}
+
+/// A resource the caller destroyed is not given back, and a scanout
+/// that was blanked is not pointed anywhere.
+#[test]
+fn a_destroyed_resource_and_a_blanked_scanout_are_not_restored() {
+    let device = device();
+    let mode = DisplayMode::new(64, 32);
+    let frame = create_framebuffer(&device, mode);
+    let future = pin!(device.set_scanout(ScanoutId::new(0), frame, Rect::of(mode)));
+    exchange(&device, future, &header_response(RESP_OK_NODATA))
+        .1
+        .expect("the scanout is set");
+    let future = pin!(device.blank_scanout(ScanoutId::new(0)));
+    exchange(&device, future, &header_response(RESP_OK_NODATA))
+        .1
+        .expect("the scanout is blanked");
+
+    let mut destroy = pin!(device.destroy_framebuffer(frame));
+    for _ in 0..2 {
+        let token = pending_control(&device, destroy.as_mut());
+        answer_control(&device, token, &header_response(RESP_OK_NODATA));
+    }
+    assert_eq!(block_on(poll_once(destroy.as_mut())), Some(Ok(())));
+
+    let mut requests = Vec::new();
+    let _reset = device
+        .reinitialize(|| {
+            play_device(&device, &mut requests);
+            false
+        })
+        .expect("a device with nothing to restore comes back");
+    assert!(requests.is_empty());
+}
+
+/// A refused command leaves no record: the reset device is not told
+/// about a scanout it never agreed to.
+#[test]
+fn a_refused_scanout_is_not_remembered() {
+    let device = device();
+    let mode = DisplayMode::new(64, 32);
+    let frame = create_framebuffer(&device, mode);
+    let future = pin!(device.set_scanout(ScanoutId::new(0), frame, Rect::of(mode)));
+    let (_, outcome) = exchange(
+        &device,
+        future,
+        &header_response(RESP_ERR_INVALID_SCANOUT_ID),
+    );
+    assert!(outcome.is_err());
+
+    let mut requests = Vec::new();
+    let _reset = device
+        .reinitialize(|| {
+            play_device(&device, &mut requests);
+            false
+        })
+        .expect("the device comes back");
+    let commands: Vec<u32> = requests.iter().map(|r| command_of(r)).collect();
+    assert_eq!(
+        commands,
+        [
+            CMD_RESOURCE_CREATE_2D,
+            CMD_RESOURCE_ATTACH_BACKING,
+            CMD_TRANSFER_TO_HOST_2D
+        ]
+    );
+}
+
+#[test]
+fn a_device_holding_a_renderer_context_cannot_be_given_it_back() {
+    let device = render_device(1);
+    open_context(&device);
+    assert_eq!(
+        device.reinitialize(|| false),
+        Err(ReinitError::StateNotRestorable {
+            device: DeviceType::Gpu,
+            what: "renderer contexts",
+        })
+    );
+    assert_eq!(
+        device.transport.driver_reset_count(),
+        1,
+        "the device was refused before it was touched"
+    );
+}
+
+#[test]
+fn a_device_that_offers_fewer_features_after_the_reset_is_refused() {
+    let device = device();
+    device
+        .transport
+        .withdraw_features(VirtioFeatures::VERSION_1.bits());
+    assert_eq!(
+        device.reinitialize(|| false),
+        Err(ReinitError::Renegotiate(
+            RenegotiateError::FeatureWithdrawn {
+                device: DeviceType::Gpu,
+                bit: 32,
+            }
+        ))
+    );
+}
+
+#[test]
+fn a_device_that_presents_other_scanouts_is_refused() {
+    let device = device();
+    device
+        .transport
+        .set_config_u32(super::CONFIG_NUM_SCANOUTS, 2);
+    assert_eq!(
+        device.reinitialize(|| false),
+        Err(ReinitError::DeviceChanged {
+            device: DeviceType::Gpu,
+            what: "the number of scanouts",
+        })
+    );
+}
+
+#[test]
+fn a_device_that_never_answers_a_restore_command_times_out() {
+    let device = device();
+    create_framebuffer(&device, DisplayMode::new(64, 32));
+    assert_eq!(
+        device.reinitialize(|| true),
+        Err(ReinitError::RestoreTimedOut {
+            device: DeviceType::Gpu,
+            what: "a resource",
+        })
+    );
+}
+
+/// A restore command that outlived its deadline is still the device's,
+/// so the device is lost: a second attempt is an error, not a panic.
+#[test]
+fn a_device_lost_by_a_timed_out_restore_is_refused_afterwards() {
+    let device = device();
+    create_framebuffer(&device, DisplayMode::new(64, 32));
+    assert!(matches!(
+        device.reinitialize(|| true),
+        Err(ReinitError::RestoreTimedOut { .. })
+    ));
+
+    assert_eq!(
+        device.reinitialize(|| false),
+        Err(ReinitError::DeviceLost {
+            device: DeviceType::Gpu
+        })
+    );
+}
+
+/// A re-initialisation that fails leaves the device FAILED and every
+/// command after it failing fast.
+#[test]
+fn a_failed_reinitialization_fails_the_commands_that_follow() {
+    let device = device();
+    device
+        .transport
+        .set_config_u32(super::CONFIG_NUM_SCANOUTS, 2);
+    assert!(matches!(
+        device.reinitialize(|| false),
+        Err(ReinitError::DeviceChanged { .. })
+    ));
+    assert!(
+        device
+            .transport
+            .status()
+            .contains(crate::transport::DeviceStatus::FAILED)
+    );
+
+    assert_eq!(
+        block_on(poll_once(device.scanouts())),
+        Some(Err(DisplayError::Transport(IoError::DeviceFault)))
+    );
+}
+
+/// A scanout that shows a resource would be left scanning out memory the
+/// device no longer references, and the record would replay a scanout of
+/// a resource that is never created again. The destroy is refused until
+/// the caller has blanked the scanout, and nothing reaches the device.
+#[test]
+fn a_frame_buffer_that_is_still_shown_cannot_be_destroyed() {
+    let device = device();
+    let (frame, cursor) = display_in_use(&device);
+
+    assert_eq!(
+        block_on(poll_once(device.destroy_framebuffer(frame))),
+        Some(Err(DisplayError::InvalidParameter)),
+        "on a scanout"
+    );
+    assert_eq!(
+        block_on(poll_once(device.destroy_framebuffer(cursor))),
+        Some(Err(DisplayError::InvalidParameter)),
+        "in the cursor plane"
+    );
+    assert!(
+        device
+            .control
+            .try_lock()
+            .expect("nothing is parked")
+            .device_in_flight_heads()
+            .is_empty()
+    );
+
+    // The record is intact, so a reset device still gets all of it back.
+    device.quiesce(|| false).expect("nothing is in flight");
+    device.transport.reset_behind_the_driver();
+    let mut requests = Vec::new();
+    let _reset = device
+        .reinitialize(|| {
+            play_device(&device, &mut requests);
+            false
+        })
+        .expect("the device comes back");
+    assert_eq!(requests.len(), 9);
+}
+
+/// The create was answered while the machine froze, and the attach had
+/// not gone out: the quiesce reaps the answer for the waiter, so the
+/// record holds the resource unbacked and the reset device is given
+/// just the resource. The thawed task then sends its own attach to a
+/// device that has the resource and accepts it.
+#[test]
+fn a_resource_created_but_not_yet_backed_is_restored_unbacked() {
+    let device = device();
+    let pages = backing(64);
+    let mode = DisplayMode::new(64, 32);
+    let mut create = pin!(device.create_framebuffer(mode, PixelFormat::Bgra8888, &pages));
+    let token = pending_control(&device, create.as_mut());
+    answer_control(&device, token, &header_response(RESP_OK_NODATA));
+
+    let mut ignored = Vec::new();
+    device
+        .quiesce(|| {
+            play_device(&device, &mut ignored);
+            false
+        })
+        .expect("the device answers inside the deadline");
+    device.transport.reset_behind_the_driver();
+    let mut requests = Vec::new();
+    let _reset = device
+        .reinitialize(|| {
+            play_device(&device, &mut requests);
+            false
+        })
+        .expect("the device comes back");
+    let commands: Vec<u32> = requests.iter().map(|r| command_of(r)).collect();
+    assert_eq!(commands, [CMD_RESOURCE_CREATE_2D], "no backing to attach");
+
+    // The thaw: the task's own attach goes out and is accepted.
+    let token = pending_control(&device, create.as_mut());
+    assert_eq!(
+        command_of(&control_request(&device, token)),
+        CMD_RESOURCE_ATTACH_BACKING
+    );
+    answer_control(&device, token, &header_response(RESP_OK_NODATA));
+    let frame = block_on(poll_once(create.as_mut()))
+        .expect("the attach is answered")
+        .expect("the frame buffer is created");
+    assert!(
+        device
+            .restorable
+            .lock()
+            .resources
+            .iter()
+            .any(|held| held.id == frame && held.backed)
+    );
+}
+
+/// A create the device refused while the machine froze never made a
+/// resource, so there is nothing to replay.
+#[test]
+fn a_resource_the_device_refused_during_the_freeze_is_not_restored() {
+    let device = device();
+    let pages = backing(64);
+    let mut create =
+        pin!(device.create_framebuffer(DisplayMode::new(64, 32), PixelFormat::Bgra8888, &pages));
+    let token = pending_control(&device, create.as_mut());
+    answer_control(&device, token, &header_response(RESP_ERR_OUT_OF_MEMORY));
+
+    device.quiesce(|| false).expect("the queue is drained");
+    device.transport.reset_behind_the_driver();
+    let mut requests = Vec::new();
+    let _reset = device
+        .reinitialize(|| {
+            play_device(&device, &mut requests);
+            false
+        })
+        .expect("the device comes back");
+    assert!(requests.is_empty());
+    assert_eq!(
+        block_on(poll_once(create.as_mut())),
+        Some(Err(DisplayError::OutOfMemory))
+    );
 }

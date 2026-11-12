@@ -966,3 +966,145 @@ fn a_buffer_wholly_inside_the_window_translates_as_before() {
         .submit(&transport, &[bytes], &mut [])
         .expect("the same page can be submitted");
 }
+
+#[test]
+fn a_chain_counts_as_in_flight_until_its_completion_is_popped() {
+    let transport = transport();
+    let mut queue = VirtQueue::new(&transport, 0, 8, 2, features(VirtioFeatures::empty()))
+        .expect("queue should initialize");
+    assert_eq!(queue.in_flight_chains(), 0);
+
+    let input = [1_u8; 8];
+    let mut output = [0_u8; 8];
+    let first = queue
+        .submit(&transport, &[&input], &mut [&mut output])
+        .expect("the ring has room");
+    queue
+        .submit(&transport, &[&input], &mut [])
+        .expect("the ring has room");
+    assert_eq!(
+        queue.in_flight_chains(),
+        2,
+        "chains are counted, not descriptors"
+    );
+
+    split(&queue).device_complete(first, 8);
+    assert_eq!(
+        queue.in_flight_chains(),
+        2,
+        "a completion the driver has not reaped is still the device's"
+    );
+    assert_eq!(queue.pop_used(), Ok(Some(first)));
+    assert_eq!(queue.in_flight_chains(), 1);
+}
+
+#[test]
+fn a_reset_device_gets_its_queue_back_at_the_same_memory_with_fresh_indices() {
+    for extra in [VirtioFeatures::empty(), VirtioFeatures::RING_PACKED] {
+        let transport = transport();
+        let mut queue =
+            VirtQueue::new(&transport, 3, 8, 1, features(extra)).expect("queue should initialize");
+        let buffer = [1_u8; 8];
+        // Advance the ring past its start so a stale index would show.
+        for _ in 0..5 {
+            queue
+                .submit(&transport, &[&buffer], &mut [])
+                .expect("the ring has room");
+        }
+        // The device answers everything, as a quiesce waits for.
+        for token in 0..5_u16 {
+            match &queue.ring {
+                Ring::Split(ring) => ring.device_complete(token, 0),
+                Ring::Packed(ring) => ring.device_complete(token, true, token, 0),
+            }
+        }
+        while queue.pop_used().expect("no fault").is_some() {}
+        queue
+            .reinitialize(&transport)
+            .expect("the device still offers the queue");
+
+        let programmed = transport.programmed_queues();
+        assert_eq!(programmed.len(), 2, "the queue is programmed again");
+        assert_eq!(
+            programmed[0], programmed[1],
+            "at the memory it already had, so the driver's records stay valid"
+        );
+        assert_eq!(queue.available_descriptors(), 8);
+        assert_eq!(queue.next_free_descriptor(), 0);
+        assert_eq!(queue.in_flight_chains(), 0);
+
+        let token = queue
+            .submit(&transport, &[&buffer], &mut [])
+            .expect("the queue works after the device was reset");
+        assert_eq!(token, 0);
+        if extra.is_empty() {
+            assert_eq!(
+                split(&queue).published_avail_idx(),
+                1,
+                "the available index starts again from zero"
+            );
+        }
+    }
+}
+
+#[test]
+#[should_panic(expected = "re-initialised with requests still in flight")]
+fn a_queue_with_a_request_in_flight_is_not_reinitialised_as_idle() {
+    let transport = transport();
+    let mut queue = VirtQueue::new(&transport, 0, 8, 1, features(VirtioFeatures::empty()))
+        .expect("queue should initialize");
+    let buffer = [1_u8; 8];
+    queue
+        .submit(&transport, &[&buffer], &mut [])
+        .expect("the ring has room");
+    let _ = queue.reinitialize(&transport);
+}
+
+#[test]
+fn a_posted_receive_buffer_is_dropped_by_a_discarding_reinitialisation() {
+    for extra in [VirtioFeatures::empty(), VirtioFeatures::RING_PACKED] {
+        let transport = transport();
+        let mut queue =
+            VirtQueue::new(&transport, 0, 8, 1, features(extra)).expect("queue should initialize");
+        let mut buffer = [0_u8; 8];
+        queue
+            .submit(&transport, &[], &mut [&mut buffer])
+            .expect("the ring has room");
+        assert_eq!(queue.in_flight_chains(), 1);
+
+        queue
+            .reinitialize_discarding(&transport)
+            .expect("the device still offers the queue");
+
+        assert_eq!(queue.in_flight_chains(), 0);
+        assert_eq!(queue.available_descriptors(), 8);
+    }
+}
+
+#[test]
+fn a_queue_the_device_now_offers_shallower_is_refused() {
+    let transport = FakeTransport::new(FakeTransportConfig {
+        queue_size: 8,
+        ..FakeTransportConfig::default()
+    });
+    let mut queue = VirtQueue::new(&transport, 1, 8, 1, features(VirtioFeatures::empty()))
+        .expect("queue should initialize");
+    let shallower = FakeTransport::new(FakeTransportConfig {
+        queue_size: 4,
+        ..FakeTransportConfig::default()
+    });
+
+    assert_eq!(
+        queue.reinitialize(&shallower),
+        Err(crate::resume::ReinitError::QueueShrunk {
+            device: crate::transport::DeviceType::Block,
+            queue: 1,
+            size: 8,
+            offered: 4,
+        })
+    );
+    assert!(
+        shallower.programmed_queues().is_empty(),
+        "nothing was programmed at a size the ring does not have"
+    );
+}

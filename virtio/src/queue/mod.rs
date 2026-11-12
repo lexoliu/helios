@@ -37,6 +37,7 @@ use helios_hal::dma::{DmaBuffer, DmaError, DmaMemory};
 
 use crate::bus::DeviceBus;
 use crate::features::NegotiatedFeatures;
+use crate::resume::ReinitError;
 use crate::transport::VirtioTransport;
 
 use packed::PackedRing;
@@ -230,6 +231,19 @@ impl InFlightHeads {
 
     fn clear(&mut self) {
         self.bits.fill(0);
+    }
+
+    /// How many chain heads the device owns.
+    fn count(&self) -> usize {
+        self.bits
+            .iter()
+            .map(|word| word.count_ones() as usize)
+            .sum()
+    }
+
+    #[cfg(test)]
+    fn contains(&self, id: u16) -> bool {
+        self.bits[usize::from(id) / 64] & (1 << (id % 64)) != 0
     }
 
     fn insert(&mut self, id: u16) {
@@ -563,6 +577,9 @@ trait RingOps<T: VirtioTransport>: Sized {
 
     fn next_id(&self) -> u16;
 
+    /// Chains the device owns right now.
+    fn in_flight_chains(&self) -> usize;
+
     /// Drops every in-flight chain and re-programs the device-side queue
     /// after a [`VirtioTransport::reset_queue`].
     fn reprogram(&mut self, transport: &T, index: u16);
@@ -645,6 +662,13 @@ impl<T: VirtioTransport> Ring<T> {
         }
     }
 
+    fn in_flight_chains(&self) -> usize {
+        match self {
+            Self::Split(ring) => ring.in_flight_chains(),
+            Self::Packed(ring) => ring.in_flight_chains(),
+        }
+    }
+
     fn reprogram(&mut self, transport: &T, index: u16) {
         match self {
             Self::Split(ring) => ring.reprogram(transport, index),
@@ -675,7 +699,8 @@ pub(crate) fn negotiated_queue_size<T: VirtioTransport>(
 /// A virtqueue in whichever layout the device and driver agreed on.
 pub struct VirtQueue<T: VirtioTransport> {
     index: u16,
-    /// Descriptors, and so the identifiers a chain can be headed by.
+    /// Descriptors, and so the identifiers a chain can be headed by; a
+    /// re-initialisation checks the device still offers a queue this deep.
     size: u16,
     features: NegotiatedFeatures,
     ring: Ring<T>,
@@ -828,6 +853,70 @@ impl<T: VirtioTransport> VirtQueue<T> {
         Ok((token, span))
     }
 
+    /// Chains the device owns right now.
+    ///
+    /// A chain stays counted from its submission until its completion is
+    /// popped, so this is what a quiesce waits to reach zero.
+    pub(crate) fn in_flight_chains(&self) -> usize {
+        self.ring.in_flight_chains()
+    }
+
+    /// Re-programs the queue on a device that was reset, at the memory it
+    /// already has, with fresh indices and every identifier back in the
+    /// pool.
+    ///
+    /// The device has dropped the queue along with everything else, so
+    /// this needs neither [`VIRTIO_F_RING_RESET`] nor a per-queue reset
+    /// register, and it works on both ring layouts. The caller has
+    /// renegotiated the features first and sets `DRIVER_OK` after the
+    /// last queue.
+    ///
+    /// Chains still in flight are abandoned: the device that owned them
+    /// is gone. A queue the driver drains to a stop first (a request
+    /// queue) is expected to have none, which is a contract this asserts;
+    /// use [`VirtQueue::reinitialize_discarding`] for a queue whose
+    /// in-flight chains are posted receive buffers.
+    ///
+    /// # Panics
+    ///
+    /// When a chain is still in flight. The caller quiesced the device, so
+    /// one that remains means a request was submitted after that.
+    ///
+    /// # Errors
+    ///
+    /// [`ReinitError::QueueShrunk`] when the device no longer offers a
+    /// queue as deep as this one: the ring memory cannot be programmed
+    /// at a smaller size.
+    ///
+    /// [`VIRTIO_F_RING_RESET`]: crate::transport::VirtioFeatures::RING_RESET
+    pub(crate) fn reinitialize(&mut self, transport: &T) -> Result<(), ReinitError> {
+        assert_eq!(
+            self.in_flight_chains(),
+            0,
+            "virtio queue {} was re-initialised with requests still in flight",
+            self.index
+        );
+        self.reinitialize_discarding(transport)
+    }
+
+    /// [`VirtQueue::reinitialize`] for a queue whose in-flight chains are
+    /// receive buffers the device owned: they are dropped, and the caller
+    /// posts its pool again from its own records.
+    pub(crate) fn reinitialize_discarding(&mut self, transport: &T) -> Result<(), ReinitError> {
+        let offered = transport.queue_max_size(self.index);
+        if offered < self.size {
+            return Err(ReinitError::QueueShrunk {
+                device: transport.device_type(),
+                queue: self.index,
+                size: self.size,
+                offered,
+            });
+        }
+        self.ring.reprogram(transport, self.index);
+        self.faulted = false;
+        Ok(())
+    }
+
     /// The features this queue was built with.
     pub fn features(&self) -> NegotiatedFeatures {
         self.features
@@ -885,6 +974,29 @@ impl<T: VirtioTransport> VirtQueue<T> {
         parts: &[&[u8]],
     ) -> IoResult<u16> {
         self.submit_deferred(transport, parts, &mut [])
+    }
+
+    /// Posts every buffer of a pool on a queue that was just
+    /// re-programmed, and publishes them together.
+    ///
+    /// `buffer_for_token` records which buffer each descriptor identifier
+    /// carries, which is the pairing a completion is decoded by. The pool
+    /// is posted in order, so buffer `n` is the `n`th entry; whatever the
+    /// device wrote into a buffer before the reset is overwritten by the
+    /// next completion and never read.
+    pub(crate) fn restock<'a>(
+        &mut self,
+        transport: &T,
+        buffers: impl Iterator<Item = &'a mut [u8]>,
+        buffer_for_token: &mut [u16],
+    ) -> IoResult<()> {
+        for (index, buffer) in buffers.enumerate() {
+            let token = self.submit_output_deferred(transport, buffer)?;
+            buffer_for_token[usize::from(token)] =
+                u16::try_from(index).expect("a pool was built from a u16 count");
+        }
+        self.publish();
+        Ok(())
     }
 
     /// Stages one writable buffer without publishing it.
@@ -1115,6 +1227,17 @@ impl<T: VirtioTransport> VirtQueue<T> {
             written += take;
         }
         u32::try_from(written).expect("device response length fits a u32")
+    }
+
+    /// Device side, tests only: the heads of the chains the device owns.
+    #[cfg(test)]
+    pub(crate) fn device_in_flight_heads(&self) -> alloc::vec::Vec<u16> {
+        match &self.ring {
+            Ring::Split(ring) => ring.device_in_flight_heads(),
+            Ring::Packed(_) => {
+                panic!("device_in_flight_heads drives the split ring")
+            }
+        }
     }
 
     #[cfg(test)]

@@ -27,10 +27,13 @@ use helios_hal::dma::{BufError, BufResult, DmaMemory};
 use helios_hal::io::{IoError, IoResult};
 
 use crate::bus::DeviceBus;
-use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate};
-use crate::inflight::{InFlight, await_completion, submit_lent};
+use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate, renegotiate};
+use crate::inflight::{
+    InFlight, await_completion, drain_to_idle, reinitialize_requests, submit_lent,
+};
 use crate::notify::Notify;
 use crate::queue::{ControlSlots, Part, READ_WRITE, TransportBuffer, VirtQueue, control_slots};
+use crate::resume::{DeviceReset, QuiesceError, ReinitError, conclude, driver_ok};
 use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
 
 /// Alignment of a request or reply buffer a consumer allocates: a cache
@@ -148,6 +151,55 @@ impl<T: VirtioTransport> Virtio9pDevice<T> {
     pub fn handle_interrupt(&self) {
         self.transport.ack_interrupt();
         self.interrupts.notify_all();
+    }
+
+    /// Waits for every request the device owns to complete, so the device
+    /// may be reset. See [`crate::resume`] for the contract; `expired`
+    /// says when the caller's deadline has passed.
+    pub fn quiesce(&self, mut expired: impl FnMut() -> bool) -> Result<(), QuiesceError> {
+        drain_to_idle(
+            &self.inflight,
+            &self.queue,
+            &self.transport,
+            REQUEST_QUEUE_INDEX,
+            &mut expired,
+        )
+    }
+
+    /// Brings a reset device back with the features it had, after
+    /// [`Self::quiesce`].
+    ///
+    /// The mount tag is read again and must be the one the share was
+    /// mounted under. The returned [`DeviceReset`] is the signal the 9p
+    /// client reacts to: a reset device is a server that has forgotten
+    /// every session and every fid, and a request that completed before
+    /// the reset names state that no longer exists.
+    pub fn reinitialize(&self) -> Result<DeviceReset, ReinitError> {
+        conclude(&self.transport, self.restore(), |resumed| {
+            self.inflight.resume(resumed);
+        })
+    }
+
+    fn restore(&self) -> Result<DeviceReset, ReinitError> {
+        renegotiate(&self.transport, self.features)?;
+        reinitialize_requests(&self.queue, &self.transport, REQUEST_QUEUE_INDEX)?;
+        // A device is untrusted: what it reads back is compared. The tag
+        // is the share's name, and a different one is a different share.
+        let tag = read_mount_tag(&self.transport).map_err(|error| ReinitError::Restore {
+            device: DeviceType::_9P,
+            what: "the mount tag",
+            error,
+        })?;
+        if tag != self.mount_tag {
+            return Err(ReinitError::DeviceChanged {
+                device: DeviceType::_9P,
+                what: "the mount tag",
+            });
+        }
+        driver_ok(&self.transport);
+        Ok(DeviceReset {
+            device: DeviceType::_9P,
+        })
     }
 
     /// Allocates a zeroed buffer of `capacity` bytes the device can reach,
@@ -281,6 +333,7 @@ fn read_mount_tag<T: VirtioTransport>(transport: &T) -> IoResult<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::features::RenegotiateError;
     use crate::testing::{
         ConfinedDmaBuffer, ConfinedTransport, FakeTransport, FakeTransportConfig,
     };
@@ -308,11 +361,10 @@ mod tests {
         let tag_len = u16::try_from(MOUNT_TAG.len()).expect("mount tag length fits in u16");
         config[..2].copy_from_slice(&tag_len.to_le_bytes());
         config[2..2 + MOUNT_TAG.len()].copy_from_slice(MOUNT_TAG.as_bytes());
-        for (index, word) in config.chunks_exact(4).enumerate() {
-            transport.bus().write_u32(
-                index * 4,
-                u32::from_le_bytes([word[0], word[1], word[2], word[3]]),
-            );
+        for (index, &word) in config.as_chunks::<4>().0.iter().enumerate() {
+            transport
+                .bus()
+                .write_u32(index * 4, u32::from_le_bytes(word));
         }
         transport
     }
@@ -435,6 +487,149 @@ mod tests {
         outcome: Option<BufResult<usize, (ConfinedDmaBuffer, ConfinedDmaBuffer)>>,
     ) -> Option<usize> {
         outcome.map(|result| result.expect("the request succeeds").0)
+    }
+
+    /// Plays the device answering `token` with a reply of `len` bytes.
+    fn answer(device: &Virtio9pDevice<ConfinedTransport>, token: u16, len: u32) {
+        device
+            .queue
+            .try_lock()
+            .expect("a parked driver does not hold the queue lock")
+            .device_complete(token, len);
+        device.handle_interrupt();
+    }
+
+    #[test]
+    fn quiesce_waits_for_every_request_in_flight() {
+        let device = Virtio9pDevice::new(transport(8)).expect("the device should initialize");
+        let mut first = pin!(device.request(request(&device, 16, 1), 16, reply(&device, 24), 24));
+        assert!(block_on(poll_once(first.as_mut())).is_none());
+        let mut second = pin!(device.request(request(&device, 16, 2), 16, reply(&device, 32), 32));
+        assert!(block_on(poll_once(second.as_mut())).is_none());
+
+        // A two-buffer chain takes two descriptors, so the second request's
+        // head is descriptor 2.
+        let mut pending = [(2_u16, 32_u32), (0_u16, 24_u32)].into_iter();
+        let mut passes = 0;
+        device
+            .quiesce(|| {
+                passes += 1;
+                if let Some((token, len)) = pending.next() {
+                    answer(&device, token, len);
+                }
+                false
+            })
+            .expect("the device answers inside the deadline");
+        assert_eq!(passes, 2, "one pass per answer, out of order");
+
+        assert_eq!(written(block_on(poll_once(first.as_mut()))), Some(24));
+        assert_eq!(written(block_on(poll_once(second.as_mut()))), Some(32));
+    }
+
+    #[test]
+    fn quiesce_gives_up_when_the_deadline_passes() {
+        let device = Virtio9pDevice::new(transport(8)).expect("the device should initialize");
+        let mut pending = pin!(device.request(request(&device, 16, 1), 16, reply(&device, 24), 24));
+        assert!(block_on(poll_once(pending.as_mut())).is_none());
+
+        assert_eq!(
+            device.quiesce(|| true),
+            Err(QuiesceError::RequestsStillInFlight {
+                device: DeviceType::_9P,
+                queue: 0,
+                count: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn a_reset_device_serves_requests_again_and_signals_the_reset() {
+        let device = Virtio9pDevice::new(transport(8)).expect("the device should initialize");
+        let mut pending = pin!(device.request(request(&device, 16, 1), 16, reply(&device, 24), 24));
+        assert!(block_on(poll_once(pending.as_mut())).is_none());
+        device
+            .quiesce(|| {
+                answer(&device, 0, 24);
+                false
+            })
+            .expect("the device answers inside the deadline");
+
+        device.transport.reset_behind_the_driver();
+        assert_eq!(
+            device.reinitialize(),
+            Ok(DeviceReset {
+                device: DeviceType::_9P
+            })
+        );
+
+        assert_eq!(
+            written(block_on(poll_once(pending.as_mut()))),
+            Some(24),
+            "the reply that arrived before the reset is still delivered"
+        );
+        let programmed = device.transport.programmed_queues();
+        assert_eq!(programmed.len(), 2);
+        assert_eq!(programmed[0], programmed[1]);
+        let mut round_trip =
+            pin!(device.request(request(&device, 16, 1), 16, reply(&device, 12), 12));
+        assert!(block_on(poll_once(round_trip.as_mut())).is_none());
+        answer(&device, 0, 12);
+        assert_eq!(written(block_on(poll_once(round_trip.as_mut()))), Some(12));
+    }
+
+    #[test]
+    fn a_device_that_offers_fewer_features_after_the_reset_is_refused() {
+        let device = Virtio9pDevice::new(transport(8)).expect("the device should initialize");
+        device.transport.withdraw_features(P9_FEATURE_MOUNT_TAG);
+
+        assert_eq!(
+            device.reinitialize(),
+            Err(ReinitError::Renegotiate(
+                RenegotiateError::FeatureWithdrawn {
+                    device: DeviceType::_9P,
+                    bit: 0,
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn a_device_that_serves_another_share_after_the_reset_is_refused() {
+        let device = Virtio9pDevice::new(transport(8)).expect("the device should initialize");
+        // The tag's first byte sits two bytes into the configuration.
+        device.transport.set_config_u8(2, b'x');
+
+        assert_eq!(
+            device.reinitialize(),
+            Err(ReinitError::DeviceChanged {
+                device: DeviceType::_9P,
+                what: "the mount tag",
+            })
+        );
+    }
+
+    /// A device refused after its reset is FAILED, and a request made
+    /// afterwards fails at once instead of waiting for a completion that
+    /// cannot come.
+    #[test]
+    fn a_refused_device_fails_the_requests_that_follow() {
+        let device = Virtio9pDevice::new(transport(8)).expect("the device should initialize");
+        device.transport.set_config_u8(2, b'x');
+        assert!(matches!(
+            device.reinitialize(),
+            Err(ReinitError::DeviceChanged { .. })
+        ));
+        assert!(
+            device
+                .transport
+                .status()
+                .contains(crate::transport::DeviceStatus::FAILED)
+        );
+
+        let refused = block_on(device.request(request(&device, 16, 1), 16, reply(&device, 24), 24))
+            .map(|(written, _)| written)
+            .map_err(BufError::into_error);
+        assert_eq!(refused, Err(IoError::DeviceFault));
     }
 
     #[test]

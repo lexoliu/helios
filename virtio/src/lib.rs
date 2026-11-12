@@ -12,12 +12,14 @@ mod gpu;
 mod inflight;
 mod input;
 mod iommu;
+mod journal;
 mod mmio;
 mod net;
 mod notify;
 mod p9;
 mod pci;
 mod queue;
+mod resume;
 mod rng;
 mod snd;
 #[cfg(test)]
@@ -40,7 +42,9 @@ pub use discovery::{
     InterruptTrigger, MmioCandidate, MmioInterrupt, NodeInterrupt, mmio_candidates,
     mmio_device_matches, node_interrupt, node_interrupt_kind,
 };
-pub use features::{NegotiatedFeatures, RING_FEATURES, negotiate, negotiate_with};
+pub use features::{
+    NegotiatedFeatures, RING_FEATURES, RenegotiateError, negotiate, negotiate_with, renegotiate,
+};
 pub use gpu::{DisplayTopology, VirtioGpuDevice};
 pub use input::VirtioInputDevice;
 pub use iommu::{MAX_RESERVED_REGIONS, ReservedRegion, VirtioIommuDevice};
@@ -64,6 +68,7 @@ pub use pci::{
     p9_from_pci, rng_from_pci, snd_from_pci, virtio_pci_device_type, vsock_from_pci,
 };
 pub use queue::{MAX_CHAIN_BUFFERS, TransportBuffer, VirtQueue, VirtqueueError};
+pub use resume::{DeviceReset, QuiesceError, ReinitError};
 pub use rng::VirtioRngDevice;
 pub use snd::VirtioSndDevice;
 pub use transport::{

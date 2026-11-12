@@ -2,10 +2,13 @@ use async_lock::Mutex;
 
 use helios_hal::io::{IoError, IoResult};
 
-use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate};
-use crate::inflight::{InFlight, await_completion, submit_control};
+use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate, renegotiate};
+use crate::inflight::{
+    InFlight, await_completion, drain_to_idle, reinitialize_requests, submit_control,
+};
 use crate::notify::Notify;
 use crate::queue::{ControlSlots, Part, TransportBuffer, VirtQueue, control_slots};
+use crate::resume::{DeviceReset, QuiesceError, ReinitError, conclude, driver_ok};
 use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
 
 const REQUEST_QUEUE_INDEX: u16 = 0;
@@ -79,6 +82,36 @@ impl<T: VirtioTransport> VirtioRngDevice<T> {
         self.interrupts.notify_all();
     }
 
+    /// Waits for every request the device owns to complete, so the device
+    /// may be reset. See [`crate::resume`] for the contract; `expired`
+    /// says when the caller's deadline has passed.
+    pub fn quiesce(&self, mut expired: impl FnMut() -> bool) -> Result<(), QuiesceError> {
+        drain_to_idle(
+            &self.inflight,
+            &self.queue,
+            &self.transport,
+            REQUEST_QUEUE_INDEX,
+            &mut expired,
+        )
+    }
+
+    /// Brings a reset device back with the features it had, after
+    /// [`Self::quiesce`]. Entropy keeps no state outside its ring.
+    pub fn reinitialize(&self) -> Result<DeviceReset, ReinitError> {
+        conclude(&self.transport, self.restore(), |resumed| {
+            self.inflight.resume(resumed);
+        })
+    }
+
+    fn restore(&self) -> Result<DeviceReset, ReinitError> {
+        renegotiate(&self.transport, self.features)?;
+        reinitialize_requests(&self.queue, &self.transport, REQUEST_QUEUE_INDEX)?;
+        driver_ok(&self.transport);
+        Ok(DeviceReset {
+            device: DeviceType::Entropy,
+        })
+    }
+
     pub async fn fill(&self, buffer: &mut [u8]) -> IoResult<()> {
         if buffer.is_empty() {
             return Ok(());
@@ -124,7 +157,8 @@ impl<T: VirtioTransport> Drop for VirtioRngDevice<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DeviceType, IoError, VirtioRngDevice};
+    use super::{DeviceReset, DeviceType, IoError, QuiesceError, ReinitError, VirtioRngDevice};
+    use crate::features::RenegotiateError;
     use crate::testing::{ConfinedTransport, FakeTransport, FakeTransportConfig};
     use crate::transport::VirtioFeatures;
     use core::pin::pin;
@@ -348,6 +382,125 @@ mod tests {
         assert!(block_on(poll_once(fill.as_mut())).is_none());
         answer(&device, 1, &[2; 8]);
         assert_eq!(block_on(poll_once(fill.as_mut())), Some(Ok(())));
+    }
+
+    /// A device that offers a ring feature besides the mandatory one, so
+    /// a test can withdraw it.
+    fn device_with_event_idx() -> VirtioRngDevice<ConfinedTransport> {
+        VirtioRngDevice::new(FakeTransport::confined(FakeTransportConfig {
+            device_type: DeviceType::Entropy,
+            offered_features: VirtioFeatures::VERSION_1.bits()
+                | VirtioFeatures::RING_EVENT_IDX.bits(),
+            queue_size: 8,
+            supports_queue_reset: false,
+            absent_queues: &[],
+        }))
+        .expect("entropy device should initialize")
+    }
+
+    #[test]
+    fn quiesce_waits_for_the_requests_the_device_owns() {
+        let device = device();
+        let mut buffer = [0_u8; 16];
+        let mut fill = pin!(device.fill(&mut buffer));
+        assert!(block_on(poll_once(fill.as_mut())).is_none());
+
+        // The device answers while the quiesce spins.
+        let mut passes = 0;
+        device
+            .quiesce(|| {
+                passes += 1;
+                complete(&device, 0, 16);
+                false
+            })
+            .expect("the device answers inside the deadline");
+        assert_eq!(passes, 1);
+
+        assert_eq!(
+            block_on(poll_once(fill.as_mut())),
+            Some(Ok(())),
+            "the completion reaped during the quiesce is still the waiter's"
+        );
+    }
+
+    #[test]
+    fn quiesce_gives_up_when_the_deadline_passes() {
+        let device = device();
+        let mut buffer = [0_u8; 16];
+        let mut fill = pin!(device.fill(&mut buffer));
+        assert!(block_on(poll_once(fill.as_mut())).is_none());
+
+        assert_eq!(
+            device.quiesce(|| true),
+            Err(QuiesceError::RequestsStillInFlight {
+                device: DeviceType::Entropy,
+                queue: 0,
+                count: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn a_reset_device_serves_requests_again_with_the_features_it_had() {
+        let device = device();
+        let mut first = [0_u8; 16];
+        let mut fill = pin!(device.fill(&mut first));
+        assert!(block_on(poll_once(fill.as_mut())).is_none());
+        device
+            .quiesce(|| {
+                complete(&device, 0, 16);
+                false
+            })
+            .expect("the device answers inside the deadline");
+
+        device.transport.reset_behind_the_driver();
+        let reset = device
+            .reinitialize()
+            .expect("the device offers what it did");
+        assert_eq!(
+            reset,
+            DeviceReset {
+                device: DeviceType::Entropy
+            }
+        );
+
+        // The request that completed before the reset is collected after
+        // it, and the ring starts again from its first descriptor.
+        assert_eq!(block_on(poll_once(fill.as_mut())), Some(Ok(())));
+        assert_eq!(device.transport.driver_features(), device.features().bits());
+        assert_eq!(
+            device.transport.driver_reset_count(),
+            2,
+            "bring-up and the re-initialisation each ran the handshake from a reset"
+        );
+        let programmed = device.transport.programmed_queues();
+        assert_eq!(programmed.len(), 2);
+        assert_eq!(programmed[0], programmed[1]);
+        let mut second = [0_u8; 8];
+        let mut fill = pin!(device.fill(&mut second));
+        assert!(block_on(poll_once(fill.as_mut())).is_none());
+        complete(&device, 0, 8);
+        assert_eq!(block_on(poll_once(fill.as_mut())), Some(Ok(())));
+    }
+
+    #[test]
+    fn a_device_that_offers_fewer_features_after_the_reset_is_refused() {
+        let device = device_with_event_idx();
+        assert!(device.features().event_idx());
+        device.quiesce(|| false).expect("nothing is in flight");
+
+        device
+            .transport
+            .withdraw_features(VirtioFeatures::RING_EVENT_IDX.bits());
+        assert_eq!(
+            device.reinitialize(),
+            Err(ReinitError::Renegotiate(
+                RenegotiateError::FeatureWithdrawn {
+                    device: DeviceType::Entropy,
+                    bit: 29,
+                }
+            ))
+        );
     }
 
     #[test]

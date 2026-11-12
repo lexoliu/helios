@@ -49,12 +49,15 @@ use helios_hal::input::{
 use helios_hal::io::{IoError, IoResult};
 
 use crate::bus::DeviceBus;
-use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate};
-use crate::inflight::{InFlight, await_completion, submit_control};
+use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate, renegotiate};
+use crate::inflight::{
+    InFlight, await_completion, drain_to_idle, reinitialize_requests, submit_control,
+};
 use crate::notify::Notify;
 use crate::queue::{
     ControlSlots, Part, SlotPool, TransportBuffer, VirtQueue, control_slots, negotiated_queue_size,
 };
+use crate::resume::{DeviceReset, QuiesceError, ReinitError, conclude, driver_ok};
 use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
 
 /// The queue the device reports events on (virtio 1.2 §5.8.2).
@@ -220,6 +223,85 @@ impl<T: VirtioTransport> VirtioInputDevice<T> {
     pub fn handle_interrupt(&self) {
         self.transport.ack_interrupt();
         self.interrupts.notify_all();
+    }
+
+    /// Waits for every event the device owns on the status queue to
+    /// complete, so the device may be reset. See [`crate::resume`] for
+    /// the contract; `expired` says when the caller's deadline has
+    /// passed.
+    ///
+    /// The event queue holds buffers posted for the device to fill when
+    /// somebody presses a key, so it is not waited on.
+    pub fn quiesce(&self, mut expired: impl FnMut() -> bool) -> Result<(), QuiesceError> {
+        drain_to_idle(
+            &self.status_inflight,
+            &self.status_queue,
+            &self.transport,
+            STATUS_QUEUE_INDEX,
+            &mut expired,
+        )
+    }
+
+    /// Brings a reset device back with the features it had, after
+    /// [`Self::quiesce`].
+    ///
+    /// The configuration register file is read again, once, and must
+    /// describe the device the driver brought up: a different name, ids
+    /// or set of axes is a different device, and everything above this
+    /// driver was built on what the first read said. The event ring is
+    /// stocked again, and any event it held is discarded.
+    pub fn reinitialize(&self) -> Result<DeviceReset, ReinitError> {
+        conclude(&self.transport, self.restore(), |resumed| {
+            self.status_inflight.resume(resumed);
+        })
+    }
+
+    fn restore(&self) -> Result<DeviceReset, ReinitError> {
+        let device = DeviceType::Input;
+        renegotiate(&self.transport, self.features)?;
+        reinitialize_requests(&self.status_queue, &self.transport, STATUS_QUEUE_INDEX)?;
+        {
+            let mut events = self.events.try_lock().ok_or(ReinitError::QueueBusy {
+                device,
+                queue: EVENT_QUEUE_INDEX,
+            })?;
+            let EventRing {
+                queue,
+                slots,
+                slot_for_token,
+            } = &mut *events;
+            queue.reinitialize_discarding(&self.transport)?;
+            queue
+                .restock(&self.transport, slots.slots_mut(), slot_for_token)
+                .map_err(|error| ReinitError::Restore {
+                    device,
+                    what: "the event buffers",
+                    error,
+                })?;
+        }
+        // The register file is read before `DRIVER_OK`, exactly as at
+        // bring-up, by the one processor that can reach the device.
+        let capabilities =
+            read_capabilities(&self.transport).map_err(|error| ReinitError::Restore {
+                device,
+                what: "the device description",
+                error,
+            })?;
+        if capabilities != self.capabilities {
+            return Err(ReinitError::DeviceChanged {
+                device,
+                what: "the device description",
+            });
+        }
+        driver_ok(&self.transport);
+        self.events
+            .try_lock()
+            .expect("the event lock was just released")
+            .queue
+            .notify(&self.transport);
+        // A reader parked on an empty ring has nothing new to be woken
+        // for, and the next event arrives through the device's interrupt.
+        Ok(DeviceReset { device })
     }
 
     /// Takes one event out of the ring, if the device has published
@@ -504,6 +586,8 @@ mod tests {
         CFG_ABS_INFO, CFG_ID_DEVIDS, CFG_ID_NAME, CFG_ID_SERIAL, CFG_PROP_BITS, DeviceType,
         EVENT_BYTES, IoError, VirtioInputDevice, encode_event,
     };
+    use super::{DeviceReset, QuiesceError, ReinitError};
+    use crate::features::RenegotiateError;
     use crate::testing::{ConfinedTransport, FakeTransport, FakeTransportConfig};
     use crate::transport::VirtioFeatures;
     use alloc::format;
@@ -879,6 +963,111 @@ mod tests {
         assert!(
             device.status_inflight.is_idle(0),
             "the answer to the dropped request released its slot"
+        );
+    }
+
+    fn complete_status(device: &VirtioInputDevice<ConfinedTransport>, token: u16) {
+        device
+            .status_queue
+            .try_lock()
+            .expect("nobody holds the status queue")
+            .device_complete(token, 0);
+    }
+
+    #[test]
+    fn quiesce_waits_for_an_indicator_update_in_flight() {
+        let device = VirtioInputDevice::new(keyboard()).expect("a keyboard initializes");
+        let mut led = pin!(device.set_led(codes::LED_CAPSL, true));
+        assert!(block_on(poll_once(led.as_mut())).is_none());
+
+        let mut passes = 0;
+        device
+            .quiesce(|| {
+                passes += 1;
+                complete_status(&device, 0);
+                false
+            })
+            .expect("the device answers inside the deadline");
+        assert_eq!(passes, 1);
+        assert_eq!(block_on(poll_once(led.as_mut())), Some(Ok(())));
+    }
+
+    #[test]
+    fn quiesce_gives_up_when_the_deadline_passes() {
+        let device = VirtioInputDevice::new(keyboard()).expect("a keyboard initializes");
+        let mut led = pin!(device.set_led(codes::LED_CAPSL, true));
+        assert!(block_on(poll_once(led.as_mut())).is_none());
+
+        assert_eq!(
+            device.quiesce(|| true),
+            Err(QuiesceError::RequestsStillInFlight {
+                device: DeviceType::Input,
+                queue: 1,
+                count: 1,
+            })
+        );
+    }
+
+    /// The events the device had not been asked for stay in the ring
+    /// when it is quiesced, and the reset discards them: the pool is
+    /// posted again whole, so the first event after the reset is read
+    /// from a slot the device was handed after it came back.
+    #[test]
+    fn a_reset_device_is_stocked_again_with_the_features_it_had() {
+        let device = VirtioInputDevice::new(tablet()).expect("a tablet initializes");
+        let event = InputEvent::new(codes::EV_ABS, codes::ABS_X, 7);
+        report(&device, 0, event);
+        device.quiesce(|| false).expect("nothing is in flight");
+
+        device.transport.reset_behind_the_driver();
+        assert_eq!(
+            device.reinitialize(),
+            Ok(DeviceReset {
+                device: DeviceType::Input
+            })
+        );
+        assert_eq!(device.transport.driver_features(), device.features().bits());
+        assert_eq!(device.transport.driver_reset_count(), 2);
+
+        // The completion from before the reset belonged to a ring that
+        // no longer exists.
+        assert!(block_on(poll_once(pin!(device.next_event()))).is_none());
+        report(&device, 0, event);
+        assert_eq!(
+            block_on(poll_once(pin!(device.next_event()))),
+            Some(Ok(event))
+        );
+    }
+
+    #[test]
+    fn a_device_that_offers_fewer_features_after_the_reset_is_refused() {
+        let device = VirtioInputDevice::new(tablet()).expect("a tablet initializes");
+        device
+            .transport
+            .withdraw_features(VirtioFeatures::VERSION_1.bits());
+        assert_eq!(
+            device.reinitialize(),
+            Err(ReinitError::Renegotiate(
+                RenegotiateError::FeatureWithdrawn {
+                    device: DeviceType::Input,
+                    bit: 32,
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn a_device_that_describes_itself_differently_is_refused() {
+        let device = VirtioInputDevice::new(keyboard()).expect("a keyboard initializes");
+        device
+            .transport
+            .set_config_block(CFG_ID_NAME, 0, b"another keyboard\0");
+        assert_eq!(
+            device.reinitialize(),
+            Err(ReinitError::DeviceChanged {
+                device: DeviceType::Input,
+                what: "the device description",
+            })
         );
     }
 

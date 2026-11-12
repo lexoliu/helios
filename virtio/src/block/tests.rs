@@ -765,6 +765,129 @@ fn requests_are_pipelined_and_completed_out_of_order() {
 }
 
 #[test]
+fn quiesce_waits_for_every_request_in_flight_and_leaves_the_answers_for_their_waiters() {
+    let device = device();
+    let first_token = next_token(&device);
+    let mut read_first = pin!(device.read(0, TestBuffer::new(&device, 512)));
+    assert!(block_on(poll_once(read_first.as_mut())).is_none());
+    let second_token = next_token(&device);
+    let mut read_second = pin!(device.read(1, TestBuffer::new(&device, 512)));
+    assert!(block_on(poll_once(read_second.as_mut())).is_none());
+
+    // The device answers while the quiesce spins, the later request
+    // first.
+    let mut answers = [(second_token, 0x22_u8), (first_token, 0x11_u8)].into_iter();
+    let mut passes = 0;
+    device
+        .quiesce(|| {
+            passes += 1;
+            if let Some((token, byte)) = answers.next() {
+                answer(&device, token, &read_response(byte, 512));
+            }
+            false
+        })
+        .expect("the device answers inside the deadline");
+    assert_eq!(passes, 2);
+    assert_eq!(ring(&device).in_flight_chains(), 0);
+
+    let (_, first) =
+        answered(block_on(poll_once(read_first.as_mut())).expect("the first read is done"));
+    assert_eq!(first.bytes(), [0x11_u8; 512]);
+    let (_, second) =
+        answered(block_on(poll_once(read_second.as_mut())).expect("the second read is done"));
+    assert_eq!(second.bytes(), [0x22_u8; 512]);
+}
+
+#[test]
+fn quiesce_gives_up_when_the_deadline_passes() {
+    let device = device();
+    let mut read = pin!(device.read(0, TestBuffer::new(&device, 512)));
+    assert!(block_on(poll_once(read.as_mut())).is_none());
+
+    assert_eq!(
+        device.quiesce(|| true),
+        Err(QuiesceError::RequestsStillInFlight {
+            device: DeviceType::Block,
+            queue: 0,
+            count: 1,
+        })
+    );
+}
+
+#[test]
+fn a_reset_device_serves_requests_again_with_the_features_it_had() {
+    let device = device_with(BLK_F_RO, |_| {});
+    let mut read = pin!(device.read(0, TestBuffer::new(&device, 512)));
+    assert!(block_on(poll_once(read.as_mut())).is_none());
+    device
+        .quiesce(|| {
+            answer(&device, 0, &read_response(0x5a, 512));
+            false
+        })
+        .expect("the device answers inside the deadline");
+
+    device.object().transport.reset_behind_the_driver();
+    assert_eq!(
+        device.reinitialize(),
+        Ok(DeviceReset {
+            device: DeviceType::Block
+        })
+    );
+
+    let (_, done) =
+        answered(block_on(poll_once(read.as_mut())).expect("the answer from before the reset"));
+    assert_eq!(done.bytes(), [0x5a_u8; 512]);
+    let transport = &device.object().transport;
+    assert_eq!(transport.driver_features(), device.features().bits());
+    let programmed = transport.programmed_queues();
+    assert_eq!(programmed.len(), 2);
+    assert_eq!(programmed[0], programmed[1]);
+
+    // The ring starts again from its first descriptor and works.
+    assert_eq!(next_token(&device), 0);
+    let mut again = pin!(device.read(1, TestBuffer::new(&device, 512)));
+    assert!(block_on(poll_once(again.as_mut())).is_none());
+    assert_eq!(request_of(&device, 0), header(ReqType::In, 1));
+    complete(&device, 0, &read_response(0x6b, 512));
+    let (_, done) =
+        answered(block_on(poll_once(again.as_mut())).expect("the read after the reset"));
+    assert_eq!(done.bytes(), [0x6b_u8; 512]);
+}
+
+#[test]
+fn a_device_that_offers_fewer_features_after_the_reset_is_refused() {
+    let device = device_with(BLK_F_RO, |_| {});
+    device.object().transport.withdraw_features(BLK_F_RO);
+
+    assert_eq!(
+        device.reinitialize(),
+        Err(ReinitError::Renegotiate(
+            crate::features::RenegotiateError::FeatureWithdrawn {
+                device: DeviceType::Block,
+                bit: 5,
+            }
+        ))
+    );
+}
+
+#[test]
+fn a_disk_of_another_size_after_the_reset_is_refused() {
+    let device = device();
+    device
+        .object()
+        .transport
+        .set_config_u32(CFG_CAPACITY_LOW, TEST_CAPACITY_SECTORS * 2);
+
+    assert_eq!(
+        device.reinitialize(),
+        Err(ReinitError::DeviceChanged {
+            device: DeviceType::Block,
+            what: "capacity",
+        })
+    );
+}
+
+#[test]
 fn a_readonly_device_refuses_writes() {
     let device = device_with(BLK_F_RO, |_| {});
 
@@ -1386,6 +1509,97 @@ fn swap_extents_are_reused_and_coalesced() {
     let mut state = backend.state.lock();
     assert_eq!(state.free.len(), 1);
     assert_eq!(state.available_blocks(), 8);
+}
+
+/// Every field of the configuration space the driver sized its
+/// requests or reported its geometry from is compared after a reset,
+/// not only the capacity.
+#[test]
+fn a_device_whose_limits_changed_after_the_reset_is_refused() {
+    let features = BLK_F_SIZE_MAX
+        | BLK_F_SEG_MAX
+        | BLK_F_BLK_SIZE
+        | BLK_F_TOPOLOGY
+        | BLK_F_CONFIG_WCE
+        | BLK_F_DISCARD
+        | BLK_F_WRITE_ZEROES;
+    type Change = fn(&ConfinedTransport);
+    let changes: [(&str, Change); 8] = [
+        ("seg_max", |t| t.set_config_u32(CFG_SEG_MAX, 8)),
+        ("size_max", |t| t.set_config_u32(CFG_SIZE_MAX, 8192)),
+        ("blk_size", |t| t.set_config_u32(CFG_BLK_SIZE, 512)),
+        ("topology", |t| t.set_config_u16(CFG_MIN_IO_SIZE, 4)),
+        ("writeback", |t| t.set_config_u8(CFG_WRITEBACK, 0)),
+        ("discard", |t| t.set_config_u32(CFG_MAX_DISCARD_SECTORS, 1)),
+        ("write zeroes", |t| {
+            t.set_config_u32(CFG_MAX_WRITE_ZEROES_SECTORS, 1);
+        }),
+        ("write zeroes segments", |t| {
+            t.set_config_u32(CFG_MAX_WRITE_ZEROES_SEG, 1);
+        }),
+    ];
+    for (name, change) in changes {
+        let device = device_with(features, |transport| {
+            transport.set_config_u32(CFG_SEG_MAX, 4);
+            transport.set_config_u32(CFG_SIZE_MAX, 16384);
+            transport.set_config_u32(CFG_BLK_SIZE, 4096);
+            transport.set_config_u16(CFG_MIN_IO_SIZE, 2);
+            transport.set_config_u8(CFG_WRITEBACK, 1);
+            transport.set_config_u32(CFG_MAX_DISCARD_SECTORS, 64);
+            transport.set_config_u32(CFG_MAX_DISCARD_SEG, 2);
+            transport.set_config_u32(CFG_MAX_WRITE_ZEROES_SECTORS, 64);
+            transport.set_config_u32(CFG_MAX_WRITE_ZEROES_SEG, 2);
+        });
+        change(&device.object().transport);
+
+        assert!(
+            matches!(
+                device.reinitialize(),
+                Err(ReinitError::DeviceChanged { .. })
+            ),
+            "a changed {name} must be refused"
+        );
+    }
+}
+
+/// A multi-queue device has every queue programmed again, not only the
+/// first.
+#[test]
+fn every_queue_of_a_multi_queue_device_is_programmed_again() {
+    let transport = FakeTransport::new(FakeTransportConfig {
+        device_type: DeviceType::Block,
+        offered_features: VirtioFeatures::VERSION_1.bits() | BLK_F_MQ,
+        queue_size: 8,
+        supports_queue_reset: false,
+        absent_queues: &[],
+    });
+    transport.set_config_u32(CFG_CAPACITY_LOW, TEST_CAPACITY_SECTORS);
+    transport.set_config_u16(CFG_NUM_QUEUES, 2);
+    let device = VirtioBlockDevice::<_, _, TestBuffer>::new(transport, FakeAffinity::<2>)
+        .expect("a two-queue device comes up")
+        .into_resource(BlockDeviceRights::READ | BlockDeviceRights::WRITE);
+    assert_eq!(device.queue_count(), 2);
+    device.quiesce(|| false).expect("both queues are idle");
+
+    device.object().transport.reset_behind_the_driver();
+    assert_eq!(
+        device.reinitialize(),
+        Ok(DeviceReset {
+            device: DeviceType::Block
+        })
+    );
+
+    let programmed = device.object().transport.programmed_queues();
+    for index in 0..2 {
+        assert_eq!(
+            programmed
+                .iter()
+                .filter(|queue| queue.index == index)
+                .count(),
+            2,
+            "queue {index} is programmed at bring-up and again after the reset"
+        );
+    }
 }
 
 #[test]

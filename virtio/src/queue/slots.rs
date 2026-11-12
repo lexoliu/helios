@@ -484,6 +484,17 @@ impl<B: DmaBuffer> SlotPool<B> {
         })
     }
 
+    /// Every slot, in index order: what a ring re-programmed on a reset
+    /// device posts again, at the memory it already had.
+    pub(crate) fn slots_mut(&mut self) -> core::slice::ChunksExactMut<'_, u8> {
+        // SAFETY: the allocation holds `count` slots of `slot_bytes`, and
+        // `&mut self` is the only handle to it.
+        let bytes = unsafe {
+            core::slice::from_raw_parts_mut(self.buffer.as_ptr(), self.count * self.slot_bytes)
+        };
+        bytes.chunks_exact_mut(self.slot_bytes)
+    }
+
     /// Slot `index`.
     ///
     /// # Panics
