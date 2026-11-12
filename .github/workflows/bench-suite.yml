@@ -72,12 +72,19 @@ on:
 # A label other than `bench` runs nothing (`tooling` skips, and every
 # other job needs it) and takes a group of its own, so it cannot cancel a
 # measurement hours in (#687).
+#
+# Only a new head cancels: a push, a dispatch and a pull request's
+# `synchronize` supersede the older run of their group. `opened`,
+# `reopened`, `labeled` and `ready_for_review` carry a head a run may
+# already be measuring and queue behind it, because a run cancelled before
+# its matrix expands leaves a failed check named after the unexpanded
+# expression that nothing replaces.
 concurrency:
   group: >-
     ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}${{
       github.event.action == 'labeled' && github.event.label.name != 'bench'
       && format('-label-{0}', github.run_id) || '' }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name != 'pull_request' || github.event.action == 'synchronize' }}
 
 permissions:
   contents: read
@@ -96,10 +103,16 @@ jobs:
   # The job itself runs on every event that runs anything: a skipped
   # ancestor fails the implicit `success()` of every job after `tooling`,
   # so skipping it here would skip the profile collections of a dispatch
-  # and a push (#860). A label other than `bench` runs nothing.
+  # and a push (#860). A label other than `bench` runs nothing, and nor do
+  # `opened` and `ready_for_review` on a pull request that carries
+  # `bench`: its `labeled` event measures that head, so the pair is not
+  # built twice. A new head (`synchronize`) and `reopened` still run.
   changes:
     name: changes
-    if: github.event.action != 'labeled' || github.event.label.name == 'bench'
+    if: >-
+      (github.event.action != 'labeled' || github.event.label.name == 'bench')
+      && !((github.event.action == 'opened' || github.event.action == 'ready_for_review')
+      && contains(github.event.pull_request.labels.*.name, 'bench'))
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
