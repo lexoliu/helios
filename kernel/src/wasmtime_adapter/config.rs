@@ -1,4 +1,4 @@
-use wasmtime::{Config, StackLimitLocation};
+use wasmtime::{Config, ModuleVersionStrategy, StackLimitLocation};
 
 pub use crate::component::{
     COMPONENT_ASYNC_STACK_SIZE, MAX_CONCURRENT_INSTANCES, MAX_CORE_INSTANCES_PER_COMPONENT,
@@ -34,6 +34,19 @@ pub fn build_target_engine_config(target: &str) -> Config {
         // ABI, so Wasmtime's x86_64-unknown-none soft-float guard does not
         // apply to this kernel build.
         config.x86_float_abi_ok(true);
+    }
+    // The engine has no compiler, so it cannot compare an artifact's signing
+    // flags against its own. It requires the protection the target's
+    // Cranelift producers emit through the artifact's version string instead,
+    // and refuses any other artifact, Winch output included. Nothing depends
+    // on the processor: signed code runs on processors without pointer
+    // authentication, where the signing instructions do nothing.
+    if let Some(version) = helios_artifact::cwasm_target_code_protection(target)
+        .module_version(ModuleVersionStrategy::WasmtimeVersion.as_str())
+    {
+        config
+            .module_version(ModuleVersionStrategy::Custom(version))
+            .expect("the code protection version string must be accepted by Wasmtime");
     }
     config
 }

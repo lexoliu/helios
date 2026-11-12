@@ -676,6 +676,16 @@ class ComparedCells:
     candidate: Cell
     rebuild: Cell | None = None
     first_pass: dict[Column, Cell] = field(default_factory=dict)
+    baseline_workload: WorkloadResult | None = None
+
+    @property
+    def matched_metrics(self) -> frozenset[str]:
+        """Metrics either run's record holds matched: a baseline built before a
+        metric existed has no record of it, and the candidate's does."""
+        names = set(self.workload.matched_metrics)
+        if self.baseline_workload is not None:
+            names.update(self.baseline_workload.matched_metrics)
+        return frozenset(names)
 
 
 def series(cell: Cell, measurement: str) -> SeriesStats | None:
@@ -760,6 +770,9 @@ def gate_rows(
         for metric in sorted(set(base_cell.metrics) | set(cand_cell.metrics)):
             if metric.endswith(SAMPLE_COUNT_SUFFIX):
                 # Context for the percentiles beside it, not a row.
+                continue
+            if metric in compared.matched_metrics:
+                # A condition the comparison is held at, not a measurement.
                 continue
             before = base_cell.metrics.get(metric)
             after = cand_cell.metrics.get(metric)
@@ -887,7 +900,14 @@ def evaluate(baseline: Report, candidate: Report) -> GateResult:
             continue
         # Two jobs: neither run's rebuild column or reconfirm boots
         # measured anything about the other run's machine.
-        pairs.append(ComparedCells(workload=workload, baseline=base_cell, candidate=cand_cell))
+        pairs.append(
+            ComparedCells(
+                workload=workload,
+                baseline=base_cell,
+                candidate=cand_cell,
+                baseline_workload=before,
+            )
+        )
     bound = candidate.thresholds.cv_bound
     rows, unpaired = gate_rows(pairs, floor, bound)
     # Two runs of one lane are two machines as often as they are one

@@ -10,6 +10,8 @@ mod audio;
 mod bootfs;
 mod buffer;
 mod component;
+#[cfg(feature = "wasmtime-runtime")]
+mod control_flow;
 mod device;
 mod display;
 mod embedded;
@@ -156,8 +158,8 @@ pub use kernel_exception::{
     dispatch_native_trap, install_native_trap_handler,
 };
 pub use machine::{
-    AdvanceCause, Generation, MachineGeneration, MachineGenerationHandle, UnhandledAdvances,
-    install_generation_reactions,
+    AdvanceCause, DeviceResets, Generation, MachineGeneration, MachineGenerationHandle,
+    ResetDevice, UnhandledAdvances, install_generation_reactions,
 };
 pub use memory::{
     AGE_BATCH_PAGES, AccessibilityPlan, BalloonHandle, BalloonStats, BootMemoryPlan,
@@ -198,8 +200,8 @@ pub use network::{
     validate_http_path_with_query, validate_http_status_code,
 };
 pub use process::{
-    AudioClaimCap, ClockAuthorityRights, DescriptorEntry, DescriptorId, DescriptorLimit,
-    DescriptorTable, DescriptorTableError, DeviceClassRights, DeviceGrantClaimCap,
+    AudioClaimCap, ClockAuthorityRights, CompileAuthority, DescriptorEntry, DescriptorId,
+    DescriptorLimit, DescriptorTable, DescriptorTableError, DeviceClassRights, DeviceGrantClaimCap,
     DirectoryAuthorityRights, DirectoryCap, DirectoryPreopen, DisplayClaimCap, DnsCap,
     ExecAuthority, ForkAuthority, FutexKey, FutexTable, FutexWaitRegistration, GpuClaimCap,
     GuestAddress, InputClaimCap, JoinAuthority, LinkAuthorityRights, LinkSourceCap,

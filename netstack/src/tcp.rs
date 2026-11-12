@@ -1813,11 +1813,23 @@ where
         } else {
             u32::try_from(payload_len).unwrap_or(u32::MAX)
         };
+        // RFC 7323 section 3.2: TSval is the clock when the segment is
+        // sent, and a retransmission is sent now. Its ACK then echoes
+        // this transmission, so the echo is a round trip of it alone
+        // (section 4.1) and not of the wait since the first one.
+        let options = if in_flight.options.timestamp().is_some() {
+            in_flight.options.with_timestamp(TcpTimestampOption {
+                value: timestamp_value(now_nanos),
+                echo_reply: self.peer_timestamp.map_or(0, |timestamp| timestamp.value),
+            })
+        } else {
+            in_flight.options
+        };
         Some(TcpTransmitSegment {
             local,
             remote,
             header: in_flight.header,
-            options: in_flight.options,
+            options,
             payload: in_flight.payload.slice(..payload_len),
             sequence_len,
             segment_bytes: payload_len as u32,
@@ -3845,6 +3857,61 @@ mod tests {
                 interval_nanos: 123,
             }
         );
+    }
+
+    #[test]
+    fn a_retransmission_is_acknowledged_with_a_round_trip_of_its_own() {
+        let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, BbrV3::new(1460));
+        socket.mark_syn_queued(0);
+        let _ = deliver_segment(
+            &mut socket,
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 100,
+                acknowledgement: 8,
+                flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                window_size: u16::MAX,
+                options: TcpOptions::parse(&[8, 10, 0, 0, 0, 9, 0, 0, 0, 0])
+                    .expect("timestamp option should parse"),
+                payload: &[],
+            },
+            TCP_INITIAL_RTO_NANOS,
+        );
+        socket.mark_ack_queued();
+        assert_eq!(socket.queue_send(b"hello"), 5);
+        let sent_at = 2 * TCP_INITIAL_RTO_NANOS;
+        let first = socket
+            .take_transmit_segment(sent_at, TcpSegmentBudget::wire_segments(usize::MAX))
+            .expect("established socket should transmit queued bytes");
+
+        let retransmitted_at = sent_at + socket.retransmission_timer.timeout_nanos();
+        let retransmission = socket
+            .pending_retransmission(retransmitted_at)
+            .expect("the segment should come due after its timeout");
+        socket.mark_retransmission_queued(first.header.sequence, retransmitted_at);
+        let echoed = retransmission
+            .options
+            .timestamp()
+            .expect("the retransmission carries a timestamp");
+
+        let round_trip = 3_000_000;
+        let acked_at = retransmitted_at + round_trip;
+        let timing = socket.ack_sample_timing(
+            first.header.sequence + first.sequence_len,
+            acked_at,
+            Some(TcpTimestampOption {
+                value: 10,
+                echo_reply: echoed.value,
+            }),
+        );
+
+        assert!(
+            timing.rtt_nanos <= round_trip,
+            "a sample of {} ns is longer than the {round_trip} ns since the retransmission",
+            timing.rtt_nanos
+        );
+        assert_eq!(echoed.value, timestamp_value(retransmitted_at));
     }
 
     #[test]
