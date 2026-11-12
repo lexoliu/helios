@@ -519,12 +519,28 @@ pub(crate) enum VmSessionError {
 /// Every one of them fails the same way — the guest refused or never
 /// answered — so the step is what tells them apart in the message.
 #[derive(Debug, thiserror::Error)]
-#[error("failed to {step}: {source}")]
-pub(crate) struct ProfilingStepError {
-    /// The profiling step, spelled the way the message reads it.
-    step: &'static str,
-    #[source]
-    source: helios_inspector_protocol::RpcError,
+pub(crate) enum ProfilingStepError {
+    #[error("failed to {step}: {source}")]
+    Rpc {
+        /// The profiling step, spelled the way the message reads it.
+        step: &'static str,
+        #[source]
+        source: helios_inspector_protocol::RpcError,
+    },
+    /// The guest answered a read but refused its filter as too large.
+    #[error("the guest refused the filter to {step}: {source}")]
+    FilterRefused {
+        step: &'static str,
+        #[source]
+        source: system_profiling::FilterError,
+    },
+    /// The guest answered a control but refused it: the session does not
+    /// hold the right to observe the machine.
+    #[error("the guest refused to {step}: {source:?}")]
+    ControlRefused {
+        step: &'static str,
+        source: system_profiling::ControlError,
+    },
 }
 
 /// Why an `aot-bench` run did not produce its measurements.
@@ -3858,7 +3874,7 @@ fn run_workload_bench(
         let before_profile = if collect_profile {
             guest_step_under_deadline("the profile reset", seconds, &vcpus, async {
                 Ok::<_, VmSessionError>(
-                    profiling_step(
+                    profiling_control_step(
                         "clear remote profile samples",
                         system_profiling::clear(&client),
                     )
@@ -3868,7 +3884,7 @@ fn run_workload_bench(
             .await?;
             guest_step_under_deadline("the profiler hand-off", seconds, &vcpus, async {
                 Ok::<_, VmSessionError>(
-                    profiling_step(
+                    profiling_control_step(
                         "enable remote profiling",
                         system_profiling::set_enabled(&client, true),
                     )
@@ -3878,7 +3894,7 @@ fn run_workload_bench(
             .await?;
             guest_step_under_deadline("the initial profile read", seconds, &vcpus, async {
                 Ok::<_, VmSessionError>(
-                    profiling_step(
+                    profiling_read_step(
                         "read initial remote profile samples",
                         system_profiling::folded(&client, &profile_filter, 0),
                     )
@@ -3913,7 +3929,7 @@ fn run_workload_bench(
         if collect_profile {
             guest_step_under_deadline("the profiler stop", seconds, &vcpus, async {
                 Ok::<_, VmSessionError>(
-                    profiling_step(
+                    profiling_control_step(
                         "disable remote profiling",
                         system_profiling::set_enabled(&client, false),
                     )
@@ -3924,7 +3940,7 @@ fn run_workload_bench(
             let after_profile =
                 guest_step_under_deadline("the final profile read", seconds, &vcpus, async {
                     Ok::<_, VmSessionError>(
-                        profiling_step(
+                        profiling_read_step(
                             "read final remote profile samples",
                             system_profiling::folded(&client, &profile_filter, 0),
                         )
@@ -3935,7 +3951,7 @@ fn run_workload_bench(
             let metrics =
                 guest_step_under_deadline("the perf metric read", seconds, &vcpus, async {
                     Ok::<_, VmSessionError>(
-                        profiling_step(
+                        profiling_read_step(
                             "read final remote perf metrics",
                             system_profiling::metrics(&client, &metric_filter, 0),
                         )
@@ -3970,7 +3986,38 @@ async fn profiling_step<T>(
     call: impl std::future::Future<Output = Result<T, helios_inspector_protocol::RpcError>>,
 ) -> Result<T, ProfilingStepError> {
     call.await
-        .map_err(|source| ProfilingStepError { step, source })
+        .map_err(|source| ProfilingStepError::Rpc { step, source })
+}
+
+/// A profiling control, which the guest refuses to a session that lacks
+/// the right to observe the machine.
+async fn profiling_control_step(
+    step: &'static str,
+    call: impl std::future::Future<
+        Output = Result<
+            Result<(), system_profiling::ControlError>,
+            helios_inspector_protocol::RpcError,
+        >,
+    >,
+) -> Result<(), ProfilingStepError> {
+    profiling_step(step, call)
+        .await?
+        .map_err(|source| ProfilingStepError::ControlRefused { step, source })
+}
+
+/// A profiling read, whose filter the guest may refuse as too large.
+async fn profiling_read_step<T>(
+    step: &'static str,
+    call: impl std::future::Future<
+        Output = Result<
+            Result<T, system_profiling::FilterError>,
+            helios_inspector_protocol::RpcError,
+        >,
+    >,
+) -> Result<T, ProfilingStepError> {
+    profiling_step(step, call)
+        .await?
+        .map_err(|source| ProfilingStepError::FilterRefused { step, source })
 }
 
 /// Fetches and prints the guest's recent tracing events (info level and
@@ -4035,17 +4082,17 @@ fn run_aot_bench(
             || command.user_profile_output.is_some()
             || command.perf_metrics_output.is_some();
         let before_profile = if collect_profile {
-            profiling_step(
+            profiling_control_step(
                 "clear remote profile samples",
                 system_profiling::clear(&client),
             )
             .await?;
-            profiling_step(
+            profiling_control_step(
                 "enable remote profiling",
                 system_profiling::set_enabled(&client, true),
             )
             .await?;
-            profiling_step(
+            profiling_read_step(
                 "read initial remote profile samples",
                 system_profiling::folded(&client, &profile_filter, 0),
             )
@@ -4116,17 +4163,17 @@ fn run_aot_bench(
             instruction_profile::stop(&client).await?;
         }
         if collect_profile {
-            profiling_step(
+            profiling_control_step(
                 "disable remote profiling",
                 system_profiling::set_enabled(&client, false),
             )
             .await?;
-            let after_profile = profiling_step(
+            let after_profile = profiling_read_step(
                 "read final remote profile samples",
                 system_profiling::folded(&client, &profile_filter, 0),
             )
             .await?;
-            let metrics = profiling_step(
+            let metrics = profiling_read_step(
                 "read final remote perf metrics",
                 system_profiling::metrics(&client, &metric_filter, 0),
             )

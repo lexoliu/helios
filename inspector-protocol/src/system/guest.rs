@@ -8,7 +8,7 @@ use crate::error::DispatchError;
 use crate::system::accept;
 use crate::system::server::{self, Dispatcher};
 
-use super::bindings::helios::system::{instances, profiling, programs, stats, tracing};
+use super::bindings::helios::system::{filters, instances, profiling, programs, stats, tracing};
 use super::methods::{
     INSTANCES_INSTANCE, INSTANCES_KILL, INSTANCES_SNAPSHOT, PROFILING_CLEAR, PROFILING_FOLDED,
     PROFILING_INSTANCE, PROFILING_INSTRUCTION_SAMPLES, PROFILING_METRICS,
@@ -200,6 +200,7 @@ async fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>,
                     host_tracing::TargetError::UnknownTarget(name) => {
                         tracing::TargetError::UnknownTarget(name)
                     }
+                    host_tracing::TargetError::Denied => tracing::TargetError::Denied,
                 });
             postcard::to_allocvec(&result).map_err(|source| DispatchError::Encode {
                 operation: "tracing.set-target-enabled",
@@ -213,9 +214,8 @@ async fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>,
                     source,
                 })?;
             let events = host_tracing::recent(&convert_filter(filter), limit)
-                .into_iter()
-                .map(convert_event)
-                .collect::<Vec<_>>();
+                .map(|events| events.into_iter().map(convert_event).collect::<Vec<_>>())
+                .map_err(convert_filter_error);
             postcard::to_allocvec(&events).map_err(|source| DispatchError::Encode {
                 operation: "tracing.recent",
                 source,
@@ -227,8 +227,8 @@ async fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>,
                     operation: "profiling.set-enabled",
                     source,
                 })?;
-            host_profiling::set_enabled(enabled);
-            postcard::to_allocvec(&()).map_err(|source| DispatchError::Encode {
+            let result = host_profiling::set_enabled(enabled).map_err(convert_control_error);
+            postcard::to_allocvec(&result).map_err(|source| DispatchError::Encode {
                 operation: "profiling.set-enabled",
                 source,
             })
@@ -239,8 +239,8 @@ async fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>,
                     operation: "profiling.clear",
                 });
             }
-            host_profiling::clear();
-            postcard::to_allocvec(&()).map_err(|source| DispatchError::Encode {
+            let result = host_profiling::clear().map_err(convert_control_error);
+            postcard::to_allocvec(&result).map_err(|source| DispatchError::Encode {
                 operation: "profiling.clear",
                 source,
             })
@@ -252,9 +252,13 @@ async fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>,
                     source,
                 })?;
             let samples = host_profiling::folded(&convert_profile_filter(filter), limit)
-                .into_iter()
-                .map(convert_profile_sample)
-                .collect::<Vec<_>>();
+                .map(|samples| {
+                    samples
+                        .into_iter()
+                        .map(convert_profile_sample)
+                        .collect::<Vec<_>>()
+                })
+                .map_err(convert_filter_error);
             postcard::to_allocvec(&samples).map_err(|source| DispatchError::Encode {
                 operation: "profiling.folded",
                 source,
@@ -267,9 +271,13 @@ async fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>,
                     source,
                 })?;
             let samples = host_profiling::metrics(&convert_metric_filter(filter), limit)
-                .into_iter()
-                .map(convert_metric_sample)
-                .collect::<Vec<_>>();
+                .map(|samples| {
+                    samples
+                        .into_iter()
+                        .map(convert_metric_sample)
+                        .collect::<Vec<_>>()
+                })
+                .map_err(convert_filter_error);
             postcard::to_allocvec(&samples).map_err(|source| DispatchError::Encode {
                 operation: "profiling.metrics",
                 source,
@@ -414,6 +422,15 @@ fn map_capability_grants_to_host(
                         .collect(),
                 })
             }
+            programs::CapabilityGrant::Diagnostics(grant) => {
+                host_programs::CapabilityGrant::Diagnostics(host_programs::DiagnosticsGrant {
+                    rights: grant
+                        .rights
+                        .into_iter()
+                        .map(map_diagnostics_right_to_host)
+                        .collect(),
+                })
+            }
         })
         .collect()
 }
@@ -481,6 +498,16 @@ fn map_device_class_to_host(class: programs::DeviceClass) -> host_programs::Devi
         programs::DeviceClass::Input => host_programs::DeviceClass::Input,
         programs::DeviceClass::Gpu => host_programs::DeviceClass::Gpu,
         programs::DeviceClass::Audio => host_programs::DeviceClass::Audio,
+    }
+}
+
+fn map_diagnostics_right_to_host(
+    right: programs::DiagnosticsRight,
+) -> host_programs::DiagnosticsRight {
+    match right {
+        programs::DiagnosticsRight::ObserveMachine => {
+            host_programs::DiagnosticsRight::ObserveMachine
+        }
     }
 }
 
@@ -706,6 +733,16 @@ fn convert_filter(filter: tracing::Filter) -> host_tracing::Filter {
     }
 }
 
+fn convert_filter_error(error: host_tracing::FilterError) -> filters::FilterError {
+    use filters::FilterError as Wire;
+    use host_tracing::FilterError as Host;
+
+    match error {
+        Host::TooManyPrefixes(limit) => Wire::TooManyPrefixes(limit),
+        Host::PrefixTooLong(limit) => Wire::PrefixTooLong(limit),
+    }
+}
+
 fn convert_raw_profile_error(error: host_profiling::RawProfileError) -> profiling::RawProfileError {
     use host_profiling::RawProfileError as Host;
     use profiling::RawProfileError as Wire;
@@ -716,6 +753,13 @@ fn convert_raw_profile_error(error: host_profiling::RawProfileError) -> profilin
         Host::MalformedSection(section) => Wire::MalformedSection(convert_profile_section(section)),
         Host::OutOfRange(len) => Wire::OutOfRange(len),
         Host::ReadTooLarge(limit) => Wire::ReadTooLarge(limit),
+        Host::Denied => Wire::Denied,
+    }
+}
+
+fn convert_control_error(error: host_profiling::ControlError) -> profiling::ControlError {
+    match error {
+        host_profiling::ControlError::Denied => profiling::ControlError::Denied,
     }
 }
 
@@ -759,6 +803,9 @@ fn convert_instruction_profile_error(
     match error {
         host_profiling::InstructionProfileError::NotCaptured => {
             profiling::InstructionProfileError::NotCaptured
+        }
+        host_profiling::InstructionProfileError::Denied => {
+            profiling::InstructionProfileError::Denied
         }
     }
 }

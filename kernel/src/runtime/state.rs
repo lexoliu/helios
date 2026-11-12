@@ -8,10 +8,10 @@ use triomphe::Arc;
 use crate::{
     BootPayload, DEFAULT_PERF_METRIC_CAPACITY, DEFAULT_PROFILE_STACK_CAPACITY,
     DEFAULT_TRACE_HISTORY_CAPACITY, EmbeddedBootFs, EmbeddedComponent, FoldedProfileSample,
-    FutexKey, FutexTable, FutexWaitRegistration, HEAP_SIZE_CLASS_COUNT, HeapStats,
+    FutexKey, FutexTable, FutexWaitRegistration, HEAP_SIZE_CLASS_COUNT, HeapStats, InstanceId,
     InstanceRegistry, InstructionSampler, Notify, PerfMetricFilter, PerfMetricHistory,
     PerfMetricSample, PerfSample, ProfileFilter, ProfileScope, ProfileSink, StatsSample,
-    TraceEvent, TraceFilter, TraceHistory,
+    TraceEvent, TraceFilter, TraceLog,
 };
 use crate::{MachineGeneration, MachineGenerationHandle, RootEntropy, RootEntropyHandle};
 use helios_hal::cpu::{HardwarePerfCounterDelta, Timebase};
@@ -116,7 +116,7 @@ struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     /// boot module at bring-up.
     payload: BootPayload,
     bootfs: Mutex<Option<EmbeddedBootFs>>,
-    tracing: Mutex<TraceHistory>,
+    tracing: TraceLog,
     /// The profile and perf histories, held as a handle rather than as
     /// fields so a subsystem this state owns can record into them
     /// without naming the state's own type (see [`ProfileSink`]).
@@ -353,7 +353,7 @@ where
                 futex_table: Mutex::new(FutexTable::new()),
                 payload,
                 bootfs: Mutex::new(Some(payload.bootfs())),
-                tracing: Mutex::new(TraceHistory::new(DEFAULT_TRACE_HISTORY_CAPACITY)),
+                tracing: TraceLog::new(DEFAULT_TRACE_HISTORY_CAPACITY),
                 profiles: ProfileSink::new(
                     DEFAULT_PROFILE_STACK_CAPACITY,
                     DEFAULT_PERF_METRIC_CAPACITY,
@@ -364,20 +364,35 @@ where
         }
     }
 
-    pub fn record_console_text(&self, current_ticks: u64, text: &str) {
+    /// Records `text` as console events attributed to `origin`: the
+    /// instance that wrote it, or `None` for the kernel's own console.
+    pub fn record_console_text(&self, current_ticks: u64, origin: Option<InstanceId>, text: &str) {
         let timestamp = self.ticks_to_nanos(current_ticks.saturating_sub(self.inner.boot_ticks));
         self.inner
             .tracing
-            .lock()
-            .record_console_text(timestamp, text);
+            .record_console_text(timestamp, origin, text);
     }
 
-    pub fn recent(&self, filter: &TraceFilter, limit: u32) -> alloc::vec::Vec<TraceEvent> {
-        self.inner.tracing.lock().recent(filter, limit)
+    /// The newest `limit` events `scope` admits and `filter` matches; see
+    /// [`TraceLog::recent`].
+    pub fn recent(
+        &self,
+        scope: &impl crate::ObservationScope,
+        filter: &TraceFilter,
+        limit: u32,
+    ) -> alloc::vec::Vec<Arc<TraceEvent>> {
+        self.inner.tracing.recent(scope, filter, limit)
     }
 
-    pub fn next_after(&self, cursor: u64, filter: &TraceFilter) -> Option<(u64, TraceEvent)> {
-        self.inner.tracing.lock().next_after(cursor, filter)
+    /// The next event after `*cursor` that `scope` admits and `filter`
+    /// matches; see [`TraceLog::next_after`].
+    pub fn next_after(
+        &self,
+        scope: &impl crate::ObservationScope,
+        cursor: &mut u64,
+        filter: &TraceFilter,
+    ) -> Option<Arc<TraceEvent>> {
+        self.inner.tracing.next_after(scope, cursor, filter)
     }
 
     pub fn set_profiling_enabled(&self, enabled: bool) {
@@ -494,35 +509,33 @@ where
             .record_str(scope, stack, weight_nanos);
     }
 
-    pub fn record_profile_stack_parts_nanos(
-        &self,
-        scope: ProfileScope,
-        prefix: &str,
-        suffix: &str,
-        weight_nanos: u64,
-    ) {
+    /// Records `weight_nanos` of time `instance`, running the program
+    /// named `program`, spent in user code, as the user-scope stack
+    /// `user;<program>` attributed to that instance.
+    ///
+    /// Concurrency: callable from any processor; it takes the profile
+    /// history's lock for one record.
+    pub fn record_user_profile(&self, instance: InstanceId, program: &str, weight_nanos: u64) {
         if !self.inner.profiles.enabled() {
             return;
         }
-        self.inner
-            .profiles
-            .profiling()
-            .lock()
-            .record_parts(scope, prefix, suffix, weight_nanos);
+        self.inner.profiles.profiling().lock().record_user_parts(
+            instance,
+            "user;",
+            program,
+            weight_nanos,
+        );
     }
 
     pub fn folded_profile(
         &self,
         current_ticks: u64,
+        scope: &impl crate::ObservationScope,
         filter: &ProfileFilter,
         limit: u32,
     ) -> alloc::vec::Vec<FoldedProfileSample> {
         let _ = current_ticks;
-        self.inner
-            .profiles
-            .profiling()
-            .lock()
-            .folded(filter, core::iter::empty(), limit)
+        self.inner.profiles.folded(scope, filter, limit)
     }
 
     pub fn record_perf_metric_parts(
@@ -644,14 +657,11 @@ where
 
     pub fn perf_metrics(
         &self,
+        scope: &impl crate::ObservationScope,
         filter: &PerfMetricFilter,
         limit: u32,
     ) -> alloc::vec::Vec<PerfMetricSample> {
-        self.inner
-            .profiles
-            .perf_metrics()
-            .lock()
-            .recent(filter, limit)
+        self.inner.profiles.metrics(scope, filter, limit)
     }
 
     pub fn ticks_to_nanos(&self, ticks: u64) -> u64 {
@@ -1184,8 +1194,8 @@ where
         RuntimeState::wall_clock_offset_nanos(self)
     }
 
-    fn record_console_text(&self, current_ticks: u64, text: &str) {
-        RuntimeState::record_console_text(self, current_ticks, text);
+    fn record_console_text(&self, current_ticks: u64, origin: Option<InstanceId>, text: &str) {
+        RuntimeState::record_console_text(self, current_ticks, origin, text);
     }
 
     fn root_entropy(&self) -> &RootEntropy {
@@ -1233,14 +1243,8 @@ where
         RuntimeState::record_profile_stack_nanos(self, scope, stack, weight_nanos);
     }
 
-    fn record_profile_stack_parts_nanos(
-        &self,
-        scope: ProfileScope,
-        prefix: &str,
-        suffix: &str,
-        weight_nanos: u64,
-    ) {
-        RuntimeState::record_profile_stack_parts_nanos(self, scope, prefix, suffix, weight_nanos);
+    fn record_user_profile(&self, instance: InstanceId, program: &str, weight_nanos: u64) {
+        RuntimeState::record_user_profile(self, instance, program, weight_nanos);
     }
 
     fn record_perf_metric_parts(
@@ -1272,8 +1276,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use alloc::vec;
-
     use super::*;
 
     /// A real-time clock whose reading the test moves, as a restore
@@ -1351,50 +1353,52 @@ mod tests {
         state.record_kernel_heap_metrics(current);
 
         let samples = state.perf_metrics(
+            &crate::test_support::test_observe_machine_cap(),
             &PerfMetricFilter {
-                name_prefixes: vec!["kernel;heap;".into()],
+                name_prefixes: crate::PrefixSet::from_prefixes(["kernel;heap;"])
+                    .expect("one short prefix fits the filter bounds"),
             },
             8,
         );
 
         let alloc = samples
             .iter()
-            .find(|sample| sample.name == "kernel;heap;alloc")
+            .find(|sample| &*sample.name == "kernel;heap;alloc")
             .expect("alloc metric should be recorded");
         assert_eq!(alloc.total_events, 3);
         assert_eq!(alloc.total_bytes, 96);
 
         let dealloc = samples
             .iter()
-            .find(|sample| sample.name == "kernel;heap;dealloc")
+            .find(|sample| &*sample.name == "kernel;heap;dealloc")
             .expect("dealloc metric should be recorded");
         assert_eq!(dealloc.total_events, 2);
         assert_eq!(dealloc.total_bytes, 64);
 
         let realloc = samples
             .iter()
-            .find(|sample| sample.name == "kernel;heap;realloc")
+            .find(|sample| &*sample.name == "kernel;heap;realloc")
             .expect("realloc metric should be recorded");
         assert_eq!(realloc.total_events, 1);
         assert_eq!(realloc.total_bytes, 128);
 
         let alloc_size = samples
             .iter()
-            .find(|sample| sample.name == "kernel;heap;alloc-size-0064")
+            .find(|sample| &*sample.name == "kernel;heap;alloc-size-0064")
             .expect("alloc size class metric should be recorded");
         assert_eq!(alloc_size.total_events, 2);
         assert_eq!(alloc_size.total_bytes, 96);
 
         let dealloc_size = samples
             .iter()
-            .find(|sample| sample.name == "kernel;heap;dealloc-size-0032")
+            .find(|sample| &*sample.name == "kernel;heap;dealloc-size-0032")
             .expect("dealloc size class metric should be recorded");
         assert_eq!(dealloc_size.total_events, 1);
         assert_eq!(dealloc_size.total_bytes, 32);
 
         let realloc_size = samples
             .iter()
-            .find(|sample| sample.name == "kernel;heap;realloc-size-0128")
+            .find(|sample| &*sample.name == "kernel;heap;realloc-size-0128")
             .expect("realloc size class metric should be recorded");
         assert_eq!(realloc_size.total_events, 1);
         assert_eq!(realloc_size.total_bytes, 128);

@@ -2921,16 +2921,16 @@ mod tests {
         profiles: &crate::ProfileSink,
     ) -> alloc::collections::BTreeMap<String, crate::PerfMetricSample> {
         profiles
-            .perf_metrics()
-            .lock()
-            .recent(
+            .metrics(
+                &crate::test_support::test_observe_machine_cap(),
                 &crate::PerfMetricFilter {
-                    name_prefixes: alloc::vec!["kernel;hostfs;".to_owned()],
+                    name_prefixes: crate::PrefixSet::from_prefixes(["kernel;hostfs;"])
+                        .expect("one short prefix fits the filter bounds"),
                 },
                 u32::MAX,
             )
             .into_iter()
-            .map(|sample| (sample.name.clone(), sample))
+            .map(|sample| (String::from(&*sample.name), sample))
             .collect()
     }
 

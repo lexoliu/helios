@@ -35,10 +35,11 @@ pub use idle::IdleOutcome;
 pub use in_flight::InFlight;
 pub use observer::{
     DEFAULT_PERF_METRIC_CAPACITY, DEFAULT_PROFILE_STACK_CAPACITY, DEFAULT_TRACE_HISTORY_CAPACITY,
-    FoldedProfileSample, PerfMetricFilter, PerfMetricHistory, PerfMetricSample, PerfSample,
-    ProfileFilter, ProfileHistory, ProfileScope, ProfileSink, StatsSample, TraceEvent, TraceField,
-    TraceFilter, TraceHistory, TraceLevel, TraceValue, matches_perf_metric_filter,
-    matches_profile_filter, matches_trace_filter, parse_console_text,
+    FoldedProfileSample, MAX_FILTER_PREFIX_BYTES, MAX_FILTER_PREFIXES, ObservationScope,
+    OwnInstance, PerfMetricFilter, PerfMetricHistory, PerfMetricSample, PerfSample, PrefixSet,
+    PrefixSetError, ProfileFilter, ProfileHistory, ProfileScope, ProfileSink, StatsSample,
+    TraceEvent, TraceField, TraceFilter, TraceHistory, TraceLevel, TraceLog, TraceValue,
+    matches_perf_metric_filter, matches_profile_filter, matches_trace_filter, parse_console_text,
 };
 pub use sync::{
     Mutex, MutexGuard, Notified, Notify, NotifyWaiter, OwnedRawMutexLease, OwnedRawRwLockReadLease,

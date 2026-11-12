@@ -119,11 +119,10 @@ where
 
     pub(super) fn record_user_ticks(&self, ticks: u64) {
         if self.runtime_state.profiling_enabled() {
-            self.runtime_state.record_profile_stack_parts(
-                ProfileScope::User,
-                "user;",
+            self.runtime_state.record_user_profile(
+                self.instance.id(),
                 self.instance.name(),
-                ticks,
+                self.runtime_state.ticks_to_nanos(ticks),
             );
         }
     }

@@ -2205,6 +2205,9 @@ pub(super) fn wasix_proc_spawn_inherited_non_directory_authority(
     // device does not: it belongs to the driver instance it was granted
     // to, not to that instance's children.
     authority.grant_device_classes(parent.device_class_rights());
+    // The observation right follows the shell the same way: the programs
+    // a launcher runs through `dash` observe the machine as it does.
+    authority.grant_diagnostic_rights(parent.diagnostic_rights());
     authority
 }
 
