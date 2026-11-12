@@ -38,15 +38,13 @@ use futures::channel::oneshot;
 use helios_hal::display::{
     CursorImage, DisplayMode, FramebufferId, PixelFormat, Point, Rect, ScanoutId, ScanoutList,
 };
-use helios_hal::pmm::PhysFrameRange;
 use triomphe::Arc;
 
-use concurrent_queue::ConcurrentQueue;
-
+use crate::buffer::Buffer;
 use crate::component::{ProviderError, ProviderSender};
 use crate::exec::{Notify, NotifyWaiter};
+use crate::process::DisplayClaimCap;
 
-use super::DisplayPins;
 use super::DisplayServiceError;
 
 /// Requests one claim may have in flight on each queue before its next
@@ -177,12 +175,15 @@ pub(crate) enum ControlRequest {
         scanout: ScanoutId,
         reply: oneshot::Sender<Result<DisplayMode, DisplayServiceError>>,
     },
+    /// The frame buffer travels with the request, and the owner task's
+    /// record of the resource keeps it until the display engine has
+    /// destroyed the resource.
     CreateSurface {
         generation: u64,
         scanout: ScanoutId,
         mode: DisplayMode,
         format: PixelFormat,
-        backing: PhysFrameRange,
+        backing: Buffer,
         reply: oneshot::Sender<Result<FramebufferId, DisplayServiceError>>,
     },
     DestroySurface {
@@ -199,7 +200,7 @@ pub(crate) enum ControlRequest {
     CreateCursor {
         generation: u64,
         format: PixelFormat,
-        backing: PhysFrameRange,
+        backing: Buffer,
         reply: oneshot::Sender<Result<FramebufferId, DisplayServiceError>>,
     },
     SetCursor {
@@ -254,8 +255,9 @@ pub(super) struct DisplayShared {
     pub(super) cursor: ProviderSender<CursorRequest>,
     /// One of [`ClaimState`]'s three values.
     pub(super) claim: AtomicU8,
-    /// Bumped by every successful claim, so a request that outlived its
-    /// claim can be told from one that did not.
+    /// Bumped by every successful claim and by every claim's drop, so a
+    /// request that outlived its claim can be told from one that did
+    /// not.
     pub(super) generation: AtomicU64,
     /// One permit per claim that has been let go.
     pub(super) release: Notify,
@@ -270,13 +272,6 @@ pub(super) struct DisplayShared {
     /// some instance's store outlives the host call that built it and
     /// holds the signal directly.
     pub(super) changes: Arc<SequenceSignal>,
-    /// The frame buffers of a claim that has been let go, waiting for
-    /// the owner task to stop the display engine reading them.
-    ///
-    /// One slot, and one is provably enough: there is at most one claim
-    /// at a time, and the claim word does not return to
-    /// [`ClaimState::FREE`] until this has been drained.
-    pub(super) returned: ConcurrentQueue<DisplayPins>,
 }
 
 /// The kernel's display, as everything outside the owner tasks sees it.
@@ -312,7 +307,10 @@ impl DisplayService {
     /// still being handed back: the display is not free until the
     /// display engine says it is, and answering otherwise would hand out
     /// a screen with somebody else's pixels still on it.
-    pub fn claim(&self) -> Result<DisplayClaim, DisplayServiceError> {
+    ///
+    /// `_cap` is the proof that the caller's authority names the display
+    /// class; the check happened where the cap was derived.
+    pub fn claim(&self, _cap: DisplayClaimCap) -> Result<DisplayClaim, DisplayServiceError> {
         self.shared
             .claim
             .compare_exchange(
@@ -364,25 +362,6 @@ impl DisplayClaim {
     /// The signal every change to the set of outputs is published on.
     pub fn changes(&self) -> Arc<SequenceSignal> {
         self.shared.changes.clone()
-    }
-
-    /// Hand this claim's frame buffers to the owner task.
-    ///
-    /// The pages are not freed here: the display engine may still be
-    /// scanning them out, and the owner task is what knows when it has
-    /// stopped. Called by the store's own drop, so it neither allocates
-    /// nor waits.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the slot is already occupied, which would mean two
-    /// claims existed at once — the one invariant the claim word is
-    /// there to keep.
-    pub(super) fn return_pins(&self, pins: DisplayPins) {
-        self.shared
-            .returned
-            .push(pins)
-            .unwrap_or_else(|_| panic!("two display claims returned their frame buffers at once"));
     }
 }
 
@@ -438,6 +417,13 @@ impl Drop for DisplayClaim {
         // instance this claim belonged to may already be dead. One
         // permit is enough, because there is exactly one claim to
         // release and the owner clears the word once it has.
+        //
+        // The generation moves here, not only on the next claim: a
+        // request queued under this one and still sitting in an inbox
+        // must fail the generation check however long the display then
+        // sits unclaimed, or the device would be given a frame for a
+        // claim that is already gone.
+        self.shared.generation.fetch_add(1, Ordering::AcqRel);
         self.shared
             .claim
             .store(ClaimState::RELEASING, Ordering::Release);

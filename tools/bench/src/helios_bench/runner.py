@@ -24,9 +24,11 @@ from pathlib import Path
 
 from helios_bench import REPO_ROOT, WASI_APPS_ROOT
 from helios_bench.assemble import assemble_report, build_cell, build_control
+from helios_bench.asymmetries import collect_asymmetries
 from helios_bench.baseline import Baseline
 from helios_bench.baseline import prepare as prepare_baseline
 from helios_bench.gate import evaluate_paired
+from helios_bench.host_gate import HostGateRecorder, gate_deviations
 from helios_bench.manifest import (
     Lane,
     Manifest,
@@ -36,7 +38,8 @@ from helios_bench.manifest import (
     host_deviations,
     host_memory_bytes,
     qemu_version,
-    vendored_wasmtime_revision,
+    validate_rounds,
+    vendored_wasmtime_pin,
     wasmtime_linux_release,
 )
 from helios_bench.report import (
@@ -67,6 +70,12 @@ NATIVE_BUILD = REPO_ROOT / "tools" / "bench" / "native" / "build.sh"
 NATIVE_ARTIFACTS = REPO_ROOT / "artifacts" / "bench-native"
 BOOT_ARTIFACTS = WASI_APPS_ROOT / "boot-artifacts.toml"
 CARGO_TARGETS = {"aarch64": "aarch64-unknown-none", "x86-64": "x86_64-unknown-none"}
+# What `helios-cli kernel-prebuild` names the compiler plugin's core module
+# beside the `compiler_plugin.cwasm` it precompiles from it.
+COMPILER_PLUGIN_WASM = "compiler_plugin.wasm"
+# The host that runs that module under Wasmtime on Linux, one of the native
+# counterparts `tools/bench/native/build.sh` builds.
+COMPILER_HOST = "helios-compiler-host"
 HELIOS_OUT = "helios"
 HELIOS_BASELINE_OUT = "helios-baseline"
 HELIOS_BASELINE_REBUILD_OUT = "helios-baseline-rebuild"
@@ -80,6 +89,11 @@ LINUX_SIDES = {Side.LINUX_NATIVE, Side.LINUX_WASMTIME}
 # pairing varies the candidate.
 RELEASE_BUILD = "release"
 PROFILE_USE_BUILD = "profile-use"
+# The `target/<triple>/` and `target/kernel-prebuild/<triple>/` directory
+# each build lands in: its cargo profile (`KernelBuildProfile::directory` in
+# inspector/src/vm.rs). A plain release image is the `kernel-release`
+# profile.
+KERNEL_BUILD_DIRECTORIES = {RELEASE_BUILD: "kernel-release", PROFILE_USE_BUILD: "profile-use"}
 # Architectures whose `--release` kernel is built against the profile the
 # latest release published (docs/pgo.md, #226). On those there is no plain
 # release kernel: the inspector compiles one with `-C profile-use` and its
@@ -182,6 +196,12 @@ class RunOptions:
     # shares it out over twice as many boots, and each of those boots
     # carries one workload rather than a whole class.
     baseline: Baseline | None = None
+    # The host compiles nothing: the inspector, helios-cli, the kernel
+    # image, its `helios-bootfs` and the native counterparts were put in
+    # place beforehand (a CI artifact and files copied from the machine
+    # that built them). The run refuses to start when any of them is
+    # missing, and never builds one.
+    prebuilt: bool = False
     # The merged `.profdata` the candidate kernel is compiled against
     # (docs/pgo.md). It pairs the same way a baseline commit does, and
     # against the plain release build of this checkout: what varies
@@ -206,8 +226,36 @@ class RunOptions:
     # this checkout's profile-guided release kernel against its plain one;
     # with a baseline commit, that commit's plain kernel.
     plain_baseline: bool = False
+    # Whether the first Helios pass ends with an untimed second boot of
+    # every unit that takes the kernel profile, the flamegraph and the perf
+    # metrics the report publishes (#747). No timed boot ever runs with the
+    # profiler on; false is a run that only wants timings. The passes that
+    # repeat a measurement (retake, reconfirm, retry) never take one: the
+    # artifacts are the first pass's.
+    profile_boot: bool = True
+    # The alternating rounds of the run (#491), overriding the lane's own
+    # count: each round times both sides once, and consecutive rounds swap
+    # which goes first. None takes the lane's setting.
+    rounds: int | None = None
 
     def __post_init__(self) -> None:
+        if self.rounds is not None:
+            try:
+                validate_rounds(self.rounds)
+            except ValueError as error:
+                raise SystemExit(f"--rounds: {error}") from None
+        if self.effective_rounds is not None:
+            if self.paired:
+                raise SystemExit(
+                    f"lane {self.lane.name} alternates rounds between its Helios and Linux sides, "
+                    "and a paired run times a second Helios image beside the first: "
+                    "the two orderings are not defined together"
+                )
+            if Side.HELIOS not in self.sides or not self.sides & LINUX_SIDES:
+                raise SystemExit(
+                    f"a run of {self.effective_rounds} alternating rounds times both sides in every "
+                    "round: --sides has to name helios and a Linux side"
+                )
         if self.plain_baseline and not self.reads_release_profile:
             raise SystemExit(
                 f"--baseline-kernel-build {RELEASE_BUILD} is the control of a PGO measurement, "
@@ -245,6 +293,11 @@ class RunOptions:
                     f"{self.baseline_profile_use}: the rebuild is the baseline commit built "
                     "against a second, independent collection"
                 )
+
+    @property
+    def effective_rounds(self) -> int | None:
+        """The number of alternating rounds this run takes; None is one single pass."""
+        return self.rounds if self.rounds is not None else self.lane.rounds
 
     @property
     def rebuilt(self) -> bool:
@@ -300,6 +353,10 @@ class PlannedCommand:
     #: retry of an inconclusive paired control repeats, whose wall time is
     #: the estimate that retry is sized against.
     helios_pass: bool = False
+    #: The side (`helios` or `linux`) and alternating round this invocation
+    #: times, for the host gate to bracket; None for a step that times nothing.
+    side: str | None = None
+    round: int | None = None
 
     def shell(self) -> str:
         exports = " ".join(f"{key}={shlex.quote(value)}" for key, value in sorted(self.env.items()))
@@ -353,13 +410,16 @@ def helios_command(
     out_root: Path,
     description: str,
     unit_order: dict[str, UnitOrder],
+    profile_boot: bool,
     helios_pass: bool = False,
 ) -> PlannedCommand:
     """The driver invocation that times the Helios image, and the baseline
     images beside it when the run is paired, under ``out_root``.
 
     ``unit_order`` names the order every unit of a paired invocation boots
-    the images in, and is empty for an unpaired one.
+    the images in, and is empty for an unpaired one. ``profile_boot`` asks
+    the driver for the untimed second boot that produces the kernel
+    profile; without it the invocation takes none.
     """
     lane = options.lane
     env = {
@@ -383,6 +443,10 @@ def helios_command(
             "--helios-accel",
             lane.accelerator,
             "--skip-linux",
+            # The driver's boots never build; this is also the build it
+            # does before them, which a prebuilt run has no host for.
+            *(["--helios-skip-build"] if options.prebuilt else []),
+            *([] if profile_boot else ["--helios-no-profile-boot"]),
             "--helios-timeout-seconds",
             str(options.helios_timeout_seconds),
             "--helios-side-timeout-seconds",
@@ -402,11 +466,59 @@ def helios_command(
     )
 
 
+def round_out_root(options: RunOptions, number: int) -> Path:
+    """Where the raw output of round ``number`` goes: the run's own directory
+    for a single pass, and one directory per round otherwise."""
+    return options.out_dir / f"round-{number}" if options.effective_rounds else options.out_dir
+
+
+def linux_command(
+    options: RunOptions, common: list[str], out_root: Path, description: str, number: int
+) -> PlannedCommand:
+    """The driver invocation that times both Linux counterparts in the pinned Fedora guest."""
+    lane = options.lane
+    return PlannedCommand(
+        description=f"{description} in the pinned Fedora guest",
+        argv=[
+            *common,
+            "--skip-helios",
+            "--linux-guest-arch",
+            lane.guest_arch,
+            "--linux-vm-accel",
+            lane.accelerator,
+            "--linux-vm-memory",
+            lane.linux_vm_memory,
+            "--linux-vm-smp",
+            str(lane.vcpus),
+            "--linux-vm-setup-timeout-seconds",
+            str(options.linux_setup_timeout_seconds),
+            *[argument for name in options.skip_linux_workloads for argument in ("--skip-workload", name)],
+            "--native-bin-dir",
+            str(NATIVE_ARTIFACTS / lane.guest_arch),
+            # The compile the Helios column's plugin does: the module it
+            # runs, the kernel's target and the kernel's worker count, for
+            # a counterpart hosting that plugin.
+            "--compiler-plugin-wasm",
+            str(compiler_plugin_wasm(lane, options.kernel_build)),
+            "--compiler-target",
+            CARGO_TARGETS[lane.helios_arch],
+            "--compiler-workers",
+            str(lane.compiler_workers),
+            "--out-dir",
+            str(out_root / LINUX_OUT),
+        ],
+        env={},
+        cwd=REPO_ROOT,
+        side="linux",
+        round=number,
+    )
+
+
 def plan(options: RunOptions, manifest: Manifest, workloads: list[dict]) -> list[PlannedCommand]:
     lane = options.lane
     iterations = options.iterations or manifest.statistics.iterations
     commands = []
-    if options.sides & LINUX_SIDES:
+    if options.sides & LINUX_SIDES and not options.prebuilt:
         commands.append(
             PlannedCommand(
                 description=f"build the native counterparts for {lane.guest_arch}",
@@ -416,48 +528,35 @@ def plan(options: RunOptions, manifest: Manifest, workloads: list[dict]) -> list
             )
         )
     common = driver_arguments(options, iterations, workloads, control=True)
-    if Side.HELIOS in options.sides:
-        commands.append(
-            helios_command(
-                options,
-                common,
-                options.out_dir,
-                "time every workload on Helios",
-                boot_orders(options, workloads),
-                helios_pass=True,
+    rounds = options.effective_rounds
+    for number in range(1, (rounds or 1) + 1):
+        out_root = round_out_root(options, number)
+        label = f"round {number}: " if rounds else ""
+        side_commands = []
+        if Side.HELIOS in options.sides:
+            side_commands.append(
+                replace(
+                    helios_command(
+                        options,
+                        common,
+                        out_root,
+                        f"{label}time every workload on Helios",
+                        boot_orders(options, workloads),
+                        # The untimed profile boot is the first pass's artifact.
+                        options.profile_boot and number == 1,
+                        helios_pass=True,
+                    ),
+                    side="helios",
+                    round=number,
+                )
             )
-        )
-    if options.sides & LINUX_SIDES:
-        commands.append(
-            PlannedCommand(
-                description="time every counterpart in the pinned Fedora guest",
-                argv=[
-                    *common,
-                    "--skip-helios",
-                    "--linux-guest-arch",
-                    lane.guest_arch,
-                    "--linux-vm-accel",
-                    lane.accelerator,
-                    "--linux-vm-memory",
-                    lane.linux_vm_memory,
-                    "--linux-vm-smp",
-                    str(lane.vcpus),
-                    "--linux-vm-setup-timeout-seconds",
-                    str(options.linux_setup_timeout_seconds),
-                    *[
-                        argument
-                        for name in options.skip_linux_workloads
-                        for argument in ("--skip-workload", name)
-                    ],
-                    "--native-bin-dir",
-                    str(NATIVE_ARTIFACTS / lane.guest_arch),
-                    "--out-dir",
-                    str(options.out_dir / LINUX_OUT),
-                ],
-                env={},
-                cwd=REPO_ROOT,
+        if options.sides & LINUX_SIDES:
+            side_commands.append(
+                linux_command(options, common, out_root, f"{label}time every counterpart", number)
             )
-        )
+        # Consecutive rounds swap which side goes first: Helios on the odd
+        # rounds, Linux on the even ones.
+        commands.extend(side_commands if number % 2 == 1 else reversed(side_commands))
     return commands
 
 
@@ -560,6 +659,16 @@ def baseline_arguments(options: RunOptions, out_root: Path) -> list[str]:
     return arguments
 
 
+def execute_gated(command: PlannedCommand, gate: HostGateRecorder) -> None:
+    """Runs ``command``, reading the host gate before and after a step that times a side (#491)."""
+    if command.side is None or command.round is None:
+        execute(command)
+        return
+    gate.take(command.round, command.side, "before")
+    execute(command)
+    gate.take(command.round, command.side, "after")
+
+
 def execute(command: PlannedCommand) -> None:
     env = os.environ.copy()
     env.update(command.env)
@@ -613,6 +722,117 @@ def inspector_for(workspace_root: Path) -> Path:
     return workspace_root / "target" / "release" / "helios-inspector"
 
 
+def kernel_path(workspace_root: Path, lane: Lane, profile_use: Path | None) -> Path:
+    """The kernel image the inspector of ``workspace_root`` boots on ``lane``.
+
+    Asked of the inspector, which owns the mapping from architecture and
+    build profile to artifact directory. The answer is a path and not a
+    promise that the file exists. A failing `kernel-path` is a broken
+    inspector, a wrong workspace root or a refused profile (a `--release`
+    x86-64 kernel reads the fetched profile, `helios-cli profile-fetch`),
+    and is fatal.
+    """
+    argv = [
+        str(inspector_for(workspace_root)),
+        "vm",
+        "--arch",
+        lane.helios_arch,
+        "--release",
+        "--accel",
+        lane.accelerator,
+    ]
+    if profile_use is not None:
+        argv += ["--profile-use", str(profile_use)]
+    argv.append("kernel-path")
+    env = os.environ.copy()
+    env["HELIOS_WORKSPACE_ROOT"] = str(workspace_root)
+    completed = subprocess.run(argv, cwd=REPO_ROOT, env=env, capture_output=True, text=True, check=False)
+    if completed.returncode != 0:
+        raise SystemExit(
+            f"`{shlex.join(argv)}` exited with status {completed.returncode}: {completed.stderr.strip()}"
+        )
+    return Path(completed.stdout.strip())
+
+
+def helios_cli_for_repo() -> Path:
+    """The `helios-cli` this checkout's driver boots with (`HELIOS_CLI_BIN` pins it)."""
+    return Path(os.environ.get("HELIOS_CLI_BIN", REPO_ROOT / "target" / "release" / "helios-cli"))
+
+
+NATIVE_BIN_REFERENCE = re.compile(r"\{native_bin\}/([\w.+-]+)")
+
+
+def native_counterparts(options: RunOptions, workloads: list[dict]) -> list[str]:
+    """The native binaries the Linux sides of the selected workloads run."""
+    runner = workload_runner()
+    names = set()
+    for workload in workloads:
+        if workload["name"] in options.skip_linux_workloads:
+            continue
+        for side in options.sides & LINUX_SIDES:
+            for template in runner.counterpart_templates(workload, side.value):
+                names.update(NATIVE_BIN_REFERENCE.findall(template))
+    return sorted(names)
+
+
+def missing_prebuilt_files(options: RunOptions, workloads: list[dict]) -> list[str]:
+    """Every file a prebuilt run reads that is not on disk, as one line each.
+
+    The kernel image and `helios-bootfs` are named by the inspector's
+    `kernel-path`. The inspector has no question for the payload, which
+    `kernel-prebuild` writes at `target/kernel-prebuild/<triple>/<build>/`,
+    beside the kernel's `target/<triple>/<build>/` (inspector/src/vm.rs,
+    `kernel_prebuild_dir`).
+    """
+    lane = options.lane
+    missing = []
+    if Side.HELIOS in options.sides:
+        inspector = inspector_for(REPO_ROOT)
+        cli = helios_cli_for_repo()
+        for what, tool in (("helios-inspector", inspector), ("helios-cli", cli)):
+            if not (tool.is_file() and os.access(tool, os.X_OK)):
+                missing.append(f"{tool} ({what}, not an executable file)")
+        if inspector.is_file() and os.access(inspector, os.X_OK):
+            kernel = kernel_path(REPO_ROOT, lane, None)
+            build_dir, triple_dir = kernel.parent, kernel.parent.parent
+            bootfs = (
+                triple_dir.parent / "kernel-prebuild" / triple_dir.name / build_dir.name / "helios-bootfs"
+            )
+            for what, path in (("kernel image", kernel), ("helios-bootfs", bootfs)):
+                if not path.is_file():
+                    missing.append(f"{path} ({what})")
+        else:
+            missing.append(
+                "the kernel image and helios-bootfs paths (they are asked of the inspector, which is missing)"
+            )
+    if options.sides & LINUX_SIDES:
+        for name in native_counterparts(options, workloads):
+            path = NATIVE_ARTIFACTS / lane.guest_arch / name
+            if not path.is_file():
+                missing.append(f"{path} (native counterpart)")
+        runner = workload_runner()
+        hosts_plugin = any(
+            runner.uses_placeholder(workload, side.value, runner.COMPILER_PLUGIN_PLACEHOLDER)
+            for workload in workloads
+            if workload["name"] not in options.skip_linux_workloads
+            for side in options.sides & LINUX_SIDES
+        )
+        plugin = compiler_plugin_wasm(lane, options.kernel_build)
+        if hosts_plugin and not plugin.is_file():
+            missing.append(f"{plugin} (the compiler plugin the helios-bootfs was precompiled from)")
+    return missing
+
+
+def require_prebuilt(options: RunOptions, workloads: list[dict]) -> None:
+    """Refuses a prebuilt run before any guest starts if a file it reads is missing."""
+    missing = missing_prebuilt_files(options, workloads)
+    if missing:
+        raise SystemExit(
+            "--prebuilt builds nothing, and these files the run reads are missing:\n  - "
+            + "\n  - ".join(missing)
+        )
+
+
 def kernel_pgo_uncovered(
     workspace_root: Path,
     lane: Lane,
@@ -634,27 +854,7 @@ def kernel_pgo_uncovered(
     workspace root, or a refused profile, and it is fatal rather than a
     missing count.
     """
-    inspector = inspector_for(workspace_root)
-    argv = [
-        str(inspector),
-        "vm",
-        "--arch",
-        lane.helios_arch,
-        "--release",
-        "--accel",
-        lane.accelerator,
-    ]
-    if profile_use is not None:
-        argv += ["--profile-use", str(profile_use)]
-    argv.append("kernel-path")
-    env = os.environ.copy()
-    env["HELIOS_WORKSPACE_ROOT"] = str(workspace_root)
-    completed = subprocess.run(argv, cwd=REPO_ROOT, env=env, capture_output=True, text=True, check=False)
-    if completed.returncode != 0:
-        raise SystemExit(
-            f"`{shlex.join(argv)}` exited with status {completed.returncode}: {completed.stderr.strip()}"
-        )
-    listing = Path(completed.stdout.strip() + ".pgo-uncovered.txt")
+    listing = Path(str(kernel_path(workspace_root, lane, profile_use)) + ".pgo-uncovered.txt")
     if not listing.is_file():
         return None
     with listing.open("r", encoding="utf-8") as handle:
@@ -673,24 +873,69 @@ def kernel_pgo_uncovered(
     return int(match.group(1)), int(match.group(2))
 
 
-def bootfs_cwasm_digests(lane: Lane, kernel_build: str) -> dict[str, str]:
-    """SHA256 of the signed cwasm files the Helios guest loaded.
+def kernel_prebuild_dir(lane: Lane, kernel_build: str) -> Path:
+    """Where the candidate's `kernel-prebuild` wrote its payload.
 
     Under the candidate's own build directory: the inspector's prebuild
     writes beside the kernel it prebuilds for, so a PGO candidate's
-    bootfs is not in the plain release directory.
+    bootfs is not in the plain release directory. The directory is the
+    build's cargo profile, which for a plain release build is not the
+    build's own name.
     """
-    prebuild = REPO_ROOT / "target" / "kernel-prebuild" / CARGO_TARGETS[lane.helios_arch] / kernel_build
+    return (
+        REPO_ROOT
+        / "target"
+        / "kernel-prebuild"
+        / CARGO_TARGETS[lane.helios_arch]
+        / KERNEL_BUILD_DIRECTORIES[kernel_build]
+    )
+
+
+def compiler_plugin_wasm(lane: Lane, kernel_build: str) -> Path:
+    """The compiler plugin's core module the candidate's prebuild
+    precompiled into its bootfs, which the Linux + Wasmtime column of
+    `aot-curl` hosts directly, so both columns run one plugin build."""
+    return kernel_prebuild_dir(lane, kernel_build) / COMPILER_PLUGIN_WASM
+
+
+def bootfs_cwasm_digests(lane: Lane, kernel_build: str) -> dict[str, str]:
+    """SHA256 of the signed cwasm files the Helios guest loaded."""
+    prebuild = kernel_prebuild_dir(lane, kernel_build)
     if not prebuild.is_dir():
         return {}
     return {path.name: sha256_of(path) for path in sorted(prebuild.glob("*.cwasm"))}
 
 
-def collect_pins(lane: Lane, workloads: list[dict], kernel_build: str) -> Pins:
+def compiler_pins(lane: Lane, workloads: list[dict], kernel_build: str) -> tuple[str | None, str | None]:
+    """The digests of the compiler plugin build and of the
+    `helios-compiler-host` the selection's workloads hosted it with, each
+    None when no selected workload names it or it is not on disk."""
+    runner = workload_runner()
+    plugin = compiler_plugin_wasm(lane, kernel_build)
+    host = NATIVE_ARTIFACTS / lane.guest_arch / COMPILER_HOST
+    plugin_digest = (
+        sha256_of(plugin) if runner.needs_compiler_plugin(workloads) and plugin.is_file() else None
+    )
+    host_named = any(
+        f"{{native_bin}}/{COMPILER_HOST}" in template
+        for workload in workloads
+        for side in LINUX_SIDES
+        for template in runner.counterpart_templates(workload, side.value)
+    )
+    host_digest = sha256_of(host) if host_named and host.is_file() else None
+    return plugin_digest, host_digest
+
+
+def collect_pins(lane: Lane, workloads: list[dict], kernel_build: str, baseline: Baseline | None) -> Pins:
     image_url, image_sha256 = fedora_image(lane.guest_arch)
+    plugin_digest, host_digest = compiler_pins(lane, workloads, kernel_build)
+    wasmtime_revision = vendored_wasmtime_pin().revision
+    linux_release = wasmtime_linux_release(lane.guest_arch)
     return Pins(
-        wasmtime_revision=vendored_wasmtime_revision(),
-        wasmtime_linux_release=wasmtime_linux_release(lane.guest_arch),
+        asymmetries=collect_asymmetries(lane, wasmtime_revision, linux_release),
+        wasmtime_revision=wasmtime_revision,
+        baseline_wasmtime_revision=baseline.wasmtime.revision if baseline is not None else None,
+        wasmtime_linux_release=linux_release,
         fedora_image_url=image_url,
         fedora_image_sha256=image_sha256,
         qemu_version=lane.qemu_version,
@@ -702,6 +947,8 @@ def collect_pins(lane: Lane, workloads: list[dict], kernel_build: str) -> Pins:
         devices=lane.devices,
         wasm_artifacts=wasm_artifact_digests(workloads),
         bootfs_cwasm=bootfs_cwasm_digests(lane, kernel_build),
+        compiler_plugin_wasm=plugin_digest,
+        compiler_host=host_digest,
     )
 
 
@@ -769,9 +1016,46 @@ def thresholds_from(manifest: Manifest, iterations: int | None) -> Thresholds:
     )
 
 
+def read_side_rounds(options: RunOptions, side: Side, thresholds: Thresholds) -> RawSide:
+    """One side's cells with every alternating round's launches pooled (#491).
+
+    A workload every round has a cell for is pooled; one any round failed
+    is a failed cell, since a pool missing a round is not the series the
+    run set out to take. A round missing a workload another has is a
+    broken run, not a failure of the workload.
+    """
+    per_round: list[RawSide] = []
+    for number in range(1, (options.effective_rounds or 0) + 1):
+        out_dir = round_out_root(options, number) / SIDE_OUT[side]
+        raw = read_optional_side(out_dir, side, thresholds.warmup_discard, number)
+        if raw is None:
+            raise SystemExit(f"the {side} side produced no JSONL in round {number} under {out_dir}")
+        per_round.append(raw)
+    names = sorted({name for raw in per_round for name in raw.cells})
+    cells: dict[str, RawCell] = {}
+    for name in names:
+        missing = [number for number, raw in enumerate(per_round, 1) if name not in raw.cells]
+        if missing:
+            raise SystemExit(f"the {side} side recorded nothing for {name} in round(s) {missing}")
+        failures = [
+            f"round {number}: {raw.cells[name].failure}"
+            for number, raw in enumerate(per_round, 1)
+            if raw.cells[name].failure is not None
+        ]
+        cells[name] = (
+            RawCell(failure="; ".join(failures))
+            if failures
+            else RawCell(iterations=[it for raw in per_round for it in raw.cells[name].iterations])
+        )
+    return RawSide(run=per_round[0].run, cells=cells)
+
+
 def read_sides(options: RunOptions, thresholds: Thresholds) -> dict[Side, RawSide]:
     sides = {}
     for side in options.sides:
+        if options.effective_rounds:
+            sides[side] = read_side_rounds(options, side, thresholds)
+            continue
         out_dir = options.out_dir / SIDE_OUT[side]
         raw = read_optional_side(out_dir, side, thresholds.warmup_discard)
         if raw is None:
@@ -781,11 +1065,18 @@ def read_sides(options: RunOptions, thresholds: Thresholds) -> dict[Side, RawSid
 
 
 def read_controls(options: RunOptions, thresholds: Thresholds) -> dict[Side, tuple[RawSide, RawSide]]:
+    """The control pair of each side; over alternating rounds, the first
+    round's `before` and the last round's `after`, so the floor is the
+    drift of the control across the whole run."""
+    rounds = options.effective_rounds
     controls = {}
     for side in options.sides:
-        out_dir = options.out_dir / SIDE_OUT[side]
-        before = read_control(out_dir, side, "before", thresholds.warmup_discard)
-        after = read_control(out_dir, side, "after", thresholds.warmup_discard)
+        before = read_control(
+            round_out_root(options, 1) / SIDE_OUT[side], side, "before", thresholds.warmup_discard
+        )
+        after = read_control(
+            round_out_root(options, rounds or 1) / SIDE_OUT[side], side, "after", thresholds.warmup_discard
+        )
         if before is not None and after is not None:
             controls[side] = (before, after)
     return controls
@@ -830,6 +1121,7 @@ def retake_plan(
         options.out_dir / out_name,
         f"measure {', '.join(names)} again on every Helios image: {reason}",
         unit_order,
+        profile_boot=False,
     )
 
 
@@ -888,7 +1180,9 @@ def retake(
     a loop. The retake replaces the pass it repeats, so it boots each
     workload's images in the order that pass did (``orders``).
     """
-    if Side.HELIOS not in options.sides:
+    # Over alternating rounds a retake would replace a pooled cell with one
+    # pass of one side, breaking the alternation the cell was taken under.
+    if Side.HELIOS not in options.sides or options.effective_rounds:
         return []
     names = dispersed_headline_workloads(sides, workloads, thresholds)
     retake_workloads(
@@ -1057,6 +1351,7 @@ def retry(
             "measure the control pair and every workload on every Helios image once more: "
             f"the first pass's noise floor crossed the {result.floor_bound:.3f} bound",
             orders,
+            profile_boot=False,
         )
     )
     second_sides = read_sides(retry_options, thresholds)
@@ -1123,6 +1418,11 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
             "a run that rebuilds the baseline times it as the helios_baseline_rebuild side, and "
             "only such a run has that side: --sides and --baseline-rebuild-profile-use disagree"
         )
+    if options.prebuilt and paired:
+        raise SystemExit(
+            "--prebuilt builds nothing, and a paired run builds its second Helios image: "
+            "drop --prebuilt or the pairing options"
+        )
     workload_manifest = load_workloads()
     workloads = select_workloads(workload_manifest, options.workload_names)
     commands = plan(options, manifest, workloads)
@@ -1132,6 +1432,8 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
         for command in commands:
             print(f"# {command.description}\n{command.shell()}")
         return None
+    if options.prebuilt:
+        require_prebuilt(options, workloads)
 
     # The monotonic clock the retry's budget check reads, started before
     # the baseline is prepared and the first command runs: `started`
@@ -1146,11 +1448,14 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
     started = datetime.now(UTC).isoformat(timespec="seconds")
     options.out_dir.mkdir(parents=True, exist_ok=True)
     helios_seconds = 0.0
+    gate = HostGateRecorder()
     for command in commands:
         before = time.monotonic()
-        execute(command)
+        execute_gated(command, gate)
         if command.helios_pass:
             helios_seconds = time.monotonic() - before
+    host_gate = gate.record()
+    deviations = [*deviations, *gate_deviations(host_gate)]
     thresholds = thresholds_from(manifest, options.iterations)
     orders = boot_orders(options, workloads)
     sides = read_sides(options, thresholds)
@@ -1202,8 +1507,7 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
             url=run_url,
             attempt=attempt,
             lane=lane.name,
-            runner_label=options.runner_label
-            or (lane.shared_runner if options.advisory else lane.runner_label),
+            runner_label=options.runner_label or lane.runs_on(options.advisory),
             advisory=options.advisory,
             publishable=not options.advisory and not deviations,
             deviations=deviations,
@@ -1223,6 +1527,7 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
             if options.baseline
             else (git_sha() if paired else None),
             kernel_build=options.kernel_build,
+            prebuilt=options.prebuilt,
             baseline_kernel_build=options.baseline_kernel_build,
             kernel_profile=profiles.candidate,
             baseline_kernel_profile=profiles.baseline,
@@ -1247,6 +1552,8 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
             retaken=retaken,
             reconfirmed=reconfirmation.names,
             noise_retry=noise_retry,
+            rounds=options.effective_rounds,
+            host_gate=host_gate,
         )
         return assemble_report(
             workloads=workloads,
@@ -1254,7 +1561,7 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
             control=control,
             run=run,
             hardware=collect_hardware(lane),
-            pins=collect_pins(lane, workloads, options.kernel_build),
+            pins=collect_pins(lane, workloads, options.kernel_build, options.baseline),
             thresholds=thresholds,
             first_pass=reconfirmation.first_pass,
         )

@@ -36,13 +36,17 @@ on:
     # are built from: the kernel crates and their layers below (§1 of
     # AGENTS.md), the backend, the root crate, the guest programs the
     # bootfs embeds, the workload manifest and the WASI apps the
-    # collection boots, the collection sequence itself, and the Wasmtime
-    # pin. A merge that touches none of these leaves the profile as it
-    # was.
+    # collection boots, the collection sequence itself, the Wasmtime
+    # pin, the toolchain (LLVM's profile format and codegen move with it)
+    # and the inspector, which defines the kernel build's
+    # profile-generate and profile-use rustflags (#687). A merge that
+    # touches none of these leaves the profile as it was.
     paths:
       - "Cargo.toml"
       - "Cargo.lock"
+      - "rust-toolchain.toml"
       - ".cargo/**"
+      - "inspector/**"
       - "src/**"
       - "hal/**"
       - "netstack/**"
@@ -78,6 +82,16 @@ on:
         description: Name the merged profile is uploaded under
         type: string
         default: helios-kernel-profdata
+      root:
+        description: >-
+          Directory, relative to the workspace, the collection lays the
+          Helios checkout and the Wasmtime fork its ref pins out in, side
+          by side; empty means the workspace itself. The profile names
+          Wasmtime's crates by the fork's absolute path (#359), so a
+          paired baseline pinning another fork than its candidate's is
+          collected in the directory the suite builds it in (#486).
+        type: string
+        default: ""
 
 jobs:
   kernel-profile:
@@ -87,7 +101,11 @@ jobs:
     # commit's profile is the one `profile-fetch` should find newest, so
     # the older run is cancelled rather than left to finish last. Every
     # other event gets a group of its own — a dispatch, or a call from
-    # `bench-suite.yml`, whose own concurrency already governs it. Each
+    # `bench-suite.yml`, whose own concurrency already governs it. A
+    # called workflow sees the caller's `github.event_name`, so a call
+    # made on a `dev` push reads as a push here; `github.workflow` is the
+    # caller's name too, and is this workflow's only when its own push
+    # trigger started the run (#687). Each
     # call of one run is its own group too, keyed by the artifact it
     # uploads: the `profile-columns` matrix calls this workflow once per
     # column within one run, and one group for all of them ran them one
@@ -96,10 +114,10 @@ jobs:
     # behind a pending second.
     concurrency:
       group: >-
-        ${{ github.event_name == 'push'
+        ${{ github.event_name == 'push' && github.workflow == 'kernel-profile'
             && format('kernel-profile-push-{0}', github.ref)
             || format('kernel-profile-{0}-{1}-{2}', github.run_id, github.job, inputs.artifact) }}
-      cancel-in-progress: ${{ github.event_name == 'push' }}
+      cancel-in-progress: ${{ github.event_name == 'push' && github.workflow == 'kernel-profile' }}
     timeout-minutes: 240
     permissions:
       contents: read
@@ -107,19 +125,30 @@ jobs:
       # The lane whose workloads and machine the profile describes: the
       # one benchmark lane of AGENTS.md §3.6.
       BENCH_LANE: x86-64-kvm
+      # Where the build runs: `helios/` and `wasmtime/` in the workspace,
+      # or side by side under `root`. The actions are always read from
+      # `helios/`, because a job's `uses:` cannot be an expression.
+      CHECKOUT_PATH: ${{ inputs.root && format('{0}/helios', inputs.root) || 'helios' }}
+      WASMTIME_PATH: ${{ inputs.root && format('{0}/wasmtime', inputs.root) || 'wasmtime' }}
     steps:
       - uses: actions/checkout@v4
         with:
           path: helios
           ref: ${{ inputs.ref || github.sha }}
+      - name: Lay the checkout out under the column's root
+        if: inputs.root != ''
+        run: git -C helios worktree add --detach "$GITHUB_WORKSPACE/$CHECKOUT_PATH" HEAD
       - uses: ./helios/.github/actions/checkout-wasmtime
+        with:
+          path: ${{ env.WASMTIME_PATH }}
       - uses: ./helios/.github/actions/bench-host
         with:
-          rust-cache-key: kernel-profile
+          checkout-path: ${{ env.CHECKOUT_PATH }}
           network-tools: "true"
           bench-tooling: "true"
       - uses: ./helios/.github/actions/collect-kernel-profile
         with:
+          checkout-path: ${{ env.CHECKOUT_PATH }}
           lane: ${{ env.BENCH_LANE }}
           limine-dir: ${{ github.workspace }}/limine
           output: ${{ github.workspace }}/profiles/helios-kernel.profdata

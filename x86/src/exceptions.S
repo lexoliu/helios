@@ -215,6 +215,10 @@ helios_x86_exception_common:
     mov dword ptr [rsp], 0x1f80
     fninit
     ldmxcsr [rsp]
+    // The SysV ABI requires DF clear at every call, and the interrupted
+    // code may have been inside a `std; rep movs; cld` window. `iretq`
+    // restores the interrupted RFLAGS, so DF comes back as it was.
+    cld
     call helios_x86_exception_dispatch
     add rsp, 16
     fxrstor64 [rsp]
@@ -263,6 +267,8 @@ helios_x86_interrupt_common:
     mov dword ptr [rsp], 0x1f80
     fninit
     ldmxcsr [rsp]
+    // See `helios_x86_exception_common`: DF is clear for every Rust call.
+    cld
     call helios_x86_interrupt_dispatch
     add rsp, 16
     fxrstor64 [rsp]

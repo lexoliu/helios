@@ -71,9 +71,13 @@ pub mod device {
             path: "../wit",
             world: "device-host",
             imports: {
-                // The one call that hands back a stream has to see the
-                // store, so it can build the reader against it.
+                // The call that hands back a stream has to see the store,
+                // so it can build the reader against it; the two that
+                // take a span have to see it to read the memory's base
+                // and current size at the call.
                 "helios:system/device.[method]grant.interrupts": store | trappable,
+                "helios:system/device.[method]grant.map-region": store | trappable,
+                "helios:system/device.[method]grant.dma-alloc": store | trappable,
                 default: trappable,
             },
             with: {

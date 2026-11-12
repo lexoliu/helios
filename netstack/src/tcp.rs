@@ -92,6 +92,15 @@ pub const TCP_MAX_RTO_NANOS: u64 = 60_000_000_000;
 pub const TCP_MAX_RETRANSMISSIONS: u8 = 5;
 pub const TCP_DELAYED_ACK_NANOS: u64 = 40_000_000;
 pub const TCP_TIME_WAIT_NANOS: u64 = 60_000_000_000;
+/// Challenge ACKs one connection sends per
+/// [`TCP_CHALLENGE_ACK_INTERVAL_NANOS`]. RFC 5961 section 7 requires the
+/// rate to be limited and leaves the figure to the implementation; ten a
+/// second keeps a legitimate peer's resynchronisation attempts answered
+/// while capping what a forger can make this connection emit. The budget
+/// belongs to the connection: a counter shared across connections is the
+/// side channel of CVE-2016-5696.
+const TCP_CHALLENGE_ACK_LIMIT: u8 = 10;
+const TCP_CHALLENGE_ACK_INTERVAL_NANOS: u64 = 1_000_000_000;
 
 /// How much of the transmit queue a socket may put into one frame.
 ///
@@ -826,6 +835,15 @@ where
     /// count reflects window updates *sent* and not window updates
     /// merely wanted.
     pending_ack_reopens_window: bool,
+    /// The largest window the peer has advertised (RFC 5961 MAX.SND.WND),
+    /// in bytes. It bounds how old an acknowledgement may be and still be
+    /// believed.
+    max_peer_receive_window: u32,
+    /// Start of the interval the challenge-ACK budget is counted in, and
+    /// the challenge ACKs spent in it. Per connection, by RFC 5961
+    /// section 7.
+    challenge_ack_interval_start_nanos: Option<u64>,
+    challenge_acks_in_interval: u8,
     /// IPv4 TTL / IPv6 hop limit stamped on every frame this socket emits.
     hop_limit: u8,
 }
@@ -851,14 +869,12 @@ pub enum TcpStateChangeReason {
     SynSentReset,
     /// `SYN-SENT` received an acceptable SYN-ACK.
     SynSentEstablished,
-    /// `SYN-RECEIVED` received an in-window RST.
+    /// `SYN-RECEIVED` received a RST at exactly the next sequence.
     SynReceivedReset,
     /// `SYN-RECEIVED` received the ACK completing the handshake.
     SynReceivedEstablished,
-    /// A synchronised state received an in-window RST.
+    /// A synchronised state received a RST at exactly the next sequence.
     PeerReset,
-    /// A synchronised state received an in-window SYN.
-    PeerSyn,
     /// The peer's FIN was consumed in sequence.
     PeerFin,
     /// The application closed its send side.
@@ -881,8 +897,7 @@ pub enum TcpCloseKind {
     /// The connection ended in order: the peer's FIN arrived in sequence
     /// behind everything it sent, so the reader has the whole stream.
     Graceful,
-    /// The connection was reset — an in-window RST, or the in-window SYN
-    /// that RFC 9293 3.10.7.4 answers with one.
+    /// The connection was reset by a RST at exactly the next sequence.
     Reset,
     /// The local side aborted the connection.
     Aborted,
@@ -933,7 +948,7 @@ impl TcpStateChangeReason {
             Self::TimeWaitExpired | Self::PeerFin | Self::LocalClose | Self::FinAcknowledged => {
                 Some(TcpCloseKind::Graceful)
             }
-            Self::SynSentReset | Self::SynReceivedReset | Self::PeerReset | Self::PeerSyn => {
+            Self::SynSentReset | Self::SynReceivedReset | Self::PeerReset => {
                 Some(TcpCloseKind::Reset)
             }
             Self::Abort => Some(TcpCloseKind::Aborted),
@@ -998,6 +1013,9 @@ where
             quickack_segments_remaining: TCP_QUICKACK_SEGMENTS,
             pending_window_update_bytes: 0,
             pending_ack_reopens_window: false,
+            max_peer_receive_window: u32::from(u16::MAX),
+            challenge_ack_interval_start_nanos: None,
+            challenge_acks_in_interval: 0,
             hop_limit: crate::DEFAULT_HOP_LIMIT,
         }
     }
@@ -1818,6 +1836,17 @@ where
         }
     }
 
+    /// Whether `sequence` was sent and is still unacknowledged
+    /// (`SND.UNA <= sequence < SND.NXT`). For a connection in `SYN-SENT`
+    /// that is exactly the SYN's sequence number.
+    ///
+    /// RFC 5927 section 4.1: an ICMP error quoting a sequence number
+    /// outside this range did not come from a segment this connection
+    /// has in flight, so whoever sent it did not see one.
+    pub(crate) fn sequence_in_flight(&self, sequence: u32) -> bool {
+        sequence_leq(self.send_unacknowledged, sequence) && sequence_lt(sequence, self.send_next)
+    }
+
     pub fn mark_path_mtu_reduced(&mut self, sequence: u32) {
         let Some(in_flight) = self.in_flight.as_ref() else {
             return;
@@ -2004,8 +2033,13 @@ where
                 }
             }
             TcpState::SynReceived if packet.flags.contains(TcpFlags::RST) => {
-                if self.receive_sequence_acceptable(packet.sequence, receive_sequence_len(packet)) {
+                // RFC 5961 section 3.2.
+                if packet.sequence == self.receive_next {
                     self.set_state(TcpState::Closed, TcpStateChangeReason::SynReceivedReset);
+                } else if self
+                    .receive_sequence_acceptable(packet.sequence, receive_sequence_len(packet))
+                {
+                    self.request_challenge_ack(now_nanos);
                 }
                 TcpSegmentOutcome::default()
             }
@@ -2047,9 +2081,10 @@ where
                     payload_len: u32::try_from(packet.payload.len()).unwrap_or(u32::MAX),
                 });
                 if packet.flags.contains(TcpFlags::RST) {
-                    if self
-                        .receive_sequence_acceptable(packet.sequence, receive_sequence_len(packet))
-                    {
+                    // RFC 5961 section 3.2: only the exact next sequence
+                    // resets; elsewhere in the window the peer is asked to
+                    // repeat itself, and outside it nothing happens.
+                    if packet.sequence == self.receive_next {
                         self.set_state(TcpState::Closed, TcpStateChangeReason::PeerReset);
                         return TcpSegmentOutcome {
                             recovery: Some(self.congestion.on_congestion_event(
@@ -2060,13 +2095,30 @@ where
                             reset: None,
                         };
                     }
+                    if self
+                        .receive_sequence_acceptable(packet.sequence, receive_sequence_len(packet))
+                    {
+                        self.request_challenge_ack(now_nanos);
+                    }
+                    return TcpSegmentOutcome::default();
+                }
+                // RFC 5961 section 4.2: a SYN on a synchronised connection
+                // is answered with a challenge ACK whatever its sequence
+                // number; a genuine restart answers it with a RST.
+                if packet.flags.contains(TcpFlags::SYN) {
+                    self.request_challenge_ack(now_nanos);
                     return TcpSegmentOutcome::default();
                 }
                 if !packet.flags.contains(TcpFlags::ACK) {
                     return TcpSegmentOutcome::default();
                 }
-                if self.acknowledges_unsent_data(packet.acknowledgement) {
-                    self.request_ack();
+                // RFC 5961 section 5.2: an acknowledgement outside
+                // `SND.UNA - MAX.SND.WND ..= SND.NXT` drops the segment,
+                // payload included, and is answered with an ACK.
+                if self.acknowledges_unsent_data(packet.acknowledgement)
+                    || self.acknowledges_ancient_data(packet.acknowledgement)
+                {
+                    self.request_challenge_ack(now_nanos);
                     return TcpSegmentOutcome::default();
                 }
                 if !self.receive_sequence_acceptable(packet.sequence, receive_sequence_len(packet))
@@ -2076,17 +2128,6 @@ where
                     self.record_old_payload(packet.sequence, packet.payload.len());
                     self.request_duplicate_ack();
                     return TcpSegmentOutcome::default();
-                }
-                if packet.flags.contains(TcpFlags::SYN) {
-                    self.set_state(TcpState::Closed, TcpStateChangeReason::PeerSyn);
-                    return TcpSegmentOutcome {
-                        recovery: Some(self.congestion.on_congestion_event(
-                            CongestionEvent::RetransmissionTimeout { now_nanos },
-                        )),
-                        readable: false,
-                        receive_backpressure: false,
-                        reset: None,
-                    };
                 }
                 let duplicate_ack_eligible = self.duplicate_ack_eligible(packet);
                 let action = if sequence_lt(packet.acknowledgement, self.send_unacknowledged) {
@@ -2137,6 +2178,21 @@ where
                     receive_backpressure: false,
                     reset: None,
                 }
+            }
+            // A RST is ignored whatever its sequence number: honouring
+            // one would end TIME-WAIT early (RFC 1337's hazard 1), so a
+            // challenge ACK would only ask the peer for a RST that changes
+            // nothing.
+            TcpState::TimeWait if packet.flags.contains(TcpFlags::RST) => {
+                TcpSegmentOutcome::default()
+            }
+            // RFC 9293 section 3.10.7.4 has TIME-WAIT answer a SYN as
+            // every other synchronised state does, with a challenge ACK
+            // (RFC 5961 section 4.2), short of RFC 6191's timestamp test,
+            // which this stack does not run.
+            TcpState::TimeWait if packet.flags.contains(TcpFlags::SYN) => {
+                self.request_challenge_ack(now_nanos);
+                TcpSegmentOutcome::default()
             }
             TcpState::TimeWait => {
                 if packet.flags.contains(TcpFlags::FIN)
@@ -2286,8 +2342,12 @@ where
 
     fn highest_sent_sequence(&self) -> u32 {
         self.persist_probe.map_or(self.send_next, |probe| {
-            self.send_next
-                .max(probe.sequence.wrapping_add(probe.sequence_len))
+            let probe_end = probe.sequence.wrapping_add(probe.sequence_len);
+            if sequence_lt(self.send_next, probe_end) {
+                probe_end
+            } else {
+                self.send_next
+            }
         })
     }
 
@@ -2302,6 +2362,34 @@ where
 
     fn acknowledges_unsent_data(&self, acknowledgement: u32) -> bool {
         sequence_lt(self.highest_sent_sequence(), acknowledgement)
+    }
+
+    /// RFC 5961 section 5: an acknowledgement older than
+    /// `SND.UNA - MAX.SND.WND` cannot come from this connection's peer.
+    fn acknowledges_ancient_data(&self, acknowledgement: u32) -> bool {
+        sequence_lt(
+            acknowledgement,
+            self.send_unacknowledged
+                .wrapping_sub(self.max_peer_receive_window),
+        )
+    }
+
+    /// Queues the ACK that answers a segment RFC 5961 declines to act on
+    /// (an in-window RST, a SYN, an acknowledgement outside the
+    /// acceptable range), unless this connection has spent its
+    /// challenge-ACK budget for the interval (section 7).
+    fn request_challenge_ack(&mut self, now_nanos: u64) {
+        let interval_over = self.challenge_ack_interval_start_nanos.is_none_or(|start| {
+            now_nanos.saturating_sub(start) >= TCP_CHALLENGE_ACK_INTERVAL_NANOS
+        });
+        if interval_over {
+            self.challenge_ack_interval_start_nanos = Some(now_nanos);
+            self.challenge_acks_in_interval = 0;
+        }
+        if self.challenge_acks_in_interval < TCP_CHALLENGE_ACK_LIMIT {
+            self.challenge_acks_in_interval += 1;
+            self.request_ack();
+        }
     }
 
     fn syn_sent_ack_acceptable(&self, acknowledgement: u32) -> bool {
@@ -2360,9 +2448,13 @@ where
         duplicate_ack_eligible: bool,
     ) -> Option<RecoveryAction> {
         if sequence_leq(acknowledgement, self.send_unacknowledged) {
-            return (acknowledgement == self.send_unacknowledged && duplicate_ack_eligible)
+            let action = (acknowledgement == self.send_unacknowledged && duplicate_ack_eligible)
                 .then(|| self.note_duplicate_ack(now_nanos))
                 .flatten();
+            // A window update carried by an ACK that acknowledges
+            // nothing new still reopens the window the probe asked about.
+            self.refresh_persist_after_ack(now_nanos);
+            return action;
         }
         let mut acked = acknowledgement.wrapping_sub(self.send_unacknowledged);
         if let Some(probe) = self.persist_probe
@@ -2957,6 +3049,7 @@ where
         // RFC 7323 §2.2: the window field in a SYN or SYN-ACK is never
         // scaled, even though that segment is what carries the option.
         self.peer_receive_window = u32::from(packet.window_size);
+        self.max_peer_receive_window = self.peer_receive_window;
         self.peer_sack_permitted = packet.options.sack_permitted();
         self.record_peer_timestamp(packet.options.timestamp());
     }
@@ -2969,6 +3062,7 @@ where
 
     fn update_peer_receive_window(&mut self, window_size: u16) {
         self.peer_receive_window = self.scaled_peer_receive_window(window_size);
+        self.max_peer_receive_window = self.max_peer_receive_window.max(self.peer_receive_window);
     }
 
     fn scaled_peer_receive_window(&self, window_size: u16) -> u32 {
@@ -4572,7 +4666,7 @@ mod tests {
     }
 
     #[test]
-    fn synchronized_state_closes_on_in_window_syn() {
+    fn synchronized_state_answers_in_window_syn_with_challenge_ack() {
         let mut socket = established_socket();
         let receive_next_before = socket.receive_next;
 
@@ -4591,8 +4685,192 @@ mod tests {
             TCP_INITIAL_RTO_NANOS + 1,
         );
 
-        assert_eq!(socket.state(), TcpState::Closed);
-        assert!(outcome.recovery.is_some());
+        assert_eq!(outcome, TcpSegmentOutcome::default());
+        assert_eq!(socket.state(), TcpState::Established);
+        let ack = socket
+            .pending_ack()
+            .expect("an in-window SYN must draw a challenge ACK");
+        assert_eq!(ack.acknowledgement, receive_next_before);
+        assert_eq!(ack.sequence, socket.send_next);
+    }
+
+    #[test]
+    fn synchronized_state_answers_bare_syn_with_challenge_ack() {
+        let mut socket = established_socket();
+        let far_sequence = socket.receive_next.wrapping_add(1 << 30);
+
+        let outcome = deliver_segment(
+            &mut socket,
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: far_sequence,
+                acknowledgement: 0,
+                flags: TcpFlags::SYN,
+                window_size: u16::MAX,
+                options: TcpOptions::empty(),
+                payload: &[],
+            },
+            TCP_INITIAL_RTO_NANOS + 1,
+        );
+
+        assert_eq!(outcome, TcpSegmentOutcome::default());
+        assert_eq!(socket.state(), TcpState::Established);
+        assert!(socket.pending_ack().is_some());
+    }
+
+    #[test]
+    fn synchronized_state_answers_in_window_rst_off_the_next_sequence_with_challenge_ack() {
+        let mut socket = established_socket();
+        let receive_next_before = socket.receive_next;
+
+        let outcome = deliver_segment(
+            &mut socket,
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: receive_next_before.wrapping_add(1000),
+                acknowledgement: 0,
+                flags: TcpFlags::RST,
+                window_size: u16::MAX,
+                options: TcpOptions::empty(),
+                payload: &[],
+            },
+            TCP_INITIAL_RTO_NANOS + 1,
+        );
+
+        assert_eq!(outcome, TcpSegmentOutcome::default());
+        assert_eq!(socket.state(), TcpState::Established);
+        let ack = socket
+            .pending_ack()
+            .expect("an in-window RST off RCV.NXT must draw a challenge ACK");
+        assert_eq!(ack.acknowledgement, receive_next_before);
+    }
+
+    #[test]
+    fn syn_received_answers_in_window_rst_off_the_next_sequence_with_challenge_ack() {
+        let mut socket = TcpSocket::accept(endpoint(8080), peer(49152), 11, 99, BbrV3::new(1460));
+        socket.mark_syn_ack_queued(0);
+
+        let outcome = deliver_segment(
+            &mut socket,
+            TcpPacket {
+                source_port: 49152,
+                destination_port: 8080,
+                sequence: 12,
+                acknowledgement: 0,
+                flags: TcpFlags::RST,
+                window_size: u16::MAX,
+                options: TcpOptions::empty(),
+                payload: &[],
+            },
+            TCP_INITIAL_RTO_NANOS,
+        );
+
+        assert_eq!(outcome, TcpSegmentOutcome::default());
+        assert_eq!(socket.state(), TcpState::SynReceived);
+        assert!(socket.pending_ack().is_some());
+    }
+
+    #[test]
+    fn ack_older_than_the_peer_window_drops_the_segment_and_draws_an_ack() {
+        let mut socket = established_socket();
+        let receive_next_before = socket.receive_next;
+        // SND.UNA is 8, so this wraps below zero: the comparison has to
+        // survive the sequence space's wraparound.
+        let ancient = socket
+            .send_unacknowledged
+            .wrapping_sub(socket.max_peer_receive_window + 1);
+
+        let outcome = deliver_segment(
+            &mut socket,
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: receive_next_before,
+                acknowledgement: ancient,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+                options: TcpOptions::empty(),
+                payload: b"forged",
+            },
+            TCP_INITIAL_RTO_NANOS + 1,
+        );
+
+        assert_eq!(outcome, TcpSegmentOutcome::default());
+        assert_eq!(socket.receive_next, receive_next_before);
+        assert_eq!(socket.receive(16, TCP_INITIAL_RTO_NANOS + 2), None);
+        let ack = socket
+            .pending_ack()
+            .expect("an ACK outside the acceptable range must draw an ACK");
+        assert_eq!(ack.acknowledgement, receive_next_before);
+    }
+
+    #[test]
+    fn ack_within_the_peer_window_behind_send_unacknowledged_still_delivers_payload() {
+        let mut socket = established_socket();
+        let behind = socket.send_unacknowledged.wrapping_sub(1000);
+        let receive_next = socket.receive_next;
+
+        let _ = deliver_segment(
+            &mut socket,
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: receive_next,
+                acknowledgement: behind,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+                options: TcpOptions::empty(),
+                payload: b"late",
+            },
+            TCP_INITIAL_RTO_NANOS + 1,
+        );
+
+        let received = socket
+            .receive(16, TCP_INITIAL_RTO_NANOS + 2)
+            .expect("a reordered old ACK is within RFC 5961's range");
+        assert_eq!(received.as_ref(), b"late");
+    }
+
+    #[test]
+    fn challenge_acks_are_limited_per_connection_and_per_interval() {
+        let forge = |socket: &mut TcpSocket<BbrV3>, now_nanos: u64| {
+            let receive_next = socket.receive_next;
+            let _ = deliver_segment(
+                socket,
+                TcpPacket {
+                    source_port: 80,
+                    destination_port: 49152,
+                    sequence: receive_next,
+                    acknowledgement: 0,
+                    flags: TcpFlags::SYN,
+                    window_size: u16::MAX,
+                    options: TcpOptions::empty(),
+                    payload: &[],
+                },
+                now_nanos,
+            );
+            let sent = socket.pending_ack().is_some();
+            if sent {
+                socket.mark_ack_queued();
+            }
+            sent
+        };
+        let now = TCP_INITIAL_RTO_NANOS + 1;
+        let mut attacked = established_socket();
+        let mut bystander = established_socket();
+
+        let sent = (0..u64::from(TCP_CHALLENGE_ACK_LIMIT) * 3)
+            .filter(|_| forge(&mut attacked, now))
+            .count();
+        assert_eq!(sent, usize::from(TCP_CHALLENGE_ACK_LIMIT));
+
+        // The attacked connection's exhausted budget says nothing about
+        // another connection's.
+        assert!(forge(&mut bystander, now));
+        // The budget renews with the next interval.
+        assert!(forge(&mut attacked, now + TCP_CHALLENGE_ACK_INTERVAL_NANOS));
     }
 
     #[test]
@@ -4985,6 +5263,108 @@ mod tests {
             .expect("opened window should transmit queued data normally");
         assert_eq!(segment.payload.as_ref(), b"bc");
         assert_eq!(segment.header.sequence, 9);
+    }
+
+    fn peer_ack(acknowledgement: u32, window_size: u16) -> TcpPacket<'static> {
+        TcpPacket {
+            source_port: 80,
+            destination_port: 49152,
+            sequence: 101,
+            acknowledgement,
+            flags: TcpFlags::ACK,
+            window_size,
+            options: TcpOptions::empty(),
+            payload: &[],
+        }
+    }
+
+    #[test]
+    fn window_update_at_snd_una_retires_probe_and_keeps_stream_intact() {
+        let mut socket = established_socket();
+        let _ = deliver_segment(&mut socket, peer_ack(8, 0), TCP_INITIAL_RTO_NANOS + 1);
+        assert_eq!(socket.queue_send(b"abc"), 3);
+        let deadline = TCP_INITIAL_RTO_NANOS + 2 + socket.retransmission_timer.timeout_nanos();
+        assert_eq!(
+            socket.take_transmit_segment(
+                TCP_INITIAL_RTO_NANOS + 2,
+                TcpSegmentBudget::wire_segments(usize::MAX)
+            ),
+            None
+        );
+        let probe = socket
+            .take_transmit_segment(deadline, TcpSegmentBudget::wire_segments(usize::MAX))
+            .expect("persist timer should send a one-byte probe");
+        assert_eq!(probe.payload.as_ref(), b"a");
+        assert_eq!(probe.header.sequence, 8);
+
+        // The window reopens with an ACK that acknowledges nothing new.
+        let _ = deliver_segment(&mut socket, peer_ack(8, 32), deadline + 1);
+        assert_eq!(socket.peer_receive_window(), 32);
+
+        let mut delivered = alloc::vec::Vec::new();
+        let first = socket
+            .take_transmit_segment(deadline + 2, TcpSegmentBudget::wire_segments(usize::MAX))
+            .expect("opened window should transmit queued data normally");
+        assert_eq!(first.header.sequence, 8);
+        delivered.extend_from_slice(&first.payload);
+        assert_eq!(socket.queue_send(b"def"), 3);
+        let second = socket
+            // Past the pacing interval the first segment scheduled.
+            .take_transmit_segment(
+                deadline + 1_000_000_000,
+                TcpSegmentBudget::wire_segments(usize::MAX),
+            )
+            .expect("opened window should transmit later data normally");
+        assert_eq!(second.header.sequence, 8 + first.payload.len() as u32);
+        delivered.extend_from_slice(&second.payload);
+        assert_eq!(delivered, b"abcdef");
+
+        let _ = deliver_segment(&mut socket, peer_ack(14, 32), deadline + 2_000_000_000);
+        assert_eq!(socket.send_unacknowledged, 14);
+        assert_eq!(socket.send_next, 14);
+        assert_eq!(socket.bytes_in_flight, 0);
+        assert!(socket.transmit_queue_is_empty());
+        assert!(
+            socket
+                .in_flight
+                .as_ref()
+                .is_none_or(|queue| queue.front().is_none())
+        );
+    }
+
+    #[test]
+    fn probe_at_sequence_wraparound_is_acknowledged() {
+        let mut socket = established_socket();
+        let _ = deliver_segment(&mut socket, peer_ack(8, 0), TCP_INITIAL_RTO_NANOS + 1);
+        socket.send_unacknowledged = u32::MAX;
+        socket.send_next = u32::MAX;
+        assert_eq!(socket.queue_send(b"abc"), 3);
+        let deadline = TCP_INITIAL_RTO_NANOS + 2 + socket.retransmission_timer.timeout_nanos();
+        assert_eq!(
+            socket.take_transmit_segment(
+                TCP_INITIAL_RTO_NANOS + 2,
+                TcpSegmentBudget::wire_segments(usize::MAX)
+            ),
+            None
+        );
+        let probe = socket
+            .take_transmit_segment(deadline, TcpSegmentBudget::wire_segments(usize::MAX))
+            .expect("persist timer should send a one-byte probe");
+        assert_eq!(probe.payload.as_ref(), b"a");
+        assert_eq!(probe.header.sequence, u32::MAX);
+
+        // ACK 0 acknowledges the probe byte, and its window update must
+        // not be discarded as an acknowledgement of unsent data.
+        let _ = deliver_segment(&mut socket, peer_ack(0, 32), deadline + 1);
+        assert_eq!(socket.peer_receive_window(), 32);
+        assert_eq!(socket.send_unacknowledged, 0);
+        assert_eq!(socket.send_next, 0);
+
+        let segment = socket
+            .take_transmit_segment(deadline + 2, TcpSegmentBudget::wire_segments(usize::MAX))
+            .expect("opened window should transmit the rest of the queue");
+        assert_eq!(segment.payload.as_ref(), b"bc");
+        assert_eq!(segment.header.sequence, 0);
     }
 
     #[test]
@@ -5453,6 +5833,89 @@ mod tests {
         assert_eq!(outcome, TcpSegmentOutcome::default());
         assert_eq!(socket.state(), TcpState::TimeWait);
         assert_eq!(socket.next_deadline_nanos(), Some(original_deadline));
+        assert!(socket.pending_ack().is_none());
+    }
+
+    /// An active close the peer has finished: the socket sits in
+    /// TIME-WAIT with nothing owed.
+    fn time_wait_socket() -> TcpSocket<BbrV3> {
+        let mut socket = established_socket();
+        socket.close_send();
+        let fin = socket
+            .take_transmit_segment(
+                TCP_INITIAL_RTO_NANOS + 1,
+                TcpSegmentBudget::wire_segments(usize::MAX),
+            )
+            .expect("active close must queue FIN");
+        let _ = deliver_segment(
+            &mut socket,
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 101,
+                acknowledgement: fin.header.sequence + 1,
+                flags: TcpFlags::ACK.union(TcpFlags::FIN),
+                window_size: u16::MAX,
+                options: TcpOptions::empty(),
+                payload: &[],
+            },
+            TCP_INITIAL_RTO_NANOS + 2,
+        );
+        assert_eq!(socket.state(), TcpState::TimeWait);
+        socket.mark_ack_queued();
+        socket
+    }
+
+    #[test]
+    fn time_wait_answers_syn_with_challenge_ack() {
+        let mut socket = time_wait_socket();
+        let receive_next = socket.receive_next;
+
+        let outcome = deliver_segment(
+            &mut socket,
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: receive_next.wrapping_add(1 << 30),
+                acknowledgement: 0,
+                flags: TcpFlags::SYN,
+                window_size: u16::MAX,
+                options: TcpOptions::empty(),
+                payload: &[],
+            },
+            TCP_INITIAL_RTO_NANOS + 3,
+        );
+
+        assert_eq!(outcome, TcpSegmentOutcome::default());
+        assert_eq!(socket.state(), TcpState::TimeWait);
+        let ack = socket
+            .pending_ack()
+            .expect("a SYN in TIME-WAIT must draw a challenge ACK");
+        assert_eq!(ack.acknowledgement, receive_next);
+    }
+
+    #[test]
+    fn time_wait_ignores_rst_even_at_the_next_sequence() {
+        let mut socket = time_wait_socket();
+        let receive_next = socket.receive_next;
+
+        let outcome = deliver_segment(
+            &mut socket,
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: receive_next,
+                acknowledgement: 0,
+                flags: TcpFlags::RST,
+                window_size: u16::MAX,
+                options: TcpOptions::empty(),
+                payload: &[],
+            },
+            TCP_INITIAL_RTO_NANOS + 3,
+        );
+
+        assert_eq!(outcome, TcpSegmentOutcome::default());
+        assert_eq!(socket.state(), TcpState::TimeWait);
         assert!(socket.pending_ack().is_none());
     }
 

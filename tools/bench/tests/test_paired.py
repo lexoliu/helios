@@ -24,7 +24,7 @@ from bench_stub import fake_checkout, fake_inspector, records, workload
 from helios_bench.baseline import Baseline
 from helios_bench.cli import main as cli_main
 from helios_bench.gate import GateKind, evaluate, evaluate_paired, gate_report
-from helios_bench.manifest import load_manifest
+from helios_bench.manifest import WasmtimePin, load_manifest
 from helios_bench.plots import plot_report
 from helios_bench.render import render_gate, render_pins, render_tables
 from helios_bench.report import InstructionSampling, Report, Side, load_report, save_report
@@ -49,6 +49,8 @@ WORKLOADS = [
     workload("cpython-json", "compute"),
     workload("hostcall-loop", "hostcall"),
 ]
+
+BASELINE_FORK = WasmtimePin(repository="lexoliu/wasmtime", revision="2fb47b20" + "0" * 32)
 
 
 def boot_order(order_log: Path) -> list[tuple[str, str, str, str]]:
@@ -80,7 +82,9 @@ def driver(tmp_path, monkeypatch):
     return module
 
 
-def run_side(driver, tmp_path, images: list, services=None, shared_endpoints=None) -> Path:
+def run_side(
+    driver, tmp_path, images: list, services=None, shared_endpoints=None, profile_boot=False
+) -> Path:
     driver.run_helios(
         Path("tools/wasi-apps/workloads.json"),
         images,
@@ -96,6 +100,7 @@ def run_side(driver, tmp_path, images: list, services=None, shared_endpoints=Non
         skip_build=False,
         control_workload=None,
         keep_going=True,
+        profile_boot=profile_boot,
     )
     return tmp_path / "order"
 
@@ -142,7 +147,8 @@ def host_services(driver, tmp_path, monkeypatch):
         return Server(port), port
 
     monkeypatch.setattr(driver, "start_host_http", start)
-    monkeypatch.setattr(driver, "start_tcp_throughput_server", start)
+    monkeypatch.setattr(driver, "start_tcp_download_server", start)
+    monkeypatch.setattr(driver, "start_tcp_upload_server", start)
     monkeypatch.setattr(driver, "start_host_tcp_echo", start)
     services = driver.HostServices(tmp_path, "10.77.0.1", "10.77.0.1", http=True, tcp=True, tcp_echo=True)
     return services, events
@@ -157,7 +163,7 @@ def test_guest_boots_isolate_listeners_unless_reuse_is_explicit(
     run_once = driver.run_helios_once
 
     def record(*args, **kwargs):
-        endpoints.append(args[8:12])
+        endpoints.append(args[8:13])
         return run_once(*args, **kwargs)
 
     monkeypatch.setattr(driver, "run_helios_once", record)
@@ -168,9 +174,10 @@ def test_guest_boots_isolate_listeners_unless_reuse_is_explicit(
     assert len({endpoint[0] for endpoint in endpoints}) == expected
     assert len({endpoint[2] for endpoint in endpoints}) == expected
     assert len({endpoint[3] for endpoint in endpoints}) == expected
+    assert len({endpoint[4] for endpoint in endpoints}) == expected
     assert all(endpoint[1] == "10.77.0.1" for endpoint in endpoints)
     started = [port for event, port in events if event == "start"]
-    assert len(started) == expected * 3
+    assert len(started) == expected * 4
     for port in started:
         assert [event for event, value in events if value == port] == ["start", "shutdown", "close"]
 
@@ -180,7 +187,7 @@ def test_host_listeners_close_when_the_guest_scope_fails(host_services):
     with pytest.raises(RuntimeError, match="guest failed"):
         with services.serve():
             raise RuntimeError("guest failed")
-    assert [event for event, _ in events].count("close") == 3
+    assert [event for event, _ in events].count("close") == 4
 
 
 def test_host_listeners_close_after_partial_startup(driver, monkeypatch, host_services):
@@ -189,7 +196,7 @@ def test_host_listeners_close_after_partial_startup(driver, monkeypatch, host_se
     def refuse(*args):
         raise RuntimeError("bind failed")
 
-    monkeypatch.setattr(driver, "start_tcp_throughput_server", refuse)
+    monkeypatch.setattr(driver, "start_tcp_download_server", refuse)
     with pytest.raises(RuntimeError, match="bind failed"):
         with services.serve():
             pytest.fail("startup should fail")
@@ -306,6 +313,7 @@ def run_three(driver, tmp_path, images: list, unit_orders: dict[str, str] | None
         control_workload=None,
         keep_going=True,
         unit_orders=unit_orders,
+        profile_boot=False,
     )
     return [guest for _, guest, _, _ in boot_order(tmp_path / "order")]
 
@@ -481,7 +489,13 @@ def test_the_driver_parses_the_baseline_flags_the_plan_emits(tmp_path, reuse) ->
         out_dir=tmp_path,
         advisory=True,
         sides=frozenset({Side.HELIOS, Side.HELIOS_BASELINE}),
-        baseline=Baseline(ref="merge-base", sha="a" * 40, worktree=tmp_path / "worktree"),
+        baseline=Baseline(
+            ref="merge-base",
+            sha="a" * 40,
+            worktree=tmp_path / "worktree",
+            wasmtime=BASELINE_FORK,
+            fork_root="",
+        ),
         network=NetworkOptions(reuse_host_listeners=reuse),
     )
     commands = [
@@ -532,6 +546,7 @@ def granted_budgets(
         skip_build=False,
         control_workload=control,
         keep_going=True,
+        profile_boot=False,
     )
     return granted
 
@@ -550,7 +565,7 @@ def test_the_paired_budget_charges_nothing_before_the_first_unit(driver, tmp_pat
     side = 60
     granted = granted_budgets(driver, tmp_path, monkeypatch, None, side=side, build_seconds=7)
 
-    boots = driver.side_boots(len(WORKLOADS), 2, None)
+    boots = driver.side_boots(len(WORKLOADS), 2, None, False)
     assert boots == len(granted) == 6
     expected = driver.class_budget(side, boots, PER_UNIT_CAP)
     # Only the clock ticking through the assertion itself separates the
@@ -575,7 +590,7 @@ def test_the_control_boots_take_a_share_and_not_a_cap(driver, tmp_path, monkeypa
     control = workload("quickjs-loop", "compute")
     granted = granted_budgets(driver, tmp_path, monkeypatch, control, side=side, build_seconds=0)
 
-    boots = driver.side_boots(len(WORKLOADS), 2, control)
+    boots = driver.side_boots(len(WORKLOADS), 2, control, False)
     assert boots == len(granted) == 10, "three workloads and a control, before and after, per image"
     expected = driver.class_budget(side, boots, PER_UNIT_CAP)
     assert expected - granted[0] <= 1
@@ -635,6 +650,35 @@ def test_a_paired_report_names_each_side_tooling_revision(paired_regression_repo
     pins = render_pins(paired_regression_report)
     assert f"| `helios-inspector`/`helios-cli` | `{run.inspector_git_sha}` |" in pins
     assert f"| `helios-inspector`/`helios-cli`, baseline | `{run.baseline_inspector_git_sha}` |" in pins
+
+
+def test_a_paired_report_names_each_columns_wasmtime_fork(paired_regression_report: Report) -> None:
+    """#486: each column is built against the fork its own commit pins,
+    and the header, the pins table and the gate's column labels name it."""
+    candidate_fork = paired_regression_report.pins.wasmtime_revision
+    baseline_fork = "2fb47b20" + "c" * 32
+    report = paired_regression_report.model_copy(
+        update={
+            "pins": paired_regression_report.pins.model_copy(
+                update={"baseline_wasmtime_revision": baseline_fork}
+            )
+        }
+    )
+    tables = render_tables(report)
+    header = next(line for line in tables.splitlines() if line.startswith("Helios `"))
+    assert f"Wasmtime `{candidate_fork[:12]}`" in header
+    assert f"Wasmtime `{baseline_fork[:12]}`" in header
+    pins = render_pins(report)
+    assert f"| Vendored Wasmtime | `{candidate_fork}` |" in pins
+    assert f"| Vendored Wasmtime, baseline | `{baseline_fork}` |" in pins
+    result = evaluate_paired(report)
+    assert result is not None
+    assert f"Wasmtime `{candidate_fork[:12]}`" in result.candidate_label
+    assert f"Wasmtime `{baseline_fork[:12]}`" in result.baseline_label
+    # A report from before the field names no column's fork rather than
+    # the candidate's for both.
+    legacy = evaluate_paired(paired_regression_report)
+    assert legacy is not None and "Wasmtime" not in legacy.baseline_label + legacy.candidate_label
 
 
 def test_an_unpaired_report_keeps_its_three_columns(baseline_report: Report) -> None:
@@ -1168,7 +1212,9 @@ def test_a_paired_baseline_can_carry_its_own_profile(tmp_path) -> None:
         out_dir=tmp_path / "out",
         advisory=True,
         sides=frozenset({Side.HELIOS, Side.HELIOS_BASELINE, Side.HELIOS_BASELINE_REBUILD}),
-        baseline=Baseline(ref="dev", sha="b" * 40, worktree=tmp_path / "worktree"),
+        baseline=Baseline(
+            ref="dev", sha="b" * 40, worktree=tmp_path / "worktree", wasmtime=BASELINE_FORK, fork_root=""
+        ),
         baseline_profile_use=profile,
         baseline_rebuild_profile_use=rebuild,
     )
@@ -1209,7 +1255,9 @@ def test_a_per_run_baseline_profile_needs_its_rebuild(tmp_path) -> None:
         "out_dir": tmp_path / "out",
         "advisory": True,
         "sides": frozenset({Side.HELIOS, Side.HELIOS_BASELINE, Side.HELIOS_BASELINE_REBUILD}),
-        "baseline": Baseline(ref="dev", sha="b" * 40, worktree=tmp_path / "worktree"),
+        "baseline": Baseline(
+            ref="dev", sha="b" * 40, worktree=tmp_path / "worktree", wasmtime=BASELINE_FORK, fork_root=""
+        ),
     }
     with pytest.raises(SystemExit, match="--baseline-rebuild-profile-use"):
         RunOptions(**common, baseline_profile_use=profile)
@@ -1245,7 +1293,9 @@ def test_the_plain_control_reads_no_profile(tmp_path) -> None:
             out_dir=tmp_path / "out",
             advisory=True,
             sides=frozenset({Side.HELIOS, Side.HELIOS_BASELINE}),
-            baseline=Baseline(ref="dev", sha="b" * 40, worktree=tmp_path / "worktree"),
+            baseline=Baseline(
+                ref="dev", sha="b" * 40, worktree=tmp_path / "worktree", wasmtime=BASELINE_FORK, fork_root=""
+            ),
             baseline_profile_use=profile,
             plain_baseline=True,
         )
@@ -1276,7 +1326,9 @@ def test_a_per_column_baseline_profile_names_itself(tmp_path, monkeypatch) -> No
         out_dir=tmp_path / "out",
         advisory=True,
         sides=frozenset({Side.HELIOS, Side.HELIOS_BASELINE, Side.HELIOS_BASELINE_REBUILD}),
-        baseline=Baseline(ref="dev", sha="b" * 40, worktree=tmp_path / "worktree"),
+        baseline=Baseline(
+            ref="dev", sha="b" * 40, worktree=tmp_path / "worktree", wasmtime=BASELINE_FORK, fork_root=""
+        ),
         profile_use=tmp_path / "pgo-candidate" / "helios-kernel.profdata",
         baseline_profile_use=profile,
         baseline_rebuild_profile_use=rebuild,
@@ -1484,7 +1536,13 @@ def test_the_sampling_record_reaches_the_run_record(tmp_path, monkeypatch) -> No
         out_dir=tmp_path,
         advisory=True,
         sides=frozenset({Side.HELIOS, Side.HELIOS_BASELINE}),
-        baseline=Baseline(ref="merge-base", sha="a" * 40, worktree=tmp_path / "worktree"),
+        baseline=Baseline(
+            ref="merge-base",
+            sha="a" * 40,
+            worktree=tmp_path / "worktree",
+            wasmtime=BASELINE_FORK,
+            fork_root="",
+        ),
     )
     monkeypatch.setenv("HELIOS_BENCH_INSTRUCTION_PROFILE", "1")
     (tmp_path / "helios").mkdir()
@@ -1511,3 +1569,177 @@ def test_a_sampled_run_cannot_be_published(tmp_path, monkeypatch) -> None:
     )
     with pytest.raises(SystemExit, match="instruction sampling requested for diagnosis"):
         run_suite(options, manifest, dry_run=True)
+
+
+# The profile boot (#747). The span profiler and the kernel counters sit
+# inside every iteration they time, and the Linux columns carry nothing
+# like them, so no timed boot runs with them: the kernel profile and the
+# perf metrics come from a second boot of each unit that nothing times.
+
+
+def profile_requests(tmp_path) -> list[dict]:
+    """What every boot of the side was handed, in order, as the stand-in saw it."""
+    boots = []
+    for line in (tmp_path / "profiles").read_text(encoding="utf-8").splitlines():
+        guest, log, kernel, perf, wasm, user = line.split("|")
+        boots.append({"guest": guest, "log": log, "kernel": kernel, "perf": perf, "wasm": wasm, "user": user})
+    return boots
+
+
+@pytest.fixture
+def profiled(driver, tmp_path, monkeypatch):
+    monkeypatch.setenv("HELIOS_TEST_PROFILE_LOG", str(tmp_path / "profiles"))
+    # A caller who exported the variables must not turn a timed boot into
+    # a profiled one.
+    for variable in driver.TIMED_BOOT_PROFILE_VARIABLES:
+        monkeypatch.setenv(variable, "/inherited/from/the/caller")
+
+
+def test_no_timed_boot_is_asked_for_a_profile_and_every_profile_boot_is(driver, tmp_path, profiled) -> None:
+    images = images_of(driver, tmp_path, paired=True)
+    run_side(driver, tmp_path, images, profile_boot=True)
+
+    boots = profile_requests(tmp_path)
+    timed, profile = boots[:6], boots[6:]
+    # Both images boot each of the three units, then both boot each again.
+    assert len(boots) == 12
+    for boot in timed:
+        assert (boot["kernel"], boot["perf"], boot["wasm"], boot["user"]) == ("", "", "", "")
+    for boot in profile:
+        assert boot["kernel"].endswith(".kernel.folded")
+        assert boot["perf"].endswith(".perf.json")
+    assert {(boot["guest"], boot["log"]) for boot in timed} == {
+        (guest, f"helios-{unit}.jsonl")
+        for guest in ("candidate", "baseline")
+        for unit in ("quickjs-loop", "cpython-json", "hostcall-loop")
+    }
+    assert {(boot["guest"], boot["log"]) for boot in profile} == {
+        (guest, f"helios-{unit}.jsonl")
+        for guest in ("candidate", "baseline")
+        for unit in ("quickjs-loop", "cpython-json", "hostcall-loop")
+    }, "the profile boot is the same image and the same workloads"
+
+
+def test_the_artifacts_keep_their_names_and_no_timing_comes_from_the_profile_boot(
+    driver, tmp_path, profiled
+) -> None:
+    images = images_of(driver, tmp_path, paired=True)
+    run_side(driver, tmp_path, images, profile_boot=True)
+
+    for image in images:
+        names = sorted(path.name for path in image.out_dir.iterdir() if path.is_file())
+        for unit in ("quickjs-loop", "cpython-json", "hostcall-loop"):
+            assert f"helios-{unit}.kernel.folded" in names
+            assert f"helios-{unit}.perf.json" in names
+        # The timed records: one summary per workload, none from the
+        # profile boot, whose own JSONL is kept apart where no reader looks.
+        merged = (image.out_dir / "helios.jsonl").read_text(encoding="utf-8").splitlines()
+        assert len(merged) == 3
+        kept = sorted(path.name for path in (image.out_dir / driver.PROFILE_BOOT_DIR).iterdir())
+        assert kept == [
+            f"helios-{unit}.jsonl" for unit in sorted(("quickjs-loop", "cpython-json", "hostcall-loop"))
+        ]
+        record = json.loads((image.out_dir / driver.PROFILE_BOOT_RECORD).read_text(encoding="utf-8"))
+        assert record == {
+            "timed": False,
+            "iterations": 1,
+            "units": ["quickjs-loop", "cpython-json", "hostcall-loop"],
+            "failed": [],
+        }
+
+
+def test_the_profile_boots_follow_every_timed_boot(driver, tmp_path, profiled) -> None:
+    """Nothing timed sits behind a profiled boot, and the report says
+    which boot its profile came from."""
+    run_side(driver, tmp_path, images_of(driver, tmp_path, paired=True), profile_boot=True)
+
+    boots = profile_requests(tmp_path)
+    requested = [bool(boot["kernel"]) for boot in boots]
+    assert requested == [False] * 6 + [True] * 6
+
+
+def test_skipping_the_profile_boot_removes_the_second_boot(driver, tmp_path, profiled) -> None:
+    images = images_of(driver, tmp_path, paired=True)
+    stale = images[0].out_dir / driver.PROFILE_BOOT_RECORD
+    stale.write_text("{}", encoding="utf-8")
+    run_side(driver, tmp_path, images, profile_boot=False)
+
+    boots = profile_requests(tmp_path)
+    assert len(boots) == 6
+    assert not any(boot["kernel"] or boot["perf"] for boot in boots)
+    for image in images:
+        assert not list(image.out_dir.glob("*.kernel.folded"))
+        assert not list(image.out_dir.glob("*.perf.json"))
+        assert not (image.out_dir / driver.PROFILE_BOOT_DIR).exists()
+        assert not (image.out_dir / driver.PROFILE_BOOT_RECORD).exists(), "a stale record is removed"
+
+
+def test_a_failed_profile_boot_fails_the_run_and_keeps_every_timed_record(
+    driver, tmp_path, profiled, monkeypatch
+) -> None:
+    monkeypatch.setenv("HELIOS_TEST_PROFILE_FAIL", "1")
+    images = images_of(driver, tmp_path, paired=True)
+    with pytest.raises(driver.ProfileBootFailed, match="every timed record of the run is complete") as raised:
+        run_side(driver, tmp_path, images, profile_boot=True)
+
+    assert raised.value.log == images[0].log()
+    # keep_going: every unit of every image still got its profile boot.
+    assert len(profile_requests(tmp_path)) == 12
+    for image in images:
+        merged = (image.out_dir / "helios.jsonl").read_text(encoding="utf-8").splitlines()
+        assert len(merged) == 3, "the timed records are whole"
+        record = json.loads((image.out_dir / driver.PROFILE_BOOT_RECORD).read_text(encoding="utf-8"))
+        assert record["units"] == []
+        assert record["failed"] == ["cpython-json", "hostcall-loop", "quickjs-loop"]
+
+
+def test_a_failed_profile_boot_ends_a_run_that_does_not_keep_going(
+    driver, tmp_path, profiled, monkeypatch
+) -> None:
+    monkeypatch.setenv("HELIOS_TEST_PROFILE_FAIL", "1")
+    images = images_of(driver, tmp_path, paired=True)
+    run_once = driver.run_helios
+
+    def strict(*args, **kwargs):
+        return run_once(*args, **{**kwargs, "keep_going": False})
+
+    monkeypatch.setattr(driver, "run_helios", strict)
+    with pytest.raises(driver.ProfileBootFailed):
+        run_side(driver, tmp_path, images, profile_boot=True)
+
+    assert len(profile_requests(tmp_path)) == 7, "six timed boots and the first profile boot"
+
+
+def test_a_unit_whose_timed_boot_was_lost_is_not_profiled(driver, tmp_path, profiled, monkeypatch) -> None:
+    images = images_of(driver, tmp_path, paired=False)
+    real = driver.run_helios_once
+
+    def refuse_hostcall(image, manifest, log, *args, **kwargs):
+        if kwargs.get("profile_for") is None and log.name == "helios-hostcall.jsonl":
+            raise driver.HeliosRunFailed("the guest died")
+        return real(image, manifest, log, *args, **kwargs)
+
+    monkeypatch.setattr(driver, "run_helios_once", refuse_hostcall)
+    run_side(driver, tmp_path, images, profile_boot=True)
+
+    profile = [boot for boot in profile_requests(tmp_path) if boot["kernel"]]
+    assert [boot["log"] for boot in profile] == ["helios-compute.jsonl"]
+
+
+def test_the_sampler_stays_on_the_timed_boots(driver, tmp_path, profiled, monkeypatch) -> None:
+    """The opt-in sampler keeps its meaning: a sampled run is a diagnosis
+    whose timings carry the sampler, so the second boot does not sample."""
+    monkeypatch.setenv("HELIOS_BENCH_INSTRUCTION_PROFILE", "1")
+    images = images_of(driver, tmp_path, paired=True)
+    run_side(driver, tmp_path, images, profile_boot=True)
+
+    for image in images:
+        assert len(list(image.out_dir.glob("*.pc.folded"))) == 3
+        record = json.loads((image.out_dir / driver.INSTRUCTION_SAMPLING_RECORD).read_text(encoding="utf-8"))
+        assert record["boots"] == 3
+
+
+def test_a_profile_boot_is_inside_the_sides_budget(driver) -> None:
+    assert driver.side_boots(3, 2, None, True) == 12
+    assert driver.side_boots(3, 2, {"name": "control"}, True) == 16
+    assert driver.side_boots(3, 2, None, False) == 6

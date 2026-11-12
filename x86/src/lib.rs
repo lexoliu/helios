@@ -15,6 +15,7 @@ mod host_fs;
 mod input;
 mod ioapic;
 mod iommu;
+mod memory_type;
 mod net;
 mod pci;
 mod rtc;
@@ -331,20 +332,31 @@ fn x86_kernel_main() -> ! {
     // before it is programmed, and that pass also programs the block
     // device, which needs the root DRBG this call produces. It joins
     // through the reseed task once the executor runs.
-    let root_entropy =
-        helios_kernel::seed_root_entropy(&cpu, None, None::<&helios_kernel::NoEntropyDevice>);
+    // No VM generation ID window is discovered on this platform yet, so
+    // the machine generation moves only through `advance`.
+    let machine_generation = helios_kernel::MachineGeneration::new(None);
+    debug_state.install_machine_generation(machine_generation.clone());
+    let root_entropy = helios_kernel::seed_root_entropy(
+        &cpu,
+        None,
+        None::<&helios_kernel::NoEntropyDevice>,
+        machine_generation,
+    );
     debug_state.install_root_entropy(root_entropy.clone());
     // The calendar is read once, here, before any component can ask
     // what time it is. The TSC carries wall time forward from that
-    // reading; nothing re-synchronises it afterwards.
-    match rtc::discover(rsdp_address, physical_memory_offset) {
+    // reading; only a machine restore re-reads it, which the reactions
+    // task does with the same clock.
+    let rtc = rtc::discover(rsdp_address, physical_memory_offset);
+    match &rtc {
         Some(rtc) => {
-            debug_state.seed_wall_clock(cpu.now().ticks(), &rtc);
+            debug_state.seed_wall_clock(cpu.now().ticks(), rtc);
         }
         None => {
             tracing::warn!("the FADT points at no readable CMOS clock; wall time reads as uptime");
         }
     }
+    helios_kernel::install_generation_reactions(&kernel, debug_state.clone(), rtc);
     // Devices are brought up while the bootstrap processor still runs
     // with interrupts masked, so their MSI-X routes are published before
     // the first message can be delivered.
@@ -1310,6 +1322,14 @@ extern "C" fn wasmtime_tls_get(slot: usize) -> *mut u8 {
 #[unsafe(no_mangle)]
 extern "C" fn wasmtime_tls_set(slot: usize, ptr: *mut u8) {
     smp::current_runtime().wasmtime_tls.set(slot, ptr);
+}
+
+/// The executing processor's guest stack-limit word, the location the
+/// kernel's engines publish stack limits to
+/// (`helios_hal::cpu::GUEST_STACK_LIMIT_OFFSET`).
+#[unsafe(no_mangle)]
+extern "C" fn wasmtime_processor_stack_limit() -> *mut usize {
+    smp::current_guest_stack_limit().as_ptr()
 }
 
 #[unsafe(no_mangle)]

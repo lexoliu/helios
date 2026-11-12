@@ -18,6 +18,8 @@ use helios_hal::io::IoResult;
 use std::sync::Mutex;
 use triomphe::Arc;
 
+use crate::process::test_caps;
+
 use super::owner::{device_channels, drain_input_events};
 use super::service::{EVENT_QUEUE_DEPTH, InputService, InputShared};
 use super::{InputServiceError, MAX_CLAIMED_DEVICES};
@@ -126,16 +128,20 @@ fn poll_until_parked<F: Future>(future: F) {
 fn a_second_claim_of_the_same_device_is_refused() {
     let service = service_of(&[KEYBOARD, TABLET]);
 
-    let held = service.claim(KEYBOARD).expect("the first claim succeeds");
+    let held = service
+        .claim(KEYBOARD, test_caps::input())
+        .expect("the first claim succeeds");
 
     assert_eq!(
-        service.claim(KEYBOARD).err(),
+        service.claim(KEYBOARD, test_caps::input()).err(),
         Some(InputServiceError::AlreadyClaimed)
     );
     // A different device is unaffected: they are claimed one at a time
     // so a compositor can hold them all and a program that wants only
     // the tablet still can.
-    service.claim(TABLET).expect("another device is still free");
+    service
+        .claim(TABLET, test_caps::input())
+        .expect("another device is still free");
     drop(held);
 }
 
@@ -145,12 +151,16 @@ fn a_second_claim_of_the_same_device_is_refused() {
 fn two_devices_of_one_name_are_both_claimable() {
     let service = service_of(&[KEYBOARD, KEYBOARD]);
 
-    let first = service.claim(KEYBOARD).expect("the first is free");
-    let second = service.claim(KEYBOARD).expect("the second is free too");
+    let first = service
+        .claim(KEYBOARD, test_caps::input())
+        .expect("the first is free");
+    let second = service
+        .claim(KEYBOARD, test_caps::input())
+        .expect("the second is free too");
 
     assert_ne!(first.index(), second.index());
     assert_eq!(
-        service.claim(KEYBOARD).err(),
+        service.claim(KEYBOARD, test_caps::input()).err(),
         Some(InputServiceError::AlreadyClaimed)
     );
 }
@@ -162,7 +172,9 @@ fn an_unknown_device_name_is_refused_by_name() {
     let service = service_of(&[KEYBOARD]);
 
     assert_eq!(
-        service.claim("Some Other Keyboard").err(),
+        service
+            .claim("Some Other Keyboard", test_caps::input())
+            .err(),
         Some(InputServiceError::NoSuchDevice)
     );
 }
@@ -174,7 +186,7 @@ fn a_machine_with_no_input_device_says_so() {
     let service = service_of(&[]);
 
     assert_eq!(
-        service.claim(KEYBOARD).err(),
+        service.claim(KEYBOARD, test_caps::input()).err(),
         Some(InputServiceError::Unavailable)
     );
     assert_eq!(service.device_count(), 0);
@@ -187,11 +199,15 @@ fn a_machine_with_no_input_device_says_so() {
 fn dropping_a_claim_releases_the_device() {
     let service = service_of(&[KEYBOARD]);
 
-    let held = service.claim(KEYBOARD).expect("the first claim succeeds");
+    let held = service
+        .claim(KEYBOARD, test_caps::input())
+        .expect("the first claim succeeds");
     let first_generation = held.generation();
     drop(held);
 
-    let again = service.claim(KEYBOARD).expect("a released device is free");
+    let again = service
+        .claim(KEYBOARD, test_caps::input())
+        .expect("a released device is free");
     assert!(
         again.generation() > first_generation,
         "every claim gets a generation of its own, so a request that \
@@ -211,15 +227,19 @@ fn a_claimed_device_relays_whole_reports_in_order() {
     let device = ScriptedDevice::new(KEYBOARD, script);
     let (shared, _requests) = device_channels(0, device.capabilities().clone());
     let service = InputService::from_devices(Arc::new(one(shared.clone())));
-    let claim = service.claim(KEYBOARD).expect("the device is free");
+    let claim = service
+        .claim(KEYBOARD, test_caps::input())
+        .expect("the device is free");
     let mut events = claim.events();
 
     poll_until_parked(drain_input_events(&device, &shared));
 
     let mut context = Context::from_waker(Waker::noop());
     let burst = match events.poll_burst(&mut context) {
-        Poll::Ready(burst) => burst,
-        Poll::Pending => panic!("two reports were committed, so a read has to find them"),
+        Poll::Ready(Some(burst)) => burst,
+        Poll::Ready(None) | Poll::Pending => {
+            panic!("two reports were committed, so a read has to find them")
+        }
     };
     assert_eq!(
         burst.as_slice(),
@@ -265,7 +285,9 @@ fn a_full_queue_drops_a_whole_report_and_counts_one() {
     let device = ScriptedDevice::new(KEYBOARD, script);
     let (shared, _requests) = device_channels(0, device.capabilities().clone());
     let service = InputService::from_devices(Arc::new(one(shared.clone())));
-    let claim = service.claim(KEYBOARD).expect("the device is free");
+    let claim = service
+        .claim(KEYBOARD, test_caps::input())
+        .expect("the device is free");
     let mut events = claim.events();
 
     poll_until_parked(drain_input_events(&device, &shared));
@@ -281,8 +303,8 @@ fn a_full_queue_drops_a_whole_report_and_counts_one() {
     // with the `SYN_REPORT` that closed it.
     let mut context = Context::from_waker(Waker::noop());
     let burst = match events.poll_burst(&mut context) {
-        Poll::Ready(burst) => burst,
-        Poll::Pending => panic!("a full queue has events in it"),
+        Poll::Ready(Some(burst)) => burst,
+        Poll::Ready(None) | Poll::Pending => panic!("a full queue has events in it"),
     };
     assert_eq!(burst.len(), EVENT_QUEUE_DEPTH);
     assert!(
@@ -304,7 +326,9 @@ fn a_reader_that_catches_up_is_served_again() {
     let device = ScriptedDevice::new(KEYBOARD, script);
     let (shared, _requests) = device_channels(0, device.capabilities().clone());
     let service = InputService::from_devices(Arc::new(one(shared.clone())));
-    let claim = service.claim(KEYBOARD).expect("the device is free");
+    let claim = service
+        .claim(KEYBOARD, test_caps::input())
+        .expect("the device is free");
     let mut events = claim.events();
     poll_until_parked(drain_input_events(&device, &shared));
 
@@ -316,8 +340,8 @@ fn a_reader_that_catches_up_is_served_again() {
     poll_until_parked(drain_input_events(&follow_up, &shared));
 
     let burst = match events.poll_burst(&mut context) {
-        Poll::Ready(burst) => burst,
-        Poll::Pending => panic!("a drained queue accepts the next report"),
+        Poll::Ready(Some(burst)) => burst,
+        Poll::Ready(None) | Poll::Pending => panic!("a drained queue accepts the next report"),
     };
     assert_eq!(burst[0], InputEvent::new(codes::EV_KEY, codes::KEY_B, 1));
     assert_eq!(service.snapshot()[0].lost_reports, 1);
@@ -331,7 +355,9 @@ fn a_reader_with_nothing_to_read_parks() {
     let device = ScriptedDevice::new(KEYBOARD, key_report(codes::KEY_A, 1).to_vec());
     let (shared, _requests) = device_channels(0, device.capabilities().clone());
     let service = InputService::from_devices(Arc::new(one(shared.clone())));
-    let claim = service.claim(KEYBOARD).expect("the device is free");
+    let claim = service
+        .claim(KEYBOARD, test_caps::input())
+        .expect("the device is free");
     let mut events = claim.events();
 
     let mut context = Context::from_waker(Waker::noop());
@@ -350,11 +376,15 @@ fn a_release_throws_away_what_its_owner_never_read() {
     let device = ScriptedDevice::new(KEYBOARD, key_report(codes::KEY_A, 1).to_vec());
     let (shared, _requests) = device_channels(0, device.capabilities().clone());
     let service = InputService::from_devices(Arc::new(one(shared.clone())));
-    let claim = service.claim(KEYBOARD).expect("the device is free");
+    let claim = service
+        .claim(KEYBOARD, test_caps::input())
+        .expect("the device is free");
     poll_until_parked(drain_input_events(&device, &shared));
     drop(claim);
 
-    let claim = service.claim(KEYBOARD).expect("a released device is free");
+    let claim = service
+        .claim(KEYBOARD, test_caps::input())
+        .expect("a released device is free");
     let mut events = claim.events();
     let mut context = Context::from_waker(Waker::noop());
 
@@ -364,6 +394,102 @@ fn a_release_throws_away_what_its_owner_never_read() {
     );
 }
 
+/// A stream outlives nothing: once its claim is let go the reader ends,
+/// after it has read what was already queued for it.
+#[test]
+fn a_reader_ends_when_its_claim_is_released() {
+    let device = ScriptedDevice::new(KEYBOARD, key_report(codes::KEY_A, 1).to_vec());
+    let (shared, _requests) = device_channels(0, device.capabilities().clone());
+    let service = InputService::from_devices(Arc::new(one(shared.clone())));
+    let claim = service
+        .claim(KEYBOARD, test_caps::input())
+        .expect("the device is free");
+    let mut events = claim.events();
+    let mut context = Context::from_waker(Waker::noop());
+    assert!(matches!(events.poll_burst(&mut context), Poll::Pending));
+
+    poll_until_parked(drain_input_events(&device, &shared));
+    drop(claim);
+
+    assert!(
+        matches!(events.poll_burst(&mut context), Poll::Ready(Some(_))),
+        "what was queued before the release is still the reader's"
+    );
+    assert!(
+        matches!(events.poll_burst(&mut context), Poll::Ready(None)),
+        "the reader ends once its claim is gone and its queue is empty"
+    );
+}
+
+/// A reader kept past its claim never sees the next owner's input: the
+/// next claim's reports go to its own queue, and the old reader only
+/// ends.
+#[test]
+fn a_stale_reader_never_sees_the_next_claims_events() {
+    let device = ScriptedDevice::new(KEYBOARD, key_report(codes::KEY_A, 1).to_vec());
+    let (shared, _requests) = device_channels(0, device.capabilities().clone());
+    let service = InputService::from_devices(Arc::new(one(shared.clone())));
+    let first = service
+        .claim(KEYBOARD, test_caps::input())
+        .expect("the device is free");
+    let mut stale = first.events();
+    drop(first);
+
+    let second = service
+        .claim(KEYBOARD, test_caps::input())
+        .expect("a released device is free");
+    let mut fresh = second.events();
+    poll_until_parked(drain_input_events(&device, &shared));
+
+    let mut context = Context::from_waker(Waker::noop());
+    assert!(
+        matches!(stale.poll_burst(&mut context), Poll::Ready(None)),
+        "the first claim's reader ends without reading the second claim's report"
+    );
+    let burst = match fresh.poll_burst(&mut context) {
+        Poll::Ready(Some(burst)) => burst,
+        Poll::Ready(None) | Poll::Pending => panic!("the second claim is owed the report"),
+    };
+    assert_eq!(
+        burst.as_slice(),
+        &[
+            InputEvent::new(codes::EV_KEY, codes::KEY_A, 1),
+            InputEvent::new(codes::EV_SYN, codes::SYN_REPORT, 0),
+        ],
+        "the second claim sees the whole report"
+    );
+}
+
+/// An indicator request queued under a claim that is then released fails
+/// its check, however long the device sits unclaimed.
+#[test]
+fn an_indicator_request_queued_before_release_is_dropped() {
+    let device = ScriptedDevice::new(KEYBOARD, Vec::new());
+    let (shared, requests) = device_channels(0, device.capabilities().clone());
+    let service = InputService::from_devices(Arc::new(one(shared.clone())));
+    let claim = service
+        .claim(KEYBOARD, test_caps::input())
+        .expect("the device is free");
+    let leds = claim.leds();
+
+    let mut sent = pin!(leds.set_led(codes::LED_CAPSL, true));
+    let mut context = Context::from_waker(Waker::noop());
+    assert!(sent.as_mut().poll(&mut context).is_pending());
+    drop(claim);
+
+    let served = pin!(super::owner::serve_indicators(&device, &shared, &requests));
+    block_on(async {
+        match futures::future::select(sent, served).await {
+            futures::future::Either::Left((answer, _)) => {
+                assert_eq!(answer, Err(InputServiceError::Closed));
+            }
+            futures::future::Either::Right(((), _)) => panic!("the server never ends"),
+        }
+    });
+
+    assert!(device.leds().is_empty(), "nothing reached the device");
+}
+
 /// An indicator change reaches the device, and one made under a claim
 /// that has since been released does not.
 #[test]
@@ -371,7 +497,9 @@ fn an_indicator_change_reaches_the_device_under_its_own_claim() {
     let device = ScriptedDevice::new(KEYBOARD, Vec::new());
     let (shared, requests) = device_channels(0, device.capabilities().clone());
     let service = InputService::from_devices(Arc::new(one(shared.clone())));
-    let claim = service.claim(KEYBOARD).expect("the device is free");
+    let claim = service
+        .claim(KEYBOARD, test_caps::input())
+        .expect("the device is free");
     let leds = claim.leds();
 
     block_on(async {
@@ -390,4 +518,107 @@ fn one(shared: Arc<InputShared>) -> ArrayVec<Arc<InputShared>, MAX_CLAIMED_DEVIC
     let mut devices = ArrayVec::new();
     devices.push(shared);
     devices
+}
+
+/// What a component sees when it calls `input.available` and
+/// `input.claim`: both are answered by the instance's own authority
+/// before they reach the service.
+#[cfg(feature = "wasmtime-runtime")]
+mod component_host {
+    use super::*;
+    use crate::wasmtime_adapter::bindings::input::bindings::helios::system::input as contract;
+    use crate::wasmtime_adapter::component_host::service::test_store;
+    use crate::{DeviceClassRights, ProcessAuthority};
+
+    fn authority_with(classes: DeviceClassRights) -> ProcessAuthority {
+        let mut authority = ProcessAuthority::empty();
+        authority.grant_device_classes(classes);
+        authority
+    }
+
+    fn store_under(
+        authority: ProcessAuthority,
+        service: &InputService,
+    ) -> test_store::TestStoreData {
+        test_store::store_data_authorized(authority, |runtime_state| {
+            runtime_state.install_input_service(service.clone());
+        })
+    }
+
+    /// An ordinary program lists nothing and is told what a machine with
+    /// no input device tells everyone, and the devices stay free for
+    /// their owner.
+    #[test]
+    fn ordinary_program_is_refused_input_and_lists_no_devices() {
+        let service = service_of(&[KEYBOARD, TABLET]);
+
+        for authority in [
+            ProcessAuthority::empty(),
+            ProcessAuthority::root(),
+            authority_with(DeviceClassRights::all() - DeviceClassRights::INPUT),
+        ] {
+            let mut data = store_under(authority, &service);
+            let listed = <test_store::TestStoreData as contract::Host>::available(&mut data)
+                .expect("the list is answered");
+            assert!(listed.is_empty(), "the machine's devices are not listed");
+            let answer =
+                <test_store::TestStoreData as contract::Host>::claim(&mut data, KEYBOARD.into())
+                    .expect("a refusal is an answer, not a trap");
+            assert_eq!(answer.err(), Some(contract::Error::Unavailable));
+            assert_eq!(data.input.held(), 0);
+        }
+
+        // Neither device was taken: the owner still gets both.
+        service
+            .claim(KEYBOARD, test_caps::input())
+            .expect("the keyboard is still free");
+        service
+            .claim(TABLET, test_caps::input())
+            .expect("the tablet is still free");
+
+        let mut absent = test_store::store_data_authorized(ProcessAuthority::empty(), |_| {});
+        let none =
+            <test_store::TestStoreData as contract::Host>::claim(&mut absent, KEYBOARD.into())
+                .expect("a machine with no input device answers");
+        assert_eq!(
+            none.err(),
+            Some(contract::Error::Unavailable),
+            "the answer is the one a machine with no input device gives"
+        );
+    }
+
+    /// The inventory a program reads agrees with what its claims answer:
+    /// an input device it cannot claim is not listed.
+    #[test]
+    fn program_stats_hide_input_devices_the_caller_cannot_claim() {
+        let service = service_of(&[KEYBOARD, TABLET]);
+        let listed = |authority: ProcessAuthority| {
+            let data = store_under(authority, &service);
+            let mut sample = data.runtime_state.snapshot(0);
+            sample.restrict_to(data.process_authority());
+            sample.inputs.len()
+        };
+
+        assert_eq!(listed(ProcessAuthority::empty()), 0);
+        assert_eq!(listed(authority_with(DeviceClassRights::INPUT)), 2);
+    }
+
+    /// The compositor's provisioning holds the input class: it lists the
+    /// devices and claims each.
+    #[test]
+    fn provisioned_owner_lists_and_claims_every_input_device() {
+        let service = service_of(&[KEYBOARD, TABLET]);
+        let mut data = store_under(authority_with(DeviceClassRights::INPUT), &service);
+
+        let listed = <test_store::TestStoreData as contract::Host>::available(&mut data)
+            .expect("the list is answered");
+        assert_eq!(listed.len(), 2);
+        for name in [KEYBOARD, TABLET] {
+            let answer =
+                <test_store::TestStoreData as contract::Host>::claim(&mut data, name.into())
+                    .expect("the claim is answered");
+            assert!(answer.is_ok(), "the owner is given {name}");
+        }
+        assert_eq!(data.input.held(), 2);
+    }
 }
