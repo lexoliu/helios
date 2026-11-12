@@ -76,10 +76,18 @@ use helios_hal::audio::{
 };
 use helios_hal::io::{IoError, IoResult};
 
-use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate};
-use crate::inflight::{InFlight, await_completion, submit_chain};
+use spin::Mutex as SpinMutex;
+
+use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate, renegotiate};
+use crate::inflight::{
+    InFlight, await_completion, drain_to_idle, reinitialize_requests, submit_chain,
+};
+use crate::journal::Journal;
 use crate::notify::Notify;
 use crate::queue::{VirtQueue, negotiated_queue_size};
+use crate::resume::{
+    DeviceReset, Lost, PolledError, QuiesceError, ReinitError, conclude, driver_ok, polled_command,
+};
 use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
 
 /// The control queue: every question and every state change.
@@ -257,6 +265,64 @@ impl SoundTopology {
     }
 }
 
+/// How far a stream has been driven through the state machine of
+/// virtio 1.2 §5.14.6.6.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamPhase {
+    /// `PCM_SET_PARAMS` has not been accepted.
+    Unconfigured,
+    /// Parameters are set; also where `PCM_RELEASE` leaves a stream.
+    ParamsSet,
+    /// `PCM_PREPARE` has allocated the device side; `PCM_STOP` leaves a
+    /// stream here too.
+    Prepared,
+    /// `PCM_START` has begun the device's clock.
+    Running,
+}
+
+/// What the device has acknowledged a stream to be, which is everything
+/// a device that lost its state needs to be told again.
+///
+/// A command's change is filed with the [`Journal`] when the command is
+/// submitted and applied here when its answer is first seen, by the
+/// waiter or by a quiesce that reaped the completion for it, and only if
+/// the answer is `VIRTIO_SND_S_OK`. A command that was never submitted,
+/// or that the device refused, leaves no trace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StreamRecord {
+    params: Option<PcmParams>,
+    phase: StreamPhase,
+    /// The phase a quiesce released the stream from so that the periods
+    /// it held could complete: the re-initialisation drives the stream
+    /// back to it.
+    resume: Option<StreamPhase>,
+}
+
+impl StreamRecord {
+    const UNCONFIGURED: Self = Self {
+        params: None,
+        phase: StreamPhase::Unconfigured,
+        resume: None,
+    };
+}
+
+/// What one acknowledged command does to a stream's record.
+#[derive(Clone, Copy, Debug)]
+struct StreamChange {
+    stream: StreamId,
+    kind: ChangeKind,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ChangeKind {
+    /// `PCM_SET_PARAMS`: the stream has these parameters and nothing
+    /// beyond them.
+    Params(PcmParams),
+    /// `PCM_PREPARE`, `PCM_START`, `PCM_STOP` or `PCM_RELEASE`: the
+    /// stream is in this phase.
+    Phase(StreamPhase),
+}
+
 /// The event ring together with the buffer pool that backs it.
 ///
 /// Slot bookkeeping lives beside the queue rather than behind a lock of
@@ -295,6 +361,18 @@ pub struct VirtioSndDevice<T: VirtioTransport> {
     /// than a lock because there is nothing else in the word to keep
     /// consistent with it.
     period_bytes: [AtomicU32; MAX_STREAMS],
+    /// What the device has acknowledged each stream to be, for a device
+    /// that has to be told again after a reset. A spin lock held for a
+    /// copy or one update, never across a call into the queue.
+    records: SpinMutex<[StreamRecord; MAX_STREAMS]>,
+    /// The stream commands submitted and not yet collected, whose
+    /// acknowledgement updates `records`.
+    commands: Journal<StreamChange, { CONTROL_QUEUE_SIZE as usize }>,
+    /// Set once a restore command timed out and the device is lost.
+    lost: Lost,
+    /// How many of each kind of item the device presented at bring-up,
+    /// to compare with what a reset device presents.
+    counts: ItemCounts,
     features: NegotiatedFeatures,
 }
 
@@ -433,6 +511,10 @@ impl<T: VirtioTransport> VirtioSndDevice<T> {
             event_arrivals: Notify::new(),
             topology: SoundTopology::empty(),
             period_bytes: [const { AtomicU32::new(0) }; MAX_STREAMS],
+            records: SpinMutex::new([StreamRecord::UNCONFIGURED; MAX_STREAMS]),
+            commands: Journal::new(),
+            lost: Lost::new(),
+            counts,
             features,
         };
         Ok((device, counts))
@@ -506,10 +588,77 @@ impl<T: VirtioTransport> VirtioSndDevice<T> {
     /// Runs one command whose whole body is a PCM header.
     async fn stream_command(&self, code: u32, stream: StreamId) -> AudioResult<()> {
         self.playback_stream(stream)?;
+        let phase = match code {
+            R_PCM_PREPARE | R_PCM_STOP => StreamPhase::Prepared,
+            R_PCM_START => StreamPhase::Running,
+            R_PCM_RELEASE => StreamPhase::ParamsSet,
+            _ => unreachable!("a stream command is prepare, start, stop or release"),
+        };
         let request = encode_pcm_header(code, stream);
-        let mut response = [0_u8; HEADER_BYTES];
-        self.control_command(&request, &mut response).await?;
-        Ok(())
+        self.acknowledged(
+            &request,
+            StreamChange {
+                stream,
+                kind: ChangeKind::Phase(phase),
+            },
+        )
+        .await
+    }
+
+    /// Runs one command that changes a stream's state and records the
+    /// change once the device has answered it, however that answer
+    /// reaches this task. See [`crate::journal`].
+    async fn acknowledged(&self, request: &[u8], change: StreamChange) -> AudioResult<()> {
+        let sent = self
+            .commands
+            .send(
+                &self.control_inflight,
+                &self.control,
+                &self.transport,
+                &[request],
+                HEADER_BYTES,
+                change,
+            )
+            .await?;
+        let written = await_completion(&self.control_inflight, &self.control, sent.token(), || {
+            self.completions.notified()
+        })
+        .await;
+        if written.is_ok() {
+            sent.settle(Self::accepted, |change| self.apply(*change));
+        }
+        self.commands.forget(&sent);
+        if (written? as usize) < HEADER_BYTES {
+            return Err(IoError::DeviceFault.into());
+        }
+        check_status(status_of(&sent.response())?)
+    }
+
+    /// Whether a command's answer says the device took it.
+    fn accepted(response: &[u8]) -> bool {
+        status_of(response) == Ok(S_OK)
+    }
+
+    /// Applies one acknowledged command to its stream's record.
+    fn apply(&self, change: StreamChange) {
+        self.record(change.stream, |record| {
+            match change.kind {
+                ChangeKind::Params(params) => {
+                    record.params = Some(params);
+                    record.phase = StreamPhase::ParamsSet;
+                }
+                ChangeKind::Phase(phase) => record.phase = phase,
+            }
+            // The caller drove the stream, so whatever a quiesce had
+            // released it from is no longer what it is to be brought
+            // back to.
+            record.resume = None;
+        });
+    }
+
+    /// Changes `stream`'s record.
+    fn record(&self, stream: StreamId, change: impl FnOnce(&mut StreamRecord)) {
+        change(&mut self.records.lock()[stream.index() as usize]);
     }
 
     /// The description of `stream`, refusing one this device does not
@@ -535,6 +684,263 @@ impl<T: VirtioTransport> VirtioSndDevice<T> {
         self.period_bytes
             .get(stream.index() as usize)
             .ok_or(AudioError::UnknownStream(stream))
+    }
+
+    /// Waits for every command and every period the device owns to
+    /// complete, so the device may be reset. See [`crate::resume`] for
+    /// the contract; `expired` says when the caller's deadline has
+    /// passed.
+    ///
+    /// The commands the control queue held are settled first, so the
+    /// record holds what the device acknowledged, including answers this
+    /// reap collected for waiters that have not run.
+    ///
+    /// A device completes the periods of a stream when the stream is
+    /// released: `PCM_RELEASE` requires it to complete all pending I/O
+    /// messages (virtio 1.2 §5.14.6.6.5.1), while `PCM_STOP` only changes
+    /// the stream's state and a device may hold a period until its clock
+    /// reaches it. So every prepared or running stream is stopped, if it
+    /// was running, and released, and remembered: [`Self::reinitialize`]
+    /// drives it back to the phase it was in. Every such stream is
+    /// released, not only one with a period outstanding, because no count
+    /// a writer keeps can say which periods the device still holds once a
+    /// writer is cancelled, and a release with nothing pending completes
+    /// at once. The event ring is not waited on, and the receive queue is
+    /// never posted.
+    pub fn quiesce(&self, mut expired: impl FnMut() -> bool) -> Result<(), QuiesceError> {
+        drain_to_idle(
+            &self.control_inflight,
+            &self.control,
+            &self.transport,
+            CONTROL_QUEUE_INDEX,
+            &mut expired,
+        )?;
+        self.commands
+            .settle_all(Self::accepted, |change| self.apply(*change));
+        for index in 0..MAX_STREAMS {
+            let stream = StreamId::new(index as u32);
+            let phase = self.records.lock()[index].phase;
+            if !matches!(phase, StreamPhase::Prepared | StreamPhase::Running) {
+                continue;
+            }
+            if phase == StreamPhase::Running {
+                self.quiesce_command(R_PCM_STOP, stream, &mut expired)?;
+            }
+            self.quiesce_command(R_PCM_RELEASE, stream, &mut expired)?;
+            self.record(stream, |record| {
+                record.phase = StreamPhase::ParamsSet;
+                record.resume = Some(phase);
+            });
+        }
+        drain_to_idle(
+            &self.tx_inflight,
+            &self.tx,
+            &self.transport,
+            TX_QUEUE_INDEX,
+            &mut expired,
+        )
+    }
+
+    /// One stream command run by polling, for a machine that is frozen:
+    /// whether the device answered it with `VIRTIO_SND_S_OK`.
+    fn polled_status(
+        &self,
+        request: &[u8],
+        expired: &mut impl FnMut() -> bool,
+    ) -> Result<bool, PolledError> {
+        let (response, written) = polled_command(
+            &self.transport,
+            &self.control,
+            request,
+            HEADER_BYTES,
+            expired,
+        )?;
+        Ok(written as usize >= HEADER_BYTES && Self::accepted(&response))
+    }
+
+    /// A stream command a quiesce runs, as the error a quiesce reports.
+    fn quiesce_command(
+        &self,
+        code: u32,
+        stream: StreamId,
+        expired: &mut impl FnMut() -> bool,
+    ) -> Result<(), QuiesceError> {
+        let device = DeviceType::Sound;
+        let request = encode_pcm_header(code, stream);
+        match self.polled_status(&request, expired) {
+            Ok(true) => Ok(()),
+            Ok(false) | Err(PolledError::Queue(_)) => Err(QuiesceError::DeviceFault {
+                device,
+                queue: CONTROL_QUEUE_INDEX,
+            }),
+            Err(PolledError::Expired) => Err(QuiesceError::RequestsStillInFlight {
+                device,
+                queue: CONTROL_QUEUE_INDEX,
+                count: 1,
+            }),
+            Err(PolledError::Busy) => Err(QuiesceError::QueueBusy {
+                device,
+                queue: CONTROL_QUEUE_INDEX,
+            }),
+        }
+    }
+
+    /// Brings a reset device back with the features it had, after
+    /// [`Self::quiesce`].
+    ///
+    /// The queues are programmed again at their memory and the event
+    /// ring is stocked again. The device must still present the streams,
+    /// jacks and channel maps it did, and every stream is driven back
+    /// through `PCM_SET_PARAMS`, `PCM_PREPARE` and, for one that was
+    /// running, `PCM_START`, to the phase the record says it was in or
+    /// the quiesce released it from. Those commands are polled, because
+    /// the machine is frozen: `expired` bounds each answer.
+    ///
+    /// A restore command that outlives `expired` loses the device for
+    /// good: every later call answers [`ReinitError::DeviceLost`]. Any
+    /// failure leaves the device FAILED and fails every parked command.
+    pub fn reinitialize(&self, expired: impl FnMut() -> bool) -> Result<DeviceReset, ReinitError> {
+        self.lost.refuse(DeviceType::Sound)?;
+        let outcome = self.lost.observe(self.restore(expired));
+        conclude(&self.transport, outcome, |resumed| {
+            self.control_inflight.resume(resumed);
+            self.tx_inflight.resume(resumed);
+        })
+    }
+
+    fn restore(&self, mut expired: impl FnMut() -> bool) -> Result<DeviceReset, ReinitError> {
+        let device = DeviceType::Sound;
+        renegotiate(&self.transport, self.features)?;
+        reinitialize_requests(&self.control, &self.transport, CONTROL_QUEUE_INDEX)?;
+        reinitialize_requests(&self.tx, &self.transport, TX_QUEUE_INDEX)?;
+        self.rx
+            .try_lock()
+            .ok_or(ReinitError::QueueBusy {
+                device,
+                queue: RX_QUEUE_INDEX,
+            })?
+            .reinitialize(&self.transport)?;
+        {
+            let mut events = self.events.try_lock().ok_or(ReinitError::QueueBusy {
+                device,
+                queue: EVENT_QUEUE_INDEX,
+            })?;
+            let EventRing {
+                queue,
+                slots,
+                slot_for_token,
+            } = &mut *events;
+            queue.reinitialize_discarding(&self.transport)?;
+            queue
+                .restock(
+                    &self.transport,
+                    slots.chunks_exact_mut(EVENT_BYTES),
+                    slot_for_token,
+                )
+                .map_err(|error| ReinitError::Restore {
+                    device,
+                    what: "the event buffers",
+                    error,
+                })?;
+        }
+        let found = ItemCounts {
+            streams: counted(&self.transport, CONFIG_STREAMS, MAX_STREAMS, "streams").map_err(
+                |_| ReinitError::DeviceChanged {
+                    device,
+                    what: "the number of streams",
+                },
+            )?,
+            jacks: counted(&self.transport, CONFIG_JACKS, MAX_JACKS, "jacks").map_err(|_| {
+                ReinitError::DeviceChanged {
+                    device,
+                    what: "the number of jacks",
+                }
+            })?,
+            chmaps: counted(
+                &self.transport,
+                CONFIG_CHMAPS,
+                MAX_CHANNEL_MAPS,
+                "channel maps",
+            )
+            .map_err(|_| ReinitError::DeviceChanged {
+                device,
+                what: "the number of channel maps",
+            })?,
+        };
+        if found != self.counts {
+            return Err(ReinitError::DeviceChanged {
+                device,
+                what: "the number of streams, jacks or channel maps",
+            });
+        }
+        driver_ok(&self.transport);
+        self.events
+            .try_lock()
+            .expect("the event lock was just released")
+            .queue
+            .notify(&self.transport);
+
+        for index in 0..MAX_STREAMS {
+            let stream = StreamId::new(index as u32);
+            let record = self.records.lock()[index];
+            let Some(params) = record.params else {
+                continue;
+            };
+            // Where the stream is to end up: the phase a quiesce
+            // released it from, or else the one the device had
+            // acknowledged.
+            let target = record.resume.unwrap_or(record.phase);
+            let mut steps: [Option<(Vec<u8>, &'static str)>; 3] = [None, None, None];
+            steps[0] = Some((
+                encode_set_params(stream, &params).to_vec(),
+                "a stream's parameters",
+            ));
+            if matches!(target, StreamPhase::Prepared | StreamPhase::Running) {
+                steps[1] = Some((
+                    encode_pcm_header(R_PCM_PREPARE, stream).to_vec(),
+                    "a prepared stream",
+                ));
+            }
+            if target == StreamPhase::Running {
+                steps[2] = Some((
+                    encode_pcm_header(R_PCM_START, stream).to_vec(),
+                    "a running stream",
+                ));
+            }
+            for (request, what) in steps.into_iter().flatten() {
+                match self.polled_status(&request, &mut expired) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return Err(ReinitError::Restore {
+                            device,
+                            what,
+                            error: IoError::DeviceFault,
+                        });
+                    }
+                    Err(PolledError::Expired) => {
+                        return Err(ReinitError::RestoreTimedOut { device, what });
+                    }
+                    Err(PolledError::Busy) => {
+                        return Err(ReinitError::QueueBusy {
+                            device,
+                            queue: CONTROL_QUEUE_INDEX,
+                        });
+                    }
+                    Err(PolledError::Queue(error)) => {
+                        return Err(ReinitError::Restore {
+                            device,
+                            what,
+                            error,
+                        });
+                    }
+                }
+            }
+            self.record(stream, |record| {
+                record.phase = target;
+                record.resume = None;
+            });
+        }
+        Ok(DeviceReset { device })
     }
 
     /// Takes one event out of the ring, if the device has published one,
@@ -597,8 +1003,14 @@ impl<T: VirtioTransport> PlaybackDevice for VirtioSndDevice<T> {
         let info = *self.playback_stream(stream)?;
         check_params(&info, &params)?;
         let request = encode_set_params(stream, &params);
-        let mut response = [0_u8; HEADER_BYTES];
-        self.control_command(&request, &mut response).await?;
+        self.acknowledged(
+            &request,
+            StreamChange {
+                stream,
+                kind: ChangeKind::Params(params),
+            },
+        )
+        .await?;
         // Only once the device has taken them: a length remembered for a
         // configuration the device refused would let the next `write`
         // hand it a period it never agreed to.

@@ -175,11 +175,11 @@ impl Ipv6Address {
 
 impl fmt::Debug for Ipv6Address {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (index, chunk) in self.0.chunks_exact(2).enumerate() {
+        for (index, &chunk) in self.0.as_chunks::<2>().0.iter().enumerate() {
             if index != 0 {
                 f.write_str(":")?;
             }
-            write!(f, "{:x}", u16::from_be_bytes([chunk[0], chunk[1]]))?;
+            write!(f, "{:x}", u16::from_be_bytes(chunk))?;
         }
         Ok(())
     }

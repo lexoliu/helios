@@ -56,11 +56,16 @@ impl HostedConfig {
         }
     }
 
-    /// A configuration for a test that boots processors itself: `bootfs`
-    /// is the payload `kernel-prebuild` wrote, and the rest is the
-    /// environment's defaults, which tests never override.
+    /// A configuration for a test that builds its own `HostedMachine`:
+    /// `processor_count` processors, the default heap, no WASI root, and
+    /// the payload at `bootfs`. The process's arguments belong to the
+    /// test runner, so [`Self::from_env`] cannot serve.
     #[cfg(test)]
     pub(crate) fn for_test(processor_count: usize, bootfs: PathBuf) -> Self {
+        assert!(
+            processor_count != 0,
+            "a hosted machine needs at least one processor"
+        );
         Self {
             processor_count,
             bootstrap_processor: ProcessorId::new(0),

@@ -6,8 +6,8 @@ plugin. This page records what was checked, on which toolchain, and where
 each path stands. Path (a) is implemented and is described below as it
 works today; path (b) is not, and its blocker is filed as an issue.
 
-Toolchain examined: `rustc 1.98.0-nightly (3daae5e42 2026-06-14)`,
-LLVM 22.1.6 (`rust-toolchain.toml`), vendored Wasmtime
+Toolchain examined: `rustc 1.101.0-nightly (1c3a65069 2026-11-02)`,
+LLVM 23.1.5 (`rust-toolchain.toml`), vendored Wasmtime
 `lexoliu/wasmtime@b83d18c8558b6d32fb0c0727d1c6a32639842c49`.
 
 ## (a) Profile-guided optimisation of the bare-metal kernel
@@ -112,8 +112,8 @@ them.
 The format is pinned to the toolchain, not guessed at. Every object
 rustc instruments carries `__llvm_profile_raw_version`, the version word
 LLVM's own runtime would have written; the writer refuses to produce a
-byte unless it equals the version it implements — 10, with the
-IR-instrumentation variant bit, on the pinned nightly's LLVM 22.1.6.
+byte unless it equals the version it implements — 11, with the
+IR-instrumentation variant bit, on the pinned nightly's LLVM 23.1.5.
 A toolchain bump that changes the raw format therefore fails loudly at
 the export instead of writing a file `llvm-profdata` misreads.
 
@@ -357,9 +357,9 @@ answer three questions:
   step was skipped, and is refused naming that step rather than "not an
   indexed profile";
 - an indexed profile whose version is not the one this toolchain writes
-  is refused naming both versions. On the pinned nightly that is 13
-  (`IndexedInstrProf::ProfVersion::CurrentVersion`, LLVM 22.1.6), the
-  index-side counterpart of the raw version 10 the guest writer emits;
+  is refused naming both versions. On the pinned nightly that is 14
+  (`IndexedInstrProf::ProfVersion::CurrentVersion`, LLVM 23.1.5), the
+  index-side counterpart of the raw version 11 the guest writer emits;
 - a profile without the IR-instrumentation variant bit did not come from
   `-C profile-generate` and is refused as such.
 
@@ -527,6 +527,7 @@ measure, and the kernel a release ships are one build.
 ```bash
 helios-cli profile-fetch                 # the newest collection on the default branch
 helios-cli profile-fetch --branch perf/x  # the newest collection on a branch
+helios-cli profile-fetch --run 34424416974     # the artifact one run uploaded
 helios-cli profile-fetch --tag helios-v0.1.0   # the asset a release carries
 helios-inspector vm --arch x86-64 --release --accel kvm shell
 ```
