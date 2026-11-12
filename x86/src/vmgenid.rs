@@ -27,16 +27,62 @@ use core::str::FromStr;
 
 use acpi::aml::namespace::{AmlName, NamespaceLevel, NamespaceLevelKind};
 use acpi::aml::object::{DeviceStatus, Object};
-use acpi::aml::{AmlError, Interpreter};
+use acpi::aml::op_region::{OpRegion, RegionHandler};
+use acpi::aml::{AmlError, BaseInterpreter};
 use acpi::registers::FixedRegisters;
 use acpi::sdt::SdtHeader;
 use acpi::sdt::fadt::Fadt;
-use acpi::{AcpiTables, AmlTable};
+use acpi::{AcpiTables, AmlTable, PhysicalMapping};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use helios_hal::generation::{GenerationIdAddress, GenerationIdWindow};
 
 use crate::smp::{PhysicalOffsetAcpiHandler, ensure_hhdm_range_mapped};
+
+/// The region handler type of this backend's AML interpreter.
+///
+/// The backend installs no operation-region handlers, so the
+/// interpreter's region handler type has no values. Naming it keeps the
+/// interpreter free of the `dyn RegionHandler` the `acpi` crate's own
+/// `Interpreter` alias would impose.
+enum NoRegionHandler {}
+
+impl RegionHandler for NoRegionHandler {
+    fn read_u8(&self, _region: &OpRegion) -> Result<u8, AmlError> {
+        match *self {}
+    }
+
+    fn read_u16(&self, _region: &OpRegion) -> Result<u16, AmlError> {
+        match *self {}
+    }
+
+    fn read_u32(&self, _region: &OpRegion) -> Result<u32, AmlError> {
+        match *self {}
+    }
+
+    fn read_u64(&self, _region: &OpRegion) -> Result<u64, AmlError> {
+        match *self {}
+    }
+
+    fn write_u8(&self, _region: &OpRegion, _value: u8) -> Result<(), AmlError> {
+        match *self {}
+    }
+
+    fn write_u16(&self, _region: &OpRegion, _value: u16) -> Result<(), AmlError> {
+        match *self {}
+    }
+
+    fn write_u32(&self, _region: &OpRegion, _value: u32) -> Result<(), AmlError> {
+        match *self {}
+    }
+
+    fn write_u64(&self, _region: &OpRegion, _value: u64) -> Result<(), AmlError> {
+        match *self {}
+    }
+}
+
+/// The AML interpreter this backend builds.
+type Interpreter = BaseInterpreter<PhysicalOffsetAcpiHandler, NoRegionHandler>;
 
 /// `_HID` of QEMU's VM Generation ID device (`hw/acpi/vmgenid.c`).
 const VMGENID_HID: &str = "QEMUVGID";
@@ -133,19 +179,13 @@ pub(crate) fn discover(
 fn load_namespace(
     tables: &AcpiTables<PhysicalOffsetAcpiHandler>,
     handler: &PhysicalOffsetAcpiHandler,
-) -> Interpreter<PhysicalOffsetAcpiHandler> {
+) -> Interpreter {
     let fadt = tables
         .find_table::<Fadt>()
         .unwrap_or_else(|| panic!("vmgenid: the ACPI tables carry no FADT"));
-    // The interpreter's constructor takes its register block as an `Arc`,
-    // and `FixedRegisters` owns raw firmware mappings, so it is neither
-    // `Send` nor `Sync`. The interpreter and its registers live and die on
-    // the bootstrap processor inside `discover`.
-    #[expect(
-        clippy::arc_with_non_send_sync,
-        reason = "the interpreter's constructor takes an Arc and the whole interpreter is \
-                  single-threaded, so the reference count is never shared across processors"
-    )]
+    // The interpreter's constructor takes its register block as an `Arc`.
+    // The interpreter and its registers live and die on the bootstrap
+    // processor inside `discover`.
     let registers = Arc::new(
         FixedRegisters::new(&fadt, handler.clone())
             .unwrap_or_else(|error| panic!("vmgenid: FADT fixed registers: {error:?}")),
@@ -161,21 +201,19 @@ fn load_namespace(
     interpreter
 }
 
-fn load_table(
-    interpreter: &Interpreter<PhysicalOffsetAcpiHandler>,
-    handler: &PhysicalOffsetAcpiHandler,
-    table: AmlTable,
-) {
-    use acpi::Handler;
-
+fn load_table(interpreter: &Interpreter, handler: &PhysicalOffsetAcpiHandler, table: AmlTable) {
     let header_bytes = core::mem::size_of::<SdtHeader>();
     // SAFETY: the address and length come from a table header the `acpi`
     // crate already validated, and the mapping is the direct physical map
     // the bootloader left in place.
+    let mapping = unsafe {
+        PhysicalMapping::<_, u8>::new(table.phys_address, table.length as usize, handler.clone())
+    };
+    // SAFETY: the mapping covers `table.length` bytes and outlives the
+    // slice, which is dropped when `load_table` returns.
     let stream = unsafe {
-        let mapping = handler.map_physical_region::<u8>(table.phys_address, table.length as usize);
         core::slice::from_raw_parts(
-            mapping.virtual_start.as_ptr().add(header_bytes),
+            mapping.as_ptr().add(header_bytes),
             table.length as usize - header_bytes,
         )
     };
@@ -185,7 +223,7 @@ fn load_table(
 }
 
 /// The device whose `_HID` or `_CID` names the VM Generation ID.
-fn find_device(interpreter: &Interpreter<PhysicalOffsetAcpiHandler>) -> Option<AmlName> {
+fn find_device(interpreter: &Interpreter) -> Option<AmlName> {
     let mut devices = Vec::new();
     interpreter
         .namespace
@@ -205,12 +243,7 @@ fn find_device(interpreter: &Interpreter<PhysicalOffsetAcpiHandler>) -> Option<A
 
 /// Whether `device.segment` is the string `expected`. An integer id is a
 /// compressed EISA id, which this device never uses, so it never matches.
-fn names_id(
-    interpreter: &Interpreter<PhysicalOffsetAcpiHandler>,
-    device: &AmlName,
-    segment: &str,
-    expected: &str,
-) -> bool {
+fn names_id(interpreter: &Interpreter, device: &AmlName, segment: &str, expected: &str) -> bool {
     let object = interpreter
         .evaluate_if_present(child(device, segment), Vec::new())
         .unwrap_or_else(|error| panic!("vmgenid: evaluating {device}.{segment}: {error:?}"));

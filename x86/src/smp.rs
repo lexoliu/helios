@@ -1,7 +1,7 @@
 extern crate alloc;
 
 use acpi::platform::{AcpiPlatform, ProcessorState};
-use acpi::{AcpiTables, Handler, PciAddress, PhysicalMapping};
+use acpi::{AcpiTables, Handler, PciAddress, RawPhysicalMapping};
 use alloc::alloc::{Layout, alloc_zeroed};
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -1412,18 +1412,22 @@ impl Handler for PhysicalOffsetAcpiHandler {
         &self,
         physical_address: usize,
         size: usize,
-    ) -> PhysicalMapping<Self, T> {
+    ) -> RawPhysicalMapping<T> {
         ensure_hhdm_range_mapped(self.physical_memory_offset, physical_address, size);
-        PhysicalMapping {
-            physical_start: physical_address,
-            virtual_start: self.physical_to_virtual(physical_address),
-            region_length: size,
-            mapped_length: size,
-            handler: self.clone(),
+        // SAFETY: the virtual address is the direct-map alias of the
+        // physical range, which no other mapping of this handler aliases
+        // mutably, and `unmap_physical_region` has nothing to undo.
+        unsafe {
+            RawPhysicalMapping::new(
+                physical_address,
+                self.physical_to_virtual(physical_address),
+                size,
+                size,
+            )
         }
     }
 
-    fn unmap_physical_region<T>(_region: &PhysicalMapping<Self, T>) {}
+    unsafe fn unmap_physical_region<T>(&self, _region: RawPhysicalMapping<T>) {}
 
     fn read_u8(&self, address: usize) -> u8 {
         unsafe { (address as *const u8).read_volatile() }
