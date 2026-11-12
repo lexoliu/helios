@@ -160,7 +160,7 @@ macro_rules! typed_device_class_cap {
 
 typed_device_class_cap!(DisplayClaimCap, DeviceClassRights::DISPLAY);
 typed_device_class_cap!(InputClaimCap, DeviceClassRights::INPUT);
-typed_device_class_cap!(GpuClaimCap, DeviceClassRights::GPU);
+typed_device_class_cap!(GpuOpenCap, DeviceClassRights::GPU);
 typed_device_class_cap!(AudioClaimCap, DeviceClassRights::AUDIO);
 
 /// Proof that the instance was granted one named device. The name is
@@ -188,6 +188,25 @@ pub struct SpawnAuthority(ProcessAuthorityRights);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExecAuthority(ProcessAuthorityRights);
+
+/// Proof that the holder derived a process right that may start a
+/// compile: SPAWN or EXEC. It is built only from one of those two
+/// tokens, so every route into the in-kernel compiler has to have
+/// derived a process right first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompileAuthority(ProcessAuthorityRights);
+
+impl From<&SpawnAuthority> for CompileAuthority {
+    fn from(authority: &SpawnAuthority) -> Self {
+        Self(authority.rights())
+    }
+}
+
+impl From<&ExecAuthority> for CompileAuthority {
+    fn from(authority: &ExecAuthority) -> Self {
+        Self(authority.rights())
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ForkAuthority(ProcessAuthorityRights);
@@ -378,6 +397,7 @@ macro_rules! impl_process_cap {
 
 impl_process_cap!(SpawnAuthority);
 impl_process_cap!(ExecAuthority);
+impl_process_cap!(CompileAuthority);
 impl_process_cap!(ForkAuthority);
 impl_process_cap!(JoinAuthority);
 impl_process_cap!(SignalAuthority);
@@ -837,9 +857,9 @@ impl ProcessAuthority {
             .map(InputClaimCap)
     }
 
-    pub fn derive_gpu_claim_cap(&self) -> Result<GpuClaimCap, ProcessAuthorityError> {
-        self.derive_device_class_rights(GpuClaimCap::required_rights())
-            .map(GpuClaimCap)
+    pub fn derive_gpu_open_cap(&self) -> Result<GpuOpenCap, ProcessAuthorityError> {
+        self.derive_device_class_rights(GpuOpenCap::required_rights())
+            .map(GpuOpenCap)
     }
 
     pub fn derive_audio_claim_cap(&self) -> Result<AudioClaimCap, ProcessAuthorityError> {
@@ -927,7 +947,7 @@ impl ProcessAuthority {
 #[cfg(test)]
 pub(crate) mod test_caps {
     use super::{
-        AudioClaimCap, DeviceClassRights, DeviceGrantClaimCap, DisplayClaimCap, GpuClaimCap,
+        AudioClaimCap, DeviceClassRights, DeviceGrantClaimCap, DisplayClaimCap, GpuOpenCap,
         InputClaimCap, ProcessAuthority,
     };
     use crate::device::DeviceName;
@@ -950,9 +970,9 @@ pub(crate) mod test_caps {
             .expect("the authority holds the input class")
     }
 
-    pub(crate) fn gpu() -> GpuClaimCap {
+    pub(crate) fn gpu() -> GpuOpenCap {
         holding(DeviceClassRights::GPU)
-            .derive_gpu_claim_cap()
+            .derive_gpu_open_cap()
             .expect("the authority holds the GPU class")
     }
 
@@ -1443,7 +1463,7 @@ mod tests {
         assert!(parent.derive_display_claim_cap().is_ok());
         assert!(parent.derive_input_claim_cap().is_ok());
         assert!(matches!(
-            parent.derive_gpu_claim_cap(),
+            parent.derive_gpu_open_cap(),
             Err(ProcessAuthorityError::DeviceClassGrantExceedsAuthority(_))
         ));
         assert!(matches!(
@@ -1507,7 +1527,7 @@ mod tests {
         assert!(root.granted_devices().is_empty());
         assert!(root.derive_display_claim_cap().is_err());
         assert!(root.derive_input_claim_cap().is_err());
-        assert!(root.derive_gpu_claim_cap().is_err());
+        assert!(root.derive_gpu_open_cap().is_err());
         assert!(root.derive_audio_claim_cap().is_err());
     }
 }
