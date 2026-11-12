@@ -54,7 +54,7 @@ use crate::inflight::{
 };
 use crate::notify::Notify;
 use crate::queue::{VirtQueue, negotiated_queue_size};
-use crate::resume::{DeviceReset, QuiesceError, ReinitError, driver_ok};
+use crate::resume::{DeviceReset, QuiesceError, ReinitError, conclude, driver_ok};
 use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
 
 /// The queue the device reports events on (virtio 1.2 §5.8.2).
@@ -242,14 +242,15 @@ impl<T: VirtioTransport> VirtioInputDevice<T> {
     /// driver was built on what the first read said. The event ring is
     /// stocked again, and any event it held is discarded.
     pub fn reinitialize(&self) -> Result<DeviceReset, ReinitError> {
+        conclude(&self.transport, self.restore(), |resumed| {
+            self.status_inflight.resume(resumed);
+        })
+    }
+
+    fn restore(&self) -> Result<DeviceReset, ReinitError> {
         let device = DeviceType::Input;
         renegotiate(&self.transport, self.features)?;
-        reinitialize_requests(
-            &self.status_inflight,
-            &self.status_queue,
-            &self.transport,
-            STATUS_QUEUE_INDEX,
-        )?;
+        reinitialize_requests(&self.status_queue, &self.transport, STATUS_QUEUE_INDEX)?;
         {
             let mut events = self.events.try_lock().ok_or(ReinitError::QueueBusy {
                 device,
@@ -261,19 +262,17 @@ impl<T: VirtioTransport> VirtioInputDevice<T> {
                 slot_for_token,
             } = &mut *events;
             queue.reinitialize_discarding(&self.transport)?;
-            for index in 0..slot_for_token.len() {
-                let slot = &mut slots[index * EVENT_BYTES..(index + 1) * EVENT_BYTES];
-                let token = queue
-                    .submit_output_deferred(&self.transport, slot)
-                    .map_err(|error| ReinitError::Restore {
-                        device,
-                        what: "the event buffers",
-                        error,
-                    })?;
-                slot_for_token[usize::from(token)] =
-                    u16::try_from(index).expect("event slots were built from a u16 count");
-            }
-            queue.publish();
+            queue
+                .restock(
+                    &self.transport,
+                    slots.chunks_exact_mut(EVENT_BYTES),
+                    slot_for_token,
+                )
+                .map_err(|error| ReinitError::Restore {
+                    device,
+                    what: "the event buffers",
+                    error,
+                })?;
         }
         // The register file is read before `DRIVER_OK`, exactly as at
         // bring-up, by the one processor that can reach the device.

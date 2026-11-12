@@ -44,7 +44,7 @@ use spin::Mutex;
 
 use crate::notify::Notify;
 use crate::queue::VirtQueue;
-use crate::resume::{QuiesceError, ReinitError, settle};
+use crate::resume::{QuiesceError, ReinitError, Resumed, settle};
 use crate::transport::VirtioTransport;
 
 /// State of one descriptor identifier.
@@ -158,6 +158,16 @@ impl<const N: usize> InFlight<N> {
     fn recover(&self) {
         let _slots = self.slots.lock();
         self.faulted.store(false, Ordering::SeqCst);
+    }
+
+    /// Applies how a re-initialisation ended: the table serves requests
+    /// again only when the device is back, and otherwise fails every
+    /// request, parked or yet to come.
+    pub(crate) fn resume(&self, resumed: Resumed) {
+        match resumed {
+            Resumed::Back => self.recover(),
+            Resumed::Failed => self.fail(),
+        }
     }
 
     /// Finishes every request still pending with zero bytes written and
@@ -306,10 +316,11 @@ where
 /// Re-programs the request queue `queue` fronts on a reset device.
 ///
 /// The queue holds no chain: a quiesce drained it and nothing was
-/// submitted since. Completions already recorded in `inflight` stay
-/// there for their waiters.
-pub(crate) fn reinitialize_requests<T, const N: usize>(
-    inflight: &InFlight<N>,
+/// submitted since. Completions already recorded in the driver's
+/// [`InFlight`] stay there for their waiters, and the table serves
+/// requests again only when the driver reports the whole
+/// re-initialisation through [`InFlight::resume`].
+pub(crate) fn reinitialize_requests<T>(
     queue: &AsyncMutex<VirtQueue<T>>,
     transport: &T,
     queue_index: u16,
@@ -322,8 +333,6 @@ where
         queue: queue_index,
     })?;
     ring.reinitialize(transport)?;
-    drop(ring);
-    inflight.recover();
     Ok(())
 }
 
@@ -348,7 +357,6 @@ where
     })?;
     ring.reinitialize_discarding(transport)?;
     drop(ring);
-    inflight.recover();
     inflight.abandon_pending();
     Ok(())
 }

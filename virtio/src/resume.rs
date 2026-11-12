@@ -39,12 +39,23 @@
 //!   hardware-synchronisation spin AGENTS.md allows. It carries a
 //!   caller-supplied expiry, because this crate has no clock: the owner
 //!   of the freeze knows its own deadline and says when it has passed.
+//! * A `reinitialize` that fails leaves the device FAILED and every
+//!   completion table of the driver faulted, so a caller that is parked
+//!   or arrives after the thaw gets a `DeviceFault` and never waits for a
+//!   device that was not brought back. A table serves requests again only
+//!   when the whole re-initialisation succeeded.
+//! * A restore command that outlived its deadline is still the device's,
+//!   and the driver gave its buffers up. That device is lost: the driver
+//!   latches it ([`Lost`]) and every later `reinitialize` answers
+//!   [`ReinitError::DeviceLost`].
 //! * `reinitialize` runs after every `quiesce`, before any task is
 //!   polled again. It takes each queue lock with `try_lock` and holds it
 //!   only while the queue is re-programmed.
 
 use alloc::vec;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use async_lock::Mutex as AsyncMutex;
 use helios_hal::io::IoError;
 
@@ -155,6 +166,14 @@ pub enum ReinitError {
         device: DeviceType,
         /// The state.
         what: &'static str,
+    },
+    /// An earlier re-initialisation left a command with the device and
+    /// the deadline passed, so the device may still write into buffers
+    /// the driver gave up. Nothing can be asked of it again.
+    #[error("virtio {device:?} was lost by an earlier re-initialisation")]
+    DeviceLost {
+        /// The device.
+        device: DeviceType,
     },
     /// The device did not answer a command that restores state it lost
     /// before the caller's deadline.
@@ -296,4 +315,72 @@ pub(crate) fn driver_ok<T: VirtioTransport>(transport: &T) {
             | DeviceStatus::FEATURES_OK
             | DeviceStatus::DRIVER_OK,
     );
+}
+
+/// How a re-initialisation ended, for the completion tables that front the
+/// device's queues.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Resumed {
+    /// The device is back and its queues are programmed again.
+    Back,
+    /// The device was not brought back.
+    Failed,
+}
+
+/// Finishes a re-initialisation: on success lets `tables` serve requests
+/// again, and on failure marks the device FAILED and has `tables` fail
+/// every request, so nobody parks on a device nobody drives.
+///
+/// `tables` is called once with the outcome, for every completion table
+/// of the driver.
+pub(crate) fn conclude<T: VirtioTransport, R>(
+    transport: &T,
+    outcome: Result<R, ReinitError>,
+    tables: impl FnOnce(Resumed),
+) -> Result<R, ReinitError> {
+    match outcome {
+        Ok(value) => {
+            tables(Resumed::Back);
+            Ok(value)
+        }
+        Err(error) => {
+            transport.set_status(transport.status() | DeviceStatus::FAILED);
+            tables(Resumed::Failed);
+            Err(error)
+        }
+    }
+}
+
+/// Whether a driver's device was lost by a restore command that timed out.
+///
+/// The timed-out command is still counted in its queue, so the queue
+/// cannot be programmed again, and the buffers it carried were leaked to
+/// a device that may yet write them. Both are permanent, so the state is
+/// a terminal one the driver checks on entry rather than a condition a
+/// retry might clear. Written only by `reinitialize`, which runs on one
+/// processor while the machine is frozen.
+#[derive(Debug, Default)]
+pub(crate) struct Lost(AtomicBool);
+
+impl Lost {
+    pub(crate) const fn new() -> Self {
+        Self(AtomicBool::new(false))
+    }
+
+    /// Refuses a device an earlier re-initialisation lost.
+    pub(crate) fn refuse(&self, device: DeviceType) -> Result<(), ReinitError> {
+        if self.0.load(Ordering::Acquire) {
+            return Err(ReinitError::DeviceLost { device });
+        }
+        Ok(())
+    }
+
+    /// Passes `outcome` through, latching the loss when it is a restore
+    /// command that timed out.
+    pub(crate) fn observe<R>(&self, outcome: Result<R, ReinitError>) -> Result<R, ReinitError> {
+        if matches!(outcome, Err(ReinitError::RestoreTimedOut { .. })) {
+            self.0.store(true, Ordering::Release);
+        }
+        outcome
+    }
 }

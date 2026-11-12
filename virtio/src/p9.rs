@@ -25,7 +25,7 @@ use crate::inflight::{
 };
 use crate::notify::Notify;
 use crate::queue::VirtQueue;
-use crate::resume::{DeviceReset, QuiesceError, ReinitError, driver_ok};
+use crate::resume::{DeviceReset, QuiesceError, ReinitError, conclude, driver_ok};
 use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
 
 const REQUEST_QUEUE_INDEX: u16 = 0;
@@ -155,13 +155,14 @@ impl<T: VirtioTransport> Virtio9pDevice<T> {
     /// every session and every fid, and a request that completed before
     /// the reset names state that no longer exists.
     pub fn reinitialize(&self) -> Result<DeviceReset, ReinitError> {
+        conclude(&self.transport, self.restore(), |resumed| {
+            self.inflight.resume(resumed);
+        })
+    }
+
+    fn restore(&self) -> Result<DeviceReset, ReinitError> {
         renegotiate(&self.transport, self.features)?;
-        reinitialize_requests(
-            &self.inflight,
-            &self.queue,
-            &self.transport,
-            REQUEST_QUEUE_INDEX,
-        )?;
+        reinitialize_requests(&self.queue, &self.transport, REQUEST_QUEUE_INDEX)?;
         // A device is untrusted: what it reads back is compared. The tag
         // is the share's name, and a different one is a different share.
         let tag = read_mount_tag(&self.transport).map_err(|error| ReinitError::Restore {
@@ -494,6 +495,32 @@ mod tests {
                 device: DeviceType::_9P,
                 what: "the mount tag",
             })
+        );
+    }
+
+    /// A device refused after its reset is FAILED, and a request made
+    /// afterwards fails at once instead of waiting for a completion that
+    /// cannot come.
+    #[test]
+    fn a_refused_device_fails_the_requests_that_follow() {
+        let device = Virtio9pDevice::new(transport(8)).expect("the device should initialize");
+        device.transport.set_config_u8(2, b'x');
+        assert!(matches!(
+            device.reinitialize(),
+            Err(ReinitError::DeviceChanged { .. })
+        ));
+        assert!(
+            device
+                .transport
+                .status()
+                .contains(crate::transport::DeviceStatus::FAILED)
+        );
+
+        let request = [1_u8; 16];
+        let mut response = reply(24);
+        assert_eq!(
+            block_on(device.request(&request, &mut response)),
+            Err(IoError::DeviceFault)
         );
     }
 

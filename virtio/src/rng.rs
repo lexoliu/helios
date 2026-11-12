@@ -8,7 +8,7 @@ use crate::inflight::{
 };
 use crate::notify::Notify;
 use crate::queue::VirtQueue;
-use crate::resume::{DeviceReset, QuiesceError, ReinitError, driver_ok};
+use crate::resume::{DeviceReset, QuiesceError, ReinitError, conclude, driver_ok};
 use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
 
 const REQUEST_QUEUE_INDEX: u16 = 0;
@@ -89,13 +89,14 @@ impl<T: VirtioTransport> VirtioRngDevice<T> {
     /// Brings a reset device back with the features it had, after
     /// [`Self::quiesce`]. Entropy keeps no state outside its ring.
     pub fn reinitialize(&self) -> Result<DeviceReset, ReinitError> {
+        conclude(&self.transport, self.restore(), |resumed| {
+            self.inflight.resume(resumed);
+        })
+    }
+
+    fn restore(&self) -> Result<DeviceReset, ReinitError> {
         renegotiate(&self.transport, self.features)?;
-        reinitialize_requests(
-            &self.inflight,
-            &self.queue,
-            &self.transport,
-            REQUEST_QUEUE_INDEX,
-        )?;
+        reinitialize_requests(&self.queue, &self.transport, REQUEST_QUEUE_INDEX)?;
         driver_ok(&self.transport);
         Ok(DeviceReset {
             device: DeviceType::Entropy,

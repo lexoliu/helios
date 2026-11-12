@@ -1096,3 +1096,94 @@ fn swap_extents_are_reused_and_coalesced() {
     assert_eq!(state.free.len(), 1);
     assert_eq!(state.available_blocks(), 8);
 }
+
+/// Every field of the configuration space the driver sized its
+/// requests or reported its geometry from is compared after a reset,
+/// not only the capacity.
+#[test]
+fn a_device_whose_limits_changed_after_the_reset_is_refused() {
+    let features = BLK_F_SIZE_MAX
+        | BLK_F_SEG_MAX
+        | BLK_F_BLK_SIZE
+        | BLK_F_TOPOLOGY
+        | BLK_F_CONFIG_WCE
+        | BLK_F_DISCARD
+        | BLK_F_WRITE_ZEROES;
+    type Change = fn(&FakeTransport);
+    let changes: [(&str, Change); 8] = [
+        ("seg_max", |t| t.set_config_u32(CFG_SEG_MAX, 8)),
+        ("size_max", |t| t.set_config_u32(CFG_SIZE_MAX, 8192)),
+        ("blk_size", |t| t.set_config_u32(CFG_BLK_SIZE, 512)),
+        ("topology", |t| t.set_config_u16(CFG_MIN_IO_SIZE, 4)),
+        ("writeback", |t| t.set_config_u8(CFG_WRITEBACK, 0)),
+        ("discard", |t| t.set_config_u32(CFG_MAX_DISCARD_SECTORS, 1)),
+        ("write zeroes", |t| {
+            t.set_config_u32(CFG_MAX_WRITE_ZEROES_SECTORS, 1);
+        }),
+        ("write zeroes segments", |t| {
+            t.set_config_u32(CFG_MAX_WRITE_ZEROES_SEG, 1);
+        }),
+    ];
+    for (name, change) in changes {
+        let device = device_with(features, |transport| {
+            transport.set_config_u32(CFG_SEG_MAX, 4);
+            transport.set_config_u32(CFG_SIZE_MAX, 16384);
+            transport.set_config_u32(CFG_BLK_SIZE, 4096);
+            transport.set_config_u16(CFG_MIN_IO_SIZE, 2);
+            transport.set_config_u8(CFG_WRITEBACK, 1);
+            transport.set_config_u32(CFG_MAX_DISCARD_SECTORS, 64);
+            transport.set_config_u32(CFG_MAX_DISCARD_SEG, 2);
+            transport.set_config_u32(CFG_MAX_WRITE_ZEROES_SECTORS, 64);
+            transport.set_config_u32(CFG_MAX_WRITE_ZEROES_SEG, 2);
+        });
+        change(&device.object().transport);
+
+        assert!(
+            matches!(
+                device.reinitialize(),
+                Err(ReinitError::DeviceChanged { .. })
+            ),
+            "a changed {name} must be refused"
+        );
+    }
+}
+
+/// A multi-queue device has every queue programmed again, not only the
+/// first.
+#[test]
+fn every_queue_of_a_multi_queue_device_is_programmed_again() {
+    let transport = FakeTransport::new(FakeTransportConfig {
+        device_type: DeviceType::Block,
+        offered_features: VirtioFeatures::VERSION_1.bits() | BLK_F_MQ,
+        queue_size: 8,
+        supports_queue_reset: false,
+        absent_queues: &[],
+    });
+    transport.set_config_u32(CFG_CAPACITY_LOW, TEST_CAPACITY_SECTORS);
+    transport.set_config_u16(CFG_NUM_QUEUES, 2);
+    let device = VirtioBlockDevice::<_, _, TestBuffer>::new(transport, FakeAffinity::<2>)
+        .expect("a two-queue device comes up")
+        .into_resource(BlockDeviceRights::READ | BlockDeviceRights::WRITE);
+    assert_eq!(device.queue_count(), 2);
+    device.quiesce(|| false).expect("both queues are idle");
+
+    device.object().transport.reset_behind_the_driver();
+    assert_eq!(
+        device.reinitialize(),
+        Ok(DeviceReset {
+            device: DeviceType::Block
+        })
+    );
+
+    let programmed = device.object().transport.programmed_queues();
+    for index in 0..2 {
+        assert_eq!(
+            programmed
+                .iter()
+                .filter(|queue| queue.index == index)
+                .count(),
+            2,
+            "queue {index} is programmed at bring-up and again after the reset"
+        );
+    }
+}

@@ -40,7 +40,7 @@ use crate::inflight::{
 };
 use crate::notify::Notify;
 use crate::queue::{VirtQueue, negotiated_queue_size};
-use crate::resume::{DeviceReset, QuiesceError, ReinitError, driver_ok};
+use crate::resume::{DeviceReset, QuiesceError, ReinitError, conclude, driver_ok};
 use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
 
 const RX_QUEUE_INDEX: u16 = 0;
@@ -319,6 +319,16 @@ impl<T: VirtioTransport> VirtioVsockDevice<T> {
     /// connection table drops its connections through the path it
     /// already has.
     pub fn reinitialize(&self) -> Result<DeviceReset, ReinitError> {
+        let reset = conclude(&self.transport, self.restore(), |resumed| {
+            self.tx_inflight.resume(resumed);
+        })?;
+        // Set before the wake, so a reader that parked re-tests it.
+        self.transport_reset.store(true, Ordering::Release);
+        self.interrupts.notify_all();
+        Ok(reset)
+    }
+
+    fn restore(&self) -> Result<DeviceReset, ReinitError> {
         let device = DeviceType::Vsock;
         renegotiate(&self.transport, self.features)?;
         let found = read_guest_cid(&self.transport);
@@ -328,12 +338,7 @@ impl<T: VirtioTransport> VirtioVsockDevice<T> {
                 found,
             });
         }
-        reinitialize_requests(
-            &self.tx_inflight,
-            &self.tx_queue,
-            &self.transport,
-            TX_QUEUE_INDEX,
-        )?;
+        reinitialize_requests(&self.tx_queue, &self.transport, TX_QUEUE_INDEX)?;
         let restore = |what| {
             move |error| ReinitError::Restore {
                 device,
@@ -352,14 +357,13 @@ impl<T: VirtioTransport> VirtioVsockDevice<T> {
                 slot_for_token,
             } = &mut *rx;
             queue.reinitialize_discarding(&self.transport)?;
-            for (index, slot) in slots.iter_mut().enumerate() {
-                let token = queue
-                    .submit_output_deferred(&self.transport, slot)
-                    .map_err(restore("the receive buffers"))?;
-                slot_for_token[usize::from(token)] =
-                    u16::try_from(index).expect("receive slots were built from a u16 count");
-            }
-            queue.publish();
+            queue
+                .restock(
+                    &self.transport,
+                    slots.iter_mut().map(|slot| &mut **slot),
+                    slot_for_token,
+                )
+                .map_err(restore("the receive buffers"))?;
         }
         {
             let mut event = self.event.try_lock().ok_or(ReinitError::QueueBusy {
@@ -372,14 +376,13 @@ impl<T: VirtioTransport> VirtioVsockDevice<T> {
                 buffer_for_token,
             } = &mut *event;
             queue.reinitialize_discarding(&self.transport)?;
-            for (index, buffer) in buffers.iter_mut().enumerate() {
-                let token = queue
-                    .submit_output_deferred(&self.transport, buffer)
-                    .map_err(restore("the event buffers"))?;
-                buffer_for_token[usize::from(token)] =
-                    u16::try_from(index).expect("event buffers were built from a u16 count");
-            }
-            queue.publish();
+            queue
+                .restock(
+                    &self.transport,
+                    buffers.iter_mut().map(|buffer| &mut **buffer),
+                    buffer_for_token,
+                )
+                .map_err(restore("the event buffers"))?;
         }
         driver_ok(&self.transport);
         self.rx
@@ -392,9 +395,6 @@ impl<T: VirtioTransport> VirtioVsockDevice<T> {
             .expect("the event lock was just released")
             .queue
             .notify(&self.transport);
-        // Set before the wake, so a reader that parked re-tests it.
-        self.transport_reset.store(true, Ordering::Release);
-        self.interrupts.notify_all();
         Ok(DeviceReset { device })
     }
 

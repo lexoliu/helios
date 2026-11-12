@@ -898,6 +898,29 @@ impl<T: VirtioTransport> VirtQueue<T> {
         self.submit_deferred(transport, parts, &mut [])
     }
 
+    /// Posts every buffer of a pool on a queue that was just
+    /// re-programmed, and publishes them together.
+    ///
+    /// `buffer_for_token` records which buffer each descriptor identifier
+    /// carries, which is the pairing a completion is decoded by. The pool
+    /// is posted in order, so buffer `n` is the `n`th entry; whatever the
+    /// device wrote into a buffer before the reset is overwritten by the
+    /// next completion and never read.
+    pub(crate) fn restock<'a>(
+        &mut self,
+        transport: &T,
+        buffers: impl Iterator<Item = &'a mut [u8]>,
+        buffer_for_token: &mut [u16],
+    ) -> IoResult<()> {
+        for (index, buffer) in buffers.enumerate() {
+            let token = self.submit_output_deferred(transport, buffer)?;
+            buffer_for_token[usize::from(token)] =
+                u16::try_from(index).expect("a pool was built from a u16 count");
+        }
+        self.publish();
+        Ok(())
+    }
+
     /// Stages one writable buffer without publishing it.
     pub(crate) fn submit_output_deferred(
         &mut self,

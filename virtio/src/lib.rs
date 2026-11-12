@@ -12,6 +12,7 @@ mod gpu;
 mod inflight;
 mod input;
 mod iommu;
+mod journal;
 mod mmio;
 mod net;
 mod notify;

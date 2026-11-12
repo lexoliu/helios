@@ -45,7 +45,7 @@ use crate::inflight::{
 };
 use crate::notify::Notify;
 use crate::queue::{MAX_CHAIN_BUFFERS, VirtQueue};
-use crate::resume::{DeviceReset, QuiesceError, ReinitError, driver_ok};
+use crate::resume::{DeviceReset, QuiesceError, ReinitError, conclude, driver_ok};
 use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
 
 /// Page size the balloon protocol counts in (virtio 1.2 §5.5.6). It is
@@ -370,6 +370,22 @@ impl<T: VirtioTransport> VirtioBalloonDevice<T> {
     /// not the driver's. A waiting statistics request is released empty
     /// so its task posts a fresh buffer.
     pub fn reinitialize(&self) -> Result<DeviceReset, ReinitError> {
+        conclude(&self.transport, self.restore(), |resumed| {
+            self.inflate.inflight.resume(resumed);
+            self.deflate.inflight.resume(resumed);
+            if let Some(queue) = &self.free_page {
+                queue.inflight.resume(resumed);
+            }
+            if let Some(queue) = &self.reporting {
+                queue.inflight.resume(resumed);
+            }
+            if let Some(queue) = &self.stats {
+                queue.inflight.resume(resumed);
+            }
+        })
+    }
+
+    fn restore(&self) -> Result<DeviceReset, ReinitError> {
         let device = DeviceType::MemoryBalloon;
         renegotiate(&self.transport, self.features)?;
         // The queue indices follow what the device offers, and the
@@ -380,23 +396,13 @@ impl<T: VirtioTransport> VirtioBalloonDevice<T> {
                 what: "queue layout",
             });
         }
-        reinitialize_requests(
-            &self.inflate.inflight,
-            &self.inflate.queue,
-            &self.transport,
-            INFLATE_QUEUE_INDEX,
-        )?;
-        reinitialize_requests(
-            &self.deflate.inflight,
-            &self.deflate.queue,
-            &self.transport,
-            DEFLATE_QUEUE_INDEX,
-        )?;
+        reinitialize_requests(&self.inflate.queue, &self.transport, INFLATE_QUEUE_INDEX)?;
+        reinitialize_requests(&self.deflate.queue, &self.transport, DEFLATE_QUEUE_INDEX)?;
         if let (Some(queue), Some(index)) = (&self.free_page, self.layout.free_page) {
-            reinitialize_requests(&queue.inflight, &queue.queue, &self.transport, index)?;
+            reinitialize_requests(&queue.queue, &self.transport, index)?;
         }
         if let (Some(queue), Some(index)) = (&self.reporting, self.layout.reporting) {
-            reinitialize_requests(&queue.inflight, &queue.queue, &self.transport, index)?;
+            reinitialize_requests(&queue.queue, &self.transport, index)?;
         }
         if let (Some(queue), Some(index)) = (&self.stats, self.layout.stats) {
             reinitialize_posted(&queue.inflight, &queue.queue, &self.transport, index)?;

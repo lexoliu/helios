@@ -75,7 +75,7 @@ use helios_hal::vmm::SwapBackend;
 use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate, renegotiate};
 use crate::notify::Notify;
 use crate::queue::{MAX_CHAIN_BUFFERS, VirtQueue};
-use crate::resume::{DeviceReset, QuiesceError, ReinitError, driver_ok, settle};
+use crate::resume::{DeviceReset, QuiesceError, ReinitError, Resumed, conclude, driver_ok, settle};
 use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
 
 /// virtio-blk addresses every request in 512-byte sectors regardless of
@@ -405,6 +405,8 @@ pub struct VirtioBlockDevice<T: VirtioTransport, C: QueueAffinity, B> {
     geometry: BlockGeometry,
     capabilities: BlockDeviceCapabilities,
     limits: RequestLimits,
+    /// Whether the device's write cache is write-back, as it reported.
+    writeback: bool,
     readonly: bool,
     counters: RequestCounters,
     /// [`RUNNING`], [`RESETTING`] or [`STOPPED`].
@@ -661,89 +663,29 @@ impl<T: VirtioTransport, C: QueueAffinity, B: BlockBuffer> VirtioBlockDevice<T, 
 
         let features = negotiate(&transport, RING_FEATURES | BLK_FEATURES)?;
 
-        let capacity_sectors = u64::from(transport.read_config_u32(CFG_CAPACITY_LOW))
-            | (u64::from(transport.read_config_u32(CFG_CAPACITY_HIGH)) << 32);
-        let logical_block_bytes = if features.device(BLK_F_BLK_SIZE) {
-            usize::try_from(transport.read_config_u32(CFG_BLK_SIZE))
-                .map_err(|_| IoError::DeviceFault)?
-        } else {
-            SECTOR_SIZE
-        };
-        if logical_block_bytes == 0 || !logical_block_bytes.is_multiple_of(SECTOR_SIZE) {
-            return Err(IoError::InvalidDeviceConfig(
-                "virtio-blk logical block size is not a multiple of the 512-byte sector",
-            ));
-        }
-        let sectors_per_block = logical_block_bytes / SECTOR_SIZE;
-        let capacity_blocks = usize::try_from(capacity_sectors)
-            .map_err(|_| IoError::DeviceFault)?
-            / sectors_per_block;
-
-        let (physical_block_exp, min_io_blocks, opt_io_blocks) = if features.device(BLK_F_TOPOLOGY)
-        {
-            (
-                transport.read_config_u8(CFG_PHYSICAL_BLOCK_EXP),
-                u32::from(transport.read_config_u16(CFG_MIN_IO_SIZE)),
-                transport.read_config_u32(CFG_OPT_IO_SIZE),
-            )
-        } else {
-            (0, 0, 0)
-        };
-
-        // virtio 1.2 §5.2.5: a device that does not offer SEG_MAX states
-        // no limit of its own, and the driver has to pick one; a single
-        // data buffer is the only value that is correct for every device.
-        let device_segments = if features.device(BLK_F_SEG_MAX) {
-            transport.read_config_u32(CFG_SEG_MAX).max(1)
-        } else {
-            1
-        };
-        let data_segments = usize::try_from(device_segments)
-            .unwrap_or(usize::MAX)
-            .min(MAX_CHAIN_BUFFERS - 2);
-        let segment_bytes = if features.device(BLK_F_SIZE_MAX) {
-            let size_max = transport.read_config_u32(CFG_SIZE_MAX);
-            if size_max == 0 {
-                return Err(IoError::InvalidDeviceConfig(
-                    "virtio-blk offered SIZE_MAX with a zero maximum segment size",
-                ));
-            }
-            usize::try_from(size_max).unwrap_or(usize::MAX)
-        } else {
-            usize::try_from(u32::MAX).unwrap_or(usize::MAX)
-        };
-        if segment_bytes < logical_block_bytes {
-            return Err(IoError::InvalidDeviceConfig(
-                "virtio-blk cannot carry a whole logical block in one segment",
-            ));
-        }
+        let DeviceConfig {
+            geometry,
+            limits,
+            writeback,
+        } = read_config(&transport, features)?;
+        let RequestLimits {
+            data_segments,
+            segment_bytes,
+            ..
+        } = limits;
+        let logical_block_bytes = geometry.logical_block_bytes;
+        let capacity_blocks = geometry.capacity_blocks;
 
         let mut capabilities = BlockDeviceCapabilities::empty();
         if features.device(BLK_F_FLUSH) {
             capabilities |= BlockDeviceCapabilities::FLUSH;
         }
-        let (discard_sectors, discard_segments) = if features.device(BLK_F_DISCARD) {
+        if features.device(BLK_F_DISCARD) {
             capabilities |= BlockDeviceCapabilities::DISCARD;
-            deallocate_limits(
-                &transport,
-                CFG_MAX_DISCARD_SECTORS,
-                CFG_MAX_DISCARD_SEG,
-                "discard",
-            )?
-        } else {
-            (0, 0)
-        };
-        let (write_zeroes_sectors, write_zeroes_segments) = if features.device(BLK_F_WRITE_ZEROES) {
+        }
+        if features.device(BLK_F_WRITE_ZEROES) {
             capabilities |= BlockDeviceCapabilities::WRITE_ZEROES;
-            deallocate_limits(
-                &transport,
-                CFG_MAX_WRITE_ZEROES_SECTORS,
-                CFG_MAX_WRITE_ZEROES_SEG,
-                "write-zeroes",
-            )?
-        } else {
-            (0, 0)
-        };
+        }
 
         let queue_count = queue_count(&transport, &cpu, features);
         let mut queues = Vec::with_capacity(queue_count);
@@ -783,20 +725,7 @@ impl<T: VirtioTransport, C: QueueAffinity, B: BlockBuffer> VirtioBlockDevice<T, 
                 | DeviceStatus::DRIVER_OK,
         );
 
-        let geometry = BlockGeometry {
-            logical_block_bytes,
-            physical_block_exp,
-            min_io_blocks,
-            opt_io_blocks,
-            // What one request this driver builds can carry, which is
-            // fewer than the device allows once the chain bound applies.
-            max_segments: u32::try_from(data_segments).unwrap_or(u32::MAX),
-            max_segment_bytes: u32::try_from(segment_bytes).unwrap_or(u32::MAX),
-            capacity_blocks,
-        };
         let readonly = features.device(BLK_F_RO);
-        let writeback =
-            features.device(BLK_F_CONFIG_WCE) && transport.read_config_u8(CFG_WRITEBACK) != 0;
         tracing::info!(
             capacity_blocks,
             block_bytes = logical_block_bytes,
@@ -820,15 +749,8 @@ impl<T: VirtioTransport, C: QueueAffinity, B: BlockBuffer> VirtioBlockDevice<T, 
             features,
             geometry,
             capabilities,
-            limits: RequestLimits {
-                sectors_per_block,
-                data_segments,
-                segment_bytes,
-                discard_sectors,
-                discard_segments,
-                write_zeroes_sectors,
-                write_zeroes_segments,
-            },
+            limits,
+            writeback,
             readonly,
             counters: RequestCounters::default(),
             state: AtomicU8::new(RUNNING),
@@ -946,13 +868,28 @@ impl<T: VirtioTransport, C: QueueAffinity, B: BlockBuffer> VirtioBlockDevice<T, 
     /// nothing else to restore; what the device reports about itself is
     /// compared with what the driver brought up.
     pub fn reinitialize(&self) -> Result<DeviceReset, ReinitError> {
-        let device = DeviceType::Block;
         if self.state.load(Ordering::SeqCst) != RUNNING {
             return Err(ReinitError::StateNotRestorable {
-                device,
+                device: DeviceType::Block,
                 what: "a device the driver stopped after it broke the used-ring contract",
             });
         }
+        conclude(&self.transport, self.restore(), |resumed| {
+            if resumed == Resumed::Failed {
+                // Nothing is in flight after a quiesce, so what has to
+                // stop is the next request: the driver refuses every
+                // one from here, and a submitter parked for room is woken
+                // to see that.
+                self.state.store(STOPPED, Ordering::SeqCst);
+                for queue in self.queues.iter() {
+                    queue.available.notify_all();
+                }
+            }
+        })
+    }
+
+    fn restore(&self) -> Result<DeviceReset, ReinitError> {
+        let device = DeviceType::Block;
         renegotiate(&self.transport, self.features)?;
         self.check_identity()?;
         for (index, queue) in self.queues.iter().enumerate() {
@@ -975,21 +912,36 @@ impl<T: VirtioTransport, C: QueueAffinity, B: BlockBuffer> VirtioBlockDevice<T, 
     fn check_identity(&self) -> Result<(), ReinitError> {
         let device = DeviceType::Block;
         let changed = |what| ReinitError::DeviceChanged { device, what };
-        let block_bytes = if self.features.device(BLK_F_BLK_SIZE) {
-            usize::try_from(self.transport.read_config_u32(CFG_BLK_SIZE))
-                .map_err(|_| changed("logical block size"))?
-        } else {
-            SECTOR_SIZE
-        };
-        if block_bytes != self.geometry.logical_block_bytes {
+        let found = read_config(&self.transport, self.features)
+            .map_err(|_| changed("its configuration space"))?;
+        let (was, now) = (&self.geometry, &found.geometry);
+        if now.logical_block_bytes != was.logical_block_bytes {
             return Err(changed("logical block size"));
         }
-        let sectors = u64::from(self.transport.read_config_u32(CFG_CAPACITY_LOW))
-            | (u64::from(self.transport.read_config_u32(CFG_CAPACITY_HIGH)) << 32);
-        let blocks = usize::try_from(sectors).map_err(|_| changed("capacity"))?
-            / self.limits.sectors_per_block;
-        if blocks != self.geometry.capacity_blocks {
+        if now.capacity_blocks != was.capacity_blocks {
             return Err(changed("capacity"));
+        }
+        if (now.physical_block_exp, now.min_io_blocks, now.opt_io_blocks)
+            != (was.physical_block_exp, was.min_io_blocks, was.opt_io_blocks)
+        {
+            return Err(changed("topology"));
+        }
+        let (was, now) = (&self.limits, &found.limits);
+        if (now.data_segments, now.segment_bytes) != (was.data_segments, was.segment_bytes) {
+            return Err(changed("segment limits"));
+        }
+        if (now.discard_sectors, now.discard_segments)
+            != (was.discard_sectors, was.discard_segments)
+        {
+            return Err(changed("discard limits"));
+        }
+        if (now.write_zeroes_sectors, now.write_zeroes_segments)
+            != (was.write_zeroes_sectors, was.write_zeroes_segments)
+        {
+            return Err(changed("write-zeroes limits"));
+        }
+        if found.writeback != self.writeback {
+            return Err(changed("write cache mode"));
         }
         if queue_count(&self.transport, &self.cpu, self.features) != self.queues.len() {
             return Err(changed("queue count"));
@@ -1489,6 +1441,127 @@ fn queue_count<T: VirtioTransport, C: QueueAffinity>(
     }
     let device_queues = usize::from(transport.read_config_u16(CFG_NUM_QUEUES));
     device_queues.clamp(1, cpu.processor_count().max(1))
+}
+
+/// Everything the device's configuration space says that the driver
+/// builds requests or reports geometry from.
+///
+/// Read once at bring-up and again after a reset, where the two are
+/// compared: a device that reports anything else is not the one the
+/// driver's requests were sized for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DeviceConfig {
+    geometry: BlockGeometry,
+    limits: RequestLimits,
+    writeback: bool,
+}
+
+/// Reads and validates the device's configuration space.
+fn read_config<T: VirtioTransport>(
+    transport: &T,
+    features: NegotiatedFeatures,
+) -> IoResult<DeviceConfig> {
+    let capacity_sectors = u64::from(transport.read_config_u32(CFG_CAPACITY_LOW))
+        | (u64::from(transport.read_config_u32(CFG_CAPACITY_HIGH)) << 32);
+    let logical_block_bytes = if features.device(BLK_F_BLK_SIZE) {
+        usize::try_from(transport.read_config_u32(CFG_BLK_SIZE))
+            .map_err(|_| IoError::DeviceFault)?
+    } else {
+        SECTOR_SIZE
+    };
+    if logical_block_bytes == 0 || !logical_block_bytes.is_multiple_of(SECTOR_SIZE) {
+        return Err(IoError::InvalidDeviceConfig(
+            "virtio-blk logical block size is not a multiple of the 512-byte sector",
+        ));
+    }
+    let sectors_per_block = logical_block_bytes / SECTOR_SIZE;
+    let capacity_blocks =
+        usize::try_from(capacity_sectors).map_err(|_| IoError::DeviceFault)? / sectors_per_block;
+
+    let (physical_block_exp, min_io_blocks, opt_io_blocks) = if features.device(BLK_F_TOPOLOGY) {
+        (
+            transport.read_config_u8(CFG_PHYSICAL_BLOCK_EXP),
+            u32::from(transport.read_config_u16(CFG_MIN_IO_SIZE)),
+            transport.read_config_u32(CFG_OPT_IO_SIZE),
+        )
+    } else {
+        (0, 0, 0)
+    };
+
+    // virtio 1.2 §5.2.5: a device that does not offer SEG_MAX states
+    // no limit of its own, and the driver has to pick one; a single
+    // data buffer is the only value that is correct for every device.
+    let device_segments = if features.device(BLK_F_SEG_MAX) {
+        transport.read_config_u32(CFG_SEG_MAX).max(1)
+    } else {
+        1
+    };
+    let data_segments = usize::try_from(device_segments)
+        .unwrap_or(usize::MAX)
+        .min(MAX_CHAIN_BUFFERS - 2);
+    let segment_bytes = if features.device(BLK_F_SIZE_MAX) {
+        let size_max = transport.read_config_u32(CFG_SIZE_MAX);
+        if size_max == 0 {
+            return Err(IoError::InvalidDeviceConfig(
+                "virtio-blk offered SIZE_MAX with a zero maximum segment size",
+            ));
+        }
+        usize::try_from(size_max).unwrap_or(usize::MAX)
+    } else {
+        usize::try_from(u32::MAX).unwrap_or(usize::MAX)
+    };
+    if segment_bytes < logical_block_bytes {
+        return Err(IoError::InvalidDeviceConfig(
+            "virtio-blk cannot carry a whole logical block in one segment",
+        ));
+    }
+
+    let (discard_sectors, discard_segments) = if features.device(BLK_F_DISCARD) {
+        deallocate_limits(
+            transport,
+            CFG_MAX_DISCARD_SECTORS,
+            CFG_MAX_DISCARD_SEG,
+            "discard",
+        )?
+    } else {
+        (0, 0)
+    };
+    let (write_zeroes_sectors, write_zeroes_segments) = if features.device(BLK_F_WRITE_ZEROES) {
+        deallocate_limits(
+            transport,
+            CFG_MAX_WRITE_ZEROES_SECTORS,
+            CFG_MAX_WRITE_ZEROES_SEG,
+            "write-zeroes",
+        )?
+    } else {
+        (0, 0)
+    };
+    let writeback =
+        features.device(BLK_F_CONFIG_WCE) && transport.read_config_u8(CFG_WRITEBACK) != 0;
+
+    Ok(DeviceConfig {
+        geometry: BlockGeometry {
+            logical_block_bytes,
+            physical_block_exp,
+            min_io_blocks,
+            opt_io_blocks,
+            // What one request this driver builds can carry, which is
+            // fewer than the device allows once the chain bound applies.
+            max_segments: u32::try_from(data_segments).unwrap_or(u32::MAX),
+            max_segment_bytes: u32::try_from(segment_bytes).unwrap_or(u32::MAX),
+            capacity_blocks,
+        },
+        limits: RequestLimits {
+            sectors_per_block,
+            data_segments,
+            segment_bytes,
+            discard_sectors,
+            discard_segments,
+            write_zeroes_sectors,
+            write_zeroes_segments,
+        },
+        writeback,
+    })
 }
 
 /// Reads the per-run and per-request limits of a deallocation request
