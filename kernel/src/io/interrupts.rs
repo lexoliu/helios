@@ -16,9 +16,10 @@ use crate::device::DeviceInterruptRoute;
 /// Block devices one platform may route interrupts for.
 ///
 /// A machine routinely carries more than one: the disk the kernel was
-/// booted from and the scratch disk it owns are separate devices on the
-/// same bus, and the kernel has to be able to reach both to tell them
-/// apart.
+/// booted from, the scratch disk it owns and the images it mounts are
+/// separate devices on the same bus, and the kernel has to be able to
+/// reach each to tell them apart. A device past this bound is refused by
+/// [`crate::admit_block_devices`] before it is brought up.
 pub const MAX_BLOCK_DEVICES: usize = 4;
 
 /// Interrupt messages one network device may install routes for.
@@ -247,16 +248,21 @@ where
     /// Registers one more block device.
     ///
     /// Unlike the single-device slots this one takes several handlers:
-    /// the platform decides which of the disks it exposes the kernel
-    /// ends up owning, and that decision needs every candidate to be
-    /// reachable first.
+    /// the kernel gives every disk on the bus a role by its serial, so
+    /// each must be reachable. A backend passes its candidates through
+    /// [`crate::admit_block_devices`] before bringing them up, which
+    /// refuses the ones past this table's capacity by name; a route past
+    /// it here is a backend that skipped that step.
     pub fn add_block(&mut self, source: Source, handler: Block) {
         let slot = self
             .block
             .iter_mut()
             .find(|slot| slot.is_none())
             .unwrap_or_else(|| {
-                panic!("more than {MAX_BLOCK_DEVICES} block interrupt routes were installed")
+                panic!(
+                    "more than {MAX_BLOCK_DEVICES} block interrupt routes were installed; \
+                     the backend did not admit its block devices"
+                )
             });
         *slot = Some((source, handler));
     }

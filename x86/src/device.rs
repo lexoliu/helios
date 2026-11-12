@@ -2,15 +2,16 @@
 //!
 //! x86-64 publishes no device grants (`docs/device-grants.md`): a PCI
 //! function's register file is mapped by its driver and its line is
-//! routed through the IDT, so nothing substitutes a device region into
-//! an owner's memory here, and [`substitute_device`] answers exactly
-//! that (#504). What the kernel does reach through these hooks on this
-//! backend is pinned, physically contiguous memory shown in an
+//! routed through the IDT. What the kernel reaches through these hooks
+//! on this backend is pinned, physically contiguous memory shown in an
 //! instance's linear memory — a display frame buffer the display engine
 //! reads by physical address, and a compositor surface a second
-//! instance shows too — and that is the user address space's own
-//! [`AddressSpace`] surface, installed here the moment the address space
-//! exists and before any device is discovered.
+//! instance shows too — and a device region shown the same way, such as
+//! a virtio-gpu host blob placed in the host-visible aperture, mapped
+//! with the memory type its attributes call for (`crate::memory_type`). All of
+//! it is the user address space's own [`AddressSpace`] surface,
+//! installed here the moment the address space exists and before any
+//! device is discovered.
 //!
 //! # SMP contract
 //!
@@ -41,9 +42,8 @@ fn substitute_memory(
     crate::vmm::user_address_space().substitute_memory(virt, physical, flags)
 }
 
-/// Refused: this backend publishes no device grants (#504).
-fn substitute_device(_virt: VirtRange, _region: DeviceRegion) -> Result<(), AddressSpaceError> {
-    Err(AddressSpaceError::DeviceMappingUnsupported)
+fn substitute_device(virt: VirtRange, region: DeviceRegion) -> Result<(), AddressSpaceError> {
+    crate::vmm::user_address_space().substitute_device(virt, region)
 }
 
 fn restore(virt: VirtRange) -> Result<(), AddressSpaceError> {
