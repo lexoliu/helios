@@ -1665,17 +1665,18 @@ fn flush_tlb_pages(start: usize, pages: usize) {
 }
 
 fn page_flags_to_pte(flags: PageFlags) -> Result<u64, AddressSpaceError> {
-    // Write without read is a reserved encoding: every access through
-    // such a leaf faults, and the spurious-fault retry would loop on it.
-    if flags.is_empty() || (flags.contains(PageFlags::WRITE) && !flags.contains(PageFlags::READ)) {
+    if flags.is_empty() {
         return Err(AddressSpaceError::InvalidFlags);
     }
     let mut pte = 0u64;
     if flags.contains(PageFlags::READ) {
         pte |= PTE_READ;
     }
+    // Write without read is a reserved leaf encoding (every access through
+    // it faults, and the spurious-fault retry would loop on it), so write
+    // implies read, as aarch64's read-write access permission does.
     if flags.contains(PageFlags::WRITE) {
-        pte |= PTE_WRITE;
+        pte |= PTE_READ | PTE_WRITE;
     }
     if flags.contains(PageFlags::EXECUTE) {
         pte |= PTE_EXECUTE;
