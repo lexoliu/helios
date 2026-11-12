@@ -2744,9 +2744,15 @@ impl<HostFs: crate::HostFileSystem> Preview1ChunkedFile for ResolvedFileChunks<'
         position: WritePosition,
         len: usize,
     ) -> Result<u64, fs_types::ErrorCode> {
-        wasi_fs::write_resolved_with(self.file, position, len, self.now_nanos, |destination| {
-            gather.fill(destination)
-        })
+        // The regions arrive in write order and cover the chunk exactly,
+        // which is the order `gather` hands its bytes out in.
+        wasi_fs::write_resolved_with(
+            self.file,
+            position,
+            len,
+            self.now_nanos,
+            |_, destination| gather.fill(destination),
+        )
         .await
     }
 }
