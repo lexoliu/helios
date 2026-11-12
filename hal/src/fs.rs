@@ -5,6 +5,7 @@ use crate::resource::{KernelResource, ResourceRights};
 use alloc::vec::Vec;
 use bitflags::bitflags;
 use core::future::Future;
+use core::ptr::NonNull;
 
 bitflags! {
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -270,7 +271,8 @@ pub struct BlockGeometry {
     /// Transfer size the device performs best at, in logical blocks.
     /// Zero when the device states no preference.
     pub opt_io_blocks: u32,
-    /// Most buffers one request may be scattered across.
+    /// Most buffers one request may be scattered across: the device's
+    /// limit, or the driver's when the driver carries fewer.
     pub max_segments: u32,
     /// Most bytes one buffer of a request may carry.
     pub max_segment_bytes: u32,
@@ -301,42 +303,166 @@ pub struct BlockQueueTopology {
     pub depth: usize,
 }
 
-pub trait BlockDevice: Send + Sync {
-    /// A buffer the device transfers to and from in place.
+/// The memory one block request carries to or from the device.
+///
+/// A request owns its buffer from the moment the device accepts it until
+/// the device answers, the ownership [`crate::dma`]'s "Buffers a request
+/// owns" states for every request that transfers data: the driver keeps
+/// the buffer with the request in its in-flight table, and the context
+/// that drains the answer calls [`BlockBuffer::complete`] exactly once,
+/// before the buffer goes back to its waiter in the request's
+/// [`BufResult`] or, when nobody waits any more, is dropped. Dropping the
+/// future that submitted a request therefore never frees memory the
+/// device may still read or write, and never leaves the buffer's owner
+/// without the answer. This is Linux's bio, which holds its pages and
+/// whose `bi_end_io` runs from the completion path, and io_uring's owned
+/// buffers as tokio-uring and monoio hand them to the kernel.
+///
+/// Every segment is memory the device can reach: the consumer keeps the
+/// bytes a request carries in memory it allocated from the device itself
+/// through [`BlockDevice::memory`], rather than handing the driver a
+/// slice of arbitrary kernel memory. The driver translates each segment
+/// through its device's [`crate::dma::DmaMemory::device_range`] when it
+/// writes the request, and a segment the device cannot reach is refused
+/// like any other request the driver cannot issue.
+///
+/// A driver refuses a request it cannot issue (a missing right, a range
+/// past the end, a shape the device cannot carry, a segment the device
+/// cannot reach) by calling `complete` with the error, so every buffer a
+/// submission took is completed once. A buffer is dropped uncompleted
+/// only when the submission future is dropped before the device accepted
+/// the request: then the device never saw it.
+///
+/// Concurrency contract: `complete` runs on any processor, either in the
+/// device's interrupt handler or in whichever task drained the device's
+/// answer, and with no lock of the driver held. It must not block, must
+/// not take a lock an interrupt handler cannot take, and must not wait on
+/// another processor. Dropping a buffer the driver no longer needs runs
+/// in the same contexts.
+pub trait BlockBuffer: Send + 'static {
+    /// The memory the request transfers, as runs laid end to end: the
+    /// first run holds the request's first bytes. Their total is a whole
+    /// number of logical blocks.
     ///
-    /// Data reaches a request in memory the device can reach, so the
-    /// consumer allocates the buffer it was going to fill or read anyway
-    /// through [`BlockDevice::buffer`] instead of handing the driver a
-    /// slice of arbitrary kernel memory.
-    type Buffer: DmaBuffer + AsRef<[u8]> + AsMut<[u8]>;
+    /// Until `complete` runs, the runs stay where they are, nobody but
+    /// the device writes them, and for a read nobody reads them either.
+    fn segments(&self) -> impl Iterator<Item = NonNull<[u8]>> + '_;
 
-    /// Allocates a zeroed buffer of `bytes` bytes the device can reach.
+    /// The device's answer to the request this buffer carried, or the
+    /// driver's refusal of it.
+    fn complete(&mut self, result: IoResult<()>);
+}
+
+/// A [`BlockBuffer`] whose bytes belong to the buffer itself, so its
+/// holder fills and reads them through its byte views: a scratch or swap
+/// page, as opposed to a cache's own blocks.
+///
+/// It is made of one run of [`BlockDevice::memory`] and carries it as its
+/// only segment, so a request transfers the bytes in place and the run is
+/// contiguous in the device's address space. Its byte views are that
+/// run's, and like every request buffer's they are not touched while a
+/// request carries the buffer.
+pub trait OwnedBlockBuffer: BlockBuffer + AsRef<[u8]> + AsMut<[u8]> {
+    /// The device memory the buffer is made of: a device's
+    /// [`BlockDevice::Memory`].
+    type Memory;
+
+    /// A request buffer whose bytes are all of `memory`'s.
+    fn owning(memory: Self::Memory) -> Self;
+}
+
+/// A block device.
+///
+/// Concurrency contract: every operation may be called from any task on
+/// any processor, concurrently. A data request is submitted in two
+/// steps. Submission takes the buffer, waits only for room in the
+/// device's queue, and resolves to a waiter once the device has the
+/// request; the waiter resolves to the answer, which hands the buffer
+/// back whatever the answer was. Dropping the waiter detaches it and
+/// changes nothing about the request: the device still carries it out,
+/// the driver still completes the buffer (see [`BlockBuffer`]) and then
+/// drops it. The operations that carry no caller memory — flush,
+/// discard, write-zeroes, identification — are one future each, and
+/// dropping one in flight detaches it the same way.
+///
+/// A block request's failure always carries its buffer back
+/// ([`crate::dma::BufError::buffers`] is `Some`): a driver whose device
+/// broke the queue contract resets the device before it fails the
+/// requests in flight, so no device is still using a buffer it hands
+/// back.
+pub trait BlockDevice: Send + Sync {
+    /// The buffers this device's data requests carry.
+    type Buffer: BlockBuffer;
+
+    /// Memory this device can reach, in which a consumer keeps the bytes
+    /// its requests carry: a cache's blocks, a page staged for a write, a
+    /// scratch or swap buffer. A run is for this device's requests; the
+    /// memory of one device is not handed to another.
+    ///
+    /// A run may be dropped in the device's interrupt handler: a request
+    /// buffer that owns one is completed and, when nobody waits for it
+    /// any more, dropped by the driver's completion path (see
+    /// [`BlockBuffer`]). Freeing it therefore never blocks, never takes a
+    /// lock an interrupt handler cannot take, and never waits on another
+    /// processor.
+    type Memory: DmaBuffer + AsRef<[u8]> + AsMut<[u8]>;
+
+    /// Allocates `bytes` zeroed bytes this device can reach, as one run
+    /// that is contiguous in the device's address space, exactly `bytes`
+    /// long and aligned to a page ([`crate::pmm::PhysFrame::SIZE`]).
     ///
     /// A request carries a whole number of logical blocks, so a consumer
-    /// asks for a multiple of [`BlockGeometry::logical_block_bytes`].
-    fn buffer(&self, bytes: usize) -> IoResult<Self::Buffer>;
+    /// asks for a non-zero multiple of
+    /// [`BlockGeometry::logical_block_bytes`]; any other length is
+    /// refused with [`IoError::InvalidBufferLength`]. A refusal of the
+    /// memory itself is the device's [`crate::dma::DmaMemory`] answer,
+    /// handed to the caller that needed the bytes.
+    fn memory(&self, bytes: usize) -> IoResult<Self::Memory>;
 
-    /// Reads `buf.len()` bytes starting at logical block `block_id` into
-    /// `buf`, and hands `buf` back.
+    /// A request the device has accepted, until its answer is collected.
+    type Waiter<'a>: Future<Output = BufResult<(), Self::Buffer>> + Send + 'a
+    where
+        Self: 'a;
+
+    /// Submits a read of the run of logical blocks that starts at
+    /// `block_id` into `buffer`.
     ///
-    /// The buffer is the request's until the device has finished with it
-    /// (see [`crate::dma`]'s "Buffers a request owns"): dropping the future
-    /// mid-flight leaves it with the device, which frees it when it
-    /// completes the read.
-    fn read_block(
+    /// The run travels as one request, so `buffer` fits one:
+    /// [`BlockGeometry::max_segments`] runs of at most
+    /// [`BlockGeometry::max_segment_bytes`] each once its segments are
+    /// cut at that size. A buffer that does not is refused.
+    fn submit_read(
         &self,
         block_id: usize,
-        buf: Self::Buffer,
-    ) -> impl Future<Output = BufResult<(), Self::Buffer>> + Send;
+        buffer: Self::Buffer,
+    ) -> impl Future<Output = Self::Waiter<'_>> + Send + '_;
 
-    /// Writes `buf.len()` bytes starting at logical block `block_id` from
-    /// `buf`, and hands `buf` back. Owned the way
-    /// [`BlockDevice::read_block`]'s buffer is.
-    fn write_block(
+    /// Submits a write of `buffer` over the run of logical blocks that
+    /// starts at `block_id`, with the request shape
+    /// [`BlockDevice::submit_read`] describes.
+    fn submit_write(
         &self,
         block_id: usize,
-        buf: Self::Buffer,
-    ) -> impl Future<Output = BufResult<(), Self::Buffer>> + Send;
+        buffer: Self::Buffer,
+    ) -> impl Future<Output = Self::Waiter<'_>> + Send + '_;
+
+    /// [`BlockDevice::submit_read`] and its waiter, as one future.
+    fn read(
+        &self,
+        block_id: usize,
+        buffer: Self::Buffer,
+    ) -> impl Future<Output = BufResult<(), Self::Buffer>> + Send + '_ {
+        async move { self.submit_read(block_id, buffer).await.await }
+    }
+
+    /// [`BlockDevice::submit_write`] and its waiter, as one future.
+    fn write(
+        &self,
+        block_id: usize,
+        buffer: Self::Buffer,
+    ) -> impl Future<Output = BufResult<(), Self::Buffer>> + Send + '_ {
+        async move { self.submit_write(block_id, buffer).await.await }
+    }
 
     /// Commits the device's volatile write cache.
     ///
@@ -374,6 +500,13 @@ pub trait BlockDevice: Send + Sync {
 
     /// Request queues and pipeline depth this device is driven with.
     fn queue_topology(&self) -> BlockQueueTopology;
+
+    /// Whether the device refuses every write, as a medium the platform
+    /// attached read-only does.
+    ///
+    /// A caller that would only ever fail on its first write — a
+    /// read-write mount, a swap area — asks here instead.
+    fn is_read_only(&self) -> bool;
 
     fn block_size(&self) -> usize {
         self.geometry().logical_block_bytes

@@ -33,7 +33,12 @@
 //!   request area and writes the response area. The driver touches neither.
 //! - A completion may be drained by any task, including from the interrupt
 //!   path. Draining records the completion and wakes the waiter; it never
-//!   touches slot memory, so it needs no access to this table.
+//!   touches slot memory, so it needs no access to this table. The one
+//!   exception is a driver whose drainer finishes the request itself
+//!   (virtio-blk completes the request's buffer from the completion path):
+//!   that drainer reads the response area of the chain it popped, which
+//!   the device has finished writing and which stays the request's until
+//!   the driver frees the identifier.
 //! - After the completion, the waiter that owns `id` reads the response
 //!   area through its [`Reply`](crate::inflight::Reply). The slot stays
 //!   held until that reply is dropped, so a later request cannot reuse the
@@ -293,6 +298,30 @@ impl<B: DmaBuffer> ControlSlots<B> {
                 len: response_used,
             },
         ))
+    }
+
+    /// Fills the whole response area of slot `head` with `byte`, so a
+    /// response byte the device never writes reads back as `byte` once
+    /// the chain completes rather than as whatever an earlier chain of
+    /// that slot left there.
+    ///
+    /// # Safety
+    ///
+    /// The caller owns slot `head`, as [`ControlSlots::stage`] requires,
+    /// and calls this before the chain is published.
+    pub(crate) unsafe fn prime_response(&self, head: u16, byte: u8) {
+        if self.response == 0 {
+            return;
+        }
+        let slot = usize::from(head);
+        assert!(
+            slot < self.count,
+            "virtio descriptor {head} has no control slot among the {} of its queue",
+            self.count
+        );
+        // SAFETY: the response area lies inside the slot, and the caller
+        // owns the slot while the device cannot see it yet.
+        unsafe { core::ptr::write_bytes(self.slot_ptr(slot, self.request), byte, self.response) };
     }
 
     /// `used + len`, if it fits an area of `capacity` bytes.

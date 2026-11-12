@@ -6,42 +6,95 @@
 //! callers address it in its own logical blocks rather than in 512-byte
 //! sectors the device may not use natively.
 //!
-//! Concurrency contract: the device is programmed once during
-//! single-processor bring-up. Afterwards every request goes through one
-//! of the per-processor queues: the submitting task takes that queue's
-//! async mutex only long enough to write its chain and kick the device,
-//! then parks on the queue's completion table. Completions are routed by
-//! descriptor identifier, so whichever task wins the queue lock after an
-//! interrupt drains the ring on everyone's behalf. A request never
-//! migrates between queues: the queue is chosen when the chain is
-//! written and the completion is awaited on that same queue.
+//! # A request outlives the future that submitted it
+//!
+//! The device reads and writes request memory by DMA until it publishes
+//! the answer, and nothing calls a request back once it is in the ring.
+//! So the driver owns every request it hands the device, in a slot of the
+//! queue's request table named by the chain's descriptor identifier: the
+//! caller's [`BlockBuffer`] parks there, and the header, the segment list,
+//! the identifier bytes and the status byte the device reads and writes
+//! live in the control slot of the same identifier. Whoever drains the
+//! used ring finishes the requests it pops: it reads the status, calls
+//! the buffer's [`BlockBuffer::complete`], and either hands the result to
+//! the waiter or, when the waiter was dropped, drops the buffer and frees
+//! the slot. Dropping a waiter only marks its slot detached.
+//!
+//! That is Linux's shape. `virtblk_done` drains the virtqueue from the
+//! vring interrupt and completes each request it pops, and the request's
+//! bio, which holds its pages, runs `bi_end_io` from there whether or
+//! not a task still waits; io_uring's owned buffers, as tokio-uring and
+//! monoio use them, keep a cancelled operation's buffer with the kernel's
+//! completion rather than with the future.
+//!
+//! # Memory the device reaches
+//!
+//! Nothing the device reads or writes lives in a submitting future. The
+//! control bytes of every request are copied into its per-descriptor
+//! control slot, carved from the device's DMA memory when the queue is
+//! built (Linux's per-tag request PDU, `blk_mq` `cmd_size`), and every
+//! data segment is translated through the device's DMA memory when the
+//! chain is written: a segment the device cannot reach is refused, its
+//! buffer completed with the error and handed back, before any
+//! descriptor names it.
+//!
+//! # Concurrency contract
+//!
+//! The device is programmed once during single-processor bring-up.
+//! Afterwards every request goes through one of the per-processor
+//! queues. Each queue's ring is a spin lock held only to write one chain
+//! and kick the device, or to pop what the device published; it is never
+//! held across an `.await` and never while a request is finished.
+//!
+//! The ring is drained by the interrupt handler and by any task that
+//! waits on a request or for room on the queue. The interrupt handler
+//! only ever *tries* the ring lock: when it finds it held, it leaves a
+//! drain request the holder honours as it lets go, so an answer is never
+//! stranded and the handler never spins on a lock its own processor may
+//! hold. A request slot moves through idle, pending, complete and
+//! detached with single atomic transitions, so finishing a request — in
+//! interrupt context or in a task — takes no lock: the waiter and the
+//! drainer settle who frees the slot with one compare-and-swap. A
+//! request's control slot is written by its submitter under the ring
+//! lock while the request slot is idle, written by the device while the
+//! request is pending, and read by whoever finishes it; the request slot's
+//! state is what hands it from one to the next. A request never migrates
+//! between queues: the queue is chosen when the chain is written and the
+//! request finishes on that same queue.
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use arrayvec::ArrayVec;
-use async_lock::Mutex;
+use async_lock::Mutex as AsyncMutex;
+use atomic_waker::AtomicWaker;
 use core::alloc::Layout;
+use core::cell::UnsafeCell;
 use core::cmp;
+use core::future::Future;
+use core::hint::spin_loop;
 use core::mem::{size_of, size_of_val};
-use core::ops::Range;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::pin::Pin;
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering, fence};
+use core::task::{Context, Poll};
+use crossbeam_utils::CachePadded;
+use spin::{Mutex, MutexGuard};
 
 use helios_hal::cpu::{Cpu, current_processor};
 use helios_hal::dma::{BufError, BufResult, DmaMemory};
 use helios_hal::fs::{
-    BlockDevice, BlockDeviceCapabilities, BlockDeviceRights, BlockGeometry, BlockQueueTopology,
-    BlockRange, BlockSerial,
+    BlockBuffer, BlockDevice, BlockDeviceCapabilities, BlockDeviceRights, BlockGeometry,
+    BlockQueueTopology, BlockRange, BlockSerial, OwnedBlockBuffer,
 };
 use helios_hal::io::{IoError, IoResult};
+use helios_hal::pmm::PhysFrame;
 use helios_hal::resource::KernelResource;
 use helios_hal::vmm::SwapBackend;
 
 use crate::bus::DeviceBus;
 use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate};
-use crate::inflight::{InFlight, Reply, await_completion, submit_lent};
 use crate::notify::Notify;
 use crate::queue::{
-    ControlSlots, Lend, MAX_CHAIN_BUFFERS, Part, TransportBuffer, VirtQueue, control_slots,
+    ControlSlots, MAX_CHAIN_BUFFERS, Part, ResponseSpan, TransportBuffer, VirtQueue, control_slots,
 };
 use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
 
@@ -52,7 +105,7 @@ pub const SECTOR_SIZE: usize = 512;
 /// Longest request pipeline the driver keeps on one queue.
 ///
 /// The depth is what makes the device useful under concurrent load: each
-/// in-flight chain owns a descriptor identifier and a completion slot, and
+/// in-flight chain owns a descriptor identifier and a request slot, and
 /// a deeper queue only helps once the device can actually overlap that
 /// many requests. 128 is the depth QEMU's virtio-blk exposes by default,
 /// so the driver never asks for more ring than the device offers.
@@ -62,17 +115,26 @@ const BLOCK_QUEUE_SLOTS: usize = BLOCK_MAX_QUEUE_SIZE as usize;
 /// Segments one discard or write-zeroes request carries.
 ///
 /// Every segment is a 16-byte descriptor of a sector run, and all of them
-/// travel in a single read-only buffer, so this bounds a stack array
-/// rather than a descriptor chain.
+/// travel in a single read-only buffer, so this bounds the segment list
+/// a control slot holds rather than a descriptor chain.
 const DEALLOCATE_SEGMENTS: usize = 8;
-
-/// Alignment of a data buffer a consumer allocates with
-/// [`BlockDevice::buffer`]: a cache line of the target, so two buffers
-/// never share one.
-const BUFFER_ALIGNMENT: usize = core::mem::align_of::<crossbeam_utils::CachePadded<u8>>();
 
 /// Bytes of the identifier a device reports for `VIRTIO_BLK_T_GET_ID`.
 const BLOCK_ID_BYTES: usize = 20;
+
+/// The bytes of a request the device reads from its control slot: the
+/// header, and for discard and write-zeroes the segment list after it.
+const REQUEST_SLOT_BYTES: usize =
+    size_of::<BlkReq>() + DEALLOCATE_SEGMENTS * size_of::<BlkDeallocate>();
+
+/// The bytes the device writes to a control slot: the identifier a
+/// `GET_ID` reports, then the one status byte every request ends with.
+const RESPONSE_SLOT_BYTES: usize = BLOCK_ID_BYTES + size_of::<u8>();
+
+/// What a request's status byte holds until the device writes it. Not a
+/// status virtio defines, so a device that answers without writing one
+/// is reported as a fault.
+const STATUS_UNWRITTEN: u8 = 0xff;
 
 // virtio 1.2 §5.2.3: virtio-blk feature bits.
 const BLK_F_SIZE_MAX: u64 = 1 << 1;
@@ -114,6 +176,27 @@ const CFG_MAX_DISCARD_SEG: usize = 40;
 const CFG_MAX_WRITE_ZEROES_SECTORS: usize = 48;
 const CFG_MAX_WRITE_ZEROES_SEG: usize = 52;
 
+// The states of a request slot.
+/// No request uses the slot.
+const IDLE: u8 = 0;
+/// The device has the request; a waiter may be parked on it.
+const PENDING: u8 = 1;
+/// The request is finished and its result waits for the waiter.
+const COMPLETE: u8 = 2;
+/// The device has the request and nobody waits for it: whoever drains
+/// its answer frees the slot.
+const DETACHED: u8 = 3;
+
+// The states of the device as the driver sees it.
+/// The device keeps the used-ring contract; requests are accepted.
+const RUNNING: u8 = 0;
+/// The device broke the used-ring contract and is being reset; it may
+/// still be writing into the buffers it was handed.
+const RESETTING: u8 = 1;
+/// The reset is complete, so the device touches no buffer any more:
+/// every request still in flight is finished with a device fault.
+const STOPPED: u8 = 2;
+
 /// How a multiqueue driver decides which queue a request belongs on.
 ///
 /// The driver needs exactly two facts about the platform — how many
@@ -150,49 +233,97 @@ enum ReqType {
     WriteZeroes = 13,
 }
 
-/// One request's queue: the ring itself plus the completion slots for the
-/// chains in flight on it.
-struct BlockQueue<T: VirtioTransport> {
-    queue: Mutex<VirtQueue<T>>,
-    /// Completion slots, each parking the data buffer of the read or
-    /// write it heads until the device returns the chain.
-    inflight: InFlight<BLOCK_QUEUE_SLOTS, Lent<T>>,
-    /// The request header, the discard and write-zeroes segment list and
-    /// the status byte (and the identifier a `GET_ID` fills in) of every
-    /// request in flight, one slot per descriptor.
+/// Everything one request slot holds besides its state.
+///
+/// Written by the submitter while the slot is idle, by whoever drains
+/// the answer while it is pending or detached, and read by the waiter
+/// once it is complete. The state word, and the ring lock the submitter
+/// and the drainer hold, order those accesses.
+struct RequestBody<B> {
+    kind: ReqType,
+    /// Where the chain's response bytes sit in the queue's control slot
+    /// of the same identifier.
+    response: ResponseSpan,
+    /// The identifier a `GET_ID` reported, copied out of the control slot
+    /// once the request is finished.
+    id: [u8; BLOCK_ID_BYTES],
+    /// Payload bytes the device must write for a read to be whole.
+    expected: usize,
+    buffer: Option<B>,
+    /// Payload bytes the device wrote, once the request is finished.
+    result: IoResult<usize>,
+}
+
+/// One request the driver handed the device, in the slot its chain's
+/// descriptor identifier names.
+struct Request<B> {
+    state: AtomicU8,
+    /// The waiter's, while it is parked on a pending request.
+    waker: AtomicWaker,
+    body: UnsafeCell<RequestBody<B>>,
+}
+
+// SAFETY: `body` is touched by one context at a time, as the slot's state
+// and the ring lock decide (see `RequestBody`); every other field is
+// atomic.
+unsafe impl<B: Send> Sync for Request<B> {}
+
+impl<B> Request<B> {
+    fn idle() -> Self {
+        Self {
+            state: AtomicU8::new(IDLE),
+            waker: AtomicWaker::new(),
+            body: UnsafeCell::new(RequestBody {
+                kind: ReqType::Flush,
+                response: ResponseSpan::default(),
+                id: [0; BLOCK_ID_BYTES],
+                expected: 0,
+                buffer: None,
+                result: Ok(0),
+            }),
+        }
+    }
+}
+
+/// One request queue: the ring, and the requests in flight on it.
+struct BlockQueue<T: VirtioTransport, B> {
+    ring: Mutex<VirtQueue<T>>,
+    /// Set by a drainer that found the ring locked; whoever holds it
+    /// drains on the drainer's behalf as it lets go.
+    drain_pending: AtomicBool,
+    /// One slot per descriptor identifier the ring hands out.
+    requests: Box<[Request<B>]>,
+    /// The header, the segment list, the identifier and the status byte
+    /// of every request in flight, one control slot per descriptor
+    /// identifier, in memory the device reaches.
     slots: ControlSlots<TransportBuffer<T>>,
+    /// Submitters parked because the ring is full or because the slot
+    /// they would be handed is still occupied.
+    blocked: AtomicUsize,
+    /// Wakes those submitters: a chain or a slot was freed.
+    available: Notify,
 }
 
-/// The bytes of a request the device reads from its control slot: the
-/// header, and for discard and write-zeroes the segment list after it.
-const REQUEST_SLOT_BYTES: usize =
-    size_of::<BlkReq>() + DEALLOCATE_SEGMENTS * size_of::<BlkDeallocate>();
+impl<T: VirtioTransport, B> BlockQueue<T, B> {
+    /// Reports that `count` chains or slots became free.
+    ///
+    /// The notification is a broadcast, so one is enough however many
+    /// were freed: every parked submitter re-tests the ring and its slot
+    /// for itself. Nothing is published when no submitter is parked.
+    fn note_released(&self, count: usize) {
+        if count == 0 || self.blocked.load(Ordering::SeqCst) == 0 {
+            return;
+        }
+        self.available.notify_all();
+    }
 
-/// The bytes the device writes to a control slot: the identifier a
-/// `GET_ID` reports, then the one status byte every request ends with.
-const RESPONSE_SLOT_BYTES: usize = BLOCK_ID_BYTES + size_of::<u8>();
-
-/// The response area of a request that reports nothing but its status.
-const STATUS_ONLY: &[usize] = &[size_of::<u8>()];
-
-/// What a request lends the device: the data buffer of a read or a
-/// write, nothing for the requests whose bytes all travel in their
-/// control slot.
-type Lent<T> = Option<TransportBuffer<T>>;
-
-/// The data a chain carries: bytes `range` of the buffer the request
-/// lent, which the device writes for a read and reads for a write.
-struct DataRange {
-    range: Range<usize>,
-    device_writes: bool,
-}
-
-/// A data request's failure with its buffer, which every data request
-/// lends.
-fn data_error<B>(error: BufError<Option<B>>) -> BufError<B> {
-    BufError {
-        error: error.error,
-        buffers: error.buffers.flatten(),
+    fn request(&self, id: u16) -> &Request<B> {
+        self.requests.get(usize::from(id)).unwrap_or_else(|| {
+            panic!(
+                "virtio-blk descriptor {id} is outside the {}-slot request table",
+                self.requests.len()
+            )
+        })
     }
 }
 
@@ -258,43 +389,66 @@ struct RequestLimits {
     write_zeroes_segments: usize,
 }
 
-impl RequestLimits {
-    /// Most bytes one request may transfer, as a whole number of logical
-    /// blocks.
-    fn max_transfer_bytes(&self, block_bytes: usize) -> usize {
-        let per_request = self.segment_bytes.saturating_mul(self.data_segments);
-        let blocks = per_request / block_bytes;
-        assert!(
-            blocks != 0,
-            "virtio-blk cannot carry a whole {block_bytes}-byte block in one request"
-        );
-        blocks * block_bytes
+/// The data runs of one request: the addresses and lengths of the
+/// caller's segments, cut at the device's segment size. Each is
+/// translated to a device address when the chain is written.
+type DataRuns = ArrayVec<(usize, usize), MAX_CHAIN_BUFFERS>;
+
+/// What one request asks of the device, besides the caller's buffer.
+struct Command {
+    kind: ReqType,
+    sector: u64,
+    deallocate: ArrayVec<BlkDeallocate, DEALLOCATE_SEGMENTS>,
+    runs: DataRuns,
+}
+
+impl Command {
+    fn bare(kind: ReqType) -> Self {
+        Self {
+            kind,
+            sector: 0,
+            deallocate: ArrayVec::new(),
+            runs: ArrayVec::new(),
+        }
+    }
+
+    /// Buffers the chain carries: the header, the payload and the status
+    /// byte.
+    fn buffers(&self) -> usize {
+        let payload = match self.kind {
+            ReqType::In | ReqType::Out => self.runs.len(),
+            ReqType::GetId => 1,
+            ReqType::Discard | ReqType::WriteZeroes => 1,
+            ReqType::Flush => 0,
+        };
+        2 + payload
     }
 }
 
-pub struct VirtioBlockDevice<T: VirtioTransport, C: QueueAffinity> {
+pub struct VirtioBlockDevice<T: VirtioTransport, C: QueueAffinity, B> {
     transport: T,
     cpu: C,
     /// One queue per processor when the device offers enough of them.
     /// A request is bound to the queue it was written into, so a task
-    /// that migrates still reaps its completion where it left it.
-    queues: Box<[BlockQueue<T>]>,
-    interrupts: Notify,
+    /// that migrates still collects its answer where it left it.
+    queues: Box<[CachePadded<BlockQueue<T, B>>]>,
     features: NegotiatedFeatures,
     geometry: BlockGeometry,
     capabilities: BlockDeviceCapabilities,
     limits: RequestLimits,
     readonly: bool,
     counters: RequestCounters,
+    /// [`RUNNING`], [`RESETTING`] or [`STOPPED`].
+    state: AtomicU8,
 }
 
-pub struct VirtioBlockResource<T: VirtioTransport, C: QueueAffinity> {
-    resource: KernelResource<VirtioBlockDevice<T, C>, BlockDeviceRights>,
+pub struct VirtioBlockResource<T: VirtioTransport, C: QueueAffinity, B> {
+    resource: KernelResource<VirtioBlockDevice<T, C, B>, BlockDeviceRights>,
 }
 
 pub struct VirtioBlockSwapBackend<D: BlockDevice> {
     device: D,
-    state: Mutex<VirtioBlockSwapState>,
+    state: AsyncMutex<VirtioBlockSwapState>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -384,7 +538,156 @@ impl BlkDeallocate {
     }
 }
 
-impl<T: VirtioTransport, C: QueueAffinity> VirtioBlockDevice<T, C> {
+/// What a finished request hands its waiter.
+struct Finished<B> {
+    result: IoResult<usize>,
+    buffer: Option<B>,
+    id: [u8; BLOCK_ID_BYTES],
+}
+
+/// Where a [`RequestWaiter`] stands.
+enum Flight<B> {
+    /// The device has the request in slot `id` of queue `queue`.
+    Issued { queue: usize, id: u16 },
+    /// The driver refused the request before the device saw it; the
+    /// buffer was completed with the error already.
+    Refused { error: IoError, buffer: Option<B> },
+    /// The waiter took its answer.
+    Collected,
+}
+
+/// Waits for one request's answer. Dropping it detaches the request,
+/// which then finishes on its own.
+struct RequestWaiter<'a, T: VirtioTransport, C: QueueAffinity, B: BlockBuffer> {
+    device: &'a VirtioBlockDevice<T, C, B>,
+    flight: Flight<B>,
+}
+
+// The waiter never pins the buffer it may hold: it only moves it out.
+impl<T: VirtioTransport, C: QueueAffinity, B: BlockBuffer> Unpin for RequestWaiter<'_, T, C, B> {}
+
+impl<'a, T: VirtioTransport, C: QueueAffinity, B: BlockBuffer> RequestWaiter<'a, T, C, B> {
+    /// A request the driver refused: the buffer hears the error now, and
+    /// the waiter answers it at once.
+    fn refused(
+        device: &'a VirtioBlockDevice<T, C, B>,
+        error: IoError,
+        mut buffer: Option<B>,
+    ) -> Self {
+        if let Some(buffer) = buffer.as_mut() {
+            buffer.complete(Err(error));
+        }
+        Self {
+            device,
+            flight: Flight::Refused { error, buffer },
+        }
+    }
+
+    /// Takes the answer out of a complete slot and frees it.
+    fn collect(&mut self, queue: usize, id: u16) -> Finished<B> {
+        let queue = &self.device.queues[queue];
+        let request = queue.request(id);
+        // SAFETY: the slot is complete, so the drainer is done with the
+        // body and nobody else touches it until it is idle again.
+        let body = unsafe { &mut *request.body.get() };
+        let finished = Finished {
+            result: body.result,
+            buffer: body.buffer.take(),
+            id: body.id,
+        };
+        request.state.store(IDLE, Ordering::Release);
+        queue.note_released(1);
+        self.flight = Flight::Collected;
+        finished
+    }
+}
+
+impl<T: VirtioTransport, C: QueueAffinity, B: BlockBuffer> Future for RequestWaiter<'_, T, C, B> {
+    type Output = Finished<B>;
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        match &mut this.flight {
+            Flight::Collected => panic!("a virtio-blk request was polled after it was answered"),
+            Flight::Refused { error, buffer } => {
+                let finished = Finished {
+                    result: Err(*error),
+                    buffer: buffer.take(),
+                    id: [0; BLOCK_ID_BYTES],
+                };
+                this.flight = Flight::Collected;
+                Poll::Ready(finished)
+            }
+            &mut Flight::Issued { queue, id } => {
+                let block_queue = &this.device.queues[queue];
+                let request = block_queue.request(id);
+                // Registered before the state is tested, so a drainer
+                // that completes the request in between wakes this task.
+                request.waker.register(context.waker());
+                if request.state.load(Ordering::Acquire) != COMPLETE {
+                    // Drain on everyone's behalf: the answer may already
+                    // be in the used ring with no interrupt to come.
+                    this.device.reap(block_queue);
+                    if request.state.load(Ordering::Acquire) != COMPLETE {
+                        return Poll::Pending;
+                    }
+                }
+                Poll::Ready(this.collect(queue, id))
+            }
+        }
+    }
+}
+
+impl<T: VirtioTransport, C: QueueAffinity, B: BlockBuffer> Drop for RequestWaiter<'_, T, C, B> {
+    fn drop(&mut self) {
+        let Flight::Issued { queue, id } = self.flight else {
+            return;
+        };
+        let request = self.device.queues[queue].request(id);
+        match request
+            .state
+            .compare_exchange(PENDING, DETACHED, Ordering::AcqRel, Ordering::Acquire)
+        {
+            // Whoever drains the answer frees the slot.
+            Ok(_) => {}
+            // Finished already: its buffer was completed, and goes now.
+            Err(COMPLETE) => drop(self.collect(queue, id)),
+            Err(state) => {
+                panic!("virtio-blk request {id} was abandoned in slot state {state}")
+            }
+        }
+    }
+}
+
+/// The waiter of one data request: the [`BlockDevice::Waiter`] of
+/// [`VirtioBlockResource`].
+pub struct VirtioBlockWaiter<'a, T: VirtioTransport, C: QueueAffinity, B: BlockBuffer> {
+    request: RequestWaiter<'a, T, C, B>,
+}
+
+impl<T: VirtioTransport, C: QueueAffinity, B: BlockBuffer> Future
+    for VirtioBlockWaiter<'_, T, C, B>
+{
+    type Output = BufResult<(), B>;
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.get_mut().request)
+            .poll(context)
+            .map(|finished| {
+                let buffer = finished
+                    .buffer
+                    .expect("a virtio-blk data request carries a buffer");
+                match finished.result {
+                    Ok(_) => Ok(((), buffer)),
+                    // The device was reset before a request in flight was
+                    // failed, so every failure hands its buffer back.
+                    Err(error) => Err(BufError::returned(error, buffer)),
+                }
+            })
+    }
+}
+
+impl<T: VirtioTransport, C: QueueAffinity, B: BlockBuffer> VirtioBlockDevice<T, C, B> {
     pub fn new(transport: T, cpu: C) -> IoResult<Self> {
         if transport.device_type() != DeviceType::Block {
             return Err(IoError::Unsupported);
@@ -492,13 +795,16 @@ impl<T: VirtioTransport, C: QueueAffinity> VirtioBlockDevice<T, C> {
                     "virtio-blk queue is too small to carry one request chain",
                 ));
             }
-            let queue = VirtQueue::new(&transport, index, queue_size, chain_limit, features)?;
-            let slots = control_slots(&transport, &queue, REQUEST_SLOT_BYTES, RESPONSE_SLOT_BYTES)?;
-            queues.push(BlockQueue {
-                queue: Mutex::new(queue),
-                inflight: InFlight::new(),
+            let ring = VirtQueue::new(&transport, index, queue_size, chain_limit, features)?;
+            let slots = control_slots(&transport, &ring, REQUEST_SLOT_BYTES, RESPONSE_SLOT_BYTES)?;
+            queues.push(CachePadded::new(BlockQueue {
+                ring: Mutex::new(ring),
+                drain_pending: AtomicBool::new(false),
+                requests: (0..queue_size).map(|_| Request::idle()).collect(),
                 slots,
-            });
+                blocked: AtomicUsize::new(0),
+                available: Notify::new(),
+            }));
         }
 
         transport.set_status(
@@ -513,7 +819,9 @@ impl<T: VirtioTransport, C: QueueAffinity> VirtioBlockDevice<T, C> {
             physical_block_exp,
             min_io_blocks,
             opt_io_blocks,
-            max_segments: device_segments,
+            // What one request this driver builds can carry, which is
+            // fewer than the device allows once the chain bound applies.
+            max_segments: u32::try_from(data_segments).unwrap_or(u32::MAX),
             max_segment_bytes: u32::try_from(segment_bytes).unwrap_or(u32::MAX),
             capacity_blocks,
         };
@@ -540,7 +848,6 @@ impl<T: VirtioTransport, C: QueueAffinity> VirtioBlockDevice<T, C> {
             transport,
             cpu,
             queues: queues.into_boxed_slice(),
-            interrupts: Notify::new(),
             features,
             geometry,
             capabilities,
@@ -555,6 +862,7 @@ impl<T: VirtioTransport, C: QueueAffinity> VirtioBlockDevice<T, C> {
             },
             readonly,
             counters: RequestCounters::default(),
+            state: AtomicU8::new(RUNNING),
         })
     }
 
@@ -594,7 +902,7 @@ impl<T: VirtioTransport, C: QueueAffinity> VirtioBlockDevice<T, C> {
         self.counters.snapshot()
     }
 
-    pub fn into_resource(self, rights: BlockDeviceRights) -> VirtioBlockResource<T, C> {
+    pub fn into_resource(self, rights: BlockDeviceRights) -> VirtioBlockResource<T, C, B> {
         VirtioBlockResource {
             resource: KernelResource::new(self, rights),
         }
@@ -604,12 +912,19 @@ impl<T: VirtioTransport, C: QueueAffinity> VirtioBlockDevice<T, C> {
         transport: T,
         cpu: C,
         rights: BlockDeviceRights,
-    ) -> IoResult<VirtioBlockResource<T, C>> {
+    ) -> IoResult<VirtioBlockResource<T, C, B>> {
         Self::new(transport, cpu).map(|device| device.into_resource(rights))
     }
 
-    /// Interrupt handlers should only call this method: acknowledge the
-    /// device interrupt and wake the tasks parked on its queues.
+    /// The device's interrupt: acknowledges it and finishes every request
+    /// the device answered.
+    ///
+    /// This is the completion path, as `virtblk_done` is Linux's: it
+    /// runs each answered buffer's [`BlockBuffer::complete`] and frees
+    /// the slots nobody waits on, so a request finishes whether or not
+    /// its submitter is still there. It never spins on a ring lock: a
+    /// ring another context holds is drained by that context as it lets
+    /// go.
     ///
     /// The transport acknowledges the whole interrupt-status word, so a
     /// configuration-change notification (bit 1 of the ISR, virtio 1.2
@@ -620,7 +935,9 @@ impl<T: VirtioTransport, C: QueueAffinity> VirtioBlockDevice<T, C> {
     /// driver.
     pub fn handle_interrupt(&self) {
         self.transport.ack_interrupt();
-        self.interrupts.notify_all();
+        for queue in self.queues.iter() {
+            self.reap(queue);
+        }
     }
 
     /// The first sector of a logical block.
@@ -628,106 +945,85 @@ impl<T: VirtioTransport, C: QueueAffinity> VirtioBlockDevice<T, C> {
         (block_id as u64) * self.limits.sectors_per_block as u64
     }
 
-    /// Reads the whole of `buf` starting at logical block `block_id`, one
-    /// chain per [`RequestLimits::max_transfer_bytes`], and hands `buf`
-    /// back.
-    ///
-    /// The chains run one after another, so at any moment `buf` is lent
-    /// to at most one of them and parks with that chain's head.
-    async fn read_blocks(
-        &self,
-        block_id: usize,
-        buf: TransportBuffer<T>,
-    ) -> BufResult<(), TransportBuffer<T>> {
+    /// Bytes one data segment carries: the device's segment limit,
+    /// rounded down to whole logical blocks so that a request cut at a
+    /// segment boundary still ends on a block.
+    fn segment_stride(&self) -> usize {
         let block_bytes = self.geometry.logical_block_bytes;
-        let stride = self.limits.max_transfer_bytes(block_bytes);
-        let total = buf.as_ref().len();
-        let mut buf = buf;
-        let mut offset = 0;
-        while offset < total {
-            let len = cmp::min(stride, total - offset);
-            let sector = self.sector_of(block_id + offset / block_bytes);
-            let request = BlkReq::new(ReqType::In, sector);
-            let reply = self
-                .execute(
-                    ReqType::In,
-                    &[as_bytes(&request)],
-                    Some(DataRange {
-                        range: offset..offset + len,
-                        device_writes: true,
-                    }),
-                    Some(buf),
-                    STATUS_ONLY,
-                )
-                .await
-                .map_err(data_error)?;
-            let status = status_of(&reply);
-            let used = reply.written();
-            buf = reply
-                .into_lent()
-                .expect("a read gets back the buffer it lent");
-            // The used length counts everything the device wrote into the
-            // chain, which is the payload plus the status byte. A short
-            // read is a device fault rather than a partial success: the
-            // caller asked for whole blocks and the tail would otherwise
-            // silently keep whatever was in the buffer.
-            let outcome = status.and_then(map_block_status).and_then(|()| {
-                let written = usize::try_from(used)
-                    .map_err(|_| IoError::DeviceFault)?
-                    .checked_sub(size_of::<u8>())
-                    .ok_or(IoError::DeviceFault)?;
-                if written != len {
-                    return Err(IoError::DeviceFault);
-                }
-                Ok(())
-            });
-            if let Err(error) = outcome {
-                return Err(BufError::returned(error, buf));
-            }
-            offset += len;
-        }
-        Ok(((), buf))
+        self.limits.segment_bytes / block_bytes * block_bytes
     }
 
-    /// Writes the whole of `buf` starting at logical block `block_id`,
-    /// and hands `buf` back. Lent the way [`Self::read_blocks`] lends it.
-    async fn write_blocks(
-        &self,
-        block_id: usize,
-        buf: TransportBuffer<T>,
-    ) -> BufResult<(), TransportBuffer<T>> {
-        let block_bytes = self.geometry.logical_block_bytes;
-        let stride = self.limits.max_transfer_bytes(block_bytes);
-        let total = buf.as_ref().len();
-        let mut buf = buf;
-        let mut offset = 0;
-        while offset < total {
-            let len = cmp::min(stride, total - offset);
-            let sector = self.sector_of(block_id + offset / block_bytes);
-            let request = BlkReq::new(ReqType::Out, sector);
-            let reply = self
-                .execute(
-                    ReqType::Out,
-                    &[as_bytes(&request)],
-                    Some(DataRange {
-                        range: offset..offset + len,
-                        device_writes: false,
-                    }),
-                    Some(buf),
-                    STATUS_ONLY,
-                )
-                .await
-                .map_err(data_error)?;
-            let status = status_of(&reply);
-            buf = reply
-                .into_lent()
-                .expect("a write gets back the buffer it lent");
-            if let Err(error) = status.and_then(map_block_status) {
-                return Err(BufError::returned(error, buf));
+    /// Cuts `buffer` into the data segments one request carries, and
+    /// answers them with their total length. A buffer that needs more
+    /// segments than one request carries is refused.
+    fn data_runs(&self, buffer: &B) -> IoResult<(DataRuns, usize)> {
+        let stride = self.segment_stride();
+        let mut runs = DataRuns::new();
+        let mut total = 0_usize;
+        for segment in buffer.segments() {
+            let mut address = segment.cast::<u8>().as_ptr() as usize;
+            let mut len = segment.len();
+            if len == 0 {
+                return Err(IoError::InvalidBufferLength {
+                    required_multiple: self.geometry.logical_block_bytes,
+                    actual: 0,
+                });
             }
-            offset += len;
+            while len != 0 {
+                let take = len.min(stride);
+                if runs.len() == self.limits.data_segments {
+                    return Err(IoError::OutOfBounds);
+                }
+                runs.push((address, take));
+                address += take;
+                len -= take;
+                total = total.checked_add(take).ok_or(IoError::OutOfBounds)?;
+            }
         }
-        Ok(((), buf))
+        Ok((runs, total))
+    }
+
+    /// Checks a data request against the handle's rights and the device,
+    /// and builds its command.
+    fn data_command(
+        &self,
+        kind: ReqType,
+        rights: BlockDeviceRights,
+        block_id: usize,
+        buffer: &B,
+    ) -> IoResult<Command> {
+        let required = match kind {
+            ReqType::In => BlockDeviceRights::READ,
+            _ => BlockDeviceRights::WRITE,
+        };
+        if !rights.contains(required) {
+            return Err(IoError::PermissionDenied);
+        }
+        let (runs, len) = self.data_runs(buffer)?;
+        validate_request(rights, self.geometry, block_id, len, required)?;
+        if kind == ReqType::Out && self.readonly {
+            return Err(IoError::ReadOnly);
+        }
+        Ok(Command {
+            kind,
+            sector: self.sector_of(block_id),
+            deallocate: ArrayVec::new(),
+            runs,
+        })
+    }
+
+    /// Submits a data request, or refuses it with its buffer completed.
+    async fn submit_data(
+        &self,
+        kind: ReqType,
+        rights: BlockDeviceRights,
+        block_id: usize,
+        buffer: B,
+    ) -> RequestWaiter<'_, T, C, B> {
+        match self.data_command(kind, rights, block_id, &buffer) {
+            Ok(command) => self.issue(command, Some(buffer)).await,
+            Err(error) => RequestWaiter::refused(self, error, Some(buffer)),
+        }
     }
 
     async fn flush_cache(&self) -> IoResult<()> {
@@ -737,40 +1033,17 @@ impl<T: VirtioTransport, C: QueueAffinity> VirtioBlockDevice<T, C> {
         if !self.capabilities.contains(BlockDeviceCapabilities::FLUSH) {
             return Ok(());
         }
-        let request = BlkReq::new(ReqType::Flush, 0);
-        let reply = self
-            .execute(
-                ReqType::Flush,
-                &[as_bytes(&request)],
-                None,
-                None,
-                STATUS_ONLY,
-            )
+        self.issue(Command::bare(ReqType::Flush), None)
             .await
-            .map_err(BufError::into_error)?;
-        map_block_status(status_of(&reply)?)
+            .await
+            .result
+            .map(drop)
     }
 
     async fn read_serial(&self) -> IoResult<BlockSerial> {
-        let request = BlkReq::new(ReqType::GetId, 0);
-        // The identifier and the status are both device-written slot
-        // bytes: two descriptors, laid out one after the other.
-        let reply = self
-            .execute(
-                ReqType::GetId,
-                &[as_bytes(&request)],
-                None,
-                None,
-                &[BLOCK_ID_BYTES, size_of::<u8>()],
-            )
-            .await
-            .map_err(BufError::into_error)?;
-        map_block_status(status_of(&reply)?)?;
-        let reported = usize::try_from(reply.written())
-            .map_err(|_| IoError::DeviceFault)?
-            .saturating_sub(size_of::<u8>())
-            .min(BLOCK_ID_BYTES);
-        BlockSerial::new(&reply.response()[..reported]).ok_or(IoError::DeviceFault)
+        let finished = self.issue(Command::bare(ReqType::GetId), None).await.await;
+        let reported = finished.result?;
+        BlockSerial::new(&finished.id[..reported]).ok_or(IoError::DeviceFault)
     }
 
     /// Issues one deallocation request kind over `range`.
@@ -802,119 +1075,367 @@ impl<T: VirtioTransport, C: QueueAffinity> VirtioBlockDevice<T, C> {
         let mut sector = self.sector_of(range.start_block);
         let mut remaining = (range.block_count as u64) * self.limits.sectors_per_block as u64;
         while remaining != 0 {
-            let mut segments: ArrayVec<BlkDeallocate, DEALLOCATE_SEGMENTS> = ArrayVec::new();
-            while remaining != 0 && segments.len() < max_segments {
+            let mut command = Command::bare(request);
+            while remaining != 0 && command.deallocate.len() < max_segments {
                 let run = cmp::min(remaining, u64::from(max_sectors));
                 let run = u32::try_from(run).map_err(|_| IoError::DeviceFault)?;
-                segments.push(BlkDeallocate::new(sector, run));
+                command.deallocate.push(BlkDeallocate::new(sector, run));
                 sector += u64::from(run);
                 remaining -= u64::from(run);
             }
-            let header = BlkReq::new(request, 0);
-            let reply = self
-                .execute(
-                    request,
-                    &[as_bytes(&header), as_bytes_slice(&segments)],
-                    None,
-                    None,
-                    STATUS_ONLY,
-                )
-                .await
-                .map_err(BufError::into_error)?;
-            map_block_status(status_of(&reply)?)?;
+            self.issue(command, None).await.await.result?;
         }
         Ok(())
     }
 
-    /// Writes one request chain onto this processor's queue and waits for
-    /// its completion, returning the reply the device wrote.
+    /// Writes one request into a slot of this processor's queue and kicks
+    /// the device, answering the waiter of that slot.
     ///
-    /// `request` is copied into the control slot of the chain's head
-    /// descriptor, and `response` sizes the device-written slot bytes
-    /// that follow the data. Nothing the device reads or writes at either
-    /// end of the chain lives in this future.
-    ///
-    /// `data` names the bytes of `lent` the chain carries, cut into
-    /// segments of at most the device's segment size. `lent` parks with
-    /// the chain until the device returns it, and comes back in the
-    /// reply; a request that fails before the chain is published gets it
-    /// back in the error, and one whose queue faulted with the chain in
-    /// flight leaves it with the device.
-    ///
-    /// The completion is routed by descriptor identifier: whichever task
-    /// wins the queue lock after an interrupt drains everything the
-    /// device published, so a device that finishes requests out of order
-    /// — which EVENT_IDX and IN_ORDER both permit — is handled without
-    /// any task assuming the completion it sees is its own.
-    async fn execute(
-        &self,
-        kind: ReqType,
-        request: &[&[u8]],
-        data: Option<DataRange>,
-        lent: Lent<T>,
-        response: &[usize],
-    ) -> Result<Reply<'_, BLOCK_QUEUE_SLOTS, Lent<T>>, BufError<Lent<T>>> {
-        let mut parts: ArrayVec<Part<'_>, MAX_CHAIN_BUFFERS> = ArrayVec::new();
-        for bytes in request {
-            parts.push(Part::Request(bytes));
-        }
-        if let Some(DataRange {
-            range,
-            device_writes,
-        }) = data
-        {
-            let mut start = range.start;
-            while start < range.end {
-                let end = cmp::min(start + self.limits.segment_bytes, range.end);
-                parts.push(if device_writes {
-                    Part::LentWrite {
-                        buffer: 0,
-                        range: start..end,
+    /// Two conditions make a submission wait, and neither is a device
+    /// fault: the ring has no room for the chain, or the slot the queue
+    /// would hand out next still holds an answer its waiter has not
+    /// collected. Either way the submitter drains what the device has
+    /// published, which frees descriptors and finishes requests, and then
+    /// parks until a chain or a slot is freed. `buffer` stays with this
+    /// future until the device has the request, so dropping the future
+    /// before then drops it uncompleted.
+    async fn issue(&self, command: Command, buffer: Option<B>) -> RequestWaiter<'_, T, C, B> {
+        let queue_index = self.cpu.current_processor() % self.queues.len();
+        let queue = &self.queues[queue_index];
+        let buffers = command.buffers();
+        let mut buffer = buffer;
+        let mut announced = false;
+        let outcome = loop {
+            // Armed before the ring is tested: a release that lands in
+            // between must not be slept through.
+            let notified = queue.available.notified();
+            {
+                let mut ring = queue.ring.lock();
+                // Tested under the ring lock: a reset that lands later
+                // finds this request pending when it takes the lock.
+                if self.state.load(Ordering::SeqCst) != RUNNING {
+                    self.unlock(queue, ring);
+                    break Err((IoError::DeviceFault, buffer.take()));
+                }
+                let id = ring.next_free_descriptor();
+                let request = queue.request(id);
+                if ring.has_room_for(buffers) && request.state.load(Ordering::Acquire) == IDLE {
+                    // SAFETY: the slot is idle and this task holds the
+                    // ring that hands its identifier out, so nobody else
+                    // touches the body until the state says otherwise.
+                    let body = unsafe { &mut *request.body.get() };
+                    body.kind = command.kind;
+                    body.expected = match command.kind {
+                        ReqType::In => command.runs.iter().map(|&(_, len)| len).sum(),
+                        _ => 0,
+                    };
+                    body.buffer = buffer.take();
+                    body.result = Ok(0);
+                    // SAFETY: the ring is held and the request slot of
+                    // `id`, the identifier the chain will be headed by,
+                    // is idle, which is the ownership of its control
+                    // slot `write_chain` asks for. The runs are the
+                    // buffer's, which the request slot now owns.
+                    match unsafe { write_chain(&mut ring, &self.transport, &queue.slots, &command) }
+                    {
+                        Ok((token, response)) => {
+                            assert_eq!(
+                                token, id,
+                                "virtio-blk chain took descriptor {token}, not the slot {id} it was written for"
+                            );
+                            body.response = response;
+                            // Pending before the ring is let go: no drain
+                            // can pop the answer before this.
+                            request.state.store(PENDING, Ordering::Release);
+                            ring.notify(&self.transport);
+                            self.unlock(queue, ring);
+                            break Ok(id);
+                        }
+                        Err(error) => {
+                            let buffer = body.buffer.take();
+                            self.unlock(queue, ring);
+                            break Err((error, buffer));
+                        }
                     }
-                } else {
-                    Part::LentRead {
-                        buffer: 0,
-                        range: start..end,
-                    }
-                });
-                start = end;
+                }
+                self.unlock(queue, ring);
             }
+            if self.reap(queue) != 0 {
+                continue;
+            }
+            if !announced {
+                // Announced before the ring is re-tested, so a drainer
+                // that frees it in between cannot read the count as
+                // zero and leave this task asleep.
+                queue.blocked.fetch_add(1, Ordering::SeqCst);
+                announced = true;
+                continue;
+            }
+            notified.await;
+        };
+        if announced {
+            queue.blocked.fetch_sub(1, Ordering::SeqCst);
         }
-        for len in response {
-            parts.push(Part::Response(*len));
+        match outcome {
+            Ok(id) => RequestWaiter {
+                device: self,
+                flight: Flight::Issued {
+                    queue: queue_index,
+                    id,
+                },
+            },
+            Err((error, buffer)) => RequestWaiter::refused(self, error, buffer),
         }
-
-        let queue = self.queue_for_current_processor();
-        let ticket = submit_lent(
-            &queue.inflight,
-            &queue.queue,
-            &self.transport,
-            &queue.slots,
-            &parts,
-            lent,
-        )
-        .await?;
-        // A chain that never comes back keeps what it was lent.
-        let reply = await_completion(&queue.queue, ticket, || self.interrupts.notified())
-            .await
-            .map_err(|error| BufError {
-                error,
-                buffers: None,
-            })?;
-        self.counters.count(kind);
-        Ok(reply)
     }
 
-    fn queue_for_current_processor(&self) -> &BlockQueue<T> {
-        let processor = self.cpu.current_processor();
-        &self.queues[processor % self.queues.len()]
+    /// Lets go of `queue`'s ring, draining it first if a drainer found it
+    /// held meanwhile.
+    fn unlock(&self, queue: &BlockQueue<T, B>, ring: MutexGuard<'_, VirtQueue<T>>) {
+        drop(ring);
+        // Pairs with the fence in `reap`: either that drainer's request is
+        // seen here, or its next attempt finds the ring free.
+        fence(Ordering::SeqCst);
+        if queue.drain_pending.load(Ordering::SeqCst) {
+            self.reap(queue);
+        }
+    }
+
+    /// Pops every answer the device published on `queue` and finishes
+    /// those requests, answering how many it finished.
+    ///
+    /// Never spins on the ring lock: a ring someone else holds is left
+    /// to its holder with a drain request.
+    fn reap(&self, queue: &BlockQueue<T, B>) -> usize {
+        let mut finished = 0;
+        loop {
+            queue.drain_pending.store(true, Ordering::SeqCst);
+            fence(Ordering::SeqCst);
+            let Some(mut ring) = queue.ring.try_lock() else {
+                return finished;
+            };
+            queue.drain_pending.store(false, Ordering::SeqCst);
+            match self.state.load(Ordering::SeqCst) {
+                RUNNING => {}
+                // The context resetting the device drains every queue
+                // once the reset is done.
+                RESETTING => return finished,
+                _ => {
+                    finished += self.fail_in_flight(queue);
+                    drop(ring);
+                    queue.available.notify_all();
+                    return finished;
+                }
+            }
+            let mut answered: ArrayVec<(u16, u32), BLOCK_QUEUE_SLOTS> = ArrayVec::new();
+            let drained = ring.drain_used(|id, used| answered.push((id, used)));
+            drop(ring);
+            // Every popped chain gave its descriptors back to the ring;
+            // answers popped before a fault stand.
+            let mut released = answered.len();
+            for &(id, used) in &answered {
+                released += self.finish(queue, id, used);
+            }
+            queue.note_released(released);
+            finished += answered.len();
+            if drained.is_err() {
+                self.stop();
+                return finished;
+            }
+            fence(Ordering::SeqCst);
+            if !queue.drain_pending.load(Ordering::SeqCst) {
+                return finished;
+            }
+        }
+    }
+
+    /// Finishes the request in slot `id`, which the device answered with
+    /// `used` bytes written: reads its status, completes its buffer, and
+    /// hands the result to its waiter or, with none left, frees the slot.
+    /// Answers how many slots it freed.
+    fn finish(&self, queue: &BlockQueue<T, B>, id: u16, used: u32) -> usize {
+        let request = queue.request(id);
+        // SAFETY: the device answered and this context popped the answer,
+        // which no other context can; the waiter reads the body only once
+        // the state says complete. The body is this context's.
+        let body = unsafe { &mut *request.body.get() };
+        let window = queue.slots.window(id, body.response);
+        // SAFETY: the device answered the chain, so it writes the control
+        // slot no more, and the slot stays this request's until its
+        // request slot is idle again, which happens after this read.
+        let response = unsafe { window.bytes() };
+        let status = response.last().copied().unwrap_or(STATUS_UNWRITTEN);
+        if body.kind == ReqType::GetId {
+            body.id.copy_from_slice(&response[..BLOCK_ID_BYTES]);
+        }
+        let result = map_block_status(status).and_then(|()| {
+            // The used length counts everything the device wrote into the
+            // chain, which is the payload plus the status byte.
+            let written = usize::try_from(used)
+                .map_err(|_| IoError::DeviceFault)?
+                .checked_sub(size_of::<u8>())
+                .ok_or(IoError::DeviceFault)?;
+            match body.kind {
+                // A short read is a device fault rather than a partial
+                // success: the caller asked for whole blocks, and the
+                // tail would otherwise keep whatever was in the buffer.
+                ReqType::In if written != body.expected => Err(IoError::DeviceFault),
+                ReqType::GetId => Ok(written.min(BLOCK_ID_BYTES)),
+                _ => Ok(written),
+            }
+        });
+        body.result = result;
+        if let Some(buffer) = body.buffer.as_mut() {
+            buffer.complete(result.map(drop));
+        }
+        self.counters.count(body.kind);
+        match request
+            .state
+            .compare_exchange(PENDING, COMPLETE, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => {
+                request.waker.wake();
+                0
+            }
+            Err(DETACHED) => {
+                drop(body.buffer.take());
+                request.state.store(IDLE, Ordering::Release);
+                1
+            }
+            Err(state) => {
+                panic!("virtio-blk device answered descriptor {id}, whose slot is in state {state}")
+            }
+        }
+    }
+
+    /// Gives up on a device that broke the used-ring contract.
+    ///
+    /// The device is reset first, because only a device that has been
+    /// reset is done with the buffers it was handed (virtio 1.2, device
+    /// status field: a reset is complete once the status reads back
+    /// zero). Then every request still in flight on every queue finishes
+    /// with a device fault and hands its buffer back, and the driver
+    /// refuses every request from then on.
+    fn stop(&self) {
+        if self
+            .state
+            .compare_exchange(RUNNING, RESETTING, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        tracing::error!("virtio-blk device broke the used-ring contract; resetting it");
+        self.transport.reset();
+        while !self.transport.status().is_empty() {
+            spin_loop();
+        }
+        self.state.store(STOPPED, Ordering::SeqCst);
+        // A queue someone else holds is failed by its holder as it lets
+        // go, through the drain request `reap` leaves.
+        for queue in self.queues.iter() {
+            self.reap(queue);
+        }
+    }
+
+    /// Finishes every request in flight on `queue` with a device fault,
+    /// answering how many it finished. The caller holds the ring, and
+    /// the device has been reset.
+    fn fail_in_flight(&self, queue: &BlockQueue<T, B>) -> usize {
+        let mut failed = 0;
+        for request in queue.requests.iter() {
+            if !matches!(request.state.load(Ordering::Acquire), PENDING | DETACHED) {
+                continue;
+            }
+            // SAFETY: the device has the request and the ring is held, so
+            // no other drainer touches the body, and the reset device
+            // writes into it no more; a waiter reads it only once complete.
+            let body = unsafe { &mut *request.body.get() };
+            body.result = Err(IoError::DeviceFault);
+            if let Some(buffer) = body.buffer.as_mut() {
+                buffer.complete(Err(IoError::DeviceFault));
+            }
+            match request.state.compare_exchange(
+                PENDING,
+                COMPLETE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => request.waker.wake(),
+                Err(DETACHED) => {
+                    drop(body.buffer.take());
+                    request.state.store(IDLE, Ordering::Release);
+                }
+                Err(state) => {
+                    panic!("virtio-blk request was failed in slot state {state}")
+                }
+            }
+            failed += 1;
+        }
+        failed
     }
 }
 
-impl<T: VirtioTransport, C: QueueAffinity> Drop for VirtioBlockDevice<T, C> {
+/// Writes one request's chain: the header, and for discard and
+/// write-zeroes the segment list, copied into the control slot of the
+/// identifier the chain will be headed by; the payload runs, translated
+/// to device addresses; and the response bytes, the status last, back in
+/// the control slot. Answers the identifier and where the response bytes
+/// are.
+///
+/// # Safety
+///
+/// The caller holds `ring` and owns the control slot of
+/// [`VirtQueue::next_free_descriptor`]: its request slot is idle. Every
+/// run is memory the caller's request slot owns, which nobody but the
+/// device reads or writes until the request is finished.
+unsafe fn write_chain<T: VirtioTransport>(
+    ring: &mut VirtQueue<T>,
+    transport: &T,
+    slots: &ControlSlots<TransportBuffer<T>>,
+    command: &Command,
+) -> IoResult<(u16, ResponseSpan)> {
+    let header = BlkReq::new(command.kind, command.sector);
+    let mut parts: ArrayVec<Part<'_>, MAX_CHAIN_BUFFERS> = ArrayVec::new();
+    parts.push(Part::Request(as_bytes(&header)));
+    match command.kind {
+        ReqType::Out => {
+            for &(address, len) in &command.runs {
+                // SAFETY: the run is part of the buffer the slot owns,
+                // which the contract leaves unwritten until it completes.
+                parts.push(Part::Read(unsafe {
+                    core::slice::from_raw_parts(address as *const u8, len)
+                }));
+            }
+        }
+        ReqType::In => {
+            for &(address, len) in &command.runs {
+                // SAFETY: the run is part of the buffer the slot owns,
+                // which the contract leaves to the device alone until it
+                // completes.
+                parts.push(Part::Write(unsafe {
+                    core::slice::from_raw_parts_mut(address as *mut u8, len)
+                }));
+            }
+        }
+        ReqType::GetId => parts.push(Part::Response(BLOCK_ID_BYTES)),
+        ReqType::Discard | ReqType::WriteZeroes => {
+            parts.push(Part::Request(as_bytes_slice(command.deallocate.as_slice())));
+        }
+        ReqType::Flush => {}
+    }
+    parts.push(Part::Response(size_of::<u8>()));
+    let head = ring.next_free_descriptor();
+    // SAFETY: the caller owns the control slot of `head`, and the chain
+    // is not published yet.
+    unsafe { slots.prime_response(head, STATUS_UNWRITTEN) };
+    // SAFETY: as above; the caller's request slot being idle is the
+    // ownership `submit_parts` asks for.
+    unsafe { ring.submit_parts(transport, slots, &parts, &mut ()) }
+}
+
+impl<T: VirtioTransport, C: QueueAffinity, B> Drop for VirtioBlockDevice<T, C, B> {
     fn drop(&mut self) {
-        for queue in &mut self.queues {
-            queue.queue.get_mut().shutdown(&self.transport);
+        for queue in self.queues.iter_mut() {
+            queue.ring.get_mut().shutdown(&self.transport);
         }
     }
 }
@@ -987,7 +1508,7 @@ impl<D: BlockDevice> VirtioBlockSwapBackend<D> {
 
         Ok(Self {
             device,
-            state: Mutex::new(VirtioBlockSwapState {
+            state: AsyncMutex::new(VirtioBlockSwapState {
                 free: Vec::from([SwapExtent {
                     start_block,
                     block_count,
@@ -1080,7 +1601,7 @@ impl VirtioBlockSwapState {
     }
 }
 
-impl<T: VirtioTransport, C: QueueAffinity> VirtioBlockResource<T, C> {
+impl<T: VirtioTransport, C: QueueAffinity, B: BlockBuffer> VirtioBlockResource<T, C, B> {
     pub fn rights(&self) -> BlockDeviceRights {
         self.resource.rights()
     }
@@ -1115,7 +1636,7 @@ impl<T: VirtioTransport, C: QueueAffinity> VirtioBlockResource<T, C> {
         self.object().request_counts()
     }
 
-    fn object(&self) -> &VirtioBlockDevice<T, C> {
+    fn object(&self) -> &VirtioBlockDevice<T, C, B> {
         self.resource.object()
     }
 
@@ -1140,7 +1661,7 @@ impl<T: VirtioTransport, C: QueueAffinity> VirtioBlockResource<T, C> {
     }
 }
 
-impl<T: VirtioTransport, C: QueueAffinity> Clone for VirtioBlockResource<T, C> {
+impl<T: VirtioTransport, C: QueueAffinity, B> Clone for VirtioBlockResource<T, C, B> {
     fn clone(&self) -> Self {
         Self {
             resource: self.resource.clone(),
@@ -1148,45 +1669,47 @@ impl<T: VirtioTransport, C: QueueAffinity> Clone for VirtioBlockResource<T, C> {
     }
 }
 
-impl<T: VirtioTransport, C: QueueAffinity> BlockDevice for VirtioBlockResource<T, C> {
-    type Buffer = TransportBuffer<T>;
+impl<T: VirtioTransport, C: QueueAffinity, B: BlockBuffer> BlockDevice
+    for VirtioBlockResource<T, C, B>
+{
+    type Buffer = B;
+    type Memory = TransportBuffer<T>;
+    type Waiter<'a>
+        = VirtioBlockWaiter<'a, T, C, B>
+    where
+        Self: 'a;
 
-    fn buffer(&self, bytes: usize) -> IoResult<Self::Buffer> {
+    /// Memory from the transport's DMA pool, which is the memory this
+    /// device's requests are translated against.
+    fn memory(&self, bytes: usize) -> IoResult<TransportBuffer<T>> {
+        let logical_block_bytes = self.object().geometry.logical_block_bytes;
+        if bytes == 0 || !bytes.is_multiple_of(logical_block_bytes) {
+            return Err(IoError::InvalidBufferLength {
+                required_multiple: logical_block_bytes,
+                actual: bytes,
+            });
+        }
         let layout =
-            Layout::from_size_align(bytes, BUFFER_ALIGNMENT).map_err(|_| IoError::OutOfBounds)?;
+            Layout::from_size_align(bytes, PhysFrame::SIZE).map_err(|_| IoError::OutOfBounds)?;
         self.object().transport.bus().dma().allocate_zeroed(layout)
     }
 
-    async fn read_block(&self, block_id: usize, buf: Self::Buffer) -> BufResult<(), Self::Buffer> {
-        if let Err(error) = validate_request(
-            self.rights(),
-            self.object().geometry,
-            block_id,
-            buf.as_ref().len(),
-            BlockDeviceRights::READ,
-        ) {
-            return Err(BufError::returned(error, buf));
+    async fn submit_read(&self, block_id: usize, buffer: B) -> Self::Waiter<'_> {
+        VirtioBlockWaiter {
+            request: self
+                .object()
+                .submit_data(ReqType::In, self.rights(), block_id, buffer)
+                .await,
         }
-
-        self.object().read_blocks(block_id, buf).await
     }
 
-    async fn write_block(&self, block_id: usize, buf: Self::Buffer) -> BufResult<(), Self::Buffer> {
-        if let Err(error) = validate_request(
-            self.rights(),
-            self.object().geometry,
-            block_id,
-            buf.as_ref().len(),
-            BlockDeviceRights::WRITE,
-        ) {
-            return Err(BufError::returned(error, buf));
+    async fn submit_write(&self, block_id: usize, buffer: B) -> Self::Waiter<'_> {
+        VirtioBlockWaiter {
+            request: self
+                .object()
+                .submit_data(ReqType::Out, self.rights(), block_id, buffer)
+                .await,
         }
-
-        if self.object().readonly {
-            return Err(BufError::returned(IoError::ReadOnly, buf));
-        }
-
-        self.object().write_blocks(block_id, buf).await
     }
 
     async fn flush(&self) -> IoResult<()> {
@@ -1227,33 +1750,50 @@ impl<T: VirtioTransport, C: QueueAffinity> BlockDevice for VirtioBlockResource<T
             depth: self.object().queue_depth(),
         }
     }
+
+    /// Writes are refused when the device negotiated
+    /// `VIRTIO_BLK_F_RO` or this handle was derived without the write
+    /// right: either way no write through it can succeed.
+    fn is_read_only(&self) -> bool {
+        self.object().readonly || !self.rights().contains(BlockDeviceRights::WRITE)
+    }
 }
 
-impl<D: BlockDevice + 'static> SwapBackend for VirtioBlockSwapBackend<D> {
+impl<D> SwapBackend for VirtioBlockSwapBackend<D>
+where
+    D: BlockDevice + 'static,
+    D::Buffer: OwnedBlockBuffer<Memory = <D as BlockDevice>::Memory> + Sync,
+{
     type Token = VirtioBlockSwapToken;
     type Error = VirtioBlockSwapError;
 
     type Buffer = D::Buffer;
 
-    /// The staging buffer is the device's own, rounded up to whole
-    /// blocks: a request carries whole blocks, so the page is stored and
-    /// restored as the buffer and no partial block is ever bounced
-    /// through scratch.
+    /// The staging buffer is a request buffer made of the device's own
+    /// memory, rounded up to whole blocks: a request carries whole
+    /// blocks, so the page is stored and restored as the buffer itself
+    /// and never copied into one.
     fn buffer(&self, bytes: usize) -> Result<Self::Buffer, Self::Error> {
+        if bytes == 0 {
+            return Err(VirtioBlockSwapError::EmptyPayload);
+        }
         let block_size = self.device.block_size();
         if block_size == 0 {
             return Err(VirtioBlockSwapError::InvalidBlockSize);
         }
-        Ok(self.device.buffer(bytes.next_multiple_of(block_size))?)
+        let memory = self.device.memory(bytes.next_multiple_of(block_size))?;
+        Ok(D::Buffer::owning(memory))
     }
 
     /// Writes the whole of `page` into a freshly allocated extent.
     ///
-    /// No flush follows. Swap is scratch storage whose only reader is
-    /// the kernel that wrote it: once the device has taken the write it
-    /// will hand the same bytes back, and nothing in swap has to outlive
-    /// the kernel. A flush per page would buy durability nobody wants at
-    /// the price of a host fsync on every page evicted.
+    /// The page is the write's until the device answers, so a dropped
+    /// swap-out leaves it with the request. No flush follows. Swap is
+    /// scratch storage whose only reader is the kernel that wrote it:
+    /// once the device has taken the write it will hand the same bytes
+    /// back, and nothing in swap has to outlive the kernel. A flush per
+    /// page would buy durability nobody wants at the price of a host
+    /// fsync on every page evicted.
     async fn swap_out(
         &self,
         page: Self::Buffer,
@@ -1262,7 +1802,7 @@ impl<D: BlockDevice + 'static> SwapBackend for VirtioBlockSwapBackend<D> {
             Ok(token) => token,
             Err(error) => return Err(BufError::returned(error, page)),
         };
-        match self.device.write_block(token.start_block, page).await {
+        match self.device.write(token.start_block, page).await {
             Ok(((), page)) => Ok((token, page)),
             Err(error) => {
                 self.release_token(token).await;
@@ -1291,12 +1831,11 @@ impl<D: BlockDevice + 'static> SwapBackend for VirtioBlockSwapBackend<D> {
                 page,
             ));
         }
-        let page = self
+        let ((), page) = self
             .device
-            .read_block(token.start_block, page)
+            .read(token.start_block, page)
             .await
-            .map_err(|error| error.map_error(VirtioBlockSwapError::Io))?
-            .1;
+            .map_err(|error| error.map_error(VirtioBlockSwapError::Io))?;
         self.release_token(token).await;
         Ok(((), page))
     }
@@ -1336,12 +1875,6 @@ fn validate_request(
     Ok(())
 }
 
-/// The status byte a request ends with: the last byte the device wrote
-/// to the slot.
-fn status_of<L: Lend>(reply: &Reply<'_, BLOCK_QUEUE_SLOTS, L>) -> IoResult<u8> {
-    reply.response().last().copied().ok_or(IoError::DeviceFault)
-}
-
 fn map_block_status(status: u8) -> IoResult<()> {
     match status {
         0 => Ok(()),
@@ -1360,986 +1893,4 @@ fn as_bytes_slice<T>(values: &[T]) -> &[u8] {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    use alloc::vec;
-
-    use crate::testing::{
-        ConfinedDmaBuffer, ConfinedDmaPool, ConfinedTransport, FakeAffinity, FakeTransport,
-        FakeTransportConfig,
-    };
-    use crate::transport::VirtioFeatures;
-    use core::pin::pin;
-    use futures_lite::future::{block_on, poll_once};
-    use helios_hal::dma::DmaBuffer;
-    use spin::Mutex as SpinMutex;
-
-    /// A device with 2 MiB of capacity in 512-byte sectors.
-    const TEST_CAPACITY_SECTORS: u32 = 4096;
-
-    /// A device whose DMA reaches only memory its pool handed out: the
-    /// rings, the control slots and the data buffers a test takes from
-    /// [`data`].
-    type TestDevice = VirtioBlockResource<ConfinedTransport, FakeAffinity<1>>;
-
-    /// A buffer of `bytes` bytes the device can reach, for a read or
-    /// write payload.
-    fn data(device: &TestDevice, bytes: usize) -> ConfinedDmaBuffer {
-        device.object().transport.pool().buffer(bytes)
-    }
-
-    /// A payload buffer of `bytes` bytes of `fill`.
-    fn payload(device: &TestDevice, bytes: usize, fill: u8) -> ConfinedDmaBuffer {
-        let mut buffer = data(device, bytes);
-        buffer.as_mut_slice().fill(fill);
-        buffer
-    }
-
-    fn device_with(features: u64, setup: impl FnOnce(&ConfinedTransport)) -> TestDevice {
-        let transport = FakeTransport::confined(FakeTransportConfig {
-            device_type: DeviceType::Block,
-            offered_features: VirtioFeatures::VERSION_1.bits() | features,
-            queue_size: 8,
-            supports_queue_reset: false,
-            absent_queues: &[],
-        });
-        transport.set_config_u32(CFG_CAPACITY_LOW, TEST_CAPACITY_SECTORS);
-        setup(&transport);
-        VirtioBlockDevice::new(transport, FakeAffinity::<1>)
-            .expect("block device should initialize")
-            .into_resource(BlockDeviceRights::READ | BlockDeviceRights::WRITE)
-    }
-
-    fn device() -> TestDevice {
-        device_with(0, |_| {})
-    }
-
-    /// The identifier the next submission on the first queue will take.
-    ///
-    /// A chain spends one descriptor per buffer, so the identifiers a
-    /// driver's requests get depend on the shape of the chains before
-    /// them; tests ask the ring rather than assuming a numbering.
-    fn next_token(device: &TestDevice) -> u16 {
-        device.object().queues[0]
-            .queue
-            .try_lock()
-            .expect("a parked driver does not hold the queue lock")
-            .next_free_descriptor()
-    }
-
-    /// The bytes the driver made readable in chain `token`.
-    fn request_of(device: &TestDevice, token: u16) -> Vec<u8> {
-        device.object().queues[0]
-            .queue
-            .try_lock()
-            .expect("a parked driver does not hold the queue lock")
-            .device_request(token)
-    }
-
-    /// Plays the device: writes `response` into the chain's writable
-    /// buffers, publishes the used entry and raises the interrupt.
-    fn complete(device: &TestDevice, token: u16, response: &[u8]) {
-        {
-            let queue = device.object().queues[0]
-                .queue
-                .try_lock()
-                .expect("a parked driver does not hold the queue lock");
-            let len = queue.device_respond(token, response);
-            queue.device_complete(token, len);
-        }
-        device.handle_interrupt();
-    }
-
-    fn header(request: ReqType, sector: u64) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&(request as u32).to_le_bytes());
-        bytes.extend_from_slice(&0_u32.to_le_bytes());
-        bytes.extend_from_slice(&sector.to_le_bytes());
-        bytes
-    }
-
-    #[test]
-    fn a_wrong_device_type_is_rejected() {
-        let rejected = VirtioBlockDevice::new(
-            FakeTransport::new(FakeTransportConfig {
-                device_type: DeviceType::Entropy,
-                ..FakeTransportConfig::default()
-            }),
-            FakeAffinity::<1>,
-        )
-        .err();
-        assert_eq!(rejected, Some(IoError::Unsupported));
-    }
-
-    #[test]
-    fn a_plain_device_reports_sector_geometry_and_one_queue() {
-        let device = device();
-
-        assert_eq!(
-            device.geometry(),
-            BlockGeometry {
-                logical_block_bytes: SECTOR_SIZE,
-                physical_block_exp: 0,
-                min_io_blocks: 0,
-                opt_io_blocks: 0,
-                max_segments: 1,
-                max_segment_bytes: u32::MAX,
-                capacity_blocks: TEST_CAPACITY_SECTORS as usize,
-            }
-        );
-        assert_eq!(device.capabilities(), BlockDeviceCapabilities::empty());
-        assert_eq!(device.queue_count(), 1);
-    }
-
-    #[test]
-    fn topology_and_block_size_are_read_into_the_geometry() {
-        let device = device_with(
-            BLK_F_BLK_SIZE | BLK_F_TOPOLOGY | BLK_F_SEG_MAX | BLK_F_SIZE_MAX,
-            |transport| {
-                transport.set_config_u32(CFG_BLK_SIZE, 4096);
-                transport.set_config_u8(CFG_PHYSICAL_BLOCK_EXP, 1);
-                transport.set_config_u16(CFG_MIN_IO_SIZE, 2);
-                transport.set_config_u32(CFG_OPT_IO_SIZE, 8);
-                transport.set_config_u32(CFG_SEG_MAX, 4);
-                transport.set_config_u32(CFG_SIZE_MAX, 16384);
-            },
-        );
-
-        assert_eq!(
-            device.geometry(),
-            BlockGeometry {
-                logical_block_bytes: 4096,
-                physical_block_exp: 1,
-                min_io_blocks: 2,
-                opt_io_blocks: 8,
-                max_segments: 4,
-                max_segment_bytes: 16384,
-                // 4096 512-byte sectors are 512 blocks of 4 KiB.
-                capacity_blocks: 512,
-            }
-        );
-        assert_eq!(device.geometry().physical_block_bytes(), 8192);
-        assert_eq!(device.geometry().capacity_bytes(), 2 * 1024 * 1024);
-    }
-
-    #[test]
-    fn a_logical_block_larger_than_a_sector_addresses_in_sectors_on_the_wire() {
-        let device = device_with(BLK_F_BLK_SIZE, |transport| {
-            transport.set_config_u32(CFG_BLK_SIZE, 4096);
-        });
-
-        let mut read = pin!(device.read_block(3, data(&device, 4096)));
-        assert!(block_on(poll_once(read.as_mut())).is_none());
-
-        // Block 3 of a 4 KiB device is sector 24: virtio-blk addresses
-        // every request in 512-byte sectors whatever the block size is.
-        assert_eq!(request_of(&device, 0), header(ReqType::In, 24));
-    }
-
-    #[test]
-    fn a_read_carries_the_payload_and_checks_the_used_length() {
-        let device = device();
-        let mut read = pin!(device.read_block(2, data(&device, 512)));
-
-        assert!(block_on(poll_once(read.as_mut())).is_none());
-        assert_eq!(request_of(&device, 0), header(ReqType::In, 2));
-
-        let mut response = vec![0xa5_u8; 512];
-        response.push(0);
-        complete(&device, 0, &response);
-        let ((), buffer) = block_on(poll_once(read.as_mut()))
-            .expect("the read is complete")
-            .expect("the read succeeds");
-        assert_eq!(buffer.as_ref(), [0xa5_u8; 512]);
-        assert_eq!(device.request_counts().reads, 1);
-    }
-
-    /// What a finished data request reported, `None` while it is pending.
-    fn outcome(polled: Option<BufResult<(), ConfinedDmaBuffer>>) -> Option<IoResult<()>> {
-        polled.map(|result| result.map(|((), _)| ()).map_err(BufError::into_error))
-    }
-
-    #[test]
-    fn a_short_read_is_a_device_fault() {
-        let device = device();
-        let mut read = pin!(device.read_block(0, data(&device, 1024)));
-
-        assert!(block_on(poll_once(read.as_mut())).is_none());
-        // The device claims success but only filled half the chain.
-        {
-            let queue = device.object().queues[0]
-                .queue
-                .try_lock()
-                .expect("a parked driver does not hold the queue lock");
-            queue.device_respond(0, &vec![0_u8; 1025]);
-            queue.device_complete(0, 513);
-        }
-        device.handle_interrupt();
-
-        let refused = block_on(poll_once(read.as_mut()))
-            .expect("the read is complete")
-            .err()
-            .expect("a short read fails");
-        assert_eq!(refused.error, IoError::DeviceFault);
-        assert!(
-            refused.buffers.is_some(),
-            "the device returned the chain, so the buffer comes back with the error"
-        );
-    }
-
-    #[test]
-    fn a_write_puts_the_payload_after_the_header() {
-        let device = device();
-        let mut write = pin!(device.write_block(7, payload(&device, 512, 0x5a)));
-
-        assert!(block_on(poll_once(write.as_mut())).is_none());
-        let mut expected = header(ReqType::Out, 7);
-        expected.extend_from_slice(&[0x5a_u8; 512]);
-        assert_eq!(request_of(&device, 0), expected);
-
-        complete(&device, 0, &[0]);
-        assert_eq!(outcome(block_on(poll_once(write.as_mut()))), Some(Ok(())));
-        assert_eq!(device.request_counts().writes, 1);
-    }
-
-    #[test]
-    fn a_device_error_status_becomes_a_device_fault() {
-        let device = device();
-        let mut write = pin!(device.write_block(0, payload(&device, 512, 0)));
-
-        assert!(block_on(poll_once(write.as_mut())).is_none());
-        complete(&device, 0, &[1]);
-        assert_eq!(
-            outcome(block_on(poll_once(write.as_mut()))),
-            Some(Err(IoError::DeviceFault))
-        );
-    }
-
-    #[test]
-    fn a_flush_is_a_bare_header_when_the_device_has_a_write_cache() {
-        let device = device_with(BLK_F_FLUSH, |_| {});
-        assert!(
-            device
-                .capabilities()
-                .contains(BlockDeviceCapabilities::FLUSH)
-        );
-
-        let mut flush = pin!(device.flush());
-        assert!(block_on(poll_once(flush.as_mut())).is_none());
-        assert_eq!(request_of(&device, 0), header(ReqType::Flush, 0));
-
-        complete(&device, 0, &[0]);
-        assert_eq!(block_on(poll_once(flush.as_mut())), Some(Ok(())));
-        assert_eq!(device.request_counts().flushes, 1);
-    }
-
-    #[test]
-    fn a_device_without_a_write_cache_has_nothing_to_flush() {
-        let device = device();
-
-        assert_eq!(block_on(device.flush()), Ok(()));
-        assert_eq!(
-            device.object().transport.kick_count(),
-            0,
-            "a flush with no volatile cache must not reach the device"
-        );
-    }
-
-    #[test]
-    fn the_serial_comes_back_from_a_get_id_request() {
-        let device = device();
-        let mut serial = pin!(device.serial());
-
-        assert!(block_on(poll_once(serial.as_mut())).is_none());
-        assert_eq!(request_of(&device, 0), header(ReqType::GetId, 0));
-
-        let mut response = [0_u8; BLOCK_ID_BYTES + 1];
-        response[..11].copy_from_slice(b"helios-data");
-        complete(&device, 0, &response);
-
-        let serial = block_on(poll_once(serial.as_mut()))
-            .expect("the identifier request has completed")
-            .expect("the device answered the identifier request");
-        assert_eq!(serial.as_str(), Some("helios-data"));
-    }
-
-    #[test]
-    fn a_device_that_rejects_get_id_reports_it_as_unsupported() {
-        let device = device();
-        let token = next_token(&device);
-        let mut serial = pin!(device.serial());
-
-        assert!(block_on(poll_once(serial.as_mut())).is_none());
-        // A device without identification support writes nothing but the
-        // status byte, VIRTIO_BLK_S_UNSUPP, and reports that one byte as
-        // the used length.
-        {
-            let queue = device.object().queues[0]
-                .queue
-                .try_lock()
-                .expect("a parked driver does not hold the queue lock");
-            let mut response = [0_u8; BLOCK_ID_BYTES + 1];
-            response[BLOCK_ID_BYTES] = 2;
-            queue.device_respond(token, &response);
-            queue.device_complete(token, 1);
-        }
-        device.handle_interrupt();
-
-        assert_eq!(
-            block_on(poll_once(serial.as_mut())),
-            Some(Err(IoError::Unsupported))
-        );
-    }
-
-    #[test]
-    fn discard_carries_one_sector_run_per_segment() {
-        let device = device_with(BLK_F_DISCARD, |transport| {
-            transport.set_config_u32(CFG_MAX_DISCARD_SECTORS, 8);
-            transport.set_config_u32(CFG_MAX_DISCARD_SEG, 4);
-        });
-        assert!(
-            device
-                .capabilities()
-                .contains(BlockDeviceCapabilities::DISCARD)
-        );
-
-        let mut discard = pin!(device.discard(BlockRange::new(16, 12)));
-        assert!(block_on(poll_once(discard.as_mut())).is_none());
-
-        let mut expected = header(ReqType::Discard, 0);
-        // 12 sectors split into runs of at most 8.
-        expected.extend_from_slice(&16_u64.to_le_bytes());
-        expected.extend_from_slice(&8_u32.to_le_bytes());
-        expected.extend_from_slice(&0_u32.to_le_bytes());
-        expected.extend_from_slice(&24_u64.to_le_bytes());
-        expected.extend_from_slice(&4_u32.to_le_bytes());
-        expected.extend_from_slice(&0_u32.to_le_bytes());
-        assert_eq!(request_of(&device, 0), expected);
-
-        complete(&device, 0, &[0]);
-        assert_eq!(block_on(poll_once(discard.as_mut())), Some(Ok(())));
-        assert_eq!(device.request_counts().discards, 1);
-    }
-
-    #[test]
-    fn write_zeroes_uses_its_own_limits() {
-        let device = device_with(BLK_F_WRITE_ZEROES, |transport| {
-            transport.set_config_u32(CFG_MAX_WRITE_ZEROES_SECTORS, 64);
-            transport.set_config_u32(CFG_MAX_WRITE_ZEROES_SEG, 1);
-        });
-
-        let mut zeroes = pin!(device.write_zeroes(BlockRange::new(0, 8)));
-        assert!(block_on(poll_once(zeroes.as_mut())).is_none());
-
-        let mut expected = header(ReqType::WriteZeroes, 0);
-        expected.extend_from_slice(&0_u64.to_le_bytes());
-        expected.extend_from_slice(&8_u32.to_le_bytes());
-        expected.extend_from_slice(&0_u32.to_le_bytes());
-        assert_eq!(request_of(&device, 0), expected);
-
-        complete(&device, 0, &[0]);
-        assert_eq!(block_on(poll_once(zeroes.as_mut())), Some(Ok(())));
-        assert_eq!(device.request_counts().write_zeroes, 1);
-    }
-
-    #[test]
-    fn deallocation_is_rejected_on_a_device_that_does_not_offer_it() {
-        let device = device();
-
-        assert_eq!(
-            block_on(device.discard(BlockRange::new(0, 1))),
-            Err(IoError::Unsupported)
-        );
-        assert_eq!(
-            block_on(device.write_zeroes(BlockRange::new(0, 1))),
-            Err(IoError::Unsupported)
-        );
-    }
-
-    #[test]
-    fn deallocation_beyond_the_capacity_is_rejected() {
-        let device = device_with(BLK_F_DISCARD, |transport| {
-            transport.set_config_u32(CFG_MAX_DISCARD_SECTORS, 8);
-            transport.set_config_u32(CFG_MAX_DISCARD_SEG, 1);
-        });
-
-        assert_eq!(
-            block_on(device.discard(BlockRange::new(TEST_CAPACITY_SECTORS as usize - 1, 2))),
-            Err(IoError::OutOfBounds)
-        );
-    }
-
-    #[test]
-    fn a_transfer_is_split_at_the_segment_and_request_limits() {
-        let device = device_with(BLK_F_SEG_MAX | BLK_F_SIZE_MAX, |transport| {
-            transport.set_config_u32(CFG_SEG_MAX, 2);
-            transport.set_config_u32(CFG_SIZE_MAX, 1024);
-        });
-        let mut write = pin!(device.write_block(0, payload(&device, 4096, 0x11)));
-
-        assert!(block_on(poll_once(write.as_mut())).is_none());
-        // Two segments of 1024 bytes each is 2048 bytes per request, so
-        // the first request covers sectors 0..4 and the second 4..8.
-        let mut expected = header(ReqType::Out, 0);
-        expected.extend_from_slice(&[0x11_u8; 2048]);
-        assert_eq!(request_of(&device, 0), expected);
-
-        complete(&device, 0, &[0]);
-        let second = next_token(&device);
-        assert!(block_on(poll_once(write.as_mut())).is_none());
-        let mut expected = header(ReqType::Out, 4);
-        expected.extend_from_slice(&[0x11_u8; 2048]);
-        assert_eq!(request_of(&device, second), expected);
-
-        complete(&device, second, &[0]);
-        assert_eq!(outcome(block_on(poll_once(write.as_mut()))), Some(Ok(())));
-        assert_eq!(device.request_counts().writes, 2);
-    }
-
-    /// The buffer a finished read handed back. A pending or failed read
-    /// fails the test.
-    fn read_back(polled: Option<BufResult<(), ConfinedDmaBuffer>>) -> ConfinedDmaBuffer {
-        polled
-            .expect("the read is complete")
-            .expect("the read succeeds")
-            .1
-    }
-
-    #[test]
-    fn requests_are_pipelined_and_completed_out_of_order() {
-        let device = device();
-        let first_token = next_token(&device);
-        let mut read_first = pin!(device.read_block(0, data(&device, 512)));
-        assert!(block_on(poll_once(read_first.as_mut())).is_none());
-        let second_token = next_token(&device);
-        let mut read_second = pin!(device.read_block(1, data(&device, 512)));
-        assert!(block_on(poll_once(read_second.as_mut())).is_none());
-        assert_eq!(request_of(&device, first_token), header(ReqType::In, 0));
-        assert_eq!(request_of(&device, second_token), header(ReqType::In, 1));
-
-        // The device answers the second request first. The waiter that
-        // wakes drains the ring for everyone, so the first request must
-        // not take a completion that is not addressed to it.
-        let mut response = vec![0x22_u8; 512];
-        response.push(0);
-        complete(&device, second_token, &response);
-        assert!(
-            block_on(poll_once(read_first.as_mut())).is_none(),
-            "the first request is still outstanding"
-        );
-        let second = read_back(block_on(poll_once(read_second.as_mut())));
-
-        let mut response = vec![0x33_u8; 512];
-        response.push(0);
-        complete(&device, first_token, &response);
-        let first = read_back(block_on(poll_once(read_first.as_mut())));
-        assert_eq!(first.as_ref(), [0x33_u8; 512]);
-        assert_eq!(second.as_ref(), [0x22_u8; 512]);
-    }
-
-    /// The device address of the first descriptor of chain `token`, which
-    /// is where the request header was put.
-    fn header_address(device: &TestDevice, token: u16) -> u64 {
-        device.object().queues[0]
-            .queue
-            .try_lock()
-            .expect("a parked driver does not hold the queue lock")
-            .device_chain(token)[0]
-            .0
-    }
-
-    #[test]
-    fn the_header_and_the_status_travel_in_the_requests_own_slot() {
-        let device = device();
-        let request = header(ReqType::In, 0);
-        let mut read = pin!(device.read_block(0, data(&device, 512)));
-        assert!(block_on(poll_once(read.as_mut())).is_none());
-
-        let chain = device.object().queues[0]
-            .queue
-            .try_lock()
-            .expect("a parked driver does not hold the queue lock")
-            .device_chain(0);
-        assert_eq!(chain.len(), 3, "header, data, status");
-        let slots = &device.object().queues[0].slots;
-        for (address, _, _) in [chain[0], chain[2]] {
-            assert!(
-                slots.contains(address),
-                "descriptor at {address:#x} is outside the control slots"
-            );
-        }
-        assert_eq!(request_of(&device, 0)[..request.len()], request[..]);
-    }
-
-    #[test]
-    fn a_buffer_another_device_owns_is_refused_and_handed_back() {
-        // Memory the device cannot reach is refused before any
-        // descriptor is written. A buffer from another device's memory
-        // has the right type but not the right provenance, which is what
-        // a header in this future's frame would have had too.
-        let device = device();
-        let foreign = ConfinedDmaPool::new(4096).buffer(512);
-        let refused = block_on(device.read_block(0, foreign))
-            .err()
-            .expect("the device cannot reach the buffer");
-        assert_eq!(refused.error, IoError::DeviceFault);
-        assert!(
-            refused.buffers.is_some(),
-            "nothing was published, so the buffer comes straight back"
-        );
-    }
-
-    /// A read whose future is dropped while the device fills it: the
-    /// buffer stays the device's until the chain comes back, the late
-    /// reply lands in memory nobody reused, and the queue carries the
-    /// requests after it.
-    #[test]
-    fn a_dropped_request_keeps_its_buffer_until_the_device_completes_it() {
-        let device = device();
-        let pool = device.object().transport.pool().clone();
-        let abandoned = data(&device, 512);
-        let abandoned_bytes = (abandoned.device_address().get(), 512);
-        {
-            let mut read = pin!(device.read_block(0, abandoned));
-            assert!(block_on(poll_once(read.as_mut())).is_none());
-        }
-        let first_header = header_address(&device, 0);
-        let inflight = &device.object().queues[0].inflight;
-        assert!(
-            !inflight.is_idle(0),
-            "the chain is still with the device, so its slot stays held"
-        );
-        assert!(
-            !pool.is_released(abandoned_bytes.0, abandoned_bytes.1),
-            "the buffer of a dropped read is still the device's"
-        );
-
-        // A request submitted meanwhile gets a slot of its own.
-        let second_token = next_token(&device);
-        let mut read = pin!(device.read_block(1, data(&device, 512)));
-        assert!(block_on(poll_once(read.as_mut())).is_none());
-        assert_ne!(first_header, header_address(&device, second_token));
-
-        // The late answer to the dropped request lands in live memory,
-        // frees its identifier and its buffer, and leaves the live
-        // request alone.
-        let mut response = vec![0x11_u8; 512];
-        response.push(0);
-        {
-            let queue = device.object().queues[0]
-                .queue
-                .try_lock()
-                .expect("a parked driver does not hold the queue lock");
-            let written = pool.respond_into_live_memory(&queue, 0, &response);
-            queue.device_complete(0, written);
-        }
-        device.handle_interrupt();
-        assert!(block_on(poll_once(read.as_mut())).is_none());
-        assert!(inflight.is_idle(0));
-        assert!(
-            pool.is_released(abandoned_bytes.0, abandoned_bytes.1),
-            "the device's completion is what frees the dropped read's buffer"
-        );
-
-        let mut response = vec![0x22_u8; 512];
-        response.push(0);
-        complete(&device, second_token, &response);
-        assert_eq!(
-            read_back(block_on(poll_once(read.as_mut()))).as_ref(),
-            [0x22_u8; 512]
-        );
-
-        // The queue is not stalled: the next request goes through.
-        let third_token = next_token(&device);
-        let mut read = pin!(device.read_block(2, data(&device, 512)));
-        assert!(block_on(poll_once(read.as_mut())).is_none());
-        let mut response = vec![0x33_u8; 512];
-        response.push(0);
-        complete(&device, third_token, &response);
-        assert_eq!(
-            read_back(block_on(poll_once(read.as_mut()))).as_ref(),
-            [0x33_u8; 512]
-        );
-    }
-
-    #[test]
-    fn a_dropped_deallocation_is_dropped_whole_not_half_written() {
-        let device = device_with(BLK_F_DISCARD, |transport| {
-            transport.set_config_u32(CFG_MAX_DISCARD_SECTORS, 8);
-            transport.set_config_u32(CFG_MAX_DISCARD_SEG, 4);
-        });
-        {
-            let mut discard = pin!(device.discard(BlockRange::new(16, 12)));
-            assert!(block_on(poll_once(discard.as_mut())).is_none());
-        }
-        // The segment list is in the slot the device still owns, so the
-        // request is still intact on the wire after its future is gone.
-        let mut expected = header(ReqType::Discard, 0);
-        expected.extend_from_slice(&16_u64.to_le_bytes());
-        expected.extend_from_slice(&8_u32.to_le_bytes());
-        expected.extend_from_slice(&0_u32.to_le_bytes());
-        expected.extend_from_slice(&24_u64.to_le_bytes());
-        expected.extend_from_slice(&4_u32.to_le_bytes());
-        expected.extend_from_slice(&0_u32.to_le_bytes());
-        assert_eq!(request_of(&device, 0), expected);
-    }
-
-    #[test]
-    fn a_readonly_device_refuses_writes() {
-        let device = device_with(BLK_F_RO, |_| {});
-
-        assert_eq!(
-            outcome(Some(block_on(
-                device.write_block(0, payload(&device, 512, 0))
-            ))),
-            Some(Err(IoError::ReadOnly))
-        );
-    }
-
-    #[test]
-    fn multiqueue_programs_one_queue_per_processor() {
-        let transport = FakeTransport::new(FakeTransportConfig {
-            device_type: DeviceType::Block,
-            offered_features: VirtioFeatures::VERSION_1.bits() | BLK_F_MQ,
-            queue_size: 8,
-            supports_queue_reset: false,
-            absent_queues: &[],
-        });
-        transport.set_config_u32(CFG_CAPACITY_LOW, TEST_CAPACITY_SECTORS);
-        transport.set_config_u16(CFG_NUM_QUEUES, 8);
-
-        let device = VirtioBlockDevice::new(transport, FakeAffinity::<4>)
-            .expect("block device should initialize");
-
-        assert_eq!(
-            device.queue_count(),
-            4,
-            "a device with more queues than processors is programmed per processor"
-        );
-        let programmed = device.transport.programmed_queues();
-        assert_eq!(
-            programmed
-                .iter()
-                .map(|queue| queue.index)
-                .collect::<Vec<_>>(),
-            [0, 1, 2, 3]
-        );
-    }
-
-    #[test]
-    fn a_device_that_offers_a_deallocation_feature_without_limits_is_rejected() {
-        let transport = FakeTransport::new(FakeTransportConfig {
-            device_type: DeviceType::Block,
-            offered_features: VirtioFeatures::VERSION_1.bits() | BLK_F_DISCARD,
-            queue_size: 8,
-            supports_queue_reset: false,
-            absent_queues: &[],
-        });
-        transport.set_config_u32(CFG_CAPACITY_LOW, TEST_CAPACITY_SECTORS);
-
-        let rejected = VirtioBlockDevice::new(transport, FakeAffinity::<1>).err();
-        assert!(matches!(rejected, Some(IoError::InvalidDeviceConfig(_))));
-    }
-
-    #[test]
-    fn rejects_missing_rights() {
-        let error = validate_request(
-            BlockDeviceRights::READ,
-            test_geometry(),
-            0,
-            512,
-            BlockDeviceRights::WRITE,
-        )
-        .expect_err("write access without WRITE right must fail");
-
-        assert_eq!(error, IoError::PermissionDenied);
-    }
-
-    #[test]
-    fn rejects_invalid_buffer_length() {
-        let error = validate_request(
-            BlockDeviceRights::READ | BlockDeviceRights::WRITE,
-            test_geometry(),
-            0,
-            511,
-            BlockDeviceRights::READ,
-        )
-        .expect_err("request must reject invalid buffer length");
-
-        assert_eq!(
-            error,
-            IoError::InvalidBufferLength {
-                required_multiple: 512,
-                actual: 511,
-            }
-        );
-    }
-
-    #[test]
-    fn rejects_out_of_bounds_requests() {
-        let mut geometry = test_geometry();
-        geometry.capacity_blocks = 1;
-        let error = validate_request(
-            BlockDeviceRights::READ,
-            geometry,
-            1,
-            512,
-            BlockDeviceRights::READ,
-        )
-        .expect_err("out-of-bounds request must fail");
-
-        assert_eq!(error, IoError::OutOfBounds);
-    }
-
-    #[test]
-    fn accepts_well_formed_request() {
-        validate_request(
-            BlockDeviceRights::READ | BlockDeviceRights::WRITE,
-            test_geometry(),
-            2,
-            1024,
-            BlockDeviceRights::READ,
-        )
-        .expect("request should be accepted");
-    }
-
-    fn test_geometry() -> BlockGeometry {
-        BlockGeometry {
-            logical_block_bytes: SECTOR_SIZE,
-            physical_block_exp: 0,
-            min_io_blocks: 0,
-            opt_io_blocks: 0,
-            max_segments: 1,
-            max_segment_bytes: u32::MAX,
-            capacity_blocks: 8,
-        }
-    }
-
-    /// A block device backed by host memory, for the swap backend tests.
-    struct MemoryBlockDevice {
-        blocks: SpinMutex<Vec<u8>>,
-        block_size: usize,
-        flushes: AtomicU64,
-        fail_reads: bool,
-        /// Where the buffers a consumer allocates come from.
-        pool: ConfinedDmaPool,
-    }
-
-    impl MemoryBlockDevice {
-        fn new(block_size: usize, block_count: usize) -> Self {
-            Self {
-                blocks: SpinMutex::new(vec![0_u8; block_size * block_count]),
-                block_size,
-                flushes: AtomicU64::new(0),
-                fail_reads: false,
-                pool: ConfinedDmaPool::new(1 << 20),
-            }
-        }
-
-        fn failing_reads(block_size: usize, block_count: usize) -> Self {
-            Self {
-                fail_reads: true,
-                ..Self::new(block_size, block_count)
-            }
-        }
-
-        fn flushes(&self) -> u64 {
-            self.flushes.load(Ordering::Relaxed)
-        }
-    }
-
-    impl BlockDevice for MemoryBlockDevice {
-        type Buffer = ConfinedDmaBuffer;
-
-        fn buffer(&self, bytes: usize) -> IoResult<Self::Buffer> {
-            Ok(self.pool.buffer(bytes))
-        }
-
-        async fn read_block(
-            &self,
-            block_id: usize,
-            mut buf: Self::Buffer,
-        ) -> BufResult<(), Self::Buffer> {
-            if self.fail_reads {
-                return Err(BufError::returned(IoError::DeviceFault, buf));
-            }
-            let bytes = buf.as_mut_slice();
-            let offset = block_id * self.block_size;
-            bytes.copy_from_slice(&self.blocks.lock()[offset..offset + bytes.len()]);
-            Ok(((), buf))
-        }
-
-        async fn write_block(
-            &self,
-            block_id: usize,
-            buf: Self::Buffer,
-        ) -> BufResult<(), Self::Buffer> {
-            let bytes = buf.as_ref();
-            let offset = block_id * self.block_size;
-            self.blocks.lock()[offset..offset + bytes.len()].copy_from_slice(bytes);
-            Ok(((), buf))
-        }
-
-        async fn flush(&self) -> IoResult<()> {
-            self.flushes.fetch_add(1, Ordering::Relaxed);
-            Ok(())
-        }
-
-        async fn discard(&self, _range: BlockRange) -> IoResult<()> {
-            Err(IoError::Unsupported)
-        }
-
-        async fn write_zeroes(&self, _range: BlockRange) -> IoResult<()> {
-            Err(IoError::Unsupported)
-        }
-
-        async fn serial(&self) -> IoResult<BlockSerial> {
-            Err(IoError::Unsupported)
-        }
-
-        fn geometry(&self) -> BlockGeometry {
-            BlockGeometry {
-                logical_block_bytes: self.block_size,
-                physical_block_exp: 0,
-                min_io_blocks: 0,
-                opt_io_blocks: 0,
-                max_segments: 1,
-                max_segment_bytes: u32::MAX,
-                capacity_blocks: self.blocks.lock().len() / self.block_size,
-            }
-        }
-
-        fn capabilities(&self) -> BlockDeviceCapabilities {
-            BlockDeviceCapabilities::FLUSH
-        }
-
-        fn queue_topology(&self) -> BlockQueueTopology {
-            BlockQueueTopology {
-                queues: 1,
-                depth: 1,
-            }
-        }
-    }
-
-    #[test]
-    fn a_swapped_out_page_comes_back_unchanged_and_is_committed() {
-        let backend = VirtioBlockSwapBackend::from_entire_device(MemoryBlockDevice::new(512, 16))
-            .expect("swap backend should initialize");
-        // Deliberately not a whole number of blocks: the staging buffer
-        // is rounded up to the next one, and the page rides in its head.
-        let mut page = backend.buffer(1300).expect("staging buffer");
-        assert_eq!(page.as_ref().len(), 1536);
-        for (index, byte) in page.as_mut().iter_mut().enumerate() {
-            *byte = index as u8;
-        }
-
-        let expected = page.as_ref().to_vec();
-
-        let (token, _page) = block_on(backend.swap_out(page)).expect("swap-out should succeed");
-        assert_eq!(
-            backend.device.flushes(),
-            0,
-            "swap is scratch storage; a flush per evicted page buys durability nobody reads"
-        );
-
-        let restored = backend.buffer(1300).expect("staging buffer");
-        let ((), restored) =
-            block_on(backend.swap_in(token, restored)).expect("swap-in should succeed");
-        assert_eq!(restored.as_ref(), expected);
-    }
-
-    /// Swaps `bytes` bytes of `fill` out and returns the token.
-    fn swapped(
-        backend: &VirtioBlockSwapBackend<MemoryBlockDevice>,
-        bytes: usize,
-        fill: u8,
-    ) -> Result<VirtioBlockSwapToken, VirtioBlockSwapError> {
-        block_on(backend.swap_out(staged(backend, bytes, fill)))
-            .map(|(token, _page)| token)
-            .map_err(BufError::into_error)
-    }
-
-    /// Swaps `token` back into a fresh buffer of `bytes` bytes and returns
-    /// the bytes.
-    fn restored(
-        backend: &VirtioBlockSwapBackend<MemoryBlockDevice>,
-        token: VirtioBlockSwapToken,
-        bytes: usize,
-    ) -> Result<Vec<u8>, VirtioBlockSwapError> {
-        block_on(backend.swap_in(token, staged(backend, bytes, 0)))
-            .map(|((), page)| page.as_ref().to_vec())
-            .map_err(BufError::into_error)
-    }
-
-    /// A staging buffer of `bytes` bytes of `fill`.
-    fn staged(
-        backend: &VirtioBlockSwapBackend<MemoryBlockDevice>,
-        bytes: usize,
-        fill: u8,
-    ) -> ConfinedDmaBuffer {
-        let mut buffer = backend.buffer(bytes).expect("staging buffer");
-        buffer.as_mut().fill(fill);
-        buffer
-    }
-
-    #[test]
-    fn a_failed_swap_in_keeps_the_token_valid() {
-        let backend =
-            VirtioBlockSwapBackend::from_entire_device(MemoryBlockDevice::failing_reads(512, 4))
-                .expect("swap backend should initialize");
-        let token = swapped(&backend, 1024, 7).expect("swap-out should succeed");
-
-        let refused = block_on(backend.swap_in(token, staged(&backend, 1024, 0)))
-            .err()
-            .expect("the read fails");
-        assert_eq!(
-            refused.error,
-            VirtioBlockSwapError::Io(IoError::DeviceFault)
-        );
-        assert!(refused.buffers.is_some(), "the staging page comes back");
-        assert_eq!(
-            block_on(backend.state.lock()).available_blocks(),
-            2,
-            "the extent of a page that is still on the device must stay allocated"
-        );
-    }
-
-    #[test]
-    fn swap_extents_are_reused_and_coalesced() {
-        let backend = VirtioBlockSwapBackend::from_entire_device(MemoryBlockDevice::new(512, 8))
-            .expect("swap backend should initialize");
-
-        let first = swapped(&backend, 1024, 1).expect("first swap-out");
-        let second = swapped(&backend, 1024, 2).expect("second swap-out");
-        let third = swapped(&backend, 2048, 3).expect("third swap-out");
-        assert_eq!(block_on(backend.state.lock()).available_blocks(), 0);
-        assert_eq!(
-            swapped(&backend, 512, 4),
-            Err(VirtioBlockSwapError::OutOfSwap {
-                requested_blocks: 1,
-                available_blocks: 0,
-            })
-        );
-
-        restored(&backend, second, 1024).expect("swap-in of the middle extent");
-        restored(&backend, first, 1024).expect("swap-in of the first extent");
-        {
-            let state = block_on(backend.state.lock());
-            assert_eq!(state.available_blocks(), 4);
-            assert_eq!(
-                state.free.len(),
-                1,
-                "two adjacent freed extents are one free extent"
-            );
-        }
-
-        assert_eq!(
-            restored(&backend, third, 2048).expect("swap-in of the last extent"),
-            vec![3_u8; 2048]
-        );
-        let state = block_on(backend.state.lock());
-        assert_eq!(state.free.len(), 1);
-        assert_eq!(state.available_blocks(), 8);
-    }
-}
+mod tests;
