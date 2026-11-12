@@ -453,14 +453,11 @@ fn address_option(value: &[u8]) -> Option<Ipv4Address> {
 /// The addresses of an option that lists them, or `None` when its
 /// length is not a positive multiple of four.
 fn address_list_option(value: &[u8]) -> Option<impl Iterator<Item = Ipv4Address> + '_> {
-    if value.is_empty() || !value.len().is_multiple_of(4) {
+    let (addresses, rest) = value.as_chunks::<4>();
+    if addresses.is_empty() || !rest.is_empty() {
         return None;
     }
-    Some(
-        value
-            .chunks_exact(4)
-            .map(|chunk| Ipv4Address::new([chunk[0], chunk[1], chunk[2], chunk[3]])),
-    )
+    Some(addresses.iter().copied().map(Ipv4Address::new))
 }
 
 fn seconds_option(value: &[u8]) -> Option<u32> {

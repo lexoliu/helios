@@ -959,7 +959,7 @@ where
             "thread-spawn",
             |caller: Caller<'_, CompilerCoreStore<CpuImpl, Net, HostFs>>, start_arg: i32| -> i32 {
                 let store_data = caller.data().clone();
-                let next = store_data.shared.next_thread_id.fetch_update(
+                let next = store_data.shared.next_thread_id.try_update(
                     AtomicOrdering::Relaxed,
                     AtomicOrdering::Relaxed,
                     |value| (value <= 0x1fff_fffe).then_some(value + 1),
