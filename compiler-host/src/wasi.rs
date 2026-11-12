@@ -198,7 +198,7 @@ fn thread_spawn(caller: Caller<'_, PluginState>, start_arg: i32) -> wasmtime::Re
     let Ok(previous) =
         shared
             .next_thread_id
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 (value < MAX_THREAD_ID).then_some(value + 1)
             })
     else {

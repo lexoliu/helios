@@ -1024,6 +1024,12 @@ impl AuthorityDomain {
     /// They belong to no real filesystem, so they need a device id of their
     /// own for `st_dev` to stay distinct from bootfs and the host share.
     pub const GUEST_DEVICES: Self = Self(3);
+    /// Every namespace's private root layer: the writable tree each process
+    /// tree keeps over the boot image.
+    pub const GUEST_ROOT_LAYER: Self = Self(4);
+    /// The first id the mount table hands to a filesystem it mounts; every
+    /// later one counts up from here.
+    pub const FIRST_MOUNTED: Self = Self(5);
     const HOST_DEVICE_NAMESPACE: u64 = 1 << 63;
 
     pub const fn new(raw: u64) -> Self {
@@ -1163,7 +1169,7 @@ pub enum HostShareRestore {
     SessionLost,
 }
 
-pub trait HostFileSystem: Clone + Send + 'static {
+pub trait HostFileSystem: Clone + Send + Sync + 'static {
     /// How this filesystem's caches have been serving the kernel, or
     /// `None` from an implementation that caches nothing.
     fn cache_stats(&self) -> Option<crate::HostFsCacheStats>;
@@ -1284,14 +1290,6 @@ pub trait HostFileSystem: Clone + Send + 'static {
         &'a self,
         path: &'a str,
     ) -> impl Future<Output = Result<String, HostFsError>> + Send + 'a;
-}
-
-pub trait ComponentHostFilesystemState<Service>: Clone + Send + 'static
-where
-    Service: HostFileSystem,
-{
-    fn host_filesystem_service(&self) -> Option<Service>;
-    fn bootfs(&self) -> Option<crate::EmbeddedBootFs>;
 }
 
 #[cfg(test)]
