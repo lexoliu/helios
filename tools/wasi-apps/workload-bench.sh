@@ -191,6 +191,10 @@ if [[ -n "${HELIOS_WORKLOAD_BENCH_HOST_TCP_PORT:-}" ]]; then
     command+=(--host-tcp-port "${HELIOS_WORKLOAD_BENCH_HOST_TCP_PORT}")
 fi
 
+if [[ -n "${HELIOS_WORKLOAD_BENCH_HOST_TCP_UPLOAD_PORT:-}" ]]; then
+    command+=(--host-tcp-upload-port "${HELIOS_WORKLOAD_BENCH_HOST_TCP_UPLOAD_PORT}")
+fi
+
 # A workload runs inside the guest and is reported by an RPC that never
 # answers if the guest stops making progress, so the runner fails an
 # iteration that overruns rather than holding the lane. The inspector's
