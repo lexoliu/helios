@@ -1997,7 +1997,7 @@ where
         hint: AotCompileHint,
         profile: bool,
         phases: &mut CompilerPhaseTimestamps,
-    ) -> Result<Result<Vec<u8>, ProgramExecError>, ProgramExecError> {
+    ) -> CompilerCallOutcome {
         let target = env!("HELIOS_BUILD_TARGET").as_bytes();
         let wasm_ptr = allocations
             .alloc(&mut *store, &exports.alloc, wasm.len(), 1)
