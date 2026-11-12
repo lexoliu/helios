@@ -263,12 +263,17 @@ pub(crate) fn polled_command<T: VirtioTransport>(
             .pop_used_with_len()
             .map_err(PolledError::Queue)?;
         match popped {
-            Some((completed, written)) => {
-                assert_eq!(
-                    completed, token,
-                    "a polled command found a completion that is not its own"
-                );
-                break written;
+            Some((completed, written)) if completed == token => break written,
+            // Nothing else is in flight on a queue the caller owns
+            // exclusively, so completing any other chain breaks the
+            // used-ring contract. The device is untrusted, so that is a
+            // fault it is refused for, not a kernel panic, and the
+            // command may still be its own: the buffers are leaked as on
+            // expiry.
+            Some(_) => {
+                core::mem::forget(request);
+                core::mem::forget(response);
+                return Err(PolledError::Queue(IoError::DeviceFault));
             }
             None if expired() => {
                 core::mem::forget(request);
