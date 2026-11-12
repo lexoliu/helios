@@ -615,13 +615,17 @@ pub trait AddressSpace: Send + Sync + 'static {
 
     /// Detach the committed page at `addr` so its frame can be reused.
     ///
-    /// The page's bytes are copied into `out` (exactly one frame long,
-    /// caller-owned so the address space never hands a raw frame out),
-    /// the leaf entry becomes a not-present entry carrying `token`, and
-    /// the frame goes back to this address space's own pool. Per §3.4
-    /// the call invalidates the local TLB and shoots down every other
-    /// processor that has run in this space before it returns, so no
-    /// processor can still reach the frame afterwards.
+    /// The leaf entry becomes a not-present entry carrying `token`, the
+    /// local TLB is invalidated and every other processor that has run in
+    /// this space has acknowledged a shootdown (§3.5), and only then is
+    /// the page's frame read: its bytes are copied into `out` (exactly one
+    /// frame long, caller-owned so the address space never hands a raw
+    /// frame out) and the frame goes back to this address space's own
+    /// pool. Reading after the shootdown is what makes the copy complete:
+    /// a store from a processor that was still running in the space has
+    /// landed in the frame before the copy or faulted on the not-present
+    /// entry, and cannot land in a frame that has already been read. A
+    /// copy taken before the leaf is replaced loses such a store.
     ///
     /// The flags the page had are returned; [`Self::swap_in_page`]
     /// needs them to put the page back exactly as it was.
