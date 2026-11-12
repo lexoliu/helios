@@ -48,6 +48,18 @@
 //! back in. Both eviction phases below take that bar; the difference
 //! between them is how long the instance has to have been off.
 //!
+//! The bar holds at the moment of each detach, not at the moment a
+//! victim was picked. A pass picks its victims once and then awaits the
+//! device for every page, and any victim may begin a turn during one of
+//! those awaits. So the only way to a detach is
+//! [`SwapVmHooks::detach_page`], which takes the
+//! [`OffProcessor`] proof that
+//! [`InstanceRegistry::while_off_processor`] lends: the page's instance
+//! had no store on a processor when the hold was granted, and none can
+//! begin a turn until the detach — leaf, shootdown and copy — is done.
+//! A victim that is running when its next page comes up refuses the
+//! hold, and the pass leaves it.
+//!
 //! "On a processor" is a store's processor turn (`crate::StoreTurns`):
 //! the poll of the future that drives its guest, synchronous host calls
 //! included. A fiber stopped in the trampoline has suspended, so its
@@ -102,7 +114,7 @@ use thiserror::Error;
 
 use crate::exec::Spawner;
 use crate::exec::{PressureLevel, monotonic_nanos};
-use crate::instance::InstanceRegistry;
+use crate::instance::{InstanceId, InstanceRegistry, OffProcessor};
 use crate::{Notify, Timer};
 
 use super::owner::MemoryOwner;
@@ -219,7 +231,10 @@ pub struct SwapStats {
 /// it.
 pub struct SwapVmHooks {
     /// Detach one committed page, copying it into the caller's buffer.
-    pub swap_out_page: fn(VirtAddr, SwapToken, &mut [u8]) -> Result<PageFlags, AddressSpaceError>,
+    /// Reached only through [`Self::detach_page`], which asks for the
+    /// proof that the page's instance is off every processor.
+    pub(crate) swap_out_page:
+        fn(VirtAddr, SwapToken, &mut [u8]) -> Result<PageFlags, AddressSpaceError>,
     /// Reinstate one page, but only while its entry carries the given
     /// token. The address space allocates the frame and calls the fill
     /// with the caller's context on it before it takes its lock; see
@@ -241,6 +256,26 @@ pub struct SwapVmHooks {
     /// fault entry and the pre-fault accessor: neither holds a `Cpu`, and
     /// the handle they reach swap through cannot be generic over one.
     pub now_ticks: fn() -> u64,
+}
+
+impl SwapVmHooks {
+    /// Detach the committed page at `addr`, which belongs to the instance
+    /// `off` holds off every processor, leaving `token` in its entry and
+    /// its bytes in `out`.
+    ///
+    /// The proof is what keeps a page from leaving an instance that may
+    /// be inside a host call (see the module docs); every path that takes
+    /// a page out of memory, whatever it does with the bytes afterwards,
+    /// comes through here.
+    pub fn detach_page(
+        &self,
+        _off: &OffProcessor<'_>,
+        addr: VirtAddr,
+        token: SwapToken,
+        out: &mut [u8],
+    ) -> Result<PageFlags, AddressSpaceError> {
+        (self.swap_out_page)(addr, token, out)
+    }
 }
 
 /// What [`SwapVmHooks::scan_committed_pages`] calls for each page it
@@ -1030,27 +1065,21 @@ where
 
         let now = monotonic_nanos(&self.cpu);
         let idle_after = IDLE_SWAP_AFTER.as_nanos() as u64;
-        let mut candidates: Vec<MemoryOwner> = self
-            .registry
-            .idle_instances(now, idle_after)
-            .into_iter()
-            .map(|id| MemoryOwner::new(id.raw()))
-            .collect();
+        let mut candidates = self.registry.idle_instances(now, idle_after);
         // Largest resident first: one pass over the biggest idle
         // instance frees more than several passes over small ones, and
         // resident bytes come from the address space rather than from
         // what the instance thinks it grew to.
-        candidates.sort_by_key(|owner| {
-            core::cmp::Reverse((self.hooks.owned_resident_bytes)(owner.raw()))
-        });
+        candidates
+            .sort_by_key(|id| core::cmp::Reverse((self.hooks.owned_resident_bytes)(id.raw())));
 
         let mut moved = 0_usize;
-        for owner in &candidates {
+        for id in &candidates {
             if moved >= SWAP_BATCH_BYTES {
                 break;
             }
             moved += self
-                .evict_owner(*owner, SWAP_BATCH_BYTES - moved, EvictionAge::Any)
+                .evict_owner(*id, SWAP_BATCH_BYTES - moved, EvictionAge::Any)
                 .await;
         }
 
@@ -1078,16 +1107,14 @@ where
         // what keeps the kernel out of that corner, and it is why the
         // pre-fault accessor is a contract for kernel paths that hold
         // guest pointers rather than a thing every host call must do.
+        // The list below only nominates; each detach re-establishes the
+        // bar for itself (`evict_owner`).
         for id in self.registry.idle_instances(now, 0) {
             if moved >= SWAP_BATCH_BYTES {
                 break;
             }
             moved += self
-                .evict_owner(
-                    MemoryOwner::new(id.raw()),
-                    SWAP_BATCH_BYTES - moved,
-                    EvictionAge::ColdOnly,
-                )
+                .evict_owner(id, SWAP_BATCH_BYTES - moved, EvictionAge::ColdOnly)
                 .await;
         }
         tracing::debug!(
@@ -1097,9 +1124,26 @@ where
         );
     }
 
-    /// Swaps up to `budget` bytes of `owner`'s pages out, and reports
+    /// Swaps up to `budget` bytes of `instance`'s pages out, and reports
     /// how many bytes actually left memory.
-    async fn evict_owner(&mut self, owner: MemoryOwner, budget: usize, age: EvictionAge) -> usize {
+    ///
+    /// The plan is a scan taken once, and the instance was off every
+    /// processor when it was nominated; neither is true for long. Each
+    /// page is detached under a hold of its own
+    /// ([`InstanceRegistry::while_off_processor`]), taken after the
+    /// previous page's device write has landed, and the first refusal —
+    /// the instance began a turn, or is gone — ends the instance's part
+    /// of the pass. The hold covers the detach and nothing after it: the
+    /// device write runs with the page already out, and a turn that
+    /// begins then meets a swapped page the way it would after any
+    /// earlier pass.
+    async fn evict_owner(
+        &mut self,
+        instance: InstanceId,
+        budget: usize,
+        age: EvictionAge,
+    ) -> usize {
+        let owner = MemoryOwner::new(instance.raw());
         let mut plan = EvictionPlan {
             pages: Vec::new(),
             remaining: budget,
@@ -1126,7 +1170,7 @@ where
             if !self.handle.shared.faults.is_empty() {
                 break;
             }
-            match self.swap_out(addr).await {
+            match self.swap_out(instance, addr).await {
                 Ok(()) => moved += PhysFrame::SIZE,
                 Err(()) => break,
             }
@@ -1142,7 +1186,8 @@ where
         moved
     }
 
-    async fn swap_out(&mut self, addr: VirtAddr) -> Result<(), ()> {
+    /// Swaps out the page at `addr`, which belongs to `instance`.
+    async fn swap_out(&mut self, instance: InstanceId, addr: VirtAddr) -> Result<(), ()> {
         // The index has to exist before the page can be detached: the
         // page-table entry carries it, and the entry has to be in place
         // before the frame goes back to the pool.
@@ -1160,15 +1205,36 @@ where
         // buffer and hands the frame back, all under the address space's
         // own lock: a store from a processor that was still running the
         // instance has landed in the frame before the copy, or faulted.
-        if let Err(error) = (self.hooks.swap_out_page)(addr, handle, &mut self.page) {
-            tracing::debug!(
-                target: "helios_kernel::swap",
-                addr = addr.raw(),
-                ?error,
-                "page could not be detached for swap-out"
-            );
-            self.handle.shared.slots.free(claim);
-            return Err(());
+        // The hold around it keeps every store of the instance off every
+        // processor until it is done.
+        let hooks = self.hooks;
+        let page = &mut self.page;
+        let detached = self
+            .registry
+            .while_off_processor(instance, |off| hooks.detach_page(off, addr, handle, page));
+        match detached {
+            Ok(Ok(_flags)) => {}
+            Ok(Err(error)) => {
+                tracing::debug!(
+                    target: "helios_kernel::swap",
+                    addr = addr.raw(),
+                    ?error,
+                    "page could not be detached for swap-out"
+                );
+                self.handle.shared.slots.free(claim);
+                return Err(());
+            }
+            Err(refused) => {
+                tracing::debug!(
+                    target: "helios_kernel::swap",
+                    instance = instance.raw(),
+                    addr = addr.raw(),
+                    %refused,
+                    "instance cannot be held off the processors; leaving its pages"
+                );
+                self.handle.shared.slots.free(claim);
+                return Err(());
+            }
         }
         // From here the page is not present and its entry points at a
         // reserved slot. A guest faulting on it in this window queues a
