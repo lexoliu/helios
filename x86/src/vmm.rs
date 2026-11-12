@@ -73,6 +73,43 @@ const RETIRED: PageTableFlags = PageTableFlags::BIT_9;
 
 /// Owned x86 user address space. Built once at boot, accessed through
 /// `&'static`.
+///
+/// # Concurrency contract
+///
+/// `state` is the one lock that serialises every mutation of this
+/// address space's page-table structure, and the reservation records it
+/// guards. A path that can build an intermediate table (`commit`,
+/// `relocate`, `prepare_demand_commit` and `ensure_accessible_subranges`,
+/// through `OffsetPageTable::map_to` or `ensure_table`), or rewrite a
+/// leaf of a committed range (`protect`, `relocate`,
+/// `substitute_memory`, `restore`, `withdraw`,
+/// `ensure_accessible_subranges`, `decommit_committed_subranges`),
+/// takes `state` before its first check and holds it through its last
+/// table access and the matching tracker record; no helper it calls
+/// takes `state` again. The shape is "build under the lock", not
+/// "publish by compare-exchange": the lock already orders the tracker
+/// against the tables, so the check, the walk and the record are one
+/// critical section and there is no loser table to free, and the next
+/// holder of `state` sees tables and tracker agree.
+///
+/// `state` is a plain spin lock taken from task context with interrupts
+/// enabled and never from an interrupt or trap handler, so a processor
+/// spinning on it still acknowledges TLB shootdowns. Holding it across
+/// a shootdown is the existing order (`state` then the broadcast lock).
+/// Nothing awaits or blocks while holding it: the frame and table
+/// allocations under it take the user pool's and the kernel heap's
+/// interrupt-masking locks, which nothing holds across `state`.
+///
+/// Not under `state`: `commit_demand_page`, `leaf_entry` and the walk
+/// `translate` makes after its tracker lookup walk tables lock-free,
+/// which is sound because no intermediate table is freed while the
+/// address space lives, and the one leaf `commit_demand_page` writes
+/// belongs to a prepared demand-commit region only its fiber faults on;
+/// `allocate_run` and `free_run`, which change no translation; and the
+/// leaf clearing `decommit`, `release` and `end_demand_commit` do
+/// through `unmap_range`, `unmap_demand_pages` and
+/// `drop_substituted_leaves` after taking the range out of the tracker,
+/// which never touches an intermediate entry.
 pub struct X86UserAddressSpace {
     physical_memory_offset: usize,
     processor_count: usize,
@@ -304,11 +341,12 @@ impl X86UserAddressSpace {
     /// The table `table[index]` points at, building it when the entry
     /// is unused.
     ///
-    /// The caller holds the reservation lock, so no other processor is
-    /// editing this walk. Intermediate entries are present and writable
-    /// and never carry `NO_EXECUTE`: the permission that matters is the
-    /// leaf's, and clearing execute on a parent would take it away from
-    /// every mapping below it, compiled code included.
+    /// The caller holds `state` (see the type's concurrency contract),
+    /// so no other processor is editing this walk. Intermediate entries
+    /// are present and writable and never carry `NO_EXECUTE`: the
+    /// permission that matters is the leaf's, and clearing execute on a
+    /// parent would take it away from every mapping below it, compiled
+    /// code included.
     fn ensure_table(
         &self,
         table: *mut PageTable,
@@ -715,7 +753,10 @@ impl AddressSpace for X86UserAddressSpace {
         validate_range(virt)?;
         let pt_flags = page_flags_to_pt(flags)?;
 
-        self.state.lock().precheck_commit(virt)?;
+        // One critical section from precheck to record: two commits
+        // that share a missing intermediate table cannot both build it.
+        let mut state = self.state.lock();
+        state.precheck_commit(virt)?;
 
         let mut mapper = unsafe { smp::current_mapper(self.physical_memory_offset) };
         let mut frame_allocator = DirectMappedFrameAllocator {
@@ -723,9 +764,9 @@ impl AddressSpace for X86UserAddressSpace {
         };
         self.map_pages(&mut mapper, &mut frame_allocator, virt, pt_flags)?;
 
-        self.state
-            .lock()
-            .record_commit(virt, flags, MemoryOwner::NONE)?;
+        let orphaned = state.record_commit(virt, flags, MemoryOwner::NONE)?;
+        // This backend has no swap, see `ensure_accessible_subranges`.
+        debug_assert!(orphaned.is_empty());
         Ok(())
     }
 
@@ -883,11 +924,15 @@ impl AddressSpace for X86UserAddressSpace {
         self.assert_smp_safe();
         validate_range(virt)?;
         let pt_flags = page_flags_to_pt(flags)?;
-        self.state.lock().ensure_committed(virt)?;
+        // The check, the leaf rewrite and the record are one critical
+        // section, as in `ensure_accessible_subranges`: a concurrent
+        // decommit or commit of the range cannot slip between them.
+        let mut state = self.state.lock();
+        state.ensure_committed(virt)?;
         let mut mapper = unsafe { smp::current_mapper(self.physical_memory_offset) };
         self.protect_pages(&mut mapper, virt, pt_flags)?;
         self.shootdown_range(virt);
-        self.state.lock().record_protect(virt, flags)?;
+        state.record_protect(virt, flags)?;
         Ok(())
     }
 
@@ -1004,12 +1049,12 @@ impl AddressSpace for X86UserAddressSpace {
     fn relocate(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
         self.assert_smp_safe();
         validate_range(virt)?;
-        {
-            let state = self.state.lock();
-            state.ensure_committed(virt)?;
-            // A substitution has no pool frames to copy and free.
-            state.ensure_unsubstituted(virt)?;
-        }
+        // Held through the remap: `remap_page` unmaps and re-maps leaves
+        // of a committed range and `map_to` may build a table.
+        let state = self.state.lock();
+        state.ensure_committed(virt)?;
+        // A substitution has no pool frames to copy and free.
+        state.ensure_unsubstituted(virt)?;
 
         let mut mapper = unsafe { smp::current_mapper(self.physical_memory_offset) };
         let mut frame_allocator = DirectMappedFrameAllocator {
