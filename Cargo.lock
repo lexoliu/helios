@@ -1312,7 +1312,7 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 [[package]]
 name = "erofs-rs"
 version = "0.3.0"
-source = "git+https://github.com/lexoliu/erofs-rs?branch=no-std-bare-metal#10e1da3a66e2dab27f164f8fcb20a15603a1dc33"
+source = "git+https://github.com/lexoliu/erofs-rs?branch=no-std-bare-metal#e9b6461051e080c531a567f7be70a3e4d2fd91d1"
 dependencies = [
  "binrw",
  "bitflags 2.13.1",
