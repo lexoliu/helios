@@ -209,10 +209,12 @@ one implementation of — and the kernel holds the device through
 consumes the device's `VIRTIO_GPU_EVENT_DISPLAY` announcements and reads
 the new topology back. The renderer half is a second trait of the same
 kind — `hal::display::Gpu3d`, naming capability sets, contexts, blobs,
-opaque submissions and per-context fences — and the kernel holds it
-through `install_gpu3d_device` (`kernel/src/gpu/owner.rs`), which serves
-the `helios:system/gpu` contract from a claim at most one instance may
-hold. An announcement nobody collects stays latched and
+opaque submissions and fences per context and ring — and the kernel
+holds it through `install_gpu3d_device` (`kernel/src/gpu/owner.rs`),
+which serves the `helios:system/gpu` contract to every instance holding
+the GPU class at once: each opens a session of its own, bounded in
+contexts and blobs, and an instance's death releases exactly what its
+session made. An announcement nobody collects stays latched and
 the next change raises no interrupt at all, which is why the kernel owns
 the device from bring-up.
 
@@ -236,9 +238,15 @@ A renderer is a host property, not a guest one. `helios-inspector vm`
 attaches the plain 2D device unless a session asks for one with
 `--renderer virtio-gpu-gl` (Venus through virglrenderer) or
 `--renderer virtio-gpu-rutabaga` (Venus and gfxstream through
-rutabaga-gfx); both come with `blob=on` and a `hostmem` aperture, and a
-host QEMU that lacks the renderer fails with QEMU's own message rather
-than a substitute device. Venus needs a QEMU ≥ 9.2 built
+rutabaga-gfx); both come with `blob=on` and a `hostmem` aperture of
+`--renderer-hostmem` bytes (256M unless named), and a host QEMU that
+lacks the renderer fails with QEMU's own message rather than a
+substitute device. A renderer session's guest RAM is a shared
+`memory-backend-memfd` of `--memory` bytes, because QEMU builds a guest
+blob's dmabuf from the RAM block's file descriptor; memfd makes it a
+Linux-host session. `gpu-test --expect-renderer` is the guest side of
+such a boot: it fails where the smoke lane's 2D boot prints
+`gpu-test:3d=none`. Venus needs a QEMU ≥ 9.2 built
 `--enable-virglrenderer`, a virglrenderer built with Venus support, and
 a host Vulkan driver — lavapipe serves a headless runner.
 
