@@ -239,27 +239,27 @@ impl AsRef<[u8]> for RxFrame {
     }
 }
 
-/// What one immediate receive drain came to: the frames it wrote into
-/// the caller's slice, and the refusal it stopped on.
+/// What one immediate receive drain came to: the frames it handed to
+/// the caller's sink, and the refusal it stopped on.
 ///
 /// Both halves travel together because a drain that stops partway has
-/// already taken its frames off the device, and a completed receive
-/// buffer cannot be put back. Reporting the error on its own therefore
-/// loses every frame the drain had already taken — one malformed frame
-/// costs the whole batch in front of it, and the peer retransmits data
-/// the guest did in fact receive. So the caller delivers `received`
-/// frames first and handles `refusal` afterwards.
+/// already delivered the frames in front of the refusal, and a
+/// completed receive buffer cannot be put back. Reporting the error on
+/// its own would leave the caller unable to account for those frames —
+/// they reached the stack, and its counters and receive budget have to
+/// say so. So the caller counts `received` first and handles `refusal`
+/// afterwards.
 #[derive(Debug)]
 pub struct RxDrain {
-    /// Frames written into the front of the caller's slice. They belong
-    /// to the caller whether or not the drain went on to be refused.
+    /// Frames the drain handed to the sink. They were delivered whether
+    /// or not the drain went on to be refused.
     pub received: usize,
     /// The error the drain stopped on, if it stopped on one.
     pub refusal: Option<helios_hal::io::IoError>,
 }
 
 impl RxDrain {
-    /// A drain that ran to the end of the caller's slice or to the end
+    /// A drain that ran to the end of the caller's budget or to the end
     /// of what the device had ready.
     pub const fn completed(received: usize) -> Self {
         Self {
@@ -617,55 +617,43 @@ pub trait NetworkInterface: Clone + Send + Sync + 'static {
         }
     }
 
-    /// Attempts to receive one frame into caller-owned storage.
-    fn try_receive<'a>(
-        &'a self,
-        buffer: &'a mut PacketBuffer,
-    ) -> impl Future<Output = IoResult<bool>> + Send + 'a;
-
-    /// Attempts to receive one frame as an owning device buffer.
-    fn try_receive_frame(&self) -> impl Future<Output = IoResult<Option<RxFrame>>> + Send;
-
-    /// Attempts to receive owning device buffers from one RX queue pair
-    /// without waiting for any async lock or event.
+    /// Drains up to `budget` frames from one RX queue pair without
+    /// waiting for any lock or event, handing each one to `sink` while
+    /// the pair is still held.
+    ///
+    /// This is the interface's only receive path. A frame goes from the
+    /// ring to `sink` and from `sink` back to the device inside one
+    /// hold of the pair, so no frame is ever off the ring and
+    /// undelivered outside the pair's holder: two processors draining
+    /// one pair cannot hand its frames on in an order the ring never
+    /// had. The frame is lent, not given — the buffer under it is the
+    /// driver's, on loan for this one pass, and goes back to the device
+    /// before the pair is released. A sink that needs the bytes later
+    /// copies them.
+    ///
+    /// `sink` runs with the pair held, so it may take locks that rank
+    /// below the pair (a shard's) and must never wait for the pair
+    /// itself.
     ///
     /// One pair, not all of them: the caller sweeps the pairs itself so
     /// it can start at the one its own processor owns and skip a pair
-    /// somebody else is already draining. `None` means this pair could
-    /// not be entered without waiting.
+    /// somebody else is already draining. `None` means another
+    /// processor holds this pair; that holder is delivering its frames,
+    /// and when it lets go with completions still on the ring it wakes
+    /// the pair's waiters, so a caller turned away here parks rather
+    /// than retries.
     ///
-    /// A device error does not discard the drain. It arrives in the
-    /// [`RxDrain`] beside the frames the drain had already written, so
-    /// the caller delivers those before it reports the refusal.
-    fn try_receive_frames_immediate_on<'a, 'slots>(
-        &'a self,
+    /// A device error ends the drain, but every frame taken before it
+    /// has already been through `sink`; [`RxDrain::received`] counts
+    /// them and [`RxDrain::refusal`] carries the error.
+    fn try_receive_frames_immediate_on<Sink>(
+        &self,
         queue_idx: usize,
-        frames: &'slots mut [Option<RxFrame>],
+        budget: usize,
+        sink: Sink,
     ) -> Option<RxDrain>
     where
-        'a: 'slots,
-    {
-        let _ = (queue_idx, frames);
-        None
-    }
-
-    /// Releases an owning device RX frame back to the interface.
-    fn repost_rx_frame<'a>(
-        &'a self,
-        frame: RxFrame,
-    ) -> impl Future<Output = IoResult<()>> + Send + 'a;
-
-    /// Releases owning device RX frames without waiting for any async lock or event.
-    fn repost_rx_frames_immediate<'a, 'slots>(
-        &'a self,
-        frames: &'slots mut [Option<RxFrame>],
-    ) -> IoResult<Option<()>>
-    where
-        'a: 'slots,
-    {
-        let _ = frames;
-        Ok(None)
-    }
+        Sink: FnMut(&RxFrame);
 
     /// Whether the interface currently has carrier.
     ///
@@ -761,27 +749,6 @@ pub trait NetworkInterface: Clone + Send + Sync + 'static {
     fn rx_pool_free(&self, queue_idx: usize) -> u32 {
         let _ = queue_idx;
         0
-    }
-}
-
-/// Batch-oriented optional fast path for interfaces with queue-level access.
-pub trait NetworkInterfaceBatch: NetworkInterface {
-    /// Receives into caller-owned packet buffers without allocating.
-    fn receive_batch<'a>(
-        &'a self,
-        frames: &'a mut [PacketBuffer],
-    ) -> impl Future<Output = IoResult<usize>> + Send + 'a {
-        async move {
-            let mut received = 0;
-            for frame in frames {
-                frame.clear();
-                if !self.try_receive(frame).await? {
-                    break;
-                }
-                received += 1;
-            }
-            Ok(received)
-        }
     }
 }
 

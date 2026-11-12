@@ -119,8 +119,8 @@ pub use gpu::{
 pub use helios_hal::Platform;
 pub use helios_netstack::{
     ChecksumOffload, DEFAULT_POLL_BUDGET, EventDeliveryCapabilities, InterfaceCapabilities,
-    InterfaceEventMark, LinkState, NetworkInterface as NetworkDevice, PacketBuffer, RxDrain,
-    RxFrame, RxFrameOffload, SegmentationOffload, TxFrameRef,
+    InterfaceEventMark, LinkState, NetworkInterface as NetworkDevice, RxDrain, RxFrame,
+    RxFrameOffload, SegmentationOffload, TxFrameRef,
 };
 pub use host_fs::{
     HOST_SHARE_GUEST_MOUNT_PATH, HOST_SHARE_MOUNT_TAG, HostFsCacheStats, HostFsClient,
