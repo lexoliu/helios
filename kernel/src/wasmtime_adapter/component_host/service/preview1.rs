@@ -2132,7 +2132,11 @@ where
             let descriptor = descriptor.clone();
             let offset = *offset;
             let namespace = p1_namespace(caller);
-            let bytes = match wasi_fs::read(&namespace, &descriptor, offset, capacity).await {
+            let file = match p1_grant(&descriptor) {
+                Ok(file) => file,
+                Err(errno) => return errno,
+            };
+            let bytes = match wasi_fs::read(&namespace, file, offset, capacity).await {
                 Ok(bytes) => bytes,
                 Err(error) => return p1_errno_from_fs(error),
             };
@@ -2436,7 +2440,11 @@ where
     let descriptor = descriptor.clone();
     let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
-    wasi_fs::set_size(&namespace, &descriptor, size, now_nanos)
+    let file = match p1_grant(&descriptor) {
+        Ok(file) => file,
+        Err(errno) => return errno,
+    };
+    wasi_fs::set_size(&namespace, file, size, now_nanos)
         .await
         .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
@@ -2539,7 +2547,11 @@ where
         return p1::errno::SUCCESS;
     }
     let now_nanos = caller.data().now_nanos();
-    wasi_fs::set_size(&namespace, &descriptor, end, now_nanos)
+    let file = match p1_grant(&descriptor) {
+        Ok(file) => file,
+        Err(errno) => return errno,
+    };
+    wasi_fs::set_size(&namespace, file, end, now_nanos)
         .await
         .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
@@ -2621,7 +2633,11 @@ where
     };
     let descriptor = descriptor.clone();
     let namespace = p1_namespace(caller);
-    let bytes = match wasi_fs::read(&namespace, &descriptor, offset, layout.byte_len).await {
+    let file = match p1_grant(&descriptor) {
+        Ok(file) => file,
+        Err(errno) => return errno,
+    };
+    let bytes = match wasi_fs::read(&namespace, file, offset, layout.byte_len).await {
         Ok(bytes) => bytes,
         Err(error) => return p1_errno_from_fs(error),
     };
@@ -2699,7 +2715,8 @@ where
     let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
     let end = {
-        let file = wasi_fs::writable_file(&namespace, &descriptor).map_err(p1_errno_from_fs)?;
+        let file =
+            wasi_fs::writable_file(&namespace, p1_grant(&descriptor)?).map_err(p1_errno_from_fs)?;
         wasi_fs::write_resolved_with(&file, position, layout.byte_len, now_nanos, |destination| {
             p1_gather_into(memory, &ranges, destination)
         })
@@ -3093,7 +3110,11 @@ where
     };
     let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
-    wasi_fs::create_directory_at(&namespace, &base, &path, now_nanos)
+    let granted = match p1_grant(&base) {
+        Ok(granted) => granted,
+        Err(errno) => return errno,
+    };
+    wasi_fs::create_directory_at(&namespace, granted, &path, now_nanos)
         .await
         .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
@@ -3219,11 +3240,15 @@ where
         };
     let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
+    let destination = match p1_grant(&destination_base) {
+        Ok(destination) => destination,
+        Err(errno) => return errno,
+    };
     wasi_fs::link_at(
         &namespace,
         &source_base,
         &old_path,
-        &destination_base,
+        destination,
         &new_path,
         now_nanos,
     )
@@ -3301,7 +3326,11 @@ where
         Err(errno) => return errno,
     };
     let namespace = p1_namespace(caller);
-    wasi_fs::remove_directory_at(&namespace, &base, &path)
+    let granted = match p1_grant(&base) {
+        Ok(granted) => granted,
+        Err(errno) => return errno,
+    };
+    wasi_fs::remove_directory_at(&namespace, granted, &path)
         .await
         .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
@@ -3344,11 +3373,15 @@ where
         };
     let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
+    let (source, destination) = match (p1_grant(&source_base), p1_grant(&destination_base)) {
+        (Ok(source), Ok(destination)) => (source, destination),
+        (Err(errno), _) | (_, Err(errno)) => return errno,
+    };
     wasi_fs::rename_at(
         &namespace,
-        &source_base,
+        source,
         &old_path,
-        &destination_base,
+        destination,
         &new_path,
         now_nanos,
     )
@@ -3391,7 +3424,11 @@ where
     };
     let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
-    wasi_fs::symlink_at(&namespace, &base, &target, &new_path, now_nanos)
+    let granted = match p1_grant(&base) {
+        Ok(granted) => granted,
+        Err(errno) => return errno,
+    };
+    wasi_fs::symlink_at(&namespace, granted, &target, &new_path, now_nanos)
         .await
         .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
@@ -3419,7 +3456,11 @@ where
         Err(errno) => return errno,
     };
     let namespace = p1_namespace(caller);
-    wasi_fs::unlink_file_at(&namespace, &base, &path)
+    let granted = match p1_grant(&base) {
+        Ok(granted) => granted,
+        Err(errno) => return errno,
+    };
+    wasi_fs::unlink_file_at(&namespace, granted, &path)
         .await
         .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
@@ -4439,7 +4480,7 @@ where
             let descriptor = descriptor.clone();
             let offset = *offset;
             let namespace = p1_namespace(caller);
-            let bytes = wasi_fs::read(&namespace, &descriptor, offset, capacity)
+            let bytes = wasi_fs::read(&namespace, p1_grant(&descriptor)?, offset, capacity)
                 .await
                 .map_err(p1_errno_from_fs)?;
             p1_set_file_offset(caller, fd, offset.saturating_add(bytes.len() as u64));
@@ -4600,6 +4641,14 @@ pub(super) fn p1_errno_from_component_path(error: crate::ComponentFsPathError) -
     }
 }
 
+/// The proof an operation demands of `descriptor`, or the errno that
+/// refuses it.
+pub(super) fn p1_grant<K: wasi_fs::Kind, R: wasi_fs::Right>(
+    descriptor: &FsDescriptor,
+) -> Result<wasi_fs::Granted<'_, K, R>, i32> {
+    descriptor.grant().map_err(p1_errno_from_fs)
+}
+
 pub(super) fn p1_errno_from_fs(error: fs_types::ErrorCode) -> i32 {
     match error {
         fs_types::ErrorCode::Access => p1::errno::ACCES,
@@ -4718,7 +4767,7 @@ mod tests {
         .expect("the owner creates the file");
         block_on(wasi_fs::write(
             &namespace,
-            &file,
+            file.grant().expect("the owner may write the file"),
             helios_hal::fs::WritePosition::At(0),
             "日本語 한국어".as_bytes(),
             2,
@@ -4740,8 +4789,13 @@ mod tests {
                 3,
             ));
             assert!(matches!(opened, Err(fs_types::ErrorCode::ReadOnly)));
-            let contents =
-                block_on(wasi_fs::read(&namespace, &file, 0, 64)).expect("the owner reads back");
+            let contents = block_on(wasi_fs::read(
+                &namespace,
+                file.grant().expect("the owner may read the file"),
+                0,
+                64,
+            ))
+            .expect("the owner reads back");
             assert_eq!(contents.as_ref(), "日本語 한국어".as_bytes());
         }
     }

@@ -453,16 +453,30 @@ where
         super::descriptor_in(self, resource).map_err(error_code_from_p3)
     }
 
-    /// A file stream's target: `resource` must name a regular file opened
-    /// with `right`.
-    fn p2_stream_target(
+    /// A file read stream's target: `resource` must name a regular file
+    /// opened with `read`.
+    fn p2_read_stream_target(
         &mut self,
         resource: &Resource<FsDescriptor>,
-        right: p3fs::DescriptorFlags,
-        refused: p3fs::ErrorCode,
     ) -> core::result::Result<HeldPath<HostFs>, p2fs::ErrorCode> {
         let (descriptor, namespace) = self.p2_descriptor(resource)?;
-        super::stream_target(&namespace, &descriptor, right, refused).map_err(error_code_from_p3)
+        descriptor
+            .grant()
+            .and_then(|file| super::read_stream_target(&namespace, file))
+            .map_err(error_code_from_p3)
+    }
+
+    /// A file write stream's target: `resource` must name a regular file
+    /// opened with `write`.
+    fn p2_write_stream_target(
+        &mut self,
+        resource: &Resource<FsDescriptor>,
+    ) -> core::result::Result<HeldPath<HostFs>, p2fs::ErrorCode> {
+        let (descriptor, namespace) = self.p2_descriptor(resource)?;
+        descriptor
+            .grant()
+            .and_then(|file| super::write_stream_target(&namespace, file))
+            .map_err(error_code_from_p3)
     }
 
     fn p2_output_stream(
@@ -470,11 +484,7 @@ where
         resource: &Resource<FsDescriptor>,
         mode: WritePosition,
     ) -> Result<core::result::Result<Resource<DynOutputStream>, p2fs::ErrorCode>> {
-        let file = match self.p2_stream_target(
-            resource,
-            p3fs::DescriptorFlags::WRITE,
-            p3fs::ErrorCode::NotPermitted,
-        ) {
+        let file = match self.p2_write_stream_target(resource) {
             Ok(file) => file,
             Err(error) => return Ok(Err(error)),
         };
@@ -1174,11 +1184,7 @@ where
         descriptor: Resource<FsDescriptor>,
         offset: u64,
     ) -> Result<core::result::Result<Resource<DynInputStream>, p2fs::ErrorCode>> {
-        let file = match self.p2_stream_target(
-            &descriptor,
-            p3fs::DescriptorFlags::READ,
-            p3fs::ErrorCode::NotPermitted,
-        ) {
+        let file = match self.p2_read_stream_target(&descriptor) {
             Ok(file) => file,
             Err(error) => return Ok(Err(error)),
         };
@@ -1252,9 +1258,14 @@ where
         let now = self.now_nanos();
         Ok(async {
             let (descriptor, namespace) = target?;
-            super::set_size(&namespace, &descriptor, size, now)
-                .await
-                .map_err(error_code_from_p3)
+            super::set_size(
+                &namespace,
+                descriptor.grant().map_err(error_code_from_p3)?,
+                size,
+                now,
+            )
+            .await
+            .map_err(error_code_from_p3)
         }
         .await)
     }
@@ -1289,7 +1300,8 @@ where
         Ok(async {
             let (descriptor, namespace) = target?;
             let length = usize::try_from(length).map_err(|_| p2fs::ErrorCode::Overflow)?;
-            let bytes = super::read(&namespace, &descriptor, offset, length)
+            let file = descriptor.grant().map_err(error_code_from_p3)?;
+            let bytes = super::read(&namespace, file, offset, length)
                 .await
                 .map_err(error_code_from_p3)?;
             let end_of_file = bytes.len() < length;
@@ -1310,7 +1322,7 @@ where
             let (descriptor, namespace) = target?;
             super::write(
                 &namespace,
-                &descriptor,
+                descriptor.grant().map_err(error_code_from_p3)?,
                 WritePosition::At(offset),
                 &buffer,
                 now,
@@ -1366,9 +1378,14 @@ where
         let now = self.now_nanos();
         Ok(async {
             let (base, namespace) = target?;
-            super::create_directory_at(&namespace, &base, &path, now)
-                .await
-                .map_err(error_code_from_p3)
+            super::create_directory_at(
+                &namespace,
+                base.grant().map_err(error_code_from_p3)?,
+                &path,
+                now,
+            )
+            .await
+            .map_err(error_code_from_p3)
         }
         .await)
     }
@@ -1457,7 +1474,7 @@ where
                 &namespace,
                 &source_base,
                 &source_path,
-                &destination_base,
+                destination_base.grant().map_err(error_code_from_p3)?,
                 &destination_path,
                 now,
             )
@@ -1524,7 +1541,7 @@ where
         let target = self.p2_descriptor(&descriptor);
         Ok(async {
             let (base, namespace) = target?;
-            super::remove_directory_at(&namespace, &base, &path)
+            super::remove_directory_at(&namespace, base.grant().map_err(error_code_from_p3)?, &path)
                 .await
                 .map_err(error_code_from_p3)
         }
@@ -1545,9 +1562,9 @@ where
             let (source_base, destination_base, namespace) = target?;
             super::rename_at(
                 &namespace,
-                &source_base,
+                source_base.grant().map_err(error_code_from_p3)?,
                 &source_path,
-                &destination_base,
+                destination_base.grant().map_err(error_code_from_p3)?,
                 &destination_path,
                 now,
             )
@@ -1574,9 +1591,15 @@ where
         let now = self.now_nanos();
         Ok(async {
             let (base, namespace) = target?;
-            super::symlink_at(&namespace, &base, &old_path, &new_path, now)
-                .await
-                .map_err(error_code_from_p3)
+            super::symlink_at(
+                &namespace,
+                base.grant().map_err(error_code_from_p3)?,
+                &old_path,
+                &new_path,
+                now,
+            )
+            .await
+            .map_err(error_code_from_p3)
         }
         .await)
     }
@@ -1589,7 +1612,7 @@ where
         let target = self.p2_descriptor(&descriptor);
         Ok(async {
             let (base, namespace) = target?;
-            super::unlink_file_at(&namespace, &base, &path)
+            super::unlink_file_at(&namespace, base.grant().map_err(error_code_from_p3)?, &path)
                 .await
                 .map_err(error_code_from_p3)
         }
@@ -3436,7 +3459,7 @@ mod tests {
 
         let written = block_on(crate::wasmtime_adapter::wasi::read(
             store.filesystem(),
-            &descriptor,
+            descriptor.grant().expect("the file was opened for reading"),
             0,
             64,
         ))

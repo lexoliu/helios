@@ -181,31 +181,6 @@ fn require_directory(base: &FsDescriptor) -> FsOpResult<()> {
     Ok(())
 }
 
-fn require_mutate_directory(base: &FsDescriptor) -> FsOpResult<()> {
-    if !base
-        .flags
-        .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
-    {
-        return Err(fs_types::ErrorCode::ReadOnly);
-    }
-    Ok(())
-}
-
-/// Checks that `descriptor` is a regular file opened with `right`.
-fn require_file(
-    descriptor: &FsDescriptor,
-    right: fs_types::DescriptorFlags,
-    refused: fs_types::ErrorCode,
-) -> FsOpResult<()> {
-    if descriptor.kind != FsNodeKind::File {
-        return Err(fs_types::ErrorCode::IsDirectory);
-    }
-    if !descriptor.flags.contains(right) {
-        return Err(refused);
-    }
-    Ok(())
-}
-
 /// Opens `path` below `base` as WASI `open-at` does.
 ///
 /// A descriptor may be opened with any rights `base` holds, whatever the
@@ -256,18 +231,8 @@ where
                 if existing.kind != NodeKind::File {
                     return Err(fs_types::ErrorCode::IsDirectory);
                 }
-                require_mutate_directory(base)?;
-                validate_descriptor_flags_within_base(
-                    base.flags,
-                    fs_types::DescriptorFlags::WRITE,
-                )?;
-                let truncated = resolved
-                    .writable()
-                    .map_err(fs_error_code)?
-                    .open(resolved.path(), OpenFlags::TRUNCATE, now)
-                    .await
-                    .map_err(fs_error_code)?;
-                (truncated, flags)
+                let rights = (base.grant()?, base.grant()?);
+                (truncate_file(&resolved, rights, now).await?, flags)
             }
         }
         Err(VfsError::NoEntry) => {
@@ -277,15 +242,9 @@ where
             if open_flags.contains(fs_types::OpenFlags::DIRECTORY) {
                 return Err(fs_types::ErrorCode::Unsupported);
             }
-            require_mutate_directory(base)?;
+            let mutate = base.grant()?;
             let flags = effective_open_descriptor_flags(base.flags, requested, FsNodeKind::File)?;
-            let created = resolved
-                .writable()
-                .map_err(fs_error_code)?
-                .open(resolved.path(), OpenFlags::CREATE, now)
-                .await
-                .map_err(fs_error_code)?;
-            (created, flags)
+            (create_file(&resolved, mutate, now).await?, flags)
         }
         Err(error) => return Err(fs_error_code(error)),
     };
@@ -297,6 +256,45 @@ where
         identity: Some(object_identity(&metadata)),
         mount: resolved.hold(),
     })
+}
+
+/// Creates the file `resolved` names, in the directory `_mutate` proves the
+/// guest may change.
+async fn create_file<HostFs>(
+    resolved: &Resolved<'_, HostFs>,
+    _mutate: Granted<'_, Directory, Mutate>,
+    now: u64,
+) -> FsOpResult<Metadata>
+where
+    HostFs: crate::HostFileSystem,
+{
+    resolved
+        .writable()
+        .map_err(fs_error_code)?
+        .open(resolved.path(), OpenFlags::CREATE, now)
+        .await
+        .map_err(fs_error_code)
+}
+
+/// Truncates the file `resolved` names: the guest may change its directory
+/// and write through the same base.
+async fn truncate_file<HostFs>(
+    resolved: &Resolved<'_, HostFs>,
+    _rights: (
+        Granted<'_, Directory, Mutate>,
+        Granted<'_, Directory, Write>,
+    ),
+    now: u64,
+) -> FsOpResult<Metadata>
+where
+    HostFs: crate::HostFileSystem,
+{
+    resolved
+        .writable()
+        .map_err(fs_error_code)?
+        .open(resolved.path(), OpenFlags::TRUNCATE, now)
+        .await
+        .map_err(fs_error_code)
 }
 
 /// How a path below `base` follows a final symbolic link: when the guest
@@ -353,34 +351,41 @@ fn child_below(base: &FsDescriptor, path: &str) -> FsOpResult<String> {
 /// Reads at most `max_bytes` at `offset`; an empty result is end of file.
 pub(crate) async fn read<HostFs>(
     namespace: &Namespace<HostFs>,
-    descriptor: &FsDescriptor,
+    file: Granted<'_, RegularFile, Read>,
     offset: u64,
     max_bytes: usize,
 ) -> FsOpResult<Bytes>
 where
     HostFs: crate::HostFileSystem,
 {
-    require_file(
-        descriptor,
-        fs_types::DescriptorFlags::READ,
-        fs_types::ErrorCode::NotPermitted,
-    )?;
-    read_resolved(&resolve(namespace, &descriptor.path)?, offset, max_bytes).await
+    read_resolved(
+        &resolve(namespace, &file.descriptor().path)?,
+        offset,
+        max_bytes,
+    )
+    .await
 }
 
-/// The file a stream reads or writes across polls: `descriptor` must be a
-/// regular file opened with `right`, refused with `refused` otherwise.
-pub(crate) fn stream_target<HostFs>(
+/// The file a stream reads across polls.
+pub(crate) fn read_stream_target<HostFs>(
     namespace: &Namespace<HostFs>,
-    descriptor: &FsDescriptor,
-    right: fs_types::DescriptorFlags,
-    refused: fs_types::ErrorCode,
+    file: Granted<'_, RegularFile, Read>,
 ) -> FsOpResult<HeldPath<HostFs>>
 where
     HostFs: crate::HostFileSystem,
 {
-    require_file(descriptor, right, refused)?;
-    resolve(namespace, &descriptor.path).map(|resolved| resolved.held())
+    resolve(namespace, &file.descriptor().path).map(|resolved| resolved.held())
+}
+
+/// The file a stream writes across polls.
+pub(crate) fn write_stream_target<HostFs>(
+    namespace: &Namespace<HostFs>,
+    file: Granted<'_, RegularFile, Write>,
+) -> FsOpResult<HeldPath<HostFs>>
+where
+    HostFs: crate::HostFileSystem,
+{
+    resolve(namespace, &file.descriptor().path).map(|resolved| resolved.held())
 }
 
 /// One positional read through `resolved`.
@@ -416,7 +421,7 @@ where
 /// offset just past them: where a sequential writer continues.
 pub(crate) async fn write<HostFs>(
     namespace: &Namespace<HostFs>,
-    descriptor: &FsDescriptor,
+    file: Granted<'_, RegularFile, Write>,
     position: WritePosition,
     bytes: &[u8],
     now: u64,
@@ -424,24 +429,18 @@ pub(crate) async fn write<HostFs>(
 where
     HostFs: crate::HostFileSystem,
 {
-    write_resolved(&writable_file(namespace, descriptor)?, position, bytes, now).await
+    write_resolved(&writable_file(namespace, file)?, position, bytes, now).await
 }
 
-/// The file `descriptor` names, resolved for a write: it must be a
-/// regular file opened with `write`.
+/// The file `file` names, resolved for a write.
 pub(crate) fn writable_file<'a, HostFs>(
     namespace: &'a Namespace<HostFs>,
-    descriptor: &'a FsDescriptor,
+    file: Granted<'a, RegularFile, Write>,
 ) -> FsOpResult<Resolved<'a, HostFs>>
 where
     HostFs: crate::HostFileSystem,
 {
-    require_file(
-        descriptor,
-        fs_types::DescriptorFlags::WRITE,
-        fs_types::ErrorCode::ReadOnly,
-    )?;
-    resolve(namespace, &descriptor.path)
+    resolve(namespace, &file.descriptor().path)
 }
 
 /// Writes `bytes` through `resolved`, and resolves with the offset just
@@ -493,19 +492,14 @@ where
 
 pub(crate) async fn set_size<HostFs>(
     namespace: &Namespace<HostFs>,
-    descriptor: &FsDescriptor,
+    file: Granted<'_, RegularFile, Write>,
     size: u64,
     now: u64,
 ) -> FsOpResult<()>
 where
     HostFs: crate::HostFileSystem,
 {
-    require_file(
-        descriptor,
-        fs_types::DescriptorFlags::WRITE,
-        fs_types::ErrorCode::ReadOnly,
-    )?;
-    let resolved = resolve(namespace, &descriptor.path)?;
+    let resolved = resolve(namespace, &file.descriptor().path)?;
     resolved
         .writable()
         .map_err(fs_error_code)?
@@ -564,16 +558,14 @@ where
 
 pub(crate) async fn create_directory_at<HostFs>(
     namespace: &Namespace<HostFs>,
-    base: &FsDescriptor,
+    base: Granted<'_, Directory, Mutate>,
     path: &str,
     now: u64,
 ) -> FsOpResult<()>
 where
     HostFs: crate::HostFileSystem,
 {
-    require_mutate_directory(base)?;
-    require_directory(base)?;
-    let absolute = child_path(base, path)?;
+    let absolute = child_path(base.descriptor(), path)?;
     let resolved = resolve(namespace, &absolute)?;
     if resolved.is_mount_root() {
         return Err(fs_types::ErrorCode::Exist);
@@ -588,14 +580,13 @@ where
 
 pub(crate) async fn remove_directory_at<HostFs>(
     namespace: &Namespace<HostFs>,
-    base: &FsDescriptor,
+    base: Granted<'_, Directory, Mutate>,
     path: &str,
 ) -> FsOpResult<()>
 where
     HostFs: crate::HostFileSystem,
 {
-    require_mutate_directory(base)?;
-    let absolute = child_below(base, path)?;
+    let absolute = child_below(base.descriptor(), path)?;
     namespace
         .remove_directory(&absolute)
         .await
@@ -604,14 +595,13 @@ where
 
 pub(crate) async fn unlink_file_at<HostFs>(
     namespace: &Namespace<HostFs>,
-    base: &FsDescriptor,
+    base: Granted<'_, Directory, Mutate>,
     path: &str,
 ) -> FsOpResult<()>
 where
     HostFs: crate::HostFileSystem,
 {
-    require_mutate_directory(base)?;
-    let absolute = child_below(base, path)?;
+    let absolute = child_below(base.descriptor(), path)?;
     let resolved = resolve(namespace, &absolute)?;
     if resolved.is_mount_root() {
         return Err(fs_types::ErrorCode::IsDirectory);
@@ -627,21 +617,17 @@ where
 /// Renames within one mount; across two, `cross-device`.
 pub(crate) async fn rename_at<HostFs>(
     namespace: &Namespace<HostFs>,
-    source_base: &FsDescriptor,
+    source_base: Granted<'_, Directory, Mutate>,
     source_path: &str,
-    destination_base: &FsDescriptor,
+    destination_base: Granted<'_, Directory, Mutate>,
     destination_path: &str,
     now: u64,
 ) -> FsOpResult<()>
 where
     HostFs: crate::HostFileSystem,
 {
-    require_directory(source_base)?;
-    require_directory(destination_base)?;
-    require_mutate_directory(source_base)?;
-    require_mutate_directory(destination_base)?;
-    let source = child_below(source_base, source_path)?;
-    let destination = child_below(destination_base, destination_path)?;
+    let source = child_below(source_base.descriptor(), source_path)?;
+    let destination = child_below(destination_base.descriptor(), destination_path)?;
     namespace
         .rename(&source, &destination, now)
         .await
@@ -653,7 +639,7 @@ pub(crate) async fn link_at<HostFs>(
     namespace: &Namespace<HostFs>,
     source_base: &FsDescriptor,
     source_path: &str,
-    destination_base: &FsDescriptor,
+    destination_base: Granted<'_, Directory, Mutate>,
     destination_path: &str,
     now: u64,
 ) -> FsOpResult<()>
@@ -661,10 +647,8 @@ where
     HostFs: crate::HostFileSystem,
 {
     require_directory(source_base)?;
-    require_directory(destination_base)?;
-    require_mutate_directory(destination_base)?;
     let source = child_path(source_base, source_path)?;
-    let destination = child_path(destination_base, destination_path)?;
+    let destination = child_path(destination_base.descriptor(), destination_path)?;
     namespace
         .link(&source, &destination, now)
         .await
@@ -675,7 +659,7 @@ where
 /// `target`. The target must name something inside the link's directory.
 pub(crate) async fn symlink_at<HostFs>(
     namespace: &Namespace<HostFs>,
-    base: &FsDescriptor,
+    base: Granted<'_, Directory, Mutate>,
     target: &str,
     path: &str,
     now: u64,
@@ -683,9 +667,7 @@ pub(crate) async fn symlink_at<HostFs>(
 where
     HostFs: crate::HostFileSystem,
 {
-    require_directory(base)?;
-    require_mutate_directory(base)?;
-    let absolute = child_below(base, path)?;
+    let absolute = child_below(base.descriptor(), path)?;
     crate::symlink_target(&absolute, target).map_err(fs_error_code)?;
     let resolved = resolve(namespace, &absolute)?;
     resolved
@@ -1282,12 +1264,7 @@ where
     ) -> Result<(StreamReader<u8>, FutureReader<FsOpResult<()>>)> {
         let resolved =
             descriptor_in(accessor.get(), &descriptor).and_then(|(descriptor, namespace)| {
-                stream_target(
-                    &namespace,
-                    &descriptor,
-                    fs_types::DescriptorFlags::READ,
-                    fs_types::ErrorCode::NotPermitted,
-                )
+                read_stream_target(&namespace, descriptor.grant()?)
             });
         match resolved {
             Ok(resolved) => {
@@ -1376,7 +1353,7 @@ where
             let (descriptor, namespace) = descriptor_in(access.get(), &descriptor)?;
             Ok::<_, fs_types::ErrorCode>((descriptor, namespace, access.get().now_nanos()))
         })?;
-        Ok(self::set_size(&namespace, &descriptor, size, now).await?)
+        Ok(self::set_size(&namespace, descriptor.grant()?, size, now).await?)
     }
 
     async fn set_times(
@@ -1451,7 +1428,7 @@ where
             let (base, namespace) = descriptor_in(access.get(), &descriptor)?;
             Ok::<_, fs_types::ErrorCode>((base, namespace, access.get().now_nanos()))
         })?;
-        Ok(self::create_directory_at(&namespace, &base, &path, now).await?)
+        Ok(self::create_directory_at(&namespace, base.grant()?, &path, now).await?)
     }
 
     async fn stat(
@@ -1533,7 +1510,7 @@ where
             &namespace,
             &source_base,
             &source_path,
-            &destination_base,
+            destination_base.grant()?,
             &destination_path,
             now,
         )
@@ -1588,7 +1565,7 @@ where
     ) -> Result<(), FsError> {
         let (base, namespace) =
             accessor.with(|mut access| descriptor_in(access.get(), &descriptor))?;
-        Ok(self::remove_directory_at(&namespace, &base, &path).await?)
+        Ok(self::remove_directory_at(&namespace, base.grant()?, &path).await?)
     }
 
     async fn rename_at(
@@ -1605,9 +1582,9 @@ where
         })?;
         Ok(self::rename_at(
             &namespace,
-            &source_base,
+            source_base.grant()?,
             &source_path,
-            &destination_base,
+            destination_base.grant()?,
             &destination_path,
             now,
         )
@@ -1632,7 +1609,7 @@ where
             let (base, namespace) = descriptor_in(access.get(), &descriptor)?;
             Ok((base, namespace, access.get().now_nanos()))
         })?;
-        Ok(self::symlink_at(&namespace, &base, &old_path, &new_path, now).await?)
+        Ok(self::symlink_at(&namespace, base.grant()?, &old_path, &new_path, now).await?)
     }
 
     async fn unlink_file_at(
@@ -1642,7 +1619,7 @@ where
     ) -> Result<(), FsError> {
         let (base, namespace) =
             accessor.with(|mut access| descriptor_in(access.get(), &descriptor))?;
-        Ok(self::unlink_file_at(&namespace, &base, &path).await?)
+        Ok(self::unlink_file_at(&namespace, base.grant()?, &path).await?)
     }
 
     async fn is_same_object(
@@ -1704,15 +1681,8 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    let resolved =
-        descriptor_in(accessor.get(), &descriptor).and_then(|(descriptor, namespace)| {
-            stream_target(
-                &namespace,
-                &descriptor,
-                fs_types::DescriptorFlags::WRITE,
-                fs_types::ErrorCode::NotPermitted,
-            )
-        });
+    let resolved = descriptor_in(accessor.get(), &descriptor)
+        .and_then(|(descriptor, namespace)| write_stream_target(&namespace, descriptor.grant()?));
     let getter = accessor.getter();
     match resolved {
         Ok(resolved) => {

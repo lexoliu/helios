@@ -7,16 +7,17 @@ use futures_lite::future::block_on;
 use helios_hal::fs::{FileSystemRights, NodeKind, WritePosition};
 
 use super::{
-    FsDescriptor, FsNodeKind, create_directory_at, fs_types, link_at, metadata_hash, open_at, read,
-    read_program_file, readlink_at, remove_directory_at, rename_at, set_size, set_times, stat_at,
-    stat_path, symlink_at, unlink_file_at, write_program_file,
+    FsDescriptor, FsNodeKind, Granted, Kind, RegularFile, Right, Write, create_directory_at,
+    fs_types, link_at, metadata_hash, open_at, read, read_program_file, readlink_at,
+    remove_directory_at, rename_at, set_size, set_times, stat_at, stat_path, symlink_at,
+    unlink_file_at, write_program_file,
 };
 use crate::wasmtime_adapter::component_host::ProgramSource;
 use crate::wasmtime_adapter::cwasm::{self, UntrustedCwasm};
 use crate::{
     AuthorityDomain, BOOT_DEVICE, BootFs, EmbeddedBootDirectory, EmbeddedBootFile, EmbeddedBootFs,
-    FileContents, Follow, MemoryFs, MountTable, MountedFs, Namespace, UnsupportedHostFileSystem,
-    object_identity,
+    FileContents, Follow, HostShare, MemoryFs, MountTable, MountedFs, Namespace,
+    UnsupportedHostFileSystem, object_identity,
 };
 
 type TestNamespace = Namespace<UnsupportedHostFileSystem>;
@@ -52,6 +53,13 @@ fn readonly_root() -> FsDescriptor {
     }
 }
 
+/// The proof of a right the test's descriptor is known to hold.
+fn held<K: Kind, R: Right>(descriptor: &FsDescriptor) -> Granted<'_, K, R> {
+    descriptor
+        .grant()
+        .expect("the descriptor holds the right the operation demands")
+}
+
 fn open(
     namespace: &TestNamespace,
     base: &FsDescriptor,
@@ -81,7 +89,7 @@ fn create_file(namespace: &TestNamespace, path: &str, bytes: &[u8]) -> FsDescrip
     .expect("file creation must succeed");
     block_on(super::write(
         namespace,
-        &descriptor,
+        held(&descriptor),
         WritePosition::At(0),
         bytes,
         1,
@@ -91,7 +99,7 @@ fn create_file(namespace: &TestNamespace, path: &str, bytes: &[u8]) -> FsDescrip
 }
 
 fn read_all(namespace: &TestNamespace, descriptor: &FsDescriptor) -> alloc::vec::Vec<u8> {
-    block_on(read(namespace, descriptor, 0, 64))
+    block_on(read(namespace, held(descriptor), 0, 64))
         .expect("read must succeed")
         .to_vec()
 }
@@ -108,7 +116,7 @@ fn mount_memory(namespace: &TestNamespace, point: &str) {
 #[test]
 fn create_directory_adds_node() {
     let namespace = namespace();
-    block_on(create_directory_at(&namespace, &root(), "tmp", 7))
+    block_on(create_directory_at(&namespace, held(&root()), "tmp", 7))
         .expect("directory creation must succeed");
 
     let metadata =
@@ -120,10 +128,10 @@ fn create_directory_adds_node() {
 #[test]
 fn create_directory_rejects_existing_path() {
     let namespace = namespace();
-    block_on(create_directory_at(&namespace, &root(), "tmp", 1))
+    block_on(create_directory_at(&namespace, held(&root()), "tmp", 1))
         .expect("initial directory creation must succeed");
 
-    let error = block_on(create_directory_at(&namespace, &root(), "tmp", 2))
+    let error = block_on(create_directory_at(&namespace, held(&root()), "tmp", 2))
         .expect_err("creating the same directory twice must fail");
     assert!(matches!(error, fs_types::ErrorCode::Exist));
 }
@@ -159,7 +167,7 @@ fn writing_a_boot_image_file_writes_the_trees_own_copy() {
 
     let end = block_on(super::write(
         &namespace,
-        &descriptor,
+        held(&descriptor),
         WritePosition::At(0),
         b"T",
         1,
@@ -188,7 +196,7 @@ fn open_at_rejects_descriptor_right_widening() {
 #[test]
 fn opening_existing_directory_without_directory_flag_fails() {
     let namespace = namespace();
-    block_on(create_directory_at(&namespace, &root(), "tmp", 1))
+    block_on(create_directory_at(&namespace, held(&root()), "tmp", 1))
         .expect("directory creation must succeed");
 
     let error = open(
@@ -245,8 +253,15 @@ fn rename_preserves_object_identity_local_part() {
     create_file(&namespace, "tmp", b"data");
     let before = metadata_hash(&block_on(stat_path(&namespace, "/tmp", Follow::No)).expect("stat"));
 
-    block_on(rename_at(&namespace, &root(), "tmp", &root(), "renamed", 2))
-        .expect("rename must succeed");
+    block_on(rename_at(
+        &namespace,
+        held(&root()),
+        "tmp",
+        held(&root()),
+        "renamed",
+        2,
+    ))
+    .expect("rename must succeed");
     let after =
         metadata_hash(&block_on(stat_path(&namespace, "/renamed", Follow::No)).expect("stat"));
 
@@ -259,8 +274,15 @@ fn rename_across_mounts_is_cross_device() {
     mount_memory(&namespace, "/mnt");
     create_file(&namespace, "tmp", b"data");
 
-    let error = block_on(rename_at(&namespace, &root(), "tmp", &root(), "mnt/tmp", 2))
-        .expect_err("rename across mounts must fail");
+    let error = block_on(rename_at(
+        &namespace,
+        held(&root()),
+        "tmp",
+        held(&root()),
+        "mnt/tmp",
+        2,
+    ))
+    .expect_err("rename across mounts must fail");
 
     assert!(matches!(error, fs_types::ErrorCode::CrossDevice));
 }
@@ -274,8 +296,15 @@ fn rename_into_a_missing_directory_fails() {
     };
     create_file(&namespace, "tmp", b"data");
 
-    let error = block_on(rename_at(&namespace, &root(), "tmp", &stale, "tmp", 2))
-        .expect_err("rename into a directory that does not exist must fail");
+    let error = block_on(rename_at(
+        &namespace,
+        held(&root()),
+        "tmp",
+        held(&stale),
+        "tmp",
+        2,
+    ))
+    .expect_err("rename into a directory that does not exist must fail");
 
     assert!(matches!(error, fs_types::ErrorCode::NoEntry));
 }
@@ -284,8 +313,15 @@ fn rename_into_a_missing_directory_fails() {
 fn hardlink_preserves_identity_and_shared_contents() {
     let namespace = namespace();
     let original = create_file(&namespace, "tmp", b"data");
-    block_on(link_at(&namespace, &root(), "tmp", &root(), "alias", 2))
-        .expect("hardlink must succeed");
+    block_on(link_at(
+        &namespace,
+        &root(),
+        "tmp",
+        held(&root()),
+        "alias",
+        2,
+    ))
+    .expect("hardlink must succeed");
     let alias = open(
         &namespace,
         &root(),
@@ -306,7 +342,7 @@ fn hardlink_preserves_identity_and_shared_contents() {
 
     block_on(super::write(
         &namespace,
-        &original,
+        held(&original),
         WritePosition::At(0),
         b"bolt",
         3,
@@ -319,9 +355,16 @@ fn hardlink_preserves_identity_and_shared_contents() {
 fn set_size_resizes_all_links_without_widening_descriptor_rights() {
     let namespace = namespace();
     let original = create_file(&namespace, "tmp", b"data");
-    block_on(link_at(&namespace, &root(), "tmp", &root(), "alias", 3))
-        .expect("hardlink must succeed");
-    block_on(set_size(&namespace, &original, 6, 4)).expect("set-size must grow the file");
+    block_on(link_at(
+        &namespace,
+        &root(),
+        "tmp",
+        held(&root()),
+        "alias",
+        3,
+    ))
+    .expect("hardlink must succeed");
+    block_on(set_size(&namespace, held(&original), 6, 4)).expect("set-size must grow the file");
 
     let alias = open(
         &namespace,
@@ -343,8 +386,10 @@ fn set_size_resizes_all_links_without_widening_descriptor_rights() {
         flags: fs_types::DescriptorFlags::READ,
         ..original
     };
-    let error = block_on(set_size(&namespace, &read_only, 1, 5))
-        .expect_err("set-size through a read-only descriptor must fail");
+    let error = read_only
+        .grant::<RegularFile, Write>()
+        .err()
+        .expect("set-size through a read-only descriptor must be refused");
     assert!(matches!(error, fs_types::ErrorCode::ReadOnly));
 }
 
@@ -368,24 +413,44 @@ fn set_times_updates_stat_and_metadata_hash() {
 fn hardlink_rejects_directory_and_cross_mount() {
     let namespace = namespace();
     mount_memory(&namespace, "/mnt");
-    block_on(create_directory_at(&namespace, &root(), "dir", 1))
+    block_on(create_directory_at(&namespace, held(&root()), "dir", 1))
         .expect("directory creation must succeed");
     create_file(&namespace, "tmp", b"");
 
-    let directory_error = block_on(link_at(&namespace, &root(), "dir", &root(), "dir-link", 1))
-        .expect_err("hardlinking directories must fail");
+    let directory_error = block_on(link_at(
+        &namespace,
+        &root(),
+        "dir",
+        held(&root()),
+        "dir-link",
+        1,
+    ))
+    .expect_err("hardlinking directories must fail");
     assert!(matches!(directory_error, fs_types::ErrorCode::NotPermitted));
 
-    let file_error = block_on(link_at(&namespace, &root(), "tmp", &root(), "mnt/tmp", 1))
-        .expect_err("hardlink across mounts must fail");
+    let file_error = block_on(link_at(
+        &namespace,
+        &root(),
+        "tmp",
+        held(&root()),
+        "mnt/tmp",
+        1,
+    ))
+    .expect_err("hardlink across mounts must fail");
     assert!(matches!(file_error, fs_types::ErrorCode::CrossDevice));
 }
 
 #[test]
 fn symlink_target_is_read_without_normalization() {
     let namespace = namespace();
-    block_on(symlink_at(&namespace, &root(), "bin/tool", "tool-link", 1))
-        .expect("symlink creation must succeed");
+    block_on(symlink_at(
+        &namespace,
+        held(&root()),
+        "bin/tool",
+        "tool-link",
+        1,
+    ))
+    .expect("symlink creation must succeed");
 
     assert_eq!(
         block_on(readlink_at(&namespace, &root(), "tool-link")).expect("readlink must succeed"),
@@ -420,20 +485,38 @@ fn symlink_targets_stay_inside_the_link_directory() {
 fn symlink_rejects_rooted_and_parent_escape_targets() {
     let namespace = namespace();
 
-    let absolute = block_on(symlink_at(&namespace, &root(), "/bin/tool", "absolute", 1))
-        .expect_err("an absolute symlink target must be rejected");
+    let absolute = block_on(symlink_at(
+        &namespace,
+        held(&root()),
+        "/bin/tool",
+        "absolute",
+        1,
+    ))
+    .expect_err("an absolute symlink target must be rejected");
     assert!(matches!(absolute, fs_types::ErrorCode::NotPermitted));
 
-    let parent = block_on(symlink_at(&namespace, &root(), "../bin/tool", "escape", 1))
-        .expect_err("a parent-escaping symlink target must be rejected");
+    let parent = block_on(symlink_at(
+        &namespace,
+        held(&root()),
+        "../bin/tool",
+        "escape",
+        1,
+    ))
+    .expect_err("a parent-escaping symlink target must be rejected");
     assert!(matches!(parent, fs_types::ErrorCode::NotPermitted));
 }
 
 #[test]
 fn symlink_follow_is_confined_and_loop_limited() {
     let namespace = namespace();
-    block_on(symlink_at(&namespace, &root(), "bin/tool", "tool-link", 1))
-        .expect("symlink creation must succeed");
+    block_on(symlink_at(
+        &namespace,
+        held(&root()),
+        "bin/tool",
+        "tool-link",
+        1,
+    ))
+    .expect("symlink creation must succeed");
     let opened = block_on(open_at(
         &namespace,
         &root(),
@@ -446,9 +529,9 @@ fn symlink_follow_is_confined_and_loop_limited() {
     .expect("symlink follow must open the target");
     assert_eq!(read_all(&namespace, &opened), b"tool");
 
-    block_on(symlink_at(&namespace, &root(), "loop-b", "loop-a", 1))
+    block_on(symlink_at(&namespace, held(&root()), "loop-b", "loop-a", 1))
         .expect("loop symlink a must be created");
-    block_on(symlink_at(&namespace, &root(), "loop-a", "loop-b", 1))
+    block_on(symlink_at(&namespace, held(&root()), "loop-a", "loop-b", 1))
         .expect("loop symlink b must be created");
     let error = block_on(open_at(
         &namespace,
@@ -516,7 +599,7 @@ fn bootfs_cwasm_loads_without_signature_verification() {
 #[test]
 fn guest_written_cwasm_must_verify() {
     let namespace = namespace_with_bootfs_cwasm();
-    block_on(create_directory_at(&namespace, &root(), "tmp", 1))
+    block_on(create_directory_at(&namespace, held(&root()), "tmp", 1))
         .expect("creating /tmp must succeed");
     mount_memory(&namespace, "/mnt");
 
@@ -588,14 +671,14 @@ fn writing_a_bootfs_node_drops_its_provenance() {
         |namespace, descriptor| {
             block_on(super::write(
                 namespace,
-                descriptor,
+                held(descriptor),
                 WritePosition::At(0),
                 b"p",
                 2,
             ))
             .map(drop)
         },
-        |namespace, descriptor| block_on(set_size(namespace, descriptor, 1, 3)),
+        |namespace, descriptor| block_on(set_size(namespace, held(descriptor), 1, 3)),
         |namespace, _| {
             block_on(write_program_file(
                 namespace,
@@ -634,28 +717,42 @@ fn work() -> FsDescriptor {
 #[test]
 fn the_base_itself_is_never_removed_renamed_or_replaced_through_it() {
     let namespace = namespace();
-    block_on(create_directory_at(&namespace, &root(), "work", 1)).expect("creates /work");
-    block_on(create_directory_at(&namespace, &root(), "bob", 1)).expect("creates /bob");
+    block_on(create_directory_at(&namespace, held(&root()), "work", 1)).expect("creates /work");
+    block_on(create_directory_at(&namespace, held(&root()), "bob", 1)).expect("creates /bob");
 
     for path in ["", ".", "sub/.."] {
         assert!(matches!(
-            block_on(remove_directory_at(&namespace, &work(), path)),
+            block_on(remove_directory_at(&namespace, held(&work()), path)),
             Err(fs_types::ErrorCode::Invalid)
         ));
         assert!(matches!(
-            block_on(unlink_file_at(&namespace, &work(), path)),
+            block_on(unlink_file_at(&namespace, held(&work()), path)),
             Err(fs_types::ErrorCode::Invalid)
         ));
         assert!(matches!(
-            block_on(symlink_at(&namespace, &work(), "bob", path, 1)),
+            block_on(symlink_at(&namespace, held(&work()), "bob", path, 1)),
             Err(fs_types::ErrorCode::Invalid)
         ));
         assert!(matches!(
-            block_on(rename_at(&namespace, &work(), path, &root(), "moved", 1)),
+            block_on(rename_at(
+                &namespace,
+                held(&work()),
+                path,
+                held(&root()),
+                "moved",
+                1
+            )),
             Err(fs_types::ErrorCode::Invalid)
         ));
         assert!(matches!(
-            block_on(rename_at(&namespace, &root(), "bob", &work(), path, 1)),
+            block_on(rename_at(
+                &namespace,
+                held(&root()),
+                "bob",
+                held(&work()),
+                path,
+                1
+            )),
             Err(fs_types::ErrorCode::Invalid)
         ));
     }
@@ -666,11 +763,11 @@ fn the_base_itself_is_never_removed_renamed_or_replaced_through_it() {
 #[test]
 fn a_link_at_the_base_does_not_lead_out_of_it() {
     let namespace = namespace();
-    block_on(create_directory_at(&namespace, &root(), "bob", 1)).expect("creates /bob");
+    block_on(create_directory_at(&namespace, held(&root()), "bob", 1)).expect("creates /bob");
     create_file(&namespace, "bob/secret", b"bob's");
     // Whoever holds the parent replaces the preopen's directory with a
     // link to its sibling: `work`'s holder still names `/work`.
-    block_on(symlink_at(&namespace, &root(), "bob", "work", 1)).expect("links /work");
+    block_on(symlink_at(&namespace, held(&root()), "bob", "work", 1)).expect("links /work");
 
     for path in [".", ""] {
         let opened = block_on(open_at(
@@ -750,7 +847,7 @@ fn an_append_resolves_with_the_end_of_file_it_reached() {
     .expect("a second writer opens the file");
     let end = block_on(super::write(
         &namespace,
-        &other,
+        held(&other),
         WritePosition::At(3),
         "日本語".as_bytes(),
         2,
@@ -760,7 +857,7 @@ fn an_append_resolves_with_the_end_of_file_it_reached() {
 
     let end = block_on(super::write(
         &namespace,
-        &appender,
+        held(&appender),
         WritePosition::End,
         "한국어".as_bytes(),
         3,
@@ -775,21 +872,28 @@ fn an_append_resolves_with_the_end_of_file_it_reached() {
 fn a_directory_holding_a_mount_point_is_busy() {
     let namespace = namespace();
     for directory in ["a", "a/b"] {
-        block_on(create_directory_at(&namespace, &root(), directory, 1)).expect("creates");
+        block_on(create_directory_at(&namespace, held(&root()), directory, 1)).expect("creates");
     }
     mount_memory(&namespace, "/a/b");
 
     for (source, path) in [("the holder", "a"), ("the mount point", "a/b")] {
         assert!(
             matches!(
-                block_on(remove_directory_at(&namespace, &root(), path)),
+                block_on(remove_directory_at(&namespace, held(&root()), path)),
                 Err(fs_types::ErrorCode::Busy)
             ),
             "removing {source} must be refused as busy"
         );
         assert!(
             matches!(
-                block_on(rename_at(&namespace, &root(), path, &root(), "z", 1)),
+                block_on(rename_at(
+                    &namespace,
+                    held(&root()),
+                    path,
+                    held(&root()),
+                    "z",
+                    1
+                )),
                 Err(fs_types::ErrorCode::Busy)
             ),
             "renaming {source} must be refused as busy"
@@ -804,13 +908,8 @@ fn a_mount_with_a_descriptor_or_stream_open_on_it_is_busy() {
     let namespace = namespace();
     mount_memory(&namespace, "/mnt");
     let descriptor = create_file(&namespace, "mnt/notes", "日本語 한국어".as_bytes());
-    let stream = super::stream_target(
-        &namespace,
-        &descriptor,
-        fs_types::DescriptorFlags::READ,
-        fs_types::ErrorCode::NotPermitted,
-    )
-    .expect("a stream over the file");
+    let stream =
+        super::read_stream_target(&namespace, held(&descriptor)).expect("a stream over the file");
 
     let unmount = || block_on(namespace.table().unmount("/mnt"));
     assert_eq!(unmount(), Err(crate::MountError::Busy("/mnt".into())));
@@ -824,4 +923,99 @@ fn a_mount_with_a_descriptor_or_stream_open_on_it_is_busy() {
     );
     drop(stream);
     unmount().expect("nothing holds the mount any more");
+}
+
+/// Mounts a host share at `point` whose every request fails with
+/// `unsupported`, read-write. A refusal with any other code therefore proves
+/// that no request reached the host.
+fn mount_unreachable_host(namespace: &TestNamespace, point: &str) {
+    let fs = MountedFs::Host(HostShare::new(UnsupportedHostFileSystem));
+    let cap = crate::ProcessAuthority::root()
+        .derive_mount_cap(point)
+        .expect("root may mount anywhere");
+    block_on(namespace.mount(&cap, fs, FileSystemRights::READ | FileSystemRights::WRITE))
+        .expect("mount must succeed");
+}
+
+/// A directory descriptor at `path` that holds exactly `flags`.
+fn directory_holding(path: &str, flags: fs_types::DescriptorFlags) -> FsDescriptor {
+    FsDescriptor {
+        path: String::from(path),
+        flags,
+        ..root()
+    }
+}
+
+/// A grant of the share's directory that holds every right, and one that
+/// only reads.
+fn host_bases() -> (FsDescriptor, FsDescriptor) {
+    let rights = root().flags;
+    (
+        directory_holding("/mnt/a", rights),
+        directory_holding("/mnt/a", fs_types::DescriptorFlags::READ),
+    )
+}
+
+#[test]
+fn a_read_only_base_creates_no_directory_on_the_host_share() {
+    let namespace = namespace();
+    mount_unreachable_host(&namespace, "/mnt");
+    let (rw, ro) = host_bases();
+
+    // The control: a request the base may make reaches the share.
+    let reached = block_on(async { create_directory_at(&namespace, rw.grant()?, "new", 1).await });
+    assert!(matches!(reached, Err(fs_types::ErrorCode::Unsupported)));
+
+    let refused = block_on(async { create_directory_at(&namespace, ro.grant()?, "new", 1).await });
+    assert!(matches!(refused, Err(fs_types::ErrorCode::ReadOnly)));
+}
+
+#[test]
+fn a_read_only_base_removes_no_directory_on_the_host_share() {
+    let namespace = namespace();
+    mount_unreachable_host(&namespace, "/mnt");
+    let (rw, ro) = host_bases();
+
+    let reached = block_on(async { remove_directory_at(&namespace, rw.grant()?, "old").await });
+    assert!(matches!(reached, Err(fs_types::ErrorCode::Unsupported)));
+
+    let refused = block_on(async { remove_directory_at(&namespace, ro.grant()?, "old").await });
+    assert!(matches!(refused, Err(fs_types::ErrorCode::ReadOnly)));
+}
+
+#[test]
+fn a_read_only_base_renames_nothing_on_the_host_share() {
+    let namespace = namespace();
+    mount_unreachable_host(&namespace, "/mnt");
+    let (rw, ro) = host_bases();
+
+    let reached =
+        block_on(async { rename_at(&namespace, rw.grant()?, "old", rw.grant()?, "new", 1).await });
+    assert!(matches!(reached, Err(fs_types::ErrorCode::Unsupported)));
+
+    let from_read_only =
+        block_on(async { rename_at(&namespace, ro.grant()?, "old", rw.grant()?, "new", 1).await });
+    assert!(matches!(
+        from_read_only,
+        Err(fs_types::ErrorCode::ReadOnly)
+    ));
+    let into_read_only =
+        block_on(async { rename_at(&namespace, rw.grant()?, "old", ro.grant()?, "new", 1).await });
+    assert!(matches!(
+        into_read_only,
+        Err(fs_types::ErrorCode::ReadOnly)
+    ));
+}
+
+#[test]
+fn a_read_only_base_unlinks_nothing_on_the_host_share() {
+    let namespace = namespace();
+    mount_unreachable_host(&namespace, "/mnt");
+    let (rw, ro) = host_bases();
+
+    let reached = block_on(async { unlink_file_at(&namespace, rw.grant()?, "old").await });
+    assert!(matches!(reached, Err(fs_types::ErrorCode::Unsupported)));
+
+    let refused = block_on(async { unlink_file_at(&namespace, ro.grant()?, "old").await });
+    assert!(matches!(refused, Err(fs_types::ErrorCode::ReadOnly)));
 }
