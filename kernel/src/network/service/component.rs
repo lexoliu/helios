@@ -107,6 +107,11 @@ where
     }
 
     /// Runs one dual-family lookup over an already-open resolver socket.
+    ///
+    /// The lookup's two question ids are drawn at random from the
+    /// socket's shard. An answer is matched on this lookup's own
+    /// socket, so the ids have to differ from each other and from
+    /// nothing else: no lookup holds an id another could want.
     async fn resolve_through(
         &self,
         socket: &ResolverSocket,
@@ -118,7 +123,7 @@ where
             .state
             .shard_at(socket.shard_idx)
             .lock()
-            .next_dns_query_pair();
+            .draw_dns_query_pair();
         let mut answers = DnsAnswers::new();
         loop {
             // The answers land in the socket's own shard, whichever
@@ -132,7 +137,7 @@ where
             let now = StackInstant::from_nanos(self.now_nanos());
             let mut shard = self.inner.state.shard_at(socket.shard_idx).lock();
             shard.send_dns_queries(socket, queries, host, &answers, now)?;
-            shard.poll_dns_responses(socket, queries, &mut answers)?;
+            shard.poll_dns_responses(socket, queries, host, &mut answers)?;
             drop(shard);
             if answers.complete() {
                 return answers.finish();
@@ -1089,21 +1094,13 @@ impl NetworkShard {
         self.stack.take_icmp_echo_reply(key)
     }
 
-    fn next_dns_query_id(&mut self) -> u16 {
-        let id = self.next_dns_query_id;
-        self.next_dns_query_id = self.next_dns_query_id.wrapping_add(1);
-        if self.next_dns_query_id == 0 {
-            self.next_dns_query_id = 1;
-        }
-        id
-    }
-
-    /// The two question ids one dual-family lookup will carry.
-    pub(super) fn next_dns_query_pair(&mut self) -> DnsQueryPair {
-        DnsQueryPair {
-            a: self.next_dns_query_id(),
-            aaaa: self.next_dns_query_id(),
-        }
+    /// The two question ids one dual-family lookup will carry, drawn
+    /// from the shard's random stream.
+    pub(super) fn draw_dns_query_pair(&mut self) -> DnsQueryPair {
+        DnsQueryPair::from_draws(
+            self.entropy.below(DnsQueryPair::IDS),
+            self.entropy.below(DnsQueryPair::IDS - 1),
+        )
     }
 
     /// Sends whichever of the pair's questions is still outstanding.
@@ -1160,10 +1157,16 @@ impl NetworkShard {
 
     /// Drains this lookup's resolver socket, banking whichever of the
     /// pair's answers have arrived.
+    ///
+    /// A datagram counts as an answer only when its id selects one of
+    /// the pair and the question it repeats is `host` with that id's
+    /// record type: anything else, a forgery included, is dropped and
+    /// leaves the question outstanding.
     pub(super) fn poll_dns_responses(
         &mut self,
         socket: &ResolverSocket,
         queries: DnsQueryPair,
+        host: &str,
         answers: &mut DnsAnswers,
     ) -> Result<(), DnsError> {
         let socket = socket.stack_socket;
@@ -1171,16 +1174,22 @@ impl NetworkShard {
             kind: DnsErrorKind::Unavailable,
             detail: NetworkErrorDetail::DnsQueryStartFailed,
         })? {
-            let Some(message) = DnsResponse::parse(&datagram.bytes).and_then(DnsResponse::message)
-            else {
+            let Some(response) = DnsResponse::parse(&datagram.bytes) else {
                 continue;
             };
-            if message.id == queries.a {
-                answers.a_answered = true;
-            } else if message.id == queries.aaaa {
-                answers.aaaa_answered = true;
+            let record = if response.id() == queries.a {
+                DnsRecordType::A
+            } else if response.id() == queries.aaaa {
+                DnsRecordType::Aaaa
             } else {
                 continue;
+            };
+            let Some(message) = response.message(DnsQuery { name: host, record }) else {
+                continue;
+            };
+            match record {
+                DnsRecordType::A => answers.a_answered = true,
+                DnsRecordType::Aaaa => answers.aaaa_answered = true,
             }
             answers.extend(message.addresses.iter().copied());
         }
@@ -1221,6 +1230,25 @@ pub(super) struct ResolverSocket {
 pub(super) struct DnsQueryPair {
     pub(super) a: u16,
     pub(super) aaaa: u16,
+}
+
+impl DnsQueryPair {
+    /// Ids a question may carry: every nonzero 16-bit value.
+    pub(super) const IDS: u32 = u16::MAX as u32;
+
+    /// The pair two uniform draws select: `first` in `0..IDS` picks the
+    /// `A` id, and `second` in `0..IDS - 1` picks the `AAAA` id among
+    /// the ids that are left, so the two always differ and neither is
+    /// zero.
+    pub(super) fn from_draws(first: u32, second: u32) -> Self {
+        debug_assert!(first < Self::IDS && second < Self::IDS - 1);
+        // Both sums are reduced below `IDS` before the `1 +`, so each
+        // id lies in `1..=u16::MAX`.
+        Self {
+            a: (1 + first) as u16,
+            aaaa: (1 + (first + 1 + second) % Self::IDS) as u16,
+        }
+    }
 }
 
 /// Answers accumulated for one dual-family lookup.

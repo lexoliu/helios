@@ -608,7 +608,7 @@ impl DmaPool for WindowDmaPool {
     fn allocate_zeroed(&self, layout: Layout) -> IoResult<Self::Buffer> {
         let base = self.arena_base();
         let mut offset = 0;
-        let taken = self.arena.next.fetch_update(
+        let taken = self.arena.next.try_update(
             core::sync::atomic::Ordering::SeqCst,
             core::sync::atomic::Ordering::SeqCst,
             |next| {

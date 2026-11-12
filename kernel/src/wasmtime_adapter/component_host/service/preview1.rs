@@ -956,7 +956,7 @@ where
             "thread-spawn",
             |caller: Caller<'_, CompilerCoreStore<CpuImpl, Net, HostFs>>, start_arg: i32| -> i32 {
                 let context = caller.data().context.clone();
-                let next = context.shared.next_thread_id.fetch_update(
+                let next = context.shared.next_thread_id.try_update(
                     AtomicOrdering::Relaxed,
                     AtomicOrdering::Relaxed,
                     |value| (value <= 0x1fff_fffe).then_some(value + 1),
@@ -5226,6 +5226,7 @@ pub(super) fn p1_errno_from_fs(error: fs_types::ErrorCode) -> i32 {
         fs_types::ErrorCode::Io => p1::errno::IO,
         fs_types::ErrorCode::IsDirectory => p1::errno::ISDIR,
         fs_types::ErrorCode::Loop => p1::errno::LOOP,
+        fs_types::ErrorCode::NameTooLong => p1::errno::NAMETOOLONG,
         fs_types::ErrorCode::NoEntry => p1::errno::NOENT,
         fs_types::ErrorCode::NotDirectory => p1::errno::NOTDIR,
         fs_types::ErrorCode::NotEmpty => p1::errno::NOTEMPTY,

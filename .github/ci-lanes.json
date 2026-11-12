@@ -1,6 +1,7 @@
 {
   "check-host": {
     "command": "just check-host",
+    "rust-cache": true,
     "surfaces": ["hosted", "host_tools", "programs"]
   },
   "check-aarch64": {
@@ -17,6 +18,7 @@
   },
   "test-embedded-debugger": {
     "command": "just test-embedded-debugger",
+    "rust-cache": true,
     "surfaces": ["hosted", "host_tools", "programs"]
   },
   "lint-fmt": {
@@ -25,6 +27,7 @@
   },
   "lint-host": {
     "command": "just clippy-host && just clippy-programs",
+    "rust-cache": true,
     "surfaces": ["hosted", "host_tools", "programs"]
   },
   "lint-aarch64": {
@@ -41,6 +44,7 @@
   },
   "test-units": {
     "command": "just test-units",
+    "rust-cache": true,
     "surfaces": ["x86", "hosted", "host_tools", "programs"]
   },
   "smoke-riscv64": {
