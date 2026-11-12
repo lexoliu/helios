@@ -1122,7 +1122,8 @@ fn rollback_partial_protect(
 }
 
 fn page_flags_to_pt(flags: PageFlags) -> Result<PageTableFlags, AddressSpaceError> {
-    if flags.is_empty() {
+    // x86 has no allocation-tag storage to map.
+    if flags.is_empty() || flags.contains(PageFlags::TAGGED) {
         return Err(AddressSpaceError::InvalidFlags);
     }
     // No `USER_ACCESSIBLE`: every helios thread runs in ring 0, guest wasm

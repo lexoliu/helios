@@ -25,6 +25,8 @@ mod kernel_exception;
 mod log;
 mod machine;
 mod memory;
+#[cfg(feature = "wasmtime-runtime")]
+mod memory_tagging;
 mod network;
 mod process;
 mod profiling;

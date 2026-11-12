@@ -1437,7 +1437,9 @@ impl AddressSpace for Aarch64UserAddressSpace {
 }
 
 fn page_flags_to_pte(flags: PageFlags) -> Result<u64, AddressSpaceError> {
-    if flags.is_empty() {
+    // No Tagged memory attribute is programmed yet, so no mapping is
+    // tag-capable.
+    if flags.is_empty() || flags.contains(PageFlags::TAGGED) {
         return Err(AddressSpaceError::InvalidFlags);
     }
     let mut pte = (ATTR_NORMAL << 2) | PXN | UXN;

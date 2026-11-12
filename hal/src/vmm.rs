@@ -151,6 +151,11 @@ bitflags! {
         const READ    = 1 << 0;
         const WRITE   = 1 << 1;
         const EXECUTE = 1 << 2;
+        /// The mapping is tag-capable: the memory it shows carries
+        /// allocation tags ([`crate::tagging`]). A backend that cannot map
+        /// tag-capable memory on the executing processor refuses the flag
+        /// with [`AddressSpaceError::InvalidFlags`].
+        const TAGGED  = 1 << 3;
     }
 }
 
