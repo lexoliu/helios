@@ -141,6 +141,20 @@ interface programs {
     classes: list<device-class>,
   }
 
+  /// A right over the machine's diagnostics. A program that holds none
+  /// of them reads only its own tracing and profiling records.
+  enum diagnostics-right {
+    /// Control the machine-wide tracing and profiling and read every
+    /// instance's records.
+    observe-machine,
+  }
+
+  record diagnostics-grant {
+    /// Diagnostics rights granted to the child. These must be a subset
+    /// of the caller's diagnostics authority.
+    rights: list<diagnostics-right>,
+  }
+
   variant capability-grant {
     directory(directory-grant),
     network(network-grant),
@@ -150,6 +164,7 @@ interface programs {
     link(link-grant),
     mount(mount-grant),
     device(device-grant),
+    diagnostics(diagnostics-grant),
   }
 
   record spawn-request {

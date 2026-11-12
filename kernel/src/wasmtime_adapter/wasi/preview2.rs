@@ -1339,7 +1339,8 @@ where
         let target = self.p2_descriptor(&descriptor);
         let entries = async {
             let (descriptor, namespace) = target?;
-            super::read_directory(&namespace, &descriptor)
+            let directory = descriptor.grant().map_err(error_code_from_p3)?;
+            super::read_directory(&namespace, directory)
                 .await
                 .map_err(error_code_from_p3)
         }
@@ -1472,9 +1473,11 @@ where
             let (source_base, destination_base, namespace) = target?;
             super::link_at(
                 &namespace,
-                &source_base,
+                source_base
+                    .grant()
+                    .and_then(|source| source.link_into(destination_base.grant()?))
+                    .map_err(error_code_from_p3)?,
                 &source_path,
-                destination_base.grant().map_err(error_code_from_p3)?,
                 &destination_path,
                 now,
             )
