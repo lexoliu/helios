@@ -59,6 +59,9 @@ compiler_workers = 3
 # instance-startup-500 wants about 6.1 GiB of guest (docs/benchmarks.md).
 memory = "6G"
 linux_vm_memory = "4G"
+memory_differs_because = """\
+The Helios guest is sized for instance-startup-500, which wants about 6.1 GiB \
+(docs/benchmarks.md); the Linux guest keeps the 4G the lane was created with."""
 net_backend = "tap"
 net_host = "10.77.0.1"
 devices = ["virtio-blk-pci", "virtio-net-pci", "virtio-rng-pci"]

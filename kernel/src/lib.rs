@@ -103,21 +103,22 @@ pub use embedded::{BootPayload, EmbeddedComponent, EmbeddedInit};
 pub use exec::{
     CompactionBudget, CompactionPolicy, CompactionReport, CompactionTarget, Compactor,
     DEFAULT_PERF_METRIC_CAPACITY, DEFAULT_PROFILE_STACK_CAPACITY, DEFAULT_TRACE_HISTORY_CAPACITY,
-    Executor, ExecutorRunStats, FoldedProfileSample, GUEST_TIME_SLICE, IdleOutcome,
-    InstanceSpawner, JoinHandle, KernelClock, LocalJoinHandle, Mutex, MutexGuard, Notified, Notify,
-    NotifyWaiter, OwnedRawMutexLease, OwnedRawRwLockReadLease, OwnedRawRwLockWriteLease,
-    PerfMetricFilter, PerfMetricHistory, PerfMetricSample, PerfSample, PressureLevel,
-    ProfileFilter, ProfileHistory, ProfileScope, ProfileSink, ProgressChanged, ProgressMark,
-    ProgressSignal, RawMutex, RawMutexLease, RawRwLock, RawRwLockReadLease, RawRwLockWriteLease,
-    ReadyLink, RwLock, RwLockReadGuard, RwLockWriteGuard, Sleep, Spawner, StatsSample,
-    TaskCapacityError, TaskFunding, Timer, TraceEvent, TraceField, TraceFilter, TraceHistory,
-    TraceLevel, TraceValue, UptimeClock, YieldNow, elapsed_millis, matches_perf_metric_filter,
-    matches_profile_filter, matches_trace_filter, monotonic_nanos, parse_console_text,
-    wall_clock_offset_nanos, yield_now,
+    Executor, ExecutorRunStats, FoldedProfileSample, FreezeError, FrozenMachine, GUEST_TIME_SLICE,
+    IdleOutcome, InstanceSpawner, JoinHandle, KernelClock, LocalJoinHandle, Mutex, MutexGuard,
+    Notified, Notify, NotifyWaiter, OwnedRawMutexLease, OwnedRawRwLockReadLease,
+    OwnedRawRwLockWriteLease, PerfMetricFilter, PerfMetricHistory, PerfMetricSample, PerfSample,
+    PressureLevel, ProfileFilter, ProfileHistory, ProfileScope, ProfileSink, ProgressChanged,
+    ProgressMark, ProgressSignal, RawMutex, RawMutexLease, RawRwLock, RawRwLockReadLease,
+    RawRwLockWriteLease, ReadyLink, RwLock, RwLockReadGuard, RwLockWriteGuard, Sleep, Spawner,
+    StatsSample, TaskCapacityError, TaskFunding, Timer, TraceEvent, TraceField, TraceFilter,
+    TraceHistory, TraceLevel, TraceValue, UptimeClock, YieldNow, elapsed_millis,
+    matches_perf_metric_filter, matches_profile_filter, matches_trace_filter, monotonic_nanos,
+    parse_console_text, wall_clock_offset_nanos, yield_now,
 };
 pub use gpu::{
-    ContextRecord, Gpu3dClaim, Gpu3dOwnership, Gpu3dSender, Gpu3dService, Gpu3dServiceError,
-    MAX_GPU_BLOBS, MAX_GPU_CONTEXTS, MAX_GPU_VIEWS, install_gpu3d_device,
+    ContextRecord, ContextShared, Gpu3dOwnership, Gpu3dSender, Gpu3dService, Gpu3dServiceError,
+    Gpu3dSession, MAX_EXECUTE_BYTES, MAX_GPU_BLOBS, MAX_GPU_CONTEXTS, MAX_GPU_VIEWS,
+    MAX_MACHINE_GPU_BLOBS, MAX_MACHINE_GPU_CONTEXTS, RingTimeline, SessionId, install_gpu3d_device,
 };
 pub use helios_hal::Platform;
 pub use helios_netstack::{
@@ -203,7 +204,7 @@ pub use process::{
     AudioClaimCap, ClockAuthorityRights, CompileAuthority, DescriptorEntry, DescriptorId,
     DescriptorLimit, DescriptorTable, DescriptorTableError, DeviceClassRights, DeviceGrantClaimCap,
     DirectoryAuthorityRights, DirectoryCap, DirectoryPreopen, DisplayClaimCap, DnsCap,
-    ExecAuthority, ForkAuthority, FutexKey, FutexTable, FutexWaitRegistration, GpuClaimCap,
+    ExecAuthority, ForkAuthority, FutexKey, FutexTable, FutexWaitRegistration, GpuOpenCap,
     GuestAddress, InputClaimCap, JoinAuthority, LinkAuthorityRights, LinkSourceCap,
     LinkTargetDirectoryCap, MountAuthorityRights, MountCap, MulticastCap, NetworkAdminCap,
     NetworkAuthorityRights, NetworkCap, PrivilegedBindCap, ProcessAuthority, ProcessAuthorityError,
@@ -911,6 +912,34 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> Kernel<CpuImpl, Watch
         self.timer.sleep_for(duration)
     }
 
+    /// Holds every processor still at a scheduler boundary, from this
+    /// one, until the returned [`FrozenMachine`] is dropped.
+    ///
+    /// `arrival_deadline` is how long the caller lets the other
+    /// processors take to reach a boundary: its policy for a host that
+    /// may deschedule a processor, and for a task that does not yield.
+    /// `interrupt_guests` asks the runtime that runs guests to interrupt
+    /// each one that is running now (`GuestInterrupts::interrupt_running`),
+    /// so a processor inside wasm reaches a boundary at its next check
+    /// and not at the end of its slice. The concurrency contract, and
+    /// what the caller may do while the machine is held, are in
+    /// `exec::freeze`. The answer pets this kernel's hardware watchdog on
+    /// request, which a hold longer than the watchdog's timeout needs.
+    pub async fn freeze(
+        &self,
+        arrival_deadline: Duration,
+        interrupt_guests: impl FnOnce(),
+    ) -> Result<FrozenMachine<CpuImpl, WatchdogImpl>, FreezeError> {
+        self.executor
+            .freeze(
+                &self.timer,
+                self.watchdog.clone(),
+                arrival_deadline,
+                interrupt_guests,
+            )
+            .await
+    }
+
     pub fn run_until_stalled(&self) -> usize {
         self.run_until_stalled_with_stats().progress_count()
     }
@@ -975,6 +1004,9 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> Kernel<CpuImpl, Watch
         let mut task = core::pin::pin!(self.spawn_local(future));
 
         loop {
+            // The root future is polled outside the ready queues, so it
+            // has a scheduler boundary of its own.
+            self.executor.freeze_checkpoint(&self.cpu);
             parker.clear();
             match task.as_mut().poll(&mut context) {
                 Poll::Ready(output) => return output,
