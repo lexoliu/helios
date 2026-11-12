@@ -1245,6 +1245,17 @@ where
             .preempt_overdue(self.inner.clock_cpu.now());
     }
 
+    /// Interrupts every guest that is running on any processor now,
+    /// however long it has run: what a freeze passes as its
+    /// `interrupt_guests`, so a processor inside wasm reaches a
+    /// scheduler boundary at its next check.
+    ///
+    /// Like [`Self::preempt_overdue_guests`] it takes no lock, allocates
+    /// nothing and sends no IPI.
+    pub fn interrupt_running_guests(&self) {
+        self.inner.engine.interrupts().interrupt_running();
+    }
+
     /// Interrupts every store of `instance`, so a kill whose flag is set
     /// reaches the guest wherever it is.
     pub(crate) fn interrupt_instance(&self, instance: crate::InstanceId) {
