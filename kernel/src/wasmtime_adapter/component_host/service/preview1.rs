@@ -382,7 +382,7 @@ where
         if bytes.is_empty() {
             return RoutedOutput::Local(0);
         }
-        match self.output_mode.sink(stream) {
+        match self.output_mode.sink(stream, self.instance().id()) {
             crate::ComponentOutputSink::Local(local) => RoutedOutput::Local(local.write(
                 &self.cpu,
                 &self.runtime_state,

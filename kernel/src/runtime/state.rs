@@ -8,7 +8,7 @@ use triomphe::Arc;
 use crate::{
     BootPayload, DEFAULT_PERF_METRIC_CAPACITY, DEFAULT_PROFILE_STACK_CAPACITY,
     DEFAULT_TRACE_HISTORY_CAPACITY, EmbeddedBootFs, EmbeddedComponent, FoldedProfileSample,
-    FutexKey, FutexTable, FutexWaitRegistration, HEAP_SIZE_CLASS_COUNT, HeapStats,
+    FutexKey, FutexTable, FutexWaitRegistration, HEAP_SIZE_CLASS_COUNT, HeapStats, InstanceId,
     InstanceRegistry, InstructionSampler, Notify, PerfMetricFilter, PerfMetricHistory,
     PerfMetricSample, PerfSample, ProfileFilter, ProfileScope, ProfileSink, StatsSample,
     TraceEvent, TraceFilter, TraceLog,
@@ -361,9 +361,13 @@ where
         }
     }
 
-    pub fn record_console_text(&self, current_ticks: u64, text: &str) {
+    /// Records `text` as console events attributed to `origin`: the
+    /// instance that wrote it, or `None` for the kernel's own console.
+    pub fn record_console_text(&self, current_ticks: u64, origin: Option<InstanceId>, text: &str) {
         let timestamp = self.ticks_to_nanos(current_ticks.saturating_sub(self.inner.boot_ticks));
-        self.inner.tracing.record_console_text(timestamp, text);
+        self.inner
+            .tracing
+            .record_console_text(timestamp, origin, text);
     }
 
     pub fn recent(&self, filter: &TraceFilter, limit: u32) -> alloc::vec::Vec<Arc<TraceEvent>> {
@@ -490,21 +494,22 @@ where
             .record_str(scope, stack, weight_nanos);
     }
 
-    pub fn record_profile_stack_parts_nanos(
-        &self,
-        scope: ProfileScope,
-        prefix: &str,
-        suffix: &str,
-        weight_nanos: u64,
-    ) {
+    /// Records `weight_nanos` of time `instance`, running the program
+    /// named `program`, spent in user code, as the user-scope stack
+    /// `user;<program>` attributed to that instance.
+    ///
+    /// Concurrency: callable from any processor; it takes the profile
+    /// history's lock for one record.
+    pub fn record_user_profile(&self, instance: InstanceId, program: &str, weight_nanos: u64) {
         if !self.inner.profiles.enabled() {
             return;
         }
-        self.inner
-            .profiles
-            .profiling()
-            .lock()
-            .record_parts(scope, prefix, suffix, weight_nanos);
+        self.inner.profiles.profiling().lock().record_user_parts(
+            instance,
+            "user;",
+            program,
+            weight_nanos,
+        );
     }
 
     pub fn folded_profile(
@@ -1134,8 +1139,8 @@ where
         RuntimeState::wall_clock_offset_nanos(self)
     }
 
-    fn record_console_text(&self, current_ticks: u64, text: &str) {
-        RuntimeState::record_console_text(self, current_ticks, text);
+    fn record_console_text(&self, current_ticks: u64, origin: Option<InstanceId>, text: &str) {
+        RuntimeState::record_console_text(self, current_ticks, origin, text);
     }
 
     fn root_entropy(&self) -> &RootEntropy {
@@ -1183,14 +1188,8 @@ where
         RuntimeState::record_profile_stack_nanos(self, scope, stack, weight_nanos);
     }
 
-    fn record_profile_stack_parts_nanos(
-        &self,
-        scope: ProfileScope,
-        prefix: &str,
-        suffix: &str,
-        weight_nanos: u64,
-    ) {
-        RuntimeState::record_profile_stack_parts_nanos(self, scope, prefix, suffix, weight_nanos);
+    fn record_user_profile(&self, instance: InstanceId, program: &str, weight_nanos: u64) {
+        RuntimeState::record_user_profile(self, instance, program, weight_nanos);
     }
 
     fn record_perf_metric_parts(

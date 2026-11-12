@@ -364,7 +364,7 @@ impl crate::component::ComponentRuntimeState for TestRuntimeState {
         0
     }
 
-    fn record_console_text(&self, _: u64, _: &str) {}
+    fn record_console_text(&self, _: u64, _: Option<crate::InstanceId>, _: &str) {}
 
     fn root_entropy(&self) -> &crate::RootEntropy {
         panic!("the network test runtime state has no root entropy")
@@ -411,7 +411,7 @@ impl crate::component::ComponentRuntimeState for TestRuntimeState {
     fn record_profile_stack_nanos(&self, _: crate::ProfileScope, _: alloc::string::String, _: u64) {
     }
 
-    fn record_profile_stack_parts_nanos(&self, _: crate::ProfileScope, _: &str, _: &str, _: u64) {}
+    fn record_user_profile(&self, _: crate::InstanceId, _: &str, _: u64) {}
 
     fn record_perf_metric_parts(
         &self,

@@ -16,6 +16,8 @@ use helios_hal::cpu::HardwarePerfCounterDelta;
 use spin::Mutex;
 use triomphe::Arc;
 
+use crate::InstanceId;
+
 pub const DEFAULT_TRACE_HISTORY_CAPACITY: usize = 512;
 pub const DEFAULT_PROFILE_STACK_CAPACITY: usize = 1024;
 pub const DEFAULT_PERF_METRIC_CAPACITY: usize = 512;
@@ -126,6 +128,9 @@ pub struct TraceFilter {
 
 #[derive(Clone, Debug)]
 pub struct TraceEvent {
+    /// The instance that wrote the event, or `None` for the kernel's own
+    /// console. Fixed when the event is recorded and never changed after.
+    pub origin: Option<InstanceId>,
     pub timestamp: u64,
     pub level: TraceLevel,
     pub target: String,
@@ -255,7 +260,45 @@ pub struct PerfMetricSample {
     pub total_instructions_retired: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+impl PerfMetricSample {
+    /// Folds `other`, a row of the same scope and name held for another
+    /// origin, into this one, combining each field as a record into a
+    /// held row does: every count and total is summed, saturating, the
+    /// minimum is the smaller and the maximum the larger.
+    fn merge(&mut self, other: &Self) {
+        self.count = self.count.saturating_add(other.count);
+        self.total_events = self.total_events.saturating_add(other.total_events);
+        self.total_nanos = self.total_nanos.saturating_add(other.total_nanos);
+        self.min_nanos = self.min_nanos.min(other.min_nanos);
+        self.max_nanos = self.max_nanos.max(other.max_nanos);
+        self.total_bytes = self.total_bytes.saturating_add(other.total_bytes);
+        self.total_reference_cycles = self
+            .total_reference_cycles
+            .saturating_add(other.total_reference_cycles);
+        self.total_cpu_cycles = self.total_cpu_cycles.saturating_add(other.total_cpu_cycles);
+        self.total_instructions_retired = self
+            .total_instructions_retired
+            .saturating_add(other.total_instructions_retired);
+    }
+}
+
+/// A held sample and the instance it is attributed to: `None` for the
+/// kernel's own, `Some` for a user program's.
+///
+/// The origin is part of the key a history holds a sample under, so two
+/// instances recording one name hold two rows. A read that does not care
+/// which instance a row came from merges them; see [`ProfileHistory::rank`].
+/// The public sample types carry no origin, so what a reader sees is the
+/// same whichever way the rows were held.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Attributed<Sample> {
+    pub origin: Option<InstanceId>,
+    pub sample: Sample,
+}
+
+/// Ordered so a read can sort a snapshot by `(scope, name)` to merge the
+/// rows of one name; the order itself carries no meaning.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ProfileScope {
     Kernel,
     User,
@@ -323,9 +366,10 @@ impl TraceLog {
     }
 
     /// Records every non-empty line of `text` as one event stamped
-    /// `timestamp`, each pushed as it is parsed.
-    pub fn record_console_text(&self, timestamp: u64, text: &str) {
-        parse_console_text(timestamp, text, |event| {
+    /// `timestamp` and attributed to `origin` (`None` for the kernel's own
+    /// console), each pushed as it is parsed.
+    pub fn record_console_text(&self, timestamp: u64, origin: Option<InstanceId>, text: &str) {
+        parse_console_text(timestamp, origin, text, |event| {
             let event = Arc::new(event);
             let evicted = self.history.lock().push(event);
             // The oldest event's last reference may free it; that happens
@@ -383,8 +427,10 @@ impl TraceLog {
 /// A record holds its lock for the length of one record. A read
 /// ([`Self::folded`], [`Self::metrics`]) reserves its snapshot before
 /// locking, clones at most the history's capacity of pointers under the
-/// lock, and filters, sorts and truncates after releasing it, so no read
-/// allocates or frees while a history lock is held.
+/// lock, and filters, merges the rows of one name across origins, sorts
+/// and truncates after releasing it, so no read allocates, frees or
+/// matches while a history lock is held. The merge sorts the snapshot in
+/// place and folds adjacent rows; it builds no table.
 #[derive(Clone)]
 pub struct ProfileSink {
     inner: Arc<ProfileSinkInner>,
@@ -414,7 +460,8 @@ impl ProfileSink {
     }
 
     /// The folded stacks `filter` admits, heaviest first, at most `limit`
-    /// of them (all when `limit` is zero).
+    /// of them (all when `limit` is zero), with the rows of one stack held
+    /// for different instances merged into one.
     pub fn folded(&self, filter: &ProfileFilter, limit: u32) -> Vec<FoldedProfileSample> {
         let mut samples = Vec::with_capacity(self.inner.profile_capacity);
         self.inner.profiling.lock().copy_into(&mut samples);
@@ -422,7 +469,8 @@ impl ProfileSink {
     }
 
     /// The perf metrics `filter` admits, slowest total first, at most
-    /// `limit` of them (all when `limit` is zero).
+    /// `limit` of them (all when `limit` is zero), with the rows of one
+    /// name held for different instances merged into one.
     pub fn metrics(&self, filter: &PerfMetricFilter, limit: u32) -> Vec<PerfMetricSample> {
         let mut samples = Vec::with_capacity(self.inner.perf_metric_capacity);
         self.inner.perf_metrics.lock().copy_into(&mut samples);
@@ -483,8 +531,9 @@ impl ProfileSink {
     }
 }
 
-/// Folded stacks aggregated by `(scope, stack)`, at most `capacity` of
-/// them.
+/// Folded stacks aggregated by `(scope, origin, stack)`, at most
+/// `capacity` of them. The origin is the instance a user sample is
+/// attributed to and `None` for a kernel one.
 ///
 /// A record is O(1) in the number of stacks held: the stack is hashed
 /// once and found through [`KeyedSamples`]. Only a new stack arriving
@@ -493,20 +542,23 @@ impl ProfileSink {
 /// stack the linear scan this replaced would have found.
 #[derive(Debug)]
 pub struct ProfileHistory {
-    samples: KeyedSamples<FoldedProfileSample>,
+    samples: KeyedSamples<Attributed<FoldedProfileSample>>,
 }
 
-/// Perf metrics aggregated by `(scope, name)`, at most `capacity` of
-/// them, with the same O(1) record path as [`ProfileHistory`].
+/// Perf metrics aggregated by `(scope, origin, name)`, at most `capacity`
+/// of them, with the same O(1) record path as [`ProfileHistory`].
 #[derive(Debug)]
 pub struct PerfMetricHistory {
-    samples: KeyedSamples<PerfMetricSample>,
+    samples: KeyedSamples<Attributed<PerfMetricSample>>,
 }
 
-/// A sample a [`KeyedSamples`] can hold: named, scoped, and ranked by
-/// the number that decides which sample a full history gives up.
+/// A sample a [`KeyedSamples`] can hold: named, scoped, attributed, and
+/// ranked by the number that decides which sample a full history gives
+/// up.
 trait KeyedSample {
     fn scope(&self) -> ProfileScope;
+
+    fn origin(&self) -> Option<InstanceId>;
 
     fn name(&self) -> &str;
 
@@ -515,35 +567,43 @@ trait KeyedSample {
     fn rank(&self) -> u64;
 }
 
-impl KeyedSample for FoldedProfileSample {
+impl KeyedSample for Attributed<FoldedProfileSample> {
     fn scope(&self) -> ProfileScope {
-        self.scope
+        self.sample.scope
+    }
+
+    fn origin(&self) -> Option<InstanceId> {
+        self.origin
     }
 
     fn name(&self) -> &str {
-        &self.stack
+        &self.sample.stack
     }
 
     fn rank(&self) -> u64 {
-        self.weight
+        self.sample.weight
     }
 }
 
-impl KeyedSample for PerfMetricSample {
+impl KeyedSample for Attributed<PerfMetricSample> {
     fn scope(&self) -> ProfileScope {
-        self.scope
+        self.sample.scope
+    }
+
+    fn origin(&self) -> Option<InstanceId> {
+        self.origin
     }
 
     fn name(&self) -> &str {
-        &self.name
+        &self.sample.name
     }
 
     fn rank(&self) -> u64 {
-        self.count
+        self.sample.count
     }
 }
 
-/// A bounded set of samples keyed by `(scope, name)`.
+/// A bounded set of samples keyed by `(scope, origin, name)`.
 ///
 /// `samples` is laid out exactly as the linear history it replaces laid
 /// it out: appended on insert, `swap_remove`d on eviction. That order is
@@ -614,17 +674,22 @@ where
         self.samples.iter()
     }
 
-    fn hash(&self, scope: ProfileScope, name: &str) -> u64 {
-        self.hasher.hash_one((scope, name))
+    fn hash(&self, scope: ProfileScope, origin: Option<InstanceId>, name: &str) -> u64 {
+        self.hasher.hash_one((scope, origin, name))
     }
 
-    /// The held sample named `name` in `scope`.
-    fn get_mut(&mut self, scope: ProfileScope, name: &str) -> Option<&mut Sample> {
-        let hash = self.hash(scope, name);
+    /// The held sample named `name` in `scope` and attributed to `origin`.
+    fn get_mut(
+        &mut self,
+        scope: ProfileScope,
+        origin: Option<InstanceId>,
+        name: &str,
+    ) -> Option<&mut Sample> {
+        let hash = self.hash(scope, origin, name);
         let samples = &self.samples;
         let position = *self.index.find(hash, |&position| {
             let sample = &samples[position];
-            sample.scope() == scope && sample.name() == name
+            sample.scope() == scope && sample.origin() == origin && sample.name() == name
         })?;
         Some(&mut self.samples[position])
     }
@@ -659,7 +724,7 @@ where
             "evicting a sample that is not the lightest"
         );
         let evicted = &self.samples[position];
-        let hash = self.hash(evicted.scope(), evicted.name());
+        let hash = self.hash(evicted.scope(), evicted.origin(), evicted.name());
         match self.index.find_entry(hash, |&at| at == position) {
             Ok(entry) => {
                 entry.remove();
@@ -673,7 +738,7 @@ where
             return;
         }
         let moved = &self.samples[position];
-        let hash = self.hash(moved.scope(), moved.name());
+        let hash = self.hash(moved.scope(), moved.origin(), moved.name());
         match self.index.find_mut(hash, |&at| at == last) {
             Some(at) => *at = position,
             None => panic!("profile sample at {last} is missing from its index"),
@@ -690,7 +755,7 @@ where
         let position = self.samples.len();
         let id = self.next_id;
         self.next_id += 1;
-        let hash = self.hash(sample.scope(), sample.name());
+        let hash = self.hash(sample.scope(), sample.origin(), sample.name());
         let rank = sample.rank();
         self.samples.push(sample);
         self.ids.push(id);
@@ -702,7 +767,7 @@ where
         } = self;
         index.insert_unique(hash, position, |&at| {
             let held = &samples[at];
-            hasher.hash_one((held.scope(), held.name()))
+            hasher.hash_one((held.scope(), held.origin(), held.name()))
         });
         self.push_bound(rank, position, id);
     }
@@ -856,29 +921,54 @@ impl ProfileHistory {
         self.samples.clear();
     }
 
+    /// Records a kernel stack: it is attributed to no instance.
     pub fn record(&mut self, scope: ProfileScope, stack: String, weight: u64) {
-        self.record_input(scope, stack, weight);
+        self.record_input(scope, None, stack, weight);
     }
 
+    /// Records a kernel stack, borrowed.
     pub fn record_str(&mut self, scope: ProfileScope, stack: &str, weight: u64) {
-        self.record_input(scope, stack, weight);
+        self.record_input(scope, None, stack, weight);
     }
 
+    /// Records a kernel stack named by a prefix and a suffix.
     pub fn record_parts(&mut self, scope: ProfileScope, prefix: &str, suffix: &str, weight: u64) {
-        self.record_input(scope, ProfileStackParts { prefix, suffix }, weight);
+        self.record_input(scope, None, ProfileStackParts { prefix, suffix }, weight);
     }
 
-    fn record_input<Stack>(&mut self, scope: ProfileScope, stack: Stack, weight: u64)
-    where
+    /// Records the time `instance` spent running a user program, as the
+    /// user-scope stack `prefix` + `suffix` attributed to it.
+    pub fn record_user_parts(
+        &mut self,
+        instance: InstanceId,
+        prefix: &str,
+        suffix: &str,
+        weight: u64,
+    ) {
+        self.record_input(
+            ProfileScope::User,
+            Some(instance),
+            ProfileStackParts { prefix, suffix },
+            weight,
+        );
+    }
+
+    fn record_input<Stack>(
+        &mut self,
+        scope: ProfileScope,
+        origin: Option<InstanceId>,
+        stack: Stack,
+        weight: u64,
+    ) where
         Stack: ProfileStackInput,
     {
         if weight == 0 {
             return;
         }
 
-        let held = stack.with_name(|name| match self.samples.get_mut(scope, name) {
-            Some(sample) => {
-                sample.weight = sample.weight.saturating_add(weight);
+        let held = stack.with_name(|name| match self.samples.get_mut(scope, origin, name) {
+            Some(held) => {
+                held.sample.weight = held.sample.weight.saturating_add(weight);
                 true
             }
             None => false,
@@ -892,23 +982,26 @@ impl ProfileHistory {
                 .samples
                 .lightest()
                 .expect("a full profile history has a lightest entry");
-            if self.samples.samples[lightest].weight >= weight {
+            if self.samples.samples[lightest].sample.weight >= weight {
                 return;
             }
             self.samples.evict(lightest);
         }
 
-        self.samples.insert(FoldedProfileSample {
-            scope,
-            stack: stack.into_shared(),
-            weight,
+        self.samples.insert(Attributed {
+            origin,
+            sample: FoldedProfileSample {
+                scope,
+                stack: stack.into_shared(),
+                weight,
+            },
         });
     }
 
     /// Appends a copy of every held sample to `out`, in the history's
     /// own order. `out` must have room for them, so nothing allocates: a
     /// copy clones a pointer, not the stack.
-    pub fn copy_into(&self, out: &mut Vec<FoldedProfileSample>) {
+    pub fn copy_into(&self, out: &mut Vec<Attributed<FoldedProfileSample>>) {
         debug_assert!(
             out.capacity() - out.len() >= self.samples.samples.len(),
             "the snapshot was not reserved before the lock"
@@ -916,26 +1009,51 @@ impl ProfileHistory {
         out.extend(self.samples.iter().cloned());
     }
 
-    /// Filters a copy taken by [`Self::copy_into`], orders it heaviest
-    /// first (ties by stack) and keeps `limit` of it, all when `limit` is
-    /// zero. It takes no lock, so it is for after the lock is released.
+    /// Filters a copy taken by [`Self::copy_into`], merges the rows of one
+    /// `(scope, stack)` held for different origins into one row of their
+    /// summed weight, orders the result heaviest first (ties by stack,
+    /// then scope) and keeps `limit` of it, all when `limit` is zero.
+    ///
+    /// The merge sorts the copy by `(scope, stack)` in place and folds
+    /// adjacent equal rows in place, so it allocates nothing and builds no
+    /// table. Only the returned list, which drops the origins, is a new
+    /// allocation. It takes no lock, so it is for after the lock is
+    /// released.
     pub fn rank(
-        mut samples: Vec<FoldedProfileSample>,
+        mut samples: Vec<Attributed<FoldedProfileSample>>,
         filter: &ProfileFilter,
         limit: u32,
     ) -> Vec<FoldedProfileSample> {
-        samples.retain(|sample| matches_profile_filter(sample, filter));
-        samples.sort_by(|left, right| {
+        samples.retain(|row| matches_profile_filter(&row.sample, filter));
+        samples.sort_unstable_by(|left, right| {
+            left.sample
+                .scope
+                .cmp(&right.sample.scope)
+                .then_with(|| (*left.sample.stack).cmp(&*right.sample.stack))
+        });
+        samples.dedup_by(|next, kept| {
+            let same =
+                next.sample.scope == kept.sample.scope && *next.sample.stack == *kept.sample.stack;
+            if same {
+                kept.sample.weight = kept.sample.weight.saturating_add(next.sample.weight);
+            }
+            same
+        });
+        // `(scope, stack)` is unique after the merge, so this order is
+        // total and an unstable sort is exact.
+        samples.sort_unstable_by(|left, right| {
             right
+                .sample
                 .weight
-                .cmp(&left.weight)
-                .then_with(|| (*left.stack).cmp(&*right.stack))
+                .cmp(&left.sample.weight)
+                .then_with(|| (*left.sample.stack).cmp(&*right.sample.stack))
+                .then_with(|| left.sample.scope.cmp(&right.sample.scope))
         });
         let keep = limit as usize;
         if keep != 0 && samples.len() > keep {
             samples.truncate(keep);
         }
-        samples
+        samples.into_iter().map(|row| row.sample).collect()
     }
 }
 
@@ -978,10 +1096,12 @@ impl PerfMetricHistory {
         self.samples.clear();
     }
 
+    /// Records a kernel metric, which is attributed to no instance.
     pub fn record_str(&mut self, scope: ProfileScope, name: &str, sample: PerfSample) {
-        self.record_input(scope, name, sample);
+        self.record_input(scope, None, name, sample);
     }
 
+    /// Records a kernel metric named by a prefix and a suffix.
     pub fn record_parts(
         &mut self,
         scope: ProfileScope,
@@ -989,11 +1109,16 @@ impl PerfMetricHistory {
         suffix: &str,
         sample: PerfSample,
     ) {
-        self.record_input(scope, ProfileStackParts { prefix, suffix }, sample);
+        self.record_input(scope, None, ProfileStackParts { prefix, suffix }, sample);
     }
 
-    fn record_input<Name>(&mut self, scope: ProfileScope, name: Name, sample: PerfSample)
-    where
+    fn record_input<Name>(
+        &mut self,
+        scope: ProfileScope,
+        origin: Option<InstanceId>,
+        name: Name,
+        sample: PerfSample,
+    ) where
         Name: ProfileStackInput,
     {
         let PerfSample {
@@ -1012,8 +1137,9 @@ impl PerfMetricHistory {
             return;
         }
 
-        let held = name.with_name(|key| match self.samples.get_mut(scope, key) {
-            Some(sample) => {
+        let held = name.with_name(|key| match self.samples.get_mut(scope, origin, key) {
+            Some(held) => {
+                let sample = &mut held.sample;
                 sample.count = sample.count.saturating_add(1);
                 sample.total_events = sample.total_events.saturating_add(events);
                 sample.total_nanos = sample.total_nanos.saturating_add(elapsed_nanos);
@@ -1044,25 +1170,28 @@ impl PerfMetricHistory {
             self.samples.evict(coldest);
         }
 
-        self.samples.insert(PerfMetricSample {
-            scope,
-            name: name.into_shared(),
-            count: 1,
-            total_events: events,
-            total_nanos: elapsed_nanos,
-            min_nanos: elapsed_nanos,
-            max_nanos: elapsed_nanos,
-            total_bytes: bytes,
-            total_reference_cycles: counters.reference_cycles,
-            total_cpu_cycles: counters.cpu_cycles,
-            total_instructions_retired: counters.instructions_retired,
+        self.samples.insert(Attributed {
+            origin,
+            sample: PerfMetricSample {
+                scope,
+                name: name.into_shared(),
+                count: 1,
+                total_events: events,
+                total_nanos: elapsed_nanos,
+                min_nanos: elapsed_nanos,
+                max_nanos: elapsed_nanos,
+                total_bytes: bytes,
+                total_reference_cycles: counters.reference_cycles,
+                total_cpu_cycles: counters.cpu_cycles,
+                total_instructions_retired: counters.instructions_retired,
+            },
         });
     }
 
     /// Appends a copy of every held sample to `out`, in the history's
     /// own order. `out` must have room for them, so nothing allocates: a
     /// copy clones a pointer, not the name.
-    pub fn copy_into(&self, out: &mut Vec<PerfMetricSample>) {
+    pub fn copy_into(&self, out: &mut Vec<Attributed<PerfMetricSample>>) {
         debug_assert!(
             out.capacity() - out.len() >= self.samples.samples.len(),
             "the snapshot was not reserved before the lock"
@@ -1070,39 +1199,70 @@ impl PerfMetricHistory {
         out.extend(self.samples.iter().cloned());
     }
 
-    /// Filters a copy taken by [`Self::copy_into`], orders it by total
-    /// time, then count, then name, and keeps `limit` of it, all when
-    /// `limit` is zero. It takes no lock, so it is for after the lock is
+    /// Filters a copy taken by [`Self::copy_into`], merges the rows of one
+    /// `(scope, name)` held for different origins into one row (see
+    /// [`PerfMetricSample::merge`]: counts and totals are summed, the
+    /// minimum and maximum latency are the least and the greatest), orders
+    /// the result by total time, then count, then name, then scope, and
+    /// keeps `limit` of it, all when `limit` is zero.
+    ///
+    /// The merge sorts the copy by `(scope, name)` in place and folds
+    /// adjacent equal rows in place, so it allocates nothing and builds no
+    /// table. Only the returned list, which drops the origins, is a new
+    /// allocation. It takes no lock, so it is for after the lock is
     /// released.
     pub fn rank(
-        mut samples: Vec<PerfMetricSample>,
+        mut samples: Vec<Attributed<PerfMetricSample>>,
         filter: &PerfMetricFilter,
         limit: u32,
     ) -> Vec<PerfMetricSample> {
-        samples.retain(|sample| matches_perf_metric_filter(sample, filter));
-        samples.sort_by(|left, right| {
+        samples.retain(|row| matches_perf_metric_filter(&row.sample, filter));
+        samples.sort_unstable_by(|left, right| {
+            left.sample
+                .scope
+                .cmp(&right.sample.scope)
+                .then_with(|| (*left.sample.name).cmp(&*right.sample.name))
+        });
+        samples.dedup_by(|next, kept| {
+            let same =
+                next.sample.scope == kept.sample.scope && *next.sample.name == *kept.sample.name;
+            if same {
+                kept.sample.merge(&next.sample);
+            }
+            same
+        });
+        // `(scope, name)` is unique after the merge, so this order is
+        // total and an unstable sort is exact.
+        samples.sort_unstable_by(|left, right| {
             right
+                .sample
                 .total_nanos
-                .cmp(&left.total_nanos)
-                .then_with(|| right.count.cmp(&left.count))
-                .then_with(|| (*left.name).cmp(&*right.name))
+                .cmp(&left.sample.total_nanos)
+                .then_with(|| right.sample.count.cmp(&left.sample.count))
+                .then_with(|| (*left.sample.name).cmp(&*right.sample.name))
+                .then_with(|| left.sample.scope.cmp(&right.sample.scope))
         });
         let keep = limit as usize;
         if keep != 0 && samples.len() > keep {
             samples.truncate(keep);
         }
-        samples
+        samples.into_iter().map(|row| row.sample).collect()
     }
 }
 
 /// Hands `push` one event per non-empty line of `text`, each as soon as it
 /// is parsed, so no list of them is built.
-pub fn parse_console_text(timestamp: u64, text: &str, mut push: impl FnMut(TraceEvent)) {
+pub fn parse_console_text(
+    timestamp: u64,
+    origin: Option<InstanceId>,
+    text: &str,
+    mut push: impl FnMut(TraceEvent),
+) {
     let stripped = strip_ansi(text);
     for raw_line in stripped.lines() {
         let line = raw_line.trim();
         if !line.is_empty() {
-            push(parse_console_line(timestamp, line));
+            push(parse_console_line(timestamp, origin, line));
         }
     }
 }
@@ -1129,9 +1289,10 @@ pub fn matches_perf_metric_filter(sample: &PerfMetricSample, filter: &PerfMetric
     filter.name_prefixes.admits(&sample.name)
 }
 
-fn parse_console_line(timestamp: u64, line: &str) -> TraceEvent {
+fn parse_console_line(timestamp: u64, origin: Option<InstanceId>, line: &str) -> TraceEvent {
     if let Some((level, target, message)) = split_prefixed_line(line) {
         return TraceEvent {
+            origin,
             timestamp,
             level,
             target,
@@ -1143,6 +1304,7 @@ fn parse_console_line(timestamp: u64, line: &str) -> TraceEvent {
     }
 
     TraceEvent {
+        origin,
         timestamp,
         level: TraceLevel::Info,
         target: "console".to_owned(),
@@ -1224,9 +1386,11 @@ mod tests {
     use super::{
         FoldedProfileSample, MAX_FILTER_PREFIX_BYTES, MAX_FILTER_PREFIXES, PerfMetricFilter,
         PerfMetricHistory, PerfMetricSample, PerfSample, PrefixSet, PrefixSetError, ProfileFilter,
-        ProfileHistory, ProfileScope, ProfileSink, TRACE_STREAM_BATCH, TraceEvent, TraceField,
-        TraceFilter, TraceLevel, TraceLog, TraceValue, matches_trace_filter, parse_console_text,
+        ProfileHistory, ProfileScope, ProfileSink, ProfileStackParts, TRACE_STREAM_BATCH,
+        TraceEvent, TraceField, TraceFilter, TraceLevel, TraceLog, TraceValue,
+        matches_trace_filter, parse_console_text,
     };
+    use crate::InstanceId;
     use helios_hal::cpu::HardwarePerfCounterDelta;
     use triomphe::Arc;
 
@@ -1258,6 +1422,7 @@ mod tests {
 
     fn event(target: &str, message: &str) -> TraceEvent {
         TraceEvent {
+            origin: None,
             timestamp: 0,
             level: TraceLevel::Info,
             target: target.to_owned(),
@@ -1306,9 +1471,12 @@ mod tests {
     #[test]
     fn parses_kernel_console_prefixes() {
         let mut parsed = Vec::new();
-        parse_console_text(42, "INFO [helios_kernel] Kernel initialized", |event| {
-            parsed.push(event)
-        });
+        parse_console_text(
+            42,
+            None,
+            "INFO [helios_kernel] Kernel initialized",
+            |event| parsed.push(event),
+        );
         let event = parsed
             .into_iter()
             .next()
@@ -1327,7 +1495,11 @@ mod tests {
     #[test]
     fn trace_history_applies_filter_and_limit() {
         let history = TraceLog::new(8);
-        history.record_console_text(1, "INFO [helios_kernel] one\nWARN [helios_shell] two\n");
+        history.record_console_text(
+            1,
+            None,
+            "INFO [helios_kernel] one\nWARN [helios_shell] two\n",
+        );
 
         let filter = TraceFilter {
             min_level: Some(TraceLevel::Warn),
@@ -1476,7 +1648,7 @@ mod tests {
         let mut cursor = 0;
         assert_eq!(drain(&log, &mut cursor, &everything), ["0", "1", "2"]);
 
-        log.record_console_text(0, "INFO [late] later\n");
+        log.record_console_text(0, None, "INFO [late] later\n");
         let late = log
             .next_after(&mut cursor, &everything)
             .expect("an event recorded after the drain is delivered");
@@ -1487,6 +1659,7 @@ mod tests {
     #[test]
     fn filter_accepts_matching_event() {
         let event = TraceEvent {
+            origin: None,
             timestamp: 7,
             level: TraceLevel::Error,
             target: "helios_kernel".to_owned(),
@@ -1619,11 +1792,14 @@ mod tests {
 
         fn folded(&self) -> Vec<FoldedProfileSample> {
             let mut samples = self.samples.clone();
+            // The read orders equal weights and stacks by scope, where the
+            // history it replaced left them in insertion order.
             samples.sort_by(|left, right| {
                 right
                     .weight
                     .cmp(&left.weight)
                     .then_with(|| (*left.stack).cmp(&*right.stack))
+                    .then_with(|| left.scope.cmp(&right.scope))
             });
             samples
         }
@@ -1668,6 +1844,7 @@ mod tests {
                     .cmp(&left.3)
                     .then_with(|| right.2.cmp(&left.2))
                     .then_with(|| left.1.cmp(&right.1))
+                    .then_with(|| left.0.cmp(&right.0))
             });
             samples
         }
@@ -1947,6 +2124,191 @@ mod tests {
         );
         let korean = "한".repeat(MAX_FILTER_PREFIX_BYTES / 3);
         assert!(PrefixSet::from_prefixes([korean.as_str()]).is_ok());
+    }
+
+    fn instance(raw: u64) -> InstanceId {
+        InstanceId::from_raw(raw)
+    }
+
+    fn any_stack() -> ProfileFilter {
+        ProfileFilter {
+            scope: None,
+            stack_prefixes: PrefixSet::default(),
+        }
+    }
+
+    fn any_metric() -> PerfMetricFilter {
+        PerfMetricFilter {
+            name_prefixes: PrefixSet::default(),
+        }
+    }
+
+    #[test]
+    fn two_instances_recording_one_user_stack_are_two_rows_read_as_one() {
+        let mut history = ProfileHistory::new(8);
+        let (first, second) = (instance(1), instance(2));
+        history.record_user_parts(first, "user;", "dash", 3);
+        history.record_user_parts(second, "user;", "dash", 4);
+        history.record_user_parts(first, "user;", "dash", 5);
+
+        // Held apart: one row per origin.
+        assert_eq!(history.samples.samples.len(), 2);
+
+        let samples = folded(&history, &any_stack(), 0);
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].scope, ProfileScope::User);
+        assert_eq!(&*samples[0].stack, "user;dash");
+        assert_eq!(samples[0].weight, 12);
+    }
+
+    /// A metric merge sums `count`, `total_events`, `total_nanos`,
+    /// `total_bytes` and the three hardware totals, and takes the least
+    /// `min_nanos` and the greatest `max_nanos`: the same combination a
+    /// record into a held row applies.
+    #[test]
+    fn two_instances_recording_one_metric_are_two_rows_read_as_one() {
+        let mut history = PerfMetricHistory::new(8);
+        let (first, second) = (instance(1), instance(2));
+        let sample = |events, elapsed_nanos, bytes, cycles| PerfSample {
+            events,
+            elapsed_nanos,
+            counters: HardwarePerfCounterDelta {
+                reference_cycles: cycles,
+                cpu_cycles: cycles * 2,
+                instructions_retired: cycles * 3,
+            },
+            bytes,
+        };
+        history.record_input(
+            ProfileScope::User,
+            Some(first),
+            "user;m",
+            sample(1, 10, 100, 1),
+        );
+        history.record_input(
+            ProfileScope::User,
+            Some(first),
+            "user;m",
+            sample(2, 30, 200, 2),
+        );
+        history.record_input(
+            ProfileScope::User,
+            Some(second),
+            "user;m",
+            sample(4, 4, 400, 4),
+        );
+
+        assert_eq!(history.samples.samples.len(), 2);
+
+        let merged = metrics(&history, &any_metric(), 0);
+        assert_eq!(merged.len(), 1);
+        let merged = &merged[0];
+        assert_eq!(merged.scope, ProfileScope::User);
+        assert_eq!(&*merged.name, "user;m");
+        assert_eq!(merged.count, 3);
+        assert_eq!(merged.total_events, 7);
+        assert_eq!(merged.total_nanos, 44);
+        assert_eq!(merged.min_nanos, 4);
+        assert_eq!(merged.max_nanos, 30);
+        assert_eq!(merged.total_bytes, 700);
+        assert_eq!(merged.total_reference_cycles, 7);
+        assert_eq!(merged.total_cpu_cycles, 14);
+        assert_eq!(merged.total_instructions_retired, 21);
+    }
+
+    #[test]
+    fn kernel_and_user_rows_of_one_name_do_not_merge() {
+        let mut history = ProfileHistory::new(8);
+        history.record_str(ProfileScope::Kernel, "shared", 5);
+        history.record_user_parts(instance(1), "", "shared", 7);
+        let samples = folded(&history, &any_stack(), 0);
+        let rows = samples
+            .iter()
+            .map(|sample| (sample.scope, &*sample.stack, sample.weight))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows,
+            [
+                (ProfileScope::User, "shared", 7),
+                (ProfileScope::Kernel, "shared", 5)
+            ]
+        );
+
+        let mut perf = PerfMetricHistory::new(8);
+        let timed = PerfSample::timed(9, HardwarePerfCounterDelta::default(), 0);
+        perf.record_str(ProfileScope::Kernel, "shared", timed);
+        perf.record_input(ProfileScope::User, Some(instance(1)), "shared", timed);
+        let samples = metrics(&perf, &any_metric(), 0);
+        assert_eq!(samples.len(), 2);
+        assert!(samples.iter().all(|sample| sample.count == 1));
+    }
+
+    #[test]
+    fn merged_read_orders_and_limits_like_a_single_origin_history() {
+        let mut split = ProfileHistory::new(64);
+        let mut single = ProfileHistory::new(64);
+        let mut split_perf = PerfMetricHistory::new(64);
+        let mut single_perf = PerfMetricHistory::new(64);
+        for step in 0..120_u64 {
+            let stack = alloc::format!("stack-{}", step % 7);
+            let weight = step % 5 + 1;
+            // Three instances take the records in turn; the single-origin
+            // history takes all of them.
+            let origin = instance(step % 3);
+            split.record_user_parts(origin, "user;", &stack, weight);
+            single.record_input(
+                ProfileScope::User,
+                None,
+                ProfileStackParts {
+                    prefix: "user;",
+                    suffix: &stack,
+                },
+                weight,
+            );
+            let timed = PerfSample::timed(weight, HardwarePerfCounterDelta::default(), weight);
+            split_perf.record_input(ProfileScope::User, Some(origin), stack.as_str(), timed);
+            single_perf.record_input(ProfileScope::User, None, stack.as_str(), timed);
+        }
+        assert!(split.samples.samples.len() > single.samples.samples.len());
+
+        for limit in [0, 1, 3, 7] {
+            assert_eq!(
+                folded(&split, &any_stack(), limit),
+                folded(&single, &any_stack(), limit),
+                "folded, limit {limit}"
+            );
+            assert_eq!(
+                metrics(&split_perf, &any_metric(), limit),
+                metrics(&single_perf, &any_metric(), limit),
+                "metrics, limit {limit}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_event_keeps_its_origin_through_recent_and_next_after() {
+        let log = TraceLog::new(8);
+        let writer = instance(7);
+        log.record_console_text(1, Some(writer), "INFO [guest] hello\n");
+        log.record_console_text(2, None, "INFO [kernel] boot\n");
+        let everything = TraceFilter {
+            min_level: None,
+            target_prefixes: PrefixSet::default(),
+        };
+
+        let recent = log.recent(&everything, 8);
+        let origins = recent.iter().map(|event| event.origin).collect::<Vec<_>>();
+        assert_eq!(origins, [Some(writer), None]);
+
+        let mut cursor = 0;
+        let first = log
+            .next_after(&mut cursor, &everything)
+            .expect("the first event is delivered");
+        assert_eq!(first.origin, Some(writer));
+        let second = log
+            .next_after(&mut cursor, &everything)
+            .expect("the second event is delivered");
+        assert_eq!(second.origin, None);
     }
 
     #[test]
