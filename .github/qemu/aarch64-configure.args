@@ -1,0 +1,6 @@
+--target-list=aarch64-softmmu
+--enable-slirp
+--disable-docs
+--disable-gtk
+--disable-sdl
+--disable-vnc

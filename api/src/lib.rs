@@ -31,6 +31,8 @@ pub mod input;
 pub mod instances;
 #[cfg(feature = "io")]
 pub mod io;
+#[cfg(any(feature = "display", feature = "gpu", feature = "surface"))]
+pub mod memory;
 #[cfg(feature = "net")]
 pub mod net;
 pub mod prelude;
@@ -40,6 +42,8 @@ pub mod profiling;
 pub mod programs;
 #[cfg(feature = "serial")]
 pub mod serial;
+#[cfg(feature = "snapshot")]
+pub mod snapshot;
 #[cfg(feature = "stats")]
 pub mod stats;
 #[cfg(feature = "surface")]

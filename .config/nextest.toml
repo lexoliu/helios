@@ -8,3 +8,10 @@
 # third period is killed and reported as a failure: a lost wake-up (AGENTS.md
 # §4) becomes a named failure in three minutes rather than a lane timeout.
 slow-timeout = { period = "60s", terminate-after = 3 }
+
+# The Mesa parity test generates and compiles Mesa's driver and renderer
+# protocol headers (about a minute each, in parallel) before it compares any
+# bytes, so its first period is the generator's, not a hang.
+[[profile.default.overrides]]
+filter = "package(helios-venus) & test(encoders_match_mesas_generator)"
+slow-timeout = { period = "300s", terminate-after = 4 }

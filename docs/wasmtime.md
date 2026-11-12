@@ -5,13 +5,65 @@ at `../wasmtime/crates/wasmtime`.
 
 ## Required revision
 
-The local checkout must be at (branch `helios/parking-wait-cancel`):
+The local checkout must be at (branch `helios/next-solver-bindgen`):
 
 ```text
-2fb47b20c7ff9a91b6dbc03062d1dd4dddab4969
+18b428e6becfb6138b877a3fe70afb08bf5724ba
 ```
 
-That revision is `helios/parking-wait-timeout` at
+That revision is `helios/stack-limit-percpu` at
+`1ed7678a8ee4f57cbe4a4e89ade7f7fda6092055` plus upstream
+bytecodealliance/wasmtime#14193 (30dddb655), which spells out the type
+arguments of `with_getter` and `Access::new` in the code `bindgen!`
+generates; nightly's next-generation trait solver no longer infers them.
+
+`helios/stack-limit-percpu` is `helios/parking-wait-cancel` at
+`2fb47b20c7ff9a91b6dbc03062d1dd4dddab4969` plus four additive commits,
+which make each stack-limit interruption check one compare against the
+executing processor's own word (#465):
+
+- The resumable check's cold call goes through a `preserve_all`
+  trampoline, so it clobbers no register and a call-free function keeps
+  its values in caller-saved registers across its checks.
+- Cranelift gains `load_processor_local.i64 +offset`, a load from the
+  thread-pointer base (`fs` on x86-64, `tpidr_el1` on AArch64, `tp` on
+  RISC-V 64) that is never merged or hoisted. On x86-64 a stack check
+  against it lowers to `cmp rsp, fs:[offset]; jb`. To get there, a
+  branch may now sink a side-effecting single-use input as any other
+  instruction may, and `get_stack_pointer` is rematerialized per block.
+- `memory.copy` and `memory.fill` no longer expand into a chunk loop with
+  a check between chunks under stack-limit interruption: the libcalls
+  chunk the work and deliver a pending interrupt between chunks
+  themselves, through the same callback as the builtin.
+- `Config::stack_limit_location(StackLimitLocation::PerProcessor { offset })`
+  makes every resumable check read the processor's word instead of
+  `VMStoreContext::stack_limit`. It is a tunable, so a cwasm compiled for
+  one location is refused by an engine set to the other. A `no_std` build
+  with the `custom-processor-stack-limit` feature declares
+  `wasmtime_processor_stack_limit() -> *mut usize`, which returns the
+  executing processor's word; a build without it neither links the hook
+  nor runs per-processor code, though it still compiles it. The runtime publishes the store's limit
+  there when its wasm enters or resumes on a processor, and when it leaves
+  the innermost activation left on the thread publishes its own again. An
+  interrupt request stores the pending flag and raises the sentinel in the
+  word the store was last published to: no lock, no allocation, no IPI.
+- A riscv64 `preserve_all` frame saves the vector registers only when the
+  ISA has V. The builtin trampolines are `preserve_all`, and on a hart
+  without V (QEMU's `rv64imafdch`) their `vsetivli`/`vse8.v` saves were an
+  illegal instruction on the first interrupt.
+
+Helios needs it because the store-context check costs 7-8 instructions
+and a register chain per loop iteration (12-31% on compute against no
+interruption). Every bare-metal backend keeps the word at
+`helios_hal::cpu::GUEST_STACK_LIMIT_OFFSET` in its processor anchor
+block and exports `wasmtime_processor_stack_limit`, which the kernel's
+`wasmtime-bare-metal` feature links through `custom-processor-stack-limit`;
+`hosted` keeps the
+store-context location.
+
+The revision it replaces is `helios/parking-wait-cancel` at
+`2fb47b20c7ff9a91b6dbc03062d1dd4dddab4969`, which is
+`helios/parking-wait-timeout` at
 `3741766da8e691dfa9e642ab9f16cfb30c1fc5a3` plus one additive commit
 (written on that branch's earlier `62bf033a` and merged forward), which
 gives a `no_std` `memory.atomic.wait` a cancellation exit (#445):
@@ -173,7 +225,7 @@ This revision is based on upstream Wasmtime commit:
 ```
 
 It corresponds to Wasmtime 48.0.0-dev and requires Rust 1.95 or newer. Helios
-pins `nightly-2026-06-15` in `rust-toolchain.toml` for Rust 1.98 and installs all
+pins `nightly-2026-11-03` in `rust-toolchain.toml` for Rust 1.101 and installs all
 host, bare-metal, and WASI targets used by the workspace.
 
 ## Patch series

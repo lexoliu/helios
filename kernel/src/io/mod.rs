@@ -15,8 +15,11 @@ mod poll_registry;
 mod serial;
 
 pub use block::{
-    BlockInstallError, BlockSelfCheckError, BlockService, BlockStats, SCRATCH_DISK_SERIAL,
-    install_block_devices,
+    BlockCache, BlockCacheError, BlockCacheLimits, BlockInstallError, BlockMut, BlockPages,
+    BlockRef, BlockRouteError, BlockSelfCheckError, BlockService, BlockStats, CACHE_BLOCK_BYTES,
+    CacheLayoutError, CachedDisk, CachedDiskStats, DiskRefusal, DiskRole, SCRATCH_DISK_SERIAL,
+    ScratchDisk, ScratchDiskStats, admit_block_devices, install_block_devices,
+    install_scratch_swap,
 };
 pub use child::{
     ByteReadWait, ByteReader, ByteWriteWait, ByteWriter, ClosedPeer, TryRead, TryWrite,

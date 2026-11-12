@@ -734,7 +734,7 @@ impl<'a> TcpOptions<'a> {
                             options.sack_permitted = true;
                         }
                         5 if data.len().is_multiple_of(8) => {
-                            for block in data.chunks_exact(8) {
+                            for block in data.as_chunks::<8>().0 {
                                 options
                                     .sack_blocks
                                     .push(TcpSackBlock {
@@ -1034,6 +1034,21 @@ impl<'a> Icmpv4Packet<'a> {
         }
     }
 
+    /// The echo request an ICMP error quotes. RFC 792 guarantees the
+    /// quote only the original datagram's first 8 payload octets, which
+    /// are the whole echo header, so the payload may be cut short and
+    /// the checksum cannot be checked.
+    pub fn parse_quoted_echo_request(bytes: &'a [u8]) -> Option<Icmpv4Echo<'a>> {
+        if bytes.len() < Self::HEADER_LEN || bytes[..2] != [8, 0] {
+            return None;
+        }
+        Some(Icmpv4Echo {
+            identifier: read_u16(bytes, 4)?,
+            sequence: read_u16(bytes, 6)?,
+            payload: &bytes[Self::HEADER_LEN..],
+        })
+    }
+
     /// Encodes an Echo Request (RFC 792) carrying `payload`.
     pub fn encode_echo_request(
         output: &mut [u8],
@@ -1173,8 +1188,10 @@ pub struct NdpRecursiveDnsServers<'a> {
 impl<'a> NdpRecursiveDnsServers<'a> {
     pub fn addresses(self) -> impl Iterator<Item = Ipv6Address> + 'a {
         self.addresses
-            .chunks_exact(16)
-            .map(|chunk| Ipv6Address::new(chunk.try_into().expect("16-byte chunk")))
+            .as_chunks::<16>()
+            .0
+            .iter()
+            .map(|&chunk| Ipv6Address::new(chunk))
     }
 }
 
@@ -1412,6 +1429,20 @@ impl<'a> Icmpv6Packet<'a> {
         let checksum = icmpv6_checksum(source, destination, &output[..len]);
         write_u16(output, 2, checksum)?;
         Some(len)
+    }
+
+    /// The echo request an ICMPv6 error quotes. The quote may be cut
+    /// short anywhere past the echo header (RFC 4443 section 2.4 (c)),
+    /// so the checksum cannot be checked.
+    pub fn parse_quoted_echo_request(bytes: &'a [u8]) -> Option<Icmpv6Echo<'a>> {
+        if bytes.len() < Self::ECHO_HEADER_LEN || bytes[..2] != [128, 0] {
+            return None;
+        }
+        Some(Icmpv6Echo {
+            identifier: read_u16(bytes, 4)?,
+            sequence: read_u16(bytes, 6)?,
+            payload: &bytes[Self::ECHO_HEADER_LEN..],
+        })
     }
 
     /// Encodes an Echo Request (RFC 4443 §4.1) carrying `payload`.

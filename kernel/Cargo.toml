@@ -26,6 +26,10 @@ wasmtime-bare-metal = [
     # Only compiles alongside `custom-virtual-memory` on a bare-metal target:
     # the pooling allocator is written against wasmtime's `Mmap`.
     "wasmtime/pooling-allocator",
+    # Every bare-metal engine keeps the stack-limit interruption word in the
+    # processor's anchor block (`hal::cpu::GUEST_STACK_LIMIT_OFFSET`); the
+    # backends answer the `wasmtime_processor_stack_limit` hook this links.
+    "wasmtime/custom-processor-stack-limit",
 ]
 
 [dependencies]
@@ -64,6 +68,8 @@ spin = { version = "0.9.8", default-features = false, features = ["mutex", "once
 wasmparser = { version = "0.245.0", default-features = false, features = ["component-model"] }
 talc = { version = "=5.1.0", default-features = false, features = ["counters"] }
 frame-alloc = { version = "=0.1.0", default-features = false, features = ["stats"] }
+# The fork makes `CompressContext` available without `std` (paddor/zrip#106).
+zrip = { git = "https://github.com/lexoliu/zrip", branch = "compress-context-alloc", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 critical-section = { version = "1.2.0", features = ["std"] }

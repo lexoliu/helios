@@ -37,6 +37,7 @@ use crate::{
     ConnectError, InterruptError, SessionCommand, SessionError, connect_client, run_connected,
 };
 
+mod disk;
 mod input;
 mod instruction_profile;
 mod kernel_image;
@@ -47,6 +48,7 @@ mod raw_profile;
 mod vcpu_state;
 mod x86_image_audit;
 
+use disk::{DiskSpecError, VmDiskSpec, validate_disks};
 use input::{InputScript, InputScriptError, InputStatement};
 use network::{
     HostPlatform, NetSetupCommand, NetTeardownCommand, QemuNetArgs, VmNetwork, VmNetworkArgs,
@@ -138,6 +140,14 @@ pub(crate) enum VmConfigError {
     NoNativeAccelerator(#[from] NoNativeAccelerator),
     #[error("--data-disk-size must be greater than zero")]
     ZeroDataDiskSize,
+    #[error("{0}")]
+    DiskSpec(#[from] DiskSpecError),
+    #[error("--disk image {path} cannot be opened: {source}")]
+    DiskImage {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
     #[error("--gdb-wait requires --gdb or --debug")]
     GdbWaitWithoutGdb,
     #[error("{0}")]
@@ -165,6 +175,8 @@ pub(crate) enum VmConfigError {
     Network(#[from] VmNetworkError),
     #[error("{0}")]
     AudioDev(#[from] AudioDevError),
+    #[error("--shared-dir-writable requires --shared-dir (or `shared_dir` in the config file)")]
+    WritableShareWithoutDir,
     #[error("shared directory does not exist: {path}")]
     SharedDirMissing { path: String },
     #[error("aarch64-virt-hvf requires an aarch64 host; pass --accel tcg explicitly for TCG")]
@@ -686,6 +698,15 @@ enum VmDataDiskProfile {
 enum VmHostShareProfile {
     Virtio9pMmio,
     Virtio9pPci,
+}
+
+/// What the guest may do to the directory `--shared-dir` exports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostShareAccess {
+    /// QEMU refuses every write the guest sends.
+    ReadOnly,
+    /// The guest can create, rewrite and delete files in the host directory.
+    ReadWrite,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1425,6 +1446,10 @@ pub(crate) struct VmConfigFile {
     pub(crate) keep_runtime_dir: Option<bool>,
     #[serde(default)]
     pub(crate) data_disk_size: Option<u64>,
+    /// `--disk` entries, in the same `<image>,serial=<name>[,readonly]`
+    /// form; the command line's are attached after these.
+    #[serde(default)]
+    pub(crate) disk: Vec<String>,
     #[serde(default)]
     pub(crate) acpi: Option<bool>,
     #[serde(default)]
@@ -1547,12 +1572,24 @@ pub(crate) struct VmCommand {
     #[arg(long)]
     accel: Vec<String>,
 
+    /// Host directory exported to the guest over 9p, read-only unless
+    /// `--shared-dir-writable` is given.
     #[arg(long)]
     shared_dir: Option<PathBuf>,
+
+    /// Let the guest write to `--shared-dir`. Without it the share is
+    /// read-only, so a guest program cannot alter the host directory.
+    #[arg(long, default_value_t = false)]
+    shared_dir_writable: bool,
 
     /// Size in bytes of the scratch disk every profile attaches.
     #[arg(long)]
     data_disk_size: Option<u64>,
+
+    /// Attach a raw disk image the guest can mount, found by its serial:
+    /// `<image>,serial=<name>[,readonly]`. Repeat for more disks.
+    #[arg(long = "disk", value_name = "IMAGE,serial=NAME[,readonly]")]
+    disks: Vec<VmDiskSpec>,
 
     #[arg(long)]
     gdb: Option<String>,
@@ -1979,7 +2016,10 @@ struct ResolvedVmCommand {
     cpu: Option<String>,
     accel: Vec<String>,
     shared_dir: Option<PathBuf>,
+    shared_dir_access: HostShareAccess,
     data_disk_bytes: u64,
+    /// `--disk` images, their paths canonical, in attach order.
+    disks: Vec<VmDiskSpec>,
     gdb: Option<String>,
     gdb_wait: bool,
     monitor: Option<String>,
@@ -2422,6 +2462,11 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
         .or(file.cpu)
         .or_else(|| default_cpu(profile, &accel).map(str::to_owned));
     let shared_dir = command.shared_dir.or(file.shared_dir);
+    let shared_dir_access = match (command.shared_dir_writable, &shared_dir) {
+        (false, _) => HostShareAccess::ReadOnly,
+        (true, Some(_)) => HostShareAccess::ReadWrite,
+        (true, None) => return Err(VmConfigError::WritableShareWithoutDir),
+    };
     let data_disk_bytes = command
         .data_disk_size
         .or(file.data_disk_size)
@@ -2429,6 +2474,7 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
     if data_disk_bytes == 0 {
         return Err(VmConfigError::ZeroDataDiskSize);
     }
+    let disks = resolve_disks(file.disk, command.disks)?;
     let gdb = command
         .gdb
         .or(file.gdb)
@@ -2536,7 +2582,9 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
         cpu,
         accel,
         shared_dir,
+        shared_dir_access,
         data_disk_bytes,
+        disks,
         gdb,
         gdb_wait,
         monitor,
@@ -5121,10 +5169,22 @@ impl VmRuntime {
             &data_disk,
             command.virtio_devices,
         );
+        configure_disks(
+            &mut qemu,
+            command.profile.data_disk,
+            &command.disks,
+            command.virtio_devices,
+        );
         if let Some(host_share) = command.profile.host_share
             && let Some(shared_dir) = &command.shared_dir
         {
-            configure_host_share(&mut qemu, host_share, shared_dir, command.virtio_devices);
+            configure_host_share(
+                &mut qemu,
+                host_share,
+                shared_dir,
+                command.shared_dir_access,
+                command.virtio_devices,
+            );
         }
         if let Some(watchdog) = command.profile.watchdog {
             configure_watchdog(&mut qemu, watchdog);
@@ -5635,10 +5695,59 @@ fn configure_data_disk(
     qemu.arg("-device").arg(device.to_string());
 }
 
+/// The `--disk` images to attach: the config file's, then the command
+/// line's, each image opened by its canonical path so a relative path
+/// means the same disk whatever directory QEMU runs in.
+fn resolve_disks(
+    file: Vec<String>,
+    command: Vec<VmDiskSpec>,
+) -> Result<Vec<VmDiskSpec>, VmConfigError> {
+    let mut disks = file
+        .iter()
+        .map(|spec| spec.parse::<VmDiskSpec>())
+        .collect::<Result<Vec<_>, _>>()?;
+    disks.extend(command);
+    validate_disks(&disks, DATA_DISK_SERIAL)?;
+    for disk in &mut disks {
+        disk.image = fs::canonicalize(&disk.image).map_err(|source| VmConfigError::DiskImage {
+            path: disk.image.display().to_string(),
+            source,
+        })?;
+    }
+    Ok(disks)
+}
+
+/// Attaches every `--disk` image on the scratch disk's transport, each
+/// with the serial the guest names it by.
+fn configure_disks(
+    qemu: &mut Command,
+    transport: VmDataDiskProfile,
+    disks: &[VmDiskSpec],
+    queues: VirtioDeviceProfile,
+) {
+    for (index, disk) in disks.iter().enumerate() {
+        let id = format!("disk{index}");
+        qemu.arg("-drive").arg(disk.drive(&id).to_string());
+        let mut device = QemuOptions::new(match transport {
+            VmDataDiskProfile::VirtioMmio => "virtio-blk-device",
+            VmDataDiskProfile::VirtioPci => "virtio-blk-pci",
+        });
+        device.set("drive", &id);
+        device.set("serial", &disk.serial);
+        apply_transport(
+            transport == VmDataDiskProfile::VirtioPci,
+            queues,
+            &mut device,
+        );
+        qemu.arg("-device").arg(device.to_string());
+    }
+}
+
 fn configure_host_share(
     qemu: &mut Command,
     host_share: VmHostShareProfile,
     shared_dir: &Path,
+    access: HostShareAccess,
     queues: VirtioDeviceProfile,
 ) {
     let mut fsdev = QemuOptions::new("local");
@@ -5646,6 +5755,9 @@ fn configure_host_share(
     fsdev.set("path", shared_dir.display());
     fsdev.set("security_model", "none");
     fsdev.set("multidevs", "remap");
+    if access == HostShareAccess::ReadOnly {
+        fsdev.set("readonly", "on");
+    }
     qemu.arg("-fsdev").arg(fsdev.to_string());
     let mut device = QemuOptions::new(match host_share {
         VmHostShareProfile::Virtio9pMmio => "virtio-9p-device",
@@ -6077,6 +6189,93 @@ mod tests {
         qemu.get_args()
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect()
+    }
+
+    /// Every `--disk` rides the scratch disk's transport, so it reaches
+    /// the kernel on the bus the kernel already scans for block devices,
+    /// and carries the serial the guest finds it by.
+    #[test]
+    fn extra_disks_are_attached_with_their_serial_on_the_scratch_disks_bus() {
+        let disks: Vec<VmDiskSpec> = [
+            "/images/rootfs.erofs,serial=rootfs,readonly",
+            "/images/home.btrfs,serial=home",
+        ]
+        .iter()
+        .map(|spec| spec.parse().expect("a valid disk"))
+        .collect();
+
+        assert_eq!(
+            rendered(|qemu| configure_disks(
+                qemu,
+                VmDataDiskProfile::VirtioMmio,
+                &disks,
+                VirtioDeviceProfile::default()
+            )),
+            [
+                "-drive",
+                "if=none,format=raw,file=/images/rootfs.erofs,id=disk0,readonly=on",
+                "-device",
+                "virtio-blk-device,drive=disk0,serial=rootfs",
+                "-drive",
+                "if=none,format=raw,file=/images/home.btrfs,id=disk1",
+                "-device",
+                "virtio-blk-device,drive=disk1,serial=home",
+            ]
+        );
+        let pci = rendered(|qemu| {
+            configure_disks(
+                qemu,
+                VmDataDiskProfile::VirtioPci,
+                &disks[..1],
+                VirtioDeviceProfile::default(),
+            )
+        });
+        assert!(
+            pci[3].starts_with("virtio-blk-pci,drive=disk0,serial=rootfs"),
+            "{pci:?}"
+        );
+    }
+
+    /// The share a developer gets without asking for more: QEMU refuses
+    /// every write, so a guest program cannot alter the host directory.
+    #[test]
+    fn the_host_share_is_read_only_by_default() {
+        let arguments = rendered(|qemu| {
+            configure_host_share(
+                qemu,
+                VmHostShareProfile::Virtio9pPci,
+                Path::new("/scratch"),
+                HostShareAccess::ReadOnly,
+                VirtioDeviceProfile::default(),
+            )
+        });
+        assert_eq!(
+            arguments[..2],
+            [
+                "-fsdev",
+                "local,id=hostfs,path=/scratch,security_model=none,multidevs=remap,readonly=on"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_writable_host_share_carries_no_readonly_option() {
+        let arguments = rendered(|qemu| {
+            configure_host_share(
+                qemu,
+                VmHostShareProfile::Virtio9pPci,
+                Path::new("/scratch"),
+                HostShareAccess::ReadWrite,
+                VirtioDeviceProfile::default(),
+            )
+        });
+        assert_eq!(
+            arguments[..2],
+            [
+                "-fsdev",
+                "local,id=hostfs,path=/scratch,security_model=none,multidevs=remap"
+            ]
+        );
     }
 
     /// A capture is only evidence if it is a capture of the guest's own
@@ -6867,7 +7066,7 @@ mod tests {
         let path = directory.join("helios-kernel.profdata");
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&0x8169_666f_7270_6cffu64.to_le_bytes());
-        bytes.extend_from_slice(&(13u64 | 1 << 56).to_le_bytes());
+        bytes.extend_from_slice(&(14u64 | 1 << 56).to_le_bytes());
         fs::write(&path, bytes).expect("writing the profile header");
         path
     }
@@ -7395,7 +7594,7 @@ mod tests {
             .expect_err("a profile this toolchain cannot read never reaches cargo");
         assert!(matches!(error, VmConfigError::ProfileUse(_)), "{error}");
         assert!(error.to_string().contains("version 9"), "{error}");
-        assert!(error.to_string().contains("version 13"), "{error}");
+        assert!(error.to_string().contains("version 14"), "{error}");
     }
 
     #[test]
@@ -7484,7 +7683,9 @@ mod tests {
             // host, so they ask for the emulator on purpose.
             accel: vec!["tcg".to_owned()],
             shared_dir: None,
+            shared_dir_writable: false,
             data_disk_size: None,
+            disks: Vec::new(),
             gdb: None,
             gdb_wait: false,
             monitor: None,
@@ -7544,7 +7745,9 @@ mod tests {
             // host, so they ask for the emulator on purpose.
             accel: vec!["tcg".to_owned()],
             shared_dir: None,
+            shared_dir_writable: false,
             data_disk_size: None,
+            disks: Vec::new(),
             gdb: None,
             gdb_wait: false,
             monitor: None,
@@ -7591,6 +7794,38 @@ mod tests {
     /// virtio-iommu can only confine PCI endpoints, so asking for it on
     /// a machine whose virtio devices are memory-mapped is refused
     /// rather than quietly ignored.
+    #[test]
+    fn a_writable_share_needs_a_directory_to_export() {
+        let tempdir =
+            tempfile::tempdir().expect("temporary directory for VM config resolution must exist");
+        let config = tempdir.path().join("missing-vm.json");
+
+        let error = resolve(VmCommand {
+            shared_dir_writable: true,
+            config: Some(config.clone()),
+            ..minimal_command()
+        })
+        .expect_err("a writable share without a directory names nothing");
+        assert!(matches!(error, VmConfigError::WritableShareWithoutDir));
+
+        let resolved = resolve(VmCommand {
+            shared_dir: Some(tempdir.path().to_path_buf()),
+            config: Some(config.clone()),
+            ..minimal_command()
+        })
+        .expect("a share resolves");
+        assert_eq!(resolved.shared_dir_access, HostShareAccess::ReadOnly);
+
+        let resolved = resolve(VmCommand {
+            shared_dir: Some(tempdir.path().to_path_buf()),
+            shared_dir_writable: true,
+            config: Some(config),
+            ..minimal_command()
+        })
+        .expect("an explicit writable share resolves");
+        assert_eq!(resolved.shared_dir_access, HostShareAccess::ReadWrite);
+    }
+
     #[test]
     fn iommu_is_refused_on_a_memory_mapped_machine() {
         let tempdir =
@@ -7683,7 +7918,9 @@ mod tests {
             // host, so they ask for the emulator on purpose.
             accel: vec!["tcg".to_owned()],
             shared_dir: None,
+            shared_dir_writable: false,
             data_disk_size: None,
+            disks: Vec::new(),
             gdb: None,
             gdb_wait: false,
             monitor: None,
@@ -7822,7 +8059,9 @@ mod tests {
                 .map(|value| (*value).to_owned())
                 .collect(),
             shared_dir: None,
+            shared_dir_access: HostShareAccess::ReadOnly,
             data_disk_bytes: DEFAULT_DATA_DISK_BYTES,
+            disks: Vec::new(),
             gdb: None,
             gdb_wait: false,
             monitor: None,
@@ -8033,7 +8272,9 @@ mod tests {
                 .map(|value| (*value).to_owned())
                 .collect(),
             shared_dir: Some(repo_root().expect("workspace root must resolve")),
+            shared_dir_access: HostShareAccess::ReadOnly,
             data_disk_bytes: DEFAULT_DATA_DISK_BYTES,
+            disks: Vec::new(),
             gdb: None,
             gdb_wait: false,
             monitor: None,

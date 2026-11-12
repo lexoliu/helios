@@ -17,8 +17,8 @@ use crate::wasmtime_adapter::wasi::net::ipv6_address_groups;
 use bytes::Bytes;
 
 use crate::{
-    ClockAuthorityRights, DirectoryAuthorityRights, LinkAuthorityRights, NetworkAuthorityRights,
-    ProcessAuthority, ProcessAuthorityError, TerminalAuthorityRights,
+    ClockAuthorityRights, DeviceClassRights, DirectoryAuthorityRights, LinkAuthorityRights,
+    NetworkAuthorityRights, ProcessAuthority, ProcessAuthorityError, TerminalAuthorityRights,
 };
 use crate::{
     ComponentCache, ComponentOutputMode, ComponentOutputRoute, ComponentOutputStreamKind,
@@ -60,6 +60,7 @@ const NET_INSTANCE: &str = "helios:system/net@0.1.0";
 const TRACING_INSTANCE: &str = "helios:system/tracing@0.1.0";
 const PROFILING_INSTANCE: &str = "helios:system/profiling@0.1.0";
 const INSTANCES_INSTANCE: &str = "helios:system/instances@0.1.0";
+const SNAPSHOT_INSTANCE: &str = "helios:system/snapshot@0.1.0";
 /// The share of the machine's free memory the compiled-component cache
 /// may hold.
 ///
@@ -80,9 +81,13 @@ fn lower_bytes_to_vec(bytes: Bytes) -> Vec<u8> {
 
 mod device;
 pub(crate) use device::record_linear_memory;
+mod pending;
+pub(crate) use pending::PendingReply;
 pub mod service;
 mod topology;
+mod views;
 mod vsock;
+pub(crate) use views::{guest_memory, view_trap};
 
 pub use service::{
     BlobHandle, ChildExit, ChildHandle, ClientSurfaceHandle, CommandBufferHandle, ContextHandle,
@@ -113,6 +118,7 @@ pub type StoreData<CpuImpl, Net, HostFs> = ComponentStoreData<
     HostRuntimeState<CpuImpl, Net, HostFs>,
     crate::wasmtime_adapter::wasi::DebugFileSystem<HostRuntimeState<CpuImpl, Net, HostFs>, HostFs>,
     ResourceTable,
+    wasmtime::Memory,
 >;
 pub type OutputMode = ComponentOutputMode;
 pub type OutputRoute = ComponentOutputRoute;
@@ -679,7 +685,7 @@ macro_rules! impl_program_bindings {
                     match write_program_artifact(
                         accessor,
                         &request.destination_path,
-                        &artifact,
+                        &artifact.signed,
                         &caller_authority,
                         &write_cpu,
                         write_serial,
@@ -698,6 +704,7 @@ macro_rules! impl_program_bindings {
                     }
                     Ok(Ok($bindings::helios::system::programs::AotResult {
                         destination_path: request.destination_path,
+                        worker_threads: artifact.worker_threads,
                     }))
                 }
             }
@@ -868,6 +875,29 @@ macro_rules! impl_authority_conversion {
                             .map_err(map_process_authority_error)?;
                         authority.grant_link_rights(rights);
                     }
+                    $bindings::helios::system::programs::CapabilityGrant::Device(device) => {
+                        let mut rights = DeviceClassRights::empty();
+                        for class in device.classes {
+                            rights |= match class {
+                                $bindings::helios::system::programs::DeviceClass::Display => {
+                                    DeviceClassRights::DISPLAY
+                                }
+                                $bindings::helios::system::programs::DeviceClass::Input => {
+                                    DeviceClassRights::INPUT
+                                }
+                                $bindings::helios::system::programs::DeviceClass::Gpu => {
+                                    DeviceClassRights::GPU
+                                }
+                                $bindings::helios::system::programs::DeviceClass::Audio => {
+                                    DeviceClassRights::AUDIO
+                                }
+                            };
+                        }
+                        let rights = caller_authority
+                            .derive_device_class_rights(rights)
+                            .map_err(map_process_authority_error)?;
+                        authority.grant_device_classes(rights);
+                    }
                 }
             }
             Ok(authority)
@@ -953,14 +983,15 @@ mod authority_tests {
         require_spawn_authority, tcp_connect_network_rights, udp_bind_network_rights,
     };
     use crate::{
-        ClockAuthorityRights, DirectoryAuthorityRights, DirectoryPreopen, LinkAuthorityRights,
-        NetworkAuthorityRights, ProcessAuthority, ProcessAuthorityRights, TerminalAuthorityRights,
+        ClockAuthorityRights, DeviceClassRights, DirectoryAuthorityRights, DirectoryPreopen,
+        LinkAuthorityRights, NetworkAuthorityRights, ProcessAuthority, ProcessAuthorityRights,
+        TerminalAuthorityRights,
     };
 
     use program_wit::programs::{
-        CapabilityGrant, ClockGrant, ClockRight, DirectoryGrant, FilesystemRight, LinkGrant,
-        LinkRight, NetworkGrant, NetworkRight, ProcessGrant, ProcessRight, TerminalGrant,
-        TerminalRight,
+        CapabilityGrant, ClockGrant, ClockRight, DeviceClass, DeviceGrant, DirectoryGrant,
+        FilesystemRight, LinkGrant, LinkRight, NetworkGrant, NetworkRight, ProcessGrant,
+        ProcessRight, TerminalGrant, TerminalRight,
     };
 
     fn directory_grant(
@@ -995,6 +1026,10 @@ mod authority_tests {
         CapabilityGrant::Link(LinkGrant { rights })
     }
 
+    fn device_grant(classes: Vec<DeviceClass>) -> CapabilityGrant {
+        CapabilityGrant::Device(DeviceGrant { classes })
+    }
+
     #[test]
     fn empty_grants_create_zero_child_authority() {
         let child = build_program_child_authority(&ProcessAuthority::root(), Vec::new())
@@ -1006,7 +1041,65 @@ mod authority_tests {
         assert!(child.terminal_rights().is_empty());
         assert!(child.process_rights().is_empty());
         assert!(child.link_rights().is_empty());
+        assert!(child.device_class_rights().is_empty());
+        assert!(child.granted_devices().is_empty());
         assert!(child.cwd().is_none());
+    }
+
+    #[test]
+    fn device_grant_derives_subset_from_caller_authority() {
+        let mut caller = ProcessAuthority::empty();
+        caller.grant_device_classes(DeviceClassRights::DISPLAY | DeviceClassRights::INPUT);
+
+        let child =
+            build_program_child_authority(&caller, vec![device_grant(vec![DeviceClass::Input])])
+                .expect("device child grant may derive a subset");
+
+        assert_eq!(child.device_class_rights(), DeviceClassRights::INPUT);
+        assert!(child.granted_devices().is_empty());
+    }
+
+    /// What the debugger passes down to the programs the inspector runs
+    /// is bounded by what the debugger holds, which is every class and no
+    /// named device.
+    #[test]
+    fn debugger_authority_hands_every_device_class_to_what_it_launches() {
+        let debugger = super::debugger_authority();
+
+        let child = build_program_child_authority(
+            &debugger,
+            vec![device_grant(vec![
+                DeviceClass::Display,
+                DeviceClass::Input,
+                DeviceClass::Gpu,
+                DeviceClass::Audio,
+            ])],
+        )
+        .expect("the debugger holds every device class");
+
+        assert_eq!(child.device_class_rights(), DeviceClassRights::all());
+        assert!(child.granted_devices().is_empty());
+        assert!(debugger.granted_devices().is_empty());
+    }
+
+    #[test]
+    fn device_grant_exceeding_caller_is_refused() {
+        let mut caller = ProcessAuthority::empty();
+        caller.grant_device_classes(DeviceClassRights::DISPLAY);
+
+        let error = build_program_child_authority(
+            &caller,
+            vec![device_grant(vec![DeviceClass::Display, DeviceClass::Gpu])],
+        )
+        .expect_err("GPU must not be created from display-only authority");
+        assert_eq!(error.kind, crate::ProgramExecErrorKind::PermissionDenied);
+
+        let error = build_program_child_authority(
+            &ProcessAuthority::root(),
+            vec![device_grant(vec![DeviceClass::Display])],
+        )
+        .expect_err("root authority holds no device class to hand on");
+        assert_eq!(error.kind, crate::ProgramExecErrorKind::PermissionDenied);
     }
 
     #[test]
@@ -1422,7 +1515,12 @@ fn map_process_authority_error(error: ProcessAuthorityError) -> crate::ProgramEx
         | ProcessAuthorityError::TerminalGrantExceedsAuthority(_)
         | ProcessAuthorityError::ProcessGrantExceedsAuthority(_)
         | ProcessAuthorityError::EmptyLinkRights
-        | ProcessAuthorityError::LinkGrantExceedsAuthority(_) => {
+        | ProcessAuthorityError::LinkGrantExceedsAuthority(_)
+        | ProcessAuthorityError::EmptyDeviceClassRights
+        | ProcessAuthorityError::DeviceClassGrantExceedsAuthority(_)
+        | ProcessAuthorityError::DeviceGrantExceedsAuthority(_)
+        | ProcessAuthorityError::DeviceNameTooLong
+        | ProcessAuthorityError::TooManyDeviceGrants => {
             crate::ProgramExecErrorKind::PermissionDenied
         }
     };
@@ -1464,6 +1562,17 @@ where
     pub(super) debug_state: HostRuntimeState<CpuImpl, Net, HostFs>,
     pub(super) read_serial: crate::SerialReader,
     pub(super) write_serial: crate::DebugSerialWriter,
+}
+
+/// The authority the embedded debugger runs with: everything `root`
+/// grants, plus every device class. The debugger claims no device
+/// itself; it holds the classes because a program can be handed only
+/// what its launcher holds, and the inspector session runs desktop,
+/// input and audio programs through it.
+fn debugger_authority() -> ProcessAuthority {
+    let mut authority = ProcessAuthority::root();
+    authority.grant_device_classes(DeviceClassRights::all());
+    authority
 }
 
 async fn run_system_component<CpuImpl, Net, HostFs>(
@@ -1552,7 +1661,7 @@ where
         debug_state.clone(),
         Vec::new(),
         Vec::new(),
-        ProcessAuthority::root(),
+        debugger_authority(),
         OutputMode::Serial,
         read_serial,
         write_serial,
@@ -1702,6 +1811,7 @@ where
     service::add_gpu_to_linker(linker)?;
     service::add_audio_to_linker(linker)?;
     add_instances_to_linker(linker)?;
+    add_snapshot_to_linker(linker)?;
     add_tracing_to_linker(linker)?;
     debugger_profiling::add_to_linker(linker)?;
     Ok(())
@@ -3535,6 +3645,46 @@ where
     Ok(())
 }
 
+fn add_snapshot_to_linker<CpuImpl, Net, HostFs>(
+    linker: &mut Linker<StoreData<CpuImpl, Net, HostFs>>,
+) -> wasmtime::Result<()>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    HostFs: crate::HostFileSystem,
+{
+    let mut instance = linker.instance(SNAPSHOT_INSTANCE)?;
+    instance.func_wrap_concurrent(
+        "prepare",
+        |accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>, (): ()| {
+            Box::pin(async move {
+                let (host_fs, has_generation_id) = accessor.with(|mut access| {
+                    let state = &access.get().runtime_state;
+                    (
+                        state.host_fs_service(),
+                        state.machine_generation().has_window(),
+                    )
+                });
+                // A machine with no host share has nothing to release.
+                if let Some(host_fs) = host_fs {
+                    host_fs.prepare_snapshot().await;
+                }
+                Ok::<_, wasmtime::Error>((debugger_wit::snapshot::Prepared { has_generation_id },))
+            })
+        },
+    )?;
+    instance.func_wrap(
+        "finished",
+        |caller: StoreContextMut<'_, StoreData<CpuImpl, Net, HostFs>>, (): ()| {
+            if let Some(host_fs) = caller.data().runtime_state.host_fs_service() {
+                host_fs.snapshot_finished();
+            }
+            Ok(())
+        },
+    )?;
+    Ok(())
+}
+
 impl<CpuImpl, Net, HostFs> debugger_wit::serial::Host for StoreData<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
@@ -4091,7 +4241,12 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    convert_program_sample(store.runtime_state.snapshot(store.cpu.now().ticks()))
+    // A program sees only the hardware it could claim: `claim` answers
+    // as if the device were absent, and a listed device would say
+    // otherwise.
+    let mut sample = store.runtime_state.snapshot(store.cpu.now().ticks());
+    sample.restrict_to(store.process_authority());
+    convert_program_sample(sample)
 }
 
 /// Maps the kernel's block-device snapshot onto one binding set's

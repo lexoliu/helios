@@ -139,6 +139,41 @@ class InstructionSampling(BaseModel):
     dropped: int = Field(description="samples the guest's rings refused over those boots")
 
 
+class PressureReading(BaseModel):
+    """One `kern.memorystatus_vm_pressure_level` reading around a side of a round."""
+
+    round: int
+    side: str = Field(description="`helios` or `linux`: the side the reading brackets")
+    moment: Literal["before", "after"]
+    level: int
+
+
+#: What `kern.memorystatus_vm_pressure_level` reads on a host under no
+#: memory pressure; 2 is warn and 4 is critical.
+PRESSURE_NORMAL = 1
+
+
+class HostGate(BaseModel):
+    """The host state a run was gated on, and what it read (#491).
+
+    On macOS memory pressure is read around every side of every round,
+    and the run is inconclusive unless it was normal throughout. A Linux
+    host is not gated: there is no equivalent reading this tool takes.
+    """
+
+    applies: bool
+    note: str = Field(description="what was read and why, or why the gate does not apply to this host")
+    readings: list[PressureReading] = Field(default_factory=list)
+
+    @property
+    def violations(self) -> list[PressureReading]:
+        return [reading for reading in self.readings if reading.level != PRESSURE_NORMAL]
+
+    @property
+    def inconclusive(self) -> bool:
+        return bool(self.violations)
+
+
 class RunInfo(BaseModel):
     id: str | None
     url: str | None
@@ -184,6 +219,14 @@ class RunInfo(BaseModel):
         default=None,
         description=(
             "the cargo profile the `helios_baseline` kernel was built with, when the run was paired"
+        ),
+    )
+    prebuilt: bool = Field(
+        default=False,
+        description=(
+            "the host compiled nothing: the kernel, the tooling and the native counterparts were "
+            "put in place beforehand, so `helios_git_sha` is the checkout the run read its "
+            "manifests from, not a statement of what built them"
         ),
     )
     retaken: list[str] = Field(
@@ -271,6 +314,18 @@ class RunInfo(BaseModel):
         default=None,
         description="how the `helios_baseline_rebuild` column was sampled, when the run built and sampled it",
     )
+    rounds: int | None = Field(
+        default=None,
+        description=(
+            "the number of alternating rounds the run took (#491): each round times both sides "
+            "once and consecutive rounds swap which goes first; None is a single pass"
+        ),
+    )
+    host_gate: HostGate | None = Field(
+        default=None,
+        description="the host state the run was gated on and every reading it took; None for a report "
+        "written before the gate existed",
+    )
 
     @property
     def paired(self) -> bool:
@@ -292,8 +347,25 @@ class Hardware(BaseModel):
     qemu_version: str | None
 
 
+class Asymmetry(BaseModel):
+    """One thing the two columns of a lane still differ in by construction (#491)."""
+
+    what: str
+    helios: str
+    linux: str
+
+
 class Pins(BaseModel):
-    wasmtime_revision: str
+    wasmtime_revision: str = Field(
+        description="the Wasmtime fork revision the `helios` side was built against"
+    )
+    baseline_wasmtime_revision: str | None = Field(
+        default=None,
+        description=(
+            "the Wasmtime fork revision the `helios_baseline` side and its rebuild were "
+            "built against — the one the baseline commit pins (#486) — when the run was paired"
+        ),
+    )
     wasmtime_linux_release: str
     fedora_image_url: str
     fedora_image_sha256: str
@@ -317,6 +389,25 @@ class Pins(BaseModel):
     bootfs_cwasm: dict[str, str] = Field(
         description="bootfs asset -> sha256 of the signed cwasm Helios loaded"
     )
+    compiler_plugin_wasm: str | None = Field(
+        default=None,
+        description=(
+            "sha256 of the compiler plugin's core module both `aot-curl` columns ran: Helios "
+            "through the bootfs cwasm precompiled from it, Linux + Wasmtime directly; None when "
+            "the run selected no workload that hosts it"
+        ),
+    )
+    compiler_host: str | None = Field(
+        default=None,
+        description=(
+            "sha256 of the `helios-compiler-host` binary the Linux + Wasmtime column hosted the "
+            "plugin with, built from this checkout against `wasmtime_revision`"
+        ),
+    )
+    asymmetries: list[Asymmetry] = Field(
+        default_factory=list,
+        description="what still differs between the Helios and Linux columns by construction (#491)",
+    )
 
 
 class Thresholds(BaseModel):
@@ -329,6 +420,10 @@ class Thresholds(BaseModel):
 
 
 class Iteration(BaseModel):
+    round: int = Field(
+        default=1,
+        description="the alternating round (#491) this launch was timed in; `index` counts within it",
+    )
     index: int
     elapsed_ms: float
     cold: bool
@@ -358,6 +453,10 @@ class Cell(BaseModel):
     rejected: bool
     rejection_reason: str | None
     metrics: dict[str, SeriesStats] = Field(description="warm-series statistics of every bench.<name> metric")
+    round_medians: list[float] = Field(
+        default_factory=list,
+        description="the warm median of each alternating round, in round order; empty for a single pass",
+    )
 
 
 class Comparison(BaseModel):

@@ -1,6 +1,6 @@
 use helios_artifact::{
     CWASM_MEMORY_GUARD_SIZE, CWASM_MEMORY_RESERVATION, cwasm_target_cranelift_flags,
-    cwasm_target_supports_wasm_simd,
+    cwasm_target_guest_stack_limit_offset, cwasm_target_supports_wasm_simd,
 };
 use std::cell::{Cell, RefCell};
 use std::env;
@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use thiserror::Error;
 use wasmparser::{Encoding, Parser, Payload};
-use wasmtime::{Config, Engine, OptLevel, Strategy};
+use wasmtime::{Config, Engine, OptLevel, StackLimitLocation, Strategy};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AotCompileHint {
@@ -415,7 +415,16 @@ fn compiler_worker_count() -> usize {
         .map_or(1, NonZeroUsize::get)
 }
 
-fn build_engine_config(target: &str, hint: AotCompileHint, worker_count: usize) -> Result<Config> {
+/// The engine configuration that decides the machine code a precompile for
+/// `target` under `hint` produces: the target and its ISA flags, the compiler
+/// strategy and optimisation level, the wasm features, and the memory
+/// profile that bounds-check elision is compiled against.
+///
+/// Nothing here exists only because of the Helios kernel. The kernel's
+/// compiler adds its own runtime mechanisms on top (`build_engine_config`),
+/// and `helios-compiler-host` runs the compiler plugin's own module under
+/// this configuration on Linux, so the plugin's code is the same on both.
+pub fn codegen_config(target: &str, hint: AotCompileHint) -> Result<Config> {
     let mut config = Config::new();
     config
         .target(target)
@@ -469,12 +478,6 @@ fn build_engine_config(target: &str, hint: AotCompileHint, worker_count: usize) 
     // the section is unaffected, so it is on for every compile.
     config.wasm_branch_hinting(true);
     config.concurrency_support(true);
-    config.parallel_compilation(worker_count > 1);
-    config.stack_limit_interruption(true);
-    // Wasmtime validates `max_wasm_stack <= async_stack_size`; keep the async
-    // fiber stack comfortably above the wasm stack limit with host headroom.
-    config.max_wasm_stack(8 * 1024 * 1024);
-    config.async_stack_size(9 * 1024 * 1024);
     // Every helios target runs the lazy-commit memory profile, and the
     // reservation and guard sizes compiled into a cwasm artifact are the ones
     // the kernel engine configures for it. Compiling against a different
@@ -484,6 +487,34 @@ fn build_engine_config(target: &str, hint: AotCompileHint, worker_count: usize) 
     config.memory_may_move(false);
     config.memory_reservation(CWASM_MEMORY_RESERVATION);
     config.memory_guard_size(CWASM_MEMORY_GUARD_SIZE);
+    Ok(config)
+}
+
+/// The wasm stack limit every Helios engine runs guests under.
+///
+/// The kernel's `kernel/src/component/runtime.rs` sets the same 8 MiB, and
+/// `helios-compiler-host` takes it from here so the plugin meets one limit on
+/// both hosts.
+pub const MAX_WASM_STACK: usize = 8 * 1024 * 1024;
+
+/// The native stack a thread that runs wasm under [`MAX_WASM_STACK`] gets:
+/// the wasm limit plus 1 MiB of headroom for the host functions it calls.
+pub const WASM_THREAD_STACK: usize = 9 * 1024 * 1024;
+
+fn build_engine_config(target: &str, hint: AotCompileHint, worker_count: usize) -> Result<Config> {
+    let mut config = codegen_config(target, hint)?;
+    config.parallel_compilation(worker_count > 1);
+    config.stack_limit_interruption(true);
+    // The kernel engine reads the limit from the same location (see
+    // `cwasm_target_guest_stack_limit_offset`) and refuses a cwasm compiled
+    // for the other one.
+    if let Some(offset) = cwasm_target_guest_stack_limit_offset(target) {
+        config.stack_limit_location(StackLimitLocation::PerProcessor { offset });
+    }
+    // Wasmtime validates `max_wasm_stack <= async_stack_size`; keep the async
+    // fiber stack comfortably above the wasm stack limit with host headroom.
+    config.max_wasm_stack(MAX_WASM_STACK);
+    config.async_stack_size(WASM_THREAD_STACK);
     Ok(config)
 }
 

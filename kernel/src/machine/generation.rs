@@ -34,6 +34,9 @@
 //!   [`GENERATION_PROBE_INTERVAL`] on the kernel timer between calls to
 //!   [`MachineGeneration::observe`]. It takes no lock of its own, never
 //!   busy-waits, and exists only on a machine that has a window.
+//! - [`MachineGeneration::take_unhandled`] takes the advance lock, reads
+//!   the counter and clears the restore memory as one step. It has one
+//!   caller, the reactions task.
 //! - Two [`Notify`]s are fired on every advance, each with a single
 //!   consumer: one for the reactions that follow a restore (wall clock,
 //!   host share, network), one for the entropy reseed task. Both are
@@ -140,6 +143,23 @@ struct GenerationWords {
 /// a consumer that wakes late can fold it in.
 struct LatestAdvance {
     cause: [u8; 16],
+    /// Whether an [`AdvanceCause::ImageRestored`] advance has happened
+    /// since [`MachineGeneration::take_unhandled`] last cleared it.
+    /// Sticky across advances, because the latest cause alone would let
+    /// a later advance hide an earlier restore from a consumer that woke
+    /// late.
+    image_restored_unhandled: bool,
+}
+
+/// What a reactions consumer has not yet dealt with, as
+/// [`MachineGeneration::take_unhandled`] reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnhandledAdvances {
+    /// The generation the machine is in now.
+    pub generation: Generation,
+    /// The kernel restored itself from a hibernate image since the last
+    /// call, whatever advanced the generation after that.
+    pub image_restored: bool,
 }
 
 pub struct MachineGeneration {
@@ -167,14 +187,17 @@ impl MachineGeneration {
                 seen_low: AtomicU64::new(low),
                 seen_high: AtomicU64::new(high),
             }),
-            advance_lock: IrqSafeMutex::new(LatestAdvance { cause: [0; 16] }),
+            advance_lock: IrqSafeMutex::new(LatestAdvance {
+                cause: [0; 16],
+                image_restored_unhandled: false,
+            }),
             reactions: Notify::new(),
             entropy_wake: Notify::new(),
         })
     }
 
-    /// Whether the platform published a window, so that observing can
-    /// ever see anything.
+    /// Whether the VMM publishes a generation ID window, which is what
+    /// tells a restored copy of the machine that it is one.
     pub fn has_window(&self) -> bool {
         self.window.is_some()
     }
@@ -214,7 +237,11 @@ impl MachineGeneration {
                 self.words.seen_low.store(low, Ordering::Release);
                 self.words.seen_high.store(high, Ordering::Release);
             }
-            self.bump(latest, cause.bytes());
+            self.bump(
+                latest,
+                cause.bytes(),
+                matches!(cause, AdvanceCause::ImageRestored { .. }),
+            );
         });
         self.fire();
     }
@@ -224,6 +251,19 @@ impl MachineGeneration {
     pub fn latest_advance(&self) -> (Generation, [u8; 16]) {
         self.advance_lock
             .with(|latest| (self.current(), latest.cause))
+    }
+
+    /// The generation now, with what has advanced it since the last call
+    /// folded into one answer, and the memory of it cleared.
+    ///
+    /// The reactions task calls it after every wake. Two advances that
+    /// land before it runs are one answer, so nothing an earlier advance
+    /// said is lost to the later one.
+    pub fn take_unhandled(&self) -> UnhandledAdvances {
+        self.advance_lock.with(|latest| UnhandledAdvances {
+            generation: self.current(),
+            image_restored: core::mem::take(&mut latest.image_restored_unhandled),
+        })
     }
 
     /// Completes when the machine generation has advanced since the
@@ -251,7 +291,7 @@ impl MachineGeneration {
             }
             self.words.seen_low.store(low, Ordering::Release);
             self.words.seen_high.store(high, Ordering::Release);
-            self.bump(latest, *id.as_bytes());
+            self.bump(latest, *id.as_bytes(), false);
             true
         });
         if advanced {
@@ -260,8 +300,9 @@ impl MachineGeneration {
     }
 
     /// Records `cause` and moves the counter. The advance lock is held.
-    fn bump(&self, latest: &mut LatestAdvance, cause: [u8; 16]) {
+    fn bump(&self, latest: &mut LatestAdvance, cause: [u8; 16], image_restored: bool) {
         latest.cause = cause;
+        latest.image_restored_unhandled |= image_restored;
         self.words.counter.fetch_add(1, Ordering::Release);
     }
 

@@ -3,7 +3,7 @@ use divan::counter::{BytesCount, ItemsCount};
 use divan::{AllocProfiler, Bencher, black_box};
 use helios_netstack::{
     BbrV3, DEFAULT_HOP_LIMIT, DEFAULT_TCP_LISTEN_BACKLOG, EthernetAddress, EthernetFrame,
-    EthernetProtocol, IpAddress, IpProtocol, Ipv4Address, Ipv4Cidr, Ipv4Packet,
+    EthernetProtocol, IpAddress, IpProtocol, Ipv4Address, Ipv4Cidr, Ipv4Packet, IsnSecret,
     MAX_OUTBOUND_FRAMES, NeighborEntry, NeighborState, OutboundBatchStatus, PacketBuffer,
     RxChecksumOffload, RxFrame, RxFrameOffload, Stack, StackConfig, StackInstant,
     TCP_TRANSMIT_BUFFER_BYTES, TcpEndpoint, TcpFlags, TcpHeader, TcpOptions, TcpPacket,
@@ -16,6 +16,7 @@ static ALLOC: AllocProfiler = AllocProfiler::system();
 
 const LOCAL_MAC: EthernetAddress = [0x02, 0, 0, 0, 0, 1];
 const PEER_MAC: EthernetAddress = [0x02, 0, 0, 0, 0, 2];
+const ISN_SECRET: IsnSecret = IsnSecret::from_bytes([0x5a; 16]);
 const LOCAL_IP: Ipv4Address = Ipv4Address::new([192, 0, 2, 10]);
 const PEER_IP: Ipv4Address = Ipv4Address::new([192, 0, 2, 20]);
 const MULTICAST_IP: Ipv4Address = Ipv4Address::new([224, 0, 0, 251]);
@@ -45,7 +46,7 @@ fn checksum(bencher: Bencher, len: usize) {
 
 #[divan::bench]
 fn stack_new(bencher: Bencher) {
-    bencher.bench_local(|| Stack::new(StackConfig::new(black_box(LOCAL_MAC), 1514)));
+    bencher.bench_local(|| Stack::new(StackConfig::new(black_box(LOCAL_MAC), 1514, ISN_SECRET)));
 }
 
 fn local_tcp_endpoint() -> TcpEndpoint {
@@ -229,8 +230,10 @@ fn udp_ipv4_fragment_frames(payload: &[u8]) -> [Bytes; 2] {
 }
 
 fn established_stack() -> Stack {
-    let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, 1514));
-    stack.add_ipv4_address(Ipv4Cidr::new(LOCAL_IP, 24));
+    let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, 1514, ISN_SECRET));
+    stack
+        .add_ipv4_address(Ipv4Cidr::new(LOCAL_IP, 24))
+        .expect("bench address should be accepted");
     stack.learn_neighbor(NeighborEntry {
         ip: IpAddress::Ipv4(PEER_IP),
         mac: PEER_MAC,
@@ -282,8 +285,10 @@ fn udp_receive_and_take(bencher: Bencher, packets: usize) {
     });
 
     bencher.counter(ItemsCount::new(packets)).bench_local(|| {
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, 1514));
-        stack.add_ipv4_address(Ipv4Cidr::new(LOCAL_IP, 24));
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, 1514, ISN_SECRET));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(LOCAL_IP, 24))
+            .expect("bench address should be accepted");
         let socket = stack
             .open_udp(UdpSocketBinding::wildcard(49152))
             .expect("benchmark UDP socket should bind");
@@ -318,8 +323,10 @@ fn udp_receive_take_tail_port(bencher: Bencher, packets: usize) {
     });
 
     bencher.counter(ItemsCount::new(packets)).bench_local(|| {
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, 1514));
-        stack.add_ipv4_address(Ipv4Cidr::new(LOCAL_IP, 24));
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, 1514, ISN_SECRET));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(LOCAL_IP, 24))
+            .expect("bench address should be accepted");
         let sockets: [UdpSocketId; 64] = core::array::from_fn(|index| {
             stack
                 .open_udp(UdpSocketBinding::wildcard(
@@ -352,8 +359,10 @@ fn udp_receive_large_owned_frame(bencher: Bencher) {
     bencher
         .counter(BytesCount::new(UDP_LARGE_PAYLOAD.len()))
         .bench_local(|| {
-            let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, 1514));
-            stack.add_ipv4_address(Ipv4Cidr::new(LOCAL_IP, 24));
+            let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, 1514, ISN_SECRET));
+            stack
+                .add_ipv4_address(Ipv4Cidr::new(LOCAL_IP, 24))
+                .expect("bench address should be accepted");
             let socket = stack
                 .open_udp(UdpSocketBinding::wildcard(49152))
                 .expect("benchmark UDP socket should bind");
@@ -375,14 +384,16 @@ fn udp_receive_large_owned_frame(bencher: Bencher) {
 #[divan::bench]
 fn udp_receive_large_owned_frame_rx_checksum_offload(bencher: Bencher) {
     let frame = udp_ipv4_frame_bytes(8080, 49152, UDP_LARGE_PAYLOAD);
-    let config = StackConfig::new(LOCAL_MAC, 1514)
+    let config = StackConfig::new(LOCAL_MAC, 1514, ISN_SECRET)
         .with_rx_checksum_offload(RxChecksumOffload::new(true, false, true));
 
     bencher
         .counter(BytesCount::new(UDP_LARGE_PAYLOAD.len()))
         .bench_local(|| {
             let mut stack = Stack::new(black_box(config));
-            stack.add_ipv4_address(Ipv4Cidr::new(LOCAL_IP, 24));
+            stack
+                .add_ipv4_address(Ipv4Cidr::new(LOCAL_IP, 24))
+                .expect("bench address should be accepted");
             let socket = stack
                 .open_udp(UdpSocketBinding::wildcard(49152))
                 .expect("benchmark UDP socket should bind");
@@ -406,8 +417,10 @@ fn udp_receive_ipv4_joined_multicast(bencher: Bencher) {
     let frame = udp_ipv4_frame_to_bytes(MULTICAST_IP, 5353, 49152, UDP_PAYLOAD);
 
     bencher.counter(ItemsCount::new(1usize)).bench_local(|| {
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, 1514));
-        stack.add_ipv4_address(Ipv4Cidr::new(LOCAL_IP, 24));
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, 1514, ISN_SECRET));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(LOCAL_IP, 24))
+            .expect("bench address should be accepted");
         stack
             .join_ipv4_multicast(MULTICAST_IP, LOCAL_IP)
             .expect("benchmark IPv4 multicast group should join");
@@ -433,8 +446,10 @@ fn udp_receive_ipv4_fragment_reassembly(bencher: Bencher) {
     let fragments = udp_ipv4_fragment_frames(UDP_PAYLOAD);
 
     bencher.counter(ItemsCount::new(2usize)).bench_local(|| {
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, 1514));
-        stack.add_ipv4_address(Ipv4Cidr::new(LOCAL_IP, 24));
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, 1514, ISN_SECRET));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(LOCAL_IP, 24))
+            .expect("bench address should be accepted");
         let socket = stack
             .open_udp(UdpSocketBinding::wildcard(49152))
             .expect("benchmark UDP socket should bind");
@@ -790,7 +805,7 @@ fn tcp_ack_discards_in_flight_segments(bencher: Bencher) {
 #[divan::bench]
 fn tcp_first_listen(bencher: Bencher) {
     bencher.bench_local(|| {
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, 1514));
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, 1514, ISN_SECRET));
         stack
             .open_tcp_listen(
                 TcpEndpoint {
@@ -806,7 +821,7 @@ fn tcp_first_listen(bencher: Bencher) {
 #[divan::bench(args = [8usize, 64])]
 fn tcp_listen_many(bencher: Bencher, sockets: usize) {
     bencher.counter(ItemsCount::new(sockets)).bench_local(|| {
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, 1514));
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, 1514, ISN_SECRET));
         for index in 0..sockets {
             stack
                 .open_tcp_listen(
@@ -824,8 +839,10 @@ fn tcp_listen_many(bencher: Bencher, sockets: usize) {
 
 #[divan::bench]
 fn udp_queue_and_immediate_submit(bencher: Bencher) {
-    let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, 1514));
-    stack.add_ipv4_address(Ipv4Cidr::new(LOCAL_IP, 24));
+    let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, 1514, ISN_SECRET));
+    stack
+        .add_ipv4_address(Ipv4Cidr::new(LOCAL_IP, 24))
+        .expect("bench address should be accepted");
     stack.learn_neighbor(NeighborEntry {
         ip: IpAddress::Ipv4(PEER_IP),
         mac: PEER_MAC,
@@ -874,8 +891,10 @@ fn udp_queue_and_immediate_submit(bencher: Bencher) {
 
 #[divan::bench(args = [8usize, MAX_OUTBOUND_FRAMES])]
 fn udp_queue_and_immediate_submit_batch(bencher: Bencher, batch: usize) {
-    let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, 1514));
-    stack.add_ipv4_address(Ipv4Cidr::new(LOCAL_IP, 24));
+    let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, 1514, ISN_SECRET));
+    stack
+        .add_ipv4_address(Ipv4Cidr::new(LOCAL_IP, 24))
+        .expect("bench address should be accepted");
     stack.learn_neighbor(NeighborEntry {
         ip: IpAddress::Ipv4(PEER_IP),
         mac: PEER_MAC,

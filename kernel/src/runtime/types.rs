@@ -417,6 +417,8 @@ pub enum NetworkErrorDetail {
     TcpClosedUnexpectedly,
     #[error("no ephemeral TCP ports are available")]
     TcpNoEphemeralPorts,
+    #[error("no TCP socket slots are available")]
+    TcpNoSocketSlots,
     #[error("UDP send timed out")]
     UdpSendTimeout,
     #[error("UDP receive timed out")]
@@ -499,6 +501,7 @@ impl NetworkErrorDetail {
             Self::TcpReceiveFailed => "TCP receive failed",
             Self::TcpClosedUnexpectedly => "TCP stream closed unexpectedly",
             Self::TcpNoEphemeralPorts => "no ephemeral TCP ports are available",
+            Self::TcpNoSocketSlots => "no TCP socket slots are available",
             Self::UdpSendTimeout => "UDP send timed out",
             Self::UdpReceiveTimeout => "UDP receive timed out",
             Self::UdpPortInUse => "UDP local port is already in use",
@@ -698,6 +701,15 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<SocketReadiness, UdpError>> + Send + '_;
 
     fn hardware_address(&self) -> [u8; 6];
+
+    /// Asks the DHCP server whether the lease the interface holds is
+    /// still good, after a machine restore may have moved the machine to
+    /// another network. An interface that is not DHCP-configured does
+    /// nothing. Resolves once the question is on the wire; the answer
+    /// is applied by the service's own packet pumps, an ACK keeping the
+    /// lease and a NAK or silence starting configuration over. Called
+    /// only by the machine-generation reactions task.
+    fn revalidate_lease(&self) -> impl Future<Output = ()> + Send + '_;
 
     fn ipv4_cidr(&self) -> impl Future<Output = Option<crate::Ipv4Cidr>> + Send + '_;
 
@@ -975,6 +987,33 @@ pub struct HostDirEntry {
     pub is_directory: bool,
 }
 
+/// How much of one directory the caller of [`HostFileSystem::read_dir`] is
+/// prepared to hold. The host is the source of the listing and decides how
+/// long it is, so the caller states what it can afford; a listing that goes
+/// past either bound fails with [`HostFsError::DirectoryTooLarge`] instead
+/// of being cut short.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostDirLimit {
+    /// Most entries one listing may hold.
+    pub max_entries: usize,
+    /// Most bytes of entry names one listing may hold in total.
+    pub max_name_bytes: usize,
+}
+
+impl HostDirLimit {
+    /// Fails when a listing of `entries` entries whose names total
+    /// `name_bytes` bytes is past either bound.
+    pub fn check(self, entries: usize, name_bytes: usize) -> Result<(), HostFsError> {
+        if entries > self.max_entries || name_bytes > self.max_name_bytes {
+            return Err(HostFsError::DirectoryTooLarge {
+                max_entries: self.max_entries,
+                max_name_bytes: self.max_name_bytes,
+            });
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AuthorityDomain(u64);
 
@@ -1048,6 +1087,19 @@ pub enum HostFsError {
     Server(u32),
     #[error("invalid utf-8")]
     Utf8,
+    /// A name or path component the host share's wire format cannot
+    /// carry: longer than `max_len` bytes, the most one string field of
+    /// a request holds under the session's negotiated message size.
+    #[error("name of {len} bytes exceeds the {max_len} bytes the host share can carry")]
+    NameTooLong { len: usize, max_len: usize },
+    #[error(
+        "directory listing exceeds the caller's limit of {max_entries} entries or \
+         {max_name_bytes} name bytes"
+    )]
+    DirectoryTooLarge {
+        max_entries: usize,
+        max_name_bytes: usize,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1059,6 +1111,7 @@ pub enum HostFsErrorKind {
     NotEmpty,
     ReadOnly,
     Unsupported,
+    NameTooLong,
     Io,
 }
 
@@ -1073,12 +1126,14 @@ impl HostFsError {
             HostFsError::Transport(IoError::PermissionDenied)
             | HostFsError::Transport(IoError::ReadOnly) => HostFsErrorKind::ReadOnly,
             HostFsError::Transport(IoError::Unsupported) => HostFsErrorKind::Unsupported,
+            HostFsError::NameTooLong { .. } => HostFsErrorKind::NameTooLong,
             HostFsError::Transport(IoError::InvalidBufferLength { .. })
             | HostFsError::Transport(IoError::InvalidDeviceConfig(_))
             | HostFsError::Transport(IoError::OutOfBounds)
             | HostFsError::Transport(IoError::DeviceFault)
             | HostFsError::Protocol(_)
-            | HostFsError::Utf8 => HostFsErrorKind::Io,
+            | HostFsError::Utf8
+            | HostFsError::DirectoryTooLarge { .. } => HostFsErrorKind::Io,
             HostFsError::Server(code) => match code {
                 2 => HostFsErrorKind::NoEntry,
                 17 => HostFsErrorKind::Exist,
@@ -1091,18 +1146,65 @@ impl HostFsError {
     }
 }
 
+/// What a machine restore did to the host share, as far as the kernel
+/// can tell from the restore's cause.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostShareRestore {
+    /// The host's 9p server is the one the session was attached to and
+    /// still knows it. What the kernel remembered is stale: cached
+    /// answers carry ages on a monotonic clock that did not advance
+    /// while the machine was stopped.
+    ServerKept,
+    /// The server no longer knows the session or any fid in it, because
+    /// the kernel came back from an image taken before the server saw
+    /// them. The session is dropped without a `Tclunk`, and the next
+    /// operation attaches again.
+    SessionLost,
+}
+
 pub trait HostFileSystem: Clone + Send + 'static {
     /// How this filesystem's caches have been serving the kernel, or
     /// `None` from an implementation that caches nothing.
     fn cache_stats(&self) -> Option<crate::HostFsCacheStats>;
 
+    /// Brings the filesystem's own state in line with a machine restore:
+    /// an implementation with a session and caches drops what `restore`
+    /// says is stale, and one with neither does nothing. Called by the
+    /// machine-generation reactions task, never concurrently with
+    /// itself; operations may be in flight on other tasks.
+    fn after_machine_restore(
+        &self,
+        restore: HostShareRestore,
+    ) -> impl Future<Output = ()> + Send + '_;
+
+    /// Releases the host share so the VMM may snapshot the machine, and
+    /// holds it released: resolves once every operation in flight has
+    /// finished and the share's session and fids are returned to the
+    /// host. Operations issued from the moment this is called wait
+    /// rather than fail, until the hold ends through
+    /// [`Self::snapshot_finished`] or a machine restore reaches
+    /// [`Self::after_machine_restore`]. Calling it while the hold is
+    /// already in force is harmless. An implementation with no session
+    /// has nothing to release and resolves at once.
+    fn prepare_snapshot(&self) -> impl Future<Output = ()> + Send + '_;
+
+    /// Ends a hold taken by [`Self::prepare_snapshot`] because the
+    /// snapshot is over and this machine, the source, runs on. Waiting
+    /// operations resume and the session is attached again. A no-op when
+    /// no hold is in force, which is the case once a machine restore has
+    /// already ended it.
+    fn snapshot_finished(&self);
+
     fn stat_path<'a>(
         &'a self,
         path: &'a str,
     ) -> impl Future<Output = Result<HostMetadata, HostFsError>> + Send + 'a;
+    /// Lists `path`, failing with [`HostFsError::DirectoryTooLarge`] when the
+    /// directory is past `limit`.
     fn read_dir<'a>(
         &'a self,
         path: &'a str,
+        limit: HostDirLimit,
     ) -> impl Future<Output = Result<Vec<HostDirEntry>, HostFsError>> + Send + 'a;
     fn read_file<'a>(
         &'a self,

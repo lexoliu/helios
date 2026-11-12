@@ -11,7 +11,7 @@ use core::num::NonZeroUsize;
 use core::ops::Range;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
-use helios_hal::cpu::{ProcessorId, Timebase};
+use helios_hal::cpu::{GUEST_STACK_LIMIT_OFFSET, ProcessorId, Timebase};
 use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::watchdog::Watchdog;
 use helios_kernel::{InstructionSampler, SampleCapture, Timer, WasmtimeTlsSlots};
@@ -118,11 +118,7 @@ const BOOTSTRAP_ANCHOR_LOGICAL_ID: u16 = u16::MAX;
 /// runtime's address in `IA32_FS_BASE` before the first compiler-generated
 /// instruction runs on it. This word exists before the allocator that would
 /// otherwise own it, which is the whole of why it is a `static`.
-static BOOTSTRAP_ANCHOR: ProcessorAnchor = ProcessorAnchor {
-    identity: AtomicUsize::new(0),
-    logical_id: BOOTSTRAP_ANCHOR_LOGICAL_ID,
-    _reserved: [0; 3],
-};
+static BOOTSTRAP_ANCHOR: ProcessorAnchor = ProcessorAnchor::new(BOOTSTRAP_ANCHOR_LOGICAL_ID);
 
 /// The words the executing processor answers `fs`-relative loads with.
 ///
@@ -137,11 +133,14 @@ static BOOTSTRAP_ANCHOR: ProcessorAnchor = ProcessorAnchor {
 ///
 /// # Concurrency
 ///
-/// Both words are written once, by the bootstrap processor, before the
-/// processor that reads them runs: `logical_id` when the runtime is
-/// constructed, `identity` when [`build_boot_context`] has settled the
-/// runtimes at their final addresses. Every read is the owning processor
-/// reading its own anchor through its own `IA32_FS_BASE`.
+/// `identity` and `logical_id` are written once, by the bootstrap processor,
+/// before the processor that reads them runs: `logical_id` when the runtime
+/// is constructed, `identity` when [`build_boot_context`] has settled the
+/// runtimes at their final addresses. Every read of them is the owning
+/// processor reading its own anchor through its own `IA32_FS_BASE`.
+/// `guest_stack_limit` follows [`GUEST_STACK_LIMIT_OFFSET`]'s contract: the
+/// owning processor writes and reads it, any processor may store the
+/// interrupt sentinel into it.
 #[repr(C)]
 pub(crate) struct ProcessorAnchor {
     /// Offset 0: the identity this processor answers a critical-section
@@ -153,6 +152,11 @@ pub(crate) struct ProcessorAnchor {
     /// [`BOOTSTRAP_ANCHOR_LOGICAL_ID`] on the bootstrap anchor.
     logical_id: u16,
     _reserved: [u16; 3],
+    /// Offset 16: the stack limit of the guest running on this processor,
+    /// which compiled guest code compares `rsp` against as
+    /// `fs:[GUEST_STACK_LIMIT_OFFSET]`. Wasmtime owns its contents through
+    /// `wasmtime_processor_stack_limit`.
+    guest_stack_limit: AtomicUsize,
 }
 
 /// Byte offset of [`ProcessorAnchor::identity`] from `IA32_FS_BASE`.
@@ -171,6 +175,10 @@ const _: () = assert!(
 const _: () = assert!(
     core::mem::offset_of!(ProcessorAnchor, logical_id) == ANCHOR_LOGICAL_ID_OFFSET,
     "the fs-relative logical-id load would read the wrong word"
+);
+const _: () = assert!(
+    core::mem::offset_of!(ProcessorAnchor, guest_stack_limit) == GUEST_STACK_LIMIT_OFFSET as usize,
+    "compiled guest code would compare its stack pointer against the wrong word"
 );
 
 #[repr(C)]
@@ -238,6 +246,7 @@ impl ProcessorAnchor {
             identity: AtomicUsize::new(0),
             logical_id,
             _reserved: [0; 3],
+            guest_stack_limit: AtomicUsize::new(usize::MAX),
         }
     }
 }
@@ -549,6 +558,15 @@ pub(crate) fn current_runtime() -> &'static ProcessorRuntime {
         .runtime_address()
         .unwrap_or_else(|| panic!("x86 processor runtime was not installed before use"));
     unsafe { &*(runtime.get() as *const ProcessorRuntime) }
+}
+
+/// The executing processor's guest stack-limit word.
+///
+/// Read through the runtime rather than `fs` because Wasmtime needs the
+/// word's address, which an `fs`-relative load cannot produce. A guest only
+/// runs once this processor's runtime is installed.
+pub(crate) fn current_guest_stack_limit() -> &'static AtomicUsize {
+    &current_runtime().anchor.guest_stack_limit
 }
 
 pub(crate) fn current_processor() -> ProcessorId {

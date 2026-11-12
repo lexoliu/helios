@@ -14,16 +14,21 @@ mod program_service;
 mod table;
 mod thread;
 
+#[cfg(test)]
+pub(crate) use authority::test_caps;
 pub use authority::{
-    ClockAuthorityRights, DirectoryAuthorityRights, DirectoryCap, DirectoryPreopen, DnsCap,
-    ExecAuthority, ForkAuthority, JoinAuthority, LinkAuthorityRights, LinkSourceCap,
-    LinkTargetDirectoryCap, MulticastCap, NetworkAdminCap, NetworkAuthorityRights, NetworkCap,
-    PrivilegedBindCap, ProcessAuthority, ProcessAuthorityError, ProcessAuthorityRights,
+    AudioClaimCap, ClockAuthorityRights, DeviceClassRights, DeviceGrantClaimCap,
+    DirectoryAuthorityRights, DirectoryCap, DirectoryPreopen, DisplayClaimCap, DnsCap,
+    ExecAuthority, ForkAuthority, GpuClaimCap, InputClaimCap, JoinAuthority, LinkAuthorityRights,
+    LinkSourceCap, LinkTargetDirectoryCap, MulticastCap, NetworkAdminCap, NetworkAuthorityRights,
+    NetworkCap, PrivilegedBindCap, ProcessAuthority, ProcessAuthorityError, ProcessAuthorityRights,
     SetWallClockCap, SignalAuthority, SpawnAuthority, SymlinkCreateCap, SymlinkReadCap, TcpCap,
     TerminalAuthorityRights, TerminalInputCap, TerminalOutputCap, TtyControlCap, UdpCap,
 };
 pub(crate) use descriptor::FreeDescriptorSlots;
-pub use descriptor::{DescriptorEntry, DescriptorId, DescriptorTable, DescriptorTableError};
+pub use descriptor::{
+    DescriptorEntry, DescriptorId, DescriptorLimit, DescriptorTable, DescriptorTableError,
+};
 pub use futex::{FutexKey, FutexTable, FutexWaitRegistration, GuestAddress, ProcessMemoryIdentity};
 pub use program_service::{
     ProgramExecError, ProgramExecErrorDetail, ProgramExecErrorKind, ProgramOutOfMemory,

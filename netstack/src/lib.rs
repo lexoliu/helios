@@ -2,11 +2,13 @@
 
 extern crate alloc;
 
+mod address;
 mod checksum;
 mod congestion;
 mod dhcp;
 mod dns;
 mod hash;
+mod isn;
 mod ndp;
 mod packet;
 mod stack;
@@ -19,6 +21,9 @@ use bytes::Bytes;
 use helios_hal::io::IoResult;
 use thiserror::Error;
 
+pub use address::{
+    AddressLifetimes, Ipv6AddressEntry, Ipv6AddressOrigin, Lifetime, Preference, TWO_HOURS_SECONDS,
+};
 pub use checksum::{
     icmpv6_checksum, icmpv6_checksum_valid, internet_checksum, ipv4_checksum,
     partial_transport_checksum_completes, tcp_checksum_valid, tcp_pseudo_header_checksum,
@@ -33,16 +38,18 @@ pub use dhcp::{
     DhcpOptionBuffer, DhcpOptionWriter, DhcpPacket, DhcpServerMessage, MAX_DHCP_DNS_SERVERS,
 };
 pub use dns::{
-    DNS_MAX_ADDRESS_RECORDS, DNS_PORT, DnsMessage, DnsQuestionWriter, DnsRecordType, DnsResponse,
+    DNS_MAX_ADDRESS_RECORDS, DNS_MAX_CNAME_CHAIN, DNS_PORT, DnsMessage, DnsQuery,
+    DnsQuestionWriter, DnsRecordType, DnsResponse,
 };
 pub use hash::{
     FlowHash, FlowTuple, RSS_INDIRECTION_ENTRIES, RSS_KEY_BYTES, STANDARD_RSS_KEY, flow_hash,
     rss_indirection_entry, toeplitz,
 };
+pub use isn::{IsnSecret, initial_sequence_number};
 pub use ndp::{
-    Ipv6DnsServers, Ipv6RouterConfiguration, MAX_ADVERTISED_PREFIXES, MAX_IPV6_DNS_SERVERS,
-    MAX_ROUTER_SOLICITATIONS, NeighborDiscovery, ROUTER_SOLICITATION_INTERVAL_NANOS,
-    SLAAC_PREFIX_LEN, interpret_router_advertisement,
+    AdvertisedAddress, Ipv6DnsServers, Ipv6RouterConfiguration, MAX_ADVERTISED_PREFIXES,
+    MAX_IPV6_DNS_SERVERS, MAX_ROUTER_SOLICITATIONS, NeighborDiscovery, OnLinkPrefix,
+    ROUTER_SOLICITATION_INTERVAL_NANOS, SLAAC_PREFIX_LEN, interpret_router_advertisement,
 };
 pub use packet::{
     ArpOperation, ArpPacket, EthernetFrame, EthernetProtocol, Icmpv4DestinationUnreachableCode,
@@ -839,6 +846,13 @@ pub enum StackError {
     /// A socket address set overlaps an existing socket.
     #[error("network socket address is already in use")]
     AddressInUse,
+    /// The TCP socket slab has no free slot.
+    ///
+    /// Closed sockets keep their slot until the close finishes, `TIME-WAIT`
+    /// included, and a listener's half-open children hold slots too, so a
+    /// caller can meet this whatever it holds itself.
+    #[error("TCP socket slab is full")]
+    TcpSocketsExhausted,
     /// A listen backlog value cannot be represented by the stack.
     #[error("TCP listen backlog is invalid")]
     InvalidListenBacklog,
@@ -866,4 +880,10 @@ pub enum StackError {
     /// Multicast membership storage was exhausted.
     #[error("network multicast membership table is full")]
     MulticastMembershipTableFull,
+    /// Route storage was exhausted and nothing could be displaced.
+    #[error("network route table is full")]
+    RouteTableFull,
+    /// Interface address storage was exhausted.
+    #[error("network address table is full")]
+    AddressTableFull,
 }

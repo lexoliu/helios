@@ -34,27 +34,32 @@
 //! leaves when a claim is released, which is what makes the restart
 //! visible from a capture rather than only from a log.
 //!
-//! Every window the dead instance was composing dies with it: the pages
-//! belong to the clients and stay theirs, but the identities are retired
-//! and the next call a client makes on one is answered `gone`.
+//! Every window the dead instance was composing dies with it: the frame
+//! buffers belong to the clients and stay theirs — the dead store's
+//! views of them are withdrawn with its view table — but the identities
+//! are retired and the next call a client makes on one is answered
+//! `gone`.
 //!
 //! # Concurrency
 //!
 //! Three things run inside the one store at once: `run`, the request
-//! loop, and the drain that takes back what dying clients handed over.
+//! loop, and the drain that takes back every window a client let go —
+//! by dying, by dropping it, or by cancelling its `create`.
 //! `run` is dispatched with [`Accessor::spawn`] so the other two are not
 //! behind it; the supervisor task itself is `spawn_local`, so it stays
 //! on the bootstrap processor alongside the store it owns.
 
 use super::*;
 
+use crate::buffer::Span;
 use crate::component::ComponentRuntimeState;
 use crate::surface::{
     SURFACE_REQUEST_QUEUE_DEPTH, SurfaceCreate, SurfaceId, SurfaceRequest, SurfaceService,
     SurfaceServiceError,
 };
 use crate::wasmtime_adapter::bindings::compositor::bindings::{CompositorHost, exports};
-use crate::{ProcessAuthority, ProviderReceiver, provider_channel};
+use crate::wasmtime_adapter::component_host::{guest_memory, view_trap};
+use crate::{DeviceClassRights, ProcessAuthority, ProviderReceiver, provider_channel};
 use thiserror::Error;
 use wasmtime::component::{Accessor, AccessorTask, HasSelf, ResourceTable};
 
@@ -75,6 +80,16 @@ pub(super) const COMPOSITOR_PLUGIN_INSTANCE_NAME: &str = "compositor-plugin";
 /// short enough that a restart looks instant to whoever is watching the
 /// screen.
 const RESTART_DELAY: Duration = Duration::from_millis(250);
+
+/// The authority the compositor runs with: everything `root` grants,
+/// since it spawns the shell it draws and is bootfs-provisioned and
+/// signed like the system components, plus the display and the input
+/// devices it draws and reads. It never claims the GPU.
+fn compositor_authority() -> ProcessAuthority {
+    let mut authority = ProcessAuthority::root();
+    authority.grant_device_classes(DeviceClassRights::DISPLAY | DeviceClassRights::INPUT);
+    authority
+}
 
 /// Provision the `compositor` plugin, if this kernel image ships one.
 ///
@@ -249,10 +264,7 @@ where
             DebugFileSystem::new(exec_context.runtime_state.clone()),
             alloc::vec![String::from(COMPOSITOR_PLUGIN_PATH)],
             Vec::new(),
-            // Same authority the system components get: the compositor
-            // spawns the shell it draws, and it is bootfs-provisioned
-            // and signed like they are.
-            ProcessAuthority::root(),
+            compositor_authority(),
             OutputMode::Serial,
             exec_context.read_serial,
             exec_context.write_serial,
@@ -336,12 +348,16 @@ where
             let _ = reply.send(answer.map_err(from_guest_error));
             Ok(())
         }
-        SurfaceRequest::Destroy { id } => destroy_surface(accessor, guest, id).await,
     }
 }
 
-/// Give the compositor a view of one client's pages and tell it about
-/// the window they hold.
+/// Tell the compositor about one client's window, and show the client's
+/// frame buffer at the span the compositor answers with.
+///
+/// The compositor names the span, so it is told about the window before
+/// the buffer is shown; the interface promises it no `commit` for the
+/// window before the buffer is there, and this task serves the commit
+/// queue, so none is served in between.
 async fn serve_create<CpuImpl, Net, HostFs>(
     accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>,
     guest: &exports::helios::system::compositor::Guest,
@@ -356,24 +372,16 @@ where
     let SurfaceCreate {
         id,
         geometry,
-        physical,
+        buffer,
         reply,
     } = create;
-    // The view first: the compositor is told where the client's frame
-    // buffer is in its own memory, so it cannot be told before it can
-    // reach it.
-    let view = accessor.with(|mut access| {
-        let data = access.get();
-        let (surfaces, window) = data.device.surfaces_mut()?;
-        surfaces.map_view(registry, window, id, physical)
-    });
-    let view = match view {
-        Ok(view) => view,
-        Err(error) => {
-            let _ = reply.send(Err(error));
-            return Ok(());
-        }
-    };
+    // A client that let the window go while this request was queued has
+    // already been answered by its own side; the compositor is never
+    // told about a window that is no longer on the desktop.
+    if registry.lookup(id).is_none() {
+        let _ = reply.send(Err(SurfaceServiceError::Gone));
+        return Ok(());
+    }
 
     let answer = guest
         .call_create(
@@ -385,28 +393,67 @@ where
                 width: geometry.width,
                 height: geometry.height,
             },
-            exports::helios::system::compositor::Placement {
-                offset: view.offset,
-                length: view.bytes,
-            },
         )
         .await?;
-    match answer {
-        Ok(()) => {
-            let _ = reply.send(Ok(()));
-        }
+    let span = match answer {
+        Ok(span) => Span::new(span.offset, span.length),
         Err(error) => {
-            // The compositor would not take the window, so the view goes
-            // back before the client is told: an unmapped page is one
-            // the compositor provably cannot read.
-            accessor.with(|mut access| access.get().device.unmap_surface_view(id));
             let _ = reply.send(Err(from_guest_error(error)));
+            return Ok(());
         }
+    };
+
+    let shown = accessor.with(|mut access| {
+        // Checked again, in the same step as the show: the client may
+        // have let the window go while the compositor was answering —
+        // dropped it, died, or stopped waiting for this create — and the
+        // drain's destroy for it may already have run. A view taken now
+        // would outlive it.
+        if registry.lookup(id).is_none() {
+            return Err(SurfaceServiceError::Gone);
+        }
+        let linear_memory = access.get().linear_memory;
+        let memory = guest_memory(linear_memory, &access)?;
+        let data = access.get();
+        data.device
+            .surfaces_mut()
+            .show_view(&mut data.views, memory, span, id, &buffer)
+    });
+    if let Err(SurfaceServiceError::Gone) = shown {
+        // The window went back on the return queue, and the drain may
+        // have served that destroy before the compositor had taken the
+        // window on, which leaves the compositor holding it. So it is
+        // told here, whatever the drain did: nothing was shown at its
+        // span, and a destroy for a window it already let go does
+        // nothing.
+        guest.call_destroy(accessor, id.raw()).await?;
+        let _ = reply.send(Err(SurfaceServiceError::Gone));
+        return Ok(());
     }
+    if let Err(error) = shown {
+        // The compositor answered with a span the kernel cannot show the
+        // window at. It took the window on, so it is told the window is
+        // gone again — its span was never anything but its own memory —
+        // and the client is told why.
+        tracing::warn!(
+            target: "helios_kernel::supervisor",
+            surface = id.raw(),
+            %error,
+            "the compositor answered create with a span the window cannot be shown at"
+        );
+        guest.call_destroy(accessor, id.raw()).await?;
+        let _ = reply.send(Err(error));
+        return Ok(());
+    }
+    let _ = reply.send(Ok(()));
     Ok(())
 }
 
-/// Take one window off the desktop and drop the compositor's view of it.
+/// End the compositor's view of one window and take it off the desktop.
+///
+/// The view goes first: the interface promises the compositor its span
+/// is ordinary zeroed memory again before `destroy` is called, and the
+/// buffer goes back to the client's pool with the view's reference.
 async fn destroy_surface<CpuImpl, Net, HostFs>(
     accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>,
     guest: &exports::helios::system::compositor::Guest,
@@ -417,8 +464,13 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
+    accessor
+        .with(|mut access| {
+            let data = access.get();
+            data.device.surfaces_mut().end_view(id, &mut data.views)
+        })
+        .map_err(view_trap)?;
     guest.call_destroy(accessor, id.raw()).await?;
-    accessor.with(|mut access| access.get().device.unmap_surface_view(id));
     Ok(())
 }
 
@@ -433,7 +485,7 @@ const fn from_guest_error(
         GuestError::UnsupportedSize => SurfaceServiceError::UnsupportedSize,
         GuestError::TooManySurfaces => SurfaceServiceError::TooManySurfaces,
         GuestError::OutOfBounds => SurfaceServiceError::OutOfBounds,
-        GuestError::WindowExhausted => SurfaceServiceError::WindowExhausted,
+        GuestError::BadSpan => SurfaceServiceError::CompositorBadSpan,
         GuestError::OutOfMemory => SurfaceServiceError::OutOfMemory,
         GuestError::Gone => SurfaceServiceError::Gone,
         GuestError::NotTheCompositor => SurfaceServiceError::NotTheCompositor,
@@ -478,7 +530,9 @@ where
     }
 }
 
-/// The drain that takes back what dying clients handed over.
+/// The drain that takes back every window a client let go: the windows
+/// of a client that died, a window a client dropped, and a window whose
+/// `create` its client stopped waiting for.
 struct DrainReturnedSurfaces<CpuImpl, Net, HostFs> {
     guest: exports::helios::system::compositor::Guest,
     registry: SurfaceService,
@@ -499,19 +553,20 @@ where
     ) -> wasmtime::Result<()> {
         let registry = self.registry;
         // Armed before the first look, and re-armed as part of every
-        // completed wait: an arena handed back between a drain and a
-        // park is one this task is owed.
+        // completed wait: windows handed back between a drain and a park
+        // are ones this task is owed.
         let mut waiter = registry.returns_waiter();
         loop {
             for returned in registry.take_returned() {
-                for id in &returned.ids {
-                    // The window goes off the desktop and the view of
-                    // its pages goes with it, both before the arena is
-                    // dropped: the client's pages go back to its pool
-                    // only once nothing here can reach them.
-                    destroy_surface(accessor, &self.guest, *id).await?;
-                }
-                drop(returned);
+                // The view ends and the window goes off the desktop;
+                // the client's buffer goes back to its pool with the
+                // view's reference.
+                destroy_surface(accessor, &self.guest, returned.id()).await?;
+                // Only now does the window's slot come back. A failure
+                // above ends this task and drops the guards it still
+                // holds, which releases them the way the dead
+                // compositor's windows are.
+                returned.drained();
             }
             core::future::poll_fn(|cx| registry.poll_returns(cx, &mut waiter)).await;
         }
@@ -520,8 +575,25 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{DesktopRefusal, desktop_refusal};
+    use super::{DesktopRefusal, compositor_authority, desktop_refusal};
     use crate::test_support::TestRuntimeState;
+
+    /// The compositor draws the display and reads the input devices, and
+    /// is given nothing else of the machine's hardware.
+    #[test]
+    fn provisioned_compositor_claims_the_display_and_every_input_device() {
+        let authority = compositor_authority();
+
+        assert!(authority.derive_display_claim_cap().is_ok());
+        assert!(authority.derive_input_claim_cap().is_ok());
+        assert!(authority.derive_gpu_claim_cap().is_err());
+        assert!(authority.derive_audio_claim_cap().is_err());
+        assert!(authority.granted_devices().is_empty());
+        assert!(
+            authority.derive_spawn_authority().is_ok(),
+            "it keeps what root grants: it spawns the shell it draws"
+        );
+    }
 
     /// A bench-lane or smoke boot has no display device. The plugin is
     /// not started there, instead of being rebuilt every restart delay

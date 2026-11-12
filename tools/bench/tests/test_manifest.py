@@ -1,12 +1,14 @@
 import re
 from pathlib import Path
 
+import pytest
+
 from helios_bench import REPO_ROOT
 from helios_bench.manifest import (
     Lane,
     fedora_image,
     load_manifest,
-    vendored_wasmtime_revision,
+    vendored_wasmtime_pin,
     wasmtime_linux_release,
 )
 from helios_bench.report import WorkloadClass
@@ -15,7 +17,7 @@ from helios_bench.workloads import load_workloads
 
 def test_manifest_lanes_are_complete() -> None:
     manifest = load_manifest()
-    assert {lane.name for lane in manifest.lanes} == {"x86-64-kvm"}
+    assert {lane.name for lane in manifest.lanes} == {"x86-64-kvm", "aarch64-hvf"}
     for lane in manifest.lanes:
         assert isinstance(lane, Lane)
         assert lane.runner_label.startswith("helios-bench-")
@@ -26,7 +28,9 @@ def test_manifest_lanes_are_complete() -> None:
 
 
 def test_pins_come_from_their_single_sources() -> None:
-    revision = vendored_wasmtime_revision()
+    pin = vendored_wasmtime_pin()
+    revision = pin.revision
+    assert pin.repository == "lexoliu/wasmtime"
     assert len(revision) == 40
     action = (REPO_ROOT / ".github/actions/checkout-wasmtime/action.yml").read_text(encoding="utf-8")
     assert revision in action
@@ -89,7 +93,11 @@ def test_coreutils_counterparts_run_one_exec_per_helios_exec() -> None:
 
 def test_native_counterparts_exist_for_every_native_bin_reference() -> None:
     manifest = load_workloads()
-    sources = {path.stem for path in (REPO_ROOT / "tools/bench/native").glob("*.c")}
+    native_root = REPO_ROOT / "tools/bench/native"
+    sources = {path.stem for path in native_root.glob("*.c")}
+    # The Rust tools `build.sh` builds alongside the C ones, by package.
+    sources.update(re.findall(r"cargo zigbuild .*-p (\S+)", (native_root / "build.sh").read_text()))
+    assert "helios-compiler-host" in sources
     for workload in manifest["workloads"]:
         for side in ("linux_native", "linux_wasmtime"):
             spec = workload["counterparts"][side]
@@ -100,16 +108,57 @@ def test_native_counterparts_exist_for_every_native_bin_reference() -> None:
                     assert Path(value).name in sources, value
 
 
-def test_the_suite_measures_one_lane() -> None:
-    """One architecture, on purpose.
+def test_aot_curl_runs_the_compiler_plugin_on_both_compared_columns() -> None:
+    """#750: the Linux + Wasmtime column hosts the plugin the Helios column
+    runs, asking for the same compile; native `wasmtime compile` is the
+    reference beside them, never a comparison."""
+    workload = next(w for w in load_workloads()["workloads"] if w["name"] == "aot-curl")
+    native = workload["counterparts"]["linux_native"]
+    wasmtime = workload["counterparts"]["linux_wasmtime"]
+    assert native["program"] == "{wasmtime}" and native["args"][0] == "compile"
+    assert wasmtime["resident"] is True
+    assert wasmtime["program"] == "{native_bin}/helios-compiler-host"
+    args = wasmtime["args"]
+    flags = dict(zip(args[::2], args[1::2], strict=True))
+    assert flags == {
+        "--plugin": "{compiler_plugin}",
+        "--input": "{guest:artifacts/wasi-tools/curl.wasm}",
+        "--output": "{workdir}/aot-curl-output.cwasm",
+        "--target": "{compiler_target}",
+        "--hint": "performance",
+        "--workers": "{compiler_workers}",
+    }
+    # The input is the one the Helios column uploads.
+    assert flags["--input"] == "{guest:" + workload["wasm_path"] + "}"
+    assert set(workload["uncompared"]) == {"linux_native"}
+    assert workload["matched_metrics"] == ["compiler_workers"]
+
+
+def test_every_lane_states_its_compiler_worker_count() -> None:
+    """The kernel's kernel-role processors: every vCPU but the one the
+    embedded debugger reserves for the system component."""
+    for lane in load_manifest().lanes:
+        assert 1 <= lane.compiler_workers < lane.vcpus, lane.name
+
+
+def test_the_workflow_measures_one_lane() -> None:
+    """One architecture in CI, on purpose.
 
     Nearly everything this suite measures lives in the cross-platform
     kernel, and no hosted GitHub Arm runner exposes `/dev/kvm`, so a
-    second lane would repeat the first through an interpreter. An Arm
-    number comes from a dedicated machine, by hand.
+    second workflow lane would repeat the first through an interpreter.
+    The Arm lane has no hosted runner: it is run by hand on a dedicated
+    machine and never enters the workflow matrix.
     """
     manifest = load_manifest()
-    assert [lane.name for lane in manifest.lanes] == ["x86-64-kvm"]
+    scheduled = [lane.name for lane in manifest.lanes if lane.shared_runner is not None]
+    assert scheduled == ["x86-64-kvm"]
+    by_hand = manifest.lane("aarch64-hvf")
+    assert by_hand.accelerator == "hvf"
+    assert by_hand.rpc_transport == "serial"
+    assert by_hand.runs_on(advisory=True) == by_hand.runner_label
+    with pytest.raises(SystemExit):
+        by_hand.github_matrix_entry()
     lane = manifest.lane("x86-64-kvm")
     assert lane.accelerator == "kvm"
     assert lane.rpc_transport == "vsock"
