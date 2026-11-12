@@ -11,11 +11,12 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::alloc::Layout;
-use core::cell::UnsafeCell;
+use core::cell::{RefCell, UnsafeCell};
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use helios_hal::io::{IoError, IoResult};
+use helios_hal::tagging::{AllocationTags, Tag, TagSet};
 use spin::Mutex;
 
 use crate::bus::{DeviceBus, DmaAddressing, DmaBuffer, DmaPool, IdentityDmaPool};
@@ -711,5 +712,84 @@ impl WindowDmaBuffer {
     /// The buffer as guest memory a driver can be handed.
     pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
         unsafe { core::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+/// One call a [`RecordingTags`] received, with the address the caller named.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TagOp {
+    Assign {
+        addr: usize,
+        len: usize,
+        avoid: TagSet,
+    },
+    Store {
+        addr: usize,
+        len: usize,
+        tag: Tag,
+    },
+}
+
+std::thread_local! {
+    /// The calling test thread's record: each test, and so each pool under
+    /// it, runs on a thread of its own.
+    static TAG_OPS: RefCell<Vec<TagOp>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Allocation tags that record every `assign` and `store` and touch no
+/// memory. A pointer it tags carries [`RecordingTags::ASSIGNED`] in its top
+/// byte, so a host CPU would fault on one: only tests that never dereference
+/// a pointer a pool tagged with it may use it. `CHECKING` is what
+/// [`AllocationTags::checking`] answers.
+pub(crate) struct RecordingTags<const CHECKING: bool>;
+
+impl<const CHECKING: bool> RecordingTags<CHECKING> {
+    /// The tag `assign` picks.
+    pub(crate) const ASSIGNED: Tag = Tag::new(0x5);
+
+    /// Every call this thread made since the last `take`, in order.
+    pub(crate) fn take() -> Vec<TagOp> {
+        TAG_OPS.with(|ops| core::mem::take(&mut *ops.borrow_mut()))
+    }
+
+    fn record(op: TagOp) {
+        TAG_OPS.with(|ops| ops.borrow_mut().push(op));
+    }
+}
+
+impl<const CHECKING: bool> AllocationTags for RecordingTags<CHECKING> {
+    const GRANULE_BYTES: usize = 16;
+
+    fn checking() -> bool {
+        CHECKING
+    }
+
+    unsafe fn assign(range: NonNull<[u8]>, avoid: TagSet) -> Tag {
+        Self::record(TagOp::Assign {
+            addr: range.cast::<u8>().as_ptr() as usize,
+            len: range.len(),
+            avoid,
+        });
+        if CHECKING {
+            Self::ASSIGNED
+        } else {
+            Tag::UNCHECKED
+        }
+    }
+
+    unsafe fn store(range: NonNull<[u8]>, tag: Tag) {
+        Self::record(TagOp::Store {
+            addr: range.cast::<u8>().as_ptr() as usize,
+            len: range.len(),
+            tag,
+        });
+    }
+
+    fn apply(addr: usize, tag: Tag) -> usize {
+        Self::strip(addr) | usize::from(tag.raw()) << (usize::BITS - 8)
+    }
+
+    fn strip(addr: usize) -> usize {
+        addr & (usize::MAX >> 8)
     }
 }
