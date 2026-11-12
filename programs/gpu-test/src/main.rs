@@ -62,21 +62,21 @@ async fn main() -> Result<(), GpuTestError> {
     let context = gpu.create_context(chosen.id, "gpu-test").await?;
     println!("gpu-test:context capset={}", chosen.id);
 
-    let buffer = context.commands(COMMAND_BUFFER_BYTES).await?;
-    let placement = buffer.placement();
+    let mut buffer = context.commands(COMMAND_BUFFER_BYTES).await?;
+    let span = buffer.span();
     println!(
         "gpu-test:commands offset={:#x} length={}",
-        placement.offset, placement.length
+        span.offset, span.length
     );
+    // The command stream is empty, and is cleared with one bulk
+    // `memory.fill` over the pinned pages.
+    buffer.bytes().fill(0);
 
     // The stream is armed before the submission: the fence is published
     // the moment the device has taken the buffer, and a reader that
     // asked afterwards could arrive after the answer it was waiting for.
     let mut fences = context.fences();
-    match context
-        .submit(&buffer, 0, placement.length, SUBMIT_FENCE)
-        .await
-    {
+    match context.submit(&buffer, 0, span.length, SUBMIT_FENCE).await {
         Ok(()) => println!("gpu-test:submit ok"),
         // A refused submission still retires its fence, so the stream
         // read below has an answer to give either way.

@@ -24,8 +24,8 @@
 //!   pops counts against the claim's in-flight tally until the device
 //!   has answered it, and a release waits that tally out before it
 //!   destroys anything — a chain still parked for ring room publishes
-//!   after `CTX_DESTROY` otherwise, onto command pages the release is
-//!   about to free.
+//!   after `CTX_DESTROY` otherwise, naming a context the device has
+//!   already forgotten.
 //!
 //! Both hold the same device handle. The trait's own contract says every
 //! method takes `&self`, may be called from several tasks at once, and
@@ -38,13 +38,14 @@ use futures::future::{Either, select};
 use helios_hal::cpu::Cpu;
 use helios_hal::device::DeviceRegion;
 use helios_hal::display::{
-    BlobId, BlobRequest, CapsetId, CapsetList, ContextId, ContextName, Gpu3d,
+    BlobId, BlobRequest, CapsetId, CapsetList, ContextId, ContextName, Gpu3d, Gpu3dError,
 };
 use helios_hal::pmm::PhysFrameRange;
 use helios_hal::watchdog::Watchdog;
 use triomphe::Arc;
 
 use crate::Kernel;
+use crate::buffer::Buffer;
 use crate::component::{ProviderReceiver, provider_channel};
 use crate::exec::monotonic_nanos;
 
@@ -127,7 +128,6 @@ pub(super) fn gpu3d_channels(
         submits_in_flight: AtomicU64::new(0),
         submits_drained: crate::exec::ProgressSignal::new(),
         renders,
-        returned: concurrent_queue::ConcurrentQueue::bounded(1),
     });
     (shared, control_rx, submit_rx)
 }
@@ -141,6 +141,11 @@ struct HeldBlob {
     /// while it is placed would leave the engine decoding a span that
     /// no longer names anything.
     mapped: bool,
+    /// The instance's buffer behind a guest-backed blob, held until the
+    /// device has destroyed the blob: the run cannot go back to the pool
+    /// while the renderer may still read it. [`release_blob`] drops it
+    /// only on the device's agreement.
+    backing: Option<Buffer>,
 }
 
 /// Everything the current claim has the renderer holding.
@@ -187,13 +192,9 @@ pub(super) async fn serve_control<Device>(
         let next = pin!(inbox.recv());
         match select(released, next).await {
             Either::Left(((), _)) => {
+                // The records' references to the blobs' buffers go as
+                // the blobs do, after the renderer has let them go.
                 release_claim(device, shared, &mut held).await;
-                // Only now: the renderer has stopped reading, so
-                // dropping the arena hands the pages back to a pool
-                // nothing is decoding.
-                while let Ok(pins) = shared.returned.pop() {
-                    drop(pins);
-                }
                 shared.claim.store(ClaimState::FREE, Ordering::Release);
             }
             Either::Right((Some(request), _)) => {
@@ -262,14 +263,28 @@ async fn serve_request<Device>(
         Gpu3dRequest::DestroyContext { context, .. } => {
             destroy_context(device, held, context).await;
         }
+        // A host call that stopped waiting closes its end before it
+        // goes. One that went before its request was served is owed
+        // nothing, and one that went while the device was working can
+        // never learn what was made to undo it, so it is undone here.
         Gpu3dRequest::CreateBlob { spec, reply, .. } => {
-            let _ = reply.send(create_blob(device, held, spec).await);
+            if reply.is_canceled() {
+                return;
+            }
+            if let Err(Ok(blob)) = reply.send(create_blob(device, held, spec).await) {
+                destroy_blob(device, held, blob).await;
+            }
         }
         Gpu3dRequest::DestroyBlob { blob, .. } => {
             destroy_blob(device, held, blob).await;
         }
         Gpu3dRequest::MapBlob { blob, reply, .. } => {
-            let _ = reply.send(map_blob(device, held, blob).await);
+            if reply.is_canceled() {
+                return;
+            }
+            if let Err(Ok(_)) = reply.send(map_blob(device, held, blob).await) {
+                let _ = unmap_blob(device, held, blob).await;
+            }
         }
         Gpu3dRequest::UnmapBlob { blob, reply, .. } => {
             let _ = reply.send(unmap_blob(device, held, blob).await);
@@ -380,11 +395,12 @@ async fn create_blob<Device: Gpu3d>(
     if held.blobs.is_full() {
         return Err(Gpu3dServiceError::TooManyBlobs);
     }
-    let pages: &[PhysFrameRange] = match &spec.backing {
+    let frames = spec.backing.as_ref().map(Buffer::frames);
+    let pages: &[PhysFrameRange] = match &frames {
         Some(range) => core::slice::from_ref(range),
         None => &[],
     };
-    let blob = device
+    let created = device
         .create_blob(BlobRequest {
             context: spec.context,
             memory: spec.memory,
@@ -393,11 +409,30 @@ async fn create_blob<Device: Gpu3d>(
             host_id: spec.host_id,
             backing: pages,
         })
-        .await
-        .map_err(Gpu3dServiceError::from)?;
+        .await;
+    let blob = match created {
+        Ok(blob) => blob,
+        Err(error) => {
+            if let (Gpu3dError::Transport(_), Some(backing)) = (&error, spec.backing) {
+                // No answer came, so the device may hold a blob nobody
+                // has a name for, attached to these pages: the run is
+                // kept out of the pool for good rather than handed to
+                // the next instance.
+                tracing::error!(
+                    %error,
+                    bytes = backing.bytes(),
+                    "the display engine did not answer a blob create; its backing run is kept \
+                     out of the pool for good, because the engine may be reading and writing it"
+                );
+                backing.leak();
+            }
+            return Err(Gpu3dServiceError::from(error));
+        }
+    };
     held.blobs.push(HeldBlob {
         id: blob,
         mapped: false,
+        backing: spec.backing,
     });
     Ok(blob)
 }
@@ -413,19 +448,50 @@ async fn destroy_blob<Device: Gpu3d>(device: &Device, held: &mut ClaimResources,
         return;
     };
     let record = held.blobs.remove(index);
-    if record.mapped
-        && let Err(error) = device.unmap_blob(blob).await
-    {
-        tracing::warn!(
-            %error,
-            "the display engine would not unmap a blob its owner destroyed"
+    release_blob(device, record).await;
+}
+
+/// Take one blob out of the aperture and destroy it, and let its backing
+/// go only if the display engine agreed to both.
+///
+/// A blob the engine would not unmap or destroy is one it may still
+/// read and write, so the run behind it never goes back to the pool: the
+/// device is outside the kernel's trust, and a run handed to the next
+/// instance while the renderer still writes it would put that instance's
+/// memory under the renderer. A blob whose unmap failed is not destroyed
+/// at all, because the driver refuses to destroy a placed blob. The
+/// bytes are lost instead, and said so.
+async fn release_blob<Device: Gpu3d>(device: &Device, record: HeldBlob) {
+    let HeldBlob {
+        id,
+        mapped,
+        backing,
+    } = record;
+    if mapped && let Err(error) = device.unmap_blob(id).await {
+        keep_backing(
+            "would not take a blob out of the aperture",
+            &error,
+            id,
+            backing,
         );
+        return;
     }
-    if let Err(error) = device.destroy_blob(blob).await {
-        tracing::warn!(
-            %error,
-            "the display engine would not release a blob its owner destroyed"
-        );
+    if let Err(error) = device.destroy_blob(id).await {
+        keep_backing("would not destroy a blob", &error, id, backing);
+    }
+}
+
+/// Keep a blob's backing out of the pool for good.
+fn keep_backing(refusal: &str, error: &Gpu3dError, blob: BlobId, backing: Option<Buffer>) {
+    tracing::error!(
+        %error,
+        blob = blob.raw(),
+        bytes = backing.as_ref().map_or(0, Buffer::bytes),
+        "the display engine {refusal}; its backing run is kept out of the pool for good, \
+         because the engine may still be reading and writing it"
+    );
+    if let Some(backing) = backing {
+        backing.leak();
     }
 }
 
@@ -438,6 +504,12 @@ async fn map_blob<Device: Gpu3d>(
     let Some(index) = held.blobs.iter().position(|held| held.id == blob) else {
         return Err(Gpu3dServiceError::InvalidBlob);
     };
+    // Checked here as well as in the store: two `map-blob` calls on one
+    // blob can both be in flight, and this record is the one place they
+    // meet.
+    if held.blobs[index].mapped {
+        return Err(Gpu3dServiceError::AlreadyMapped);
+    }
     let region = device
         .map_blob(blob)
         .await
@@ -455,6 +527,9 @@ async fn unmap_blob<Device: Gpu3d>(
     let Some(index) = held.blobs.iter().position(|held| held.id == blob) else {
         return Err(Gpu3dServiceError::InvalidBlob);
     };
+    if !held.blobs[index].mapped {
+        return Err(Gpu3dServiceError::NotMapped);
+    }
     device
         .unmap_blob(blob)
         .await
@@ -493,8 +568,8 @@ async fn attach<Device: Gpu3d>(
 /// the tally reads zero; the mark is sampled before the count so a
 /// drain between the two is not missed.
 ///
-/// The order after that is what makes it safe to release the caller's
-/// pages: every mapped blob leaves the aperture, every blob is
+/// The order after that is what makes it safe to drop the records'
+/// buffers: every mapped blob leaves the aperture, every blob is
 /// destroyed, and only then is a context let go — a renderer still
 /// holding a context that names dead resources would be reading guest
 /// pages on their way back to a pool.
@@ -508,21 +583,9 @@ async fn release_claim<Device: Gpu3d>(
         shared.submits_drained.changed(drained).await;
         drained = shared.submits_drained.mark();
     }
-    for blob in &held.blobs {
-        if blob.mapped
-            && let Err(error) = device.unmap_blob(blob.id).await
-        {
-            tracing::warn!(
-                %error,
-                "the display engine would not unmap a blob of a claim that ended"
-            );
-        }
-        if let Err(error) = device.destroy_blob(blob.id).await {
-            tracing::warn!(
-                %error,
-                "the display engine would not release a blob of a claim that ended"
-            );
-        }
+    let blobs = held.blobs.len();
+    for blob in held.blobs.drain(..) {
+        release_blob(device, blob).await;
     }
     for context in &held.contexts {
         if let Err(error) = device.destroy_context(*context).await {
@@ -532,13 +595,8 @@ async fn release_claim<Device: Gpu3d>(
             );
         }
     }
-    tracing::info!(
-        contexts = held.contexts.len(),
-        blobs = held.blobs.len(),
-        "3D claim released"
-    );
+    tracing::info!(contexts = held.contexts.len(), blobs, "3D claim released");
     held.contexts.clear();
-    held.blobs.clear();
 }
 
 /// Serves the command streams a claim's contexts submit.
@@ -549,7 +607,12 @@ async fn release_claim<Device: Gpu3d>(
 /// window between the two. The tally, not the check, is what a release
 /// waits out: a chain parked for ring room publishes whenever the
 /// device takes it, and destroying the context underneath it would
-/// leave the engine reading command pages the release has freed.
+/// leave the engine running a command stream against a context it has
+/// torn down. The request's own reference to the command buffer is what
+/// keeps the pages from going back to the pool while the device reads
+/// them; it is dropped once the device has answered, and kept out of the
+/// pool for good when the device never did (a transport error), because
+/// the chain may still be with it.
 ///
 /// The fence a submission carries is published to the signal the
 /// request brought with it the moment the device has taken the buffer,
@@ -574,6 +637,7 @@ pub(super) async fn serve_submit<Device, CpuImpl>(
         let SubmitRequest::Submit {
             generation,
             context,
+            buffer,
             commands,
             fence,
             fences,
@@ -584,11 +648,20 @@ pub(super) async fn serve_submit<Device, CpuImpl>(
             // than served, for the reason the control queue's are.
             continue;
         }
-        let outcome = device
-            .submit(context, commands, fence)
-            .await
-            .map_err(Gpu3dServiceError::from);
+        let outcome = device.submit(context, commands, fence).await;
+        if let Err(error @ Gpu3dError::Transport(_)) = &outcome {
+            // No answer came, so the chain may still be with the device
+            // and may be read at any later time: the run is kept out of
+            // the pool for good rather than handed to the next instance.
+            tracing::error!(
+                %error,
+                bytes = buffer.bytes(),
+                "the display engine did not answer a command submission; its command buffer is \
+                 kept out of the pool for good, because the engine may still be reading it"
+            );
+            buffer.leak();
+        }
         fences.publish(fence.raw(), monotonic_nanos(cpu));
-        let _ = reply.send(outcome);
+        let _ = reply.send(outcome.map_err(Gpu3dServiceError::from));
     }
 }

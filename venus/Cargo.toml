@@ -1,0 +1,22 @@
+[package]
+name = "helios-venus"
+version = "0.1.0"
+edition.workspace = true
+build = "build.rs"
+
+[dependencies]
+thiserror = { version = "2.0.21", default-features = false, features = ["std"] }
+
+[build-dependencies]
+helios-venus-gen = { workspace = true, features = ["generate"] }
+thiserror = { version = "2.0.21", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+askama = { version = "0.15.6", default-features = false, features = ["derive", "std"] }
+cc = { version = "1.11.1", default-features = false }
+helios-venus-gen = { workspace = true, features = ["generate"] }
+libloading = { version = "0.9.0", default-features = false, features = ["std"] }
+tempfile.workspace = true
+
+[lints]
+workspace = true
