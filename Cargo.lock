@@ -1844,7 +1844,6 @@ version = "0.1.0"
 dependencies = [
  "acpi",
  "arm-gic",
- "bytes",
  "critical-section",
  "fdt",
  "helios-hal",
@@ -2298,7 +2297,6 @@ name = "helios-riscv"
 version = "0.1.0"
 dependencies = [
  "arrayvec",
- "bytes",
  "critical-section",
  "fdt",
  "helios-hal",
@@ -2401,7 +2399,6 @@ version = "0.1.0"
 dependencies = [
  "acpi",
  "bitflags 2.13.1",
- "bytes",
  "critical-section",
  "helios-hal",
  "helios-kernel",

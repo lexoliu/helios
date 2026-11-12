@@ -31,20 +31,26 @@
 //! wakes [`VirtioBalloonDevice::config_changed`] waiters.
 
 use core::future::Future;
+use core::mem::size_of;
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use arrayvec::ArrayVec;
 use async_lock::Mutex;
 use helios_hal::balloon::{MemoryBalloon, MemoryStat, MemoryStatTag};
 use helios_hal::io::{IoError, IoResult};
 
-use crate::bus::{DeviceBus, DmaPool};
+use helios_hal::dma::DmaMemory;
+
+use crate::bus::DeviceBus;
 use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate_with, renegotiate};
 use crate::inflight::{
     InFlight, await_completion, drain_to_idle, reinitialize_posted, reinitialize_requests,
-    submit_chain,
+    submit_control,
 };
 use crate::notify::Notify;
-use crate::queue::{MAX_CHAIN_BUFFERS, VirtQueue};
+use crate::queue::{
+    ControlSlots, MAX_CHAIN_BUFFERS, Part, TransportBuffer, VirtQueue, control_slots,
+};
 use crate::resume::{DeviceReset, QuiesceError, ReinitError, conclude, driver_ok};
 use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
 
@@ -101,10 +107,12 @@ const QUEUE_SIZE: u16 = 16;
 
 /// Page-frame numbers one inflate or deflate request carries.
 ///
-/// The array is built on the caller's stack for the duration of the
-/// request, so it is bounded rather than sized after the range the
-/// caller passed.
+/// The list is staged in the request's control slot, which is sized for
+/// exactly this many, so it is bounded rather than sized after the range
+/// the caller passed.
 const PFNS_PER_REQUEST: usize = 256;
+/// A page-frame number on the wire: a little-endian 32-bit word.
+const PFN_BYTES: usize = size_of::<u32>();
 
 /// Statistics entries one stats reply carries.
 const STATS_PER_REPLY: usize = 8;
@@ -137,45 +145,58 @@ const fn stat_tag(tag: MemoryStatTag) -> u16 {
 struct BalloonQueue<T: VirtioTransport> {
     queue: Mutex<VirtQueue<T>>,
     inflight: InFlight<{ QUEUE_SIZE as usize }>,
+    /// The page-frame lists, command identifiers and statistics the
+    /// device reads, one slot per descriptor.
+    slots: ControlSlots<TransportBuffer<T>>,
     interrupts: Notify,
 }
 
 impl<T: VirtioTransport> BalloonQueue<T> {
+    /// A queue whose requests carry up to `request_bytes` of driver-built
+    /// bytes. Free-page ranges are the guest's own memory, named in place
+    /// and not counted in it.
     fn new(
         transport: &T,
         index: u16,
         chain_limit: u16,
+        request_bytes: usize,
         features: NegotiatedFeatures,
     ) -> IoResult<Self> {
         let size = transport.queue_max_size(index).min(QUEUE_SIZE);
         if size == 0 || !size.is_power_of_two() {
             return Err(IoError::Unsupported);
         }
+        let queue = VirtQueue::new(transport, index, size, chain_limit, features)?;
+        let slots = control_slots(transport, &queue, request_bytes, 0)?;
         Ok(Self {
-            queue: Mutex::new(VirtQueue::new(
-                transport,
-                index,
-                size,
-                chain_limit,
-                features,
-            )?),
+            queue: Mutex::new(queue),
             inflight: InFlight::new(),
+            slots,
             interrupts: Notify::new(),
         })
     }
 
     /// Places one chain and waits for the device to finish it.
+    ///
+    /// `inputs` are copied into the request's control slot. `outputs` are
+    /// the caller's own memory.
     async fn request(
         &self,
         transport: &T,
         inputs: &[&[u8]],
         outputs: &mut [&mut [u8]],
     ) -> IoResult<u32> {
-        let token = submit_chain(&self.inflight, &self.queue, transport, inputs, outputs).await?;
-        await_completion(&self.inflight, &self.queue, token, || {
-            self.interrupts.notified()
-        })
-        .await
+        let mut parts: ArrayVec<Part<'_>, MAX_CHAIN_BUFFERS> = ArrayVec::new();
+        for bytes in inputs {
+            parts.push(Part::Request(bytes));
+        }
+        for bytes in outputs.iter_mut() {
+            parts.push(Part::Write(bytes));
+        }
+        let ticket =
+            submit_control(&self.inflight, &self.queue, transport, &self.slots, &parts).await?;
+        let reply = await_completion(&self.queue, ticket, || self.interrupts.notified()).await?;
+        Ok(reply.written())
     }
 
     /// Wakes whoever is waiting on this queue.
@@ -232,19 +253,45 @@ impl<T: VirtioTransport> VirtioBalloonDevice<T> {
         })?;
         let layout = QueueLayout::from_offered(offered);
 
-        let inflate = BalloonQueue::new(&transport, INFLATE_QUEUE_INDEX, 1, features)?;
-        let deflate = BalloonQueue::new(&transport, DEFLATE_QUEUE_INDEX, 1, features)?;
+        let inflate = BalloonQueue::new(
+            &transport,
+            INFLATE_QUEUE_INDEX,
+            1,
+            PFNS_PER_REQUEST * PFN_BYTES,
+            features,
+        )?;
+        let deflate = BalloonQueue::new(
+            &transport,
+            DEFLATE_QUEUE_INDEX,
+            1,
+            PFNS_PER_REQUEST * PFN_BYTES,
+            features,
+        )?;
         let stats = layout
             .stats
-            .map(|index| BalloonQueue::new(&transport, index, 1, features))
+            .map(|index| {
+                BalloonQueue::new(&transport, index, 1, STATS_PER_REPLY * STAT_BYTES, features)
+            })
             .transpose()?;
+        // A command identifier, or a run of free memory the driver does
+        // not own the bytes of.
         let free_page = layout
             .free_page
-            .map(|index| BalloonQueue::new(&transport, index, MAX_CHAIN_BUFFERS as u16, features))
+            .map(|index| {
+                BalloonQueue::new(
+                    &transport,
+                    index,
+                    MAX_CHAIN_BUFFERS as u16,
+                    size_of::<u32>(),
+                    features,
+                )
+            })
             .transpose()?;
         let reporting = layout
             .reporting
-            .map(|index| BalloonQueue::new(&transport, index, MAX_CHAIN_BUFFERS as u16, features))
+            .map(|index| {
+                BalloonQueue::new(&transport, index, MAX_CHAIN_BUFFERS as u16, 0, features)
+            })
             .transpose()?;
 
         transport.set_status(
@@ -574,7 +621,7 @@ impl<T: VirtioTransport> VirtioBalloonDevice<T> {
                 return Err(IoError::OutOfBounds);
             }
             for page in range.chunks(BALLOON_PAGE_SIZE) {
-                let address = dma.dma_addr(page.as_ptr())?;
+                let address = dma.device_range(page)?.get();
                 if !address.is_multiple_of(BALLOON_PAGE_SIZE as u64) {
                     return Err(IoError::OutOfBounds);
                 }
@@ -733,7 +780,8 @@ mod tests {
         CONFIG_NUM_PAGES, F_DEFLATE_ON_OOM, F_FREE_PAGE_HINT, F_MUST_TELL_HOST, F_PAGE_REPORTING,
         F_STATS_VQ, FREE_PAGE_CMD_ID_STOP, QueueLayout, VirtioBalloonDevice,
     };
-    use crate::bus::DmaBuffer;
+    use helios_hal::dma::DmaBuffer;
+
     use crate::features::RenegotiateError;
     use crate::resume::{DeviceReset, QuiesceError, ReinitError};
     use crate::testing::{FakeTransport, FakeTransportConfig, WindowDmaBuffer, WindowDmaPool};
@@ -799,7 +847,7 @@ mod tests {
 
         /// The address the device sees for the first page.
         fn device_base(&self) -> u64 {
-            self.0.phys_addr()
+            self.0.device_address().get()
         }
     }
 
@@ -925,12 +973,7 @@ mod tests {
         let mut inflate = pin!(device.inflate(&mut ranges));
         assert!(block_on(poll_once(inflate.as_mut())).is_none());
 
-        let chain = device
-            .inflate
-            .queue
-            .try_lock()
-            .expect("the driver parked without the queue lock")
-            .device_request(0);
+        let chain = device.inflate.slots.request_bytes(0, 3 * 4);
         let pfns: Vec<u32> = chain
             .as_chunks::<4>()
             .0
@@ -953,6 +996,41 @@ mod tests {
     /// Giving frames back is a different queue from handing them over,
     /// and a driver that confused the two would tell the host to reclaim
     /// memory the guest had just taken back.
+    /// The page-frame numbers live in the request's own slot, so a caller
+    /// that drops its inflate and reuses its ranges cannot change what
+    /// the device reads.
+    #[test]
+    fn a_dropped_inflate_keeps_its_page_frame_numbers_in_the_slot() {
+        let dma = arena();
+        let device = device_with(ALL_BALLOON_FEATURES, dma.clone());
+        let mut pages = Pages::new(&dma, 1);
+        let base = pages.device_base();
+        {
+            let mut ranges = [pages.range(1)];
+            let mut inflate = pin!(device.inflate(&mut ranges));
+            assert!(block_on(poll_once(inflate.as_mut())).is_none());
+        }
+        assert!(
+            !device.inflate.inflight.is_idle(0),
+            "the chain is still with the device, so its slot stays held"
+        );
+        assert_eq!(
+            device.inflate.slots.request_bytes(0, 4),
+            ((base >> 12) as u32).to_le_bytes()
+        );
+
+        // A second request takes another slot while the first is held.
+        let mut ranges = [pages.range(1)];
+        let mut second = pin!(device.inflate(&mut ranges));
+        assert!(block_on(poll_once(second.as_mut())).is_none());
+        assert!(!device.inflate.inflight.is_idle(1));
+
+        // The device finishing the dropped chain releases its identifier.
+        complete(&device, 0, 0);
+        assert!(block_on(poll_once(second.as_mut())).is_none());
+        assert!(device.inflate.inflight.is_idle(0));
+    }
+
     #[test]
     fn deflate_posts_on_the_deflate_queue() {
         let dma = arena();
@@ -981,12 +1059,7 @@ mod tests {
             idle_inflate,
             "the inflate queue must not carry a deflate request"
         );
-        let request = device
-            .deflate
-            .queue
-            .try_lock()
-            .expect("the driver parked without the queue lock")
-            .device_request(0);
+        let request = device.deflate.slots.request_bytes(0, 4);
         assert_eq!(request, ((base >> 12) as u32).to_le_bytes());
 
         complete(&device, 1, 0);
@@ -1060,14 +1133,7 @@ mod tests {
         let mut begin = pin!(device.begin_free_page_hint(7));
         let token = next_token(free_page);
         assert!(block_on(poll_once(begin.as_mut())).is_none());
-        assert_eq!(
-            free_page
-                .queue
-                .try_lock()
-                .expect("idle queue")
-                .device_request(token),
-            7_u32.to_le_bytes()
-        );
+        assert_eq!(free_page.slots.request_bytes(token, 4), 7_u32.to_le_bytes());
         complete(&device, 3, token);
         assert_eq!(block_on(poll_once(begin.as_mut())), Some(Ok(())));
 
@@ -1091,11 +1157,7 @@ mod tests {
         let token = next_token(free_page);
         assert!(block_on(poll_once(end.as_mut())).is_none());
         assert_eq!(
-            free_page
-                .queue
-                .try_lock()
-                .expect("idle queue")
-                .device_request(token),
+            free_page.slots.request_bytes(token, 4),
             FREE_PAGE_CMD_ID_STOP.to_le_bytes()
         );
         complete(&device, 3, token);
@@ -1138,11 +1200,8 @@ mod tests {
             .stats
             .as_ref()
             .expect("stats queue")
-            .queue
-            .try_lock()
-            .expect("idle queue")
-            .device_request(0);
-        assert_eq!(payload.len(), 20);
+            .slots
+            .request_bytes(0, 20);
         assert_eq!(u16::from_le_bytes([payload[0], payload[1]]), 5);
         assert_eq!(
             u64::from_le_bytes(payload[2..10].try_into().expect("eight bytes")),

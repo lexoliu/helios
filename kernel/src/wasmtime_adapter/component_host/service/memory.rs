@@ -428,23 +428,28 @@ impl Preview1Gather {
     }
 }
 
-/// Sends everything `gather` still holds through `send`, one chunk at a
-/// time, and reports how many bytes went. An empty transfer reaches `send`
+/// A stream a gathered send goes out on, one chunk at a time.
+pub(super) trait Preview1ChunkedStream {
+    /// Takes the next `len` bytes out of `gather` and sends them.
+    fn send(
+        &mut self,
+        gather: &mut Preview1Gather,
+        len: usize,
+    ) -> impl Future<Output = Result<(), i32>> + Send;
+}
+
+/// Sends everything `gather` still holds on `stream`, one chunk at a
+/// time, and reports how many bytes went. An empty transfer reaches `stream`
 /// once. A refusal after some chunks went leaves them sent: the guest meets
 /// the refusal on its next call.
-pub(super) async fn p1_send_gathered<SendChunk, ChunkSent>(
+pub(super) async fn p1_send_gathered(
     gather: &mut Preview1Gather,
-    mut send: SendChunk,
-) -> Result<u32, i32>
-where
-    SendChunk: FnMut(Vec<u8>) -> ChunkSent,
-    ChunkSent: Future<Output = Result<(), i32>>,
-{
+    stream: &mut impl Preview1ChunkedStream,
+) -> Result<u32, i32> {
     let mut sent = 0_u32;
     loop {
-        let chunk = gather.next_chunk().unwrap_or_default();
-        let len = chunk.len();
-        match send(chunk).await {
+        let len = gather.next_len();
+        match stream.send(gather, len).await {
             // The iovecs' sum fits a `u32`, so no count of it overflows.
             Ok(()) => sent += len as u32,
             Err(_) if sent > 0 => break,

@@ -11,10 +11,10 @@ extern crate alloc;
 
 use alloc::sync::Arc;
 
-use bytes::BytesMut;
+use helios_hal::dma::BufResult;
 use helios_hal::io::IoError;
 use helios_kernel::{ExternalInterruptHandler, HostFsTransport};
-use helios_virtio::{DeviceType, Virtio9pDevice, VirtioPciTransport};
+use helios_virtio::{DeviceType, TransportBuffer, Virtio9pDevice, VirtioPciTransport};
 use pci_types::PciAddress;
 
 use crate::debug_state::RuntimeState;
@@ -82,17 +82,21 @@ impl HostFsTransport for HostFsTransportService {
         self.device.pipeline_depth()
     }
 
-    async fn request<'a>(
-        &'a self,
-        bytes: &'a [u8],
-        response: &'a mut BytesMut,
+    type Buffer = TransportBuffer<VirtioPciTransport<X86DmaPool>>;
+
+    fn buffer(&self, capacity: usize) -> Result<Self::Buffer, IoError> {
+        self.device.buffer(capacity)
+    }
+
+    async fn request(
+        &self,
+        request: Self::Buffer,
+        request_len: usize,
+        response: Self::Buffer,
         response_len: usize,
-    ) -> Result<(), IoError> {
-        response.clear();
-        response.resize(response_len, 0);
-        let used = self.device.request(bytes, response).await?;
-        let used = usize::try_from(used).map_err(|_| IoError::DeviceFault)?;
-        response.truncate(used);
-        Ok(())
+    ) -> BufResult<usize, (Self::Buffer, Self::Buffer)> {
+        self.device
+            .request(request, request_len, response, response_len)
+            .await
     }
 }

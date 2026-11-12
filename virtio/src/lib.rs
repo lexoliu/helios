@@ -35,8 +35,8 @@ pub use block::{
     VirtioBlockSwapBackend, VirtioBlockSwapError, VirtioBlockSwapToken,
 };
 pub use bus::{
-    DeviceBus, DmaAddressing, DmaBuffer, DmaPool, IdentityDmaBuffer, IdentityDmaPool, MmioBus,
-    OffsetDmaBuffer, OffsetDmaPool, PlatformDmaBuffer, PlatformDmaPool,
+    DeviceBus, IdentityDmaBuffer, IdentityDmaPool, MmioBus, OffsetDmaBuffer, OffsetDmaPool,
+    PlatformDmaBuffer, PlatformDmaPool,
 };
 pub use discovery::{
     InterruptTrigger, MmioCandidate, MmioInterrupt, NodeInterrupt, mmio_candidates,
@@ -67,7 +67,7 @@ pub use pci::{
     balloon_from_pci, block_from_pci, gpu_from_pci, input_from_pci, iommu_from_pci, net_from_pci,
     p9_from_pci, rng_from_pci, snd_from_pci, virtio_pci_device_type, vsock_from_pci,
 };
-pub use queue::{MAX_CHAIN_BUFFERS, VirtQueue, VirtqueueError};
+pub use queue::{MAX_CHAIN_BUFFERS, TransportBuffer, VirtQueue, VirtqueueError};
 pub use resume::{DeviceReset, QuiesceError, ReinitError};
 pub use rng::VirtioRngDevice;
 pub use snd::VirtioSndDevice;

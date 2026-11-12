@@ -19,6 +19,7 @@ mod types;
 use core::future::Future;
 
 use bytes::Bytes;
+use helios_hal::dma::DmaSpaceMark;
 use helios_hal::io::IoResult;
 use thiserror::Error;
 
@@ -598,6 +599,46 @@ pub struct InterfaceEventMark {
 
 /// Multi-core aware network interface contract used by packet stacks.
 pub trait NetworkInterface: Clone + Send + Sync + 'static {
+    /// A buffer the interface transmits from in place.
+    ///
+    /// [`NetworkInterface::try_transmit_scatter_immediate_on`] reads a
+    /// frame's scatter payload where it is, so the payload has to be
+    /// memory the device can reach. The caller allocates it through
+    /// [`NetworkInterface::transmit_payload`], fills the copy it was
+    /// going to make anyway, and freezes it with `Bytes::from_owner`.
+    type TxPayload: AsMut<[u8]> + AsRef<[u8]> + Send + Sync + 'static;
+
+    /// Allocates a zeroed transmit payload buffer of `bytes` bytes the
+    /// device can reach.
+    ///
+    /// [`helios_hal::io::IoError::Replenishing`] says the interface's
+    /// transmit memory has none free now and more is on its way;
+    /// [`helios_hal::io::IoError::Exhausted`] says it cannot grow, which a
+    /// write reports as back-pressure rather than as a failure. Both are
+    /// waited out the same way: call
+    /// [`NetworkInterface::want_transmit_space`], ask again, and only if
+    /// that is refused too park on
+    /// [`NetworkInterface::transmit_space_changed`]. The protocol and the
+    /// contexts that raise the signal are those of
+    /// [`helios_hal::dma::DmaMemory::want_space`].
+    fn transmit_payload(&self, bytes: usize) -> IoResult<Self::TxPayload>;
+
+    /// The interface's [`helios_hal::dma::DmaMemory::want_space`] for its
+    /// transmit memory.
+    fn want_transmit_space(&self) -> DmaSpaceMark;
+
+    /// The interface's [`helios_hal::dma::DmaMemory::space_mark`] for its
+    /// transmit memory.
+    fn transmit_space_mark(&self) -> DmaSpaceMark;
+
+    /// The interface's [`helios_hal::dma::DmaMemory::space_changed`] for
+    /// its transmit memory.
+    fn transmit_space_changed(&self, mark: DmaSpaceMark) -> impl Future<Output = ()> + Send + '_;
+
+    /// The interface's [`helios_hal::dma::DmaMemory::short_of_space`] for
+    /// its transmit memory.
+    fn transmit_short_of_space(&self) -> bool;
+
     /// Returns the hardware MAC address programmed for this interface.
     fn mac_address(&self) -> EthernetAddress;
 

@@ -9,24 +9,36 @@
 //! parks on the device interrupt until a completion frees descriptors
 //! rather than failing. Completions are routed by descriptor identifier
 //! through [`InFlight`], so whichever task wins the queue lock drains
-//! the used ring on behalf of every waiter. The caller's request and
-//! response buffers stay borrowed for the lifetime of the future, so
-//! the device writes straight into them and nothing is copied.
+//! the used ring on behalf of every waiter.
+//!
+//! The caller's request and response buffers move into the request and
+//! the device reads and writes them in place, so nothing is copied. They
+//! park with the chain's head descriptor until the device returns the
+//! chain (see [`InFlight`]'s "Parked buffers"): a completed request hands
+//! both back, and one whose future is dropped mid-flight leaves them with
+//! the device until its completion frees them.
 
 use alloc::string::String;
 use alloc::vec;
+use core::alloc::Layout;
 
 use async_lock::Mutex;
+use helios_hal::dma::{BufError, BufResult, DmaMemory};
 use helios_hal::io::{IoError, IoResult};
 
+use crate::bus::DeviceBus;
 use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate, renegotiate};
 use crate::inflight::{
-    InFlight, await_completion, drain_to_idle, reinitialize_requests, submit_chain,
+    InFlight, await_completion, drain_to_idle, reinitialize_requests, submit_lent,
 };
 use crate::notify::Notify;
-use crate::queue::VirtQueue;
+use crate::queue::{ControlSlots, Part, READ_WRITE, TransportBuffer, VirtQueue, control_slots};
 use crate::resume::{DeviceReset, QuiesceError, ReinitError, conclude, driver_ok};
 use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
+
+/// Alignment of a request or reply buffer a consumer allocates: a cache
+/// line of the target, so two buffers never share one.
+const BUFFER_ALIGNMENT: usize = core::mem::align_of::<crossbeam_utils::CachePadded<u8>>();
 
 const REQUEST_QUEUE_INDEX: u16 = 0;
 const REQUEST_QUEUE_SIZE: u16 = 16;
@@ -46,7 +58,13 @@ const P9_FEATURE_MOUNT_TAG: u64 = 1 << 0;
 pub struct Virtio9pDevice<T: VirtioTransport> {
     transport: T,
     queue: Mutex<VirtQueue<T>>,
-    inflight: InFlight<{ REQUEST_QUEUE_SIZE as usize }>,
+    /// Completion slots, each parking the request and response buffer of
+    /// the chain it heads.
+    inflight: InFlight<{ REQUEST_QUEUE_SIZE as usize }, [TransportBuffer<T>; 2]>,
+    /// A 9p chain carries no control bytes: both of its buffers are the
+    /// caller's, lent. The table is empty and exists because every
+    /// submission is staged through one.
+    slots: ControlSlots<TransportBuffer<T>>,
     interrupts: Notify,
     features: NegotiatedFeatures,
     queue_size: u16,
@@ -82,6 +100,7 @@ impl<T: VirtioTransport> Virtio9pDevice<T> {
             chain_limit,
             features,
         )?;
+        let slots = control_slots(&transport, &queue, 0, 0)?;
         let mount_tag = read_mount_tag(&transport)?;
 
         transport.set_status(
@@ -95,6 +114,7 @@ impl<T: VirtioTransport> Virtio9pDevice<T> {
             transport,
             queue: Mutex::new(queue),
             inflight: InFlight::new(),
+            slots,
             interrupts: Notify::new(),
             features,
             queue_size,
@@ -182,39 +202,108 @@ impl<T: VirtioTransport> Virtio9pDevice<T> {
         })
     }
 
-    pub async fn request(&self, request: &[u8], response: &mut [u8]) -> IoResult<u32> {
-        if request.is_empty() || response.len() < HEADER_SIZE {
-            return Err(IoError::InvalidBufferLength {
-                required_multiple: HEADER_SIZE,
-                actual: response.len(),
-            });
+    /// Allocates a zeroed buffer of `capacity` bytes the device can reach,
+    /// for a request to be encoded into or a reply to land in.
+    pub fn buffer(&self, capacity: usize) -> IoResult<TransportBuffer<T>> {
+        let layout = Layout::from_size_align(capacity, BUFFER_ALIGNMENT)
+            .map_err(|_| IoError::OutOfBounds)?;
+        Ok(self.transport.bus().dma().allocate(layout, READ_WRITE)?)
+    }
+
+    /// Sends the first `request_len` bytes of `request` and lets the
+    /// device write up to `response_len` bytes of reply into the head of
+    /// `response`. Resolves with the number of bytes the device wrote and
+    /// both buffers, as `(request, response)`.
+    ///
+    /// Both buffers come from [`Virtio9pDevice::buffer`] and move into the
+    /// request, so the device reads and writes them where they are and
+    /// nothing is copied. They come back with every result except one: a
+    /// request in flight when the queue faulted leaves them with the
+    /// device, which may still be using them.
+    pub async fn request(
+        &self,
+        request: TransportBuffer<T>,
+        request_len: usize,
+        response: TransportBuffer<T>,
+        response_len: usize,
+    ) -> BufResult<usize, (TransportBuffer<T>, TransportBuffer<T>)> {
+        let returned = |error, [request, response]: [TransportBuffer<T>; 2]| {
+            Err(BufError::returned(error, (request, response)))
+        };
+        let lent = [request, response];
+        if request_len == 0 || request_len > lent[0].as_ref().len() {
+            return returned(IoError::OutOfBounds, lent);
+        }
+        if response_len < HEADER_SIZE || response_len > lent[1].as_ref().len() {
+            return returned(
+                IoError::InvalidBufferLength {
+                    required_multiple: HEADER_SIZE,
+                    actual: response_len,
+                },
+                lent,
+            );
         }
 
-        let token = submit_chain(
+        let parts = [
+            Part::LentRead {
+                buffer: 0,
+                range: 0..request_len,
+            },
+            Part::LentWrite {
+                buffer: 1,
+                range: 0..response_len,
+            },
+        ];
+        let ticket = match submit_lent(
             &self.inflight,
             &self.queue,
             &self.transport,
-            &[request],
-            &mut [response],
+            &self.slots,
+            &parts,
+            lent,
         )
-        .await?;
+        .await
+        {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                return Err(error.map_buffers(|[request, response]| (request, response)));
+            }
+        };
 
         // Completions are routed by descriptor identifier: with EVENT_IDX
         // and IN_ORDER the device may finish requests in an order that
         // has nothing to do with which task is awake.
-        let used_len = await_completion(&self.inflight, &self.queue, token, || {
-            self.interrupts.notified()
-        })
-        .await?;
+        let reply = match await_completion(&self.queue, ticket, || self.interrupts.notified()).await
+        {
+            Ok(reply) => reply,
+            // The chain never came back: its buffers stay parked with it.
+            Err(error) => {
+                return Err(BufError {
+                    error,
+                    buffers: None,
+                });
+            }
+        };
+        let used_len = reply.written();
+        let lent = reply.into_lent();
 
+        let response = lent[1].as_ref();
         let header_len = u32::from_le_bytes([response[0], response[1], response[2], response[3]]);
         if header_len != used_len {
-            return Err(IoError::InvalidDeviceConfig(
-                "virtio-9p response length header did not match the used ring length",
-            ));
+            return returned(
+                IoError::InvalidDeviceConfig(
+                    "virtio-9p response length header did not match the used ring length",
+                ),
+                lent,
+            );
         }
-
-        Ok(used_len)
+        match usize::try_from(used_len) {
+            Ok(used) => {
+                let [request, response] = lent;
+                Ok((used, (request, response)))
+            }
+            Err(_) => returned(IoError::DeviceFault, lent),
+        }
     }
 }
 
@@ -244,19 +333,24 @@ fn read_mount_tag<T: VirtioTransport>(transport: &T) -> IoResult<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bus::DeviceBus;
     use crate::features::RenegotiateError;
-    use crate::testing::{FakeTransport, FakeTransportConfig};
+    use crate::testing::{
+        ConfinedDmaBuffer, ConfinedTransport, FakeTransport, FakeTransportConfig,
+    };
     use crate::transport::VirtioFeatures;
     use core::pin::pin;
     use futures_lite::future::{block_on, poll_once};
+    use helios_hal::dma::DmaBuffer;
 
     const MOUNT_TAG: &str = "helios";
 
     /// A transport whose config space already carries `MOUNT_TAG` and
-    /// which offers exactly the features a 9p device must have.
-    fn transport(queue_size: u16) -> FakeTransport {
-        let transport = FakeTransport::new(FakeTransportConfig {
+    /// which offers exactly the features a 9p device must have. Its
+    /// device reaches only what its own pool handed out, so a request
+    /// that named caller memory instead of a buffer from
+    /// [`Virtio9pDevice::buffer`] would be refused.
+    fn transport(queue_size: u16) -> ConfinedTransport {
+        let transport = FakeTransport::confined(FakeTransportConfig {
             device_type: DeviceType::_9P,
             offered_features: VirtioFeatures::VERSION_1.bits() | P9_FEATURE_MOUNT_TAG,
             queue_size,
@@ -278,10 +372,22 @@ mod tests {
     /// A 9p response buffer holding the reply header the device would
     /// have written, so the driver's length check sees a consistent
     /// message.
-    fn reply(len: usize) -> alloc::vec::Vec<u8> {
-        let mut bytes = vec![0_u8; len];
-        bytes[..4].copy_from_slice(&u32::try_from(len).expect("reply fits in u32").to_le_bytes());
-        bytes
+    fn reply(device: &Virtio9pDevice<ConfinedTransport>, len: usize) -> ConfinedDmaBuffer {
+        let mut buffer = device.buffer(len).expect("a reply buffer");
+        buffer.as_mut()[..4]
+            .copy_from_slice(&u32::try_from(len).expect("reply fits in u32").to_le_bytes());
+        buffer
+    }
+
+    /// A request buffer of `len` bytes of `fill`.
+    fn request(
+        device: &Virtio9pDevice<ConfinedTransport>,
+        len: usize,
+        fill: u8,
+    ) -> ConfinedDmaBuffer {
+        let mut buffer = device.buffer(len).expect("a request buffer");
+        buffer.as_mut().fill(fill);
+        buffer
     }
 
     #[test]
@@ -315,9 +421,13 @@ mod tests {
     #[test]
     fn three_requests_are_in_flight_together_and_complete_out_of_order() {
         let device = Virtio9pDevice::new(transport(8)).expect("the device should initialize");
-        let requests = [[1_u8; 16], [2_u8; 16], [3_u8; 16]];
-        let mut responses = [reply(24), reply(32), reply(40)];
-        let [first_response, second_response, third_response] = &mut responses;
+        let [first_request, second_request, third_request] = [
+            request(&device, 16, 1),
+            request(&device, 16, 2),
+            request(&device, 16, 3),
+        ];
+        let [first_response, second_response, third_response] =
+            [reply(&device, 24), reply(&device, 32), reply(&device, 40)];
 
         let mut tokens = [0_u16; 3];
         // All three are submitted before any of them completes, so the
@@ -327,21 +437,21 @@ mod tests {
             .try_lock()
             .expect("the queue is free before the first request")
             .next_free_descriptor();
-        let mut first = pin!(device.request(&requests[0], first_response));
+        let mut first = pin!(device.request(first_request, 16, first_response, 24));
         assert!(block_on(poll_once(first.as_mut())).is_none());
         tokens[1] = device
             .queue
             .try_lock()
             .expect("the queue lock is released once a request is in flight")
             .next_free_descriptor();
-        let mut second = pin!(device.request(&requests[1], second_response));
+        let mut second = pin!(device.request(second_request, 16, second_response, 32));
         assert!(block_on(poll_once(second.as_mut())).is_none());
         tokens[2] = device
             .queue
             .try_lock()
             .expect("the queue lock is released once a request is in flight")
             .next_free_descriptor();
-        let mut third = pin!(device.request(&requests[2], third_response));
+        let mut third = pin!(device.request(third_request, 16, third_response, 40));
         assert!(block_on(poll_once(third.as_mut())).is_none());
         assert_eq!(
             device
@@ -363,16 +473,24 @@ mod tests {
         device.handle_interrupt();
 
         assert_eq!(
-            block_on(poll_once(second.as_mut())),
-            Some(Ok(32)),
+            written(block_on(poll_once(second.as_mut()))),
+            Some(32),
             "each waiter resolves with its own reply length"
         );
-        assert_eq!(block_on(poll_once(third.as_mut())), Some(Ok(40)));
-        assert_eq!(block_on(poll_once(first.as_mut())), Some(Ok(24)));
+        assert_eq!(written(block_on(poll_once(third.as_mut()))), Some(40));
+        assert_eq!(written(block_on(poll_once(first.as_mut()))), Some(24));
+    }
+
+    /// The reply length a finished request reports, `None` while it is
+    /// still pending. A request that failed fails the test.
+    fn written(
+        outcome: Option<BufResult<usize, (ConfinedDmaBuffer, ConfinedDmaBuffer)>>,
+    ) -> Option<usize> {
+        outcome.map(|result| result.expect("the request succeeds").0)
     }
 
     /// Plays the device answering `token` with a reply of `len` bytes.
-    fn answer(device: &Virtio9pDevice<FakeTransport>, token: u16, len: u32) {
+    fn answer(device: &Virtio9pDevice<ConfinedTransport>, token: u16, len: u32) {
         device
             .queue
             .try_lock()
@@ -384,12 +502,9 @@ mod tests {
     #[test]
     fn quiesce_waits_for_every_request_in_flight() {
         let device = Virtio9pDevice::new(transport(8)).expect("the device should initialize");
-        let requests = [[1_u8; 16], [2_u8; 16]];
-        let mut responses = [reply(24), reply(32)];
-        let [first_response, second_response] = &mut responses;
-        let mut first = pin!(device.request(&requests[0], first_response));
+        let mut first = pin!(device.request(request(&device, 16, 1), 16, reply(&device, 24), 24));
         assert!(block_on(poll_once(first.as_mut())).is_none());
-        let mut second = pin!(device.request(&requests[1], second_response));
+        let mut second = pin!(device.request(request(&device, 16, 2), 16, reply(&device, 32), 32));
         assert!(block_on(poll_once(second.as_mut())).is_none());
 
         // A two-buffer chain takes two descriptors, so the second request's
@@ -407,16 +522,14 @@ mod tests {
             .expect("the device answers inside the deadline");
         assert_eq!(passes, 2, "one pass per answer, out of order");
 
-        assert_eq!(block_on(poll_once(first.as_mut())), Some(Ok(24)));
-        assert_eq!(block_on(poll_once(second.as_mut())), Some(Ok(32)));
+        assert_eq!(written(block_on(poll_once(first.as_mut()))), Some(24));
+        assert_eq!(written(block_on(poll_once(second.as_mut()))), Some(32));
     }
 
     #[test]
     fn quiesce_gives_up_when_the_deadline_passes() {
         let device = Virtio9pDevice::new(transport(8)).expect("the device should initialize");
-        let request = [1_u8; 16];
-        let mut response = reply(24);
-        let mut pending = pin!(device.request(&request, &mut response));
+        let mut pending = pin!(device.request(request(&device, 16, 1), 16, reply(&device, 24), 24));
         assert!(block_on(poll_once(pending.as_mut())).is_none());
 
         assert_eq!(
@@ -432,9 +545,7 @@ mod tests {
     #[test]
     fn a_reset_device_serves_requests_again_and_signals_the_reset() {
         let device = Virtio9pDevice::new(transport(8)).expect("the device should initialize");
-        let request = [1_u8; 16];
-        let mut response = reply(24);
-        let mut pending = pin!(device.request(&request, &mut response));
+        let mut pending = pin!(device.request(request(&device, 16, 1), 16, reply(&device, 24), 24));
         assert!(block_on(poll_once(pending.as_mut())).is_none());
         device
             .quiesce(|| {
@@ -452,18 +563,18 @@ mod tests {
         );
 
         assert_eq!(
-            block_on(poll_once(pending.as_mut())),
-            Some(Ok(24)),
+            written(block_on(poll_once(pending.as_mut()))),
+            Some(24),
             "the reply that arrived before the reset is still delivered"
         );
         let programmed = device.transport.programmed_queues();
         assert_eq!(programmed.len(), 2);
         assert_eq!(programmed[0], programmed[1]);
-        let mut again = reply(12);
-        let mut round_trip = pin!(device.request(&request, &mut again));
+        let mut round_trip =
+            pin!(device.request(request(&device, 16, 1), 16, reply(&device, 12), 12));
         assert!(block_on(poll_once(round_trip.as_mut())).is_none());
         answer(&device, 0, 12);
-        assert_eq!(block_on(poll_once(round_trip.as_mut())), Some(Ok(12)));
+        assert_eq!(written(block_on(poll_once(round_trip.as_mut()))), Some(12));
     }
 
     #[test]
@@ -515,34 +626,36 @@ mod tests {
                 .contains(crate::transport::DeviceStatus::FAILED)
         );
 
-        let request = [1_u8; 16];
-        let mut response = reply(24);
-        assert_eq!(
-            block_on(device.request(&request, &mut response)),
-            Err(IoError::DeviceFault)
-        );
+        let refused = block_on(device.request(request(&device, 16, 1), 16, reply(&device, 24), 24))
+            .map(|(written, _)| written)
+            .map_err(BufError::into_error);
+        assert_eq!(refused, Err(IoError::DeviceFault));
     }
 
     #[test]
     fn a_full_ring_parks_the_submitter_until_a_chain_is_recycled() {
         let device = Virtio9pDevice::new(transport(4)).expect("the device should initialize");
         assert_eq!(device.pipeline_depth(), 2);
-        let requests = [[1_u8; 8], [2_u8; 8], [3_u8; 8]];
-        let mut responses = [reply(12), reply(16), reply(20)];
-        let [first_response, second_response, third_response] = &mut responses;
+        let [first_request, second_request, third_request] = [
+            request(&device, 8, 1),
+            request(&device, 8, 2),
+            request(&device, 8, 3),
+        ];
+        let [first_response, second_response, third_response] =
+            [reply(&device, 12), reply(&device, 16), reply(&device, 20)];
 
         let first_token = device
             .queue
             .try_lock()
             .expect("the queue is free")
             .next_free_descriptor();
-        let mut first = pin!(device.request(&requests[0], first_response));
+        let mut first = pin!(device.request(first_request, 8, first_response, 12));
         assert!(block_on(poll_once(first.as_mut())).is_none());
-        let mut second = pin!(device.request(&requests[1], second_response));
+        let mut second = pin!(device.request(second_request, 8, second_response, 16));
         assert!(block_on(poll_once(second.as_mut())).is_none());
 
         // The ring is full: the third request must wait rather than fail.
-        let mut third = pin!(device.request(&requests[2], third_response));
+        let mut third = pin!(device.request(third_request, 8, third_response, 20));
         assert!(block_on(poll_once(third.as_mut())).is_none());
         assert_eq!(
             device
@@ -561,8 +674,8 @@ mod tests {
         device.handle_interrupt();
 
         assert_eq!(
-            block_on(poll_once(first.as_mut())),
-            Some(Ok(12)),
+            written(block_on(poll_once(first.as_mut()))),
+            Some(12),
             "the interrupt belongs to the waiter, which drains and collects its reply"
         );
         assert!(
@@ -579,5 +692,87 @@ mod tests {
             "the third request took the recycled chain"
         );
         assert!(block_on(poll_once(second.as_mut())).is_none());
+    }
+
+    /// A guest that cancels a host-share read drops the request future
+    /// while the device is still filling the reply. The buffers must stay
+    /// the device's until it hands the chain back, and the queue must
+    /// carry the next request.
+    #[test]
+    fn a_dropped_request_keeps_its_buffers_until_the_device_completes_it() {
+        let device = Virtio9pDevice::new(transport(8)).expect("the device should initialize");
+        let pool = device.transport.pool().clone();
+        let abandoned_token = device
+            .queue
+            .try_lock()
+            .expect("the queue is free")
+            .next_free_descriptor();
+        let reply_bytes = {
+            let request = request(&device, 16, 1);
+            let response = device.buffer(64).expect("a reply buffer");
+            let reply_bytes = (response.as_ptr() as u64, 64);
+            let mut abandoned = pin!(device.request(request, 16, response, 64));
+            assert!(block_on(poll_once(abandoned.as_mut())).is_none());
+            reply_bytes
+        };
+        assert!(
+            !pool.is_released(reply_bytes.0, reply_bytes.1),
+            "the reply buffer of a dropped request is still the device's"
+        );
+
+        // The device finishes the read it was given, after the request is
+        // gone: its reply lands in memory nobody has reused.
+        let mut late = vec![0_u8; 64];
+        late[..4].copy_from_slice(&64_u32.to_le_bytes());
+        {
+            let queue = device.queue.try_lock().expect("the queue is free");
+            let written = pool.respond_into_live_memory(&queue, abandoned_token, &late);
+            queue.device_complete(abandoned_token, written);
+        }
+        device.handle_interrupt();
+
+        // The next request drains that completion, which frees the parked
+        // buffers, and goes through on the same queue.
+        let next_token = device
+            .queue
+            .try_lock()
+            .expect("the queue is free")
+            .next_free_descriptor();
+        let mut next = pin!(device.request(request(&device, 16, 2), 16, reply(&device, 24), 24));
+        assert!(block_on(poll_once(next.as_mut())).is_none());
+        assert!(
+            pool.is_released(reply_bytes.0, reply_bytes.1),
+            "the device's completion is what frees the dropped request's buffers"
+        );
+        assert!(device.inflight.is_idle(abandoned_token));
+
+        device
+            .queue
+            .try_lock()
+            .expect("the queue is free")
+            .device_complete(next_token, 24);
+        device.handle_interrupt();
+        assert_eq!(
+            written(block_on(poll_once(next.as_mut()))),
+            Some(24),
+            "the queue is not stalled by the abandoned chain"
+        );
+    }
+
+    #[test]
+    fn a_request_the_device_never_saw_hands_its_buffers_back() {
+        let device = Virtio9pDevice::new(transport(8)).expect("the device should initialize");
+        let refused = block_on(device.request(
+            request(&device, 16, 1),
+            16,
+            device.buffer(4).expect("a reply buffer"),
+            4,
+        ))
+        .err()
+        .expect("a reply shorter than a 9p header is refused");
+        assert!(matches!(refused.error, IoError::InvalidBufferLength { .. }));
+        let (request, response) = refused.buffers.expect("the buffers come back");
+        assert_eq!(request.as_ref(), [1_u8; 16]);
+        assert_eq!(response.as_ref().len(), 4);
     }
 }

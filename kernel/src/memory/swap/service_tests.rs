@@ -19,6 +19,7 @@ use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 use std::sync::Mutex;
 
+use helios_hal::dma::{BufError, BufResult};
 use helios_hal::vmm::{AddressSpaceError, PageFlags};
 
 use super::*;
@@ -154,28 +155,40 @@ impl FlakyBackend {
 impl SwapBackend for FlakyBackend {
     type Token = u64;
     type Error = Injected;
+    type Buffer = Box<[u8]>;
 
-    async fn swap_out(&self, bytes: &[u8]) -> Result<Self::Token, Self::Error> {
+    fn buffer(&self, bytes: usize) -> Result<Self::Buffer, Self::Error> {
+        Ok(vec![0_u8; bytes].into_boxed_slice())
+    }
+
+    async fn swap_out(
+        &self,
+        page: Self::Buffer,
+    ) -> BufResult<Self::Token, Self::Buffer, Self::Error> {
         let mut state = self.state.lock().unwrap();
         if state.writes_to_refuse > 0 {
             state.writes_to_refuse -= 1;
-            return Err(Injected);
+            return Err(BufError::returned(Injected, page));
         }
         state.next_token += 1;
         let token = state.next_token;
-        state.extents.insert(token, bytes.to_vec());
-        Ok(token)
+        state.extents.insert(token, page.to_vec());
+        Ok((token, page))
     }
 
-    async fn swap_in(&self, token: Self::Token, dst: &mut [u8]) -> Result<(), Self::Error> {
+    async fn swap_in(
+        &self,
+        token: Self::Token,
+        mut page: Self::Buffer,
+    ) -> BufResult<(), Self::Buffer, Self::Error> {
         let mut state = self.state.lock().unwrap();
         if state.reads_to_fail > 0 {
             state.reads_to_fail -= 1;
-            return Err(Injected);
+            return Err(BufError::returned(Injected, page));
         }
         let bytes = state.extents.remove(&token).expect("a live token");
-        dst.copy_from_slice(&bytes);
-        Ok(())
+        page.copy_from_slice(&bytes);
+        Ok(((), page))
     }
 
     async fn release(&self, token: Self::Token) {
@@ -218,7 +231,7 @@ impl Harness {
             registry: InstanceRegistry::new(),
             cpu: TestCpu::with_entropy(0),
             map: SwapMap::new(),
-            page: vec![0_u8; PAGE].into_boxed_slice(),
+            page: Some(vec![0_u8; PAGE].into_boxed_slice()),
             report: SwapReport::default(),
         };
         Self {

@@ -21,6 +21,7 @@
 
 use core::future::Future;
 
+use helios_hal::dma::DmaSpaceMark;
 use helios_hal::io::IoError;
 use helios_kernel::{InterfaceEventMark, NetworkDevice, PacketBuffer, RxFrame};
 
@@ -33,6 +34,31 @@ pub(crate) enum HostedNetworkDevice {}
     reason = "every body here is unreachable because the interface is uninhabited, which is the whole point of the type: the compiler proves the hosted machine never reaches a network device method rather than a runtime check doing it"
 )]
 impl NetworkDevice for HostedNetworkDevice {
+    /// No value of the device exists, so no payload is ever asked of it.
+    type TxPayload = Vec<u8>;
+
+    fn transmit_payload(&self, bytes: usize) -> Result<Self::TxPayload, IoError> {
+        let _ = bytes;
+        match *self {}
+    }
+
+    fn want_transmit_space(&self) -> DmaSpaceMark {
+        match *self {}
+    }
+
+    fn transmit_space_mark(&self) -> DmaSpaceMark {
+        match *self {}
+    }
+
+    fn transmit_space_changed(&self, mark: DmaSpaceMark) -> impl Future<Output = ()> + Send + '_ {
+        let _ = mark;
+        core::future::ready(match *self {})
+    }
+
+    fn transmit_short_of_space(&self) -> bool {
+        match *self {}
+    }
+
     fn mac_address(&self) -> [u8; 6] {
         match *self {}
     }

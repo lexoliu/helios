@@ -13,12 +13,15 @@ use core::sync::atomic::{Ordering, fence};
 
 use alloc::boxed::Box;
 
-use crate::bus::{DeviceBus, DmaBuffer, DmaPool};
+use helios_hal::dma::{DmaBuffer, DmaMemory};
+
+use crate::bus::DeviceBus;
 use crate::features::NegotiatedFeatures;
 use crate::transport::VirtioTransport;
 
 use super::{
-    ChainEntry, DESCRIPTOR_BYTES, RingCore, RingOps, TransportBuffer, VirtqueueError, need_event,
+    ChainEntry, DESCRIPTOR_BYTES, READ_WRITE, RingCore, RingOps, TransportBuffer, VirtqueueError,
+    need_event,
 };
 
 const DESC_F_NEXT: u16 = 1;
@@ -78,13 +81,13 @@ impl<T: VirtioTransport> RingOps<T> for PackedRing<T> {
         let ring = Self {
             core: RingCore::new(dma, size, chain_limit, features)?,
             descriptors: dma
-                .allocate_zeroed(descriptor_layout)
+                .allocate_resident(descriptor_layout, READ_WRITE)
                 .map_err(|_| VirtqueueError::RingAllocation)?,
             driver_event: dma
-                .allocate_zeroed(event_layout)
+                .allocate_resident(event_layout, READ_WRITE)
                 .map_err(|_| VirtqueueError::RingAllocation)?,
             device_event: dma
-                .allocate_zeroed(event_layout)
+                .allocate_resident(event_layout, READ_WRITE)
                 .map_err(|_| VirtqueueError::RingAllocation)?,
             slots: alloc::vec![0_u16; usize::from(size)].into_boxed_slice(),
             next_avail: 0,
@@ -272,9 +275,9 @@ impl<T: VirtioTransport> PackedRing<T> {
         transport.set_queue(
             index,
             self.core.size,
-            self.descriptors.phys_addr(),
-            self.driver_event.phys_addr(),
-            self.device_event.phys_addr(),
+            self.descriptors.device_address().get(),
+            self.driver_event.device_address().get(),
+            self.device_event.device_address().get(),
         );
     }
 

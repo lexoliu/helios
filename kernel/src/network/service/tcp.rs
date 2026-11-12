@@ -57,6 +57,17 @@ pub(super) enum TcpReadIntoProgress {
     Eof,
 }
 
+/// Whether `error` is the interface's transmit memory refusing a piece,
+/// whether it is still on its way or cannot grow: the two refusals a
+/// write waits out on one signal.
+fn is_transmit_memory_refusal(error: &TcpError) -> bool {
+    matches!(
+        error.detail,
+        NetworkErrorDetail::TransmitMemoryReplenishing
+            | NetworkErrorDetail::TransmitMemoryExhausted
+    )
+}
+
 /// The kernel-side reading of a netstack close kind.
 ///
 /// A gracefully closed connection is end-of-stream and has no error;
@@ -175,23 +186,142 @@ where
         self.execute_tcp_accept(listener, timeout_nanos).await
     }
 
-    pub async fn tcp_write_all(
-        &self,
-        stream: TcpStreamId,
-        bytes: &[u8],
-        timeout_nanos: u64,
-    ) -> Result<(), TcpError> {
-        self.execute_tcp_write_all_bytes(stream, Bytes::copy_from_slice(bytes), timeout_nanos)
-            .await
+    /// At least `bytes` of memory the interface transmits from in place.
+    ///
+    /// A refusal that clears with time is
+    /// [`NetworkErrorDetail::TransmitMemoryReplenishing`], and one that
+    /// does not is [`NetworkErrorDetail::TransmitMemoryExhausted`]; both
+    /// are what [`Self::tcp_write_all`] waits out.
+    pub fn tcp_transmit_payload(&self, bytes: usize) -> Result<DeviceImpl::TxPayload, TcpError> {
+        self.inner
+            .device
+            .transmit_payload(bytes)
+            .map_err(|error| TcpError {
+                kind: TcpErrorKind::Unavailable,
+                detail: match error {
+                    IoError::Replenishing => NetworkErrorDetail::TransmitMemoryReplenishing,
+                    IoError::Exhausted => NetworkErrorDetail::TransmitMemoryExhausted,
+                    _ => NetworkErrorDetail::TcpWriteQueueFailed,
+                },
+            })
     }
 
+    /// Writes every piece `pieces` yields to `stream`, in order; each is
+    /// frozen from [`Self::tcp_transmit_payload`] memory.
+    ///
+    /// A piece is drawn only after the one before it is queued, so a lazy
+    /// iterator holds one piece of transmit memory beyond the send queue
+    /// at a time. The timeout covers the whole write, not each piece.
+    ///
+    /// A piece that fails with
+    /// [`NetworkErrorDetail::TransmitMemoryReplenishing`] or
+    /// [`NetworkErrorDetail::TransmitMemoryExhausted`] holds the write
+    /// back, as a full send queue does, and the write fails only by its
+    /// deadline or with the stream's own close error. The write declares
+    /// its wait ([`NetworkDevice::want_transmit_space`]), draws the
+    /// piece again, and parks on the interface's space signal only if that
+    /// is refused too; see [`Self::wait_for_transmit_space`]. An iterator
+    /// therefore yields the same piece again after either failure, as
+    /// [`crate::TcpPayloadPieces`] does.
+    pub async fn tcp_write_all<Pieces>(
+        &self,
+        stream: TcpStreamId,
+        mut pieces: Pieces,
+        timeout_nanos: u64,
+    ) -> Result<(), TcpError>
+    where
+        Pieces: Iterator<Item = Result<Bytes, TcpError>>,
+    {
+        let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
+        loop {
+            // Sampled before the piece is drawn, so a payload that leaves
+            // the wire between the refusal and the park releases it.
+            let wait = self.shard_wait_for_handle(stream);
+            let Some(piece) = pieces.next() else {
+                return Ok(());
+            };
+            let piece = match piece {
+                Err(refusal) if is_transmit_memory_refusal(&refusal) => {
+                    // Declared before the piece is drawn again: memory
+                    // that comes back after this point moves the signal
+                    // past `space`, and memory that came back before it
+                    // is found by this draw.
+                    let space = self.inner.device.want_transmit_space();
+                    let Some(piece) = pieces.next() else {
+                        return Ok(());
+                    };
+                    match piece {
+                        Err(refusal) if is_transmit_memory_refusal(&refusal) => {
+                            self.wait_for_transmit_space(stream, wait, space, deadline_nanos)
+                                .await?;
+                            continue;
+                        }
+                        piece => piece,
+                    }
+                }
+                piece => piece,
+            };
+            self.execute_tcp_write_until(stream, piece?, deadline_nanos)
+                .await?;
+        }
+    }
+
+    /// Holds a write back until transmit memory may be available again,
+    /// the stream can no longer send, or the write's deadline passes.
+    ///
+    /// `space` is what [`NetworkDevice::want_transmit_space`] returned
+    /// before the draw that was refused again, and `wait` was sampled
+    /// before the first one. In order:
+    ///
+    /// 1. the stack is driven, which reaps the local transmit completions
+    ///    and takes the ACKs that release queued payloads;
+    /// 2. a send side that is closed ends the write with its close error,
+    ///    so a reset is not waited out;
+    /// 3. the park: the interface's space signal after `space`, raced
+    ///    against the stream's shard, its queue pair's event and the next
+    ///    protocol timer — memory comes back through the first on any
+    ///    processor, and through the others once the payload's segment is
+    ///    acknowledged or its descriptor reaped;
+    /// 4. a deadline that has passed is the write's timeout.
+    async fn wait_for_transmit_space(
+        &self,
+        stream: TcpStreamId,
+        wait: NetworkWait,
+        space: DmaSpaceMark,
+        deadline_nanos: u64,
+    ) -> Result<(), TcpError> {
+        self.drive_tcp().await?;
+        if let TcpWriteProgress::Closed(error) = self.tcp_send_room(stream)? {
+            return Err(error);
+        }
+        let mut changed = core::pin::pin!(self.inner.device.transmit_space_changed(space));
+        let mut progress = core::pin::pin!(self.wait_for_tcp_progress(wait, deadline_nanos));
+        core::future::poll_fn(|cx| {
+            if changed.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(());
+            }
+            progress.as_mut().poll(cx)
+        })
+        .await;
+        if self.now_nanos() >= deadline_nanos {
+            return Err(TcpError {
+                kind: TcpErrorKind::Timeout,
+                detail: NetworkErrorDetail::TcpWriteTimeout,
+            });
+        }
+        Ok(())
+    }
+
+    /// Writes `bytes`, which the caller froze from memory the interface
+    /// can transmit from ([`Self::tcp_transmit_payload`]).
     pub async fn tcp_write_all_bytes(
         &self,
         stream: TcpStreamId,
         bytes: Bytes,
         timeout_nanos: u64,
     ) -> Result<(), TcpError> {
-        self.execute_tcp_write_all_bytes(stream, bytes, timeout_nanos)
+        let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
+        self.execute_tcp_write_until(stream, bytes, deadline_nanos)
             .await
     }
 
@@ -263,10 +393,23 @@ where
     /// is a send side that cannot take bytes again — the answer that
     /// resolves a parked `ready` instead of letting it sleep through the
     /// close.
+    ///
+    /// `Pending` also covers an interface whose transmit memory is short
+    /// ([`NetworkDevice::transmit_short_of_space`]): the memory is the
+    /// interface's, so every stream on it reports the same until some
+    /// comes back. The hint is read after the send queue is, and `Closed`
+    /// is never hidden by it.
     pub fn tcp_send_room(&self, stream: TcpStreamId) -> Result<TcpWriteProgress, TcpError> {
-        self.inner
+        let room = self
+            .inner
             .state
-            .with_handle(stream, |state| state.tcp_send_room(stream))
+            .with_handle(stream, |state| state.tcp_send_room(stream))?;
+        Ok(match room {
+            TcpWriteProgress::Room(_) if self.inner.device.transmit_short_of_space() => {
+                TcpWriteProgress::Pending
+            }
+            room => room,
+        })
     }
 
     /// Queues what `bytes` gives `stream`'s send queue and publishes it
@@ -347,9 +490,15 @@ where
     /// reset — another processor drains between the probe and the park
     /// resolves the wait rather than being slept through. The drive in
     /// between is what consumes the segments that change the answer.
+    ///
+    /// Transmit memory is part of the answer ([`Self::tcp_send_room`]), so
+    /// the park also ends when the interface's space signal is raised. Its
+    /// mark is taken with the shard wait, before the probe: memory that
+    /// comes back after the hint was read has moved the signal past it.
     pub async fn tcp_write_ready(&self, stream: TcpStreamId) -> Result<(), TcpError> {
         loop {
             let wait = self.shard_wait_for_handle(stream);
+            let space = self.inner.device.transmit_space_mark();
             if !matches!(self.tcp_send_room(stream)?, TcpWriteProgress::Pending) {
                 return Ok(());
             }
@@ -357,7 +506,15 @@ where
             if !matches!(self.tcp_send_room(stream)?, TcpWriteProgress::Pending) {
                 return Ok(());
             }
-            self.wait_for_tcp_progress(wait, u64::MAX).await;
+            let mut changed = core::pin::pin!(self.inner.device.transmit_space_changed(space));
+            let mut progress = core::pin::pin!(self.wait_for_tcp_progress(wait, u64::MAX));
+            core::future::poll_fn(|cx| {
+                if changed.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(());
+                }
+                progress.as_mut().poll(cx)
+            })
+            .await;
         }
     }
 
@@ -694,13 +851,14 @@ where
         }
     }
 
-    pub(super) async fn execute_tcp_write_all_bytes(
+    /// Queues all of `bytes` on `stream`, parking on a full send queue
+    /// until `deadline_nanos`.
+    pub(super) async fn execute_tcp_write_until(
         &self,
         stream: TcpStreamId,
         mut bytes: Bytes,
-        timeout_nanos: u64,
+        deadline_nanos: u64,
     ) -> Result<(), TcpError> {
-        let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
         while !bytes.is_empty() {
             // A blocked write is unblocked by the peer's window opening,
             // which arrives as an ACK on this stream's shard.

@@ -1,22 +1,44 @@
-//! The memory a kernel block request carries: whole pages, owned by the
-//! request until the device answers.
+//! The memory a kernel block request carries: whole pages of the kernel
+//! heap, owned by the request until the device answers.
 //!
 //! Every block device the kernel drives carries [`BlockPages`], so one
 //! device type serves the block cache and the scratch disk alike. The
-//! pages of a request are either the request's own — a scratch buffer
-//! its holder fills or reads, a copy the cache staged for a write — or
+//! bytes of a request are kernel memory, never memory a device reaches:
+//! the driver copies them to and from memory of its own
+//! ([`BlockBuffer::fill`] and [`BlockBuffer::deliver`]), so the device
+//! never sees the buffer itself. A request's bytes are either the
+//! request's own — a scratch or swap buffer its holder fills or reads — or
 //! the block cache's entries, which the request holds through the
-//! entries' state words: locked for a read, in write-back for a write.
-//! A cache request also carries its [`CacheRun`], which the driver's
-//! completion path completes, so the entries are finished by the answer
-//! itself rather than by the task that submitted it.
+//! entries' state words: locked for a read, in write-back for a write. A
+//! block of a write is one of two sources: the page its entry holds, which
+//! `fill` copies, or the compressed page its entry holds, which `fill`
+//! decompresses straight into the run the driver hands it, so a write-back
+//! allocates no page whatever the memory pressure. A cache request also
+//! carries its [`CacheRun`], which the driver's completion path completes,
+//! so the entries are finished by the answer itself rather than by the task
+//! that submitted it.
 //!
 //! Concurrency contract: a buffer has one owner at a time — its builder,
-//! then the driver, then the waiter or nobody — and is never shared. Its
-//! completion and its drop may run in the device's interrupt handler, so
-//! neither blocks nor takes a lock an interrupt handler cannot take: the
-//! cache's half is the run's lock-free state transitions, and freeing an
-//! owned page goes to the kernel heap, whose lock is interrupt-safe.
+//! then the driver, then the waiter or nobody — and is never shared while
+//! a request carries it. `fill` and `deliver` only copy: `fill` runs in
+//! the driver's submit path, in task context on whichever processor
+//! submits, which need not be the one that started the write; `deliver`
+//! runs in the driver's completion path, which is the device's interrupt
+//! handler or the task that drained the answer, and a page a read fills
+//! is locked by its run until `complete` publishes it. A source `fill`
+//! reads stays alive and unwritten from the moment the write starts until
+//! the answer: the run holds the entry's `WRITEBACK` bit, a share and a
+//! pin, and no path frees, replaces or writes a slot in that state (see
+//! the cache's `start_writeback`). `fill` allocates no page and takes no
+//! lock an interrupt handler can reach: decompression uses the executing
+//! processor's workspace in the compressed pool, behind a spin lock that
+//! only tasks on that processor take. The decoder in that workspace is
+//! built on the processor's first decompression and keeps its tables, so
+//! that is the one kernel-heap allocation a write-back can still make.
+//! The completion and the drop of a
+//! buffer may run in the device's interrupt handler, so neither blocks nor
+//! takes a lock an interrupt handler cannot take: the cache's half is the
+//! run's lock-free state transitions.
 
 extern crate alloc;
 
@@ -28,9 +50,9 @@ use helios_hal::fs::{AnswerFlag, BlockBuffer, OwnedBlockBuffer};
 use helios_hal::io::IoResult;
 
 use super::cache::{CACHE_BLOCK_BYTES, CacheRun, MAX_RUN_BLOCKS};
+use crate::memory::CompressedPage;
 
-/// A page buffer, aligned to its size so that it never straddles a page
-/// and a device can be handed it as one segment.
+/// A page buffer, aligned to its size so that it never straddles a page.
 #[repr(C, align(4096))]
 pub(super) struct Page(pub(super) [u8; CACHE_BLOCK_BYTES]);
 
@@ -40,10 +62,15 @@ const _: () = assert!(
     "a block buffer page is one page, aligned to a page"
 );
 
-const _: () = assert!(
-    MAX_RUN_BLOCKS <= u32::BITS as usize,
-    "a request's owned pages are one bit each in a u32"
-);
+/// Where one block of a cache request's bytes lives.
+#[derive(Clone, Copy)]
+enum Source {
+    /// The page buffer of a cache entry the run holds.
+    Page(NonNull<Page>),
+    /// The compressed page of a cache entry the run holds in write-back:
+    /// a write's `fill` decompresses it into the driver's run.
+    Compressed(NonNull<CompressedPage>),
+}
 
 impl Page {
     /// A zeroed page from the kernel heap.
@@ -53,14 +80,15 @@ impl Page {
     }
 }
 
-/// The kernel's [`BlockBuffer`]: up to [`MAX_RUN_BLOCKS`] pages, laid end
-/// to end.
+/// The kernel's [`BlockBuffer`]: either up to [`MAX_RUN_BLOCKS`] cache
+/// blocks of a cache request, laid end to end, or one run of heap bytes the
+/// buffer owns.
 pub struct BlockPages {
-    pages: ArrayVec<NonNull<Page>, MAX_RUN_BLOCKS>,
-    /// Bit `i` set: page `i` is this buffer's own, freed with it.
-    owned: u32,
-    /// Bytes the request transfers; every page but the last is whole.
-    len: usize,
+    /// The blocks a cache request transfers, in block order.
+    pages: ArrayVec<Source, MAX_RUN_BLOCKS>,
+    /// The bytes of a buffer built by [`OwnedBlockBuffer::zeroed`]; `None`
+    /// for a cache request.
+    own: Option<Box<[u8]>>,
     /// The cache blocks the request fills or writes, when the block cache
     /// issued it.
     run: Option<CacheRun>,
@@ -69,10 +97,13 @@ pub struct BlockPages {
     answered: Option<AnswerFlag>,
 }
 
-// SAFETY: the pages are either the buffer's own or cache pages the run
-// holds through their entries' state words, which no other owner touches
-// while the buffer lives; nothing in it is tied to a thread.
+// SAFETY: the sources are cache slots the run holds through their
+// entries' state words, which no other owner touches while the buffer
+// lives; nothing in it is tied to a thread.
 unsafe impl Send for BlockPages {}
+// SAFETY: a shared buffer only reads: its byte view reads memory it owns,
+// and its sources are addresses, not accesses.
+unsafe impl Sync for BlockPages {}
 
 impl BlockPages {
     /// A request buffer for a cache run, whose pages the cache pushes
@@ -80,8 +111,7 @@ impl BlockPages {
     pub(super) fn for_run(run: CacheRun) -> Self {
         Self {
             pages: ArrayVec::new(),
-            owned: 0,
-            len: 0,
+            own: None,
             run: Some(run),
             answered: None,
         }
@@ -90,15 +120,13 @@ impl BlockPages {
     /// Appends a page the request borrows from a cache entry the run
     /// holds.
     pub(super) fn push_borrowed(&mut self, page: NonNull<Page>) {
-        self.pages.push(page);
-        self.len += CACHE_BLOCK_BYTES;
+        self.pages.push(Source::Page(page));
     }
 
-    /// Appends a page the request owns.
-    pub(super) fn push_owned(&mut self, page: Box<Page>) {
-        self.owned |= 1 << self.pages.len();
-        self.pages.push(NonNull::from(Box::leak(page)));
-        self.len += CACHE_BLOCK_BYTES;
+    /// Appends the compressed page of a cache entry the run holds in
+    /// write-back, for `fill` to decompress.
+    pub(super) fn push_compressed(&mut self, page: NonNull<CompressedPage>) {
+        self.pages.push(Source::Compressed(page));
     }
 
     /// The cache blocks a cache request names.
@@ -122,38 +150,58 @@ impl BlockPages {
         self.run().id(index)
     }
 
-    /// The page at `index`, which this buffer owns.
-    fn own_page(&self, index: usize) -> NonNull<Page> {
-        assert!(
-            self.run.is_none() && self.owned & (1 << index) != 0,
-            "only a buffer's own pages are filled or read by its holder"
-        );
-        self.pages[index]
-    }
-}
-
-impl Drop for BlockPages {
-    fn drop(&mut self) {
-        // The run first: it gives its entries back, as answered or as
-        // never seen by the device, and stops counting staged pages.
-        drop(self.run.take());
-        for (index, page) in self.pages.drain(..).enumerate() {
-            if self.owned & (1 << index) != 0 {
-                // SAFETY: an owned page came from `Box::leak` in
-                // `push_owned` or `zeroed`, and is freed once, here.
-                drop(unsafe { Box::from_raw(page.as_ptr()) });
-            }
-        }
+    /// The bytes of a buffer its holder fills or reads.
+    fn own_bytes(&self) -> &[u8] {
+        self.own
+            .as_deref()
+            .expect("only a buffer made of its own bytes is filled or read by its holder")
     }
 }
 
 impl BlockBuffer for BlockPages {
-    fn segments(&self) -> impl Iterator<Item = NonNull<[u8]>> + '_ {
-        let len = self.len;
-        self.pages.iter().enumerate().map(move |(index, page)| {
-            let start = index * CACHE_BLOCK_BYTES;
-            NonNull::slice_from_raw_parts(page.cast::<u8>(), (len - start).min(CACHE_BLOCK_BYTES))
-        })
+    fn len(&self) -> usize {
+        self.own
+            .as_deref()
+            .map_or(self.pages.len() * CACHE_BLOCK_BYTES, <[u8]>::len)
+    }
+
+    fn fill(&mut self, to: &mut [u8]) {
+        debug_assert_eq!(to.len(), self.len(), "a write is filled whole");
+        if let Some(own) = &self.own {
+            to.copy_from_slice(own);
+            return;
+        }
+        let (blocks, _) = to.as_chunks_mut::<CACHE_BLOCK_BYTES>();
+        for (source, to) in self.pages.iter().zip(blocks) {
+            match *source {
+                // SAFETY: the page is a cache entry's the run holds in
+                // write-back, so nothing writes or frees it while the
+                // request carries it.
+                Source::Page(page) => to.copy_from_slice(&unsafe { page.as_ref() }.0),
+                // SAFETY: the compressed page is a cache entry's the run
+                // holds in write-back, which no path frees or replaces
+                // until the write is answered.
+                Source::Compressed(page) => unsafe { page.as_ref() }.decompress_into(to),
+            }
+        }
+    }
+
+    fn deliver(&mut self, from: &[u8]) {
+        debug_assert_eq!(from.len(), self.len(), "a read is delivered whole");
+        if let Some(own) = &mut self.own {
+            own.copy_from_slice(from);
+            return;
+        }
+        let (blocks, _) = from.as_chunks::<CACHE_BLOCK_BYTES>();
+        for (source, from) in self.pages.iter_mut().zip(blocks) {
+            let Source::Page(page) = source else {
+                panic!("a read request names a compressed block")
+            };
+            // SAFETY: the page is a cache entry's the run holds locked for
+            // this read, which no reader sees before `complete` publishes
+            // it, so this is the only access.
+            unsafe { page.as_mut() }.0.copy_from_slice(from);
+        }
     }
 
     fn complete(&mut self, result: IoResult<()>) {
@@ -171,57 +219,26 @@ impl OwnedBlockBuffer for BlockPages {
         self.answered = Some(flag);
     }
 
-    fn zeroed(len: usize) -> Option<Self> {
-        let count = len.div_ceil(CACHE_BLOCK_BYTES);
-        if count > MAX_RUN_BLOCKS {
-            return None;
-        }
-        let mut buffer = Self {
+    fn zeroed(len: usize) -> Self {
+        Self {
             pages: ArrayVec::new(),
-            owned: 0,
-            len: 0,
+            own: Some(alloc::vec![0; len].into_boxed_slice()),
             run: None,
             answered: None,
-        };
-        for _ in 0..count {
-            buffer.push_owned(Page::zeroed());
-        }
-        buffer.len = len;
-        Some(buffer)
-    }
-
-    fn len(&self) -> usize {
-        self.len
-    }
-
-    fn copy_from(&mut self, src: &[u8]) {
-        assert!(
-            src.len() <= self.len,
-            "{} bytes do not fit a {}-byte block buffer",
-            src.len(),
-            self.len
-        );
-        for (index, chunk) in src.chunks(CACHE_BLOCK_BYTES).enumerate() {
-            let mut page = self.own_page(index);
-            // SAFETY: the page is this buffer's own and no request holds
-            // the buffer, so nothing else reads or writes it.
-            let page = unsafe { page.as_mut() };
-            page.0[..chunk.len()].copy_from_slice(chunk);
         }
     }
+}
 
-    fn copy_to(&self, dst: &mut [u8]) {
-        assert!(
-            dst.len() <= self.len,
-            "a {}-byte block buffer cannot fill {} bytes",
-            self.len,
-            dst.len()
-        );
-        for (index, chunk) in dst.chunks_mut(CACHE_BLOCK_BYTES).enumerate() {
-            let page = self.own_page(index);
-            // SAFETY: as in `copy_from`; the page is only read.
-            let page = unsafe { page.as_ref() };
-            chunk.copy_from_slice(&page.0[..chunk.len()]);
-        }
+impl AsRef<[u8]> for BlockPages {
+    fn as_ref(&self) -> &[u8] {
+        self.own_bytes()
+    }
+}
+
+impl AsMut<[u8]> for BlockPages {
+    fn as_mut(&mut self) -> &mut [u8] {
+        self.own
+            .as_deref_mut()
+            .expect("only a buffer made of its own bytes is filled or read by its holder")
     }
 }

@@ -12,6 +12,7 @@ pub mod cpu;
 pub mod critical_section;
 pub mod device;
 pub mod display;
+pub mod dma;
 pub mod entropy;
 pub mod fs;
 pub mod generation;

@@ -24,6 +24,7 @@ use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::Mutex;
 
+use helios_hal::dma::{BufError, BufResult};
 use helios_hal::vmm::SwapBackend;
 use thiserror::Error;
 
@@ -171,26 +172,51 @@ impl FileSwapBackend {
 impl SwapBackend for FileSwapBackend {
     type Token = FileSwapToken;
     type Error = FileSwapError;
+    /// The file is written and read through ordinary host calls, so a page
+    /// is staged in plain memory.
+    type Buffer = Box<[u8]>;
 
-    async fn swap_out(&self, bytes: &[u8]) -> Result<Self::Token, Self::Error> {
-        let token = self.allocate(bytes.len())?;
-        if let Err(error) = self.file.write_all_at(bytes, token.offset) {
-            self.free(token);
-            return Err(error.into());
-        }
-        Ok(token)
+    fn buffer(&self, bytes: usize) -> Result<Self::Buffer, Self::Error> {
+        Ok(vec![0_u8; bytes].into_boxed_slice())
     }
 
-    async fn swap_in(&self, token: Self::Token, dst: &mut [u8]) -> Result<(), Self::Error> {
-        if dst.len() != token.byte_len {
-            return Err(FileSwapError::InvalidDestination {
-                expected: token.byte_len,
-                actual: dst.len(),
-            });
+    /// The transfer is a synchronous `pwrite` that has finished with the
+    /// page before this returns, so the page always comes back.
+    async fn swap_out(
+        &self,
+        page: Self::Buffer,
+    ) -> BufResult<Self::Token, Self::Buffer, Self::Error> {
+        let token = match self.allocate(page.len()) {
+            Ok(token) => token,
+            Err(error) => return Err(BufError::returned(error, page)),
+        };
+        if let Err(error) = self.file.write_all_at(&page, token.offset) {
+            self.free(token);
+            return Err(BufError::returned(error.into(), page));
         }
-        self.file.read_exact_at(dst, token.offset)?;
+        Ok((token, page))
+    }
+
+    async fn swap_in(
+        &self,
+        token: Self::Token,
+        mut page: Self::Buffer,
+    ) -> BufResult<(), Self::Buffer, Self::Error> {
+        if page.len() != token.byte_len {
+            let actual = page.len();
+            return Err(BufError::returned(
+                FileSwapError::InvalidDestination {
+                    expected: token.byte_len,
+                    actual,
+                },
+                page,
+            ));
+        }
+        if let Err(error) = self.file.read_exact_at(&mut page, token.offset) {
+            return Err(BufError::returned(error.into(), page));
+        }
         self.free(token);
-        Ok(())
+        Ok(((), page))
     }
 
     async fn release(&self, token: Self::Token) {
@@ -218,28 +244,48 @@ mod tests {
     #[test]
     fn a_page_comes_back_byte_for_byte() {
         let backend = backend(64 * 1024);
-        let page: Vec<u8> = (0..4096).map(|index| (index % 251) as u8).collect();
-        let token = block_on(backend.swap_out(&page)).expect("swap out");
-        let mut restored = vec![0_u8; 4096];
-        block_on(backend.swap_in(token, &mut restored)).expect("swap in");
-        assert_eq!(restored, page);
+        let mut page = backend.buffer(4096).expect("staging buffer");
+        for (index, byte) in page.iter_mut().enumerate() {
+            *byte = (index % 251) as u8;
+        }
+        let expected = page.clone();
+        let (token, _page) = block_on(backend.swap_out(page)).expect("swap out");
+        let restored = backend.buffer(4096).expect("staging buffer");
+        let ((), restored) = block_on(backend.swap_in(token, restored)).expect("swap in");
+        assert_eq!(restored, expected);
+    }
+
+    /// A staging buffer of `bytes` bytes of `fill`.
+    fn staged(backend: &FileSwapBackend, bytes: usize, fill: u8) -> Box<[u8]> {
+        let mut buffer = backend.buffer(bytes).expect("staging buffer");
+        buffer.fill(fill);
+        buffer
+    }
+
+    /// Swaps `bytes` bytes of `fill` out, for the token.
+    fn swapped(
+        backend: &FileSwapBackend,
+        bytes: usize,
+        fill: u8,
+    ) -> Result<FileSwapToken, FileSwapError> {
+        block_on(backend.swap_out(staged(backend, bytes, fill)))
+            .map(|(token, _page)| token)
+            .map_err(BufError::into_error)
     }
 
     #[test]
     fn swapping_in_gives_the_extent_back() {
         let backend = backend(8192);
-        let page = vec![7_u8; 4096];
-        let token = block_on(backend.swap_out(&page)).expect("swap out");
+        let token = swapped(&backend, 4096, 7).expect("swap out");
         assert_eq!(backend.used_bytes(), 4096);
-        let mut restored = vec![0_u8; 4096];
-        block_on(backend.swap_in(token, &mut restored)).expect("swap in");
+        block_on(backend.swap_in(token, staged(&backend, 4096, 0))).expect("swap in");
         assert_eq!(backend.used_bytes(), 0);
     }
 
     #[test]
     fn releasing_gives_the_extent_back_without_reading_it() {
         let backend = backend(8192);
-        let token = block_on(backend.swap_out(&[3_u8; 4096])).expect("swap out");
+        let token = swapped(&backend, 4096, 3).expect("swap out");
         assert_eq!(backend.used_bytes(), 4096);
         block_on(backend.release(token));
         assert_eq!(backend.used_bytes(), 0);
@@ -248,8 +294,8 @@ mod tests {
     #[test]
     fn a_full_swap_file_refuses_rather_than_overwriting() {
         let backend = backend(4096);
-        let _first = block_on(backend.swap_out(&[1_u8; 4096])).expect("first page fits");
-        let second = block_on(backend.swap_out(&[2_u8; 4096]));
+        let _first = swapped(&backend, 4096, 1).expect("first page fits");
+        let second = swapped(&backend, 4096, 2);
         assert!(
             matches!(second, Err(FileSwapError::OutOfSwap { .. })),
             "a full swap file must refuse, got {second:?}"
@@ -259,23 +305,25 @@ mod tests {
     #[test]
     fn released_extents_coalesce_so_a_large_page_still_fits() {
         let backend = backend(8192);
-        let first = block_on(backend.swap_out(&[1_u8; 4096])).expect("first");
-        let second = block_on(backend.swap_out(&[2_u8; 4096])).expect("second");
+        let first = swapped(&backend, 4096, 1).expect("first");
+        let second = swapped(&backend, 4096, 2).expect("second");
         block_on(backend.release(first));
         block_on(backend.release(second));
-        let whole = block_on(backend.swap_out(&vec![3_u8; 8192])).expect("coalesced extent");
+        let whole = swapped(&backend, 8192, 3).expect("coalesced extent");
         assert_eq!(whole.byte_len, 8192);
     }
 
     #[test]
     fn a_mismatched_destination_is_refused() {
         let backend = backend(8192);
-        let token = block_on(backend.swap_out(&[5_u8; 4096])).expect("swap out");
-        let mut short = vec![0_u8; 2048];
-        let result = block_on(backend.swap_in(token, &mut short));
+        let token = swapped(&backend, 4096, 5).expect("swap out");
+        let refused = block_on(backend.swap_in(token, staged(&backend, 2048, 0)))
+            .expect_err("a short page is refused");
         assert!(
-            matches!(result, Err(FileSwapError::InvalidDestination { .. })),
-            "got {result:?}"
+            matches!(refused.error, FileSwapError::InvalidDestination { .. }),
+            "got {:?}",
+            refused.error
         );
+        assert!(refused.buffers.is_some(), "the page comes back");
     }
 }

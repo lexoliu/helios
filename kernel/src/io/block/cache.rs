@@ -23,8 +23,8 @@
 //!   starts a block's write-back — a sync, a miss that needs an entry,
 //!   the reclaim task — submits it, with its dirty neighbours, as
 //!   another. The request carries a [`BlockPages`] that owns the run: the
-//!   entries' pins, locks and write-back bits, and any page staged for
-//!   the write. The device's completion path calls the run's completion,
+//!   entries' pins, locks and write-back bits. The device's completion
+//!   path calls the run's completion,
 //!   which makes the entries valid, clean, dirty again or stale, and
 //!   records a failure for the next sync — whether or not the task that
 //!   submitted it still waits. The completion is lock-free apart from the
@@ -45,6 +45,15 @@
 //!   bit with one compare-and-swap, so the entry stays in the index and
 //!   a task that wants the block meanwhile parks on it exactly as on a
 //!   read in flight. The work runs on the processor that took the bit.
+//! - **A compressed block is written from its compressed page.** The
+//!   write-back of a dirty compressed block takes the entry's `WRITEBACK`
+//!   bit, a share and a pin, and keeps its compressed page until the write
+//!   is answered: nothing inflates, recycles, compresses again, drops or
+//!   overwrites an entry in write-back, and a hit that finds one parks on
+//!   `WRITEBACK` through the entry's wait signal. The driver's submit path
+//!   decompresses the page straight into the run it copies the request
+//!   through ([`BlockPages`]'s `fill`), on whichever processor submits, so
+//!   a write-back allocates no page on any pressure tier.
 //! - **Syncs of one disk take turns.** One sync at a time leads: it
 //!   drains the disk's dirty set, writes what it found, and flushes; a
 //!   sync that arrives meanwhile waits for the leader, and is answered by
@@ -147,8 +156,12 @@
 //!
 //! Blocks live in page-sized, page-aligned buffers taken zeroed from the
 //! kernel heap: the cache is kernel memory (AGENTS §3.1), never charged
-//! to an instance. It grows while the machine's memory pressure is green
-//! and recycles its coldest clean block once it is not. The entry
+//! to an instance, and a device never sees a page of it, because the
+//! driver copies every request through memory of its own
+//! ([`helios_hal::fs::BlockBuffer`]). A page is the cache's, whatever
+//! disk its block belongs to: an entry recycled for another disk's block
+//! keeps its page. The cache grows while the machine's memory pressure is
+//! green and recycles its coldest clean block once it is not. The entry
 //! table's bound is half the machine — the cache cannot grow past the
 //! point where pressure stops being green — and only the entries the
 //! cache actually grows into are allocated. A free entry holds no
@@ -162,9 +175,9 @@
 //!   marked `COMPRESSED`, so a later hit decompresses it into a fresh
 //!   buffer without asking the device. A dirty block stays dirty while it
 //!   is compressed: it reaches the disk uncompressed, through the same
-//!   write-back and [`CachedDisk::sync`] as any other dirty block, from a
-//!   page decompressed for the write alone. A block that does not
-//!   compress below [`crate::memory::INCOMPRESSIBLE_BYTES`] skips the
+//!   write-back and [`CachedDisk::sync`] as any other dirty block, from its
+//!   compressed page decompressed into the driver's run. A block that does
+//!   not compress below [`crate::memory::INCOMPRESSIBLE_BYTES`] skips the
 //!   tier: a clean one is dropped and a dirty one is written back and
 //!   dropped, as zswap and zram send such a page straight to the backing
 //!   device. When the pool is full it evicts its own coldest pages first
@@ -172,9 +185,8 @@
 //!   and the block is offered once more.
 //! - **Red empties the cache of everything nobody holds.** Clean blocks
 //!   are dropped, compressed or not; dirty ones are written back and then
-//!   dropped. A compressed block is written from a page decompressed for
-//!   that write, so emptying the tier never holds more page buffers than
-//!   one request carries.
+//!   dropped. A compressed block is written from its compressed page, so
+//!   emptying the tier allocates no page buffer at all.
 //!
 //! The miss path's clock may also recycle a clean compressed entry, as
 //! it recycles any clean one; it does not compress the block it
@@ -376,7 +388,7 @@ pub(super) struct DiskLayout {
     /// block is not addressable through the cache.
     pub(super) capacity_blocks: u64,
     /// Cache blocks one device request carries: as many as the device's
-    /// segments hold, up to [`MAX_RUN_BLOCKS`].
+    /// transfer limit holds, up to [`MAX_RUN_BLOCKS`].
     pub(super) run_blocks: usize,
     /// Cache blocks one miss reads, aligned to their own size: the
     /// device's optimal transfer, or the missing block alone when the
@@ -400,13 +412,9 @@ impl DiskLayout {
         if capacity_blocks == 0 {
             return Err(CacheLayoutError::TooSmall);
         }
-        // A segment carries whole logical blocks, so a cache block takes
-        // as many segments as it takes pieces of that size.
-        let segment_bytes = (geometry.max_segment_bytes as usize / logical_block_bytes).max(1)
-            * logical_block_bytes;
-        let segments_per_block = CACHE_BLOCK_BYTES.div_ceil(segment_bytes);
-        let run_blocks =
-            (geometry.max_segments as usize / segments_per_block).clamp(1, MAX_RUN_BLOCKS);
+        // One request carries `max_transfer_bytes` through one contiguous
+        // run of the driver's memory, however many pages it is made of.
+        let run_blocks = (geometry.max_transfer_bytes / CACHE_BLOCK_BYTES).clamp(1, MAX_RUN_BLOCKS);
         let optimal_bytes = (geometry.opt_io_blocks as usize).saturating_mul(logical_block_bytes);
         let readahead_blocks = ((optimal_bytes / CACHE_BLOCK_BYTES) as u64)
             .clamp(1, run_blocks as u64)
@@ -633,9 +641,6 @@ pub(super) struct CacheRun {
     first_block: u64,
     ids: ArrayVec<u32, MAX_RUN_BLOCKS>,
     kind: RunKind,
-    /// Page buffers staged for this write, which the request owns and
-    /// the cache counts.
-    staged: usize,
     answered: bool,
 }
 
@@ -695,11 +700,10 @@ impl CacheRun {
 
 impl Drop for CacheRun {
     fn drop(&mut self) {
-        let cache = &*self.cache;
-        cache.pages.fetch_sub(self.staged, Ordering::Relaxed);
         if self.answered {
             return;
         }
+        let cache = &*self.cache;
         // The device never saw the request: the blocks go back as they
         // were before it was built.
         for &id in &self.ids {
@@ -745,31 +749,25 @@ struct WriteRun {
     disk: usize,
     first_block: u64,
     ids: ArrayVec<u32, MAX_RUN_BLOCKS>,
-    /// For a block held compressed, its bytes decompressed for this
-    /// write alone; the entry keeps its compressed page.
-    staged: ArrayVec<Option<Box<Page>>, MAX_RUN_BLOCKS>,
 }
 
 impl WriteRun {
-    fn new(disk: usize, block: u64, id: u32, staged: Option<Box<Page>>) -> Self {
-        let mut run = Self {
+    fn new(disk: usize, block: u64, id: u32) -> Self {
+        let mut ids = ArrayVec::new();
+        ids.push(id);
+        Self {
             disk,
             first_block: block,
-            ids: ArrayVec::new(),
-            staged: ArrayVec::new(),
-        };
-        run.push_back(id, staged);
-        run
+            ids,
+        }
     }
 
-    fn push_back(&mut self, id: u32, staged: Option<Box<Page>>) {
+    fn push_back(&mut self, id: u32) {
         self.ids.push(id);
-        self.staged.push(staged);
     }
 
-    fn push_front(&mut self, id: u32, staged: Option<Box<Page>>) {
+    fn push_front(&mut self, id: u32) {
         self.ids.insert(0, id);
-        self.staged.insert(0, staged);
         self.first_block -= 1;
     }
 }
@@ -1073,8 +1071,12 @@ pub(super) struct CacheCore {
     reclaimable: CachePadded<Gate>,
     /// The last [`PressureLevel`] the reclaim task measured.
     pressure: CachePadded<AtomicU8>,
-    /// Page buffers the cache holds, staged write copies included.
+    /// Page buffers the cache holds.
     pages: CachePadded<AtomicUsize>,
+    /// Pages ever allocated, for tests that check a recycled entry keeps
+    /// its page.
+    #[cfg(test)]
+    pages_allocated: AtomicUsize,
     /// The tier cold blocks are compressed into under pressure.
     pool: CompressedPool,
     disks: ArrayVec<DiskState, MAX_BLOCK_DEVICES>,
@@ -1154,6 +1156,8 @@ impl CacheCore {
             reclaimable: CachePadded::new(Gate::new()),
             pressure: CachePadded::new(AtomicU8::new(PressureLevel::Green as u8)),
             pages: CachePadded::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            pages_allocated: AtomicUsize::new(0),
             pool,
             disks: ArrayVec::new(),
         }
@@ -1211,6 +1215,8 @@ impl CacheCore {
 
     fn new_page(&self) -> Box<Page> {
         self.pages.fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        self.pages_allocated.fetch_add(1, Ordering::Relaxed);
         Page::zeroed()
     }
 
@@ -1522,7 +1528,8 @@ impl CacheCore {
     /// Green pressure reuses a free entry or grows; otherwise the clock
     /// recycles a clean block first. An `urgent` claim — a reader that
     /// cannot proceed without one — grows under pressure when nothing
-    /// is evictable; a speculative one does not.
+    /// is evictable; a speculative one does not. A recycled entry keeps
+    /// its page, whichever disk's block it held: pages are the kernel's.
     fn try_claim(&self, urgent: bool) -> Option<u32> {
         let id = if self.pressure() == PressureLevel::Green {
             self.pop_free()
@@ -1611,57 +1618,39 @@ impl CacheCore {
     }
 
     /// Moves the pinned, dirty entry `id` into write-back, with a share
-    /// and a pin of the write's own. A block held compressed is
-    /// decompressed into a page staged for the write, and keeps its
-    /// compressed page.
+    /// and a pin of the write's own. The slot, a buffer or a compressed
+    /// page, stays as it is and is read by the request's `fill`: no path
+    /// frees, replaces or writes the slot of an entry in write-back, so
+    /// starting a write allocates nothing and the write takes no page.
     ///
-    /// Answers `None`, doing nothing, when the entry is clean, held, or
+    /// Answers false, doing nothing, when the entry is clean, held, or
     /// already in flight.
-    fn start_writeback(&self, id: u32) -> Option<Option<Box<Page>>> {
+    fn start_writeback(&self, id: u32) -> bool {
         let entry = self.entry(id);
         let mut current = entry.state.load(Ordering::Acquire);
         loop {
             if current & DIRTY == 0 || current & (LOCKED | WRITEBACK | RECLAIM) != 0 {
-                return None;
+                return false;
             }
-            let next = if current & COMPRESSED == 0 {
-                ((current & !DIRTY) | WRITEBACK) + SHARE + PIN
-            } else {
-                current | LOCKED
-            };
             match entry.state.compare_exchange_weak(
                 current,
-                next,
+                ((current & !DIRTY) | WRITEBACK) + SHARE + PIN,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) if current & COMPRESSED == 0 => return Some(None),
-                Ok(_) => break,
+                Ok(_) => return true,
                 Err(observed) => current = observed,
             }
         }
-        let mut staged = self.new_page();
-        // SAFETY: this task holds the entry `LOCKED`, so nobody replaces
-        // its slot while the compressed page is read.
-        match unsafe { entry.slot() } {
-            Slot::Compressed(page) => page.decompress_into(&mut staged.0),
-            Slot::Empty | Slot::Buffer(_) => {
-                panic!("block cache entry {id} is marked compressed without a compressed page")
-            }
-        }
-        self.transition(id, |state| {
-            ((state & !(LOCKED | DIRTY)) | WRITEBACK) + SHARE + PIN
-        });
-        Some(Some(staged))
     }
 
     /// Starts the write-back of the next block of `disk` after or
     /// before a run, if it is cached and dirty.
-    fn start_neighbour(&self, disk: usize, block: u64) -> Option<(u32, Option<Box<Page>>)> {
+    fn start_neighbour(&self, disk: usize, block: u64) -> Option<u32> {
         let id = self.find(key_of(disk, block), Take::Pin)?;
         let started = self.start_writeback(id);
         self.unpin(id);
-        started.map(|staged| (id, staged))
+        started.then_some(id)
     }
 
     /// Starts the write-back of the entry `seed` and of the dirty blocks
@@ -1686,21 +1675,24 @@ impl CacheCore {
             return None;
         }
         let block = key_block(key);
-        let mut run = WriteRun::new(disk, block, seed, self.start_writeback(seed)?);
+        if !self.start_writeback(seed) {
+            return None;
+        }
+        let mut run = WriteRun::new(disk, block, seed);
         let limit = state.layout.run_blocks;
         let mut after = block + 1;
         while run.ids.len() < limit && after < state.layout.capacity_blocks {
-            let Some((id, staged)) = self.start_neighbour(disk, after) else {
+            let Some(id) = self.start_neighbour(disk, after) else {
                 break;
             };
-            run.push_back(id, staged);
+            run.push_back(id);
             after += 1;
         }
         while run.ids.len() < limit && run.first_block > 0 {
-            let Some((id, staged)) = self.start_neighbour(disk, run.first_block - 1) else {
+            let Some(id) = self.start_neighbour(disk, run.first_block - 1) else {
                 break;
             };
-            run.push_front(id, staged);
+            run.push_front(id);
         }
         Some(run)
     }
@@ -1708,14 +1700,16 @@ impl CacheCore {
     /// Decompresses the compressed entry `id` into a fresh buffer, so it
     /// is valid again with its dirtiness unchanged. Answers false, doing
     /// nothing, when the entry is not compressed or another task owns
-    /// it; that task's release wakes anyone waiting on the entry.
+    /// it; that task's release wakes anyone waiting on the entry. An entry
+    /// in write-back is owned by the write, whose request reads the
+    /// compressed page until the answer, so it is refused too.
     ///
     /// The caller holds a pin.
     fn try_inflate(&self, id: u32) -> bool {
         let entry = self.entry(id);
         let mut current = entry.state.load(Ordering::Acquire);
         loop {
-            if current & COMPRESSED == 0 || current & (LOCKED | RECLAIM) != 0 {
+            if current & COMPRESSED == 0 || current & (LOCKED | WRITEBACK | RECLAIM) != 0 {
                 return false;
             }
             match entry.state.compare_exchange_weak(
@@ -1729,9 +1723,10 @@ impl CacheCore {
             }
         }
         let mut page = self.new_page();
-        // SAFETY: this task holds the entry `LOCKED`. Shares are granted
-        // only on a valid buffer, and a write-back in flight reads the
-        // copy it staged, so no reference into the slot lives.
+        // SAFETY: this task holds the entry `LOCKED`, and it was not in
+        // write-back, so no request reads its compressed page. Shares are
+        // granted only on a valid buffer, so no reference into the slot
+        // lives.
         let slot = unsafe { entry.slot_mut() };
         match &*slot {
             Slot::Compressed(compressed) => compressed.decompress_into(&mut page.0),
@@ -1874,7 +1869,6 @@ impl<Device> CacheShared<Device> {
             first_block: run.first_block,
             ids: run.ids,
             kind: RunKind::Read,
-            staged: 0,
             answered: false,
         });
         for index in 0..pages.run_blocks() {
@@ -1900,7 +1894,6 @@ impl<Device> CacheShared<Device> {
             disk,
             first_block,
             ids,
-            staged,
         } = run;
         let mut pages = BlockPages::for_run(CacheRun {
             cache: Arc::clone(&self.core),
@@ -1908,23 +1901,18 @@ impl<Device> CacheShared<Device> {
             first_block,
             ids: ids.clone(),
             kind,
-            staged: staged.iter().flatten().count(),
             answered: false,
         });
-        for (id, staged) in ids.into_iter().zip(staged) {
-            match staged {
-                Some(page) => pages.push_owned(page),
-                None => {
-                    // SAFETY: the run holds a share of the entry, so it
-                    // holds a valid buffer that nobody writes or replaces
-                    // until the write completes; the device only reads it.
-                    let page = match unsafe { self.entry(id).slot() } {
-                        Slot::Buffer(page) => NonNull::from(&**page),
-                        Slot::Empty | Slot::Compressed(_) => {
-                            panic!("block cache entry {id} is in write-back without a buffer")
-                        }
-                    };
-                    pages.push_borrowed(page);
+        for id in ids {
+            // SAFETY: the run holds the entry in write-back with a share
+            // and a pin, so its slot is neither written, freed nor
+            // replaced until the write completes; the request only reads
+            // it.
+            match unsafe { self.entry(id).slot() } {
+                Slot::Buffer(page) => pages.push_borrowed(NonNull::from(&**page)),
+                Slot::Compressed(page) => pages.push_compressed(NonNull::from(page)),
+                Slot::Empty => {
+                    panic!("block cache entry {id} is in write-back without a slot")
                 }
             }
         }
@@ -1951,11 +1939,17 @@ where
         let (disk, first_block, blocks) = pages.run_target();
         let state = &self.disks[disk];
         let first = first_block as usize * state.layout.device_blocks_per_block;
-        let answer = self.devices[disk].read(first, pages).await;
-        if let Err(error) = answer.result {
-            tracing::warn!(?error, serial = ?state.serial, block = first_block, blocks, "block cache read failed");
+        // The buffer comes back either way and goes here: its run was
+        // completed by the answer, so dropping it only gives back what
+        // the request held.
+        match self.devices[disk].read(first, pages).await {
+            Ok(((), _pages)) => true,
+            Err(failure) => {
+                let error = failure.error;
+                tracing::warn!(?error, serial = ?state.serial, block = first_block, blocks, "block cache read failed");
+                false
+            }
         }
-        answer.result.is_ok()
     }
 
     /// Writes the run `pages` carries. Its completion makes the blocks
@@ -1965,11 +1959,14 @@ where
         let (disk, first_block, blocks) = pages.run_target();
         let state = &self.disks[disk];
         let first = first_block as usize * state.layout.device_blocks_per_block;
-        let answer = self.devices[disk].write(first, pages).await;
-        if let Err(error) = answer.result {
-            tracing::warn!(?error, serial = ?state.serial, block = first_block, blocks, "block cache write-back failed");
+        match self.devices[disk].write(first, pages).await {
+            Ok(((), _pages)) => Ok(()),
+            Err(failure) => {
+                let error = failure.error;
+                tracing::warn!(?error, serial = ?state.serial, block = first_block, blocks, "block cache write-back failed");
+                Err(error)
+            }
         }
-        answer.result
     }
 
     /// Writes the entry `seed` back with its dirty neighbours, if it can
@@ -2317,8 +2314,7 @@ where
         self.shared.compressed_blocks()
     }
 
-    /// Page buffers the cache holds right now, pages staged for a write
-    /// included.
+    /// Page buffers the cache holds right now.
     pub fn page_buffers(&self) -> usize {
         self.shared.pages.load(Ordering::Relaxed)
     }
@@ -2470,6 +2466,15 @@ where
                 continue;
             }
             if state & COMPRESSED != 0 {
+                if state & WRITEBACK != 0 {
+                    // A write reads the compressed page until the device
+                    // answers: inflating would free it. The completion
+                    // clears `WRITEBACK` and wakes this wait.
+                    cache
+                        .wait_state(held.id, |state| state & WRITEBACK == 0)
+                        .await;
+                    continue;
+                }
                 // A hit in the compressed tier: no device read.
                 cache.try_inflate(held.id);
                 continue;
@@ -2662,7 +2667,7 @@ where
                 + PIN
         });
         let held = Held { cache, id };
-        let pages = cache.write_pages(WriteRun::new(self.disk, block, id, None), RunKind::Commit);
+        let pages = cache.write_pages(WriteRun::new(self.disk, block, id), RunKind::Commit);
         let written = cache.write_run(pages).await;
         drop(held);
         written.map_err(BlockCacheError::Device)?;
@@ -2946,6 +2951,13 @@ pub(super) fn dirty_blocks<Device>(cache: &BlockCache<Device>) -> alloc::vec::Ve
         .filter(|&id| shared.entry(id).state.load(Ordering::Acquire) & DIRTY != 0)
         .map(|id| key_block(shared.entry(id).key.load(Ordering::Acquire)))
         .collect()
+}
+
+/// Pages the cache ever allocated, for tests that check an entry keeps
+/// its page when it is recycled.
+#[cfg(test)]
+pub(super) fn pages_allocated<Device>(cache: &BlockCache<Device>) -> usize {
+    cache.shared.pages_allocated.load(Ordering::Relaxed)
 }
 
 /// Resident entries nobody holds, for tests that check nothing is left

@@ -27,6 +27,7 @@ use core::time::Duration;
 
 use bytes::Bytes;
 use helios_hal::cpu::{Cpu, HardwarePerfCounters, current_processor};
+use helios_hal::dma::DmaSpaceMark;
 use helios_hal::io::IoError;
 use helios_netstack::{
     DEFAULT_HOP_LIMIT, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DNS_PORT, DhcpAction, DhcpClient,
@@ -1834,6 +1835,9 @@ mod tests {
     /// The peer's hardware address in the frames these tests build.
     const PEER_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 2];
 
+    use crate::{NetworkErrorDetail, TcpError, TcpErrorKind, TcpStreamId, TcpWriteProgress};
+    use core::future::Future;
+    use core::time::Duration;
     use helios_netstack::{
         ArpOperation, ArpPacket, ETHERNET_FRAME_BYTES, EthernetFrame, EthernetProtocol,
         IcmpEchoKey, Icmpv4Packet, Icmpv6Packet, IpAddress, IpProtocol, Ipv4Address, Ipv4Cidr,
@@ -3759,66 +3763,10 @@ mod tests {
         /// The `tcp-latency` request: sixteen bytes, which every
         /// congestion window and send queue has room for.
         const REQUEST: &[u8] = b"0123456789abcdef";
-
-        let local = Ipv4Address::new([192, 0, 2, 10]);
-        let peer = Ipv4Address::new([192, 0, 2, 20]);
         let service = test_network_service();
         let state = &service.inner.state;
         let owner = super::DEFAULT_SHARD_IDX;
-
-        let stream = {
-            let mut shard = state.shard_at(owner).lock();
-            shard
-                .stack
-                .add_ipv4_address(Ipv4Cidr::new(local, 24))
-                .expect("test address should be accepted");
-            shard.stack.learn_neighbor(NeighborEntry {
-                ip: IpAddress::Ipv4(peer),
-                mac: PEER_MAC,
-                state: NeighborState::Reachable,
-                updated_at: StackInstant::from_nanos(0),
-            });
-            service.inner.control.publish_from_shard(&shard);
-            let socket = shard
-                .stack
-                .open_tcp_connect(
-                    TcpEndpoint {
-                        address: IpAddress::Ipv4(local),
-                        port: 49_152,
-                    },
-                    TcpEndpoint {
-                        address: IpAddress::Ipv4(peer),
-                        port: 7,
-                    },
-                    7,
-                )
-                .expect("the test connection should allocate a socket");
-            shard.insert_tcp_stream(socket)
-        };
-
-        let (syn_ack, syn_ack_len) = ipv4_tcp_frame(
-            peer,
-            local,
-            TcpHeader {
-                source_port: 7,
-                destination_port: 49_152,
-                sequence: 100,
-                acknowledgement: 8,
-                flags: TcpFlags::SYN.union(TcpFlags::ACK),
-                window_size: u16::MAX,
-            },
-            &[],
-        );
-        state
-            .shard_at(owner)
-            .lock()
-            .stack
-            .receive_frame(&syn_ack[..syn_ack_len], StackInstant::from_nanos(1))
-            .expect("the SYN-ACK should establish the connection");
-
-        // Everything the handshake owed is already queued; the frame
-        // this test is about is the one the write produces.
-        while state.shard_at(owner).lock().stack.take_outbound().is_some() {}
+        let stream = established_tcp_stream(&service);
 
         block_on(service.tcp_write_all_bytes(stream, Bytes::from_static(REQUEST), u64::MAX))
             .expect("a sixteen-byte write into an open window should complete");
@@ -3850,6 +3798,310 @@ mod tests {
             Some(REQUEST),
             "the write must publish its own segment rather than leave it \
              for the packet pump's next wake"
+        );
+    }
+
+    /// A piece the interface refused for want of transmit memory.
+    fn refused(detail: NetworkErrorDetail) -> Result<Bytes, TcpError> {
+        Err(TcpError {
+            kind: TcpErrorKind::Unavailable,
+            detail,
+        })
+    }
+
+    /// A piece refused while the interface replenishes its transmit memory
+    /// is drawn again once the interface says it is ready, and the write
+    /// completes with it.
+    #[test]
+    fn a_write_whose_transmit_memory_is_replenishing_draws_its_piece_again() {
+        const REQUEST: &[u8] = b"0123456789abcdef";
+        let device = RecordingNetworkInterface::new(1);
+        let service = test_network_service_on(device.clone());
+        let stream = established_tcp_stream(&service);
+        let mut draws = 0_usize;
+        let pieces = core::iter::from_fn(|| {
+            draws += 1;
+            match draws {
+                1 | 2 => {
+                    // The interface's memory is back as the refusal is
+                    // answered, which is what ends the park.
+                    device.raise_space_signal();
+                    Some(refused(NetworkErrorDetail::TransmitMemoryReplenishing))
+                }
+                3 => Some(Ok(Bytes::from_static(REQUEST))),
+                _ => None,
+            }
+        });
+
+        block_on(service.tcp_write_all(stream, pieces, u64::MAX))
+            .expect("a piece drawn again after a replenish should be written");
+
+        assert_eq!(
+            draws, 4,
+            "two refusals, the piece, and the end of the write"
+        );
+    }
+
+    /// Exhausted transmit memory holds the write back as a full send queue
+    /// does, so it fails only by its deadline and never as an error of its
+    /// own.
+    #[test]
+    fn a_write_whose_transmit_memory_is_exhausted_fails_only_by_its_deadline() {
+        let service = test_network_service();
+        let stream = established_tcp_stream(&service);
+        let pieces =
+            core::iter::repeat_with(|| refused(NetworkErrorDetail::TransmitMemoryExhausted));
+
+        let error = block_on(service.tcp_write_all(stream, pieces, 0))
+            .expect_err("a write that is never given memory cannot complete");
+
+        assert_eq!(error.kind, TcpErrorKind::Timeout);
+        assert_eq!(error.detail, NetworkErrorDetail::TcpWriteTimeout);
+    }
+
+    /// The deadline covers a replenish as well: memory that is always on
+    /// its way and never arrives ends the write when its time is up.
+    #[test]
+    fn a_write_whose_transmit_memory_keeps_replenishing_fails_by_its_deadline() {
+        let service = test_network_service();
+        let stream = established_tcp_stream(&service);
+        let pieces =
+            core::iter::repeat_with(|| refused(NetworkErrorDetail::TransmitMemoryReplenishing));
+
+        let error = block_on(service.tcp_write_all(stream, pieces, 0))
+            .expect_err("a write that is never given memory cannot complete");
+
+        assert_eq!(error.kind, TcpErrorKind::Timeout);
+        assert_eq!(error.detail, NetworkErrorDetail::TcpWriteTimeout);
+    }
+
+    /// A waker that reports each wake on a channel, so a test that parked
+    /// a future can wait for the one wake it is owed instead of assuming
+    /// another thread ran.
+    struct ChannelWaker(std::sync::mpsc::Sender<()>);
+
+    impl std::task::Wake for ChannelWaker {
+        fn wake(self: std::sync::Arc<Self>) {
+            let _ = self.0.send(());
+        }
+    }
+
+    /// How long a test waits for a wake it is owed. A wake that never
+    /// comes fails the test with this bound instead of hanging it.
+    const OWED_WAKE: Duration = Duration::from_secs(5);
+
+    fn channel_waker() -> (core::task::Waker, std::sync::mpsc::Receiver<()>) {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        (
+            core::task::Waker::from(std::sync::Arc::new(ChannelWaker(sender))),
+            receiver,
+        )
+    }
+
+    /// One draw of a `REQUEST`-sized piece from the interface's transmit
+    /// memory, as a write's iterator makes it.
+    fn draw_request_piece(
+        service: &super::NetworkService<TestCpu, RecordingNetworkInterface>,
+        request: &[u8],
+    ) -> Result<Bytes, TcpError> {
+        service
+            .tcp_transmit_payload(request.len())
+            .map(|mut payload| {
+                payload.copy_from_slice(request);
+                Bytes::from_owner(payload)
+            })
+    }
+
+    /// A write refused `Exhausted` is released by the interface's space
+    /// signal alone: the signal comes from another thread, raises no
+    /// shard arrival and no queue event, and the write completes with its
+    /// deadline still far off.
+    #[test]
+    fn a_write_held_back_by_transmit_memory_is_released_by_the_space_signal() {
+        const REQUEST: &[u8] = b"0123456789abcdef";
+        let device = RecordingNetworkInterface::new(1);
+        let service = test_network_service_on(device.clone());
+        let stream = established_tcp_stream(&service);
+        device.refuse_transmit_payloads(helios_hal::io::IoError::Exhausted);
+        let mut written = false;
+        let pieces = core::iter::from_fn(|| {
+            if written {
+                return None;
+            }
+            let piece = draw_request_piece(&service, REQUEST);
+            written = piece.is_ok();
+            Some(piece)
+        });
+        let mut write = core::pin::pin!(service.tcp_write_all(
+            stream,
+            pieces,
+            Duration::from_secs(60).as_nanos() as u64,
+        ));
+        let (waker, woken) = channel_waker();
+        let mut cx = core::task::Context::from_waker(&waker);
+
+        assert!(
+            write.as_mut().poll(&mut cx).is_pending(),
+            "a write refused for want of transmit memory parks"
+        );
+        std::thread::scope(|scope| {
+            scope.spawn(|| device.release_transmit_space());
+        });
+        woken
+            .recv_timeout(OWED_WAKE)
+            .expect("the space signal must wake the parked write; no arrival or event is coming");
+        assert!(
+            matches!(
+                write.as_mut().poll(&mut cx),
+                core::task::Poll::Ready(Ok(()))
+            ),
+            "the write must draw its piece again and complete"
+        );
+    }
+
+    /// The space signal is armed before the piece is asked for again: one
+    /// raised after the write declared its wait, while that second ask is
+    /// still being answered, ends the park before it begins.
+    #[test]
+    fn a_space_signal_raised_after_the_wait_was_declared_ends_the_park() {
+        const REQUEST: &[u8] = b"0123456789abcdef";
+        let device = RecordingNetworkInterface::new(1);
+        let service = test_network_service_on(device.clone());
+        let stream = established_tcp_stream(&service);
+        device.refuse_transmit_payloads(helios_hal::io::IoError::Exhausted);
+        let mut draws = 0_usize;
+        let pieces = core::iter::from_fn(|| {
+            draws += 1;
+            match draws {
+                // The first refusal.
+                1 => Some(draw_request_piece(&service, REQUEST)),
+                // The ask that tests the declared wait: refused, and the
+                // memory comes back while it is being answered.
+                2 => {
+                    let refused = draw_request_piece(&service, REQUEST);
+                    device.release_transmit_space();
+                    Some(refused)
+                }
+                3 => Some(draw_request_piece(&service, REQUEST)),
+                _ => None,
+            }
+        });
+        let mut write = core::pin::pin!(service.tcp_write_all(
+            stream,
+            pieces,
+            Duration::from_secs(60).as_nanos() as u64,
+        ));
+        let (waker, _woken) = channel_waker();
+        let mut cx = core::task::Context::from_waker(&waker);
+
+        assert!(
+            matches!(
+                write.as_mut().poll(&mut cx),
+                core::task::Poll::Ready(Ok(()))
+            ),
+            "a signal raised between the declaration and the park must not be slept through"
+        );
+    }
+
+    /// A reset ends a write held back for transmit memory with the
+    /// connection's error, not with the write's timeout.
+    #[test]
+    fn a_reset_ends_a_write_held_back_for_transmit_memory() {
+        const REQUEST: &[u8] = b"0123456789abcdef";
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let device = RecordingNetworkInterface::new(1);
+        let service = test_network_service_on(device.clone());
+        let state = &service.inner.state;
+        let owner = super::DEFAULT_SHARD_IDX;
+        let stream = established_tcp_stream(&service);
+        device.refuse_transmit_payloads(helios_hal::io::IoError::Exhausted);
+        let pieces = core::iter::repeat_with(|| draw_request_piece(&service, REQUEST));
+        let mut write = core::pin::pin!(service.tcp_write_all(
+            stream,
+            pieces,
+            Duration::from_secs(60).as_nanos() as u64,
+        ));
+        let (waker, woken) = channel_waker();
+        let mut cx = core::task::Context::from_waker(&waker);
+        assert!(
+            write.as_mut().poll(&mut cx).is_pending(),
+            "a write refused for want of transmit memory parks"
+        );
+
+        let (reset, reset_len) = ipv4_tcp_frame(
+            peer,
+            local,
+            TcpHeader {
+                source_port: 7,
+                destination_port: 49_152,
+                sequence: 101,
+                acknowledgement: 8,
+                flags: TcpFlags::RST.union(TcpFlags::ACK),
+                window_size: 0,
+            },
+            &[],
+        );
+        state
+            .shard_at(owner)
+            .lock()
+            .stack
+            .receive_frame(&reset[..reset_len], StackInstant::from_nanos(2))
+            .expect("an in-window RST should be accepted");
+        state.arrival_for(state.shard_wait(owner).target).signal();
+        woken
+            .recv_timeout(OWED_WAKE)
+            .expect("the shard's arrival must wake the parked write");
+
+        let core::task::Poll::Ready(Err(error)) = write.as_mut().poll(&mut cx) else {
+            panic!("a write on a reset connection must end, not park again");
+        };
+        assert_eq!(error.kind, TcpErrorKind::ConnectionReset);
+        assert_eq!(error.detail, NetworkErrorDetail::TcpConnectionReset);
+    }
+
+    /// Writability includes the interface's transmit memory: a stream with
+    /// send room is not writable while the memory is short, and a
+    /// `tcp_write_ready` parked on it resolves on the space signal alone.
+    #[test]
+    fn writability_waits_for_transmit_memory() {
+        let device = RecordingNetworkInterface::new(1);
+        let service = test_network_service_on(device.clone());
+        let stream = established_tcp_stream(&service);
+        assert!(
+            matches!(service.tcp_send_room(stream), Ok(TcpWriteProgress::Room(_))),
+            "an established stream with an empty send queue has room"
+        );
+
+        device.refuse_transmit_payloads(helios_hal::io::IoError::Exhausted);
+        assert!(
+            matches!(service.tcp_send_room(stream), Ok(TcpWriteProgress::Pending)),
+            "room the interface cannot back with memory is not writable"
+        );
+        let mut ready = core::pin::pin!(service.tcp_write_ready(stream));
+        let (waker, woken) = channel_waker();
+        let mut cx = core::task::Context::from_waker(&waker);
+        assert!(
+            ready.as_mut().poll(&mut cx).is_pending(),
+            "the writability wait parks while the memory is short"
+        );
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| device.release_transmit_space());
+        });
+        woken
+            .recv_timeout(OWED_WAKE)
+            .expect("the space signal must wake the writability wait");
+        assert!(
+            matches!(
+                ready.as_mut().poll(&mut cx),
+                core::task::Poll::Ready(Ok(()))
+            ),
+            "the wait resolves once the memory is back"
+        );
+        assert!(
+            matches!(service.tcp_send_room(stream), Ok(TcpWriteProgress::Room(_))),
+            "the room is reported again after the release"
         );
     }
 
@@ -4034,6 +4286,72 @@ mod tests {
             block_on(poll_once(parked.as_mut())).is_none(),
             "a read that was never blocking the pump must not wake it"
         );
+    }
+
+    /// An established TCP connection to a reachable neighbour on the
+    /// default shard, with everything the handshake owed already taken
+    /// off its outbound queue.
+    fn established_tcp_stream(
+        service: &super::NetworkService<TestCpu, RecordingNetworkInterface>,
+    ) -> TcpStreamId {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let state = &service.inner.state;
+        let owner = super::DEFAULT_SHARD_IDX;
+
+        let stream = {
+            let mut shard = state.shard_at(owner).lock();
+            shard
+                .stack
+                .add_ipv4_address(Ipv4Cidr::new(local, 24))
+                .expect("test address should be accepted");
+            shard.stack.learn_neighbor(NeighborEntry {
+                ip: IpAddress::Ipv4(peer),
+                mac: PEER_MAC,
+                state: NeighborState::Reachable,
+                updated_at: StackInstant::from_nanos(0),
+            });
+            service.inner.control.publish_from_shard(&shard);
+            let socket = shard
+                .stack
+                .open_tcp_connect(
+                    TcpEndpoint {
+                        address: IpAddress::Ipv4(local),
+                        port: 49_152,
+                    },
+                    TcpEndpoint {
+                        address: IpAddress::Ipv4(peer),
+                        port: 7,
+                    },
+                    7,
+                )
+                .expect("the test connection should allocate a socket");
+            shard.insert_tcp_stream(socket)
+        };
+
+        let (syn_ack, syn_ack_len) = ipv4_tcp_frame(
+            peer,
+            local,
+            TcpHeader {
+                source_port: 7,
+                destination_port: 49_152,
+                sequence: 100,
+                acknowledgement: 8,
+                flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                window_size: u16::MAX,
+            },
+            &[],
+        );
+        state
+            .shard_at(owner)
+            .lock()
+            .stack
+            .receive_frame(&syn_ack[..syn_ack_len], StackInstant::from_nanos(1))
+            .expect("the SYN-ACK should establish the connection");
+
+        // Everything the handshake owed is already queued.
+        while state.shard_at(owner).lock().stack.take_outbound().is_some() {}
+        stream
     }
 
     /// A service over an interface that reports events and moves no

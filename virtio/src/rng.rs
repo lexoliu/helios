@@ -4,10 +4,10 @@ use helios_hal::io::{IoError, IoResult};
 
 use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate, renegotiate};
 use crate::inflight::{
-    InFlight, await_completion, drain_to_idle, reinitialize_requests, submit_chain,
+    InFlight, await_completion, drain_to_idle, reinitialize_requests, submit_control,
 };
 use crate::notify::Notify;
-use crate::queue::VirtQueue;
+use crate::queue::{ControlSlots, Part, TransportBuffer, VirtQueue, control_slots};
 use crate::resume::{DeviceReset, QuiesceError, ReinitError, conclude, driver_ok};
 use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
 
@@ -15,11 +15,18 @@ const REQUEST_QUEUE_INDEX: u16 = 0;
 const REQUEST_QUEUE_SIZE: u16 = 16;
 /// The entropy queue only ever carries a single writable buffer.
 const REQUEST_CHAIN_LIMIT: u16 = 1;
+/// Entropy one request asks for: the size of the response area of a
+/// control slot. A fill larger than this takes several requests, which it
+/// already does whenever the device answers with fewer bytes than asked.
+/// The kernel's reseed asks for 64 bytes.
+const CHUNK_BYTES: usize = 256;
 
 pub struct VirtioRngDevice<T: VirtioTransport> {
     transport: T,
     queue: Mutex<VirtQueue<T>>,
     inflight: InFlight<{ REQUEST_QUEUE_SIZE as usize }>,
+    /// The memory the device writes entropy into, one slot per descriptor.
+    slots: ControlSlots<TransportBuffer<T>>,
     interrupts: Notify,
     features: NegotiatedFeatures,
 }
@@ -46,6 +53,7 @@ impl<T: VirtioTransport> VirtioRngDevice<T> {
             REQUEST_CHAIN_LIMIT,
             features,
         )?;
+        let slots = control_slots(&transport, &queue, 0, CHUNK_BYTES)?;
         transport.set_status(
             DeviceStatus::ACKNOWLEDGE
                 | DeviceStatus::DRIVER
@@ -57,6 +65,7 @@ impl<T: VirtioTransport> VirtioRngDevice<T> {
             transport,
             queue: Mutex::new(queue),
             inflight: InFlight::new(),
+            slots,
             interrupts: Notify::new(),
             features,
         })
@@ -120,24 +129,22 @@ impl<T: VirtioTransport> VirtioRngDevice<T> {
     }
 
     async fn fill_chunk(&self, buffer: &mut [u8]) -> IoResult<usize> {
-        let capacity = buffer.len();
-        let token = submit_chain(
+        let capacity = buffer.len().min(CHUNK_BYTES);
+        let ticket = submit_control(
             &self.inflight,
             &self.queue,
             &self.transport,
-            &[],
-            &mut [buffer],
+            &self.slots,
+            &[Part::Response(capacity)],
         )
         .await?;
 
-        let len = await_completion(&self.inflight, &self.queue, token, || {
-            self.interrupts.notified()
-        })
-        .await?;
-        let len = usize::try_from(len).map_err(|_| IoError::DeviceFault)?;
+        let reply = await_completion(&self.queue, ticket, || self.interrupts.notified()).await?;
+        let len = usize::try_from(reply.written()).map_err(|_| IoError::DeviceFault)?;
         if len > capacity {
             return Err(IoError::DeviceFault);
         }
+        buffer[..len].copy_from_slice(&reply.response()[..len]);
         Ok(len)
     }
 }
@@ -152,13 +159,15 @@ impl<T: VirtioTransport> Drop for VirtioRngDevice<T> {
 mod tests {
     use super::{DeviceReset, DeviceType, IoError, QuiesceError, ReinitError, VirtioRngDevice};
     use crate::features::RenegotiateError;
-    use crate::testing::{FakeTransport, FakeTransportConfig};
+    use crate::testing::{ConfinedTransport, FakeTransport, FakeTransportConfig};
     use crate::transport::VirtioFeatures;
     use core::pin::pin;
     use futures_lite::future::{block_on, poll_once};
 
-    fn device() -> VirtioRngDevice<FakeTransport> {
-        VirtioRngDevice::new(FakeTransport::new(FakeTransportConfig {
+    /// A device whose DMA reaches only memory its own pool handed out,
+    /// so a request that names a buffer in its future fails its test.
+    fn device() -> VirtioRngDevice<ConfinedTransport> {
+        VirtioRngDevice::new(FakeTransport::confined(FakeTransportConfig {
             device_type: DeviceType::Entropy,
             offered_features: VirtioFeatures::VERSION_1.bits(),
             queue_size: 8,
@@ -170,7 +179,7 @@ mod tests {
 
     /// Plays the device: publishes a used entry for `token` and raises
     /// the device's interrupt.
-    fn complete(device: &VirtioRngDevice<FakeTransport>, token: u16, len: u32) {
+    fn complete(device: &VirtioRngDevice<ConfinedTransport>, token: u16, len: u32) {
         device
             .queue
             .try_lock()
@@ -263,10 +272,122 @@ mod tests {
         );
     }
 
+    /// Plays the device answering `token` with `bytes`: writes them where
+    /// the chain's writable descriptors point, then completes it.
+    fn answer(device: &VirtioRngDevice<ConfinedTransport>, token: u16, bytes: &[u8]) {
+        let written = device
+            .queue
+            .try_lock()
+            .expect("a parked driver does not hold the queue lock")
+            .device_respond(token, bytes);
+        complete(device, token, written);
+    }
+
+    #[test]
+    fn the_device_writes_into_a_slot_and_the_driver_copies_it_out() {
+        let device = device();
+        let mut buffer = [0_u8; 16];
+        let address = buffer.as_ptr() as u64;
+        {
+            let mut fill = pin!(device.fill(&mut buffer));
+
+            assert!(block_on(poll_once(fill.as_mut())).is_none());
+            let chain = device
+                .queue
+                .try_lock()
+                .expect("a parked driver does not hold the queue lock")
+                .device_chain(0);
+            assert_eq!(chain.len(), 1);
+            assert_ne!(
+                chain[0].0, address,
+                "the descriptor names the slot, not the caller's buffer"
+            );
+
+            answer(&device, 0, &[0x5a; 16]);
+            assert_eq!(block_on(poll_once(fill.as_mut())), Some(Ok(())));
+        }
+        assert_eq!(buffer, [0x5a; 16]);
+    }
+
+    #[test]
+    fn a_dropped_fill_keeps_its_slot_until_the_device_completes_it() {
+        let device = device();
+        let mut abandoned = [0_u8; 16];
+        {
+            let mut fill = pin!(device.fill(&mut abandoned));
+            assert!(block_on(poll_once(fill.as_mut())).is_none());
+        }
+        let first_slot = device
+            .queue
+            .try_lock()
+            .expect("nothing holds the queue lock")
+            .device_chain(0)[0]
+            .0;
+        assert!(
+            !device.inflight.is_idle(0),
+            "the chain is still with the device, so its identifier and slot stay held"
+        );
+
+        // A later request cannot be given the slot the device may still
+        // write into.
+        let mut second = [0_u8; 16];
+        {
+            let mut fill = pin!(device.fill(&mut second));
+            assert!(block_on(poll_once(fill.as_mut())).is_none());
+            let second_slot = device
+                .queue
+                .try_lock()
+                .expect("a parked driver does not hold the queue lock")
+                .device_chain(1)[0]
+                .0;
+            assert_ne!(first_slot, second_slot);
+
+            // The dropped request's late answer lands in its own slot and
+            // nowhere else, and frees its identifier.
+            answer(&device, 0, &[0xaa; 16]);
+            assert!(
+                block_on(poll_once(fill.as_mut())).is_none(),
+                "the late answer is not the second request's"
+            );
+            assert!(device.inflight.is_idle(0));
+
+            answer(&device, 1, &[0x55; 16]);
+            assert_eq!(block_on(poll_once(fill.as_mut())), Some(Ok(())));
+        }
+        assert_eq!(
+            abandoned, [0; 16],
+            "the dropped caller's buffer is never written"
+        );
+        assert_eq!(second, [0x55; 16]);
+    }
+
+    #[test]
+    fn a_request_larger_than_a_slot_is_split_into_several() {
+        let device = device();
+        let mut buffer = [0_u8; super::CHUNK_BYTES + 8];
+        let mut fill = pin!(device.fill(&mut buffer));
+
+        assert!(block_on(poll_once(fill.as_mut())).is_none());
+        let chain = device
+            .queue
+            .try_lock()
+            .expect("a parked driver does not hold the queue lock")
+            .device_chain(0);
+        assert_eq!(
+            usize::try_from(chain[0].1).expect("a length"),
+            super::CHUNK_BYTES,
+            "one request asks for what a slot holds"
+        );
+        answer(&device, 0, &[1; super::CHUNK_BYTES]);
+        assert!(block_on(poll_once(fill.as_mut())).is_none());
+        answer(&device, 1, &[2; 8]);
+        assert_eq!(block_on(poll_once(fill.as_mut())), Some(Ok(())));
+    }
+
     /// A device that offers a ring feature besides the mandatory one, so
     /// a test can withdraw it.
-    fn device_with_event_idx() -> VirtioRngDevice<FakeTransport> {
-        VirtioRngDevice::new(FakeTransport::new(FakeTransportConfig {
+    fn device_with_event_idx() -> VirtioRngDevice<ConfinedTransport> {
+        VirtioRngDevice::new(FakeTransport::confined(FakeTransportConfig {
             device_type: DeviceType::Entropy,
             offered_features: VirtioFeatures::VERSION_1.bits()
                 | VirtioFeatures::RING_EVENT_IDX.bits(),

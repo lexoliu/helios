@@ -16,6 +16,6 @@ pub use types::{
     HostFsError, HostFsErrorKind, HostMetadata, HostShareRestore, Ipv4Address, NetworkErrorDetail,
     NetworkHandle, NetworkIpAddress, NetworkPacketPump, ObjectIdentity, PingError, PingErrorKind,
     PingReply, RegisteredTcpReadBuffer, SocketReadiness, TcpAccepted, TcpError, TcpErrorKind,
-    TcpListener, TcpReadProgress, TcpWriteProgress, UdpBinding, UdpDatagram, UdpError,
-    UdpErrorKind,
+    TcpListener, TcpPayloadPieces, TcpReadProgress, TcpWriteProgress, UdpBinding, UdpDatagram,
+    UdpError, UdpErrorKind,
 };

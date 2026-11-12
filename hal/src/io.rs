@@ -29,6 +29,12 @@ pub enum IoError {
     InvalidDeviceConfig(&'static str),
     #[error("device fault")]
     DeviceFault,
+    /// The device's memory has none free now and more is on its way.
+    #[error("the device's memory is being replenished")]
+    Replenishing,
+    /// The device's memory cannot grow; this is not a device failure.
+    #[error("the device's memory is exhausted")]
+    Exhausted,
 }
 
 pub type IoResult<T> = Result<T, IoError>;

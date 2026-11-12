@@ -122,9 +122,11 @@ fn a_swapped_page_comes_back_with_its_bytes_and_its_flags() {
     );
     assert_eq!(address_space.swapped_token(range.start), Some(token(1)));
 
-    let stored = block_on(backend.swap_out(&page)).expect("backend swap out");
-    let mut restored = vec![0_u8; PAGE];
-    block_on(backend.swap_in(stored, &mut restored)).expect("backend swap in");
+    let mut staged = backend.buffer(PAGE).expect("staging buffer");
+    staged.copy_from_slice(&page);
+    let (stored, _staged) = block_on(backend.swap_out(staged)).expect("backend swap out");
+    let restored = backend.buffer(PAGE).expect("staging buffer");
+    let ((), restored) = block_on(backend.swap_in(stored, restored)).expect("backend swap in");
 
     let recovered = address_space
         .swap_in_page(range.start, &restored)

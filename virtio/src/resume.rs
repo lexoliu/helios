@@ -52,13 +52,16 @@
 //!   polled again. It takes each queue lock with `try_lock` and holds it
 //!   only while the queue is re-programmed.
 
-use alloc::vec;
 use alloc::vec::Vec;
+use core::alloc::Layout;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use async_lock::Mutex as AsyncMutex;
+use helios_hal::dma::DmaMemory;
 use helios_hal::io::IoError;
+use helios_hal::iommu::DmaAccess;
 
+use crate::bus::DeviceBus;
 use crate::features::RenegotiateError;
 use crate::queue::VirtQueue;
 use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
@@ -241,11 +244,17 @@ pub(crate) enum PolledError {
 /// its used ring, for a machine that is frozen: no interrupt will be
 /// delivered and no task will run, so nothing else could complete it.
 ///
-/// The buffers are heap copies made here, because the device writes the
-/// answer into them. When `expired` ends the wait the command is still
-/// the device's, so the buffers are leaked rather than freed under a
-/// device that may yet write to them. Returns the answer and the number
-/// of bytes the device wrote.
+/// The buffers are copies made here in the device's own memory, because
+/// the device reads the command from them and writes the answer into
+/// them. They are not the control slots of the queue's identifiers: a
+/// quiesce may have reaped a completion its waiter has not collected yet,
+/// and the slot of that identifier still holds the waiter's reply when the
+/// ring hands the identifier out again. When `expired` ends the wait the
+/// command is still the device's, so the buffers are leaked rather than
+/// freed under a device that may yet write to them. Device memory that
+/// refuses the copies fails the command: the machine is frozen, so
+/// nothing would return memory to wait for. Returns the answer and the
+/// number of bytes the device wrote.
 pub(crate) fn polled_command<T: VirtioTransport>(
     transport: &T,
     queue: &AsyncMutex<VirtQueue<T>>,
@@ -253,20 +262,30 @@ pub(crate) fn polled_command<T: VirtioTransport>(
     response_bytes: usize,
     expired: &mut impl FnMut() -> bool,
 ) -> Result<(Vec<u8>, u32), PolledError> {
-    let request = request.to_vec();
-    let mut response = vec![0_u8; response_bytes];
+    let dma = transport.bus().dma();
+    let copy = |bytes: usize, access: DmaAccess| {
+        let layout = Layout::array::<u8>(bytes).map_err(|_| IoError::OutOfBounds)?;
+        dma.allocate(layout, access).map_err(IoError::from)
+    };
+    let mut command = copy(request.len(), DmaAccess::READ).map_err(PolledError::Queue)?;
+    command.as_mut()[..request.len()].copy_from_slice(request);
+    // A queue that carries no reply (the gpu cursor queue) takes a chain
+    // with no writable buffer.
+    let mut response = if response_bytes == 0 {
+        None
+    } else {
+        Some(copy(response_bytes, DmaAccess::WRITE).map_err(PolledError::Queue)?)
+    };
     let token = {
         let mut ring = queue.try_lock().ok_or(PolledError::Busy)?;
-        // A queue that carries no reply (the gpu cursor queue) takes a
-        // chain with no writable buffer.
-        let token = if response.is_empty() {
-            ring.submit(transport, &[request.as_slice()], &mut [])
-        } else {
-            ring.submit(
+        let inputs = [&command.as_ref()[..request.len()]];
+        let token = match response.as_mut() {
+            None => ring.submit(transport, &inputs, &mut []),
+            Some(response) => ring.submit(
                 transport,
-                &[request.as_slice()],
-                &mut [response.as_mut_slice()],
-            )
+                &inputs,
+                &mut [&mut response.as_mut()[..response_bytes]],
+            ),
         }
         .map_err(PolledError::Queue)?;
         ring.notify(transport);
@@ -290,12 +309,12 @@ pub(crate) fn polled_command<T: VirtioTransport>(
             // command may still be its own: the buffers are leaked as on
             // expiry.
             Some(_) => {
-                core::mem::forget(request);
+                core::mem::forget(command);
                 core::mem::forget(response);
                 return Err(PolledError::Queue(IoError::DeviceFault));
             }
             None if expired() => {
-                core::mem::forget(request);
+                core::mem::forget(command);
                 core::mem::forget(response);
                 return Err(PolledError::Expired);
             }
@@ -303,7 +322,10 @@ pub(crate) fn polled_command<T: VirtioTransport>(
         }
     };
     transport.ack_interrupt();
-    Ok((response, written))
+    let answer = response.as_ref().map_or_else(Vec::new, |response| {
+        response.as_ref()[..response_bytes].to_vec()
+    });
+    Ok((answer, written))
 }
 
 /// Tells a re-handshaken device that the driver is ready, once every

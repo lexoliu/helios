@@ -4517,10 +4517,6 @@ where
         }
     }
 
-    pub fn tcp_send(&mut self, socket: SocketId, bytes: &[u8]) -> Result<usize, StackError> {
-        Ok(self.tcp_socket_mut(socket)?.queue_send(bytes))
-    }
-
     pub fn tcp_send_bytes(
         &mut self,
         socket: SocketId,
@@ -11273,7 +11269,7 @@ mod tests {
         );
         let payload = vec![0x5a_u8; TCP_SCATTER_MIN_PAYLOAD_BYTES];
         stack
-            .tcp_send(socket, &payload)
+            .tcp_send_bytes(socket, &mut Bytes::copy_from_slice(&payload))
             .expect("bulk TCP send should queue");
         stack
             .drive_tcp(StackInstant::from_nanos(2))
@@ -11303,7 +11299,7 @@ mod tests {
         );
         let payload = vec![0x5a_u8; TCP_SCATTER_MIN_PAYLOAD_BYTES];
         stack
-            .tcp_send(socket, &payload)
+            .tcp_send_bytes(socket, &mut Bytes::copy_from_slice(&payload))
             .expect("bulk TCP send should queue");
         stack
             .drive_tcp(StackInstant::from_nanos(2))
@@ -11331,7 +11327,7 @@ mod tests {
         );
         let payload: Vec<u8> = (0..40 * 1024).map(|index| index as u8).collect();
         let queued = stack
-            .tcp_send(socket, &payload)
+            .tcp_send_bytes(socket, &mut Bytes::copy_from_slice(&payload))
             .expect("bulk TCP send should queue");
         assert_eq!(queued, payload.len());
         stack
@@ -11388,7 +11384,7 @@ mod tests {
         );
         let payload: Vec<u8> = (0..40 * 1024).map(|index| index as u8).collect();
         stack
-            .tcp_send(socket, &payload)
+            .tcp_send_bytes(socket, &mut Bytes::copy_from_slice(&payload))
             .expect("bulk TCP send should queue");
         stack
             .drive_tcp(StackInstant::from_nanos(2))
@@ -11424,7 +11420,7 @@ mod tests {
         );
         let payload: Vec<u8> = (0..40 * 1024).map(|index| index as u8).collect();
         stack
-            .tcp_send(socket, &payload)
+            .tcp_send_bytes(socket, &mut Bytes::copy_from_slice(&payload))
             .expect("bulk TCP send should queue");
         stack
             .drive_tcp(StackInstant::from_nanos(2))
@@ -14160,7 +14156,7 @@ mod tests {
         );
         assert_eq!(
             stack
-                .tcp_send(accepted, b"hello")
+                .tcp_send_bytes(accepted, &mut Bytes::from_static(b"hello"))
                 .expect("the accepted connection should still send"),
             5
         );
@@ -14804,7 +14800,12 @@ mod tests {
                 StackInstant::from_nanos(2),
             )
             .expect("payload should request an ACK");
-        assert_eq!(stack.tcp_send(socket, b"w").unwrap(), 1);
+        assert_eq!(
+            stack
+                .tcp_send_bytes(socket, &mut Bytes::from_static(b"w"))
+                .unwrap(),
+            1
+        );
 
         stack
             .drive_tcp(StackInstant::from_nanos(3))
@@ -14879,7 +14880,10 @@ mod tests {
             .take_outbound()
             .expect("handshake ACK frame should be queued");
         // The error has to quote a segment the connection has in flight.
-        assert_eq!(stack.tcp_send(socket, b"x"), Ok(1));
+        assert_eq!(
+            stack.tcp_send_bytes(socket, &mut Bytes::from_static(b"x")),
+            Ok(1)
+        );
         stack
             .drive_tcp(StackInstant::from_nanos(2))
             .expect("first data should be queued");
@@ -14910,7 +14914,10 @@ mod tests {
         while stack.take_outbound().is_some() {}
 
         let payload = [0u8; 1024];
-        assert_eq!(stack.tcp_send(socket, &payload), Ok(payload.len()));
+        assert_eq!(
+            stack.tcp_send_bytes(socket, &mut Bytes::copy_from_slice(&payload)),
+            Ok(payload.len())
+        );
         stack
             .drive_tcp(StackInstant::from_nanos(4))
             .expect("PMTU-limited TCP data should be queued");
@@ -14989,7 +14996,10 @@ mod tests {
             .expect("handshake ACK frame should be queued");
 
         let payload = [0u8; 1024];
-        assert_eq!(stack.tcp_send(socket, &payload), Ok(payload.len()));
+        assert_eq!(
+            stack.tcp_send_bytes(socket, &mut Bytes::copy_from_slice(&payload)),
+            Ok(payload.len())
+        );
         stack
             .drive_tcp(StackInstant::from_nanos(2))
             .expect("full-size TCP data should be queued");

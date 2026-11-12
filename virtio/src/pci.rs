@@ -27,7 +27,9 @@ use pci_types::{Bar, CommandRegister, ConfigRegionAccess, EndpointHeader, PciAdd
 
 use crate::balloon::VirtioBalloonDevice;
 use crate::block::{QueueAffinity, VirtioBlockDevice, VirtioBlockResource};
-use crate::bus::{DeviceBus, DmaPool};
+use helios_hal::dma::DmaMemory;
+
+use crate::bus::DeviceBus;
 use crate::gpu::{VirtioGpuDevice, report_gpu_online};
 use crate::iommu::VirtioIommuDevice;
 use crate::net::{QueuePairBudget, VirtioNetDevice};
@@ -279,12 +281,12 @@ unsafe impl Sync for BarWindow {}
 
 /// Device-side view a virtio driver gets from a PCI function: the
 /// device-specific configuration window plus the DMA pool.
-pub struct VirtioPciBus<P: DmaPool> {
+pub struct VirtioPciBus<P: DmaMemory> {
     device_config: Option<BarWindow>,
     dma: P,
 }
 
-impl<P: DmaPool> VirtioPciBus<P> {
+impl<P: DmaMemory> VirtioPciBus<P> {
     fn config(&self) -> &BarWindow {
         self.device_config.as_ref().unwrap_or_else(|| {
             panic!("virtio-pci function exposes no device configuration capability")
@@ -292,7 +294,7 @@ impl<P: DmaPool> VirtioPciBus<P> {
     }
 }
 
-impl<P: DmaPool> DeviceBus for VirtioPciBus<P> {
+impl<P: DmaMemory> DeviceBus for VirtioPciBus<P> {
     type DmaPool = P;
 
     fn read_u8(&self, offset: usize) -> u8 {
@@ -321,7 +323,7 @@ impl<P: DmaPool> DeviceBus for VirtioPciBus<P> {
 }
 
 /// Modern virtio-PCI transport over one PCI function.
-pub struct VirtioPciTransport<P: DmaPool> {
+pub struct VirtioPciTransport<P: DmaMemory> {
     bus: VirtioPciBus<P>,
     common: BarWindow,
     notify: BarWindow,
@@ -404,7 +406,7 @@ struct VirtioCapabilities {
     shared_memory: ArrayVec<SharedMemoryCapability, MAX_SHARED_MEMORY_REGIONS>,
 }
 
-impl<P: DmaPool> VirtioPciTransport<P> {
+impl<P: DmaMemory> VirtioPciTransport<P> {
     /// Brings up a modern virtio-PCI function.
     ///
     /// `msix_vector` binds the device configuration and every virtqueue
@@ -536,7 +538,7 @@ impl<P: DmaPool> VirtioPciTransport<P> {
     }
 }
 
-impl<P: DmaPool> VirtioTransport for VirtioPciTransport<P> {
+impl<P: DmaMemory> VirtioTransport for VirtioPciTransport<P> {
     type Bus = VirtioPciBus<P>;
 
     fn bus(&self) -> &Self::Bus {
@@ -892,7 +894,7 @@ pub fn net_from_pci<A, M, P>(
 where
     A: ConfigRegionAccess,
     M: PciMmioMapper,
-    P: DmaPool,
+    P: DmaMemory,
 {
     let transport = VirtioPciTransport::new(access, address, mapper, dma, msix)?;
     VirtioNetDevice::new(transport, pair_budget)
@@ -909,7 +911,7 @@ pub fn p9_from_pci<A, M, P>(
 where
     A: ConfigRegionAccess,
     M: PciMmioMapper,
-    P: DmaPool,
+    P: DmaMemory,
 {
     let transport = VirtioPciTransport::new(access, address, mapper, dma, msix)?;
     Virtio9pDevice::new(transport)
@@ -928,7 +930,7 @@ pub fn block_from_pci<A, M, P, C, B>(
 where
     A: ConfigRegionAccess,
     M: PciMmioMapper,
-    P: DmaPool,
+    P: DmaMemory,
     C: QueueAffinity,
     B: BlockBuffer,
 {
@@ -951,7 +953,7 @@ pub fn iommu_from_pci<A, M, P>(
 where
     A: ConfigRegionAccess,
     M: PciMmioMapper,
-    P: DmaPool,
+    P: DmaMemory,
 {
     let transport = VirtioPciTransport::new(access, address, mapper, dma, msix)?;
     VirtioIommuDevice::new(transport)
@@ -968,7 +970,7 @@ pub fn rng_from_pci<A, M, P>(
 where
     A: ConfigRegionAccess,
     M: PciMmioMapper,
-    P: DmaPool,
+    P: DmaMemory,
 {
     let transport = VirtioPciTransport::new(access, address, mapper, dma, msix)?;
     VirtioRngDevice::new(transport)
@@ -985,7 +987,7 @@ pub fn balloon_from_pci<A, M, P>(
 where
     A: ConfigRegionAccess,
     M: PciMmioMapper,
-    P: DmaPool,
+    P: DmaMemory,
 {
     let transport = VirtioPciTransport::new(access, address, mapper, dma, msix)?;
     VirtioBalloonDevice::new(transport)
@@ -1005,7 +1007,7 @@ pub fn gpu_from_pci<A, M, P>(
 where
     A: ConfigRegionAccess,
     M: PciMmioMapper,
-    P: DmaPool,
+    P: DmaMemory,
 {
     let transport = VirtioPciTransport::new(access, address, mapper, dma, msix)?;
     let device = VirtioGpuDevice::new(transport)?;
@@ -1027,7 +1029,7 @@ pub fn input_from_pci<A, M, P>(
 where
     A: ConfigRegionAccess,
     M: PciMmioMapper,
-    P: DmaPool,
+    P: DmaMemory,
 {
     let transport = VirtioPciTransport::new(access, address, mapper, dma, msix)?;
     let device = crate::input::VirtioInputDevice::new(transport)?;
@@ -1049,7 +1051,7 @@ pub fn snd_from_pci<A, M, P>(
 where
     A: ConfigRegionAccess,
     M: PciMmioMapper,
-    P: DmaPool,
+    P: DmaMemory,
 {
     let transport = VirtioPciTransport::new(access, address, mapper, dma, msix)?;
     let device = crate::snd::VirtioSndDevice::new(transport)?;
@@ -1068,7 +1070,7 @@ pub fn vsock_from_pci<A, M, P>(
 where
     A: ConfigRegionAccess,
     M: PciMmioMapper,
-    P: DmaPool,
+    P: DmaMemory,
 {
     let transport = VirtioPciTransport::new(access, address, mapper, dma, msix)?;
     crate::vsock::VirtioVsockDevice::new(transport)

@@ -544,6 +544,7 @@ impl ComponentNetworkService for BenchNetworkService {
     type TcpStream = u64;
     type TcpListener = u64;
     type UdpSocket = u64;
+    type TxPayload = Vec<u8>;
 
     // The in-memory doubles model an always-ready loopback peer.
     fn tcp_readiness(
@@ -684,12 +685,19 @@ impl ComponentNetworkService for BenchNetworkService {
         Err(bench_tcp_error())
     }
 
-    async fn tcp_write_all(
-        &self,
+    fn tcp_transmit_payload(&self, bytes: usize) -> Result<Self::TxPayload, TcpError> {
+        Ok(alloc::vec![0; bytes])
+    }
+
+    async fn tcp_write_all<'a, Pieces>(
+        &'a self,
         _stream: Self::TcpStream,
-        _bytes: &[u8],
+        _pieces: Pieces,
         _timeout_nanos: u64,
-    ) -> Result<(), TcpError> {
+    ) -> Result<(), TcpError>
+    where
+        Pieces: Iterator<Item = Result<Bytes, TcpError>> + Send + 'a,
+    {
         Ok(())
     }
 

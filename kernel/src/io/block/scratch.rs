@@ -42,8 +42,6 @@ pub enum BlockSelfCheckError {
         capacity_blocks: usize,
         block_bytes: usize,
     },
-    #[error("a {bytes}-byte self check does not fit one block request buffer")]
-    Buffer { bytes: usize },
     #[error("scratch disk write failed: {0}")]
     Write(IoError),
     #[error("scratch disk cache flush failed: {0}")]
@@ -165,7 +163,7 @@ where
             return None;
         }
     };
-    Some(install_swap(
+    match install_swap(
         spawner,
         timer,
         cpu,
@@ -173,7 +171,18 @@ where
         backend,
         backend_name,
         (swap_blocks * block_bytes) as u64,
-    ))
+    ) {
+        Ok(handle) => Some(handle),
+        Err(error) => {
+            tracing::warn!(
+                target: "helios_kernel::swap",
+                %error,
+                "scratch disk could not supply swap's staging page"
+            );
+            disable_swap(SwapDisabled::NoSwapDevice);
+            None
+        }
+    }
 }
 
 /// The disk the platform named [`super::SCRATCH_DISK_SERIAL`], typed as
@@ -224,14 +233,6 @@ where
             .saturating_sub(self.self_check_blocks())
     }
 
-    /// A zeroed request buffer for `bytes` of the self-check.
-    fn check_buffer(bytes: usize) -> Result<Device::Buffer, BlockSelfCheckError>
-    where
-        Device::Buffer: OwnedBlockBuffer,
-    {
-        Device::Buffer::zeroed(bytes).ok_or(BlockSelfCheckError::Buffer { bytes })
-    }
-
     /// Proves the disk round-trips before anything depends on it.
     ///
     /// The pattern is random so a device that answers with a stale or
@@ -259,19 +260,18 @@ where
         let pattern = &mut pattern[..bytes];
         root.fill(pattern);
 
-        let mut written = Self::check_buffer(bytes)?;
-        written.copy_from(pattern);
+        let mut written = Device::Buffer::zeroed(bytes);
+        written.as_mut().copy_from_slice(pattern);
         self.write(start_block, written)
             .await
-            .result
-            .map_err(BlockSelfCheckError::Write)?;
+            .map_err(|failure| BlockSelfCheckError::Write(failure.into_error()))?;
         self.flush().await.map_err(BlockSelfCheckError::Flush)?;
 
-        let read = self.read(start_block, Self::check_buffer(bytes)?).await;
-        read.result.map_err(BlockSelfCheckError::Read)?;
-        let mut readback = [0_u8; SELF_CHECK_BYTES];
-        let readback = &mut readback[..bytes];
-        read.buffer.copy_to(readback);
+        let ((), read) = self
+            .read(start_block, Device::Buffer::zeroed(bytes))
+            .await
+            .map_err(|failure| BlockSelfCheckError::Read(failure.into_error()))?;
+        let readback = read.as_ref();
         if readback != pattern {
             let block = readback
                 .chunks(block_bytes)

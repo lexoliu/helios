@@ -13,7 +13,9 @@
 
 use helios_hal::io::{IoError, IoResult};
 
-use crate::bus::{DeviceBus, DmaAddressing, DmaPool};
+use helios_hal::dma::{DmaAddressing, DmaMemory};
+
+use crate::bus::DeviceBus;
 use crate::transport::{DeviceStatus, DeviceType, VirtioFeatures, VirtioTransport};
 
 /// Transport-level ring features every helios driver asks for.

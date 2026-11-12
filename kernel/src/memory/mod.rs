@@ -81,9 +81,9 @@ pub use swap::{
     swap_vm_hooks, swapped_token,
 };
 pub use user::{
-    UserHeapStats, UserMemoryPool, allocate_user_frame_uninit_on, allocate_user_frame_zeroed,
-    allocate_user_frame_zeroed_on, allocate_user_memory_pool, allocate_user_run_zeroed_on,
-    deallocate_user_frame, deallocate_user_frame_on, deallocate_user_run_on,
-    install_user_memory_pool, largest_servable_user_bytes, user_heap_stats,
+    UserHeapStats, UserMemoryPool, UserPoolChunks, allocate_user_frame_uninit_on,
+    allocate_user_frame_zeroed, allocate_user_frame_zeroed_on, allocate_user_memory_pool,
+    allocate_user_run_zeroed_on, deallocate_user_frame, deallocate_user_frame_on,
+    deallocate_user_run_on, install_user_memory_pool, largest_servable_user_bytes, user_heap_stats,
 };
 pub(crate) use user::{lend_user_memory_to_kernel_heap, user_pool_available_bytes};

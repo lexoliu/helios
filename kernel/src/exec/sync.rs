@@ -125,6 +125,19 @@ pub struct ProgressSignal {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProgressMark(u64);
 
+impl ProgressMark {
+    /// The generation this mark sampled.
+    pub const fn generation(self) -> u64 {
+        self.0
+    }
+
+    /// The mark of generation `generation`, for a holder that carried the
+    /// number across a boundary that cannot name this type.
+    pub const fn from_generation(generation: u64) -> Self {
+        Self(generation)
+    }
+}
+
 /// Future returned by [`ProgressSignal::changed`].
 #[must_use = "futures do nothing unless awaited"]
 pub struct ProgressChanged<'a> {

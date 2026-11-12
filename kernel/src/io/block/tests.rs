@@ -11,13 +11,14 @@ use core::task::{Context, Poll, Waker};
 
 use futures_lite::future::block_on;
 use helios_hal::cpu::ProcessorId;
+use helios_hal::dma::{BufError, BufResult};
 use helios_hal::fs::{
-    BlockBuffer, BlockCompletion, BlockDevice, BlockDeviceCapabilities, BlockGeometry,
-    BlockQueueTopology, BlockRange, BlockSerial, IoError, IoResult,
+    BlockBuffer, BlockDevice, BlockDeviceCapabilities, BlockGeometry, BlockQueueTopology,
+    BlockRange, BlockSerial, IoError, IoResult,
 };
 use spin::Mutex;
 
-use super::cache::{CacheDisk, DiskLayout, dirty_blocks, idle_blocks};
+use super::cache::{CacheDisk, DiskLayout, dirty_blocks, idle_blocks, pages_allocated};
 use super::*;
 use crate::memory::{CompressedPool, RootEntropy};
 use crate::test_support::TestCpu;
@@ -45,7 +46,7 @@ enum Direction {
 /// Where a request's answer meets its waiter.
 #[derive(Default)]
 struct Answer {
-    completion: Option<BlockCompletion<BlockPages>>,
+    completion: Option<BufResult<(), BlockPages>>,
     waker: Option<Waker>,
     /// The waiter was dropped: the answer goes nowhere.
     detached: bool,
@@ -74,7 +75,7 @@ struct MemoryWaiter {
 }
 
 impl Future for MemoryWaiter {
-    type Output = BlockCompletion<BlockPages>;
+    type Output = BufResult<(), BlockPages>;
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         let mut answer = self.answer.lock();
@@ -104,7 +105,8 @@ struct DiskState {
     log: Mutex<Vec<Op>>,
     block_bytes: usize,
     opt_io_blocks: u32,
-    max_segments: u32,
+    /// Bytes one request may carry, as the disk's geometry reports them.
+    max_transfer_bytes: usize,
     serial: &'static str,
     read_only: bool,
     fail_reads: bool,
@@ -139,7 +141,7 @@ impl MemoryDisk {
             log: Mutex::new(Vec::new()),
             block_bytes,
             opt_io_blocks: 0,
-            max_segments: 32,
+            max_transfer_bytes: 32 * CACHE_BLOCK_BYTES,
             serial,
             read_only: false,
             fail_reads: false,
@@ -247,23 +249,21 @@ impl MemoryDisk {
             answer,
         } = request;
         let result = match direction {
+            // The disk plays a driver: its own memory is the run, filled
+            // from the buffer before a write and delivered into the
+            // buffer after a read that succeeded.
             Direction::Read => {
-                let mut runs: Vec<&mut [u8]> = buffer
-                    .segments()
-                    // SAFETY: the disk holds the request, and with it the
-                    // only right to touch the buffer's runs until it
-                    // completes the buffer.
-                    .map(|run| unsafe { &mut *run.as_ptr() })
-                    .collect();
-                self.read_into(block_id, &mut runs)
+                let mut run = alloc::vec![0_u8; buffer.len()];
+                let result = self.read_into(block_id, &mut [&mut run[..]]);
+                if result.is_ok() {
+                    buffer.deliver(&run);
+                }
+                result
             }
             Direction::Write => {
-                let runs: Vec<&[u8]> = buffer
-                    .segments()
-                    // SAFETY: as above; a write only reads the runs.
-                    .map(|run| unsafe { &*run.as_ptr() })
-                    .collect();
-                self.write_from(block_id, &runs)
+                let mut run = alloc::vec![0_u8; buffer.len()];
+                buffer.fill(&mut run);
+                self.write_from(block_id, &[&run[..]])
             }
         };
         buffer.complete(result);
@@ -273,7 +273,10 @@ impl MemoryDisk {
             drop(buffer);
             return;
         }
-        slot.completion = Some(BlockCompletion { result, buffer });
+        slot.completion = Some(match result {
+            Ok(()) => Ok(((), buffer)),
+            Err(error) => Err(BufError::returned(error, buffer)),
+        });
         let waker = slot.waker.take();
         drop(slot);
         if let Some(waker) = waker {
@@ -370,8 +373,7 @@ impl BlockDevice for MemoryDisk {
             physical_block_exp: 0,
             min_io_blocks: 0,
             opt_io_blocks: self.state.opt_io_blocks,
-            max_segments: self.state.max_segments,
-            max_segment_bytes: u32::MAX,
+            max_transfer_bytes: self.state.max_transfer_bytes,
             capacity_blocks: self.state.bytes.lock().len() / self.state.block_bytes,
         }
     }
@@ -731,30 +733,43 @@ fn a_miss_reads_the_devices_optimal_transfer_ahead_in_one_request() {
 
 #[test]
 fn readahead_is_bounded_whatever_transfer_the_device_claims() {
-    let geometry = |opt_io_blocks, max_segments| BlockGeometry {
+    let geometry = |opt_io_blocks, max_transfer_bytes| BlockGeometry {
         logical_block_bytes: 512,
         physical_block_exp: 0,
         min_io_blocks: 0,
         opt_io_blocks,
-        max_segments,
-        max_segment_bytes: u32::MAX,
+        max_transfer_bytes,
         capacity_blocks: 1 << 30,
     };
 
     // A device claiming a 2 TiB optimal transfer gets Linux's 128 KiB
     // window.
-    let layout = DiskLayout::new(geometry(u32::MAX, u32::MAX)).expect("layout");
+    let layout = DiskLayout::new(geometry(u32::MAX, usize::MAX)).expect("layout");
     assert_eq!((layout.readahead_blocks, layout.run_blocks), (32, 32));
-    // One request carries no more blocks than the device has segments.
-    let layout = DiskLayout::new(geometry(u32::MAX, 4)).expect("layout");
+    // One request carries no more blocks than its transfer holds.
+    let layout = DiskLayout::new(geometry(u32::MAX, 4 * CACHE_BLOCK_BYTES)).expect("layout");
     assert_eq!((layout.readahead_blocks, layout.run_blocks), (4, 4));
-    // A segment smaller than a cache block takes several per block.
+    // A transfer shorter than two cache blocks carries one.
+    let layout = DiskLayout::new(geometry(u32::MAX, 2 * CACHE_BLOCK_BYTES - 512)).expect("layout");
+    assert_eq!(layout.run_blocks, 1);
+}
+
+/// What virtio-blk publishes for the guest CI boots (14 segments of up
+/// to `SIZE_MAX` bytes, bounded by the longest run of the driver's
+/// memory): one contiguous run per request, so a request carries a whole
+/// readahead window.
+#[test]
+fn a_request_of_the_ci_geometry_carries_a_whole_window() {
     let layout = DiskLayout::new(BlockGeometry {
-        max_segment_bytes: 1024,
-        ..geometry(u32::MAX, 8)
+        logical_block_bytes: 512,
+        physical_block_exp: 0,
+        min_io_blocks: 0,
+        opt_io_blocks: 0,
+        max_transfer_bytes: 14 * (u32::MAX as usize / 512 * 512),
+        capacity_blocks: 1 << 20,
     })
     .expect("layout");
-    assert_eq!(layout.run_blocks, 2);
+    assert_eq!(layout.run_blocks, 32);
 }
 
 #[test]
@@ -847,7 +862,7 @@ fn red_pressure_drops_clean_compressed_blocks_and_writes_back_dirty_ones() {
     shrink(&cache, PressureLevel::Red);
 
     // Both left the cache; the dirty one reached the disk uncompressed
-    // first, from a page staged for the write and freed after it.
+    // first, decompressed into the driver's run.
     assert_eq!(cache.resident_blocks(), 0);
     assert_eq!(cache.page_buffers(), 0);
     assert_eq!(cache.compressed_pool().stats().stored_pages, 0);
@@ -860,10 +875,10 @@ fn red_pressure_drops_clean_compressed_blocks_and_writes_back_dirty_ones() {
 }
 
 #[test]
-fn red_pressure_on_a_full_pool_holds_no_more_pages_than_one_request_carries() {
-    // Four segments a request: write-back runs of four blocks.
+fn writing_back_compressed_blocks_allocates_no_page() {
+    // Four blocks a request: write-back runs of four blocks.
     let mut state = MemoryDisk::build("images", CACHE_BLOCK_BYTES, 32);
-    state.max_segments = 4;
+    state.max_transfer_bytes = 4 * CACHE_BLOCK_BYTES;
     let disk = MemoryDisk::from(state);
     let cache = cache_over(&disk, 32, 1);
     let view = cache.disk(0);
@@ -882,6 +897,7 @@ fn red_pressure_on_a_full_pool_holds_no_more_pages_than_one_request_carries() {
     // The pool is full: nothing more fits until it gives pages back.
     let pool = cache.compressed_pool();
     pool.set_limit_bytes(pool.stats().stored_bytes);
+    let allocated = pages_allocated(&cache);
 
     let peak = Arc::new(AtomicUsize::new(0));
     {
@@ -895,10 +911,15 @@ fn red_pressure_on_a_full_pool_holds_no_more_pages_than_one_request_carries() {
     // The probe holds a clone of the cache; let it go.
     disk.state.on_write.lock().take();
 
-    assert!(
-        peak.load(Ordering::SeqCst) <= 4,
-        "red pressure held {} page buffers at once",
-        peak.load(Ordering::SeqCst)
+    assert_eq!(
+        peak.load(Ordering::SeqCst),
+        0,
+        "a write-back of compressed blocks held page buffers"
+    );
+    assert_eq!(
+        pages_allocated(&cache),
+        allocated,
+        "a write-back of compressed blocks allocated a page"
     );
     assert_eq!(cache.page_buffers(), 0);
     assert_eq!(cache.resident_blocks(), 0);
@@ -1016,11 +1037,103 @@ fn sync_writes_a_dirty_block_held_compressed_uncompressed() {
         disk.bytes_at(5 * CACHE_BLOCK_BYTES, CACHE_BLOCK_BYTES),
         [0x55; CACHE_BLOCK_BYTES]
     );
-    // The block stays compressed, now clean, and the page the write was
-    // staged in is gone.
+    // The block stays compressed and now clean, and the write allocated
+    // no page.
     assert!(dirty_blocks(&cache).is_empty());
     assert_eq!(cache.compressed_blocks(), 1);
     assert_eq!(cache.page_buffers(), 0);
+    assert_eq!(pages_allocated(&cache), 1);
+
+    // A hit decompresses it for good, and its bytes are what was written.
+    block_on(async {
+        let block = view.read(5).await.expect("block 5 from the pool");
+        assert!(block.iter().all(|byte| *byte == 0x55));
+    });
+    assert_eq!(cache.compressed_blocks(), 0);
+}
+
+#[test]
+fn a_hit_on_a_compressed_block_under_write_back_waits_for_the_write() {
+    let disk = MemoryDisk::with_blocks("images", CACHE_BLOCK_BYTES, 16);
+    let cache = cache_over(&disk, 16, 1);
+    let view = cache.disk(0);
+    let mut context = Context::from_waker(Waker::noop());
+
+    block_on(async {
+        view.overwrite(5).await.expect("block 5").fill(0x55);
+    });
+    compress_cold_blocks(&cache);
+    assert_eq!(cache.compressed_blocks(), 1);
+
+    // The device holds the write: a paused disk keeps every data request
+    // it accepts, unanswered and unfilled, until `resume`.
+    disk.pause();
+    assert!(poll_up_to(view.sync(), 1).is_none());
+    assert_eq!(disk.accepted(), 1);
+
+    // The write still reads the compressed page, so a hit parks on the
+    // write-back and the page stays.
+    let mut hit = pin!(view.read(5));
+    for _ in 0..3 {
+        assert!(hit.as_mut().poll(&mut context).is_pending());
+    }
+    assert_eq!(cache.compressed_blocks(), 1);
+    assert_eq!(cache.page_buffers(), 0);
+    assert!(disk.writes().is_empty());
+
+    disk.resume();
+
+    let Poll::Ready(Ok(block)) = hit.as_mut().poll(&mut context) else {
+        panic!("the hit should be answered once the write is");
+    };
+    assert!(block.iter().all(|byte| *byte == 0x55));
+    drop(block);
+    assert_eq!(disk.writes(), [Op::Write(5, 1)]);
+    assert_eq!(
+        disk.bytes_at(5 * CACHE_BLOCK_BYTES, CACHE_BLOCK_BYTES),
+        [0x55; CACHE_BLOCK_BYTES]
+    );
+    assert!(dirty_blocks(&cache).is_empty());
+    assert_eq!(cache.compressed_blocks(), 0);
+}
+
+#[test]
+fn a_recycled_entry_keeps_its_page_whatever_disk_it_served() {
+    let images = MemoryDisk::with_blocks("images", CACHE_BLOCK_BYTES, 16);
+    let data = MemoryDisk::with_blocks("data", CACHE_BLOCK_BYTES, 16);
+    let cache = BlockCache::new(
+        BlockCacheLimits { max_blocks: 1 },
+        1,
+        CompressedPool::new(1 << 20, 1),
+        [&images, &data].map(|disk| CacheDisk {
+            serial: BlockSerial::new(disk.state.serial.as_bytes()).expect("serial fits"),
+            layout: DiskLayout::new(disk.geometry()).expect("the test disk fits the cache"),
+            read_only: false,
+            device: disk.clone(),
+        }),
+    );
+
+    block_on(async {
+        drop(cache.disk(0).read(0).await.expect("images block 0"));
+        drop(cache.disk(0).read(1).await.expect("images block 1"));
+    });
+    assert_eq!(
+        pages_allocated(&cache),
+        1,
+        "an entry recycled for the same disk keeps its page"
+    );
+
+    block_on(async {
+        let disk = cache.disk(1);
+        let block = disk.read(2).await.expect("data block 2");
+        assert!(block.iter().all(|byte| *byte == 2));
+    });
+    assert_eq!(
+        pages_allocated(&cache),
+        1,
+        "an entry recycled for another disk keeps its page too"
+    );
+    assert_eq!(cache.page_buffers(), 1);
 }
 
 #[test]
@@ -1595,7 +1708,10 @@ fn the_cache_stays_coherent_under_real_threads() {
                     };
                     cache.set_pressure(level);
                     run_or_abandon(cache.shrink(level), abandon_after(seed));
-                    if pass.is_multiple_of(3)
+                    // A sync right after a yellow pass writes dirty
+                    // compressed blocks back from their compressed pages
+                    // while the readers hit them.
+                    if (pass % 4 == 1 || pass.is_multiple_of(3))
                         && let Some(synced) = run_or_abandon(view.sync(), abandon_after(seed >> 2))
                     {
                         synced.expect("sync");
@@ -1636,6 +1752,10 @@ fn the_cache_stays_coherent_under_real_threads() {
     assert!(dirty_blocks(&cache).is_empty());
     assert_eq!(disk.accepted(), 0);
     assert_eq!(cache.disk(0).stats().write_errors, 0);
+    assert!(
+        cache.compressed_pool().stats().stores > 0,
+        "the reclaimer compressed blocks, dirty ones among them"
+    );
     assert_eq!(
         idle_blocks(&cache),
         cache.resident_blocks(),

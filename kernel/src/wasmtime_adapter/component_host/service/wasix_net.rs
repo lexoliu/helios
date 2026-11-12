@@ -2334,17 +2334,13 @@ where
                 Err(errno) => return errno,
             };
             let timeout = wasix_effective_socket_timeout(options.send_timeout, fdflags);
-            let written = match p1_send_gathered(&mut gather, |chunk| {
-                let (service, stream) = (&service, stream.id());
-                async move {
-                    service
-                        .tcp_write_all_bytes(stream, Bytes::from(chunk), timeout)
-                        .await
-                        .map_err(|error| p1_errno_from_tcp_error_for_fdflags(error, fdflags))
-                }
-            })
-            .await
-            {
+            let mut stream = Preview1TcpStream {
+                service: &service,
+                stream: stream.id(),
+                timeout,
+                fdflags,
+            };
+            let written = match p1_send_gathered(&mut gather, &mut stream).await {
                 Ok(written) => written,
                 Err(errno) => return errno,
             };
@@ -2359,11 +2355,11 @@ where
                 Ok(fdflags) => fdflags,
                 Err(errno) => return errno,
             };
-            let written = match p1_send_gathered(&mut gather, |chunk| {
-                p1_send_to_socketpair(&writer, chunk, fdflags)
-            })
-            .await
-            {
+            let mut stream = Preview1SocketpairStream {
+                writer: &writer,
+                fdflags,
+            };
+            let written = match p1_send_gathered(&mut gather, &mut stream).await {
                 Ok(written) => written,
                 Err(errno) => return errno,
             };
@@ -2456,10 +2452,10 @@ where
                 Err(errno) => return errno,
             };
             let timeout = wasix_effective_socket_timeout(options.send_timeout, fdflags);
-            if let Err(error) = service
-                .tcp_write_all_bytes(stream.id(), bytes, timeout)
-                .await
-            {
+            let pieces = service.tcp_payload_pieces(bytes.len(), |offset, piece| {
+                piece.copy_from_slice(&bytes[offset..][..piece.len()]);
+            });
+            if let Err(error) = service.tcp_write_all(stream.id(), pieces, timeout).await {
                 return p1_errno_from_tcp_error_for_fdflags(error, fdflags);
             }
             p1_write_u64(caller, memory, GuestAddress::wasm32(ret_size), written)

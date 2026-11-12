@@ -17,17 +17,25 @@
 //! submitted a chain is the task that reaps it.
 
 mod packed;
+mod slots;
 mod split;
 #[cfg(test)]
 mod tests;
+
+pub(crate) use slots::{
+    ControlSlots, Lend, Part, ResponseSpan, ResponseWindow, SlotPool, control_slots,
+    exchange_blocking,
+};
 
 use core::alloc::Layout;
 
 use alloc::boxed::Box;
 use helios_hal::io::{IoError, IoResult};
-use helios_hal::iommu::PhysicalRange;
+use helios_hal::iommu::{DmaAccess, PhysicalRange};
 
-use crate::bus::{DeviceBus, DmaBuffer, DmaPool};
+use helios_hal::dma::{DmaBuffer, DmaError, DmaMemory};
+
+use crate::bus::DeviceBus;
 use crate::features::NegotiatedFeatures;
 use crate::resume::ReinitError;
 use crate::transport::VirtioTransport;
@@ -35,9 +43,13 @@ use crate::transport::VirtioTransport;
 use packed::PackedRing;
 use split::SplitRing;
 
+/// What a device may do with memory it both reads and writes: rings, and
+/// every buffer whose direction is not one-way.
+pub(crate) const READ_WRITE: DmaAccess = DmaAccess::READ.union(DmaAccess::WRITE);
+
 /// The DMA buffer type a transport's bus hands out.
-pub(crate) type TransportBuffer<T> =
-    <<<T as VirtioTransport>::Bus as DeviceBus>::DmaPool as DmaPool>::Buffer;
+pub type TransportBuffer<T> =
+    <<<T as VirtioTransport>::Bus as DeviceBus>::DmaPool as DmaMemory>::Buffer;
 
 /// Both ring layouts use 16-byte descriptors, so one indirect table
 /// stride covers both.
@@ -69,6 +81,20 @@ pub enum VirtqueueError {
     Full { needed: usize },
     #[error("virtqueue ring memory could not be allocated")]
     RingAllocation,
+    #[error("{bytes} bytes at {address:#x} are not reachable by the device")]
+    Unreachable { address: usize, bytes: usize },
+    #[error("the device's memory refused the buffer: {0}")]
+    Memory(DmaError),
+    #[error("a control slot holds {capacity} bytes and the request needs {needed}")]
+    ControlSlotOverflow { needed: usize, capacity: usize },
+    #[error("a descriptor chain lists a readable buffer after a writable one")]
+    ReadableAfterWritable,
+    #[error("a chain names bytes up to {end} of lent buffer {buffer}, which holds {len}")]
+    LentOutOfRange {
+        buffer: usize,
+        end: usize,
+        len: usize,
+    },
     #[error("this queue did not negotiate VIRTIO_F_RING_RESET")]
     ResetUnsupported,
     #[error("the device completed descriptor {id}, which is not a chain in flight on this queue")]
@@ -86,9 +112,15 @@ impl From<VirtqueueError> for IoError {
                 Self::Unsupported
             }
             VirtqueueError::EmptyChain => Self::DeviceFault,
-            VirtqueueError::ChainTooLong { .. } => Self::OutOfBounds,
+            VirtqueueError::ChainTooLong { .. }
+            | VirtqueueError::ControlSlotOverflow { .. }
+            | VirtqueueError::LentOutOfRange { .. } => Self::OutOfBounds,
+            VirtqueueError::ReadableAfterWritable => Self::DeviceFault,
             VirtqueueError::Full { .. } => Self::DeviceFault,
-            VirtqueueError::RingAllocation => Self::DeviceFault,
+            VirtqueueError::RingAllocation | VirtqueueError::Unreachable { .. } => {
+                Self::DeviceFault
+            }
+            VirtqueueError::Memory(error) => Self::from(error),
             VirtqueueError::ResetUnsupported => Self::Unsupported,
             VirtqueueError::UnexpectedUsedId { .. }
             | VirtqueueError::SpuriousCompletion
@@ -316,7 +348,7 @@ impl<B: DmaBuffer> IndirectTables<B> {
     }
 
     fn table_addr(&self, id: u16) -> u64 {
-        self.memory.phys_addr() + (usize::from(id) * self.stride) as u64
+        self.memory.device_address().get() + (usize::from(id) * self.stride) as u64
     }
 
     fn entries(&self) -> usize {
@@ -364,7 +396,7 @@ impl<B: DmaBuffer> RingCore<B> {
         features: NegotiatedFeatures,
     ) -> Result<Self, VirtqueueError>
     where
-        P: DmaPool<Buffer = B>,
+        P: DmaMemory<Buffer = B>,
     {
         let chain_limit = usize::from(chain_limit);
         let indirect = if features.indirect() && chain_limit >= INDIRECT_MIN_CHAIN {
@@ -373,7 +405,7 @@ impl<B: DmaBuffer> RingCore<B> {
                 .map_err(|_| VirtqueueError::RingAllocation)?;
             Some(IndirectTables {
                 memory: dma
-                    .allocate_zeroed(layout)
+                    .allocate_resident(layout, DmaAccess::READ)
                     .map_err(|_| VirtqueueError::RingAllocation)?,
                 stride,
                 entries: chain_limit,
@@ -667,8 +699,8 @@ pub(crate) fn negotiated_queue_size<T: VirtioTransport>(
 /// A virtqueue in whichever layout the device and driver agreed on.
 pub struct VirtQueue<T: VirtioTransport> {
     index: u16,
-    /// Descriptors in the ring, kept so a re-initialisation can check the
-    /// device still offers a queue this deep.
+    /// Descriptors, and so the identifiers a chain can be headed by; a
+    /// re-initialisation checks the device still offers a queue this deep.
     size: u16,
     features: NegotiatedFeatures,
     ring: Ring<T>,
@@ -773,6 +805,52 @@ impl<T: VirtioTransport> VirtQueue<T> {
             ring,
             faulted: false,
         })
+    }
+
+    /// Descriptors in the ring, which is how many chains it holds at
+    /// once and how many identifiers a chain can be headed by.
+    pub fn size(&self) -> u16 {
+        self.size
+    }
+
+    /// Submits the chain `parts` describes, staging its control bytes in
+    /// the slot of the identifier it will be headed by, and makes it
+    /// available to the device immediately.
+    ///
+    /// Returns the identifier and where the response bytes will be.
+    /// `lent` is what the [`Part::LentRead`] and [`Part::LentWrite`] parts
+    /// name.
+    ///
+    /// # Safety
+    ///
+    /// The caller owns the slot of [`VirtQueue::next_free_descriptor`]:
+    /// no chain headed by it is in flight and no reply of an earlier chain
+    /// headed by it is still being read. Under the queue lock that is the
+    /// completion table reporting the identifier idle.
+    pub(crate) unsafe fn submit_parts<L: Lend>(
+        &mut self,
+        transport: &T,
+        slots: &ControlSlots<TransportBuffer<T>>,
+        parts: &[Part<'_>],
+        lent: &mut L,
+    ) -> IoResult<(u16, ResponseSpan)> {
+        let mut chain = [ChainEntry {
+            addr: 0,
+            len: 0,
+            writable: false,
+        }; MAX_CHAIN_BUFFERS];
+        self.ensure_driven()?;
+        let head = self.ring.next_id();
+        // SAFETY: the caller owns the slot of the next identifier, which
+        // is `head`.
+        let (used, span) =
+            unsafe { slots.stage(transport.bus().dma(), head, parts, lent, &mut chain)? };
+        let token = self.ring.submit(&chain[..used], true)?;
+        assert_eq!(
+            token, head,
+            "the ring headed a chain by a different identifier than it announced"
+        );
+        Ok((token, span))
     }
 
     /// Chains the device owns right now.
@@ -1217,7 +1295,7 @@ fn build_chain<T: VirtioTransport>(
 }
 
 /// One read-only descriptor over memory the driver never mapped.
-fn foreign_entry<P: DmaPool>(
+fn foreign_entry<P: DmaMemory>(
     dma: &P,
     payload: PhysicalRange,
 ) -> Result<ChainEntry, VirtqueueError> {
@@ -1230,21 +1308,34 @@ fn foreign_entry<P: DmaPool>(
     })?;
     Ok(ChainEntry {
         addr: dma
-            .device_range(payload.start, payload.bytes)
-            .map_err(|_| VirtqueueError::RingAllocation)?,
+            .foreign_range(payload.start, payload.bytes)
+            .map_err(|_| VirtqueueError::Unreachable {
+                address: payload.start as usize,
+                bytes: len as usize,
+            })?,
         len,
         writable: false,
     })
 }
 
-fn entry<P: DmaPool>(dma: &P, buffer: &[u8], writable: bool) -> Result<ChainEntry, VirtqueueError> {
+fn entry<P: DmaMemory>(
+    dma: &P,
+    buffer: &[u8],
+    writable: bool,
+) -> Result<ChainEntry, VirtqueueError> {
     if buffer.is_empty() {
         return Err(VirtqueueError::EmptyChain);
     }
     Ok(ChainEntry {
         addr: dma
-            .dma_addr(buffer.as_ptr())
-            .map_err(|_| VirtqueueError::RingAllocation)?,
+            .device_range(buffer)
+            .map_err(|error| match error {
+                DmaError::Unreachable { address, bytes } => {
+                    VirtqueueError::Unreachable { address, bytes }
+                }
+                other => VirtqueueError::Memory(other),
+            })?
+            .get(),
         len: u32::try_from(buffer.len()).map_err(|_| VirtqueueError::ChainTooLong {
             actual: buffer.len(),
             limit: u32::MAX as usize,

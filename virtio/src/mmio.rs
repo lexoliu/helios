@@ -5,7 +5,9 @@ use helios_hal::io::IoResult;
 
 use crate::balloon::VirtioBalloonDevice;
 use crate::block::{QueueAffinity, VirtioBlockDevice, VirtioBlockResource};
-use crate::bus::{DmaPool, IdentityDmaPool, MmioBus};
+use helios_hal::dma::DmaMemory;
+
+use crate::bus::{IdentityDmaPool, MmioBus};
 use crate::gpu::{VirtioGpuDevice, report_gpu_online};
 use crate::input::{VirtioInputDevice, report_input_online};
 use crate::net::{QueuePairBudget, VirtioNetDevice};
@@ -29,7 +31,7 @@ pub type VirtioMmioSndDevice = VirtioSndDevice<VirtioMmioTransport<MmioBus>>;
 ///
 /// The current backend assumes identity-mapped DMA addresses, which matches
 /// the bare-metal no-MMU configuration Helios uses today. A future bus-backed
-/// driver runtime can swap in a different `DmaPool` without changing the block
+/// driver runtime can swap in a different `DmaMemory` without changing the block
 /// driver layer.
 ///
 /// # Safety
@@ -55,7 +57,7 @@ pub unsafe fn block_from_mmio<C: QueueAffinity, B: BlockBuffer>(
 /// # Safety
 ///
 /// Same as [`block_from_mmio`].
-pub unsafe fn block_from_mmio_with_dma<C: QueueAffinity, P: DmaPool, B: BlockBuffer>(
+pub unsafe fn block_from_mmio_with_dma<C: QueueAffinity, P: DmaMemory, B: BlockBuffer>(
     header: NonNull<u8>,
     mmio_size: usize,
     dma: P,
@@ -107,7 +109,7 @@ pub unsafe fn net_from_mmio_with_dma<P>(
     pair_budget: QueuePairBudget,
 ) -> IoResult<VirtioNetDevice<VirtioMmioTransport<MmioBus<P>>>>
 where
-    P: DmaPool,
+    P: DmaMemory,
 {
     let bus = unsafe { MmioBus::new(header, mmio_size, dma) }?;
     let transport = VirtioMmioTransport::new(bus)?;
@@ -141,7 +143,7 @@ pub unsafe fn p9_from_mmio_with_dma<P>(
     dma: P,
 ) -> IoResult<Virtio9pDevice<VirtioMmioTransport<MmioBus<P>>>>
 where
-    P: DmaPool,
+    P: DmaMemory,
 {
     let bus = unsafe { MmioBus::new(header, mmio_size, dma) }?;
     let transport = VirtioMmioTransport::new(bus)?;
@@ -177,7 +179,7 @@ pub unsafe fn rng_from_mmio_with_dma<P>(
     dma: P,
 ) -> IoResult<VirtioRngDevice<VirtioMmioTransport<MmioBus<P>>>>
 where
-    P: DmaPool,
+    P: DmaMemory,
 {
     let bus = unsafe { MmioBus::new(header, mmio_size, dma) }?;
     let transport = VirtioMmioTransport::new(bus)?;
@@ -215,7 +217,7 @@ pub unsafe fn balloon_from_mmio_with_dma<P>(
     dma: P,
 ) -> IoResult<VirtioBalloonDevice<VirtioMmioTransport<MmioBus<P>>>>
 where
-    P: DmaPool,
+    P: DmaMemory,
 {
     let bus = unsafe { MmioBus::new(header, mmio_size, dma) }?;
     let transport = VirtioMmioTransport::new(bus)?;
@@ -256,7 +258,7 @@ pub unsafe fn gpu_from_mmio_with_dma<P>(
     dma: P,
 ) -> IoResult<VirtioGpuDevice<VirtioMmioTransport<MmioBus<P>>>>
 where
-    P: DmaPool,
+    P: DmaMemory,
 {
     let bus = unsafe { MmioBus::new(header, mmio_size, dma) }?;
     let transport = VirtioMmioTransport::new(bus)?;
@@ -294,7 +296,7 @@ pub unsafe fn vsock_from_mmio_with_dma<P>(
     dma: P,
 ) -> IoResult<VirtioVsockDevice<VirtioMmioTransport<MmioBus<P>>>>
 where
-    P: DmaPool,
+    P: DmaMemory,
 {
     let bus = unsafe { MmioBus::new(header, mmio_size, dma) }?;
     let transport = VirtioMmioTransport::new(bus)?;
@@ -335,7 +337,7 @@ pub unsafe fn input_from_mmio_with_dma<P>(
     dma: P,
 ) -> IoResult<VirtioInputDevice<VirtioMmioTransport<MmioBus<P>>>>
 where
-    P: DmaPool,
+    P: DmaMemory,
 {
     let bus = unsafe { MmioBus::new(header, mmio_size, dma) }?;
     let transport = VirtioMmioTransport::new(bus)?;
@@ -375,7 +377,7 @@ pub unsafe fn snd_from_mmio_with_dma<P>(
     dma: P,
 ) -> IoResult<VirtioSndDevice<VirtioMmioTransport<MmioBus<P>>>>
 where
-    P: DmaPool,
+    P: DmaMemory,
 {
     let bus = unsafe { MmioBus::new(header, mmio_size, dma) }?;
     let transport = VirtioMmioTransport::new(bus)?;
