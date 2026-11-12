@@ -243,7 +243,12 @@ impl FreezeBarrier {
     /// Whether a freeze holds the machine and `processor` is not the one
     /// that asked: the idle loop's reason to return to its run loop.
     pub(crate) fn requested_of(&self, processor: ProcessorId) -> bool {
-        self.requested() && self.control.freezer.load(Ordering::Acquire) != processor.id()
+        // `hold` is loaded `Acquire` and `freezer` after it, as `arrive`
+        // does: the freezer stores `freezer` before it releases `hold`,
+        // so a `hold` that is seen is paired with its own `freezer`, not
+        // with the previous freeze's.
+        self.control.hold.load(Ordering::Acquire) & HELD != 0
+            && self.control.freezer.load(Ordering::Relaxed) != processor.id()
     }
 
     /// A scheduler boundary: the processor polls no task, fires no timer
