@@ -1084,6 +1084,11 @@ pub enum HostFsError {
     Server(u32),
     #[error("invalid utf-8")]
     Utf8,
+    /// A name or path component the host share's wire format cannot
+    /// carry: longer than `max_len` bytes, the most one string field of
+    /// a request holds under the session's negotiated message size.
+    #[error("name of {len} bytes exceeds the {max_len} bytes the host share can carry")]
+    NameTooLong { len: usize, max_len: usize },
     #[error(
         "directory listing exceeds the caller's limit of {max_entries} entries or \
          {max_name_bytes} name bytes"
@@ -1103,6 +1108,7 @@ pub enum HostFsErrorKind {
     NotEmpty,
     ReadOnly,
     Unsupported,
+    NameTooLong,
     Io,
 }
 
@@ -1117,6 +1123,7 @@ impl HostFsError {
             HostFsError::Transport(IoError::PermissionDenied)
             | HostFsError::Transport(IoError::ReadOnly) => HostFsErrorKind::ReadOnly,
             HostFsError::Transport(IoError::Unsupported) => HostFsErrorKind::Unsupported,
+            HostFsError::NameTooLong { .. } => HostFsErrorKind::NameTooLong,
             HostFsError::Transport(IoError::InvalidBufferLength { .. })
             | HostFsError::Transport(IoError::InvalidDeviceConfig(_))
             | HostFsError::Transport(IoError::OutOfBounds)
