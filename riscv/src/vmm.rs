@@ -397,8 +397,8 @@ impl RiscvUserAddressSpace {
     /// hot. And a hart may have cached the leaf while it was invalid (a
     /// swap entry that [`SwapLeafFormat::attach`] has since made valid
     /// from another hart): a local fence drops that translation. Both end
-    /// the same way, a local `sfence.vma` for the page and a retry, so one
-    /// step covers them.
+    /// the same way, a full local `sfence.vma` and a retry, so one step
+    /// covers them.
     ///
     /// Returns `false` when the address is outside the user window, has no
     /// valid leaf, or the leaf does not grant the access: the fault then
@@ -436,7 +436,13 @@ impl RiscvUserAddressSpace {
                 Err(changed) => entry = changed,
             }
         }
-        fence_local_page(virt);
+        // A full local fence, not one scoped to the address: `sfence.vma`
+        // with an address operand orders and invalidates only leaf entries
+        // for that address, and this hart may instead have cached an
+        // invalid non-leaf entry, from before `ensure_intermediate` built
+        // the table under a later commit. Only the full fence clears it,
+        // and a spurious fault is rare enough to pay for it.
+        fence_local_all();
         true
     }
 
@@ -1587,6 +1593,18 @@ impl AddressSpace for RiscvUserAddressSpace {
             self.dealloc_user_phys(page.old_phys);
         }
         Ok(())
+    }
+}
+
+/// Drops every translation this hart has cached, leaf and non-leaf.
+fn fence_local_all() {
+    // SAFETY: `sfence.vma` with both operands zero is a supervisor-legal
+    // local fence.
+    unsafe {
+        core::arch::asm!(
+            "sfence.vma zero, zero",
+            options(nostack, preserves_flags),
+        );
     }
 }
 
