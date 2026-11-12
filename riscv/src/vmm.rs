@@ -1218,7 +1218,14 @@ impl SwapLeafFormat for RiscvUserAddressSpace {
         })
     }
 
-    fn accessed_cleared(&self, _start: VirtAddr, _pages: usize) {}
+    fn accessed_cleared(&self, _start: VirtAddr, _pages: usize) {
+        // Clearing A narrows no permission, so no shootdown is due, but
+        // every address-space mutation invalidates the local TLB: a stale
+        // entry with A set would keep the hart from setting it again, and
+        // the next scan would read a touched page as cold. One full fence
+        // per batch, which is why the caller batches.
+        fence_local_all();
+    }
 }
 
 impl InstalledAddressSpace for RiscvUserAddressSpace {
