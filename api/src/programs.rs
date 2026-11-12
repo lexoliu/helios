@@ -14,8 +14,9 @@ use futures_lite::future::zip;
 pub use crate::bindings::helios::system::programs::{
     AotHint, AotRequest, AotResult, CapabilityGrant, ClockGrant, ClockRight, DeviceClass,
     DeviceGrant, DirectoryGrant, ExecError, ExecErrorKind, ExecOutput, ExecRequest, ExecResult,
-    ExitStatus, FilesystemRight, LinkGrant, LinkRight, NetworkGrant, NetworkRight, ProcessGrant,
-    ProcessRight, SpawnError, SpawnErrorKind, SpawnRequest, TerminalGrant, TerminalRight,
+    ExitStatus, FilesystemRight, LinkGrant, LinkRight, MountGrant, MountRight, NetworkGrant,
+    NetworkRight, ProcessGrant, ProcessRight, SpawnError, SpawnErrorKind, SpawnRequest,
+    TerminalGrant, TerminalRight,
 };
 
 /// Build a directory capability grant for `helios:system/programs`.
@@ -71,6 +72,16 @@ pub fn process_grant(rights: Vec<ProcessRight>) -> CapabilityGrant {
 
 pub fn link_grant(rights: Vec<LinkRight>) -> CapabilityGrant {
     CapabilityGrant::Link(LinkGrant { rights })
+}
+
+/// Build a mount-table capability grant: the child may attach or detach
+/// filesystems at directories its directory grants let it change.
+pub fn mount_grant(rights: Vec<MountRight>) -> CapabilityGrant {
+    CapabilityGrant::Mount(MountGrant { rights })
+}
+
+pub fn root_mount_grant() -> CapabilityGrant {
+    mount_grant(vec![MountRight::Mount, MountRight::Unmount])
 }
 
 pub fn root_link_grant() -> CapabilityGrant {

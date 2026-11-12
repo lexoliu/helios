@@ -18,10 +18,12 @@
 //! in-flight invocation inside one future keeps every wakeup an ordinary
 //! intra-future wakeup that the executor already handles.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 use std::future::Future;
 use std::io;
+use std::rc::Rc;
 
 use futures_io::{AsyncRead, AsyncWrite};
 use futures_util::future::{Either, select};
@@ -43,12 +45,56 @@ pub trait Dispatcher {
     fn supports(&self, instance: &str, func: &str) -> bool;
 
     /// Runs one invocation whose request payload has been fully read.
+    /// `invocations` describes the connection it runs on, itself
+    /// included.
     fn dispatch(
         &self,
+        invocations: &Invocations,
         instance: &str,
         func: &str,
         payload: &[u8],
     ) -> impl Future<Output = Result<Vec<u8>, DispatchError>>;
+}
+
+/// Which invocations a connection is running, for a dispatcher that
+/// has to know whether it is alone.
+///
+/// An invocation counts from the moment the loop starts it until its
+/// future is dropped, so one that has been started but not yet polled is
+/// counted too. The count is shared by the loop's single future, never
+/// by threads, so it is a plain cell.
+#[derive(Clone, Default)]
+pub struct Invocations {
+    running: Rc<Cell<usize>>,
+}
+
+impl Invocations {
+    /// How many invocations are running on the connection besides the
+    /// one asking.
+    pub fn others(&self) -> usize {
+        self.running
+            .get()
+            .checked_sub(1)
+            .expect("an invocation asks about the others only while it is itself counted")
+    }
+
+    fn start(&self) -> RunningInvocation {
+        self.running.set(self.running.get() + 1);
+        RunningInvocation {
+            running: Rc::clone(&self.running),
+        }
+    }
+}
+
+/// Counts one invocation for as long as it lives.
+struct RunningInvocation {
+    running: Rc<Cell<usize>>,
+}
+
+impl Drop for RunningInvocation {
+    fn drop(&mut self) {
+        self.running.set(self.running.get() - 1);
+    }
 }
 
 /// A request whose `Open` frame has been accepted and whose payload is
@@ -91,6 +137,8 @@ where
     D: Dispatcher,
 {
     let mut requests = BTreeMap::<u32, PendingRequest>::new();
+    // Declared before `inflight`, which borrows it and drops first.
+    let invocations = Invocations::default();
     let mut inflight = FuturesUnordered::new();
     let mut next_frame = Box::pin(read_next_frame(read));
     // Cleared once the transport reports end of stream.
@@ -132,7 +180,13 @@ where
                         let action =
                             handle_frame(&mut write, &dispatcher, &mut requests, frame).await?;
                         if let FrameAction::Dispatch(invocation, request) = action {
-                            inflight.push(run_invocation(&dispatcher, invocation, request));
+                            inflight.push(run_invocation(
+                                &dispatcher,
+                                &invocations,
+                                invocations.start(),
+                                invocation,
+                                request,
+                            ));
                         }
                     }
                 }
@@ -157,13 +211,25 @@ where
 
 /// Runs one invocation and labels its result with the invocation it
 /// belongs to, which is what lets responses complete out of order.
-async fn run_invocation<D>(dispatcher: &D, invocation: u32, request: PendingRequest) -> Completed
+async fn run_invocation<D>(
+    dispatcher: &D,
+    invocations: &Invocations,
+    running: RunningInvocation,
+    invocation: u32,
+    request: PendingRequest,
+) -> Completed
 where
     D: Dispatcher,
 {
     let result = dispatcher
-        .dispatch(&request.instance, &request.func, &request.payload)
+        .dispatch(
+            invocations,
+            &request.instance,
+            &request.func,
+            &request.payload,
+        )
         .await;
+    drop(running);
     Completed { invocation, result }
 }
 
@@ -320,7 +386,7 @@ mod tests {
     use tokio::sync::Notify;
     use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
 
-    use super::{Dispatcher, serve};
+    use super::{Dispatcher, Invocations, serve};
     use crate::error::DispatchError;
     use crate::transport::Client;
 
@@ -328,6 +394,7 @@ mod tests {
     const SLOW_FUNC: &str = "run";
     const PROBE_INSTANCE: &str = "server:test/probe";
     const PROBE_FUNC: &str = "ping";
+    const OTHERS_FUNC: &str = "others";
 
     /// How long a probe may take while the slow invocation is still
     /// running in the guest. Long enough that a loaded machine does not
@@ -348,12 +415,13 @@ mod tests {
         fn supports(&self, instance: &str, func: &str) -> bool {
             matches!(
                 (instance, func),
-                (SLOW_INSTANCE, SLOW_FUNC) | (PROBE_INSTANCE, PROBE_FUNC)
+                (SLOW_INSTANCE, SLOW_FUNC) | (PROBE_INSTANCE, PROBE_FUNC | OTHERS_FUNC)
             )
         }
 
         async fn dispatch(
             &self,
+            invocations: &Invocations,
             instance: &str,
             func: &str,
             payload: &[u8],
@@ -366,6 +434,9 @@ mod tests {
                     Ok(b"slow".to_vec())
                 }
                 (PROBE_INSTANCE, PROBE_FUNC) => Ok(b"pong".to_vec()),
+                (PROBE_INSTANCE, OTHERS_FUNC) => Ok(vec![
+                    u8::try_from(invocations.others()).expect("a test runs few invocations"),
+                ]),
                 _ => Err(DispatchError::protocol("unsupported test method")),
             }
         }
@@ -418,6 +489,17 @@ mod tests {
 
                     let answer = probe(&client).await;
                     assert_eq!(answer, b"pong");
+
+                    // The abandoned invocation is still running, so an
+                    // invocation asking sees exactly one other.
+                    let others = tokio::time::timeout(
+                        PROBE_DEADLINE,
+                        client.invoke_raw(PROBE_INSTANCE, OTHERS_FUNC, Vec::new()),
+                    )
+                    .await
+                    .expect("the others query went unanswered")
+                    .expect("the others query failed");
+                    assert_eq!(others, [1]);
 
                     // The abandoned invocation still owes a response.
                     // Letting it finish proves the server writes it
