@@ -51,7 +51,6 @@ use helios_hal::watchdog::Watchdog;
 
 use crate::machine::{Generation, MachineGeneration};
 use crate::{ComponentNetworkService, HostFileSystem, HostShareRestore, Kernel, RuntimeState};
-
 /// The steps of one pass, so the loop that orders them is exercised
 /// without the devices behind them.
 trait ReactionSteps {
@@ -81,18 +80,18 @@ pub fn install_generation_reactions<
     WatchdogImpl,
     ProgramService,
     NetworkService,
-    HostFs,
+    StorageImpl,
     Rtc,
 >(
     kernel: &Kernel<CpuImpl, WatchdogImpl>,
-    runtime_state: RuntimeState<ProgramService, NetworkService, HostFs>,
+    runtime_state: RuntimeState<ProgramService, NetworkService, StorageImpl>,
     rtc: Option<Rtc>,
 ) where
     CpuImpl: Cpu + Clone + Send + Sync + 'static,
     WatchdogImpl: Watchdog + Clone,
     ProgramService: Clone + 'static,
     NetworkService: ComponentNetworkService,
-    HostFs: HostFileSystem,
+    StorageImpl: crate::Storage,
     Rtc: RealTimeClock + 'static,
 {
     let generation = runtime_state.machine_generation_handle();
@@ -107,26 +106,26 @@ pub fn install_generation_reactions<
 }
 
 /// The production steps, over the runtime state the backend built.
-struct MachineSteps<CpuImpl, ProgramService, NetworkService, HostFs, Rtc> {
+struct MachineSteps<CpuImpl, ProgramService, NetworkService, StorageImpl: crate::Storage, Rtc> {
     cpu: CpuImpl,
-    runtime_state: RuntimeState<ProgramService, NetworkService, HostFs>,
+    runtime_state: RuntimeState<ProgramService, NetworkService, StorageImpl>,
     rtc: Option<Rtc>,
 }
 
-impl<CpuImpl, ProgramService, NetworkService, HostFs, Rtc> ReactionSteps
-    for MachineSteps<CpuImpl, ProgramService, NetworkService, HostFs, Rtc>
+impl<CpuImpl, ProgramService, NetworkService, StorageImpl, Rtc> ReactionSteps
+    for MachineSteps<CpuImpl, ProgramService, NetworkService, StorageImpl, Rtc>
 where
     CpuImpl: Cpu,
     ProgramService: Clone,
     NetworkService: ComponentNetworkService,
-    HostFs: HostFileSystem,
+    StorageImpl: crate::Storage,
     Rtc: RealTimeClock,
 {
     async fn reread_wall_clock(&mut self) {
         let Some(rtc) = &self.rtc else {
             return;
         };
-        let wall = RuntimeState::<ProgramService, NetworkService, HostFs>::read_rtc(rtc);
+        let wall = RuntimeState::<ProgramService, NetworkService, StorageImpl>::read_rtc(rtc);
         self.runtime_state
             .reseed_wall_clock(self.cpu.now().ticks(), wall);
         tracing::info!(

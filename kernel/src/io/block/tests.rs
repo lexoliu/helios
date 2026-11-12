@@ -69,7 +69,7 @@ struct Queue {
 
 /// The waiter of one [`MemoryDisk`] data request. Dropping it detaches
 /// it; the request is still answered and its buffer completed.
-struct MemoryWaiter {
+pub(crate) struct MemoryWaiter {
     answer: Arc<Mutex<Answer>>,
 }
 
@@ -122,11 +122,25 @@ struct DiskState {
 /// A disk in host memory that answers a fixed serial and logs every
 /// request it serves.
 #[derive(Clone)]
-struct MemoryDisk {
+pub(crate) struct MemoryDisk {
     state: Arc<DiskState>,
 }
 
 impl MemoryDisk {
+    /// A read-only disk of 512-byte blocks holding `image`, zero-padded
+    /// to whole cache blocks: an image a filesystem test mounts. With
+    /// `fail_reads`, every read the disk is asked for fails.
+    pub(crate) fn holding(serial: &'static str, image: &[u8], fail_reads: bool) -> Self {
+        let blocks = image.len().div_ceil(CACHE_BLOCK_BYTES) * (CACHE_BLOCK_BYTES / 512);
+        let mut state = Self::build(serial, 512, blocks);
+        let bytes = state.bytes.get_mut();
+        bytes.fill(0);
+        bytes[..image.len()].copy_from_slice(image);
+        state.read_only = true;
+        state.fail_reads = fail_reads;
+        Self::from(state)
+    }
+
     fn build(serial: &'static str, block_bytes: usize, blocks: usize) -> DiskState {
         let mut bytes = alloc::vec![0_u8; block_bytes * blocks];
         // Every cache-sized block starts filled with its own number, so
@@ -405,7 +419,11 @@ fn root() -> RootEntropyHandle {
 }
 
 /// A cache over one disk, sized and shaped by the test.
-fn cache_over(disk: &MemoryDisk, max_blocks: usize, processors: usize) -> BlockCache<MemoryDisk> {
+pub(crate) fn cache_over(
+    disk: &MemoryDisk,
+    max_blocks: usize,
+    processors: usize,
+) -> BlockCache<MemoryDisk> {
     let layout = DiskLayout::new(disk.geometry()).expect("the test disk fits the cache");
     BlockCache::new(
         BlockCacheLimits { max_blocks },

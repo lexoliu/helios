@@ -15,11 +15,11 @@ use crate::wasmtime_adapter::component_host::ProgramSource;
 use crate::wasmtime_adapter::cwasm::{self, UntrustedCwasm};
 use crate::{
     AuthorityDomain, BOOT_DEVICE, BootFs, EmbeddedBootDirectory, EmbeddedBootFile, EmbeddedBootFs,
-    FileContents, Follow, MemoryFs, MountTable, MountedFs, Namespace, UnsupportedHostFileSystem,
+    FileContents, Follow, MemoryFs, MountTable, MountedFs, Namespace, UnsupportedStorage,
     object_identity,
 };
 
-type TestNamespace = Namespace<UnsupportedHostFileSystem>;
+type TestNamespace = Namespace<UnsupportedStorage>;
 
 const IMAGE: EmbeddedBootFs = EmbeddedBootFs::new(
     &[

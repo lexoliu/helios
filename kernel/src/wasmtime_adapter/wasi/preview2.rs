@@ -318,8 +318,8 @@ struct EmptyInputStream;
 /// pollable (and which `blocking-read` awaits for it). Only one chunk is
 /// ever resident, so streaming a large file never scales kernel memory
 /// with the file's size.
-struct FileInputStream<HostFs> {
-    file: HeldPath<HostFs>,
+struct FileInputStream<StorageImpl: crate::Storage> {
+    file: HeldPath<StorageImpl>,
     offset: u64,
     buffer: Bytes,
     end_of_file: bool,
@@ -332,15 +332,15 @@ struct FileInputStream<HostFs> {
 /// or host round trip, so each permitted batch is parked here and handed
 /// to the filesystem from `Pollable::ready`; `check_write` withholds the
 /// next permit until then.
-struct FileOutputStream<CpuImpl, Net, HostFs>
+struct FileOutputStream<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     cpu: CpuImpl,
-    runtime_state: HostRuntimeState<CpuImpl, Net, HostFs>,
-    file: HeldPath<HostFs>,
+    runtime_state: HostRuntimeState<CpuImpl, Net, StorageImpl>,
+    file: HeldPath<StorageImpl>,
     mode: WritePosition,
     pending: Option<Bytes>,
     failure: Option<p2fs::ErrorCode>,
@@ -352,11 +352,11 @@ enum P2FileStreamError {
     Failed(p2fs::ErrorCode),
 }
 
-impl<HostFs> FileInputStream<HostFs>
+impl<StorageImpl> FileInputStream<StorageImpl>
 where
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    fn new(file: HeldPath<HostFs>, offset: u64) -> Self {
+    fn new(file: HeldPath<StorageImpl>, offset: u64) -> Self {
         Self {
             file,
             offset,
@@ -390,16 +390,16 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> FileOutputStream<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> FileOutputStream<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn new(
         cpu: CpuImpl,
-        runtime_state: HostRuntimeState<CpuImpl, Net, HostFs>,
-        file: HeldPath<HostFs>,
+        runtime_state: HostRuntimeState<CpuImpl, Net, StorageImpl>,
+        file: HeldPath<StorageImpl>,
         mode: WritePosition,
     ) -> Self {
         Self {
@@ -438,18 +438,18 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     /// A descriptor of this store's table and the store's namespace, in
     /// preview2's error codes.
     fn p2_descriptor(
         &mut self,
         resource: &Resource<FsDescriptor>,
-    ) -> core::result::Result<(FsDescriptor, Namespace<HostFs>), p2fs::ErrorCode> {
+    ) -> core::result::Result<(FsDescriptor, Namespace<StorageImpl>), p2fs::ErrorCode> {
         super::descriptor_in(self, resource).map_err(error_code_from_p3)
     }
 
@@ -460,7 +460,7 @@ where
         resource: &Resource<FsDescriptor>,
         right: p3fs::DescriptorFlags,
         refused: p3fs::ErrorCode,
-    ) -> core::result::Result<HeldPath<HostFs>, p2fs::ErrorCode> {
+    ) -> core::result::Result<HeldPath<StorageImpl>, p2fs::ErrorCode> {
         let (descriptor, namespace) = self.p2_descriptor(resource)?;
         super::stream_target(&namespace, &descriptor, right, refused).map_err(error_code_from_p3)
     }
@@ -486,7 +486,7 @@ where
     /// Backs `set-times` and `set-times-at`.
     async fn set_times_at_absolute_path(
         &mut self,
-        namespace: Namespace<HostFs>,
+        namespace: Namespace<StorageImpl>,
         absolute: String,
         data_access_timestamp: p2fs::NewTimestamp,
         data_modification_timestamp: p2fs::NewTimestamp,
@@ -506,41 +506,41 @@ where
     }
 }
 
-pub(crate) fn add_to_linker<CpuImpl, Net, HostFs>(
-    linker: &mut Linker<StoreData<CpuImpl, Net, HostFs>>,
+pub(crate) fn add_to_linker<CpuImpl, Net, StorageImpl>(
+    linker: &mut Linker<StoreData<CpuImpl, Net, StorageImpl>>,
     imports: &WasiImportSet,
 ) -> Result<()>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     if imports.has("wasi:cli/environment", "0.2") {
-        cli_bindings::cli::environment::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, HostFs>>>(
-            linker,
-            |state| state,
-        )?;
+        cli_bindings::cli::environment::add_to_linker::<
+            _,
+            HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
+        >(linker, |state| state)?;
     }
     if imports.has("wasi:cli/exit", "0.2") {
-        cli_bindings::cli::exit::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, HostFs>>>(
+        cli_bindings::cli::exit::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>(
             linker,
             |state| state,
         )?;
     }
     if imports.has("wasi:cli/stdin", "0.2") {
-        cli_bindings::cli::stdin::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, HostFs>>>(
+        cli_bindings::cli::stdin::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>(
             linker,
             |state| state,
         )?;
     }
     if imports.has("wasi:cli/stdout", "0.2") {
-        cli_bindings::cli::stdout::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, HostFs>>>(
+        cli_bindings::cli::stdout::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>(
             linker,
             |state| state,
         )?;
     }
     if imports.has("wasi:cli/stderr", "0.2") {
-        cli_bindings::cli::stderr::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, HostFs>>>(
+        cli_bindings::cli::stderr::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>(
             linker,
             |state| state,
         )?;
@@ -548,44 +548,44 @@ where
     if imports.has("wasi:cli/terminal-input", "0.2") {
         cli_bindings::cli::terminal_input::add_to_linker::<
             _,
-            HasSelf<StoreData<CpuImpl, Net, HostFs>>,
+            HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
         >(linker, |state| state)?;
     }
     if imports.has("wasi:cli/terminal-output", "0.2") {
         cli_bindings::cli::terminal_output::add_to_linker::<
             _,
-            HasSelf<StoreData<CpuImpl, Net, HostFs>>,
+            HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
         >(linker, |state| state)?;
     }
     if imports.has("wasi:cli/terminal-stdin", "0.2") {
         cli_bindings::cli::terminal_stdin::add_to_linker::<
             _,
-            HasSelf<StoreData<CpuImpl, Net, HostFs>>,
+            HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
         >(linker, |state| state)?;
     }
     if imports.has("wasi:cli/terminal-stdout", "0.2") {
         cli_bindings::cli::terminal_stdout::add_to_linker::<
             _,
-            HasSelf<StoreData<CpuImpl, Net, HostFs>>,
+            HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
         >(linker, |state| state)?;
     }
     if imports.has("wasi:cli/terminal-stderr", "0.2") {
         cli_bindings::cli::terminal_stderr::add_to_linker::<
             _,
-            HasSelf<StoreData<CpuImpl, Net, HostFs>>,
+            HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
         >(linker, |state| state)?;
     }
 
     if imports.has("wasi:clocks/monotonic-clock", "0.2") {
         clocks_bindings::clocks::monotonic_clock::add_to_linker::<
             _,
-            HasSelf<StoreData<CpuImpl, Net, HostFs>>,
+            HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
         >(linker, |state| state)?;
     }
     if imports.has("wasi:clocks/wall-clock", "0.2") {
         clocks_bindings::clocks::wall_clock::add_to_linker::<
             _,
-            HasSelf<StoreData<CpuImpl, Net, HostFs>>,
+            HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
         >(linker, |state| state)?;
     }
     if imports.has("wasi:clocks/timezone", "0.2") {
@@ -595,81 +595,81 @@ where
         options.clocks_timezone(true);
         clocks_bindings::clocks::timezone::add_to_linker::<
             _,
-            HasSelf<StoreData<CpuImpl, Net, HostFs>>,
+            HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
         >(linker, &options, |state| state)?;
     }
 
     if imports.has("wasi:filesystem/preopens", "0.2") {
         filesystem_bindings::filesystem::preopens::add_to_linker::<
             _,
-            HasSelf<StoreData<CpuImpl, Net, HostFs>>,
+            HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
         >(linker, |state| state)?;
     }
     if imports.has("wasi:filesystem/types", "0.2") {
         filesystem_bindings::filesystem::types::add_to_linker::<
             _,
-            HasSelf<StoreData<CpuImpl, Net, HostFs>>,
+            HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
         >(linker, |state| state)?;
     }
 
     if imports.has("wasi:random/random", "0.2") {
         random_bindings::random::random::add_to_linker::<
             _,
-            HasSelf<StoreData<CpuImpl, Net, HostFs>>,
+            HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
         >(linker, |state| state)?;
     }
     if imports.has("wasi:random/insecure", "0.2") {
         random_bindings::random::insecure::add_to_linker::<
             _,
-            HasSelf<StoreData<CpuImpl, Net, HostFs>>,
+            HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
         >(linker, |state| state)?;
     }
     if imports.has("wasi:random/insecure-seed", "0.2") {
         random_bindings::random::insecure_seed::add_to_linker::<
             _,
-            HasSelf<StoreData<CpuImpl, Net, HostFs>>,
+            HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
         >(linker, |state| state)?;
     }
     if imports.has("wasi:sockets/network", "0.2") {
         sockets_bindings::sockets::network::add_to_linker::<
             _,
-            HasSelf<StoreData<CpuImpl, Net, HostFs>>,
+            HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
         >(linker, &Default::default(), |state| state)?;
     }
     if imports.has("wasi:sockets/instance-network", "0.2") {
         sockets_bindings::sockets::instance_network::add_to_linker::<
             _,
-            HasSelf<StoreData<CpuImpl, Net, HostFs>>,
+            HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
         >(linker, |state| state)?;
     }
     if imports.has("wasi:sockets/udp", "0.2") {
-        sockets_bindings::sockets::udp::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, HostFs>>>(
-            linker,
-            |state| state,
-        )?;
+        sockets_bindings::sockets::udp::add_to_linker::<
+            _,
+            HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
+        >(linker, |state| state)?;
     }
     if imports.has("wasi:sockets/udp-create-socket", "0.2") {
         sockets_bindings::sockets::udp_create_socket::add_to_linker::<
             _,
-            HasSelf<StoreData<CpuImpl, Net, HostFs>>,
+            HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
         >(linker, |state| state)?;
     }
     if imports.has("wasi:sockets/tcp", "0.2") {
-        sockets_bindings::sockets::tcp::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, HostFs>>>(
-            linker,
-            |state| state,
-        )?;
+        sockets_bindings::sockets::tcp::add_to_linker::<
+            _,
+            HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
+        >(linker, |state| state)?;
     }
     if imports.has("wasi:sockets/tcp-create-socket", "0.2") {
         sockets_bindings::sockets::tcp_create_socket::add_to_linker::<
             _,
-            HasSelf<StoreData<CpuImpl, Net, HostFs>>,
+            HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
         >(linker, |state| state)?;
     }
     if imports.has("wasi:sockets/ip-name-lookup", "0.2") {
         sockets_bindings::sockets::ip_name_lookup::add_to_linker::<
             _,
-            HasSelf<StoreData<CpuImpl, Net, HostFs>>,
+            HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
         >(linker, |state| state)?;
     }
     Ok(())
@@ -693,9 +693,9 @@ impl InputStream for EmptyInputStream {
 }
 
 #[wasmtime_wasi_io::async_trait]
-impl<HostFs> Pollable for FileInputStream<HostFs>
+impl<StorageImpl> Pollable for FileInputStream<StorageImpl>
 where
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     async fn ready(&mut self) {
         self.fill().await;
@@ -703,9 +703,9 @@ where
 }
 
 #[wasmtime_wasi_io::async_trait]
-impl<HostFs> InputStream for FileInputStream<HostFs>
+impl<StorageImpl> InputStream for FileInputStream<StorageImpl>
 where
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn read(&mut self, size: usize) -> core::result::Result<Bytes, StreamError> {
         // A failure is sticky: once a read has failed the stream is broken,
@@ -729,11 +729,11 @@ where
 }
 
 #[wasmtime_wasi_io::async_trait]
-impl<CpuImpl, Net, HostFs> Pollable for FileOutputStream<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> Pollable for FileOutputStream<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     async fn ready(&mut self) {
         self.flush_pending().await;
@@ -741,11 +741,11 @@ where
 }
 
 #[wasmtime_wasi_io::async_trait]
-impl<CpuImpl, Net, HostFs> OutputStream for FileOutputStream<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> OutputStream for FileOutputStream<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn write(&mut self, bytes: Bytes) -> core::result::Result<(), StreamError> {
         // Sticky, like the read side: a stream whose write failed stays
@@ -836,11 +836,12 @@ impl Pollable for P2ResolveAddressStream {
     }
 }
 
-impl<CpuImpl, Net, HostFs> cli_bindings::cli::environment::Host for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> cli_bindings::cli::environment::Host
+    for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn get_environment(&mut self) -> Result<Vec<(String, String)>> {
         Ok(self.environment().to_vec())
@@ -858,11 +859,12 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> cli_bindings::cli::exit::Host for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> cli_bindings::cli::exit::Host
+    for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn exit(&mut self, status: core::result::Result<(), ()>) -> Result<()> {
         let code = match status {
@@ -883,11 +885,12 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> cli_bindings::cli::stdin::Host for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> cli_bindings::cli::stdin::Host
+    for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn get_stdin(&mut self) -> Result<Resource<DynInputStream>> {
         let stream: DynInputStream = match self.output_mode() {
@@ -903,11 +906,12 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> cli_bindings::cli::stdout::Host for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> cli_bindings::cli::stdout::Host
+    for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn get_stdout(&mut self) -> Result<Resource<DynOutputStream>> {
         let stream = build_stdio_stream(self, ComponentOutputStreamKind::Stdout);
@@ -915,11 +919,12 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> cli_bindings::cli::stderr::Host for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> cli_bindings::cli::stderr::Host
+    for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn get_stderr(&mut self) -> Result<Resource<DynOutputStream>> {
         let stream = build_stdio_stream(self, ComponentOutputStreamKind::Stderr);
@@ -927,14 +932,14 @@ where
     }
 }
 
-fn build_stdio_stream<CpuImpl, Net, HostFs>(
-    store: &StoreData<CpuImpl, Net, HostFs>,
+fn build_stdio_stream<CpuImpl, Net, StorageImpl>(
+    store: &StoreData<CpuImpl, Net, StorageImpl>,
     kind: ComponentOutputStreamKind,
 ) -> StdioOutputStream
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     match store.output_mode() {
         ComponentOutputMode::Child { .. } => {
@@ -968,29 +973,29 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> cli_bindings::cli::terminal_input::Host
-    for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> cli_bindings::cli::terminal_input::Host
+    for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
 }
-impl<CpuImpl, Net, HostFs> cli_bindings::cli::terminal_output::Host
-    for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> cli_bindings::cli::terminal_output::Host
+    for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
 }
 
-impl<CpuImpl, Net, HostFs> cli_bindings::cli::terminal_input::HostTerminalInput
-    for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> cli_bindings::cli::terminal_input::HostTerminalInput
+    for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn drop(&mut self, resource: Resource<TerminalInput>) -> Result<()> {
         self.table.delete(resource)?;
@@ -998,12 +1003,12 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> cli_bindings::cli::terminal_output::HostTerminalOutput
-    for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> cli_bindings::cli::terminal_output::HostTerminalOutput
+    for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn drop(&mut self, resource: Resource<TerminalOutput>) -> Result<()> {
         self.table.delete(resource)?;
@@ -1011,12 +1016,12 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> cli_bindings::cli::terminal_stdin::Host
-    for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> cli_bindings::cli::terminal_stdin::Host
+    for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn get_terminal_stdin(&mut self) -> Result<Option<Resource<TerminalInput>>> {
         if !stdin_is_terminal(self.output_mode()) {
@@ -1026,12 +1031,12 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> cli_bindings::cli::terminal_stdout::Host
-    for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> cli_bindings::cli::terminal_stdout::Host
+    for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn get_terminal_stdout(&mut self) -> Result<Option<Resource<TerminalOutput>>> {
         if !output_is_terminal(self.output_mode(), ComponentOutputStreamKind::Stdout) {
@@ -1041,12 +1046,12 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> cli_bindings::cli::terminal_stderr::Host
-    for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> cli_bindings::cli::terminal_stderr::Host
+    for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn get_terminal_stderr(&mut self) -> Result<Option<Resource<TerminalOutput>>> {
         if !output_is_terminal(self.output_mode(), ComponentOutputStreamKind::Stderr) {
@@ -1056,12 +1061,12 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> clocks_bindings::clocks::monotonic_clock::Host
-    for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> clocks_bindings::clocks::monotonic_clock::Host
+    for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn now(&mut self) -> Result<clocks_bindings::clocks::monotonic_clock::Instant> {
         Ok(self.now_nanos())
@@ -1086,12 +1091,12 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> clocks_bindings::clocks::wall_clock::Host
-    for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> clocks_bindings::clocks::wall_clock::Host
+    for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn now(&mut self) -> Result<clocks_bindings::clocks::wall_clock::Datetime> {
         Ok(system_time_from_nanos(self.system_time_nanos()))
@@ -1105,12 +1110,12 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> clocks_bindings::clocks::timezone::Host
-    for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> clocks_bindings::clocks::timezone::Host
+    for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn display(
         &mut self,
@@ -1130,12 +1135,12 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> filesystem_bindings::filesystem::preopens::Host
-    for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> filesystem_bindings::filesystem::preopens::Host
+    for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn get_directories(&mut self) -> Result<Vec<(Resource<FsDescriptor>, String)>> {
         let preopens = self.process_authority().directory_preopens().to_vec();
@@ -1150,24 +1155,24 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> filesystem_bindings::filesystem::types::Host
-    for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> filesystem_bindings::filesystem::types::Host
+    for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn filesystem_error_code(&mut self, _: Resource<IoError>) -> Result<Option<p2fs::ErrorCode>> {
         Ok(None)
     }
 }
 
-impl<CpuImpl, Net, HostFs> filesystem_bindings::filesystem::types::HostDescriptor
-    for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> filesystem_bindings::filesystem::types::HostDescriptor
+    for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn read_via_stream(
         &mut self,
@@ -1647,12 +1652,12 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> filesystem_bindings::filesystem::types::HostDirectoryEntryStream
-    for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> filesystem_bindings::filesystem::types::HostDirectoryEntryStream
+    for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn read_directory_entry(
         &mut self,
@@ -1675,11 +1680,12 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> random_bindings::random::random::Host for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> random_bindings::random::random::Host
+    for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn get_random_bytes(&mut self, len: u64) -> Result<Vec<u8>> {
         let len = super::random_len(len)?;
@@ -1693,12 +1699,12 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> random_bindings::random::insecure::Host
-    for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> random_bindings::random::insecure::Host
+    for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn get_insecure_random_bytes(&mut self, len: u64) -> Result<Vec<u8>> {
         Ok(self.insecure_random_bytes(super::random_len(len)?))
@@ -1709,36 +1715,36 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> random_bindings::random::insecure_seed::Host
-    for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> random_bindings::random::insecure_seed::Host
+    for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn insecure_seed(&mut self) -> Result<(u64, u64)> {
         Ok(self.insecure_seed())
     }
 }
 
-fn delete_resource<R: 'static, CpuImpl, Net, HostFs>(
-    store: &mut StoreData<CpuImpl, Net, HostFs>,
+fn delete_resource<R: 'static, CpuImpl, Net, StorageImpl>(
+    store: &mut StoreData<CpuImpl, Net, StorageImpl>,
     resource: Resource<R>,
 ) -> Result<()>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     store.table.delete(resource)?;
     Ok(())
 }
 
-impl<CpuImpl, Net, HostFs> p2net::Host for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> p2net::Host for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn network_error_code(
         &mut self,
@@ -1748,42 +1754,42 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> p2net::HostNetwork for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> p2net::HostNetwork for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn drop(&mut self, resource: Resource<P2Network>) -> Result<()> {
         delete_resource(self, resource)
     }
 }
 
-impl<CpuImpl, Net, HostFs> sockets_bindings::sockets::instance_network::Host
-    for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> sockets_bindings::sockets::instance_network::Host
+    for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn instance_network(&mut self) -> Result<Resource<P2Network>> {
         self.table.push(P2Network).map_err(Into::into)
     }
 }
 
-impl<CpuImpl, Net, HostFs> p2udp::Host for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> p2udp::Host for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
 }
 
-impl<CpuImpl, Net, HostFs> p2udp::HostUdpSocket for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> p2udp::HostUdpSocket for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     async fn start_bind(
         &mut self,
@@ -1950,11 +1956,12 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> p2udp::HostIncomingDatagramStream for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> p2udp::HostIncomingDatagramStream
+    for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     async fn receive(
         &mut self,
@@ -2011,11 +2018,12 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> p2udp::HostOutgoingDatagramStream for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> p2udp::HostOutgoingDatagramStream
+    for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn check_send(
         &mut self,
@@ -2102,11 +2110,11 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> p2udp_create::Host for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> p2udp_create::Host for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn create_udp_socket(
         &mut self,
@@ -2364,15 +2372,15 @@ fn map_p2_tcp_socket_error(error: super::socket_types::ErrorCode) -> p2tcp::Erro
     }
 }
 
-fn p2_record_kernel_profile<CpuImpl, Net, HostFs>(
-    runtime_state: &HostRuntimeState<CpuImpl, Net, HostFs>,
+fn p2_record_kernel_profile<CpuImpl, Net, StorageImpl>(
+    runtime_state: &HostRuntimeState<CpuImpl, Net, StorageImpl>,
     cpu: &CpuImpl,
     phase: &'static str,
     started_ticks: u64,
 ) where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     if runtime_state.profiling_enabled() {
         runtime_state.record_profile_stack_parts(
@@ -2396,15 +2404,15 @@ fn p2_record_kernel_profile<CpuImpl, Net, HostFs>(
 /// makes teardown trivial: a parked `ready` lives inside the guest's own
 /// task and dies with the store, which is the lifetime the bridge's
 /// channel race had to re-create by hand (#184).
-fn p2_tcp_stream_pair<CpuImpl, Net, HostFs>(
-    store: &mut StoreData<CpuImpl, Net, HostFs>,
+fn p2_tcp_stream_pair<CpuImpl, Net, StorageImpl>(
+    store: &mut StoreData<CpuImpl, Net, StorageImpl>,
     socket_resource: &Resource<TcpSocket>,
     socket: TcpSocket,
 ) -> Result<(Resource<p2tcp::InputStream>, Resource<p2tcp::OutputStream>)>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let started = store.cpu.now().ticks();
     // The streams run without a store, so each carries its own clone of
@@ -2428,19 +2436,19 @@ where
     Ok((input, output))
 }
 
-impl<CpuImpl, Net, HostFs> p2tcp::Host for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> p2tcp::Host for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
 }
 
-impl<CpuImpl, Net, HostFs> p2tcp::HostTcpSocket for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> p2tcp::HostTcpSocket for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn start_bind(
         &mut self,
@@ -3011,11 +3019,11 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> p2tcp_create::Host for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> p2tcp_create::Host for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn create_tcp_socket(
         &mut self,
@@ -3038,11 +3046,11 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> p2lookup::Host for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> p2lookup::Host for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn resolve_addresses(
         &mut self,
@@ -3073,11 +3081,12 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> p2lookup::HostResolveAddressStream for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> p2lookup::HostResolveAddressStream
+    for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn resolve_next_address(
         &mut self,

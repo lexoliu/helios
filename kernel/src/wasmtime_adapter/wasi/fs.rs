@@ -20,24 +20,24 @@ use crate::{
 
 use super::*;
 
-pub(super) struct ComponentFsProfile<CpuImpl, Net, HostFs>
+pub(super) struct ComponentFsProfile<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    pub(super) runtime_state: HostRuntimeState<CpuImpl, Net, HostFs>,
+    pub(super) runtime_state: HostRuntimeState<CpuImpl, Net, StorageImpl>,
     pub(super) cpu: CpuImpl,
     pub(super) started_ticks: u64,
 }
 
-pub(super) fn component_fs_profile<CpuImpl, Net, HostFs>(
-    store: &StoreData<CpuImpl, Net, HostFs>,
-) -> Option<ComponentFsProfile<CpuImpl, Net, HostFs>>
+pub(super) fn component_fs_profile<CpuImpl, Net, StorageImpl>(
+    store: &StoreData<CpuImpl, Net, StorageImpl>,
+) -> Option<ComponentFsProfile<CpuImpl, Net, StorageImpl>>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     store
         .runtime_state
@@ -49,13 +49,13 @@ where
         })
 }
 
-pub(super) fn record_component_fs_profile<CpuImpl, Net, HostFs>(
-    profile: Option<ComponentFsProfile<CpuImpl, Net, HostFs>>,
+pub(super) fn record_component_fs_profile<CpuImpl, Net, StorageImpl>(
+    profile: Option<ComponentFsProfile<CpuImpl, Net, StorageImpl>>,
     operation: &'static str,
 ) where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     if let Some(profile) = profile {
         profile.runtime_state.record_profile_stack_parts(
@@ -160,12 +160,12 @@ pub(crate) fn metadata_hash(metadata: &Metadata) -> fs_types::MetadataHashValue 
     )
 }
 
-fn resolve<'a, HostFs>(
-    namespace: &'a Namespace<HostFs>,
+fn resolve<'a, StorageImpl>(
+    namespace: &'a Namespace<StorageImpl>,
     absolute: &'a str,
-) -> FsOpResult<Resolved<'a, HostFs>>
+) -> FsOpResult<Resolved<'a, StorageImpl>>
 where
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     namespace.resolve(absolute).map_err(fs_error_code)
 }
@@ -215,8 +215,8 @@ fn require_file(
 /// mount; truncating also changes the file's data, so it needs `base`'s
 /// `write` as well. Every right is checked before anything changes: a
 /// refused open leaves the filesystem as it was.
-pub(crate) async fn open_at<HostFs>(
-    namespace: &Namespace<HostFs>,
+pub(crate) async fn open_at<StorageImpl>(
+    namespace: &Namespace<StorageImpl>,
     base: &FsDescriptor,
     path_flags: fs_types::PathFlags,
     path: &str,
@@ -225,7 +225,7 @@ pub(crate) async fn open_at<HostFs>(
     now: u64,
 ) -> FsOpResult<FsDescriptor>
 where
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     require_directory(base)?;
     let absolute = child_path(base, path)?;
@@ -311,13 +311,13 @@ pub(crate) fn follow_within(base: &FsDescriptor, path_flags: fs_types::PathFlags
 
 /// Describes the object `absolute` names, following a final symbolic link
 /// as `follow` says.
-pub(crate) async fn stat_path<HostFs>(
-    namespace: &Namespace<HostFs>,
+pub(crate) async fn stat_path<StorageImpl>(
+    namespace: &Namespace<StorageImpl>,
     absolute: &str,
     follow: Follow<'_>,
 ) -> FsOpResult<Metadata>
 where
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     namespace
         .stat(absolute, follow)
@@ -325,14 +325,14 @@ where
         .map_err(fs_error_code)
 }
 
-pub(crate) async fn stat_at<HostFs>(
-    namespace: &Namespace<HostFs>,
+pub(crate) async fn stat_at<StorageImpl>(
+    namespace: &Namespace<StorageImpl>,
     base: &FsDescriptor,
     path_flags: fs_types::PathFlags,
     path: &str,
 ) -> FsOpResult<Metadata>
 where
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let absolute = child_path(base, path)?;
     stat_path(namespace, &absolute, follow_within(base, path_flags)).await
@@ -351,14 +351,14 @@ fn child_below(base: &FsDescriptor, path: &str) -> FsOpResult<String> {
 }
 
 /// Reads at most `max_bytes` at `offset`; an empty result is end of file.
-pub(crate) async fn read<HostFs>(
-    namespace: &Namespace<HostFs>,
+pub(crate) async fn read<StorageImpl>(
+    namespace: &Namespace<StorageImpl>,
     descriptor: &FsDescriptor,
     offset: u64,
     max_bytes: usize,
 ) -> FsOpResult<Bytes>
 where
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     require_file(
         descriptor,
@@ -370,27 +370,27 @@ where
 
 /// The file a stream reads or writes across polls: `descriptor` must be a
 /// regular file opened with `right`, refused with `refused` otherwise.
-pub(crate) fn stream_target<HostFs>(
-    namespace: &Namespace<HostFs>,
+pub(crate) fn stream_target<StorageImpl>(
+    namespace: &Namespace<StorageImpl>,
     descriptor: &FsDescriptor,
     right: fs_types::DescriptorFlags,
     refused: fs_types::ErrorCode,
-) -> FsOpResult<HeldPath<HostFs>>
+) -> FsOpResult<HeldPath<StorageImpl>>
 where
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     require_file(descriptor, right, refused)?;
     resolve(namespace, &descriptor.path).map(|resolved| resolved.held())
 }
 
 /// One positional read through `resolved`.
-pub(crate) async fn read_resolved<HostFs>(
-    resolved: &Resolved<'_, HostFs>,
+pub(crate) async fn read_resolved<StorageImpl>(
+    resolved: &Resolved<'_, StorageImpl>,
     offset: u64,
     max_bytes: usize,
 ) -> FsOpResult<Bytes>
 where
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     resolved
         .fs()
@@ -401,40 +401,40 @@ where
 
 /// One positional read through a held path, for a stream that must own
 /// its read across polls.
-pub(crate) async fn read_held<HostFs>(
-    held: HeldPath<HostFs>,
+pub(crate) async fn read_held<StorageImpl>(
+    held: HeldPath<StorageImpl>,
     offset: u64,
     max_bytes: usize,
 ) -> FsOpResult<Bytes>
 where
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     read_resolved(&held.resolved(), offset, max_bytes).await
 }
 
 /// Writes `bytes` to the file `descriptor` names, and resolves with the
 /// offset just past them: where a sequential writer continues.
-pub(crate) async fn write<HostFs>(
-    namespace: &Namespace<HostFs>,
+pub(crate) async fn write<StorageImpl>(
+    namespace: &Namespace<StorageImpl>,
     descriptor: &FsDescriptor,
     position: WritePosition,
     bytes: &[u8],
     now: u64,
 ) -> FsOpResult<u64>
 where
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     write_resolved(&writable_file(namespace, descriptor)?, position, bytes, now).await
 }
 
 /// The file `descriptor` names, resolved for a write: it must be a
 /// regular file opened with `write`.
-pub(crate) fn writable_file<'a, HostFs>(
-    namespace: &'a Namespace<HostFs>,
+pub(crate) fn writable_file<'a, StorageImpl>(
+    namespace: &'a Namespace<StorageImpl>,
     descriptor: &'a FsDescriptor,
-) -> FsOpResult<Resolved<'a, HostFs>>
+) -> FsOpResult<Resolved<'a, StorageImpl>>
 where
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     require_file(
         descriptor,
@@ -446,14 +446,14 @@ where
 
 /// Writes `bytes` through `resolved`, and resolves with the offset just
 /// past them.
-pub(crate) async fn write_resolved<HostFs>(
-    resolved: &Resolved<'_, HostFs>,
+pub(crate) async fn write_resolved<StorageImpl>(
+    resolved: &Resolved<'_, StorageImpl>,
     position: WritePosition,
     bytes: &[u8],
     now: u64,
 ) -> FsOpResult<u64>
 where
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     write_resolved_with(resolved, position, bytes.len(), now, |destination| {
         destination.copy_from_slice(bytes)
@@ -469,15 +469,15 @@ where
 ///
 /// `fill` runs before this returns, so it may read guest memory; the
 /// future holds nothing of it.
-pub(crate) fn write_resolved_with<'r, HostFs, F>(
-    resolved: &'r Resolved<'_, HostFs>,
+pub(crate) fn write_resolved_with<'r, StorageImpl, F>(
+    resolved: &'r Resolved<'_, StorageImpl>,
     position: WritePosition,
     len: usize,
     now: u64,
     fill: F,
 ) -> impl Future<Output = FsOpResult<u64>> + Send + 'r
 where
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
     F: FnOnce(&mut [u8]),
 {
     let write = resolved
@@ -491,14 +491,14 @@ where
     }
 }
 
-pub(crate) async fn set_size<HostFs>(
-    namespace: &Namespace<HostFs>,
+pub(crate) async fn set_size<StorageImpl>(
+    namespace: &Namespace<StorageImpl>,
     descriptor: &FsDescriptor,
     size: u64,
     now: u64,
 ) -> FsOpResult<()>
 where
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     require_file(
         descriptor,
@@ -515,15 +515,15 @@ where
 }
 
 /// Sets the times of the object `absolute` names; `None` leaves one alone.
-pub(crate) async fn set_times<HostFs>(
-    namespace: &Namespace<HostFs>,
+pub(crate) async fn set_times<StorageImpl>(
+    namespace: &Namespace<StorageImpl>,
     absolute: &str,
     access_nanos: Option<u64>,
     modified_nanos: Option<u64>,
     now: u64,
 ) -> FsOpResult<()>
 where
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let resolved = resolve(namespace, absolute)?;
     resolved
@@ -536,12 +536,12 @@ where
 
 /// Every entry of the directory `descriptor` names, directories first and
 /// each group by name, with the mount points inside it.
-pub(crate) async fn read_directory<HostFs>(
-    namespace: &Namespace<HostFs>,
+pub(crate) async fn read_directory<StorageImpl>(
+    namespace: &Namespace<StorageImpl>,
     descriptor: &FsDescriptor,
 ) -> FsOpResult<Vec<fs_types::DirectoryEntry>>
 where
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     require_directory(descriptor)?;
     let mut entries: Vec<fs_types::DirectoryEntry> = namespace
@@ -562,14 +562,14 @@ where
     Ok(entries)
 }
 
-pub(crate) async fn create_directory_at<HostFs>(
-    namespace: &Namespace<HostFs>,
+pub(crate) async fn create_directory_at<StorageImpl>(
+    namespace: &Namespace<StorageImpl>,
     base: &FsDescriptor,
     path: &str,
     now: u64,
 ) -> FsOpResult<()>
 where
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     require_mutate_directory(base)?;
     require_directory(base)?;
@@ -586,13 +586,13 @@ where
         .map_err(fs_error_code)
 }
 
-pub(crate) async fn remove_directory_at<HostFs>(
-    namespace: &Namespace<HostFs>,
+pub(crate) async fn remove_directory_at<StorageImpl>(
+    namespace: &Namespace<StorageImpl>,
     base: &FsDescriptor,
     path: &str,
 ) -> FsOpResult<()>
 where
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     require_mutate_directory(base)?;
     let absolute = child_below(base, path)?;
@@ -602,13 +602,13 @@ where
         .map_err(fs_error_code)
 }
 
-pub(crate) async fn unlink_file_at<HostFs>(
-    namespace: &Namespace<HostFs>,
+pub(crate) async fn unlink_file_at<StorageImpl>(
+    namespace: &Namespace<StorageImpl>,
     base: &FsDescriptor,
     path: &str,
 ) -> FsOpResult<()>
 where
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     require_mutate_directory(base)?;
     let absolute = child_below(base, path)?;
@@ -625,8 +625,8 @@ where
 }
 
 /// Renames within one mount; across two, `cross-device`.
-pub(crate) async fn rename_at<HostFs>(
-    namespace: &Namespace<HostFs>,
+pub(crate) async fn rename_at<StorageImpl>(
+    namespace: &Namespace<StorageImpl>,
     source_base: &FsDescriptor,
     source_path: &str,
     destination_base: &FsDescriptor,
@@ -634,7 +634,7 @@ pub(crate) async fn rename_at<HostFs>(
     now: u64,
 ) -> FsOpResult<()>
 where
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     require_directory(source_base)?;
     require_directory(destination_base)?;
@@ -649,8 +649,8 @@ where
 }
 
 /// Links within one mount; across two, `cross-device`.
-pub(crate) async fn link_at<HostFs>(
-    namespace: &Namespace<HostFs>,
+pub(crate) async fn link_at<StorageImpl>(
+    namespace: &Namespace<StorageImpl>,
     source_base: &FsDescriptor,
     source_path: &str,
     destination_base: &FsDescriptor,
@@ -658,7 +658,7 @@ pub(crate) async fn link_at<HostFs>(
     now: u64,
 ) -> FsOpResult<()>
 where
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     require_directory(source_base)?;
     require_directory(destination_base)?;
@@ -673,15 +673,15 @@ where
 
 /// Creates a symbolic link at `path` below `base` whose target text is
 /// `target`. The target must name something inside the link's directory.
-pub(crate) async fn symlink_at<HostFs>(
-    namespace: &Namespace<HostFs>,
+pub(crate) async fn symlink_at<StorageImpl>(
+    namespace: &Namespace<StorageImpl>,
     base: &FsDescriptor,
     target: &str,
     path: &str,
     now: u64,
 ) -> FsOpResult<()>
 where
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     require_directory(base)?;
     require_mutate_directory(base)?;
@@ -698,13 +698,13 @@ where
 
 /// The target text of the symbolic link at `path` below `base`, refused
 /// when it would name something outside the link's directory.
-pub(crate) async fn readlink_at<HostFs>(
-    namespace: &Namespace<HostFs>,
+pub(crate) async fn readlink_at<StorageImpl>(
+    namespace: &Namespace<StorageImpl>,
     base: &FsDescriptor,
     path: &str,
 ) -> FsOpResult<String>
 where
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     require_directory(base)?;
     let absolute = child_path(base, path)?;
@@ -720,13 +720,13 @@ where
 
 /// Makes the descriptor's object durable: its data, and its metadata
 /// unless `data_only`.
-pub(crate) async fn sync<HostFs>(
-    namespace: &Namespace<HostFs>,
+pub(crate) async fn sync<StorageImpl>(
+    namespace: &Namespace<StorageImpl>,
     descriptor: &FsDescriptor,
     data_only: bool,
 ) -> FsOpResult<()>
 where
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let resolved = resolve(namespace, &descriptor.path)?;
     let fs = resolved.fs();
@@ -745,13 +745,13 @@ where
 /// `floor` is the directory whose grant admits the load
 /// ([`crate::ProcessAuthority::program_load_floor`]); a symbolic link
 /// that leads out of it is refused.
-pub(crate) async fn read_program_file<HostFs>(
-    namespace: &Namespace<HostFs>,
+pub(crate) async fn read_program_file<StorageImpl>(
+    namespace: &Namespace<StorageImpl>,
     absolute: &str,
     floor: &str,
 ) -> FsOpResult<FileContents>
 where
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let resolved = namespace
         .resolve_following(absolute, Follow::Within(floor))
@@ -761,14 +761,14 @@ where
 }
 
 /// Creates or replaces the file `absolute` names with `bytes`.
-pub(crate) async fn write_program_file<HostFs>(
-    namespace: &Namespace<HostFs>,
+pub(crate) async fn write_program_file<StorageImpl>(
+    namespace: &Namespace<StorageImpl>,
     absolute: &str,
     bytes: &[u8],
     now: u64,
 ) -> FsOpResult<()>
 where
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let resolved = resolve(namespace, absolute)?;
     let fs = resolved.writable().map_err(fs_error_code)?;
@@ -791,14 +791,14 @@ type ChunkReadResult = FsOpResult<Bytes>;
 type ChunkWriteResult = FsOpResult<usize>;
 
 /// One write of a stream's batch, as a future the consumer owns by value.
-async fn write_chunk<HostFs>(
-    held: HeldPath<HostFs>,
+async fn write_chunk<StorageImpl>(
+    held: HeldPath<StorageImpl>,
     mode: WritePosition,
     bytes: Vec<u8>,
     now: u64,
 ) -> ChunkWriteResult
 where
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     write_resolved(&held.resolved(), mode, &bytes, now).await?;
     Ok(bytes.len())
@@ -824,17 +824,23 @@ pin_project! {
     /// [`file_read_producer`] infers from [`read_held`], and `start`
     /// mints the next one: only one chunk is ever in flight, so a stream
     /// over a large file never holds more than one chunk of kernel memory.
-    pub(super) struct FileReadStreamProducer<HostFs, Fut> {
-        pub(super) held: HeldPath<HostFs>,
+    pub(super) struct FileReadStreamProducer<StorageImpl, Fut>
+    where
+        StorageImpl: crate::Storage,
+    {
+        pub(super) held: HeldPath<StorageImpl>,
         pub(super) offset: u64,
         pub(super) chunk_bytes: usize,
-        pub(super) start: fn(HeldPath<HostFs>, u64, usize) -> Fut,
+        pub(super) start: fn(HeldPath<StorageImpl>, u64, usize) -> Fut,
         #[pin]
         pub(super) pending: Option<Fut>,
         pub(super) result: Option<oneshot::Sender<FsOpResult<()>>>,
     }
 
-    impl<HostFs, Fut> PinnedDrop for FileReadStreamProducer<HostFs, Fut> {
+    impl<StorageImpl, Fut> PinnedDrop for FileReadStreamProducer<StorageImpl, Fut>
+    where
+        StorageImpl: crate::Storage,
+    {
         fn drop(this: Pin<&mut Self>) {
             complete_file_transfer(this.project().result, Ok(()));
         }
@@ -842,28 +848,28 @@ pin_project! {
 }
 
 /// The `read-via-stream` source for `held`, from `offset`.
-pub(super) fn file_read_producer<HostFs>(
-    held: HeldPath<HostFs>,
+pub(super) fn file_read_producer<StorageImpl>(
+    held: HeldPath<StorageImpl>,
     offset: u64,
     chunk_bytes: usize,
     result: oneshot::Sender<FsOpResult<()>>,
-) -> FileReadStreamProducer<HostFs, impl core::future::Future<Output = ChunkReadResult> + Send>
+) -> FileReadStreamProducer<StorageImpl, impl core::future::Future<Output = ChunkReadResult> + Send>
 where
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     FileReadStreamProducer {
         held,
         offset,
         chunk_bytes,
-        start: read_held::<HostFs>,
+        start: read_held::<StorageImpl>,
         pending: None,
         result: Some(result),
     }
 }
 
-impl<T: 'static, HostFs, Fut> StreamProducer<T> for FileReadStreamProducer<HostFs, Fut>
+impl<T: 'static, StorageImpl, Fut> StreamProducer<T> for FileReadStreamProducer<StorageImpl, Fut>
 where
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
     Fut: core::future::Future<Output = ChunkReadResult> + Send + 'static,
 {
     type Item = u8;
@@ -923,31 +929,31 @@ pin_project! {
     /// The `write-via-stream` and `append-via-stream` sink for one file,
     /// the mirror of [`FileReadStreamProducer`]. `mode` decides whether
     /// each batch lands at the stream's own offset or at the end of file.
-    pub(super) struct FileWriteConsumer<T, CpuImpl, Net, HostFs, Fut>
+    pub(super) struct FileWriteConsumer<T, CpuImpl, Net, StorageImpl, Fut>
     where
         // `pin_project!` parses each where-clause bound as one path, so
         // `Cpu` and `Clone` are two predicates here rather than `Cpu + Clone`.
         CpuImpl: Cpu,
         CpuImpl: Clone,
         Net: ComponentHostNetwork,
-        HostFs: crate::HostFileSystem,
+        StorageImpl: crate::Storage,
     {
-        pub(super) getter: fn(&mut T) -> &mut StoreData<CpuImpl, Net, HostFs>,
-        pub(super) held: HeldPath<HostFs>,
+        pub(super) getter: fn(&mut T) -> &mut StoreData<CpuImpl, Net, StorageImpl>,
+        pub(super) held: HeldPath<StorageImpl>,
         pub(super) mode: WritePosition,
-        pub(super) start: fn(HeldPath<HostFs>, WritePosition, Vec<u8>, u64) -> Fut,
+        pub(super) start: fn(HeldPath<StorageImpl>, WritePosition, Vec<u8>, u64) -> Fut,
         #[pin]
         pub(super) pending: Option<Fut>,
         pub(super) result: Option<oneshot::Sender<FsOpResult<()>>>,
     }
 
-    impl<T, CpuImpl, Net, HostFs, Fut> PinnedDrop
-        for FileWriteConsumer<T, CpuImpl, Net, HostFs, Fut>
+    impl<T, CpuImpl, Net, StorageImpl, Fut> PinnedDrop
+        for FileWriteConsumer<T, CpuImpl, Net, StorageImpl, Fut>
     where
         CpuImpl: Cpu,
         CpuImpl: Clone,
         Net: ComponentHostNetwork,
-        HostFs: crate::HostFileSystem,
+        StorageImpl: crate::Storage,
     {
         fn drop(this: Pin<&mut Self>) {
             complete_file_transfer(this.project().result, Ok(()));
@@ -956,40 +962,40 @@ pin_project! {
 }
 
 /// The `write-via-stream` and `append-via-stream` sink for `held`.
-pub(super) fn file_write_consumer<T, CpuImpl, Net, HostFs>(
-    getter: fn(&mut T) -> &mut StoreData<CpuImpl, Net, HostFs>,
-    held: HeldPath<HostFs>,
+pub(super) fn file_write_consumer<T, CpuImpl, Net, StorageImpl>(
+    getter: fn(&mut T) -> &mut StoreData<CpuImpl, Net, StorageImpl>,
+    held: HeldPath<StorageImpl>,
     mode: WritePosition,
     result: oneshot::Sender<FsOpResult<()>>,
 ) -> FileWriteConsumer<
     T,
     CpuImpl,
     Net,
-    HostFs,
+    StorageImpl,
     impl core::future::Future<Output = ChunkWriteResult> + Send,
 >
 where
     T: 'static,
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     FileWriteConsumer {
         getter,
         held,
         mode,
-        start: write_chunk::<HostFs>,
+        start: write_chunk::<StorageImpl>,
         pending: None,
         result: Some(result),
     }
 }
 
-impl<T: 'static, CpuImpl, Net, HostFs, Fut> StreamConsumer<T>
-    for FileWriteConsumer<T, CpuImpl, Net, HostFs, Fut>
+impl<T: 'static, CpuImpl, Net, StorageImpl, Fut> StreamConsumer<T>
+    for FileWriteConsumer<T, CpuImpl, Net, StorageImpl, Fut>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
     Fut: core::future::Future<Output = ChunkWriteResult> + Send + 'static,
 {
     type Item = u8;
@@ -1055,25 +1061,25 @@ pin_project! {
 
 /// Lists `descriptor` through an owned namespace, for a stream that must
 /// own the listing across polls.
-async fn list_owned<HostFs>(
-    namespace: Namespace<HostFs>,
+async fn list_owned<StorageImpl>(
+    namespace: Namespace<StorageImpl>,
     descriptor: FsDescriptor,
 ) -> FsOpResult<Vec<fs_types::DirectoryEntry>>
 where
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     read_directory(&namespace, &descriptor).await
 }
 
-pub(super) fn directory_producer<HostFs>(
-    namespace: Namespace<HostFs>,
+pub(super) fn directory_producer<StorageImpl>(
+    namespace: Namespace<StorageImpl>,
     descriptor: FsDescriptor,
     result: oneshot::Sender<FsOpResult<()>>,
 ) -> DirectoryStreamProducer<
     impl core::future::Future<Output = FsOpResult<Vec<fs_types::DirectoryEntry>>> + Send,
 >
 where
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     DirectoryStreamProducer {
         listing: list_owned(namespace, descriptor),
@@ -1177,29 +1183,29 @@ pub(crate) fn effective_open_descriptor_flags(
 
 /// A descriptor of the store's table and the store's namespace, for an
 /// operation to run on after the store is released.
-pub(crate) fn descriptor_in<CpuImpl, Net, HostFs>(
-    store: &mut StoreData<CpuImpl, Net, HostFs>,
+pub(crate) fn descriptor_in<CpuImpl, Net, StorageImpl>(
+    store: &mut StoreData<CpuImpl, Net, StorageImpl>,
     resource: &Resource<FsDescriptor>,
-) -> FsOpResult<(FsDescriptor, Namespace<HostFs>)>
+) -> FsOpResult<(FsDescriptor, Namespace<StorageImpl>)>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let descriptor = get_fs_descriptor(store, resource)?;
     Ok((descriptor, store.filesystem().clone()))
 }
 
 /// Two descriptors of the store's table and the store's namespace.
-pub(crate) fn descriptor_pair_in<CpuImpl, Net, HostFs>(
-    store: &mut StoreData<CpuImpl, Net, HostFs>,
+pub(crate) fn descriptor_pair_in<CpuImpl, Net, StorageImpl>(
+    store: &mut StoreData<CpuImpl, Net, StorageImpl>,
     first: &Resource<FsDescriptor>,
     second: &Resource<FsDescriptor>,
-) -> FsOpResult<(FsDescriptor, FsDescriptor, Namespace<HostFs>)>
+) -> FsOpResult<(FsDescriptor, FsDescriptor, Namespace<StorageImpl>)>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let first = get_fs_descriptor(store, first)?;
     let second = get_fs_descriptor(store, second)?;
@@ -1225,11 +1231,12 @@ fn failed_transfer<S: wasmtime::AsContextMut>(
     FutureReader::new(store, async move { Ok::<_, wasmtime::Error>(Err(error)) })
 }
 
-impl<CpuImpl, Net, HostFs> wasi::filesystem::preopens::Host for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> wasi::filesystem::preopens::Host
+    for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn get_directories(&mut self) -> Result<Vec<(Resource<FsDescriptor>, String)>> {
         let preopens = self.process_authority().directory_preopens().to_vec();
@@ -1244,23 +1251,24 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> wasi::filesystem::types::Host for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> wasi::filesystem::types::Host
+    for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn convert_error_code(&mut self, error: FsError) -> Result<fs_types::ErrorCode> {
         error.downcast()
     }
 }
 
-impl<CpuImpl, Net, HostFs> wasi::filesystem::types::HostDescriptor
-    for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> wasi::filesystem::types::HostDescriptor
+    for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn drop(&mut self, descriptor: Resource<FsDescriptor>) -> Result<()> {
         self.table.delete(descriptor)?;
@@ -1268,12 +1276,12 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs, U> wasi::filesystem::types::HostDescriptorWithStore<U>
-    for HasSelf<StoreData<CpuImpl, Net, HostFs>>
+impl<CpuImpl, Net, StorageImpl, U> wasi::filesystem::types::HostDescriptorWithStore<U>
+    for HasSelf<StoreData<CpuImpl, Net, StorageImpl>>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn read_via_stream(
         mut accessor: Access<'_, U, Self>,
@@ -1693,8 +1701,8 @@ where
 
 /// Pipes the guest's `data` into the file `descriptor` names, at an
 /// offset or at the end of file as `mode` says.
-fn pipe_into_file<U, CpuImpl, Net, HostFs>(
-    mut accessor: Access<'_, U, HasSelf<StoreData<CpuImpl, Net, HostFs>>>,
+fn pipe_into_file<U, CpuImpl, Net, StorageImpl>(
+    mut accessor: Access<'_, U, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>,
     descriptor: Resource<FsDescriptor>,
     mut data: StreamReader<u8>,
     mode: WritePosition,
@@ -1702,7 +1710,7 @@ fn pipe_into_file<U, CpuImpl, Net, HostFs>(
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let resolved =
         descriptor_in(accessor.get(), &descriptor).and_then(|(descriptor, namespace)| {
@@ -1730,14 +1738,14 @@ where
     }
 }
 
-pub(super) fn get_fs_descriptor<CpuImpl, Net, HostFs>(
-    store: &mut StoreData<CpuImpl, Net, HostFs>,
+pub(super) fn get_fs_descriptor<CpuImpl, Net, StorageImpl>(
+    store: &mut StoreData<CpuImpl, Net, StorageImpl>,
     resource: &Resource<FsDescriptor>,
 ) -> FsOpResult<FsDescriptor>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     store
         .table

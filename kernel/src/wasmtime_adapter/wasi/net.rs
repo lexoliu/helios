@@ -354,26 +354,27 @@ fn complete_socket_transfer(
     }
 }
 
-pub(super) struct TcpListenStreamProducer<T, CpuImpl, Net, HostFs>
+pub(super) struct TcpListenStreamProducer<T, CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     pub(super) socket: TcpSocket,
     /// The service every accept this stream starts runs on, taken from
     /// the store when the listen began.
     pub(super) service: Net,
-    pub(super) get_store_data: for<'a> fn(&'a mut T) -> &'a mut StoreData<CpuImpl, Net, HostFs>,
+    pub(super) get_store_data:
+        for<'a> fn(&'a mut T) -> &'a mut StoreData<CpuImpl, Net, StorageImpl>,
     pub(super) spawner: crate::InstanceSpawner<CpuImpl>,
     pub(super) waiter: crate::NotifyWaiter,
 }
 
-impl<T, CpuImpl, Net, HostFs> Unpin for TcpListenStreamProducer<T, CpuImpl, Net, HostFs>
+impl<T, CpuImpl, Net, StorageImpl> Unpin for TcpListenStreamProducer<T, CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
 }
 
@@ -1191,16 +1192,16 @@ where
     }
 }
 
-impl<T, CpuImpl, Net, HostFs> TcpListenStreamProducer<T, CpuImpl, Net, HostFs>
+impl<T, CpuImpl, Net, StorageImpl> TcpListenStreamProducer<T, CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     pub(super) fn new(
         socket: TcpSocket,
         service: Net,
-        get_store_data: for<'a> fn(&'a mut T) -> &'a mut StoreData<CpuImpl, Net, HostFs>,
+        get_store_data: for<'a> fn(&'a mut T) -> &'a mut StoreData<CpuImpl, Net, StorageImpl>,
         spawner: crate::InstanceSpawner<CpuImpl>,
     ) -> Self {
         let waiter = socket.ready.waiter();
@@ -1214,12 +1215,13 @@ where
     }
 }
 
-impl<T, CpuImpl, Net, HostFs> StreamProducer<T> for TcpListenStreamProducer<T, CpuImpl, Net, HostFs>
+impl<T, CpuImpl, Net, StorageImpl> StreamProducer<T>
+    for TcpListenStreamProducer<T, CpuImpl, Net, StorageImpl>
 where
     T: 'static,
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     type Item = Resource<TcpSocket>;
     type Buffer = Option<Self::Item>;
@@ -2006,18 +2008,19 @@ pub(super) fn network_ip_address_is_unspecified(address: crate::NetworkIpAddress
     }
 }
 
-impl<CpuImpl, Net, HostFs> wasi::sockets::types::Host for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> wasi::sockets::types::Host for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
 }
-impl<CpuImpl, Net, HostFs> wasi::sockets::types::HostTcpSocket for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> wasi::sockets::types::HostTcpSocket
+    for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     async fn bind(
         &mut self,
@@ -2231,11 +2234,12 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> wasi::sockets::types::HostUdpSocket for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> wasi::sockets::types::HostUdpSocket
+    for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     async fn bind(
         &mut self,
@@ -2419,12 +2423,12 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs, U> wasi::sockets::types::HostTcpSocketWithStore<U>
-    for HasSelf<StoreData<CpuImpl, Net, HostFs>>
+impl<CpuImpl, Net, StorageImpl, U> wasi::sockets::types::HostTcpSocketWithStore<U>
+    for HasSelf<StoreData<CpuImpl, Net, StorageImpl>>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     async fn connect(
         accessor: &Accessor<U, Self>,
@@ -2614,12 +2618,12 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs, U> wasi::sockets::types::HostUdpSocketWithStore<U>
-    for HasSelf<StoreData<CpuImpl, Net, HostFs>>
+impl<CpuImpl, Net, StorageImpl, U> wasi::sockets::types::HostUdpSocketWithStore<U>
+    for HasSelf<StoreData<CpuImpl, Net, StorageImpl>>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     async fn send(
         accessor: &Accessor<U, Self>,
@@ -2909,20 +2913,21 @@ pub(super) fn map_p3_udp_socket_error(error: WasiUdpSocketError) -> socket_types
     }
 }
 
-impl<CpuImpl, Net, HostFs> wasi::sockets::ip_name_lookup::Host for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> wasi::sockets::ip_name_lookup::Host
+    for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
 }
 
-impl<CpuImpl, Net, HostFs, U> wasi::sockets::ip_name_lookup::HostWithStore<U>
-    for HasSelf<StoreData<CpuImpl, Net, HostFs>>
+impl<CpuImpl, Net, StorageImpl, U> wasi::sockets::ip_name_lookup::HostWithStore<U>
+    for HasSelf<StoreData<CpuImpl, Net, StorageImpl>>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     async fn resolve_addresses(
         accessor: &Accessor<U, Self>,
