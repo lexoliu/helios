@@ -1189,6 +1189,8 @@ fn current_pressure() -> PressureLevel {
 }
 
 #[cfg(test)]
+mod lz4_tests;
+#[cfg(test)]
 mod service_tests;
 #[cfg(test)]
 mod space_tests;
