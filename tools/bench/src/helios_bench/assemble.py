@@ -154,6 +154,7 @@ def build_workload(
         uncompared=uncompared,
         description=workload["description"],
         throughput_bytes=workload.get("throughput_bytes"),
+        matched_metrics=tuple(workload.get("matched_metrics", [])),
         cells=cells,
         failures=failures or {},
         comparisons=comparisons,
