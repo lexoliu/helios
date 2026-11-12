@@ -137,7 +137,7 @@ where
             let now = StackInstant::from_nanos(self.now_nanos());
             let mut shard = self.inner.state.shard_at(socket.shard_idx).lock();
             shard.send_dns_queries(socket, queries, host, &answers, now)?;
-            shard.poll_dns_responses(socket, queries, &mut answers)?;
+            shard.poll_dns_responses(socket, queries, host, &mut answers)?;
             drop(shard);
             if answers.complete() {
                 return answers.finish();
@@ -1157,10 +1157,16 @@ impl NetworkShard {
 
     /// Drains this lookup's resolver socket, banking whichever of the
     /// pair's answers have arrived.
+    ///
+    /// A datagram counts as an answer only when its id selects one of
+    /// the pair and the question it repeats is `host` with that id's
+    /// record type: anything else, a forgery included, is dropped and
+    /// leaves the question outstanding.
     pub(super) fn poll_dns_responses(
         &mut self,
         socket: &ResolverSocket,
         queries: DnsQueryPair,
+        host: &str,
         answers: &mut DnsAnswers,
     ) -> Result<(), DnsError> {
         let socket = socket.stack_socket;
@@ -1168,16 +1174,22 @@ impl NetworkShard {
             kind: DnsErrorKind::Unavailable,
             detail: NetworkErrorDetail::DnsQueryStartFailed,
         })? {
-            let Some(message) = DnsResponse::parse(&datagram.bytes).and_then(DnsResponse::message)
-            else {
+            let Some(response) = DnsResponse::parse(&datagram.bytes) else {
                 continue;
             };
-            if message.id == queries.a {
-                answers.a_answered = true;
-            } else if message.id == queries.aaaa {
-                answers.aaaa_answered = true;
+            let record = if response.id() == queries.a {
+                DnsRecordType::A
+            } else if response.id() == queries.aaaa {
+                DnsRecordType::Aaaa
             } else {
                 continue;
+            };
+            let Some(message) = response.message(DnsQuery { name: host, record }) else {
+                continue;
+            };
+            match record {
+                DnsRecordType::A => answers.a_answered = true,
+                DnsRecordType::Aaaa => answers.aaaa_answered = true,
             }
             answers.extend(message.addresses.iter().copied());
         }
