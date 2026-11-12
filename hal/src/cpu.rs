@@ -267,6 +267,44 @@ pub enum TimerInterrupt {
     Periodic,
 }
 
+/// The control-flow integrity a backend brought up for code that runs at
+/// the kernel's privilege level.
+///
+/// # Concurrency contract
+///
+/// The backend computes the value on the bootstrap processor before the
+/// `Cpu` reaches the kernel and never changes it. It enables every
+/// mechanism the value names on each processor before that processor runs
+/// anything the kernel schedules and before [`Cpu::start_processor`]
+/// returns for it, and refuses to start a processor that lacks one.
+/// Reading the value is a copy, on any processor and in any context.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ControlFlowIntegrity {
+    /// The backend's image signs every return address a non-leaf function
+    /// saves on the stack and authenticates it before returning, with one
+    /// instruction key shared by every processor (Arm FEAT_PAuth, key A).
+    /// Other code is authenticated only where it was compiled to sign its
+    /// own return addresses; a return address saved without signing (an
+    /// exception frame, assembly) is not covered.
+    pub return_addresses: Option<ReturnAddressSigning>,
+}
+
+impl ControlFlowIntegrity {
+    /// A backend that enabled no control-flow integrity mechanism.
+    pub const NONE: Self = Self {
+        return_addresses: None,
+    };
+}
+
+/// How a processor reacts to a return address that fails authentication.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReturnAddressSigning {
+    /// A failed authentication raises an exception at the authenticating
+    /// instruction (Arm FEAT_FPAC); without it the instruction leaves a
+    /// pointer that faults where it is used.
+    pub faults_at_authentication: bool,
+}
+
 pub trait Cpu: Send + Sync + 'static {
     /// How this platform's timer interrupt is scheduled.
     ///
@@ -367,6 +405,9 @@ pub trait Cpu: Send + Sync + 'static {
     /// The kernel calls this during bootstrap for every processor other than the
     /// bootstrap processor. Implementations may panic if the platform cannot start the
     /// requested processor, because that is a real bring-up failure.
+    ///
+    /// The call returns only after that processor has enabled every
+    /// mechanism [`Cpu::control_flow_integrity`] names.
     fn start_processor(&self, processor: ProcessorId);
 
     /// Nudges a processor that may currently be parked so it can observe newly
@@ -452,6 +493,15 @@ pub trait Cpu: Send + Sync + 'static {
         false
     }
 
+    /// The control-flow integrity this backend enabled on every processor.
+    ///
+    /// The default [`ControlFlowIntegrity::NONE`] means the backend enabled
+    /// nothing. A backend that enables a mechanism reports it here, and the
+    /// value is the same on every processor.
+    fn control_flow_integrity(&self) -> ControlFlowIntegrity {
+        ControlFlowIntegrity::NONE
+    }
+
     /// Zero-initializes `size` bytes starting at `ptr`.
     ///
     /// The default implementation falls through to
@@ -483,9 +533,22 @@ pub trait Cpu: Send + Sync + 'static {
 mod tests {
     use core::time::Duration;
 
-    use super::Timebase;
+    use super::{ControlFlowIntegrity, ReturnAddressSigning, Timebase};
 
     const GIGAHERTZ: u64 = 1_000_000_000;
+
+    #[test]
+    fn no_control_flow_integrity_names_no_mechanism() {
+        assert_eq!(ControlFlowIntegrity::NONE.return_addresses, None);
+        assert_ne!(
+            ControlFlowIntegrity::NONE,
+            ControlFlowIntegrity {
+                return_addresses: Some(ReturnAddressSigning {
+                    faults_at_authentication: false,
+                }),
+            }
+        );
+    }
 
     #[test]
     fn infinite_guest_timeout_saturates_instead_of_panicking() {
