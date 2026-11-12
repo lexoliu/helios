@@ -749,3 +749,80 @@ def test_the_baseline_builds_against_the_fork_its_commit_pins(jobs):
         by_uses["./helios/.github/actions/collect-kernel-profile"]["with"]["checkout-path"]
         == "${{ env.CHECKOUT_PATH }}"
     )
+
+
+def evaluate(expression: str, event_name: str, action: str = "", labels=(), label: str = "") -> bool:
+    """Evaluate the boolean subset of GitHub's expression language the
+    workflows' conditions use: `==`, `!=`, `!`, `&&`, `||`, parentheses,
+    string literals, `github.event_name`, `github.event.action`,
+    `github.event.label.name` and `contains(...labels.*.name, '<name>')`."""
+    python = expression.strip().removeprefix("${{").removesuffix("}}")
+    python = re.sub(
+        r"contains\(github\.event\.pull_request\.labels\.\*\.name,\s*('[^']*')\)", r"(\1 in labels)", python
+    )
+    python = python.replace("&&", " and ").replace("||", " or ")
+    python = re.sub(r"!(?!=)", " not ", python)
+    python = python.replace("github.event.label.name", "label")
+    python = python.replace("github.event.action", "action").replace("github.event_name", "event_name")
+    scope = {"event_name": event_name, "action": action, "labels": list(labels), "label": label}
+    return eval(python, {"__builtins__": {}}, scope)  # noqa: S307 - the expression is the repository's own
+
+
+PULL_REQUEST_ACTIONS = ["opened", "synchronize", "reopened", "labeled", "ready_for_review"]
+
+
+@pytest.mark.parametrize(
+    ("event_name", "action", "cancels"),
+    [
+        # Only a new head cancels the run that is measuring or building it.
+        ("pull_request", "synchronize", True),
+        ("pull_request", "opened", False),
+        ("pull_request", "reopened", False),
+        ("pull_request", "labeled", False),
+        ("pull_request", "ready_for_review", False),
+        # The suite's push and dispatch supersede their predecessors; the
+        # CI workflow's `dev` push runs to completion.
+        ("push", "", None),
+        ("workflow_dispatch", "", None),
+    ],
+)
+def test_only_a_new_head_cancels_a_run(workflow, event_name, action, cancels):
+    """The expressions are evaluated by `evaluate`, a translation of the
+    boolean subset they use, not by GitHub."""
+    ci = yaml.load((REPO_ROOT / ".github/workflows/ci.yml").read_text(), Loader=yaml.BaseLoader)
+    suite = workflow["concurrency"]["cancel-in-progress"]
+    ci_cancel = ci["concurrency"]["cancel-in-progress"]
+    if cancels is None:
+        assert evaluate(suite, event_name, action) is True
+        assert evaluate(ci_cancel, event_name, action) is False
+    else:
+        assert evaluate(suite, event_name, action) is cancels
+        assert evaluate(ci_cancel, event_name, action) is cancels
+
+
+@pytest.mark.parametrize("action", PULL_REQUEST_ACTIONS)
+@pytest.mark.parametrize("carries_bench", [True, False])
+def test_a_labelled_pull_request_is_measured_by_its_label_event(jobs, action, carries_bench):
+    """`changes` is the root every other job needs, so its condition is
+    what starts a run. A pull request opened with `bench` gets `opened`
+    and `labeled` together; only `labeled` measures the head, and
+    `ready_for_review` on a labelled pull request starts nothing either.
+    A new head or a reopening of one that carries `bench` still runs."""
+    labels = ["bench"] if carries_bench else []
+    runs = evaluate(
+        jobs["changes"]["if"],
+        "pull_request",
+        action,
+        labels=labels,
+        label="bench" if action == "labeled" else "",
+    )
+    expected = not (carries_bench and action in {"opened", "ready_for_review"})
+    assert runs is expected
+
+
+def test_a_foreign_label_and_other_events_still_decide_as_before(jobs):
+    condition = jobs["changes"]["if"]
+    assert not evaluate(condition, "pull_request", "labeled", labels=["docs"], label="docs")
+    assert evaluate(condition, "pull_request", "opened", labels=["docs"])
+    assert evaluate(condition, "push")
+    assert evaluate(condition, "workflow_dispatch")

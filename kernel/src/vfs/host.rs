@@ -11,17 +11,19 @@
 extern crate alloc;
 
 use alloc::string::String;
-use alloc::vec;
 use alloc::vec::Vec;
 use core::future::Future;
 
 use bytes::Bytes;
 use helios_hal::fs::{
     DeviceId, DirCookie, DirEntry, FileSystem, FsError, FsPath, FsResult, Metadata, NodeId,
-    NodeKind, OpenFlags, WritePosition,
+    NodeKind, OpenFlags, PreparedWrite, WritePosition, WriteProgress,
 };
 
-use crate::{HostDirLimit, HostFileSystem, HostFsError, HostFsErrorKind, HostMetadata};
+use crate::{
+    HostDirLimit, HostFileSystem, HostFilledWrite, HostFsError, HostFsErrorKind, HostMetadata,
+    HostWrite,
+};
 
 /// 9p `QTDIR`: the qid type bit that marks a directory.
 const P9_QID_TYPE_DIRECTORY: u8 = 0x80;
@@ -91,7 +93,36 @@ fn metadata_from_host(metadata: &HostMetadata) -> Metadata {
     }
 }
 
+/// A host-share write, staged by the client: the filler writes the
+/// guest's bytes straight into the client's destinations (the 9p request
+/// frames), one round at a time.
+pub struct HostShareWrite<W> {
+    write: W,
+}
+
+impl<W: HostWrite> PreparedWrite for HostShareWrite<W> {
+    fn staged_len(&self) -> usize {
+        self.write.staged_len()
+    }
+
+    fn submit<F>(self, fill: F) -> impl Future<Output = FsResult<WriteProgress<Self>>> + Send
+    where
+        F: FnMut(usize, &mut [u8]),
+    {
+        // Filled here, so the future holds nothing of `fill`.
+        let filled = self.write.fill(fill);
+        async move {
+            match filled.submit().await.map_err(fs_error_from_host)? {
+                WriteProgress::More(write) => Ok(WriteProgress::More(Self { write })),
+                WriteProgress::Done(landed) => Ok(WriteProgress::Done(landed)),
+            }
+        }
+    }
+}
+
 impl<H: HostFileSystem> FileSystem for HostShare<H> {
+    type Write<'a> = HostShareWrite<H::Write<'a>>;
+
     async fn stat(&self, path: FsPath<'_>) -> FsResult<Metadata> {
         self.client
             .stat_path(host_path(path))
@@ -150,33 +181,18 @@ impl<H: HostFileSystem> FileSystem for HostShare<H> {
             .map_err(fs_error_from_host)
     }
 
-    fn write_with<'a, F>(
+    async fn prepare_write<'a>(
         &'a self,
         path: FsPath<'a>,
         position: WritePosition,
         len: usize,
         _now: u64,
-        fill: F,
-    ) -> impl Future<Output = FsResult<u64>> + Send + 'a
-    where
-        F: FnOnce(&mut [u8]),
-    {
-        // The bytes leave for the host after awaits `fill` may not live
-        // across, so they are gathered into the buffer the request sends.
-        let mut data = vec![0; len];
-        fill(&mut data);
-        async move {
-            let host = host_path(path);
-            let landed = match position {
-                WritePosition::At(offset) => self
-                    .client
-                    .write_file(host, offset, &data)
-                    .await
-                    .map(|()| offset),
-                WritePosition::End => self.client.append_file(host, &data).await,
-            };
-            landed.map_err(fs_error_from_host)
-        }
+    ) -> FsResult<HostShareWrite<H::Write<'a>>> {
+        self.client
+            .prepare_write(host_path(path), position, len)
+            .await
+            .map(|write| HostShareWrite { write })
+            .map_err(fs_error_from_host)
     }
 
     async fn set_size(&self, path: FsPath<'_>, size: u64, _now: u64) -> FsResult<()> {

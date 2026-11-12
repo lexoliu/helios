@@ -1273,6 +1273,7 @@ pub(crate) mod test_store {
 
     use crate::component::{ComponentOutputMode, ComponentStoreData};
     use crate::gpu::{ContextShared, Gpu3dService, SessionId};
+    use crate::isa::GuestIsa;
     use crate::test_support::{TestCpu, TestNetworkService};
     use crate::{
         Executor, InstanceRegistry, ProcessAuthority, TaskFunding, UnsupportedHostFileSystem,
@@ -1356,7 +1357,13 @@ pub(crate) mod test_store {
             TestCpu,
             TestNetworkService,
             UnsupportedHostFileSystem,
-        > = crate::RuntimeState::new(cpu.timebase(), 1, 0, crate::BootPayload::for_tests());
+        > = crate::RuntimeState::new(
+            cpu.timebase(),
+            1,
+            0,
+            crate::BootPayload::for_tests(),
+            GuestIsa::for_build_target(cpu.native_feature_probe()),
+        );
         runtime_state.install_root_entropy(Arc::new(
             crate::RootEntropy::from_platform(
                 &cpu,

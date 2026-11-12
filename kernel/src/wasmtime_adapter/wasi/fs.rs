@@ -465,40 +465,41 @@ pub(crate) async fn write_resolved<HostFs>(
 where
     HostFs: crate::HostFileSystem,
 {
-    write_resolved_with(resolved, position, bytes.len(), now, |destination| {
-        destination.copy_from_slice(bytes)
+    write_resolved_with(resolved, position, bytes.len(), now, |at, destination| {
+        destination.copy_from_slice(&bytes[at..at + destination.len()]);
     })
     .await
 }
 
-/// Writes `len` bytes that `fill` puts straight into the filesystem's
-/// destination ([`FileSystem::write_with`]), and resolves with the offset
-/// just past them. An append lands at the end of the file as the
-/// filesystem sees it when the write arrives, so its end is the
-/// filesystem's answer, never the caller's idea of where the file ended.
+/// Writes `len` bytes that `source` copies straight into the
+/// filesystem's destination ([`helios_hal::fs::write_with`]), and
+/// resolves with the offset just past them. An append lands at the end of
+/// the file as the filesystem sees it when the write arrives, so its end
+/// is the filesystem's answer, never the caller's idea of where the file
+/// ended.
 ///
-/// `fill` runs before this returns, so it may read guest memory; the
-/// future holds nothing of it.
-pub(crate) fn write_resolved_with<'r, HostFs, F>(
-    resolved: &'r Resolved<'_, HostFs>,
+/// `source(at, destination)` fills `destination` with the write's bytes
+/// from offset `at`. It runs between awaits, never across one, once per
+/// destination region; what it reads must stay valid for the whole call,
+/// which guest memory does for the host call that holds it.
+pub(crate) async fn write_resolved_with<HostFs, S>(
+    resolved: &Resolved<'_, HostFs>,
     position: WritePosition,
     len: usize,
     now: u64,
-    fill: F,
-) -> impl Future<Output = FsOpResult<u64>> + Send + 'r
+    source: S,
+) -> FsOpResult<u64>
 where
     HostFs: crate::HostFileSystem,
-    F: FnOnce(&mut [u8]),
+    S: FnMut(usize, &mut [u8]),
 {
-    let write = resolved
-        .writable()
-        .map(|fs| fs.write_with(resolved.path(), position, len, now, fill));
-    async move {
-        let landed = write.map_err(fs_error_code)?.await.map_err(fs_error_code)?;
-        landed
-            .checked_add(len as u64)
-            .ok_or(fs_types::ErrorCode::Overflow)
-    }
+    let fs = resolved.writable().map_err(fs_error_code)?;
+    let landed = helios_hal::fs::write_with(fs, resolved.path(), position, len, now, source)
+        .await
+        .map_err(fs_error_code)?;
+    landed
+        .checked_add(len as u64)
+        .ok_or(fs_types::ErrorCode::Overflow)
 }
 
 pub(crate) async fn set_size<HostFs>(
@@ -580,14 +581,13 @@ where
 /// each group by name, with the mount points inside it.
 pub(crate) async fn read_directory<HostFs>(
     namespace: &Namespace<HostFs>,
-    descriptor: &FsDescriptor,
+    directory: Granted<'_, Directory, Read>,
 ) -> FsOpResult<Vec<fs_types::DirectoryEntry>>
 where
     HostFs: crate::HostFileSystem,
 {
-    require_directory(descriptor)?;
     let mut entries: Vec<fs_types::DirectoryEntry> = namespace
-        .list(&descriptor.path)
+        .list(&directory.descriptor().path)
         .await
         .map_err(fs_error_code)?
         .into_iter()
@@ -685,18 +685,16 @@ where
 /// Links within one mount; across two, `cross-device`.
 pub(crate) async fn link_at<HostFs>(
     namespace: &Namespace<HostFs>,
-    source_base: &FsDescriptor,
+    link: LinkGrant<'_, '_>,
     source_path: &str,
-    destination_base: Granted<'_, Directory, Mutate>,
     destination_path: &str,
     now: u64,
 ) -> FsOpResult<()>
 where
     HostFs: crate::HostFileSystem,
 {
-    require_directory(source_base)?;
-    let source = child_path(source_base, source_path)?;
-    let destination = child_path(destination_base.descriptor(), destination_path)?;
+    let source = child_path(link.source(), source_path)?;
+    let destination = child_path(link.destination(), destination_path)?;
     namespace
         .link(&source, &destination, now)
         .await
@@ -1092,7 +1090,7 @@ async fn list_owned<HostFs>(
 where
     HostFs: crate::HostFileSystem,
 {
-    read_directory(&namespace, &descriptor).await
+    read_directory(&namespace, descriptor.grant()?).await
 }
 
 pub(super) fn directory_producer<HostFs>(
@@ -1557,9 +1555,8 @@ where
         })?;
         Ok(self::link_at(
             &namespace,
-            &source_base,
+            source_base.grant()?.link_into(destination_base.grant()?)?,
             &source_path,
-            destination_base.grant()?,
             &destination_path,
             now,
         )

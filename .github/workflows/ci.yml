@@ -10,10 +10,14 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  # A pull request's newer push supersedes its older run. A `dev` push
-  # runs to completion: merges land faster than a run finishes, and a
-  # completed `dev` run is the only writer of the host lanes' caches.
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  # Only a new head cancels: a pull request's `synchronize` supersedes
+  # the older run. `opened`, `reopened` and `ready_for_review` carry the
+  # head a run is already building and queue behind it, because a run
+  # cancelled before its matrix expands leaves a failed check named after
+  # the unexpanded expression that nothing replaces. A `dev` push runs to
+  # completion: merges land faster than a run finishes, and a completed
+  # `dev` run is the only writer of the host lanes' caches.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.event.action == 'synchronize' }}
 
 permissions:
   contents: read
@@ -687,6 +691,9 @@ jobs:
           cat boot-dt.out
           grep -Fqx ok boot-dt.out
           grep -F 'platform described by device-tree' "$runtime/inspector.log"
+          # Every processor installed the machine's key and enabled
+          # return-address signing before the kernel ran anything else.
+          grep -F 'return-address signing enabled on every processor' "$runtime/inspector.log"
           # The `virt` board's PL061 GPIO controller is hardware the
           # kernel has no driver for, so discovery offers it to a
           # user-mode one. This asserts the whole path from the device
@@ -771,12 +778,48 @@ jobs:
           cat boot-acpi.out
           grep -Fqx ok boot-acpi.out
           grep -F 'platform described by acpi' "$runtime/inspector.log"
+          grep -F 'return-address signing enabled on every processor' "$runtime/inspector.log"
           # The ACPI walk looks for virtio transports by hardware id and
           # names nothing else, so an ACPI-described machine publishes
           # no grants. Asserting the absence keeps that a stated fact
           # rather than something that quietly starts or stops being
           # true.
           ! grep -qF 'device grant published' "$runtime/inspector.log"
+      - name: Take a wasm trap on aarch64
+        timeout-minutes: 10
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+          HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          # Without this the step reports tee's status, not the
+          # command's, and a runner script that fails is invisible.
+          set -o pipefail
+          # A wasm32 guest cannot form an address outside the 4 GiB the
+          # kernel reserves behind its linear memory, which is why Cranelift
+          # emits no bounds check for its loads: an access past the pages the
+          # guest has grown into lands on reserved memory and faults. That
+          # fault has to reach the runtime's trap handler and come back out as
+          # a wasm trap that kills one instance. `oob-load` prints its marker,
+          # then makes the access; the shell printing afterwards is what says
+          # the fault did not take the machine with it (#59).
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/oob-load"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G \
+            --accel tcg \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger --boot-program oob-load \
+            --no-compiler-plugin \
+            shell --trace-log "$runtime/guest-tracing.log" \
+            -c '/bin/oob-load; echo guest-alive' \
+            2>&1 > oob-load-smoke.out | tee "$runtime/inspector.log"
+          cat oob-load-smoke.out
+          cat "$runtime/guest-tracing.log"
+          grep -Fqx oob-load:before-fault oob-load-smoke.out
+          grep -Fqx guest-alive oob-load-smoke.out
+          ! grep -Fq 'Kernel panic' oob-load-smoke.out
       - name: Upload the inspector runtime directories
         if: failure()
         uses: actions/upload-artifact@v4
@@ -818,6 +861,25 @@ jobs:
             helios/target/kernel-prebuild/aarch64-unknown-none/kernel-release/compiler_plugin.wasm
           if-no-files-found: error
           retention-days: 90
+      # A kernel built with HELIOS_CFI_SELF_TEST corrupts a signed return
+      # address once every processor has started, and the guest has to panic
+      # with a control-flow violation. It is a debug build of its own kernel
+      # and bootfs, so it runs after the steps that take the release image
+      # from the target directory. The test runs under `cargo test`, not
+      # nextest: its slow-timeout would kill the build it makes. The pinned
+      # QEMU is already on PATH, which is where the inspector looks for
+      # `qemu-system-aarch64`.
+      - name: Refuse a corrupted return address
+        timeout-minutes: 60
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+          HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          cargo test -p helios-inspector -- --ignored --nocapture --exact \
+            vm::tests::cfi_self_test_panics_aarch64
 
   smoke-x86-64:
     name: smoke-x86-64

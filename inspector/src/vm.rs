@@ -534,12 +534,28 @@ pub(crate) enum VmSessionError {
 /// Every one of them fails the same way — the guest refused or never
 /// answered — so the step is what tells them apart in the message.
 #[derive(Debug, thiserror::Error)]
-#[error("failed to {step}: {source}")]
-pub(crate) struct ProfilingStepError {
-    /// The profiling step, spelled the way the message reads it.
-    step: &'static str,
-    #[source]
-    source: helios_inspector_protocol::RpcError,
+pub(crate) enum ProfilingStepError {
+    #[error("failed to {step}: {source}")]
+    Rpc {
+        /// The profiling step, spelled the way the message reads it.
+        step: &'static str,
+        #[source]
+        source: helios_inspector_protocol::RpcError,
+    },
+    /// The guest answered a read but refused its filter as too large.
+    #[error("the guest refused the filter to {step}: {source}")]
+    FilterRefused {
+        step: &'static str,
+        #[source]
+        source: system_profiling::FilterError,
+    },
+    /// The guest answered a control but refused it: the session does not
+    /// hold the right to observe the machine.
+    #[error("the guest refused to {step}: {source:?}")]
+    ControlRefused {
+        step: &'static str,
+        source: system_profiling::ControlError,
+    },
 }
 
 /// Why an `aot-bench` run did not produce its measurements.
@@ -4073,7 +4089,7 @@ fn run_workload_bench(
         let before_profile = if collect_profile {
             guest_step_under_deadline("the profile reset", seconds, &vcpus, async {
                 Ok::<_, VmSessionError>(
-                    profiling_step(
+                    profiling_control_step(
                         "clear remote profile samples",
                         system_profiling::clear(&client),
                     )
@@ -4083,7 +4099,7 @@ fn run_workload_bench(
             .await?;
             guest_step_under_deadline("the profiler hand-off", seconds, &vcpus, async {
                 Ok::<_, VmSessionError>(
-                    profiling_step(
+                    profiling_control_step(
                         "enable remote profiling",
                         system_profiling::set_enabled(&client, true),
                     )
@@ -4093,7 +4109,7 @@ fn run_workload_bench(
             .await?;
             guest_step_under_deadline("the initial profile read", seconds, &vcpus, async {
                 Ok::<_, VmSessionError>(
-                    profiling_step(
+                    profiling_read_step(
                         "read initial remote profile samples",
                         system_profiling::folded(&client, &profile_filter, 0),
                     )
@@ -4128,7 +4144,7 @@ fn run_workload_bench(
         if collect_profile {
             guest_step_under_deadline("the profiler stop", seconds, &vcpus, async {
                 Ok::<_, VmSessionError>(
-                    profiling_step(
+                    profiling_control_step(
                         "disable remote profiling",
                         system_profiling::set_enabled(&client, false),
                     )
@@ -4139,7 +4155,7 @@ fn run_workload_bench(
             let after_profile =
                 guest_step_under_deadline("the final profile read", seconds, &vcpus, async {
                     Ok::<_, VmSessionError>(
-                        profiling_step(
+                        profiling_read_step(
                             "read final remote profile samples",
                             system_profiling::folded(&client, &profile_filter, 0),
                         )
@@ -4150,7 +4166,7 @@ fn run_workload_bench(
             let metrics =
                 guest_step_under_deadline("the perf metric read", seconds, &vcpus, async {
                     Ok::<_, VmSessionError>(
-                        profiling_step(
+                        profiling_read_step(
                             "read final remote perf metrics",
                             system_profiling::metrics(&client, &metric_filter, 0),
                         )
@@ -4185,7 +4201,38 @@ async fn profiling_step<T>(
     call: impl std::future::Future<Output = Result<T, helios_inspector_protocol::RpcError>>,
 ) -> Result<T, ProfilingStepError> {
     call.await
-        .map_err(|source| ProfilingStepError { step, source })
+        .map_err(|source| ProfilingStepError::Rpc { step, source })
+}
+
+/// A profiling control, which the guest refuses to a session that lacks
+/// the right to observe the machine.
+async fn profiling_control_step(
+    step: &'static str,
+    call: impl std::future::Future<
+        Output = Result<
+            Result<(), system_profiling::ControlError>,
+            helios_inspector_protocol::RpcError,
+        >,
+    >,
+) -> Result<(), ProfilingStepError> {
+    profiling_step(step, call)
+        .await?
+        .map_err(|source| ProfilingStepError::ControlRefused { step, source })
+}
+
+/// A profiling read, whose filter the guest may refuse as too large.
+async fn profiling_read_step<T>(
+    step: &'static str,
+    call: impl std::future::Future<
+        Output = Result<
+            Result<T, system_profiling::FilterError>,
+            helios_inspector_protocol::RpcError,
+        >,
+    >,
+) -> Result<T, ProfilingStepError> {
+    profiling_step(step, call)
+        .await?
+        .map_err(|source| ProfilingStepError::FilterRefused { step, source })
 }
 
 /// Fetches and prints the guest's recent tracing events (info level and
@@ -4250,17 +4297,17 @@ fn run_aot_bench(
             || command.user_profile_output.is_some()
             || command.perf_metrics_output.is_some();
         let before_profile = if collect_profile {
-            profiling_step(
+            profiling_control_step(
                 "clear remote profile samples",
                 system_profiling::clear(&client),
             )
             .await?;
-            profiling_step(
+            profiling_control_step(
                 "enable remote profiling",
                 system_profiling::set_enabled(&client, true),
             )
             .await?;
-            profiling_step(
+            profiling_read_step(
                 "read initial remote profile samples",
                 system_profiling::folded(&client, &profile_filter, 0),
             )
@@ -4331,17 +4378,17 @@ fn run_aot_bench(
             instruction_profile::stop(&client).await?;
         }
         if collect_profile {
-            profiling_step(
+            profiling_control_step(
                 "disable remote profiling",
                 system_profiling::set_enabled(&client, false),
             )
             .await?;
-            let after_profile = profiling_step(
+            let after_profile = profiling_read_step(
                 "read final remote profile samples",
                 system_profiling::folded(&client, &profile_filter, 0),
             )
             .await?;
-            let metrics = profiling_step(
+            let metrics = profiling_read_step(
                 "read final remote perf metrics",
                 system_profiling::metrics(&client, &metric_filter, 0),
             )
@@ -6316,13 +6363,20 @@ mod tests {
         Step(#[from] BuildStepError),
         #[error("{0}")]
         WorkspaceRoot(#[from] WorkspaceRootError),
-        #[error("failed to spawn cargo for watchdog self-test kernel build: {source}")]
+        #[error("failed to spawn cargo for the self-test kernel build: {source}")]
         SpawnCargo {
             #[source]
             source: io::Error,
         },
-        #[error("watchdog self-test kernel build exited with status {status}")]
+        #[error("self-test kernel build exited with status {status}")]
         CargoExited { status: std::process::ExitStatus },
+        #[error("failed to open the guest serial link: {source}")]
+        OpenSerial {
+            #[source]
+            source: crate::serial::SerialError,
+        },
+        #[error("expected a {CFI_VIOLATION_MESSAGE:?} panic from the guest, got: {outcome}")]
+        NotAControlFlowViolation { outcome: String },
         #[error("socket path must be valid UTF-8")]
         SocketPathNotUtf8,
         #[error("failed to connect {purpose} RPC client: {source}")]
@@ -6390,6 +6444,9 @@ mod tests {
 
     const WATCHDOG_SELF_TEST_DELAY_MS: &str = "5000";
 
+    /// What the aarch64 kernel's panic carries when a return address fails
+    /// authentication (`aarch64/src/cfi.rs`).
+    const CFI_VIOLATION_MESSAGE: &str = "control-flow violation:";
     const WATCHDOG_TIMEOUT_SECS: &str = "10";
     const WATCHDOG_STAGE_TIMEOUT: Duration = Duration::from_secs(120);
     const DIRECT_EXEC_TIMEOUT: Duration = Duration::from_secs(900);
@@ -8557,17 +8614,72 @@ mod tests {
         Ok(())
     }
 
+    /// The aarch64 kernel built with `HELIOS_CFI_SELF_TEST` corrupts a signed
+    /// return address on the bootstrap processor once every processor has
+    /// started, so a machine that enforces return-address signing panics with
+    /// a control-flow violation before the debugger reports that it runs.
+    #[test]
+    #[ignore = "requires qemu and a cross-compiled aarch64 kernel"]
+    fn cfi_self_test_panics_aarch64() -> Result<(), GuestTestFailure> {
+        let command = guest_test_command(&AARCH64_VIRT_TCG_PROFILE);
+        build_self_test_kernel(&command, &[("HELIOS_CFI_SELF_TEST", "1")])?;
+        let mut runtime = VmRuntime::spawn(&command)?;
+        let socket = runtime
+            .socket_path()
+            .to_str()
+            .ok_or(GuestTestFailure::SocketPathNotUtf8)?
+            .to_owned();
+        let baud = command.baud;
+        let outcome = crate::runtime::block_on(async move {
+            let io = crate::serial::open(&socket, baud)
+                .await
+                .map_err(|source| GuestTestFailure::OpenSerial { source })?;
+            let (read, _write) = io.into_split();
+            Ok::<_, GuestTestFailure>(crate::ready::wait_for_boot(read).await.map(drop))
+        })?;
+        runtime.shutdown();
+        match outcome {
+            Err(crate::ready::BootError::GuestPanicked { report, trailer })
+                if report.contains(CFI_VIOLATION_MESSAGE)
+                    || trailer.contains(CFI_VIOLATION_MESSAGE) =>
+            {
+                Ok(())
+            }
+            Err(other) => Err(GuestTestFailure::NotAControlFlowViolation {
+                outcome: other.to_string(),
+            }),
+            Ok(()) => Err(GuestTestFailure::NotAControlFlowViolation {
+                outcome: "the guest booted to the debugger".to_owned(),
+            }),
+        }
+    }
+
     fn assert_watchdog_reset(arch: VmArch) -> Result<(), GuestTestFailure> {
-        build_watchdog_test_kernel(arch)?;
         let command = watchdog_test_command(arch);
+        build_self_test_kernel(
+            &command,
+            &[
+                ("HELIOS_WATCHDOG_SELF_TEST", "1"),
+                ("HELIOS_WATCHDOG_TIMEOUT_SECS", WATCHDOG_TIMEOUT_SECS),
+                (
+                    "HELIOS_WATCHDOG_SELF_TEST_DELAY_MS",
+                    WATCHDOG_SELF_TEST_DELAY_MS,
+                ),
+            ],
+        )?;
         let mut runtime = VmRuntime::spawn(&command)?;
         wait_for_stage_occurrences(runtime.socket_path(), DEBUGGER_RUN_STAGE_MARKER, 2)?;
         runtime.shutdown();
         Ok(())
     }
 
-    fn build_watchdog_test_kernel(arch: VmArch) -> Result<(), GuestTestFailure> {
-        let command = watchdog_test_command(arch);
+    /// Builds the kernel `command` boots with the self-test environment
+    /// `envs` set, after the host tools and the bootfs it needs.
+    fn build_self_test_kernel(
+        command: &ResolvedVmCommand,
+        envs: &[(&str, &str)],
+    ) -> Result<(), GuestTestFailure> {
+        let profile = command.profile;
         run_step(
             "building helios-cli",
             command
@@ -8583,11 +8695,11 @@ mod tests {
         let status = std::process::Command::new("cargo")
             .current_dir(repo_root()?)
             .arg("build")
-            .args(arch.build_std_arguments())
+            .args(profile.arch.build_std_arguments())
             .arg("--target")
-            .arg(arch.profile().cargo_target)
+            .arg(profile.cargo_target)
             .arg("--bin")
-            .arg(arch.profile().kernel_artifact_name)
+            .arg(profile.kernel_artifact_name)
             .env(
                 "HELIOS_KERNEL_ROOT_PUBLIC_KEY",
                 prebuild_dir.join("helios-root-public.key"),
@@ -8596,12 +8708,7 @@ mod tests {
                 "HELIOS_KERNEL_ROOT_SECRET_KEY",
                 prebuild_dir.join("helios-root-secret.key"),
             )
-            .env("HELIOS_WATCHDOG_SELF_TEST", "1")
-            .env("HELIOS_WATCHDOG_TIMEOUT_SECS", WATCHDOG_TIMEOUT_SECS)
-            .env(
-                "HELIOS_WATCHDOG_SELF_TEST_DELAY_MS",
-                WATCHDOG_SELF_TEST_DELAY_MS,
-            )
+            .envs(envs.iter().copied())
             .status()
             .map_err(|source| GuestTestFailure::SpawnCargo { source })?;
         if status.success() {
@@ -8611,7 +8718,12 @@ mod tests {
     }
 
     fn watchdog_test_command(arch: VmArch) -> ResolvedVmCommand {
-        let profile = arch.profile();
+        guest_test_command(arch.profile())
+    }
+
+    /// The debug kernel with only the debugger in its bootfs, booted on
+    /// `profile`'s defaults.
+    fn guest_test_command(profile: &'static VmProfile) -> ResolvedVmCommand {
         let build = KernelBuildSpec {
             profile,
             kind: KernelBuildProfile::Debug,

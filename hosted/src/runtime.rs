@@ -469,6 +469,9 @@ fn shared_debug_state(machine: &HostedMachine) -> HostedRuntimeState {
                 machine.processor_count(),
                 machine.now_ticks(),
                 machine.payload,
+                helios_kernel::GuestIsa::for_build_target(Some(
+                    crate::cpu::detect_host_native_feature,
+                )),
             )
         })
         .clone()

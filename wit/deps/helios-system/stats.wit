@@ -29,6 +29,14 @@ interface stats {
     configured: u32,
     online: u32,
     utilization: list<processor>,
+    /// The instruction-set level the kernel compiles guest code for, named
+    /// as the target defines it (for example `x86-64-v4`). It is the
+    /// highest level the processors satisfy.
+    guest-isa-level: string,
+    /// The features the compiled code uses beyond `guest-isa-level`, by
+    /// short name (for example `vbmi`, `bitalg`). Empty when the level
+    /// is compiled for exactly.
+    guest-isa-extras: list<string>,
   }
 
   /// One node's share of the user pool.

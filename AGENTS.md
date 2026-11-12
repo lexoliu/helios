@@ -197,9 +197,12 @@ maintainer's decision and the fork's revision moves once, per §1.
   bounds checks, with `memory_init_cow(true)` and `memory_may_move(false)`.
   Disabling any of them needs a same-PR justification of the alternative
   semantic path.
-- Full x86 AVX, FMA and AVX-512 enablement waits on the x86 kernel providing
-  OSXSAVE, XCR0 configuration and XSAVE/XRSTOR state preservation, and is
-  tracked as such.
+- x86 guest code is compiled for the highest ISA level the processor
+  satisfies. The kernel saves no extended vector state: its image carries no
+  VEX or EVEX instruction, and it switches away from guest code only at
+  call boundaries, where the vector registers and k-masks are caller-saved.
+  A change that breaks either property brings XSAVE/XRSTOR preservation
+  with it.
 - Performance decisions rest on bare-metal targets and explicit capabilities,
   never on `hosted/`.
 - A performance test, benchmark, or acceptance measurement runs `--release`

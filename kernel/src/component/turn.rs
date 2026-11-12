@@ -32,7 +32,7 @@ use helios_hal::cpu::Cpu;
 use pin_project_lite::pin_project;
 
 use super::{ComponentRuntimeState, InstanceKilled, SocketRetirementQueue};
-use crate::{NotifyWaiter, ProfileScope, StoreTurns};
+use crate::{NotifyWaiter, StoreTurns};
 
 /// How a store's own stop, one that is not its instance's condemnation,
 /// wakes a turn whose guest is suspended.
@@ -180,12 +180,9 @@ where
         let output = work();
         let elapsed = turn.end(self.now_nanos());
         if self.runtime_state.profiling_enabled() {
-            self.runtime_state.record_profile_stack_parts_nanos(
-                ProfileScope::User,
-                "user;",
-                self.turns.instance().name(),
-                elapsed,
-            );
+            let instance = self.turns.instance();
+            self.runtime_state
+                .record_user_profile(instance.id(), instance.name(), elapsed);
         }
         self.epilogue.end_turn(&self.runtime_state);
         output
