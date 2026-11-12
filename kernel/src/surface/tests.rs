@@ -7,6 +7,7 @@
 //! platform surface in [`crate::device::test_hooks`], so a test asserts
 //! the substitutions the kernel actually asked the address space for.
 
+use alloc::vec::Vec;
 use core::task::{Context, Poll, Waker};
 
 use helios_hal::input::InputEvent;
@@ -320,13 +321,90 @@ fn a_dying_client_hands_its_windows_to_the_supervisor() {
     assert!(service.lookup(id).is_none());
     let returned = service.take_returned();
     assert_eq!(returned.len(), 1);
-    assert_eq!(returned[0].ids.as_slice(), [id].as_slice());
+    assert_eq!(returned[0].id(), id);
 
     let before = test_hooks::changes().len();
     drop(views);
     let changes = test_hooks::changes();
     assert!(matches!(changes[before], MappingChange::Withdraw(_)));
     assert!(matches!(changes[before + 1], MappingChange::Freed(_)));
+}
+
+/// Every window a dying client held is handed back exactly once, and each
+/// one's slot in the registry stays counted until the drain has processed
+/// it.
+#[test]
+fn a_dying_clients_windows_are_returned_once_and_counted_until_drained() {
+    test_hooks::install();
+    let service = SurfaceService::new();
+    let (mut client, mut views) = (SurfaceOwnership::new(), ViewTable::new());
+    let mut ids = Vec::new();
+    for page in 1..=2 {
+        let pending = client
+            .prepare(
+                &service,
+                &views,
+                client_memory(),
+                pages(page, 1),
+                geometry(64, 64),
+            )
+            .expect("a 64 by 64 window fits one wasm page");
+        let (shared, _view) = client
+            .show(&mut views, client_memory(), pending)
+            .expect("nothing else was shown at the client's spans");
+        ids.push(shared.id());
+    }
+
+    drop(client);
+    assert_eq!(service.live(), 0);
+    assert_eq!(service.undrained(), 2, "handed back and still counted");
+    let mut returned = service.take_returned();
+    assert_eq!(returned.len(), 2);
+    returned.sort_by_key(|window| window.id());
+    assert_eq!(
+        returned
+            .iter()
+            .map(|window| window.id())
+            .collect::<Vec<_>>(),
+        ids
+    );
+    assert!(
+        service.take_returned().is_empty(),
+        "each window is handed back once"
+    );
+    assert_eq!(service.undrained(), 2, "taking them is not draining them");
+
+    for window in returned {
+        window.drained();
+    }
+    assert_eq!(service.undrained(), 0);
+}
+
+/// A compositor that died holds nothing of the windows still waiting for
+/// the drain, so their slots come back with the rest.
+#[test]
+fn a_dead_compositor_releases_the_windows_waiting_for_the_drain() {
+    test_hooks::install();
+    let service = SurfaceService::new();
+    let (mut client, views) = (SurfaceOwnership::new(), ViewTable::new());
+    let pending = client
+        .prepare(
+            &service,
+            &views,
+            client_memory(),
+            pages(1, 1),
+            geometry(64, 64),
+        )
+        .expect("a 64 by 64 window fits one wasm page");
+    drop(pending);
+    assert_eq!(service.undrained(), 1);
+    assert_eq!(client.held(), 1);
+
+    service.retire_compositor();
+
+    assert_eq!(service.undrained(), 0);
+    assert_eq!(client.held(), 0);
+    assert!(service.take_returned().is_empty());
 }
 
 /// A create its client stopped waiting for — the guest dropped the
@@ -367,46 +445,86 @@ fn a_create_its_client_stopped_waiting_for_shows_nothing_and_goes_back_once() {
     assert!(service.lookup(id).is_none(), "the window left the desktop");
     let returned = service.take_returned();
     assert_eq!(returned.len(), 1);
-    assert_eq!(returned[0].ids.as_slice(), [id].as_slice());
+    assert_eq!(returned[0].id(), id);
     assert_eq!(
         test_hooks::live_runs(),
         runs,
         "nobody else held the run, so it went back with the pending window"
     );
 
-    // The slot is free again, and the window is not handed back a second
-    // time when the client dies.
-    assert_eq!(client.held(), 0);
+    // The window still holds its slot until the drain has processed it,
+    // and it is not handed back a second time when the client dies.
+    assert_eq!(client.held(), 1);
     assert!(matches!(client.surface(id), Err(SurfaceServiceError::Gone)));
+    drop(returned);
+    assert_eq!(client.held(), 0);
     drop(client);
     assert!(service.take_returned().is_empty());
 }
 
-/// A cancelled create frees its slot for the next one: an instance that
-/// abandons creates without bound is never refused for slots it no
-/// longer holds.
+/// A cancelled create holds its slot, in the registry and in its
+/// instance, until the drain has processed the window it handed back: a
+/// program that cancels creates in a loop is refused rather than growing
+/// the return queue, and is served again once the drain catches up.
 #[test]
-fn a_cancelled_create_holds_no_slot() {
+fn a_cancelled_create_holds_its_slot_until_the_drain_processes_it() {
     test_hooks::install();
     let service = SurfaceService::new();
-    let (mut client, views) = (SurfaceOwnership::new(), ViewTable::new());
-    for _ in 0..2 * super::MAX_INSTANCE_SURFACES {
-        let pending = client
-            .prepare(
-                &service,
-                &views,
-                client_memory(),
-                pages(1, 1),
-                geometry(64, 64),
-            )
-            .expect("every earlier create was cancelled, so a slot is free");
-        drop(pending);
+    let views = ViewTable::new();
+    let create = |client: &mut SurfaceOwnership| {
+        client.prepare(
+            &service,
+            &views,
+            client_memory(),
+            pages(1, 1),
+            geometry(64, 64),
+        )
+    };
+
+    // One client cancels until its own bound refuses it, with nothing
+    // draining.
+    let mut client = SurfaceOwnership::new();
+    for _ in 0..super::MAX_INSTANCE_SURFACES {
+        drop(create(&mut client).expect("the client's bound is not reached yet"));
     }
-    assert_eq!(client.held(), 0);
+    assert_eq!(client.held(), super::MAX_INSTANCE_SURFACES);
     assert_eq!(
-        service.take_returned().len(),
-        2 * super::MAX_INSTANCE_SURFACES
+        create(&mut client).err(),
+        Some(SurfaceServiceError::TooManySurfaces),
+        "the client's cancelled creates still count against it"
     );
+
+    // Other clients fill the registry the same way, and the registry's
+    // bound refuses the next one although it holds no window of its own.
+    let mut others = Vec::new();
+    for _ in 1..super::MAX_LIVE_SURFACES / super::MAX_INSTANCE_SURFACES {
+        let mut other = SurfaceOwnership::new();
+        for _ in 0..super::MAX_INSTANCE_SURFACES {
+            drop(create(&mut other).expect("the registry's bound is not reached yet"));
+        }
+        others.push(other);
+    }
+    assert_eq!(service.live(), 0);
+    assert_eq!(service.undrained(), super::MAX_LIVE_SURFACES);
+    let mut fresh = SurfaceOwnership::new();
+    assert_eq!(
+        create(&mut fresh).err(),
+        Some(SurfaceServiceError::TooManySurfaces),
+        "the registry counts every window waiting for the drain"
+    );
+
+    // The queue holds exactly the bound, no more.
+    let returned = service.take_returned();
+    assert_eq!(returned.len(), super::MAX_LIVE_SURFACES);
+    assert!(service.take_returned().is_empty());
+    assert_eq!(client.held(), super::MAX_INSTANCE_SURFACES);
+
+    // The drain has processed them: the slots come back.
+    drop(returned);
+    assert_eq!(service.undrained(), 0);
+    assert_eq!(client.held(), 0);
+    drop(create(&mut client).expect("the drain released this client's slots"));
+    drop(create(&mut fresh).expect("the drain released the registry's slots"));
 }
 
 /// A span something else was shown over while the compositor was
@@ -450,9 +568,13 @@ fn a_span_taken_while_the_compositor_answered_is_refused_in_the_last_step() {
     assert!(service.lookup(id).is_none());
     let returned = service.take_returned();
     assert_eq!(returned.len(), 1);
-    assert_eq!(returned[0].ids.as_slice(), [id].as_slice());
-    assert_eq!(client.held(), 1);
+    assert_eq!(returned[0].id(), id);
+    // The refused window still holds its slot until the drain has
+    // processed it, beside the first window's.
+    assert_eq!(client.held(), 2);
     assert!(client.surface(first.id()).is_ok());
+    drop(returned);
+    assert_eq!(client.held(), 1);
 }
 
 /// A client that drops a window reaches the compositor's supervisor
@@ -507,6 +629,9 @@ fn a_dropped_window_reaches_the_supervisor_with_the_request_queue_full() {
     assert!(!shared.is_alive());
     let returned = service.take_returned();
     assert_eq!(returned.len(), 1);
-    assert_eq!(returned[0].ids.as_slice(), [id].as_slice());
+    assert_eq!(returned[0].id(), id);
+    // Counted against the client until the drain has processed it.
+    assert_eq!(client.held(), 1);
+    drop(returned);
     assert_eq!(client.held(), 0);
 }

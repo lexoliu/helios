@@ -9,11 +9,14 @@ to the same conclusion.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
+from helios_bench import cli
 from helios_bench.manifest import load_manifest
 from helios_bench.report import Side
-from helios_bench.runner import GAP_BENCH, RunOptions, plan
+from helios_bench.runner import GAP_BENCH, RunOptions, plan, retake_plan
 from helios_bench.wasi_apps import gap_bench
 from helios_bench.workloads import load_workloads
 
@@ -88,3 +91,36 @@ def test_the_helios_side_carries_the_lanes_rpc_transport(options) -> None:
     assert options.lane.rpc_transport == "vsock"
     for command in helios:
         assert command.env["HELIOS_WORKLOAD_BENCH_RPC_TRANSPORT"] == "vsock"
+
+
+def helios_argvs(options: RunOptions) -> list[list[str]]:
+    commands = plan(options, load_manifest(), load_workloads()["workloads"])
+    return [command.argv for command in commands if "--skip-linux" in command.argv]
+
+
+def test_the_helios_pass_takes_a_profile_boot_unless_told_not_to(options) -> None:
+    """#747: the profile comes from a second, untimed boot, which the
+    suite's Helios pass asks for by default and `--no-profile-boot` drops."""
+    parser = gap_bench().build_parser()
+    (argv,) = helios_argvs(options)
+    assert not parser.parse_args(argv[2:]).helios_no_profile_boot
+
+    (argv,) = helios_argvs(replace(options, profile_boot=False))
+    assert parser.parse_args(argv[2:]).helios_no_profile_boot
+
+
+def test_a_pass_that_repeats_a_measurement_never_takes_a_profile_boot(options) -> None:
+    """The artifacts are the first pass's: a retake or a retry would boot
+    every repeated unit a second time to overwrite them with the same."""
+    parser = gap_bench().build_parser()
+    retake = retake_plan(options, 5, ["spawn-wait"], "retake", "dispersed", {})
+    assert parser.parse_args(retake.argv[2:]).helios_no_profile_boot
+
+
+def test_the_cli_threads_no_profile_boot_into_the_run_options(tmp_path, monkeypatch) -> None:
+    seen = []
+    monkeypatch.setattr(cli, "run_suite", lambda options, manifest, dry_run: seen.append(options))
+    for flags, expected in (([], True), (["--no-profile-boot"], False)):
+        with pytest.raises(SystemExit):
+            cli.main(["run", "--lane", "x86-64-kvm", "--out-dir", str(tmp_path), "--sides", "helios", *flags])
+        assert seen[-1].profile_boot is expected
