@@ -102,7 +102,7 @@ use slab::Slab;
 use spin::Mutex;
 use wasmtime::{Store, StoreInterruptHandle};
 
-use crate::{GUEST_TIME_SLICE, InstanceId};
+use crate::{GUEST_TIME_SLICE, InstanceId, KillReason};
 
 /// The interrupt routes into every store of one engine.
 pub struct GuestInterrupts {
@@ -171,6 +171,18 @@ impl GuestInterrupts {
         self.running.interrupt_overdue(now);
     }
 
+    /// Whether a guest call is being polled on `processor` right now, as
+    /// the running slot says.
+    #[cfg(test)]
+    pub(crate) fn is_running_a_store(&self, processor: ProcessorId) -> bool {
+        !self
+            .running
+            .slot(processor)
+            .target
+            .load(Ordering::Acquire)
+            .is_null()
+    }
+
     /// Interrupts every live store of `instance`, wherever it is: running
     /// on a processor, suspended on its fiber, or in host code.
     ///
@@ -183,6 +195,26 @@ impl GuestInterrupts {
                 target.handle.interrupt();
             }
         }
+    }
+}
+
+/// What an interrupted guest does once its store has nothing to deliver
+/// but a condemnation: it traps a pending kill of its instance, and
+/// otherwise yields to the executor, because an interruption that is not a
+/// kill is the end of a time slice.
+///
+/// Every store's interrupt callback ends in this decision, so a kill reaches
+/// a running guest the same way whichever store it runs on, and no store
+/// resumes a guest the tick asked to give up its processor.
+///
+/// Runs in the store's own host context, on its own processor, and reads
+/// only the `pending_kill` its caller loaded: no lock, no allocation.
+pub(crate) fn kill_or_yield(
+    pending_kill: Option<KillReason>,
+) -> wasmtime::Result<wasmtime::InterruptAction> {
+    match pending_kill {
+        Some(reason) => Err(wasmtime::Error::from(crate::InstanceKilled { reason })),
+        None => Ok(wasmtime::InterruptAction::Yield),
     }
 }
 

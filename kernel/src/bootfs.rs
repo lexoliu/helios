@@ -343,11 +343,11 @@ impl BootIndex {
         let run = self.descendants(path);
         let resume = usize::try_from(cookie.raw()).map_err(|_| FsError::Invalid)?;
         let mut entries = Vec::new();
-        for index in run.start.max(resume)..run.end {
+        let first = run.start.max(resume);
+        for (index, node) in self.nodes.iter().enumerate().take(run.end).skip(first) {
             if entries.len() == max_entries {
                 break;
             }
-            let node = &self.nodes[index];
             let name = &node.path[prefix_len..];
             if name.contains('/') {
                 continue;
