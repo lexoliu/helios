@@ -120,6 +120,16 @@ type CompilerThreadTasks = SmallVec<[crate::JoinHandle<CompilerThreadReport>; 8]
 type CompilerThreadReports = SmallVec<[CompilerThreadReport; 8]>;
 type CompilerPluginHandle<CpuImpl, Net, HostFs> = Arc<CompilerPluginRuntime<CpuImpl, Net, HostFs>>;
 
+/// What [`UserProgramService::aot`] produced.
+pub(crate) struct AotArtifact {
+    /// The signed `cwasm` artifact.
+    pub(crate) signed: Vec<u8>,
+    /// The worker count the compiler plugin was told to compile with
+    /// (`compiler_plugin_worker_threads`), reported so a caller comparing
+    /// this compile with another can hold the count fixed.
+    pub(crate) worker_threads: u32,
+}
+
 #[derive(Clone, Copy, Default)]
 struct CompilerPhaseTimestamps {
     processor: u16,
@@ -1493,9 +1503,14 @@ where
         wasm: &Bytes,
         hint: AotCompileHint,
         profile: bool,
-    ) -> Result<Vec<u8>, ProgramExecError> {
-        self.compile_raw_component_to_signed_artifact(exec_context, wasm, hint, profile)
-            .await
+    ) -> Result<AotArtifact, ProgramExecError> {
+        let signed = self
+            .compile_raw_component_to_signed_artifact(exec_context, wasm, hint, profile)
+            .await?;
+        Ok(AotArtifact {
+            signed,
+            worker_threads: compiler_plugin_worker_threads(&exec_context.cpu),
+        })
     }
 
     async fn load_executable(
