@@ -2152,7 +2152,9 @@ fn rustc_print(query: &'static str) -> Result<String, WasmBuildError> {
             status: output.status,
         });
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim_end().to_owned())
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_owned())
 }
 
 fn wasm_rustflags(target_triple: &str) -> String {
