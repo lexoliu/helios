@@ -15,6 +15,7 @@ mod host_fs;
 mod input;
 mod ioapic;
 mod iommu;
+mod memory_type;
 mod net;
 mod pci;
 mod rtc;

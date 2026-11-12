@@ -61,7 +61,7 @@ use crate::wasmtime_adapter::{
         WasiImportSet, bindings::filesystem::types as fs_types, preview1 as p1,
     },
 };
-use crate::{BootfsBytes, ProgramExecErrorDetail, RuntimeMessage};
+use crate::{BootfsBytes, GuestAddress, ProgramExecErrorDetail, RuntimeMessage};
 use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -1994,9 +1994,17 @@ where
             core::mem::align_of::<CompilerRequestHeader>(),
         )
         .await?;
-        write_shared_memory(store.data().memory(), wasm_ptr, wasm)?;
-        write_shared_memory(store.data().memory(), target_ptr, target)?;
-        write_shared_memory(store.data().memory(), isa_level_ptr, isa_level)?;
+        write_shared_memory(store.data().memory(), GuestAddress::wasm32(wasm_ptr), wasm)?;
+        write_shared_memory(
+            store.data().memory(),
+            GuestAddress::wasm32(target_ptr),
+            target,
+        )?;
+        write_shared_memory(
+            store.data().memory(),
+            GuestAddress::wasm32(isa_level_ptr),
+            isa_level,
+        )?;
         let header = CompilerRequestHeader {
             abi_version: HELIOS_COMPILER_ABI_VERSION,
             hint: match hint {
@@ -2016,12 +2024,16 @@ where
                 0
             },
         };
-        write_shared_memory(store.data().memory(), request_ptr, unsafe {
-            core::slice::from_raw_parts(
-                core::ptr::addr_of!(header).cast::<u8>(),
-                core::mem::size_of::<CompilerRequestHeader>(),
-            )
-        })?;
+        write_shared_memory(
+            store.data().memory(),
+            GuestAddress::wasm32(request_ptr),
+            unsafe {
+                core::slice::from_raw_parts(
+                    core::ptr::addr_of!(header).cast::<u8>(),
+                    core::mem::size_of::<CompilerRequestHeader>(),
+                )
+            },
+        )?;
         phases.input_done_ns = if profile {
             monotonic_nanos(&exec_context.cpu)
         } else {
@@ -2055,7 +2067,8 @@ where
             .saturating_sub(compile_started);
         store.data().record_user_ticks(compile_elapsed);
         let response_ptr = response_ptr.map_err(map_program_runtime_error)? as u32;
-        let response = read_compiler_response(store.data().memory(), response_ptr)?;
+        let response =
+            read_compiler_response(store.data().memory(), GuestAddress::wasm32(response_ptr))?;
         if response.abi_version != HELIOS_COMPILER_ABI_VERSION {
             return Err(ProgramExecError {
                 kind: ProgramExecErrorKind::InvalidBinary,
@@ -2064,7 +2077,7 @@ where
         }
         let diagnostic = read_shared_memory(
             store.data().memory(),
-            response.diagnostic_ptr,
+            GuestAddress::wasm32(response.diagnostic_ptr),
             response.diagnostic_len,
         )?;
         if response.status != CompilerStatus::Ok {
@@ -2089,7 +2102,7 @@ where
         };
         let output = read_shared_memory(
             store.data().memory(),
-            response.precompiled_ptr,
+            GuestAddress::wasm32(response.precompiled_ptr),
             response.precompiled_len,
         )?;
         phases.response_done_ns = if profile {
@@ -3388,15 +3401,77 @@ mod tests {
         };
         let mut bytes = [0_u8; 4];
 
-        preview1_read_memory_into(memory, 1, &mut bytes).expect("fixed read should fit");
+        preview1_read_memory_into(memory, GuestAddress::wasm32(1), &mut bytes)
+            .expect("fixed read should fit");
 
         assert_eq!(bytes, [2, 3, 4, 5]);
-        let error =
-            preview1_read_memory_into(memory, 4, &mut bytes).expect_err("read should overflow");
+        let error = preview1_read_memory_into(memory, GuestAddress::wasm32(4), &mut bytes)
+            .expect_err("read should overflow");
         assert_eq!(error.kind, crate::ProgramExecErrorKind::InvalidBinary);
         assert_eq!(
             error.detail,
             ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds
+        );
+    }
+
+    /// Every WASI/WASIX host-call family addresses the fields of a guest
+    /// structure as `base.offset(field)`. A base near the top of the 32-bit
+    /// space must fault at the access, never wrap into low guest memory.
+    #[test]
+    fn guest_field_offsets_near_the_top_of_guest_space_fault_for_every_family() {
+        let mut guest = [0xAA_u8; 64];
+        let memory = Preview1Memory {
+            base: guest.as_mut_ptr() as usize,
+            len: guest.len(),
+        };
+        let base = GuestAddress::wasm32(u32::MAX - 2);
+        // preview1 fd_prestat_get (+4), poll_oneoff event (+8..), filestat (+8..56)
+        // and iovec (+4), WASIX epoll event, proc spawn handles, tty state and
+        // thread snapshot (+8/+16) fields all use these offsets.
+        let family_offsets = [
+            ("preview1 prestat", 4_u64),
+            ("preview1 iovec", 4),
+            ("preview1 poll event", 8),
+            ("preview1 filestat", 56),
+            ("wasix epoll event", 16),
+            ("wasix proc handles", 12),
+            ("wasix tty state", 21),
+            ("wasix thread snapshot", 16),
+        ];
+        for (family, offset) in family_offsets {
+            let field = base.offset(offset);
+            assert_eq!(
+                preview1_write_memory(memory, field, &[1, 2, 3, 4]),
+                p1::errno::FAULT,
+                "{family}: write at u32::MAX - 2 + {offset} must be EFAULT",
+            );
+            let mut bytes = [0_u8; 4];
+            assert!(
+                preview1_read_memory_into(memory, field, &mut bytes).is_err(),
+                "{family}: read at u32::MAX - 2 + {offset} must fail",
+            );
+            assert_eq!(
+                preview1_read_u32(memory, field).map_err(|error| error.detail),
+                Err(ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds),
+                "{family}: u32 read must be out of bounds",
+            );
+        }
+        assert!(
+            guest.iter().all(|byte| *byte == 0xAA),
+            "a wrapped offset must not write into low guest memory",
+        );
+    }
+
+    #[test]
+    fn guest_iovec_array_beyond_guest_space_faults() {
+        let guest = [0_u8; 16];
+        let memory = Preview1Memory {
+            base: guest.as_ptr() as usize,
+            len: guest.len(),
+        };
+        assert_eq!(
+            p1_iovs_memory_ranges(memory, &[(u32::MAX - 2, 4)]).err(),
+            Some(p1::errno::FAULT),
         );
     }
 

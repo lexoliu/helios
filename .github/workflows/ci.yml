@@ -84,6 +84,7 @@ jobs:
         with:
           workspaces: helios
           key: ${{ matrix.name }}
+      - uses: astral-sh/setup-uv@v6
       - name: ${{ matrix.name }}
         working-directory: helios
         run: ${{ matrix.command }}
@@ -309,6 +310,35 @@ jobs:
             smoke-runtime/*/*.log
           if-no-files-found: warn
           retention-days: 7
+      # Each boot above rebuilds the bootfs for its own `--boot-program`
+      # selection, so what the target directory holds now is the last
+      # boot's subset. A build with no selection is the superset every
+      # workload class boots from; the kernel is not relinked.
+      - name: Build the full guest image
+        id: guest-image
+        # A lane that failed before it built the inspector has nothing
+        # to build an image with.
+        if: always() && hashFiles('helios/target/release/helios-inspector') != ''
+        working-directory: helios
+        run: ./target/release/helios-inspector vm --arch riscv64 --release build
+      # The image a `--no-build` boot needs on another host, laid out as
+      # the paths under `target/` the inspector reads: unpacked into
+      # `target/`, it is the whole installation (docs/boot.md). The
+      # manifest and the key files are not part of it: nothing on the
+      # `--no-build` path reads them, and the manifest records this
+      # runner's absolute paths. The root key pair is generated per
+      # build, so the signing key the kernel carries belongs to this
+      # image alone.
+      - name: Upload the guest image
+        if: always() && steps.guest-image.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: helios-guest-riscv64
+          path: |
+            helios/target/riscv64gc-unknown-none-elf/kernel-release/helios
+            helios/target/kernel-prebuild/riscv64gc-unknown-none-elf/kernel-release/helios-bootfs
+          if-no-files-found: error
+          retention-days: 90
 
   # A native Arm Linux runner under multi-threaded TCG. This lane is a
   # functional check, not a performance surface: `ubuntu-24.04-arm`
@@ -493,6 +523,35 @@ jobs:
             smoke-runtime/*/*.log
           if-no-files-found: warn
           retention-days: 7
+      # Each boot above rebuilds the bootfs for its own `--boot-program`
+      # selection, so what the target directory holds now is the last
+      # boot's subset. A build with no selection is the superset every
+      # workload class boots from; the kernel is not relinked.
+      - name: Build the full guest image
+        id: guest-image
+        # A lane that failed before it built the inspector has nothing
+        # to build an image with.
+        if: always() && hashFiles('helios/target/release/helios-inspector') != ''
+        working-directory: helios
+        run: ./target/release/helios-inspector vm --arch aarch64 --release build
+      # The image a `--no-build` boot needs on another host, laid out as
+      # the paths under `target/` the inspector reads: unpacked into
+      # `target/`, it is the whole installation (docs/boot.md). The
+      # manifest and the key files are not part of it: nothing on the
+      # `--no-build` path reads them, and the manifest records this
+      # runner's absolute paths. The root key pair is generated per
+      # build, so the signing key the kernel carries belongs to this
+      # image alone.
+      - name: Upload the guest image
+        if: always() && steps.guest-image.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: helios-guest-aarch64
+          path: |
+            helios/target/aarch64-unknown-none/kernel-release/helios
+            helios/target/kernel-prebuild/aarch64-unknown-none/kernel-release/helios-bootfs
+          if-no-files-found: error
+          retention-days: 90
 
   smoke-x86-64:
     name: smoke-x86-64
@@ -1318,6 +1377,36 @@ jobs:
             smoke-runtime/*/*.log
           if-no-files-found: warn
           retention-days: 7
+      # Each boot above rebuilds the bootfs for its own `--boot-program`
+      # selection, so what the target directory holds now is the last
+      # boot's subset. A build with no selection is the superset every
+      # workload class boots from; the kernel, built against the fetched
+      # profile, is not relinked.
+      - name: Build the full guest image
+        id: guest-image
+        # A lane that failed before it built the inspector has nothing
+        # to build an image with.
+        if: always() && hashFiles('helios/target/release/helios-inspector') != ''
+        working-directory: helios
+        run: ./target/release/helios-inspector vm --arch x86-64 --release build
+      # The image a `--no-build` boot needs on another host, laid out as
+      # the paths under `target/` the inspector reads: unpacked into
+      # `target/`, it is the whole installation (docs/boot.md). The
+      # manifest and the key files are not part of it: nothing on the
+      # `--no-build` path reads them, and the manifest records this
+      # runner's absolute paths. The root key pair is generated per
+      # build, so the signing key the kernel carries belongs to this
+      # image alone.
+      - name: Upload the guest image
+        if: always() && steps.guest-image.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: helios-guest-x86-64
+          path: |
+            helios/target/x86_64-unknown-none/profile-use/helios
+            helios/target/kernel-prebuild/x86_64-unknown-none/profile-use/helios-bootfs
+          if-no-files-found: error
+          retention-days: 90
 
   bench:
     name: bench-${{ matrix.name }}
