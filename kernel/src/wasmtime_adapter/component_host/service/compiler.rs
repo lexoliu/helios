@@ -419,7 +419,10 @@ pub(super) fn write_decimal(memory: &SharedMemory, ptr: GuestAddress, mut value:
 /// processor's running slot ever names it. Two things interrupt it: a kill
 /// of its instance, which the callback traps, and a freeze request
 /// (`GuestInterrupts::interrupt_running` reaches undriven stores through
-/// the kill table), on which the callback yields. Every compile call is a
+/// the kill table), on which the callback yields and requests the
+/// interruption again, so the compile keeps yielding at each resumption
+/// until the freeze is released
+/// (`GuestInterrupts::undriven_interrupt_action`). Every compile call is a
 /// `call_async` made from a task, so the yield returns the task to the
 /// executor and its processor reaches the freeze barrier's boundary; the
 /// compile resumes when the machine thaws. An interrupt that is neither
@@ -432,17 +435,17 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    store.interrupt_callback(|caller| {
+    let interrupts = store.data().shared.interrupts.clone();
+    let own_handle = store.interrupt_handle().unwrap_or_else(|error| {
+        panic!("a kernel engine was built without stack-limit interruption: {error}")
+    });
+    let callback_interrupts = interrupts.clone();
+    store.interrupt_callback(move |caller| {
         if let Some(reason) = caller.data().instance.pending_kill() {
             return Err(wasmtime::Error::from(crate::InstanceKilled { reason }));
         }
-        if caller.data().shared.interrupts.freeze_requested() {
-            Ok(wasmtime::InterruptAction::Yield)
-        } else {
-            Ok(wasmtime::InterruptAction::Continue)
-        }
+        Ok(callback_interrupts.undriven_interrupt_action(&own_handle))
     });
-    let interrupts = store.data().shared.interrupts.clone();
     interrupts.register_undriven(store.data().instance.id(), store, store.data().cpu.clone())
 }
 

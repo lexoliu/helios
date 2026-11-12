@@ -277,6 +277,32 @@ impl GuestInterrupts {
         self.freeze.load(Ordering::Acquire)
     }
 
+    /// What an undriven store's interrupt callback answers, given the
+    /// handle of its own store.
+    ///
+    /// While a freeze request is pending the store yields, and requests
+    /// the interruption again before it does, so that each resumption
+    /// yields at its next check: the yielded task returns to the executor
+    /// and may be popped again, even by the freezer's own processor
+    /// before the machine is frozen, and without the re-arm it would run
+    /// on to the end of the compile. The store has already taken the
+    /// request this callback answers and restored its real stack limit
+    /// before the callback runs, so a request made here is delivered at
+    /// the next check and not cleared with this one. Once the request has
+    /// dropped the answer is to continue, with nothing re-armed: the
+    /// interruption already pending is the last one.
+    pub(crate) fn undriven_interrupt_action(
+        &self,
+        own: &StoreInterruptHandle,
+    ) -> wasmtime::InterruptAction {
+        if self.freeze_requested() {
+            own.interrupt();
+            wasmtime::InterruptAction::Yield
+        } else {
+            wasmtime::InterruptAction::Continue
+        }
+    }
+
     /// Interrupts every live store of `instance`, wherever it is: running
     /// on a processor, suspended on its fiber, or in host code.
     ///
@@ -795,5 +821,91 @@ mod tests {
         drop(request);
         assert!(!interrupts.freeze_requested());
         drop((driven, undriven));
+    }
+
+    /// `spin(n)` counts `n` down in a loop, with a stack-limit check at
+    /// each loop header, and answers zero.
+    fn spin_module() -> alloc::vec::Vec<u8> {
+        use wasm_encoder::{
+            BlockType, CodeSection, ExportKind, ExportSection, Function, FunctionSection,
+            Instruction, Module, TypeSection, ValType,
+        };
+        let mut types = TypeSection::new();
+        types.ty().function([ValType::I32], [ValType::I32]);
+        let mut functions = FunctionSection::new();
+        functions.function(0);
+        let mut exports = ExportSection::new();
+        exports.export("spin", ExportKind::Func, 0);
+        let mut body = Function::new([]);
+        body.instruction(&Instruction::Loop(BlockType::Empty));
+        body.instruction(&Instruction::LocalGet(0));
+        body.instruction(&Instruction::I32Const(1));
+        body.instruction(&Instruction::I32Sub);
+        body.instruction(&Instruction::LocalTee(0));
+        body.instruction(&Instruction::BrIf(0));
+        body.instruction(&Instruction::End);
+        body.instruction(&Instruction::LocalGet(0));
+        body.instruction(&Instruction::End);
+        let mut code = CodeSection::new();
+        code.function(&body);
+        let mut module = Module::new();
+        module
+            .section(&types)
+            .section(&functions)
+            .section(&exports)
+            .section(&code);
+        module.finish()
+    }
+
+    /// While a freeze request is pending an undriven store yields at
+    /// every resumption, not once, and when the request drops its next
+    /// interruption resumes the guest and re-arms nothing.
+    #[test]
+    fn a_freeze_request_keeps_an_undriven_store_interrupted_until_it_drops() {
+        let engine = engine();
+        let interrupts = guest_interrupts(1);
+        let module =
+            wasmtime::Module::new(&engine, spin_module()).expect("the spin module compiles");
+        let mut store = wasmtime::Store::new(&engine, ());
+        let handle = store.interrupt_handle().expect("the engine interrupts");
+        let (callback_interrupts, own) = (interrupts.clone(), handle.clone());
+        let yields = Arc::new(AtomicUsize::new(0));
+        let counted = yields.clone();
+        store.interrupt_callback(move |_| {
+            let action = callback_interrupts.undriven_interrupt_action(&own);
+            if matches!(action, wasmtime::InterruptAction::Yield) {
+                counted.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(action)
+        });
+        let _registration =
+            interrupts.register_undriven(InstanceId::from_raw(3), &store, ManualClockCpu::new());
+        let instance =
+            wasmtime::Instance::new(&mut store, &module, &[]).expect("the spin module runs");
+        let spin = instance
+            .get_typed_func::<i32, i32>(&mut store, "spin")
+            .expect("spin is exported");
+
+        let request = interrupts.interrupt_running();
+        let mut call = core::pin::pin!(spin.call_async(&mut store, i32::MAX));
+        for resumption in 1..=5 {
+            assert!(
+                poll_once(call.as_mut()).is_pending(),
+                "resumption {resumption} ran on instead of yielding"
+            );
+            assert_eq!(yields.load(Ordering::Relaxed), resumption);
+        }
+
+        drop(request);
+        assert!(!interrupts.freeze_requested());
+        match poll_once(call.as_mut()) {
+            Poll::Ready(Ok(0)) => {}
+            other => panic!("a released store did not run to its end: {other:?}"),
+        }
+        assert_eq!(
+            yields.load(Ordering::Relaxed),
+            5,
+            "a released store yielded again"
+        );
     }
 }
