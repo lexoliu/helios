@@ -1,0 +1,30 @@
+[package]
+name = "helios-compiler-host"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+clap = { version = "4.6.6", default-features = false, features = ["derive", "error-context", "help", "std", "usage"] }
+getrandom = { version = "0.3.4", default-features = false, features = ["std"] }
+helios-compiler-abi.workspace = true
+helios-compiler-support.workspace = true
+serde = { version = "1.0.229", default-features = false, features = ["derive"] }
+serde_json = { version = "1.0.151", default-features = false, features = ["std"] }
+# Names the host triple the plugin's own module is compiled for, so no host
+# feature detection widens its ISA flags past the kernel target's set.
+target-lexicon = { version = "0.13.5", default-features = false }
+thiserror = { version = "2.0.21", default-features = false }
+tracing = { workspace = true, features = ["std"] }
+tracing-log = { version = "0.2.0", default-features = false, features = ["log-tracer", "std"] }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
+# `component-model-async` is the runtime half of the `concurrency_support`
+# the plugin's codegen configuration turns on: without it a store on that
+# engine cannot be created.
+wasmtime = { path = "../../wasmtime/crates/wasmtime", default-features = false, features = ["component-model-async", "cranelift", "parallel-compilation", "runtime", "std", "threads"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+wat = { version = "1.258.0", default-features = false }
+
+[lints]
+workspace = true

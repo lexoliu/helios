@@ -37,6 +37,10 @@ pub const MAX_UDP_RX: usize = 64;
 /// unsolicited ones the link delivers. The oldest is evicted once the
 /// buffer fills.
 pub const MAX_ICMP_ECHO_REPLIES: usize = 8;
+/// Echo requests remembered until answered, so an ICMP error quoting one
+/// can be told from a forgery: as many exchanges as replies are banked
+/// for. The oldest is forgotten once the table fills.
+const MAX_ICMP_ECHO_REQUESTS: usize = MAX_ICMP_ECHO_REPLIES;
 pub const MAX_UDP_SOCKETS: usize = 256;
 pub const MAX_IPV4_MULTICAST_MEMBERSHIPS: usize = 64;
 pub const MAX_PATH_MTU_ENTRIES: usize = 128;
@@ -359,6 +363,14 @@ pub struct IcmpEchoKey {
     pub destination: IpAddress,
     pub identifier: u16,
     pub sequence: u16,
+}
+
+/// An echo request this stack put on the wire and has not seen answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct IcmpEchoRequest {
+    path: PathMtuKey,
+    identifier: u16,
+    sequence: u16,
 }
 
 /// A received echo reply, held until the waiter for its key claims it.
@@ -2386,6 +2398,10 @@ where
     /// first. ICMP frames carry no port, so every one of them lands on
     /// shard 0 and this buffer belongs to that shard alone.
     icmp_echo_replies: ArrayVec<IcmpEchoReply, MAX_ICMP_ECHO_REPLIES>,
+    /// Echo requests sent from this shard and not yet answered, oldest
+    /// first, held so a path-MTU error quoting one can be believed
+    /// (RFC 5927 section 4.1).
+    icmp_echo_requests: ArrayVec<IcmpEchoRequest, MAX_ICMP_ECHO_REQUESTS>,
     udp_rx_counts: [u8; MAX_UDP_SOCKETS],
     tcp_accept: Deque<TcpQueuedAccept, MAX_TCP_ACCEPT>,
     tcp_listener_queues: TcpListenerQueues,
@@ -2775,6 +2791,7 @@ where
             udp: UdpSocketSlab::new(),
             udp_rx: Deque::new(),
             icmp_echo_replies: ArrayVec::new(),
+            icmp_echo_requests: ArrayVec::new(),
             udp_rx_counts: [0; MAX_UDP_SOCKETS],
             tcp_accept: Deque::new(),
             tcp_listener_queues: TcpListenerQueues::new(),
@@ -3606,6 +3623,7 @@ where
         initial_sequence: u32,
     ) -> Result<SocketId, StackError> {
         self.ensure_tcp_connect_unique(local, remote)?;
+        self.ensure_tcp_slot_free()?;
         let socket = TcpSocket::connect(local, remote, initial_sequence, self.congestion.clone());
         Ok(self.insert_tcp(socket))
     }
@@ -3619,6 +3637,7 @@ where
         if backlog.capacity() > MAX_TCP_ACCEPT {
             return Err(StackError::InvalidListenBacklog);
         }
+        self.ensure_tcp_slot_free()?;
         let socket = TcpSocket::listen(local, self.congestion.clone());
         let socket = self.insert_tcp(socket);
         self.tcp_listener_queues.insert(socket, backlog);
@@ -4361,13 +4380,14 @@ where
         let icmp_len = Icmpv4Packet::HEADER_LEN
             .checked_add(payload.len())
             .ok_or(StackError::PacketTooLarge)?;
+        let path = PathMtuKey::new(IpAddress::Ipv4(source), IpAddress::Ipv4(destination));
         self.ensure_path_packet_fits(
-            PathMtuKey::new(IpAddress::Ipv4(source), IpAddress::Ipv4(destination)),
+            path,
             EthernetFrame::HEADER_LEN + Ipv4Packet::MIN_HEADER_LEN,
             icmp_len,
         )?;
         let local_mac = self.config.mac;
-        self.queue_outbound_frame(|frame| {
+        let sent = self.queue_outbound_frame(|frame| {
             let storage = frame.storage_mut();
             let mut offset = EthernetFrame::encode_header(
                 storage,
@@ -4395,7 +4415,13 @@ where
             .ok_or(StackError::OutputQueueFull)?;
             frame.set_len(offset);
             Ok(payload.len())
-        })
+        })?;
+        self.record_icmp_echo_request(IcmpEchoRequest {
+            path,
+            identifier,
+            sequence,
+        });
+        Ok(sent)
     }
 
     fn send_icmpv6_echo_request(
@@ -4426,13 +4452,14 @@ where
         let icmp_len = Icmpv6Packet::ECHO_HEADER_LEN
             .checked_add(payload.len())
             .ok_or(StackError::PacketTooLarge)?;
+        let path = PathMtuKey::new(IpAddress::Ipv6(source), IpAddress::Ipv6(destination));
         self.ensure_path_packet_fits(
-            PathMtuKey::new(IpAddress::Ipv6(source), IpAddress::Ipv6(destination)),
+            path,
             EthernetFrame::HEADER_LEN + Ipv6Packet::HEADER_LEN,
             icmp_len,
         )?;
         let local_mac = self.config.mac;
-        self.queue_outbound_frame(|frame| {
+        let sent = self.queue_outbound_frame(|frame| {
             let storage = frame.storage_mut();
             let mut offset = EthernetFrame::encode_header(
                 storage,
@@ -4461,6 +4488,40 @@ where
             .ok_or(StackError::OutputQueueFull)?;
             frame.set_len(offset);
             Ok(payload.len())
+        })?;
+        self.record_icmp_echo_request(IcmpEchoRequest {
+            path,
+            identifier,
+            sequence,
+        });
+        Ok(sent)
+    }
+
+    /// Remembers an echo request that went on the wire, forgetting the
+    /// oldest once the table is full.
+    fn record_icmp_echo_request(&mut self, request: IcmpEchoRequest) {
+        if self.icmp_echo_requests.contains(&request) {
+            return;
+        }
+        if self.icmp_echo_requests.is_full() {
+            self.icmp_echo_requests.remove(0);
+        }
+        self.icmp_echo_requests.push(request);
+    }
+
+    /// Whether the echo request `identifier`/`sequence` an ICMP error
+    /// about `path` quotes is one this stack sent and has not seen
+    /// answered.
+    fn icmp_echo_request_outstanding(
+        &self,
+        path: PathMtuKey,
+        identifier: u16,
+        sequence: u16,
+    ) -> bool {
+        self.icmp_echo_requests.contains(&IcmpEchoRequest {
+            path,
+            identifier,
+            sequence,
         })
     }
 
@@ -4475,8 +4536,14 @@ where
         Some(self.icmp_echo_replies.remove(index))
     }
 
-    /// Banks a received echo reply for whichever waiter owns its key.
+    /// Banks a received echo reply for whichever waiter owns its key. The
+    /// request it answers is no longer in flight.
     fn record_icmp_echo_reply(&mut self, key: IcmpEchoKey, payload_bytes: usize) {
+        self.icmp_echo_requests.retain(|request| {
+            request.path.destination != key.destination
+                || request.identifier != key.identifier
+                || request.sequence != key.sequence
+        });
         if self.icmp_echo_replies.is_full() {
             self.icmp_echo_replies.remove(0);
         }
@@ -5820,6 +5887,9 @@ where
             IpAddress::Ipv4(quoted.source),
             IpAddress::Ipv4(quoted.destination),
         );
+        let Some(flow) = self.quoted_flow(quoted.protocol, key, quoted.payload) else {
+            return;
+        };
         let decreased = if next_hop_mtu == 0 {
             self.path_mtu.update_next_lower(key, quoted.total_len, now)
         } else {
@@ -5827,7 +5897,7 @@ where
                 .update_if_less(key, usize::from(next_hop_mtu), now)
         };
         if decreased {
-            self.mark_tcp_path_mtu_reduced(quoted.protocol, quoted.payload, key);
+            self.mark_tcp_path_mtu_reduced(flow);
         }
     }
 
@@ -5846,38 +5916,77 @@ where
             IpAddress::Ipv6(quoted.source),
             IpAddress::Ipv6(quoted.destination),
         );
+        let Some(flow) = self.quoted_flow(quoted.next_header, key, quoted.payload) else {
+            return;
+        };
         if self.path_mtu.update_if_less(key, mtu, now) {
-            self.mark_tcp_path_mtu_reduced(quoted.next_header, quoted.payload, key);
+            self.mark_tcp_path_mtu_reduced(flow);
         }
     }
 
-    fn mark_tcp_path_mtu_reduced(
-        &mut self,
+    /// The live flow the packet an ICMP error quotes belongs to, so the
+    /// error can be a reply to something this stack sent; `None` when
+    /// there is none (RFC 5927 section 4.1).
+    ///
+    /// A TCP segment must belong to a connection that has the quoted
+    /// sequence number in flight, a UDP datagram to a bound socket, and
+    /// an echo request to one this stack sent and has not seen answered.
+    /// A quote too short to carry what is checked matches nothing.
+    fn quoted_flow(
+        &self,
         protocol: crate::IpProtocol,
-        transport: &[u8],
         key: PathMtuKey,
-    ) {
-        if protocol != crate::IpProtocol::Tcp {
-            return;
+        transport: &[u8],
+    ) -> Option<QuotedFlow> {
+        match protocol {
+            crate::IpProtocol::Tcp => {
+                let packet = crate::TcpPacket::parse_quoted(transport)?;
+                let local = TcpEndpoint {
+                    address: key.source,
+                    port: packet.source_port,
+                };
+                let remote = TcpEndpoint {
+                    address: key.destination,
+                    port: packet.destination_port,
+                };
+                let index = self.tcp.find_endpoint(local, remote)?;
+                self.tcp
+                    .get(index)
+                    .unwrap_or_else(|| panic!("TCP endpoint index referenced a missing socket"))
+                    .sequence_in_flight(packet.sequence)
+                    .then_some(QuotedFlow {
+                        tcp_segment: Some((index, packet.sequence)),
+                    })
+            }
+            crate::IpProtocol::Udp => {
+                let ports = UdpPacket::parse_ports(transport)?;
+                // The quoted packet travelled from this stack to its
+                // peer, so the socket that owns it receives the reverse.
+                self.udp
+                    .socket_for_packet(key.destination, ports.destination, key.source, ports.source)
+                    .map(|_| QuotedFlow { tcp_segment: None })
+            }
+            crate::IpProtocol::Icmp => {
+                let echo = Icmpv4Packet::parse_quoted_echo_request(transport)?;
+                self.icmp_echo_request_outstanding(key, echo.identifier, echo.sequence)
+                    .then_some(QuotedFlow { tcp_segment: None })
+            }
+            crate::IpProtocol::Icmpv6 => {
+                let echo = Icmpv6Packet::parse_quoted_echo_request(transport)?;
+                self.icmp_echo_request_outstanding(key, echo.identifier, echo.sequence)
+                    .then_some(QuotedFlow { tcp_segment: None })
+            }
         }
-        let Some(packet) = crate::TcpPacket::parse_quoted(transport) else {
-            return;
-        };
-        let local = TcpEndpoint {
-            address: key.source,
-            port: packet.source_port,
-        };
-        let remote = TcpEndpoint {
-            address: key.destination,
-            port: packet.destination_port,
-        };
-        let Some(index) = self.tcp.find_endpoint(local, remote) else {
+    }
+
+    fn mark_tcp_path_mtu_reduced(&mut self, flow: QuotedFlow) {
+        let Some((index, sequence)) = flow.tcp_segment else {
             return;
         };
         self.tcp
             .get_mut(index)
             .unwrap_or_else(|| panic!("TCP PMTU endpoint index referenced a missing socket"))
-            .mark_path_mtu_reduced(packet.sequence);
+            .mark_path_mtu_reduced(sequence);
         self.schedule_tcp_timer(index);
     }
 
@@ -5913,6 +6022,19 @@ where
             .unwrap_or_else(|| panic!("TCP endpoint index referenced a missing socket"))
             .state()
             != crate::TcpState::SynSent
+        {
+            return;
+        }
+        // RFC 5927 section 4.1: only the SYN this connection has in
+        // flight can have drawn the error.
+        let Some(sequence) = error.sequence else {
+            return;
+        };
+        if !self
+            .tcp
+            .get(index)
+            .unwrap_or_else(|| panic!("TCP endpoint index referenced a missing socket"))
+            .sequence_in_flight(sequence)
         {
             return;
         }
@@ -6024,6 +6146,17 @@ where
         let id = self.tcp.insert(socket);
         self.schedule_tcp_timer(socket_index(id));
         id
+    }
+
+    /// Refuses an open the slab cannot hold. The slab's own panic stays
+    /// for a corrupt free list: a full slab is reachable by a guest, so
+    /// it is an error here, the way the inbound SYN path asks first.
+    fn ensure_tcp_slot_free(&self) -> Result<(), StackError> {
+        if self.tcp.has_free_slot() {
+            Ok(())
+        } else {
+            Err(StackError::TcpSocketsExhausted)
+        }
     }
 
     fn ensure_tcp_connect_unique(
@@ -6575,6 +6708,7 @@ impl IcmpDestinationUnreachable<'_> {
                 let ports = transport_ports(quoted.protocol, quoted.payload)?;
                 Some(IcmpTransportError {
                     protocol: quoted.protocol,
+                    sequence: quoted_tcp_sequence(quoted.protocol, quoted.payload),
                     kind: IcmpTransportErrorKind::from_ipv4_code(unreachable.code)?,
                     endpoint: IcmpQuotedEndpoint {
                         local: IpAddress::Ipv4(quoted.source),
@@ -6589,6 +6723,7 @@ impl IcmpDestinationUnreachable<'_> {
                 let ports = transport_ports(quoted.next_header, quoted.payload)?;
                 Some(IcmpTransportError {
                     protocol: quoted.next_header,
+                    sequence: quoted_tcp_sequence(quoted.next_header, quoted.payload),
                     kind: IcmpTransportErrorKind::from_ipv6_code(unreachable.code)?,
                     endpoint: IcmpQuotedEndpoint {
                         local: IpAddress::Ipv6(quoted.source),
@@ -6602,9 +6737,20 @@ impl IcmpDestinationUnreachable<'_> {
     }
 }
 
+/// The live flow an ICMP error's quoted packet belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct QuotedFlow {
+    /// The connection's socket index and the quoted segment's sequence
+    /// number, when the flow is a TCP connection.
+    tcp_segment: Option<(usize, u32)>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct IcmpTransportError {
     protocol: crate::IpProtocol,
+    /// The sequence number of the quoted TCP segment, `None` for any
+    /// other protocol or a quote too short to carry it.
+    sequence: Option<u32>,
     endpoint: IcmpQuotedEndpoint,
     kind: IcmpTransportErrorKind,
 }
@@ -6672,6 +6818,13 @@ impl IcmpTransportErrorKind {
             Self::PortUnreachable => TcpConnectTerminalError::RemotePortUnreachable,
             Self::CommunicationProhibited => TcpConnectTerminalError::RemoteCommunicationProhibited,
         }
+    }
+}
+
+fn quoted_tcp_sequence(protocol: crate::IpProtocol, payload: &[u8]) -> Option<u32> {
+    match protocol {
+        crate::IpProtocol::Tcp => Some(TcpPacket::parse_quoted(payload)?.sequence),
+        crate::IpProtocol::Udp | crate::IpProtocol::Icmp | crate::IpProtocol::Icmpv6 => None,
     }
 }
 
@@ -8834,6 +8987,316 @@ mod tests {
             stack.tcp_connect_state(socket),
             Ok(TcpConnectState::Closed(TcpConnectTerminalError::Closed))
         );
+    }
+
+    #[test]
+    fn icmp_unreachable_quoting_a_sequence_outside_the_syn_leaves_connect_pending() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let router = Ipv4Address::new([192, 0, 2, 1]);
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
+        let socket = stack
+            .open_tcp_connect(
+                TcpEndpoint {
+                    address: IpAddress::Ipv4(local),
+                    port: 49152,
+                },
+                TcpEndpoint {
+                    address: IpAddress::Ipv4(peer),
+                    port: 80,
+                },
+                7,
+            )
+            .expect("test TCP connect should allocate a socket");
+
+        // The ports match the live connect; the sequence number is one an
+        // off-path sender, who never saw the SYN, would have to guess.
+        for forged_sequence in [6, 8, 0x8000_0007] {
+            let (icmp, icmp_len) = ipv4_icmp_port_unreachable_for_tcp(
+                router,
+                local,
+                local,
+                peer,
+                TcpHeader {
+                    source_port: 49152,
+                    destination_port: 80,
+                    sequence: forged_sequence,
+                    acknowledgement: 0,
+                    flags: TcpFlags::SYN,
+                    window_size: u16::MAX,
+                },
+            );
+            stack
+                .receive_frame(&icmp[..icmp_len], StackInstant::from_nanos(1))
+                .expect("ICMPv4 unreachable should be handled");
+        }
+
+        assert_eq!(
+            stack.tcp_connect_state(socket),
+            Ok(TcpConnectState::Pending)
+        );
+    }
+
+    #[test]
+    fn ipv4_fragmentation_needed_for_an_address_pair_no_socket_owns_is_ignored() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let router = Ipv4Address::new([192, 0, 2, 1]);
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
+        let key = PathMtuKey::new(IpAddress::Ipv4(local), IpAddress::Ipv4(peer));
+        let (quoted_udp, quoted_udp_len) = ipv4_udp_frame(local, 49152, peer, 53, b"payload");
+        let (udp_icmp, udp_icmp_len) = ipv4_icmp_unreachable_for_udp_frame(
+            router,
+            local,
+            &quoted_udp[..quoted_udp_len],
+            Icmpv4DestinationUnreachableCode::FragmentationNeeded { next_hop_mtu: 576 },
+        );
+        let (tcp_icmp, tcp_icmp_len) = ipv4_icmp_unreachable_for_tcp(
+            router,
+            local,
+            local,
+            peer,
+            TcpHeader {
+                source_port: 49152,
+                destination_port: 80,
+                sequence: 8,
+                acknowledgement: 0,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+            },
+            Icmpv4DestinationUnreachableCode::FragmentationNeeded { next_hop_mtu: 576 },
+        );
+
+        for (icmp, icmp_len) in [(udp_icmp, udp_icmp_len), (tcp_icmp, tcp_icmp_len)] {
+            stack
+                .receive_frame(&icmp[..icmp_len], StackInstant::from_nanos(1))
+                .expect("ICMPv4 fragmentation-needed should be handled");
+        }
+
+        assert_eq!(stack.path_mtu.get(key), None);
+    }
+
+    #[test]
+    fn ipv4_fragmentation_needed_quoting_a_sequence_not_in_flight_is_ignored() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let router = Ipv4Address::new([192, 0, 2, 1]);
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
+        let _socket = stack
+            .open_tcp_connect(
+                TcpEndpoint {
+                    address: IpAddress::Ipv4(local),
+                    port: 49152,
+                },
+                TcpEndpoint {
+                    address: IpAddress::Ipv4(peer),
+                    port: 80,
+                },
+                7,
+            )
+            .expect("test TCP connect should allocate a socket");
+        let (icmp, icmp_len) = ipv4_icmp_unreachable_for_tcp(
+            router,
+            local,
+            local,
+            peer,
+            TcpHeader {
+                source_port: 49152,
+                destination_port: 80,
+                sequence: 5000,
+                acknowledgement: 0,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+            },
+            Icmpv4DestinationUnreachableCode::FragmentationNeeded { next_hop_mtu: 576 },
+        );
+
+        stack
+            .receive_frame(&icmp[..icmp_len], StackInstant::from_nanos(1))
+            .expect("ICMPv4 fragmentation-needed should be handled");
+
+        assert_eq!(
+            stack.path_mtu.get(PathMtuKey::new(
+                IpAddress::Ipv4(local),
+                IpAddress::Ipv4(peer)
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn ipv6_packet_too_big_for_an_address_pair_no_socket_owns_is_ignored() {
+        let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        let peer = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+        let router = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]);
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
+        stack
+            .add_ipv6_address(Ipv6Cidr::new(local, 64))
+            .expect("test address should be accepted");
+        let (quoted, quoted_len) = ipv6_udp_frame(local, 49152, peer, 53, b"payload");
+        let (icmp, icmp_len) =
+            ipv6_icmp_packet_too_big_for_frame(router, local, &quoted[..quoted_len], 1280);
+
+        stack
+            .receive_frame(&icmp[..icmp_len], StackInstant::from_nanos(1))
+            .expect("ICMPv6 Packet Too Big should be handled");
+
+        assert_eq!(
+            stack.path_mtu.get(PathMtuKey::new(
+                IpAddress::Ipv6(local),
+                IpAddress::Ipv6(peer)
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn fragmentation_needed_quoting_an_outstanding_echo_request_lowers_the_path_mtu() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let router = Ipv4Address::new([192, 0, 2, 1]);
+        let key = PathMtuKey::new(IpAddress::Ipv4(local), IpAddress::Ipv4(peer));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
+        stack.learn_neighbor(NeighborEntry {
+            ip: IpAddress::Ipv4(peer),
+            mac: PEER_MAC,
+            state: NeighborState::Reachable,
+            updated_at: StackInstant::from_nanos(0),
+        });
+        let sent = stack
+            .send_icmp_echo_request(
+                IpAddress::Ipv4(peer),
+                7,
+                1,
+                &[0x5a; 64],
+                3,
+                StackInstant::from_nanos(1),
+            )
+            .expect("echo request should be queued");
+        assert_eq!(sent, 64);
+        let request = stack
+            .take_outbound()
+            .expect("echo request should be queued");
+        // The same request with another sequence number: what a sender
+        // that never saw the real one would have to guess.
+        let mut forged = [0u8; crate::ETHERNET_FRAME_BYTES];
+        let request_len = request.as_slice().len();
+        forged[..request_len].copy_from_slice(request.as_slice());
+        let sequence_offset =
+            EthernetFrame::HEADER_LEN + Ipv4Packet::MIN_HEADER_LEN + Icmpv4Packet::HEADER_LEN - 1;
+        forged[sequence_offset] ^= 0x80;
+        let fragmentation_needed =
+            Icmpv4DestinationUnreachableCode::FragmentationNeeded { next_hop_mtu: 576 };
+
+        let (icmp, icmp_len) = ipv4_icmp_unreachable_for_udp_frame(
+            router,
+            local,
+            &forged[..request_len],
+            fragmentation_needed,
+        );
+        stack
+            .receive_frame(&icmp[..icmp_len], StackInstant::from_nanos(2))
+            .expect("ICMPv4 fragmentation-needed should be handled");
+        assert_eq!(stack.path_mtu.get(key), None);
+
+        let (icmp, icmp_len) = ipv4_icmp_unreachable_for_udp_frame(
+            router,
+            local,
+            request.as_slice(),
+            fragmentation_needed,
+        );
+        stack
+            .receive_frame(&icmp[..icmp_len], StackInstant::from_nanos(3))
+            .expect("ICMPv4 fragmentation-needed should be handled");
+        assert_eq!(stack.path_mtu.get(key), Some(576));
+    }
+
+    #[test]
+    fn packet_too_big_quoting_an_outstanding_echo_request_lowers_the_path_mtu() {
+        let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        let peer = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+        let router = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]);
+        let key = PathMtuKey::new(IpAddress::Ipv6(local), IpAddress::Ipv6(peer));
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
+        stack
+            .add_ipv6_address(Ipv6Cidr::new(local, 64))
+            .expect("test address should be accepted");
+        stack.learn_neighbor(NeighborEntry {
+            ip: IpAddress::Ipv6(peer),
+            mac: PEER_MAC,
+            state: NeighborState::Reachable,
+            updated_at: StackInstant::from_nanos(0),
+        });
+        let sent = stack
+            .send_icmp_echo_request(
+                IpAddress::Ipv6(peer),
+                7,
+                1,
+                &[0x5a; 64],
+                0,
+                StackInstant::from_nanos(1),
+            )
+            .expect("echo request should be queued");
+        assert_eq!(sent, 64);
+        let request = stack
+            .take_outbound()
+            .expect("echo request should be queued");
+        let mut forged = [0u8; crate::ETHERNET_FRAME_BYTES];
+        let request_len = request.as_slice().len();
+        forged[..request_len].copy_from_slice(request.as_slice());
+        let sequence_offset =
+            EthernetFrame::HEADER_LEN + Ipv6Packet::HEADER_LEN + Icmpv6Packet::ECHO_HEADER_LEN - 1;
+        forged[sequence_offset] ^= 0x80;
+
+        let (icmp, icmp_len) =
+            ipv6_icmp_packet_too_big_for_frame(router, local, &forged[..request_len], 1280);
+        stack
+            .receive_frame(&icmp[..icmp_len], StackInstant::from_nanos(2))
+            .expect("ICMPv6 Packet Too Big should be handled");
+        assert_eq!(stack.path_mtu.get(key), None);
+
+        let (icmp, icmp_len) =
+            ipv6_icmp_packet_too_big_for_frame(router, local, request.as_slice(), 1280);
+        stack
+            .receive_frame(&icmp[..icmp_len], StackInstant::from_nanos(3))
+            .expect("ICMPv6 Packet Too Big should be handled");
+        assert_eq!(stack.path_mtu.get(key), Some(1280));
     }
 
     #[test]
@@ -12065,6 +12528,134 @@ mod tests {
         );
     }
 
+    /// A slab that orphans fill is the stack's to report, not to panic
+    /// on: a close keeps its socket for the whole of `TIME-WAIT`, so a
+    /// guest that opens and closes faster than 2MSL drains reaches a
+    /// full slab through calls it is entitled to make.
+    #[test]
+    fn tcp_open_reports_a_full_slab_of_time_wait_orphans() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
+        stack.learn_neighbor(NeighborEntry {
+            ip: IpAddress::Ipv4(peer),
+            mac: PEER_MAC,
+            state: NeighborState::Reachable,
+            updated_at: StackInstant::from_nanos(0),
+        });
+        let remote_endpoint = TcpEndpoint {
+            address: IpAddress::Ipv4(peer),
+            port: 80,
+        };
+        let endpoint_for = |index: usize| TcpEndpoint {
+            address: IpAddress::Ipv4(local),
+            port: 40_000 + u16::try_from(index).expect("slab index fits a port offset"),
+        };
+        let receive = |stack: &mut Stack, port: u16, header: TcpHeader, now: u64| {
+            let (segment, len) = tcp_segment(
+                peer,
+                local,
+                TcpHeader {
+                    destination_port: port,
+                    ..header
+                },
+            );
+            stack
+                .receive_tcp(
+                    IpAddress::Ipv4(peer),
+                    IpAddress::Ipv4(local),
+                    &Bytes::copy_from_slice(&segment[..len]),
+                    RxFrameOffload::none(),
+                    StackInstant::from_nanos(now),
+                )
+                .expect("the peer's segment should be accepted");
+        };
+
+        for index in 0..MAX_TCP_SOCKETS {
+            let local_endpoint = endpoint_for(index);
+            let socket = stack
+                .open_tcp_connect(local_endpoint, remote_endpoint, 7)
+                .expect("a slot is free while the slab is filling");
+            receive(
+                &mut stack,
+                local_endpoint.port,
+                TcpHeader {
+                    source_port: 80,
+                    destination_port: 0,
+                    sequence: 100,
+                    acknowledgement: 8,
+                    flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                    window_size: u16::MAX,
+                },
+                1,
+            );
+            assert_eq!(
+                stack.close_tcp_socket(socket, StackInstant::from_nanos(2)),
+                Ok(TcpCloseOutcome::Finishing)
+            );
+            stack
+                .drive_tcp(StackInstant::from_nanos(2))
+                .expect("the close should queue a FIN");
+            let mut fin_sequence = None;
+            while let Some((flags, sequence, _)) = take_tcp_segment(&mut stack) {
+                if flags.contains(TcpFlags::FIN) {
+                    fin_sequence = Some(sequence);
+                }
+            }
+            receive(
+                &mut stack,
+                local_endpoint.port,
+                TcpHeader {
+                    source_port: 80,
+                    destination_port: 0,
+                    sequence: 101,
+                    acknowledgement: fin_sequence
+                        .expect("the close owes its peer a FIN")
+                        .wrapping_add(1),
+                    flags: TcpFlags::ACK.union(TcpFlags::FIN),
+                    window_size: u16::MAX,
+                },
+                3,
+            );
+            while stack.take_outbound().is_some() {}
+            while stack.take_event().is_some() {}
+        }
+
+        assert_eq!(
+            stack.open_tcp_connect(endpoint_for(MAX_TCP_SOCKETS), remote_endpoint, 7),
+            Err(StackError::TcpSocketsExhausted)
+        );
+        assert_eq!(
+            stack.open_tcp_listen(
+                TcpEndpoint {
+                    address: IpAddress::Ipv4(local),
+                    port: 8080,
+                },
+                TcpListenBacklog::try_new(1).expect("a backlog of one is representable"),
+            ),
+            Err(StackError::TcpSocketsExhausted)
+        );
+
+        stack
+            .drive_tcp(StackInstant::from_nanos(
+                3 + crate::tcp::TCP_TIME_WAIT_NANOS,
+            ))
+            .expect("the 2MSL timers should expire");
+        assert!(
+            stack
+                .open_tcp_connect(endpoint_for(MAX_TCP_SOCKETS), remote_endpoint, 7)
+                .is_ok(),
+            "the slots come back once TIME-WAIT drains"
+        );
+    }
+
     #[test]
     fn tcp_stack_accepts_replaceable_congestion_control() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
@@ -13058,6 +13649,14 @@ mod tests {
         let _ = stack
             .take_outbound()
             .expect("handshake ACK frame should be queued");
+        // The error has to quote a segment the connection has in flight.
+        assert_eq!(stack.tcp_send(socket, b"x"), Ok(1));
+        stack
+            .drive_tcp(StackInstant::from_nanos(2))
+            .expect("first data should be queued");
+        let _ = stack
+            .take_outbound()
+            .expect("first data frame should be queued");
         let (icmp, icmp_len) = ipv4_icmp_unreachable_for_tcp(
             router,
             local,
@@ -13074,23 +13673,30 @@ mod tests {
             Icmpv4DestinationUnreachableCode::FragmentationNeeded { next_hop_mtu: 576 },
         );
         stack
-            .receive_frame(&icmp[..icmp_len], StackInstant::from_nanos(2))
+            .receive_frame(&icmp[..icmp_len], StackInstant::from_nanos(3))
             .expect("ICMPv4 fragmentation-needed should update PMTU");
+        stack
+            .drive_tcp(StackInstant::from_nanos(3))
+            .expect("PMTU update should queue its eager retransmission");
+        while stack.take_outbound().is_some() {}
 
         let payload = [0u8; 1024];
         assert_eq!(stack.tcp_send(socket, &payload), Ok(payload.len()));
         stack
-            .drive_tcp(StackInstant::from_nanos(3))
+            .drive_tcp(StackInstant::from_nanos(4))
             .expect("PMTU-limited TCP data should be queued");
 
-        let frame = stack.take_outbound().expect("data frame should be queued");
-        let ethernet = EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
-        let ipv4 = Ipv4Packet::parse(ethernet.payload).expect("IPv4 packet should parse");
-        let data = TcpPacket::parse(ipv4.payload).expect("TCP packet should parse");
-        assert_eq!(
-            data.payload.len(),
-            576 - Ipv4Packet::MIN_HEADER_LEN - TcpPacket::MIN_HEADER_LEN - data.options.raw().len()
-        );
+        let cap = 576 - Ipv4Packet::MIN_HEADER_LEN - TcpPacket::MIN_HEADER_LEN;
+        let mut largest = 0;
+        while let Some(frame) = stack.take_outbound() {
+            let ethernet =
+                EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
+            let ipv4 = Ipv4Packet::parse(ethernet.payload).expect("IPv4 packet should parse");
+            let data = TcpPacket::parse(ipv4.payload).expect("TCP packet should parse");
+            assert!(data.payload.len() <= cap - data.options.raw().len());
+            largest = largest.max(data.payload.len() + data.options.raw().len());
+        }
+        assert_eq!(largest, cap);
     }
 
     #[test]

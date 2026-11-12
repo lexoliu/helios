@@ -30,11 +30,11 @@ use helios_hal::cpu::{Cpu, HardwarePerfCounters, current_processor};
 use helios_hal::io::IoError;
 use helios_netstack::{
     DEFAULT_HOP_LIMIT, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DNS_PORT, DhcpAction, DhcpClient,
-    DhcpDestination, DhcpDnsServers, DhcpLease, DhcpPacket, DhcpTransmit, DnsQuestionWriter,
-    DnsRecordType, DnsResponse, EthernetFrame, EthernetProtocol, FlowTuple, IcmpEchoKey,
-    IcmpEchoReply, Icmpv4Packet, Icmpv6Packet, InterfaceEventMark, IpAddress, IpCidr, IpProtocol,
-    Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6AddressEntry, Ipv6Cidr, Ipv6Packet,
-    IsnSecret, MAX_OUTBOUND_FRAMES, NeighborCache, NeighborEntry,
+    DhcpDestination, DhcpDnsServers, DhcpLease, DhcpPacket, DhcpTransmit, DnsQuery,
+    DnsQuestionWriter, DnsRecordType, DnsResponse, EthernetFrame, EthernetProtocol, FlowTuple,
+    IcmpEchoKey, IcmpEchoReply, Icmpv4Packet, Icmpv6Packet, InterfaceEventMark, IpAddress, IpCidr,
+    IpProtocol, Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6AddressEntry, Ipv6Cidr,
+    Ipv6Packet, IsnSecret, MAX_OUTBOUND_FRAMES, NeighborCache, NeighborEntry,
     NetworkInterface as NetworkDevice, OutboundBatchStatus, Route, RouteTable, RxChecksumOffload,
     RxDrain, RxFrame, SegmentationOffload, Stack, StackConfig, StackError, StackEvent,
     StackInstant, TcpCloseKind, TcpConnectState, TcpConnectTerminalError, TcpEndpoint,

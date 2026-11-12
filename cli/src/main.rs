@@ -1555,6 +1555,15 @@ fn build_compiler_plugin_asset(build: &BootBuild<'_>) -> Result<BootAsset, Bootf
             source,
         }
     })?;
+    // The exact module this run precompiled into the bootfs, at a path that
+    // does not depend on cargo's target-directory layout: the bench's Linux
+    // + Wasmtime column runs this file under `helios-compiler-host`, so both
+    // columns run one plugin build.
+    let wasm_output_path = build.out_dir.join("compiler_plugin.wasm");
+    fs::write(&wasm_output_path, &wasm).map_err(|source| BootfsError::Write {
+        path: wasm_output_path.display().to_string(),
+        source,
+    })?;
     let output_path = build.out_dir.join("compiler_plugin.cwasm");
     write_bootfs_artifact(&output_path, signed)?;
 
