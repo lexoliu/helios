@@ -15,6 +15,7 @@ mod idle;
 mod in_flight;
 mod observer;
 pub(crate) mod phases;
+mod ready;
 mod sync;
 mod task;
 mod time;
@@ -40,6 +41,7 @@ pub use observer::{
     TraceFilter, TraceHistory, TraceLevel, TraceValue, matches_perf_metric_filter,
     matches_profile_filter, matches_trace_filter, parse_console_text,
 };
+pub use ready::ReadyLink;
 pub use sync::{
     Mutex, MutexGuard, Notified, Notify, NotifyWaiter, OwnedRawMutexLease, OwnedRawRwLockReadLease,
     OwnedRawRwLockWriteLease, ProgressChanged, ProgressMark, ProgressSignal, RawMutex,
@@ -48,6 +50,6 @@ pub use sync::{
 };
 pub use task::{YieldNow, yield_now};
 pub use time::{
-    KernelClock, UptimeClock, elapsed_millis, monotonic_nanos, wall_clock_offset_nanos,
+    KernelClock, UptimeClock, WallClock, elapsed_millis, monotonic_nanos, wall_clock_offset_nanos,
 };
 pub use timer::{GUEST_TIME_SLICE, Sleep, Timer};

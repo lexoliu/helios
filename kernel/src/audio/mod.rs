@@ -21,18 +21,18 @@
 //!   feedback comes back on. No trait object and no lock crosses that
 //!   boundary.
 //! * [`instance`] is the claiming instance's side: the claim its store
-//!   holds and the arena its period buffers are pinned in, released by
-//!   the same drop that kills the instance.
+//!   holds and the ring its period buffers cross in, released by the
+//!   same drop that kills the instance.
 //!
 //! # Where the samples are
 //!
-//! Nowhere the kernel owns. A stream's period buffers are committed
-//! from the user pool into the claiming instance's audio window —
-//! pinned, physically contiguous pages accounted to that instance — and
-//! those same pages are what the device is told to read. The bytes
-//! arriving on the guest's `samples` stream are copied into them once,
-//! by the task that owns the guest's store, and the device takes them
-//! from there.
+//! Nowhere the kernel owns. A stream's period buffers are
+//! [`crate::Buffer`]s pinned from the user pool on the claiming
+//! instance's behalf — physically contiguous runs accounted to that
+//! instance — and those same runs are what the device is told to read.
+//! The bytes arriving on the guest's `samples` stream are copied into
+//! them once, through each buffer's kernel alias, by the task that owns
+//! the guest's store, and the device takes them from there.
 //!
 //! # What the kernel never plays
 //!
@@ -51,9 +51,10 @@
 //! queues, [`owner`] for the tasks. The one rule that spans them is the
 //! release: a claim is let go by a drop, which cannot await anything,
 //! so the stream is neither held nor free until the stream's own task
-//! has stopped the device and taken the pages back — and the pages are
-//! handed to that task rather than freed by the drop, because the
-//! device may still be reading them when the instance dies.
+//! has stopped the device. The period buffers are not freed by the
+//! drop: the ring holds them and the stream's task holds the ring while
+//! it plays from it, so they go back to the pool, on that task's
+//! processor, once the device has stopped reading them.
 
 mod instance;
 mod owner;
@@ -63,7 +64,7 @@ mod tests;
 
 use thiserror::Error;
 
-use crate::pins::PinError;
+use crate::buffer::BufferError;
 
 pub use instance::AudioOwnership;
 pub use owner::install_audio_device;
@@ -128,9 +129,6 @@ pub enum AudioServiceError {
     /// accounting refused it.
     #[error("no contiguous run of memory left for a period buffer")]
     OutOfMemory,
-    /// The instance's audio window has no room left.
-    #[error("this instance's audio window has no room left")]
-    WindowExhausted,
     /// The device failed rather than refused.
     #[error("the sound device faulted")]
     DeviceFault,
@@ -140,20 +138,18 @@ pub enum AudioServiceError {
     Closed,
 }
 
-/// A period buffer the arena refused, in the vocabulary a player acts
+/// A period buffer the pool refused, in the vocabulary a player acts
 /// on.
-impl From<PinError> for AudioServiceError {
-    fn from(error: PinError) -> Self {
+impl From<BufferError> for AudioServiceError {
+    fn from(error: BufferError) -> Self {
         match error {
-            // A period of no bytes comes from a format whose frame size
-            // is zero, which is a format no stream accepts.
-            PinError::EmptyRun => Self::UnsupportedFormat,
-            PinError::TooManyRuns | PinError::WindowExhausted => Self::WindowExhausted,
-            PinError::OutOfMemory => Self::OutOfMemory,
-            // A playback claim never asks for a view of somebody else's
-            // run, so an address space refusing one here is a wiring
-            // fault rather than a shortage.
-            PinError::ShareRefused => Self::DeviceFault,
+            // A period of no bytes, or of more than any address space
+            // describes, comes from a format no stream accepts.
+            BufferError::Empty | BufferError::TooLarge => Self::UnsupportedFormat,
+            BufferError::OutOfMemory => Self::OutOfMemory,
+            // The address space refused a run the kernel described
+            // correctly: a wiring fault rather than a shortage.
+            BufferError::AddressSpace(_) => Self::DeviceFault,
         }
     }
 }

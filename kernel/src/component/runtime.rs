@@ -424,8 +424,19 @@ pub(crate) struct ComponentExecutionContext<FileSystem> {
     output_mode: ComponentOutputMode,
 }
 
-pub struct ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem, ResourceTableImpl>
-where
+/// One instance's store data.
+///
+/// `LinearMemoryImpl` is the runtime's handle on the instance's one
+/// unshared linear memory: the kernel never looks inside it, and the
+/// runtime adapter reads the memory's current extent through it each
+/// time a guest names a span.
+pub struct ComponentStoreData<
+    CpuImpl,
+    RuntimeStateImpl,
+    FileSystem,
+    ResourceTableImpl,
+    LinearMemoryImpl,
+> where
     CpuImpl: Cpu + Clone,
     RuntimeStateImpl: ComponentRuntimeState,
 {
@@ -447,9 +458,25 @@ where
     execution_context: ComponentExecutionContext<FileSystem>,
     serial_reader: crate::SerialReader,
     serial_writer: crate::DebugSerialWriter,
-    /// Where this instance's linear memory sits and the device it
-    /// holds, if any. Empty on every instance that never asks for one,
-    /// which is every instance that is not a driver.
+    /// The runtime's handle on this instance's linear memory, once the
+    /// instance is built. Absent when its component lowers through a
+    /// shared memory, or through more than one: nothing is ever shown
+    /// in such a memory.
+    pub linear_memory: Option<LinearMemoryImpl>,
+    /// Every buffer and device region shown in this instance's linear
+    /// memory.
+    ///
+    /// Declared before `device` on purpose: fields drop in order, so a
+    /// dying store withdraws every view before any claim it holds is
+    /// let go, and the claims' owner tasks — which may run on another
+    /// processor the moment a claim drops — never act on a device whose
+    /// memory this instance can still reach. The runtime drops store
+    /// data before it deallocates the instance and resets the memory
+    /// slot, so no view outlives the memory it was shown in.
+    pub views: crate::buffer::ViewTable,
+    /// The devices, display, desktop windows, 3D engine and playback
+    /// stream this instance holds, if any. Empty on every instance that
+    /// never asks for one.
     pub device: crate::device::DeviceOwnership,
     /// The input devices this instance holds, if any. Empty on every
     /// instance that never claims one, which is every instance that is
@@ -496,8 +523,8 @@ impl<FileSystem> ComponentExecutionContext<FileSystem> {
     }
 }
 
-impl<CpuImpl, RuntimeStateImpl, FileSystem, ResourceTableImpl>
-    ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem, ResourceTableImpl>
+impl<CpuImpl, RuntimeStateImpl, FileSystem, ResourceTableImpl, LinearMemoryImpl>
+    ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem, ResourceTableImpl, LinearMemoryImpl>
 where
     CpuImpl: Cpu + Clone,
     RuntimeStateImpl: ComponentRuntimeState,
@@ -545,6 +572,8 @@ where
             ),
             serial_reader,
             serial_writer,
+            linear_memory: None,
+            views: crate::buffer::ViewTable::new(),
             device: crate::device::DeviceOwnership::new(),
             input: crate::input::InputOwnership::new(),
             requested_exit: None,
@@ -598,10 +627,6 @@ where
 
     pub(crate) fn filesystem(&self) -> &FileSystem {
         &self.execution_context.filesystem
-    }
-
-    pub(crate) fn filesystem_mut(&mut self) -> &mut FileSystem {
-        &mut self.execution_context.filesystem
     }
 
     pub(crate) fn arguments(&self) -> &[String] {

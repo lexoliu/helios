@@ -2342,8 +2342,12 @@ where
 
     fn highest_sent_sequence(&self) -> u32 {
         self.persist_probe.map_or(self.send_next, |probe| {
-            self.send_next
-                .max(probe.sequence.wrapping_add(probe.sequence_len))
+            let probe_end = probe.sequence.wrapping_add(probe.sequence_len);
+            if sequence_lt(self.send_next, probe_end) {
+                probe_end
+            } else {
+                self.send_next
+            }
         })
     }
 
@@ -2444,9 +2448,13 @@ where
         duplicate_ack_eligible: bool,
     ) -> Option<RecoveryAction> {
         if sequence_leq(acknowledgement, self.send_unacknowledged) {
-            return (acknowledgement == self.send_unacknowledged && duplicate_ack_eligible)
+            let action = (acknowledgement == self.send_unacknowledged && duplicate_ack_eligible)
                 .then(|| self.note_duplicate_ack(now_nanos))
                 .flatten();
+            // A window update carried by an ACK that acknowledges
+            // nothing new still reopens the window the probe asked about.
+            self.refresh_persist_after_ack(now_nanos);
+            return action;
         }
         let mut acked = acknowledgement.wrapping_sub(self.send_unacknowledged);
         if let Some(probe) = self.persist_probe
@@ -2824,9 +2832,16 @@ where
             .wrapping_add(u32::try_from(payload_len).unwrap_or(u32::MAX));
         let drained_segments = self.drain_contiguous_out_of_order();
         self.refresh_advertised_window();
-        if drained_segments == 0 {
+        // Duplicate acknowledgements owed for a hole all carry the old
+        // `receive_next`. Once it advances they would repeat the new one
+        // and read to the peer as a loss report for data it has not lost,
+        // so the advance settles them to the single immediate
+        // acknowledgement of RFC 5681 §4.2.
+        let settles_duplicates = payload_len != 0 && self.pending_acks > 1;
+        if drained_segments == 0 && !settles_duplicates {
             self.note_inbound_payload(now_nanos);
         } else {
+            self.pending_acks = 0;
             self.request_ack();
         }
         Ok(payload_len != 0 || drained_segments != 0)
@@ -5257,6 +5272,108 @@ mod tests {
         assert_eq!(segment.header.sequence, 9);
     }
 
+    fn peer_ack(acknowledgement: u32, window_size: u16) -> TcpPacket<'static> {
+        TcpPacket {
+            source_port: 80,
+            destination_port: 49152,
+            sequence: 101,
+            acknowledgement,
+            flags: TcpFlags::ACK,
+            window_size,
+            options: TcpOptions::empty(),
+            payload: &[],
+        }
+    }
+
+    #[test]
+    fn window_update_at_snd_una_retires_probe_and_keeps_stream_intact() {
+        let mut socket = established_socket();
+        let _ = deliver_segment(&mut socket, peer_ack(8, 0), TCP_INITIAL_RTO_NANOS + 1);
+        assert_eq!(socket.queue_send(b"abc"), 3);
+        let deadline = TCP_INITIAL_RTO_NANOS + 2 + socket.retransmission_timer.timeout_nanos();
+        assert_eq!(
+            socket.take_transmit_segment(
+                TCP_INITIAL_RTO_NANOS + 2,
+                TcpSegmentBudget::wire_segments(usize::MAX)
+            ),
+            None
+        );
+        let probe = socket
+            .take_transmit_segment(deadline, TcpSegmentBudget::wire_segments(usize::MAX))
+            .expect("persist timer should send a one-byte probe");
+        assert_eq!(probe.payload.as_ref(), b"a");
+        assert_eq!(probe.header.sequence, 8);
+
+        // The window reopens with an ACK that acknowledges nothing new.
+        let _ = deliver_segment(&mut socket, peer_ack(8, 32), deadline + 1);
+        assert_eq!(socket.peer_receive_window(), 32);
+
+        let mut delivered = alloc::vec::Vec::new();
+        let first = socket
+            .take_transmit_segment(deadline + 2, TcpSegmentBudget::wire_segments(usize::MAX))
+            .expect("opened window should transmit queued data normally");
+        assert_eq!(first.header.sequence, 8);
+        delivered.extend_from_slice(&first.payload);
+        assert_eq!(socket.queue_send(b"def"), 3);
+        let second = socket
+            // Past the pacing interval the first segment scheduled.
+            .take_transmit_segment(
+                deadline + 1_000_000_000,
+                TcpSegmentBudget::wire_segments(usize::MAX),
+            )
+            .expect("opened window should transmit later data normally");
+        assert_eq!(second.header.sequence, 8 + first.payload.len() as u32);
+        delivered.extend_from_slice(&second.payload);
+        assert_eq!(delivered, b"abcdef");
+
+        let _ = deliver_segment(&mut socket, peer_ack(14, 32), deadline + 2_000_000_000);
+        assert_eq!(socket.send_unacknowledged, 14);
+        assert_eq!(socket.send_next, 14);
+        assert_eq!(socket.bytes_in_flight, 0);
+        assert!(socket.transmit_queue_is_empty());
+        assert!(
+            socket
+                .in_flight
+                .as_ref()
+                .is_none_or(|queue| queue.front().is_none())
+        );
+    }
+
+    #[test]
+    fn probe_at_sequence_wraparound_is_acknowledged() {
+        let mut socket = established_socket();
+        let _ = deliver_segment(&mut socket, peer_ack(8, 0), TCP_INITIAL_RTO_NANOS + 1);
+        socket.send_unacknowledged = u32::MAX;
+        socket.send_next = u32::MAX;
+        assert_eq!(socket.queue_send(b"abc"), 3);
+        let deadline = TCP_INITIAL_RTO_NANOS + 2 + socket.retransmission_timer.timeout_nanos();
+        assert_eq!(
+            socket.take_transmit_segment(
+                TCP_INITIAL_RTO_NANOS + 2,
+                TcpSegmentBudget::wire_segments(usize::MAX)
+            ),
+            None
+        );
+        let probe = socket
+            .take_transmit_segment(deadline, TcpSegmentBudget::wire_segments(usize::MAX))
+            .expect("persist timer should send a one-byte probe");
+        assert_eq!(probe.payload.as_ref(), b"a");
+        assert_eq!(probe.header.sequence, u32::MAX);
+
+        // ACK 0 acknowledges the probe byte, and its window update must
+        // not be discarded as an acknowledgement of unsent data.
+        let _ = deliver_segment(&mut socket, peer_ack(0, 32), deadline + 1);
+        assert_eq!(socket.peer_receive_window(), 32);
+        assert_eq!(socket.send_unacknowledged, 0);
+        assert_eq!(socket.send_next, 0);
+
+        let segment = socket
+            .take_transmit_segment(deadline + 2, TcpSegmentBudget::wire_segments(usize::MAX))
+            .expect("opened window should transmit the rest of the queue");
+        assert_eq!(segment.payload.as_ref(), b"bc");
+        assert_eq!(segment.header.sequence, 0);
+    }
+
     #[test]
     fn zero_peer_receive_window_probes_queued_fin() {
         let mut socket = established_socket();
@@ -6921,6 +7038,95 @@ mod tests {
             acknowledgements += 1;
         }
         assert_eq!(acknowledgements, 4);
+    }
+
+    /// An established socket that has received peer data up to 201 and
+    /// owes no acknowledgement.
+    fn socket_with_receive_next_201() -> TcpSocket<BbrV3> {
+        let mut socket = established_socket();
+        let payload = [0u8; 100];
+        let _ = deliver_segment(
+            &mut socket,
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 101,
+                acknowledgement: 8,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+                options: TcpOptions::empty(),
+                payload: &payload,
+            },
+            1,
+        );
+        while socket.pending_ack().is_some() {
+            socket.mark_ack_queued();
+        }
+        socket
+    }
+
+    fn deliver_payload_at(socket: &mut TcpSocket<BbrV3>, sequence: u32, now_nanos: u64) {
+        let payload = [0u8; 100];
+        let _ = deliver_segment(
+            socket,
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence,
+                acknowledgement: 8,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+                options: TcpOptions::empty(),
+                payload: &payload,
+            },
+            now_nanos,
+        );
+    }
+
+    /// Filling the hole settles the duplicates owed for it to the one
+    /// acknowledgement of the advance, so the peer never counts them.
+    #[test]
+    fn filling_the_hole_settles_owed_duplicate_acks_to_one() {
+        let mut socket = socket_with_receive_next_201();
+        for index in 0..4u32 {
+            deliver_payload_at(&mut socket, 301 + index * 100, 2 + u64::from(index));
+        }
+        assert_eq!(socket.pending_ack_count(), 4);
+
+        deliver_payload_at(&mut socket, 201, 10);
+
+        assert_eq!(socket.pending_ack_count(), 1);
+        let header = socket.pending_ack().expect("the advance owes an ACK");
+        assert_eq!(header.acknowledgement, 701);
+    }
+
+    /// A segment that advances `receive_next` without reaching the next
+    /// queued segment owes one immediate acknowledgement; the hole that
+    /// remains owes one more per segment arriving ahead of it.
+    #[test]
+    fn partly_filled_hole_owes_one_ack_then_one_per_later_segment() {
+        let mut socket = socket_with_receive_next_201();
+        for index in 0..3u32 {
+            deliver_payload_at(&mut socket, 401 + index * 100, 2 + u64::from(index));
+        }
+        assert_eq!(socket.pending_ack_count(), 3);
+
+        deliver_payload_at(&mut socket, 201, 10);
+
+        assert_eq!(socket.pending_ack_count(), 1);
+        let header = socket.pending_ack().expect("the advance owes an ACK");
+        assert_eq!(header.acknowledgement, 301);
+
+        deliver_payload_at(&mut socket, 701, 11);
+        deliver_payload_at(&mut socket, 801, 12);
+        assert_eq!(socket.pending_ack_count(), 3);
+        let mut acknowledgements = 0;
+        while let Some(header) = socket.pending_ack() {
+            assert_eq!(header.acknowledgement, 301);
+            socket.mark_ack_queued();
+            acknowledgements += 1;
+        }
+        assert_eq!(acknowledgements, 3);
     }
 
     /// The queue of owed acknowledgements is bounded: a peer that keeps

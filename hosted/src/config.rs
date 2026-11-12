@@ -56,6 +56,25 @@ impl HostedConfig {
         }
     }
 
+    /// A configuration for a test that builds its own `HostedMachine`:
+    /// `processor_count` processors, the default heap, no WASI root, and
+    /// the payload at `bootfs`. The process's arguments belong to the
+    /// test runner, so [`Self::from_env`] cannot serve.
+    #[cfg(test)]
+    pub(crate) fn for_test(processor_count: usize, bootfs: PathBuf) -> Self {
+        assert!(
+            processor_count != 0,
+            "a hosted machine needs at least one processor"
+        );
+        Self {
+            processor_count,
+            bootstrap_processor: ProcessorId::new(0),
+            heap_bytes: DEFAULT_HEAP_BYTES,
+            init_wasi_root: None,
+            bootfs,
+        }
+    }
+
     pub fn processor_count(&self) -> usize {
         self.processor_count
     }
