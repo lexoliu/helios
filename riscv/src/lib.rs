@@ -461,6 +461,32 @@ extern "Rust" fn helios_current_processor() -> ProcessorId {
     }
 }
 
+/// The supervisor timer and external interrupt enables cleared on the
+/// hart that took them, and put back as they were when dropped. Only the
+/// software interrupt, the wake, stays enabled meanwhile; the rest stays
+/// pending in `sip`. `sie` is the hart's own register, so the value is
+/// not `Send`; it leaves `sstatus.SIE` alone.
+pub struct RiscvWakeOnlyMask {
+    timer: bool,
+    external: bool,
+    _processor_local: core::marker::PhantomData<*mut ()>,
+}
+
+impl Drop for RiscvWakeOnlyMask {
+    fn drop(&mut self) {
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: restores the bits read when the mask was raised.
+        unsafe {
+            if self.timer {
+                riscv::register::sie::set_stimer();
+            }
+            if self.external {
+                riscv::register::sie::set_sext();
+            }
+        }
+    }
+}
+
 impl Cpu for RiscvCpu {
     // SBI `set_timer` programs this hart's one-shot comparator.
     const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
@@ -477,26 +503,39 @@ impl Cpu for RiscvCpu {
         riscv::asm::wfi();
     }
 
+    type WakeOnlyMask = RiscvWakeOnlyMask;
+
+    fn mask_to_wake_only(&self) -> RiscvWakeOnlyMask {
+        // The wake is the supervisor software interrupt; the timer and the
+        // external interrupt (every device) are taken out of `sie`, so
+        // they stay pending in `sip` and a `wfi` neither ends on them nor
+        // delivers them. The shootdown is an SBI call that needs no
+        // supervisor interrupt on this hart.
+        let sie = riscv::register::sie::read();
+        let (timer, external) = (sie.stimer(), sie.sext());
+        // SAFETY: both bits are put back when the guard drops.
+        unsafe {
+            riscv::register::sie::clear_stimer();
+            riscv::register::sie::clear_sext();
+        }
+        compiler_fence(Ordering::SeqCst);
+        RiscvWakeOnlyMask {
+            timer,
+            external,
+            _processor_local: core::marker::PhantomData,
+        }
+    }
+
     fn park_wake_only(&self, word: &AtomicU8, held: u8) {
         assert!(
             !riscv::register::sstatus::read().sie(),
             "RISC-V park_wake_only was entered with supervisor interrupts enabled, before the \
              enable set was narrowed"
         );
-        // The wake is the supervisor software interrupt; the timer and the
-        // external interrupt (every device) are taken out of `sie`, so
-        // they stay pending in `sip` and a `wfi` neither ends on them nor
-        // delivers them. A `wfi` ends on any pending interrupt that
-        // `sie` enables, whatever `sstatus.SIE` says, so a wake raised
-        // between the test below and the `wfi` completes it at once.
-        let sie = riscv::register::sie::read();
-        let (timer, external) = (sie.stimer(), sie.sext());
-        // SAFETY: both bits are put back below before this returns.
-        unsafe {
-            riscv::register::sie::clear_stimer();
-            riscv::register::sie::clear_sext();
-        }
-        compiler_fence(Ordering::SeqCst);
+        // A `wfi` ends on any pending interrupt that `sie` enables,
+        // whatever `sstatus.SIE` says, so a wake raised between the test
+        // below and the `wfi` completes it at once.
+        let mask = self.mask_to_wake_only();
         while word.load(Ordering::Acquire) == held {
             riscv::asm::wfi();
             // The wait leaves the software interrupt pending: taking it
@@ -506,16 +545,7 @@ impl Cpu for RiscvCpu {
             unsafe { riscv::interrupt::supervisor::enable() };
             riscv::interrupt::supervisor::disable();
         }
-        compiler_fence(Ordering::SeqCst);
-        // SAFETY: restores the bits read above.
-        unsafe {
-            if timer {
-                riscv::register::sie::set_stimer();
-            }
-            if external {
-                riscv::register::sie::set_sext();
-            }
-        }
+        drop(mask);
     }
 
     fn start_processor(&self, hart: ProcessorId) {

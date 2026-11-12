@@ -815,6 +815,12 @@ impl Cpu for BenchCpu {
 
     fn park_current(&self) {}
 
+    type WakeOnlyMask = ();
+
+    fn mask_to_wake_only(&self) {
+        panic!("this bench platform never freezes")
+    }
+
     fn park_wake_only(&self, _word: &core::sync::atomic::AtomicU8, _held: u8) {
         panic!("this bench platform never freezes")
     }

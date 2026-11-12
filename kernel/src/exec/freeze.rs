@@ -54,12 +54,19 @@
 //!    such processor: `hold` is cleared, the secondaries that did arrive
 //!    are woken, `phase` returns to `Running`, and nothing stays held;
 //! 5. after its last await, and from there with no await until it
-//!    thaws, masks interrupts on its own processor, sets `phase` to
-//!    `Frozen` and returns a [`FrozenMachine`]. The freezer's processor
-//!    polls no task but the one that holds that value, because that task
-//!    does not yield; the value is not `Send`, so it cannot be carried to
-//!    another processor, and a task that yields while holding it breaks
-//!    the contract (the processor's next boundary reports it).
+//!    thaws, narrows the interrupt mask of its own processor to the wake
+//!    and shootdown IPIs ([`Cpu::mask_to_wake_only`], the mask the
+//!    secondaries park under), sets `phase` to `Frozen` and returns a
+//!    [`FrozenMachine`]. The freezer's processor polls no task but the
+//!    one that holds that value, because that task does not yield; the
+//!    value is not `Send`, so it cannot be carried to another processor,
+//!    and a task that yields while holding it breaks the contract (the
+//!    processor's next boundary reports it). The freezer does not clear
+//!    its interrupt flag: a device interrupt or timer tick is held off by
+//!    the narrowed mask, and the flag stays set so that the freezer can
+//!    change a mapping while it holds the machine, which broadcasts a TLB
+//!    shootdown and must be able to take the one another processor would
+//!    send (the x86 backend refuses to broadcast with the flag clear).
 //!
 //! A secondary reaches a boundary before every attempt to pop a task in
 //! `Executor::run_until_stalled_with_stats` (so also on a pass that finds
@@ -96,7 +103,7 @@
 //! every secondary, and then a wait, a hardware-synchronisation spin
 //! bounded by IPI latency, until no secondary's arrival word still equals
 //! the held value, so that each has left its park. Last, `phase` returns
-//! to `Running` and the freezer's own interrupts are unmasked.
+//! to `Running` and the freezer's own mask is lifted.
 //!
 //! No wake is lost:
 //!
@@ -120,6 +127,7 @@
 
 use alloc::boxed::Box;
 use core::future::poll_fn;
+use core::marker::PhantomData;
 use core::pin::pin;
 use core::sync::atomic::{AtomicU8, AtomicU16, Ordering};
 use core::task::Poll;
@@ -365,8 +373,10 @@ impl<CpuImpl: Cpu + Clone> Drop for Hold<CpuImpl> {
 
 /// The machine, held still. Every processor but this one is parked at a
 /// scheduler boundary with its interrupts held off, no task is polled on
-/// any of them, no timer fires, and this processor's interrupts are
-/// masked: the caller works alone until it drops the value.
+/// any of them, no timer fires, and this processor takes only the wake
+/// and TLB-shootdown IPIs ([`Cpu::mask_to_wake_only`]): the caller works
+/// alone until it drops the value, and may change a mapping, which
+/// broadcasts a shootdown the parked processors acknowledge.
 ///
 /// Dropping it, or [`FrozenMachine::thaw`], releases the machine. The
 /// value is `!Send` and the work done while it is held is synchronous:
@@ -375,13 +385,16 @@ impl<CpuImpl: Cpu + Clone> Drop for Hold<CpuImpl> {
 #[must_use = "the machine stays frozen until this is dropped"]
 pub struct FrozenMachine<CpuImpl: Cpu + Clone> {
     // Field order is the thaw order: the secondaries are released first,
-    // and this processor's interrupts are unmasked last.
+    // and this processor's mask is lifted last.
     _hold: Hold<CpuImpl>,
-    _masked: LocalInterruptsMasked,
+    _mask: CpuImpl::WakeOnlyMask,
+    /// The mask is this processor's register state, whatever a backend's
+    /// own type for it says.
+    _processor_local: PhantomData<*mut ()>,
 }
 
 impl<CpuImpl: Cpu + Clone> FrozenMachine<CpuImpl> {
-    /// Releases every processor and unmasks this one.
+    /// Releases every processor and lifts this processor's mask.
     pub fn thaw(self) {
         drop(self);
     }
@@ -472,14 +485,15 @@ impl Executor {
 
         // No await from here: this processor polls nothing else until the
         // guard is dropped.
-        let masked = LocalInterruptsMasked::new();
+        let mask = cpu.mask_to_wake_only();
         barrier
             .control
             .phase
             .store(Phase::Frozen as u8, Ordering::Release);
         Ok(FrozenMachine {
             _hold: hold,
-            _masked: masked,
+            _mask: mask,
+            _processor_local: PhantomData,
         })
     }
 

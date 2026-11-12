@@ -327,6 +327,12 @@ mod tests {
             panic!("test CPU should not park")
         }
 
+        type WakeOnlyMask = ();
+
+        fn mask_to_wake_only(&self) {
+            panic!("test CPU should not park")
+        }
+
         fn park_wake_only(&self, _word: &core::sync::atomic::AtomicU8, _held: u8) {
             panic!("test CPU should not park")
         }

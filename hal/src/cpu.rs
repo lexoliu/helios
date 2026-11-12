@@ -296,6 +296,35 @@ pub trait Cpu: Send + Sync + 'static {
     /// stronger fairness guarantee.
     fn park_current(&self);
 
+    /// What [`Cpu::mask_to_wake_only`] answers: the narrowed mask, put
+    /// back when the value drops. It is the calling processor's own
+    /// register state, so a backend's type is not `Send`.
+    type WakeOnlyMask;
+
+    /// Narrows the calling processor's interrupt mask to the wake
+    /// [`Cpu::wake_processor`] raises and the cross-processor maintenance
+    /// IPIs (a TLB shootdown), and holds it until the answer drops.
+    ///
+    /// Every other source (a device interrupt, a timer tick, a doorbell)
+    /// stays pending in the interrupt controller and is taken when the
+    /// answer drops. This is how a processor is held off from code that
+    /// runs in a handler while it stays able to take the IPIs another
+    /// processor's work depends on: the shootdown a processor broadcasts
+    /// is acknowledged by every processor that has run in the space, so a
+    /// processor that is held must keep taking it, and a processor that
+    /// broadcasts one must have interrupts enabled. The mask is a hardware
+    /// property (a priority mask that lets only the wake class through, a
+    /// supervisor interrupt-enable set restricted to the software
+    /// interrupt), and it names no consumer.
+    ///
+    /// The mask the answer restores is the one it replaced. It composes
+    /// with the interrupt flag and does not touch it: it may be raised
+    /// with the flag set or clear. A caller that must not be interrupted
+    /// at all in the window between its own announcement and the mask
+    /// masks the flag first
+    /// ([`crate::critical_section::LocalInterruptsMasked`]).
+    fn mask_to_wake_only(&self) -> Self::WakeOnlyMask;
+
     /// Parks the current processor until `word` no longer reads `held`,
     /// with every interrupt source masked except the ones that carry no
     /// driver or task code: the wake [`Cpu::wake_processor`] raises and
@@ -307,7 +336,8 @@ pub trait Cpu: Send + Sync + 'static {
     /// state the working processor owns. It is a hardware property (a
     /// priority mask that lets only the wake class through, a supervisor
     /// interrupt-enable set restricted to the software interrupt), and it
-    /// names no consumer.
+    /// names no consumer. The mask is [`Cpu::mask_to_wake_only`], held for
+    /// the length of the wait.
     ///
     /// # Contract
     ///

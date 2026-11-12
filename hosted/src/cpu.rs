@@ -1,3 +1,4 @@
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::thread;
@@ -31,6 +32,12 @@ impl HostedCpu {
     pub fn install_timer(&self, timer: Timer<HostedCpu>) {
         self.machine.install_timer(self.processor, timer);
     }
+}
+
+/// The wake-only mask of a hosted processor: nothing to restore, and
+/// bound to the thread that took it like the register state it stands for.
+pub struct HostedWakeOnlyMask {
+    _processor_local: PhantomData<*mut ()>,
 }
 
 thread_local! {
@@ -80,6 +87,18 @@ impl Cpu for HostedCpu {
         // Either way the interrupt step runs here, on the owner.
         thread::park();
         self.machine.take_timer_interrupt(self.processor);
+    }
+
+    type WakeOnlyMask = HostedWakeOnlyMask;
+
+    fn mask_to_wake_only(&self) -> HostedWakeOnlyMask {
+        // A hosted processor is a thread whose only interrupt sources are
+        // unparks, and none of them runs device code on a thread that is
+        // not parked: the timer thread's expiry sets a flag that the
+        // owner's `park_current` acts on. There is no register to narrow.
+        HostedWakeOnlyMask {
+            _processor_local: PhantomData,
+        }
     }
 
     fn park_wake_only(&self, word: &AtomicU8, held: u8) {

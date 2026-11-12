@@ -1557,6 +1557,12 @@ mod tests {
 
         fn park_current(&self) {}
 
+        type WakeOnlyMask = ();
+
+        fn mask_to_wake_only(&self) {
+            panic!("this test platform never freezes")
+        }
+
         fn park_wake_only(&self, _word: &core::sync::atomic::AtomicU8, _held: u8) {
             panic!("this test platform never freezes")
         }
@@ -1650,6 +1656,12 @@ mod tests {
             );
             self.nanos
                 .fetch_add(self.park_advance.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+
+        type WakeOnlyMask = ();
+
+        fn mask_to_wake_only(&self) {
+            panic!("this test platform never freezes")
         }
 
         fn park_wake_only(&self, _word: &core::sync::atomic::AtomicU8, _held: u8) {

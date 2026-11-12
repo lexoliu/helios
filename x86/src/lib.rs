@@ -862,6 +862,27 @@ unsafe fn write_cr8(value: u64) {
     }
 }
 
+/// `CR8` raised to [`exceptions::WAKE_ONLY_TASK_PRIORITY`] on the
+/// processor that took it, and put back to what it was when dropped.
+///
+/// The local APIC then holds every vector below class 14 pending (the
+/// timer, the device vectors, the APIC error) and still delivers the
+/// wake and shootdown IPIs, which sit in class 14. It leaves the
+/// interrupt flag alone. `CR8` is the processor's own register, so the
+/// value is not `Send`.
+pub(crate) struct X86WakeOnlyMask {
+    previous: u64,
+    _processor_local: core::marker::PhantomData<*mut ()>,
+}
+
+impl Drop for X86WakeOnlyMask {
+    fn drop(&mut self) {
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: restores the value read when the mask was raised.
+        unsafe { write_cr8(self.previous) };
+    }
+}
+
 impl Cpu for X86Cpu {
     // The local APIC timer runs in periodic mode at the scheduler tick;
     // `set_deadline` only starts it.
@@ -909,12 +930,9 @@ impl Cpu for X86Cpu {
         }
     }
 
-    fn park_wake_only(&self, word: &AtomicU8, held: u8) {
-        assert!(
-            !x86_64::instructions::interrupts::are_enabled(),
-            "x86 park_wake_only was entered with interrupts enabled, before the finer mask \
-             was in place"
-        );
+    type WakeOnlyMask = X86WakeOnlyMask;
+
+    fn mask_to_wake_only(&self) -> X86WakeOnlyMask {
         // Raise the task-priority register so the local APIC holds every
         // vector below class 14 pending: the timer, the device vectors,
         // the APIC error. The wake and shootdown IPIs sit in class 14 and
@@ -923,9 +941,22 @@ impl Cpu for X86Cpu {
         // xAPIC and x2APIC mode alike.
         let previous = read_cr8();
         // SAFETY: CR8 is the task-priority register, and raising it only
-        // withholds interrupts; it is restored below before this returns.
+        // withholds interrupts; the guard puts the previous value back.
         unsafe { write_cr8(exceptions::WAKE_ONLY_TASK_PRIORITY) };
         compiler_fence(Ordering::SeqCst);
+        X86WakeOnlyMask {
+            previous,
+            _processor_local: core::marker::PhantomData,
+        }
+    }
+
+    fn park_wake_only(&self, word: &AtomicU8, held: u8) {
+        assert!(
+            !x86_64::instructions::interrupts::are_enabled(),
+            "x86 park_wake_only was entered with interrupts enabled, before the finer mask \
+             was in place"
+        );
+        let mask = self.mask_to_wake_only();
         while word.load(Ordering::Acquire) == held {
             // `sti; hlt` is atomic: a wake IPI already pending, or one
             // that arrives during the halt, completes it, and the
@@ -941,9 +972,7 @@ impl Cpu for X86Cpu {
                 core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
             }
         }
-        compiler_fence(Ordering::SeqCst);
-        // SAFETY: restores the value read above.
-        unsafe { write_cr8(previous) };
+        drop(mask);
         // The wake the loop took, or one that raced it, leaves its latch
         // set; `park_current` would take it as a wake for work it does
         // not have.

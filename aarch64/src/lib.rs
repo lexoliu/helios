@@ -918,6 +918,22 @@ extern "Rust" fn helios_current_processor() -> ProcessorId {
     current_processor_runtime().logical_id()
 }
 
+/// The GIC CPU interface's priority mask raised so that only the wake
+/// SGI gets through, on the processor that took it, and put back to the
+/// value it replaced when dropped. Every other interrupt stays pending in
+/// the GIC meanwhile. The mask is the processor's own register, so the
+/// value is not `Send`; it leaves PSTATE.I alone.
+pub struct Aarch64WakeOnlyMask {
+    previous: u8,
+    _processor_local: core::marker::PhantomData<*mut ()>,
+}
+
+impl Drop for Aarch64WakeOnlyMask {
+    fn drop(&mut self) {
+        gic::restore_priority_mask(self.previous);
+    }
+}
+
 impl Cpu for Aarch64Cpu {
     // `CNTV_CVAL_EL0` is this processor's one-shot comparator.
     const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
@@ -950,6 +966,15 @@ impl Cpu for Aarch64Cpu {
         unsafe { write_daif(daif) };
     }
 
+    type WakeOnlyMask = Aarch64WakeOnlyMask;
+
+    fn mask_to_wake_only(&self) -> Aarch64WakeOnlyMask {
+        Aarch64WakeOnlyMask {
+            previous: gic::raise_priority_mask_to_wake_only(),
+            _processor_local: core::marker::PhantomData,
+        }
+    }
+
     fn park_wake_only(&self, word: &AtomicU8, held: u8) {
         let runtime = current_processor_runtime();
         assert!(
@@ -963,7 +988,7 @@ impl Cpu for Aarch64Cpu {
         // interface signals even while PSTATE.I is set, and the word is
         // tested with IRQ masked first, so a wake raised after the test
         // completes the wait instead of being slept through.
-        let previous = gic::raise_priority_mask_to_wake_only();
+        let mask = self.mask_to_wake_only();
         while word.load(Ordering::Acquire) == held {
             if !runtime.wake_pending.swap(false, Ordering::AcqRel) {
                 // SAFETY: `wfi` has no operands and touches no memory.
@@ -976,7 +1001,7 @@ impl Cpu for Aarch64Cpu {
             // forever. The mask above admits nothing else.
             take_pending_irq();
         }
-        gic::restore_priority_mask(previous);
+        drop(mask);
     }
 
     fn start_processor(&self, processor: ProcessorId) {
