@@ -708,7 +708,11 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         release_early_boot_harts();
     }
     if current_hart == bootstrap_processor {
-        helios_kernel::prime_bootstrap_allocator(memory_regions.iter().copied(), &numa);
+        helios_kernel::prime_bootstrap_allocator(
+            memory_regions.iter().copied(),
+            &numa,
+            bootstrap_processor,
+        );
     }
 
     let debug_state = shared_debug_state(timebase, hart_count, initrd.clone());

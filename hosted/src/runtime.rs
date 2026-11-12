@@ -327,6 +327,7 @@ fn spawn_processor_thread(
                 helios_kernel::prime_bootstrap_allocator(
                     machine.bootstrap_memory_regions(),
                     &SingleNode::new(machine.processor_count()),
+                    processor,
                 );
             }
             let mut devices = DeviceInventory::new().with_debug_serial();

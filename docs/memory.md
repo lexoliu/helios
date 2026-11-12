@@ -11,8 +11,12 @@ The policy itself lives in one place, `kernel/src/memory/policy.rs`, and
 every backend reaches it through the same call. `riscv/`, `x86/`,
 `aarch64/` and `hosted/` each hand `helios_kernel::prime_bootstrap_allocator`
 the usable regions of their boot memory map, each tagged with its NUMA
-node, and the platform's NUMA description; no backend decides how much
-memory either domain gets.
+node, the platform's NUMA description and the bootstrap processor; no
+backend decides how much memory either domain gets. The kernel boot
+share is taken from the bootstrap processor's node first, and the user
+pool is one buddy pool per node: an allocation is served by the
+executing processor's node, then by the other nodes nearest first, and
+a frame always returns to the node it came from.
 
 ## The policy
 

@@ -212,6 +212,9 @@ fn x86_kernel_main() -> ! {
             &numa,
         ),
         &numa,
+        // `smp` numbers processors in MADT order, whose first entry is
+        // this one, the bootstrap processor.
+        ProcessorId::new(0),
     );
     let wakeup_page = (processor_count > 1).then_some(reserved_wakeup_page);
     // The memory a confined device is allowed to reach is exactly what

@@ -685,9 +685,10 @@ mod tests {
         let layout = Layout::from_size_align(bytes, PhysFrame::SIZE).expect("pool layout");
         let start = unsafe { alloc::alloc::alloc(layout) } as usize;
         assert!(start != 0, "host allocation for the user pool failed");
-        let pool: &'static UserMemoryPool = Box::leak(Box::new(UserMemoryPool::empty()));
-        pool.initialize(&[(start, start + bytes)]);
-        pool
+        Box::leak(Box::new(UserMemoryPool::single_node(
+            1,
+            &[(start, start + bytes)],
+        )))
     }
 
     /// A balloon device that records what the guest handed it.

@@ -819,10 +819,10 @@ mod tests {
         // SAFETY: the layout has a non-zero size.
         let base = unsafe { alloc::alloc::alloc_zeroed(layout) } as usize;
         assert!(base != 0, "pool backing");
-        let pool =
-            super::super::install_user_memory_pool(super::super::allocate_user_memory_pool());
-        pool.initialize(&[(base, base + POOL_BYTES)]);
-        pool.configure_processors(TEST_PROCESSORS);
+        super::super::install_user_memory_pool(super::super::UserMemoryPool::single_node(
+            TEST_PROCESSORS,
+            &[(base, base + POOL_BYTES)],
+        ));
         frame_reserve::configure_processors(TEST_PROCESSORS);
         install_fiber_stack_hooks(&TEST_HOOKS);
         install_fiber_stack_arena(

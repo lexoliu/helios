@@ -48,9 +48,10 @@ use helios_kernel::runtime_memory::{
 };
 use helios_kernel::{
     FiberStackVmHooks, MemoryOwner, ReservationLookup, ReservationTracker, SwapEntry, SwapVmHooks,
-    VaCursor, allocate_user_frame_uninit_on, allocate_user_run_zeroed_on,
-    current_user_memory_owner, deallocate_user_frame_on, deallocate_user_run_on,
-    install_fiber_stack_hooks, ranges_outside, validate_range,
+    VaCursor, allocate_user_frame_uninit_on, allocate_user_frame_uninit_on_node,
+    allocate_user_run_zeroed_on, current_user_memory_owner, deallocate_user_frame_on,
+    deallocate_user_run_on, install_fiber_stack_hooks, ranges_outside, user_frame_node,
+    validate_range,
 };
 use spin::{Mutex, Once};
 
@@ -635,6 +636,18 @@ impl Aarch64UserAddressSpace {
         Ok(virt - self.physical_memory_offset)
     }
 
+    /// A replacement for the frame at `old_phys`, from the node that
+    /// frame is on: a relocation that moved the page to another node
+    /// would undo its placement. Not zeroed, because the caller copies
+    /// the whole page over it.
+    fn alloc_relocation_frame(&self, old_phys: usize) -> Result<usize, AddressSpaceError> {
+        let old = NonNull::new(self.hhdm_ptr(old_phys))
+            .unwrap_or_else(|| panic!("Aarch64 relocation source has a null HHDM address"));
+        let raw = allocate_user_frame_uninit_on_node(user_frame_node(old))
+            .map_err(|_| AddressSpaceError::OutOfFrames)?;
+        Ok(raw.as_ptr() as usize - self.physical_memory_offset)
+    }
+
     fn hhdm_ptr(&self, phys: usize) -> *mut u8 {
         let virt = phys
             .checked_add(self.physical_memory_offset)
@@ -669,7 +682,8 @@ impl Aarch64UserAddressSpace {
                     return Err(AddressSpaceError::NotCommitted);
                 }
             };
-            let new_phys = match self.alloc_user_frame() {
+            let old_phys = (old_entry & PT_ADDR_MASK) as usize;
+            let new_phys = match self.alloc_relocation_frame(old_phys) {
                 Ok(phys) => phys,
                 Err(error) => {
                     for page in pages {
@@ -680,7 +694,7 @@ impl Aarch64UserAddressSpace {
             };
             unsafe {
                 ptr::copy_nonoverlapping(
-                    self.hhdm_ptr((old_entry & PT_ADDR_MASK) as usize) as *const u8,
+                    self.hhdm_ptr(old_phys) as *const u8,
                     self.hhdm_ptr(new_phys),
                     PAGE,
                 );

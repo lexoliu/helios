@@ -15,7 +15,9 @@
 
 use std::alloc::{Layout, alloc};
 
-use helios_kernel::{BootMemoryPlan, UserMemoryPool};
+use helios_hal::cpu::ProcessorId;
+use helios_hal::numa::{NodeId, SingleNode};
+use helios_kernel::{BootMemoryPlan, NodeRun, UserMemoryPool};
 
 /// What one live instance costs each domain, measured on the density
 /// workload rather than guessed.
@@ -52,8 +54,8 @@ fn leak_machine_memory(bytes: usize) -> (usize, usize) {
 /// not when either domain's boot share is.
 fn instances_until_refusal(usable_bytes: usize) -> usize {
     let plan = BootMemoryPlan::for_usable_bytes(usable_bytes);
-    let pool = UserMemoryPool::empty();
-    pool.configure_processors(1);
+    // The pool allocates in the executing processor's name.
+    crate::cpu::set_current_processor(ProcessorId::new(0));
     let (start, end) = leak_machine_memory(usable_bytes);
     // The same split `prime_bootstrap_allocator` makes: the kernel's
     // boot share comes off the front and the pool takes the frames the
@@ -63,7 +65,15 @@ fn instances_until_refusal(usable_bytes: usize) -> usize {
         .split(start, end)
         .user
         .expect("the machine leaves the user pool a share");
-    pool.initialize(&[(user.start, user.end)]);
+    let pool = UserMemoryPool::new(
+        &SingleNode::new(1),
+        ProcessorId::new(0),
+        &[NodeRun {
+            start: user.start,
+            end: user.end,
+            node: NodeId::FIRST,
+        }],
+    );
 
     let mut placed = 0;
     while take(&pool, USER_BYTES_PER_INSTANCE) && take(&pool, KERNEL_BYTES_PER_INSTANCE) {

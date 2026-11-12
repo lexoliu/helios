@@ -30,10 +30,10 @@ use crate::MAX_BOOT_MEMORY_REGIONS;
 /// A run of user-pool memory on one node: `start..end` in the kernel's
 /// direct map.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct NodeRun {
-    pub(crate) start: usize,
-    pub(crate) end: usize,
-    pub(crate) node: NodeId,
+pub struct NodeRun {
+    pub start: usize,
+    pub end: usize,
+    pub node: NodeId,
 }
 
 pub struct Locality {

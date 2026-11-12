@@ -159,22 +159,22 @@ pub use memory::{
     FiberStackArenaStats, FiberStackError, FiberStackVmHooks, HardwareEntropySource,
     IDLE_SWAP_AFTER, KERNEL_HEAP_BOOTSTRAP_BYTES, KERNEL_HEAP_GROWTH_CHUNK_BYTES,
     KERNEL_HEAP_MAX_BOOT_FRACTION, KERNEL_HEAP_MIN_RESERVE_BYTES, KERNEL_HEAP_RESERVE_FRACTION,
-    MemoryOwner, NoCryptographicEntropy, NoEntropyDevice,
-    ROOT_ENTROPY_MATERIAL_BYTES, RegionShares, ReleasedReservation, ReservationLookup,
-    ReservationTracker, RootEntropy, RootEntropyHandle, SWAP_BATCH_BYTES, SWAP_TICK, StackFault,
-    SwapDisabled, SwapEntry, SwapFaultError, SwapHandle, SwapStats, SwapVmHooks,
-    TASK_ARENA_FRACTION, TASK_ARENA_MIN_BYTES, USER_POOL_MIN_REGION_BYTES, UserHeapStats,
-    UserMemoryOwnerScope, UserMemoryOwners, UserMemoryPool, VaCursor,
-    allocate_user_frame_uninit_on, allocate_user_frame_zeroed, allocate_user_frame_zeroed_on,
-    allocate_user_run_zeroed_on, claim_fiber_stack, configure_user_memory_owner_processors,
-    current_user_memory_owner, deallocate_user_frame, deallocate_user_frame_on,
-    deallocate_user_run_on, disable_swap, enter_user_memory_owner, fiber_stack_arena_stats,
-    fiber_stack_demand_commits_on, install_entropy_device, install_fiber_stack_arena,
-    install_fiber_stack_hooks, install_memory_balloon, install_swap, install_swap_hooks,
-    installed_swap_handle, installed_swap_hooks, kernel_reserve_for, largest_servable_user_bytes,
+    MemoryOwner, NoCryptographicEntropy, NoEntropyDevice, NodeRun, ROOT_ENTROPY_MATERIAL_BYTES,
+    RegionShares, ReleasedReservation, ReservationLookup, ReservationTracker, RootEntropy,
+    RootEntropyHandle, SWAP_BATCH_BYTES, SWAP_TICK, StackFault, SwapDisabled, SwapEntry,
+    SwapFaultError, SwapHandle, SwapStats, SwapVmHooks, TASK_ARENA_FRACTION, TASK_ARENA_MIN_BYTES,
+    USER_POOL_MIN_REGION_BYTES, UserHeapStats, UserMemoryOwnerScope, UserMemoryOwners,
+    UserMemoryPool, VaCursor, allocate_user_frame_uninit_on, allocate_user_frame_uninit_on_node,
+    allocate_user_frame_zeroed, allocate_user_frame_zeroed_on, allocate_user_run_zeroed_on,
+    claim_fiber_stack, configure_user_memory_owner_processors, current_user_memory_owner,
+    deallocate_user_frame, deallocate_user_frame_on, deallocate_user_run_on, disable_swap,
+    enter_user_memory_owner, fiber_stack_arena_stats, fiber_stack_demand_commits_on,
+    install_entropy_device, install_fiber_stack_arena, install_fiber_stack_hooks,
+    install_memory_balloon, install_swap, install_swap_hooks, installed_swap_handle,
+    installed_swap_hooks, kernel_reserve_for, largest_servable_user_bytes,
     page_fault_frame_reserve_bytes, ranges_outside, resolve_stack_fault, seed_root_entropy,
-    swapped_token, task_arena_bytes_for, user_heap_stats, user_mapping_kernel_heap_bytes,
-    validate_range,
+    swapped_token, task_arena_bytes_for, user_frame_node, user_heap_stats,
+    user_mapping_kernel_heap_bytes, validate_range,
 };
 pub use network::{
     HTTP_FORBIDDEN_FIELD_NAMES, HTTP_MAX_FIELD_SECTION_BYTES, HTTP_MAX_FIELD_VALUE_BYTES, HttpBody,
@@ -1164,6 +1164,14 @@ where
                     memory::locality().processor_count(),
                     topology.configured_processors
                 );
+                let primed_by = memory::user_memory_pool().bootstrap_processor();
+                assert!(
+                    primed_by == topology.bootstrap_processor,
+                    "the user pool was primed for bootstrap processor {} but the platform \
+                     topology names {}",
+                    primed_by.id(),
+                    topology.bootstrap_processor.id()
+                );
                 finish_bootstrap(console, &cpu, topology, dma_model, devices)
             }
             state => panic!("bootstrap processor observed invalid boot state {state}"),
@@ -1213,15 +1221,27 @@ where
 /// that into the kernel's boot share and its reserve, and the second
 /// pass hands the regions out. See [`memory::policy`] for the policy
 /// itself and the evidence behind it.
+///
+/// The second pass hands out the bootstrap processor's node first, so
+/// the kernel heap's boot share, which comes off the front, is local to
+/// the processor that runs the boot. Each node's user share then seeds
+/// that node's own buddy pool.
 fn init_allocator<Regions, Numa>(
     memory_regions: Regions,
     numa: &Numa,
+    bootstrap: ProcessorId,
 ) -> &'static memory::UserMemoryPool
 where
     Regions: IntoIterator<Item = MemoryRegion>,
     Numa: NumaTopology,
 {
     let processor_count = numa.processor_count();
+    assert!(
+        usize::from(bootstrap.id()) < processor_count,
+        "bootstrap processor {} is outside the NUMA description's {processor_count} processors",
+        bootstrap.id()
+    );
+    let bootstrap_node = numa.processor_node(bootstrap);
     let mut regions: ArrayVec<memory::NodeRun, MAX_BOOT_MEMORY_REGIONS> = ArrayVec::new();
     for region in memory_regions {
         regions
@@ -1245,40 +1265,30 @@ where
     ALLOCATOR.install_plan(plan);
     let mut splitter = plan.splitter();
 
-    let mut user_pool = None;
+    // No heap exists yet, so the order is two walks rather than a sort.
+    let bootstrap_first = regions
+        .iter()
+        .filter(|region| region.node == bootstrap_node)
+        .chain(
+            regions
+                .iter()
+                .filter(|region| region.node != bootstrap_node),
+        );
     let mut user_runs: ArrayVec<memory::NodeRun, MAX_BOOT_MEMORY_REGIONS> = ArrayVec::new();
-    for region in regions {
+    for region in bootstrap_first {
         let shares = splitter.split(region.start, region.end);
         if let Some(kernel) = shares.kernel {
             unsafe {
                 ALLOCATOR.add_to_heap(kernel.start, kernel.end);
             }
         }
-        // The pool is installed as soon as the kernel heap can allocate
-        // it, and before the first user region is added: every later
-        // region, and every byte the kernel heap later borrows back,
-        // goes through it.
-        let Some(user) = shares.user else {
-            continue;
-        };
-        user_pool.get_or_insert_with(|| {
-            let pool = memory::install_user_memory_pool(memory::allocate_user_memory_pool());
-            pool.configure_processors(processor_count);
-            // The swap policy asks which instance a committed page
-            // belongs to, and the answer is per-processor; size that
-            // table with the pool it describes.
-            memory::configure_user_memory_owner_processors(processor_count);
-            // And the frames the page-fault path is allowed to take,
-            // which come out of this same pool and are held per
-            // processor because a fault may not wait on its lock.
-            memory::configure_frame_reserve_processors(processor_count);
-            pool
-        });
-        user_runs.push(memory::NodeRun {
-            start: user.start,
-            end: user.end,
-            node: region.node,
-        });
+        if let Some(user) = shares.user {
+            user_runs.push(memory::NodeRun {
+                start: user.start,
+                end: user.end,
+                node: region.node,
+            });
+        }
     }
 
     assert_eq!(
@@ -1287,20 +1297,23 @@ where
         "the boot memory map is smaller than the kernel heap's boot share of {} bytes",
         plan.kernel_boot_bytes
     );
-    let pool =
-        user_pool.unwrap_or_else(|| panic!("bootstrap did not provide memory for user pool"));
-    // The kernel heap now exists, which is what the locality's tables
-    // are allocated from.
-    let locality = memory::Locality::new(numa, &user_runs);
     assert!(
-        locality.node_count() == 1,
-        "the platform describes {} NUMA nodes but the user pool is one pool over every node",
-        locality.node_count()
+        !user_runs.is_empty(),
+        "bootstrap did not provide memory for user pool"
     );
-    pool.install_locality(locality);
-    let user_regions: ArrayVec<(usize, usize), MAX_BOOT_MEMORY_REGIONS> =
-        user_runs.iter().map(|run| (run.start, run.end)).collect();
-    pool.initialize(&user_regions);
+    // The kernel heap now exists, which is what the pool's per-node and
+    // per-processor tables are allocated from. Until the pool is
+    // installed below the heap grows out of nothing but its boot share.
+    let pool =
+        memory::install_user_memory_pool(memory::UserMemoryPool::new(numa, bootstrap, &user_runs));
+    // The swap policy asks which instance a committed page belongs to,
+    // and the answer is per-processor; size that table with the pool it
+    // describes.
+    memory::configure_user_memory_owner_processors(processor_count);
+    // And the frames the page-fault path is allowed to take, which come
+    // out of this same pool and are held per processor because a fault
+    // may not wait on its lock.
+    memory::configure_frame_reserve_processors(processor_count);
     pool
 }
 
@@ -1308,10 +1321,15 @@ where
 /// bootstrap processor before anything else runs.
 ///
 /// This is the one way memory enters the kernel. `numa` is read here,
-/// once, and the kernel keeps its own copy of the answers.
+/// once, and the kernel keeps its own copy of the answers. `bootstrap`
+/// is the processor making this call: the backend names it because
+/// [`helios_hal::cpu::current_processor`] is published only once the
+/// backend's processor runtime exists, which is after the heap this call
+/// creates. `init` checks it against the platform topology.
 pub fn prime_bootstrap_allocator<Regions, Numa>(
     memory_regions: Regions,
     numa: &Numa,
+    bootstrap: ProcessorId,
 ) -> &'static memory::UserMemoryPool
 where
     Regions: IntoIterator<Item = MemoryRegion>,
@@ -1323,7 +1341,7 @@ where
         Ordering::AcqRel,
         Ordering::Acquire,
     ) {
-        Ok(_) => init_allocator(memory_regions, numa),
+        Ok(_) => init_allocator(memory_regions, numa, bootstrap),
         Err(state) => panic!("bootstrap allocator observed invalid boot state {state}"),
     }
 }

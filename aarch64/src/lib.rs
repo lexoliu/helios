@@ -599,7 +599,9 @@ extern "C" fn aarch64_kernel_main() -> ! {
         // and the kernel image is reserved out.
         unsafe { usable_node_regions(region, &reserved_ranges, physical_memory_offset, &numa) }
     });
-    helios_kernel::prime_bootstrap_allocator(memory_regions, &numa);
+    // Limine hands control to the bootstrap processor, which the
+    // processor table lists first.
+    helios_kernel::prime_bootstrap_allocator(memory_regions, &numa, ProcessorId::new(0));
     let payload = helios_kernel::BootPayload::from_boot_modules(&handoff.modules);
     // The rest of the description needs the heap: the ACPI path has to
     // interpret AML to reach a device's `_CRS`.
