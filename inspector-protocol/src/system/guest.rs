@@ -424,6 +424,15 @@ fn map_capability_grants_to_host(
                         .collect(),
                 })
             }
+            programs::CapabilityGrant::Mount(grant) => {
+                host_programs::CapabilityGrant::Mount(host_programs::MountGrant {
+                    rights: grant
+                        .rights
+                        .into_iter()
+                        .map(map_mount_right_to_host)
+                        .collect(),
+                })
+            }
             programs::CapabilityGrant::Device(grant) => {
                 host_programs::CapabilityGrant::Device(host_programs::DeviceGrant {
                     classes: grant
@@ -500,6 +509,13 @@ fn map_link_right_to_host(right: programs::LinkRight) -> host_programs::LinkRigh
         programs::LinkRight::TargetDirectory => host_programs::LinkRight::TargetDirectory,
         programs::LinkRight::SymlinkCreate => host_programs::LinkRight::SymlinkCreate,
         programs::LinkRight::SymlinkRead => host_programs::LinkRight::SymlinkRead,
+    }
+}
+
+fn map_mount_right_to_host(right: programs::MountRight) -> host_programs::MountRight {
+    match right {
+        programs::MountRight::Mount => host_programs::MountRight::Mount,
+        programs::MountRight::Unmount => host_programs::MountRight::Unmount,
     }
 }
 

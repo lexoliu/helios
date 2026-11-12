@@ -637,10 +637,6 @@ where
         &self.execution_context.filesystem
     }
 
-    pub(crate) fn filesystem_mut(&mut self) -> &mut FileSystem {
-        &mut self.execution_context.filesystem
-    }
-
     pub(crate) fn arguments(&self) -> &[String] {
         &self.execution_context.arguments
     }

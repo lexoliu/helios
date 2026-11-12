@@ -20,11 +20,12 @@ pub use authority::{
     AudioClaimCap, ClockAuthorityRights, DeviceClassRights, DeviceGrantClaimCap,
     DiagnosticAuthorityRights, DirectoryAuthorityRights, DirectoryCap, DirectoryPreopen,
     DisplayClaimCap, DnsCap, ExecAuthority, ForkAuthority, GpuClaimCap, InputClaimCap,
-    JoinAuthority, LinkAuthorityRights, LinkSourceCap, LinkTargetDirectoryCap, MulticastCap,
-    NetworkAdminCap, NetworkAuthorityRights, NetworkCap, ObserveMachineCap, PrivilegedBindCap,
-    ProcessAuthority, ProcessAuthorityError, ProcessAuthorityRights, SetWallClockCap,
-    SignalAuthority, SpawnAuthority, SymlinkCreateCap, SymlinkReadCap, TcpCap,
-    TerminalAuthorityRights, TerminalInputCap, TerminalOutputCap, TtyControlCap, UdpCap,
+    JoinAuthority, LinkAuthorityRights, LinkSourceCap, LinkTargetDirectoryCap,
+    MountAuthorityRights, MountCap, MulticastCap, NetworkAdminCap, NetworkAuthorityRights,
+    NetworkCap, ObserveMachineCap, PrivilegedBindCap, ProcessAuthority, ProcessAuthorityError,
+    ProcessAuthorityRights, SetWallClockCap, SignalAuthority, SpawnAuthority, SymlinkCreateCap,
+    SymlinkReadCap, TcpCap, TerminalAuthorityRights, TerminalInputCap, TerminalOutputCap,
+    TtyControlCap, UdpCap, UnmountCap,
 };
 pub(crate) use descriptor::FreeDescriptorSlots;
 pub use descriptor::{
