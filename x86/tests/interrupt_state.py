@@ -72,6 +72,10 @@ def main():
         6: "YMM upper state corrupted",
         7: "ZMM state corrupted",
         8: "opmask state corrupted",
+        9: "interrupt stub entered Rust with DF set",
+        10: "interrupt stub did not restore the interrupted DF",
+        11: "exception stub entered Rust with DF set",
+        12: "exception stub did not restore the interrupted DF",
     }
     component_mask = components.returncode
     verified_components = ["x87", "sse"]

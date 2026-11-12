@@ -64,8 +64,8 @@ pub use policy::{
     USER_POOL_MIN_REGION_BYTES, kernel_reserve_for, task_arena_bytes_for,
 };
 pub use reservations::{
-    AccessibilityPlan, CommittedRegion, ReleasedReservation, ReservationLookup, ReservationTracker,
-    SwapEntry, VaCursor, validate_range,
+    AccessibilityPlan, CommittedRegion, CommittedRemoval, Decommitted, ReleasedReservation,
+    ReservationLookup, ReservationTracker, SwapEntry, VaCursor, ranges_outside, validate_range,
 };
 pub use swap::{
     IDLE_SWAP_AFTER, SWAP_BATCH_BYTES, SWAP_TICK, SwapDisabled, SwapFaultError, SwapHandle,
