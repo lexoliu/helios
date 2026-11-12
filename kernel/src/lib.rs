@@ -27,6 +27,7 @@ mod network;
 mod process;
 mod profiling;
 mod runtime;
+mod settings;
 mod surface;
 #[cfg(test)]
 mod test_support;
@@ -226,6 +227,10 @@ pub use runtime::{
     ObjectIdentity, PingError, PingErrorKind, PingReply, RegisteredTcpReadBuffer, RuntimeState,
     SocketReadiness, TcpAccepted, TcpError, TcpErrorKind, TcpListener, TcpReadProgress,
     TcpWriteProgress, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
+};
+pub use settings::{
+    Holds, SETTING_COUNT, Setting, SettingCell, SettingEntry, SettingUnit, SettingValue,
+    SettingWriteError, Settings,
 };
 pub use surface::{
     MAX_INSTANCE_SURFACES, MAX_LIVE_SURFACES, ReturnedSurface, ReturnedSurfaces,

@@ -10,10 +10,11 @@ use crate::{
     DEFAULT_TRACE_HISTORY_CAPACITY, EmbeddedBootFs, EmbeddedComponent, FoldedProfileSample,
     FutexKey, FutexTable, FutexWaitRegistration, HEAP_SIZE_CLASS_COUNT, HeapStats, InstanceId,
     InstanceRegistry, InstructionSampler, Notify, PerfMetricFilter, PerfMetricHistory,
-    PerfMetricSample, PerfSample, ProfileFilter, ProfileScope, ProfileSink, StatsSample,
+    PerfMetricSample, PerfSample, ProfileFilter, ProfileScope, ProfileSink, Settings, StatsSample,
     TraceEvent, TraceFilter, TraceLog,
 };
 use crate::{MachineGeneration, MachineGenerationHandle, RootEntropy, RootEntropyHandle};
+use crossbeam_utils::CachePadded;
 use helios_hal::cpu::{HardwarePerfCounterDelta, Timebase};
 use helios_hal::rtc::{RealTimeClock, UnixSeconds};
 use spin::{Mutex, Once};
@@ -126,6 +127,11 @@ struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     /// bring-up.
     instructions: InstructionSampler,
     heap_perf_snapshot: HeapPerfSnapshot,
+    /// The operator's machine-wide settings. Padded to its own cache
+    /// line: every process creation reads them and the profile counters
+    /// above are written constantly. Its words are written by whichever
+    /// processor serves a write (see [`crate::Settings`]).
+    settings: CachePadded<Settings>,
 }
 
 struct HeapPerfSnapshot {
@@ -360,6 +366,7 @@ where
                 ),
                 instructions: InstructionSampler::new(processor_count),
                 heap_perf_snapshot: HeapPerfSnapshot::new(),
+                settings: CachePadded::new(Settings::default()),
             }),
         }
     }
@@ -401,6 +408,12 @@ where
             self.inner.heap_perf_snapshot.reset(crate::heap_stats());
         }
         self.inner.profiles.set_enabled(enabled);
+    }
+
+    /// The machine-wide settings. Every consumer reaches them through the
+    /// state it already holds.
+    pub fn settings(&self) -> &Settings {
+        &self.inner.settings
     }
 
     /// The instruction-address sampler. It has its own start and stop
