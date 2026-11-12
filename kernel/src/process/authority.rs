@@ -189,6 +189,25 @@ pub struct SpawnAuthority(ProcessAuthorityRights);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExecAuthority(ProcessAuthorityRights);
 
+/// Proof that the holder derived a process right that may start a
+/// compile: SPAWN or EXEC. It is built only from one of those two
+/// tokens, so every route into the in-kernel compiler has to have
+/// derived a process right first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompileAuthority(ProcessAuthorityRights);
+
+impl From<&SpawnAuthority> for CompileAuthority {
+    fn from(authority: &SpawnAuthority) -> Self {
+        Self(authority.rights())
+    }
+}
+
+impl From<&ExecAuthority> for CompileAuthority {
+    fn from(authority: &ExecAuthority) -> Self {
+        Self(authority.rights())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ForkAuthority(ProcessAuthorityRights);
 
@@ -378,6 +397,7 @@ macro_rules! impl_process_cap {
 
 impl_process_cap!(SpawnAuthority);
 impl_process_cap!(ExecAuthority);
+impl_process_cap!(CompileAuthority);
 impl_process_cap!(ForkAuthority);
 impl_process_cap!(JoinAuthority);
 impl_process_cap!(SignalAuthority);
