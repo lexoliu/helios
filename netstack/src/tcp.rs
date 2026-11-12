@@ -2740,9 +2740,16 @@ where
             .wrapping_add(u32::try_from(payload_len).unwrap_or(u32::MAX));
         let drained_segments = self.drain_contiguous_out_of_order();
         self.refresh_advertised_window();
-        if drained_segments == 0 {
+        // Duplicate acknowledgements owed for a hole all carry the old
+        // `receive_next`. Once it advances they would repeat the new one
+        // and read to the peer as a loss report for data it has not lost,
+        // so the advance settles them to the single immediate
+        // acknowledgement of RFC 5681 §4.2.
+        let settles_duplicates = payload_len != 0 && self.pending_acks > 1;
+        if drained_segments == 0 && !settles_duplicates {
             self.note_inbound_payload(now_nanos);
         } else {
+            self.pending_acks = 0;
             self.request_ack();
         }
         Ok(payload_len != 0 || drained_segments != 0)
@@ -6568,6 +6575,95 @@ mod tests {
             acknowledgements += 1;
         }
         assert_eq!(acknowledgements, 4);
+    }
+
+    /// An established socket that has received peer data up to 201 and
+    /// owes no acknowledgement.
+    fn socket_with_receive_next_201() -> TcpSocket<BbrV3> {
+        let mut socket = established_socket();
+        let payload = [0u8; 100];
+        let _ = deliver_segment(
+            &mut socket,
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 101,
+                acknowledgement: 8,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+                options: TcpOptions::empty(),
+                payload: &payload,
+            },
+            1,
+        );
+        while socket.pending_ack().is_some() {
+            socket.mark_ack_queued();
+        }
+        socket
+    }
+
+    fn deliver_payload_at(socket: &mut TcpSocket<BbrV3>, sequence: u32, now_nanos: u64) {
+        let payload = [0u8; 100];
+        let _ = deliver_segment(
+            socket,
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence,
+                acknowledgement: 8,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+                options: TcpOptions::empty(),
+                payload: &payload,
+            },
+            now_nanos,
+        );
+    }
+
+    /// Filling the hole settles the duplicates owed for it to the one
+    /// acknowledgement of the advance, so the peer never counts them.
+    #[test]
+    fn filling_the_hole_settles_owed_duplicate_acks_to_one() {
+        let mut socket = socket_with_receive_next_201();
+        for index in 0..4u32 {
+            deliver_payload_at(&mut socket, 301 + index * 100, 2 + u64::from(index));
+        }
+        assert_eq!(socket.pending_ack_count(), 4);
+
+        deliver_payload_at(&mut socket, 201, 10);
+
+        assert_eq!(socket.pending_ack_count(), 1);
+        let header = socket.pending_ack().expect("the advance owes an ACK");
+        assert_eq!(header.acknowledgement, 701);
+    }
+
+    /// A segment that advances `receive_next` without reaching the next
+    /// queued segment owes one immediate acknowledgement; the hole that
+    /// remains owes one more per segment arriving ahead of it.
+    #[test]
+    fn partly_filled_hole_owes_one_ack_then_one_per_later_segment() {
+        let mut socket = socket_with_receive_next_201();
+        for index in 0..3u32 {
+            deliver_payload_at(&mut socket, 401 + index * 100, 2 + u64::from(index));
+        }
+        assert_eq!(socket.pending_ack_count(), 3);
+
+        deliver_payload_at(&mut socket, 201, 10);
+
+        assert_eq!(socket.pending_ack_count(), 1);
+        let header = socket.pending_ack().expect("the advance owes an ACK");
+        assert_eq!(header.acknowledgement, 301);
+
+        deliver_payload_at(&mut socket, 701, 11);
+        deliver_payload_at(&mut socket, 801, 12);
+        assert_eq!(socket.pending_ack_count(), 3);
+        let mut acknowledgements = 0;
+        while let Some(header) = socket.pending_ack() {
+            assert_eq!(header.acknowledgement, 301);
+            socket.mark_ack_queued();
+            acknowledgements += 1;
+        }
+        assert_eq!(acknowledgements, 3);
     }
 
     /// The queue of owed acknowledgements is bounded: a peer that keeps
