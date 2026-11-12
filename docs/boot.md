@@ -66,3 +66,29 @@ The parsed result is a `BootPayload`, which the backend hands
 `EmbeddedBootDirectory`, `EmbeddedComponent` and `EmbeddedInit` stay the
 kernel's view types — they are views over the payload image now instead
 of generated statics.
+
+## Booting a CI-built image without a rebuild
+
+Each smoke lane uploads the release kernel and the full `helios-bootfs`
+it built as `helios-guest-<arch>` (`aarch64`, `riscv64`, `x86-64`), kept
+90 days. The archive mirrors the paths under `target/` that
+`vm --no-build` reads, so on a host with the same commit checked out and
+`helios-inspector` and `helios-cli` built, unpacking it into `target/` is
+the whole installation:
+
+```bash
+gh run download <run> -n helios-guest-aarch64 -D target
+./target/release/helios-inspector vm --arch aarch64 --release --no-build shell -c 'echo ok'
+HELIOS_WORKLOAD_BENCH_NO_BUILD=1 tools/wasi-apps/workload-bench.sh
+```
+
+The archive holds `<triple>/kernel-release/helios` and
+`kernel-prebuild/<triple>/kernel-release/helios-bootfs`; the x86-64 one
+uses `profile-use` for the directory, because its release kernel is
+built against the fetched profile, so that host runs
+`helios-cli profile-fetch` first for the inspector to resolve the same
+directory. The disk image Limine boots (x86-64, aarch64) is written at
+boot from these two files, so the host needs `HELIOS_LIMINE_SHARE` and
+`HELIOS_LIMINE_BIN` as for any boot. The prebuild manifest and the root
+key files are not shipped: they are read by the build only, and the
+manifest records absolute paths of the machine that wrote it.

@@ -8,6 +8,7 @@ extern crate std;
 
 mod audio;
 mod bootfs;
+mod buffer;
 mod component;
 mod device;
 mod display;
@@ -23,7 +24,6 @@ mod log;
 mod machine;
 mod memory;
 mod network;
-mod pins;
 mod process;
 mod profiling;
 mod runtime;
@@ -62,6 +62,10 @@ pub use bootfs::{
     BootDirectory, BootDirectoryEntry, BootDirectoryHandleExt, BootFile, BootfsBytes,
     EmbeddedBootDirectory, EmbeddedBootFile, EmbeddedBootFs,
 };
+pub use buffer::{
+    BYTES_PER_PIXEL, Buffer, BufferError, GuestMemory, MAX_VIEWS, Span, ViewError, ViewGroup,
+    ViewId, ViewTable, WASM_PAGE_BYTES,
+};
 pub(crate) use component::ComponentCache;
 pub use component::{
     COMPONENT_ASYNC_STACK_SIZE, CompiledComponent, ComponentExecContext, ComponentExecutor,
@@ -82,19 +86,17 @@ pub use component::{
     wait_until_runtime_deadline,
 };
 pub use device::{
-    AUDIO_WINDOW_BYTES, DEFAULT_DMA_BUDGET_BYTES, DEVICE_WINDOW_BYTES, DISPLAY_WINDOW_BYTES,
-    DeviceGrant, DeviceGrantRegistry, DeviceInterruptHooks, DeviceInterruptRoute, DeviceName,
-    DeviceOwnership, DeviceVmHooks, DeviceWindow, DmaBudget, DmaBuffer, DmaBufferHandle,
-    GPU_WINDOW_BYTES, GrantError, GrantHandle, GrantInterrupt, GrantLease, GrantStats,
-    GrantedDeviceSnapshot, InterruptEvent, InterruptRelay, InterruptStats, LinearMemory,
-    MAX_DEVICE_NAME, MAX_DMA_BUFFERS, MAX_GRANT_INTERRUPTS, MAX_GRANT_REGIONS, MAX_GRANTS,
-    MappedRegion, PublishedDevice, SURFACE_WINDOW_BYTES, install_device_interrupt_hooks,
-    install_device_vm_hooks,
+    DEFAULT_DMA_BUDGET_BYTES, DeviceGrant, DeviceGrantRegistry, DeviceInterruptHooks,
+    DeviceInterruptRoute, DeviceName, DeviceOwnership, DeviceVmHooks, DmaBudget, DmaBuffer,
+    DmaBufferHandle, GrantError, GrantHandle, GrantInterrupt, GrantLease, GrantStats,
+    GrantedDeviceSnapshot, InterruptEvent, InterruptRelay, InterruptStats, MAX_DEVICE_NAME,
+    MAX_DMA_BUFFERS, MAX_GRANT_INTERRUPTS, MAX_GRANT_REGIONS, MAX_GRANTS, PublishedDevice,
+    install_device_interrupt_hooks, install_device_vm_hooks,
 };
 pub use display::{
-    DisplayClaim, DisplayOwnership, DisplayPins, DisplaySender, DisplayService,
-    DisplayServiceError, FrameToken, MAX_CLAIMED_SCANOUTS, MAX_PINNED_FRAMES, PinnedFrame,
-    REQUEST_QUEUE_DEPTH, SequenceSignal, install_display_device,
+    DisplayClaim, DisplayOwnership, DisplaySender, DisplayService, DisplayServiceError, FrameToken,
+    MAX_CLAIMED_SCANOUTS, MAX_PINNED_FRAMES, REQUEST_QUEUE_DEPTH, SequenceSignal,
+    install_display_device,
 };
 pub use embedded::{BootPayload, EmbeddedComponent, EmbeddedInit};
 pub use exec::{
@@ -113,7 +115,7 @@ pub use exec::{
 };
 pub use gpu::{
     ContextRecord, Gpu3dClaim, Gpu3dOwnership, Gpu3dSender, Gpu3dService, Gpu3dServiceError,
-    GpuPins, MAX_GPU_BLOBS, MAX_GPU_CONTEXTS, MAX_GPU_PINS, install_gpu3d_device,
+    MAX_GPU_BLOBS, MAX_GPU_CONTEXTS, MAX_GPU_VIEWS, install_gpu3d_device,
 };
 pub use helios_hal::Platform;
 pub use helios_netstack::{
@@ -153,16 +155,17 @@ pub use kernel_exception::{
 pub use machine::{AdvanceCause, Generation, MachineGeneration, MachineGenerationHandle};
 pub use memory::{
     AccessibilityPlan, BalloonHandle, BalloonStats, BootMemoryPlan, BootRegionSplitter,
-    CommittedRegion, ENTROPY_RESEED_INTERVAL, EntropyPool, EntropySources, FIBER_STACK_GUARD_BYTES,
-    FREE_PAGE_REPORT_INTERVAL, FiberStack, FiberStackArenaStats, FiberStackError,
-    FiberStackVmHooks, HardwareEntropySource, IDLE_SWAP_AFTER, KERNEL_HEAP_BOOTSTRAP_BYTES,
-    KERNEL_HEAP_GROWTH_CHUNK_BYTES, KERNEL_HEAP_MAX_BOOT_FRACTION, KERNEL_HEAP_MIN_RESERVE_BYTES,
-    KERNEL_HEAP_RESERVE_FRACTION, KernelPhysFrameAllocator, MemoryOwner, NoCryptographicEntropy,
-    NoEntropyDevice, ROOT_ENTROPY_MATERIAL_BYTES, RegionShares, ReleasedReservation,
-    ReservationLookup, ReservationTracker, RootEntropy, RootEntropyHandle, SWAP_BATCH_BYTES,
-    SWAP_TICK, StackFault, SwapDisabled, SwapEntry, SwapFaultError, SwapHandle, SwapStats,
-    SwapVmHooks, TASK_ARENA_FRACTION, TASK_ARENA_MIN_BYTES, USER_POOL_MIN_REGION_BYTES,
-    UserHeapStats, UserMemoryOwnerScope, UserMemoryOwners, UserMemoryPool, VaCursor,
+    CommittedRegion, CommittedRemoval, Decommitted, ENTROPY_RESEED_INTERVAL, EntropyPool,
+    EntropySources, FIBER_STACK_GUARD_BYTES, FREE_PAGE_REPORT_INTERVAL, FiberStack,
+    FiberStackArenaStats, FiberStackError, FiberStackVmHooks, HardwareEntropySource,
+    IDLE_SWAP_AFTER, KERNEL_HEAP_BOOTSTRAP_BYTES, KERNEL_HEAP_GROWTH_CHUNK_BYTES,
+    KERNEL_HEAP_MAX_BOOT_FRACTION, KERNEL_HEAP_MIN_RESERVE_BYTES, KERNEL_HEAP_RESERVE_FRACTION,
+    KernelPhysFrameAllocator, MemoryOwner, NoCryptographicEntropy, NoEntropyDevice,
+    ROOT_ENTROPY_MATERIAL_BYTES, RegionShares, ReleasedReservation, ReservationLookup,
+    ReservationTracker, RootEntropy, RootEntropyHandle, SWAP_BATCH_BYTES, SWAP_TICK, StackFault,
+    SwapDisabled, SwapEntry, SwapFaultError, SwapHandle, SwapStats, SwapVmHooks,
+    TASK_ARENA_FRACTION, TASK_ARENA_MIN_BYTES, USER_POOL_MIN_REGION_BYTES, UserHeapStats,
+    UserMemoryOwnerScope, UserMemoryOwners, UserMemoryPool, VaCursor,
     allocate_user_frame_uninit_on, allocate_user_frame_zeroed, allocate_user_frame_zeroed_on,
     allocate_user_run_zeroed_on, claim_fiber_stack, configure_user_memory_owner_processors,
     current_user_memory_owner, deallocate_user_frame, deallocate_user_frame_on,
@@ -170,8 +173,9 @@ pub use memory::{
     fiber_stack_demand_commits_on, install_entropy_device, install_fiber_stack_arena,
     install_fiber_stack_hooks, install_memory_balloon, install_swap, install_swap_hooks,
     installed_swap_handle, installed_swap_hooks, kernel_reserve_for, largest_servable_user_bytes,
-    page_fault_frame_reserve_bytes, resolve_stack_fault, seed_root_entropy, swapped_token,
-    task_arena_bytes_for, user_heap_stats, user_mapping_kernel_heap_bytes, validate_range,
+    page_fault_frame_reserve_bytes, ranges_outside, resolve_stack_fault, seed_root_entropy,
+    swapped_token, task_arena_bytes_for, user_heap_stats, user_mapping_kernel_heap_bytes,
+    validate_range,
 };
 pub use network::{
     HTTP_FORBIDDEN_FIELD_NAMES, HTTP_MAX_FIELD_SECTION_BYTES, HTTP_MAX_FIELD_VALUE_BYTES, HttpBody,
@@ -184,7 +188,6 @@ pub use network::{
     SocketStack, TcpListenerId, TcpStreamId, UdpSocketId, validate_http_authority,
     validate_http_path_with_query, validate_http_status_code,
 };
-pub use pins::{BYTES_PER_PIXEL, PinError, PinnedArena, PinnedRun};
 pub use process::{
     AudioClaimCap, ClockAuthorityRights, DescriptorEntry, DescriptorId, DescriptorTable,
     DescriptorTableError, DeviceClassRights, DeviceGrantClaimCap, DirectoryAuthorityRights,
@@ -219,10 +222,10 @@ pub use signing_key::{
     SigningKeyError, settle_signing_key,
 };
 pub use surface::{
-    MAX_INSTANCE_SURFACES, MAX_LIVE_SURFACES, ReturnedSurfaces, SURFACE_EVENT_QUEUE_DEPTH,
-    SURFACE_REQUEST_QUEUE_DEPTH, SurfaceCreate, SurfaceEvents, SurfaceGeometry, SurfaceId,
-    SurfaceOwnership, SurfaceRect, SurfaceRequest, SurfaceService, SurfaceServiceError,
-    SurfaceShared,
+    MAX_INSTANCE_SURFACES, MAX_LIVE_SURFACES, ReturnedSurface, ReturnedSurfaces,
+    SURFACE_EVENT_QUEUE_DEPTH, SURFACE_REQUEST_QUEUE_DEPTH, SurfaceCreate, SurfaceEvents,
+    SurfaceGeometry, SurfaceId, SurfaceOwnership, SurfaceRect, SurfaceRequest, SurfaceService,
+    SurfaceServiceError, SurfaceShared,
 };
 pub use vsock::{
     ComponentHostVsockService, MAX_VSOCK_BACKLOG, MAX_VSOCK_CONNECTIONS, MAX_VSOCK_LISTENERS,

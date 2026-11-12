@@ -28,8 +28,9 @@ use alloc::vec::Vec;
 
 use super::grant::{DeviceGrant, DeviceName, GrantError, GrantInterrupt};
 use super::interrupt::InterruptRelay;
-use super::lease::{DeviceWindow, GrantLease, PublishedDevice};
+use super::lease::{GrantLease, PublishedDevice};
 use super::platform::device_hooks_installed;
+use crate::buffer::ViewGroup;
 use crate::io::ExternalInterruptHandler;
 use crate::process::DeviceGrantClaimCap;
 
@@ -147,8 +148,9 @@ impl DeviceGrantRegistry {
             .find(|device| device.grant.name().as_str() == name)
     }
 
-    /// Take exclusive ownership of the device `cap` names, mapping its
-    /// regions into the linear memory `window` describes.
+    /// Take exclusive ownership of the device `cap` names. Every view the
+    /// owner is later given of the device — a region, a ring — goes in
+    /// `views`, the set that ends when the lease does.
     ///
     /// The cap is the proof that the caller's authority names this
     /// device; it can only be derived from an authority that does, so
@@ -163,7 +165,7 @@ impl DeviceGrantRegistry {
     pub fn claim(
         &self,
         cap: DeviceGrantClaimCap,
-        window: DeviceWindow,
+        views: ViewGroup,
     ) -> Result<GrantLease, GrantError> {
         let name = cap.name().as_str();
         let device = self.device(name).ok_or(GrantError::NotFound)?;
@@ -174,11 +176,9 @@ impl DeviceGrantRegistry {
         tracing::info!(
             target: "helios_kernel::device",
             device = name,
-            window_offset = window.offset(),
-            window_bytes = window.bytes(),
             "device grant claimed"
         );
-        Ok(GrantLease::new(device.clone(), window))
+        Ok(GrantLease::new(device.clone(), views))
     }
 
     /// Hand `source` to whichever published device raises it.

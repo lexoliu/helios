@@ -385,6 +385,8 @@ mod tests {
     use core::ptr;
     use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use core::task::{Context, Poll, Waker};
+    use core::time::Duration;
+    use std::time::Instant as WallClock;
 
     use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase, current_processor};
 
@@ -534,10 +536,16 @@ mod tests {
     #[test]
     fn a_withdrawn_target_is_never_interrupted() {
         const RUNS: usize = 200_000;
+        // How long publishing may go on waiting for a tick to catch a
+        // target: the ticking threads only race the withdrawal once the
+        // host schedules them, which a busy host may do late. It is a
+        // third of the three 60-second periods `.config/nextest.toml`
+        // allows a test before killing it, so this bound fires first.
+        const CATCH_DEADLINE: Duration = Duration::from_secs(60);
         let slots = RunningSlots::new(2, 0);
         let (count, violations) = (AtomicUsize::new(0), AtomicUsize::new(0));
         let done = AtomicBool::new(false);
-        std::thread::scope(|scope| {
+        let caught = std::thread::scope(|scope| {
             for _ in 0..2 {
                 scope.spawn(|| {
                     while !done.load(Ordering::Relaxed) {
@@ -545,19 +553,32 @@ mod tests {
                     }
                 });
             }
-            for run in 0..RUNS {
+            let started = WallClock::now();
+            let mut run = 0_usize;
+            // Leaves the loop rather than panicking in it: the scope
+            // joins the ticking threads, which stop only on `done`.
+            let caught = loop {
+                if run >= RUNS && count.load(Ordering::Relaxed) > 0 {
+                    break true;
+                }
+                if started.elapsed() >= CATCH_DEADLINE {
+                    break false;
+                }
                 let target = Recorder::new(&count, &violations);
                 let processor = ProcessorId::new(u16::from(run % 2 == 1));
                 let published = slots.publish(processor, &target, Instant::new(0));
                 drop(published);
                 target.live.store(false, Ordering::Relaxed);
-            }
+                run += 1;
+            };
             done.store(true, Ordering::Relaxed);
+            caught
         });
         assert_eq!(violations.load(Ordering::Relaxed), 0);
         assert!(
-            count.load(Ordering::Relaxed) > 0,
-            "the ticks never caught a published target, so the race went untested"
+            caught,
+            "the ticks caught no published target in {CATCH_DEADLINE:?} of publishing, \
+             so the race went untested"
         );
     }
 

@@ -18,7 +18,8 @@
 //! routed to.
 //!
 //! * The drain parks on the device's own notification and never polls.
-//!   It is the single producer of that device's event queue, and it
+//!   It is the single producer of the holding claim's event queue (none
+//!   when the device is unclaimed), and it
 //!   never waits on the queue: a report that does not fit is dropped
 //!   whole and counted, because a drain that waits is a ring that stops.
 //! * The indicator server owns the direction that travels towards the
