@@ -29,6 +29,7 @@ mod frame_slab;
 mod irq_safe;
 mod mapping_cost;
 mod owner;
+mod paged;
 mod pmm;
 mod policy;
 mod reported;
@@ -63,6 +64,7 @@ pub use owner::{
     MemoryOwner, UserMemoryOwnerScope, UserMemoryOwners, configure_user_memory_owner_processors,
     current_user_memory_owner, enter_user_memory_owner,
 };
+pub use paged::{DetachedPages, FrameReservation, FrameShortage, PagedBytes};
 pub use pmm::KernelPhysFrameAllocator;
 pub use policy::{
     BootMemoryPlan, BootRegionSplitter, KERNEL_HEAP_BOOTSTRAP_BYTES,
