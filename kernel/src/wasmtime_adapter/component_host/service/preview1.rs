@@ -4907,7 +4907,7 @@ mod tests {
     /// closes its stream straight from `WasixOwnedTcpStream::drop` and
     /// never went through that drain. Its FIN therefore sat in the
     /// queue until the pump's park expired, which on a guest with
-    /// nothing else to send is `DHCP_RETRANSMIT_NANOS` — a second of
+    /// nothing else to send is `CONFIGURATION_POLL_NANOS` — a second of
     /// silence the peer spends holding an established connection
     /// (#231). This asks the park, not the wire: the previous test
     /// already proves the FIN is queued, and what was wrong was when it
