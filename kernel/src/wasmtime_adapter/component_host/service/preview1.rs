@@ -1008,10 +1008,14 @@ where
                         }
                     };
                     let finished_ns = crate::monotonic_nanos(&store.data().context.cpu);
-                    if let Err(error) = result {
+                    // A trap here is the compile's: the other stores are told
+                    // by the condemnation, and the requester gets this error.
+                    let trap = result.err().and_then(|error| {
                         tracing::error!(thread_id, "compiler plugin thread failed: {error:#}");
-                    }
+                        store.data().context.condemn_for_store_end(error)
+                    });
                     CompilerThreadReport {
+                        trap,
                         thread_id,
                         processor,
                         spawned_ns,
@@ -2125,11 +2129,14 @@ where
             let descriptor = descriptor.clone();
             let offset = *offset;
             let namespace = p1_namespace(caller);
-            let bytes =
-                match wasi_fs::read(&namespace, &descriptor, offset, capacity as usize).await {
-                    Ok(bytes) => bytes,
-                    Err(error) => return p1_errno_from_fs(error),
-                };
+            let file = match p1_grant(&descriptor) {
+                Ok(file) => file,
+                Err(errno) => return errno,
+            };
+            let bytes = match wasi_fs::read(&namespace, file, offset, capacity as usize).await {
+                Ok(bytes) => bytes,
+                Err(error) => return p1_errno_from_fs(error),
+            };
             p1_set_file_offset(caller, fd, offset.saturating_add(bytes.len() as u64));
             return p1_write_iovs_from_bytes(caller, memory, layout.iovs, &bytes, nread);
         }
@@ -2430,7 +2437,11 @@ where
     let descriptor = descriptor.clone();
     let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
-    wasi_fs::set_size(&namespace, &descriptor, size, now_nanos)
+    let file = match p1_grant(&descriptor) {
+        Ok(file) => file,
+        Err(errno) => return errno,
+    };
+    wasi_fs::set_size(&namespace, file, size, now_nanos)
         .await
         .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
@@ -2447,21 +2458,29 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let Some(path) = p1_descriptor_path(caller.data().descriptors.get(fd)).map(ToOwned::to_owned)
-    else {
+    let Some(descriptor) = p1_fs_descriptor(caller.data().descriptors.get(fd)).cloned() else {
         return p1::errno::BADF;
     };
-    p1_set_times_at_path(caller, &path, atim, mtim, fstflags).await
+    let target = match descriptor.grant_touch() {
+        Ok(target) => target,
+        Err(error) => return p1_errno_from_fs(error),
+    };
+    let (access, modified, now_nanos) = p1_set_times_arguments(caller, atim, mtim, fstflags);
+    let namespace = p1_namespace(caller);
+    wasi_fs::set_times(&namespace, target, access, modified, now_nanos)
+        .await
+        .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
 
-/// Backs `fd_filestat_set_times` and `path_filestat_set_times`.
-async fn p1_set_times_at_path<CpuImpl, Net, StorageImpl>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
-    absolute: &str,
+/// The access time, the modification time and the current time, in
+/// nanoseconds, that `fstflags` asks `fd_filestat_set_times` and
+/// `path_filestat_set_times` to set.
+fn p1_set_times_arguments<CpuImpl, Net, StorageImpl>(
+    caller: &Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     atim: u64,
     mtim: u64,
     fstflags: u16,
-) -> i32
+) -> (Option<u64>, Option<u64>, u64)
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
@@ -2482,10 +2501,7 @@ where
         mtim,
         now_nanos,
     );
-    let namespace = p1_namespace(caller);
-    wasi_fs::set_times(&namespace, absolute, access, modified, now_nanos)
-        .await
-        .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
+    (access, modified, now_nanos)
 }
 
 pub(super) fn p1_fd_advise<CpuImpl, Net, StorageImpl>(
@@ -2533,7 +2549,11 @@ where
         return p1::errno::SUCCESS;
     }
     let now_nanos = caller.data().now_nanos();
-    wasi_fs::set_size(&namespace, &descriptor, end, now_nanos)
+    let file = match p1_grant(&descriptor) {
+        Ok(file) => file,
+        Err(errno) => return errno,
+    };
+    wasi_fs::set_size(&namespace, file, end, now_nanos)
         .await
         .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
@@ -2614,8 +2634,11 @@ where
     };
     let descriptor = descriptor.clone();
     let namespace = p1_namespace(caller);
-    let bytes = match wasi_fs::read(&namespace, &descriptor, offset, layout.byte_len as usize).await
-    {
+    let file = match p1_grant(&descriptor) {
+        Ok(file) => file,
+        Err(errno) => return errno,
+    };
+    let bytes = match wasi_fs::read(&namespace, file, offset, layout.byte_len as usize).await {
         Ok(bytes) => bytes,
         Err(error) => return p1_errno_from_fs(error),
     };
@@ -2691,7 +2714,8 @@ where
     let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
     let (end, written) = {
-        let file = wasi_fs::writable_file(&namespace, &descriptor).map_err(p1_errno_from_fs)?;
+        let file =
+            wasi_fs::writable_file(&namespace, p1_grant(&descriptor)?).map_err(p1_errno_from_fs)?;
         let mut file = ResolvedFileChunks {
             file: &file,
             now_nanos,
@@ -3110,7 +3134,11 @@ where
     };
     let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
-    wasi_fs::create_directory_at(&namespace, &base, &path, now_nanos)
+    let granted = match p1_grant(&base) {
+        Ok(granted) => granted,
+        Err(errno) => return errno,
+    };
+    wasi_fs::create_directory_at(&namespace, granted, &path, now_nanos)
         .await
         .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
@@ -3182,11 +3210,19 @@ where
         Ok(path) => path,
         Err(_) => return p1::errno::FAULT,
     };
-    let (_, _, absolute) = match caller.data().resolve_preview1_path(fd, &path) {
+    let (base, path, _) = match caller.data().resolve_preview1_path(fd, &path) {
         Ok(resolved) => resolved,
         Err(errno) => return errno,
     };
-    p1_set_times_at_path(caller, &absolute, atim, mtim, fstflags).await
+    let granted = match p1_grant(&base) {
+        Ok(granted) => granted,
+        Err(errno) => return errno,
+    };
+    let (access, modified, now_nanos) = p1_set_times_arguments(caller, atim, mtim, fstflags);
+    let namespace = p1_namespace(caller);
+    wasi_fs::set_times_at(&namespace, granted, &path, access, modified, now_nanos)
+        .await
+        .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
 
 #[expect(
@@ -3236,11 +3272,15 @@ where
         };
     let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
+    let destination = match p1_grant(&destination_base) {
+        Ok(destination) => destination,
+        Err(errno) => return errno,
+    };
     wasi_fs::link_at(
         &namespace,
         &source_base,
         &old_path,
-        &destination_base,
+        destination,
         &new_path,
         now_nanos,
     )
@@ -3318,7 +3358,11 @@ where
         Err(errno) => return errno,
     };
     let namespace = p1_namespace(caller);
-    wasi_fs::remove_directory_at(&namespace, &base, &path)
+    let granted = match p1_grant(&base) {
+        Ok(granted) => granted,
+        Err(errno) => return errno,
+    };
+    wasi_fs::remove_directory_at(&namespace, granted, &path)
         .await
         .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
@@ -3361,11 +3405,15 @@ where
         };
     let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
+    let (source, destination) = match (p1_grant(&source_base), p1_grant(&destination_base)) {
+        (Ok(source), Ok(destination)) => (source, destination),
+        (Err(errno), _) | (_, Err(errno)) => return errno,
+    };
     wasi_fs::rename_at(
         &namespace,
-        &source_base,
+        source,
         &old_path,
-        &destination_base,
+        destination,
         &new_path,
         now_nanos,
     )
@@ -3408,7 +3456,11 @@ where
     };
     let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
-    wasi_fs::symlink_at(&namespace, &base, &target, &new_path, now_nanos)
+    let granted = match p1_grant(&base) {
+        Ok(granted) => granted,
+        Err(errno) => return errno,
+    };
+    wasi_fs::symlink_at(&namespace, granted, &target, &new_path, now_nanos)
         .await
         .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
@@ -3436,7 +3488,11 @@ where
         Err(errno) => return errno,
     };
     let namespace = p1_namespace(caller);
-    wasi_fs::unlink_file_at(&namespace, &base, &path)
+    let granted = match p1_grant(&base) {
+        Ok(granted) => granted,
+        Err(errno) => return errno,
+    };
+    wasi_fs::unlink_file_at(&namespace, granted, &path)
         .await
         .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
@@ -4503,9 +4559,14 @@ where
             let descriptor = descriptor.clone();
             let offset = *offset;
             let namespace = p1_namespace(caller);
-            let bytes = wasi_fs::read(&namespace, &descriptor, offset, capacity as usize)
-                .await
-                .map_err(p1_errno_from_fs)?;
+            let bytes = wasi_fs::read(
+                &namespace,
+                p1_grant(&descriptor)?,
+                offset,
+                capacity as usize,
+            )
+            .await
+            .map_err(p1_errno_from_fs)?;
             p1_set_file_offset(caller, fd, offset.saturating_add(bytes.len() as u64));
             Ok(bytes)
         }
@@ -4664,6 +4725,14 @@ pub(super) fn p1_errno_from_component_path(error: crate::ComponentFsPathError) -
     }
 }
 
+/// The proof an operation demands of `descriptor`, or the errno that
+/// refuses it.
+pub(super) fn p1_grant<K: wasi_fs::Kind, R: wasi_fs::Right>(
+    descriptor: &FsDescriptor,
+) -> Result<wasi_fs::Granted<'_, K, R>, i32> {
+    descriptor.grant().map_err(p1_errno_from_fs)
+}
+
 pub(super) fn p1_errno_from_fs(error: fs_types::ErrorCode) -> i32 {
     match error {
         fs_types::ErrorCode::Access => p1::errno::ACCES,
@@ -4782,7 +4851,7 @@ mod tests {
         .expect("the owner creates the file");
         block_on(wasi_fs::write(
             &namespace,
-            &file,
+            file.grant().expect("the owner may write the file"),
             helios_hal::fs::WritePosition::At(0),
             "日本語 한국어".as_bytes(),
             2,
@@ -4804,10 +4873,127 @@ mod tests {
                 3,
             ));
             assert!(matches!(opened, Err(fs_types::ErrorCode::ReadOnly)));
-            let contents =
-                block_on(wasi_fs::read(&namespace, &file, 0, 64)).expect("the owner reads back");
+            let contents = block_on(wasi_fs::read(
+                &namespace,
+                file.grant().expect("the owner may read the file"),
+                0,
+                64,
+            ))
+            .expect("the owner reads back");
             assert_eq!(contents.as_ref(), "日本語 한국어".as_bytes());
         }
+    }
+
+    /// A namespace with one file, `/data`, and the time it was last
+    /// modified.
+    fn namespace_with_file() -> crate::Namespace<crate::UnsupportedStorage> {
+        use futures_lite::future::block_on;
+
+        let namespace = crate::Namespace::new(crate::MountTable::new(
+            crate::BootFs::new(crate::EmbeddedBootFs::new(&[], &[]), crate::BOOT_DEVICE),
+            1,
+        ));
+        let owner = FsDescriptor {
+            path: "/".into(),
+            kind: FsNodeKind::Directory,
+            flags: fs_types::DescriptorFlags::READ
+                | fs_types::DescriptorFlags::WRITE
+                | fs_types::DescriptorFlags::MUTATE_DIRECTORY,
+            identity: None,
+            mount: None,
+        };
+        block_on(wasi_fs::open_at(
+            &namespace,
+            &owner,
+            fs_types::PathFlags::empty(),
+            "data",
+            fs_types::OpenFlags::CREATE,
+            fs_types::DescriptorFlags::READ,
+            1,
+        ))
+        .expect("the owner creates the file");
+        namespace
+    }
+
+    fn modified_nanos(namespace: &crate::Namespace<crate::UnsupportedStorage>) -> u64 {
+        futures_lite::future::block_on(wasi_fs::stat_path(namespace, "/data", crate::Follow::No))
+            .expect("the file exists")
+            .modified_nanos
+    }
+
+    /// `fd_filestat_set_times` is decided by the rights the descriptor was
+    /// opened with: `FD_FILESTAT_SET_TIMES` gives the file `write`, and
+    /// reading alone gives it nothing to retime with.
+    #[test]
+    fn fd_filestat_set_times_needs_the_set_times_right() {
+        use futures_lite::future::block_on;
+
+        let namespace = namespace_with_file();
+        let before = modified_nanos(&namespace);
+        let file = |rights| FsDescriptor {
+            flags: p1_descriptor_flags(rights, 0),
+            ..match regular_file() {
+                Preview1Descriptor::File { descriptor, .. } => descriptor,
+                _ => unreachable!("regular_file is a file"),
+            }
+        };
+
+        let reader = file(P1_RIGHT_FD_READ);
+        assert!(matches!(
+            reader.grant_touch().err(),
+            Some(fs_types::ErrorCode::ReadOnly)
+        ));
+        assert_eq!(modified_nanos(&namespace), before);
+
+        let retimer = file(P1_RIGHT_FD_FILESTAT_SET_TIMES);
+        block_on(wasi_fs::set_times(
+            &namespace,
+            retimer
+                .grant_touch()
+                .expect("FD_FILESTAT_SET_TIMES gives write"),
+            None,
+            Some(77),
+            78,
+        ))
+        .expect("the descriptor with the right sets the times");
+        assert_eq!(modified_nanos(&namespace), 77);
+    }
+
+    /// `path_filestat_set_times` is decided by the base: reading a
+    /// directory gives no right to retime below it, and the right to create
+    /// below it does.
+    #[test]
+    fn path_filestat_set_times_is_decided_by_the_base() {
+        use futures_lite::future::block_on;
+
+        let namespace = namespace_with_file();
+        let before = modified_nanos(&namespace);
+        let base = |rights| FsDescriptor {
+            path: "/".into(),
+            kind: FsNodeKind::Directory,
+            flags: p1_descriptor_flags(rights, 0),
+            identity: None,
+            mount: None,
+        };
+
+        let reader = base(P1_RIGHT_FD_READDIR);
+        assert_eq!(
+            p1_grant::<wasi_fs::Directory, wasi_fs::Retime>(&reader).err(),
+            Some(p1::errno::ROFS)
+        );
+        assert_eq!(modified_nanos(&namespace), before);
+
+        let creator = base(P1_RIGHT_PATH_CREATE_FILE);
+        block_on(wasi_fs::set_times_at(
+            &namespace,
+            p1_grant(&creator).expect("PATH_CREATE_FILE gives mutate-directory"),
+            "data",
+            None,
+            Some(88),
+            89,
+        ))
+        .expect("the base with the right sets the times");
+        assert_eq!(modified_nanos(&namespace), 88);
     }
 
     fn connected_socket_entry<Net: ComponentHostNetwork>(

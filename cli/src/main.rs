@@ -234,6 +234,22 @@ enum WasmBuildError {
     LoadCoreModule { path: String, report: String },
     #[error("failed to encode component {path}: {report}")]
     EncodeComponent { path: String, report: String },
+    #[error("failed to run `rustc {query}`: {source}")]
+    SpawnRustc {
+        query: &'static str,
+        #[source]
+        source: io::Error,
+    },
+    #[error("`rustc {query}` failed with status {status}")]
+    RustcFailed {
+        query: &'static str,
+        status: std::process::ExitStatus,
+    },
+    #[error(
+        "the toolchain has no llvm-ar at {path}; rust-toolchain.toml lists the \
+         llvm-tools component that ships it"
+    )]
+    LlvmArMissing { path: String },
 }
 
 /// Why the set of boot programs could not be resolved from the
@@ -2105,6 +2121,14 @@ fn build_wasm_program(
     }
     command.env_remove("CARGO_ENCODED_RUSTFLAGS");
     command.env("RUSTFLAGS", wasm_rustflags(target_triple));
+    // C code a program links (ring's, for one) is archived by `cc`, which
+    // falls back to the host's `ar` for a wasm target; that archive carries
+    // no symbol index wasm-ld can read, and the link then misses every C
+    // symbol. The toolchain's own llvm-ar writes one.
+    command.env(
+        format!("AR_{}", target_triple.replace('-', "_")),
+        toolchain_llvm_ar()?,
+    );
     let status = command
         .status()
         .map_err(|source| WasmBuildError::SpawnCargo {
@@ -2134,6 +2158,41 @@ fn build_wasm_program(
         artifact: artifact_name.to_owned(),
         source,
     })
+}
+
+/// The llvm-ar the toolchain's llvm-tools component installs beside
+/// rust-lld, in the host's directory of the sysroot.
+fn toolchain_llvm_ar() -> Result<PathBuf, WasmBuildError> {
+    let sysroot = rustc_print("--print=sysroot")?;
+    let host = rustc_print("--print=host-tuple")?;
+    let path = PathBuf::from(sysroot)
+        .join("lib/rustlib")
+        .join(host)
+        .join("bin/llvm-ar");
+    if path.is_file() {
+        Ok(path)
+    } else {
+        Err(WasmBuildError::LlvmArMissing {
+            path: path.display().to_string(),
+        })
+    }
+}
+
+/// What `rustc <query>` prints, without its trailing newline.
+fn rustc_print(query: &'static str) -> Result<String, WasmBuildError> {
+    let output = Command::new("rustc")
+        .arg(query)
+        .output()
+        .map_err(|source| WasmBuildError::SpawnRustc { query, source })?;
+    if !output.status.success() {
+        return Err(WasmBuildError::RustcFailed {
+            query,
+            status: output.status,
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_owned())
 }
 
 fn wasm_rustflags(target_triple: &str) -> String {

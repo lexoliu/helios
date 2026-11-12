@@ -230,9 +230,85 @@ where
     pub(super) spawner: crate::Spawner<CpuImpl>,
     pub(super) runtime_state: HostRuntimeState<CpuImpl, Net, StorageImpl>,
     pub(super) instance: crate::RegisteredInstance,
+    /// The registry `instance` lives in, which a condemnation goes through.
+    pub(super) registry: crate::InstanceRegistry,
     pub(super) shared: Arc<CompilerCoreShared<CompilerCoreStore<CpuImpl, Net, StorageImpl>>>,
     pub(super) write_serial: crate::DebugSerialWriter,
     pub(super) _marker: core::marker::PhantomData<fn() -> StorageImpl>,
+}
+
+impl<CpuImpl, Net, StorageImpl> CompilerCompileContext<CpuImpl, Net, StorageImpl>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    /// Condemns the compile's instance for `reason` and interrupts every
+    /// store of it.
+    fn condemn(&self, reason: crate::KillReason) -> crate::KillOutcome {
+        condemn_compile(
+            &self.registry,
+            &self.shared.interrupts,
+            self.instance.id(),
+            reason,
+            self.runtime_state.uptime_nanos(self.cpu.now().ticks()),
+        )
+    }
+
+    /// A worker store's call ended in `error`; returns the error the compile
+    /// reports when this is the compile's first trap.
+    ///
+    /// A trap on one store tells the compile's other stores nothing: main
+    /// parks for ever on the job the dead worker held, or the workers park
+    /// for ever once main is gone. So a trap, an end that is not the compile's
+    /// own kill, condemns the instance, and every other store unwinds through
+    /// the kill path. The first condemnation's reason stands, so only the
+    /// trap that condemns first reports its error: a store that ends by a
+    /// kill, or by a trap after another store condemned, reports none.
+    pub(super) fn condemn_for_store_end(&self, error: wasmtime::Error) -> Option<ProgramExecError> {
+        if error.downcast_ref::<crate::InstanceKilled>().is_some() {
+            return None;
+        }
+        match self.condemn(crate::KillReason::StoreFailed) {
+            crate::KillOutcome::Requested => Some(map_program_runtime_error(error)),
+            crate::KillOutcome::AlreadyStopping | crate::KillOutcome::NoSuchInstance => None,
+        }
+    }
+
+    /// The compile's main thread ended its part with `result`, before the
+    /// workers are joined: a failure condemns the instance, as a worker's
+    /// trap does ([`Self::condemn_for_store_end`]), so workers parked in the
+    /// pool's idle wait end instead of being joined for ever.
+    ///
+    /// A failure after a worker's own trap is the condemnation reaching main;
+    /// [`first_trap_wins`] swaps it for the worker's error once the workers
+    /// are joined.
+    pub(super) fn end_main_part<T>(
+        &self,
+        result: Result<T, ProgramExecError>,
+    ) -> Result<T, ProgramExecError> {
+        if result.is_err() {
+            self.condemn(crate::KillReason::StoreFailed);
+        }
+        result
+    }
+}
+
+/// The result a compile reports once every worker is joined: the first
+/// trap's error, taken from the worker that condemned the compile, over
+/// whatever main ended with (the condemnation, when main was ended by it).
+///
+/// Only the store that condemned the instance carries an error, so at most one
+/// report does. A compile in which a store trapped fails even when main
+/// returned a response, because the plugin's memory is in an unknown state.
+pub(super) fn first_trap_wins<T>(
+    result: Result<T, ProgramExecError>,
+    reports: &mut [CompilerThreadReport],
+) -> Result<T, ProgramExecError> {
+    match reports.iter_mut().find_map(|report| report.trap.take()) {
+        Some(trap) => Err(trap),
+        None => result,
+    }
 }
 
 /// One compiler store's data: the compile's context, and what belongs to
@@ -301,8 +377,11 @@ pub(super) struct CompilerCoreShared<T> {
     pub(super) interrupts: Arc<crate::wasmtime_adapter::preemption::GuestInterrupts>,
 }
 
-#[derive(Clone, Copy)]
 pub(super) struct CompilerThreadReport {
+    /// The error this worker's store trapped with, when that trap is the one
+    /// that condemned the compile. See
+    /// [`CompilerCompileContext::condemn_for_store_end`].
+    pub(super) trap: Option<ProgramExecError>,
     pub(super) thread_id: i32,
     pub(super) processor: u16,
     pub(super) spawned_ns: u64,
@@ -469,7 +548,8 @@ pub(super) fn write_decimal(memory: &SharedMemory, ptr: GuestAddress, mut value:
 ///
 /// Every call into a compiler store, the compile's main thread and each
 /// worker alike, is made through [`Self::call`] or [`Self::instantiate`], so
-/// the end of a processor's guest time slice makes the guest yield to the
+/// the end of a processor's guest time slice, or a freeze's request
+/// (`GuestInterrupts::interrupt_running`), makes the guest yield to the
 /// executor and a kill of the compile's instance ends the call, including
 /// one parked in `memory.atomic.wait`.
 ///
@@ -991,6 +1071,7 @@ mod tests {
                 spawner: executor.spawner(cpu),
                 runtime_state,
                 instance: instance.clone(),
+                registry: registry.clone(),
                 shared,
                 write_serial: crate::DebugSerialWriter::of::<DiscardPort>(),
                 _marker: core::marker::PhantomData,
@@ -1067,6 +1148,7 @@ mod tests {
             crate::KillReason::SupervisorRestart,
             crate::KillReason::Operator,
             crate::KillReason::RequesterGone,
+            crate::KillReason::StoreFailed,
         ] {
             let fixture = CompileFixture::new();
             let (store, _drive) = fixture.open_store();
@@ -1142,6 +1224,216 @@ mod tests {
         assert!(
             dropped.load(Ordering::SeqCst),
             "the worker unwound past its parked host future"
+        );
+    }
+
+    /// A function of `store` that traps: a host function that returns an
+    /// error, as the plugin's abort does.
+    fn trapping(
+        store: &mut wasmtime::Store<FixtureStore>,
+        message: &'static str,
+    ) -> wasmtime::TypedFunc<(), ()> {
+        wasmtime::Func::wrap(&mut *store, move || -> wasmtime::Result<()> {
+            Err(wasmtime::Error::msg(message))
+        })
+        .typed::<(), ()>(&*store)
+        .expect("the trap is a () -> () function")
+    }
+
+    /// A function of `store` that parks where the plugin's wait parks it, in
+    /// an async host future that nothing resolves.
+    fn parked(store: &mut wasmtime::Store<FixtureStore>) -> wasmtime::TypedFunc<(), ()> {
+        wasmtime::Func::wrap_async(
+            &mut *store,
+            move |_: wasmtime::Caller<'_, FixtureStore>, (): ()| {
+                Box::new(core::future::pending::<()>())
+            },
+        )
+        .typed::<(), ()>(&*store)
+        .expect("the parked wait is a () -> () function")
+    }
+
+    fn report(trap: Option<ProgramExecError>) -> CompilerThreadReport {
+        CompilerThreadReport {
+            trap,
+            thread_id: 1,
+            processor: 0,
+            spawned_ns: 0,
+            started_ns: 0,
+            instantiated_ns: 0,
+            finished_ns: 0,
+        }
+    }
+
+    /// The runtime's message an error carries.
+    fn message_of(error: &ProgramExecError) -> &str {
+        match &error.detail {
+            ProgramExecErrorDetail::RuntimeFailure(message) => message.as_str(),
+            other => panic!("expected the runtime's own failure, got {other:?}"),
+        }
+    }
+
+    /// A trap on the compile's main thread while a worker is parked
+    /// condemns the compile: the worker's call ends with the kill instead of
+    /// being joined for ever, and the compile's error is the trap's.
+    #[test]
+    fn a_trap_on_main_ends_a_parked_worker_and_is_the_compiles_error() {
+        let fixture = CompileFixture::new();
+        let (mut main, main_drive) = fixture.open_store();
+        let (mut worker, worker_drive) = fixture.open_store();
+        let trap = trapping(&mut main, "main trapped");
+        let wait = parked(&mut worker);
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut worker_call = pin!(worker_drive.call(&mut worker, &wait, ()));
+        assert!(worker_call.as_mut().poll(&mut cx).is_pending());
+
+        let main_error =
+            block_on(main_drive.call(&mut main, &trap, ())).expect_err("the main thread traps");
+        let result = fixture
+            .context
+            .end_main_part::<()>(Err(map_program_runtime_error(main_error)));
+
+        assert_eq!(
+            fixture.instance.pending_kill(),
+            Some(crate::KillReason::StoreFailed),
+            "main's failure condemns the compile before its workers are joined"
+        );
+        match worker_call.as_mut().poll(&mut cx) {
+            Poll::Ready(Err(error)) => {
+                assert_eq!(
+                    error.downcast_ref::<crate::InstanceKilled>(),
+                    Some(&crate::InstanceKilled {
+                        reason: crate::KillReason::StoreFailed
+                    })
+                );
+                assert!(
+                    fixture.context.condemn_for_store_end(error).is_none(),
+                    "a worker ended by the condemnation reports no trap"
+                );
+            }
+            other => panic!("the condemnation ends the parked worker, got {other:?}"),
+        }
+        let mut reports = [report(None)];
+        let Err(error) = first_trap_wins(result, &mut reports) else {
+            panic!("a compile whose main thread trapped fails");
+        };
+        assert!(
+            message_of(&error).contains("main trapped"),
+            "the requester gets main's trap, got {error}"
+        );
+    }
+
+    /// A trap on a worker while main waits on it condemns the compile: main's
+    /// call ends with the kill, and the error handed to the requester is the
+    /// worker's trap, not the condemnation main ended with.
+    #[test]
+    fn a_trap_on_a_worker_ends_main_and_is_the_compiles_error() {
+        let fixture = CompileFixture::new();
+        let (mut main, main_drive) = fixture.open_store();
+        let (mut worker, worker_drive) = fixture.open_store();
+        let wait = parked(&mut main);
+        let trap = trapping(&mut worker, "worker trapped");
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut main_call = pin!(main_drive.call(&mut main, &wait, ()));
+        assert!(main_call.as_mut().poll(&mut cx).is_pending());
+
+        let worker_error =
+            block_on(worker_drive.call(&mut worker, &trap, ())).expect_err("the worker traps");
+        let worker_trap = fixture.context.condemn_for_store_end(worker_error);
+        assert!(
+            worker_trap.is_some(),
+            "the trap that condemns the compile carries its error"
+        );
+        assert_eq!(
+            fixture.instance.pending_kill(),
+            Some(crate::KillReason::StoreFailed)
+        );
+
+        let Poll::Ready(Err(kill)) = main_call.as_mut().poll(&mut cx) else {
+            panic!("the condemnation ends main's parked call");
+        };
+        let kill = map_program_runtime_error(kill);
+        assert!(
+            message_of(&kill).contains("terminated"),
+            "main ended by the kill, got {kill}"
+        );
+        let result = fixture.context.end_main_part::<()>(Err(kill));
+        let mut reports = [report(None), report(worker_trap)];
+        let Err(error) = first_trap_wins(result, &mut reports) else {
+            panic!("a compile whose worker trapped fails");
+        };
+        assert!(
+            message_of(&error).contains("worker trapped"),
+            "the requester gets the worker's trap, not the kill, got {error}"
+        );
+        assert!(!message_of(&error).contains("terminated"));
+    }
+
+    /// A store that ends by a kill does not condemn the compile again: the
+    /// first condemnation's reason stands, and the end is no trap.
+    #[test]
+    fn a_store_that_ends_by_a_kill_does_not_condemn_with_the_trap_reason() {
+        // A kill the registry has not recorded: only the error's type says it
+        // is one, so the decision is the end's, not the registry's.
+        let fixture = CompileFixture::new();
+        let (mut worker, drive) = fixture.open_store();
+        let killed = wasmtime::Func::wrap(&mut worker, || -> wasmtime::Result<()> {
+            Err(wasmtime::Error::new(crate::InstanceKilled {
+                reason: crate::KillReason::Operator,
+            }))
+        })
+        .typed::<(), ()>(&worker)
+        .expect("the kill is a () -> () function");
+        let error = block_on(drive.call(&mut worker, &killed, ())).expect_err("the call ends");
+        assert!(fixture.context.condemn_for_store_end(error).is_none());
+        assert_eq!(
+            fixture.instance.pending_kill(),
+            None,
+            "a store ended by a kill is not a trap and condemns nothing"
+        );
+
+        // A real kill, then a worker parked in the wait it ends.
+        let fixture = CompileFixture::new();
+        let (mut worker, drive) = fixture.open_store();
+        let wait = parked(&mut worker);
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut call = pin!(drive.call(&mut worker, &wait, ()));
+        assert!(call.as_mut().poll(&mut cx).is_pending());
+        fixture
+            .registry
+            .request_kill(fixture.instance.id(), crate::KillReason::Operator, 0);
+        let Poll::Ready(Err(error)) = call.as_mut().poll(&mut cx) else {
+            panic!("the kill ends the parked worker");
+        };
+        assert!(fixture.context.condemn_for_store_end(error).is_none());
+        assert_eq!(
+            fixture.instance.pending_kill(),
+            Some(crate::KillReason::Operator),
+            "the first reason stands"
+        );
+    }
+
+    /// A trap after another store condemned the compile is not the first
+    /// trap: it reports no error, and the first condemnation's reason stands.
+    #[test]
+    fn only_the_first_trap_reports_its_error() {
+        let fixture = CompileFixture::new();
+        let (mut first, first_drive) = fixture.open_store();
+        let (mut second, second_drive) = fixture.open_store();
+        let first_trap = trapping(&mut first, "first trapped");
+        let second_trap = trapping(&mut second, "second trapped");
+        let first_error =
+            block_on(first_drive.call(&mut first, &first_trap, ())).expect_err("traps");
+        let second_error =
+            block_on(second_drive.call(&mut second, &second_trap, ())).expect_err("traps");
+
+        let first = fixture.context.condemn_for_store_end(first_error);
+        let second = fixture.context.condemn_for_store_end(second_error);
+        assert!(first.is_some());
+        assert!(second.is_none());
+        assert_eq!(
+            fixture.instance.pending_kill(),
+            Some(crate::KillReason::StoreFailed)
         );
     }
 }

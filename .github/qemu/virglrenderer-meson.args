@@ -1,0 +1,5 @@
+--buildtype=release
+--libdir=lib
+-Dplatforms=egl
+-Dvenus=true
+-Dtests=false

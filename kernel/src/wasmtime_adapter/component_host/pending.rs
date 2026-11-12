@@ -36,7 +36,7 @@ use futures::channel::oneshot;
 /// the owner task a request that destroys the thing, and never waits.
 pub(crate) struct PendingReply<T, E, Undo>
 where
-    T: Copy,
+    T: Clone,
     Undo: FnOnce(T),
 {
     answer: oneshot::Receiver<Result<T, E>>,
@@ -49,7 +49,7 @@ where
 
 impl<T, E, Undo> PendingReply<T, E, Undo>
 where
-    T: Copy,
+    T: Clone,
     Undo: FnOnce(T),
 {
     /// Hold `answer`, the receiving end of a request about to be
@@ -72,7 +72,7 @@ where
         let answer = (&mut self.answer).await;
         match answer {
             Ok(Ok(made)) => {
-                self.made = Some(made);
+                self.made = Some(made.clone());
                 Ok(made)
             }
             Ok(Err(error)) => {
@@ -95,14 +95,14 @@ where
 
 impl<T, E, Undo> Drop for PendingReply<T, E, Undo>
 where
-    T: Copy,
+    T: Clone,
     Undo: FnOnce(T),
 {
     fn drop(&mut self) {
         let Some(undo) = self.undo.take() else {
             return;
         };
-        let made = match self.made {
+        let made = match self.made.take() {
             Some(made) => Some(made),
             None => {
                 // Every send after this fails, and the owner task undoes

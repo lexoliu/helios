@@ -165,3 +165,31 @@ def test_the_workflow_measures_one_lane() -> None:
     assert lane.github_matrix_entry()["rpc-transport"] == "vsock"
     assert lane.runs_on(advisory=True) == "ubuntu-24.04"
     assert lane.runs_on(advisory=False) == "helios-bench-x86-kvm"
+
+
+def lane_with(**overrides) -> dict:
+    """The aarch64-hvf lane as the manifest states it, with ``overrides``."""
+    return {**load_manifest().lane("aarch64-hvf").model_dump(), **overrides}
+
+
+def test_the_two_guests_of_a_lane_have_one_memory_size() -> None:
+    """Both columns compare alike only on equal guests (#491): a lane whose
+    memory fields differ without a stated reason fails at load, naming both."""
+    lane = load_manifest().lane("aarch64-hvf")
+    assert lane.memory == lane.linux_vm_memory
+    assert lane.memory_differs_because is None
+    with pytest.raises(ValueError, match=r"memory = '2G' and the Linux guest linux_vm_memory = '4G'"):
+        Lane.model_validate(lane_with(linux_vm_memory="4G"))
+    stated = Lane.model_validate(lane_with(linux_vm_memory="4G", memory_differs_because="a reason"))
+    assert stated.linux_vm_memory == "4G"
+
+
+def test_a_reason_for_unequal_memory_is_refused_on_equal_guests() -> None:
+    with pytest.raises(ValueError, match="states memory_differs_because"):
+        Lane.model_validate(lane_with(memory_differs_because="stale"))
+
+
+def test_a_lane_that_sets_its_guests_apart_says_why() -> None:
+    lane = load_manifest().lane("x86-64-kvm")
+    assert lane.memory != lane.linux_vm_memory
+    assert lane.memory_differs_because

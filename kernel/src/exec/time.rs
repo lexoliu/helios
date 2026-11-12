@@ -226,6 +226,16 @@ mod tests {
 
         fn park_current(&self) {}
 
+        type WakeOnlyMask = ();
+
+        fn mask_to_wake_only(&self) {
+            panic!("this test platform never freezes")
+        }
+
+        fn park_wake_only(&self, _: &core::sync::atomic::AtomicU8, _: u8) {
+            panic!("this test platform never freezes")
+        }
+
         fn start_processor(&self, _: ProcessorId) {}
 
         fn wake_processor(&self, _: ProcessorId) {}

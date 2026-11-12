@@ -122,6 +122,7 @@ mod guest {
                         stdout: result.output.stdout,
                         stderr: result.output.stderr,
                     },
+                    launch_nanos: result.launch_nanos,
                 })
                 .map_err(|error| ExecError {
                     kind: convert_exec_error_kind(error.kind),

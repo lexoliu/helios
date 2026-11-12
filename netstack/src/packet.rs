@@ -1056,12 +1056,33 @@ impl<'a> Icmpv4Packet<'a> {
         sequence: u16,
         payload: &[u8],
     ) -> Option<usize> {
+        Self::encode_echo(output, 8, identifier, sequence, payload)
+    }
+
+    /// Encodes the Echo Reply (RFC 792) that answers a request with the
+    /// same `identifier`, `sequence` and `payload`.
+    pub fn encode_echo_reply(
+        output: &mut [u8],
+        identifier: u16,
+        sequence: u16,
+        payload: &[u8],
+    ) -> Option<usize> {
+        Self::encode_echo(output, 0, identifier, sequence, payload)
+    }
+
+    fn encode_echo(
+        output: &mut [u8],
+        kind: u8,
+        identifier: u16,
+        sequence: u16,
+        payload: &[u8],
+    ) -> Option<usize> {
         let len = Self::HEADER_LEN.checked_add(payload.len())?;
         if output.len() < len {
             return None;
         }
         output[..len].fill(0);
-        output[0] = 8;
+        output[0] = kind;
         write_u16(output, 4, identifier)?;
         write_u16(output, 6, sequence)?;
         output[Self::HEADER_LEN..len].copy_from_slice(payload);
@@ -1212,6 +1233,26 @@ impl<'a> NdpOptions<'a> {
 
     pub fn iter(self) -> NdpOptionIter<'a> {
         NdpOptionIter { bytes: self.bytes }
+    }
+
+    /// Whether the list is cut into whole options: every option has a
+    /// nonzero length that fits the bytes that remain, and nothing is
+    /// left over. RFC 4861 section 7.1 has a message with an option of
+    /// length zero discarded; the iterator stops at one, so this is
+    /// what tells a malformed list from a short one.
+    pub fn is_well_formed(self) -> bool {
+        let mut rest = self.bytes;
+        while !rest.is_empty() {
+            let Some(&units) = rest.get(1) else {
+                return false;
+            };
+            let len = usize::from(units) * 8;
+            if len == 0 || len > rest.len() {
+                return false;
+            }
+            rest = &rest[len..];
+        }
+        true
     }
 
     /// First Source Link-Layer Address option, if any.
@@ -1454,12 +1495,53 @@ impl<'a> Icmpv6Packet<'a> {
         sequence: u16,
         payload: &[u8],
     ) -> Option<usize> {
+        Self::encode_echo(
+            output,
+            128,
+            source,
+            destination,
+            identifier,
+            sequence,
+            payload,
+        )
+    }
+
+    /// Encodes the Echo Reply (RFC 4443 section 4.2) that answers a
+    /// request with the same `identifier`, `sequence` and `payload`.
+    pub fn encode_echo_reply(
+        output: &mut [u8],
+        source: Ipv6Address,
+        destination: Ipv6Address,
+        identifier: u16,
+        sequence: u16,
+        payload: &[u8],
+    ) -> Option<usize> {
+        Self::encode_echo(
+            output,
+            129,
+            source,
+            destination,
+            identifier,
+            sequence,
+            payload,
+        )
+    }
+
+    fn encode_echo(
+        output: &mut [u8],
+        kind: u8,
+        source: Ipv6Address,
+        destination: Ipv6Address,
+        identifier: u16,
+        sequence: u16,
+        payload: &[u8],
+    ) -> Option<usize> {
         let len = Self::ECHO_HEADER_LEN.checked_add(payload.len())?;
         if output.len() < len {
             return None;
         }
         output[..len].fill(0);
-        output[0] = 128;
+        output[0] = kind;
         write_u16(output, 4, identifier)?;
         write_u16(output, 6, sequence)?;
         output[Self::ECHO_HEADER_LEN..len].copy_from_slice(payload);
@@ -1584,6 +1666,27 @@ fn write_u32(bytes: &mut [u8], offset: usize, value: u32) -> Option<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ndp_options_are_well_formed_only_when_every_option_has_a_length_and_fits() {
+        let link_layer = [1u8, 1, 2, 0, 0, 0, 0, 1];
+        assert!(NdpOptions::new(&[]).is_well_formed());
+        assert!(NdpOptions::new(&link_layer).is_well_formed());
+        let mut two = [0u8; 16];
+        two[..8].copy_from_slice(&link_layer);
+        two[8..].copy_from_slice(&link_layer);
+        assert!(NdpOptions::new(&two).is_well_formed());
+        assert!(!NdpOptions::new(&[1, 0, 0, 0, 0, 0, 0, 0]).is_well_formed());
+        assert!(!NdpOptions::new(&[1, 2, 0, 0, 0, 0, 0, 0]).is_well_formed());
+        assert!(!NdpOptions::new(&[1]).is_well_formed());
+        let mut trailing = [0u8; 16];
+        trailing[..8].copy_from_slice(&link_layer);
+        trailing[8] = 1;
+        assert!(!NdpOptions::new(&trailing[..9]).is_well_formed());
+        // A good option followed by one of length zero.
+        trailing[9] = 0;
+        assert!(!NdpOptions::new(&trailing).is_well_formed());
+    }
 
     #[test]
     fn tcp_options_parse_mss_sack_window_scale_and_timestamp() {
