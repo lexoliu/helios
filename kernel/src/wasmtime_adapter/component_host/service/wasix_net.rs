@@ -503,7 +503,7 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let host = match p1_read_path(caller, memory, host, host_len) {
+    let host = match p1_read_path(caller, memory, GuestAddress::wasm32(host), host_len) {
         Ok(host) => host,
         Err(_) => return p1::errno::FAULT,
     };
@@ -515,15 +515,9 @@ where
         Err(error) => return p1_errno_from_dns_error(error),
     };
     let returned = resolved.len().min(naddrs as usize);
+    let addrs = GuestAddress::wasm32(addrs);
     for (index, address) in resolved.iter().take(returned).enumerate() {
-        let offset = match (index as u32).checked_mul(WASIX_ADDR_IP_SIZE) {
-            Some(offset) => offset,
-            None => return p1::errno::OVERFLOW,
-        };
-        let entry = match addrs.checked_add(offset) {
-            Some(entry) => entry,
-            None => return p1::errno::OVERFLOW,
-        };
+        let entry = addrs.offset(index as u64 * u64::from(WASIX_ADDR_IP_SIZE));
         let status = write_wasix_addr_ip(caller, memory, entry, *address);
         if status != p1::errno::SUCCESS {
             return status;
@@ -533,7 +527,7 @@ where
         Ok(returned) => returned,
         Err(_) => return p1::errno::OVERFLOW,
     };
-    p1_write_u32(caller, memory, ret_naddrs, returned)
+    p1_write_u32(caller, memory, GuestAddress::wasm32(ret_naddrs), returned)
 }
 
 pub(super) fn wasix_network_admin_service<CpuImpl, Net, HostFs>(
@@ -681,7 +675,7 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let cidr = match wasix_read_addr_cidr_ip4(caller, memory, addr) {
+    let cidr = match wasix_read_addr_cidr_ip4(caller, memory, GuestAddress::wasm32(addr)) {
         Ok(cidr) => cidr,
         Err(status) => return status,
     };
@@ -711,7 +705,7 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let address = match wasix_read_addr_ip4(caller, memory, addr) {
+    let address = match wasix_read_addr_ip4(caller, memory, GuestAddress::wasm32(addr)) {
         Ok(address) => address,
         Err(status) => return status,
     };
@@ -773,7 +767,7 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    p1_write_memory(caller, memory, ret_mac, &mac.octets())
+    p1_write_memory(caller, memory, GuestAddress::wasm32(ret_mac), &mac.octets())
 }
 
 pub(super) async fn wasix_port_addr_list<CpuImpl, Net, HostFs>(
@@ -789,6 +783,7 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
+    let (addrs, naddrs) = (GuestAddress::wasm32(addrs), GuestAddress::wasm32(naddrs));
     let capacity = match p1_try_read_u32(caller, memory, naddrs) {
         Ok(capacity) => capacity,
         Err(_) => return p1::errno::FAULT,
@@ -817,14 +812,7 @@ where
         return p1::errno::OVERFLOW;
     };
     for (index, cidr) in addresses.iter().enumerate() {
-        let offset = match (index as u32).checked_mul(WASIX_ADDR_CIDR_SIZE) {
-            Some(offset) => offset,
-            None => return p1::errno::OVERFLOW,
-        };
-        let entry = match addrs.checked_add(offset) {
-            Some(entry) => entry,
-            None => return p1::errno::OVERFLOW,
-        };
+        let entry = addrs.offset(index as u64 * u64::from(WASIX_ADDR_CIDR_SIZE));
         let status = write_wasix_addr_cidr_ip4(caller, memory, entry, *cidr);
         if status != p1::errno::SUCCESS {
             return status;
@@ -845,7 +833,7 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let gateway = match wasix_read_addr_ip4(caller, memory, addr) {
+    let gateway = match wasix_read_addr_ip4(caller, memory, GuestAddress::wasm32(addr)) {
         Ok(gateway) => gateway,
         Err(status) => return status,
     };
@@ -878,19 +866,21 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let destination = match wasix_read_addr_cidr_ip4(caller, memory, cidr) {
+    let destination = match wasix_read_addr_cidr_ip4(caller, memory, GuestAddress::wasm32(cidr)) {
         Ok(destination) => destination,
         Err(status) => return status,
     };
-    let gateway = match wasix_read_addr_ip4(caller, memory, router) {
+    let gateway = match wasix_read_addr_ip4(caller, memory, GuestAddress::wasm32(router)) {
         Ok(gateway) => gateway,
         Err(status) => return status,
     };
-    let preferred = match wasix_read_optional_timestamp(caller, memory, preferred) {
-        Ok(value) => value,
-        Err(status) => return status,
-    };
-    let expires = match wasix_read_optional_timestamp(caller, memory, expires) {
+    let preferred =
+        match wasix_read_optional_timestamp(caller, memory, GuestAddress::wasm32(preferred)) {
+            Ok(value) => value,
+            Err(status) => return status,
+        };
+    let expires = match wasix_read_optional_timestamp(caller, memory, GuestAddress::wasm32(expires))
+    {
         Ok(value) => value,
         Err(status) => return status,
     };
@@ -921,7 +911,7 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let destination = match wasix_read_addr_ip4(caller, memory, cidr) {
+    let destination = match wasix_read_addr_ip4(caller, memory, GuestAddress::wasm32(cidr)) {
         Ok(destination) => destination,
         Err(status) => return status,
     };
@@ -983,6 +973,7 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
+    let (routes, nroutes) = (GuestAddress::wasm32(routes), GuestAddress::wasm32(nroutes));
     let capacity = match p1_try_read_u32(caller, memory, nroutes) {
         Ok(capacity) => capacity,
         Err(_) => return p1::errno::FAULT,
@@ -1008,14 +999,7 @@ where
         return p1::errno::OVERFLOW;
     }
     for (index, route) in route_entries.iter().enumerate() {
-        let offset = match (index as u32).checked_mul(WASIX_ROUTE_SIZE) {
-            Some(offset) => offset,
-            None => return p1::errno::OVERFLOW,
-        };
-        let entry = match routes.checked_add(offset) {
-            Some(entry) => entry,
-            None => return p1::errno::OVERFLOW,
-        };
+        let entry = routes.offset(index as u64 * u64::from(WASIX_ROUTE_SIZE));
         let status = write_wasix_route_ip4(caller, memory, entry, *route);
         if status != p1::errno::SUCCESS {
             return status;
@@ -1041,7 +1025,12 @@ where
     if status != p1::errno::SUCCESS {
         return status;
     }
-    p1_write_u8(caller, memory, ret_status, WASIX_SOCK_STATUS_OPENED)
+    p1_write_u8(
+        caller,
+        memory,
+        GuestAddress::wasm32(ret_status),
+        WASIX_SOCK_STATUS_OPENED,
+    )
 }
 
 pub(super) fn wasix_sock_addr_local<CpuImpl, Net, HostFs>(
@@ -1066,7 +1055,13 @@ where
             ..
         }))) => {
             let (address, local_port) = (family.unspecified_address(), *local_port);
-            write_wasix_addr_port(caller, memory, ret_addr, address, local_port)
+            write_wasix_addr_port(
+                caller,
+                memory,
+                GuestAddress::wasm32(ret_addr),
+                address,
+                local_port,
+            )
         }
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
             WasixTcpSocket::Bound {
@@ -1077,10 +1072,16 @@ where
             },
         ))) => {
             let (address, local_port) = (family.unspecified_address(), *local_port);
-            write_wasix_addr_port(caller, memory, ret_addr, address, local_port)
+            write_wasix_addr_port(
+                caller,
+                memory,
+                GuestAddress::wasm32(ret_addr),
+                address,
+                local_port,
+            )
         }
         Some(Preview1Descriptor::Socket(_)) => {
-            write_wasix_addr_port_unspec(caller, memory, ret_addr)
+            write_wasix_addr_port_unspec(caller, memory, GuestAddress::wasm32(ret_addr))
         }
         Some(_) => p1::errno::NOTSOCK,
         None => p1::errno::BADF,
@@ -1107,9 +1108,15 @@ where
                 peer_port,
                 ..
             },
-        ))) => write_wasix_addr_port(caller, memory, ret_addr, *peer_address, *peer_port),
+        ))) => write_wasix_addr_port(
+            caller,
+            memory,
+            GuestAddress::wasm32(ret_addr),
+            *peer_address,
+            *peer_port,
+        ),
         Some(Preview1Descriptor::Socket(_)) => {
-            write_wasix_addr_port_unspec(caller, memory, ret_addr)
+            write_wasix_addr_port_unspec(caller, memory, GuestAddress::wasm32(ret_addr))
         }
         Some(_) => p1::errno::NOTSOCK,
         None => p1::errno::BADF,
@@ -1211,7 +1218,7 @@ where
         Ok(fd) => fd,
         Err(errno) => return errno,
     };
-    p1_write_u32(caller, memory, ret_fd, fd)
+    p1_write_u32(caller, memory, GuestAddress::wasm32(ret_fd), fd)
 }
 
 pub(super) fn wasix_sock_pair<CpuImpl, Net, HostFs>(
@@ -1260,11 +1267,11 @@ where
             return errno;
         }
     };
-    let status = p1_write_u32(caller, memory, ret_fd0, fd0);
+    let status = p1_write_u32(caller, memory, GuestAddress::wasm32(ret_fd0), fd0);
     if status != p1::errno::SUCCESS {
         return status;
     }
-    p1_write_u32(caller, memory, ret_fd1, fd1)
+    p1_write_u32(caller, memory, GuestAddress::wasm32(ret_fd1), fd1)
 }
 
 pub(super) fn wasix_sock_descriptor_unavailable<CpuImpl, Net, HostFs>(
@@ -1406,7 +1413,7 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    p1_write_wasix_bool(caller, memory, ret_flag, flag)
+    p1_write_wasix_bool(caller, memory, GuestAddress::wasm32(ret_flag), flag)
 }
 
 pub(super) fn wasix_sock_set_opt_time<CpuImpl, Net, HostFs>(
@@ -1423,7 +1430,7 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let time = match wasix_read_optional_timestamp(caller, memory, time) {
+    let time = match wasix_read_optional_timestamp(caller, memory, GuestAddress::wasm32(time)) {
         Ok(time) => time,
         Err(errno) => return errno,
     };
@@ -1461,7 +1468,7 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    p1_write_wasix_optional_timestamp(caller, memory, ret_time, time)
+    p1_write_wasix_optional_timestamp(caller, memory, GuestAddress::wasm32(ret_time), time)
 }
 
 pub(super) fn wasix_sock_set_opt_size<CpuImpl, Net, HostFs>(
@@ -1568,7 +1575,7 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    p1_write_u64(caller, memory, ret_size, size)
+    p1_write_u64(caller, memory, GuestAddress::wasm32(ret_size), size)
 }
 
 pub(super) fn wasix_sock_multicast_v6<CpuImpl, Net, HostFs>(
@@ -1597,10 +1604,10 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    if let Err(errno) = wasix_validate_addr_ip6(caller, memory, multiaddr) {
+    if let Err(errno) = wasix_validate_addr_ip6(caller, memory, GuestAddress::wasm32(multiaddr)) {
         return errno;
     }
-    if let Err(errno) = wasix_validate_addr_ip6(caller, memory, interface) {
+    if let Err(errno) = wasix_validate_addr_ip6(caller, memory, GuestAddress::wasm32(interface)) {
         return errno;
     }
     p1::errno::NOTSUP
@@ -1633,11 +1640,11 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let group = match wasix_read_addr_ip4(caller, memory, multiaddr) {
+    let group = match wasix_read_addr_ip4(caller, memory, GuestAddress::wasm32(multiaddr)) {
         Ok(group) => group,
         Err(errno) => return errno,
     };
-    let interface = match wasix_read_addr_ip4(caller, memory, interface) {
+    let interface = match wasix_read_addr_ip4(caller, memory, GuestAddress::wasm32(interface)) {
         Ok(interface) => interface,
         Err(errno) => return errno,
     };
@@ -1679,7 +1686,7 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let (_, port) = match wasix_read_addr_port(caller, memory, addr) {
+    let (_, port) = match wasix_read_addr_port(caller, memory, GuestAddress::wasm32(addr)) {
         Ok(addr) => addr,
         Err(errno) => return errno,
     };
@@ -1877,13 +1884,19 @@ where
         let _ = caller.data_mut().descriptors.close(accepted_fd as i32);
         return p1::errno::FAULT;
     };
-    let status = p1_write_u32(caller, memory, ret_fd, accepted_fd);
+    let status = p1_write_u32(caller, memory, GuestAddress::wasm32(ret_fd), accepted_fd);
     if status != p1::errno::SUCCESS {
         let _ = caller.data_mut().descriptors.close(accepted_fd as i32);
         return status;
     }
     if ret_addr != 0 {
-        return write_wasix_addr_port(caller, memory, ret_addr, peer_address, accepted.port);
+        return write_wasix_addr_port(
+            caller,
+            memory,
+            GuestAddress::wasm32(ret_addr),
+            peer_address,
+            accepted.port,
+        );
     }
     p1::errno::SUCCESS
 }
@@ -1923,10 +1936,12 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let (Some(address), port) = (match wasix_read_addr_port(caller, memory, addr) {
-        Ok(addr) => addr,
-        Err(errno) => return errno,
-    }) else {
+    let (Some(address), port) =
+        (match wasix_read_addr_port(caller, memory, GuestAddress::wasm32(addr)) {
+            Ok(addr) => addr,
+            Err(errno) => return errno,
+        })
+    else {
         return p1::errno::INVAL;
     };
     let status = caller.data().require_tcp_authority();
@@ -2051,6 +2066,12 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
+    let (iovs, ret_size, ret_flags, ret_addr) = (
+        GuestAddress::wasm32(iovs),
+        GuestAddress::wasm32(ret_size),
+        GuestAddress::wasm32(ret_flags),
+        GuestAddress::wasm32(ret_addr),
+    );
     let layout = match p1_read_iovs_with_byte_len(caller, memory, iovs, iovs_len) {
         Ok(layout) => layout,
         Err(errno) => return errno,
@@ -2212,6 +2233,7 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
+    let (iovs, ret_size) = (GuestAddress::wasm32(iovs), GuestAddress::wasm32(ret_size));
     let layout = match p1_read_iovs_with_byte_len(caller, memory, iovs, iovs_len) {
         Ok(layout) => layout,
         Err(errno) => return errno,
@@ -2232,10 +2254,12 @@ where
     match descriptor {
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(socket))) => {
             let bytes = preview1_ranges_to_vec(memory.base as *const u8, &ranges, layout.byte_len);
-            let (Some(address), port) = (match wasix_read_addr_port(caller, memory, addr) {
-                Ok(addr) => addr,
-                Err(errno) => return errno,
-            }) else {
+            let (Some(address), port) =
+                (match wasix_read_addr_port(caller, memory, GuestAddress::wasm32(addr)) {
+                    Ok(addr) => addr,
+                    Err(errno) => return errno,
+                })
+            else {
                 return p1::errno::INVAL;
             };
             let (socket, send_timeout) = match socket {
@@ -2454,7 +2478,7 @@ where
             if let Err(error) = service.tcp_write_all(stream.id(), pieces, timeout).await {
                 return p1_errno_from_tcp_error_for_fdflags(error, fdflags);
             }
-            p1_write_u64(caller, memory, ret_size, written)
+            p1_write_u64(caller, memory, GuestAddress::wasm32(ret_size), written)
         }
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { writer, .. })) => {
             let fdflags = match caller.data().descriptors.fdflags(out_fd) {
@@ -2470,7 +2494,7 @@ where
             } else if writer.write(bytes).await.is_err() {
                 return p1::errno::IO;
             }
-            p1_write_u64(caller, memory, ret_size, written)
+            p1_write_u64(caller, memory, GuestAddress::wasm32(ret_size), written)
         }
         Some(Preview1Descriptor::Socket(_)) => p1::errno::INVAL,
         Some(_) => p1::errno::NOTSOCK,
@@ -2484,19 +2508,23 @@ where
 pub(super) fn wasix_read_addr_port<T>(
     caller: &mut Caller<'_, T>,
     memory: Preview1Memory,
-    ptr: u32,
+    ptr: GuestAddress,
 ) -> Result<(Option<crate::NetworkIpAddress>, u16), i32> {
     let tag = p1_try_read_u8(caller, memory, ptr).map_err(|_| p1::errno::FAULT)?;
     match tag {
         WASIX_ADDRESS_FAMILY_UNSPEC => Ok((None, 0)),
         WASIX_ADDRESS_FAMILY_IP_INET4 => {
-            let port = p1_try_read_u16(caller, memory, ptr + WASIX_ADDR_PORT_UNION_OFFSET)
-                .map_err(|_| p1::errno::FAULT)?;
+            let port = p1_try_read_u16(
+                caller,
+                memory,
+                ptr.offset(u64::from(WASIX_ADDR_PORT_UNION_OFFSET)),
+            )
+            .map_err(|_| p1::errno::FAULT)?;
             let mut octets = [0_u8; 4];
             p1_read_memory_into(
                 caller,
                 memory,
-                ptr + WASIX_ADDR_PORT_IP4_ADDRESS_OFFSET,
+                ptr.offset(u64::from(WASIX_ADDR_PORT_IP4_ADDRESS_OFFSET)),
                 &mut octets,
             )
             .map_err(|_| p1::errno::FAULT)?;
@@ -2508,13 +2536,17 @@ pub(super) fn wasix_read_addr_port<T>(
             ))
         }
         WASIX_ADDRESS_FAMILY_IP_INET6 => {
-            let port = p1_try_read_u16(caller, memory, ptr + WASIX_ADDR_PORT_UNION_OFFSET)
-                .map_err(|_| p1::errno::FAULT)?;
+            let port = p1_try_read_u16(
+                caller,
+                memory,
+                ptr.offset(u64::from(WASIX_ADDR_PORT_UNION_OFFSET)),
+            )
+            .map_err(|_| p1::errno::FAULT)?;
             let mut octets = [0_u8; 16];
             p1_read_memory_into(
                 caller,
                 memory,
-                ptr + WASIX_ADDR_PORT_IP6_ADDRESS_OFFSET,
+                ptr.offset(u64::from(WASIX_ADDR_PORT_IP6_ADDRESS_OFFSET)),
                 &mut octets,
             )
             .map_err(|_| p1::errno::FAULT)?;
@@ -2533,7 +2565,7 @@ pub(super) fn wasix_read_addr_port<T>(
 pub(super) fn wasix_read_addr_ip4<T>(
     caller: &mut Caller<'_, T>,
     memory: Preview1Memory,
-    ptr: u32,
+    ptr: GuestAddress,
 ) -> Result<crate::Ipv4Address, i32> {
     let tag = p1_try_read_u8(caller, memory, ptr).map_err(|_| p1::errno::FAULT)?;
     match tag {
@@ -2542,7 +2574,7 @@ pub(super) fn wasix_read_addr_ip4<T>(
             p1_read_memory_into(
                 caller,
                 memory,
-                ptr + WASIX_ADDR_IP_UNION_OFFSET,
+                ptr.offset(u64::from(WASIX_ADDR_IP_UNION_OFFSET)),
                 &mut octets,
             )
             .map_err(|_| p1::errno::FAULT)?;
@@ -2557,7 +2589,7 @@ pub(super) fn wasix_read_addr_ip4<T>(
 pub(super) fn wasix_validate_addr_ip6<T>(
     caller: &mut Caller<'_, T>,
     memory: Preview1Memory,
-    ptr: u32,
+    ptr: GuestAddress,
 ) -> Result<(), i32> {
     let tag = p1_try_read_u8(caller, memory, ptr).map_err(|_| p1::errno::FAULT)?;
     wasix_addr_ip6_family_status(tag)?;
@@ -2565,7 +2597,7 @@ pub(super) fn wasix_validate_addr_ip6<T>(
     p1_read_memory_into(
         caller,
         memory,
-        ptr + WASIX_ADDR_IP_UNION_OFFSET,
+        ptr.offset(u64::from(WASIX_ADDR_IP_UNION_OFFSET)),
         &mut octets,
     )
     .map_err(|_| p1::errno::FAULT)
@@ -2583,7 +2615,7 @@ pub(super) fn wasix_addr_ip6_family_status(tag: u8) -> Result<(), i32> {
 pub(super) fn wasix_read_addr_cidr_ip4<T>(
     caller: &mut Caller<'_, T>,
     memory: Preview1Memory,
-    ptr: u32,
+    ptr: GuestAddress,
 ) -> Result<crate::Ipv4Cidr, i32> {
     let tag = p1_try_read_u8(caller, memory, ptr).map_err(|_| p1::errno::FAULT)?;
     match tag {
@@ -2592,12 +2624,16 @@ pub(super) fn wasix_read_addr_cidr_ip4<T>(
             p1_read_memory_into(
                 caller,
                 memory,
-                ptr + WASIX_ADDR_CIDR_IP4_ADDRESS_OFFSET,
+                ptr.offset(u64::from(WASIX_ADDR_CIDR_IP4_ADDRESS_OFFSET)),
                 &mut octets,
             )
             .map_err(|_| p1::errno::FAULT)?;
-            let prefix = p1_try_read_u8(caller, memory, ptr + WASIX_ADDR_CIDR_IP4_PREFIX_OFFSET)
-                .map_err(|_| p1::errno::FAULT)?;
+            let prefix = p1_try_read_u8(
+                caller,
+                memory,
+                ptr.offset(u64::from(WASIX_ADDR_CIDR_IP4_PREFIX_OFFSET)),
+            )
+            .map_err(|_| p1::errno::FAULT)?;
             if prefix > 32 {
                 return Err(p1::errno::INVAL);
             }
@@ -2615,14 +2651,18 @@ pub(super) fn wasix_read_addr_cidr_ip4<T>(
 pub(super) fn wasix_read_option_pid<T>(
     caller: &mut Caller<'_, T>,
     memory: Preview1Memory,
-    ptr: u32,
+    ptr: GuestAddress,
 ) -> Result<Option<u32>, i32> {
     let tag = p1_try_read_u8(caller, memory, ptr).map_err(|_| p1::errno::FAULT)?;
     match tag {
         WASIX_OPTION_NONE => Ok(None),
-        WASIX_OPTION_SOME => p1_try_read_u32(caller, memory, ptr + WASIX_OPTION_UNION_U32_OFFSET)
-            .map(Some)
-            .map_err(|_| p1::errno::FAULT),
+        WASIX_OPTION_SOME => p1_try_read_u32(
+            caller,
+            memory,
+            ptr.offset(u64::from(WASIX_OPTION_UNION_U32_OFFSET)),
+        )
+        .map(Some)
+        .map_err(|_| p1::errno::FAULT),
         _ => Err(p1::errno::INVAL),
     }
 }
@@ -2630,20 +2670,17 @@ pub(super) fn wasix_read_option_pid<T>(
 pub(super) fn wasix_read_optional_timestamp<T>(
     caller: &mut Caller<'_, T>,
     memory: Preview1Memory,
-    ptr: u32,
+    ptr: GuestAddress,
 ) -> Result<Option<u64>, i32> {
-    if ptr == 0 {
+    if ptr == GuestAddress::wasm32(0) {
         return Ok(None);
     }
     let tag = p1_try_read_u8(caller, memory, ptr).map_err(|_| p1::errno::FAULT)?;
     match tag {
         0 => Ok(None),
-        1 => {
-            let value = ptr.checked_add(8).ok_or(p1::errno::OVERFLOW)?;
-            p1_try_read_u64(caller, memory, value)
-                .map(Some)
-                .map_err(|_| p1::errno::FAULT)
-        }
+        1 => p1_try_read_u64(caller, memory, ptr.offset(8))
+            .map(Some)
+            .map_err(|_| p1::errno::FAULT),
         _ => Err(p1::errno::INVAL),
     }
 }
@@ -2651,20 +2688,20 @@ pub(super) fn wasix_read_optional_timestamp<T>(
 pub(super) fn p1_write_wasix_optional_timestamp<T>(
     caller: &mut Caller<'_, T>,
     memory: Preview1Memory,
-    ptr: u32,
+    ptr: GuestAddress,
     value: Option<u64>,
 ) -> i32 {
     match value {
         Some(value) => p1_write_u8(caller, memory, ptr, WASIX_OPTION_SOME).max(p1_write_u64(
             caller,
             memory,
-            ptr + WASIX_OPTION_UNION_U64_OFFSET,
+            ptr.offset(u64::from(WASIX_OPTION_UNION_U64_OFFSET)),
             value,
         )),
         None => p1_write_u8(caller, memory, ptr, WASIX_OPTION_NONE).max(p1_write_u64(
             caller,
             memory,
-            ptr + WASIX_OPTION_UNION_U64_OFFSET,
+            ptr.offset(u64::from(WASIX_OPTION_UNION_U64_OFFSET)),
             0,
         )),
     }
@@ -2691,7 +2728,7 @@ pub(super) fn wasix_socket_flag_bit(option: i32) -> Result<u32, i32> {
 pub(super) fn p1_write_wasix_bool<T>(
     caller: &mut Caller<'_, T>,
     memory: Preview1Memory,
-    ptr: u32,
+    ptr: GuestAddress,
     value: bool,
 ) -> i32 {
     p1_write_u8(caller, memory, ptr, u8::from(value))
@@ -2700,7 +2737,7 @@ pub(super) fn p1_write_wasix_bool<T>(
 pub(super) fn p1_read_wasix_bool<T>(
     caller: &mut Caller<'_, T>,
     memory: Preview1Memory,
-    ptr: u32,
+    ptr: GuestAddress,
 ) -> Result<bool, i32> {
     match p1_try_read_u8(caller, memory, ptr).map_err(|_| p1::errno::FAULT)? {
         0 => Ok(false),
@@ -2715,7 +2752,7 @@ pub(super) fn p1_read_wasix_bool<T>(
 pub(super) fn write_wasix_addr_ip<T>(
     caller: &mut Caller<'_, T>,
     memory: Preview1Memory,
-    ptr: u32,
+    ptr: GuestAddress,
     address: crate::NetworkIpAddress,
 ) -> i32 {
     match address {
@@ -2727,7 +2764,7 @@ pub(super) fn write_wasix_addr_ip<T>(
             p1_write_u8(caller, memory, ptr, WASIX_ADDRESS_FAMILY_IP_INET6).max(p1_write_memory(
                 caller,
                 memory,
-                ptr + WASIX_ADDR_IP_UNION_OFFSET,
+                ptr.offset(u64::from(WASIX_ADDR_IP_UNION_OFFSET)),
                 &octets,
             ))
         }
@@ -2737,14 +2774,14 @@ pub(super) fn write_wasix_addr_ip<T>(
 pub(super) fn write_wasix_addr_ip4<T>(
     caller: &mut Caller<'_, T>,
     memory: Preview1Memory,
-    ptr: u32,
+    ptr: GuestAddress,
     address: crate::Ipv4Address,
 ) -> i32 {
     let octets = address.octets();
     p1_write_u8(caller, memory, ptr, WASIX_ADDRESS_FAMILY_IP_INET4).max(p1_write_memory(
         caller,
         memory,
-        ptr + WASIX_ADDR_IP_UNION_OFFSET,
+        ptr.offset(u64::from(WASIX_ADDR_IP_UNION_OFFSET)),
         &octets,
     ))
 }
@@ -2752,7 +2789,7 @@ pub(super) fn write_wasix_addr_ip4<T>(
 pub(super) fn write_wasix_addr_cidr_ip4<T>(
     caller: &mut Caller<'_, T>,
     memory: Preview1Memory,
-    ptr: u32,
+    ptr: GuestAddress,
     cidr: crate::Ipv4Cidr,
 ) -> i32 {
     let mut bytes = [0_u8; WASIX_ADDR_CIDR_SIZE as usize];
@@ -2767,13 +2804,13 @@ pub(super) fn write_wasix_addr_cidr_ip4<T>(
 pub(super) fn write_wasix_route_ip4<T>(
     caller: &mut Caller<'_, T>,
     memory: Preview1Memory,
-    ptr: u32,
+    ptr: GuestAddress,
     route: crate::Ipv4Route,
 ) -> i32 {
     let status = write_wasix_addr_cidr_ip4(
         caller,
         memory,
-        ptr + WASIX_ROUTE_CIDR_OFFSET,
+        ptr.offset(u64::from(WASIX_ROUTE_CIDR_OFFSET)),
         route.destination(),
     );
     if status != p1::errno::SUCCESS {
@@ -2782,7 +2819,7 @@ pub(super) fn write_wasix_route_ip4<T>(
     let status = write_wasix_addr_ip4(
         caller,
         memory,
-        ptr + WASIX_ROUTE_ROUTER_OFFSET,
+        ptr.offset(u64::from(WASIX_ROUTE_ROUTER_OFFSET)),
         route.gateway(),
     );
     if status != p1::errno::SUCCESS {
@@ -2791,13 +2828,13 @@ pub(super) fn write_wasix_route_ip4<T>(
     p1_write_wasix_optional_timestamp(
         caller,
         memory,
-        ptr + WASIX_ROUTE_PREFERRED_UNTIL_OFFSET,
+        ptr.offset(u64::from(WASIX_ROUTE_PREFERRED_UNTIL_OFFSET)),
         route.preferred_until_nanos(),
     )
     .max(p1_write_wasix_optional_timestamp(
         caller,
         memory,
-        ptr + WASIX_ROUTE_EXPIRES_AT_OFFSET,
+        ptr.offset(u64::from(WASIX_ROUTE_EXPIRES_AT_OFFSET)),
         route.expires_at_nanos(),
     ))
 }
@@ -2807,7 +2844,7 @@ pub(super) fn write_wasix_route_ip4<T>(
 pub(super) fn write_wasix_addr_port<T>(
     caller: &mut Caller<'_, T>,
     memory: Preview1Memory,
-    ptr: u32,
+    ptr: GuestAddress,
     address: crate::NetworkIpAddress,
     port: u16,
 ) -> i32 {
@@ -2821,13 +2858,13 @@ pub(super) fn write_wasix_addr_port<T>(
                 .max(p1_write_u16(
                     caller,
                     memory,
-                    ptr + WASIX_ADDR_PORT_UNION_OFFSET,
+                    ptr.offset(u64::from(WASIX_ADDR_PORT_UNION_OFFSET)),
                     port,
                 ))
                 .max(p1_write_memory(
                     caller,
                     memory,
-                    ptr + WASIX_ADDR_PORT_IP6_ADDRESS_OFFSET,
+                    ptr.offset(u64::from(WASIX_ADDR_PORT_IP6_ADDRESS_OFFSET)),
                     &octets,
                 ))
         }
@@ -2837,7 +2874,7 @@ pub(super) fn write_wasix_addr_port<T>(
 pub(super) fn write_wasix_addr_port_ip4<T>(
     caller: &mut Caller<'_, T>,
     memory: Preview1Memory,
-    ptr: u32,
+    ptr: GuestAddress,
     address: crate::Ipv4Address,
     port: u16,
 ) -> i32 {
@@ -2846,13 +2883,13 @@ pub(super) fn write_wasix_addr_port_ip4<T>(
         .max(p1_write_u16(
             caller,
             memory,
-            ptr + WASIX_ADDR_PORT_UNION_OFFSET,
+            ptr.offset(u64::from(WASIX_ADDR_PORT_UNION_OFFSET)),
             port,
         ))
         .max(p1_write_memory(
             caller,
             memory,
-            ptr + WASIX_ADDR_PORT_IP4_ADDRESS_OFFSET,
+            ptr.offset(u64::from(WASIX_ADDR_PORT_IP4_ADDRESS_OFFSET)),
             &octets,
         ))
 }
@@ -2860,19 +2897,19 @@ pub(super) fn write_wasix_addr_port_ip4<T>(
 pub(super) fn write_wasix_addr_port_unspec<T>(
     caller: &mut Caller<'_, T>,
     memory: Preview1Memory,
-    ptr: u32,
+    ptr: GuestAddress,
 ) -> i32 {
     p1_write_u8(caller, memory, ptr, WASIX_ADDRESS_FAMILY_UNSPEC)
         .max(p1_write_u16(
             caller,
             memory,
-            ptr + WASIX_ADDR_PORT_UNION_OFFSET,
+            ptr.offset(u64::from(WASIX_ADDR_PORT_UNION_OFFSET)),
             0,
         ))
         .max(p1_write_memory(
             caller,
             memory,
-            ptr + WASIX_ADDR_PORT_IP4_ADDRESS_OFFSET,
+            ptr.offset(u64::from(WASIX_ADDR_PORT_IP4_ADDRESS_OFFSET)),
             &[0, 0, 0, 0],
         ))
 }

@@ -2,25 +2,33 @@
 //!
 //! This is the whole of what a program sees of the desktop, and the
 //! kernel implements none of it. A `create` pins the client's frame
-//! buffer, mints an identity and hands both to the compositor through
-//! the provider slot; a `commit` is one message; the events a client
-//! reads are the ones the compositor routed to it with `deliver`. The
-//! kernel validates, forwards and accounts, and never touches a pixel.
+//! buffer, mints an identity, hands the identity and the buffer to the
+//! compositor through the provider slot and, once the compositor has
+//! answered, shows the buffer at the span the client named; a `commit`
+//! is one message; the events a client reads are the ones the
+//! compositor routed to it with `deliver`. The kernel validates,
+//! forwards and accounts, and never touches a pixel.
+//!
+//! A `create` the guest stops waiting for shows nothing: the view is
+//! taken in the call's last step, after its last wait, and the window
+//! the compositor was told about goes back to the compositor's
+//! supervisor from the pending window's drop.
 //!
 //! The surfaces live in the instance's store, so they are single-owned:
 //! the resource handle a program holds carries the registry entry and
-//! the run its pixels are in, and nothing else. A handle that outlived
-//! its surface — the client dropped it, or the compositor died under it
-//! — names a window that is no longer on the desktop and is refused,
-//! rather than being answered against whatever is there now.
+//! the view its pixels are shown through, and nothing else. A handle
+//! that outlived its surface — the client dropped it, or the compositor
+//! died under it — names a window that is no longer on the desktop and
+//! is refused, rather than being answered against whatever is there now.
 //!
 //! # Concurrency contract
 //!
-//! Every call here runs on the task that owns the store, so the arena
-//! and the held list need no lock. What is shared is the registry, which
-//! carries its own, the provider queue into the compositor, which
-//! carries its own, and each surface's event queue, whose reader arms
-//! its wait before it looks.
+//! Every call here runs on the task that owns the store, so the view
+//! table and the held list need no lock, and the client's span is
+//! substituted by that task alone. What is shared is the registry,
+//! which carries its own, the provider queue into the compositor, which
+//! carries its own, the frame buffer, whose count is atomic, and each
+//! surface's event queue, whose reader arms its wait before it looks.
 
 use alloc::vec::Vec;
 use core::pin::Pin;
@@ -35,15 +43,15 @@ use wasmtime::component::{
 };
 
 use crate::ComponentHostNetwork;
+use crate::buffer::{Span, ViewId};
 use crate::component::ProviderError;
-use crate::pins::PinnedRun;
 use crate::surface::{
     SurfaceCreate, SurfaceEvents, SurfaceGeometry, SurfaceId, SurfaceRect, SurfaceRequest,
     SurfaceServiceError, SurfaceShared,
 };
 use crate::wasmtime_adapter::bindings::surface::bindings::helios::system::surface as surface_wit;
 
-use super::super::StoreData;
+use super::super::{StoreData, guest_memory, view_trap};
 
 /// Register `helios:system/surface` in a linker.
 ///
@@ -65,7 +73,9 @@ where
 /// One client window, as its store records it.
 pub struct ClientSurfaceHandle {
     shared: Arc<SurfaceShared>,
-    frame: PinnedRun,
+    /// The frame buffer's view at the client's span, ended when the
+    /// handle is dropped.
+    view: ViewId,
 }
 
 const fn to_wit_error(error: SurfaceServiceError) -> surface_wit::Error {
@@ -75,7 +85,9 @@ const fn to_wit_error(error: SurfaceServiceError) -> surface_wit::Error {
         SurfaceServiceError::UnsupportedSize => surface_wit::Error::UnsupportedSize,
         SurfaceServiceError::TooManySurfaces => surface_wit::Error::TooManySurfaces,
         SurfaceServiceError::OutOfBounds => surface_wit::Error::OutOfBounds,
-        SurfaceServiceError::WindowExhausted => surface_wit::Error::WindowExhausted,
+        SurfaceServiceError::BadSpan(_) | SurfaceServiceError::CompositorBadSpan => {
+            surface_wit::Error::BadSpan
+        }
         SurfaceServiceError::OutOfMemory => surface_wit::Error::OutOfMemory,
         SurfaceServiceError::Gone => surface_wit::Error::Gone,
         SurfaceServiceError::NotTheCompositor => surface_wit::Error::NotTheCompositor,
@@ -118,17 +130,6 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    fn buffer(
-        &mut self,
-        handle: Resource<ClientSurfaceHandle>,
-    ) -> wasmtime::Result<surface_wit::Placement> {
-        let handle = self.table.get(&handle)?;
-        Ok(surface_wit::Placement {
-            offset: handle.frame.offset,
-            length: handle.frame.bytes,
-        })
-    }
-
     fn size(
         &mut self,
         handle: Resource<ClientSurfaceHandle>,
@@ -145,19 +146,17 @@ where
         let handle = self.table.delete(handle)?;
         let id = handle.shared.id();
         let registry = self.runtime_state.surface_service();
-        // The window comes off the desktop here; the compositor is told
-        // on the queue, and it drops its own view when it is. The run
-        // itself stays pinned until this instance's arena ends, because
-        // the compositor may be composing from it right now.
-        if let Ok((surfaces, _window)) = self.device.surfaces_mut() {
-            surfaces.abandon(&registry, id);
-        } else {
-            registry.unregister(id);
-        }
-        let _ = self
-            .runtime_state
-            .compositor()
-            .try_send(SurfaceRequest::Destroy { id });
+        // The client's span is its ordinary memory again once the drop
+        // returns. The window comes off the desktop here too, and goes
+        // to the compositor's supervisor on the return queue, which the
+        // registry's count keeps from ever being full — the provider
+        // queue is bounded, and a destroy it had no room
+        // for would leave the compositor's view, and the run behind it,
+        // in place for good. The supervisor ends that view and tells the
+        // compositor; the frame buffer stays pinned until then, because
+        // the compositor may be composing from it now.
+        self.views.end(handle.view).map_err(view_trap)?;
+        self.device.surfaces_mut().release(&registry, id);
         Ok(())
     }
 }
@@ -216,35 +215,50 @@ where
         accessor: &Accessor<U, Self>,
         width: u32,
         height: u32,
+        buffer: surface_wit::Span,
     ) -> wasmtime::Result<Result<Resource<ClientSurfaceHandle>, surface_wit::Error>> {
         let geometry = SurfaceGeometry { width, height };
-        // The pages and the identity come first, on the store's own
-        // task: the compositor is told where the client's frame buffer
-        // is, so it cannot be told before there is one.
+        let span = Span::new(buffer.offset, buffer.length);
+        // The frame buffer and the identity come first, on the store's
+        // own task: the compositor is handed the buffer, so it cannot be
+        // told before there is one. Pinned inside this host call, so the
+        // run is charged to this client. Nothing is shown yet: until the
+        // call's last step the window is a pending one, which a guest
+        // that drops this call's future hands back to the compositor's
+        // supervisor as it goes.
         let prepared = accessor.with(|mut access| {
+            let linear_memory = access.get().linear_memory;
+            let memory = guest_memory(linear_memory, &access);
             let data = access.get();
             let registry = data.runtime_state.surface_service();
             let runtime_state = data.runtime_state.clone();
-            let created = data
-                .device
-                .surfaces_mut()
-                .and_then(|(surfaces, window)| surfaces.create(&registry, window, geometry));
-            (created, runtime_state)
+            let pending = memory
+                .map_err(SurfaceServiceError::from)
+                .and_then(|memory| {
+                    data.device.surfaces_mut().prepare(
+                        &registry,
+                        &data.views,
+                        memory,
+                        span,
+                        geometry,
+                    )
+                });
+            (pending, runtime_state)
         });
-        let (created, runtime_state) = prepared;
-        let (shared, frame) = match created {
-            Ok(created) => created,
+        let (pending, runtime_state) = prepared;
+        let pending = match pending {
+            Ok(pending) => pending,
             Err(error) => return Ok(Err(to_wit_error(error))),
         };
 
-        let id = shared.id();
+        let id = pending.id();
         let (reply, answer) = oneshot::channel();
         let queued = runtime_state
             .compositor()
             .send(SurfaceRequest::Create(SurfaceCreate {
                 id,
                 geometry,
-                physical: frame.physical(),
+                buffer: pending.buffer().clone(),
                 reply,
             }))
             .await;
@@ -257,30 +271,42 @@ where
             Err(error) => Err(provider_error(error)),
         };
 
+        // The last step, and the only one that shows anything: the view
+        // at the client's span and the handle that owns it are recorded
+        // together, with no wait in between that a cancellation could
+        // land in.
         accessor.with(|mut access| {
+            let linear_memory = access.get().linear_memory;
+            // The store's memory handle is recorded once, when the
+            // instance is built, and `prepare` already read it.
+            let memory = guest_memory(linear_memory, &access)
+                .expect("a store whose memory took the span when the window was prepared has one");
             let data = access.get();
-            match accepted {
-                Ok(()) => {
-                    let handle = data.table.push(ClientSurfaceHandle { shared, frame })?;
-                    tracing::info!(
-                        target: "helios_kernel::surface",
-                        surface = id.raw(),
-                        width,
-                        height,
-                        "a program took a window on the desktop"
-                    );
-                    Ok(Ok(handle))
-                }
-                Err(error) => {
-                    let registry = data.runtime_state.surface_service();
-                    if let Ok((surfaces, _window)) = data.device.surfaces_mut() {
-                        surfaces.abandon(&registry, id);
-                    } else {
-                        registry.unregister(id);
-                    }
-                    Ok(Err(to_wit_error(error)))
-                }
+            let registry = data.runtime_state.surface_service();
+            let surfaces = data.device.surfaces_mut();
+            if let Err(error) = accepted {
+                // The compositor holds nothing of the window, so it is
+                // only taken off the desktop, and the run goes back with
+                // the pending window's reference.
+                surfaces.refused(&registry, pending);
+                return Ok(Err(to_wit_error(error)));
             }
+            // A span something else was shown over while the compositor
+            // was answering is refused here, and the pending window goes
+            // back to the supervisor, which tells the compositor.
+            let (shared, view) = match surfaces.show(&mut data.views, memory, pending) {
+                Ok(shown) => shown,
+                Err(error) => return Ok(Err(to_wit_error(error))),
+            };
+            let handle = data.table.push(ClientSurfaceHandle { shared, view })?;
+            tracing::info!(
+                target: "helios_kernel::surface",
+                surface = id.raw(),
+                width,
+                height,
+                "a program took a window on the desktop"
+            );
+            Ok(Ok(handle))
         })
     }
 

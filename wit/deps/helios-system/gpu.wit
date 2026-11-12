@@ -11,7 +11,7 @@ package helios:system@0.1.0;
 /// created is released when it lets go or dies.
 ///
 /// Nothing the renderer speaks travels through the kernel. A command
-/// buffer is pinned, physically contiguous memory placed inside the
+/// buffer is pinned, physically contiguous memory shown at pages of the
 /// claiming instance's own linear memory; `submit` names a run of it,
 /// the kernel hands the device its physical pages, and the bytes are
 /// the renderer's protocol — virgl's, Venus's, gfxstream's — which this
@@ -21,9 +21,9 @@ package helios:system@0.1.0;
 ///
 /// Memory that is the host's rather than the machine's — a blob's
 /// host-side storage — reaches the instance through the engine's
-/// host-visible aperture: `map-blob` places it there and lands it in the
-/// instance's own linear memory, where the guest's writes are the host's
-/// without a copy through either side.
+/// host-visible aperture: `map-blob` places it there and shows it at
+/// pages of the instance's own linear memory, where the guest's writes
+/// are the host's without a copy through either side.
 ///
 /// Completion is a fence stream, not a return value. A submission's
 /// future reports that the device took the command buffer; the `fences`
@@ -32,6 +32,8 @@ package helios:system@0.1.0;
 /// its fence, because a reader must never wait for a point that will
 /// not come.
 interface gpu {
+  use memory.{span};
+
   /// Why a request was refused.
   enum error {
     /// This machine has no display device, or the kernel never brought
@@ -55,6 +57,9 @@ interface gpu {
     too-many-contexts,
     /// This claim already holds as many blobs as it may.
     too-many-blobs,
+    /// This claim already shows as many command buffers, guest-backed
+    /// blobs and mapped blobs in the instance's memory as it may.
+    too-many-views,
     /// The blob cannot exist or be used as asked: its size or memory
     /// kind is not one the device accepts, or it names a context this
     /// claim does not hold.
@@ -70,9 +75,16 @@ interface gpu {
     /// timeline, and a fence that would go backwards is a defect the
     /// device is not asked to carry.
     stale-fence,
-    /// The part of this instance's linear memory the kernel devotes to
-    /// the 3D engine has no room left.
-    window-exhausted,
+    /// The span is not whole pages inside this instance's memory, is not
+    /// the length the request needs, overlaps something already shown,
+    /// or was given for a blob that has no pages of its own (or left
+    /// out for one that has).
+    bad-span,
+    /// The blob's host storage is already shown in this instance's
+    /// memory.
+    already-mapped,
+    /// The blob's host storage is not shown in this instance's memory.
+    not-mapped,
     /// The pages could not be pinned: the machine has no contiguous
     /// run of that size left, or the instance's own memory accounting
     /// refused it.
@@ -95,15 +107,6 @@ interface gpu {
     max-size: u32,
   }
 
-  /// Where a run of bytes landed in this instance's linear memory.
-  record placement {
-    /// Byte offset of the run.
-    offset: u64,
-    /// How many bytes of linear memory it covers, which is the request
-    /// rounded up to whole pages.
-    length: u64,
-  }
-
   /// Where a blob's storage lives.
   enum blob-memory {
     /// The instance's own pinned pages, which the device reads.
@@ -112,7 +115,8 @@ interface gpu {
     /// aperture once `map-blob` has placed it there.
     host3d,
     /// The renderer's own storage, backed by the instance's pinned
-    /// pages as well: both `buffer` and `map-blob` answer for it.
+    /// pages as well: it has a span of its own and `map-blob` answers
+    /// for it too.
     host3d-guest,
   }
 
@@ -129,15 +133,14 @@ interface gpu {
   /// One command buffer: pinned pages of this instance's own memory
   /// that a `submit` names a run of.
   ///
-  /// The bytes at `buffer` are the renderer's command stream, written
-  /// with ordinary stores. The buffer is reusable — a renderer writes
-  /// its commands into it, submits a run, and writes the next commands
-  /// over the same pages once their fence has retired — and dropping it
-  /// only forgets the handle; the pages stay with the claim.
-  resource command-buffer {
-    /// Where this buffer's pages sit in linear memory.
-    buffer: func() -> placement;
-  }
+  /// The bytes at the span it was created with are the renderer's
+  /// command stream, written with ordinary stores. The buffer is
+  /// reusable — a renderer writes its commands into it, submits a run,
+  /// and writes the next commands over the same pages once their fence
+  /// has retired. Dropping it makes the span ordinary zeroed memory
+  /// again; the frames go back to the instance's pool once no
+  /// submission still names them.
+  resource command-buffer;
 
   /// One renderer context: a virgl, Venus or gfxstream instance the
   /// device multiplexes its command ring across.
@@ -145,12 +148,12 @@ interface gpu {
   /// Dropping the context lets the renderer's half go; the device is
   /// told by the task that owns it.
   resource context {
-    /// Pin `bytes` of this instance's memory as a command buffer.
+    /// Pin a command buffer as long as `buffer` and show it there.
     ///
-    /// The pages are committed from the instance's own pool into the
-    /// part of its linear memory the kernel devotes to the 3D engine,
-    /// and are what `submit` names a run of.
-    commands: async func(bytes: u64) -> result<command-buffer, error>;
+    /// The frames come from the instance's own pool and are what
+    /// `submit` names a run of. What the span held is discarded; the
+    /// buffer starts zeroed.
+    commands: async func(buffer: span) -> result<command-buffer, error>;
 
     /// Hand the device `length` bytes of `commands` starting at
     /// `offset`, fenced at `fence`.
@@ -182,25 +185,23 @@ interface gpu {
   /// guest and placed by the device.
   ///
   /// Where its bytes live depends on its memory kind: a guest blob's
-  /// are this instance's pinned pages at `buffer`; a host3d blob's are
-  /// the renderer's, reached through `map-blob`. Dropping the blob destroys
-  /// it; its pages or aperture placement go back with the claim.
+  /// are this instance's pinned pages, shown at the span it was created
+  /// with; a host3d blob's are the renderer's, reached through
+  /// `map-blob`. Dropping the blob destroys it and makes every span it
+  /// was shown at ordinary zeroed memory again.
   resource blob {
-    /// Where this blob's own pages sit in linear memory, for the
-    /// guest-backed kinds; `none` for a host3d blob, which has none.
-    buffer: func() -> option<placement>;
-
     /// Place this blob's host storage in the engine's host-visible
-    /// aperture and report where it landed in this instance's linear
-    /// memory.
+    /// aperture and show it at `at`.
     ///
-    /// The placement is a window onto memory the machine does not own:
-    /// the bytes behind it are the renderer's, and the instance's
-    /// writes to them are the host's without a copy through either
-    /// side.
-    map-blob: async func() -> result<placement, error>;
+    /// `at` is the blob's size rounded up to whole wasm pages. The
+    /// bytes shown there are memory the machine does not own: they are
+    /// the renderer's, and the instance's writes to them are the host's
+    /// without a copy through either side. A call that does not succeed
+    /// — refused, or cancelled by the caller — shows nothing at `at`.
+    map-blob: async func(at: span) -> result<_, error>;
 
-    /// Take this blob back out of the aperture.
+    /// Take this blob back out of the aperture. The span `map-blob`
+    /// was given is ordinary zeroed memory again.
     unmap-blob: async func() -> result<_, error>;
   }
 
@@ -238,7 +239,13 @@ interface gpu {
     /// and `usage` what it may be used for; `host-id` lets the host
     /// share the resource with other guests, and is `0` when it does
     /// not.
-    create-blob: async func(context: borrow<context>, memory: blob-memory, usage: blob-usage, size: u64, host-id: u64) -> result<blob, error>;
+    ///
+    /// A blob with pages of its own (`guest`, `host3d-guest`) takes
+    /// `buffer`, `size` rounded up to whole wasm pages, and its pinned
+    /// pages are shown there, zeroed. A `host3d` blob takes none. A
+    /// call that does not return a blob — refused, or cancelled by the
+    /// caller — shows nothing at `buffer`.
+    create-blob: async func(context: borrow<context>, memory: blob-memory, usage: blob-usage, size: u64, host-id: u64, buffer: option<span>) -> result<blob, error>;
   }
 
   /// Take exclusive ownership of the machine's 3D engine.

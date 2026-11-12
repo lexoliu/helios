@@ -159,7 +159,7 @@ where
     pub(super) fn futex_key(&self, address: u32) -> crate::FutexKey {
         crate::FutexKey::new(
             crate::ProcessMemoryIdentity::new(self.instance().id().raw()),
-            crate::GuestAddress::new(u64::from(address)),
+            GuestAddress::wasm32(address),
         )
     }
 
@@ -819,7 +819,7 @@ where
                     caller.data().memory(),
                     &caller.data().shared.entropy,
                     caller.data().runtime_state.root_entropy(),
-                    ptr as u32,
+                    GuestAddress::wasm32(ptr as u32),
                     len as u32,
                 )
             },
@@ -841,7 +841,7 @@ where
              -> i32 {
                 write_u64(
                     caller.data().memory(),
-                    ptr as u32,
+                    GuestAddress::wasm32(ptr as u32),
                     crate::monotonic_nanos(&caller.data().cpu),
                 )
             },
@@ -898,8 +898,8 @@ where
                 let thread_count = compiler_plugin_worker_threads(&caller.data().cpu);
                 let env_len = compiler_rayon_env_len(thread_count);
                 let memory = caller.data().memory();
-                let first = write_u32(memory, count as u32, 1);
-                let second = write_u32(memory, size as u32, env_len);
+                let first = write_u32(memory, GuestAddress::wasm32(count as u32), 1);
+                let second = write_u32(memory, GuestAddress::wasm32(size as u32), env_len);
                 first.max(second)
             },
         )
@@ -1828,7 +1828,12 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    p1_write_u32(caller, memory, argc, count).max(p1_write_u32(caller, memory, argv_buf_size, size))
+    p1_write_u32(caller, memory, GuestAddress::wasm32(argc), count).max(p1_write_u32(
+        caller,
+        memory,
+        GuestAddress::wasm32(argv_buf_size),
+        size,
+    ))
 }
 
 pub(super) fn p1_args_get<CpuImpl, Net, HostFs>(
@@ -1842,7 +1847,12 @@ where
     HostFs: crate::HostFileSystem,
 {
     let values = caller.data().arguments.clone();
-    p1_write_string_array(caller, argv, argv_buf, values.iter().map(String::as_str))
+    p1_write_string_array(
+        caller,
+        GuestAddress::wasm32(argv),
+        GuestAddress::wasm32(argv_buf),
+        values.iter().map(String::as_str),
+    )
 }
 
 pub(super) fn p1_environ_sizes_get<CpuImpl, Net, HostFs>(
@@ -1867,7 +1877,12 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    p1_write_u32(caller, memory, count, env_count).max(p1_write_u32(caller, memory, size, env_size))
+    p1_write_u32(caller, memory, GuestAddress::wasm32(count), env_count).max(p1_write_u32(
+        caller,
+        memory,
+        GuestAddress::wasm32(size),
+        env_size,
+    ))
 }
 
 pub(super) fn p1_environ_get<CpuImpl, Net, HostFs>(
@@ -1881,7 +1896,12 @@ where
     HostFs: crate::HostFileSystem,
 {
     let env = p1_environment_strings(caller.data());
-    p1_write_string_array(caller, environ, environ_buf, env.iter().map(String::as_str))
+    p1_write_string_array(
+        caller,
+        GuestAddress::wasm32(environ),
+        GuestAddress::wasm32(environ_buf),
+        env.iter().map(String::as_str),
+    )
 }
 
 pub(super) fn p1_clock_res_get<CpuImpl, Net, HostFs>(
@@ -1899,7 +1919,7 @@ where
             let Some(memory) = p1_memory(caller) else {
                 return p1::errno::FAULT;
             };
-            p1_write_u64(caller, memory, resolution, 1)
+            p1_write_u64(caller, memory, GuestAddress::wasm32(resolution), 1)
         }
         _ => p1::errno::INVAL,
     }
@@ -1923,7 +1943,7 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    p1_write_u64(caller, memory, timestamp, value)
+    p1_write_u64(caller, memory, GuestAddress::wasm32(timestamp), value)
 }
 
 pub(super) fn p1_random_get<CpuImpl, Net, HostFs>(
@@ -1944,7 +1964,7 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    p1_write_memory(caller, memory, ptr, &bytes)
+    p1_write_memory(caller, memory, GuestAddress::wasm32(ptr), &bytes)
 }
 
 pub(super) fn p1_record_kernel_profile<CpuImpl, Net, HostFs>(
@@ -2007,7 +2027,14 @@ where
     HostFs: crate::HostFileSystem,
 {
     let started = caller.data().cpu.now().ticks();
-    let result = p1_fd_write_inner(caller, fd, iovs, iovs_len, nwritten).await;
+    let result = p1_fd_write_inner(
+        caller,
+        fd,
+        GuestAddress::wasm32(iovs),
+        iovs_len,
+        GuestAddress::wasm32(nwritten),
+    )
+    .await;
     p1_record_kernel_profile(caller.data(), "fd_write", started);
     result
 }
@@ -2015,9 +2042,9 @@ where
 pub(super) async fn p1_fd_write_inner<CpuImpl, Net, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     fd: i32,
-    iovs: u32,
+    iovs: GuestAddress,
     iovs_len: u32,
-    nwritten: u32,
+    nwritten: GuestAddress,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
@@ -2112,7 +2139,14 @@ where
     HostFs: crate::HostFileSystem,
 {
     let started = caller.data().cpu.now().ticks();
-    let result = p1_fd_read_inner(caller, fd, iovs, iovs_len, nread).await;
+    let result = p1_fd_read_inner(
+        caller,
+        fd,
+        GuestAddress::wasm32(iovs),
+        iovs_len,
+        GuestAddress::wasm32(nread),
+    )
+    .await;
     p1_record_kernel_profile(caller.data(), "fd_read", started);
     result
 }
@@ -2120,9 +2154,9 @@ where
 pub(super) async fn p1_fd_read_inner<CpuImpl, Net, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     fd: i32,
-    iovs: u32,
+    iovs: GuestAddress,
     iovs_len: u32,
-    nread: u32,
+    nread: GuestAddress,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
@@ -2202,7 +2236,12 @@ where
             break;
         }
         let len = (len as usize).min(bytes.len() - copied);
-        let status = p1_write_memory(caller, memory, ptr, &bytes[copied..copied + len]);
+        let status = p1_write_memory(
+            caller,
+            memory,
+            GuestAddress::wasm32(ptr),
+            &bytes[copied..copied + len],
+        );
         if status != p1::errno::SUCCESS {
             return status;
         }
@@ -2236,7 +2275,8 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    p1_write_u8(caller, memory, buf, 0).max(p1_write_u32(caller, memory, buf + 4, len))
+    let buf = GuestAddress::wasm32(buf);
+    p1_write_u8(caller, memory, buf, 0).max(p1_write_u32(caller, memory, buf.offset(4), len))
 }
 
 pub(super) fn p1_fd_prestat_dir_name<CpuImpl, Net, HostFs>(
@@ -2261,7 +2301,7 @@ where
     if bytes.len() != len as usize {
         return p1::errno::INVAL;
     }
-    preview1_write_memory(memory, path, bytes)
+    preview1_write_memory(memory, GuestAddress::wasm32(path), bytes)
 }
 
 pub(super) fn p1_fdstat_bytes(filetype: u8, fdflags: u16, rights: u64) -> [u8; 24] {
@@ -2301,7 +2341,11 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    preview1_write_memory(memory, stat, &p1_fdstat_bytes(filetype, fdflags, rights))
+    preview1_write_memory(
+        memory,
+        GuestAddress::wasm32(stat),
+        &p1_fdstat_bytes(filetype, fdflags, rights),
+    )
 }
 
 pub(super) fn p1_fd_fdstat_set_flags<CpuImpl, Net, HostFs>(
@@ -2370,6 +2414,7 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
+    let stat = GuestAddress::wasm32(stat);
     if matches!(
         caller.data().descriptors.get(fd),
         Some(Preview1Descriptor::NullDevice)
@@ -2681,10 +2726,11 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let layout = match p1_read_iovs_with_byte_len(caller, memory, iovs, iovs_len) {
-        Ok(layout) => layout,
-        Err(errno) => return errno,
-    };
+    let layout =
+        match p1_read_iovs_with_byte_len(caller, memory, GuestAddress::wasm32(iovs), iovs_len) {
+            Ok(layout) => layout,
+            Err(errno) => return errno,
+        };
     let capacity = layout.byte_len;
     let Some(Preview1Descriptor::File { descriptor, .. }) = caller.data().descriptors.get(fd)
     else {
@@ -2717,7 +2763,13 @@ where
             Err(error) => return p1_errno_from_fs(error),
         }
     };
-    p1_write_iovs_from_bytes(caller, memory, layout.iovs, &bytes, nread)
+    p1_write_iovs_from_bytes(
+        caller,
+        memory,
+        layout.iovs,
+        &bytes,
+        GuestAddress::wasm32(nread),
+    )
 }
 
 pub(super) async fn p1_fd_pwrite<CpuImpl, Net, HostFs>(
@@ -2736,7 +2788,8 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let bytes = match p1_read_iovs_to_bytes(caller, memory, iovs, iovs_len) {
+    let nwritten = GuestAddress::wasm32(nwritten);
+    let bytes = match p1_read_iovs_to_bytes(caller, memory, GuestAddress::wasm32(iovs), iovs_len) {
         Ok(bytes) => bytes,
         Err(errno) => return errno,
     };
@@ -2799,6 +2852,7 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
+    let (buf, bufused) = (GuestAddress::wasm32(buf), GuestAddress::wasm32(bufused));
     let Some(path) = p1_descriptor_path(caller.data().descriptors.get(fd)) else {
         return p1::errno::BADF;
     };
@@ -2841,10 +2895,10 @@ where
 pub(super) fn p1_fd_readdir_entries<CpuImpl, Net, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     entries: Vec<fs_types::DirectoryEntry>,
-    buf: u32,
+    buf: GuestAddress,
     buf_len: u32,
     cookie: u64,
-    bufused: u32,
+    bufused: GuestAddress,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
@@ -2873,22 +2927,19 @@ where
         if capacity - used < dirent_len {
             break;
         }
-        let dirent_ptr = match buf.checked_add(used as u32) {
-            Some(ptr) => ptr,
-            None => return p1::errno::OVERFLOW,
-        };
+        let dirent_ptr = buf.offset(used as u64);
         let status = p1_write_u64(caller, memory, dirent_ptr, next)
-            .max(p1_write_u64(caller, memory, dirent_ptr + 8, next))
+            .max(p1_write_u64(caller, memory, dirent_ptr.offset(8), next))
             .max(p1_write_u32(
                 caller,
                 memory,
-                dirent_ptr + 16,
+                dirent_ptr.offset(16),
                 name.len().try_into().unwrap_or(u32::MAX),
             ))
             .max(p1_write_u8(
                 caller,
                 memory,
-                dirent_ptr + 20,
+                dirent_ptr.offset(20),
                 p1_filetype_from_descriptor_type(entry.type_.clone()),
             ));
         if status != p1::errno::SUCCESS {
@@ -2897,10 +2948,7 @@ where
         used += dirent_len;
         let remaining = capacity - used;
         let copied = remaining.min(name.len());
-        let name_ptr = match buf.checked_add(used as u32) {
-            Some(ptr) => ptr,
-            None => return p1::errno::OVERFLOW,
-        };
+        let name_ptr = buf.offset(used as u64);
         let status = p1_write_memory(caller, memory, name_ptr, &name[..copied]);
         if status != p1::errno::SUCCESS {
             return status;
@@ -2993,7 +3041,7 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    p1_write_u64(caller, memory, new_offset, next)
+    p1_write_u64(caller, memory, GuestAddress::wasm32(new_offset), next)
 }
 
 pub(super) fn p1_fd_tell<CpuImpl, Net, HostFs>(
@@ -3014,7 +3062,7 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    p1_write_u64(caller, memory, offset_out, offset)
+    p1_write_u64(caller, memory, GuestAddress::wasm32(offset_out), offset)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3037,7 +3085,7 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let path = match p1_read_path(caller, memory, path, path_len) {
+    let path = match p1_read_path(caller, memory, GuestAddress::wasm32(path), path_len) {
         Ok(path) => path,
         Err(_) => return p1::errno::FAULT,
     };
@@ -3109,7 +3157,7 @@ where
                 Ok(fd) => fd,
                 Err(errno) => return errno,
             };
-            return p1_write_u32(caller, memory, opened_fd, fd);
+            return p1_write_u32(caller, memory, GuestAddress::wasm32(opened_fd), fd);
         }
         Ok(false) => {}
         Err(errno) => return errno,
@@ -3138,7 +3186,7 @@ where
         Ok(fd) => fd,
         Err(errno) => return errno,
     };
-    p1_write_u32(caller, memory, opened_fd, fd)
+    p1_write_u32(caller, memory, GuestAddress::wasm32(opened_fd), fd)
 }
 
 pub(super) fn p1_open_null_device(
@@ -3336,7 +3384,7 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let path = match p1_read_path(caller, memory, path, path_len) {
+    let path = match p1_read_path(caller, memory, GuestAddress::wasm32(path), path_len) {
         Ok(path) => path,
         Err(_) => return p1::errno::FAULT,
     };
@@ -3394,7 +3442,8 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let path = match p1_read_path(caller, memory, path, path_len) {
+    let stat = GuestAddress::wasm32(stat);
+    let path = match p1_read_path(caller, memory, GuestAddress::wasm32(path), path_len) {
         Ok(path) => path,
         Err(_) => return p1::errno::FAULT,
     };
@@ -3439,7 +3488,7 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let path = match p1_read_path(caller, memory, path, path_len) {
+    let path = match p1_read_path(caller, memory, GuestAddress::wasm32(path), path_len) {
         Ok(path) => path,
         Err(_) => return p1::errno::FAULT,
     };
@@ -3508,11 +3557,13 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let old_path = match p1_read_path(caller, memory, old_path, old_path_len) {
+    let old_path = match p1_read_path(caller, memory, GuestAddress::wasm32(old_path), old_path_len)
+    {
         Ok(path) => path,
         Err(_) => return p1::errno::FAULT,
     };
-    let new_path = match p1_read_path(caller, memory, new_path, new_path_len) {
+    let new_path = match p1_read_path(caller, memory, GuestAddress::wasm32(new_path), new_path_len)
+    {
         Ok(path) => path,
         Err(_) => return p1::errno::FAULT,
     };
@@ -3595,7 +3646,7 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let path = match p1_read_path(caller, memory, path, path_len) {
+    let path = match p1_read_path(caller, memory, GuestAddress::wasm32(path), path_len) {
         Ok(path) => path,
         Err(_) => return p1::errno::FAULT,
     };
@@ -3635,7 +3686,7 @@ where
     };
     let bytes = payload.as_bytes();
     let copied = (buf_len as usize).min(bytes.len());
-    let status = p1_write_memory(caller, memory, buf, &bytes[..copied]);
+    let status = p1_write_memory(caller, memory, GuestAddress::wasm32(buf), &bytes[..copied]);
     if status != p1::errno::SUCCESS {
         return status;
     }
@@ -3643,7 +3694,7 @@ where
         Ok(copied) => copied,
         Err(_) => return p1::errno::OVERFLOW,
     };
-    p1_write_u32(caller, memory, bufused, copied)
+    p1_write_u32(caller, memory, GuestAddress::wasm32(bufused), copied)
 }
 
 pub(super) async fn p1_path_remove_directory<CpuImpl, Net, HostFs>(
@@ -3660,7 +3711,7 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let path = match p1_read_path(caller, memory, path, path_len) {
+    let path = match p1_read_path(caller, memory, GuestAddress::wasm32(path), path_len) {
         Ok(path) => path,
         Err(_) => return p1::errno::FAULT,
     };
@@ -3715,11 +3766,13 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let old_path = match p1_read_path(caller, memory, old_path, old_path_len) {
+    let old_path = match p1_read_path(caller, memory, GuestAddress::wasm32(old_path), old_path_len)
+    {
         Ok(path) => path,
         Err(_) => return p1::errno::FAULT,
     };
-    let new_path = match p1_read_path(caller, memory, new_path, new_path_len) {
+    let new_path = match p1_read_path(caller, memory, GuestAddress::wasm32(new_path), new_path_len)
+    {
         Ok(path) => path,
         Err(_) => return p1::errno::FAULT,
     };
@@ -3800,11 +3853,13 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let old_path = match p1_read_path(caller, memory, old_path, old_path_len) {
+    let old_path = match p1_read_path(caller, memory, GuestAddress::wasm32(old_path), old_path_len)
+    {
         Ok(path) => path,
         Err(_) => return p1::errno::FAULT,
     };
-    let new_path = match p1_read_path(caller, memory, new_path, new_path_len) {
+    let new_path = match p1_read_path(caller, memory, GuestAddress::wasm32(new_path), new_path_len)
+    {
         Ok(path) => path,
         Err(_) => return p1::errno::FAULT,
     };
@@ -3868,7 +3923,7 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let path = match p1_read_path(caller, memory, path, path_len) {
+    let path = match p1_read_path(caller, memory, GuestAddress::wasm32(path), path_len) {
         Ok(path) => path,
         Err(_) => return p1::errno::FAULT,
     };
@@ -3970,7 +4025,12 @@ where
         return p1::errno::FAULT;
     };
 
-    let parsed = match p1_read_subscriptions(caller, memory, subscriptions, nsubscriptions) {
+    let parsed = match p1_read_subscriptions(
+        caller,
+        memory,
+        GuestAddress::wasm32(subscriptions),
+        nsubscriptions,
+    ) {
         Ok(parsed) => parsed,
         Err(errno) => return errno,
     };
@@ -4047,30 +4107,41 @@ where
         p1_wait_step(&timer, &mut wait, earliest).await;
     };
 
+    let events = GuestAddress::wasm32(events);
     let mut event_count = 0u32;
     for event in &ready {
-        let Some(event_ptr) = event_count
-            .checked_mul(P1_EVENT_SIZE)
-            .and_then(|offset| events.checked_add(offset))
-        else {
-            return p1::errno::OVERFLOW;
-        };
+        let event_ptr = events.offset(u64::from(event_count) * u64::from(P1_EVENT_SIZE));
         let status = p1_write_u64(caller, memory, event_ptr, event.userdata)
-            .max(p1_write_u16(caller, memory, event_ptr + 8, event.error))
+            .max(p1_write_u16(
+                caller,
+                memory,
+                event_ptr.offset(8),
+                event.error,
+            ))
             .max(p1_write_u8(
                 caller,
                 memory,
-                event_ptr + 10,
+                event_ptr.offset(10),
                 event.event_type,
             ))
-            .max(p1_write_u64(caller, memory, event_ptr + 16, event.nbytes))
-            .max(p1_write_u16(caller, memory, event_ptr + 24, event.fd_flags));
+            .max(p1_write_u64(
+                caller,
+                memory,
+                event_ptr.offset(16),
+                event.nbytes,
+            ))
+            .max(p1_write_u16(
+                caller,
+                memory,
+                event_ptr.offset(24),
+                event.fd_flags,
+            ));
         if status != p1::errno::SUCCESS {
             return status;
         }
         event_count += 1;
     }
-    p1_write_u32(caller, memory, nevents, event_count)
+    p1_write_u32(caller, memory, GuestAddress::wasm32(nevents), event_count)
 }
 
 /// Whether a clock subscription's deadline has arrived.
@@ -4134,7 +4205,7 @@ fn p1_clock_progress(userdata: u64, deadline_nanos: u64, now: u64) -> P1ClockPro
 fn p1_read_subscriptions<CpuImpl, Net, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     memory: Preview1Memory,
-    subscriptions: u32,
+    subscriptions: GuestAddress,
     nsubscriptions: u32,
 ) -> Result<Vec<P1Subscription>, i32>
 where
@@ -4144,21 +4215,19 @@ where
 {
     let mut parsed = Vec::with_capacity(nsubscriptions as usize);
     for index in 0..nsubscriptions {
-        let subscription_ptr = index
-            .checked_mul(P1_SUBSCRIPTION_SIZE)
-            .and_then(|offset| subscriptions.checked_add(offset))
-            .ok_or(p1::errno::OVERFLOW)?;
+        let subscription_ptr =
+            subscriptions.offset(u64::from(index) * u64::from(P1_SUBSCRIPTION_SIZE));
         let userdata =
             p1_try_read_u64(caller, memory, subscription_ptr).map_err(|_| p1::errno::FAULT)?;
-        let event_type =
-            p1_try_read_u8(caller, memory, subscription_ptr + 8).map_err(|_| p1::errno::FAULT)?;
+        let event_type = p1_try_read_u8(caller, memory, subscription_ptr.offset(8))
+            .map_err(|_| p1::errno::FAULT)?;
         parsed.push(match event_type {
             P1_EVENTTYPE_CLOCK => {
-                let clock_id = p1_try_read_u32(caller, memory, subscription_ptr + 16)
+                let clock_id = p1_try_read_u32(caller, memory, subscription_ptr.offset(16))
                     .map_err(|_| p1::errno::FAULT)?;
-                let timeout = p1_try_read_u64(caller, memory, subscription_ptr + 24)
+                let timeout = p1_try_read_u64(caller, memory, subscription_ptr.offset(24))
                     .map_err(|_| p1::errno::FAULT)?;
-                let flags = p1_try_read_u16(caller, memory, subscription_ptr + 40)
+                let flags = p1_try_read_u16(caller, memory, subscription_ptr.offset(40))
                     .map_err(|_| p1::errno::FAULT)?;
                 if !matches!(clock_id, 0 | 1) {
                     P1Subscription::Failed {
@@ -4189,7 +4258,7 @@ where
                 }
             }
             P1_EVENTTYPE_FD_READ | P1_EVENTTYPE_FD_WRITE => {
-                let fd = p1_try_read_u32(caller, memory, subscription_ptr + 16)
+                let fd = p1_try_read_u32(caller, memory, subscription_ptr.offset(16))
                     .map_err(|_| p1::errno::FAULT)? as i32;
                 P1Subscription::Fd {
                     userdata,
@@ -4307,7 +4376,7 @@ where
         let _ = caller.data_mut().descriptors.close(accepted_fd as i32);
         return p1::errno::FAULT;
     };
-    let status = p1_write_u32(caller, memory, fd_out, accepted_fd);
+    let status = p1_write_u32(caller, memory, GuestAddress::wasm32(fd_out), accepted_fd);
     if status != p1::errno::SUCCESS {
         let _ = caller.data_mut().descriptors.close(accepted_fd as i32);
         return status;
@@ -4386,6 +4455,11 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
+    let (ri_data, ro_datalen, ro_flags) = (
+        GuestAddress::wasm32(ri_data),
+        GuestAddress::wasm32(ro_datalen),
+        GuestAddress::wasm32(ro_flags),
+    );
     let iovs_started = p1_kernel_profile_start(caller.data());
     let layout = match p1_read_iovs_with_byte_len(caller, memory, ri_data, ri_data_len) {
         Ok(layout) => layout,
@@ -4530,6 +4604,10 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
+    let (si_data, so_datalen) = (
+        GuestAddress::wasm32(si_data),
+        GuestAddress::wasm32(so_datalen),
+    );
     let layout = match p1_read_iovs_with_byte_len(caller, memory, si_data, si_data_len) {
         Ok(layout) => layout,
         Err(errno) => return errno,
@@ -5068,7 +5146,7 @@ pub(super) fn p1_fdflags_nonblocking(fdflags: u16) -> bool {
 /// field here may be a placeholder zero.
 pub(super) fn p1_write_filestat<CpuImpl, Net, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
-    stat: u32,
+    stat: GuestAddress,
     identity: crate::ObjectIdentity,
     value: fs_types::DescriptorStat,
 ) -> i32
@@ -5108,18 +5186,28 @@ where
         })
         .unwrap_or(0);
     p1_write_u64(caller, memory, stat, identity.domain().raw())
-        .max(p1_write_u64(caller, memory, stat + 8, identity.local()))
+        .max(p1_write_u64(
+            caller,
+            memory,
+            stat.offset(8),
+            identity.local(),
+        ))
         .max(p1_write_u8(
             caller,
             memory,
-            stat + 16,
+            stat.offset(16),
             p1_filetype_from_descriptor_type(value.type_),
         ))
-        .max(p1_write_u64(caller, memory, stat + 24, value.link_count))
-        .max(p1_write_u64(caller, memory, stat + 32, value.size))
-        .max(p1_write_u64(caller, memory, stat + 40, atim))
-        .max(p1_write_u64(caller, memory, stat + 48, mtim))
-        .max(p1_write_u64(caller, memory, stat + 56, ctim))
+        .max(p1_write_u64(
+            caller,
+            memory,
+            stat.offset(24),
+            value.link_count,
+        ))
+        .max(p1_write_u64(caller, memory, stat.offset(32), value.size))
+        .max(p1_write_u64(caller, memory, stat.offset(40), atim))
+        .max(p1_write_u64(caller, memory, stat.offset(48), mtim))
+        .max(p1_write_u64(caller, memory, stat.offset(56), ctim))
 }
 
 pub(super) fn p1_timestamp_from_fstflags(

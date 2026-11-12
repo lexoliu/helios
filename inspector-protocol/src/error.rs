@@ -185,7 +185,7 @@ impl DispatchError {
 /// before the host allocates for it. The wire layer reports through
 /// `io::Error` to match the stream it reads, carrying this enum as the
 /// payload; use [`WireError::from_io`] to recover it.
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum WireError {
     /// A frame header announced a payload above the frame maximum.
     #[error("frame payload of {len} bytes exceeds the {max}-byte maximum")]
@@ -205,6 +205,22 @@ pub enum WireError {
     /// newline or a frame header.
     #[error("console line exceeds the {max}-byte maximum without a terminator")]
     ConsoleLineTooLong { max: usize },
+
+    /// A peer sent one invocation more undelivered payload than the
+    /// transport holds for it. Only that invocation fails.
+    #[error(
+        "invocation {invocation} would hold {held} undelivered bytes, over the {max}-byte maximum"
+    )]
+    InboundBacklogExceeded {
+        invocation: u32,
+        held: usize,
+        max: usize,
+    },
+
+    /// A peer addressed more distinct paths on one invocation than the
+    /// transport holds state for. Only that invocation fails.
+    #[error("invocation {invocation} addressed more than the {max} inbound path(s) it may hold")]
+    TooManyInboundPaths { invocation: u32, max: usize },
 }
 
 impl WireError {
