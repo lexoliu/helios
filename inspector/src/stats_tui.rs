@@ -879,8 +879,17 @@ fn draw_network_panel(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats
                         Span::raw("       "),
                         Span::styled(
                             format!(
-                                "{} sock  {} shut  {}B win  {} ack  {} winupd  {} rexmit",
+                                "{} sock  {} orphan (fw1 {} fw2 {} closing {} last-ack {} tw {} other {} rexmit-armed {})  {}B orphan-queued  {} shut  {}B win  {} ack  {} winupd  {} rexmit",
                                 queue.tcp_sockets,
+                                queue.tcp_orphan_sockets,
+                                queue.tcp_orphan_fin_wait_1,
+                                queue.tcp_orphan_fin_wait_2,
+                                queue.tcp_orphan_closing,
+                                queue.tcp_orphan_last_ack,
+                                queue.tcp_orphan_time_wait,
+                                queue.tcp_orphan_other_state,
+                                queue.tcp_orphan_retransmit_armed,
+                                queue.tcp_orphan_send_queued_bytes,
                                 queue.tcp_receive_backpressured_sockets,
                                 queue.tcp_receive_window_bytes,
                                 queue.tcp_acks_sent,

@@ -994,35 +994,7 @@ impl Cpu for Aarch64Cpu {
         if len == 0 {
             return;
         }
-        let start = ptr as usize;
-        let end = start
-            .checked_add(len)
-            .unwrap_or_else(|| panic!("AArch64 executable publish range overflow"));
-        let mut address = start & !(cache_line_bytes() - 1);
-        while address < end {
-            unsafe {
-                asm!("dc cvau, {addr}", addr = in(reg) address, options(nostack, preserves_flags));
-            }
-            address = address
-                .checked_add(cache_line_bytes())
-                .unwrap_or_else(|| panic!("AArch64 data-cache clean iteration overflow"));
-        }
-        unsafe {
-            asm!("dsb ish", options(nostack, preserves_flags));
-        }
-        let mut address = start & !(cache_line_bytes() - 1);
-        while address < end {
-            unsafe {
-                asm!("ic ivau, {addr}", addr = in(reg) address, options(nostack, preserves_flags));
-            }
-            address = address.checked_add(cache_line_bytes()).unwrap_or_else(|| {
-                panic!("AArch64 instruction-cache invalidate iteration overflow")
-            });
-        }
-        unsafe {
-            asm!("dsb ish", options(nostack, preserves_flags));
-            asm!("isb", options(nostack, preserves_flags));
-        }
+        make_instructions_coherent(ptr, len);
         helios_kernel::runtime_memory::publish_code_memory(ptr, len);
     }
 
@@ -1693,6 +1665,43 @@ fn timebase() -> Timebase {
     }
     assert!(value != 0, "AArch64 CNTFRQ_EL0 reported zero");
     Timebase::new(value)
+}
+
+/// Makes bytes written through the data side visible to instruction fetch on
+/// every processor: clean the data cache to the point of unification, then
+/// invalidate the instruction cache over the range, as the Arm ARM requires
+/// before newly written code runs. Shared by code publication and by swap
+/// reinstating an executable page.
+pub(crate) fn make_instructions_coherent(ptr: *const u8, len: usize) {
+    let start = ptr as usize;
+    let end = start
+        .checked_add(len)
+        .unwrap_or_else(|| panic!("AArch64 executable publish range overflow"));
+    let mut address = start & !(cache_line_bytes() - 1);
+    while address < end {
+        unsafe {
+            asm!("dc cvau, {addr}", addr = in(reg) address, options(nostack, preserves_flags));
+        }
+        address = address
+            .checked_add(cache_line_bytes())
+            .unwrap_or_else(|| panic!("AArch64 data-cache clean iteration overflow"));
+    }
+    unsafe {
+        asm!("dsb ish", options(nostack, preserves_flags));
+    }
+    let mut address = start & !(cache_line_bytes() - 1);
+    while address < end {
+        unsafe {
+            asm!("ic ivau, {addr}", addr = in(reg) address, options(nostack, preserves_flags));
+        }
+        address = address
+            .checked_add(cache_line_bytes())
+            .unwrap_or_else(|| panic!("AArch64 instruction-cache invalidate iteration overflow"));
+    }
+    unsafe {
+        asm!("dsb ish", options(nostack, preserves_flags));
+        asm!("isb", options(nostack, preserves_flags));
+    }
 }
 
 fn cache_line_bytes() -> usize {

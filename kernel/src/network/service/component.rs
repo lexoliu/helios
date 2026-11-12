@@ -1046,19 +1046,11 @@ impl NetworkShard {
             .map_err(|_| NetworkControlError::BackendFault)
     }
 
-    /// Identifier for the next echo exchange this shard starts.
-    ///
-    /// Replies are matched on it, so an identifier that a previous ping
-    /// abandoned must not be handed out again while its late reply may
-    /// still arrive; the counter therefore walks the whole 16-bit space
-    /// before it repeats, and skips zero the way the DNS query ids do.
-    pub(super) fn next_icmp_echo_identifier(&mut self) -> u16 {
-        let identifier = self.next_icmp_echo_identifier;
-        self.next_icmp_echo_identifier = self.next_icmp_echo_identifier.wrapping_add(1);
-        if self.next_icmp_echo_identifier == 0 {
-            self.next_icmp_echo_identifier = 1;
-        }
-        identifier
+    /// Identifier for the next echo exchange this shard starts, drawn
+    /// from the shard's random stream so an off-path sender cannot guess
+    /// the key a reply has to carry.
+    pub(super) fn draw_icmp_echo_identifier(&mut self) -> u16 {
+        self.entropy.nonzero_u16()
     }
 
     /// Queues the echo request `key` describes.
@@ -1234,7 +1226,7 @@ pub(super) struct DnsQueryPair {
 
 impl DnsQueryPair {
     /// Ids a question may carry: every nonzero 16-bit value.
-    pub(super) const IDS: u32 = u16::MAX as u32;
+    pub(super) const IDS: u32 = NONZERO_U16_VALUES;
 
     /// The pair two uniform draws select: `first` in `0..IDS` picks the
     /// `A` id, and `second` in `0..IDS - 1` picks the `AAAA` id among

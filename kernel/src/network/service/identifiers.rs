@@ -37,7 +37,18 @@ impl ShardEntropy {
         debug_assert!(bound != 0, "a draw below zero has no value");
         (self.pool.secure_u64(&self.root) % u64::from(bound)) as u32
     }
+
+    /// A uniform nonzero 16-bit identifier: a DNS question id or an ICMP
+    /// echo identifier, neither of which may be zero here.
+    pub(super) fn nonzero_u16(&mut self) -> u16 {
+        // `below` is under `NONZERO_U16_VALUES`, so `1 +` lies in
+        // `1..=u16::MAX`.
+        (1 + self.below(NONZERO_U16_VALUES)) as u16
+    }
 }
+
+/// How many values a 16-bit identifier may take once zero is excluded.
+pub(super) const NONZERO_U16_VALUES: u32 = u16::MAX as u32;
 
 /// One walk over a shard's window of the ephemeral range: every port in
 /// it exactly once, from a random starting point, wrapping at the end.
