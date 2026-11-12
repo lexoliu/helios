@@ -29,7 +29,8 @@ pub use authority::{
 };
 pub(crate) use descriptor::FreeDescriptorSlots;
 pub use descriptor::{
-    DescriptorEntry, DescriptorId, DescriptorLimit, DescriptorTable, DescriptorTableError,
+    DescriptorEntry, DescriptorId, DescriptorLimit, DescriptorLimitSetting, DescriptorTable,
+    DescriptorTableError,
 };
 pub use futex::{FutexKey, FutexTable, FutexWaitRegistration, GuestAddress, ProcessMemoryIdentity};
 pub use program_service::{

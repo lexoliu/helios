@@ -325,12 +325,16 @@ macro_rules! settings {
 
 // The machine's settings. A setting is listed here together with the change
 // that makes a consumer enforce it, so that none is declared and then ignored.
-settings! {}
+settings! {
+    descriptor_limit: crate::process::DescriptorLimitSetting,
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ProcessAuthority, SettingsAuthorityRights};
+    use crate::{
+        DescriptorLimit, DescriptorLimitSetting, ProcessAuthority, SettingsAuthorityRights,
+    };
 
     /// The proof a holder of the right derives from its authority.
     fn proof() -> WriteSettingsCap {
@@ -389,16 +393,61 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_name_is_refused_and_lists_nothing() {
+    fn an_unknown_name_is_refused_and_changes_nothing() {
+        let settings = Settings::default();
+        let proof = proof();
+        let before = settings.entries();
+
+        assert_eq!(settings.read_by_name("no.such-setting"), None);
+        assert_eq!(
+            settings.write_by_name(&proof, "no.such-setting", SettingValue::Count(1)),
+            Err(SettingWriteError::Unknown)
+        );
+        assert_eq!(settings.entries(), before);
+    }
+
+    #[test]
+    fn the_machine_lists_the_descriptor_limit_and_nothing_else() {
+        let settings = Settings::default();
+
+        assert_eq!(SETTING_COUNT, 1);
+        assert_eq!(
+            settings.entries(),
+            [SettingEntry {
+                name: "process.descriptor-limit",
+                description: DescriptorLimitSetting::DESCRIPTION,
+                value: SettingValue::Count(1024),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_write_by_name_reaches_the_limit_the_consumers_read() {
         let settings = Settings::default();
         let proof = proof();
 
-        assert_eq!(SETTING_COUNT, 0, "the machine declares no setting yet");
-        assert_eq!(settings.entries(), []);
-        assert_eq!(settings.read_by_name("process.descriptor-limit"), None);
         assert_eq!(
-            settings.write_by_name(&proof, "process.descriptor-limit", SettingValue::Count(1)),
-            Err(SettingWriteError::Unknown)
+            settings.get::<DescriptorLimitSetting>(),
+            DescriptorLimit::DEFAULT
+        );
+        assert_eq!(
+            settings.write_by_name(&proof, "process.descriptor-limit", SettingValue::Count(64)),
+            Ok(SettingValue::Count(1024))
+        );
+        assert_eq!(
+            settings.get::<DescriptorLimitSetting>(),
+            DescriptorLimit::new(64)
+        );
+        assert_eq!(
+            settings.set::<DescriptorLimitSetting>(&proof, DescriptorLimit::new(0)),
+            DescriptorLimit::new(64)
+        );
+        assert_eq!(
+            settings
+                .read_by_name("process.descriptor-limit")
+                .map(|entry| entry.value),
+            Some(SettingValue::Count(0)),
+            "operators are trusted, so zero is a limit"
         );
     }
 

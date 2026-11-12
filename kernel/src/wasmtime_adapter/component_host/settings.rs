@@ -216,7 +216,9 @@ mod tests {
     use crate::wasmtime_adapter::component_host::service::test_store::{
         TestStoreData, store_data_authorized,
     };
-    use crate::{ProcessAuthority, SettingsAuthorityRights};
+    use crate::{
+        DescriptorLimit, DescriptorLimitSetting, ProcessAuthority, Setting, SettingsAuthorityRights,
+    };
 
     /// A store whose instance holds `rights`.
     fn store(rights: SettingsAuthorityRights) -> TestStoreData {
@@ -256,6 +258,77 @@ mod tests {
             write(&holder(), "no.such-setting", SettingValue::Count(1)),
             Err(WriteRefusal::Setting(SettingWriteError::Unknown))
         );
+    }
+
+    #[test]
+    fn a_holder_writes_and_is_told_the_value_it_replaced() {
+        let program = holder();
+        let state = program.runtime_state.settings();
+
+        assert_eq!(
+            write(
+                &program,
+                "process.descriptor-limit",
+                SettingValue::Count(64)
+            ),
+            Ok(SettingValue::Count(1024))
+        );
+        assert_eq!(
+            state.get::<DescriptorLimitSetting>(),
+            DescriptorLimit::new(64),
+            "the write reached the value new processes read"
+        );
+        assert_eq!(
+            read(&program, "process.descriptor-limit").map(|entry| entry.value),
+            Some(SettingValue::Count(64))
+        );
+        assert_eq!(
+            write(&program, "process.descriptor-limit", SettingValue::Count(8)),
+            Ok(SettingValue::Count(64)),
+            "each write answers the value it displaced"
+        );
+    }
+
+    #[test]
+    fn a_write_of_another_unit_is_refused_and_changes_nothing() {
+        let program = holder();
+
+        assert_eq!(
+            write(
+                &program,
+                "process.descriptor-limit",
+                SettingValue::Bytes(64)
+            ),
+            Err(WriteRefusal::Setting(SettingWriteError::UnitMismatch {
+                holds: SettingUnit::Count
+            }))
+        );
+        assert_eq!(
+            program
+                .runtime_state
+                .settings()
+                .get::<DescriptorLimitSetting>(),
+            DescriptorLimit::DEFAULT
+        );
+    }
+
+    #[test]
+    fn list_shows_the_descriptor_limit_with_its_unit_and_value() {
+        let program = ordinary();
+
+        assert_eq!(
+            list(&program),
+            [SettingEntry {
+                name: "process.descriptor-limit",
+                description: DescriptorLimitSetting::DESCRIPTION,
+                value: SettingValue::Count(1024),
+            }]
+        );
+        let views = listing(&program);
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].name, "process.descriptor-limit");
+        assert_eq!(views[0].description, DescriptorLimitSetting::DESCRIPTION);
+        assert!(matches!(views[0].value, ValueView::Count(1024)));
     }
 
     #[test]

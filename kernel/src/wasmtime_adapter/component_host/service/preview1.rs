@@ -79,7 +79,7 @@ where
         write_serial: crate::DebugSerialWriter,
         imported_memory: Option<SharedMemory>,
         filesystem: Option<DebugFileSystemSnapshot>,
-        descriptors: Option<Preview1DescriptorTable<Net>>,
+        descriptors: DescriptorOrigin<Net>,
         signal_state: WasixSignalState,
         thread_signals: WasixSignalState,
         signal_dispositions: Vec<WasixSignalDisposition>,
@@ -92,8 +92,7 @@ where
             |snapshot| DebugFileSystem::from_snapshot(runtime_state.clone(), snapshot),
         );
         let entropy = crate::EntropyPool::derive(runtime_state.root_entropy(), instance.id().raw());
-        let descriptors =
-            descriptors.unwrap_or_else(|| Preview1DescriptorTable::from_authority(&authority));
+        let descriptors = process_descriptors(descriptors, &authority, runtime_state.settings());
         let clock = crate::KernelClock::new(cpu.clone(), runtime_state.clone());
         let wall_clock_cap = authority.derive_set_wall_clock_cap().ok();
         let cwd = preview1_cwd_from_authority(&authority);

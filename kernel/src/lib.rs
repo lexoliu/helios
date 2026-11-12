@@ -200,9 +200,9 @@ pub use network::{
 };
 pub use process::{
     AudioClaimCap, ClockAuthorityRights, DescriptorEntry, DescriptorId, DescriptorLimit,
-    DescriptorTable, DescriptorTableError, DeviceClassRights, DeviceGrantClaimCap,
-    DiagnosticAuthorityRights, DirectoryAuthorityRights, DirectoryCap, DirectoryPreopen,
-    DisplayClaimCap, DnsCap, ExecAuthority, ForkAuthority, FutexKey, FutexTable,
+    DescriptorLimitSetting, DescriptorTable, DescriptorTableError, DeviceClassRights,
+    DeviceGrantClaimCap, DiagnosticAuthorityRights, DirectoryAuthorityRights, DirectoryCap,
+    DirectoryPreopen, DisplayClaimCap, DnsCap, ExecAuthority, ForkAuthority, FutexKey, FutexTable,
     FutexWaitRegistration, GpuClaimCap, GuestAddress, InputClaimCap, JoinAuthority,
     LinkAuthorityRights, LinkSourceCap, LinkTargetDirectoryCap, MulticastCap, NetworkAdminCap,
     NetworkAuthorityRights, NetworkCap, ObserveMachineCap, PrivilegedBindCap, ProcessAuthority,

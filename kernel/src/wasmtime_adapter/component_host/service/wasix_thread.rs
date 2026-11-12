@@ -379,7 +379,8 @@ where
         write_serial,
         Some(imported_memory.clone()),
         Some(filesystem),
-        Some(descriptors),
+        // A thread is its process's: it keeps the process's limit.
+        DescriptorOrigin::SameProcess(descriptors),
         signal_state,
         // The thread's own mailbox, which the table below holds.
         WasixSignalState::new(),

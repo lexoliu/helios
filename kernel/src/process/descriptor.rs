@@ -8,6 +8,8 @@ use heapless::binary_heap::{BinaryHeap as InlineBinaryHeap, Min};
 use helios_hal::resource::{KernelResource, ResourceRights};
 use thiserror::Error;
 
+use crate::settings::{Setting, SettingUnit};
+
 const INLINE_FREE_DESCRIPTOR_SLOTS: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -89,6 +91,32 @@ impl DescriptorLimit {
 impl Default for DescriptorLimit {
     fn default() -> Self {
         Self::DEFAULT
+    }
+}
+
+// A limit is a `usize` and a setting's amount is a `u64`; the conversions
+// below are lossless only where both have the same width, which every
+// target the kernel runs on does.
+const _: () = assert!(usize::BITS == u64::BITS);
+
+/// The machine-wide setting a new process's descriptor limit starts from.
+/// A running process keeps the limit it was created with.
+pub struct DescriptorLimitSetting;
+
+impl Setting for DescriptorLimitSetting {
+    const NAME: &'static str = "process.descriptor-limit";
+    const DESCRIPTION: &'static str =
+        "Descriptor numbers a new process may hand out; one past the highest it may open.";
+    const UNIT: SettingUnit = SettingUnit::Count;
+    type Value = DescriptorLimit;
+    const DEFAULT: DescriptorLimit = DescriptorLimit::DEFAULT;
+
+    fn to_raw(value: DescriptorLimit) -> u64 {
+        u64::try_from(value.get()).expect("usize is no wider than u64, asserted above")
+    }
+
+    fn from_raw(raw: u64) -> DescriptorLimit {
+        DescriptorLimit::new(usize::try_from(raw).expect("usize is as wide as u64, asserted above"))
     }
 }
 

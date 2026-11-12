@@ -192,9 +192,48 @@ pub(super) struct Preview1DescriptorTable<Net: ComponentHostNetwork> {
     pub(super) entries: Vec<Option<Preview1DescriptorEntry<Net>>>,
     pub(super) free: FreeDescriptorSlots,
     /// Descriptor numbers at or past this are never handed out or accepted.
-    /// The table's owner assigns it; `from_entries` starts at the default
-    /// and `clone_for_exec` and `Clone` carry it to the child.
+    /// A process takes it from the machine's descriptor-limit setting when
+    /// it is created ([`process_descriptors`]) and keeps it for as long as
+    /// it runs: `clone_for_exec` and `Clone` carry it to the same process.
     pub(super) limit: DescriptorLimit,
+}
+
+/// Where a process's descriptor table comes from. Every place that builds
+/// a process names one, because the case decides which descriptor limit the
+/// process runs with.
+pub(super) enum DescriptorOrigin<Net: ComponentHostNetwork> {
+    /// A process that inherits nothing: its table holds the standard
+    /// streams and the authority's directories, under the machine's
+    /// current limit.
+    Fresh,
+    /// A new process (a fork child, a spawn child) that inherits its
+    /// parent's descriptors. It is a new process, so it takes the machine's
+    /// current limit, not its parent's; descriptors it inherits at or past
+    /// that limit stay open.
+    NewProcess(Preview1DescriptorTable<Net>),
+    /// The same process continuing in a new image, store or thread (exec,
+    /// a new thread). It keeps the limit it has.
+    SameProcess(Preview1DescriptorTable<Net>),
+}
+
+/// The descriptor table a process starts with, under the limit its origin
+/// gives it. A spawn's descriptor actions read the setting once more,
+/// earlier, because they run on the child's table before it reaches here.
+pub(super) fn process_descriptors<Net: ComponentHostNetwork>(
+    origin: DescriptorOrigin<Net>,
+    authority: &ProcessAuthority,
+    settings: &Settings,
+) -> Preview1DescriptorTable<Net> {
+    match origin {
+        DescriptorOrigin::Fresh => Preview1DescriptorTable::from_authority(
+            authority,
+            settings.get::<DescriptorLimitSetting>(),
+        ),
+        DescriptorOrigin::NewProcess(table) => {
+            table.for_new_process(settings.get::<DescriptorLimitSetting>())
+        }
+        DescriptorOrigin::SameProcess(table) => table,
+    }
 }
 
 #[derive(Clone)]
@@ -1163,7 +1202,7 @@ pub(super) fn guest_path_suffix<'a>(path: &'a str, preopen: &str) -> &'a str {
 }
 
 impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
-    pub(super) fn from_authority(authority: &ProcessAuthority) -> Self {
+    pub(super) fn from_authority(authority: &ProcessAuthority, limit: DescriptorLimit) -> Self {
         let preopens = authority.directory_preopens();
         let mut entries = Vec::with_capacity(3 + preopens.len());
         entries.push(Some(Preview1DescriptorEntry::new(
@@ -1180,7 +1219,7 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
             Preview1Descriptor::Stderr,
             false,
         )));
-        let mut table = Self::from_entries(entries);
+        let mut table = Self::from_entries_with_limit(entries, limit);
         for preopen in preopens {
             let descriptor = FsDescriptor {
                 path: preopen.source_path().to_owned(),
@@ -1199,7 +1238,11 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
         table
     }
 
-    pub(super) fn from_entries(entries: Vec<Option<Preview1DescriptorEntry<Net>>>) -> Self {
+    /// A table of `entries` whose numbers are admitted below `limit`.
+    pub(super) fn from_entries_with_limit(
+        entries: Vec<Option<Preview1DescriptorEntry<Net>>>,
+        limit: DescriptorLimit,
+    ) -> Self {
         let mut free = FreeDescriptorSlots::with_capacity(entries.len());
         for (index, entry) in entries.iter().enumerate() {
             if entry.is_none() {
@@ -1209,8 +1252,23 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
         Self {
             entries,
             free,
-            limit: DescriptorLimit::DEFAULT,
+            limit,
         }
+    }
+
+    /// A fixture table of `entries` under the default limit. Production
+    /// tables take their limit from the machine's setting.
+    #[cfg(test)]
+    pub(super) fn from_entries(entries: Vec<Option<Preview1DescriptorEntry<Net>>>) -> Self {
+        Self::from_entries_with_limit(entries, DescriptorLimit::DEFAULT)
+    }
+
+    /// The same descriptors under `limit`, for a new process that inherits
+    /// them. Descriptors open at or past a lowered limit stay open; no new
+    /// number at or past it is handed out.
+    pub(super) fn for_new_process(mut self, limit: DescriptorLimit) -> Self {
+        self.limit = limit;
+        self
     }
 
     pub(super) fn get(&self, fd: i32) -> Option<&Preview1Descriptor<Net>> {
@@ -1367,7 +1425,7 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
     }
 
     pub(super) fn clone_for_exec(&self) -> Self {
-        let mut table = Self::from_entries(
+        Self::from_entries_with_limit(
             self.entries
                 .iter()
                 .map(|entry| match entry {
@@ -1375,9 +1433,8 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
                     _ => entry.clone(),
                 })
                 .collect(),
-        );
-        table.limit = self.limit;
-        table
+            self.limit,
+        )
     }
 
     pub(super) fn close(&mut self, fd: i32) -> i32 {
