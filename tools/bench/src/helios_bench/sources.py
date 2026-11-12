@@ -47,7 +47,7 @@ class RawSide:
     cells: dict[str, RawCell]
 
 
-def read_side_jsonl(path: Path, warmup_discard: int) -> RawSide:
+def read_side_jsonl(path: Path, warmup_discard: int, round_number: int = 1) -> RawSide:
     run: dict = {}
     cells: dict[str, RawCell] = {}
     with path.open("r", encoding="utf-8") as handle:
@@ -62,6 +62,7 @@ def read_side_jsonl(path: Path, warmup_discard: int) -> RawSide:
                 index = int(record["iteration"])
                 cell.iterations.append(
                     Iteration(
+                        round=round_number,
                         index=index,
                         elapsed_ms=float(record["elapsed_ms"]),
                         cold=index <= warmup_discard,
@@ -76,11 +77,13 @@ def read_side_jsonl(path: Path, warmup_discard: int) -> RawSide:
     return RawSide(run=run, cells=cells)
 
 
-def read_optional_side(out_dir: Path, side: Side, warmup_discard: int) -> RawSide | None:
+def read_optional_side(
+    out_dir: Path, side: Side, warmup_discard: int, round_number: int = 1
+) -> RawSide | None:
     path = out_dir / SIDE_JSONL[side]
     if not path.exists():
         return None
-    return read_side_jsonl(path, warmup_discard)
+    return read_side_jsonl(path, warmup_discard, round_number)
 
 
 def read_control(out_dir: Path, side: Side, moment: str, warmup_discard: int) -> RawSide | None:

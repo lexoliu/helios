@@ -6,15 +6,16 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use triomphe::Arc;
 
 use crate::{
-    BootPayload, DEFAULT_PERF_METRIC_CAPACITY, DEFAULT_PROFILE_STACK_CAPACITY,
-    DEFAULT_TRACE_HISTORY_CAPACITY, EmbeddedBootFs, EmbeddedComponent, FoldedProfileSample,
-    FutexKey, FutexTable, FutexWaitRegistration, HEAP_SIZE_CLASS_COUNT, HeapStats,
-    InstanceRegistry, InstructionSampler, Notify, PerfMetricFilter, PerfMetricHistory,
-    PerfMetricSample, PerfSample, ProfileFilter, ProfileScope, ProfileSink, StatsSample,
-    TraceEvent, TraceFilter, TraceHistory,
+    BOOT_DEVICE, BootFs, BootPayload, DEFAULT_PERF_METRIC_CAPACITY, DEFAULT_PROFILE_STACK_CAPACITY,
+    DEFAULT_TRACE_HISTORY_CAPACITY, EmbeddedComponent, FoldedProfileSample, FutexKey, FutexTable,
+    FutexWaitRegistration, HEAP_SIZE_CLASS_COUNT, HOST_SHARE_GUEST_MOUNT_PATH, HeapStats,
+    HostShare, InstanceRegistry, InstructionSampler, MountTable, MountedFs, Namespace, Notify,
+    PerfMetricFilter, PerfMetricHistory, PerfMetricSample, PerfSample, ProfileFilter, ProfileScope,
+    ProfileSink, StatsSample, TraceEvent, TraceFilter, TraceHistory,
 };
 use crate::{MachineGeneration, MachineGenerationHandle, RootEntropy, RootEntropyHandle};
 use helios_hal::cpu::{HardwarePerfCounterDelta, Timebase};
+use helios_hal::fs::FileSystemRights;
 use helios_hal::rtc::{RealTimeClock, UnixSeconds};
 use spin::{Mutex, Once};
 
@@ -25,7 +26,6 @@ use crate::ComponentHostVsockService;
 use crate::component::{ComponentRuntimeState, ProviderSlot};
 use crate::device::DeviceGrantRegistry;
 use crate::network::HttpExchange;
-use crate::runtime::types::ComponentHostFilesystemState;
 
 #[derive(Clone)]
 pub struct RuntimeState<ProgramService, NetworkService, HostFsService> {
@@ -52,16 +52,19 @@ struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     /// on. Installed before the root entropy.
     machine_generation: Once<MachineGenerationHandle>,
     /// Nanoseconds between the monotonic clock and wall time, as the
-    /// platform's real-time clock set them during bring-up. Empty on a
-    /// machine that carries no such clock, where wall time is uptime.
-    wall_clock_offset_nanos: Once<i128>,
+    /// platform's real-time clock last set them: at bring-up, and again
+    /// after each machine restore. Unseeded on a machine that carries no
+    /// such clock, where wall time is uptime.
+    wall_clock: crate::exec::WallClock,
     /// Queue into the `http-client` kernel plugin. Empty on a kernel image
     /// that does not provision the plugin, in which case the runtime adapter
     /// answers a configuration error rather than trapping.
     http_client: ProviderSlot<HttpExchange>,
     host_fs_service: Mutex<Option<HostFsService>>,
-    /// The scratch disk the platform gave this kernel, once it has been
-    /// identified and proved. Empty on a machine with no block device.
+    /// What the kernel publishes about its disks once it identified them
+    /// and proved the scratch disk: the scratch disk's counters and the
+    /// compressed pool's settings. Empty on a machine with no block
+    /// device.
     block_service: Once<BlockService>,
     /// The devices the machine is willing to hand to user-mode drivers,
     /// as discovery published them. Empty on a machine whose backend
@@ -112,7 +115,11 @@ struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     /// `argv0`, and the boot filesystem it carries — parsed from the
     /// boot module at bring-up.
     payload: BootPayload,
-    bootfs: Mutex<Option<EmbeddedBootFs>>,
+    /// The root namespace: the kernel's own process tree, which every
+    /// program's tree descends from. Its root is the payload's boot
+    /// filesystem; the host share joins its table once a backend installs
+    /// the 9p client.
+    namespace: Namespace<HostFsService>,
     tracing: Mutex<TraceHistory>,
     /// The profile and perf histories, held as a handle rather than as
     /// fields so a subsystem this state owns can record into them
@@ -332,7 +339,7 @@ where
                 network_service_ready: Notify::new(),
                 root_entropy: Once::new(),
                 machine_generation: Once::new(),
-                wall_clock_offset_nanos: Once::new(),
+                wall_clock: crate::exec::WallClock::new(),
                 http_client: ProviderSlot::new(),
                 host_fs_service: Mutex::new(None),
                 block_service: Once::new(),
@@ -349,7 +356,10 @@ where
                 vsock_service: Once::new(),
                 futex_table: Mutex::new(FutexTable::new()),
                 payload,
-                bootfs: Mutex::new(Some(payload.bootfs())),
+                namespace: Namespace::new(MountTable::new(
+                    BootFs::new(payload.bootfs(), BOOT_DEVICE),
+                    processor_count,
+                )),
                 tracing: Mutex::new(TraceHistory::new(DEFAULT_TRACE_HISTORY_CAPACITY)),
                 profiles: ProfileSink::new(
                     DEFAULT_PROFILE_STACK_CAPACITY,
@@ -676,8 +686,9 @@ where
     /// The backend calls this once, on the bootstrap processor, after
     /// the kernel's log is installed and before any component runs, so
     /// every store the runtime opens afterwards reads the same calendar.
-    /// The clock is read exactly once: the monotonic timer carries time
-    /// forward from here, and nothing re-synchronises it.
+    /// The monotonic timer carries time forward from here; only a machine
+    /// restore moves the calendar again, through
+    /// [`Self::reseed_wall_clock`].
     ///
     /// A clock that answers with something no calendar can mean is a
     /// bring-up fault rather than a degraded mode, so it panics instead
@@ -686,19 +697,10 @@ where
     where
         Rtc: RealTimeClock,
     {
-        let wall = rtc.read().unwrap_or_else(|error| {
-            panic!(
-                "platform real-time clock {} could not be read: {error}",
-                Rtc::SOURCE
-            )
-        });
-        let offset = crate::exec::wall_clock_offset_nanos(wall, self.uptime_nanos(current_ticks));
-        let mut installed = false;
-        self.inner.wall_clock_offset_nanos.call_once(|| {
-            installed = true;
-            offset
-        });
-        assert!(installed, "the wall clock was seeded more than once");
+        let wall = Self::read_rtc(rtc);
+        self.inner
+            .wall_clock
+            .seed(self.offset_for(current_ticks, wall));
         tracing::info!(
             "wall clock seeded source={} unix_seconds={}",
             Rtc::SOURCE,
@@ -707,14 +709,48 @@ where
         wall
     }
 
+    /// Moves the wall clock to `wall`, a reading the real-time clock
+    /// gave at `current_ticks`, after the machine's calendar was
+    /// disturbed by a restore.
+    ///
+    /// Every store reads the machine's offset live, so each of them
+    /// follows at its next read. A caller is the machine-generation
+    /// reactions task, the only writer after bring-up.
+    pub fn reseed_wall_clock(&self, current_ticks: u64, wall: UnixSeconds) {
+        self.inner
+            .wall_clock
+            .reseed(self.offset_for(current_ticks, wall));
+    }
+
+    /// One reading of `rtc`, fatal when the device cannot answer: the
+    /// same fault whether it is the boot read or a read after a restore.
+    pub(crate) fn read_rtc<Rtc: RealTimeClock>(rtc: &Rtc) -> UnixSeconds {
+        rtc.read().unwrap_or_else(|error| {
+            panic!(
+                "platform real-time clock {} could not be read: {error}",
+                Rtc::SOURCE
+            )
+        })
+    }
+
+    /// The offset that puts the monotonic clock, at `current_ticks`, on
+    /// `wall`. A reading beyond what 64 bits of nanoseconds carry, which
+    /// is the year 2262, panics naming it.
+    fn offset_for(&self, current_ticks: u64, wall: UnixSeconds) -> i64 {
+        let offset = crate::exec::wall_clock_offset_nanos(wall, self.uptime_nanos(current_ticks));
+        i64::try_from(offset).unwrap_or_else(|_| {
+            panic!(
+                "real-time clock reported {} seconds, which is beyond the year 2262 that a \
+                 64-bit nanosecond wall-clock offset carries",
+                wall.get()
+            )
+        })
+    }
+
     /// Nanoseconds between the monotonic clock and wall time, zero until
     /// a real-time clock has seeded it.
     pub fn wall_clock_offset_nanos(&self) -> i128 {
-        self.inner
-            .wall_clock_offset_nanos
-            .get()
-            .copied()
-            .unwrap_or_default()
+        i128::from(self.inner.wall_clock.offset_nanos())
     }
 
     /// Wall time in nanoseconds since the Unix epoch, as the seeded
@@ -922,6 +958,18 @@ where
         );
     }
 
+    /// The machine generation as a shared handle, for a task that has to
+    /// own it.
+    pub fn machine_generation_handle(&self) -> MachineGenerationHandle {
+        self.inner
+            .machine_generation
+            .get()
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!("the machine generation was used before the backend installed it")
+            })
+    }
+
     /// The machine generation of this boot.
     pub fn machine_generation(&self) -> &MachineGeneration {
         self.inner.machine_generation.get().unwrap_or_else(|| {
@@ -941,30 +989,53 @@ where
 
     /// The root DRBG every instance pool is derived from.
     pub fn root_entropy(&self) -> &RootEntropy {
+        self.root_entropy_handle()
+    }
+
+    /// The shared handle to the root DRBG, cloned by a subsystem that
+    /// keeps drawing from it after construction.
+    pub fn root_entropy_handle(&self) -> &RootEntropyHandle {
         self.inner
             .root_entropy
             .get()
             .unwrap_or_else(|| panic!("root entropy was used before the backend installed it"))
     }
 
+    /// Installs the host share's 9p client and mounts the share at
+    /// [`HOST_SHARE_GUEST_MOUNT_PATH`].
     pub fn install_host_fs_service(&self, service: HostFsService) {
         let mut slot = self.inner.host_fs_service.lock();
         assert!(
             slot.is_none(),
             "host-fs service was installed more than once"
         );
-        *slot = Some(service);
+        *slot = Some(service.clone());
+        self.inner
+            .namespace
+            .table()
+            .mount(
+                HOST_SHARE_GUEST_MOUNT_PATH,
+                MountedFs::Host(HostShare::new(service)),
+                FileSystemRights::READ | FileSystemRights::WRITE,
+            )
+            .unwrap_or_else(|error| panic!("host share mount failed at bring-up: {error}"));
+    }
+
+    /// The root namespace. A program the kernel launches runs in a tree
+    /// that descends from it ([`Namespace::descend`]).
+    pub fn root_namespace(&self) -> &Namespace<HostFsService> {
+        &self.inner.namespace
     }
 
     pub fn host_fs_service(&self) -> Option<HostFsService> {
         self.inner.host_fs_service.lock().clone()
     }
 
-    /// Publishes the block device the kernel owns.
+    /// Publishes what the kernel knows about the machine's disks.
     ///
-    /// Called from the task that identified the disk and proved it round
-    /// trips, so a service that is visible here is one every consumer may
-    /// use without checking it first.
+    /// Called from the task that identified every disk and proved the
+    /// scratch disk round trips, so a service that is visible here is one
+    /// every consumer may use without checking it first.
     pub fn install_block_service(&self, service: BlockService) {
         let mut installed = false;
         self.inner.block_service.call_once(|| {
@@ -1046,10 +1117,6 @@ where
         self.inner.futex_table.lock().wake_all(key)
     }
 
-    pub fn bootfs(&self) -> Option<EmbeddedBootFs> {
-        *self.inner.bootfs.lock()
-    }
-
     /// The system component this payload carries, when this build would
     /// autostart one.
     pub fn system_component(&self) -> Option<EmbeddedComponent> {
@@ -1060,10 +1127,6 @@ where
     /// autostart.
     pub fn has_system_component(&self) -> bool {
         self.inner.payload.has_system_component()
-    }
-
-    pub fn retire_bootfs(&self) {
-        *self.inner.bootfs.lock() = None;
     }
 }
 
@@ -1124,7 +1187,7 @@ impl<ProgramService, NetworkService, HostFsService> ComponentRuntimeState
 where
     ProgramService: Clone + Send + 'static,
     NetworkService: crate::ComponentNetworkService,
-    HostFsService: Clone + Send + 'static,
+    HostFsService: Clone + Send + Sync + 'static,
 {
     fn retire_network_handles(&self, retired: &crate::SocketRetirementQueue) {
         if retired.is_empty() {
@@ -1214,27 +1277,57 @@ where
     }
 }
 
-impl<ProgramService, NetworkService, HostFsService> ComponentHostFilesystemState<HostFsService>
-    for RuntimeState<ProgramService, NetworkService, HostFsService>
-where
-    ProgramService: Clone + Send + 'static,
-    NetworkService: Clone + Send + Sync + 'static,
-    HostFsService: crate::HostFileSystem,
-{
-    fn host_filesystem_service(&self) -> Option<HostFsService> {
-        self.host_fs_service()
-    }
-
-    fn bootfs(&self) -> Option<EmbeddedBootFs> {
-        RuntimeState::bootfs(self)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use alloc::vec;
 
     use super::*;
+
+    /// A real-time clock whose reading the test moves, as a restore
+    /// moves the calendar.
+    struct SettableRtc(core::cell::Cell<u64>);
+
+    impl RealTimeClock for SettableRtc {
+        const SOURCE: &'static str = "test clock";
+
+        fn read(&self) -> Result<UnixSeconds, helios_hal::rtc::RtcError> {
+            Ok(UnixSeconds::new(self.0.get()))
+        }
+    }
+
+    #[test]
+    fn a_reseed_moves_the_wall_clock_to_the_new_reading() {
+        let state = RuntimeState::<(), (), ()>::new(
+            Timebase::new(1_000_000_000),
+            1,
+            0,
+            BootPayload::for_tests(),
+        );
+        let rtc = SettableRtc(core::cell::Cell::new(1_000));
+        state.seed_wall_clock(2_000_000_000, &rtc);
+        assert_eq!(state.wall_clock_nanos(2_000_000_000), 1_000_000_000_000);
+        assert_eq!(state.wall_clock_nanos(5_000_000_000), 1_003_000_000_000);
+
+        // The machine was stopped and the calendar moved a day.
+        rtc.0.set(1_000 + 86_400);
+        let wall = RuntimeState::<(), (), ()>::read_rtc(&rtc);
+        state.reseed_wall_clock(6_000_000_000, wall);
+        assert_eq!(state.wall_clock_nanos(6_000_000_000), 87_400_000_000_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "seeded more than once")]
+    fn seeding_the_wall_clock_twice_is_a_bring_up_fault() {
+        let state = RuntimeState::<(), (), ()>::new(
+            Timebase::new(1_000_000_000),
+            1,
+            0,
+            BootPayload::for_tests(),
+        );
+        let rtc = SettableRtc(core::cell::Cell::new(1_000));
+        state.seed_wall_clock(0, &rtc);
+        state.seed_wall_clock(0, &rtc);
+    }
 
     #[test]
     fn runtime_state_records_kernel_heap_delta_metrics() {

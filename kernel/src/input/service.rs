@@ -15,14 +15,28 @@
 //! from any processor. `claim` is a compare-and-exchange on one word per
 //! device.
 //!
-//! Each device's event queue has exactly one producer — the drain task
-//! that owns the device — and one consumer per stream the claiming
-//! instance opened. The producer never waits: a report that does not fit
-//! is dropped whole and counted, because parking the producer would park
+//! The event queue belongs to a claim, not to the device: every
+//! successful `claim` builds a [`ClaimEvents`] (queue, [`Notify`], alive
+//! flag) and installs it in the device's slot, and the claim's drop
+//! retires and uninstalls it. A stream a claim opened holds that claim's
+//! own state, so a stream kept past its claim's release can never pop
+//! the next owner's events: it reads what was left in its own queue and
+//! then ends. The slot is a pointer cell, written by `claim` and by the
+//! claim's drop (any processor) and read by the drain task once per
+//! report (the device's processor, task context); it is never held
+//! across an await and no interrupt handler reaches it, so it needs no
+//! local interrupt mask.
+//!
+//! Each claim's queue has exactly one producer — the drain task that
+//! owns the device — and one consumer per stream the claiming instance
+//! opened. The producer never waits: a report that does not fit is
+//! dropped whole and counted, because parking the producer would park
 //! the drain, and a drain that is parked is a virtio ring the host runs
 //! out of buffers on. The consumer parks on [`Notify`], armed before it
 //! looks at the queue, so a report published between the look and the
-//! park wakes it.
+//! park wakes it. The alive flag is written once, by the claim's drop,
+//! and read by consumers; it is set false before the final notify, so a
+//! consumer woken by the retirement sees it.
 //!
 //! The indicator queue is separate, because the direction is: a
 //! `set-led` must not wait behind an event nobody has read, and the
@@ -30,11 +44,13 @@
 //!
 //! A claim's release is not a message. The store that holds a claim is
 //! dropped by whatever kills its instance, and a drop cannot await, so
-//! the drop stores the claim word back to free and empties the queue.
-//! Nothing is owed to the device: the kernel's drain has never stopped,
-//! and the next claimant starts from the next report.
+//! the drop retires the claim's event state, moves the generation so
+//! indicator requests queued under the claim fail their check, and
+//! stores the claim word back to free. Nothing is owed to the device:
+//! the kernel's drain has never stopped, and the next claimant starts
+//! from the next report.
 
-use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use core::task::{Context, Poll};
 
 use alloc::string::String;
@@ -43,6 +59,7 @@ use arrayvec::ArrayVec;
 use concurrent_queue::ConcurrentQueue;
 use futures::channel::oneshot;
 use helios_hal::input::{InputCapabilities, InputEvent};
+use spin::Mutex;
 use triomphe::Arc;
 
 use crate::component::{ProviderError, ProviderSender};
@@ -128,20 +145,67 @@ pub(super) enum ReportOutcome {
     Unclaimed,
 }
 
+/// The event state of one claim.
+///
+/// Built by `claim`, installed in [`InputShared`] and shared with every
+/// stream the claim opens; retired by the claim's drop. Because it dies
+/// with the claim, a stream that outlives the claim cannot reach a later
+/// owner's events.
+///
+/// # Concurrency contract
+///
+/// `events` has one producer, the drain task (the device's processor),
+/// and consumers on whichever processor drives each stream. `published`
+/// is raised by the producer and by the retirement. `alive` is written
+/// once, by the claim's drop, and read by consumers and the producer.
+pub(super) struct ClaimEvents {
+    /// Whole reports the drain task committed, oldest first.
+    events: ConcurrentQueue<InputEvent>,
+    /// Raised once per committed report, and once on retirement.
+    published: Notify,
+    /// Cleared when the claim is dropped.
+    alive: AtomicBool,
+}
+
+impl ClaimEvents {
+    fn new() -> Self {
+        Self {
+            events: ConcurrentQueue::bounded(EVENT_QUEUE_DEPTH),
+            published: Notify::new(),
+            alive: AtomicBool::new(true),
+        }
+    }
+
+    fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
+    }
+
+    /// End every reader once it has read what is queued.
+    fn retire(&self) {
+        self.alive.store(false, Ordering::Release);
+        self.published.notify_all();
+    }
+}
+
 /// One device, as everything outside its owner tasks sees it.
 pub(super) struct InputShared {
     index: DeviceIndex,
     /// What the device said about itself while it was brought up.
     /// Immutable from then on, so this is read without a lock.
     capabilities: InputCapabilities,
-    /// Whole reports the drain task committed, oldest first.
-    events: ConcurrentQueue<InputEvent>,
-    /// Raised once per committed report.
-    published: Notify,
+    /// The holding claim's event state, if any.
+    ///
+    /// Written by `claim` and the claim's drop (any processor), read by
+    /// the drain task once per report to clone the `Arc` (device
+    /// processor, task context). A pointer cell only: never held across
+    /// an await, never reached from an interrupt, and the queue it
+    /// points at is lock-free.
+    installed: Mutex<Option<Arc<ClaimEvents>>>,
     /// One of [`ClaimState`]'s two values.
     claim: AtomicU8,
-    /// Bumped by every successful claim, so a request that outlived its
-    /// claim can be told from one that did not.
+    /// Bumped by every successful claim and by every claim's drop, so a
+    /// request that outlived its claim can be told from one that did
+    /// not.
     generation: AtomicU64,
     /// Events this device has handed to a reader.
     delivered: AtomicU64,
@@ -161,8 +225,7 @@ impl InputShared {
                 u8::try_from(index).expect("a machine brings up at most 256 input devices"),
             ),
             capabilities,
-            events: ConcurrentQueue::bounded(EVENT_QUEUE_DEPTH),
-            published: Notify::new(),
+            installed: Mutex::new(None),
             claim: AtomicU8::new(ClaimState::FREE),
             generation: AtomicU64::new(0),
             delivered: AtomicU64::new(0),
@@ -194,10 +257,13 @@ impl InputShared {
     /// moving, and a ring that stops moving is a machine whose next
     /// keystroke has nowhere to go.
     pub(super) fn publish_report(&self, report: &[InputEvent], truncated: bool) -> ReportOutcome {
-        if !self.is_claimed() {
+        let Some(claim) = self.installed.lock().clone() else {
+            return ReportOutcome::Unclaimed;
+        };
+        if !claim.is_alive() {
             return ReportOutcome::Unclaimed;
         }
-        if truncated || self.events.len() + report.len() > EVENT_QUEUE_DEPTH {
+        if truncated || claim.events.len() + report.len() > EVENT_QUEUE_DEPTH {
             let lost = self.lost_reports.fetch_add(1, Ordering::AcqRel) + 1;
             if lost == 1 {
                 tracing::warn!(
@@ -210,22 +276,15 @@ impl InputShared {
             return ReportOutcome::Dropped;
         }
         for event in report {
-            self.events
+            claim
+                .events
                 .push(*event)
                 .expect("the only producer just measured room for this whole report");
         }
         self.delivered
             .fetch_add(report.len() as u64, Ordering::AcqRel);
-        self.published.notify_all();
+        claim.published.notify_all();
         ReportOutcome::Delivered
-    }
-
-    /// Throw away whatever the queue still holds.
-    ///
-    /// Called when a claim is taken and again when it is let go, so no
-    /// instance is handed input that was meant for the one before it.
-    fn drain(&self) {
-        while self.events.pop().is_ok() {}
     }
 
     fn snapshot(&self) -> InputDeviceSnapshot {
@@ -295,10 +354,10 @@ impl InputService {
     /// twice. A caller that asks for a name no device has is told so
     /// rather than being handed something else.
     ///
-    /// The queue is emptied before the claim is handed back, so the new
-    /// owner's stream starts from the reports that follow. A report the
-    /// device was publishing at that instant may still reach it, which
-    /// is the input the user was giving as the claim was taken.
+    /// The claim gets an event queue of its own, so the new owner's
+    /// stream starts from the reports that follow. A report the device
+    /// was publishing at that instant may still reach it, which is the
+    /// input the user was giving as the claim was taken.
     ///
     /// `_cap` is the proof that the caller's authority names the input
     /// class; the check happened where the cap was derived.
@@ -325,9 +384,11 @@ impl InputService {
                 continue;
             }
             let generation = device.generation.fetch_add(1, Ordering::AcqRel) + 1;
-            device.drain();
+            let events = Arc::new(ClaimEvents::new());
+            *device.installed.lock() = Some(events.clone());
             return Ok(InputClaim {
                 shared: device.clone(),
+                events,
                 generation,
             });
         }
@@ -342,10 +403,13 @@ impl InputService {
 /// One instance's hold on one input device.
 ///
 /// Dropping it — or dying while holding it — hands the device back to
-/// the kernel's own drain and throws away whatever this owner never
-/// read.
+/// the kernel's own drain, ends every stream it opened once that stream
+/// has read what was already queued for it, and fails every indicator
+/// request still queued under it.
 pub struct InputClaim {
     shared: Arc<InputShared>,
+    /// This claim's own event state; also installed in `shared`.
+    events: Arc<ClaimEvents>,
     generation: u64,
 }
 
@@ -371,8 +435,8 @@ impl InputClaim {
     /// waited past.
     pub fn events(&self) -> InputEvents {
         InputEvents {
-            waiter: self.shared.published.waiter(),
-            shared: self.shared.clone(),
+            waiter: self.events.published.waiter(),
+            events: self.events.clone(),
         }
     }
 
@@ -396,9 +460,18 @@ impl Drop for InputClaim {
         // Not a message: a drop cannot await room in a queue, and the
         // instance this claim belonged to may already be dead. The
         // device itself needs nothing — the kernel's drain never
-        // stopped — so the word going back to free is the whole release.
+        // stopped — so retiring this claim's events and the word going
+        // back to free are the whole release.
+        //
+        // The generation moves here, not only on the next claim: an
+        // indicator request queued under this claim must fail its check
+        // however long the device then sits unclaimed.
+        self.events.retire();
+        *self.shared.installed.lock() = None;
+        self.shared.generation.fetch_add(1, Ordering::AcqRel);
+        // Last: a new claim installs its own state only after this word
+        // is free, so the uninstall above can never remove its state.
         self.shared.claim.store(ClaimState::FREE, Ordering::Release);
-        self.shared.drain();
     }
 }
 
@@ -438,32 +511,37 @@ pub type EventBurst = ArrayVec<InputEvent, EVENT_QUEUE_DEPTH>;
 /// armed before every look at the queue: [`InputEvents::poll_burst`]
 /// re-arms as part of completing a wait, and the constructor arms the
 /// first one, so a report committed between a look and a park cannot be
-/// slept through.
+/// slept through. It holds its claim's own queue, never the device's
+/// current one, so it ends with its claim.
 pub struct InputEvents {
-    shared: Arc<InputShared>,
+    events: Arc<ClaimEvents>,
     waiter: NotifyWaiter,
 }
 
 impl InputEvents {
-    /// Every event queued right now, or a park until one is.
+    /// Every event queued right now, a park until one is, or `None` once
+    /// the claim is gone and nothing is left to read.
     ///
     /// Events come back in the order the device produced them,
     /// `SYN_REPORT` included, and a burst may end mid-report: the queue
     /// holds only reports the drain committed whole, so the rest of one
     /// is already on its way rather than lost.
-    pub fn poll_burst(&mut self, cx: &mut Context<'_>) -> Poll<EventBurst> {
+    pub fn poll_burst(&mut self, cx: &mut Context<'_>) -> Poll<Option<EventBurst>> {
         loop {
             let mut burst = EventBurst::new();
             while !burst.is_full() {
-                match self.shared.events.pop() {
+                match self.events.events.pop() {
                     Ok(event) => burst.push(event),
                     Err(_) => break,
                 }
             }
             if !burst.is_empty() {
-                return Poll::Ready(burst);
+                return Poll::Ready(Some(burst));
             }
-            match self.shared.published.poll_notified(cx, &mut self.waiter) {
+            if !self.events.is_alive() {
+                return Poll::Ready(None);
+            }
+            match self.events.published.poll_notified(cx, &mut self.waiter) {
                 Poll::Ready(()) => continue,
                 Poll::Pending => return Poll::Pending,
             }

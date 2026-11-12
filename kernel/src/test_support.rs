@@ -127,6 +127,20 @@ impl Cpu for TestCpu {
     }
 }
 
+/// A root DRBG seeded from the test CPU's entropy source, for a test that
+/// builds something which draws from it at construction.
+pub(crate) fn test_root_entropy() -> crate::RootEntropyHandle {
+    crate::RootEntropyHandle::new(
+        crate::RootEntropy::from_platform(
+            &TestCpu::with_entropy(0x5a),
+            None,
+            None,
+            crate::MachineGeneration::new(None),
+        )
+        .expect("the test CPU has an entropy source"),
+    )
+}
+
 /// A timer whose base belongs to the processor the calling test thread
 /// stands for, as [`crate::Executor::timer`] brings one online on every
 /// processor, on a group of its own so no other test's sleeps share it.
@@ -920,6 +934,10 @@ mod network {
 
         fn hardware_address(&self) -> [u8; 6] {
             [2, 0, 0, 0, 0, 1]
+        }
+
+        fn revalidate_lease(&self) -> impl Future<Output = ()> + Send + '_ {
+            core::future::ready(())
         }
 
         fn ipv4_cidr(

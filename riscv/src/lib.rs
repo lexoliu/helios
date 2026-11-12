@@ -153,8 +153,8 @@ use helios_hal::memory::MemoryRegion;
 use helios_hal::serial::ByteSerial;
 use helios_hal::{DeviceInventory, DmaModel, ProcessorStartupPolicy, ProcessorTopology};
 use helios_kernel::{
-    DebugSerialAccess, KernelException, KernelExceptionCause, KernelExceptionDispatch,
-    KernelNativeTrapHandler, Timer, WasmtimeTlsSlots,
+    DebugSerialAccess, KernelException, KernelExceptionCause, KernelNativeTrapHandler, Timer,
+    WasmtimeTlsSlots,
 };
 use riscv::interrupt::Trap;
 use riscv::interrupt::supervisor::{Exception, Interrupt};
@@ -354,6 +354,13 @@ struct HartRuntime {
     wasmtime_tls: WasmtimeTlsSlots,
     external_interrupts: Option<net::ExternalInterrupts>,
     program_service: Option<debug_state::ProgramService>,
+    /// The stack a kernel exception the kernel did not resolve is handed
+    /// to the runtime from (`trap::hand_over_trap`). It is not the trap
+    /// stack because the hand-over gives that back before the runtime's
+    /// handler runs, so the next trap can carve its region at the top.
+    hand_over_stack: Range<usize>,
+    /// The record of this hart's trap hand-over self-check.
+    hand_over_probe: trap::HandOverProbe,
 }
 
 const _: () = assert!(
@@ -618,9 +625,14 @@ fn trap_dispatch(tf: &mut TrapFrame) {
             }
             current_hart_runtime().timer.handle_interrupt();
         }
-        Ok(Trap::Interrupt(Interrupt::SupervisorSoft)) => unsafe {
-            riscv::register::sip::clear_ssoft();
-        },
+        Ok(Trap::Interrupt(Interrupt::SupervisorSoft)) => {
+            if let Some(runtime) = installed_hart_runtime() {
+                runtime.hand_over_probe.record_interrupt(tf);
+            }
+            unsafe {
+                riscv::register::sip::clear_ssoft();
+            }
+        }
         Ok(Trap::Interrupt(Interrupt::SupervisorExternal)) => {
             let runtime = current_hart_runtime();
             let interrupts = runtime.external_interrupts.as_ref().unwrap_or_else(|| {
@@ -631,6 +643,10 @@ fn trap_dispatch(tf: &mut TrapFrame) {
             });
             interrupts.handle();
         }
+        // The trap hand-over self-check's second trap is resolved in place.
+        Ok(Trap::Exception(Exception::Breakpoint))
+            if installed_hart_runtime()
+                .is_some_and(|runtime| runtime.hand_over_probe.resolve_returning_trap(tf)) => {}
         Ok(Trap::Exception(exception)) => {
             handle_exception(exception, tf);
         }
@@ -804,10 +820,12 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         debug_state.install_root_entropy(root.clone());
         // The calendar is read once, on the bootstrap hart, before any
         // component can ask what time it is. The hart timer carries wall
-        // time forward from that reading; nothing re-synchronises it.
-        match rtc::discover(&fdt) {
+        // time forward from that reading; only a machine restore re-reads
+        // it, which the reactions task does with the same clock.
+        let rtc = rtc::discover(&fdt);
+        match &rtc {
             Some(rtc) => {
-                debug_state.seed_wall_clock(cpu.now().ticks(), &rtc);
+                debug_state.seed_wall_clock(cpu.now().ticks(), rtc);
             }
             None => {
                 tracing::warn!(
@@ -815,6 +833,7 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
                 );
             }
         }
+        helios_kernel::install_generation_reactions(&kernel, debug_state.clone(), rtc);
         root
     });
     // Only the bootstrap hart brings devices up, and it is the hart
@@ -903,6 +922,8 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         wasmtime_tls: WasmtimeTlsSlots::new(),
         external_interrupts,
         program_service: None,
+        hand_over_stack: trap::allocate_trap_stack(),
+        hand_over_probe: trap::HandOverProbe::new(),
     };
     hart_runtime.install();
     // Every hart's timer preempts the guest running on it, so every hart
@@ -1279,15 +1300,17 @@ unsafe fn configure_interrupts() {
     // prove it round-trips the floating-point file. §3.4: every hart proves
     // it for itself, because `FS` and the trap vector are per-hart state.
     trap::verify_trap_preserves_fp_state();
+    // `sscratch` and the hand-over stack are per-hart state too.
+    trap::verify_trap_hand_over();
 }
 
 /// Handles one synchronous exception.
 ///
 /// Returns only when the fault was resolved in place and the trap
 /// epilogue should restore the interrupted context and run the faulting
-/// instruction again. Every other path diverges: into the runtime's trap
-/// handler, which unwinds the guest and never comes back, or into a
-/// panic.
+/// instruction again. Every other path diverges: into the hand-over to
+/// the runtime's trap handler (`trap::hand_over_trap`), which leaves the
+/// trap stack for good, or into a panic.
 fn handle_exception(exception: Exception, tf: &TrapFrame) {
     let stval = riscv::register::stval::read();
     // A reserved page inside a live fiber stack is a demand commit the
@@ -1304,56 +1327,36 @@ fn handle_exception(exception: Exception, tf: &TrapFrame) {
     }
     match trap_origin(tf) {
         TrapOrigin::Kernel => {
-            if dispatch_kernel_exception(exception, stval, tf) == KernelExceptionDispatch::Unhandled
-            {
+            let Some(cause) = kernel_exception_cause(exception) else {
                 panic!(
                     "kernel exception: {exception:?}, sepc={:#x}, stval={:#x}{stack_fault}, \
                      tf={tf:#x?}",
                     tf.sepc, stval,
                 );
-            }
-            unreachable!("handled kernel exception returned to the RISC-V dispatcher")
+            };
+            let refusal = trap::hand_over_trap(
+                trap::TrapHandOver {
+                    exception: KernelException {
+                        cause,
+                        instruction_pointer: tf.sepc,
+                        frame_pointer: tf.general.s0,
+                        faulting_address: kernel_exception_faulting_address(exception, stval),
+                    },
+                    cause: exception,
+                    stval,
+                    stack_fault,
+                    frame_address: core::ptr::from_ref(tf) as usize,
+                    frame: *tf,
+                },
+                tf,
+            );
+            panic!(
+                "kernel exception: {exception:?}, sepc={:#x}, stval={:#x}{stack_fault}, \
+                 tf={tf:#x?}; not handed to the runtime because {refusal}",
+                tf.sepc, stval,
+            )
         }
         TrapOrigin::User => handle_user_exception(exception, stval, tf),
-    }
-}
-
-fn dispatch_kernel_exception(
-    exception: Exception,
-    stval: usize,
-    tf: &TrapFrame,
-) -> KernelExceptionDispatch {
-    let Some(cause) = kernel_exception_cause(exception) else {
-        return KernelExceptionDispatch::Unhandled;
-    };
-    trap::restore_trap_stack_for_unwind(tf);
-    restore_sie_for_unwind(tf);
-    helios_kernel::dispatch_native_trap(KernelException {
-        cause,
-        instruction_pointer: tf.sepc,
-        frame_pointer: tf.general.s0,
-        faulting_address: kernel_exception_faulting_address(exception, stval),
-    })
-}
-
-/// Puts the interrupted context's supervisor interrupt enable back
-/// before an exception is handed to the runtime's trap handler.
-///
-/// The handler never returns for a trap it claims: it unwinds out of
-/// this handler onto the interrupted stack, so the `sret` that would
-/// have restored `SIE` from `SPIE` never runs and the trap entry's
-/// clearing of it would outlive the handler. Everything the unwind
-/// lands in — the store's teardown, its fiber stack's release, the TLB
-/// shootdown that release broadcasts — is the interrupted code's
-/// continuation and runs on that code's terms, so `SIE` is restored
-/// here, before the hand-over. The panic path for a trap the runtime
-/// declines runs with it restored too.
-fn restore_sie_for_unwind(tf: &TrapFrame) {
-    if tf.sstatus & SSTATUS_SPIE_BIT != 0 {
-        // SAFETY: the interrupted context ran with supervisor interrupts
-        // enabled, and what runs from here is that context's
-        // continuation.
-        unsafe { riscv::interrupt::supervisor::enable() };
     }
 }
 

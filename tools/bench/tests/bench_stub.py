@@ -55,6 +55,26 @@ if [ -n "${HELIOS_TEST_ORDER:-}" ]; then
     printf '%s %s %s %s\n' "$(basename "$PWD")" "$(basename "$HELIOS_WORKSPACE_ROOT")" \
         "${HELIOS_INSPECTOR_BIN:--}" "$HELIOS_WORKLOAD_BENCH_WORKLOADS" >> "$HELIOS_TEST_ORDER"
 fi
+# What each boot was asked to profile, one line per boot, so a test can
+# tell a timed boot from a profile boot by the variables it was handed.
+# The profile boot writes the artifacts the inspector would, and
+# HELIOS_TEST_PROFILE_FAIL makes it die the way a failed guest does.
+if [ -n "${HELIOS_TEST_PROFILE_LOG:-}" ]; then
+    printf '%s|%s|%s|%s|%s|%s\n' "$(basename "$HELIOS_WORKSPACE_ROOT")" \
+        "$(basename "$log")" "${HELIOS_WORKLOAD_BENCH_KERNEL_PROFILE_OUTPUT:-}" \
+        "${HELIOS_WORKLOAD_BENCH_PERF_METRICS_OUTPUT:-}" \
+        "${HELIOS_WORKLOAD_BENCH_PROFILE_OUTPUT:-}" \
+        "${HELIOS_WORKLOAD_BENCH_USER_PROFILE_OUTPUT:-}" >> "$HELIOS_TEST_PROFILE_LOG"
+fi
+if [ -n "${HELIOS_WORKLOAD_BENCH_KERNEL_PROFILE_OUTPUT:-}" ]; then
+    if [ -n "${HELIOS_TEST_PROFILE_FAIL:-}" ]; then
+        exit 1
+    fi
+    printf 'kernel;network;rx 5\n' > "$HELIOS_WORKLOAD_BENCH_KERNEL_PROFILE_OUTPUT"
+fi
+if [ -n "${HELIOS_WORKLOAD_BENCH_PERF_METRICS_OUTPUT:-}" ]; then
+    printf '[]\n' > "$HELIOS_WORKLOAD_BENCH_PERF_METRICS_OUTPUT"
+fi
 if [ "$HELIOS_WORKLOAD_BENCH_CLASSES" = "@WEDGED@" ]; then
     sleep 600 &
     echo $! > "$HELIOS_TEST_WEDGE_PID_FILE"

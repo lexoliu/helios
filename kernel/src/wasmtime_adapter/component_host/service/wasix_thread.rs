@@ -301,7 +301,8 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    p1_write_u32(caller, memory, ret_tid, caller.data().thread_id)
+    let thread_id = caller.data().thread_id;
+    p1_write_u32(caller, memory, GuestAddress::wasm32(ret_tid), thread_id)
 }
 
 pub(super) async fn wasix_thread_spawn_v2<CpuImpl, Net, HostFs>(
@@ -318,7 +319,14 @@ where
         return p1::errno::FAULT;
     };
     let mut thread_start = [0_u8; WASIX_THREAD_START_SIZE];
-    if p1_read_memory_into(caller, memory, args, &mut thread_start).is_err() {
+    if p1_read_memory_into(
+        caller,
+        memory,
+        GuestAddress::wasm32(args),
+        &mut thread_start,
+    )
+    .is_err()
+    {
         return p1::errno::FAULT;
     }
     let Some(imported_memory) = caller.data().imported_memory.clone() else {
@@ -348,7 +356,7 @@ where
     let output_mode = caller.data().output_mode.clone();
     let read_serial = caller.data().read_serial;
     let write_serial = caller.data().write_serial;
-    let filesystem = caller.data().filesystem.snapshot();
+    let filesystem = caller.data().filesystem.clone();
     let descriptors = caller.data().descriptors.clone();
     let signal_state = caller.data().signal_state.clone();
     let wasix_abi = caller.data().wasix_abi;
@@ -390,7 +398,7 @@ where
         Err(errno) => return errno,
     };
     store_data.set_thread_id(tid);
-    let status = p1_write_u32(caller, memory, ret_tid, tid);
+    let status = p1_write_u32(caller, memory, GuestAddress::wasm32(ret_tid), tid);
     if status != p1::errno::SUCCESS {
         threads.withdraw(tid);
         exit.publish(u32::from(status as u16));
@@ -629,7 +637,12 @@ where
         Ok(parallelism) => parallelism,
         Err(_) => return p1::errno::OVERFLOW,
     };
-    p1_write_u32(caller, memory, ret_parallelism, parallelism)
+    p1_write_u32(
+        caller,
+        memory,
+        GuestAddress::wasm32(ret_parallelism),
+        parallelism,
+    )
 }
 
 pub(super) fn wasix_thread_signal<CpuImpl, Net, HostFs>(
@@ -785,7 +798,7 @@ where
         let Some(memory) = p1_memory(caller) else {
             return p1::errno::FAULT;
         };
-        return p1_write_u64(caller, memory, ret_value, value);
+        return p1_write_u64(caller, memory, GuestAddress::wasm32(ret_value), value);
     }
 
     let Some(memory) = p1_memory(caller) else {
@@ -802,7 +815,12 @@ where
         Ok(len) => len,
         Err(_) => return p1::errno::OVERFLOW,
     };
-    let memory_stack = match p1_read_memory(caller, memory, stack_pointer, memory_stack_len) {
+    let memory_stack = match p1_read_memory(
+        caller,
+        memory,
+        GuestAddress::wasm32(stack_pointer),
+        memory_stack_len,
+    ) {
         Ok(stack) => stack,
         Err(_) => return p1::errno::FAULT,
     };
@@ -810,9 +828,20 @@ where
         Some(begin) if begin <= stack_pointer => begin,
         _ => return p1::errno::OVERFLOW,
     };
-    let status = p1_write_u32(caller, memory, stack_lower, unwind_stack_begin)
-        .max(p1_write_u32(caller, memory, stack_lower + 4, stack_pointer))
-        .max(p1_write_u64(caller, memory, ret_value, 0));
+    let stack_lower_address = GuestAddress::wasm32(stack_lower);
+    let status = p1_write_u32(caller, memory, stack_lower_address, unwind_stack_begin)
+        .max(p1_write_u32(
+            caller,
+            memory,
+            stack_lower_address.offset(4),
+            stack_pointer,
+        ))
+        .max(p1_write_u64(
+            caller,
+            memory,
+            GuestAddress::wasm32(ret_value),
+            0,
+        ));
     if status != p1::errno::SUCCESS {
         return status;
     }
@@ -844,9 +873,11 @@ where
             detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
         }));
     };
-    let hash_lower = p1_try_read_u64(caller, memory, snapshot + 8).map_err(wasmtime::Error::new)?;
+    let snapshot = GuestAddress::wasm32(snapshot);
+    let hash_lower =
+        p1_try_read_u64(caller, memory, snapshot.offset(8)).map_err(wasmtime::Error::new)?;
     let hash_upper =
-        p1_try_read_u64(caller, memory, snapshot + 16).map_err(wasmtime::Error::new)?;
+        p1_try_read_u64(caller, memory, snapshot.offset(16)).map_err(wasmtime::Error::new)?;
     let Ok((stack_lower, stack_upper, stack_pointer)) = wasix_stack_bounds_from_caller(caller)
     else {
         return Err(wasmtime::Error::new(ProgramExecError {
@@ -868,12 +899,10 @@ where
                 detail: ProgramExecErrorDetail::StackBoundsInvalid,
             })
         })?;
-    let status = p1_write_u32(caller, memory, stack_lower, unwind_stack_begin).max(p1_write_u32(
-        caller,
-        memory,
-        stack_lower + 4,
-        stack_pointer,
-    ));
+    let stack_lower_address = GuestAddress::wasm32(stack_lower);
+    let status = p1_write_u32(caller, memory, stack_lower_address, unwind_stack_begin).max(
+        p1_write_u32(caller, memory, stack_lower_address.offset(4), stack_pointer),
+    );
     if status != p1::errno::SUCCESS {
         return Err(wasmtime::Error::new(ProgramExecError {
             kind: ProgramExecErrorKind::InvalidBinary,
@@ -909,7 +938,8 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let timeout = match wasix_read_optional_timestamp(caller, memory, timeout) {
+    let timeout = match wasix_read_optional_timestamp(caller, memory, GuestAddress::wasm32(timeout))
+    {
         Ok(timeout) => timeout,
         Err(errno) => return errno,
     };
@@ -921,7 +951,7 @@ where
     // wake-all landing between the comparison and the park is only
     // observed by a wait that was armed first.
     let wake = registration.notify().notified();
-    let current = match p1_try_read_u32(caller, memory, futex) {
+    let current = match p1_try_read_u32(caller, memory, GuestAddress::wasm32(futex)) {
         Ok(value) => value,
         Err(_) => {
             drop(wake);
@@ -964,7 +994,7 @@ where
         .data()
         .runtime_state
         .complete_futex_wait(registration);
-    p1_write_wasix_bool(caller, memory, ret_woken, woken)
+    p1_write_wasix_bool(caller, memory, GuestAddress::wasm32(ret_woken), woken)
 }
 
 pub(super) fn wasix_futex_wake<CpuImpl, Net, HostFs>(
@@ -980,12 +1010,12 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    if p1_try_read_u32(caller, memory, futex).is_err() {
+    if p1_try_read_u32(caller, memory, GuestAddress::wasm32(futex)).is_err() {
         return p1::errno::FAULT;
     }
     let key = caller.data().futex_key(futex);
     let woken = caller.data().runtime_state.wake_futex(key, 1) != 0;
-    p1_write_wasix_bool(caller, memory, ret_woken, woken)
+    p1_write_wasix_bool(caller, memory, GuestAddress::wasm32(ret_woken), woken)
 }
 
 pub(super) fn wasix_futex_wake_all<CpuImpl, Net, HostFs>(
@@ -1001,12 +1031,12 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    if p1_try_read_u32(caller, memory, futex).is_err() {
+    if p1_try_read_u32(caller, memory, GuestAddress::wasm32(futex)).is_err() {
         return p1::errno::FAULT;
     }
     let key = caller.data().futex_key(futex);
     let woken = caller.data().runtime_state.wake_all_futex(key) != 0;
-    p1_write_wasix_bool(caller, memory, ret_woken, woken)
+    p1_write_wasix_bool(caller, memory, GuestAddress::wasm32(ret_woken), woken)
 }
 
 #[cfg(test)]

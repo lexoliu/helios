@@ -46,7 +46,7 @@ mod wasix_epoll;
 use wasix_epoll::*;
 
 use super::*;
-use crate::process::FreeDescriptorSlots;
+use crate::process::{DescriptorLimit, FreeDescriptorSlots};
 use crate::wasmtime_adapter::artifact_profile::{self, ArtifactProfileError};
 use crate::wasmtime_adapter::code_map::{CodeMap, CodeRegistration};
 use crate::wasmtime_adapter::config::AotCompileHint;
@@ -56,11 +56,12 @@ use crate::wasmtime_adapter::{WasmtimeCompiledComponent, WasmtimeCompiledCoreMod
 use crate::wasmtime_adapter::{
     WasmtimePrecompiledKind,
     wasi::{
-        DebugFileSystem, DebugFileSystemSnapshot, FileContents, FsDescriptor, FsNodeKind,
-        WasiImportSet, bindings::filesystem::types as fs_types, preview1 as p1,
+        self as wasi_fs, FsDescriptor, FsNodeKind, WasiImportSet,
+        bindings::filesystem::types as fs_types, preview1 as p1,
     },
 };
-use crate::{BootfsBytes, ProgramExecErrorDetail, RuntimeMessage};
+use crate::{BootfsBytes, GuestAddress, ProgramExecErrorDetail, RuntimeMessage};
+use crate::{FileContents, MemoryFs, Namespace};
 use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -73,10 +74,12 @@ use core::task::{Context, Poll};
 use core::time::Duration;
 use hashbrown::HashMap;
 use helios_compiler_abi::{
-    CompileHint as CompilerAbiHint, CompilerRequestHeader, CompilerResponseHeader, CompilerStatus,
+    CompileHint as CompilerAbiHint, CompilerRequestHeader, CompilerResponseHeader,
     HELIOS_COMPILER_ABI_VERSION, HELIOS_COMPILER_ALLOC, HELIOS_COMPILER_COMPILE,
-    HELIOS_COMPILER_INITIALIZE, HELIOS_COMPILER_PTHREAD_SELF_OFFSET,
+    HELIOS_COMPILER_FREE, HELIOS_COMPILER_INITIALIZE, HELIOS_COMPILER_OUTSTANDING_BYTES,
+    HELIOS_COMPILER_PTHREAD_SELF_OFFSET,
 };
+use helios_hal::fs::WritePosition;
 use helios_hal::watchdog::Watchdog;
 use smallvec::SmallVec;
 use thiserror::Error;
@@ -119,6 +122,16 @@ type Preview1IovRanges = SmallVec<[(usize, usize); 8]>;
 type CompilerThreadTasks = SmallVec<[crate::JoinHandle<CompilerThreadReport>; 8]>;
 type CompilerThreadReports = SmallVec<[CompilerThreadReport; 8]>;
 type CompilerPluginHandle<CpuImpl, Net, HostFs> = Arc<CompilerPluginRuntime<CpuImpl, Net, HostFs>>;
+
+/// What [`UserProgramService::aot`] produced.
+pub(crate) struct AotArtifact {
+    /// The signed `cwasm` artifact.
+    pub(crate) signed: Vec<u8>,
+    /// The worker count the compiler plugin was told to compile with
+    /// (`compiler_plugin_worker_threads`), reported so a caller comparing
+    /// this compile with another can hold the count fixed.
+    pub(crate) worker_threads: u32,
+}
 
 #[derive(Clone, Copy, Default)]
 struct CompilerPhaseTimestamps {
@@ -191,11 +204,15 @@ where
 /// Distinct from [`ProgramExecContext`], which is the host the program
 /// runs *in*, and from [`ChildStdio`], which is how the caller talks to
 /// it once it is running.
-pub(super) struct ProgramLaunch<Net: ComponentHostNetwork> {
+pub(super) struct ProgramLaunch<Net: ComponentHostNetwork, HostFs: crate::HostFileSystem> {
     argv: ProgramArgv,
     env: LaunchEnvironment,
     authority: ProcessAuthority,
-    filesystem: Option<DebugFileSystemSnapshot>,
+    /// The namespace the program runs in: the launcher's own tree when it
+    /// shares it, or a tree descending from the launcher's. `None` for a
+    /// program the kernel launches, which runs in a tree descending from
+    /// the root namespace.
+    filesystem: Option<Namespace<HostFs>>,
     /// Inherited preview1 descriptors. Only core modules have a
     /// descriptor table; a component ignores one.
     descriptors: Option<Preview1DescriptorTable<Net>>,
@@ -206,7 +223,7 @@ pub(super) struct ProgramLaunch<Net: ComponentHostNetwork> {
     timeline: phases::Timeline,
 }
 
-impl<Net: ComponentHostNetwork> ProgramLaunch<Net> {
+impl<Net: ComponentHostNetwork, HostFs: crate::HostFileSystem> ProgramLaunch<Net, HostFs> {
     /// A launch that inherits nothing: no descriptors, no signal
     /// dispositions. `env` is the caller's environment; the kernel owns
     /// `HELIOS_PROCESS_ID` and replaces any entry for it (see
@@ -215,7 +232,7 @@ impl<Net: ComponentHostNetwork> ProgramLaunch<Net> {
         argv: ProgramArgv,
         env: Vec<(String, String)>,
         authority: ProcessAuthority,
-        filesystem: Option<DebugFileSystemSnapshot>,
+        filesystem: Option<Namespace<HostFs>>,
     ) -> Self {
         Self {
             argv,
@@ -309,10 +326,10 @@ where
     /// Serialises compile calls. The cached `SharedMemory` is the
     /// plugin's only scratch surface; concurrent calls would race on
     /// the bump allocator and corrupt each other's request/response
-    /// buffers. The lock is held only on the kernel side; the rayon
+    /// buffers. The slot is held only on the kernel side; the rayon
     /// worker pool inside the plugin still parallelises a single
     /// compile across all cores.
-    compile_in_progress: AtomicBool,
+    compile_slot: CompilerCompileSlot,
     /// Every wasm image this service loaded, by address, for the
     /// instruction sampler to name.
     code_map: CodeMap,
@@ -327,11 +344,11 @@ struct ProgramComponent {
     _code: CodeRegistration,
 }
 
-struct ProgramSpawnRequest<Net: ComponentHostNetwork> {
+struct ProgramSpawnRequest<Net: ComponentHostNetwork, HostFs: crate::HostFileSystem> {
     argv: ProgramArgv,
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
-    filesystem: Option<DebugFileSystemSnapshot>,
+    filesystem: Option<Namespace<HostFs>>,
     descriptors: Option<Preview1DescriptorTable<Net>>,
     signal_state: WasixSignalState,
     signal_dispositions: Vec<WasixSignalDisposition>,
@@ -352,21 +369,21 @@ pub(crate) enum ProgramSource {
 }
 
 impl ProgramSource {
-    /// Classifies a program read from the in-memory filesystem by the
-    /// provenance its node carries.
+    /// Classifies a program file by the provenance the filesystem layer
+    /// that produced its bytes gave them.
     pub(crate) fn from_file(contents: FileContents) -> Self {
         match contents {
-            FileContents::Bootfs(bytes) if cwasm::is_cwasm(bytes.as_slice()) => {
+            FileContents::Boot(bytes) if cwasm::is_cwasm(bytes.as_slice()) => {
                 Self::BootfsArtifact(bytes)
             }
-            FileContents::Bootfs(bytes) => Self::RawWasm(bytes.to_bytes()),
+            FileContents::Boot(bytes) => Self::RawWasm(bytes.to_bytes()),
             FileContents::Written(bytes) => Self::from_untrusted(bytes),
         }
     }
 
     /// Classifies bytes no boot payload vouches for: a file a guest
-    /// wrote, or one read from the host share.
-    pub(crate) fn from_untrusted(bytes: Bytes) -> Self {
+    /// wrote, on whichever mount, or one a host shared.
+    fn from_untrusted(bytes: Bytes) -> Self {
         if cwasm::is_cwasm(&bytes) {
             Self::SignedArtifact(bytes)
         } else {
@@ -447,7 +464,7 @@ impl ChildHandle {
 pub struct ChildExit {
     pub instance_id: crate::InstanceId,
     pub exit_code: u32,
-    filesystem: Option<DebugFileSystemSnapshot>,
+    filesystem: Option<MemoryFs>,
 }
 
 pub fn install_program_service<CpuImpl, Net, HostFs, WatchdogImpl>(
@@ -533,7 +550,7 @@ where
             core_module_instance_pre_cache: Arc::new(Mutex::new(ComponentCache::new(cache_budget))),
             compiler_artifact,
             compiler_plugin: Mutex::new(None),
-            compile_in_progress: AtomicBool::new(false),
+            compile_slot: CompilerCompileSlot::new(),
             code_map: CodeMap::new(),
             clock_cpu: cpu.clone(),
             _marker: core::marker::PhantomData,
@@ -1215,7 +1232,7 @@ where
         exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
         source: ProgramSource,
         hint: Option<AotCompileHint>,
-        launch: ProgramLaunch<Net>,
+        launch: ProgramLaunch<Net, HostFs>,
     ) -> Result<ChildHandle, ProgramExecError> {
         super::emit_program_stage_marker(exec_context.write_serial, "program:spawn-begin");
         let executable = self
@@ -1241,7 +1258,7 @@ where
         exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
         source: ProgramSource,
         hint: Option<AotCompileHint>,
-        mut launch: ProgramLaunch<Net>,
+        mut launch: ProgramLaunch<Net, HostFs>,
         output_mode: OutputMode,
         stdio: ChildStdio,
     ) -> Result<ChildHandle, ProgramExecError> {
@@ -1266,7 +1283,7 @@ where
         &self,
         exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
         executable: ProgramExecutable<CpuImpl, Net, HostFs>,
-        launch: ProgramLaunch<Net>,
+        launch: ProgramLaunch<Net, HostFs>,
     ) -> Result<ChildHandle, ProgramExecError> {
         let (stdin_writer, stdin_reader) = crate::byte_channel();
         let (stdout_writer, stdout_reader) = crate::byte_channel();
@@ -1292,7 +1309,7 @@ where
         &self,
         exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
         executable: ProgramExecutable<CpuImpl, Net, HostFs>,
-        launch: ProgramLaunch<Net>,
+        launch: ProgramLaunch<Net, HostFs>,
         output_mode: OutputMode,
         stdio: ChildStdio,
     ) -> Result<ChildHandle, ProgramExecError> {
@@ -1404,7 +1421,7 @@ where
         source: ProgramSource,
         hint: Option<AotCompileHint>,
         stdin: Vec<u8>,
-        launch: ProgramLaunch<Net>,
+        launch: ProgramLaunch<Net, HostFs>,
     ) -> Result<ExecResult, ProgramExecError> {
         self.exec_buffered_with_snapshot(exec_context, source, hint, stdin, launch)
             .await
@@ -1417,8 +1434,8 @@ where
         source: ProgramSource,
         hint: Option<AotCompileHint>,
         stdin: Vec<u8>,
-        launch: ProgramLaunch<Net>,
-    ) -> Result<(ExecResult, Option<DebugFileSystemSnapshot>), ProgramExecError> {
+        launch: ProgramLaunch<Net, HostFs>,
+    ) -> Result<(ExecResult, Option<MemoryFs>), ProgramExecError> {
         let executable = self
             .load_executable(
                 &exec_context,
@@ -1438,8 +1455,8 @@ where
         exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
         executable: ProgramExecutable<CpuImpl, Net, HostFs>,
         stdin: Vec<u8>,
-        launch: ProgramLaunch<Net>,
-    ) -> Result<(ExecResult, Option<DebugFileSystemSnapshot>), ProgramExecError> {
+        launch: ProgramLaunch<Net, HostFs>,
+    ) -> Result<(ExecResult, Option<MemoryFs>), ProgramExecError> {
         let mut child = self.spawn_loaded(exec_context, executable, launch)?;
 
         // Feed stdin in one shot, then close the writer to signal EOF.
@@ -1493,9 +1510,14 @@ where
         wasm: &Bytes,
         hint: AotCompileHint,
         profile: bool,
-    ) -> Result<Vec<u8>, ProgramExecError> {
-        self.compile_raw_component_to_signed_artifact(exec_context, wasm, hint, profile)
-            .await
+    ) -> Result<AotArtifact, ProgramExecError> {
+        let signed = self
+            .compile_raw_component_to_signed_artifact(exec_context, wasm, hint, profile)
+            .await?;
+        Ok(AotArtifact {
+            signed,
+            worker_threads: compiler_plugin_worker_threads(&exec_context.cpu),
+        })
     }
 
     async fn load_executable(
@@ -1814,7 +1836,7 @@ where
         profile: bool,
         phases: &mut CompilerPhaseTimestamps,
     ) -> Result<(Vec<u8>, CompilerThreadReports), ProgramExecError> {
-        let _compile_guard = self.acquire_compiler_compile_slot().await;
+        let _compile_slot = self.inner.compile_slot.acquire().await;
         phases.slot_acquired_ns = if profile {
             monotonic_nanos(&exec_context.cpu)
         } else {
@@ -1845,27 +1867,6 @@ where
             *self.inner.compiler_plugin.lock() = None;
         }
         result.map(|payload| (payload, thread_reports))
-    }
-
-    async fn acquire_compiler_compile_slot(&self) -> CompilerCompileSlot<'_> {
-        loop {
-            if self
-                .inner
-                .compile_in_progress
-                .compare_exchange(
-                    false,
-                    true,
-                    AtomicOrdering::Acquire,
-                    AtomicOrdering::Relaxed,
-                )
-                .is_ok()
-            {
-                return CompilerCompileSlot {
-                    occupied: &self.inner.compile_in_progress,
-                };
-            }
-            crate::yield_now().await;
-        }
     }
 
     async fn await_compiler_thread_tasks(&self) -> CompilerThreadReports {
@@ -1959,36 +1960,89 @@ where
             .call_async(&mut store, thread_pointer as i32)
             .await
             .map_err(map_program_runtime_error)?;
-        let alloc = instance
-            .get_typed_func::<(i32, i32), i32>(&mut store, HELIOS_COMPILER_ALLOC)
-            .map_err(map_program_runtime_error)?;
-        let compile = instance
-            .get_typed_func::<(i32, i32), i32>(&mut store, HELIOS_COMPILER_COMPILE)
-            .map_err(map_program_runtime_error)?;
+        let exports = CompilerExports {
+            alloc: instance
+                .get_typed_func::<(i32, i32), i32>(&mut store, HELIOS_COMPILER_ALLOC)
+                .map_err(map_program_runtime_error)?,
+            free: instance
+                .get_typed_func::<(i32, i32, i32), ()>(&mut store, HELIOS_COMPILER_FREE)
+                .map_err(map_program_runtime_error)?,
+            compile: instance
+                .get_typed_func::<(i32, i32), i32>(&mut store, HELIOS_COMPILER_COMPILE)
+                .map_err(map_program_runtime_error)?,
+            outstanding: instance
+                .get_typed_func::<(), i32>(&mut store, HELIOS_COMPILER_OUTSTANDING_BYTES)
+                .map_err(map_program_runtime_error)?,
+        };
         phases.instantiated_ns = if profile {
             monotonic_nanos(&exec_context.cpu)
         } else {
             0
         };
-        let target = env!("HELIOS_BUILD_TARGET").as_bytes();
-        let wasm_ptr = compiler_alloc(&mut store, &alloc, wasm.len(), 1).await?;
-        let target_ptr = compiler_alloc(&mut store, &alloc, target.len(), 1).await?;
-        let request_ptr = compiler_alloc(
+        let outstanding_before =
+            compiler_outstanding_bytes(&mut store, &exports.outstanding).await?;
+        let mut allocations = CompilerAllocations::new();
+        let outcome = Self::call_compiler(
             &mut store,
-            &alloc,
-            core::mem::size_of::<CompilerRequestHeader>(),
-            core::mem::align_of::<CompilerRequestHeader>(),
+            &exports,
+            &mut allocations,
+            wasm,
+            hint,
+            profile,
+            phases,
         )
-        .await?;
-        write_shared_memory(store.data().memory(), wasm_ptr, wasm)?;
-        write_shared_memory(store.data().memory(), target_ptr, target)?;
+        .await;
+        // A call into the plugin that failed leaves its allocator in an
+        // unknown state, so nothing is freed and the memory dies with the
+        // runtime; every other end returns the call's allocations. A release
+        // that fails, or leaves the plugin's count off its starting level,
+        // comes before the compile's own result: it says the plugin's memory
+        // can no longer be trusted, which is what discards the runtime.
+        let result = outcome?;
+        allocations.release(&mut store, &exports.free).await?;
+        let outstanding_after =
+            compiler_outstanding_bytes(&mut store, &exports.outstanding).await?;
+        ensure_compiler_buffers_returned(outstanding_before, outstanding_after)?;
+        result
+    }
+
+    /// Runs one compile against the plugin instance: allocates the request,
+    /// calls `compile`, and copies the response out. The caller owns
+    /// `allocations` and releases them according to the returned
+    /// [`CompilerCallOutcome`].
+    async fn call_compiler(
+        store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, HostFs>>,
+        exports: &CompilerExports,
+        allocations: &mut CompilerAllocations,
+        wasm: &Bytes,
+        hint: AotCompileHint,
+        profile: bool,
+        phases: &mut CompilerPhaseTimestamps,
+    ) -> CompilerCallOutcome {
+        let target = env!("HELIOS_BUILD_TARGET").as_bytes();
+        let wasm_ptr = allocations
+            .alloc(&mut *store, &exports.alloc, wasm.len(), 1)
+            .await?;
+        let target_ptr = allocations
+            .alloc(&mut *store, &exports.alloc, target.len(), 1)
+            .await?;
+        let request_ptr = allocations
+            .alloc(
+                &mut *store,
+                &exports.alloc,
+                CompilerRequestHeader::SIZE,
+                CompilerRequestHeader::ALIGN,
+            )
+            .await?;
+        // From here to the response, only host-side work can fail apart from
+        // the `compile` call itself, so a failure is the inner `Err`.
         let header = CompilerRequestHeader {
             abi_version: HELIOS_COMPILER_ABI_VERSION,
-            hint: match hint {
+            hint: u32::from(match hint {
                 AotCompileHint::Fast => CompilerAbiHint::Fast,
                 AotCompileHint::Balanced => CompilerAbiHint::Balanced,
                 AotCompileHint::Performance => CompilerAbiHint::Performance,
-            },
+            }),
             wasm_ptr,
             wasm_len: wasm.len() as u32,
             target_ptr,
@@ -1999,34 +2053,39 @@ where
                 0
             },
         };
-        write_shared_memory(store.data().memory(), request_ptr, unsafe {
-            core::slice::from_raw_parts(
-                core::ptr::addr_of!(header).cast::<u8>(),
-                core::mem::size_of::<CompilerRequestHeader>(),
-            )
-        })?;
+        let memory = store.data().memory();
+        let written = write_shared_memory(memory, GuestAddress::wasm32(wasm_ptr), wasm)
+            .and_then(|()| write_shared_memory(memory, GuestAddress::wasm32(target_ptr), target))
+            .and_then(|()| {
+                write_shared_memory(
+                    memory,
+                    GuestAddress::wasm32(request_ptr),
+                    &header.to_bytes(),
+                )
+            });
+        if let Err(error) = written {
+            return Ok(Err(error));
+        }
         phases.input_done_ns = if profile {
-            monotonic_nanos(&exec_context.cpu)
+            monotonic_nanos(&store.data().cpu)
         } else {
             0
         };
         phases.compile_started_ns = if profile {
-            monotonic_nanos(&exec_context.cpu)
+            monotonic_nanos(&store.data().cpu)
         } else {
             0
         };
         let compile_started = store.data().cpu.now().ticks();
-        let response_ptr = compile
+        let response_ptr = exports
+            .compile
             .call_async(
-                &mut store,
-                (
-                    request_ptr as i32,
-                    core::mem::size_of::<CompilerRequestHeader>() as i32,
-                ),
+                &mut *store,
+                (request_ptr as i32, CompilerRequestHeader::SIZE as i32),
             )
             .await;
         phases.compile_returned_ns = if profile {
-            monotonic_nanos(&exec_context.cpu)
+            monotonic_nanos(&store.data().cpu)
         } else {
             0
         };
@@ -2038,49 +2097,13 @@ where
             .saturating_sub(compile_started);
         store.data().record_user_ticks(compile_elapsed);
         let response_ptr = response_ptr.map_err(map_program_runtime_error)? as u32;
-        let response = read_compiler_response(store.data().memory(), response_ptr)?;
-        if response.abi_version != HELIOS_COMPILER_ABI_VERSION {
-            return Err(ProgramExecError {
-                kind: ProgramExecErrorKind::InvalidBinary,
-                detail: ProgramExecErrorDetail::CompilerAbiMismatch,
-            });
-        }
-        let diagnostic = read_shared_memory(
-            store.data().memory(),
-            response.diagnostic_ptr,
-            response.diagnostic_len,
-        )?;
-        if response.status != CompilerStatus::Ok {
-            if !diagnostic.is_empty() {
-                tracing::error!(
-                    diagnostic = %core::str::from_utf8(&diagnostic).unwrap_or("<non-utf8 compiler diagnostic>"),
-                    "compiler plugin rejected input"
-                );
-            }
-            return Err(ProgramExecError {
-                kind: ProgramExecErrorKind::InvalidBinary,
-                detail: ProgramExecErrorDetail::CompilerRejectedInput,
-            });
-        }
-        if !diagnostic.is_empty() {
-            store.data().write_serial.emit(&diagnostic);
-        }
-        phases.diagnostic_done_ns = if profile {
-            monotonic_nanos(&exec_context.cpu)
-        } else {
-            0
-        };
-        let output = read_shared_memory(
-            store.data().memory(),
-            response.precompiled_ptr,
-            response.precompiled_len,
-        )?;
-        phases.response_done_ns = if profile {
-            monotonic_nanos(&exec_context.cpu)
-        } else {
-            0
-        };
-        Ok(output)
+        Ok(accept_compiler_response(
+            store.data(),
+            allocations,
+            response_ptr,
+            profile,
+            phases,
+        ))
     }
 
     fn read_compiler_plugin_artifact(
@@ -2574,18 +2597,34 @@ mod tests {
     }
 
     #[test]
+    fn a_name_too_long_is_name_too_long_in_every_wasi_layer() {
+        let code =
+            crate::wasmtime_adapter::wasi::fs_error_code(helios_hal::fs::FsError::NameTooLong);
+
+        // Preview 2 and 3 return the code itself; preview 1 and WASIX
+        // answer its errno.
+        assert!(matches!(code, fs_types::ErrorCode::NameTooLong));
+        assert_eq!(
+            p1_errno_from_fs(fs_types::ErrorCode::NameTooLong),
+            p1::errno::NAMETOOLONG
+        );
+    }
+
+    #[test]
     fn null_device_open_is_confined_to_authorized_path_resolution() {
         let root = FsDescriptor {
             path: "/".into(),
             kind: FsNodeKind::Directory,
             flags: fs_types::DescriptorFlags::READ,
             identity: None,
+            mount: None,
         };
         let work = FsDescriptor {
             path: "/work".into(),
             kind: FsNodeKind::Directory,
             flags: fs_types::DescriptorFlags::READ,
             identity: None,
+            mount: None,
         };
 
         assert_eq!(
@@ -2634,6 +2673,7 @@ mod tests {
                 kind: FsNodeKind::File,
                 flags: fs_types::DescriptorFlags::WRITE,
                 identity: None,
+                mount: None,
             },
             offset: 0,
             fdflags: 0,
@@ -2665,6 +2705,89 @@ mod tests {
         }
         assert_eq!(table.close_on_exec(1), Ok(false));
         assert!(table.get(3).is_none());
+    }
+
+    fn stdio_table() -> TestDescriptorTable {
+        Preview1DescriptorTable::from_entries(vec![
+            Some(Preview1DescriptorEntry::new(
+                Preview1Descriptor::Stdin {
+                    carry: Bytes::new(),
+                },
+                false,
+            )),
+            Some(Preview1DescriptorEntry::new(
+                Preview1Descriptor::Stdout,
+                false,
+            )),
+            Some(Preview1DescriptorEntry::new(
+                Preview1Descriptor::Stderr,
+                false,
+            )),
+        ])
+    }
+
+    #[test]
+    fn fd_renumber_past_the_descriptor_limit_is_badf_and_allocates_nothing() {
+        let mut table = stdio_table();
+
+        // `fd_renumber` takes an `i32`, so `i32::MAX - 1` is the highest
+        // number a guest can name; it used to resize the table to match.
+        assert_eq!(table.renumber(1, i32::MAX - 1), p1::errno::BADF);
+        assert_eq!(table.renumber(1, -2), p1::errno::BADF);
+        assert_eq!(table.renumber(1, 1024), p1::errno::BADF);
+        assert_eq!(table.entries.len(), 3);
+        assert!(table.get(1).is_some());
+
+        assert_eq!(table.renumber(1, 1023), p1::errno::SUCCESS);
+        assert!(table.get(1023).is_some());
+    }
+
+    #[test]
+    fn fd_dup2_past_the_descriptor_limit_is_badf_and_allocates_nothing() {
+        let mut table = stdio_table();
+        table.limit = DescriptorLimit::new(8);
+
+        assert_eq!(table.dup_to(0, i32::MAX - 1, false), Err(p1::errno::BADF));
+        assert_eq!(table.dup_to(0, 8, false), Err(p1::errno::BADF));
+        assert_eq!(table.entries.len(), 3);
+        assert_eq!(table.dup_to(0, 7, false), Ok(7));
+    }
+
+    #[test]
+    fn spawn_dup2_action_inherits_the_descriptor_limit() {
+        let mut table = stdio_table();
+        table.limit = DescriptorLimit::new(8);
+        let mut snapshot = table.clone_for_exec();
+
+        // The spawn-time dup2 action applies `dup_to` to this table.
+        assert_eq!(snapshot.limit, DescriptorLimit::new(8));
+        assert_eq!(
+            snapshot.dup_to(0, i32::MAX - 1, false),
+            Err(p1::errno::BADF)
+        );
+        assert_eq!(
+            snapshot.insert_at(i32::MAX - 1, Preview1Descriptor::NullDevice, false),
+            Err(p1::errno::BADF)
+        );
+        assert_eq!(snapshot.target_index(i32::MAX - 1), Err(p1::errno::BADF));
+        assert_eq!(snapshot.entries.len(), 3);
+    }
+
+    #[test]
+    fn lowest_free_allocation_at_the_descriptor_limit_is_mfile() {
+        let mut table = stdio_table();
+        table.limit = DescriptorLimit::new(4);
+
+        assert_eq!(table.insert(Preview1Descriptor::NullDevice), Ok(3));
+        assert_eq!(
+            table.insert(Preview1Descriptor::NullDevice),
+            Err(p1::errno::MFILE)
+        );
+        assert_eq!(table.dup(0), Err(p1::errno::MFILE));
+        assert_eq!(table.entries.len(), 4);
+
+        assert_eq!(table.close(1), p1::errno::SUCCESS);
+        assert_eq!(table.dup(0), Ok(1));
     }
 
     #[test]
@@ -2723,6 +2846,7 @@ mod tests {
                 kind: FsNodeKind::File,
                 flags: fs_types::DescriptorFlags::WRITE,
                 identity: None,
+                mount: None,
             },
             offset: 0,
             fdflags: 0,
@@ -2763,6 +2887,7 @@ mod tests {
                 kind: FsNodeKind::File,
                 flags: fs_types::DescriptorFlags::READ,
                 identity: None,
+                mount: None,
             },
             offset: 0,
             fdflags: P1_FDFLAG_NONBLOCK,
@@ -2865,6 +2990,7 @@ mod tests {
                 kind: FsNodeKind::Directory,
                 flags: fs_types::DescriptorFlags::READ,
                 identity: None,
+                mount: None,
             },
         };
 
@@ -2983,6 +3109,7 @@ mod tests {
                 kind: FsNodeKind::File,
                 flags: fs_types::DescriptorFlags::READ,
                 identity: None,
+                mount: None,
             },
             offset: 0,
             fdflags: 0,
@@ -2993,6 +3120,7 @@ mod tests {
                 kind: FsNodeKind::File,
                 flags: fs_types::DescriptorFlags::READ,
                 identity: None,
+                mount: None,
             },
             offset: 0,
             fdflags: 0,
@@ -3031,6 +3159,7 @@ mod tests {
                             kind: FsNodeKind::Directory,
                             flags: fs_types::DescriptorFlags::READ,
                             identity: None,
+                            mount: None,
                         },
                     },
                     false,
@@ -3059,6 +3188,7 @@ mod tests {
                 kind: FsNodeKind::Directory,
                 flags: fs_types::DescriptorFlags::READ,
                 identity: None,
+                mount: None,
             },
         };
         let mut authority = ProcessAuthority::empty();
@@ -3101,6 +3231,7 @@ mod tests {
                             kind: FsNodeKind::Directory,
                             flags: fs_types::DescriptorFlags::READ,
                             identity: None,
+                            mount: None,
                         },
                     },
                     false,
@@ -3114,6 +3245,7 @@ mod tests {
                     kind: FsNodeKind::Directory,
                     flags: fs_types::DescriptorFlags::READ,
                     identity: None,
+                    mount: None,
                 },
             }),
         };
@@ -3137,6 +3269,7 @@ mod tests {
                             kind: FsNodeKind::Directory,
                             flags: fs_types::DescriptorFlags::READ,
                             identity: None,
+                            mount: None,
                         },
                     },
                     false,
@@ -3371,15 +3504,77 @@ mod tests {
         };
         let mut bytes = [0_u8; 4];
 
-        preview1_read_memory_into(memory, 1, &mut bytes).expect("fixed read should fit");
+        preview1_read_memory_into(memory, GuestAddress::wasm32(1), &mut bytes)
+            .expect("fixed read should fit");
 
         assert_eq!(bytes, [2, 3, 4, 5]);
-        let error =
-            preview1_read_memory_into(memory, 4, &mut bytes).expect_err("read should overflow");
+        let error = preview1_read_memory_into(memory, GuestAddress::wasm32(4), &mut bytes)
+            .expect_err("read should overflow");
         assert_eq!(error.kind, crate::ProgramExecErrorKind::InvalidBinary);
         assert_eq!(
             error.detail,
             ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds
+        );
+    }
+
+    /// Every WASI/WASIX host-call family addresses the fields of a guest
+    /// structure as `base.offset(field)`. A base near the top of the 32-bit
+    /// space must fault at the access, never wrap into low guest memory.
+    #[test]
+    fn guest_field_offsets_near_the_top_of_guest_space_fault_for_every_family() {
+        let mut guest = [0xAA_u8; 64];
+        let memory = Preview1Memory {
+            base: guest.as_mut_ptr() as usize,
+            len: guest.len(),
+        };
+        let base = GuestAddress::wasm32(u32::MAX - 2);
+        // preview1 fd_prestat_get (+4), poll_oneoff event (+8..), filestat (+8..56)
+        // and iovec (+4), WASIX epoll event, proc spawn handles, tty state and
+        // thread snapshot (+8/+16) fields all use these offsets.
+        let family_offsets = [
+            ("preview1 prestat", 4_u64),
+            ("preview1 iovec", 4),
+            ("preview1 poll event", 8),
+            ("preview1 filestat", 56),
+            ("wasix epoll event", 16),
+            ("wasix proc handles", 12),
+            ("wasix tty state", 21),
+            ("wasix thread snapshot", 16),
+        ];
+        for (family, offset) in family_offsets {
+            let field = base.offset(offset);
+            assert_eq!(
+                preview1_write_memory(memory, field, &[1, 2, 3, 4]),
+                p1::errno::FAULT,
+                "{family}: write at u32::MAX - 2 + {offset} must be EFAULT",
+            );
+            let mut bytes = [0_u8; 4];
+            assert!(
+                preview1_read_memory_into(memory, field, &mut bytes).is_err(),
+                "{family}: read at u32::MAX - 2 + {offset} must fail",
+            );
+            assert_eq!(
+                preview1_read_u32(memory, field).map_err(|error| error.detail),
+                Err(ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds),
+                "{family}: u32 read must be out of bounds",
+            );
+        }
+        assert!(
+            guest.iter().all(|byte| *byte == 0xAA),
+            "a wrapped offset must not write into low guest memory",
+        );
+    }
+
+    #[test]
+    fn guest_iovec_array_beyond_guest_space_faults() {
+        let guest = [0_u8; 16];
+        let memory = Preview1Memory {
+            base: guest.as_ptr() as usize,
+            len: guest.len(),
+        };
+        assert_eq!(
+            p1_iovs_memory_ranges(memory, &[(u32::MAX - 2, 4)]).err(),
+            Some(p1::errno::FAULT),
         );
     }
 

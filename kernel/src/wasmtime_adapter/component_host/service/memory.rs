@@ -28,7 +28,7 @@ pub(super) fn take_preview1_carry(carry: &mut Bytes, max_bytes: usize) -> Bytes 
 pub(super) fn p1_read_path<T>(
     caller: &mut Caller<'_, T>,
     memory: Preview1Memory,
-    path: u32,
+    path: GuestAddress,
     path_len: u32,
 ) -> Result<String, ProgramExecError> {
     p1_read_memory(caller, memory, path, path_len as usize).and_then(|bytes| {
@@ -50,8 +50,8 @@ pub(super) fn nul_terminated_list_size<'a>(
 
 pub(super) fn p1_write_string_array<'a, CpuImpl, Net, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
-    pointers: u32,
-    buffer: u32,
+    pointers: GuestAddress,
+    buffer: GuestAddress,
     values: impl Iterator<Item = &'a str>,
 ) -> i32
 where
@@ -65,24 +65,17 @@ where
     let mut current = buffer;
     let mut status = p1::errno::SUCCESS;
     for (index, value) in values.enumerate() {
-        let pointer = match u32::try_from(index)
-            .ok()
-            .and_then(|index| index.checked_mul(4))
-            .and_then(|offset| pointers.checked_add(offset))
-        {
-            Some(pointer) => pointer,
-            None => return p1::errno::OVERFLOW,
+        let pointer = pointers.offset(index as u64 * 4);
+        // The guest pointer table holds 32-bit addresses; an address past the
+        // 32-bit guest space is unrepresentable and faults.
+        let Ok(string_address) = u32::try_from(current.raw()) else {
+            return p1::errno::FAULT;
         };
-        status = status.max(p1_write_u32(caller, memory, pointer, current));
+        status = status.max(p1_write_u32(caller, memory, pointer, string_address));
         status = status.max(p1_write_memory(caller, memory, current, value.as_bytes()));
-        current = match current
-            .checked_add(u32::try_from(value.len()).unwrap_or(u32::MAX))
-            .and_then(|value| value.checked_add(1))
-        {
-            Some(next) => next,
-            None => return p1::errno::OVERFLOW,
-        };
-        status = status.max(p1_write_u8(caller, memory, current - 1, 0));
+        let terminator = current.offset(value.len() as u64);
+        status = status.max(p1_write_u8(caller, memory, terminator, 0));
+        current = terminator.offset(1);
     }
     status
 }
@@ -139,7 +132,7 @@ where
 
 pub(super) fn preview1_read_memory(
     memory: Preview1Memory,
-    ptr: u32,
+    ptr: GuestAddress,
     len: usize,
 ) -> Result<Vec<u8>, ProgramExecError> {
     let start = preview1_memory_start(memory, ptr, len)?;
@@ -152,7 +145,7 @@ pub(super) fn preview1_read_memory(
 
 pub(super) fn preview1_read_memory_into(
     memory: Preview1Memory,
-    ptr: u32,
+    ptr: GuestAddress,
     bytes: &mut [u8],
 ) -> Result<(), ProgramExecError> {
     let start = preview1_memory_start(memory, ptr, bytes.len())?;
@@ -171,14 +164,15 @@ pub(super) fn preview1_read_memory_into(
 
 pub(super) fn preview1_memory_start(
     memory: Preview1Memory,
-    ptr: u32,
+    ptr: GuestAddress,
     len: usize,
 ) -> Result<usize, ProgramExecError> {
-    let start = ptr as usize;
-    let end = start.checked_add(len).ok_or(ProgramExecError {
+    let overflow = || ProgramExecError {
         kind: ProgramExecErrorKind::InvalidBinary,
         detail: ProgramExecErrorDetail::GuestMemoryAccessOverflow,
-    })?;
+    };
+    let start = usize::try_from(ptr.raw()).map_err(|_| overflow())?;
+    let end = start.checked_add(len).ok_or_else(overflow)?;
     if end > memory.len {
         return Err(ProgramExecError {
             kind: ProgramExecErrorKind::InvalidBinary,
@@ -188,8 +182,14 @@ pub(super) fn preview1_memory_start(
     Ok(start)
 }
 
-pub(super) fn preview1_write_memory(memory: Preview1Memory, ptr: u32, bytes: &[u8]) -> i32 {
-    let start = ptr as usize;
+pub(super) fn preview1_write_memory(
+    memory: Preview1Memory,
+    ptr: GuestAddress,
+    bytes: &[u8],
+) -> i32 {
+    let Ok(start) = usize::try_from(ptr.raw()) else {
+        return p1::errno::FAULT;
+    };
     let Some(end) = start.checked_add(bytes.len()) else {
         return p1::errno::FAULT;
     };
@@ -208,14 +208,17 @@ pub(super) fn preview1_write_memory(memory: Preview1Memory, ptr: u32, bytes: &[u
     p1::errno::SUCCESS
 }
 
-pub(super) fn preview1_read_u32(memory: Preview1Memory, ptr: u32) -> Result<u32, ProgramExecError> {
+pub(super) fn preview1_read_u32(
+    memory: Preview1Memory,
+    ptr: GuestAddress,
+) -> Result<u32, ProgramExecError> {
     let bytes = preview1_read_memory(memory, ptr, 4)?;
     Ok(u32::from_le_bytes(bytes.try_into().unwrap_or_else(|_| {
         panic!("Preview1 raw u32 read must return exactly 4 bytes")
     })))
 }
 
-pub(super) fn preview1_write_u32(memory: Preview1Memory, ptr: u32, value: u32) -> i32 {
+pub(super) fn preview1_write_u32(memory: Preview1Memory, ptr: GuestAddress, value: u32) -> i32 {
     preview1_write_memory(memory, ptr, &value.to_le_bytes())
 }
 
@@ -226,16 +229,15 @@ pub(super) fn preview1_write_u32(memory: Preview1Memory, ptr: u32, value: u32) -
 pub(super) fn p1_read_iovs_with_byte_len<T>(
     caller: &mut Caller<'_, T>,
     memory: Preview1Memory,
-    iovs: u32,
+    iovs: GuestAddress,
     iovs_len: u32,
 ) -> Result<Preview1IovLayout, i32> {
     let mut result = Preview1Iovs::new();
     let mut byte_len = 0usize;
     for index in 0..iovs_len {
-        let offset = index.checked_mul(8).ok_or(p1::errno::OVERFLOW)?;
-        let iov = iovs.checked_add(offset).ok_or(p1::errno::OVERFLOW)?;
+        let iov = iovs.offset(u64::from(index) * 8);
         let ptr = p1_try_read_u32(caller, memory, iov).map_err(|_| p1::errno::FAULT)?;
-        let len = p1_try_read_u32(caller, memory, iov + 4).map_err(|_| p1::errno::FAULT)?;
+        let len = p1_try_read_u32(caller, memory, iov.offset(4)).map_err(|_| p1::errno::FAULT)?;
         let len_usize = usize::try_from(len).map_err(|_| p1::errno::OVERFLOW)?;
         byte_len = byte_len.checked_add(len_usize).ok_or(p1::errno::OVERFLOW)?;
         result.push((ptr, len));
@@ -249,28 +251,56 @@ pub(super) fn p1_read_iovs_with_byte_len<T>(
 pub(super) fn p1_read_iovs_to_bytes<T>(
     caller: &mut Caller<'_, T>,
     memory: Preview1Memory,
-    iovs: u32,
+    iovs: GuestAddress,
     iovs_len: u32,
 ) -> Result<Vec<u8>, i32> {
     let layout = p1_read_iovs_with_byte_len(caller, memory, iovs, iovs_len)?;
+    p1_iov_bytes(memory, &layout)
+}
+
+/// The bytes `layout`'s iovecs name, gathered into one buffer.
+pub(super) fn p1_iov_bytes(
+    memory: Preview1Memory,
+    layout: &Preview1IovLayout,
+) -> Result<Vec<u8>, i32> {
+    let ranges = p1_iovs_memory_ranges(memory, &layout.iovs)?;
     let mut bytes: Vec<u8> = Vec::with_capacity(layout.byte_len);
-    let mut written = 0usize;
-    for (ptr, len) in layout.iovs {
-        let len = usize::try_from(len).map_err(|_| p1::errno::OVERFLOW)?;
-        let start = preview1_memory_start(memory, ptr, len).map_err(|_| p1::errno::FAULT)?;
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                (memory.base as *const u8).add(start),
-                bytes.as_mut_ptr().add(written),
-                len,
-            );
-        }
-        written = written.checked_add(len).ok_or(p1::errno::OVERFLOW)?;
-    }
-    unsafe {
-        bytes.set_len(written);
+    for source in p1_guest_slices(memory, &ranges) {
+        bytes.extend_from_slice(source);
     }
     Ok(bytes)
+}
+
+/// Copies the guest bytes `ranges` name into `destination`, which is
+/// exactly as long as they are together: a gathered write's one copy.
+pub(super) fn p1_gather_into(
+    memory: Preview1Memory,
+    ranges: &[(usize, usize)],
+    destination: &mut [u8],
+) {
+    let mut rest = destination;
+    for source in p1_guest_slices(memory, ranges) {
+        let (head, tail) = rest.split_at_mut(source.len());
+        head.copy_from_slice(source);
+        rest = tail;
+    }
+    debug_assert!(
+        rest.is_empty(),
+        "a gathered write's destination is its length"
+    );
+}
+
+/// The guest bytes of each range, in order.
+fn p1_guest_slices(
+    memory: Preview1Memory,
+    ranges: &[(usize, usize)],
+) -> impl Iterator<Item = &[u8]> {
+    ranges.iter().map(move |&(start, len)| {
+        // SAFETY: each range was checked against the guest memory's length
+        // (`p1_iovs_memory_ranges`), and guest memory neither moves nor
+        // shrinks during the host call that holds `memory`.
+        unsafe { core::slice::from_raw_parts((memory.base as *const u8).add(start), len) }
+    })
 }
 
 pub(super) fn p1_iovs_memory_ranges(
@@ -280,45 +310,17 @@ pub(super) fn p1_iovs_memory_ranges(
     let mut ranges = Preview1IovRanges::with_capacity(iovs.len());
     for (ptr, len) in iovs {
         let len = usize::try_from(*len).map_err(|_| p1::errno::OVERFLOW)?;
-        let start = preview1_memory_start(memory, *ptr, len).map_err(|_| p1::errno::FAULT)?;
+        let start = preview1_memory_start(memory, GuestAddress::wasm32(*ptr), len)
+            .map_err(|_| p1::errno::FAULT)?;
         ranges.push((start, len));
     }
     Ok(ranges)
 }
 
-pub(super) fn copy_preview1_ranges_to_slice(
-    memory_base: *const u8,
-    ranges: &[(usize, usize)],
-    destination: &mut [u8],
-) {
-    let mut copied = 0usize;
-    for (start, len) in ranges {
-        let next = copied
-            .checked_add(*len)
-            .expect("validated preview1 iov ranges overflowed while copying");
-        // SAFETY: `p1_iovs_memory_ranges` validated every source range
-        // against the live guest memory, and `destination` was allocated
-        // to the exact summed iov length before this copy.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                memory_base.add(*start),
-                destination.as_mut_ptr().add(copied),
-                *len,
-            );
-        }
-        copied = next;
-    }
-    assert_eq!(
-        copied,
-        destination.len(),
-        "validated preview1 iov ranges did not fill destination"
-    );
-}
-
 pub(super) fn p1_read_memory<T>(
     _caller: &mut Caller<'_, T>,
     memory: Preview1Memory,
-    ptr: u32,
+    ptr: GuestAddress,
     len: usize,
 ) -> Result<Vec<u8>, ProgramExecError> {
     preview1_read_memory(memory, ptr, len)
@@ -327,7 +329,7 @@ pub(super) fn p1_read_memory<T>(
 pub(super) fn p1_read_memory_into<T>(
     _caller: &mut Caller<'_, T>,
     memory: Preview1Memory,
-    ptr: u32,
+    ptr: GuestAddress,
     bytes: &mut [u8],
 ) -> Result<(), ProgramExecError> {
     preview1_read_memory_into(memory, ptr, bytes)
@@ -336,7 +338,7 @@ pub(super) fn p1_read_memory_into<T>(
 pub(super) fn p1_write_memory<T>(
     _caller: &mut Caller<'_, T>,
     memory: Preview1Memory,
-    ptr: u32,
+    ptr: GuestAddress,
     bytes: &[u8],
 ) -> i32 {
     preview1_write_memory(memory, ptr, bytes)
@@ -345,7 +347,7 @@ pub(super) fn p1_write_memory<T>(
 pub(super) fn p1_try_read_u32<T>(
     caller: &mut Caller<'_, T>,
     memory: Preview1Memory,
-    ptr: u32,
+    ptr: GuestAddress,
 ) -> Result<u32, ProgramExecError> {
     let mut bytes = [0_u8; 4];
     p1_read_memory_into(caller, memory, ptr, &mut bytes)?;
@@ -355,7 +357,7 @@ pub(super) fn p1_try_read_u32<T>(
 pub(super) fn p1_try_read_u8<T>(
     caller: &mut Caller<'_, T>,
     memory: Preview1Memory,
-    ptr: u32,
+    ptr: GuestAddress,
 ) -> Result<u8, ProgramExecError> {
     let mut bytes = [0_u8; 1];
     p1_read_memory_into(caller, memory, ptr, &mut bytes)?;
@@ -365,7 +367,7 @@ pub(super) fn p1_try_read_u8<T>(
 pub(super) fn p1_try_read_u16<T>(
     caller: &mut Caller<'_, T>,
     memory: Preview1Memory,
-    ptr: u32,
+    ptr: GuestAddress,
 ) -> Result<u16, ProgramExecError> {
     let mut bytes = [0_u8; 2];
     p1_read_memory_into(caller, memory, ptr, &mut bytes)?;
@@ -375,7 +377,7 @@ pub(super) fn p1_try_read_u16<T>(
 pub(super) fn p1_try_read_u64<T>(
     caller: &mut Caller<'_, T>,
     memory: Preview1Memory,
-    ptr: u32,
+    ptr: GuestAddress,
 ) -> Result<u64, ProgramExecError> {
     let mut bytes = [0_u8; 8];
     p1_read_memory_into(caller, memory, ptr, &mut bytes)?;
@@ -385,7 +387,7 @@ pub(super) fn p1_try_read_u64<T>(
 pub(super) fn p1_write_u8<T>(
     caller: &mut Caller<'_, T>,
     memory: Preview1Memory,
-    ptr: u32,
+    ptr: GuestAddress,
     value: u8,
 ) -> i32 {
     p1_write_memory(caller, memory, ptr, &[value])
@@ -394,7 +396,7 @@ pub(super) fn p1_write_u8<T>(
 pub(super) fn p1_write_u16<T>(
     caller: &mut Caller<'_, T>,
     memory: Preview1Memory,
-    ptr: u32,
+    ptr: GuestAddress,
     value: u16,
 ) -> i32 {
     p1_write_memory(caller, memory, ptr, &value.to_le_bytes())
@@ -403,7 +405,7 @@ pub(super) fn p1_write_u16<T>(
 pub(super) fn p1_write_u32<T>(
     caller: &mut Caller<'_, T>,
     memory: Preview1Memory,
-    ptr: u32,
+    ptr: GuestAddress,
     value: u32,
 ) -> i32 {
     p1_write_memory(caller, memory, ptr, &value.to_le_bytes())
@@ -412,7 +414,7 @@ pub(super) fn p1_write_u32<T>(
 pub(super) fn p1_write_u64<T>(
     caller: &mut Caller<'_, T>,
     memory: Preview1Memory,
-    ptr: u32,
+    ptr: GuestAddress,
     value: u64,
 ) -> i32 {
     p1_write_memory(caller, memory, ptr, &value.to_le_bytes())
@@ -423,7 +425,7 @@ pub(super) fn p1_write_iovs_from_bytes<T>(
     memory: Preview1Memory,
     iovs: Preview1Iovs,
     bytes: &[u8],
-    written_out: u32,
+    written_out: GuestAddress,
 ) -> i32 {
     let mut copied = 0usize;
     for (ptr, len) in iovs {
@@ -431,7 +433,12 @@ pub(super) fn p1_write_iovs_from_bytes<T>(
             break;
         }
         let len = (len as usize).min(bytes.len() - copied);
-        let status = p1_write_memory(caller, memory, ptr, &bytes[copied..copied + len]);
+        let status = p1_write_memory(
+            caller,
+            memory,
+            GuestAddress::wasm32(ptr),
+            &bytes[copied..copied + len],
+        );
         if status != p1::errno::SUCCESS {
             return status;
         }

@@ -417,6 +417,8 @@ pub enum NetworkErrorDetail {
     TcpClosedUnexpectedly,
     #[error("no ephemeral TCP ports are available")]
     TcpNoEphemeralPorts,
+    #[error("no TCP socket slots are available")]
+    TcpNoSocketSlots,
     #[error("UDP send timed out")]
     UdpSendTimeout,
     #[error("UDP receive timed out")]
@@ -499,6 +501,7 @@ impl NetworkErrorDetail {
             Self::TcpReceiveFailed => "TCP receive failed",
             Self::TcpClosedUnexpectedly => "TCP stream closed unexpectedly",
             Self::TcpNoEphemeralPorts => "no ephemeral TCP ports are available",
+            Self::TcpNoSocketSlots => "no TCP socket slots are available",
             Self::UdpSendTimeout => "UDP send timed out",
             Self::UdpReceiveTimeout => "UDP receive timed out",
             Self::UdpPortInUse => "UDP local port is already in use",
@@ -698,6 +701,15 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<SocketReadiness, UdpError>> + Send + '_;
 
     fn hardware_address(&self) -> [u8; 6];
+
+    /// Asks the DHCP server whether the lease the interface holds is
+    /// still good, after a machine restore may have moved the machine to
+    /// another network. An interface that is not DHCP-configured does
+    /// nothing. Resolves once the question is on the wire; the answer
+    /// is applied by the service's own packet pumps, an ACK keeping the
+    /// lease and a NAK or silence starting configuration over. Called
+    /// only by the machine-generation reactions task.
+    fn revalidate_lease(&self) -> impl Future<Output = ()> + Send + '_;
 
     fn ipv4_cidr(&self) -> impl Future<Output = Option<crate::Ipv4Cidr>> + Send + '_;
 
@@ -1012,6 +1024,12 @@ impl AuthorityDomain {
     /// They belong to no real filesystem, so they need a device id of their
     /// own for `st_dev` to stay distinct from bootfs and the host share.
     pub const GUEST_DEVICES: Self = Self(3);
+    /// Every namespace's private root layer: the writable tree each process
+    /// tree keeps over the boot image.
+    pub const GUEST_ROOT_LAYER: Self = Self(4);
+    /// The first id the mount table hands to a filesystem it mounts; every
+    /// later one counts up from here.
+    pub const FIRST_MOUNTED: Self = Self(5);
     const HOST_DEVICE_NAMESPACE: u64 = 1 << 63;
 
     pub const fn new(raw: u64) -> Self {
@@ -1075,6 +1093,11 @@ pub enum HostFsError {
     Server(u32),
     #[error("invalid utf-8")]
     Utf8,
+    /// A name or path component the host share's wire format cannot
+    /// carry: longer than `max_len` bytes, the most one string field of
+    /// a request holds under the session's negotiated message size.
+    #[error("name of {len} bytes exceeds the {max_len} bytes the host share can carry")]
+    NameTooLong { len: usize, max_len: usize },
     #[error(
         "directory listing exceeds the caller's limit of {max_entries} entries or \
          {max_name_bytes} name bytes"
@@ -1094,6 +1117,7 @@ pub enum HostFsErrorKind {
     NotEmpty,
     ReadOnly,
     Unsupported,
+    NameTooLong,
     Io,
 }
 
@@ -1108,6 +1132,7 @@ impl HostFsError {
             HostFsError::Transport(IoError::PermissionDenied)
             | HostFsError::Transport(IoError::ReadOnly) => HostFsErrorKind::ReadOnly,
             HostFsError::Transport(IoError::Unsupported) => HostFsErrorKind::Unsupported,
+            HostFsError::NameTooLong { .. } => HostFsErrorKind::NameTooLong,
             HostFsError::Transport(IoError::InvalidBufferLength { .. })
             | HostFsError::Transport(IoError::InvalidDeviceConfig(_))
             | HostFsError::Transport(IoError::OutOfBounds)
@@ -1127,10 +1152,54 @@ impl HostFsError {
     }
 }
 
-pub trait HostFileSystem: Clone + Send + 'static {
+/// What a machine restore did to the host share, as far as the kernel
+/// can tell from the restore's cause.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostShareRestore {
+    /// The host's 9p server is the one the session was attached to and
+    /// still knows it. What the kernel remembered is stale: cached
+    /// answers carry ages on a monotonic clock that did not advance
+    /// while the machine was stopped.
+    ServerKept,
+    /// The server no longer knows the session or any fid in it, because
+    /// the kernel came back from an image taken before the server saw
+    /// them. The session is dropped without a `Tclunk`, and the next
+    /// operation attaches again.
+    SessionLost,
+}
+
+pub trait HostFileSystem: Clone + Send + Sync + 'static {
     /// How this filesystem's caches have been serving the kernel, or
     /// `None` from an implementation that caches nothing.
     fn cache_stats(&self) -> Option<crate::HostFsCacheStats>;
+
+    /// Brings the filesystem's own state in line with a machine restore:
+    /// an implementation with a session and caches drops what `restore`
+    /// says is stale, and one with neither does nothing. Called by the
+    /// machine-generation reactions task, never concurrently with
+    /// itself; operations may be in flight on other tasks.
+    fn after_machine_restore(
+        &self,
+        restore: HostShareRestore,
+    ) -> impl Future<Output = ()> + Send + '_;
+
+    /// Releases the host share so the VMM may snapshot the machine, and
+    /// holds it released: resolves once every operation in flight has
+    /// finished and the share's session and fids are returned to the
+    /// host. Operations issued from the moment this is called wait
+    /// rather than fail, until the hold ends through
+    /// [`Self::snapshot_finished`] or a machine restore reaches
+    /// [`Self::after_machine_restore`]. Calling it while the hold is
+    /// already in force is harmless. An implementation with no session
+    /// has nothing to release and resolves at once.
+    fn prepare_snapshot(&self) -> impl Future<Output = ()> + Send + '_;
+
+    /// Ends a hold taken by [`Self::prepare_snapshot`] because the
+    /// snapshot is over and this machine, the source, runs on. Waiting
+    /// operations resume and the session is attached again. A no-op when
+    /// no hold is in force, which is the case once a machine restore has
+    /// already ended it.
+    fn snapshot_finished(&self);
 
     fn stat_path<'a>(
         &'a self,
@@ -1219,14 +1288,6 @@ pub trait HostFileSystem: Clone + Send + 'static {
         &'a self,
         path: &'a str,
     ) -> impl Future<Output = Result<String, HostFsError>> + Send + 'a;
-}
-
-pub trait ComponentHostFilesystemState<Service>: Clone + Send + 'static
-where
-    Service: HostFileSystem,
-{
-    fn host_filesystem_service(&self) -> Option<Service>;
-    fn bootfs(&self) -> Option<crate::EmbeddedBootFs>;
 }
 
 #[cfg(test)]

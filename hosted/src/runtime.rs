@@ -471,6 +471,11 @@ fn spawn_processor_thread(
                 // read once, here, before any component can ask what
                 // time it is.
                 debug_state.seed_wall_clock(cpu.now().ticks(), &HostRtc);
+                helios_kernel::install_generation_reactions(
+                    &kernel,
+                    debug_state.clone(),
+                    Some(HostRtc),
+                );
 
                 // Install host filesystem if configured.
                 if let Some(root) = config.init_wasi_root() {

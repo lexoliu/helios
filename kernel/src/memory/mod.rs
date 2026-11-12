@@ -3,6 +3,8 @@
 //! `irq_safe` carries the lock every allocator here is built on: an
 //! interrupt handler allocates, so the lock that guards an allocator
 //! has to mask interrupts while it is held.
+//! `compressed` is the compressed page pool, the in-memory tier a page
+//! goes to before a disk.
 //! `pmm` exposes the kernel's physical-frame allocator wrapper.
 //! `fiber_stack` owns the arena the runtime's async stacks are committed
 //! out of one page-fault at a time, and `frame_reserve` holds the frames
@@ -18,6 +20,7 @@
 //! domains.
 
 mod balloon;
+mod compressed;
 mod entropy;
 mod fiber_stack;
 mod frame_pool;
@@ -34,6 +37,10 @@ mod swap;
 mod user;
 
 pub use balloon::{BalloonHandle, BalloonStats, FREE_PAGE_REPORT_INTERVAL, install_memory_balloon};
+pub use compressed::{
+    COMPRESSED_PAGE_BYTES, CompressRefusal, CompressedPage, CompressedPool, CompressedPoolError,
+    CompressedPoolStats, DEFAULT_COMPRESSION_LEVEL, DEFAULT_POOL_PERCENT, INCOMPRESSIBLE_BYTES,
+};
 pub use entropy::{
     ENTROPY_RESEED_INTERVAL, EntropyPool, EntropySources, HardwareEntropySource,
     NoCryptographicEntropy, NoEntropyDevice, ROOT_ENTROPY_MATERIAL_BYTES, RootEntropy,
@@ -64,20 +71,21 @@ pub use policy::{
     USER_POOL_MIN_REGION_BYTES, kernel_reserve_for, task_arena_bytes_for,
 };
 pub use reservations::{
-    AccessibilityPlan, CommittedRegion, ReleasedReservation, ReservationLookup, ReservationTracker,
-    SwapEntry, VaCursor, validate_range,
+    AccessibilityPlan, CommittedRegion, CommittedRemoval, Decommitted, ReleasedReservation,
+    ReservationLookup, ReservationTracker, SwapEntry, VaCursor, ranges_outside, validate_range,
 };
 pub use swap::{
-    IDLE_SWAP_AFTER, SWAP_BATCH_BYTES, SWAP_TICK, SwapDisabled, SwapFaultError, SwapHandle,
-    SwapStats, SwapVmHooks, disable_swap, install_swap, install_swap_hooks, installed_swap_handle,
-    installed_swap_hooks, swapped_token,
+    AGE_BATCH_PAGES, IDLE_SWAP_AFTER, InstalledAddressSpace, SWAP_BATCH_BYTES, SWAP_TICK,
+    SwapDisabled, SwapFaultError, SwapHandle, SwapLeafFormat, SwapSpace, SwapStats, SwapVmHooks,
+    disable_swap, install_swap, install_swap_hooks, installed_swap_handle, installed_swap_hooks,
+    swap_vm_hooks, swapped_token,
 };
 pub use user::{
     UserHeapStats, UserMemoryPool, allocate_user_frame_uninit_on, allocate_user_frame_zeroed,
-    allocate_user_frame_zeroed_on, allocate_user_run_zeroed_on, deallocate_user_frame,
-    deallocate_user_frame_on, deallocate_user_run_on, largest_servable_user_bytes, user_heap_stats,
+    allocate_user_frame_zeroed_on, allocate_user_memory_pool, allocate_user_run_zeroed_on,
+    deallocate_user_frame, deallocate_user_frame_on, deallocate_user_run_on,
+    install_user_memory_pool, largest_servable_user_bytes, user_heap_stats,
 };
 pub(crate) use user::{
-    allocate_user_memory_pool, install_user_memory_pool, lend_user_memory_to_kernel_heap,
-    release_processor_frames, user_pool_available_bytes,
+    lend_user_memory_to_kernel_heap, release_processor_frames, user_pool_available_bytes,
 };

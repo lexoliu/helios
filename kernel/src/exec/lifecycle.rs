@@ -74,7 +74,7 @@ use crate::Kernel;
 /// `SeqCst`, because the executor's global-work handoff rests on a
 /// departing processor's removal and a waker's read of the set falling
 /// in one total order with the global ready count (see
-/// `ExecutorGroup::take_processor_offline`).
+/// `Executor::take_offline`).
 pub struct OnlineSet {
     words: Box<[AtomicU64]>,
     count: AtomicUsize,
@@ -563,11 +563,7 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> ProcessorStep<CpuImpl
         successor: ProcessorId,
     ) -> Result<(), OfflineRefusal> {
         kernel.timer.arm_scheduler_tick();
-        kernel.executor.group().take_processor_offline(
-            &kernel.cpu,
-            kernel.executor.owner_processor(),
-            successor,
-        )?;
+        kernel.executor.take_offline(&kernel.cpu, successor)?;
         Ok(())
     }
 }
@@ -736,7 +732,7 @@ mod tests {
         let pinned = spawner1.spawn_local(pending::<()>());
 
         assert_eq!(
-            group.take_processor_offline(&cpu, P1, P0),
+            executor1.take_offline(&cpu, P0),
             Err(PinnedTasks {
                 processor: P1,
                 live: 1
@@ -752,7 +748,7 @@ mod tests {
         // Cancelling queues the task to be dropped on its owner, which
         // the step does before it counts.
         drop(pinned);
-        assert_eq!(group.take_processor_offline(&cpu, P1, P0), Ok(()));
+        assert_eq!(executor1.take_offline(&cpu, P0), Ok(()));
         assert!(!group.online().contains(P1));
         assert_eq!(group.online().count(), 1);
         assert_eq!(cpu.woken()[woken_before..], [P0]);

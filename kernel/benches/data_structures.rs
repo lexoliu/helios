@@ -583,6 +583,10 @@ impl ComponentNetworkService for BenchNetworkService {
         [2, 0, 0, 0, 0, 1]
     }
 
+    fn revalidate_lease(&self) -> impl Future<Output = ()> + Send + '_ {
+        core::future::ready(())
+    }
+
     async fn ipv4_cidr(&self) -> Option<Ipv4Cidr> {
         None
     }

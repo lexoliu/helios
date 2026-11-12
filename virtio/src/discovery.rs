@@ -206,12 +206,11 @@ fn interrupt_cell_values<'v>(bytes: &'v [u8], name: &str) -> impl Iterator<Item 
         bytes.len().is_multiple_of(4),
         "interrupts property of device tree node {name} is not a whole number of cells"
     );
-    bytes.chunks_exact(4).map(|cell| {
-        u32::from_be_bytes(
-            cell.try_into()
-                .unwrap_or_else(|_| panic!("interrupt cell had invalid width")),
-        )
-    })
+    bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&cell| u32::from_be_bytes(cell))
 }
 
 fn next_interrupt_cell(values: &mut impl Iterator<Item = u32>, name: &str) -> u32 {
@@ -237,14 +236,11 @@ fn reg_cells_to_usize(bytes: &[u8], name: &str) -> usize {
         bytes.len()
     );
     let mut value = 0usize;
-    for cell in bytes.chunks_exact(4) {
+    for &cell in bytes.as_chunks::<4>().0 {
         value = value
             .checked_shl(32)
             .unwrap_or_else(|| panic!("{name} cell shift overflow"))
-            | u32::from_be_bytes(
-                cell.try_into()
-                    .unwrap_or_else(|_| panic!("{name} cell had invalid width")),
-            ) as usize;
+            | u32::from_be_bytes(cell) as usize;
     }
     value
 }
