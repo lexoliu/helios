@@ -30,12 +30,12 @@ use bytes::Bytes;
 use helios_hal::cpu::{Cpu, HardwarePerfCounters, current_processor};
 use helios_hal::io::IoError;
 use helios_netstack::{
-    DEFAULT_HOP_LIMIT, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DNS_PORT, DhcpClientMessage,
-    DhcpDnsServers, DhcpMessageType, DhcpPacket, DhcpServerMessage, DnsQuery, DnsQuestionWriter,
-    DnsRecordType, DnsResponse, EthernetFrame, EthernetProtocol, FlowTuple, IcmpEchoKey,
-    IcmpEchoReply, Icmpv4Packet, Icmpv6Packet, InterfaceEventMark, IpAddress, IpCidr, IpProtocol,
-    Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6AddressEntry, Ipv6Cidr, Ipv6Packet,
-    IsnSecret, MAX_OUTBOUND_FRAMES, NeighborCache, NeighborEntry,
+    DEFAULT_HOP_LIMIT, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DNS_PORT, DestinationPortHashes,
+    DhcpClientMessage, DhcpDnsServers, DhcpMessageType, DhcpPacket, DhcpServerMessage, DnsQuery,
+    DnsQuestionWriter, DnsRecordType, DnsResponse, EthernetFrame, EthernetProtocol, FlowTuple,
+    IcmpEchoKey, IcmpEchoReply, Icmpv4Packet, Icmpv6Packet, InterfaceEventMark, IpAddress, IpCidr,
+    IpProtocol, Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6AddressEntry, Ipv6Cidr,
+    Ipv6Packet, IsnSecret, MAX_OUTBOUND_FRAMES, NeighborCache, NeighborEntry,
     NetworkInterface as NetworkDevice, OutboundBatchStatus, Route, RouteTable, RxChecksumOffload,
     RxDrain, RxFrame, SegmentationOffload, Stack, StackConfig, StackError, StackEvent,
     StackInstant, TcpCloseKind, TcpConnectState, TcpConnectTerminalError, TcpEndpoint,
@@ -4229,6 +4229,177 @@ mod tests {
         ports
     }
 
+    /// The candidates of the window `first..=last` for the connect of
+    /// `connect_request` from shard `accepting` of `shard_count`, for
+    /// the random draw `draw`.
+    fn classified_candidates(
+        first: u16,
+        last: u16,
+        draw: u32,
+        accepting: usize,
+        shard_count: usize,
+    ) -> super::EphemeralCandidates {
+        let owners = connect_request().port_owners(shard_count);
+        super::EphemeralCandidates::classify(first, last, draw, |port| {
+            owners.owner_of(port) == accepting
+        })
+    }
+
+    /// The owner of a port through [`super::PortOwners`] is what
+    /// `shard_idx_for_flow` answers for every port of the ephemeral
+    /// range, on several shard counts, in both families, and the
+    /// default shard answers when the families form no tuple.
+    #[test]
+    fn port_owners_equal_the_flow_owner_for_every_ephemeral_port() {
+        let v4_local = IpAddress::Ipv4(Ipv4Address::new([192, 0, 2, 7]));
+        let v4_remote = IpAddress::Ipv4(Ipv4Address::new([198, 51, 100, 9]));
+        let v6 = connect_request();
+        for (local, remote, remote_port) in [
+            (v4_local, v4_remote, 443),
+            (v6.local, v6.destination, v6.port),
+        ] {
+            for shard_count in [1usize, 3, 4, 7] {
+                let owners = super::PortOwners::new(local, remote, remote_port, shard_count);
+                for port in super::EPHEMERAL_PORT_START..=super::EPHEMERAL_PORT_END {
+                    assert_eq!(
+                        owners.owner_of(port),
+                        super::shard_idx_for_flow(local, port, remote, remote_port, shard_count),
+                        "port {port} on {shard_count} shards to {remote:?}"
+                    );
+                }
+            }
+        }
+        let mixed = super::PortOwners::new(v4_local, v6.destination, 443, 4);
+        assert_eq!(mixed.owner_of(49_200), super::DEFAULT_SHARD_IDX);
+    }
+
+    /// Issue #790: every draw the connect can make, on every shard of a
+    /// set, counted by the port it takes first with every port free.
+    /// Each own port is taken `floor(W / n)` or `ceil(W / n)` times of
+    /// the `W` draws and no foreign port is taken, however the shard's
+    /// own ports are spaced in its window. Shard counts that do not
+    /// divide the range leave the last window longer than the others.
+    #[test]
+    fn an_ephemeral_connect_takes_each_own_port_equally_often() {
+        for shard_count in [3usize, 4, 7] {
+            for accepting in 0..shard_count {
+                let shard = NetworkShard::new(
+                    test_stack_config(),
+                    1,
+                    accepting,
+                    shard_count,
+                    test_root_entropy(),
+                );
+                let (first, last) = shard.ephemeral_window();
+                let window = u32::from(last - first) + 1;
+                let mut taken = alloc::collections::BTreeMap::<u16, u32>::new();
+                // The classification does not depend on the draw.
+                let owners = connect_request().port_owners(shard_count);
+                let is_own: Vec<bool> = (first..=last)
+                    .map(|port| owners.owner_of(port) == accepting)
+                    .collect();
+                let own_count = is_own.iter().filter(|own| **own).count() as u32;
+                assert!(own_count != 0, "the fixture needs an own port");
+                for draw in 0..window {
+                    let candidates =
+                        super::EphemeralCandidates::classify(first, last, draw, |port| {
+                            is_own[usize::from(port - first)]
+                        });
+                    let port = candidates.own_ports().next().expect("an own port exists");
+                    *taken.entry(port).or_default() += 1;
+                }
+                assert_eq!(
+                    taken.len() as u32,
+                    own_count,
+                    "every own port is the first candidate of some draw \
+                     (shards {shard_count}, accepting {accepting})"
+                );
+                for (port, times) in &taken {
+                    assert_eq!(
+                        owners.owner_of(*port),
+                        accepting,
+                        "a foreign port {port} was taken first"
+                    );
+                    assert!(
+                        *times == window / own_count || *times == window.div_ceil(own_count),
+                        "port {port} was taken {times} times of {window} draws over \
+                         {own_count} own ports (shards {shard_count}, accepting {accepting})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The own ports are tried in rank order from the selected one, each
+    /// once, and the foreign ports each once from the drawn place, so
+    /// together they are the window exactly once.
+    #[test]
+    fn the_candidates_cover_the_window_once() {
+        let first = super::EPHEMERAL_PORT_START;
+        let last = first + 1023;
+        for draw in [0, 1, 511, 1022, 1023] {
+            let candidates = classified_candidates(first, last, draw, 1, 4);
+            let own: Vec<u16> = candidates.own_ports().collect();
+            let foreign: Vec<u16> = candidates.foreign_ports().collect();
+            let mut all = [own.clone(), foreign.clone()].concat();
+            all.sort_unstable();
+            assert_eq!(all, (first..=last).collect::<Vec<u16>>());
+            let lowest = own
+                .iter()
+                .position(|port| Some(port) == own.iter().min())
+                .expect("an own port exists");
+            let mut ascending = own;
+            ascending.rotate_left(lowest);
+            assert!(ascending.windows(2).all(|pair| pair[0] < pair[1]));
+            assert_eq!(
+                foreign.first().copied(),
+                (first + draw as u16..=last)
+                    .chain(first..first + draw as u16)
+                    .find(|port| !ascending.contains(port)),
+                "the foreign ports start at the drawn place"
+            );
+        }
+    }
+
+    /// A connect opens on an own port whenever one is free: with every
+    /// own port but one held, every draw takes that one.
+    #[test]
+    fn an_ephemeral_connect_takes_the_one_free_own_port() {
+        const SHARDS: usize = 64;
+        let (first, last) = {
+            let shard = NetworkShard::new(test_stack_config(), 1, 0, SHARDS, test_root_entropy());
+            shard.ephemeral_window()
+        };
+        let window = u32::from(last - first) + 1;
+        let own: Vec<u16> = classified_candidates(first, last, 0, 0, SHARDS)
+            .own_ports()
+            .collect();
+        assert!(own.len() > 2, "the fixture needs several own ports");
+        for draw in (0..window).step_by(7).chain([window - 1]) {
+            let state = connect_shard_set(SHARDS);
+            let free = own[draw as usize % own.len()];
+            let mut shard = state.shard_at(0).lock();
+            for port in own.iter().filter(|port| **port != free) {
+                hold_four_tuple(&mut shard, *port);
+            }
+            let candidates = classified_candidates(first, last, draw, 0, SHARDS);
+
+            shard
+                .open_tcp_connect_along_own_flows(&candidates, connect_request())
+                .expect("an in-use candidate is not a failure")
+                .expect("the one free own port opens");
+
+            assert_eq!(
+                queued_syn_source_ports(&mut shard)
+                    .into_iter()
+                    .filter(|port| *port == free)
+                    .count(),
+                1,
+                "draw {draw} did not take the one free own port"
+            );
+        }
+    }
+
     /// Issue #788: a walk that starts on ports whose four-tuple to this
     /// remote a lingering connection still holds takes the next
     /// candidate instead of failing the connect.
@@ -4241,10 +4412,10 @@ mod tests {
         for offset in 0..HELD {
             hold_four_tuple(&mut shard, first + offset);
         }
-        let walk = super::EphemeralWalk::starting_at(first, last, 0);
+        let candidates = classified_candidates(first, last, 0, 0, 1);
 
         shard
-            .open_tcp_connect_along_own_flows(walk, connect_request(), 1)
+            .open_tcp_connect_along_own_flows(&candidates, connect_request())
             .expect("an in-use candidate is not a failure")
             .expect("the candidate after the held ones opens");
 
@@ -4308,16 +4479,20 @@ mod tests {
             hold_four_tuple(&mut state.shard_at(0).lock(), *port);
         }
         hold_four_tuple(&mut state.shard_at(1).lock(), foreign[0]);
-        let walk = super::EphemeralWalk::starting_at(first, first + 63, 0);
+        let candidates = classified_candidates(first, first + 63, 0, 0, 2);
 
         let own_flow = state
             .shard_at(0)
             .lock()
-            .open_tcp_connect_along_own_flows(walk, connect_request(), 2)
+            .open_tcp_connect_along_own_flows(&candidates, connect_request())
             .expect("an in-use candidate is not a failure");
         assert!(own_flow.is_none(), "every own-shard candidate is held");
         let stream = state
-            .open_tcp_connect_along_foreign_flows(walk, 0, connect_request())
+            .open_tcp_connect_along_foreign_flows(
+                &candidates,
+                &connect_request().port_owners(2),
+                connect_request(),
+            )
             .expect("the second foreign candidate opens");
 
         assert_eq!(state.shard_idx_for_handle(stream), 1);
@@ -4340,16 +4515,20 @@ mod tests {
         for port in &foreign {
             hold_four_tuple(&mut state.shard_at(1).lock(), *port);
         }
-        let walk = super::EphemeralWalk::starting_at(first, first + 63, 0);
+        let candidates = classified_candidates(first, first + 63, 0, 0, 2);
 
         let own_flow = state
             .shard_at(0)
             .lock()
-            .open_tcp_connect_along_own_flows(walk, connect_request(), 2)
+            .open_tcp_connect_along_own_flows(&candidates, connect_request())
             .expect("an in-use candidate is not a failure");
         assert!(own_flow.is_none());
         let error = state
-            .open_tcp_connect_along_foreign_flows(walk, 0, connect_request())
+            .open_tcp_connect_along_foreign_flows(
+                &candidates,
+                &connect_request().port_owners(2),
+                connect_request(),
+            )
             .err()
             .expect("no candidate is free");
         assert_eq!(error.detail, crate::NetworkErrorDetail::TcpNoEphemeralPorts);

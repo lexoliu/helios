@@ -1630,15 +1630,10 @@ pub(super) struct TcpConnectRequest {
 }
 
 impl TcpConnectRequest {
-    /// The shard the flow hashes to once it has `local_port`.
-    fn owner_of(&self, local_port: u16, shard_count: usize) -> usize {
-        shard_idx_for_flow(
-            self.local,
-            local_port,
-            self.destination,
-            self.port,
-            shard_count,
-        )
+    /// The shard each local port's flow hashes to, on `shard_count`
+    /// shards.
+    pub(super) fn port_owners(&self, shard_count: usize) -> PortOwners {
+        PortOwners::new(self.local, self.destination, self.port, shard_count)
     }
 
     /// Opens the connection from `local_port` on `shard`, which must be
@@ -1663,52 +1658,52 @@ impl NetworkShardSet {
     /// Chooses an ephemeral port and opens the connection from it, as
     /// one step, from the window of shard `accepting`.
     ///
-    /// The window is walked once from a random start (RFC 6056
-    /// §3.3.1). Under one acquisition of the accepting shard's lock,
-    /// the candidates whose flow hashes back to it are tried first:
-    /// the connection is then also received on the processor that
-    /// opened it, with no cross-processor hop for its whole life. The
-    /// candidates that hash elsewhere are then tried on their owning
-    /// shards, in walk order, one lock at a time and none across an
-    /// await. A candidate in use ([`TcpConnectStartError::PortInUse`])
-    /// moves the walk on; any other failure ends it. Only a window with
-    /// every candidate in use fails with
+    /// The window is classified once ([`EphemeralCandidates`]), outside
+    /// every lock: the accepting shard's lock is taken only to read its
+    /// window and draw from its entropy, then released while the
+    /// window is classified, and taken again for the own half. The
+    /// ports whose flow hashes back to the accepting shard are tried
+    /// first, under that lock, from one drawn uniformly among them: the
+    /// connection is then also received on the processor that opened
+    /// it, with no cross-processor hop for its whole life. The ports
+    /// that hash elsewhere are then tried on their owning shards, from a
+    /// random place (RFC 6056 §3.3.1), one lock at a time, never two,
+    /// and none across an await. A candidate in use
+    /// ([`TcpConnectStartError::PortInUse`]) moves on to the next; any
+    /// other failure ends the search. Only a window with every
+    /// candidate in use fails with
     /// [`NetworkErrorDetail::TcpNoEphemeralPorts`].
     pub(super) fn open_ephemeral_tcp_connect(
         &self,
         accepting: usize,
         request: TcpConnectRequest,
     ) -> Result<TcpStreamId, TcpError> {
-        let shard_count = self.shard_count();
-        let walk = {
-            let mut shard = self.shard_at(accepting).lock();
-            let walk = shard.ephemeral_walk();
-            if let Some(stream) =
-                shard.open_tcp_connect_along_own_flows(walk, request, shard_count)?
-            {
-                return Ok(stream);
-            }
-            walk
-        };
-        self.open_tcp_connect_along_foreign_flows(walk, accepting, request)
+        let owners = request.port_owners(self.shard_count());
+        let (first, last, draw) = self.shard_at(accepting).lock().connect_draw();
+        let candidates = EphemeralCandidates::classify(first, last, draw, |port| {
+            owners.owner_of(port) == accepting
+        });
+        if let Some(stream) = self
+            .shard_at(accepting)
+            .lock()
+            .open_tcp_connect_along_own_flows(&candidates, request)?
+        {
+            return Ok(stream);
+        }
+        self.open_tcp_connect_along_foreign_flows(&candidates, &owners, request)
     }
 
     /// The second half of [`Self::open_ephemeral_tcp_connect`]: the
-    /// candidates of `walk` that hash to a shard other than
-    /// `accepting`, each opened on its owner.
+    /// ports of `candidates` that hash to a shard other than the
+    /// accepting one, each opened on its owner under `owners`.
     pub(super) fn open_tcp_connect_along_foreign_flows(
         &self,
-        walk: EphemeralWalk,
-        accepting: usize,
+        candidates: &EphemeralCandidates,
+        owners: &PortOwners,
         request: TcpConnectRequest,
     ) -> Result<TcpStreamId, TcpError> {
-        let shard_count = self.shard_count();
-        for candidate in walk {
-            let owner = request.owner_of(candidate, shard_count);
-            if owner == accepting {
-                // Already tried, and in use, under the accepting lock.
-                continue;
-            }
+        for candidate in candidates.foreign_ports() {
+            let owner = owners.owner_of(candidate);
             match request.start_on(&mut self.shard_at(owner).lock(), candidate) {
                 Ok(stream) => return Ok(stream),
                 Err(TcpConnectStartError::PortInUse) => {}
@@ -1773,26 +1768,32 @@ impl NetworkShard {
         Ok(self.insert_tcp_stream(socket))
     }
 
-    /// Opens an ephemeral-port connection on this shard along `walk`,
-    /// the walk of this shard's own window.
+    /// This shard's window `(first, last)` and the draw, below the
+    /// window's length, that [`EphemeralCandidates::classify`] selects
+    /// its starting points from. The entropy stream is touched only
+    /// here, under this shard's lock, which the caller holds.
+    pub(super) fn connect_draw(&mut self) -> (u16, u16, u32) {
+        let (first, last) = self.ephemeral_window();
+        let draw = self.entropy.below(EphemeralWalk::window_len(first, last));
+        (first, last, draw)
+    }
+
+    /// Opens an ephemeral-port connection on this shard from the own
+    /// ports of `candidates`, this shard's own window.
     ///
-    /// Only a candidate whose flow hashes to this shard is tried here,
-    /// which is what makes a connection opened on this processor also
-    /// received on it. A candidate that is in use is skipped; any other
-    /// failure is returned. `None` means no candidate of this shard
-    /// opened, and the caller tries the rest on their owning shards.
+    /// Only a port whose flow hashes to this shard is tried here, which
+    /// is what makes a connection opened on this processor also
+    /// received on it. A port that is in use is skipped; any other
+    /// failure is returned. `None` means no port of this shard opened,
+    /// and the caller tries the rest on their owning shards.
     ///
     /// Runs under this shard's lock, which the caller holds.
     pub(super) fn open_tcp_connect_along_own_flows(
         &mut self,
-        walk: EphemeralWalk,
+        candidates: &EphemeralCandidates,
         request: TcpConnectRequest,
-        shard_count: usize,
     ) -> Result<Option<TcpStreamId>, TcpError> {
-        for candidate in walk {
-            if request.owner_of(candidate, shard_count) != self.shard_idx {
-                continue;
-            }
+        for candidate in candidates.own_ports() {
             match request.start_on(self, candidate) {
                 Ok(stream) => return Ok(Some(stream)),
                 Err(TcpConnectStartError::PortInUse) => {}

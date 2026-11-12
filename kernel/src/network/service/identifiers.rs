@@ -8,6 +8,7 @@
 //! touched only under that shard's lock. Nothing is shared between
 //! shards; two shards draw from separately derived streams.
 
+use super::{EPHEMERAL_PORT_END, EPHEMERAL_PORT_START};
 use crate::{EntropyPool, RootEntropyHandle};
 
 /// The random stream one shard draws its identifiers from.
@@ -104,6 +105,144 @@ impl Iterator for EphemeralWalk {
         };
         self.remaining -= 1;
         Some(port)
+    }
+}
+
+/// Ports in the whole ephemeral range, the largest window a shard can
+/// have (one shard owns all of it).
+const EPHEMERAL_RANGE_PORTS: usize = (EPHEMERAL_PORT_END - EPHEMERAL_PORT_START) as usize + 1;
+
+/// 64-bit words a set over [`EPHEMERAL_RANGE_PORTS`] ports takes.
+const OWN_SET_WORDS: usize = EPHEMERAL_RANGE_PORTS.div_ceil(u64::BITS as usize);
+
+/// The ports of a shard's window a connect may try, sorted by who
+/// receives the flow they make.
+///
+/// The shard prefers a port whose flow hashes back to it, but the ports
+/// that do are not evenly spaced in the window (under the standard RSS
+/// key they come in runs), so walking from a random place to the next
+/// such port takes the port after a long foreign run far more often
+/// than the others. The pick here is made among the shard's own ports
+/// instead: one pass classifies the window, and a draw `r` below the
+/// window's length `W` selects the own port of rank `r * n / W` among
+/// the `n` own ports, so every own port is the first candidate for
+/// `floor(W / n)` or `ceil(W / n)` of the `W` draws.
+///
+/// Concurrency contract: a plain value, owned by the one connect that
+/// built it. It is classified outside every lock, from a window and a
+/// draw read under the accepting shard's lock. The own half is then
+/// tried under that lock, taken again, and the foreign half afterwards,
+/// each candidate under its owner's lock alone.
+pub(super) struct EphemeralCandidates {
+    first: u16,
+    /// Ports in the window.
+    window: u32,
+    /// Bit `i` is set when the port `first + i` hashes to the shard.
+    own: [u64; OWN_SET_WORDS],
+    own_count: u32,
+    /// Window offset of the own port of the selected rank; meaningful
+    /// only when `own_count` is not zero.
+    own_start: u32,
+    /// The foreign ports are visited from the place the draw names.
+    foreign: EphemeralWalk,
+}
+
+impl EphemeralCandidates {
+    /// Classifies the window `first..=last` with `is_own`, and selects
+    /// the starting points from `draw`, which is below the window's
+    /// length.
+    pub(super) fn classify(
+        first: u16,
+        last: u16,
+        draw: u32,
+        mut is_own: impl FnMut(u16) -> bool,
+    ) -> Self {
+        let window = EphemeralWalk::window_len(first, last);
+        debug_assert!(
+            window as usize <= EPHEMERAL_RANGE_PORTS,
+            "a window lies inside the ephemeral range"
+        );
+        let mut own = [0u64; OWN_SET_WORDS];
+        let mut own_count = 0u32;
+        for offset in 0..window {
+            // `offset < window <= u16::MAX + 1`, and `first + offset <= last`.
+            if is_own(first + offset as u16) {
+                own[(offset / u64::BITS) as usize] |= 1 << (offset % u64::BITS);
+                own_count += 1;
+            }
+        }
+        let mut candidates = Self {
+            first,
+            window,
+            own,
+            own_count,
+            own_start: 0,
+            foreign: EphemeralWalk::starting_at(first, last, draw),
+        };
+        if own_count != 0 {
+            // `draw < window`, so the rank is below `own_count`.
+            let rank = (u64::from(draw) * u64::from(own_count) / u64::from(window)) as u32;
+            candidates.own_start = candidates.offset_of_rank(rank);
+        }
+        candidates
+    }
+
+    /// The window offset of the own port with `rank` among the own
+    /// ports in ascending order, with `rank` below `own_count`.
+    fn offset_of_rank(&self, mut rank: u32) -> u32 {
+        for (index, word) in self.own.iter().enumerate() {
+            let in_word = word.count_ones();
+            if rank < in_word {
+                let mut bits = *word;
+                for _ in 0..rank {
+                    // Clears the lowest set bit.
+                    bits &= bits - 1;
+                }
+                return index as u32 * u64::BITS + bits.trailing_zeros();
+            }
+            rank -= in_word;
+        }
+        unreachable!("the rank is below the own count");
+    }
+
+    /// The first own port at window offset `from` or after it, wrapping
+    /// to the start of the window. Requires an own port to exist.
+    fn next_own_offset(&self, from: u32) -> u32 {
+        let mut index = (from / u64::BITS) as usize;
+        let mut bits = self.own[index] & (!0u64 << (from % u64::BITS));
+        loop {
+            if bits != 0 {
+                return index as u32 * u64::BITS + bits.trailing_zeros();
+            }
+            index = (index + 1) % OWN_SET_WORDS;
+            bits = self.own[index];
+        }
+    }
+
+    fn is_own(&self, port: u16) -> bool {
+        let offset = u32::from(port - self.first);
+        self.own[(offset / u64::BITS) as usize] & (1 << (offset % u64::BITS)) != 0
+    }
+
+    /// The shard's own ports, each once: from the selected rank in
+    /// ascending order, wrapping at the end of the window.
+    pub(super) fn own_ports(&self) -> impl Iterator<Item = u16> + '_ {
+        let mut from = self.own_start;
+        (0..self.own_count).map(move |_| {
+            let offset = self.next_own_offset(from);
+            from = if offset + 1 == self.window {
+                0
+            } else {
+                offset + 1
+            };
+            self.first + offset as u16
+        })
+    }
+
+    /// The ports that hash to another shard, each once, from the place
+    /// the draw names and wrapping at the end of the window.
+    pub(super) fn foreign_ports(&self) -> impl Iterator<Item = u16> + '_ {
+        self.foreign.filter(|port| !self.is_own(*port))
     }
 }
 
