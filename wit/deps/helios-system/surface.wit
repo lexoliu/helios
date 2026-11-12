@@ -16,10 +16,11 @@ package helios:system@0.1.0;
 /// # Where the pixels are
 ///
 /// In this program's own linear memory, and in the compositor's, at the
-/// same time. `create` commits one physically contiguous run of pages
-/// from this program's pool, places it in this program's surface window
-/// and maps the same run into the compositor's — so a client writes its
-/// window with ordinary stores, `commit` costs one message rather than a
+/// same time. `create` pins one physically contiguous run of frames
+/// from this program's pool, shows it at the pages of this program's
+/// memory the program names and shows the same run at pages the
+/// compositor names in its own — so a client writes its window with
+/// ordinary stores, `commit` costs one message rather than a
 /// copy, and the compositor composes from the bytes the client wrote
 /// rather than from a staging copy of them. Nothing is copied anywhere,
 /// and the pages are charged to the client that asked for them.
@@ -32,6 +33,7 @@ package helios:system@0.1.0;
 /// it is handed while it has focus.
 interface surface {
   use input.{input-event};
+  use memory.{span};
 
   /// Why a surface request was refused.
   enum error {
@@ -47,9 +49,11 @@ interface surface {
     too-many-surfaces,
     /// The rectangle does not lie inside the surface it names.
     out-of-bounds,
-    /// The part of this program's linear memory the kernel devotes to
-    /// surfaces has no room left.
-    window-exhausted,
+    /// The span is not whole pages inside the caller's memory, is not
+    /// the length the surface needs, or overlaps something already
+    /// shown there. A compositor that answers `create` with such a span
+    /// fails the client's request with this.
+    bad-span,
     /// The frame buffer could not be pinned: the machine has no
     /// contiguous run of that size left, or this program's own memory
     /// accounting refused it.
@@ -60,16 +64,6 @@ interface surface {
     /// Only the instance the kernel provisioned as the compositor may
     /// deliver input to a surface.
     not-the-compositor,
-  }
-
-  /// Where a surface's frame buffer landed in this program's linear
-  /// memory.
-  record placement {
-    /// Byte offset of the frame buffer.
-    offset: u64,
-    /// How many bytes of linear memory it covers, which is the frame
-    /// rounded up to whole pages.
-    length: u64,
   }
 
   /// A rectangular region of a surface.
@@ -88,17 +82,17 @@ interface surface {
 
   /// One window on the desktop.
   ///
-  /// The bytes at `buffer` are what the compositor composes from, not a
-  /// staging copy: what is written there is what reaches the screen when
-  /// `commit` names it. Rows are `width * 4` bytes in the display's own
-  /// `bgrx8888` ordering, top row first, no padding between them.
+  /// The bytes at the span it was created with are what the compositor
+  /// composes from, not a staging copy: what is written there is what
+  /// reaches the screen when `commit` names it. Rows are `width * 4`
+  /// bytes in the display's own `bgrx8888` ordering, top row first, no
+  /// padding between them.
   ///
-  /// Dropping the surface takes the window off the desktop and hands the
-  /// pages back to this program's pool.
+  /// Dropping the surface takes the window off the desktop; the span is
+  /// ordinary zeroed memory again once the drop returns, and the frames
+  /// go back to this program's pool when the compositor's view of them
+  /// has ended.
   resource surface {
-    /// Where this surface's frame buffer sits in linear memory.
-    buffer: func() -> placement;
-
     /// The size this surface was created at.
     %size: func() -> size;
 
@@ -123,8 +117,15 @@ interface surface {
     events: func() -> stream<input-event>;
   }
 
-  /// Ask the compositor for a window of `width` by `height` pixels.
-  create: async func(width: u32, height: u32) -> result<surface, error>;
+  /// Ask the compositor for a window of `width` by `height` pixels,
+  /// with its pixels shown at `buffer`.
+  ///
+  /// `buffer` is `width * height * 4` bytes rounded up to whole wasm
+  /// pages. What those pages held is discarded; the window starts
+  /// zeroed. A call that does not return a surface — refused, or
+  /// cancelled by the caller — shows nothing at `buffer`, so the caller
+  /// may free those pages at once.
+  create: async func(width: u32, height: u32, buffer: span) -> result<surface, error>;
 
   /// Hand `events` to the surface `id` names.
   ///
@@ -152,11 +153,12 @@ interface surface {
 ///
 /// A surface is named by an identifier here rather than carried as a
 /// resource, because the resource lives in the *client's* table and the
-/// two never meet: what the compositor is given is a number, a geometry,
-/// and where the client's pages landed in the compositor's own linear
-/// memory.
+/// two never meet: what the compositor is given is a number and a
+/// geometry, and what it answers with is where in its own linear memory
+/// the client's pixels are to appear.
 interface compositor {
-  use surface.{error, placement, rect};
+  use surface.{error, rect};
+  use memory.{span};
 
   /// Stable identifier of one client surface, minted by the kernel.
   type surface-id = u64;
@@ -173,17 +175,27 @@ interface compositor {
 
   /// Take a new client surface onto the desktop.
   ///
-  /// `buffer` is where the client's frame buffer landed in *this*
-  /// component's linear memory: the kernel mapped the client's pinned
-  /// run a second time, so these bytes and the client's are the same
-  /// bytes.
-  create: async func(id: surface-id, dimensions: rect, buffer: placement) -> result<_, error>;
+  /// The answer is a span of *this* component's linear memory,
+  /// `dimensions.width * dimensions.height * 4` bytes rounded up to
+  /// whole wasm pages, that the compositor allocated for the surface.
+  /// When the call returns the kernel shows the client's pinned run
+  /// there, so those bytes and the client's are the same bytes; no
+  /// `commit` for `id` arrives before that has happened.
+  create: async func(id: surface-id, dimensions: rect) -> result<span, error>;
 
   /// The client published the pixels in `region`.
   commit: async func(id: surface-id, region: rect) -> result<_, error>;
 
-  /// The surface is gone: the client dropped it or died. Its pages are
-  /// unmapped from this component the moment this returns, so nothing
-  /// may read them afterwards.
+  /// The surface is gone: the client dropped it, died, or stopped
+  /// waiting for its `create`. The span `create` answered with is
+  /// ordinary zeroed memory again before this is called, so the
+  /// compositor frees it here and reads nothing from it.
+  ///
+  /// `id` may name a surface this component does not hold — one whose
+  /// `create` it refused, or one it was already told is gone — and the
+  /// call then does nothing. A client that gives up while `create` is
+  /// still running can be told before `create` returns; the kernel
+  /// calls `destroy` again once it has, so the surface never outlives
+  /// both calls.
   destroy: async func(id: surface-id);
 }

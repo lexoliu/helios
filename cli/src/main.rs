@@ -26,6 +26,7 @@ use wasmparser::Parser as WasmParser;
 use wit_component::ComponentEncoder;
 
 mod boot_kernel;
+mod venus_fetch;
 
 /// Why a `helios-cli` invocation did not do what it was asked.
 ///
@@ -44,6 +45,10 @@ enum CliError {
     LimineUefiImage(#[from] LimineError),
     #[error("{0}")]
     ProfileFetch(#[from] ProfileFetchError),
+    #[error("{0}")]
+    VenusProtocolFetch(#[from] venus_fetch::VenusFetchError),
+    #[error("{0}")]
+    WorkspaceRoot(#[from] WorkspaceRootError),
 }
 
 /// Why an ahead-of-time compile did not produce a signed artifact.
@@ -668,6 +673,9 @@ enum Commands {
     KernelPrebuild(KernelPrebuildCommand),
     LimineUefiImage(LimineUefiImageCommand),
     ProfileFetch(ProfileFetchCommand),
+    /// Download the venus-protocol files `venus/protocol-inputs.toml` pins,
+    /// which the `helios-venus` build reads.
+    VenusProtocolFetch,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -882,6 +890,10 @@ fn run(cli: Cli) -> Result<(), CliError> {
         Commands::LimineUefiImage(command) => Ok(run_limine_uefi_image(command)?),
         Commands::ProfileFetch(command) => {
             Ok(run_profile_fetch(command, cli.workspace_root.as_deref())?)
+        }
+        Commands::VenusProtocolFetch => {
+            let workspace_root = WorkspaceRoot::resolve(cli.workspace_root.as_deref())?;
+            Ok(venus_fetch::run(workspace_root.path())?)
         }
     }
 }
