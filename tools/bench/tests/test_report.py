@@ -126,6 +126,20 @@ def test_a_report_written_before_the_rpc_transport_was_recorded_still_loads(
     assert "inspector RPC over `unrecorded`" in render_pins(loaded)
 
 
+def test_a_report_written_before_matched_metrics_was_recorded_still_loads(
+    tmp_path: Path, baseline_report: Report
+) -> None:
+    """A baseline run's report may predate the field (#849): it reads as having none."""
+    path = tmp_path / "report.json"
+    save_report(baseline_report, path)
+    raw = json.loads(path.read_text())
+    for workload in raw["workloads"]:
+        workload.pop("matched_metrics", None)
+    path.write_text(json.dumps(raw))
+    loaded = load_report(path)
+    assert all(workload.matched_metrics == () for workload in loaded.workloads)
+
+
 AOT_CURL = {
     "name": "aot-curl",
     "class": "compute",
