@@ -1730,6 +1730,8 @@ enum VmSessionCommand {
     Stats,
     /// List the live program instances, and optionally stop one.
     Instances(crate::InstancesCommand),
+    /// Show the guest's swap policy, or change some of its settings.
+    Swap(crate::SwapCommand),
     Repl,
     AotBench(AotBenchCommand),
     WorkloadBench(WorkloadBenchCommand),
@@ -6017,6 +6019,7 @@ impl From<VmSessionCommand> for ResolvedVmSessionCommand {
             VmSessionCommand::Instances(command) => {
                 Self::Session(SessionCommand::Instances(command))
             }
+            VmSessionCommand::Swap(command) => Self::Session(SessionCommand::Swap(command)),
             VmSessionCommand::Repl => Self::Session(SessionCommand::Repl),
             VmSessionCommand::AotBench(command) => Self::AotBench(command),
             VmSessionCommand::WorkloadBench(command) => Self::WorkloadBench(command),
