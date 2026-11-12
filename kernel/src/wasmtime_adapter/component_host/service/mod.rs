@@ -1227,7 +1227,6 @@ where
                 launch.argv.program_name(),
                 &source,
                 hint,
-                exec_context.write_serial,
                 &launch.timeline,
             )
             .await?;
@@ -1244,7 +1243,6 @@ where
         compile: &CompileAuthority,
         exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
         source: ProgramSource,
-        hint: Option<AotCompileHint>,
         mut launch: ProgramLaunch<Net>,
         output_mode: OutputMode,
         stdio: ChildStdio,
@@ -1256,8 +1254,7 @@ where
                 &exec_context,
                 launch.argv.program_name(),
                 &source,
-                hint,
-                exec_context.write_serial,
+                None,
                 &launch.timeline,
             )
             .await?;
@@ -1433,7 +1430,6 @@ where
                 launch.argv.program_name(),
                 &source,
                 hint,
-                exec_context.write_serial,
                 &launch.timeline,
             )
             .await?;
@@ -1514,9 +1510,9 @@ where
         program: &str,
         source: &ProgramSource,
         hint: Option<AotCompileHint>,
-        write_serial: crate::DebugSerialWriter,
         timeline: &phases::Timeline,
     ) -> Result<ProgramExecutable<CpuImpl, Net, HostFs>, ProgramExecError> {
+        let write_serial = exec_context.write_serial;
         let started_at = monotonic_nanos(&self.inner.clock_cpu);
         timeline.record(&self.inner.clock_cpu, LaunchPhase::LoadBegin);
         let payload = match source {

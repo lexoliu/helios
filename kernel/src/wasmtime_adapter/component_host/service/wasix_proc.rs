@@ -1857,7 +1857,6 @@ where
     let filesystem = Some(caller.data().filesystem.snapshot());
     let signal_state = caller.data().signal_state.clone();
     let signal_dispositions = caller.data().signal_dispositions.clone();
-    let write_serial = caller.data().write_serial;
     let executable = service
         .load_executable(
             compile,
@@ -1865,7 +1864,6 @@ where
             argv.program_name(),
             &prepared.source,
             None,
-            write_serial,
             trace.timeline(),
         )
         .await
@@ -3473,7 +3471,6 @@ where
             compile,
             exec_context,
             prepared.source,
-            None,
             ProgramLaunch {
                 argv,
                 env: LaunchEnvironment::from_guest(environment),
