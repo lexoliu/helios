@@ -413,11 +413,17 @@ pub(super) fn write_decimal(memory: &SharedMemory, ptr: GuestAddress, mut value:
 /// Installs the compiler store's interrupt callback and registers the
 /// store for kills, for as long as the returned registration lives.
 ///
-/// The compiler is never preempted: its calls are not driven through
+/// The compiler is never preempted by a slice: its calls are not driven
+/// through
 /// [`crate::wasmtime_adapter::preemption::StoreInterrupts::drive`], so no
-/// processor's running slot ever names it, and what interrupts it is a kill
-/// of its instance. The callback traps that kill, and resumes the compile when it
-/// finds none.
+/// processor's running slot ever names it. Two things interrupt it: a kill
+/// of its instance, which the callback traps, and a freeze request
+/// (`GuestInterrupts::interrupt_running` reaches undriven stores through
+/// the kill table), on which the callback yields. Every compile call is a
+/// `call_async` made from a task, so the yield returns the task to the
+/// executor and its processor reaches the freeze barrier's boundary; the
+/// compile resumes when the machine thaws. An interrupt that is neither
+/// resumes the compile.
 pub(super) fn configure_compiler_core_store<CpuImpl, Net, HostFs>(
     store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, HostFs>>,
 ) -> crate::wasmtime_adapter::preemption::StoreInterrupts<CpuImpl>
@@ -430,10 +436,14 @@ where
         if let Some(reason) = caller.data().instance.pending_kill() {
             return Err(wasmtime::Error::from(crate::InstanceKilled { reason }));
         }
-        Ok(wasmtime::InterruptAction::Continue)
+        if caller.data().shared.interrupts.freeze_requested() {
+            Ok(wasmtime::InterruptAction::Yield)
+        } else {
+            Ok(wasmtime::InterruptAction::Continue)
+        }
     });
     let interrupts = store.data().shared.interrupts.clone();
-    interrupts.register(store.data().instance.id(), store, store.data().cpu.clone())
+    interrupts.register_undriven(store.data().instance.id(), store, store.data().cpu.clone())
 }
 
 pub(super) fn compiler_tls_base<CpuImpl, Net, HostFs>(

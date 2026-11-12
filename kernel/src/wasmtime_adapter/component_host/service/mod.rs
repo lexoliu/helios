@@ -1197,14 +1197,18 @@ where
     }
 
     /// Interrupts every guest that is running on any processor now,
-    /// however long it has run: what a freeze passes as its
+    /// however long it has run, and every store the slices do not
+    /// preempt (the in-kernel compiler's): what a freeze passes as its
     /// `interrupt_guests`, so a processor inside wasm reaches a
-    /// scheduler boundary at its next check.
+    /// scheduler boundary at its next check. The answer is the freeze
+    /// request those stores yield on, and the freeze drops it before it
+    /// releases the machine.
     ///
-    /// Like [`Self::preempt_overdue_guests`] it takes no lock, allocates
-    /// nothing and sends no IPI.
-    pub fn interrupt_running_guests(&self) {
-        self.inner.engine.interrupts().interrupt_running();
+    /// Like [`Self::preempt_overdue_guests`] it allocates nothing and
+    /// sends no IPI; it takes the kill table's lock, which is held only
+    /// across synchronous bookkeeping.
+    pub fn interrupt_running_guests(&self) -> crate::wasmtime_adapter::preemption::FreezeRequest {
+        self.inner.engine.interrupts().interrupt_running()
     }
 
     /// Interrupts every store of `instance`, so a kill whose flag is set

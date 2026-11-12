@@ -95,7 +95,7 @@ use core::future::Future;
 use core::hint::spin_loop;
 use core::pin::Pin;
 use core::ptr;
-use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use core::task::{Context, Poll};
 
 use crossbeam_utils::CachePadded;
@@ -114,11 +114,38 @@ pub struct GuestInterrupts {
     running: RunningSlots<StoreInterruptHandle>,
     /// Every live store of this engine, by the instance it runs.
     stores: Mutex<Slab<KillTarget>>,
+    /// Whether a freeze holds the machine, set by
+    /// [`Self::interrupt_running`] and cleared when the request it
+    /// answers drops. It is a request of its own, apart from the slice
+    /// preemption that also lowers a store's stack limit: a store whose
+    /// calls no processor's slot names ([`Self::register_undriven`]) is
+    /// preempted by no slice, and yields to the executor only for this.
+    freeze: AtomicBool,
 }
 
 struct KillTarget {
     instance: InstanceId,
     handle: StoreInterruptHandle,
+    /// Whether the store's calls are driven through
+    /// [`StoreInterrupts::drive`], so that a processor's slot names it
+    /// while it runs. An undriven store is reached through this table.
+    driven: bool,
+}
+
+/// A freeze request to every guest, ended when it drops.
+///
+/// [`GuestInterrupts::interrupt_running`] answers it; while it lives,
+/// [`GuestInterrupts::freeze_requested`] is true, and an undriven
+/// store's interrupt callback yields instead of resuming.
+#[must_use = "the request ends when this is dropped"]
+pub struct FreezeRequest {
+    interrupts: Arc<GuestInterrupts>,
+}
+
+impl Drop for FreezeRequest {
+    fn drop(&mut self) {
+        self.interrupts.freeze.store(false, Ordering::Release);
+    }
 }
 
 impl GuestInterrupts {
@@ -133,6 +160,7 @@ impl GuestInterrupts {
         Self {
             running: RunningSlots::new(processor_count, slice_ticks),
             stores: Mutex::new(Slab::new()),
+            freeze: AtomicBool::new(false),
         }
     }
 
@@ -148,12 +176,37 @@ impl GuestInterrupts {
         store: &Store<T>,
         clock: Clock,
     ) -> StoreInterrupts<Clock> {
+        self.register_store(instance, store, clock, true)
+    }
+
+    /// Like [`Self::register`], for a store whose calls are not driven
+    /// through [`StoreInterrupts::drive`], the in-kernel compiler's: no
+    /// processor's running slot names it and no slice preempts it, so a
+    /// kill reaches it through the table, and so does a freeze
+    /// ([`Self::interrupt_running`]).
+    pub(crate) fn register_undriven<T, Clock: Cpu>(
+        self: &Arc<Self>,
+        instance: InstanceId,
+        store: &Store<T>,
+        clock: Clock,
+    ) -> StoreInterrupts<Clock> {
+        self.register_store(instance, store, clock, false)
+    }
+
+    fn register_store<T, Clock: Cpu>(
+        self: &Arc<Self>,
+        instance: InstanceId,
+        store: &Store<T>,
+        clock: Clock,
+        driven: bool,
+    ) -> StoreInterrupts<Clock> {
         let handle = store.interrupt_handle().unwrap_or_else(|error| {
             panic!("a kernel engine was built without stack-limit interruption: {error}")
         });
         let key = self.stores.lock().insert(KillTarget {
             instance,
             handle: handle.clone(),
+            driven,
         });
         StoreInterrupts {
             interrupts: self.clone(),
@@ -181,19 +234,47 @@ impl GuestInterrupts {
     /// The freeze barrier calls it so that a guest in the middle of wasm
     /// reaches the executor at its next function-entry or loop-header
     /// check, instead of at the end of its slice. It makes the same
-    /// request [`Self::preempt_overdue`] does, so the store's callback
-    /// runs the same yield (or condemnation), and takes the same
-    /// lock-free, allocation-free, IPI-free walk: it is callable from
-    /// task context on any processor. A guest that is suspended or in
-    /// host code is not reached, because it is not running and reaches
-    /// the executor on its own.
-    pub fn interrupt_running(&self) {
+    /// request [`Self::preempt_overdue`] does of each store a processor's
+    /// slot names, so the store's callback runs the same yield (or
+    /// condemnation), with the same lock-free, allocation-free, IPI-free
+    /// walk, and then asks every undriven store ([`Self::register_undriven`])
+    /// the same: no slot names those, and no slice preempts them, so
+    /// they yield only for the freeze request this answers. That second
+    /// walk takes the kill table's lock, held elsewhere only across
+    /// synchronous bookkeeping. It is callable from task context on any
+    /// processor. A guest that is suspended or in host code is not
+    /// reached through a slot, because it is not running and reaches the
+    /// executor on its own; an undriven one is asked anyway, and takes
+    /// the request at its next check.
+    ///
+    /// The returned request holds [`Self::freeze_requested`] true until
+    /// it drops, which is how a store's callback tells this request from
+    /// a slice's.
+    pub fn interrupt_running(self: &Arc<Self>) -> FreezeRequest {
+        // Before any interrupt, so a callback that an interrupt reaches
+        // finds the flag.
+        self.freeze.store(true, Ordering::Release);
         // A reader runs with the local processor's interrupts masked, so
         // that an interrupt handler never lands between its increment of
         // `readers` and its decrement, which an owner on another
         // processor would spin through (module docs, "Reclamation"). This
         // caller is a task, so it masks them itself.
         with_local_interrupts_masked(|| self.running.interrupt_all());
+        for (_, target) in self.stores.lock().iter() {
+            if !target.driven {
+                target.handle.interrupt();
+            }
+        }
+        FreezeRequest {
+            interrupts: self.clone(),
+        }
+    }
+
+    /// Whether a freeze request ([`Self::interrupt_running`]) is
+    /// pending. An undriven store's interrupt callback yields to the
+    /// executor when it is, and resumes the guest when it is not.
+    pub(crate) fn freeze_requested(&self) -> bool {
+        self.freeze.load(Ordering::Acquire)
     }
 
     /// Interrupts every live store of `instance`, wherever it is: running
@@ -678,5 +759,41 @@ mod tests {
         assert_eq!(instances(&interrupts), [InstanceId::from_raw(7)]);
         drop(second);
         assert!(instances(&interrupts).is_empty());
+    }
+
+    /// A freeze request is its own flag: it is set before any store is
+    /// interrupted, reaches the undriven stores of the kill table, and
+    /// ends when its answer drops, whatever slice preemption did.
+    #[test]
+    fn a_freeze_request_lasts_until_its_answer_drops() {
+        let engine = engine();
+        let interrupts = guest_interrupts(1);
+        let clock = ManualClockCpu::new();
+        let driven_store = wasmtime::Store::new(&engine, ());
+        let undriven_store = wasmtime::Store::new(&engine, ());
+        let driven = interrupts.register(InstanceId::from_raw(1), &driven_store, clock.clone());
+        let undriven =
+            interrupts.register_undriven(InstanceId::from_raw(2), &undriven_store, clock);
+        let driven_flags = |interrupts: &GuestInterrupts| {
+            interrupts
+                .stores
+                .lock()
+                .iter()
+                .map(|(_, target)| target.driven)
+                .collect::<alloc::vec::Vec<_>>()
+        };
+        assert_eq!(driven_flags(&interrupts), [true, false]);
+
+        assert!(!interrupts.freeze_requested());
+        interrupts.preempt_overdue(Instant::new(u64::MAX));
+        assert!(
+            !interrupts.freeze_requested(),
+            "a slice's preemption is not a freeze request"
+        );
+        let request = interrupts.interrupt_running();
+        assert!(interrupts.freeze_requested());
+        drop(request);
+        assert!(!interrupts.freeze_requested());
+        drop((driven, undriven));
     }
 }
