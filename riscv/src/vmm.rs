@@ -1153,6 +1153,15 @@ impl SwapLeafFormat for RiscvUserAddressSpace {
             return Err(AddressSpaceError::NotSwapped);
         }
         let ppn = (frame.as_ptr() as u64) >> PAGE_SHIFT;
+        // The caller filled the frame with data stores, and RISC-V orders
+        // those before an instruction fetch only through `fence.i` on the
+        // fetching hart. An instance owns the memory its code occupies for
+        // its whole turn, host calls included, so an executable page can
+        // have been evicted; fence every hart's instruction stream before
+        // the leaf exposes the page to any of them.
+        if flags.contains(PageFlags::EXECUTE) {
+            crate::fence_instruction_streams();
+        }
         // SAFETY: as above. The release orders the frame's contents,
         // filled by the caller, before the leaf that exposes them.
         unsafe {
