@@ -200,10 +200,6 @@ pub(super) struct NetworkShard {
     /// address to hash a flow with, so it demuxes there.
     pub(super) dhcp: DhcpClient,
     pub(super) dns_servers: DhcpDnsServers,
-    /// Identifier stamped on the next ICMP echo request. ICMP frames
-    /// carry no port, so every one of them is demultiplexed onto shard
-    /// 0 and this counter is that shard's alone.
-    pub(super) next_icmp_echo_identifier: u16,
 }
 
 /// One shard's stack and the per-shard words beside it.
@@ -1049,7 +1045,6 @@ impl NetworkShard {
             udp_sockets,
             dhcp,
             dns_servers: DhcpDnsServers::new(),
-            next_icmp_echo_identifier: 1,
         }
     }
 

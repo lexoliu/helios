@@ -62,7 +62,7 @@ pub use packet::{
 };
 pub use stack::{
     DEFAULT_TCP_LISTEN_BACKLOG, DhcpLease, DnsQueryId, IcmpEchoKey, IcmpEchoReply,
-    Ipv4MulticastMembership, MAX_ICMP_ECHO_REPLIES, MAX_IPV4_MULTICAST_MEMBERSHIPS,
+    Ipv4MulticastMembership, MAX_ICMP_ECHO_EXCHANGES, MAX_IPV4_MULTICAST_MEMBERSHIPS,
     MAX_OUTBOUND_FRAMES, MAX_UDP_RX, MAX_UDP_SOCKETS, NeighborCache, NeighborEntry, NeighborState,
     OutboundBatchStatus, Route, RouteTable, RxChecksumOffload, SocketId, Stack, StackConfig,
     StackEvent, StackInstant, TcpAccept, TcpCloseOutcome, TcpConnectState, TcpConnectTerminalError,
