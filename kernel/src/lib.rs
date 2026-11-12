@@ -221,10 +221,10 @@ pub use runtime::{
     UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
 };
 pub use surface::{
-    MAX_INSTANCE_SURFACES, MAX_LIVE_SURFACES, ReturnedSurfaces, SURFACE_EVENT_QUEUE_DEPTH,
-    SURFACE_REQUEST_QUEUE_DEPTH, SurfaceCreate, SurfaceEvents, SurfaceGeometry, SurfaceId,
-    SurfaceOwnership, SurfaceRect, SurfaceRequest, SurfaceService, SurfaceServiceError,
-    SurfaceShared,
+    MAX_INSTANCE_SURFACES, MAX_LIVE_SURFACES, ReturnedSurface, ReturnedSurfaces,
+    SURFACE_EVENT_QUEUE_DEPTH, SURFACE_REQUEST_QUEUE_DEPTH, SurfaceCreate, SurfaceEvents,
+    SurfaceGeometry, SurfaceId, SurfaceOwnership, SurfaceRect, SurfaceRequest, SurfaceService,
+    SurfaceServiceError, SurfaceShared,
 };
 pub use vsock::{
     ComponentHostVsockService, MAX_VSOCK_BACKLOG, MAX_VSOCK_CONNECTIONS, MAX_VSOCK_LISTENERS,

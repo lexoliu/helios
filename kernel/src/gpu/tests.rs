@@ -10,7 +10,7 @@
 use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::pin;
-use core::sync::atomic::AtomicBool;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use futures::channel::oneshot;
 use futures_lite::future::{block_on, poll_once};
@@ -19,6 +19,7 @@ use helios_hal::display::{
     BlobId, BlobMemory, BlobRequest, BlobUsage, CapsetId, CapsetInfo, CapsetList, ContextId,
     ContextName, FenceId, Gpu3d, Gpu3dError, Gpu3dResult,
 };
+use helios_hal::io::IoError;
 use helios_hal::iommu::PhysicalRange;
 use helios_hal::vmm::VirtAddr;
 use std::sync::Mutex;
@@ -87,6 +88,19 @@ struct FakeGpu3d {
     /// receiver until the test lets it answer — a device still working
     /// on a chain it was given.
     submit_hold: Mutex<Option<oneshot::Receiver<()>>>,
+    /// Set to make every submission end in a transport error, as a
+    /// faulted queue does: the chain is left published and nothing
+    /// answers it.
+    transport_fault_submits: AtomicBool,
+    /// Like `submit_hold`, for `destroy_blob`.
+    destroy_hold: Mutex<Option<oneshot::Receiver<()>>>,
+    /// Set to make every blob destroy fail.
+    refuse_destroy: AtomicBool,
+    /// Set to make every blob unmap fail.
+    refuse_unmap: AtomicBool,
+    /// Set to make every blob create fail: an answered refusal when
+    /// false is stored with it, a transport error when true.
+    fail_creates: Mutex<Option<bool>>,
     next_context: Mutex<u32>,
     next_blob: Mutex<u32>,
 }
@@ -98,6 +112,11 @@ impl FakeGpu3d {
             capset_bytes: alloc::vec![0xde, 0xad, 0xbe, 0xef],
             refuse_submits: AtomicBool::new(false),
             submit_hold: Mutex::new(None),
+            transport_fault_submits: AtomicBool::new(false),
+            destroy_hold: Mutex::new(None),
+            refuse_destroy: AtomicBool::new(false),
+            refuse_unmap: AtomicBool::new(false),
+            fail_creates: Mutex::new(None),
             next_context: Mutex::new(1),
             next_blob: Mutex::new(1),
         }
@@ -163,11 +182,26 @@ impl Gpu3d for FakeGpu3d {
             request.memory,
             request.size,
         ));
-        Ok(id)
+        match *self.fail_creates.lock().expect("no test panics here") {
+            Some(true) => Err(Gpu3dError::Transport(IoError::DeviceFault)),
+            Some(false) => Err(Gpu3dError::Unspecified),
+            None => Ok(id),
+        }
     }
 
     async fn destroy_blob(&self, blob: BlobId) -> Gpu3dResult<()> {
         self.record(Call::DestroyBlob(blob));
+        let hold = self
+            .destroy_hold
+            .lock()
+            .expect("no test panics here")
+            .take();
+        if let Some(hold) = hold {
+            let _ = hold.await;
+        }
+        if self.refuse_destroy.load(Ordering::Relaxed) {
+            return Err(Gpu3dError::Unspecified);
+        }
         Ok(())
     }
 
@@ -181,6 +215,9 @@ impl Gpu3d for FakeGpu3d {
 
     async fn unmap_blob(&self, blob: BlobId) -> Gpu3dResult<()> {
         self.record(Call::UnmapBlob(blob));
+        if self.refuse_unmap.load(Ordering::Relaxed) {
+            return Err(Gpu3dError::Unspecified);
+        }
         Ok(())
     }
 
@@ -205,11 +242,11 @@ impl Gpu3d for FakeGpu3d {
         if let Some(hold) = hold {
             let _ = hold.await;
         }
-        if self
-            .refuse_submits
-            .load(core::sync::atomic::Ordering::Relaxed)
-        {
-            return Err(helios_hal::display::Gpu3dError::Unspecified);
+        if self.transport_fault_submits.load(Ordering::Relaxed) {
+            return Err(Gpu3dError::Transport(IoError::DeviceFault));
+        }
+        if self.refuse_submits.load(Ordering::Relaxed) {
+            return Err(Gpu3dError::Unspecified);
         }
         assert!(commands.bytes > 0, "a command buffer covers bytes");
         Ok(())
@@ -636,9 +673,7 @@ fn a_rejected_submission_still_retires_its_fence() {
     test_hooks::install();
     let (shared, control, submit) = gpu3d_channels(true);
     let device = FakeGpu3d::new();
-    device
-        .refuse_submits
-        .store(true, core::sync::atomic::Ordering::Relaxed);
+    device.refuse_submits.store(true, Ordering::Relaxed);
     let ownership = claimed(&shared);
 
     with_servers(&device, &shared, &control, &submit, async {
@@ -1262,4 +1297,360 @@ mod component_host {
         assert!(answer.is_ok(), "the GPU class opens the engine");
         assert!(service.is_claimed());
     }
+}
+
+/// Ask the control server for one blob of `memory` in `context`, with a
+/// run of its own behind it when it is guest-backed.
+async fn new_blob(
+    ownership: &Gpu3dOwnership,
+    context: ContextId,
+    memory: BlobMemory,
+    usage: BlobUsage,
+) -> BlobId {
+    request_blob(ownership, context, memory, usage)
+        .await
+        .expect("the fake engine agrees")
+}
+
+/// [`new_blob`], with the engine's answer left to the caller.
+async fn request_blob(
+    ownership: &Gpu3dOwnership,
+    context: ContextId,
+    memory: BlobMemory,
+    usage: BlobUsage,
+) -> Result<BlobId, Gpu3dServiceError> {
+    let claim = ownership.claim_ref().expect("the claim is held");
+    let (reply, answer) = oneshot::channel();
+    claim
+        .sender()
+        .control(
+            Gpu3dRequest::CreateBlob {
+                generation: claim.generation(),
+                spec: crate::gpu::BlobSpec {
+                    context,
+                    memory,
+                    usage,
+                    size: 4096,
+                    host_id: 0,
+                    backing: Some(pinned(4096)),
+                },
+                reply,
+            },
+            answer,
+        )
+        .await
+}
+
+/// Place `blob` in the aperture.
+async fn place(ownership: &Gpu3dOwnership, blob: BlobId) {
+    let claim = ownership.claim_ref().expect("the claim is held");
+    let (reply, answer) = oneshot::channel();
+    claim
+        .sender()
+        .control(
+            Gpu3dRequest::MapBlob {
+                generation: claim.generation(),
+                blob,
+                reply,
+            },
+            answer,
+        )
+        .await
+        .expect("the fake engine agrees");
+}
+
+/// Queue the destroy of `blob` without waiting for it to be served.
+async fn queue_destroy(ownership: &Gpu3dOwnership, blob: BlobId) {
+    let claim = ownership.claim_ref().expect("the claim is held");
+    claim
+        .sender()
+        .control_oneway(Gpu3dRequest::DestroyBlob {
+            generation: claim.generation(),
+            blob,
+        })
+        .await
+        .expect("the owner task is serving");
+}
+
+/// Let the owner tasks run until they have nothing left to do.
+async fn settle() {
+    for _ in 0..8 {
+        crate::yield_now().await;
+    }
+}
+
+/// A blob's run stays live for as long as the device has not answered
+/// the destroy, and goes back once it has.
+#[test]
+fn a_blob_is_freed_only_once_the_device_has_destroyed_it() {
+    test_hooks::install();
+    let (shared, control, submit) = gpu3d_channels(true);
+    let device = FakeGpu3d::new();
+    let (gate, hold) = oneshot::channel();
+    *device.destroy_hold.lock().expect("no test panics here") = Some(hold);
+    let ownership = claimed(&shared);
+    let runs = test_hooks::live_runs();
+
+    with_servers(&device, &shared, &control, &submit, async {
+        let context = create_context(&ownership).await;
+        let blob = new_blob(
+            &ownership,
+            context.id,
+            BlobMemory::Guest,
+            BlobUsage::empty(),
+        )
+        .await;
+        assert_eq!(test_hooks::live_runs() - runs, 1);
+
+        queue_destroy(&ownership, blob).await;
+        settle().await;
+        assert!(
+            device.calls().contains(&Call::DestroyBlob(blob)),
+            "the device is holding the destroy"
+        );
+        assert_eq!(
+            test_hooks::live_runs() - runs,
+            1,
+            "the run stays live while the device has not answered"
+        );
+
+        gate.send(()).expect("the device is parked on it");
+        settle().await;
+        assert_eq!(
+            test_hooks::live_runs(),
+            runs,
+            "the run goes back once the device has destroyed the blob"
+        );
+    });
+}
+
+/// A blob the device would not destroy may still be read and written by
+/// the renderer, so its run never goes back to the pool, whether the
+/// destroy was asked for on its own or came with the claim.
+#[test]
+fn a_blob_the_device_would_not_destroy_stays_pinned() {
+    test_hooks::install();
+    let (shared, control, submit) = gpu3d_channels(true);
+    let device = FakeGpu3d::new();
+    device.refuse_destroy.store(true, Ordering::Relaxed);
+    let mut views = ViewTable::new();
+    let mut ownership = claimed_in(&shared, &mut views);
+    let runs = test_hooks::live_runs();
+
+    with_servers(&device, &shared, &control, &submit, async {
+        let context = create_context(&ownership).await;
+        let first = new_blob(
+            &ownership,
+            context.id,
+            BlobMemory::Guest,
+            BlobUsage::empty(),
+        )
+        .await;
+        new_blob(
+            &ownership,
+            context.id,
+            BlobMemory::Guest,
+            BlobUsage::empty(),
+        )
+        .await;
+        assert_eq!(test_hooks::live_runs() - runs, 2);
+
+        queue_destroy(&ownership, first).await;
+        settle().await;
+        assert!(device.calls().contains(&Call::DestroyBlob(first)));
+        assert_eq!(
+            test_hooks::live_runs() - runs,
+            2,
+            "a refused destroy keeps the run"
+        );
+
+        ownership
+            .release(&mut views)
+            .expect("the claim showed nothing");
+        settle().await;
+    });
+
+    let destroyed = device
+        .calls()
+        .iter()
+        .filter(|call| matches!(call, Call::DestroyBlob(_)))
+        .count();
+    assert_eq!(destroyed, 2, "both blobs were asked to go");
+    assert_eq!(
+        test_hooks::live_runs() - runs,
+        2,
+        "neither run goes back to a pool the renderer may still write"
+    );
+}
+
+/// A blob the device would not take out of the aperture is not destroyed
+/// at all, and its run never goes back to the pool.
+#[test]
+fn a_blob_the_device_would_not_unmap_stays_pinned() {
+    test_hooks::install();
+    let (shared, control, submit) = gpu3d_channels(true);
+    let device = FakeGpu3d::new();
+    device.refuse_unmap.store(true, Ordering::Relaxed);
+    let mut views = ViewTable::new();
+    let mut ownership = claimed_in(&shared, &mut views);
+    let runs = test_hooks::live_runs();
+
+    with_servers(&device, &shared, &control, &submit, async {
+        let context = create_context(&ownership).await;
+        let first = new_blob(
+            &ownership,
+            context.id,
+            BlobMemory::Host3dGuest,
+            BlobUsage::MAPPABLE,
+        )
+        .await;
+        let second = new_blob(
+            &ownership,
+            context.id,
+            BlobMemory::Host3dGuest,
+            BlobUsage::MAPPABLE,
+        )
+        .await;
+        place(&ownership, first).await;
+        place(&ownership, second).await;
+        assert_eq!(test_hooks::live_runs() - runs, 2);
+
+        queue_destroy(&ownership, first).await;
+        settle().await;
+        assert!(device.calls().contains(&Call::UnmapBlob(first)));
+        assert_eq!(
+            test_hooks::live_runs() - runs,
+            2,
+            "a refused unmap keeps the run"
+        );
+
+        ownership
+            .release(&mut views)
+            .expect("the claim showed nothing");
+        settle().await;
+    });
+
+    assert!(
+        !device
+            .calls()
+            .iter()
+            .any(|call| matches!(call, Call::DestroyBlob(_))),
+        "a placed blob is never offered to the device's destroy"
+    );
+    assert_eq!(
+        test_hooks::live_runs() - runs,
+        2,
+        "neither run goes back to a pool the renderer may still write"
+    );
+}
+
+/// Submit one command buffer on `context` and report the answer.
+async fn submit_commands(
+    ownership: &Gpu3dOwnership,
+    context: &super::ContextRecord,
+    fence: u64,
+) -> Result<(), Gpu3dServiceError> {
+    let commands = pinned(4096);
+    let claim = ownership.claim_ref().expect("the claim is held");
+    let (reply, answer) = oneshot::channel();
+    claim
+        .sender()
+        .submit(
+            SubmitRequest::Submit {
+                generation: claim.generation(),
+                context: context.id,
+                commands: commands.physical(),
+                buffer: commands,
+                fence: FenceId::new(fence),
+                fences: context.fences.clone(),
+                reply,
+            },
+            answer,
+        )
+        .await
+}
+
+/// A submission the device never answered may still be read by it, so
+/// its command buffer stays out of the pool; one the device answered
+/// with a refusal is finished with, and the buffer goes back.
+#[test]
+fn a_command_buffer_is_kept_only_when_the_device_never_answered() {
+    test_hooks::install();
+    let (shared, control, submit) = gpu3d_channels(true);
+    let device = FakeGpu3d::new();
+    let ownership = claimed(&shared);
+    let runs = test_hooks::live_runs();
+
+    with_servers(&device, &shared, &control, &submit, async {
+        let context = create_context(&ownership).await;
+
+        device.refuse_submits.store(true, Ordering::Relaxed);
+        assert!(submit_commands(&ownership, &context, 1).await.is_err());
+        settle().await;
+        assert_eq!(
+            test_hooks::live_runs(),
+            runs,
+            "an answered refusal frees the command buffer"
+        );
+
+        device
+            .transport_fault_submits
+            .store(true, Ordering::Relaxed);
+        assert!(submit_commands(&ownership, &context, 2).await.is_err());
+        settle().await;
+        assert_eq!(
+            test_hooks::live_runs() - runs,
+            1,
+            "a submission the device never answered keeps its command buffer"
+        );
+        assert_eq!(context.fences.sequence(), 2, "its fence retired anyway");
+    });
+}
+
+/// A blob create the device never answered may have attached the pages
+/// to a blob nobody has a name for, so the run stays out of the pool;
+/// one the device refused attached nothing, and the run goes back.
+#[test]
+fn a_blobs_backing_is_kept_only_when_the_create_was_never_answered() {
+    test_hooks::install();
+    let (shared, control, submit) = gpu3d_channels(true);
+    let device = FakeGpu3d::new();
+    let ownership = claimed(&shared);
+    let runs = test_hooks::live_runs();
+
+    with_servers(&device, &shared, &control, &submit, async {
+        let context = create_context(&ownership).await;
+
+        *device.fail_creates.lock().expect("no test panics here") = Some(false);
+        let refused = request_blob(
+            &ownership,
+            context.id,
+            BlobMemory::Guest,
+            BlobUsage::empty(),
+        )
+        .await;
+        assert!(refused.is_err());
+        settle().await;
+        assert_eq!(
+            test_hooks::live_runs(),
+            runs,
+            "an answered refusal frees the backing"
+        );
+
+        *device.fail_creates.lock().expect("no test panics here") = Some(true);
+        let unanswered = request_blob(
+            &ownership,
+            context.id,
+            BlobMemory::Guest,
+            BlobUsage::empty(),
+        )
+        .await;
+        assert!(unanswered.is_err());
+        settle().await;
+        assert_eq!(
+            test_hooks::live_runs() - runs,
+            1,
+            "a create the device never answered keeps its backing"
+        );
+    });
 }

@@ -345,5 +345,7 @@ tail-end of this one. It is recorded on #5.
 
 What x86-64 does install is the memory half: a display frame buffer is
 pinned and shown in an instance's memory on this backend exactly as on
-the other two, while `substitute_device` answers
-`DeviceMappingUnsupported` because no grant ever names a region here.
+the other two, and `substitute_device` shows a device region (a virtio-gpu
+host blob in the host-visible aperture) with the memory type its attributes
+call for (`x86/src/memory_type.rs`), although no grant names a region
+here.

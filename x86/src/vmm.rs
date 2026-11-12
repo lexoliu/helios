@@ -20,7 +20,7 @@ use core::ffi::c_int;
 use core::ptr;
 use core::ptr::NonNull;
 
-use helios_hal::device::DmaPlacement;
+use helios_hal::device::{DeviceRegion, DmaPlacement};
 use helios_hal::iommu::PhysicalRange;
 use helios_hal::pmm::PhysFrame;
 use helios_hal::vmm::{
@@ -46,6 +46,7 @@ use x86_64::structures::paging::{
     FrameAllocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, Size4KiB, Translate,
 };
 
+use crate::memory_type;
 use crate::smp::{self, DirectMappedFrameAllocator};
 
 /// Start of the user-VA window. `0x0000_2000_0000_0000` keeps the
@@ -272,6 +273,10 @@ impl X86UserAddressSpace {
                     return Err(AddressSpaceError::NotCommitted);
                 }
             };
+            // A substituted device region keeps its memory type through
+            // a protection change: `flags` says what the owner may do,
+            // never how the hardware is reached.
+            let flags = flags | (previous & memory_type::MEMORY_TYPE_BITS);
             match unsafe { mapper.update_flags(page, flags) } {
                 Ok(flush) => {
                     flush.flush();
@@ -531,6 +536,47 @@ impl X86UserAddressSpace {
         Ok(leaves)
     }
 
+    /// Show the physical bytes from `phys` at `virt` with `pt_flags`, in
+    /// place of the pool frames that are there.
+    ///
+    /// The reservation lock is held from the check that `virt` is
+    /// committed (this backend never swaps) and unsubstituted, across
+    /// every leaf rewrite and the shootdown, to the bookkeeping that
+    /// marks it. Each leaf goes from one present entry to another in a
+    /// single store, so a processor racing the call reads the old page or
+    /// the new one, and the old frames are freed only after the shootdown
+    /// has been acknowledged. The old and new leaves name different
+    /// physical frames, so no frame is ever mapped with two memory types
+    /// at once.
+    fn substitute_leaves(
+        &self,
+        virt: VirtRange,
+        phys: usize,
+        pt_flags: PageTableFlags,
+    ) -> Result<(), AddressSpaceError> {
+        let mut state = self.state.lock();
+        state.check_substitutable(virt)?;
+        let leaves = self.present_leaves(virt)?;
+        let mut replaced = Vec::with_capacity(leaves.len());
+        for (index, leaf) in leaves.into_iter().enumerate() {
+            // SAFETY: `present_leaves` walked live tables for this
+            // range, and the reservation lock is held.
+            let entry = unsafe { &mut *leaf };
+            replaced.push(entry.addr().as_u64() as usize);
+            entry.set_addr(PhysAddr::new((phys + index * PAGE) as u64), pt_flags);
+        }
+        smp::flush_tlb_range_local(virt.start.raw(), virt.byte_len);
+        smp::shootdown_tlb_range(virt.start.raw(), virt.byte_len);
+        for old in replaced {
+            self.dealloc_user_phys(old);
+        }
+        // This backend never swaps, so every page was committed and no
+        // swap extent is orphaned.
+        let orphaned = state.record_substitute(virt)?;
+        debug_assert!(orphaned.is_empty());
+        Ok(())
+    }
+
     /// Drop the leaves of a substituted range, freeing no frame, and
     /// shoot the range down on every processor before returning.
     ///
@@ -728,13 +774,8 @@ impl AddressSpace for X86UserAddressSpace {
         Ok(())
     }
 
-    /// The reservation lock is held from the check that `virt` is
-    /// committed (this backend never swaps) and unsubstituted, across
-    /// every leaf rewrite and the
-    /// shootdown, to the bookkeeping that marks it. Each leaf goes from
-    /// one present entry to another in a single store, so a processor
-    /// racing the call reads the old page or the new one, and the old
-    /// frames are freed only after the shootdown has been acknowledged.
+    /// The leaves carry ordinary write-back attributes. The reservation
+    /// lock is held across the rewrite: see [`Self::substitute_leaves`].
     fn substitute_memory(
         &self,
         virt: VirtRange,
@@ -752,38 +793,30 @@ impl AddressSpace for X86UserAddressSpace {
         // buffer, and a second holder that reached them uncached would
         // see a picture the first holder's stores had not reached yet.
         let pt_flags = page_flags_to_pt(flags)?;
-        let phys = physical.start as usize;
-        let mut state = self.state.lock();
-        state.check_substitutable(virt)?;
-        let leaves = self.present_leaves(virt)?;
-        let mut replaced = Vec::with_capacity(leaves.len());
-        for (index, leaf) in leaves.into_iter().enumerate() {
-            // SAFETY: `present_leaves` walked live tables for this
-            // range, and the reservation lock is held.
-            let entry = unsafe { &mut *leaf };
-            replaced.push(entry.addr().as_u64() as usize);
-            entry.set_addr(PhysAddr::new((phys + index * PAGE) as u64), pt_flags);
-        }
-        smp::flush_tlb_range_local(virt.start.raw(), virt.byte_len);
-        smp::shootdown_tlb_range(virt.start.raw(), virt.byte_len);
-        for old in replaced {
-            self.dealloc_user_phys(old);
-        }
-        // This backend never swaps, so every page was committed and no
-        // swap extent is orphaned.
-        let orphaned = state.record_substitute(virt)?;
-        debug_assert!(orphaned.is_empty());
-        Ok(())
+        self.substitute_leaves(virt, physical.start as usize, pt_flags)
     }
 
-    /// This backend publishes no device grants, so there is nothing to
-    /// substitute a device region with (#504).
+    /// The region's own attributes, from
+    /// [`memory_type::device_leaf_flags`]: uncacheable for a register
+    /// file, write-back for memory, read-only when the region is not
+    /// writable, never executable. The
+    /// reservation lock is held across the rewrite: see
+    /// [`Self::substitute_leaves`].
     fn substitute_device(
         &self,
-        _virt: VirtRange,
-        _region: helios_hal::device::DeviceRegion,
+        virt: VirtRange,
+        region: DeviceRegion,
     ) -> Result<(), AddressSpaceError> {
-        Err(AddressSpaceError::DeviceMappingUnsupported)
+        self.assert_smp_safe();
+        validate_range(virt)?;
+        if !region.is_frame_aligned() || region.physical.bytes as usize != virt.byte_len {
+            return Err(AddressSpaceError::Misaligned);
+        }
+        self.substitute_leaves(
+            virt,
+            region.physical.start as usize,
+            memory_type::device_leaf_flags(region.attributes),
+        )
     }
 
     /// The reservation lock is held from the check that `virt` is

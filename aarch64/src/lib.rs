@@ -172,6 +172,7 @@ mod device;
 mod entropy;
 mod gic;
 mod gpu;
+mod hand_over;
 mod host_fs;
 mod input;
 mod net;
@@ -297,6 +298,12 @@ struct ProcessorRuntime {
     /// interrupt sentinel into it.
     guest_stack_limit: AtomicUsize,
     exception_stack: ExceptionStack,
+    /// The stack a synchronous exception the kernel did not resolve is
+    /// handed to the runtime from (`hand_over`). It is not the exception
+    /// stack because the hand-over gives that back before the runtime's
+    /// handler runs, so the next exception can build its frame at the
+    /// top.
+    hand_over_stack: ExceptionStack,
     wasmtime_tls: WasmtimeTlsSlots,
     /// This processor's kernel timer, published once its own
     /// `helios_kernel::init` has run so the timer PPI can advance it.
@@ -307,6 +314,8 @@ struct ProcessorRuntime {
     /// Device interrupt routes, installed on the bootstrap processor
     /// only: every device SPI is routed to it.
     device_interrupts: Once<DeviceInterruptRoutes>,
+    /// The record of this processor's trap hand-over self-check.
+    hand_over_probe: hand_over::HandOverProbe,
 }
 
 impl ProcessorRuntime {
@@ -319,10 +328,12 @@ impl ProcessorRuntime {
             wake_pending: AtomicBool::new(false),
             guest_stack_limit: AtomicUsize::new(usize::MAX),
             exception_stack: ExceptionStack::new(),
+            hand_over_stack: ExceptionStack::new(),
             wasmtime_tls: WasmtimeTlsSlots::new(),
             timer: Once::new(),
             program_service: Once::new(),
             device_interrupts: Once::new(),
+            hand_over_probe: hand_over::HandOverProbe::new(),
         }
     }
 }
@@ -338,6 +349,12 @@ struct ExceptionStack([u8; EXCEPTION_STACK_BYTES]);
 impl ExceptionStack {
     const fn new() -> Self {
         Self([0; EXCEPTION_STACK_BYTES])
+    }
+
+    /// The stack's bytes; its top is `end`, 16-byte aligned.
+    fn range(&self) -> core::ops::Range<usize> {
+        let base = core::ptr::from_ref(self) as usize;
+        base..base + EXCEPTION_STACK_BYTES
     }
 }
 
@@ -864,6 +881,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
     // and device routes are published, and every device SPI is routed
     // here, so an arriving interrupt now finds a handler.
     unsafe { unmask_irq() };
+    hand_over::verify_trap_hand_over(platform_state.bootstrap_mpidr());
 
     for processor in helios_kernel::component_host_processors_to_start(
         cpu.processor_count(),
@@ -1073,9 +1091,7 @@ impl ProcessorRuntime {
 
 fn activate_processor_runtime(runtime: &'static ProcessorRuntime) {
     let ptr = runtime as *const _ as usize;
-    let exception_stack_top = (&raw const runtime.exception_stack as usize)
-        .checked_add(EXCEPTION_STACK_BYTES)
-        .unwrap_or_else(|| panic!("AArch64 exception stack top overflow"));
+    let exception_stack_top = runtime.exception_stack.range().end;
     unsafe {
         asm!("msr tpidr_el1, {ptr}", ptr = in(reg) ptr, options(nomem, nostack, preserves_flags));
         // The kernel never leaves EL1 and always runs on SP_EL1, so
@@ -1229,6 +1245,7 @@ unsafe extern "C" fn aarch64_secondary_main(mp_info: &MpInfo) -> ! {
     // timer is published; device interrupts are routed to the
     // bootstrap processor, so only private interrupts arrive here.
     unsafe { unmask_irq() };
+    hand_over::verify_trap_hand_over(mp_info.mpidr);
     helios_kernel::run_component_host_processor_forever(
         cpu,
         kernel,
@@ -1293,6 +1310,17 @@ extern "C" fn aarch64_handle_sync_exception(
         0b001110 => (KernelExceptionCause::IllegalInstruction, None),
         _ => (KernelExceptionCause::IllegalInstruction, None),
     };
+    // The trap hand-over self-check's second trap is resolved in place.
+    // SAFETY: the entry wrote a complete frame at `frame`, and nothing
+    // else touches it while this handler runs.
+    if cause == KernelExceptionCause::Breakpoint
+        && let Some(runtime) = installed_processor_runtime()
+        && runtime
+            .hand_over_probe
+            .resolve_returning_trap(unsafe { &mut *frame })
+    {
+        return;
+    }
 
     let mut stack_fault = helios_kernel::StackFault::Elsewhere;
     if faulting_address.is_some() {
@@ -1327,22 +1355,27 @@ extern "C" fn aarch64_handle_sync_exception(
         }
     }
 
-    // SAFETY: the entry wrote a complete frame at this address.
-    let (elr_el1, frame_pointer) = unsafe { ((*frame).elr as usize, (*frame).x[29] as usize) };
-    // A claimed trap unwinds out of this stack and never comes back, so
-    // reaching the panic below is the runtime declining the exception.
-    // SAFETY: the frame is intact; only its saved `spsr` is read.
-    restore_irq_mask_for_unwind(unsafe { (*frame).spsr });
-    let _ = helios_kernel::dispatch_native_trap(KernelException {
+    // SAFETY: the entry wrote a complete frame at this address, and
+    // nothing else touches it while this handler runs.
+    let saved = unsafe { &*frame };
+    let elr_el1 = saved.elr as usize;
+    let exception = KernelException {
         cause,
         instruction_pointer: elr_el1,
-        frame_pointer,
+        frame_pointer: saved.x[29] as usize,
         faulting_address,
-    });
-
+    };
+    // Everything else goes to the runtime from the hand-over stack and
+    // never comes back; only an exception that must not leave the
+    // exception stack is reported here.
+    let refusal = hand_over::hand_over_trap(
+        hand_over::TrapHandOver::new(exception, esr_el1, far_el1, stack_fault, saved),
+        saved.spsr,
+    );
     panic!(
         "unhandled AArch64 synchronous exception ec={exception_class:#x} esr={esr_el1:#x} \
-         elr={elr_el1:#x} far={far_el1:#x}{stack_fault}"
+         elr={elr_el1:#x} far={far_el1:#x}{stack_fault}; not handed to the runtime because \
+         {refusal}"
     )
 }
 
@@ -1412,14 +1445,15 @@ extern "C" fn swap_fault_trampoline(frame: *mut SyncTrapFrame, faulting_address:
 
 /// IRQ entry point for every exception level slot, called from
 /// `entry.S` on the per-processor exception stack with `PSTATE.I` still
-/// set, so the handler never nests.
+/// set, so the handler never nests. `frame` is the frame the entry built.
 ///
 /// The CPU interface signals one interrupt at a time; the loop drains
 /// every pending one before returning so a level-triggered device that
 /// re-asserts while its handler runs is picked up in the same entry.
 #[unsafe(no_mangle)]
-extern "C" fn aarch64_handle_irq() {
+extern "C" fn aarch64_handle_irq(frame: *const IrqTrapFrame) {
     let runtime = current_processor_runtime();
+    runtime.hand_over_probe.record_interrupt(frame as usize);
     while let Some(intid) = gic::acknowledge_interrupt() {
         if intid == gic::WAKE_SGI {
             // The wake carries no payload: returning from `wfi` is the
@@ -1455,26 +1489,6 @@ extern "C" fn aarch64_handle_irq() {
 /// critical section that unmasked them on exit would enable more than
 /// it disabled.
 const SPSR_IRQ_MASK: u64 = 1 << 7;
-
-/// Puts the interrupted context's IRQ mask back before an exception is
-/// handed to the runtime's trap handler.
-///
-/// The handler never returns for a trap it claims: it unwinds out of
-/// this handler onto the interrupted stack, so the `eret` that would
-/// have restored `PSTATE` from the saved `SPSR_EL1` never runs and the
-/// mask the exception entry set would stay set. Everything the unwind
-/// lands in — the store's teardown, its fiber stack's release, the TLB
-/// shootdown that release broadcasts — is the interrupted code's
-/// continuation and runs on that code's terms, so its mask is restored
-/// here, before the hand-over. The panic path for a trap the runtime
-/// declines runs with it restored too.
-fn restore_irq_mask_for_unwind(spsr: u64) {
-    if spsr & SPSR_IRQ_MASK == 0 {
-        // SAFETY: the interrupted context ran with IRQs unmasked, and
-        // what runs from here is that context's continuation.
-        unsafe { unmask_irq() };
-    }
-}
 
 fn mask_irq() {
     unsafe {
@@ -1543,12 +1557,17 @@ fn read_processor_runtime() -> usize {
 }
 
 fn current_processor_runtime() -> &'static ProcessorRuntime {
+    installed_processor_runtime()
+        .unwrap_or_else(|| panic!("AArch64 processor runtime was not installed before use"))
+}
+
+/// This processor's runtime, or `None` before `activate_processor_runtime`
+/// has published it in `tpidr_el1`.
+fn installed_processor_runtime() -> Option<&'static ProcessorRuntime> {
     let ptr = read_processor_runtime() as *const ProcessorRuntime;
-    assert!(
-        !ptr.is_null(),
-        "AArch64 processor runtime was not installed before use"
-    );
-    unsafe { &*ptr }
+    // SAFETY: only `activate_processor_runtime` writes `tpidr_el1`, from a
+    // `&'static ProcessorRuntime`.
+    unsafe { ptr.as_ref() }
 }
 
 fn detect_aarch64_native_feature(feature: &str) -> Option<bool> {

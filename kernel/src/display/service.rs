@@ -255,8 +255,9 @@ pub(super) struct DisplayShared {
     pub(super) cursor: ProviderSender<CursorRequest>,
     /// One of [`ClaimState`]'s three values.
     pub(super) claim: AtomicU8,
-    /// Bumped by every successful claim, so a request that outlived its
-    /// claim can be told from one that did not.
+    /// Bumped by every successful claim and by every claim's drop, so a
+    /// request that outlived its claim can be told from one that did
+    /// not.
     pub(super) generation: AtomicU64,
     /// One permit per claim that has been let go.
     pub(super) release: Notify,
@@ -416,6 +417,13 @@ impl Drop for DisplayClaim {
         // instance this claim belonged to may already be dead. One
         // permit is enough, because there is exactly one claim to
         // release and the owner clears the word once it has.
+        //
+        // The generation moves here, not only on the next claim: a
+        // request queued under this one and still sitting in an inbox
+        // must fail the generation check however long the display then
+        // sits unclaimed, or the device would be given a frame for a
+        // claim that is already gone.
+        self.shared.generation.fetch_add(1, Ordering::AcqRel);
         self.shared
             .claim
             .store(ClaimState::RELEASING, Ordering::Release);
