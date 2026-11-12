@@ -39,9 +39,27 @@ pub(crate) const EXCEPTION_STACK_BYTES: usize = 64 * 1024;
 /// page-fault probe has been resolved, distinct from every page address.
 const PROBE_RESOLVED: usize = usize::MAX;
 pub(crate) const TIMER_INTERRUPT_VECTOR: u8 = 0x20;
-pub(crate) const WAKE_INTERRUPT_VECTOR: u8 = 0x21;
-pub(crate) const TLB_SHOOTDOWN_INTERRUPT_VECTOR: u8 = 0x22;
+/// The wake IPI and the TLB-shootdown IPI sit in priority class 14
+/// (vector bits 7:4), above every device vector, the timer and the APIC
+/// error vector, which all sit below class 4. The local APIC delivers a
+/// vector only when its class is above the task-priority register's, so
+/// a processor can hold off everything but these two by raising the
+/// register to [`WAKE_ONLY_TASK_PRIORITY`] (`Cpu::park_wake_only`). The
+/// stubs in `exceptions.S` push these numbers literally; they have to
+/// change together.
+pub(crate) const WAKE_INTERRUPT_VECTOR: u8 = 0xe1;
+pub(crate) const TLB_SHOOTDOWN_INTERRUPT_VECTOR: u8 = 0xe2;
+/// The `CR8` value that passes only priority class 14 and above: `CR8`
+/// holds the task-priority class in bits 3:0, and a vector is delivered
+/// when its class is greater than it.
+pub(crate) const WAKE_ONLY_TASK_PRIORITY: u64 = 0xd;
 pub(crate) const APIC_ERROR_INTERRUPT_VECTOR: u8 = 0x23;
+const _: () = {
+    assert!(WAKE_INTERRUPT_VECTOR >> 4 > WAKE_ONLY_TASK_PRIORITY as u8);
+    assert!(TLB_SHOOTDOWN_INTERRUPT_VECTOR >> 4 > WAKE_ONLY_TASK_PRIORITY as u8);
+    assert!(TIMER_INTERRUPT_VECTOR >> 4 <= WAKE_ONLY_TASK_PRIORITY as u8);
+    assert!(APIC_ERROR_INTERRUPT_VECTOR >> 4 <= WAKE_ONLY_TASK_PRIORITY as u8);
+};
 /// MSI-X vectors for the PCI devices the kernel drives. One vector per
 /// device keeps dispatch a direct lookup in [`DeviceInterruptRoutes`]
 /// without a shared interrupt-status scan.
