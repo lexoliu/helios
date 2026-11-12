@@ -23,6 +23,7 @@ use helios_hal::vmm::{AddressSpaceError, PageFlags};
 
 use super::*;
 use crate::test_support::TestCpu;
+use crate::{InstanceActivity, ProcessorTurn, RegisteredInstance, StoreTurns};
 
 const PAGE: usize = PhysFrame::SIZE;
 
@@ -39,6 +40,10 @@ struct FakeSpace {
     /// as it was, the way the real address spaces do.
     reinstatements_to_refuse: u32,
     orphans: Vec<SwapToken>,
+    /// The instance every page belongs to, and the registry that knows
+    /// whether it is on a processor: a detach checks it at the moment it
+    /// happens.
+    owner: Option<(InstanceRegistry, InstanceId)>,
 }
 
 std::thread_local! {
@@ -57,6 +62,13 @@ fn set_clock(nanos: u64) {
 static TEST_HOOKS: SwapVmHooks = SwapVmHooks {
     swap_out_page: |addr, token, out| {
         with_space(|space| {
+            if let Some((registry, id)) = &space.owner {
+                assert!(
+                    registry.idle_instances(u64::MAX, 0).contains(id),
+                    "page {:#x} detached while its instance is on a processor",
+                    addr.raw()
+                );
+            }
             let page = space
                 .pages
                 .get_mut(&addr.raw())
@@ -92,7 +104,31 @@ static TEST_HOOKS: SwapVmHooks = SwapVmHooks {
             _ => None,
         })
     },
-    scan_committed_pages: |_, _, _| 0,
+    // Every resident page belongs to the one instance, and every one is
+    // cold: the pass takes whatever its plan has room for.
+    scan_committed_pages: |_, context, visit| {
+        let resident: Vec<VirtAddr> = with_space(|space| {
+            space
+                .pages
+                .iter()
+                .filter(|(_, page)| matches!(page, FakePage::Present(_)))
+                .map(|(addr, _)| VirtAddr::new(*addr))
+                .collect()
+        });
+        let mut visited = 0;
+        for addr in resident {
+            visited += 1;
+            if !visit(
+                context,
+                addr,
+                PageFlags::READ | PageFlags::WRITE,
+                PageAge::Cold,
+            ) {
+                break;
+            }
+        }
+        visited
+    },
     owned_resident_bytes: |_| 0,
     drain_orphaned_swap_tokens: |context, visit| {
         let orphans = with_space(|space| core::mem::take(&mut space.orphans));
@@ -117,6 +153,12 @@ struct FlakyState {
     writes_to_refuse: u32,
     /// Every token passed to `release`, in call order.
     released: Vec<u64>,
+    /// A store whose turn begins once this many more writes have landed:
+    /// another processor putting the instance on while the pass awaits
+    /// the device.
+    turn_after_writes: Option<(u32, &'static StoreTurns)>,
+    /// The turn that began, until the test ends it.
+    open_turn: Option<ProcessorTurn<'static>>,
 }
 
 /// A backend whose reads and writes fail on demand. A failed read leaves
@@ -134,6 +176,21 @@ impl FlakyBackend {
 
     fn refuse_writes(&self, count: u32) {
         self.state.lock().unwrap().writes_to_refuse = count;
+    }
+
+    fn begin_turn_after_writes(&self, writes: u32, turns: &'static StoreTurns) {
+        self.state.lock().unwrap().turn_after_writes = Some((writes, turns));
+    }
+
+    fn end_turn(&self, now_nanos: u64) {
+        let turn = self
+            .state
+            .lock()
+            .unwrap()
+            .open_turn
+            .take()
+            .expect("a turn began during the pass");
+        let _ = turn.end(now_nanos);
     }
 
     fn released(&self) -> Vec<u64> {
@@ -164,6 +221,14 @@ impl SwapBackend for FlakyBackend {
         state.next_token += 1;
         let token = state.next_token;
         state.extents.insert(token, bytes.to_vec());
+        if let Some((writes, turns)) = state.turn_after_writes.as_mut() {
+            *writes -= 1;
+            if *writes == 0 {
+                let turns = *turns;
+                state.turn_after_writes = None;
+                state.open_turn = Some(turns.begin(1));
+            }
+        }
         Ok(token)
     }
 
@@ -192,6 +257,9 @@ struct Harness {
     service: SwapService<FlakyBackend, TestCpu>,
     handle: SwapHandle,
     backend: FlakyBackend,
+    /// The instance every resident page belongs to. It has no store, so
+    /// it is off every processor until a test gives it one.
+    instance: RegisteredInstance,
 }
 
 fn block_on<F: Future>(future: F) -> F::Output {
@@ -211,11 +279,14 @@ impl Harness {
                 now_ticks: TEST_HOOKS.now_ticks,
             },
         );
+        let registry = InstanceRegistry::new();
+        let instance = registry.register("evicted", 0);
+        with_space(|space| space.owner = Some((registry.clone(), instance.id())));
         let service = SwapService {
             backend: backend.clone(),
             handle: handle.clone(),
             hooks: &TEST_HOOKS,
-            registry: InstanceRegistry::new(),
+            registry,
             cpu: TestCpu::with_entropy(0),
             map: SwapMap::new(),
             page: vec![0_u8; PAGE].into_boxed_slice(),
@@ -225,7 +296,17 @@ impl Harness {
             service,
             handle,
             backend,
+            instance,
         }
+    }
+
+    fn evict_instance(&mut self, budget: usize) -> usize {
+        let id = self.instance.id();
+        block_on(self.service.evict_owner(id, budget, EvictionAge::Any))
+    }
+
+    fn is_resident(&self, addr: VirtAddr) -> bool {
+        with_space(|space| matches!(space.pages[&addr.raw()], FakePage::Present(_)))
     }
 
     /// A resident page at page number `number`, filled with a pattern
@@ -241,7 +322,8 @@ impl Harness {
     }
 
     fn evict(&mut self, addr: VirtAddr) -> Result<(), ()> {
-        block_on(self.service.swap_out(addr))
+        let id = self.instance.id();
+        block_on(self.service.swap_out(id, addr))
     }
 
     /// The index the page-table entry carries, if the page is swapped.
@@ -486,6 +568,43 @@ fn two_faults_on_one_page_both_succeed() {
     );
     assert_eq!(harness.contents(addr), pattern(0xb0));
     assert_eq!(harness.handle.stats().pages_in, 1);
+}
+
+/// An instance that begins a turn while the pass is waiting on the
+/// device keeps every page the pass had planned to take: nothing leaves
+/// memory while it runs, and the pass takes the rest once it is off
+/// again.
+#[test]
+fn an_instance_that_starts_running_mid_pass_keeps_its_pages() {
+    let mut harness = Harness::new();
+    let pages: Vec<VirtAddr> = (1..=4)
+        .map(|number| harness.resident(number, number as u8))
+        .collect();
+    let activity = InstanceActivity::new(harness.instance.clone(), 0);
+    let turns: &'static StoreTurns = Box::leak(Box::new(activity.turns()));
+    harness.backend.begin_turn_after_writes(1, turns);
+
+    assert_eq!(
+        harness.evict_instance(pages.len() * PAGE),
+        PAGE,
+        "the page whose write was in flight is out, and nothing after it"
+    );
+    assert!(!harness.is_resident(pages[0]));
+    for &addr in &pages[1..] {
+        assert!(
+            harness.is_resident(addr),
+            "page {:#x} left memory while its instance ran",
+            addr.raw()
+        );
+    }
+
+    harness.backend.end_turn(2);
+    assert_eq!(harness.evict_instance(pages.len() * PAGE), 3 * PAGE);
+    for (number, &addr) in pages.iter().enumerate() {
+        harness.fault(addr).expect("fault the page back");
+        assert_eq!(harness.contents(addr), pattern(number as u8 + 1));
+    }
+    drop(activity);
 }
 
 #[test]
