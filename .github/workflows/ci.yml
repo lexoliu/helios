@@ -8,7 +8,10 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # A pull request's newer push supersedes its older run. A `dev` push
+  # runs to completion: merges land faster than a run finishes, and a
+  # completed `dev` run is the only writer of the host lanes' caches.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -23,6 +26,15 @@ jobs:
   # by path. A skipped lane reports as skipped, which a required check
   # counts as passing; no ruleset on `dev` requires a lane of this
   # workflow. A dispatch and a push to `dev` run every lane.
+  #
+  # It also says whether the change touches what fixes the kernel
+  # profile's format (the profdata header check, the guest's raw writer)
+  # or the compiler that reads it. The profile every x86-64 lane spends is
+  # the newest one collected on dev, by the compiler dev pinned then; a
+  # pull request that moves any of these cannot read it, and dev cannot
+  # collect another until the pull request merges (#731). Only a pull
+  # request is asked: a push to dev is what `kernel-profile.yml` collects
+  # on, and a dispatch has no change to speak of.
   changes:
     name: changes
     runs-on: ubuntu-24.04
@@ -36,6 +48,9 @@ jobs:
       # JSON array of {name, command, rust-cache} for the legs of the
       # `checks` matrix.
       checks: ${{ steps.select.outputs.checks }}
+      # `true` when the change moves the kernel profile's format or the
+      # compiler that reads it; `kernel-profile` then collects this run's.
+      profile_format: ${{ steps.filter.outputs.profile_format || 'false' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -91,6 +106,10 @@ jobs:
               - 'api/**'
               - 'api-macro/**'
               - 'compiler-plugin/**'
+            profile_format:
+              - 'rust-toolchain.toml'
+              - 'profdata/**'
+              - 'kernel/src/profiling/**'
       - id: select
         env:
           CHANGED: ${{ steps.filter.outputs.changes || 'null' }}
@@ -110,6 +129,17 @@ jobs:
           echo "lanes=${lanes}" >> "$GITHUB_OUTPUT"
           echo "checks=${checks}" >> "$GITHUB_OUTPUT"
           echo "${lanes}"
+
+  # The collection a `profile_format` change spends in place of dev's
+  # profile: the same workflow `bench-suite.yml` calls, on this run's
+  # commit, uploaded under the stable artifact name.
+  kernel-profile:
+    name: kernel-profile
+    needs: changes
+    if: needs.changes.outputs.profile_format == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/kernel-profile.yml
 
   checks:
     name: ${{ matrix.name }}
@@ -173,6 +203,13 @@ jobs:
         working-directory: helios
         run: ${{ matrix.command }}
 
+  # Every smoke step that boots a guest carries a bound of its own, so a
+  # guest that hangs fails that step and the lane uploads its runtime
+  # directories; the job's limit would cancel it hours later with nothing
+  # kept (#795). A bound is several times the longest its step took over
+  # 40 green runs: 30 minutes where the step also builds the kernel image
+  # or compiles in the guest (614 s at most), 5 minutes for every other
+  # boot (64 s at most).
   smoke-riscv64:
     name: smoke-riscv64
     needs: changes
@@ -215,6 +252,7 @@ jobs:
         working-directory: helios
         run: cargo build --release -p helios-inspector
       - name: Boot riscv64 guest
+        timeout-minutes: 30
         shell: bash
         working-directory: helios
         env:
@@ -235,6 +273,7 @@ jobs:
           cat boot-smoke.out
           grep -Fqx ok boot-smoke.out
       - name: Seed the wall clock from the goldfish RTC
+        timeout-minutes: 5
         shell: bash
         working-directory: helios
         env:
@@ -261,6 +300,7 @@ jobs:
           echo "guest ${guest_epoch}, host ${host_epoch}, skew ${skew}s"
           test "${skew}" -le 60
       - name: Run the coreutils applets through dash
+        timeout-minutes: 5
         shell: bash
         working-directory: helios
         env:
@@ -287,6 +327,7 @@ jobs:
           grep -Fqx coreutils:ok coreutils-smoke.out
           grep -Fqx bin coreutils-smoke.out
       - name: Run CPython
+        timeout-minutes: 5
         shell: bash
         working-directory: helios
         env:
@@ -309,6 +350,7 @@ jobs:
           cat cpython-smoke.out
           grep -Fqx '{"ok":"a"}' cpython-smoke.out
       - name: Trap an out-of-bounds guest load
+        timeout-minutes: 5
         shell: bash
         working-directory: helios
         env:
@@ -342,6 +384,7 @@ jobs:
           ! grep -Fq 'Kernel panic' oob-load-smoke.out
       - uses: ./helios/.github/actions/vhost-vsock
       - name: Boot riscv64 guest with the inspector RPC on vsock
+        timeout-minutes: 5
         shell: bash
         working-directory: helios
         env:
@@ -355,6 +398,7 @@ jobs:
           cat vsock-smoke.out
           grep -Fqx ok vsock-smoke.out
       - name: Fetch over virtio-net with curl
+        timeout-minutes: 5
         shell: bash
         working-directory: helios
         env:
@@ -540,6 +584,7 @@ jobs:
       # same smoke runs twice and each mode asserts which one the kernel
       # actually used.
       - name: Boot aarch64 guest from the device tree
+        timeout-minutes: 30
         shell: bash
         working-directory: helios
         env:
@@ -573,6 +618,7 @@ jobs:
       # FEAT_RNG and the bring-up read of the virtio-rng device rather
       # than from the firmware.
       - name: Boot aarch64 guest from ACPI
+        timeout-minutes: 5
         shell: bash
         working-directory: helios
         env:
@@ -626,7 +672,9 @@ jobs:
       # `--no-build` path reads them, and the manifest records this
       # runner's absolute paths. The root key pair is generated per
       # build, so the signing key the kernel carries belongs to this
-      # image alone.
+      # image alone. The compiler plugin's core module rides along: the
+      # bench's Linux + Wasmtime column runs the build the bootfs
+      # precompiled (tools/bench/native/build.sh, compiler-host/).
       - name: Upload the guest image
         if: always() && steps.guest-image.outcome == 'success'
         uses: actions/upload-artifact@v4
@@ -635,13 +683,14 @@ jobs:
           path: |
             helios/target/aarch64-unknown-none/kernel-release/helios
             helios/target/kernel-prebuild/aarch64-unknown-none/kernel-release/helios-bootfs
+            helios/target/kernel-prebuild/aarch64-unknown-none/kernel-release/compiler_plugin.wasm
           if-no-files-found: error
           retention-days: 90
 
   smoke-x86-64:
     name: smoke-x86-64
-    needs: changes
-    if: contains(fromJSON(needs.changes.outputs.lanes), 'smoke-x86-64')
+    needs: [changes, kernel-profile]
+    if: ${{ !cancelled() && needs.changes.result == 'success' && contains(fromJSON(needs.changes.outputs.lanes), 'smoke-x86-64') && (needs.kernel-profile.result == 'success' || needs.kernel-profile.result == 'skipped') }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -716,11 +765,24 @@ jobs:
       # label, so the fetch comes before the build. Reading the artifact
       # is what the job's `actions: read` is for.
       - name: Fetch the kernel profile
+        if: needs.changes.outputs.profile_format != 'true'
         working-directory: helios
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: cargo run --release -p helios-cli -- profile-fetch
+      # A change to what fixes the profile's format or to the compiler
+      # that reads it leaves the default branch's profile unreadable to
+      # this tree, and nothing on that branch can replace it before the
+      # change merges (#731). The run collects its own, and the lane
+      # spends that one: the same fetch, naming the run.
+      - name: Fetch this run's kernel profile
+        if: needs.changes.outputs.profile_format == 'true'
+        working-directory: helios
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: cargo run --release -p helios-cli -- profile-fetch --run "${{ github.run_id }}"
       - name: Boot x86-64 guest
+        timeout-minutes: 30
         shell: bash
         working-directory: helios
         run: |
@@ -763,6 +825,7 @@ jobs:
           grep -aF 'mount source online serial="src-b"' "$runtime/debug-serial.log" | grep -aF 'read_only=true'
           grep -aF 'block device identified as the kernel scratch disk serial="helios-data"' "$runtime/debug-serial.log"
       - name: Run the coreutils applets through dash
+        timeout-minutes: 5
         shell: bash
         working-directory: helios
         run: |
@@ -784,6 +847,7 @@ jobs:
           grep -Fqx coreutils:ok coreutils-smoke.out
           grep -Fqx bin coreutils-smoke.out
       - name: Run CPython twice and record its launch phases
+        timeout-minutes: 5
         shell: bash
         working-directory: helios
         run: |
@@ -829,6 +893,7 @@ jobs:
           test "$(echo "$warm" | grep -ac 'deserialize_ns')" -eq 0
           echo "$warm" | grep -aq 'cache_hit=true'
       - name: Compile a guest with the in-kernel compiler plugin
+        timeout-minutes: 30
         shell: bash
         working-directory: helios
         run: |
@@ -847,6 +912,7 @@ jobs:
           cat compiler-smoke.out
           grep -Fqx compiler:ok compiler-smoke.out
       - name: Trap an out-of-bounds guest load
+        timeout-minutes: 5
         shell: bash
         working-directory: helios
         run: |
@@ -877,6 +943,7 @@ jobs:
           grep -Fqx guest-alive oob-load-smoke.out
           ! grep -Fq 'Kernel panic' oob-load-smoke.out
       - name: Refuse a guest-written cwasm whose signature does not verify
+        timeout-minutes: 5
         shell: bash
         working-directory: helios
         run: |
@@ -1097,6 +1164,7 @@ jobs:
           [[ "$thread_status" == "$main_status" ]]
           ! grep -Fq 'Kernel panic' "$runtime/guest.log"
       - name: Fetch over virtio-net with curl
+        timeout-minutes: 5
         shell: bash
         working-directory: helios
         run: |
@@ -1122,6 +1190,7 @@ jobs:
           cat curl-smoke.out
           grep -Fqx success curl-smoke.out
       - name: Draw on the display and capture the scanout
+        timeout-minutes: 5
         shell: bash
         working-directory: helios
         run: |
@@ -1197,6 +1266,7 @@ jobs:
           python3 tools/desktop/check-cursor.py \
             "$runtime/inspector.log" "$runtime/qemu-trace.log"
       - name: Read the desktop's input devices from the guest
+        timeout-minutes: 5
         shell: bash
         working-directory: helios
         run: |
@@ -1252,6 +1322,7 @@ jobs:
           # injects a handful of events into a queue 64 deep.
           ! grep -Fq 'input report was dropped' "$runtime/inspector.log"
       - name: Boot the desktop with the compositor and type at its terminal
+        timeout-minutes: 5
         shell: bash
         working-directory: helios
         run: |
@@ -1330,6 +1401,7 @@ jobs:
           python3 tools/desktop/check-cursor.py \
             "$runtime/inspector.log" "$runtime/qemu-trace.log"
       - name: Kill the compositor and watch the supervisor bring it back
+        timeout-minutes: 5
         shell: bash
         working-directory: helios
         run: |
@@ -1394,6 +1466,7 @@ jobs:
             --capture "$captures/restart-after.png" --origin "$origin" \
             --expect '0,0=helios$ '
       - name: Play a tone through the desktop's sound device
+        timeout-minutes: 5
         shell: bash
         working-directory: helios
         run: |
@@ -1510,7 +1583,9 @@ jobs:
       # `--no-build` path reads them, and the manifest records this
       # runner's absolute paths. The root key pair is generated per
       # build, so the signing key the kernel carries belongs to this
-      # image alone.
+      # image alone. The compiler plugin's core module rides along: the
+      # bench's Linux + Wasmtime column runs the build the bootfs
+      # precompiled (tools/bench/native/build.sh, compiler-host/).
       - name: Upload the guest image
         if: always() && steps.guest-image.outcome == 'success'
         uses: actions/upload-artifact@v4
@@ -1519,5 +1594,6 @@ jobs:
           path: |
             helios/target/x86_64-unknown-none/profile-use/helios
             helios/target/kernel-prebuild/x86_64-unknown-none/profile-use/helios-bootfs
+            helios/target/kernel-prebuild/x86_64-unknown-none/profile-use/compiler_plugin.wasm
           if-no-files-found: error
           retention-days: 90

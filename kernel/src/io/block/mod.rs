@@ -48,7 +48,9 @@ pub use cache::{
     CacheLayoutError, CachedDisk, CachedDiskStats,
 };
 pub use pages::BlockPages;
-pub use scratch::{BlockSelfCheckError, BlockStats, ScratchDisk, ScratchDiskStats};
+pub use scratch::{
+    BlockSelfCheckError, BlockStats, ScratchDisk, ScratchDiskStats, install_scratch_swap,
+};
 
 use crate::memory::{CompressedPool, RootEntropyHandle};
 use crate::{Kernel, MAX_BLOCK_DEVICES, PressureLevel, Timer};

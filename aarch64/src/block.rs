@@ -15,7 +15,7 @@ use alloc::vec::Vec;
 
 use crate::platform::PlatformDescription;
 use arm_gic::{IntId, Trigger};
-use helios_hal::fs::{BlockDevice, BlockDeviceRights};
+use helios_hal::fs::BlockDeviceRights;
 use helios_kernel::ExternalInterruptHandler;
 
 use crate::Aarch64Cpu;
@@ -83,56 +83,23 @@ where
         devices,
         move |service, scratch, _mount_sources| {
             state.install_block_service(service);
-            install_swap(&state, scratch, spawner, timer, swap_cpu);
+            if let Some(swap) = helios_kernel::install_scratch_swap(
+                state.instance_registry(),
+                scratch,
+                spawner,
+                timer,
+                swap_cpu,
+                "virtio-blk",
+                helios_virtio::VirtioBlockSwapBackend::new,
+            ) {
+                state.install_swap(swap);
+            }
         },
     );
     for interrupt in &discovered {
         tracing::info!(interrupt = ?interrupt.interrupt, "virtio block online");
     }
     discovered
-}
-
-/// Puts swap on the scratch disk, behind the self-check's blocks.
-///
-/// The self-check owns the last blocks of the device and has already
-/// run by the time this is called; everything before them is swap's.
-/// Swap is not persistence — a token is meaningless across a boot — so
-/// the whole extent is handed out fresh every time.
-fn install_swap(
-    state: &RuntimeState,
-    scratch: helios_kernel::ScratchDisk<Aarch64VirtioBlockDevice>,
-    spawner: helios_kernel::Spawner<Aarch64Cpu>,
-    timer: helios_kernel::Timer<Aarch64Cpu>,
-    cpu: Aarch64Cpu,
-) {
-    let block_bytes = scratch.geometry().logical_block_bytes;
-    let swap_blocks = scratch.swap_blocks();
-    if swap_blocks == 0 {
-        helios_kernel::disable_swap(helios_kernel::SwapDisabled::NoSwapDevice);
-        return;
-    }
-    let backend = match helios_virtio::VirtioBlockSwapBackend::new(scratch, 0, swap_blocks) {
-        Ok(backend) => backend,
-        Err(error) => {
-            tracing::warn!(
-                target: "helios_aarch64::swap",
-                %error,
-                "scratch disk cannot back swap"
-            );
-            helios_kernel::disable_swap(helios_kernel::SwapDisabled::NoSwapDevice);
-            return;
-        }
-    };
-    let handle = helios_kernel::install_swap(
-        spawner,
-        timer,
-        cpu,
-        state.instance_registry(),
-        backend,
-        "virtio-blk",
-        (swap_blocks * block_bytes) as u64,
-    );
-    state.install_swap(handle);
 }
 
 fn discover_block_devices(

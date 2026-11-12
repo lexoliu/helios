@@ -337,7 +337,7 @@ impl Terminal {
             let Some(strip) = target.get_mut(start..start + CELL_WIDTH * 4) else {
                 return;
             };
-            for pixel in strip.chunks_exact_mut(4) {
+            for pixel in strip.as_chunks_mut::<4>().0 {
                 colour.write(pixel);
             }
         }
@@ -361,7 +361,7 @@ fn draw_cell(
             return;
         };
         let coverage = raster.get(y).copied().unwrap_or(&[]);
-        for (x, pixel) in strip.chunks_exact_mut(4).enumerate() {
+        for (x, pixel) in strip.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let alpha = coverage.get(x).copied().unwrap_or(0);
             blend(background, foreground, alpha).write(pixel);
         }

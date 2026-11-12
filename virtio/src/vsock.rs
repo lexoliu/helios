@@ -34,10 +34,13 @@ use helios_hal::vsock::{
     VsockShutdown,
 };
 
-use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate};
-use crate::inflight::{InFlight, await_completion, submit_chain};
+use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate, renegotiate};
+use crate::inflight::{
+    InFlight, await_completion, drain_to_idle, reinitialize_requests, submit_chain,
+};
 use crate::notify::Notify;
 use crate::queue::{VirtQueue, negotiated_queue_size};
+use crate::resume::{DeviceReset, QuiesceError, ReinitError, conclude, driver_ok};
 use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
 
 const RX_QUEUE_INDEX: u16 = 0;
@@ -284,6 +287,117 @@ impl<T: VirtioTransport> VirtioVsockDevice<T> {
         self.interrupts.notify_all();
     }
 
+    /// Waits for every packet the device owns on the transmit queue to
+    /// complete, so the device may be reset. See [`crate::resume`] for
+    /// the contract; `expired` says when the caller's deadline has
+    /// passed.
+    ///
+    /// The receive and event queues hold buffers posted for the device to
+    /// fill whenever it has something to say, so they are not waited on.
+    pub fn quiesce(&self, mut expired: impl FnMut() -> bool) -> Result<(), QuiesceError> {
+        drain_to_idle(
+            &self.tx_inflight,
+            &self.tx_queue,
+            &self.transport,
+            TX_QUEUE_INDEX,
+            &mut expired,
+        )
+    }
+
+    /// Brings a reset device back with the features it had, after
+    /// [`Self::quiesce`].
+    ///
+    /// The guest CID the device reports is compared with the one the
+    /// driver brought up, because every connection the image holds was
+    /// made under it. The receive and event rings are stocked again from
+    /// the buffers the driver owns, and what they held is discarded: the
+    /// device that wrote it is gone.
+    ///
+    /// A reset device is a host that has forgotten every connection, so
+    /// the transport-reset announcement is raised exactly as if the
+    /// device had sent `VIRTIO_VSOCK_EVENT_TRANSPORT_RESET`, and the
+    /// connection table drops its connections through the path it
+    /// already has.
+    pub fn reinitialize(&self) -> Result<DeviceReset, ReinitError> {
+        let reset = conclude(&self.transport, self.restore(), |resumed| {
+            self.tx_inflight.resume(resumed);
+        })?;
+        // Set before the wake, so a reader that parked re-tests it.
+        self.transport_reset.store(true, Ordering::Release);
+        self.interrupts.notify_all();
+        Ok(reset)
+    }
+
+    fn restore(&self) -> Result<DeviceReset, ReinitError> {
+        let device = DeviceType::Vsock;
+        renegotiate(&self.transport, self.features)?;
+        let found = read_guest_cid(&self.transport);
+        if found != self.guest_cid {
+            return Err(ReinitError::GuestCidChanged {
+                expected: self.guest_cid,
+                found,
+            });
+        }
+        reinitialize_requests(&self.tx_queue, &self.transport, TX_QUEUE_INDEX)?;
+        let restore = |what| {
+            move |error| ReinitError::Restore {
+                device,
+                what,
+                error,
+            }
+        };
+        {
+            let mut rx = self.rx.try_lock().ok_or(ReinitError::QueueBusy {
+                device,
+                queue: RX_QUEUE_INDEX,
+            })?;
+            let VsockRxState {
+                queue,
+                slots,
+                slot_for_token,
+            } = &mut *rx;
+            queue.reinitialize_discarding(&self.transport)?;
+            queue
+                .restock(
+                    &self.transport,
+                    slots.iter_mut().map(|slot| &mut **slot),
+                    slot_for_token,
+                )
+                .map_err(restore("the receive buffers"))?;
+        }
+        {
+            let mut event = self.event.try_lock().ok_or(ReinitError::QueueBusy {
+                device,
+                queue: EVENT_QUEUE_INDEX,
+            })?;
+            let VsockEventState {
+                queue,
+                buffers,
+                buffer_for_token,
+            } = &mut *event;
+            queue.reinitialize_discarding(&self.transport)?;
+            queue
+                .restock(
+                    &self.transport,
+                    buffers.iter_mut().map(|buffer| &mut **buffer),
+                    buffer_for_token,
+                )
+                .map_err(restore("the event buffers"))?;
+        }
+        driver_ok(&self.transport);
+        self.rx
+            .try_lock()
+            .expect("the receive lock was just released")
+            .queue
+            .notify(&self.transport);
+        self.event
+            .try_lock()
+            .expect("the event lock was just released")
+            .queue
+            .notify(&self.transport);
+        Ok(DeviceReset { device })
+    }
+
     /// Takes the pending transport-reset announcement, if any.
     ///
     /// The device raises it when the host end of the link was replaced,
@@ -486,9 +600,10 @@ pub fn vsock_shutdown_header(
 #[cfg(test)]
 mod tests {
     use super::{
-        DeviceType, HEADER_BYTES, IoError, PACKET_TYPE_STREAM, VSOCK_MAX_PAYLOAD_BYTES,
-        VirtioVsockDevice, decode_header, encode_header,
+        DeviceReset, DeviceType, HEADER_BYTES, IoError, PACKET_TYPE_STREAM, QuiesceError,
+        ReinitError, VSOCK_MAX_PAYLOAD_BYTES, VirtioVsockDevice, decode_header, encode_header,
     };
+    use crate::features::RenegotiateError;
     use crate::testing::{FakeTransport, FakeTransportConfig};
     use crate::transport::VirtioFeatures;
     use alloc::vec;
@@ -723,6 +838,164 @@ mod tests {
         drop(queue);
         device.handle_interrupt();
         assert_eq!(block_on(poll_once(send.as_mut())), Some(Ok(())));
+    }
+
+    /// Plays the device completing transmit chain `token`.
+    fn complete_transmit(device: &VirtioVsockDevice<FakeTransport>, token: u16) {
+        device
+            .tx_queue
+            .try_lock()
+            .expect("a parked sender does not hold the transmit lock")
+            .device_complete(token, 0);
+        device.handle_interrupt();
+    }
+
+    #[test]
+    fn quiesce_waits_for_the_packets_the_device_owns_to_be_sent() {
+        let device = device();
+        let mut send = pin!(device.send(header(VsockOp::Data, 4), b"ping"));
+        assert!(block_on(poll_once(send.as_mut())).is_none());
+
+        device
+            .quiesce(|| {
+                complete_transmit(&device, 0);
+                false
+            })
+            .expect("the device answers inside the deadline");
+
+        assert_eq!(block_on(poll_once(send.as_mut())), Some(Ok(())));
+    }
+
+    #[test]
+    fn quiesce_leaves_the_posted_receive_buffers_alone() {
+        let device = device();
+
+        device
+            .quiesce(|| true)
+            .expect("buffers posted for the device are not requests");
+    }
+
+    #[test]
+    fn quiesce_gives_up_when_the_deadline_passes() {
+        let device = device();
+        let mut send = pin!(device.send(header(VsockOp::Data, 4), b"ping"));
+        assert!(block_on(poll_once(send.as_mut())).is_none());
+
+        assert_eq!(
+            device.quiesce(|| true),
+            Err(QuiesceError::RequestsStillInFlight {
+                device: DeviceType::Vsock,
+                queue: 1,
+                count: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn a_reset_device_gets_its_receive_pool_back_and_the_connections_are_reset() {
+        let device = device();
+        let mut payload = vec![0_u8; VSOCK_MAX_PAYLOAD_BYTES];
+        // A packet the device wrote before the image was taken. It is in
+        // the used ring, unread, and the device that wrote it is gone.
+        let stale = encode_header(&header(VsockOp::Data, 0));
+        deliver(&device, 0, &stale);
+
+        device.transport.reset_behind_the_driver();
+        assert_eq!(
+            device.reinitialize(),
+            Ok(DeviceReset {
+                device: DeviceType::Vsock
+            })
+        );
+
+        {
+            let state = device.rx.try_lock().expect("the driver is idle");
+            assert_eq!(
+                state.queue.available_descriptors(),
+                0,
+                "the whole receive ring is handed to the new device"
+            );
+        }
+        assert_eq!(device.transport.driver_features(), device.features().bits());
+        assert_eq!(
+            block_on(device.receive_into(&mut payload)),
+            Ok(VsockDelivery::TransportReset),
+            "a device that was reset is a host that forgot every connection"
+        );
+        {
+            let mut receive = pin!(device.receive_into(&mut payload));
+            assert!(
+                block_on(poll_once(receive.as_mut())).is_none(),
+                "the stale packet was discarded with the old ring"
+            );
+        }
+
+        deliver(
+            &device,
+            0,
+            &encode_header(&header(VsockOp::CreditUpdate, 0)),
+        );
+        let received = block_on(device.receive_into(&mut payload)).expect("a packet arrives");
+        let VsockDelivery::Packet(received) = received else {
+            panic!("expected a packet, got {received:?}");
+        };
+        assert_eq!(received.header.op, VsockOp::CreditUpdate);
+    }
+
+    #[test]
+    fn a_parked_reader_is_woken_by_the_reset() {
+        let device = device();
+        let mut payload = vec![0_u8; VSOCK_MAX_PAYLOAD_BYTES];
+        let mut receive = pin!(device.receive_into(&mut payload));
+        assert!(block_on(poll_once(receive.as_mut())).is_none());
+
+        let _reset = device.reinitialize().expect("the device is as it was");
+
+        assert_eq!(
+            block_on(poll_once(receive.as_mut())),
+            Some(Ok(VsockDelivery::TransportReset))
+        );
+    }
+
+    #[test]
+    fn a_device_that_offers_fewer_features_after_the_reset_is_refused() {
+        let transport = FakeTransport::new(FakeTransportConfig {
+            device_type: DeviceType::Vsock,
+            offered_features: VirtioFeatures::VERSION_1.bits()
+                | VirtioFeatures::RING_EVENT_IDX.bits(),
+            queue_size: 8,
+            supports_queue_reset: false,
+            absent_queues: &[],
+        });
+        transport.set_config_u32(0, GUEST_CID as u32);
+        let device = VirtioVsockDevice::new(transport).expect("vsock device should initialize");
+        device
+            .transport
+            .withdraw_features(VirtioFeatures::RING_EVENT_IDX.bits());
+
+        assert_eq!(
+            device.reinitialize(),
+            Err(ReinitError::Renegotiate(
+                RenegotiateError::FeatureWithdrawn {
+                    device: DeviceType::Vsock,
+                    bit: 29,
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn a_device_that_assigns_another_address_after_the_reset_is_refused() {
+        let device = device();
+        device.transport.set_config_u32(0, 7);
+
+        assert_eq!(
+            device.reinitialize(),
+            Err(ReinitError::GuestCidChanged {
+                expected: GUEST_CID,
+                found: 7,
+            })
+        );
     }
 
     #[test]

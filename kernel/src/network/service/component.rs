@@ -137,7 +137,7 @@ where
             let now = StackInstant::from_nanos(self.now_nanos());
             let mut shard = self.inner.state.shard_at(socket.shard_idx).lock();
             shard.send_dns_queries(socket, queries, host, &answers, now)?;
-            shard.poll_dns_responses(socket, queries, &mut answers)?;
+            shard.poll_dns_responses(socket, queries, host, &mut answers)?;
             drop(shard);
             if answers.complete() {
                 return answers.finish();
@@ -1046,19 +1046,11 @@ impl NetworkShard {
             .map_err(|_| NetworkControlError::BackendFault)
     }
 
-    /// Identifier for the next echo exchange this shard starts.
-    ///
-    /// Replies are matched on it, so an identifier that a previous ping
-    /// abandoned must not be handed out again while its late reply may
-    /// still arrive; the counter therefore walks the whole 16-bit space
-    /// before it repeats, and skips zero the way the DNS query ids do.
-    pub(super) fn next_icmp_echo_identifier(&mut self) -> u16 {
-        let identifier = self.next_icmp_echo_identifier;
-        self.next_icmp_echo_identifier = self.next_icmp_echo_identifier.wrapping_add(1);
-        if self.next_icmp_echo_identifier == 0 {
-            self.next_icmp_echo_identifier = 1;
-        }
-        identifier
+    /// Identifier for the next echo exchange this shard starts, drawn
+    /// from the shard's random stream so an off-path sender cannot guess
+    /// the key a reply has to carry.
+    pub(super) fn draw_icmp_echo_identifier(&mut self) -> u16 {
+        self.entropy.nonzero_u16()
     }
 
     /// Queues the echo request `key` describes.
@@ -1157,10 +1149,16 @@ impl NetworkShard {
 
     /// Drains this lookup's resolver socket, banking whichever of the
     /// pair's answers have arrived.
+    ///
+    /// A datagram counts as an answer only when its id selects one of
+    /// the pair and the question it repeats is `host` with that id's
+    /// record type: anything else, a forgery included, is dropped and
+    /// leaves the question outstanding.
     pub(super) fn poll_dns_responses(
         &mut self,
         socket: &ResolverSocket,
         queries: DnsQueryPair,
+        host: &str,
         answers: &mut DnsAnswers,
     ) -> Result<(), DnsError> {
         let socket = socket.stack_socket;
@@ -1168,16 +1166,22 @@ impl NetworkShard {
             kind: DnsErrorKind::Unavailable,
             detail: NetworkErrorDetail::DnsQueryStartFailed,
         })? {
-            let Some(message) = DnsResponse::parse(&datagram.bytes).and_then(DnsResponse::message)
-            else {
+            let Some(response) = DnsResponse::parse(&datagram.bytes) else {
                 continue;
             };
-            if message.id == queries.a {
-                answers.a_answered = true;
-            } else if message.id == queries.aaaa {
-                answers.aaaa_answered = true;
+            let record = if response.id() == queries.a {
+                DnsRecordType::A
+            } else if response.id() == queries.aaaa {
+                DnsRecordType::Aaaa
             } else {
                 continue;
+            };
+            let Some(message) = response.message(DnsQuery { name: host, record }) else {
+                continue;
+            };
+            match record {
+                DnsRecordType::A => answers.a_answered = true,
+                DnsRecordType::Aaaa => answers.aaaa_answered = true,
             }
             answers.extend(message.addresses.iter().copied());
         }
@@ -1222,7 +1226,7 @@ pub(super) struct DnsQueryPair {
 
 impl DnsQueryPair {
     /// Ids a question may carry: every nonzero 16-bit value.
-    pub(super) const IDS: u32 = u16::MAX as u32;
+    pub(super) const IDS: u32 = NONZERO_U16_VALUES;
 
     /// The pair two uniform draws select: `first` in `0..IDS` picks the
     /// `A` id, and `second` in `0..IDS - 1` picks the `AAAA` id among
