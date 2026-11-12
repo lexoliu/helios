@@ -149,10 +149,6 @@ jobs:
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         working-directory: helios
         run: tools/wasi-apps/build.sh
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: helios
-          key: bench-${{ matrix.name }}
       - name: Install inferno flamegraph renderer
         run: cargo install inferno --locked
       # The guest image, its bootfs and the inspector are built here so

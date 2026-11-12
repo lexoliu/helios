@@ -582,12 +582,14 @@ where
             local_port
         };
         let owner = shard_idx_for_flow(local, local_port, destination, port, shard_count);
+        let opened_at = StackInstant::from_nanos(self.now_nanos());
         let stream = self.inner.state.shard_at(owner).lock().start_tcp_connect(
             local,
             destination,
             port,
             local_port,
             hop_limit,
+            opened_at,
         )?;
 
         loop {
@@ -1624,6 +1626,7 @@ impl NetworkShard {
         port: u16,
         local_port: u16,
         hop_limit: u8,
+        now: StackInstant,
     ) -> Result<TcpStreamId, TcpError> {
         if !self.is_tcp_local_port_free(local_port) {
             return Err(TcpError {
@@ -1631,19 +1634,19 @@ impl NetworkShard {
                 detail: NetworkErrorDetail::TcpConnectStartFailed,
             });
         }
+        let local = TcpEndpoint {
+            address: local,
+            port: local_port,
+        };
+        let remote = TcpEndpoint {
+            address: destination,
+            port,
+        };
+        // RFC 6528: the same keyed function a passive open uses.
+        let initial_sequence = self.stack.tcp_initial_sequence(local, remote, now);
         let socket = self
             .stack
-            .open_tcp_connect(
-                TcpEndpoint {
-                    address: local,
-                    port: local_port,
-                },
-                TcpEndpoint {
-                    address: destination,
-                    port,
-                },
-                1,
-            )
+            .open_tcp_connect(local, remote, initial_sequence)
             .map_err(|_| TcpError {
                 kind: TcpErrorKind::Unavailable,
                 detail: NetworkErrorDetail::TcpConnectStartFailed,
@@ -1957,9 +1960,7 @@ impl NetworkShard {
     }
 
     pub(super) fn allocate_tcp_local_port(&mut self) -> Result<u16, TcpError> {
-        for _ in 0..self.ephemeral_port_attempts() {
-            let candidate = self.next_tcp_local_port;
-            self.next_tcp_local_port = self.advance_ephemeral_port(self.next_tcp_local_port);
+        for candidate in self.ephemeral_walk() {
             if self.is_tcp_local_port_free(candidate) {
                 return Ok(candidate);
             }
@@ -1987,9 +1988,7 @@ impl NetworkShard {
         shard_count: usize,
     ) -> Result<u16, TcpError> {
         let mut fallback = None;
-        for _ in 0..self.ephemeral_port_attempts() {
-            let candidate = self.next_tcp_local_port;
-            self.next_tcp_local_port = self.advance_ephemeral_port(self.next_tcp_local_port);
+        for candidate in self.ephemeral_walk() {
             if !self.is_tcp_local_port_free(candidate) {
                 continue;
             }
