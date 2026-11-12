@@ -51,6 +51,7 @@ use crate::{
     TraceFilter, TraceLevel, TraceValue,
 };
 use filters::{MetricFilterView, ProfileFilterView, TraceFilterView};
+use observation::{Denied, Refused, TargetRefusal, Visibility};
 // The two generated worlds spell every shared type identically, so each keeps
 // its own short alias rather than importing the names themselves.
 use debugger_bindings::helios::system as debugger_wit;
@@ -83,6 +84,7 @@ fn lower_bytes_to_vec(bytes: Bytes) -> Vec<u8> {
 mod device;
 pub(crate) use device::record_linear_memory;
 mod filters;
+mod observation;
 mod pending;
 pub(crate) use pending::PendingReply;
 pub mod service;
@@ -3001,10 +3003,15 @@ where
     let mut instance = linker.instance(TRACING_INSTANCE)?;
     instance.func_wrap(
         "set-target-enabled",
-        |_caller, (target, enabled): (String, bool)| {
-            let result = crate::log::set_gated_target(&target, enabled).map_err(|error| {
-                debugger_wit::tracing::TargetError::UnknownTarget(error.to_string())
-            });
+        |caller, (target, enabled): (String, bool)| {
+            let result = observation::set_target_enabled(caller.data(), &target, enabled).map_err(
+                |refusal| match refusal {
+                    TargetRefusal::Denied => debugger_wit::tracing::TargetError::Denied,
+                    TargetRefusal::Unknown(error) => {
+                        debugger_wit::tracing::TargetError::UnknownTarget(error)
+                    }
+                },
+            );
             Ok((result,))
         },
     )?;
@@ -3014,10 +3021,7 @@ where
             let events = filter
                 .lift(&mut caller)?
                 .map(|filter| {
-                    caller
-                        .data()
-                        .runtime_state
-                        .recent(&filter, limit)
+                    observation::recent_events(caller.data(), &filter, limit)
                         .into_iter()
                         .map(|event| convert_event(&event))
                         .collect::<Vec<_>>()
@@ -3033,7 +3037,16 @@ where
                 return Ok((Err(debugger_wit::filters::FilterError::from(refusal)),));
             }
         };
-        let reader = StreamReader::new(&mut caller, TracingStreamProducer::new(filter))?;
+        // The stream fixes its scope here and keeps it for its life.
+        let visibility = Visibility::of(caller.data());
+        let reader = match visibility {
+            Visibility::Machine(scope) => {
+                StreamReader::new(&mut caller, TracingStreamProducer::new(filter, scope))?
+            }
+            Visibility::Own(scope) => {
+                StreamReader::new(&mut caller, TracingStreamProducer::new(filter, scope))?
+            }
+        };
         Ok((Ok(reader),))
     })?;
     Ok(())
@@ -3065,13 +3078,19 @@ macro_rules! impl_profiling_bindings {
                 HostFs: crate::HostFileSystem,
             {
                 let mut instance = linker.instance(PROFILING_INSTANCE)?;
+                // The controls and the instruction and raw profile reads
+                // need the right to observe the machine; the folded and
+                // metric reads are answered for every caller, within the
+                // scope its authority selects. See `observation`.
                 instance.func_wrap("set-enabled", |caller, (enabled,): (bool,)| {
-                    caller.data().runtime_state.set_profiling_enabled(enabled);
-                    Ok(())
+                    let result = observation::set_profiling_enabled(caller.data(), enabled)
+                        .map_err(|Denied| $wit::profiling::ControlError::Denied);
+                    Ok((result,))
                 })?;
                 instance.func_wrap("clear", |caller, (): ()| {
-                    caller.data().runtime_state.clear_profile();
-                    Ok(())
+                    let result = observation::clear_profile(caller.data())
+                        .map_err(|Denied| $wit::profiling::ControlError::Denied);
+                    Ok((result,))
                 })?;
                 instance.func_wrap(
                     "folded",
@@ -3079,10 +3098,7 @@ macro_rules! impl_profiling_bindings {
                         let samples = filter
                             .lift(&mut caller)?
                             .map(|filter| {
-                                caller
-                                    .data()
-                                    .runtime_state
-                                    .folded_profile(caller.data().cpu.now().ticks(), &filter, limit)
+                                observation::folded_samples(caller.data(), &filter, limit)
                                     .into_iter()
                                     .map(convert_profile_sample)
                                     .collect::<Vec<_>>()
@@ -3097,10 +3113,7 @@ macro_rules! impl_profiling_bindings {
                         let samples = filter
                             .lift(&mut caller)?
                             .map(|filter| {
-                                caller
-                                    .data()
-                                    .runtime_state
-                                    .perf_metrics(&filter, limit)
+                                observation::metric_samples(caller.data(), &filter, limit)
                                     .into_iter()
                                     .map(convert_perf_metric_sample)
                                     .collect::<Vec<_>>()
@@ -3110,41 +3123,27 @@ macro_rules! impl_profiling_bindings {
                     },
                 )?;
                 instance.func_wrap("set-instruction-sampling", |caller, (enabled,): (bool,)| {
-                    let result = caller
-                        .data()
-                        .runtime_state
-                        .instruction_sampler()
-                        .set_sampling(enabled)
-                        .map_err(convert_instruction_profile_error);
+                    let result = observation::set_instruction_sampling(caller.data(), enabled)
+                        .map_err(convert_instruction_profile_refusal);
                     Ok((result,))
                 })?;
                 instance.func_wrap("instruction-samples", |caller, (): ()| {
-                    let runtime_state = &caller.data().runtime_state;
-                    // Only the program service knows the wasm code that
-                    // can run; a read before it exists is a bring-up
-                    // ordering defect, not an empty profile.
-                    let service = runtime_state.program_service().ok_or_else(|| {
-                        wasmtime::Error::msg(
-                            "instruction samples were read before the program service was \
-                             installed",
-                        )
-                    })?;
-                    let profile = runtime_state
-                        .instruction_sampler()
-                        .profile(service.code_map())
+                    let profile = observation::instruction_samples(caller.data())?
                         .map(convert_instruction_profile)
-                        .map_err(convert_instruction_profile_error);
+                        .map_err(convert_instruction_profile_refusal);
                     Ok((profile,))
                 })?;
-                instance.func_wrap("raw-profile-size", |_caller, (): ()| {
-                    Ok((crate::KernelLlvmProfile
-                        .size()
-                        .map_err(convert_raw_profile_error),))
+                instance.func_wrap("raw-profile-size", |caller, (): ()| {
+                    let size = observation::raw_profile_size(caller.data())
+                        .map_err(convert_raw_profile_refusal);
+                    Ok((size,))
                 })?;
                 instance.func_wrap(
                     "raw-profile-read",
-                    |_caller, (offset, length): (u64, u32)| {
-                        Ok((read_raw_profile(offset, length).map_err(convert_raw_profile_error),))
+                    |caller, (offset, length): (u64, u32)| {
+                        let window = observation::raw_profile_read(caller.data(), offset, length)
+                            .map_err(convert_raw_profile_refusal);
+                        Ok((window,))
                     },
                 )?;
                 Ok(())
@@ -3219,30 +3218,34 @@ macro_rules! impl_profiling_bindings {
                 }
             }
 
-            fn convert_instruction_profile_error(
-                error: crate::InstructionProfileError,
+            fn convert_instruction_profile_refusal(
+                refusal: Refused<crate::InstructionProfileError>,
             ) -> $wit::profiling::InstructionProfileError {
-                match error {
-                    crate::InstructionProfileError::NotCaptured => {
+                match refusal {
+                    Refused::Denied => $wit::profiling::InstructionProfileError::Denied,
+                    Refused::Failed(crate::InstructionProfileError::NotCaptured) => {
                         $wit::profiling::InstructionProfileError::NotCaptured
                     }
                 }
             }
 
-            fn convert_raw_profile_error(
-                error: crate::LlvmProfileError,
+            fn convert_raw_profile_refusal(
+                refusal: Refused<crate::LlvmProfileError>,
             ) -> $wit::profiling::RawProfileError {
                 use crate::LlvmProfileError as Local;
                 use $wit::profiling::RawProfileError as Wit;
 
-                match error {
-                    Local::NotInstrumented => Wit::NotInstrumented,
-                    Local::UnsupportedVersion { found, .. } => Wit::UnsupportedVersion(found),
-                    Local::MalformedSection { section, .. } => {
+                match refusal {
+                    Refused::Denied => Wit::Denied,
+                    Refused::Failed(Local::NotInstrumented) => Wit::NotInstrumented,
+                    Refused::Failed(Local::UnsupportedVersion { found, .. }) => {
+                        Wit::UnsupportedVersion(found)
+                    }
+                    Refused::Failed(Local::MalformedSection { section, .. }) => {
                         Wit::MalformedSection(convert_profile_section(section))
                     }
-                    Local::OutOfRange { len, .. } => Wit::OutOfRange(len),
-                    Local::ReadTooLarge { limit, .. } => Wit::ReadTooLarge(limit),
+                    Refused::Failed(Local::OutOfRange { len, .. }) => Wit::OutOfRange(len),
+                    Refused::Failed(Local::ReadTooLarge { limit, .. }) => Wit::ReadTooLarge(limit),
                 }
             }
 
@@ -3318,10 +3321,15 @@ where
     let mut instance = linker.instance(TRACING_INSTANCE)?;
     instance.func_wrap(
         "set-target-enabled",
-        |_caller, (target, enabled): (String, bool)| {
-            let result = crate::log::set_gated_target(&target, enabled).map_err(|error| {
-                program_wit::tracing::TargetError::UnknownTarget(error.to_string())
-            });
+        |caller, (target, enabled): (String, bool)| {
+            let result = observation::set_target_enabled(caller.data(), &target, enabled).map_err(
+                |refusal| match refusal {
+                    TargetRefusal::Denied => program_wit::tracing::TargetError::Denied,
+                    TargetRefusal::Unknown(error) => {
+                        program_wit::tracing::TargetError::UnknownTarget(error)
+                    }
+                },
+            );
             Ok((result,))
         },
     )?;
@@ -3331,10 +3339,7 @@ where
             let events = filter
                 .lift(&mut caller)?
                 .map(|filter| {
-                    caller
-                        .data()
-                        .runtime_state
-                        .recent(&filter, limit)
+                    observation::recent_events(caller.data(), &filter, limit)
                         .into_iter()
                         .map(|event| convert_program_event(&event))
                         .collect::<Vec<_>>()
@@ -3350,7 +3355,18 @@ where
                 return Ok((Err(program_wit::filters::FilterError::from(refusal)),));
             }
         };
-        let reader = StreamReader::new(&mut caller, ProgramTracingStreamProducer::new(filter))?;
+        // The stream fixes its scope here and keeps it for its life.
+        let visibility = Visibility::of(caller.data());
+        let reader = match visibility {
+            Visibility::Machine(scope) => StreamReader::new(
+                &mut caller,
+                ProgramTracingStreamProducer::new(filter, scope),
+            )?,
+            Visibility::Own(scope) => StreamReader::new(
+                &mut caller,
+                ProgramTracingStreamProducer::new(filter, scope),
+            )?,
+        };
         Ok((Ok(reader),))
     })?;
     Ok(())
@@ -4161,23 +4177,34 @@ where
     }
 }
 
-/// The debugger's trace stream. It owns a filter and a cursor and no
-/// buffer: each poll runs on the store's task and asks the trace log for
-/// the next admitted event, which copies a bounded batch of pointers under
-/// the log's lock and matches after releasing it.
-struct TracingStreamProducer {
+/// The debugger world's trace stream. It owns a filter, the scope it was
+/// created with and a cursor, and no buffer: each poll runs on the store's
+/// task and asks the trace log for the next event the scope admits and the
+/// filter matches, which copies a bounded batch of pointers under the
+/// log's lock and matches after releasing it.
+///
+/// The scope is fixed when the stream is created, from the creator's
+/// authority at that moment, and the stream keeps it for its life.
+struct TracingStreamProducer<Scope> {
+    scope: Scope,
     filter: TraceFilter,
     cursor: u64,
 }
 
-impl TracingStreamProducer {
-    fn new(filter: TraceFilter) -> Self {
-        Self { filter, cursor: 0 }
+impl<Scope> TracingStreamProducer<Scope> {
+    fn new(filter: TraceFilter, scope: Scope) -> Self {
+        Self {
+            scope,
+            filter,
+            cursor: 0,
+        }
     }
 }
 
-impl<CpuImpl, Net, HostFs> StreamProducer<StoreData<CpuImpl, Net, HostFs>> for TracingStreamProducer
+impl<Scope, CpuImpl, Net, HostFs> StreamProducer<StoreData<CpuImpl, Net, HostFs>>
+    for TracingStreamProducer<Scope>
 where
+    Scope: crate::ObservationScope + Send + Unpin + 'static,
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
@@ -4200,7 +4227,7 @@ where
         match store
             .data()
             .runtime_state
-            .next_after(&mut this.cursor, &this.filter)
+            .next_after(&this.scope, &mut this.cursor, &this.filter)
         {
             Some(event) => {
                 destination.set_buffer(Some(convert_event(&event)));
@@ -4213,20 +4240,26 @@ where
 
 /// The program world's trace stream, with the contract of
 /// [`TracingStreamProducer`].
-struct ProgramTracingStreamProducer {
+struct ProgramTracingStreamProducer<Scope> {
+    scope: Scope,
     filter: TraceFilter,
     cursor: u64,
 }
 
-impl ProgramTracingStreamProducer {
-    fn new(filter: TraceFilter) -> Self {
-        Self { filter, cursor: 0 }
+impl<Scope> ProgramTracingStreamProducer<Scope> {
+    fn new(filter: TraceFilter, scope: Scope) -> Self {
+        Self {
+            scope,
+            filter,
+            cursor: 0,
+        }
     }
 }
 
-impl<CpuImpl, Net, HostFs> StreamProducer<StoreData<CpuImpl, Net, HostFs>>
-    for ProgramTracingStreamProducer
+impl<Scope, CpuImpl, Net, HostFs> StreamProducer<StoreData<CpuImpl, Net, HostFs>>
+    for ProgramTracingStreamProducer<Scope>
 where
+    Scope: crate::ObservationScope + Send + Unpin + 'static,
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
@@ -4249,7 +4282,7 @@ where
         match store
             .data()
             .runtime_state
-            .next_after(&mut this.cursor, &this.filter)
+            .next_after(&this.scope, &mut this.cursor, &this.filter)
         {
             Some(event) => {
                 destination.set_buffer(Some(convert_program_event(&event)));

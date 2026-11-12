@@ -324,6 +324,17 @@ pub(crate) fn test_profile_sink() -> crate::ProfileSink {
     )
 }
 
+/// The proof that an instance may observe the whole machine, derived
+/// the way a kernel host function derives it: from an authority that was
+/// granted the right.
+pub(crate) fn test_observe_machine_cap() -> crate::ObserveMachineCap {
+    let mut authority = crate::ProcessAuthority::empty();
+    authority.grant_diagnostic_rights(crate::DiagnosticAuthorityRights::OBSERVE_MACHINE);
+    authority
+        .derive_observe_machine_cap()
+        .expect("an authority granted the right derives its proof")
+}
+
 /// The uptime clock a test service reads, at a 1 GHz timebase whose
 /// origin is the boot tick, so a tick is a nanosecond and a test can
 /// state deadlines in either.

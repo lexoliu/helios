@@ -2692,6 +2692,7 @@ mod tests {
     ) -> alloc::collections::BTreeMap<String, crate::PerfMetricSample> {
         profiles
             .metrics(
+                &crate::test_support::test_observe_machine_cap(),
                 &crate::PerfMetricFilter {
                     name_prefixes: crate::PrefixSet::from_prefixes(["kernel;hostfs;"])
                         .expect("one short prefix fits the filter bounds"),

@@ -53,6 +53,9 @@ interface tracing {
   variant target-error {
     /// The kernel gates no diagnostic target under the name given.
     unknown-target(string),
+    /// The caller does not hold the right to observe the machine, which
+    /// flipping a kernel-wide diagnostic gate requires.
+    denied,
   }
 
   /// Enables or disables a kernel diagnostic target by name.
@@ -66,8 +69,15 @@ interface tracing {
   set-target-enabled: func(target: string, enabled: bool) -> result<_, target-error>;
 
   /// Returns at most `limit` newest matching events, ordered oldest to newest.
+  ///
+  /// A caller that holds the right to observe the machine sees every
+  /// event, the kernel's own included. Any other caller sees only the
+  /// events its own instance wrote.
   recent: func(filter: filter, limit: u32) -> result<list<event>, filter-error>;
 
   /// Subscribes to future matching events.
+  ///
+  /// The stream's visibility is fixed when it is created, by the same
+  /// rule as `recent`.
   subscribe: func(filter: filter) -> result<stream<event>, filter-error>;
 }

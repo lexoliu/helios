@@ -370,14 +370,26 @@ where
             .record_console_text(timestamp, origin, text);
     }
 
-    pub fn recent(&self, filter: &TraceFilter, limit: u32) -> alloc::vec::Vec<Arc<TraceEvent>> {
-        self.inner.tracing.recent(filter, limit)
+    /// The newest `limit` events `scope` admits and `filter` matches; see
+    /// [`TraceLog::recent`].
+    pub fn recent(
+        &self,
+        scope: &impl crate::ObservationScope,
+        filter: &TraceFilter,
+        limit: u32,
+    ) -> alloc::vec::Vec<Arc<TraceEvent>> {
+        self.inner.tracing.recent(scope, filter, limit)
     }
 
-    /// The next event after `*cursor` that `filter` admits; see
-    /// [`TraceLog::next_after`].
-    pub fn next_after(&self, cursor: &mut u64, filter: &TraceFilter) -> Option<Arc<TraceEvent>> {
-        self.inner.tracing.next_after(cursor, filter)
+    /// The next event after `*cursor` that `scope` admits and `filter`
+    /// matches; see [`TraceLog::next_after`].
+    pub fn next_after(
+        &self,
+        scope: &impl crate::ObservationScope,
+        cursor: &mut u64,
+        filter: &TraceFilter,
+    ) -> Option<Arc<TraceEvent>> {
+        self.inner.tracing.next_after(scope, cursor, filter)
     }
 
     pub fn set_profiling_enabled(&self, enabled: bool) {
@@ -515,11 +527,12 @@ where
     pub fn folded_profile(
         &self,
         current_ticks: u64,
+        scope: &impl crate::ObservationScope,
         filter: &ProfileFilter,
         limit: u32,
     ) -> alloc::vec::Vec<FoldedProfileSample> {
         let _ = current_ticks;
-        self.inner.profiles.folded(filter, limit)
+        self.inner.profiles.folded(scope, filter, limit)
     }
 
     pub fn record_perf_metric_parts(
@@ -641,10 +654,11 @@ where
 
     pub fn perf_metrics(
         &self,
+        scope: &impl crate::ObservationScope,
         filter: &PerfMetricFilter,
         limit: u32,
     ) -> alloc::vec::Vec<PerfMetricSample> {
-        self.inner.profiles.metrics(filter, limit)
+        self.inner.profiles.metrics(scope, filter, limit)
     }
 
     pub fn ticks_to_nanos(&self, ticks: u64) -> u64 {
@@ -1252,6 +1266,7 @@ mod tests {
         state.record_kernel_heap_metrics(current);
 
         let samples = state.perf_metrics(
+            &crate::test_support::test_observe_machine_cap(),
             &PerfMetricFilter {
                 name_prefixes: crate::PrefixSet::from_prefixes(["kernel;heap;"])
                     .expect("one short prefix fits the filter bounds"),

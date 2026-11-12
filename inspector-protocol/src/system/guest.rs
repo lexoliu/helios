@@ -200,6 +200,7 @@ async fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>,
                     host_tracing::TargetError::UnknownTarget(name) => {
                         tracing::TargetError::UnknownTarget(name)
                     }
+                    host_tracing::TargetError::Denied => tracing::TargetError::Denied,
                 });
             postcard::to_allocvec(&result).map_err(|source| DispatchError::Encode {
                 operation: "tracing.set-target-enabled",
@@ -226,8 +227,8 @@ async fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>,
                     operation: "profiling.set-enabled",
                     source,
                 })?;
-            host_profiling::set_enabled(enabled);
-            postcard::to_allocvec(&()).map_err(|source| DispatchError::Encode {
+            let result = host_profiling::set_enabled(enabled).map_err(convert_control_error);
+            postcard::to_allocvec(&result).map_err(|source| DispatchError::Encode {
                 operation: "profiling.set-enabled",
                 source,
             })
@@ -238,8 +239,8 @@ async fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>,
                     operation: "profiling.clear",
                 });
             }
-            host_profiling::clear();
-            postcard::to_allocvec(&()).map_err(|source| DispatchError::Encode {
+            let result = host_profiling::clear().map_err(convert_control_error);
+            postcard::to_allocvec(&result).map_err(|source| DispatchError::Encode {
                 operation: "profiling.clear",
                 source,
             })
@@ -752,6 +753,13 @@ fn convert_raw_profile_error(error: host_profiling::RawProfileError) -> profilin
         Host::MalformedSection(section) => Wire::MalformedSection(convert_profile_section(section)),
         Host::OutOfRange(len) => Wire::OutOfRange(len),
         Host::ReadTooLarge(limit) => Wire::ReadTooLarge(limit),
+        Host::Denied => Wire::Denied,
+    }
+}
+
+fn convert_control_error(error: host_profiling::ControlError) -> profiling::ControlError {
+    match error {
+        host_profiling::ControlError::Denied => profiling::ControlError::Denied,
     }
 }
 
@@ -795,6 +803,9 @@ fn convert_instruction_profile_error(
     match error {
         host_profiling::InstructionProfileError::NotCaptured => {
             profiling::InstructionProfileError::NotCaptured
+        }
+        host_profiling::InstructionProfileError::Denied => {
+            profiling::InstructionProfileError::Denied
         }
     }
 }

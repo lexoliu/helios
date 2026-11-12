@@ -524,6 +524,13 @@ pub(crate) enum ProfilingStepError {
         #[source]
         source: system_profiling::FilterError,
     },
+    /// The guest answered a control but refused it: the session does not
+    /// hold the right to observe the machine.
+    #[error("the guest refused to {step}: {source:?}")]
+    ControlRefused {
+        step: &'static str,
+        source: system_profiling::ControlError,
+    },
 }
 
 /// Why an `aot-bench` run did not produce its measurements.
@@ -3844,7 +3851,7 @@ fn run_workload_bench(
         let before_profile = if collect_profile {
             guest_step_under_deadline("the profile reset", seconds, &vcpus, async {
                 Ok::<_, VmSessionError>(
-                    profiling_step(
+                    profiling_control_step(
                         "clear remote profile samples",
                         system_profiling::clear(&client),
                     )
@@ -3854,7 +3861,7 @@ fn run_workload_bench(
             .await?;
             guest_step_under_deadline("the profiler hand-off", seconds, &vcpus, async {
                 Ok::<_, VmSessionError>(
-                    profiling_step(
+                    profiling_control_step(
                         "enable remote profiling",
                         system_profiling::set_enabled(&client, true),
                     )
@@ -3899,7 +3906,7 @@ fn run_workload_bench(
         if collect_profile {
             guest_step_under_deadline("the profiler stop", seconds, &vcpus, async {
                 Ok::<_, VmSessionError>(
-                    profiling_step(
+                    profiling_control_step(
                         "disable remote profiling",
                         system_profiling::set_enabled(&client, false),
                     )
@@ -3957,6 +3964,22 @@ async fn profiling_step<T>(
 ) -> Result<T, ProfilingStepError> {
     call.await
         .map_err(|source| ProfilingStepError::Rpc { step, source })
+}
+
+/// A profiling control, which the guest refuses to a session that lacks
+/// the right to observe the machine.
+async fn profiling_control_step(
+    step: &'static str,
+    call: impl std::future::Future<
+        Output = Result<
+            Result<(), system_profiling::ControlError>,
+            helios_inspector_protocol::RpcError,
+        >,
+    >,
+) -> Result<(), ProfilingStepError> {
+    profiling_step(step, call)
+        .await?
+        .map_err(|source| ProfilingStepError::ControlRefused { step, source })
 }
 
 /// A profiling read, whose filter the guest may refuse as too large.
@@ -4036,12 +4059,12 @@ fn run_aot_bench(
             || command.user_profile_output.is_some()
             || command.perf_metrics_output.is_some();
         let before_profile = if collect_profile {
-            profiling_step(
+            profiling_control_step(
                 "clear remote profile samples",
                 system_profiling::clear(&client),
             )
             .await?;
-            profiling_step(
+            profiling_control_step(
                 "enable remote profiling",
                 system_profiling::set_enabled(&client, true),
             )
@@ -4117,7 +4140,7 @@ fn run_aot_bench(
             instruction_profile::stop(&client).await?;
         }
         if collect_profile {
-            profiling_step(
+            profiling_control_step(
                 "disable remote profiling",
                 system_profiling::set_enabled(&client, false),
             )

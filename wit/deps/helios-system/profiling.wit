@@ -64,6 +64,16 @@ interface profiling {
     out-of-range(u64),
     /// The largest window one read serves, which the request exceeded.
     read-too-large(u32),
+    /// The caller does not hold the right to observe the machine, which
+    /// reading the kernel's profile requires.
+    denied,
+  }
+
+  /// Why `set-enabled` or `clear` refused.
+  enum control-error {
+    /// The caller does not hold the right to observe the machine, which
+    /// controlling machine-wide profiling requires.
+    denied,
   }
 
   /// A function of a loaded wasm program that a sample landed in.
@@ -113,11 +123,26 @@ interface profiling {
   enum instruction-profile-error {
     /// The running backend does not sample instruction addresses.
     not-captured,
+    /// The caller does not hold the right to observe the machine, which
+    /// sampling instruction addresses requires: a sample cannot be
+    /// attributed to one instance.
+    denied,
   }
 
-  set-enabled: func(enabled: bool);
-  clear: func();
+  /// Turns machine-wide profiling on or off. It needs the right to
+  /// observe the machine.
+  set-enabled: func(enabled: bool) -> result<_, control-error>;
+
+  /// Wipes the machine-wide profile. It needs the right to observe the
+  /// machine.
+  clear: func() -> result<_, control-error>;
+
+  /// The folded stacks of the profile. A caller that holds the right to
+  /// observe the machine sees every instance's and the kernel's; any other
+  /// caller sees only the samples its own instance recorded.
   folded: func(filter: filter, limit: u32) -> result<list<folded-sample>, filter-error>;
+
+  /// The perf metrics of the profile, visible by the rule of `folded`.
   metrics: func(filter: metric-filter, limit: u32) -> result<list<metric-sample>, filter-error>;
 
   /// Starts or stops instruction-address sampling, independently of

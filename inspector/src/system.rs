@@ -267,6 +267,9 @@ pub async fn enable_tracing_targets(
             target: target.clone(),
             detail: match error {
                 tracing::TargetError::UnknownTarget(name) => name,
+                tracing::TargetError::Denied => {
+                    "the session does not hold the right to observe the machine".to_owned()
+                }
             },
         })?;
     }
