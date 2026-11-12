@@ -1201,7 +1201,8 @@ fn flush_tlb_pages(start: usize, pages: usize) {
 }
 
 fn page_flags_to_pte(flags: PageFlags) -> Result<u64, AddressSpaceError> {
-    if flags.is_empty() {
+    // RISC-V has no allocation-tag storage to map.
+    if flags.is_empty() || flags.contains(PageFlags::TAGGED) {
         return Err(AddressSpaceError::InvalidFlags);
     }
     let mut pte = 0u64;

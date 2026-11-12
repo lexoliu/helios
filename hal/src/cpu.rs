@@ -5,6 +5,7 @@ use core::time::Duration;
 use strength_reduce::StrengthReducedU64;
 
 use crate::entropy::{EntropyQuality, EntropyUnavailable};
+use crate::tagging::MemoryTagging;
 
 /// Logical processor identifier.
 ///
@@ -407,7 +408,8 @@ pub trait Cpu: Send + Sync + 'static {
     /// requested processor, because that is a real bring-up failure.
     ///
     /// The call returns only after that processor has enabled every
-    /// mechanism [`Cpu::control_flow_integrity`] names.
+    /// mechanism [`Cpu::control_flow_integrity`] names, and every mechanism
+    /// [`Cpu::memory_tagging`] names.
     fn start_processor(&self, processor: ProcessorId);
 
     /// Nudges a processor that may currently be parked so it can observe newly
@@ -500,6 +502,14 @@ pub trait Cpu: Send + Sync + 'static {
     /// value is the same on every processor.
     fn control_flow_integrity(&self) -> ControlFlowIntegrity {
         ControlFlowIntegrity::NONE
+    }
+
+    /// The memory tagging this backend enabled on every processor.
+    ///
+    /// The default [`MemoryTagging::NONE`] means the backend enabled
+    /// nothing. The value is the same on every processor.
+    fn memory_tagging(&self) -> MemoryTagging {
+        MemoryTagging::NONE
     }
 
     /// Zero-initializes `size` bytes starting at `ptr`.

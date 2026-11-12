@@ -320,6 +320,7 @@ impl AddressSpace for HostedAddressSpace {
     }
 
     fn commit(&self, virt: VirtRange, flags: PageFlags) -> Result<(), AddressSpaceError> {
+        refuse_tagged(flags)?;
         validate_range(virt)?;
         let mut reservations = self.reservations.lock().unwrap();
         reservations.precheck_commit(virt)?;
@@ -350,6 +351,7 @@ impl AddressSpace for HostedAddressSpace {
     }
 
     fn protect(&self, virt: VirtRange, flags: PageFlags) -> Result<(), AddressSpaceError> {
+        refuse_tagged(flags)?;
         validate_range(virt)?;
         let mut reservations = self.reservations.lock().unwrap();
         reservations.ensure_committed(virt)?;
@@ -485,6 +487,7 @@ impl AddressSpace for HostedAddressSpace {
         physical: PhysicalRange,
         flags: PageFlags,
     ) -> Result<(), AddressSpaceError> {
+        refuse_tagged(flags)?;
         if physical.bytes as usize != virt.byte_len {
             return Err(AddressSpaceError::Misaligned);
         }
@@ -830,6 +833,15 @@ fn set_protection(range: VirtRange, prot: i32) -> Result<(), AddressSpaceError> 
     }
 }
 
+/// The host's `mmap` has no allocation-tag storage, so no hosted mapping is
+/// tag-capable.
+fn refuse_tagged(flags: PageFlags) -> Result<(), AddressSpaceError> {
+    if flags.contains(PageFlags::TAGGED) {
+        return Err(AddressSpaceError::InvalidFlags);
+    }
+    Ok(())
+}
+
 fn page_flags_to_prot(flags: PageFlags) -> i32 {
     let mut prot = 0i32;
     if flags.contains(PageFlags::READ) {
@@ -863,6 +875,26 @@ mod tests {
         assert_eq!(address_space.translate(range.start), Translation::Reserved);
         address_space.release(range).unwrap();
         assert_eq!(address_space.translate(range.start), Translation::Unmapped);
+    }
+
+    #[test]
+    fn commit_refuses_tagged_pages() {
+        let address_space = HostedAddressSpace::new();
+        let range = address_space.reserve(page_aligned_len(1)).unwrap();
+        let tagged = PageFlags::READ | PageFlags::WRITE | PageFlags::TAGGED;
+        assert_eq!(
+            address_space.commit(range, tagged),
+            Err(AddressSpaceError::InvalidFlags)
+        );
+        assert_eq!(address_space.translate(range.start), Translation::Reserved);
+        address_space
+            .commit(range, PageFlags::READ | PageFlags::WRITE)
+            .unwrap();
+        assert_eq!(
+            address_space.protect(range, tagged),
+            Err(AddressSpaceError::InvalidFlags)
+        );
+        address_space.release(range).unwrap();
     }
 
     #[test]

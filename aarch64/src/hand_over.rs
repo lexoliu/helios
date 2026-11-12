@@ -113,6 +113,9 @@ global_asm!(
 pub(crate) struct TrapHandOver {
     exception: KernelException,
     esr: usize,
+    /// `FAR_EL1` as the processor wrote it, logical tag included. The
+    /// exception's `faulting_address` is its canonical form; this raw value
+    /// is what the fatal report prints.
     far: usize,
     stack_fault: StackFault,
     /// Where the entry built the frame, and the `SP_EL1` it recorded.

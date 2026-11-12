@@ -189,6 +189,7 @@ mod net;
 mod platform;
 mod rtc;
 mod snd;
+mod tagging;
 mod vsock;
 
 mod debug_state {
@@ -1402,6 +1403,17 @@ extern "C" fn aarch64_handle_sync_exception(
     frame: *mut SyncTrapFrame,
 ) {
     let exception_class = (esr_el1 >> 26) & 0x3f;
+    // A tag check fault is decided before every other path: it is never
+    // offered to the access-flag, stack-commit, swap or runtime paths, so it
+    // cannot be taken for a guest trap or a swap-in. A guest reaches its
+    // memory through untagged pointers, so one is a kernel or runtime defect.
+    if tagging::is_tag_check_fault(esr_el1) {
+        // SAFETY: the entry wrote a complete frame at `frame`, and nothing
+        // else touches it while this handler runs. A processor that took a
+        // tag check fault implements FEAT_MTE2, and a tag mismatch is only
+        // raised on a tag-capable mapping.
+        unsafe { tagging::report_tag_check_fault(esr_el1, far_el1, (*frame).elr) }
+    }
     // A failed return-address authentication is never the runtime's: a
     // guest cannot form a native return address, so it is a corrupted host
     // stack or a compiler bug. It is refused before anything below can
@@ -1411,7 +1423,20 @@ extern "C" fn aarch64_handle_sync_exception(
     cfi::refuse_authentication_failure(esr_el1, far_el1, unsafe { (*frame).elr });
     let (cause, faulting_address) = match exception_class {
         0b100000 | 0b100001 => (KernelExceptionCause::InstructionFault, Some(far_el1)),
-        0b100100 | 0b100101 => (KernelExceptionCause::DataFault, Some(far_el1)),
+        // With top-byte-ignore a data abort's FAR carries the pointer's
+        // logical tag; every consumer below wants the address the
+        // processor translated. `far_el1` stays raw for the fatal report.
+        0b100100 | 0b100101 => {
+            let tcr_el1: u64;
+            // SAFETY: reading TCR_EL1 has no side effect at EL1.
+            unsafe {
+                asm!("mrs {tcr}, tcr_el1", tcr = out(reg) tcr_el1, options(nomem, nostack, preserves_flags));
+            }
+            (
+                KernelExceptionCause::DataFault,
+                Some(tagging::translated_address(far_el1, tcr_el1)),
+            )
+        }
         0b111100 => (KernelExceptionCause::Breakpoint, None),
         0b001110 => (KernelExceptionCause::IllegalInstruction, None),
         _ => (KernelExceptionCause::IllegalInstruction, None),
@@ -1429,17 +1454,19 @@ extern "C" fn aarch64_handle_sync_exception(
     }
 
     let mut stack_fault = helios_kernel::StackFault::Elsewhere;
-    if faulting_address.is_some() {
+    if let Some(faulting_address) = faulting_address {
         // The swap policy's aging pass clears access flags to measure
         // which pages are still being used. This machine may not set
         // them again in hardware, so the fault is how a page reports
         // that it was touched: set the bit and retry the instruction.
         if ACCESS_FLAG_FAULT_STATUS.contains(&(esr_el1 & 0x3f))
-            && vmm::resolve_access_flag_fault(far_el1)
+            && vmm::resolve_access_flag_fault(faulting_address)
         {
             return;
         }
-        match helios_kernel::classify_user_page_fault(helios_hal::vmm::VirtAddr::new(far_el1)) {
+        match helios_kernel::classify_user_page_fault(helios_hal::vmm::VirtAddr::new(
+            faulting_address,
+        )) {
             // A reserved page inside a live fiber stack was a demand
             // commit the kernel resolved in place.
             helios_kernel::UserPageFault::Resolved => return,
@@ -1451,7 +1478,7 @@ extern "C" fn aarch64_handle_sync_exception(
                 // SAFETY: `frame` is the frame the entry above wrote, and
                 // `enter_swap_fault_trampoline` only rewrites fields in it.
                 unsafe {
-                    enter_swap_fault_trampoline(frame, far_el1);
+                    enter_swap_fault_trampoline(frame, faulting_address);
                 }
                 return;
             }
