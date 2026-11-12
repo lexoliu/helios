@@ -185,6 +185,24 @@ interface stats {
     /// What those orphans still owe their peers, in bytes: sent and
     /// unacknowledged plus queued and unsent.
     tcp-orphan-send-queued-bytes: u64,
+    /// Orphans in `FIN-WAIT-1`: their FIN is sent, unacknowledged.
+    tcp-orphan-fin-wait-1: u32,
+    /// Orphans in `FIN-WAIT-2`: their FIN is acknowledged, the peer's has
+    /// not arrived.
+    tcp-orphan-fin-wait-2: u32,
+    /// Orphans in `CLOSING`: both FINs crossed, theirs unacknowledged.
+    tcp-orphan-closing: u32,
+    /// Orphans in `LAST-ACK`: the peer closed first and their FIN is
+    /// unacknowledged.
+    tcp-orphan-last-ack: u32,
+    /// Orphans in `TIME-WAIT`: waiting out the 2MSL timer.
+    tcp-orphan-time-wait: u32,
+    /// Orphans in any other state (`CLOSED` awaiting the sweep,
+    /// `ESTABLISHED`, `CLOSE-WAIT`, `SYN-SENT`, `SYN-RECEIVED`).
+    tcp-orphan-other-state: u32,
+    /// Orphans whose retransmission timer is armed: a sent segment awaits
+    /// acknowledgement.
+    tcp-orphan-retransmit-armed: u32,
     /// How many of them are refusing segments for want of receive room.
     /// Nonzero while `tcp-sockets` is zero is a leaked window: the shard
     /// refuses frames with no socket left that could relieve it.

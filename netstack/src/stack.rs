@@ -20,8 +20,8 @@ use crate::{
     PacketBuffer, RxChecksumReport, RxFrame, RxFrameOffload, SegmentationOffload, StackError,
     TcpCloseAction, TcpCloseKind, TcpEndpoint, TcpFlags, TcpHeader, TcpHeaderOptions, TcpPacket,
     TcpReceiveBuffer, TcpReceiveCounters, TcpReceiveDiagnostics, TcpSegmentBudget, TcpSocket,
-    TcpTransmitSegment, TransportChecksum, TxChecksum, TxFrameRef, TxSegmentation, UdpPacket,
-    icmpv6_checksum_valid, interpret_router_advertisement, ipv4_checksum,
+    TcpState, TcpTransmitSegment, TransportChecksum, TxChecksum, TxFrameRef, TxSegmentation,
+    UdpPacket, icmpv6_checksum_valid, interpret_router_advertisement, ipv4_checksum,
     partial_transport_checksum_completes, tcp_checksum_valid, udp_checksum_valid,
 };
 
@@ -2513,6 +2513,24 @@ pub struct TcpStackCounters {
     /// What those orphans still owe their peers, in bytes: sent and
     /// unacknowledged plus queued and unsent.
     pub orphan_send_queued_bytes: u64,
+    /// Orphans in `FIN-WAIT-1`: their FIN is sent, unacknowledged.
+    pub orphan_fin_wait_1: u32,
+    /// Orphans in `FIN-WAIT-2`: their FIN is acknowledged, the peer's
+    /// has not arrived.
+    pub orphan_fin_wait_2: u32,
+    /// Orphans in `CLOSING`: both FINs crossed, theirs unacknowledged.
+    pub orphan_closing: u32,
+    /// Orphans in `LAST-ACK`: the peer closed first and their FIN is
+    /// unacknowledged.
+    pub orphan_last_ack: u32,
+    /// Orphans in `TIME-WAIT`: waiting out the 2MSL timer.
+    pub orphan_time_wait: u32,
+    /// Orphans in any other state (`CLOSED` awaiting the sweep,
+    /// `ESTABLISHED`, `CLOSE-WAIT`, `SYN-SENT`, `SYN-RECEIVED`).
+    pub orphan_other_state: u32,
+    /// Orphans whose retransmission timer is armed: a sent segment
+    /// awaits acknowledgement.
+    pub orphan_retransmit_armed: u32,
     /// How many of them have a full receive queue and are refusing
     /// segments. A count that stays nonzero while `sockets` is zero is a
     /// leaked window, and the stack will refuse frames for ever.
@@ -2800,6 +2818,13 @@ where
         let mut sockets = 0u32;
         let mut orphan_sockets = 0u32;
         let mut orphan_send_queued_bytes = 0u64;
+        let mut orphan_fin_wait_1 = 0u32;
+        let mut orphan_fin_wait_2 = 0u32;
+        let mut orphan_closing = 0u32;
+        let mut orphan_last_ack = 0u32;
+        let mut orphan_time_wait = 0u32;
+        let mut orphan_other_state = 0u32;
+        let mut orphan_retransmit_armed = 0u32;
         let mut receive_window_bytes = 0u64;
         let mut receive_queued_bytes = 0u64;
         let mut out_of_order_queued_bytes = 0u64;
@@ -2813,6 +2838,21 @@ where
                 orphan_sockets += 1;
                 orphan_send_queued_bytes =
                     orphan_send_queued_bytes.saturating_add(socket.send_queued_bytes());
+                let by_state = match socket.state() {
+                    TcpState::FinWait1 => &mut orphan_fin_wait_1,
+                    TcpState::FinWait2 => &mut orphan_fin_wait_2,
+                    TcpState::Closing => &mut orphan_closing,
+                    TcpState::LastAck => &mut orphan_last_ack,
+                    TcpState::TimeWait => &mut orphan_time_wait,
+                    TcpState::Closed
+                    | TcpState::Listen
+                    | TcpState::SynSent
+                    | TcpState::SynReceived
+                    | TcpState::Established
+                    | TcpState::CloseWait => &mut orphan_other_state,
+                };
+                *by_state += 1;
+                orphan_retransmit_armed += u32::from(socket.retransmission_timer_armed());
             }
             receive_window_bytes = receive_window_bytes
                 .saturating_add(u64::from(socket.advertised_receive_window_bytes()));
@@ -2828,6 +2868,13 @@ where
             sockets,
             orphan_sockets,
             orphan_send_queued_bytes,
+            orphan_fin_wait_1,
+            orphan_fin_wait_2,
+            orphan_closing,
+            orphan_last_ack,
+            orphan_time_wait,
+            orphan_other_state,
+            orphan_retransmit_armed,
             receive_backpressured_sockets: self.tcp_receive_backpressured_count as u32,
             receive_window_bytes,
             receive_queued_bytes,
@@ -11813,6 +11860,20 @@ mod tests {
         let (flags, fin_sequence, _) =
             take_tcp_segment(&mut stack).expect("the close owes its peer a FIN");
         assert!(flags.contains(TcpFlags::FIN));
+        let finishing = stack.tcp_counters();
+        assert_eq!(
+            (
+                finishing.orphan_fin_wait_1,
+                finishing.orphan_fin_wait_2,
+                finishing.orphan_closing,
+                finishing.orphan_last_ack,
+                finishing.orphan_time_wait,
+                finishing.orphan_other_state,
+                finishing.orphan_retransmit_armed,
+            ),
+            (1, 0, 0, 0, 0, 0, 1),
+            "an orphan whose FIN is unacknowledged is in FIN-WAIT-1 with its timer armed"
+        );
 
         let time_wait_started = 3;
         deliver_peer_fin(
@@ -11821,6 +11882,18 @@ mod tests {
             peer,
             fin_sequence.wrapping_add(1),
             time_wait_started,
+        );
+        let waiting = stack.tcp_counters();
+        assert_eq!(
+            (
+                waiting.orphan_sockets,
+                waiting.orphan_fin_wait_1,
+                waiting.orphan_time_wait,
+                waiting.orphan_other_state,
+                waiting.orphan_retransmit_armed,
+            ),
+            (1, 0, 1, 0, 0),
+            "the peer's FIN-ACK leaves the orphan in TIME-WAIT with nothing in flight"
         );
         stack
             .drive_tcp(StackInstant::from_nanos(
@@ -11833,6 +11906,15 @@ mod tests {
                 swept.sockets,
                 swept.orphan_sockets,
                 swept.orphan_send_queued_bytes
+            ),
+            (0, 0, 0),
+            "a swept orphan leaves the counters"
+        );
+        assert_eq!(
+            (
+                swept.orphan_time_wait,
+                swept.orphan_other_state,
+                swept.orphan_retransmit_armed
             ),
             (0, 0, 0),
             "a swept orphan leaves the counters"

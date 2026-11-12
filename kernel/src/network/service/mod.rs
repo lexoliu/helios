@@ -240,6 +240,24 @@ pub struct NetworkQueueStats {
     /// What those orphans still owe their peers, in bytes: sent and
     /// unacknowledged plus queued and unsent.
     pub tcp_orphan_send_queued_bytes: u64,
+    /// Orphans in `FIN-WAIT-1`: their FIN is sent, unacknowledged.
+    pub tcp_orphan_fin_wait_1: u32,
+    /// Orphans in `FIN-WAIT-2`: their FIN is acknowledged, the peer's has
+    /// not arrived.
+    pub tcp_orphan_fin_wait_2: u32,
+    /// Orphans in `CLOSING`: both FINs crossed, theirs unacknowledged.
+    pub tcp_orphan_closing: u32,
+    /// Orphans in `LAST-ACK`: the peer closed first and their FIN is
+    /// unacknowledged.
+    pub tcp_orphan_last_ack: u32,
+    /// Orphans in `TIME-WAIT`: waiting out the 2MSL timer.
+    pub tcp_orphan_time_wait: u32,
+    /// Orphans in any other state (`CLOSED` awaiting the sweep,
+    /// `ESTABLISHED`, `CLOSE-WAIT`, `SYN-SENT`, `SYN-RECEIVED`).
+    pub tcp_orphan_other_state: u32,
+    /// Orphans whose retransmission timer is armed: a sent segment awaits
+    /// acknowledgement.
+    pub tcp_orphan_retransmit_armed: u32,
     /// How many of them are refusing segments for want of receive room.
     /// Nonzero with `tcp_sockets` at zero is a leaked window: the shard
     /// will refuse frames with no socket left that could relieve it.
@@ -735,6 +753,13 @@ where
                         tcp_sockets: tcp.sockets,
                         tcp_orphan_sockets: tcp.orphan_sockets,
                         tcp_orphan_send_queued_bytes: tcp.orphan_send_queued_bytes,
+                        tcp_orphan_fin_wait_1: tcp.orphan_fin_wait_1,
+                        tcp_orphan_fin_wait_2: tcp.orphan_fin_wait_2,
+                        tcp_orphan_closing: tcp.orphan_closing,
+                        tcp_orphan_last_ack: tcp.orphan_last_ack,
+                        tcp_orphan_time_wait: tcp.orphan_time_wait,
+                        tcp_orphan_other_state: tcp.orphan_other_state,
+                        tcp_orphan_retransmit_armed: tcp.orphan_retransmit_armed,
                         tcp_receive_backpressured_sockets: tcp.receive_backpressured_sockets,
                         tcp_receive_window_bytes: tcp.receive_window_bytes,
                         receive_queued_bytes: tcp.receive_queued_bytes,

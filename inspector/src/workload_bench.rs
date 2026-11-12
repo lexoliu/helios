@@ -438,8 +438,8 @@ pub(crate) struct WorkloadBenchCommand {
     pub(crate) llvm_raw_profile_output: Option<PathBuf>,
 
     /// Diagnosis: write the guest's network counters to stderr before the
-    /// first iteration of each workload and after its last. The samples
-    /// are taken outside every iteration's measured interval; the JSONL on
+    /// first iteration of each workload, after every iteration and after
+    /// the last. The samples are taken outside every iteration's measured interval; the JSONL on
     /// stdout is unchanged.
     #[arg(long)]
     pub(crate) network_counters: bool,
@@ -824,6 +824,17 @@ async fn measure_workload(
             stderr: stream_validation(workload, &output.stderr, workload.stderr_empty),
             validation,
         })?;
+        // Untimed: the iteration's interval closed when its runner returned
+        // (`elapsed_millis(started)`), before this request is sent.
+        if command.network_counters {
+            write_guest_network_counters(
+                client,
+                workload,
+                &format!("after iteration {iteration}"),
+                vcpus,
+            )
+            .await;
+        }
     }
     if command.network_counters {
         write_guest_network_counters(client, workload, "after", vcpus).await;
@@ -1465,7 +1476,10 @@ fn render_network_counters(
                 let _ = writeln!(
                     sink,
                     "shard {} rx={} tx={} irq={} refused={} device-refused={} \
-                     sockets={} orphan-sockets={} orphan-send-queued={} shut-sockets={} \
+                     sockets={} orphan-sockets={} orphan-fin-wait-1={} orphan-fin-wait-2={} \
+                     orphan-closing={} orphan-last-ack={} orphan-time-wait={} \
+                     orphan-other-state={} orphan-retransmit-armed={} \
+                     orphan-send-queued={} shut-sockets={} \
                      window-bytes={} queued={} ooo={} peer-rexmit={} dup-acks={} \
                      pool-stalls={} pool-free={} acks={} window-updates={} retransmits={}",
                     queue.id,
@@ -1476,6 +1490,13 @@ fn render_network_counters(
                     queue.rx_device_refusals,
                     queue.tcp_sockets,
                     queue.tcp_orphan_sockets,
+                    queue.tcp_orphan_fin_wait_1,
+                    queue.tcp_orphan_fin_wait_2,
+                    queue.tcp_orphan_closing,
+                    queue.tcp_orphan_last_ack,
+                    queue.tcp_orphan_time_wait,
+                    queue.tcp_orphan_other_state,
+                    queue.tcp_orphan_retransmit_armed,
                     queue.tcp_orphan_send_queued_bytes,
                     queue.tcp_receive_backpressured_sockets,
                     queue.tcp_receive_window_bytes,
@@ -1740,6 +1761,13 @@ mod tests {
             tcp_sockets: 9,
             tcp_orphan_sockets: 7,
             tcp_orphan_send_queued_bytes: 123_456,
+            tcp_orphan_fin_wait_1: 1,
+            tcp_orphan_fin_wait_2: 2,
+            tcp_orphan_closing: 3,
+            tcp_orphan_last_ack: 4,
+            tcp_orphan_time_wait: 5,
+            tcp_orphan_other_state: 6,
+            tcp_orphan_retransmit_armed: 8,
             tcp_receive_backpressured_sockets: 0,
             tcp_receive_window_bytes: 0,
             receive_queued_bytes: 0,
@@ -1760,7 +1788,11 @@ mod tests {
         );
         let block = String::from_utf8(block).expect("the block is text");
         assert!(block.starts_with("--- workload tcp-upload before network counters ---\n"));
-        assert!(block.contains("sockets=9 orphan-sockets=7 orphan-send-queued=123456 "));
+        assert!(block.contains(
+            "sockets=9 orphan-sockets=7 orphan-fin-wait-1=1 orphan-fin-wait-2=2 \
+             orphan-closing=3 orphan-last-ack=4 orphan-time-wait=5 orphan-other-state=6 \
+             orphan-retransmit-armed=8 orphan-send-queued=123456 "
+        ));
         assert!(block.ends_with("--- end of workload tcp-upload before network counters ---\n"));
     }
 

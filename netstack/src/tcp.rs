@@ -1284,6 +1284,15 @@ where
         u64::from(self.bytes_in_flight) + unsent
     }
 
+    /// Whether the retransmission timer is armed: a sent segment awaits
+    /// acknowledgement, and [`Self::next_deadline_nanos`] includes its
+    /// retransmission deadline.
+    pub fn retransmission_timer_armed(&self) -> bool {
+        self.in_flight
+            .as_ref()
+            .is_some_and(|in_flight| in_flight.front().is_some())
+    }
+
     /// Data held in the out-of-order reassembly queue, in bytes.
     pub fn out_of_order_queued_bytes(&self) -> usize {
         self.out_of_order_queued_bytes
