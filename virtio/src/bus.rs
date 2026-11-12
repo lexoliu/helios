@@ -3,6 +3,7 @@ use core::alloc::Layout;
 use core::future::Future;
 use core::ptr::NonNull;
 
+use futures_lite::future::yield_now;
 use helios_hal::dma::{DeviceAddress, DmaAddressing, DmaBuffer, DmaError, DmaMemory, DmaSpaceMark};
 use helios_hal::io::{IoError, IoResult};
 use helios_hal::iommu::{DmaAccess, DmaTranslation};
@@ -146,14 +147,20 @@ impl DmaMemory for IdentityDmaPool {
         Ok(IdentityDmaBuffer { ptr, layout })
     }
 
-    /// Heap memory is never being replenished: an allocation either
-    /// succeeds or is refused for good, so there is no space to wait for
-    /// and a wait resolves at once.
+    /// Heap memory has no signal for space coming back: a refusal is not
+    /// for good, because the allocator can satisfy the same request once
+    /// anything frees memory, but nothing announces it. There is no
+    /// generation to sample.
     fn want_space(&self) -> DmaSpaceMark {
         DmaSpaceMark::new(0)
     }
 
-    async fn space_changed(&self, _mark: DmaSpaceMark) {}
+    /// A wait is one yield to the executor: a caller that asks again
+    /// polls the heap at the executor's pace, never in a loop that
+    /// cannot return `Pending`.
+    async fn space_changed(&self, _mark: DmaSpaceMark) {
+        yield_now().await;
+    }
 
     fn short_of_space(&self) -> bool {
         false
@@ -210,14 +217,20 @@ impl DmaMemory for OffsetDmaPool {
         })
     }
 
-    /// Heap memory is never being replenished: an allocation either
-    /// succeeds or is refused for good, so there is no space to wait for
-    /// and a wait resolves at once.
+    /// Heap memory has no signal for space coming back: a refusal is not
+    /// for good, because the allocator can satisfy the same request once
+    /// anything frees memory, but nothing announces it. There is no
+    /// generation to sample.
     fn want_space(&self) -> DmaSpaceMark {
         DmaSpaceMark::new(0)
     }
 
-    async fn space_changed(&self, _mark: DmaSpaceMark) {}
+    /// A wait is one yield to the executor: a caller that asks again
+    /// polls the heap at the executor's pace, never in a loop that
+    /// cannot return `Pending`.
+    async fn space_changed(&self, _mark: DmaSpaceMark) {
+        yield_now().await;
+    }
 
     fn short_of_space(&self) -> bool {
         false
@@ -519,12 +532,18 @@ unsafe impl<P: Sync> Sync for MmioBus<P> {}
 
 #[cfg(test)]
 mod tests {
+    use alloc::sync::Arc;
+    use alloc::task::Wake;
     use core::alloc::Layout;
+    use core::future::Future;
+    use core::pin::pin;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::task::{Context, Poll, Waker};
 
     use helios_hal::dma::{DeviceAddress, DmaAddressing, DmaBuffer, DmaError, DmaMemory};
     use helios_hal::iommu::{DmaAccess, DmaTranslation, DmaWindow, IoVirtAddr};
 
-    use super::{IdentityDmaPool, PlatformDmaPool};
+    use super::{IdentityDmaPool, OffsetDmaPool, PlatformDmaPool};
 
     /// A platform with no translation unit hands the device physical
     /// addresses and must not ask it to negotiate anything.
@@ -615,6 +634,44 @@ mod tests {
                 bytes: 32,
             })
         );
+    }
+
+    /// Counts its wakes, so a test can tell a yield from a park nobody
+    /// will end.
+    struct WakeCount(AtomicUsize);
+
+    impl Wake for WakeCount {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Polls `wait` twice and checks the shape of a yield: pending on the
+    /// first poll with the task woken, ready on the second.
+    fn assert_is_one_yield(wait: impl Future<Output = ()>) {
+        let count = Arc::new(WakeCount(AtomicUsize::new(0)));
+        let waker = Waker::from(count.clone());
+        let mut context = Context::from_waker(&waker);
+        let mut wait = pin!(wait);
+
+        assert_eq!(wait.as_mut().poll(&mut context), Poll::Pending);
+        assert_eq!(
+            count.0.load(Ordering::SeqCst),
+            1,
+            "a pending wait woke its task, or nothing would poll it again"
+        );
+        assert_eq!(wait.as_mut().poll(&mut context), Poll::Ready(()));
+    }
+
+    /// Heap memory announces nothing when it comes back, so a caller that
+    /// follows `want_space` and parks on `space_changed` has to be handed
+    /// back to the executor, or its retry loop never returns `Pending`.
+    #[test]
+    fn waiting_for_heap_memory_yields_once() {
+        let identity = IdentityDmaPool;
+        assert_is_one_yield(identity.space_changed(identity.want_space()));
+        let offset = OffsetDmaPool::new(0);
+        assert_is_one_yield(offset.space_changed(offset.want_space()));
     }
 
     /// A buffer the domain does not map would fault inside the device.
