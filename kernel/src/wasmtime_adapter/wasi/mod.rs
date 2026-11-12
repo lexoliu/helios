@@ -66,7 +66,7 @@ const DEFAULT_WASI_TCP_LISTEN_BACKLOG: u16 = 128;
 const DEFAULT_WASI_TCP_KEEP_ALIVE_IDLE_NANOS: u64 = 7_200_000_000_000;
 const DEFAULT_WASI_TCP_KEEP_ALIVE_INTERVAL_NANOS: u64 = 75_000_000_000;
 const DEFAULT_WASI_TCP_KEEP_ALIVE_COUNT: u32 = 9;
-const MAX_WASI_UDP_DATAGRAM_BYTES: usize = u16::MAX as usize;
+pub(crate) const MAX_WASI_UDP_DATAGRAM_BYTES: usize = u16::MAX as usize;
 
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 #[error("guest requested wasi preview2 exit code {code}")]
