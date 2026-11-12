@@ -586,6 +586,20 @@ impl ReservationTracker {
             .sum()
     }
 
+    /// Every committed, unsubstituted region with a real owner, as
+    /// `(owner, bytes)`: [`Self::owned_resident_bytes`] for every owner
+    /// in one walk, the caller summing. Allocates nothing.
+    pub fn visit_owned_resident_bytes<Visit>(&self, mut visit: Visit)
+    where
+        Visit: FnMut(MemoryOwner, u64),
+    {
+        self.reservations
+            .iter()
+            .flat_map(|reservation| reservation.committed.iter())
+            .filter(|region| !region.owner.is_none() && !region.substituted)
+            .for_each(|region| visit(region.owner, region.range.byte_len as u64));
+    }
+
     /// Pages `owner` has swapped out across every reservation.
     pub fn owned_swapped_pages(&self, owner: MemoryOwner) -> usize {
         self.reservations

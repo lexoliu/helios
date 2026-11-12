@@ -59,6 +59,15 @@ impl AddressSpace for FakeAddressSpace {
     fn translate(&self, _addr: VirtAddr) -> Translation {
         Translation::Unmapped
     }
+    fn owned_resident_bytes(&self, _owner: u64) -> u64 {
+        unimplemented!("compactor never reads residency")
+    }
+    fn visit_owned_resident_bytes<Visit>(&self, _visit: Visit)
+    where
+        Visit: FnMut(u64, u64),
+    {
+        unimplemented!("compactor never reads residency")
+    }
     fn relocate(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
         self.relocate_log.lock().unwrap().push(virt);
         let mut outcomes = self.relocate_outcomes.lock().unwrap();
