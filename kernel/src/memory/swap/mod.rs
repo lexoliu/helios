@@ -2023,7 +2023,13 @@ where
         let policy = self.handle.shared.policy.load();
 
         // A page of zeros has no storage. The scan reads whole words.
-        if self.page.chunks_exact(8).all(|word| word == [0; 8]) {
+        if self
+            .page
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .all(|word| *word == [0; 8])
+        {
             let shared = &self.handle.shared;
             shared.restore(claim, SlotState::Zero);
             let counters = shared.counters.here();

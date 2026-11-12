@@ -1013,6 +1013,12 @@ impl SwapLeafFormat for Aarch64UserAddressSpace {
             .checked_sub(self.physical_memory_offset)
             .expect("a user frame lies in the kernel's physical memory map");
         let descriptor = (phys as u64) | pte_flags | PAGE_DESCRIPTOR | AF | SH_INNER;
+        if flags.contains(PageFlags::EXECUTE) {
+            // The bytes were written through the direct map, and the frame's
+            // earlier user may have left its own code in an instruction
+            // cache: publish them before the leaf makes them fetchable.
+            crate::make_instructions_coherent(frame.as_ptr(), PAGE);
+        }
         // SAFETY: as above. The frame's bytes are ordered before the
         // descriptor that exposes them, and the descriptor before any
         // walk that can see it.

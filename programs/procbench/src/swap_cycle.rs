@@ -200,7 +200,7 @@ fn fill_page(content: Content, seed: u64, index: u64, page: &mut [u8]) {
     match content.of_page(index) {
         PageContent::Random => {
             let mut generator = SplitMix64(seed ^ index);
-            for word in page.chunks_exact_mut(size_of::<u64>()) {
+            for word in page.as_chunks_mut::<{ size_of::<u64>() }>().0 {
                 word.copy_from_slice(&generator.next().to_le_bytes());
             }
         }
@@ -451,7 +451,12 @@ pub(crate) async fn swap_child(args: impl Iterator<Item = String>) -> Result<(),
         .try_reserve_exact(bytes)
         .map_err(|_| ProcbenchError::HogAllocation { bytes })?;
     region.resize(bytes, 0);
-    for (index, page) in region.chunks_exact_mut(PAGE_BYTES).enumerate() {
+    for (index, page) in region
+        .as_chunks_mut::<PAGE_BYTES>()
+        .0
+        .iter_mut()
+        .enumerate()
+    {
         fill_page(content, seed, index as u64, page);
     }
     if let Some(page) = corrupt_page {
@@ -475,7 +480,7 @@ pub(crate) async fn swap_child(args: impl Iterator<Item = String>) -> Result<(),
     }
 
     let mut expected = [0u8; PAGE_BYTES];
-    for (index, page) in region.chunks_exact(PAGE_BYTES).enumerate() {
+    for (index, page) in region.as_chunks::<PAGE_BYTES>().0.iter().enumerate() {
         fill_page(content, seed, index as u64, &mut expected);
         if let Some(offset) = page.iter().zip(&expected).position(|(a, e)| a != e) {
             return Err(ProcbenchError::PageMismatch {

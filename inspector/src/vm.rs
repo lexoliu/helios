@@ -7055,7 +7055,7 @@ mod tests {
         let path = directory.join("helios-kernel.profdata");
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&0x8169_666f_7270_6cffu64.to_le_bytes());
-        bytes.extend_from_slice(&(13u64 | 1 << 56).to_le_bytes());
+        bytes.extend_from_slice(&(14u64 | 1 << 56).to_le_bytes());
         fs::write(&path, bytes).expect("writing the profile header");
         path
     }
@@ -7583,7 +7583,7 @@ mod tests {
             .expect_err("a profile this toolchain cannot read never reaches cargo");
         assert!(matches!(error, VmConfigError::ProfileUse(_)), "{error}");
         assert!(error.to_string().contains("version 9"), "{error}");
-        assert!(error.to_string().contains("version 13"), "{error}");
+        assert!(error.to_string().contains("version 14"), "{error}");
     }
 
     #[test]

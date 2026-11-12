@@ -3,6 +3,7 @@ package helios:kernel@0.1.0;
 world init {
   include wasi:cli/command@0.3.0;
   import helios:system/programs@0.1.0;
+  import helios:system/mounts@0.1.0;
   import helios:system/net@0.1.0;
   import helios:system/vsock@0.1.0;
   import helios:system/stats@0.1.0;
@@ -22,6 +23,7 @@ world init {
 world debugger{
   include wasi:cli/command@0.3.0;
   import helios:system/programs@0.1.0;
+  import helios:system/mounts@0.1.0;
   import helios:system/net@0.1.0;
   import helios:system/vsock@0.1.0;
   import helios:system/stats@0.1.0;

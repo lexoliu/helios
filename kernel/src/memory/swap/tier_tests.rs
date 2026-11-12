@@ -40,9 +40,11 @@ fn text_page(number: usize) -> Vec<u8> {
     static PAGES: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
     PAGES
         .get_or_init(|| {
-            TEXT.chunks_exact(PAGE)
-                .filter(|page| compresses_under_the_gate(page))
-                .map(<[u8]>::to_vec)
+            TEXT.as_chunks::<PAGE>()
+                .0
+                .iter()
+                .filter(|page| compresses_under_the_gate(page.as_slice()))
+                .map(|page| page.to_vec())
                 .collect()
         })
         .get(number)
