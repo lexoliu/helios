@@ -15,32 +15,33 @@
 //! view, so a call the plugin stops waiting for shows nothing; what the
 //! device made for it goes back through a [`PendingReply`].
 //!
-//! The claim lives in the instance's store, so it is single-owned: the
-//! resource handles a plugin holds carry the claim generation to check
-//! against and nothing else. A handle that outlived a release names an
-//! engine its instance no longer holds and is refused, rather than
-//! being answered against whoever holds it now.
+//! The session lives in the instance's store, so it is single-owned:
+//! the resource handles a plugin holds carry the session id to check
+//! against and nothing else. A handle that outlived its session names
+//! resources the session's end already handed back, and is refused
+//! `session-ended`.
 //!
 //! # Concurrency contract
 //!
-//! Every call here runs on the task that owns the store, so the claim
+//! Every call here runs on the task that owns the store, so the session
 //! and the view table need no lock, and every view is shown and ended by
-//! that task alone; a context's last-submitted fence is a `Cell` for the
-//! same reason. What is shared is the two queues into the owner tasks,
-//! which carry their own synchronisation, the buffers, whose counts are
-//! atomic, and the fence signal each context was created with, which
-//! the submit server publishes every retired fence to.
+//! that task alone. A submission's fence is checked against its ring
+//! and the submission queued in one step of that task, so the submit
+//! queue holds every ring's commands in fence order. What is shared is
+//! the two queues into the owner tasks, which carry their own
+//! synchronisation, the buffers, whose counts are atomic, and each
+//! context's rings, whose fence streams the submit server publishes.
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::cell::Cell;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
 use futures::channel::oneshot;
 use helios_hal::device::DeviceRegion;
 use helios_hal::display::{
-    BlobId, BlobMemory, BlobUsage, CapsetId, ContextId, ContextName, FenceId, MAX_CONTEXT_NAME,
+    BlobId, BlobMemory, BlobUsage, CapsetId, ContextId, ContextName, MAX_CONTEXT_NAME, RingCount,
+    RingIndex,
 };
 use helios_hal::iommu::PhysicalRange;
 use triomphe::Arc;
@@ -52,8 +53,10 @@ use wasmtime::component::{
 
 use crate::ComponentHostNetwork;
 use crate::buffer::{Buffer, GuestMemory, Span, ViewError, ViewGroup, ViewId, ViewTable};
-use crate::display::SequenceSignal;
-use crate::gpu::{BlobSpec, Gpu3dRequest, Gpu3dSender, Gpu3dServiceError, SubmitRequest};
+use crate::gpu::{
+    BlobShared, BlobSpec, ContextShared, Gpu3dRequest, Gpu3dSender, Gpu3dServiceError,
+    InlineCommands, MAX_EXECUTE_BYTES, SessionId, SubmitCommands, SubmitRequest,
+};
 use crate::wasmtime_adapter::bindings::gpu::bindings::helios::system::gpu as gpu_wit;
 
 use super::super::{PendingReply, StoreData, guest_memory, view_trap};
@@ -62,7 +65,7 @@ use super::super::{PendingReply, StoreData, guest_memory, view_trap};
 ///
 /// Every program linker gets it, for the reason the display interface
 /// does: linkage is cached per binary while authority belongs to the
-/// instance. The claim checks the instance's GPU device class, and an
+/// instance. `open` checks the instance's GPU device class, and an
 /// instance without it is told `unavailable`, which is what a machine
 /// with no 3D service tells every program.
 pub(in crate::wasmtime_adapter::component_host) fn add_gpu_to_linker<CpuImpl, Net, HostFs>(
@@ -76,48 +79,47 @@ where
     gpu_wit::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, HostFs>>>(linker, |state| state)
 }
 
-/// A plugin's hold on the 3D engine, as its store records it.
+/// One of a plugin's `gpu` handles, as its store records it.
 ///
-/// It carries the generation and nothing else: the claim itself is in
-/// the store's [`crate::Gpu3dOwnership`], which is what the store's own
-/// drop releases.
+/// It carries the session id and nothing else: the session itself is
+/// in the store's [`crate::Gpu3dOwnership`], which counts the handles
+/// holding it and which the store's own drop ends.
 pub struct GpuHandle {
-    generation: u64,
+    session: SessionId,
 }
 
 /// One renderer context, as its store records it.
 pub struct ContextHandle {
-    generation: u64,
-    id: ContextId,
-    /// Every fence retired on this context, shared with the submit
-    /// server that publishes them.
-    fences: Arc<SequenceSignal>,
-    /// The newest fence this context has submitted. A `Cell` because
-    /// every call here runs on the task that owns the store: the
-    /// increasing-fence rule is the guest's own order, checked where
-    /// the guest's calls are already serialised.
-    submitted: Cell<u64>,
+    session: SessionId,
+    /// The context's identity, rings and fault state, shared with the
+    /// submit server that retires its fences.
+    shared: Arc<ContextShared>,
 }
 
 /// One pinned command buffer, as its store records it.
 ///
-/// Its view is in the claim's set, so a release ends it; the handle's
-/// own drop ends it only while the claim it was made under lives.
+/// Its view is in the session's set, so the session's end ends it; the
+/// handle's own drop ends it only while the session it was made under
+/// is open.
 pub struct CommandBufferHandle {
-    pub(crate) generation: u64,
+    pub(crate) session: SessionId,
     pub(crate) buffer: Buffer,
     pub(crate) view: ViewId,
 }
 
 /// One blob resource, as its store records it.
 ///
-/// Both views are in the claim's set, for the reason a command buffer's
-/// is.
+/// Both views are in the session's set, for the reason a command
+/// buffer's is.
 pub struct BlobHandle {
-    pub(crate) generation: u64,
+    pub(crate) session: SessionId,
     pub(crate) id: BlobId,
-    /// The view of the instance's buffer backing it, for the
-    /// guest-backed kinds.
+    /// What the owner task and every scanout of the blob share: a
+    /// surface made from the blob takes a hold on it, so the blob
+    /// outlives this handle for as long as a scanout shows it.
+    pub(crate) shared: Arc<BlobShared>,
+    /// The view of the blob's own pages in the instance's memory, for
+    /// the guest-backed kinds.
     pub(crate) backing: Option<ViewId>,
     /// The view of its aperture placement, once `map-blob` has put one
     /// there.
@@ -128,17 +130,19 @@ fn to_wit_error(error: Gpu3dServiceError) -> gpu_wit::Error {
     match error {
         Gpu3dServiceError::Unavailable => gpu_wit::Error::Unavailable,
         Gpu3dServiceError::NoRenderer => gpu_wit::Error::NoRenderer,
-        Gpu3dServiceError::AlreadyClaimed => gpu_wit::Error::AlreadyClaimed,
-        Gpu3dServiceError::NotClaimed => gpu_wit::Error::NotClaimed,
+        Gpu3dServiceError::SessionEnded => gpu_wit::Error::SessionEnded,
         Gpu3dServiceError::NoSuchCapset => gpu_wit::Error::NoSuchCapset,
         Gpu3dServiceError::UnsupportedContext => gpu_wit::Error::UnsupportedContext,
         Gpu3dServiceError::TooManyContexts => gpu_wit::Error::TooManyContexts,
         Gpu3dServiceError::TooManyBlobs => gpu_wit::Error::TooManyBlobs,
+        Gpu3dServiceError::ContextsExhausted => gpu_wit::Error::ContextsExhausted,
+        Gpu3dServiceError::BlobsExhausted => gpu_wit::Error::BlobsExhausted,
         Gpu3dServiceError::TooManyViews => gpu_wit::Error::TooManyViews,
         Gpu3dServiceError::InvalidBlob => gpu_wit::Error::InvalidBlob,
         Gpu3dServiceError::ApertureExhausted => gpu_wit::Error::ApertureExhausted,
         Gpu3dServiceError::OutOfBounds => gpu_wit::Error::OutOfBounds,
-        Gpu3dServiceError::FenceNotIncreasing => gpu_wit::Error::StaleFence,
+        Gpu3dServiceError::BadRing => gpu_wit::Error::BadRing,
+        Gpu3dServiceError::StaleFence => gpu_wit::Error::StaleFence,
         Gpu3dServiceError::BadSpan(_) | Gpu3dServiceError::BlobSpanMismatch => {
             gpu_wit::Error::BadSpan
         }
@@ -200,39 +204,33 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    /// The queue into the 3D owner, checked against `generation`.
-    fn gpu_sender(&self, generation: u64) -> Result<Gpu3dSender, Gpu3dServiceError> {
-        let claim = self.device.gpu().claim_ref()?;
-        if claim.generation() != generation {
-            return Err(Gpu3dServiceError::NotClaimed);
-        }
-        Ok(claim.sender())
+    /// The queue into the 3D owner, for session `session` if it is the
+    /// one open now.
+    fn gpu_sender(&self, session: SessionId) -> Result<Gpu3dSender, Gpu3dServiceError> {
+        Ok(self.device.gpu().session_of(session)?.sender())
     }
 
     /// The physical run `offset`/`length` name inside `commands`,
-    /// checked against `generation` — the live claim's — and the buffer
-    /// it lies in, for the request to hold while the device reads it.
+    /// checked against `session` — the live one's — and the buffer it
+    /// lies in, for the request to hold while the device reads it.
     ///
-    /// A buffer pinned under an older claim was shown in a set the
-    /// release has already ended, so the refusal is the WIT's answer for
-    /// a dead claim, not a bounds one.
+    /// A buffer pinned under an ended session was shown in a set the
+    /// end has already ended, so the refusal is the WIT's answer for an
+    /// ended session, not a bounds one.
     pub(crate) fn command_range(
         &mut self,
         commands: &Resource<CommandBufferHandle>,
         offset: u64,
         length: u64,
-        generation: u64,
-    ) -> wasmtime::Result<Result<(Buffer, PhysicalRange), gpu_wit::Error>> {
+        session: SessionId,
+    ) -> wasmtime::Result<Result<SubmitCommands, gpu_wit::Error>> {
         let commands = self.table.get(commands)?;
-        if commands.generation != generation {
-            return Ok(Err(gpu_wit::Error::NotClaimed));
+        if commands.session != session {
+            return Ok(Err(gpu_wit::Error::SessionEnded));
         }
         // The submission is a run of the buffer's own pages: the
         // physical run is what the device reads, and it has to lie
-        // inside the run the buffer covers. An empty run is the
-        // device's to refuse, not ours: its fence still has to retire,
-        // and a fence spent here would never reach the stream the
-        // reader waits on.
+        // inside the run the buffer covers.
         let Some(end) = offset.checked_add(length) else {
             return Ok(Err(gpu_wit::Error::OutOfBounds));
         };
@@ -240,53 +238,46 @@ where
             return Ok(Err(gpu_wit::Error::OutOfBounds));
         }
         let physical = commands.buffer.physical();
-        Ok(Ok((
-            commands.buffer.clone(),
-            PhysicalRange::new(physical.start + offset, length),
-        )))
+        Ok(Ok(SubmitCommands::Pages {
+            buffer: commands.buffer.clone(),
+            range: PhysicalRange::new(physical.start + offset, length),
+        }))
     }
 
-    /// End `view`, one of the claim's set, if the claim made under
-    /// `generation` still holds the engine.
+    /// End `view`, one of the session's set, if session `session` is
+    /// still open.
     ///
-    /// A handle that outlived its claim names a view the release already
+    /// A handle that outlived its session names a view the end already
     /// ended with the rest of the set, and ending it again would be a
     /// view the table never made.
-    fn end_claim_view(&mut self, generation: u64, view: ViewId) -> wasmtime::Result<()> {
-        if self
-            .device
-            .gpu()
-            .claim_ref()
-            .is_ok_and(|claim| claim.generation() == generation)
-        {
+    fn end_session_view(&mut self, session: SessionId, view: ViewId) -> wasmtime::Result<()> {
+        if self.device.gpu().is_current(session) {
             self.views.end(view).map_err(view_trap)?;
         }
         Ok(())
     }
 
-    /// Show something in the set of the claim made under `generation`,
-    /// which is the last step of every call that shows a view.
+    /// Show something in the set of session `session`, which is the
+    /// last step of every call that shows a view.
     ///
-    /// The claim may have been let go, or let go and taken again, while
-    /// the call was waiting on the owner task; a view in a later claim's
-    /// set would outlive the handle that names it.
-    fn show_in_claim(
+    /// The session may have ended, or ended and been opened again,
+    /// while the call was waiting on the owner task; a view in a later
+    /// session's set would outlive the handle that names it.
+    fn show_in_session(
         &mut self,
-        generation: u64,
+        session: SessionId,
         show: impl FnOnce(&mut ViewTable, ViewGroup) -> Result<ViewId, ViewError>,
     ) -> Result<ViewId, Gpu3dServiceError> {
-        if self.device.gpu().claim_ref()?.generation() != generation {
-            return Err(Gpu3dServiceError::NotClaimed);
-        }
+        self.device.gpu().session_of(session)?;
         let group = self.device.gpu().room_for_view(&self.views)?;
         Ok(show(&mut self.views, group)?)
     }
 
-    /// Check `at` of `memory` for an object of `bytes`, and the claim's
+    /// Check `at` of `memory` for an object of `bytes`, and the session's
     /// room for one more view: the early half of every call that shows
     /// a view, run before anything is pinned or the owner task is told
     /// anything, so a span the table would refuse costs nothing.
-    fn check_claim_span(
+    fn check_session_span(
         &self,
         memory: GuestMemory,
         at: Span,
@@ -297,18 +288,18 @@ where
         Ok(())
     }
 
-    /// Check `at` as [`Self::check_claim_span`] does, then pin a buffer
-    /// of `bytes` for showing there.
+    /// Check `at` as [`Self::check_session_span`] does, then pin a
+    /// buffer of `bytes` for showing there.
     ///
     /// Called inside the host call, so the run is charged to the calling
     /// instance's pool. Nothing is shown.
-    fn pin_claim_buffer(
+    fn pin_session_buffer(
         &self,
         memory: GuestMemory,
         at: Span,
         bytes: u64,
     ) -> Result<Buffer, Gpu3dServiceError> {
-        self.check_claim_span(memory, at, bytes)?;
+        self.check_session_span(memory, at, bytes)?;
         Ok(Buffer::pinned(bytes)?)
     }
 }
@@ -347,14 +338,14 @@ where
     memory_of(access).expect("a store whose memory took the span in the call's first step has one")
 }
 
-/// Tell the owner task to let go of something this claim made, without
-/// the store and without waiting.
+/// Tell the owner task to let go of something this session made,
+/// without the store and without waiting.
 ///
 /// A resource drop and a host call the guest stopped waiting for are
 /// both synchronous here and the engine is not, so the work is handed to
 /// a task rather than awaited. It cannot be lost for good: if the task
-/// cannot be spawned, or the instance dies before it runs, the claim's
-/// own release lets go of everything the claim made.
+/// cannot be spawned, or the instance dies before it runs, the
+/// session's own end lets go of everything the session made.
 fn spawn_gpu_cleanup<CpuImpl>(
     spawner: &crate::InstanceSpawner<CpuImpl>,
     sender: Gpu3dSender,
@@ -372,25 +363,21 @@ fn spawn_gpu_cleanup<CpuImpl>(
         }
     });
     if let Err(error) = spawned {
-        // The task arena is full. Nothing is leaked — the claim's own
-        // release lets go of the same resource — but the engine holds it
+        // The task arena is full. Nothing is leaked — the session's own
+        // end lets go of the same resource — but the engine holds it
         // until then, and that is worth saying.
         tracing::warn!(
             target: "helios_kernel::gpu",
             %error,
-            "a resource stays with the 3D engine until the claim ends"
+            "a resource stays with the 3D engine until the session ends"
         );
     }
 }
 
 /// An `UnmapBlob` nobody waits for the answer to.
-fn unmap_request(generation: u64, blob: BlobId) -> Gpu3dRequest {
+fn unmap_request(blob: BlobId) -> Gpu3dRequest {
     let (reply, _) = oneshot::channel();
-    Gpu3dRequest::UnmapBlob {
-        generation,
-        blob,
-        reply,
-    }
+    Gpu3dRequest::UnmapBlob { blob, reply }
 }
 
 impl<CpuImpl, Net, HostFs> gpu_wit::Host for StoreData<CpuImpl, Net, HostFs>
@@ -399,30 +386,25 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    fn claim(&mut self) -> wasmtime::Result<Result<Resource<GpuHandle>, gpu_wit::Error>> {
+    fn open(&mut self) -> wasmtime::Result<Result<Resource<GpuHandle>, gpu_wit::Error>> {
         let Some(service) = self.runtime_state.gpu3d_service() else {
             return Ok(Err(gpu_wit::Error::Unavailable));
         };
         // Without the GPU class the answer is the one a machine with no
         // 3D service gives, not `no-renderer`, which would say the
         // machine has a device that renders nothing.
-        let Ok(cap) = self.process_authority().derive_gpu_claim_cap() else {
+        let Ok(cap) = self.process_authority().derive_gpu_open_cap() else {
             return Ok(Err(gpu_wit::Error::Unavailable));
         };
-        if let Err(error) = self.device.claim_gpu(&service, &mut self.views, cap) {
-            return Ok(Err(to_wit_error(error)));
-        }
-        let generation = self
-            .device
-            .gpu()
-            .claim_ref()
-            .expect("a successful claim leaves one")
-            .generation();
-        let handle = self.table.push(GpuHandle { generation })?;
+        let session = match self.device.open_gpu(&service, &mut self.views, cap) {
+            Ok(session) => session,
+            Err(error) => return Ok(Err(to_wit_error(error))),
+        };
+        let handle = self.table.push(GpuHandle { session })?;
         tracing::info!(
             target: "helios_kernel::gpu",
-            generation,
-            "an instance took ownership of the 3D engine"
+            session = session.raw(),
+            "an instance holds the 3D engine"
         );
         Ok(Ok(handle))
     }
@@ -436,22 +418,14 @@ where
 {
     fn drop(&mut self, handle: Resource<GpuHandle>) -> wasmtime::Result<()> {
         let handle = self.table.delete(handle)?;
-        // Dropping the handle is a plugin saying it is done, and it
-        // costs exactly what dying costs: every view of the claim ended,
-        // every context and blob released and every aperture placement
-        // undone before the engine is offered to anyone else.
-        if self
-            .device
-            .gpu()
-            .claim_ref()
-            .is_ok_and(|claim| claim.generation() == handle.generation)
-        {
-            self.device
-                .gpu_mut()
-                .release(&mut self.views)
-                .map_err(view_trap)?;
-        }
-        Ok(())
+        // Dropping the last handle is a plugin saying it is done, and it
+        // costs exactly what dying costs: every view of the session
+        // ended, every context and blob it made released and every
+        // aperture placement undone.
+        self.device
+            .gpu_mut()
+            .close(handle.session, &mut self.views)
+            .map_err(view_trap)
     }
 }
 
@@ -464,21 +438,16 @@ where
     fn drop(&mut self, handle: Resource<ContextHandle>) -> wasmtime::Result<()> {
         let context = self.table.delete(handle)?;
         // The context is let go through the owner task, which destroys
-        // it on the device; a context dropped by an instance that no
-        // longer holds the engine has already had that done for it.
-        let Ok(claim) = self.device.gpu().claim_ref() else {
+        // it on the device; a context of a session that has ended has
+        // already had that done for it.
+        let Ok(sender) = self.gpu_sender(context.session) else {
             return Ok(());
         };
-        if claim.generation() != context.generation {
-            return Ok(());
-        }
-        let sender = claim.sender();
         spawn_gpu_cleanup(
             self.spawner(),
             sender,
             Gpu3dRequest::DestroyContext {
-                generation: context.generation,
-                context: context.id,
+                context: context.shared.id(),
             },
         );
         Ok(())
@@ -496,7 +465,7 @@ where
         // The span is the instance's ordinary memory again at once. The
         // run goes back to the pool when the last submission still
         // naming it has been answered, because each one holds it.
-        self.end_claim_view(commands.generation, commands.view)
+        self.end_session_view(commands.session, commands.view)
     }
 }
 
@@ -506,6 +475,10 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
+    fn resource_id(&mut self, handle: Resource<BlobHandle>) -> wasmtime::Result<u32> {
+        Ok(self.table.get(&handle)?.id.raw())
+    }
+
     fn drop(&mut self, handle: Resource<BlobHandle>) -> wasmtime::Result<()> {
         let blob = self.table.delete(handle)?;
         // The instance's views end first — a span still showing the
@@ -513,42 +486,33 @@ where
         // name whatever the engine places there next — and then the
         // device is told through the owner task, which unmaps a
         // still-placed blob before it destroys it and drops its
-        // reference to the blob's buffer after. A blob dropped by an
-        // instance that no longer holds the engine has already had all
-        // of that done for it.
-        let Ok(claim) = self.device.gpu().claim_ref() else {
+        // reference to the blob's buffer after. A blob of a session that
+        // has ended has already had all of that done for it.
+        let Ok(sender) = self.gpu_sender(blob.session) else {
             return Ok(());
         };
-        if claim.generation() != blob.generation {
-            return Ok(());
-        }
-        let sender = claim.sender();
         for view in [blob.mapped, blob.backing].into_iter().flatten() {
             self.views.end(view).map_err(view_trap)?;
         }
         spawn_gpu_cleanup(
             self.spawner(),
             sender,
-            Gpu3dRequest::DestroyBlob {
-                generation: blob.generation,
-                blob: blob.id,
-            },
+            Gpu3dRequest::DestroyBlob { blob: blob.id },
         );
         Ok(())
     }
 }
 
-/// The claim generation a gpu handle names, and the queue into the
-/// owner task.
+/// The session a gpu handle names, and the queue into the owner task.
 ///
 /// Every call that reaches the display engine starts here, and the
 /// store is given back before anything is awaited: an `Access` guard
 /// held across a wait would hold the store for as long as the engine
 /// takes.
-fn claim_of<U, CpuImpl, Net, HostFs>(
+fn session_of<U, CpuImpl, Net, HostFs>(
     mut access: Access<'_, U, HasSelf<StoreData<CpuImpl, Net, HostFs>>>,
     handle: &Resource<GpuHandle>,
-) -> wasmtime::Result<Result<(u64, Gpu3dSender), gpu_wit::Error>>
+) -> wasmtime::Result<Result<(SessionId, Gpu3dSender), gpu_wit::Error>>
 where
     U: 'static,
     CpuImpl: helios_hal::cpu::Cpu + Clone,
@@ -556,19 +520,19 @@ where
     HostFs: crate::HostFileSystem,
 {
     let data = access.get();
-    let generation = data.table.get(handle)?.generation;
+    let session = data.table.get(handle)?.session;
     Ok(data
-        .gpu_sender(generation)
-        .map(|sender| (generation, sender))
+        .gpu_sender(session)
+        .map(|sender| (session, sender))
         .map_err(to_wit_error))
 }
 
-/// What a blob call needs from the store before it waits: the
-/// generation, the blob and the sender, checked together.
-fn blob_claim<U, CpuImpl, Net, HostFs>(
+/// What a blob call needs from the store before it waits: the session,
+/// the blob and the sender, checked together.
+fn blob_session<U, CpuImpl, Net, HostFs>(
     mut access: Access<'_, U, HasSelf<StoreData<CpuImpl, Net, HostFs>>>,
     handle: &Resource<BlobHandle>,
-) -> wasmtime::Result<Result<(u64, BlobId, Gpu3dSender), gpu_wit::Error>>
+) -> wasmtime::Result<Result<(SessionId, BlobId, Gpu3dSender), gpu_wit::Error>>
 where
     U: 'static,
     CpuImpl: helios_hal::cpu::Cpu + Clone,
@@ -577,19 +541,20 @@ where
 {
     let data = access.get();
     let blob = data.table.get(handle)?;
-    let (generation, id) = (blob.generation, blob.id);
+    let (session, id) = (blob.session, blob.id);
     Ok(data
-        .gpu_sender(generation)
-        .map(|sender| (generation, id, sender))
+        .gpu_sender(session)
+        .map(|sender| (session, id, sender))
         .map_err(to_wit_error))
 }
 
 /// What a context call needs from the store before it waits: the
-/// generation and the sender, checked together.
-fn context_claim<U, CpuImpl, Net, HostFs>(
+/// session, the context and the sender, checked together, and refused
+/// `device-fault` once the device has faulted the context.
+fn context_session<U, CpuImpl, Net, HostFs>(
     mut access: Access<'_, U, HasSelf<StoreData<CpuImpl, Net, HostFs>>>,
     handle: &Resource<ContextHandle>,
-) -> wasmtime::Result<Result<(u64, ContextId, Gpu3dSender), gpu_wit::Error>>
+) -> wasmtime::Result<Result<(SessionId, ContextId, Gpu3dSender), gpu_wit::Error>>
 where
     U: 'static,
     CpuImpl: helios_hal::cpu::Cpu + Clone,
@@ -598,58 +563,119 @@ where
 {
     let data = access.get();
     let context = data.table.get(handle)?;
-    let (generation, id) = (context.generation, context.id);
-    Ok(data
-        .gpu_sender(generation)
-        .map(|sender| (generation, id, sender))
-        .map_err(to_wit_error))
-}
-
-/// What `submit` needs from the store: the claim checked, the fence
-/// rule applied, and the context's own signal.
-///
-/// The increasing-fence rule lives here rather than in the owner task
-/// because the store is where the guest's submissions are already
-/// serialised: `submitted` is the newest fence this context was given,
-/// and a fence that does not come after it would let the guest write a
-/// gap its own `fences` stream can never fill.
-struct SubmitClaim {
-    generation: u64,
-    context: ContextId,
-    sender: Gpu3dSender,
-    fences: Arc<SequenceSignal>,
-}
-
-fn submit_claim<U, CpuImpl, Net, HostFs>(
-    mut access: Access<'_, U, HasSelf<StoreData<CpuImpl, Net, HostFs>>>,
-    handle: &Resource<ContextHandle>,
-    fence: u64,
-) -> wasmtime::Result<Result<SubmitClaim, gpu_wit::Error>>
-where
-    U: 'static,
-    CpuImpl: helios_hal::cpu::Cpu + Clone,
-    Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
-{
-    let data = access.get();
-    let context = data.table.get(handle)?;
-    if fence <= context.submitted.get() {
-        return Ok(Err(gpu_wit::Error::StaleFence));
+    let (session, id) = (context.session, context.shared.id());
+    if context.shared.is_faulted() {
+        return Ok(Err(gpu_wit::Error::DeviceFault));
     }
     Ok(data
-        .gpu_sender(context.generation)
-        .map(|sender| SubmitClaim {
-            generation: context.generation,
-            context: context.id,
-            sender,
-            fences: context.fences.clone(),
-        })
+        .gpu_sender(session)
+        .map(|sender| (session, id, sender))
         .map_err(to_wit_error))
 }
 
-/// The stream a plugin reads one context's fences from.
+/// One attempt at queueing a submission, made in one step of the task
+/// that owns the store.
+enum SubmitStep {
+    /// The submission is queued; this is its answer.
+    Queued(oneshot::Receiver<Result<(), Gpu3dServiceError>>),
+    /// The submit queue was full; nothing was queued or admitted.
+    Full(Gpu3dSender),
+    /// Refused before anything was queued.
+    Refused(gpu_wit::Error),
+}
+
+/// Check one submission against its context and ring, and queue it, in
+/// one step; wait for room and try again while the queue is full.
+///
+/// The fence is checked against everything already let onto its ring
+/// and recorded on it only once the submission is in the queue, in the
+/// same step, so the queue's order is the order fences were admitted
+/// in, and a submission that waited for room is checked again against
+/// whatever was admitted while it waited. `commands` builds the stream
+/// afresh for each attempt, because a full queue drops the attempt
+/// unsent.
+async fn queue_submission<U, CpuImpl, Net, HostFs>(
+    accessor: &Accessor<U, HasSelf<StoreData<CpuImpl, Net, HostFs>>>,
+    handle: &Resource<ContextHandle>,
+    ring: u8,
+    fence: Option<u64>,
+    mut commands: impl FnMut(
+        &mut StoreData<CpuImpl, Net, HostFs>,
+        SessionId,
+    ) -> wasmtime::Result<Result<SubmitCommands, gpu_wit::Error>>,
+) -> wasmtime::Result<Result<(), gpu_wit::Error>>
+where
+    U: 'static,
+    CpuImpl: helios_hal::cpu::Cpu + Clone,
+    Net: ComponentHostNetwork,
+    HostFs: crate::HostFileSystem,
+{
+    // The sender whose room this call was last woken for: a call that
+    // then queues nothing passes its turn on.
+    let mut woken: Option<Gpu3dSender> = None;
+    loop {
+        let step = accessor.with(|mut access| -> wasmtime::Result<SubmitStep> {
+            let data = access.get();
+            let context = data.table.get(handle)?;
+            let (session, shared) = (context.session, context.shared.clone());
+            let sender = match data.gpu_sender(session) {
+                Ok(sender) => sender,
+                Err(error) => return Ok(SubmitStep::Refused(to_wit_error(error))),
+            };
+            let (ring, fence, timeline) = match shared.admit(ring, fence) {
+                Ok(admitted) => admitted,
+                Err(error) => return Ok(SubmitStep::Refused(to_wit_error(error))),
+            };
+            let commands = match commands(data, session)? {
+                Ok(commands) => commands,
+                Err(error) => return Ok(SubmitStep::Refused(error)),
+            };
+            let (reply, answer) = oneshot::channel();
+            let request = SubmitRequest {
+                context: shared.clone(),
+                commands,
+                ring,
+                fence,
+                reply,
+            };
+            Ok(match sender.try_submit(request) {
+                Ok(true) => {
+                    if let Some(fence) = fence {
+                        timeline.record_submitted(fence);
+                    }
+                    SubmitStep::Queued(answer)
+                }
+                Ok(false) => SubmitStep::Full(sender),
+                Err(error) => SubmitStep::Refused(to_wit_error(error)),
+            })
+        })?;
+        match step {
+            // A reply dropped unanswered is the submit server dropping a
+            // request whose session ended while it was queued.
+            SubmitStep::Queued(answer) => {
+                return Ok(answer
+                    .await
+                    .unwrap_or(Err(Gpu3dServiceError::SessionEnded))
+                    .map_err(to_wit_error));
+            }
+            SubmitStep::Full(sender) => {
+                sender.submit_room().await;
+                woken = Some(sender);
+            }
+            SubmitStep::Refused(error) => {
+                if let Some(sender) = woken {
+                    sender.pass_submit_room();
+                }
+                return Ok(Err(error));
+            }
+        }
+    }
+}
+
+/// The stream a plugin reads one ring's fences from.
 struct FenceStreamProducer {
-    signal: Arc<SequenceSignal>,
+    context: Arc<ContextShared>,
+    ring: RingIndex,
     waiter: Option<crate::exec::NotifyWaiter>,
     last_seen: u64,
 }
@@ -671,7 +697,11 @@ impl<T: 'static> StreamProducer<T> for FenceStreamProducer {
             return Poll::Ready(Ok(StreamResult::Cancelled));
         }
         let producer = &mut *self;
-        let signal = producer.signal.clone();
+        let signal = producer
+            .context
+            .timeline(producer.ring)
+            .expect("the stream was opened on one of the context's rings")
+            .signal();
         let waiter = producer.waiter.get_or_insert_with(|| signal.waiter());
         match signal.poll_next(cx, waiter, &mut producer.last_seen) {
             Poll::Ready((fence, _nanos)) => {
@@ -695,13 +725,13 @@ where
         accessor: &Accessor<U, Self>,
         handle: Resource<GpuHandle>,
     ) -> wasmtime::Result<Result<Vec<gpu_wit::CapsetInfo>, gpu_wit::Error>> {
-        let (generation, sender) = match accessor.with(|access| claim_of(access, &handle))? {
-            Ok(pair) => pair,
+        let sender = match accessor.with(|access| session_of(access, &handle))? {
+            Ok((_, sender)) => sender,
             Err(error) => return Ok(Err(error)),
         };
         let (reply, answer) = oneshot::channel();
         let outcome = sender
-            .control(Gpu3dRequest::Capsets { generation, reply }, answer)
+            .control(Gpu3dRequest::Capsets { reply }, answer)
             .await;
         Ok(outcome
             .map(|capsets| {
@@ -721,17 +751,18 @@ where
         accessor: &Accessor<U, Self>,
         handle: Resource<GpuHandle>,
         id: u32,
+        version: u32,
     ) -> wasmtime::Result<Result<Vec<u8>, gpu_wit::Error>> {
-        let (generation, sender) = match accessor.with(|access| claim_of(access, &handle))? {
-            Ok(pair) => pair,
+        let sender = match accessor.with(|access| session_of(access, &handle))? {
+            Ok((_, sender)) => sender,
             Err(error) => return Ok(Err(error)),
         };
         let (reply, answer) = oneshot::channel();
         let outcome = sender
             .control(
                 Gpu3dRequest::Capset {
-                    generation,
                     id: CapsetId::new(id),
+                    version,
                     reply,
                 },
                 answer,
@@ -744,18 +775,22 @@ where
         accessor: &Accessor<U, Self>,
         handle: Resource<GpuHandle>,
         capset: u32,
+        rings: u8,
         name: String,
     ) -> wasmtime::Result<Result<Resource<ContextHandle>, gpu_wit::Error>> {
-        let (generation, sender) = match accessor.with(|access| claim_of(access, &handle))? {
+        let (session, sender) = match accessor.with(|access| session_of(access, &handle))? {
             Ok(pair) => pair,
             Err(error) => return Ok(Err(error)),
+        };
+        let Some(rings) = RingCount::new(rings) else {
+            return Ok(Err(gpu_wit::Error::BadRing));
         };
         let (reply, answer) = oneshot::channel();
         let record = sender
             .control(
                 Gpu3dRequest::CreateContext {
-                    generation,
                     capset: CapsetId::new(capset),
+                    rings,
                     name: to_context_name(&name),
                     reply,
                 },
@@ -768,10 +803,8 @@ where
         };
         let context = accessor.with(|mut access| {
             access.get().table.push(ContextHandle {
-                generation,
-                id: record.id,
-                fences: record.fences,
-                submitted: Cell::new(0),
+                session,
+                shared: record.shared,
             })
         })?;
         Ok(Ok(context))
@@ -784,17 +817,20 @@ where
         memory: gpu_wit::BlobMemory,
         usage: gpu_wit::BlobUsage,
         size: u64,
-        host_id: u64,
+        blob_id: u64,
         buffer: Option<gpu_wit::Span>,
     ) -> wasmtime::Result<Result<Resource<BlobHandle>, gpu_wit::Error>> {
-        let (generation, sender) = match accessor.with(|access| claim_of(access, &handle))? {
+        let (session, sender) = match accessor.with(|access| session_of(access, &handle))? {
             Ok(pair) => pair,
             Err(error) => return Ok(Err(error)),
         };
         let (context_id, spawner) = accessor.with(
             |mut access| -> wasmtime::Result<(ContextId, crate::InstanceSpawner<CpuImpl>)> {
                 let data = access.get();
-                Ok((data.table.get(&context)?.id, data.spawner().clone()))
+                Ok((
+                    data.table.get(&context)?.shared.id(),
+                    data.spawner().clone(),
+                ))
             },
         )?;
         let memory_kind = from_wit_blob_memory(memory);
@@ -814,7 +850,7 @@ where
                 let at = span(at);
                 let pinned = accessor.with(|mut access| {
                     let memory = memory_of(&mut access)?;
-                    access.get().pin_claim_buffer(memory, at, size)
+                    access.get().pin_session_buffer(memory, at, size)
                 });
                 match pinned {
                     Ok(buffer) => Some((at, buffer)),
@@ -829,22 +865,21 @@ where
         // A blob the device makes for a call that is dropped before its
         // last step goes back the way a dropped blob handle's does.
         let cleanup = sender.clone();
-        let mut pending = PendingReply::new(answer, move |blob| {
+        let mut pending = PendingReply::new(answer, move |blob: Arc<BlobShared>| {
             spawn_gpu_cleanup(
                 &spawner,
                 cleanup,
-                Gpu3dRequest::DestroyBlob { generation, blob },
+                Gpu3dRequest::DestroyBlob { blob: blob.id() },
             );
         });
         let queued = sender
             .control_oneway(Gpu3dRequest::CreateBlob {
-                generation,
                 spec: BlobSpec {
                     context: context_id,
                     memory: memory_kind,
                     usage: from_wit_blob_usage(usage),
                     size,
-                    host_id,
+                    blob_id,
                     backing: backing.as_ref().map(|(_, buffer)| buffer.clone()),
                 },
                 reply,
@@ -854,8 +889,8 @@ where
             Ok(()) => pending.reply(Gpu3dServiceError::Closed).await,
             Err(error) => Err(error),
         };
-        let id = match id {
-            Ok(id) => id,
+        let shared = match id {
+            Ok(shared) => shared,
             // Nothing of the device's names these pages and nothing
             // showed them, so the run goes back with this call's
             // reference.
@@ -873,20 +908,21 @@ where
                     let memory = checked_memory(&mut access);
                     access
                         .get()
-                        .show_in_claim(generation, |views, group| {
+                        .show_in_session(session, |views, group| {
                             views.show_buffer(memory, *at, buffer, Some(group))
                         })
                         .map(Some)
                 }
             };
-            let backing = match shown {
+            let backing_view = match shown {
                 Ok(view) => view,
                 Err(error) => return Ok(Err(error)),
             };
             let resource = access.get().table.push(BlobHandle {
-                generation,
-                id,
-                backing,
+                session,
+                id: shared.id(),
+                shared: shared.clone(),
+                backing: backing_view,
                 mapped: None,
             })?;
             Ok::<_, wasmtime::Error>(Ok(resource))
@@ -898,15 +934,12 @@ where
             }
             Err(error) => {
                 // The span was taken while the device was creating the
-                // blob, or the claim ended. The blob goes back before the
-                // refusal does; the pending reply stays armed across the
-                // wait, so a call dropped in it still hands the blob
+                // blob, or the session ended. The blob goes back before
+                // the refusal does; the pending reply stays armed across
+                // the wait, so a call dropped in it still hands the blob
                 // back, and a send that completed is never repeated.
                 if let Err(closed) = sender
-                    .control_oneway(Gpu3dRequest::DestroyBlob {
-                        generation,
-                        blob: id,
-                    })
+                    .control_oneway(Gpu3dRequest::DestroyBlob { blob: shared.id() })
                     .await
                 {
                     tracing::warn!(
@@ -935,8 +968,8 @@ where
         handle: Resource<ContextHandle>,
         buffer: gpu_wit::Span,
     ) -> wasmtime::Result<Result<Resource<CommandBufferHandle>, gpu_wit::Error>> {
-        let generation = match accessor.with(|access| context_claim(access, &handle))? {
-            Ok((generation, _, _)) => generation,
+        let session = match accessor.with(|access| context_session(access, &handle))? {
+            Ok((session, _, _)) => session,
             Err(error) => return Ok(Err(error)),
         };
         // A command buffer is as long as the span it is shown at: the
@@ -947,8 +980,8 @@ where
         accessor.with(|mut access| {
             let shown = memory_of(&mut access).and_then(|memory| {
                 let data = access.get();
-                let buffer = data.pin_claim_buffer(memory, at, at.length)?;
-                let view = data.show_in_claim(generation, |views, group| {
+                let buffer = data.pin_session_buffer(memory, at, at.length)?;
+                let view = data.show_in_session(session, |views, group| {
                     views.show_buffer(memory, at, &buffer, Some(group))
                 })?;
                 Ok((buffer, view))
@@ -958,7 +991,7 @@ where
                 Err(error) => return Ok(Err(to_wit_error(error))),
             };
             let resource = access.get().table.push(CommandBufferHandle {
-                generation,
+                session,
                 buffer,
                 view,
             })?;
@@ -972,77 +1005,69 @@ where
         commands: Resource<CommandBufferHandle>,
         offset: u64,
         length: u64,
-        fence: u64,
+        ring: u8,
+        fence: Option<u64>,
     ) -> wasmtime::Result<Result<(), gpu_wit::Error>> {
-        let SubmitClaim {
-            generation,
-            context,
-            sender,
-            fences,
-        } = match accessor.with(|access| submit_claim(access, &handle, fence))? {
-            Ok(values) => values,
-            Err(error) => return Ok(Err(error)),
+        queue_submission(accessor, &handle, ring, fence, |data, session| {
+            data.command_range(&commands, offset, length, session)
+        })
+        .await
+    }
+
+    async fn execute(
+        accessor: &Accessor<U, Self>,
+        handle: Resource<ContextHandle>,
+        commands: Vec<u8>,
+        ring: u8,
+        fence: Option<u64>,
+    ) -> wasmtime::Result<Result<(), gpu_wit::Error>> {
+        let Ok(inline) = InlineCommands::try_from(commands.as_slice()) else {
+            // Longer than the kernel carries inline: such a stream
+            // belongs in a command buffer.
+            debug_assert!(commands.len() > MAX_EXECUTE_BYTES);
+            return Ok(Err(gpu_wit::Error::OutOfBounds));
         };
-        let (buffer, range) = match accessor.with(|mut access| {
-            access
-                .get()
-                .command_range(&commands, offset, length, generation)
-        })? {
-            Ok(range) => range,
-            Err(error) => return Ok(Err(error)),
-        };
-        let (reply, answer) = oneshot::channel();
-        let outcome = sender
-            .submit(
-                SubmitRequest::Submit {
-                    generation,
-                    context,
-                    buffer,
-                    commands: range,
-                    fence: FenceId::new(fence),
-                    fences,
-                    reply,
-                },
-                answer,
-            )
-            .await;
-        // The fence was spent the moment the device answered, agreed or
-        // refused: the next submission must come after it either way.
-        accessor.with(|mut access| {
-            if let Ok(context) = access.get().table.get(&handle) {
-                context.submitted.set(fence);
-            }
-        });
-        Ok(outcome.map_err(to_wit_error))
+        queue_submission(accessor, &handle, ring, fence, |_, _| {
+            Ok(Ok(SubmitCommands::Inline(inline.clone())))
+        })
+        .await
     }
 
     fn fences(
         mut accessor: Access<'_, U, Self>,
         handle: Resource<ContextHandle>,
-    ) -> wasmtime::Result<StreamReader<u64>> {
+        ring: u8,
+    ) -> wasmtime::Result<Result<StreamReader<u64>, gpu_wit::Error>> {
         let data = accessor.get();
         let context = data.table.get(&handle)?;
-        // As for `command-buffer.buffer`: the signature cannot carry
-        // `not-claimed`, so a context that outlived its claim is a
-        // trap. Answering it would hand back the dead claim's signal —
-        // one nothing publishes to again — and the guest's stream read
-        // would hang on a fence that never retires.
-        data.gpu_sender(context.generation)
-            .map_err(|error| wasmtime::Error::msg(alloc::format!("{error}")))?;
-        let signal = context.fences.clone();
+        // A context whose session ended has nothing left to retire:
+        // its stream would be one nothing publishes to again, and a
+        // reader would hang on a fence that never comes.
+        if let Err(error) = data.gpu_sender(context.session) {
+            return Ok(Err(to_wit_error(error)));
+        }
+        let shared = context.shared.clone();
+        let Some(ring) = RingIndex::new(ring).filter(|ring| shared.rings().contains(*ring)) else {
+            return Ok(Err(gpu_wit::Error::BadRing));
+        };
         // From the stream's creation on, not from the context's first
         // submission: a reader that asks for a stream mid-render-loop
         // wants the fences that retire next, and the newest retired
-        // fence answers for everything before it anyway.
-        let last_seen = signal.sequence();
-        StreamReader::new(
+        // fence answers for everything before it on the ring anyway.
+        let last_seen = shared
+            .timeline(ring)
+            .expect("the ring was just checked against the context's count")
+            .signal()
+            .sequence();
+        Ok(Ok(StreamReader::new(
             &mut accessor,
             FenceStreamProducer {
-                signal,
+                context: shared,
+                ring,
                 waiter: None,
                 last_seen,
             },
-        )
+        )?))
     }
 
     async fn attach(
@@ -1076,25 +1101,22 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    let (generation, context, sender) =
-        match accessor.with(|access| context_claim(access, &handle))? {
-            Ok(values) => values,
-            Err(error) => return Ok(Err(error)),
-        };
+    let (_, context, sender) = match accessor.with(|access| context_session(access, &handle))? {
+        Ok(values) => values,
+        Err(error) => return Ok(Err(error)),
+    };
     let blob = accessor.with(|mut access| -> wasmtime::Result<BlobId> {
         Ok(access.get().table.get(&resource)?.id)
     })?;
     let (reply, answer) = oneshot::channel();
     let request = if attach {
         Gpu3dRequest::AttachResource {
-            generation,
             context,
             blob,
             reply,
         }
     } else {
         Gpu3dRequest::DetachResource {
-            generation,
             context,
             blob,
             reply,
@@ -1116,11 +1138,10 @@ where
         handle: Resource<BlobHandle>,
         at: gpu_wit::Span,
     ) -> wasmtime::Result<Result<(), gpu_wit::Error>> {
-        let (generation, blob, sender) =
-            match accessor.with(|access| blob_claim(access, &handle))? {
-                Ok(values) => values,
-                Err(error) => return Ok(Err(error)),
-            };
+        let (session, blob, sender) = match accessor.with(|access| blob_session(access, &handle))? {
+            Ok(values) => values,
+            Err(error) => return Ok(Err(error)),
+        };
         let at = span(at);
         // A blob shown once is refused a second span here, before the
         // device is asked; the owner task's record refuses a second
@@ -1135,7 +1156,7 @@ where
                 }
                 let checked = memory_of(&mut access).and_then(|memory| {
                     let data = access.get();
-                    data.check_claim_span(memory, at, at.length)?;
+                    data.check_session_span(memory, at, at.length)?;
                     Ok(data.spawner().clone())
                 });
                 Ok(checked)
@@ -1151,14 +1172,10 @@ where
         // guest cannot reach is a slot the renderer holds for nothing.
         let cleanup = sender.clone();
         let mut pending = PendingReply::new(answer, move |_: DeviceRegion| {
-            spawn_gpu_cleanup(&spawner, cleanup, unmap_request(generation, blob));
+            spawn_gpu_cleanup(&spawner, cleanup, unmap_request(blob));
         });
         let queued = sender
-            .control_oneway(Gpu3dRequest::MapBlob {
-                generation,
-                blob,
-                reply,
-            })
+            .control_oneway(Gpu3dRequest::MapBlob { blob, reply })
             .await;
         let region = match queued {
             Ok(()) => pending.reply(Gpu3dServiceError::Closed).await,
@@ -1170,13 +1187,13 @@ where
         };
 
         // The last step, and the only one that shows anything: the view
-        // of the placement and the handle's record of it are made
-        // together, with no wait in between that a cancellation could
-        // land in.
+        // of the placement — under the memory type the host asked for —
+        // and the handle's record of it are made together, with no wait
+        // in between that a cancellation could land in.
         let recorded = accessor.with(|mut access| {
             let memory = checked_memory(&mut access);
             let data = access.get();
-            let view = match data.show_in_claim(generation, |views, group| {
+            let view = match data.show_in_session(session, |views, group| {
                 views.show_device(memory, at, region, Some(group))
             }) {
                 Ok(view) => view,
@@ -1192,10 +1209,10 @@ where
             }
             Err(error) => {
                 // The span was taken while the device was placing the
-                // blob, or the claim ended. The placement goes back
+                // blob, or the session ended. The placement goes back
                 // before the refusal does, with the pending reply armed
                 // across the wait for the reason `create-blob` gives.
-                if let Err(closed) = sender.control_oneway(unmap_request(generation, blob)).await {
+                if let Err(closed) = sender.control_oneway(unmap_request(blob)).await {
                     tracing::warn!(
                         target: "helios_kernel::gpu",
                         %closed,
@@ -1212,11 +1229,10 @@ where
         accessor: &Accessor<U, Self>,
         handle: Resource<BlobHandle>,
     ) -> wasmtime::Result<Result<(), gpu_wit::Error>> {
-        let (generation, blob, sender) =
-            match accessor.with(|access| blob_claim(access, &handle))? {
-                Ok(values) => values,
-                Err(error) => return Ok(Err(error)),
-            };
+        let (_, blob, sender) = match accessor.with(|access| blob_session(access, &handle))? {
+            Ok(values) => values,
+            Err(error) => return Ok(Err(error)),
+        };
         // The instance's view ends first — a guest that can no longer
         // reach the storage cannot be racing the engine for it — and the
         // aperture placement is handed back after.
@@ -1233,14 +1249,7 @@ where
         }
         let (reply, answer) = oneshot::channel();
         Ok(sender
-            .control(
-                Gpu3dRequest::UnmapBlob {
-                    generation,
-                    blob,
-                    reply,
-                },
-                answer,
-            )
+            .control(Gpu3dRequest::UnmapBlob { blob, reply }, answer)
             .await
             .map_err(to_wit_error))
     }
@@ -1263,7 +1272,7 @@ pub(crate) mod test_store {
     use wasmtime::component::ResourceTable;
 
     use crate::component::{ComponentOutputMode, ComponentStoreData};
-    use crate::gpu::Gpu3dService;
+    use crate::gpu::{ContextShared, Gpu3dService, SessionId};
     use crate::test_support::{TestCpu, TestNetworkService};
     use crate::{
         Executor, InstanceRegistry, ProcessAuthority, TaskFunding, UnsupportedHostFileSystem,
@@ -1308,22 +1317,17 @@ pub(crate) mod test_store {
 
     fn read_nothing(_: &mut Vec<u8>, _: u32) {}
 
-    /// A context resource minted under `generation`, as a store that
-    /// opened one through `create-context` would carry.
+    /// A context resource made under `session`, as a store that opened
+    /// one through `create-context` would carry.
     pub(crate) fn context_handle(
-        generation: u64,
-        id: helios_hal::display::ContextId,
+        session: SessionId,
+        shared: Arc<ContextShared>,
     ) -> super::ContextHandle {
-        super::ContextHandle {
-            generation,
-            id,
-            fences: Arc::new(crate::display::SequenceSignal::new()),
-            submitted: core::cell::Cell::new(0),
-        }
+        super::ContextHandle { session, shared }
     }
 
-    /// A store on a runtime state that publishes `service`, holding no
-    /// claim yet.
+    /// A store on a runtime state that publishes `service`, with no
+    /// session open yet.
     pub(crate) fn store_data(service: &Gpu3dService) -> TestStoreData {
         store_data_with(|runtime_state| runtime_state.install_gpu3d_service(service.clone()))
     }
@@ -1339,8 +1343,8 @@ pub(crate) mod test_store {
     }
 
     /// As [`store_data_with`], for an instance running under
-    /// `authority`: what a claim test needs to tell the provisioned
-    /// owner from an ordinary program.
+    /// `authority`: what an `open` test needs to tell an instance that
+    /// holds the GPU class from an ordinary program.
     pub(crate) fn store_data_authorized(
         authority: ProcessAuthority,
         configure: impl FnOnce(

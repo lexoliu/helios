@@ -72,6 +72,15 @@ const PAGE_PXN: u64 = 1 << 53;
 const PAGE_UXN: u64 = 1 << 54;
 const MAIR_DEVICE_ATTR_INDEX_SHIFT: u64 = PAGE_ATTR_DEVICE_INDEX * 8;
 const MAIR_DEVICE_NGNRNE: u64 = 0x00;
+/// The MAIR index a write-combined mapping selects: Normal memory,
+/// inner and outer non-cacheable, which lets stores gather and merge
+/// without any cache holding them — what a host renderer means by
+/// write-combining.
+const PAGE_ATTR_NORMAL_NC_INDEX: u64 = 6;
+const MAIR_NORMAL_NC_ATTR_INDEX_SHIFT: u64 = PAGE_ATTR_NORMAL_NC_INDEX * 8;
+/// `0b0100_0100`: Normal memory, outer non-cacheable, inner
+/// non-cacheable (Arm ARM D19.2 "MAIR_EL1", the `Attr<n>` encoding).
+const MAIR_NORMAL_NON_CACHEABLE: u64 = 0x44;
 const PL011_DATA: usize = 0x000;
 const PL011_FLAG: usize = 0x018;
 const PL011_FLAG_RXFE: u32 = 1 << 4;
@@ -574,6 +583,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
         "Limine bootloader does not support the required base protocol revision"
     );
     install_exception_vectors();
+    install_memory_attributes();
     let handoff = limine_boot_handoff();
     let physical_memory_offset = physical_memory_offset();
     // The firmware description comes up before anything else, because
@@ -1307,6 +1317,7 @@ fn prepare_current_processor() {
         asm!("msr cpacr_el1, {cpacr}", cpacr = in(reg) cpacr, options(nomem, nostack, preserves_flags));
         asm!("isb", options(nostack, preserves_flags));
     }
+    install_memory_attributes();
     enable_pmu_for_current_processor();
     install_exception_vectors();
 }
@@ -1816,13 +1827,25 @@ fn read_ttbr1_el1() -> usize {
     value & PAGE_ADDRESS_MASK as usize
 }
 
-fn install_device_memory_attribute() {
+/// Programs the two MAIR indexes this backend owns on the calling
+/// processor: [`PAGE_ATTR_DEVICE_INDEX`] as Device-nGnRnE and
+/// [`PAGE_ATTR_NORMAL_NC_INDEX`] as Normal non-cacheable.
+///
+/// Called on every processor during its bring-up, before it maps
+/// anything with either index — the bootstrap processor at the top of
+/// its entry point, every secondary in `prepare_current_processor` — so
+/// each processor decodes a leaf's attribute index the same way. The
+/// other six indexes keep what the loader programmed, index 0 among
+/// them, which every ordinary mapping uses.
+fn install_memory_attributes() {
     let mair: u64;
     unsafe {
         asm!("mrs {mair}, mair_el1", mair = out(reg) mair, options(nomem, nostack, preserves_flags));
     }
-    let mask = 0xff << MAIR_DEVICE_ATTR_INDEX_SHIFT;
-    let mair = (mair & !mask) | (MAIR_DEVICE_NGNRNE << MAIR_DEVICE_ATTR_INDEX_SHIFT);
+    let mask = (0xff << MAIR_DEVICE_ATTR_INDEX_SHIFT) | (0xff << MAIR_NORMAL_NC_ATTR_INDEX_SHIFT);
+    let mair = (mair & !mask)
+        | (MAIR_DEVICE_NGNRNE << MAIR_DEVICE_ATTR_INDEX_SHIFT)
+        | (MAIR_NORMAL_NON_CACHEABLE << MAIR_NORMAL_NC_ATTR_INDEX_SHIFT);
     unsafe {
         asm!("msr mair_el1, {mair}", mair = in(reg) mair, options(nomem, nostack, preserves_flags));
         asm!("isb", options(nostack, preserves_flags));
@@ -1834,7 +1857,6 @@ fn map_mmio_page(
     physical_memory_offset: usize,
     handoff: &LimineBootHandoff,
 ) {
-    install_device_memory_attribute();
     let virtual_address = mmio_virtual_base(physical_address, physical_memory_offset);
     let block_virtual = virtual_address & !(MMIO_BLOCK_BYTES - 1);
     let block_physical = physical_address & !(MMIO_BLOCK_BYTES - 1);
