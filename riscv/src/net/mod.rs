@@ -83,10 +83,17 @@ static INTERRUPT_DOMAINS: Once<InterruptDomains> = Once::new();
 /// # Concurrency contract
 ///
 /// Built on the bootstrap hart while no other hart runs kernel code:
-/// devices attach through `&mut self`, which sets their priorities,
-/// enables them on `context` and opens its threshold. Then moved into
-/// [`INTERRUPT_DOMAINS`] by [`publish_interrupt_domains`], and never
-/// mutated again except through the PLIC's own registers.
+/// devices attach through `&mut self`, which sets their priorities and
+/// records the sources to arm. Then moved into [`INTERRUPT_DOMAINS`] by
+/// [`publish_interrupt_domains`], and never mutated again except through
+/// the PLIC's own registers.
+///
+/// `context`'s enable words and threshold are first written by `hart`
+/// itself, in [`Self::open`], once it runs kernel code: the SBI firmware
+/// resets a hart's PLIC contexts when it starts the hart (OpenSBI's
+/// `plic_warm_irqchip_init` disables every source on them and raises
+/// their threshold to 7), so anything the bootstrap hart wrote there for
+/// a hart it had not started yet would be lost.
 ///
 /// Afterwards `hart` alone claims and completes on `context`, from its
 /// supervisor-external trap, and so it alone runs the route handlers.
@@ -122,6 +129,10 @@ pub(crate) struct ExternalInterrupts {
     /// Whether any device is routed here. A PLIC nothing is wired to
     /// keeps its sources disabled and its taking hart never visits it.
     routed: bool,
+    /// The sources [`Self::open`] enables: every kernel device attached
+    /// during bring-up. A granted device's source is not among them; its
+    /// owner arms it.
+    armed: Vec<InterruptSourceId>,
     routes: DeviceRoutes,
 }
 
@@ -213,17 +224,27 @@ impl ExternalInterrupts {
             context,
             enable_words: Mutex::new(()),
             routed: false,
+            armed: Vec::new(),
             routes: ExternalInterruptRoutes::new(),
         }
     }
 
-    /// Give `source` a priority, enable it on the taking context and
-    /// open the context's threshold.
+    /// Give `source` a priority and record it for the taking hart to
+    /// enable in [`Self::open`].
     fn enable_source(&mut self, source: InterruptSourceId) {
         self.plic.set_priority(source, 1);
-        self.set_source_enabled(source, true);
-        self.plic.set_threshold(self.context, 0);
+        self.armed.push(source);
         self.routed = true;
+    }
+
+    /// Enable every armed source on the taking context and open its
+    /// threshold. Runs on the taking hart, once, after the firmware has
+    /// started it and before it sets `sie.SEIE`.
+    fn open(&self) {
+        for &source in &self.armed {
+            self.set_source_enabled(source, true);
+        }
+        self.plic.set_threshold(self.context, 0);
     }
 
     /// Arm or hold off one source on the taking context, without
@@ -269,10 +290,9 @@ impl ExternalInterrupts {
 /// each hart's trap reads the domains it takes with no lock, and the
 /// grant hooks read the one a granted source belongs to.
 ///
-/// A source enabled during bring-up on a context whose hart is not yet
-/// running stays pending there: that hart takes no external interrupt
-/// until it has installed its runtime, which carries the published
-/// table, and enabled its own `sie.SEIE`.
+/// A source that fires during bring-up stays pending in its PLIC: the
+/// hart that takes it enables it only once it has installed its runtime,
+/// which carries the published table, and then sets its own `sie.SEIE`.
 pub(crate) struct InterruptDomains {
     /// Indexed by the domain number a granted source's
     /// [`GrantInterrupt`] carries, so never reordered.
@@ -413,8 +433,6 @@ impl InterruptDomains {
     pub(crate) fn attach_device(&mut self, line: PlicInterrupt, route: DeviceInterruptRoute) {
         let domain = self.domain_mut(line, "a granted device");
         domain.plic.set_priority(line.source, 1);
-        domain.set_source_enabled(line.source, false);
-        domain.plic.set_threshold(domain.context, 0);
         domain.routed = true;
         domain.routes.add_device(line.source, route);
     }
@@ -491,6 +509,15 @@ impl HartInterrupts {
             .next()
             .is_some()
             .then_some(Self { domains, hart })
+    }
+
+    /// Open every domain this hart takes: its kernel devices' sources
+    /// enabled on this hart's contexts, the thresholds at zero. Called by
+    /// this hart when it builds its runtime, before it sets `sie.SEIE`.
+    pub(crate) fn open(&self) {
+        for domain in self.domains.taken_by(self.hart) {
+            domain.open();
+        }
     }
 
     /// Claim and dispatch everything pending on every domain this hart

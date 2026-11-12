@@ -987,6 +987,11 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         hand_over_probe: trap::HandOverProbe::new(),
     };
     hart_runtime.install();
+    // Only now, on the hart itself: the firmware reset this hart's PLIC
+    // contexts when it started it, after the bootstrap hart's bring-up.
+    if let Some(interrupts) = hart_runtime.external_interrupts {
+        interrupts.open();
+    }
     // Every hart's timer preempts the guest running on it, so every hart
     // holds the service: the bootstrap hart installs it, and the others,
     // which it starts only afterwards, take the installed one.
