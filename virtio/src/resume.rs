@@ -46,7 +46,7 @@
 use helios_hal::io::IoError;
 
 use crate::features::RenegotiateError;
-use crate::transport::DeviceType;
+use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
 
 /// The proof that a device was reset and rebuilt.
 ///
@@ -192,4 +192,15 @@ pub(crate) fn settle(
         // hardware progress and not a wait on software state.
         core::hint::spin_loop();
     }
+}
+
+/// Tells a re-handshaken device that the driver is ready, once every
+/// queue it uses has been programmed again.
+pub(crate) fn driver_ok<T: VirtioTransport>(transport: &T) {
+    transport.set_status(
+        DeviceStatus::ACKNOWLEDGE
+            | DeviceStatus::DRIVER
+            | DeviceStatus::FEATURES_OK
+            | DeviceStatus::DRIVER_OK,
+    );
 }
