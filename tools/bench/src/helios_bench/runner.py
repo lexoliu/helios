@@ -995,17 +995,6 @@ def linux_wasmtime_isa_flags(run: dict) -> list[str]:
     return list(flags)
 
 
-def collect_pins(
-    lane: Lane,
-    workloads: list[dict],
-    kernel_build: str,
-    baseline: Baseline | None,
-    sides: dict[Side, RawSide],
-) -> Pins:
-    image_url, image_sha256 = fedora_image(lane.guest_arch)
-    helios = sides.get(Side.HELIOS)
-    helios_baseline = sides.get(Side.HELIOS_BASELINE)
-    linux_wasmtime = sides.get(Side.LINUX_WASMTIME)
 def compiler_pins(lane: Lane, workloads: list[dict], kernel_build: str) -> tuple[str | None, str | None]:
     """The digests of the compiler plugin build and of the
     `helios-compiler-host` the selection's workloads hosted it with, each

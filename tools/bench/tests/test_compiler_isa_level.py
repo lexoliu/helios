@@ -55,9 +55,7 @@ def test_a_helios_record_without_the_level_is_a_broken_run(tmp_path) -> None:
 
 
 @pytest.mark.parametrize("rounds", [None, 2, 4])
-def test_every_linux_invocation_reads_the_level_from_the_first_rounds_helios_record(
-    tmp_path, rounds
-) -> None:
+def test_every_linux_invocation_reads_the_level_from_the_first_rounds_helios_record(tmp_path, rounds) -> None:
     options = options_for(tmp_path, BOTH, rounds)
     commands = plan(options, load_manifest(), load_workloads()["workloads"])
     first_helios = next(index for index, command in enumerate(commands) if command.side == "helios")
