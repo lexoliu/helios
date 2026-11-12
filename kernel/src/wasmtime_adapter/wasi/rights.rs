@@ -135,27 +135,37 @@ impl<'d, K, R> Granted<'d, K, R> {
     }
 }
 
-/// Proof of both bases of a hard link, checked together: the source base
-/// may be read and the destination base may have its entries changed.
+/// Proof of both bases of an operation that makes an object reachable
+/// under a second directory, checked together: the source base may be read
+/// and the destination base may have its entries changed.
 ///
-/// A link makes the source's object reachable through the destination, so
-/// it is a second name with the destination's rights. A destination that
-/// can write must therefore not be fed by a source the caller could not
-/// have opened for writing; only [`Granted::link_into`] makes one.
-pub(crate) struct LinkGrant<'s, 'd> {
+/// A hard link and a rename both do this: the object is reachable through
+/// the destination afterwards, with the destination's rights. A destination
+/// that can write must therefore not be fed by a source the caller could not
+/// have opened for writing; only [`Granted::alias_into`] makes one.
+///
+/// `Removal` is the proof the operation needs beyond that. A link leaves
+/// the source entry alone and carries `()`; a rename removes it, and
+/// [`AliasGrant::removing_source`] adds the source base's `mutate-directory`.
+pub(crate) struct AliasGrant<'s, 'd, Removal = ()> {
     source: Granted<'s, Directory, Read>,
     destination: Granted<'d, Directory, Mutate>,
+    _removal: Removal,
 }
+
+/// The proof a rename takes: [`AliasGrant`] with the source base's
+/// `mutate-directory`.
+pub(crate) type RenameGrant<'s, 'd> = AliasGrant<'s, 'd, Granted<'s, Directory, Mutate>>;
 
 impl<'s> Granted<'s, Directory, Read> {
     /// Pairs this source base with a destination base. Refuses with
     /// `NotPermitted` when the destination holds `WRITE` and the source
-    /// does not: the link would otherwise make a file writable that the
-    /// caller could only read.
-    pub(crate) fn link_into<'d>(
+    /// does not: the second name would otherwise make a file writable that
+    /// the caller could only read.
+    pub(crate) fn alias_into<'d>(
         self,
         destination: Granted<'d, Directory, Mutate>,
-    ) -> FsOpResult<LinkGrant<'s, 'd>> {
+    ) -> FsOpResult<AliasGrant<'s, 'd>> {
         let writable = destination
             .descriptor()
             .flags
@@ -168,14 +178,28 @@ impl<'s> Granted<'s, Directory, Read> {
         {
             return Err(fs_types::ErrorCode::NotPermitted);
         }
-        Ok(LinkGrant {
+        Ok(AliasGrant {
             source: self,
             destination,
+            _removal: (),
         })
     }
 }
 
-impl<'s, 'd> LinkGrant<'s, 'd> {
+impl<'s, 'd> AliasGrant<'s, 'd> {
+    /// Adds what a rename needs: the source base's `mutate-directory`,
+    /// refused as `ReadOnly`, since the rename removes the source entry.
+    pub(crate) fn removing_source(self) -> FsOpResult<RenameGrant<'s, 'd>> {
+        let removal = self.source.descriptor().grant()?;
+        Ok(AliasGrant {
+            source: self.source,
+            destination: self.destination,
+            _removal: removal,
+        })
+    }
+}
+
+impl<'s, 'd, Removal> AliasGrant<'s, 'd, Removal> {
     /// The source base.
     pub(crate) fn source(&self) -> &'s FsDescriptor {
         self.source.descriptor()
