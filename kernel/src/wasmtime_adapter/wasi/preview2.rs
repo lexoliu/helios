@@ -1413,9 +1413,14 @@ where
         let target = self.p2_descriptor(&descriptor);
         Ok(async {
             let (base, namespace) = target?;
-            let metadata = super::stat_at(&namespace, &base, path_flags_to_p3(path_flags), &path)
-                .await
-                .map_err(error_code_from_p3)?;
+            let metadata = super::stat_at(
+                &namespace,
+                base.grant().map_err(error_code_from_p3)?,
+                path_flags_to_p3(path_flags),
+                &path,
+            )
+            .await
+            .map_err(error_code_from_p3)?;
             Ok(descriptor_stat_from_p3(super::descriptor_stat(&metadata)))
         }
         .await)
@@ -1475,7 +1480,7 @@ where
                 &namespace,
                 source_base
                     .grant()
-                    .and_then(|source| source.link_into(destination_base.grant()?))
+                    .and_then(|source| source.alias_into(destination_base.grant()?))
                     .map_err(error_code_from_p3)?,
                 &source_path,
                 &destination_path,
@@ -1501,7 +1506,7 @@ where
             let (base, namespace) = target?;
             super::open_at(
                 &namespace,
-                &base,
+                base.grant().map_err(error_code_from_p3)?,
                 path_flags_to_p3(path_flags),
                 &path,
                 open_flags_to_p3(open_flags),
@@ -1529,7 +1534,7 @@ where
         let target = self.p2_descriptor(&descriptor);
         Ok(async {
             let (base, namespace) = target?;
-            super::readlink_at(&namespace, &base, &path)
+            super::readlink_at(&namespace, base.grant().map_err(error_code_from_p3)?, &path)
                 .await
                 .map_err(error_code_from_p3)
         }
@@ -1563,16 +1568,14 @@ where
         let now = self.now_nanos();
         Ok(async {
             let (source_base, destination_base, namespace) = target?;
-            super::rename_at(
-                &namespace,
-                source_base.grant().map_err(error_code_from_p3)?,
-                &source_path,
-                destination_base.grant().map_err(error_code_from_p3)?,
-                &destination_path,
-                now,
-            )
-            .await
-            .map_err(error_code_from_p3)
+            let rename = source_base
+                .grant()
+                .and_then(|source| source.alias_into(destination_base.grant()?))
+                .and_then(|alias| alias.removing_source())
+                .map_err(error_code_from_p3)?;
+            super::rename_at(&namespace, rename, &source_path, &destination_path, now)
+                .await
+                .map_err(error_code_from_p3)
         }
         .await)
     }
@@ -1659,9 +1662,14 @@ where
         let target = self.p2_descriptor(&descriptor);
         Ok(async {
             let (base, namespace) = target?;
-            let metadata = super::stat_at(&namespace, &base, path_flags_to_p3(path_flags), &path)
-                .await
-                .map_err(error_code_from_p3)?;
+            let metadata = super::stat_at(
+                &namespace,
+                base.grant().map_err(error_code_from_p3)?,
+                path_flags_to_p3(path_flags),
+                &path,
+            )
+            .await
+            .map_err(error_code_from_p3)?;
             Ok(metadata_hash_from_p3(super::metadata_hash(&metadata)))
         }
         .await)
@@ -3408,7 +3416,7 @@ mod tests {
         };
         let descriptor = block_on(crate::wasmtime_adapter::wasi::open_at(
             store.filesystem(),
-            &root,
+            root.grant().expect("the root holds read"),
             p3fs::PathFlags::empty(),
             "copy",
             p3fs::OpenFlags::CREATE | p3fs::OpenFlags::TRUNCATE,

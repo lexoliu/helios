@@ -174,14 +174,10 @@ pub(crate) fn child_path(base: &FsDescriptor, path: &str) -> FsOpResult<String> 
     crate::resolve_child_path(&base.path, path).map_err(map_component_fs_path_error)
 }
 
-fn require_directory(base: &FsDescriptor) -> FsOpResult<()> {
-    if base.kind != FsNodeKind::Directory {
-        return Err(fs_types::ErrorCode::NotDirectory);
-    }
-    Ok(())
-}
-
 /// Opens `path` below `base` as WASI `open-at` does.
+///
+/// The lookup itself needs `base`'s `read`, which the signature proves
+/// before anything is resolved.
 ///
 /// A descriptor may be opened with any rights `base` holds, whatever the
 /// filesystem would let it do: a file on a read-only filesystem opens for
@@ -193,7 +189,7 @@ fn require_directory(base: &FsDescriptor) -> FsOpResult<()> {
 /// filesystem and leaves it as it was.
 pub(crate) async fn open_at<HostFs>(
     namespace: &Namespace<HostFs>,
-    base: &FsDescriptor,
+    base: Granted<'_, Directory, Read>,
     path_flags: fs_types::PathFlags,
     path: &str,
     open_flags: fs_types::OpenFlags,
@@ -203,7 +199,7 @@ pub(crate) async fn open_at<HostFs>(
 where
     HostFs: crate::HostFileSystem,
 {
-    require_directory(base)?;
+    let base = base.descriptor();
     // Every right the flags need is proved before the path is resolved, so a
     // refusal reaches no filesystem, a host share included, and holds
     // whether or not the file exists.
@@ -334,15 +330,17 @@ where
         .map_err(fs_error_code)
 }
 
+/// The metadata of `path` below `base`, which must be readable.
 pub(crate) async fn stat_at<HostFs>(
     namespace: &Namespace<HostFs>,
-    base: &FsDescriptor,
+    base: Granted<'_, Directory, Read>,
     path_flags: fs_types::PathFlags,
     path: &str,
 ) -> FsOpResult<Metadata>
 where
     HostFs: crate::HostFileSystem,
 {
+    let base = base.descriptor();
     let absolute = child_path(base, path)?;
     stat_path(namespace, &absolute, follow_within(base, path_flags)).await
 }
@@ -662,20 +660,20 @@ where
         .map_err(fs_error_code)
 }
 
-/// Renames within one mount; across two, `cross-device`.
+/// Renames within one mount; across two, `cross-device`. A rename is a link
+/// that also removes the source entry, so it follows the link's rule.
 pub(crate) async fn rename_at<HostFs>(
     namespace: &Namespace<HostFs>,
-    source_base: Granted<'_, Directory, Mutate>,
+    rename: RenameGrant<'_, '_>,
     source_path: &str,
-    destination_base: Granted<'_, Directory, Mutate>,
     destination_path: &str,
     now: u64,
 ) -> FsOpResult<()>
 where
     HostFs: crate::HostFileSystem,
 {
-    let source = child_below(source_base.descriptor(), source_path)?;
-    let destination = child_below(destination_base.descriptor(), destination_path)?;
+    let source = child_below(rename.source(), source_path)?;
+    let destination = child_below(rename.destination(), destination_path)?;
     namespace
         .rename(&source, &destination, now)
         .await
@@ -685,7 +683,7 @@ where
 /// Links within one mount; across two, `cross-device`.
 pub(crate) async fn link_at<HostFs>(
     namespace: &Namespace<HostFs>,
-    link: LinkGrant<'_, '_>,
+    link: AliasGrant<'_, '_>,
     source_path: &str,
     destination_path: &str,
     now: u64,
@@ -728,14 +726,13 @@ where
 /// when it would name something outside the link's directory.
 pub(crate) async fn readlink_at<HostFs>(
     namespace: &Namespace<HostFs>,
-    base: &FsDescriptor,
+    base: Granted<'_, Directory, Read>,
     path: &str,
 ) -> FsOpResult<String>
 where
     HostFs: crate::HostFileSystem,
 {
-    require_directory(base)?;
-    let absolute = child_path(base, path)?;
+    let absolute = child_path(base.descriptor(), path)?;
     let resolved = resolve(namespace, &absolute)?;
     let target = resolved
         .fs()
@@ -1500,7 +1497,7 @@ where
         let profile = accessor.with(|mut access| component_fs_profile(access.get()));
         let (base, namespace) =
             accessor.with(|mut access| descriptor_in(access.get(), &descriptor))?;
-        let result = self::stat_at(&namespace, &base, path_flags, &path)
+        let result = self::stat_at(&namespace, base.grant()?, path_flags, &path)
             .await
             .map(|metadata| descriptor_stat(&metadata));
         record_component_fs_profile(profile, "stat-at");
@@ -1555,7 +1552,7 @@ where
         })?;
         Ok(self::link_at(
             &namespace,
-            source_base.grant()?.link_into(destination_base.grant()?)?,
+            source_base.grant()?.alias_into(destination_base.grant()?)?,
             &source_path,
             &destination_path,
             now,
@@ -1576,8 +1573,16 @@ where
             let (base, namespace) = descriptor_in(access.get(), &descriptor)?;
             Ok::<_, fs_types::ErrorCode>((base, namespace, access.get().now_nanos()))
         })?;
-        let opened =
-            self::open_at(&namespace, &base, path_flags, &path, open_flags, flags, now).await?;
+        let opened = self::open_at(
+            &namespace,
+            base.grant()?,
+            path_flags,
+            &path,
+            open_flags,
+            flags,
+            now,
+        )
+        .await?;
         let result = accessor
             .with(|mut access| access.get().table.push(opened))
             .map_err(FsError::trap);
@@ -1601,7 +1606,7 @@ where
             }
             descriptor_in(access.get(), &descriptor)
         })?;
-        Ok(self::readlink_at(&namespace, &base, &path).await?)
+        Ok(self::readlink_at(&namespace, base.grant()?, &path).await?)
     }
 
     async fn remove_directory_at(
@@ -1628,9 +1633,11 @@ where
         })?;
         Ok(self::rename_at(
             &namespace,
-            source_base.grant()?,
+            source_base
+                .grant()?
+                .alias_into(destination_base.grant()?)?
+                .removing_source()?,
             &source_path,
-            destination_base.grant()?,
             &destination_path,
             now,
         )
@@ -1706,7 +1713,7 @@ where
         let profile = accessor.with(|mut access| component_fs_profile(access.get()));
         let (base, namespace) =
             accessor.with(|mut access| descriptor_in(access.get(), &descriptor))?;
-        let result = self::stat_at(&namespace, &base, path_flags, &path)
+        let result = self::stat_at(&namespace, base.grant()?, path_flags, &path)
             .await
             .map(|metadata| self::metadata_hash(&metadata));
         record_component_fs_profile(profile, "metadata-hash-at");
