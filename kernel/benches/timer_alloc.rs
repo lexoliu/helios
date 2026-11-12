@@ -30,8 +30,9 @@ use divan::counter::ItemsCount;
 use divan::{AllocProfiler, Bencher, black_box};
 use futures::task::noop_waker_ref;
 use helios_hal::cpu::{Cpu, HardwarePerfCounters, Instant, ProcessorId, Timebase, TimerInterrupt};
+use helios_hal::numa::SingleNode;
 use helios_hal::watchdog::ProgressCounter;
-use helios_kernel::{Executor, Timer};
+use helios_kernel::{Executor, Locality, Timer};
 
 #[global_allocator]
 static ALLOC: AllocProfiler = AllocProfiler::system();
@@ -60,9 +61,12 @@ impl helios_hal::critical_section::LocalInterruptMask for BenchInterruptMask {
 
 helios_hal::critical_section::set_local_interrupt_mask_impl!(BenchInterruptMask);
 
-/// Processor 0's timer, as its executor builds it.
+/// Processor 0's timer, as its executor builds it on a one-processor
+/// machine with no NUMA description. The locality is leaked: the kernel
+/// holds it for the machine's life, and the benchmark process is that.
 fn bench_timer() -> Timer<BenchCpu> {
-    Executor::new(ProgressCounter::new(), 1, ProcessorId::new(0)).timer(BenchCpu::new())
+    let locality = Box::leak(Box::new(Locality::new(&SingleNode::new(1), &[])));
+    Executor::new(ProgressCounter::new(), locality, ProcessorId::new(0)).timer(BenchCpu::new())
 }
 
 #[derive(Clone)]

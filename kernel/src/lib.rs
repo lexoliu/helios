@@ -159,22 +159,22 @@ pub use memory::{
     FiberStackArenaStats, FiberStackError, FiberStackVmHooks, HardwareEntropySource,
     IDLE_SWAP_AFTER, KERNEL_HEAP_BOOTSTRAP_BYTES, KERNEL_HEAP_GROWTH_CHUNK_BYTES,
     KERNEL_HEAP_MAX_BOOT_FRACTION, KERNEL_HEAP_MIN_RESERVE_BYTES, KERNEL_HEAP_RESERVE_FRACTION,
-    MemoryOwner, NoCryptographicEntropy, NoEntropyDevice, NodeRun, ROOT_ENTROPY_MATERIAL_BYTES,
-    RegionShares, ReleasedReservation, ReservationLookup, ReservationTracker, RootEntropy,
-    RootEntropyHandle, SWAP_BATCH_BYTES, SWAP_TICK, StackFault, SwapDisabled, SwapEntry,
-    SwapFaultError, SwapHandle, SwapStats, SwapVmHooks, TASK_ARENA_FRACTION, TASK_ARENA_MIN_BYTES,
-    USER_POOL_MIN_REGION_BYTES, UserHeapStats, UserMemoryOwnerScope, UserMemoryOwners,
-    UserMemoryPool, VaCursor, allocate_user_frame_uninit_on, allocate_user_frame_uninit_on_node,
-    allocate_user_frame_zeroed, allocate_user_frame_zeroed_on, allocate_user_run_zeroed_on,
-    claim_fiber_stack, configure_user_memory_owner_processors, current_user_memory_owner,
-    deallocate_user_frame, deallocate_user_frame_on, deallocate_user_run_on, disable_swap,
-    enter_user_memory_owner, fiber_stack_arena_stats, fiber_stack_demand_commits_on,
-    install_entropy_device, install_fiber_stack_arena, install_fiber_stack_hooks,
-    install_memory_balloon, install_swap, install_swap_hooks, installed_swap_handle,
-    installed_swap_hooks, kernel_reserve_for, largest_servable_user_bytes,
-    page_fault_frame_reserve_bytes, ranges_outside, resolve_stack_fault, seed_root_entropy,
-    swapped_token, task_arena_bytes_for, user_frame_node, user_heap_stats,
-    user_mapping_kernel_heap_bytes, validate_range,
+    Locality, MemoryOwner, NoCryptographicEntropy, NoEntropyDevice, NodeRun,
+    ROOT_ENTROPY_MATERIAL_BYTES, RegionShares, ReleasedReservation, ReservationLookup,
+    ReservationTracker, RootEntropy, RootEntropyHandle, SWAP_BATCH_BYTES, SWAP_TICK, StackFault,
+    SwapDisabled, SwapEntry, SwapFaultError, SwapHandle, SwapStats, SwapVmHooks,
+    TASK_ARENA_FRACTION, TASK_ARENA_MIN_BYTES, USER_POOL_MIN_REGION_BYTES, UserHeapStats,
+    UserMemoryOwnerScope, UserMemoryOwners, UserMemoryPool, VaCursor,
+    allocate_user_frame_uninit_on, allocate_user_frame_uninit_on_node, allocate_user_frame_zeroed,
+    allocate_user_frame_zeroed_on, allocate_user_run_zeroed_on, claim_fiber_stack,
+    configure_user_memory_owner_processors, current_user_memory_owner, deallocate_user_frame,
+    deallocate_user_frame_on, deallocate_user_run_on, disable_swap, enter_user_memory_owner,
+    fiber_stack_arena_stats, fiber_stack_demand_commits_on, install_entropy_device,
+    install_fiber_stack_arena, install_fiber_stack_hooks, install_memory_balloon, install_swap,
+    install_swap_hooks, installed_swap_handle, installed_swap_hooks, kernel_reserve_for,
+    largest_servable_user_bytes, page_fault_frame_reserve_bytes, ranges_outside,
+    resolve_stack_fault, seed_root_entropy, swapped_token, task_arena_bytes_for, user_frame_node,
+    user_heap_stats, user_mapping_kernel_heap_bytes, validate_range,
 };
 pub use network::{
     HTTP_FORBIDDEN_FIELD_NAMES, HTTP_MAX_FIELD_SECTION_BYTES, HTTP_MAX_FIELD_VALUE_BYTES, HttpBody,
@@ -1185,7 +1185,9 @@ where
     } else {
         ProgressCounter::new()
     };
-    let executor = Executor::new(progress, topology.configured_processors, current_processor);
+    // The bootstrap processor asserted above that the locality names
+    // `topology.configured_processors`; secondaries start only after.
+    let executor = Executor::new(progress, memory::locality(), current_processor);
     let kernel = Kernel {
         timer: executor.timer(cpu.clone()),
         cpu,

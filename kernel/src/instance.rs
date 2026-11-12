@@ -4,17 +4,19 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use core::task::{Context, Poll};
 use core::time::Duration;
 
 use crossbeam_utils::CachePadded;
-use helios_hal::cpu::current_processor;
+use helios_hal::cpu::{ProcessorId, current_processor};
+use helios_hal::numa::NodeId;
 use slab::Slab;
 use spin::Mutex;
 use triomphe::Arc;
 
-use crate::memory::{MemoryOwner, UserMemoryOwnerScope, enter_user_memory_owner};
+use crate::exec::TaskHome;
+use crate::memory::{Locality, MemoryOwner, UserMemoryOwnerScope, enter_user_memory_owner};
 use crate::user_mapping_kernel_heap_bytes;
 use crate::{Notify, NotifyWaiter};
 
@@ -314,6 +316,86 @@ struct InstanceEntry {
     condemned_user_bytes: AtomicU64,
     condemned_kernel_bytes: AtomicU64,
     handle_count: AtomicUsize,
+    /// Where the instance's global tasks are queued. Shared with every
+    /// [`crate::InstanceSpawner`] of the instance, whose tasks may
+    /// outlive this entry.
+    home: Arc<InstanceHome>,
+}
+
+/// The home of an instance: the node its global tasks are queued on,
+/// named by the processor whose node it is.
+///
+/// #516 defines the home as the node the instance's memory was committed
+/// on. Wasmtime commits an instance's linear memory during instantiation,
+/// on the processor running the instance's first turn, under the owner
+/// scope [`StoreTurns::begin`] opens, so that first turn fixes the home.
+/// Until then the home is provisional: the processor that registered
+/// the instance, which is where the launch path runs.
+///
+/// The home does not move afterwards. A stolen turn runs on the thief
+/// and commits from the thief's node, but the next wake still queues the
+/// task at home: placement follows where the memory is, not where load
+/// last spiked.
+///
+/// The word holds the processor rather than its node because the
+/// processor is what the executing hardware answers, and its node is
+/// read through the machine's immutable [`Locality`] by the scheduler
+/// that queues the task.
+///
+/// # Concurrency contract
+///
+/// One lock-free word, not cache-padded: it is written at most twice in
+/// the instance's life. Registration writes the provisional value; the
+/// first [`StoreTurns::begin`] of any of the instance's stores, on any
+/// processor, settles it with one CAS that only a provisional value
+/// passes, so the first turn wins and every later one only loads.
+/// Every scheduler of the instance's tasks reads it on every schedule,
+/// from any processor. `Relaxed` throughout: the word publishes no other
+/// memory, and a scheduler that reads the provisional value just after
+/// it settled queues that one task where it would have gone a moment
+/// earlier.
+pub(crate) struct InstanceHome {
+    word: AtomicU32,
+}
+
+/// The bit of [`InstanceHome::word`] that says the home is provisional.
+/// The processor occupies the low 16 bits ([`ProcessorId`] is a `u16`).
+const HOME_PROVISIONAL: u32 = 1 << 31;
+
+impl InstanceHome {
+    fn provisional(processor: ProcessorId) -> Self {
+        Self {
+            word: AtomicU32::new(HOME_PROVISIONAL | u32::from(processor.id())),
+        }
+    }
+
+    /// Fixes the home at `processor` unless a turn already has.
+    fn settle(&self, processor: ProcessorId) {
+        let word = self.word.load(Ordering::Relaxed);
+        if word & HOME_PROVISIONAL == 0 {
+            return;
+        }
+        // A failed exchange means another store's first turn settled it
+        // first, and that turn's processor is the home.
+        let _ = self.word.compare_exchange(
+            word,
+            u32::from(processor.id()),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// The processor whose node is the home.
+    pub(crate) fn processor(&self) -> ProcessorId {
+        // The low 16 bits are a processor id by construction.
+        ProcessorId::new(self.word.load(Ordering::Relaxed) as u16)
+    }
+}
+
+impl TaskHome for Arc<InstanceHome> {
+    fn node(&self, locality: &Locality) -> NodeId {
+        locality.node_of(self.processor())
+    }
 }
 
 #[derive(Default)]
@@ -365,6 +447,7 @@ impl InstanceRegistry {
             condemned_user_bytes: AtomicU64::new(0),
             condemned_kernel_bytes: AtomicU64::new(0),
             handle_count: AtomicUsize::new(1),
+            home: Arc::new(InstanceHome::provisional(current_processor())),
         });
         let entry_ptr = NonNull::from(entry.as_ref());
         let entry_slot = self.inner.entries.lock().insert(entry);
@@ -773,6 +856,11 @@ impl RegisteredInstance {
         self.entry().policy
     }
 
+    /// The instance's home, for a spawner that queues its tasks.
+    pub(crate) fn home(&self) -> Arc<InstanceHome> {
+        self.entry().home.clone()
+    }
+
     pub fn memory_bytes(&self) -> u64 {
         self.entry().memory_bytes.load(Ordering::Acquire)
     }
@@ -1099,7 +1187,8 @@ impl StoreTurns {
     /// Put the store on the executing processor as of `now_nanos`.
     ///
     /// Until the turn ends, user memory this processor commits is the
-    /// instance's: see [`ProcessorTurn`].
+    /// instance's: see [`ProcessorTurn`]. The instance's first turn, of
+    /// any of its stores, fixes its home here (`InstanceHome`).
     pub fn begin(&self, now_nanos: u64) -> ProcessorTurn<'_> {
         let word = self.clock.word.load(Ordering::Relaxed);
         // Turns of one store cannot nest: the driver holds the store by
@@ -1112,10 +1201,9 @@ impl StoreTurns {
         );
         // The owner scope is entered before the clock is marked, so a
         // processor without identity fails before the store is on it.
-        let owner = enter_user_memory_owner(
-            current_processor(),
-            MemoryOwner::new(self.instance.id().raw()),
-        );
+        let processor = current_processor();
+        let owner = enter_user_memory_owner(processor, MemoryOwner::new(self.instance.id().raw()));
+        self.instance.entry().home.settle(processor);
         self.clock.word.store(
             ON_PROCESSOR | now_nanos.saturating_sub(word),
             Ordering::Release,
@@ -1250,6 +1338,36 @@ mod tests {
         drop(main);
         assert_eq!(registry.active_totals(5_000)[0].active_nanos, 260);
         assert_eq!(registry.idle_instances(5_000, 2_990), vec![instance.id()]);
+    }
+
+    /// The home is provisional until the instance's first turn, of any
+    /// of its stores, and fixed where that turn ran from then on.
+    #[test]
+    fn the_first_turn_of_any_store_fixes_the_home() {
+        let processor = helios_hal::cpu::ProcessorId::new;
+        crate::test_processor_identity::set(processor(2));
+        let registry = InstanceRegistry::new();
+        let instance = registry.register("homed", 0);
+        let main = InstanceActivity::new(instance.clone(), 0);
+        let thread = InstanceActivity::new(instance.clone(), 0);
+        assert_eq!(
+            instance.home().processor(),
+            processor(2),
+            "provisionally the registering processor"
+        );
+
+        crate::test_processor_identity::set(processor(1));
+        thread.turns().begin(1).end(2);
+        assert_eq!(instance.home().processor(), processor(1));
+
+        crate::test_processor_identity::set(processor(0));
+        main.turns().begin(3).end(4);
+        thread.turns().begin(5).end(6);
+        assert_eq!(
+            instance.home().processor(),
+            processor(1),
+            "a later turn elsewhere does not move it"
+        );
     }
 
     #[test]

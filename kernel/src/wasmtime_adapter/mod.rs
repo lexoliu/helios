@@ -258,7 +258,7 @@ where
                 wasmtime::component::ResourceTable::new(),
                 context.cpu,
                 context.timer,
-                context.spawner.instance_spawner(funding),
+                context.spawner.instance_spawner(funding, &context.instance),
                 context.runtime_state,
                 context.instance_registry,
                 context.instance,

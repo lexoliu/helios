@@ -50,7 +50,7 @@ pub(crate) use frame_reserve::{
     configure_processors as configure_frame_reserve_processors, top_up as top_up_frame_reserve,
 };
 pub(crate) use irq_safe::IrqSafeMutex;
-pub use locality::NodeRun;
+pub use locality::{Locality, NodeRun};
 pub use mapping_cost::user_mapping_kernel_heap_bytes;
 pub use owner::{
     MemoryOwner, UserMemoryOwnerScope, UserMemoryOwners, configure_user_memory_owner_processors,

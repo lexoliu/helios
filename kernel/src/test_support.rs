@@ -4,9 +4,14 @@
 //! test that needs one should not have to spell a whole `Cpu`
 //! implementation out again.
 
+use alloc::boxed::Box;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase, TimerInterrupt};
+use helios_hal::numa::{MemoryAffinity, NodeDistance, NodeId, NumaTopology, SingleNode};
+
+use crate::memory::Locality;
 
 /// The processor-local interrupt mask for the kernel's own unit tests.
 ///
@@ -124,10 +129,61 @@ impl Cpu for TestCpu {
 pub(crate) fn test_timer<CpuImpl: Cpu + Clone>(cpu: CpuImpl) -> crate::Timer<CpuImpl> {
     crate::Executor::new(
         helios_hal::watchdog::ProgressCounter::new(),
-        cpu.processor_count(),
+        single_node_locality(cpu.processor_count()),
         helios_hal::cpu::current_processor(),
     )
     .timer(cpu)
+}
+
+/// The locality of a machine with `processors` processors and no NUMA
+/// description, as a backend that publishes none hands the kernel.
+///
+/// It is leaked, because the kernel holds the machine's locality for
+/// the machine's life, and a test process is that life. It describes no
+/// user memory: nothing that takes it allocates from a pool.
+pub(crate) fn single_node_locality(processors: usize) -> &'static Locality {
+    Box::leak(Box::new(Locality::new(&SingleNode::new(processors), &[])))
+}
+
+/// A machine a test spells out: which node each processor is on and
+/// the distance matrix. It names no memory affinity.
+pub(crate) struct TestMachine {
+    /// Index: processor.
+    pub(crate) processor_nodes: Vec<usize>,
+    /// Row-major, `node_count²`.
+    pub(crate) distances: Vec<u8>,
+}
+
+impl TestMachine {
+    /// The machine's locality, leaked as [`single_node_locality`]'s is,
+    /// with no user memory.
+    pub(crate) fn locality(&self) -> &'static Locality {
+        Box::leak(Box::new(Locality::new(self, &[])))
+    }
+}
+
+impl NumaTopology for TestMachine {
+    type MemoryAffinities<'a> = core::iter::Empty<MemoryAffinity>;
+
+    fn node_count(&self) -> usize {
+        self.distances.len().isqrt()
+    }
+
+    fn processor_count(&self) -> usize {
+        self.processor_nodes.len()
+    }
+
+    fn processor_node(&self, processor: ProcessorId) -> NodeId {
+        NodeId::new(self.processor_nodes[usize::from(processor.id())])
+    }
+
+    fn distance(&self, from: NodeId, to: NodeId) -> NodeDistance {
+        NodeDistance::new(self.distances[from.index() * self.node_count() + to.index()])
+    }
+
+    fn memory_affinity(&self) -> Self::MemoryAffinities<'_> {
+        core::iter::empty()
+    }
 }
 
 /// A CPU whose clock a test moves by hand.

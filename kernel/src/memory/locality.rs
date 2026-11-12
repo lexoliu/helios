@@ -65,7 +65,7 @@ impl Locality {
     /// exactly one affinity range is checked where the physical addresses
     /// are still known, by `usable_node_regions`: the kernel sees the
     /// direct map only.
-    pub(crate) fn new<Numa: NumaTopology>(numa: &Numa, pool_regions: &[NodeRun]) -> Self {
+    pub fn new<Numa: NumaTopology>(numa: &Numa, pool_regions: &[NodeRun]) -> Self {
         let node_count = numa.node_count();
         assert!(
             (1..=MAX_NODES).contains(&node_count),

@@ -256,7 +256,7 @@ where
             // cannot starve the desktop.
             exec_context
                 .spawner
-                .instance_spawner(crate::TaskFunding::Kernel),
+                .instance_spawner(crate::TaskFunding::Kernel, &instance),
             exec_context.runtime_state.clone(),
             exec_context.instance_registry.clone(),
             instance,

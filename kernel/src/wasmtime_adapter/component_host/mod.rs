@@ -1646,7 +1646,7 @@ where
     // A system component is kernel infrastructure, so its tasks are
     // funded from the arena's kernel reserve: user-mode load fills the
     // instance share and stops there.
-    let instantiate_spawner = spawner.instance_spawner(crate::TaskFunding::Kernel);
+    let instantiate_spawner = spawner.instance_spawner(crate::TaskFunding::Kernel, &instance);
 
     let context = ComponentExecContext::new(
         cpu,
@@ -4761,10 +4761,15 @@ mod tests {
     impl PhaseFixture {
         fn new() -> Self {
             let cpu = TestCpu::without_entropy();
-            let executor = Executor::new(ProgressCounter::new(), 1, ProcessorId::new(0));
+            let executor = Executor::new(
+                ProgressCounter::new(),
+                crate::test_support::single_node_locality(1),
+                ProcessorId::new(0),
+            );
+            let instance = crate::InstanceRegistry::new().register("phase", 0);
             let spawner = executor
                 .spawner(cpu)
-                .instance_spawner(TaskFunding::Instance);
+                .instance_spawner(TaskFunding::Instance, &instance);
             let timer = executor.timer(cpu);
             Self {
                 executor,
