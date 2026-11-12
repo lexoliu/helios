@@ -157,7 +157,7 @@ impl<'f, P: ProcessorIdentities> DeviceTreeNuma<'f, P> {
         if bytes.len() % (DISTANCE_ENTRY_CELLS * 4) != 0 {
             return Err(FirmwareNumaError::DistanceMapMalformed);
         }
-        for entry in bytes.chunks_exact(DISTANCE_ENTRY_CELLS * 4) {
+        for entry in bytes.as_chunks::<{ DISTANCE_ENTRY_CELLS * 4 }>().0 {
             let cell = |index: usize| {
                 u32::from_be_bytes(entry[index * 4..index * 4 + 4].try_into().unwrap())
             };
