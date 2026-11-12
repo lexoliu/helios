@@ -239,6 +239,33 @@ where
         })
     }
 
+    /// Asks the DHCP server whether the lease the interface holds is
+    /// still good, once the machine has been restored.
+    ///
+    /// The DHCP client lives on the default shard, so that is the one
+    /// state this touches, under its own lock for the length of one
+    /// message. Live TCP is left alone: a connection keeps working if
+    /// the lease is confirmed. Resolves once the REQUEST has
+    /// been handed to the device; the packet pumps carry the exchange
+    /// on from there, retransmitting it on the client's own deadline.
+    pub(super) async fn revalidate_lease(&self) {
+        let now_nanos = self.now_nanos();
+        let transaction_id = next_transaction_id(now_nanos as u32);
+        let begun = self.inner.state.with_mut(|state| {
+            state.begin_lease_revalidation(transaction_id, StackInstant::from_nanos(now_nanos))
+        });
+        if !begun {
+            return;
+        }
+        tracing::info!("machine restored: re-validating the DHCP lease");
+        // The configuration duty runs the client, which queues the
+        // REQUEST that is due, and submitting it puts it on the device.
+        self.drive_interface_configuration();
+        if let Err(error) = self.drive_network(NetworkPollSource::Configuration).await {
+            tracing::warn!(?error, "the lease re-validation could not be sent");
+        }
+    }
+
     pub(super) async fn drive_dns(&self) -> Result<(), DnsError> {
         self.drive_network(NetworkPollSource::Dns)
             .await
@@ -292,6 +319,10 @@ where
 
     fn hardware_address(&self) -> [u8; 6] {
         NetworkService::hardware_address(self)
+    }
+
+    async fn revalidate_lease(&self) {
+        NetworkService::revalidate_lease(self).await;
     }
 
     async fn ipv4_cidr(&self) -> Option<crate::Ipv4Cidr> {
@@ -876,6 +907,23 @@ impl NetworkShard {
             });
         }
         self.dns_servers.clear();
+    }
+
+    /// Starts INIT-REBOOT for the lease the interface holds, after a
+    /// machine restore that may have moved it to another network.
+    ///
+    /// Returns whether a question was begun: only a client that holds a
+    /// lease has one to ask about, and one that does not has an exchange
+    /// of its own under way, which already asks the link for an address.
+    /// The REQUEST itself leaves with the next DHCP drive, which also
+    /// retransmits it and, when nobody answers, ends the lease; the
+    /// address stays in use until then.
+    pub(super) fn begin_lease_revalidation(
+        &mut self,
+        transaction_id: u32,
+        now: StackInstant,
+    ) -> bool {
+        self.dhcp.revalidate(now, transaction_id)
     }
 
     /// Queues one client message, and tells the client when a unicast

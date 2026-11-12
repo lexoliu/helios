@@ -2098,6 +2098,117 @@ mod tests {
         TcpListenerId(ReplicaHandle::new(slot).get())
     }
 
+    /// A restored machine may be on another network, so a client that
+    /// holds a lease asks the link to confirm it (INIT-REBOOT) and keeps
+    /// the address while it waits; one with no lease has an exchange of
+    /// its own under way and is left alone.
+    #[test]
+    fn a_restored_machine_asks_the_link_to_confirm_its_lease() {
+        let mut shard = test_network_shard();
+        assert!(
+            !shard.begin_lease_revalidation(9, StackInstant::from_nanos(SECOND)),
+            "a client still in INIT has no lease to confirm"
+        );
+        assert_eq!(shard.dhcp.state(), DhcpState::Init);
+        let own_exchange = shard.dhcp.transaction_id();
+        drive_dhcp_ok(&mut shard, SECOND);
+        assert_eq!(shard.dhcp.state(), DhcpState::Selecting);
+        assert!(
+            !shard.begin_lease_revalidation(9, StackInstant::from_nanos(SECOND)),
+            "a client mid-DISCOVER has no lease to confirm"
+        );
+        assert_eq!(shard.dhcp.state(), DhcpState::Selecting);
+        assert_eq!(shard.dhcp.transaction_id(), own_exchange);
+
+        let mut shard = dhcp_bound_shard();
+        let start = 100 * SECOND;
+        assert!(shard.begin_lease_revalidation(9, StackInstant::from_nanos(start)));
+        assert_eq!(shard.dhcp.state(), DhcpState::Rebooting);
+        assert_eq!(shard.dhcp.transaction_id(), 9);
+        assert!(
+            !drive_dhcp_ok(&mut shard, start),
+            "a question about the lease changes nothing yet"
+        );
+        assert_eq!(
+            shard.stack.ipv4_addresses().count(),
+            1,
+            "the address stays in use until the link answers"
+        );
+        let frames = drain_outbound(&mut shard);
+        let (destination, port, payload) = dhcp_datagram(
+            frames
+                .last()
+                .expect("a DHCP REQUEST frame should be queued"),
+        );
+        assert_eq!(destination, Ipv4Address::BROADCAST);
+        assert_eq!(port, DHCP_SERVER_PORT);
+        // The requested-IP option (50) names the held address.
+        assert!(
+            payload
+                .windows(6)
+                .any(|option| option == [50, 4, 192, 0, 2, 10])
+        );
+    }
+
+    /// A link that never confirms the lease leaves the client no reason
+    /// to trust it: after the attempts the shard takes the address, the
+    /// route and the resolvers off the interface, and asks for a new
+    /// lease.
+    #[test]
+    fn an_unconfirmed_lease_is_taken_off_the_interface() {
+        let mut shard = dhcp_bound_shard();
+        let start = 100 * SECOND;
+        assert!(shard.begin_lease_revalidation(9, StackInstant::from_nanos(start)));
+
+        for attempt in 0..4 {
+            assert!(!drive_dhcp_ok(&mut shard, start + attempt * SECOND));
+            assert_eq!(shard.stack.ipv4_addresses().count(), 1);
+        }
+        drain_outbound(&mut shard);
+
+        assert!(
+            drive_dhcp_ok(&mut shard, start + 4 * SECOND),
+            "the lease ended"
+        );
+
+        assert_eq!(shard.stack.ipv4_addresses().count(), 0);
+        assert!(!has_default_route(&shard));
+        assert!(shard.dns_servers.is_empty());
+        assert_eq!(shard.dhcp.state(), DhcpState::Selecting);
+        let frames = drain_outbound(&mut shard);
+        let (destination, port, _) = dhcp_datagram(
+            frames
+                .last()
+                .expect("a DHCP DISCOVER frame should be queued"),
+        );
+        assert_eq!(destination, Ipv4Address::BROADCAST);
+        assert_eq!(port, DHCP_SERVER_PORT);
+    }
+
+    /// A server on the new link may confirm another address than the one
+    /// the machine held: the shard swaps the old one for it.
+    #[test]
+    fn a_confirmation_that_names_another_address_replaces_the_one_held() {
+        let mut shard = dhcp_bound_shard();
+        let start = 100 * SECOND;
+        assert!(shard.begin_lease_revalidation(9, StackInstant::from_nanos(start)));
+        drive_dhcp_ok(&mut shard, start);
+        drain_outbound(&mut shard);
+        let moved = Ipv4Address::new([192, 0, 2, 77]);
+        let mut ack = dhcp_reply(&shard.dhcp, DhcpMessageType::Ack);
+        ack.your_ip = moved;
+        deliver_dhcp(&mut shard, &ack, start + SECOND);
+
+        assert!(drive_dhcp_ok(&mut shard, start + SECOND));
+
+        assert_eq!(shard.dhcp.state(), DhcpState::Bound);
+        assert_eq!(shard.stack.ipv4_addresses().count(), 1);
+        assert_eq!(
+            shard.stack.primary_ipv4_address(),
+            Some(Ipv4Cidr::new(moved, 24))
+        );
+    }
+
     /// A link that comes back is not the link that went away: the lease,
     /// the routes it pointed at and the resolvers that came with it are
     /// all stale, and nothing would ask the new link for an address

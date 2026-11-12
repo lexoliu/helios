@@ -12,6 +12,11 @@ const NANOS_PER_SECOND: u64 = 1_000_000_000;
 /// always retransmitted at. RFC 2131 §4.1 suggests a randomised backoff
 /// that starts at four seconds and doubles to 64.
 const RETRANSMIT_NANOS: u64 = NANOS_PER_SECOND;
+/// REQUESTs an INIT-REBOOT client sends before giving the lease up and
+/// starting over from DISCOVER. RFC 2131 section 3.2 leaves the count
+/// to the client; with the retransmission interval above, four tries
+/// is the few seconds a server on the same link needs to answer.
+const DHCP_REBOOT_ATTEMPTS: u32 = 4;
 /// RFC 2131 §4.4.5: a client in RENEWING or REBINDING waits half the
 /// time left to the next deadline between requests, "down to a minimum
 /// of 60 seconds".
@@ -142,6 +147,26 @@ impl DhcpClientMessage {
             client_mac,
             client_ip,
             requested_ip: None,
+            server_identifier: None,
+        }
+    }
+
+    /// A REQUEST in the INIT-REBOOT state (RFC 2131 §3.2, §4.3.2): the
+    /// client asks whether the address it last held is still good,
+    /// without naming a server, so any server on the link may answer.
+    /// `ciaddr` stays zero and the address rides in the requested-address
+    /// option.
+    pub fn init_reboot(
+        transaction_id: u32,
+        client_mac: EthernetAddress,
+        requested_ip: Ipv4Address,
+    ) -> Self {
+        Self {
+            message_type: DhcpMessageType::Request,
+            transaction_id,
+            client_mac,
+            client_ip: Ipv4Address::UNSPECIFIED,
+            requested_ip: Some(requested_ip),
             server_identifier: None,
         }
     }
@@ -530,6 +555,7 @@ pub enum DhcpState {
     Bound,
     Renewing,
     Rebinding,
+    Rebooting,
 }
 
 /// The three deadlines of a finite lease, RFC 2131 §4.4.5, in the order
@@ -572,6 +598,18 @@ struct Renewal {
     resolution_retried: bool,
 }
 
+/// The requests of INIT-REBOOT, for a lease the client held before the
+/// machine was restored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Reboot {
+    /// When the exchange began, which the lease an ACK grants runs from
+    /// (RFC 2131 §4.4.1).
+    requested_at: StackInstant,
+    /// REQUESTs sent so far, the first included.
+    attempts: u32,
+    retransmit_at: StackInstant,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Phase {
     Init {
@@ -602,10 +640,19 @@ enum Phase {
         schedule: LeaseSchedule,
         renewal: Renewal,
     },
+    /// INIT-REBOOT (RFC 2131 §3.2): the lease is still configured while
+    /// any server on the link is asked to confirm it.
+    Rebooting {
+        binding: Binding,
+        /// When the lease the client held runs out, if it does: the
+        /// address is not the client's past that, answer or not.
+        expires_at: Option<StackInstant>,
+        reboot: Reboot,
+    },
 }
 
 /// The DHCPv4 client of RFC 2131 §4.4: INIT, SELECTING, REQUESTING,
-/// BOUND, RENEWING and REBINDING.
+/// BOUND, RENEWING, REBINDING and INIT-REBOOT.
 ///
 /// The client does no I/O and reads no clock. It is given the current
 /// time and at most one parsed server message, and answers with the one
@@ -617,11 +664,11 @@ enum Phase {
 ///
 /// A message is acted on only when it is for this interface's hardware
 /// address and this exchange's transaction id, and in a state that
-/// waits for it (RFC 2131 §4.4.1, table 4): REQUESTING, RENEWING and
-/// REBINDING take an ACK or a NAK, SELECTING an OFFER. REQUESTING and
-/// RENEWING take them only from the server that was asked, and an
-/// ACK or NAK in REBINDING from any server that names itself, because
-/// REBINDING asks them all (§4.4.5).
+/// waits for it (RFC 2131 §4.4.1, table 4): REQUESTING, RENEWING,
+/// REBINDING and INIT-REBOOT take an ACK or a NAK, SELECTING an OFFER.
+/// REQUESTING and RENEWING take them only from the server that was
+/// asked, and an ACK or NAK in REBINDING or INIT-REBOOT from any server
+/// that names itself, because those states ask them all (§3.2, §4.4.5).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DhcpClient {
     mac: EthernetAddress,
@@ -656,6 +703,7 @@ impl DhcpClient {
             Phase::Bound { .. } => DhcpState::Bound,
             Phase::Renewing { .. } => DhcpState::Renewing,
             Phase::Rebinding { .. } => DhcpState::Rebinding,
+            Phase::Rebooting { .. } => DhcpState::Rebooting,
         }
     }
 
@@ -669,7 +717,8 @@ impl DhcpClient {
         match &self.phase {
             Phase::Bound { binding, .. }
             | Phase::Renewing { binding, .. }
-            | Phase::Rebinding { binding, .. } => Some(&binding.lease),
+            | Phase::Rebinding { binding, .. }
+            | Phase::Rebooting { binding, .. } => Some(&binding.lease),
             Phase::Init { .. } | Phase::Selecting { .. } | Phase::Requesting { .. } => None,
         }
     }
@@ -689,7 +738,53 @@ impl DhcpClient {
             Phase::Rebinding {
                 schedule, renewal, ..
             } => Some(renewal.retransmit_at.min(schedule.expires_at)),
+            Phase::Rebooting {
+                expires_at, reboot, ..
+            } => Some(expires_at.map_or(reboot.retransmit_at, |expires_at| {
+                reboot.retransmit_at.min(expires_at)
+            })),
         }
+    }
+
+    /// Asks the link whether the lease the client holds is still good,
+    /// as after a machine restore that may have moved it to another
+    /// network (INIT-REBOOT, RFC 2131 §3.2), in a new exchange under
+    /// `transaction_id`. The first REQUEST is due at once: the caller
+    /// polls for it.
+    ///
+    /// Answers whether the question was started. Only a client that
+    /// holds a lease (BOUND, RENEWING or REBINDING) has one to ask
+    /// about; any other has an exchange of its own under way, which
+    /// already asks the link for an address, and is left alone. The
+    /// address stays configured until a server answers or the REQUESTs
+    /// go unanswered.
+    pub fn revalidate(&mut self, now: StackInstant, transaction_id: u32) -> bool {
+        let (binding, expires_at) = match &self.phase {
+            Phase::Bound { binding, schedule } => {
+                (binding, schedule.map(|schedule| schedule.expires_at))
+            }
+            Phase::Renewing {
+                binding, schedule, ..
+            }
+            | Phase::Rebinding {
+                binding, schedule, ..
+            } => (binding, Some(schedule.expires_at)),
+            Phase::Init { .. }
+            | Phase::Selecting { .. }
+            | Phase::Requesting { .. }
+            | Phase::Rebooting { .. } => return false,
+        };
+        self.phase = Phase::Rebooting {
+            binding: binding.clone(),
+            expires_at,
+            reboot: Reboot {
+                requested_at: now,
+                attempts: 0,
+                retransmit_at: now,
+            },
+        };
+        self.transaction_id = transaction_id;
+        true
     }
 
     /// Tells the client its last renewal request could not leave,
@@ -779,8 +874,61 @@ impl DhcpClient {
                 schedule,
                 renewal,
             } => self.step_rebinding(binding, schedule, renewal, now),
+            Phase::Rebooting {
+                binding,
+                expires_at,
+                reboot,
+            } => self.step_rebooting(binding, expires_at, reboot, now),
             phase => (phase, DhcpAction::None),
         }
+    }
+
+    fn step_rebooting(
+        &mut self,
+        binding: Binding,
+        expires_at: Option<StackInstant>,
+        reboot: Reboot,
+        now: StackInstant,
+    ) -> (Phase, DhcpAction) {
+        let expired = expires_at.is_some_and(|expires_at| now >= expires_at);
+        let unanswered = now >= reboot.retransmit_at && reboot.attempts >= DHCP_REBOOT_ATTEMPTS;
+        if expired || unanswered {
+            // The lease ran out, or nobody on this link confirmed it, so
+            // it cannot be assumed good: configuration starts over
+            // exactly as a NAK would start it.
+            return (
+                self.restart_exchange(now),
+                DhcpAction::Remove(binding.lease),
+            );
+        }
+        if now < reboot.retransmit_at {
+            return (
+                Phase::Rebooting {
+                    binding,
+                    expires_at,
+                    reboot,
+                },
+                DhcpAction::None,
+            );
+        }
+        let message = DhcpClientMessage::init_reboot(
+            self.transaction_id,
+            self.mac,
+            binding.lease.address.address(),
+        );
+        let reboot = Reboot {
+            attempts: reboot.attempts + 1,
+            retransmit_at: after(now, RETRANSMIT_NANOS),
+            ..reboot
+        };
+        (
+            Phase::Rebooting {
+                binding,
+                expires_at,
+                reboot,
+            },
+            broadcast(message),
+        )
     }
 
     fn step_renewing(
@@ -996,13 +1144,13 @@ impl DhcpClient {
                     schedule,
                     renewal,
                 },
-                kind @ (DhcpMessageType::Ack | DhcpMessageType::Nak),
+                DhcpMessageType::Ack | DhcpMessageType::Nak,
             ) if message.server_identifier == Some(binding.server) => self.answer_to_renewal(
                 binding,
-                kind,
                 message,
                 now,
                 renewal.requested_at,
+                AddressChange::Refused,
                 |binding| Phase::Renewing {
                     binding,
                     schedule,
@@ -1015,17 +1163,36 @@ impl DhcpClient {
                     schedule,
                     renewal,
                 },
-                kind @ (DhcpMessageType::Ack | DhcpMessageType::Nak),
+                DhcpMessageType::Ack | DhcpMessageType::Nak,
             ) if message.server_identifier.is_some() => self.answer_to_renewal(
                 binding,
-                kind,
                 message,
                 now,
                 renewal.requested_at,
+                AddressChange::Refused,
                 |binding| Phase::Rebinding {
                     binding,
                     schedule,
                     renewal,
+                },
+            ),
+            (
+                Phase::Rebooting {
+                    binding,
+                    expires_at,
+                    reboot,
+                },
+                DhcpMessageType::Ack | DhcpMessageType::Nak,
+            ) if message.server_identifier.is_some() => self.answer_to_renewal(
+                binding,
+                message,
+                now,
+                reboot.requested_at,
+                AddressChange::Allowed,
+                |binding| Phase::Rebooting {
+                    binding,
+                    expires_at,
+                    reboot,
                 },
             ),
             (phase, message_type) => {
@@ -1038,20 +1205,21 @@ impl DhcpClient {
         }
     }
 
-    /// An ACK or NAK in RENEWING or REBINDING, from a server that may
-    /// answer, to requests the first of which went out at
-    /// `requested_at`. `stay` rebuilds the phase the client is in, for
-    /// an ACK that has to be refused.
+    /// An ACK or NAK in RENEWING, REBINDING or INIT-REBOOT, from a server
+    /// that may answer, to requests the first of which went out at
+    /// `requested_at`. `change` says whether an ACK may grant another
+    /// address than the one held. `stay` rebuilds the phase the client
+    /// is in, for an ACK that has to be refused.
     fn answer_to_renewal(
         &mut self,
         binding: Binding,
-        kind: DhcpMessageType,
         message: &DhcpServerMessage,
         now: StackInstant,
         requested_at: StackInstant,
+        change: AddressChange,
         stay: impl FnOnce(Binding) -> Phase,
     ) -> (Phase, DhcpAction) {
-        if kind == DhcpMessageType::Nak {
+        if message.message_type == DhcpMessageType::Nak {
             // RFC 2131 §4.4.5: the lease is gone, and the client
             // "SHOULD ... return to the INIT state".
             let phase = self.restart_exchange(now);
@@ -1059,7 +1227,8 @@ impl DhcpClient {
         }
         let (renewed, schedule) = match lease_terms(message, requested_at) {
             Ok((renewed, schedule))
-                if renewed.lease.address.address() == binding.lease.address.address() =>
+                if change == AddressChange::Allowed
+                    || renewed.lease.address.address() == binding.lease.address.address() =>
             {
                 (renewed, schedule)
             }
@@ -1086,6 +1255,16 @@ impl DhcpClient {
             },
         )
     }
+}
+
+/// Whether an ACK to a request for a held lease may grant a different
+/// address. A renewal asks to keep the address, so a server that names
+/// another is refused; INIT-REBOOT asks whether the address is still
+/// good, and a server may answer with the one the link now has.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AddressChange {
+    Refused,
+    Allowed,
 }
 
 fn broadcast(message: DhcpClientMessage) -> DhcpAction {
@@ -2060,6 +2239,237 @@ mod tests {
             .expect("the message fits");
         assert_eq!(&bytes[12..16], &[0; 4]);
         assert_eq!(&bytes[10..12], &[0x80, 0]);
+    }
+
+    /// A bound client whose lease was granted at 0 s, asked to confirm
+    /// it at 100 s under transaction 9.
+    fn rebooting() -> DhcpClient {
+        let mut client = bound(|_| {});
+        assert!(client.revalidate(at(100), 9));
+        assert_eq!(client.state(), DhcpState::Rebooting);
+        client
+    }
+
+    /// RFC 2131 §3.2: only a client that holds a lease has one to
+    /// confirm. The others have an exchange of their own under way.
+    #[test]
+    fn a_lease_is_revalidated_only_by_a_client_that_holds_one() {
+        let selecting = {
+            let mut client = DhcpClient::new(MAC, TRANSACTION);
+            sent(client.poll(at(0)));
+            client
+        };
+        for mut client in [
+            DhcpClient::new(MAC, TRANSACTION),
+            selecting,
+            requesting(),
+            rebooting(),
+        ] {
+            let before = client.clone();
+
+            assert!(!client.revalidate(at(100), 9), "{:?}", before.state());
+
+            assert_eq!(client, before);
+        }
+        for mut client in [bound(|_| {}), renewing(), rebinding()] {
+            let held = client.lease().cloned();
+
+            assert!(client.revalidate(at(3200), 9), "{:?}", client.state());
+
+            assert_eq!(client.state(), DhcpState::Rebooting);
+            assert_eq!(client.transaction_id(), 9);
+            // The address stays configured while the question is open.
+            assert_eq!(client.lease().cloned(), held);
+        }
+    }
+
+    /// RFC 2131 §4.3.2, table 5: INIT-REBOOT broadcasts a REQUEST with
+    /// `ciaddr` zero, the address in option 50 and no option 54.
+    #[test]
+    fn the_first_reboot_request_is_a_broadcast_naming_the_address_and_no_server() {
+        let mut client = rebooting();
+
+        let request = sent(client.poll(at(100)));
+
+        assert_eq!(request.destination, DhcpDestination::Broadcast);
+        assert_eq!(
+            request.message,
+            DhcpClientMessage::init_reboot(9, MAC, ADDRESS)
+        );
+        let mut bytes = [0u8; 400];
+        let len = request
+            .message
+            .encode(&mut bytes)
+            .expect("the message fits");
+        assert_eq!(&bytes[12..16], &[0; 4]);
+        // With no address to answer to, the server broadcasts.
+        assert_eq!(&bytes[10..12], &[0x80, 0]);
+        let mut requested = None;
+        let mut parser = DhcpOptionParser::new(&bytes[BOOTP_HEADER_LEN + 4..len]);
+        while let Some(option) = parser.next().expect("options are well formed") {
+            assert_ne!(option.code, OPTION_SERVER_IDENTIFIER);
+            if option.code == OPTION_REQUESTED_IP {
+                requested = Some(option.value);
+            }
+        }
+        assert_eq!(requested, Some(&ADDRESS.octets()[..]));
+    }
+
+    #[test]
+    fn an_unconfirmed_lease_is_asked_about_every_second_and_then_removed() {
+        let mut client = rebooting();
+        let transaction = client.transaction_id();
+
+        for attempt in 0..DHCP_REBOOT_ATTEMPTS {
+            let now = at(100 + u64::from(attempt));
+            let request = sent(client.poll(now));
+            assert_eq!(
+                request.message,
+                DhcpClientMessage::init_reboot(transaction, MAC, ADDRESS)
+            );
+            assert_eq!(client.poll(now), DhcpAction::None);
+            assert_eq!(client.next_deadline(), Some(after(now, RETRANSMIT_NANOS)));
+            assert_eq!(client.state(), DhcpState::Rebooting);
+            assert!(client.lease().is_some());
+        }
+        assert_eq!(
+            client.poll(StackInstant::from_nanos(
+                (100 + u64::from(DHCP_REBOOT_ATTEMPTS)) * NANOS_PER_SECOND - 1
+            )),
+            DhcpAction::None
+        );
+
+        let action = client.poll(at(100 + u64::from(DHCP_REBOOT_ATTEMPTS)));
+
+        assert_eq!(action, DhcpAction::Remove(expected_lease(Some(at(3600)))));
+        assert_eq!(client.state(), DhcpState::Init);
+        assert_eq!(client.lease(), None);
+        assert_ne!(client.transaction_id(), transaction);
+        let discover = sent(client.poll(at(100 + u64::from(DHCP_REBOOT_ATTEMPTS))));
+        assert_eq!(discover.message.message_type, DhcpMessageType::Discover);
+    }
+
+    #[test]
+    fn a_lease_that_runs_out_while_rebooting_is_removed_when_it_does() {
+        let mut client = bound(|_| {});
+        let begun = StackInstant::from_nanos(3600 * NANOS_PER_SECOND - NANOS_PER_SECOND / 2);
+        assert!(client.revalidate(begun, 9));
+        sent(client.poll(begun));
+        // The retransmission is due a second on, past the expiry.
+        assert_eq!(client.next_deadline(), Some(at(3600)));
+        assert_eq!(
+            client.poll(StackInstant::from_nanos(at(3600).nanos() - 1)),
+            DhcpAction::None
+        );
+
+        let action = client.poll(at(3600));
+
+        assert_eq!(action, DhcpAction::Remove(expected_lease(Some(at(3600)))));
+        assert_eq!(client.state(), DhcpState::Init);
+    }
+
+    /// RFC 2131 §3.2: any server on the link may answer, and the lease
+    /// it confirms is then that server's to renew.
+    #[test]
+    fn an_ack_for_the_same_address_keeps_it_with_a_new_schedule() {
+        let mut client = rebooting();
+        sent(client.poll(at(100)));
+        let mut ack = reply(&client, DhcpMessageType::Ack, OTHER_SERVER);
+        ack.lease_seconds = Some(7200);
+
+        let (lease, replaces) = installed(client.on_message(at(101), &ack));
+
+        // The lease runs from the exchange's first request, at 100 s.
+        assert_eq!(lease, expected_lease(Some(at(100 + 7200))));
+        assert_eq!(replaces, None);
+        assert_eq!(client.state(), DhcpState::Bound);
+        assert_eq!(client.next_deadline(), Some(at(100 + 3600)));
+        let renewal = sent(client.poll(at(100 + 3600)));
+        assert_eq!(renewal.destination, DhcpDestination::Server(OTHER_SERVER));
+    }
+
+    #[test]
+    fn an_ack_for_another_address_replaces_the_one_held() {
+        let mut client = rebooting();
+        sent(client.poll(at(100)));
+        let moved = Ipv4Address::new([198, 51, 100, 7]);
+        let mut ack = reply(&client, DhcpMessageType::Ack, SERVER);
+        ack.your_ip = moved;
+        ack.subnet_mask = Some(Ipv4Address::new([255, 255, 0, 0]));
+        ack.router = Some(Ipv4Address::new([198, 51, 0, 1]));
+
+        let (lease, replaces) = installed(client.on_message(at(101), &ack));
+
+        assert_eq!(lease.address, Ipv4Cidr::new(moved, 16));
+        assert_eq!(lease.router, Some(Ipv4Address::new([198, 51, 0, 1])));
+        assert_eq!(replaces, Some(expected_lease(Some(at(3600)))));
+        assert_eq!(client.state(), DhcpState::Bound);
+        assert_eq!(client.lease(), Some(&lease));
+    }
+
+    #[test]
+    fn a_nak_while_rebooting_removes_the_lease_whichever_server_sends_it() {
+        let mut client = rebooting();
+        sent(client.poll(at(100)));
+        let transaction = client.transaction_id();
+        let nak = reply(&client, DhcpMessageType::Nak, OTHER_SERVER);
+
+        let action = client.on_message(at(101), &nak);
+
+        assert_eq!(action, DhcpAction::Remove(expected_lease(Some(at(3600)))));
+        assert_eq!(client.state(), DhcpState::Init);
+        assert_eq!(client.lease(), None);
+        assert_ne!(client.transaction_id(), transaction);
+        assert_eq!(client.next_deadline(), Some(at(101)));
+    }
+
+    #[test]
+    fn a_reply_to_another_exchange_is_ignored_while_rebooting() {
+        for message_type in [DhcpMessageType::Ack, DhcpMessageType::Nak] {
+            let mut client = rebooting();
+            sent(client.poll(at(100)));
+            let before = client.clone();
+            let mut message = reply(&client, message_type, SERVER);
+            // The exchange that was Bound's, not the one INIT-REBOOT began.
+            message.transaction_id = TRANSACTION;
+
+            assert_eq!(client.on_message(at(101), &message), DhcpAction::None);
+
+            assert_eq!(client, before, "{message_type:?}");
+        }
+    }
+
+    /// An ACK that renewing or rebinding refuses is refused here too,
+    /// and a NAK or ACK that names no server is no answer.
+    #[test]
+    fn a_reply_that_cannot_be_acted_on_leaves_the_client_rebooting() {
+        let faults: [fn(&mut DhcpServerMessage); 6] = [
+            |reply| reply.server_identifier = None,
+            |reply| reply.lease_seconds = None,
+            |reply| reply.lease_seconds = Some(0),
+            |reply| reply.your_ip = Ipv4Address::new([240, 0, 0, 1]),
+            |reply| reply.subnet_mask = Some(Ipv4Address::new([255, 0, 255, 0])),
+            |reply| reply.message_type = DhcpMessageType::Offer,
+        ];
+        for fault in faults {
+            let mut client = rebooting();
+            sent(client.poll(at(100)));
+            let before = client.clone();
+            let mut ack = reply(&client, DhcpMessageType::Ack, SERVER);
+            fault(&mut ack);
+
+            assert_eq!(client.on_message(at(101), &ack), DhcpAction::None);
+
+            assert_eq!(client, before, "{ack:?}");
+        }
+        let mut client = rebooting();
+        let before = client.clone();
+        let mut nak = reply(&client, DhcpMessageType::Nak, SERVER);
+        nak.server_identifier = None;
+
+        assert_eq!(client.on_message(at(101), &nak), DhcpAction::None);
+
+        assert_eq!(client, before);
     }
 
     #[test]

@@ -699,6 +699,15 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
 
     fn hardware_address(&self) -> [u8; 6];
 
+    /// Asks the DHCP server whether the lease the interface holds is
+    /// still good, after a machine restore may have moved the machine to
+    /// another network. An interface that is not DHCP-configured does
+    /// nothing. Resolves once the question is on the wire; the answer
+    /// is applied by the service's own packet pumps, an ACK keeping the
+    /// lease and a NAK or silence starting configuration over. Called
+    /// only by the machine-generation reactions task.
+    fn revalidate_lease(&self) -> impl Future<Output = ()> + Send + '_;
+
     fn ipv4_cidr(&self) -> impl Future<Output = Option<crate::Ipv4Cidr>> + Send + '_;
 
     fn ping<'a>(
@@ -1127,10 +1136,36 @@ impl HostFsError {
     }
 }
 
+/// What a machine restore did to the host share, as far as the kernel
+/// can tell from the restore's cause.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostShareRestore {
+    /// The host's 9p server is the one the session was attached to and
+    /// still knows it. What the kernel remembered is stale: cached
+    /// answers carry ages on a monotonic clock that did not advance
+    /// while the machine was stopped.
+    ServerKept,
+    /// The server no longer knows the session or any fid in it, because
+    /// the kernel came back from an image taken before the server saw
+    /// them. The session is dropped without a `Tclunk`, and the next
+    /// operation attaches again.
+    SessionLost,
+}
+
 pub trait HostFileSystem: Clone + Send + 'static {
     /// How this filesystem's caches have been serving the kernel, or
     /// `None` from an implementation that caches nothing.
     fn cache_stats(&self) -> Option<crate::HostFsCacheStats>;
+
+    /// Brings the filesystem's own state in line with a machine restore:
+    /// an implementation with a session and caches drops what `restore`
+    /// says is stale, and one with neither does nothing. Called by the
+    /// machine-generation reactions task, never concurrently with
+    /// itself; operations may be in flight on other tasks.
+    fn after_machine_restore(
+        &self,
+        restore: HostShareRestore,
+    ) -> impl Future<Output = ()> + Send + '_;
 
     fn stat_path<'a>(
         &'a self,

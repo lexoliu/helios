@@ -83,6 +83,15 @@ impl HostFileSystem for HostedFileSystem {
         None
     }
 
+    /// The host OS is called directly: no session to drop and no cache
+    /// of ours to flush.
+    fn after_machine_restore(
+        &self,
+        _restore: helios_kernel::HostShareRestore,
+    ) -> impl core::future::Future<Output = ()> + Send + '_ {
+        core::future::ready(())
+    }
+
     fn stat_path(
         &self,
         path: &str,
