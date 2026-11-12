@@ -468,7 +468,7 @@ where
         }
     }
 
-    pub(super) async fn read_stdin(&mut self, max_bytes: usize) -> Bytes {
+    pub(super) async fn read_stdin(&mut self, max_bytes: u32) -> Bytes {
         let descriptor = self.descriptors.get_mut(0);
         let Some(Preview1Descriptor::Stdin { carry }) = descriptor else {
             return Bytes::new();
@@ -477,11 +477,7 @@ where
             match &self.output_mode {
                 OutputMode::Serial => loop {
                     let wait = self.write_serial.wait_for_debug_serial_input();
-                    (self.read_serial)(
-                        &mut self.serial_read_buffer,
-                        u32::try_from(max_bytes)
-                            .unwrap_or_else(|_| panic!("stdin read capacity exceeds u32")),
-                    );
+                    (self.read_serial)(&mut self.serial_read_buffer, max_bytes);
                     if !self.serial_read_buffer.is_empty() {
                         *carry = Bytes::copy_from_slice(&self.serial_read_buffer);
                         break;
@@ -496,7 +492,7 @@ where
                 }
             }
         }
-        take_preview1_carry(carry, max_bytes)
+        take_preview1_carry(carry, max_bytes as usize)
     }
 
     /// Probe stdin for `poll_oneoff`/`epoll_wait` without blocking.
@@ -1960,15 +1956,15 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    let mut bytes = vec![0; len as usize];
-    let store = caller.data_mut();
-    store
-        .entropy
-        .fill_secure(store.runtime_state.root_entropy(), &mut bytes);
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    p1_write_memory(caller, memory, GuestAddress::wasm32(ptr), &bytes)
+    let store = caller.data_mut();
+    p1_fill_random(memory, GuestAddress::wasm32(ptr), len, |chunk| {
+        store
+            .entropy
+            .fill_secure(store.runtime_state.root_entropy(), chunk);
+    })
 }
 
 pub(super) fn p1_record_kernel_profile<CpuImpl, Net, HostFs>(
@@ -2058,7 +2054,7 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let layout = match p1_read_iovs_with_byte_len(caller, memory, iovs, iovs_len) {
+    let layout = match p1_read_iovs_with_byte_len(memory, iovs, iovs_len) {
         Ok(layout) => layout,
         Err(errno) => return errno,
     };
@@ -2109,7 +2105,7 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let layout = match p1_read_iovs_with_byte_len(caller, memory, iovs, iovs_len) {
+    let layout = match p1_read_iovs_with_byte_len(memory, iovs, iovs_len) {
         Ok(layout) => layout,
         Err(errno) => return errno,
     };
@@ -2120,7 +2116,7 @@ where
             return p1_write_iovs_from_bytes(caller, memory, layout.iovs, &bytes, nread);
         }
         Some(Preview1Descriptor::PipeRead { .. }) => {
-            let bytes = match caller.data_mut().read_pipe(fd, capacity).await {
+            let bytes = match caller.data_mut().read_pipe(fd, capacity as usize).await {
                 Ok(bytes) => bytes,
                 Err(errno) => return errno,
             };
@@ -2132,10 +2128,11 @@ where
             let descriptor = descriptor.clone();
             let offset = *offset;
             let namespace = p1_namespace(caller);
-            let bytes = match wasi_fs::read(&namespace, &descriptor, offset, capacity).await {
-                Ok(bytes) => bytes,
-                Err(error) => return p1_errno_from_fs(error),
-            };
+            let bytes =
+                match wasi_fs::read(&namespace, &descriptor, offset, capacity as usize).await {
+                    Ok(bytes) => bytes,
+                    Err(error) => return p1_errno_from_fs(error),
+                };
             p1_set_file_offset(caller, fd, offset.saturating_add(bytes.len() as u64));
             return p1_write_iovs_from_bytes(caller, memory, layout.iovs, &bytes, nread);
         }
@@ -2610,18 +2607,18 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let layout =
-        match p1_read_iovs_with_byte_len(caller, memory, GuestAddress::wasm32(iovs), iovs_len) {
-            Ok(layout) => layout,
-            Err(errno) => return errno,
-        };
+    let layout = match p1_read_iovs_with_byte_len(memory, GuestAddress::wasm32(iovs), iovs_len) {
+        Ok(layout) => layout,
+        Err(errno) => return errno,
+    };
     let Some(Preview1Descriptor::File { descriptor, .. }) = caller.data().descriptors.get(fd)
     else {
         return p1::errno::BADF;
     };
     let descriptor = descriptor.clone();
     let namespace = p1_namespace(caller);
-    let bytes = match wasi_fs::read(&namespace, &descriptor, offset, layout.byte_len).await {
+    let bytes = match wasi_fs::read(&namespace, &descriptor, offset, layout.byte_len as usize).await
+    {
         Ok(bytes) => bytes,
         Err(error) => return p1_errno_from_fs(error),
     };
@@ -2651,11 +2648,10 @@ where
         return p1::errno::FAULT;
     };
     let nwritten = GuestAddress::wasm32(nwritten);
-    let layout =
-        match p1_read_iovs_with_byte_len(caller, memory, GuestAddress::wasm32(iovs), iovs_len) {
-            Ok(layout) => layout,
-            Err(errno) => return errno,
-        };
+    let layout = match p1_read_iovs_with_byte_len(memory, GuestAddress::wasm32(iovs), iovs_len) {
+        Ok(layout) => layout,
+        Err(errno) => return errno,
+    };
     let written = match p1_write_file(caller, fd, memory, &layout, Some(offset)).await {
         Ok(written) => written,
         Err(errno) => return errno,
@@ -2694,17 +2690,18 @@ where
         None => WritePosition::At(*offset),
     };
     let descriptor = descriptor.clone();
-    let written = layout.byte_len_u32()?;
-    let ranges = p1_iovs_memory_ranges(memory, &layout.iovs)?;
+    let mut gather = Preview1Gather::new(memory, layout)?;
     let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
-    let end = {
+    let (end, written) = {
         let file = wasi_fs::writable_file(&namespace, &descriptor).map_err(p1_errno_from_fs)?;
-        wasi_fs::write_resolved_with(&file, position, layout.byte_len, now_nanos, |destination| {
-            p1_gather_into(memory, &ranges, destination)
-        })
-        .await
-        .map_err(p1_errno_from_fs)?
+        let mut file = ResolvedFileChunks {
+            file: &file,
+            now_nanos,
+        };
+        p1_write_gathered(&mut gather, position, &mut file)
+            .await
+            .map_err(p1_errno_from_fs)?
     };
     if at.is_none() {
         // After an append the offset is the end of the file the write
@@ -2712,6 +2709,29 @@ where
         p1_set_file_offset(caller, fd, end);
     }
     Ok(written)
+}
+
+/// A resolved file as what a gathered write lands in: each chunk goes
+/// straight from guest memory into the file system's own destination.
+struct ResolvedFileChunks<'file, 'namespace, HostFs: crate::HostFileSystem> {
+    file: &'file crate::vfs::Resolved<'namespace, HostFs>,
+    now_nanos: u64,
+}
+
+impl<HostFs: crate::HostFileSystem> Preview1ChunkedFile for ResolvedFileChunks<'_, '_, HostFs> {
+    type Refusal = fs_types::ErrorCode;
+
+    async fn land(
+        &mut self,
+        gather: &mut Preview1Gather,
+        position: WritePosition,
+        len: usize,
+    ) -> Result<u64, fs_types::ErrorCode> {
+        wasi_fs::write_resolved_with(self.file, position, len, self.now_nanos, |destination| {
+            gather.fill(destination)
+        })
+        .await
+    }
 }
 
 pub(super) async fn p1_fd_readdir<CpuImpl, Net, HostFs>(
@@ -3488,11 +3508,16 @@ where
         return p1::errno::FAULT;
     };
 
+    let (monotonic_now, system_now) =
+        (caller.data().now_nanos(), caller.data().system_time_nanos());
+    let max_subscriptions = p1_subscription_limit(caller.data().descriptors.limit);
     let parsed = match p1_read_subscriptions(
-        caller,
         memory,
         GuestAddress::wasm32(subscriptions),
         nsubscriptions,
+        max_subscriptions,
+        monotonic_now,
+        system_now,
     ) {
         Ok(parsed) => parsed,
         Err(errno) => return errno,
@@ -3665,33 +3690,43 @@ fn p1_clock_progress(userdata: u64, deadline_nanos: u64, now: u64) -> P1ClockPro
     P1ClockProgress::Waiting(Duration::from_nanos(deadline_nanos - now))
 }
 
-fn p1_read_subscriptions<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+/// The most subscriptions one `poll_oneoff` takes for a process whose
+/// descriptor table admits `limit` descriptors. Linux `poll` refuses an
+/// `nfds` above `RLIMIT_NOFILE` with `EINVAL`, and wasi-libc's `poll` turns
+/// each `pollfd` into at most two subscriptions (read and write) plus one
+/// clock for the timeout.
+fn p1_subscription_limit(limit: DescriptorLimit) -> usize {
+    limit.get().saturating_mul(2).saturating_add(1)
+}
+
+/// Decodes the `nsubscriptions` subscriptions at `subscriptions`, anchoring
+/// clock timeouts at `monotonic_now` / `system_now`. A count above
+/// `max_subscriptions` is `EINVAL`, and the array must lie inside `memory`;
+/// both are checked before anything is collected for it.
+fn p1_read_subscriptions(
     memory: Preview1Memory,
     subscriptions: GuestAddress,
     nsubscriptions: u32,
-) -> Result<Vec<P1Subscription>, i32>
-where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
-{
+    max_subscriptions: usize,
+    monotonic_now: u64,
+    system_now: u64,
+) -> Result<Vec<P1Subscription>, i32> {
+    if nsubscriptions as usize > max_subscriptions {
+        return Err(p1::errno::INVAL);
+    }
     let mut parsed = Vec::with_capacity(nsubscriptions as usize);
     for index in 0..nsubscriptions {
         let subscription_ptr =
             subscriptions.offset(u64::from(index) * u64::from(P1_SUBSCRIPTION_SIZE));
-        let userdata =
-            p1_try_read_u64(caller, memory, subscription_ptr).map_err(|_| p1::errno::FAULT)?;
-        let event_type = p1_try_read_u8(caller, memory, subscription_ptr.offset(8))
-            .map_err(|_| p1::errno::FAULT)?;
+        let userdata = u64::from_le_bytes(p1_read_array(memory, subscription_ptr)?);
+        let [event_type] = p1_read_array(memory, subscription_ptr.offset(8))?;
         parsed.push(match event_type {
             P1_EVENTTYPE_CLOCK => {
-                let clock_id = p1_try_read_u32(caller, memory, subscription_ptr.offset(16))
-                    .map_err(|_| p1::errno::FAULT)?;
-                let timeout = p1_try_read_u64(caller, memory, subscription_ptr.offset(24))
-                    .map_err(|_| p1::errno::FAULT)?;
-                let flags = p1_try_read_u16(caller, memory, subscription_ptr.offset(40))
-                    .map_err(|_| p1::errno::FAULT)?;
+                let clock_id =
+                    u32::from_le_bytes(p1_read_array(memory, subscription_ptr.offset(16))?);
+                let timeout =
+                    u64::from_le_bytes(p1_read_array(memory, subscription_ptr.offset(24))?);
+                let flags = u16::from_le_bytes(p1_read_array(memory, subscription_ptr.offset(40))?);
                 if !matches!(clock_id, 0 | 1) {
                     P1Subscription::Failed {
                         userdata,
@@ -3700,11 +3735,7 @@ where
                     }
                 } else {
                     let monotonic = clock_id == 1;
-                    let now = if monotonic {
-                        caller.data().now_nanos()
-                    } else {
-                        caller.data().system_time_nanos()
-                    };
+                    let now = if monotonic { monotonic_now } else { system_now };
                     // Relative timeouts are anchored once, here, so a
                     // subscription cannot restart its countdown every time
                     // the wait loop re-probes.
@@ -3721,8 +3752,7 @@ where
                 }
             }
             P1_EVENTTYPE_FD_READ | P1_EVENTTYPE_FD_WRITE => {
-                let fd = p1_try_read_u32(caller, memory, subscription_ptr.offset(16))
-                    .map_err(|_| p1::errno::FAULT)? as i32;
+                let fd = i32::from_le_bytes(p1_read_array(memory, subscription_ptr.offset(16))?);
                 P1Subscription::Fd {
                     userdata,
                     event_type,
@@ -3924,15 +3954,12 @@ where
         GuestAddress::wasm32(ro_flags),
     );
     let iovs_started = p1_kernel_profile_start(caller.data());
-    let layout = match p1_read_iovs_with_byte_len(caller, memory, ri_data, ri_data_len) {
+    let layout = match p1_read_iovs_with_byte_len(memory, ri_data, ri_data_len) {
         Ok(layout) => layout,
         Err(errno) => return errno,
     };
     p1_record_optional_kernel_profile(caller.data(), "sock_recv_iovs", iovs_started);
-    let capacity = match layout.byte_len_u32() {
-        Ok(capacity) => capacity,
-        Err(errno) => return errno,
-    };
+    let capacity = layout.byte_len;
     let fdflags = match caller.data().descriptors.fdflags(fd) {
         Ok(fdflags) => fdflags,
         Err(errno) => return errno,
@@ -4071,24 +4098,27 @@ where
         GuestAddress::wasm32(si_data),
         GuestAddress::wasm32(so_datalen),
     );
-    let bytes = match p1_read_iovs_to_bytes(caller, memory, si_data, si_data_len) {
-        Ok(bytes) => bytes,
+    let mut gather = match p1_read_iovs_with_byte_len(memory, si_data, si_data_len)
+        .and_then(|layout| Preview1Gather::new(memory, &layout))
+    {
+        Ok(gather) => gather,
         Err(errno) => return errno,
     };
     let descriptor = caller.data().descriptors.get(fd).cloned();
     if let Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { writer, .. })) = descriptor
     {
-        let written = match u32::try_from(bytes.len()) {
-            Ok(written) => written,
-            Err(_) => return p1::errno::OVERFLOW,
-        };
         let fdflags = match caller.data().descriptors.fdflags(fd) {
             Ok(fdflags) => fdflags,
             Err(errno) => return errno,
         };
-        if let Err(errno) = p1_send_to_socketpair(&writer, bytes, fdflags).await {
-            return errno;
-        }
+        let written = match p1_send_gathered(&mut gather, |chunk| {
+            p1_send_to_socketpair(&writer, chunk, fdflags)
+        })
+        .await
+        {
+            Ok(written) => written,
+            Err(errno) => return errno,
+        };
         return p1_write_u32(caller, memory, so_datalen, written);
     }
     let Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Connected {
@@ -4116,16 +4146,20 @@ where
     } else {
         u64::MAX
     };
-    let written = match u32::try_from(bytes.len()) {
-        Ok(written) => written,
-        Err(_) => return p1::errno::OVERFLOW,
-    };
-    if let Err(error) = service
-        .tcp_write_all_bytes(stream.id(), Bytes::from(bytes), timeout)
-        .await
+    let written = match p1_send_gathered(&mut gather, |chunk| {
+        let (service, stream) = (&service, stream.id());
+        async move {
+            service
+                .tcp_write_all_bytes(stream, Bytes::from(chunk), timeout)
+                .await
+                .map_err(|error| p1_errno_from_tcp_error_for_fdflags(error, fdflags))
+        }
+    })
+    .await
     {
-        return p1_errno_from_tcp_error_for_fdflags(error, fdflags);
-    }
+        Ok(written) => written,
+        Err(errno) => return errno,
+    };
     p1_write_u32(caller, memory, so_datalen, written)
 }
 
@@ -4343,11 +4377,10 @@ where
     HostFs: crate::HostFileSystem,
 {
     // A file takes the guest's bytes straight into its own destination;
-    // every other sink takes them gathered.
+    // every other sink takes them gathered, one bounded chunk at a time.
     if let Some(Preview1Descriptor::File { .. }) = caller.data().descriptors.get(fd) {
         return p1_write_file(caller, fd, memory, layout, None).await;
     }
-    let bytes = &p1_iov_bytes(memory, layout)?[..];
     // A descriptor whose sink is a bounded channel blocks the guest while
     // that channel is full, unless the guest asked for non-blocking IO —
     // then it gets `EAGAIN` and keeps its bytes, as POSIX requires.
@@ -4356,6 +4389,40 @@ where
         .descriptors
         .fdflags(fd)
         .is_ok_and(p1_fdflags_nonblocking);
+    let mut gather = Preview1Gather::new(memory, layout)?;
+    let mut written = 0_u32;
+    // An empty write still reaches the sink once.
+    loop {
+        let chunk = gather.next_chunk().unwrap_or_default();
+        let taken = match p1_write_sink_chunk(caller, fd, &chunk, nonblocking).await {
+            Ok(taken) => taken,
+            // What an earlier chunk wrote stands; the guest meets the
+            // refusal on its next call.
+            Err(_) if written > 0 => break,
+            Err(errno) => return Err(errno),
+        };
+        // A count above `u32::MAX` cannot arise: the iovecs' sum fits it.
+        written += taken;
+        if gather.remaining() == 0 || (taken as usize) < chunk.len() {
+            break;
+        }
+    }
+    Ok(written)
+}
+
+/// One chunk of a gathered write to the non-file descriptor `fd`, and how
+/// many of its bytes the sink took.
+async fn p1_write_sink_chunk<CpuImpl, Net, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+    fd: i32,
+    bytes: &[u8],
+    nonblocking: bool,
+) -> Result<u32, i32>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    HostFs: crate::HostFileSystem,
+{
     match caller.data().descriptors.get(fd) {
         Some(Preview1Descriptor::Stdout) => {
             p1_write_stdio(
@@ -4414,7 +4481,7 @@ where
 pub(super) async fn p1_read_descriptor<CpuImpl, Net, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     fd: i32,
-    capacity: usize,
+    capacity: u32,
 ) -> Result<Bytes, i32>
 where
     CpuImpl: Cpu + Clone,
@@ -4424,7 +4491,7 @@ where
     match caller.data().descriptors.get(fd) {
         Some(Preview1Descriptor::Stdin { .. }) => Ok(caller.data_mut().read_stdin(capacity).await),
         Some(Preview1Descriptor::PipeRead { .. }) => {
-            caller.data_mut().read_pipe(fd, capacity).await
+            caller.data_mut().read_pipe(fd, capacity as usize).await
         }
         Some(Preview1Descriptor::Event(event)) => {
             if capacity < 8 {
@@ -4439,7 +4506,7 @@ where
             let descriptor = descriptor.clone();
             let offset = *offset;
             let namespace = p1_namespace(caller);
-            let bytes = wasi_fs::read(&namespace, &descriptor, offset, capacity)
+            let bytes = wasi_fs::read(&namespace, &descriptor, offset, capacity as usize)
                 .await
                 .map_err(p1_errno_from_fs)?;
             p1_set_file_offset(caller, fd, offset.saturating_add(bytes.len() as u64));
@@ -5416,5 +5483,411 @@ mod tests {
             drive_wasix_call(&activity, &signal_state, call).expect_err("the call is stopped");
         assert!(error.downcast_ref::<crate::InstanceKilled>().is_none());
         assert_eq!(preview1_exit_status(&error, None), Some(130));
+    }
+
+    fn memory_of(bytes: &[u8]) -> Preview1Memory {
+        Preview1Memory {
+            base: bytes.as_ptr() as usize,
+            len: bytes.len(),
+        }
+    }
+
+    fn iovec_table(entries: &[(u32, u32)]) -> Vec<u8> {
+        entries
+            .iter()
+            .flat_map(|(ptr, len)| ptr.to_le_bytes().into_iter().chain(len.to_le_bytes()))
+            .collect()
+    }
+
+    /// `random_get` with a length no memory could hold is refused before
+    /// anything is drawn or allocated for it, and a length that fits is
+    /// filled in full through the fixed-size chunk.
+    #[test]
+    fn random_get_refuses_a_length_beyond_guest_memory_before_drawing() {
+        let mut guest = vec![0_u8; 3 * P1_RANDOM_CHUNK_BYTES];
+        let memory = Preview1Memory {
+            base: guest.as_mut_ptr() as usize,
+            len: guest.len(),
+        };
+        let mut draws = 0;
+        for (ptr, len) in [(0, u32::MAX), (16, u32::MAX), (u32::MAX, 1), (u32::MAX, 0)] {
+            let status = p1_fill_random(memory, GuestAddress::wasm32(ptr), len, |_| draws += 1);
+            assert_eq!(status, p1::errno::FAULT, "random_get({ptr}, {len})");
+        }
+        assert_eq!(draws, 0, "a refused length draws no entropy");
+
+        let wanted = guest.len() - 5;
+        let mut drawn = Vec::new();
+        let status = p1_fill_random(memory, GuestAddress::wasm32(5), wanted as u32, |chunk| {
+            drawn.push(chunk.len());
+            chunk.fill(0xA5);
+        });
+        assert_eq!(status, p1::errno::SUCCESS);
+        assert_eq!(
+            drawn,
+            [
+                P1_RANDOM_CHUNK_BYTES,
+                P1_RANDOM_CHUNK_BYTES,
+                P1_RANDOM_CHUNK_BYTES - 5
+            ],
+            "each pass draws exactly the bytes it writes"
+        );
+        assert!(guest[..5].iter().all(|byte| *byte == 0));
+        assert!(guest[5..].iter().all(|byte| *byte == 0xA5));
+    }
+
+    /// `poll_oneoff` refuses a subscription count above what the process's
+    /// descriptor limit admits (`EINVAL`) before anything is collected for
+    /// it, and an array that does not lie in guest memory (`EFAULT`).
+    #[test]
+    fn poll_oneoff_refuses_a_subscription_count_beyond_its_bounds() {
+        assert_eq!(p1_subscription_limit(DescriptorLimit::DEFAULT), 2049);
+        let guest = vec![0_u8; 4 * P1_SUBSCRIPTION_SIZE as usize];
+        let memory = memory_of(&guest);
+        let max = p1_subscription_limit(DescriptorLimit::new(1));
+        assert_eq!(max, 3);
+        for count in [u32::MAX, 4] {
+            assert_eq!(
+                p1_read_subscriptions(memory, GuestAddress::wasm32(0), count, max, 0, 0).err(),
+                Some(p1::errno::INVAL),
+                "poll_oneoff count {count} over a bound of {max}",
+            );
+        }
+        let max = p1_subscription_limit(DescriptorLimit::new(1 << 20));
+        for (ptr, count) in [(0, 5), (16, 4), (u32::MAX, 1)] {
+            assert_eq!(
+                p1_read_subscriptions(memory, GuestAddress::wasm32(ptr), count, max, 0, 0).err(),
+                Some(p1::errno::FAULT),
+                "poll_oneoff subscriptions at {ptr}, count {count}",
+            );
+        }
+        let subscriptions = p1_read_subscriptions(memory, GuestAddress::wasm32(0), 4, max, 0, 0)
+            .expect("four subscriptions fit");
+        assert_eq!(subscriptions.len(), 4);
+    }
+
+    /// Vectored I/O refuses an iovec count above `IOV_MAX` (`EINVAL`) and
+    /// validates the iovec array and every buffer against guest memory
+    /// (`EFAULT`) before anything is gathered.
+    #[test]
+    fn vectored_io_refuses_iovecs_guest_memory_cannot_hold() {
+        let guest = vec![0_u8; 4096];
+        let memory = memory_of(&guest);
+        let table_at = |table: &[u8]| {
+            let mut guest = guest.clone();
+            guest[..table.len()].copy_from_slice(table);
+            guest
+        };
+        // More iovecs than `IOV_MAX`.
+        for count in [u32::MAX, P1_IOV_MAX as u32 + 1] {
+            assert_eq!(
+                p1_read_iovs_with_byte_len(memory, GuestAddress::wasm32(0), count).err(),
+                Some(p1::errno::INVAL)
+            );
+        }
+        // The array does not fit.
+        assert_eq!(
+            p1_read_iovs_with_byte_len(memory, GuestAddress::wasm32(0), P1_IOV_MAX as u32).err(),
+            Some(p1::errno::FAULT)
+        );
+        // A buffer lies outside memory.
+        let table = table_at(&iovec_table(&[(0, 16), (4090, u32::MAX)]));
+        assert_eq!(
+            p1_read_iovs_with_byte_len(memory_of(&table), GuestAddress::wasm32(0), 2).err(),
+            Some(p1::errno::FAULT)
+        );
+        // Overlapping buffers may add up to more than memory holds: nothing
+        // is sized by the total, so that is a valid transfer.
+        let table = table_at(&iovec_table(&[(0, 4096), (0, 4096)]));
+        let layout = p1_read_iovs_with_byte_len(memory_of(&table), GuestAddress::wasm32(0), 2)
+            .expect("overlapping buffers are valid");
+        assert_eq!(layout.byte_len, 8192);
+        // Overlapping buffers that fit are a valid transfer.
+        let table = table_at(&iovec_table(&[(64, 2048), (1024, 1024)]));
+        let layout = p1_read_iovs_with_byte_len(memory_of(&table), GuestAddress::wasm32(0), 2)
+            .expect("buffers that fit are valid");
+        assert_eq!(layout.byte_len, 3072);
+    }
+
+    /// Iovecs that overlap may sum past what a 32-bit byte count holds
+    /// (#806): that is refused with `EINVAL` as `readv` does, so the layout
+    /// a read takes its capacity from always fits the `u32` `read_stdin`
+    /// takes.
+    #[test]
+    fn iovecs_summing_past_u32_are_refused_not_converted() {
+        let table = iovec_table(&[(0, 0x8000_0000), (0, 0x8000_0000)]);
+        let memory = Preview1Memory {
+            base: table.as_ptr() as usize,
+            // Linear memory of 4 GiB: each buffer is inside it, and only
+            // the iovec table, which is real, is ever read.
+            len: 1 << 32,
+        };
+        assert_eq!(
+            p1_read_iovs_with_byte_len(memory, GuestAddress::wasm32(0), 2).err(),
+            Some(p1::errno::INVAL)
+        );
+    }
+
+    /// A gathered write copies guest memory in chunks no larger than
+    /// [`P1_IO_CHUNK_BYTES`], in iovec order, across overlapping and empty
+    /// iovecs, and hands the sink every byte once.
+    #[test]
+    fn gathered_writes_move_in_bounded_chunks() {
+        use futures_lite::future::block_on;
+
+        let guest: Vec<u8> = (0..3 * P1_IO_CHUNK_BYTES)
+            .map(|index| index as u8)
+            .collect();
+        let table = iovec_table(&[(0, 150_000), (7, 0), (50_000, 40_000)]);
+        let table_at = guest.len() - table.len();
+        let mut memory = guest.clone();
+        memory[table_at..].copy_from_slice(&table);
+        let memory = memory_of(&memory);
+        let layout = p1_read_iovs_with_byte_len(memory, GuestAddress::wasm32(table_at as u32), 3)
+            .expect("iovecs fit");
+        let expected: Vec<u8> = guest[..150_000]
+            .iter()
+            .chain(&guest[50_000..90_000])
+            .copied()
+            .collect();
+        let mut gather = Preview1Gather::new(memory, &layout).expect("buffers fit");
+        let mut chunks = Vec::new();
+        let sent = block_on(p1_send_gathered(&mut gather, |chunk| {
+            chunks.push(chunk);
+            core::future::ready(Ok(()))
+        }))
+        .expect("every chunk is taken");
+        assert_eq!(sent as usize, expected.len());
+        assert!(chunks.len() > 1);
+        assert!(chunks.iter().all(|chunk| chunk.len() <= P1_IO_CHUNK_BYTES));
+        assert_eq!(chunks.concat(), expected);
+    }
+
+    /// A sink that refuses after taking some chunks leaves them written:
+    /// the count of what went is the result, and a refusal before any
+    /// went is the error.
+    #[test]
+    fn a_refusal_after_some_chunks_reports_what_went() {
+        use futures_lite::future::block_on;
+
+        let guest = vec![1_u8; 3 * P1_IO_CHUNK_BYTES];
+        let table = iovec_table(&[(0, (3 * P1_IO_CHUNK_BYTES) as u32)]);
+        let mut memory = guest.clone();
+        memory[..table.len()].copy_from_slice(&table);
+        let memory = memory_of(&memory);
+        let layout = p1_read_iovs_with_byte_len(memory, GuestAddress::wasm32(0), 1).expect("fits");
+
+        let mut calls = 0;
+        let mut gather = Preview1Gather::new(memory, &layout).expect("fits");
+        let sent = block_on(p1_send_gathered(&mut gather, |_| {
+            calls += 1;
+            core::future::ready(if calls == 1 {
+                Ok(())
+            } else {
+                Err(p1::errno::AGAIN)
+            })
+        }));
+        assert_eq!(sent, Ok(P1_IO_CHUNK_BYTES as u32));
+
+        let mut gather = Preview1Gather::new(memory, &layout).expect("fits");
+        let sent = block_on(p1_send_gathered(&mut gather, |_| {
+            core::future::ready(Err(p1::errno::AGAIN))
+        }));
+        assert_eq!(sent, Err(p1::errno::AGAIN));
+    }
+
+    /// An empty transfer still reaches the sink once, as an empty write.
+    #[test]
+    fn an_empty_gathered_write_reaches_the_sink_once() {
+        use futures_lite::future::block_on;
+
+        let guest = vec![0_u8; 64];
+        let memory = memory_of(&guest);
+        let layout = p1_read_iovs_with_byte_len(memory, GuestAddress::wasm32(0), 0).expect("empty");
+        let mut gather = Preview1Gather::new(memory, &layout).expect("empty");
+        let mut calls = Vec::new();
+        let sent = block_on(p1_send_gathered(&mut gather, |chunk| {
+            calls.push(chunk.len());
+            core::future::ready(Ok(()))
+        }));
+        assert_eq!(sent, Ok(0));
+        assert_eq!(calls, [0]);
+    }
+
+    /// Guest memory of `len` payload bytes followed by one iovec naming
+    /// them, and the layout that iovec decodes to.
+    fn one_iovec(len: usize) -> (Vec<u8>, Preview1IovLayout) {
+        let mut guest: Vec<u8> = (0..len).map(|index| index as u8).collect();
+        guest.extend(iovec_table(&[(0, len as u32)]));
+        let layout =
+            p1_read_iovs_with_byte_len(memory_of(&guest), GuestAddress::wasm32(len as u32), 1)
+                .expect("the iovec fits");
+        (guest, layout)
+    }
+
+    /// A datagram's payload is gathered whole, across its buffers and past
+    /// the size of a stream chunk, and one byte more than the protocol
+    /// carries is `EMSGSIZE` with nothing taken.
+    #[test]
+    fn a_datagram_is_gathered_whole_or_refused() {
+        let max = P1_IO_CHUNK_BYTES + 7;
+        let mut guest: Vec<u8> = (0..max + 1).map(|index| index as u8).collect();
+        let table = guest.len() as u32;
+        guest.extend(iovec_table(&[(0, 9), (9, max as u32 - 9), (max as u32, 1)]));
+        let memory = memory_of(&guest);
+
+        let whole = p1_read_iovs_with_byte_len(memory, GuestAddress::wasm32(table), 2)
+            .expect("the iovecs fit");
+        let mut gather = Preview1Gather::new(memory, &whole).expect("buffers fit");
+        assert_eq!(gather.datagram(max).as_deref(), Ok(&guest[..max]));
+        assert_eq!(gather.remaining(), 0);
+
+        let over = p1_read_iovs_with_byte_len(memory, GuestAddress::wasm32(table), 3)
+            .expect("the iovecs fit");
+        let mut gather = Preview1Gather::new(memory, &over).expect("buffers fit");
+        assert_eq!(gather.datagram(max), Err(p1::errno::MSGSIZE));
+        assert_eq!(gather.remaining(), max + 1);
+    }
+
+    /// A file for [`p1_write_gathered`] to land chunks in, which records
+    /// where each was asked to go.
+    struct ChunkedFile {
+        bytes: Vec<u8>,
+        positions: Vec<WritePosition>,
+        /// How many more chunks land before the file refuses one.
+        accepts: usize,
+        /// What another writer appends after the first chunk landed.
+        other_writer: &'static [u8],
+    }
+
+    impl ChunkedFile {
+        fn new(bytes: &[u8], accepts: usize) -> Self {
+            Self {
+                bytes: bytes.to_vec(),
+                positions: Vec::new(),
+                accepts,
+                other_writer: b"",
+            }
+        }
+    }
+
+    impl Preview1ChunkedFile for ChunkedFile {
+        type Refusal = i32;
+
+        async fn land(
+            &mut self,
+            gather: &mut Preview1Gather,
+            position: WritePosition,
+            len: usize,
+        ) -> Result<u64, i32> {
+            if self.positions.len() == 1 {
+                self.bytes.extend_from_slice(self.other_writer);
+            }
+            self.positions.push(position);
+            if self.accepts == 0 {
+                return Err(p1::errno::IO);
+            }
+            self.accepts -= 1;
+            let at = match position {
+                WritePosition::End => self.bytes.len(),
+                WritePosition::At(at) => at as usize,
+            };
+            if self.bytes.len() < at + len {
+                self.bytes.resize(at + len, 0);
+            }
+            gather.fill(&mut self.bytes[at..at + len]);
+            Ok((at + len) as u64)
+        }
+    }
+
+    /// Every chunk of an append goes to the end the file has when the
+    /// chunk arrives, so bytes another writer appended between two chunks
+    /// are still there afterwards.
+    #[test]
+    fn a_chunked_append_never_lands_on_another_writers_bytes() {
+        use futures_lite::future::block_on;
+
+        let len = 2 * P1_IO_CHUNK_BYTES + 10;
+        let (guest, layout) = one_iovec(len);
+        let mut gather = Preview1Gather::new(memory_of(&guest), &layout).expect("buffers fit");
+        let mut file = ChunkedFile::new(b"head", usize::MAX);
+        file.other_writer = b"other";
+        let landed = block_on(p1_write_gathered(
+            &mut gather,
+            WritePosition::End,
+            &mut file,
+        ));
+        let expected: Vec<u8> = b"head"
+            .iter()
+            .chain(&guest[..P1_IO_CHUNK_BYTES])
+            .chain(b"other")
+            .chain(&guest[P1_IO_CHUNK_BYTES..len])
+            .copied()
+            .collect();
+        assert_eq!(landed, Ok((expected.len() as u64, len as u32)));
+        assert_eq!(file.positions, [WritePosition::End; 3]);
+        assert!(file.bytes == expected, "the other writer's bytes survive");
+    }
+
+    /// A positioned write's chunks follow one another from the position
+    /// it was given.
+    #[test]
+    fn a_chunked_positioned_write_continues_where_the_last_chunk_ended() {
+        use futures_lite::future::block_on;
+
+        let len = 2 * P1_IO_CHUNK_BYTES + 10;
+        let (guest, layout) = one_iovec(len);
+        let mut gather = Preview1Gather::new(memory_of(&guest), &layout).expect("buffers fit");
+        let mut file = ChunkedFile::new(&[0xEE; 16], usize::MAX);
+        let landed = block_on(p1_write_gathered(
+            &mut gather,
+            WritePosition::At(3),
+            &mut file,
+        ));
+        assert_eq!(landed, Ok((3 + len as u64, len as u32)));
+        assert_eq!(
+            file.positions,
+            [
+                WritePosition::At(3),
+                WritePosition::At(3 + P1_IO_CHUNK_BYTES as u64),
+                WritePosition::At(3 + 2 * P1_IO_CHUNK_BYTES as u64),
+            ]
+        );
+        assert_eq!(file.bytes[..3], [0xEE; 3]);
+        assert!(file.bytes[3..] == guest[..len]);
+    }
+
+    /// A file that refuses a chunk after taking some leaves a short write
+    /// that ends where the last landed chunk did; a refusal of the first
+    /// chunk is the error, and an empty write reaches the file once.
+    #[test]
+    fn a_refused_file_chunk_is_a_short_write() {
+        use futures_lite::future::block_on;
+
+        let (guest, layout) = one_iovec(3 * P1_IO_CHUNK_BYTES);
+        let write = |accepts: usize| {
+            let mut gather = Preview1Gather::new(memory_of(&guest), &layout).expect("buffers fit");
+            let mut file = ChunkedFile::new(b"", accepts);
+            let landed = block_on(p1_write_gathered(
+                &mut gather,
+                WritePosition::At(0),
+                &mut file,
+            ));
+            (landed, file.positions.len())
+        };
+        let two = 2 * P1_IO_CHUNK_BYTES;
+        assert_eq!(write(2), (Ok((two as u64, two as u32)), 3));
+        assert_eq!(write(0), (Err(p1::errno::IO), 1));
+
+        let (guest, layout) = one_iovec(0);
+        let mut gather = Preview1Gather::new(memory_of(&guest), &layout).expect("empty");
+        let mut file = ChunkedFile::new(b"four", usize::MAX);
+        let landed = block_on(p1_write_gathered(
+            &mut gather,
+            WritePosition::End,
+            &mut file,
+        ));
+        assert_eq!(landed, Ok((4, 0)));
+        assert_eq!(file.positions, [WritePosition::End]);
     }
 }
