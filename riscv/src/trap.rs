@@ -179,9 +179,10 @@ pub(crate) unsafe fn enter_swap_fault_trampoline(
     access: crate::vmm::FaultAccess,
 ) {
     let landing = (frame.general.sp - size_of::<TrapFrame>()) & !15;
-    // SAFETY: the caller's contract. A fault on this write is a stack
-    // commit on the trap stack, which the nested entry resolves and
-    // returns from.
+    // SAFETY: the caller's contract. The write lands on the faulting
+    // fiber's own stack below its `sp`; a fault on it is a demand commit of
+    // that stack, which a nested trap, its frame built on the trap stack,
+    // resolves and returns from.
     unsafe {
         (landing as *mut TrapFrame).write(*frame);
     }

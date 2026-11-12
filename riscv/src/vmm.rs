@@ -1176,10 +1176,10 @@ impl SwapLeafFormat for RiscvUserAddressSpace {
                 (ppn << PTE_PPN_SHIFT) | pte_flags | PTE_VALID | PTE_ACCESSED | PTE_DIRTY,
             );
         }
-        // No remote fence: a hart can have cached the invalid entry, but
-        // only a hart that faulted on it, and that fault resolves through
-        // `resolve_spurious_fault`, which fences its own hart. The fence
-        // here covers this hart, which may have walked the entry itself.
+        // No remote fence: any hart may hold a stale invalid entry for
+        // this page, speculative walks included, but a hart that does
+        // faults on it, and `resolve_spurious_fault` fences that hart,
+        // whichever it is. The fence here covers this hart.
         fence_local_page(addr.raw());
         Ok(())
     }
@@ -1608,10 +1608,7 @@ fn fence_local_all() {
     // SAFETY: `sfence.vma` with both operands zero is a supervisor-legal
     // local fence.
     unsafe {
-        core::arch::asm!(
-            "sfence.vma zero, zero",
-            options(nostack, preserves_flags),
-        );
+        core::arch::asm!("sfence.vma zero, zero", options(nostack, preserves_flags),);
     }
 }
 
