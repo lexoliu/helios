@@ -386,7 +386,10 @@ pub struct BlockCompletion<Buffer> {
 /// any processor, concurrently. A data request is submitted in two
 /// steps. Submission takes the buffer, waits only for room in the
 /// device's queue, and resolves to a waiter once the device has the
-/// request; the waiter resolves to the answer. Dropping the waiter
+/// request; the waiter resolves to the answer. Handing the device the
+/// request and resolving are one step, so a submission dropped before it
+/// resolves never reached the device and drops its buffer uncompleted.
+/// Dropping the waiter
 /// detaches it and changes nothing about the request: the device still
 /// carries it out, the driver still completes the buffer (see
 /// [`BlockBuffer`]) and then drops it. The operations that carry no
