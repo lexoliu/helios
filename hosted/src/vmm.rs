@@ -602,9 +602,22 @@ impl AddressSpace for HostedAddressSpace {
         )
     }
 
-    fn swap_in_page(&self, addr: VirtAddr, bytes: &[u8]) -> Result<SwapToken, AddressSpaceError> {
-        self.swap
-            .swap_in_page(&mut self.reservations.lock().unwrap(), self, addr, bytes)
+    fn swap_in_page<Fill>(
+        &self,
+        addr: VirtAddr,
+        expected: SwapToken,
+        fill: Fill,
+    ) -> Result<(), AddressSpaceError>
+    where
+        Fill: FnOnce(&mut [u8]),
+    {
+        self.swap.swap_in_page(
+            self,
+            || self.reservations.lock().unwrap(),
+            addr,
+            expected,
+            fill,
+        )
     }
 
     fn swapped_token(&self, addr: VirtAddr) -> Option<SwapToken> {
@@ -1176,11 +1189,11 @@ mod tests {
             all(view.start.raw() as *const u8, 0x5a, view.byte_len),
             "the swapped part shows the run like the rest"
         );
-        for index in 0..swapped_pages {
+        for (index, token) in tokens.iter().enumerate() {
             let addr = VirtAddr::new(range.start.raw() + index * PAGE_SIZE);
             assert_eq!(AddressSpace::swapped_token(&address_space, addr), None);
             assert_eq!(
-                address_space.swap_in_page(addr, &page),
+                address_space.swap_in_page(addr, *token, |frame| frame.copy_from_slice(&page)),
                 Err(AddressSpaceError::NotSwapped),
                 "a substituted page is no longer swapped"
             );

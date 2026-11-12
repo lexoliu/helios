@@ -10,7 +10,7 @@
 
 use helios_hal::vmm::{AddressSpace, AddressSpaceError, PageFlags, SwapToken, VirtAddr};
 
-use super::{CommittedPageVisitor, OrphanedTokenVisitor, SwapVmHooks};
+use super::{CommittedPageVisitor, OrphanedTokenVisitor, PageFill, SwapVmHooks};
 
 /// An address space a backend installed at boot and the kernel can reach
 /// without holding a value of it.
@@ -48,11 +48,16 @@ fn swap_out_page<S: InstalledAddressSpace>(
     S::installed().swap_out_page(addr, token, out)
 }
 
+/// The fill takes the caller's state as an opaque pointer and a plain
+/// function, like the visitors below: the closure the address space takes
+/// is built here, around the pointer.
 fn swap_in_page<S: InstalledAddressSpace>(
     addr: VirtAddr,
-    bytes: &[u8],
-) -> Result<SwapToken, AddressSpaceError> {
-    S::installed().swap_in_page(addr, bytes)
+    expected: SwapToken,
+    context: *mut (),
+    fill: PageFill,
+) -> Result<(), AddressSpaceError> {
+    S::installed().swap_in_page(addr, expected, |page| fill(context, page))
 }
 
 fn swapped_token<S: InstalledAddressSpace>(addr: VirtAddr) -> Option<SwapToken> {

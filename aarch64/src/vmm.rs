@@ -1374,9 +1374,17 @@ impl AddressSpace for Aarch64UserAddressSpace {
             .swap_out_page(&mut self.state.lock(), self, addr, token, out)
     }
 
-    fn swap_in_page(&self, addr: VirtAddr, bytes: &[u8]) -> Result<SwapToken, AddressSpaceError> {
+    fn swap_in_page<Fill>(
+        &self,
+        addr: VirtAddr,
+        expected: SwapToken,
+        fill: Fill,
+    ) -> Result<(), AddressSpaceError>
+    where
+        Fill: FnOnce(&mut [u8]),
+    {
         self.swap
-            .swap_in_page(&mut self.state.lock(), self, addr, bytes)
+            .swap_in_page(self, || self.state.lock(), addr, expected, fill)
     }
 
     fn swapped_token(&self, addr: VirtAddr) -> Option<SwapToken> {

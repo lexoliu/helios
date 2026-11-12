@@ -126,10 +126,11 @@ fn a_swapped_page_comes_back_with_its_bytes_and_its_flags() {
     let mut restored = vec![0_u8; PAGE];
     block_on(backend.swap_in(stored, &mut restored)).expect("backend swap in");
 
-    let recovered = address_space
-        .swap_in_page(range.start, &restored)
+    address_space
+        .swap_in_page(range.start, token(1), |frame| {
+            frame.copy_from_slice(&restored);
+        })
         .expect("swap in");
-    assert_eq!(recovered, token(1));
     check(range, 0x40);
     match address_space.translate(range.start) {
         Translation::Committed { flags, .. } => {
@@ -153,7 +154,7 @@ fn a_swapped_page_is_still_writable_after_it_comes_back() {
         .swap_out_page(range.start, token(2), &mut page)
         .expect("swap out");
     address_space
-        .swap_in_page(range.start, &page)
+        .swap_in_page(range.start, token(2), |frame| frame.copy_from_slice(&page))
         .expect("swap in");
 
     fill(range, 0x99);
@@ -358,7 +359,7 @@ fn a_swap_cycle_leaves_the_user_pool_as_it_found_it() {
         .swap_out_page(range.start, token(71), &mut page)
         .expect("swap out");
     address_space
-        .swap_in_page(range.start, &page)
+        .swap_in_page(range.start, token(71), |frame| frame.copy_from_slice(&page))
         .expect("swap in");
 
     assert_eq!(helios_kernel::user_heap_stats().allocated_bytes, before);

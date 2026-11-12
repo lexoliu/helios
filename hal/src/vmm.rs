@@ -189,6 +189,8 @@ pub enum AddressSpaceError {
     SwapUnsupported,
     #[error("page is not swapped out")]
     NotSwapped,
+    #[error("the page's swap entry carries a different token than the caller expected")]
+    SwapTokenChanged,
     #[error("page buffer is not exactly one frame")]
     BadPageBuffer,
     #[error("this address space cannot map device memory")]
@@ -638,22 +640,41 @@ pub trait AddressSpace: Send + Sync + 'static {
         Err(AddressSpaceError::SwapUnsupported)
     }
 
-    /// Put a swapped-out page back at `addr`.
+    /// Put a swapped-out page back at `addr`, but only while its entry
+    /// still carries `expected`.
     ///
-    /// A fresh frame is taken from this address space's pool, filled
-    /// from `bytes` through the kernel's own view of that frame, and
-    /// only then mapped with the flags the page had when it left. The
-    /// page therefore becomes readable at `addr` already complete: no
-    /// processor can observe a half-restored page, which matters
-    /// because the faulting processor is not the only one that may
-    /// touch it.
+    /// A fresh frame is taken from this address space's pool and `fill`
+    /// writes the page's bytes into it, one whole frame as `&mut [u8]`
+    /// for the duration of the call: the address space never hands a raw
+    /// frame out. `fill` must write every byte, runs before the address
+    /// space takes its own lock (so the lock covers bookkeeping and the
+    /// leaf write only) and cannot fail: whatever it copies or decodes
+    /// from is valid by the time this is called.
     ///
-    /// The flags come from the address space's own record of the page,
-    /// so a caller putting a page back never has to remember them.
+    /// The lock is then taken and the entry checked against `expected`.
+    /// A page with no swap entry returns [`AddressSpaceError::NotSwapped`],
+    /// and one whose entry carries another token returns
+    /// [`AddressSpaceError::SwapTokenChanged`]: the caller read its token
+    /// before the page was reinstated and swapped out again under another,
+    /// and the bytes it holds are not this page's. Either way the entry is
+    /// untouched and the frame goes back to the pool.
     ///
-    /// Returns the token the entry carried, which the caller hands back
-    /// to its [`SwapBackend`].
-    fn swap_in_page(&self, _addr: VirtAddr, _bytes: &[u8]) -> Result<SwapToken, AddressSpaceError> {
+    /// Otherwise the page is mapped with the flags it had when it left,
+    /// read from the address space's own record so a caller never has to
+    /// remember them. It becomes readable at `addr` already complete: no
+    /// processor can observe a half-restored page, which matters because
+    /// the faulting processor is not the only one that may touch it.
+    /// [`AddressSpaceError::OutOfFrames`] is returned, with the entry
+    /// untouched, when the pool has no frame.
+    fn swap_in_page<Fill>(
+        &self,
+        _addr: VirtAddr,
+        _expected: SwapToken,
+        _fill: Fill,
+    ) -> Result<(), AddressSpaceError>
+    where
+        Fill: FnOnce(&mut [u8]),
+    {
         Err(AddressSpaceError::SwapUnsupported)
     }
 

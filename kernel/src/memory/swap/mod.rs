@@ -206,8 +206,11 @@ pub struct SwapStats {
 pub struct SwapVmHooks {
     /// Detach one committed page, copying it into the caller's buffer.
     pub swap_out_page: fn(VirtAddr, SwapToken, &mut [u8]) -> Result<PageFlags, AddressSpaceError>,
-    /// Reinstate one page from the caller's buffer.
-    pub swap_in_page: fn(VirtAddr, &[u8]) -> Result<SwapToken, AddressSpaceError>,
+    /// Reinstate one page, but only while its entry carries the given
+    /// token. The address space allocates the frame and calls the fill
+    /// with the caller's context on it before it takes its lock; see
+    /// [`AddressSpace::swap_in_page`](helios_hal::vmm::AddressSpace::swap_in_page).
+    pub swap_in_page: fn(VirtAddr, SwapToken, *mut (), PageFill) -> Result<(), AddressSpaceError>,
     /// The token the entry at this address carries. Lock-free; the
     /// fault entry calls it from trap context.
     pub swapped_token: fn(VirtAddr) -> Option<SwapToken>,
@@ -230,6 +233,11 @@ pub struct SwapVmHooks {
 /// walks: the caller's context, the page, its flags and its age.
 /// Returning `false` ends the scan.
 pub type CommittedPageVisitor = fn(*mut (), VirtAddr, PageFlags, PageAge) -> bool;
+
+/// What [`SwapVmHooks::swap_in_page`] calls to write the page's bytes into
+/// the frame it is about to map: the caller's context and the frame as
+/// one page. It must write every byte.
+pub type PageFill = fn(*mut (), &mut [u8]);
 
 /// What [`SwapVmHooks::drain_orphaned_swap_tokens`] calls for each token
 /// the address space dropped: the caller's context and the token.
@@ -833,7 +841,7 @@ where
         // The address space reads the flags the page had out of its own
         // bookkeeping, fills a fresh frame from the staging buffer, and
         // only publishes the mapping once the bytes are there.
-        if let Err(error) = (self.hooks.swap_in_page)(addr, &self.page) {
+        if let Err(error) = self.reinstate(addr, handle) {
             tracing::warn!(
                 target: "helios_kernel::swap",
                 addr = addr.raw(),
@@ -856,6 +864,23 @@ where
             .used_bytes
             .fetch_sub(PhysFrame::SIZE as u64, Ordering::AcqRel);
         Ok(())
+    }
+
+    /// Reinstates the page in the staging buffer at `addr`, which must
+    /// still carry `token` in its page-table entry.
+    fn reinstate(&self, addr: VirtAddr, token: SwapToken) -> Result<(), AddressSpaceError> {
+        let mut source: &[u8] = &self.page;
+        (self.hooks.swap_in_page)(
+            addr,
+            token,
+            (&raw mut source).cast::<()>(),
+            |context, page| {
+                // SAFETY: `context` is `source` above, alive for this call and
+                // reached from nowhere else.
+                let source = unsafe { *context.cast::<&[u8]>() };
+                page.copy_from_slice(source);
+            },
+        )
     }
 
     /// Writes the staging buffer, which holds the only copy of the page
@@ -1081,8 +1106,8 @@ where
                 );
                 // The staging buffer holds the page's only copy. The index
                 // is released only once the page is resident again.
-                match (self.hooks.swap_in_page)(addr, &self.page) {
-                    Ok(_) => {
+                match self.reinstate(addr, handle) {
+                    Ok(()) => {
                         self.map.free(handle);
                         return Err(());
                     }

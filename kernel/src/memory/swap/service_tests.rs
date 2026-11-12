@@ -69,12 +69,14 @@ static TEST_HOOKS: SwapVmHooks = SwapVmHooks {
             Ok(PageFlags::READ | PageFlags::WRITE)
         })
     },
-    swap_in_page: |addr, bytes| {
+    swap_in_page: |addr, expected, context, fill| {
         with_space(|space| {
             if space.reinstatements_to_refuse > 0 {
                 space.reinstatements_to_refuse -= 1;
                 return Err(AddressSpaceError::OutOfFrames);
             }
+            let mut bytes = vec![0_u8; PAGE];
+            fill(context, &mut bytes);
             let page = space
                 .pages
                 .get_mut(&addr.raw())
@@ -82,8 +84,11 @@ static TEST_HOOKS: SwapVmHooks = SwapVmHooks {
             let FakePage::Swapped(token) = *page else {
                 return Err(AddressSpaceError::NotSwapped);
             };
-            *page = FakePage::Present(bytes.to_vec());
-            Ok(token)
+            if token != expected {
+                return Err(AddressSpaceError::SwapTokenChanged);
+            }
+            *page = FakePage::Present(bytes);
+            Ok(())
         })
     },
     swapped_token: |addr| {
