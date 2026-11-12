@@ -36,13 +36,17 @@ on:
     # are built from: the kernel crates and their layers below (§1 of
     # AGENTS.md), the backend, the root crate, the guest programs the
     # bootfs embeds, the workload manifest and the WASI apps the
-    # collection boots, the collection sequence itself, and the Wasmtime
-    # pin. A merge that touches none of these leaves the profile as it
-    # was.
+    # collection boots, the collection sequence itself, the Wasmtime
+    # pin, the toolchain (LLVM's profile format and codegen move with it)
+    # and the inspector, which defines the kernel build's
+    # profile-generate and profile-use rustflags (#687). A merge that
+    # touches none of these leaves the profile as it was.
     paths:
       - "Cargo.toml"
       - "Cargo.lock"
+      - "rust-toolchain.toml"
       - ".cargo/**"
+      - "inspector/**"
       - "src/**"
       - "hal/**"
       - "netstack/**"
@@ -97,7 +101,11 @@ jobs:
     # commit's profile is the one `profile-fetch` should find newest, so
     # the older run is cancelled rather than left to finish last. Every
     # other event gets a group of its own — a dispatch, or a call from
-    # `bench-suite.yml`, whose own concurrency already governs it. Each
+    # `bench-suite.yml`, whose own concurrency already governs it. A
+    # called workflow sees the caller's `github.event_name`, so a call
+    # made on a `dev` push reads as a push here; `github.workflow` is the
+    # caller's name too, and is this workflow's only when its own push
+    # trigger started the run (#687). Each
     # call of one run is its own group too, keyed by the artifact it
     # uploads: the `profile-columns` matrix calls this workflow once per
     # column within one run, and one group for all of them ran them one
@@ -106,10 +114,10 @@ jobs:
     # behind a pending second.
     concurrency:
       group: >-
-        ${{ github.event_name == 'push'
+        ${{ github.event_name == 'push' && github.workflow == 'kernel-profile'
             && format('kernel-profile-push-{0}', github.ref)
             || format('kernel-profile-{0}-{1}-{2}', github.run_id, github.job, inputs.artifact) }}
-      cancel-in-progress: ${{ github.event_name == 'push' }}
+      cancel-in-progress: ${{ github.event_name == 'push' && github.workflow == 'kernel-profile' }}
     timeout-minutes: 240
     permissions:
       contents: read
@@ -136,7 +144,6 @@ jobs:
       - uses: ./helios/.github/actions/bench-host
         with:
           checkout-path: ${{ env.CHECKOUT_PATH }}
-          rust-cache-key: kernel-profile
           network-tools: "true"
           bench-tooling: "true"
       - uses: ./helios/.github/actions/collect-kernel-profile

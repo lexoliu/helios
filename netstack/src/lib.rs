@@ -8,6 +8,7 @@ mod congestion;
 mod dhcp;
 mod dns;
 mod hash;
+mod isn;
 mod ndp;
 mod packet;
 mod stack;
@@ -37,12 +38,14 @@ pub use dhcp::{
     DhcpOptionBuffer, DhcpOptionWriter, DhcpPacket, DhcpServerMessage, MAX_DHCP_DNS_SERVERS,
 };
 pub use dns::{
-    DNS_MAX_ADDRESS_RECORDS, DNS_PORT, DnsMessage, DnsQuestionWriter, DnsRecordType, DnsResponse,
+    DNS_MAX_ADDRESS_RECORDS, DNS_MAX_CNAME_CHAIN, DNS_PORT, DnsMessage, DnsQuery,
+    DnsQuestionWriter, DnsRecordType, DnsResponse,
 };
 pub use hash::{
     FlowHash, FlowTuple, RSS_INDIRECTION_ENTRIES, RSS_KEY_BYTES, STANDARD_RSS_KEY, flow_hash,
     rss_indirection_entry, toeplitz,
 };
+pub use isn::{IsnSecret, initial_sequence_number};
 pub use ndp::{
     AdvertisedAddress, Ipv6DnsServers, Ipv6RouterConfiguration, MAX_ADVERTISED_PREFIXES,
     MAX_IPV6_DNS_SERVERS, MAX_ROUTER_SOLICITATIONS, NeighborDiscovery, OnLinkPrefix,
@@ -843,6 +846,13 @@ pub enum StackError {
     /// A socket address set overlaps an existing socket.
     #[error("network socket address is already in use")]
     AddressInUse,
+    /// The TCP socket slab has no free slot.
+    ///
+    /// Closed sockets keep their slot until the close finishes, `TIME-WAIT`
+    /// included, and a listener's half-open children hold slots too, so a
+    /// caller can meet this whatever it holds itself.
+    #[error("TCP socket slab is full")]
+    TcpSocketsExhausted,
     /// A listen backlog value cannot be represented by the stack.
     #[error("TCP listen backlog is invalid")]
     InvalidListenBacklog,

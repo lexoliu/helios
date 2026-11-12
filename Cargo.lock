@@ -328,17 +328,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "async-net"
-version = "2.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b948000fad4873c1c9339d60f2623323a0cfd3816e5181033c6a5cb68b2accf7"
-dependencies = [
- "async-io",
- "blocking",
- "futures-lite",
-]
-
-[[package]]
 name = "async-signal"
 version = "0.2.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1953,6 +1942,29 @@ dependencies = [
 [[package]]
 name = "helios-compiler-abi"
 version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "helios-compiler-host"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "getrandom 0.3.4",
+ "helios-compiler-abi",
+ "helios-compiler-support",
+ "serde",
+ "serde_json",
+ "target-lexicon",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tracing",
+ "tracing-log",
+ "tracing-subscriber",
+ "wasmtime",
+ "wat",
+]
 
 [[package]]
 name = "helios-compiler-plugin"
@@ -2108,7 +2120,6 @@ dependencies = [
  "askama",
  "async-channel",
  "async-io",
- "async-net",
  "async-signal",
  "blocking",
  "clap",
@@ -2208,6 +2219,7 @@ dependencies = [
  "wasmparser 0.245.1",
  "wasmtime",
  "wasmtime-wasi-io",
+ "zrip",
 ]
 
 [[package]]
@@ -2219,6 +2231,7 @@ dependencies = [
  "divan",
  "heapless",
  "helios-hal",
+ "siphasher",
  "thiserror 2.0.21",
  "tracing",
  "wide",
@@ -2301,6 +2314,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "helios-surface-test"
+version = "0.1.0"
+dependencies = [
+ "helios-api",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "helios-venus"
 version = "0.1.0"
 dependencies = [
@@ -2335,6 +2356,7 @@ version = "0.1.0"
 dependencies = [
  "arrayvec",
  "async-lock",
+ "atomic-waker",
  "bitflags 2.13.1",
  "bytes",
  "critical-section",
@@ -4676,9 +4698,9 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "siphasher"
-version = "1.0.3"
+version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
+checksum = "33f4fe9184a62d842c9ef383018f3306d8ba224fd9d836f56d7288308847c256"
 
 [[package]]
 name = "slab"
@@ -6619,4 +6641,35 @@ dependencies = [
  "crc32fast",
  "log",
  "simd-adler32",
+]
+
+[[package]]
+name = "zrip"
+version = "0.8.16"
+source = "git+https://github.com/lexoliu/zrip?branch=compress-context-alloc#d83abccf8e6ed53b77c4965886033c194806c678"
+dependencies = [
+ "zrip-core",
+ "zrip-decode",
+ "zrip-encode",
+]
+
+[[package]]
+name = "zrip-core"
+version = "0.11.1"
+source = "git+https://github.com/lexoliu/zrip?branch=compress-context-alloc#d83abccf8e6ed53b77c4965886033c194806c678"
+
+[[package]]
+name = "zrip-decode"
+version = "0.8.13"
+source = "git+https://github.com/lexoliu/zrip?branch=compress-context-alloc#d83abccf8e6ed53b77c4965886033c194806c678"
+dependencies = [
+ "zrip-core",
+]
+
+[[package]]
+name = "zrip-encode"
+version = "0.9.4"
+source = "git+https://github.com/lexoliu/zrip?branch=compress-context-alloc#d83abccf8e6ed53b77c4965886033c194806c678"
+dependencies = [
+ "zrip-core",
 ]

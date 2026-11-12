@@ -30,6 +30,7 @@ world debugger{
   import helios:system/sync@0.1.0;
   import helios:system/serial@0.1.0;
   import helios:system/instances@0.1.0;
+  import helios:system/snapshot@0.1.0;
   import helios:system/display@0.1.0;
   import helios:system/input@0.1.0;
   import helios:system/surface@0.1.0;

@@ -56,11 +56,12 @@ __helios_aarch64_exception_vectors:
 // Synchronous exception entry. Like the IRQ entry this runs on the
 // per-processor stack in SP_EL0, leaving the interrupted SP_EL1 intact,
 // and it saves the complete interrupted context: x0-x30, ELR, SPSR, the
-// interrupted SP, and the whole FP/SIMD file. Wasm traps still end in a
-// panic inside the handler, but a fault on a swapped-out page is
-// redirected: the handler rewrites the frame to enter the kernel's swap
-// trampoline on the faulting stack, and the epilogue below erets into
-// it. Nothing here can assume it never returns.
+// interrupted SP, and the whole FP/SIMD file. The handler returns here
+// when it resolved the fault in place, and when it redirected a fault
+// on a swapped-out page: it rewrites the frame to enter the kernel's
+// swap trampoline on the faulting stack, and the epilogue below erets
+// into it. A fault it does not resolve leaves through
+// `__helios_aarch64_trap_hand_over` instead and never comes back.
 __helios_aarch64_sync_exception:
     msr spsel, #0
     sub sp, sp, #{sync_frame_bytes}
@@ -207,6 +208,40 @@ __helios_aarch64_swap_fault_resume:
     eret
 .size __helios_aarch64_swap_fault_resume, . - __helios_aarch64_swap_fault_resume
 
+// Leaves the exception stack for good and calls
+// `aarch64_trap_hand_over_main` on this processor's hand-over stack, in
+// the state the synchronous epilogue above would have restored: SP_EL1
+// selected, SP_EL0 back at the exception-stack top, and the interrupted
+// context's IRQ mask. The runtime's trap handler, which runs from
+// there, ends a trap it claims by writing `sp` and branching, so that
+// write lands in SP_EL1 and nothing on the exception stack is live when
+// the next exception builds its frame at the top.
+//
+// x0: the hand-over record, 16-byte aligned at the top of the hand-over
+//     stack; it becomes the stack pointer, so the record sits above
+//     everything pushed after it.
+// x1: the exception-stack top to put back in SP_EL0.
+// x2: non-zero when the interrupted context ran with IRQs unmasked.
+//
+// Entered from the handler above, on SP_EL0 with IRQs masked, so every
+// step before the unmask is atomic with respect to interrupts. SP_EL0
+// is written only once SP_EL1 is the selected stack pointer, the one
+// state in which EL1 may access it.
+.global __helios_aarch64_trap_hand_over
+.type __helios_aarch64_trap_hand_over, %function
+__helios_aarch64_trap_hand_over:
+    msr spsel, #1
+    mov sp, x0
+    msr sp_el0, x1
+    // Nothing above the hand-over is a frame anyone returns to.
+    mov x29, xzr
+    cbz x2, 1f
+    msr daifclr, #0x2
+1:
+    bl aarch64_trap_hand_over_main
+    udf #0
+.size __helios_aarch64_trap_hand_over, . - __helios_aarch64_trap_hand_over
+
 // IRQ entry. The interrupted context keeps SP_EL1 untouched: selecting
 // SP_EL0 switches to the per-processor exception stack that
 // `activate_processor_runtime` installed there, so an interrupt taken on
@@ -263,6 +298,7 @@ __helios_aarch64_irq:
     stp q26, q27, [sp, #0x2c0]
     stp q28, q29, [sp, #0x2e0]
     stp q30, q31, [sp, #0x300]
+    mov x0, sp
     bl aarch64_handle_irq
     ldp x0, x1, [sp, #0x108]
     msr fpsr, x0
