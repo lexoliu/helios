@@ -468,7 +468,8 @@ pub(super) fn write_decimal(memory: &SharedMemory, ptr: GuestAddress, mut value:
 ///
 /// Every call into a compiler store, the compile's main thread and each
 /// worker alike, is made through [`Self::call`] or [`Self::instantiate`], so
-/// the end of a processor's guest time slice makes the guest yield to the
+/// the end of a processor's guest time slice, or a freeze's request
+/// (`GuestInterrupts::interrupt_running`), makes the guest yield to the
 /// executor and a kill of the compile's instance ends the call, including
 /// one parked in `memory.atomic.wait`.
 ///

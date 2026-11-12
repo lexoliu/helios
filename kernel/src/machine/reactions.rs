@@ -1,25 +1,28 @@
-//! What the kernel does when the machine generation advances.
+//! What the kernel does when the machine generation advances, or a
+//! device that left state in the kernel was reset.
 //!
 //! A restored machine keeps the memory it had and nothing it learned from
 //! the outside since: the calendar is behind by however long it was
 //! stopped, the host share's server may never have heard of the session,
-//! the DHCP lease may belong to another network. One kernel task waits on
+//! the DHCP lease may belong to another network. A reset device has
+//! forgotten what the kernel gave it: the 9p server its session, the
+//! balloon its frames and free-page reports. One kernel task waits on
 //! [`MachineGeneration::reactions`] and sets each of those right, in a
 //! fixed order:
 //!
-//! 1. the wall clock is re-read from the platform's real-time clock;
-//! 2. the host-share session is reset, when the server lost it, and its
-//!    caches are flushed;
+//! 1. the wall clock is re-read from the platform's real-time clock, when
+//!    the generation advanced;
+//! 2. the host-share session is reset, when the server lost it (an image
+//!    restore, or the 9p device itself was reset), and its caches are
+//!    flushed, whenever either happened;
 //! 3. the DHCP lease is re-validated, where the interface is
-//!    DHCP-configured.
+//!    DHCP-configured, when the generation advanced;
+//! 4. the memory balloon is resynchronised with its device, only when
+//!    that device was reset.
 //!
 //! The root DRBG is not in this list. It rekeys on its own before it
 //! produces a byte ([`crate::RootEntropy`]), which is why none of these
 //! steps can observe a stream the restore left shared.
-//!
-//! The memory balloon is not in the list either: it resynchronises only
-//! when the device itself was reset, which is a different event from a
-//! generation advance, and nothing in the tree reports it yet.
 //!
 //! # Concurrency contract
 //!
@@ -28,19 +31,22 @@
 //! of the generation's reaction [`Notify`](crate::Notify). It runs the
 //! steps one after another and never concurrently with itself.
 //!
-//! The wait is armed before the generation is read: `notified()` is
-//! created first, an advance that lands after that leaves a stored permit,
-//! and the task reads [`MachineGeneration::take_unhandled`] only after the
-//! wait resolved. An advance that lands while the steps run therefore
-//! wakes the next wait at once, and the whole set runs again for the
-//! newest generation. A burst of advances before the task runs is one
-//! wake and one run, and a wake that finds nothing new runs nothing.
+//! The wait is armed before anything is read: `notified()` is created
+//! first, an advance or a device reset that lands after that leaves a
+//! stored permit, and the task reads [`MachineGeneration::take_unhandled`]
+//! only after the wait resolved. One that lands while the steps run
+//! therefore wakes the next wait at once, and the set runs again for what
+//! is newest. A burst before the task runs is one wake and one pass, and
+//! a wake that finds neither a new generation nor a new reset runs
+//! nothing.
 //!
 //! Each step touches only state that is safe to touch from outside its
 //! owner: the wall-clock offset is one atomic written by this task alone
 //! after bring-up, the host share's session reset takes the client's own
-//! session lock, and the DHCP step locks the default network shard for
-//! the length of one message.
+//! session lock, the DHCP step locks the default network shard for the
+//! length of one message, and the balloon step is a request to the task
+//! that owns the inflated frames ([`crate::BalloonHandle::resynchronise`]),
+//! which carries it out at its next turn without this task waiting.
 
 use core::future::Future;
 use core::pin::pin;
@@ -50,12 +56,12 @@ use helios_hal::measured_boot::MeasuredBoot;
 use helios_hal::rtc::RealTimeClock;
 use helios_hal::watchdog::Watchdog;
 
-use crate::machine::{Generation, MachineGeneration};
+use crate::machine::{DeviceResets, Generation, MachineGeneration};
 use crate::{ComponentNetworkService, HostFileSystem, HostShareRestore, Kernel, RuntimeState};
 
 /// The steps of one pass, so the loop that orders them is exercised
 /// without the devices behind them.
-trait ReactionSteps {
+pub(crate) trait ReactionSteps {
     /// Re-reads the real-time clock and moves the wall clock to it.
     fn reread_wall_clock(&mut self) -> impl Future<Output = ()> + '_;
 
@@ -65,6 +71,10 @@ trait ReactionSteps {
 
     /// Asks the DHCP server whether the lease is still good.
     fn revalidate_lease(&mut self) -> impl Future<Output = ()> + '_;
+
+    /// Asks the balloon service to bring its view in line with a device
+    /// that was reset.
+    fn resynchronise_balloon(&mut self) -> impl Future<Output = ()> + '_;
 }
 
 /// Spawns the task that reacts to machine-generation advances.
@@ -151,36 +161,63 @@ where
             network.revalidate_lease().await;
         }
     }
+
+    async fn resynchronise_balloon(&mut self) {
+        if let Some(balloon) = self.runtime_state.memory_balloon() {
+            balloon.resynchronise();
+            tracing::info!("memory balloon reset: resynchronisation requested");
+        }
+    }
 }
 
-/// Runs the steps once for every generation the machine reaches, until
-/// the kernel stops.
-async fn react_forever<Steps: ReactionSteps>(generation: &MachineGeneration, mut steps: Steps) {
+/// Runs the steps once for every generation the machine reaches and
+/// every device reset recorded, until the kernel stops.
+pub(crate) async fn react_forever<Steps: ReactionSteps>(
+    generation: &MachineGeneration,
+    mut steps: Steps,
+) {
     let mut handled = Generation::BOOT;
+    let mut handled_resets = DeviceResets::BOOT;
     loop {
-        // The wait is armed by creating it, before the generation is
-        // read, so an advance between the two is a stored permit.
-        let advanced = pin!(generation.reactions().notified());
-        advanced.await;
+        // The wait is armed by creating it, before anything is read, so
+        // an advance or a reset between the two is a stored permit.
+        let woken = pin!(generation.reactions().notified());
+        woken.await;
         let pending = generation.take_unhandled();
-        if pending.generation == handled {
+        let advanced = pending.generation != handled;
+        let host_share_reset = pending.device_resets.host_share != handled_resets.host_share;
+        let balloon_reset = pending.device_resets.memory_balloon != handled_resets.memory_balloon;
+        if !advanced && !host_share_reset && !balloon_reset {
             continue;
         }
         tracing::info!(
             generation = pending.generation.get(),
+            advanced,
             image_restored = pending.image_restored,
-            "machine generation advanced; running its reactions"
+            host_share_reset,
+            balloon_reset,
+            "machine generation advanced or a device was reset; running the reactions"
         );
-        steps.reread_wall_clock().await;
-        steps
-            .reset_host_share(if pending.image_restored {
-                HostShareRestore::SessionLost
-            } else {
-                HostShareRestore::ServerKept
-            })
-            .await;
-        steps.revalidate_lease().await;
+        if advanced {
+            steps.reread_wall_clock().await;
+        }
+        if advanced || host_share_reset {
+            steps
+                .reset_host_share(if pending.image_restored || host_share_reset {
+                    HostShareRestore::SessionLost
+                } else {
+                    HostShareRestore::ServerKept
+                })
+                .await;
+        }
+        if advanced {
+            steps.revalidate_lease().await;
+        }
+        if balloon_reset {
+            steps.resynchronise_balloon().await;
+        }
         handled = pending.generation;
+        handled_resets = pending.device_resets;
     }
 }
 
@@ -195,13 +232,14 @@ mod tests {
 
     use super::{ReactionSteps, react_forever};
     use crate::HostShareRestore;
-    use crate::machine::{AdvanceCause, MachineGeneration, MachineGenerationHandle};
+    use crate::machine::{AdvanceCause, MachineGeneration, MachineGenerationHandle, ResetDevice};
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Step {
         WallClock,
         HostShare(HostShareRestore),
         Lease,
+        Balloon,
     }
 
     /// Records every step, and advances the generation once from inside
@@ -228,6 +266,11 @@ mod tests {
 
         fn revalidate_lease(&mut self) -> impl Future<Output = ()> + '_ {
             self.log.borrow_mut().push(Step::Lease);
+            core::future::ready(())
+        }
+
+        fn resynchronise_balloon(&mut self) -> impl Future<Output = ()> + '_ {
+            self.log.borrow_mut().push(Step::Balloon);
             core::future::ready(())
         }
     }
@@ -320,5 +363,129 @@ mod tests {
         ));
         assert_eq!(task.as_mut().poll(&mut context), Poll::Pending);
         assert_eq!(*log.borrow(), SESSION_LOST_PASS);
+    }
+
+    /// A 9p device reset is not an advance: the clock and the lease are
+    /// as good as they were, and only the session the server forgot is
+    /// dropped.
+    #[test]
+    fn a_host_share_device_reset_drops_the_session_and_nothing_else() {
+        let generation = MachineGeneration::new(None);
+        let (log, steps) = recording(&generation, None);
+        let mut context = Context::from_waker(Waker::noop());
+        let mut task = pin!(react_forever(&generation, steps));
+
+        generation.record_device_reset(ResetDevice::HostShare);
+        assert_eq!(task.as_mut().poll(&mut context), Poll::Pending);
+        assert_eq!(
+            *log.borrow(),
+            [Step::HostShare(HostShareRestore::SessionLost)]
+        );
+
+        assert_eq!(task.as_mut().poll(&mut context), Poll::Pending);
+        assert_eq!(log.borrow().len(), 1, "a reset is reacted to once");
+        assert_eq!(generation.current().get(), 0, "a reset advances nothing");
+    }
+
+    /// A 9p reset that lands with an advance the server survived still
+    /// means the session is gone.
+    #[test]
+    fn a_host_share_device_reset_with_a_kept_server_advance_loses_the_session() {
+        let generation = MachineGeneration::new(None);
+        let (log, steps) = recording(&generation, None);
+        let mut context = Context::from_waker(Waker::noop());
+        let mut task = pin!(react_forever(&generation, steps));
+
+        generation.advance(AdvanceCause::GenerationId(
+            helios_hal::generation::VmGenerationId::from_bytes([4; 16]),
+        ));
+        generation.record_device_reset(ResetDevice::HostShare);
+        assert_eq!(task.as_mut().poll(&mut context), Poll::Pending);
+        assert_eq!(*log.borrow(), SESSION_LOST_PASS);
+    }
+
+    /// The balloon is resynchronised only when its device was reset, and
+    /// last: after everything a generation advance asks for.
+    #[test]
+    fn a_balloon_reset_runs_last_and_only_when_the_balloon_was_reset() {
+        let generation = MachineGeneration::new(None);
+        let (log, steps) = recording(&generation, None);
+        let mut context = Context::from_waker(Waker::noop());
+        let mut task = pin!(react_forever(&generation, steps));
+
+        generation.advance(restored(1));
+        assert_eq!(task.as_mut().poll(&mut context), Poll::Pending);
+        assert_eq!(
+            *log.borrow(),
+            SESSION_LOST_PASS,
+            "an advance alone leaves the balloon alone"
+        );
+
+        // A hibernate resume: every device reset, then the advance.
+        generation.record_device_reset(ResetDevice::HostShare);
+        generation.record_device_reset(ResetDevice::MemoryBalloon);
+        generation.advance(restored(2));
+        assert_eq!(task.as_mut().poll(&mut context), Poll::Pending);
+        assert_eq!(
+            log.borrow()[3..],
+            [
+                Step::WallClock,
+                Step::HostShare(HostShareRestore::SessionLost),
+                Step::Lease,
+                Step::Balloon,
+            ]
+        );
+
+        generation.record_device_reset(ResetDevice::MemoryBalloon);
+        assert_eq!(task.as_mut().poll(&mut context), Poll::Pending);
+        assert_eq!(log.borrow()[7..], [Step::Balloon]);
+    }
+
+    /// Resets arm the same wait advances do, so one recorded while a pass
+    /// runs is reacted to by the next pass.
+    #[test]
+    fn a_reset_recorded_during_a_pass_runs_its_reaction_afterwards() {
+        struct ResettingClock {
+            inner: Recording,
+        }
+
+        impl ReactionSteps for ResettingClock {
+            fn reread_wall_clock(&mut self) -> impl Future<Output = ()> + '_ {
+                self.inner
+                    .generation
+                    .record_device_reset(ResetDevice::MemoryBalloon);
+                self.inner.reread_wall_clock()
+            }
+
+            fn reset_host_share(
+                &mut self,
+                restore: HostShareRestore,
+            ) -> impl Future<Output = ()> + '_ {
+                self.inner.reset_host_share(restore)
+            }
+
+            fn revalidate_lease(&mut self) -> impl Future<Output = ()> + '_ {
+                self.inner.revalidate_lease()
+            }
+
+            fn resynchronise_balloon(&mut self) -> impl Future<Output = ()> + '_ {
+                self.inner.resynchronise_balloon()
+            }
+        }
+
+        let generation = MachineGeneration::new(None);
+        let (log, inner) = recording(&generation, None);
+        let mut context = Context::from_waker(Waker::noop());
+        let mut task = pin!(react_forever(&generation, ResettingClock { inner }));
+
+        generation.advance(restored(1));
+        assert_eq!(task.as_mut().poll(&mut context), Poll::Pending);
+        let log = log.borrow();
+        assert_eq!(log[..3], SESSION_LOST_PASS);
+        assert_eq!(
+            log[3..],
+            [Step::Balloon],
+            "the pass that took the advance had already read the resets"
+        );
     }
 }
