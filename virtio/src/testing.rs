@@ -399,9 +399,11 @@ impl<P: DmaPool> FakeTransport<P> {
     /// A pair with no block answers a size of zero, which is how a real
     /// device says it does not support the question.
     pub(crate) fn set_config_block(&self, select: u8, subsel: u8, payload: &[u8]) {
-        self.config_blocks
-            .lock()
-            .push((select, subsel, payload.to_vec()));
+        let mut blocks = self.config_blocks.lock();
+        blocks.retain(|(block_select, block_subsel, _)| {
+            (*block_select, *block_subsel) != (select, subsel)
+        });
+        blocks.push((select, subsel, payload.to_vec()));
     }
 
     /// Answers the currently selected pair, the way a device refills
