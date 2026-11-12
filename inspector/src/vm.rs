@@ -42,6 +42,7 @@ mod input;
 mod instruction_profile;
 mod kernel_image;
 mod network;
+mod numa;
 mod qemu;
 mod qmp;
 mod raw_profile;
@@ -54,6 +55,7 @@ use network::{
     HostPlatform, NetSetupCommand, NetTeardownCommand, QemuNetArgs, VmNetwork, VmNetworkArgs,
     VmNetworkError, VmNetworkFile, VmNetworkProfile, VmNetworkSetupError,
 };
+use numa::{NumaError, NumaMachine};
 use qemu::QemuOptions;
 use qmp::{QmpClient, QmpError, SizeError};
 use raw_profile::{ProfileCommand, RawProfileCollectError};
@@ -171,6 +173,8 @@ pub(crate) enum VmConfigError {
          virtio-iommu can only confine PCI endpoints"
     )]
     IommuUnavailable { arch: &'static str },
+    #[error("{0}")]
+    Numa(#[from] NumaError),
     #[error("{0}")]
     Network(#[from] VmNetworkError),
     #[error("{0}")]
@@ -1399,6 +1403,10 @@ pub(crate) struct VmConfigFile {
     #[serde(default)]
     pub(crate) memory: Option<String>,
     #[serde(default)]
+    pub(crate) numa_nodes: Option<u16>,
+    #[serde(default)]
+    pub(crate) numa_distance: Option<u8>,
+    #[serde(default)]
     pub(crate) bios: Option<String>,
     #[serde(default)]
     pub(crate) baud: Option<u32>,
@@ -1545,6 +1553,19 @@ pub(crate) struct VmCommand {
 
     #[arg(long)]
     memory: Option<String>,
+
+    /// Present a NUMA machine of this many symmetric nodes: `--smp` and
+    /// `--memory` are split evenly across them, one socket per node, so
+    /// the count must divide both. QEMU then publishes the node layout in
+    /// the guest's devicetree or ACPI tables.
+    #[arg(long, value_name = "N")]
+    numa_nodes: Option<u16>,
+
+    /// The distance between every two different NUMA nodes (11 to 254;
+    /// a node is 10 from itself), published as the SLIT or the
+    /// devicetree distance map. Requires `--numa-nodes` of at least 2.
+    #[arg(long, value_name = "D")]
+    numa_distance: Option<u8>,
 
     #[arg(long)]
     bios: Option<String>,
@@ -2003,6 +2024,8 @@ struct ResolvedVmCommand {
     no_build: bool,
     smp: u16,
     memory: String,
+    /// The NUMA machine `--numa-nodes` asked for, when it did.
+    numa: Option<NumaMachine>,
     bios: Option<String>,
     baud: u32,
     cpu: Option<String>,
@@ -2434,6 +2457,12 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
         .memory
         .or(file.memory)
         .unwrap_or_else(|| profile.default_memory.to_owned());
+    let numa = NumaMachine::resolve(
+        command.numa_nodes.or(file.numa_nodes),
+        command.numa_distance.or(file.numa_distance),
+        smp,
+        &memory,
+    )?;
     let bios = command
         .bios
         .or(file.bios)
@@ -2569,6 +2598,7 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
         no_build: command.no_build,
         smp,
         memory,
+        numa,
         bios,
         baud,
         cpu,
@@ -5030,7 +5060,7 @@ impl VmRuntime {
             qemu.arg("-accel").arg(accel);
         }
         qemu.arg("-m").arg(&command.memory);
-        qemu.arg("-smp").arg(command.smp.to_string());
+        configure_cpus(&mut qemu, command);
         if command.serial_stdio {
             qemu.arg("-serial").arg("stdio");
         } else if let Some(serial_pty) = &serial_pty {
@@ -5806,6 +5836,20 @@ fn machine(command: &ResolvedVmCommand) -> &'static str {
         });
     }
     command.profile.machine
+}
+
+/// The processor count and, for a NUMA machine, the sockets, memory
+/// backends and node table that describe how it is split.
+fn configure_cpus(qemu: &mut Command, command: &ResolvedVmCommand) {
+    match &command.numa {
+        Some(numa) => {
+            qemu.arg("-smp").arg(numa.smp());
+            qemu.args(numa.arguments());
+        }
+        None => {
+            qemu.arg("-smp").arg(command.smp.to_string());
+        }
+    }
 }
 
 fn configure_iommu(
@@ -7644,6 +7688,8 @@ mod tests {
             no_build: true,
             smp: None,
             memory: None,
+            numa_nodes: None,
+            numa_distance: None,
             bios: None,
             baud: DEFAULT_BAUD,
             cpu: None,
@@ -7706,6 +7752,8 @@ mod tests {
             no_build: true,
             smp: None,
             memory: None,
+            numa_nodes: None,
+            numa_distance: None,
             bios: None,
             baud: DEFAULT_BAUD,
             cpu: None,
@@ -7794,6 +7842,106 @@ mod tests {
         assert_eq!(resolved.shared_dir_access, HostShareAccess::ReadWrite);
     }
 
+    /// The `-smp` and NUMA arguments a command resolves to.
+    fn cpu_arguments(command: VmCommand) -> Result<Vec<String>, VmConfigError> {
+        let resolved = resolve(command)?;
+        let mut qemu = Command::new("qemu");
+        configure_cpus(&mut qemu, &resolved);
+        Ok(qemu
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect())
+    }
+
+    #[test]
+    fn a_two_node_split_reaches_qemu_on_every_architecture() {
+        let tempdir =
+            tempfile::tempdir().expect("temporary directory for VM config resolution must exist");
+        let config = tempdir.path().join("missing-vm.json");
+        let expected = [
+            "-smp",
+            "4,sockets=2,cores=2,threads=1",
+            "-object",
+            "memory-backend-ram,id=helios-node0,size=1G",
+            "-object",
+            "memory-backend-ram,id=helios-node1,size=1G",
+            "-numa",
+            "node,nodeid=0,memdev=helios-node0",
+            "-numa",
+            "node,nodeid=1,memdev=helios-node1",
+            "-numa",
+            "cpu,node-id=0,socket-id=0",
+            "-numa",
+            "cpu,node-id=1,socket-id=1",
+            "-numa",
+            "dist,src=0,dst=1,val=20",
+            "-numa",
+            "dist,src=1,dst=0,val=20",
+        ];
+        for (arch, acpi) in [
+            (VmArch::X86_64, false),
+            (VmArch::Aarch64, false),
+            (VmArch::Aarch64, true),
+            (VmArch::Riscv64, false),
+        ] {
+            let arguments = cpu_arguments(VmCommand {
+                arch,
+                acpi,
+                smp: Some(4),
+                memory: Some("2G".to_owned()),
+                numa_nodes: Some(2),
+                numa_distance: Some(20),
+                config: Some(config.clone()),
+                ..minimal_command()
+            })
+            .expect("two nodes divide four processors and 2G");
+            assert_eq!(arguments, expected, "{arch:?} acpi={acpi}");
+        }
+    }
+
+    #[test]
+    fn without_numa_nodes_only_smp_is_passed() {
+        let tempdir =
+            tempfile::tempdir().expect("temporary directory for VM config resolution must exist");
+        let arguments = cpu_arguments(VmCommand {
+            smp: Some(4),
+            config: Some(tempdir.path().join("missing-vm.json")),
+            ..minimal_command()
+        })
+        .expect("a plain machine resolves");
+        assert_eq!(arguments, ["-smp", "4"]);
+    }
+
+    #[test]
+    fn numa_flags_that_do_not_describe_a_machine_are_refused() {
+        let tempdir =
+            tempfile::tempdir().expect("temporary directory for VM config resolution must exist");
+        let config = tempdir.path().join("missing-vm.json");
+        let refusals = [
+            (Some(3), None, Some(4), "2G", "does not divide --smp"),
+            (Some(3), None, Some(6), "2G", "does not divide --memory"),
+            (Some(0), None, Some(4), "2G", "must be at least 1"),
+            (None, Some(20), Some(4), "2G", "requires --numa-nodes"),
+            (Some(1), Some(20), Some(4), "2G", "no pair to describe"),
+            (Some(2), Some(10), Some(4), "2G", "is outside 11..=254"),
+        ];
+        for (nodes, distance, smp, memory, message) in refusals {
+            let error = resolve(VmCommand {
+                smp,
+                memory: Some(memory.to_owned()),
+                numa_nodes: nodes,
+                numa_distance: distance,
+                config: Some(config.clone()),
+                ..minimal_command()
+            })
+            .expect_err("the flags do not describe a NUMA machine");
+            assert!(
+                error.to_string().contains(message),
+                "expected {message:?}, got: {error}"
+            );
+        }
+    }
+
     #[test]
     fn iommu_is_refused_on_a_memory_mapped_machine() {
         let tempdir =
@@ -7879,6 +8027,8 @@ mod tests {
             no_build: true,
             smp: None,
             memory: None,
+            numa_nodes: None,
+            numa_distance: None,
             bios: None,
             baud: DEFAULT_BAUD,
             cpu: None,
@@ -8018,6 +8168,7 @@ mod tests {
             no_build: true,
             smp: profile.default_smp,
             memory: profile.default_memory.to_owned(),
+            numa: None,
             bios: profile.default_bios.map(str::to_owned),
             baud: DEFAULT_BAUD,
             cpu: profile.default_cpu.map(str::to_owned),
@@ -8231,6 +8382,7 @@ mod tests {
             no_build: true,
             smp: profile.default_smp,
             memory: profile.default_memory.to_owned(),
+            numa: None,
             bios: profile.default_bios.map(str::to_owned),
             baud: DEFAULT_BAUD,
             cpu: profile.default_cpu.map(str::to_owned),
