@@ -660,6 +660,24 @@ impl VmArch {
             Self::X86_64 => &X86_64_VM_PROFILE,
         }
     }
+
+    /// The cargo arguments that rebuild the standard crates this
+    /// architecture's kernel is compiled against, or none when the
+    /// precompiled ones are used.
+    ///
+    /// The aarch64 kernel is compiled with `-Zbranch-protection=pac-ret`
+    /// (`.cargo/config.toml`), which rustc treats as a target modifier: it
+    /// refuses to link a crate built with the flag against a `core`,
+    /// `alloc` or `compiler_builtins` built without it, and the sysroot
+    /// ships only the latter. Every kernel build for the architecture
+    /// passes these, so the Justfile's `build_std_flag` is the same
+    /// argument.
+    fn build_std_arguments(self) -> &'static [&'static str] {
+        match self {
+            Self::Aarch64 => &["-Zbuild-std=core,alloc"],
+            Self::Riscv64 | Self::X86_64 => &[],
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2877,6 +2895,7 @@ fn cargo_build_command(repo_root: &Path, build: KernelBuildProfile) -> Command {
 /// the target its link arguments and ISA features.
 fn kernel_build_command(repo_root: &Path, command: &KernelBuildSpec) -> Command {
     let mut cargo = cargo_build_command(repo_root, command.kind);
+    cargo.args(command.profile.arch.build_std_arguments());
     // The guest build alone moves. The host tools compiled beside it
     // read no profile and are looked up beside the running inspector,
     // so they stay in the two directories a host build ever uses
@@ -7121,6 +7140,42 @@ mod tests {
         }
     }
 
+    /// The aarch64 kernel's `-Zbranch-protection` forbids the precompiled
+    /// `core`, `alloc` and `compiler_builtins`, so every aarch64 kernel
+    /// build rebuilds them and no other architecture's does.
+    #[test]
+    fn only_the_aarch64_kernel_rebuilds_the_standard_crates() {
+        assert_eq!(
+            VmArch::Aarch64.build_std_arguments(),
+            ["-Zbuild-std=core,alloc"]
+        );
+        assert!(VmArch::Riscv64.build_std_arguments().is_empty());
+        assert!(VmArch::X86_64.build_std_arguments().is_empty());
+
+        let root = Path::new("/checkout");
+        for arch in [VmArch::Aarch64, VmArch::Riscv64, VmArch::X86_64] {
+            for kind in [
+                KernelBuildProfile::Debug,
+                KernelBuildProfile::Release,
+                KernelBuildProfile::ProfileGenerate,
+            ] {
+                let build = KernelBuildSpec {
+                    profile: arch.profile(),
+                    kind,
+                    profile_use: None,
+                    boot_programs: Vec::new(),
+                    no_compiler_plugin: true,
+                };
+                let arguments = cargo_arguments(&kernel_build_command(root, &build));
+                assert_eq!(
+                    arguments.contains(&"-Zbuild-std=core,alloc".to_owned()),
+                    arch == VmArch::Aarch64,
+                    "{arch:?} {kind:?}: {arguments:?}"
+                );
+            }
+        }
+    }
+
     /// A named profile and the release profile are both `profile-use`
     /// builds, and one cargo profile is one output directory: without a
     /// directory of its own the named build overwrites the release
@@ -7969,6 +8024,7 @@ mod tests {
         let status = std::process::Command::new("cargo")
             .current_dir(repo_root()?)
             .arg("build")
+            .args(arch.build_std_arguments())
             .arg("--target")
             .arg(arch.profile().cargo_target)
             .arg("--bin")
