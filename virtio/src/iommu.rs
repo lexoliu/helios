@@ -18,6 +18,7 @@
 
 use alloc::boxed::Box;
 use alloc::vec;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use helios_hal::io::{IoError, IoResult};
@@ -26,8 +27,9 @@ use helios_hal::iommu::{
 };
 use spin::Mutex;
 
-use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate_with};
+use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate_with, renegotiate};
 use crate::queue::VirtQueue;
+use crate::resume::{DeviceReset, Lost, QuiesceError, ReinitError, conclude, driver_ok, settle};
 use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
 
 /// Request queue index (virtio 1.3 §5.13.2).
@@ -148,6 +150,93 @@ pub struct VirtioIommuDevice<T: VirtioTransport> {
     features: NegotiatedFeatures,
     faults: AtomicU64,
     requests: AtomicU64,
+    /// Held only for a copy or one record update, never across a poll.
+    domains: Mutex<Domains>,
+    /// Set once a restore command timed out and the device is lost.
+    lost: Lost,
+}
+
+/// How a request that has a deadline ended without succeeding.
+enum Exchange {
+    /// The device answered, or the queue refused the request.
+    Refused(IommuError),
+    /// The deadline passed with the request still the device's.
+    TimedOut,
+}
+
+impl From<IommuError> for Exchange {
+    fn from(error: IommuError) -> Self {
+        Self::Refused(error)
+    }
+}
+
+/// One endpoint attached to a domain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Attachment {
+    domain: DomainId,
+    endpoint: EndpointId,
+}
+
+/// One range mapped into a domain, as the device was told it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Mapping {
+    domain: DomainId,
+    first: u64,
+    last: u64,
+    physical: u64,
+    access: DmaAccess,
+}
+
+/// The domains the device has been told about, which a device that lost
+/// its state has to be told again.
+///
+/// Kept by the driver rather than asked of the layer above: this driver
+/// is the one place that sees every command that reached the device, so
+/// the record cannot disagree with it. Each is written once the device
+/// has accepted the command, which is safe because a command is issued
+/// and answered inside one call, so a freeze never finds one half done
+/// (a quiesce refuses a queue that still holds a request).
+#[derive(Clone, Debug, Default)]
+struct Domains {
+    attachments: Vec<Attachment>,
+    mappings: Vec<Mapping>,
+}
+
+impl Domains {
+    /// An endpoint belongs to one domain at a time, and an `ATTACH` of
+    /// one that is in another domain acts as a `DETACH` from that domain
+    /// first (virtio 1.3 §5.13.6.2), so the old attachment goes, and the
+    /// old domain with its mappings if this was its last endpoint.
+    fn attach(&mut self, attachment: Attachment) {
+        if let Some(position) = self
+            .attachments
+            .iter()
+            .position(|held| held.endpoint == attachment.endpoint)
+        {
+            let previous = self.attachments.remove(position);
+            self.drop_if_empty(previous.domain);
+        }
+        self.attachments.push(attachment);
+    }
+
+    fn detach(&mut self, attachment: Attachment) {
+        self.attachments.retain(|held| *held != attachment);
+        self.drop_if_empty(attachment.domain);
+    }
+
+    /// A domain with no endpoint left is deleted by the device, with
+    /// everything mapped into it.
+    fn drop_if_empty(&mut self, domain: DomainId) {
+        if !self.attachments.iter().any(|held| held.domain == domain) {
+            self.mappings.retain(|mapping| mapping.domain != domain);
+        }
+    }
+
+    fn unmap(&mut self, domain: DomainId, first: u64, last: u64) {
+        self.mappings.retain(|mapping| {
+            mapping.domain != domain || mapping.first < first || mapping.last > last
+        });
+    }
 }
 
 /// The request body and reply buffers, kept on the heap so their
@@ -261,6 +350,8 @@ impl<T: VirtioTransport> VirtioIommuDevice<T> {
             features,
             faults: AtomicU64::new(0),
             requests: AtomicU64::new(0),
+            domains: Mutex::new(Domains::default()),
+            lost: Lost::new(),
         })
     }
 
@@ -374,6 +465,26 @@ impl<T: VirtioTransport> VirtioIommuDevice<T> {
         body_bytes: usize,
         reply_bytes: usize,
     ) -> Result<(), IommuError> {
+        match self.exchange_until(buffers, body_bytes, reply_bytes, &mut || false) {
+            Ok(()) => Ok(()),
+            Err(Exchange::Refused(error)) => Err(error),
+            Err(Exchange::TimedOut) => unreachable!("a deadline that never passes did not pass"),
+        }
+    }
+
+    /// [`Self::exchange`] with a deadline: `expired` is asked between
+    /// polls of the used ring.
+    ///
+    /// A request that outlives its deadline is still the device's, and
+    /// its buffers stay where they are: they belong to the driver for the
+    /// device's whole life, and the caller treats the device as lost.
+    fn exchange_until(
+        &self,
+        buffers: &mut RequestBuffers,
+        body_bytes: usize,
+        reply_bytes: usize,
+        expired: &mut impl FnMut() -> bool,
+    ) -> Result<(), Exchange> {
         let RequestBuffers { body, reply } = buffers;
         reply[..reply_bytes].fill(0);
         let token = {
@@ -405,18 +516,173 @@ impl<T: VirtioTransport> VirtioIommuDevice<T> {
                 // without waiting on anything the kernel has to do
                 // first, so this is a device handshake rather than a
                 // wait on software state.
+                None if expired() => return Err(Exchange::TimedOut),
                 None => core::hint::spin_loop(),
             }
         }
         self.requests.fetch_add(1, Ordering::Relaxed);
-        status_result(reply[reply_bytes - TAIL_BYTES])
+        Ok(status_result(reply[reply_bytes - TAIL_BYTES])?)
     }
 
-    /// Encodes and runs a request whose reply is just the status tail.
-    fn command(&self, encode: impl FnOnce(&mut [u8]) -> usize) -> Result<(), IommuError> {
+    /// Waits for the request the device may hold to complete, so the
+    /// device may be reset. See [`crate::resume`] for the contract;
+    /// `expired` says when the caller's deadline has passed.
+    ///
+    /// A request is issued and answered inside one call, polling the
+    /// used ring, so the one that is in flight belongs to a caller that
+    /// is still polling and pops it itself: this only waits for that to
+    /// happen. The event queue holds buffers posted for faults the
+    /// device may never report, so it is not waited on.
+    pub fn quiesce(&self, mut expired: impl FnMut() -> bool) -> Result<(), QuiesceError> {
+        settle(DeviceType::Iommu, REQUEST_QUEUE_INDEX, &mut expired, || {
+            let queue = self
+                .request_queue
+                .try_lock()
+                .ok_or(QuiesceError::QueueBusy {
+                    device: DeviceType::Iommu,
+                    queue: REQUEST_QUEUE_INDEX,
+                })?;
+            Ok(queue.in_flight_chains())
+        })
+    }
+
+    /// Brings a reset device back with the features it had, after
+    /// [`Self::quiesce`].
+    ///
+    /// The device must still describe the same address space. Every
+    /// endpoint is attached to its domain again and every range mapped
+    /// again, from the record this driver keeps of the commands the
+    /// device accepted, and the event queue is stocked again. The
+    /// commands are polled, because the machine is frozen: `expired`
+    /// bounds each answer.
+    ///
+    /// A restore command that outlives `expired` loses the device for
+    /// good: every later call answers [`ReinitError::DeviceLost`]. A
+    /// failure leaves the device FAILED. Requests are polled, never
+    /// parked, so there is no completion table to fail.
+    pub fn reinitialize(&self, expired: impl FnMut() -> bool) -> Result<DeviceReset, ReinitError> {
+        self.lost.refuse(DeviceType::Iommu)?;
+        let outcome = self.lost.observe(self.bring_back(expired));
+        conclude(&self.transport, outcome, |_| {})
+    }
+
+    fn bring_back(&self, mut expired: impl FnMut() -> bool) -> Result<DeviceReset, ReinitError> {
+        let device = DeviceType::Iommu;
+        renegotiate(&self.transport, self.features)?;
+
+        // The same checks bring-up makes, as errors rather than panics:
+        // everything the kernel built on the first answers is untrusted
+        // against the second.
+        let changed = |what| ReinitError::DeviceChanged { device, what };
+        if read_config_u64(&self.transport, CONFIG_PAGE_SIZE_MASK) == 0 {
+            return Err(changed("the page sizes it maps"));
+        }
+        if read_geometry(&self.transport, self.features) != self.geometry {
+            return Err(changed("the address space it translates"));
+        }
+        let probe_bytes = if self.features.device(F_PROBE) {
+            self.transport.read_config_u32(CONFIG_PROBE_SIZE) as usize
+        } else {
+            0
+        };
+        if probe_bytes != self.probe_bytes {
+            return Err(changed("the size of its probe reply"));
+        }
+
+        self.request_queue
+            .try_lock()
+            .ok_or(ReinitError::QueueBusy {
+                device,
+                queue: REQUEST_QUEUE_INDEX,
+            })?
+            .reinitialize(&self.transport)?;
+        {
+            let mut events = self.event_queue.try_lock().ok_or(ReinitError::QueueBusy {
+                device,
+                queue: EVENT_QUEUE_INDEX,
+            })?;
+            events.queue.reinitialize_discarding(&self.transport)?;
+            stock_event_queue(&mut events, &self.transport).map_err(|error| {
+                ReinitError::Restore {
+                    device,
+                    what: "the fault buffers",
+                    error,
+                }
+            })?;
+        }
+        driver_ok(&self.transport);
+
+        // Copied out and released before the first command: `command`
+        // takes `domains` while it holds `request`, and a restore that
+        // held `domains` across its polled commands would be the same
+        // spin lock held across waits on the device.
+        let domains = self.domains.lock().clone();
+        let mut buffers = self.request.try_lock().ok_or(ReinitError::QueueBusy {
+            device,
+            queue: REQUEST_QUEUE_INDEX,
+        })?;
+        for attachment in &domains.attachments {
+            let body = encode_attach(&mut buffers.body, attachment.domain, attachment.endpoint);
+            self.restore(&mut buffers, body, "an endpoint's domain", &mut expired)?;
+        }
+        for mapping in &domains.mappings {
+            let body = encode_map(
+                &mut buffers.body,
+                mapping.domain,
+                mapping.first,
+                mapping.last,
+                mapping.physical,
+                mapping.access,
+            );
+            self.restore(&mut buffers, body, "a mapped range", &mut expired)?;
+        }
+        Ok(DeviceReset { device })
+    }
+
+    /// One command that restores state, as an error a reset reports.
+    fn restore(
+        &self,
+        buffers: &mut RequestBuffers,
+        body_bytes: usize,
+        what: &'static str,
+        expired: &mut impl FnMut() -> bool,
+    ) -> Result<(), ReinitError> {
+        let device = DeviceType::Iommu;
+        self.exchange_until(buffers, body_bytes, TAIL_BYTES, expired)
+            .map_err(|error| match error {
+                Exchange::TimedOut => ReinitError::RestoreTimedOut { device, what },
+                Exchange::Refused(error) => {
+                    tracing::error!(?error, what, "virtio-iommu refused to restore state");
+                    ReinitError::Restore {
+                        device,
+                        what,
+                        error: IoError::DeviceFault,
+                    }
+                }
+            })
+    }
+
+    /// Encodes and runs a request whose reply is just the status tail,
+    /// and applies `record` to the domain record once the device has
+    /// accepted it.
+    ///
+    /// The record is updated while `request` is still held. That lock is
+    /// what orders requests, so two commands that touch the same range
+    /// reach the device and the record in the same order; updated after
+    /// the lock was released, a later command on another processor could
+    /// reach the record first and the earlier one would then leave behind
+    /// a state the device no longer has. The lock order is `request`,
+    /// then `domains`; nothing takes them the other way round.
+    fn command(
+        &self,
+        encode: impl FnOnce(&mut [u8]) -> usize,
+        record: impl FnOnce(&mut Domains),
+    ) -> Result<(), IommuError> {
         let mut buffers = self.request.lock();
         let body = encode(&mut buffers.body);
-        self.exchange(&mut buffers, body, TAIL_BYTES)
+        self.exchange(&mut buffers, body, TAIL_BYTES)?;
+        record(&mut self.domains.lock());
+        Ok(())
     }
 }
 
@@ -426,11 +692,17 @@ impl<T: VirtioTransport> Iommu for VirtioIommuDevice<T> {
     }
 
     fn attach(&self, domain: DomainId, endpoint: EndpointId) -> Result<(), IommuError> {
-        self.command(|body| encode_attach(body, domain, endpoint))
+        self.command(
+            |body| encode_attach(body, domain, endpoint),
+            |domains| domains.attach(Attachment { domain, endpoint }),
+        )
     }
 
     fn detach(&self, domain: DomainId, endpoint: EndpointId) -> Result<(), IommuError> {
-        self.command(|body| encode_detach(body, domain, endpoint))
+        self.command(
+            |body| encode_detach(body, domain, endpoint),
+            |domains| domains.detach(Attachment { domain, endpoint }),
+        )
     }
 
     fn map(
@@ -454,12 +726,26 @@ impl<T: VirtioTransport> Iommu for VirtioIommuDevice<T> {
         {
             return Err(IommuError::Invalid);
         }
-        self.command(|body| encode_map(body, domain, iova.get(), last, physical, access))
+        self.command(
+            |body| encode_map(body, domain, iova.get(), last, physical, access),
+            |domains| {
+                domains.mappings.push(Mapping {
+                    domain,
+                    first: iova.get(),
+                    last,
+                    physical,
+                    access,
+                });
+            },
+        )
     }
 
     fn unmap(&self, domain: DomainId, iova: IoVirtAddr, bytes: u64) -> Result<(), IommuError> {
         let last = mapping_last_address(iova.get(), bytes)?;
-        self.command(|body| encode_unmap(body, domain, iova.get(), last))
+        self.command(
+            |body| encode_unmap(body, domain, iova.get(), last),
+            |domains| domains.unmap(domain, iova.get(), last),
+        )
     }
 }
 
@@ -720,10 +1006,12 @@ mod tests {
         DmaAccess, DomainId, EndpointId, FAULT_BYTES, IoError, IoVirtAddr, Iommu, IommuError,
         MAX_RESERVED_REGIONS, PROBE_T_RESV_MEM, RESV_MEM_T_MSI, ReservedRegion, S_INVAL, S_NOENT,
         S_OK, T_ATTACH, T_DETACH, T_MAP, T_PROBE, T_UNMAP, VirtioIommuDevice,
-        decode_reserved_regions,
+        decode_reserved_regions, encode_attach,
     };
+    use crate::features::RenegotiateError;
+    use crate::resume::{DeviceReset, QuiesceError, ReinitError};
     use crate::testing::{FakeTransport, FakeTransportConfig};
-    use crate::transport::{DeviceType, VirtioFeatures};
+    use crate::transport::{DeviceStatus, DeviceType, VirtioFeatures, VirtioTransport};
 
     /// `-(4 * KiB)`, a device that maps from 4 KiB pages upwards.
     const PAGE_SIZE_MASK: u64 = 0xffff_ffff_ffff_f000;
@@ -1053,5 +1341,378 @@ mod tests {
         // The identifier the re-armed buffer was given points back at
         // the slot it actually occupies.
         assert_eq!(state.slot_for_token[0], 0);
+    }
+
+    /// Plays the device for a driver that is polling it: answers the
+    /// request the driver has outstanding with success, and records the
+    /// body it read.
+    fn play(
+        device: &VirtioIommuDevice<FakeTransport>,
+        requests: &mut std::vec::Vec<std::vec::Vec<u8>>,
+    ) {
+        let queue = device.request_queue.lock();
+        if let Some(&token) = queue.device_in_flight_heads().first() {
+            requests.push(queue.device_request(token));
+            queue.device_respond(token, &[S_OK, 0, 0, 0]);
+            queue.device_complete(token, 4);
+        }
+    }
+
+    /// Runs `request` on `device` while another thread answers it with
+    /// `status`.
+    fn run<R: Send>(
+        device: &VirtioIommuDevice<FakeTransport>,
+        status: u8,
+        request: impl FnOnce(&VirtioIommuDevice<FakeTransport>) -> R + Send,
+    ) -> R {
+        let kicks_before = device.transport.kick_count();
+        thread::scope(|scope| {
+            let responder = scope.spawn(move || {
+                while device.transport.kick_count() == kicks_before {
+                    thread::yield_now();
+                }
+                let queue = device.request_queue.lock();
+                let token = *queue
+                    .device_in_flight_heads()
+                    .first()
+                    .expect("the driver submitted a request");
+                queue.device_respond(token, &[status, 0, 0, 0]);
+                queue.device_complete(token, 4);
+            });
+            let result = request(device);
+            responder.join().expect("the device thread finishes");
+            result
+        })
+    }
+
+    /// The record follows what the device accepted: a refused command
+    /// leaves nothing to restore, and the last endpoint leaving a domain
+    /// takes the domain's mappings with it.
+    #[test]
+    fn the_record_follows_the_commands_the_device_accepted() {
+        let device = device();
+        let (domain, endpoint) = (DomainId::new(3), EndpointId::new(0x18));
+        assert_eq!(run(&device, S_OK, |d| d.attach(domain, endpoint)), Ok(()));
+        assert_eq!(
+            run(&device, S_INVAL, |d| d.attach(DomainId::new(4), endpoint)),
+            Err(IommuError::Invalid)
+        );
+        assert_eq!(
+            run(&device, S_OK, |d| d.map(
+                domain,
+                IoVirtAddr::new(0x1000),
+                0x8000,
+                0x2000,
+                DmaAccess::READ | DmaAccess::WRITE
+            )),
+            Ok(())
+        );
+        {
+            let domains = device.domains.lock();
+            assert_eq!(domains.attachments.len(), 1);
+            assert_eq!(domains.mappings.len(), 1);
+        }
+
+        assert_eq!(
+            run(&device, S_OK, |d| d.unmap(
+                domain,
+                IoVirtAddr::new(0x1000),
+                0x2000
+            )),
+            Ok(())
+        );
+        assert!(device.domains.lock().mappings.is_empty());
+
+        assert_eq!(
+            run(&device, S_OK, |d| d.map(
+                domain,
+                IoVirtAddr::new(0x1000),
+                0x8000,
+                0x1000,
+                DmaAccess::READ
+            )),
+            Ok(())
+        );
+        assert_eq!(run(&device, S_OK, |d| d.detach(domain, endpoint)), Ok(()));
+        let domains = device.domains.lock();
+        assert!(domains.attachments.is_empty());
+        assert!(
+            domains.mappings.is_empty(),
+            "a domain with no endpoint is gone, and so is what was mapped into it"
+        );
+    }
+
+    #[test]
+    fn quiesce_waits_for_the_request_a_poller_holds() {
+        let device = device();
+        let body = [T_ATTACH; 4];
+        let mut reply = [0_u8; 4];
+        device
+            .request_queue
+            .lock()
+            .submit(&device.transport, &[&body], &mut [&mut reply])
+            .expect("the request queue has room");
+
+        let mut passes = 0;
+        device
+            .quiesce(|| {
+                passes += 1;
+                play(&device, &mut std::vec::Vec::new());
+                // The caller that was polling pops its own answer.
+                device
+                    .request_queue
+                    .lock()
+                    .pop_used()
+                    .expect("the device completed the request");
+                false
+            })
+            .expect("the device answers inside the deadline");
+        assert_eq!(passes, 1);
+    }
+
+    #[test]
+    fn quiesce_gives_up_when_the_deadline_passes() {
+        let device = device();
+        let body = [T_ATTACH; 4];
+        let mut reply = [0_u8; 4];
+        device
+            .request_queue
+            .lock()
+            .submit(&device.transport, &[&body], &mut [&mut reply])
+            .expect("the request queue has room");
+
+        assert_eq!(
+            device.quiesce(|| true),
+            Err(QuiesceError::RequestsStillInFlight {
+                device: DeviceType::Iommu,
+                queue: 0,
+                count: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn a_reset_device_gets_its_domains_back_with_the_features_it_had() {
+        let device = device();
+        let (domain, endpoint) = (DomainId::new(3), EndpointId::new(0x18));
+        run(&device, S_OK, |d| d.attach(domain, endpoint)).expect("attached");
+        run(&device, S_OK, |d| {
+            d.map(
+                domain,
+                IoVirtAddr::new(0x1000),
+                0x8000,
+                0x2000,
+                DmaAccess::READ | DmaAccess::WRITE,
+            )
+        })
+        .expect("mapped");
+        device.quiesce(|| false).expect("nothing is in flight");
+
+        device.transport.reset_behind_the_driver();
+        let mut requests = std::vec::Vec::new();
+        assert_eq!(
+            device.reinitialize(|| {
+                play(&device, &mut requests);
+                false
+            }),
+            Ok(DeviceReset {
+                device: DeviceType::Iommu
+            })
+        );
+
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0][0], T_ATTACH);
+        assert_eq!(&requests[0][4..8], &3_u32.to_le_bytes());
+        assert_eq!(&requests[0][8..12], &0x18_u32.to_le_bytes());
+        assert_eq!(requests[1][0], T_MAP);
+        assert_eq!(&requests[1][8..16], &0x1000_u64.to_le_bytes());
+        assert_eq!(&requests[1][16..24], &0x2fff_u64.to_le_bytes());
+        assert_eq!(&requests[1][24..32], &0x8000_u64.to_le_bytes());
+        assert_eq!(device.transport.driver_features(), device.features().bits());
+        assert_eq!(device.transport.driver_reset_count(), 2);
+        assert_eq!(
+            device.event_queue.lock().queue.available_descriptors(),
+            0,
+            "every event buffer is back in the device's hands"
+        );
+
+        // The ring starts again and takes the next command.
+        assert_eq!(run(&device, S_OK, |d| d.detach(domain, endpoint)), Ok(()));
+    }
+
+    #[test]
+    fn a_device_that_never_answers_a_restore_command_times_out() {
+        let device = device();
+        device.domains.lock().attach(super::Attachment {
+            domain: DomainId::new(3),
+            endpoint: EndpointId::new(0x18),
+        });
+        assert_eq!(
+            device.reinitialize(|| true),
+            Err(ReinitError::RestoreTimedOut {
+                device: DeviceType::Iommu,
+                what: "an endpoint's domain",
+            })
+        );
+    }
+
+    /// What a reset device is asked to restore: the domain id and
+    /// endpoint of each `ATTACH` and the domain and first address of each
+    /// `MAP`, in order.
+    fn restored(device: &VirtioIommuDevice<FakeTransport>) -> std::vec::Vec<(u8, u32, u64)> {
+        device
+            .quiesce(|| false)
+            .expect("nothing is in flight between commands");
+        device.transport.reset_behind_the_driver();
+        let mut requests = std::vec::Vec::new();
+        let _reset = device
+            .reinitialize(|| {
+                play(device, &mut requests);
+                false
+            })
+            .expect("the device comes back");
+        requests
+            .iter()
+            .map(|body| {
+                let domain = u32::from_le_bytes(body[4..8].try_into().expect("a domain"));
+                let detail = if body[0] == T_MAP {
+                    u64::from_le_bytes(body[8..16].try_into().expect("an address"))
+                } else {
+                    u64::from(u32::from_le_bytes(
+                        body[8..12].try_into().expect("an endpoint"),
+                    ))
+                };
+                (body[0], domain, detail)
+            })
+            .collect()
+    }
+
+    /// An `ATTACH` of an endpoint that is in another domain acts as a
+    /// `DETACH` from that domain first, and a domain whose last endpoint
+    /// leaves takes its mappings with it: the record holds the one
+    /// attachment the device has, and no mapping into a domain it no
+    /// longer has.
+    #[test]
+    fn a_re_attached_endpoint_leaves_its_old_domain_and_its_mappings() {
+        let device = device();
+        let endpoint = EndpointId::new(0x18);
+        run(&device, S_OK, |d| d.attach(DomainId::new(3), endpoint)).expect("attached");
+        run(&device, S_OK, |d| {
+            d.map(
+                DomainId::new(3),
+                IoVirtAddr::new(0x1000),
+                0x8000,
+                0x2000,
+                DmaAccess::READ,
+            )
+        })
+        .expect("mapped");
+        run(&device, S_OK, |d| d.attach(DomainId::new(4), endpoint)).expect("moved");
+
+        assert_eq!(restored(&device), [(T_ATTACH, 4, 0x18)]);
+    }
+
+    /// An endpoint that moved to another domain and was detached from it
+    /// is attached nowhere: it must not come back to the domain it left,
+    /// whose mappings it could then reach.
+    #[test]
+    fn a_detached_endpoint_does_not_return_to_the_domain_it_left() {
+        let device = device();
+        let (first, second) = (EndpointId::new(0x18), EndpointId::new(0x20));
+        run(&device, S_OK, |d| d.attach(DomainId::new(3), first)).expect("attached");
+        run(&device, S_OK, |d| d.attach(DomainId::new(3), second)).expect("attached");
+        run(&device, S_OK, |d| {
+            d.map(
+                DomainId::new(3),
+                IoVirtAddr::new(0x1000),
+                0x8000,
+                0x2000,
+                DmaAccess::READ,
+            )
+        })
+        .expect("mapped");
+        run(&device, S_OK, |d| d.attach(DomainId::new(4), first)).expect("moved");
+        run(&device, S_OK, |d| d.detach(DomainId::new(4), first)).expect("detached");
+
+        assert_eq!(
+            restored(&device),
+            [(T_ATTACH, 3, 0x20), (T_MAP, 3, 0x1000)],
+            "only the endpoint still in the domain, and the domain's mapping"
+        );
+    }
+
+    /// The record is updated while the request lock that orders commands
+    /// is still held, so a command on another processor cannot reach the
+    /// record before one the device saw first.
+    #[test]
+    fn the_record_is_updated_under_the_lock_that_orders_requests() {
+        let device = device();
+        let held = run(&device, S_OK, |d| {
+            let mut held = None;
+            d.command(
+                |body| encode_attach(body, DomainId::new(3), EndpointId::new(0x18)),
+                |_| held = Some(d.request.try_lock().is_none()),
+            )
+            .expect("accepted");
+            held
+        });
+        assert_eq!(held, Some(true));
+    }
+
+    /// A restore command that outlived its deadline is still the
+    /// device's, so the device is lost for good: asking again is an
+    /// error, not a re-programmed queue under a chain the device owns.
+    #[test]
+    fn a_device_lost_by_a_timed_out_restore_is_refused_afterwards() {
+        let device = device();
+        device.domains.lock().attach(super::Attachment {
+            domain: DomainId::new(3),
+            endpoint: EndpointId::new(0x18),
+        });
+        assert!(matches!(
+            device.reinitialize(|| true),
+            Err(ReinitError::RestoreTimedOut { .. })
+        ));
+
+        assert_eq!(
+            device.reinitialize(|| false),
+            Err(ReinitError::DeviceLost {
+                device: DeviceType::Iommu
+            })
+        );
+        assert!(
+            device.transport.status().contains(DeviceStatus::FAILED),
+            "a failed re-initialisation leaves the device FAILED"
+        );
+    }
+
+    #[test]
+    fn a_device_that_offers_fewer_features_after_the_reset_is_refused() {
+        let device = device();
+        device.transport.withdraw_features(super::F_PROBE);
+        assert_eq!(
+            device.reinitialize(|| false),
+            Err(ReinitError::Renegotiate(
+                RenegotiateError::FeatureWithdrawn {
+                    device: DeviceType::Iommu,
+                    bit: 4,
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn a_device_that_translates_another_address_space_is_refused() {
+        let device = device();
+        device
+            .transport
+            .set_config_u32(super::CONFIG_PAGE_SIZE_MASK, 0xffff_0000);
+        assert_eq!(
+            device.reinitialize(|| false),
+            Err(ReinitError::DeviceChanged {
+                device: DeviceType::Iommu,
+                what: "the address space it translates",
+            })
+        );
     }
 }

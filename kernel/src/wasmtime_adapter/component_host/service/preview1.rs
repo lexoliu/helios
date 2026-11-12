@@ -15,7 +15,7 @@ where
     pub(super) interrupts: Arc<GuestInterrupts>,
     activity: crate::InstanceActivity,
     pub(super) parent_instance_id: Option<crate::InstanceId>,
-    pub(super) filesystem: DebugFileSystem<HostRuntimeState<CpuImpl, Net, HostFs>, HostFs>,
+    pub(super) filesystem: Namespace<HostFs>,
     pub(super) clock: crate::KernelClock<CpuImpl, HostRuntimeState<CpuImpl, Net, HostFs>>,
     pub(super) wall_clock_cap: Option<crate::SetWallClockCap>,
     pub(super) cwd: Option<Preview1Cwd>,
@@ -78,7 +78,7 @@ where
         read_serial: crate::SerialReader,
         write_serial: crate::DebugSerialWriter,
         imported_memory: Option<SharedMemory>,
-        filesystem: Option<DebugFileSystemSnapshot>,
+        filesystem: Option<Namespace<HostFs>>,
         descriptors: Option<Preview1DescriptorTable<Net>>,
         signal_state: WasixSignalState,
         thread_signals: WasixSignalState,
@@ -87,10 +87,7 @@ where
         wasix_abi: bool,
         threads: WasixImageThreads<CpuImpl, Net, HostFs>,
     ) -> Self {
-        let filesystem = filesystem.map_or_else(
-            || DebugFileSystem::new(runtime_state.clone()),
-            |snapshot| DebugFileSystem::from_snapshot(runtime_state.clone(), snapshot),
-        );
+        let filesystem = filesystem.unwrap_or_else(|| runtime_state.root_namespace().descend());
         let entropy = crate::EntropyPool::derive(runtime_state.root_entropy(), instance.id().raw());
         let descriptors =
             descriptors.unwrap_or_else(|| Preview1DescriptorTable::from_authority(&authority));
@@ -437,7 +434,7 @@ where
             Poll::Ready(Ok(Ok(exit))) => {
                 let code = exit.exit_code;
                 if let Some(filesystem) = exit.filesystem {
-                    self.filesystem.replace_with_snapshot(filesystem);
+                    self.filesystem.adopt_root_layer(filesystem);
                 }
                 self.children[index].completed = Some(code);
                 self.children[index].exit = None;
@@ -629,8 +626,8 @@ where
             .ok_or(p1::errno::NOTCAPABLE)
     }
 
-    pub(super) fn chdir(&mut self, path: &str) -> i32 {
-        let cwd = match self.resolve_cwd_target(path) {
+    pub(super) async fn chdir(&mut self, path: &str) -> i32 {
+        let cwd = match self.resolve_cwd_target(path).await {
             Ok(cwd) => cwd,
             Err(errno) => return errno,
         };
@@ -654,29 +651,35 @@ where
         )
     }
 
-    pub(super) fn resolve_cwd_target(&self, path: &str) -> Result<Preview1Cwd, i32> {
-        let (guest_name, source_path, flags) = if path.starts_with('/') {
+    pub(super) async fn resolve_cwd_target(&self, path: &str) -> Result<Preview1Cwd, i32> {
+        let (guest_name, base, suffix) = if path.starts_with('/') {
             let guest_name =
                 crate::resolve_absolute_path(path).map_err(p1_errno_from_component_path)?;
-            let (source_path, flags) = self.resolve_absolute_guest_path(&guest_name)?;
-            (guest_name, source_path, flags)
+            let (base, suffix) = self.resolve_absolute_guest_base(&guest_name)?;
+            (guest_name, base, suffix)
         } else {
             let cwd = self.cwd.as_ref().ok_or(p1::errno::NOTCAPABLE)?;
             let guest_name = crate::resolve_child_path(&cwd.guest_name, path)
                 .map_err(p1_errno_from_component_path)?;
-            let source_path = crate::resolve_child_path(&cwd.descriptor.path, path)
-                .map_err(p1_errno_from_component_path)?;
-            (guest_name, source_path, cwd.descriptor.flags)
+            (guest_name, cwd.descriptor.clone(), path.to_owned())
         };
+        let source_path =
+            crate::resolve_child_path(&base.path, &suffix).map_err(p1_errno_from_component_path)?;
+        let flags = base.flags;
 
         if !flags.contains(fs_types::DescriptorFlags::READ) {
             return Err(p1::errno::NOTCAPABLE);
         }
-        let stat = self
-            .filesystem
-            .stat(&source_path)
-            .map_err(p1_errno_from_fs)?;
-        if !matches!(stat.type_, fs_types::DescriptorType::Directory) {
+        // chdir follows a symbolic link to the directory it names, inside
+        // the directory the path was resolved against.
+        let metadata = wasi_fs::stat_path(
+            &self.filesystem,
+            &source_path,
+            crate::Follow::Within(&base.path),
+        )
+        .await
+        .map_err(p1_errno_from_fs)?;
+        if metadata.kind != helios_hal::fs::NodeKind::Directory {
             return Err(p1::errno::NOTDIR);
         }
         Ok(Preview1Cwd {
@@ -686,6 +689,7 @@ where
                 kind: FsNodeKind::Directory,
                 flags,
                 identity: None,
+                mount: None,
             },
         })
     }
@@ -2047,72 +2051,11 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    if let Some(Preview1Descriptor::File {
-        descriptor,
-        offset,
-        fdflags,
-    }) = caller.data().descriptors.get(fd)
-    {
-        let descriptor = descriptor.clone();
-        if crate::guest_host_share_path(&descriptor.path).is_none() {
-            let current_offset = *offset;
-            let fdflags = *fdflags;
-            let layout = match p1_read_iovs_with_byte_len(caller, memory, iovs, iovs_len) {
-                Ok(layout) => layout,
-                Err(errno) => return errno,
-            };
-            let byte_len = layout.byte_len;
-            let written = match u32::try_from(byte_len) {
-                Ok(written) => written,
-                Err(_) => return p1::errno::OVERFLOW,
-            };
-            let ranges = match p1_iovs_memory_ranges(memory, &layout.iovs) {
-                Ok(ranges) => ranges,
-                Err(errno) => return errno,
-            };
-            let memory_base = memory.base as *const u8;
-            let now_nanos = caller.data().now_nanos();
-            let write_result = if fdflags & P1_FDFLAG_APPEND != 0 {
-                caller.data_mut().filesystem.append_with(
-                    &descriptor,
-                    byte_len,
-                    now_nanos,
-                    |destination| {
-                        copy_preview1_ranges_to_slice(memory_base, &ranges, destination);
-                    },
-                )
-            } else {
-                let write_offset: usize = match current_offset.try_into() {
-                    Ok(offset) => offset,
-                    Err(_) => return p1::errno::OVERFLOW,
-                };
-                caller.data_mut().filesystem.write_at_with(
-                    &descriptor,
-                    write_offset,
-                    byte_len,
-                    now_nanos,
-                    |destination| {
-                        copy_preview1_ranges_to_slice(memory_base, &ranges, destination);
-                    },
-                )
-            };
-            if let Err(error) = write_result {
-                return p1_errno_from_fs(error);
-            }
-            let Some(Preview1Descriptor::File { offset, .. }) =
-                caller.data_mut().descriptors.get_mut(fd)
-            else {
-                panic!("Preview1 descriptor disappeared during direct file write");
-            };
-            *offset = current_offset.saturating_add(byte_len as u64);
-            return p1_write_u32(caller, memory, nwritten, written);
-        }
-    }
-    let bytes = match p1_read_iovs_to_bytes(caller, memory, iovs, iovs_len) {
-        Ok(bytes) => bytes,
+    let layout = match p1_read_iovs_with_byte_len(caller, memory, iovs, iovs_len) {
+        Ok(layout) => layout,
         Err(errno) => return errno,
     };
-    let written = match p1_write_descriptor(caller, fd, &bytes).await {
+    let written = match p1_write_descriptor(caller, fd, memory, &layout).await {
         Ok(written) => written,
         Err(errno) => return errno,
     };
@@ -2181,40 +2124,12 @@ where
         }) => {
             let descriptor = descriptor.clone();
             let offset = *offset;
-            let bytes = if let Some(host_path) =
-                crate::guest_host_share_path(&descriptor.path).map(ToOwned::to_owned)
-            {
-                let service = match caller.data().filesystem.host_service() {
-                    Ok(service) => service,
-                    Err(error) => return p1_errno_from_fs(error),
-                };
-                let max_bytes = match u32::try_from(capacity) {
-                    Ok(max_bytes) => max_bytes,
-                    Err(_) => return p1::errno::OVERFLOW,
-                };
-                match service.read_file_range(&host_path, offset, max_bytes).await {
-                    Ok(bytes) => Bytes::from(bytes),
-                    Err(error) => {
-                        return p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(
-                            error,
-                        ));
-                    }
-                }
-            } else {
-                match caller
-                    .data()
-                    .filesystem
-                    .read_file_chunk(&descriptor, offset, capacity)
-                {
-                    Ok(bytes) => bytes,
-                    Err(error) => return p1_errno_from_fs(error),
-                }
+            let namespace = p1_namespace(caller);
+            let bytes = match wasi_fs::read(&namespace, &descriptor, offset, capacity).await {
+                Ok(bytes) => bytes,
+                Err(error) => return p1_errno_from_fs(error),
             };
-            if let Some(Preview1Descriptor::File { offset, .. }) =
-                caller.data_mut().descriptors.get_mut(fd)
-            {
-                *offset = offset.saturating_add(bytes.len() as u64);
-            }
+            p1_set_file_offset(caller, fd, offset.saturating_add(bytes.len() as u64));
             return p1_write_iovs_from_bytes(caller, memory, layout.iovs, &bytes, nread);
         }
         _ => {}
@@ -2423,45 +2338,78 @@ where
     else {
         return p1::errno::BADF;
     };
-    let (identity, stat_value) = match p1_stat_absolute_path(caller, &path).await {
+    let (identity, stat_value) = match p1_stat_absolute_path(caller, &path, crate::Follow::No).await
+    {
         Ok(stat) => stat,
         Err(errno) => return errno,
     };
     p1_write_filestat(caller, stat, identity, stat_value)
 }
 
-/// Resolves a guest-absolute path to its object identity and descriptor stat.
-///
-/// Host-share paths take the async 9p route so `st_dev`/`st_ino`, link count,
-/// and timestamps all come from the host's own `Rgetattr`; embedded paths read
-/// the in-memory node, whose identity is allocated once per object.
+/// Resolves a guest-absolute path through the store's namespace to its
+/// object identity and descriptor stat, following a final symbolic link
+/// when `follow` is set.
 pub(super) async fn p1_stat_absolute_path<CpuImpl, Net, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     path: &str,
+    follow: crate::Follow<'_>,
 ) -> Result<(crate::ObjectIdentity, fs_types::DescriptorStat), i32>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    if let Some(host_path) = crate::guest_host_share_path(path).map(ToOwned::to_owned) {
-        let service = caller
-            .data()
-            .filesystem
-            .host_service()
-            .map_err(p1_errno_from_fs)?;
-        let metadata = service.stat_path(&host_path).await.map_err(|error| {
-            p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(error))
-        })?;
-        let stat = p1_descriptor_stat_from_host_metadata(&metadata);
-        return Ok((metadata.identity, stat));
-    }
-    let filesystem = &caller.data().filesystem;
-    let identity = filesystem
-        .identity_at_path(path)
+    let namespace = p1_namespace(caller);
+    let metadata = wasi_fs::stat_path(&namespace, path, follow)
+        .await
         .map_err(p1_errno_from_fs)?;
-    let stat = filesystem.stat(path).map_err(p1_errno_from_fs)?;
-    Ok((identity, stat))
+    Ok((
+        crate::object_identity(&metadata),
+        wasi_fs::descriptor_stat(&metadata),
+    ))
+}
+
+/// The namespace the store's filesystem calls resolve through, owned so a
+/// call can await on it while the store stays borrowable.
+pub(super) fn p1_namespace<CpuImpl, Net, HostFs>(
+    caller: &Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+) -> Namespace<HostFs>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    HostFs: crate::HostFileSystem,
+{
+    caller.data().filesystem.clone()
+}
+
+/// The filesystem descriptor behind a preview1 descriptor: an open file or
+/// directory, or a preopen.
+pub(super) fn p1_fs_descriptor<Net: ComponentHostNetwork>(
+    descriptor: Option<&Preview1Descriptor<Net>>,
+) -> Option<&FsDescriptor> {
+    match descriptor {
+        Some(Preview1Descriptor::Preopen { descriptor, .. })
+        | Some(Preview1Descriptor::File { descriptor, .. }) => Some(descriptor),
+        _ => None,
+    }
+}
+
+/// Moves the offset of the open file `fd` after one of its own reads or
+/// writes.
+fn p1_set_file_offset<CpuImpl, Net, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+    fd: i32,
+    next: u64,
+) where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    HostFs: crate::HostFileSystem,
+{
+    let Some(Preview1Descriptor::File { offset, .. }) = caller.data_mut().descriptors.get_mut(fd)
+    else {
+        panic!("Preview1 file descriptor {fd} disappeared during its own operation");
+    };
+    *offset = next;
 }
 
 pub(super) async fn p1_fd_filestat_set_size<CpuImpl, Net, HostFs>(
@@ -2479,32 +2427,11 @@ where
         return p1::errno::BADF;
     };
     let descriptor = descriptor.clone();
-    if let Some(host_path) = crate::guest_host_share_path(&descriptor.path).map(ToOwned::to_owned) {
-        if !descriptor.flags.contains(fs_types::DescriptorFlags::WRITE) {
-            return p1::errno::NOTCAPABLE;
-        }
-        let service = match caller.data().filesystem.host_service() {
-            Ok(service) => service,
-            Err(error) => return p1_errno_from_fs(error),
-        };
-        return service
-            .set_file_size(&host_path, size)
-            .await
-            .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
-            .map_or_else(p1_errno_from_fs, |_| {
-                caller
-                    .data_mut()
-                    .filesystem
-                    .invalidate_host_subtree(&descriptor.path);
-                p1::errno::SUCCESS
-            });
-    }
+    let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
-    caller
-        .data_mut()
-        .filesystem
-        .set_size(&descriptor, size, now_nanos)
-        .map_or_else(p1_errno_from_fs, |_| p1::errno::SUCCESS)
+    wasi_fs::set_size(&namespace, &descriptor, size, now_nanos)
+        .await
+        .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
 
 pub(super) async fn p1_fd_filestat_set_times<CpuImpl, Net, HostFs>(
@@ -2519,12 +2446,26 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    let (Some(Preview1Descriptor::File { descriptor, .. })
-    | Some(Preview1Descriptor::Preopen { descriptor, .. })) = caller.data().descriptors.get(fd)
+    let Some(path) = p1_descriptor_path(caller.data().descriptors.get(fd)).map(ToOwned::to_owned)
     else {
         return p1::errno::BADF;
     };
-    let descriptor = descriptor.clone();
+    p1_set_times_at_path(caller, &path, atim, mtim, fstflags).await
+}
+
+/// Backs `fd_filestat_set_times` and `path_filestat_set_times`.
+async fn p1_set_times_at_path<CpuImpl, Net, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+    absolute: &str,
+    atim: u64,
+    mtim: u64,
+    fstflags: u16,
+) -> i32
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    HostFs: crate::HostFileSystem,
+{
     let now_nanos = caller.data().system_time_nanos();
     let access = p1_timestamp_from_fstflags(
         fstflags,
@@ -2540,28 +2481,10 @@ where
         mtim,
         now_nanos,
     );
-    if let Some(host_path) = crate::guest_host_share_path(&descriptor.path).map(ToOwned::to_owned) {
-        let service = match caller.data().filesystem.host_service() {
-            Ok(service) => service,
-            Err(error) => return p1_errno_from_fs(error),
-        };
-        return service
-            .set_times(&host_path, access, modified)
-            .await
-            .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
-            .map_or_else(p1_errno_from_fs, |_| {
-                caller
-                    .data_mut()
-                    .filesystem
-                    .invalidate_host_subtree(&descriptor.path);
-                p1::errno::SUCCESS
-            });
-    }
-    caller
-        .data_mut()
-        .filesystem
-        .set_times(&descriptor, access, modified, now_nanos)
-        .map_or_else(p1_errno_from_fs, |_| p1::errno::SUCCESS)
+    let namespace = p1_namespace(caller);
+    wasi_fs::set_times(&namespace, absolute, access, modified, now_nanos)
+        .await
+        .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
 
 pub(super) fn p1_fd_advise<CpuImpl, Net, HostFs>(
@@ -2600,48 +2523,18 @@ where
         return p1::errno::BADF;
     };
     let descriptor = descriptor.clone();
-    if let Some(host_path) = crate::guest_host_share_path(&descriptor.path).map(ToOwned::to_owned) {
-        if !descriptor.flags.contains(fs_types::DescriptorFlags::WRITE) {
-            return p1::errno::NOTCAPABLE;
-        }
-        let service = match caller.data().filesystem.host_service() {
-            Ok(service) => service,
-            Err(error) => return p1_errno_from_fs(error),
-        };
-        let current = match service.stat_path(&host_path).await {
-            Ok(metadata) => metadata.size,
-            Err(error) => {
-                return p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(error));
-            }
-        };
-        if end <= current {
-            return p1::errno::SUCCESS;
-        }
-        return service
-            .set_file_size(&host_path, end)
-            .await
-            .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
-            .map_or_else(p1_errno_from_fs, |_| {
-                caller
-                    .data_mut()
-                    .filesystem
-                    .invalidate_host_subtree(&descriptor.path);
-                p1::errno::SUCCESS
-            });
-    }
-    let current = match caller.data().filesystem.stat(&descriptor.path) {
-        Ok(stat) => stat.size,
+    let namespace = p1_namespace(caller);
+    let current = match wasi_fs::stat_path(&namespace, &descriptor.path, crate::Follow::No).await {
+        Ok(metadata) => metadata.size,
         Err(error) => return p1_errno_from_fs(error),
     };
     if end <= current {
         return p1::errno::SUCCESS;
     }
     let now_nanos = caller.data().now_nanos();
-    caller
-        .data_mut()
-        .filesystem
-        .set_size(&descriptor, end, now_nanos)
-        .map_or_else(p1_errno_from_fs, |_| p1::errno::SUCCESS)
+    wasi_fs::set_size(&namespace, &descriptor, end, now_nanos)
+        .await
+        .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
 
 pub(super) async fn p1_fd_datasync<CpuImpl, Net, HostFs>(
@@ -2653,7 +2546,7 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    p1_fd_sync_impl(caller, fd).await
+    p1_fd_sync_impl(caller, fd, true).await
 }
 
 pub(super) async fn p1_fd_sync<CpuImpl, Net, HostFs>(
@@ -2665,19 +2558,17 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    p1_fd_sync_impl(caller, fd).await
+    p1_fd_sync_impl(caller, fd, false).await
 }
 
-/// Backs `fd_sync` and `fd_datasync`.
-///
-/// A descriptor on the host share is flushed with a real 9p `Tfsync`; 9p has
-/// no separate data-only barrier, so both entry points map to it. Descriptors
-/// on the embedded filesystem, on stdio, and on `/dev/null` have no
-/// write-back stage to flush, so success there is an accurate answer and not
-/// a silent skip.
+/// Backs `fd_sync` and `fd_datasync`: a filesystem object is made durable
+/// by the filesystem that serves it. Stdio, pipes and `/dev/null` have no
+/// write-back stage to flush, so success there is an accurate answer and
+/// not a silent skip.
 async fn p1_fd_sync_impl<CpuImpl, Net, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     fd: i32,
+    data_only: bool,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
@@ -2687,20 +2578,13 @@ where
     let Some(descriptor) = caller.data().descriptors.get(fd) else {
         return p1::errno::BADF;
     };
-    let host_path = p1_descriptor_path(Some(descriptor))
-        .and_then(crate::guest_host_share_path)
-        .map(ToOwned::to_owned);
-    let Some(host_path) = host_path else {
+    let Some(descriptor) = p1_fs_descriptor(Some(descriptor)).cloned() else {
         return p1::errno::SUCCESS;
     };
-    let service = match caller.data().filesystem.host_service() {
-        Ok(service) => service,
-        Err(error) => return p1_errno_from_fs(error),
-    };
-    match service.sync_file(&host_path).await {
-        Ok(()) => p1::errno::SUCCESS,
-        Err(error) => p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(error)),
-    }
+    let namespace = p1_namespace(caller);
+    wasi_fs::sync(&namespace, &descriptor, data_only)
+        .await
+        .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
 
 pub(super) async fn p1_fd_pread<CpuImpl, Net, HostFs>(
@@ -2724,37 +2608,15 @@ where
             Ok(layout) => layout,
             Err(errno) => return errno,
         };
-    let capacity = layout.byte_len;
     let Some(Preview1Descriptor::File { descriptor, .. }) = caller.data().descriptors.get(fd)
     else {
         return p1::errno::BADF;
     };
-    let bytes = if let Some(host_path) =
-        crate::guest_host_share_path(&descriptor.path).map(ToOwned::to_owned)
-    {
-        let service = match caller.data().filesystem.host_service() {
-            Ok(service) => service,
-            Err(error) => return p1_errno_from_fs(error),
-        };
-        let max_bytes = match u32::try_from(capacity) {
-            Ok(max_bytes) => max_bytes,
-            Err(_) => return p1::errno::OVERFLOW,
-        };
-        match service.read_file_range(&host_path, offset, max_bytes).await {
-            Ok(bytes) => Bytes::from(bytes),
-            Err(error) => {
-                return p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(error));
-            }
-        }
-    } else {
-        match caller
-            .data()
-            .filesystem
-            .read_file_chunk(descriptor, offset, capacity)
-        {
-            Ok(bytes) => bytes,
-            Err(error) => return p1_errno_from_fs(error),
-        }
+    let descriptor = descriptor.clone();
+    let namespace = p1_namespace(caller);
+    let bytes = match wasi_fs::read(&namespace, &descriptor, offset, layout.byte_len).await {
+        Ok(bytes) => bytes,
+        Err(error) => return p1_errno_from_fs(error),
     };
     p1_write_iovs_from_bytes(
         caller,
@@ -2782,54 +2644,67 @@ where
         return p1::errno::FAULT;
     };
     let nwritten = GuestAddress::wasm32(nwritten);
-    let bytes = match p1_read_iovs_to_bytes(caller, memory, GuestAddress::wasm32(iovs), iovs_len) {
-        Ok(bytes) => bytes,
+    let layout =
+        match p1_read_iovs_with_byte_len(caller, memory, GuestAddress::wasm32(iovs), iovs_len) {
+            Ok(layout) => layout,
+            Err(errno) => return errno,
+        };
+    let written = match p1_write_file(caller, fd, memory, &layout, Some(offset)).await {
+        Ok(written) => written,
         Err(errno) => return errno,
     };
-    let Some(Preview1Descriptor::File { descriptor, .. }) = caller.data().descriptors.get(fd)
+    p1_write_u32(caller, memory, nwritten, written)
+}
+
+/// Writes the bytes `layout` names in guest memory to the file `fd`,
+/// gathered straight into the filesystem's destination: at `at` when
+/// given (`fd_pwrite`, which leaves the offset alone), else at the
+/// descriptor's offset or, in append mode, at the end of the file, moving
+/// the offset past them.
+async fn p1_write_file<CpuImpl, Net, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+    fd: i32,
+    memory: Preview1Memory,
+    layout: &Preview1IovLayout,
+    at: Option<u64>,
+) -> Result<u32, i32>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    HostFs: crate::HostFileSystem,
+{
+    let Some(Preview1Descriptor::File {
+        descriptor,
+        offset,
+        fdflags,
+    }) = caller.data().descriptors.get(fd)
     else {
-        return p1::errno::BADF;
+        return Err(p1::errno::BADF);
     };
-    let offset: usize = match offset.try_into() {
-        Ok(offset) => offset,
-        Err(_) => return p1::errno::OVERFLOW,
+    let position = match at {
+        Some(at) => WritePosition::At(at),
+        None if fdflags & P1_FDFLAG_APPEND != 0 => WritePosition::End,
+        None => WritePosition::At(*offset),
     };
     let descriptor = descriptor.clone();
-    if let Some(host_path) = crate::guest_host_share_path(&descriptor.path).map(ToOwned::to_owned) {
-        if !descriptor.flags.contains(fs_types::DescriptorFlags::WRITE) {
-            return p1::errno::NOTCAPABLE;
-        }
-        let service = match caller.data().filesystem.host_service() {
-            Ok(service) => service,
-            Err(error) => return p1_errno_from_fs(error),
-        };
-        if let Err(error) = service.write_file(&host_path, offset as u64, &bytes).await {
-            return p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(error));
-        }
-        caller
-            .data_mut()
-            .filesystem
-            .invalidate_host_subtree(&descriptor.path);
-        let written = match u32::try_from(bytes.len()) {
-            Ok(written) => written,
-            Err(_) => return p1::errno::OVERFLOW,
-        };
-        return p1_write_u32(caller, memory, nwritten, written);
-    }
+    let written = layout.byte_len_u32()?;
+    let ranges = p1_iovs_memory_ranges(memory, &layout.iovs)?;
+    let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
-    if let Err(error) =
-        caller
-            .data_mut()
-            .filesystem
-            .write_at(&descriptor, offset, &bytes, now_nanos)
-    {
-        return p1_errno_from_fs(error);
-    }
-    let written = match u32::try_from(bytes.len()) {
-        Ok(written) => written,
-        Err(_) => return p1::errno::OVERFLOW,
+    let end = {
+        let file = wasi_fs::writable_file(&namespace, &descriptor).map_err(p1_errno_from_fs)?;
+        wasi_fs::write_resolved_with(&file, position, layout.byte_len, now_nanos, |destination| {
+            p1_gather_into(memory, &ranges, destination)
+        })
+        .await
+        .map_err(p1_errno_from_fs)?
     };
-    p1_write_u32(caller, memory, nwritten, written)
+    if at.is_none() {
+        // After an append the offset is the end of the file the write
+        // reached, which another writer may have moved meanwhile.
+        p1_set_file_offset(caller, fd, end);
+    }
+    Ok(written)
 }
 
 pub(super) async fn p1_fd_readdir<CpuImpl, Net, HostFs>(
@@ -2846,39 +2721,11 @@ where
     HostFs: crate::HostFileSystem,
 {
     let (buf, bufused) = (GuestAddress::wasm32(buf), GuestAddress::wasm32(bufused));
-    let Some(path) = p1_descriptor_path(caller.data().descriptors.get(fd)) else {
+    let Some(descriptor) = p1_fs_descriptor(caller.data().descriptors.get(fd)).cloned() else {
         return p1::errno::BADF;
     };
-    if let Some(host_path) = crate::guest_host_share_path(path).map(ToOwned::to_owned) {
-        let directory_path = path.to_owned();
-        let service = match caller.data().filesystem.host_service() {
-            Ok(service) => service,
-            Err(error) => return p1_errno_from_fs(error),
-        };
-        // The whole listing is mirrored, so the bound is the mirror's.
-        let entries = match service
-            .read_dir(
-                &host_path,
-                crate::wasmtime_adapter::wasi::GUEST_DIRECTORY_MIRROR_LIMIT,
-            )
-            .await
-        {
-            Ok(entries) => entries,
-            Err(error) => {
-                return p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(error));
-            }
-        };
-        caller
-            .data_mut()
-            .filesystem
-            .seed_host_directory_entries(&directory_path, entries);
-        let entries = match caller.data().filesystem.read_directory(&directory_path) {
-            Ok(entries) => entries,
-            Err(error) => return p1_errno_from_fs(error),
-        };
-        return p1_fd_readdir_entries(caller, entries, buf, buf_len, cookie, bufused);
-    }
-    let entries = match caller.data().filesystem.read_directory(path) {
+    let namespace = p1_namespace(caller);
+    let entries = match wasi_fs::read_directory(&namespace, &descriptor).await {
         Ok(entries) => entries,
         Err(error) => return p1_errno_from_fs(error),
     };
@@ -2994,26 +2841,10 @@ where
         0 => 0,
         1 => current,
         2 => {
-            if let Some(host_path) =
-                crate::guest_host_share_path(&descriptor.path).map(ToOwned::to_owned)
-            {
-                let service = match caller.data().filesystem.host_service() {
-                    Ok(service) => service,
-                    Err(error) => return p1_errno_from_fs(error),
-                };
-                match service.stat_path(&host_path).await {
-                    Ok(metadata) => metadata.size,
-                    Err(error) => {
-                        return p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(
-                            error,
-                        ));
-                    }
-                }
-            } else {
-                match caller.data().filesystem.stat(&descriptor.path) {
-                    Ok(stat) => stat.size,
-                    Err(error) => return p1_errno_from_fs(error),
-                }
+            let namespace = p1_namespace(caller);
+            match wasi_fs::stat_path(&namespace, &descriptor.path, crate::Follow::No).await {
+                Ok(metadata) => metadata.size,
+                Err(error) => return p1_errno_from_fs(error),
             }
         }
         _ => return p1::errno::INVAL,
@@ -3216,151 +3047,19 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    if base.kind != FsNodeKind::Directory {
-        return Err(p1::errno::NOTDIR);
-    }
-    let absolute =
-        crate::resolve_child_path(&base.path, path).map_err(p1_errno_from_component_path)?;
-    if let Some(host_path) = crate::guest_host_share_path(&absolute).map(ToOwned::to_owned) {
-        return p1_open_host_descriptor_resolved(
-            caller,
-            base,
-            absolute,
-            host_path,
-            open_flags,
-            descriptor_flags,
-        )
-        .await;
-    }
+    let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
-    caller
-        .data_mut()
-        .filesystem
-        .open_at(
-            base,
-            path_flags,
-            path,
-            open_flags,
-            descriptor_flags,
-            now_nanos,
-        )
-        .map_err(p1_errno_from_fs)
-}
-
-pub(super) async fn p1_open_host_descriptor_resolved<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
-    base: &FsDescriptor,
-    absolute: String,
-    host_path: String,
-    open_flags: fs_types::OpenFlags,
-    descriptor_flags: fs_types::DescriptorFlags,
-) -> Result<FsDescriptor, i32>
-where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
-{
-    let service = caller
-        .data()
-        .filesystem
-        .host_service()
-        .map_err(p1_errno_from_fs)?;
-    let metadata = service.stat_path(&host_path).await;
-    // Host files are never materialised in kernel memory on open: `fd_read`
-    // and `fd_pread` pull bounded ranges over 9p on demand.
-    let (kind, identity, descriptor_flags) = match metadata {
-        Ok(metadata) => {
-            let kind = crate::wasmtime_adapter::wasi::host_metadata_node_kind(&metadata);
-            if open_flags.contains(fs_types::OpenFlags::EXCLUSIVE)
-                && open_flags.contains(fs_types::OpenFlags::CREATE)
-            {
-                return Err(p1::errno::EXIST);
-            }
-            if open_flags.contains(fs_types::OpenFlags::DIRECTORY) && kind != FsNodeKind::Directory
-            {
-                return Err(p1::errno::NOTDIR);
-            }
-            if !open_flags.contains(fs_types::OpenFlags::DIRECTORY) && kind == FsNodeKind::Directory
-            {
-                return Err(p1::errno::ISDIR);
-            }
-            let descriptor_flags = crate::wasmtime_adapter::wasi::effective_open_descriptor_flags(
-                base.flags,
-                descriptor_flags,
-                kind,
-            )
-            .map_err(p1_errno_from_fs)?;
-            if open_flags.contains(fs_types::OpenFlags::TRUNCATE) {
-                if kind != FsNodeKind::File {
-                    return Err(p1::errno::ISDIR);
-                }
-                if !base
-                    .flags
-                    .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
-                {
-                    return Err(p1::errno::ROFS);
-                }
-                service
-                    .truncate_file(&host_path)
-                    .await
-                    .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
-                    .map_err(p1_errno_from_fs)?;
-            }
-            if kind != FsNodeKind::File {
-                // The whole listing is mirrored, so the bound is the mirror's.
-                let entries = service
-                    .read_dir(
-                        &host_path,
-                        crate::wasmtime_adapter::wasi::GUEST_DIRECTORY_MIRROR_LIMIT,
-                    )
-                    .await
-                    .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
-                    .map_err(p1_errno_from_fs)?;
-                caller
-                    .data_mut()
-                    .filesystem
-                    .seed_host_directory_entries(&absolute, entries);
-            }
-            (kind, metadata.identity, descriptor_flags)
-        }
-        Err(error) => {
-            let error = crate::wasmtime_adapter::wasi::map_host_fs_error(error);
-            if !matches!(error, fs_types::ErrorCode::NoEntry)
-                || !open_flags.contains(fs_types::OpenFlags::CREATE)
-            {
-                return Err(p1_errno_from_fs(error));
-            }
-            if !base
-                .flags
-                .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
-            {
-                return Err(p1::errno::ROFS);
-            }
-            service
-                .create_file(&host_path)
-                .await
-                .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
-                .map_err(p1_errno_from_fs)?;
-            let metadata = service
-                .stat_path(&host_path)
-                .await
-                .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
-                .map_err(p1_errno_from_fs)?;
-            let descriptor_flags = crate::wasmtime_adapter::wasi::effective_open_descriptor_flags(
-                base.flags,
-                descriptor_flags,
-                FsNodeKind::File,
-            )
-            .map_err(p1_errno_from_fs)?;
-            (FsNodeKind::File, metadata.identity, descriptor_flags)
-        }
-    };
-    Ok(FsDescriptor {
-        path: absolute,
-        kind,
-        flags: descriptor_flags,
-        identity: Some(identity),
-    })
+    wasi_fs::open_at(
+        &namespace,
+        base,
+        path_flags,
+        path,
+        open_flags,
+        descriptor_flags,
+        now_nanos,
+    )
+    .await
+    .map_err(p1_errno_from_fs)
 }
 
 pub(super) async fn p1_path_create_directory<CpuImpl, Net, HostFs>(
@@ -3381,48 +3080,21 @@ where
         Ok(path) => path,
         Err(_) => return p1::errno::FAULT,
     };
-    let (descriptor, path, absolute) = match caller.data().resolve_preview1_path(fd, &path) {
+    let (base, path, _) = match caller.data().resolve_preview1_path(fd, &path) {
         Ok(resolved) => resolved,
         Err(errno) => return errno,
     };
-    if let Some(host_path) = crate::guest_host_share_path(&absolute) {
-        if descriptor.kind != FsNodeKind::Directory {
-            return p1::errno::NOTDIR;
-        }
-        if !descriptor
-            .flags
-            .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
-        {
-            return p1::errno::ROFS;
-        }
-        let service = match caller.data().filesystem.host_service() {
-            Ok(service) => service,
-            Err(error) => return p1_errno_from_fs(error),
-        };
-        return service
-            .create_directory(host_path)
-            .await
-            .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
-            .map_or_else(p1_errno_from_fs, |_| {
-                caller
-                    .data_mut()
-                    .filesystem
-                    .invalidate_host_subtree(&absolute);
-                p1::errno::SUCCESS
-            });
-    }
+    let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
-    caller
-        .data_mut()
-        .filesystem
-        .create_directory_at(&descriptor, &path, now_nanos)
-        .map_or_else(p1_errno_from_fs, |_| p1::errno::SUCCESS)
+    wasi_fs::create_directory_at(&namespace, &base, &path, now_nanos)
+        .await
+        .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
 
 pub(super) async fn p1_path_filestat_get<CpuImpl, Net, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     fd: i32,
-    _flags: u32,
+    flags: u32,
     path: u32,
     path_len: u32,
     stat: u32,
@@ -3440,7 +3112,7 @@ where
         Ok(path) => path,
         Err(_) => return p1::errno::FAULT,
     };
-    let (_, _, absolute) = match caller.data().resolve_preview1_path(fd, &path) {
+    let (base, _, absolute) = match caller.data().resolve_preview1_path(fd, &path) {
         Ok(resolved) => resolved,
         Err(errno) => return errno,
     };
@@ -3452,7 +3124,8 @@ where
             p1_null_device_stat(),
         );
     }
-    let (identity, stat_value) = match p1_stat_absolute_path(caller, &absolute).await {
+    let follow = wasi_fs::follow_within(&base, p1_path_flags(flags));
+    let (identity, stat_value) = match p1_stat_absolute_path(caller, &absolute, follow).await {
         Ok(stat) => stat,
         Err(errno) => return errno,
     };
@@ -3489,43 +3162,7 @@ where
         Ok(resolved) => resolved,
         Err(errno) => return errno,
     };
-    let now_nanos = caller.data().system_time_nanos();
-    let access = p1_timestamp_from_fstflags(
-        fstflags,
-        P1_FSTFLAG_ATIM,
-        P1_FSTFLAG_ATIM_NOW,
-        atim,
-        now_nanos,
-    );
-    let modified = p1_timestamp_from_fstflags(
-        fstflags,
-        P1_FSTFLAG_MTIM,
-        P1_FSTFLAG_MTIM_NOW,
-        mtim,
-        now_nanos,
-    );
-    if let Some(host_path) = crate::guest_host_share_path(&absolute).map(ToOwned::to_owned) {
-        let service = match caller.data().filesystem.host_service() {
-            Ok(service) => service,
-            Err(error) => return p1_errno_from_fs(error),
-        };
-        return service
-            .set_times(&host_path, access, modified)
-            .await
-            .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
-            .map_or_else(p1_errno_from_fs, |_| {
-                caller
-                    .data_mut()
-                    .filesystem
-                    .invalidate_host_subtree(&absolute);
-                p1::errno::SUCCESS
-            });
-    }
-    caller
-        .data_mut()
-        .filesystem
-        .set_times_at_path(&absolute, access, modified, now_nanos)
-        .map_or_else(p1_errno_from_fs, |_| p1::errno::SUCCESS)
+    p1_set_times_at_path(caller, &absolute, atim, mtim, fstflags).await
 }
 
 #[expect(
@@ -3564,62 +3201,27 @@ where
     if status != p1::errno::SUCCESS {
         return status;
     }
-    let (source_base, old_path, source_absolute) =
-        match caller.data().resolve_preview1_path(old_fd, &old_path) {
-            Ok(resolved) => resolved,
-            Err(errno) => return errno,
-        };
-    let (destination_base, new_path, destination_absolute) =
+    let (source_base, old_path, _) = match caller.data().resolve_preview1_path(old_fd, &old_path) {
+        Ok(resolved) => resolved,
+        Err(errno) => return errno,
+    };
+    let (destination_base, new_path, _) =
         match caller.data().resolve_preview1_path(new_fd, &new_path) {
             Ok(resolved) => resolved,
             Err(errno) => return errno,
         };
-    if source_base.kind != FsNodeKind::Directory || destination_base.kind != FsNodeKind::Directory {
-        return p1::errno::NOTDIR;
-    }
-    let source_host = crate::guest_host_share_path(&source_absolute);
-    let destination_host = crate::guest_host_share_path(&destination_absolute);
-    if source_host.is_some() || destination_host.is_some() {
-        if !destination_base
-            .flags
-            .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
-        {
-            return p1::errno::ROFS;
-        }
-        let Some(source_host) = source_host else {
-            return p1::errno::XDEV;
-        };
-        let Some(destination_host) = destination_host else {
-            return p1::errno::XDEV;
-        };
-        let service = match caller.data().filesystem.host_service() {
-            Ok(service) => service,
-            Err(error) => return p1_errno_from_fs(error),
-        };
-        return service
-            .hard_link(source_host, destination_host)
-            .await
-            .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
-            .map_or_else(p1_errno_from_fs, |_| {
-                caller
-                    .data_mut()
-                    .filesystem
-                    .invalidate_host_subtree(&destination_absolute);
-                p1::errno::SUCCESS
-            });
-    }
+    let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
-    caller
-        .data_mut()
-        .filesystem
-        .link_at(
-            &source_base,
-            &old_path,
-            &destination_base,
-            &new_path,
-            now_nanos,
-        )
-        .map_or_else(p1_errno_from_fs, |_| p1::errno::SUCCESS)
+    wasi_fs::link_at(
+        &namespace,
+        &source_base,
+        &old_path,
+        &destination_base,
+        &new_path,
+        now_nanos,
+    )
+    .await
+    .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
 
 pub(super) async fn p1_path_readlink<CpuImpl, Net, HostFs>(
@@ -3647,37 +3249,16 @@ where
     if status != p1::errno::SUCCESS {
         return status;
     }
-    let (base, path, absolute) = match caller.data().resolve_preview1_path(fd, &path) {
+    let (base, path, _) = match caller.data().resolve_preview1_path(fd, &path) {
         Ok(resolved) => resolved,
         Err(errno) => return errno,
     };
-    let payload = if let Some(host_path) = crate::guest_host_share_path(&absolute) {
-        if base.kind != FsNodeKind::Directory {
-            return p1::errno::NOTDIR;
-        }
-        let service = match caller.data().filesystem.host_service() {
-            Ok(service) => service,
-            Err(error) => return p1_errno_from_fs(error),
-        };
-        let payload = match service.read_link(host_path).await {
-            Ok(payload) => payload,
-            Err(error) => {
-                return p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(error));
-            }
-        };
-        if let Err(error) =
-            crate::wasmtime_adapter::wasi::resolve_symlink_payload(&absolute, &payload)
-        {
-            return p1_errno_from_fs(error);
-        }
-        payload
-    } else {
-        match caller.data().filesystem.readlink_at(&base, &path) {
-            Ok(payload) => payload,
-            Err(error) => return p1_errno_from_fs(error),
-        }
+    let namespace = p1_namespace(caller);
+    let target = match wasi_fs::readlink_at(&namespace, &base, &path).await {
+        Ok(target) => target,
+        Err(error) => return p1_errno_from_fs(error),
     };
-    let bytes = payload.as_bytes();
+    let bytes = target.as_bytes();
     let copied = (buf_len as usize).min(bytes.len());
     let status = p1_write_memory(caller, memory, GuestAddress::wasm32(buf), &bytes[..copied]);
     if status != p1::errno::SUCCESS {
@@ -3708,38 +3289,14 @@ where
         Ok(path) => path,
         Err(_) => return p1::errno::FAULT,
     };
-    let (base, path, absolute) = match caller.data().resolve_preview1_path(fd, &path) {
+    let (base, path, _) = match caller.data().resolve_preview1_path(fd, &path) {
         Ok(resolved) => resolved,
         Err(errno) => return errno,
     };
-    if let Some(host_path) = crate::guest_host_share_path(&absolute) {
-        if !base
-            .flags
-            .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
-        {
-            return p1::errno::ROFS;
-        }
-        let service = match caller.data().filesystem.host_service() {
-            Ok(service) => service,
-            Err(error) => return p1_errno_from_fs(error),
-        };
-        return service
-            .remove(host_path, true)
-            .await
-            .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
-            .map_or_else(p1_errno_from_fs, |_| {
-                caller
-                    .data_mut()
-                    .filesystem
-                    .invalidate_host_subtree(&absolute);
-                p1::errno::SUCCESS
-            });
-    }
-    caller
-        .data_mut()
-        .filesystem
-        .remove_directory_at(&base, &path)
-        .map_or_else(p1_errno_from_fs, |_| p1::errno::SUCCESS)
+    let namespace = p1_namespace(caller);
+    wasi_fs::remove_directory_at(&namespace, &base, &path)
+        .await
+        .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
 
 pub(super) async fn p1_path_rename<CpuImpl, Net, HostFs>(
@@ -3769,65 +3326,27 @@ where
         Ok(path) => path,
         Err(_) => return p1::errno::FAULT,
     };
-    let (source_base, old_path, source_absolute) =
-        match caller.data().resolve_preview1_path(old_fd, &old_path) {
-            Ok(resolved) => resolved,
-            Err(errno) => return errno,
-        };
-    let (destination_base, new_path, destination_absolute) =
+    let (source_base, old_path, _) = match caller.data().resolve_preview1_path(old_fd, &old_path) {
+        Ok(resolved) => resolved,
+        Err(errno) => return errno,
+    };
+    let (destination_base, new_path, _) =
         match caller.data().resolve_preview1_path(new_fd, &new_path) {
             Ok(resolved) => resolved,
             Err(errno) => return errno,
         };
-    if source_base.kind != FsNodeKind::Directory || destination_base.kind != FsNodeKind::Directory {
-        return p1::errno::NOTDIR;
-    }
-    let source_host = crate::guest_host_share_path(&source_absolute).map(ToOwned::to_owned);
-    let destination_host =
-        crate::guest_host_share_path(&destination_absolute).map(ToOwned::to_owned);
-    if source_host.is_some() || destination_host.is_some() {
-        if !source_base
-            .flags
-            .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
-            || !destination_base
-                .flags
-                .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
-        {
-            return p1::errno::ROFS;
-        }
-        let Some(source_host) = source_host else {
-            return p1::errno::XDEV;
-        };
-        let Some(destination_host) = destination_host else {
-            return p1::errno::XDEV;
-        };
-        let service = match caller.data().filesystem.host_service() {
-            Ok(service) => service,
-            Err(error) => return p1_errno_from_fs(error),
-        };
-        return service
-            .rename(&source_host, &destination_host)
-            .await
-            .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
-            .map_or_else(p1_errno_from_fs, |_| {
-                let filesystem = &mut caller.data_mut().filesystem;
-                filesystem.invalidate_host_subtree(&source_absolute);
-                filesystem.invalidate_host_subtree(&destination_absolute);
-                p1::errno::SUCCESS
-            });
-    }
+    let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
-    caller
-        .data_mut()
-        .filesystem
-        .rename_at(
-            &source_base,
-            &old_path,
-            &destination_base,
-            &new_path,
-            now_nanos,
-        )
-        .map_or_else(p1_errno_from_fs, |_| p1::errno::SUCCESS)
+    wasi_fs::rename_at(
+        &namespace,
+        &source_base,
+        &old_path,
+        &destination_base,
+        &new_path,
+        now_nanos,
+    )
+    .await
+    .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
 
 pub(super) async fn p1_path_symlink<CpuImpl, Net, HostFs>(
@@ -3846,8 +3365,7 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let old_path = match p1_read_path(caller, memory, GuestAddress::wasm32(old_path), old_path_len)
-    {
+    let target = match p1_read_path(caller, memory, GuestAddress::wasm32(old_path), old_path_len) {
         Ok(path) => path,
         Err(_) => return p1::errno::FAULT,
     };
@@ -3860,46 +3378,15 @@ where
     if status != p1::errno::SUCCESS {
         return status;
     }
-    let (base, new_path, absolute) = match caller.data().resolve_preview1_path(fd, &new_path) {
+    let (base, new_path, _) = match caller.data().resolve_preview1_path(fd, &new_path) {
         Ok(resolved) => resolved,
         Err(errno) => return errno,
     };
-    if let Err(error) = crate::wasmtime_adapter::wasi::resolve_symlink_payload(&absolute, &old_path)
-    {
-        return p1_errno_from_fs(error);
-    }
-    if let Some(host_path) = crate::guest_host_share_path(&absolute) {
-        if base.kind != FsNodeKind::Directory {
-            return p1::errno::NOTDIR;
-        }
-        if !base
-            .flags
-            .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
-        {
-            return p1::errno::ROFS;
-        }
-        let service = match caller.data().filesystem.host_service() {
-            Ok(service) => service,
-            Err(error) => return p1_errno_from_fs(error),
-        };
-        return service
-            .symlink(&old_path, host_path)
-            .await
-            .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
-            .map_or_else(p1_errno_from_fs, |_| {
-                caller
-                    .data_mut()
-                    .filesystem
-                    .invalidate_host_subtree(&absolute);
-                p1::errno::SUCCESS
-            });
-    }
+    let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
-    caller
-        .data_mut()
-        .filesystem
-        .symlink_at(&base, &new_path, &old_path, now_nanos)
-        .map_or_else(p1_errno_from_fs, |_| p1::errno::SUCCESS)
+    wasi_fs::symlink_at(&namespace, &base, &target, &new_path, now_nanos)
+        .await
+        .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
 
 pub(super) async fn p1_path_unlink_file<CpuImpl, Net, HostFs>(
@@ -3920,38 +3407,14 @@ where
         Ok(path) => path,
         Err(_) => return p1::errno::FAULT,
     };
-    let (base, path, absolute) = match caller.data().resolve_preview1_path(fd, &path) {
+    let (base, path, _) = match caller.data().resolve_preview1_path(fd, &path) {
         Ok(resolved) => resolved,
         Err(errno) => return errno,
     };
-    if let Some(host_path) = crate::guest_host_share_path(&absolute) {
-        if !base
-            .flags
-            .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
-        {
-            return p1::errno::ROFS;
-        }
-        let service = match caller.data().filesystem.host_service() {
-            Ok(service) => service,
-            Err(error) => return p1_errno_from_fs(error),
-        };
-        return service
-            .remove(host_path, false)
-            .await
-            .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
-            .map_or_else(p1_errno_from_fs, |_| {
-                caller
-                    .data_mut()
-                    .filesystem
-                    .invalidate_host_subtree(&absolute);
-                p1::errno::SUCCESS
-            });
-    }
-    caller
-        .data_mut()
-        .filesystem
-        .unlink_file_at(&base, &path)
-        .map_or_else(p1_errno_from_fs, |_| p1::errno::SUCCESS)
+    let namespace = p1_namespace(caller);
+    wasi_fs::unlink_file_at(&namespace, &base, &path)
+        .await
+        .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
 
 /// How much console input one stdin readiness probe pulls into the carry.
@@ -4864,13 +4327,20 @@ pub(super) enum RoutedOutput {
 pub(super) async fn p1_write_descriptor<CpuImpl, Net, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     fd: i32,
-    bytes: &[u8],
+    memory: Preview1Memory,
+    layout: &Preview1IovLayout,
 ) -> Result<u32, i32>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
+    // A file takes the guest's bytes straight into its own destination;
+    // every other sink takes them gathered.
+    if let Some(Preview1Descriptor::File { .. }) = caller.data().descriptors.get(fd) {
+        return p1_write_file(caller, fd, memory, layout, None).await;
+    }
+    let bytes = &p1_iov_bytes(memory, layout)?[..];
     // A descriptor whose sink is a bounded channel blocks the guest while
     // that channel is full, unless the guest asked for non-blocking IO —
     // then it gets `EAGAIN` and keeps its bytes, as POSIX requires.
@@ -4929,79 +4399,6 @@ where
         Some(Preview1Descriptor::NullDevice) => {
             u32::try_from(bytes.len()).map_err(|_| p1::errno::OVERFLOW)
         }
-        Some(Preview1Descriptor::File { .. }) => {
-            let Some(Preview1Descriptor::File {
-                descriptor,
-                offset,
-                fdflags,
-            }) = caller.data().descriptors.get(fd)
-            else {
-                return Err(p1::errno::BADF);
-            };
-            let current_offset = *offset;
-            let descriptor = descriptor.clone();
-            let next_offset = current_offset.saturating_add(bytes.len() as u64);
-            if let Some(host_path) =
-                crate::guest_host_share_path(&descriptor.path).map(ToOwned::to_owned)
-            {
-                if !descriptor.flags.contains(fs_types::DescriptorFlags::WRITE) {
-                    return Err(p1::errno::NOTCAPABLE);
-                }
-                let service = caller
-                    .data()
-                    .filesystem
-                    .host_service()
-                    .map_err(p1_errno_from_fs)?;
-                let host_offset = if fdflags & P1_FDFLAG_APPEND != 0 {
-                    service
-                        .stat_path(&host_path)
-                        .await
-                        .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
-                        .map_err(p1_errno_from_fs)?
-                        .size
-                } else {
-                    current_offset
-                };
-                service
-                    .write_file(&host_path, host_offset, bytes)
-                    .await
-                    .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
-                    .map_err(p1_errno_from_fs)?;
-                caller
-                    .data_mut()
-                    .filesystem
-                    .invalidate_host_subtree(&descriptor.path);
-                let Some(Preview1Descriptor::File { offset, .. }) =
-                    caller.data_mut().descriptors.get_mut(fd)
-                else {
-                    panic!("Preview1 descriptor disappeared during host write");
-                };
-                *offset = next_offset;
-                return u32::try_from(bytes.len()).map_err(|_| p1::errno::OVERFLOW);
-            }
-            let now_nanos = caller.data().now_nanos();
-            let write_offset: usize = current_offset.try_into().map_err(|_| p1::errno::OVERFLOW)?;
-            if fdflags & P1_FDFLAG_APPEND != 0 {
-                caller
-                    .data_mut()
-                    .filesystem
-                    .append(&descriptor, bytes, now_nanos)
-                    .map_err(p1_errno_from_fs)?;
-            } else {
-                caller
-                    .data_mut()
-                    .filesystem
-                    .write_at(&descriptor, write_offset, bytes, now_nanos)
-                    .map_err(p1_errno_from_fs)?;
-            }
-            let Some(Preview1Descriptor::File { offset, .. }) =
-                caller.data_mut().descriptors.get_mut(fd)
-            else {
-                panic!("Preview1 descriptor disappeared during write");
-            };
-            *offset = next_offset;
-            u32::try_from(bytes.len()).map_err(|_| p1::errno::OVERFLOW)
-        }
         Some(_) => Err(p1::errno::BADF),
         None => Err(p1::errno::BADF),
     }
@@ -5034,33 +4431,11 @@ where
         }) => {
             let descriptor = descriptor.clone();
             let offset = *offset;
-            let bytes = if let Some(host_path) =
-                crate::guest_host_share_path(&descriptor.path).map(ToOwned::to_owned)
-            {
-                let service = caller
-                    .data()
-                    .filesystem
-                    .host_service()
-                    .map_err(p1_errno_from_fs)?;
-                let max_bytes = u32::try_from(capacity).map_err(|_| p1::errno::OVERFLOW)?;
-                service
-                    .read_file_range(&host_path, offset, max_bytes)
-                    .await
-                    .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
-                    .map_err(p1_errno_from_fs)?
-                    .into()
-            } else {
-                caller
-                    .data()
-                    .filesystem
-                    .read_file_chunk(&descriptor, offset, capacity)
-                    .map_err(p1_errno_from_fs)?
-            };
-            if let Some(Preview1Descriptor::File { offset, .. }) =
-                caller.data_mut().descriptors.get_mut(fd)
-            {
-                *offset = offset.saturating_add(bytes.len() as u64);
-            }
+            let namespace = p1_namespace(caller);
+            let bytes = wasi_fs::read(&namespace, &descriptor, offset, capacity)
+                .await
+                .map_err(p1_errno_from_fs)?;
+            p1_set_file_offset(caller, fd, offset.saturating_add(bytes.len() as u64));
             Ok(bytes)
         }
         Some(_) => Err(p1::errno::BADF),
@@ -5296,9 +4671,71 @@ mod tests {
                 kind: FsNodeKind::File,
                 flags: fs_types::DescriptorFlags::READ,
                 identity: None,
+                mount: None,
             },
             offset: 0,
             fdflags: 0,
+        }
+    }
+
+    /// `path_open(O_TRUNC)` against a preopen that may read and change its
+    /// directory but not write file data is refused, whatever rights the
+    /// guest asks for, and leaves the file as it was.
+    #[test]
+    fn path_open_truncate_without_write_authority_leaves_the_file_untouched() {
+        use futures_lite::future::block_on;
+
+        let namespace: crate::Namespace<crate::UnsupportedHostFileSystem> =
+            crate::Namespace::new(crate::MountTable::new(
+                crate::BootFs::new(crate::EmbeddedBootFs::new(&[], &[]), crate::BOOT_DEVICE),
+                1,
+            ));
+        let owner = FsDescriptor {
+            path: "/".into(),
+            kind: FsNodeKind::Directory,
+            flags: fs_types::DescriptorFlags::READ
+                | fs_types::DescriptorFlags::WRITE
+                | fs_types::DescriptorFlags::MUTATE_DIRECTORY,
+            identity: None,
+            mount: None,
+        };
+        let file = block_on(wasi_fs::open_at(
+            &namespace,
+            &owner,
+            fs_types::PathFlags::empty(),
+            "notes.txt",
+            fs_types::OpenFlags::CREATE,
+            fs_types::DescriptorFlags::READ | fs_types::DescriptorFlags::WRITE,
+            1,
+        ))
+        .expect("the owner creates the file");
+        block_on(wasi_fs::write(
+            &namespace,
+            &file,
+            helios_hal::fs::WritePosition::At(0),
+            "日本語 한국어".as_bytes(),
+            2,
+        ))
+        .expect("the owner writes the file");
+
+        let preopen = FsDescriptor {
+            flags: fs_types::DescriptorFlags::READ | fs_types::DescriptorFlags::MUTATE_DIRECTORY,
+            ..owner
+        };
+        for rights in [P1_RIGHT_FD_READ | P1_RIGHT_FD_WRITE, P1_RIGHT_FD_READ] {
+            let opened = block_on(wasi_fs::open_at(
+                &namespace,
+                &preopen,
+                fs_types::PathFlags::empty(),
+                "notes.txt",
+                p1_open_flags(8),
+                p1_descriptor_flags(rights, 0),
+                3,
+            ));
+            assert!(matches!(opened, Err(fs_types::ErrorCode::ReadOnly)));
+            let contents =
+                block_on(wasi_fs::read(&namespace, &file, 0, 64)).expect("the owner reads back");
+            assert_eq!(contents.as_ref(), "日本語 한국어".as_bytes());
         }
     }
 

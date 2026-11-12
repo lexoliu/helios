@@ -170,6 +170,10 @@ impl<T: VirtioTransport> RingOps<T> for SplitRing<T> {
         self.core.ids.peek()
     }
 
+    fn in_flight_chains(&self) -> usize {
+        self.core.in_flight.count()
+    }
+
     fn reprogram(&mut self, transport: &T, index: u16) {
         zero(&self.descriptors);
         zero(&self.driver_area);
@@ -524,6 +528,16 @@ impl<T: VirtioTransport> SplitRing<T> {
     /// the way a device would; both start from the chain the driver
     /// published, whether it went into the ring directly or into this
     /// chain's indirect table.
+    /// Device side: the heads of the chains the device owns right now,
+    /// so a test playing a device that is polled can find the one
+    /// request it has to answer.
+    #[cfg(test)]
+    pub(super) fn device_in_flight_heads(&self) -> alloc::vec::Vec<u16> {
+        (0..self.core.size)
+            .filter(|id| self.core.in_flight.contains(*id))
+            .collect()
+    }
+
     #[cfg(test)]
     pub(super) fn device_chain(&self, id: u16) -> alloc::vec::Vec<(u64, u32, bool)> {
         let head = self.descriptor(id);
