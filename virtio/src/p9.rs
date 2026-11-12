@@ -214,11 +214,10 @@ mod tests {
         let tag_len = u16::try_from(MOUNT_TAG.len()).expect("mount tag length fits in u16");
         config[..2].copy_from_slice(&tag_len.to_le_bytes());
         config[2..2 + MOUNT_TAG.len()].copy_from_slice(MOUNT_TAG.as_bytes());
-        for (index, word) in config.chunks_exact(4).enumerate() {
-            transport.bus().write_u32(
-                index * 4,
-                u32::from_le_bytes([word[0], word[1], word[2], word[3]]),
-            );
+        for (index, &word) in config.as_chunks::<4>().0.iter().enumerate() {
+            transport
+                .bus()
+                .write_u32(index * 4, u32::from_le_bytes(word));
         }
         transport
     }

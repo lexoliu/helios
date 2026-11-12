@@ -6,7 +6,7 @@ use helios_api::{
 
 use crate::error::DispatchError;
 use crate::system::accept;
-use crate::system::server::{self, Dispatcher};
+use crate::system::server::{self, Dispatcher, Invocations};
 
 use super::bindings::helios::system::{filters, instances, profiling, programs, stats, tracing};
 use super::methods::{
@@ -16,7 +16,7 @@ use super::methods::{
     PROFILING_SET_INSTRUCTION_SAMPLING, PROGRAMS_AOT, PROGRAMS_EXEC, PROGRAMS_INSTANCE,
     STATS_INSTANCE, STATS_SNAPSHOT, TRACING_INSTANCE, TRACING_RECENT, TRACING_SET_TARGET_ENABLED,
 };
-use crate::debugger::{filesystem, programs as debugger_programs};
+use crate::debugger::{filesystem, programs as debugger_programs, snapshot as debugger_snapshot};
 
 /// The embedded debugger's dispatcher: every method it exposes,
 /// answered out of the guest's own system interfaces.
@@ -30,11 +30,12 @@ impl Dispatcher for SystemDispatcher {
 
     async fn dispatch(
         &self,
+        invocations: &Invocations,
         instance: &str,
         func: &str,
         payload: &[u8],
     ) -> Result<Vec<u8>, DispatchError> {
-        dispatch(instance, func, payload).await
+        dispatch(invocations, instance, func, payload).await
     }
 }
 
@@ -81,9 +82,15 @@ fn supports_request(instance: &str, func: &str) -> bool {
             | (PROFILING_INSTANCE, PROFILING_RAW_PROFILE_READ)
     ) || filesystem::supports(instance, func)
         || debugger_programs::supports(instance, func)
+        || debugger_snapshot::supports(instance, func)
 }
 
-async fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>, DispatchError> {
+async fn dispatch(
+    invocations: &Invocations,
+    instance: &str,
+    func: &str,
+    payload: &[u8],
+) -> Result<Vec<u8>, DispatchError> {
     match (instance, func) {
         (PROGRAMS_INSTANCE, PROGRAMS_EXEC) => {
             let request =
@@ -139,6 +146,7 @@ async fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>,
             let response = response
                 .map(|result| programs::AotResult {
                     destination_path: result.destination_path,
+                    worker_threads: result.worker_threads,
                 })
                 .map_err(|error| programs::ExecError {
                     kind: convert_launch_error_kind(error.kind),
@@ -338,6 +346,9 @@ async fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>,
         _ if filesystem::supports(instance, func) => filesystem::dispatch(func, payload).await,
         _ if debugger_programs::supports(instance, func) => {
             debugger_programs::dispatch(func, payload).await
+        }
+        _ if debugger_snapshot::supports(instance, func) => {
+            debugger_snapshot::dispatch(invocations, func, payload).await
         }
         _ => unreachable!("supports_request must reject unsupported methods before dispatch"),
     }
