@@ -43,7 +43,9 @@ from helios_bench.manifest import (
     wasmtime_linux_release,
 )
 from helios_bench.report import (
+    HELIOS_SIDES,
     Control,
+    GuestRam,
     Hardware,
     InstructionSampling,
     NoiseRetry,
@@ -62,7 +64,7 @@ from helios_bench.sources import (
     read_control,
     read_optional_side,
 )
-from helios_bench.wasi_apps import gap_bench, workload_runner
+from helios_bench.wasi_apps import fedora_baseline, gap_bench, workload_runner
 from helios_bench.workloads import load_workloads, select_workloads
 
 GAP_BENCH = WASI_APPS_ROOT / "linux-gap-bench.py"
@@ -84,6 +86,11 @@ RECONFIRM_OUT = "reconfirm"
 RETRY_OUT = "retry"
 LINUX_OUT = "linux"
 LINUX_SIDES = {Side.LINUX_NATIVE, Side.LINUX_WASMTIME}
+#: How every Helios boot's RAM is backed (`--guest-ram`): preallocated, as
+#: the Fedora guest's always is (`guest_ram_backend` in
+#: fedora_qemu_baseline.py), so neither column pays host page faults the
+#: other does not (#491).
+HELIOS_GUEST_RAM = "prealloc"
 # The cargo profiles a Helios image of a run can be built with, as the
 # inspector names them. The baseline image is always the plain one: a
 # pairing varies the candidate.
@@ -424,6 +431,7 @@ def helios_command(
     lane = options.lane
     env = {
         "HELIOS_WORKLOAD_BENCH_VM_MEMORY": lane.memory,
+        "HELIOS_WORKLOAD_BENCH_GUEST_RAM": HELIOS_GUEST_RAM,
         "HELIOS_WORKLOAD_BENCH_VM_SMP": str(lane.vcpus),
         "HELIOS_WORKLOAD_BENCH_NET_BACKEND": lane.net_backend,
         "HELIOS_WORKLOAD_BENCH_RPC_TRANSPORT": lane.rpc_transport,
@@ -906,6 +914,34 @@ def bootfs_cwasm_digests(lane: Lane, kernel_build: str) -> dict[str, str]:
     return {path.name: sha256_of(path) for path in sorted(prebuild.glob("*.cwasm"))}
 
 
+def helios_guest_ram(run: dict) -> GuestRam:
+    """How the Helios guest's RAM was backed, as its inspector's run record states (#491)."""
+    vm = run.get("vm")
+    if vm is None or "guest_ram" not in vm:
+        raise SystemExit(
+            "the helios run record states no vm.guest_ram, so the inspector that boots it "
+            "predates --guest-ram and the report cannot say how its RAM was backed"
+        )
+    backing = vm["guest_ram"]
+    return GuestRam(
+        backing=backing["backing"], size=vm["memory"], prealloc_threads=backing.get("prealloc_threads")
+    )
+
+
+def linux_guest_ram(lane: Lane) -> GuestRam:
+    """How the Fedora guest's RAM is backed: the `-object` its script hands QEMU (#491)."""
+    spec = fedora_baseline().guest_ram_backend(lane.linux_vm_memory)
+    kind, *entries = spec.split(",")
+    if kind != "memory-backend-ram":
+        raise SystemExit(f"the Fedora guest's RAM backend is {spec!r}, not a memory-backend-ram")
+    options = dict(entry.split("=", 1) for entry in entries)
+    return GuestRam(
+        backing="prealloc" if options.get("prealloc") == "on" else "lazy",
+        size=options["size"],
+        prealloc_threads=int(options["prealloc-threads"]) if "prealloc-threads" in options else None,
+    )
+
+
 def compiler_pins(lane: Lane, workloads: list[dict], kernel_build: str) -> tuple[str | None, str | None]:
     """The digests of the compiler plugin build and of the
     `helios-compiler-host` the selection's workloads hosted it with, each
@@ -926,7 +962,15 @@ def compiler_pins(lane: Lane, workloads: list[dict], kernel_build: str) -> tuple
     return plugin_digest, host_digest
 
 
-def collect_pins(lane: Lane, workloads: list[dict], kernel_build: str, baseline: Baseline | None) -> Pins:
+def collect_pins(
+    lane: Lane,
+    workloads: list[dict],
+    kernel_build: str,
+    baseline: Baseline | None,
+    helios_run: dict | None,
+) -> Pins:
+    """Every pin of the run. ``helios_run`` is the `helios` side's run
+    record, None for a run that timed no Helios side."""
     image_url, image_sha256 = fedora_image(lane.guest_arch)
     plugin_digest, host_digest = compiler_pins(lane, workloads, kernel_build)
     wasmtime_revision = vendored_wasmtime_pin().revision
@@ -942,6 +986,8 @@ def collect_pins(lane: Lane, workloads: list[dict], kernel_build: str, baseline:
         vcpus=lane.vcpus,
         memory=lane.memory,
         linux_vm_memory=lane.linux_vm_memory,
+        helios_guest_ram=helios_guest_ram(helios_run) if helios_run is not None else None,
+        linux_guest_ram=linux_guest_ram(lane),
         net_backend=lane.net_backend,
         rpc_transport=lane.rpc_transport,
         devices=lane.devices,
@@ -1027,7 +1073,7 @@ def read_side_rounds(options: RunOptions, side: Side, thresholds: Thresholds) ->
     per_round: list[RawSide] = []
     for number in range(1, (options.effective_rounds or 0) + 1):
         out_dir = round_out_root(options, number) / SIDE_OUT[side]
-        raw = read_optional_side(out_dir, side, thresholds.warmup_discard, number)
+        raw = read_optional_side(out_dir, side, options.lane.rpc_transport, thresholds.warmup_discard, number)
         if raw is None:
             raise SystemExit(f"the {side} side produced no JSONL in round {number} under {out_dir}")
         per_round.append(raw)
@@ -1057,7 +1103,7 @@ def read_sides(options: RunOptions, thresholds: Thresholds) -> dict[Side, RawSid
             sides[side] = read_side_rounds(options, side, thresholds)
             continue
         out_dir = options.out_dir / SIDE_OUT[side]
-        raw = read_optional_side(out_dir, side, thresholds.warmup_discard)
+        raw = read_optional_side(out_dir, side, options.lane.rpc_transport, thresholds.warmup_discard)
         if raw is None:
             raise SystemExit(f"the {side} side produced no JSONL under {out_dir}")
         sides[side] = raw
@@ -1071,18 +1117,20 @@ def read_controls(options: RunOptions, thresholds: Thresholds) -> dict[Side, tup
     rounds = options.effective_rounds
     controls = {}
     for side in options.sides:
+        transport = options.lane.rpc_transport
         before = read_control(
-            round_out_root(options, 1) / SIDE_OUT[side], side, "before", thresholds.warmup_discard
+            round_out_root(options, 1) / SIDE_OUT[side], side, transport, "before", thresholds.warmup_discard
         )
         after = read_control(
-            round_out_root(options, rounds or 1) / SIDE_OUT[side], side, "after", thresholds.warmup_discard
+            round_out_root(options, rounds or 1) / SIDE_OUT[side],
+            side,
+            transport,
+            "after",
+            thresholds.warmup_discard,
         )
         if before is not None and after is not None:
             controls[side] = (before, after)
     return controls
-
-
-HELIOS_SIDES = frozenset({Side.HELIOS, Side.HELIOS_BASELINE, Side.HELIOS_BASELINE_REBUILD})
 
 
 def dispersed_headline_workloads(
@@ -1145,7 +1193,7 @@ def retake_workloads(
     replaced: dict[Side, dict[str, RawCell]] = {}
     for side in options.sides & HELIOS_SIDES:
         out_dir = options.out_dir / out_name / SIDE_OUT[side]
-        raw = read_optional_side(out_dir, side, thresholds.warmup_discard)
+        raw = read_optional_side(out_dir, side, options.lane.rpc_transport, thresholds.warmup_discard)
         if raw is None:
             raise SystemExit(f"the second pass produced no JSONL for the {side} side under {out_dir}")
         for name in names:
@@ -1561,7 +1609,13 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
             control=control,
             run=run,
             hardware=collect_hardware(lane),
-            pins=collect_pins(lane, workloads, options.kernel_build, options.baseline),
+            pins=collect_pins(
+                lane,
+                workloads,
+                options.kernel_build,
+                options.baseline,
+                sides[Side.HELIOS].run if Side.HELIOS in sides else None,
+            ),
             thresholds=thresholds,
             first_pass=reconfirmation.first_pass,
         )
