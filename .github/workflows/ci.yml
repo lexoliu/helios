@@ -686,6 +686,7 @@ jobs:
           # rather than something that quietly starts or stops being
           # true.
           ! grep -qF 'device grant published' "$runtime/inspector.log"
+      - uses: ./helios/.github/actions/swtpm
       # Measured boot (#602): the kernel's signing seed is sealed in the
       # TPM to the boot chain. The ACPI description is the boot whose
       # measured input repeats (PCR 9 holds the kernel and the payload),
@@ -1006,6 +1007,7 @@ jobs:
           grep -aF 'mount source online serial="src-a"' "$runtime/debug-serial.log" | grep -aF 'read_only=false'
           grep -aF 'mount source online serial="src-b"' "$runtime/debug-serial.log" | grep -aF 'read_only=true'
           grep -aF 'block device identified as the kernel scratch disk serial="helios-data"' "$runtime/debug-serial.log"
+      - uses: ./helios/.github/actions/swtpm
       # The kernel's signing seed is sealed in the TPM to the measured
       # boot chain (#602). Two boots of one payload on one TPM state
       # directory: the first provisions and seals a seed, the second
