@@ -104,6 +104,9 @@ class Lane(BaseModel):
     qemu_version: str
     boot_timeout_seconds: int = Field(ge=1)
     vcpus: int = Field(ge=1)
+    # The worker count the kernel's compiler plugin runs with on this lane's
+    # guest, which the Linux + Wasmtime column of `aot-curl` is given.
+    compiler_workers: int = Field(ge=1)
     memory: str
     linux_vm_memory: str
     # Why the lane gives its two guests different memory sizes. The two

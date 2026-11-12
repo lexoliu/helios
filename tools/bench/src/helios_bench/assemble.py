@@ -136,11 +136,14 @@ def build_workload(
 ) -> WorkloadResult:
     comparisons = []
     parity_bug = False
+    uncompared = {Side(side): reason for side, reason in workload.get("uncompared", {}).items()}
     helios = cells.get(Side.HELIOS)
     if helios is not None and not helios.rejected:
         for side in (Side.LINUX_WASMTIME, Side.LINUX_NATIVE):
             other = cells.get(side)
-            if other is None or other.rejected:
+            # An uncompared side that was measured is a reference shown
+            # beside the Helios number, never a speedup against it.
+            if other is None or other.rejected or side in uncompared:
                 continue
             comparison = compare(helios, other, floor)
             comparisons.append(comparison)
@@ -155,14 +158,50 @@ def build_workload(
         name=workload["name"],
         workload_class=WorkloadClass(workload["class"]),
         headline=bool(workload.get("headline", False)),
-        uncompared={Side(side): reason for side, reason in workload.get("uncompared", {}).items()},
+        uncompared=uncompared,
         description=workload["description"],
         throughput_bytes=workload.get("throughput_bytes"),
+        matched_metrics=tuple(workload.get("matched_metrics", [])),
         cells=cells,
         failures=failures or {},
         comparisons=comparisons,
         parity_bug=parity_bug,
     )
+
+
+#: The sides a workload's `matched_metrics` hold equal: the Helios column and
+#: the Linux column that runs the same wasm. A baseline image is driven by its
+#: own commit's tooling, which may predate the metric.
+MATCHED_SIDES = (Side.HELIOS, Side.LINUX_WASMTIME)
+
+
+def check_matched_metrics(workload: dict, cells: dict[Side, Cell]) -> None:
+    """Stops assembly when the sides a comparison holds a metric fixed for
+    ran with different values of it, or one of them did not report it.
+
+    `aot-curl` compares one compiler on two systems only at one worker
+    count; a cell that compiled with another count is a different
+    measurement, and the run's raw JSONL says which.
+    """
+    for name in workload.get("matched_metrics", []):
+        values: dict[Side, set[float]] = {}
+        for side in MATCHED_SIDES:
+            cell = cells.get(side)
+            if cell is None:
+                continue
+            missing = [it.index for it in cell.iterations if name not in it.metrics]
+            if missing:
+                raise SystemExit(
+                    f"workload {workload['name']}: {side} iterations {missing} do not report "
+                    f"`{name}`, which the manifest holds equal across {', '.join(MATCHED_SIDES)}"
+                )
+            values[side] = {it.metrics[name] for it in cell.iterations}
+        if len(set().union(*values.values())) > 1:
+            seen = "; ".join(f"{side}: {sorted(found)}" for side, found in values.items())
+            raise SystemExit(
+                f"workload {workload['name']}: `{name}` must be one value across "
+                f"{', '.join(MATCHED_SIDES)}, found {seen}"
+            )
 
 
 def build_control(
@@ -218,6 +257,7 @@ def assemble_report(
             cells[side] = build_cell(side, raw_cell.iterations, thresholds, round_floor)
         if not cells and not failures:
             continue
+        check_matched_metrics(workload, cells)
         result = build_workload(workload, cells, floor, failures)
         for side, raw_cells in (first_pass or {}).items():
             raw_cell = raw_cells.get(workload["name"])

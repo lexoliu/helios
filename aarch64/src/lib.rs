@@ -774,7 +774,13 @@ extern "C" fn aarch64_kernel_main() -> ! {
         );
         routes.set_entropy(entropy.interrupt, entropy.device);
     }
-    if let Some(balloon) = balloon::install(&kernel, &platform, physical_memory_offset, &handoff) {
+    if let Some(balloon) = balloon::install(
+        &kernel,
+        &platform,
+        physical_memory_offset,
+        &handoff,
+        debug_state.machine_generation_handle(),
+    ) {
         gic.enable_device_interrupt(
             balloon.interrupt,
             balloon.trigger,
@@ -990,35 +996,7 @@ impl Cpu for Aarch64Cpu {
         if len == 0 {
             return;
         }
-        let start = ptr as usize;
-        let end = start
-            .checked_add(len)
-            .unwrap_or_else(|| panic!("AArch64 executable publish range overflow"));
-        let mut address = start & !(cache_line_bytes() - 1);
-        while address < end {
-            unsafe {
-                asm!("dc cvau, {addr}", addr = in(reg) address, options(nostack, preserves_flags));
-            }
-            address = address
-                .checked_add(cache_line_bytes())
-                .unwrap_or_else(|| panic!("AArch64 data-cache clean iteration overflow"));
-        }
-        unsafe {
-            asm!("dsb ish", options(nostack, preserves_flags));
-        }
-        let mut address = start & !(cache_line_bytes() - 1);
-        while address < end {
-            unsafe {
-                asm!("ic ivau, {addr}", addr = in(reg) address, options(nostack, preserves_flags));
-            }
-            address = address.checked_add(cache_line_bytes()).unwrap_or_else(|| {
-                panic!("AArch64 instruction-cache invalidate iteration overflow")
-            });
-        }
-        unsafe {
-            asm!("dsb ish", options(nostack, preserves_flags));
-            asm!("isb", options(nostack, preserves_flags));
-        }
+        make_instructions_coherent(ptr, len);
         helios_kernel::runtime_memory::publish_code_memory(ptr, len);
     }
 
@@ -1337,25 +1315,25 @@ extern "C" fn aarch64_handle_sync_exception(
         {
             return;
         }
-        // A reserved page inside a live fiber stack is a demand commit
-        // the kernel resolves here, with no lock and no allocation; the
-        // guard page below one is a stack overflow and stays a fault.
-        stack_fault = helios_kernel::resolve_stack_fault(helios_hal::vmm::VirtAddr::new(far_el1));
-        if stack_fault == helios_kernel::StackFault::Committed {
-            return;
-        }
-        // A swapped-out page is ours to resolve, and resolving it means
-        // waiting for the swap device. Redirect the faulting context
-        // onto a kernel trampoline running on its own stack, which can
-        // block the fiber the way a host call does; everything else —
-        // guard pages included — still belongs to the runtime.
-        if helios_kernel::swapped_token(helios_hal::vmm::VirtAddr::new(far_el1)).is_some() {
-            // SAFETY: `frame` is the frame the entry above wrote, and
-            // `enter_swap_fault_trampoline` only rewrites fields in it.
-            unsafe {
-                enter_swap_fault_trampoline(frame, far_el1);
+        match helios_kernel::classify_user_page_fault(helios_hal::vmm::VirtAddr::new(far_el1)) {
+            // A reserved page inside a live fiber stack was a demand
+            // commit the kernel resolved in place.
+            helios_kernel::UserPageFault::Resolved => return,
+            // A swapped-out page is ours to resolve, and resolving it
+            // means waiting for the swap device. Redirect the faulting
+            // context onto a kernel trampoline running on its own stack,
+            // which can block the fiber the way a host call does.
+            helios_kernel::UserPageFault::Swapped => {
+                // SAFETY: `frame` is the frame the entry above wrote, and
+                // `enter_swap_fault_trampoline` only rewrites fields in it.
+                unsafe {
+                    enter_swap_fault_trampoline(frame, far_el1);
+                }
+                return;
             }
-            return;
+            // Everything else — guard pages included — still belongs to
+            // the runtime.
+            helios_kernel::UserPageFault::Unclaimed(fault) => stack_fault = fault,
         }
     }
 
@@ -1427,36 +1405,24 @@ unsafe fn enter_swap_fault_trampoline(frame: *mut SyncTrapFrame, faulting_addres
 /// runtime's trap handler, which unwinds the guest. Only a fault the
 /// runtime does not claim either is fatal.
 extern "C" fn swap_fault_trampoline(frame: *mut SyncTrapFrame, faulting_address: usize) -> ! {
-    let outcome = helios_kernel::resolve_swap_fault_blocking(helios_hal::vmm::VirtAddr::new(
-        faulting_address,
-    ));
-    if outcome.is_ok() {
+    // SAFETY: the frame is intact; only its saved registers are read. The
+    // trampoline runs with the interrupt mask the faulting context had
+    // (`SPSR` was left alone), so what the runtime's unwind lands in runs
+    // on that context's terms without a mask to restore.
+    let (elr_el1, frame_pointer) = unsafe { ((*frame).elr as usize, (*frame).x[29] as usize) };
+    helios_kernel::run_swap_fault_trampoline(
+        helios_hal::vmm::VirtAddr::new(faulting_address),
+        KernelException {
+            cause: KernelExceptionCause::DataFault,
+            instruction_pointer: elr_el1,
+            frame_pointer,
+            faulting_address: Some(faulting_address),
+        },
         // SAFETY: `frame` is the copy `enter_swap_fault_trampoline` put
         // one frame below this stack's interrupted SP, and this code is
         // running on that stack.
-        unsafe { __helios_aarch64_swap_fault_resume(frame) }
-    }
-    // SAFETY: the frame is intact; only its saved registers are read.
-    let (elr_el1, frame_pointer) = unsafe { ((*frame).elr as usize, (*frame).x[29] as usize) };
-    tracing::error!(
-        target: "helios_aarch64::swap",
-        addr = faulting_address,
-        error = ?outcome.err(),
-        "page fault on a swapped-out page could not be resolved"
-    );
-    // The epilogue's `eret` brought this code here, so the processor is
-    // already in the state `dispatch_native_trap` asks for: SP_EL1
-    // selected and running the faulting stack, which the runtime's
-    // resume moves up, SP_EL0 at the exception-stack top, and the
-    // faulting context's IRQ mask. The handler returns only when it did
-    // not claim the fault.
-    let _ = helios_kernel::dispatch_native_trap(KernelException {
-        cause: KernelExceptionCause::DataFault,
-        instruction_pointer: elr_el1,
-        frame_pointer,
-        faulting_address: Some(faulting_address),
-    });
-    panic!("unresolvable swap fault at {faulting_address:#x} that the runtime did not claim either")
+        || unsafe { __helios_aarch64_swap_fault_resume(frame) },
+    )
 }
 
 /// IRQ entry point for every exception level slot, called from
@@ -1703,6 +1669,43 @@ fn timebase() -> Timebase {
     Timebase::new(value)
 }
 
+/// Makes bytes written through the data side visible to instruction fetch on
+/// every processor: clean the data cache to the point of unification, then
+/// invalidate the instruction cache over the range, as the Arm ARM requires
+/// before newly written code runs. Shared by code publication and by swap
+/// reinstating an executable page.
+pub(crate) fn make_instructions_coherent(ptr: *const u8, len: usize) {
+    let start = ptr as usize;
+    let end = start
+        .checked_add(len)
+        .unwrap_or_else(|| panic!("AArch64 executable publish range overflow"));
+    let mut address = start & !(cache_line_bytes() - 1);
+    while address < end {
+        unsafe {
+            asm!("dc cvau, {addr}", addr = in(reg) address, options(nostack, preserves_flags));
+        }
+        address = address
+            .checked_add(cache_line_bytes())
+            .unwrap_or_else(|| panic!("AArch64 data-cache clean iteration overflow"));
+    }
+    unsafe {
+        asm!("dsb ish", options(nostack, preserves_flags));
+    }
+    let mut address = start & !(cache_line_bytes() - 1);
+    while address < end {
+        unsafe {
+            asm!("ic ivau, {addr}", addr = in(reg) address, options(nostack, preserves_flags));
+        }
+        address = address
+            .checked_add(cache_line_bytes())
+            .unwrap_or_else(|| panic!("AArch64 instruction-cache invalidate iteration overflow"));
+    }
+    unsafe {
+        asm!("dsb ish", options(nostack, preserves_flags));
+        asm!("isb", options(nostack, preserves_flags));
+    }
+}
+
 fn cache_line_bytes() -> usize {
     let ctr_el0: u64;
     unsafe {
@@ -1881,8 +1884,8 @@ fn fdt_cells(bytes: &[u8]) -> Option<usize> {
         return None;
     }
     let mut value = 0usize;
-    for cell in bytes.chunks_exact(4) {
-        let cell = u32::from_be_bytes(cell.try_into().ok()?) as usize;
+    for &cell in bytes.as_chunks::<4>().0 {
+        let cell = u32::from_be_bytes(cell) as usize;
         value = value.checked_shl(32)? | cell;
     }
     Some(value)

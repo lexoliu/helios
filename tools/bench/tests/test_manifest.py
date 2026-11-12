@@ -93,7 +93,11 @@ def test_coreutils_counterparts_run_one_exec_per_helios_exec() -> None:
 
 def test_native_counterparts_exist_for_every_native_bin_reference() -> None:
     manifest = load_workloads()
-    sources = {path.stem for path in (REPO_ROOT / "tools/bench/native").glob("*.c")}
+    native_root = REPO_ROOT / "tools/bench/native"
+    sources = {path.stem for path in native_root.glob("*.c")}
+    # The Rust tools `build.sh` builds alongside the C ones, by package.
+    sources.update(re.findall(r"cargo zigbuild .*-p (\S+)", (native_root / "build.sh").read_text()))
+    assert "helios-compiler-host" in sources
     for workload in manifest["workloads"]:
         for side in ("linux_native", "linux_wasmtime"):
             spec = workload["counterparts"][side]
@@ -102,6 +106,39 @@ def test_native_counterparts_exist_for_every_native_bin_reference() -> None:
             for value in [spec["program"], *spec.get("args", [])]:
                 if value.startswith("{native_bin}/"):
                     assert Path(value).name in sources, value
+
+
+def test_aot_curl_runs_the_compiler_plugin_on_both_compared_columns() -> None:
+    """#750: the Linux + Wasmtime column hosts the plugin the Helios column
+    runs, asking for the same compile; native `wasmtime compile` is the
+    reference beside them, never a comparison."""
+    workload = next(w for w in load_workloads()["workloads"] if w["name"] == "aot-curl")
+    native = workload["counterparts"]["linux_native"]
+    wasmtime = workload["counterparts"]["linux_wasmtime"]
+    assert native["program"] == "{wasmtime}" and native["args"][0] == "compile"
+    assert wasmtime["resident"] is True
+    assert wasmtime["program"] == "{native_bin}/helios-compiler-host"
+    args = wasmtime["args"]
+    flags = dict(zip(args[::2], args[1::2], strict=True))
+    assert flags == {
+        "--plugin": "{compiler_plugin}",
+        "--input": "{guest:artifacts/wasi-tools/curl.wasm}",
+        "--output": "{workdir}/aot-curl-output.cwasm",
+        "--target": "{compiler_target}",
+        "--hint": "performance",
+        "--workers": "{compiler_workers}",
+    }
+    # The input is the one the Helios column uploads.
+    assert flags["--input"] == "{guest:" + workload["wasm_path"] + "}"
+    assert set(workload["uncompared"]) == {"linux_native"}
+    assert workload["matched_metrics"] == ["compiler_workers"]
+
+
+def test_every_lane_states_its_compiler_worker_count() -> None:
+    """The kernel's kernel-role processors: every vCPU but the one the
+    embedded debugger reserves for the system component."""
+    for lane in load_manifest().lanes:
+        assert 1 <= lane.compiler_workers < lane.vcpus, lane.name
 
 
 def test_the_workflow_measures_one_lane() -> None:

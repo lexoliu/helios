@@ -1265,7 +1265,6 @@ pub(crate) mod test_store {
     use crate::component::{ComponentOutputMode, ComponentStoreData};
     use crate::gpu::Gpu3dService;
     use crate::test_support::{TestCpu, TestNetworkService};
-    use crate::wasmtime_adapter::wasi::DebugFileSystem;
     use crate::{
         Executor, InstanceRegistry, ProcessAuthority, TaskFunding, UnsupportedHostFileSystem,
     };
@@ -1279,7 +1278,7 @@ pub(crate) mod test_store {
 
     /// The serial port the fixture's writer names: the store data has
     /// to carry one, and nothing the tests do is about what it writes.
-    struct DiscardPort;
+    pub(crate) struct DiscardPort;
 
     impl helios_hal::serial::ByteSerial for DiscardPort {
         fn try_read_byte(&self) -> Option<u8> {
@@ -1378,7 +1377,7 @@ pub(crate) mod test_store {
             registry,
             instance,
             None,
-            DebugFileSystem::new(runtime_state),
+            runtime_state.root_namespace().descend(),
             Vec::new(),
             Vec::new(),
             authority,

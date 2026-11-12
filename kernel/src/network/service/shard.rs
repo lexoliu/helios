@@ -189,18 +189,17 @@ pub(super) struct NetworkShard {
     /// Total number of shards in the parent set. Required for the
     /// stride-based handle encoding.
     pub(super) shard_count: usize,
-    pub(super) next_tcp_local_port: u16,
-    pub(super) next_udp_local_port: u16,
+    /// Where this shard draws ephemeral ports and DNS question ids
+    /// from. Touched only under the shard's lock.
+    pub(super) entropy: ShardEntropy,
     pub(super) tcp_streams: HandleSlab<helios_netstack::SocketId, MAX_TCP_STREAM_HANDLES>,
     pub(super) tcp_listeners: HandleSlab<TcpListenerState, MAX_TCP_LISTENER_HANDLES>,
     pub(super) udp_sockets: HandleSlab<UdpSocketState, MAX_UDP_SOCKET_HANDLES>,
-    pub(super) dhcp: DhcpClientState,
+    /// The DHCP client. Only the default shard's is ever driven: the
+    /// exchange is broadcast at a moment when the interface has no
+    /// address to hash a flow with, so it demuxes there.
+    pub(super) dhcp: DhcpClient,
     pub(super) dns_servers: DhcpDnsServers,
-    pub(super) next_dns_query_id: u16,
-    /// Identifier stamped on the next ICMP echo request. ICMP frames
-    /// carry no port, so every one of them is demultiplexed onto shard
-    /// 0 and this counter is that shard's alone.
-    pub(super) next_icmp_echo_identifier: u16,
 }
 
 /// One shard's stack and the per-shard words beside it.
@@ -1008,14 +1007,13 @@ impl NetworkShard {
         transaction_id: u32,
         shard_idx: usize,
         shard_count: usize,
+        root_entropy: RootEntropyHandle,
     ) -> Self {
         assert!(shard_count != 0, "network shard count must be non-zero");
         assert!(
             shard_idx < shard_count,
             "shard idx {shard_idx} out of range for {shard_count} shards"
         );
-        let initial_ephemeral =
-            EPHEMERAL_PORT_START + (shard_idx as u16) * ephemeral_window_len(shard_count);
         let mut stack = Box::new(Stack::new(stack_config));
         let mut udp_sockets = HandleSlab::new();
         // Every shard opens the DHCP client socket, and always in the
@@ -1036,19 +1034,17 @@ impl NetworkShard {
             slot, INTERNAL_DHCP_SOCKET_INDEX,
             "DHCP internal UDP socket slot changed"
         );
+        let dhcp = DhcpClient::new(stack.config().mac, transaction_id);
         Self {
             stack,
             shard_idx,
             shard_count,
-            next_tcp_local_port: initial_ephemeral,
-            next_udp_local_port: initial_ephemeral,
+            entropy: ShardEntropy::derive(root_entropy, shard_idx),
             tcp_streams: HandleSlab::new(),
             tcp_listeners: HandleSlab::new(),
             udp_sockets,
-            dhcp: DhcpClientState::Init { transaction_id },
+            dhcp,
             dns_servers: DhcpDnsServers::new(),
-            next_dns_query_id: 1,
-            next_icmp_echo_identifier: 1,
         }
     }
 
@@ -1075,6 +1071,25 @@ impl NetworkShard {
 
     pub(super) fn is_configured(&self) -> bool {
         self.stack.primary_ipv4_address().is_some()
+    }
+
+    /// Drives the shard's TCP timers and hands the control plane what
+    /// the drive told it.
+    ///
+    /// Driving queues ARP and neighbor-discovery requests, and a
+    /// connection that closed on a timer leaves its closure behind, so a
+    /// shard that sends without ever receiving still owes the control
+    /// plane its events. Every place that drives a shard's stack goes
+    /// through here, the way a receive goes through
+    /// [`NetworkShardSet::dispatch_rx_frame`].
+    pub(super) fn drive_tcp(
+        &mut self,
+        now: StackInstant,
+        control: &NetworkControlPlane,
+    ) -> Result<(), StackError> {
+        let driven = self.stack.drive_tcp(now);
+        self.drain_control_events(control);
+        driven
     }
 
     pub(super) fn drain_control_events(&mut self, control: &NetworkControlPlane) {
@@ -1115,22 +1130,14 @@ impl NetworkShard {
         (first, last)
     }
 
-    /// How many candidates an allocation walk may try before it gives
-    /// up: every port in this shard's window.
-    pub(super) fn ephemeral_port_attempts(&self) -> usize {
+    /// A walk over every port in this shard's window, from a random
+    /// starting point (RFC 6056 §3.3.1). An allocation takes the first
+    /// port it finds suitable, and gives up only after the whole window
+    /// has been tried.
+    pub(super) fn ephemeral_walk(&mut self) -> EphemeralWalk {
         let (first, last) = self.ephemeral_window();
-        usize::from(last - first) + 1
-    }
-
-    /// Advances the rolling allocator pointer, wrapping at the end of
-    /// this shard's window.
-    pub(super) fn advance_ephemeral_port(&self, current: u16) -> u16 {
-        let (first, last) = self.ephemeral_window();
-        if current >= last || current < first {
-            first
-        } else {
-            current + 1
-        }
+        let offset = self.entropy.below(EphemeralWalk::window_len(first, last));
+        EphemeralWalk::starting_at(first, last, offset)
     }
 
     pub(super) fn add_ipv4_address(
@@ -1206,6 +1213,6 @@ impl NetworkShard {
         self.clear_ipv4_routes();
         self.stack.restart_ipv6_autoconfig();
         self.dns_servers.clear();
-        self.dhcp = DhcpClientState::Init { transaction_id };
+        self.dhcp.restart(transaction_id);
     }
 }

@@ -16,9 +16,6 @@ inputs:
     description: Directory the Helios checkout is in, relative to the workspace.
     required: false
     default: helios
-  rust-cache-key:
-    description: Key that separates this job's cargo cache from the other jobs'.
-    required: true
   network-tools:
     description: >-
       Install the packages `vm net-setup` needs to provision the
@@ -109,10 +106,6 @@ runs:
           ${{ inputs.checkout-path }}/target/perf-baselines/linux-vm/fedora-${{ inputs.guest-arch }}/sources
           ${{ inputs.checkout-path }}/target/perf-baselines/linux-vm/fedora-${{ inputs.guest-arch }}/tools
         key: fedora-vm-assets-${{ inputs.guest-arch }}-${{ hashFiles(format('{0}/tools/wasi-apps/fedora_qemu_baseline.py', inputs.checkout-path)) }}
-    - uses: Swatinem/rust-cache@v2
-      with:
-        workspaces: ${{ inputs.checkout-path }}
-        key: ${{ inputs.rust-cache-key }}
     - name: Install inferno flamegraph renderer
       if: inputs.flamegraphs == 'true'
       shell: bash

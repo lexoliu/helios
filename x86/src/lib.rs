@@ -552,7 +552,13 @@ fn install_pci_devices<WatchdogImpl>(
         tracing::info!("no virtio-gpu function on the PCI bus; this machine has no display");
     }
     if let Some(address) = balloon_function {
-        let handle = balloon::install(kernel, pci, address, physical_memory_offset);
+        let handle = balloon::install(
+            kernel,
+            pci,
+            address,
+            physical_memory_offset,
+            debug_state.machine_generation_handle(),
+        );
         debug_state.install_memory_balloon(handle);
     }
     if input_functions.is_empty() {
@@ -962,12 +968,11 @@ fn x86_has_rdrand() -> bool {
 }
 
 fn fill_with_rdrand(buffer: &mut [u8]) {
-    let mut chunks = buffer.chunks_exact_mut(core::mem::size_of::<u64>());
-    for chunk in chunks.by_ref() {
-        chunk.copy_from_slice(&rdrand64().to_le_bytes());
+    let (words, remainder) = buffer.as_chunks_mut::<{ core::mem::size_of::<u64>() }>();
+    for word in words {
+        *word = rdrand64().to_le_bytes();
     }
 
-    let remainder = chunks.into_remainder();
     if !remainder.is_empty() {
         let word = rdrand64().to_le_bytes();
         remainder.copy_from_slice(&word[..remainder.len()]);

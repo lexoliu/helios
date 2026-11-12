@@ -26,6 +26,12 @@
 //! other's freshly mapped leaves. Reads (`translate_4k`) stay
 //! lock-free: table frames are never freed while the address space
 //! lives, and 64-bit descriptor reads are single-copy atomic.
+//!
+//! The one lock-free write is the access-flag setter that resolves an
+//! access-flag fault in trap context ([`Aarch64UserAddressSpace::set_access_flag`]).
+//! It is a compare-exchange against the descriptor it read, so a
+//! descriptor that a locked writer replaced in the meantime (swap-out
+//! turning it into a swap entry) is never written over.
 
 extern crate alloc;
 
@@ -34,6 +40,7 @@ use alloc::vec::Vec;
 use core::arch::asm;
 use core::ffi::c_int;
 use core::ptr::{self, NonNull};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use helios_hal::device::{DeviceRegion, DeviceRegionAttributes, DmaPlacement, MemoryKind};
 use helios_hal::iommu::PhysicalRange;
@@ -47,10 +54,11 @@ use helios_kernel::runtime_memory::{
     default_memory_image_map_at, default_memory_image_new, default_page_size,
 };
 use helios_kernel::{
-    FiberStackVmHooks, MemoryOwner, ReservationLookup, ReservationTracker, SwapEntry, SwapVmHooks,
-    VaCursor, allocate_user_frame_uninit_on, allocate_user_run_zeroed_on,
-    current_user_memory_owner, deallocate_user_frame_on, deallocate_user_run_on,
-    install_fiber_stack_hooks, ranges_outside, validate_range,
+    FiberStackVmHooks, InstalledAddressSpace, MemoryOwner, ReservationLookup, ReservationTracker,
+    SwapLeafFormat, SwapSpace, SwapVmHooks, VaCursor, allocate_user_frame_uninit_on,
+    allocate_user_run_zeroed_on, current_user_memory_owner, deallocate_user_frame_on,
+    deallocate_user_run_on, install_fiber_stack_hooks, ranges_outside, swap_vm_hooks,
+    validate_range,
 };
 use spin::{Mutex, Once};
 
@@ -101,9 +109,6 @@ fn swap_descriptor_token(entry: u64) -> Option<SwapToken> {
     SwapToken::new((entry >> SWAP_TOKEN_SHIFT) as u32)
 }
 
-/// Pages whose access flag one scan clears before it re-arms the TLB.
-const AF_SCAN_BATCH_PAGES: usize = 128;
-
 const USER_VA_BASE: usize = 0xFFFF_C000_0000_0000;
 const USER_VA_END: usize = 0xFFFF_E000_0000_0000;
 
@@ -112,13 +117,14 @@ pub struct Aarch64UserAddressSpace {
     physical_memory_offset: usize,
     va_cursor: VaCursor,
     state: Mutex<ReservationTracker>,
-    /// Swap tokens whose pages went away underneath them, waiting for
-    /// the kernel's swap task to hand them back to the backend.
+    /// Everything about swapping a page that is not this backend's
+    /// descriptor encoding or TLB work: the order of a swap-out, the
+    /// frame, the bookkeeping rollback, the orphan queue and the ageing
+    /// walk. This backend supplies the leaf through [`SwapLeafFormat`].
     ///
-    /// They cannot be released here: this runs under `state`'s spinlock
-    /// and releasing an extent is asynchronous. Lock order is `state`
-    /// then `orphans`, and the drain takes only `orphans`.
-    orphans: Mutex<Vec<SwapToken>>,
+    /// Lock order is `state` then the space's own `orphans`; the drain
+    /// takes only `orphans`.
+    swap: SwapSpace,
 }
 
 #[derive(Clone, Copy)]
@@ -134,7 +140,7 @@ impl Aarch64UserAddressSpace {
             physical_memory_offset,
             va_cursor: VaCursor::new(USER_VA_BASE, USER_VA_END),
             state: Mutex::new(ReservationTracker::new()),
-            orphans: Mutex::new(Vec::new()),
+            swap: SwapSpace::new(),
         }
     }
 
@@ -151,14 +157,6 @@ impl Aarch64UserAddressSpace {
                 .checked_add(self.physical_memory_offset)
                 .expect("a physical frame plus the kernel's map offset fits the address space"),
         )
-    }
-
-    fn orphan(&self, entries: Vec<SwapEntry>) {
-        if entries.is_empty() {
-            return;
-        }
-        let mut orphans = self.orphans.lock();
-        orphans.extend(entries.into_iter().map(|entry| entry.token));
     }
 
     /// Reads the level-3 descriptor for `virt` whether or not it is
@@ -205,190 +203,57 @@ impl Aarch64UserAddressSpace {
         Some(unsafe { l3.add((virt >> 12) & 0x1ff) })
     }
 
-    /// Turns a swap descriptor back into a plain unmapped entry.
-    fn clear_swap_descriptor(&self, virt: usize) {
-        let Some(entry_ptr) = self.leaf_ptr(virt) else {
-            return;
-        };
-        let entry = unsafe { entry_ptr.read_volatile() };
-        if swap_descriptor_token(entry).is_none() {
-            return;
-        }
-        unsafe {
-            entry_ptr.write_volatile(0);
-            flush_tlb_pages(virt, 1);
-        }
-    }
-
-    /// Swaps one committed page out: copy it, file the entry, hand the
-    /// frame back.
-    ///
-    /// The copy happens with the page still mapped and the address
-    /// space's lock held, so nothing can write it between the copy and
-    /// the unmapping, and the broadcast TLB invalidation inside
-    /// `replace_4k` retires every other processor's translation before
-    /// the frame is recycled.
-    fn swap_out_page_locked(
-        &self,
-        addr: VirtAddr,
-        token: SwapToken,
-        out: &mut [u8],
-    ) -> Result<PageFlags, AddressSpaceError> {
-        if out.len() != PAGE {
-            return Err(AddressSpaceError::BadPageBuffer);
-        }
-        if !addr.is_page_aligned() {
-            return Err(AddressSpaceError::Misaligned);
-        }
-        let mut state = self.state.lock();
-        let virt = addr.raw();
-        let entry = self
-            .translate_4k(virt)
-            .ok_or(AddressSpaceError::NotCommitted)?;
-        let flags = state.record_swap_out(addr, token)?;
-        let phys = (entry & PT_ADDR_MASK) as usize;
-        unsafe {
-            ptr::copy_nonoverlapping(self.hhdm_ptr(phys) as *const u8, out.as_mut_ptr(), PAGE);
-        }
-        match self.replace_4k(virt, swap_descriptor(token)) {
-            Ok(_) => {
-                self.dealloc_user_phys(phys);
-                Ok(flags)
-            }
-            Err(error) => {
-                // Nothing moved; put the bookkeeping back the way it was.
-                let _ = state.take_swap_entry(addr);
-                Err(error)
-            }
-        }
-    }
-
-    /// Puts a swapped-out page back: fill a fresh frame first, publish
-    /// the mapping second, so no processor sees a half-restored page.
-    fn swap_in_page_locked(
-        &self,
-        addr: VirtAddr,
-        bytes: &[u8],
-    ) -> Result<SwapToken, AddressSpaceError> {
-        if bytes.len() != PAGE {
-            return Err(AddressSpaceError::BadPageBuffer);
-        }
-        if !addr.is_page_aligned() {
-            return Err(AddressSpaceError::Misaligned);
-        }
-        let mut state = self.state.lock();
-        let entry: SwapEntry = state.take_swap_entry(addr)?;
-        let pte_flags = match page_flags_to_pte(entry.flags) {
-            Ok(pte_flags) => pte_flags,
-            Err(error) => {
-                let _ = state.record_swap_out(addr, entry.token);
-                return Err(error);
-            }
-        };
-        let phys = match self.alloc_user_frame() {
-            Ok(phys) => phys,
-            Err(error) => {
-                let _ = state.record_swap_out(addr, entry.token);
-                return Err(error);
-            }
-        };
-        unsafe {
-            ptr::copy_nonoverlapping(bytes.as_ptr(), self.hhdm_ptr(phys), PAGE);
-        }
-        let descriptor = (phys as u64) | pte_flags | PAGE_DESCRIPTOR | AF | SH_INNER;
-        let virt = addr.raw();
-        let Some(entry_ptr) = self.leaf_ptr(virt) else {
-            self.dealloc_user_phys(phys);
-            let _ = state.record_swap_out(addr, entry.token);
-            return Err(AddressSpaceError::NotSwapped);
-        };
-        unsafe {
-            entry_ptr.write_volatile(descriptor);
-            flush_tlb_pages(virt, 1);
-        }
-        Ok(entry.token)
-    }
-
-    /// Reports how recently the hardware saw each of `owner`'s pages and
-    /// clears the access flag behind the scan.
-    ///
-    /// This machine may not update the access flag in hardware, so
-    /// clearing it arms an access-flag fault instead: the next touch
-    /// traps, [`Self::set_access_flag`] sets the bit and the instruction
-    /// is retried. That is what makes a page read as `Hot` on the next
-    /// pass, and it costs one cheap trap per page the aging touched.
-    fn scan_committed_pages_locked<Visit>(&self, owner: MemoryOwner, mut visit: Visit) -> usize
-    where
-        Visit: FnMut(VirtAddr, PageFlags, PageAge) -> bool,
-    {
-        let state = self.state.lock();
-        let mut visited = 0_usize;
-        let mut keep_going = true;
-        state.owned_committed_regions(owner, |region| {
-            let mut cleared_from = region.range.start.raw();
-            let mut cleared = 0_usize;
-            for offset in (0..region.range.byte_len).step_by(PAGE) {
-                let virt = region.range.start.raw() + offset;
-                let Some(entry_ptr) = self.leaf_ptr(virt) else {
-                    continue;
-                };
-                let entry = unsafe { entry_ptr.read_volatile() };
-                if entry & VALID == 0 {
-                    continue;
-                }
-                let age = if entry & AF != 0 {
-                    if cleared == 0 {
-                        cleared_from = virt;
-                    }
-                    unsafe {
-                        entry_ptr.write_volatile(entry & !AF);
-                    }
-                    cleared += 1;
-                    PageAge::Hot
-                } else {
-                    PageAge::Cold
-                };
-                visited += 1;
-                if cleared == AF_SCAN_BATCH_PAGES {
-                    unsafe {
-                        flush_tlb_pages(cleared_from, cleared);
-                    }
-                    cleared = 0;
-                }
-                if !visit(VirtAddr::new(virt), region.flags, age) {
-                    keep_going = false;
-                    break;
-                }
-            }
-            if cleared != 0 {
-                unsafe {
-                    flush_tlb_pages(cleared_from, cleared);
-                }
-            }
-            keep_going
-        });
-        visited
-    }
-
     /// Resolves an access-flag fault by setting the bit the aging pass
-    /// cleared. Returns `false` when the address is not a committed page
-    /// with a clear access flag, in which case the fault belongs to
-    /// someone else.
+    /// cleared. Returns `false` when the address is not a present page
+    /// any more, in which case the fault belongs to someone else.
+    ///
+    /// This machine may not update the access flag in hardware, so the
+    /// ageing pass clears it to arm a fault: the next touch traps here,
+    /// the bit is set and the instruction is retried. That is what makes
+    /// a page read as `Hot` on the next pass, and it costs one cheap trap
+    /// per page the ageing touched.
+    ///
+    /// Runs in trap context with no lock, so it races every writer of the
+    /// descriptor: swap-out replacing it with a swap entry, `protect`,
+    /// `decommit`. The bit is set with a compare-exchange against the
+    /// descriptor that was read, and a descriptor that changed is read
+    /// again rather than written over: a plain store of the old value with
+    /// the bit set would resurrect a mapping to a frame that was already
+    /// returned to the pool.
     pub fn set_access_flag(&self, addr: VirtAddr) -> bool {
         let virt = addr.page_floor().raw();
         let Some(entry_ptr) = self.leaf_ptr(virt) else {
             return false;
         };
-        let entry = unsafe { entry_ptr.read_volatile() };
-        if entry & VALID == 0 || entry & AF != 0 {
-            return false;
+        // SAFETY: `leaf_ptr` walked live tables, which are never freed
+        // while the address space lives, to an aligned descriptor.
+        let descriptor = unsafe { AtomicU64::from_ptr(entry_ptr) };
+        let mut entry = descriptor.load(Ordering::Acquire);
+        loop {
+            if entry & VALID == 0 {
+                return false;
+            }
+            if entry & AF != 0 {
+                // Another processor faulting on the same page set it
+                // first: the instruction can be retried.
+                return true;
+            }
+            match descriptor.compare_exchange(
+                entry,
+                entry | AF,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(changed) => entry = changed,
+            }
         }
         unsafe {
-            entry_ptr.write_volatile(entry | AF);
             flush_tlb_pages(virt, 1);
         }
         true
     }
+
     fn carve_reservation(&self, byte_len: usize) -> Option<VirtRange> {
         self.state
             .lock()
@@ -788,11 +653,7 @@ impl Aarch64UserAddressSpace {
     fn decommit_committed_subranges(&self, range: VirtRange) -> Result<(), AddressSpaceError> {
         validate_range(range)?;
         let mut state = self.state.lock();
-        let swapped = state.take_swap_entries_in(range);
-        for entry in &swapped {
-            self.clear_swap_descriptor(entry.addr.raw());
-        }
-        self.orphan(swapped);
+        self.swap.discard(self, state.take_swap_entries_in(range));
         let removal = state.take_committed_intersections(range)?;
         // A substitution inside the range is dropped without freeing the
         // run's frames, as a withdraw would.
@@ -939,7 +800,9 @@ impl Aarch64UserAddressSpace {
         for entry in replaced {
             self.dealloc_user_frame(entry);
         }
-        self.orphan(state.record_substitute(virt)?);
+        // The swapped-out pages' leaves are already the substitution's,
+        // which `discard` leaves alone; it only queues their tokens.
+        self.swap.discard(self, state.record_substitute(virt)?);
         Ok(())
     }
 
@@ -972,10 +835,7 @@ impl Aarch64UserAddressSpace {
         // the runtime asked for fresh anonymous memory here. Clearing
         // the descriptor is what `map_4k_no_flush` needs to see, and the
         // extent behind the token still has to be given back.
-        self.orphan(state.take_swap_entries_in(virt));
-        for offset in (0..virt.byte_len).step_by(PAGE) {
-            self.clear_swap_descriptor(virt.start.raw() + offset);
-        }
+        self.swap.discard(self, state.take_swap_entries_in(virt));
 
         let mut mapped_pages = 0;
         for offset in (0..virt.byte_len).step_by(PAGE) {
@@ -1001,7 +861,8 @@ impl Aarch64UserAddressSpace {
         }
 
         let owner = current_user_memory_owner(crate::current_processor_runtime().logical_id());
-        self.orphan(state.record_commit(virt, flags, owner)?);
+        self.swap
+            .discard(self, state.record_commit(virt, flags, owner)?);
         Ok(())
     }
 
@@ -1072,6 +933,127 @@ impl Aarch64UserAddressSpace {
     }
 }
 
+/// The level-3 descriptor encoding swap works through.
+///
+/// A swap entry is an invalid descriptor (bit 0 clear, so the MMU ignores
+/// every other bit) with [`SWAP_MARKER`] set and the token above it. No
+/// invalid descriptor is cached by the TLB, so turning one into a valid
+/// one, or into zero, needs no invalidation; the reverse is what `detach`
+/// broadcasts.
+impl SwapLeafFormat for Aarch64UserAddressSpace {
+    fn swapped_token(&self, addr: VirtAddr) -> Option<SwapToken> {
+        let virt = addr.page_floor().raw();
+        if !(USER_VA_BASE..USER_VA_END).contains(&virt) {
+            return None;
+        }
+        swap_descriptor_token(self.leaf_entry(virt)?)
+    }
+
+    fn detach(
+        &self,
+        _tracker: &ReservationTracker,
+        addr: VirtAddr,
+        token: SwapToken,
+    ) -> Result<NonNull<u8>, AddressSpaceError> {
+        // `replace_4k` stores the swap descriptor, then broadcasts the
+        // invalidation and waits for it (`dsb ish`): when it returns no
+        // processor translates the page any more. A processor racing it
+        // with a store either landed before the invalidation completed,
+        // and the caller's copy sees it, or faults on the swap entry.
+        let old_entry = self.replace_4k(addr.raw(), swap_descriptor(token))?;
+        let frame = self.hhdm_ptr((old_entry & PT_ADDR_MASK) as usize);
+        Ok(NonNull::new(frame)
+            .unwrap_or_else(|| panic!("Aarch64 swap-out found a null HHDM pointer for a frame")))
+    }
+
+    fn attach(
+        &self,
+        _tracker: &ReservationTracker,
+        addr: VirtAddr,
+        expected: SwapToken,
+        frame: NonNull<u8>,
+        flags: PageFlags,
+    ) -> Result<(), AddressSpaceError> {
+        let pte_flags = page_flags_to_pte(flags)?;
+        let entry_ptr = self
+            .leaf_ptr(addr.raw())
+            .ok_or(AddressSpaceError::NotSwapped)?;
+        // SAFETY: the walk above ran through live tables, and the leaf is
+        // written only under the reservation lock the caller holds.
+        let current = unsafe { entry_ptr.read_volatile() };
+        if swap_descriptor_token(current) != Some(expected) {
+            return Err(AddressSpaceError::NotSwapped);
+        }
+        let phys = (frame.as_ptr() as usize)
+            .checked_sub(self.physical_memory_offset)
+            .expect("a user frame lies in the kernel's physical memory map");
+        let descriptor = (phys as u64) | pte_flags | PAGE_DESCRIPTOR | AF | SH_INNER;
+        if flags.contains(PageFlags::EXECUTE) {
+            // The bytes were written through the direct map, and the frame's
+            // earlier user may have left its own code in an instruction
+            // cache: publish them before the leaf makes them fetchable.
+            crate::make_instructions_coherent(frame.as_ptr(), PAGE);
+        }
+        // SAFETY: as above. The frame's bytes are ordered before the
+        // descriptor that exposes them, and the descriptor before any
+        // walk that can see it.
+        unsafe {
+            asm!("dmb ishst", options(nostack, preserves_flags));
+            entry_ptr.write_volatile(descriptor);
+            asm!("dsb ishst", options(nostack, preserves_flags));
+            asm!("isb", options(nostack, preserves_flags));
+        }
+        Ok(())
+    }
+
+    fn clear_swapped(&self, addr: VirtAddr) {
+        let Some(entry_ptr) = self.leaf_ptr(addr.raw()) else {
+            return;
+        };
+        // SAFETY: as in `attach`.
+        if swap_descriptor_token(unsafe { entry_ptr.read_volatile() }).is_none() {
+            return;
+        }
+        // SAFETY: as above.
+        unsafe {
+            entry_ptr.write_volatile(0);
+        }
+    }
+
+    fn test_and_clear_accessed(&self, addr: VirtAddr) -> Option<PageAge> {
+        let entry_ptr = self.leaf_ptr(addr.raw())?;
+        // SAFETY: as in `attach`.
+        let entry = unsafe { entry_ptr.read_volatile() };
+        if entry & VALID == 0 {
+            return None;
+        }
+        // The descriptor is present and only this lock's holder makes one
+        // absent, so clearing the bit by an atomic AND cannot touch a swap
+        // entry's token bits; it can race `set_access_flag` and hardware
+        // updates, which the AND does not lose.
+        // SAFETY: as above; the descriptor is aligned.
+        let previous = unsafe { AtomicU64::from_ptr(entry_ptr) }.fetch_and(!AF, Ordering::AcqRel);
+        Some(if previous & AF != 0 {
+            PageAge::Hot
+        } else {
+            PageAge::Cold
+        })
+    }
+
+    fn accessed_cleared(&self, start: VirtAddr, pages: usize) {
+        // SAFETY: a TLB invalidation has no memory-safety preconditions.
+        unsafe {
+            flush_tlb_pages(start.raw(), pages);
+        }
+    }
+}
+
+impl InstalledAddressSpace for Aarch64UserAddressSpace {
+    fn installed() -> &'static Self {
+        user_as()
+    }
+}
+
 impl AddressSpace for Aarch64UserAddressSpace {
     fn reserve(&self, byte_len: usize) -> Result<VirtRange, AddressSpaceError> {
         if byte_len == 0 {
@@ -1101,10 +1083,7 @@ impl AddressSpace for Aarch64UserAddressSpace {
                 }
             }
         }
-        for entry in &released.swapped {
-            self.clear_swap_descriptor(entry.addr.raw());
-        }
-        self.orphan(released.swapped);
+        self.swap.discard(self, released.swapped);
         state.push_free_range(virt);
         Ok(())
     }
@@ -1119,10 +1098,7 @@ impl AddressSpace for Aarch64UserAddressSpace {
         validate_range(virt)?;
         let mut state = self.state.lock();
         let removed = state.record_decommit(virt)?;
-        for entry in &removed.swapped {
-            self.clear_swap_descriptor(entry.addr.raw());
-        }
-        self.orphan(removed.swapped);
+        self.swap.discard(self, removed.swapped);
         // A substitution inside the range is dropped without freeing the
         // run's frames, as a withdraw would.
         self.drop_substituted_parts(&removed.substituted);
@@ -1308,7 +1284,8 @@ impl AddressSpace for Aarch64UserAddressSpace {
         // resident until something faults on them. Offering the policy a
         // fiber stack would also let it take away the very stack a fault
         // handler is standing on.
-        self.orphan(state.record_commit(virt, flags, MemoryOwner::NONE)?);
+        self.swap
+            .discard(self, state.record_commit(virt, flags, MemoryOwner::NONE)?);
         Ok(())
     }
 
@@ -1366,7 +1343,7 @@ impl AddressSpace for Aarch64UserAddressSpace {
             removed.swapped.is_empty() && removed.substituted.is_empty(),
             "a demand-commit region is never offered to the swap policy or substituted"
         );
-        self.orphan(removed.swapped);
+        self.swap.discard(self, removed.swapped);
         self.unmap_demand_pages(mapped);
         Ok(())
     }
@@ -1399,22 +1376,25 @@ impl AddressSpace for Aarch64UserAddressSpace {
         token: SwapToken,
         out: &mut [u8],
     ) -> Result<PageFlags, AddressSpaceError> {
-        self.swap_out_page_locked(addr, token, out)
+        self.swap
+            .swap_out_page(&mut self.state.lock(), self, addr, token, out)
     }
 
     fn swap_in_page(&self, addr: VirtAddr, bytes: &[u8]) -> Result<SwapToken, AddressSpaceError> {
-        self.swap_in_page_locked(addr, bytes)
+        self.swap
+            .swap_in_page(&mut self.state.lock(), self, addr, bytes)
     }
 
     fn swapped_token(&self, addr: VirtAddr) -> Option<SwapToken> {
-        swap_descriptor_token(self.leaf_entry(addr.page_floor().raw())?)
+        SwapLeafFormat::swapped_token(self, addr)
     }
 
     fn scan_committed_pages<Visit>(&self, owner: u64, visit: Visit) -> usize
     where
         Visit: FnMut(VirtAddr, PageFlags, PageAge) -> bool,
     {
-        self.scan_committed_pages_locked(MemoryOwner::new(owner), visit)
+        self.swap
+            .scan_committed_pages(&self.state.lock(), self, owner, visit)
     }
 
     fn owned_resident_bytes(&self, owner: u64) -> u64 {
@@ -1423,16 +1403,11 @@ impl AddressSpace for Aarch64UserAddressSpace {
             .owned_resident_bytes(MemoryOwner::new(owner))
     }
 
-    fn drain_orphaned_swap_tokens<Visit>(&self, mut visit: Visit) -> usize
+    fn drain_orphaned_swap_tokens<Visit>(&self, visit: Visit) -> usize
     where
         Visit: FnMut(SwapToken),
     {
-        let drained: Vec<SwapToken> = core::mem::take(&mut *self.orphans.lock());
-        let count = drained.len();
-        for token in drained {
-            visit(token);
-        }
-        count
+        self.swap.drain_orphaned_swap_tokens(visit)
     }
 
     fn relocate(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
@@ -1719,48 +1694,9 @@ const _: () = {
         default_memory_image_new;
 };
 
-fn hook_swap_out_page(
-    addr: VirtAddr,
-    token: SwapToken,
-    out: &mut [u8],
-) -> Result<PageFlags, AddressSpaceError> {
-    user_as().swap_out_page(addr, token, out)
-}
-
-fn hook_swap_in_page(addr: VirtAddr, bytes: &[u8]) -> Result<SwapToken, AddressSpaceError> {
-    user_as().swap_in_page(addr, bytes)
-}
-
-fn hook_swapped_token(addr: VirtAddr) -> Option<SwapToken> {
-    user_as().swapped_token(addr)
-}
-
-fn hook_scan_committed_pages(
-    owner: u64,
-    context: *mut (),
-    visit: fn(*mut (), VirtAddr, PageFlags, PageAge) -> bool,
-) -> usize {
-    user_as().scan_committed_pages(owner, |addr, flags, age| visit(context, addr, flags, age))
-}
-
-fn hook_owned_resident_bytes(owner: u64) -> u64 {
-    user_as().owned_resident_bytes(owner)
-}
-
-fn hook_drain_orphaned_swap_tokens(context: *mut (), visit: fn(*mut (), SwapToken)) -> usize {
-    user_as().drain_orphaned_swap_tokens(|token| visit(context, token))
-}
-
 /// The kernel's view of this backend's swap surface.
-pub static AARCH64_SWAP_HOOKS: SwapVmHooks = SwapVmHooks {
-    swap_out_page: hook_swap_out_page,
-    swap_in_page: hook_swap_in_page,
-    swapped_token: hook_swapped_token,
-    scan_committed_pages: hook_scan_committed_pages,
-    owned_resident_bytes: hook_owned_resident_bytes,
-    drain_orphaned_swap_tokens: hook_drain_orphaned_swap_tokens,
-    now_ticks: crate::read_counter,
-};
+pub static AARCH64_SWAP_HOOKS: SwapVmHooks =
+    swap_vm_hooks::<Aarch64UserAddressSpace>(crate::read_counter);
 
 /// The arena's address-space surface for this backend.
 ///

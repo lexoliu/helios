@@ -33,4 +33,10 @@
 {% for path, digest in report.pins.bootfs_cwasm.items() %}
 | cwasm `{{ path }}` | `{{ digest }}` |
 {% endfor %}
+{% if report.pins.compiler_plugin_wasm %}
+| Compiler plugin `compiler_plugin.wasm` | `{{ report.pins.compiler_plugin_wasm }}` |
+{% endif %}
+{% if report.pins.compiler_host %}
+| `helios-compiler-host` | `{{ report.pins.compiler_host }}` |
+{% endif %}
 {% include "construction_pins.md.j2" %}
