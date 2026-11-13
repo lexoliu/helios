@@ -3513,7 +3513,7 @@ mod tests {
         };
         let file = block_on(crate::wasmtime_adapter::wasi::open_at(
             store.filesystem(),
-            root.grant().expect("the root holds read"),
+            root.grant().expect("the root may be read"),
             p3fs::PathFlags::empty(),
             "doomed",
             p3fs::OpenFlags::CREATE | p3fs::OpenFlags::TRUNCATE,
