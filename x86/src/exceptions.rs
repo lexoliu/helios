@@ -5,7 +5,9 @@ use core::ptr::NonNull;
 use core::sync::atomic::Ordering;
 
 use helios_hal::vmm::VirtAddr as UserVirtAddr;
-use helios_kernel::{KernelException, KernelExceptionCause, KernelExceptionDispatch, StackFault};
+use helios_kernel::{
+    InterruptedContext, KernelException, KernelExceptionCause, KernelExceptionDispatch, StackFault,
+};
 use x86_64::VirtAddr;
 use x86_64::instructions::segmentation::{CS, DS, ES, SS, Segment};
 use x86_64::instructions::tables::load_tss;
@@ -629,9 +631,17 @@ extern "C" fn helios_x86_exception_dispatch(frame: &mut ExceptionFrame) {
             return;
         }
         // A reserved page inside a live fiber stack is a demand commit
-        // the kernel resolves here, with no lock and no allocation; the
-        // guard page below one is a stack overflow and stays a fault.
-        stack_fault = helios_kernel::resolve_stack_fault(UserVirtAddr::new(faulting_address));
+        // the kernel resolves here: from the user pool's ordinary path
+        // when the interrupted context had interrupts enabled (the gate
+        // cleared IF, so the saved RFLAGS is the answer), from the
+        // per-processor reserve when it had them masked; the guard page
+        // below one is a stack overflow and stays a fault.
+        stack_fault = helios_kernel::resolve_stack_fault(
+            UserVirtAddr::new(faulting_address),
+            InterruptedContext {
+                interrupts_enabled: frame.rflags & RFLAGS_INTERRUPT_FLAG != 0,
+            },
+        );
         if stack_fault == StackFault::Committed {
             return;
         }

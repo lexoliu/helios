@@ -10,10 +10,10 @@
 //! construction, `slots × (guard + stack)`, and hands the runtime stacks
 //! out of it. A slot is `[guard][stack]` with the guard at the bottom,
 //! the direction a stack grows. Only the top page of a fresh stack is
-//! committed; every page below it arrives when something faults on it,
-//! and when the stack is dropped the slot keeps those pages for the next
-//! stack while a machine-wide budget has room for them, or gives them
-//! back when it does not.
+//! committed, through the user pool's fallible path; every page below it
+//! arrives when something faults on it, and when the stack is dropped the
+//! slot keeps those pages for the next stack while a machine-wide budget
+//! has room for them, or gives them back when it does not.
 //!
 //! # Retained slots
 //!
@@ -34,12 +34,8 @@
 //! # Why the arena exists at all
 //!
 //! A fault-time commit runs on the faulting stack's own processor,
-//! inside whatever the interrupted code was doing. Kernel host calls run
-//! on fiber stacks, so the interrupted code may hold the address-space
-//! tracker's lock, the frame pool's, or the kernel heap's — and an
-//! exception is not an interrupt, so masking buys nothing. The handler
-//! therefore has to resolve the fault without taking a lock and without
-//! allocating, which is what the arena's shape is for:
+//! inside whatever the interrupted code was doing, and the arena's shape
+//! is what lets it be short:
 //!
 //! - Classifying an address is arithmetic. Subtract the base, divide by
 //!   the slot stride, compare against the guard length, read one atomic
@@ -47,9 +43,17 @@
 //! - The page tables above the leaf already exist, because
 //!   [`hal::vmm::AddressSpace::prepare_demand_commit`](helios_hal::vmm::AddressSpace::prepare_demand_commit)
 //!   built them on the ordinary locked path when the stack was created.
-//!   The fault writes one leaf entry into tables nothing is editing.
-//! - The frame comes from [`super::frame_reserve`], which the executor
-//!   loop keeps full outside fault context.
+//!   The fault writes leaf entries into tables nothing is editing.
+//! - The frames come from one of two places, chosen by what the fault
+//!   interrupted. Every lock on the user pool's path is an
+//!   [`IrqSafeMutex`](super::irq_safe), which masks the holder's
+//!   interrupts while it is held, so a context that was interrupted with
+//!   interrupts enabled holds none of them, and the fault takes its
+//!   frames through the pool's ordinary blocking path: it only ever waits
+//!   for another processor's critical section, which waits for nothing.
+//!   A context interrupted with interrupts masked may hold one, so the
+//!   fault cannot wait: it takes its frames from the per-processor
+//!   [`super::frame_reserve`], which no lock guards.
 //!
 //! # Concurrency contract
 //!
@@ -57,17 +61,26 @@
 //! from any processor:
 //!
 //! - `claim` and the release in [`FiberStack`]'s `Drop` run on the
-//!   ordinary path with no fault outstanding. They take the address
-//!   space's own lock through the hooks, which is what makes them the
-//!   *locked* half.
+//!   ordinary path with no fault outstanding. They may wait on the pool's
+//!   locks and take the address space's own lock through the hooks.
+//!   Slot state moves by compare-and-swap.
 //! - [`resolve_stack_fault`] runs in fault context on the processor that
-//!   faulted, and takes no lock at all.
+//!   faulted. Classification is lock-free. Frames are taken through the
+//!   pool's blocking path, which takes only `IrqSafeMutex` locks, when the
+//!   interrupted context says it was running with interrupts enabled
+//!   ([`InterruptedContext`]), and from the processor's own lock-free
+//!   reserve when it says they were masked; the first form waits on
+//!   another processor's pool critical section if it meets one, the
+//!   second never waits. The leaf writes that map the frames take no lock
+//!   and need no shootdown: a not-present page becoming present is one no
+//!   processor caches. Nothing fans out to another processor.
 //!
 //! One fiber runs on one processor at a time, so the pages of a given
-//! slot are only ever faulted in by one processor at a time; the atomics
-//! below are what keep that true against a fiber that migrates between
-//! polls, and what keep a claim on one processor from racing a release
-//! on another. Per-processor counters sit on their own cache lines.
+//! slot are only ever faulted in by one processor at a time and its
+//! watermark has one writer at a time; the atomics below are what keep
+//! that true against a fiber that migrates between polls, and what keep
+//! a claim on one processor from racing a release on another.
+//! Per-processor counters sit on their own cache lines.
 //!
 //! A slot's guard page is never mapped. Guest code that overflows its
 //! stack hits it and the runtime turns the fault into a wasm trap;
@@ -91,7 +104,8 @@ use helios_hal::vmm::{AddressSpaceError, PageFlags, VirtAddr, VirtRange};
 use spin::Once;
 use thiserror::Error;
 
-use super::frame_reserve;
+use super::{allocate_user_frame_zeroed_on, deallocate_user_frame_on, frame_reserve};
+use crate::ProgramOutOfMemory;
 #[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]
 use crate::wasmtime_adapter::parking::ParkedFibers;
 
@@ -127,6 +141,23 @@ pub struct FiberStackVmHooks {
     pub end_demand_commit: fn(VirtRange, VirtRange) -> Result<(), AddressSpaceError>,
 }
 
+/// What a fault entry knows about the context it interrupted.
+///
+/// The fault may wait for the user pool's locks only when the interrupted
+/// context holds none of them. Every one of those locks masks its
+/// holder's interrupts, so the interrupted context's own interrupt-enable
+/// bit, as the exception saved it, is the whole answer: enabled, the
+/// fault takes its frames through the pool; masked, it takes them from
+/// the per-processor reserve. The backend reads the bit from the frame it
+/// saved: `RFLAGS.IF` on x86, `SPSR_EL1.I` (inverted) on aarch64,
+/// `sstatus.SPIE` on riscv.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InterruptedContext {
+    /// Whether the context the fault interrupted was running with
+    /// interrupts enabled.
+    pub interrupts_enabled: bool,
+}
+
 /// What a backend's fault entry does with a faulting address.
 ///
 /// The three fault entries all read the same way: ask, return when the
@@ -139,9 +170,17 @@ pub enum StackFault {
     /// The arena does not own this address; the fault belongs to
     /// whatever the entry would have done with it anyway.
     Elsewhere,
-    /// A reserved page inside a live stack, committed in place. The
-    /// faulting instruction runs again.
+    /// A reserved page inside a live stack, committed in place together
+    /// with any gap between it and the committed range. The faulting
+    /// instruction runs again.
     Committed,
+    /// The user pool could not back the faulting page and the gap above
+    /// it. Nothing was committed: the stack is as the fault found it.
+    Starved {
+        slot: usize,
+        addr: usize,
+        shortfall: ProgramOutOfMemory,
+    },
     /// The guard page below a live fiber stack: a stack overflow.
     ///
     /// Guest code overflowing its stack is the runtime's to trap, so the
@@ -155,6 +194,15 @@ impl fmt::Display for StackFault {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Elsewhere | Self::Committed => Ok(()),
+            Self::Starved {
+                slot,
+                addr,
+                shortfall,
+            } => write!(
+                f,
+                "; {addr:#x} in fiber stack slot {slot} needed a page and the user pool is \
+                 exhausted: {shortfall}"
+            ),
             Self::Guard { slot, addr } => write!(
                 f,
                 "; {addr:#x} is the guard page below fiber stack slot {slot}, so a kernel path \
@@ -178,6 +226,11 @@ pub enum FiberStackError {
     Exhausted { slots: usize },
     #[error("the address space refused to prepare a fiber stack slot: {0}")]
     Prepare(#[source] AddressSpaceError),
+    /// The user pool could not back the stack's top page. The runtime
+    /// wraps this in its own error, so the failed instantiation or call
+    /// is classified as running out of memory like any refused grow.
+    #[error("the user pool could not back a fiber stack's top page: {0}")]
+    OutOfMemory(#[source] ProgramOutOfMemory),
 }
 
 /// One slot's mutable state.
@@ -222,10 +275,14 @@ pub struct FiberStackArena {
     /// Bytes warm slots hold now. Written on every claim and release from
     /// whichever processor runs them, so it sits on its own line.
     retained_bytes: CachePadded<AtomicUsize>,
-    /// Demand commits this processor has resolved. One counter per
-    /// processor, each on its own line, because every one of them is
+    /// Demand commits (faults) this processor has resolved. One counter
+    /// per processor, each on its own line, because every one of them is
     /// written from fault context on its own processor.
     demand_commits: Box<[CachePadded<AtomicU64>]>,
+    /// Pages those faults mapped, the faulting page and any gap above it
+    /// together. Written like `demand_commits`, by the owning processor
+    /// alone.
+    committed_pages: Box<[CachePadded<AtomicU64>]>,
     /// Whether the console has already been told this processor is
     /// resolving commits. Written from the release path, which is a
     /// place a `tracing` call is allowed; see [`Self::announce_processors`].
@@ -265,6 +322,8 @@ pub struct FiberStackArenaStats {
     pub eager_bytes: usize,
     /// Demand commits resolved since boot, across every processor.
     pub demand_commits: u64,
+    /// Pages those demand commits mapped, skipped gaps included.
+    pub demand_committed_pages: u64,
     /// Stacks given back over the life of the arena.
     pub released_stacks: u64,
     /// Bytes those stacks had committed when they were given back.
@@ -343,6 +402,8 @@ pub fn install_fiber_stack_arena(
         });
         let mut counters = Vec::with_capacity(processor_count);
         counters.resize_with(processor_count, || CachePadded::new(AtomicU64::new(0)));
+        let mut page_counters = Vec::with_capacity(processor_count);
+        page_counters.resize_with(processor_count, || CachePadded::new(AtomicU64::new(0)));
         let mut announced = Vec::with_capacity(processor_count);
         announced.resize_with(processor_count, || CachePadded::new(AtomicBool::new(false)));
         tracing::info!(
@@ -364,6 +425,7 @@ pub fn install_fiber_stack_arena(
             retain_budget: retain_bytes,
             retained_bytes: CachePadded::new(AtomicUsize::new(0)),
             demand_commits: counters.into_boxed_slice(),
+            committed_pages: page_counters.into_boxed_slice(),
             announced: announced.into_boxed_slice(),
             released: CachePadded::new(ReleasedTotals {
                 stacks: AtomicU64::new(0),
@@ -397,14 +459,24 @@ pub fn fiber_stack_demand_commits_on(processor: ProcessorId) -> u64 {
 
 /// Classifies `addr` and, when it is a demand-commit page, resolves it.
 ///
-/// This is what a backend's fault entry calls. It takes no lock, walks
-/// no list and allocates nothing; see the module docs for why it may
-/// not.
-pub fn resolve_stack_fault(addr: VirtAddr) -> StackFault {
+/// This is what a backend's fault entry calls, with what it knows of the
+/// context the fault interrupted. Classification takes no lock and walks
+/// no list. Resolving takes the frames through the user pool's blocking
+/// path when `interrupted` says interrupts were enabled, which the module
+/// docs show is safe, and from the processor's reserve when it says they
+/// were masked.
+///
+/// # Panics
+///
+/// When `interrupted` says interrupts were masked and the processor's
+/// reserve cannot supply the frames the fault needs: a path holding an
+/// interrupt-masking lock grew its stack further than the reserve covers
+/// between two refills, or the pool is exhausted.
+pub fn resolve_stack_fault(addr: VirtAddr, interrupted: InterruptedContext) -> StackFault {
     let Some(arena) = ARENA.get() else {
         return StackFault::Elsewhere;
     };
-    arena.resolve(addr)
+    arena.resolve(addr, interrupted)
 }
 
 impl FiberStackArena {
@@ -444,7 +516,31 @@ impl FiberStackArena {
         &slot.parked_generation
     }
 
-    fn resolve(&self, addr: VirtAddr) -> StackFault {
+    /// Resolves a fault at `addr`, or classifies it.
+    ///
+    /// A fault on a page of a live stack's body maps `[page, watermark)`:
+    /// the faulting page and any gap a large frame skipped above it, so
+    /// the committed range stays one run `[watermark, top)`, every page
+    /// charged to the pool as user memory. The frames are all taken before
+    /// any is mapped. A fault that interrupted a context with interrupts
+    /// enabled takes them through the pool and answers
+    /// [`StackFault::Starved`] with nothing mapped when the pool cannot
+    /// back them all; one that interrupted a masked context takes them
+    /// from the processor's reserve without touching the pool.
+    ///
+    /// Concurrency: fault context on the faulting processor, see the
+    /// module docs. The slot's watermark has one writer, the processor
+    /// running its fiber.
+    ///
+    /// # Panics
+    ///
+    /// - The slot is not live: the runtime is running on a stack it gave
+    ///   back.
+    /// - The page is already inside the committed range: the stack's
+    ///   bookkeeping and its page tables disagree.
+    /// - The faulting context had interrupts masked and the processor's
+    ///   reserve cannot supply the frames.
+    fn resolve(&self, addr: VirtAddr, interrupted: InterruptedContext) -> StackFault {
         let raw = addr.raw();
         let Some(offset) = raw.checked_sub(self.base) else {
             return StackFault::Elsewhere;
@@ -467,29 +563,96 @@ impl FiberStackArena {
                 addr: raw,
             };
         }
-        let page = VirtAddr::new(raw & !(PhysFrame::SIZE - 1));
-        let processor = current_processor();
-        let frame = frame_reserve::take_frame(processor);
-        match (self.hooks.commit_demand_page)(page, frame, PageFlags::READ | PageFlags::WRITE) {
-            Ok(()) => {}
-            Err(error) => {
-                panic!(
-                    "page fault at {raw:#x} in fiber stack slot {index} could not be committed \
-                     in place: {error}"
-                );
-            }
+        let page = raw & !(PhysFrame::SIZE - 1);
+        let committed_from = slot.watermark.load(Ordering::Acquire);
+        if page >= committed_from {
+            panic!(
+                "page fault at {raw:#x} in fiber stack slot {index}, on a page its committed range \
+                 from {committed_from:#x} already maps: the stack's bookkeeping and its page tables \
+                 disagree"
+            );
         }
-        slot.watermark.fetch_min(page.raw(), Ordering::AcqRel);
+        let pages = (committed_from - page) / PhysFrame::SIZE;
+        let processor = current_processor();
+        let mut frames = if interrupted.interrupts_enabled {
+            match FrameChain::take(processor, pages) {
+                Ok(frames) => frames,
+                Err(shortfall) => {
+                    return StackFault::Starved {
+                        slot: index,
+                        addr: raw,
+                        shortfall,
+                    };
+                }
+            }
+        } else {
+            FrameChain::take_from_reserve(processor, pages).unwrap_or_else(|held| {
+                panic!(
+                    "a fault at {raw:#x} in fiber stack slot {index}, from a context running with \
+                     interrupts masked, needed {pages} frames and processor {} reserved {held} of \
+                     its {}: a path holding an interrupt-masking lock grew its stack further than \
+                     the reserve covers between two refills, or the user pool is exhausted",
+                    processor.id(),
+                    frame_reserve::RESERVE_CAPACITY,
+                )
+            })
+        };
+        if let Err(error) = self.map_frames(index, &mut frames) {
+            panic!(
+                "page fault at {raw:#x} in fiber stack slot {index} could not be committed in \
+                 place: {error}"
+            );
+        }
         self.demand_commits[usize::from(processor.id())].fetch_add(1, Ordering::Relaxed);
+        self.committed_pages[usize::from(processor.id())]
+            .fetch_add(pages as u64, Ordering::Relaxed);
+        if interrupted.interrupts_enabled {
+            // The interrupted context held no pool lock, so the refill
+            // may wait on the pool like the fault just did. It is one
+            // atomic load when the reserve is full.
+            frame_reserve::top_up(processor);
+        }
         // Nothing is logged from here. `tracing` reaches the debug
         // console, which is a lock the interrupted code may be holding
-        // on this very processor; the counter above is what the release
-        // path reports instead.
+        // on this very processor; the counters above are what the
+        // release path reports instead.
         StackFault::Committed
     }
 
+    /// Maps `frames`, one page each, immediately below slot `index`'s
+    /// committed range, from the page next to it downwards.
+    ///
+    /// The watermark follows every page, so the committed range is one
+    /// run at each step and the release walk stays exact however far a
+    /// refused page got. The refused page's frame goes back on the chain:
+    /// a fault that interrupted a masked context may not hand it to the
+    /// pool, so what becomes of the chain is the caller's to decide.
+    fn map_frames(&self, index: usize, frames: &mut FrameChain) -> Result<(), AddressSpaceError> {
+        let slot = &self.slots[index];
+        let flags = PageFlags::READ | PageFlags::WRITE;
+        while let Some(frame) = frames.pop() {
+            let page = VirtAddr::new(slot.watermark.load(Ordering::Acquire) - PhysFrame::SIZE);
+            if let Err(error) = (self.hooks.commit_demand_page)(page, frame, flags) {
+                frames.push(frame);
+                return Err(error);
+            }
+            slot.watermark.fetch_min(page.raw(), Ordering::AcqRel);
+        }
+        Ok(())
+    }
+
     /// Takes a slot: a warm one as it stands, or a cold one prepared
-    /// with the one page the runtime writes first.
+    /// with its top page committed, the one the runtime writes the fiber's
+    /// initial frame to.
+    ///
+    /// The top page's frame comes from the pool's blocking fallible path
+    /// and is taken before anything of the slot is touched, so a pool
+    /// that cannot back it answers [`FiberStackError::OutOfMemory`] with
+    /// the slot as it was found. A claim never draws on the page-fault
+    /// reserve.
+    ///
+    /// Concurrency: ordinary context on any processor. It waits on the
+    /// pool's locks, so no pool lock may be held by the caller.
     fn claim(&'static self, stack_bytes: usize) -> Result<FiberStack, FiberStackError> {
         if stack_bytes != self.stack_bytes {
             return Err(FiberStackError::WrongSize {
@@ -497,14 +660,12 @@ impl FiberStackArena {
                 slot: self.stack_bytes,
             });
         }
-        let processor = current_processor();
         if let Some(index) = self.take_slot(SLOT_WARM) {
             // The pages its last stack touched are still mapped, so the
             // runtime's first frame lands on a committed page and nothing
             // here touches the address space.
             self.retained_bytes
                 .fetch_sub(self.committed_bytes(index), Ordering::AcqRel);
-            frame_reserve::top_up(processor);
             return Ok(FiberStack { arena: self, index });
         }
         let index = self
@@ -513,38 +674,44 @@ impl FiberStackArena {
                 slots: self.slots.len(),
             })?;
         let body = self.body(index);
-        let flags = PageFlags::READ | PageFlags::WRITE;
-        if let Err(error) = (self.hooks.prepare_demand_commit)(body, flags) {
+        let body_top = body.end().raw();
+        // The runtime writes the fiber's initial frame at the top of the
+        // stack, so that page is committed here rather than left to a
+        // fault. Its frame is taken before anything of the slot is
+        // touched, so a pool that cannot back it leaves the slot exactly
+        // as it was found.
+        let processor = current_processor();
+        let mut frames = match FrameChain::take(processor, 1) {
+            Ok(frames) => frames,
+            Err(shortfall) => {
+                self.slots[index].state.store(SLOT_COLD, Ordering::Release);
+                return Err(FiberStackError::OutOfMemory(shortfall));
+            }
+        };
+        if let Err(error) =
+            (self.hooks.prepare_demand_commit)(body, PageFlags::READ | PageFlags::WRITE)
+        {
+            frames.give_back(processor);
             self.slots[index].state.store(SLOT_COLD, Ordering::Release);
             return Err(FiberStackError::Prepare(error));
         }
-        let body_top = body.end().raw();
         self.slots[index]
             .watermark
             .store(body_top, Ordering::Release);
-        // The runtime writes the fiber's initial frame at the top of the
-        // stack, so that page is committed here rather than left to a
-        // fault: the write happens before anything has run on the stack,
-        // and paying for it on the locked path keeps the very first
-        // fault a stack the runtime is already using.
-        let top_page = VirtAddr::new(body_top - PhysFrame::SIZE);
-        let frame = frame_reserve::take_frame(processor);
-        if let Err(error) = (self.hooks.commit_demand_page)(top_page, frame, flags) {
+        if let Err(error) = self.map_frames(index, &mut frames) {
+            frames.give_back(processor);
             (self.hooks.end_demand_commit)(body, body).unwrap_or_else(|cleanup| {
                 panic!(
                     "fiber stack slot {index} could not be given back after its top page was \
                      refused ({error}): {cleanup}"
                 )
             });
+            self.slots[index]
+                .watermark
+                .store(body_top, Ordering::Release);
             self.slots[index].state.store(SLOT_COLD, Ordering::Release);
             return Err(FiberStackError::Prepare(error));
         }
-        self.slots[index]
-            .watermark
-            .store(top_page.raw(), Ordering::Release);
-        // Creating a stack is outside fault context, so it is one of the
-        // two places that may refill the reserve the ordinary way.
-        frame_reserve::top_up(processor);
         Ok(FiberStack { arena: self, index })
     }
 
@@ -665,9 +832,94 @@ impl FiberStackArena {
                 .iter()
                 .map(|counter| counter.load(Ordering::Relaxed))
                 .sum(),
+            demand_committed_pages: self
+                .committed_pages
+                .iter()
+                .map(|counter| counter.load(Ordering::Relaxed))
+                .sum(),
             released_stacks,
             released_committed_bytes: self.released.committed_bytes.load(Ordering::Relaxed),
             released_eager_bytes: released_stacks * self.stack_bytes as u64,
+        }
+    }
+}
+
+/// The frames one commit needs, taken from the user pool (or, for a
+/// masked fault, the processor's reserve) before any of them is mapped.
+///
+/// Mapping is not undone from fault context (taking a translation away
+/// needs a shootdown, and frees nothing until every processor has
+/// acknowledged it), so a commit that could run out of frames halfway
+/// must not have mapped any. Taking all of them first makes a refusal
+/// cost nothing: the chain gives its frames back to the pool and the
+/// stack is as it was.
+///
+/// The list is threaded through the frames' own first word, as
+/// [`super::frame_slab`] does, so it allocates nothing. Every frame is
+/// zeroed by the pool and the link is cleared on the way out, so a frame
+/// leaves the chain exactly as the pool handed it over.
+///
+/// Concurrency: a local value of the one context that built it.
+struct FrameChain {
+    head: Option<NonNull<u8>>,
+}
+
+impl FrameChain {
+    /// `count` zeroed frames from the user pool, through its blocking
+    /// path, or the refusal that stopped it, with what was taken given
+    /// back.
+    fn take(processor: ProcessorId, count: usize) -> Result<Self, ProgramOutOfMemory> {
+        let mut chain = Self { head: None };
+        for _ in 0..count {
+            match allocate_user_frame_zeroed_on(processor) {
+                Ok(frame) => chain.push(frame),
+                Err(shortfall) => {
+                    chain.give_back(processor);
+                    return Err(shortfall);
+                }
+            }
+        }
+        Ok(chain)
+    }
+
+    /// `count` zeroed frames from `processor`'s reserve, without touching
+    /// the pool, or how many the reserve held when it ran dry. The frames
+    /// taken before it ran dry are not returned: the caller panics.
+    fn take_from_reserve(processor: ProcessorId, count: usize) -> Result<Self, usize> {
+        let mut chain = Self { head: None };
+        for held in 0..count {
+            match frame_reserve::take_frame(processor) {
+                Some(frame) => chain.push(frame),
+                None => return Err(held),
+            }
+        }
+        Ok(chain)
+    }
+
+    fn push(&mut self, frame: NonNull<u8>) {
+        // SAFETY: the pool handed this page over whole and nothing else
+        // holds it, and a page has room for a pointer-sized link at its
+        // start.
+        unsafe { frame.cast::<Option<NonNull<u8>>>().write(self.head) };
+        self.head = Some(frame);
+    }
+
+    /// The most recently taken frame, zeroed again.
+    fn pop(&mut self) -> Option<NonNull<u8>> {
+        let frame = self.head?;
+        // SAFETY: `push` wrote the link of every frame on the chain, and
+        // this one is leaving it, so nothing reads the link again.
+        unsafe {
+            let link = frame.cast::<Option<NonNull<u8>>>();
+            self.head = link.read();
+            link.write(None);
+        }
+        Some(frame)
+    }
+
+    fn give_back(&mut self, processor: ProcessorId) {
+        while let Some(frame) = self.pop() {
+            deallocate_user_frame_on(processor, frame);
         }
     }
 }
@@ -741,18 +993,19 @@ pub fn claim_fiber_stack(stack_bytes: usize) -> Result<FiberStack, FiberStackErr
 mod tests {
     use core::alloc::Layout;
     use core::sync::atomic::AtomicUsize;
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
 
     use helios_hal::cpu::ProcessorId;
 
     use super::*;
+    use crate::test_processor_identity;
 
     /// Bytes of pretend user memory the pool is built over. It has to
-    /// cover the reserve's own fill as well as the pages the test
-    /// faults in.
+    /// cover the reserve and every page the tests commit.
     const POOL_BYTES: usize = 4 * 1024 * 1024;
-    /// A stack small enough to walk in a test and still several pages
-    /// deep, so a fault below the top page is a real demand commit.
-    const TEST_STACK_BYTES: usize = 16 * PhysFrame::SIZE;
+    /// Deep enough for a fault dozens of pages below the top.
+    const TEST_STACK_BYTES: usize = 96 * PhysFrame::SIZE;
     const TEST_SLOTS: usize = 3;
     /// Two, so that a commit resolved on the test's processor can be
     /// shown to land on that processor's counter and no other.
@@ -763,6 +1016,7 @@ mod tests {
     /// Where the fake address space puts the arena. Any page-aligned
     /// value works; nothing dereferences it.
     const TEST_ARENA_BASE: usize = 0x0000_4000_0000_0000;
+    const TEST_SLOT_BYTES: usize = FIBER_STACK_GUARD_BYTES + TEST_STACK_BYTES;
 
     static PREPARED: AtomicUsize = AtomicUsize::new(0);
     static COMMITTED: AtomicUsize = AtomicUsize::new(0);
@@ -770,18 +1024,20 @@ mod tests {
     /// The `mapped` range of the most recent `end_demand_commit`, as
     /// `(start, byte_len)`.
     static LAST_MAPPED: (AtomicUsize, AtomicUsize) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    /// The fake page table: every mapped page and the frame behind it.
+    static MAPPED: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
 
     /// An address space that records what the arena asked of it.
     ///
     /// The arena's own logic is the geometry, the slot bookkeeping and
     /// the fault classification; what the page tables do with the
-    /// result is each backend's, and is covered by booting them.
+    /// result is each backend's, and is covered by booting them. The
+    /// fake does keep what a real one owes the pool: a page mapped twice
+    /// is refused, a page in a guard is refused, a frame handed to it is
+    /// a whole zeroed page, and ending a commit gives its frames back.
     static TEST_HOOKS: FiberStackVmHooks = FiberStackVmHooks {
         reserve: |bytes| {
-            assert_eq!(
-                bytes,
-                TEST_SLOTS * (FIBER_STACK_GUARD_BYTES + TEST_STACK_BYTES)
-            );
+            assert_eq!(bytes, TEST_SLOTS * TEST_SLOT_BYTES);
             Ok(VirtRange::new(VirtAddr::new(TEST_ARENA_BASE), bytes))
         },
         prepare_demand_commit: |virt, flags| {
@@ -790,9 +1046,23 @@ mod tests {
             PREPARED.fetch_add(1, Ordering::Relaxed);
             Ok(())
         },
-        commit_demand_page: |addr, _frame, flags| {
+        commit_demand_page: |addr, frame, flags| {
             assert!(addr.is_page_aligned());
             assert_eq!(flags, PageFlags::READ | PageFlags::WRITE);
+            assert!(
+                (addr.raw() - TEST_ARENA_BASE) % TEST_SLOT_BYTES >= FIBER_STACK_GUARD_BYTES,
+                "{addr:?} is in a guard, which is never mapped"
+            );
+            // SAFETY: the frame is one whole page the pool handed over.
+            let page = unsafe { core::slice::from_raw_parts(frame.as_ptr(), PhysFrame::SIZE) };
+            assert!(
+                page.iter().all(|byte| *byte == 0),
+                "a frame arrives zeroed, its chain link included"
+            );
+            let mut mapped = MAPPED.lock().expect("fake page table");
+            if mapped.insert(addr.raw(), frame.as_ptr() as usize).is_some() {
+                return Err(AddressSpaceError::Overlap);
+            }
             COMMITTED.fetch_add(1, Ordering::Relaxed);
             Ok(())
         },
@@ -805,14 +1075,92 @@ mod tests {
             LAST_MAPPED.0.store(mapped.start.raw(), Ordering::Relaxed);
             LAST_MAPPED.1.store(mapped.byte_len, Ordering::Relaxed);
             ENDED.fetch_add(1, Ordering::Relaxed);
+            let mut table = MAPPED.lock().expect("fake page table");
+            let pages: alloc::vec::Vec<usize> = table
+                .range(virt.start.raw()..virt.end().raw())
+                .map(|(page, _)| *page)
+                .collect();
+            for page in pages {
+                let frame = table.remove(&page).expect("a page just listed");
+                assert!(
+                    mapped.start.raw() <= page && page < mapped.end().raw(),
+                    "page {page:#x} is mapped outside the range the arena named"
+                );
+                super::super::deallocate_user_frame(
+                    NonNull::new(frame as *mut u8).expect("a mapped frame"),
+                );
+            }
             Ok(())
         },
     };
 
-    /// Brings up the one-processor user pool the frame reserve draws on
-    /// and the arena on top of it. Each test runs in its own process,
-    /// so the install-once statics are fresh every time.
-    fn arena() {
+    fn enabled() -> InterruptedContext {
+        InterruptedContext {
+            interrupts_enabled: true,
+        }
+    }
+
+    fn masked() -> InterruptedContext {
+        InterruptedContext {
+            interrupts_enabled: false,
+        }
+    }
+
+    /// The fake page table's mapped pages, lowest first.
+    fn mapped_pages() -> alloc::vec::Vec<usize> {
+        MAPPED
+            .lock()
+            .expect("fake page table")
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    /// The pages of `[low, high)`.
+    fn pages_between(low: usize, high: usize) -> alloc::vec::Vec<usize> {
+        (low..high).step_by(PhysFrame::SIZE).collect()
+    }
+
+    /// Frames taken out of the pool, so a test can give some back.
+    struct Hoard(alloc::vec::Vec<NonNull<u8>>);
+
+    impl Hoard {
+        /// Takes every frame the pool has, then gives `left` of them
+        /// back.
+        fn exhaust_pool_leaving(left: usize) -> Self {
+            let mut hoard = Self(alloc::vec::Vec::new());
+            while let Ok(frame) = super::super::allocate_user_frame_zeroed() {
+                hoard.0.push(frame);
+            }
+            hoard.give_back(left);
+            hoard
+        }
+
+        fn give_back(&mut self, count: usize) {
+            for _ in 0..count {
+                super::super::deallocate_user_frame(self.0.pop().expect("a frame to give back"));
+            }
+        }
+    }
+
+    /// How many frames the pool can hand out right now; it takes them
+    /// all and gives them back.
+    fn frames_in_pool() -> usize {
+        let mut held = alloc::vec::Vec::new();
+        while let Ok(frame) = super::super::allocate_user_frame_zeroed() {
+            held.push(frame);
+        }
+        let count = held.len();
+        for frame in held {
+            super::super::deallocate_user_frame(frame);
+        }
+        count
+    }
+
+    /// Brings up the user pool the arena draws on and the arena on top
+    /// of it. Each test runs in its own process, so the install-once
+    /// statics are fresh every time.
+    fn arena_retaining(retain_bytes: usize) {
         let layout = Layout::from_size_align(POOL_BYTES, PhysFrame::SIZE).expect("pool layout");
         // Leaked on purpose: the pool is a `&'static` for the life of
         // the machine, and a test process is that life.
@@ -825,12 +1173,11 @@ mod tests {
         pool.configure_processors(TEST_PROCESSORS);
         frame_reserve::configure_processors(TEST_PROCESSORS);
         install_fiber_stack_hooks(&TEST_HOOKS);
-        install_fiber_stack_arena(
-            TEST_SLOTS,
-            TEST_STACK_BYTES,
-            TEST_PROCESSORS,
-            TEST_RETAIN_BYTES,
-        );
+        install_fiber_stack_arena(TEST_SLOTS, TEST_STACK_BYTES, TEST_PROCESSORS, retain_bytes);
+    }
+
+    fn arena() {
+        arena_retaining(TEST_RETAIN_BYTES);
     }
 
     #[test]
@@ -842,7 +1189,14 @@ mod tests {
         assert_eq!(
             COMMITTED.load(Ordering::Relaxed),
             1,
-            "a fresh stack pays for one page, not for the span it may grow into"
+            "a fresh stack pays for its top page, not for the span it may grow into"
+        );
+        let top = stack.range().end;
+        assert_eq!(mapped_pages(), pages_between(top - PhysFrame::SIZE, top));
+        assert_eq!(
+            reserved_bytes(),
+            0,
+            "a claim draws on the page-fault reserve never and fills it never"
         );
         let range = stack.range();
         assert_eq!(range.end - range.start, TEST_STACK_BYTES);
@@ -856,35 +1210,93 @@ mod tests {
     }
 
     #[test]
-    fn a_fault_below_the_top_commits_that_page_and_a_guard_hit_does_not() {
+    fn an_enabled_fault_commits_exactly_the_page_and_the_gap_above_it_as_one_run() {
         arena();
         let stack = claim_fiber_stack(TEST_STACK_BYTES).expect("a free slot");
         let range = stack.range();
         let committed_before = COMMITTED.load(Ordering::Relaxed);
 
-        // Four pages below the top: the stack grew past its first page.
-        let deep = VirtAddr::new(range.end - 4 * PhysFrame::SIZE + 8);
-        assert_eq!(resolve_stack_fault(deep), StackFault::Committed);
-        assert_eq!(COMMITTED.load(Ordering::Relaxed), committed_before + 1);
+        // Thirty pages below the top: with a gap between the committed
+        // top page and the faulting page that a large frame skipped.
+        let page = range.end - 30 * PhysFrame::SIZE;
+        assert_eq!(
+            resolve_stack_fault(VirtAddr::new(page + 8), enabled()),
+            StackFault::Committed
+        );
 
-        // And a second fault on the same page is a second commit only
-        // because nothing here maps anything; what matters is that the
-        // watermark followed the deepest address.
+        assert_eq!(
+            mapped_pages(),
+            pages_between(page, range.end),
+            "the committed range is one run from the faulting page to the top, the skipped gap \
+             included, and nothing below the faulting page"
+        );
+        let faulted_pages = 29;
+        assert_eq!(
+            COMMITTED.load(Ordering::Relaxed),
+            committed_before + faulted_pages
+        );
         let stats = fiber_stack_arena_stats().expect("arena stats");
         assert_eq!(stats.live_slots, 1);
-        assert_eq!(stats.committed_bytes, 4 * PhysFrame::SIZE);
+        assert_eq!(stats.committed_bytes, range.end - page);
         assert_eq!(stats.eager_bytes, TEST_STACK_BYTES);
-        assert!(stats.demand_commits >= 1);
+        assert_eq!(stats.demand_commits, 1, "one fault is one demand commit");
+        assert_eq!(stats.demand_committed_pages, faulted_pages as u64);
+    }
 
-        let guard = VirtAddr::new(range.start - PhysFrame::SIZE);
-        let outcome = resolve_stack_fault(guard);
-        assert!(
-            matches!(outcome, StackFault::Guard { .. }),
-            "a guard hit is a stack overflow, never a commit: {outcome:?}"
+    #[test]
+    fn a_served_enabled_fault_tops_the_reserve_up_through_the_pool() {
+        arena();
+        let stack = claim_fiber_stack(TEST_STACK_BYTES).expect("a free slot");
+        assert_eq!(reserved_bytes(), 0);
+
+        assert_eq!(
+            resolve_stack_fault(thirty_page_fault(&stack), enabled()),
+            StackFault::Committed
         );
-        assert!(
-            alloc::format!("{outcome}").contains("guard page"),
-            "the fatal report has to name it"
+        assert_eq!(
+            reserved_bytes(),
+            frame_reserve::RESERVE_CAPACITY * PhysFrame::SIZE,
+            "the fault's frames came from the pool and the reserve was refilled behind it"
+        );
+    }
+
+    #[test]
+    fn a_guard_hit_is_an_overflow_for_any_interrupted_context() {
+        arena();
+        let stack = claim_fiber_stack(TEST_STACK_BYTES).expect("a free slot");
+        let range = stack.range();
+        let mapped_before = mapped_pages();
+
+        for interrupted in [enabled(), masked()] {
+            let guard = VirtAddr::new(range.start - PhysFrame::SIZE);
+            let outcome = resolve_stack_fault(guard, interrupted);
+            assert!(
+                matches!(outcome, StackFault::Guard { .. }),
+                "a guard hit is a stack overflow, never a commit and never the masked-fault \
+                 panic: {outcome:?}"
+            );
+            assert!(
+                alloc::format!("{outcome}").contains("guard page"),
+                "the fatal report has to name it"
+            );
+        }
+        assert_eq!(mapped_pages(), mapped_before);
+    }
+
+    #[test]
+    fn a_fault_on_the_lowest_page_of_the_body_commits_the_whole_body_and_never_the_guard() {
+        arena();
+        let stack = claim_fiber_stack(TEST_STACK_BYTES).expect("a free slot");
+        let range = stack.range();
+
+        assert_eq!(
+            resolve_stack_fault(VirtAddr::new(range.start), enabled()),
+            StackFault::Committed
+        );
+        assert_eq!(mapped_pages(), pages_between(range.start, range.end));
+        assert_eq!(
+            fiber_stack_arena_stats().expect("stats").committed_bytes,
+            TEST_STACK_BYTES
         );
     }
 
@@ -892,14 +1304,92 @@ mod tests {
     fn an_address_outside_the_arena_is_nobody_else_business() {
         arena();
         assert_eq!(
-            resolve_stack_fault(VirtAddr::new(TEST_ARENA_BASE - PhysFrame::SIZE)),
+            resolve_stack_fault(VirtAddr::new(TEST_ARENA_BASE - PhysFrame::SIZE), enabled()),
             StackFault::Elsewhere
         );
-        let past = TEST_ARENA_BASE + TEST_SLOTS * (FIBER_STACK_GUARD_BYTES + TEST_STACK_BYTES);
+        let past = TEST_ARENA_BASE + TEST_SLOTS * TEST_SLOT_BYTES;
         assert_eq!(
-            resolve_stack_fault(VirtAddr::new(past)),
+            resolve_stack_fault(VirtAddr::new(past), enabled()),
             StackFault::Elsewhere
         );
+    }
+
+    /// A processor's reserve, filled the way the executor loop fills it,
+    /// with the calling thread as processor 0.
+    fn full_reserve() {
+        frame_reserve::top_up(current_processor());
+        assert_eq!(
+            reserved_bytes(),
+            frame_reserve::RESERVE_CAPACITY * PhysFrame::SIZE
+        );
+    }
+
+    fn reserved_bytes() -> usize {
+        frame_reserve::reserved_bytes()
+    }
+
+    #[test]
+    #[should_panic(expected = "needed 29 frames and processor 0 reserved 0 of its 64")]
+    fn a_masked_fault_with_the_reserve_empty_is_the_named_panic() {
+        arena();
+        let stack = claim_fiber_stack(TEST_STACK_BYTES).expect("a free slot");
+        assert_eq!(reserved_bytes(), 0);
+
+        let _ = resolve_stack_fault(thirty_page_fault(&stack), masked());
+    }
+
+    #[test]
+    fn a_masked_fault_is_served_from_the_reserve_while_another_processor_holds_the_pool_lock() {
+        arena();
+        let stack = claim_fiber_stack(TEST_STACK_BYTES).expect("a free slot");
+        let fault = thirty_page_fault(&stack);
+        full_reserve();
+        let served = core::sync::atomic::AtomicBool::new(false);
+
+        std::thread::scope(|scope| {
+            test_processor_identity::set(ProcessorId::new(1));
+            let pool = super::super::user::installed_user_memory_pool().expect("pool");
+            pool.hold_buddy_lock_while(|| {
+                scope.spawn(|| {
+                    test_processor_identity::set(ProcessorId::new(0));
+                    assert_eq!(resolve_stack_fault(fault, masked()), StackFault::Committed);
+                    served.store(true, Ordering::Release);
+                });
+                // The fault has no pool lock to wait for; give it ample
+                // time to finish while this thread still holds the lock.
+                for _ in 0..200 {
+                    if served.load(Ordering::Acquire) {
+                        break;
+                    }
+                    std::thread::sleep(core::time::Duration::from_millis(10));
+                }
+                assert!(
+                    served.load(Ordering::Acquire),
+                    "the masked fault was not served while the pool lock was held: it touched \
+                     the pool"
+                );
+            });
+        });
+        assert_eq!(
+            reserved_bytes(),
+            (frame_reserve::RESERVE_CAPACITY - 29) * PhysFrame::SIZE,
+            "the fault's twenty-nine frames came out of the reserve, and the reserve is not \
+             refilled from fault context"
+        );
+        assert_eq!(
+            mapped_pages(),
+            pages_between(stack.range().end - 30 * PhysFrame::SIZE, stack.range().end)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "already maps")]
+    fn a_fault_on_a_page_the_stack_already_maps_is_a_bookkeeping_defect() {
+        arena();
+        let stack = claim_fiber_stack(TEST_STACK_BYTES).expect("a free slot");
+        let range = stack.range();
+
+        let _ = resolve_stack_fault(VirtAddr::new(range.end - PhysFrame::SIZE), enabled());
     }
 
     #[test]
@@ -941,20 +1431,25 @@ mod tests {
     }
 
     #[test]
-    fn a_warm_slot_serves_the_next_stack_without_touching_the_address_space() {
-        arena();
+    fn a_warm_slot_serves_the_next_stack_without_touching_the_address_space_or_the_pool() {
+        // Room for a stack that grew, so it is kept rather than given back.
+        arena_retaining(TEST_STACK_BYTES);
         let first = claim_fiber_stack(TEST_STACK_BYTES).expect("a free slot");
         let range = first.range();
         assert_eq!(
-            resolve_stack_fault(VirtAddr::new(range.end - PhysFrame::SIZE - 8)),
+            resolve_stack_fault(VirtAddr::new(range.end - 20 * PhysFrame::SIZE), enabled()),
             StackFault::Committed
         );
+        // The top page, the skipped gap and the faulting page.
+        let held = 20 * PhysFrame::SIZE;
         drop(first);
         let stats = fiber_stack_arena_stats().expect("stats");
         assert_eq!(stats.warm_slots, 1);
-        assert_eq!(stats.retained_bytes, 2 * PhysFrame::SIZE);
+        assert_eq!(stats.retained_bytes, held);
         assert_eq!(ENDED.load(Ordering::Relaxed), 0);
 
+        // Nothing is left in the pool: a warm claim has to need none.
+        let _hoard = Hoard::exhaust_pool_leaving(0);
         let prepared = PREPARED.load(Ordering::Relaxed);
         let committed = COMMITTED.load(Ordering::Relaxed);
         let second = claim_fiber_stack(TEST_STACK_BYTES).expect("the warm slot");
@@ -965,8 +1460,7 @@ mod tests {
         assert_eq!(stats.warm_slots, 0);
         assert_eq!(stats.retained_bytes, 0);
         assert_eq!(
-            stats.committed_bytes,
-            2 * PhysFrame::SIZE,
+            stats.committed_bytes, held,
             "the pages the first stack touched are still the second's"
         );
     }
@@ -976,26 +1470,27 @@ mod tests {
         arena();
         let stack = claim_fiber_stack(TEST_STACK_BYTES).expect("a free slot");
         let range = stack.range();
-        let deep = range.end - 4 * PhysFrame::SIZE + 8;
+        let page = range.end - 30 * PhysFrame::SIZE;
         assert_eq!(
-            resolve_stack_fault(VirtAddr::new(deep)),
+            resolve_stack_fault(VirtAddr::new(page + 8), enabled()),
             StackFault::Committed
         );
 
         drop(stack);
-        let deepest_page = deep & !(PhysFrame::SIZE - 1);
-        assert_eq!(LAST_MAPPED.0.load(Ordering::Relaxed), deepest_page);
+        let lowest = page;
+        assert_eq!(LAST_MAPPED.0.load(Ordering::Relaxed), lowest);
         assert_eq!(
             LAST_MAPPED.1.load(Ordering::Relaxed),
-            range.end - deepest_page,
+            range.end - lowest,
             "the address space walks from the watermark to the top and nothing below"
+        );
+        assert!(
+            mapped_pages().is_empty(),
+            "every frame the stack held went back to the address space's owner"
         );
         let stats = fiber_stack_arena_stats().expect("stats");
         assert_eq!(stats.released_stacks, 1);
-        assert_eq!(
-            stats.released_committed_bytes,
-            (range.end - deepest_page) as u64
-        );
+        assert_eq!(stats.released_committed_bytes, (range.end - lowest) as u64);
     }
 
     #[test]
@@ -1016,7 +1511,7 @@ mod tests {
         let stack = claim_fiber_stack(TEST_STACK_BYTES).expect("a free slot");
         let range = stack.range();
         assert_eq!(
-            resolve_stack_fault(VirtAddr::new(range.end - 2 * PhysFrame::SIZE)),
+            resolve_stack_fault(VirtAddr::new(range.end - 20 * PhysFrame::SIZE), enabled()),
             StackFault::Committed
         );
 
@@ -1027,5 +1522,182 @@ mod tests {
         assert_eq!(fiber_stack_demand_commits_on(here), 1);
         assert_eq!(fiber_stack_demand_commits_on(other), 0);
         assert_eq!(fiber_stack_arena_stats().expect("stats").demand_commits, 1);
+    }
+
+    /// The fault that needs 30 pages, and the page it faults on.
+    fn thirty_page_fault(stack: &FiberStack) -> VirtAddr {
+        VirtAddr::new(stack.range().end - 30 * PhysFrame::SIZE + 8)
+    }
+
+    #[test]
+    fn an_enabled_fault_with_the_pool_exhausted_is_starved_and_changes_nothing() {
+        arena();
+        let stack = claim_fiber_stack(TEST_STACK_BYTES).expect("a free slot");
+        let fault = thirty_page_fault(&stack);
+        let mapped_before = mapped_pages();
+        let stats_before = fiber_stack_arena_stats().expect("stats");
+
+        // One frame short of the twenty-nine the fault needs.
+        let mut hoard = Hoard::exhaust_pool_leaving(28);
+        let outcome = resolve_stack_fault(fault, enabled());
+        let StackFault::Starved {
+            slot,
+            addr,
+            shortfall,
+        } = outcome
+        else {
+            panic!("a pool one frame short must starve the fault: {outcome:?}");
+        };
+        assert_eq!(slot, 0);
+        assert_eq!(addr, fault.raw());
+        assert_eq!(shortfall.requested_bytes, PhysFrame::SIZE);
+        assert!(
+            alloc::format!("{outcome}").contains("user pool is exhausted"),
+            "the fatal report has to name it"
+        );
+
+        assert_eq!(mapped_pages(), mapped_before, "nothing was mapped");
+        let stats = fiber_stack_arena_stats().expect("stats");
+        assert_eq!(stats.committed_bytes, stats_before.committed_bytes);
+        assert_eq!(stats.demand_commits, stats_before.demand_commits);
+        assert_eq!(stats.demand_committed_pages, 0);
+        assert_eq!(
+            frames_in_pool(),
+            28,
+            "the frames the fault had taken went back to the pool"
+        );
+
+        // And it is recoverable: with the twenty-ninth frame back the same
+        // fault is served.
+        hoard.give_back(1);
+        assert_eq!(resolve_stack_fault(fault, enabled()), StackFault::Committed);
+        assert_eq!(
+            mapped_pages().len(),
+            mapped_before.len() + 29,
+            "the whole run arrives together"
+        );
+    }
+
+    #[test]
+    fn a_cold_claim_with_the_pool_exhausted_is_a_typed_error_and_leaves_the_reserve_alone() {
+        arena();
+        full_reserve();
+        let mut hoard = Hoard::exhaust_pool_leaving(0);
+
+        let refusal = claim_fiber_stack(TEST_STACK_BYTES).err();
+        let Some(FiberStackError::OutOfMemory(shortfall)) = refusal else {
+            panic!("a pool with no frame must refuse the claim: {refusal:?}");
+        };
+        assert_eq!(shortfall.requested_bytes, PhysFrame::SIZE);
+        assert_eq!(
+            PREPARED.load(Ordering::Relaxed),
+            0,
+            "nothing of the slot is touched before its top page is in hand"
+        );
+        assert!(mapped_pages().is_empty());
+        let stats = fiber_stack_arena_stats().expect("stats");
+        assert_eq!((stats.live_slots, stats.warm_slots), (0, 0));
+        assert_eq!(
+            reserved_bytes(),
+            frame_reserve::RESERVE_CAPACITY * PhysFrame::SIZE,
+            "a claim does not draw on the page-fault reserve"
+        );
+
+        // The slot is as found: with a frame back the same claim takes it.
+        hoard.give_back(1);
+        let stack = claim_fiber_stack(TEST_STACK_BYTES).expect("the slot is still cold");
+        assert_eq!(
+            stack.range().start,
+            TEST_ARENA_BASE + FIBER_STACK_GUARD_BYTES,
+            "the refused claim left the lowest slot free"
+        );
+        assert_eq!(mapped_pages().len(), 1);
+    }
+
+    #[test]
+    fn an_enabled_fault_waits_for_a_pool_lock_another_processor_holds_and_is_served_with_the_reserve_empty()
+     {
+        arena();
+        let stack = claim_fiber_stack(TEST_STACK_BYTES).expect("a free slot");
+        let fault = thirty_page_fault(&stack);
+        assert_eq!(reserved_bytes(), 0, "this processor's reserve is empty");
+        // Frames the pool holds in its fallback shard, so the faulting
+        // processor's own shard is empty and the allocation has to take
+        // the buddy lock.
+        let mut hoard = Hoard::exhaust_pool_leaving(0);
+        hoard.give_back(64);
+        let served = core::sync::atomic::AtomicBool::new(false);
+
+        std::thread::scope(|scope| {
+            test_processor_identity::set(ProcessorId::new(1));
+            let pool = super::super::user::installed_user_memory_pool().expect("pool");
+            pool.hold_buddy_lock_while(|| {
+                scope.spawn(|| {
+                    // Processor 0 faults while processor 1 is inside the
+                    // pool's critical section.
+                    test_processor_identity::set(ProcessorId::new(0));
+                    assert_eq!(resolve_stack_fault(fault, enabled()), StackFault::Committed);
+                    served.store(true, Ordering::Release);
+                });
+                std::thread::sleep(core::time::Duration::from_millis(200));
+                assert!(
+                    !served.load(Ordering::Acquire),
+                    "the fault was served, or refused, while the pool lock was held: it did not \
+                     wait for it"
+                );
+            });
+        });
+        assert!(served.load(Ordering::Acquire));
+        assert_eq!(mapped_pages().len(), 1 + 29);
+    }
+
+    #[test]
+    fn the_refill_waits_out_a_pool_lock_another_processor_holds_and_fills_the_reserve() {
+        arena();
+        let processor = ProcessorId::new(0);
+        assert_eq!(reserved_bytes(), 0, "the reserve starts empty");
+        let filled = core::sync::atomic::AtomicBool::new(false);
+
+        std::thread::scope(|scope| {
+            test_processor_identity::set(ProcessorId::new(1));
+            let pool = super::super::user::installed_user_memory_pool().expect("pool");
+            pool.hold_buddy_lock_while(|| {
+                scope.spawn(|| {
+                    test_processor_identity::set(processor);
+                    frame_reserve::top_up(processor);
+                    filled.store(true, Ordering::Release);
+                });
+                std::thread::sleep(core::time::Duration::from_millis(200));
+                assert!(
+                    !filled.load(Ordering::Acquire),
+                    "the refill returned while the pool's lock was held: it gave up instead of \
+                     waiting"
+                );
+            });
+        });
+        assert_eq!(
+            reserved_bytes(),
+            frame_reserve::RESERVE_CAPACITY * PhysFrame::SIZE,
+            "the refill filled the reserve once the lock came free"
+        );
+    }
+
+    /// The failed instantiation or call has to classify as out of memory:
+    /// the runtime wraps the creator's error in its own, and the
+    /// classifier walks the chain for the pool's refusal.
+    #[cfg(feature = "wasmtime-runtime")]
+    #[test]
+    fn the_runtimes_error_chain_reaches_the_pools_refusal() {
+        let refusal = ProgramOutOfMemory {
+            requested_bytes: PhysFrame::SIZE,
+            available_bytes: 0,
+            pool_bytes: POOL_BYTES,
+            reserved_bytes: 0,
+        };
+        let error = wasmtime::Error::new(FiberStackError::OutOfMemory(refusal));
+        assert!(
+            error.chain().any(|cause| cause.is::<ProgramOutOfMemory>()),
+            "the creator's error reaches the runtime with the refusal in its chain"
+        );
     }
 }
