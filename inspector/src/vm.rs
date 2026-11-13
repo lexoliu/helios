@@ -65,6 +65,7 @@ use qmp::{QmpClient, QmpError, SizeError};
 use raw_profile::{ProfileCommand, RawProfileCollectError};
 use tpm::{Swtpm, SwtpmError, VmTpm, VmTpmBackend, VmTpmError, VmTpmProfile};
 pub(crate) use vcpu_state::VcpuStateCapture;
+use vcpu_state::VcpuStateError;
 
 /// Why a `vm` session did not run.
 ///
@@ -82,6 +83,8 @@ pub(crate) enum VmError {
     Build(#[from] VmBuildError),
     #[error("{0}")]
     Runtime(#[from] VmRuntimeError),
+    #[error("{0}")]
+    VcpuState(#[from] VcpuStateCommandError),
     /// A session that failed, with the runtime directory it left behind
     /// and QEMU's own account of the machine.
     ///
@@ -95,6 +98,30 @@ pub(crate) enum VmError {
         #[source]
         source: VmSessionError,
     },
+}
+
+/// Why `vm vcpu-state` could not reach the guest it was pointed at, or
+/// could not capture it.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum VcpuStateCommandError {
+    #[error(
+        "vcpu-state captures a running guest, and names it by the --runtime-dir its session \
+         keeps; none was given"
+    )]
+    NoRuntimeDir,
+    #[error(
+        "the runtime directory {runtime_dir} has no `{SOCKET_DIR_LINK_NAME}` link to the \
+         guest's sockets (is it a kept runtime directory of a running guest?): {source}"
+    )]
+    NoSocketDir {
+        runtime_dir: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("--qmp {endpoint} is not a `unix:<path>` socket the inspector can speak to")]
+    QmpNotUnix { endpoint: String },
+    #[error("{0}")]
+    Capture(#[from] VcpuStateError),
 }
 
 /// Why the flags, the config file and this host do not describe a VM
@@ -2046,6 +2073,19 @@ enum VmSessionCommand {
     /// file's `bootfs` if named, else the build's prebuild directory. A
     /// release uses it to attach the payload its kernel trusts.
     BootfsPath,
+    /// Capture what every vCPU of a running guest is doing, and stop
+    /// there.
+    ///
+    /// The guest is the one whose session keeps `--runtime-dir`: the
+    /// capture speaks to QEMU over that session's QMP socket (or the
+    /// `unix:` endpoint `--qmp` names), appends the register file, each
+    /// local APIC and each vCPU's stacks to `vcpu-state.log` there, and
+    /// names on stderr the kernel function each vCPU is executing and
+    /// the return addresses on its stacks, against the kernel this
+    /// checkout's build spec resolves. It is what a session does for
+    /// itself when one of its own guest steps times out, offered to a
+    /// check whose wait on the guest is its own.
+    VcpuState(VcpuStateCommand),
     /// Provision the privileged host state a network backend needs.
     NetSetup(NetSetupCommand),
     /// Remove the host state `net-setup` provisioned.
@@ -2073,6 +2113,16 @@ pub(crate) struct BalloonCommand {
     /// How long to hold each target before moving to the next one.
     #[arg(long, default_value_t = 0)]
     hold_seconds: u64,
+}
+
+/// Captures every vCPU of a running guest through its session's QMP
+/// socket; see [`VmSessionCommand::VcpuState`].
+#[derive(Debug, Clone, ClapArgs)]
+pub(crate) struct VcpuStateCommand {
+    /// What the capture is taken after, such as the wait that expired.
+    /// It heads the capture in `vcpu-state.log`.
+    #[arg(long, value_name = "TEXT")]
+    after: String,
 }
 
 /// Captures the machine's scanout through QMP.
@@ -2417,6 +2467,44 @@ pub(crate) fn run(mut command: VmCommand) -> Result<(), VmError> {
             let bootfs = resolve_bootfs_path(command.bootfs, file.bootfs, &build)
                 .map_err(VmConfigError::from)?;
             println!("{}", bootfs.display());
+            return Ok(());
+        }
+        // Speaks to a guest another session booted, so it boots nothing
+        // and needs no accelerator.
+        Some(VmSessionCommand::VcpuState(capture)) => {
+            let file = load_config_file(command.config.as_deref())?;
+            let build = resolve_build(&command, &file, None)?;
+            let kernel = resolve_kernel_path(command.kernel, file.kernel, &build)
+                .map_err(VmConfigError::from)?;
+            let runtime_dir = command
+                .runtime_dir
+                .or(file.runtime_dir)
+                .ok_or(VcpuStateCommandError::NoRuntimeDir)?;
+            let qmp_socket = match command.qmp.or(file.qmp) {
+                Some(endpoint) => unix_socket_of(&endpoint)
+                    .ok_or(VcpuStateCommandError::QmpNotUnix { endpoint })?,
+                // The link, resolved: the path through it can be longer
+                // than a socket address holds.
+                None => fs::read_link(runtime_dir.join(SOCKET_DIR_LINK_NAME))
+                    .map_err(|source| VcpuStateCommandError::NoSocketDir {
+                        runtime_dir: runtime_dir.display().to_string(),
+                        source,
+                    })?
+                    .join(QMP_SOCKET_NAME),
+            };
+            let debug_serial_log = command
+                .debug_serial_log
+                .or(file.debug_serial_log)
+                .unwrap_or_else(|| runtime_dir.join(DEBUG_SERIAL_LOG_NAME));
+            VcpuStateCapture::new(
+                build.profile.arch,
+                Some(qmp_socket),
+                &runtime_dir,
+                Some(debug_serial_log),
+                kernel,
+            )
+            .capture_after(&capture.after)
+            .map_err(VcpuStateCommandError::from)?;
             return Ok(());
         }
         session => command.command = session,
@@ -5802,14 +5890,15 @@ fn qmp_socket_path(
     command: &ResolvedVmCommand,
     socket_dir: &Path,
 ) -> Result<Option<PathBuf>, SocketPathTooLong> {
-    let Some(endpoint) = qmp_endpoint(command, socket_dir)? else {
-        return Ok(None);
-    };
-    let Some(path) = endpoint.strip_prefix("unix:") else {
-        return Ok(None);
-    };
+    Ok(qmp_endpoint(command, socket_dir)?.and_then(|endpoint| unix_socket_of(&endpoint)))
+}
+
+/// The socket path of a QEMU `unix:<path>[,option…]` endpoint, or `None`
+/// for any other form.
+fn unix_socket_of(endpoint: &str) -> Option<PathBuf> {
+    let path = endpoint.strip_prefix("unix:")?;
     let path = path.split(',').next().unwrap_or(path);
-    Ok(Some(PathBuf::from(path)))
+    Some(PathBuf::from(path))
 }
 
 fn unix_endpoint(socket_dir: &Path, name: &str) -> Result<String, SocketPathTooLong> {
@@ -6558,10 +6647,12 @@ impl From<VmSessionCommand> for ResolvedVmSessionCommand {
             VmSessionCommand::Build
             | VmSessionCommand::KernelPath
             | VmSessionCommand::BootfsPath
+            | VmSessionCommand::VcpuState(_)
             | VmSessionCommand::NetSetup(_)
             | VmSessionCommand::NetTeardown(_) => {
                 unreachable!(
-                    "the build, the artifact query and the network helpers never reach a guest session"
+                    "the build, the artifact queries, the vCPU capture and the network helpers \
+                     never reach a guest session"
                 )
             }
         }
