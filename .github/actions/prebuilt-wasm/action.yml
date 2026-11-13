@@ -1,0 +1,57 @@
+name: Download the run's prebuilt guest wasm
+description: >-
+  Waits for the `wasm-programs` job of this run to upload the guest wasm of
+  one profile, then downloads it. The lane that calls it runs in parallel
+  with that job, so this is the step placed right before the lane's first
+  kernel prebuild. It fails at once when the job concluded with anything but
+  success, and when the artifact has not appeared within the bound. The
+  calling job needs `actions: read`.
+inputs:
+  profile:
+    description: The guest programs' cargo profile, `release` or `debug`.
+    required: true
+  path:
+    description: Directory to download into, relative to the workspace.
+    required: true
+  timeout-seconds:
+    description: How long to wait for the artifact.
+    required: false
+    default: "1800"
+runs:
+  using: composite
+  steps:
+    - name: Wait for the wasm-programs job
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        PROFILE: ${{ inputs.profile }}
+        TIMEOUT_SECONDS: ${{ inputs.timeout-seconds }}
+      run: |
+        set -euo pipefail
+        artifact="helios-wasm-${PROFILE}"
+        job="wasm-programs (${PROFILE})"
+        run="repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+        deadline=$((SECONDS + TIMEOUT_SECONDS))
+        while true; do
+          found="$(gh api --paginate "${run}/artifacts" \
+            --jq ".artifacts[] | select(.name == \"${artifact}\" and (.expired | not)) | .id")"
+          if [[ -n "${found}" ]]; then
+            echo "${artifact} is uploaded"
+            exit 0
+          fi
+          conclusion="$(gh api --paginate "${run}/attempts/${GITHUB_RUN_ATTEMPT}/jobs" \
+            --jq ".jobs[] | select(.name == \"${job}\") | .conclusion // \"\"")"
+          if [[ -n "${conclusion}" && "${conclusion}" != success ]]; then
+            echo "::error::the '${job}' job of this run concluded '${conclusion}', so ${artifact} will not appear"
+            exit 1
+          fi
+          if ((SECONDS >= deadline)); then
+            echo "::error::${artifact} did not appear within ${TIMEOUT_SECONDS} s; the '${job}' job has not finished or did not run"
+            exit 1
+          fi
+          sleep 10
+        done
+    - uses: actions/download-artifact@v4
+      with:
+        name: helios-wasm-${{ inputs.profile }}
+        path: ${{ inputs.path }}
