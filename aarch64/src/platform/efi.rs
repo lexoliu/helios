@@ -31,7 +31,7 @@ use core::ptr::NonNull;
 use fdt::{Fdt, FdtError};
 use limine::memmap::{
     Entry, MEMMAP_ACPI_NVS, MEMMAP_ACPI_RECLAIMABLE, MEMMAP_BOOTLOADER_RECLAIMABLE,
-    MEMMAP_RESERVED_MAPPED,
+    MEMMAP_MAPPED_RESERVED,
 };
 use r_efi::efi::{ConfigurationTable, DTB_TABLE_GUID, SYSTEM_TABLE_SIGNATURE, SystemTable};
 use thiserror::Error;
@@ -45,7 +45,7 @@ use thiserror::Error;
 /// map or not firmware memory at all.
 const FIRMWARE_TREE_MEMORY_TYPES: [u64; 4] = [
     MEMMAP_BOOTLOADER_RECLAIMABLE,
-    MEMMAP_RESERVED_MAPPED,
+    MEMMAP_MAPPED_RESERVED,
     MEMMAP_ACPI_RECLAIMABLE,
     MEMMAP_ACPI_NVS,
 ];
