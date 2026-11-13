@@ -19031,98 +19031,120 @@ mod tests {
     /// that received the frame.
     #[test]
     fn an_answer_completes_only_a_pending_resolution() {
-        let local = link_local_stack()
-            .ipv6_link_local_address()
-            .expect("link-local address");
-        let target_option = link_layer_option(2, PEER_MAC);
-        let advertisement = |flags: u8, mac: EthernetAddress| TestNeighborMessage {
-            source_mac: mac,
-            source: LINK_LOCAL_PEER,
-            destination: local,
-            hop_limit: 255,
-            kind: NA,
-            code: 0,
-            flags,
-            target: LINK_LOCAL_PEER,
-            options: &target_option,
-        };
-        let pending_stack = || {
-            let mut stack = link_local_stack();
+        // Each phase builds its own stack in its own frame: a `Stack` is
+        // too large for one frame to hold several.
+        fn local_address() -> Ipv6Address {
+            link_local_stack()
+                .ipv6_link_local_address()
+                .expect("link-local address")
+        }
+        fn advertisement<'a>(
+            local: Ipv6Address,
+            target_option: &'a [u8],
+            flags: u8,
+            mac: EthernetAddress,
+        ) -> TestNeighborMessage<'a> {
+            TestNeighborMessage {
+                source_mac: mac,
+                source: LINK_LOCAL_PEER,
+                destination: local,
+                hop_limit: 255,
+                kind: NA,
+                code: 0,
+                flags,
+                target: LINK_LOCAL_PEER,
+                options: target_option,
+            }
+        }
+        fn make_pending(stack: &mut Stack, local: Ipv6Address) {
             stack
                 .queue_ndp_solicitation(local, LINK_LOCAL_PEER, StackInstant::from_nanos(1))
                 .expect("the solicitation should be queued");
             while stack.take_event().is_some() {}
-            stack
-        };
-
-        let mut stack = link_local_stack();
-        assert!(
-            !offer_neighbor_message(
-                &mut stack,
-                advertisement(NA_SOLICITED | NA_OVERRIDE, PEER_MAC),
-                5
-            ),
-            "nothing pending: the answer is refused"
-        );
-        assert_eq!(stack.neighbors().count(), 0, "nothing pending: no entry");
-
-        let known = NeighborEntry {
-            ip: IpAddress::Ipv6(LINK_LOCAL_PEER),
-            mac: SECOND_MAC,
-            state: NeighborState::Reachable,
-            updated_at: StackInstant::from_nanos(0),
-        };
-        stack.learn_neighbor(known);
-        while stack.take_event().is_some() {}
-        assert!(
-            !offer_neighbor_message(
-                &mut stack,
-                advertisement(NA_SOLICITED | NA_OVERRIDE, PEER_MAC),
-                5
-            ),
-            "an entry without a pending resolution is not the answer's to update"
-        );
-        assert_eq!(cached(&stack, LINK_LOCAL_PEER), Some(known));
-        assert!(stack.take_event().is_none(), "nothing is reported");
-
-        let mut stack = pending_stack();
-        assert!(
-            offer_neighbor_message(
-                &mut stack,
-                advertisement(NA_SOLICITED | NA_OVERRIDE, PEER_MAC),
-                5
-            ),
-            "a pending resolution takes the answer"
-        );
-        assert_eq!(
-            cached(&stack, LINK_LOCAL_PEER).map(|entry| (entry.mac, entry.state)),
-            Some((PEER_MAC, NeighborState::Reachable))
-        );
-        assert!(
-            !stack
-                .pending_resolutions
-                .contains(IpAddress::Ipv6(LINK_LOCAL_PEER)),
-            "the record is gone"
-        );
-        let mut updates = 0;
-        while let Some(event) = stack.take_event() {
-            if matches!(event, StackEvent::NeighborUpdated(_)) {
-                updates += 1;
-            }
         }
-        assert_eq!(updates, 1, "one neighbor update is reported");
 
-        let mut stack = pending_stack();
-        assert!(offer_neighbor_message(
-            &mut stack,
-            advertisement(NA_OVERRIDE, PEER_MAC),
-            5
-        ));
-        assert_eq!(
-            cached(&stack, LINK_LOCAL_PEER).map(|entry| (entry.mac, entry.state)),
-            Some((PEER_MAC, NeighborState::Stale)),
-            "without the solicited flag the address is not yet confirmed"
-        );
+        let local = local_address();
+        let target_option = link_layer_option(2, PEER_MAC);
+        refused_without_a_pending_resolution(local, &target_option);
+        takes_the_solicited_answer(local, &target_option);
+        leaves_an_unsolicited_answer_stale(local, &target_option);
+
+        fn refused_without_a_pending_resolution(local: Ipv6Address, target_option: &[u8]) {
+            let mut stack = link_local_stack();
+            assert!(
+                !offer_neighbor_message(
+                    &mut stack,
+                    advertisement(local, target_option, NA_SOLICITED | NA_OVERRIDE, PEER_MAC),
+                    5
+                ),
+                "nothing pending: the answer is refused"
+            );
+            assert_eq!(stack.neighbors().count(), 0, "nothing pending: no entry");
+
+            let known = NeighborEntry {
+                ip: IpAddress::Ipv6(LINK_LOCAL_PEER),
+                mac: SECOND_MAC,
+                state: NeighborState::Reachable,
+                updated_at: StackInstant::from_nanos(0),
+            };
+            stack.learn_neighbor(known);
+            while stack.take_event().is_some() {}
+            assert!(
+                !offer_neighbor_message(
+                    &mut stack,
+                    advertisement(local, target_option, NA_SOLICITED | NA_OVERRIDE, PEER_MAC),
+                    5
+                ),
+                "an entry without a pending resolution is not the answer's to update"
+            );
+            assert_eq!(cached(&stack, LINK_LOCAL_PEER), Some(known));
+            assert!(stack.take_event().is_none(), "nothing is reported");
+        }
+
+        fn takes_the_solicited_answer(local: Ipv6Address, target_option: &[u8]) {
+            let mut stack = link_local_stack();
+            make_pending(&mut stack, local);
+            assert!(
+                offer_neighbor_message(
+                    &mut stack,
+                    advertisement(local, target_option, NA_SOLICITED | NA_OVERRIDE, PEER_MAC),
+                    5
+                ),
+                "a pending resolution takes the answer"
+            );
+            assert_eq!(
+                cached(&stack, LINK_LOCAL_PEER).map(|entry| (entry.mac, entry.state)),
+                Some((PEER_MAC, NeighborState::Reachable))
+            );
+            assert!(
+                !stack
+                    .pending_resolutions
+                    .contains(IpAddress::Ipv6(LINK_LOCAL_PEER)),
+                "the record is gone"
+            );
+            let mut updates = 0;
+            while let Some(event) = stack.take_event() {
+                if matches!(event, StackEvent::NeighborUpdated(_)) {
+                    updates += 1;
+                }
+            }
+            assert_eq!(updates, 1, "one neighbor update is reported");
+        }
+
+        fn leaves_an_unsolicited_answer_stale(local: Ipv6Address, target_option: &[u8]) {
+            let mut stack = link_local_stack();
+            make_pending(&mut stack, local);
+            assert!(offer_neighbor_message(
+                &mut stack,
+                advertisement(local, target_option, NA_OVERRIDE, PEER_MAC),
+                5
+            ));
+            assert_eq!(
+                cached(&stack, LINK_LOCAL_PEER).map(|entry| (entry.mac, entry.state)),
+                Some((PEER_MAC, NeighborState::Stale)),
+                "without the solicited flag the address is not yet confirmed"
+            );
+        }
     }
 
     /// Asking for one address does not make a stack take another stack's
@@ -19697,9 +19719,12 @@ mod tests {
         (frame, offset)
     }
 
+    const IPV4_TEST_LOCAL: Ipv4Address = Ipv4Address::new([192, 0, 2, 10]);
+    const IPV4_TEST_PEER: Ipv4Address = Ipv4Address::new([192, 0, 2, 20]);
+
     fn ipv4_test_stack() -> (Stack, Ipv4Address, Ipv4Address) {
-        let local = Ipv4Address::new([192, 0, 2, 10]);
-        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let local = IPV4_TEST_LOCAL;
+        let peer = IPV4_TEST_PEER;
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
@@ -19822,31 +19847,41 @@ mod tests {
     fn an_echo_reply_that_would_exceed_the_interface_mtu_is_dropped() {
         // A 600-octet interface frame holds an IPv4 echo reply of 558
         // data octets and an IPv6 one of 538.
+        // Each family builds its own stack in its own frame: a `Stack` is
+        // too large for one frame to hold several.
         let config = StackConfig::new(LOCAL_MAC, 600, TEST_ISN_SECRET);
-        let (_, local, peer) = ipv4_test_stack();
-        let mut stack = Stack::new(config);
-        stack
-            .add_ipv4_address(Ipv4Cidr::new(local, 24))
-            .expect("test address should be accepted");
-        for (payload_len, answered) in [(558, true), (559, false)] {
-            let (frame, len) = ipv4_echo_frame(peer, local, &vec![0xa5; payload_len]);
+        ipv4_echo_replies_are_bounded_by_the_mtu(config);
+        ipv6_echo_replies_are_bounded_by_the_mtu(config);
+
+        fn ipv4_echo_replies_are_bounded_by_the_mtu(config: StackConfig) {
+            let (local, peer) = (IPV4_TEST_LOCAL, IPV4_TEST_PEER);
+            let mut stack = Stack::new(config);
             stack
-                .receive_frame(&frame[..len], StackInstant::from_nanos(1))
-                .expect("echo request should be handled");
-            assert_eq!(stack.take_outbound().is_some(), answered, "{payload_len}");
+                .add_ipv4_address(Ipv4Cidr::new(local, 24))
+                .expect("test address should be accepted");
+            for (payload_len, answered) in [(558, true), (559, false)] {
+                let (frame, len) = ipv4_echo_frame(peer, local, &vec![0xa5; payload_len]);
+                stack
+                    .receive_frame(&frame[..len], StackInstant::from_nanos(1))
+                    .expect("echo request should be handled");
+                assert_eq!(stack.take_outbound().is_some(), answered, "{payload_len}");
+            }
         }
 
-        let mut stack = Stack::new(config);
-        stack
-            .configure_ipv6_link_local()
-            .expect("link-local address should be accepted");
-        let local = stack.ipv6_link_local_address().expect("link-local address");
-        for (payload_len, answered) in [(538, true), (539, false)] {
-            let (frame, len) = ipv6_echo_frame(LINK_LOCAL_PEER, local, &vec![0xa5; payload_len]);
+        fn ipv6_echo_replies_are_bounded_by_the_mtu(config: StackConfig) {
+            let mut stack = Stack::new(config);
             stack
-                .receive_frame(&frame[..len], StackInstant::from_nanos(1))
-                .expect("echo request should be handled");
-            assert_eq!(stack.take_outbound().is_some(), answered, "{payload_len}");
+                .configure_ipv6_link_local()
+                .expect("link-local address should be accepted");
+            let local = stack.ipv6_link_local_address().expect("link-local address");
+            for (payload_len, answered) in [(538, true), (539, false)] {
+                let (frame, len) =
+                    ipv6_echo_frame(LINK_LOCAL_PEER, local, &vec![0xa5; payload_len]);
+                stack
+                    .receive_frame(&frame[..len], StackInstant::from_nanos(1))
+                    .expect("echo request should be handled");
+                assert_eq!(stack.take_outbound().is_some(), answered, "{payload_len}");
+            }
         }
     }
 
@@ -20109,43 +20144,52 @@ mod tests {
 
     #[test]
     fn no_echo_reply_answers_a_source_that_is_not_one_host_or_a_group_frame() {
-        let (mut stack, local, peer) = ipv4_test_stack();
-        for source in [
-            Ipv4Address::UNSPECIFIED,
-            Ipv4Address::BROADCAST,
-            Ipv4Address::new([192, 0, 2, 255]),
-            Ipv4Address::new([224, 0, 0, 5]),
-            Ipv4Address::new([127, 0, 0, 1]),
-            Ipv4Address::new([240, 0, 0, 1]),
-        ] {
-            let (frame, len) = ipv4_echo_frame(source, local, b"ping");
-            assert_eq!(answers_to(&mut stack, &frame[..len], 1), 0, "{source:?}");
-        }
-        let (mut frame, len) = ipv4_echo_frame(peer, local, b"ping");
-        frame[..6].fill(0xff);
-        assert_eq!(
-            answers_to(&mut stack, &frame[..len], 1),
-            0,
-            "link-layer broadcast"
-        );
+        // Each family builds its own stack in its own frame: a `Stack` is
+        // too large for one frame to hold several.
+        ipv4_sources_are_not_answered();
+        ipv6_sources_are_not_answered();
 
-        let mut stack = link_local_stack();
-        let local = stack.ipv6_link_local_address().expect("link-local address");
-        for source in [
-            Ipv6Address::UNSPECIFIED,
-            Ipv6Address::LOOPBACK,
-            Ipv6Address::ALL_NODES_LINK_LOCAL,
-        ] {
-            let (frame, len) = ipv6_echo_frame(source, local, b"ping");
-            assert_eq!(answers_to(&mut stack, &frame[..len], 1), 0, "{source:?}");
+        fn ipv4_sources_are_not_answered() {
+            let (mut stack, local, peer) = ipv4_test_stack();
+            for source in [
+                Ipv4Address::UNSPECIFIED,
+                Ipv4Address::BROADCAST,
+                Ipv4Address::new([192, 0, 2, 255]),
+                Ipv4Address::new([224, 0, 0, 5]),
+                Ipv4Address::new([127, 0, 0, 1]),
+                Ipv4Address::new([240, 0, 0, 1]),
+            ] {
+                let (frame, len) = ipv4_echo_frame(source, local, b"ping");
+                assert_eq!(answers_to(&mut stack, &frame[..len], 1), 0, "{source:?}");
+            }
+            let (mut frame, len) = ipv4_echo_frame(peer, local, b"ping");
+            frame[..6].fill(0xff);
+            assert_eq!(
+                answers_to(&mut stack, &frame[..len], 1),
+                0,
+                "link-layer broadcast"
+            );
         }
-        let (mut frame, len) = ipv6_echo_frame(LINK_LOCAL_PEER, local, b"ping");
-        frame[..6].copy_from_slice(&[0x33, 0x33, 0, 0, 0, 1]);
-        assert_eq!(
-            answers_to(&mut stack, &frame[..len], 1),
-            0,
-            "link-layer multicast"
-        );
+
+        fn ipv6_sources_are_not_answered() {
+            let mut stack = link_local_stack();
+            let local = stack.ipv6_link_local_address().expect("link-local address");
+            for source in [
+                Ipv6Address::UNSPECIFIED,
+                Ipv6Address::LOOPBACK,
+                Ipv6Address::ALL_NODES_LINK_LOCAL,
+            ] {
+                let (frame, len) = ipv6_echo_frame(source, local, b"ping");
+                assert_eq!(answers_to(&mut stack, &frame[..len], 1), 0, "{source:?}");
+            }
+            let (mut frame, len) = ipv6_echo_frame(LINK_LOCAL_PEER, local, b"ping");
+            frame[..6].copy_from_slice(&[0x33, 0x33, 0, 0, 0, 1]);
+            assert_eq!(
+                answers_to(&mut stack, &frame[..len], 1),
+                0,
+                "link-layer multicast"
+            );
+        }
     }
 
     #[test]
