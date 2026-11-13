@@ -510,3 +510,168 @@ fn fault_latency_counts_the_time_a_request_spent_queued() {
         "latency runs from the request to its completion, queue included"
     );
 }
+
+/// The checks a host call or a runtime copy makes, over the fake address
+/// space and the harness's swap service.
+fn residency(handle: &SwapHandle) -> GuestResidency {
+    GuestResidency {
+        hooks: &TEST_HOOKS,
+        // Leaked: a residency names its handle `'static`, as the machine's
+        // one swap handle is.
+        handle: Box::leak(Box::new(Once::initialized(handle.clone()))),
+    }
+}
+
+/// Stands in for a host call's copy: writes `byte` at the start of each
+/// page, and refuses to run while any of them is out.
+fn copy_into(pages: &[VirtAddr], byte: u8) {
+    with_space(|space| {
+        for page in pages {
+            match space.pages.get_mut(&page.raw()) {
+                Some(FakePage::Present(bytes)) => bytes[0] = byte,
+                _ => panic!("the copy ran while page {:#x} was out", page.raw()),
+            }
+        }
+    });
+}
+
+/// The issue's done-when case: a page a host call is about to write was
+/// evicted while its instance was idle. The call waits for the page
+/// rather than faulting outside a fiber, and completes, its write
+/// landing, once the page is back.
+#[test]
+fn a_host_call_writing_into_an_evicted_page_completes_once_it_is_back() {
+    let mut harness = Harness::new();
+    let head = harness.resident(1, 0x10);
+    let tail = harness.resident(2, 0x20);
+    harness.evict(tail).expect("evict the page the call writes");
+    let residency = residency(&harness.handle);
+
+    // Eight bytes either side of the page boundary.
+    let range = VirtRange::new(VirtAddr::new(tail.raw() - 8), 16);
+    let mut call = Box::pin(residency.with_present(range, || {
+        copy_into(&[head, tail], 0xee);
+        "written"
+    }));
+    assert!(
+        poll(&mut call).is_none(),
+        "the call waits for the page instead of touching it"
+    );
+    assert!(
+        harness.index_of(tail).is_some(),
+        "nothing has read the page back yet"
+    );
+
+    harness.serve();
+    assert_eq!(poll(&mut call), Some(Ok("written")));
+    let mut expected = pattern(0x20);
+    expected[0] = 0xee;
+    assert_eq!(
+        harness.contents(tail),
+        expected,
+        "the page came back with its bytes, and the call's write landed on it"
+    );
+}
+
+/// A page brought back for one check may be taken again before the
+/// waiter is next polled; the access runs only after a check that finds
+/// every page present, in its own poll.
+#[test]
+fn a_page_taken_again_before_the_access_runs_is_brought_back_again() {
+    let mut harness = Harness::new();
+    let page = harness.resident(1, 0x30);
+    harness.evict(page).expect("evict");
+    let residency = residency(&harness.handle);
+
+    let mut call = Box::pin(residency.with_present(VirtRange::new(page, PAGE), || {
+        copy_into(&[page], 0x31);
+    }));
+    assert!(poll(&mut call).is_none());
+    harness.serve();
+    // Back in, and out again before the waiter runs.
+    harness.evict(page).expect("evict again");
+    assert!(
+        poll(&mut call).is_none(),
+        "the re-check finds the page out and waits again"
+    );
+    harness.serve();
+    assert_eq!(poll(&mut call), Some(Ok(())));
+    assert_eq!(harness.contents(page)[0], 0x31);
+    assert_eq!(harness.handle.stats().pages_in, 2);
+}
+
+/// A page that cannot be read back fails the access, which never runs:
+/// the caller traps its guest rather than copying memory that is gone.
+#[test]
+fn a_page_that_cannot_come_back_fails_the_access_without_running_it() {
+    let mut harness = Harness::new();
+    let page = harness.resident(1, 0x40);
+    harness.evict(page).expect("evict");
+    harness.backend.fail_reads(1);
+    let residency = residency(&harness.handle);
+
+    let mut call = Box::pin(residency.with_present(VirtRange::new(page, PAGE), || {
+        panic!("the access ran over a page that never came back")
+    }));
+    assert!(poll(&mut call).is_none());
+    harness.serve();
+    assert_eq!(poll(&mut call), Some(Err(SwapFaultError::Backend)));
+}
+
+/// Before the swap device comes up nothing can have been swapped out, so
+/// an access runs at once without asking the address space anything.
+#[test]
+fn an_access_before_swap_comes_up_runs_at_once() {
+    let residency = GuestResidency {
+        hooks: &TEST_HOOKS,
+        handle: Box::leak(Box::new(Once::new())),
+    };
+    let mut call =
+        Box::pin(residency.with_present(VirtRange::new(VirtAddr::new(PAGE), PAGE), || "ran"));
+    assert_eq!(poll(&mut call), Some(Ok("ran")));
+}
+
+/// The stream path: a page of a guest's read buffer is swapped out when
+/// a host producer is about to deliver into it. The runtime asks the
+/// residency hook in the poll that would make the copy; the hook hands
+/// back the fault-in instead of letting the copy through, and once that
+/// has resolved the same check lets the delivery go ahead.
+#[cfg(feature = "wasmtime-runtime")]
+#[test]
+fn a_stream_delivery_into_an_evicted_read_buffer_waits_for_the_fault_in() {
+    use core::ptr::NonNull;
+
+    use wasmtime::component::GuestMemoryResidency;
+
+    use crate::wasmtime_adapter::residency::SwapResidencyHook;
+
+    let mut harness = Harness::new();
+    let buffer = harness.resident(3, 0x50);
+    let tail = harness.resident(4, 0x60);
+    harness
+        .evict(tail)
+        .expect("evict the second page of the read buffer");
+    let mut hook = SwapResidencyHook::new(residency(&harness.handle));
+
+    // The guest's read buffer as the runtime names it: host addresses,
+    // two pages long. The fake address space is never dereferenced.
+    let read_buffer = NonNull::slice_from_raw_parts(
+        NonNull::new(buffer.raw() as *mut u8).expect("a page is never at address zero"),
+        2 * PAGE,
+    );
+    let mut wait = Box::pin(
+        hook.wait_until_resident(read_buffer)
+            .expect("a page of the read buffer is out, so the delivery must wait"),
+    );
+    assert!(
+        poll(&mut wait).is_none(),
+        "the fault-in waits for the device"
+    );
+    harness.serve();
+    assert_eq!(poll(&mut wait), Some(Ok(())));
+    assert!(
+        hook.wait_until_resident(read_buffer).is_none(),
+        "every page of the buffer is back, so the delivery goes ahead in this poll"
+    );
+    assert_eq!(harness.contents(tail), pattern(0x60));
+}

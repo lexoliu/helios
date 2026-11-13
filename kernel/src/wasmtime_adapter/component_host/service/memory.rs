@@ -1,4 +1,8 @@
+use helios_hal::vmm::{VirtAddr, VirtRange};
+use thiserror::Error;
+
 use super::*;
+use crate::memory::{GuestResidency, SwapFaultError};
 
 pub(super) struct Preview1IovLayout {
     pub(super) iovs: Preview1Iovs,
@@ -11,6 +15,130 @@ pub(super) struct Preview1IovLayout {
 pub(super) struct Preview1Memory {
     pub(super) base: usize,
     pub(super) len: usize,
+}
+
+/// A guest's linear memory as an async host function reaches it.
+///
+/// An async host function is polled inside its fiber's `block_on`, which
+/// holds the fiber's blocking context, so a swapped-out page it touched
+/// could not be faulted in where it stands. This type therefore offers no
+/// view of the memory that outlives a check: the only way to its bytes
+/// is [`Self::read`] or [`Self::write`], each of which finds every page
+/// of the range present and runs its synchronous closure in that same
+/// poll (`GuestResidency::with_present`). A copy after an await is a new
+/// call, with a check of its own.
+///
+/// What a synchronous host call holds is [`Preview1Memory`]: its fiber's
+/// blocking context is free, so a fault there is served in place.
+pub(super) struct Preview1AsyncMemory {
+    memory: Preview1Memory,
+    /// `None` on a machine that cannot swap, where every page is present.
+    residency: Option<GuestResidency>,
+}
+
+/// Why an async host function could not reach guest bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+pub(super) enum GuestAccessError {
+    /// The range is not inside the guest's linear memory: the guest's
+    /// mistake, answered with `EFAULT`.
+    #[error("the range is not inside the guest's linear memory")]
+    OutOfBounds,
+    /// A page of the range is gone and could not be read back: the
+    /// guest's memory is lost, and the guest traps.
+    #[error("a page of the range could not be swapped back in: {0}")]
+    Swap(#[from] SwapFaultError),
+}
+
+impl Preview1AsyncMemory {
+    pub(super) fn new(memory: Preview1Memory) -> Self {
+        Self {
+            memory,
+            residency: GuestResidency::installed(),
+        }
+    }
+
+    /// Runs `access` over the `len` guest bytes at `ptr` once they are
+    /// all present, in the poll that found them so.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the read half of the accessor; its first callers are the async host \
+                      calls of preview1 and WASIX net and proc, which still hold the raw view"
+        )
+    )]
+    pub(super) async fn read<R>(
+        &self,
+        ptr: GuestAddress,
+        len: usize,
+        access: impl FnOnce(&[u8]) -> R,
+    ) -> Result<R, GuestAccessError> {
+        let start = self.checked_host_address(ptr, len)?;
+        self.present(start, len, || {
+            // SAFETY: `checked_host_address` proved the range lies inside
+            // the guest's linear memory, which never moves or shrinks while
+            // the instance lives, and `present` runs this in the poll that
+            // found every page of it present.
+            access(unsafe { core::slice::from_raw_parts(start as *const u8, len) })
+        })
+        .await
+    }
+
+    /// Runs `access` over the `len` guest bytes at `ptr`, mutably, once
+    /// they are all present, in the poll that found them so.
+    pub(super) async fn write<R>(
+        &self,
+        ptr: GuestAddress,
+        len: usize,
+        access: impl FnOnce(&mut [u8]) -> R,
+    ) -> Result<R, GuestAccessError> {
+        let start = self.checked_host_address(ptr, len)?;
+        self.present(start, len, || {
+            // SAFETY: as in `read`; the guest is suspended in this host
+            // call, so nothing else on its store touches the range while
+            // the closure runs.
+            access(unsafe { core::slice::from_raw_parts_mut(start as *mut u8, len) })
+        })
+        .await
+    }
+
+    /// The host address of the `len` guest bytes at `ptr`, or
+    /// [`GuestAccessError::OutOfBounds`].
+    fn checked_host_address(
+        &self,
+        ptr: GuestAddress,
+        len: usize,
+    ) -> Result<usize, GuestAccessError> {
+        let start = p1_checked_guest_array(self.memory.len, ptr, len, 1)
+            .map_err(|_| GuestAccessError::OutOfBounds)?;
+        Ok(self.memory.base + start)
+    }
+
+    async fn present<R>(
+        &self,
+        start: usize,
+        len: usize,
+        access: impl FnOnce() -> R,
+    ) -> Result<R, GuestAccessError> {
+        match &self.residency {
+            Some(residency) => Ok(residency
+                .with_present(VirtRange::new(VirtAddr::new(start), len), access)
+                .await?),
+            None => Ok(access()),
+        }
+    }
+}
+
+/// The caller's linear memory, as an async host function reaches it.
+pub(super) fn p1_async_memory<CpuImpl, Net, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+) -> Option<Preview1AsyncMemory>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    HostFs: crate::HostFileSystem,
+{
+    p1_memory(caller).map(Preview1AsyncMemory::new)
 }
 
 /// The most guest bytes one host call holds in kernel memory at once when
@@ -651,4 +779,77 @@ pub(super) fn p1_write_iovs_from_bytes<T>(
         Err(_) => return p1::errno::OVERFLOW,
     };
     p1_write_u32(caller, memory, written_out, copied)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A guest memory of `len` bytes, backed by `backing`, on a machine
+    /// that cannot swap. What the accessor does once pages go missing is
+    /// `GuestResidency::with_present`'s, tested with the swap service.
+    fn memory_over(backing: &mut [u8]) -> Preview1AsyncMemory {
+        Preview1AsyncMemory {
+            memory: Preview1Memory {
+                base: backing.as_mut_ptr() as usize,
+                len: backing.len(),
+            },
+            residency: None,
+        }
+    }
+
+    fn run<F: Future>(future: F) -> F::Output {
+        futures_lite::future::block_on(future)
+    }
+
+    #[test]
+    fn a_write_lands_on_exactly_the_bytes_it_names() {
+        let mut backing = vec![0_u8; 64];
+        let memory = memory_over(&mut backing);
+        run(memory.write(GuestAddress::wasm32(8), 4, |bytes| {
+            bytes.copy_from_slice(&0xdead_beef_u32.to_le_bytes())
+        }))
+        .expect("in bounds");
+        let mut expected = vec![0_u8; 64];
+        expected[8..12].copy_from_slice(&0xdead_beef_u32.to_le_bytes());
+        assert_eq!(backing, expected);
+    }
+
+    #[test]
+    fn a_read_sees_the_bytes_it_names() {
+        let mut backing: Vec<u8> = (0..64).collect();
+        let memory = memory_over(&mut backing);
+        let seen =
+            run(memory.read(GuestAddress::wasm32(60), 4, <[u8]>::to_vec)).expect("in bounds");
+        assert_eq!(seen, [60, 61, 62, 63]);
+    }
+
+    /// A range that runs past the end of linear memory is the guest's
+    /// mistake, and the closure never sees any of it.
+    #[test]
+    fn a_range_past_the_end_is_refused_before_anything_is_touched() {
+        let mut backing = vec![0_u8; 64];
+        let memory = memory_over(&mut backing);
+        let mut ran = false;
+        assert_eq!(
+            run(memory.write(GuestAddress::wasm32(61), 4, |_| ran = true)),
+            Err(GuestAccessError::OutOfBounds)
+        );
+        assert_eq!(
+            run(memory.read(GuestAddress::wasm32(u32::MAX), 2, |_| ())),
+            Err(GuestAccessError::OutOfBounds)
+        );
+        assert!(!ran, "an out-of-bounds access never reaches its closure");
+        assert_eq!(backing, vec![0_u8; 64]);
+    }
+
+    #[test]
+    fn an_empty_range_at_the_end_is_in_bounds() {
+        let mut backing = vec![0_u8; 64];
+        let memory = memory_over(&mut backing);
+        assert_eq!(
+            run(memory.read(GuestAddress::wasm32(64), 0, <[u8]>::len)),
+            Ok(0)
+        );
+    }
 }
