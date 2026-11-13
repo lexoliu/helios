@@ -163,11 +163,11 @@ jobs:
             | map(select(.value.command and (.key as $name | $lanes | index($name))))
             | map({name: .key, command: .value.command,
                    "rust-cache": (.value["rust-cache"] // false)})' .github/ci-lanes.json)"
-          # `release` for the lanes that boot optimised kernels, `debug`
-          # for the two that boot debug ones.
-          wasm_profiles="$(jq -c '
-            [(if any(.[]; IN("smoke-x86-64", "smoke-riscv64", "smoke-aarch64")) then "release" else empty end),
-             (if any(.[]; IN("smoke-aarch64-cfi", "smoke-x86-64-venus")) then "debug" else empty end)]' <<< "${lanes}")"
+          # The guest-wasm profile each selected lane boots, as its entry
+          # states it: what `wasm-programs` builds and the lane's
+          # `prebuilt-wasm` step waits for.
+          wasm_profiles="$(jq -c --argjson lanes "${lanes}" '
+            [$lanes[] as $name | .[$name]["guest-wasm"] // empty] | unique' .github/ci-lanes.json)"
           {
             echo "wasm_profiles=${wasm_profiles}"
             echo "lanes=${lanes}"
@@ -584,6 +584,33 @@ jobs:
             shell -c 'echo ok' > vsock-smoke.out
           cat vsock-smoke.out
           grep -Fqx ok vsock-smoke.out
+      - name: Boot riscv64 guest on two NUMA nodes
+        timeout-minutes: 5
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          # Every other boot describes one node, so nothing else reads
+          # `numa-node-id` or the distance map from a real device tree
+          # (#516). The kernel prints the layout it placed memory and
+          # processors by; the log carries colour escapes, hence `-a`.
+          # The RPC rides vsock here because the boot UART carries the
+          # kernel log only when the debugger does not need the line.
+          set -o pipefail
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/numa"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
+            --accel tcg --smp 4 --numa-nodes 2 --numa-distance 20 \
+            --rpc-transport vsock \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger --no-compiler-plugin \
+            shell -c 'echo ok' 2>&1 > boot-numa.out | tee "$runtime/inspector.log"
+          cat boot-numa.out
+          grep -Fqx ok boot-numa.out
+          grep -aF 'NUMA topology nodes=2 distances=10,20;20,10' "$runtime/debug-serial.log"
+          grep -aF 'NUMA node node=0' "$runtime/debug-serial.log" | grep -aF 'processors=0-1'
+          grep -aF 'NUMA node node=1' "$runtime/debug-serial.log" | grep -aF 'processors=2-3'
       - name: Fetch over virtio-net with curl
         timeout-minutes: 5
         shell: bash
@@ -845,6 +872,56 @@ jobs:
           # proves the walk still sees a real device rather than
           # nothing.
           grep -F 'device grant published device=pl061@9030000' "$runtime/inspector.log"
+      - name: Boot aarch64 guest on two NUMA nodes from the device tree
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+          HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          # Every other boot describes one node, so nothing else reads
+          # `numa-node-id` or the distance map from a real device tree
+          # (#516). The kernel prints the layout it placed memory and
+          # processors by; the log carries colour escapes, hence `-a`.
+          set -o pipefail
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/numa"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G \
+            --accel tcg --smp 4 --numa-nodes 2 --numa-distance 20 \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger --no-compiler-plugin \
+            shell -c 'echo ok' 2>&1 > boot-numa.out | tee "$runtime/inspector.log"
+          cat boot-numa.out
+          grep -Fqx ok boot-numa.out
+          grep -aF 'NUMA topology nodes=2 distances=10,20;20,10' "$runtime/debug-serial.log"
+          grep -aF 'NUMA node node=0' "$runtime/debug-serial.log" | grep -aF 'processors=0-1'
+          grep -aF 'NUMA node node=1' "$runtime/debug-serial.log" | grep -aF 'processors=2-3'
+      - name: Boot aarch64 guest on two NUMA nodes from ACPI
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+          HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          # The same machine as the boot above, described by the SRAT, the
+          # SLIT and the MADT's GICC entries instead of `numa-node-id` and
+          # the distance map (#516).
+          set -o pipefail
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/acpi-numa"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G --acpi \
+            --accel tcg --smp 4 --numa-nodes 2 --numa-distance 20 \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger --no-compiler-plugin \
+            shell -c 'echo ok' 2>&1 > boot-acpi-numa.out | tee "$runtime/inspector.log"
+          cat boot-acpi-numa.out
+          grep -Fqx ok boot-acpi-numa.out
+          grep -F 'platform described by acpi' "$runtime/inspector.log"
+          grep -aF 'NUMA topology nodes=2 distances=10,20;20,10' "$runtime/debug-serial.log"
+          grep -aF 'NUMA node node=0' "$runtime/debug-serial.log" | grep -aF 'processors=0-1'
+          grep -aF 'NUMA node node=1' "$runtime/debug-serial.log" | grep -aF 'processors=2-3'
       # The same guest under the same accelerator as the device-tree
       # boot above, described the other way. ACPI carries no counterpart
       # to `/chosen/rng-seed`, so this boot's seed comes from the CPU's
@@ -1383,6 +1460,30 @@ jobs:
           # The inspector attaches `vmgenid` on the x86 profile, so the
           # guest has to have found its generation ID window (#572).
           grep -aF 'vmgenid online' "$runtime/debug-serial.log"
+      - name: Boot x86-64 guest on two NUMA nodes
+        timeout-minutes: 5
+        shell: bash
+        working-directory: helios
+        run: |
+          # Every other boot describes one node, so nothing else reads the
+          # SRAT or the SLIT from real ACPI tables (#516). `-smp
+          # 4,sockets=2,cores=2` gives processors 0-3 APIC ids 0-3 in MADT
+          # order, and `-numa node,cpus=` puts 0-1 on node 0 and 2-3 on
+          # node 1. The kernel prints the layout it placed memory and
+          # processors by; the log carries colour escapes, hence `-a`.
+          set -o pipefail
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/numa"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            --accel kvm --smp 4 --numa-nodes 2 --numa-distance 20 \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger --no-compiler-plugin \
+            shell -c 'echo ok' 2>&1 > boot-numa.out | tee "$runtime/inspector.log"
+          cat boot-numa.out
+          grep -Fqx ok boot-numa.out
+          grep -aF 'NUMA topology nodes=2 distances=10,20;20,10' "$runtime/debug-serial.log"
+          grep -aF 'NUMA node node=0' "$runtime/debug-serial.log" | grep -aF 'processors=0-1'
+          grep -aF 'NUMA node node=1' "$runtime/debug-serial.log" | grep -aF 'processors=2-3'
       - uses: ./helios/.github/actions/swtpm
       # The kernel's signing seed is sealed in the TPM to the measured
       # boot chain (#602). Two boots of one payload on one TPM state
@@ -1485,6 +1586,8 @@ jobs:
           # shell's own stdout still works after that redirection (#904).
           runtime="$GITHUB_WORKSPACE/smoke-runtime/coreutils"
           mkdir -p "$runtime"
+          # The single-quoted -c argument is the guest dash's command line; $(date) must reach dash unexpanded, so the host shell must not expand it.
+          # shellcheck disable=SC2016
           ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
             --accel kvm \
             --runtime-dir "$runtime" --keep-runtime-dir \
@@ -2371,6 +2474,7 @@ jobs:
       actions: read
     timeout-minutes: 60
     env:
+      HELIOS_PREBUILT_WASM: ${{ github.workspace }}/helios/target/wasm-programs
       HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
       HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
       HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
@@ -2385,7 +2489,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libudev-dev just cmake ninja-build erofs-utils \
-            qemu-system-x86 ovmf swtpm
+            qemu-system-x86 ovmf swtpm socat
           qemu-system-x86_64 --version
           if [ -e /dev/kvm ]; then
             sudo chmod 666 /dev/kvm
@@ -2439,6 +2543,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: cargo run --release -p helios-cli -- profile-fetch --run "${{ github.run_id }}"
+      - uses: ./helios/.github/actions/prebuilt-wasm
+        with:
+          profile: release
+          path: helios/target/wasm-programs/release
       - name: Take a processor offline and back under load
         timeout-minutes: 30
         shell: bash
@@ -2452,6 +2560,24 @@ jobs:
         with:
           name: smoke-x86-64-cpu-lifecycle-runtime
           path: smoke-runtime/cpu-lifecycle
+          if-no-files-found: ignore
+          retention-days: 14
+      # `-smp 2,maxcpus=4`: QMP `device_add` brings a vCPU online through
+      # SCI, GPE and AML Notify and `device_del` releases it, without a
+      # reboot (#497).
+      - name: Hot-add and hot-remove a vCPU through ACPI
+        timeout-minutes: 30
+        shell: bash
+        working-directory: helios
+        run: |
+          tools/cpu-lifecycle/hotplug.sh ./target/release/helios-inspector \
+            "$GITHUB_WORKSPACE/smoke-runtime/cpu-hotplug"
+      - name: Upload the hotplug runtime directory
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-x86-64-cpu-hotplug-runtime
+          path: smoke-runtime/cpu-hotplug
           if-no-files-found: ignore
           retention-days: 14
       # The same multi-queue tap the benchmark lane provisions: only a

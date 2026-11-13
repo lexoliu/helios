@@ -7,6 +7,7 @@ use divan::counter::ItemsCount;
 use divan::{AllocProfiler, Bencher, black_box};
 use helios_hal::cpu::{Cpu, HardwarePerfCounters, Instant, ProcessorId, Timebase, TimerInterrupt};
 use helios_hal::fs::FileRights;
+use helios_hal::numa::{NodeId, SingleNode};
 use helios_hal::resource::KernelResource;
 use helios_hal::watchdog::ProgressCounter;
 use helios_kernel::SocketReadiness;
@@ -14,10 +15,10 @@ use helios_kernel::{
     ComponentNetworkService, DescriptorId, DescriptorTable, DnsError, DnsErrorKind, Executor,
     FutexKey, FutexTable, GuestAddress, Ipv4Address, Ipv4Cidr, Ipv4Route, MacAddress,
     NetworkAdminBackend, NetworkBridgeRequest, NetworkControlError, NetworkErrorDetail,
-    NetworkIpAddress, NetworkPortId, Notify, PingError, PingErrorKind, PingReply,
+    NetworkIpAddress, NetworkPortId, NodeRun, Notify, PingError, PingErrorKind, PingReply,
     ProcessMemoryIdentity, RegisteredTcpReadBuffer, TcpAccepted, TcpError, TcpErrorKind,
     TcpListener, TcpReadInto, TcpReadProgress, TcpWriteProgress, TryRead, TryWrite, UdpBinding,
-    UdpDatagram, UdpError, UdpErrorKind, byte_channel,
+    UdpDatagram, UdpError, UdpErrorKind, UserMemoryPool, byte_channel,
 };
 use spin::{Mutex, Once};
 
@@ -80,6 +81,30 @@ impl helios_hal::critical_section::LocalInterruptMask for BenchInterruptMask {
 }
 
 helios_hal::critical_section::set_local_interrupt_mask_impl!(BenchInterruptMask);
+
+/// Processor 0's executor on the one-processor machine this bench
+/// models, which has no NUMA description. The pool is leaked over one
+/// naturally aligned host block: the kernel holds it for the machine's
+/// life, and the bench process is that.
+fn bench_executor() -> Executor {
+    const BLOCK_BYTES: usize = 64 << 20;
+    let layout =
+        core::alloc::Layout::from_size_align(BLOCK_BYTES, BLOCK_BYTES).expect("bench pool layout");
+    // SAFETY: a non-zero layout, leaked for the process's life.
+    let start = unsafe { alloc::alloc::alloc(layout) } as usize;
+    assert!(start != 0, "host allocation for the bench pool failed");
+    let runs = [NodeRun {
+        start,
+        end: start + BLOCK_BYTES,
+        node: NodeId::new(0),
+    }];
+    let pool = Box::leak(Box::new(UserMemoryPool::new(
+        &SingleNode::new(1),
+        ProcessorId::new(0),
+        &runs,
+    )));
+    Executor::new(ProgressCounter::new(), pool, ProcessorId::new(0))
+}
 
 #[divan::bench(args = [16usize, 64, 256])]
 fn descriptor_insert_close_reuse(bencher: Bencher, count: usize) {
@@ -341,7 +366,7 @@ fn drain_byte_channel(reader: helios_kernel::ByteReader, count: usize) {
 fn futex_prepare_complete_distinct_keys(bencher: Bencher, count: usize) {
     let memory = ProcessMemoryIdentity::new(1);
     bencher.counter(ItemsCount::new(count)).bench_local(|| {
-        let mut table = FutexTable::new();
+        let table = FutexTable::new();
         let mut registrations = [const { None }; 64];
         for (index, registration) in registrations.iter_mut().take(count).enumerate() {
             *registration = Some(table.prepare_wait(FutexKey::new(
@@ -355,16 +380,14 @@ fn futex_prepare_complete_distinct_keys(bencher: Bencher, count: usize) {
                     .notify(),
             );
         }
-        for registration in registrations.into_iter().take(count).flatten() {
-            table.complete_wait(registration);
-        }
+        // Dropping a registration completes it.
+        drop(registrations);
     });
 }
 
 #[divan::bench(args = [1usize, 64, 1024])]
 fn timer_sleep_future_create_drop(bencher: Bencher, count: usize) {
-    let timer =
-        Executor::new(ProgressCounter::new(), 1, ProcessorId::new(0)).timer(BenchCpu::new());
+    let timer = bench_executor().timer(BenchCpu::new());
     // Created-but-never-polled sleeps model timeout candidates that lose a
     // select/race before the executor parks the task. They must not allocate;
     // pending sleeps still allocate one timer state until the sleep-state pool
@@ -407,7 +430,7 @@ fn notify_coalesced_presignaled_future_wait(bencher: Bencher, count: usize) {
 
 #[divan::bench(args = [1usize, 64, 1024])]
 fn executor_spawn_detached_run_global(bencher: Bencher, count: usize) {
-    let executor = Executor::new(ProgressCounter::new(), 1, ProcessorId::new(0));
+    let executor = bench_executor();
     let spawner = executor.spawner(BenchCpu::new());
     let timer = executor.timer(BenchCpu::new());
     // Task allocation includes the scheduler capture stored by async-task. This
@@ -426,7 +449,7 @@ fn executor_spawn_detached_run_global(bencher: Bencher, count: usize) {
 
 #[divan::bench(args = [1usize, 64, 1024])]
 fn executor_spawn_detached_run_local(bencher: Bencher, count: usize) {
-    let executor = Executor::new(ProgressCounter::new(), 1, ProcessorId::new(0));
+    let executor = bench_executor();
     let spawner = executor.spawner(BenchCpu::new());
     let timer = executor.timer(BenchCpu::new());
     // Local tasks still carry owner-processor routing state, so the scheduler

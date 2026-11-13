@@ -112,7 +112,6 @@ fn build_engine_for_platform<P: Cpu + Clone>(
         crate::memory::install_fiber_stack_arena(
             budget.stacks as usize,
             COMPONENT_ASYNC_STACK_SIZE,
-            platform.processor_count(),
             crate::machine_memory().usable_bytes / FIBER_STACK_RETAIN_FRACTION,
         );
         config.with_host_stack(Arc::new(super::fiber_stack::ArenaStackCreator));

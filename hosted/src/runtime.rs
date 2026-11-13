@@ -9,6 +9,7 @@ use std::time::{Duration, Instant as StdInstant};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase};
 use helios_hal::memory::MemoryRegion;
+use helios_hal::numa::{NodeId, SingleNode};
 use helios_hal::{DeviceInventory, DmaModel, Platform, ProcessorStartupPolicy, ProcessorTopology};
 use helios_kernel::Timer;
 
@@ -428,15 +429,10 @@ impl HostedMachine {
             .unwrap_or_else(|_| panic!("processor {} thread was registered twice", processor.id()));
     }
 
-    pub(crate) fn bootstrap_memory_regions(
-        &self,
-        processor: ProcessorId,
-    ) -> core::iter::Once<MemoryRegion> {
-        if processor == self.bootstrap_processor {
-            core::iter::once(self.heap.as_memory_region())
-        } else {
-            core::iter::once(NonNull::from(&[] as &[u8]))
-        }
+    /// The memory the bootstrap processor primes the kernel with: the one
+    /// region the host reserved, on the only node the host machine has.
+    pub(crate) fn bootstrap_memory_regions(&self) -> core::iter::Once<MemoryRegion> {
+        core::iter::once(self.heap.as_memory_region())
     }
 
     fn now_ticks(&self) -> u64 {
@@ -468,12 +464,20 @@ fn spawn_processor_thread(
 
             let console = HostedConsole::new();
             let cpu = HostedCpu::new(processor, machine.clone());
-            let memory_regions = machine.bootstrap_memory_regions(processor);
+            if processor == machine.bootstrap_processor() {
+                // The host machine reports no NUMA description: one node
+                // holds every processor and all of the reserved heap.
+                helios_kernel::prime_bootstrap_allocator(
+                    machine.bootstrap_memory_regions(),
+                    &SingleNode::new(machine.processor_count()),
+                    processor,
+                );
+            }
             let mut devices = DeviceInventory::new().with_debug_serial();
             if config.init_wasi_root().is_some() {
                 devices = devices.with_host_share();
             }
-            let platform = Platform::new(console, memory_regions, cpu.clone())
+            let platform = Platform::new(console, cpu.clone())
                 .with_topology(
                     ProcessorTopology::start_all_secondaries(
                         machine.bootstrap_processor(),
@@ -615,7 +619,9 @@ impl HeapReservation {
     }
 
     fn as_memory_region(&self) -> MemoryRegion {
-        NonNull::from(self.backing.as_ref())
+        // SAFETY: the reservation is host memory nothing else touches, and
+        // the machine that owns it lives as long as the kernel runs.
+        unsafe { MemoryRegion::new(NonNull::from(self.backing.as_ref()), NodeId::FIRST) }
     }
 }
 

@@ -138,6 +138,15 @@ pub(crate) enum MonitorError {
     Abandoned { vcpu: u32, command: String },
 }
 
+/// Why a capture produced no report.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum VcpuStateError {
+    #[error("vCPU state not captured: {0}")]
+    Unavailable(#[from] CaptureUnavailable),
+    #[error("vCPU state not captured: {0}")]
+    Capture(#[from] CaptureError),
+}
+
 /// Why the vCPUs' instruction pointers could not be named.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SymbolizeError {
@@ -212,21 +221,26 @@ impl VcpuStateCapture {
     /// happens here, and a capture that could not be taken says why in
     /// the run log instead of in place of it.
     pub(crate) async fn record(&self, timeout: &WorkloadBenchError) {
-        let probe = match &self.probe {
-            Ok(probe) => probe.clone(),
-            Err(unavailable) => {
-                eprintln!("helios-inspector: vCPU state not captured: {unavailable}");
-                return;
-            }
-        };
+        let capture = self.clone();
         let trigger = timeout.to_string();
         // QMP is a blocking socket and the kernel image is tens of
         // megabytes; neither belongs on the executor thread.
-        let captured = blocking::unblock(move || probe.capture(&trigger)).await;
-        match captured {
-            Ok(report) => report.print(),
-            Err(error) => eprintln!("helios-inspector: vCPU state not captured: {error}"),
+        if let Err(error) = blocking::unblock(move || capture.capture_after(&trigger)).await {
+            eprintln!("helios-inspector: {error}");
         }
+    }
+
+    /// Captures every vCPU's state after `trigger`, appends the dumps to
+    /// `vcpu-state.log` and names in the run log what each vCPU was
+    /// executing.
+    ///
+    /// Blocking: QMP is a blocking socket. A caller that has nothing but
+    /// the capture to do, such as a check whose own wait on the guest
+    /// expired, takes the error as its answer.
+    pub(crate) fn capture_after(&self, trigger: &str) -> Result<(), VcpuStateError> {
+        let probe = self.probe.as_ref().map_err(Clone::clone)?;
+        probe.capture(trigger)?.print();
+        Ok(())
     }
 }
 
@@ -769,8 +783,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        CaptureUnavailable, RegisterDumpError, SymbolizeError, VcpuLine, VcpuRegisters,
-        VcpuStateCapture, kernel_virtual_base, parse_registers,
+        CaptureError, CaptureUnavailable, RegisterDumpError, SymbolizeError, VcpuLine,
+        VcpuRegisters, VcpuStateCapture, VcpuStateError, kernel_virtual_base, parse_registers,
     };
     use crate::vm::VmArch;
     use crate::workload_bench::{WorkloadBenchError, guest_step_under_deadline};
@@ -1025,6 +1039,45 @@ mod tests {
         assert!(
             !runtime.path().join(super::VCPU_STATE_LOG_NAME).exists(),
             "a capture that never reached QEMU writes no log"
+        );
+    }
+
+    /// A capture taken on request answers with why it could not be
+    /// taken, instead of only saying so in the run log.
+    #[test]
+    fn a_requested_capture_reports_why_it_failed() {
+        let runtime = tempfile::tempdir().expect("a scratch runtime directory");
+        let unreachable = VcpuStateCapture::new(
+            VmArch::X86_64,
+            Some(runtime.path().join("no-qemu-is-listening.sock")),
+            runtime.path(),
+            None,
+            runtime.path().join("kernel"),
+        );
+        let error = unreachable
+            .capture_after("a check's wait")
+            .expect_err("no QEMU answers the socket");
+        assert!(
+            matches!(error, VcpuStateError::Capture(CaptureError::Connect { .. })),
+            "an unreachable QMP socket is a connect failure, got {error}"
+        );
+
+        let riscv = VcpuStateCapture::new(
+            VmArch::Riscv64,
+            Some(runtime.path().join("qmp.sock")),
+            runtime.path(),
+            None,
+            runtime.path().join("kernel"),
+        );
+        let error = riscv
+            .capture_after("a check's wait")
+            .expect_err("the capture reads x86-64 state only");
+        assert!(
+            matches!(
+                error,
+                VcpuStateError::Unavailable(CaptureUnavailable::Architecture { .. })
+            ),
+            "a riscv64 guest is refused before QMP is spoken to, got {error}"
         );
     }
 }

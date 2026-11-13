@@ -10,13 +10,12 @@ extern crate alloc;
 
 use alloc::sync::Arc;
 use core::future::Future;
-use core::num::NonZeroU32;
 
 use fdt::Fdt;
 use helios_hal::io::IoError;
 use helios_kernel::{ExternalInterruptHandler, HardwareEntropySource};
 
-use crate::net::InterruptSourceId;
+use crate::net::PlicInterrupt;
 
 #[derive(Clone)]
 pub(crate) struct VirtioEntropyDevice {
@@ -24,9 +23,9 @@ pub(crate) struct VirtioEntropyDevice {
 }
 
 /// The entropy device the bootstrap hart brought up, together with the
-/// PLIC source the device tree routes it to.
+/// PLIC line the device tree routes it to.
 pub(crate) struct EntropyInterrupt {
-    pub(crate) source: InterruptSourceId,
+    pub(crate) line: PlicInterrupt,
     pub(crate) device: VirtioEntropyDevice,
 }
 
@@ -62,11 +61,11 @@ pub(crate) fn has_entropy_device(fdt: &Fdt<'_>) -> bool {
 /// reseed task that keeps reading it needs the seeded root and so comes
 /// after.
 pub(crate) fn bring_up(fdt: &Fdt<'_>) -> Option<EntropyInterrupt> {
-    let Some((device, source)) = discover_entropy_device(fdt) else {
+    let Some((device, line)) = discover_entropy_device(fdt) else {
         tracing::warn!("virtio entropy device was not discovered on the platform bus");
         return None;
     };
-    Some(EntropyInterrupt { source, device })
+    Some(EntropyInterrupt { line, device })
 }
 
 /// Hands the device to the kernel's reseed task.
@@ -78,20 +77,19 @@ pub(crate) fn install<WatchdogImpl>(
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
 {
     helios_kernel::install_entropy_device(kernel, root, entropy.device.clone());
-    tracing::info!("virtio entropy online irq={}", entropy.source.0.get());
+    tracing::info!("virtio entropy online irq={}", entropy.line.number());
 }
 
-fn discover_entropy_device(fdt: &Fdt<'_>) -> Option<(VirtioEntropyDevice, InterruptSourceId)> {
+fn discover_entropy_device(fdt: &Fdt<'_>) -> Option<(VirtioEntropyDevice, PlicInterrupt)> {
     let candidate = helios_virtio::mmio_candidates(fdt).find(|candidate| {
         crate::matches_virtio_mmio_device(candidate.base, helios_virtio::DeviceType::Entropy)
     })?;
     let base = candidate.base;
     let header = core::ptr::NonNull::new(base as *mut u8)
         .unwrap_or_else(|| panic!("virtio MMIO base {base:#x} was unexpectedly null"));
-    let source = candidate
+    let line = candidate
         .interrupt
-        .and_then(|interrupt| NonZeroU32::new(interrupt.number))
-        .map(InterruptSourceId)
+        .and_then(PlicInterrupt::from_specifier)
         .unwrap_or_else(|| panic!("virtio-rng node at {base:#x} has no valid interrupt source"));
     let device =
         unsafe { helios_virtio::rng_from_mmio(header, candidate.size) }.unwrap_or_else(|error| {
@@ -101,6 +99,6 @@ fn discover_entropy_device(fdt: &Fdt<'_>) -> Option<(VirtioEntropyDevice, Interr
         VirtioEntropyDevice {
             inner: Arc::new(device),
         },
-        source,
+        line,
     ))
 }

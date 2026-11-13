@@ -48,6 +48,8 @@ mod debug_state {
     }
 }
 
+use acpi::sdt::madt::Madt;
+use acpi::{AcpiTables, PhysicalMapping};
 use alloc::sync::Arc;
 use core::arch::asm;
 use core::arch::global_asm;
@@ -55,11 +57,15 @@ use core::arch::x86_64::{__cpuid, __cpuid_count, _rdrand64_step, _rdtsc};
 use core::ops::Range;
 use core::sync::atomic::{AtomicU8, Ordering, compiler_fence};
 use helios_artifact::{ProbeAnswers, cwasm_target_isa_levels};
-use helios_hal::boot::{BootMemoryMap, BootReservedRanges, usable_region_segments};
+use helios_firmware::{AcpiNuma, LocalApicKey, ProcessorIdentities};
+use helios_hal::boot::{
+    BootMemoryMap, BootReservedRanges, usable_node_regions, usable_region_segments,
+};
 use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase, TimerInterrupt, current_processor};
 use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
 use helios_hal::memory::MemoryRegion;
+use helios_hal::numa::NumaTopology;
 use helios_hal::serial::ByteSerial;
 use helios_hal::watchdog::Watchdog;
 use helios_hal::{
@@ -208,23 +214,32 @@ fn x86_kernel_main() -> ! {
         .tables
         .acpi_rsdp
         .unwrap_or_else(|| panic!("Limine handoff did not include an ACPI RSDP address"));
-    let processor_count = processor_count(rsdp_address, physical_memory_offset);
-    helios_kernel::prime_bootstrap_allocator(
+    // The MADT and the SRAT/SLIT are read in place before the bootstrap
+    // allocator is primed: the processor count and each processor's and
+    // each memory range's node size its per-processor and per-node
+    // structures.
+    // The processor count is the MADT's possible set, so a processor
+    // firmware hot-adds later was counted, and placed on its SRAT node,
+    // here.
+    let pre_heap_tables = pre_heap_acpi_tables(rsdp_address, physical_memory_offset);
+    let processors = MadtProcessors::new(&pre_heap_tables);
+    let processor_count = processors.processor_count();
+    let numa = AcpiNuma::new(&pre_heap_tables, processors, LocalApicKey)
+        .unwrap_or_else(|error| panic!("x86 NUMA discovery failed: {error}"));
+    let pool = helios_kernel::prime_bootstrap_allocator(
         boot_memory_regions(
             &handoff,
             physical_memory_offset,
             &reserved_ranges,
             Some(reserved_wakeup_page.clone()),
+            &numa,
         ),
-        processor_count,
+        &numa,
+        // `smp` numbers processors in MADT order, whose first entry is
+        // this one, the bootstrap processor.
+        ProcessorId::new(0),
     );
     let wakeup_page = (processor_count > 1).then_some(reserved_wakeup_page);
-    let memory_regions = boot_memory_regions(
-        &handoff,
-        physical_memory_offset,
-        &reserved_ranges,
-        wakeup_page.clone(),
-    );
     // The memory a confined device is allowed to reach is exactly what
     // the allocator was primed with, captured here while the boot
     // handoff is still in hand.
@@ -233,6 +248,7 @@ fn x86_kernel_main() -> ! {
         physical_memory_offset,
         &reserved_ranges,
         wakeup_page.clone(),
+        &numa,
     );
     let timebase = Timebase::new(detect_tsc_frequency_hz());
     let tsc_base = read_tsc();
@@ -252,12 +268,15 @@ fn x86_kernel_main() -> ! {
         .install_capture(smp::instruction_sample_capture(handoff.kernel.virtual_base));
     let boot = smp::build_boot_context(
         rsdp_address,
-        physical_memory_offset,
+        smp::PhysicalOffsetAcpiHandler {
+            physical_memory_offset,
+            tsc_base,
+            timebase,
+        },
         wakeup_page,
-        tsc_base,
-        timebase,
         debug_state.clone(),
         xcr0,
+        pool,
     );
     smp::activate_runtime(boot.bootstrap_runtime());
     // The local APIC is enabled once, here, and never re-attached on the
@@ -314,7 +333,7 @@ fn x86_kernel_main() -> ! {
         devices = devices.with_block_devices(block_functions.len());
     }
     let kernel = helios_kernel::init_with_watchdog(
-        Platform::with_watchdog(console, memory_regions, cpu.clone(), cpu.watchdog())
+        Platform::with_watchdog(console, cpu.clone(), cpu.watchdog())
             .with_topology(
                 ProcessorTopology::start_all_secondaries(
                     cpu.bootstrap_processor(),
@@ -713,28 +732,63 @@ fn install_pci_devices<WatchdogImpl, MeasuredBootImpl>(
     );
 }
 
-/// Counts the possible processors the MADT lists, present or not. Runs
-/// before the bootstrap allocator is primed (the count sizes the
-/// allocator's per-processor structures), so it must not allocate: it
-/// iterates the MADT entries directly.
-fn processor_count(rsdp_address: usize, physical_memory_offset: usize) -> usize {
-    use acpi::sdt::madt::Madt;
-
+/// The ACPI tables, opened before the bootstrap allocator is primed.
+/// Nothing read through them may allocate: MADT and SRAT entries are
+/// walked in place rather than collected into `AcpiPlatform`.
+fn pre_heap_acpi_tables(
+    rsdp_address: usize,
+    physical_memory_offset: usize,
+) -> AcpiTables<smp::PhysicalOffsetAcpiHandler> {
     let handler = smp::PhysicalOffsetAcpiHandler {
         physical_memory_offset,
         tsc_base: 0,
         timebase: Timebase::new(1),
     };
-    let tables =
-        unsafe { acpi::AcpiTables::from_rsdp(handler, rsdp_address) }.unwrap_or_else(|error| {
-            panic!("failed to parse ACPI tables for processor count: {error:?}")
-        });
-    let madt = tables
-        .find_table::<Madt>()
-        .unwrap_or_else(|| panic!("ACPI tables did not expose an MADT"));
-    let count = smp::possible_processors(madt.get()).count();
-    assert!(count > 0, "MADT did not list any possible processors");
-    count
+    unsafe { AcpiTables::from_rsdp(handler, rsdp_address) }
+        .unwrap_or_else(|error| panic!("failed to parse ACPI tables before the heap: {error:?}"))
+}
+
+/// Each possible processor's local APIC id, present or not
+/// ([`smp::possible_processors`]), in MADT entry order: the order `smp`
+/// numbers processors in, whose first entry is the bootstrap processor.
+/// The possible set, not the present one, sizes every per-processor and
+/// per-node structure, so a processor firmware hot-adds later already
+/// has its slot on the node the SRAT gives it. Read in place, so it
+/// answers before the heap exists.
+struct MadtProcessors {
+    madt: PhysicalMapping<smp::PhysicalOffsetAcpiHandler, Madt>,
+}
+
+impl MadtProcessors {
+    fn new(tables: &AcpiTables<smp::PhysicalOffsetAcpiHandler>) -> Self {
+        let madt = tables
+            .find_table::<Madt>()
+            .unwrap_or_else(|| panic!("ACPI tables did not expose an MADT"));
+        let processors = Self { madt };
+        assert!(
+            processors.apic_ids().next().is_some(),
+            "MADT did not list any possible processors"
+        );
+        processors
+    }
+
+    fn apic_ids(&self) -> impl Iterator<Item = u32> + '_ {
+        smp::possible_processors(self.madt.get()).map(|processor| processor.apic_id)
+    }
+}
+
+impl ProcessorIdentities for MadtProcessors {
+    fn processor_count(&self) -> usize {
+        self.apic_ids().count()
+    }
+
+    fn hardware_id(&self, processor: ProcessorId) -> u64 {
+        let index = usize::from(processor.id());
+        self.apic_ids()
+            .nth(index)
+            .map(u64::from)
+            .unwrap_or_else(|| panic!("the MADT names no possible processor {index}"))
+    }
 }
 
 fn boot_reserved_ranges(handoff: &boot::LimineBootHandoff) -> BootReservedRanges {
@@ -792,28 +846,23 @@ fn reserve_wakeup_page(
         .unwrap_or_else(|| panic!("failed to reserve a low-memory wakeup page for x86 AP startup"))
 }
 
-fn boot_memory_regions(
+/// The usable memory the kernel may own, each region on its node.
+fn boot_memory_regions<'n, Numa: NumaTopology>(
     handoff: &boot::LimineBootHandoff,
     physical_memory_offset: usize,
     reserved_ranges: &BootReservedRanges,
     excluded: Option<Range<usize>>,
-) -> impl IntoIterator<Item = MemoryRegion> {
+    numa: &'n Numa,
+) -> impl Iterator<Item = MemoryRegion> + use<'n, Numa> {
     let mut reserved_ranges = reserved_ranges.clone();
     if let Some(excluded) = excluded {
         reserved_ranges.reserve(excluded);
     }
     handoff.memory_map.regions().flat_map(move |region| {
-        usable_region_segments(region, &reserved_ranges)
-            .into_iter()
-            .flatten()
-            .map(move |segment| {
-                let start = segment.start + physical_memory_offset;
-                let len = segment.end - segment.start;
-                let slice = core::ptr::slice_from_raw_parts_mut(start as *mut u8, len);
-                core::ptr::NonNull::new(slice).unwrap_or_else(|| {
-                    panic!("usable memory segment had a null start: {segment:?}")
-                })
-            })
+        // SAFETY: Limine's usable entries are RAM nothing else owns, mapped
+        // in the higher-half direct map at `physical_memory_offset`, and
+        // the kernel image, modules and the wakeup page are reserved out.
+        unsafe { usable_node_regions(region, &reserved_ranges, physical_memory_offset, numa) }
     })
 }
 
@@ -822,19 +871,25 @@ fn boot_memory_regions(
 /// It is exactly what the bootstrap allocator was primed with: every
 /// buffer a driver hands to a device is a kernel heap allocation, so a
 /// domain that maps these runs reaches every buffer and nothing else.
-fn dma_capable_ranges(
+fn dma_capable_ranges<Numa: NumaTopology>(
     handoff: &boot::LimineBootHandoff,
     physical_memory_offset: usize,
     reserved_ranges: &BootReservedRanges,
     excluded: Option<Range<usize>>,
+    numa: &Numa,
 ) -> alloc::vec::Vec<helios_hal::iommu::PhysicalRange> {
-    boot_memory_regions(handoff, physical_memory_offset, reserved_ranges, excluded)
-        .into_iter()
-        .map(|region| {
-            let start = region.as_ptr().cast::<u8>() as usize - physical_memory_offset;
-            helios_hal::iommu::PhysicalRange::new(start as u64, region.len() as u64)
-        })
-        .collect()
+    boot_memory_regions(
+        handoff,
+        physical_memory_offset,
+        reserved_ranges,
+        excluded,
+        numa,
+    )
+    .map(|region| {
+        let start = region.start() - physical_memory_offset;
+        helios_hal::iommu::PhysicalRange::new(start as u64, region.len() as u64)
+    })
+    .collect()
 }
 
 /// The kernel console: every record is retained for the debugger and
@@ -1242,7 +1297,6 @@ extern "C" fn secondary_start_rust(
     let cpu = X86Cpu::new(boot.platform());
     let kernel = helios_kernel::init_with_watchdog(Platform::with_watchdog(
         console,
-        core::iter::empty::<MemoryRegion>(),
         cpu.clone(),
         cpu.watchdog(),
     ));

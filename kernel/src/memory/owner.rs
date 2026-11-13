@@ -16,18 +16,19 @@
 //!
 //! Concurrency contract: one cell per processor, written only by the
 //! processor it belongs to and read by the swap policy from wherever it
-//! runs, so the cells are relaxed atomics and never a lock. The table is
-//! sized once at boot, like the frame slab's shards; before it is sized,
-//! and on a processor that never entered a scope, the owner reads as
+//! runs, so the cells are relaxed atomics and never a lock. The cells
+//! are a [`PerProcessor`] table, each on its own cache line in memory of
+//! its processor's node, built once at boot; before it is built, and on
+//! a processor that never entered a scope, the owner reads as
 //! [`MemoryOwner::NONE`].
 
-extern crate alloc;
-
-use alloc::boxed::Box;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use helios_hal::cpu::ProcessorId;
 use spin::Once;
+
+use super::per_processor::PerProcessor;
+use super::user::UserMemoryPool;
 
 /// Which instance a committed page belongs to.
 ///
@@ -56,7 +57,7 @@ impl MemoryOwner {
 
 /// Per-processor "who is committing right now" cells.
 pub struct UserMemoryOwners {
-    processors: Once<Box<[AtomicU64]>>,
+    processors: Once<PerProcessor<AtomicU64>>,
 }
 
 impl UserMemoryOwners {
@@ -66,18 +67,15 @@ impl UserMemoryOwners {
         }
     }
 
-    /// Sizes the table. Called once, from the same place the user pool
-    /// learns its processor count.
-    pub fn configure_processors(&self, processor_count: usize) {
-        self.processors.call_once(|| {
-            (0..processor_count)
-                .map(|_| AtomicU64::new(MemoryOwner::NONE.raw()))
-                .collect()
-        });
+    /// Builds the table, one cell per processor of `pool`'s machine.
+    /// Called once, right after the pool is built.
+    pub fn configure_processors(&self, pool: &UserMemoryPool) {
+        self.processors
+            .call_once(|| PerProcessor::new(pool, |_, _| AtomicU64::new(MemoryOwner::NONE.raw())));
     }
 
     fn cell(&self, processor: ProcessorId) -> Option<&AtomicU64> {
-        self.processors.get()?.get(processor.id() as usize)
+        self.processors.get()?.try_get(processor)
     }
 
     /// The owner pages committed on `processor` are attributed to.
@@ -131,8 +129,8 @@ impl Drop for UserMemoryOwnerScope<'_> {
 /// component host writes it around the work it runs.
 static OWNERS: UserMemoryOwners = UserMemoryOwners::new();
 
-pub fn configure_user_memory_owner_processors(processor_count: usize) {
-    OWNERS.configure_processors(processor_count);
+pub fn configure_user_memory_owner_processors(pool: &UserMemoryPool) {
+    OWNERS.configure_processors(pool);
 }
 
 /// The owner a page committed on `processor` right now belongs to.
@@ -151,11 +149,12 @@ pub fn enter_user_memory_owner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::single_node_pool;
 
     #[test]
     fn scopes_nest_and_restore() {
         let owners = UserMemoryOwners::new();
-        owners.configure_processors(2);
+        owners.configure_processors(single_node_pool(2));
         let processor = ProcessorId::new(0);
         assert_eq!(owners.current(processor), MemoryOwner::NONE);
         {
@@ -173,7 +172,7 @@ mod tests {
     #[test]
     fn processors_do_not_share_an_owner() {
         let owners = UserMemoryOwners::new();
-        owners.configure_processors(2);
+        owners.configure_processors(single_node_pool(2));
         let _first = owners.enter(ProcessorId::new(0), MemoryOwner::new(1));
         assert_eq!(owners.current(ProcessorId::new(1)), MemoryOwner::NONE);
     }

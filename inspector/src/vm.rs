@@ -44,6 +44,7 @@ mod input;
 mod instruction_profile;
 mod kernel_image;
 mod network;
+mod numa;
 mod qemu;
 mod qmp;
 mod raw_profile;
@@ -58,11 +59,13 @@ use network::{
     HostPlatform, NetSetupCommand, NetTeardownCommand, QemuNetArgs, VmNetwork, VmNetworkArgs,
     VmNetworkError, VmNetworkFile, VmNetworkProfile, VmNetworkSetupError,
 };
+use numa::{NumaError, NumaMachine};
 use qemu::QemuOptions;
 use qmp::{QmpClient, QmpError, SizeError};
 use raw_profile::{ProfileCommand, RawProfileCollectError};
 use tpm::{Swtpm, SwtpmError, VmTpm, VmTpmBackend, VmTpmError, VmTpmProfile};
 pub(crate) use vcpu_state::VcpuStateCapture;
+use vcpu_state::VcpuStateError;
 
 /// Why a `vm` session did not run.
 ///
@@ -80,6 +83,8 @@ pub(crate) enum VmError {
     Build(#[from] VmBuildError),
     #[error("{0}")]
     Runtime(#[from] VmRuntimeError),
+    #[error("{0}")]
+    VcpuState(#[from] VcpuStateCommandError),
     /// A session that failed, with the runtime directory it left behind
     /// and QEMU's own account of the machine.
     ///
@@ -93,6 +98,30 @@ pub(crate) enum VmError {
         #[source]
         source: VmSessionError,
     },
+}
+
+/// Why `vm vcpu-state` could not reach the guest it was pointed at, or
+/// could not capture it.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum VcpuStateCommandError {
+    #[error(
+        "vcpu-state captures a running guest, and names it by the --runtime-dir its session \
+         keeps; none was given"
+    )]
+    NoRuntimeDir,
+    #[error(
+        "the runtime directory {runtime_dir} has no `{SOCKET_DIR_LINK_NAME}` link to the \
+         guest's sockets (is it a kept runtime directory of a running guest?): {source}"
+    )]
+    NoSocketDir {
+        runtime_dir: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("--qmp {endpoint} is not a `unix:<path>` socket the inspector can speak to")]
+    QmpNotUnix { endpoint: String },
+    #[error("{0}")]
+    Capture(#[from] VcpuStateError),
 }
 
 /// Why the flags, the config file and this host do not describe a VM
@@ -189,6 +218,8 @@ pub(crate) enum VmConfigError {
          virtio-iommu can only confine PCI endpoints"
     )]
     IommuUnavailable { arch: &'static str },
+    #[error("{0}")]
+    Numa(#[from] NumaError),
     #[error("{0}")]
     Network(#[from] VmNetworkError),
     #[error("{0}")]
@@ -1402,6 +1433,56 @@ impl ResolvedGuestRam {
     }
 }
 
+/// What a session's guest RAM is made of: the kind of `-object` and how
+/// it is populated. One backend carries it on an ordinary machine, and
+/// each node's backend on a NUMA machine.
+///
+/// A renderer session's RAM is a shared memfd: a guest blob reaches the
+/// host as a dmabuf QEMU builds out of the RAM block's file descriptor
+/// (`virtio_gpu_create_udmabuf` in `hw/display/virtio-gpu-udmabuf.c`,
+/// which gives up on a block with none), and a blob scanout of one needs
+/// that dmabuf. `--guest-ram prealloc` populates the backend before the
+/// first guest instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GuestRamBacking {
+    shared_memfd: bool,
+    guest_ram: ResolvedGuestRam,
+}
+
+impl GuestRamBacking {
+    fn of(command: &ResolvedVmCommand) -> Self {
+        Self {
+            shared_memfd: command.renderer.is_some(),
+            guest_ram: command.guest_ram,
+        }
+    }
+
+    /// Whether this is what QEMU gives a machine that names no backend:
+    /// anonymous memory, mapped lazily.
+    fn is_qemu_default(self) -> bool {
+        !self.shared_memfd && self.guest_ram == ResolvedGuestRam::Lazy
+    }
+
+    /// The `-object` named `id` that backs `size` of guest RAM this way.
+    fn backend(self, id: impl std::fmt::Display, size: impl std::fmt::Display) -> QemuOptions {
+        let mut backend = QemuOptions::new(if self.shared_memfd {
+            "memory-backend-memfd"
+        } else {
+            "memory-backend-ram"
+        });
+        backend.set("id", id).set("size", size);
+        if self.shared_memfd {
+            backend.set("share", "on");
+        }
+        if let ResolvedGuestRam::Prealloc { prealloc_threads } = self.guest_ram {
+            backend
+                .set("prealloc", "on")
+                .set("prealloc-threads", prealloc_threads);
+        }
+        backend
+    }
+}
+
 /// The host display backend QEMU opens for the session.
 ///
 /// `none` is the default and what every existing lane boots: the
@@ -1555,6 +1636,10 @@ pub(crate) struct VmConfigFile {
     pub(crate) max_processors: Option<u16>,
     #[serde(default)]
     pub(crate) memory: Option<String>,
+    #[serde(default)]
+    pub(crate) numa_nodes: Option<u16>,
+    #[serde(default)]
+    pub(crate) numa_distance: Option<u8>,
     #[serde(default)]
     pub(crate) guest_ram: Option<VmGuestRam>,
     #[serde(default)]
@@ -1722,6 +1807,19 @@ pub(crate) struct VmCommand {
 
     #[arg(long)]
     memory: Option<String>,
+
+    /// Present a NUMA machine of this many symmetric nodes: `--smp` and
+    /// `--memory` are split evenly across them, one socket per node, so
+    /// the count must divide both. QEMU then publishes the node layout in
+    /// the guest's devicetree or ACPI tables.
+    #[arg(long, value_name = "N")]
+    numa_nodes: Option<u16>,
+
+    /// The distance between every two different NUMA nodes (11 to 254;
+    /// a node is 10 from itself), published as the SLIT or the
+    /// devicetree distance map. Requires `--numa-nodes` of at least 2.
+    #[arg(long, value_name = "D")]
+    numa_distance: Option<u8>,
 
     /// How the host backs guest RAM: `lazy`, QEMU's default, faults
     /// each page in on the guest's first store to it; `prealloc` makes
@@ -1975,6 +2073,19 @@ enum VmSessionCommand {
     /// file's `bootfs` if named, else the build's prebuild directory. A
     /// release uses it to attach the payload its kernel trusts.
     BootfsPath,
+    /// Capture what every vCPU of a running guest is doing, and stop
+    /// there.
+    ///
+    /// The guest is the one whose session keeps `--runtime-dir`: the
+    /// capture speaks to QEMU over that session's QMP socket (or the
+    /// `unix:` endpoint `--qmp` names), appends the register file, each
+    /// local APIC and each vCPU's stacks to `vcpu-state.log` there, and
+    /// names on stderr the kernel function each vCPU is executing and
+    /// the return addresses on its stacks, against the kernel this
+    /// checkout's build spec resolves. It is what a session does for
+    /// itself when one of its own guest steps times out, offered to a
+    /// check whose wait on the guest is its own.
+    VcpuState(VcpuStateCommand),
     /// Provision the privileged host state a network backend needs.
     NetSetup(NetSetupCommand),
     /// Remove the host state `net-setup` provisioned.
@@ -2002,6 +2113,16 @@ pub(crate) struct BalloonCommand {
     /// How long to hold each target before moving to the next one.
     #[arg(long, default_value_t = 0)]
     hold_seconds: u64,
+}
+
+/// Captures every vCPU of a running guest through its session's QMP
+/// socket; see [`VmSessionCommand::VcpuState`].
+#[derive(Debug, Clone, ClapArgs)]
+pub(crate) struct VcpuStateCommand {
+    /// What the capture is taken after, such as the wait that expired.
+    /// It heads the capture in `vcpu-state.log`.
+    #[arg(long, value_name = "TEXT")]
+    after: String,
 }
 
 /// Captures the machine's scanout through QMP.
@@ -2225,6 +2346,8 @@ struct ResolvedVmCommand {
     smp: u16,
     max_processors: Option<u16>,
     memory: String,
+    /// The NUMA machine `--numa-nodes` asked for, when it did.
+    numa: Option<NumaMachine>,
     guest_ram: ResolvedGuestRam,
     bios: Option<String>,
     baud: u32,
@@ -2344,6 +2467,44 @@ pub(crate) fn run(mut command: VmCommand) -> Result<(), VmError> {
             let bootfs = resolve_bootfs_path(command.bootfs, file.bootfs, &build)
                 .map_err(VmConfigError::from)?;
             println!("{}", bootfs.display());
+            return Ok(());
+        }
+        // Speaks to a guest another session booted, so it boots nothing
+        // and needs no accelerator.
+        Some(VmSessionCommand::VcpuState(capture)) => {
+            let file = load_config_file(command.config.as_deref())?;
+            let build = resolve_build(&command, &file, None)?;
+            let kernel = resolve_kernel_path(command.kernel, file.kernel, &build)
+                .map_err(VmConfigError::from)?;
+            let runtime_dir = command
+                .runtime_dir
+                .or(file.runtime_dir)
+                .ok_or(VcpuStateCommandError::NoRuntimeDir)?;
+            let qmp_socket = match command.qmp.or(file.qmp) {
+                Some(endpoint) => unix_socket_of(&endpoint)
+                    .ok_or(VcpuStateCommandError::QmpNotUnix { endpoint })?,
+                // The link, resolved: the path through it can be longer
+                // than a socket address holds.
+                None => fs::read_link(runtime_dir.join(SOCKET_DIR_LINK_NAME))
+                    .map_err(|source| VcpuStateCommandError::NoSocketDir {
+                        runtime_dir: runtime_dir.display().to_string(),
+                        source,
+                    })?
+                    .join(QMP_SOCKET_NAME),
+            };
+            let debug_serial_log = command
+                .debug_serial_log
+                .or(file.debug_serial_log)
+                .unwrap_or_else(|| runtime_dir.join(DEBUG_SERIAL_LOG_NAME));
+            VcpuStateCapture::new(
+                build.profile.arch,
+                Some(qmp_socket),
+                &runtime_dir,
+                Some(debug_serial_log),
+                kernel,
+            )
+            .capture_after(&capture.after)
+            .map_err(VcpuStateCommandError::from)?;
             return Ok(());
         }
         session => command.command = session,
@@ -2724,6 +2885,13 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
         .memory
         .or(file.memory)
         .unwrap_or_else(|| profile.default_memory.to_owned());
+    let numa = NumaMachine::resolve(
+        command.numa_nodes.or(file.numa_nodes),
+        command.numa_distance.or(file.numa_distance),
+        smp,
+        max_processors,
+        &memory,
+    )?;
     let guest_ram =
         ResolvedGuestRam::resolve(command.guest_ram.or(file.guest_ram).unwrap_or_default())?;
     let bios = command
@@ -2876,6 +3044,7 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
         smp,
         max_processors,
         memory,
+        numa,
         guest_ram,
         bios,
         baud,
@@ -5408,11 +5577,7 @@ impl VmRuntime {
             qemu.arg("-accel").arg(accel);
         }
         qemu.arg("-m").arg(&command.memory);
-        if let Some(backend) = guest_ram_backend(command) {
-            qemu.arg("-object").arg(backend.to_string());
-        }
-        qemu.arg("-smp")
-            .arg(smp_argument(command.smp, command.max_processors));
+        configure_cpus_and_memory(&mut qemu, command);
         if command.serial_stdio {
             qemu.arg("-serial").arg("stdio");
         } else if let Some(serial_pty) = &serial_pty {
@@ -5725,14 +5890,15 @@ fn qmp_socket_path(
     command: &ResolvedVmCommand,
     socket_dir: &Path,
 ) -> Result<Option<PathBuf>, SocketPathTooLong> {
-    let Some(endpoint) = qmp_endpoint(command, socket_dir)? else {
-        return Ok(None);
-    };
-    let Some(path) = endpoint.strip_prefix("unix:") else {
-        return Ok(None);
-    };
+    Ok(qmp_endpoint(command, socket_dir)?.and_then(|endpoint| unix_socket_of(&endpoint)))
+}
+
+/// The socket path of a QEMU `unix:<path>[,option…]` endpoint, or `None`
+/// for any other form.
+fn unix_socket_of(endpoint: &str) -> Option<PathBuf> {
+    let path = endpoint.strip_prefix("unix:")?;
     let path = path.split(',').next().unwrap_or(path);
-    Ok(Some(PathBuf::from(path)))
+    Some(PathBuf::from(path))
 }
 
 fn unix_endpoint(socket_dir: &Path, name: &str) -> Result<String, SocketPathTooLong> {
@@ -6219,50 +6385,51 @@ fn machine(command: &ResolvedVmCommand) -> &'static str {
     command.profile.machine
 }
 
+/// The processor count and the guest RAM backends.
+///
+/// A NUMA machine gets its sockets, one memory backend per node, backed
+/// the way `--guest-ram` asked, and the node table that describes how it
+/// is split. Any other machine gets `-smp` and, when `--guest-ram` asked
+/// for one, the single backend [`machine_options`] names as its memory.
+/// Either names `maxcpus` when `--max-processors` holds processors to
+/// hot-add, and a NUMA machine places those on its nodes too.
+fn configure_cpus_and_memory(qemu: &mut Command, command: &ResolvedVmCommand) {
+    match &command.numa {
+        Some(numa) => {
+            qemu.arg("-smp").arg(numa.smp());
+            qemu.args(numa.arguments(GuestRamBacking::of(command)));
+        }
+        None => {
+            if let Some(backend) = guest_ram_backend(command) {
+                qemu.arg("-object").arg(backend.to_string());
+            }
+            qemu.arg("-smp")
+                .arg(smp_argument(command.smp, command.max_processors));
+        }
+    }
+}
+
 /// The `-machine` argument: the profile's machine, naming the guest RAM
 /// backend as its memory when the session has one, as the Fedora
 /// baseline wires its own.
+///
+/// A NUMA machine names none: its RAM is its nodes' backends
+/// (`-numa node,memdev=`), which QEMU refuses alongside a machine memory
+/// backend, so the backing is set on each of them instead.
 fn machine_options(command: &ResolvedVmCommand) -> QemuOptions {
     let mut options = QemuOptions::new(machine(command));
-    if guest_ram_backend(command).is_some() {
+    if command.numa.is_none() && guest_ram_backend(command).is_some() {
         options.set("memory-backend", GUEST_RAM_ID);
     }
     options
 }
 
-/// The `-object` guest RAM is made of, when it is not QEMU's anonymous
-/// default, and QEMU requires its size to match `-m`.
-///
-/// A renderer session's RAM is a shared memfd: a guest blob reaches the
-/// host as a dmabuf QEMU builds out of the RAM block's file descriptor
-/// (`virtio_gpu_create_udmabuf` in `hw/display/virtio-gpu-udmabuf.c`,
-/// which gives up on a block with none), and a blob scanout of one needs
-/// that dmabuf. `--guest-ram prealloc` populates the backend before the
-/// first guest instruction.
+/// The single `-object` an ordinary machine's guest RAM is made of, when
+/// it is not QEMU's anonymous default; QEMU requires its size to match
+/// `-m`. See [`GuestRamBacking`] for what decides it.
 fn guest_ram_backend(command: &ResolvedVmCommand) -> Option<QemuOptions> {
-    let prealloc_threads = match command.guest_ram {
-        ResolvedGuestRam::Lazy => None,
-        ResolvedGuestRam::Prealloc { prealloc_threads } => Some(prealloc_threads),
-    };
-    let renderer = command.renderer.is_some();
-    if !renderer && prealloc_threads.is_none() {
-        return None;
-    }
-    let mut backend = QemuOptions::new(if renderer {
-        "memory-backend-memfd"
-    } else {
-        "memory-backend-ram"
-    });
-    backend.set("id", GUEST_RAM_ID).set("size", &command.memory);
-    if renderer {
-        backend.set("share", "on");
-    }
-    if let Some(prealloc_threads) = prealloc_threads {
-        backend
-            .set("prealloc", "on")
-            .set("prealloc-threads", prealloc_threads);
-    }
-    Some(backend)
+    let backing = GuestRamBacking::of(command);
+    (!backing.is_qemu_default()).then(|| backing.backend(GUEST_RAM_ID, &command.memory))
 }
 
 /// Attaches the machine's translation unit.
@@ -6480,10 +6647,12 @@ impl From<VmSessionCommand> for ResolvedVmSessionCommand {
             VmSessionCommand::Build
             | VmSessionCommand::KernelPath
             | VmSessionCommand::BootfsPath
+            | VmSessionCommand::VcpuState(_)
             | VmSessionCommand::NetSetup(_)
             | VmSessionCommand::NetTeardown(_) => {
                 unreachable!(
-                    "the build, the artifact query and the network helpers never reach a guest session"
+                    "the build, the artifact queries, the vCPU capture and the network helpers \
+                     never reach a guest session"
                 )
             }
         }
@@ -8231,6 +8400,8 @@ mod tests {
             smp: None,
             max_processors: None,
             memory: None,
+            numa_nodes: None,
+            numa_distance: None,
             guest_ram: None,
             bios: None,
             baud: DEFAULT_BAUD,
@@ -8300,6 +8471,8 @@ mod tests {
             smp: None,
             max_processors: None,
             memory: None,
+            numa_nodes: None,
+            numa_distance: None,
             guest_ram: None,
             bios: None,
             baud: DEFAULT_BAUD,
@@ -8532,6 +8705,197 @@ mod tests {
         })
         .expect("an explicit writable share resolves");
         assert_eq!(resolved.shared_dir_access, HostShareAccess::ReadWrite);
+    }
+
+    /// The `-smp`, NUMA and guest RAM arguments a command resolves to.
+    fn cpu_arguments(command: VmCommand) -> Result<Vec<String>, VmConfigError> {
+        let resolved = resolve(command)?;
+        let mut qemu = Command::new("qemu");
+        configure_cpus_and_memory(&mut qemu, &resolved);
+        Ok(qemu
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect())
+    }
+
+    #[test]
+    fn a_two_node_split_reaches_qemu_on_every_architecture() {
+        let tempdir =
+            tempfile::tempdir().expect("temporary directory for VM config resolution must exist");
+        let config = tempdir.path().join("missing-vm.json");
+        let expected = [
+            "-smp",
+            "4,sockets=2,cores=2,threads=1",
+            "-object",
+            "memory-backend-ram,id=helios-node0,size=1G",
+            "-object",
+            "memory-backend-ram,id=helios-node1,size=1G",
+            "-numa",
+            "node,nodeid=0,memdev=helios-node0,cpus=0-1",
+            "-numa",
+            "node,nodeid=1,memdev=helios-node1,cpus=2-3",
+            "-numa",
+            "dist,src=0,dst=1,val=20",
+            "-numa",
+            "dist,src=1,dst=0,val=20",
+        ];
+        for (arch, acpi) in [
+            (VmArch::X86_64, false),
+            (VmArch::Aarch64, false),
+            (VmArch::Aarch64, true),
+            (VmArch::Riscv64, false),
+        ] {
+            let arguments = cpu_arguments(VmCommand {
+                arch,
+                acpi,
+                smp: Some(4),
+                memory: Some("2G".to_owned()),
+                numa_nodes: Some(2),
+                numa_distance: Some(20),
+                config: Some(config.clone()),
+                ..minimal_command()
+            })
+            .expect("two nodes divide four processors and 2G");
+            assert_eq!(arguments, expected, "{arch:?} acpi={acpi}");
+        }
+    }
+
+    /// `--max-processors` reaches a NUMA machine's `-smp`, and the nodes
+    /// split the possible processors, not only the ones present at boot.
+    #[test]
+    fn numa_nodes_and_max_processors_compose_into_one_machine() {
+        let tempdir =
+            tempfile::tempdir().expect("temporary directory for VM config resolution must exist");
+        let config = tempdir.path().join("missing-vm.json");
+        let arguments = cpu_arguments(VmCommand {
+            smp: Some(2),
+            max_processors: Some(4),
+            memory: Some("2G".to_owned()),
+            numa_nodes: Some(2),
+            config: Some(config.clone()),
+            ..minimal_command()
+        })
+        .expect("two nodes divide four possible processors and 2G");
+        assert_eq!(
+            arguments,
+            [
+                "-smp",
+                "2,maxcpus=4,sockets=2,cores=2,threads=1",
+                "-object",
+                "memory-backend-ram,id=helios-node0,size=1G",
+                "-object",
+                "memory-backend-ram,id=helios-node1,size=1G",
+                "-numa",
+                "node,nodeid=0,memdev=helios-node0,cpus=0-1",
+                "-numa",
+                "node,nodeid=1,memdev=helios-node1,cpus=2-3",
+            ]
+        );
+
+        let error = resolve(VmCommand {
+            smp: Some(2),
+            max_processors: Some(3),
+            memory: Some("2G".to_owned()),
+            numa_nodes: Some(2),
+            config: Some(config),
+            ..minimal_command()
+        })
+        .expect_err("two nodes do not split three possible processors");
+        let message = error.to_string();
+        assert!(
+            message.contains("--numa-nodes 2") && message.contains("--max-processors 3"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn without_numa_nodes_only_smp_is_passed() {
+        let tempdir =
+            tempfile::tempdir().expect("temporary directory for VM config resolution must exist");
+        let arguments = cpu_arguments(VmCommand {
+            smp: Some(4),
+            config: Some(tempdir.path().join("missing-vm.json")),
+            ..minimal_command()
+        })
+        .expect("a plain machine resolves");
+        assert_eq!(arguments, ["-smp", "4"]);
+    }
+
+    /// QEMU refuses a machine memory backend beside `-numa node,memdev=`,
+    /// so a preallocated NUMA machine names none and preallocates each
+    /// node's backend instead.
+    #[test]
+    fn preallocated_guest_ram_on_a_numa_machine_backs_each_node() {
+        let tempdir =
+            tempfile::tempdir().expect("temporary directory for VM config resolution must exist");
+        let resolved = resolve(VmCommand {
+            smp: Some(4),
+            memory: Some("2G".to_owned()),
+            numa_nodes: Some(2),
+            guest_ram: Some(VmGuestRam::Prealloc),
+            config: Some(tempdir.path().join("missing-vm.json")),
+            ..minimal_command()
+        })
+        .expect("a preallocated two-node machine resolves");
+        assert_eq!(
+            machine_options(&resolved).to_string(),
+            X86_64_VM_PROFILE.machine,
+            "the nodes' backends are the machine's RAM"
+        );
+
+        let mut qemu = Command::new("qemu");
+        configure_cpus_and_memory(&mut qemu, &resolved);
+        let backends: Vec<_> = qemu
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .filter(|argument| argument.starts_with("memory-backend-ram"))
+            .collect();
+        let threads = std::thread::available_parallelism()
+            .expect("the test host reports its parallelism")
+            .get();
+        assert_eq!(
+            backends,
+            [
+                format!(
+                    "memory-backend-ram,id=helios-node0,size=1G,prealloc=on,\
+                     prealloc-threads={threads}"
+                ),
+                format!(
+                    "memory-backend-ram,id=helios-node1,size=1G,prealloc=on,\
+                     prealloc-threads={threads}"
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn numa_flags_that_do_not_describe_a_machine_are_refused() {
+        let tempdir =
+            tempfile::tempdir().expect("temporary directory for VM config resolution must exist");
+        let config = tempdir.path().join("missing-vm.json");
+        let refusals = [
+            (Some(3), None, Some(4), "2G", "does not divide --smp"),
+            (Some(3), None, Some(6), "2G", "does not divide --memory"),
+            (Some(0), None, Some(4), "2G", "must be at least 1"),
+            (None, Some(20), Some(4), "2G", "requires --numa-nodes"),
+            (Some(1), Some(20), Some(4), "2G", "no pair to describe"),
+            (Some(2), Some(10), Some(4), "2G", "is outside 11..=254"),
+        ];
+        for (nodes, distance, smp, memory, message) in refusals {
+            let error = resolve(VmCommand {
+                smp,
+                memory: Some(memory.to_owned()),
+                numa_nodes: nodes,
+                numa_distance: distance,
+                config: Some(config.clone()),
+                ..minimal_command()
+            })
+            .expect_err("the flags do not describe a NUMA machine");
+            assert!(
+                error.to_string().contains(message),
+                "expected {message:?}, got: {error}"
+            );
+        }
     }
 
     #[test]
@@ -8787,6 +9151,8 @@ mod tests {
             smp: None,
             max_processors: None,
             memory: None,
+            numa_nodes: None,
+            numa_distance: None,
             guest_ram: None,
             bios: None,
             baud: DEFAULT_BAUD,
@@ -8983,6 +9349,7 @@ mod tests {
             smp: profile.default_smp,
             max_processors: None,
             memory: profile.default_memory.to_owned(),
+            numa: None,
             guest_ram: ResolvedGuestRam::Lazy,
             bios: profile.default_bios.map(str::to_owned),
             baud: DEFAULT_BAUD,
@@ -9201,6 +9568,7 @@ mod tests {
             smp: profile.default_smp,
             max_processors: None,
             memory: profile.default_memory.to_owned(),
+            numa: None,
             guest_ram: ResolvedGuestRam::Lazy,
             bios: profile.default_bios.map(str::to_owned),
             baud: DEFAULT_BAUD,

@@ -24,11 +24,7 @@
 //! Real workloads can swap in alternative policies without touching
 //! the dispatch loop.
 
-use core::marker::PhantomData;
-
 use helios_hal::vmm::{AddressSpace, AddressSpaceError, VirtRange};
-
-use crate::memory::KernelPhysFrameAllocator;
 
 /// Coarse pressure classification used by the compactor and the OOM
 /// killer to decide whether to act on a `FrameAllocStats` snapshot.
@@ -105,7 +101,6 @@ where
     address_space: &'static As,
     policy: Policy,
     budget: CompactionBudget,
-    _frames: PhantomData<&'static KernelPhysFrameAllocator>,
 }
 
 impl<As, Policy> Compactor<As, Policy>
@@ -118,7 +113,6 @@ where
             address_space,
             policy,
             budget,
-            _frames: PhantomData,
         }
     }
 

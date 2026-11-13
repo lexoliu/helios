@@ -31,11 +31,11 @@ pub use compaction::{
 };
 #[cfg(test)]
 pub(crate) use executor::executor_test_guard;
-pub(crate) use executor::task_arena_bytes;
 pub use executor::{
     Executor, ExecutorRunStats, InstanceSpawner, JoinHandle, LocalJoinHandle, PinnedTasks,
     READY_BATCH_TASKS, Spawner, TaskCapacityError, TaskFunding,
 };
+pub(crate) use executor::{TaskHome, task_arena_bytes};
 pub use freeze::{FreezeError, FrozenMachine};
 pub use idle::IdleOutcome;
 pub use in_flight::InFlight;

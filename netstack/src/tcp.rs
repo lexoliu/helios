@@ -2164,6 +2164,18 @@ where
         }
     }
 
+    /// Whether `packet` would move this connection out of `SYN-RECEIVED`:
+    /// an ACK, not a RST, of exactly the SYN-ACK this socket sent.
+    ///
+    /// Lets the stack decide whether it can take the connection on before
+    /// the segment is applied, since applying it is irreversible.
+    pub(crate) fn completes_handshake(&self, packet: TcpPacket<'_>) -> bool {
+        self.state == TcpState::SynReceived
+            && packet.flags.contains(TcpFlags::ACK)
+            && !packet.flags.contains(TcpFlags::RST)
+            && packet.acknowledgement == self.send_next
+    }
+
     pub fn on_segment(
         &mut self,
         packet: TcpPacket<'_>,
@@ -2237,7 +2249,7 @@ where
                 TcpSegmentOutcome::default()
             }
             TcpState::SynReceived if packet.flags.contains(TcpFlags::ACK) => {
-                if packet.acknowledgement != self.send_next {
+                if !self.completes_handshake(packet) {
                     return TcpSegmentOutcome {
                         reset: self.unacceptable_ack_reset(packet.acknowledgement),
                         ..TcpSegmentOutcome::default()
@@ -3086,8 +3098,16 @@ where
 
     /// The round trip the retransmission timer learns from an
     /// acknowledgement of `acknowledgement`: the timestamp echo when the
-    /// peer sent one, else the send time of the last segment it covers
-    /// that was never retransmitted, else zero (no sample).
+    /// peer sent one, else the send time of the last segment it covers,
+    /// else zero (no sample).
+    ///
+    /// An acknowledgement that covers a retransmitted segment gives no
+    /// send-time sample at all (RFC 6298 section 3, Karn's algorithm).
+    /// It may answer the retransmission rather than the original, and
+    /// the segments it covers past that one were waiting at the peer for
+    /// the hole to fill, so their send times measure the repair, not the
+    /// path. Linux skips the sample on the same condition
+    /// (`FLAG_RETRANS_DATA_ACKED` in `tcp_clean_rtx_queue`).
     fn ack_rtt_nanos(
         &self,
         acknowledgement: u32,
@@ -3101,7 +3121,8 @@ where
                     break;
                 }
                 if segment.retransmissions != 0 {
-                    continue;
+                    rtt_nanos = 0;
+                    break;
                 }
                 rtt_nanos = now_nanos.saturating_sub(segment.sent_at_nanos());
             }
@@ -4448,6 +4469,30 @@ mod tests {
                 assert_eq!(pending, None, "duplicate {duplicate} resends nothing");
             }
         }
+    }
+
+    #[test]
+    fn an_ack_covering_a_retransmission_takes_no_round_trip_sample() {
+        // The peer holds five segments behind a lost first one; the ACK
+        // the resend draws covers all six, and the originals' send
+        // times are the repair's length, not the path's round trip.
+        let mut socket = established_window_socket(6, TcpOptions::empty());
+        let sent_at = TCP_INITIAL_RTO_NANOS + 1;
+        let hole = send_flight(&mut socket, 6, sent_at);
+        for duplicate in 1..=3 {
+            let _ = deliver_segment(&mut socket, peer_ack(hole, u16::MAX), sent_at + duplicate);
+        }
+        socket.mark_retransmission_queued(hole, sent_at + 3);
+        let before = socket.retransmission_timer;
+        // Two seconds: far past any round trip the flight measured.
+        let repaired_at = sent_at + 2_000_000_000;
+        let everything = socket.send_next;
+        let _ = deliver_segment(&mut socket, peer_ack(everything, u16::MAX), repaired_at);
+        assert_eq!(socket.send_unacknowledged, socket.send_next);
+        assert_eq!(
+            socket.retransmission_timer, before,
+            "Karn's algorithm: no sample from an acknowledgement of a retransmission"
+        );
     }
 
     #[test]

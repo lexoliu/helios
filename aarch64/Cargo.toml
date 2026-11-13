@@ -8,7 +8,7 @@ default = ["embedded-debugger"]
 embedded-debugger = ["helios-kernel/embedded-debugger"]
 
 [dependencies]
-acpi.workspace = true
+acpi = { workspace = true, features = ["aml"] }
 helios-acpi.workspace = true
 arm-gic = "0.9.1"
 # The ID, key and control registers return-address signing programs. `arm-gic`
@@ -18,11 +18,15 @@ bytes = { version = "1.12.1", default-features = false }
 critical-section = { version = "1.2.0", features = ["restore-state-usize"] }
 fdt = { version = "0.1.5", default-features = false }
 helios-artifact.workspace = true
+helios-firmware = { workspace = true, features = ["acpi", "devicetree"] }
 helios-hal.workspace = true
 helios-kernel = { workspace = true, default-features = false, features = ["wasmtime-bare-metal"] }
 helios-virtio.workspace = true
 helios-tpm.workspace = true
 limine = "0.6.5"
+# The UEFI system and configuration table layouts and the device-tree table
+# GUID, through which the firmware's own device tree is found.
+r-efi = { version = "7.1.0", default-features = false }
 smccc = "0.2.3"
 spin = "0.12.3"
 thiserror = { version = "2.0.20", default-features = false }
