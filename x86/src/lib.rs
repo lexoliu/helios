@@ -17,6 +17,7 @@ mod input;
 mod ioapic;
 mod iommu;
 mod memory_type;
+mod mtrr;
 mod net;
 mod pci;
 mod rtc;
@@ -1214,6 +1215,9 @@ extern "C" fn secondary_start_rust(
     // The same page-attribute table the bootstrap processor runs with,
     // before this processor can touch a write-combined mapping.
     memory_type::program_page_attribute_table();
+    // And the bootstrap processor's MTRRs, which a started processor
+    // leaves reset without.
+    boot.mtrrs().apply();
     // Guest code is compiled once for the ISA level the bootstrap processor
     // satisfies and runs on any processor, so every processor must answer
     // every level feature the same way. XCR0 is programmed, which the AVX
