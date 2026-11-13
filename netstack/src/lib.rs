@@ -5,6 +5,7 @@ extern crate alloc;
 mod address;
 mod checksum;
 mod congestion;
+mod delivery_rate;
 mod dhcp;
 mod dns;
 mod hash;
@@ -12,6 +13,8 @@ mod icmp_rate;
 mod isn;
 mod ndp;
 mod packet;
+#[cfg(test)]
+mod path_sim;
 mod stack;
 mod tcp;
 mod types;
@@ -31,8 +34,8 @@ pub use checksum::{
     tcpv4_checksum, tcpv6_checksum, udp_checksum, udp_checksum_valid, udp_pseudo_header_checksum,
 };
 pub use congestion::{
-    AckSample, BbrV3, CongestionControl, CongestionEvent, CongestionWindow, Cubic, NewReno,
-    PacingRate, RecoveryAction,
+    AckSample, BbrV3, CongestionControl, CongestionEvent, CongestionWindow, Cubic, LostPacket,
+    NewReno, PacingRate, PacketSent, RateSample, RecoveryAction, RecoveryTrigger, SendSnapshot,
 };
 pub use dhcp::{
     DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DhcpAction, DhcpClient, DhcpClientMessage, DhcpDestination,
