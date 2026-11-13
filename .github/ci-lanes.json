@@ -36,22 +36,28 @@
     "surfaces": ["x86", "hosted", "host_tools", "programs"]
   },
   "smoke-riscv64": {
-    "surfaces": ["riscv", "host_tools", "programs"]
+    "surfaces": ["riscv", "host_tools", "programs"],
+    "guest-wasm": "release"
   },
   "smoke-aarch64": {
-    "surfaces": ["aarch64", "host_tools", "programs"]
+    "surfaces": ["aarch64", "host_tools", "programs"],
+    "guest-wasm": "release"
   },
   "smoke-aarch64-cfi": {
-    "surfaces": ["aarch64", "host_tools", "programs"]
+    "surfaces": ["aarch64", "host_tools", "programs"],
+    "guest-wasm": "debug"
   },
   "smoke-x86-64": {
-    "surfaces": ["x86", "host_tools", "programs"]
+    "surfaces": ["x86", "host_tools", "programs"],
+    "guest-wasm": "release"
   },
   "smoke-x86-64-cpu-lifecycle": {
-    "surfaces": ["x86", "host_tools", "programs"]
+    "surfaces": ["x86", "host_tools", "programs"],
+    "guest-wasm": "release"
   },
   "smoke-x86-64-venus": {
     "surfaces": ["gpu"],
-    "exclusive": true
+    "exclusive": true,
+    "guest-wasm": "debug"
   }
 }
