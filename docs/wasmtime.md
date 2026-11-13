@@ -8,10 +8,11 @@ at `../wasmtime/crates/wasmtime`.
 The local checkout must be at (branch `helios/release-48.0.8`):
 
 ```text
-1c4b1742798208727174d61d80bee099cfd62876
+8a1cd4e1a4922d7f8a19280256b92aafa646c4ce
 ```
 
-That revision is `helios/next-solver-bindgen` at
+That revision is `1c4b1742798208727174d61d80bee099cfd62876` plus one commit
+described below, and `1c4b1742` is `helios/next-solver-bindgen` at
 `18b428e6becfb6138b877a3fe70afb08bf5724ba` merged with upstream's `v48.0.8`
 tag (`7b6c29ec3e9a49c97da231665cbd8eead9ccbda0`), which brings in the 48.0.x
 point releases and their security fixes (#503). The release removed every
@@ -28,6 +29,15 @@ more than it saves: a paired run on x86-64 under KVM whose two sides differ
 only in that commit measured `hostcall-loop` at 256 ms with it and 211 ms
 without, and `sched-tasks` at 117 ms against 106 ms, with the compute
 control flat (run 43203149211).
+
+The branch also raises Cranelift's preferred function alignment on x86-64
+from 32 bytes to 64 (`8a1cd4e1a4`). At 32 a function starts at either half
+of a cache line, and which half depends on the sizes of the functions laid
+out before it: QuickJS's `JS_CallInternal` is the same instruction stream
+under the previous pin and under 48.0.8, moved from offset 0 to offset 32
+of a line, and `quickjs-loop` read 37.2 ms against 21.8 ms on an EPYC 7763
+(run 43378980666) and 24.9 ms against 18.5 ms on an EPYC 9V74 (run
+43099286068). At 64 a function's layout within its lines is its own.
 
 `helios/next-solver-bindgen` is `helios/stack-limit-percpu` at
 `1ed7678a8ee4f57cbe4a4e89ade7f7fda6092055` plus upstream
