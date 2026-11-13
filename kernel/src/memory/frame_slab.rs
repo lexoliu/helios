@@ -22,6 +22,9 @@
 //! - **From any processor:** [`FrameSlabCache::drain`] takes each
 //!   processor's list for one node briefly under its lock, and
 //!   [`FrameSlabCache::cached_bytes`] reads the lists' counters without it.
+//!   [`FrameSlabCache::drain_processor`] empties one processor's list
+//!   for one node the same way; the offline step runs it on the
+//!   departing processor for each of its lists.
 //! - Each list's lock is an [`IrqSafeMutex`], which masks the local
 //!   processor's interrupts while held, because interrupt handlers
 //!   allocate. Drain callbacks run after the list is unlocked.
@@ -192,6 +195,19 @@ impl FrameSlabCache {
         for (_, shard) in self.shards.iter() {
             shard.list(node).drain(&mut release);
         }
+    }
+
+    /// Empties `processor`'s list for `node` alone into `release`, for a
+    /// processor going offline: nothing pops that list while the
+    /// processor is stopped, so its frames would sit out of every
+    /// allocation that does not drain the node.
+    pub(crate) fn drain_processor(
+        &self,
+        processor: ProcessorId,
+        node: NodeId,
+        release: impl FnMut(NonNull<u8>),
+    ) {
+        self.list(processor, node).drain(release);
     }
 
     /// Bytes of `node` cached across every processor.

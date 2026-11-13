@@ -56,7 +56,7 @@
 //! hart sets up the root table, secondary harts share it via `satp`.
 //! Every address-space mutation invalidates this hart's TLB entries
 //! and dispatches one `sbi_rt::remote_sfence_vma` range fence to every
-//! other hart, after the last page-table write and before any frame
+//! other running hart (a stopped hart flushes on restart), after the last page-table write and before any frame
 //! goes back to the user-memory pool.
 
 extern crate alloc;
@@ -1200,17 +1200,7 @@ fn flush_tlb_pages(start: usize, pages: usize) {
         }
     }
     let byte_len = pages * PAGE_SIZE;
-    let ret = sbi_rt::remote_sfence_vma(
-        sbi_rt::HartMask::from_mask_base(0, usize::MAX),
-        start,
-        byte_len,
-    );
-    assert!(
-        ret.is_ok(),
-        "SBI remote_sfence_vma failed for user VA {start:#x}+{byte_len:#x}: error={} value={}",
-        ret.error,
-        ret.value
-    );
+    crate::lifecycle::remote_sfence_vma(start, byte_len);
 }
 
 fn page_flags_to_pte(flags: PageFlags) -> Result<u64, AddressSpaceError> {

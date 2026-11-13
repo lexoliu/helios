@@ -282,6 +282,25 @@ pub(crate) fn top_up(processor: ProcessorId) {
     }
 }
 
+/// Hands every frame `processor`'s reserve holds back to the user pool.
+///
+/// The offline step of a departing processor, run on that processor
+/// outside fault context: a stopped processor takes no fault, so frames
+/// parked here would be memory no program can be given until it came
+/// back. The run loop's [`top_up`] refills the reserve once the
+/// processor is online again.
+pub(crate) fn release(processor: ProcessorId) {
+    if !is_configured() {
+        return;
+    }
+    let shard = RESERVE.shard(processor);
+    while let Some(frame) = shard.pop() {
+        // In the departing processor's name: the frame goes onto its
+        // list for the frame's node, which the memory step drains next.
+        super::deallocate_user_frame_on(processor, frame);
+    }
+}
+
 /// Fills `shard` as far as the pool will go without waiting.
 ///
 /// Runs in fault context, so nothing here may wait on a lock: the

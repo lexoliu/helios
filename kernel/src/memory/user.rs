@@ -643,6 +643,30 @@ impl UserMemoryPool {
         self.deallocate_bytes_on(current_processor(), ptr, layout);
     }
 
+    /// Returns every frame `processor`'s lists cache to the buddy of the
+    /// node it lies on, for a processor going offline: nothing pops those
+    /// lists while the processor is stopped.
+    ///
+    /// The lists are kept per node, so each node's list drains into that
+    /// node's buddy under that node's lock alone — the nesting the module
+    /// contract allows — and no frame changes node. A node with no pool
+    /// was never given a frame to cache, so its list is empty.
+    pub(crate) fn release_processor_frames(&self, processor: ProcessorId) {
+        for (index, pool) in self.nodes.iter().enumerate() {
+            let Some(pool) = pool.as_ref() else {
+                continue;
+            };
+            let node = NodeId::new(index);
+            pool.heap.with(|heap| {
+                self.frame_slab.drain_processor(processor, node, |ptr| {
+                    // SAFETY: a frame on `node`'s list is a single frame
+                    // of `node`'s buddy that no one holds.
+                    unsafe { heap.deallocate(ptr, PhysFrame::SIZE) };
+                });
+            });
+        }
+    }
+
     /// Returns a byte allocation to the node it lies on. A single frame
     /// goes onto `processor`'s list for that node; anything larger goes
     /// back to the node's buddy.
@@ -860,6 +884,21 @@ pub(crate) fn installed_user_memory_pool() -> Option<&'static UserMemoryPool> {
         None
     } else {
         Some(unsafe { &*ptr })
+    }
+}
+
+/// The memory step of a processor going offline: every frame it holds
+/// for itself — its page-fault reserve and its frame-slab lists — goes
+/// back to the buddy of the node the frame lies on. Run on the departing
+/// processor.
+///
+/// The reserve is released first and in this processor's name, so its
+/// frames land on this processor's lists for their nodes, which the
+/// drain after it then empties.
+pub(crate) fn release_processor_frames(processor: ProcessorId) {
+    super::frame_reserve::release(processor);
+    if let Some(pool) = installed_user_memory_pool() {
+        pool.release_processor_frames(processor);
     }
 }
 
@@ -1549,6 +1588,54 @@ mod tests {
             "the frame sits on P1's node-0 list"
         );
         pool.deallocate_bytes_on(P1, frame, frame_layout(1));
+    }
+
+    /// A processor going offline hands every frame its lists cache back
+    /// to the buddy of the node the frame lies on, and leaves the other
+    /// processors' lists alone.
+    #[test]
+    fn an_offline_processors_cached_frames_return_to_their_own_nodes() {
+        let (pool, ranges) = two_nodes();
+        let node_0 = NodeId::new(0);
+        let node_1 = NodeId::new(1);
+        let buddy_allocated = |node: NodeId| {
+            pool.owning_pool(node)
+                .heap
+                .with(|heap| heap.allocated_bytes)
+        };
+        let before = [buddy_allocated(node_0), buddy_allocated(node_1)];
+
+        let local = pool
+            .allocate_zeroed_on(P0, frame_layout(1))
+            .expect("node-0 frame");
+        let remote = pool
+            .allocate_zeroed_on(P1, frame_layout(1))
+            .expect("node-1 frame");
+        let kept = pool
+            .allocate_zeroed_on(P1, frame_layout(1))
+            .expect("second node-1 frame");
+        assert_eq!((node_of(&ranges, local), node_of(&ranges, remote)), (0, 1));
+        pool.deallocate_bytes_on(P0, local, frame_layout(1));
+        pool.deallocate_bytes_on(P0, remote, frame_layout(1));
+        pool.deallocate_bytes_on(P1, kept, frame_layout(1));
+        assert_eq!(pool.frame_slab.cached_bytes(node_0), PhysFrame::SIZE);
+        assert_eq!(pool.frame_slab.cached_bytes(node_1), 2 * PhysFrame::SIZE);
+
+        pool.release_processor_frames(P0);
+
+        assert_eq!(pool.frame_slab.cached_bytes(node_0), 0);
+        assert_eq!(
+            pool.frame_slab.cached_bytes(node_1),
+            PhysFrame::SIZE,
+            "P1's node-1 list is untouched"
+        );
+        assert_eq!(buddy_allocated(node_0), before[0]);
+        assert_eq!(
+            buddy_allocated(node_1),
+            before[1] + PhysFrame::SIZE,
+            "only the frame P1 still caches is out of node 1's buddy"
+        );
+        assert_eq!(pool.frame_slab.allocate_on(P1, node_1), Some(kept));
     }
 
     #[test]

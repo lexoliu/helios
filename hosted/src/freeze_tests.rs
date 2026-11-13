@@ -11,7 +11,6 @@
 
 #![cfg(test)]
 
-use std::path::PathBuf;
 use std::pin::pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -25,7 +24,7 @@ use helios_hal::numa::SingleNode;
 use helios_hal::{DeviceInventory, DmaModel, Platform, ProcessorStartupPolicy, ProcessorTopology};
 use helios_kernel::{FreezeError, Kernel, Spawner, yield_now};
 
-use crate::config::HostedConfig;
+use crate::config::DEFAULT_HEAP_BYTES;
 use crate::console::HostedConsole;
 use crate::cpu::HostedCpu;
 use crate::runtime::HostedMachine;
@@ -104,12 +103,7 @@ fn machine() -> (&'static TestMachine, MutexGuard<'static, ()>) {
 /// runs a loop of this module's own after `init`, and returns once every
 /// processor is in it.
 fn boot() -> TestMachine {
-    let bootfs = PathBuf::from(
-        std::env::var_os("HELIOS_BOOTFS")
-            .expect("HELIOS_BOOTFS must name the kernel-prebuild payload"),
-    );
-    let config = HostedConfig::for_test(PROCESSORS, bootfs);
-    let machine = HostedMachine::new(&config);
+    let machine = HostedMachine::new(PROCESSORS, ProcessorId::new(0), DEFAULT_HEAP_BYTES);
     let timers_fired: Arc<[AtomicUsize]> = (0..PROCESSORS).map(|_| AtomicUsize::new(0)).collect();
     let (registered, registrations) = unbounded();
     let (online, onlines) = bounded(PROCESSORS);
@@ -355,6 +349,43 @@ fn a_task_that_never_yields_fails_the_freeze_naming_its_processor() {
         recv(&reports),
         Ok(()),
         "a machine whose freeze failed freezes once the task yields"
+    );
+    machine.every_run_loop_answers(0);
+}
+
+/// A processor taken offline is not a secondary: a freeze holds the
+/// rest of the machine without waiting for it, and once it is back
+/// online the next freeze counts it again.
+#[test]
+fn a_freeze_waits_on_the_online_set_only() {
+    let (machine, _turn) = machine();
+    let departed = ProcessorId::new(3);
+    let (report, reports) = bounded(1);
+    machine.on(0, move |kernel| {
+        kernel.spawn_local_detached(async move {
+            let control = kernel.processor_control();
+            let offline = control.offline(departed).await;
+            // The deadline only has to outlast the online processors'
+            // arrival: a freeze that waited on the stopped one would
+            // fail naming it.
+            let without = kernel.freeze(NEVER_ARRIVES_DEADLINE, || {}).await.map(drop);
+            let online = control.online(departed).await;
+            let with = kernel.freeze(ARRIVAL_DEADLINE, || {}).await.map(drop);
+            report.send((offline, without, online, with)).unwrap();
+        });
+    });
+    let (offline, without, online, with) = recv(&reports);
+    assert_eq!(offline, Ok(()));
+    assert_eq!(
+        without,
+        Ok(()),
+        "a freeze waited on a processor outside the online set"
+    );
+    assert_eq!(online, Ok(()));
+    assert_eq!(
+        with,
+        Ok(()),
+        "a processor back online freezes with the rest"
     );
     machine.every_run_loop_answers(0);
 }

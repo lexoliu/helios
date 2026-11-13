@@ -3,34 +3,37 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::thread;
 
-use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase, TimerInterrupt};
+use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase, TimerInterrupt, current_processor};
 use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
-
 use helios_kernel::Timer;
 
 use crate::runtime::HostedMachine;
 
 /// Hosted CPU adapter that exposes one OS thread as one logical processor.
 ///
-/// The processor id is fixed when the thread starts, which makes
-/// `current_processor()` trivial and avoids any TLS lookup in the hot path.
+/// A handle names the machine, not a processor: like a register read on
+/// bare metal, every per-processor operation acts on the thread that
+/// calls it, whose identity [`HostedCpu::new`] seeded.
 #[derive(Clone)]
 pub struct HostedCpu {
-    processor: ProcessorId,
     machine: Arc<HostedMachine>,
 }
 
 impl HostedCpu {
+    /// The handle for the calling thread, which stands for `processor`
+    /// from here on.
     pub fn new(processor: ProcessorId, machine: Arc<HostedMachine>) -> Self {
         set_current_processor(processor);
-        Self { processor, machine }
+        Self { machine }
     }
 
-    /// Publishes this processor's kernel timer, built from the kernel its
-    /// `helios_kernel::init` returned, so the timer interrupt can advance
-    /// it. Once per processor, before it parks.
+    /// Installs the calling processor's timer, which runs its interrupt
+    /// step whenever the machine's timer thread has raised this
+    /// processor's timer interrupt. The processor calls this once, after
+    /// `helios_kernel::init`, the way the bare-metal backends install
+    /// theirs; an interrupt raised before that stays pending.
     pub fn install_timer(&self, timer: Timer<HostedCpu>) {
-        self.machine.install_timer(self.processor, timer);
+        self.machine.install_timer(current_processor(), timer);
     }
 }
 
@@ -79,14 +82,18 @@ impl Cpu for HostedCpu {
         self.machine.bootstrap_processor()
     }
 
+    /// Parks until woken, taking the processor's timer interrupt on the
+    /// way in and on the way out: one raised while it ran is handled
+    /// before it sleeps, and one that woke it is handled before it
+    /// returns. The timer thread raises the interrupt before it unparks,
+    /// so a raise between the check and the park leaves its unpark
+    /// token, the park returns at once and the interrupt is taken on the
+    /// way out. Either way the interrupt step runs here, on the owner.
     fn park_current(&self) {
-        // The timer thread's expiry is this processor's timer interrupt:
-        // it sets the pending flag, then unparks. An expiry before this
-        // park leaves the unpark token, so the park returns at once and
-        // the flag is found below; one during it ends it the same way.
-        // Either way the interrupt step runs here, on the owner.
+        let processor = current_processor();
+        self.machine.take_timer_interrupt(processor);
         thread::park();
-        self.machine.take_timer_interrupt(self.processor);
+        self.machine.take_timer_interrupt(processor);
     }
 
     type WakeOnlyMask = HostedWakeOnlyMask;
@@ -123,6 +130,14 @@ impl Cpu for HostedCpu {
         self.machine.wake_processor(processor);
     }
 
+    fn stop_current(&self) {
+        self.machine.stop_current(current_processor());
+    }
+
+    fn restart_processor(&self, processor: ProcessorId) {
+        self.machine.restart_processor(processor);
+    }
+
     fn now(&self) -> Instant {
         self.machine.now()
     }
@@ -132,7 +147,7 @@ impl Cpu for HostedCpu {
     }
 
     fn set_deadline(&self, deadline: Instant) {
-        self.machine.set_deadline(self.processor, deadline);
+        self.machine.set_deadline(current_processor(), deadline);
     }
 
     fn publish_executable(&self, _ptr: *const u8, _len: usize) {}

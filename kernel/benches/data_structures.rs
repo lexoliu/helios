@@ -853,6 +853,14 @@ impl Cpu for BenchCpu {
 
     fn wake_processor(&self, _processor: ProcessorId) {}
 
+    fn stop_current(&self) {
+        panic!("bench CPU never stops a processor")
+    }
+
+    fn restart_processor(&self, _processor: ProcessorId) {
+        panic!("bench CPU never restarts a processor")
+    }
+
     fn now(&self) -> Instant {
         Instant::new(0)
     }

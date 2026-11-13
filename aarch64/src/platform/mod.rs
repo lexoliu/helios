@@ -201,6 +201,20 @@ impl GicDescription {
     }
 }
 
+/// The instruction a PSCI call enters firmware with.
+///
+/// The discriminants are the values a processor's resume context carries
+/// across a power-down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum PsciConduit {
+    /// `hvc`: PSCI is served by a hypervisor, as under KVM and QEMU's
+    /// `virt` board without EL3.
+    Hvc = 0,
+    /// `smc`: PSCI is served by secure firmware.
+    Smc = 1,
+}
+
 /// Where the description came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PlatformSource {
@@ -223,6 +237,11 @@ pub(crate) struct PlatformDescription {
     pub(crate) source: PlatformSource,
     pub(crate) console: ConsoleDescription,
     pub(crate) gic: GicDescription,
+    /// The conduit of the PSCI service that powers processors on and
+    /// off, when the firmware describes one. A machine without it still
+    /// runs; it just cannot take a processor offline, and says so when
+    /// asked to.
+    pub(crate) psci: Option<PsciConduit>,
     /// The real-time clock, when the platform has one. A machine
     /// without one leaves the kernel's wall clock reading as uptime.
     pub(crate) rtc: Option<MmioRegion>,
