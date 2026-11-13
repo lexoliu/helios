@@ -609,6 +609,13 @@ struct RecordingInterfaceState {
     /// Every frame the transmit ring took, headers and payload joined,
     /// in the order it took them.
     transmitted: spin::Mutex<alloc::vec::Vec<alloc::vec::Vec<u8>>>,
+    /// How many times a stack drive has drained a receive ring: every
+    /// interface-scope drive drains each shard's pair once, so this is
+    /// the drive count.
+    receive_drains: AtomicU64,
+    /// The drain count past which the next drain panics, so a test of a
+    /// loop that must not spin ends at a message instead of never.
+    receive_drain_ceiling: AtomicU64,
 }
 
 impl RecordingNetworkInterface {
@@ -640,8 +647,23 @@ impl RecordingNetworkInterface {
                 device_signal: crate::ProgressSignal::new(),
                 accept_transmissions,
                 transmitted: spin::Mutex::new(alloc::vec::Vec::new()),
+                receive_drains: AtomicU64::new(0),
+                receive_drain_ceiling: AtomicU64::new(u64::MAX),
             }),
         }
+    }
+
+    /// How many times the stack has drained a receive ring since the
+    /// interface was built.
+    pub(crate) fn receive_drains(&self) -> u64 {
+        self.inner.receive_drains.load(Ordering::Acquire)
+    }
+
+    /// Makes the drain that would take the count past `ceiling` panic.
+    pub(crate) fn panic_past_receive_drains(&self, ceiling: u64) {
+        self.inner
+            .receive_drain_ceiling
+            .store(ceiling, Ordering::Release);
     }
 
     /// The frames the transmit ring has taken since the interface was
@@ -812,6 +834,12 @@ impl helios_netstack::NetworkInterface for RecordingNetworkInterface {
     where
         Sink: FnMut(&helios_netstack::RxFrame),
     {
+        let drains = self.inner.receive_drains.fetch_add(1, Ordering::AcqRel) + 1;
+        let ceiling = self.inner.receive_drain_ceiling.load(Ordering::Acquire);
+        assert!(
+            drains <= ceiling,
+            "the stack was driven {drains} times, past the {ceiling} the test allows"
+        );
         let pair = self.inner.pair(queue_idx);
         let drain = {
             // The pair is held for the whole pass and each frame reaches

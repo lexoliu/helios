@@ -1491,20 +1491,9 @@ where
         let available_window = if persist_probe.is_some() {
             1
         } else {
-            self.available_send_window()
+            self.sendable_window()
         };
         if available_window == 0 {
-            return None;
-        }
-        // A full in-flight queue closes the effective send window until
-        // ACKs drain it; emitting another segment would have nowhere to
-        // record its retransmission state.
-        if persist_probe.is_none()
-            && self
-                .in_flight
-                .as_ref()
-                .is_some_and(TcpInFlightQueue::is_full)
-        {
             return None;
         }
         if matches!(
@@ -1649,9 +1638,13 @@ where
         });
         // A socket waiting for a link-layer address cannot send at its
         // pacing time, so the time it asks again stands in for it.
+        // A pacing time is only a promise when a segment could go out at
+        // it: with the send window shut the take refuses regardless of
+        // the clock, and the persist or retransmission deadline is the
+        // next thing that can change that.
         let transmit_deadline = self.resolution_retry_nanos.or_else(|| {
             self.next_pacing_send_nanos
-                .filter(|_| !self.transmit_queue_is_empty())
+                .filter(|_| !self.transmit_queue_is_empty() && self.sendable_window() > 0)
         });
         let persist_deadline = self.persist_timer.map(TcpPersistTimer::deadline_nanos);
         min_deadline(
@@ -3150,6 +3143,23 @@ where
             && !packet.flags.contains(TcpFlags::FIN)
             && !packet.flags.contains(TcpFlags::RST)
             && self.scaled_peer_receive_window(packet.window_size) == self.peer_receive_window
+    }
+
+    /// The bytes a data segment that is not a persist probe may carry
+    /// now: what the congestion and peer receive windows leave, or none
+    /// while the in-flight queue has no entry left to record another
+    /// segment's retransmission state. [`Self::take_transmit_segment`]
+    /// refuses at zero and [`Self::next_deadline_nanos`] promises no
+    /// pacing time at zero.
+    fn sendable_window(&self) -> usize {
+        if self
+            .in_flight
+            .as_ref()
+            .is_some_and(TcpInFlightQueue::is_full)
+        {
+            return 0;
+        }
+        self.available_send_window()
     }
 
     fn available_send_window(&self) -> usize {
@@ -5761,6 +5771,50 @@ mod tests {
             )
             .expect("paced deadline should release the next segment");
         assert_eq!(second.payload.as_ref(), b"ijkl");
+    }
+
+    #[test]
+    fn closed_peer_window_reports_the_persist_deadline_not_a_past_pacing_time() {
+        let mut socket = established_fixed_pacing_socket(PacingRate::from_bytes_per_second(1_000));
+        assert_eq!(socket.queue_send(b"abcdefgh"), 8);
+        let sent_at = TCP_INITIAL_RTO_NANOS + 1;
+        socket
+            .take_transmit_segment(sent_at, TcpSegmentBudget::wire_segments(usize::MAX))
+            .expect("first paced segment should transmit immediately");
+        // The peer acknowledges everything and closes its window, long
+        // after the pacing time the send left behind.
+        let now = sent_at + 1_000_000_000;
+        let _ = deliver_segment(
+            &mut socket,
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 101,
+                acknowledgement: 16,
+                flags: TcpFlags::ACK,
+                window_size: 0,
+                options: TcpOptions::empty(),
+                payload: &[],
+            },
+            now,
+        );
+        assert_eq!(socket.queue_send(b"ijkl"), 4);
+        assert_eq!(
+            socket.take_transmit_segment(now, TcpSegmentBudget::wire_segments(usize::MAX)),
+            None
+        );
+
+        let deadline = socket
+            .next_deadline_nanos()
+            .expect("queued data behind a closed window keeps the persist timer");
+        assert!(
+            deadline > now,
+            "deadline {deadline} must lie after now {now}, not at the stale pacing time"
+        );
+        assert_eq!(
+            Some(deadline),
+            socket.persist_timer.map(TcpPersistTimer::deadline_nanos)
+        );
     }
 
     #[test]
