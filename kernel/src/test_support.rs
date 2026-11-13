@@ -110,6 +110,14 @@ impl Cpu for TestCpu {
 
     fn wake_processor(&self, _: ProcessorId) {}
 
+    fn stop_current(&self) {
+        panic!("test CPU never stops a processor")
+    }
+
+    fn restart_processor(&self, _: ProcessorId) {
+        panic!("test CPU never restarts a processor")
+    }
+
     fn now(&self) -> Instant {
         Instant::new(11)
     }
@@ -157,10 +165,11 @@ pub(crate) fn test_root_entropy() -> crate::RootEntropyHandle {
     )
 }
 
-/// A timer owned by the processor the calling test thread stands for,
-/// as [`crate::Executor::timer`] builds one on every processor.
+/// A timer whose base belongs to the processor the calling test thread
+/// stands for, as [`crate::Executor::timer`] brings one online on every
+/// processor, on a group of its own so no other test's sleeps share it.
 pub(crate) fn test_timer<CpuImpl: Cpu + Clone>(cpu: CpuImpl) -> crate::Timer<CpuImpl> {
-    crate::Executor::new(
+    crate::Executor::isolated(
         helios_hal::watchdog::ProgressCounter::new(),
         cpu.processor_count(),
         helios_hal::cpu::current_processor(),
@@ -219,6 +228,14 @@ impl Cpu for ManualClockCpu {
     fn start_processor(&self, _: ProcessorId) {}
 
     fn wake_processor(&self, _: ProcessorId) {}
+
+    fn stop_current(&self) {
+        panic!("test CPU never stops a processor")
+    }
+
+    fn restart_processor(&self, _: ProcessorId) {
+        panic!("test CPU never restarts a processor")
+    }
 
     fn now(&self) -> Instant {
         Instant::new(self.nanos.load(Ordering::Relaxed))
@@ -330,6 +347,14 @@ impl Cpu for RecordingSmpCpu {
 
     fn wake_processor(&self, processor: ProcessorId) {
         self.woken.lock().push(processor);
+    }
+
+    fn stop_current(&self) {
+        self.base.stop_current();
+    }
+
+    fn restart_processor(&self, processor: ProcessorId) {
+        self.base.restart_processor(processor);
     }
 
     fn now(&self) -> Instant {
@@ -518,6 +543,28 @@ pub(crate) struct RecordingNetworkInterface {
     inner: Arc<RecordingInterfaceState>,
 }
 
+/// A point in one drain's pass where it stops, pair held, until the
+/// test that armed it through [`RecordingNetworkInterface::pause_drain`]
+/// lets it go.
+pub(crate) struct DrainPause {
+    pair: usize,
+    after: usize,
+    reached: std::sync::Barrier,
+    resume: std::sync::Barrier,
+}
+
+impl DrainPause {
+    /// Blocks until the paused drain has reached its pause.
+    pub(crate) fn wait_until_reached(&self) {
+        self.reached.wait();
+    }
+
+    /// Lets the paused drain finish its pass.
+    pub(crate) fn resume(&self) {
+        self.resume.wait();
+    }
+}
+
 /// What one queue pair hands the next drain, in the order the device
 /// produced it.
 enum PendingReceive {
@@ -536,6 +583,13 @@ struct RecordingInterfaceState {
     /// order. A test that wants to prove the kernel takes a frame off
     /// the device has to put one there first.
     pending: alloc::vec::Vec<spin::Mutex<alloc::collections::VecDeque<PendingReceive>>>,
+    /// Each queue pair's drain hold, the stand-in for the driver's
+    /// receive state: taken with `try_lock` for a whole pass, apart from
+    /// `pending` so the device side can keep completing into a held
+    /// ring.
+    holds: alloc::vec::Vec<spin::Mutex<()>>,
+    /// A drain a test asked to stop partway through its pass.
+    pause: spin::Mutex<Option<Arc<DrainPause>>>,
     /// Wakes whatever is parked on the same pair's counter — a per-queue
     /// interrupt reaches the pair's listeners and nobody else's, the
     /// way the real driver's does.
@@ -577,6 +631,8 @@ impl RecordingNetworkInterface {
                 pending: (0..queue_pairs)
                     .map(|_| spin::Mutex::new(alloc::collections::VecDeque::new()))
                     .collect(),
+                holds: (0..queue_pairs).map(|_| spin::Mutex::new(())).collect(),
+                pause: spin::Mutex::new(None),
                 queue_signals: (0..queue_pairs)
                     .map(|_| crate::ProgressSignal::new())
                     .collect(),
@@ -614,6 +670,74 @@ impl RecordingNetworkInterface {
             .lock()
             .push_back(PendingReceive::Refusal(error));
         self.complete_on(queue_idx);
+    }
+
+    /// Makes the next drain of `queue_idx` that has lent `frames` frames
+    /// stop once it has taken the next one off the ring, still holding
+    /// the pair, until the test resumes it.
+    ///
+    /// This is a processor caught mid-delivery, in the one window where
+    /// a frame is off the ring and not yet delivered: the frames in
+    /// front of the pause are in their shards, one is in the drainer's
+    /// hands, the rest are still on the ring, and the pair is held. A
+    /// test drives a second drainer into that window from another
+    /// thread.
+    pub(crate) fn pause_drain(&self, queue_idx: usize, frames: usize) -> Arc<DrainPause> {
+        let pause = Arc::new(DrainPause {
+            pair: self.inner.pair(queue_idx),
+            after: frames,
+            reached: std::sync::Barrier::new(2),
+            resume: std::sync::Barrier::new(2),
+        });
+        let previous = self.inner.pause.lock().replace(pause.clone());
+        assert!(previous.is_none(), "a drain pause was already armed");
+        pause
+    }
+
+    /// One held pass over `pair`'s pending completions: up to `budget`
+    /// frames through `sink`, stopping at a refusal.
+    fn drain_held_pair<Sink>(
+        &self,
+        pair: usize,
+        budget: usize,
+        sink: &mut Sink,
+    ) -> helios_netstack::RxDrain
+    where
+        Sink: FnMut(&helios_netstack::RxFrame),
+    {
+        let mut received = 0;
+        while received < budget {
+            let next = self.inner.pending[pair].lock().pop_front();
+            match next {
+                Some(PendingReceive::Frame(frame)) => {
+                    self.pause_if_asked(pair, received);
+                    sink(&frame);
+                    received += 1;
+                }
+                Some(PendingReceive::Refusal(error)) => {
+                    return helios_netstack::RxDrain::refused(received, error);
+                }
+                None => break,
+            }
+        }
+        helios_netstack::RxDrain::completed(received)
+    }
+
+    /// Blocks this drain, pair held and a popped frame not yet lent,
+    /// when a test armed a pause for exactly this point of its pass.
+    /// The pause fires once.
+    fn pause_if_asked(&self, pair: usize, lent: usize) {
+        let pause = {
+            let mut armed = self.inner.pause.lock();
+            match armed.as_ref() {
+                Some(pause) if pause.pair == pair && pause.after == lent => armed.take(),
+                _ => None,
+            }
+        };
+        if let Some(pause) = pause {
+            pause.reached.wait();
+            pause.resume.wait();
+        }
     }
 
     /// Raises the event one queue pair's completions raise, as the
@@ -679,61 +803,30 @@ impl helios_netstack::NetworkInterface for RecordingNetworkInterface {
         }
     }
 
-    fn try_receive<'a>(
-        &'a self,
-        _: &'a mut helios_netstack::PacketBuffer,
-    ) -> impl core::future::Future<Output = helios_hal::io::IoResult<bool>> + Send + 'a {
-        core::future::ready(Ok(false))
-    }
-
-    fn try_receive_frame(
+    fn try_receive_frames_immediate_on<Sink>(
         &self,
-    ) -> impl core::future::Future<
-        Output = helios_hal::io::IoResult<Option<helios_netstack::RxFrame>>,
-    > + Send {
-        core::future::ready(Ok(None))
-    }
-
-    fn try_receive_frames_immediate_on<'a, 'slots>(
-        &'a self,
         queue_idx: usize,
-        slots: &'slots mut [Option<helios_netstack::RxFrame>],
+        budget: usize,
+        mut sink: Sink,
     ) -> Option<helios_netstack::RxDrain>
     where
-        'a: 'slots,
+        Sink: FnMut(&helios_netstack::RxFrame),
     {
-        let mut pending = self.inner.pending[queue_idx].lock();
-        let mut received = 0;
-        for slot in slots.iter_mut() {
-            match pending.pop_front() {
-                Some(PendingReceive::Frame(frame)) => {
-                    *slot = Some(frame);
-                    received += 1;
-                }
-                Some(PendingReceive::Refusal(error)) => {
-                    return Some(helios_netstack::RxDrain::refused(received, error));
-                }
-                None => break,
-            }
+        let pair = self.inner.pair(queue_idx);
+        let drain = {
+            // The pair is held for the whole pass and each frame reaches
+            // the sink inside it, as the driver's receive state is: a
+            // second drainer that arrives meanwhile is turned away,
+            // while the ring itself stays open to the device.
+            let _hold = self.inner.holds[pair].try_lock()?;
+            self.drain_held_pair(pair, budget, &mut sink)
+        };
+        // Completions left behind are announced once the pair is let
+        // go, the way the driver wakes the drainers it turned away.
+        if !self.inner.pending[pair].lock().is_empty() {
+            self.complete_on(pair);
         }
-        Some(helios_netstack::RxDrain::completed(received))
-    }
-
-    fn repost_rx_frame<'a>(
-        &'a self,
-        _: helios_netstack::RxFrame,
-    ) -> impl core::future::Future<Output = helios_hal::io::IoResult<()>> + Send + 'a {
-        core::future::ready(Ok(()))
-    }
-
-    fn repost_rx_frames_immediate<'a, 'slots>(
-        &'a self,
-        _: &'slots mut [Option<helios_netstack::RxFrame>],
-    ) -> helios_hal::io::IoResult<Option<()>>
-    where
-        'a: 'slots,
-    {
-        Ok(Some(()))
+        Some(drain)
     }
 
     fn try_transmit_scatter_immediate_on(

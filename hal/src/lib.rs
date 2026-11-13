@@ -19,6 +19,8 @@ pub mod input;
 pub mod interrupt;
 pub mod io;
 pub mod iommu;
+pub mod measured_boot;
+pub mod measured_boot_model;
 pub mod memory;
 pub mod mmio;
 pub mod pmm;
@@ -194,9 +196,11 @@ pub struct Platform<
     Cpu: cpu::Cpu,
     Regions,
     WatchdogImpl = watchdog::NoWatchdog,
+    MeasuredBootImpl = measured_boot::NoMeasuredBoot,
 > where
     Regions: IntoIterator<Item = MemoryRegion>,
     WatchdogImpl: watchdog::Watchdog,
+    MeasuredBootImpl: measured_boot::MeasuredBoot,
 {
     pub console: Console,
     pub cpu: Cpu,
@@ -206,6 +210,9 @@ pub struct Platform<
     pub dma_model: DmaModel,
     pub devices: DeviceInventory,
     pub watchdog: WatchdogImpl,
+    /// The platform's measured-boot device, present only when the chain
+    /// that loaded the kernel measured it into that device.
+    pub measured_boot: Option<MeasuredBootImpl>,
 }
 
 impl<Console: Write + Send + 'static, Cpu: cpu::Cpu, Regions> Platform<Console, Cpu, Regions>
@@ -243,6 +250,46 @@ where
             dma_model: DmaModel::Identity,
             devices: DeviceInventory::new(),
             watchdog,
+            measured_boot: None,
+        }
+    }
+}
+
+impl<Console: Write + Send + 'static, Cpu: cpu::Cpu, Regions, WatchdogImpl, MeasuredBootImpl>
+    Platform<Console, Cpu, Regions, WatchdogImpl, MeasuredBootImpl>
+where
+    Regions: IntoIterator<Item = MemoryRegion>,
+    WatchdogImpl: watchdog::Watchdog,
+    MeasuredBootImpl: measured_boot::MeasuredBoot,
+{
+    /// The same platform with `measured_boot` as its measured-boot
+    /// device. A backend passes `None` when the device is absent or the
+    /// chain that loaded the kernel did not measure into it.
+    pub fn with_measured_boot<Next: measured_boot::MeasuredBoot>(
+        self,
+        measured_boot: Option<Next>,
+    ) -> Platform<Console, Cpu, Regions, WatchdogImpl, Next> {
+        let Self {
+            console,
+            cpu,
+            memory_regions,
+            topology,
+            timer_frequency_hz,
+            dma_model,
+            devices,
+            watchdog,
+            measured_boot: _,
+        } = self;
+        Platform {
+            console,
+            cpu,
+            memory_regions,
+            topology,
+            timer_frequency_hz,
+            dma_model,
+            devices,
+            watchdog,
+            measured_boot,
         }
     }
 
@@ -345,6 +392,14 @@ mod tests {
             panic!("test CPU should not wake processors")
         }
 
+        fn stop_current(&self) {
+            panic!("test CPU should not stop processors")
+        }
+
+        fn restart_processor(&self, _processor: ProcessorId) {
+            panic!("test CPU should not restart processors")
+        }
+
         fn now(&self) -> cpu::Instant {
             cpu::Instant::new(0)
         }
@@ -389,6 +444,23 @@ mod tests {
         assert_eq!(platform.timer_frequency_hz, 24_000_000);
         assert_eq!(platform.dma_model, DmaModel::Identity);
         assert_eq!(platform.devices, DeviceInventory::new());
+        assert!(platform.measured_boot.is_none());
+    }
+
+    #[test]
+    fn a_measured_boot_device_replaces_the_absent_one() {
+        use crate::measured_boot::{MeasuredBoot, MeasurementRegister, MeasurementSet};
+        use crate::measured_boot_model::MeasuredBootModel;
+
+        let registers =
+            MeasurementSet::of(&[MeasurementRegister::new(4), MeasurementRegister::new(9)]);
+        let platform = Platform::new(TestConsole, empty_regions(), TestCpu::new())
+            .with_measured_boot(Some(MeasuredBootModel::new(registers)));
+
+        let device = platform
+            .measured_boot
+            .expect("the platform must carry the device it was given");
+        assert_eq!(device.kernel_image_registers(), registers);
     }
 
     #[test]

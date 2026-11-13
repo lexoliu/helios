@@ -16,6 +16,9 @@ interface mounts {
     boot-image,
     /// The host share, when the platform attached one.
     host-share,
+    /// The EROFS image on the disk that reported this serial. Always
+    /// read-only.
+    disk(string),
   }
 
   record mount-request {
@@ -45,6 +48,11 @@ interface mounts {
     unavailable,
     /// The mount point, or the directory holding it, cannot take a mount.
     invalid-path,
+    /// The source holds no filesystem the kernel can read: a malformed
+    /// image, or one whose checksum does not match.
+    invalid-filesystem,
+    /// Reading the source failed.
+    io,
   }
 
   record mount-error {

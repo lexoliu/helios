@@ -59,15 +59,22 @@ use super::super::{StoreData, guest_memory, view_trap};
 /// does: the window is the capability, not the import. A program that
 /// never asks for one learns nothing from having it, and one that asks
 /// on a machine with no compositor is told `unavailable`.
-pub(in crate::wasmtime_adapter::component_host) fn add_surface_to_linker<CpuImpl, Net, HostFs>(
-    linker: &mut Linker<StoreData<CpuImpl, Net, HostFs>>,
+pub(in crate::wasmtime_adapter::component_host) fn add_surface_to_linker<
+    CpuImpl,
+    Net,
+    StorageImpl,
+>(
+    linker: &mut Linker<StoreData<CpuImpl, Net, StorageImpl>>,
 ) -> wasmtime::Result<()>
 where
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    surface_wit::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, HostFs>>>(linker, |state| state)
+    surface_wit::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>(
+        linker,
+        |state| state,
+    )
 }
 
 /// One client window, as its store records it.
@@ -116,19 +123,19 @@ const fn provider_error(error: ProviderError) -> SurfaceServiceError {
     }
 }
 
-impl<CpuImpl, Net, HostFs> surface_wit::Host for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> surface_wit::Host for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
 }
 
-impl<CpuImpl, Net, HostFs> surface_wit::HostSurface for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> surface_wit::HostSurface for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn size(
         &mut self,
@@ -203,13 +210,13 @@ impl<T: 'static> StreamProducer<T> for SurfaceEventStreamProducer {
     }
 }
 
-impl<CpuImpl, Net, HostFs, U> surface_wit::HostWithStore<U>
-    for HasSelf<StoreData<CpuImpl, Net, HostFs>>
+impl<CpuImpl, Net, StorageImpl, U> surface_wit::HostWithStore<U>
+    for HasSelf<StoreData<CpuImpl, Net, StorageImpl>>
 where
     U: 'static,
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     async fn create(
         accessor: &Accessor<U, Self>,
@@ -343,13 +350,13 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs, U> surface_wit::HostSurfaceWithStore<U>
-    for HasSelf<StoreData<CpuImpl, Net, HostFs>>
+impl<CpuImpl, Net, StorageImpl, U> surface_wit::HostSurfaceWithStore<U>
+    for HasSelf<StoreData<CpuImpl, Net, StorageImpl>>
 where
     U: 'static,
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn events(
         mut accessor: Access<'_, U, Self>,

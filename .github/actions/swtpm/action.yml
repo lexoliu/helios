@@ -1,0 +1,20 @@
+name: Provision swtpm
+description: >-
+  Lets `swtpm` open the control socket the inspector hands it. Ubuntu
+  confines `swtpm` with an AppArmor profile that names where it may
+  create sockets (libvirt's directories, `/tmp` and the owner's home),
+  and the inspector keeps a VM's sockets in a short directory under
+  `$XDG_RUNTIME_DIR`, which the profile does not cover: `swtpm` exits
+  with "Could not open UnixIO socket: Permission denied". The profile
+  includes `local/usr.bin.swtpm` for site additions, which is where the
+  socket's path is granted.
+runs:
+  using: composite
+  steps:
+    - name: Provision swtpm
+      shell: bash
+      run: |
+        swtpm --version
+        echo 'owner /run/user/[0-9]*/helios-*/swtpm.sock rwk,' \
+          | sudo tee /etc/apparmor.d/local/usr.bin.swtpm
+        sudo apparmor_parser -r /etc/apparmor.d/usr.bin.swtpm

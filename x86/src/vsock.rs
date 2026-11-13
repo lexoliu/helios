@@ -42,9 +42,9 @@ pub(crate) fn discover(pci: &PciRoot) -> Option<PciAddress> {
 /// Brings up the virtio-vsock function at `address` and publishes it as
 /// the machine's host link.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn install<WatchdogImpl>(
+pub(crate) fn install<WatchdogImpl, MeasuredBootImpl>(
     cpu: &crate::X86Cpu,
-    kernel: &helios_kernel::Kernel<crate::X86Cpu, WatchdogImpl>,
+    kernel: &helios_kernel::Kernel<crate::X86Cpu, WatchdogImpl, MeasuredBootImpl>,
     pci: &PciRoot,
     address: PciAddress,
     physical_memory_offset: usize,
@@ -54,6 +54,7 @@ pub(crate) fn install<WatchdogImpl>(
 ) -> VirtioVsockFunction
 where
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
 {
     let msix_vector = pci.bind_msix_vector(address, vector, destination_apic_id);
     let device = helios_virtio::vsock_from_pci(

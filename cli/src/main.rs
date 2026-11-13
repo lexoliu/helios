@@ -11,8 +11,7 @@ use ed25519_dalek::{SecretKey, SigningKey, VerifyingKey};
 use fatfs::{FatType, FileSystem, FormatVolumeOptions, FsOptions};
 use helios_artifact::bootfs::{self, WriteEntry};
 use helios_artifact::{
-    CwasmTarget, IsaLevelError, TrailerError, cwasm_target_isa_levels,
-    cwasm_target_supports_wasm_simd, sign_payload_with_key,
+    CwasmTarget, IsaLevelError, cwasm_target_isa_levels, cwasm_target_supports_wasm_simd,
 };
 use helios_compiler_support::{AotCompileHint, CompileError, precompile_artifact};
 use helios_profdata::{
@@ -39,10 +38,6 @@ mod venus_fetch;
 #[derive(Debug, thiserror::Error)]
 enum CliError {
     #[error("{0}")]
-    Aot(#[from] AotError),
-    #[error("{0}")]
-    CompilerPlugin(#[from] CompilerPluginError),
-    #[error("{0}")]
     KernelPrebuild(#[from] PrebuildError),
     #[error("{0}")]
     LimineUefiImage(#[from] LimineError),
@@ -52,70 +47,6 @@ enum CliError {
     VenusProtocolFetch(#[from] venus_fetch::VenusFetchError),
     #[error("{0}")]
     WorkspaceRoot(#[from] WorkspaceRootError),
-}
-
-/// Why an ahead-of-time compile did not produce a signed artifact.
-#[derive(Debug, thiserror::Error)]
-enum AotError {
-    #[error("{0}")]
-    Key(#[from] KeyError),
-    #[error("failed to read {path}: {source}")]
-    ReadInput {
-        path: String,
-        #[source]
-        source: io::Error,
-    },
-    #[error("{0}")]
-    IsaLevel(#[from] IsaLevelError),
-    #[error("{0}")]
-    Compile(#[from] CompileError),
-    #[error("failed to sign AOT payload: {source}")]
-    Sign {
-        #[source]
-        source: TrailerError,
-    },
-    #[error("failed to write {path}: {source}")]
-    WriteOutput {
-        path: String,
-        #[source]
-        source: io::Error,
-    },
-}
-
-/// Why the in-kernel compiler plugin could not be compiled and signed.
-#[derive(Debug, thiserror::Error)]
-enum CompilerPluginError {
-    #[error("{COMPILER_PLUGIN_ROOT_KEY_ENV} is required: {source}")]
-    MissingRootKey {
-        #[source]
-        source: std::env::VarError,
-    },
-    #[error("failed to decode compiler plugin root key: {source}")]
-    DecodeRootKey {
-        #[source]
-        source: hex::FromHexError,
-    },
-    #[error("root key must be 32 bytes, got {len}")]
-    RootKeyLength { len: usize },
-    #[error("failed to read wasm from stdin: {source}")]
-    ReadStdin {
-        #[source]
-        source: io::Error,
-    },
-    #[error("{0}")]
-    IsaLevel(#[from] IsaLevelError),
-    #[error("{0}")]
-    Compile(#[from] CompileError),
-    #[error("failed to sign compiler plugin output: {source}")]
-    Sign {
-        #[source]
-        source: TrailerError,
-    },
-    #[error("failed to write signed cwasm to stdout: {source}")]
-    WriteStdout {
-        #[source]
-        source: io::Error,
-    },
 }
 
 /// Why the root signing keypair could not be read or written.
@@ -148,6 +79,10 @@ enum KeyError {
         "{path} is a secret key with mode {mode:03o}; it must be readable by its owner alone (600)"
     )]
     SecretKeyExposed { path: String, mode: u32 },
+    #[error(
+        "--root-secret-key {path} is not a file; the key a release signs with is never generated"
+    )]
+    SuppliedKeyMissing { path: String },
 }
 
 /// The mode a secret key file is created with: its owner reads and writes
@@ -182,11 +117,6 @@ enum PrebuildError {
         path: String,
         #[source]
         source: io::Error,
-    },
-    #[error("failed to sign init AOT payload: {source}")]
-    SignInit {
-        #[source]
-        source: TrailerError,
     },
     #[error("failed to write {path}: {source}")]
     Write {
@@ -369,14 +299,6 @@ enum BootfsError {
         #[source]
         source: io::Error,
     },
-    #[error("failed to sign {payload} AOT payload: {source}")]
-    Sign {
-        /// Which payload was being signed, spelled the way the message
-        /// reads it.
-        payload: String,
-        #[source]
-        source: TrailerError,
-    },
     #[error("failed to write {path}: {source}")]
     Write {
         path: String,
@@ -545,6 +467,9 @@ const PREBUILD_MANIFEST_FILE: &str = "kernel-prebuild.json";
 /// user payload the kernel used to link in, delivered as a boot module.
 const BOOTFS_IMAGE_FILE: &str = "helios-bootfs";
 const DEFAULT_INIT_ARGV0: &str = "/init.wasm";
+/// The boot-program name `programs/init` answers to, published at
+/// `bin/init` like every other boot program.
+const INIT_COMMAND: &str = "init";
 const DEFAULT_BOOT_ARTIFACTS_MANIFEST: &str = "tools/wasi-apps/boot-artifacts.toml";
 /// Why the kernel profile did not reach the store.
 ///
@@ -662,7 +587,6 @@ enum ProfileFetchError {
 }
 
 const COMPILER_PLUGIN_BOOTFS_PATH: &str = "bin/compiler.cwasm";
-const COMPILER_PLUGIN_ROOT_KEY_ENV: &str = "HELIOS_COMPILER_ROOT_KEY_HEX";
 const COMPILER_PLUGIN_SHARED_MEMORY_MAX_BYTES: usize = 512 * 1024 * 1024;
 const LIMINE_IMAGE_BYTES: u64 = 768 * 1024 * 1024;
 const LIMINE_PARTITION_START_LBA: u32 = 2048;
@@ -693,8 +617,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    Aot(AotCommand),
-    CompilerPlugin(CompilerPluginCommand),
     KernelPrebuild(KernelPrebuildCommand),
     LimineUefiImage(LimineUefiImageCommand),
     ProfileFetch(ProfileFetchCommand),
@@ -719,34 +641,6 @@ impl From<Hint> for AotCompileHint {
 }
 
 #[derive(Parser)]
-struct AotCommand {
-    #[arg(long)]
-    input: PathBuf,
-    #[arg(long)]
-    output: PathBuf,
-    #[arg(long)]
-    target: String,
-    /// The ISA level to compile for, one of the target's defined levels.
-    #[arg(long)]
-    isa_level: String,
-    #[arg(long, default_value = "performance")]
-    hint: Hint,
-    #[arg(long)]
-    root_key: PathBuf,
-}
-
-#[derive(Parser)]
-struct CompilerPluginCommand {
-    #[arg(long)]
-    target: String,
-    /// The ISA level to compile for, one of the target's defined levels.
-    #[arg(long)]
-    isa_level: String,
-    #[arg(long, default_value = "performance")]
-    hint: Hint,
-}
-
-#[derive(Parser)]
 struct KernelPrebuildCommand {
     #[arg(long)]
     out_dir: PathBuf,
@@ -768,6 +662,14 @@ struct KernelPrebuildCommand {
     boot_artifacts_manifest: PathBuf,
     #[arg(long = "no-compiler-plugin", default_value_t = false)]
     no_compiler_plugin: bool,
+    /// Sign the payload with the 32-byte Ed25519 secret in this file
+    /// instead of the key generated in `--out-dir`.
+    ///
+    /// The file is read in place and nothing secret is written to
+    /// `--out-dir`; a release build names the key its workflow
+    /// installed.
+    #[arg(long, value_name = "PATH")]
+    root_secret_key: Option<PathBuf>,
 }
 
 #[derive(Parser)]
@@ -878,15 +780,13 @@ struct ExternalBootArtifact {
 /// The inputs every bootfs asset build shares.
 ///
 /// They travel together because each asset is compiled by the same cargo, for
-/// the same profile and target, signed by the same root key, and resolved
-/// against the same checkout.
+/// the same profile and target, and resolved against the same checkout.
 struct BootBuild<'a> {
     cargo: &'a Path,
     profile: &'a str,
     out_dir: &'a Path,
     /// The level every boot artifact is compiled for: the target's floor.
     target: &'a CwasmTarget<'a>,
-    root_signing_key: &'a SigningKey,
     workspace_root: &'a WorkspaceRoot,
 }
 
@@ -912,8 +812,6 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<(), CliError> {
     match cli.command {
-        Commands::Aot(command) => Ok(run_aot(command)?),
-        Commands::CompilerPlugin(command) => Ok(run_compiler_plugin(command)?),
         Commands::KernelPrebuild(command) => {
             Ok(run_kernel_prebuild(command, cli.workspace_root.as_deref())?)
         }
@@ -928,46 +826,6 @@ fn run(cli: Cli) -> Result<(), CliError> {
     }
 }
 
-fn run_aot(command: AotCommand) -> Result<(), AotError> {
-    let root_signing_key = read_signing_key(&command.root_key)?;
-    let wasm = fs::read(&command.input).map_err(|source| AotError::ReadInput {
-        path: command.input.display().to_string(),
-        source,
-    })?;
-    let target = CwasmTarget::new(&command.target, &command.isa_level)?;
-    let payload = precompile_artifact(&wasm, &target, command.hint.into())?.bytes;
-    let signed = sign_payload_with_key(&payload, &root_signing_key)
-        .map_err(|source| AotError::Sign { source })?;
-    fs::write(&command.output, signed).map_err(|source| AotError::WriteOutput {
-        path: command.output.display().to_string(),
-        source,
-    })?;
-    Ok(())
-}
-
-fn run_compiler_plugin(command: CompilerPluginCommand) -> Result<(), CompilerPluginError> {
-    let root_key_hex = std::env::var(COMPILER_PLUGIN_ROOT_KEY_ENV)
-        .map_err(|source| CompilerPluginError::MissingRootKey { source })?;
-    let root_key_bytes: [u8; 32] = hex::decode(root_key_hex.trim())
-        .map_err(|source| CompilerPluginError::DecodeRootKey { source })?
-        .try_into()
-        .map_err(|bytes: Vec<u8>| CompilerPluginError::RootKeyLength { len: bytes.len() })?;
-    let root_signing_key = SigningKey::from_bytes(&root_key_bytes);
-
-    let mut wasm = Vec::new();
-    io::stdin()
-        .read_to_end(&mut wasm)
-        .map_err(|source| CompilerPluginError::ReadStdin { source })?;
-    let target = CwasmTarget::new(&command.target, &command.isa_level)?;
-    let payload = precompile_artifact(&wasm, &target, command.hint.into())?.bytes;
-    let signed = sign_payload_with_key(&payload, &root_signing_key)
-        .map_err(|source| CompilerPluginError::Sign { source })?;
-    io::stdout()
-        .write_all(&signed)
-        .map_err(|source| CompilerPluginError::WriteStdout { source })?;
-    Ok(())
-}
-
 fn run_kernel_prebuild(
     command: KernelPrebuildCommand,
     explicit_workspace_root: Option<&Path>,
@@ -978,9 +836,18 @@ fn run_kernel_prebuild(
         source,
     })?;
 
-    let root_secret_path = command.out_dir.join(ROOT_SECRET_FILE);
     let root_public_path = command.out_dir.join(ROOT_PUBLIC_FILE);
-    let root_signing_key = ensure_root_keypair(&root_secret_path, &root_public_path)?;
+    let (root_secret_path, root_signing_key) = match &command.root_secret_key {
+        Some(supplied) => (
+            supplied.clone(),
+            supplied_root_keypair(supplied, &root_public_path)?,
+        ),
+        None => {
+            let generated = command.out_dir.join(ROOT_SECRET_FILE);
+            let key = ensure_root_keypair(&generated, &root_public_path)?;
+            (generated, key)
+        }
+    };
 
     let init_manifest = workspace_root.join(&command.init_manifest);
     let bootfs_root = workspace_root.join(&command.bootfs_root);
@@ -1010,9 +877,7 @@ fn run_kernel_prebuild(
     let target = CwasmTarget::new(&command.target, floor.name())?;
     let init_payload =
         precompile_artifact(&init_component_bytes, &target, Hint::Performance.into())?.bytes;
-    let init_signed = sign_payload_with_key(&init_payload, &root_signing_key)
-        .map_err(|source| PrebuildError::SignInit { source })?;
-    fs::write(&init_cwasm, init_signed).map_err(|source| PrebuildError::Write {
+    fs::write(&init_cwasm, init_payload).map_err(|source| PrebuildError::Write {
         path: init_cwasm.display().to_string(),
         source,
     })?;
@@ -1022,7 +887,6 @@ fn run_kernel_prebuild(
         profile: &command.profile,
         out_dir: &command.out_dir,
         target: &target,
-        root_signing_key: &root_signing_key,
         workspace_root: &workspace_root,
     };
     let mut bootfs_assets = Vec::new();
@@ -1034,6 +898,16 @@ fn run_kernel_prebuild(
         &selected_programs,
         &boot_artifacts_manifest,
     )?);
+    if selected_programs
+        .as_ref()
+        .is_none_or(|selected| selected.contains(INIT_COMMAND))
+    {
+        bootfs_assets.push(BootAsset {
+            path: format!("bin/{INIT_COMMAND}"),
+            source: resolve_bootfs_source(&init_cwasm)?,
+            kind: BootAssetKind::File,
+        });
+    }
 
     let bootfs_path = command.out_dir.join(BOOTFS_IMAGE_FILE);
     write_bootfs_image(
@@ -1042,6 +916,7 @@ fn run_kernel_prebuild(
         &bootfs_assets,
         &init_cwasm,
         &command.init_argv0,
+        &root_signing_key,
     )?;
 
     let resolve = |path: &Path| {
@@ -1084,6 +959,7 @@ fn write_bootfs_image(
     assets: &[BootAsset],
     init_component: &Path,
     init_argv0: &str,
+    signing_key: &SigningKey,
 ) -> Result<(), PrebuildError> {
     let mut directories = Vec::new();
     let mut files = Vec::new();
@@ -1185,7 +1061,8 @@ fn write_bootfs_image(
         modified_nanos: 0,
     });
 
-    fs::write(image_path, bootfs::write_image(&entries)).map_err(|source| PrebuildError::Write {
+    let signed = bootfs::sign_image(bootfs::write_image(&entries), signing_key);
+    fs::write(image_path, signed).map_err(|source| PrebuildError::Write {
         path: image_path.display().to_string(),
         source,
     })
@@ -1591,12 +1468,6 @@ fn build_compiler_plugin_asset(build: &BootBuild<'_>) -> Result<BootAsset, Bootf
         source,
     })?;
     let payload = precompile_artifact(&wasm, build.target, Hint::Performance.into())?.bytes;
-    let signed = sign_payload_with_key(&payload, build.root_signing_key).map_err(|source| {
-        BootfsError::Sign {
-            payload: "compiler plugin".to_owned(),
-            source,
-        }
-    })?;
     // The exact module this run precompiled into the bootfs, at a path that
     // does not depend on cargo's target-directory layout: the bench's Linux
     // + Wasmtime column runs this file under `helios-compiler-host`, so both
@@ -1607,7 +1478,7 @@ fn build_compiler_plugin_asset(build: &BootBuild<'_>) -> Result<BootAsset, Bootf
         source,
     })?;
     let output_path = build.out_dir.join("compiler_plugin.cwasm");
-    write_bootfs_artifact(&output_path, signed)?;
+    write_bootfs_artifact(&output_path, payload)?;
 
     Ok(BootAsset {
         path: COMPILER_PLUGIN_BOOTFS_PATH.to_owned(),
@@ -1616,7 +1487,8 @@ fn build_compiler_plugin_asset(build: &BootBuild<'_>) -> Result<BootAsset, Bootf
     })
 }
 
-/// Writes one signed bootfs artifact to `path`.
+/// Writes one bare Wasmtime bootfs artifact to `path`; the image's own
+/// footer is what signs it.
 fn write_bootfs_artifact(path: &Path, bytes: Vec<u8>) -> Result<(), BootfsError> {
     fs::write(path, bytes).map_err(|source| BootfsError::Write {
         path: path.display().to_string(),
@@ -1686,10 +1558,12 @@ fn build_boot_program_assets(
             }
             .into());
         };
-        if command == "init" {
+        available_programs.insert(command.to_owned());
+        // Init is built once, as the payload's init component; the
+        // prebuild publishes that same artifact at `bin/init`.
+        if command == INIT_COMMAND {
             continue;
         }
-        available_programs.insert(command.to_owned());
         if selected_programs
             .as_ref()
             .is_some_and(|selected| !selected.contains(command))
@@ -1906,16 +1780,10 @@ fn build_boot_program_asset(
     let component_bytes = encode_component(&wasm_path)?;
     let payload =
         precompile_artifact(&component_bytes, build.target, Hint::Performance.into())?.bytes;
-    let signed = sign_payload_with_key(&payload, build.root_signing_key).map_err(|source| {
-        BootfsError::Sign {
-            payload: "bootfs".to_owned(),
-            source,
-        }
-    })?;
     let output_path = build
         .out_dir
         .join(format!("{}_bootfs_component.cwasm", manifest.command));
-    write_bootfs_artifact(&output_path, signed)?;
+    write_bootfs_artifact(&output_path, payload)?;
 
     Ok(BootAsset {
         path: format!("bin/{}", manifest.command),
@@ -1934,16 +1802,10 @@ fn build_external_boot_artifact_assets(
         source: error,
     })?;
     let payload = precompile_artifact(&wasm, build.target, Hint::Performance.into())?.bytes;
-    let signed = sign_payload_with_key(&payload, build.root_signing_key).map_err(|source| {
-        BootfsError::Sign {
-            payload: format!("external bootfs {}", artifact.command),
-            source,
-        }
-    })?;
     let output_path = build
         .out_dir
         .join(format!("{}_bootfs_component.cwasm", artifact.command));
-    write_bootfs_artifact(&output_path, signed)?;
+    write_bootfs_artifact(&output_path, payload)?;
 
     let mut assets = vec![BootAsset {
         path: artifact.bootfs_path,
@@ -2264,20 +2126,44 @@ fn ensure_root_keypair(
             })?;
         signing_key
     };
-    // The public key always lands next to the secret: it is the copy the
-    // kernel verifies against, and a secret that outlived its public half
-    // would otherwise sign artifacts nothing can check. The write is
-    // skipped when the bytes already match — a kernel build tracks the
-    // file through `cargo:rerun-if-changed`, and an untouched mtime is
-    // what keeps a payload-only prebuild from recompiling it.
-    let public_bytes = VerifyingKey::from(&signing_key).to_bytes();
+    write_root_public_key(&signing_key, root_public_path)?;
+    Ok(signing_key)
+}
+
+/// The root key a release names: read in place, never generated and never
+/// copied, so the only file holding the secret is the one the caller owns.
+fn supplied_root_keypair(
+    root_secret_path: &Path,
+    root_public_path: &Path,
+) -> Result<SigningKey, KeyError> {
+    if !root_secret_path.is_file() {
+        return Err(KeyError::SuppliedKeyMissing {
+            path: root_secret_path.display().to_string(),
+        });
+    }
+    let signing_key = read_signing_key(root_secret_path)?;
+    write_root_public_key(&signing_key, root_public_path)?;
+    Ok(signing_key)
+}
+
+/// The public key always lands in the prebuild directory: it is the copy
+/// the kernel verifies against, and a secret that outlived its public half
+/// would otherwise sign artifacts nothing can check. The write is
+/// skipped when the bytes already match — a kernel build tracks the
+/// file through `cargo:rerun-if-changed`, and an untouched mtime is
+/// what keeps a payload-only prebuild from recompiling it.
+fn write_root_public_key(
+    signing_key: &SigningKey,
+    root_public_path: &Path,
+) -> Result<(), KeyError> {
+    let public_bytes = VerifyingKey::from(signing_key).to_bytes();
     if fs::read(root_public_path).ok().as_deref() != Some(public_bytes.as_slice()) {
         fs::write(root_public_path, public_bytes).map_err(|source| KeyError::Write {
             path: root_public_path.display().to_string(),
             source,
         })?;
     }
-    Ok(signing_key)
+    Ok(())
 }
 
 fn read_signing_key(path: &Path) -> Result<SigningKey, KeyError> {
@@ -2751,6 +2637,67 @@ mod tests {
         assert!(
             matches!(error, KeyError::SecretKeyExposed { mode: 0o644, .. }),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn a_supplied_root_secret_signs_and_nothing_secret_is_written_beside_the_public_key() {
+        let keys = tempfile::tempdir().expect("a directory for the release key");
+        let out_dir = tempfile::tempdir().expect("a prebuild directory");
+        let supplied = keys.path().join("release.key");
+        fs::write(&supplied, [7_u8; 32]).expect("a key file");
+        fs::set_permissions(&supplied, fs::Permissions::from_mode(SECRET_KEY_MODE))
+            .expect("an owner-only mode");
+        let public = out_dir.path().join(ROOT_PUBLIC_FILE);
+
+        let key = supplied_root_keypair(&supplied, &public).expect("the supplied key is read");
+
+        let expected = VerifyingKey::from(&SigningKey::from_bytes(&[7_u8; 32])).to_bytes();
+        assert_eq!(fs::read(&public).expect("the public half"), expected);
+        let signed = bootfs::sign_image(bootfs::write_image(&[]), &key);
+        let footer_start = signed.len() - bootfs::SIGNATURE_FOOTER_BYTES;
+        // Magic, footer version and algorithm precede the signer's key.
+        let signer_offset = footer_start + 8 + 4 + 4;
+        assert_eq!(
+            &signed[signer_offset..signer_offset + 32],
+            expected.as_slice()
+        );
+        let written: Vec<_> = fs::read_dir(out_dir.path())
+            .expect("the prebuild directory")
+            .map(|entry| entry.expect("an entry").file_name())
+            .collect();
+        assert_eq!(written, [std::ffi::OsString::from(ROOT_PUBLIC_FILE)]);
+    }
+
+    #[test]
+    fn a_missing_supplied_root_secret_is_refused_naming_its_path() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let supplied = dir.path().join("absent.key");
+        let error = supplied_root_keypair(&supplied, &dir.path().join("root.pub"))
+            .expect_err("a key that is not there is never generated");
+        assert!(
+            matches!(&error, KeyError::SuppliedKeyMissing { path } if path == &supplied.display().to_string()),
+            "{error}"
+        );
+        assert!(!supplied.exists(), "nothing was generated at the path");
+    }
+
+    #[test]
+    fn a_supplied_root_secret_others_can_read_is_refused_with_its_mode() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let supplied = dir.path().join("release.key");
+        fs::write(&supplied, [7_u8; 32]).expect("a key file");
+        fs::set_permissions(&supplied, fs::Permissions::from_mode(0o640)).expect("a wider mode");
+        let public = dir.path().join("root.pub");
+        let error =
+            supplied_root_keypair(&supplied, &public).expect_err("a group-readable key is refused");
+        assert!(
+            matches!(error, KeyError::SecretKeyExposed { mode: 0o640, .. }),
+            "{error}"
+        );
+        assert!(
+            !public.exists(),
+            "no public half is written for a refused key"
         );
     }
 

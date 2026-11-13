@@ -43,6 +43,34 @@ fn hal_does_not_name_wasm_or_wasi_abstractions() {
     );
 }
 
+/// The device and protocol libraries of AGENTS.md §1: each builds on
+/// `hal/` and none on the kernel.
+const DEVICE_LIBRARIES: &[&str] = &["netstack", "virtio", "i6300esb", "tpm"];
+
+#[test]
+fn device_libraries_never_depend_on_the_kernel() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = manifest_dir
+        .parent()
+        .expect("kernel crate must live under the repository root");
+
+    let mut leaks = Vec::new();
+    for library in DEVICE_LIBRARIES {
+        let path = repo_root.join(library).join("Cargo.toml");
+        let manifest = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        if manifest.contains("helios-kernel") {
+            leaks.push(path.display().to_string());
+        }
+    }
+
+    assert!(
+        leaks.is_empty(),
+        "device and protocol libraries must not depend on the kernel:\n{}",
+        leaks.join("\n")
+    );
+}
+
 #[test]
 fn wasmtime_wasi_io_stays_inside_adapter_layer() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

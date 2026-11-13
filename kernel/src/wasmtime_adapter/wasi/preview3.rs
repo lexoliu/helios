@@ -53,26 +53,26 @@ pub(crate) const WIT_PACKAGES: &[(&str, &str)] = &[
     ("wasi:http", include_str!("../../../../wit/deps/http.wit")),
 ];
 
-pub(crate) fn add_to_linker<CpuImpl, Net, HostFs>(
-    linker: &mut Linker<StoreData<CpuImpl, Net, HostFs>>,
+pub(crate) fn add_to_linker<CpuImpl, Net, StorageImpl>(
+    linker: &mut Linker<StoreData<CpuImpl, Net, StorageImpl>>,
     imports: &WasiImportSet,
 ) -> Result<()>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     if imports.has("wasi:clocks/monotonic-clock", "0.3") {
-        wasi::clocks::monotonic_clock::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, HostFs>>>(
-            linker,
-            |state| state,
-        )?;
+        wasi::clocks::monotonic_clock::add_to_linker::<
+            _,
+            HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
+        >(linker, |state| state)?;
     }
     if imports.has("wasi:clocks/system-clock", "0.3") {
-        wasi::clocks::system_clock::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, HostFs>>>(
-            linker,
-            |state| state,
-        )?;
+        wasi::clocks::system_clock::add_to_linker::<
+            _,
+            HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
+        >(linker, |state| state)?;
     }
     if imports.has("wasi:clocks/timezone", "0.3") {
         // Every member of `wasi:clocks/timezone` is gated behind the
@@ -80,113 +80,113 @@ where
         // must opt in or the interface links with no functions at all.
         let mut options = wasi::clocks::timezone::LinkOptions::default();
         options.clocks_timezone(true);
-        wasi::clocks::timezone::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, HostFs>>>(
+        wasi::clocks::timezone::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>(
             linker,
             &options,
             |state| state,
         )?;
     }
     if imports.has("wasi:cli/environment", "0.3") {
-        wasi::cli::environment::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, HostFs>>>(
+        wasi::cli::environment::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>(
             linker,
             |state| state,
         )?;
     }
     if imports.has("wasi:cli/exit", "0.3") {
-        wasi::cli::exit::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, HostFs>>>(
+        wasi::cli::exit::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>(
             linker,
             |state| state,
         )?;
     }
     if imports.has("wasi:cli/stdin", "0.3") {
-        wasi::cli::stdin::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, HostFs>>>(
+        wasi::cli::stdin::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>(
             linker,
             |state| state,
         )?;
     }
     if imports.has("wasi:cli/stdout", "0.3") {
-        wasi::cli::stdout::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, HostFs>>>(
+        wasi::cli::stdout::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>(
             linker,
             |state| state,
         )?;
     }
     if imports.has("wasi:cli/stderr", "0.3") {
-        wasi::cli::stderr::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, HostFs>>>(
+        wasi::cli::stderr::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>(
             linker,
             |state| state,
         )?;
     }
     if imports.has("wasi:cli/terminal-input", "0.3") {
-        wasi::cli::terminal_input::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, HostFs>>>(
+        wasi::cli::terminal_input::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>(
             linker,
             |state| state,
         )?;
     }
     if imports.has("wasi:cli/terminal-output", "0.3") {
-        wasi::cli::terminal_output::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, HostFs>>>(
-            linker,
-            |state| state,
-        )?;
+        wasi::cli::terminal_output::add_to_linker::<
+            _,
+            HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
+        >(linker, |state| state)?;
     }
     if imports.has("wasi:cli/terminal-stdin", "0.3") {
-        wasi::cli::terminal_stdin::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, HostFs>>>(
+        wasi::cli::terminal_stdin::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>(
             linker,
             |state| state,
         )?;
     }
     if imports.has("wasi:cli/terminal-stdout", "0.3") {
-        wasi::cli::terminal_stdout::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, HostFs>>>(
-            linker,
-            |state| state,
-        )?;
+        wasi::cli::terminal_stdout::add_to_linker::<
+            _,
+            HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
+        >(linker, |state| state)?;
     }
     if imports.has("wasi:cli/terminal-stderr", "0.3") {
-        wasi::cli::terminal_stderr::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, HostFs>>>(
-            linker,
-            |state| state,
-        )?;
+        wasi::cli::terminal_stderr::add_to_linker::<
+            _,
+            HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
+        >(linker, |state| state)?;
     }
     if imports.has("wasi:random/random", "0.3") {
-        wasi::random::random::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, HostFs>>>(
+        wasi::random::random::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>(
             linker,
             |state| state,
         )?;
     }
     if imports.has("wasi:random/insecure", "0.3") {
-        wasi::random::insecure::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, HostFs>>>(
+        wasi::random::insecure::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>(
             linker,
             |state| state,
         )?;
     }
     if imports.has("wasi:random/insecure-seed", "0.3") {
-        wasi::random::insecure_seed::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, HostFs>>>(
-            linker,
-            |state| state,
-        )?;
+        wasi::random::insecure_seed::add_to_linker::<
+            _,
+            HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
+        >(linker, |state| state)?;
     }
     if imports.has("wasi:filesystem/types", "0.3") {
-        wasi::filesystem::types::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, HostFs>>>(
+        wasi::filesystem::types::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>(
             linker,
             |state| state,
         )?;
     }
     if imports.has("wasi:filesystem/preopens", "0.3") {
-        wasi::filesystem::preopens::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, HostFs>>>(
-            linker,
-            |state| state,
-        )?;
+        wasi::filesystem::preopens::add_to_linker::<
+            _,
+            HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
+        >(linker, |state| state)?;
     }
     if imports.has("wasi:sockets/types", "0.3") {
-        wasi::sockets::types::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, HostFs>>>(
+        wasi::sockets::types::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>(
             linker,
             |state| state,
         )?;
     }
     if imports.has("wasi:sockets/ip-name-lookup", "0.3") {
-        wasi::sockets::ip_name_lookup::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, HostFs>>>(
-            linker,
-            |state| state,
-        )?;
+        wasi::sockets::ip_name_lookup::add_to_linker::<
+            _,
+            HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
+        >(linker, |state| state)?;
     }
     Ok(())
 }

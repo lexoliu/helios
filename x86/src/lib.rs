@@ -21,6 +21,7 @@ mod pci;
 mod rtc;
 mod smp;
 mod snd;
+mod tpm;
 mod vmgenid;
 mod vsock;
 mod watchdog;
@@ -29,16 +30,20 @@ mod debug_state {
     /// The network service this machine's virtio-net function backs.
     pub(crate) type NetworkService =
         helios_kernel::NetworkService<crate::X86Cpu, crate::net::VirtioNetworkDevice>;
-    pub(crate) type RuntimeState = helios_kernel::HostRuntimeState<
-        crate::X86Cpu,
-        NetworkService,
-        crate::host_fs::HostFileSystemService,
-    >;
-    pub(crate) type ProgramService = helios_kernel::UserProgramService<
-        crate::X86Cpu,
-        NetworkService,
-        crate::host_fs::HostFileSystemService,
-    >;
+    pub(crate) type RuntimeState =
+        helios_kernel::HostRuntimeState<crate::X86Cpu, NetworkService, Storage>;
+    pub(crate) type ProgramService =
+        helios_kernel::UserProgramService<crate::X86Cpu, NetworkService, Storage>;
+
+    /// This machine's storage: the virtio-9p host share and the
+    /// virtio-blk disks.
+    #[derive(Clone, Copy)]
+    pub(crate) struct Storage;
+
+    impl helios_kernel::Storage for Storage {
+        type HostShare = crate::host_fs::HostFileSystemService;
+        type Disk = crate::block::X86VirtioBlockDevice;
+    }
 }
 
 use alloc::sync::Arc;
@@ -277,6 +282,15 @@ fn x86_kernel_main() -> ! {
     let input_functions = input::discover(&pci);
     let sound_function = snd::discover(&pci);
     let block_functions = block::discover(&pci);
+    // The TPM is checked before the kernel exists, because whether the
+    // kernel is handed one is part of the platform it is built from; the
+    // outcome is reported once the logger is up.
+    let (measured_boot, measured_boot_discovery) = tpm::discover(
+        rsdp_address,
+        physical_memory_offset,
+        cpu.clone(),
+        handoff.tables.measurement_log,
+    );
     let mut devices = DeviceInventory::new().with_debug_serial();
     if network_function.is_some() {
         devices = devices.with_network();
@@ -306,7 +320,8 @@ fn x86_kernel_main() -> ! {
                 .with_startup_policy(ProcessorStartupPolicy::BootstrapOnly),
             )
             .with_dma_model(DmaModel::Translated)
-            .with_devices(devices),
+            .with_devices(devices)
+            .with_measured_boot(measured_boot),
     );
     smp::current_runtime().install_timer(kernel.timer());
     // The first line the logger can carry. The bootloader decides where
@@ -319,6 +334,11 @@ fn x86_kernel_main() -> ! {
         physical_base = format_args!("{:#x}", handoff.kernel.physical_base),
         "kernel image loaded"
     );
+    if measured_boot_discovery.is_refusal() {
+        tracing::warn!("{measured_boot_discovery}");
+    } else {
+        tracing::info!("{measured_boot_discovery}");
+    }
     let (xsave_standard_bytes, xsave_max_bytes) = extended_state::xsave_sizes();
     let supervisor_state = extended_state::supervisor_state_support();
     tracing::info!(
@@ -454,9 +474,9 @@ fn x86_kernel_main() -> ! {
 /// an interrupt from a device the kernel never claimed fails loudly
 /// instead of being silently acknowledged.
 #[allow(clippy::too_many_arguments)]
-fn install_pci_devices<WatchdogImpl>(
+fn install_pci_devices<WatchdogImpl, MeasuredBootImpl>(
     cpu: &X86Cpu,
-    kernel: &helios_kernel::Kernel<X86Cpu, WatchdogImpl>,
+    kernel: &helios_kernel::Kernel<X86Cpu, WatchdogImpl, MeasuredBootImpl>,
     pci: &pci::PciRoot,
     physical_memory_offset: usize,
     iommu_topology: Option<iommu::IommuTopology>,
@@ -474,6 +494,7 @@ fn install_pci_devices<WatchdogImpl>(
     root_entropy: helios_kernel::RootEntropyHandle,
 ) where
     WatchdogImpl: Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
 {
     let destination_apic_id = cpu.bootstrap_apic_id();
     let mut routes = exceptions::DeviceInterruptRoutes::new();
@@ -1029,6 +1050,23 @@ impl Cpu for X86Cpu {
             .start_processor(processor, secondary_start_rust as *const () as usize);
     }
 
+    /// Saves the callee-saved context, leaves the shootdown set, masks the
+    /// local APIC timer and halts with interrupts masked until
+    /// [`Cpu::restart_processor`] sends INIT/SIPI; the handshake and what
+    /// is re-seeded on the way back are in `smp::stop_current_processor`.
+    fn stop_current(&self) {
+        smp::stop_current_processor();
+    }
+
+    /// May land at any point after the kernel published the stop: the
+    /// restart waits for the processor to reach its halt, then claims the
+    /// stop with a compare-exchange, so it restarts the processor exactly
+    /// once (`smp::X86PlatformState::restart_processor`).
+    fn restart_processor(&self, processor: ProcessorId) {
+        self.state
+            .restart_processor(processor, smp::resume_current_rust as *const () as usize);
+    }
+
     fn wake_processor(&self, processor: ProcessorId) {
         // Publish before signalling: `park_current` masks interrupts
         // around its own test, so a target on its way into HLT either
@@ -1127,13 +1165,14 @@ fn rdrand64() -> u64 {
     unsafe { rdrand64_enabled() }.expect("x86 RDRAND failed after retries")
 }
 
-fn run_current_processor<WatchdogImpl>(
+fn run_current_processor<WatchdogImpl, MeasuredBootImpl>(
     cpu: X86Cpu,
-    kernel: helios_kernel::Kernel<X86Cpu, WatchdogImpl>,
+    kernel: helios_kernel::Kernel<X86Cpu, WatchdogImpl, MeasuredBootImpl>,
     debug_state: debug_state::RuntimeState,
 ) -> !
 where
     WatchdogImpl: Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
 {
     helios_kernel::run_component_host_processor_forever(
         cpu,

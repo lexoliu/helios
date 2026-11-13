@@ -186,26 +186,32 @@ mod gpu;
 mod hand_over;
 mod host_fs;
 mod input;
+mod lifecycle;
 mod net;
 mod platform;
 mod rtc;
 mod snd;
+mod tpm;
 mod vsock;
 
 mod debug_state {
     /// The network service this machine's virtio-net device backs.
     pub(crate) type NetworkService =
         helios_kernel::NetworkService<crate::Aarch64Cpu, crate::net::VirtioNetworkDevice>;
-    pub(crate) type RuntimeState = helios_kernel::HostRuntimeState<
-        crate::Aarch64Cpu,
-        NetworkService,
-        crate::host_fs::HostFileSystemService,
-    >;
-    pub(crate) type ProgramService = helios_kernel::UserProgramService<
-        crate::Aarch64Cpu,
-        NetworkService,
-        crate::host_fs::HostFileSystemService,
-    >;
+    pub(crate) type RuntimeState =
+        helios_kernel::HostRuntimeState<crate::Aarch64Cpu, NetworkService, Storage>;
+    pub(crate) type ProgramService =
+        helios_kernel::UserProgramService<crate::Aarch64Cpu, NetworkService, Storage>;
+
+    /// This machine's storage: the virtio-9p host share and the
+    /// virtio-blk disks.
+    #[derive(Clone, Copy)]
+    pub(crate) struct Storage;
+
+    impl helios_kernel::Storage for Storage {
+        type HostShare = crate::host_fs::HostFileSystemService;
+        type Disk = crate::block::Aarch64VirtioBlockDevice;
+    }
 }
 
 /// Interrupt routes the bootstrap processor installs for the virtio
@@ -249,6 +255,11 @@ static DEVICE_TREE_BLOB_REQUEST: DtbRequest = DtbRequest::new();
 static RSDP_REQUEST: RsdpRequest = RsdpRequest::new();
 #[used]
 static STACK_SIZE_REQUEST: StackSizeRequest = StackSizeRequest::new(KERNEL_STACK_BYTES as u64);
+/// The firmware's TPM event log, which the measured-boot discovery reads
+/// to learn whether Limine measured the kernel (`tpm::discover`).
+#[used]
+static TPM_EVENT_LOG_REQUEST: helios_kernel::LimineTpmEventLogRequest =
+    helios_kernel::LimineTpmEventLogRequest::new();
 static DEBUG_SERIAL_BASE: AtomicUsize = AtomicUsize::new(0);
 static CRITICAL_SECTION_STATE: helios_hal::critical_section::CriticalSectionState =
     helios_hal::critical_section::CriticalSectionState::new();
@@ -372,10 +383,15 @@ impl ExceptionStack {
 struct Aarch64ProcessorSlot {
     mp_info: &'static MpInfo,
     runtime: ProcessorRuntime,
+    /// Whether the processor is in service, and what it resumes from.
+    power: lifecycle::ProcessorPower,
 }
 
 struct Aarch64PlatformState {
     processors: Box<[Aarch64ProcessorSlot]>,
+    /// The PSCI service that stops and restarts processors, when the
+    /// platform describes one.
+    psci: Option<lifecycle::Psci>,
     timebase: Timebase,
     /// How a failed return-address authentication shows on every
     /// processor, probed on the bootstrap processor before any other starts
@@ -400,7 +416,7 @@ fn probe_isa_answers() -> ProbeAnswers {
 }
 
 impl Aarch64PlatformState {
-    fn from_limine_mp(timebase: Timebase) -> &'static Self {
+    fn from_limine_mp(timebase: Timebase, psci: Option<platform::PsciConduit>) -> &'static Self {
         let response = MP_REQUEST
             .response()
             .unwrap_or_else(|| panic!("Limine did not provide an AArch64 MP response"));
@@ -433,12 +449,14 @@ impl Aarch64PlatformState {
                 Aarch64ProcessorSlot {
                     mp_info,
                     runtime: ProcessorRuntime::new(logical_id),
+                    power: lifecycle::ProcessorPower::new(),
                 }
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
         Box::leak(Box::new(Self {
             processors,
+            psci: psci.map(lifecycle::Psci::new),
             timebase,
             return_address_signing: cfi::bootstrap_capability(),
             instruction_key: cfi::SharedInstructionKey::new(),
@@ -475,6 +493,16 @@ impl Aarch64PlatformState {
         self.gic
             .get()
             .unwrap_or_else(|| panic!("AArch64 processor ran before the interrupt controller"))
+    }
+
+    /// The PSCI service a processor is stopped and restarted through.
+    fn psci(&self) -> lifecycle::Psci {
+        self.psci.unwrap_or_else(|| {
+            panic!(
+                "the platform describes no PSCI service (a device tree psci node, or the FADT's \
+                 PSCI_COMPLIANT flag), so a processor cannot be stopped or restarted"
+            )
+        })
     }
 
     fn bootstrap_mpidr(&self) -> u64 {
@@ -632,7 +660,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
         .describe(console)
         .unwrap_or_else(|error| panic!("AArch64 platform description failed: {error}"));
     vmm::install_user_address_space(physical_memory_offset);
-    let platform_state = Aarch64PlatformState::from_limine_mp(timebase());
+    let platform_state = Aarch64PlatformState::from_limine_mp(timebase(), platform.psci);
     activate_processor_runtime(platform_state.bootstrap_runtime());
 
     let cpu = Aarch64Cpu {
@@ -682,6 +710,11 @@ extern "C" fn aarch64_kernel_main() -> ! {
     if block_device_count != 0 {
         devices = devices.with_block_devices(block_device_count);
     }
+    // The TPM is checked before the kernel exists, because whether the
+    // kernel is handed one is part of the platform it is built from; the
+    // outcome is reported once the logger is up.
+    let (measured_boot, measured_boot_discovery) =
+        tpm::discover(&platform, physical_memory_offset, &handoff, cpu);
     let kernel = helios_kernel::init(
         Platform::new(console, core::iter::empty::<MemoryRegion>(), cpu)
             .with_topology(
@@ -693,8 +726,14 @@ extern "C" fn aarch64_kernel_main() -> ! {
             )
             .with_timer_frequency_hz(cpu.timebase().frequency())
             .with_dma_model(DmaModel::Translated)
-            .with_devices(devices),
+            .with_devices(devices)
+            .with_measured_boot(measured_boot),
     );
+    if measured_boot_discovery.is_refusal() {
+        tracing::warn!("{measured_boot_discovery}");
+    } else {
+        tracing::info!("{measured_boot_discovery}");
+    }
     tracing::info!(
         "platform described by {} console={:#x} gicd={:#x} gicr={:#x} virtio-slots={} rtc={}",
         platform.source,
@@ -1069,6 +1108,23 @@ impl Cpu for Aarch64Cpu {
 
     fn start_processor(&self, processor: ProcessorId) {
         self.state.start_processor(processor);
+    }
+
+    fn stop_current(&self) {
+        let runtime = current_processor_runtime();
+        let slot = self.state.processor_slot(runtime.logical_id());
+        slot.power.stop(
+            self.state.psci(),
+            slot.mp_info.mpidr,
+            self.state.gic(),
+            &runtime.wake_pending,
+        );
+    }
+
+    fn restart_processor(&self, processor: ProcessorId) {
+        let slot = self.state.processor_slot(processor);
+        slot.power
+            .restart(self.state.psci(), slot.mp_info.mpidr, self.state.timebase);
     }
 
     fn wake_processor(&self, processor: ProcessorId) {
@@ -2367,6 +2423,7 @@ fn limine_boot_handoff() -> LimineBootHandoff {
             device_tree_blob: DEVICE_TREE_BLOB_REQUEST
                 .response()
                 .map(|response| response.dtb_ptr as usize),
+            measurement_log: TPM_EVENT_LOG_REQUEST.measurement_log(),
         },
     }
 }

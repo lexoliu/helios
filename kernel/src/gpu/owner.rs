@@ -90,14 +90,15 @@ pub(super) const SUBMITS_IN_FLIGHT: usize = 16;
 /// nothing gets the service — so an `open` is answered `no-renderer`
 /// rather than `unavailable` — but no tasks, because no session can
 /// ever be opened on it.
-pub fn install_gpu3d_device<CpuImpl, WatchdogImpl, Device>(
-    kernel: &Kernel<CpuImpl, WatchdogImpl>,
+pub fn install_gpu3d_device<CpuImpl, WatchdogImpl, MeasuredBootImpl, Device>(
+    kernel: &Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
     cpu: &CpuImpl,
     device: Device,
 ) -> Gpu3dService
 where
     CpuImpl: Cpu + Clone + Send + Sync + 'static,
     WatchdogImpl: Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
     Device: Gpu3d + Clone,
 {
     let (shared, control_rx, submit_rx) = gpu3d_channels(device.renders());
