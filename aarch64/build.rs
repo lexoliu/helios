@@ -13,6 +13,14 @@ const ENCODED_RUSTFLAGS_SEPARATOR: char = '\x1f';
 /// and the language offers no `cfg` that reports the flag, so the build
 /// refuses it here.
 fn main() {
+    // The self-test image corrupts a signed return address on the
+    // bootstrap processor and expects the machine to refuse it
+    // (`cfi::self_test`).
+    println!("cargo:rustc-check-cfg=cfg(helios_cfi_self_test)");
+    println!("cargo:rerun-if-env-changed=HELIOS_CFI_SELF_TEST");
+    if env::var_os("HELIOS_CFI_SELF_TEST").is_some() {
+        println!("cargo:rustc-cfg=helios_cfi_self_test");
+    }
     println!("cargo:rerun-if-env-changed=CARGO_ENCODED_RUSTFLAGS");
     let flags = env::var("CARGO_ENCODED_RUSTFLAGS")
         .unwrap_or_else(|error| panic!("CARGO_ENCODED_RUSTFLAGS is unreadable: {error}"));

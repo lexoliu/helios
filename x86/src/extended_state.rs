@@ -18,18 +18,36 @@
 //! writes those components, so they survive interrupt entry/exit without
 //! XSAVE.
 //! This is deliberate: #410 measured eager AVX-512 XSAVE on every interrupt
-//! as +15–38% on interrupt/IPI-heavy rows. Timer/preemption, wake, TLB-shootdown,
-//! and device handlers do not switch context. Wasmtime trap delivery resumes
-//! at a call boundary where SysV vector registers are dead, and the FXSAVE
-//! area remains on the IST stack.
+//! as +15–38% on interrupt/IPI-heavy rows. Timer, wake, TLB-shootdown and
+//! device handlers do not switch context; the timer handler only lowers
+//! stack limits. A wasm trap resumes at the host entry's `try_call` landing,
+//! where every register is clobbered, so no guest vector value is live
+//! there, and the FXSAVE area remains on the IST stack.
 //!
-//! Fiber switches are cooperative calls; SysV makes vector registers and
-//! k-masks caller-saved, so only callee-saved GPRs switch. MXCSR and the x87
-//! control word are callee-saved but unchanged across a switch. Preemption is
-//! cooperative through a Cranelift stack-limit check and call boundary; x86 has no
-//! asynchronous preemption. The aarch64 swap trampoline does not exist here:
-//! x86 disables swap with `SwapDisabled::NoSwapHooks`. If swap is added (#25),
-//! arbitrary interruption requires full XSAVE of the enabled XCR0 state.
+//! Guest vector state, which is what AVX-512 code adds, is bounded by three
+//! properties of the Cranelift x64 backend (pinned by
+//! `compiler-support/tests/avx512_lowerings.rs`, listed in `docs/wasmtime.md`):
+//! every EVEX instruction it emits is 128 bits wide, EVEX masking is always
+//! k0, and its allocator uses xmm0-xmm15 only. Compiled code therefore never
+//! holds a live value in bits 128-511 of a register, in xmm16-xmm31 or in
+//! k1-k7; its live vector state is the low 128 bits of xmm0-xmm15 plus MXCSR.
+//!
+//! Preemption, kill and signal delivery are a stack-limit check at function
+//! entry and loop headers whose cold path calls the `stack_limit_interrupt`
+//! builtin through a `preserve_all` trampoline. Guest xmm values are live
+//! across that call. They survive it because the trampoline treats every
+//! register as callee-saved and saves xmm0-xmm15 as 128-bit values, which
+//! covers all the guest state the properties above allow.
+//!
+//! Every other switch happens in Rust host code, where SysV makes vector
+//! registers and k-masks caller-saved, or inside that trampoline. Fiber
+//! switches therefore save only the callee-saved GPRs. MXCSR and the x87
+//! control word are callee-saved but unchanged across a switch. x86 has no
+//! asynchronous preemption and disables swap with
+//! `SwapDisabled::NoSwapHooks`; a stack fault commits in place and never
+//! blocks a fiber. A fiber that blocked inside a fault handler on x86 (swap,
+//! #25) would be interrupted at an arbitrary instruction and would need a full
+//! XSAVE of the enabled XCR0 set.
 //!
 //! XCR0 is every user state component CPUID.(0DH,0):EDX:EAX reports, not
 //! only the vector components guest code uses. Under KVM, which is the

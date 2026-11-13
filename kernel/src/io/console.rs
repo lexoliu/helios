@@ -77,7 +77,8 @@ where
     /// therefore cut at the same boundaries.
     fn emit(&mut self, record: &str) {
         let ticks = (self.tick_fn)();
-        self.state.record_console_text(ticks, record);
+        // The kernel's own console: no instance wrote it.
+        self.state.record_console_text(ticks, None, record);
         if let Some(writer) = self.writer {
             writer.emit(record.as_bytes());
         }
@@ -233,7 +234,7 @@ mod tests {
             0
         }
 
-        fn record_console_text(&self, _: u64, text: &str) {
+        fn record_console_text(&self, _: u64, _: Option<crate::InstanceId>, text: &str) {
             self.text
                 .lock()
                 .expect("the recorded console text was poisoned")
@@ -284,14 +285,7 @@ mod tests {
 
         fn record_profile_stack_nanos(&self, _: crate::ProfileScope, _: String, _: u64) {}
 
-        fn record_profile_stack_parts_nanos(
-            &self,
-            _: crate::ProfileScope,
-            _: &str,
-            _: &str,
-            _: u64,
-        ) {
-        }
+        fn record_user_profile(&self, _: crate::InstanceId, _: &str, _: u64) {}
 
         fn record_perf_metric_parts(
             &self,

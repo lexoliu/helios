@@ -48,6 +48,7 @@ mod wasix_epoll;
 use wasix_epoll::*;
 
 use super::*;
+use crate::isa::GuestIsa;
 use crate::process::{DescriptorLimit, FreeDescriptorSlots};
 use crate::wasmtime_adapter::artifact_profile::{self, ArtifactProfileError};
 use crate::wasmtime_adapter::code_map::{CodeMap, CodeRegistration};
@@ -124,14 +125,6 @@ type Preview1IovRanges = SmallVec<[(usize, usize); 8]>;
 type CompilerThreadTasks = SmallVec<[crate::JoinHandle<CompilerThreadReport>; 8]>;
 type CompilerThreadReports = SmallVec<[CompilerThreadReport; 8]>;
 type CompilerPluginHandle<CpuImpl, Net, HostFs> = Arc<CompilerPluginRuntime<CpuImpl, Net, HostFs>>;
-
-/// What one call into the compiler plugin compiles, and how.
-#[derive(Clone, Copy)]
-struct CompilerCallInput<'a> {
-    wasm: &'a Bytes,
-    hint: AotCompileHint,
-    profile: bool,
-}
 
 /// What one compile session takes from its requester: the compiler plugin's
 /// artifact, the input, and how to compile it.
@@ -342,6 +335,8 @@ where
     // whose imports are independent of per-process shared-memory binding.
     core_module_instance_pre_cache: CoreModuleInstancePreCache<CpuImpl, Net, HostFs>,
     compiler_artifact: Option<BootfsBytes>,
+    /// The level the in-kernel compiler emits, selected once at install.
+    guest_isa: GuestIsa,
     /// Lazily-built compiler kernel-plugin runtime. The plugin's
     /// `wasmtime::Module`, `InstancePre`, and 512 MiB `SharedMemory` are
     /// allocated on first compile and reused for every subsequent call,
@@ -552,6 +547,12 @@ where
         return service;
     }
 
+    // Selected by the backend when it built the runtime state, before any
+    // secondary processor ran guest code, and logged once here: this is the
+    // single place every backend's program service passes through, after the
+    // logger is up.
+    let guest_isa = debug_state.guest_isa();
+    guest_isa.log();
     let cache_budget = machine_memory().free_bytes / COMPONENT_CACHE_FRACTION;
     let shared_memory_pool_budget =
         user_heap_stats().available_bytes() / SHARED_MEMORY_POOL_FRACTION;
@@ -574,6 +575,7 @@ where
             core_module_cache: Mutex::new(ComponentCache::new(cache_budget)),
             core_module_instance_pre_cache: Arc::new(Mutex::new(ComponentCache::new(cache_budget))),
             compiler_artifact,
+            guest_isa,
             compiler_plugin: Mutex::new(None),
             compile_slot: CompilerCompileSlot::new(),
             code_map: CodeMap::new(),
@@ -1984,8 +1986,9 @@ where
                 exec_context,
                 &compiler_payload,
                 instance,
-                CompilerCallInput {
+                CompileRequest {
                     wasm: &wasm,
+                    guest_isa: self.inner.guest_isa,
                     hint,
                     profile,
                 },
@@ -2055,14 +2058,10 @@ where
         exec_context: &ProgramExecContext<CpuImpl, Net, HostFs>,
         compiler_payload: &Bytes,
         compiler_instance: crate::RegisteredInstance,
-        input: CompilerCallInput<'_>,
+        request: CompileRequest<'_>,
         phases: &mut CompilerPhaseTimestamps,
     ) -> Result<Vec<u8>, ProgramExecError> {
-        let CompilerCallInput {
-            wasm,
-            hint,
-            profile,
-        } = input;
+        let profile = request.profile;
         let (plugin, plugin_cached) = self
             .ensure_compiler_plugin(exec_context, compiler_payload)
             .await?;
@@ -2085,17 +2084,7 @@ where
         // The main thread's part ends here, before the workers are joined, so
         // a failure condemns the compile while they can still be ended.
         let result = self
-            .run_main_thread(
-                exec_context,
-                &plugin,
-                context.clone(),
-                CompilerCallInput {
-                    wasm,
-                    hint,
-                    profile,
-                },
-                phases,
-            )
+            .run_main_thread(exec_context, &plugin, context.clone(), request, phases)
             .await;
         context.end_main_part(result)
     }
@@ -2107,14 +2096,10 @@ where
         exec_context: &ProgramExecContext<CpuImpl, Net, HostFs>,
         plugin: &CompilerPluginHandle<CpuImpl, Net, HostFs>,
         context: CompilerCompileContext<CpuImpl, Net, HostFs>,
-        input: CompilerCallInput<'_>,
+        request: CompileRequest<'_>,
         phases: &mut CompilerPhaseTimestamps,
     ) -> Result<Vec<u8>, ProgramExecError> {
-        let CompilerCallInput {
-            wasm,
-            hint,
-            profile,
-        } = input;
+        let profile = request.profile;
         let engine = self.inner.engine.raw();
         let store_data = CompilerCoreStore::new(context);
         let mut store = wasmtime::Store::new(engine, store_data);
@@ -2174,11 +2159,7 @@ where
             &mut store,
             &exports,
             &mut allocations,
-            CompilerCallInput {
-                wasm,
-                hint,
-                profile,
-            },
+            request,
             phases,
         )
         .await;
@@ -2207,20 +2188,26 @@ where
         store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, HostFs>>,
         exports: &CompilerExports,
         allocations: &mut CompilerAllocations,
-        input: CompilerCallInput<'_>,
+        request: CompileRequest<'_>,
         phases: &mut CompilerPhaseTimestamps,
     ) -> CompilerCallOutcome {
-        let CompilerCallInput {
+        let CompileRequest {
             wasm,
+            guest_isa,
             hint,
             profile,
-        } = input;
-        let target = env!("HELIOS_BUILD_TARGET").as_bytes();
+        } = request;
+        let target = guest_isa.compile_target();
+        let isa_level = target.level().name().as_bytes();
+        let target = target.triple().as_bytes();
         let wasm_ptr = allocations
             .alloc(drive, &mut *store, &exports.alloc, wasm.len(), 1)
             .await?;
         let target_ptr = allocations
             .alloc(drive, &mut *store, &exports.alloc, target.len(), 1)
+            .await?;
+        let isa_level_ptr = allocations
+            .alloc(drive, &mut *store, &exports.alloc, isa_level.len(), 1)
             .await?;
         let request_ptr = allocations
             .alloc(
@@ -2236,7 +2223,6 @@ where
         let header = CompilerRequestHeader {
             abi_version: HELIOS_COMPILER_ABI_VERSION,
             hint: u32::from(match hint {
-                AotCompileHint::Fast => CompilerAbiHint::Fast,
                 AotCompileHint::Balanced => CompilerAbiHint::Balanced,
                 AotCompileHint::Performance => CompilerAbiHint::Performance,
             }),
@@ -2244,6 +2230,8 @@ where
             wasm_len: wasm.len() as u32,
             target_ptr,
             target_len: target.len() as u32,
+            isa_level_ptr,
+            isa_level_len: isa_level.len() as u32,
             flags: if profile {
                 helios_compiler_abi::HELIOS_COMPILER_REQUEST_PROFILE
             } else {
@@ -2253,6 +2241,9 @@ where
         let memory = store.data().memory();
         let written = write_shared_memory(memory, GuestAddress::wasm32(wasm_ptr), wasm)
             .and_then(|()| write_shared_memory(memory, GuestAddress::wasm32(target_ptr), target))
+            .and_then(|()| {
+                write_shared_memory(memory, GuestAddress::wasm32(isa_level_ptr), isa_level)
+            })
             .and_then(|()| {
                 write_shared_memory(
                     memory,
@@ -3226,6 +3217,7 @@ mod tests {
         parent.grant_device_classes(
             crate::DeviceClassRights::DISPLAY | crate::DeviceClassRights::AUDIO,
         );
+        parent.grant_diagnostic_rights(crate::DiagnosticAuthorityRights::OBSERVE_MACHINE);
 
         let child = wasix_proc_spawn_inherited_non_directory_authority(&parent);
 
@@ -3247,6 +3239,10 @@ mod tests {
         assert_eq!(
             child.device_class_rights(),
             crate::DeviceClassRights::DISPLAY | crate::DeviceClassRights::AUDIO
+        );
+        assert_eq!(
+            child.diagnostic_rights(),
+            crate::DiagnosticAuthorityRights::OBSERVE_MACHINE
         );
         assert!(parent.contains_authority(&child));
     }
@@ -4309,5 +4305,32 @@ mod tests {
                 .set_time(WASIX_SOCK_OPTION_SEND_BUF_SIZE, None),
             p1::errno::INVAL
         );
+    }
+
+    /// An exec of a path the authority admits but no file backs is the
+    /// filesystem's no-entry, not an authority refusal (#502): the kind is
+    /// `NotFound`, the detail carries the filesystem's error, and the
+    /// guest reads `ENOENT`.
+    #[test]
+    fn wasix_exec_of_a_missing_program_file_is_not_found() {
+        let namespace = Namespace::<crate::UnsupportedHostFileSystem>::new(crate::MountTable::new(
+            crate::BootFs::new(crate::EmbeddedBootFs::new(&[], &[]), crate::BOOT_DEVICE),
+            1,
+        ));
+        let authority = ProcessAuthority::root();
+
+        let error = futures_lite::future::block_on(read_program_source_from(
+            &namespace, &authority, "/forged",
+        ))
+        .err()
+        .expect("a path no file backs cannot be read as a program");
+
+        assert_eq!(error.kind, ProgramExecErrorKind::NotFound);
+        assert_eq!(
+            error.detail,
+            ProgramExecErrorDetail::ProgramSourceUnreadable(helios_hal::fs::FsError::NoEntry),
+            "the filesystem's own error travels in the detail"
+        );
+        assert_eq!(p1_errno_from_program_exec_error(&error), p1::errno::NOENT);
     }
 }
