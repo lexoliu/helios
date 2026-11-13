@@ -22,7 +22,7 @@ use pci_types::PciAddress;
 
 use crate::exceptions::INPUT_INTERRUPT_VECTORS;
 use crate::iommu::X86DmaPool;
-use crate::pci::PciRoot;
+use crate::pci::{PciRoot, VirtioFunctions};
 
 type X86VirtioInputDevice = VirtioInputDevice<VirtioPciTransport<X86DmaPool>>;
 
@@ -50,8 +50,8 @@ impl ExternalInterruptHandler for VirtioInputFunction {
 }
 
 /// Every PCI function that carries an input device.
-pub(crate) fn discover(pci: &PciRoot) -> Vec<PciAddress> {
-    let functions: Vec<PciAddress> = pci.find_virtio_functions(DeviceType::Input).collect();
+pub(crate) fn discover(virtio: &VirtioFunctions) -> Vec<PciAddress> {
+    let functions: Vec<PciAddress> = virtio.find_virtio_functions(DeviceType::Input).collect();
     assert!(
         functions.len() <= INPUT_INTERRUPT_VECTORS.len(),
         "platform exposes {} input functions but only {} interrupt vectors exist",

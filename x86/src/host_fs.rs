@@ -19,7 +19,7 @@ use pci_types::PciAddress;
 
 use crate::debug_state::RuntimeState;
 use crate::iommu::X86DmaPool;
-use crate::pci::PciRoot;
+use crate::pci::{PciRoot, VirtioFunctions};
 
 type X86Virtio9pDevice = Virtio9pDevice<VirtioPciTransport<X86DmaPool>>;
 
@@ -32,8 +32,8 @@ pub(crate) struct HostFsTransportService {
 }
 
 /// The PCI function that carries the platform's virtio-9p host share.
-pub(crate) fn discover(pci: &PciRoot) -> Option<PciAddress> {
-    pci.find_virtio_function(DeviceType::_9P)
+pub(crate) fn discover(virtio: &VirtioFunctions) -> Option<PciAddress> {
+    virtio.find_virtio_function(DeviceType::_9P)
 }
 
 /// Brings up the virtio-9p function at `address` and installs the host
