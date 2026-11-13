@@ -162,6 +162,7 @@ async fn write_impl(path: &Path, contents: &[u8]) -> Result<()> {
     let (mut tx, rx) = crate::bindings::wit_stream::new();
     let bytes = contents.to_vec();
     let display = display_path(path);
+    let feed_target = display.clone();
     let (write_result, feed_result) = zip(
         async move {
             descriptor
@@ -170,14 +171,20 @@ async fn write_impl(path: &Path, contents: &[u8]) -> Result<()> {
                 .map_err(|code| error::filesystem(&display, code))
         },
         async move {
-            tx.write(bytes).await;
+            let unwritten = tx.write_all(bytes).await.len();
             drop(tx);
-            Ok::<(), std::io::Error>(())
+            if unwritten == 0 {
+                Ok(())
+            } else {
+                Err(error::stream_closed(&feed_target, unwritten))
+            }
         },
     )
     .await;
-    feed_result?;
-    write_result
+    // The host's own error names the cause; a reader that closed early is
+    // only the symptom.
+    write_result?;
+    feed_result
 }
 
 fn root_descriptor() -> Result<Descriptor> {

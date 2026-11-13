@@ -56,6 +56,14 @@ pub fn stdin(code: crate::bindings::wasi::cli::types::ErrorCode) -> io::Error {
     io::Error::other(format!("stdin read failed: {code:?}"))
 }
 
+#[cfg(any(feature = "fs", feature = "io"))]
+pub fn stream_closed(target: &str, unwritten: usize) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::BrokenPipe,
+        format!("{target} stream closed by the reader with {unwritten} bytes unwritten"),
+    )
+}
+
 #[cfg(feature = "fs")]
 pub fn invalid_utf8(path: &str, error: std::string::FromUtf8Error) -> io::Error {
     io::Error::new(

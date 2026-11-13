@@ -247,14 +247,24 @@ async fn write_with_sink_owned(bytes: Vec<u8>, sink: OutputSink) -> Result<()> {
             }
         },
         async {
-            tx.write(bytes).await;
+            let target = match sink {
+                OutputSink::Stdout => "stdout",
+                OutputSink::Stderr => "stderr",
+            };
+            let unwritten = tx.write_all(bytes).await.len();
             drop(tx);
-            Ok::<(), std::io::Error>(())
+            if unwritten == 0 {
+                Ok(())
+            } else {
+                Err(error::stream_closed(target, unwritten))
+            }
         },
     )
     .await;
-    feed_result?;
-    write_result
+    // The host's own error names the cause; a reader that closed early is
+    // only the symptom.
+    write_result?;
+    feed_result
 }
 
 async fn write_all_poll<W>(writer: &mut W, mut bytes: &[u8]) -> io::Result<()>
