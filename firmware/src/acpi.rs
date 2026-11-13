@@ -220,7 +220,8 @@ impl<H: Handler, P: ProcessorIdentities, K: SratProcessorKey> AcpiNuma<H, P, K> 
             localities,
             length: slit.header.length,
         };
-        // Checked here because the crate squares the count unchecked.
+        // A count whose square does not fit has no matrix either: the
+        // crate answers it with the same empty one.
         let cells = localities.checked_mul(localities).ok_or(truncated)?;
         let matrix = slit.matrix();
         // The crate answers a table too short for its count with an empty

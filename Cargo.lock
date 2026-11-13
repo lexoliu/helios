@@ -5,7 +5,7 @@ version = 4
 [[package]]
 name = "acpi"
 version = "7.0.0-pre1"
-source = "git+https://github.com/lexoliu/acpi?branch=helios#66a72c1d9418d18a9723b4a6123de3e4014189f4"
+source = "git+https://github.com/lexoliu/acpi?branch=helios#a4207d9f8f7feccdc409232762953674a75f523d"
 dependencies = [
  "bit_field",
  "bitflags 2.13.1",
