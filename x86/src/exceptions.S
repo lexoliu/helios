@@ -186,6 +186,12 @@ helios_x86_interrupt_debug_serial:
     push 0x3e
     jmp helios_x86_interrupt_common
 
+.global helios_x86_interrupt_sci
+helios_x86_interrupt_sci:
+    push 0
+    push 0x3f
+    jmp helios_x86_interrupt_common
+
 helios_x86_exception_common:
     push rax
     push rcx

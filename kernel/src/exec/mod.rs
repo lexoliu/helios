@@ -13,6 +13,7 @@
 mod compaction;
 mod executor;
 mod freeze;
+mod hotplug;
 mod idle;
 mod in_flight;
 mod lifecycle;
