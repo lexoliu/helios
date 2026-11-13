@@ -45,6 +45,7 @@ from helios_bench.manifest import (
 from helios_bench.report import (
     HELIOS_SIDES,
     Control,
+    GuestIsa,
     GuestRam,
     Hardware,
     InstructionSampling,
@@ -59,10 +60,12 @@ from helios_bench.report import (
 )
 from helios_bench.sources import (
     SIDE_CONTROL_JSONL,
+    SIDE_JSONL,
     RawCell,
     RawSide,
     read_control,
     read_optional_side,
+    read_run_record,
 )
 from helios_bench.wasi_apps import fedora_baseline, gap_bench, workload_runner
 from helios_bench.workloads import load_workloads, select_workloads
@@ -233,6 +236,12 @@ class RunOptions:
     # this checkout's profile-guided release kernel against its plain one;
     # with a baseline commit, that commit's plain kernel.
     plain_baseline: bool = False
+    # The name of the ISA level a counterpart naming `{compiler_isa_level}`
+    # compiles for, such as `x86-64-v4+vbmi+bitalg`, for a run that does not
+    # time the `helios` side. A run that does takes it from that side's own
+    # `run` record, because the level is the processor's and the CI runner's
+    # CPU model changes from run to run; the two together are refused.
+    compiler_isa_level: str | None = None
     # Whether the first Helios pass ends with an untimed second boot of
     # every unit that takes the kernel profile, the flamegraph and the perf
     # metrics the report publishes (#747). No timed boot ever runs with the
@@ -364,10 +373,38 @@ class PlannedCommand:
     #: times, for the host gate to bracket; None for a step that times nothing.
     side: str | None = None
     round: int | None = None
+    #: The directory of a Helios invocation's output whose `run` record
+    #: names the ISA level this invocation's compile asks for. The record
+    #: exists only once that invocation has run, so the flag is appended
+    #: when this one starts (`resolved`), not when the plan is made.
+    isa_level_source: Path | None = None
+
+    def resolved(self) -> list[str]:
+        """The argv to run: ``argv`` plus the ISA level read from the Helios
+        record this invocation follows."""
+        if self.isa_level_source is None:
+            return self.argv
+        return [*self.argv, "--compiler-isa-level", guest_isa_level_name(self.isa_level_source)]
 
     def shell(self) -> str:
         exports = " ".join(f"{key}={shlex.quote(value)}" for key, value in sorted(self.env.items()))
         return f"{exports} {shlex.join(self.argv)}".strip()
+
+
+def guest_isa_level_name(helios_out: Path) -> str:
+    """The ISA level name the Helios guest compiled for, from its `run` record.
+
+    The driver owns the reading of the record: its `level` and `extras` are
+    the level name split at its `+`, and it joins them back.
+    """
+    path = helios_out / SIDE_JSONL[Side.HELIOS]
+    if not path.is_file():
+        raise SystemExit(
+            f"{path} does not exist, so the ISA level of the Helios guest is not known: the Helios "
+            "invocation must run before the Linux one, or pass --compiler-isa-level to a run that "
+            "does not time the helios side"
+        )
+    return gap_bench().guest_isa_level_name(read_run_record(path))
 
 
 def git_sha() -> str:
@@ -481,12 +518,25 @@ def round_out_root(options: RunOptions, number: int) -> Path:
 
 
 def linux_command(
-    options: RunOptions, common: list[str], out_root: Path, description: str, number: int
+    options: RunOptions,
+    common: list[str],
+    out_root: Path,
+    description: str,
+    number: int,
+    isa_level_source: Path | None,
 ) -> PlannedCommand:
-    """The driver invocation that times both Linux counterparts in the pinned Fedora guest."""
+    """The driver invocation that times both Linux counterparts in the pinned Fedora guest.
+
+    ``isa_level_source`` is the output directory of a Helios invocation that
+    runs before this one, whose guest's ISA level the Linux compile asks for;
+    None for a run that does not time the `helios` side, which names the
+    level itself with ``--compiler-isa-level`` or has the driver refuse a
+    counterpart that needs it.
+    """
     lane = options.lane
     return PlannedCommand(
         description=f"{description} in the pinned Fedora guest",
+        isa_level_source=isa_level_source,
         argv=[
             *common,
             "--skip-helios",
@@ -512,6 +562,11 @@ def linux_command(
             CARGO_TARGETS[lane.helios_arch],
             "--compiler-workers",
             str(lane.compiler_workers),
+            *(
+                ["--compiler-isa-level", options.compiler_isa_level]
+                if options.compiler_isa_level is not None
+                else []
+            ),
             "--out-dir",
             str(out_root / LINUX_OUT),
         ],
@@ -560,7 +615,17 @@ def plan(options: RunOptions, manifest: Manifest, workloads: list[dict]) -> list
             )
         if options.sides & LINUX_SIDES:
             side_commands.append(
-                linux_command(options, common, out_root, f"{label}time every counterpart", number)
+                linux_command(
+                    options,
+                    common,
+                    out_root,
+                    f"{label}time every counterpart",
+                    number,
+                    # Round 1 times Helios first, so its record exists before
+                    # any Linux invocation starts, even one of an even round,
+                    # which runs ahead of its own round's Helios.
+                    round_out_root(options, 1) / HELIOS_OUT if Side.HELIOS in options.sides else None,
+                )
             )
         # Consecutive rounds swap which side goes first: Helios on the odd
         # rounds, Linux on the even ones.
@@ -680,8 +745,9 @@ def execute_gated(command: PlannedCommand, gate: HostGateRecorder) -> None:
 def execute(command: PlannedCommand) -> None:
     env = os.environ.copy()
     env.update(command.env)
-    print(f"==> {command.description}\n    {command.shell()}", flush=True)
-    subprocess.run(command.argv, cwd=command.cwd, env=env, check=True)
+    argv = command.resolved()
+    print(f"==> {command.description}\n    {replace(command, argv=argv).shell()}", flush=True)
+    subprocess.run(argv, cwd=command.cwd, env=env, check=True)
 
 
 def wasm_artifact_digests(workloads: list[dict]) -> dict[str, str]:
@@ -914,6 +980,29 @@ def bootfs_cwasm_digests(lane: Lane, kernel_build: str) -> dict[str, str]:
     return {path.name: sha256_of(path) for path in sorted(prebuild.glob("*.cwasm"))}
 
 
+def guest_isa_of(run: dict, side: Side, *, required: bool) -> GuestIsa | None:
+    """The ISA level a Helios side's `run` record says its guest compiled for.
+
+    The `helios` side is the candidate, built from this commit, so its guest
+    always reports one and a record without it is a broken run. The baseline
+    image is an older commit that may predate the report.
+    """
+    raw = run.get("guest_isa")
+    if raw is None:
+        if required:
+            raise SystemExit(f"the {side} side's run record carries no `guest_isa`")
+        return None
+    return GuestIsa.model_validate(raw)
+
+
+def linux_wasmtime_isa_flags(run: dict) -> list[str]:
+    """The ISA flags the Linux guest's Wasmtime inferred, from its `run` record."""
+    flags = run.get("inferred_isa_flags")
+    if flags is None:
+        raise SystemExit("the linux_wasmtime side's run record carries no `inferred_isa_flags`")
+    return list(flags)
+
+
 def helios_guest_ram(run: dict) -> GuestRam:
     """How the Helios guest's RAM was backed, as its inspector's run record states (#491)."""
     vm = run.get("vm")
@@ -967,16 +1056,28 @@ def collect_pins(
     workloads: list[dict],
     kernel_build: str,
     baseline: Baseline | None,
-    helios_run: dict | None,
+    sides: dict[Side, RawSide],
 ) -> Pins:
-    """Every pin of the run. ``helios_run`` is the `helios` side's run
-    record, None for a run that timed no Helios side."""
+    """Every pin of the run. ``sides`` holds the sides this run timed; a
+    side it did not time contributes no pin read from its run record."""
     image_url, image_sha256 = fedora_image(lane.guest_arch)
     plugin_digest, host_digest = compiler_pins(lane, workloads, kernel_build)
+    helios = sides.get(Side.HELIOS)
+    helios_baseline = sides.get(Side.HELIOS_BASELINE)
+    linux_wasmtime = sides.get(Side.LINUX_WASMTIME)
     wasmtime_revision = vendored_wasmtime_pin().revision
     linux_release = wasmtime_linux_release(lane.guest_arch)
     return Pins(
         asymmetries=collect_asymmetries(lane, wasmtime_revision, linux_release),
+        guest_isa=guest_isa_of(helios.run, Side.HELIOS, required=True) if helios is not None else None,
+        baseline_guest_isa=(
+            guest_isa_of(helios_baseline.run, Side.HELIOS_BASELINE, required=False)
+            if helios_baseline is not None
+            else None
+        ),
+        linux_wasmtime_inferred_isa_flags=(
+            linux_wasmtime_isa_flags(linux_wasmtime.run) if linux_wasmtime is not None else None
+        ),
         wasmtime_revision=wasmtime_revision,
         baseline_wasmtime_revision=baseline.wasmtime.revision if baseline is not None else None,
         wasmtime_linux_release=linux_release,
@@ -986,7 +1087,7 @@ def collect_pins(
         vcpus=lane.vcpus,
         memory=lane.memory,
         linux_vm_memory=lane.linux_vm_memory,
-        helios_guest_ram=helios_guest_ram(helios_run) if helios_run is not None else None,
+        helios_guest_ram=helios_guest_ram(helios.run) if helios is not None else None,
         linux_guest_ram=linux_guest_ram(lane),
         net_backend=lane.net_backend,
         rpc_transport=lane.rpc_transport,
@@ -1471,6 +1572,11 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
             "--prebuilt builds nothing, and a paired run builds its second Helios image: "
             "drop --prebuilt or the pairing options"
         )
+    if options.compiler_isa_level is not None and Side.HELIOS in options.sides:
+        raise SystemExit(
+            "--compiler-isa-level names the level of a run that does not time the helios side; "
+            "this run times it, and the Linux compile follows the level its guest reports"
+        )
     workload_manifest = load_workloads()
     workloads = select_workloads(workload_manifest, options.workload_names)
     commands = plan(options, manifest, workloads)
@@ -1609,13 +1715,7 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
             control=control,
             run=run,
             hardware=collect_hardware(lane),
-            pins=collect_pins(
-                lane,
-                workloads,
-                options.kernel_build,
-                options.baseline,
-                sides[Side.HELIOS].run if Side.HELIOS in sides else None,
-            ),
+            pins=collect_pins(lane, workloads, options.kernel_build, options.baseline, sides),
             thresholds=thresholds,
             first_pass=reconfirmation.first_pass,
         )

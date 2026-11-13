@@ -4736,6 +4736,12 @@ fn convert_sample(sample: StatsSample) -> debugger_wit::stats::Sample {
             utilization: (0..sample.configured_processors)
                 .map(|id| debugger_wit::stats::Processor { id, busy: 0 })
                 .collect(),
+            guest_isa_level: sample.guest_isa_level.into(),
+            guest_isa_extras: sample
+                .guest_isa_extras
+                .into_iter()
+                .map(Into::into)
+                .collect(),
         },
         memory: debugger_wit::stats::Memory {
             total_bytes,
@@ -4771,6 +4777,12 @@ fn convert_program_sample(sample: StatsSample) -> program_wit::stats::Sample {
             online: sample.online_processors,
             utilization: (0..sample.configured_processors)
                 .map(|id| program_wit::stats::Processor { id, busy: 0 })
+                .collect(),
+            guest_isa_level: sample.guest_isa_level.into(),
+            guest_isa_extras: sample
+                .guest_isa_extras
+                .into_iter()
+                .map(Into::into)
                 .collect(),
         },
         memory: program_wit::stats::Memory {
