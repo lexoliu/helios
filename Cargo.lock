@@ -1038,7 +1038,7 @@ dependencies = [
 
 [[package]]
 name = "cranelift-reader"
-version = "0.135.0"
+version = "0.135.8"
 dependencies = [
  "anyhow",
  "cranelift-codegen",
