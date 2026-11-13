@@ -163,11 +163,11 @@ jobs:
             | map(select(.value.command and (.key as $name | $lanes | index($name))))
             | map({name: .key, command: .value.command,
                    "rust-cache": (.value["rust-cache"] // false)})' .github/ci-lanes.json)"
-          # `release` for the lanes that boot optimised kernels, `debug`
-          # for the two that boot debug ones.
-          wasm_profiles="$(jq -c '
-            [(if any(.[]; IN("smoke-x86-64", "smoke-riscv64", "smoke-aarch64")) then "release" else empty end),
-             (if any(.[]; IN("smoke-aarch64-cfi", "smoke-x86-64-venus")) then "debug" else empty end)]' <<< "${lanes}")"
+          # The guest-wasm profile each selected lane boots, as its entry
+          # states it: what `wasm-programs` builds and the lane's
+          # `prebuilt-wasm` step waits for.
+          wasm_profiles="$(jq -c --argjson lanes "${lanes}" '
+            [$lanes[] as $name | .[$name]["guest-wasm"] // empty] | unique' .github/ci-lanes.json)"
           {
             echo "wasm_profiles=${wasm_profiles}"
             echo "lanes=${lanes}"
@@ -1485,6 +1485,8 @@ jobs:
           # shell's own stdout still works after that redirection (#904).
           runtime="$GITHUB_WORKSPACE/smoke-runtime/coreutils"
           mkdir -p "$runtime"
+          # The single-quoted -c argument is the guest dash's command line; $(date) must reach dash unexpanded, so the host shell must not expand it.
+          # shellcheck disable=SC2016
           ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
             --accel kvm \
             --runtime-dir "$runtime" --keep-runtime-dir \
@@ -2371,6 +2373,7 @@ jobs:
       actions: read
     timeout-minutes: 60
     env:
+      HELIOS_PREBUILT_WASM: ${{ github.workspace }}/helios/target/wasm-programs
       HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
       HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
       HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
@@ -2439,6 +2442,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: cargo run --release -p helios-cli -- profile-fetch --run "${{ github.run_id }}"
+      - uses: ./helios/.github/actions/prebuilt-wasm
+        with:
+          profile: release
+          path: helios/target/wasm-programs/release
       - name: Take a processor offline and back under load
         timeout-minutes: 30
         shell: bash
