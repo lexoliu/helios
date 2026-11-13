@@ -90,7 +90,7 @@ def test_failure_records_become_failed_cells(tmp_path, baseline_report: Report) 
         ' "error": "TcpErrorKind::Timeout: TCP read timed out"}\n',
         encoding="utf-8",
     )
-    raw = read_side_jsonl(path, warmup_discard=1)
+    raw = read_side_jsonl(path, Side.HELIOS, "vsock", warmup_discard=1)
     assert raw.cells["tcp-throughput"].failure == "TcpErrorKind::Timeout: TCP read timed out"
     assert raw.cells["tcp-throughput"].iterations == []
 
@@ -107,6 +107,32 @@ def test_failure_records_become_failed_cells(tmp_path, baseline_report: Report) 
     text = render_tables(report)
     assert "| `tcp-throughput` (headline) | **failed** | n/a | n/a | n/a | n/a |" in text
     assert "`tcp-throughput` failed on Helios: TcpErrorKind::Timeout: TCP read timed out" in text
+
+
+def test_a_report_written_before_the_isa_pins_still_loads(tmp_path: Path, baseline_report: Report) -> None:
+    """Older reports carry neither the guest's ISA level nor the Linux flags."""
+    path = tmp_path / "report.json"
+    save_report(baseline_report, path)
+    raw = json.loads(path.read_text())
+    for field in ("guest_isa", "baseline_guest_isa", "linux_wasmtime_inferred_isa_flags"):
+        raw["pins"].pop(field, None)
+    path.write_text(json.dumps(raw))
+    loaded = load_report(path)
+    assert loaded.pins.guest_isa is None
+    assert loaded.pins.linux_wasmtime_inferred_isa_flags is None
+    rendered = render_pins(loaded)
+    assert "Guest code ISA level" not in rendered
+    assert "inferred ISA flags" not in rendered
+
+
+def test_the_isa_pins_survive_a_round_trip(tmp_path: Path, baseline_report: Report) -> None:
+    path = tmp_path / "report.json"
+    save_report(baseline_report, path)
+    loaded = load_report(path)
+    assert loaded.pins.guest_isa is not None
+    assert loaded.pins.guest_isa.level == "x86-64-v4"
+    assert loaded.pins.guest_isa.extras == ["vbmi", "bitalg"]
+    assert loaded.pins.linux_wasmtime_inferred_isa_flags == ["has_avx", "has_avx2", "has_avx512f", "has_sse3"]
 
 
 def test_a_report_written_before_the_rpc_transport_was_recorded_still_loads(

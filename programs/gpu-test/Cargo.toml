@@ -5,7 +5,7 @@ edition.workspace = true
 autobins = false
 
 [dependencies]
-helios-api = { path = "../../api", default-features = false, features = ["gpu", "task"] }
+helios-api = { path = "../../api", default-features = false, features = ["gpu", "programs", "task"] }
 thiserror = { version = "2.0.20", default-features = false }
 
 [lib]

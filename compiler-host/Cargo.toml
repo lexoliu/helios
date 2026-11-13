@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 clap = { version = "4.6.6", default-features = false, features = ["derive", "error-context", "help", "std", "usage"] }
 getrandom = { version = "0.3.4", default-features = false, features = ["std"] }
+helios-artifact.workspace = true
 helios-compiler-abi.workspace = true
 helios-compiler-support.workspace = true
 serde = { version = "1.0.229", default-features = false, features = ["derive"] }

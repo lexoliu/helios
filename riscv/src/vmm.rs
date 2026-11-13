@@ -56,7 +56,7 @@
 //! hart sets up the root table, secondary harts share it via `satp`.
 //! Every address-space mutation invalidates this hart's TLB entries
 //! and dispatches one `sbi_rt::remote_sfence_vma` range fence to every
-//! other hart, after the last page-table write and before any frame
+//! other running hart (a stopped hart flushes on restart), after the last page-table write and before any frame
 //! goes back to the user-memory pool.
 
 extern crate alloc;
@@ -283,9 +283,13 @@ impl RiscvUserAddressSpace {
     /// access is cacheable and reorderable is a physical memory
     /// attribute of the address, fixed by the platform, not something
     /// a leaf PTE selects. (Svpbmt adds one, and QEMU's `virt` does not
-    /// offer it.) So a register window is an ordinary valid leaf
-    /// pointing into the platform's I/O space, and the region's `kind`
-    /// changes nothing here — it is already true of the address.
+    /// offer it, so this backend negotiates no Svpbmt.) So a register
+    /// window is an ordinary valid leaf pointing into the platform's I/O
+    /// space, and the region's `kind` changes nothing here — it is
+    /// already true of the address. A write-combining region is reached
+    /// with whatever the platform's attributes of its address say, which
+    /// for a device aperture is I/O memory: stronger ordering than the
+    /// kind asks for, never weaker.
     /// Execute is never granted: a device holds no instructions the
     /// guest may run.
     fn device_pte(&self, attributes: DeviceRegionAttributes) -> u64 {
@@ -1183,17 +1187,7 @@ fn flush_tlb_pages(start: usize, pages: usize) {
         }
     }
     let byte_len = pages * PAGE_SIZE;
-    let ret = sbi_rt::remote_sfence_vma(
-        sbi_rt::HartMask::from_mask_base(0, usize::MAX),
-        start,
-        byte_len,
-    );
-    assert!(
-        ret.is_ok(),
-        "SBI remote_sfence_vma failed for user VA {start:#x}+{byte_len:#x}: error={} value={}",
-        ret.error,
-        ret.value
-    );
+    crate::lifecycle::remote_sfence_vma(start, byte_len);
 }
 
 fn page_flags_to_pte(flags: PageFlags) -> Result<u64, AddressSpaceError> {

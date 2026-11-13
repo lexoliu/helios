@@ -81,13 +81,14 @@ use super::service::{
 /// The device is never handed anywhere else. What callers get back is a
 /// handle to the tasks this spawns, which is what a claim and every
 /// period after it travels through.
-pub fn install_audio_device<CpuImpl, WatchdogImpl, Device>(
-    kernel: &Kernel<CpuImpl, WatchdogImpl>,
+pub fn install_audio_device<CpuImpl, WatchdogImpl, MeasuredBootImpl, Device>(
+    kernel: &Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
     device: Device,
 ) -> AudioService
 where
     CpuImpl: Cpu + Clone + Send + Sync + 'static,
     WatchdogImpl: Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
     Device: PlaybackDevice + Clone,
 {
     let mut playback = ArrayVec::new();

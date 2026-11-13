@@ -5,7 +5,7 @@ edition.workspace = true
 autobins = false
 
 [dependencies]
-helios-api = { path = "../../api", default-features = false }
+helios-api = { path = "../../api", default-features = false, features = ["mounts", "programs"] }
 
 [lib]
 name = "helios_init"

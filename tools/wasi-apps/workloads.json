@@ -218,6 +218,8 @@
             "{workdir}/aot-curl-output.cwasm",
             "--target",
             "{compiler_target}",
+            "--isa-level",
+            "{compiler_isa_level}",
             "--hint",
             "performance",
             "--workers",

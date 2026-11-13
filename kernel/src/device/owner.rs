@@ -18,8 +18,8 @@
 use crate::audio::{AudioOwnership, AudioService, AudioServiceError};
 use crate::buffer::{ViewError, ViewTable};
 use crate::display::{DisplayOwnership, DisplayService, DisplayServiceError};
-use crate::gpu::{Gpu3dOwnership, Gpu3dService, Gpu3dServiceError};
-use crate::process::{AudioClaimCap, DeviceGrantClaimCap, DisplayClaimCap, GpuClaimCap};
+use crate::gpu::{Gpu3dOwnership, Gpu3dService, Gpu3dServiceError, SessionId};
+use crate::process::{AudioClaimCap, DeviceGrantClaimCap, DisplayClaimCap, GpuOpenCap};
 use crate::surface::SurfaceOwnership;
 
 use super::grant::{DeviceName, GrantError};
@@ -30,7 +30,7 @@ use super::registry::DeviceGrantRegistry;
 ///
 /// Five things can put hardware, or another instance's pixels, inside
 /// an instance's memory: a device grant, a display claim, the windows
-/// of the surface path, a claim on the 3D engine, and — through a
+/// of the surface path, a session on the 3D engine, and — through a
 /// stream rather than a view — a playback claim. All five are released
 /// by the store's own drop.
 #[derive(Default)]
@@ -43,7 +43,8 @@ pub struct DeviceOwnership {
     /// everybody's it composes. Empty on every instance that neither
     /// asks for a window nor composes the desktop.
     surfaces: SurfaceOwnership,
-    /// The machine's 3D engine, once this instance claimed it.
+    /// This instance's session on the machine's 3D engine, once it
+    /// opened one.
     gpu: Gpu3dOwnership,
     /// The playback stream, once this instance claimed one.
     audio: AudioOwnership,
@@ -70,16 +71,16 @@ impl DeviceOwnership {
         &mut self.gpu
     }
 
-    /// Take exclusive ownership of the machine's 3D engine. The views
-    /// the claim's aperture placements get go in a set of `views` that
-    /// ends when the claim does.
-    pub fn claim_gpu(
+    /// Open this instance's session on the machine's 3D engine, or hold
+    /// the open one once more. The views the session shows go in a set
+    /// of `views` that ends when the session does.
+    pub fn open_gpu(
         &mut self,
         service: &Gpu3dService,
         views: &mut ViewTable,
-        cap: GpuClaimCap,
-    ) -> Result<(), Gpu3dServiceError> {
-        self.gpu.claim(service, views.group(), cap)
+        cap: GpuOpenCap,
+    ) -> Result<SessionId, Gpu3dServiceError> {
+        self.gpu.open(service, || views.group(), cap)
     }
 
     /// This instance's side of the surface path.

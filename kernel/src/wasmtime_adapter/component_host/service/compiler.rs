@@ -8,14 +8,14 @@ use helios_compiler_abi::{CompilerStatus, OutputKind, UnknownDiscriminant};
 /// `Linker::instantiate_pre`; the result is reused across compile
 /// calls. Per-call work is reduced to a fresh `wasmtime::Store`,
 /// `instance_pre.instantiate`, then `initialize` / `alloc` / `compile`.
-pub(super) struct CompilerPluginRuntime<CpuImpl, Net, HostFs>
+pub(super) struct CompilerPluginRuntime<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    pub(super) instance_pre: Arc<InstancePre<CompilerCoreStore<CpuImpl, Net, HostFs>>>,
-    pub(super) shared: Arc<CompilerCoreShared<CompilerCoreStore<CpuImpl, Net, HostFs>>>,
+    pub(super) instance_pre: Arc<InstancePre<CompilerCoreStore<CpuImpl, Net, StorageImpl>>>,
+    pub(super) shared: Arc<CompilerCoreShared<CompilerCoreStore<CpuImpl, Net, StorageImpl>>>,
     /// The linker-reserved main-thread TLS block, initialised once by the
     /// instance that wins the memory-init flag; every per-compile instance
     /// adopts it because later instances skip that init and see `__tls_base == 0`.
@@ -75,15 +75,15 @@ pub(super) struct CompilerExports {
 }
 
 /// The bytes the plugin counts as owned across the interface right now.
-pub(super) async fn compiler_outstanding_bytes<CpuImpl, Net, HostFs>(
+pub(super) async fn compiler_outstanding_bytes<CpuImpl, Net, StorageImpl>(
     drive: &CompilerStoreDrive<CpuImpl>,
-    store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, HostFs>>,
+    store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, StorageImpl>>,
     outstanding: &wasmtime::TypedFunc<(), i32>,
 ) -> Result<u32, ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     drive
         .call(store, outstanding, ())
@@ -129,6 +129,17 @@ pub(super) fn ensure_compiler_buffers_returned(
 /// program `Err`.
 pub(super) type CompilerCallOutcome = Result<Result<Vec<u8>, ProgramExecError>, ProgramExecError>;
 
+/// What one compile asks of the plugin: the module, the ISA the artifact
+/// is for, and how hard to optimise it.
+#[derive(Clone, Copy)]
+pub(super) struct CompileRequest<'a> {
+    pub(super) wasm: &'a Bytes,
+    pub(super) guest_isa: GuestIsa,
+    pub(super) hint: AotCompileHint,
+    /// Whether the plugin reports its pass timings.
+    pub(super) profile: bool,
+}
+
 /// A buffer in the plugin's memory, with the layout it was allocated with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PluginBuffer {
@@ -137,7 +148,7 @@ struct PluginBuffer {
     align: usize,
 }
 
-/// The plugin allocations of one compile call: the three request buffers the
+/// The plugin allocations of one compile call: the four request buffers the
 /// kernel allocates and the three response buffers the plugin hands over (the
 /// ownership table is in `helios_compiler_abi`).
 ///
@@ -147,8 +158,8 @@ struct PluginBuffer {
 /// reaches `release`, and its allocations die with the runtime.
 #[must_use = "the plugin's allocations leak unless released"]
 pub(super) struct CompilerAllocations {
-    /// Three request buffers and three response buffers.
-    buffers: SmallVec<[PluginBuffer; 6]>,
+    /// Four request buffers and three response buffers.
+    buffers: SmallVec<[PluginBuffer; 7]>,
 }
 
 impl CompilerAllocations {
@@ -160,10 +171,10 @@ impl CompilerAllocations {
 
     /// Allocates a request buffer through the plugin and records it. A
     /// zero-length buffer is pointer 0 and is not allocated.
-    pub(super) async fn alloc<CpuImpl, Net, HostFs>(
+    pub(super) async fn alloc<CpuImpl, Net, StorageImpl>(
         &mut self,
         drive: &CompilerStoreDrive<CpuImpl>,
-        store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, HostFs>>,
+        store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, StorageImpl>>,
         alloc: &wasmtime::TypedFunc<(i32, i32), i32>,
         len: usize,
         align: usize,
@@ -171,7 +182,7 @@ impl CompilerAllocations {
     where
         CpuImpl: Cpu + Clone,
         Net: ComponentHostNetwork,
-        HostFs: crate::HostFileSystem,
+        StorageImpl: crate::Storage,
     {
         if len == 0 {
             return Ok(0);
@@ -191,16 +202,16 @@ impl CompilerAllocations {
     }
 
     /// Returns every recorded buffer to the plugin.
-    pub(super) async fn release<CpuImpl, Net, HostFs>(
+    pub(super) async fn release<CpuImpl, Net, StorageImpl>(
         self,
         drive: &CompilerStoreDrive<CpuImpl>,
-        store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, HostFs>>,
+        store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, StorageImpl>>,
         free: &wasmtime::TypedFunc<(i32, i32, i32), ()>,
     ) -> Result<(), ProgramExecError>
     where
         CpuImpl: Cpu + Clone,
         Net: ComponentHostNetwork,
-        HostFs: crate::HostFileSystem,
+        StorageImpl: crate::Storage,
     {
         for buffer in self.buffers {
             drive
@@ -220,19 +231,95 @@ impl CompilerAllocations {
 /// compile's instance and the plugin runtime's shared state. A worker store
 /// is built from a clone of its parent's context.
 #[derive(Clone)]
-pub(super) struct CompilerCompileContext<CpuImpl, Net, HostFs>
+pub(super) struct CompilerCompileContext<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     pub(super) cpu: CpuImpl,
     pub(super) spawner: crate::Spawner<CpuImpl>,
-    pub(super) runtime_state: HostRuntimeState<CpuImpl, Net, HostFs>,
+    pub(super) runtime_state: HostRuntimeState<CpuImpl, Net, StorageImpl>,
     pub(super) instance: crate::RegisteredInstance,
-    pub(super) shared: Arc<CompilerCoreShared<CompilerCoreStore<CpuImpl, Net, HostFs>>>,
+    /// The registry `instance` lives in, which a condemnation goes through.
+    pub(super) registry: crate::InstanceRegistry,
+    pub(super) shared: Arc<CompilerCoreShared<CompilerCoreStore<CpuImpl, Net, StorageImpl>>>,
     pub(super) write_serial: crate::DebugSerialWriter,
-    pub(super) _marker: core::marker::PhantomData<fn() -> HostFs>,
+    pub(super) _marker: core::marker::PhantomData<fn() -> StorageImpl>,
+}
+
+impl<CpuImpl, Net, StorageImpl> CompilerCompileContext<CpuImpl, Net, StorageImpl>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    /// Condemns the compile's instance for `reason` and interrupts every
+    /// store of it.
+    fn condemn(&self, reason: crate::KillReason) -> crate::KillOutcome {
+        condemn_compile(
+            &self.registry,
+            &self.shared.interrupts,
+            self.instance.id(),
+            reason,
+            self.runtime_state.uptime_nanos(self.cpu.now().ticks()),
+        )
+    }
+
+    /// A worker store's call ended in `error`; returns the error the compile
+    /// reports when this is the compile's first trap.
+    ///
+    /// A trap on one store tells the compile's other stores nothing: main
+    /// parks for ever on the job the dead worker held, or the workers park
+    /// for ever once main is gone. So a trap, an end that is not the compile's
+    /// own kill, condemns the instance, and every other store unwinds through
+    /// the kill path. The first condemnation's reason stands, so only the
+    /// trap that condemns first reports its error: a store that ends by a
+    /// kill, or by a trap after another store condemned, reports none.
+    pub(super) fn condemn_for_store_end(&self, error: wasmtime::Error) -> Option<ProgramExecError> {
+        if error.downcast_ref::<crate::InstanceKilled>().is_some() {
+            return None;
+        }
+        match self.condemn(crate::KillReason::StoreFailed) {
+            crate::KillOutcome::Requested => Some(map_program_runtime_error(error)),
+            crate::KillOutcome::AlreadyStopping | crate::KillOutcome::NoSuchInstance => None,
+        }
+    }
+
+    /// The compile's main thread ended its part with `result`, before the
+    /// workers are joined: a failure condemns the instance, as a worker's
+    /// trap does ([`Self::condemn_for_store_end`]), so workers parked in the
+    /// pool's idle wait end instead of being joined for ever.
+    ///
+    /// A failure after a worker's own trap is the condemnation reaching main;
+    /// [`first_trap_wins`] swaps it for the worker's error once the workers
+    /// are joined.
+    pub(super) fn end_main_part<T>(
+        &self,
+        result: Result<T, ProgramExecError>,
+    ) -> Result<T, ProgramExecError> {
+        if result.is_err() {
+            self.condemn(crate::KillReason::StoreFailed);
+        }
+        result
+    }
+}
+
+/// The result a compile reports once every worker is joined: the first
+/// trap's error, taken from the worker that condemned the compile, over
+/// whatever main ended with (the condemnation, when main was ended by it).
+///
+/// Only the store that condemned the instance carries an error, so at most one
+/// report does. A compile in which a store trapped fails even when main
+/// returned a response, because the plugin's memory is in an unknown state.
+pub(super) fn first_trap_wins<T>(
+    result: Result<T, ProgramExecError>,
+    reports: &mut [CompilerThreadReport],
+) -> Result<T, ProgramExecError> {
+    match reports.iter_mut().find_map(|report| report.trap.take()) {
+        Some(trap) => Err(trap),
+        None => result,
+    }
 }
 
 /// One compiler store's data: the compile's context, and what belongs to
@@ -243,13 +330,13 @@ where
 /// plugin's memory belongs to the cached runtime, not to the compile's
 /// instance or to the requester, and the kernel reads it without a
 /// pre-fault, so it is never the swap policy's to evict.
-pub(super) struct CompilerCoreStore<CpuImpl, Net, HostFs>
+pub(super) struct CompilerCoreStore<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    pub(super) context: CompilerCompileContext<CpuImpl, Net, HostFs>,
+    pub(super) context: CompilerCompileContext<CpuImpl, Net, StorageImpl>,
     pub(super) preview1_descriptors: CompilerPreview1Descriptors,
     activity: crate::InstanceActivity,
 }
@@ -301,8 +388,11 @@ pub(super) struct CompilerCoreShared<T> {
     pub(super) interrupts: Arc<crate::wasmtime_adapter::preemption::GuestInterrupts>,
 }
 
-#[derive(Clone, Copy)]
 pub(super) struct CompilerThreadReport {
+    /// The error this worker's store trapped with, when that trap is the one
+    /// that condemned the compile. See
+    /// [`CompilerCompileContext::condemn_for_store_end`].
+    pub(super) trap: Option<ProgramExecError>,
     pub(super) thread_id: i32,
     pub(super) processor: u16,
     pub(super) spawned_ns: u64,
@@ -311,15 +401,15 @@ pub(super) struct CompilerThreadReport {
     pub(super) finished_ns: u64,
 }
 
-impl<CpuImpl, Net, HostFs> CompilerCoreStore<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> CompilerCoreStore<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     /// A store of `context`'s compile, with its own accounting over the
     /// compile's instance.
-    pub(super) fn new(context: CompilerCompileContext<CpuImpl, Net, HostFs>) -> Self {
+    pub(super) fn new(context: CompilerCompileContext<CpuImpl, Net, StorageImpl>) -> Self {
         let activity = crate::InstanceActivity::without_memory_owner(
             context.instance.clone(),
             crate::store_kernel_heap_bytes(size_of::<Self>()),
@@ -340,7 +430,8 @@ where
     /// see [`crate::component::GuestTurns::drive`].
     fn guest_turns(
         &self,
-    ) -> crate::component::GuestTurns<CpuImpl, HostRuntimeState<CpuImpl, Net, HostFs>, ()> {
+    ) -> crate::component::GuestTurns<CpuImpl, HostRuntimeState<CpuImpl, Net, StorageImpl>, ()>
+    {
         crate::component::GuestTurns::new(
             self.activity.turns(),
             self.context.cpu.clone(),
@@ -377,14 +468,14 @@ pub(super) fn define_compiler_shared_memory<T>(
     define_imported_shared_memory(linker, store, module, memory)
 }
 
-pub(super) fn add_compiler_core_imports<CpuImpl, Net, HostFs>(
-    linker: &mut CoreLinker<CompilerCoreStore<CpuImpl, Net, HostFs>>,
+pub(super) fn add_compiler_core_imports<CpuImpl, Net, StorageImpl>(
+    linker: &mut CoreLinker<CompilerCoreStore<CpuImpl, Net, StorageImpl>>,
     memory: SharedMemory,
 ) -> Result<(), ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     add_wasi_p1_imports(linker)?;
     add_wasi_thread_spawn(linker)?;
@@ -406,15 +497,15 @@ pub(super) fn compiler_rayon_env_len(thread_count: u32) -> u32 {
     RAYON_NUM_THREADS_ENV.len() as u32 + decimal_len(thread_count) + 1
 }
 
-pub(super) fn compiler_environ_get<CpuImpl, Net, HostFs>(
-    caller: Caller<'_, CompilerCoreStore<CpuImpl, Net, HostFs>>,
+pub(super) fn compiler_environ_get<CpuImpl, Net, StorageImpl>(
+    caller: Caller<'_, CompilerCoreStore<CpuImpl, Net, StorageImpl>>,
     environ: u32,
     buf: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let thread_count = compiler_plugin_worker_threads(&caller.data().context.cpu);
     let memory = caller.data().memory();
@@ -468,7 +559,8 @@ pub(super) fn write_decimal(memory: &SharedMemory, ptr: GuestAddress, mut value:
 ///
 /// Every call into a compiler store, the compile's main thread and each
 /// worker alike, is made through [`Self::call`] or [`Self::instantiate`], so
-/// the end of a processor's guest time slice makes the guest yield to the
+/// the end of a processor's guest time slice, or a freeze's request
+/// (`GuestInterrupts::interrupt_running`), makes the guest yield to the
 /// executor and a kill of the compile's instance ends the call, including
 /// one parked in `memory.atomic.wait`.
 ///
@@ -484,15 +576,15 @@ pub(super) struct CompilerStoreDrive<CpuImpl: Cpu> {
 
 impl<CpuImpl: Cpu + Clone> CompilerStoreDrive<CpuImpl> {
     /// Calls `func` on `store` under the drive.
-    pub(super) async fn call<Net, HostFs, Params, Results>(
+    pub(super) async fn call<Net, StorageImpl, Params, Results>(
         &self,
-        store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, HostFs>>,
+        store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, StorageImpl>>,
         func: &wasmtime::TypedFunc<Params, Results>,
         params: Params,
     ) -> wasmtime::Result<Results>
     where
         Net: ComponentHostNetwork,
-        HostFs: crate::HostFileSystem,
+        StorageImpl: crate::Storage,
         Params: wasmtime::WasmParams + Sync,
         Results: wasmtime::WasmResults + Sync,
     {
@@ -503,14 +595,14 @@ impl<CpuImpl: Cpu + Clone> CompilerStoreDrive<CpuImpl> {
     }
 
     /// Instantiates `instance_pre` on `store` under the drive.
-    pub(super) async fn instantiate<Net, HostFs>(
+    pub(super) async fn instantiate<Net, StorageImpl>(
         &self,
-        store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, HostFs>>,
-        instance_pre: &InstancePre<CompilerCoreStore<CpuImpl, Net, HostFs>>,
+        store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, StorageImpl>>,
+        instance_pre: &InstancePre<CompilerCoreStore<CpuImpl, Net, StorageImpl>>,
     ) -> wasmtime::Result<wasmtime::Instance>
     where
         Net: ComponentHostNetwork,
-        HostFs: crate::HostFileSystem,
+        StorageImpl: crate::Storage,
     {
         let turns = store.data().guest_turns();
         self.interrupts
@@ -521,13 +613,13 @@ impl<CpuImpl: Cpu + Clone> CompilerStoreDrive<CpuImpl> {
 
 /// Installs the compiler store's interrupt callback and registers the
 /// store for kills, for as long as the returned drive lives.
-pub(super) fn configure_compiler_core_store<CpuImpl, Net, HostFs>(
-    store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, HostFs>>,
+pub(super) fn configure_compiler_core_store<CpuImpl, Net, StorageImpl>(
+    store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, StorageImpl>>,
 ) -> CompilerStoreDrive<CpuImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     store.interrupt_callback(|caller| caller.data().on_interrupt());
     let interrupts = store.data().context.shared.interrupts.clone();
@@ -537,14 +629,14 @@ where
     }
 }
 
-pub(super) fn compiler_tls_base<CpuImpl, Net, HostFs>(
-    store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, HostFs>>,
+pub(super) fn compiler_tls_base<CpuImpl, Net, StorageImpl>(
+    store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, StorageImpl>>,
     instance: &wasmtime::Instance,
 ) -> Result<u32, ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let global = instance
         .get_global(&mut *store, "__tls_base")
@@ -564,15 +656,15 @@ where
     }
 }
 
-pub(super) fn set_compiler_tls_base<CpuImpl, Net, HostFs>(
-    store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, HostFs>>,
+pub(super) fn set_compiler_tls_base<CpuImpl, Net, StorageImpl>(
+    store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, StorageImpl>>,
     instance: &wasmtime::Instance,
     tls_base: u32,
 ) -> Result<(), ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let global = instance
         .get_global(&mut *store, "__tls_base")
@@ -585,9 +677,9 @@ where
         .map_err(map_program_runtime_error)
 }
 
-pub(super) async fn compiler_alloc<CpuImpl, Net, HostFs>(
+pub(super) async fn compiler_alloc<CpuImpl, Net, StorageImpl>(
     drive: &CompilerStoreDrive<CpuImpl>,
-    store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, HostFs>>,
+    store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, StorageImpl>>,
     alloc: &wasmtime::TypedFunc<(i32, i32), i32>,
     len: usize,
     align: usize,
@@ -595,7 +687,7 @@ pub(super) async fn compiler_alloc<CpuImpl, Net, HostFs>(
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let ptr = drive
         .call(store, alloc, (len as i32, align as i32))
@@ -662,8 +754,8 @@ pub(super) fn decode_compiler_response(
 /// the caller. The response buffers are adopted into `allocations` as soon as
 /// the header's layout is known to be this ABI's, before anything else can
 /// fail, so a rejected or malformed response is freed too.
-pub(super) fn accept_compiler_response<CpuImpl, Net, HostFs>(
-    store: &CompilerCoreStore<CpuImpl, Net, HostFs>,
+pub(super) fn accept_compiler_response<CpuImpl, Net, StorageImpl>(
+    store: &CompilerCoreStore<CpuImpl, Net, StorageImpl>,
     allocations: &mut CompilerAllocations,
     response_ptr: u32,
     profile: bool,
@@ -672,7 +764,7 @@ pub(super) fn accept_compiler_response<CpuImpl, Net, HostFs>(
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let memory = store.memory();
     let header = read_compiler_response(memory, GuestAddress::wasm32(response_ptr))?;
@@ -728,15 +820,15 @@ where
     Ok(output)
 }
 
-pub(super) fn compiler_fd_fdstat_get<CpuImpl, Net, HostFs>(
-    caller: Caller<'_, CompilerCoreStore<CpuImpl, Net, HostFs>>,
+pub(super) fn compiler_fd_fdstat_get<CpuImpl, Net, StorageImpl>(
+    caller: Caller<'_, CompilerCoreStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     stat: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let descriptor = match fd {
         1 if caller.data().preview1_descriptors.stdout_open => Preview1Descriptor::<Net>::Stdout,
@@ -748,8 +840,8 @@ where
         .map_or(p1::errno::FAULT, |_| p1::errno::SUCCESS)
 }
 
-pub(super) fn fd_write<CpuImpl, Net, HostFs>(
-    caller: Caller<'_, CompilerCoreStore<CpuImpl, Net, HostFs>>,
+pub(super) fn fd_write<CpuImpl, Net, StorageImpl>(
+    caller: Caller<'_, CompilerCoreStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     iovs: u32,
     iovs_len: u32,
@@ -758,7 +850,7 @@ pub(super) fn fd_write<CpuImpl, Net, HostFs>(
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     if !caller.data().preview1_descriptors.can_write(fd) {
         return p1::errno::BADF;
@@ -926,7 +1018,7 @@ mod tests {
     type FixtureStore = CompilerCoreStore<
         crate::test_support::TestCpu,
         crate::test_support::TestNetworkService,
-        crate::UnsupportedHostFileSystem,
+        crate::UnsupportedStorage,
     >;
 
     /// A compile's context on the fixtures a kernel unit test carries, the
@@ -939,7 +1031,7 @@ mod tests {
         context: CompilerCompileContext<
             crate::test_support::TestCpu,
             crate::test_support::TestNetworkService,
-            crate::UnsupportedHostFileSystem,
+            crate::UnsupportedStorage,
         >,
     }
 
@@ -957,8 +1049,14 @@ mod tests {
             let runtime_state: HostRuntimeState<
                 TestCpu,
                 crate::test_support::TestNetworkService,
-                crate::UnsupportedHostFileSystem,
-            > = crate::RuntimeState::new(cpu.timebase(), 1, 0, crate::BootPayload::for_tests());
+                crate::UnsupportedStorage,
+            > = crate::RuntimeState::new(
+                cpu.timebase(),
+                1,
+                0,
+                crate::BootPayload::for_tests(),
+                GuestIsa::for_build_target(cpu.native_feature_probe()),
+            );
             runtime_state.install_root_entropy(triomphe::Arc::new(
                 crate::RootEntropy::from_platform(
                     &cpu,
@@ -990,6 +1088,7 @@ mod tests {
                 spawner: executor.spawner(cpu),
                 runtime_state,
                 instance: instance.clone(),
+                registry: registry.clone(),
                 shared,
                 write_serial: crate::DebugSerialWriter::of::<DiscardPort>(),
                 _marker: core::marker::PhantomData,
@@ -1066,6 +1165,7 @@ mod tests {
             crate::KillReason::SupervisorRestart,
             crate::KillReason::Operator,
             crate::KillReason::RequesterGone,
+            crate::KillReason::StoreFailed,
         ] {
             let fixture = CompileFixture::new();
             let (store, _drive) = fixture.open_store();
@@ -1141,6 +1241,216 @@ mod tests {
         assert!(
             dropped.load(Ordering::SeqCst),
             "the worker unwound past its parked host future"
+        );
+    }
+
+    /// A function of `store` that traps: a host function that returns an
+    /// error, as the plugin's abort does.
+    fn trapping(
+        store: &mut wasmtime::Store<FixtureStore>,
+        message: &'static str,
+    ) -> wasmtime::TypedFunc<(), ()> {
+        wasmtime::Func::wrap(&mut *store, move || -> wasmtime::Result<()> {
+            Err(wasmtime::Error::msg(message))
+        })
+        .typed::<(), ()>(&*store)
+        .expect("the trap is a () -> () function")
+    }
+
+    /// A function of `store` that parks where the plugin's wait parks it, in
+    /// an async host future that nothing resolves.
+    fn parked(store: &mut wasmtime::Store<FixtureStore>) -> wasmtime::TypedFunc<(), ()> {
+        wasmtime::Func::wrap_async(
+            &mut *store,
+            move |_: wasmtime::Caller<'_, FixtureStore>, (): ()| {
+                Box::new(core::future::pending::<()>())
+            },
+        )
+        .typed::<(), ()>(&*store)
+        .expect("the parked wait is a () -> () function")
+    }
+
+    fn report(trap: Option<ProgramExecError>) -> CompilerThreadReport {
+        CompilerThreadReport {
+            trap,
+            thread_id: 1,
+            processor: 0,
+            spawned_ns: 0,
+            started_ns: 0,
+            instantiated_ns: 0,
+            finished_ns: 0,
+        }
+    }
+
+    /// The runtime's message an error carries.
+    fn message_of(error: &ProgramExecError) -> &str {
+        match &error.detail {
+            ProgramExecErrorDetail::RuntimeFailure(message) => message.as_str(),
+            other => panic!("expected the runtime's own failure, got {other:?}"),
+        }
+    }
+
+    /// A trap on the compile's main thread while a worker is parked
+    /// condemns the compile: the worker's call ends with the kill instead of
+    /// being joined for ever, and the compile's error is the trap's.
+    #[test]
+    fn a_trap_on_main_ends_a_parked_worker_and_is_the_compiles_error() {
+        let fixture = CompileFixture::new();
+        let (mut main, main_drive) = fixture.open_store();
+        let (mut worker, worker_drive) = fixture.open_store();
+        let trap = trapping(&mut main, "main trapped");
+        let wait = parked(&mut worker);
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut worker_call = pin!(worker_drive.call(&mut worker, &wait, ()));
+        assert!(worker_call.as_mut().poll(&mut cx).is_pending());
+
+        let main_error =
+            block_on(main_drive.call(&mut main, &trap, ())).expect_err("the main thread traps");
+        let result = fixture
+            .context
+            .end_main_part::<()>(Err(map_program_runtime_error(main_error)));
+
+        assert_eq!(
+            fixture.instance.pending_kill(),
+            Some(crate::KillReason::StoreFailed),
+            "main's failure condemns the compile before its workers are joined"
+        );
+        match worker_call.as_mut().poll(&mut cx) {
+            Poll::Ready(Err(error)) => {
+                assert_eq!(
+                    error.downcast_ref::<crate::InstanceKilled>(),
+                    Some(&crate::InstanceKilled {
+                        reason: crate::KillReason::StoreFailed
+                    })
+                );
+                assert!(
+                    fixture.context.condemn_for_store_end(error).is_none(),
+                    "a worker ended by the condemnation reports no trap"
+                );
+            }
+            other => panic!("the condemnation ends the parked worker, got {other:?}"),
+        }
+        let mut reports = [report(None)];
+        let Err(error) = first_trap_wins(result, &mut reports) else {
+            panic!("a compile whose main thread trapped fails");
+        };
+        assert!(
+            message_of(&error).contains("main trapped"),
+            "the requester gets main's trap, got {error}"
+        );
+    }
+
+    /// A trap on a worker while main waits on it condemns the compile: main's
+    /// call ends with the kill, and the error handed to the requester is the
+    /// worker's trap, not the condemnation main ended with.
+    #[test]
+    fn a_trap_on_a_worker_ends_main_and_is_the_compiles_error() {
+        let fixture = CompileFixture::new();
+        let (mut main, main_drive) = fixture.open_store();
+        let (mut worker, worker_drive) = fixture.open_store();
+        let wait = parked(&mut main);
+        let trap = trapping(&mut worker, "worker trapped");
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut main_call = pin!(main_drive.call(&mut main, &wait, ()));
+        assert!(main_call.as_mut().poll(&mut cx).is_pending());
+
+        let worker_error =
+            block_on(worker_drive.call(&mut worker, &trap, ())).expect_err("the worker traps");
+        let worker_trap = fixture.context.condemn_for_store_end(worker_error);
+        assert!(
+            worker_trap.is_some(),
+            "the trap that condemns the compile carries its error"
+        );
+        assert_eq!(
+            fixture.instance.pending_kill(),
+            Some(crate::KillReason::StoreFailed)
+        );
+
+        let Poll::Ready(Err(kill)) = main_call.as_mut().poll(&mut cx) else {
+            panic!("the condemnation ends main's parked call");
+        };
+        let kill = map_program_runtime_error(kill);
+        assert!(
+            message_of(&kill).contains("terminated"),
+            "main ended by the kill, got {kill}"
+        );
+        let result = fixture.context.end_main_part::<()>(Err(kill));
+        let mut reports = [report(None), report(worker_trap)];
+        let Err(error) = first_trap_wins(result, &mut reports) else {
+            panic!("a compile whose worker trapped fails");
+        };
+        assert!(
+            message_of(&error).contains("worker trapped"),
+            "the requester gets the worker's trap, not the kill, got {error}"
+        );
+        assert!(!message_of(&error).contains("terminated"));
+    }
+
+    /// A store that ends by a kill does not condemn the compile again: the
+    /// first condemnation's reason stands, and the end is no trap.
+    #[test]
+    fn a_store_that_ends_by_a_kill_does_not_condemn_with_the_trap_reason() {
+        // A kill the registry has not recorded: only the error's type says it
+        // is one, so the decision is the end's, not the registry's.
+        let fixture = CompileFixture::new();
+        let (mut worker, drive) = fixture.open_store();
+        let killed = wasmtime::Func::wrap(&mut worker, || -> wasmtime::Result<()> {
+            Err(wasmtime::Error::new(crate::InstanceKilled {
+                reason: crate::KillReason::Operator,
+            }))
+        })
+        .typed::<(), ()>(&worker)
+        .expect("the kill is a () -> () function");
+        let error = block_on(drive.call(&mut worker, &killed, ())).expect_err("the call ends");
+        assert!(fixture.context.condemn_for_store_end(error).is_none());
+        assert_eq!(
+            fixture.instance.pending_kill(),
+            None,
+            "a store ended by a kill is not a trap and condemns nothing"
+        );
+
+        // A real kill, then a worker parked in the wait it ends.
+        let fixture = CompileFixture::new();
+        let (mut worker, drive) = fixture.open_store();
+        let wait = parked(&mut worker);
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut call = pin!(drive.call(&mut worker, &wait, ()));
+        assert!(call.as_mut().poll(&mut cx).is_pending());
+        fixture
+            .registry
+            .request_kill(fixture.instance.id(), crate::KillReason::Operator, 0);
+        let Poll::Ready(Err(error)) = call.as_mut().poll(&mut cx) else {
+            panic!("the kill ends the parked worker");
+        };
+        assert!(fixture.context.condemn_for_store_end(error).is_none());
+        assert_eq!(
+            fixture.instance.pending_kill(),
+            Some(crate::KillReason::Operator),
+            "the first reason stands"
+        );
+    }
+
+    /// A trap after another store condemned the compile is not the first
+    /// trap: it reports no error, and the first condemnation's reason stands.
+    #[test]
+    fn only_the_first_trap_reports_its_error() {
+        let fixture = CompileFixture::new();
+        let (mut first, first_drive) = fixture.open_store();
+        let (mut second, second_drive) = fixture.open_store();
+        let first_trap = trapping(&mut first, "first trapped");
+        let second_trap = trapping(&mut second, "second trapped");
+        let first_error =
+            block_on(first_drive.call(&mut first, &first_trap, ())).expect_err("traps");
+        let second_error =
+            block_on(second_drive.call(&mut second, &second_trap, ())).expect_err("traps");
+
+        let first = fixture.context.condemn_for_store_end(first_error);
+        let second = fixture.context.condemn_for_store_end(second_error);
+        assert!(first.is_some());
+        assert!(second.is_none());
+        assert_eq!(
+            fixture.instance.pending_kill(),
+            Some(crate::KillReason::StoreFailed)
         );
     }
 }

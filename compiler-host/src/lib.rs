@@ -9,10 +9,13 @@
 //! compile timed here is the plugin's work on this system and nothing else.
 //!
 //! The plugin's own machine code is compiled with
-//! [`helios_compiler_support::codegen_config`], the configuration the kernel's
-//! precompile of it uses minus the kernel's runtime mechanisms (stack-limit
-//! interruption, async fibers, the pooling allocator), which a process on
-//! this system does not have.
+//! [`helios_compiler_support::codegen_config`] for the host triple at that
+//! triple's floor ISA level, as the prebuild compiles the bootfs plugin at the
+//! floor of its target. That is the configuration the kernel's precompile of
+//! it uses minus the kernel's runtime mechanisms (stack-limit interruption,
+//! async fibers, the pooling allocator), which a process on this system does
+//! not have. The request the plugin is driven with names its compile target
+//! and ISA level exactly as the kernel's does.
 //!
 //! Concurrency: a [`CompilerHost`] is driven by one thread, which must have
 //! a [`WASM_THREAD_STACK`] native stack ([`on_wasm_thread`] provides one).
@@ -30,6 +33,7 @@ use std::sync::{Arc, OnceLock, mpsc};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
+use helios_artifact::{CwasmTarget, IsaLevelError, cwasm_target_isa_levels};
 use helios_compiler_abi::{
     CompileHint, CompilerRequestHeader, CompilerResponseHeader, CompilerStatus,
     HELIOS_COMPILER_ABI_VERSION, HELIOS_COMPILER_ALLOC, HELIOS_COMPILER_COMPILE,
@@ -53,6 +57,8 @@ const THREAD_START_EXPORT: &str = "wasi_thread_start";
 /// Why the plugin could not be hosted or a compile did not produce output.
 #[derive(Debug, Error)]
 pub enum CompilerHostError {
+    #[error("the compile target is not one Helios defines: {0}")]
+    IsaLevel(#[from] IsaLevelError),
     #[error("failed to configure the engine for the plugin's own code: {0}")]
     CodegenConfig(#[source] helios_compiler_support::CompileError),
     #[error("failed to build the Wasmtime engine for {target}: {source}")]
@@ -209,15 +215,23 @@ struct PluginThread {
 }
 
 impl CompilerHost {
-    /// Builds the engine and precompiles `plugin` for this host: the
-    /// counterpart of the prebuild that puts the plugin's cwasm in the
-    /// Helios bootfs, so it is paid before any compile is timed.
+    /// Builds the engine and precompiles `plugin` for this host's triple at
+    /// that triple's floor ISA level: the counterpart of the prebuild that
+    /// puts the plugin's cwasm in the Helios bootfs, so it is paid before any
+    /// compile is timed.
     ///
     /// `workers` is the worker count the plugin is told through
     /// `RAYON_NUM_THREADS`, as the kernel tells it its kernel-role
     /// processor count.
+    ///
+    /// # Panics
+    ///
+    /// Panics when Helios defines no ISA levels for the host's architecture
+    /// (`helios_artifact::cwasm_target_isa_levels`).
     pub fn new(plugin: &[u8], workers: NonZeroU32) -> Result<Self, CompilerHostError> {
-        let target = target_lexicon::HOST.to_string();
+        let triple = target_lexicon::HOST.to_string();
+        let floor = cwasm_target_isa_levels(&triple).floor();
+        let target = CwasmTarget::new(&triple, floor.name())?;
         let mut config = codegen_config(&target, AotCompileHint::Performance)
             .map_err(CompilerHostError::CodegenConfig)?;
         config.parallel_compilation(true);
@@ -225,8 +239,10 @@ impl CompilerHost {
         // No fiber runs on this engine; Wasmtime still requires the async
         // stack to hold the wasm stack limit.
         config.async_stack_size(WASM_THREAD_STACK);
-        let engine =
-            Engine::new(&config).map_err(|source| CompilerHostError::Engine { target, source })?;
+        let engine = Engine::new(&config).map_err(|source| CompilerHostError::Engine {
+            target: triple,
+            source,
+        })?;
         let precompiled = engine
             .precompile_module(plugin)
             .map_err(CompilerHostError::Precompile)?;
@@ -243,18 +259,29 @@ impl CompilerHost {
         self.workers
     }
 
-    /// Compiles `wasm` for `target` under `hint`, through the kernel's call
-    /// sequence, and joins every thread the plugin spawned for it.
+    /// Compiles `wasm` for the ISA level named `isa_level` of `target` under
+    /// `hint`, through the kernel's call sequence, and joins every thread the
+    /// plugin spawned for it.
+    ///
+    /// `isa_level` is the level name the kernel sends, such as
+    /// `x86-64-v4+vbmi+bitalg`; one `target` does not define is
+    /// [`CompilerHostError::IsaLevel`].
     ///
     /// The first call also builds the resident runtime, as the kernel's
     /// first compile of a boot does. The calling thread runs the plugin and
     /// needs a [`WASM_THREAD_STACK`] stack.
+    ///
+    /// # Panics
+    ///
+    /// Panics when Helios defines no ISA levels for `target`'s architecture.
     pub fn compile(
         &mut self,
         wasm: &[u8],
         target: &str,
+        isa_level: &str,
         hint: CompileHint,
     ) -> Result<Compiled, CompilerHostError> {
+        let target = CwasmTarget::new(target, isa_level)?;
         let runtime = match &mut self.runtime {
             Some(runtime) => runtime,
             slot @ None => slot.insert(PluginRuntime::build(
@@ -266,7 +293,7 @@ impl CompilerHost {
         // A failed call can leave the plugin's workers parked on work that
         // never comes, so only a compile that returned is joined; the
         // failure ends the host.
-        let compiled = runtime.invoke(wasm, target, hint)?;
+        let compiled = runtime.invoke(wasm, &target, hint)?;
         runtime.join_threads()?;
         Ok(compiled)
     }
@@ -350,7 +377,7 @@ impl PluginRuntime {
     fn invoke(
         &self,
         wasm: &[u8],
-        target: &str,
+        target: &CwasmTarget<'_>,
         hint: CompileHint,
     ) -> Result<Compiled, CompilerHostError> {
         let mut store = Store::new(
@@ -411,23 +438,25 @@ impl PluginRuntime {
         result
     }
 
-    /// `call_compiler`: allocates the three request buffers, writes the
-    /// request, calls `compile`, and copies the response out. The outer
-    /// `Err` is a failed call into the plugin, after which nothing is freed;
-    /// every other end is the inner `Result`, and the call's `allocations`
-    /// are released.
+    /// `call_compiler`: allocates the four request buffers (wasm, target
+    /// triple, ISA level name, header), writes the request, calls `compile`,
+    /// and copies the response out. The outer `Err` is a failed call into the
+    /// plugin, after which nothing is freed; every other end is the inner
+    /// `Result`, and the call's `allocations` are released.
     fn call_compiler(
         &self,
         store: &mut Store<PluginState>,
         exports: &Exports,
         allocations: &mut Allocations,
         wasm: &[u8],
-        target: &str,
+        target: &CwasmTarget<'_>,
         hint: CompileHint,
     ) -> Result<Result<Compiled, CompilerHostError>, CompilerHostError> {
-        let target = target.as_bytes();
+        let isa_level = target.level().name().as_bytes();
+        let target = target.triple().as_bytes();
         let wasm_ptr = allocations.alloc(&mut *store, &exports.alloc, wasm.len(), 1)?;
         let target_ptr = allocations.alloc(&mut *store, &exports.alloc, target.len(), 1)?;
+        let isa_level_ptr = allocations.alloc(&mut *store, &exports.alloc, isa_level.len(), 1)?;
         let request_ptr = allocations.alloc(
             &mut *store,
             &exports.alloc,
@@ -445,11 +474,14 @@ impl PluginRuntime {
                 wasm_len: guest_len(wasm.len())?,
                 target_ptr,
                 target_len: guest_len(target.len())?,
+                isa_level_ptr,
+                isa_level_len: guest_len(isa_level.len())?,
                 // `profile: false`, as the bench's AOT request is.
                 flags: 0,
             };
             memory::write(memory, wasm_ptr, wasm)?;
             memory::write(memory, target_ptr, target)?;
+            memory::write(memory, isa_level_ptr, isa_level)?;
             memory::write(memory, request_ptr, &request.to_bytes())?;
             Ok(())
         })();
