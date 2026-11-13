@@ -2370,6 +2370,7 @@ dependencies = [
  "rand_chacha",
  "rand_core 0.6.4",
  "sha2 0.11.0",
+ "siphasher",
  "slab",
  "smallvec",
  "spin 0.9.9",
