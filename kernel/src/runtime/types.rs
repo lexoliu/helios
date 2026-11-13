@@ -627,24 +627,45 @@ impl<Service> ComponentHostNetwork for Service where
 {
 }
 
-/// The queue-pair packet pump a network service runs per processor.
+/// The queue-pair packet pump a network service runs per processor, and
+/// the hand-off of a processor's pair when it goes offline or online.
 ///
 /// A queue pair's interrupt is routed to one processor, so the pump
-/// that drains the pair is pinned to it: every processor calls this
-/// once from its own run loop through `spawn_local_detached`, and the
-/// service either runs the pump for the pair the processor owns or
-/// returns at once. Which pair a processor owns is decided from the
-/// topology inside the service, never by which task got there first —
-/// with more processors than pairs, only the lowest processor mapped
-/// to each pair runs a pump.
+/// that drains the pair is pinned to it: every online processor runs
+/// one as a local task, which its network lifecycle step spawns on the
+/// way up and cancels on the way down. Which pair a processor owns is
+/// the service's routing table's answer, never which task got there
+/// first, and it changes only through the two hand-off calls below.
+///
+/// # Concurrency contract
+///
+/// `hand_off_queue_pair` and `take_up_queue_pair` run on the processor
+/// they name, from its lifecycle step, while the initiator of the
+/// transition holds the lifecycle's transition lock: at most one runs
+/// at a time, and never during a machine freeze. They are synchronous
+/// and take no lock a pump or a socket operation holds; the device
+/// command they issue is polled for its acknowledgement.
 pub trait NetworkPacketPump {
-    /// Runs the packet pump for the queue pair `processor` owns, for as
-    /// long as the interface lives — or completes immediately when the
-    /// processor owns no pair.
+    /// Runs the packet pump of `processor` for as long as the task is
+    /// not cancelled: it drains whichever pair the processor owns and
+    /// parks while it owns none.
     fn run_packet_pump(
         &self,
         processor: helios_hal::cpu::ProcessorId,
     ) -> impl Future<Output = ()> + Send + '_;
+
+    /// Hands the pair `departing` owns to an online processor, steering
+    /// its interrupt and the device's live pair count, before
+    /// `departing` leaves `online`.
+    fn hand_off_queue_pair(
+        &self,
+        departing: helios_hal::cpu::ProcessorId,
+        online: &crate::exec::OnlineSet,
+    );
+
+    /// Gives `arriving` a pair when the device has one that is not
+    /// live, after `arriving` restarted or refused to go offline.
+    fn take_up_queue_pair(&self, arriving: helios_hal::cpu::ProcessorId);
 }
 
 /// A network handle's stable numeric name.
