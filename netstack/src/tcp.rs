@@ -806,6 +806,8 @@ where
     transmit_queue: Option<TcpTransmitQueue>,
     in_flight: Option<TcpInFlightQueue>,
     bytes_in_flight: u32,
+    /// Bytes of the in-flight segments a SACK block covers.
+    sacked_bytes: u32,
     delivered_bytes: u64,
     syn_queued: bool,
     syn_ack_queued: bool,
@@ -999,6 +1001,7 @@ where
             transmit_queue: None,
             in_flight: None,
             bytes_in_flight: 0,
+            sacked_bytes: 0,
             delivered_bytes: 0,
             syn_queued: false,
             syn_ack_queued: false,
@@ -1186,7 +1189,7 @@ where
             })
             .expect("TCP in-flight queue is full");
         self.congestion
-            .on_packet_sent(1, self.bytes_in_flight, now_nanos);
+            .on_packet_sent(1, self.pipe_bytes(), now_nanos);
     }
 
     pub fn mark_syn_ack_queued(&mut self, now_nanos: u64) {
@@ -1213,7 +1216,7 @@ where
             })
             .expect("TCP in-flight queue is full");
         self.congestion
-            .on_packet_sent(1, self.bytes_in_flight, now_nanos);
+            .on_packet_sent(1, self.pipe_bytes(), now_nanos);
     }
 
     /// The reset this socket owes its peer when the local side tears
@@ -1571,7 +1574,7 @@ where
             self.bytes_in_flight = self.bytes_in_flight.saturating_add(1);
             self.persist_timer = None;
             self.congestion
-                .on_packet_sent(1, self.bytes_in_flight, now_nanos);
+                .on_packet_sent(1, self.pipe_bytes(), now_nanos);
             self.in_flight_mut()
                 .push_back(TcpInFlightSegment {
                     header,
@@ -1735,7 +1738,7 @@ where
                 self.send_next = self.send_next.wrapping_add(chunk_sequence_len);
                 self.bytes_in_flight = self.bytes_in_flight.saturating_add(chunk_sequence_len);
                 self.congestion
-                    .on_packet_sent(chunk_sequence_len, self.bytes_in_flight, now_nanos);
+                    .on_packet_sent(chunk_sequence_len, self.pipe_bytes(), now_nanos);
                 self.in_flight_mut()
                     .push_back(TcpInFlightSegment {
                         header: chunk_header,
@@ -1862,6 +1865,7 @@ where
         if in_flight.retransmissions > TCP_MAX_RETRANSMISSIONS {
             self.set_state(TcpState::Closed, TcpStateChangeReason::RetransmissionLimit);
             self.bytes_in_flight = 0;
+            self.sacked_bytes = 0;
             if let Some(in_flight) = self.in_flight.as_mut() {
                 in_flight.clear();
             }
@@ -2285,6 +2289,7 @@ where
     pub fn abort(&mut self) {
         self.set_state(TcpState::Closed, TcpStateChangeReason::Abort);
         self.bytes_in_flight = 0;
+        self.sacked_bytes = 0;
         self.receive_queue = None;
         self.receive_queued_bytes = 0;
         self.receive_fin_sequence = None;
@@ -2317,6 +2322,9 @@ where
                 return;
             };
             if sequence_leq(segment_end(front), acknowledgement) {
+                if front.sacked {
+                    self.sacked_bytes -= front.sequence_len;
+                }
                 let Some(in_flight) = self.in_flight.as_mut() else {
                     return;
                 };
@@ -2340,9 +2348,11 @@ where
                     );
                     let _ = front.payload.split_to(trim);
                 }
-                front.sequence_len = front
-                    .sequence_len
-                    .saturating_sub(u32::try_from(trim).expect("TCP partial ACK trim exceeds u32"));
+                let trim = u32::try_from(trim).expect("TCP partial ACK trim exceeds u32");
+                front.sequence_len = front.sequence_len.saturating_sub(trim);
+                if front.sacked {
+                    self.sacked_bytes -= trim;
+                }
             }
             return;
         }
@@ -2544,7 +2554,7 @@ where
         Some(self.congestion.on_ack(AckSample {
             acked_bytes: acked,
             delivered_bytes: self.delivered_bytes,
-            bytes_in_flight: self.bytes_in_flight,
+            bytes_in_flight: self.pipe_bytes(),
             rtt_nanos: timing.rtt_nanos,
             interval_nanos: timing.interval_nanos,
             now_nanos,
@@ -2584,7 +2594,7 @@ where
             self.congestion
                 .on_congestion_event(CongestionEvent::PacketLoss {
                     lost_bytes,
-                    bytes_in_flight: self.bytes_in_flight,
+                    bytes_in_flight: self.pipe_bytes(),
                     now_nanos,
                 }),
         )
@@ -2601,8 +2611,10 @@ where
             for segment in in_flight.iter_mut() {
                 if sequence_leq(block.left_edge, segment.header.sequence)
                     && sequence_leq(segment_end(segment), block.right_edge)
+                    && !segment.sacked
                 {
                     segment.sacked = true;
+                    self.sacked_bytes += segment.sequence_len;
                 }
             }
         }
@@ -2623,6 +2635,14 @@ where
                 segment.sacked = false;
             }
         }
+        self.sacked_bytes = 0;
+    }
+
+    /// `C.inflight`, RFC 6675's pipe: what was sent and is still
+    /// believed in the network. Outstanding data less what the peer
+    /// selectively acknowledged.
+    fn pipe_bytes(&self) -> u32 {
+        self.bytes_in_flight - self.sacked_bytes
     }
 
     fn ack_sample_timing(
@@ -3151,12 +3171,15 @@ where
             && self.scaled_peer_receive_window(packet.window_size) == self.peer_receive_window
     }
 
+    /// What may be sent now: the congestion window bounds the pipe
+    /// (RFC 6675 section 5, step 4.3's `cwnd - pipe`), and the peer's
+    /// window bounds the sequence space outstanding.
     fn available_send_window(&self) -> usize {
         let congestion_window = self
             .congestion
             .congestion_window()
             .bytes()
-            .saturating_sub(self.bytes_in_flight);
+            .saturating_sub(self.pipe_bytes());
         let receive_window = self
             .peer_receive_window
             .saturating_sub(self.bytes_in_flight);
@@ -4018,6 +4041,40 @@ mod tests {
             .pending_retransmission(now)
             .expect("a partial ACK resends the next hole at once");
         assert_eq!(retransmit.header.sequence, hole + mss);
+    }
+
+    #[test]
+    fn selective_acks_open_the_congestion_window_by_what_they_cover() {
+        let mss = TCP_RECEIVE_SEGMENT_BYTES as u32;
+        let sack_permitted = TcpOptions::parse(&[4, 2, 0, 0]).expect("SACK-permitted should parse");
+        let mut socket = established_window_socket(4, sack_permitted);
+        let sent_at = TCP_INITIAL_RTO_NANOS + 1;
+        let hole = send_flight(&mut socket, 4, sent_at);
+        let more = [0x5a; TCP_RECEIVE_SEGMENT_BYTES];
+        assert_eq!(socket.queue_send(&more), more.len());
+        assert_eq!(
+            socket.take_transmit_segment(sent_at, full_segment_budget()),
+            None,
+            "four segments fill a four-segment window"
+        );
+
+        let block = sack_options_bytes(TcpSackBlock {
+            left_edge: hole + mss,
+            right_edge: hole + 3 * mss,
+        });
+        let now = sent_at + 1;
+        let _ = deliver_segment(
+            &mut socket,
+            TcpPacket {
+                options: TcpOptions::parse(&block).expect("SACK block should parse"),
+                ..peer_ack(hole, u16::MAX)
+            },
+            now,
+        );
+        let segment = socket
+            .take_transmit_segment(now, full_segment_budget())
+            .expect("two segments left the network, so new data may follow");
+        assert_eq!(segment.header.sequence, hole + 4 * mss);
     }
 
     #[test]
