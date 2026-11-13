@@ -816,6 +816,10 @@ where
     pending_acks: u8,
     duplicate_ack_count: u8,
     fast_retransmit_pending: bool,
+    /// RFC 6582's `recover`: the highest sequence sent when the fast
+    /// retransmit in progress began. Recovery lasts until the cumulative
+    /// acknowledgement reaches it.
+    fast_recovery_point: Option<u32>,
     pending_pmtu_retransmit_sequence: Option<u32>,
     retransmission_timer: TcpRetransmissionTimer,
     persist_timer: Option<TcpPersistTimer>,
@@ -1002,6 +1006,7 @@ where
             pending_acks: 0,
             duplicate_ack_count: 0,
             fast_retransmit_pending: false,
+            fast_recovery_point: None,
             pending_pmtu_retransmit_sequence: None,
             retransmission_timer: TcpRetransmissionTimer::new(),
             persist_timer: None,
@@ -2293,6 +2298,7 @@ where
         self.pending_acks = 0;
         self.duplicate_ack_count = 0;
         self.fast_retransmit_pending = false;
+        self.fast_recovery_point = None;
         self.pending_pmtu_retransmit_sequence = None;
         self.persist_timer = None;
         self.persist_probe = None;
@@ -2511,6 +2517,17 @@ where
         self.delivered_bytes = self
             .delivered_bytes
             .saturating_add(u64::from(acked.saturating_add(probe_acked)));
+        // RFC 6582 section 3.2, step 5: an acknowledgement that advances
+        // but stops short of the recovery point names the next hole, and
+        // the sender resends it without waiting for three more
+        // duplicates.
+        if let Some(point) = self.fast_recovery_point {
+            if sequence_leq(point, acknowledgement) {
+                self.fast_recovery_point = None;
+            } else {
+                self.fast_retransmit_pending = self.first_unsacked_in_flight().is_some();
+            }
+        }
         if self.fin_queued && sequence_leq(self.send_next, acknowledgement) {
             match self.state {
                 TcpState::FinWait1 => {
@@ -2543,15 +2560,26 @@ where
         }
     }
 
+    /// RFC 5681 section 3.2: the third duplicate ACK retransmits the
+    /// first unacknowledged segment, once. Every duplicate after it
+    /// reports a segment that left the network and resends nothing; a
+    /// further hole is repaired by the partial ACK the retransmission
+    /// draws (RFC 6582 section 3.2, step 5).
     fn note_duplicate_ack(&mut self, now_nanos: u64) -> Option<RecoveryAction> {
         let lost_bytes = self
             .first_unsacked_in_flight()
             .map(|segment| segment.sequence_len)?;
         self.duplicate_ack_count = self.duplicate_ack_count.saturating_add(1);
-        if self.duplicate_ack_count < 3 || self.fast_retransmit_pending {
+        if self.duplicate_ack_count != 3 || self.fast_retransmit_pending {
             return None;
         }
         self.fast_retransmit_pending = true;
+        // Inside an episode the resend repairs another hole of the same
+        // congestion event, and the window was already reduced for it.
+        if self.fast_recovery_point.is_some() {
+            return None;
+        }
+        self.fast_recovery_point = Some(self.highest_sent_sequence());
         Some(
             self.congestion
                 .on_congestion_event(CongestionEvent::PacketLoss {
@@ -2589,6 +2617,7 @@ where
     fn on_retransmission_timeout(&mut self) {
         self.duplicate_ack_count = 0;
         self.fast_retransmit_pending = false;
+        self.fast_recovery_point = None;
         if let Some(in_flight) = self.in_flight.as_mut() {
             for segment in in_flight.iter_mut() {
                 segment.sacked = false;
@@ -3893,6 +3922,102 @@ mod tests {
         assert!(retransmit.retransmission);
         assert_eq!(retransmit.header.sequence, data.header.sequence);
         assert_eq!(retransmit.payload, data.payload);
+    }
+
+    /// A connection whose congestion window is `segments` full segments
+    /// and which does not pace, so a test of what ACKs do can send a
+    /// whole flight at one instant. `options` is what the peer's SYN-ACK
+    /// carries.
+    fn established_window_socket(segments: u32, options: TcpOptions<'_>) -> TcpSocket<FixedPacing> {
+        let window = segments * TCP_RECEIVE_SEGMENT_BYTES as u32;
+        let mut socket = TcpSocket::connect(
+            endpoint(49152),
+            peer(80),
+            7,
+            FixedPacing::new(CongestionWindow::new(window), None),
+        );
+        socket.mark_syn_queued(0);
+        let _ = deliver_segment(
+            &mut socket,
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 100,
+                acknowledgement: 8,
+                flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                window_size: u16::MAX,
+                options,
+                payload: &[],
+            },
+            TCP_INITIAL_RTO_NANOS,
+        );
+        socket.mark_ack_queued();
+        socket
+    }
+
+    /// One full segment on the wire: the TCP header and an MSS.
+    fn full_segment_budget() -> TcpSegmentBudget {
+        TcpSegmentBudget::wire_segments(TcpPacket::MIN_HEADER_LEN + TCP_RECEIVE_SEGMENT_BYTES)
+    }
+
+    /// Queues and sends `segments` full segments at `now`, and returns
+    /// the sequence number of the first.
+    fn send_flight<C: CongestionControl>(
+        socket: &mut TcpSocket<C>,
+        segments: u32,
+        now: u64,
+    ) -> u32 {
+        let payload = alloc::vec![0x5a; segments as usize * TCP_RECEIVE_SEGMENT_BYTES];
+        assert_eq!(socket.queue_send(&payload), payload.len());
+        let first = socket.send_next;
+        for _ in 0..segments {
+            let segment = socket
+                .take_transmit_segment(now, full_segment_budget())
+                .expect("the window holds the flight");
+            assert_eq!(segment.sequence_len as usize, TCP_RECEIVE_SEGMENT_BYTES);
+        }
+        first
+    }
+
+    #[test]
+    fn duplicates_past_the_third_resend_nothing() {
+        let mut socket = established_window_socket(6, TcpOptions::empty());
+        let sent_at = TCP_INITIAL_RTO_NANOS + 1;
+        let hole = send_flight(&mut socket, 6, sent_at);
+
+        for duplicate in 1..=5 {
+            let now = sent_at + duplicate;
+            let _ = deliver_segment(&mut socket, peer_ack(hole, u16::MAX), now);
+            let pending = socket.pending_retransmission(now);
+            if duplicate == 3 {
+                let retransmit = pending.expect("the third duplicate ACK retransmits the hole");
+                assert_eq!(retransmit.header.sequence, hole);
+                socket.mark_retransmission_queued(hole, now);
+            } else {
+                assert_eq!(pending, None, "duplicate {duplicate} resends nothing");
+            }
+        }
+    }
+
+    #[test]
+    fn a_partial_ack_resends_the_next_hole() {
+        let mss = TCP_RECEIVE_SEGMENT_BYTES as u32;
+        let mut socket = established_window_socket(6, TcpOptions::empty());
+        let sent_at = TCP_INITIAL_RTO_NANOS + 1;
+        let hole = send_flight(&mut socket, 6, sent_at);
+        for duplicate in 1..=3 {
+            let _ = deliver_segment(&mut socket, peer_ack(hole, u16::MAX), sent_at + duplicate);
+        }
+        socket.mark_retransmission_queued(hole, sent_at + 3);
+
+        // The resend fills the first hole, and the ACK it draws stops at
+        // the second, short of everything sent before recovery began.
+        let now = sent_at + 4;
+        let _ = deliver_segment(&mut socket, peer_ack(hole + mss, u16::MAX), now);
+        let retransmit = socket
+            .pending_retransmission(now)
+            .expect("a partial ACK resends the next hole at once");
+        assert_eq!(retransmit.header.sequence, hole + mss);
     }
 
     #[test]
