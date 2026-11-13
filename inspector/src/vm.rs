@@ -47,6 +47,7 @@ mod numa;
 mod qemu;
 mod qmp;
 mod raw_profile;
+mod tpm;
 mod vcpu_state;
 mod x86_image_audit;
 
@@ -60,6 +61,7 @@ use numa::{NumaError, NumaMachine};
 use qemu::QemuOptions;
 use qmp::{QmpClient, QmpError, SizeError};
 use raw_profile::{ProfileCommand, RawProfileCollectError};
+use tpm::{Swtpm, SwtpmError, VmTpm, VmTpmBackend, VmTpmError, VmTpmProfile};
 pub(crate) use vcpu_state::VcpuStateCapture;
 
 /// Why a `vm` session did not run.
@@ -129,6 +131,12 @@ pub(crate) enum VmConfigError {
     WithoutKernelProfileOnPlainTarget { arch: &'static str },
     #[error("{0}")]
     WorkloadSelection(#[from] WorkloadSelectionError),
+    #[error("--root-secret-key {path} cannot be made absolute: {source}")]
+    RootSecretKeyPath {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
     #[error("failed to read inspector VM config {path}: {source}")]
     ReadConfig {
         path: String,
@@ -182,6 +190,8 @@ pub(crate) enum VmConfigError {
     Network(#[from] VmNetworkError),
     #[error("{0}")]
     AudioDev(#[from] AudioDevError),
+    #[error("{0}")]
+    Tpm(#[from] VmTpmError),
     #[error("--shared-dir-writable requires --shared-dir (or `shared_dir` in the config file)")]
     WritableShareWithoutDir,
     #[error("shared directory does not exist: {path}")]
@@ -366,6 +376,8 @@ pub(crate) enum VmRuntimeError {
         #[source]
         source: io::Error,
     },
+    #[error("{0}")]
+    Swtpm(#[from] SwtpmError),
     #[error("failed to start QEMU executable {path}: {source}")]
     SpawnQemu {
         path: String,
@@ -1050,6 +1062,10 @@ struct VmProfile {
     host_share: Option<VmHostShareProfile>,
     watchdog: Option<VmWatchdogProfile>,
     entropy: VmEntropyProfile,
+    /// Whether this machine can carry QEMU's `vmgenid` device, which
+    /// publishes the VM Generation ID through an ACPI SSDT. Only the x86
+    /// machines build that table; `virt` on aarch64 and riscv64 has none.
+    vm_generation_id: bool,
     /// The `-machine` option list that makes this machine publish ACPI
     /// tables instead of a device tree, when it can publish both.
     acpi_machine: Option<&'static str>,
@@ -1066,6 +1082,10 @@ struct VmProfile {
     /// How this profile would attach a vsock device, when a session asks
     /// for the vsock RPC transport.
     vsock: VmVsockProfile,
+    /// The TPM front end this profile attaches when a session asks for a
+    /// TPM (`--tpm`); `None` where the kernel takes no measured-boot
+    /// device.
+    tpm: Option<VmTpmProfile>,
     /// Linker script fragment that places this target's LLVM
     /// instrumentation sections, for `--profile-generate` builds.
     ///
@@ -1119,6 +1139,7 @@ const AARCH64_VIRT_HVF_PROFILE: VmProfile = VmProfile {
     host_share: Some(VmHostShareProfile::Virtio9pMmio),
     watchdog: Some(VmWatchdogProfile::I6300Esb),
     entropy: VmEntropyProfile::VirtioRngMmio,
+    vm_generation_id: false,
     // The virtio devices of the `virt` machines are memory-mapped, and
     // virtio-iommu translates PCI endpoints only, so there is nothing
     // here it could confine.
@@ -1129,6 +1150,7 @@ const AARCH64_VIRT_HVF_PROFILE: VmProfile = VmProfile {
     input: VmInputProfile::VirtioInputMmio,
     sound: VmSoundProfile::VirtioSoundMmio,
     vsock: VmVsockProfile::VhostVsockMmio,
+    tpm: Some(VmTpmProfile::TisMmio),
     profile_generate_linker_script: Some("aarch64/profile-generate.ld"),
     release_kernel_profile: false,
 };
@@ -1153,6 +1175,7 @@ const AARCH64_VIRT_TCG_PROFILE: VmProfile = VmProfile {
     host_share: Some(VmHostShareProfile::Virtio9pMmio),
     watchdog: Some(VmWatchdogProfile::I6300Esb),
     entropy: VmEntropyProfile::VirtioRngMmio,
+    vm_generation_id: false,
     // The virtio devices of the `virt` machines are memory-mapped, and
     // virtio-iommu translates PCI endpoints only, so there is nothing
     // here it could confine.
@@ -1163,6 +1186,7 @@ const AARCH64_VIRT_TCG_PROFILE: VmProfile = VmProfile {
     input: VmInputProfile::VirtioInputMmio,
     sound: VmSoundProfile::VirtioSoundMmio,
     vsock: VmVsockProfile::VhostVsockMmio,
+    tpm: Some(VmTpmProfile::TisMmio),
     profile_generate_linker_script: Some("aarch64/profile-generate.ld"),
     release_kernel_profile: false,
 };
@@ -1186,6 +1210,7 @@ const RISCV64_VM_PROFILE: VmProfile = VmProfile {
     host_share: Some(VmHostShareProfile::Virtio9pMmio),
     watchdog: Some(VmWatchdogProfile::I6300Esb),
     entropy: VmEntropyProfile::VirtioRngMmio,
+    vm_generation_id: false,
     // The virtio devices of the `virt` machines are memory-mapped, and
     // virtio-iommu translates PCI endpoints only, so there is nothing
     // here it could confine.
@@ -1196,6 +1221,9 @@ const RISCV64_VM_PROFILE: VmProfile = VmProfile {
     input: VmInputProfile::VirtioInputMmio,
     sound: VmSoundProfile::VirtioSoundMmio,
     vsock: VmVsockProfile::VhostVsockMmio,
+    // The riscv kernel keeps its per-boot signing seed and takes no
+    // measured-boot device.
+    tpm: None,
     profile_generate_linker_script: Some("riscv/profile-generate.x"),
     release_kernel_profile: false,
 };
@@ -1219,6 +1247,7 @@ const X86_64_VM_PROFILE: VmProfile = VmProfile {
     host_share: Some(VmHostShareProfile::Virtio9pPci),
     watchdog: Some(VmWatchdogProfile::I6300Esb),
     entropy: VmEntropyProfile::VirtioRngPci,
+    vm_generation_id: true,
     acpi_machine: None,
     iommu: Some(VmIommuProfile::VirtioIommuPci),
     balloon: VmBalloonProfile::VirtioBalloonPci,
@@ -1226,6 +1255,7 @@ const X86_64_VM_PROFILE: VmProfile = VmProfile {
     input: VmInputProfile::VirtioInputPci,
     sound: VmSoundProfile::VirtioSoundPci,
     vsock: VmVsockProfile::VhostVsockPci,
+    tpm: Some(VmTpmProfile::Crb),
     profile_generate_linker_script: None,
     // The one architecture performance is measured on, and the one
     // release.yml collects and publishes a profile for.
@@ -1637,6 +1667,10 @@ pub(crate) struct VmConfigFile {
     #[serde(default)]
     pub(crate) audiodev: Option<String>,
     #[serde(default)]
+    pub(crate) tpm: Option<VmTpmBackend>,
+    #[serde(default)]
+    pub(crate) tpm_state: Option<PathBuf>,
+    #[serde(default)]
     pub(crate) network: VmNetworkFile,
 }
 
@@ -1703,6 +1737,14 @@ pub(crate) struct VmCommand {
     /// `--no-build --kernel` boots an image from outside this checkout.
     #[arg(long)]
     bootfs: Option<PathBuf>,
+
+    /// Sign the boot payload with the Ed25519 secret in this file, and
+    /// embed its public half in the kernel, instead of the key a
+    /// development build generates in its own build directory. A
+    /// release names the key its workflow installed; the file is read
+    /// in place and never copied into the build directory.
+    #[arg(long, value_name = "PATH")]
+    root_secret_key: Option<PathBuf>,
 
     #[arg(long)]
     socket: Option<PathBuf>,
@@ -1833,6 +1875,13 @@ pub(crate) struct VmCommand {
     #[arg(long, default_value_t = false)]
     no_compiler_plugin: bool,
 
+    /// The directory whose files the boot image carries beside the
+    /// programs: `init.txt`, and the `etc/fstab` and `etc/rc` init
+    /// reads. Defaults to `programs/init/bootfs`; a relative path is
+    /// relative to the repository root.
+    #[arg(long, value_name = "DIR")]
+    bootfs_root: Option<PathBuf>,
+
     /// Directory for VM sockets, logs, and generated boot artifacts.
     #[arg(long)]
     runtime_dir: Option<PathBuf>,
@@ -1915,6 +1964,18 @@ pub(crate) struct VmCommand {
     #[arg(long, value_name = "BACKEND")]
     audiodev: Option<String>,
 
+    /// Give the guest a TPM 2.0 for measured boot, emulated on the host:
+    /// `swtpm` behind QEMU's `tpm-crb` on x86-64 and `tpm-tis-device` on
+    /// aarch64. Refused on riscv64, whose kernel takes none.
+    #[arg(long, value_enum, value_name = "BACKEND")]
+    tpm: Option<VmTpmBackend>,
+
+    /// Directory the TPM keeps its non-volatile state in, created when
+    /// missing and never removed, so what the guest sealed survives the
+    /// next boot. Without it the state lives in the runtime directory.
+    #[arg(long, value_name = "DIR")]
+    tpm_state: Option<PathBuf>,
+
     #[command(flatten)]
     network: VmNetworkArgs,
 
@@ -1962,6 +2023,14 @@ enum VmSessionCommand {
     /// refuse two checkouts whose guest images turn out to be the same
     /// build, which the comparison between them could say nothing about.
     KernelPath,
+    /// Print the signed `helios-bootfs` payload this checkout would boot
+    /// with that kernel, and stop there.
+    ///
+    /// The payload is the one `kernel-prebuild` wrote for the same
+    /// build, resolved as a boot resolves it: `--bootfs` or the config
+    /// file's `bootfs` if named, else the build's prebuild directory. A
+    /// release uses it to attach the payload its kernel trusts.
+    BootfsPath,
     /// Provision the privileged host state a network backend needs.
     NetSetup(NetSetupCommand),
     /// Remove the host state `net-setup` provisioned.
@@ -2241,6 +2310,7 @@ struct ResolvedVmCommand {
     display: VmDisplayBackend,
     renderer: Option<VmRendererConfig>,
     audiodev: VmAudioDev,
+    tpm: Option<VmTpm>,
     virtio_devices: VirtioDeviceProfile,
     rpc_transport: VmRpcTransport,
     vsock_cid: u32,
@@ -2325,6 +2395,14 @@ pub(crate) fn run(mut command: VmCommand) -> Result<(), VmError> {
             println!("{}", kernel.display());
             return Ok(());
         }
+        Some(VmSessionCommand::BootfsPath) => {
+            let file = load_config_file(command.config.as_deref())?;
+            let build = resolve_build(&command, &file, None)?;
+            let bootfs = resolve_bootfs_path(command.bootfs, file.bootfs, &build)
+                .map_err(VmConfigError::from)?;
+            println!("{}", bootfs.display());
+            return Ok(());
+        }
         session => command.command = session,
     }
     let command = resolve(command)?;
@@ -2359,6 +2437,12 @@ struct KernelBuildSpec {
     profile_use: Option<KernelProfileUse>,
     boot_programs: Vec<String>,
     no_compiler_plugin: bool,
+    /// The release signing key a build was told to use, absolute. `None`
+    /// is a development build, whose key `kernel-prebuild` generates in
+    /// the build's own prebuild directory.
+    root_secret_key: Option<PathBuf>,
+    /// The boot image's file tree, when not the prebuild's default.
+    bootfs_root: Option<PathBuf>,
 }
 
 /// Which profile a `profile-use` kernel reads, and what that makes of
@@ -2549,12 +2633,26 @@ fn resolve_build(
         }
     }
     let no_compiler_plugin = command.no_compiler_plugin || file.no_compiler_plugin.unwrap_or(false);
+    // Absolute, because the prebuild and the kernel build each run in the
+    // workspace root rather than the directory the inspector was invoked in.
+    let root_secret_key = command
+        .root_secret_key
+        .as_deref()
+        .map(|path| {
+            std::path::absolute(path).map_err(|source| VmConfigError::RootSecretKeyPath {
+                path: path.display().to_string(),
+                source,
+            })
+        })
+        .transpose()?;
     Ok(KernelBuildSpec {
         profile,
         kind,
         profile_use,
         boot_programs,
         no_compiler_plugin,
+        root_secret_key,
+        bootfs_root: command.bootfs_root.clone(),
     })
 }
 
@@ -2624,6 +2722,20 @@ fn resolve_kernel_path(
     }
 }
 
+/// The `helios-bootfs` payload a session boots: an explicit path from the
+/// command line or the config file, else the one `kernel-prebuild` wrote
+/// for the resolved build.
+fn resolve_bootfs_path(
+    explicit: Option<PathBuf>,
+    configured: Option<PathBuf>,
+    build: &KernelBuildSpec,
+) -> Result<PathBuf, WorkspaceRootError> {
+    match explicit.or(configured) {
+        Some(bootfs) => Ok(bootfs),
+        None => bootfs_path(build),
+    }
+}
+
 fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
     let file = load_config_file(command.config.as_deref())?;
     let session_command: Option<ResolvedVmSessionCommand> = command.command.take().map(Into::into);
@@ -2636,10 +2748,7 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
         .or(file.qemu_bin)
         .unwrap_or_else(|| PathBuf::from(profile.qemu_bin));
     let kernel = resolve_kernel_path(command.kernel, file.kernel, &build)?;
-    let bootfs = match command.bootfs.or(file.bootfs) {
-        Some(bootfs) => bootfs,
-        None => bootfs_path(&build)?,
-    };
+    let bootfs = resolve_bootfs_path(command.bootfs, file.bootfs, &build)?;
     let smp = command.smp.or(file.smp).unwrap_or(profile.default_smp);
     let memory = command
         .memory
@@ -2760,6 +2869,12 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
         Some(text) => VmAudioDev::parse(&text)?,
         None => VmAudioDev::default(),
     };
+    let tpm = VmTpm::resolve(
+        command.tpm.or(file.tpm),
+        command.tpm_state.or(file.tpm_state),
+        profile.tpm,
+        arch_label(arch),
+    )?;
     let virtio_devices = VirtioDeviceProfile {
         ring: if command.virtio_packed || file.virtio_packed.unwrap_or(false) {
             VirtioRingLayout::Packed
@@ -2824,6 +2939,7 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
         display,
         renderer,
         audiodev,
+        tpm,
         virtio_devices,
         rpc_transport,
         vsock_cid,
@@ -3011,6 +3127,9 @@ fn ensure_qemu_command(command: &ResolvedVmCommand) -> Result<(), VmConfigError>
             .network
             .preflight(&command.qemu_bin, qemu_net.queue_pairs())?;
     }
+    if let Some(tpm) = &command.tpm {
+        tpm.preflight()?;
+    }
     Ok(())
 }
 
@@ -3038,16 +3157,7 @@ fn build_vm(command: &KernelBuildSpec) -> Result<(), VmBuildError> {
         None => format!("building {} kernel", arch_label(command.profile.arch)),
     };
     let mut kernel_build = kernel_build_command(&repo_root, command);
-    let prebuild_dir = kernel_prebuild_dir(command)?;
-    kernel_build
-        .env(
-            "HELIOS_KERNEL_ROOT_PUBLIC_KEY",
-            prebuild_dir.join("helios-root-public.key"),
-        )
-        .env(
-            "HELIOS_KERNEL_ROOT_SECRET_KEY",
-            prebuild_dir.join("helios-root-secret.key"),
-        )
+    export_trusted_root_public_key(&mut kernel_build, command)?
         .arg("--target")
         .arg(command.profile.cargo_target)
         .arg("--bin")
@@ -3276,8 +3386,28 @@ fn run_kernel_prebuild(command: &KernelBuildSpec) -> Result<(), VmBuildError> {
     if command.no_compiler_plugin {
         prebuild.arg("--no-compiler-plugin");
     }
+    if let Some(secret) = &command.root_secret_key {
+        prebuild.arg("--root-secret-key").arg(secret);
+    }
+    if let Some(root) = &command.bootfs_root {
+        prebuild.arg("--bootfs-root").arg(root);
+    }
     run_step("prebuilding kernel bootfs", &mut prebuild)?;
     Ok(())
+}
+
+/// Points a kernel image build at the public half of the root key
+/// `kernel-prebuild` wrote for `build`. An image carries the public key
+/// alone: the secret never reaches a kernel build, so a release key cannot
+/// land under `target/`.
+fn export_trusted_root_public_key<'a>(
+    kernel_build: &'a mut Command,
+    build: &KernelBuildSpec,
+) -> Result<&'a mut Command, WorkspaceRootError> {
+    Ok(kernel_build.env(
+        "HELIOS_KERNEL_ROOT_PUBLIC_KEY",
+        kernel_prebuild_dir(build)?.join("helios-root-public.key"),
+    ))
 }
 
 fn connect_and_run(
@@ -5080,6 +5210,9 @@ struct VmRuntime {
     _socket_dir: VmSocketDir,
     qemu_log: PathBuf,
     child: Child,
+    /// The TPM emulator, when the session asked for a TPM; ended after
+    /// QEMU, which holds its control channel.
+    swtpm: Option<Swtpm>,
 }
 
 enum VmTransport {
@@ -5265,6 +5398,18 @@ impl VmRuntime {
         prepare_log_path(&qemu_log)?;
         let artifact = prepare_boot_artifact(command, Some(runtime_dir.path()))?;
         let data_disk = prepare_data_disk(command, runtime_dir.path())?;
+        // QEMU connects to the emulator's control socket while it builds
+        // the machine, so the emulator is listening first.
+        let swtpm = command
+            .tpm
+            .as_ref()
+            .map(|tpm| {
+                tpm.start(
+                    runtime_dir.path(),
+                    &socket_dir.path().join(tpm::SOCKET_NAME),
+                )
+            })
+            .transpose()?;
 
         let spinner = spinner(&match &command.qemu_net {
             Some(qemu_net) => format!(
@@ -5344,32 +5489,7 @@ impl VmRuntime {
             qemu.arg("-cpu").arg(cpu);
         }
         qemu.args(&command.qemu_arg);
-        // QEMU sits in its own process group, so a signal aimed at the
-        // inspector's group (a terminal's SIGINT, a driver's timeout kill)
-        // never reaches it and the shutdown in `VmRuntime::drop` is the one
-        // path that ends it. An inspector that dies by a signal runs no
-        // `Drop`, so on Linux the kernel ends QEMU with the thread that
-        // spawned it instead; `spawn` runs on the main thread, which lives
-        // as long as the process. Bench run 34443906698 left nineteen
-        // guests running that way, one per timed-out boot, under every
-        // boot that followed.
-        qemu.process_group(0);
-        #[cfg(target_os = "linux")]
-        {
-            // SAFETY: the closure runs in the child between fork and exec;
-            // `prctl` sets one flag on the calling task and allocates
-            // nothing, takes no lock and touches no memory the parent
-            // shares.
-            unsafe {
-                qemu.pre_exec(|| {
-                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == 0 {
-                        Ok(())
-                    } else {
-                        Err(std::io::Error::last_os_error())
-                    }
-                });
-            }
-        }
+        keep_off_the_terminal(&mut qemu);
         if command.serial_stdio {
             qemu.stdin(Stdio::piped());
             qemu.stdout(Stdio::piped());
@@ -5448,6 +5568,9 @@ impl VmRuntime {
             configure_watchdog(&mut qemu, watchdog);
         }
         configure_entropy_device(&mut qemu, command.profile.entropy, command.virtio_devices);
+        if command.profile.vm_generation_id {
+            configure_vm_generation_id(&mut qemu);
+        }
         configure_balloon(&mut qemu, command.profile.balloon, command.virtio_devices);
         if command.desktop {
             configure_display(
@@ -5471,6 +5594,9 @@ impl VmRuntime {
                 command.vsock_cid,
                 command.virtio_devices,
             );
+        }
+        if let (Some(tpm), Some(swtpm)) = (&command.tpm, &swtpm) {
+            tpm.apply(&mut qemu, &qemu_option_value(swtpm.socket())?);
         }
 
         let mut child = qemu.spawn().map_err(|source| VmRuntimeError::SpawnQemu {
@@ -5516,6 +5642,7 @@ impl VmRuntime {
             runtime_dir,
             _socket_dir: socket_dir,
             child,
+            swtpm,
         })
     }
 
@@ -5572,6 +5699,9 @@ impl VmRuntime {
         if let Ok(None) = self.child.try_wait() {
             let _ = self.child.kill();
             let _ = self.child.wait();
+        }
+        if let Some(swtpm) = &mut self.swtpm {
+            swtpm.shutdown();
         }
     }
 }
@@ -5704,36 +5834,85 @@ fn qemu_option_value(path: &Path) -> Result<String, VmRuntimeError> {
     Ok(text.replace(',', ",,"))
 }
 
+/// Puts a host process the VM depends on (QEMU, `swtpm`) where only the
+/// inspector ends it.
+///
+/// It sits in its own process group, so a signal aimed at the
+/// inspector's group (a terminal's SIGINT, a driver's timeout kill)
+/// never reaches it and the shutdown in `VmRuntime::drop` is the one
+/// path that ends it. An inspector that dies by a signal runs no `Drop`,
+/// so on Linux the kernel ends the child with the thread that spawned it
+/// instead; `VmRuntime::spawn` runs on the main thread, which lives as
+/// long as the process. Bench run 34443906698 left nineteen guests
+/// running that way, one per timed-out boot, under every boot that
+/// followed.
+fn keep_off_the_terminal(child: &mut Command) {
+    child.process_group(0);
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: the closure runs in the child between fork and exec;
+        // `prctl` sets one flag on the calling task and allocates
+        // nothing, takes no lock and touches no memory the parent
+        // shares.
+        unsafe {
+            child.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+    }
+}
+
+/// How the wait for a child's listening socket ended.
+enum SocketWait {
+    Ready,
+    Exited,
+    TimedOut,
+}
+
+/// Waits up to [`DEFAULT_SOCKET_WAIT`] for `child` to create
+/// `socket_path`, and notices when it exits first.
+fn poll_for_socket(socket_path: &Path, child: &mut Child) -> io::Result<SocketWait> {
+    let started = Instant::now();
+    while started.elapsed() < DEFAULT_SOCKET_WAIT {
+        if socket_path.exists() {
+            return Ok(SocketWait::Ready);
+        }
+        if child.try_wait()?.is_some() {
+            return Ok(SocketWait::Exited);
+        }
+        std::thread::sleep(SOCKET_POLL_INTERVAL);
+    }
+    Ok(SocketWait::TimedOut)
+}
+
 fn wait_for_socket(
     socket_path: &Path,
     qemu_log: &Path,
     child: &mut Child,
 ) -> Result<(), VmRuntimeError> {
-    let started = Instant::now();
-    while started.elapsed() < DEFAULT_SOCKET_WAIT {
-        if socket_path.exists() {
-            return Ok(());
-        }
-        if child
-            .try_wait()
-            .map_err(|source| VmRuntimeError::PollQemu { source })?
-            .is_some()
-        {
+    match poll_for_socket(socket_path, child)
+        .map_err(|source| VmRuntimeError::PollQemu { source })?
+    {
+        SocketWait::Ready => Ok(()),
+        SocketWait::Exited => {
             let log =
                 fs::read_to_string(qemu_log).map_err(|source| VmRuntimeError::ReadQemuLog {
                     path: qemu_log.display().to_string(),
                     source,
                 })?;
-            return Err(VmRuntimeError::QemuExitedBeforeSocket {
+            Err(VmRuntimeError::QemuExitedBeforeSocket {
                 socket: socket_path.display().to_string(),
                 log,
-            });
+            })
         }
-        std::thread::sleep(SOCKET_POLL_INTERVAL);
+        SocketWait::TimedOut => Err(VmRuntimeError::SocketTimedOut {
+            socket: socket_path.display().to_string(),
+        }),
     }
-    Err(VmRuntimeError::SocketTimedOut {
-        socket: socket_path.display().to_string(),
-    })
 }
 
 fn spinner(label: &str) -> ProgressBar {
@@ -6293,6 +6472,13 @@ fn configure_sound(
     qemu.arg("-device").arg(device.to_string());
 }
 
+/// Attaches the VM Generation ID device. `guid=auto` has QEMU draw a
+/// fresh identifier at start and write a new one on every snapshot
+/// restore, which is what the guest compares against.
+fn configure_vm_generation_id(qemu: &mut Command) {
+    qemu.arg("-device").arg("vmgenid,guid=auto");
+}
+
 fn configure_watchdog(qemu: &mut Command, watchdog: VmWatchdogProfile) {
     match watchdog {
         VmWatchdogProfile::I6300Esb => {
@@ -6320,6 +6506,7 @@ impl From<VmSessionCommand> for ResolvedVmSessionCommand {
             VmSessionCommand::Profile(command) => Self::Profile(command),
             VmSessionCommand::Build
             | VmSessionCommand::KernelPath
+            | VmSessionCommand::BootfsPath
             | VmSessionCommand::NetSetup(_)
             | VmSessionCommand::NetTeardown(_) => {
                 unreachable!(
@@ -7344,6 +7531,22 @@ mod tests {
         assert_eq!(X86_64_VM_PROFILE.entropy, VmEntropyProfile::VirtioRngPci);
     }
 
+    /// Only the x86 machines build the ACPI table the device publishes
+    /// through, so only the x86 profile attaches it.
+    #[test]
+    fn only_the_x86_profile_attaches_the_vm_generation_id() {
+        const {
+            assert!(X86_64_VM_PROFILE.vm_generation_id);
+            assert!(!AARCH64_VIRT_HVF_PROFILE.vm_generation_id);
+            assert!(!AARCH64_VIRT_TCG_PROFILE.vm_generation_id);
+            assert!(!RISCV64_VM_PROFILE.vm_generation_id);
+        }
+        assert_eq!(
+            rendered(configure_vm_generation_id),
+            ["-device", "vmgenid,guid=auto"]
+        );
+    }
+
     /// A `vm` invocation with nothing but its defaults, for tests that
     /// only care about one option.
     #[test]
@@ -7439,6 +7642,8 @@ mod tests {
             profile_use: None,
             boot_programs: Vec::new(),
             no_compiler_plugin: true,
+            root_secret_key: None,
+            bootfs_root: None,
         };
         let root = Path::new("/checkout");
         for kind in [
@@ -7485,6 +7690,8 @@ mod tests {
                     profile_use: None,
                     boot_programs: Vec::new(),
                     no_compiler_plugin: true,
+                    root_secret_key: None,
+                    bootfs_root: None,
                 };
                 let arguments = cargo_arguments(&kernel_build_command(root, &build));
                 assert_eq!(
@@ -7998,6 +8205,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_kernel_image_build_is_given_the_public_root_key_and_never_the_secret() {
+        let mut build = KernelBuildSpec {
+            profile: &X86_64_VM_PROFILE,
+            kind: KernelBuildProfile::Release,
+            profile_use: None,
+            boot_programs: Vec::new(),
+            no_compiler_plugin: false,
+            root_secret_key: Some(PathBuf::from("/run/release/root.key")),
+            bootfs_root: None,
+        };
+        for root_secret_key in [None, build.root_secret_key.clone()] {
+            build.root_secret_key = root_secret_key;
+            let mut cargo = Command::new("cargo");
+            export_trusted_root_public_key(&mut cargo, &build)
+                .expect("workspace root must resolve");
+            let public = kernel_prebuild_dir(&build)
+                .expect("workspace root must resolve")
+                .join("helios-root-public.key");
+            let envs: Vec<_> = cargo.get_envs().collect();
+            assert_eq!(
+                envs,
+                [(
+                    std::ffi::OsStr::new("HELIOS_KERNEL_ROOT_PUBLIC_KEY"),
+                    Some(public.as_os_str())
+                )]
+            );
+        }
+    }
+
     fn minimal_command() -> VmCommand {
         VmCommand {
             rpc_transport: None,
@@ -8013,6 +8250,7 @@ mod tests {
             qemu_bin: None,
             kernel: None,
             bootfs: None,
+            root_secret_key: None,
             socket: None,
             serial_stdio: false,
             serial_pty: false,
@@ -8044,6 +8282,7 @@ mod tests {
             enable_targets: Vec::new(),
             boot_programs: Vec::new(),
             no_compiler_plugin: false,
+            bootfs_root: None,
             runtime_dir: None,
             keep_runtime_dir: false,
             acpi: false,
@@ -8055,6 +8294,8 @@ mod tests {
             renderer: None,
             renderer_hostmem: None,
             audiodev: None,
+            tpm: None,
+            tpm_state: None,
             network: default_network_args(),
             command: None,
         }
@@ -8079,6 +8320,7 @@ mod tests {
             qemu_bin: None,
             kernel: None,
             bootfs: None,
+            root_secret_key: None,
             socket: None,
             serial_stdio: false,
             serial_pty: false,
@@ -8110,6 +8352,7 @@ mod tests {
             enable_targets: Vec::new(),
             boot_programs: Vec::new(),
             no_compiler_plugin: false,
+            bootfs_root: None,
             runtime_dir: None,
             keep_runtime_dir: false,
             acpi: false,
@@ -8121,6 +8364,8 @@ mod tests {
             renderer: None,
             renderer_hostmem: None,
             audiodev: None,
+            tpm: None,
+            tpm_state: None,
             network: default_network_args(),
             command: None,
         };
@@ -8495,6 +8740,122 @@ mod tests {
         );
     }
 
+    /// `--tpm swtpm` and `--tpm-state` as a command line spells them, and
+    /// the same two keys in the config file.
+    #[test]
+    fn tpm_flags_and_config_keys_resolve_to_one_tpm() {
+        #[derive(clap::Parser)]
+        struct VmLine {
+            #[command(flatten)]
+            command: VmCommand,
+        }
+        let tempdir =
+            tempfile::tempdir().expect("temporary directory for VM config resolution must exist");
+        let missing = tempdir.path().join("missing-vm.json");
+        let state = tempdir.path().join("tpm-state");
+        let path = |path: &Path| path.to_str().expect("tempdir paths are UTF-8").to_owned();
+        let line = <VmLine as clap::Parser>::try_parse_from([
+            "vm".to_owned(),
+            "--arch".to_owned(),
+            "x86-64".to_owned(),
+            // Named, as every test names it, so this resolves on any host.
+            "--accel".to_owned(),
+            "tcg".to_owned(),
+            "--no-build".to_owned(),
+            "--tpm".to_owned(),
+            "swtpm".to_owned(),
+            "--tpm-state".to_owned(),
+            path(&state),
+            "--config".to_owned(),
+            path(&missing),
+        ])
+        .expect("--tpm takes a backend and --tpm-state a directory");
+        assert_eq!(line.command.tpm, Some(VmTpmBackend::Swtpm));
+        let from_flags = resolve(line.command)
+            .expect("q35 attaches a TPM")
+            .tpm
+            .expect("--tpm asks for a TPM");
+
+        let config = tempdir.path().join("vm.json");
+        fs::write(
+            &config,
+            serde_json::json!({ "tpm": "swtpm", "tpm_state": state }).to_string(),
+        )
+        .expect("the VM config must be writable");
+        let from_file = resolve(VmCommand {
+            config: Some(config),
+            ..minimal_command()
+        })
+        .expect("q35 attaches a TPM")
+        .tpm
+        .expect("`tpm` in the config file asks for a TPM");
+        assert_eq!(from_flags, from_file);
+
+        let mut qemu = Command::new("true");
+        from_file.apply(&mut qemu, "swtpm.sock");
+        let arguments: Vec<_> = qemu
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            arguments.last().map(String::as_str),
+            Some("tpm-crb,tpmdev=tpm0")
+        );
+    }
+
+    /// aarch64 puts its TPM on the platform bus in both firmware
+    /// descriptions; riscv64 takes none, and says so before anything is
+    /// built.
+    #[test]
+    fn the_tpm_front_end_follows_the_machine() {
+        let tempdir =
+            tempfile::tempdir().expect("temporary directory for VM config resolution must exist");
+        let config = tempdir.path().join("missing-vm.json");
+        for acpi in [false, true] {
+            let tpm = resolve(VmCommand {
+                arch: VmArch::Aarch64,
+                acpi,
+                tpm: Some(VmTpmBackend::Swtpm),
+                config: Some(config.clone()),
+                ..minimal_command()
+            })
+            .expect("the virt machine attaches a TPM")
+            .tpm
+            .expect("--tpm asks for a TPM");
+            let mut qemu = Command::new("true");
+            tpm.apply(&mut qemu, "swtpm.sock");
+            assert!(
+                qemu.get_args()
+                    .any(|argument| argument == "tpm-tis-device,tpmdev=tpm0"),
+                "acpi={acpi}"
+            );
+        }
+        let error = resolve(VmCommand {
+            arch: VmArch::Riscv64,
+            tpm: Some(VmTpmBackend::Swtpm),
+            config: Some(config.clone()),
+            ..minimal_command()
+        })
+        .expect_err("riscv64 takes no measured-boot device");
+        assert!(
+            matches!(
+                error,
+                VmConfigError::Tpm(VmTpmError::Unavailable { arch: "riscv64" })
+            ),
+            "{error}"
+        );
+        let error = resolve(VmCommand {
+            tpm_state: Some(tempdir.path().join("tpm-state")),
+            config: Some(config),
+            ..minimal_command()
+        })
+        .expect_err("a state directory names no TPM by itself");
+        assert!(
+            matches!(error, VmConfigError::Tpm(VmTpmError::StateWithoutTpm)),
+            "{error}"
+        );
+    }
+
     /// Every endpoint the unit protects is told to translate; the unit
     /// itself is not one of its own endpoints.
     #[test]
@@ -8540,6 +8901,7 @@ mod tests {
             qemu_bin: None,
             kernel: None,
             bootfs: None,
+            root_secret_key: None,
             socket: None,
             serial_stdio: false,
             serial_pty: false,
@@ -8571,6 +8933,7 @@ mod tests {
             enable_targets: Vec::new(),
             boot_programs: Vec::new(),
             no_compiler_plugin: false,
+            bootfs_root: None,
             runtime_dir: None,
             keep_runtime_dir: false,
             acpi: false,
@@ -8582,6 +8945,8 @@ mod tests {
             renderer: None,
             renderer_hostmem: None,
             audiodev: None,
+            tpm: None,
+            tpm_state: None,
             network: default_network_args(),
             command: None,
         };
@@ -8691,8 +9056,9 @@ mod tests {
                 .arg("helios-cli"),
         )?;
         run_kernel_prebuild(&command.build)?;
-        let prebuild_dir = kernel_prebuild_dir(&command.build)?;
-        let status = std::process::Command::new("cargo")
+        let mut cargo = std::process::Command::new("cargo");
+        export_trusted_root_public_key(&mut cargo, &command.build)?;
+        let status = cargo
             .current_dir(repo_root()?)
             .arg("build")
             .args(profile.arch.build_std_arguments())
@@ -8700,14 +9066,6 @@ mod tests {
             .arg(profile.cargo_target)
             .arg("--bin")
             .arg(profile.kernel_artifact_name)
-            .env(
-                "HELIOS_KERNEL_ROOT_PUBLIC_KEY",
-                prebuild_dir.join("helios-root-public.key"),
-            )
-            .env(
-                "HELIOS_KERNEL_ROOT_SECRET_KEY",
-                prebuild_dir.join("helios-root-secret.key"),
-            )
             .envs(envs.iter().copied())
             .status()
             .map_err(|source| GuestTestFailure::SpawnCargo { source })?;
@@ -8730,6 +9088,8 @@ mod tests {
             profile_use: None,
             boot_programs: vec!["debugger".to_owned()],
             no_compiler_plugin: true,
+            root_secret_key: None,
+            bootfs_root: None,
         };
         ResolvedVmCommand {
             profile,
@@ -8777,6 +9137,7 @@ mod tests {
             display: VmDisplayBackend::None,
             renderer: None,
             audiodev: VmAudioDev::None,
+            tpm: None,
             needs_qmp: false,
             virtio_devices: VirtioDeviceProfile::default(),
             rpc_transport: VmRpcTransport::Serial,
@@ -8945,6 +9306,8 @@ mod tests {
             profile_use: None,
             boot_programs: Vec::new(),
             no_compiler_plugin: false,
+            root_secret_key: None,
+            bootfs_root: None,
         };
         ResolvedVmCommand {
             profile,
@@ -8992,6 +9355,7 @@ mod tests {
             display: VmDisplayBackend::None,
             renderer: None,
             audiodev: VmAudioDev::None,
+            tpm: None,
             needs_qmp: false,
             virtio_devices: VirtioDeviceProfile::default(),
             rpc_transport: VmRpcTransport::Serial,

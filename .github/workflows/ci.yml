@@ -202,7 +202,7 @@ jobs:
           sudo rm -f /etc/apt/sources.list.d/google-chrome*
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libudev-dev just cmake ninja-build
+            libudev-dev just cmake ninja-build erofs-utils
       - uses: taiki-e/install-action@v2
         with:
           tool: wasm-tools,cargo-deny,nextest
@@ -261,7 +261,7 @@ jobs:
           sudo rm -f /etc/apt/sources.list.d/google-chrome*
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libudev-dev just cmake ninja-build \
+            libudev-dev just cmake ninja-build erofs-utils \
             qemu-system-misc opensbi
           qemu-system-riscv64 --version
       - uses: taiki-e/install-action@v2
@@ -307,6 +307,32 @@ jobs:
             shell -c 'echo ok' 2>&1 > boot-smoke.out | tee "$runtime/inspector.log"
           cat boot-smoke.out
           grep -Fqx ok boot-smoke.out
+      # Verified boot needs no TPM (#602): the payload the boot above
+      # ran, with one byte of its signed body inverted, is refused on
+      # its signature before anything in it is read.
+      - name: Refuse a tampered boot payload
+        timeout-minutes: 10
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          check=tools/measured-boot-check.sh
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/tampered"
+          mkdir -p "$runtime"
+          "$check" tamper target/kernel-prebuild/riscv64gc-unknown-none-elf/kernel-release/helios-bootfs \
+            "$runtime/helios-bootfs"
+          if ./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
+            --accel tcg \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --bootfs "$runtime/helios-bootfs" \
+            --boot-program dash --boot-program debugger --no-compiler-plugin \
+            shell -c 'echo ok' > "$runtime/shell.out" 2> "$runtime/inspector.log"; then
+            echo 'the inspector booted a payload whose signature does not match'
+            exit 1
+          fi
+          cat "$runtime/inspector.log"
+          "$check" refused "$runtime/debug-serial.log"
       - name: Seed the wall clock from the goldfish RTC
         timeout-minutes: 5
         shell: bash
@@ -361,6 +387,48 @@ jobs:
           cat coreutils-smoke.out
           grep -Fqx coreutils:ok coreutils-smoke.out
           grep -Fqx bin coreutils-smoke.out
+      - name: Mount an EROFS disk from init
+        timeout-minutes: 5
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          set -o pipefail
+          # A read-only disk with a serial other than the scratch disk's
+          # is a mount source. The session runs init, which mounts it from
+          # /etc/fstab; mounts belong to a process tree, so the reads run
+          # from /etc/rc, under init (#511).
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/erofs"
+          mkdir -p "$runtime/tree/docs" "$runtime/bootfs/etc" "$runtime/bootfs/image"
+          printf 'erofs:ok\n' > "$runtime/tree/hello.txt"
+          printf '中文\n' > "$runtime/tree/docs/中文.txt"
+          printf '日本語\n' > "$runtime/tree/docs/日本語.txt"
+          printf '한국어\n' > "$runtime/tree/docs/한국어.txt"
+          mkfs.erofs -zlz4 "$runtime/image.erofs" "$runtime/tree"
+          printf 'helios init: erofs smoke\n' > "$runtime/bootfs/init.txt"
+          printf 'disk:erofs-smoke /image ro\n' > "$runtime/bootfs/etc/fstab"
+          printf 'cat /image/hello.txt\nls /image/docs\n' > "$runtime/bootfs/etc/rc"
+          ./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
+            --accel tcg \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --bootfs-root "$runtime/bootfs" \
+            --disk "$runtime/image.erofs,serial=erofs-smoke,readonly" \
+            --boot-program dash --boot-program debugger \
+            --boot-program ls --boot-program cat --boot-program init \
+            --no-compiler-plugin \
+            shell -c init 2>&1 > erofs-smoke.out | tee "$runtime/inspector.log"
+          cat erofs-smoke.out
+          grep -Fqx 'helios init: mounted disk:erofs-smoke at /image' erofs-smoke.out
+          grep -Fqx 'helios init: listing /image' erofs-smoke.out
+          grep -Fqx 'dir docs' erofs-smoke.out
+          grep -Fqx 'file hello.txt' erofs-smoke.out
+          # The rest is /etc/rc: cat and ls, children of init, reading
+          # through the mount.
+          grep -Fqx 'erofs:ok' erofs-smoke.out
+          grep -Fqx '中文.txt' erofs-smoke.out
+          grep -Fqx '日本語.txt' erofs-smoke.out
+          grep -Fqx '한국어.txt' erofs-smoke.out
       - name: Run CPython
         timeout-minutes: 5
         shell: bash
@@ -600,9 +668,11 @@ jobs:
           sudo rm -f /etc/apt/sources.list.d/google-chrome*
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libudev-dev just cmake ninja-build \
+            libudev-dev just cmake ninja-build erofs-utils \
             python3-venv pkg-config flex bison \
-            libglib2.0-dev libpixman-1-dev libslirp-dev libfdt-dev zlib1g-dev
+            libglib2.0-dev libpixman-1-dev libslirp-dev libfdt-dev zlib1g-dev \
+            swtpm
+          swtpm --version
           # Recorded rather than required: the accelerator is picked by
           # capability and today's Arm runners publish no KVM node.
           ls -la /dev/kvm || echo 'no /dev/kvm on this runner'
@@ -645,8 +715,16 @@ jobs:
           version: 0.13.0
       - name: Stage Limine bootloader share
         run: |
-          git clone --depth 1 --branch v11.x-binary \
-            https://github.com/limine-bootloader/limine "$GITHUB_WORKSPACE/limine"
+          # Limine publishes its prebuilt bootloader as a release asset;
+          # the digest is the one of v12.9.6's `limine-binary.tar.gz`.
+          curl --fail --silent --show-error --location \
+            --output "$RUNNER_TEMP/limine-binary.tar.gz" \
+            https://github.com/limine-bootloader/limine/releases/download/v12.9.6/limine-binary.tar.gz
+          echo "b38aabb042b0c0f9f562b7741be3c1204838d7bbacfa78bb411c674bd5b984ee  $RUNNER_TEMP/limine-binary.tar.gz" \
+            | sha256sum --check -
+          mkdir -p "$GITHUB_WORKSPACE/limine"
+          tar -xzf "$RUNNER_TEMP/limine-binary.tar.gz" --strip-components=1 \
+            -C "$GITHUB_WORKSPACE/limine"
           make -C "$GITHUB_WORKSPACE/limine"
       - name: Restore WASI tooling artifacts
         id: artifact-cache
@@ -785,6 +863,50 @@ jobs:
           # rather than something that quietly starts or stops being
           # true.
           ! grep -qF 'device grant published' "$runtime/inspector.log"
+      - name: Mount an EROFS disk from init
+        timeout-minutes: 5
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+          HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          set -o pipefail
+          # A read-only disk with a serial other than the scratch disk's
+          # is a mount source. The session runs init, which mounts it from
+          # /etc/fstab; mounts belong to a process tree, so the reads run
+          # from /etc/rc, under init (#511).
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/erofs"
+          mkdir -p "$runtime/tree/docs" "$runtime/bootfs/etc" "$runtime/bootfs/image"
+          printf 'erofs:ok\n' > "$runtime/tree/hello.txt"
+          printf '中文\n' > "$runtime/tree/docs/中文.txt"
+          printf '日本語\n' > "$runtime/tree/docs/日本語.txt"
+          printf '한국어\n' > "$runtime/tree/docs/한국어.txt"
+          mkfs.erofs -zlz4 "$runtime/image.erofs" "$runtime/tree"
+          printf 'helios init: erofs smoke\n' > "$runtime/bootfs/init.txt"
+          printf 'disk:erofs-smoke /image ro\n' > "$runtime/bootfs/etc/fstab"
+          printf 'cat /image/hello.txt\nls /image/docs\n' > "$runtime/bootfs/etc/rc"
+          ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G \
+            --accel tcg \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --bootfs-root "$runtime/bootfs" \
+            --disk "$runtime/image.erofs,serial=erofs-smoke,readonly" \
+            --boot-program dash --boot-program debugger \
+            --boot-program ls --boot-program cat --boot-program init \
+            --no-compiler-plugin \
+            shell -c init 2>&1 > erofs-smoke.out | tee "$runtime/inspector.log"
+          cat erofs-smoke.out
+          grep -Fqx 'helios init: mounted disk:erofs-smoke at /image' erofs-smoke.out
+          grep -Fqx 'helios init: listing /image' erofs-smoke.out
+          grep -Fqx 'dir docs' erofs-smoke.out
+          grep -Fqx 'file hello.txt' erofs-smoke.out
+          # The rest is /etc/rc: cat and ls, children of init, reading
+          # through the mount.
+          grep -Fqx 'erofs:ok' erofs-smoke.out
+          grep -Fqx '中文.txt' erofs-smoke.out
+          grep -Fqx '日本語.txt' erofs-smoke.out
+          grep -Fqx '한국어.txt' erofs-smoke.out
       - name: Take a wasm trap on aarch64
         timeout-minutes: 10
         shell: bash
@@ -820,6 +942,146 @@ jobs:
           grep -Fqx oob-load:before-fault oob-load-smoke.out
           grep -Fqx guest-alive oob-load-smoke.out
           ! grep -Fq 'Kernel panic' oob-load-smoke.out
+      - uses: ./helios/.github/actions/swtpm
+      # Measured boot (#602): the kernel's signing seed is sealed in the
+      # TPM to the boot chain. The ACPI description is the boot whose
+      # measured input repeats (PCR 9 holds the kernel and the payload),
+      # so the retention check runs here: two boots of one payload on
+      # one TPM state directory, the first provisions and seals a seed,
+      # the second unseals it, and the public half of the derived key is
+      # the same. The second boot is handed the payload the first booted
+      # by path, so both measure the same bytes whether or not a rebuild
+      # reproduces them. Whether it also skips recompiling needs the
+      # persisted cwasm of #579.
+      - name: Keep the kernel signing key across measured ACPI boots
+        timeout-minutes: 20
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+          HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          set -o pipefail
+          check=tools/measured-boot-check.sh
+          state="$RUNNER_TEMP/tpm-state-aarch64-acpi"
+          rm -rf "$state"
+          boot() {
+            runtime="$GITHUB_WORKSPACE/smoke-runtime-measured/$1"
+            shift
+            mkdir -p "$runtime"
+            ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G --acpi \
+              --accel tcg --tpm swtpm --tpm-state "$state" \
+              --runtime-dir "$runtime" --keep-runtime-dir "$@" \
+              shell -c 'echo ok' 2>&1 > "$runtime/shell.out" | tee "$runtime/inspector.log"
+            grep -Fqx ok "$runtime/shell.out"
+          }
+          boot acpi-retention-1 --boot-program dash --boot-program debugger --no-compiler-plugin
+          cp target/kernel-prebuild/aarch64-unknown-none/kernel-release/helios-bootfs \
+            "$GITHUB_WORKSPACE/smoke-runtime-measured/helios-bootfs.retained"
+          first="$("$check" settled "$GITHUB_WORKSPACE/smoke-runtime-measured/acpi-retention-1/debug-serial.log" provisioned-and-sealed empty)"
+          boot acpi-retention-2 --bootfs "$GITHUB_WORKSPACE/smoke-runtime-measured/helios-bootfs.retained" \
+            --boot-program dash --boot-program debugger --no-compiler-plugin
+          second="$("$check" settled "$GITHUB_WORKSPACE/smoke-runtime-measured/acpi-retention-2/debug-serial.log" unsealed none)"
+          echo "signer: first boot $first, second boot $second"
+          test "$first" = "$second"
+          echo "$first" > "$RUNNER_TEMP/tpm-signer-aarch64-acpi"
+      # One byte of the payload's signed body is inverted. The kernel
+      # refuses the payload on its signature before it measures or
+      # parses it, so the guest never reaches the debugger and the
+      # inspector reports the panic.
+      - name: Refuse a tampered boot payload
+        timeout-minutes: 10
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+          HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          check=tools/measured-boot-check.sh
+          runtime="$GITHUB_WORKSPACE/smoke-runtime-measured/acpi-tampered"
+          mkdir -p "$runtime"
+          "$check" tamper "$GITHUB_WORKSPACE/smoke-runtime-measured/helios-bootfs.retained" \
+            "$runtime/helios-bootfs"
+          if ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G --acpi \
+            --accel tcg --tpm swtpm \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --bootfs "$runtime/helios-bootfs" \
+            --boot-program dash --boot-program debugger --no-compiler-plugin \
+            shell -c 'echo ok' > "$runtime/shell.out" 2> "$runtime/inspector.log"; then
+            echo 'the inspector booted a payload whose signature does not match'
+            exit 1
+          fi
+          cat "$runtime/inspector.log"
+          "$check" refused "$runtime/debug-serial.log"
+      # A different boot program set is a different payload, signed by
+      # the same build root, so it verifies and PCR 9 differs. The TPM
+      # state the retention step left is sealed to the old measurement:
+      # it is reported as changed state, a new seed replaces it, and the
+      # key is not the one of the two boots before.
+      - name: Reseal the kernel signing key after a changed payload
+        timeout-minutes: 10
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+          HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          set -o pipefail
+          check=tools/measured-boot-check.sh
+          runtime="$GITHUB_WORKSPACE/smoke-runtime-measured/acpi-changed"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G --acpi \
+            --accel tcg --tpm swtpm --tpm-state "$RUNNER_TEMP/tpm-state-aarch64-acpi" \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger --boot-program date \
+            --no-compiler-plugin \
+            shell -c 'echo ok' 2>&1 > "$runtime/shell.out" | tee "$runtime/inspector.log"
+          grep -Fqx ok "$runtime/shell.out"
+          changed="$("$check" settled "$runtime/debug-serial.log" provisioned-and-sealed state-changed)"
+          retained="$(cat "$RUNNER_TEMP/tpm-signer-aarch64-acpi")"
+          echo "signer: retained $retained, after the change $changed"
+          test "$changed" != "$retained"
+      # Booted from the device tree, QEMU's `virt` writes a fresh
+      # `/chosen/rng-seed` and `kaslr-seed` into the blob at every boot,
+      # and Limine measures the blob into PCR 9, so PCR 9 never repeats
+      # (#602). A sealed seed cannot survive a reboot here, and that is
+      # the sealing policy working: the second boot of one payload on
+      # one TPM state directory must report changed state, provision a
+      # new seed, and derive a different key, where the ACPI boots
+      # above retain it.
+      - name: Detect changed state across measured device-tree boots
+        timeout-minutes: 20
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+          HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          set -o pipefail
+          check=tools/measured-boot-check.sh
+          state="$RUNNER_TEMP/tpm-state-aarch64-dt"
+          rm -rf "$state"
+          boot() {
+            runtime="$GITHUB_WORKSPACE/smoke-runtime-measured/$1"
+            mkdir -p "$runtime"
+            ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G \
+              --accel tcg --tpm swtpm --tpm-state "$state" \
+              --runtime-dir "$runtime" --keep-runtime-dir \
+              --boot-program dash --boot-program debugger --no-compiler-plugin \
+              shell -c 'echo ok' 2>&1 > "$runtime/shell.out" | tee "$runtime/inspector.log"
+            grep -Fqx ok "$runtime/shell.out"
+            grep -F 'platform described by device-tree' "$runtime/inspector.log"
+          }
+          boot dt-1
+          first="$("$check" settled "$GITHUB_WORKSPACE/smoke-runtime-measured/dt-1/debug-serial.log" provisioned-and-sealed empty)"
+          boot dt-2
+          second="$("$check" settled "$GITHUB_WORKSPACE/smoke-runtime-measured/dt-2/debug-serial.log" provisioned-and-sealed state-changed)"
+          echo "signer: first boot $first, second boot $second"
+          test "$first" != "$second"
       - name: Upload the inspector runtime directories
         if: failure()
         uses: actions/upload-artifact@v4
@@ -827,6 +1089,7 @@ jobs:
           name: smoke-aarch64-runtime
           path: |
             smoke-runtime/*/*.log
+            smoke-runtime-measured/*/*.log
           if-no-files-found: warn
           retention-days: 7
       # Each boot above rebuilds the bootfs for its own `--boot-program`
@@ -908,9 +1171,10 @@ jobs:
           sudo rm -f /etc/apt/sources.list.d/google-chrome*
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libudev-dev just cmake ninja-build \
-            qemu-system-x86 ovmf
+            libudev-dev just cmake ninja-build erofs-utils \
+            qemu-system-x86 ovmf swtpm
           qemu-system-x86_64 --version
+          swtpm --version
           # The inspector picks the accelerator by capability; this only
           # fixes the permissions on the node when the runner has one.
           if [ -e /dev/kvm ]; then
@@ -925,8 +1189,16 @@ jobs:
           version: 0.13.0
       - name: Stage Limine bootloader share
         run: |
-          git clone --depth 1 --branch v11.x-binary \
-            https://github.com/limine-bootloader/limine "$GITHUB_WORKSPACE/limine"
+          # Limine publishes its prebuilt bootloader as a release asset;
+          # the digest is the one of v12.9.6's `limine-binary.tar.gz`.
+          curl --fail --silent --show-error --location \
+            --output "$RUNNER_TEMP/limine-binary.tar.gz" \
+            https://github.com/limine-bootloader/limine/releases/download/v12.9.6/limine-binary.tar.gz
+          echo "b38aabb042b0c0f9f562b7741be3c1204838d7bbacfa78bb411c674bd5b984ee  $RUNNER_TEMP/limine-binary.tar.gz" \
+            | sha256sum --check -
+          mkdir -p "$GITHUB_WORKSPACE/limine"
+          tar -xzf "$RUNNER_TEMP/limine-binary.tar.gz" --strip-components=1 \
+            -C "$GITHUB_WORKSPACE/limine"
           make -C "$GITHUB_WORKSPACE/limine"
       - name: Restore WASI tooling artifacts
         id: artifact-cache
@@ -1010,6 +1282,9 @@ jobs:
           grep -aF 'mount source online serial="src-a"' "$runtime/debug-serial.log" | grep -aF 'read_only=false'
           grep -aF 'mount source online serial="src-b"' "$runtime/debug-serial.log" | grep -aF 'read_only=true'
           grep -aF 'block device identified as the kernel scratch disk serial="helios-data"' "$runtime/debug-serial.log"
+          # The inspector attaches `vmgenid` on the x86 profile, so the
+          # guest has to have found its generation ID window (#572).
+          grep -aF 'vmgenid online' "$runtime/debug-serial.log"
       - name: Boot x86-64 guest on two NUMA nodes
         timeout-minutes: 5
         shell: bash
@@ -1034,6 +1309,94 @@ jobs:
           grep -aF 'NUMA topology nodes=2 distances=10,20;20,10' "$runtime/debug-serial.log"
           grep -aF 'NUMA node node=0' "$runtime/debug-serial.log" | grep -aF 'processors=0-1'
           grep -aF 'NUMA node node=1' "$runtime/debug-serial.log" | grep -aF 'processors=2-3'
+      - uses: ./helios/.github/actions/swtpm
+      # The kernel's signing seed is sealed in the TPM to the measured
+      # boot chain (#602). Two boots of one payload on one TPM state
+      # directory: the first provisions and seals a seed, the second
+      # unseals it, and the public half of the key the seed derives is
+      # the same in both. The second boot is handed the payload the
+      # first one booted by path, so the two measure the same bytes
+      # whether or not a rebuild reproduces them. Whether the second
+      # boot also skips recompiling needs the persisted cwasm of #579.
+      - name: Keep the kernel signing key across measured boots
+        timeout-minutes: 15
+        shell: bash
+        working-directory: helios
+        run: |
+          set -o pipefail
+          check=tools/measured-boot-check.sh
+          state="$RUNNER_TEMP/tpm-state-x86-64"
+          rm -rf "$state"
+          boot() {
+            runtime="$GITHUB_WORKSPACE/smoke-runtime-measured/$1"
+            shift
+            mkdir -p "$runtime"
+            ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+              --accel kvm --tpm swtpm --tpm-state "$state" \
+              --runtime-dir "$runtime" --keep-runtime-dir "$@" \
+              shell -c 'echo ok' 2>&1 > "$runtime/shell.out" | tee "$runtime/inspector.log"
+            grep -Fqx ok "$runtime/shell.out"
+          }
+          boot retention-1 --boot-program dash --boot-program debugger --no-compiler-plugin
+          cp target/kernel-prebuild/x86_64-unknown-none/profile-use/helios-bootfs \
+            "$GITHUB_WORKSPACE/smoke-runtime-measured/helios-bootfs.retained"
+          first="$("$check" settled "$GITHUB_WORKSPACE/smoke-runtime-measured/retention-1/debug-serial.log" provisioned-and-sealed empty)"
+          boot retention-2 --bootfs "$GITHUB_WORKSPACE/smoke-runtime-measured/helios-bootfs.retained" \
+            --boot-program dash --boot-program debugger --no-compiler-plugin
+          second="$("$check" settled "$GITHUB_WORKSPACE/smoke-runtime-measured/retention-2/debug-serial.log" unsealed none)"
+          echo "signer: first boot $first, second boot $second"
+          test "$first" = "$second"
+          echo "$first" > "$RUNNER_TEMP/tpm-signer-x86-64"
+      # One byte of the payload's signed body is inverted. The kernel
+      # refuses the payload on its signature before it measures or
+      # parses it, so the guest never reaches the debugger and the
+      # inspector reports the panic.
+      - name: Refuse a tampered boot payload
+        timeout-minutes: 10
+        shell: bash
+        working-directory: helios
+        run: |
+          check=tools/measured-boot-check.sh
+          runtime="$GITHUB_WORKSPACE/smoke-runtime-measured/tampered"
+          mkdir -p "$runtime"
+          "$check" tamper "$GITHUB_WORKSPACE/smoke-runtime-measured/helios-bootfs.retained" \
+            "$runtime/helios-bootfs"
+          if ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            --accel kvm --tpm swtpm \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --bootfs "$runtime/helios-bootfs" \
+            --boot-program dash --boot-program debugger --no-compiler-plugin \
+            shell -c 'echo ok' > "$runtime/shell.out" 2> "$runtime/inspector.log"; then
+            echo 'the inspector booted a payload whose signature does not match'
+            exit 1
+          fi
+          cat "$runtime/inspector.log"
+          "$check" refused "$runtime/debug-serial.log"
+      # A different boot program set is a different payload, signed by
+      # the same build root, so it verifies and PCR 9 differs. The TPM
+      # state the retention step left is sealed to the old measurement:
+      # it is reported as changed state, a new seed replaces it, and the
+      # key is not the one of the two boots before.
+      - name: Reseal the kernel signing key after a changed payload
+        timeout-minutes: 10
+        shell: bash
+        working-directory: helios
+        run: |
+          set -o pipefail
+          check=tools/measured-boot-check.sh
+          runtime="$GITHUB_WORKSPACE/smoke-runtime-measured/changed"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            --accel kvm --tpm swtpm --tpm-state "$RUNNER_TEMP/tpm-state-x86-64" \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger --boot-program date \
+            --no-compiler-plugin \
+            shell -c 'echo ok' 2>&1 > "$runtime/shell.out" | tee "$runtime/inspector.log"
+          grep -Fqx ok "$runtime/shell.out"
+          changed="$("$check" settled "$runtime/debug-serial.log" provisioned-and-sealed state-changed)"
+          retained="$(cat "$RUNNER_TEMP/tpm-signer-x86-64")"
+          echo "signer: retained $retained, after the change $changed"
+          test "$changed" != "$retained"
       - name: Run the coreutils applets through dash
         timeout-minutes: 5
         shell: bash
@@ -1056,6 +1419,46 @@ jobs:
           cat coreutils-smoke.out
           grep -Fqx coreutils:ok coreutils-smoke.out
           grep -Fqx bin coreutils-smoke.out
+      - name: Mount an EROFS disk from init
+        timeout-minutes: 5
+        shell: bash
+        working-directory: helios
+        run: |
+          set -o pipefail
+          # A read-only disk with a serial other than the scratch disk's
+          # is a mount source. The session runs init, which mounts it from
+          # /etc/fstab; mounts belong to a process tree, so the reads run
+          # from /etc/rc, under init (#511).
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/erofs"
+          mkdir -p "$runtime/tree/docs" "$runtime/bootfs/etc" "$runtime/bootfs/image"
+          printf 'erofs:ok\n' > "$runtime/tree/hello.txt"
+          printf '中文\n' > "$runtime/tree/docs/中文.txt"
+          printf '日本語\n' > "$runtime/tree/docs/日本語.txt"
+          printf '한국어\n' > "$runtime/tree/docs/한국어.txt"
+          mkfs.erofs -zlz4 "$runtime/image.erofs" "$runtime/tree"
+          printf 'helios init: erofs smoke\n' > "$runtime/bootfs/init.txt"
+          printf 'disk:erofs-smoke /image ro\n' > "$runtime/bootfs/etc/fstab"
+          printf 'cat /image/hello.txt\nls /image/docs\n' > "$runtime/bootfs/etc/rc"
+          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            --accel kvm \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --bootfs-root "$runtime/bootfs" \
+            --disk "$runtime/image.erofs,serial=erofs-smoke,readonly" \
+            --boot-program dash --boot-program debugger \
+            --boot-program ls --boot-program cat --boot-program init \
+            --no-compiler-plugin \
+            shell -c init 2>&1 > erofs-smoke.out | tee "$runtime/inspector.log"
+          cat erofs-smoke.out
+          grep -Fqx 'helios init: mounted disk:erofs-smoke at /image' erofs-smoke.out
+          grep -Fqx 'helios init: listing /image' erofs-smoke.out
+          grep -Fqx 'dir docs' erofs-smoke.out
+          grep -Fqx 'file hello.txt' erofs-smoke.out
+          # The rest is /etc/rc: cat and ls, children of init, reading
+          # through the mount.
+          grep -Fqx 'erofs:ok' erofs-smoke.out
+          grep -Fqx '中文.txt' erofs-smoke.out
+          grep -Fqx '日本語.txt' erofs-smoke.out
+          grep -Fqx '한국어.txt' erofs-smoke.out
       - name: Run CPython twice and record its launch phases
         timeout-minutes: 5
         shell: bash
@@ -1162,12 +1565,14 @@ jobs:
           set -o pipefail
           # Only bytes that came from the boot payload load without a
           # signature check; a cwasm a guest writes must verify against
-          # the kernel's trusted roots (#483). CPython copies a bootfs
-          # cwasm to /copy unchanged and to /forged with the last byte
-          # of its payload signature flipped. The copy is still signed
-          # by the trusted root and runs; the forged one must be refused,
-          # so its marker line must not print a second time. A missing
-          # /forged is refused too, so the writes must report success.
+          # the kernel's trusted roots (#483). The build root signs the
+          # payload image once, not each cwasm in it (#602), so a bootfs
+          # cwasm carries no signature of its own and a guest's copy of
+          # it inherits nothing. CPython copies one to /copy unchanged
+          # and to /forged with one byte flipped: the original runs from
+          # the boot payload, and both copies must be refused, so the
+          # program's marker line prints exactly once. A missing file is
+          # refused too, so the writes must report success.
           runtime="$GITHUB_WORKSPACE/smoke-runtime/unsigned-cwasm"
           mkdir -p "$runtime"
           ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
@@ -1176,11 +1581,13 @@ jobs:
             --boot-program dash --boot-program debugger --boot-program python3 \
             --boot-program wasix-atomic-wait-timeout --no-compiler-plugin \
             shell --trace-log "$runtime/guest-tracing.log" \
-            -c 'python3 -c "import pathlib; b = pathlib.Path(\"/bin/wasix-atomic-wait-timeout\").read_bytes(); pathlib.Path(\"/copy\").write_bytes(b); f = bytearray(b); f[-13] ^= 1; pathlib.Path(\"/forged\").write_bytes(bytes(f))" && echo cwasm:written; /copy && echo copy:ran; /forged && echo forged:ran || echo forged:refused' \
+            -c 'python3 -c "import pathlib; b = pathlib.Path(\"/bin/wasix-atomic-wait-timeout\").read_bytes(); pathlib.Path(\"/copy\").write_bytes(b); f = bytearray(b); f[-13] ^= 1; pathlib.Path(\"/forged\").write_bytes(bytes(f))" && echo cwasm:written; /bin/wasix-atomic-wait-timeout && echo original:ran; /copy && echo copy:ran || echo copy:refused; /forged && echo forged:ran || echo forged:refused' \
             2>&1 > unsigned-cwasm-smoke.out | tee "$runtime/inspector.log"
           cat unsigned-cwasm-smoke.out
           grep -Fqx cwasm:written unsigned-cwasm-smoke.out
-          grep -Fqx copy:ran unsigned-cwasm-smoke.out
+          grep -Fqx original:ran unsigned-cwasm-smoke.out
+          grep -Fqx copy:refused unsigned-cwasm-smoke.out
+          test "$(grep -cF copy:ran unsigned-cwasm-smoke.out)" -eq 0
           grep -Fqx forged:refused unsigned-cwasm-smoke.out
           test "$(grep -cF forged:ran unsigned-cwasm-smoke.out)" -eq 0
           test "$(grep -cFx atomic-wait-timeout:ok unsigned-cwasm-smoke.out)" -eq 1
@@ -1792,6 +2199,7 @@ jobs:
           # rather than as console output.
           path: |
             smoke-runtime/*/*.log
+            smoke-runtime-measured/*/*.log
           if-no-files-found: warn
           retention-days: 7
       # Each boot above rebuilds the bootfs for its own `--boot-program`

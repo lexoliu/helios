@@ -24,7 +24,17 @@ const NANOS_PER_SECOND: u64 = 1_000_000_000;
 
 type HostedNetworkService = helios_kernel::NetworkService<HostedCpu, HostedNetworkDevice>;
 type HostedRuntimeState =
-    helios_kernel::HostRuntimeState<HostedCpu, HostedNetworkService, HostedFileSystem>;
+    helios_kernel::HostRuntimeState<HostedCpu, HostedNetworkService, HostedStorage>;
+
+/// The hosted machine's storage: the host directory it shares, and no
+/// disk.
+#[derive(Clone, Copy)]
+pub(crate) struct HostedStorage;
+
+impl helios_kernel::Storage for HostedStorage {
+    type HostShare = HostedFileSystem;
+    type Disk = helios_kernel::NoDisks;
+}
 
 /// Shared debug state across all hosted processor threads.
 static DEBUG_STATE: OnceLock<HostedRuntimeState> = OnceLock::new();

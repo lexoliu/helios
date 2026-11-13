@@ -68,15 +68,17 @@ use super::super::{PendingReply, StoreData, guest_memory, view_trap};
 /// instance. `open` checks the instance's GPU device class, and an
 /// instance without it is told `unavailable`, which is what a machine
 /// with no 3D service tells every program.
-pub(in crate::wasmtime_adapter::component_host) fn add_gpu_to_linker<CpuImpl, Net, HostFs>(
-    linker: &mut Linker<StoreData<CpuImpl, Net, HostFs>>,
+pub(in crate::wasmtime_adapter::component_host) fn add_gpu_to_linker<CpuImpl, Net, StorageImpl>(
+    linker: &mut Linker<StoreData<CpuImpl, Net, StorageImpl>>,
 ) -> wasmtime::Result<()>
 where
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    gpu_wit::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, HostFs>>>(linker, |state| state)
+    gpu_wit::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>(linker, |state| {
+        state
+    })
 }
 
 /// One of a plugin's `gpu` handles, as its store records it.
@@ -198,11 +200,11 @@ fn to_context_name(name: &str) -> ContextName {
     label
 }
 
-impl<CpuImpl, Net, HostFs> StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     /// The queue into the 3D owner, for session `session` if it is the
     /// one open now.
@@ -305,14 +307,14 @@ where
 }
 
 /// The calling instance's linear memory, read through `access`.
-fn memory_of<U, CpuImpl, Net, HostFs>(
-    access: &mut Access<'_, U, HasSelf<StoreData<CpuImpl, Net, HostFs>>>,
+fn memory_of<U, CpuImpl, Net, StorageImpl>(
+    access: &mut Access<'_, U, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>,
 ) -> Result<GuestMemory, Gpu3dServiceError>
 where
     U: 'static,
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let linear_memory = access.get().linear_memory;
     Ok(guest_memory(linear_memory, &*access)?)
@@ -326,14 +328,14 @@ where
 /// Panics when the store has no unshared memory: the handle is recorded
 /// once, when the instance is built, and the early half of the call
 /// already found it.
-fn checked_memory<U, CpuImpl, Net, HostFs>(
-    access: &mut Access<'_, U, HasSelf<StoreData<CpuImpl, Net, HostFs>>>,
+fn checked_memory<U, CpuImpl, Net, StorageImpl>(
+    access: &mut Access<'_, U, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>,
 ) -> GuestMemory
 where
     U: 'static,
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     memory_of(access).expect("a store whose memory took the span in the call's first step has one")
 }
@@ -380,11 +382,11 @@ fn unmap_request(blob: BlobId) -> Gpu3dRequest {
     Gpu3dRequest::UnmapBlob { blob, reply }
 }
 
-impl<CpuImpl, Net, HostFs> gpu_wit::Host for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> gpu_wit::Host for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn open(&mut self) -> wasmtime::Result<Result<Resource<GpuHandle>, gpu_wit::Error>> {
         let Some(service) = self.runtime_state.gpu3d_service() else {
@@ -410,11 +412,11 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> gpu_wit::HostGpu for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> gpu_wit::HostGpu for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn drop(&mut self, handle: Resource<GpuHandle>) -> wasmtime::Result<()> {
         let handle = self.table.delete(handle)?;
@@ -429,11 +431,11 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> gpu_wit::HostContext for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> gpu_wit::HostContext for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn drop(&mut self, handle: Resource<ContextHandle>) -> wasmtime::Result<()> {
         let context = self.table.delete(handle)?;
@@ -454,11 +456,11 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> gpu_wit::HostCommandBuffer for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> gpu_wit::HostCommandBuffer for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn drop(&mut self, handle: Resource<CommandBufferHandle>) -> wasmtime::Result<()> {
         let commands = self.table.delete(handle)?;
@@ -469,11 +471,11 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> gpu_wit::HostBlob for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> gpu_wit::HostBlob for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn resource_id(&mut self, handle: Resource<BlobHandle>) -> wasmtime::Result<u32> {
         Ok(self.table.get(&handle)?.id.raw())
@@ -509,15 +511,15 @@ where
 /// store is given back before anything is awaited: an `Access` guard
 /// held across a wait would hold the store for as long as the engine
 /// takes.
-fn session_of<U, CpuImpl, Net, HostFs>(
-    mut access: Access<'_, U, HasSelf<StoreData<CpuImpl, Net, HostFs>>>,
+fn session_of<U, CpuImpl, Net, StorageImpl>(
+    mut access: Access<'_, U, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>,
     handle: &Resource<GpuHandle>,
 ) -> wasmtime::Result<Result<(SessionId, Gpu3dSender), gpu_wit::Error>>
 where
     U: 'static,
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let data = access.get();
     let session = data.table.get(handle)?.session;
@@ -529,15 +531,15 @@ where
 
 /// What a blob call needs from the store before it waits: the session,
 /// the blob and the sender, checked together.
-fn blob_session<U, CpuImpl, Net, HostFs>(
-    mut access: Access<'_, U, HasSelf<StoreData<CpuImpl, Net, HostFs>>>,
+fn blob_session<U, CpuImpl, Net, StorageImpl>(
+    mut access: Access<'_, U, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>,
     handle: &Resource<BlobHandle>,
 ) -> wasmtime::Result<Result<(SessionId, BlobId, Gpu3dSender), gpu_wit::Error>>
 where
     U: 'static,
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let data = access.get();
     let blob = data.table.get(handle)?;
@@ -551,15 +553,15 @@ where
 /// What a context call needs from the store before it waits: the
 /// session, the context and the sender, checked together, and refused
 /// `device-fault` once the device has faulted the context.
-fn context_session<U, CpuImpl, Net, HostFs>(
-    mut access: Access<'_, U, HasSelf<StoreData<CpuImpl, Net, HostFs>>>,
+fn context_session<U, CpuImpl, Net, StorageImpl>(
+    mut access: Access<'_, U, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>,
     handle: &Resource<ContextHandle>,
 ) -> wasmtime::Result<Result<(SessionId, ContextId, Gpu3dSender), gpu_wit::Error>>
 where
     U: 'static,
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let data = access.get();
     let context = data.table.get(handle)?;
@@ -594,13 +596,13 @@ enum SubmitStep {
 /// whatever was admitted while it waited. `commands` builds the stream
 /// afresh for each attempt, because a full queue drops the attempt
 /// unsent.
-async fn queue_submission<U, CpuImpl, Net, HostFs>(
-    accessor: &Accessor<U, HasSelf<StoreData<CpuImpl, Net, HostFs>>>,
+async fn queue_submission<U, CpuImpl, Net, StorageImpl>(
+    accessor: &Accessor<U, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>,
     handle: &Resource<ContextHandle>,
     ring: u8,
     fence: Option<u64>,
     mut commands: impl FnMut(
-        &mut StoreData<CpuImpl, Net, HostFs>,
+        &mut StoreData<CpuImpl, Net, StorageImpl>,
         SessionId,
     ) -> wasmtime::Result<Result<SubmitCommands, gpu_wit::Error>>,
 ) -> wasmtime::Result<Result<(), gpu_wit::Error>>
@@ -608,7 +610,7 @@ where
     U: 'static,
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     // The sender whose room this call was last woken for: a call that
     // then queues nothing passes its turn on.
@@ -713,13 +715,13 @@ impl<T: 'static> StreamProducer<T> for FenceStreamProducer {
     }
 }
 
-impl<CpuImpl, Net, HostFs, U> gpu_wit::HostGpuWithStore<U>
-    for HasSelf<StoreData<CpuImpl, Net, HostFs>>
+impl<CpuImpl, Net, StorageImpl, U> gpu_wit::HostGpuWithStore<U>
+    for HasSelf<StoreData<CpuImpl, Net, StorageImpl>>
 where
     U: 'static,
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     async fn capsets(
         accessor: &Accessor<U, Self>,
@@ -955,13 +957,13 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs, U> gpu_wit::HostContextWithStore<U>
-    for HasSelf<StoreData<CpuImpl, Net, HostFs>>
+impl<CpuImpl, Net, StorageImpl, U> gpu_wit::HostContextWithStore<U>
+    for HasSelf<StoreData<CpuImpl, Net, StorageImpl>>
 where
     U: 'static,
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     async fn commands(
         accessor: &Accessor<U, Self>,
@@ -1089,8 +1091,8 @@ where
 
 /// Both halves of the resource-attachment call, which differ only in
 /// which message they send.
-async fn attach_or_detach<U, CpuImpl, Net, HostFs>(
-    accessor: &Accessor<U, HasSelf<StoreData<CpuImpl, Net, HostFs>>>,
+async fn attach_or_detach<U, CpuImpl, Net, StorageImpl>(
+    accessor: &Accessor<U, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>,
     handle: Resource<ContextHandle>,
     resource: Resource<BlobHandle>,
     attach: bool,
@@ -1099,7 +1101,7 @@ where
     U: 'static,
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let (_, context, sender) = match accessor.with(|access| context_session(access, &handle))? {
         Ok(values) => values,
@@ -1125,13 +1127,13 @@ where
     Ok(sender.control(request, answer).await.map_err(to_wit_error))
 }
 
-impl<CpuImpl, Net, HostFs, U> gpu_wit::HostBlobWithStore<U>
-    for HasSelf<StoreData<CpuImpl, Net, HostFs>>
+impl<CpuImpl, Net, StorageImpl, U> gpu_wit::HostBlobWithStore<U>
+    for HasSelf<StoreData<CpuImpl, Net, StorageImpl>>
 where
     U: 'static,
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     async fn map_blob(
         accessor: &Accessor<U, Self>,
@@ -1275,16 +1277,13 @@ pub(crate) mod test_store {
     use crate::gpu::{ContextShared, Gpu3dService, SessionId};
     use crate::isa::GuestIsa;
     use crate::test_support::{TestCpu, TestNetworkService};
-    use crate::{
-        Executor, InstanceRegistry, ProcessAuthority, TaskFunding, UnsupportedHostFileSystem,
-    };
+    use crate::{Executor, InstanceRegistry, ProcessAuthority, TaskFunding, UnsupportedStorage};
 
     use crate::wasmtime_adapter::component_host::{HostRuntimeState, StoreData};
 
     /// The store data these tests exercise: the component host's own
     /// generics, on the fixtures a kernel unit test carries.
-    pub(crate) type TestStoreData =
-        StoreData<TestCpu, TestNetworkService, UnsupportedHostFileSystem>;
+    pub(crate) type TestStoreData = StoreData<TestCpu, TestNetworkService, UnsupportedStorage>;
 
     /// The serial port the fixture's writer names: the store data has
     /// to carry one, and nothing the tests do is about what it writes.
@@ -1336,9 +1335,7 @@ pub(crate) mod test_store {
     /// A store on a runtime state that `configure` has set up, over a
     /// fresh debug filesystem of its own.
     pub(crate) fn store_data_with(
-        configure: impl FnOnce(
-            &HostRuntimeState<TestCpu, TestNetworkService, UnsupportedHostFileSystem>,
-        ),
+        configure: impl FnOnce(&HostRuntimeState<TestCpu, TestNetworkService, UnsupportedStorage>),
     ) -> TestStoreData {
         store_data_authorized(ProcessAuthority::empty(), configure)
     }
@@ -1348,22 +1345,17 @@ pub(crate) mod test_store {
     /// holds the GPU class from an ordinary program.
     pub(crate) fn store_data_authorized(
         authority: ProcessAuthority,
-        configure: impl FnOnce(
-            &HostRuntimeState<TestCpu, TestNetworkService, UnsupportedHostFileSystem>,
-        ),
+        configure: impl FnOnce(&HostRuntimeState<TestCpu, TestNetworkService, UnsupportedStorage>),
     ) -> TestStoreData {
         let cpu = TestCpu::with_entropy(0x5a);
-        let runtime_state: HostRuntimeState<
-            TestCpu,
-            TestNetworkService,
-            UnsupportedHostFileSystem,
-        > = crate::RuntimeState::new(
-            cpu.timebase(),
-            1,
-            0,
-            crate::BootPayload::for_tests(),
-            GuestIsa::for_build_target(cpu.native_feature_probe()),
-        );
+        let runtime_state: HostRuntimeState<TestCpu, TestNetworkService, UnsupportedStorage> =
+            crate::RuntimeState::new(
+                cpu.timebase(),
+                1,
+                0,
+                crate::BootPayload::for_tests(),
+                GuestIsa::for_build_target(cpu.native_feature_probe()),
+            );
         runtime_state.install_root_entropy(Arc::new(
             crate::RootEntropy::from_platform(
                 &cpu,

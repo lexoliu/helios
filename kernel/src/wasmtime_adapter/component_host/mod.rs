@@ -23,11 +23,12 @@ use crate::{
 };
 use crate::{
     ComponentCache, ComponentOutputMode, ComponentOutputRoute, ComponentOutputStreamKind,
-    ComponentStoreData, DeadlinePollable, EmbeddedComponent, ExecResult, InstanceId, KillOutcome,
-    KillReason, ProgramExecError, ProgramExecErrorDetail, ProgramExecErrorKind, RawMutex,
-    RawMutexGuardResource, RawMutexResource, RawRwLock, RawRwLockReadGuardResource,
-    RawRwLockResource, RawRwLockWriteGuardResource, SerialPortResource, elapsed_millis,
-    largest_servable_user_bytes, machine_memory, monotonic_nanos, user_heap_stats, user_node_stats,
+    ComponentStoreData, DeadlinePollable, EmbeddedComponent, ExecResult, HostFileSystem,
+    InstanceId, KillOutcome, KillReason, ProgramExecError, ProgramExecErrorDetail,
+    ProgramExecErrorKind, RawMutex, RawMutexGuardResource, RawMutexResource, RawRwLock,
+    RawRwLockReadGuardResource, RawRwLockResource, RawRwLockWriteGuardResource, SerialPortResource,
+    elapsed_millis, largest_servable_user_bytes, machine_memory, monotonic_nanos, user_heap_stats,
+    user_node_stats,
 };
 use helios_hal::cpu::Cpu;
 use spin::Mutex;
@@ -42,7 +43,7 @@ use crate::exec::phases::{self, LaunchPhase};
 use crate::wasmtime_adapter::bindings::debugger::bindings as debugger_bindings;
 use crate::wasmtime_adapter::bindings::program::bindings as program_bindings;
 use crate::wasmtime_adapter::config::AotCompileHint;
-use crate::wasmtime_adapter::cwasm::{self, ArtifactTrustError};
+use crate::wasmtime_adapter::cwasm;
 use crate::wasmtime_adapter::wasi::ChannelStreamProducer;
 use crate::wasmtime_adapter::wasi::bindings::filesystem::types::ErrorCode as FsErrorCode;
 use crate::{
@@ -116,20 +117,20 @@ pub type NetworkTcpBackend<Net> = crate::ComponentTcpBackend<Net>;
 pub type NetworkUdpBackend<Net> = crate::ComponentUdpBackend<Net>;
 pub type SbiTcpStream<Net> = crate::ComponentTcpStream<NetworkTcpBackend<Net>>;
 pub type SbiUdpSocket<Net> = crate::ComponentUdpSocket<NetworkUdpBackend<Net>>;
-pub type HostRuntimeState<CpuImpl, Net, HostFs> =
-    crate::RuntimeState<UserProgramService<CpuImpl, Net, HostFs>, Net, HostFs>;
-pub type StoreData<CpuImpl, Net, HostFs> = ComponentStoreData<
+pub type HostRuntimeState<CpuImpl, Net, StorageImpl> =
+    crate::RuntimeState<UserProgramService<CpuImpl, Net, StorageImpl>, Net, StorageImpl>;
+pub type StoreData<CpuImpl, Net, StorageImpl> = ComponentStoreData<
     CpuImpl,
-    HostRuntimeState<CpuImpl, Net, HostFs>,
-    crate::Namespace<HostFs>,
+    HostRuntimeState<CpuImpl, Net, StorageImpl>,
+    crate::Namespace<StorageImpl>,
     ResourceTable,
     wasmtime::Memory,
 >;
 pub type OutputMode = ComponentOutputMode;
 pub type OutputRoute = ComponentOutputRoute;
 pub type OutputStreamKind = ComponentOutputStreamKind;
-pub type RuntimeDeadlinePollable<CpuImpl, Net, HostFs> =
-    DeadlinePollable<CpuImpl, HostRuntimeState<CpuImpl, Net, HostFs>>;
+pub type RuntimeDeadlinePollable<CpuImpl, Net, StorageImpl> =
+    DeadlinePollable<CpuImpl, HostRuntimeState<CpuImpl, Net, StorageImpl>>;
 
 /// A long-running bring-up phase the heartbeat reports on.
 ///
@@ -212,32 +213,61 @@ pub type SbiRawRwLock = crate::ComponentRawRwLock;
 pub type SbiRawRwLockReadGuard = crate::ComponentRawRwLockReadGuard;
 pub type SbiRawRwLockWriteGuard = crate::ComponentRawRwLockWriteGuard;
 
+/// A WIT `aot-hint` a program request carries, taken into the kernel's own
+/// hint. The one place a hint the kernel cannot compile for is refused, so a
+/// request that names it fails before its source is read or anything is
+/// compiled.
+trait RequestedAotHint {
+    fn compile_hint(self) -> Result<AotCompileHint, ProgramExecError>;
+}
+
+macro_rules! impl_requested_aot_hint {
+    ($bindings:ident) => {
+        impl RequestedAotHint for $bindings::helios::system::programs::AotHint {
+            fn compile_hint(self) -> Result<AotCompileHint, ProgramExecError> {
+                match self {
+                    Self::Fast => Err(ProgramExecError {
+                        kind: ProgramExecErrorKind::InvalidHint,
+                        detail: ProgramExecErrorDetail::UnsupportedAotHint,
+                    }),
+                    Self::Balanced => Ok(AotCompileHint::Balanced),
+                    Self::Performance => Ok(AotCompileHint::Performance),
+                }
+            }
+        }
+    };
+}
+
+impl_requested_aot_hint!(debugger_bindings);
+impl_requested_aot_hint!(program_bindings);
+
 macro_rules! impl_program_bindings {
     ($bindings:ident, $convert_result:ident, $convert_error:ident, $build_authority:ident) => {
-        impl<CpuImpl, Net, HostFs> $bindings::helios::system::programs::Host
-            for StoreData<CpuImpl, Net, HostFs>
+        impl<CpuImpl, Net, StorageImpl> $bindings::helios::system::programs::Host
+            for StoreData<CpuImpl, Net, StorageImpl>
         where
             CpuImpl: Cpu + Clone,
             Net: ComponentHostNetwork,
-            HostFs: crate::HostFileSystem,
+            StorageImpl: crate::Storage,
         {
         }
 
-        impl<CpuImpl, Net, HostFs> $bindings::helios::system::programs::HostChild
-            for StoreData<CpuImpl, Net, HostFs>
+        impl<CpuImpl, Net, StorageImpl> $bindings::helios::system::programs::HostChild
+            for StoreData<CpuImpl, Net, StorageImpl>
         where
             CpuImpl: Cpu + Clone,
             Net: ComponentHostNetwork,
-            HostFs: crate::HostFileSystem,
+            StorageImpl: crate::Storage,
         {
         }
 
-        impl<CpuImpl, Net, HostFs, U> $bindings::helios::system::programs::HostChildWithStore<U>
-            for HasSelf<StoreData<CpuImpl, Net, HostFs>>
+        impl<CpuImpl, Net, StorageImpl, U>
+            $bindings::helios::system::programs::HostChildWithStore<U>
+            for HasSelf<StoreData<CpuImpl, Net, StorageImpl>>
         where
             CpuImpl: Cpu + Clone,
             Net: ComponentHostNetwork,
-            HostFs: crate::HostFileSystem,
+            StorageImpl: crate::Storage,
         {
             async fn drop(
                 accessor: &Accessor<U, Self>,
@@ -396,12 +426,12 @@ macro_rules! impl_program_bindings {
             }
         }
 
-        impl<CpuImpl, Net, HostFs, U> $bindings::helios::system::programs::HostWithStore<U>
-            for HasSelf<StoreData<CpuImpl, Net, HostFs>>
+        impl<CpuImpl, Net, StorageImpl, U> $bindings::helios::system::programs::HostWithStore<U>
+            for HasSelf<StoreData<CpuImpl, Net, StorageImpl>>
         where
             CpuImpl: Cpu + Clone,
             Net: ComponentHostNetwork,
-            HostFs: crate::HostFileSystem,
+            StorageImpl: crate::Storage,
         {
             fn spawn(
                 accessor: &Accessor<U, Self>,
@@ -564,6 +594,15 @@ macro_rules! impl_program_bindings {
                                 return Ok(Err($convert_error(error)));
                             }
                         };
+                    // Refused before the source is read: the hint is a
+                    // property of the request alone.
+                    let hint = match request.hint.map(RequestedAotHint::compile_hint).transpose() {
+                        Ok(hint) => hint,
+                        Err(error) => {
+                            launch.refused(error.kind);
+                            return Ok(Err($convert_error(error)));
+                        }
+                    };
                     let source =
                         match read_program_source(accessor, &request.path, &caller_authority).await
                         {
@@ -583,18 +622,6 @@ macro_rules! impl_program_bindings {
                         };
                     launch.record(LaunchPhase::SourceRead);
                     launch.record_source_bytes(source.payload_len());
-                    let hint = match request.hint {
-                        Some($bindings::helios::system::programs::AotHint::Fast) => {
-                            Some(AotCompileHint::Fast)
-                        }
-                        Some($bindings::helios::system::programs::AotHint::Balanced) => {
-                            Some(AotCompileHint::Balanced)
-                        }
-                        Some($bindings::helios::system::programs::AotHint::Performance) => {
-                            Some(AotCompileHint::Performance)
-                        }
-                        None => None,
-                    };
                     let executed = service
                         .exec_buffered(
                             &compile_authority,
@@ -659,6 +686,12 @@ macro_rules! impl_program_bindings {
                         Ok(authority) => authority,
                         Err(error) => return Ok(Err($convert_error(error))),
                     };
+                    // Refused before the source is read: the hint is a
+                    // property of the request alone.
+                    let hint = match request.hint.compile_hint() {
+                        Ok(hint) => hint,
+                        Err(error) => return Ok(Err($convert_error(error))),
+                    };
                     let source = match read_program_source(
                         accessor,
                         &request.source_path,
@@ -680,15 +713,6 @@ macro_rules! impl_program_bindings {
                             kind: $bindings::helios::system::programs::ExecErrorKind::InvalidHint,
                             detail: "aot only accepts raw wasm inputs".to_owned(),
                         }));
-                    };
-                    let hint = match request.hint {
-                        $bindings::helios::system::programs::AotHint::Fast => AotCompileHint::Fast,
-                        $bindings::helios::system::programs::AotHint::Balanced => {
-                            AotCompileHint::Balanced
-                        }
-                        $bindings::helios::system::programs::AotHint::Performance => {
-                            AotCompileHint::Performance
-                        }
                     };
                     // The compile runs in its own session task, which stops
                     // the compile when this call is dropped.
@@ -1034,6 +1058,49 @@ mod lowering_tests {
         assert_eq!(lowered.as_slice(), [1, 2, 3, 4]);
         assert_eq!(lowered.as_ptr(), source_ptr);
     }
+}
+
+#[cfg(test)]
+mod hint_tests {
+    use super::{
+        AotCompileHint, ProgramExecErrorDetail, ProgramExecErrorKind, RequestedAotHint,
+        debugger_bindings, program_bindings,
+    };
+
+    macro_rules! hint_cases {
+        ($name:ident, $bindings:ident) => {
+            mod $name {
+                use super::*;
+                use $bindings::helios::system::programs::AotHint;
+
+                /// The conversion both the exec and the aot request make
+                /// before the source is read and the compiler is asked.
+                #[test]
+                fn a_request_for_fast_is_refused() {
+                    let error = AotHint::Fast
+                        .compile_hint()
+                        .expect_err("fast must be refused at the request");
+                    assert_eq!(error.kind, ProgramExecErrorKind::InvalidHint);
+                    assert_eq!(error.detail, ProgramExecErrorDetail::UnsupportedAotHint);
+                }
+
+                #[test]
+                fn the_other_hints_convert() {
+                    assert_eq!(
+                        AotHint::Balanced.compile_hint(),
+                        Ok(AotCompileHint::Balanced)
+                    );
+                    assert_eq!(
+                        AotHint::Performance.compile_hint(),
+                        Ok(AotCompileHint::Performance)
+                    );
+                }
+            }
+        };
+    }
+
+    hint_cases!(debugger, debugger_bindings);
+    hint_cases!(program, program_bindings);
 }
 
 #[cfg(test)]
@@ -1469,15 +1536,15 @@ mod authority_tests {
     }
 }
 
-async fn read_program_source<T, CpuImpl, Net, HostFs>(
-    accessor: &Accessor<T, HasSelf<StoreData<CpuImpl, Net, HostFs>>>,
+async fn read_program_source<T, CpuImpl, Net, StorageImpl>(
+    accessor: &Accessor<T, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>,
     path: &str,
     authority: &ProcessAuthority,
 ) -> wasmtime::Result<Result<ProgramSource, crate::ProgramExecError>>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let absolute =
         crate::resolve_guest_path("/", path).map_err(map_component_fs_path_error_to_wasmtime)?;
@@ -1490,12 +1557,12 @@ where
     let namespace = accessor.with(|mut access| access.get().filesystem().clone());
     let contents = crate::wasmtime_adapter::wasi::read_program_file(&namespace, &absolute, floor)
         .await
-        .map_err(map_fs_error_to_program_exec)?;
+        .map_err(ProgramExecError::from_source_read_error)?;
     Ok(Ok(ProgramSource::from_file(contents)))
 }
 
-async fn write_program_artifact<T, CpuImpl, Net, HostFs>(
-    accessor: &Accessor<T, HasSelf<StoreData<CpuImpl, Net, HostFs>>>,
+async fn write_program_artifact<T, CpuImpl, Net, StorageImpl>(
+    accessor: &Accessor<T, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>,
     path: &str,
     bytes: &[u8],
     authority: &ProcessAuthority,
@@ -1506,7 +1573,7 @@ async fn write_program_artifact<T, CpuImpl, Net, HostFs>(
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let started_ns = if profile {
         crate::monotonic_nanos(cpu)
@@ -1619,16 +1686,16 @@ fn map_program_host_error(
 }
 
 /// The kernel handles a system component borrows for its whole run.
-pub(super) struct SystemComponentHost<CpuImpl, Net, HostFs>
+pub(super) struct SystemComponentHost<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     pub(super) cpu: CpuImpl,
     pub(super) timer: crate::Timer<CpuImpl>,
     pub(super) spawner: crate::Spawner<CpuImpl>,
-    pub(super) debug_state: HostRuntimeState<CpuImpl, Net, HostFs>,
+    pub(super) debug_state: HostRuntimeState<CpuImpl, Net, StorageImpl>,
     pub(super) read_serial: crate::SerialReader,
     pub(super) write_serial: crate::DebugSerialWriter,
 }
@@ -1647,15 +1714,15 @@ fn debugger_authority() -> ProcessAuthority {
     authority
 }
 
-async fn run_system_component<CpuImpl, Net, HostFs>(
+async fn run_system_component<CpuImpl, Net, StorageImpl>(
     component: EmbeddedComponent,
     world: ComponentBindingSet,
-    host: SystemComponentHost<CpuImpl, Net, HostFs>,
+    host: SystemComponentHost<CpuImpl, Net, StorageImpl>,
 ) -> Result<(), DebuggerError>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     use crate::{
         ComponentExecContext, ComponentExecutor, ComponentExitStatus, ComponentRuntimeFactory,
@@ -1682,8 +1749,8 @@ where
     let engine =
         <crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl> as ComponentRuntimeFactory<
             CpuImpl,
-            HostRuntimeState<CpuImpl, Net, HostFs>,
-            HostFs,
+            HostRuntimeState<CpuImpl, Net, StorageImpl>,
+            StorageImpl,
         >>::create_engine(&runtime)
         .map_err(DebuggerError::CreateEngine)?;
     write_serial.emit_stage_marker("engine:ok");
@@ -1693,7 +1760,7 @@ where
         "loading embedded system component artifact"
     );
     let artifact = component.bootfs_bytes();
-    let trusted = cwasm::trust_bootfs_artifact(&artifact).map_err(DebuggerError::TrustComponent)?;
+    let trusted = cwasm::trust_bootfs_artifact(&artifact);
     let compiled = crate::wasmtime_adapter::WasmtimeCompiledComponent {
         component: unsafe {
             wasmtime::component::Component::deserialize(engine.raw(), trusted.payload())
@@ -1772,17 +1839,17 @@ where
     }
 }
 
-pub(crate) fn component_linker<CpuImpl, Net, HostFs>(
+pub(crate) fn component_linker<CpuImpl, Net, StorageImpl>(
     engine: &Engine,
     world: ComponentBindingSet,
     component: &Component,
-) -> wasmtime::Result<Linker<StoreData<CpuImpl, Net, HostFs>>>
+) -> wasmtime::Result<Linker<StoreData<CpuImpl, Net, StorageImpl>>>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    let mut linker = Linker::<StoreData<CpuImpl, Net, HostFs>>::new(engine);
+    let mut linker = Linker::<StoreData<CpuImpl, Net, StorageImpl>>::new(engine);
     let wasi_imports =
         crate::wasmtime_adapter::wasi::WasiImportSet::from_component(engine, component);
     linker.allow_shadowing(true);
@@ -1809,13 +1876,13 @@ where
 /// installed there is none. A system component runs on an engine of its
 /// own, which nothing interrupts: it meets a condemnation where its call
 /// completes.
-pub(crate) fn deliver_kill<CpuImpl, Net, HostFs>(
-    runtime_state: &HostRuntimeState<CpuImpl, Net, HostFs>,
+pub(crate) fn deliver_kill<CpuImpl, Net, StorageImpl>(
+    runtime_state: &HostRuntimeState<CpuImpl, Net, StorageImpl>,
     victim: InstanceId,
 ) where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     if let Some(service) = runtime_state.program_service() {
         service.interrupt_instance(victim);
@@ -1824,17 +1891,17 @@ pub(crate) fn deliver_kill<CpuImpl, Net, HostFs>(
 
 /// A component store on `engine`, with the interrupt route the
 /// end of a time slice, a kill and the drive of its calls go through.
-pub(crate) fn store_with_state<CpuImpl, Net, HostFs>(
+pub(crate) fn store_with_state<CpuImpl, Net, StorageImpl>(
     engine: &crate::wasmtime_adapter::WasmtimeEngine,
-    state: StoreData<CpuImpl, Net, HostFs>,
+    state: StoreData<CpuImpl, Net, StorageImpl>,
 ) -> (
-    Store<StoreData<CpuImpl, Net, HostFs>>,
+    Store<StoreData<CpuImpl, Net, StorageImpl>>,
     crate::wasmtime_adapter::preemption::StoreInterrupts<CpuImpl>,
 )
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let instance = state.instance().id();
     let mut store = Store::new(engine.raw(), state);
@@ -1861,13 +1928,13 @@ where
     (store, interrupts)
 }
 
-fn add_system_to_linker<CpuImpl, Net, HostFs>(
-    linker: &mut Linker<StoreData<CpuImpl, Net, HostFs>>,
+fn add_system_to_linker<CpuImpl, Net, StorageImpl>(
+    linker: &mut Linker<StoreData<CpuImpl, Net, StorageImpl>>,
 ) -> wasmtime::Result<()>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     add_programs_to_linker(linker)?;
     mounts::add_mounts_to_linker(linker)?;
@@ -1887,24 +1954,24 @@ where
     Ok(())
 }
 
-struct ComponentHostProfile<CpuImpl, Net, HostFs>
+struct ComponentHostProfile<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    runtime_state: HostRuntimeState<CpuImpl, Net, HostFs>,
+    runtime_state: HostRuntimeState<CpuImpl, Net, StorageImpl>,
     cpu: CpuImpl,
     started_ticks: u64,
     counters: helios_hal::cpu::HardwarePerfCounters,
     started_heap: HeapStats,
 }
 
-impl<CpuImpl, Net, HostFs> ComponentHostProfile<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> ComponentHostProfile<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn restarted(&self) -> Self {
         Self {
@@ -1917,13 +1984,13 @@ where
     }
 }
 
-fn component_host_profile<CpuImpl, Net, HostFs>(
-    store: &StoreData<CpuImpl, Net, HostFs>,
-) -> Option<ComponentHostProfile<CpuImpl, Net, HostFs>>
+fn component_host_profile<CpuImpl, Net, StorageImpl>(
+    store: &StoreData<CpuImpl, Net, StorageImpl>,
+) -> Option<ComponentHostProfile<CpuImpl, Net, StorageImpl>>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     store
         .runtime_state
@@ -1937,13 +2004,13 @@ where
         })
 }
 
-fn record_component_host_kernel_profile<CpuImpl, Net, HostFs>(
-    profile: Option<ComponentHostProfile<CpuImpl, Net, HostFs>>,
+fn record_component_host_kernel_profile<CpuImpl, Net, StorageImpl>(
+    profile: Option<ComponentHostProfile<CpuImpl, Net, StorageImpl>>,
     phase: &'static str,
 ) where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     if let Some(profile) = profile {
         profile.runtime_state.record_profile_stack_parts(
@@ -1959,15 +2026,15 @@ fn record_component_host_kernel_profile<CpuImpl, Net, HostFs>(
     }
 }
 
-fn record_component_host_kernel_profile_events_bytes<CpuImpl, Net, HostFs>(
-    profile: Option<ComponentHostProfile<CpuImpl, Net, HostFs>>,
+fn record_component_host_kernel_profile_events_bytes<CpuImpl, Net, StorageImpl>(
+    profile: Option<ComponentHostProfile<CpuImpl, Net, StorageImpl>>,
     phase: &'static str,
     events: u64,
     bytes: u64,
 ) where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     if let Some(profile) = profile {
         let ended_ticks = profile.cpu.now().ticks();
@@ -2028,8 +2095,8 @@ fn record_component_host_kernel_profile_events_bytes<CpuImpl, Net, HostFs>(
     }
 }
 
-fn record_component_host_heap_delta<CpuImpl, Net, HostFs>(
-    runtime_state: &HostRuntimeState<CpuImpl, Net, HostFs>,
+fn record_component_host_heap_delta<CpuImpl, Net, StorageImpl>(
+    runtime_state: &HostRuntimeState<CpuImpl, Net, StorageImpl>,
     phase: &'static str,
     kind: &'static str,
     events: u64,
@@ -2037,7 +2104,7 @@ fn record_component_host_heap_delta<CpuImpl, Net, HostFs>(
 ) where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     if events == 0 && bytes == 0 {
         return;
@@ -2065,13 +2132,13 @@ fn component_host_usize_to_u64(value: usize, label: &'static str) -> u64 {
     u64::try_from(value).unwrap_or_else(|_| panic!("{label} does not fit into u64"))
 }
 
-pub(crate) fn add_program_world_to_linker<CpuImpl, Net, HostFs>(
-    linker: &mut Linker<StoreData<CpuImpl, Net, HostFs>>,
+pub(crate) fn add_program_world_to_linker<CpuImpl, Net, StorageImpl>(
+    linker: &mut Linker<StoreData<CpuImpl, Net, StorageImpl>>,
 ) -> wasmtime::Result<()>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     add_programs_to_program_linker(linker)?;
     mounts::add_mounts_to_program_linker(linker)?;
@@ -2089,28 +2156,28 @@ where
     Ok(())
 }
 
-pub(crate) fn add_serial_to_linker<CpuImpl, Net, HostFs>(
-    linker: &mut Linker<StoreData<CpuImpl, Net, HostFs>>,
+pub(crate) fn add_serial_to_linker<CpuImpl, Net, StorageImpl>(
+    linker: &mut Linker<StoreData<CpuImpl, Net, StorageImpl>>,
 ) -> wasmtime::Result<()>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    debugger_wit::serial::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, HostFs>>>(
+    debugger_wit::serial::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>(
         linker,
         |state| state,
     )?;
     Ok(())
 }
 
-pub(crate) fn add_sync_to_linker<CpuImpl, Net, HostFs>(
-    linker: &mut Linker<StoreData<CpuImpl, Net, HostFs>>,
+pub(crate) fn add_sync_to_linker<CpuImpl, Net, StorageImpl>(
+    linker: &mut Linker<StoreData<CpuImpl, Net, StorageImpl>>,
 ) -> wasmtime::Result<()>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let mut instance = linker.instance(SYNC_INSTANCE)?;
     instance.resource_concurrent(
@@ -2180,7 +2247,7 @@ where
     )?;
     instance.func_wrap(
         "[constructor]raw-mutex",
-        |mut caller: StoreContextMut<'_, StoreData<CpuImpl, Net, HostFs>>, (): ()| {
+        |mut caller: StoreContextMut<'_, StoreData<CpuImpl, Net, StorageImpl>>, (): ()| {
             let resource = caller.data_mut().table.push(SbiRawMutex {
                 resource: RawMutexResource {
                     inner: Arc::new(RawMutex::new()),
@@ -2191,7 +2258,7 @@ where
     )?;
     instance.func_wrap_concurrent(
         "[method]raw-mutex.lock",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>,
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
          (resource,): (Resource<SbiRawMutex>,)| {
             Box::pin(async move {
                 let mutex = accessor.with(|mut access| {
@@ -2211,7 +2278,7 @@ where
     )?;
     instance.func_wrap(
         "[constructor]raw-rw-lock",
-        |mut caller: StoreContextMut<'_, StoreData<CpuImpl, Net, HostFs>>, (): ()| {
+        |mut caller: StoreContextMut<'_, StoreData<CpuImpl, Net, StorageImpl>>, (): ()| {
             let resource = caller.data_mut().table.push(SbiRawRwLock {
                 resource: RawRwLockResource {
                     inner: Arc::new(RawRwLock::new()),
@@ -2222,7 +2289,7 @@ where
     )?;
     instance.func_wrap_concurrent(
         "[method]raw-rw-lock.read",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>,
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
          (resource,): (Resource<SbiRawRwLock>,)| {
             Box::pin(async move {
                 let rwlock = accessor.with(|mut access| {
@@ -2242,7 +2309,7 @@ where
     )?;
     instance.func_wrap_concurrent(
         "[method]raw-rw-lock.write",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>,
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
          (resource,): (Resource<SbiRawRwLock>,)| {
             Box::pin(async move {
                 let rwlock = accessor.with(|mut access| {
@@ -2263,13 +2330,13 @@ where
     Ok(())
 }
 
-fn add_stats_to_linker<CpuImpl, Net, HostFs>(
-    linker: &mut Linker<StoreData<CpuImpl, Net, HostFs>>,
+fn add_stats_to_linker<CpuImpl, Net, StorageImpl>(
+    linker: &mut Linker<StoreData<CpuImpl, Net, StorageImpl>>,
 ) -> wasmtime::Result<()>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let mut instance = linker.instance(STATS_INSTANCE)?;
     instance.func_wrap("snapshot", |caller, (): ()| {
@@ -2283,30 +2350,30 @@ where
     Ok(())
 }
 
-fn add_programs_to_linker<CpuImpl, Net, HostFs>(
-    linker: &mut Linker<StoreData<CpuImpl, Net, HostFs>>,
+fn add_programs_to_linker<CpuImpl, Net, StorageImpl>(
+    linker: &mut Linker<StoreData<CpuImpl, Net, StorageImpl>>,
 ) -> wasmtime::Result<()>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    debugger_wit::programs::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, HostFs>>>(
+    debugger_wit::programs::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>(
         linker,
         |state| state,
     )?;
     Ok(())
 }
 
-fn add_programs_to_program_linker<CpuImpl, Net, HostFs>(
-    linker: &mut Linker<StoreData<CpuImpl, Net, HostFs>>,
+fn add_programs_to_program_linker<CpuImpl, Net, StorageImpl>(
+    linker: &mut Linker<StoreData<CpuImpl, Net, StorageImpl>>,
 ) -> wasmtime::Result<()>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    program_wit::programs::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, HostFs>>>(
+    program_wit::programs::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>(
         linker,
         |state| state,
     )?;
@@ -2329,13 +2396,13 @@ fn udp_bind_network_rights(local_port: u16) -> NetworkAuthorityRights {
     }
 }
 
-fn add_net_to_linker<CpuImpl, Net, HostFs>(
-    linker: &mut Linker<StoreData<CpuImpl, Net, HostFs>>,
+fn add_net_to_linker<CpuImpl, Net, StorageImpl>(
+    linker: &mut Linker<StoreData<CpuImpl, Net, StorageImpl>>,
 ) -> wasmtime::Result<()>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let mut instance = linker.instance(NET_INSTANCE)?;
     instance.resource_concurrent(
@@ -2372,7 +2439,8 @@ where
     )?;
     instance.func_wrap_concurrent(
         "ping",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>, (host, timeout): (String, u64)| {
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
+         (host, timeout): (String, u64)| {
             Box::pin(async move {
                 let has_authority = accessor.with(|mut access| {
                     Ok::<_, wasmtime::Error>(
@@ -2409,7 +2477,7 @@ where
     )?;
     instance.func_wrap_concurrent(
         "tcp-connect",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>,
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
          (host, port, timeout): (String, u16, u64)| {
             Box::pin(async move {
                 let has_authority = accessor.with(|mut access| {
@@ -2455,7 +2523,7 @@ where
     )?;
     instance.func_wrap_concurrent(
         "udp-bind",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>, (local_port,): (u16,)| {
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>, (local_port,): (u16,)| {
             Box::pin(async move {
                 let required = udp_bind_network_rights(local_port);
                 let has_authority = accessor.with(|mut access| {
@@ -2496,7 +2564,7 @@ where
     )?;
     instance.func_wrap_concurrent(
         "[method]tcp-stream.read",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>,
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
          (resource, max_bytes, timeout): (Resource<SbiTcpStream<Net>>, u32, u64)| {
             Box::pin(async move {
                 let (socket, profile) = accessor.with(|mut access| {
@@ -2533,7 +2601,7 @@ where
     )?;
     instance.func_wrap_concurrent(
         "[method]tcp-stream.write",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>,
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
          (resource, bytes, timeout): (Resource<SbiTcpStream<Net>>, Vec<u8>, u64)| {
             Box::pin(async move {
                 let (socket, profile) = accessor.with(|mut access| {
@@ -2563,7 +2631,7 @@ where
     )?;
     instance.func_wrap_concurrent(
         "[method]tcp-stream.close",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>,
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
          (resource,): (Resource<SbiTcpStream<Net>>,)| {
             Box::pin(async move {
                 accessor.with(|mut access| {
@@ -2577,7 +2645,7 @@ where
     )?;
     instance.func_wrap_concurrent(
         "[method]udp-socket.receive",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>,
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
          (resource, max_bytes, timeout): (Resource<SbiUdpSocket<Net>>, u32, u64)| {
             Box::pin(async move {
                 let socket = accessor.with(|mut access| {
@@ -2602,7 +2670,7 @@ where
     )?;
     instance.func_wrap_concurrent(
         "[method]udp-socket.send",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>,
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
          (resource, host, port, bytes, timeout): (
             Resource<SbiUdpSocket<Net>>,
             String,
@@ -2632,7 +2700,7 @@ where
     )?;
     instance.func_wrap_concurrent(
         "[method]udp-socket.close",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>,
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
          (resource,): (Resource<SbiUdpSocket<Net>>,)| {
             Box::pin(async move {
                 accessor.with(|mut access| {
@@ -2647,13 +2715,13 @@ where
     Ok(())
 }
 
-fn add_net_to_program_linker<CpuImpl, Net, HostFs>(
-    linker: &mut Linker<StoreData<CpuImpl, Net, HostFs>>,
+fn add_net_to_program_linker<CpuImpl, Net, StorageImpl>(
+    linker: &mut Linker<StoreData<CpuImpl, Net, StorageImpl>>,
 ) -> wasmtime::Result<()>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let mut instance = linker.instance(NET_INSTANCE)?;
     instance.resource_concurrent(
@@ -2690,7 +2758,8 @@ where
     )?;
     instance.func_wrap_concurrent(
         "ping",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>, (host, timeout): (String, u64)| {
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
+         (host, timeout): (String, u64)| {
             Box::pin(async move {
                 let has_authority = accessor.with(|mut access| {
                     Ok::<_, wasmtime::Error>(
@@ -2727,7 +2796,7 @@ where
     )?;
     instance.func_wrap_concurrent(
         "tcp-connect",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>,
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
          (host, port, timeout): (String, u16, u64)| {
             Box::pin(async move {
                 let has_authority = accessor.with(|mut access| {
@@ -2775,7 +2844,7 @@ where
     )?;
     instance.func_wrap_concurrent(
         "udp-bind",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>, (local_port,): (u16,)| {
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>, (local_port,): (u16,)| {
             Box::pin(async move {
                 let required = udp_bind_network_rights(local_port);
                 let has_authority = accessor.with(|mut access| {
@@ -2818,7 +2887,7 @@ where
     )?;
     instance.func_wrap_concurrent(
         "[method]tcp-stream.read",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>,
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
          (resource, max_bytes, timeout): (Resource<SbiTcpStream<Net>>, u32, u64)| {
             Box::pin(async move {
                 let (socket, profile) = accessor.with(|mut access| {
@@ -2869,7 +2938,7 @@ where
     )?;
     instance.func_wrap_concurrent(
         "[method]tcp-stream.write",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>,
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
          (resource, bytes, timeout): (Resource<SbiTcpStream<Net>>, Vec<u8>, u64)| {
             Box::pin(async move {
                 let (socket, profile) = accessor.with(|mut access| {
@@ -2899,7 +2968,7 @@ where
     )?;
     instance.func_wrap_concurrent(
         "[method]tcp-stream.close",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>,
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
          (resource,): (Resource<SbiTcpStream<Net>>,)| {
             Box::pin(async move {
                 accessor.with(|mut access| {
@@ -2913,7 +2982,7 @@ where
     )?;
     instance.func_wrap_concurrent(
         "[method]udp-socket.receive",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>,
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
          (resource, max_bytes, timeout): (Resource<SbiUdpSocket<Net>>, u32, u64)| {
             Box::pin(async move {
                 let socket = accessor.with(|mut access| {
@@ -2938,7 +3007,7 @@ where
     )?;
     instance.func_wrap_concurrent(
         "[method]udp-socket.send",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>,
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
          (resource, host, port, bytes, timeout): (
             Resource<SbiUdpSocket<Net>>,
             String,
@@ -2968,7 +3037,7 @@ where
     )?;
     instance.func_wrap_concurrent(
         "[method]udp-socket.close",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>,
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
          (resource,): (Resource<SbiUdpSocket<Net>>,)| {
             Box::pin(async move {
                 accessor.with(|mut access| {
@@ -2983,13 +3052,13 @@ where
     Ok(())
 }
 
-fn add_tracing_to_linker<CpuImpl, Net, HostFs>(
-    linker: &mut Linker<StoreData<CpuImpl, Net, HostFs>>,
+fn add_tracing_to_linker<CpuImpl, Net, StorageImpl>(
+    linker: &mut Linker<StoreData<CpuImpl, Net, StorageImpl>>,
 ) -> wasmtime::Result<()>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let mut instance = linker.instance(TRACING_INSTANCE)?;
     instance.func_wrap(
@@ -3060,13 +3129,13 @@ macro_rules! impl_profiling_bindings {
         mod $module {
             use super::*;
 
-            pub(super) fn add_to_linker<CpuImpl, Net, HostFs>(
-                linker: &mut Linker<StoreData<CpuImpl, Net, HostFs>>,
+            pub(super) fn add_to_linker<CpuImpl, Net, StorageImpl>(
+                linker: &mut Linker<StoreData<CpuImpl, Net, StorageImpl>>,
             ) -> wasmtime::Result<()>
             where
                 CpuImpl: Cpu + Clone,
                 Net: ComponentHostNetwork,
-                HostFs: crate::HostFileSystem,
+                StorageImpl: crate::Storage,
             {
                 let mut instance = linker.instance(PROFILING_INSTANCE)?;
                 // The controls and the instruction and raw profile reads
@@ -3281,13 +3350,13 @@ fn read_raw_profile(offset: u64, length: u32) -> Result<Vec<u8>, crate::LlvmProf
     Ok(bytes)
 }
 
-fn add_stats_to_program_linker<CpuImpl, Net, HostFs>(
-    linker: &mut Linker<StoreData<CpuImpl, Net, HostFs>>,
+fn add_stats_to_program_linker<CpuImpl, Net, StorageImpl>(
+    linker: &mut Linker<StoreData<CpuImpl, Net, StorageImpl>>,
 ) -> wasmtime::Result<()>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let mut instance = linker.instance(STATS_INSTANCE)?;
     instance.func_wrap("snapshot", |caller, (): ()| {
@@ -3301,13 +3370,13 @@ where
     Ok(())
 }
 
-fn add_tracing_to_program_linker<CpuImpl, Net, HostFs>(
-    linker: &mut Linker<StoreData<CpuImpl, Net, HostFs>>,
+fn add_tracing_to_program_linker<CpuImpl, Net, StorageImpl>(
+    linker: &mut Linker<StoreData<CpuImpl, Net, StorageImpl>>,
 ) -> wasmtime::Result<()>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let mut instance = linker.instance(TRACING_INSTANCE)?;
     instance.func_wrap(
@@ -3386,6 +3455,8 @@ fn convert_launch_error(error: crate::ProgramExecError) -> debugger_wit::program
             ProgramExecErrorKind::OutOfMemory => debugger_wit::programs::ExecErrorKind::OutOfMemory,
             ProgramExecErrorKind::Unavailable => debugger_wit::programs::ExecErrorKind::Unavailable,
             ProgramExecErrorKind::Internal => debugger_wit::programs::ExecErrorKind::Internal,
+            ProgramExecErrorKind::NotFound => debugger_wit::programs::ExecErrorKind::NotFound,
+            ProgramExecErrorKind::Io => debugger_wit::programs::ExecErrorKind::Io,
         },
         detail: error.detail.as_str().to_owned(),
     }
@@ -3431,6 +3502,8 @@ fn convert_program_launch_error(
             ProgramExecErrorKind::OutOfMemory => program_wit::programs::ExecErrorKind::OutOfMemory,
             ProgramExecErrorKind::Unavailable => program_wit::programs::ExecErrorKind::Unavailable,
             ProgramExecErrorKind::Internal => program_wit::programs::ExecErrorKind::Internal,
+            ProgramExecErrorKind::NotFound => program_wit::programs::ExecErrorKind::NotFound,
+            ProgramExecErrorKind::Io => program_wit::programs::ExecErrorKind::Io,
         },
         detail: error.detail.as_str().to_owned(),
     }
@@ -3689,13 +3762,13 @@ fn convert_program_udp_error(error: crate::UdpError) -> program_wit::net::UdpErr
     }
 }
 
-fn add_instances_to_linker<CpuImpl, Net, HostFs>(
-    linker: &mut Linker<StoreData<CpuImpl, Net, HostFs>>,
+fn add_instances_to_linker<CpuImpl, Net, StorageImpl>(
+    linker: &mut Linker<StoreData<CpuImpl, Net, StorageImpl>>,
 ) -> wasmtime::Result<()>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let mut instance = linker.instance(INSTANCES_INSTANCE)?;
     instance.func_wrap("snapshot", |caller, (): ()| {
@@ -3732,18 +3805,18 @@ where
     Ok(())
 }
 
-fn add_snapshot_to_linker<CpuImpl, Net, HostFs>(
-    linker: &mut Linker<StoreData<CpuImpl, Net, HostFs>>,
+fn add_snapshot_to_linker<CpuImpl, Net, StorageImpl>(
+    linker: &mut Linker<StoreData<CpuImpl, Net, StorageImpl>>,
 ) -> wasmtime::Result<()>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let mut instance = linker.instance(SNAPSHOT_INSTANCE)?;
     instance.func_wrap_concurrent(
         "prepare",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>, (): ()| {
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>, (): ()| {
             Box::pin(async move {
                 let (host_fs, has_generation_id) = accessor.with(|mut access| {
                     let state = &access.get().runtime_state;
@@ -3762,7 +3835,7 @@ where
     )?;
     instance.func_wrap(
         "finished",
-        |caller: StoreContextMut<'_, StoreData<CpuImpl, Net, HostFs>>, (): ()| {
+        |caller: StoreContextMut<'_, StoreData<CpuImpl, Net, StorageImpl>>, (): ()| {
             if let Some(host_fs) = caller.data().runtime_state.host_fs_service() {
                 host_fs.snapshot_finished();
             }
@@ -3772,20 +3845,20 @@ where
     Ok(())
 }
 
-impl<CpuImpl, Net, HostFs> debugger_wit::serial::Host for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> debugger_wit::serial::Host for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
 }
 
-impl<CpuImpl, Net, HostFs, U> debugger_wit::serial::HostWithStore<U>
-    for HasSelf<StoreData<CpuImpl, Net, HostFs>>
+impl<CpuImpl, Net, StorageImpl, U> debugger_wit::serial::HostWithStore<U>
+    for HasSelf<StoreData<CpuImpl, Net, StorageImpl>>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     async fn debug_port(
         accessor: &Accessor<U, Self>,
@@ -3799,20 +3872,21 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> debugger_wit::serial::HostSerialPort for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> debugger_wit::serial::HostSerialPort
+    for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
 }
 
-impl<CpuImpl, Net, HostFs, U> debugger_wit::serial::HostSerialPortWithStore<U>
-    for HasSelf<StoreData<CpuImpl, Net, HostFs>>
+impl<CpuImpl, Net, StorageImpl, U> debugger_wit::serial::HostSerialPortWithStore<U>
+    for HasSelf<StoreData<CpuImpl, Net, StorageImpl>>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     async fn rights(
         accessor: &Accessor<U, Self>,
@@ -3896,28 +3970,29 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> debugger_wit::sync::Host for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> debugger_wit::sync::Host for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
 }
 
-impl<CpuImpl, Net, HostFs> debugger_wit::sync::HostRawMutex for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> debugger_wit::sync::HostRawMutex
+    for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
 }
 
-impl<CpuImpl, Net, HostFs, U> debugger_wit::sync::HostRawMutexWithStore<U>
-    for HasSelf<StoreData<CpuImpl, Net, HostFs>>
+impl<CpuImpl, Net, StorageImpl, U> debugger_wit::sync::HostRawMutexWithStore<U>
+    for HasSelf<StoreData<CpuImpl, Net, StorageImpl>>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn new(
         mut access: Access<'_, U, Self>,
@@ -3958,20 +4033,21 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> debugger_wit::sync::HostRawMutexGuard for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> debugger_wit::sync::HostRawMutexGuard
+    for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
 }
 
-impl<CpuImpl, Net, HostFs, U> debugger_wit::sync::HostRawMutexGuardWithStore<U>
-    for HasSelf<StoreData<CpuImpl, Net, HostFs>>
+impl<CpuImpl, Net, StorageImpl, U> debugger_wit::sync::HostRawMutexGuardWithStore<U>
+    for HasSelf<StoreData<CpuImpl, Net, StorageImpl>>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     async fn drop(
         accessor: &Accessor<U, Self>,
@@ -3984,20 +4060,21 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> debugger_wit::sync::HostRawRwLock for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> debugger_wit::sync::HostRawRwLock
+    for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
 }
 
-impl<CpuImpl, Net, HostFs, U> debugger_wit::sync::HostRawRwLockWithStore<U>
-    for HasSelf<StoreData<CpuImpl, Net, HostFs>>
+impl<CpuImpl, Net, StorageImpl, U> debugger_wit::sync::HostRawRwLockWithStore<U>
+    for HasSelf<StoreData<CpuImpl, Net, StorageImpl>>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn new(
         mut access: Access<'_, U, Self>,
@@ -4051,21 +4128,21 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> debugger_wit::sync::HostRawRwLockReadGuard
-    for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> debugger_wit::sync::HostRawRwLockReadGuard
+    for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
 }
 
-impl<CpuImpl, Net, HostFs, U> debugger_wit::sync::HostRawRwLockReadGuardWithStore<U>
-    for HasSelf<StoreData<CpuImpl, Net, HostFs>>
+impl<CpuImpl, Net, StorageImpl, U> debugger_wit::sync::HostRawRwLockReadGuardWithStore<U>
+    for HasSelf<StoreData<CpuImpl, Net, StorageImpl>>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     async fn drop(
         accessor: &Accessor<U, Self>,
@@ -4078,21 +4155,21 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> debugger_wit::sync::HostRawRwLockWriteGuard
-    for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> debugger_wit::sync::HostRawRwLockWriteGuard
+    for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
 }
 
-impl<CpuImpl, Net, HostFs, U> debugger_wit::sync::HostRawRwLockWriteGuardWithStore<U>
-    for HasSelf<StoreData<CpuImpl, Net, HostFs>>
+impl<CpuImpl, Net, StorageImpl, U> debugger_wit::sync::HostRawRwLockWriteGuardWithStore<U>
+    for HasSelf<StoreData<CpuImpl, Net, StorageImpl>>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     async fn drop(
         accessor: &Accessor<U, Self>,
@@ -4131,11 +4208,12 @@ impl StatsStreamProducer {
     }
 }
 
-impl<CpuImpl, Net, HostFs> StreamProducer<StoreData<CpuImpl, Net, HostFs>> for StatsStreamProducer
+impl<CpuImpl, Net, StorageImpl> StreamProducer<StoreData<CpuImpl, Net, StorageImpl>>
+    for StatsStreamProducer
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     type Item = debugger_wit::stats::Sample;
     type Buffer = Option<Self::Item>;
@@ -4143,7 +4221,7 @@ where
     fn poll_produce<'a>(
         mut self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
-        store: StoreContextMut<'_, StoreData<CpuImpl, Net, HostFs>>,
+        store: StoreContextMut<'_, StoreData<CpuImpl, Net, StorageImpl>>,
         mut destination: Destination<'a, Self::Item, Self::Buffer>,
         finish: bool,
     ) -> Poll<wasmtime::Result<StreamResult>> {
@@ -4180,12 +4258,12 @@ impl ProgramStatsStreamProducer {
     }
 }
 
-impl<CpuImpl, Net, HostFs> StreamProducer<StoreData<CpuImpl, Net, HostFs>>
+impl<CpuImpl, Net, StorageImpl> StreamProducer<StoreData<CpuImpl, Net, StorageImpl>>
     for ProgramStatsStreamProducer
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     type Item = program_wit::stats::Sample;
     type Buffer = Option<Self::Item>;
@@ -4193,7 +4271,7 @@ where
     fn poll_produce<'a>(
         mut self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
-        store: StoreContextMut<'_, StoreData<CpuImpl, Net, HostFs>>,
+        store: StoreContextMut<'_, StoreData<CpuImpl, Net, StorageImpl>>,
         mut destination: Destination<'a, Self::Item, Self::Buffer>,
         finish: bool,
     ) -> Poll<wasmtime::Result<StreamResult>> {
@@ -4240,13 +4318,13 @@ impl<Scope> TracingStreamProducer<Scope> {
     }
 }
 
-impl<Scope, CpuImpl, Net, HostFs> StreamProducer<StoreData<CpuImpl, Net, HostFs>>
+impl<Scope, CpuImpl, Net, StorageImpl> StreamProducer<StoreData<CpuImpl, Net, StorageImpl>>
     for TracingStreamProducer<Scope>
 where
     Scope: crate::ObservationScope + Send + Unpin + 'static,
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     type Item = debugger_wit::tracing::Event;
     type Buffer = Option<Self::Item>;
@@ -4254,7 +4332,7 @@ where
     fn poll_produce<'a>(
         mut self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
-        store: StoreContextMut<'_, StoreData<CpuImpl, Net, HostFs>>,
+        store: StoreContextMut<'_, StoreData<CpuImpl, Net, StorageImpl>>,
         mut destination: Destination<'a, Self::Item, Self::Buffer>,
         finish: bool,
     ) -> Poll<wasmtime::Result<StreamResult>> {
@@ -4295,13 +4373,13 @@ impl<Scope> ProgramTracingStreamProducer<Scope> {
     }
 }
 
-impl<Scope, CpuImpl, Net, HostFs> StreamProducer<StoreData<CpuImpl, Net, HostFs>>
+impl<Scope, CpuImpl, Net, StorageImpl> StreamProducer<StoreData<CpuImpl, Net, StorageImpl>>
     for ProgramTracingStreamProducer<Scope>
 where
     Scope: crate::ObservationScope + Send + Unpin + 'static,
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     type Item = program_wit::tracing::Event;
     type Buffer = Option<Self::Item>;
@@ -4309,7 +4387,7 @@ where
     fn poll_produce<'a>(
         mut self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
-        store: StoreContextMut<'_, StoreData<CpuImpl, Net, HostFs>>,
+        store: StoreContextMut<'_, StoreData<CpuImpl, Net, StorageImpl>>,
         mut destination: Destination<'a, Self::Item, Self::Buffer>,
         finish: bool,
     ) -> Poll<wasmtime::Result<StreamResult>> {
@@ -4332,24 +4410,24 @@ where
     }
 }
 
-fn snapshot_sample<CpuImpl, Net, HostFs>(
-    store: &StoreData<CpuImpl, Net, HostFs>,
+fn snapshot_sample<CpuImpl, Net, StorageImpl>(
+    store: &StoreData<CpuImpl, Net, StorageImpl>,
 ) -> debugger_wit::stats::Sample
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     convert_sample(store.runtime_state.snapshot(store.cpu.now().ticks()))
 }
 
-fn snapshot_program_sample<CpuImpl, Net, HostFs>(
-    store: &StoreData<CpuImpl, Net, HostFs>,
+fn snapshot_program_sample<CpuImpl, Net, StorageImpl>(
+    store: &StoreData<CpuImpl, Net, StorageImpl>,
 ) -> program_wit::stats::Sample
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     // A program sees only the hardware it could claim: `claim` answers
     // as if the device were absent, and a listed device would say
@@ -4836,8 +4914,6 @@ fn emit_program_stage_marker(write_serial: crate::DebugSerialWriter, stage: &str
 enum DebuggerError {
     #[error("failed to initialize Wasmtime engine: {0:#}")]
     CreateEngine(wasmtime::Error),
-    #[error("failed to validate embedded debugger artifact: {0}")]
-    TrustComponent(ArtifactTrustError),
     #[error("failed to load embedded debugger component: {0:#}")]
     LoadComponent(wasmtime::Error),
     #[error("failed to instantiate debugger component: {0:#}")]

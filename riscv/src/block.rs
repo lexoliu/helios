@@ -22,7 +22,7 @@ use crate::RiscvCpu;
 use crate::debug_state::RuntimeState;
 use crate::net::PlicInterrupt;
 
-type RiscvVirtioBlockDevice =
+pub(crate) type RiscvVirtioBlockDevice =
     helios_virtio::VirtioMmioBlockDevice<RiscvCpu, helios_kernel::BlockPages>;
 
 #[derive(Clone)]
@@ -66,15 +66,16 @@ where
         .collect();
     let state = debug_state.clone();
     // Swap is not wired on this backend, so the scratch disk is proved
-    // and counted but nothing writes to it yet. Nothing mounts a disk
-    // yet either, so the mount sources' cache is held by its reclaim
-    // task alone.
+    // and counted but nothing writes to it yet.
     helios_kernel::install_block_devices(
         kernel,
         root,
         devices,
-        move |service, _scratch, _mount_sources| {
+        move |service, _scratch, mount_sources| {
             state.install_block_service(service);
+            if let Some(cache) = mount_sources {
+                state.install_mount_sources(cache);
+            }
         },
     );
     for interrupt in &discovered {

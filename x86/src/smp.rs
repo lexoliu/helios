@@ -1442,9 +1442,9 @@ impl Handler for PhysicalOffsetAcpiHandler {
         size: usize,
     ) -> RawPhysicalMapping<T> {
         ensure_hhdm_range_mapped(self.physical_memory_offset, physical_address, size);
-        // SAFETY: the direct map now covers the whole range at its one
-        // fixed offset, and nothing ever unmaps it, so the address stays
-        // valid for as long as the mapping is used.
+        // SAFETY: the virtual address is the direct-map alias of the
+        // physical range, which no other mapping of this handler aliases
+        // mutably, and `unmap_physical_region` has nothing to undo.
         unsafe {
             RawPhysicalMapping::new(
                 physical_address,
@@ -1553,6 +1553,33 @@ impl Handler for PhysicalOffsetAcpiHandler {
     fn sleep(&self, milliseconds: u64) {
         self.stall(milliseconds.saturating_mul(1_000));
     }
+
+    /// AML mutexes need no state here, and the handle is the same for
+    /// every one of them.
+    ///
+    /// A mutex keeps two threads of control out of the same AML region.
+    /// The only AML interpreter this backend builds (`vmgenid`) is
+    /// created, used and dropped on the bootstrap processor during
+    /// bring-up, before any secondary starts and before the executor
+    /// exists, so it has one thread of control: every acquire succeeds at
+    /// once, recursive acquires included, and a release has nothing to
+    /// hand over. [`Self::acquire`] asserts that rather than assuming it,
+    /// so an interpreter that ever ran elsewhere fails here instead of
+    /// silently losing mutual exclusion.
+    fn create_mutex(&self) -> acpi::Handle {
+        acpi::Handle(0)
+    }
+
+    fn acquire(&self, _mutex: acpi::Handle, _timeout: u16) -> Result<(), acpi::aml::AmlError> {
+        assert!(
+            current_processor() == ProcessorId::new(0),
+            "the AML interpreter ran outside the bootstrap processor, where its mutexes would \
+             no longer provide mutual exclusion"
+        );
+        Ok(())
+    }
+
+    fn release(&self, _mutex: acpi::Handle) {}
 }
 
 fn prepare_wakeup_page(platform: &X86PlatformState, wakeup_page: &WakeupPage) {

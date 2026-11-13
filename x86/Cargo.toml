@@ -8,7 +8,7 @@ default = ["embedded-debugger"]
 embedded-debugger = ["helios-kernel/embedded-debugger"]
 
 [dependencies]
-acpi = { workspace = true, features = ["alloc"] }
+acpi = { workspace = true, features = ["aml"] }
 helios-artifact.workspace = true
 bitflags = "2.11.0"
 critical-section = { version = "1.2.0", features = ["restore-state-usize"] }
@@ -17,6 +17,7 @@ helios-hal.workspace = true
 i6300esb.workspace = true
 helios-kernel = { workspace = true, default-features = false, features = ["wasmtime-bare-metal"] }
 helios-virtio.workspace = true
+helios-tpm.workspace = true
 bytes = { version = "1.10.1", default-features = false }
 # The kernel saves only the legacy FXSAVE x87/SSE state on interrupt entry,
 # so it must not contain libm's CPUID-dispatched FMA/FMA4 paths.
