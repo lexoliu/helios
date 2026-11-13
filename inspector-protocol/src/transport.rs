@@ -131,9 +131,19 @@ struct Invocation<R, W> {
     progress: Notify,
 }
 
-#[derive(Clone)]
 pub struct Client<R, W> {
     inner: Arc<ClientInner<R, W>>,
+}
+
+/// Another handle on the same connection. Written out because the
+/// derive would ask the transport halves themselves to be `Clone`, and
+/// the handle only shares them.
+impl<R, W> Clone for Client<R, W> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
 }
 
 /// The client half of a connection: one reader, many waiters.

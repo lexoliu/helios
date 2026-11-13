@@ -1,3 +1,4 @@
+mod frame_reader;
 mod programs;
 mod ready;
 mod remote;
