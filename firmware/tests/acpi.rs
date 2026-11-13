@@ -779,6 +779,54 @@ fn a_locality_count_whose_square_overflows_is_refused() {
     );
 }
 
+/// An SRAT whose entry states a length of zero never advances the
+/// crate's iterator; the table ends the walk instead, before the valid
+/// entry behind it, so the machine has no usable description.
+#[test]
+fn an_srat_entry_of_length_zero_ends_the_walk_as_single_node() {
+    for typ in [0xff_u8, 0, 1, 2, 3] {
+        let firmware = Firmware::new(vec![srat(&[
+            vec![typ, 0, 0, 0],
+            lapic(0, 0, ENABLED),
+            memory(0, 0x4000_0000, 0, ENABLED),
+        ])]);
+        let numa = x86_numa(&firmware, vec![0, 1]);
+        assert_single_node(&numa, 2);
+    }
+}
+
+/// An entry shorter than the structure its type is read as would be cast
+/// past the end of the table; it is refused and the walk ends.
+#[test]
+fn an_srat_last_entry_shorter_than_its_type_ends_the_walk_as_single_node() {
+    // A type 1 Memory Affinity Structure is 40 bytes; this one states 4
+    // and is the last bytes of the table.
+    let firmware = Firmware::new(vec![srat(&[vec![1, 4, 0, 0]])]);
+    let numa = x86_numa(&firmware, vec![0, 1]);
+    assert_single_node(&numa, 2);
+
+    // A 15-byte Processor Local APIC entry, one byte short of its 16.
+    let mut short = lapic(0, 0, ENABLED);
+    short.pop();
+    short[1] = 15;
+    let firmware = Firmware::new(vec![srat(&[short])]);
+    let numa = x86_numa(&firmware, vec![0]);
+    assert_single_node(&numa, 1);
+}
+
+/// A locality count of 2^32 squares to 2^64, which wraps to zero cells
+/// unchecked; the matrix is refused instead.
+#[test]
+fn a_locality_count_of_two_to_the_32_is_refused() {
+    assert_eq!(
+        x86_refusal(&two_nodes_with(slit(1 << 32, &[10])), vec![0, 1]),
+        FirmwareNumaError::SlitTruncated {
+            localities: 1 << 32,
+            length: 36 + 8 + 1
+        }
+    );
+}
+
 #[test]
 fn a_memory_range_past_the_address_space_is_refused() {
     let firmware = Firmware::new(vec![srat(&[
