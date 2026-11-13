@@ -15320,8 +15320,12 @@ mod tests {
 
         let payload = [0u8; 1024];
         assert_eq!(stack.tcp_send(socket, &payload), Ok(payload.len()));
+        // A millisecond on: the first data segment set a pacing deadline
+        // (BBR paces from its first packet, at the initial window per
+        // millisecond until a round trip is measured), and this test is
+        // about the segment size, not the departure time.
         stack
-            .drive_tcp(StackInstant::from_nanos(4))
+            .drive_tcp(StackInstant::from_nanos(1_000_000))
             .expect("PMTU-limited TCP data should be queued");
 
         let cap = 576 - Ipv4Packet::MIN_HEADER_LEN - TcpPacket::MIN_HEADER_LEN;

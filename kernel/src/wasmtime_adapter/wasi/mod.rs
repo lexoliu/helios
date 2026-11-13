@@ -1526,7 +1526,7 @@ mod tests {
         // The peer advertised a 64 KiB window and never ACKs, so enough
         // queued bytes fill it and then the send queue behind it.
         let mut fill = Bytes::from(vec![0xAB; 2 * 1024 * 1024]);
-        loop {
+        let mut fill_send_queue = || loop {
             service
                 .tcp_try_write(fixture.stream(), &mut fill)
                 .expect("the fill write queues");
@@ -1544,20 +1544,32 @@ mod tests {
                 !fill.is_empty(),
                 "the send queue must fill before the fill buffer runs out"
             );
-        }
+        };
+        fill_send_queue();
         // How far the send sequence actually ran is what the peer may
-        // acknowledge — the window, the congestion window and the
-        // socket's own segmentation decide it, so read it off the
-        // wire: the refused device's ring kept the segments staged,
-        // and `drive` reports them.
-        let sent = fixture
-            .drive()
-            .iter()
-            .map(|segment| segment.payload_len as u32)
-            .fold(
-                EstablishedTcpFixture::LOCAL_SEQUENCE.wrapping_add(1),
-                u32::wrapping_add,
-            );
+        // acknowledge — the window, the congestion window, the pacing
+        // rate and the socket's own segmentation decide it, so read it
+        // off the wire: the refused device's ring kept the segments
+        // staged, and `drive` reports them. The sender paces, so time
+        // passes between drives until a drive sends nothing: the
+        // windows are full. A millisecond a step stays far inside the
+        // first retransmission timeout, so nothing on the wire is a
+        // resend.
+        let mut sent = EstablishedTcpFixture::LOCAL_SEQUENCE.wrapping_add(1);
+        loop {
+            let staged = fixture.drive();
+            if staged.iter().all(|segment| segment.payload_len == 0) {
+                break;
+            }
+            sent = staged
+                .iter()
+                .map(|segment| segment.payload_len as u32)
+                .fold(sent, u32::wrapping_add);
+            fixture.advance(1_000_000);
+        }
+        // What left the queue for the wire made room behind it; fill
+        // that too, so the queue is full while nothing more may leave.
+        fill_send_queue();
         assert_ne!(
             sent,
             EstablishedTcpFixture::LOCAL_SEQUENCE.wrapping_add(1),
