@@ -1003,8 +1003,8 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone, MeasuredBootImpl: Mea
         let mut stats = KernelRunStats::default();
 
         loop {
-            let fired = self.timer.fire_expired();
             let executor_stats = self.executor.run_until_stalled_with_stats(&self.timer);
+            let fired = executor_stats.timer_fired_count();
             let ran = executor_stats.runnable_count();
 
             stats.timer_fired_count += fired;
