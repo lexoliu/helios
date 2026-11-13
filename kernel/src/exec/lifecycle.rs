@@ -912,7 +912,7 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone, MeasuredBootImpl: Mea
 #[cfg(test)]
 mod tests {
     use core::future::{Future as _, pending};
-    use core::pin::Pin;
+    use core::pin::pin;
     use core::task::{Context, Poll};
 
     use futures::task::noop_waker_ref;
@@ -1023,10 +1023,11 @@ mod tests {
         const DUE: u64 = 200_000;
         const CANCELLED_DUE: u64 = 100_000;
         let mut context = Context::from_waker(noop_waker_ref());
-        let mut sleep = timer1.sleep_until(Instant::new(DUE));
-        assert!(Pin::new(&mut sleep).poll(&mut context).is_pending());
-        let mut cancelled = timer1.sleep_until(Instant::new(CANCELLED_DUE));
-        assert!(Pin::new(&mut cancelled).poll(&mut context).is_pending());
+        let mut sleep = pin!(timer1.sleep_until(Instant::new(DUE)));
+        assert!(sleep.as_mut().poll(&mut context).is_pending());
+        // Boxed, so that dropping it drops the sleep and not a borrow.
+        let mut cancelled = alloc::boxed::Box::pin(timer1.sleep_until(Instant::new(CANCELLED_DUE)));
+        assert!(cancelled.as_mut().poll(&mut context).is_pending());
         drop(cancelled);
 
         timer1.migrate_base(P0);
@@ -1043,6 +1044,6 @@ mod tests {
         assert!(timer0.is_due(Instant::new(DUE)));
         cpu.advance(DUE);
         assert_eq!(timer0.fire_expired(), 1);
-        assert_eq!(Pin::new(&mut sleep).poll(&mut context), Poll::Ready(()));
+        assert_eq!(sleep.as_mut().poll(&mut context), Poll::Ready(()));
     }
 }

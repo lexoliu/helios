@@ -1,25 +1,205 @@
-extern crate alloc;
+//! The kernel's timers, one base per processor, and the [`Sleep`] future.
+//!
+//! A [`Timer`] is a handle that names no processor. A sleep is registered
+//! on the timer base of the processor that first polls it, the
+//! per-processor base model Linux's hrtimers use: the registrant is the
+//! base's owner, so registering lowers its own hardware deadline and never
+//! has to reach another processor's comparator, and a handle cloned into a
+//! long-lived service does not tie every sleep of that service to
+//! whichever processor built the handle — or to a processor that has since
+//! gone offline. The base-driving operations (firing, the timer interrupt,
+//! the idle loop's arming) act on the base of the processor executing
+//! them. A processor going offline hands its pending sleeps to another
+//! base ([`Timer::migrate_base`]) and keeps its own, empty, for when it
+//! comes back.
+//!
+//! A pending sleep's timer state lives in the sleep. [`Sleep`] carries a
+//! [`SleepNode`]: its links in a base's [`TimingWheel`], the quantum tick
+//! it is filed under, the list it is on, its *home* (the lock of the wheel
+//! it is linked in), a state word and an `AtomicWaker`. Registering links
+//! memory the sleep already is, so it cannot fail for capacity, and
+//! nothing kernel-owned grows with the number of sleeps: a wheel's slot
+//! heads are fixed and built once with its base. A dropped sleep unlinks
+//! itself at once and leaves nothing behind for a later drain. The shape
+//! is Tokio's `TimerEntry` (`runtime/time/entry.rs`) on a per-processor
+//! base, as Linux's `hrtimer` and `timer_list` embed their queue nodes.
+//!
+//! # Concurrency contract
+//!
+//! A base belongs to one processor, its owner. Its wheel is guarded by one
+//! `spin::Mutex`, the base's wheel lock. Every operation on a base, who
+//! runs it and how:
+//!
+//! | Operation | Who | Context | Synchronisation | Allocates |
+//! | --- | --- | --- | --- | --- |
+//! | `Sleep::poll`, first pending poll (`IDLE → REGISTERED`) | the owner: registration picks the base of the processor polling the sleep | task | `AtomicWaker::register` (lock-free), then the wheel lock for an O(1) link and to lower `next_sleep_deadline`; after unlocking, the owner arms the deadline itself | never |
+//! | `Sleep::poll` while `REGISTERED` | any processor: a global task's sleep is re-polled wherever the task runs next | task | lock-free: a state load and `AtomicWaker::register`. Takes the home lock only when the deadline has already passed, to deregister and complete, so a completed sleep holds nothing even before it is dropped | never |
+//! | `Sleep::drop` | any processor | task only: a future is dropped only inside async-task's `run` or `Runnable::drop`, never in an interrupt handler | an `Acquire` state load: `IDLE` or `DONE` returns with no lock (Linux `hrtimer_try_to_cancel`'s lock-free test). `REGISTERED` or `FIRING` takes the home lock, following the home if a hand-over moved it (Linux `lock_hrtimer_base`), unlinks in O(1) and stores `DONE`. The `AtomicWaker` is dropped by drop glue after the lock is released | never |
+//! | [`Timer::fire_expired`] | the owner: it fires the executing processor's base | task | lock-free fast path: `next_sleep_deadline > now` returns 0. Otherwise the lock; the wheel jumps by its occupancy words; each due node is unlinked and fired. Every [`TIMER_WAKE_BATCH`] wakers the lock is released, the batch is woken and the lock is retaken (Tokio `process_at_time`). Then `next_sleep_deadline` is stored, the lock released, the rest woken and the deadline armed | never: the batch is a stack array |
+//! | [`Timer::migrate_base`] | a departing processor, onto its successor's base | task, its last timer act before it stops | in batches of [`TIMER_HAND_OVER_BATCH`] nodes, its own wheel lock and then the successor's; each node is moved under both (see *Hand-over*) and the successor's `next_sleep_deadline` is lowered under its lock. After the last batch, a foreign publish: the successor is woken if it is parked, and no comparator is programmed | never |
+//! | [`Timer::bring_base_online`] | the owner, on its way online | task | builds the base on first bring-up; the wheel lock once, to move the empty wheel's clock to now | never: the base's slot is sized with the executor group |
+//! | [`Timer::handle_interrupt`] | the owner | interrupt | atomics only (`armed_deadline`, `next_sleep_deadline`); never a wheel lock | never |
+//! | [`Timer::is_due`], [`Timer::arm_published_deadline`], [`Timer::arm_scheduler_tick`] | the owner | task (park path, run loop) | atomics only | never |
+//!
+//! The lock is a plain `spin::Mutex`, as `ready`'s global consumer lock
+//! is. No interrupt handler can reach it: [`Timer::handle_interrupt`]
+//! reads atomics, wakers run outside it, and no `Sleep` is polled or
+//! dropped in interrupt context. So the `IrqSafeMutex` rule for locks an
+//! interrupt handler can reach does not apply. Nothing inside it
+//! allocates, calls or drops a waker, or faults: a node lives in kernel
+//! heap, the task arena or a fiber stack, none of which is swappable, and
+//! its page is resident from the registration's first write. Only a
+//! hand-over holds two wheel locks, its own and then its successor's.
+//! Lifecycle transitions are serialised (`lifecycle`'s contract), so at
+//! most one hand-over runs at a time and its successor is never itself
+//! departing; every other holder holds one lock and takes no other under
+//! it, so no cycle of waiters can form. Register and cancel hold a lock
+//! for O(1); firing holds it for at most [`TIMER_WAKE_BATCH`] fires; a
+//! cascade holds it for one slot's nodes; a hand-over holds both for at
+//! most [`TIMER_HAND_OVER_BATCH`] moves.
+//!
+//! # Node states
+//!
+//! - `IDLE`: on no list, and no home yet. Initial. No processor but the
+//!   holder has the node's address.
+//! - `REGISTERED`: linked in a slot list or in `pending` of its home's
+//!   wheel, or being moved between two wheels by a hand-over that holds
+//!   both their locks. Entered only under the home lock.
+//! - `FIRING`: taken off the wheel by a firer that still holds the home
+//!   lock and is taking the waker. A poll reads it as complete; a drop
+//!   that reads it waits for the lock.
+//! - `DONE`: off the wheel for good, fired or deregistered. Stored only
+//!   under the home lock.
+//!
+//! # Hand-over
+//!
+//! A departing processor moves every node on its wheel onto its
+//! successor's (Linux `migrate_hrtimer_list`). Each batch takes the
+//! departing wheel's lock, then the successor's, and for each node: pops
+//! it off its list, files it under its own tick against the successor's
+//! clock (straight to `pending` when the successor has already passed it),
+//! and stores the successor's wheel lock as its home, before either lock
+//! is released. The node stays `REGISTERED` with its waker in place
+//! throughout, and is on no list only inside that critical section, where
+//! no other processor can reach it.
+//!
+//! - *A concurrent cancel* (a drop, or a re-poll past the deadline) reads
+//!   the home, takes that lock, and re-reads the home under it. If it read
+//!   the departing wheel, it waits there for the batch that holds it; once
+//!   it has the lock, a node that still names the departing wheel has not
+//!   moved and cannot move while it holds the lock, and one that names the
+//!   successor's has already been filed there, so it lets go and follows
+//!   the home. Either way it unlinks the node from the wheel it is really
+//!   on (the home invariant below).
+//! - *A concurrent fire* cannot touch a node in transit. The departing
+//!   processor is the only firer of its own base and is running the
+//!   hand-over; the successor's owner fires a moved node only once it is on
+//!   its lists, under its lock, after the batch that filed it. A poll on
+//!   another processor that registers a new waker while the node moves is
+//!   unaffected: the waker lives in the node, and the `AtomicWaker`
+//!   protocol does not depend on which wheel holds it.
+//! - *No registration reaches the departing base*: registration is on the
+//!   polling processor's base, and the departing processor polls nothing
+//!   until it comes back. The successor's owner registers on its own wheel
+//!   under its lock, between batches.
+//!
+//! Each batch lowers the successor's `next_sleep_deadline` under its lock.
+//! The departing base's is set to `u64::MAX` under its own once its wheel
+//! is empty, and after the last batch the successor is reached through the
+//! idle handshake, below.
+//!
+//! # Invariants the `unsafe` code rests on
+//!
+//! - *Lifetime*: a node is linked in a wheel list only while it is
+//!   `REGISTERED`, and its sleep's `Drop` unlinks it under its home lock
+//!   before the memory can be reused. That is the `Pin` drop guarantee,
+//!   which Tokio's `TimerEntry` rests on: `Sleep` is `!Unpin`, so once
+//!   polled it is never moved, and its memory is not reused until it is
+//!   dropped.
+//! - *Lock*: a node's links, filed tick and list are read and written only
+//!   under its home lock, and its state changes to `REGISTERED`, `FIRING`
+//!   and `DONE` only under it.
+//! - *Home*: a node's home changes only while the lock it names is held,
+//!   and the new home's lock with it. So whoever holds the lock a node
+//!   names as its home holds the lock of the wheel the node is on.
+//! - *Last access*: whoever moves a node to `DONE` does it with a
+//!   `Release` store, under the home lock, as its last access to the node.
+//! - *Bases outlive nodes*: a base is never freed once built, so a home a
+//!   node names is always a live lock.
+//!
+//! # Memory ordering
+//!
+//! - **Registrant.** Writes the links, tick, list and home, then stores
+//!   `REGISTERED` with `Release`, under the lock. A later holder sees them
+//!   through the lock's acquire, and a lock-free reader that loads
+//!   `REGISTERED` with `Acquire` sees the home.
+//! - **Hand-over.** Under both locks: unlinks the node, files it on the
+//!   successor's wheel, stores its new home. A canceller that read the old
+//!   home and then takes the old lock is ordered after the batch by that
+//!   lock, so its re-read sees the new home.
+//! - **Firer.** Under the lock: unlinks the node (writing it and its
+//!   neighbours), stores `FIRING`, takes the waker, stores `DONE` with
+//!   `Release`. It never touches the node again. `FIRING` comes before
+//!   the take because `AtomicWaker` requires the state a waiter tests to
+//!   change before its waker is taken: a poll that registers a new waker
+//!   between a take and a `DONE` store would otherwise test `REGISTERED`,
+//!   return `Pending`, and never be woken.
+//! - **Deregisterer.** Under the home lock: unlinks the node and stores
+//!   `DONE` with `Release`.
+//! - **Dropper.** An `Acquire` load that reads `DONE` synchronizes with
+//!   that `Release`, so every access the remover made happens before the
+//!   memory is freed. Reading `IDLE` means no other processor ever had the
+//!   address. Reading `REGISTERED` or `FIRING` goes through the home lock,
+//!   which orders the dropper after every earlier holder; under it the
+//!   node is `REGISTERED` (unlink it) or `DONE` (a firer won; nothing to
+//!   do), because `FIRING` exists only while a firer holds the lock.
+//! - **Poll racing a fire.** `AtomicWaker`'s protocol covers it: either
+//!   the firer takes the new waker, or the poller's `register` sees the
+//!   firer's take and wakes the new waker itself, and either way its
+//!   re-test reads `FIRING` or `DONE` and returns `Ready`.
+//! - **The deadline handshake with a parked owner.** A foreign publish —
+//!   a hand-over lowering its successor's deadline — is a `SeqCst` store
+//!   to the successor's `next_sleep_deadline` followed by a `SeqCst` read
+//!   of the successor's idle state; they pair with the owner's `SeqCst`
+//!   `Parked` store and its [`Timer::is_due`] and
+//!   [`Timer::arm_published_deadline`] loads: either the publisher sees
+//!   `Parked` and wakes the owner, or the owner's load comes after the
+//!   lowering and arms it before it parks. Each store is made under the
+//!   lock, after a `min` test against the value there, so it needs no
+//!   compare-and-swap: every writer of `next_sleep_deadline` holds its
+//!   base's lock.
+//! - **`next_sleep_deadline` is never later than the wheel's earliest
+//!   expiration.** A registration or a hand-over batch lowers it under the
+//!   lock; [`Timer::fire_expired`] stores the wheel's next expiration
+//!   under the lock; a cancel never raises it, and a stale low value costs
+//!   one slow path. So the lock-free fast path never skips a due sleep.
+//!
+//! # Cache lines
+//!
+//! `TimerShared`, one per processor, in its slot of [`TimerBases`]:
+//!
+//! | Block | Contents | Written by |
+//! | --- | --- | --- |
+//! | read-only | `processor`, `tick_ticks`, `idle_interval_ticks`, `wheel_quantum_ticks` | nobody after the base is built |
+//! | `CachePadded<TimerDeadlines>` | `next_sleep_deadline`, `armed_deadline` | `armed_deadline`: the owner only, from task context with interrupts masked and from its timer interrupt. `next_sleep_deadline`: holders of this base's wheel lock — the owner registering and firing, a departing processor handing its sleeps over to it, and the owner handing its own away. Both read by the owner on its run and park paths and by its interrupt |
+//! | `CachePadded<WheelLock>` | the lock word, `elapsed`, `pending`, the six occupancy words; the slot heads follow | every lock holder: the owner's registrations and fires, any canceller, a hand-over onto or off this base |
+//! | each [`SleepNode`] | in its holder's memory | links, tick, list and state: home-lock holders. `home`: its registrant, and a hand-over holding both locks. `waker`: the poller and the firer |
 
 use alloc::boxed::Box;
-use alloc::vec::Vec;
-use core::cell::UnsafeCell;
 use core::future::Future;
-use core::mem::MaybeUninit;
-use core::ops::Deref;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering as AtomicOrdering, fence};
-use core::task::{Context, Poll};
+use core::ptr::NonNull;
+use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use core::task::{Context, Poll, Waker};
 use core::time::Duration;
 
-use atomic_waker::AtomicWaker;
-use concurrent_queue::{ConcurrentQueue, PushError};
 use crossbeam_utils::CachePadded;
 use helios_hal::cpu::{Cpu, Instant, ProcessorId, TimerInterrupt, current_processor};
 use helios_hal::critical_section::with_local_interrupts_masked;
-use objectpool::Pool;
-use spin::Once;
+use spin::{Mutex, Once};
 
 use super::executor::ExecutorGroup;
+use super::wheel::{NodeState, SleepNode, TimingWheel, WheelLock};
 
 /// How long a guest holds its processor before it is preempted and
 /// yields to the executor.
@@ -65,191 +245,115 @@ const SCHEDULER_TICK: Duration = Duration::from_millis(10);
 /// The longest a parked processor with no sleep due sooner goes without
 /// a timer interrupt.
 const IDLE_INTERRUPT_INTERVAL: Duration = Duration::from_millis(100);
-const TIMER_WHEEL_QUANTUM: Duration = Duration::from_micros(50);
-const TIMER_WHEEL_LEVELS: usize = 4;
-const TIMER_WHEEL_SLOTS: usize = 256;
-const TIMER_INBOX_CAPACITY: usize = TIMER_WHEEL_SLOTS * 16;
-const TIMER_READY_POOL_SLOTS: usize = 8;
-const TIMER_READY_RETAINED_ENTRIES: usize = TIMER_WHEEL_SLOTS;
-/// Slots reserved for the per-base SleepState pool. A slot is held
-/// exactly as long as its `Sleep` future is alive — the wheel holds
-/// generation-validated weak handles and never pins a slot — so this
-/// bounds the number of concurrently live pending sleeps registered on
-/// one base, matching the `TIMER_INBOX_CAPACITY` capacity contract.
-const SLEEP_STATE_POOL_SLOTS: usize = TIMER_INBOX_CAPACITY;
+/// The wheel's resolution. A sleep is due at the first quantum boundary
+/// at or after its deadline, and that boundary is the deadline the timer
+/// publishes and arms.
+pub(super) const TIMER_WHEEL_QUANTUM: Duration = Duration::from_micros(50);
+/// How many wakers a fire collects before it releases the wheel lock to
+/// wake them: Tokio's `WakeList` capacity, `NUM_WAKERS`
+/// (`util/wake_list.rs`).
+const TIMER_WAKE_BATCH: usize = 32;
+/// How many nodes one batch of a hand-over moves while it holds both
+/// wheel locks: a fire's wake batch, so the successor's owner and any
+/// canceller wait about as long for a wheel lock during a hand-over as
+/// during one of the owner's own fire batches.
+const TIMER_HAND_OVER_BATCH: usize = TIMER_WAKE_BATCH;
 
-/// A handle on the kernel's timers.
-///
-/// The handle names no processor. A sleep is registered on the timer
-/// base of the processor that first polls it, the per-processor timer
-/// base model Linux's hrtimers use: the processor that registers a
-/// sleep is the one whose hardware deadline it lowers, so registration
-/// never has to reach another processor's comparator, and a handle
-/// cloned into a long-lived service does not tie every sleep of that
-/// service to whichever processor built the handle — or to a processor
-/// that has since gone offline. The base-driving operations (firing,
-/// the timer interrupt, the idle loop's arming) act on the base of the
-/// processor executing them.
+/// A handle on the kernel's timers. It names no processor: see the module
+/// docs for which base each operation acts on.
 #[derive(Clone)]
 pub struct Timer<CpuImpl: Cpu + Clone> {
     cpu: CpuImpl,
     group: &'static ExecutorGroup,
 }
 
+/// A future that completes at a deadline.
+///
+/// `!Unpin`: once polled, the node it carries may be linked in a timer
+/// base's wheel, and its `Drop` unlinks it.
 pub struct Sleep<CpuImpl: Cpu + Clone> {
     timer: Timer<CpuImpl>,
     deadline: Option<Instant>,
-    state: Option<SleepRef>,
-}
-
-struct TimerState {
-    wheel: TimingWheel,
+    node: SleepNode,
 }
 
 /// Every processor's timer base, one per possible processor.
 ///
 /// A base is built the first time its processor comes online and kept
 /// for the life of the kernel. A processor going offline hands its
-/// pending entries to another base ([`Timer::migrate_base`]) but keeps
-/// the base, because the sleeps behind those entries still hold their
-/// state slots in its pool, and it finds the base again when it comes
-/// back.
+/// pending sleeps to another base ([`Timer::migrate_base`]) but keeps
+/// its own: a sleep's node names a base's wheel lock as its home, so no
+/// base may ever be freed, and the processor finds its base again when it
+/// comes back.
 pub(crate) struct TimerBases {
     bases: Box<[CachePadded<Once<TimerShared>>]>,
 }
 
-/// One processor's timer base.
-///
-/// # Concurrency contract
-///
-/// A base belongs to one processor, its owner. A sleep is registered
-/// on the owner's base by the owner itself, because registration picks
-/// the base of the processor polling the sleep; the only pushes that
-/// arrive from another processor are a departing processor's entries,
-/// handed over once on its way offline.
-///
-/// - `state`, the timing wheel, is the owner's event loop's alone.
-///   Interrupt handlers never touch it. A departing processor drains
-///   its own wheel as its last timer act.
-/// - `inbox` is a lock-free MPSC queue the owner pushes its own new
-///   sleeps through and drains into the wheel; `adopted` is the
-///   unbounded MPSC queue a departing processor pushes its whole wheel
-///   onto, which the owner drains the same way. It is unbounded because
-///   a wheel arrives at once and the departing processor cannot wait
-///   for the owner to make room.
-/// - `next_sleep_deadline` is the earliest pending sleep. A departing
-///   processor lowers it with a compare-and-swap after pushing to
-///   `adopted`; the owner lowers it for its own sleeps and stores the
-///   wheel's earliest after draining.
-/// - `armed_deadline` is the deadline programmed into the owner's
-///   hardware. Only the owner writes it, from task context with local
-///   interrupts masked and from its timer interrupt, so the record and
-///   the comparator never disagree. Task context only ever moves it
-///   earlier; the timer interrupt, which runs once it has passed, picks
-///   the next one: the earlier of the next sleep and one
-///   [`SCHEDULER_TICK`] on, or one [`IDLE_INTERRUPT_INTERVAL`] on when
-///   the owner is parked. An executor pass about to run work pulls it
-///   to within a tick ([`Timer::arm_scheduler_tick`]), so a processor
-///   running a guest takes an interrupt at least once a tick and an
-///   idle one keeps its long deadline, with no arm per guest poll. A
-///   processor that is not the owner never programs a deadline:
-///   [`Cpu::set_deadline`] reaches the executing processor's
-///   comparator, not the owner's. It wakes the owner instead, when the
-///   owner is parked, and the owner programs the new deadline before it
-///   parks again.
+/// One processor's timer base. The module docs give its concurrency
+/// contract and which processor writes each block.
 struct TimerShared {
     processor: ProcessorId,
-    state: UnsafeCell<TimerState>,
-    inbox: ConcurrentQueue<TimerEntry>,
-    adopted: ConcurrentQueue<TimerEntry>,
-    next_sleep_deadline: AtomicU64,
-    armed_deadline: AtomicU64,
     tick_ticks: u64,
     idle_interval_ticks: u64,
     wheel_quantum_ticks: u64,
-    ready_pool: Pool<Vec<TimerEntry>>,
-    sleep_pool: SleepStatePool,
+    deadlines: CachePadded<TimerDeadlines>,
+    wheel: CachePadded<WheelLock>,
 }
 
-struct TimerEntry {
-    deadline: Instant,
-    deadline_tick: u64,
-    state: SleepHandle,
+struct TimerDeadlines {
+    /// The earliest instant the wheel has work, in timer ticks: a quantum
+    /// boundary, never later than the earliest registered sleep's.
+    /// `u64::MAX` when nothing is registered.
+    next_sleep_deadline: AtomicU64,
+    /// The deadline programmed into the owner's hardware. Only the owner
+    /// writes it, from task context with local interrupts masked and from
+    /// its timer interrupt, so the record and the comparator never
+    /// disagree. Task context only ever moves it earlier; the timer
+    /// interrupt, which runs once it has passed, picks the next one: the
+    /// earlier of the next sleep and one [`SCHEDULER_TICK`] on, or one
+    /// [`IDLE_INTERRUPT_INTERVAL`] on when the owner is parked. An
+    /// executor pass about to run work pulls it to within a tick
+    /// ([`Timer::arm_scheduler_tick`]), so a processor running a guest
+    /// takes an interrupt at least once a tick and an idle one keeps its
+    /// long deadline, with no arm per guest poll. A processor that is not
+    /// the owner never programs a deadline: [`Cpu::set_deadline`] reaches
+    /// the executing processor's comparator, not the owner's. It wakes the
+    /// owner instead, when the owner is parked, and the owner programs the
+    /// new deadline before it parks again.
+    armed_deadline: AtomicU64,
 }
 
-struct SleepState {
-    queued: AtomicBool,
-    fired: AtomicBool,
-    waker: AtomicWaker,
+/// The wakers one fire collects under the lock, woken after it is
+/// released. A stack array: firing allocates nothing.
+struct WakeBatch {
+    wakers: [Option<Waker>; TIMER_WAKE_BATCH],
+    len: usize,
 }
 
-/// Bounded slab pool that hands out reference-counted handles to a
-/// fixed array of `SleepState` cells. Slots are pinned only by live
-/// `Sleep` futures, so exhaustion means more concurrently pending
-/// sleeps than the kernel capacity contract allows and fails
-/// immediately instead of reintroducing per-Sleep heap allocation.
-struct SleepStatePool {
-    slots: Box<[SleepStateSlot]>,
-    free_indices: ConcurrentQueue<u32>,
-}
+impl WakeBatch {
+    const fn new() -> Self {
+        Self {
+            wakers: [const { None }; TIMER_WAKE_BATCH],
+            len: 0,
+        }
+    }
 
-#[repr(C)]
-struct SleepStateSlot {
-    /// Live ref count when occupied. Zero means the slot is free
-    /// and the cell is uninitialised; readers must consult the
-    /// freelist before touching the cell.
-    refcount: AtomicU32,
-    /// Bumped on every final release, before the slot returns to the
-    /// freelist. Weak handles snapshot it and validate against it so a
-    /// recycled slot can never satisfy a stale wheel entry.
-    generation: AtomicU64,
-    /// Slot storage. Initialised between `acquire` and the final
-    /// `Drop` of every `SleepRef` referencing this slot.
-    cell: UnsafeCell<MaybeUninit<SleepState>>,
-}
+    fn push(&mut self, waker: Waker) {
+        self.wakers[self.len] = Some(waker);
+        self.len += 1;
+    }
 
-// SAFETY: the pool synchronises slot ownership through `refcount`
-// (Acquire/Release for the cell publication) and through the
-// `ConcurrentQueue<u32>` freelist (which provides its own
-// happens-before for the slot index itself). Writes to `cell` only
-// happen with exclusive ownership: either the acquiring thread
-// before publishing the slot, or the releasing thread after
-// observing refcount==0.
-unsafe impl Send for SleepStateSlot {}
-unsafe impl Sync for SleepStateSlot {}
+    fn is_full(&self) -> bool {
+        self.len == TIMER_WAKE_BATCH
+    }
 
-/// Pool-backed strong handle on the base the sleep was registered on.
-/// Bases live as long as the kernel's executor group, so the handle
-/// borrows its base instead of counting a reference to it; the slot is
-/// reclaimed once the last handle drops.
-struct SleepRef {
-    base: &'static TimerShared,
-    idx: u32,
-}
-
-/// Weak, generation-validated handle held by timer inbox and wheel
-/// entries. It pins nothing: the slot is reclaimed the moment the
-/// owning `Sleep` drops, and a stale handle just fails validation.
-/// It names the pool its slot is in, because an entry handed to another
-/// base on a processor's way offline sits in that base's wheel while
-/// its slot stays in the pool it was registered on.
-#[derive(Clone, Copy)]
-struct SleepHandle {
-    pool: &'static SleepStatePool,
-    idx: u32,
-    generation: u64,
-}
-
-struct TimingWheel {
-    levels: [WheelLevel; TIMER_WHEEL_LEVELS],
-    current_tick: u64,
-    next_deadline: Option<Instant>,
-    next_deadline_tick: Option<u64>,
-    next_deadline_dirty: bool,
-}
-
-struct WheelLevel {
-    buckets: Box<[Vec<TimerEntry>]>,
+    /// Wakes every collected waker. Called with the wheel lock released.
+    fn wake_all(&mut self) {
+        for waker in self.wakers[..self.len].iter_mut().filter_map(Option::take) {
+            waker.wake();
+        }
+        self.len = 0;
+    }
 }
 
 impl TimerBases {
@@ -299,29 +403,32 @@ impl TimerShared {
         );
         Self {
             processor,
-            state: UnsafeCell::new(TimerState {
-                wheel: TimingWheel::new(wheel_tick_floor(cpu.now(), wheel_quantum_ticks)),
-            }),
-            inbox: ConcurrentQueue::bounded(TIMER_INBOX_CAPACITY),
-            adopted: ConcurrentQueue::unbounded(),
-            next_sleep_deadline: AtomicU64::new(u64::MAX),
-            armed_deadline: AtomicU64::new(u64::MAX),
             tick_ticks,
             idle_interval_ticks,
             wheel_quantum_ticks,
-            ready_pool: Pool::bounded(TIMER_READY_POOL_SLOTS, Vec::new, reset_timer_ready_entries),
-            sleep_pool: SleepStatePool::new(SLEEP_STATE_POOL_SLOTS),
+            deadlines: CachePadded::new(TimerDeadlines {
+                next_sleep_deadline: AtomicU64::new(u64::MAX),
+                armed_deadline: AtomicU64::new(u64::MAX),
+            }),
+            wheel: CachePadded::new(Mutex::new(TimingWheel::new(wheel_tick_floor(
+                cpu.now(),
+                wheel_quantum_ticks,
+            )))),
         }
     }
 
-    /// Moves everything pushed onto this base since the last drain into
-    /// the wheel. Owner only.
-    fn drain_inbox(&self, wheel: &mut TimingWheel) {
-        for queue in [&self.inbox, &self.adopted] {
-            while let Ok(entry) = queue.pop() {
-                wheel.insert(entry);
-            }
+    /// Lowers the published sleep deadline to `due` if that is earlier,
+    /// and says whether it did. The caller holds this base's wheel lock:
+    /// every writer of `next_sleep_deadline` does, so a load and a store
+    /// under it are a `min`.
+    fn lower_next_sleep_deadline(&self, due: u64) -> bool {
+        let next = &self.deadlines.next_sleep_deadline;
+        let lowered = due < next.load(AtomicOrdering::Relaxed);
+        if lowered {
+            // `SeqCst`: the publisher half of the idle handshake.
+            next.store(due, AtomicOrdering::SeqCst);
         }
+        lowered
     }
 }
 
@@ -344,8 +451,9 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
     /// out. On a periodic platform this is what starts the interrupt.
     ///
     /// The base's wheel is empty either way — new, or emptied when the
-    /// processor went offline — so its clock is moved to now, rather
-    /// than left to walk every wheel tick the processor was away for.
+    /// processor went offline, and no other processor registers on it —
+    /// so its clock is moved to now, rather than left to walk every
+    /// quantum the processor was away for.
     pub(crate) fn bring_base_online(&self) {
         let processor = current_processor();
         let base = self
@@ -354,13 +462,13 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
             .slot(processor)
             .call_once(|| TimerShared::new(&self.cpu, processor));
         let now = self.cpu.now();
-        // SAFETY: this processor is the base's owner, the only one that
-        // touches its wheel.
-        let wheel = unsafe { &mut (*base.state.get()).wheel };
-        wheel.current_tick = wheel_tick_floor(now, base.wheel_quantum_ticks);
+        base.wheel
+            .lock()
+            .restart(wheel_tick_floor(now, base.wheel_quantum_ticks));
         let initial_deadline = now.saturating_add(base.tick_ticks);
         with_local_interrupts_masked(|| {
-            base.armed_deadline
+            base.deadlines
+                .armed_deadline
                 .store(initial_deadline.ticks(), AtomicOrdering::Relaxed);
             self.cpu.set_deadline(initial_deadline);
         });
@@ -373,11 +481,12 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
     /// Runs on the departing processor, after it has left the online
     /// set and run its last task, so nothing registers on its base any
     /// more: registration is always on the polling processor's base, and
-    /// this processor polls nothing until it comes back. The entries go
-    /// onto `successor`'s `adopted` queue and the earliest of them is
-    /// published there the way any lowered deadline is, so a parked
-    /// successor is woken to arm it. The sleeps' state slots stay in
-    /// this base's pool, which every entry names.
+    /// this processor polls nothing until it comes back. The nodes move in
+    /// batches under both wheel locks, which is what lets a canceller on
+    /// any processor and the successor's own fires run alongside; the
+    /// module docs' *Hand-over* gives the argument. The earliest of them is
+    /// published on the successor's base the way any lowered deadline is,
+    /// so a parked successor is woken to arm it.
     pub(crate) fn migrate_base(&self, successor: ProcessorId) {
         let processor = current_processor();
         assert_ne!(
@@ -389,24 +498,30 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
         let bases = self.group.timer_bases();
         let base = bases.get(processor);
         let target = bases.get(successor);
-        // SAFETY: this processor is the base's owner, the only one that
-        // touches its wheel.
-        let wheel = unsafe { &mut (*base.state.get()).wheel };
-        base.drain_inbox(wheel);
-        let mut earliest = u64::MAX;
-        wheel.drain_all(|entry| {
-            earliest = earliest.min(entry.deadline.ticks());
-            target.adopted.push(entry).unwrap_or_else(|_| {
-                panic!("timer base {} closed its adopted queue", successor.id())
-            });
-        });
-        base.next_sleep_deadline
-            .store(u64::MAX, AtomicOrdering::SeqCst);
-        if earliest != u64::MAX {
-            // The pushes before the lowering, as in `enqueue`; the
-            // owner's side of this fence is in `fire_expired`.
-            fence(AtomicOrdering::SeqCst);
-            self.publish_deadline(target, Instant::new(earliest));
+        let quantum = target.wheel_quantum_ticks;
+        let mut lowered: Option<u64> = None;
+        loop {
+            let mut from = base.wheel.lock();
+            let mut to = target.wheel.lock();
+            // SAFETY: the two guards are of two bases' locks (the assert
+            // above), both held here, and `to` came from `target.wheel`.
+            let moved = unsafe { from.move_to(&mut to, &target.wheel, TIMER_HAND_OVER_BATCH) };
+            if let Some(tick) = moved.earliest_tick {
+                let due = tick.saturating_mul(quantum);
+                if target.lower_next_sleep_deadline(due) {
+                    lowered = Some(lowered.map_or(due, |earlier| earlier.min(due)));
+                }
+            }
+            drop(to);
+            if moved.emptied {
+                base.deadlines
+                    .next_sleep_deadline
+                    .store(u64::MAX, AtomicOrdering::SeqCst);
+                break;
+            }
+        }
+        if let Some(deadline) = lowered {
+            self.publish_lowered_deadline(target, deadline);
         }
     }
 
@@ -424,10 +539,14 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
     /// polling without parking.
     ///
     /// `SeqCst`: after the owner has published `Parked`, this is the
-    /// parker half of the wake handshake [`Self::publish_deadline`]
+    /// parker half of the wake handshake [`Self::publish_lowered_deadline`]
     /// describes.
     pub(crate) fn is_due(&self, now: Instant) -> bool {
-        self.base().next_sleep_deadline.load(AtomicOrdering::SeqCst) <= now.ticks()
+        self.base()
+            .deadlines
+            .next_sleep_deadline
+            .load(AtomicOrdering::SeqCst)
+            <= now.ticks()
     }
 
     /// Programs the published sleep deadline into the owner's hardware
@@ -439,7 +558,10 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
     pub(crate) fn arm_published_deadline(&self) {
         let base = self.base();
         // `SeqCst`: the parker half of the wake handshake.
-        let published = base.next_sleep_deadline.load(AtomicOrdering::SeqCst);
+        let published = base
+            .deadlines
+            .next_sleep_deadline
+            .load(AtomicOrdering::SeqCst);
         self.arm_earlier(base, published);
     }
 
@@ -460,18 +582,10 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
     }
 
     pub fn sleep_until(&self, deadline: Instant) -> Sleep<CpuImpl> {
-        if deadline <= self.now() {
-            return Sleep {
-                timer: self.clone(),
-                deadline: None,
-                state: None,
-            };
-        }
-
         Sleep {
             timer: self.clone(),
-            deadline: Some(deadline),
-            state: None,
+            deadline: (deadline > self.now()).then_some(deadline),
+            node: SleepNode::new(),
         }
     }
 
@@ -480,44 +594,55 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
         self.sleep_until(self.now().saturating_add(ticks))
     }
 
-    /// Fires every sleep due on the executing processor's base.
+    /// Fires every sleep due by now on the executing processor's base and
+    /// returns how many fired.
+    ///
+    /// When nothing is due this is one clock read and one load, and takes
+    /// no lock (Go's `timers.check` early-out on `wakeTime`).
     pub fn fire_expired(&self) -> usize {
         let base = self.base();
         let now = self.now();
-        let mut ready = base.ready_pool.get_owned();
-        // SAFETY: the timing wheel is owned by the kernel event loop on
-        // this processor. Sleeps reach it only through the lock-free
-        // inbox and adopted queues, and interrupt handlers only disarm
-        // the hardware timer.
-        let wheel = unsafe { &mut (*base.state.get()).wheel };
-        let now_tick = wheel_tick_floor(now, base.wheel_quantum_ticks);
+        let deadlines = &base.deadlines;
+        if deadlines.next_sleep_deadline.load(AtomicOrdering::Acquire) > now.ticks() {
+            return 0;
+        }
 
-        loop {
-            base.drain_inbox(wheel);
-            wheel.drain_expired(now_tick, &mut ready);
-            let next_deadline = wheel.next_live_deadline();
-            base.next_sleep_deadline.store(
-                next_deadline.map_or(u64::MAX, |deadline| deadline.ticks()),
-                AtomicOrdering::SeqCst,
-            );
-            // An entry pushed after the drain above may have lowered the
-            // published deadline before the store overwrote it. Its push
-            // fences between the push and the lowering, and this fence
-            // sits between the store and the emptiness test, so either
-            // that lowering read this store and stands, or this test
-            // sees the push and the loop drains it.
-            fence(AtomicOrdering::SeqCst);
-            if base.inbox.is_empty() && base.adopted.is_empty() {
-                break;
+        let quantum = base.wheel_quantum_ticks;
+        let now_tick = wheel_tick_floor(now, quantum);
+        let mut batch = WakeBatch::new();
+        let mut fired = 0;
+        let mut wheel = base.wheel.lock();
+        while let Some(waker) = wheel.fire_next(now_tick) {
+            fired += 1;
+            let Some(waker) = waker else {
+                continue;
+            };
+            batch.push(waker);
+            if batch.is_full() {
+                // Wakers run outside the lock: a waker may reach this
+                // timer, and a long fire must not hold off registrants.
+                drop(wheel);
+                batch.wake_all();
+                wheel = base.wheel.lock();
             }
         }
+        let next = wheel
+            .next_expiration_tick()
+            .map_or(u64::MAX, |tick| tick.saturating_mul(quantum));
+        deadlines
+            .next_sleep_deadline
+            .store(next, AtomicOrdering::SeqCst);
+        drop(wheel);
+        batch.wake_all();
+        self.arm_earlier(base, next);
+        fired
+    }
 
-        for entry in ready.iter() {
-            entry.state.fire();
-        }
-
-        self.arm_earlier(base, base.next_sleep_deadline.load(AtomicOrdering::Relaxed));
-        ready.len()
+    /// How many sleeps are registered on the executing processor's base.
+    /// It walks every list under the wheel lock, so it is for tests and
+    /// diagnosis, never a hot path.
+    pub fn registered_sleeps(&self) -> usize {
+        self.base().wheel.lock().registered()
     }
 
     /// The executing processor's timer interrupt: arms the next one, at
@@ -536,7 +661,10 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
             base.tick_ticks
         };
         let periodic = now.ticks().saturating_add(interval);
-        let sleep = base.next_sleep_deadline.load(AtomicOrdering::Acquire);
+        let sleep = base
+            .deadlines
+            .next_sleep_deadline
+            .load(AtomicOrdering::Acquire);
         let deadline = if sleep > now.ticks() {
             periodic.min(sleep)
         } else {
@@ -546,36 +674,16 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
         0
     }
 
-    fn enqueue(&self, base: &TimerShared, deadline: Instant, state: SleepHandle) {
-        let entry = TimerEntry {
-            deadline,
-            deadline_tick: wheel_tick_ceil(deadline, base.wheel_quantum_ticks),
-            state,
-        };
-
-        match base.inbox.push(entry) {
-            Ok(()) => {
-                // The push before the lowering in `publish_deadline`; the
-                // owner's side of this fence is in `fire_expired`.
-                fence(AtomicOrdering::SeqCst);
-                self.publish_deadline(base, deadline);
-            }
-            Err(PushError::Full(_)) => {
-                panic!("timer inbox capacity {TIMER_INBOX_CAPACITY} exhausted")
-            }
-            Err(PushError::Closed(_)) => panic!("timer inbox was closed unexpectedly"),
-        }
-    }
-
-    /// Lowers `base`'s published sleep deadline to `deadline` and makes
-    /// sure its owner's hardware will interrupt by then.
+    /// Makes sure `base`'s owner's hardware will interrupt by `deadline`,
+    /// which the caller has just stored as the lower `next_sleep_deadline`
+    /// under `base`'s wheel lock.
     ///
-    /// On the owner that is a reprogramming of its own comparator. On
-    /// any other processor — a departing one handing its sleeps over —
-    /// it is not, because [`Cpu::set_deadline`] would program the
-    /// executing processor's comparator, replacing that processor's own
-    /// deadline with this one. The owner is reached through the
-    /// executor's idle handshake instead:
+    /// On the owner — a registration — that is a reprogramming of its own
+    /// comparator. On any other processor — a departing one handing its
+    /// sleeps over — it is not, because [`Cpu::set_deadline`] would
+    /// program the executing processor's comparator, replacing that
+    /// processor's own deadline with this one. The owner is reached
+    /// through the executor's idle handshake instead:
     ///
     /// - this side lowers `next_sleep_deadline`, then reads the owner's
     ///   idle state, and wakes it only if it has published `Parked`;
@@ -589,24 +697,7 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
     /// it on its next executor pass or before its next park. A periodic
     /// timer interrupt needs neither: no deadline is programmed, and the
     /// owner's next tick finds the sleep.
-    fn publish_deadline(&self, base: &TimerShared, deadline: Instant) {
-        let deadline = deadline.ticks();
-        let mut published = base.next_sleep_deadline.load(AtomicOrdering::SeqCst);
-        loop {
-            if deadline >= published {
-                return;
-            }
-            match base.next_sleep_deadline.compare_exchange_weak(
-                published,
-                deadline,
-                AtomicOrdering::SeqCst,
-                AtomicOrdering::SeqCst,
-            ) {
-                Ok(_) => break,
-                Err(current) => published = current,
-            }
-        }
-
+    fn publish_lowered_deadline(&self, base: &TimerShared, deadline: u64) {
         let owner = base.processor;
         if current_processor() == owner {
             self.arm_earlier(base, deadline);
@@ -627,15 +718,16 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
     /// comparator on every pass, and would undo the tick a running
     /// guest needs. `u64::MAX`, no sleep pending, is never earlier.
     fn arm_earlier(&self, base: &TimerShared, deadline: u64) {
+        let armed = &base.deadlines.armed_deadline;
         if CpuImpl::TIMER_INTERRUPT == TimerInterrupt::Periodic
-            || deadline >= base.armed_deadline.load(AtomicOrdering::Relaxed)
+            || deadline >= armed.load(AtomicOrdering::Relaxed)
         {
             return;
         }
         // Re-checked with interrupts masked: the owner's timer interrupt
         // may have re-armed between the test above and the mask.
         with_local_interrupts_masked(|| {
-            if deadline < base.armed_deadline.load(AtomicOrdering::Relaxed) {
+            if deadline < armed.load(AtomicOrdering::Relaxed) {
                 self.arm_deadline(base, Instant::new(deadline));
             }
         });
@@ -662,6 +754,7 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
         let deadline_ticks = deadline.ticks();
         with_local_interrupts_masked(|| {
             let previous = base
+                .deadlines
                 .armed_deadline
                 .swap(deadline_ticks, AtomicOrdering::Relaxed);
             if previous != deadline_ticks {
@@ -671,398 +764,92 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
     }
 }
 
+impl<CpuImpl: Cpu + Clone> Sleep<CpuImpl> {
+    /// Links this sleep's node into the executing processor's wheel and
+    /// lowers that base's published deadline if this sleep is the
+    /// earliest.
+    ///
+    /// The node is `IDLE` and its waker already registered, so a fire that
+    /// follows the unlock finds it.
+    fn register(self: Pin<&Self>, deadline: Instant) {
+        let base = self.timer.base();
+        let quantum = base.wheel_quantum_ticks;
+        let deadline_tick = wheel_tick_ceil(deadline, quantum);
+        // The instant the wheel counts the sleep due: the quantum boundary
+        // at or after its deadline.
+        let due = deadline_tick.saturating_mul(quantum);
+        let lowered = {
+            let mut wheel = base.wheel.lock();
+            // SAFETY: `wheel` is `base.wheel`'s guard. The node is pinned
+            // with this sleep (`self` is `Pin<&Self>` and `Sleep` is
+            // `!Unpin`) and `IDLE`, and `Sleep::drop` deregisters it under
+            // its home lock before its memory can be reused: the lifetime
+            // invariant.
+            unsafe { wheel.register(&base.wheel, NonNull::from(&self.node), deadline_tick) };
+            base.lower_next_sleep_deadline(due)
+        };
+        if lowered {
+            self.timer.publish_lowered_deadline(base, due);
+        }
+    }
+
+    /// Takes this sleep's node off whichever wheel it is on, unless a
+    /// firer already has, and leaves it `DONE`.
+    fn deregister(&self) {
+        // SAFETY: the caller has read a state other than `IDLE`, so the
+        // node has been registered, and it is alive for as long as `self`
+        // is: the lifetime invariant.
+        unsafe { SleepNode::deregister(NonNull::from(&self.node)) };
+    }
+}
+
 impl<CpuImpl: Cpu + Clone> Future for Sleep<CpuImpl> {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
+        // Every field is read through a shared reference; the node's own
+        // cells and atomics carry its changes, so nothing is moved.
+        let this = self.into_ref();
         let Some(deadline) = this.deadline else {
             return Poll::Ready(());
         };
-        if deadline <= this.timer.now() {
-            this.deadline = None;
-            if let Some(state) = this.state.as_ref() {
-                state.fire();
-            }
-            return Poll::Ready(());
-        }
-
-        if this.state.is_none() {
-            this.state = Some(SleepRef::new(this.timer.base()));
-        }
-        let state = this
-            .state
-            .as_ref()
-            .expect("sleep state must exist after first pending poll");
-
-        if state.fired.load(AtomicOrdering::Acquire) {
-            return Poll::Ready(());
-        }
-
-        state.waker.register(cx.waker());
-
-        if !state.queued.swap(true, AtomicOrdering::AcqRel) {
-            this.timer.enqueue(state.base, deadline, state.downgrade());
-        }
-
-        if state.fired.load(AtomicOrdering::Acquire) {
-            return Poll::Ready(());
-        }
-
-        Poll::Pending
-    }
-}
-
-impl<CpuImpl: Cpu + Clone> Unpin for Sleep<CpuImpl> {}
-
-impl SleepState {
-    fn new() -> Self {
-        Self {
-            queued: AtomicBool::new(false),
-            fired: AtomicBool::new(false),
-            waker: AtomicWaker::new(),
-        }
-    }
-
-    fn fire(&self) {
-        if self.fired.swap(true, AtomicOrdering::AcqRel) {
-            return;
-        }
-
-        self.waker.wake();
-    }
-}
-
-impl SleepStatePool {
-    fn new(capacity: usize) -> Self {
-        let slots: Box<[SleepStateSlot]> = (0..capacity)
-            .map(|_| SleepStateSlot {
-                refcount: AtomicU32::new(0),
-                generation: AtomicU64::new(0),
-                cell: UnsafeCell::new(MaybeUninit::uninit()),
-            })
-            .collect();
-        let free_indices = ConcurrentQueue::bounded(capacity);
-        for index in 0..capacity {
-            free_indices
-                .push(index as u32)
-                .unwrap_or_else(|_| panic!("sleep state pool freelist overrun"));
-        }
-        Self {
-            slots,
-            free_indices,
-        }
-    }
-
-    /// Acquires a fresh slot from the pool, initialising it with
-    /// `state` and a refcount of 1.
-    fn acquire(&self, state: SleepState) -> u32 {
-        let idx = self
-            .free_indices
-            .pop()
-            .unwrap_or_else(|_| panic!("sleep state pool capacity exhausted"));
-        let slot = &self.slots[idx as usize];
-        debug_assert_eq!(
-            slot.refcount.load(AtomicOrdering::Relaxed),
-            0,
-            "sleep slot popped from freelist must be free"
-        );
-        // SAFETY: the freelist had exclusive ownership of `idx` until
-        // the pop above; nothing else can observe `cell` until we
-        // publish the refcount below.
-        unsafe {
-            (*slot.cell.get()).write(state);
-        }
-        // Release ordering pairs with the Acquire load on `slot()`
-        // so cell initialisation happens-before any clone reads it.
-        slot.refcount.store(1, AtomicOrdering::Release);
-        idx
-    }
-
-    fn slot(&self, idx: u32) -> &SleepStateSlot {
-        &self.slots[idx as usize]
-    }
-
-    /// Drops one reference to `idx`, tearing down and recycling the
-    /// slot when it was the last.
-    fn release(&self, idx: u32) {
-        let slot = self.slot(idx);
-        // AcqRel: pair Acquire on the last-drop branch with all
-        // Release stores on prior clones so we observe the most
-        // recent state writes before tearing down the cell.
-        let prev = slot.refcount.fetch_sub(1, AtomicOrdering::AcqRel);
-        if prev != 1 {
-            return;
-        }
-        // Last reference. Synchronise with any concurrent pre-drop
-        // reads from other threads.
-        fence(AtomicOrdering::Acquire);
-        // SAFETY: we are the last observer of the slot; the refcount
-        // is now zero, no other thread can touch the cell until
-        // acquire republishes it. Drop-in-place releases the
-        // SleepState's `AtomicWaker` registration and any other
-        // resources before the slot is recycled.
-        unsafe {
-            (*slot.cell.get()).assume_init_drop();
-        }
-        // Invalidate outstanding weak handles before the index becomes
-        // acquirable again.
-        slot.generation.fetch_add(1, AtomicOrdering::Release);
-        self.free_indices
-            .push(idx)
-            .unwrap_or_else(|_| panic!("sleep state pool freelist overflow"));
-    }
-}
-
-impl SleepRef {
-    fn new(base: &'static TimerShared) -> Self {
-        let idx = base.sleep_pool.acquire(SleepState::new());
-        Self { base, idx }
-    }
-
-    fn state(&self) -> &SleepState {
-        let slot = self.base.sleep_pool.slot(self.idx);
-        debug_assert!(
-            slot.refcount.load(AtomicOrdering::Relaxed) > 0,
-            "sleep slot dereferenced after final drop"
-        );
-        // SAFETY: the live refcount above guarantees the cell
-        // is still initialised, and Release on the publishing
-        // store paired with our Acquire on clone provides the
-        // happens-before for the contents.
-        unsafe { (*slot.cell.get()).assume_init_ref() }
-    }
-
-    /// Weak handle for the timer inbox and wheel. Snapshotting the
-    /// generation under a live strong ref is race-free: it only moves
-    /// when the refcount reaches zero.
-    fn downgrade(&self) -> SleepHandle {
-        let pool = &self.base.sleep_pool;
-        SleepHandle {
-            pool,
-            idx: self.idx,
-            generation: pool.slot(self.idx).generation.load(AtomicOrdering::Relaxed),
-        }
-    }
-}
-
-impl SleepHandle {
-    /// True once the owning `Sleep` released the slot (or the slot has
-    /// been recycled for a newer sleeper). Only touches the slot
-    /// header, never the cell, so it is safe on stale handles.
-    fn is_dead(&self) -> bool {
-        let slot = self.pool.slot(self.idx);
-        slot.refcount.load(AtomicOrdering::Acquire) == 0
-            || slot.generation.load(AtomicOrdering::Acquire) != self.generation
-    }
-
-    /// Wakes the sleeper if this handle is still current. Takes a
-    /// temporary strong reference so the cell cannot be torn down
-    /// mid-wake by a concurrent `Sleep` drop on another processor.
-    fn fire(&self) {
-        let pool = self.pool;
-        let slot = pool.slot(self.idx);
-        let mut refcount = slot.refcount.load(AtomicOrdering::Acquire);
-        loop {
-            if refcount == 0 {
-                return;
-            }
-            match slot.refcount.compare_exchange_weak(
-                refcount,
-                refcount + 1,
-                AtomicOrdering::Acquire,
-                AtomicOrdering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(current) => refcount = current,
-            }
-        }
-        if slot.generation.load(AtomicOrdering::Acquire) == self.generation {
-            // SAFETY: the reference taken above keeps the cell
-            // initialised, and the matching generation proves it still
-            // holds this handle's sleeper.
-            unsafe { (*slot.cell.get()).assume_init_ref() }.fire();
-        }
-        pool.release(self.idx);
-    }
-}
-
-impl PartialEq for SleepHandle {
-    fn eq(&self, other: &Self) -> bool {
-        core::ptr::eq(self.pool, other.pool)
-            && self.idx == other.idx
-            && self.generation == other.generation
-    }
-}
-
-impl Eq for SleepHandle {}
-
-impl Deref for SleepRef {
-    type Target = SleepState;
-
-    fn deref(&self) -> &SleepState {
-        self.state()
-    }
-}
-
-impl Drop for SleepRef {
-    fn drop(&mut self) {
-        self.base.sleep_pool.release(self.idx);
-    }
-}
-
-impl TimingWheel {
-    fn new(current_tick: u64) -> Self {
-        Self {
-            levels: core::array::from_fn(|_| WheelLevel::new()),
-            current_tick,
-            next_deadline: None,
-            next_deadline_tick: None,
-            next_deadline_dirty: false,
-        }
-    }
-
-    fn insert(&mut self, entry: TimerEntry) {
-        // A sleep dropped between enqueue and drain arrives already dead;
-        // dropping it here keeps wheel buckets bounded by live sleeps.
-        if entry.is_dead() {
-            return;
-        }
-        self.observe_deadline(entry.deadline, entry.deadline_tick);
-        let target_tick = entry.deadline_tick.max(self.current_tick);
-        let delay = target_tick.saturating_sub(self.current_tick);
-        let level = wheel_level(delay);
-        let slot = wheel_slot(target_tick, level);
-        self.levels[level].buckets[slot].push(entry);
-    }
-
-    fn drain_expired(&mut self, now_tick: u64, ready: &mut Vec<TimerEntry>) {
-        while self.current_tick < now_tick {
-            self.current_tick = self.current_tick.saturating_add(1);
-            self.cascade();
-            self.drain_current_slot(ready);
-        }
-        self.drain_current_slot(ready);
-    }
-
-    /// Takes every live entry out of the wheel, whatever its deadline,
-    /// leaving the wheel empty with no deadline cached. Buckets keep
-    /// their capacity.
-    fn drain_all(&mut self, mut take: impl FnMut(TimerEntry)) {
-        for level in &mut self.levels {
-            for bucket in level.buckets.iter_mut() {
-                for entry in bucket.drain(..) {
-                    if !entry.is_dead() {
-                        take(entry);
-                    }
+        match this.node.state() {
+            NodeState::Firing | NodeState::Done => return Poll::Ready(()),
+            NodeState::Idle => {
+                if deadline <= this.timer.now() {
+                    return Poll::Ready(());
                 }
+                this.node.register_waker(cx.waker());
+                this.register(deadline);
+            }
+            NodeState::Registered => {
+                if deadline <= this.timer.now() {
+                    // Complete now rather than wait for the owner's next
+                    // fire, so a completed sleep holds nothing.
+                    this.deregister();
+                    return Poll::Ready(());
+                }
+                this.node.register_waker(cx.waker());
             }
         }
-        self.next_deadline = None;
-        self.next_deadline_tick = None;
-        self.next_deadline_dirty = false;
-    }
-
-    fn next_live_deadline(&mut self) -> Option<Instant> {
-        if self.next_deadline_dirty
-            || self
-                .next_deadline_tick
-                .is_some_and(|deadline_tick| deadline_tick <= self.current_tick)
-        {
-            self.rebuild_next_deadline();
-        }
-        self.next_deadline
-    }
-
-    fn observe_deadline(&mut self, deadline: Instant, deadline_tick: u64) {
-        if self
-            .next_deadline
-            .is_none_or(|current_deadline| deadline < current_deadline)
-        {
-            self.next_deadline = Some(deadline);
-            self.next_deadline_tick = Some(deadline_tick);
-        }
-    }
-
-    fn rebuild_next_deadline(&mut self) {
-        let next = self
-            .levels
-            .iter()
-            .flat_map(|level| level.buckets.iter())
-            .flat_map(|bucket| bucket.iter())
-            .filter(|entry| !entry.is_dead())
-            .min_by_key(|entry| entry.deadline);
-        self.next_deadline = next.map(|entry| entry.deadline);
-        self.next_deadline_tick = next.map(|entry| entry.deadline_tick);
-        self.next_deadline_dirty = false;
-    }
-
-    fn cascade(&mut self) {
-        for level in (1..TIMER_WHEEL_LEVELS).rev() {
-            let lower_mask = (1_u64 << (level * 8)) - 1;
-            if self.current_tick & lower_mask == 0 {
-                self.cascade_level(level);
-            }
-        }
-    }
-
-    fn cascade_level(&mut self, level: usize) {
-        let slot = wheel_slot(self.current_tick, level);
-        while let Some(entry) = self.levels[level].buckets[slot].pop() {
-            self.next_deadline_dirty = true;
-            if entry.is_dead() {
-                continue;
-            }
-            self.insert(entry);
-        }
-    }
-
-    fn drain_current_slot(&mut self, ready: &mut Vec<TimerEntry>) {
-        let slot = wheel_slot(self.current_tick, 0);
-        while let Some(entry) = self.levels[0].buckets[slot].pop() {
-            self.next_deadline_dirty = true;
-            if entry.is_dead() {
-                continue;
-            }
-            if entry.deadline_tick <= self.current_tick {
-                ready.push(entry);
-            } else {
-                self.insert(entry);
-            }
+        // Re-tested after the waker is registered: a fire that took the
+        // previous waker has stored `FIRING` first.
+        if this.node.state().is_complete() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
         }
     }
 }
 
-impl WheelLevel {
-    fn new() -> Self {
-        let buckets = (0..TIMER_WHEEL_SLOTS)
-            .map(|_| Vec::new())
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        Self { buckets }
+impl<CpuImpl: Cpu + Clone> Drop for Sleep<CpuImpl> {
+    fn drop(&mut self) {
+        match self.node.state() {
+            // Never linked, or a remover has finished with it: no lock.
+            NodeState::Idle | NodeState::Done => {}
+            NodeState::Registered | NodeState::Firing => self.deregister(),
+        }
     }
-}
-
-impl TimerEntry {
-    fn is_dead(&self) -> bool {
-        self.state.is_dead()
-    }
-}
-
-fn wheel_level(delay: u64) -> usize {
-    if delay < TIMER_WHEEL_SLOTS as u64 {
-        0
-    } else if delay < (TIMER_WHEEL_SLOTS as u64).pow(2) {
-        1
-    } else if delay < (TIMER_WHEEL_SLOTS as u64).pow(3) {
-        2
-    } else {
-        3
-    }
-}
-
-fn wheel_slot(tick: u64, level: usize) -> usize {
-    ((tick >> (level * 8)) & (TIMER_WHEEL_SLOTS as u64 - 1)) as usize
 }
 
 fn wheel_tick_floor(deadline: Instant, quantum_ticks: u64) -> u64 {
@@ -1076,34 +863,28 @@ fn wheel_tick_ceil(deadline: Instant, quantum_ticks: u64) -> u64 {
         / quantum_ticks
 }
 
-fn reset_timer_ready_entries(ready: &mut Vec<TimerEntry>) {
-    if ready.capacity() > TIMER_READY_RETAINED_ENTRIES {
-        *ready = Vec::with_capacity(TIMER_READY_RETAINED_ENTRIES);
-    } else {
-        ready.clear();
-    }
-}
-
-// SAFETY: `state` is touched only by the base's owner, per the
-// concurrency contract on `TimerShared`; everything else is atomic or a
-// lock-free queue.
-unsafe impl Send for TimerShared {}
-unsafe impl Sync for TimerShared {}
-
 #[cfg(test)]
 mod tests {
-    use alloc::vec::Vec;
     use core::future::Future as _;
-    use core::pin::Pin;
-    use core::task::Context;
+    use core::pin::{Pin, pin};
+    use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use core::task::{Context, Poll, Waker};
+    use core::time::Duration;
 
-    use futures::task::noop_waker_ref;
+    use std::boxed::Box;
+    use std::sync::{Arc, Barrier, mpsc};
+    use std::vec::Vec;
+
     use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase, TimerInterrupt};
+    use helios_hal::watchdog::ProgressCounter;
 
-    use super::{
-        TIMER_INBOX_CAPACITY, TIMER_READY_RETAINED_ENTRIES, TimerEntry, TimingWheel,
-        reset_timer_ready_entries, wheel_tick_ceil, wheel_tick_floor,
-    };
+    use super::{Sleep, wheel_tick_ceil, wheel_tick_floor};
+    use crate::exec::Executor;
+    use crate::test_processor_identity;
+    use crate::test_support::{CountingWaker, ManualClockCpu, PAST_THE_OLD_TIMER_CAPACITY};
+
+    /// A sleep handed from the processor that registered it to another.
+    type HandedSleep = Pin<Box<Sleep<ManualClockCpu>>>;
 
     #[derive(Clone)]
     struct TestCpu {
@@ -1182,26 +963,6 @@ mod tests {
         }
     }
 
-    fn test_timer() -> super::Timer<TestCpu> {
-        crate::test_support::test_timer(TestCpu::at(0))
-    }
-
-    /// Builds a wheel entry plus the strong ref that keeps its slot
-    /// live; dropping the ref cancels the sleep.
-    fn timer_entry(
-        timer: &super::Timer<TestCpu>,
-        deadline: u64,
-        quantum_ticks: u64,
-    ) -> (super::SleepRef, TimerEntry) {
-        let state = super::SleepRef::new(timer.base());
-        let entry = TimerEntry {
-            deadline: Instant::new(deadline),
-            deadline_tick: wheel_tick_ceil(Instant::new(deadline), quantum_ticks),
-            state: state.downgrade(),
-        };
-        (state, entry)
-    }
-
     #[test]
     fn wheel_tick_rounding_preserves_deadline_order() {
         assert_eq!(wheel_tick_floor(Instant::new(100), 50), 2);
@@ -1209,199 +970,392 @@ mod tests {
         assert_eq!(wheel_tick_ceil(Instant::new(150), 50), 3);
     }
 
+    /// A sleep whose deadline has passed is ready at once and never
+    /// touches the wheel; one that is never polled never registers.
     #[test]
-    fn timing_wheel_expires_entries_after_deadline_tick() {
-        let timer = test_timer();
-        let mut wheel = TimingWheel::new(0);
-        let (state, entry) = timer_entry(&timer, 150, 50);
-        let handle = entry.state;
-        wheel.insert(entry);
+    fn an_elapsed_or_unpolled_sleep_never_registers() {
+        let timer = crate::test_support::test_timer(TestCpu::at(100));
+        let mut context = Context::from_waker(Waker::noop());
 
-        let mut ready = Vec::new();
-        wheel.drain_expired(2, &mut ready);
-        assert!(ready.is_empty());
-        wheel.drain_expired(3, &mut ready);
-        assert_eq!(ready.len(), 1);
-        assert!(ready[0].state == handle);
-        drop(state);
+        for deadline in [100, 99] {
+            let sleep = pin!(timer.sleep_until(Instant::new(deadline)));
+            assert!(sleep.poll(&mut context).is_ready());
+        }
+        let sleep = pin!(timer.sleep_for(Duration::ZERO));
+        assert!(sleep.poll(&mut context).is_ready());
+        let unpolled = timer.sleep_until(Instant::new(101));
+
+        assert_eq!(timer.registered_sleeps(), 0);
+        drop(unpolled);
     }
 
+    /// The shape of a guest's readiness check on a timer pollable: a sleep
+    /// polled once and dropped. Before #705 each left an inbox entry that
+    /// only `fire_expired` drained, and the 4097th panicked.
     #[test]
-    fn timing_wheel_cascades_higher_level_entries() {
-        let timer = test_timer();
-        let mut wheel = TimingWheel::new(0);
-        let (state, entry) = timer_entry(&timer, 300 * 50, 50);
-        let handle = entry.state;
-        wheel.insert(entry);
+    fn a_sleep_polled_once_and_dropped_leaves_nothing_registered() {
+        let timer = crate::test_support::test_timer(TestCpu::at(100));
+        let mut context = Context::from_waker(Waker::noop());
 
-        let mut ready = Vec::new();
-        wheel.drain_expired(255, &mut ready);
-        assert!(ready.is_empty());
-        wheel.drain_expired(300, &mut ready);
-        assert_eq!(ready.len(), 1);
-        assert!(ready[0].state == handle);
-        drop(state);
-    }
-
-    #[test]
-    fn timing_wheel_skips_cancelled_entries() {
-        let timer = test_timer();
-        let mut wheel = TimingWheel::new(0);
-        let (state, entry) = timer_entry(&timer, 100, 50);
-        drop(state);
-        wheel.insert(entry);
-
-        let mut ready = Vec::new();
-        wheel.drain_expired(2, &mut ready);
-        assert!(ready.is_empty());
-    }
-
-    #[test]
-    fn cancelled_sleep_releases_slot_and_stale_handles_fail_validation() {
-        let timer = test_timer();
-        let (state, entry) = timer_entry(&timer, 300 * 50, 50);
-        let handle = entry.state;
-
-        // Cancelling releases the slot immediately even though a wheel
-        // entry could still reference it until its distant deadline.
-        drop(state);
-        assert!(handle.is_dead());
-
-        // Recycle slots until the same index is handed out again and
-        // prove the stale handle never validates against the new
-        // occupant while the fresh handle does.
-        let mut held = Vec::new();
-        let reused = loop {
-            let sleep_ref = super::SleepRef::new(timer.base());
-            if sleep_ref.idx == handle.idx {
-                break sleep_ref;
+        for _ in 0..PAST_THE_OLD_TIMER_CAPACITY {
+            {
+                let sleep = pin!(timer.sleep_for(Duration::from_secs(1)));
+                assert!(sleep.poll(&mut context).is_pending());
+                assert_eq!(timer.registered_sleeps(), 1);
             }
-            held.push(sleep_ref);
-        };
-        let fresh = reused.downgrade();
-        assert_eq!(fresh.idx, handle.idx);
-        assert_ne!(fresh.generation, handle.generation);
-        assert!(handle.is_dead());
-        assert!(!fresh.is_dead());
-        let _ = entry;
+            assert_eq!(timer.registered_sleeps(), 0);
+        }
     }
 
+    /// More sleeps pending at once than the old pool held, all of which
+    /// fire, and every one of whose wakers is woken once.
     #[test]
-    fn timing_wheel_drain_retains_bucket_capacity() {
-        let timer = test_timer();
-        let mut wheel = TimingWheel::new(0);
-        let (state, entry) = timer_entry(&timer, 100, 50);
-        wheel.insert(entry);
-        let slot = super::wheel_slot(2, 0);
-        let retained_capacity = wheel.levels[0].buckets[slot].capacity();
-        assert_ne!(retained_capacity, 0);
+    fn more_pending_sleeps_than_the_old_pool_held_all_fire() {
+        let clock = ManualClockCpu::new();
+        let timer = crate::test_support::test_timer(clock.clone());
+        let waker = Arc::new(CountingWaker::default());
+        let waker_handle = Waker::from(waker.clone());
+        let mut context = Context::from_waker(&waker_handle);
 
-        let mut ready = Vec::new();
-        wheel.drain_expired(2, &mut ready);
+        let mut sleeps: Vec<_> = (0..PAST_THE_OLD_TIMER_CAPACITY)
+            .map(|_| Box::pin(timer.sleep_for(Duration::from_millis(1))))
+            .collect();
+        for sleep in &mut sleeps {
+            assert!(sleep.as_mut().poll(&mut context).is_pending());
+        }
+        assert_eq!(timer.registered_sleeps(), PAST_THE_OLD_TIMER_CAPACITY);
 
-        assert_eq!(ready.len(), 1);
-        assert_eq!(wheel.levels[0].buckets[slot].capacity(), retained_capacity);
-        drop(state);
+        clock.advance(2_000_000);
+        assert_eq!(timer.fire_expired(), PAST_THE_OLD_TIMER_CAPACITY);
+        assert_eq!(waker.wakes(), PAST_THE_OLD_TIMER_CAPACITY);
+        assert_eq!(timer.registered_sleeps(), 0);
+        for sleep in &mut sleeps {
+            assert!(sleep.as_mut().poll(&mut context).is_ready());
+        }
     }
 
+    /// A sleep registered on processor 0's base and dropped on processor
+    /// 1 takes itself off processor 0's wheel, with no fire in between.
     #[test]
-    fn timing_wheel_cascade_retains_bucket_capacity() {
-        let timer = test_timer();
-        let mut wheel = TimingWheel::new(0);
-        let (state, entry) = timer_entry(&timer, 300 * 50, 50);
-        wheel.insert(entry);
-        let slot = super::wheel_slot(256, 1);
-        let retained_capacity = wheel.levels[1].buckets[slot].capacity();
-        assert_ne!(retained_capacity, 0);
-
-        let mut ready = Vec::new();
-        wheel.drain_expired(256, &mut ready);
-
-        assert!(ready.is_empty());
-        assert_eq!(wheel.levels[1].buckets[slot].capacity(), retained_capacity);
-        drop(state);
-    }
-
-    #[test]
-    fn timing_wheel_rebuilds_cached_deadline_after_cancelled_front_entry() {
-        let timer = test_timer();
-        let mut wheel = TimingWheel::new(0);
-        let (cancelled, entry) = timer_entry(&timer, 100, 50);
-        drop(cancelled);
-        wheel.insert(entry);
-        let (state, entry) = timer_entry(&timer, 200, 50);
-        wheel.insert(entry);
-
-        let mut ready = Vec::new();
-        wheel.drain_expired(2, &mut ready);
-        assert!(ready.is_empty());
-        assert_eq!(
-            wheel.next_live_deadline().map(|deadline| deadline.ticks()),
-            Some(200)
-        );
-        drop(state);
-    }
-
-    #[test]
-    fn draining_a_whole_wheel_takes_every_live_entry_and_forgets_its_deadline() {
-        let timer = test_timer();
-        let mut wheel = TimingWheel::new(0);
-        let (near, entry) = timer_entry(&timer, 100, 50);
-        wheel.insert(entry);
-        let (far, entry) = timer_entry(&timer, 300 * 50, 50);
-        wheel.insert(entry);
-        let (cancelled, entry) = timer_entry(&timer, 200, 50);
-        wheel.insert(entry);
-        drop(cancelled);
-
-        let mut taken = Vec::new();
-        wheel.drain_all(|entry| taken.push(entry.deadline.ticks()));
-        taken.sort_unstable();
-
-        assert_eq!(taken, [100, 300 * 50]);
-        assert!(wheel.next_live_deadline().is_none());
-        drop((near, far));
-    }
-
-    #[test]
-    fn elapsed_sleep_does_not_allocate_state() {
+    fn a_sleep_dropped_on_another_processor_unlinks_itself() {
+        test_processor_identity::set(ProcessorId::new(0));
         let timer = crate::test_support::test_timer(TestCpu::at(100));
-        assert!(timer.sleep_until(Instant::new(101)).state.is_none());
-        assert!(timer.sleep_until(Instant::new(100)).state.is_none());
-        assert!(timer.sleep_until(Instant::new(99)).state.is_none());
-        assert!(timer.sleep_for(core::time::Duration::ZERO).state.is_none());
+        let mut context = Context::from_waker(Waker::noop());
+        let mut sleep = Box::pin(timer.sleep_for(Duration::from_secs(1)));
+        assert!(sleep.as_mut().poll(&mut context).is_pending());
+        assert_eq!(timer.registered_sleeps(), 1);
+
+        std::thread::spawn(move || {
+            test_processor_identity::set(ProcessorId::new(1));
+            drop(sleep);
+        })
+        .join()
+        .expect("the dropping processor panicked");
+
+        assert_eq!(timer.registered_sleeps(), 0);
     }
 
+    /// Processor 0 registers sleeps on its own base and hands each to one
+    /// of four other processors, which drop every other one at once and
+    /// wait on the rest, while processor 0 advances the clock and fires.
+    /// No waker is woken twice, every sleep whose waker fired is ready,
+    /// and the wheel ends empty. With no loom or shuttle in the tree, this
+    /// and the module docs' written argument are the evidence for the
+    /// protocol.
     #[test]
-    fn pending_sleep_allocates_state_on_first_poll() {
+    fn cancel_and_fire_race_from_many_processors() {
+        const PROCESSORS: u16 = 4;
+        const ITERATIONS: u64 = 100_000;
+        /// The furthest a sleep is set out, in nanoseconds: 200 µs.
+        const FURTHEST: u64 = 200_000;
+
+        test_processor_identity::set(ProcessorId::new(0));
+        let clock = ManualClockCpu::new();
+        let timer = crate::test_support::test_timer(clock.clone());
+        let finished = AtomicUsize::new(0);
+        let fired_but_pending = AtomicUsize::new(0);
+
+        let wakers: Vec<Arc<CountingWaker>> = std::thread::scope(|scope| {
+            let (senders, workers): (Vec<_>, Vec<_>) = (1..=PROCESSORS)
+                .map(|processor| {
+                    let (send, receive) = mpsc::channel::<(u64, Arc<CountingWaker>, HandedSleep)>();
+                    let (finished, fired_but_pending) = (&finished, &fired_but_pending);
+                    let worker = scope.spawn(move || {
+                        test_processor_identity::set(ProcessorId::new(processor));
+                        let mut wakers = Vec::new();
+                        for (iteration, counter, mut sleep) in receive {
+                            if iteration % 2 == 1 {
+                                while counter.wakes() == 0 {
+                                    core::hint::spin_loop();
+                                }
+                                let waker = Waker::from(counter.clone());
+                                let mut context = Context::from_waker(&waker);
+                                if sleep.as_mut().poll(&mut context).is_pending() {
+                                    fired_but_pending.fetch_add(1, Ordering::SeqCst);
+                                }
+                            }
+                            drop(sleep);
+                            wakers.push(counter);
+                        }
+                        finished.fetch_add(1, Ordering::SeqCst);
+                        wakers
+                    });
+                    (send, worker)
+                })
+                .unzip();
+
+            // Processor 0 owns the base: one sleep for each processor and
+            // one quantum of clock per pass.
+            for iteration in 0..ITERATIONS {
+                for (processor, send) in (1..=PROCESSORS).zip(&senders) {
+                    let counter = Arc::new(CountingWaker::default());
+                    let waker = Waker::from(counter.clone());
+                    let mut context = Context::from_waker(&waker);
+                    let out = (iteration * 7_919 + u64::from(processor)) % (FURTHEST + 1);
+                    let mut sleep = Box::pin(timer.sleep_for(Duration::from_nanos(out)));
+                    if sleep.as_mut().poll(&mut context).is_pending() {
+                        send.send((iteration, counter, sleep))
+                            .expect("a racing processor stopped taking sleeps");
+                    }
+                }
+                clock.advance(50_000);
+                timer.fire_expired();
+            }
+            drop(senders);
+            // The last sleeps handed out may still be waited on.
+            while finished.load(Ordering::SeqCst) < usize::from(PROCESSORS) {
+                clock.advance(50_000);
+                timer.fire_expired();
+            }
+            workers
+                .into_iter()
+                .flat_map(|worker| worker.join().expect("a racing processor panicked"))
+                .collect()
+        });
+
+        assert_eq!(fired_but_pending.load(Ordering::SeqCst), 0);
+        let woken_twice = wakers.iter().filter(|waker| waker.wakes() > 1).count();
+        assert_eq!(woken_twice, 0, "a sleep's waker was woken more than once");
+        assert_eq!(timer.registered_sleeps(), 0);
+    }
+
+    /// A registered sleep re-polled on processor 1 with a new waker each
+    /// time, while processor 0, whose base it is on, fires, is owed a wake
+    /// on the waker of its last pending poll. A lost wake hangs this test
+    /// on the waker it waits for. The narrowest race, a register between
+    /// the firer's take and its `DONE` store, is too short to hit from
+    /// here without injecting a delay; the module docs' ordering argument
+    /// (`FIRING` before the take) is what covers it.
+    #[test]
+    fn a_sleep_repolled_with_a_new_waker_while_it_fires_is_woken() {
+        const ITERATIONS: u64 = 20_000;
+        /// The furthest a sleep is set out, in nanoseconds: 200 µs.
+        const FURTHEST: u64 = 200_000;
+        /// The most polls a sleep takes, each with a new waker and none
+        /// waiting for a wake, before one waits.
+        const REPOLLS: u64 = 64;
+
+        test_processor_identity::set(ProcessorId::new(0));
+        let clock = ManualClockCpu::new();
+        let timer = crate::test_support::test_timer(clock.clone());
+        let finished = AtomicBool::new(false);
+        // How many sleeps processor 1 has taken and begun to poll. The
+        // clock holds still while one is on its way, so a sleep reaches
+        // processor 1 with its deadline ahead, as one registered there
+        // would.
+        let taken = AtomicU64::new(0);
+        let (request, requests) = mpsc::channel::<u64>();
+        let (hand, handed) = mpsc::channel::<HandedSleep>();
+
+        std::thread::scope(|scope| {
+            let (finished, taken) = (&finished, &taken);
+            scope.spawn(move || {
+                test_processor_identity::set(ProcessorId::new(1));
+                for iteration in 0..ITERATIONS {
+                    request
+                        .send(iteration)
+                        .expect("processor 0 stopped handing sleeps out");
+                    let mut sleep = handed.recv().expect("processor 0 hands every sleep out");
+                    taken.fetch_add(1, Ordering::SeqCst);
+                    let mut repolls = iteration % REPOLLS;
+                    loop {
+                        let counter = Arc::new(CountingWaker::default());
+                        let waker = Waker::from(counter.clone());
+                        let mut context = Context::from_waker(&waker);
+                        if sleep.as_mut().poll(&mut context).is_ready() {
+                            break;
+                        }
+                        if repolls != 0 {
+                            repolls -= 1;
+                            continue;
+                        }
+                        while counter.wakes() == 0 {
+                            core::hint::spin_loop();
+                        }
+                    }
+                }
+                finished.store(true, Ordering::SeqCst);
+            });
+
+            let mut handed_out = 0;
+            let mut context = Context::from_waker(Waker::noop());
+            while !finished.load(Ordering::SeqCst) {
+                if let Ok(iteration) = requests.try_recv() {
+                    let out = 1 + iteration * 7_919 % FURTHEST;
+                    let mut sleep = Box::pin(timer.sleep_for(Duration::from_nanos(out)));
+                    assert!(sleep.as_mut().poll(&mut context).is_pending());
+                    hand.send(sleep).expect("processor 1 takes every sleep");
+                    handed_out += 1;
+                }
+                if taken.load(Ordering::SeqCst) == handed_out {
+                    clock.advance(50_000);
+                }
+                timer.fire_expired();
+            }
+        });
+
+        assert_eq!(timer.registered_sleeps(), 0);
+    }
+
+    /// A departing processor hands its base to processor 0 while two other
+    /// processors drop half its sleeps and wait on the other half, and
+    /// processor 0 advances the clock and fires. A sleep that is waited
+    /// on can only fire once the hand-over has moved it, because nothing
+    /// fires the departing base. No waker is woken twice, every sleep whose
+    /// waker fired is ready, and both wheels end empty.
+    #[test]
+    fn a_hand_over_racing_cancels_and_fires_moves_every_live_sleep_once() {
+        const ROUNDS: usize = 64;
+        const SLEEPS: usize = 1024;
+        const CANCELLERS: u16 = 2;
+        /// The furthest a sleep is set out, in nanoseconds: 2 ms, so a
+        /// round's sleeps spread over many quanta and levels.
+        const FURTHEST: u64 = 2_000_000;
+        const P0: ProcessorId = ProcessorId::new(0);
+        const P1: ProcessorId = ProcessorId::new(1);
+
+        let clock = ManualClockCpu::new();
+        test_processor_identity::set(P0);
+        let executor0 = Executor::isolated(ProgressCounter::new(), 2, P0);
+        let timer0 = executor0.timer(clock.clone());
+        test_processor_identity::set(P1);
+        let executor1 = executor0.sibling(ProgressCounter::new(), P1);
+        let timer1 = executor1.timer(clock.clone());
+        let stop = AtomicBool::new(false);
+        let fired_but_pending = AtomicUsize::new(0);
+        let mut wakers = Vec::new();
+
+        std::thread::scope(|scope| {
+            let (timer0, clock, stop) = (&timer0, &clock, &stop);
+            let firer = scope.spawn(move || {
+                test_processor_identity::set(P0);
+                while !stop.load(Ordering::SeqCst) {
+                    clock.advance(50_000);
+                    timer0.fire_expired();
+                }
+                timer0.registered_sleeps()
+            });
+
+            for round in 0..ROUNDS {
+                // Processor 1 registers on its own base.
+                let mut groups: Vec<Vec<(usize, Arc<CountingWaker>, HandedSleep)>> =
+                    (0..CANCELLERS).map(|_| Vec::new()).collect();
+                for index in 0..SLEEPS {
+                    let counter = Arc::new(CountingWaker::default());
+                    let waker = Waker::from(counter.clone());
+                    let mut context = Context::from_waker(&waker);
+                    let out = 1 + (round * SLEEPS + index) as u64 * 7_919 % FURTHEST;
+                    let mut sleep = Box::pin(timer1.sleep_for(Duration::from_nanos(out)));
+                    if sleep.as_mut().poll(&mut context).is_pending() {
+                        groups[index % usize::from(CANCELLERS)].push((index, counter, sleep));
+                    }
+                }
+
+                let start = Barrier::new(usize::from(CANCELLERS) + 1);
+                let round_wakers: Vec<Arc<CountingWaker>> = std::thread::scope(|round_scope| {
+                    let cancellers: Vec<_> = (2..)
+                        .zip(groups)
+                        .map(|(processor, group)| {
+                            let (start, fired_but_pending) = (&start, &fired_but_pending);
+                            round_scope.spawn(move || {
+                                test_processor_identity::set(ProcessorId::new(processor));
+                                start.wait();
+                                let mut wakers = Vec::with_capacity(group.len());
+                                for (index, counter, mut sleep) in group {
+                                    if index % 4 >= 2 {
+                                        while counter.wakes() == 0 {
+                                            core::hint::spin_loop();
+                                        }
+                                        let waker = Waker::from(counter.clone());
+                                        let mut context = Context::from_waker(&waker);
+                                        if sleep.as_mut().poll(&mut context).is_pending() {
+                                            fired_but_pending.fetch_add(1, Ordering::SeqCst);
+                                        }
+                                    }
+                                    drop(sleep);
+                                    wakers.push(counter);
+                                }
+                                wakers
+                            })
+                        })
+                        .collect();
+                    start.wait();
+                    timer1.migrate_base(P0);
+                    cancellers
+                        .into_iter()
+                        .flat_map(|canceller| canceller.join().expect("a canceller panicked"))
+                        .collect()
+                });
+                wakers.extend(round_wakers);
+                assert_eq!(
+                    timer1.registered_sleeps(),
+                    0,
+                    "round {round}: the departed base kept a sleep"
+                );
+            }
+
+            stop.store(true, Ordering::SeqCst);
+            assert_eq!(
+                firer.join().expect("processor 0 panicked"),
+                0,
+                "a sleep stayed on the successor's wheel"
+            );
+        });
+
+        assert_eq!(fired_but_pending.load(Ordering::SeqCst), 0);
+        let woken_twice = wakers.iter().filter(|waker| waker.wakes() > 1).count();
+        assert_eq!(woken_twice, 0, "a sleep's waker was woken more than once");
+    }
+
+    /// The fast path: with nothing due, `fire_expired` answers without the
+    /// wheel lock, here held by the test itself.
+    #[test]
+    fn fire_expired_with_nothing_due_takes_no_lock() {
         let timer = crate::test_support::test_timer(TestCpu::at(100));
-        let mut sleep = timer.sleep_until(Instant::new(101));
-        assert!(sleep.state.is_none());
+        let mut context = Context::from_waker(Waker::noop());
+        let sleep = pin!(timer.sleep_for(Duration::from_secs(1)));
+        assert!(sleep.poll(&mut context).is_pending());
 
-        let mut context = Context::from_waker(noop_waker_ref());
-        assert!(Pin::new(&mut sleep).poll(&mut context).is_pending());
-
-        assert!(sleep.state.is_some());
+        let wheel = timer.base().wheel.lock();
+        assert_eq!(timer.fire_expired(), 0);
+        drop(wheel);
     }
 
+    /// A sleep polled again after its deadline passed completes and
+    /// leaves the wheel without waiting for the owner's fire.
     #[test]
-    fn timer_inbox_is_bounded_to_kernel_capacity() {
-        let timer = crate::test_support::test_timer(TestCpu::at(100));
+    fn a_registered_sleep_polled_after_its_deadline_completes_and_deregisters() {
+        let clock = ManualClockCpu::new();
+        let timer = crate::test_support::test_timer(clock.clone());
+        let mut context = Context::from_waker(Waker::noop());
+        let mut sleep = pin!(timer.sleep_for(Duration::from_millis(1)));
+        assert!(sleep.as_mut().poll(&mut context).is_pending());
+        assert_eq!(timer.registered_sleeps(), 1);
 
-        assert_eq!(timer.base().inbox.capacity(), Some(TIMER_INBOX_CAPACITY));
-    }
+        clock.advance(1_000_000);
 
-    #[test]
-    fn timer_ready_pool_reset_drops_oversized_capacity() {
-        let timer = test_timer();
-        let mut ready = Vec::with_capacity(TIMER_READY_RETAINED_ENTRIES + 1);
-        let (state, entry) = timer_entry(&timer, 100, 50);
-        ready.push(entry);
-
-        reset_timer_ready_entries(&mut ready);
-
-        assert!(ready.is_empty());
-        assert_eq!(ready.capacity(), TIMER_READY_RETAINED_ENTRIES);
-        drop(state);
+        assert_eq!(sleep.as_mut().poll(&mut context), Poll::Ready(()));
+        assert_eq!(timer.registered_sleeps(), 0);
+        assert_eq!(timer.fire_expired(), 0);
     }
 }

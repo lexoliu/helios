@@ -366,9 +366,8 @@ fn timer_sleep_future_create_drop(bencher: Bencher, count: usize) {
     let timer =
         Executor::new(ProgressCounter::new(), 1, ProcessorId::new(0)).timer(BenchCpu::new());
     // Created-but-never-polled sleeps model timeout candidates that lose a
-    // select/race before the executor parks the task. They must not allocate;
-    // pending sleeps still allocate one timer state until the sleep-state pool
-    // is designed around the timer wheel ownership boundary.
+    // select/race before the executor parks the task. They must not allocate,
+    // and neither does a pending sleep: it links the wheel node it carries.
     bencher.counter(ItemsCount::new(count)).bench_local(|| {
         for _ in 0..count {
             black_box(timer.sleep_for(core::time::Duration::from_micros(500)));

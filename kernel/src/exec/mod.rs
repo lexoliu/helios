@@ -5,8 +5,10 @@
 //! haltpoll handshake behind `Executor::park_until_work`. `freeze`
 //! holds every processor at a scheduler boundary. `sync`
 //! provides async-aware mutex /
-//! rwlock / notify primitives. `timer` exposes the timing wheel and
-//! the Sleep future. `time` provides the kernel monotonic clock.
+//! rwlock / notify primitives. `timer` exposes the timer handle over
+//! each processor's timer base and the Sleep future, whose state lives
+//! in the sleep and is linked into a base's `wheel`, the timing wheel. `time` provides the kernel monotonic
+//! clock.
 //! `compaction` runs the periodic memory-pressure scan; `observer`
 //! collects perf counters and tracing samples.
 
@@ -24,6 +26,7 @@ mod sync;
 mod task;
 mod time;
 mod timer;
+mod wheel;
 
 pub use compaction::{
     CompactionBudget, CompactionPolicy, CompactionReport, CompactionTarget, Compactor,

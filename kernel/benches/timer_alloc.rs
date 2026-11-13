@@ -1,29 +1,31 @@
 //! Timer allocation baseline.
 //!
-//! `Sleep::poll` now acquires a refcounted slab slot inside
-//! `TimerShared` on the first pending poll. The bench captures the
-//! allocation profile of the pool-backed path so the old
-//! per-`Sleep` heap allocation does not return.
+//! A pending `Sleep` carries its own wheel node, so its first pending
+//! poll links memory the sleep already is into its timer's wheel. The
+//! bench captures the allocation profile of that path so a per-`Sleep`
+//! heap allocation does not return.
 //!
 //! Workload shape:
 //!
 //!   * `sleep_create_only` — construct a Sleep but never poll. Models
 //!     timeout candidates that lose a select/race before reaching a
-//!     pending state. These already do not allocate today.
+//!     pending state.
 //!   * `sleep_first_poll_pending` — poll once with a non-zero
-//!     deadline and a noop waker so the future returns Pending. This
-//!     exercises pool acquisition. The divan allocator profile shows
+//!     deadline and a noop waker so the future returns Pending, which
+//!     registers it, then drop it. The divan allocator profile shows
 //!     per-iteration bytes / count.
 //!   * `sleep_register_then_drop` — first-pending poll, then drop the
 //!     future without firing. Mirrors a TCP retransmit timer that is
-//!     cancelled when an ACK arrives in time. This path must stay
-//!     zero-allocation after warm pool setup.
+//!     cancelled when an ACK arrives in time: the drop unlinks the node
+//!     at once and leaves nothing for a later fire.
+//!
+//! Every path here must stay zero-allocation.
 
 extern crate alloc;
 
 use alloc::string::String;
 use core::future::Future;
-use core::pin::Pin;
+use core::pin::pin;
 use core::task::Context;
 
 use divan::counter::ItemsCount;
@@ -160,18 +162,10 @@ fn sleep_first_poll_pending(bencher: Bencher, count: usize) {
     bencher.counter(ItemsCount::new(count)).bench_local(|| {
         let mut waker = Context::from_waker(noop_waker_ref());
         for _ in 0..count {
-            let mut sleep = timer.sleep_for(core::time::Duration::from_secs(1));
-            // SAFETY: the Sleep is owned by this stack frame for the
-            // duration of the poll call.
-            let pinned = unsafe { Pin::new_unchecked(&mut sleep) };
-            let _ = pinned.poll(&mut waker);
+            let mut sleep = pin!(timer.sleep_for(core::time::Duration::from_secs(1)));
+            let _ = sleep.as_mut().poll(&mut waker);
             black_box(sleep);
         }
-        // Drain the timer inbox into the wheel so the bounded
-        // inbox never fills across iterations. With `now()` pinned
-        // at 0 no entry actually fires; this just resolves the
-        // pending submissions.
-        timer.fire_expired();
     });
 }
 
@@ -181,14 +175,11 @@ fn sleep_register_then_drop(bencher: Bencher, count: usize) {
     bencher.counter(ItemsCount::new(count)).bench_local(|| {
         let mut waker = Context::from_waker(noop_waker_ref());
         for _ in 0..count {
-            let mut sleep = timer.sleep_for(core::time::Duration::from_secs(1));
-            let pinned = unsafe { Pin::new_unchecked(&mut sleep) };
-            let _ = pinned.poll(&mut waker);
-            // Drop the sleep before its deadline. Phase 3.1 must
-            // return its slot to the pool here without leaking.
-            drop(sleep);
+            // Dropped at the end of the iteration, before its deadline:
+            // the drop unlinks it from the wheel.
+            let sleep = pin!(timer.sleep_for(core::time::Duration::from_secs(1)));
+            let _ = sleep.poll(&mut waker);
         }
-        timer.fire_expired();
     });
 }
 

@@ -70,7 +70,7 @@ fn a_secondary_goes_offline_hands_its_timers_and_work_over_and_comes_back() {
     machine.register_thread(BOOTSTRAP, thread::current());
 
     let (registered_tx, registered_rx) = mpsc::channel();
-    let (sleep_tx, sleep_rx) = mpsc::channel::<Sleep<HostedCpu>>();
+    let (sleep_tx, sleep_rx) = mpsc::channel::<Pin<Box<Sleep<HostedCpu>>>>();
     let release = Arc::new(Notify::new());
     {
         let machine = machine.clone();
@@ -90,10 +90,11 @@ fn a_secondary_goes_offline_hands_its_timers_and_work_over_and_comes_back() {
 
                 // A sleep first polled here is registered on this
                 // processor's timer base; it is due long after the
-                // processor has gone offline.
-                let mut sleep = kernel.timer().sleep_for(Duration::from_millis(300));
+                // processor has gone offline. Boxed, because a polled
+                // sleep is linked where it lies and cannot move.
+                let mut sleep = Box::pin(kernel.timer().sleep_for(Duration::from_millis(300)));
                 let mut context = Context::from_waker(Waker::noop());
-                assert!(Pin::new(&mut sleep).poll(&mut context).is_pending());
+                assert!(sleep.as_mut().poll(&mut context).is_pending());
                 sleep_tx
                     .send(sleep)
                     .expect("the test thread takes the sleep");

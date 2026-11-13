@@ -508,11 +508,116 @@ impl OutputStream for SerialOutputStream {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec::Vec;
+    use core::future::Future as _;
+    use core::pin::pin;
+    use core::task::{Context, Poll, Waker};
+
+    use std::sync::Arc;
+
+    use futures_lite::future::block_on;
+    use helios_hal::cpu::Cpu;
+    use wasmtime::component::{Resource, ResourceTable};
+    use wasmtime_wasi_io::bindings::wasi::io::poll as wasi_poll;
     use wasmtime_wasi_io::bytes::Bytes;
+    use wasmtime_wasi_io::poll::{DynPollable, subscribe};
     use wasmtime_wasi_io::streams::{OutputStream, StreamError};
 
     use super::ChannelOutputStream;
+    use crate::DeadlinePollable;
     use crate::io::{TryRead, byte_channel};
+    use crate::test_support::{
+        CountingWaker, ManualClockCpu, PAST_THE_OLD_TIMER_CAPACITY, TestRuntimeState, test_timer,
+    };
+
+    /// Pushes a `subscribe-duration`-shaped pollable on `timer`, due at
+    /// `deadline_nanos` of uptime, and subscribes it. The test runtime's
+    /// uptime is the tick count, which this clock keeps in nanoseconds.
+    fn subscribe_deadline(
+        table: &mut ResourceTable,
+        cpu: &ManualClockCpu,
+        timer: &crate::Timer<ManualClockCpu>,
+        deadline_nanos: u64,
+    ) -> Resource<DynPollable> {
+        let deadline = table
+            .push(DeadlinePollable::new(
+                cpu.clone(),
+                timer.clone(),
+                TestRuntimeState::default(),
+                deadline_nanos,
+            ))
+            .expect("the table takes a deadline pollable");
+        subscribe(table, deadline).expect("a deadline pollable subscribes")
+    }
+
+    /// #705: `pollable.ready` builds a timer pollable's future, polls it
+    /// once and drops it. Each call used to leave one entry in its
+    /// timer's 4096-entry inbox that only a fire drained, so a guest
+    /// checking one pollable in a loop panicked the kernel on the 4097th
+    /// call. A dropped sleep now leaves nothing behind.
+    #[test]
+    fn a_timer_pollable_is_ready_checked_more_times_than_the_old_inbox_held() {
+        let cpu = ManualClockCpu::new();
+        let timer = test_timer(cpu.clone());
+        let mut table = ResourceTable::new();
+        let second = 1_000_000_000;
+        let pollable = subscribe_deadline(&mut table, &cpu, &timer, cpu.now().ticks() + second);
+
+        for call in 0..PAST_THE_OLD_TIMER_CAPACITY {
+            let ready = block_on(wasi_poll::HostPollable::ready(
+                &mut table,
+                Resource::new_borrow(pollable.rep()),
+            ))
+            .expect("ready on a deadline pollable does not trap");
+            assert!(!ready, "call {call} found a sleep a second out ready");
+        }
+
+        assert_eq!(timer.registered_sleeps(), 0);
+    }
+
+    /// #705: one `poll` over N timer pollables holds N sleeps pending on
+    /// one timer at once. They used to take a slot each from a 4096-slot
+    /// pool, and the 4097th panicked the kernel.
+    #[test]
+    fn one_poll_over_more_timer_pollables_than_the_old_pool_held_fires_them_all() {
+        let cpu = ManualClockCpu::new();
+        let timer = test_timer(cpu.clone());
+        let mut table = ResourceTable::new();
+        let millisecond = 1_000_000;
+        let deadline = cpu.now().ticks() + millisecond;
+        let pollables: Vec<u32> = (0..PAST_THE_OLD_TIMER_CAPACITY)
+            .map(|_| subscribe_deadline(&mut table, &cpu, &timer, deadline).rep())
+            .collect();
+        let wakes = Arc::new(CountingWaker::default());
+        let waker = Waker::from(wakes.clone());
+        let mut context = Context::from_waker(&waker);
+
+        {
+            let list: Vec<Resource<DynPollable>> = pollables
+                .iter()
+                .map(|&rep| Resource::new_borrow(rep))
+                .collect();
+            let mut polling = pin!(wasi_poll::Host::poll(&mut table, list));
+            assert!(polling.as_mut().poll(&mut context).is_pending());
+            assert_eq!(timer.registered_sleeps(), PAST_THE_OLD_TIMER_CAPACITY);
+
+            cpu.advance(2 * millisecond);
+            assert_eq!(timer.fire_expired(), PAST_THE_OLD_TIMER_CAPACITY);
+            assert_eq!(wakes.wakes(), PAST_THE_OLD_TIMER_CAPACITY);
+
+            let Poll::Ready(ready) = polling.as_mut().poll(&mut context) else {
+                panic!("a poll whose every pollable fired is still pending");
+            };
+            let mut ready = ready.expect("poll over deadline pollables does not trap");
+            ready.sort_unstable();
+            let every_index: Vec<u32> = (0..PAST_THE_OLD_TIMER_CAPACITY)
+                .map(|index| u32::try_from(index).expect("the list index fits a u32"))
+                .collect();
+            assert_eq!(ready, every_index);
+        }
+
+        assert_eq!(timer.registered_sleeps(), 0);
+    }
 
     /// #183: a parent that lets go of a child's stdout breaks the
     /// child's pipe even though every byte it wrote was delivered

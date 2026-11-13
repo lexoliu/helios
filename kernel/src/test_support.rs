@@ -177,6 +177,31 @@ pub(crate) fn test_timer<CpuImpl: Cpu + Clone>(cpu: CpuImpl) -> crate::Timer<Cpu
     .timer(cpu)
 }
 
+/// More sleeps than a timer held before #705, when its inbox and its
+/// sleep-state pool each had 4096 entries and a push past either
+/// panicked the kernel: three times that, and one more.
+pub(crate) const PAST_THE_OLD_TIMER_CAPACITY: usize = 3 * 4096 + 1;
+
+/// A waker that counts how many times it is woken.
+#[derive(Default)]
+pub(crate) struct CountingWaker(AtomicUsize);
+
+impl CountingWaker {
+    pub(crate) fn wakes(&self) -> usize {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+impl std::task::Wake for CountingWaker {
+    fn wake(self: std::sync::Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &std::sync::Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 /// A CPU whose clock a test moves by hand.
 ///
 /// Its timebase is one tick per nanosecond, so a test that wants to
