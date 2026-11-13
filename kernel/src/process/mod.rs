@@ -23,13 +23,14 @@ pub use authority::{
     JoinAuthority, LinkAuthorityRights, LinkSourceCap, LinkTargetDirectoryCap,
     MountAuthorityRights, MountCap, MulticastCap, NetworkAdminCap, NetworkAuthorityRights,
     NetworkCap, ObserveMachineCap, PrivilegedBindCap, ProcessAuthority, ProcessAuthorityError,
-    ProcessAuthorityRights, SetWallClockCap, SignalAuthority, SpawnAuthority, SymlinkCreateCap,
-    SymlinkReadCap, TcpCap, TerminalAuthorityRights, TerminalInputCap, TerminalOutputCap,
-    TtyControlCap, UdpCap, UnmountCap,
+    ProcessAuthorityRights, SetWallClockCap, SettingsAuthorityRights, SignalAuthority,
+    SpawnAuthority, SymlinkCreateCap, SymlinkReadCap, TcpCap, TerminalAuthorityRights,
+    TerminalInputCap, TerminalOutputCap, TtyControlCap, UdpCap, UnmountCap, WriteSettingsCap,
 };
 pub(crate) use descriptor::FreeDescriptorSlots;
 pub use descriptor::{
-    DescriptorEntry, DescriptorId, DescriptorLimit, DescriptorTable, DescriptorTableError,
+    DescriptorEntry, DescriptorId, DescriptorLimit, DescriptorLimitSetting, DescriptorTable,
+    DescriptorTableError,
 };
 pub use futex::{FutexKey, FutexTable, FutexWaitRegistration, GuestAddress, ProcessMemoryIdentity};
 pub use program_service::{

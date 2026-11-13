@@ -61,7 +61,7 @@ where
     pub(super) executable: ProgramExecutable<CpuImpl, Net, StorageImpl>,
     pub(super) authority: ProcessAuthority,
     pub(super) filesystem: Option<Namespace<StorageImpl>>,
-    pub(super) descriptors: Option<Preview1DescriptorTable<Net>>,
+    pub(super) descriptors: DescriptorOrigin<Net>,
     pub(super) signal_state: WasixSignalState,
     pub(super) signal_dispositions: Vec<WasixSignalDisposition>,
     /// The replacement launch's phase timeline — the calling task runs
@@ -208,7 +208,7 @@ pub(super) async fn run_program_executable<CpuImpl, Net, StorageImpl>(
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
     filesystem: Option<Namespace<StorageImpl>>,
-    descriptors: Option<Preview1DescriptorTable<Net>>,
+    descriptors: DescriptorOrigin<Net>,
     signal_state: WasixSignalState,
     signal_dispositions: Vec<WasixSignalDisposition>,
     spawner: crate::InstanceSpawner<CpuImpl>,
@@ -313,7 +313,7 @@ pub(super) async fn run_program_core_module<CpuImpl, Net, StorageImpl>(
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
     filesystem: Option<Namespace<StorageImpl>>,
-    descriptors: Option<Preview1DescriptorTable<Net>>,
+    descriptors: DescriptorOrigin<Net>,
     signal_state: WasixSignalState,
     signal_dispositions: Vec<WasixSignalDisposition>,
     spawner: crate::InstanceSpawner<CpuImpl>,
@@ -632,7 +632,9 @@ where
                 write_serial,
                 Some(restore.memory.clone()),
                 filesystem,
-                Some(restore.descriptors),
+                // The fork child is a new process: it takes the machine's
+                // current limit, not its parent's.
+                DescriptorOrigin::NewProcess(restore.descriptors),
                 signal_state,
                 threads.main_mailbox(),
                 restore.signal_dispositions,

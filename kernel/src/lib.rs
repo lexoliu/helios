@@ -35,6 +35,7 @@ mod network;
 mod process;
 mod profiling;
 mod runtime;
+mod settings;
 mod signing_key;
 mod surface;
 #[cfg(test)]
@@ -215,18 +216,20 @@ pub use network::{
 };
 pub use process::{
     AudioClaimCap, ClockAuthorityRights, CompileAuthority, DescriptorEntry, DescriptorId,
-    DescriptorLimit, DescriptorTable, DescriptorTableError, DeviceClassRights, DeviceGrantClaimCap,
-    DiagnosticAuthorityRights, DirectoryAuthorityRights, DirectoryCap, DirectoryPreopen,
-    DisplayClaimCap, DnsCap, ExecAuthority, ForkAuthority, FutexKey, FutexTable,
-    FutexWaitRegistration, GpuOpenCap, GuestAddress, InputClaimCap, JoinAuthority,
-    LinkAuthorityRights, LinkSourceCap, LinkTargetDirectoryCap, MountAuthorityRights, MountCap,
-    MulticastCap, NetworkAdminCap, NetworkAuthorityRights, NetworkCap, ObserveMachineCap,
-    PrivilegedBindCap, ProcessAuthority, ProcessAuthorityError, ProcessAuthorityRights, ProcessId,
-    ProcessMemoryIdentity, ProcessRecord, ProcessState, ProcessTable, ProcessTableError,
-    ProgramExecError, ProgramExecErrorDetail, ProgramExecErrorKind, ProgramOutOfMemory,
-    RuntimeMessage, SetWallClockCap, SignalAuthority, SpawnAuthority, SymlinkCreateCap,
-    SymlinkReadCap, TcpCap, TerminalAuthorityRights, TerminalInputCap, TerminalOutputCap, ThreadId,
-    ThreadRecord, ThreadState, ThreadTable, ThreadTableError, TtyControlCap, UdpCap, UnmountCap,
+    DescriptorLimit, DescriptorLimitSetting, DescriptorTable, DescriptorTableError,
+    DeviceClassRights, DeviceGrantClaimCap, DiagnosticAuthorityRights, DirectoryAuthorityRights,
+    DirectoryCap, DirectoryPreopen, DisplayClaimCap, DnsCap, ExecAuthority, ForkAuthority,
+    FutexKey, FutexTable, FutexWaitRegistration, GpuOpenCap, GuestAddress, InputClaimCap,
+    JoinAuthority, LinkAuthorityRights, LinkSourceCap, LinkTargetDirectoryCap,
+    MountAuthorityRights, MountCap, MulticastCap, NetworkAdminCap, NetworkAuthorityRights,
+    NetworkCap, ObserveMachineCap, PrivilegedBindCap, ProcessAuthority, ProcessAuthorityError,
+    ProcessAuthorityRights, ProcessId, ProcessMemoryIdentity, ProcessRecord, ProcessState,
+    ProcessTable, ProcessTableError, ProgramExecError, ProgramExecErrorDetail,
+    ProgramExecErrorKind, ProgramOutOfMemory, RuntimeMessage, SetWallClockCap,
+    SettingsAuthorityRights, SignalAuthority, SpawnAuthority, SymlinkCreateCap, SymlinkReadCap,
+    TcpCap, TerminalAuthorityRights, TerminalInputCap, TerminalOutputCap, ThreadId, ThreadRecord,
+    ThreadState, ThreadTable, ThreadTableError, TtyControlCap, UdpCap, UnmountCap,
+    WriteSettingsCap,
 };
 pub use profiling::{
     CodeAttribution, InstructionProfile, InstructionProfileError, InstructionSampler,
@@ -242,6 +245,10 @@ pub use runtime::{
     ObjectIdentity, PingError, PingErrorKind, PingReply, RegisteredTcpReadBuffer, RuntimeState,
     SocketReadiness, TcpAccepted, TcpError, TcpErrorKind, TcpListener, TcpReadProgress,
     TcpWriteProgress, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
+};
+pub use settings::{
+    Holds, SETTING_COUNT, Setting, SettingCell, SettingEntry, SettingUnit, SettingValue,
+    SettingWriteError, Settings,
 };
 pub use signing_key::{
     CwasmSigningKey, PAYLOAD_REGISTER, ProvisionCause, SeedSource, SettledSigningKey,

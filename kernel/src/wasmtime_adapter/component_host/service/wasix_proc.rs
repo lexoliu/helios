@@ -42,7 +42,10 @@ type WasixHostArgs14 = (
 pub(super) struct WasixChildInheritance<Net: ComponentHostNetwork> {
     pub(super) environment: Option<Vec<(String, String)>>,
     pub(super) authority: Option<ProcessAuthority>,
-    pub(super) descriptors: Option<Preview1DescriptorTable<Net>>,
+    /// A spawn child is a new process: [`DescriptorOrigin::Fresh`], or
+    /// [`DescriptorOrigin::NewProcess`] with the table its descriptor
+    /// actions produced.
+    pub(super) descriptors: DescriptorOrigin<Net>,
     pub(super) signal_dispositions: Vec<WasixSignalDisposition>,
 }
 
@@ -1886,7 +1889,8 @@ where
             executable,
             authority,
             filesystem,
-            descriptors: Some(descriptors),
+            // Exec keeps the process, so it keeps the process's limit.
+            descriptors: DescriptorOrigin::SameProcess(descriptors),
             signal_state,
             signal_dispositions,
             timeline: trace.timeline().for_task(),
@@ -2147,7 +2151,7 @@ where
         WasixChildInheritance {
             environment: None,
             authority: Some(authority),
-            descriptors: None,
+            descriptors: DescriptorOrigin::Fresh,
             signal_dispositions: Vec::new(),
         },
     )
@@ -2246,6 +2250,10 @@ pub(super) fn wasix_proc_spawn_inherited_non_directory_authority(
     // The observation right follows the shell the same way: the programs
     // a launcher runs through `dash` observe the machine as it does.
     authority.grant_diagnostic_rights(parent.diagnostic_rights());
+    // The settings-write right follows the shell the same way: the
+    // programs a launcher runs through `dash` configure the machine as
+    // it does.
+    authority.grant_settings_rights(parent.settings_rights());
     authority
 }
 
@@ -2445,8 +2453,11 @@ where
         }
     };
     let (authority, descriptors) = match snapshot {
-        Some(snapshot) => (Some(snapshot.authority), Some(snapshot.descriptors)),
-        None => (None, None),
+        Some(snapshot) => (
+            Some(snapshot.authority),
+            DescriptorOrigin::NewProcess(snapshot.descriptors),
+        ),
+        None => (None, DescriptorOrigin::Fresh),
     };
     let signal_dispositions = match wasix_read_signal_dispositions(
         caller,
@@ -2894,8 +2905,20 @@ where
     if fd_ops == 0 {
         return Err(p1::errno::FAULT);
     }
+    // The actions are the child's first steps, so they run under the
+    // limit the child takes, a new process's, not under the parent's:
+    // a target between the two would otherwise be judged by the wrong one.
+    let child_limit = caller
+        .data()
+        .runtime_state
+        .settings()
+        .get::<DescriptorLimitSetting>();
     let mut snapshot = WasixSpawnFdSnapshot {
-        descriptors: caller.data().descriptors.clone(),
+        descriptors: caller
+            .data()
+            .descriptors
+            .clone()
+            .for_new_process(child_limit),
         authority: caller.data().authority.clone(),
         cwd: caller.data().cwd.clone(),
     };
