@@ -34,6 +34,8 @@ mod exec;
 use exec::*;
 mod http_plugin;
 use http_plugin::*;
+mod network_step;
+use network_step::NetworkStep;
 mod compositor_plugin;
 use compositor_plugin::*;
 mod preview1;
@@ -782,37 +784,6 @@ where
     }
 }
 
-/// Starts the packet pump for the queue pair this processor owns, when
-/// it owns one.
-///
-/// A queue pair's interrupt is routed to one processor, so the pump
-/// that drains the pair has to be that processor's own task: this is
-/// called from every processor's run loop, before the role dispatch
-/// decides what else the processor does, and `spawn_local_detached`
-/// pins the task to it. The service is installed by a device-discovery
-/// task that may not have run yet, so the task awaits the install
-/// rather than checking and giving up; `run_packet_pump` then resolves
-/// the pair assignment from the topology and either pumps it or
-/// returns.
-fn spawn_network_packet_pump<CpuImpl, Net, StorageImpl, WatchdogImpl, MeasuredBootImpl>(
-    kernel: &crate::Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
-    debug_state: &HostRuntimeState<CpuImpl, Net, StorageImpl>,
-) where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    StorageImpl: crate::Storage,
-    WatchdogImpl: Watchdog + Clone,
-    MeasuredBootImpl: MeasuredBoot,
-{
-    let debug_state = debug_state.clone();
-    kernel.spawn_local_detached(async move {
-        let service = debug_state.wait_for_network_service().await;
-        service
-            .run_packet_pump(helios_hal::cpu::current_processor())
-            .await;
-    });
-}
-
 pub fn run_program_workers_forever<CpuImpl, Net, StorageImpl, WatchdogImpl, MeasuredBootImpl>(
     _cpu: CpuImpl,
     kernel: crate::Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
@@ -825,8 +796,11 @@ where
     WatchdogImpl: Watchdog + Clone,
     MeasuredBootImpl: MeasuredBoot,
 {
-    spawn_network_packet_pump(&kernel, &debug_state);
-    kernel.run()
+    // The packet pump has to be this processor's own task, because the
+    // pair it drains has its interrupt routed here; the step owns it and
+    // hands the pair off when the processor goes offline.
+    let network = NetworkStep::start(&kernel, &debug_state);
+    kernel.run_with_steps(&network)
 }
 
 pub fn run_component_host_processor_forever<
@@ -849,7 +823,12 @@ where
     WatchdogImpl: Watchdog + Clone,
     MeasuredBootImpl: MeasuredBoot,
 {
-    spawn_network_packet_pump(&kernel, &debug_state);
+    // Started before the role dispatch decides what else the processor
+    // does: every processor's pump is its own local task. A processor
+    // that goes on to run an embedded component keeps the step alive
+    // for good without lending it to a lifecycle — its component is
+    // pinned local work, so it never goes offline.
+    let network = NetworkStep::start(&kernel, &debug_state);
     let topology = kernel.topology();
     // Every backend's bootstrap processor reaches here only after starting
     // its secondaries, and a backend enables its mechanisms on a processor
@@ -865,7 +844,7 @@ where
         topology.bootstrap_processor,
     ) {
         ComponentHostProcessorRole::Kernel => {
-            run_kernel_processor_forever(cpu, kernel, debug_state);
+            run_kernel_processor_forever(cpu, kernel, debug_state, &network);
         }
         ComponentHostProcessorRole::SharedRuntime | ComponentHostProcessorRole::SystemComponent => {
             match debug_state.system_component() {
@@ -886,7 +865,7 @@ where
                     if cfg!(feature = "embedded-debugger") {
                         panic!("embedded init bootfs is missing the system component");
                     }
-                    run_kernel_processor_forever(cpu, kernel, debug_state);
+                    run_kernel_processor_forever(cpu, kernel, debug_state, &network);
                 }
             }
         }
@@ -937,6 +916,7 @@ fn run_kernel_processor_forever<CpuImpl, Net, StorageImpl, WatchdogImpl, Measure
     cpu: CpuImpl,
     kernel: crate::Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
     debug_state: HostRuntimeState<CpuImpl, Net, StorageImpl>,
+    network: &NetworkStep<CpuImpl, Net, StorageImpl>,
 ) -> !
 where
     CpuImpl: Cpu + Clone,
@@ -951,14 +931,16 @@ where
         let progress = if debug_state.profiling_enabled() {
             let started = cpu.now().ticks();
             let counters = cpu.hardware_perf_counters();
-            let stats = kernel.run_until_stalled_with_stats();
+            let stats = kernel.run_until_stalled_with_steps(network);
             let progress = stats.progress_count();
             if progress != 0 {
                 record_executor_metrics(&cpu, &debug_state, &stack, started, counters, stats);
             }
             progress
         } else {
-            kernel.run_until_stalled_with_stats().progress_count()
+            kernel
+                .run_until_stalled_with_steps(network)
+                .progress_count()
         };
 
         if progress != 0 {

@@ -2,11 +2,14 @@
 //!
 //! # SMP contract
 //!
-//! There is one [`NetworkShard`] per processor and every shard owns an
-//! independent `Stack`, socket slab and port allocator. A flow belongs
-//! to exactly one shard ([`shard_idx_for_frame`]), so the frames for a
-//! socket are always placed in that socket's shard whichever processor
-//! drained them off the device.
+//! There is one [`NetworkShard`] per possible processor and every shard
+//! owns an independent `Stack`, socket slab and port allocator. A flow
+//! belongs to exactly one shard ([`shard_idx_for_frame`]), so the frames
+//! for a socket are always placed in that socket's shard whichever
+//! processor drained them off the device. The set is never
+//! re-partitioned: a processor going offline leaves its shard, its
+//! sockets and its port window where they are, and only the queue pair
+//! whose pump serves the shard changes (`routes`).
 //!
 //! Placement is therefore routinely cross-processor: the shard lock is
 //! taken by the draining CPU, not the owning one. That hand-off is
@@ -839,7 +842,7 @@ impl NetworkShardSet {
     pub(super) fn with_handle_receive_drain<H, R>(
         &self,
         handle: H,
-        pair_count: usize,
+        pairs: &PairRoutes,
         f: impl FnOnce(&mut NetworkShard) -> R,
     ) -> R
     where
@@ -857,7 +860,7 @@ impl NetworkShardSet {
         };
         if relieved {
             self.raise_shard_progress(shard_idx);
-            let pump_shard = shard_idx % pair_count;
+            let pump_shard = pairs.pair_of_shard(shard_idx);
             if pump_shard != shard_idx {
                 self.raise_shard_progress(pump_shard);
             }
@@ -957,16 +960,21 @@ impl NetworkShardSet {
     /// Iterates the shards whose egress submits on `pair_idx`, calling
     /// `f` once per shard under its own lock.
     ///
-    /// Shard `s` submits on pair `s % pair_count`, so a pump that owns
-    /// a pair drives every shard that shares it — with fewer pairs than
-    /// processors, the pair's shards are exactly the ones its pump can
-    /// ever move.
-    pub(super) fn for_each_on_pair<F>(&self, pair_idx: usize, pair_count: usize, mut f: F)
+    /// A shard submits on the live pair `layout` folds it onto, so a
+    /// pump that owns a pair drives every shard that shares it — with
+    /// fewer live pairs than shards, the pair's shards are exactly the
+    /// ones its pump can ever move. One layout is used for the whole
+    /// walk, so a hand-off in the middle of it neither skips a shard
+    /// nor visits one twice.
+    pub(super) fn for_each_on_pair<F>(&self, pair_idx: usize, layout: PairLayout, mut f: F)
     where
         F: FnMut(&mut NetworkShard),
     {
-        for shard_idx in (pair_idx..self.shards.len()).step_by(pair_count) {
-            let mut guard = self.shards[shard_idx].inner.lock();
+        for (shard_idx, shard) in self.shards.iter().enumerate() {
+            if layout.pair_of_shard(shard_idx) != pair_idx {
+                continue;
+            }
+            let mut guard = shard.inner.lock();
             f(&mut guard);
         }
     }
@@ -976,10 +984,10 @@ impl NetworkShardSet {
     pub(super) fn pair_tcp_deadline_nanos(
         &self,
         pair_idx: usize,
-        pair_count: usize,
+        layout: PairLayout,
     ) -> Option<u64> {
         let mut next = None;
-        self.for_each_on_pair(pair_idx, pair_count, |shard| {
+        self.for_each_on_pair(pair_idx, layout, |shard| {
             if let Some(deadline) = shard.stack.next_tcp_deadline().map(StackInstant::nanos) {
                 next = Some(next.map_or(deadline, |current: u64| current.min(deadline)));
             }
