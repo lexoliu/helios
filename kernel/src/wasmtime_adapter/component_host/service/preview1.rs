@@ -388,22 +388,7 @@ where
     }
 
     pub(super) fn output_route(&self, stream: crate::ComponentOutputStreamKind) -> OutputRoute {
-        match &self.output_mode {
-            OutputMode::Serial => OutputRoute::Serial,
-            OutputMode::Trace => OutputRoute::Trace,
-            OutputMode::Child {
-                stdout_tx,
-                stderr_tx,
-                ..
-            } => match stream {
-                crate::ComponentOutputStreamKind::Stdout => OutputRoute::Child(stdout_tx.clone()),
-                crate::ComponentOutputStreamKind::Stderr => OutputRoute::Child(stderr_tx.clone()),
-            },
-            OutputMode::RoutedChild { stdout, stderr, .. } => match stream {
-                crate::ComponentOutputStreamKind::Stdout => stdout.clone(),
-                crate::ComponentOutputStreamKind::Stderr => stderr.clone(),
-            },
-        }
+        self.output_mode.route(stream)
     }
 
     pub(super) fn insert_child(

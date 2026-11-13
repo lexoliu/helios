@@ -233,24 +233,39 @@ where
     // handle `for_task`.
     let task_trace = timeline.task_guard(exec_context.cpu.clone());
     let outcome = match executable {
+        // A component has no descriptor table of its own: the table a
+        // WASIX parent hands down becomes its stdio, and is dropped here
+        // so that no pipe end it held outlives the launch.
         ProgramExecutable::Component(compiled) => {
-            run_program_component(
-                exec_context,
-                argv,
-                env,
-                authority,
-                filesystem,
-                signal_state,
-                spawner,
-                progress,
-                compiled,
-                engine,
-                runtime,
-                launched_instance,
-                output_mode,
-                &timeline,
-            )
-            .await
+            let stdio = match descriptors {
+                Some(table) => table.component_output_mode(&output_mode),
+                None => Ok(output_mode),
+            };
+            match stdio {
+                Ok(output_mode) => {
+                    run_program_component(
+                        exec_context,
+                        argv,
+                        env,
+                        authority,
+                        filesystem,
+                        signal_state,
+                        spawner,
+                        progress,
+                        compiled,
+                        engine,
+                        runtime,
+                        launched_instance,
+                        output_mode,
+                        &timeline,
+                    )
+                    .await
+                }
+                Err(refusal) => Err(ProgramExecError {
+                    kind: ProgramExecErrorKind::Unavailable,
+                    detail: ProgramExecErrorDetail::ComponentStdioUnbindable(refusal),
+                }),
+            }
         }
         ProgramExecutable::CoreModule(compiled) => {
             run_program_core_module(

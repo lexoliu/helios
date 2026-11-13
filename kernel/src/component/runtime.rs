@@ -288,6 +288,30 @@ impl ComponentOutputMode {
         }
     }
 
+    /// Where `kind` goes, as a route a child launched from this mode can
+    /// inherit: the same destination, with a cloned writer handle when
+    /// it is a channel.
+    pub fn route(&self, kind: ComponentOutputStreamKind) -> ComponentOutputRoute {
+        match (self, kind) {
+            (ComponentOutputMode::Serial, _) => ComponentOutputRoute::Serial,
+            (ComponentOutputMode::Trace, _) => ComponentOutputRoute::Trace,
+            (ComponentOutputMode::Child { stdout_tx, .. }, ComponentOutputStreamKind::Stdout) => {
+                ComponentOutputRoute::Child(stdout_tx.clone())
+            }
+            (ComponentOutputMode::Child { stderr_tx, .. }, ComponentOutputStreamKind::Stderr) => {
+                ComponentOutputRoute::Child(stderr_tx.clone())
+            }
+            (
+                ComponentOutputMode::RoutedChild { stdout, .. },
+                ComponentOutputStreamKind::Stdout,
+            ) => stdout.clone(),
+            (
+                ComponentOutputMode::RoutedChild { stderr, .. },
+                ComponentOutputStreamKind::Stderr,
+            ) => stderr.clone(),
+        }
+    }
+
     /// Resolve where `kind` goes without cloning a writer handle.
     /// `instance` is the writer; a [`LocalOutputSink::Trace`] attributes
     /// what it records to it.

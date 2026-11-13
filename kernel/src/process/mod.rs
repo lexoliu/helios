@@ -33,8 +33,8 @@ pub use descriptor::{
 };
 pub use futex::{FutexKey, FutexTable, FutexWaitRegistration, GuestAddress, ProcessMemoryIdentity};
 pub use program_service::{
-    ProgramExecError, ProgramExecErrorDetail, ProgramExecErrorKind, ProgramOutOfMemory,
-    RuntimeMessage,
+    ComponentStdioRefusal, ProgramExecError, ProgramExecErrorDetail, ProgramExecErrorKind,
+    ProgramOutOfMemory, RuntimeMessage, UnbindableStdio,
 };
 pub use table::{ProcessId, ProcessRecord, ProcessState, ProcessTable, ProcessTableError};
 pub use thread::{ThreadId, ThreadRecord, ThreadState, ThreadTable, ThreadTableError};

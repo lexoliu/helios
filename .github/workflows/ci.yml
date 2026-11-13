@@ -1384,7 +1384,11 @@ jobs:
         run: |
           # coreutils is one multicall WASIX module published under
           # several bootfs names, so every applet is launched by bare
-          # name and dash resolves it through PATH.
+          # name and dash resolves it through PATH. `date` is a component
+          # program: dash's descriptors must become its stdio, so its
+          # stdout reaches a command substitution and a pipe, `2>&1` sends
+          # its stderr (`usage: date`) to the shell's stdout, and the
+          # shell's own stdout still works after that redirection (#904).
           runtime="$GITHUB_WORKSPACE/smoke-runtime/coreutils"
           mkdir -p "$runtime"
           ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
@@ -1392,13 +1396,19 @@ jobs:
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program debugger \
             --boot-program ls --boot-program mkdir --boot-program cat \
+            --boot-program date \
             --no-compiler-plugin \
             shell --trace-log "$runtime/guest-tracing.log" \
-            -c 'mkdir /d; echo coreutils:ok > /d/f; cat /d/f; ls /' \
+            -c 'mkdir /d; echo coreutils:ok > /d/f; cat /d/f; ls /; echo "sub:$(date)"; date | cat; echo "suberr:$(date x 2>&1)"; date x 2>&1; echo after:ok' \
             2>&1 > coreutils-smoke.out | tee "$runtime/inspector.log"
           cat coreutils-smoke.out
           grep -Fqx coreutils:ok coreutils-smoke.out
           grep -Fqx bin coreutils-smoke.out
+          grep -q '^sub:unix_seconds=[0-9][0-9]*$' coreutils-smoke.out
+          grep -q '^unix_seconds=[0-9][0-9]*$' coreutils-smoke.out
+          grep -Fqx 'suberr:usage: date' coreutils-smoke.out
+          grep -Fqx 'usage: date' coreutils-smoke.out
+          grep -Fqx after:ok coreutils-smoke.out
       - name: Mount an EROFS disk from init
         timeout-minutes: 5
         shell: bash
