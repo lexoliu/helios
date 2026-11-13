@@ -12,6 +12,7 @@ use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering}
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use arm_gic::IntId;
+use helios_artifact::{ProbeAnswers, cwasm_target_isa_levels};
 use helios_hal::boot::{
     BootFirmwareTables, BootHandoff, BootKernelImage, BootMemoryKind, BootMemoryMap,
     BootMemoryRegion, BootModule, BootModules, BootReservedRanges, FirmwareKind,
@@ -185,26 +186,32 @@ mod gpu;
 mod hand_over;
 mod host_fs;
 mod input;
+mod lifecycle;
 mod net;
 mod platform;
 mod rtc;
 mod snd;
+mod tpm;
 mod vsock;
 
 mod debug_state {
     /// The network service this machine's virtio-net device backs.
     pub(crate) type NetworkService =
         helios_kernel::NetworkService<crate::Aarch64Cpu, crate::net::VirtioNetworkDevice>;
-    pub(crate) type RuntimeState = helios_kernel::HostRuntimeState<
-        crate::Aarch64Cpu,
-        NetworkService,
-        crate::host_fs::HostFileSystemService,
-    >;
-    pub(crate) type ProgramService = helios_kernel::UserProgramService<
-        crate::Aarch64Cpu,
-        NetworkService,
-        crate::host_fs::HostFileSystemService,
-    >;
+    pub(crate) type RuntimeState =
+        helios_kernel::HostRuntimeState<crate::Aarch64Cpu, NetworkService, Storage>;
+    pub(crate) type ProgramService =
+        helios_kernel::UserProgramService<crate::Aarch64Cpu, NetworkService, Storage>;
+
+    /// This machine's storage: the virtio-9p host share and the
+    /// virtio-blk disks.
+    #[derive(Clone, Copy)]
+    pub(crate) struct Storage;
+
+    impl helios_kernel::Storage for Storage {
+        type HostShare = crate::host_fs::HostFileSystemService;
+        type Disk = crate::block::Aarch64VirtioBlockDevice;
+    }
 }
 
 /// Interrupt routes the bootstrap processor installs for the virtio
@@ -248,6 +255,11 @@ static DEVICE_TREE_BLOB_REQUEST: DtbRequest = DtbRequest::new();
 static RSDP_REQUEST: RsdpRequest = RsdpRequest::new();
 #[used]
 static STACK_SIZE_REQUEST: StackSizeRequest = StackSizeRequest::new(KERNEL_STACK_BYTES as u64);
+/// The firmware's TPM event log, which the measured-boot discovery reads
+/// to learn whether Limine measured the kernel (`tpm::discover`).
+#[used]
+static TPM_EVENT_LOG_REQUEST: helios_kernel::LimineTpmEventLogRequest =
+    helios_kernel::LimineTpmEventLogRequest::new();
 static DEBUG_SERIAL_BASE: AtomicUsize = AtomicUsize::new(0);
 static CRITICAL_SECTION_STATE: helios_hal::critical_section::CriticalSectionState =
     helios_hal::critical_section::CriticalSectionState::new();
@@ -371,10 +383,15 @@ impl ExceptionStack {
 struct Aarch64ProcessorSlot {
     mp_info: &'static MpInfo,
     runtime: ProcessorRuntime,
+    /// Whether the processor is in service, and what it resumes from.
+    power: lifecycle::ProcessorPower,
 }
 
 struct Aarch64PlatformState {
     processors: Box<[Aarch64ProcessorSlot]>,
+    /// The PSCI service that stops and restarts processors, when the
+    /// platform describes one.
+    psci: Option<lifecycle::Psci>,
     timebase: Timebase,
     /// How a failed return-address authentication shows on every
     /// processor, probed on the bootstrap processor before any other starts
@@ -385,10 +402,21 @@ struct Aarch64PlatformState {
     instruction_key: cfi::SharedInstructionKey,
     debug_state: Once<debug_state::RuntimeState>,
     gic: Once<gic::Gic>,
+    /// The bootstrap processor's answer to every ISA level feature. Written
+    /// once before any secondary starts; each secondary compares its own.
+    isa_answers: ProbeAnswers,
+}
+
+/// What `detect_aarch64_native_feature` answers for every ISA level feature
+/// on the executing processor.
+fn probe_isa_answers() -> ProbeAnswers {
+    cwasm_target_isa_levels("aarch64-unknown-none")
+        .probe_answers(detect_aarch64_native_feature)
+        .unwrap_or_else(|error| panic!("AArch64 native feature probe is incomplete: {error}"))
 }
 
 impl Aarch64PlatformState {
-    fn from_limine_mp(timebase: Timebase) -> &'static Self {
+    fn from_limine_mp(timebase: Timebase, psci: Option<platform::PsciConduit>) -> &'static Self {
         let response = MP_REQUEST
             .response()
             .unwrap_or_else(|| panic!("Limine did not provide an AArch64 MP response"));
@@ -421,17 +449,20 @@ impl Aarch64PlatformState {
                 Aarch64ProcessorSlot {
                     mp_info,
                     runtime: ProcessorRuntime::new(logical_id),
+                    power: lifecycle::ProcessorPower::new(),
                 }
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
         Box::leak(Box::new(Self {
             processors,
+            psci: psci.map(lifecycle::Psci::new),
             timebase,
             return_address_signing: cfi::bootstrap_capability(),
             instruction_key: cfi::SharedInstructionKey::new(),
             debug_state: Once::new(),
             gic: Once::new(),
+            isa_answers: probe_isa_answers(),
         }))
     }
 
@@ -462,6 +493,16 @@ impl Aarch64PlatformState {
         self.gic
             .get()
             .unwrap_or_else(|| panic!("AArch64 processor ran before the interrupt controller"))
+    }
+
+    /// The PSCI service a processor is stopped and restarted through.
+    fn psci(&self) -> lifecycle::Psci {
+        self.psci.unwrap_or_else(|| {
+            panic!(
+                "the platform describes no PSCI service (a device tree psci node, or the FADT's \
+                 PSCI_COMPLIANT flag), so a processor cannot be stopped or restarted"
+            )
+        })
     }
 
     fn bootstrap_mpidr(&self) -> u64 {
@@ -619,7 +660,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
         .describe(console)
         .unwrap_or_else(|error| panic!("AArch64 platform description failed: {error}"));
     vmm::install_user_address_space(physical_memory_offset);
-    let platform_state = Aarch64PlatformState::from_limine_mp(timebase());
+    let platform_state = Aarch64PlatformState::from_limine_mp(timebase(), platform.psci);
     activate_processor_runtime(platform_state.bootstrap_runtime());
 
     let cpu = Aarch64Cpu {
@@ -630,6 +671,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
         cpu.processor_count(),
         cpu.now().ticks(),
         payload,
+        helios_kernel::GuestIsa::for_build_target(cpu.native_feature_probe()),
     );
     platform_state.install_debug_state(debug_state.clone());
     let console = helios_kernel::RecordingConsole::new(
@@ -668,6 +710,11 @@ extern "C" fn aarch64_kernel_main() -> ! {
     if block_device_count != 0 {
         devices = devices.with_block_devices(block_device_count);
     }
+    // The TPM is checked before the kernel exists, because whether the
+    // kernel is handed one is part of the platform it is built from; the
+    // outcome is reported once the logger is up.
+    let (measured_boot, measured_boot_discovery) =
+        tpm::discover(&platform, physical_memory_offset, &handoff, cpu);
     let kernel = helios_kernel::init(
         Platform::new(console, core::iter::empty::<MemoryRegion>(), cpu)
             .with_topology(
@@ -679,8 +726,14 @@ extern "C" fn aarch64_kernel_main() -> ! {
             )
             .with_timer_frequency_hz(cpu.timebase().frequency())
             .with_dma_model(DmaModel::Translated)
-            .with_devices(devices),
+            .with_devices(devices)
+            .with_measured_boot(measured_boot),
     );
+    if measured_boot_discovery.is_refusal() {
+        tracing::warn!("{measured_boot_discovery}");
+    } else {
+        tracing::info!("{measured_boot_discovery}");
+    }
     tracing::info!(
         "platform described by {} console={:#x} gicd={:#x} gicr={:#x} virtio-slots={} rtc={}",
         platform.source,
@@ -933,6 +986,11 @@ extern "C" fn aarch64_kernel_main() -> ! {
     // Each secondary read the key before it set `started`, and
     // `start_processor` returned only after that, so nothing reads it again.
     platform_state.instruction_key.wipe();
+    #[cfg(helios_cfi_self_test)]
+    // SAFETY: `EnIA` was set with the machine's key on this processor above.
+    unsafe {
+        cfi::self_test()
+    };
 
     helios_kernel::run_component_host_processor_forever(
         cpu,
@@ -1050,6 +1108,23 @@ impl Cpu for Aarch64Cpu {
 
     fn start_processor(&self, processor: ProcessorId) {
         self.state.start_processor(processor);
+    }
+
+    fn stop_current(&self) {
+        let runtime = current_processor_runtime();
+        let slot = self.state.processor_slot(runtime.logical_id());
+        slot.power.stop(
+            self.state.psci(),
+            slot.mp_info.mpidr,
+            self.state.gic(),
+            &runtime.wake_pending,
+        );
+    }
+
+    fn restart_processor(&self, processor: ProcessorId) {
+        let slot = self.state.processor_slot(processor);
+        slot.power
+            .restart(self.state.psci(), slot.mp_info.mpidr, self.state.timebase);
     }
 
     fn wake_processor(&self, processor: ProcessorId) {
@@ -1298,6 +1373,16 @@ unsafe extern "C" fn aarch64_secondary_main(mp_info: &MpInfo) -> ! {
     );
     let state = unsafe { &*state };
     let slot = state.processor_slot_by_mpidr(mp_info.mpidr);
+    // Guest code is compiled once for the ISA level the bootstrap processor
+    // satisfies and runs on any processor, so every processor must answer
+    // every level feature the same way.
+    let isa_answers = probe_isa_answers();
+    assert_eq!(
+        isa_answers, state.isa_answers,
+        "AArch64 processor with MPIDR {:#x} answers the ISA level features differently from the \
+         bootstrap processor; Helios requires every processor to offer the same features",
+        mp_info.mpidr
+    );
     // Everything this processor ran up to here has returned, and the one
     // function still live, this one, never does. The key is installed
     // before `started` is set, so `start_processor` returns for this
@@ -1700,7 +1785,15 @@ fn installed_processor_runtime() -> Option<&'static ProcessorRuntime> {
 fn detect_aarch64_native_feature(feature: &str) -> Option<bool> {
     match feature {
         "lse" => Some(read_id_aa64isar0_el1() & 0xf00_000 != 0),
-        "fp16" => Some(aarch64_id_field(read_id_aa64pfr0_el1(), 16) == 1),
+        // Scalar and vector half-precision arithmetic: ID_AA64PFR0_EL1.FP
+        // (bits 19:16) and .AdvSIMD (bits 23:20) both 0b0001, Linux's FPHP
+        // and ASIMDHP together. Cranelift's `has_fp16` lowers vector ops.
+        "fp16" => {
+            let pfr0 = read_id_aa64pfr0_el1();
+            Some(aarch64_id_field(pfr0, 16) == 1 && aarch64_id_field(pfr0, 20) == 1)
+        }
+        // ID_AA64ISAR0_EL1.DP (bits 47:44): SDOT and UDOT.
+        "dotprod" => Some(aarch64_id_field(read_id_aa64isar0_el1(), 44) >= 1),
         "neon" => Some(true),
         _ => None,
     }
@@ -2330,6 +2423,7 @@ fn limine_boot_handoff() -> LimineBootHandoff {
             device_tree_blob: DEVICE_TREE_BLOB_REQUEST
                 .response()
                 .map(|response| response.dtb_ptr as usize),
+            measurement_log: TPM_EVENT_LOG_REQUEST.measurement_log(),
         },
     }
 }

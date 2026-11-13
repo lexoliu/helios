@@ -31,7 +31,7 @@
     "surfaces": ["x86"]
   },
   "test-units": {
-    "command": "just test-units",
+    "command": "just test-units && just test-erofs-mkfs",
     "rust-cache": true,
     "surfaces": ["x86", "hosted", "host_tools", "programs"]
   },
@@ -39,6 +39,9 @@
     "surfaces": ["riscv", "host_tools", "programs"]
   },
   "smoke-aarch64": {
+    "surfaces": ["aarch64", "host_tools", "programs"]
+  },
+  "smoke-aarch64-cfi": {
     "surfaces": ["aarch64", "host_tools", "programs"]
   },
   "smoke-x86-64": {

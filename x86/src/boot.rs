@@ -36,6 +36,11 @@ static DEVICE_TREE_BLOB_REQUEST: DeviceTreeBlobRequest = DeviceTreeBlobRequest::
 #[used]
 static STACK_SIZE_REQUEST: StackSizeRequest =
     StackSizeRequest::new().with_size(KERNEL_STACK_BYTES as u64);
+/// The firmware's TPM event log, which the measured-boot discovery reads
+/// to learn whether Limine measured the kernel (`tpm::discover`).
+#[used]
+static TPM_EVENT_LOG_REQUEST: helios_kernel::LimineTpmEventLogRequest =
+    helios_kernel::LimineTpmEventLogRequest::new();
 
 pub(crate) fn base_revision_supported() -> bool {
     BASE_REVISION.is_supported()
@@ -136,6 +141,7 @@ pub(crate) fn limine_boot_handoff() -> LimineBootHandoff {
         tables: BootFirmwareTables {
             acpi_rsdp: Some(acpi_rsdp),
             device_tree_blob,
+            measurement_log: TPM_EVENT_LOG_REQUEST.measurement_log(),
         },
     }
 }

@@ -8,6 +8,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 cranelift-codegen = { path = "../../wasmtime/cranelift/codegen", features = ["host-arch", "timing"] }
+helios-artifact.workspace = true
 helios-compiler-abi.workspace = true
 helios-compiler-support.workspace = true
 tracing.workspace = true

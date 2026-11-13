@@ -65,15 +65,22 @@ use super::super::{PendingReply, StoreData, guest_memory, view_trap};
 /// instance. The claim checks the instance's display device class, and
 /// an instance without it is told `unavailable`, which is what a
 /// machine with no display device tells every program.
-pub(in crate::wasmtime_adapter::component_host) fn add_display_to_linker<CpuImpl, Net, HostFs>(
-    linker: &mut Linker<StoreData<CpuImpl, Net, HostFs>>,
+pub(in crate::wasmtime_adapter::component_host) fn add_display_to_linker<
+    CpuImpl,
+    Net,
+    StorageImpl,
+>(
+    linker: &mut Linker<StoreData<CpuImpl, Net, StorageImpl>>,
 ) -> wasmtime::Result<()>
 where
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    display_wit::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, HostFs>>>(linker, |state| state)
+    display_wit::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>(
+        linker,
+        |state| state,
+    )
 }
 
 /// A compositor's hold on the display, as its store records it.
@@ -180,11 +187,11 @@ const fn from_wit_format(format: display_wit::PixelFormat) -> PixelFormat {
     }
 }
 
-impl<CpuImpl, Net, HostFs> StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     /// The queue into the display owner, checked against `generation`.
     fn display_sender(&self, generation: u64) -> Result<DisplaySender, DisplayServiceError> {
@@ -204,8 +211,8 @@ where
 /// would refuse never costs the instance a run, and before the owner
 /// task is told anything. The run is pinned from the calling instance's
 /// own pool, inside its host call. Nothing is shown here.
-fn prepare_frame<U, CpuImpl, Net, HostFs>(
-    mut access: Access<'_, U, HasSelf<StoreData<CpuImpl, Net, HostFs>>>,
+fn prepare_frame<U, CpuImpl, Net, StorageImpl>(
+    mut access: Access<'_, U, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>,
     span: Span,
     bytes: u64,
 ) -> Result<(Buffer, crate::InstanceSpawner<CpuImpl>), DisplayServiceError>
@@ -213,7 +220,7 @@ where
     U: 'static,
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let linear_memory = access.get().linear_memory;
     let memory = guest_memory(linear_memory, &access)?;
@@ -229,8 +236,8 @@ where
 ///
 /// The span is checked again: another call may have shown something
 /// overlapping it while the engine was creating the resource.
-fn show_frame<U, CpuImpl, Net, HostFs>(
-    mut access: Access<'_, U, HasSelf<StoreData<CpuImpl, Net, HostFs>>>,
+fn show_frame<U, CpuImpl, Net, StorageImpl>(
+    mut access: Access<'_, U, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>,
     span: Span,
     buffer: &Buffer,
     surface: impl FnOnce(ViewId) -> SurfaceHandle,
@@ -239,7 +246,7 @@ where
     U: 'static,
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let linear_memory = access.get().linear_memory;
     // The store's memory handle is recorded once, when the instance is
@@ -324,11 +331,11 @@ fn write_cursor(buffer: &Buffer, image: &[u8]) {
     unsafe { core::ptr::copy_nonoverlapping(image.as_ptr(), destination, image.len()) };
 }
 
-impl<CpuImpl, Net, HostFs> display_wit::Host for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> display_wit::Host for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn claim(&mut self) -> wasmtime::Result<Result<Resource<DisplayHandle>, display_wit::Error>> {
         let Some(service) = self.runtime_state.display_service() else {
@@ -363,11 +370,11 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> display_wit::HostDisplay for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> display_wit::HostDisplay for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn drop(&mut self, handle: Resource<DisplayHandle>) -> wasmtime::Result<()> {
         let handle = self.table.delete(handle)?;
@@ -387,11 +394,11 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> display_wit::HostSurface for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> display_wit::HostSurface for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn resolution(
         &mut self,
@@ -439,15 +446,15 @@ where
 /// store is given back before anything is awaited: an `Access` guard
 /// held across a wait would hold the store for as long as the display
 /// engine takes.
-fn claim_of<U, CpuImpl, Net, HostFs>(
-    mut access: Access<'_, U, HasSelf<StoreData<CpuImpl, Net, HostFs>>>,
+fn claim_of<U, CpuImpl, Net, StorageImpl>(
+    mut access: Access<'_, U, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>,
     handle: &Resource<DisplayHandle>,
 ) -> wasmtime::Result<Result<(u64, DisplaySender), display_wit::Error>>
 where
     U: 'static,
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let data = access.get();
     let generation = data.table.get(handle)?.generation();
@@ -458,15 +465,15 @@ where
 }
 
 /// What a surface call needs from the store before it waits.
-fn surface_claim<U, CpuImpl, Net, HostFs>(
-    mut access: Access<'_, U, HasSelf<StoreData<CpuImpl, Net, HostFs>>>,
+fn surface_claim<U, CpuImpl, Net, StorageImpl>(
+    mut access: Access<'_, U, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>,
     handle: &Resource<SurfaceHandle>,
 ) -> wasmtime::Result<Result<(u64, ScanoutId, DisplaySender), display_wit::Error>>
 where
     U: 'static,
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let data = access.get();
     let surface = data.table.get(handle)?;
@@ -552,13 +559,13 @@ impl<T: 'static> StreamProducer<T> for DisplayChangeStreamProducer {
     }
 }
 
-impl<CpuImpl, Net, HostFs, U> display_wit::HostDisplayWithStore<U>
-    for HasSelf<StoreData<CpuImpl, Net, HostFs>>
+impl<CpuImpl, Net, StorageImpl, U> display_wit::HostDisplayWithStore<U>
+    for HasSelf<StoreData<CpuImpl, Net, StorageImpl>>
 where
     U: 'static,
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     async fn scanouts(
         accessor: &Accessor<U, Self>,
@@ -824,13 +831,13 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs, U> display_wit::HostSurfaceWithStore<U>
-    for HasSelf<StoreData<CpuImpl, Net, HostFs>>
+impl<CpuImpl, Net, StorageImpl, U> display_wit::HostSurfaceWithStore<U>
+    for HasSelf<StoreData<CpuImpl, Net, StorageImpl>>
 where
     U: 'static,
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     async fn set_cursor(
         accessor: &Accessor<U, Self>,

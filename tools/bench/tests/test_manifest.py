@@ -125,6 +125,7 @@ def test_aot_curl_runs_the_compiler_plugin_on_both_compared_columns() -> None:
         "--input": "{guest:artifacts/wasi-tools/curl.wasm}",
         "--output": "{workdir}/aot-curl-output.cwasm",
         "--target": "{compiler_target}",
+        "--isa-level": "{compiler_isa_level}",
         "--hint": "performance",
         "--workers": "{compiler_workers}",
     }

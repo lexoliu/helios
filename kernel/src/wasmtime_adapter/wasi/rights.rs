@@ -135,6 +135,82 @@ impl<'d, K, R> Granted<'d, K, R> {
     }
 }
 
+/// Proof of both bases of an operation that makes an object reachable
+/// under a second directory, checked together: the source base may be read
+/// and the destination base may have its entries changed.
+///
+/// A hard link and a rename both do this: the object is reachable through
+/// the destination afterwards, with the destination's rights. A destination
+/// that can write must therefore not be fed by a source the caller could not
+/// have opened for writing; only [`Granted::alias_into`] makes one.
+///
+/// `Removal` is the proof the operation needs beyond that. A link leaves
+/// the source entry alone and carries `()`; a rename removes it, and
+/// [`AliasGrant::removing_source`] adds the source base's `mutate-directory`.
+pub(crate) struct AliasGrant<'s, 'd, Removal = ()> {
+    source: Granted<'s, Directory, Read>,
+    destination: Granted<'d, Directory, Mutate>,
+    _removal: Removal,
+}
+
+/// The proof a rename takes: [`AliasGrant`] with the source base's
+/// `mutate-directory`.
+pub(crate) type RenameGrant<'s, 'd> = AliasGrant<'s, 'd, Granted<'s, Directory, Mutate>>;
+
+impl<'s> Granted<'s, Directory, Read> {
+    /// Pairs this source base with a destination base. Refuses with
+    /// `NotPermitted` when the destination holds `WRITE` and the source
+    /// does not: the second name would otherwise make a file writable that
+    /// the caller could only read.
+    pub(crate) fn alias_into<'d>(
+        self,
+        destination: Granted<'d, Directory, Mutate>,
+    ) -> FsOpResult<AliasGrant<'s, 'd>> {
+        let writable = destination
+            .descriptor()
+            .flags
+            .contains(fs_types::DescriptorFlags::WRITE);
+        if writable
+            && !self
+                .descriptor()
+                .flags
+                .contains(fs_types::DescriptorFlags::WRITE)
+        {
+            return Err(fs_types::ErrorCode::NotPermitted);
+        }
+        Ok(AliasGrant {
+            source: self,
+            destination,
+            _removal: (),
+        })
+    }
+}
+
+impl<'s, 'd> AliasGrant<'s, 'd> {
+    /// Adds what a rename needs: the source base's `mutate-directory`,
+    /// refused as `ReadOnly`, since the rename removes the source entry.
+    pub(crate) fn removing_source(self) -> FsOpResult<RenameGrant<'s, 'd>> {
+        let removal = self.source.descriptor().grant()?;
+        Ok(AliasGrant {
+            source: self.source,
+            destination: self.destination,
+            _removal: removal,
+        })
+    }
+}
+
+impl<'s, 'd, Removal> AliasGrant<'s, 'd, Removal> {
+    /// The source base.
+    pub(crate) fn source(&self) -> &'s FsDescriptor {
+        self.source.descriptor()
+    }
+
+    /// The destination base.
+    pub(crate) fn destination(&self) -> &'d FsDescriptor {
+        self.destination.descriptor()
+    }
+}
+
 impl FsDescriptor {
     /// Proves this descriptor names a `K` and holds `R`: the kind is tested
     /// first, then the right, and each refusal is the one its marker names.

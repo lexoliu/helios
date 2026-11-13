@@ -4,7 +4,7 @@ use std::thread;
 
 use helios_hal::cpu::ProcessorId;
 
-const DEFAULT_HEAP_BYTES: usize = 128 * 1024 * 1024;
+pub(crate) const DEFAULT_HEAP_BYTES: usize = 128 * 1024 * 1024;
 
 /// Hosted runtime configuration sourced from the process environment.
 ///
@@ -52,25 +52,6 @@ impl HostedConfig {
             bootstrap_processor: ProcessorId::new(bootstrap_processor as u16),
             heap_bytes,
             init_wasi_root,
-            bootfs,
-        }
-    }
-
-    /// A configuration for a test that builds its own `HostedMachine`:
-    /// `processor_count` processors, the default heap, no WASI root, and
-    /// the payload at `bootfs`. The process's arguments belong to the
-    /// test runner, so [`Self::from_env`] cannot serve.
-    #[cfg(test)]
-    pub(crate) fn for_test(processor_count: usize, bootfs: PathBuf) -> Self {
-        assert!(
-            processor_count != 0,
-            "a hosted machine needs at least one processor"
-        );
-        Self {
-            processor_count,
-            bootstrap_processor: ProcessorId::new(0),
-            heap_bytes: DEFAULT_HEAP_BYTES,
-            init_wasi_root: None,
             bootfs,
         }
     }
