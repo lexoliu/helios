@@ -40,14 +40,16 @@ pub(crate) fn discover(pci: &PciRoot) -> Option<PciAddress> {
 
 /// Brings up the virtio-balloon function at `address` and hands it to
 /// the kernel's balloon tasks.
-pub(crate) fn install<WatchdogImpl>(
-    kernel: &helios_kernel::Kernel<crate::X86Cpu, WatchdogImpl>,
+pub(crate) fn install<WatchdogImpl, MeasuredBootImpl>(
+    kernel: &helios_kernel::Kernel<crate::X86Cpu, WatchdogImpl, MeasuredBootImpl>,
     pci: &PciRoot,
     address: PciAddress,
     physical_memory_offset: usize,
+    generation: helios_kernel::MachineGenerationHandle,
 ) -> BalloonHandle
 where
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
 {
     let device = helios_virtio::balloon_from_pci(
         &pci.access(),
@@ -60,7 +62,7 @@ where
         panic!("failed to initialize the virtio-balloon function at {address}: {error}")
     });
     let device = Arc::new(device);
-    let handle = helios_kernel::install_memory_balloon(kernel, device.clone());
+    let handle = helios_kernel::install_memory_balloon(kernel, device.clone(), generation);
     // Local, like the balloon tasks it wakes: `install_memory_balloon`
     // keeps those on the processor that brought the device up.
     kernel.spawn_local_detached(poll_interrupt_status(device, kernel.timer()));

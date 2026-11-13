@@ -110,6 +110,18 @@ interface programs {
     rights: list<link-right>,
   }
 
+  enum mount-right {
+    mount,
+    unmount,
+  }
+
+  record mount-grant {
+    /// Mount-table rights granted to the child. These must be a subset of
+    /// the caller's mount authority; where the child may mount is still
+    /// bounded by its directory grants.
+    rights: list<mount-right>,
+  }
+
   /// A machine-wide device class a program may claim. A program that
   /// holds none of them sees the same answers as a machine without that
   /// hardware: `available` lists nothing and `claim` reports the device
@@ -129,6 +141,20 @@ interface programs {
     classes: list<device-class>,
   }
 
+  /// A right over the machine's diagnostics. A program that holds none
+  /// of them reads only its own tracing and profiling records.
+  enum diagnostics-right {
+    /// Control the machine-wide tracing and profiling and read every
+    /// instance's records.
+    observe-machine,
+  }
+
+  record diagnostics-grant {
+    /// Diagnostics rights granted to the child. These must be a subset
+    /// of the caller's diagnostics authority.
+    rights: list<diagnostics-right>,
+  }
+
   variant capability-grant {
     directory(directory-grant),
     network(network-grant),
@@ -136,7 +162,9 @@ interface programs {
     terminal(terminal-grant),
     process(process-grant),
     link(link-grant),
+    mount(mount-grant),
     device(device-grant),
+    diagnostics(diagnostics-grant),
   }
 
   record spawn-request {
@@ -197,6 +225,14 @@ interface programs {
     instance-id: instance-id,
     exit-code: u32,
     output: exec-output,
+    /// The launch's own duration in nanoseconds on the kernel's
+    /// monotonic clock: from the `exec` call's arrival in the kernel
+    /// to its result being in hand (the child exited and both output
+    /// pipes drained), the interval the launch-phase timeline brackets
+    /// from `rpc-arrival` to `reply`. Nothing outside the guest is
+    /// inside it, so a caller across a transport reads the launch
+    /// without the transport.
+    launch-nanos: u64,
   }
 
   record exit-status {
@@ -215,6 +251,10 @@ interface programs {
     out-of-memory,
     unavailable,
     internal,
+    /// The program file does not exist.
+    not-found,
+    /// Reading the program file failed with an I/O error.
+    io,
   }
 
   record spawn-error {

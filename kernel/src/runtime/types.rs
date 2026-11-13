@@ -8,6 +8,7 @@ use core::ptr;
 
 use crate::InstanceId;
 use bytes::Bytes;
+use helios_hal::fs::{WritePosition, WriteProgress};
 use helios_hal::io::IoError;
 use thiserror::Error;
 
@@ -1024,6 +1025,12 @@ impl AuthorityDomain {
     /// They belong to no real filesystem, so they need a device id of their
     /// own for `st_dev` to stay distinct from bootfs and the host share.
     pub const GUEST_DEVICES: Self = Self(3);
+    /// Every namespace's private root layer: the writable tree each process
+    /// tree keeps over the boot image.
+    pub const GUEST_ROOT_LAYER: Self = Self(4);
+    /// The first id the mount table hands to a filesystem it mounts; every
+    /// later one counts up from here.
+    pub const FIRST_MOUNTED: Self = Self(5);
     const HOST_DEVICE_NAMESPACE: u64 = 1 << 63;
 
     pub const fn new(raw: u64) -> Self {
@@ -1146,8 +1153,8 @@ impl HostFsError {
     }
 }
 
-/// What a machine restore did to the host share, as far as the kernel
-/// can tell from the restore's cause.
+/// What a machine restore or a device reset did to the host share, as far
+/// as the kernel can tell from its cause.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostShareRestore {
     /// The host's 9p server is the one the session was attached to and
@@ -1157,17 +1164,94 @@ pub enum HostShareRestore {
     ServerKept,
     /// The server no longer knows the session or any fid in it, because
     /// the kernel came back from an image taken before the server saw
-    /// them. The session is dropped without a `Tclunk`, and the next
-    /// operation attaches again.
+    /// them, or because the virtio 9p device itself was reset
+    /// ([`crate::ResetDevice::HostShare`]). The session is dropped
+    /// without a `Tclunk`, and the next operation attaches again.
     SessionLost,
 }
 
-pub trait HostFileSystem: Clone + Send + 'static {
+/// A host-share write [`HostFileSystem::prepare_write`] staged.
+///
+/// A write lands in rounds: each round's destinations are staged before
+/// its bytes, filled synchronously, and then sent. An implementation
+/// bounds a round by the destinations it can hold at once (the 9p
+/// client's request pool), never by the write's length; the rounds'
+/// lengths sum to the prepared length and land in order at consecutive
+/// offsets.
+///
+/// Dropping a staged or filled write before its submit returns what it
+/// holds (its destinations, its open file) and leaves the file as it
+/// was: the rounds already submitted have landed, this one has not.
+/// Dropping a submit's future part way may leave part of its round
+/// written.
+///
+/// Concurrency: a staged write is owned by the task that prepared it and
+/// moved, never shared; for its whole life it counts as an operation in
+/// flight on the share, so a snapshot hold waits for it.
+pub trait HostWrite: Send + Sized {
+    /// The round once its bytes are in.
+    type Filled: HostFilledWrite<Next = Self>;
+
+    /// The bytes this round stages.
+    fn staged_len(&self) -> usize;
+
+    /// Writes this round's bytes into its destinations. `fill` is called
+    /// once per destination region, in write order, with the region's
+    /// offset from the start of the whole write; the regions cover
+    /// [`Self::staged_len`] bytes exactly.
+    fn fill<F>(self, fill: F) -> Self::Filled
+    where
+        F: FnMut(usize, &mut [u8]);
+}
+
+/// A round of a [`HostWrite`] whose bytes are in, ready to send.
+pub trait HostFilledWrite: Send + Sized {
+    /// The staged write the next round continues as.
+    type Next;
+
+    /// Sends the round in order, checking that the host took every byte
+    /// of it, and resolves with the next round staged or, after the last,
+    /// the offset the whole write began at.
+    fn submit(self) -> impl Future<Output = Result<WriteProgress<Self::Next>, HostFsError>> + Send;
+}
+
+/// The write of a host filesystem that refuses every write before it is
+/// staged.
+impl HostWrite for core::convert::Infallible {
+    type Filled = Self;
+
+    fn staged_len(&self) -> usize {
+        match *self {}
+    }
+
+    fn fill<F>(self, _: F) -> Self
+    where
+        F: FnMut(usize, &mut [u8]),
+    {
+        match self {}
+    }
+}
+
+impl HostFilledWrite for core::convert::Infallible {
+    type Next = Self;
+
+    async fn submit(self) -> Result<WriteProgress<Self>, HostFsError> {
+        match self {}
+    }
+}
+
+pub trait HostFileSystem: Clone + Send + Sync + 'static {
+    /// The write [`Self::prepare_write`] stages.
+    type Write<'a>: HostWrite
+    where
+        Self: 'a;
+
     /// How this filesystem's caches have been serving the kernel, or
     /// `None` from an implementation that caches nothing.
     fn cache_stats(&self) -> Option<crate::HostFsCacheStats>;
 
-    /// Brings the filesystem's own state in line with a machine restore:
+    /// Brings the filesystem's own state in line with a machine restore
+    /// or a reset of its device:
     /// an implementation with a session and caches drops what `restore`
     /// says is stale, and one with neither does nothing. Called by the
     /// machine-generation reactions task, never concurrently with
@@ -1216,20 +1300,17 @@ pub trait HostFileSystem: Clone + Send + 'static {
         offset: u64,
         max_bytes: u32,
     ) -> impl Future<Output = Result<Vec<u8>, HostFsError>> + Send + 'a;
-    fn write_file<'a>(
+    /// Stages a write of `len` bytes to `path` at `position`: opens the
+    /// file, resolves where the bytes land (an append reads the host's
+    /// current end of file, so concurrent growth is not overwritten) and
+    /// readies the destinations the first round of bytes goes into.
+    /// Nothing reaches the file until [`HostFilledWrite::submit`].
+    fn prepare_write<'a>(
         &'a self,
         path: &'a str,
-        offset: u64,
-        bytes: &'a [u8],
-    ) -> impl Future<Output = Result<(), HostFsError>> + Send + 'a;
-    /// Appends to the end of `path`, resolving the current end of file on the
-    /// host so concurrent growth is not overwritten. Resolves with the offset
-    /// the bytes were written at.
-    fn append_file<'a>(
-        &'a self,
-        path: &'a str,
-        bytes: &'a [u8],
-    ) -> impl Future<Output = Result<u64, HostFsError>> + Send + 'a;
+        position: WritePosition,
+        len: usize,
+    ) -> impl Future<Output = Result<Self::Write<'a>, HostFsError>> + Send + 'a;
     /// Flushes host-side buffers for `path` (9p `Tfsync`).
     fn sync_file<'a>(
         &'a self,
@@ -1282,14 +1363,6 @@ pub trait HostFileSystem: Clone + Send + 'static {
         &'a self,
         path: &'a str,
     ) -> impl Future<Output = Result<String, HostFsError>> + Send + 'a;
-}
-
-pub trait ComponentHostFilesystemState<Service>: Clone + Send + 'static
-where
-    Service: HostFileSystem,
-{
-    fn host_filesystem_service(&self) -> Option<Service>;
-    fn bootfs(&self) -> Option<crate::EmbeddedBootFs>;
 }
 
 #[cfg(test)]

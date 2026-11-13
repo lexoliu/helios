@@ -873,11 +873,14 @@ impl Aarch64UserAddressSpace {
     /// reordering, gathering and early write acknowledgement that make a
     /// register file misbehave. A prefetchable region — a framebuffer,
     /// an aperture — is real memory behind a bus window and says so, so
-    /// it keeps the normal cacheable attributes.
+    /// it keeps the normal cacheable attributes. Write-combining memory
+    /// selects index 6, Normal non-cacheable: stores may gather, and no
+    /// cache holds a line another agent reads without snooping.
     fn device_pte(&self, attributes: DeviceRegionAttributes) -> u64 {
         let index = match attributes.kind {
             MemoryKind::Device => crate::PAGE_ATTR_DEVICE_INDEX,
             MemoryKind::Normal => ATTR_NORMAL,
+            MemoryKind::WriteCombining => crate::PAGE_ATTR_NORMAL_NC_INDEX,
         };
         let access = if attributes.writable {
             AP_KERNEL_RW
@@ -988,6 +991,12 @@ impl SwapLeafFormat for Aarch64UserAddressSpace {
             .checked_sub(self.physical_memory_offset)
             .expect("a user frame lies in the kernel's physical memory map");
         let descriptor = (phys as u64) | pte_flags | PAGE_DESCRIPTOR | AF | SH_INNER;
+        if flags.contains(PageFlags::EXECUTE) {
+            // The bytes were written through the direct map, and the frame's
+            // earlier user may have left its own code in an instruction
+            // cache: publish them before the leaf makes them fetchable.
+            crate::make_instructions_coherent(frame.as_ptr(), PAGE);
+        }
         // SAFETY: as above. The frame's bytes are ordered before the
         // descriptor that exposes them, and the descriptor before any
         // walk that can see it.

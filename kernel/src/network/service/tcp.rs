@@ -39,6 +39,39 @@ impl Iterator for ReceivePairOrder {
     }
 }
 
+/// What one receive batch's frames became, gathered by the drain's sink
+/// while the device holds each frame's pair and read by the poll once
+/// the device has let go.
+///
+/// Owned by the polling task alone: the sink runs synchronously on the
+/// processor that called the drain, so nothing here is shared.
+struct RxBatchDelivery {
+    /// Shards that took a frame, signalled once the batch is done.
+    arrivals: ShardArrivals,
+    /// Frames a shard consumed — delivered or unparseable — which is
+    /// what the poll's receive budget counts.
+    delivered: usize,
+    delivered_bytes: usize,
+    /// Bytes of every frame the device lent, refused ones included:
+    /// the ring phase's byte count.
+    lent_bytes: usize,
+    /// Time spent demuxing inside the device's hold, summed over the
+    /// batch's frames, which the ring phase is reported without.
+    dispatch: NetworkPerfSpan,
+}
+
+impl RxBatchDelivery {
+    fn new() -> Self {
+        Self {
+            arrivals: ShardArrivals::new(),
+            delivered: 0,
+            delivered_bytes: 0,
+            lent_bytes: 0,
+            dispatch: NetworkPerfSpan::default(),
+        }
+    }
+}
+
 pub(super) struct TcpListenerState {
     pub(super) stack_socket: helios_netstack::SocketId,
     pub(super) local_port: u16,
@@ -302,9 +335,11 @@ where
             // What was queued becomes a segment on this shard's egress
             // while the lock is already held; nothing else has to run
             // for the write to reach the wire.
-            state.stack.drive_tcp(now).unwrap_or_else(|error| {
-                tracing::debug!(?error, "failed to drive TCP after stream write")
-            });
+            state
+                .drive_tcp(now, &self.inner.control)
+                .unwrap_or_else(|error| {
+                    tracing::debug!(?error, "failed to drive TCP after stream write")
+                });
             Ok(progress)
         })?;
         let (transmitted, _) = self
@@ -418,7 +453,7 @@ where
     /// reset on the outbound queue, and neither puts a frame anywhere a
     /// shard's own arrival signal would see. Without the kick the
     /// segment waits for the pump's next park to expire — up to
-    /// `DHCP_RETRANSMIT_NANOS` on a guest with nothing else to send —
+    /// `CONFIGURATION_POLL_NANOS` on a guest with nothing else to send —
     /// so a peer learns of the close a second after the guest made it.
     /// The kick belongs here rather than at the call sites: #232 put it
     /// on the component host's retirement drain, and the owners that
@@ -541,29 +576,33 @@ where
             detail: NetworkErrorDetail::NetworkServiceUnavailable,
         })?;
         let shard_count = self.inner.state.shard_count();
-        let local_port = if local_port == 0 {
-            // Allocating from this processor's own shard, preferring a
-            // port whose answers hash back to it, is what keeps a
-            // connection opened here from being received somewhere
-            // else. Ownership follows the hash either way.
+        let opened_at = StackInstant::from_nanos(self.now_nanos());
+        let stream = if local_port == 0 {
+            // Choosing the port and opening the connection are one
+            // step: a four-tuple a lingering connection still holds
+            // (TIME-WAIT included) can only be seen by opening, so the
+            // walk moves on at that conflict instead of failing.
+            self.inner.state.open_ephemeral_tcp_connect(
+                self.accepting_shard_idx(),
+                TcpConnectRequest {
+                    local,
+                    destination,
+                    port,
+                    hop_limit,
+                    opened_at,
+                },
+            )?
+        } else {
+            // A program-bound port is one attempt; a conflict is the
+            // program's to see.
+            let owner = shard_idx_for_flow(local, local_port, destination, port, shard_count);
             self.inner
                 .state
-                .shard_at(self.accepting_shard_idx())
+                .shard_at(owner)
                 .lock()
-                .allocate_tcp_local_port_for(local, destination, port, shard_count)?
-        } else {
-            local_port
+                .start_tcp_connect(local, destination, port, local_port, hop_limit, opened_at)
+                .map_err(TcpConnectStartError::into_tcp_error)?
         };
-        let owner = shard_idx_for_flow(local, local_port, destination, port, shard_count);
-        let opened_at = StackInstant::from_nanos(self.now_nanos());
-        let stream = self.inner.state.shard_at(owner).lock().start_tcp_connect(
-            local,
-            destination,
-            port,
-            local_port,
-            hop_limit,
-            opened_at,
-        )?;
 
         loop {
             // Sampled before the handshake state is inspected, so a SYN-ACK
@@ -712,7 +751,7 @@ where
             //
             // Left to the packet pump instead, the segment waits for
             // the pump's next wake, and an idle pump parks for
-            // `DHCP_RETRANSMIT_NANOS`. A request/response exchange then
+            // `CONFIGURATION_POLL_NANOS`. A request/response exchange then
             // pays a second per round trip, which is #158: 5000 echo
             // round trips could not finish inside the benchmark's 180 s
             // iteration deadline.
@@ -1151,6 +1190,60 @@ where
         Ok(reclaimed)
     }
 
+    /// Demuxes one frame the device lent to the shard that owns its
+    /// flow, and records what became of it in `batch`.
+    ///
+    /// This is the receive drain's sink, so it runs with the frame's
+    /// queue pair held: the pair's receive state ranks above the shard
+    /// lock `dispatch_rx_frame` takes, and nothing here waits for the
+    /// pair. The shard that took the frame is remembered rather than
+    /// signalled: the signal belongs after every lock is released, and
+    /// a batch that lands several frames in the same shard should
+    /// release its waiters once.
+    ///
+    /// Each frame takes its owning shard's lock on its own, so frames
+    /// for different flows are processed in parallel by other
+    /// processors and each shard's stack only sees the connections it
+    /// owns.
+    fn deliver_rx_frame(
+        &self,
+        frame: &RxFrame,
+        received_at: StackInstant,
+        batch: &mut RxBatchDelivery,
+    ) {
+        let dispatch_started = self.profile_start();
+        let frame_len = frame.len();
+        batch.lent_bytes = batch.lent_bytes.saturating_add(frame_len);
+        match self
+            .inner
+            .state
+            .dispatch_rx_frame(frame, received_at, &self.inner.control)
+        {
+            RxFrameDispatch::Delivered { shard_idx } => {
+                batch.arrivals.record(shard_idx);
+                self.inner.state.record_received(shard_idx, 1);
+                batch.delivered += 1;
+                batch.delivered_bytes = batch.delivered_bytes.saturating_add(frame_len);
+            }
+            // The frame is already off the ring and cannot be put back,
+            // so it is lost — which is what a closed receive window
+            // means and what the peer's retransmission is for. The rest
+            // of the batch belongs to other shards and is delivered
+            // regardless: one saturated flow does not get to drop
+            // another flow's segments, nor an ARP request.
+            RxFrameDispatch::Backpressured { shard_idx } => {
+                self.inner.state.record_receive_refused(shard_idx, 1);
+            }
+            RxFrameDispatch::Malformed => {
+                batch.delivered += 1;
+                batch.delivered_bytes = batch.delivered_bytes.saturating_add(frame_len);
+            }
+        }
+        if let Some(dispatch) = NetworkPerfSpan::between(dispatch_started, self.profile_start()) {
+            batch.dispatch.add(dispatch);
+        }
+    }
+
     /// Drains received frames from the queue pairs this poll scope
     /// owns, which is what puts a reply into the shard that is waiting
     /// for it.
@@ -1163,37 +1256,45 @@ where
     /// A pump visits only the pair it owns; every other pair has a pump
     /// of its own parked on it, so a frame is never without a drainer.
     ///
+    /// Each frame reaches `sink` while the device still holds the pair
+    /// it came from, so frames of one pair are delivered in ring order
+    /// however many processors drain it: a second drainer cannot take
+    /// the frames behind a batch and deliver them before the batch
+    /// lands.
+    ///
     /// The local pair is visited first, so a processor drains its own
     /// ring before it looks at anyone else's, and a pair another
     /// processor already holds is skipped by the device's `try_lock` —
-    /// that processor is draining it and this poll has nothing to add.
-    /// `None` means every pair the scope covers was held, which is the
-    /// same "come back later" a single-pair drain reports.
+    /// that processor is delivering it, and wakes the pair's waiters if
+    /// it lets go with frames still on the ring, so this poll has
+    /// nothing to add. `None` means every pair the scope covers was
+    /// held, which is the same "come back later" a single-pair drain
+    /// reports.
+    ///
+    /// `limit` bounds the frames the whole sweep hands to `sink`, and
+    /// with it how long any one pair is held.
     ///
     /// A pair that refuses ends the sweep, and the refusal travels back
-    /// beside the frames the sweep had already collected rather than in
-    /// place of them. Those frames are off the ring and no used entry
-    /// can be put back, so dropping them to report the error costs up
-    /// to a whole batch of good frames per malformed chain and makes
-    /// the peer retransmit data the guest did receive. The refusal is
-    /// counted against the pair that produced it here, because this is
-    /// the last place that knows which pair that was.
+    /// beside the count of frames the sweep had already delivered. The
+    /// refusal is counted against the pair that produced it here,
+    /// because this is the last place that knows which pair that was.
     fn receive_frames_immediate(
         &self,
         pairs: impl Iterator<Item = usize>,
-        frames: &mut [Option<RxFrame>],
+        limit: usize,
+        mut sink: impl FnMut(&RxFrame),
     ) -> Option<RxDrain> {
         let mut received = 0usize;
         let mut drained_a_pair = false;
         for pair_idx in pairs {
-            if received >= frames.len() {
+            if received >= limit {
                 break;
             }
-            let Some(drain) = self
-                .inner
-                .device
-                .try_receive_frames_immediate_on(pair_idx, &mut frames[received..])
-            else {
+            let Some(drain) = self.inner.device.try_receive_frames_immediate_on(
+                pair_idx,
+                limit - received,
+                &mut sink,
+            ) else {
                 continue;
             };
             drained_a_pair = true;
@@ -1281,148 +1382,78 @@ where
             }
 
             let receive_limit = remaining_rx_budget.min(NETWORK_RX_BATCH_FRAMES);
-            let mut frames: [Option<RxFrame>; NETWORK_RX_BATCH_FRAMES] =
-                core::array::from_fn(|_| None);
+            let received_at = StackInstant::from_nanos(self.now_nanos());
+            let mut batch = RxBatchDelivery::new();
+            // Each frame is demuxed to its shard from inside the drain,
+            // while the device still holds the pair it came from. That
+            // is what keeps two drainers of one pair — its pump and an
+            // operation sweeping every pair — from delivering its frames
+            // in an order the ring never had. A drain that popped a
+            // batch and released the pair before demuxing it let the
+            // other drainer pop the frames behind the batch and land
+            // them first, and the stack read every overtaken segment as
+            // a hole: it queued the earlier segment out of order and
+            // owed the peer a duplicate acknowledgement, and the peer
+            // fast-retransmitted data that was never lost (#776).
             let ring_started = self.profile_start();
             let drain = self.receive_frames_immediate(
                 scope.pairs(local_pair, pair_count),
-                &mut frames[..receive_limit],
+                receive_limit,
+                |frame| self.deliver_rx_frame(frame, received_at, &mut batch),
             );
-            // Only the immediate path's frames count as ring events: a
-            // fallback's frames come from pair zero's async receive and
-            // belong to `rx-fallback`.
-            let ring_frames = drain.as_ref().map_or(0, |drain| drain.received);
-            self.record_network_profile_events_bytes(
+            let ring_finished = self.profile_start();
+            // The hold interleaves the driver's ring work with the demux
+            // frame by frame, so the two phases are the hold split by
+            // the demux time summed inside it: `rx-dispatch` is that
+            // sum, and `rx-ring` the rest of the hold — popping, chain
+            // assembly, and posting the pass's buffers back.
+            let received_batch = drain.as_ref().map_or(0, |drain| drain.received);
+            let hold = NetworkPerfSpan::between(ring_started, ring_finished);
+            self.record_network_profile_span(
                 source.rx_ring_phase(),
-                ring_started,
-                ring_frames,
-                frames[..ring_frames]
-                    .iter()
-                    .flatten()
-                    .map(RxFrame::len)
-                    .sum(),
-            );
-            let RxDrain {
-                received: received_batch,
-                refusal,
-            } = match drain {
-                Some(drain) => drain,
-                // The immediate path found every pair it covers held
-                // mid-drain by somebody else. The pair-agnostic receive
-                // is pair zero's async lock — worth taking only when
-                // this scope owns pair zero; any other held pair is
-                // being drained by its pump and needs nothing from us.
-                None if scope.covers_pair_zero() => {
-                    let mut received_batch = 0usize;
-                    for frame in &mut frames[..receive_limit] {
-                        let Some(received_frame) = self.inner.device.try_receive_frame().await?
-                        else {
-                            break;
-                        };
-                        // The lock wait inside `try_receive_frame` is
-                        // outside this span: only the synchronous
-                        // hand-off of the frame it produced is measured.
-                        let fallback_started = self.profile_start();
-                        *frame = Some(received_frame);
-                        received_batch += 1;
-                        self.record_network_profile_events(
-                            source.rx_fallback_phase(),
-                            fallback_started,
-                            1,
-                        );
-                    }
-                    RxDrain::completed(received_batch)
-                }
-                None => break,
-            };
-            // A refused drain still falls through the demux below, so
-            // the frames it did take reach their shards and their
-            // receive slots go back to the device before the error is
-            // reported at the bottom of the iteration.
-            if received_batch == 0 && refusal.is_none() {
-                break;
-            }
-
-            let received_at = StackInstant::from_nanos(self.now_nanos());
-            // Demux each frame to the shard owning its destination
-            // port. The previous single-shard path locked
-            // `shard_for_default` once per batch; under multi-shard
-            // we lock the owning shard per-frame so different
-            // ports can be processed in parallel by other CPUs and
-            // each shard's Stack only sees the connections it
-            // actually owns.
-            //
-            // The shard that took a frame is remembered rather than
-            // signalled here: the signal belongs after the lock is
-            // released, and a batch that lands several frames in the
-            // same shard should release its waiters once.
-            let mut arrivals = ShardArrivals::new();
-            let dispatch_started = self.profile_start();
-            for frame in frames[..received_batch].iter().flatten() {
-                let frame_len = frame.len();
-                match self
-                    .inner
-                    .state
-                    .dispatch_rx_frame(frame, received_at, &self.inner.control)
-                {
-                    RxFrameDispatch::Delivered { shard_idx } => {
-                        arrivals.record(shard_idx);
-                        self.inner.state.record_received(shard_idx, 1);
-                        received += 1;
-                        received_bytes = received_bytes.saturating_add(frame_len);
-                    }
-                    // The frame is already off the ring and cannot be
-                    // put back, so it is lost — which is what a closed
-                    // receive window means and what the peer's
-                    // retransmission is for. The rest of the batch
-                    // belongs to other shards and is delivered
-                    // regardless: one saturated flow does not get to
-                    // drop another flow's segments, nor an ARP request.
-                    RxFrameDispatch::Backpressured { shard_idx } => {
-                        self.inner.state.record_receive_refused(shard_idx, 1);
-                    }
-                    RxFrameDispatch::Malformed => {
-                        received += 1;
-                        received_bytes = received_bytes.saturating_add(frame_len);
-                    }
-                }
-            }
-            self.record_network_profile_events(
-                source.rx_dispatch_phase(),
-                dispatch_started,
+                hold.map(|hold| hold.excluding(batch.dispatch)),
                 received_batch,
+                batch.lent_bytes,
             );
-            // Every shard that took a frame is released here. Without
-            // this a reply demuxed into a foreign shard would sit there
-            // until its waiter's own deadline expired.
+            if received_batch != 0 {
+                self.record_network_profile_span(
+                    source.rx_dispatch_phase(),
+                    hold.map(|_| batch.dispatch),
+                    received_batch,
+                    0,
+                );
+            }
+            // `None`: every pair this scope covers is held by somebody
+            // else, who is delivering it and wakes the pair's waiters
+            // if it lets go with frames left on the ring. The caller
+            // parks on the wait it armed before this poll.
+            let Some(RxDrain { refusal, .. }) = drain else {
+                break;
+            };
+            received += batch.delivered;
+            received_bytes = received_bytes.saturating_add(batch.delivered_bytes);
+            // Every shard that took a frame is released here, after the
+            // ring and shard locks are gone, so a woken waiter never
+            // contends with the drain that woke it. Without this a reply
+            // demuxed into a foreign shard would sit there until its
+            // waiter's own deadline expired.
             let signal_started = self.profile_start();
-            self.inner.state.notify_arrivals(&arrivals);
+            self.inner.state.notify_arrivals(&batch.arrivals);
             self.record_network_profile_events(
                 source.rx_signal_phase(),
                 signal_started,
-                arrivals.len(),
+                batch.arrivals.len(),
             );
 
-            let repost_started = self.profile_start();
-            let reposted = self
-                .inner
-                .device
-                .repost_rx_frames_immediate(&mut frames[..received_batch])?;
-            // Returning the batch's slots is the same driver receive the
-            // ring phase covers; it records no frames of its own.
-            self.record_network_profile_events(source.rx_ring_phase(), repost_started, 0);
-            if reposted.is_none() {
-                for frame in &mut frames[..received_batch] {
-                    drop(frame.take());
-                }
-            }
-
-            // The drain that produced this batch was refused. Its
-            // frames have reached their shards and their receive slots
-            // are back with the device, so the error is what is left to
-            // report.
+            // The drain that produced this batch was refused. The frames
+            // in front of the refusal have reached their shards and
+            // their receive slots are back with the device, so the error
+            // is what is left to report.
             if let Some(refusal) = refusal {
                 return Err(refusal);
+            }
+            if received_batch == 0 {
+                break;
             }
         }
         self.record_network_profile_events_bytes(
@@ -1443,8 +1474,7 @@ where
         // the pump's pair for a pump.
         let drive_tcp = |state: &mut NetworkShard| {
             state
-                .stack
-                .drive_tcp(now)
+                .drive_tcp(now, &self.inner.control)
                 .unwrap_or_else(|error| tracing::debug!(?error, "failed to drive TCP control"));
         };
         match scope {
@@ -1588,9 +1618,143 @@ where
     }
 }
 
+/// Why a connection could not be started on a shard.
+///
+/// A caller that chooses the local port tells the two apart: only
+/// [`Self::PortInUse`] is cured by another port. A program-bound port
+/// sees either as the same [`TcpError`].
+#[derive(Debug)]
+pub(super) enum TcpConnectStartError {
+    /// A listener holds the local port, or a non-closed socket
+    /// (TIME-WAIT included) holds the four-tuple.
+    PortInUse,
+    /// Anything another local port would not change.
+    Failed(TcpError),
+}
+
+impl TcpConnectStartError {
+    /// The error a caller that did not choose the port sees.
+    pub(super) fn into_tcp_error(self) -> TcpError {
+        match self {
+            Self::PortInUse => TcpError {
+                kind: TcpErrorKind::Unavailable,
+                detail: NetworkErrorDetail::TcpConnectStartFailed,
+            },
+            Self::Failed(error) => error,
+        }
+    }
+}
+
+/// What a connect without a bound port knows before it has one.
+#[derive(Clone, Copy)]
+pub(super) struct TcpConnectRequest {
+    pub(super) local: IpAddress,
+    pub(super) destination: IpAddress,
+    pub(super) port: u16,
+    pub(super) hop_limit: u8,
+    pub(super) opened_at: StackInstant,
+}
+
+impl TcpConnectRequest {
+    /// The shard the flow hashes to once it has `local_port`.
+    fn owner_of(&self, local_port: u16, shard_count: usize) -> usize {
+        shard_idx_for_flow(
+            self.local,
+            local_port,
+            self.destination,
+            self.port,
+            shard_count,
+        )
+    }
+
+    /// Opens the connection from `local_port` on `shard`, which must be
+    /// the flow's owner.
+    fn start_on(
+        &self,
+        shard: &mut NetworkShard,
+        local_port: u16,
+    ) -> Result<TcpStreamId, TcpConnectStartError> {
+        shard.start_tcp_connect(
+            self.local,
+            self.destination,
+            self.port,
+            local_port,
+            self.hop_limit,
+            self.opened_at,
+        )
+    }
+}
+
+impl NetworkShardSet {
+    /// Chooses an ephemeral port and opens the connection from it, as
+    /// one step, from the window of shard `accepting`.
+    ///
+    /// The window is walked once from a random start (RFC 6056
+    /// §3.3.1). Under one acquisition of the accepting shard's lock,
+    /// the candidates whose flow hashes back to it are tried first:
+    /// the connection is then also received on the processor that
+    /// opened it, with no cross-processor hop for its whole life. The
+    /// candidates that hash elsewhere are then tried on their owning
+    /// shards, in walk order, one lock at a time and none across an
+    /// await. A candidate in use ([`TcpConnectStartError::PortInUse`])
+    /// moves the walk on; any other failure ends it. Only a window with
+    /// every candidate in use fails with
+    /// [`NetworkErrorDetail::TcpNoEphemeralPorts`].
+    pub(super) fn open_ephemeral_tcp_connect(
+        &self,
+        accepting: usize,
+        request: TcpConnectRequest,
+    ) -> Result<TcpStreamId, TcpError> {
+        let shard_count = self.shard_count();
+        let walk = {
+            let mut shard = self.shard_at(accepting).lock();
+            let walk = shard.ephemeral_walk();
+            if let Some(stream) =
+                shard.open_tcp_connect_along_own_flows(walk, request, shard_count)?
+            {
+                return Ok(stream);
+            }
+            walk
+        };
+        self.open_tcp_connect_along_foreign_flows(walk, accepting, request)
+    }
+
+    /// The second half of [`Self::open_ephemeral_tcp_connect`]: the
+    /// candidates of `walk` that hash to a shard other than
+    /// `accepting`, each opened on its owner.
+    pub(super) fn open_tcp_connect_along_foreign_flows(
+        &self,
+        walk: EphemeralWalk,
+        accepting: usize,
+        request: TcpConnectRequest,
+    ) -> Result<TcpStreamId, TcpError> {
+        let shard_count = self.shard_count();
+        for candidate in walk {
+            let owner = request.owner_of(candidate, shard_count);
+            if owner == accepting {
+                // Already tried, and in use, under the accepting lock.
+                continue;
+            }
+            match request.start_on(&mut self.shard_at(owner).lock(), candidate) {
+                Ok(stream) => return Ok(stream),
+                Err(TcpConnectStartError::PortInUse) => {}
+                Err(TcpConnectStartError::Failed(error)) => return Err(error),
+            }
+        }
+        Err(TcpError {
+            kind: TcpErrorKind::Unavailable,
+            detail: NetworkErrorDetail::TcpNoEphemeralPorts,
+        })
+    }
+}
+
 impl NetworkShard {
     /// Opens a connection on this shard, which the caller has already
     /// established is the one the flow hashes to.
+    ///
+    /// A port a listener holds, or a four-tuple a non-closed socket
+    /// (TIME-WAIT included) holds, is [`TcpConnectStartError::PortInUse`]:
+    /// the only failure a different local port can cure.
     pub(super) fn start_tcp_connect(
         &mut self,
         local: IpAddress,
@@ -1599,12 +1763,13 @@ impl NetworkShard {
         local_port: u16,
         hop_limit: u8,
         now: StackInstant,
-    ) -> Result<TcpStreamId, TcpError> {
+    ) -> Result<TcpStreamId, TcpConnectStartError> {
+        const START_FAILED: TcpError = TcpError {
+            kind: TcpErrorKind::Unavailable,
+            detail: NetworkErrorDetail::TcpConnectStartFailed,
+        };
         if !self.is_tcp_local_port_free(local_port) {
-            return Err(TcpError {
-                kind: TcpErrorKind::Unavailable,
-                detail: NetworkErrorDetail::TcpConnectStartFailed,
-            });
+            return Err(TcpConnectStartError::PortInUse);
         }
         let local = TcpEndpoint {
             address: local,
@@ -1619,18 +1784,48 @@ impl NetworkShard {
         let socket = self
             .stack
             .open_tcp_connect(local, remote, initial_sequence)
-            .map_err(|error| {
-                map_tcp_open_error(error, NetworkErrorDetail::TcpConnectStartFailed)
+            .map_err(|error| match error {
+                StackError::AddressInUse => TcpConnectStartError::PortInUse,
+                other => TcpConnectStartError::Failed(map_tcp_open_error(
+                    other,
+                    NetworkErrorDetail::TcpConnectStartFailed,
+                )),
             })?;
         // Applied before the connect loop drives the stack, so the SYN itself
         // already carries the caller's TTL.
         self.stack
             .set_tcp_hop_limit(socket, hop_limit)
-            .map_err(|_| TcpError {
-                kind: TcpErrorKind::Unavailable,
-                detail: NetworkErrorDetail::TcpConnectStartFailed,
-            })?;
+            .map_err(|_| TcpConnectStartError::Failed(START_FAILED))?;
         Ok(self.insert_tcp_stream(socket))
+    }
+
+    /// Opens an ephemeral-port connection on this shard along `walk`,
+    /// the walk of this shard's own window.
+    ///
+    /// Only a candidate whose flow hashes to this shard is tried here,
+    /// which is what makes a connection opened on this processor also
+    /// received on it. A candidate that is in use is skipped; any other
+    /// failure is returned. `None` means no candidate of this shard
+    /// opened, and the caller tries the rest on their owning shards.
+    ///
+    /// Runs under this shard's lock, which the caller holds.
+    pub(super) fn open_tcp_connect_along_own_flows(
+        &mut self,
+        walk: EphemeralWalk,
+        request: TcpConnectRequest,
+        shard_count: usize,
+    ) -> Result<Option<TcpStreamId>, TcpError> {
+        for candidate in walk {
+            if request.owner_of(candidate, shard_count) != self.shard_idx {
+                continue;
+            }
+            match request.start_on(self, candidate) {
+                Ok(stream) => return Ok(Some(stream)),
+                Err(TcpConnectStartError::PortInUse) => {}
+                Err(TcpConnectStartError::Failed(error)) => return Err(error),
+            }
+        }
+        Ok(None)
     }
 
     /// Installs this shard's replica of a listener into `slot`.
@@ -1934,40 +2129,6 @@ impl NetworkShard {
             }
         }
         Err(TcpError {
-            kind: TcpErrorKind::Unavailable,
-            detail: NetworkErrorDetail::TcpNoEphemeralPorts,
-        })
-    }
-
-    /// Allocates an ephemeral port for a flow to a known peer,
-    /// preferring one whose answers hash back to this shard.
-    ///
-    /// Ownership follows the hash whatever port is chosen, so this is
-    /// not a correctness requirement — it is what makes steering pay:
-    /// a connection opened on this processor is then also received on
-    /// it, with no cross-processor hop for its whole life. The walk is
-    /// bounded by the shard's own window, and falls back to the first
-    /// free port it saw, which the caller then places by its hash.
-    pub(super) fn allocate_tcp_local_port_for(
-        &mut self,
-        local: IpAddress,
-        remote: IpAddress,
-        remote_port: u16,
-        shard_count: usize,
-    ) -> Result<u16, TcpError> {
-        let mut fallback = None;
-        for candidate in self.ephemeral_walk() {
-            if !self.is_tcp_local_port_free(candidate) {
-                continue;
-            }
-            if shard_idx_for_flow(local, candidate, remote, remote_port, shard_count)
-                == self.shard_idx
-            {
-                return Ok(candidate);
-            }
-            fallback.get_or_insert(candidate);
-        }
-        fallback.ok_or(TcpError {
             kind: TcpErrorKind::Unavailable,
             detail: NetworkErrorDetail::TcpNoEphemeralPorts,
         })

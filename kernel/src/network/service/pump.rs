@@ -112,18 +112,6 @@ impl NetworkPollScope {
         }
     }
 
-    /// Whether the pair-agnostic async receive fallback is this scope's
-    /// to use. The fallback drains pair zero under its async lock, so
-    /// it belongs to the scope that owns pair zero — every operation,
-    /// and the pump on pair zero — not to a pump whose pair somebody
-    /// else is already draining.
-    pub(super) const fn covers_pair_zero(self) -> bool {
-        match self {
-            Self::Interface => true,
-            Self::Pair { pair, .. } => pair == 0,
-        }
-    }
-
     /// Whether this poll owes the interface's configuration state
     /// machines — the DHCP exchange and router solicitation — a drive.
     /// An operation that is configuring drives them itself through
@@ -259,17 +247,6 @@ impl NetworkPollSource {
         }
     }
 
-    pub(super) const fn rx_fallback_phase(self) -> &'static str {
-        match self {
-            Self::Pump => "rx-fallback-pump",
-            Self::Ping => "rx-fallback-ping",
-            Self::Dns => "rx-fallback-dns",
-            Self::Tcp => "rx-fallback-tcp",
-            Self::Udp => "rx-fallback-udp",
-            Self::Configuration => "rx-fallback-configuration",
-        }
-    }
-
     pub(super) const fn rx_signal_phase(self) -> &'static str {
         match self {
             Self::Pump => "rx-signal-pump",
@@ -333,6 +310,74 @@ pub(super) struct NetworkPumpCadence {
 pub(super) struct NetworkPerfStart {
     pub(super) nanos: u64,
     pub(super) counters: HardwarePerfCounters,
+}
+
+/// Time and hardware counters spent between two profile samples.
+///
+/// A span is what a phase records, and unlike a pair of samples it can
+/// be summed over disjoint intervals and taken out of the interval that
+/// encloses them — which is how a phase that runs in slices inside
+/// another one, like the receive demux inside the device's hold of a
+/// ring, is reported apart from it.
+#[derive(Clone, Copy, Default)]
+pub(super) struct NetworkPerfSpan {
+    pub(super) nanos: u64,
+    pub(super) counters: HardwarePerfCounterDelta,
+}
+
+impl NetworkPerfSpan {
+    /// The span between two samples, or `None` when profiling was off
+    /// for either of them.
+    pub(super) fn between(
+        start: Option<NetworkPerfStart>,
+        end: Option<NetworkPerfStart>,
+    ) -> Option<Self> {
+        let (start, end) = (start?, end?);
+        Some(Self {
+            nanos: end.nanos.saturating_sub(start.nanos),
+            counters: end.counters.delta_since(start.counters),
+        })
+    }
+
+    /// Adds a disjoint interval to this one.
+    pub(super) fn add(&mut self, other: Self) {
+        self.nanos = self.nanos.saturating_add(other.nanos);
+        self.counters = HardwarePerfCounterDelta {
+            reference_cycles: self
+                .counters
+                .reference_cycles
+                .saturating_add(other.counters.reference_cycles),
+            cpu_cycles: self
+                .counters
+                .cpu_cycles
+                .saturating_add(other.counters.cpu_cycles),
+            instructions_retired: self
+                .counters
+                .instructions_retired
+                .saturating_add(other.counters.instructions_retired),
+        };
+    }
+
+    /// This span without `nested`, an interval inside it.
+    pub(super) fn excluding(self, nested: Self) -> Self {
+        Self {
+            nanos: self.nanos.saturating_sub(nested.nanos),
+            counters: HardwarePerfCounterDelta {
+                reference_cycles: self
+                    .counters
+                    .reference_cycles
+                    .saturating_sub(nested.counters.reference_cycles),
+                cpu_cycles: self
+                    .counters
+                    .cpu_cycles
+                    .saturating_sub(nested.counters.cpu_cycles),
+                instructions_retired: self
+                    .counters
+                    .instructions_retired
+                    .saturating_sub(nested.counters.instructions_retired),
+            },
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -441,14 +486,14 @@ where
                     NetworkPumpAction::Continue => {}
                     NetworkPumpAction::Yield => crate::yield_now().await,
                     NetworkPumpAction::Wait => {
-                        self.wait_for_shard_progress(wait, self.pump_wait(pair))
+                        self.wait_for_shard_progress(wait, self.pump_wait(pair, interface_wide))
                             .await;
                     }
                 },
                 Err(error) => {
                     cadence.reset();
                     tracing::debug!(?error, "network packet pump failed to drive device");
-                    self.wait_for_shard_progress(wait, self.pump_wait(pair))
+                    self.wait_for_shard_progress(wait, self.pump_wait(pair, interface_wide))
                         .await;
                 }
             }
@@ -610,63 +655,6 @@ where
             return;
         };
         self.run_packet_pump(assignment).await;
-    }
-}
-
-impl NetworkShard {
-    pub(super) fn retransmit_dhcp(&mut self, now: StackInstant) -> Result<(), NetworkControlError> {
-        match self.dhcp {
-            DhcpClientState::Selecting {
-                transaction_id,
-                last_sent,
-            } if now.nanos().saturating_sub(last_sent.nanos()) >= DHCP_RETRANSMIT_NANOS => {
-                self.send_dhcp_discover(transaction_id, now)?;
-                self.dhcp = DhcpClientState::Selecting {
-                    transaction_id,
-                    last_sent: now,
-                };
-            }
-            DhcpClientState::Requesting {
-                transaction_id,
-                requested_ip,
-                server_identifier,
-                last_sent,
-            } if now.nanos().saturating_sub(last_sent.nanos()) >= DHCP_RETRANSMIT_NANOS => {
-                self.send_dhcp_request(transaction_id, requested_ip, server_identifier, now)?;
-                self.dhcp = DhcpClientState::Requesting {
-                    transaction_id,
-                    requested_ip,
-                    server_identifier,
-                    last_sent: now,
-                };
-            }
-            DhcpClientState::Rebooting {
-                transaction_id,
-                requested_ip,
-                attempts,
-                last_sent,
-            } if now.nanos().saturating_sub(last_sent.nanos()) >= DHCP_RETRANSMIT_NANOS => {
-                if attempts >= DHCP_REBOOT_ATTEMPTS {
-                    // Nobody on this link confirmed the lease, so it
-                    // cannot be assumed good: configuration starts over
-                    // exactly as a NAK would start it.
-                    self.stack.clear_ipv4_addresses();
-                    self.dhcp = DhcpClientState::Init {
-                        transaction_id: next_transaction_id(transaction_id),
-                    };
-                } else {
-                    self.send_dhcp_init_reboot(transaction_id, requested_ip, now)?;
-                    self.dhcp = DhcpClientState::Rebooting {
-                        transaction_id,
-                        requested_ip,
-                        attempts: attempts + 1,
-                        last_sent: now,
-                    };
-                }
-            }
-            _ => {}
-        }
-        Ok(())
     }
 }
 

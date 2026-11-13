@@ -5,13 +5,19 @@ at `../wasmtime/crates/wasmtime`.
 
 ## Required revision
 
-The local checkout must be at (branch `helios/stack-limit-percpu`):
+The local checkout must be at (branch `helios/next-solver-bindgen`):
 
 ```text
-1ed7678a8ee4f57cbe4a4e89ade7f7fda6092055
+18b428e6becfb6138b877a3fe70afb08bf5724ba
 ```
 
-That revision is `helios/parking-wait-cancel` at
+That revision is `helios/stack-limit-percpu` at
+`1ed7678a8ee4f57cbe4a4e89ade7f7fda6092055` plus upstream
+bytecodealliance/wasmtime#14193 (30dddb655), which spells out the type
+arguments of `with_getter` and `Access::new` in the code `bindgen!`
+generates; nightly's next-generation trait solver no longer infers them.
+
+`helios/stack-limit-percpu` is `helios/parking-wait-cancel` at
 `2fb47b20c7ff9a91b6dbc03062d1dd4dddab4969` plus four additive commits,
 which make each stack-limit interruption check one compare against the
 executing processor's own word (#465):
@@ -219,7 +225,7 @@ This revision is based on upstream Wasmtime commit:
 ```
 
 It corresponds to Wasmtime 48.0.0-dev and requires Rust 1.95 or newer. Helios
-pins `nightly-2026-06-15` in `rust-toolchain.toml` for Rust 1.98 and installs all
+pins `nightly-2026-11-03` in `rust-toolchain.toml` for Rust 1.101 and installs all
 host, bare-metal, and WASI targets used by the workspace.
 
 ## Patch series
@@ -272,6 +278,35 @@ incompatible package identities. The files currently track the released
 `0.3.0` packages plus `wasi:http@0.3.0`; refresh them from Wasmtime's
 `crates/wasi/src/p3/wit/deps` and `crates/wasi-http/src/p3/wit/deps` when the
 vendored revision moves, rather than pointing bindgen at the sibling tree.
+
+## Cranelift x86 vector-state properties
+
+The x86 backend preserves no vector state beyond FXSAVE at interrupts and the
+`preserve_all` trampoline's 128-bit xmm0-xmm15 save at stack-limit checks
+(`x86/src/extended_state.rs`). That is sound only while the fork's x64
+Cranelift backend keeps three properties, which hold at
+`1ed7678a8ee4f57cbe4a4e89ade7f7fda6092055` and which every move of the fork
+must keep:
+
+- **A, 128-bit only.** Every EVEX instruction in the assembler is declared
+  `evex(L128, …)` (`cranelift/assembler-x64/meta/src/instructions/`), and no
+  VEX instruction is declared 256-bit. Compiled code never names a `ymm` or
+  `zmm` register.
+- **B, no opmask.** The EVEX encoder hard-codes `aaa = 0b000`, mask register
+  k0 (`cranelift/assembler-x64/src/evex.rs`). Compiled code never names k1-k7.
+- **C, xmm0-xmm15 only.** The x64 register environment holds xmm0-xmm15 and
+  leaves the Vector class empty (`create_reg_env_systemv` in
+  `cranelift/codegen/src/isa/x64/abi.rs`), and Winch defines only xmm0-xmm15
+  (`winch/codegen/src/isa/x64/regs.rs`). Compiled code never names
+  xmm16-xmm31.
+
+`compiler-support/tests/avx512_lowerings.rs` pins all three. It compiles
+`compiler-support/tests/data/avx512-lowerings.clif` for x86-64 with every flag
+of the top level of `helios_artifact::cwasm_target_isa_levels`, requires the
+EVEX forms (`vpmullq`, `vpabsq`, `vpsraq`, `vpopcntb`, `vpermi2b`,
+`vcvtudq2ps`) so that it notices AVX-512 not being exercised, and fails on any
+`ymm`, `zmm`, `k1`-`k7` or `xmm16`-`xmm31` operand. A fork revision that fails
+it needs full XSAVE state handling in the x86 backend before it can be taken.
 
 ## Per-target memory profile
 

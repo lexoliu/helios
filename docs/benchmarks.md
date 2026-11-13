@@ -70,7 +70,7 @@ reason under the table the cell is missing from.
 | fs | `fs-smallfiles`, `fs-readstream` | coreutils on the embedded filesystem root | `coreutils-wasi.wasm` under `wasmtime run --dir` | ext4 in the guest |
 | compute | `quickjs-loop`, `cpython-json`, `cpython-regex`, `wasm-simd-lanes` | interpreter or SIMD loops | same wasm | native QuickJS/CPython/NEON-or-SSE probe |
 | compute | `cpython-startup`, `cpython-import-json` | the CPython row decomposed — interpreter start-up alone, then start-up plus `import json` over the host share | same wasm | native CPython |
-| compute | `aot-curl` | compiler plugin AOT of `curl.wasm` for the kernel target, performance hint, the kernel's worker count | the same compiler plugin under Wasmtime on Linux (`helios-compiler-host`), the same input, target, hint and worker count | `wasmtime compile` of the same input (a reference, uncompared) |
+| compute | `aot-curl` | compiler plugin AOT of `curl.wasm` for the kernel target, performance hint, the kernel's worker count | the same compiler plugin under Wasmtime on Linux (`helios-compiler-host`), the same input, target, ISA level (the one the Helios guest reports), hint and worker count | `wasmtime compile` of the same input (a reference, uncompared) |
 
 `headline: true` marks the rows the README table and the regression gate
 carry. Every compared row is a parity check, not a claim: Helios running
@@ -280,7 +280,7 @@ nanoseconds from `rpc-arrival`:
 | --- | --- |
 | `rpc_arrival_ns` | the launch call entered the kernel; always `0`, the epoch |
 | `source_read_ns` | the program's bytes are read out of their source (`source_bytes` carries the size) |
-| `trust_ns` | artifact trust established — the bootfs trailer parse, the signature check for a signed artifact, or — on a raw-wasm source — the whole in-kernel compile+sign between `load_begin` and here |
+| `trust_ns` | artifact trust established — the bootfs artifact hand-off, the signature check for a signed artifact, or — on a raw-wasm source — the whole in-kernel compile+sign between `load_begin` and here |
 | `cache_lookup_ns` | the deserialize cache answered (`cache_hit` carries its answer) |
 | `deserialize_ns` | the `cwasm` payload deserialized; present only on a cache miss |
 | `instantiate_pre_ns` | the `InstancePre` cache answered or `instantiate_pre` built (`instantiate_pre_hit`) |
@@ -666,6 +666,36 @@ elapsed before the lane moved (#413: `instance-startup-1` measured
 `/dev/vhost-vsock` is not usable as a deviation, the run record's `vm`
 provenance and the report's pins name the transport, and a lane on a
 host with no vhost-vsock (macOS) says `serial` and is read as such.
+
+On a `serial` lane that reading would put the serial line inside every
+Helios launch and nothing like it inside the Linux column, which is
+timed in its guest around the process. So there a launch is compared on
+the kernel's own clock: the `exec` reply carries `launch-nanos`, from
+the launch call's arrival in the kernel to its result being in hand, the
+inspector records it as `launch_elapsed_ms`, and the report compares
+that. `helios_bench.sources.compared_clock` is the one place a row's
+clock is chosen: a Linux row is `guest-process`, a Helios launch is
+`kernel-launch` on a `serial` lane and `host-round-trip` on a `vsock`
+one, and a Helios workload that launches no program (`aot-curl`) keeps
+the host clock on either. Every iteration in `report.json` names its
+`clock` and keeps `host_elapsed_ms` beside the compared value, and the
+tables say under each class which clock its rows were read from.
+
+### Both guests' RAM is backed the same way
+
+The Fedora guest's RAM is a preallocated `memory-backend-ram`
+(`guest_ram_backend` in `fedora_qemu_baseline.py`). A guest whose RAM
+QEMU maps lazily pays a host page fault on the first touch of every
+page, so a comparison boots Helios with `--guest-ram prealloc` as well
+(`HELIOS_WORKLOAD_BENCH_GUEST_RAM`, set by the runner). The inspector's
+run record states the backing it booted with, the pins print both
+guests', and a report from an inspector that predates the option is
+refused instead of read as if the backings matched.
+
+A lane gives its two guests one memory size. `manifest.toml` refuses a
+lane whose `memory` and `linux_vm_memory` differ unless it states
+`memory_differs_because`, and refuses the reason on a lane whose sizes
+agree, so the reason lives beside the two fields it explains.
 
 ## Dedicated runners
 

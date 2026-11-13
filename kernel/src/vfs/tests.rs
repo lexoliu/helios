@@ -1,0 +1,538 @@
+use alloc::string::String;
+use alloc::vec::Vec;
+
+use futures_lite::future::block_on;
+use helios_hal::cpu::ProcessorId;
+use helios_hal::fs::{FileSystem, FileSystemRights, FsError, FsPath, OpenFlags, WritePosition};
+
+use super::{
+    BOOT_DEVICE, Follow, MAX_MOUNTS, MemoryFs, MountError, MountTable, MountedFs, Namespace,
+};
+use crate::{
+    BootFs, ComponentFsPathError, EmbeddedBootDirectory, EmbeddedBootFile, EmbeddedBootFs,
+    MountCap, ProcessAuthority, UnsupportedStorage, resolve_child_path,
+};
+
+type TestNamespace = Namespace<UnsupportedStorage>;
+
+const IMAGE: EmbeddedBootFs = EmbeddedBootFs::new(
+    &[EmbeddedBootDirectory::new("mnt", 0)],
+    &[EmbeddedBootFile::new("bin/tool", b"tool", 42)],
+);
+
+const READ_WRITE: FileSystemRights = FileSystemRights::READ.union(FileSystemRights::WRITE);
+
+fn namespace() -> TestNamespace {
+    Namespace::new(MountTable::new(BootFs::new(IMAGE, BOOT_DEVICE), 1))
+}
+
+fn memory(namespace: &TestNamespace) -> MountedFs<UnsupportedStorage> {
+    MountedFs::Memory(MemoryFs::new(namespace.table().allocate_device()))
+}
+
+/// A machine with neither a host share nor a disk.
+fn nothing_attached() -> crate::AttachedStorage<UnsupportedStorage> {
+    crate::AttachedStorage {
+        host_share: None,
+        disks: None,
+    }
+}
+
+fn cap(point: &str) -> MountCap {
+    ProcessAuthority::root()
+        .derive_mount_cap(point)
+        .expect("root may mount anywhere")
+}
+
+fn mount_memory(namespace: &TestNamespace, point: &str) {
+    block_on(namespace.mount(&cap(point), memory(namespace), READ_WRITE)).expect("mounts");
+}
+
+fn owner(namespace: &TestNamespace, absolute: &str) -> (String, String) {
+    let resolved = namespace.resolve(absolute).expect("resolves");
+    (
+        String::from(resolved.mount_point()),
+        String::from(resolved.path().as_str()),
+    )
+}
+
+fn create(namespace: &TestNamespace, absolute: &str, bytes: &[u8]) {
+    let resolved = namespace.resolve(absolute).expect("resolves");
+    let fs = resolved.writable().expect("writable mount");
+    block_on(fs.open(resolved.path(), OpenFlags::CREATE, 1)).expect("creates");
+    block_on(super::write_bytes(
+        fs,
+        resolved.path(),
+        WritePosition::At(0),
+        bytes,
+        1,
+    ))
+    .expect("writes");
+}
+
+fn read(namespace: &TestNamespace, absolute: &str) -> Vec<u8> {
+    let resolved = namespace.resolve(absolute).expect("resolves");
+    block_on(resolved.fs().read_at(resolved.path(), 0, 64))
+        .expect("reads")
+        .to_vec()
+}
+
+#[test]
+fn the_longest_mount_point_owns_a_path() {
+    let namespace = namespace();
+    mount_memory(&namespace, "/mnt");
+    let mnt = resolve_child_path("/", "mnt").expect("normalizes");
+    block_on(
+        namespace
+            .resolve(&mnt)
+            .expect("resolves")
+            .writable()
+            .expect("writable")
+            .create_directory(FsPath::new("data").expect("valid"), 1),
+    )
+    .expect("creates the inner mount point");
+    mount_memory(&namespace, "/mnt/data");
+
+    assert_eq!(
+        owner(&namespace, "/mnt/data/x/y"),
+        ("/mnt/data".into(), "x/y".into())
+    );
+    assert_eq!(
+        owner(&namespace, "/mnt/data"),
+        ("/mnt/data".into(), "".into())
+    );
+    assert_eq!(
+        owner(&namespace, "/mnt/datax"),
+        ("/mnt".into(), "datax".into())
+    );
+    assert_eq!(owner(&namespace, "/mnt"), ("/mnt".into(), "".into()));
+    assert_eq!(
+        owner(&namespace, "/bin/tool"),
+        ("/".into(), "bin/tool".into())
+    );
+    assert_eq!(owner(&namespace, "/"), ("/".into(), "".into()));
+}
+
+#[test]
+fn dot_dot_climbs_out_of_a_mount_into_the_one_beneath() {
+    let namespace = namespace();
+    mount_memory(&namespace, "/mnt");
+    create(&namespace, "/mnt/inside", b"in the mount");
+
+    // From the root, `..` inside the mounted tree climbs back to the
+    // root mount, which owns `/bin/tool`.
+    let climbed = resolve_child_path("/", "mnt/../bin/tool").expect("normalizes");
+    assert_eq!(climbed, "/bin/tool");
+    assert_eq!(owner(&namespace, &climbed), ("/".into(), "bin/tool".into()));
+    assert_eq!(read(&namespace, &climbed), b"tool");
+
+    // And from the root into the mount and back into it.
+    let reentered = resolve_child_path("/", "bin/../mnt/./inside").expect("normalizes");
+    assert_eq!(
+        owner(&namespace, &reentered),
+        ("/mnt".into(), "inside".into())
+    );
+    assert_eq!(read(&namespace, &reentered), b"in the mount");
+
+    // A descriptor opened on the mount's root cannot climb out of it.
+    assert_eq!(
+        resolve_child_path("/mnt", "../bin/tool"),
+        Err(ComponentFsPathError::NotPermitted)
+    );
+}
+
+#[test]
+fn rename_and_link_across_mounts_are_refused_with_exdev() {
+    let namespace = namespace();
+    mount_memory(&namespace, "/mnt");
+    create(&namespace, "/mnt/file", b"payload");
+
+    assert_eq!(
+        block_on(namespace.rename("/mnt/file", "/file", 2)),
+        Err(FsError::CrossDevice)
+    );
+    assert_eq!(
+        block_on(namespace.link("/mnt/file", "/file", 2)),
+        Err(FsError::CrossDevice)
+    );
+    // Nothing moved.
+    assert_eq!(read(&namespace, "/mnt/file"), b"payload");
+    assert_eq!(
+        block_on(namespace.stat("/file", Follow::No)).map(drop),
+        Err(FsError::NoEntry)
+    );
+    // Within the mount, both work.
+    block_on(namespace.rename("/mnt/file", "/mnt/moved", 2)).expect("renames");
+    block_on(namespace.link("/mnt/moved", "/mnt/linked", 2)).expect("links");
+    assert_eq!(read(&namespace, "/mnt/linked"), b"payload");
+}
+
+#[test]
+fn a_mount_point_is_listed_in_its_parent_and_unmount_uncovers_it() {
+    let namespace = namespace();
+    mount_memory(&namespace, "/scratch");
+    create(&namespace, "/scratch/f", b"x");
+    let mut names: Vec<String> = block_on(namespace.list("/"))
+        .expect("lists")
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect();
+    names.sort();
+    assert_eq!(names, ["bin", "mnt", "scratch"]);
+
+    block_on(namespace.table().unmount("/scratch")).expect("unmounts");
+    assert_eq!(
+        owner(&namespace, "/scratch/f"),
+        ("/".into(), "scratch/f".into())
+    );
+    assert_eq!(
+        block_on(namespace.stat("/scratch/f", Follow::No)).map(drop),
+        Err(FsError::NoEntry)
+    );
+}
+
+#[test]
+fn a_cancelled_unmount_leaves_the_mount_live() {
+    let namespace = namespace();
+    mount_memory(&namespace, "/scratch");
+    create(&namespace, "/scratch/f", b"kept");
+
+    // A resolution that has not let go keeps the unmount waiting; the
+    // unmount is dropped while it waits.
+    let looking = namespace.resolve("/scratch/f").expect("resolves");
+    {
+        let mut unmount = core::pin::pin!(namespace.table().unmount("/scratch"));
+        assert_eq!(
+            block_on(futures_lite::future::poll_once(&mut unmount)),
+            None
+        );
+        assert_eq!(owner(&namespace, "/scratch/f").0, "/");
+    }
+    drop(looking);
+
+    assert_eq!(
+        owner(&namespace, "/scratch/f"),
+        ("/scratch".into(), "f".into())
+    );
+    assert_eq!(read(&namespace, "/scratch/f"), b"kept");
+    block_on(namespace.table().unmount("/scratch")).expect("a later unmount completes");
+}
+
+/// A resolution writes one count: its own processor's, for the slot it
+/// resolves through. A task that moves to another processor before it
+/// lets go releases its pin there, and the unmount it held up completes.
+#[test]
+fn a_resolution_pins_on_its_own_processor_and_may_let_go_on_another() {
+    let namespace: TestNamespace =
+        Namespace::new(MountTable::new(BootFs::new(IMAGE, BOOT_DEVICE), 2));
+    mount_memory(&namespace, "/scratch");
+    mount_memory(&namespace, "/other");
+    let pinned = |processor: usize| {
+        namespace.table().inner.pins.blocks[processor]
+            .iter()
+            .filter(|count| count.load(core::sync::atomic::Ordering::SeqCst) != 0)
+            .count()
+    };
+
+    crate::test_processor_identity::set(ProcessorId::new(1));
+    let looking = namespace.resolve("/scratch/f").expect("resolves");
+    assert_eq!((pinned(0), pinned(1)), (0, 1));
+
+    let mut unmount = core::pin::pin!(namespace.table().unmount("/scratch"));
+    crate::test_processor_identity::set(ProcessorId::new(0));
+    assert_eq!(
+        block_on(futures_lite::future::poll_once(&mut unmount)),
+        None
+    );
+    drop(looking);
+    assert_eq!(block_on(unmount), Ok(()));
+    assert_eq!(owner(&namespace, "/scratch/f").0, "/");
+    assert_eq!(owner(&namespace, "/other/f").0, "/other");
+}
+
+/// A scan picks a mount by its point's published length and hash; a
+/// candidate whose point turns out to differ (a hash that collided) is
+/// ruled out under its pin, and the path resolves past it.
+#[test]
+fn a_colliding_point_hash_is_ruled_out() {
+    let namespace = namespace();
+    mount_memory(&namespace, "/aa");
+    let table = &namespace.table().inner;
+    let index = table
+        .slots
+        .iter()
+        .position(|slot| slot.state.load(core::sync::atomic::Ordering::SeqCst) == super::SLOT_LIVE)
+        .expect("the mount has a slot");
+    table.slots[index].point_hash.store(
+        super::point_hash(b"/bb"),
+        core::sync::atomic::Ordering::SeqCst,
+    );
+
+    assert_eq!(owner(&namespace, "/bb/x"), ("/".into(), "bb/x".into()));
+    assert_eq!(table.pins.total(index), 0, "the ruled-out pin was released");
+}
+
+#[test]
+fn unmount_refuses_a_mount_with_mounts_below_it() {
+    let namespace = namespace();
+    mount_memory(&namespace, "/mnt");
+    block_on(
+        namespace
+            .resolve("/mnt")
+            .expect("resolves")
+            .writable()
+            .expect("writable")
+            .create_directory(FsPath::new("inner").expect("valid"), 1),
+    )
+    .expect("creates");
+    mount_memory(&namespace, "/mnt/inner");
+    assert_eq!(
+        block_on(namespace.table().unmount("/mnt")),
+        Err(MountError::Busy("/mnt".into()))
+    );
+    block_on(namespace.table().unmount("/mnt/inner")).expect("unmounts the inner one");
+    block_on(namespace.table().unmount("/mnt")).expect("then the outer one");
+    assert_eq!(
+        block_on(namespace.table().unmount("/mnt")),
+        Err(MountError::NotMounted("/mnt".into()))
+    );
+}
+
+#[test]
+fn a_read_only_mount_refuses_changes() {
+    let namespace = namespace();
+    block_on(namespace.mount(
+        &cap("/mnt"),
+        MountedFs::Boot(namespace.table().boot().clone()),
+        FileSystemRights::READ,
+    ))
+    .expect("mounts");
+    assert_eq!(read(&namespace, "/mnt/bin/tool"), b"tool");
+    assert_eq!(
+        namespace
+            .resolve("/mnt/bin/tool")
+            .expect("resolves")
+            .writable()
+            .map(drop),
+        Err(FsError::ReadOnly)
+    );
+}
+
+#[test]
+fn a_mount_point_must_be_a_directory_under_an_existing_one() {
+    let namespace = namespace();
+    let refused =
+        |point: &str| block_on(namespace.mount(&cap(point), memory(&namespace), READ_WRITE));
+    assert_eq!(refused("/"), Err(MountError::InvalidPoint("/".into())));
+    assert_eq!(
+        refused("/missing/point"),
+        Err(MountError::Filesystem {
+            point: "/missing/point".into(),
+            error: FsError::NoEntry,
+        })
+    );
+    assert_eq!(
+        refused("/bin/tool"),
+        Err(MountError::Filesystem {
+            point: "/bin/tool".into(),
+            error: FsError::NotDirectory,
+        })
+    );
+    mount_memory(&namespace, "/mnt");
+    assert_eq!(
+        refused("/mnt"),
+        Err(MountError::AlreadyMounted("/mnt".into()))
+    );
+    let root = namespace.root.clone();
+    assert_eq!(
+        namespace.table().mount("/other", root, READ_WRITE),
+        Err(MountError::RootKind)
+    );
+}
+
+#[test]
+fn the_table_refuses_a_mount_past_its_capacity() {
+    let namespace = namespace();
+    for index in 0..MAX_MOUNTS {
+        let point = alloc::format!("/m{index}");
+        namespace
+            .table()
+            .mount(&point, memory(&namespace), READ_WRITE)
+            .expect("fits");
+    }
+    assert_eq!(
+        namespace
+            .table()
+            .mount("/one-more", memory(&namespace), READ_WRITE),
+        Err(MountError::TableFull)
+    );
+}
+
+fn unmount_cap(point: &str) -> crate::UnmountCap {
+    ProcessAuthority::root()
+        .derive_unmount_cap(point)
+        .expect("root may unmount anywhere")
+}
+
+#[test]
+fn a_mount_belongs_to_its_tree_and_the_trees_below_it() {
+    let root = namespace();
+    let tree = root.descend();
+    let same_tree = tree.clone();
+    let below = tree.descend();
+    let other = root.descend();
+    mount_memory(&root, "/mnt");
+    create(&root, "/mnt/kernel", "日本語".as_bytes());
+    mount_memory(&tree, "/scratch");
+    create(&tree, "/scratch/tree", "한국어".as_bytes());
+
+    // The root namespace's mount reaches every tree below it.
+    for namespace in [&tree, &same_tree, &below, &other] {
+        assert_eq!(read(namespace, "/mnt/kernel"), "日本語".as_bytes());
+    }
+    // A tree's own mount reaches the tree and its descendants only.
+    for namespace in [&same_tree, &below] {
+        assert_eq!(read(namespace, "/scratch/tree"), "한국어".as_bytes());
+    }
+    for namespace in [&root, &other] {
+        assert_eq!(owner(namespace, "/scratch/tree").0, "/");
+        assert_eq!(
+            block_on(namespace.stat("/scratch/tree", Follow::No)).map(drop),
+            Err(FsError::NoEntry)
+        );
+    }
+    // Only the tree that made a mount removes it.
+    for namespace in [&root, &other, &below] {
+        assert_eq!(
+            block_on(namespace.unmount(&unmount_cap("/scratch"))),
+            Err(MountError::NotMounted("/scratch".into()))
+        );
+    }
+    assert_eq!(
+        block_on(tree.unmount(&unmount_cap("/mnt"))),
+        Err(MountError::NotMounted("/mnt".into()))
+    );
+    block_on(same_tree.unmount(&unmount_cap("/scratch"))).expect("the tree unmounts its own");
+    assert_eq!(owner(&below, "/scratch/tree").0, "/");
+}
+
+#[test]
+fn a_tree_shares_its_root_layer_and_a_descendant_starts_its_own() {
+    let root = namespace();
+    let tree = root.descend();
+    let same_tree = tree.clone();
+    let below = tree.descend();
+    create(&tree, "/private", b"one tree");
+    assert_eq!(read(&same_tree, "/private"), b"one tree");
+    for namespace in [&root, &below] {
+        assert_eq!(
+            block_on(namespace.stat("/private", Follow::No)).map(drop),
+            Err(FsError::NoEntry)
+        );
+    }
+}
+
+#[test]
+fn a_symbolic_link_is_followed_across_mounts_only_when_asked() {
+    let namespace = namespace();
+    mount_memory(&namespace, "/mnt");
+    create(&namespace, "/mnt/target", b"followed");
+    let resolved = namespace.resolve("/mnt/link").expect("resolves");
+    block_on(
+        resolved
+            .writable()
+            .expect("writable")
+            .symlink("target", resolved.path(), 1),
+    )
+    .expect("links");
+    let followed =
+        block_on(namespace.resolve_following("/mnt/link", Follow::Within("/"))).expect("follows");
+    assert_eq!(followed.absolute(), "/mnt/target");
+    let unfollowed =
+        block_on(namespace.resolve_following("/mnt/link", Follow::No)).expect("resolves");
+    assert_eq!(unfollowed.absolute(), "/mnt/link");
+}
+
+#[test]
+fn a_mount_request_without_mount_authority_is_refused() {
+    let namespace = namespace();
+    let mut authority = ProcessAuthority::empty();
+    authority.insert_directory_preopen(
+        crate::DirectoryPreopen::new(
+            "/",
+            "/",
+            crate::DirectoryAuthorityRights::READ
+                | crate::DirectoryAuthorityRights::MUTATE_DIRECTORY,
+        )
+        .expect("valid preopen"),
+    );
+
+    assert!(matches!(
+        block_on(crate::request_mount(
+            &authority,
+            &namespace,
+            nothing_attached(),
+            crate::MountSource::Memory,
+            "/mnt",
+            false,
+        )),
+        Err(crate::MountRequestError::Authority(
+            crate::ProcessAuthorityError::MountGrantExceedsAuthority(
+                crate::MountAuthorityRights::MOUNT
+            )
+        ))
+    ));
+    assert_eq!(owner(&namespace, "/mnt/x").0, "/");
+}
+
+#[test]
+fn a_mount_request_with_mount_authority_attaches_the_source() {
+    let namespace = namespace();
+    let authority = ProcessAuthority::root();
+
+    block_on(crate::request_mount(
+        &authority,
+        &namespace,
+        nothing_attached(),
+        crate::MountSource::BootImage,
+        "/mnt",
+        false,
+    ))
+    .expect("root may mount the boot image");
+    assert_eq!(read(&namespace, "/mnt/bin/tool"), b"tool");
+    assert_eq!(
+        namespace
+            .resolve("/mnt/bin/tool")
+            .expect("resolves")
+            .writable()
+            .map(drop),
+        Err(FsError::ReadOnly)
+    );
+
+    assert!(matches!(
+        block_on(crate::request_mount(
+            &authority,
+            &namespace,
+            nothing_attached(),
+            crate::MountSource::HostShare,
+            "/mnt",
+            false,
+        )),
+        Err(crate::MountRequestError::HostShareUnavailable)
+    ));
+    let serial = helios_hal::fs::BlockSerial::new(b"absent").expect("serial fits");
+    assert!(matches!(
+        block_on(crate::request_mount(
+            &authority,
+            &namespace,
+            nothing_attached(),
+            crate::MountSource::Disk { serial },
+            "/mnt",
+            true,
+        )),
+        Err(crate::MountRequestError::DiskUnavailable { serial: refused }) if refused == serial
+    ));
+
+    block_on(crate::request_unmount(&authority, &namespace, "/mnt")).expect("unmounts");
+    assert_eq!(owner(&namespace, "/mnt/bin/tool").0, "/");
+}

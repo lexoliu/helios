@@ -1,0 +1,68 @@
+package helios:system@0.1.0;
+
+/// Attach filesystems to the guest path tree.
+///
+/// Every path a program resolves goes through the kernel's mount table:
+/// the longest mount point that covers the path owns it. A mount is seen
+/// by every program. Attaching or detaching one takes the mount authority
+/// (`programs.mount-grant`) and mutate-directory authority over the mount
+/// point, since a mount replaces what that directory shows.
+interface mounts {
+  /// A filesystem the kernel can attach.
+  variant mount-source {
+    /// A new, empty filesystem held in memory.
+    memory,
+    /// The boot image the kernel was started with. Always read-only.
+    boot-image,
+    /// The host share, when the platform attached one.
+    host-share,
+    /// The EROFS image on the disk that reported this serial. Always
+    /// read-only.
+    disk(string),
+  }
+
+  record mount-request {
+    source: mount-source,
+    /// Directory path in the caller authority to attach the filesystem
+    /// at. It must be a directory, or not exist, inside a directory.
+    path: string,
+    /// Attach for reading only.
+    read-only: bool,
+  }
+
+  enum mount-error-kind {
+    /// The caller lacks the mount right, or mutate-directory authority
+    /// over the mount point.
+    permission-denied,
+    /// The path is not a mount point: the root, or not normalized.
+    invalid-point,
+    /// Something is already mounted at the path.
+    already-mounted,
+    /// Nothing is mounted at the path.
+    not-mounted,
+    /// Another mount lies below the one being detached.
+    busy,
+    /// The mount table has no room for another mount.
+    table-full,
+    /// The source is not attached to this machine.
+    unavailable,
+    /// The mount point, or the directory holding it, cannot take a mount.
+    invalid-path,
+    /// The source holds no filesystem the kernel can read: a malformed
+    /// image, or one whose checksum does not match.
+    invalid-filesystem,
+    /// Reading the source failed.
+    io,
+  }
+
+  record mount-error {
+    kind: mount-error-kind,
+    detail: string,
+  }
+
+  /// Attaches a filesystem.
+  mount: async func(request: mount-request) -> result<_, mount-error>;
+
+  /// Detaches the filesystem mounted at `path`.
+  unmount: async func(path: string) -> result<_, mount-error>;
+}

@@ -1,7 +1,8 @@
+pub use super::bindings::helios::system::filters::FilterError;
 pub use super::bindings::helios::system::profiling::{
-    Filter, FoldedSample, InstructionProfile, InstructionProfileError, InstructionSample,
-    MetricFilter, MetricSample, MonoNanos, ProfileSection, RawProfileError, SampledCode, Scope,
-    WasmFunction,
+    ControlError, Filter, FoldedSample, InstructionProfile, InstructionProfileError,
+    InstructionSample, MetricFilter, MetricSample, MonoNanos, ProfileSection, RawProfileError,
+    SampledCode, Scope, WasmFunction,
 };
 
 #[cfg(feature = "host")]
@@ -16,7 +17,13 @@ mod host {
     use crate::transport::Client;
     use futures_io::{AsyncRead, AsyncWrite};
 
-    pub async fn set_enabled<R, W>(client: &Client<R, W>, enabled: bool) -> Result<(), RpcError>
+    /// Turns the guest's machine-wide profiling on or off. `Ok(Err(..))`
+    /// is the guest refusing a session that lacks the right to observe
+    /// the machine.
+    pub async fn set_enabled<R, W>(
+        client: &Client<R, W>,
+        enabled: bool,
+    ) -> Result<Result<(), ControlError>, RpcError>
     where
         R: AsyncRead + Send + Unpin + 'static,
         W: AsyncWrite + Send + Unpin + 'static,
@@ -26,7 +33,7 @@ mod host {
             func: PROFILING_SET_ENABLED,
             source,
         })?;
-        client
+        let bytes = client
             .invoke_raw(PROFILING_INSTANCE, PROFILING_SET_ENABLED, request)
             .await
             .map_err(|source: TransportError| RpcError::Invoke {
@@ -34,15 +41,21 @@ mod host {
                 func: PROFILING_SET_ENABLED,
                 source,
             })?;
-        Ok(())
+        postcard::from_bytes(&bytes).map_err(|source| RpcError::Decode {
+            instance: PROFILING_INSTANCE,
+            func: PROFILING_SET_ENABLED,
+            source,
+        })
     }
 
-    pub async fn clear<R, W>(client: &Client<R, W>) -> Result<(), RpcError>
+    /// Wipes the guest's machine-wide profile. `Ok(Err(..))` is the guest
+    /// refusing as [`set_enabled`] describes.
+    pub async fn clear<R, W>(client: &Client<R, W>) -> Result<Result<(), ControlError>, RpcError>
     where
         R: AsyncRead + Send + Unpin + 'static,
         W: AsyncWrite + Send + Unpin + 'static,
     {
-        client
+        let bytes = client
             .invoke_raw(PROFILING_INSTANCE, PROFILING_CLEAR, Vec::new())
             .await
             .map_err(|source: TransportError| RpcError::Invoke {
@@ -50,14 +63,20 @@ mod host {
                 func: PROFILING_CLEAR,
                 source,
             })?;
-        Ok(())
+        postcard::from_bytes(&bytes).map_err(|source| RpcError::Decode {
+            instance: PROFILING_INSTANCE,
+            func: PROFILING_CLEAR,
+            source,
+        })
     }
 
+    /// The folded stacks matching `filter`. `Ok(Err(..))` is the guest
+    /// refusing a filter that exceeds its prefix bounds.
     pub async fn folded<R, W>(
         client: &Client<R, W>,
         filter: &Filter,
         limit: u32,
-    ) -> Result<Vec<FoldedSample>, RpcError>
+    ) -> Result<Result<Vec<FoldedSample>, FilterError>, RpcError>
     where
         R: AsyncRead + Send + Unpin + 'static,
         W: AsyncWrite + Send + Unpin + 'static,
@@ -83,11 +102,13 @@ mod host {
         })
     }
 
+    /// The metrics matching `filter`. `Ok(Err(..))` is the guest refusing a
+    /// filter that exceeds its prefix bounds.
     pub async fn metrics<R, W>(
         client: &Client<R, W>,
         filter: &MetricFilter,
         limit: u32,
-    ) -> Result<Vec<MetricSample>, RpcError>
+    ) -> Result<Result<Vec<MetricSample>, FilterError>, RpcError>
     where
         R: AsyncRead + Send + Unpin + 'static,
         W: AsyncWrite + Send + Unpin + 'static,
