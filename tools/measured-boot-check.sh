@@ -19,7 +19,9 @@
 set -euo pipefail
 
 settled_marker='compiler-signing key settled'
-refusal='helios-bootfs module is not a valid payload: bootfs signature does not match the image body'
+# The signature check's own error. The sentence around it names where the
+# backend found the payload (a Limine module, the riscv initrd).
+refusal='payload: bootfs signature does not match the image body'
 
 case "${1:-}" in
   settled)
