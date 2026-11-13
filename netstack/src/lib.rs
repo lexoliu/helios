@@ -47,8 +47,8 @@ pub use dns::{
     DnsQuestionWriter, DnsRecordType, DnsResponse,
 };
 pub use hash::{
-    FlowHash, FlowTuple, RSS_INDIRECTION_ENTRIES, RSS_KEY_BYTES, STANDARD_RSS_KEY, flow_hash,
-    rss_indirection_entry, toeplitz,
+    DestinationPortHashes, FlowHash, FlowTuple, RSS_INDIRECTION_ENTRIES, RSS_KEY_BYTES,
+    STANDARD_RSS_KEY, flow_hash, rss_indirection_entry, toeplitz,
 };
 pub use isn::{IsnSecret, initial_sequence_number};
 pub use ndp::{

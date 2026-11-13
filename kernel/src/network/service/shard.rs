@@ -227,6 +227,45 @@ pub(super) fn shard_idx_for_flow(
         .unwrap_or(DEFAULT_SHARD_IDX)
 }
 
+/// The owner of every local port of one connect: what
+/// [`shard_idx_for_flow`] answers for the flow between two endpoints,
+/// for any local port, without hashing the whole tuple per port.
+///
+/// Concurrency contract: a plain value, a pure function of the
+/// endpoints, owned by the one connect that built it.
+#[derive(Clone, Copy)]
+pub(super) struct PortOwners {
+    /// `None` when the endpoints' families form no tuple, which
+    /// [`DEFAULT_SHARD_IDX`] owns for every port.
+    hashes: Option<DestinationPortHashes>,
+    shard_count: usize,
+}
+
+impl PortOwners {
+    /// The owners for flows between `local` and `remote` on
+    /// `shard_count` shards; the tuple is the receive direction, as in
+    /// [`shard_idx_for_flow`].
+    pub(super) fn new(
+        local: IpAddress,
+        remote: IpAddress,
+        remote_port: u16,
+        shard_count: usize,
+    ) -> Self {
+        Self {
+            hashes: FlowTuple::between(remote, remote_port, local, 0)
+                .map(|tuple| DestinationPortHashes::of(&tuple)),
+            shard_count,
+        }
+    }
+
+    /// The shard the flow hashes to once it has `local_port`.
+    pub(super) fn owner_of(&self, local_port: u16) -> usize {
+        self.hashes
+            .map(|hashes| hashes.hash(local_port).bucket(self.shard_count))
+            .unwrap_or(DEFAULT_SHARD_IDX)
+    }
+}
+
 pub(super) struct NetworkShard {
     pub(super) stack: Box<Stack>,
     /// This shard's index inside the parent `NetworkShardSet`.
@@ -1280,30 +1319,26 @@ impl NetworkShard {
     /// or a listener. An allocation takes the first port it finds
     /// suitable, and gives up only after the whole window has been
     /// tried. An outbound TCP connect uses
-    /// [`Self::connect_walk`] instead.
+    /// [`Self::connect_start`] instead.
     pub(super) fn ephemeral_walk(&mut self) -> EphemeralWalk {
         let (first, last) = self.ephemeral_window();
         let offset = self.entropy.below(EphemeralWalk::window_len(first, last));
         EphemeralWalk::starting_at(first, last, offset)
     }
 
-    /// The walk over this shard's window for an outbound TCP connect to
-    /// `request`'s destination (RFC 6056 §3.3.3), and the counter to
-    /// [`Self::connect_taken`] once a port is taken.
-    pub(super) fn connect_walk(&self, request: &TcpConnectRequest) -> (EphemeralWalk, ConnectSlot) {
+    /// Where an outbound TCP connect to `request`'s destination starts
+    /// in this shard's window (RFC 6056 §3.3.3), and the counters its
+    /// take advances through [`ConnectPortSelector::took_own`] or
+    /// [`ConnectPortSelector::took_foreign`].
+    pub(super) fn connect_start(&self, request: &TcpConnectRequest) -> (ConnectStart, ConnectSlot) {
         let (first, last) = self.ephemeral_window();
-        self.connect_ports.walk(
+        self.connect_ports.start(
             first,
             last,
             request.local,
             request.destination,
             request.port,
         )
-    }
-
-    /// Records that a connect which started at `walk` took `port`.
-    pub(super) fn connect_taken(&mut self, slot: ConnectSlot, walk: &EphemeralWalk, port: u16) {
-        self.connect_ports.advance(slot, walk, walk.steps_to(port));
     }
 
     pub(super) fn add_ipv4_address(
