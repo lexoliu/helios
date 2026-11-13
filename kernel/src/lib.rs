@@ -243,10 +243,11 @@ pub use surface::{
     SurfaceServiceError, SurfaceShared,
 };
 pub use vfs::{
-    BOOT_DEVICE, FileContents, Follow, HeldPath, HostShare, HostShareWrite, MAX_MOUNTS,
-    MAX_SYMLINK_DEPTH, MemoryFs, MemoryWrite, MountError, MountHold, MountRequestError,
-    MountSource, MountTable, MountedFs, MountedWrite, Namespace, ROOT_LAYER_DEVICE, Resolved,
-    RootFs, RootWrite, object_identity, request_mount, request_unmount, symlink_target,
+    AttachedStorage, BOOT_DEVICE, DiskImage, ErofsError, ErofsFs, FileContents, Follow, HeldPath,
+    HostShare, HostShareWrite, MAX_MOUNTS, MAX_SYMLINK_DEPTH, MemoryFs, MemoryWrite, MountError,
+    MountHold, MountRequestError, MountSource, MountTable, MountedFs, MountedWrite, Namespace,
+    NoDisks, ROOT_LAYER_DEVICE, ReaderError, Resolved, RootFs, RootWrite, Storage,
+    UnsupportedStorage, object_identity, request_mount, request_unmount, symlink_target,
     within_directory,
 };
 pub use vsock::{

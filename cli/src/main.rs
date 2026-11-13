@@ -545,6 +545,9 @@ const PREBUILD_MANIFEST_FILE: &str = "kernel-prebuild.json";
 /// user payload the kernel used to link in, delivered as a boot module.
 const BOOTFS_IMAGE_FILE: &str = "helios-bootfs";
 const DEFAULT_INIT_ARGV0: &str = "/init.wasm";
+/// The boot-program name `programs/init` answers to, published at
+/// `bin/init` like every other boot program.
+const INIT_COMMAND: &str = "init";
 const DEFAULT_BOOT_ARTIFACTS_MANIFEST: &str = "tools/wasi-apps/boot-artifacts.toml";
 /// Why the kernel profile did not reach the store.
 ///
@@ -1034,6 +1037,16 @@ fn run_kernel_prebuild(
         &selected_programs,
         &boot_artifacts_manifest,
     )?);
+    if selected_programs
+        .as_ref()
+        .is_none_or(|selected| selected.contains(INIT_COMMAND))
+    {
+        bootfs_assets.push(BootAsset {
+            path: format!("bin/{INIT_COMMAND}"),
+            source: resolve_bootfs_source(&init_cwasm)?,
+            kind: BootAssetKind::File,
+        });
+    }
 
     let bootfs_path = command.out_dir.join(BOOTFS_IMAGE_FILE);
     write_bootfs_image(
@@ -1686,10 +1699,12 @@ fn build_boot_program_assets(
             }
             .into());
         };
-        if command == "init" {
+        available_programs.insert(command.to_owned());
+        // Init is built once, as the payload's init component; the
+        // prebuild publishes that same artifact at `bin/init`.
+        if command == INIT_COMMAND {
             continue;
         }
-        available_programs.insert(command.to_owned());
         if selected_programs
             .as_ref()
             .is_some_and(|selected| !selected.contains(command))
