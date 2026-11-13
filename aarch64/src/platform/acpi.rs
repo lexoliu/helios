@@ -274,7 +274,7 @@ pub(super) fn describe(
 /// (`hw/arm/virt-acpi-build.c`, `acpi_dsdt_add_tpm`).
 fn tpm(
     tables: &AcpiPlatformTables,
-    interpreter: &Interpreter<Aarch64AcpiHandler>,
+    interpreter: &Interpreter,
     device: Option<&AmlName>,
 ) -> Result<Option<TpmDescription>, AcpiError> {
     let Some((physical_address, header)) = tables
@@ -292,7 +292,7 @@ fn tpm(
         let mapping = tables
             .handler
             .map_physical_region::<u8>(physical_address, length);
-        core::slice::from_raw_parts(mapping.virtual_start.as_ptr(), length)
+        core::slice::from_raw_parts(mapping.virtual_start().as_ptr(), length)
     };
     let table = AcpiTpm2::parse(bytes).map_err(AcpiError::Tpm2)?;
     let interface = InterfaceDescription::AcpiStartMethod(table.start_method());
