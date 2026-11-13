@@ -48,8 +48,9 @@ use crate::pmm::PhysFrameRange;
 mod gpu3d;
 
 pub use gpu3d::{
-    BlobId, BlobMemory, BlobRequest, BlobUsage, CapsetId, CapsetInfo, CapsetList, ContextId,
-    ContextName, FenceId, Gpu3d, Gpu3dError, Gpu3dResult, MAX_CAPSETS, MAX_CONTEXT_NAME,
+    BlobCaching, BlobId, BlobMemory, BlobRequest, BlobScanout, BlobUsage, CapsetId, CapsetInfo,
+    CapsetList, CommandStream, ContextId, ContextName, FenceId, Gpu3d, Gpu3dError, Gpu3dResult,
+    Gpu3dTable, MAX_CAPSETS, MAX_CONTEXT_NAME, MAX_RINGS, RingCount, RingIndex, Submission,
 };
 
 /// Largest number of scanouts a display device may present.
@@ -297,6 +298,25 @@ pub enum DisplayError {
     /// The device holds as many frame buffers as it has room to track.
     #[error("the display device already holds its maximum of {limit} frame buffers")]
     TooManyFramebuffers { limit: usize },
+    /// The device cannot scan a blob out: it negotiated no blob
+    /// resources.
+    #[error("this display device cannot scan out a blob resource")]
+    BlobScanoutUnsupported,
+    /// No such blob on this device.
+    #[error("blob {} does not exist on this device", .0.raw())]
+    UnknownBlob(BlobId),
+    /// The layout names rows narrower than the mode, or a frame that
+    /// ends past the blob it is read from.
+    #[error(
+        "a {width}x{height} frame at offset {offset} with stride {stride} does not lie inside a {blob_bytes}-byte blob"
+    )]
+    BlobLayout {
+        width: u32,
+        height: u32,
+        offset: u32,
+        stride: u32,
+        blob_bytes: u64,
+    },
     /// The transport underneath the display engine failed.
     #[error("display transport: {0}")]
     Transport(#[from] IoError),
@@ -336,6 +356,12 @@ pub trait DisplayDevice: Send + Sync + 'static {
     /// one flat span, row-major from the first range's first byte. The
     /// pages stay the caller's; the device only reads them, and only
     /// between this call and [`DisplayDevice::destroy_framebuffer`].
+    ///
+    /// An error the device answered leaves it holding nothing.
+    /// [`DisplayError::Transport`] means no answer was obtained: the
+    /// request may have reached the device, which may then read the
+    /// pages at any later time, and the caller has no handle to release
+    /// them by.
     fn create_framebuffer<'a>(
         &'a self,
         mode: DisplayMode,
@@ -345,7 +371,8 @@ pub trait DisplayDevice: Send + Sync + 'static {
 
     /// Releases a frame buffer and hands its backing pages back.
     ///
-    /// On return the device holds no reference to the caller's pages.
+    /// Once this resolves `Ok` the device holds no reference to the
+    /// caller's pages. Any error leaves it free to keep reading them.
     fn destroy_framebuffer(
         &self,
         framebuffer: FramebufferId,
@@ -360,6 +387,31 @@ pub trait DisplayDevice: Send + Sync + 'static {
         scanout: ScanoutId,
         framebuffer: FramebufferId,
         source: Rect,
+    ) -> impl Future<Output = DisplayResult<()>> + Send + '_;
+
+    /// Points `scanout` at a frame read straight out of a blob.
+    ///
+    /// The blob is one a renderer context filled — the bytes stay where
+    /// the renderer put them, and nothing is copied into a frame buffer
+    /// — so the layout says how to read them. A device that negotiated
+    /// no blob resources answers
+    /// [`DisplayError::BlobScanoutUnsupported`]; a layout that does not
+    /// fit the blob is refused before it reaches the wire.
+    fn set_scanout_blob(
+        &self,
+        scanout: ScanoutId,
+        layout: BlobScanout,
+    ) -> impl Future<Output = DisplayResult<()>> + Send + '_;
+
+    /// Tells the scanouts showing `blob` that `region` of it changed.
+    ///
+    /// The blob is the device's own resource, so there is nothing to
+    /// copy first: this is the flush half of [`DisplayDevice::flush`]
+    /// alone.
+    fn flush_blob(
+        &self,
+        blob: BlobId,
+        region: Rect,
     ) -> impl Future<Output = DisplayResult<()>> + Send + '_;
 
     /// Takes whatever `scanout` is showing off it.
@@ -430,7 +482,7 @@ pub trait DisplayDevice: Send + Sync + 'static {
 /// A backend hands the same driver to two owners at once — the kernel
 /// task that follows the display topology and the interrupt route that
 /// wakes it — so the shared handle satisfies the contract without every
-/// backend writing the same eleven forwarding methods.
+/// backend writing the same forwarding methods.
 impl<Device: DisplayDevice + ?Sized> DisplayDevice for alloc::sync::Arc<Device> {
     fn scanouts(&self) -> impl Future<Output = DisplayResult<ScanoutList>> + Send + '_ {
         Device::scanouts(self)
@@ -466,6 +518,22 @@ impl<Device: DisplayDevice + ?Sized> DisplayDevice for alloc::sync::Arc<Device> 
         source: Rect,
     ) -> impl Future<Output = DisplayResult<()>> + Send + '_ {
         Device::set_scanout(self, scanout, framebuffer, source)
+    }
+
+    fn set_scanout_blob(
+        &self,
+        scanout: ScanoutId,
+        layout: BlobScanout,
+    ) -> impl Future<Output = DisplayResult<()>> + Send + '_ {
+        Device::set_scanout_blob(self, scanout, layout)
+    }
+
+    fn flush_blob(
+        &self,
+        blob: BlobId,
+        region: Rect,
+    ) -> impl Future<Output = DisplayResult<()>> + Send + '_ {
+        Device::flush_blob(self, blob, region)
     }
 
     fn blank_scanout(

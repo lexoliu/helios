@@ -302,6 +302,54 @@ unsafe extern "Rust" {
     fn _helios_local_interrupt_restore(was_enabled: bool);
 }
 
+/// Interrupts masked on the calling processor, until the guard drops.
+///
+/// The same mask as [`with_local_interrupts_masked`], for a span that is
+/// not one closure: a processor that holds the machine still while it
+/// works alone keeps its own interrupts off from the point it begins
+/// until it lets the others go.
+///
+/// The guard is `!Send`: the token it restores belongs to the processor
+/// that took it, so a task that migrates cannot carry it to another one.
+/// Dropping restores what the constructor found, so nested guards unwind
+/// in order and only the outermost one re-enables interrupts.
+///
+/// Like the closure form it gives no exclusion against another
+/// processor.
+#[must_use = "interrupts are unmasked again when the guard drops"]
+pub struct LocalInterruptsMasked {
+    was_enabled: bool,
+    /// Pins the guard to the processor that masked.
+    _processor: core::marker::PhantomData<*mut ()>,
+}
+
+impl LocalInterruptsMasked {
+    /// Masks interrupts on the calling processor.
+    #[inline]
+    pub fn new() -> Self {
+        Self {
+            was_enabled: _helios_local_interrupt_mask(),
+            _processor: core::marker::PhantomData,
+        }
+    }
+}
+
+impl Default for LocalInterruptsMasked {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for LocalInterruptsMasked {
+    #[inline(always)]
+    fn drop(&mut self) {
+        // SAFETY: `was_enabled` came from the `mask` this guard was
+        // built from, on this processor (the guard is `!Send`), and
+        // nothing between the two touches the interrupt state.
+        unsafe { _helios_local_interrupt_restore(self.was_enabled) };
+    }
+}
+
 /// Runs `act` with interrupts masked on the calling processor.
 ///
 /// The mask is the one a backend installed with
@@ -319,23 +367,7 @@ unsafe extern "Rust" {
 /// cannot leave a processor masked.
 #[inline]
 pub fn with_local_interrupts_masked<R>(act: impl FnOnce() -> R) -> R {
-    struct Restore {
-        was_enabled: bool,
-    }
-
-    impl Drop for Restore {
-        #[inline(always)]
-        fn drop(&mut self) {
-            // SAFETY: `was_enabled` came from the `mask` this guard was
-            // built from, and nothing between the two touches the
-            // interrupt state.
-            unsafe { _helios_local_interrupt_restore(self.was_enabled) };
-        }
-    }
-
-    let _restore = Restore {
-        was_enabled: _helios_local_interrupt_mask(),
-    };
+    let _masked = LocalInterruptsMasked::new();
     act()
 }
 

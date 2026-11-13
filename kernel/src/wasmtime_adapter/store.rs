@@ -19,16 +19,16 @@ use wasmtime_wasi_io::streams::{InputStream, OutputStream, StreamError, StreamRe
 use crate::io::{ByteReader, ByteWriter};
 use crate::wasmtime_adapter::component_host::{StoreData, deliver_kill};
 use crate::{
-    ComponentHostNetwork, ComponentRuntimeState, ComponentStoreData, HostFileSystem,
-    KernelHeapHeadroom, MemoryPool, OomKillOutcome, ProgramOutOfMemory,
-    allow_instance_resource_growth, heap_stats, monotonic_nanos, user_heap_stats,
+    ComponentHostNetwork, ComponentRuntimeState, ComponentStoreData, KernelHeapHeadroom,
+    MemoryPool, OomKillOutcome, ProgramOutOfMemory, Storage, allow_instance_resource_growth,
+    heap_stats, monotonic_nanos, user_heap_stats,
 };
 
-impl<CpuImpl, Net, HostFs> ResourceLimiter for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> ResourceLimiter for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: HostFileSystem,
+    StorageImpl: Storage,
 {
     fn memory_growing(
         &mut self,
@@ -46,29 +46,17 @@ where
             .into());
         }
 
-        // An instance holding a device may not grow over the window its
-        // registers are mapped into: the memory would land on top of a
-        // register file. Refusing is what `memory.grow` already reports
-        // as -1, so a driver sees a shortage rather than a trap.
-        if self
-            .device
-            .growth_limit()
-            .is_some_and(|limit| desired as u64 > limit)
-        {
-            return Ok(false);
-        }
-
         let growth = desired.saturating_sub(current);
 
         if let Some(error) = self.try_satisfy_or_kill(desired, growth) {
             return Err(error);
         }
 
-        let allowed = allow_instance_resource_growth(self.instance(), desired, maximum);
-        if allowed {
-            self.device.note_growth(desired as u64);
-        }
-        Ok(allowed)
+        Ok(allow_instance_resource_growth(
+            self.instance(),
+            desired,
+            maximum,
+        ))
     }
 
     fn memory_grow_failed(&mut self, error: wasmtime::Error) -> wasmtime::Result<()> {
@@ -85,11 +73,11 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: HostFileSystem,
+    StorageImpl: Storage,
 {
     /// Decide whether `growth` extra bytes of user memory can be granted.
     ///
@@ -222,7 +210,7 @@ where
 }
 
 impl<CpuImpl, RuntimeStateImpl, FileSystem> IoView
-    for ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem, ResourceTable>
+    for ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem, ResourceTable, wasmtime::Memory>
 where
     CpuImpl: Cpu + Clone,
     RuntimeStateImpl: ComponentRuntimeState,

@@ -2,10 +2,17 @@
 //!
 //! This is the whole of what a compositor sees of the machine's display,
 //! and none of it is on the path a frame takes to the screen. A surface
-//! is created once; from then on the compositor writes pixels into its
-//! own linear memory with ordinary stores, and `present` is one message
-//! to the task that owns the display engine, which turns it into one
-//! copy into the device's own copy of the resource and one flush.
+//! is created once, its frame buffer shown at the span of its own linear
+//! memory the compositor named; from then on the compositor writes
+//! pixels there with ordinary stores, and `present` is one message to
+//! the task that owns the display engine, which turns it into one copy
+//! into the device's own copy of the resource and one flush.
+//!
+//! The frame buffer is shown in the last step of `create`, after the
+//! display engine has answered and in the same step that records the
+//! surface owning the view, so a `create` the compositor stops waiting
+//! for shows nothing; the resource the engine made for it goes back
+//! through a [`PendingReply`].
 //!
 //! The claim lives in the instance's store, so it is single-owned: the
 //! resource handles a compositor holds carry the claim generation to
@@ -16,7 +23,8 @@
 //! # Concurrency contract
 //!
 //! Every call here runs on the task that owns the store, so the claim
-//! and its arena need no lock. What is shared is the queue into the
+//! and the store's view table need no lock, and every view is shown and
+//! ended by that task alone. What is shared is the queue into the
 //! owner tasks, which carries its own synchronisation, and the two
 //! signals a stream is driven by — one per surface for frames, one per
 //! device for topology — which are counted events whose readers arm the
@@ -28,7 +36,8 @@ use core::task::{Context, Poll};
 
 use futures::channel::oneshot;
 use helios_hal::display::{
-    CursorImage, DisplayMode, FramebufferId, PixelFormat, Point, Rect, ScanoutId,
+    BlobId, BlobScanout, CursorImage, DisplayMode, FramebufferId, PixelFormat, Point, Rect,
+    ScanoutId,
 };
 use triomphe::Arc;
 use wasmtime::StoreContextMut;
@@ -38,13 +47,16 @@ use wasmtime::component::{
 };
 
 use crate::ComponentHostNetwork;
-use crate::display::PinnedFrame;
+use crate::buffer::{Buffer, Span, ViewId};
 use crate::display::{
     ControlRequest, CursorRequest, DisplaySender, DisplayServiceError, SequenceSignal,
+    SurfaceSource,
 };
+use crate::gpu::ScanoutHold;
 use crate::wasmtime_adapter::bindings::display::bindings::helios::system::display as display_wit;
+use crate::wasmtime_adapter::component_host::BlobHandle;
 
-use super::super::StoreData;
+use super::super::{PendingReply, StoreData, guest_memory, view_trap};
 
 /// Register `helios:system/display` in a linker.
 ///
@@ -53,15 +65,22 @@ use super::super::StoreData;
 /// instance. The claim checks the instance's display device class, and
 /// an instance without it is told `unavailable`, which is what a
 /// machine with no display device tells every program.
-pub(in crate::wasmtime_adapter::component_host) fn add_display_to_linker<CpuImpl, Net, HostFs>(
-    linker: &mut Linker<StoreData<CpuImpl, Net, HostFs>>,
+pub(in crate::wasmtime_adapter::component_host) fn add_display_to_linker<
+    CpuImpl,
+    Net,
+    StorageImpl,
+>(
+    linker: &mut Linker<StoreData<CpuImpl, Net, StorageImpl>>,
 ) -> wasmtime::Result<()>
 where
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    display_wit::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, HostFs>>>(linker, |state| state)
+    display_wit::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>(
+        linker,
+        |state| state,
+    )
 }
 
 /// A compositor's hold on the display, as its store records it.
@@ -89,12 +108,18 @@ pub struct SurfaceHandle {
     scanout: ScanoutId,
     mode: DisplayMode,
     format: PixelFormat,
-    framebuffer: FramebufferId,
-    frame: PinnedFrame,
-    /// The cursor plane's own resource and pages, once this surface has
-    /// been given a pointer image. A compositor that never sets one
-    /// pays nothing for the plane existing.
-    cursor: Option<(FramebufferId, PinnedFrame)>,
+    /// What the scanout reads: a frame buffer this surface made, or a
+    /// renderer's blob.
+    source: SurfaceSource,
+    /// The frame buffer's view in the compositor's memory, ended when
+    /// the surface is dropped. A blob surface shows nothing: the blob's
+    /// bytes are wherever the gpu path put them.
+    view: Option<ViewId>,
+    /// The cursor plane's own resource and frame buffer, once this
+    /// surface has been given a pointer image. A compositor that never
+    /// sets one pays nothing for the plane existing. The buffer is shown
+    /// nowhere: the kernel writes each image through its own alias.
+    cursor: Option<(FramebufferId, Buffer)>,
     /// Every frame this surface has published.
     vsync: Arc<SequenceSignal>,
 }
@@ -108,8 +133,10 @@ fn to_wit_error(error: DisplayServiceError) -> display_wit::Error {
         DisplayServiceError::UnsupportedMode => display_wit::Error::UnsupportedMode,
         DisplayServiceError::OutOfBounds => display_wit::Error::OutOfBounds,
         DisplayServiceError::TooManySurfaces => display_wit::Error::TooManySurfaces,
-        DisplayServiceError::WindowExhausted => display_wit::Error::WindowExhausted,
+        DisplayServiceError::BadSpan(_) => display_wit::Error::BadSpan,
         DisplayServiceError::OutOfMemory => display_wit::Error::OutOfMemory,
+        DisplayServiceError::NoBlobScanout => display_wit::Error::NoBlobScanout,
+        DisplayServiceError::StaleBlob => display_wit::Error::StaleBlob,
         // A display owner that has stopped serving is a machine on its
         // way down. There is nothing a compositor can do about it that
         // it would not also do about a device fault.
@@ -160,11 +187,11 @@ const fn from_wit_format(format: display_wit::PixelFormat) -> PixelFormat {
     }
 }
 
-impl<CpuImpl, Net, HostFs> StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     /// The queue into the display owner, checked against `generation`.
     fn display_sender(&self, generation: u64) -> Result<DisplaySender, DisplayServiceError> {
@@ -174,52 +201,141 @@ where
         }
         Ok(claim.sender())
     }
+}
 
-    /// Write `image` into the pages `frame` covers.
-    ///
-    /// The pages are in this instance's linear memory, above everything
-    /// it has grown into, so they are reached through the base the
-    /// runtime recorded rather than through the memory's accessible
-    /// slice — which stops at the instance's current size and would
-    /// never contain the display window.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the instance's linear memory has not been recorded.
-    /// A claim is refused before that happens, so a surface cannot
-    /// exist without it.
-    fn write_frame(&self, frame: PinnedFrame, image: &[u8]) {
-        let memory = self
-            .device
-            .memory()
-            .expect("an instance holding the display has a recorded linear memory");
-        let base = memory.base.raw() as *mut u8;
-        assert!(
-            image.len() as u64 <= frame.bytes,
-            "a cursor image of {} bytes does not fit a {}-byte frame buffer",
-            image.len(),
-            frame.bytes
+/// Pin a fresh frame buffer of `bytes` for showing at `span` of the
+/// calling instance's memory, once the display engine has a resource
+/// for it.
+///
+/// The span is checked before anything is pinned, so a span the table
+/// would refuse never costs the instance a run, and before the owner
+/// task is told anything. The run is pinned from the calling instance's
+/// own pool, inside its host call. Nothing is shown here.
+fn prepare_frame<U, CpuImpl, Net, StorageImpl>(
+    mut access: Access<'_, U, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>,
+    span: Span,
+    bytes: u64,
+) -> Result<(Buffer, crate::InstanceSpawner<CpuImpl>), DisplayServiceError>
+where
+    U: 'static,
+    CpuImpl: helios_hal::cpu::Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    let linear_memory = access.get().linear_memory;
+    let memory = guest_memory(linear_memory, &access)?;
+    let data = access.get();
+    data.views.validate(memory, span, bytes)?;
+    let buffer = Buffer::pinned(bytes)?;
+    Ok((buffer, data.spawner().clone()))
+}
+
+/// Show a frame buffer the display engine took at `span` of the calling
+/// instance's memory, and record the surface that owns the view, in one
+/// step.
+///
+/// The span is checked again: another call may have shown something
+/// overlapping it while the engine was creating the resource.
+fn show_frame<U, CpuImpl, Net, StorageImpl>(
+    mut access: Access<'_, U, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>,
+    span: Span,
+    buffer: &Buffer,
+    surface: impl FnOnce(ViewId) -> SurfaceHandle,
+) -> wasmtime::Result<Result<Resource<SurfaceHandle>, DisplayServiceError>>
+where
+    U: 'static,
+    CpuImpl: helios_hal::cpu::Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    let linear_memory = access.get().linear_memory;
+    // The store's memory handle is recorded once, when the instance is
+    // built, and `prepare_frame` already read it.
+    let memory = guest_memory(linear_memory, &access)
+        .expect("a store whose memory took the span when the frame was pinned has one");
+    let data = access.get();
+    let view = match data.views.show_buffer(memory, span, buffer, None) {
+        Ok(view) => view,
+        Err(error) => return Ok(Err(error.into())),
+    };
+    Ok(Ok(data.table.push(surface(view))?))
+}
+
+/// Tell the owner task to let go of resources a surface no longer
+/// holds, without the store and without waiting.
+///
+/// A resource drop is synchronous and the display engine is not, so
+/// the work is handed to a task rather than awaited. It cannot be lost
+/// for good: if the task cannot be spawned, or the instance dies before
+/// it runs, the claim's own release destroys the same resources.
+fn spawn_display_cleanup<CpuImpl>(
+    spawner: &crate::InstanceSpawner<CpuImpl>,
+    sender: DisplaySender,
+    generation: u64,
+    surfaces: [Option<SurfaceSource>; 2],
+) where
+    CpuImpl: helios_hal::cpu::Cpu + Clone,
+{
+    let spawned = spawner.try_spawn_detached(async move {
+        for surface in surfaces.into_iter().flatten() {
+            if let Err(error) = sender
+                .control_oneway(ControlRequest::DestroySurface {
+                    generation,
+                    surface,
+                })
+                .await
+            {
+                tracing::warn!(
+                    target: "helios_kernel::display",
+                    %error,
+                    "a dropped surface could not be handed back to the display owner"
+                );
+            }
+        }
+    });
+    if let Err(error) = spawned {
+        // The task arena is full. Nothing is leaked — the claim's own
+        // release destroys the same resources — but the display engine
+        // holds them until then, and that is worth saying.
+        tracing::warn!(
+            target: "helios_kernel::display",
+            %error,
+            "a dropped surface stays with the display engine until the claim ends"
         );
-        // SAFETY: `frame` was committed by this instance's own arena at
-        // `frame.offset` inside the linear memory based at `base`, is
-        // `frame.bytes` long, and is mapped readable and writable until
-        // the arena releases it. The store owns both the arena and this
-        // call, so nothing else is writing it.
-        let destination = unsafe {
-            core::slice::from_raw_parts_mut(
-                base.add(usize::try_from(frame.offset).expect("a window offset fits a pointer")),
-                image.len(),
-            )
-        };
-        destination.copy_from_slice(image);
     }
 }
 
-impl<CpuImpl, Net, HostFs> display_wit::Host for StoreData<CpuImpl, Net, HostFs>
+/// Write `image` into the cursor plane's frame buffer.
+///
+/// The buffer is shown in no instance's memory, so it is written through
+/// the kernel's own alias of its run.
+///
+/// # Panics
+///
+/// Panics when `image` is longer than the buffer: the caller checked it
+/// against the cursor plane's mode, which is what the buffer was sized
+/// for.
+fn write_cursor(buffer: &Buffer, image: &[u8]) {
+    assert!(
+        image.len() as u64 <= buffer.bytes(),
+        "a cursor image of {} bytes does not fit a {}-byte frame buffer",
+        image.len(),
+        buffer.bytes()
+    );
+    let destination = buffer.kernel_alias().raw() as *mut u8;
+    // SAFETY: the run is `buffer.bytes()` long, mapped readable and
+    // writable at its kernel alias for as long as `buffer` is held, and
+    // shown in no instance's memory. The display engine reads it only
+    // while serving a `SetCursor`, which this store's task sends after
+    // the write and never concurrently with it.
+    unsafe { core::ptr::copy_nonoverlapping(image.as_ptr(), destination, image.len()) };
+}
+
+impl<CpuImpl, Net, StorageImpl> display_wit::Host for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn claim(&mut self) -> wasmtime::Result<Result<Resource<DisplayHandle>, display_wit::Error>> {
         let Some(service) = self.runtime_state.display_service() else {
@@ -254,11 +370,11 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> display_wit::HostDisplay for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> display_wit::HostDisplay for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn drop(&mut self, handle: Resource<DisplayHandle>) -> wasmtime::Result<()> {
         let handle = self.table.delete(handle)?;
@@ -278,23 +394,12 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> display_wit::HostSurface for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> display_wit::HostSurface for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    fn buffer(
-        &mut self,
-        handle: Resource<SurfaceHandle>,
-    ) -> wasmtime::Result<display_wit::Placement> {
-        let surface = self.table.get(&handle)?;
-        Ok(display_wit::Placement {
-            offset: surface.frame.offset,
-            length: surface.frame.bytes,
-        })
-    }
-
     fn resolution(
         &mut self,
         handle: Resource<SurfaceHandle>,
@@ -304,11 +409,16 @@ where
 
     fn drop(&mut self, handle: Resource<SurfaceHandle>) -> wasmtime::Result<()> {
         let surface = self.table.delete(handle)?;
+        // The span is the compositor's ordinary memory again from here,
+        // whether or not it still holds the display.
+        if let Some(view) = surface.view {
+            self.views.end(view).map_err(view_trap)?;
+        }
         // The resources go back through the owner task, which blanks the
-        // output before it drops them; the pages stay pinned until it
-        // has, and are released with the claim. A surface dropped by an
-        // instance that no longer holds the display has already had both
-        // done for it.
+        // output before it drops them; the run stays pinned until it
+        // has, because the owner task's record holds it. A surface
+        // dropped by an instance that no longer holds the display has
+        // already had its resources destroyed by the release.
         let Ok(claim) = self.device.display().claim_ref() else {
             return Ok(());
         };
@@ -317,58 +427,15 @@ where
         }
         let sender = claim.sender();
         let generation = surface.generation;
-        let requests = [Some(surface.framebuffer), surface.cursor.map(|(id, _)| id)];
-        self.spawn_display_cleanup(sender, generation, requests);
+        let requests = [
+            Some(surface.source),
+            surface
+                .cursor
+                .as_ref()
+                .map(|(id, _)| SurfaceSource::Framebuffer(*id)),
+        ];
+        spawn_display_cleanup(self.spawner(), sender, generation, requests);
         Ok(())
-    }
-}
-
-impl<CpuImpl, Net, HostFs> StoreData<CpuImpl, Net, HostFs>
-where
-    CpuImpl: helios_hal::cpu::Cpu + Clone,
-    Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
-{
-    /// Tell the owner task to let go of the resources a dropped surface
-    /// held.
-    ///
-    /// A resource drop is synchronous and the display engine is not, so
-    /// the work is handed to a task rather than awaited here. It cannot
-    /// be lost: if the instance dies before the task runs, the claim's
-    /// own release destroys the same resources.
-    fn spawn_display_cleanup(
-        &self,
-        sender: DisplaySender,
-        generation: u64,
-        framebuffers: [Option<FramebufferId>; 2],
-    ) {
-        let spawned = self.spawner().try_spawn_detached(async move {
-            for framebuffer in framebuffers.into_iter().flatten() {
-                if let Err(error) = sender
-                    .control_oneway(ControlRequest::DestroySurface {
-                        generation,
-                        framebuffer,
-                    })
-                    .await
-                {
-                    tracing::warn!(
-                        target: "helios_kernel::display",
-                        %error,
-                        "a dropped surface could not be handed back to the display owner"
-                    );
-                }
-            }
-        });
-        if let Err(error) = spawned {
-            // The task arena is full. Nothing is leaked — the claim's
-            // own release destroys the same resources — but the display
-            // engine holds them until then, and that is worth saying.
-            tracing::warn!(
-                target: "helios_kernel::display",
-                %error,
-                "a dropped surface stays with the display engine until the claim ends"
-            );
-        }
     }
 }
 
@@ -379,15 +446,15 @@ where
 /// store is given back before anything is awaited: an `Access` guard
 /// held across a wait would hold the store for as long as the display
 /// engine takes.
-fn claim_of<U, CpuImpl, Net, HostFs>(
-    mut access: Access<'_, U, HasSelf<StoreData<CpuImpl, Net, HostFs>>>,
+fn claim_of<U, CpuImpl, Net, StorageImpl>(
+    mut access: Access<'_, U, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>,
     handle: &Resource<DisplayHandle>,
 ) -> wasmtime::Result<Result<(u64, DisplaySender), display_wit::Error>>
 where
     U: 'static,
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let data = access.get();
     let generation = data.table.get(handle)?.generation();
@@ -398,15 +465,15 @@ where
 }
 
 /// What a surface call needs from the store before it waits.
-fn surface_claim<U, CpuImpl, Net, HostFs>(
-    mut access: Access<'_, U, HasSelf<StoreData<CpuImpl, Net, HostFs>>>,
+fn surface_claim<U, CpuImpl, Net, StorageImpl>(
+    mut access: Access<'_, U, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>,
     handle: &Resource<SurfaceHandle>,
 ) -> wasmtime::Result<Result<(u64, ScanoutId, DisplaySender), display_wit::Error>>
 where
     U: 'static,
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let data = access.get();
     let surface = data.table.get(handle)?;
@@ -492,13 +559,13 @@ impl<T: 'static> StreamProducer<T> for DisplayChangeStreamProducer {
     }
 }
 
-impl<CpuImpl, Net, HostFs, U> display_wit::HostDisplayWithStore<U>
-    for HasSelf<StoreData<CpuImpl, Net, HostFs>>
+impl<CpuImpl, Net, StorageImpl, U> display_wit::HostDisplayWithStore<U>
+    for HasSelf<StoreData<CpuImpl, Net, StorageImpl>>
 where
     U: 'static,
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     async fn scanouts(
         accessor: &Accessor<U, Self>,
@@ -561,6 +628,7 @@ where
         scanout: u32,
         mode: display_wit::Mode,
         format: display_wit::PixelFormat,
+        buffer: display_wit::Span,
     ) -> wasmtime::Result<Result<Resource<SurfaceHandle>, display_wit::Error>> {
         let (generation, sender) = match accessor.with(|access| claim_of(access, &handle))? {
             Ok(pair) => pair,
@@ -569,49 +637,164 @@ where
         let scanout = ScanoutId::new(scanout);
         let mode = from_wit_mode(mode);
         let format = from_wit_format(format);
-        let frame = accessor.with(|mut access| {
-            access
-                .get()
-                .device
-                .display_mut()
-                .pin_frame(mode, format.bytes_per_pixel())
+        // A mode with no pixels is a mode no display engine drives, not
+        // a span problem: its frame has no size for any span to match.
+        let Some(bytes) = mode.frame_bytes(format).filter(|bytes| *bytes != 0) else {
+            return Ok(Err(display_wit::Error::UnsupportedMode));
+        };
+        let span = Span::new(buffer.offset, buffer.length);
+        // Pinned and checked first; shown only in the last step, once
+        // the display engine has a resource for it. Until then nothing
+        // of the frame buffer is in the compositor's memory, so a
+        // compositor that stops waiting for this call can free the span
+        // at once.
+        let (backing, spawner) =
+            match accessor.with(|access| prepare_frame(access, span, bytes as u64)) {
+                Ok(prepared) => prepared,
+                Err(error) => return Ok(Err(to_wit_error(error))),
+            };
+        let (reply, answer) = oneshot::channel();
+        // What the engine makes for a call that is dropped before its
+        // last step goes back through the same path a dropped surface's
+        // resource does.
+        let cleanup = sender.clone();
+        let mut pending = PendingReply::new(answer, move |framebuffer| {
+            spawn_display_cleanup(
+                &spawner,
+                cleanup,
+                generation,
+                [Some(SurfaceSource::Framebuffer(framebuffer)), None],
+            );
         });
-        let frame = match frame {
-            Ok(frame) => frame,
+        let queued = sender
+            .control_oneway(ControlRequest::CreateSurface {
+                generation,
+                scanout,
+                mode,
+                format,
+                backing: backing.clone(),
+                reply,
+            })
+            .await;
+        let framebuffer = match queued {
+            Ok(()) => pending.reply(DisplayServiceError::Closed).await,
+            Err(error) => Err(error),
+        };
+        let framebuffer = match framebuffer {
+            Ok(framebuffer) => framebuffer,
+            // Nothing will ever latch this frame buffer, and nothing
+            // showed it, so the run goes back with this call's reference.
             Err(error) => return Ok(Err(to_wit_error(error))),
         };
+        let shown = accessor.with(|access| {
+            show_frame(access, span, &backing, |view| SurfaceHandle {
+                generation,
+                scanout,
+                mode,
+                format,
+                source: SurfaceSource::Framebuffer(framebuffer),
+                view: Some(view),
+                cursor: None,
+                vsync: Arc::new(SequenceSignal::new()),
+            })
+        })?;
+        match shown {
+            Ok(surface) => {
+                pending.keep();
+                Ok(Ok(surface))
+            }
+            Err(error) => {
+                // The span was taken while the engine was answering. The
+                // resource goes back before the refusal does; the pending
+                // reply stays armed across the wait, so a call dropped in
+                // it still hands the resource back.
+                if let Err(closed) = sender
+                    .control_oneway(ControlRequest::DestroySurface {
+                        generation,
+                        surface: SurfaceSource::Framebuffer(framebuffer),
+                    })
+                    .await
+                {
+                    tracing::warn!(
+                        target: "helios_kernel::display",
+                        %closed,
+                        "a surface whose span was taken could not be handed back to the display owner"
+                    );
+                }
+                pending.keep();
+                Ok(Err(to_wit_error(error)))
+            }
+        }
+    }
+
+    async fn create_from_blob(
+        accessor: &Accessor<U, Self>,
+        handle: Resource<DisplayHandle>,
+        scanout: u32,
+        mode: display_wit::Mode,
+        format: display_wit::PixelFormat,
+        blob: Resource<BlobHandle>,
+        offset: u32,
+        stride: u32,
+    ) -> wasmtime::Result<Result<Resource<SurfaceHandle>, display_wit::Error>> {
+        let (generation, sender) = match accessor.with(|access| claim_of(access, &handle))? {
+            Ok(pair) => pair,
+            Err(error) => return Ok(Err(error)),
+        };
+        let scanout = ScanoutId::new(scanout);
+        let mode = from_wit_mode(mode);
+        let format = from_wit_format(format);
+        // The blob has to be one this instance's open gpu session holds:
+        // a handle that outlived its session names a resource the
+        // session's end already destroyed. The scanout's hold is taken
+        // in the same step, so a release that starts after it — the
+        // handle dropped, the session ended — leaves the blob alone
+        // until the scanout has let go.
+        let named = accessor.with(
+            |mut access| -> wasmtime::Result<Result<(BlobId, ScanoutHold), DisplayServiceError>> {
+                let data = access.get();
+                let blob = data.table.get(&blob)?;
+                if !data.device.gpu().is_current(blob.session) {
+                    return Ok(Err(DisplayServiceError::StaleBlob));
+                }
+                Ok(Ok((blob.id, ScanoutHold::new(&blob.shared))))
+            },
+        )?;
+        let (blob, hold) = match named {
+            Ok(named) => named,
+            Err(error) => return Ok(Err(to_wit_error(error))),
+        };
+        let layout = BlobScanout {
+            blob,
+            mode,
+            format,
+            offset,
+            stride,
+        };
         let (reply, answer) = oneshot::channel();
-        let created = sender
+        let shown = sender
             .control(
-                ControlRequest::CreateSurface {
+                ControlRequest::CreateBlobSurface {
                     generation,
                     scanout,
-                    mode,
-                    format,
-                    backing: frame.backing,
+                    layout,
+                    hold,
                     reply,
                 },
                 answer,
             )
             .await;
-        let framebuffer = match created {
-            Ok(framebuffer) => framebuffer,
-            Err(error) => {
-                // Nothing is showing these pages, so they go straight
-                // back rather than waiting for a release that will never
-                // come.
-                accessor.with(|mut access| access.get().device.display_mut().unpin_frame(frame));
-                return Ok(Err(to_wit_error(error)));
-            }
-        };
+        if let Err(error) = shown {
+            return Ok(Err(to_wit_error(error)));
+        }
         let surface = accessor.with(|mut access| {
             access.get().table.push(SurfaceHandle {
                 generation,
                 scanout,
                 mode,
                 format,
-                framebuffer,
-                frame,
+                source: SurfaceSource::Blob { blob, scanout },
+                view: None,
                 cursor: None,
                 vsync: Arc::new(SequenceSignal::new()),
             })
@@ -648,13 +831,13 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs, U> display_wit::HostSurfaceWithStore<U>
-    for HasSelf<StoreData<CpuImpl, Net, HostFs>>
+impl<CpuImpl, Net, StorageImpl, U> display_wit::HostSurfaceWithStore<U>
+    for HasSelf<StoreData<CpuImpl, Net, StorageImpl>>
 where
     U: 'static,
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     async fn set_cursor(
         accessor: &Accessor<U, Self>,
@@ -668,7 +851,7 @@ where
                 surface.generation,
                 surface.scanout,
                 surface.format,
-                surface.cursor,
+                surface.cursor.clone(),
             ))
         })?;
         let expected = CursorImage::MODE
@@ -687,16 +870,11 @@ where
         let (framebuffer, frame) = match held {
             Some(cursor) => cursor,
             None => {
-                let frame = accessor.with(|mut access| {
-                    access
-                        .get()
-                        .device
-                        .display_mut()
-                        .pin_frame(CursorImage::MODE, format.bytes_per_pixel())
-                });
-                let frame = match frame {
+                // Pinned inside this host call, so the run is charged to
+                // this instance like any frame buffer it shows.
+                let frame = match Buffer::pinned(expected as u64) {
                     Ok(frame) => frame,
-                    Err(error) => return Ok(Err(to_wit_error(error))),
+                    Err(error) => return Ok(Err(to_wit_error(error.into()))),
                 };
                 let (reply, answer) = oneshot::channel();
                 let created = sender
@@ -704,7 +882,7 @@ where
                         ControlRequest::CreateCursor {
                             generation,
                             format,
-                            backing: frame.backing,
+                            backing: frame.clone(),
                             reply,
                         },
                         answer,
@@ -712,23 +890,21 @@ where
                     .await;
                 match created {
                     Ok(framebuffer) => {
+                        let held = frame.clone();
                         accessor.with(|mut access| {
                             access.get().table.get_mut(&handle).map(|surface| {
-                                surface.cursor = Some((framebuffer, frame));
+                                surface.cursor = Some((framebuffer, held));
                             })
                         })?;
                         (framebuffer, frame)
                     }
-                    Err(error) => {
-                        accessor.with(|mut access| {
-                            access.get().device.display_mut().unpin_frame(frame);
-                        });
-                        return Ok(Err(to_wit_error(error)));
-                    }
+                    // The owner task dropped its reference with the
+                    // refusal, so the run goes back with this one.
+                    Err(error) => return Ok(Err(to_wit_error(error))),
                 }
             }
         };
-        accessor.with(|mut access| access.get().write_frame(frame, &image));
+        write_cursor(&frame, &image);
         let (reply, answer) = oneshot::channel();
         let outcome = sender
             .control(
@@ -821,7 +997,7 @@ where
         let data = accessor.get();
         let surface = data.table.get(&handle)?;
         let generation = surface.generation;
-        let framebuffer = surface.framebuffer;
+        let source = surface.source;
         let mode = surface.mode;
         let vsync = surface.vsync.clone();
         let region = from_wit_rect(region);
@@ -849,7 +1025,7 @@ where
                 .control(
                     ControlRequest::Present {
                         generation,
-                        framebuffer,
+                        surface: source,
                         region,
                         vsync,
                         reply,

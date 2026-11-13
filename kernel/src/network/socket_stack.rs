@@ -272,6 +272,10 @@ mod tests {
             [2, 0, 0, 0, 0, 1]
         }
 
+        fn revalidate_lease(&self) -> impl Future<Output = ()> + Send + '_ {
+            core::future::ready(())
+        }
+
         fn ipv4_cidr(
             &self,
         ) -> impl core::future::Future<Output = Option<crate::Ipv4Cidr>> + Send + '_ {
@@ -395,6 +399,15 @@ mod tests {
             _: usize,
         ) -> Result<crate::TcpReadProgress, TcpError> {
             Ok(crate::TcpReadProgress::Eof)
+        }
+
+        fn tcp_read_into<'a>(
+            &'a self,
+            _: Self::TcpStream,
+            _: &'a mut crate::RegisteredTcpReadBuffer<'_>,
+            _: u64,
+        ) -> impl Future<Output = Result<crate::TcpReadInto, TcpError>> + Send + 'a {
+            core::future::ready(Ok(crate::TcpReadInto::Eof))
         }
 
         fn tcp_send_room(&self, _: Self::TcpStream) -> Result<crate::TcpWriteProgress, TcpError> {

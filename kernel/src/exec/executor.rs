@@ -1,7 +1,6 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
-use alloc::vec::Vec;
 use core::alloc::Layout;
 use core::cell::UnsafeCell;
 use core::future::Future;
@@ -12,25 +11,31 @@ use core::ptr::{self, NonNull};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use core::task::{Context, Poll};
 
-use async_task::{Builder, Runnable, Task};
-use concurrent_queue::{ConcurrentQueue, PopError, PushError};
+use async_task::{Builder, Task};
 use crossbeam_utils::CachePadded;
 use helios_hal::cpu::{Cpu, ProcessorId, current_processor};
+use helios_hal::numa::NodeId;
 use helios_hal::watchdog::ProgressCounter;
 use spin::Once;
 use triomphe::Arc as NoWeakArc;
 
+use crate::exec::freeze::FreezeBarrier;
 use crate::exec::idle::{
     IDLE_POLL_GROW_START, IDLE_POLL_MAX, IdleOutcome, IdleState, ProcessorIdle,
 };
+use crate::exec::lifecycle::{OnlineSet, ProcessorControl, ProcessorLifecycles};
+use crate::exec::ready::{
+    GlobalPop, GlobalReadyQueue, ReadyLink, ReadyRunnable, ReadyShared, RunList,
+};
 use crate::exec::sync::Notify;
-use crate::exec::timer::Timer;
-use crate::memory::task_arena_bytes_for;
+use crate::exec::timer::{Timer, TimerBases};
+use crate::instance::{InstanceHome, RegisteredInstance};
+use crate::memory::{
+    LocalMemory, Locality, NodeMemory, PerProcessor, UserMemoryPool, task_arena_bytes_for,
+};
 
-type ReadyQueue = ConcurrentQueue<Runnable>;
-pub type JoinHandle<T> = Task<T>;
+pub type JoinHandle<T> = Task<T, ReadyLink>;
 pub const READY_BATCH_TASKS: usize = 1024;
-const READY_QUEUE_CAPACITY: usize = READY_BATCH_TASKS * 4;
 const TASK_ARENA_ALIGN: usize = 64;
 /// Power-of-two block classes from the alignment granule (64 B) up to
 /// the largest future the arena places (256 KiB).
@@ -52,7 +57,7 @@ const TASK_ARENA_TOP_BYTES: usize = TASK_ARENA_ALIGN << (TASK_ARENA_CLASS_COUNT 
 const TASK_ARENA_KERNEL_RESERVE_BYTES: usize = TASK_ARENA_TOP_BYTES;
 /// Empty-list and end-of-chain sentinel for block offsets.
 const TASK_ARENA_BLOCK_NULL: usize = usize::MAX;
-static EXECUTOR_GROUP: Once<NoWeakArc<ExecutorGroup>> = Once::new();
+static EXECUTOR_GROUP: Once<ExecutorGroup> = Once::new();
 
 /// Which share of a processor's task arena a spawn draws from.
 ///
@@ -91,25 +96,139 @@ const _: () = assert!(align_of::<CachePadded<AtomicUsize>>() >= 64);
 
 /// The queues and counters every processor's executor shares.
 ///
-/// Cache-line contract: a processor's ready counter is written by
-/// whichever processor wakes a task it owns and polled by the owner
-/// on every run-loop pass, so each one sits on its own line rather
-/// than eight to a line. The two global counters are written by every
-/// processor and are padded away from the `Box` pointers beside them,
-/// which every processor reads on every schedule; without that, each
-/// global push would invalidate the line every scheduler dereferences.
-struct ExecutorGroup {
-    local_queues: Box<[ReadyQueue]>,
-    local_ready_counts: Box<[CachePadded<AtomicUsize>]>,
-    /// One cache line per processor: written only by the owner on its
-    /// way into and out of idle, read by every processor that queues
-    /// work for it. The wake handshake it serves is in `idle`'s
-    /// module docs.
-    idle: Box<[CachePadded<ProcessorIdle>]>,
-    task_arenas: Box<[NoWeakArc<TaskArena>]>,
-    global_queue: ReadyQueue,
-    global_ready_count: CachePadded<AtomicUsize>,
-    global_wake_cursor: CachePadded<AtomicUsize>,
+/// The ready queues are intrusive lists linked through the tasks'
+/// own headers, so none has a capacity; their contract is in the
+/// `ready` module docs.
+///
+/// # Concurrency contract
+///
+/// Every push is lock-free, from any processor and any context. A
+/// processor's local queue is pushed by any processor that wakes a
+/// local task it owns and popped by the owner alone, which takes the
+/// whole inbox into its private [`RunList`] (`Executor::local_run`). A
+/// node's queue ([`NodeQueue`]) is pushed by whichever processor
+/// schedules a global task whose home is that node, and popped by every
+/// processor through its consumer `try_lock`, which never spins: its
+/// own node's processors drain it right after their local queue, and
+/// every other processor steals from it once its local queue and its
+/// own node's queue are both empty, in its node's
+/// [`Locality::scheduling_order`]. A pop that loses the `try_lock` moves
+/// on to the next queue, and the queue's count stays raised, so the
+/// idle handshake re-tests it and never parks on queued work. A wake
+/// fans out to at most one other processor per push
+/// (`ExecutorGroup::wake_one_processor_for`), and only to a processor
+/// in the online set. `locality` is immutable.
+///
+/// A processor that goes offline leaves its node's queue behind: the
+/// node's other online processors drain it as their own, and every
+/// other processor steals from it, so a node whose processors are all
+/// offline still has its tasks run. Its local queue is empty when it
+/// leaves (`Executor::take_offline`).
+///
+/// Cache-line contract: each processor's [`ReadyShared`] (inbox head
+/// and ready count) is written by whichever processor wakes a task it
+/// owns and by the owner's take-all and decrement, and the count is
+/// polled by the owner on every run-loop pass, so it sits on its own
+/// line inside the processor's block. Each node's queue pads its
+/// [`ReadyShared`], written by every processor that pushes to the node
+/// and read by every processor on every park test, its consumer lock,
+/// written by the processor that wins the `try_lock`, and its wake
+/// cursor, written by every push to the node that wakes a processor,
+/// onto lines of their own. Without that padding a push to one node
+/// would invalidate the lines another node's processors poll, and the
+/// `Box` pointers every scheduler dereferences.
+///
+/// A machine with one node has one node queue, which is exactly the
+/// single machine-wide queue every processor drained before nodes
+/// existed.
+///
+/// Every per-processor table is sized to the possible set
+/// ([`Cpu::processor_count`], which the NUMA description's processor
+/// count equals) once and never resized: a processor that goes offline
+/// keeps its slot, and one that comes back finds it, on the node the
+/// description put it on.
+pub(crate) struct ExecutorGroup {
+    /// One block per processor, in memory of the processor's node.
+    processors: PerProcessor<ProcessorQueues>,
+    /// Index: [`NodeId`]. Every field of a [`NodeQueue`] is padded, so
+    /// no two nodes' queues share a line.
+    nodes: Box<[NodeQueue]>,
+    locality: &'static Locality,
+    /// The words a freeze shares, read by every processor at every
+    /// scheduler boundary. The contract is in `freeze`'s module docs.
+    pub(super) freeze: FreezeBarrier,
+    /// The kernel's online set. Written only by a processor joining or
+    /// leaving it, read by every cross-processor wake.
+    online: CachePadded<OnlineSet>,
+    /// Each processor's lifecycle cell and the lock that serialises
+    /// transitions; see `lifecycle`.
+    lifecycle: ProcessorLifecycles,
+    /// Each processor's timer base; see `timer`.
+    timer_bases: TimerBases,
+}
+
+/// What belongs to one processor: its local queue's shared half, its
+/// idle state, its task arena and its count of live local tasks.
+///
+/// `shared` (the inbox head and the count of tasks queued locally) is
+/// written by whichever processor wakes a local task the owner holds,
+/// and by the owner's take-all and decrement; the owner polls the count
+/// on every run-loop pass, so it has a line of its own. The list the
+/// owner takes the inbox into is the owner's `Executor::local_run`, not
+/// shared state. `idle` is written only by the owner on its way into
+/// and out of idle and read by every processor that queues work for it;
+/// the wake handshake it serves is in `idle`'s module docs. The arena's
+/// header is the one shared allocation every future placed in it keeps
+/// a reference to; its bytes are in the owner's node's memory.
+/// `local_live` counts the local tasks whose future is still alive. It
+/// is written by the owner only — a local task is spawned, run and
+/// dropped on its owner — and read by the owner's offline step, which
+/// refuses to stop a processor that still has work pinned to it; being
+/// owner-only, it shares the arena pointer's line.
+struct ProcessorQueues {
+    shared: CachePadded<ReadyShared>,
+    idle: CachePadded<ProcessorIdle>,
+    task_arena: NoWeakArc<TaskArena>,
+    local_live: AtomicUsize,
+}
+
+/// One node's queue of global tasks whose home is that node.
+///
+/// The queue's shared half (inbox head and ready count) and
+/// `wake_cursor` are written by every processor that schedules such a
+/// task; the queue's consumer half by whichever processor pops it; see
+/// [`ExecutorGroup`] for who pops when. The ready count is incremented
+/// before the push and decremented once the task is out of the queue,
+/// so a zero there means the queue is empty; it is the sender half of
+/// the idle handshake for the node's tasks.
+struct NodeQueue {
+    queue: GlobalReadyQueue,
+    /// Which of the node's processors the next push considers waking.
+    wake_cursor: CachePadded<AtomicUsize>,
+}
+
+/// Where a global task is queued: the node whose [`NodeQueue`] every
+/// schedule of it pushes to.
+///
+/// Variation is through this trait rather than an enum: a kernel task's
+/// home is fixed when it is spawned ([`FixedHome`]); an instance's task
+/// follows its instance's home (`crate::instance::InstanceHome`). The
+/// home is read on every schedule, from whichever processor woke the
+/// task, so `node` answers without a lock.
+pub(crate) trait TaskHome: Send + Sync + 'static {
+    fn node(&self, locality: &Locality) -> NodeId;
+}
+
+/// A kernel task's home: the node of the processor that spawned it, for
+/// the life of the task. A kernel task stays near where it was created
+/// instead of drifting with whichever processor last woke it.
+#[derive(Clone, Copy)]
+struct FixedHome(NodeId);
+
+impl TaskHome for FixedHome {
+    fn node(&self, _: &Locality) -> NodeId {
+        self.0
+    }
 }
 
 /// Per-processor buddy arena for task futures.
@@ -207,7 +326,9 @@ enum BlockRegion {
 
 const BLOCK_REGION_COUNT: usize = 2;
 
-/// The arena's backing bytes, carved from the kernel heap at boot.
+/// The arena's backing bytes, carved at boot from the memory of the node
+/// the owning processor is on and never returned: the arena lives as
+/// long as the machine, like the group that holds it.
 ///
 /// There is no compile-time array behind an arena any more: how many
 /// tasks a processor can hold is a property of the machine's memory,
@@ -215,7 +336,6 @@ const BLOCK_REGION_COUNT: usize = 2;
 /// states it.
 struct ArenaBytes {
     ptr: NonNull<u8>,
-    len: usize,
 }
 
 /// The header a block carries while it sits on one of its region's free
@@ -273,33 +393,17 @@ unsafe impl Send for TaskArena {}
 unsafe impl<Fut: Send> Send for ArenaFuture<Fut> {}
 
 impl ArenaBytes {
-    fn new(len: usize) -> Self {
-        let layout = Self::layout(len);
-        // SAFETY: `layout` has a non-zero size: the caller has already
-        // asserted the arena spans at least two top blocks.
-        let ptr = unsafe { alloc::alloc::alloc(layout) };
-        let ptr = NonNull::new(ptr).unwrap_or_else(|| alloc::alloc::handle_alloc_error(layout));
-        Self { ptr, len }
-    }
-
-    fn layout(len: usize) -> Layout {
-        Layout::from_size_align(len, TASK_ARENA_ALIGN)
-            .unwrap_or_else(|error| panic!("a task arena of {len} bytes has no layout: {error}"))
+    /// `len` bytes carved from the node `local` is on.
+    fn carve<Source: NodeMemory>(len: usize, local: &LocalMemory<'_, Source>) -> Self {
+        let layout = Layout::from_size_align(len, TASK_ARENA_ALIGN)
+            .unwrap_or_else(|error| panic!("a task arena of {len} bytes has no layout: {error}"));
+        Self {
+            ptr: local.carve(layout),
+        }
     }
 
     fn ptr(&self) -> *mut u8 {
         self.ptr.as_ptr()
-    }
-}
-
-impl Drop for ArenaBytes {
-    fn drop(&mut self) {
-        // SAFETY: the pointer came from `alloc` under the same layout,
-        // and every task that held a block is gone: the arena is only
-        // dropped when the last `ArenaFuture` referencing it has been.
-        unsafe {
-            alloc::alloc::dealloc(self.ptr.as_ptr(), Self::layout(self.len));
-        }
     }
 }
 
@@ -471,14 +575,17 @@ impl TaskArena {
     ///
     /// The size comes from the boot memory plan, so a processor's task
     /// capacity moves with the machine's memory (#159).
-    fn new_shared(arena_bytes: usize) -> NoWeakArc<Self> {
+    fn new_shared<Source: NodeMemory>(
+        arena_bytes: usize,
+        local: &LocalMemory<'_, Source>,
+    ) -> NoWeakArc<Self> {
         let total_bytes = arena_bytes / TASK_ARENA_TOP_BYTES * TASK_ARENA_TOP_BYTES;
         assert!(
             total_bytes >= TASK_ARENA_KERNEL_RESERVE_BYTES + TASK_ARENA_TOP_BYTES,
             "a task arena of {arena_bytes} bytes cannot hold the kernel reserve and a share"
         );
         let share_bytes = total_bytes - TASK_ARENA_KERNEL_RESERVE_BYTES;
-        let bytes = ArenaBytes::new(total_bytes);
+        let bytes = ArenaBytes::carve(total_bytes, local);
         let base = bytes.ptr;
         NoWeakArc::new(Self {
             regions: CachePadded::new(UnsafeCell::new([
@@ -684,53 +791,34 @@ enum ProgressMode {
 /// migration of a local task to a different processor through the type system.
 #[must_use = "tasks get canceled when dropped, use `.detach()` to run them in the background"]
 pub struct LocalJoinHandle<T> {
-    task: Task<T>,
+    task: Task<T, ReadyLink>,
     _not_send_or_sync: PhantomData<*mut ()>,
 }
 
 #[derive(Clone)]
 pub struct Spawner<CpuImpl: Cpu + Clone> {
-    group: NoWeakArc<ExecutorGroup>,
+    group: &'static ExecutorGroup,
     cpu: CpuImpl,
     owner_processor: ProcessorId,
-    local_queue_index: usize,
-    processor_count: usize,
     progress: ProgressCounter,
     progress_notify: NoWeakArc<Notify>,
 }
 
-pub struct Executor {
-    group: NoWeakArc<ExecutorGroup>,
-    owner_processor: ProcessorId,
-    local_queue_index: usize,
-    processor_count: usize,
-    progress: ProgressCounter,
-    progress_notify: NoWeakArc<Notify>,
-}
-
-/// The processor a [`Timer`] belongs to, and the idle state that
-/// processor's executor publishes.
+/// One processor's run loop.
 ///
-/// Only the owner programs the timer's hardware deadline; any other
-/// processor that publishes an earlier deadline asks this whether the
-/// owner has stopped looking ([`IdleState::Parked`]) and wakes it if so.
-#[derive(Clone)]
-pub(crate) struct TimerOwner {
-    group: NoWeakArc<ExecutorGroup>,
-    processor: ProcessorId,
-}
-
-impl TimerOwner {
-    pub(crate) fn processor(&self) -> ProcessorId {
-        self.processor
-    }
-
-    /// Whether the owner has published [`IdleState::Parked`]. `SeqCst`:
-    /// the publisher half of the timer's wake handshake, after the
-    /// publisher has lowered the timer's published deadline.
-    pub(crate) fn is_parked(&self) -> bool {
-        self.group.needs_wake(usize::from(self.processor.id()))
-    }
+/// `local_run` is the owner's FIFO of local tasks it has taken off its
+/// inbox, so the executor is `!Sync`: one thread drives it, and the list
+/// needs no lock. It is `Send`, because a list owns its tasks.
+pub struct Executor {
+    group: &'static ExecutorGroup,
+    owner_processor: ProcessorId,
+    /// The owner's node, whose queue this executor drains right after
+    /// its local one. Fixed by the NUMA description, so a processor
+    /// that goes offline and comes back drains the same node.
+    node: NodeId,
+    progress: ProgressCounter,
+    progress_notify: NoWeakArc<Notify>,
+    local_run: RunList,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -749,26 +837,26 @@ struct ProgressSignal {
 // `async_task` stores the scheduler closure inside every heap-allocated task.
 // Keep global/local schedulers narrow instead of capturing the whole `Spawner`;
 // the executor spawn benchmark tracks this directly as bytes per task.
-struct GlobalScheduler<CpuImpl: Cpu + Clone> {
-    group: NoWeakArc<ExecutorGroup>,
+// The online processor count is read from the group rather than
+// copied here, which is what makes room for the home.
+struct GlobalScheduler<CpuImpl: Cpu + Clone, Home: TaskHome> {
+    group: &'static ExecutorGroup,
     cpu: CpuImpl,
-    processor_count: usize,
     progress: ProgressSignal,
+    home: Home,
 }
 
 struct LocalScheduler<CpuImpl: Cpu + Clone> {
-    group: NoWeakArc<ExecutorGroup>,
+    group: &'static ExecutorGroup,
     cpu: CpuImpl,
     owner_processor: ProcessorId,
-    local_queue_index: usize,
     progress: ProgressSignal,
 }
 
 struct LocalSilentScheduler<CpuImpl: Cpu + Clone> {
-    group: NoWeakArc<ExecutorGroup>,
+    group: &'static ExecutorGroup,
     cpu: CpuImpl,
     owner_processor: ProcessorId,
-    local_queue_index: usize,
 }
 
 impl ExecutorRunStats {
@@ -788,69 +876,123 @@ impl ExecutorRunStats {
         self.local_empty_pop_count
     }
 
+    /// Global pops that found nothing they could take: the queue was
+    /// empty, or another processor held its consumer lock.
     pub const fn global_empty_pop_count(self) -> usize {
         self.global_empty_pop_count
     }
 }
 
 impl Executor {
+    /// The executor of `owner_processor` on the machine `pool`
+    /// describes, which also says how many processors there are.
+    ///
+    /// Every processor's executor shares one group of queues, built by
+    /// the first call from `pool`'s node memory; every processor passes
+    /// the machine's one pool.
     pub fn new(
         progress: ProgressCounter,
-        configured_processors: usize,
+        pool: &'static UserMemoryPool,
         owner_processor: ProcessorId,
     ) -> Self {
-        let group = executor_group(configured_processors);
-        let local_queue_index = owner_processor.id() as usize;
-        group
-            .local_queues
-            .get(local_queue_index)
-            .unwrap_or_else(|| {
-                panic!(
-                    "executor owner processor {} is outside configured processor count {}",
-                    owner_processor.id(),
-                    configured_processors
-                )
-            });
-        let processor_count = group.local_queues.len();
+        Self::on_group(executor_group(pool), progress, owner_processor)
+    }
+
+    /// An executor on a group of its own rather than the machine's, for
+    /// a test that must not share ready queues, timer bases or the
+    /// online set with the other tests in its process, and that chooses
+    /// the machine through `pool`.
+    #[cfg(test)]
+    pub(crate) fn isolated(
+        progress: ProgressCounter,
+        pool: &'static UserMemoryPool,
+        owner_processor: ProcessorId,
+    ) -> Self {
+        let group: &'static ExecutorGroup = Box::leak(Box::new(ExecutorGroup::new(pool)));
+        Self::on_group(group, progress, owner_processor)
+    }
+
+    /// The executor of `owner_processor` on the group another
+    /// processor's executor already runs on.
+    #[cfg(test)]
+    pub(crate) fn sibling(&self, progress: ProgressCounter, owner_processor: ProcessorId) -> Self {
+        Self::on_group(self.group, progress, owner_processor)
+    }
+
+    fn on_group(
+        group: &'static ExecutorGroup,
+        progress: ProgressCounter,
+        owner_processor: ProcessorId,
+    ) -> Self {
+        let possible = group.possible_processors();
+        assert!(
+            usize::from(owner_processor.id()) < possible,
+            "executor owner processor {} is outside the {possible} possible processors",
+            owner_processor.id(),
+        );
+        let node = group.locality.node_of(owner_processor);
         Self {
             group,
             owner_processor,
-            local_queue_index,
-            processor_count,
+            node,
             progress,
             progress_notify: NoWeakArc::new(Notify::new()),
+            local_run: RunList::new(),
         }
     }
 
     pub fn spawner<CpuImpl: Cpu + Clone>(&self, cpu: CpuImpl) -> Spawner<CpuImpl> {
         Spawner {
-            group: self.group.clone(),
+            group: self.group,
             cpu,
             owner_processor: self.owner_processor,
-            local_queue_index: self.local_queue_index,
-            processor_count: self.processor_count,
             progress: self.progress.clone(),
             progress_notify: self.progress_notify.clone(),
         }
     }
 
-    /// This processor's kernel timer, built on the processor that runs
-    /// this executor and owned by it.
+    /// A handle on the kernel's timers, with this processor's timer
+    /// base brought online: built on first use, re-armed on a
+    /// processor coming back.
     ///
-    /// The timer reads the owner's idle state, the one this executor
-    /// publishes, to decide whether a deadline published from another
-    /// processor needs a wake to reach the owner's comparator.
+    /// Run on the processor that runs this executor, because a timer
+    /// base is armed on the processor it belongs to.
     pub fn timer<CpuImpl: Cpu + Clone>(&self, cpu: CpuImpl) -> Timer<CpuImpl> {
-        Timer::new(
-            cpu,
-            TimerOwner {
-                group: self.group.clone(),
-                processor: self.owner_processor,
-            },
-        )
+        let timer = self.timer_handle(cpu);
+        timer.bring_base_online();
+        timer
+    }
+
+    /// A handle on the kernel's timers that brings no base online:
+    /// what the kernel's bring-up holds before its timer step runs.
+    pub(crate) fn timer_handle<CpuImpl: Cpu + Clone>(&self, cpu: CpuImpl) -> Timer<CpuImpl> {
+        assert_eq!(
+            current_processor(),
+            self.owner_processor,
+            "an executor's timer is taken on the processor that runs the executor"
+        );
+        Timer::new(cpu, self.group)
+    }
+
+    /// The processor this executor runs on.
+    pub(crate) fn owner_processor(&self) -> ProcessorId {
+        self.owner_processor
+    }
+
+    /// The table every processor's executor shares.
+    pub(crate) fn group(&self) -> &'static ExecutorGroup {
+        self.group
     }
 
     /// Runs ready tasks until the queues are empty or a batch has run.
+    ///
+    /// Each task is taken from the first queue that has one: the local
+    /// queue when its count is non-zero, otherwise the owner's node
+    /// queue, then the other of those two; then every other node's
+    /// queue, nearest first ([`Locality::scheduling_order`]). Remote
+    /// work is stolen as soon as the local and own-node queues are
+    /// empty, one task at a time, so the next task is looked for close
+    /// to home again. The node queues count as global in the stats.
     ///
     /// `timer` is this processor's. Before the first task of a pass runs,
     /// its deadline is pulled to within one scheduler tick
@@ -862,33 +1004,29 @@ impl Executor {
         timer: &Timer<CpuImpl>,
     ) -> ExecutorRunStats {
         let mut stats = ExecutorRunStats::default();
-        let local_queue = &self.group.local_queues[self.local_queue_index];
-        let local_ready_count = &self.group.local_ready_counts[self.local_queue_index];
+        let local_ready = &self.group.queues(self.owner_processor).shared.ready;
+        let own_node = ReadySource::Node(self.node);
+        // The order starts with the owner's node itself.
+        let remote_nodes = &self.group.locality.scheduling_order(self.node)[1..];
 
         while stats.runnable_count() < READY_BATCH_TASKS {
-            let (first, second) = if local_ready_count.load(Ordering::Relaxed) != 0 {
-                (ReadySource::Local, ReadySource::Global)
+            // A scheduler boundary: between tasks, with nothing polled.
+            // One `Relaxed` load unless a freeze holds the machine.
+            self.group.freeze.checkpoint(timer.cpu());
+            let (first, second) = if local_ready.load(Ordering::Relaxed) != 0 {
+                (ReadySource::Local, own_node)
             } else {
-                (ReadySource::Global, ReadySource::Local)
+                (own_node, ReadySource::Local)
             };
-            let Some((runnable, source)) = pop_ready_source(
-                first,
-                local_queue,
-                local_ready_count,
-                &self.group.global_queue,
-                &self.group.global_ready_count,
-                &mut stats,
-            )
-            .or_else(|| {
-                pop_ready_source(
-                    second,
-                    local_queue,
-                    local_ready_count,
-                    &self.group.global_queue,
-                    &self.group.global_ready_count,
-                    &mut stats,
-                )
-            }) else {
+            let Some((runnable, source)) = self
+                .pop_ready_source(first, &mut stats)
+                .or_else(|| self.pop_ready_source(second, &mut stats))
+                .or_else(|| {
+                    remote_nodes.iter().find_map(|&node| {
+                        self.pop_ready_source(ReadySource::Node(node), &mut stats)
+                    })
+                })
+            else {
                 return stats;
             };
 
@@ -898,7 +1036,7 @@ impl Executor {
             runnable.run();
             match source {
                 ReadySource::Local => stats.local_runnable_count += 1,
-                ReadySource::Global => stats.global_runnable_count += 1,
+                ReadySource::Node(_) => stats.global_runnable_count += 1,
             }
         }
 
@@ -931,14 +1069,18 @@ impl Executor {
         root_ready: impl Fn() -> bool,
     ) -> IdleOutcome {
         let cpu = timer.cpu();
-        let idle = &self.group.idle[self.local_queue_index];
+        let idle = &self.group.queues(self.owner_processor).idle;
         let limit = idle.poll_limit_ticks();
         idle.store(IdleState::Polling);
         let started = cpu.now();
         if limit != 0 {
             loop {
                 let now = cpu.now();
-                if self.has_ready_work() || root_ready() || timer.is_due(now) {
+                if self.has_ready_work()
+                    || root_ready()
+                    || timer.is_due(now)
+                    || self.freeze_requested_of_this_processor()
+                {
                     idle.store(IdleState::Running);
                     return IdleOutcome::Polled {
                         polled_ticks: now.ticks() - started.ticks(),
@@ -957,7 +1099,11 @@ impl Executor {
         // module doc.
         idle.store(IdleState::Parked);
         let now = cpu.now();
-        if self.has_ready_work() || root_ready() || timer.is_due(now) {
+        if self.has_ready_work()
+            || root_ready()
+            || timer.is_due(now)
+            || self.freeze_requested_of_this_processor()
+        {
             idle.store(IdleState::Running);
             return IdleOutcome::Polled {
                 polled_ticks: now.ticks() - started.ticks(),
@@ -983,19 +1129,144 @@ impl Executor {
         }
     }
 
-    /// Whether any queue this processor drains has work waiting.
-    /// `SeqCst`: the parker half of the handshake in `idle`'s module
-    /// docs.
+    /// Whether any queue this processor drains has work waiting — its
+    /// local queue and every node's, since it steals from all of them —
+    /// or the processor has been asked to go offline. `SeqCst`: the
+    /// parker half of the handshake in `idle`'s module docs, and of the
+    /// lifecycle request's.
     fn has_ready_work(&self) -> bool {
-        self.group.local_ready_counts[self.local_queue_index].load(Ordering::SeqCst) != 0
-            || self.group.global_ready_count.load(Ordering::SeqCst) != 0
+        self.group
+            .queues(self.owner_processor)
+            .shared
+            .ready
+            .load(Ordering::SeqCst)
+            != 0
+            || self.group.any_node_ready()
+            || self
+                .group
+                .lifecycle
+                .departure_requested(self.owner_processor)
+    }
+
+    /// The executor's half of this processor going offline, run on it
+    /// by its lifecycle step at the top of its run loop, with no task
+    /// mid-poll.
+    ///
+    /// Local tasks are the work that cannot leave: their futures are
+    /// `!Send` and run only on their owner. The ready ones are run
+    /// first — a cancelled local task is dropped by its owner's
+    /// executor, so a step above this one that cancelled its own task
+    /// has it gone by the time the count is read — and the departure is
+    /// refused while any local task is still alive. Otherwise the
+    /// processor leaves the online set, after which no wake addresses
+    /// it, and global work already queued is handed to `successor`:
+    /// global tasks are on their home nodes' queues already, and every
+    /// processor steals from every node, so the handoff is making sure
+    /// an online processor is looking at them. The departing
+    /// processor's own node queue stays where it is and is served by
+    /// the node's other online processors, or stolen by the rest.
+    ///
+    /// Concurrency: the local queue is drained through its owner
+    /// contract only — `pop_local`'s take-all of the inbox into
+    /// `local_run` — while wakers on any processor keep pushing onto the
+    /// inbox. A push that lands after the pass is the wake of a task
+    /// whose future is alive, so it holds `local_live` raised and the
+    /// departure is refused; the processor stays online and runs it on
+    /// its next pass. With no local task alive no runnable for one can
+    /// exist, so the queue is empty when the processor leaves. The node
+    /// queues are untouched: `ExecutorGroup::wake_one_processor_for` and
+    /// the successor wake read the online set and the node counts in one
+    /// `SeqCst` order with this removal, so a global push either sees
+    /// the processor gone — and picks another candidate — or is covered
+    /// by the successor wake below.
+    pub(crate) fn take_offline<CpuImpl: Cpu>(
+        &self,
+        cpu: &CpuImpl,
+        successor: ProcessorId,
+    ) -> Result<(), PinnedTasks> {
+        let processor = self.owner_processor;
+        let queues = self.group.queues(processor);
+        // One pass over what is queued now: a task that requeues itself
+        // is alive, and the count below refuses on it.
+        for _ in 0..queues.shared.ready.load(Ordering::Acquire) {
+            match self.pop_local() {
+                Some(runnable) => {
+                    runnable.run();
+                }
+                None => break,
+            }
+        }
+        let live = queues.local_live.load(Ordering::Acquire);
+        if live != 0 {
+            return Err(PinnedTasks { processor, live });
+        }
+        assert!(
+            self.local_run.is_empty() && queues.shared.ready.load(Ordering::SeqCst) == 0,
+            "processor {} has local work queued with no local task alive",
+            processor.id()
+        );
+        self.group.online.remove(processor);
+        if self.group.any_node_ready() && self.group.needs_wake(successor) {
+            cpu.wake_processor(successor);
+        }
+        Ok(())
+    }
+
+    /// The oldest local task, if any. Owner only: refills `local_run`
+    /// from the inbox when it has run dry. The count stays raised until
+    /// the task is out of the queue, so a task in `local_run` still holds
+    /// off the park.
+    fn pop_local(&self) -> Option<ReadyRunnable> {
+        let local_ready = &self.group.queues(self.owner_processor).shared;
+        if self.local_run.is_empty() {
+            self.local_run.append_reversed(local_ready.inbox.take_all());
+        }
+        let runnable = self.local_run.pop_front()?;
+        local_ready.release_one();
+        Some(runnable)
+    }
+
+    /// The oldest task of `source`, if this processor can take one now.
+    /// A node queue whose consumer lock another processor holds counts
+    /// as empty here; its ready count stays raised, so the caller moves
+    /// on to the next queue and the park test still sees the work.
+    fn pop_ready_source(
+        &self,
+        source: ReadySource,
+        stats: &mut ExecutorRunStats,
+    ) -> Option<(ReadyRunnable, ReadySource)> {
+        let popped = match source {
+            ReadySource::Local => self.pop_local(),
+            ReadySource::Node(node) => match self.group.nodes[node.index()].queue.pop() {
+                GlobalPop::Ready(runnable) => Some(runnable),
+                GlobalPop::Empty | GlobalPop::Contended => None,
+            },
+        };
+        let Some(runnable) = popped else {
+            match source {
+                ReadySource::Local => stats.local_empty_pop_count += 1,
+                ReadySource::Node(_) => stats.global_empty_pop_count += 1,
+            }
+            return None;
+        };
+        Some((runnable, source))
+    }
+}
+
+impl Drop for Executor {
+    /// Hands the tasks still in `local_run` back to this processor's
+    /// inbox, so queued work survives the executor as it survives in the
+    /// group. The ready count already covers them, so it is not touched.
+    fn drop(&mut self) {
+        self.local_run
+            .drain_into(&self.group.queues(self.owner_processor).shared.inbox);
     }
 }
 
 #[derive(Clone, Copy)]
 enum ReadySource {
     Local,
-    Global,
+    Node(NodeId),
 }
 
 impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
@@ -1003,51 +1274,56 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
         self.progress.clone()
     }
 
+    /// The initiator's handle on the lifecycle of the machine this
+    /// spawner's executor group runs.
+    pub(crate) fn processor_control(&self) -> ProcessorControl<CpuImpl> {
+        ProcessorControl::new(self.cpu.clone(), self.group)
+    }
+
     pub(crate) fn progress_notify(&self) -> NoWeakArc<Notify> {
         self.progress_notify.clone()
     }
 
-    /// The task arena of the processor this spawn is running on.
+    /// The task arena of `processor`, the one this spawn is running on.
     ///
     /// A `Spawner` travels with the task that holds it, so the arena a
-    /// spawn draws on is chosen here rather than bound when the spawner
-    /// was made: the arena's metadata is owner-only, and the owner is
-    /// the processor doing the allocating.
-    fn task_arena(&self) -> &NoWeakArc<TaskArena> {
-        let processor = current_processor();
-        self.group
-            .task_arenas
-            .get(processor.id() as usize)
-            .unwrap_or_else(|| {
-                panic!(
-                    "processor {} has no task arena among the {} the executor configured",
-                    processor.id(),
-                    self.group.task_arenas.len()
-                )
-            })
+    /// spawn draws on is chosen at the spawn rather than bound when the
+    /// spawner was made: the arena's metadata is owner-only, and the
+    /// owner is the processor doing the allocating.
+    fn task_arena(&self, processor: ProcessorId) -> &NoWeakArc<TaskArena> {
+        &self.group.queues(processor).task_arena
     }
 
-    /// Places `future` in this processor's task arena under `funding`.
+    /// Places `future` in the task arena of `processor`, the one this
+    /// spawn is running on, under `funding`.
     fn allocate<Fut>(
         &self,
+        processor: ProcessorId,
         future: Fut,
         funding: TaskFunding,
     ) -> Result<ArenaFuture<Fut>, TaskCapacityError> {
-        let arena = self.task_arena();
+        let arena = self.task_arena(processor);
         match funding {
             TaskFunding::Kernel => Ok(TaskArena::allocate_kernel(arena, future)),
             TaskFunding::Instance => TaskArena::allocate_instance(arena, future),
         }
     }
 
-    fn spawn_with_progress<Fut>(&self, future: ArenaFuture<Fut>) -> JoinHandle<Fut::Output>
+    fn spawn_with_progress<Fut, Home>(
+        &self,
+        future: ArenaFuture<Fut>,
+        home: Home,
+    ) -> JoinHandle<Fut::Output>
     where
         Fut: Future + Send + 'static,
         Fut::Output: Send + 'static,
+        Home: TaskHome,
     {
-        let scheduler = self.global_scheduler();
+        let scheduler = self.global_scheduler(home);
         let schedule = move |runnable| scheduler.schedule(runnable);
-        let (runnable, task) = Builder::new().spawn(move |_| future, schedule);
+        let (runnable, task) = Builder::new()
+            .metadata(ReadyLink::new())
+            .spawn(move |_| future, schedule);
         runnable.schedule();
         task
     }
@@ -1068,8 +1344,11 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
             // SAFETY: the runnable is always re-enqueued onto the spawning processor's ready
             // queue, and `LocalJoinHandle` is `!Send`, so the task cannot be awaited or
             // dropped from a different processor through safe Rust.
-            let (runnable, task) =
-                unsafe { Builder::new().spawn_unchecked(move |_| future, schedule) };
+            let (runnable, task) = unsafe {
+                Builder::new()
+                    .metadata(ReadyLink::new())
+                    .spawn_unchecked(move |_| future, schedule)
+            };
             runnable.schedule();
             return LocalJoinHandle {
                 task,
@@ -1083,7 +1362,11 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
         // SAFETY: the runnable is always re-enqueued onto the spawning processor's ready
         // queue, and `LocalJoinHandle` is `!Send`, so the task cannot be awaited or
         // dropped from a different processor through safe Rust.
-        let (runnable, task) = unsafe { Builder::new().spawn_unchecked(move |_| future, schedule) };
+        let (runnable, task) = unsafe {
+            Builder::new()
+                .metadata(ReadyLink::new())
+                .spawn_unchecked(move |_| future, schedule)
+        };
         runnable.schedule();
         LocalJoinHandle {
             task,
@@ -1098,51 +1381,58 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
         }
     }
 
-    fn global_scheduler(&self) -> GlobalScheduler<CpuImpl> {
+    fn global_scheduler<Home: TaskHome>(&self, home: Home) -> GlobalScheduler<CpuImpl, Home> {
         GlobalScheduler {
-            group: self.group.clone(),
+            group: self.group,
             cpu: self.cpu.clone(),
-            processor_count: self.processor_count,
             progress: self.progress_signal(),
+            home,
         }
     }
 
     fn local_scheduler(&self) -> LocalScheduler<CpuImpl> {
         LocalScheduler {
-            group: self.group.clone(),
+            group: self.group,
             cpu: self.cpu.clone(),
             owner_processor: self.owner_processor,
-            local_queue_index: self.local_queue_index,
             progress: self.progress_signal(),
         }
     }
 
     fn local_silent_scheduler(&self) -> LocalSilentScheduler<CpuImpl> {
         LocalSilentScheduler {
-            group: self.group.clone(),
+            group: self.group,
             cpu: self.cpu.clone(),
             owner_processor: self.owner_processor,
-            local_queue_index: self.local_queue_index,
         }
     }
 
-    /// A view of this spawner that funds every task it places from the
-    /// arena's instance share and hands back a typed refusal instead of
-    /// panicking when that share is full.
-    pub fn instance_spawner(&self, funding: TaskFunding) -> InstanceSpawner<CpuImpl> {
+    /// A view of this spawner that places `instance`'s tasks: funded
+    /// under `funding`, handing back a typed refusal instead of
+    /// panicking when the instance share is full, and queued on the
+    /// instance's home node.
+    pub fn instance_spawner(
+        &self,
+        funding: TaskFunding,
+        instance: &RegisteredInstance,
+    ) -> InstanceSpawner<CpuImpl> {
         InstanceSpawner {
             inner: self.clone(),
             funding,
+            home: instance.home(),
         }
     }
 
+    /// Spawns a kernel task whose home is the node of the processor
+    /// spawning it ([`FixedHome`]).
     pub fn spawn<Fut>(&self, future: Fut) -> JoinHandle<Fut::Output>
     where
         Fut: Future + Send + 'static,
         Fut::Output: Send + 'static,
     {
-        let future = TaskArena::allocate_kernel(self.task_arena(), future);
-        self.spawn_with_progress(future)
+        let processor = current_processor();
+        let future = TaskArena::allocate_kernel(self.task_arena(processor), future);
+        self.spawn_with_progress(future, FixedHome(self.group.locality.node_of(processor)))
     }
 
     pub fn spawn_detached<Fut>(&self, future: Fut)
@@ -1158,7 +1448,10 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
         Fut: Future + 'static,
         Fut::Output: 'static,
     {
-        let future = TaskArena::allocate_kernel(self.task_arena(), future);
+        let future = TaskArena::allocate_kernel(
+            self.task_arena(current_processor()),
+            self.local_task(future),
+        );
         self.spawn_local_with_progress(future, ProgressMode::Counted)
     }
 
@@ -1170,14 +1463,23 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
         self.spawn_local(future).detach();
     }
 
-    pub(crate) fn spawn_local_detached_silent<Fut>(&self, future: Fut)
+    /// A local task whose runs record no progress, so it cannot keep the
+    /// watchdog fed by itself.
+    pub(crate) fn spawn_local_silent<Fut>(&self, future: Fut) -> LocalJoinHandle<Fut::Output>
     where
         Fut: Future + 'static,
         Fut::Output: 'static,
     {
-        let future = TaskArena::allocate_kernel(self.task_arena(), future);
+        let future = TaskArena::allocate_kernel(
+            self.task_arena(current_processor()),
+            self.local_task(future),
+        );
         self.spawn_local_with_progress(future, ProgressMode::Silent)
-            .detach();
+    }
+
+    /// `future`, counted live on the processor whose queue it runs from.
+    fn local_task<Fut>(&self, future: Fut) -> LocalTask<Fut> {
+        LocalTask::new(future, &self.group.queues(self.owner_processor).local_live)
     }
 }
 
@@ -1188,10 +1490,16 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
 /// refused instead of walking the arena empty under the kernel. The
 /// type is the contract: an instance context cannot reach an
 /// infallible spawn, because it never holds a [`Spawner`].
+///
+/// Its global tasks are queued on the instance's home node, which every
+/// spawner of the instance shares with the instance's registry entry
+/// (`InstanceHome`). Its local tasks stay on the processor that
+/// spawned them, as every local task does.
 #[derive(Clone)]
 pub struct InstanceSpawner<CpuImpl: Cpu + Clone> {
     inner: Spawner<CpuImpl>,
     funding: TaskFunding,
+    home: NoWeakArc<InstanceHome>,
 }
 
 impl<CpuImpl: Cpu + Clone> InstanceSpawner<CpuImpl> {
@@ -1215,13 +1523,20 @@ impl<CpuImpl: Cpu + Clone> InstanceSpawner<CpuImpl> {
         &self.inner
     }
 
+    /// The initiator's handle on the machine's processor lifecycle.
+    pub(crate) fn processor_control(&self) -> ProcessorControl<CpuImpl> {
+        self.inner.processor_control()
+    }
+
     pub fn try_spawn<Fut>(&self, future: Fut) -> Result<JoinHandle<Fut::Output>, TaskCapacityError>
     where
         Fut: Future + Send + 'static,
         Fut::Output: Send + 'static,
     {
-        let future = self.inner.allocate(future, self.funding)?;
-        Ok(self.inner.spawn_with_progress(future))
+        let future = self
+            .inner
+            .allocate(current_processor(), future, self.funding)?;
+        Ok(self.inner.spawn_with_progress(future, self.home.clone()))
     }
 
     pub fn try_spawn_detached<Fut>(&self, future: Fut) -> Result<(), TaskCapacityError>
@@ -1241,7 +1556,11 @@ impl<CpuImpl: Cpu + Clone> InstanceSpawner<CpuImpl> {
         Fut: Future + 'static,
         Fut::Output: 'static,
     {
-        let future = self.inner.allocate(future, self.funding)?;
+        let future = self.inner.allocate(
+            current_processor(),
+            self.inner.local_task(future),
+            self.funding,
+        )?;
         Ok(self
             .inner
             .spawn_local_with_progress(future, ProgressMode::Counted))
@@ -1265,61 +1584,31 @@ impl ProgressSignal {
     }
 }
 
-impl<CpuImpl: Cpu + Clone> GlobalScheduler<CpuImpl> {
+impl<CpuImpl: Cpu + Clone, Home: TaskHome> GlobalScheduler<CpuImpl, Home> {
+    /// Queues the task on its home node, whichever processor woke it.
     #[inline]
-    fn schedule(&self, runnable: Runnable) {
-        let previous_ready = push_ready(
-            &self.group.global_queue,
-            &self.group.global_ready_count,
-            runnable,
-        );
+    fn schedule(&self, runnable: ReadyRunnable) {
+        let node = self.home.node(self.group.locality);
+        let previous_ready = push_ready(&self.group.nodes[node.index()].queue.shared, runnable);
         self.progress.record();
-        if should_wake_global_processor(previous_ready, self.processor_count) {
-            self.wake_one_remote_processor();
-        }
-    }
-
-    #[inline]
-    fn wake_one_remote_processor(&self) {
-        if self.processor_count <= 1 {
-            return;
-        }
-        let current_processor = current_processor();
-        let start = self
-            .group
-            .global_wake_cursor
-            .fetch_add(1, Ordering::Relaxed);
-        // The cursor names one processor per push, so consecutive
-        // pushes fan out across the machine; the chosen processor's
-        // published state then decides whether the wake needs an IPI.
-        // A polling processor re-reads `global_ready_count` on every
-        // pass; a running one drains the global queue in its own
-        // `run_until_stalled`, and re-tests the count after publishing
-        // `Parked` on its way out; only an already-parked processor
-        // has stopped looking.
-        for offset in 0..self.processor_count {
-            let processor = (start + offset) % self.processor_count;
-            if processor == usize::from(current_processor.id()) {
-                continue;
-            }
-            if self.group.idle[processor].state() == IdleState::Parked {
-                self.cpu.wake_processor(ProcessorId::new(processor as u16));
-            }
-            return;
+        // Every online processor steals from every node, so the threshold
+        // is the online set's: fewer queued tasks than other online
+        // processors means some processor has not been asked for this
+        // one. With one processor online it is never met.
+        if should_wake_global_processor(previous_ready, self.group.online.count()) {
+            self.group.wake_one_processor_for(&self.cpu, node);
         }
     }
 }
 
 impl<CpuImpl: Cpu + Clone> LocalScheduler<CpuImpl> {
     #[inline]
-    fn schedule(&self, runnable: Runnable) {
-        let queue = &self.group.local_queues[self.local_queue_index];
-        let ready_count = &self.group.local_ready_counts[self.local_queue_index];
-        let previous_ready = push_ready(queue, ready_count, runnable);
+    fn schedule(&self, runnable: ReadyRunnable) {
+        let previous_ready = push_ready(&self.group.queues(self.owner_processor).shared, runnable);
         self.progress.record();
         if should_wake_owner_processor(previous_ready)
             && current_processor() != self.owner_processor
-            && self.group.needs_wake(self.local_queue_index)
+            && self.group.needs_wake(self.owner_processor)
         {
             self.cpu.wake_processor(self.owner_processor);
         }
@@ -1328,13 +1617,11 @@ impl<CpuImpl: Cpu + Clone> LocalScheduler<CpuImpl> {
 
 impl<CpuImpl: Cpu + Clone> LocalSilentScheduler<CpuImpl> {
     #[inline]
-    fn schedule(&self, runnable: Runnable) {
-        let queue = &self.group.local_queues[self.local_queue_index];
-        let ready_count = &self.group.local_ready_counts[self.local_queue_index];
-        let previous_ready = push_ready(queue, ready_count, runnable);
+    fn schedule(&self, runnable: ReadyRunnable) {
+        let previous_ready = push_ready(&self.group.queues(self.owner_processor).shared, runnable);
         if should_wake_owner_processor(previous_ready)
             && current_processor() != self.owner_processor
-            && self.group.needs_wake(self.local_queue_index)
+            && self.group.needs_wake(self.owner_processor)
         {
             self.cpu.wake_processor(self.owner_processor);
         }
@@ -1356,113 +1643,209 @@ pub(crate) fn executor_test_guard() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn executor_group(configured_processors: usize) -> NoWeakArc<ExecutorGroup> {
-    EXECUTOR_GROUP
-        .call_once(|| {
-            assert!(
-                configured_processors != 0,
-                "executor processor count must be non-zero"
-            );
-            // Every processor's arena is the same share of the same
-            // machine; what it holds is the machine's memory divided by
-            // what a live instance costs an arena, not a constant.
-            let arena_bytes = task_arena_bytes(crate::machine_usable_bytes());
-            let mut local_queues = Vec::with_capacity(configured_processors);
-            let mut local_ready_counts = Vec::with_capacity(configured_processors);
-            let mut idle = Vec::with_capacity(configured_processors);
-            let mut task_arenas = Vec::with_capacity(configured_processors);
-            for _ in 0..configured_processors {
-                local_queues.push(ready_queue());
-                local_ready_counts.push(CachePadded::new(AtomicUsize::new(0)));
-                idle.push(CachePadded::new(ProcessorIdle::new()));
-                task_arenas.push(TaskArena::new_shared(arena_bytes));
-            }
-            NoWeakArc::new(ExecutorGroup {
-                local_queues: local_queues.into_boxed_slice(),
-                local_ready_counts: local_ready_counts.into_boxed_slice(),
-                idle: idle.into_boxed_slice(),
-                task_arenas: task_arenas.into_boxed_slice(),
-                global_queue: ready_queue(),
-                global_ready_count: CachePadded::new(AtomicUsize::new(0)),
-                global_wake_cursor: CachePadded::new(AtomicUsize::new(0)),
-            })
-        })
-        .clone()
+fn executor_group(pool: &'static UserMemoryPool) -> &'static ExecutorGroup {
+    EXECUTOR_GROUP.call_once(|| ExecutorGroup::new(pool))
+}
+
+/// The machine's executor group, once the first processor has built
+/// its executor.
+pub(crate) fn machine_executor_group() -> Option<&'static ExecutorGroup> {
+    EXECUTOR_GROUP.get()
 }
 
 impl ExecutorGroup {
+    /// One local queue, idle state, task arena, lifecycle cell and timer
+    /// base per possible processor, each in memory of its processor's
+    /// node, and one queue per node, for the machine `pool` describes.
+    fn new(pool: &'static UserMemoryPool) -> Self {
+        let locality = pool.locality();
+        let possible_processors = locality.processor_count();
+        assert!(
+            possible_processors != 0,
+            "executor processor count must be non-zero"
+        );
+        // Every processor's arena is the same share of the same
+        // machine; what it holds is the machine's memory divided by
+        // what a live instance costs an arena, not a constant.
+        let arena_bytes = task_arena_bytes(crate::machine_usable_bytes());
+        let processors = PerProcessor::new(pool, |_, local| ProcessorQueues {
+            shared: CachePadded::new(ReadyShared::new()),
+            idle: CachePadded::new(ProcessorIdle::new()),
+            task_arena: TaskArena::new_shared(arena_bytes, local),
+            local_live: AtomicUsize::new(0),
+        });
+        let nodes = (0..locality.node_count())
+            .map(|_| NodeQueue {
+                queue: GlobalReadyQueue::new(),
+                wake_cursor: CachePadded::new(AtomicUsize::new(0)),
+            })
+            .collect();
+        Self {
+            processors,
+            nodes,
+            locality,
+            freeze: FreezeBarrier::new(possible_processors),
+            online: CachePadded::new(OnlineSet::new(possible_processors)),
+            lifecycle: ProcessorLifecycles::new(pool),
+            timer_bases: TimerBases::new(pool),
+        }
+    }
+
+    /// `processor`'s local queue, idle state, task arena and live local
+    /// task count.
+    fn queues(&self, processor: ProcessorId) -> &ProcessorQueues {
+        self.processors.get(processor)
+    }
+
+    /// Whether any node's queue has work waiting. `SeqCst`, for the idle
+    /// handshake and the offline handoff.
+    fn any_node_ready(&self) -> bool {
+        self.nodes
+            .iter()
+            .any(|node| node.queue.shared.ready.load(Ordering::SeqCst) != 0)
+    }
+
     /// Whether `processor` must be sent a wake IPI for work just
     /// pushed. Called after the push. Returns true only when the
     /// target has published `Parked`; a `Polling` or `Running`
     /// processor sees the ready count itself.
-    fn needs_wake(&self, processor_index: usize) -> bool {
-        self.idle[processor_index].state() == IdleState::Parked
+    pub(crate) fn needs_wake(&self, processor: ProcessorId) -> bool {
+        self.queues(processor).idle.state() == IdleState::Parked
     }
-}
 
-fn ready_queue() -> ReadyQueue {
-    ConcurrentQueue::bounded(READY_QUEUE_CAPACITY)
-}
-
-#[inline]
-fn push_ready(queue: &ReadyQueue, ready_count: &AtomicUsize, runnable: Runnable) -> usize {
-    // The queue itself publishes the `Runnable`; the counter is also
-    // the sender half of the idle handshake — a parking processor
-    // stores `Parked` then loads it, this increment precedes the load
-    // of the parker's idle state, and both are `SeqCst`, so no wake is
-    // lost. On x86 `lock xadd` is already a full barrier, so this
-    // costs nothing there.
-    let previous_ready = ready_count.fetch_add(1, Ordering::SeqCst);
-    match queue.push(runnable) {
-        Ok(()) => previous_ready,
-        Err(PushError::Full(_)) => {
-            rollback_ready_count(ready_count);
-            panic!("executor ready queue capacity {READY_QUEUE_CAPACITY} exhausted")
-        }
-        Err(PushError::Closed(_)) => {
-            rollback_ready_count(ready_count);
-            panic!("executor ready queue was closed unexpectedly")
-        }
+    pub(crate) fn possible_processors(&self) -> usize {
+        self.processors.len()
     }
-}
 
-fn pop_ready(queue: &ReadyQueue, ready_count: &AtomicUsize) -> Result<Runnable, PopError> {
-    let runnable = queue.pop()?;
-    let previous = ready_count.fetch_sub(1, Ordering::Relaxed);
-    assert!(previous != 0, "executor ready count underflowed");
-    Ok(runnable)
-}
+    /// Publishes `Parked` for `processor`, as its idle loop does on its
+    /// way into `park_current`.
+    #[cfg(test)]
+    pub(crate) fn publish_parked(&self, processor: ProcessorId) {
+        self.queues(processor).idle.store(IdleState::Parked);
+    }
 
-fn pop_ready_source(
-    source: ReadySource,
-    local_queue: &ReadyQueue,
-    local_ready_count: &AtomicUsize,
-    global_queue: &ReadyQueue,
-    global_ready_count: &AtomicUsize,
-    stats: &mut ExecutorRunStats,
-) -> Option<(Runnable, ReadySource)> {
-    let (queue, ready_count) = match source {
-        ReadySource::Local => (local_queue, local_ready_count),
-        ReadySource::Global => (global_queue, global_ready_count),
-    };
-    match pop_ready(queue, ready_count) {
-        Ok(runnable) => Some((runnable, source)),
-        Err(PopError::Empty | PopError::Closed) => {
-            match source {
-                ReadySource::Local => stats.local_empty_pop_count += 1,
-                ReadySource::Global => stats.global_empty_pop_count += 1,
+    pub(crate) fn online(&self) -> &OnlineSet {
+        &self.online
+    }
+
+    pub(crate) fn lifecycle(&self) -> &ProcessorLifecycles {
+        &self.lifecycle
+    }
+
+    pub(crate) fn timer_bases(&self) -> &TimerBases {
+        &self.timer_bases
+    }
+
+    /// Wakes one online processor other than the caller for a task just
+    /// pushed to `node`, when that processor has parked.
+    ///
+    /// The candidates are `node`'s own online processors, then each other
+    /// node's in `node`'s [`Locality::scheduling_order`]; a node whose
+    /// only online processor is the pusher, or that has none online, has
+    /// no candidate, and the walk moves to the next node, whose
+    /// processors steal from `node`. Within a node, the node's cursor
+    /// names one processor per push, so consecutive pushes fan out across
+    /// its processors. The first candidate decides: its published state
+    /// says whether the wake needs an IPI. A polling processor re-reads
+    /// every node's ready count on every pass; a running one drains the
+    /// node queues in its own `run_until_stalled`, and re-tests the
+    /// counts after publishing `Parked` on its way out; only an
+    /// already-parked processor has stopped looking. A processor outside
+    /// the online set is never a candidate: it drains nothing, and a
+    /// stopped one must not be sent a wake. The online test is `SeqCst`,
+    /// after the push's `SeqCst` increment, which is the pusher half of
+    /// the offline handoff (`Executor::take_offline`).
+    #[inline]
+    fn wake_one_processor_for<CpuImpl: Cpu>(&self, cpu: &CpuImpl, node: NodeId) {
+        let current = current_processor();
+        for &candidate_node in self.locality.scheduling_order(node) {
+            let processors = self.locality.processors_of(candidate_node);
+            if processors.is_empty() {
+                continue;
             }
-            None
+            let start = self.nodes[candidate_node.index()]
+                .wake_cursor
+                .fetch_add(1, Ordering::Relaxed);
+            let candidate = (0..processors.len())
+                .map(|offset| processors[(start + offset) % processors.len()])
+                .find(|&processor| processor != current && self.online.contains(processor));
+            if let Some(processor) = candidate {
+                if self.needs_wake(processor) {
+                    cpu.wake_processor(processor);
+                }
+                return;
+            }
         }
+    }
+
+    /// The executor's half of a processor coming online, run on that
+    /// processor: it publishes `Running` and joins the online set, after
+    /// which wakes reach it. The node it drains first is the one the
+    /// NUMA description put it on (`Executor::node`), and its node's
+    /// queue — served by the node's other processors and by stealing
+    /// while it was away — is its own again from its next pass.
+    pub(crate) fn bring_processor_online(&self, processor: ProcessorId) {
+        self.queues(processor).idle.store(IdleState::Running);
+        self.online.insert(processor);
     }
 }
 
-fn rollback_ready_count(ready_count: &AtomicUsize) {
-    let previous = ready_count.fetch_sub(1, Ordering::Relaxed);
-    assert!(
-        previous != 0,
-        "executor ready count underflowed while rolling back failed enqueue"
-    );
+/// Local tasks still alive on a processor asked to go offline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("processor {} still runs {live} local tasks pinned to it", processor.id())]
+pub struct PinnedTasks {
+    pub processor: ProcessorId,
+    pub live: usize,
+}
+
+/// A local task's future, counted live on its owner for as long as it
+/// exists.
+///
+/// The count is what an offline step reads to learn whether work is
+/// pinned to the departing processor. A local future is created,
+/// polled and dropped on its owner — a cancel schedules it back there
+/// to be dropped — so the counter has one writer.
+struct LocalTask<Fut> {
+    future: Fut,
+    live: &'static AtomicUsize,
+}
+
+impl<Fut> LocalTask<Fut> {
+    fn new(future: Fut, live: &'static AtomicUsize) -> Self {
+        live.fetch_add(1, Ordering::Release);
+        Self { future, live }
+    }
+}
+
+impl<Fut: Future> Future for LocalTask<Fut> {
+    type Output = Fut::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // SAFETY: `future` is structurally pinned: it is never moved
+        // out of `self`, and `LocalTask` has no `Unpin` impl of its own.
+        unsafe { self.map_unchecked_mut(|task| &mut task.future) }.poll(cx)
+    }
+}
+
+impl<Fut> Drop for LocalTask<Fut> {
+    fn drop(&mut self) {
+        let previous = self.live.fetch_sub(1, Ordering::Release);
+        assert!(previous != 0, "local task live count underflowed");
+    }
+}
+
+/// Queues `runnable` and returns how many were queued before it. It
+/// cannot fail: the link it lives on is part of the task.
+#[inline]
+fn push_ready(shared: &ReadyShared, runnable: ReadyRunnable) -> usize {
+    // The counter is the sender half of the idle handshake — a parking
+    // processor stores `Parked` then loads it, this increment precedes
+    // the load of the parker's idle state, and both are `SeqCst`, so no
+    // wake is lost. On x86 `lock xadd` is already a full barrier, so
+    // this costs nothing there.
+    let previous_ready = shared.ready.fetch_add(1, Ordering::SeqCst);
+    shared.inbox.push(runnable);
+    previous_ready
 }
 
 const fn should_wake_global_processor(previous_ready: usize, processor_count: usize) -> bool {
@@ -1503,13 +1886,17 @@ mod tests {
     use alloc::vec::Vec;
 
     use super::{
-        Executor, GlobalScheduler, IDLE_POLL_GROW_START, IDLE_POLL_MAX, IdleOutcome, IdleState,
-        LocalScheduler, LocalSilentScheduler, READY_QUEUE_CAPACITY, Spawner,
+        Executor, FixedHome, GlobalScheduler, IDLE_POLL_GROW_START, IDLE_POLL_MAX, IdleOutcome,
+        IdleState, LocalScheduler, LocalSilentScheduler, NoWeakArc, Spawner,
         TASK_ARENA_CLASS_COUNT, TASK_ARENA_KERNEL_RESERVE_BYTES, TASK_ARENA_TOP_BYTES, TaskArena,
-        pop_ready, ready_queue, should_wake_global_processor, should_wake_owner_processor,
-        task_arena_bytes,
+        should_wake_global_processor, should_wake_owner_processor, task_arena_bytes,
     };
-    use crate::test_support::RecordingSmpCpu;
+    use crate::instance::{InstanceActivity, InstanceHome, InstanceRegistry};
+    use crate::memory::{PerProcessor, UserMemoryPool};
+    use crate::test_support::{
+        RecordingSmpCpu, TEST_POOL_NODE_BYTES, TestMachine, single_node_pool,
+    };
+    use crate::{TaskFunding, test_processor_identity};
     use helios_hal::cpu::{
         Cpu, HardwarePerfCounters, Instant, ProcessorId, Timebase, TimerInterrupt,
     };
@@ -1541,9 +1928,27 @@ mod tests {
 
         fn park_current(&self) {}
 
+        type WakeOnlyMask = ();
+
+        fn mask_to_wake_only(&self) {
+            panic!("this test platform never freezes")
+        }
+
+        fn park_wake_only(&self, _word: &core::sync::atomic::AtomicU8, _held: u8) {
+            panic!("this test platform never freezes")
+        }
+
         fn start_processor(&self, _processor: ProcessorId) {}
 
         fn wake_processor(&self, _processor: ProcessorId) {}
+
+        fn stop_current(&self) {
+            panic!("test CPU never stops a processor")
+        }
+
+        fn restart_processor(&self, _processor: ProcessorId) {
+            panic!("test CPU never restarts a processor")
+        }
 
         fn now(&self) -> Instant {
             Instant::new(0)
@@ -1632,9 +2037,27 @@ mod tests {
                 .fetch_add(self.park_advance.load(Ordering::Relaxed), Ordering::Relaxed);
         }
 
+        type WakeOnlyMask = ();
+
+        fn mask_to_wake_only(&self) {
+            panic!("this test platform never freezes")
+        }
+
+        fn park_wake_only(&self, _word: &core::sync::atomic::AtomicU8, _held: u8) {
+            panic!("this test platform never freezes")
+        }
+
         fn start_processor(&self, _processor: ProcessorId) {}
 
         fn wake_processor(&self, _processor: ProcessorId) {}
+
+        fn stop_current(&self) {
+            panic!("test CPU never stops a processor")
+        }
+
+        fn restart_processor(&self, _processor: ProcessorId) {
+            panic!("test CPU never restarts a processor")
+        }
 
         fn now(&self) -> Instant {
             Instant::new(self.nanos.fetch_add(self.step, Ordering::Relaxed))
@@ -1682,24 +2105,25 @@ mod tests {
     }
 
     #[test]
-    fn ready_queue_is_bounded_to_kernel_capacity() {
-        let queue = ready_queue();
-
-        assert_eq!(queue.capacity(), Some(READY_QUEUE_CAPACITY));
-    }
-
-    #[test]
-    fn scheduler_captures_are_narrower_than_spawner() {
-        assert!(size_of::<GlobalScheduler<TestCpu>>() < size_of::<Spawner<TestCpu>>());
+    fn scheduler_captures_are_no_wider_than_spawner() {
+        assert!(size_of::<GlobalScheduler<TestCpu, FixedHome>>() <= size_of::<Spawner<TestCpu>>());
+        assert!(
+            size_of::<GlobalScheduler<TestCpu, NoWeakArc<InstanceHome>>>()
+                <= size_of::<Spawner<TestCpu>>()
+        );
         assert!(size_of::<LocalScheduler<TestCpu>>() <= size_of::<Spawner<TestCpu>>());
-        assert!(size_of::<LocalSilentScheduler<TestCpu>>() < size_of::<Spawner<TestCpu>>());
+        assert!(size_of::<LocalSilentScheduler<TestCpu>>() <= size_of::<Spawner<TestCpu>>());
         assert!(size_of::<LocalSilentScheduler<TestCpu>>() < size_of::<LocalScheduler<TestCpu>>());
     }
 
     #[test]
     fn global_batch_does_not_probe_empty_local_queue_per_task() {
         let _serialized = super::executor_test_guard();
-        let executor = Executor::new(ProgressCounter::new(), 1, ProcessorId::new(0));
+        let executor = Executor::new(
+            ProgressCounter::new(),
+            single_node_pool(1),
+            ProcessorId::new(0),
+        );
         let timer = executor.timer(TestCpu::new());
         let spawner = executor.spawner(TestCpu::new());
         for _ in 0..8 {
@@ -1720,9 +2144,18 @@ mod tests {
     const TEST_ARENA_BYTES: usize = crate::memory::TASK_ARENA_MIN_BYTES;
     const TEST_SHARE_BYTES: usize = TEST_ARENA_BYTES - TASK_ARENA_KERNEL_RESERVE_BYTES;
 
+    /// A task arena of `bytes` carved from a test pool's memory, as the
+    /// executor carves its own.
+    fn test_arena(bytes: usize) -> NoWeakArc<TaskArena> {
+        let table = PerProcessor::new(single_node_pool(1), |_, local| {
+            TaskArena::new_shared(bytes, local)
+        });
+        table.get(ProcessorId::new(0)).clone()
+    }
+
     #[test]
     fn task_arena_reuses_blocks_released_around_pinned_tasks() {
-        let arena = TaskArena::new_shared(TEST_ARENA_BYTES);
+        let arena = test_arena(TEST_ARENA_BYTES);
         // An eternal task pins the arena non-empty for the whole test,
         // matching the boot-time pump/transport tasks in a real kernel.
         let pinned = TaskArena::allocate_kernel(&arena, [0_u8; 256]);
@@ -1747,7 +2180,7 @@ mod tests {
     /// with ~96% of the share free.
     #[test]
     fn freed_bytes_of_one_class_serve_a_different_class() {
-        let arena = TaskArena::new_shared(TEST_ARENA_BYTES);
+        let arena = test_arena(TEST_ARENA_BYTES);
         let large_bytes = TaskArena::class_bytes(TaskArena::block_class(size_of::<[u8; 8192]>()));
         let small_bytes = TaskArena::class_bytes(TaskArena::block_class(size_of::<[u8; 256]>()));
 
@@ -1784,7 +2217,7 @@ mod tests {
     /// so the bytes come back with no lock between the two processors.
     #[test]
     fn a_block_freed_off_the_owning_processor_comes_back_at_the_next_allocation() {
-        let arena = TaskArena::new_shared(TEST_ARENA_BYTES);
+        let arena = test_arena(TEST_ARENA_BYTES);
         let mut live = Vec::new();
         while let Ok(task) = TaskArena::allocate_instance(&arena, [0_u8; 4096]) {
             live.push(task);
@@ -1812,7 +2245,7 @@ mod tests {
     /// and the kernel's own tasks still have somewhere to go.
     #[test]
     fn instance_task_storm_is_refused_and_leaves_the_kernel_reserve_intact() {
-        let arena = TaskArena::new_shared(TEST_ARENA_BYTES);
+        let arena = test_arena(TEST_ARENA_BYTES);
         let block = TaskArena::class_bytes(TaskArena::block_class(size_of::<[u8; 4096]>()));
 
         let mut live = Vec::new();
@@ -1845,7 +2278,7 @@ mod tests {
     /// and no merge carries share bytes into it.
     #[test]
     fn the_reserve_is_never_consumed_by_instance_allocations() {
-        let arena = TaskArena::new_shared(TEST_ARENA_BYTES);
+        let arena = test_arena(TEST_ARENA_BYTES);
         let mut small = Vec::new();
         let mut large = Vec::new();
         // Interleave two classes, then drop every other small task, so
@@ -1885,7 +2318,7 @@ mod tests {
 
     #[test]
     fn instance_tasks_reclaim_the_share_when_their_instances_exit() {
-        let arena = TaskArena::new_shared(TEST_ARENA_BYTES);
+        let arena = test_arena(TEST_ARENA_BYTES);
         let mut live = Vec::new();
         while let Ok(task) = TaskArena::allocate_instance(&arena, [0_u8; 4096]) {
             live.push(task);
@@ -1906,7 +2339,7 @@ mod tests {
     /// task once one of them ends (#132).
     #[test]
     fn a_refused_instance_task_charges_nothing_to_the_share() {
-        let arena = TaskArena::new_shared(TEST_ARENA_BYTES);
+        let arena = test_arena(TEST_ARENA_BYTES);
         let mut live = Vec::new();
         while let Ok(task) = TaskArena::allocate_instance(&arena, [0_u8; 4096]) {
             live.push(task);
@@ -1935,7 +2368,7 @@ mod tests {
     /// the reserve's own buddy tree.
     #[test]
     fn released_kernel_reserve_blocks_never_reach_instance_tasks() {
-        let arena = TaskArena::new_shared(TEST_ARENA_BYTES);
+        let arena = test_arena(TEST_ARENA_BYTES);
         let mut live = Vec::new();
         while let Ok(task) = TaskArena::allocate_instance(&arena, [0_u8; 4096]) {
             live.push(task);
@@ -1954,8 +2387,8 @@ mod tests {
         /// What a QEMU `-m 2G` x86-64 guest's memory map came to (run
         /// 33943692491), and the same machine with four times it.
         const TWO_GIB_USABLE: usize = 1_977_962_496;
-        let small = TaskArena::new_shared(task_arena_bytes(TWO_GIB_USABLE));
-        let large = TaskArena::new_shared(task_arena_bytes(4 * TWO_GIB_USABLE));
+        let small = test_arena(task_arena_bytes(TWO_GIB_USABLE));
+        let large = test_arena(task_arena_bytes(4 * TWO_GIB_USABLE));
 
         let place_until_refused = |arena: &_| {
             let mut live = Vec::new();
@@ -1999,16 +2432,18 @@ mod tests {
         // This test thread is processor 0; the executor and its local
         // queue belong to processor 1.
         let cpu = RecordingSmpCpu::new(0, 2);
-        let executor = Executor::new(ProgressCounter::new(), 2, ProcessorId::new(1));
+        let executor = Executor::new(
+            ProgressCounter::new(),
+            single_node_pool(2),
+            ProcessorId::new(1),
+        );
         let spawner = executor.spawner(cpu.clone());
-        let idle = &executor.group.idle[1];
+        let idle = &executor.group.queues(ProcessorId::new(1)).idle;
         let drain = || {
-            pop_ready(
-                &executor.group.local_queues[1],
-                &executor.group.local_ready_counts[1],
-            )
-            .expect("the runnable pushed for processor 1 is still queued")
-            .run();
+            executor
+                .pop_local()
+                .expect("the runnable pushed for processor 1 is still queued")
+                .run();
         };
 
         // Parked: the push needs the IPI.
@@ -2029,31 +2464,48 @@ mod tests {
         assert_eq!(cpu.woken(), [ProcessorId::new(1)]);
     }
 
-    /// A sleep registered on processor 0's timer from processor 1
-    /// programs no comparator on processor 1 — `set_deadline` reaches
-    /// the executing processor, not the timer's owner — and reaches
-    /// processor 0 through the idle handshake: a wake when it is parked,
-    /// and its own arm before it parks when it was running.
+    /// Sleeps a departing processor hands to another processor's timer
+    /// base program no comparator on the departing processor —
+    /// `set_deadline` reaches the executing processor, not the base's
+    /// owner — and reach the owner through the idle handshake: a wake
+    /// when it is parked, and its own arm before it parks when it was
+    /// running.
     #[test]
     fn a_foreign_sleep_wakes_the_parked_owner_and_programs_no_other_comparator() {
         let _serialized = super::executor_test_guard();
         let cpu = RecordingSmpCpu::new(0, 2);
-        let executor = Executor::new(ProgressCounter::new(), 2, ProcessorId::new(0));
-        let timer = executor.timer(cpu.clone());
-        let idle = &executor.group.idle[0];
-        let built = cpu.deadlines();
-        assert_eq!(built.len(), 1);
-        assert_eq!(built[0].0, ProcessorId::new(0));
+        let executor0 = Executor::isolated(
+            ProgressCounter::new(),
+            single_node_pool(2),
+            ProcessorId::new(0),
+        );
+        let timer0 = executor0.timer(cpu.clone());
+        let idle = &executor0.group.queues(ProcessorId::new(0)).idle;
         let now = cpu.now().ticks();
         let mut context = Context::from_waker(Waker::noop());
 
+        // Processor 1 comes online with its own base and registers its
+        // sleeps there, which programs its own comparator.
         crate::test_processor_identity::set(ProcessorId::new(1));
-        idle.store(IdleState::Parked);
-        let mut while_parked = timer.sleep_until(Instant::new(now + 500));
+        let executor1 = executor0.sibling(ProgressCounter::new(), ProcessorId::new(1));
+        let timer1 = executor1.timer(cpu.clone());
+        let mut while_parked = timer1.sleep_until(Instant::new(now + 500));
         assert!(Pin::new(&mut while_parked).poll(&mut context).is_pending());
+        let registered = cpu.deadlines();
+        assert_eq!(
+            registered.last(),
+            Some(&(ProcessorId::new(1), now + 500)),
+            "a sleep programs the comparator of the processor that registers it"
+        );
+
+        // Handing the base to processor 0 while it is parked publishes
+        // onto processor 0's base: the owner is woken, and processor 1's
+        // comparator is not touched.
+        idle.store(IdleState::Parked);
+        timer1.migrate_base(ProcessorId::new(0));
         assert_eq!(
             cpu.deadlines(),
-            built,
+            registered,
             "a foreign publish programs no comparator"
         );
         assert_eq!(
@@ -2063,11 +2515,13 @@ mod tests {
         );
 
         idle.store(IdleState::Running);
-        let mut while_running = timer.sleep_until(Instant::new(now + 400));
+        let mut while_running = timer1.sleep_until(Instant::new(now + 400));
         assert!(Pin::new(&mut while_running).poll(&mut context).is_pending());
+        let registered = cpu.deadlines();
+        timer1.migrate_base(ProcessorId::new(0));
         assert_eq!(
             cpu.deadlines(),
-            built,
+            registered,
             "a foreign publish programs no comparator"
         );
         assert_eq!(
@@ -2077,7 +2531,7 @@ mod tests {
         );
 
         crate::test_processor_identity::set(ProcessorId::new(0));
-        timer.arm_published_deadline();
+        timer0.arm_published_deadline();
         assert_eq!(
             cpu.deadlines().last(),
             Some(&(ProcessorId::new(0), now + 400)),
@@ -2095,10 +2549,14 @@ mod tests {
     fn a_running_processor_is_interrupted_every_tick_and_a_parked_one_keeps_its_long_deadline() {
         let _serialized = super::executor_test_guard();
         let cpu = RecordingSmpCpu::new(0, 1);
-        let executor = Executor::new(ProgressCounter::new(), 1, ProcessorId::new(0));
+        let executor = Executor::new(
+            ProgressCounter::new(),
+            single_node_pool(1),
+            ProcessorId::new(0),
+        );
         let timer = executor.timer(cpu.clone());
         let spawner = executor.spawner(cpu.clone());
-        let idle = &executor.group.idle[0];
+        let idle = &executor.group.queues(ProcessorId::new(0)).idle;
         let now = cpu.now().ticks();
         let tick = cpu
             .timebase()
@@ -2192,9 +2650,13 @@ mod tests {
         // One tick per nanosecond, and `now()` steps a microsecond a
         // read, so a poll window of N ticks costs N/1000 loop passes.
         let cpu = SteppingClockCpu::new(1_000);
-        let executor = Executor::new(ProgressCounter::new(), 2, ProcessorId::new(0));
+        let executor = Executor::new(
+            ProgressCounter::new(),
+            single_node_pool(2),
+            ProcessorId::new(0),
+        );
         let timer = executor.timer(cpu.clone());
-        let idle = &executor.group.idle[0];
+        let idle = &executor.group.queues(ProcessorId::new(0)).idle;
         let grow_start = cpu.timebase().duration_to_ticks(IDLE_POLL_GROW_START);
         let max = cpu.timebase().duration_to_ticks(IDLE_POLL_MAX);
         assert_eq!(idle.poll_limit_ticks(), 0);
@@ -2232,14 +2694,21 @@ mod tests {
         let _serialized = super::executor_test_guard();
         let cpu = SteppingClockCpu::new(1_000);
         cpu.forbid_park();
-        let executor = Executor::new(ProgressCounter::new(), 2, ProcessorId::new(0));
+        let executor = Executor::new(
+            ProgressCounter::new(),
+            single_node_pool(2),
+            ProcessorId::new(0),
+        );
         let timer = executor.timer(cpu.clone());
         let root_ready = AtomicBool::new(true);
 
         let outcome = executor.park_until_work(&timer, || root_ready.load(Ordering::SeqCst));
 
         assert!(matches!(outcome, IdleOutcome::Polled { .. }));
-        assert_eq!(executor.group.idle[0].state(), IdleState::Running);
+        assert_eq!(
+            executor.group.queues(ProcessorId::new(0)).idle.state(),
+            IdleState::Running
+        );
     }
 
     /// The push that lands between the `Parked` store and the park is
@@ -2251,13 +2720,488 @@ mod tests {
         let _serialized = super::executor_test_guard();
         let cpu = SteppingClockCpu::new(1_000);
         cpu.forbid_park();
-        let executor = Executor::new(ProgressCounter::new(), 2, ProcessorId::new(0));
+        let executor = Executor::new(
+            ProgressCounter::new(),
+            single_node_pool(2),
+            ProcessorId::new(0),
+        );
         let timer = executor.timer(cpu.clone());
         executor.spawner(cpu).spawn_local_detached(async {});
 
         let outcome = executor.park_until_work(&timer, || false);
 
         assert!(matches!(outcome, IdleOutcome::Polled { .. }));
-        assert_eq!(executor.group.idle[0].state(), IdleState::Running);
+        assert_eq!(
+            executor.group.queues(ProcessorId::new(0)).idle.state(),
+            IdleState::Running
+        );
+    }
+
+    /// Two nodes, processor 0 on node 0 and processor 1 on node 1, remote
+    /// at Linux's default distance.
+    fn two_nodes() -> &'static UserMemoryPool {
+        TestMachine {
+            processor_nodes: alloc::vec![0, 1],
+            distances: alloc::vec![10, 20, 20, 10],
+        }
+        .pool(TEST_POOL_NODE_BYTES)
+    }
+
+    /// Three nodes, one processor each, with an asymmetric matrix: from
+    /// node 0, node 2 is nearer than node 1, and from node 1, node 2 is
+    /// nearer than node 0.
+    fn three_nodes() -> &'static UserMemoryPool {
+        TestMachine {
+            processor_nodes: alloc::vec![0, 1, 2],
+            #[rustfmt::skip]
+            distances: alloc::vec![
+                10, 30, 20,
+                30, 10, 20,
+                20, 20, 10,
+            ],
+        }
+        .pool(TEST_POOL_NODE_BYTES)
+    }
+
+    /// The executor of `owner` over a group of its own for the machine
+    /// `pool` describes, rather than over the process-wide group, so the
+    /// test chooses the machine. Every processor of it is online, as a
+    /// booted machine's are.
+    fn executor_on(pool: &'static UserMemoryPool, owner: ProcessorId) -> Executor {
+        let executor = Executor::isolated(ProgressCounter::new(), pool, owner);
+        for processor in 0..pool.locality().processor_count() {
+            executor
+                .group
+                .bring_processor_online(ProcessorId::new(processor as u16));
+        }
+        executor
+    }
+
+    /// Spawns, as `processor`, a kernel task that records `label` when it
+    /// runs. A kernel task's home is the spawning processor's node.
+    fn spawn_recording<CpuImpl: Cpu + Clone>(
+        spawner: &Spawner<CpuImpl>,
+        processor: u16,
+        ran: &Arc<spin::Mutex<Vec<u16>>>,
+        label: u16,
+    ) {
+        test_processor_identity::set(ProcessorId::new(processor));
+        let ran = ran.clone();
+        spawner.spawn_detached(async move { ran.lock().push(label) });
+    }
+
+    fn node_ready(executor: &Executor, node: usize) -> usize {
+        executor.group.nodes[node]
+            .queue
+            .shared
+            .ready
+            .load(Ordering::SeqCst)
+    }
+
+    fn local_ready(executor: &Executor, processor: u16) -> usize {
+        executor
+            .group
+            .queues(ProcessorId::new(processor))
+            .shared
+            .ready
+            .load(Ordering::SeqCst)
+    }
+
+    #[test]
+    fn a_processor_runs_its_own_nodes_tasks_before_another_nodes() {
+        let executor = executor_on(two_nodes(), ProcessorId::new(0));
+        let cpu = RecordingSmpCpu::new(0, 2);
+        let timer = executor.timer(cpu.clone());
+        let spawner = executor.spawner(cpu);
+        let ran = Arc::new(spin::Mutex::new(Vec::new()));
+        // Node 1's tasks are queued first; queueing order does not
+        // decide.
+        spawn_recording(&spawner, 1, &ran, 1);
+        spawn_recording(&spawner, 1, &ran, 1);
+        spawn_recording(&spawner, 0, &ran, 0);
+        spawn_recording(&spawner, 0, &ran, 0);
+        assert_eq!(node_ready(&executor, 0), 2);
+        assert_eq!(node_ready(&executor, 1), 2);
+
+        test_processor_identity::set(ProcessorId::new(0));
+        let stats = executor.run_until_stalled_with_stats(&timer);
+
+        assert_eq!(*ran.lock(), [0, 0, 1, 1]);
+        assert_eq!(stats.global_runnable_count(), 4);
+    }
+
+    #[test]
+    fn a_processor_steals_from_the_nearest_node_first() {
+        let executor = executor_on(three_nodes(), ProcessorId::new(0));
+        let cpu = RecordingSmpCpu::new(0, 3);
+        let timer = executor.timer(cpu.clone());
+        let spawner = executor.spawner(cpu);
+        let ran = Arc::new(spin::Mutex::new(Vec::new()));
+        spawn_recording(&spawner, 1, &ran, 1);
+        spawn_recording(&spawner, 2, &ran, 2);
+
+        test_processor_identity::set(ProcessorId::new(0));
+        executor.run_until_stalled_with_stats(&timer);
+
+        assert_eq!(
+            *ran.lock(),
+            [2, 1],
+            "node 2 is at 20 from node 0, node 1 at 30"
+        );
+    }
+
+    /// A push to a node whose only processor is the pusher has no
+    /// candidate there, so it wakes the nearest node's processor. The
+    /// first candidate decides, as within a node: a running one is not
+    /// passed over for a parked one further away.
+    #[test]
+    fn a_push_to_the_pushers_lone_node_wakes_the_nearest_nodes_parked_processor() {
+        let executor = executor_on(three_nodes(), ProcessorId::new(0));
+        let cpu = RecordingSmpCpu::new(1, 3);
+        let spawner = executor.spawner(cpu.clone());
+        let idle = |processor: u16| &executor.group.queues(ProcessorId::new(processor)).idle;
+        idle(0).store(IdleState::Parked);
+        idle(2).store(IdleState::Parked);
+
+        spawner.spawn_detached(async {});
+        assert_eq!(node_ready(&executor, 1), 1);
+        assert_eq!(cpu.woken(), [ProcessorId::new(2)]);
+
+        idle(2).store(IdleState::Running);
+        spawner.spawn_detached(async {});
+        assert_eq!(
+            cpu.woken(),
+            [ProcessorId::new(2)],
+            "a running candidate sees the count itself, and decides"
+        );
+    }
+
+    /// A processor about to park re-tests every node's queue, because it
+    /// steals from all of them. `park_current` panics if it is reached.
+    #[test]
+    fn work_on_another_node_keeps_a_processor_from_parking() {
+        let cpu = SteppingClockCpu::new(1_000);
+        cpu.forbid_park();
+        let executor = executor_on(two_nodes(), ProcessorId::new(0));
+        let timer = executor.timer(cpu.clone());
+        let spawner = executor.spawner(cpu);
+        test_processor_identity::set(ProcessorId::new(1));
+        spawner.spawn_detached(async {});
+        test_processor_identity::set(ProcessorId::new(0));
+        assert_eq!(node_ready(&executor, 1), 1);
+
+        let outcome = executor.park_until_work(&timer, || false);
+
+        assert!(matches!(outcome, IdleOutcome::Polled { .. }));
+    }
+
+    /// An instance's tasks are queued on its home, whichever processor
+    /// spawns them: provisionally the node of the processor that
+    /// registered it, then the node its first turn ran on, which later
+    /// turns elsewhere do not move.
+    #[test]
+    fn an_instances_tasks_queue_on_the_node_its_first_turn_ran_on() {
+        let executor = executor_on(two_nodes(), ProcessorId::new(0));
+        let cpu = RecordingSmpCpu::new(1, 2);
+        let registry = InstanceRegistry::new();
+        let instance = registry.register("homed", 0);
+        let activity = InstanceActivity::new(instance.clone(), 0);
+        let turns = activity.turns();
+        test_processor_identity::set(ProcessorId::new(0));
+        let timer = executor.timer(cpu.clone());
+        let spawner = executor
+            .spawner(cpu)
+            .instance_spawner(TaskFunding::Instance, &instance);
+
+        spawner
+            .try_spawn_detached(async {})
+            .expect("the instance share has room");
+        assert_eq!(
+            (node_ready(&executor, 0), node_ready(&executor, 1)),
+            (0, 1),
+            "before any turn the home is the registering processor's node"
+        );
+
+        turns.begin(1).end(2);
+        test_processor_identity::set(ProcessorId::new(1));
+        turns.begin(3).end(4);
+        test_processor_identity::set(ProcessorId::new(0));
+        spawner
+            .try_spawn_detached(async {})
+            .expect("the instance share has room");
+        assert_eq!(
+            (node_ready(&executor, 0), node_ready(&executor, 1)),
+            (1, 1),
+            "the first turn, on processor 0, fixed the home on node 0"
+        );
+
+        let stats = executor.run_until_stalled_with_stats(&timer);
+        assert_eq!(
+            stats.global_runnable_count(),
+            2,
+            "processor 0 steals node 1's task once its own node is empty"
+        );
+        drop(turns);
+        drop(activity);
+    }
+
+    /// A processor outside the online set is never a wake candidate: the
+    /// walk from the pusher's node passes over the nearer node whose only
+    /// processor is offline to the online one behind it.
+    #[test]
+    fn a_push_passes_over_an_offline_processor_to_the_nearest_online_one() {
+        let executor = executor_on(three_nodes(), ProcessorId::new(0));
+        let cpu = RecordingSmpCpu::new(0, 3);
+        let spawner = executor.spawner(cpu.clone());
+        for processor in 0..3 {
+            executor.group.publish_parked(ProcessorId::new(processor));
+        }
+        executor.group.online.remove(ProcessorId::new(2));
+
+        // Node 0's own processor is the pusher; node 2 is at 20 and node 1
+        // at 30 from it.
+        spawner.spawn_detached(async {});
+        assert_eq!(node_ready(&executor, 0), 1);
+        assert_eq!(
+            cpu.woken(),
+            [ProcessorId::new(1)],
+            "offline processor 2 is passed over for online processor 1"
+        );
+    }
+
+    /// A processor going offline leaves its node's queue where it is, and
+    /// its successor — parked, on another node — is woken for it and
+    /// steals it.
+    #[test]
+    fn a_departing_processors_node_queue_is_stolen_by_its_successor() {
+        let executor0 = executor_on(two_nodes(), ProcessorId::new(0));
+        let cpu = RecordingSmpCpu::new(1, 2);
+        let executor1 = executor0.sibling(ProgressCounter::new(), ProcessorId::new(1));
+        let spawner1 = executor1.spawner(cpu.clone());
+        let ran = Arc::new(spin::Mutex::new(Vec::new()));
+        spawn_recording(&spawner1, 1, &ran, 1);
+        assert_eq!(node_ready(&executor0, 1), 1);
+        executor0.group.publish_parked(ProcessorId::new(0));
+        let woken_before = cpu.woken().len();
+
+        assert_eq!(executor1.take_offline(&cpu, ProcessorId::new(0)), Ok(()));
+        assert!(!executor0.group.online.contains(ProcessorId::new(1)));
+        assert_eq!(cpu.woken()[woken_before..], [ProcessorId::new(0)]);
+        assert_eq!(node_ready(&executor0, 1), 1, "the queue stays on node 1");
+
+        test_processor_identity::set(ProcessorId::new(0));
+        let timer = executor0.timer(cpu.clone());
+        let stats = executor0.run_until_stalled_with_stats(&timer);
+        assert_eq!(*ran.lock(), [1]);
+        assert_eq!(stats.global_runnable_count(), 1);
+    }
+
+    use core::mem::size_of_val;
+    use core::sync::atomic::AtomicUsize;
+    use core::task::Poll;
+
+    use super::{READY_BATCH_TASKS, TASK_ARENA_ALIGN, Timer};
+
+    /// Every ready queue held this many tasks before #615, and a push
+    /// past it panicked the kernel.
+    const OLD_READY_QUEUE_CAPACITY: usize = READY_BATCH_TASKS * 4;
+
+    /// The process-wide executor of processor 0 on a one-processor,
+    /// one-node machine, whose one node queue is the machine-wide queue.
+    fn single_processor_executor() -> Executor {
+        Executor::new(
+            ProgressCounter::new(),
+            single_node_pool(1),
+            ProcessorId::new(0),
+        )
+    }
+
+    /// A future that counts its one run and fits the arena's smallest
+    /// block, so the arena admits `TEST_SHARE_BYTES / TASK_ARENA_ALIGN`
+    /// of them.
+    async fn counting_task(ran: Arc<AtomicUsize>) {
+        ran.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Runs passes until one finds nothing to run, and returns how many
+    /// local and global tasks ran in all.
+    fn run_to_stall(executor: &Executor, timer: &Timer<TestCpu>) -> (usize, usize) {
+        let (mut local, mut global) = (0, 0);
+        loop {
+            let stats = executor.run_until_stalled_with_stats(timer);
+            if stats.runnable_count() == 0 {
+                return (local, global);
+            }
+            local += stats.local_runnable_count();
+            global += stats.global_runnable_count();
+        }
+    }
+
+    /// #615, global queue: the arena is the only thing that refuses an
+    /// instance task, so more tasks than the old queue capacity can be
+    /// runnable at once, and every one of them runs.
+    #[test]
+    fn every_instance_task_the_arena_admits_is_queued_globally_and_runs() {
+        let _serialized = super::executor_test_guard();
+        crate::test_processor_identity::set(ProcessorId::new(0));
+        let executor = single_processor_executor();
+        let timer = executor.timer(TestCpu::new());
+        let registry = InstanceRegistry::new();
+        let instance = registry.register("global-storm", 0);
+        let spawner = executor
+            .spawner(TestCpu::new())
+            .instance_spawner(TaskFunding::Instance, &instance);
+        let ran = Arc::new(AtomicUsize::new(0));
+        assert!(size_of_val(&counting_task(ran.clone())) <= TASK_ARENA_ALIGN);
+
+        let mut accepted = 0;
+        while spawner
+            .try_spawn_detached(counting_task(ran.clone()))
+            .is_ok()
+        {
+            accepted += 1;
+        }
+
+        // The arena, and only the arena, refused the spawn that ended the
+        // loop; none of the accepted tasks has run, so all are queued.
+        assert_eq!(accepted, TEST_SHARE_BYTES / TASK_ARENA_ALIGN);
+        assert!(accepted > OLD_READY_QUEUE_CAPACITY);
+        assert_eq!(node_ready(&executor, 0), accepted);
+        assert_eq!(run_to_stall(&executor, &timer), (0, accepted));
+        assert_eq!(ran.load(Ordering::Relaxed), accepted);
+    }
+
+    /// #615, local queue: the same for tasks bound to the spawning
+    /// processor.
+    #[test]
+    fn every_local_instance_task_the_arena_admits_is_queued_locally_and_runs() {
+        let _serialized = super::executor_test_guard();
+        crate::test_processor_identity::set(ProcessorId::new(0));
+        let executor = single_processor_executor();
+        let timer = executor.timer(TestCpu::new());
+        let registry = InstanceRegistry::new();
+        let instance = registry.register("local-storm", 0);
+        let spawner = executor
+            .spawner(TestCpu::new())
+            .instance_spawner(TaskFunding::Instance, &instance);
+        let ran = Arc::new(AtomicUsize::new(0));
+
+        let mut accepted = 0;
+        while spawner
+            .try_spawn_local_detached(counting_task(ran.clone()))
+            .is_ok()
+        {
+            accepted += 1;
+        }
+
+        assert_eq!(accepted, TEST_SHARE_BYTES / TASK_ARENA_ALIGN);
+        assert!(accepted > OLD_READY_QUEUE_CAPACITY);
+        assert_eq!(local_ready(&executor, 0), accepted);
+        assert_eq!(run_to_stall(&executor, &timer), (accepted, 0));
+        assert_eq!(ran.load(Ordering::Relaxed), accepted);
+    }
+
+    /// Tasks that park until a gate opens, and the wakers they leave
+    /// behind.
+    struct Gate {
+        open: bool,
+        wakers: Vec<Waker>,
+    }
+
+    struct WaitForGate(Arc<std::sync::Mutex<Gate>>);
+
+    impl core::future::Future for WaitForGate {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            let mut gate = self.0.lock().expect("the gate lock is never poisoned");
+            if gate.open {
+                return Poll::Ready(());
+            }
+            gate.wakers.push(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+
+    /// #615, wake storm: one wake from another processor makes three
+    /// times the old capacity runnable on the global queue at once.
+    #[test]
+    fn a_wake_storm_from_another_processor_runs_every_parked_task() {
+        const TASKS: usize = OLD_READY_QUEUE_CAPACITY * 3;
+
+        let _serialized = super::executor_test_guard();
+        crate::test_processor_identity::set(ProcessorId::new(0));
+        let executor = single_processor_executor();
+        let timer = executor.timer(TestCpu::new());
+        let spawner = executor.spawner(TestCpu::new());
+        let gate = Arc::new(std::sync::Mutex::new(Gate {
+            open: false,
+            wakers: Vec::new(),
+        }));
+        let done = Arc::new(AtomicUsize::new(0));
+        for _ in 0..TASKS {
+            let gate = WaitForGate(gate.clone());
+            let done = done.clone();
+            spawner.spawn_detached(async move {
+                gate.await;
+                done.fetch_add(1, Ordering::Relaxed);
+            });
+        }
+
+        // Every task runs once and parks on the gate.
+        assert_eq!(run_to_stall(&executor, &timer), (0, TASKS));
+        assert_eq!(done.load(Ordering::Relaxed), 0);
+        assert_eq!(node_ready(&executor, 0), 0);
+
+        let opener = {
+            let gate = gate.clone();
+            std::thread::spawn(move || {
+                crate::test_processor_identity::set(ProcessorId::new(1));
+                let wakers = {
+                    let mut gate = gate.lock().expect("the gate lock is never poisoned");
+                    gate.open = true;
+                    core::mem::take(&mut gate.wakers)
+                };
+                for waker in wakers {
+                    waker.wake();
+                }
+            })
+        };
+        opener.join().expect("the waking thread panicked");
+
+        assert_eq!(node_ready(&executor, 0), TASKS);
+        assert_eq!(run_to_stall(&executor, &timer), (0, TASKS));
+        assert_eq!(done.load(Ordering::Relaxed), TASKS);
+    }
+
+    /// Dropping an `Executor` between two passes loses nothing: what it
+    /// had taken off its inbox and not yet run goes back to the group,
+    /// and the next executor for the processor runs it.
+    #[test]
+    fn work_left_in_a_dropped_executors_run_list_is_run_by_the_next_executor() {
+        const LEFT_OVER: usize = 16;
+
+        let _serialized = super::executor_test_guard();
+        crate::test_processor_identity::set(ProcessorId::new(0));
+        let ran = Arc::new(AtomicUsize::new(0));
+        let executor = single_processor_executor();
+        let timer = executor.timer(TestCpu::new());
+        let spawner = executor.spawner(TestCpu::new());
+        for _ in 0..READY_BATCH_TASKS + LEFT_OVER {
+            spawner.spawn_local_detached(counting_task(ran.clone()));
+        }
+
+        // One pass runs a batch and leaves the rest in the run list.
+        let stats = executor.run_until_stalled_with_stats(&timer);
+        assert_eq!(stats.local_runnable_count(), READY_BATCH_TASKS);
+        assert_eq!(ran.load(Ordering::Relaxed), READY_BATCH_TASKS);
+        assert_eq!(local_ready(&executor, 0), LEFT_OVER);
+        drop(executor);
+
+        let executor = single_processor_executor();
+        let timer = executor.timer(TestCpu::new());
+        assert_eq!(local_ready(&executor, 0), LEFT_OVER);
+        assert_eq!(run_to_stall(&executor, &timer), (LEFT_OVER, 0));
+        assert_eq!(ran.load(Ordering::Relaxed), READY_BATCH_TASKS + LEFT_OVER);
     }
 }

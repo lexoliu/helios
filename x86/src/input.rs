@@ -22,7 +22,7 @@ use pci_types::PciAddress;
 
 use crate::exceptions::INPUT_INTERRUPT_VECTORS;
 use crate::iommu::X86DmaPool;
-use crate::pci::PciRoot;
+use crate::pci::{PciRoot, VirtioFunctions};
 
 type X86VirtioInputDevice = VirtioInputDevice<VirtioPciTransport<X86DmaPool>>;
 
@@ -50,8 +50,8 @@ impl ExternalInterruptHandler for VirtioInputFunction {
 }
 
 /// Every PCI function that carries an input device.
-pub(crate) fn discover(pci: &PciRoot) -> Vec<PciAddress> {
-    let functions: Vec<PciAddress> = pci.find_virtio_functions(DeviceType::Input).collect();
+pub(crate) fn discover(virtio: &VirtioFunctions) -> Vec<PciAddress> {
+    let functions: Vec<PciAddress> = virtio.find_virtio_functions(DeviceType::Input).collect();
     assert!(
         functions.len() <= INPUT_INTERRUPT_VECTORS.len(),
         "platform exposes {} input functions but only {} interrupt vectors exist",
@@ -67,8 +67,8 @@ pub(crate) fn discover(pci: &PciRoot) -> Vec<PciAddress> {
 /// One call for every function rather than one per function: the kernel
 /// owns the machine's input devices as a set, because that is what a
 /// program asking "what can I read?" is answered from.
-pub(crate) fn install<WatchdogImpl>(
-    kernel: &helios_kernel::Kernel<crate::X86Cpu, WatchdogImpl>,
+pub(crate) fn install<WatchdogImpl, MeasuredBootImpl>(
+    kernel: &helios_kernel::Kernel<crate::X86Cpu, WatchdogImpl, MeasuredBootImpl>,
     pci: &PciRoot,
     functions: &[(PciAddress, X86DmaPool)],
     destination_apic_id: u32,
@@ -76,6 +76,7 @@ pub(crate) fn install<WatchdogImpl>(
 ) -> Vec<InputInterrupt>
 where
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
 {
     let discovered: Vec<InputInterrupt> = functions
         .iter()

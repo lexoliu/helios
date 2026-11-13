@@ -5,6 +5,12 @@ repo_root := justfile_directory()
 # Default profile directory used by `kernel-prebuild --profile`.
 default_profile := "debug"
 
+# The one bare-metal target whose rustflags carry `-Zbranch-protection`, which
+# rustc refuses to mix with a precompiled `core`, `alloc` or
+# `compiler_builtins` (`.cargo/config.toml`). Its builds rebuild them.
+build_std_target := "aarch64-unknown-none"
+build_std_flag := "-Zbuild-std=core,alloc"
+
 # Generate the kernel-prebuild manifest for `target` and run `cargo check` against it.
 # helios-kernel is checked with the feature set the bare-metal backends select,
 # not its host defaults: `wasmtime-host` on a `target_os = "none"` target is a
@@ -21,11 +27,12 @@ check-target target package:
         --profile "{{default_profile}}" \
         --cargo cargo
     export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
-    export HELIOS_KERNEL_ROOT_SECRET_KEY="${out_dir}/helios-root-secret.key"
-    cargo check -p helios-kernel \
+    build_std="{{ if target == build_std_target { build_std_flag } else { "" } }}"
+    # Unquoted on purpose: an empty value must expand to no argument.
+    cargo check ${build_std} -p helios-kernel \
         --no-default-features --features wasmtime-bare-metal,embedded-debugger \
         --target "{{target}}"
-    cargo check -p "{{package}}" --target "{{target}}"
+    cargo check ${build_std} -p "{{package}}" --target "{{target}}"
 
 # Every clippy and rustfmt gate CI enforces.
 lint:
@@ -68,17 +75,20 @@ clippy-host:
         --cargo cargo
     export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
     export HELIOS_KERNEL_ROOT_SECRET_KEY="${out_dir}/helios-root-secret.key"
+    # `helios-venus` generates its protocol module from the pinned
+    # venus-protocol inputs when it builds.
+    cargo run -p helios-cli --quiet -- venus-protocol-fetch
     cargo clippy \
         --workspace --all-targets \
         --exclude helios \
         --exclude helios-aarch64 --exclude helios-riscv --exclude helios-x86 \
-        --exclude helios-audio-test --exclude helios-compositor \
+        --exclude helios-audio-test --exclude helios-compositor --exclude helios-cpu \
         --exclude helios-date --exclude helios-debugger --exclude helios-display-test \
         --exclude helios-gpu-test --exclude helios-http-client \
         --exclude helios-init --exclude helios-input-test \
         --exclude helios-oob-load --exclude helios-perf \
         --exclude helios-ping --exclude helios-procbench \
-        --exclude helios-sched-tasks \
+        --exclude helios-sched-tasks --exclude helios-surface-test \
         -- -D warnings
 
 # Clippy each guest program on its own, denying warnings.
@@ -88,10 +98,10 @@ clippy-programs:
     # One program per invocation: they select mutually exclusive
     # `helios-api` worlds, and a single invocation covering several of
     # them would unify those features and fail to build.
-    for package in helios-audio-test helios-compositor helios-date helios-debugger helios-display-test helios-gpu-test \
+    for package in helios-audio-test helios-compositor helios-cpu helios-date helios-debugger helios-display-test helios-gpu-test \
         helios-http-client \
         helios-init helios-input-test helios-oob-load helios-perf helios-ping \
-        helios-procbench helios-sched-tasks; do
+        helios-procbench helios-sched-tasks helios-surface-test; do
         cargo clippy -p "${package}" --all-targets -- -D warnings
     done
 
@@ -108,8 +118,13 @@ test-units:
         --cargo cargo
     export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
     export HELIOS_KERNEL_ROOT_SECRET_KEY="${out_dir}/helios-root-secret.key"
-    cargo nextest run -p helios-hal -p helios-virtio -p helios-netstack -p helios-kernel --lib
+    cargo nextest run -p helios-hal -p helios-virtio -p helios-netstack -p helios-artifact -p helios-kernel --lib
+    cargo nextest run -p helios-firmware
     cargo nextest run -p helios-workspace-root --lib
+    # The TPM driver: both interfaces against register models that
+    # enforce their state machines, and the sealing scenario replayed
+    # from its committed swtpm recording.
+    cargo nextest run -p helios-tpm
     # What the desktop draws with — damage tracking, focus routing, the
     # terminal grid — is a plain library (`programs/compositor/render`)
     # and is tested here rather than only inside a boot, alongside the
@@ -119,12 +134,67 @@ test-units:
     # The host tools: QEMU arguments, network plans, the image audit, the
     # signature trailer, the profile store, the root keypair.
     cargo nextest run -p helios-inspector -p helios-artifact -p helios-profdata -p helios-cli -p helios-compiler-support
+    # The compiler plugin the prebuild above built, hosted under Wasmtime on
+    # this host the way the bench's Linux + Wasmtime column hosts it.
+    HELIOS_COMPILER_PLUGIN_WASM="${out_dir}/compiler_plugin.wasm" cargo nextest run -p helios-compiler-host
+    # The Venus protocol is generated from pinned venus-protocol inputs that
+    # the CLI fetches and hash-verifies; the parity test then compares the
+    # generated encoders with the pinned Mesa generator's output.
+    cargo run -p helios-cli --quiet -- venus-protocol-fetch
+    cargo nextest run -p helios-venus -p helios-venus-gen
+    # The ACPI library runs QEMU's own CPU hotplug AML, from the pinned
+    # tables the fetch below hash-verifies.
+    just acpi-tables-fetch
+    cargo nextest run -p helios-acpi
     cargo nextest run -p helios-kernel --test hal_layering
     # The hosted backend boots the same kernel on the host OS; its tests
     # cover the memory-policy density checks and the OOM killer, and
     # `embedded_debugger_is_provisioned` reads the prebuild payload above.
     HELIOS_BOOTFS="${out_dir}/helios-bootfs" cargo nextest run -p helios-hosted
     python3 "{{repo_root}}/x86/tests/interrupt_state.py"
+
+# Fetch the ACPI tables `acpi/tests/qemu-tables.sha256` pins — QEMU's own
+# expected tables for its q35 machine, from its `tests/data/acpi` at the
+# v9.2.0 commit — into `target/acpi-tables` (or `$HELIOS_ACPI_TABLES_DIR`).
+# A file already there at its pinned hash is kept; a fetched one replaces
+# nothing unless it matches.
+acpi-tables-fetch:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # QEMU v9.2.0.
+    commit="ae35f033b874c627d81d51070187fbf55f0bf1a7"
+    dir="${HELIOS_ACPI_TABLES_DIR:-{{repo_root}}/target/acpi-tables}"
+    while read -r hash path; do
+        file="${dir}/${path}"
+        if [[ -f "${file}" ]] && echo "${hash}  ${file}" | shasum -a 256 -c --status; then
+            continue
+        fi
+        mkdir -p "$(dirname "${file}")"
+        curl --fail --silent --show-error --location --retry 3 --output "${file}.part" \
+            "https://gitlab.com/qemu-project/qemu/-/raw/${commit}/tests/data/acpi/${path}"
+        if ! echo "${hash}  ${file}.part" | shasum -a 256 -c --status; then
+            echo "QEMU ${path} at ${commit} does not hash to the pinned ${hash}; nothing was stored" >&2
+            rm -f "${file}.part"
+            exit 1
+        fi
+        mv "${file}.part" "${file}"
+    done < "{{repo_root}}/acpi/tests/qemu-tables.sha256"
+
+# Mount the EROFS images `mkfs.erofs` builds, intact and corrupted. Needs
+# erofs-utils on PATH; the `erofs-rs` builder's images run in test-units.
+test-erofs-mkfs:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    target="$(rustc -vV | sed -n 's/^host: //p')"
+    out_dir="{{repo_root}}/target/kernel-prebuild/${target}/{{default_profile}}"
+    cargo run -p helios-cli --quiet -- kernel-prebuild \
+        --out-dir "${out_dir}" \
+        --target "${target}" \
+        --profile "{{default_profile}}" \
+        --cargo cargo
+    export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
+    export HELIOS_KERNEL_ROOT_SECRET_KEY="${out_dir}/helios-root-secret.key"
+    cargo nextest run -p helios-kernel --lib --run-ignored ignored-only -E 'test(/^vfs::erofs::tests::mkfs::/)'
 
 # Generate the kernel-prebuild manifest for `target` and run `cargo clippy`
 # against it, denying warnings.
@@ -139,15 +209,16 @@ clippy-target target package:
         --profile "{{default_profile}}" \
         --cargo cargo
     export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
-    export HELIOS_KERNEL_ROOT_SECRET_KEY="${out_dir}/helios-root-secret.key"
     # Two invocations, for the same reason `check-target` uses explicit
     # features: cargo would otherwise unify helios-kernel's host defaults with
     # the backend's `wasmtime-bare-metal` selection.
-    cargo clippy \
+    build_std="{{ if target == build_std_target { build_std_flag } else { "" } }}"
+    # Unquoted on purpose: an empty value must expand to no argument.
+    cargo clippy ${build_std} \
         -p helios-kernel --no-default-features \
         --features wasmtime-bare-metal,embedded-debugger \
         --target "{{target}}" -- -D warnings
-    cargo clippy \
+    cargo clippy ${build_std} \
         -p "{{package}}" --target "{{target}}" -- -D warnings
 
 # Build the instrumented kernel image of docs/pgo.md for `arch` (aarch64,
@@ -171,10 +242,13 @@ build-instrumented arch:
 # because a PGO kernel is only as good as the profile behind it, and the
 # inspector refuses one this toolchain cannot read before cargo starts.
 # `bench-suite.yml` uploads one as `helios-kernel-profdata`.
+# Further arguments are `vm` options: the release workflow passes
+# `--root-secret-key <file>` so the kernel it ships trusts the release key
+# (docs/boot.md).
 # Usage: just kernel-pgo-use x86-64 target/pgo/helios-kernel.profdata
-kernel-pgo-use arch profile:
+kernel-pgo-use arch profile *vm_options:
     cargo run -p helios-inspector --quiet -- \
-        vm --arch {{arch}} --profile-use {{profile}} build
+        vm --arch {{arch}} --profile-use {{profile}} {{vm_options}} build
 
 # Equivalent of AGENTS §7 required checks. Run before declaring a change complete.
 check-all:
@@ -200,7 +274,6 @@ check-host:
         --profile "{{default_profile}}" \
         --cargo cargo
     export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
-    export HELIOS_KERNEL_ROOT_SECRET_KEY="${out_dir}/helios-root-secret.key"
     cargo check -p helios-kernel
     cargo check -p helios-hosted
     cargo check -p helios-inspector
@@ -222,7 +295,6 @@ test-embedded-debugger:
         --profile "{{default_profile}}" \
         --cargo cargo
     export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
-    export HELIOS_KERNEL_ROOT_SECRET_KEY="${out_dir}/helios-root-secret.key"
     export HELIOS_BOOTFS="${out_dir}/helios-bootfs"
     cargo nextest run -p helios-hosted --no-capture init_program::tests::embedded_debugger_
 

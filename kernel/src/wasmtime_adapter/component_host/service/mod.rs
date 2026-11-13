@@ -26,12 +26,18 @@ pub(super) use surface::add_surface_to_linker;
 mod audio;
 pub use audio::PlaybackHandle;
 pub(super) use audio::add_audio_to_linker;
+mod processors;
+pub(super) use processors::add_processors_to_linker;
+mod compile_session;
+use compile_session::*;
 mod compiler;
 use compiler::*;
 mod exec;
 use exec::*;
 mod http_plugin;
 use http_plugin::*;
+mod network_step;
+use network_step::NetworkStep;
 mod compositor_plugin;
 use compositor_plugin::*;
 mod preview1;
@@ -46,7 +52,8 @@ mod wasix_epoll;
 use wasix_epoll::*;
 
 use super::*;
-use crate::process::FreeDescriptorSlots;
+use crate::isa::GuestIsa;
+use crate::process::{DescriptorLimit, FreeDescriptorSlots};
 use crate::wasmtime_adapter::artifact_profile::{self, ArtifactProfileError};
 use crate::wasmtime_adapter::code_map::{CodeMap, CodeRegistration};
 use crate::wasmtime_adapter::config::AotCompileHint;
@@ -56,11 +63,15 @@ use crate::wasmtime_adapter::{WasmtimeCompiledComponent, WasmtimeCompiledCoreMod
 use crate::wasmtime_adapter::{
     WasmtimePrecompiledKind,
     wasi::{
-        DebugFileSystem, DebugFileSystemSnapshot, FileContents, FsDescriptor, FsNodeKind,
-        WasiImportSet, bindings::filesystem::types as fs_types, preview1 as p1,
+        self as wasi_fs, FsDescriptor, FsNodeKind, WasiImportSet,
+        bindings::filesystem::types as fs_types, preview1 as p1,
     },
 };
-use crate::{BootfsBytes, ProgramExecErrorDetail, RuntimeMessage};
+use crate::{
+    BootfsBytes, ComponentStdioRefusal, GuestAddress, ProgramExecErrorDetail, RuntimeMessage,
+    UnbindableStdio,
+};
+use crate::{FileContents, MemoryFs, Namespace};
 use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -73,10 +84,13 @@ use core::task::{Context, Poll};
 use core::time::Duration;
 use hashbrown::HashMap;
 use helios_compiler_abi::{
-    CompileHint as CompilerAbiHint, CompilerRequestHeader, CompilerResponseHeader, CompilerStatus,
+    CompileHint as CompilerAbiHint, CompilerRequestHeader, CompilerResponseHeader,
     HELIOS_COMPILER_ABI_VERSION, HELIOS_COMPILER_ALLOC, HELIOS_COMPILER_COMPILE,
-    HELIOS_COMPILER_INITIALIZE, HELIOS_COMPILER_PTHREAD_SELF_OFFSET,
+    HELIOS_COMPILER_FREE, HELIOS_COMPILER_INITIALIZE, HELIOS_COMPILER_OUTSTANDING_BYTES,
+    HELIOS_COMPILER_PTHREAD_SELF_OFFSET,
 };
+use helios_hal::fs::WritePosition;
+use helios_hal::measured_boot::{MeasuredBoot, Sha256Digest};
 use helios_hal::watchdog::Watchdog;
 use smallvec::SmallVec;
 use thiserror::Error;
@@ -115,10 +129,35 @@ const WASIX_STREAM_SECURITY_CLASSIC_ENCRYPTION: u8 = 1 << 2;
 const WASIX_STREAM_SECURITY_DOUBLE_ENCRYPTION: u8 = 1 << 3;
 const DEFAULT_WASIX_EXEC_SEARCH_PATHS: &[&str] = &["/usr/local/bin", "/bin", "/usr/bin"];
 type Preview1Iovs = SmallVec<[(u32, u32); 8]>;
-type Preview1IovRanges = SmallVec<[(usize, usize); 8]>;
 type CompilerThreadTasks = SmallVec<[crate::JoinHandle<CompilerThreadReport>; 8]>;
 type CompilerThreadReports = SmallVec<[CompilerThreadReport; 8]>;
-type CompilerPluginHandle<CpuImpl, Net, HostFs> = Arc<CompilerPluginRuntime<CpuImpl, Net, HostFs>>;
+type CompilerPluginHandle<CpuImpl, Net, StorageImpl> =
+    Arc<CompilerPluginRuntime<CpuImpl, Net, StorageImpl>>;
+
+/// What one compile session takes from its requester: the compiler plugin's
+/// artifact, the input, and how to compile it.
+struct CompileJob {
+    compiler_payload: Bytes,
+    wasm: Bytes,
+    hint: AotCompileHint,
+    profile: bool,
+}
+
+/// How a compile's body ended, with the phase timestamps it filled in.
+struct CompileEnd {
+    result: Result<(Vec<u8>, CompilerThreadReports), ProgramExecError>,
+    phases: CompilerPhaseTimestamps,
+}
+
+/// What [`UserProgramService::aot`] produced.
+pub(crate) struct AotArtifact {
+    /// The signed `cwasm` artifact.
+    pub(crate) signed: Vec<u8>,
+    /// The worker count the compiler plugin was told to compile with
+    /// (`compiler_plugin_worker_threads`), reported so a caller comparing
+    /// this compile with another can hold the count fixed.
+    pub(crate) worker_threads: u32,
+}
 
 #[derive(Clone, Copy, Default)]
 struct CompilerPhaseTimestamps {
@@ -177,13 +216,13 @@ fn kernel_processor_profile_stack(processor: u16) -> String {
 }
 
 #[derive(Clone)]
-pub struct UserProgramService<CpuImpl, Net, HostFs>
+pub struct UserProgramService<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    inner: Arc<UserProgramServiceInner<CpuImpl, Net, HostFs>>,
+    inner: Arc<UserProgramServiceInner<CpuImpl, Net, StorageImpl>>,
 }
 
 /// The program a launch runs and the credentials it runs under.
@@ -191,11 +230,15 @@ where
 /// Distinct from [`ProgramExecContext`], which is the host the program
 /// runs *in*, and from [`ChildStdio`], which is how the caller talks to
 /// it once it is running.
-pub(super) struct ProgramLaunch<Net: ComponentHostNetwork> {
+pub(super) struct ProgramLaunch<Net: ComponentHostNetwork, StorageImpl: crate::Storage> {
     argv: ProgramArgv,
     env: LaunchEnvironment,
     authority: ProcessAuthority,
-    filesystem: Option<DebugFileSystemSnapshot>,
+    /// The namespace the program runs in: the launcher's own tree when it
+    /// shares it, or a tree descending from the launcher's. `None` for a
+    /// program the kernel launches, which runs in a tree descending from
+    /// the root namespace.
+    filesystem: Option<Namespace<StorageImpl>>,
     /// Inherited preview1 descriptors. Only core modules have a
     /// descriptor table; a component ignores one.
     descriptors: Option<Preview1DescriptorTable<Net>>,
@@ -206,7 +249,7 @@ pub(super) struct ProgramLaunch<Net: ComponentHostNetwork> {
     timeline: phases::Timeline,
 }
 
-impl<Net: ComponentHostNetwork> ProgramLaunch<Net> {
+impl<Net: ComponentHostNetwork, StorageImpl: crate::Storage> ProgramLaunch<Net, StorageImpl> {
     /// A launch that inherits nothing: no descriptors, no signal
     /// dispositions. `env` is the caller's environment; the kernel owns
     /// `HELIOS_PROCESS_ID` and replaces any entry for it (see
@@ -215,7 +258,7 @@ impl<Net: ComponentHostNetwork> ProgramLaunch<Net> {
         argv: ProgramArgv,
         env: Vec<(String, String)>,
         authority: ProcessAuthority,
-        filesystem: Option<DebugFileSystemSnapshot>,
+        filesystem: Option<Namespace<StorageImpl>>,
     ) -> Self {
         Self {
             argv,
@@ -246,27 +289,27 @@ pub(super) struct ChildStdio {
 }
 
 #[derive(Clone)]
-pub(crate) struct ProgramExecContext<CpuImpl, Net, HostFs>
+pub(crate) struct ProgramExecContext<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     cpu: CpuImpl,
     timer: crate::Timer<CpuImpl>,
     spawner: crate::Spawner<CpuImpl>,
-    runtime_state: HostRuntimeState<CpuImpl, Net, HostFs>,
+    runtime_state: HostRuntimeState<CpuImpl, Net, StorageImpl>,
     instance_registry: crate::InstanceRegistry,
     parent_instance_id: Option<crate::InstanceId>,
     read_serial: crate::SerialReader,
     write_serial: crate::DebugSerialWriter,
 }
 
-impl<CpuImpl, Net, HostFs> ProgramExecContext<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> ProgramExecContext<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     pub(crate) fn spawner(&self) -> crate::Spawner<CpuImpl> {
         self.spawner.clone()
@@ -281,43 +324,49 @@ where
     }
 }
 
-struct UserProgramServiceInner<CpuImpl, Net, HostFs>
+struct UserProgramServiceInner<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     runtime: crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl>,
     engine: crate::wasmtime_adapter::WasmtimeEngine,
-    preview1_core_linker: CoreLinker<Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+    preview1_core_linker: CoreLinker<Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     shared_memory_pool: Arc<Mutex<SharedMemoryPool>>,
     component_cache: Mutex<ComponentCache<ProgramComponent>>,
     component_instance_pre_cache:
-        Mutex<ComponentCache<ComponentInstancePre<StoreData<CpuImpl, Net, HostFs>>>>,
+        Mutex<ComponentCache<ComponentInstancePre<StoreData<CpuImpl, Net, StorageImpl>>>>,
     core_module_cache: Mutex<ComponentCache<WasmtimeCompiledCoreModule>>,
     // Release AArch64/HVF quickjs-loop evidence: caching the Preview1 core
     // InstancePre moved the median from 53 ms to 50-51 ms. Cache only modules
     // whose imports are independent of per-process shared-memory binding.
-    core_module_instance_pre_cache: CoreModuleInstancePreCache<CpuImpl, Net, HostFs>,
+    core_module_instance_pre_cache: CoreModuleInstancePreCache<CpuImpl, Net, StorageImpl>,
     compiler_artifact: Option<BootfsBytes>,
+    /// The key the compiler plugin's output is signed with, and the only
+    /// key a written `cwasm` verifies against. Settled at bring-up,
+    /// before this service exists, and never replaced.
+    cwasm_signing_key: crate::CwasmSigningKey,
+    /// The level the in-kernel compiler emits, selected once at install.
+    guest_isa: GuestIsa,
     /// Lazily-built compiler kernel-plugin runtime. The plugin's
     /// `wasmtime::Module`, `InstancePre`, and 512 MiB `SharedMemory` are
     /// allocated on first compile and reused for every subsequent call,
     /// turning the plugin into a long-lived kernel resident — no more
     /// per-call buddy-heap churn that previously OOM'd after one compile.
-    compiler_plugin: Mutex<Option<Arc<CompilerPluginRuntime<CpuImpl, Net, HostFs>>>>,
+    compiler_plugin: Mutex<Option<Arc<CompilerPluginRuntime<CpuImpl, Net, StorageImpl>>>>,
     /// Serialises compile calls. The cached `SharedMemory` is the
     /// plugin's only scratch surface; concurrent calls would race on
     /// the bump allocator and corrupt each other's request/response
-    /// buffers. The lock is held only on the kernel side; the rayon
+    /// buffers. The slot is held only on the kernel side; the rayon
     /// worker pool inside the plugin still parallelises a single
     /// compile across all cores.
-    compile_in_progress: AtomicBool,
+    compile_slot: CompilerCompileSlot,
     /// Every wasm image this service loaded, by address, for the
     /// instruction sampler to name.
     code_map: CodeMap,
     clock_cpu: CpuImpl,
-    _marker: core::marker::PhantomData<fn() -> HostFs>,
+    _marker: core::marker::PhantomData<fn() -> StorageImpl>,
 }
 
 /// A program component as the cache holds it: the compiled artifact and
@@ -327,11 +376,11 @@ struct ProgramComponent {
     _code: CodeRegistration,
 }
 
-struct ProgramSpawnRequest<Net: ComponentHostNetwork> {
+struct ProgramSpawnRequest<Net: ComponentHostNetwork, StorageImpl: crate::Storage> {
     argv: ProgramArgv,
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
-    filesystem: Option<DebugFileSystemSnapshot>,
+    filesystem: Option<Namespace<StorageImpl>>,
     descriptors: Option<Preview1DescriptorTable<Net>>,
     signal_state: WasixSignalState,
     signal_dispositions: Vec<WasixSignalDisposition>,
@@ -352,21 +401,23 @@ pub(crate) enum ProgramSource {
 }
 
 impl ProgramSource {
-    /// Classifies a program read from the in-memory filesystem by the
-    /// provenance its node carries.
+    /// Classifies a program file by the provenance the filesystem layer
+    /// that produced its bytes gave them.
     pub(crate) fn from_file(contents: FileContents) -> Self {
         match contents {
-            FileContents::Bootfs(bytes) if cwasm::is_cwasm(bytes.as_slice()) => {
+            FileContents::Boot(bytes)
+                if WasmtimePrecompiledKind::detect(bytes.as_slice()).is_some() =>
+            {
                 Self::BootfsArtifact(bytes)
             }
-            FileContents::Bootfs(bytes) => Self::RawWasm(bytes.to_bytes()),
+            FileContents::Boot(bytes) => Self::RawWasm(bytes.to_bytes()),
             FileContents::Written(bytes) => Self::from_untrusted(bytes),
         }
     }
 
     /// Classifies bytes no boot payload vouches for: a file a guest
-    /// wrote, or one read from the host share.
-    pub(crate) fn from_untrusted(bytes: Bytes) -> Self {
+    /// wrote, on whichever mount, or one a host shared.
+    fn from_untrusted(bytes: Bytes) -> Self {
         if cwasm::is_cwasm(&bytes) {
             Self::SignedArtifact(bytes)
         } else {
@@ -447,37 +498,45 @@ impl ChildHandle {
 pub struct ChildExit {
     pub instance_id: crate::InstanceId,
     pub exit_code: u32,
-    filesystem: Option<DebugFileSystemSnapshot>,
+    filesystem: Option<MemoryFs>,
 }
 
-pub fn install_program_service<CpuImpl, Net, HostFs, WatchdogImpl>(
-    kernel: &crate::Kernel<CpuImpl, WatchdogImpl>,
+pub fn install_program_service<CpuImpl, Net, StorageImpl, WatchdogImpl, MeasuredBootImpl>(
+    kernel: &crate::Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
     cpu: &CpuImpl,
-    debug_state: &HostRuntimeState<CpuImpl, Net, HostFs>,
+    debug_state: &HostRuntimeState<CpuImpl, Net, StorageImpl>,
     read_serial: crate::SerialReader,
     write_serial: crate::DebugSerialWriter,
-) -> UserProgramService<CpuImpl, Net, HostFs>
+) -> UserProgramService<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
     WatchdogImpl: Watchdog + Clone,
+    MeasuredBootImpl: MeasuredBoot,
 {
     install_program_service_inner(kernel, cpu, debug_state, read_serial, write_serial)
 }
 
-pub fn install_component_host_program_service<CpuImpl, Net, HostFs, WatchdogImpl>(
-    kernel: &crate::Kernel<CpuImpl, WatchdogImpl>,
+pub fn install_component_host_program_service<
+    CpuImpl,
+    Net,
+    StorageImpl,
+    WatchdogImpl,
+    MeasuredBootImpl,
+>(
+    kernel: &crate::Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
     cpu: &CpuImpl,
-    debug_state: &HostRuntimeState<CpuImpl, Net, HostFs>,
+    debug_state: &HostRuntimeState<CpuImpl, Net, StorageImpl>,
     read_serial: crate::SerialReader,
     write_serial: crate::DebugSerialWriter,
-) -> Option<UserProgramService<CpuImpl, Net, HostFs>>
+) -> Option<UserProgramService<CpuImpl, Net, StorageImpl>>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
     WatchdogImpl: Watchdog + Clone,
+    MeasuredBootImpl: MeasuredBoot,
 {
     let topology = kernel.topology();
     if helios_hal::cpu::current_processor() != topology.bootstrap_processor {
@@ -493,28 +552,50 @@ where
     ))
 }
 
-fn install_program_service_inner<CpuImpl, Net, HostFs, WatchdogImpl>(
-    kernel: &crate::Kernel<CpuImpl, WatchdogImpl>,
+fn install_program_service_inner<CpuImpl, Net, StorageImpl, WatchdogImpl, MeasuredBootImpl>(
+    kernel: &crate::Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
     cpu: &CpuImpl,
-    debug_state: &HostRuntimeState<CpuImpl, Net, HostFs>,
+    debug_state: &HostRuntimeState<CpuImpl, Net, StorageImpl>,
     read_serial: crate::SerialReader,
     write_serial: crate::DebugSerialWriter,
-) -> UserProgramService<CpuImpl, Net, HostFs>
+) -> UserProgramService<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
     WatchdogImpl: Watchdog + Clone,
+    MeasuredBootImpl: MeasuredBoot,
 {
     if let Some(service) = debug_state.program_service() {
+        // The service and its key exist already; a device still held
+        // here would never be measured into or read.
+        assert!(
+            kernel.take_measured_boot().is_none(),
+            "the program service was installed before the measured-boot device it was handed \
+             settled the compiler-signing key"
+        );
         return service;
     }
 
+    // The signing key is settled before any program can be admitted,
+    // with the measured-boot device the platform handed the kernel.
+    let mut measured_boot = kernel.take_measured_boot();
+    let cwasm_signing_key = crate::signing_key::settle_signing_key_at_bring_up(
+        measured_boot.as_mut(),
+        &Sha256Digest(debug_state.payload_digest()),
+        debug_state.root_entropy(),
+    );
+    // Selected by the backend when it built the runtime state, before any
+    // secondary processor ran guest code, and logged once here: this is the
+    // single place every backend's program service passes through, after the
+    // logger is up.
+    let guest_isa = debug_state.guest_isa();
+    guest_isa.log();
     let cache_budget = machine_memory().free_bytes / COMPONENT_CACHE_FRACTION;
     let shared_memory_pool_budget =
         user_heap_stats().available_bytes() / SHARED_MEMORY_POOL_FRACTION;
     let runtime = crate::wasmtime_adapter::WasmtimeComponentRuntime::new(cpu.clone());
-    let engine = <crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl> as crate::ComponentRuntimeFactory<CpuImpl, HostRuntimeState<CpuImpl, Net, HostFs>, HostFs>>::create_engine(&runtime)
+    let engine = <crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl> as crate::ComponentRuntimeFactory<CpuImpl, HostRuntimeState<CpuImpl, Net, StorageImpl>, StorageImpl>>::create_engine(&runtime)
         .unwrap_or_else(|error| panic!("failed to create launched-program engine: {error:#}"));
     let preview1_core_linker = preview1_program_linker(engine.raw())
         .unwrap_or_else(|error| panic!("failed to create preview1 program linker: {error:#}"));
@@ -532,8 +613,10 @@ where
             core_module_cache: Mutex::new(ComponentCache::new(cache_budget)),
             core_module_instance_pre_cache: Arc::new(Mutex::new(ComponentCache::new(cache_budget))),
             compiler_artifact,
+            cwasm_signing_key,
+            guest_isa,
             compiler_plugin: Mutex::new(None),
-            compile_in_progress: AtomicBool::new(false),
+            compile_slot: CompilerCompileSlot::new(),
             code_map: CodeMap::new(),
             clock_cpu: cpu.clone(),
             _marker: core::marker::PhantomData,
@@ -562,15 +645,16 @@ where
 /// the rings are drained every [`crate::SAMPLE_DRAIN_INTERVAL_MILLIS`]
 /// rather than once when the profile is read. Between profiles the task
 /// parks on the sampler's start signal and costs nothing.
-fn spawn_instruction_sample_drain<CpuImpl, Net, HostFs, WatchdogImpl>(
-    kernel: &crate::Kernel<CpuImpl, WatchdogImpl>,
-    service: &UserProgramService<CpuImpl, Net, HostFs>,
-    debug_state: &HostRuntimeState<CpuImpl, Net, HostFs>,
+fn spawn_instruction_sample_drain<CpuImpl, Net, StorageImpl, WatchdogImpl, MeasuredBootImpl>(
+    kernel: &crate::Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
+    service: &UserProgramService<CpuImpl, Net, StorageImpl>,
+    debug_state: &HostRuntimeState<CpuImpl, Net, StorageImpl>,
 ) where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
     WatchdogImpl: Watchdog + Clone,
+    MeasuredBootImpl: MeasuredBoot,
 {
     let sampler = debug_state.instruction_sampler();
     let code_map = service.code_map().clone();
@@ -587,20 +671,21 @@ fn spawn_instruction_sample_drain<CpuImpl, Net, HostFs, WatchdogImpl>(
     });
 }
 
-pub fn run_embedded_component_forever<CpuImpl, Net, HostFs, WatchdogImpl>(
+pub fn run_embedded_component_forever<CpuImpl, Net, StorageImpl, WatchdogImpl, MeasuredBootImpl>(
     component: EmbeddedComponent,
     world: ComponentBindingSet,
     cpu: CpuImpl,
-    kernel: &crate::Kernel<CpuImpl, WatchdogImpl>,
-    debug_state: HostRuntimeState<CpuImpl, Net, HostFs>,
+    kernel: &crate::Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
+    debug_state: HostRuntimeState<CpuImpl, Net, StorageImpl>,
     read_serial: crate::SerialReader,
     write_serial: crate::DebugSerialWriter,
 ) -> !
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
     WatchdogImpl: Watchdog + Clone,
+    MeasuredBootImpl: MeasuredBoot,
 {
     let component_name = component.name();
     write_serial.emit_stage_marker("boot");
@@ -643,28 +728,28 @@ where
     cpu.shutdown()
 }
 
-struct ProfiledSystemComponentFuture<CpuImpl, Net, HostFs, Fut>
+struct ProfiledSystemComponentFuture<CpuImpl, Net, StorageImpl, Fut>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     inner: Fut,
     cpu: CpuImpl,
-    debug_state: HostRuntimeState<CpuImpl, Net, HostFs>,
+    debug_state: HostRuntimeState<CpuImpl, Net, StorageImpl>,
     stack: String,
 }
 
-impl<CpuImpl, Net, HostFs, Fut> ProfiledSystemComponentFuture<CpuImpl, Net, HostFs, Fut>
+impl<CpuImpl, Net, StorageImpl, Fut> ProfiledSystemComponentFuture<CpuImpl, Net, StorageImpl, Fut>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn new(
         inner: Fut,
         cpu: CpuImpl,
-        debug_state: HostRuntimeState<CpuImpl, Net, HostFs>,
+        debug_state: HostRuntimeState<CpuImpl, Net, StorageImpl>,
         stack: String,
     ) -> Self {
         Self {
@@ -676,11 +761,12 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs, Fut> Future for ProfiledSystemComponentFuture<CpuImpl, Net, HostFs, Fut>
+impl<CpuImpl, Net, StorageImpl, Fut> Future
+    for ProfiledSystemComponentFuture<CpuImpl, Net, StorageImpl, Fut>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
     Fut: Future,
 {
     type Output = Fut::Output;
@@ -702,73 +788,67 @@ where
     }
 }
 
-/// Starts the packet pump for the queue pair this processor owns, when
-/// it owns one.
-///
-/// A queue pair's interrupt is routed to one processor, so the pump
-/// that drains the pair has to be that processor's own task: this is
-/// called from every processor's run loop, before the role dispatch
-/// decides what else the processor does, and `spawn_local_detached`
-/// pins the task to it. The service is installed by a device-discovery
-/// task that may not have run yet, so the task awaits the install
-/// rather than checking and giving up; `run_packet_pump` then resolves
-/// the pair assignment from the topology and either pumps it or
-/// returns.
-fn spawn_network_packet_pump<CpuImpl, Net, HostFs, WatchdogImpl>(
-    kernel: &crate::Kernel<CpuImpl, WatchdogImpl>,
-    debug_state: &HostRuntimeState<CpuImpl, Net, HostFs>,
-) where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
-    WatchdogImpl: Watchdog + Clone,
-{
-    let debug_state = debug_state.clone();
-    kernel.spawn_local_detached(async move {
-        let service = debug_state.wait_for_network_service().await;
-        service
-            .run_packet_pump(helios_hal::cpu::current_processor())
-            .await;
-    });
-}
-
-pub fn run_program_workers_forever<CpuImpl, Net, HostFs, WatchdogImpl>(
+pub fn run_program_workers_forever<CpuImpl, Net, StorageImpl, WatchdogImpl, MeasuredBootImpl>(
     _cpu: CpuImpl,
-    kernel: crate::Kernel<CpuImpl, WatchdogImpl>,
-    debug_state: HostRuntimeState<CpuImpl, Net, HostFs>,
+    kernel: crate::Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
+    debug_state: HostRuntimeState<CpuImpl, Net, StorageImpl>,
 ) -> !
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
     WatchdogImpl: Watchdog + Clone,
+    MeasuredBootImpl: MeasuredBoot,
 {
-    spawn_network_packet_pump(&kernel, &debug_state);
-    kernel.run()
+    // The packet pump has to be this processor's own task, because the
+    // pair it drains has its interrupt routed here; the step owns it and
+    // hands the pair off when the processor goes offline.
+    let network = NetworkStep::start(&kernel, &debug_state);
+    kernel.run_with_steps(&network)
 }
 
-pub fn run_component_host_processor_forever<CpuImpl, Net, HostFs, WatchdogImpl>(
+pub fn run_component_host_processor_forever<
+    CpuImpl,
+    Net,
+    StorageImpl,
+    WatchdogImpl,
+    MeasuredBootImpl,
+>(
     cpu: CpuImpl,
-    kernel: crate::Kernel<CpuImpl, WatchdogImpl>,
-    debug_state: HostRuntimeState<CpuImpl, Net, HostFs>,
+    kernel: crate::Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
+    debug_state: HostRuntimeState<CpuImpl, Net, StorageImpl>,
     read_serial: crate::SerialReader,
     write_serial: crate::DebugSerialWriter,
 ) -> !
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
     WatchdogImpl: Watchdog + Clone,
+    MeasuredBootImpl: MeasuredBoot,
 {
-    spawn_network_packet_pump(&kernel, &debug_state);
+    // Started before the role dispatch decides what else the processor
+    // does: every processor's pump is its own local task. A processor
+    // that goes on to run an embedded component keeps the step alive
+    // for good without lending it to a lifecycle — its component is
+    // pinned local work, so it never goes offline.
+    let network = NetworkStep::start(&kernel, &debug_state);
     let topology = kernel.topology();
+    // Every backend's bootstrap processor reaches here only after starting
+    // its secondaries, and a backend enables its mechanisms on a processor
+    // before `start_processor` returns for it, so the line follows every
+    // processor's enable.
+    if helios_hal::cpu::current_processor() == topology.bootstrap_processor {
+        crate::control_flow::ReturnAddressCoverage::of(&cpu, env!("HELIOS_BUILD_TARGET"))
+            .log(topology.configured_processors);
+    }
     match component_host_processor_role(
         helios_hal::cpu::current_processor(),
         topology.configured_processors,
         topology.bootstrap_processor,
     ) {
         ComponentHostProcessorRole::Kernel => {
-            run_kernel_processor_forever(cpu, kernel, debug_state);
+            run_kernel_processor_forever(cpu, kernel, debug_state, &network);
         }
         ComponentHostProcessorRole::SharedRuntime | ComponentHostProcessorRole::SystemComponent => {
             match debug_state.system_component() {
@@ -789,7 +869,7 @@ where
                     if cfg!(feature = "embedded-debugger") {
                         panic!("embedded init bootfs is missing the system component");
                     }
-                    run_kernel_processor_forever(cpu, kernel, debug_state);
+                    run_kernel_processor_forever(cpu, kernel, debug_state, &network);
                 }
             }
         }
@@ -836,16 +916,18 @@ fn report_fiber_stack_demand_commits<CpuImpl: Cpu>(cpu: &CpuImpl) {
     );
 }
 
-fn run_kernel_processor_forever<CpuImpl, Net, HostFs, WatchdogImpl>(
+fn run_kernel_processor_forever<CpuImpl, Net, StorageImpl, WatchdogImpl, MeasuredBootImpl>(
     cpu: CpuImpl,
-    kernel: crate::Kernel<CpuImpl, WatchdogImpl>,
-    debug_state: HostRuntimeState<CpuImpl, Net, HostFs>,
+    kernel: crate::Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
+    debug_state: HostRuntimeState<CpuImpl, Net, StorageImpl>,
+    network: &NetworkStep<CpuImpl, Net, StorageImpl>,
 ) -> !
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
     WatchdogImpl: Watchdog + Clone,
+    MeasuredBootImpl: MeasuredBoot,
 {
     let processor = helios_hal::cpu::current_processor().id();
     let stack = kernel_processor_profile_stack(processor);
@@ -853,14 +935,16 @@ where
         let progress = if debug_state.profiling_enabled() {
             let started = cpu.now().ticks();
             let counters = cpu.hardware_perf_counters();
-            let stats = kernel.run_until_stalled_with_stats();
+            let stats = kernel.run_until_stalled_with_steps(network);
             let progress = stats.progress_count();
             if progress != 0 {
                 record_executor_metrics(&cpu, &debug_state, &stack, started, counters, stats);
             }
             progress
         } else {
-            kernel.run_until_stalled_with_stats().progress_count()
+            kernel
+                .run_until_stalled_with_steps(network)
+                .progress_count()
         };
 
         if progress != 0 {
@@ -874,9 +958,9 @@ where
     }
 }
 
-fn record_executor_metrics<CpuImpl, Net, HostFs>(
+fn record_executor_metrics<CpuImpl, Net, StorageImpl>(
     cpu: &CpuImpl,
-    debug_state: &HostRuntimeState<CpuImpl, Net, HostFs>,
+    debug_state: &HostRuntimeState<CpuImpl, Net, StorageImpl>,
     stack: &str,
     started: u64,
     counters: helios_hal::cpu::HardwarePerfCounters,
@@ -884,7 +968,7 @@ fn record_executor_metrics<CpuImpl, Net, HostFs>(
 ) where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let progress = stats.progress_count();
     let ended = cpu.now().ticks();
@@ -933,13 +1017,13 @@ fn record_executor_metrics<CpuImpl, Net, HostFs>(
 /// `kernel;executor;idle-poll`, the parked span under
 /// `kernel;executor;idle-parked`, and a hit/miss event so a profile
 /// can weigh IPI-and-halt-exit wakes against polled ones.
-fn record_executor_idle_metrics<CpuImpl, Net, HostFs>(
-    debug_state: &HostRuntimeState<CpuImpl, Net, HostFs>,
+fn record_executor_idle_metrics<CpuImpl, Net, StorageImpl>(
+    debug_state: &HostRuntimeState<CpuImpl, Net, StorageImpl>,
     outcome: crate::IdleOutcome,
 ) where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let (polled_ticks, parked_ticks) = match outcome {
         crate::IdleOutcome::Polled { polled_ticks } => {
@@ -968,14 +1052,14 @@ fn record_executor_idle_metrics<CpuImpl, Net, HostFs>(
     }
 }
 
-fn record_executor_event_metric<CpuImpl, Net, HostFs>(
-    runtime_state: &HostRuntimeState<CpuImpl, Net, HostFs>,
+fn record_executor_event_metric<CpuImpl, Net, StorageImpl>(
+    runtime_state: &HostRuntimeState<CpuImpl, Net, StorageImpl>,
     name: &'static str,
     events: usize,
 ) where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     if events == 0 {
         return;
@@ -997,15 +1081,15 @@ fn usize_to_u64(value: usize, label: &'static str) -> u64 {
     u64::try_from(value).unwrap_or_else(|_| panic!("{label} does not fit into u64"))
 }
 
-fn record_program_kernel_profile<CpuImpl, Net, HostFs>(
-    runtime_state: &HostRuntimeState<CpuImpl, Net, HostFs>,
+fn record_program_kernel_profile<CpuImpl, Net, StorageImpl>(
+    runtime_state: &HostRuntimeState<CpuImpl, Net, StorageImpl>,
     cpu: &CpuImpl,
     phase: &'static str,
     started_ticks: u64,
 ) where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     if runtime_state.profiling_enabled() {
         runtime_state.record_profile_stack_parts(
@@ -1017,8 +1101,8 @@ fn record_program_kernel_profile<CpuImpl, Net, HostFs>(
     }
 }
 
-fn record_named_program_kernel_profile<CpuImpl, Net, HostFs>(
-    runtime_state: &HostRuntimeState<CpuImpl, Net, HostFs>,
+fn record_named_program_kernel_profile<CpuImpl, Net, StorageImpl>(
+    runtime_state: &HostRuntimeState<CpuImpl, Net, StorageImpl>,
     cpu: &CpuImpl,
     phase: &'static str,
     name: &str,
@@ -1026,7 +1110,7 @@ fn record_named_program_kernel_profile<CpuImpl, Net, HostFs>(
 ) where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     if runtime_state.profiling_enabled() {
         let mut stack = String::with_capacity("kernel;program;;".len() + phase.len() + name.len());
@@ -1042,27 +1126,27 @@ fn record_named_program_kernel_profile<CpuImpl, Net, HostFs>(
     }
 }
 
-struct ProgramKernelProfile<CpuImpl, Net, HostFs>
+struct ProgramKernelProfile<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    runtime_state: HostRuntimeState<CpuImpl, Net, HostFs>,
+    runtime_state: HostRuntimeState<CpuImpl, Net, StorageImpl>,
     cpu: CpuImpl,
     started_ticks: u64,
     counters: helios_hal::cpu::HardwarePerfCounters,
     started_heap: crate::HeapStats,
 }
 
-fn start_program_kernel_profile<CpuImpl, Net, HostFs>(
-    runtime_state: &HostRuntimeState<CpuImpl, Net, HostFs>,
+fn start_program_kernel_profile<CpuImpl, Net, StorageImpl>(
+    runtime_state: &HostRuntimeState<CpuImpl, Net, StorageImpl>,
     cpu: &CpuImpl,
-) -> Option<ProgramKernelProfile<CpuImpl, Net, HostFs>>
+) -> Option<ProgramKernelProfile<CpuImpl, Net, StorageImpl>>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     runtime_state
         .profiling_enabled()
@@ -1075,13 +1159,13 @@ where
         })
 }
 
-fn record_program_kernel_profile_sample<CpuImpl, Net, HostFs>(
-    profile: Option<ProgramKernelProfile<CpuImpl, Net, HostFs>>,
+fn record_program_kernel_profile_sample<CpuImpl, Net, StorageImpl>(
+    profile: Option<ProgramKernelProfile<CpuImpl, Net, StorageImpl>>,
     phase: &'static str,
 ) where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     if let Some(profile) = profile {
         let ended_ticks = profile.cpu.now().ticks();
@@ -1143,8 +1227,8 @@ fn record_program_kernel_profile_sample<CpuImpl, Net, HostFs>(
     }
 }
 
-fn record_program_heap_delta<CpuImpl, Net, HostFs>(
-    runtime_state: &HostRuntimeState<CpuImpl, Net, HostFs>,
+fn record_program_heap_delta<CpuImpl, Net, StorageImpl>(
+    runtime_state: &HostRuntimeState<CpuImpl, Net, StorageImpl>,
     phase: &'static str,
     kind: &'static str,
     events: u64,
@@ -1152,7 +1236,7 @@ fn record_program_heap_delta<CpuImpl, Net, HostFs>(
 ) where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     if events == 0 && bytes == 0 {
         return;
@@ -1176,11 +1260,11 @@ fn record_program_heap_delta<CpuImpl, Net, HostFs>(
     );
 }
 
-impl<CpuImpl, Net, HostFs> UserProgramService<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> UserProgramService<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     /// Preempts every guest, on any processor, that has held its
     /// processor for at least one [`crate::GUEST_TIME_SLICE`].
@@ -1193,6 +1277,17 @@ where
             .engine
             .interrupts()
             .preempt_overdue(self.inner.clock_cpu.now());
+    }
+
+    /// Interrupts every guest that is running on any processor now,
+    /// however long it has run: what a freeze passes as its
+    /// `interrupt_guests`, so a processor inside wasm reaches a
+    /// scheduler boundary at its next check.
+    ///
+    /// Like [`Self::preempt_overdue_guests`] it takes no lock, allocates
+    /// nothing and sends no IPI.
+    pub fn interrupt_running_guests(&self) {
+        self.inner.engine.interrupts().interrupt_running();
     }
 
     /// Interrupts every store of `instance`, so a kill whose flag is set
@@ -1212,19 +1307,20 @@ where
     /// future resolving with its exit status.
     pub(super) async fn spawn(
         &self,
-        exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
+        compile: &CompileAuthority,
+        exec_context: ProgramExecContext<CpuImpl, Net, StorageImpl>,
         source: ProgramSource,
         hint: Option<AotCompileHint>,
-        launch: ProgramLaunch<Net>,
+        launch: ProgramLaunch<Net, StorageImpl>,
     ) -> Result<ChildHandle, ProgramExecError> {
         super::emit_program_stage_marker(exec_context.write_serial, "program:spawn-begin");
         let executable = self
             .load_executable(
+                compile,
                 &exec_context,
                 launch.argv.program_name(),
                 &source,
                 hint,
-                exec_context.write_serial,
                 &launch.timeline,
             )
             .await?;
@@ -1238,21 +1334,21 @@ where
     /// rather than at every call site.
     async fn spawn_with_output_mode(
         &self,
-        exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
+        compile: &CompileAuthority,
+        exec_context: ProgramExecContext<CpuImpl, Net, StorageImpl>,
         source: ProgramSource,
-        hint: Option<AotCompileHint>,
-        mut launch: ProgramLaunch<Net>,
+        mut launch: ProgramLaunch<Net, StorageImpl>,
         output_mode: OutputMode,
         stdio: ChildStdio,
     ) -> Result<ChildHandle, ProgramExecError> {
         super::emit_program_stage_marker(exec_context.write_serial, "program:spawn-begin");
         let executable = self
             .load_executable(
+                compile,
                 &exec_context,
                 launch.argv.program_name(),
                 &source,
-                hint,
-                exec_context.write_serial,
+                None,
                 &launch.timeline,
             )
             .await?;
@@ -1264,9 +1360,9 @@ where
 
     fn spawn_loaded(
         &self,
-        exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
-        executable: ProgramExecutable<CpuImpl, Net, HostFs>,
-        launch: ProgramLaunch<Net>,
+        exec_context: ProgramExecContext<CpuImpl, Net, StorageImpl>,
+        executable: ProgramExecutable<CpuImpl, Net, StorageImpl>,
+        launch: ProgramLaunch<Net, StorageImpl>,
     ) -> Result<ChildHandle, ProgramExecError> {
         let (stdin_writer, stdin_reader) = crate::byte_channel();
         let (stdout_writer, stdout_reader) = crate::byte_channel();
@@ -1290,9 +1386,9 @@ where
 
     fn spawn_loaded_with_output_mode(
         &self,
-        exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
-        executable: ProgramExecutable<CpuImpl, Net, HostFs>,
-        launch: ProgramLaunch<Net>,
+        exec_context: ProgramExecContext<CpuImpl, Net, StorageImpl>,
+        executable: ProgramExecutable<CpuImpl, Net, StorageImpl>,
+        launch: ProgramLaunch<Net, StorageImpl>,
         output_mode: OutputMode,
         stdio: ChildStdio,
     ) -> Result<ChildHandle, ProgramExecError> {
@@ -1337,7 +1433,7 @@ where
         // executor capacity the kernel needs for its own tasks.
         let spawner = exec_context
             .spawner
-            .instance_spawner(crate::TaskFunding::Instance);
+            .instance_spawner(crate::TaskFunding::Instance, &launched_instance);
         let run_spawner = spawner.clone();
         let progress = spawner.progress_counter();
 
@@ -1400,32 +1496,34 @@ where
     /// along with the exit code.
     pub(super) async fn exec_buffered(
         &self,
-        exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
+        compile: &CompileAuthority,
+        exec_context: ProgramExecContext<CpuImpl, Net, StorageImpl>,
         source: ProgramSource,
         hint: Option<AotCompileHint>,
         stdin: Vec<u8>,
-        launch: ProgramLaunch<Net>,
+        launch: ProgramLaunch<Net, StorageImpl>,
     ) -> Result<ExecResult, ProgramExecError> {
-        self.exec_buffered_with_snapshot(exec_context, source, hint, stdin, launch)
+        self.exec_buffered_with_snapshot(compile, exec_context, source, hint, stdin, launch)
             .await
             .map(|(result, _)| result)
     }
 
     async fn exec_buffered_with_snapshot(
         &self,
-        exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
+        compile: &CompileAuthority,
+        exec_context: ProgramExecContext<CpuImpl, Net, StorageImpl>,
         source: ProgramSource,
         hint: Option<AotCompileHint>,
         stdin: Vec<u8>,
-        launch: ProgramLaunch<Net>,
-    ) -> Result<(ExecResult, Option<DebugFileSystemSnapshot>), ProgramExecError> {
+        launch: ProgramLaunch<Net, StorageImpl>,
+    ) -> Result<(ExecResult, Option<MemoryFs>), ProgramExecError> {
         let executable = self
             .load_executable(
+                compile,
                 &exec_context,
                 launch.argv.program_name(),
                 &source,
                 hint,
-                exec_context.write_serial,
                 &launch.timeline,
             )
             .await?;
@@ -1435,11 +1533,11 @@ where
 
     async fn exec_loaded_buffered(
         &self,
-        exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
-        executable: ProgramExecutable<CpuImpl, Net, HostFs>,
+        exec_context: ProgramExecContext<CpuImpl, Net, StorageImpl>,
+        executable: ProgramExecutable<CpuImpl, Net, StorageImpl>,
         stdin: Vec<u8>,
-        launch: ProgramLaunch<Net>,
-    ) -> Result<(ExecResult, Option<DebugFileSystemSnapshot>), ProgramExecError> {
+        launch: ProgramLaunch<Net, StorageImpl>,
+    ) -> Result<(ExecResult, Option<MemoryFs>), ProgramExecError> {
         let mut child = self.spawn_loaded(exec_context, executable, launch)?;
 
         // Feed stdin in one shot, then close the writer to signal EOF.
@@ -1489,24 +1587,31 @@ where
 
     pub(crate) async fn aot(
         &self,
-        exec_context: &ProgramExecContext<CpuImpl, Net, HostFs>,
+        compile: &CompileAuthority,
+        exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
         wasm: &Bytes,
         hint: AotCompileHint,
         profile: bool,
-    ) -> Result<Vec<u8>, ProgramExecError> {
-        self.compile_raw_component_to_signed_artifact(exec_context, wasm, hint, profile)
-            .await
+    ) -> Result<AotArtifact, ProgramExecError> {
+        let signed = self
+            .compile_raw_component_to_signed_artifact(compile, exec_context, wasm, hint, profile)
+            .await?;
+        Ok(AotArtifact {
+            signed,
+            worker_threads: compiler_plugin_worker_threads(&exec_context.cpu),
+        })
     }
 
     async fn load_executable(
         &self,
-        exec_context: &ProgramExecContext<CpuImpl, Net, HostFs>,
+        compile: &CompileAuthority,
+        exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
         program: &str,
         source: &ProgramSource,
         hint: Option<AotCompileHint>,
-        write_serial: crate::DebugSerialWriter,
         timeline: &phases::Timeline,
-    ) -> Result<ProgramExecutable<CpuImpl, Net, HostFs>, ProgramExecError> {
+    ) -> Result<ProgramExecutable<CpuImpl, Net, StorageImpl>, ProgramExecError> {
+        let write_serial = exec_context.write_serial;
         let started_at = monotonic_nanos(&self.inner.clock_cpu);
         timeline.record(&self.inner.clock_cpu, LaunchPhase::LoadBegin);
         let payload = match source {
@@ -1517,7 +1622,7 @@ where
                         detail: ProgramExecErrorDetail::HintNotAllowedForPrecompiledArtifact,
                     });
                 }
-                trusted_signed_payload(bytes)?
+                trusted_signed_payload(bytes, &self.inner.cwasm_signing_key)?
             }
             ProgramSource::BootfsArtifact(bytes) => {
                 if hint.is_some() {
@@ -1526,17 +1631,23 @@ where
                         detail: ProgramExecErrorDetail::HintNotAllowedForPrecompiledArtifact,
                     });
                 }
-                trusted_bootfs_payload(bytes)?
+                trusted_bootfs_payload(bytes)
             }
             ProgramSource::RawWasm(wasm) => {
                 let _profile = artifact_profile::classify_raw_wasm(wasm)
                     .map_err(map_artifact_profile_error)?;
                 let hint = hint.unwrap_or(AotCompileHint::Performance);
                 let signed = self
-                    .compile_raw_component_to_signed_artifact(exec_context, wasm, hint, false)
+                    .compile_raw_component_to_signed_artifact(
+                        compile,
+                        exec_context,
+                        wasm,
+                        hint,
+                        false,
+                    )
                     .await?;
                 let signed = Bytes::from(signed);
-                trusted_signed_payload(&signed)?
+                trusted_signed_payload(&signed, &self.inner.cwasm_signing_key)?
             }
         };
         timeline.record(&self.inner.clock_cpu, LaunchPhase::ArtifactTrust);
@@ -1553,7 +1664,7 @@ where
         write_serial: crate::DebugSerialWriter,
         started_at: u64,
         timeline: &phases::Timeline,
-    ) -> Result<ProgramExecutable<CpuImpl, Net, HostFs>, ProgramExecError> {
+    ) -> Result<ProgramExecutable<CpuImpl, Net, StorageImpl>, ProgramExecError> {
         match WasmtimePrecompiledKind::detect(&payload) {
             Some(WasmtimePrecompiledKind::Component) => self
                 .load_precompiled_component(program, payload, write_serial, started_at, timeline)
@@ -1575,7 +1686,7 @@ where
         write_serial: crate::DebugSerialWriter,
         started_at: u64,
         timeline: &phases::Timeline,
-    ) -> Result<PreparedComponent<CpuImpl, Net, HostFs>, ProgramExecError> {
+    ) -> Result<PreparedComponent<CpuImpl, Net, StorageImpl>, ProgramExecError> {
         let cached = self.inner.component_cache.lock().get(&payload);
         timeline.record_hit(
             &self.inner.clock_cpu,
@@ -1750,12 +1861,13 @@ where
 
     async fn compile_raw_component_to_signed_artifact(
         &self,
-        exec_context: &ProgramExecContext<CpuImpl, Net, HostFs>,
+        _: &CompileAuthority,
+        exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
         wasm: &Bytes,
         hint: AotCompileHint,
         profile: bool,
     ) -> Result<Vec<u8>, ProgramExecError> {
-        let mut phases = CompilerPhaseTimestamps {
+        let phases = CompilerPhaseTimestamps {
             processor: if profile {
                 helios_hal::cpu::current_processor().id()
             } else {
@@ -1769,25 +1881,102 @@ where
             ..CompilerPhaseTimestamps::default()
         };
         let compiler_artifact = self.read_compiler_plugin_artifact(exec_context)?;
-        let compiler_payload = trusted_bootfs_payload(&compiler_artifact)?;
-        let (payload, thread_reports) = self
-            .invoke_compiler_core_module(
-                exec_context,
-                compiler_payload,
-                wasm,
-                hint,
-                profile,
-                &mut phases,
-            )
-            .await?;
-        let signed =
-            cwasm::sign_trusted_artifact_payload(&payload).map_err(map_artifact_trust_error)?;
+        let job = CompileJob {
+            compiler_payload: trusted_bootfs_payload(&compiler_artifact),
+            wasm: wasm.clone(),
+            hint,
+            profile,
+        };
+        // The compile runs in a task of its own, whichever route asked for
+        // it, and this call holds only the receiving half of its reply: the
+        // compile outlives a requester that stops waiting, and stops itself
+        // when that happens (`run_compile_session`).
+        let (reply, artifact) = futures::channel::oneshot::channel();
+        exec_context.spawner.spawn_detached({
+            let service = self.clone();
+            let exec_context = exec_context.clone();
+            async move {
+                service
+                    .compile_session(&exec_context, job, phases, reply)
+                    .await;
+            }
+        });
+        match artifact.await {
+            Ok(result) => result,
+            Err(_) => Err(ProgramExecError {
+                kind: ProgramExecErrorKind::Internal,
+                detail: ProgramExecErrorDetail::CompileSessionEnded,
+            }),
+        }
+    }
+
+    /// The compile session task: waits for the compile slot, runs the compile
+    /// with the slot held until every worker is joined, condemns the compile
+    /// if its requester leaves, and replies with the signed artifact.
+    async fn compile_session(
+        &self,
+        exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
+        job: CompileJob,
+        phases: CompilerPhaseTimestamps,
+        reply: futures::channel::oneshot::Sender<Result<Vec<u8>, ProgramExecError>>,
+    ) {
+        let profile = job.profile;
+        run_compile_session(
+            &self.inner.compile_slot,
+            reply,
+            || {
+                let started_at = exec_context
+                    .runtime_state
+                    .uptime_nanos(exec_context.cpu.now().ticks());
+                let instance = exec_context.instance_registry.register_with_policy(
+                    "compiler-plugin",
+                    started_at,
+                    crate::OomPolicy::KernelPlugin,
+                );
+                let condemn = {
+                    let registry = exec_context.instance_registry.clone();
+                    let interrupts = self.inner.engine.interrupts().clone();
+                    let cpu = exec_context.cpu.clone();
+                    let runtime_state = exec_context.runtime_state.clone();
+                    let id = instance.id();
+                    move || {
+                        condemn_compile(
+                            &registry,
+                            &interrupts,
+                            id,
+                            crate::KillReason::RequesterGone,
+                            runtime_state.uptime_nanos(cpu.now().ticks()),
+                        );
+                    }
+                };
+                (
+                    condemn,
+                    self.run_compile(exec_context, job, instance, phases),
+                )
+            },
+            |end| self.sign_compiled(exec_context, profile, end),
+        )
+        .await;
+    }
+
+    /// Signs what a finished compile produced with this boot's key and
+    /// reports its phases.
+    fn sign_compiled(
+        &self,
+        exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
+        profile: bool,
+        end: CompileEnd,
+    ) -> Result<Vec<u8>, ProgramExecError> {
+        let CompileEnd { result, mut phases } = end;
+        let (payload, thread_reports) = result?;
+        let signed = cwasm::sign_artifact_payload(&payload, &self.inner.cwasm_signing_key)
+            .map_err(map_artifact_trust_error)?;
         phases.signed_ns = if profile {
             monotonic_nanos(&exec_context.cpu)
         } else {
             0
         };
-        cwasm::verify_signed_artifact(UntrustedCwasm::new(&signed))
+        cwasm::verify_signed_artifact(UntrustedCwasm::new(&signed), &self.inner.cwasm_signing_key)
             .map_err(map_artifact_trust_error)?;
         phases.verified_ns = if profile {
             monotonic_nanos(&exec_context.cpu)
@@ -1805,25 +1994,46 @@ where
         Ok(signed)
     }
 
-    async fn invoke_compiler_core_module(
+    /// The compile proper, run with the compile slot held: the plugin's call,
+    /// then the join of every worker task the plugin spawned, so the slot is
+    /// never released while one still runs on the plugin's memory.
+    async fn run_compile(
         &self,
-        exec_context: &ProgramExecContext<CpuImpl, Net, HostFs>,
-        compiler_payload: Bytes,
-        wasm: &Bytes,
-        hint: AotCompileHint,
-        profile: bool,
-        phases: &mut CompilerPhaseTimestamps,
-    ) -> Result<(Vec<u8>, CompilerThreadReports), ProgramExecError> {
-        let _compile_guard = self.acquire_compiler_compile_slot().await;
+        exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
+        job: CompileJob,
+        instance: crate::RegisteredInstance,
+        mut phases: CompilerPhaseTimestamps,
+    ) -> CompileEnd {
+        let CompileJob {
+            compiler_payload,
+            wasm,
+            hint,
+            profile,
+        } = job;
         phases.slot_acquired_ns = if profile {
             monotonic_nanos(&exec_context.cpu)
         } else {
             0
         };
         let result = self
-            .invoke_compiler_inner(exec_context, &compiler_payload, wasm, hint, profile, phases)
+            .invoke_compiler_inner(
+                exec_context,
+                &compiler_payload,
+                instance,
+                CompileRequest {
+                    wasm: &wasm,
+                    guest_isa: self.inner.guest_isa,
+                    hint,
+                    profile,
+                },
+                &mut phases,
+            )
             .await;
-        let thread_reports = self.await_compiler_thread_tasks().await;
+        // A failure of the main thread has condemned the compile
+        // (`end_main_part`), so the workers parked in the pool end and are
+        // joined; the first trap's error is the one reported.
+        let mut thread_reports = self.await_compiler_thread_tasks().await;
+        let result = first_trap_wins(result, &mut thread_reports);
         phases.tasks_joined_ns = if profile {
             monotonic_nanos(&exec_context.cpu)
         } else {
@@ -1844,27 +2054,9 @@ where
             );
             *self.inner.compiler_plugin.lock() = None;
         }
-        result.map(|payload| (payload, thread_reports))
-    }
-
-    async fn acquire_compiler_compile_slot(&self) -> CompilerCompileSlot<'_> {
-        loop {
-            if self
-                .inner
-                .compile_in_progress
-                .compare_exchange(
-                    false,
-                    true,
-                    AtomicOrdering::Acquire,
-                    AtomicOrdering::Relaxed,
-                )
-                .is_ok()
-            {
-                return CompilerCompileSlot {
-                    occupied: &self.inner.compile_in_progress,
-                };
-            }
-            crate::yield_now().await;
+        CompileEnd {
+            result: result.map(|payload| (payload, thread_reports)),
+            phases,
         }
     }
 
@@ -1897,55 +2089,70 @@ where
 
     async fn invoke_compiler_inner(
         &self,
-        exec_context: &ProgramExecContext<CpuImpl, Net, HostFs>,
+        exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
         compiler_payload: &Bytes,
-        wasm: &Bytes,
-        hint: AotCompileHint,
-        profile: bool,
+        compiler_instance: crate::RegisteredInstance,
+        request: CompileRequest<'_>,
         phases: &mut CompilerPhaseTimestamps,
     ) -> Result<Vec<u8>, ProgramExecError> {
-        let (plugin, plugin_cached) =
-            self.ensure_compiler_plugin(exec_context, compiler_payload)?;
+        let profile = request.profile;
+        let (plugin, plugin_cached) = self
+            .ensure_compiler_plugin(exec_context, compiler_payload)
+            .await?;
         phases.plugin_cached = plugin_cached;
         phases.plugin_ready_ns = if profile {
             monotonic_nanos(&exec_context.cpu)
         } else {
             0
         };
-        let engine = self.inner.engine.raw();
-        let started_at = exec_context
-            .runtime_state
-            .uptime_nanos(exec_context.cpu.now().ticks());
-        let compiler_instance = exec_context.instance_registry.register_with_policy(
-            "compiler-plugin",
-            started_at,
-            crate::OomPolicy::KernelPlugin,
-        );
-        let store_data = CompilerCoreStore {
+        let context = CompilerCompileContext {
             cpu: exec_context.cpu.clone(),
             spawner: exec_context.spawner.clone(),
             runtime_state: exec_context.runtime_state.clone(),
-            instance: Arc::new(compiler_instance),
+            instance: compiler_instance,
+            registry: exec_context.instance_registry.clone(),
             shared: plugin.shared.clone(),
-            preview1_descriptors: CompilerPreview1Descriptors::new(),
             write_serial: exec_context.write_serial,
             _marker: core::marker::PhantomData,
         };
+        // The main thread's part ends here, before the workers are joined, so
+        // a failure condemns the compile while they can still be ended.
+        let result = self
+            .run_main_thread(exec_context, &plugin, context.clone(), request, phases)
+            .await;
+        context.end_main_part(result)
+    }
+
+    /// The compile's main thread: its store, the plugin's initialisation and
+    /// the `compile` call, whose rayon workers run on stores of their own.
+    async fn run_main_thread(
+        &self,
+        exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
+        plugin: &CompilerPluginHandle<CpuImpl, Net, StorageImpl>,
+        context: CompilerCompileContext<CpuImpl, Net, StorageImpl>,
+        request: CompileRequest<'_>,
+        phases: &mut CompilerPhaseTimestamps,
+    ) -> Result<Vec<u8>, ProgramExecError> {
+        let profile = request.profile;
+        let engine = self.inner.engine.raw();
+        let store_data = CompilerCoreStore::new(context);
         let mut store = wasmtime::Store::new(engine, store_data);
-        let _interrupts = configure_compiler_core_store(&mut store);
-        let instance = plugin
-            .instance_pre
-            .instantiate_async(&mut store)
+        let drive = configure_compiler_core_store(&mut store);
+        let instance = drive
+            .instantiate(&mut store, &plugin.instance_pre)
             .await
             .map_err(map_program_runtime_error)?;
         let tls_base = plugin.main_thread_tls_base;
         set_compiler_tls_base(&mut store, &instance, tls_base)?;
-        let pthread_self_offset = instance
-            .get_typed_func::<(), i32>(&mut store, HELIOS_COMPILER_PTHREAD_SELF_OFFSET)
-            .map_err(map_program_runtime_error)?
-            .call_async(&mut store, ())
-            .await
-            .map_err(map_program_runtime_error)? as u32;
+        let pthread_self_offset = {
+            let pthread_self_offset = instance
+                .get_typed_func::<(), i32>(&mut store, HELIOS_COMPILER_PTHREAD_SELF_OFFSET)
+                .map_err(map_program_runtime_error)?;
+            drive
+                .call(&mut store, &pthread_self_offset, ())
+                .await
+                .map_err(map_program_runtime_error)? as u32
+        };
         let thread_pointer = tls_base
             .checked_add(pthread_self_offset)
             .ok_or(ProgramExecError {
@@ -1955,137 +2162,169 @@ where
         let initialize = instance
             .get_typed_func::<i32, ()>(&mut store, HELIOS_COMPILER_INITIALIZE)
             .map_err(map_program_runtime_error)?;
-        initialize
-            .call_async(&mut store, thread_pointer as i32)
+        drive
+            .call(&mut store, &initialize, thread_pointer as i32)
             .await
             .map_err(map_program_runtime_error)?;
-        let alloc = instance
-            .get_typed_func::<(i32, i32), i32>(&mut store, HELIOS_COMPILER_ALLOC)
-            .map_err(map_program_runtime_error)?;
-        let compile = instance
-            .get_typed_func::<(i32, i32), i32>(&mut store, HELIOS_COMPILER_COMPILE)
-            .map_err(map_program_runtime_error)?;
+        let exports = CompilerExports {
+            alloc: instance
+                .get_typed_func::<(i32, i32), i32>(&mut store, HELIOS_COMPILER_ALLOC)
+                .map_err(map_program_runtime_error)?,
+            free: instance
+                .get_typed_func::<(i32, i32, i32), ()>(&mut store, HELIOS_COMPILER_FREE)
+                .map_err(map_program_runtime_error)?,
+            compile: instance
+                .get_typed_func::<(i32, i32), i32>(&mut store, HELIOS_COMPILER_COMPILE)
+                .map_err(map_program_runtime_error)?,
+            outstanding: instance
+                .get_typed_func::<(), i32>(&mut store, HELIOS_COMPILER_OUTSTANDING_BYTES)
+                .map_err(map_program_runtime_error)?,
+        };
         phases.instantiated_ns = if profile {
             monotonic_nanos(&exec_context.cpu)
         } else {
             0
         };
-        let target = env!("HELIOS_BUILD_TARGET").as_bytes();
-        let wasm_ptr = compiler_alloc(&mut store, &alloc, wasm.len(), 1).await?;
-        let target_ptr = compiler_alloc(&mut store, &alloc, target.len(), 1).await?;
-        let request_ptr = compiler_alloc(
+        let outstanding_before =
+            compiler_outstanding_bytes(&drive, &mut store, &exports.outstanding).await?;
+        let mut allocations = CompilerAllocations::new();
+        let outcome = Self::call_compiler(
+            &drive,
             &mut store,
-            &alloc,
-            core::mem::size_of::<CompilerRequestHeader>(),
-            core::mem::align_of::<CompilerRequestHeader>(),
+            &exports,
+            &mut allocations,
+            request,
+            phases,
         )
-        .await?;
-        write_shared_memory(store.data().memory(), wasm_ptr, wasm)?;
-        write_shared_memory(store.data().memory(), target_ptr, target)?;
+        .await;
+        // A call into the plugin that failed leaves its allocator in an
+        // unknown state, so nothing is freed and the memory dies with the
+        // runtime; every other end returns the call's allocations. A release
+        // that fails, or leaves the plugin's count off its starting level,
+        // comes before the compile's own result: it says the plugin's memory
+        // can no longer be trusted, which is what discards the runtime.
+        let result = outcome?;
+        allocations
+            .release(&drive, &mut store, &exports.free)
+            .await?;
+        let outstanding_after =
+            compiler_outstanding_bytes(&drive, &mut store, &exports.outstanding).await?;
+        ensure_compiler_buffers_returned(outstanding_before, outstanding_after)?;
+        result
+    }
+
+    /// Runs one compile against the plugin instance: allocates the request,
+    /// calls `compile`, and copies the response out. The caller owns
+    /// `allocations` and releases them according to the returned
+    /// [`CompilerCallOutcome`].
+    async fn call_compiler(
+        drive: &CompilerStoreDrive<CpuImpl>,
+        store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, StorageImpl>>,
+        exports: &CompilerExports,
+        allocations: &mut CompilerAllocations,
+        request: CompileRequest<'_>,
+        phases: &mut CompilerPhaseTimestamps,
+    ) -> CompilerCallOutcome {
+        let CompileRequest {
+            wasm,
+            guest_isa,
+            hint,
+            profile,
+        } = request;
+        let target = guest_isa.compile_target();
+        let isa_level = target.level().name().as_bytes();
+        let target = target.triple().as_bytes();
+        let wasm_ptr = allocations
+            .alloc(drive, &mut *store, &exports.alloc, wasm.len(), 1)
+            .await?;
+        let target_ptr = allocations
+            .alloc(drive, &mut *store, &exports.alloc, target.len(), 1)
+            .await?;
+        let isa_level_ptr = allocations
+            .alloc(drive, &mut *store, &exports.alloc, isa_level.len(), 1)
+            .await?;
+        let request_ptr = allocations
+            .alloc(
+                drive,
+                &mut *store,
+                &exports.alloc,
+                CompilerRequestHeader::SIZE,
+                CompilerRequestHeader::ALIGN,
+            )
+            .await?;
+        // From here to the response, only host-side work can fail apart from
+        // the `compile` call itself, so a failure is the inner `Err`.
         let header = CompilerRequestHeader {
             abi_version: HELIOS_COMPILER_ABI_VERSION,
-            hint: match hint {
-                AotCompileHint::Fast => CompilerAbiHint::Fast,
+            hint: u32::from(match hint {
                 AotCompileHint::Balanced => CompilerAbiHint::Balanced,
                 AotCompileHint::Performance => CompilerAbiHint::Performance,
-            },
+            }),
             wasm_ptr,
             wasm_len: wasm.len() as u32,
             target_ptr,
             target_len: target.len() as u32,
+            isa_level_ptr,
+            isa_level_len: isa_level.len() as u32,
             flags: if profile {
                 helios_compiler_abi::HELIOS_COMPILER_REQUEST_PROFILE
             } else {
                 0
             },
         };
-        write_shared_memory(store.data().memory(), request_ptr, unsafe {
-            core::slice::from_raw_parts(
-                core::ptr::addr_of!(header).cast::<u8>(),
-                core::mem::size_of::<CompilerRequestHeader>(),
-            )
-        })?;
+        // The instance is off every processor between its calls, so the
+        // request is written during one of its turns (`in_guest_turn`).
+        let memory = Preview1AsyncMemory::of_shared(store.data().memory());
+        let written = in_guest_turn(store.data().guest_turns(), async {
+            memory
+                .write_bytes(GuestAddress::wasm32(wasm_ptr), wasm)
+                .await?;
+            memory
+                .write_bytes(GuestAddress::wasm32(target_ptr), target)
+                .await?;
+            memory
+                .write_bytes(GuestAddress::wasm32(isa_level_ptr), isa_level)
+                .await?;
+            memory
+                .write_bytes(GuestAddress::wasm32(request_ptr), &header.to_bytes())
+                .await
+        })
+        .await;
+        if let Err(error) = written {
+            return Ok(Err(error));
+        }
         phases.input_done_ns = if profile {
-            monotonic_nanos(&exec_context.cpu)
+            monotonic_nanos(&store.data().context.cpu)
         } else {
             0
         };
         phases.compile_started_ns = if profile {
-            monotonic_nanos(&exec_context.cpu)
+            monotonic_nanos(&store.data().context.cpu)
         } else {
             0
         };
-        let compile_started = store.data().cpu.now().ticks();
-        let response_ptr = compile
-            .call_async(
-                &mut store,
-                (
-                    request_ptr as i32,
-                    core::mem::size_of::<CompilerRequestHeader>() as i32,
-                ),
+        let response_ptr = drive
+            .call(
+                &mut *store,
+                &exports.compile,
+                (request_ptr as i32, CompilerRequestHeader::SIZE as i32),
             )
             .await;
         phases.compile_returned_ns = if profile {
-            monotonic_nanos(&exec_context.cpu)
+            monotonic_nanos(&store.data().context.cpu)
         } else {
             0
         };
-        let compile_elapsed = store
-            .data()
-            .cpu
-            .now()
-            .ticks()
-            .saturating_sub(compile_started);
-        store.data().record_user_ticks(compile_elapsed);
         let response_ptr = response_ptr.map_err(map_program_runtime_error)? as u32;
-        let response = read_compiler_response(store.data().memory(), response_ptr)?;
-        if response.abi_version != HELIOS_COMPILER_ABI_VERSION {
-            return Err(ProgramExecError {
-                kind: ProgramExecErrorKind::InvalidBinary,
-                detail: ProgramExecErrorDetail::CompilerAbiMismatch,
-            });
-        }
-        let diagnostic = read_shared_memory(
-            store.data().memory(),
-            response.diagnostic_ptr,
-            response.diagnostic_len,
-        )?;
-        if response.status != CompilerStatus::Ok {
-            if !diagnostic.is_empty() {
-                tracing::error!(
-                    diagnostic = %core::str::from_utf8(&diagnostic).unwrap_or("<non-utf8 compiler diagnostic>"),
-                    "compiler plugin rejected input"
-                );
-            }
-            return Err(ProgramExecError {
-                kind: ProgramExecErrorKind::InvalidBinary,
-                detail: ProgramExecErrorDetail::CompilerRejectedInput,
-            });
-        }
-        if !diagnostic.is_empty() {
-            store.data().write_serial.emit(&diagnostic);
-        }
-        phases.diagnostic_done_ns = if profile {
-            monotonic_nanos(&exec_context.cpu)
-        } else {
-            0
-        };
-        let output = read_shared_memory(
-            store.data().memory(),
-            response.precompiled_ptr,
-            response.precompiled_len,
-        )?;
-        phases.response_done_ns = if profile {
-            monotonic_nanos(&exec_context.cpu)
-        } else {
-            0
-        };
-        Ok(output)
+        Ok(
+            accept_compiler_response(store.data(), allocations, response_ptr, profile, phases)
+                .await,
+        )
     }
 
     fn read_compiler_plugin_artifact(
         &self,
-        exec_context: &ProgramExecContext<CpuImpl, Net, HostFs>,
+        exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
     ) -> Result<BootfsBytes, ProgramExecError> {
         self.inner
             .compiler_artifact
@@ -2100,14 +2339,19 @@ where
     /// it forever after. The cached `wasmtime::Module`, `InstancePre`
     /// and 512 MiB `SharedMemory` are stable across calls; per-call work
     /// drops to a fresh `wasmtime::Store` and `instance_pre.instantiate`.
-    fn ensure_compiler_plugin(
+    ///
+    /// Called only with the compile slot held, which is what makes the
+    /// build exclusive: nothing else builds or discards the cached runtime
+    /// between the check below and the store at the end, so the cache's
+    /// lock is never held across the build's awaits.
+    async fn ensure_compiler_plugin(
         &self,
-        exec_context: &ProgramExecContext<CpuImpl, Net, HostFs>,
+        exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
         compiler_payload: &Bytes,
-    ) -> Result<(CompilerPluginHandle<CpuImpl, Net, HostFs>, bool), ProgramExecError> {
-        let mut slot = self.inner.compiler_plugin.lock();
-        if let Some(plugin) = slot.as_ref() {
-            return Ok((plugin.clone(), true));
+    ) -> Result<(CompilerPluginHandle<CpuImpl, Net, StorageImpl>, bool), ProgramExecError> {
+        let cached = self.inner.compiler_plugin.lock().clone();
+        if let Some(plugin) = cached {
+            return Ok((plugin, true));
         }
 
         // The compiler plugin is a precompiled core module; a component
@@ -2147,7 +2391,7 @@ where
             thread_tasks: Mutex::new(Vec::new()),
             interrupts: self.inner.engine.interrupts().clone(),
         });
-        let mut linker: CoreLinker<CompilerCoreStore<CpuImpl, Net, HostFs>> =
+        let mut linker: CoreLinker<CompilerCoreStore<CpuImpl, Net, StorageImpl>> =
             CoreLinker::new(engine);
         add_compiler_core_imports(&mut linker, shared_memory.clone())?;
 
@@ -2164,16 +2408,16 @@ where
             scratch_started_at,
             crate::OomPolicy::KernelPlugin,
         );
-        let scratch_store_data = CompilerCoreStore {
+        let scratch_store_data = CompilerCoreStore::new(CompilerCompileContext {
             cpu: exec_context.cpu.clone(),
             spawner: exec_context.spawner.clone(),
             runtime_state: exec_context.runtime_state.clone(),
-            instance: Arc::new(scratch_instance),
+            instance: scratch_instance,
+            registry: exec_context.instance_registry.clone(),
             shared: shared.clone(),
-            preview1_descriptors: CompilerPreview1Descriptors::new(),
             write_serial: exec_context.write_serial,
             _marker: core::marker::PhantomData,
-        };
+        });
         let mut scratch_store = wasmtime::Store::new(engine, scratch_store_data);
         define_compiler_shared_memory(&mut linker, &scratch_store, &module, shared_memory)?;
 
@@ -2182,9 +2426,10 @@ where
                 .instantiate_pre(&module)
                 .map_err(map_program_runtime_error)?,
         );
-        let scratch_interrupts = configure_compiler_core_store(&mut scratch_store);
-        let scratch_instance = instance_pre
-            .instantiate(&mut scratch_store)
+        let scratch_drive = configure_compiler_core_store(&mut scratch_store);
+        let scratch_instance = scratch_drive
+            .instantiate(&mut scratch_store, &instance_pre)
+            .await
             .map_err(map_program_runtime_error)?;
         let main_thread_tls_base = compiler_tls_base(&mut scratch_store, &scratch_instance)?;
         if main_thread_tls_base == 0 {
@@ -2194,7 +2439,7 @@ where
                 detail: ProgramExecErrorDetail::CompilerPluginInvalid,
             });
         }
-        drop(scratch_interrupts);
+        drop(scratch_drive);
         drop(scratch_store);
         shared.instance_pre.call_once(|| instance_pre.clone());
 
@@ -2205,7 +2450,7 @@ where
             main_thread_tls_base,
             _code: code,
         });
-        *slot = Some(plugin.clone());
+        *self.inner.compiler_plugin.lock() = Some(plugin.clone());
         Ok((plugin, false))
     }
 }
@@ -2258,13 +2503,13 @@ fn signed_phase_us(started_ns: u64, finished_ns: u64) -> i64 {
     }
 }
 
-impl<CpuImpl, Net, HostFs> ProgramExecContext<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> ProgramExecContext<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    pub(crate) fn from_store(store: &StoreData<CpuImpl, Net, HostFs>) -> Self {
+    pub(crate) fn from_store(store: &StoreData<CpuImpl, Net, StorageImpl>) -> Self {
         Self {
             cpu: store.cpu.clone(),
             timer: store.timer(),
@@ -2574,18 +2819,34 @@ mod tests {
     }
 
     #[test]
+    fn a_name_too_long_is_name_too_long_in_every_wasi_layer() {
+        let code =
+            crate::wasmtime_adapter::wasi::fs_error_code(helios_hal::fs::FsError::NameTooLong);
+
+        // Preview 2 and 3 return the code itself; preview 1 and WASIX
+        // answer its errno.
+        assert!(matches!(code, fs_types::ErrorCode::NameTooLong));
+        assert_eq!(
+            p1_errno_from_fs(fs_types::ErrorCode::NameTooLong),
+            p1::errno::NAMETOOLONG
+        );
+    }
+
+    #[test]
     fn null_device_open_is_confined_to_authorized_path_resolution() {
         let root = FsDescriptor {
             path: "/".into(),
             kind: FsNodeKind::Directory,
             flags: fs_types::DescriptorFlags::READ,
             identity: None,
+            mount: None,
         };
         let work = FsDescriptor {
             path: "/work".into(),
             kind: FsNodeKind::Directory,
             flags: fs_types::DescriptorFlags::READ,
             identity: None,
+            mount: None,
         };
 
         assert_eq!(
@@ -2634,6 +2895,7 @@ mod tests {
                 kind: FsNodeKind::File,
                 flags: fs_types::DescriptorFlags::WRITE,
                 identity: None,
+                mount: None,
             },
             offset: 0,
             fdflags: 0,
@@ -2665,6 +2927,275 @@ mod tests {
         }
         assert_eq!(table.close_on_exec(1), Ok(false));
         assert!(table.get(3).is_none());
+    }
+
+    fn stdio_table() -> TestDescriptorTable {
+        Preview1DescriptorTable::from_entries(vec![
+            Some(Preview1DescriptorEntry::new(
+                Preview1Descriptor::Stdin {
+                    carry: Bytes::new(),
+                },
+                false,
+            )),
+            Some(Preview1DescriptorEntry::new(
+                Preview1Descriptor::Stdout,
+                false,
+            )),
+            Some(Preview1DescriptorEntry::new(
+                Preview1Descriptor::Stderr,
+                false,
+            )),
+        ])
+    }
+
+    /// dash applies `2>&1` around a command in the shell itself and
+    /// restores afterwards: save fd 2 (`fcntl(F_DUPFD)`, which is
+    /// `fd_dup`), `dup2(1, 2)`, run the command, `dup2(saved, 2)`,
+    /// `close(saved)`. The WASIX libc's `dup2` is `fd_renumber`, so the
+    /// shell's own stdout survives the pair only if `fd_renumber` copies.
+    #[test]
+    fn wasix_dup2_and_restore_of_stderr_leaves_stdout_open() {
+        let mut table = stdio_table();
+
+        let saved = i32::try_from(table.dup(2).expect("fd 2 is open")).expect("small fd");
+        assert_eq!(table.dup2(1, 2), p1::errno::SUCCESS);
+        assert!(matches!(table.get(1), Some(Preview1Descriptor::Stdout)));
+        assert!(matches!(table.get(2), Some(Preview1Descriptor::Stdout)));
+
+        assert_eq!(table.dup2(saved, 2), p1::errno::SUCCESS);
+        assert_eq!(table.close(saved), p1::errno::SUCCESS);
+        assert!(matches!(table.get(1), Some(Preview1Descriptor::Stdout)));
+        assert!(matches!(table.get(2), Some(Preview1Descriptor::Stderr)));
+        assert!(table.get(saved).is_none());
+    }
+
+    #[test]
+    fn wasix_dup2_onto_itself_changes_nothing_and_needs_an_open_source() {
+        let mut table = stdio_table();
+        assert_eq!(table.set_close_on_exec(1, true), p1::errno::SUCCESS);
+
+        assert_eq!(table.dup2(1, 1), p1::errno::SUCCESS);
+        assert_eq!(table.close_on_exec(1), Ok(true));
+        assert_eq!(table.dup2(7, 7), p1::errno::BADF);
+        assert_eq!(table.dup2(7, 1), p1::errno::BADF);
+        assert!(matches!(table.get(1), Some(Preview1Descriptor::Stdout)));
+    }
+
+    /// The writer a component's stream `kind` resolves to under `mode`.
+    fn component_channel(
+        mode: &OutputMode,
+        kind: crate::ComponentOutputStreamKind,
+    ) -> crate::ByteWriter {
+        match mode.route(kind) {
+            OutputRoute::Child(writer) => writer,
+            _ => panic!("the component's stream is not a channel"),
+        }
+    }
+
+    /// The process's own stdio as the debugger hands it to a shell: three
+    /// channels whose far ends the test holds.
+    fn session_stdio() -> (OutputMode, crate::ByteReader, crate::ByteReader) {
+        let (_, stdin_rx) = crate::byte_channel();
+        let (stdout_tx, stdout_rx) = crate::byte_channel();
+        let (stderr_tx, stderr_rx) = crate::byte_channel();
+        (
+            OutputMode::Child {
+                stdin_rx,
+                stdout_tx,
+                stderr_tx,
+            },
+            stdout_rx,
+            stderr_rx,
+        )
+    }
+
+    /// `$(component)`: the shell's child puts a pipe's write end at fd 1
+    /// and execs the component, whose stdout must reach the pipe rather
+    /// than the session.
+    #[test]
+    fn component_launched_with_a_pipe_at_stdout_writes_to_the_pipe() {
+        let (session, session_stdout, session_stderr) = session_stdio();
+        let (pipe_tx, pipe_rx) = crate::byte_channel();
+        let mut table = stdio_table();
+        let pipe = table
+            .insert(Preview1Descriptor::PipeWrite { writer: pipe_tx })
+            .expect("a free slot");
+        let pipe = i32::try_from(pipe).expect("small fd");
+        assert_eq!(table.dup2(pipe, 1), p1::errno::SUCCESS);
+        assert_eq!(table.close(pipe), p1::errno::SUCCESS);
+
+        let mode = table
+            .clone_for_exec()
+            .component_output_mode(&session)
+            .expect("a pipe is a component stdout");
+        drop(table);
+
+        let stdout = component_channel(&mode, crate::ComponentOutputStreamKind::Stdout);
+        assert!(matches!(
+            stdout.try_write(Bytes::from_static(b"possible 4\n")),
+            crate::TryWrite::Written
+        ));
+        assert!(matches!(
+            pipe_rx.try_read(),
+            crate::io::TryRead::Ready(bytes) if bytes.as_ref() == b"possible 4\n"
+        ));
+        assert!(matches!(
+            session_stdout.try_read(),
+            crate::io::TryRead::Pending
+        ));
+
+        let stderr = component_channel(&mode, crate::ComponentOutputStreamKind::Stderr);
+        assert!(matches!(
+            stderr.try_write(Bytes::from_static(b"usage\n")),
+            crate::TryWrite::Written
+        ));
+        assert!(matches!(
+            session_stderr.try_read(),
+            crate::io::TryRead::Ready(bytes) if bytes.as_ref() == b"usage\n"
+        ));
+
+        // The component's stream is the pipe's last write end, so the
+        // shell reading the substitution sees end of file once it ends.
+        drop((stdout, mode));
+        assert!(matches!(pipe_rx.try_read(), crate::io::TryRead::Eof));
+    }
+
+    /// `component 2>&1`: fd 2 is a copy of fd 1, so the component's stderr
+    /// goes where the shell's stdout goes.
+    #[test]
+    fn component_launched_with_stderr_on_stdout_writes_stderr_to_stdout() {
+        let (session, session_stdout, session_stderr) = session_stdio();
+        let mut table = stdio_table();
+        assert_eq!(table.dup2(1, 2), p1::errno::SUCCESS);
+
+        let mode = table
+            .component_output_mode(&session)
+            .expect("stdout is a component stderr");
+        let stderr = component_channel(&mode, crate::ComponentOutputStreamKind::Stderr);
+        assert!(matches!(
+            stderr.try_write(Bytes::from_static(b"usage\n")),
+            crate::TryWrite::Written
+        ));
+        assert!(matches!(
+            session_stdout.try_read(),
+            crate::io::TryRead::Ready(bytes) if bytes.as_ref() == b"usage\n"
+        ));
+        assert!(matches!(
+            session_stderr.try_read(),
+            crate::io::TryRead::Pending
+        ));
+    }
+
+    #[test]
+    fn component_launched_over_the_process_stdio_keeps_the_process_mode() {
+        let mode = stdio_table()
+            .component_output_mode(&OutputMode::Serial)
+            .expect("the process's own stdio");
+        assert!(matches!(mode, OutputMode::Serial));
+    }
+
+    #[test]
+    fn component_stdio_closed_slots_are_closed_streams_and_files_are_refused() {
+        let (session, _, _) = session_stdio();
+        let mut table = stdio_table();
+        assert_eq!(table.close(0), p1::errno::SUCCESS);
+        assert_eq!(table.close(1), p1::errno::SUCCESS);
+        let mode = table
+            .component_output_mode(&session)
+            .expect("closed slots are closed streams");
+        let OutputMode::RoutedChild { stdin_rx, .. } = &mode else {
+            panic!("a redirected table routes each stream");
+        };
+        assert!(matches!(stdin_rx.try_read(), crate::io::TryRead::Eof));
+        let stdout = component_channel(&mode, crate::ComponentOutputStreamKind::Stdout);
+        assert!(matches!(
+            stdout.try_write(Bytes::from_static(b"lost\n")),
+            crate::TryWrite::Closed
+        ));
+
+        let file: TestDescriptor = Preview1Descriptor::File {
+            descriptor: FsDescriptor {
+                path: "/redirected".into(),
+                kind: FsNodeKind::File,
+                flags: fs_types::DescriptorFlags::WRITE,
+                identity: None,
+                mount: None,
+            },
+            offset: 0,
+            fdflags: 0,
+        };
+        assert_eq!(table.insert_at(1, file, false), Ok(1));
+        assert_eq!(
+            table.component_output_mode(&session).err(),
+            Some(ComponentStdioRefusal {
+                fd: 1,
+                held: UnbindableStdio::File,
+            })
+        );
+    }
+
+    #[test]
+    fn fd_renumber_past_the_descriptor_limit_is_badf_and_allocates_nothing() {
+        let mut table = stdio_table();
+
+        // `fd_renumber` takes an `i32`, so `i32::MAX - 1` is the highest
+        // number a guest can name; it used to resize the table to match.
+        assert_eq!(table.renumber(1, i32::MAX - 1), p1::errno::BADF);
+        assert_eq!(table.renumber(1, -2), p1::errno::BADF);
+        assert_eq!(table.renumber(1, 1024), p1::errno::BADF);
+        assert_eq!(table.entries.len(), 3);
+        assert!(table.get(1).is_some());
+
+        assert_eq!(table.renumber(1, 1023), p1::errno::SUCCESS);
+        assert!(table.get(1023).is_some());
+    }
+
+    #[test]
+    fn fd_dup2_past_the_descriptor_limit_is_badf_and_allocates_nothing() {
+        let mut table = stdio_table();
+        table.limit = DescriptorLimit::new(8);
+
+        assert_eq!(table.dup_to(0, i32::MAX - 1, false), Err(p1::errno::BADF));
+        assert_eq!(table.dup_to(0, 8, false), Err(p1::errno::BADF));
+        assert_eq!(table.entries.len(), 3);
+        assert_eq!(table.dup_to(0, 7, false), Ok(7));
+    }
+
+    #[test]
+    fn spawn_dup2_action_inherits_the_descriptor_limit() {
+        let mut table = stdio_table();
+        table.limit = DescriptorLimit::new(8);
+        let mut snapshot = table.clone_for_exec();
+
+        // The spawn-time dup2 action applies `dup_to` to this table.
+        assert_eq!(snapshot.limit, DescriptorLimit::new(8));
+        assert_eq!(
+            snapshot.dup_to(0, i32::MAX - 1, false),
+            Err(p1::errno::BADF)
+        );
+        assert_eq!(
+            snapshot.insert_at(i32::MAX - 1, Preview1Descriptor::NullDevice, false),
+            Err(p1::errno::BADF)
+        );
+        assert_eq!(snapshot.target_index(i32::MAX - 1), Err(p1::errno::BADF));
+        assert_eq!(snapshot.entries.len(), 3);
+    }
+
+    #[test]
+    fn lowest_free_allocation_at_the_descriptor_limit_is_mfile() {
+        let mut table = stdio_table();
+        table.limit = DescriptorLimit::new(4);
+
+        assert_eq!(table.insert(Preview1Descriptor::NullDevice), Ok(3));
+        assert_eq!(
+            table.insert(Preview1Descriptor::NullDevice),
+            Err(p1::errno::MFILE)
+        );
+        assert_eq!(table.dup(0), Err(p1::errno::MFILE));
+        assert_eq!(table.entries.len(), 4);
+
+        assert_eq!(table.close(1), p1::errno::SUCCESS);
+        assert_eq!(table.dup(0), Ok(1));
     }
 
     #[test]
@@ -2723,6 +3254,7 @@ mod tests {
                 kind: FsNodeKind::File,
                 flags: fs_types::DescriptorFlags::WRITE,
                 identity: None,
+                mount: None,
             },
             offset: 0,
             fdflags: 0,
@@ -2763,6 +3295,7 @@ mod tests {
                 kind: FsNodeKind::File,
                 flags: fs_types::DescriptorFlags::READ,
                 identity: None,
+                mount: None,
             },
             offset: 0,
             fdflags: P1_FDFLAG_NONBLOCK,
@@ -2865,6 +3398,7 @@ mod tests {
                 kind: FsNodeKind::Directory,
                 flags: fs_types::DescriptorFlags::READ,
                 identity: None,
+                mount: None,
             },
         };
 
@@ -2905,6 +3439,8 @@ mod tests {
         parent.grant_device_classes(
             crate::DeviceClassRights::DISPLAY | crate::DeviceClassRights::AUDIO,
         );
+        parent.grant_diagnostic_rights(crate::DiagnosticAuthorityRights::OBSERVE_MACHINE);
+        parent.grant_machine_rights(crate::MachineAuthorityRights::CONTROL_PROCESSORS);
 
         let child = wasix_proc_spawn_inherited_non_directory_authority(&parent);
 
@@ -2926,6 +3462,14 @@ mod tests {
         assert_eq!(
             child.device_class_rights(),
             crate::DeviceClassRights::DISPLAY | crate::DeviceClassRights::AUDIO
+        );
+        assert_eq!(
+            child.diagnostic_rights(),
+            crate::DiagnosticAuthorityRights::OBSERVE_MACHINE
+        );
+        assert_eq!(
+            child.machine_rights(),
+            crate::MachineAuthorityRights::CONTROL_PROCESSORS
         );
         assert!(parent.contains_authority(&child));
     }
@@ -2983,6 +3527,7 @@ mod tests {
                 kind: FsNodeKind::File,
                 flags: fs_types::DescriptorFlags::READ,
                 identity: None,
+                mount: None,
             },
             offset: 0,
             fdflags: 0,
@@ -2993,6 +3538,7 @@ mod tests {
                 kind: FsNodeKind::File,
                 flags: fs_types::DescriptorFlags::READ,
                 identity: None,
+                mount: None,
             },
             offset: 0,
             fdflags: 0,
@@ -3031,6 +3577,7 @@ mod tests {
                             kind: FsNodeKind::Directory,
                             flags: fs_types::DescriptorFlags::READ,
                             identity: None,
+                            mount: None,
                         },
                     },
                     false,
@@ -3059,6 +3606,7 @@ mod tests {
                 kind: FsNodeKind::Directory,
                 flags: fs_types::DescriptorFlags::READ,
                 identity: None,
+                mount: None,
             },
         };
         let mut authority = ProcessAuthority::empty();
@@ -3101,6 +3649,7 @@ mod tests {
                             kind: FsNodeKind::Directory,
                             flags: fs_types::DescriptorFlags::READ,
                             identity: None,
+                            mount: None,
                         },
                     },
                     false,
@@ -3114,6 +3663,7 @@ mod tests {
                     kind: FsNodeKind::Directory,
                     flags: fs_types::DescriptorFlags::READ,
                     identity: None,
+                    mount: None,
                 },
             }),
         };
@@ -3137,6 +3687,7 @@ mod tests {
                             kind: FsNodeKind::Directory,
                             flags: fs_types::DescriptorFlags::READ,
                             identity: None,
+                            mount: None,
                         },
                     },
                     false,
@@ -3371,15 +3922,76 @@ mod tests {
         };
         let mut bytes = [0_u8; 4];
 
-        preview1_read_memory_into(memory, 1, &mut bytes).expect("fixed read should fit");
+        preview1_read_memory_into(memory, GuestAddress::wasm32(1), &mut bytes)
+            .expect("fixed read should fit");
 
         assert_eq!(bytes, [2, 3, 4, 5]);
-        let error =
-            preview1_read_memory_into(memory, 4, &mut bytes).expect_err("read should overflow");
+        let error = preview1_read_memory_into(memory, GuestAddress::wasm32(4), &mut bytes)
+            .expect_err("read should overflow");
         assert_eq!(error.kind, crate::ProgramExecErrorKind::InvalidBinary);
         assert_eq!(
             error.detail,
             ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds
+        );
+    }
+
+    /// Every WASI/WASIX host-call family addresses the fields of a guest
+    /// structure as `base.offset(field)`. A base near the top of the 32-bit
+    /// space must fault at the access, never wrap into low guest memory.
+    #[test]
+    fn guest_field_offsets_near_the_top_of_guest_space_fault_for_every_family() {
+        let mut guest = [0xAA_u8; 64];
+        let memory = Preview1Memory {
+            base: guest.as_mut_ptr() as usize,
+            len: guest.len(),
+        };
+        let base = GuestAddress::wasm32(u32::MAX - 2);
+        // preview1 fd_prestat_get (+4), poll_oneoff event (+8..), filestat (+8..56)
+        // and iovec (+4), WASIX epoll event, proc spawn handles, tty state and
+        // thread snapshot (+8/+16) fields all use these offsets.
+        let family_offsets = [
+            ("preview1 prestat", 4_u64),
+            ("preview1 iovec", 4),
+            ("preview1 poll event", 8),
+            ("preview1 filestat", 56),
+            ("wasix epoll event", 16),
+            ("wasix proc handles", 12),
+            ("wasix tty state", 21),
+            ("wasix thread snapshot", 16),
+        ];
+        for (family, offset) in family_offsets {
+            let field = base.offset(offset);
+            assert_eq!(
+                preview1_write_memory(memory, field, &[1, 2, 3, 4]),
+                p1::errno::FAULT,
+                "{family}: write at u32::MAX - 2 + {offset} must be EFAULT",
+            );
+            let mut bytes = [0_u8; 4];
+            assert!(
+                preview1_read_memory_into(memory, field, &mut bytes).is_err(),
+                "{family}: read at u32::MAX - 2 + {offset} must fail",
+            );
+        }
+        assert!(
+            guest.iter().all(|byte| *byte == 0xAA),
+            "a wrapped offset must not write into low guest memory",
+        );
+    }
+
+    #[test]
+    fn guest_iovec_array_beyond_guest_space_faults() {
+        let guest = [0_u8; 16];
+        let memory = Preview1AsyncMemory::new(Preview1Memory {
+            base: guest.as_ptr() as usize,
+            len: guest.len(),
+        });
+        let layout = Preview1IovLayout {
+            iovs: SmallVec::from_slice(&[(u32::MAX - 2, 4)]),
+            byte_len: 4,
+        };
+        assert_eq!(
+            Preview1Gather::new(&memory, &layout).err(),
+            Some(p1::errno::FAULT),
         );
     }
 
@@ -3919,5 +4531,32 @@ mod tests {
                 .set_time(WASIX_SOCK_OPTION_SEND_BUF_SIZE, None),
             p1::errno::INVAL
         );
+    }
+
+    /// An exec of a path the authority admits but no file backs is the
+    /// filesystem's no-entry, not an authority refusal (#502): the kind is
+    /// `NotFound`, the detail carries the filesystem's error, and the
+    /// guest reads `ENOENT`.
+    #[test]
+    fn wasix_exec_of_a_missing_program_file_is_not_found() {
+        let namespace = Namespace::<crate::UnsupportedStorage>::new(crate::MountTable::new(
+            crate::BootFs::new(crate::EmbeddedBootFs::new(&[], &[]), crate::BOOT_DEVICE),
+            1,
+        ));
+        let authority = ProcessAuthority::root();
+
+        let error = futures_lite::future::block_on(read_program_source_from(
+            &namespace, &authority, "/forged",
+        ))
+        .err()
+        .expect("a path no file backs cannot be read as a program");
+
+        assert_eq!(error.kind, ProgramExecErrorKind::NotFound);
+        assert_eq!(
+            error.detail,
+            ProgramExecErrorDetail::ProgramSourceUnreadable(helios_hal::fs::FsError::NoEntry),
+            "the filesystem's own error travels in the detail"
+        );
+        assert_eq!(p1_errno_from_program_exec_error(&error), p1::errno::NOENT);
     }
 }

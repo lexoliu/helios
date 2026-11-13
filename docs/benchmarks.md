@@ -70,7 +70,7 @@ reason under the table the cell is missing from.
 | fs | `fs-smallfiles`, `fs-readstream` | coreutils on the embedded filesystem root | `coreutils-wasi.wasm` under `wasmtime run --dir` | ext4 in the guest |
 | compute | `quickjs-loop`, `cpython-json`, `cpython-regex`, `wasm-simd-lanes` | interpreter or SIMD loops | same wasm | native QuickJS/CPython/NEON-or-SSE probe |
 | compute | `cpython-startup`, `cpython-import-json` | the CPython row decomposed — interpreter start-up alone, then start-up plus `import json` over the host share | same wasm | native CPython |
-| compute | `aot-curl` | compiler plugin AOT of `curl.wasm` | `wasmtime compile` of the same input | uncompared (`wasmtime compile` is the native equivalent of the in-guest step) |
+| compute | `aot-curl` | compiler plugin AOT of `curl.wasm` for the kernel target, performance hint, the kernel's worker count | the same compiler plugin under Wasmtime on Linux (`helios-compiler-host`), the same input, target, ISA level (the one the Helios guest reports), hint and worker count | `wasmtime compile` of the same input (a reference, uncompared) |
 
 `headline: true` marks the rows the README table and the regression gate
 carry. Every compared row is a parity check, not a claim: Helios running
@@ -280,7 +280,7 @@ nanoseconds from `rpc-arrival`:
 | --- | --- |
 | `rpc_arrival_ns` | the launch call entered the kernel; always `0`, the epoch |
 | `source_read_ns` | the program's bytes are read out of their source (`source_bytes` carries the size) |
-| `trust_ns` | artifact trust established — the bootfs trailer parse, the signature check for a signed artifact, or — on a raw-wasm source — the whole in-kernel compile+sign between `load_begin` and here |
+| `trust_ns` | artifact trust established — the bootfs artifact hand-off, the signature check for a signed artifact, or — on a raw-wasm source — the whole in-kernel compile+sign between `load_begin` and here |
 | `cache_lookup_ns` | the deserialize cache answered (`cache_hit` carries its answer) |
 | `deserialize_ns` | the `cwasm` payload deserialized; present only on a cache miss |
 | `instantiate_pre_ns` | the `InstancePre` cache answered or `instantiate_pre` built (`instantiate_pre_hit`) |
@@ -368,6 +368,35 @@ scoped kernel profile (`helios-*.kernel.folded`), so a diagnosis that
 needs a counter the table cut, or the baseline's counters at all, reads
 them from the artifact instead of re-running the lane.
 
+Those artifacts do not come from the boots that are timed (#747). The
+scoped profiler and the counters stamp every span of the guest, which is
+inside every iteration they would time, and the Linux guests carry nothing
+like them, so no timed boot runs with either: the control and workload
+boots are asked for no kernel profile, no perf metrics and no other
+profile output, whatever the caller's environment names. Once every timed
+boot and control of the first pass has finished, each Helios image boots
+every unit it finished a second time (the same image, the same workloads,
+the same iteration count, so the counters cover what the timed boots ran),
+and that profile boot writes the kernel profile and the perf metrics under
+the timed boot's names. Nothing it records is a timing: its own JSONL is
+kept under `profile-boot/` and no reader looks there, and the medians,
+verdicts, retakes and noise floors read only the timed boots'
+`helios-*.jsonl`. `profile-boot.json` beside each image's `helios.jsonl`
+records which units it booted and which failed, and the driver's
+`summary.json` and `report.md` say that the profile artifacts came from
+that boot. The instruction sampler is not part of it: it stays on the timed
+boots, where it is opt-in and makes the run a diagnosis (below). The
+retake, reconfirm and retry passes take no profile boot, since the
+artifacts are the first pass's.
+
+A profile boot that fails does not discard what was timed: the records are
+already written, the remaining units still get theirs under `--keep-going`,
+and the run then fails, naming the units whose kernel profile and perf
+metrics are missing. `helios-bench run --no-profile-boot` (the driver's
+`--helios-no-profile-boot`) skips the second boot, for a run that only
+wants timings. The profile boot adds one more boot of every unit, with all
+its iterations, to each image's share of the side's budget.
+
 On request, each x86-64 boot also writes an instruction-level profile,
 `helios-*.pc.folded`: every boot of the run's own image and, in a paired
 run, every boot of the baseline image beside it, so the artifact carries
@@ -385,7 +414,7 @@ but the extra interrupts (and, under KVM, the extra timer exits) on every
 processor cost time the medians would carry, as does the kernel task that
 drains the samples every 20 ms. Sampling therefore has its own control
 (`helios:system/profiling.set-instruction-sampling`), separate from the
-scoped profiler every lane boot enables. The inspector starts it only when
+scoped profiler, which only the profile boot enables. The inspector starts it only when
 `--instruction-profile-output` is given, for the duration of the workload,
 and stops it before reading the samples. `linux-gap-bench.py` passes the
 option only when `HELIOS_BENCH_INSTRUCTION_PROFILE=1`, and `bench-suite.yml`
@@ -548,7 +577,8 @@ what the one below it cannot see.
 - **Per side.** `--helios-side-timeout-seconds` bounds the whole Helios
   side, and every boot inside it shares it out as the run goes: one boot
   per class (or, paired, one per workload per image), plus the control
-  workload before and after for each image. Nothing is reserved off the
+  workload before and after for each image, plus one profile boot per
+  unit per image (above) unless `--no-profile-boot`. Nothing is reserved off the
   front — the builds happen before the budget starts, and the control
   boots are counted among the boots rather than set aside at the
   per-boot cap, which is what made run 33997256902 refuse all
@@ -610,6 +640,17 @@ or a developer's own arm64 box, taken by hand with the same harness
 that machine), never from hosted CI. AGENTS.md §3.5's arm64 baseline is
 that kind of measurement.
 
+A host that must not compile anything runs `helios-bench run --lane
+aarch64-hvf --prebuilt`. The kernel image and `helios-bootfs` come from CI's
+`helios-guest-aarch64` artifact, unpacked so they land at
+`target/aarch64-unknown-none/kernel-release/helios` and
+`target/kernel-prebuild/aarch64-unknown-none/kernel-release/helios-bootfs`;
+`target/release/helios-inspector`, `target/release/helios-cli` and
+`artifacts/bench-native/aarch64/` are copied from the machine that built
+them. The run then builds nothing, and lists every file it reads that is
+missing before it boots a guest. It cannot be paired with a baseline, whose
+second image has to be built.
+
 ### The RPC the numbers are taken around
 
 Every Helios row is timed host-side around the inspector's
@@ -625,6 +666,36 @@ elapsed before the lane moved (#413: `instance-startup-1` measured
 `/dev/vhost-vsock` is not usable as a deviation, the run record's `vm`
 provenance and the report's pins name the transport, and a lane on a
 host with no vhost-vsock (macOS) says `serial` and is read as such.
+
+On a `serial` lane that reading would put the serial line inside every
+Helios launch and nothing like it inside the Linux column, which is
+timed in its guest around the process. So there a launch is compared on
+the kernel's own clock: the `exec` reply carries `launch-nanos`, from
+the launch call's arrival in the kernel to its result being in hand, the
+inspector records it as `launch_elapsed_ms`, and the report compares
+that. `helios_bench.sources.compared_clock` is the one place a row's
+clock is chosen: a Linux row is `guest-process`, a Helios launch is
+`kernel-launch` on a `serial` lane and `host-round-trip` on a `vsock`
+one, and a Helios workload that launches no program (`aot-curl`) keeps
+the host clock on either. Every iteration in `report.json` names its
+`clock` and keeps `host_elapsed_ms` beside the compared value, and the
+tables say under each class which clock its rows were read from.
+
+### Both guests' RAM is backed the same way
+
+The Fedora guest's RAM is a preallocated `memory-backend-ram`
+(`guest_ram_backend` in `fedora_qemu_baseline.py`). A guest whose RAM
+QEMU maps lazily pays a host page fault on the first touch of every
+page, so a comparison boots Helios with `--guest-ram prealloc` as well
+(`HELIOS_WORKLOAD_BENCH_GUEST_RAM`, set by the runner). The inspector's
+run record states the backing it booted with, the pins print both
+guests', and a report from an inspector that predates the option is
+refused instead of read as if the backings matched.
+
+A lane gives its two guests one memory size. `manifest.toml` refuses a
+lane whose `memory` and `linux_vm_memory` differ unless it states
+`memory_differs_because`, and refuses the reason on a lane whose sizes
+agree, so the reason lives beside the two fields it explains.
 
 ## Dedicated runners
 
@@ -802,8 +873,10 @@ monitor socket with both guest images already built. The inspector puts
 own under `$XDG_RUNTIME_DIR` and links it as `<runtime>/sockets`; see
 `docs/debug-serial.md`.
 
-`bench-suite.yml` runs a pull request in paired mode against
-`github.event.pull_request.base.sha`, and `workflow_dispatch` takes a
+`bench-suite.yml` runs a pull request in paired mode against the `dev`
+commit it is merged against (the first parent of the merge commit the
+run checks out, not the event's `base.sha`, which is the tip `dev` had
+when the pull request was opened), and `workflow_dispatch` takes a
 `baseline_ref` input. An advisory dispatch with an explicit baseline is
 revision acceptance: it runs only `helios` and `helios_baseline`, with
 all workloads, warm iterations, before/after compute controls, and the
@@ -837,7 +910,7 @@ its warm series. Ordinary measurements isolate these listeners; explicit
 `--reuse-host-listeners` is reserved for reconnect diagnosis and marks the
 report as unsuitable for performance acceptance.
 
-The `bench-x86-64-linux` lane of `ci.yml` is unchanged except that the
+The `bench-x86-64-linux` lane of `bench-lane.yml` is unchanged except that the
 inspector now writes the host CPU model into the `run` record it emits,
 so a comparison between two of its runs can tell one machine from two.
 

@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
@@ -10,11 +10,16 @@ use clap::{Parser, Subcommand, ValueEnum};
 use ed25519_dalek::{SecretKey, SigningKey, VerifyingKey};
 use fatfs::{FatType, FileSystem, FormatVolumeOptions, FsOptions};
 use helios_artifact::bootfs::{self, WriteEntry};
-use helios_artifact::{TrailerError, cwasm_target_supports_wasm_simd, sign_payload_with_key};
+use helios_artifact::{
+    CwasmTarget, IsaLevelError, cwasm_target_isa_levels, cwasm_target_supports_wasm_simd,
+};
 use helios_compiler_support::{AotCompileHint, CompileError, precompile_artifact};
 use helios_profdata::{
     FetchedProfile, KERNEL_PROFILE_ARTIFACT, KERNEL_PROFILE_ASSET, KERNEL_PROFILE_WORKFLOW,
     KernelProfileStore, KernelProfileStoreError, ProfileUseError, RELEASE_REPOSITORY,
+};
+use helios_workspace_root::root_key::{
+    ROOT_PUBLIC_FILE, ROOT_SECRET_FILE, RootSecretReadError, SECRET_KEY_MODE, read_root_secret_seed,
 };
 use helios_workspace_root::{WorkspaceRoot, WorkspaceRootError};
 use mbrman::{BOOT_ACTIVE, CHS, MBR, MBRPartitionEntry};
@@ -26,6 +31,7 @@ use wasmparser::Parser as WasmParser;
 use wit_component::ComponentEncoder;
 
 mod boot_kernel;
+mod venus_fetch;
 
 /// Why a `helios-cli` invocation did not do what it was asked.
 ///
@@ -35,92 +41,56 @@ mod boot_kernel;
 #[derive(Debug, thiserror::Error)]
 enum CliError {
     #[error("{0}")]
-    Aot(#[from] AotError),
-    #[error("{0}")]
-    CompilerPlugin(#[from] CompilerPluginError),
-    #[error("{0}")]
     KernelPrebuild(#[from] PrebuildError),
     #[error("{0}")]
     LimineUefiImage(#[from] LimineError),
     #[error("{0}")]
     ProfileFetch(#[from] ProfileFetchError),
+    #[error("{0}")]
+    VenusProtocolFetch(#[from] venus_fetch::VenusFetchError),
+    #[error("{0}")]
+    WasmBuild(#[from] WasmProgramsError),
+    #[error("{0}")]
+    WorkspaceRoot(#[from] WorkspaceRootError),
 }
 
-/// Why an ahead-of-time compile did not produce a signed artifact.
+/// Why the guest wasm directory `wasm-build` writes could not be produced.
 #[derive(Debug, thiserror::Error)]
-enum AotError {
+enum WasmProgramsError {
     #[error("{0}")]
-    Key(#[from] KeyError),
-    #[error("failed to read {path}: {source}")]
-    ReadInput {
+    WorkspaceRoot(#[from] WorkspaceRootError),
+    #[error("{0}")]
+    BootPrograms(#[from] BootProgramError),
+    #[error("{0}")]
+    WasmBuild(#[from] WasmBuildError),
+    #[error("failed to create {path}: {source}")]
+    CreateDir {
         path: String,
         #[source]
         source: io::Error,
     },
-    #[error("{0}")]
-    Compile(#[from] CompileError),
-    #[error("failed to sign AOT payload: {source}")]
-    Sign {
-        #[source]
-        source: TrailerError,
-    },
-    #[error("failed to write {path}: {source}")]
-    WriteOutput {
-        path: String,
+    #[error("failed to copy {from} to {to}: {source}")]
+    Copy {
+        from: String,
+        to: String,
         #[source]
         source: io::Error,
     },
-}
-
-/// Why the in-kernel compiler plugin could not be compiled and signed.
-#[derive(Debug, thiserror::Error)]
-enum CompilerPluginError {
-    #[error("{COMPILER_PLUGIN_ROOT_KEY_ENV} is required: {source}")]
-    MissingRootKey {
-        #[source]
-        source: std::env::VarError,
-    },
-    #[error("failed to decode compiler plugin root key: {source}")]
-    DecodeRootKey {
-        #[source]
-        source: hex::FromHexError,
-    },
-    #[error("root key must be 32 bytes, got {len}")]
-    RootKeyLength { len: usize },
-    #[error("failed to read wasm from stdin: {source}")]
-    ReadStdin {
-        #[source]
-        source: io::Error,
-    },
-    #[error("{0}")]
-    Compile(#[from] CompileError),
-    #[error("failed to sign compiler plugin output: {source}")]
-    Sign {
-        #[source]
-        source: TrailerError,
-    },
-    #[error("failed to write signed cwasm to stdout: {source}")]
-    WriteStdout {
-        #[source]
-        source: io::Error,
+    #[error(
+        "{first} and {second} both build {artifact}; a prebuilt directory is keyed by artifact name"
+    )]
+    DuplicateArtifact {
+        artifact: String,
+        first: String,
+        second: String,
     },
 }
 
 /// Why the root signing keypair could not be read or written.
 #[derive(Debug, thiserror::Error)]
 enum KeyError {
-    #[error("failed to read {path}: {source}")]
-    Read {
-        path: String,
-        #[source]
-        source: io::Error,
-    },
-    #[error("{path} does not contain a 32-byte Ed25519 secret key: {source}")]
-    NotThirtyTwoBytes {
-        path: String,
-        #[source]
-        source: std::array::TryFromSliceError,
-    },
+    #[error("{0}")]
+    Read(#[from] RootSecretReadError),
     #[error("failed to write {path}: {source}")]
     Write {
         path: String,
@@ -133,17 +103,10 @@ enum KeyError {
         source: rand::rngs::SysError,
     },
     #[error(
-        "{path} is a secret key with mode {mode:03o}; it must be readable by its owner alone (600)"
+        "--root-secret-key {path} is not a file; the key a release signs with is never generated"
     )]
-    SecretKeyExposed { path: String, mode: u32 },
+    SuppliedKeyMissing { path: String },
 }
-
-/// The mode a secret key file is created with: its owner reads and writes
-/// it, and nobody else can open it.
-const SECRET_KEY_MODE: u32 = 0o600;
-
-/// The permission bits of everyone but the owner.
-const GROUP_AND_OTHER: u32 = 0o077;
 
 /// Why the kernel-prebuild manifest and the bootfs it describes could
 /// not be produced.
@@ -162,17 +125,14 @@ enum PrebuildError {
     #[error("{0}")]
     Bootfs(#[from] BootfsError),
     #[error("{0}")]
+    IsaLevel(#[from] IsaLevelError),
+    #[error("{0}")]
     Compile(#[from] CompileError),
     #[error("failed to create {path}: {source}")]
     CreateOutDir {
         path: String,
         #[source]
         source: io::Error,
-    },
-    #[error("failed to sign init AOT payload: {source}")]
-    SignInit {
-        #[source]
-        source: TrailerError,
     },
     #[error("failed to write {path}: {source}")]
     Write {
@@ -229,6 +189,27 @@ enum WasmBuildError {
     LoadCoreModule { path: String, report: String },
     #[error("failed to encode component {path}: {report}")]
     EncodeComponent { path: String, report: String },
+    #[error("failed to run `rustc {query}`: {source}")]
+    SpawnRustc {
+        query: &'static str,
+        #[source]
+        source: io::Error,
+    },
+    #[error("`rustc {query}` failed with status {status}")]
+    RustcFailed {
+        query: &'static str,
+        status: std::process::ExitStatus,
+    },
+    #[error(
+        "the toolchain has no llvm-ar at {path}; rust-toolchain.toml lists the \
+         llvm-tools component that ships it"
+    )]
+    LlvmArMissing { path: String },
+    #[error(
+        "prebuilt wasm {path} is missing; `helios-cli wasm-build --profile {profile}` \
+         writes the directory --prebuilt-wasm names"
+    )]
+    PrebuiltMissing { path: String, profile: String },
 }
 
 /// Why the set of boot programs could not be resolved from the
@@ -338,14 +319,6 @@ enum BootfsError {
         path: String,
         #[source]
         source: io::Error,
-    },
-    #[error("failed to sign {payload} AOT payload: {source}")]
-    Sign {
-        /// Which payload was being signed, spelled the way the message
-        /// reads it.
-        payload: String,
-        #[source]
-        source: TrailerError,
     },
     #[error("failed to write {path}: {source}")]
     Write {
@@ -508,13 +481,14 @@ enum LimineError {
     },
 }
 
-const ROOT_SECRET_FILE: &str = "helios-root-secret.key";
-const ROOT_PUBLIC_FILE: &str = "helios-root-public.key";
 const PREBUILD_MANIFEST_FILE: &str = "kernel-prebuild.json";
 /// The payload `kernel-prebuild` writes beside the manifest: the whole
 /// user payload the kernel used to link in, delivered as a boot module.
 const BOOTFS_IMAGE_FILE: &str = "helios-bootfs";
 const DEFAULT_INIT_ARGV0: &str = "/init.wasm";
+/// The boot-program name `programs/init` answers to, published at
+/// `bin/init` like every other boot program.
+const INIT_COMMAND: &str = "init";
 const DEFAULT_BOOT_ARTIFACTS_MANIFEST: &str = "tools/wasi-apps/boot-artifacts.toml";
 /// Why the kernel profile did not reach the store.
 ///
@@ -563,6 +537,12 @@ enum ProfileFetchError {
          (docs/pgo.md). GitHub keeps an artifact ninety days"
     )]
     NoCollection { repository: String, branch: String },
+    #[error(
+        "no unexpired {KERNEL_PROFILE_ARTIFACT} artifact from run {run} of {repository} among \
+         the newest {ARTIFACT_PAGE}; the run's own {KERNEL_PROFILE_WORKFLOW} collection has \
+         to have uploaded it first"
+    )]
+    NoRunCollection { repository: String, run: u64 },
     #[error(
         "{url} answered HTTP {status} without a redirect; GitHub answers an artifact download \
          with a redirect to its object store"
@@ -626,7 +606,13 @@ enum ProfileFetchError {
 }
 
 const COMPILER_PLUGIN_BOOTFS_PATH: &str = "bin/compiler.cwasm";
-const COMPILER_PLUGIN_ROOT_KEY_ENV: &str = "HELIOS_COMPILER_ROOT_KEY_HEX";
+const COMPILER_PLUGIN_MANIFEST: &str = "compiler-plugin/Cargo.toml";
+const COMPILER_PLUGIN_TARGET_DIR: &str = "compiler-plugin-target";
+const COMPILER_PLUGIN_TRIPLE: &str = "wasm32-wasip1-threads";
+/// The file the compiler plugin's `cdylib` builds to.
+const COMPILER_PLUGIN_WASM: &str = "helios_compiler_plugin.wasm";
+/// The file `programs/init` builds to.
+const INIT_WASM: &str = "helios_init.wasm";
 const COMPILER_PLUGIN_SHARED_MEMORY_MAX_BYTES: usize = 512 * 1024 * 1024;
 const LIMINE_IMAGE_BYTES: u64 = 768 * 1024 * 1024;
 const LIMINE_PARTITION_START_LBA: u32 = 2048;
@@ -657,16 +643,21 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    Aot(AotCommand),
-    CompilerPlugin(CompilerPluginCommand),
     KernelPrebuild(KernelPrebuildCommand),
     LimineUefiImage(LimineUefiImageCommand),
     ProfileFetch(ProfileFetchCommand),
+    /// Build the architecture-independent guest wasm once: the compiler
+    /// plugin and every program under `programs/`. `kernel-prebuild
+    /// --prebuilt-wasm` then precompiles it for a target without
+    /// building it again.
+    WasmBuild(WasmBuildCommand),
+    /// Download the venus-protocol files `venus/protocol-inputs.toml` pins,
+    /// which the `helios-venus` build reads.
+    VenusProtocolFetch,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Hint {
-    Fast,
     Balanced,
     Performance,
 }
@@ -674,33 +665,10 @@ enum Hint {
 impl From<Hint> for AotCompileHint {
     fn from(value: Hint) -> Self {
         match value {
-            Hint::Fast => Self::Fast,
             Hint::Balanced => Self::Balanced,
             Hint::Performance => Self::Performance,
         }
     }
-}
-
-#[derive(Parser)]
-struct AotCommand {
-    #[arg(long)]
-    input: PathBuf,
-    #[arg(long)]
-    output: PathBuf,
-    #[arg(long)]
-    target: String,
-    #[arg(long, default_value = "performance")]
-    hint: Hint,
-    #[arg(long)]
-    root_key: PathBuf,
-}
-
-#[derive(Parser)]
-struct CompilerPluginCommand {
-    #[arg(long)]
-    target: String,
-    #[arg(long, default_value = "performance")]
-    hint: Hint,
 }
 
 #[derive(Parser)]
@@ -725,6 +693,40 @@ struct KernelPrebuildCommand {
     boot_artifacts_manifest: PathBuf,
     #[arg(long = "no-compiler-plugin", default_value_t = false)]
     no_compiler_plugin: bool,
+    /// Take the guest wasm from this directory, as `wasm-build` wrote it,
+    /// instead of building it.
+    ///
+    /// The wasm is read from `<DIR>/<profile>/`; a file that is not there
+    /// fails the prebuild, which never builds it instead. The init
+    /// program is the one `programs/init` builds, so `--init-manifest`
+    /// cannot be combined with it. A relative path is relative to the
+    /// workspace root.
+    #[arg(
+        long,
+        value_name = "DIR",
+        env = "HELIOS_PREBUILT_WASM",
+        conflicts_with = "init_manifest"
+    )]
+    prebuilt_wasm: Option<PathBuf>,
+    /// Sign the payload with the 32-byte Ed25519 secret in this file
+    /// instead of the key generated in `--out-dir`.
+    ///
+    /// The file is read in place and nothing secret is written to
+    /// `--out-dir`; a release build names the key its workflow
+    /// installed.
+    #[arg(long, value_name = "PATH")]
+    root_secret_key: Option<PathBuf>,
+}
+
+#[derive(Parser)]
+struct WasmBuildCommand {
+    /// Directory the wasm lands in, under `<DIR>/<profile>/`.
+    #[arg(long)]
+    out_dir: PathBuf,
+    #[arg(long, value_parser = ["release", "debug"])]
+    profile: String,
+    #[arg(long)]
+    cargo: PathBuf,
 }
 
 #[derive(Parser)]
@@ -750,12 +752,16 @@ struct ProfileFetchCommand {
     /// Release to take the profile from: the asset `release.yml` attached
     /// to it. Without it, the newest artifact a `kernel-profile.yml` run
     /// on the default branch uploaded.
-    #[arg(long, value_name = "TAG", conflicts_with = "branch")]
+    #[arg(long, value_name = "TAG", conflicts_with_all = ["branch", "run"])]
     tag: Option<String>,
     /// Branch whose newest collection to take, instead of the default
     /// branch's.
-    #[arg(long, value_name = "BRANCH")]
+    #[arg(long, value_name = "BRANCH", conflicts_with = "run")]
     branch: Option<String>,
+    /// Workflow run whose collection to take: the artifact that run
+    /// itself uploaded, for a lane that collected its own profile.
+    #[arg(long, value_name = "RUN_ID")]
+    run: Option<u64>,
     /// `owner/name` of the repository whose collections and releases carry
     /// the profile.
     #[arg(long, value_name = "REPOSITORY", default_value = RELEASE_REPOSITORY)]
@@ -831,15 +837,114 @@ struct ExternalBootArtifact {
 /// The inputs every bootfs asset build shares.
 ///
 /// They travel together because each asset is compiled by the same cargo, for
-/// the same profile and target, signed by the same root key, and resolved
-/// against the same checkout.
+/// the same profile and target, and resolved against the same checkout.
 struct BootBuild<'a> {
-    cargo: &'a Path,
-    profile: &'a str,
+    wasm: &'a WasmSource<'a>,
     out_dir: &'a Path,
-    target: &'a str,
-    root_signing_key: &'a SigningKey,
+    /// The level every boot artifact is compiled for: the target's floor.
+    target: &'a CwasmTarget<'a>,
     workspace_root: &'a WorkspaceRoot,
+}
+
+/// Where the architecture-independent guest wasm of a boot payload comes
+/// from: compiled by this run, or read from the directory `wasm-build`
+/// wrote. Only the precompile to a target is the payload's own work.
+enum WasmSource<'a> {
+    Build {
+        cargo: &'a Path,
+        profile: &'a str,
+        /// Where cargo's target directories go.
+        out_dir: &'a Path,
+    },
+    Prebuilt {
+        /// The profile's own directory of the prebuilt tree.
+        dir: PathBuf,
+        profile: &'a str,
+    },
+}
+
+impl<'a> WasmSource<'a> {
+    fn new(
+        cargo: &'a Path,
+        profile: &'a str,
+        out_dir: &'a Path,
+        prebuilt: Option<PathBuf>,
+    ) -> Self {
+        match prebuilt {
+            Some(root) => Self::Prebuilt {
+                dir: root.join(profile_dir_name(profile)),
+                profile,
+            },
+            None => Self::Build {
+                cargo,
+                profile,
+                out_dir,
+            },
+        }
+    }
+
+    /// The `wasm32-wasip2` core module or component `manifest_path`
+    /// builds, whose file is named `artifact_name`.
+    fn component(
+        &self,
+        manifest_path: &Path,
+        artifact_name: &str,
+    ) -> Result<PathBuf, WasmBuildError> {
+        match self {
+            Self::Build {
+                cargo,
+                profile,
+                out_dir,
+            } => build_component_program(cargo, profile, out_dir, manifest_path, artifact_name),
+            Self::Prebuilt { dir, profile } => prebuilt_wasm(dir, profile, artifact_name),
+        }
+    }
+
+    /// The in-kernel compiler's `wasm32-wasip1-threads` module.
+    fn compiler_plugin(&self, workspace_root: &WorkspaceRoot) -> Result<PathBuf, WasmBuildError> {
+        match self {
+            Self::Build {
+                cargo,
+                profile,
+                out_dir,
+            } => build_wasm_program(
+                cargo,
+                profile,
+                out_dir,
+                &workspace_root.join(Path::new(COMPILER_PLUGIN_MANIFEST)),
+                COMPILER_PLUGIN_TARGET_DIR,
+                COMPILER_PLUGIN_TRIPLE,
+                COMPILER_PLUGIN_WASM,
+            ),
+            Self::Prebuilt { dir, profile } => prebuilt_wasm(dir, profile, COMPILER_PLUGIN_WASM),
+        }
+    }
+}
+
+/// The subdirectory of a `wasm-build` tree a cargo profile's wasm lives
+/// in: the two profiles the guest programs build with.
+fn profile_dir_name(profile: &str) -> &'static str {
+    if profile == "release" {
+        "release"
+    } else {
+        "debug"
+    }
+}
+
+fn prebuilt_wasm(
+    dir: &Path,
+    profile: &str,
+    artifact_name: &str,
+) -> Result<PathBuf, WasmBuildError> {
+    let path = dir.join(artifact_name);
+    if path.is_file() {
+        Ok(path)
+    } else {
+        Err(WasmBuildError::PrebuiltMissing {
+            path: path.display().to_string(),
+            profile: profile.to_owned(),
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -864,54 +969,22 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<(), CliError> {
     match cli.command {
-        Commands::Aot(command) => Ok(run_aot(command)?),
-        Commands::CompilerPlugin(command) => Ok(run_compiler_plugin(command)?),
         Commands::KernelPrebuild(command) => {
             Ok(run_kernel_prebuild(command, cli.workspace_root.as_deref())?)
         }
         Commands::LimineUefiImage(command) => Ok(run_limine_uefi_image(command)?),
+        Commands::WasmBuild(command) => Ok(run_wasm_build(
+            &command,
+            &WorkspaceRoot::resolve(cli.workspace_root.as_deref())?,
+        )?),
         Commands::ProfileFetch(command) => {
             Ok(run_profile_fetch(command, cli.workspace_root.as_deref())?)
         }
+        Commands::VenusProtocolFetch => {
+            let workspace_root = WorkspaceRoot::resolve(cli.workspace_root.as_deref())?;
+            Ok(venus_fetch::run(workspace_root.path())?)
+        }
     }
-}
-
-fn run_aot(command: AotCommand) -> Result<(), AotError> {
-    let root_signing_key = read_signing_key(&command.root_key)?;
-    let wasm = fs::read(&command.input).map_err(|source| AotError::ReadInput {
-        path: command.input.display().to_string(),
-        source,
-    })?;
-    let payload = precompile_artifact(&wasm, &command.target, command.hint.into())?.bytes;
-    let signed = sign_payload_with_key(&payload, &root_signing_key)
-        .map_err(|source| AotError::Sign { source })?;
-    fs::write(&command.output, signed).map_err(|source| AotError::WriteOutput {
-        path: command.output.display().to_string(),
-        source,
-    })?;
-    Ok(())
-}
-
-fn run_compiler_plugin(command: CompilerPluginCommand) -> Result<(), CompilerPluginError> {
-    let root_key_hex = std::env::var(COMPILER_PLUGIN_ROOT_KEY_ENV)
-        .map_err(|source| CompilerPluginError::MissingRootKey { source })?;
-    let root_key_bytes: [u8; 32] = hex::decode(root_key_hex.trim())
-        .map_err(|source| CompilerPluginError::DecodeRootKey { source })?
-        .try_into()
-        .map_err(|bytes: Vec<u8>| CompilerPluginError::RootKeyLength { len: bytes.len() })?;
-    let root_signing_key = SigningKey::from_bytes(&root_key_bytes);
-
-    let mut wasm = Vec::new();
-    io::stdin()
-        .read_to_end(&mut wasm)
-        .map_err(|source| CompilerPluginError::ReadStdin { source })?;
-    let payload = precompile_artifact(&wasm, &command.target, command.hint.into())?.bytes;
-    let signed = sign_payload_with_key(&payload, &root_signing_key)
-        .map_err(|source| CompilerPluginError::Sign { source })?;
-    io::stdout()
-        .write_all(&signed)
-        .map_err(|source| CompilerPluginError::WriteStdout { source })?;
-    Ok(())
 }
 
 fn run_kernel_prebuild(
@@ -924,9 +997,18 @@ fn run_kernel_prebuild(
         source,
     })?;
 
-    let root_secret_path = command.out_dir.join(ROOT_SECRET_FILE);
     let root_public_path = command.out_dir.join(ROOT_PUBLIC_FILE);
-    let root_signing_key = ensure_root_keypair(&root_secret_path, &root_public_path)?;
+    let (root_secret_path, root_signing_key) = match &command.root_secret_key {
+        Some(supplied) => (
+            supplied.clone(),
+            supplied_root_keypair(supplied, &root_public_path)?,
+        ),
+        None => {
+            let generated = command.out_dir.join(ROOT_SECRET_FILE);
+            let key = ensure_root_keypair(&generated, &root_public_path)?;
+            (generated, key)
+        }
+    };
 
     let init_manifest = workspace_root.join(&command.init_manifest);
     let bootfs_root = workspace_root.join(&command.bootfs_root);
@@ -940,35 +1022,34 @@ fn run_kernel_prebuild(
         &workspace_root,
     )?;
 
-    let init_component = build_component_program(
+    let wasm = WasmSource::new(
         &command.cargo,
         &command.profile,
         &command.out_dir,
-        &init_manifest,
-        "init-target",
-        "helios_init.wasm",
-    )?;
+        command
+            .prebuilt_wasm
+            .as_deref()
+            .map(|dir| workspace_root.join(dir)),
+    );
+    let init_component = wasm.component(&init_manifest, INIT_WASM)?;
     let init_cwasm = command.out_dir.join("init_component.cwasm");
     let init_component_bytes = encode_component(&init_component)?;
-    let init_payload = precompile_artifact(
-        &init_component_bytes,
-        &command.target,
-        Hint::Performance.into(),
-    )?
-    .bytes;
-    let init_signed = sign_payload_with_key(&init_payload, &root_signing_key)
-        .map_err(|source| PrebuildError::SignInit { source })?;
-    fs::write(&init_cwasm, init_signed).map_err(|source| PrebuildError::Write {
+    // The boot payload stays at the floor level: every processor the target
+    // supports satisfies it. Only the in-kernel compiler follows the
+    // processor's own level.
+    let floor = cwasm_target_isa_levels(&command.target).floor();
+    let target = CwasmTarget::new(&command.target, floor.name())?;
+    let init_payload =
+        precompile_artifact(&init_component_bytes, &target, Hint::Performance.into())?.bytes;
+    fs::write(&init_cwasm, init_payload).map_err(|source| PrebuildError::Write {
         path: init_cwasm.display().to_string(),
         source,
     })?;
 
     let build = BootBuild {
-        cargo: &command.cargo,
-        profile: &command.profile,
+        wasm: &wasm,
         out_dir: &command.out_dir,
-        target: &command.target,
-        root_signing_key: &root_signing_key,
+        target: &target,
         workspace_root: &workspace_root,
     };
     let mut bootfs_assets = Vec::new();
@@ -980,6 +1061,16 @@ fn run_kernel_prebuild(
         &selected_programs,
         &boot_artifacts_manifest,
     )?);
+    if selected_programs
+        .as_ref()
+        .is_none_or(|selected| selected.contains(INIT_COMMAND))
+    {
+        bootfs_assets.push(BootAsset {
+            path: format!("bin/{INIT_COMMAND}"),
+            source: resolve_bootfs_source(&init_cwasm)?,
+            kind: BootAssetKind::File,
+        });
+    }
 
     let bootfs_path = command.out_dir.join(BOOTFS_IMAGE_FILE);
     write_bootfs_image(
@@ -988,6 +1079,7 @@ fn run_kernel_prebuild(
         &bootfs_assets,
         &init_cwasm,
         &command.init_argv0,
+        &root_signing_key,
     )?;
 
     let resolve = |path: &Path| {
@@ -1030,6 +1122,7 @@ fn write_bootfs_image(
     assets: &[BootAsset],
     init_component: &Path,
     init_argv0: &str,
+    signing_key: &SigningKey,
 ) -> Result<(), PrebuildError> {
     let mut directories = Vec::new();
     let mut files = Vec::new();
@@ -1131,7 +1224,8 @@ fn write_bootfs_image(
         modified_nanos: 0,
     });
 
-    fs::write(image_path, bootfs::write_image(&entries)).map_err(|source| PrebuildError::Write {
+    let signed = bootfs::sign_image(bootfs::write_image(&entries), signing_key);
+    fs::write(image_path, signed).map_err(|source| PrebuildError::Write {
         path: image_path.display().to_string(),
         source,
     })
@@ -1521,30 +1615,23 @@ impl Seek for FileSlice<'_> {
 }
 
 fn build_compiler_plugin_asset(build: &BootBuild<'_>) -> Result<BootAsset, BootfsError> {
-    let wasm_path = build_wasm_program(
-        build.cargo,
-        build.profile,
-        build.out_dir,
-        &build
-            .workspace_root
-            .join(Path::new("compiler-plugin/Cargo.toml")),
-        "compiler-plugin-target",
-        "wasm32-wasip1-threads",
-        "helios_compiler_plugin.wasm",
-    )?;
+    let wasm_path = build.wasm.compiler_plugin(build.workspace_root)?;
     let wasm = fs::read(&wasm_path).map_err(|source| BootfsError::Read {
         path: wasm_path.display().to_string(),
         source,
     })?;
     let payload = precompile_artifact(&wasm, build.target, Hint::Performance.into())?.bytes;
-    let signed = sign_payload_with_key(&payload, build.root_signing_key).map_err(|source| {
-        BootfsError::Sign {
-            payload: "compiler plugin".to_owned(),
-            source,
-        }
+    // The exact module this run precompiled into the bootfs, at a path that
+    // does not depend on cargo's target-directory layout: the bench's Linux
+    // + Wasmtime column runs this file under `helios-compiler-host`, so both
+    // columns run one plugin build.
+    let wasm_output_path = build.out_dir.join("compiler_plugin.wasm");
+    fs::write(&wasm_output_path, &wasm).map_err(|source| BootfsError::Write {
+        path: wasm_output_path.display().to_string(),
+        source,
     })?;
     let output_path = build.out_dir.join("compiler_plugin.cwasm");
-    write_bootfs_artifact(&output_path, signed)?;
+    write_bootfs_artifact(&output_path, payload)?;
 
     Ok(BootAsset {
         path: COMPILER_PLUGIN_BOOTFS_PATH.to_owned(),
@@ -1553,7 +1640,8 @@ fn build_compiler_plugin_asset(build: &BootBuild<'_>) -> Result<BootAsset, Bootf
     })
 }
 
-/// Writes one signed bootfs artifact to `path`.
+/// Writes one bare Wasmtime bootfs artifact to `path`; the image's own
+/// footer is what signs it.
 fn write_bootfs_artifact(path: &Path, bytes: Vec<u8>) -> Result<(), BootfsError> {
     fs::write(path, bytes).map_err(|source| BootfsError::Write {
         path: path.display().to_string(),
@@ -1606,34 +1694,20 @@ fn build_boot_program_assets(
     let mut manifests = Vec::new();
     let mut external_artifacts = read_external_boot_artifacts(boot_artifacts_manifest)?;
 
-    for entry in
-        fs::read_dir(&programs_root).map_err(|source| BootProgramError::ReadProgramsRoot {
-            path: programs_root.display().to_string(),
-            source,
-        })?
-    {
-        let entry = entry.map_err(|source| BootProgramError::ReadProgramsEntry { source })?;
-        let path = entry.path();
-        if !path.is_dir() {
+    for (command, path) in program_dirs(&programs_root)? {
+        available_programs.insert(command.clone());
+        // Init is built once, as the payload's init component; the
+        // prebuild publishes that same artifact at `bin/init`.
+        if command == INIT_COMMAND {
             continue;
         }
-        let Some(command) = path.file_name().and_then(|name| name.to_str()) else {
-            return Err(BootProgramError::ProgramNameNotUtf8 {
-                path: path.display().to_string(),
-            }
-            .into());
-        };
-        if command == "init" {
-            continue;
-        }
-        available_programs.insert(command.to_owned());
         if selected_programs
             .as_ref()
-            .is_some_and(|selected| !selected.contains(command))
+            .is_some_and(|selected| !selected.contains(&command))
         {
             continue;
         }
-        manifests.push(read_program_manifest(command, &path.join("Cargo.toml"))?);
+        manifests.push(read_program_manifest(&command, &path.join("Cargo.toml"))?);
     }
     for artifact in &external_artifacts {
         if !available_programs.insert(artifact.command.clone()) {
@@ -1643,9 +1717,13 @@ fn build_boot_program_assets(
             .into());
         }
     }
-    reject_selected_target_mismatches(&external_artifacts, build.target, selected_programs)?;
+    reject_selected_target_mismatches(
+        &external_artifacts,
+        build.target.triple(),
+        selected_programs,
+    )?;
     external_artifacts.retain(|artifact| {
-        artifact.supports_target(build.target)
+        artifact.supports_target(build.target.triple())
             && selected_programs
                 .as_ref()
                 .is_none_or(|selected| selected.contains(&artifact.command))
@@ -1675,6 +1753,92 @@ fn build_boot_program_assets(
         assets.extend(build_external_boot_artifact_assets(build, artifact)?);
     }
     Ok(assets)
+}
+
+/// Every program directory under `programs_root`, as its command name and
+/// path.
+fn program_dirs(programs_root: &Path) -> Result<Vec<(String, PathBuf)>, BootProgramError> {
+    let mut dirs = Vec::new();
+    for entry in
+        fs::read_dir(programs_root).map_err(|source| BootProgramError::ReadProgramsRoot {
+            path: programs_root.display().to_string(),
+            source,
+        })?
+    {
+        let entry = entry.map_err(|source| BootProgramError::ReadProgramsEntry { source })?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(command) = path.file_name().and_then(|name| name.to_str()) else {
+            return Err(BootProgramError::ProgramNameNotUtf8 {
+                path: path.display().to_string(),
+            });
+        };
+        dirs.push((command.to_owned(), path));
+    }
+    Ok(dirs)
+}
+
+/// Builds the compiler plugin and every program under `programs/` into
+/// `<out-dir>/<profile>/`, one file per artifact name: the wasm every
+/// target's boot payload is precompiled from.
+fn run_wasm_build(
+    command: &WasmBuildCommand,
+    workspace_root: &WorkspaceRoot,
+) -> Result<(), WasmProgramsError> {
+    let dest = command.out_dir.join(profile_dir_name(&command.profile));
+    fs::create_dir_all(&dest).map_err(|source| WasmProgramsError::CreateDir {
+        path: dest.display().to_string(),
+        source,
+    })?;
+    // Cargo's target directories sit beside the result, never in it, so
+    // what is uploaded or handed to `--prebuilt-wasm` is the wasm alone.
+    let scratch = command
+        .out_dir
+        .join(format!("{}-target", profile_dir_name(&command.profile)));
+    let wasm = WasmSource::Build {
+        cargo: &command.cargo,
+        profile: &command.profile,
+        out_dir: &scratch,
+    };
+
+    let mut built = vec![(
+        COMPILER_PLUGIN_MANIFEST.to_owned(),
+        wasm.compiler_plugin(workspace_root)?,
+    )];
+    let mut programs = program_dirs(&workspace_root.join(Path::new("programs")))?;
+    programs.sort();
+    for (command_name, path) in programs {
+        let manifest = read_program_manifest(&command_name, &path.join("Cargo.toml"))?;
+        let artifact = wasm.component(&manifest.manifest_path, &manifest.artifact_name)?;
+        built.push((manifest.manifest_path.display().to_string(), artifact));
+    }
+
+    let mut names = BTreeSet::new();
+    for (source_manifest, artifact) in &built {
+        let name = artifact
+            .file_name()
+            .expect("a built artifact is a file, which has a name");
+        if !names.insert(name.to_owned()) {
+            let first = built
+                .iter()
+                .find(|(_, other)| other.file_name() == Some(name))
+                .map_or_else(String::new, |(manifest, _)| manifest.clone());
+            return Err(WasmProgramsError::DuplicateArtifact {
+                artifact: name.to_string_lossy().into_owned(),
+                first,
+                second: source_manifest.clone(),
+            });
+        }
+        let to = dest.join(name);
+        fs::copy(artifact, &to).map_err(|source| WasmProgramsError::Copy {
+            from: artifact.display().to_string(),
+            to: to.display().to_string(),
+            source,
+        })?;
+    }
+    Ok(())
 }
 
 fn read_external_boot_artifacts(
@@ -1829,27 +1993,16 @@ fn build_boot_program_asset(
     build: &BootBuild<'_>,
     manifest: ProgramManifest,
 ) -> Result<BootAsset, BootfsError> {
-    let wasm_path = build_component_program(
-        build.cargo,
-        build.profile,
-        build.out_dir,
-        &manifest.manifest_path,
-        &format!("bootfs-{}-target", manifest.command),
-        &manifest.artifact_name,
-    )?;
+    let wasm_path = build
+        .wasm
+        .component(&manifest.manifest_path, &manifest.artifact_name)?;
     let component_bytes = encode_component(&wasm_path)?;
     let payload =
         precompile_artifact(&component_bytes, build.target, Hint::Performance.into())?.bytes;
-    let signed = sign_payload_with_key(&payload, build.root_signing_key).map_err(|source| {
-        BootfsError::Sign {
-            payload: "bootfs".to_owned(),
-            source,
-        }
-    })?;
     let output_path = build
         .out_dir
         .join(format!("{}_bootfs_component.cwasm", manifest.command));
-    write_bootfs_artifact(&output_path, signed)?;
+    write_bootfs_artifact(&output_path, payload)?;
 
     Ok(BootAsset {
         path: format!("bin/{}", manifest.command),
@@ -1868,16 +2021,10 @@ fn build_external_boot_artifact_assets(
         source: error,
     })?;
     let payload = precompile_artifact(&wasm, build.target, Hint::Performance.into())?.bytes;
-    let signed = sign_payload_with_key(&payload, build.root_signing_key).map_err(|source| {
-        BootfsError::Sign {
-            payload: format!("external bootfs {}", artifact.command),
-            source,
-        }
-    })?;
     let output_path = build
         .out_dir
         .join(format!("{}_bootfs_component.cwasm", artifact.command));
-    write_bootfs_artifact(&output_path, signed)?;
+    write_bootfs_artifact(&output_path, payload)?;
 
     let mut assets = vec![BootAsset {
         path: artifact.bootfs_path,
@@ -1998,12 +2145,18 @@ fn read_program_manifest(
     })
 }
 
+/// The target directory every `wasm32-wasip2` component program builds
+/// into. The programs are workspace members built with one profile
+/// environment and one `RUSTFLAGS`, so their shared dependencies compile
+/// once; each program is still its own `cargo build`, so its feature
+/// resolution and its `.wasm` are what a private directory would produce.
+const COMPONENT_PROGRAMS_TARGET_DIR: &str = "component-programs-target";
+
 fn build_component_program(
     cargo: &Path,
     profile: &str,
     out_dir: &Path,
     manifest_path: &Path,
-    target_dir_name: &str,
     artifact_name: &str,
 ) -> Result<PathBuf, WasmBuildError> {
     build_wasm_program(
@@ -2011,7 +2164,7 @@ fn build_component_program(
         profile,
         out_dir,
         manifest_path,
-        target_dir_name,
+        COMPONENT_PROGRAMS_TARGET_DIR,
         "wasm32-wasip2",
         artifact_name,
     )
@@ -2055,6 +2208,14 @@ fn build_wasm_program(
     }
     command.env_remove("CARGO_ENCODED_RUSTFLAGS");
     command.env("RUSTFLAGS", wasm_rustflags(target_triple));
+    // C code a program links (ring's, for one) is archived by `cc`, which
+    // falls back to the host's `ar` for a wasm target; that archive carries
+    // no symbol index wasm-ld can read, and the link then misses every C
+    // symbol. The toolchain's own llvm-ar writes one.
+    command.env(
+        format!("AR_{}", target_triple.replace('-', "_")),
+        toolchain_llvm_ar()?,
+    );
     let status = command
         .status()
         .map_err(|source| WasmBuildError::SpawnCargo {
@@ -2069,21 +2230,51 @@ fn build_wasm_program(
         });
     }
 
-    let profile_dir = if profile == "release" {
-        "release"
-    } else {
-        "debug"
-    };
     fs::canonicalize(
         target_dir
             .join(target_triple)
-            .join(profile_dir)
+            .join(profile_dir_name(profile))
             .join(artifact_name),
     )
     .map_err(|source| WasmBuildError::ResolveArtifact {
         artifact: artifact_name.to_owned(),
         source,
     })
+}
+
+/// The llvm-ar the toolchain's llvm-tools component installs beside
+/// rust-lld, in the host's directory of the sysroot.
+fn toolchain_llvm_ar() -> Result<PathBuf, WasmBuildError> {
+    let sysroot = rustc_print("--print=sysroot")?;
+    let host = rustc_print("--print=host-tuple")?;
+    let path = PathBuf::from(sysroot)
+        .join("lib/rustlib")
+        .join(host)
+        .join("bin/llvm-ar");
+    if path.is_file() {
+        Ok(path)
+    } else {
+        Err(WasmBuildError::LlvmArMissing {
+            path: path.display().to_string(),
+        })
+    }
+}
+
+/// What `rustc <query>` prints, without its trailing newline.
+fn rustc_print(query: &'static str) -> Result<String, WasmBuildError> {
+    let output = Command::new("rustc")
+        .arg(query)
+        .output()
+        .map_err(|source| WasmBuildError::SpawnRustc { query, source })?;
+    if !output.status.success() {
+        return Err(WasmBuildError::RustcFailed {
+            query,
+            status: output.status,
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_owned())
 }
 
 fn wasm_rustflags(target_triple: &str) -> String {
@@ -2149,184 +2340,48 @@ fn ensure_root_keypair(
             })?;
         signing_key
     };
-    // The public key always lands next to the secret: it is the copy the
-    // kernel verifies against, and a secret that outlived its public half
-    // would otherwise sign artifacts nothing can check. The write is
-    // skipped when the bytes already match — a kernel build tracks the
-    // file through `cargo:rerun-if-changed`, and an untouched mtime is
-    // what keeps a payload-only prebuild from recompiling it.
-    let public_bytes = VerifyingKey::from(&signing_key).to_bytes();
+    write_root_public_key(&signing_key, root_public_path)?;
+    Ok(signing_key)
+}
+
+/// The root key a release names: read in place, never generated and never
+/// copied, so the only file holding the secret is the one the caller owns.
+fn supplied_root_keypair(
+    root_secret_path: &Path,
+    root_public_path: &Path,
+) -> Result<SigningKey, KeyError> {
+    if !root_secret_path.is_file() {
+        return Err(KeyError::SuppliedKeyMissing {
+            path: root_secret_path.display().to_string(),
+        });
+    }
+    let signing_key = read_signing_key(root_secret_path)?;
+    write_root_public_key(&signing_key, root_public_path)?;
+    Ok(signing_key)
+}
+
+/// The public key always lands in the prebuild directory: it is the copy
+/// the kernel verifies against, and a secret that outlived its public half
+/// would otherwise sign artifacts nothing can check. The write is
+/// skipped when the bytes already match — a kernel build tracks the
+/// file through `cargo:rerun-if-changed`, and an untouched mtime is
+/// what keeps a payload-only prebuild from recompiling it.
+fn write_root_public_key(
+    signing_key: &SigningKey,
+    root_public_path: &Path,
+) -> Result<(), KeyError> {
+    let public_bytes = VerifyingKey::from(signing_key).to_bytes();
     if fs::read(root_public_path).ok().as_deref() != Some(public_bytes.as_slice()) {
         fs::write(root_public_path, public_bytes).map_err(|source| KeyError::Write {
             path: root_public_path.display().to_string(),
             source,
         })?;
     }
-    Ok(signing_key)
+    Ok(())
 }
 
 fn read_signing_key(path: &Path) -> Result<SigningKey, KeyError> {
-    let read_error = |source| KeyError::Read {
-        path: path.display().to_string(),
-        source,
-    };
-    let mut file = fs::File::open(path).map_err(read_error)?;
-    // Judged on the open handle, so the file read is the file checked.
-    let mode = file.metadata().map_err(read_error)?.permissions().mode() & 0o777;
-    if mode & GROUP_AND_OTHER != 0 {
-        return Err(KeyError::SecretKeyExposed {
-            path: path.display().to_string(),
-            mode,
-        });
-    }
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).map_err(read_error)?;
-    let secret_bytes: [u8; 32] =
-        bytes
-            .as_slice()
-            .try_into()
-            .map_err(|source| KeyError::NotThirtyTwoBytes {
-                path: path.display().to_string(),
-                source,
-            })?;
-    Ok(SigningKey::from_bytes(&secret_bytes))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_new_root_secret_is_readable_by_its_owner_alone() {
-        let dir = tempfile::tempdir().expect("a temporary directory");
-        let secret = dir.path().join(ROOT_SECRET_FILE);
-        ensure_root_keypair(&secret, &dir.path().join("root.pub")).expect("a new keypair");
-        let mode = fs::metadata(&secret)
-            .expect("the secret was written")
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, SECRET_KEY_MODE);
-    }
-
-    #[test]
-    fn a_root_secret_others_can_read_is_refused_with_its_mode() {
-        let dir = tempfile::tempdir().expect("a temporary directory");
-        let secret = dir.path().join(ROOT_SECRET_FILE);
-        fs::write(&secret, [7_u8; 32]).expect("a key file");
-        fs::set_permissions(&secret, fs::Permissions::from_mode(0o644)).expect("a wider mode");
-        let error = ensure_root_keypair(&secret, &dir.path().join("root.pub"))
-            .expect_err("a world-readable secret is refused");
-        assert!(
-            matches!(error, KeyError::SecretKeyExposed { mode: 0o644, .. }),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn every_shape_of_github_token_makes_a_header_line() {
-        for token in [
-            "ghs_0123456789abcdefghijklmnopqrstuvwxyzAB",
-            "github_pat_11AAAAAAA0_abcdefghijklmnopqrstuvwxyz",
-            "v1.1f699f1069f60c4d3e2b8a7c5d4e3f2a1b0c9d8e7f",
-        ] {
-            let line = bearer_header("GITHUB_TOKEN", token).expect("a token curl can carry");
-            assert_eq!(
-                line,
-                format!("header = \"Authorization: Bearer {token}\"\n")
-            );
-        }
-    }
-
-    #[test]
-    fn a_value_that_would_escape_the_header_line_is_refused() {
-        for value in [
-            "ghs_abc\"",
-            "ghs_abc\\",
-            "ghs_abc\nurl = evil",
-            "ghs_ab c",
-            "ghs_ab\u{e9}",
-        ] {
-            let error = bearer_header("GH_TOKEN", value)
-                .expect_err("a value that could end or escape the config line is not a token");
-            assert!(
-                matches!(
-                    error,
-                    ProfileFetchError::Token {
-                        variable: "GH_TOKEN"
-                    }
-                ),
-                "{error}"
-            );
-        }
-    }
-
-    #[test]
-    fn selected_target_mismatches_fail_fast() {
-        let mut artifact = test_artifact(
-            "simd-lanes",
-            "helios-wasix-conformance",
-            "0.1.0",
-            "tools/wasi-apps/wasix-tests",
-            Path::new("simd-lanes.wasm"),
-        );
-        artifact.targets.push("aarch64-unknown-none".to_owned());
-        let selected = Some(BTreeSet::from(["simd-lanes".to_owned()]));
-
-        let error =
-            reject_selected_target_mismatches(&[artifact], "riscv64gc-unknown-none-elf", &selected)
-                .expect_err("target-specific artifact must reject unsupported selected target");
-        assert!(
-            error.to_string().contains("simd-lanes supports"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn wasm_simd_requirement_gates_targets() {
-        let mut artifact = test_artifact(
-            "quickjs",
-            "quickjs-ng/quickjs",
-            "v0.14.0",
-            "https://github.com/quickjs-ng/quickjs",
-            Path::new("qjs.wasm"),
-        );
-        artifact.requires_wasm_simd = true;
-
-        assert!(artifact.supports_target("aarch64-unknown-none"));
-        assert!(artifact.supports_target("x86_64-unknown-none"));
-        assert!(artifact.supports_target("aarch64-apple-darwin"));
-        assert!(!artifact.supports_target("riscv64gc-unknown-none-elf"));
-
-        let selected = Some(BTreeSet::from(["quickjs".to_owned()]));
-        let error =
-            reject_selected_target_mismatches(&[artifact], "riscv64gc-unknown-none-elf", &selected)
-                .expect_err("simd-requiring artifact must reject riscv64 selection");
-        assert!(
-            error.to_string().contains("quickjs requires wasm SIMD"),
-            "unexpected error: {error}"
-        );
-    }
-
-    fn test_artifact(
-        command: &str,
-        package: &str,
-        version: &str,
-        source_url: &str,
-        source: &Path,
-    ) -> ExternalBootArtifact {
-        ExternalBootArtifact {
-            command: command.to_owned(),
-            package: package.to_owned(),
-            version: version.to_owned(),
-            source_url: source_url.to_owned(),
-            targets: Vec::new(),
-            requires_wasm_simd: false,
-            bootfs_path: format!("bin/{command}"),
-            source: source.to_owned(),
-            support_root: None,
-            support_bootfs_prefix: None,
-        }
-    }
+    Ok(SigningKey::from_bytes(&read_root_secret_seed(path)?))
 }
 
 /// GitHub's REST API, where a release's tag and its assets are read from.
@@ -2423,7 +2478,7 @@ fn run_profile_fetch(
     let repository = &command.repository;
     let (fetched, profile) = match &command.tag {
         Some(tag) => fetch_release_asset(repository, tag)?,
-        None => fetch_collection_artifact(repository, command.branch.as_deref())?,
+        None => fetch_collection_artifact(repository, command.branch.as_deref(), command.run)?,
     };
     let path = store.profile_path(&fetched.key())?;
     let directory = path.parent().expect("a profile path names its key");
@@ -2482,14 +2537,17 @@ fn fetch_release_asset(
 
 /// The profile inside the newest unexpired collection artifact a run on
 /// `branch` uploaded, the default branch when none is named, and the
-/// record naming that run.
+/// record naming that run. With `run` it is that run's artifact instead,
+/// whatever branch it was on.
 fn fetch_collection_artifact(
     repository: &str,
     branch: Option<&str>,
+    run: Option<u64>,
 ) -> Result<(FetchedProfile, Vec<u8>), ProfileFetchError> {
-    let branch = match branch {
-        Some(branch) => branch.to_owned(),
-        None => default_branch(repository)?,
+    let branch = match (branch, run) {
+        (Some(branch), _) => branch.to_owned(),
+        (None, Some(_)) => String::new(),
+        (None, None) => default_branch(repository)?,
     };
     let url = format!(
         "{GITHUB_API}/repos/{repository}/actions/artifacts\
@@ -2503,11 +2561,20 @@ fn fetch_collection_artifact(
         .find(|artifact| {
             !artifact.expired
                 && artifact.name == KERNEL_PROFILE_ARTIFACT
-                && artifact.workflow_run.head_branch == branch
+                && match run {
+                    Some(run) => artifact.workflow_run.id == run,
+                    None => artifact.workflow_run.head_branch == branch,
+                }
         })
-        .ok_or_else(|| ProfileFetchError::NoCollection {
-            repository: repository.to_owned(),
-            branch: branch.clone(),
+        .ok_or_else(|| match run {
+            Some(run) => ProfileFetchError::NoRunCollection {
+                repository: repository.to_owned(),
+                run,
+            },
+            None => ProfileFetchError::NoCollection {
+                repository: repository.to_owned(),
+                branch: branch.clone(),
+            },
         })?;
     // The archive endpoint answers with a redirect to GitHub's object
     // store, whose signed URL refuses the token the API wanted, so the
@@ -2732,4 +2799,249 @@ fn bearer_header(variable: &'static str, token: &str) -> Result<String, ProfileF
         return Err(ProfileFetchError::Token { variable });
     }
     Ok(format!("header = \"Authorization: Bearer {token}\"\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    #[test]
+    fn a_prebuilt_tree_is_read_from_its_profile_directory() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let release = root.path().join("release");
+        fs::create_dir(&release).expect("a profile directory");
+        fs::write(release.join(INIT_WASM), b"\0asm").expect("a wasm file");
+        let source = WasmSource::new(
+            Path::new("cargo"),
+            "release",
+            Path::new("unused"),
+            Some(root.path().to_path_buf()),
+        );
+        let found = source
+            .component(Path::new("unused/Cargo.toml"), INIT_WASM)
+            .expect("the prebuilt file is found");
+        assert_eq!(found, release.join(INIT_WASM));
+    }
+
+    #[test]
+    fn a_missing_prebuilt_file_is_refused_and_never_built() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        // Only the release tree exists, so a debug prebuild finds nothing.
+        fs::create_dir(root.path().join("release")).expect("a profile directory");
+        let source = WasmSource::new(
+            Path::new("cargo"),
+            "debug",
+            Path::new("unused"),
+            Some(root.path().to_path_buf()),
+        );
+        let Err(error) = source.component(Path::new("unused/Cargo.toml"), INIT_WASM) else {
+            panic!("a file that is not there is refused");
+        };
+        assert!(
+            matches!(&error, WasmBuildError::PrebuiltMissing { path, profile }
+                if path.ends_with("debug/helios_init.wasm") && profile == "debug"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_new_root_secret_is_readable_by_its_owner_alone() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let secret = dir.path().join(ROOT_SECRET_FILE);
+        ensure_root_keypair(&secret, &dir.path().join("root.pub")).expect("a new keypair");
+        let mode = fs::metadata(&secret)
+            .expect("the secret was written")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, SECRET_KEY_MODE);
+    }
+
+    #[test]
+    fn a_root_secret_others_can_read_is_refused_with_its_mode() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let secret = dir.path().join(ROOT_SECRET_FILE);
+        fs::write(&secret, [7_u8; 32]).expect("a key file");
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o644)).expect("a wider mode");
+        let error = ensure_root_keypair(&secret, &dir.path().join("root.pub"))
+            .expect_err("a world-readable secret is refused");
+        assert!(
+            matches!(
+                error,
+                KeyError::Read(RootSecretReadError::SecretKeyExposed { mode: 0o644, .. })
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_supplied_root_secret_signs_and_nothing_secret_is_written_beside_the_public_key() {
+        let keys = tempfile::tempdir().expect("a directory for the release key");
+        let out_dir = tempfile::tempdir().expect("a prebuild directory");
+        let supplied = keys.path().join("release.key");
+        fs::write(&supplied, [7_u8; 32]).expect("a key file");
+        fs::set_permissions(&supplied, fs::Permissions::from_mode(SECRET_KEY_MODE))
+            .expect("an owner-only mode");
+        let public = out_dir.path().join(ROOT_PUBLIC_FILE);
+
+        let key = supplied_root_keypair(&supplied, &public).expect("the supplied key is read");
+
+        let expected = VerifyingKey::from(&SigningKey::from_bytes(&[7_u8; 32])).to_bytes();
+        assert_eq!(fs::read(&public).expect("the public half"), expected);
+        let signed = bootfs::sign_image(bootfs::write_image(&[]), &key);
+        let footer_start = signed.len() - bootfs::SIGNATURE_FOOTER_BYTES;
+        // Magic, footer version and algorithm precede the signer's key.
+        let signer_offset = footer_start + 8 + 4 + 4;
+        assert_eq!(
+            &signed[signer_offset..signer_offset + 32],
+            expected.as_slice()
+        );
+        let written: Vec<_> = fs::read_dir(out_dir.path())
+            .expect("the prebuild directory")
+            .map(|entry| entry.expect("an entry").file_name())
+            .collect();
+        assert_eq!(written, [std::ffi::OsString::from(ROOT_PUBLIC_FILE)]);
+    }
+
+    #[test]
+    fn a_missing_supplied_root_secret_is_refused_naming_its_path() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let supplied = dir.path().join("absent.key");
+        let error = supplied_root_keypair(&supplied, &dir.path().join("root.pub"))
+            .expect_err("a key that is not there is never generated");
+        assert!(
+            matches!(&error, KeyError::SuppliedKeyMissing { path } if path == &supplied.display().to_string()),
+            "{error}"
+        );
+        assert!(!supplied.exists(), "nothing was generated at the path");
+    }
+
+    #[test]
+    fn a_supplied_root_secret_others_can_read_is_refused_with_its_mode() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let supplied = dir.path().join("release.key");
+        fs::write(&supplied, [7_u8; 32]).expect("a key file");
+        fs::set_permissions(&supplied, fs::Permissions::from_mode(0o640)).expect("a wider mode");
+        let public = dir.path().join("root.pub");
+        let error =
+            supplied_root_keypair(&supplied, &public).expect_err("a group-readable key is refused");
+        assert!(
+            matches!(
+                error,
+                KeyError::Read(RootSecretReadError::SecretKeyExposed { mode: 0o640, .. })
+            ),
+            "{error}"
+        );
+        assert!(
+            !public.exists(),
+            "no public half is written for a refused key"
+        );
+    }
+
+    #[test]
+    fn every_shape_of_github_token_makes_a_header_line() {
+        for token in [
+            "ghs_0123456789abcdefghijklmnopqrstuvwxyzAB",
+            "github_pat_11AAAAAAA0_abcdefghijklmnopqrstuvwxyz",
+            "v1.1f699f1069f60c4d3e2b8a7c5d4e3f2a1b0c9d8e7f",
+        ] {
+            let line = bearer_header("GITHUB_TOKEN", token).expect("a token curl can carry");
+            assert_eq!(
+                line,
+                format!("header = \"Authorization: Bearer {token}\"\n")
+            );
+        }
+    }
+
+    #[test]
+    fn a_value_that_would_escape_the_header_line_is_refused() {
+        for value in [
+            "ghs_abc\"",
+            "ghs_abc\\",
+            "ghs_abc\nurl = evil",
+            "ghs_ab c",
+            "ghs_ab\u{e9}",
+        ] {
+            let error = bearer_header("GH_TOKEN", value)
+                .expect_err("a value that could end or escape the config line is not a token");
+            assert!(
+                matches!(
+                    error,
+                    ProfileFetchError::Token {
+                        variable: "GH_TOKEN"
+                    }
+                ),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn selected_target_mismatches_fail_fast() {
+        let mut artifact = test_artifact(
+            "simd-lanes",
+            "helios-wasix-conformance",
+            "0.1.0",
+            "tools/wasi-apps/wasix-tests",
+            Path::new("simd-lanes.wasm"),
+        );
+        artifact.targets.push("aarch64-unknown-none".to_owned());
+        let selected = Some(BTreeSet::from(["simd-lanes".to_owned()]));
+
+        let error =
+            reject_selected_target_mismatches(&[artifact], "riscv64gc-unknown-none-elf", &selected)
+                .expect_err("target-specific artifact must reject unsupported selected target");
+        assert!(
+            error.to_string().contains("simd-lanes supports"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn wasm_simd_requirement_gates_targets() {
+        let mut artifact = test_artifact(
+            "quickjs",
+            "quickjs-ng/quickjs",
+            "v0.14.0",
+            "https://github.com/quickjs-ng/quickjs",
+            Path::new("qjs.wasm"),
+        );
+        artifact.requires_wasm_simd = true;
+
+        assert!(artifact.supports_target("aarch64-unknown-none"));
+        assert!(artifact.supports_target("x86_64-unknown-none"));
+        assert!(artifact.supports_target("aarch64-apple-darwin"));
+        assert!(!artifact.supports_target("riscv64gc-unknown-none-elf"));
+
+        let selected = Some(BTreeSet::from(["quickjs".to_owned()]));
+        let error =
+            reject_selected_target_mismatches(&[artifact], "riscv64gc-unknown-none-elf", &selected)
+                .expect_err("simd-requiring artifact must reject riscv64 selection");
+        assert!(
+            error.to_string().contains("quickjs requires wasm SIMD"),
+            "unexpected error: {error}"
+        );
+    }
+
+    fn test_artifact(
+        command: &str,
+        package: &str,
+        version: &str,
+        source_url: &str,
+        source: &Path,
+    ) -> ExternalBootArtifact {
+        ExternalBootArtifact {
+            command: command.to_owned(),
+            package: package.to_owned(),
+            version: version.to_owned(),
+            source_url: source_url.to_owned(),
+            targets: Vec::new(),
+            requires_wasm_simd: false,
+            bootfs_path: format!("bin/{command}"),
+            source: source.to_owned(),
+            support_root: None,
+            support_bootfs_prefix: None,
+        }
+    }
 }

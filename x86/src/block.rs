@@ -1,10 +1,10 @@
 //! virtio-blk over PCI for the x86 backend.
 //!
 //! q35 hands the kernel every disk on the same bus — the image the
-//! firmware booted from and the scratch disk the kernel owns are two
-//! functions of the same device class — so every one of them is brought
-//! up here and the kernel decides which it keeps from the serials they
-//! report.
+//! firmware booted from, the scratch disk the kernel owns and the images
+//! it mounts are functions of the same device class — so every one of
+//! them is brought up here, up to the block interrupt vectors, and the
+//! kernel decides what each is for from the serials they report.
 //!
 //! Concurrency contract: the functions are discovered and programmed on
 //! the bootstrap processor before interrupts are enabled, and each of
@@ -23,9 +23,10 @@ use pci_types::PciAddress;
 use crate::X86Cpu;
 use crate::exceptions::BLOCK_INTERRUPT_VECTORS;
 use crate::iommu::X86DmaPool;
-use crate::pci::PciRoot;
+use crate::pci::{PciRoot, VirtioFunctions};
 
-type X86VirtioBlockDevice = VirtioBlockResource<VirtioPciTransport<X86DmaPool>, X86Cpu>;
+pub(crate) type X86VirtioBlockDevice =
+    VirtioBlockResource<VirtioPciTransport<X86DmaPool>, X86Cpu, helios_kernel::BlockPages>;
 
 #[derive(Clone)]
 pub(crate) struct VirtioBlockDevice {
@@ -45,23 +46,17 @@ impl ExternalInterruptHandler for VirtioBlockDevice {
     }
 }
 
-/// Every PCI function that carries a block device.
-pub(crate) fn discover(pci: &PciRoot) -> Vec<PciAddress> {
-    let functions: Vec<PciAddress> = pci.find_virtio_functions(DeviceType::Block).collect();
-    assert!(
-        functions.len() <= BLOCK_INTERRUPT_VECTORS.len(),
-        "platform exposes {} block functions but only {} interrupt vectors exist",
-        functions.len(),
-        BLOCK_INTERRUPT_VECTORS.len()
-    );
-    functions
+/// Every PCI function that carries a block device, up to the block
+/// interrupt vectors this backend has; the rest are refused by name.
+pub(crate) fn discover(virtio: &VirtioFunctions) -> Vec<PciAddress> {
+    helios_kernel::admit_block_devices(virtio.find_virtio_functions(DeviceType::Block).collect())
 }
 
 /// Brings up every block function and hands them to the kernel, which
-/// keeps the one the platform named as its own.
-pub(crate) fn install<WatchdogImpl>(
+/// gives each the role its serial names.
+pub(crate) fn install<WatchdogImpl, MeasuredBootImpl>(
     cpu: &X86Cpu,
-    kernel: &helios_kernel::Kernel<X86Cpu, WatchdogImpl>,
+    kernel: &helios_kernel::Kernel<X86Cpu, WatchdogImpl, MeasuredBootImpl>,
     pci: &PciRoot,
     functions: &[(PciAddress, X86DmaPool)],
     destination_apic_id: u32,
@@ -70,6 +65,7 @@ pub(crate) fn install<WatchdogImpl>(
 ) -> Vec<BlockInterrupt>
 where
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
 {
     let discovered: Vec<BlockInterrupt> = functions
         .iter()
@@ -103,8 +99,18 @@ where
         .map(|interrupt| interrupt.device.device.clone())
         .collect();
     let state = debug_state.clone();
-    helios_kernel::install_block_devices(kernel, root, devices, move |service| {
-        state.install_block_service(service);
-    });
+    // Swap is not wired on this backend (see the caller), so the scratch
+    // disk is proved and counted but nothing writes to it yet.
+    helios_kernel::install_block_devices(
+        kernel,
+        root,
+        devices,
+        move |service, _scratch, mount_sources| {
+            state.install_block_service(service);
+            if let Some(cache) = mount_sources {
+                state.install_mount_sources(cache);
+            }
+        },
+    );
     discovered
 }

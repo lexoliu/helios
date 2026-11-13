@@ -4,12 +4,13 @@ mod error;
 use error::*;
 mod pump;
 use pump::*;
+mod routes;
+use routes::*;
 mod tcp;
 use tcp::*;
 mod udp;
 use udp::*;
 mod component;
-use component::*;
 mod shard;
 use shard::*;
 mod identifiers;
@@ -27,21 +28,21 @@ use core::task::Poll;
 use core::time::Duration;
 
 use bytes::Bytes;
-use helios_hal::cpu::{Cpu, HardwarePerfCounters, current_processor};
+use helios_hal::cpu::{Cpu, HardwarePerfCounterDelta, HardwarePerfCounters, current_processor};
 use helios_hal::io::IoError;
 use helios_netstack::{
-    DEFAULT_HOP_LIMIT, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DNS_PORT, DhcpClientMessage,
-    DhcpDnsServers, DhcpMessageType, DhcpPacket, DhcpServerMessage, DnsQuery, DnsQuestionWriter,
-    DnsRecordType, DnsResponse, EthernetFrame, EthernetProtocol, FlowTuple, IcmpEchoKey,
-    IcmpEchoReply, Icmpv4Packet, Icmpv6Packet, InterfaceEventMark, IpAddress, IpCidr, IpProtocol,
-    Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6AddressEntry, Ipv6Cidr, Ipv6Packet,
-    MAX_OUTBOUND_FRAMES, NeighborCache, NeighborEntry, NetworkInterface as NetworkDevice,
-    OutboundBatchStatus, Route, RouteTable, RxChecksumOffload, RxDrain, RxFrame,
-    SegmentationOffload, Stack, StackConfig, StackError, StackEvent, StackInstant, StackSecret,
-    TcpCloseKind, TcpConnectState, TcpConnectTerminalError, TcpEndpoint, TcpListenBacklog,
-    TcpPacket, TcpReadIntoState, TcpReadState, TcpReceiveDiagnostics, TcpSendState,
-    TcpStackCounters, UdpEgress, UdpEndpoint, UdpPacket, UdpPayload, UdpSocketBinding,
-    UdpSocketError, flow_hash,
+    DEFAULT_HOP_LIMIT, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DNS_PORT, DhcpAction, DhcpClient,
+    DhcpDestination, DhcpDnsServers, DhcpLease, DhcpPacket, DhcpTransmit, DnsQuery,
+    DnsQuestionWriter, DnsRecordType, DnsResponse, EthernetFrame, EthernetProtocol, FlowTuple,
+    IcmpEchoKey, IcmpEchoReply, Icmpv4Packet, Icmpv6Packet, InterfaceEventMark, IpAddress, IpCidr,
+    IpProtocol, Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6AddressEntry, Ipv6Cidr,
+    Ipv6Packet, MAX_OUTBOUND_FRAMES, NeighborCache, NeighborEntry,
+    NetworkInterface as NetworkDevice, OutboundBatchStatus, Route, RouteTable, RxChecksumOffload,
+    RxDrain, RxFrame, SegmentationOffload, Stack, StackConfig, StackError, StackEvent,
+    StackInstant, StackSecret, TcpCloseKind, TcpConnectState, TcpConnectTerminalError, TcpEndpoint,
+    TcpListenBacklog, TcpPacket, TcpReadIntoState, TcpReadState, TcpReceiveDiagnostics,
+    TcpSendState, TcpStackCounters, UdpEgress, UdpEndpoint, UdpPacket, UdpPayload,
+    UdpSocketBinding, UdpSocketError, flow_hash, next_transaction_id,
 };
 use spin::{Mutex as SpinMutex, RwLock as SpinRwLock};
 
@@ -52,8 +53,8 @@ use crate::{
     NetworkBridgeRequest, NetworkControlError, NetworkErrorDetail, NetworkIpAddress, NetworkPortId,
     PingError, PingErrorKind, PingReply, ProfileSink, ProgressMark, ProgressSignal,
     RegisteredTcpReadBuffer, RootEntropyHandle, TcpAccepted, TcpError, TcpErrorKind, TcpListener,
-    TcpReadProgress, TcpWriteProgress, Timer, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
-    UptimeClock,
+    TcpReadInto, TcpReadProgress, TcpWriteProgress, Timer, UdpBinding, UdpDatagram, UdpError,
+    UdpErrorKind, UptimeClock,
 };
 use triomphe::Arc;
 
@@ -67,6 +68,10 @@ const EPHEMERAL_PORT_END: u16 = 65_535;
 /// with, so all of them are demultiplexed here on every backend. It is
 /// also where unqualified control-plane operations run, so a route the
 /// ARP reply taught and the query that reads it meet on one shard.
+///
+/// A Neighbor Advertisement is received here too, and is then also
+/// offered to every other shard as the answer to a resolution that
+/// shard is pending (`RxFrameOwner::ResolutionAnswer`).
 const DEFAULT_SHARD_IDX: usize = 0;
 
 const INTERNAL_DHCP_SOCKET_INDEX: usize = 0;
@@ -75,7 +80,17 @@ const INTERNAL_DHCP_SOCKET_INDEX: usize = 0;
 /// needs one: the resolver uses an ordinary connected socket.
 const INTERNAL_UDP_RESERVED_SLOTS: usize = 1;
 const LOCAL_NETWORK_PORT: NetworkPortId = NetworkPortId::new(0);
-const DHCP_RETRANSMIT_NANOS: u64 = 1_000_000_000;
+/// The longest a park waits on the interface's configuration duties
+/// when the DHCP client has no earlier deadline.
+///
+/// The DHCP client names its own next deadline. IPv6 router
+/// solicitation, which shares the duty, has no deadline the stack
+/// exposes, so a park on the duty still wakes at this interval to
+/// give a dropped solicitation its retransmission. One second is the
+/// interval the duty was polled at when DHCP retransmitted on it, and
+/// leaves a solicitation, which the stack paces at RFC 4861's
+/// four-second `RTR_SOLICITATION_INTERVAL`, at most that late.
+const CONFIGURATION_POLL_NANOS: u64 = 1_000_000_000;
 const MAX_TCP_STREAM_HANDLES: usize = 256;
 const MAX_TCP_LISTENER_HANDLES: usize = 64;
 const MAX_UDP_SOCKET_HANDLES: usize = 256;
@@ -96,8 +111,8 @@ const NETWORK_PROGRESS_WAIT: Duration = Duration::from_micros(50);
 /// caller's deadline and give up without ever asking twice. The
 /// callers that own such a duty — the DNS resolver and the ping walk
 /// while its next hop is still unresolved — bound their wait by this
-/// instead. DHCP has a retransmission interval of its own
-/// (`DHCP_RETRANSMIT_NANOS`) and bounds its wait by that.
+/// instead. DHCP has deadlines of its own, which the client names, and
+/// bounds its wait by those (`NetworkService::configuration_wait`).
 const NETWORK_RETRANSMIT_WAIT: Duration = Duration::from_millis(250);
 // AArch64/HVF local TCP diagnostics showed that matching the borrowed RX
 // batch to the virtio polling budget moves receive work in the right
@@ -143,6 +158,9 @@ where
     timer: Timer<CpuImpl>,
     device: Device,
     state: NetworkShardSet,
+    /// Which processor drains each queue pair and which pairs are live
+    /// (`routes`' module docs).
+    pairs: PairRoutes,
     control: NetworkControlPlane,
     /// Adaptive poll budget shared across all shards. Lifted out of
     /// `NetworkShard` so its atomic-load reads on the network poll
@@ -236,8 +254,32 @@ pub struct NetworkQueueStats {
     pub tcp_window_updates_sent: u64,
     /// Segments this shard retransmitted, by timer or fast retransmit.
     pub tcp_retransmits_sent: u64,
-    /// Connections this shard holds.
+    /// Connections this shard holds, orphans included.
     pub tcp_sockets: u32,
+    /// How many of `tcp_sockets` are orphans: closed by their owner while
+    /// the stack still runs out the connection.
+    pub tcp_orphan_sockets: u32,
+    /// What those orphans still owe their peers, in bytes: sent and
+    /// unacknowledged plus queued and unsent.
+    pub tcp_orphan_send_queued_bytes: u64,
+    /// Orphans in `FIN-WAIT-1`: their FIN is sent, unacknowledged.
+    pub tcp_orphan_fin_wait_1: u32,
+    /// Orphans in `FIN-WAIT-2`: their FIN is acknowledged, the peer's has
+    /// not arrived.
+    pub tcp_orphan_fin_wait_2: u32,
+    /// Orphans in `CLOSING`: both FINs crossed, theirs unacknowledged.
+    pub tcp_orphan_closing: u32,
+    /// Orphans in `LAST-ACK`: the peer closed first and their FIN is
+    /// unacknowledged.
+    pub tcp_orphan_last_ack: u32,
+    /// Orphans in `TIME-WAIT`: waiting out the 2MSL timer.
+    pub tcp_orphan_time_wait: u32,
+    /// Orphans in any other state (`CLOSED` awaiting the sweep,
+    /// `ESTABLISHED`, `CLOSE-WAIT`, `SYN-SENT`, `SYN-RECEIVED`).
+    pub tcp_orphan_other_state: u32,
+    /// Orphans whose retransmission timer is armed: a sent segment awaits
+    /// acknowledgement.
+    pub tcp_orphan_retransmit_armed: u32,
     /// How many of them are refusing segments for want of receive room.
     /// Nonzero with `tcp_sockets` at zero is a leaked window: the shard
     /// will refuse frames with no socket left that could relieve it.
@@ -622,18 +664,17 @@ impl<T, const CAPACITY: usize> HandleSlab<T, CAPACITY> {
     }
 }
 
-const fn next_transaction_id(current: u32) -> u32 {
-    let next = current.wrapping_add(1);
-    if next == 0 { 1 } else { next }
-}
-
 impl<CpuImpl, DeviceImpl> NetworkService<CpuImpl, DeviceImpl>
 where
     CpuImpl: Cpu + Clone,
     DeviceImpl: NetworkDevice,
 {
+    /// A service with one shard per processor, each carved from the
+    /// memory of its processor's node out of `pool`. `cpu` and `pool`
+    /// describe the same machine.
     pub fn new(
         cpu: CpuImpl,
+        pool: &crate::memory::UserMemoryPool,
         profiles: ProfileSink,
         clock: UptimeClock,
         timer: Timer<CpuImpl>,
@@ -663,7 +704,13 @@ where
         // are a follow-up. The `transaction_id` is staggered per
         // shard so DHCP DISCOVER messages from different shards do
         // not race over the same XID.
-        let shard_count = cpu.processor_count().max(1);
+        let shard_count = pool.locality().processor_count();
+        assert_eq!(
+            shard_count,
+            cpu.processor_count(),
+            "the platform reports {} processors and the NUMA description {shard_count}",
+            cpu.processor_count()
+        );
         // We probe the configured rx_budget once via a throwaway
         // Stack — every shard's Stack uses the same StackConfig so
         // the value is identical across shards.
@@ -690,7 +737,7 @@ where
                 .with_direct_tx_dma(capabilities.direct_tx_dma)
                 .with_segmentation_offload(segmentation);
         let stack_rx_budget = Stack::new(stack_config).config().rx_budget;
-        let state = NetworkShardSet::new(shard_count, |index| {
+        let state = NetworkShardSet::new(pool, |index| {
             let staggered_xid = transaction_id.wrapping_add(index as u32);
             NetworkShard::new(
                 stack_config,
@@ -700,6 +747,10 @@ where
                 root_entropy.clone(),
             )
         });
+        // Shards are sized to the possible processors and never
+        // re-partition; the pairs that are live follow the online set
+        // instead (`routes`).
+        let pairs = PairRoutes::new(device.queue_pair_count().max(1), shard_count);
         Self {
             inner: Arc::new(NetworkServiceInner {
                 cpu,
@@ -707,6 +758,7 @@ where
                 clock,
                 timer,
                 state,
+                pairs,
                 control: NetworkControlPlane::new(),
                 poll: NetworkPollState::new(rx_poll_budget, tx_completion_budget, rx_poll_budget),
                 stack_rx_budget,
@@ -745,6 +797,15 @@ where
                         tcp_window_updates_sent: tcp.window_updates_sent,
                         tcp_retransmits_sent: tcp.retransmits_sent,
                         tcp_sockets: tcp.sockets,
+                        tcp_orphan_sockets: tcp.orphan_sockets,
+                        tcp_orphan_send_queued_bytes: tcp.orphan_send_queued_bytes,
+                        tcp_orphan_fin_wait_1: tcp.orphan_fin_wait_1,
+                        tcp_orphan_fin_wait_2: tcp.orphan_fin_wait_2,
+                        tcp_orphan_closing: tcp.orphan_closing,
+                        tcp_orphan_last_ack: tcp.orphan_last_ack,
+                        tcp_orphan_time_wait: tcp.orphan_time_wait,
+                        tcp_orphan_other_state: tcp.orphan_other_state,
+                        tcp_orphan_retransmit_armed: tcp.orphan_retransmit_armed,
                         tcp_receive_backpressured_sockets: tcp.receive_backpressured_sockets,
                         tcp_receive_window_bytes: tcp.receive_window_bytes,
                         receive_queued_bytes: tcp.receive_queued_bytes,
@@ -780,7 +841,7 @@ where
         let identifier = self
             .inner
             .state
-            .with_mut(NetworkShard::next_icmp_echo_identifier);
+            .with_mut(NetworkShard::draw_icmp_echo_identifier);
         let mut sequence: u16 = 0;
         // Every candidate shares the caller's deadline, exactly as the
         // connect walk does: a destination that is unreachable in one
@@ -987,11 +1048,11 @@ where
                 return Err(timeout_error());
             }
             // A dropped DISCOVER or router solicitation produces no
-            // event at all, so the wait is capped by the retransmission
-            // interval the client state machine expects.
+            // event at all, so the wait is capped by the next deadline
+            // of the configuration state machines.
             self.wait_for_shard_progress(
                 wait,
-                self.retransmit_wait(deadline_nanos, Duration::from_nanos(DHCP_RETRANSMIT_NANOS)),
+                self.retransmit_wait(deadline_nanos, self.configuration_wait()),
             )
             .await;
         }
@@ -1009,22 +1070,28 @@ where
         // shard that solicits is the shard that receives.
         // `publish_from_shard` republishes the resulting addresses and
         // routes to the rest of the set.
-        let configured = {
+        let (configured, lease_changed, driven) = {
             let mut state = self.inner.state.shard_for_default().lock();
-            state
-                .drive_dhcp(now)
-                .map_err(NetworkConfigurationError::Control)?;
-            state
-                .drive_ipv6_autoconfig(now)
-                .map_err(NetworkConfigurationError::Control)?;
-            if state.is_configured() {
+            let dhcp = state.drive_dhcp(now);
+            let ipv6 = state.drive_ipv6_autoconfig(now);
+            // A lease that ended leaves the shard unconfigured, and the
+            // control plane still holding it: publishing is what takes
+            // it back, and the sync below is what takes it off every
+            // other shard. Both happen before a failure is reported,
+            // because what the drive changed is already on the shard.
+            if dhcp.lease_changed || state.is_configured() {
                 self.inner.control.publish_from_shard(&state);
             }
-            state.is_configured()
+            (
+                state.is_configured(),
+                dhcp.lease_changed,
+                dhcp.result.and(ipv6),
+            )
         };
-        if configured {
+        if configured || lease_changed {
             self.synchronize_control_plane();
         }
+        driven.map_err(NetworkConfigurationError::Control)?;
         self.drive_network(NetworkPollSource::Configuration)
             .await
             .map_err(NetworkConfigurationError::Device)?;
@@ -1036,7 +1103,7 @@ where
     /// whatever they learned to the control plane.
     ///
     /// This is the no-operation path of `drive_ipv4_configuration`:
-    /// the pump on the bootstrap processor's pair runs it on every
+    /// the pump on pair 0 runs it on every
     /// poll round, so a dropped DISCOVER or solicitation is still
     /// retransmitted while every socket on the machine is parked. The
     /// default shard submits on pair zero, which is that pump's own
@@ -1046,13 +1113,14 @@ where
     fn drive_interface_configuration(&self) {
         let now = StackInstant::from_nanos(self.now_nanos());
         let mut state = self.inner.state.shard_for_default().lock();
-        state
-            .drive_dhcp(now)
-            .unwrap_or_else(|error| tracing::debug!(?error, "failed to drive DHCP"));
+        let dhcp = state.drive_dhcp(now);
+        if let Err(error) = dhcp.result {
+            tracing::debug!(?error, "failed to drive DHCP");
+        }
         state.drive_ipv6_autoconfig(now).unwrap_or_else(|error| {
             tracing::debug!(?error, "failed to drive IPv6 autoconfiguration")
         });
-        if state.is_configured() {
+        if dhcp.lease_changed || state.is_configured() {
             self.inner.control.publish_from_shard(&state);
         }
     }
@@ -1109,7 +1177,7 @@ where
     ///
     /// The pump has no caller deadline, but it does own the stack's
     /// timer duties for the shards its pair serves — TCP retransmit
-    /// and delayed-ACK deadlines, and on the bootstrap pump DHCP
+    /// and delayed-ACK deadlines, and on pair 0's pump DHCP
     /// retransmission besides — so the park has to be bounded by the
     /// soonest of them. Left purely event-driven, a lost DHCP reply
     /// would never be retransmitted, because the wake that would drive
@@ -1120,17 +1188,47 @@ where
     /// hand it — a frame another processor drained, a read that
     /// relieved receive backpressure — raises the arrival signal the
     /// park races this bound against.
-    fn pump_wait(&self, pair: usize) -> Duration {
-        let pair_count = self.inner.device.queue_pair_count().max(1);
+    fn pump_wait(&self, pair: usize, interface_wide: bool) -> Duration {
         let now = self.now_nanos();
-        let next_stack_deadline = self
+        let next_tcp_deadline = self
             .inner
             .state
-            .pair_tcp_deadline_nanos(pair, pair_count)
-            .map_or(DHCP_RETRANSMIT_NANOS, |deadline| {
-                deadline.saturating_sub(now).min(DHCP_RETRANSMIT_NANOS)
+            .pair_tcp_deadline_nanos(pair, self.inner.pairs.layout())
+            .map_or(CONFIGURATION_POLL_NANOS, |deadline| {
+                deadline.saturating_sub(now).min(CONFIGURATION_POLL_NANOS)
             });
-        self.progress_wait(Duration::from_nanos(next_stack_deadline))
+        let bound = Duration::from_nanos(next_tcp_deadline);
+        // The configuration duty is pair 0's pump's alone, so its
+        // park is bounded by the DHCP client's next deadline as well.
+        let bound = if interface_wide {
+            bound.min(self.configuration_wait())
+        } else {
+            bound
+        };
+        self.progress_wait(bound)
+    }
+
+    /// How long a park may last before the interface's configuration
+    /// duties are due again: the DHCP client's next deadline — a
+    /// retransmission, T1, T2 or the lease's expiry — and no longer than
+    /// [`CONFIGURATION_POLL_NANOS`], which covers IPv6 router
+    /// solicitation.
+    fn configuration_wait(&self) -> Duration {
+        let now = self.now_nanos();
+        let deadline = self
+            .inner
+            .state
+            .shard_for_default()
+            .lock()
+            .dhcp
+            .next_deadline();
+        let nanos = deadline.map_or(CONFIGURATION_POLL_NANOS, |deadline| {
+            deadline
+                .nanos()
+                .saturating_sub(now)
+                .min(CONFIGURATION_POLL_NANOS)
+        });
+        Duration::from_nanos(nanos)
     }
 
     /// The wait to hand [`Self::wait_for_progress`] for a caller that
@@ -1160,7 +1258,10 @@ where
     /// processor placed, and the interface's event counters for a frame
     /// still sitting in the ring.
     fn shard_wait(&self, idx: usize) -> NetworkWait {
-        self.network_wait(idx, self.inner.state.shard_wait(idx))
+        self.network_wait(
+            self.inner.pairs.pair_of_shard(idx),
+            self.inner.state.shard_wait(idx),
+        )
     }
 
     /// The same for a waiter that belongs to no single shard: a
@@ -1171,10 +1272,12 @@ where
     /// processor drains — because the cross-shard hand-off is the
     /// arrival signal's job, not the device's.
     fn any_shard_wait(&self) -> NetworkWait {
-        let queue_idx = self
-            .inner
-            .state
-            .shard_idx_for_processor(current_processor());
+        let processor = current_processor();
+        let queue_idx = self.inner.pairs.drained_by(processor).unwrap_or_else(|| {
+            self.inner
+                .pairs
+                .pair_of_shard(self.inner.state.shard_idx_for_processor(processor))
+        });
         self.network_wait(queue_idx, self.inner.state.any_shard_wait())
     }
 
@@ -1184,12 +1287,13 @@ where
     /// for work the device reports there, and the arrival of the shard
     /// the pair's index names — which is also the signal raised for
     /// work queued on any shard the pair serves, since a shard's egress
-    /// submits on the pair its index folds onto. The bootstrap
-    /// processor's pump is the only one that also arms the device-wide
-    /// channel: link and configuration events arrive on no pair, and
-    /// nobody else may act on them.
+    /// submits on the live pair it folds onto, and the signal a
+    /// hand-off raises so the pump reads its pair again. The pump on
+    /// pair 0 is the only one that also arms the device-wide channel:
+    /// link and configuration events arrive on no pair, and nobody else
+    /// may act on them.
     fn pump_shard_wait(&self, pair: usize, interface_wide: bool) -> NetworkWait {
-        let mut wait = self.shard_wait(pair);
+        let mut wait = self.network_wait(pair, self.inner.state.shard_wait(pair));
         if !interface_wide {
             wait.device.device = None;
         }
@@ -1331,9 +1435,9 @@ where
     /// a synchronous close queued leaves on the next executor turn
     /// rather than the next protocol timer (#232, #231).
     ///
-    /// A shard's egress submits on the pair its index folds onto, so
-    /// the pump parked on that pair's arrival signal is the one to
-    /// raise.
+    /// A shard's egress submits on the live pair it folds onto
+    /// (`routes`), so the pump parked on that pair's arrival signal is
+    /// the one to raise.
     ///
     /// Private because the kick is not a duty an owner can be asked to
     /// remember: every close that can queue a segment —
@@ -1341,20 +1445,16 @@ where
     /// [`NetworkService::tcp_listener_close`] — ends with it, so a
     /// `Drop` that retires a handle has nothing left to do (#231).
     fn wake_packet_pump(&self, shard_idx: usize) {
-        let pair = shard_idx % self.inner.device.queue_pair_count().max(1);
+        let pair = self.inner.pairs.pair_of_shard(shard_idx);
         self.inner.state.raise_shard_progress(pair);
     }
 
     /// Wakes every pair's packet pump, for a close whose queued
     /// segments could sit on any shard — a replicated listener's
-    /// backlog scatters them wherever a connection waited.
+    /// backlog scatters them wherever a connection waited — and for a
+    /// hand-off, after which every pump reads its pair again.
     fn wake_packet_pumps(&self) {
-        let pumps = self
-            .inner
-            .state
-            .shard_count()
-            .min(self.inner.device.queue_pair_count().max(1));
-        for pair in 0..pumps {
+        for pair in 0..self.inner.pairs.brought_up() {
             self.inner.state.raise_shard_progress(pair);
         }
     }
@@ -1409,11 +1509,28 @@ where
         events: usize,
         bytes: usize,
     ) {
-        let (Some(start), Some(end)) = (start, end) else {
+        self.record_network_profile_span(
+            phase,
+            NetworkPerfSpan::between(start, end),
+            events,
+            bytes,
+        );
+    }
+
+    fn record_network_profile_span(
+        &self,
+        phase: &'static str,
+        span: Option<NetworkPerfSpan>,
+        events: usize,
+        bytes: usize,
+    ) {
+        let Some(NetworkPerfSpan {
+            nanos: elapsed_nanos,
+            counters,
+        }) = span
+        else {
             return;
         };
-        let counters = end.counters.delta_since(start.counters);
-        let elapsed_nanos = end.nanos.saturating_sub(start.nanos);
         self.inner.profiles.record_profile_stack_parts_nanos(
             crate::ProfileScope::Kernel,
             "kernel;network;",
@@ -1495,7 +1612,7 @@ pub(crate) mod fixture {
     /// This is what a close test reads instead of the wire. Whether a
     /// FIN is on the outbound queue says nothing about when it leaves;
     /// the pump publishes it, and a pump nobody woke sleeps out its
-    /// bound — the soonest protocol timer, `DHCP_RETRANSMIT_NANOS` away
+    /// bound — the soonest protocol timer, `CONFIGURATION_POLL_NANOS` away
     /// on a guest with nothing else to send (#231).
     pub(crate) struct PumpPark<'a> {
         parked: Pin<Box<ProgressChanged<'a>>>,
@@ -1522,11 +1639,15 @@ pub(crate) mod fixture {
         pub(crate) payload_len: usize,
     }
 
+    /// A connection whose clock the test moves: time passes only when
+    /// the test says it does, so a paced sender, a retransmission timer
+    /// and a round trip all run on the time the test states.
     pub(crate) struct EstablishedTcpFixture {
         service: NetworkService<
-            crate::test_support::TestCpu,
+            crate::test_support::ManualClockCpu,
             crate::test_support::RecordingNetworkInterface,
         >,
+        clock: crate::test_support::ManualClockCpu,
         stream: TcpStreamId,
     }
 
@@ -1542,6 +1663,11 @@ pub(crate) mod fixture {
         pub(crate) const LOCAL_SEQUENCE: u32 = 7;
         /// The peer's, for the acknowledgement they carry back.
         pub(crate) const PEER_SEQUENCE: u32 = 100;
+        /// The round trip the handshake measures: the SYN-ACK arrives
+        /// this long after the SYN left. One millisecond is the order of
+        /// a guest's path to its host, and any non-zero value gives the
+        /// connection a real first sample rather than a zero one.
+        pub(crate) const ROUND_TRIP_NANOS: u64 = 1_000_000;
 
         /// A connection in `ESTABLISHED`, with the handshake's own
         /// frames already drained so the next segment on the wire is
@@ -1556,17 +1682,19 @@ pub(crate) mod fixture {
         pub(crate) fn with_interface(
             device: crate::test_support::RecordingNetworkInterface,
         ) -> Self {
-            let cpu = crate::test_support::TestCpu::without_entropy();
+            let clock = crate::test_support::ManualClockCpu::new();
             let service = NetworkService::new(
-                cpu,
+                clock.clone(),
+                crate::test_support::single_node_pool(1),
                 crate::test_support::test_profile_sink(),
                 crate::test_support::test_uptime_clock(),
-                crate::test_support::test_timer(cpu),
+                crate::test_support::test_timer(clock.clone()),
                 device,
                 crate::test_support::test_root_entropy(),
             );
             let fixture = Self {
                 service,
+                clock,
                 stream: {
                     // Placeholder: replaced below once the shard has
                     // the socket. `TcpStreamId` is non-zero, so the
@@ -1609,6 +1737,10 @@ pub(crate) mod fixture {
                 shard.insert_tcp_stream(socket)
             };
             let fixture = Self { stream, ..fixture };
+            // The SYN leaves, and its answer comes back a round trip
+            // later.
+            let _ = fixture.drive();
+            fixture.advance(Self::ROUND_TRIP_NANOS);
             fixture.deliver(
                 TcpHeader {
                     source_port: Self::PEER_PORT,
@@ -1628,10 +1760,15 @@ pub(crate) mod fixture {
         pub(crate) fn service(
             &self,
         ) -> NetworkService<
-            crate::test_support::TestCpu,
+            crate::test_support::ManualClockCpu,
             crate::test_support::RecordingNetworkInterface,
         > {
             self.service.clone()
+        }
+
+        /// Moves the connection's clock forward by `nanos`.
+        pub(crate) fn advance(&self, nanos: u64) {
+            self.clock.advance(nanos);
         }
 
         /// The stream handle a component-host owner holds.
@@ -1645,10 +1782,13 @@ pub(crate) mod fixture {
         ///
         /// The pump parks on the arrival signal of the shard its pair
         /// is named for — the shard this fixture's stream lives on,
-        /// since a shard submits on the pair its index folds onto.
+        /// since a shard submits on the live pair it folds onto.
         pub(crate) fn pump_park(&self) -> PumpPark<'_> {
-            let pair_count = self.service.inner.device.queue_pair_count().max(1);
-            let pair = self.service.inner.state.shard_idx_for_handle(self.stream) % pair_count;
+            let pair = self
+                .service
+                .inner
+                .pairs
+                .pair_of_shard(self.service.inner.state.shard_idx_for_handle(self.stream));
             let wait = self.service.inner.state.shard_wait(pair);
             PumpPark {
                 parked: Box::pin(
@@ -1763,29 +1903,33 @@ mod tests {
 
     use helios_netstack::{
         ArpOperation, ArpPacket, ETHERNET_FRAME_BYTES, EthernetFrame, EthernetProtocol,
-        IcmpEchoKey, Icmpv4Packet, Icmpv6Packet, IpAddress, IpCidr, IpProtocol, Ipv4Address,
-        Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6Packet, MAX_OUTBOUND_FRAMES,
-        NeighborEntry, NeighborState, Route, StackConfig, StackInstant, StackSecret,
-        TCP_RECEIVE_WINDOW_BYTES, TcpEndpoint, TcpFlags, TcpHeader, TcpListenBacklog, TcpPacket,
-        TransportChecksum, UdpEndpoint, UdpPacket, UdpPayload, UdpSocketBinding, internet_checksum,
+        IcmpEchoKey, Icmpv4Packet, Icmpv6Packet, IpAddress, IpProtocol, Ipv4Address, Ipv4Cidr,
+        Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6Packet, MAX_OUTBOUND_FRAMES, NeighborEntry,
+        NeighborState, StackConfig, StackInstant, StackSecret, TCP_RECEIVE_WINDOW_BYTES,
+        TcpEndpoint, TcpFlags, TcpHeader, TcpListenBacklog, TcpPacket, TransportChecksum,
+        UdpEndpoint, UdpPacket, UdpPayload, UdpSocketBinding, internet_checksum,
     };
 
     use alloc::vec::Vec;
     use bytes::Bytes;
     use futures_lite::future::{block_on, poll_once};
-    use helios_netstack::RxFrame;
-
-    use crate::test_support::{
-        RecordingNetworkInterface, RecordingSmpCpu, TestCpu, test_root_entropy,
+    use helios_netstack::{
+        DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DhcpClient, DhcpMessageType, DhcpServerMessage,
+        DhcpState, RxFrame,
     };
 
+    use crate::test_support::{
+        ManualClockCpu, RecordingNetworkInterface, RecordingSmpCpu, TestCpu, test_root_entropy,
+    };
+
+    use super::component::DnsQueryPair;
     use super::{
-        AddressAttemptError, DhcpClientState, DhcpDnsServers, DhcpMessageType, DhcpServerMessage,
-        DnsQueryPair, HandleSlab, NETWORK_BUSY_POLL_ROUNDS, NETWORK_TX_BATCH_FRAMES,
-        NetworkIpAddress, NetworkPollBudget, NetworkPollProgress, NetworkPollScope,
-        NetworkPollSource, NetworkPollState, NetworkPumpAction, NetworkPumpCadence, NetworkShard,
-        ReplicaHandle, TcpListenerId, TcpReadProgress, UdpSocketId, icmp_echo_payload,
-        limit_udp_datagram_bytes, map_ipv4_address, parse_ipv6, receive_pair_order,
+        AddressAttemptError, DhcpDnsServers, HandleSlab, NETWORK_BUSY_POLL_ROUNDS,
+        NETWORK_TX_BATCH_FRAMES, NetworkIpAddress, NetworkPollBudget, NetworkPollProgress,
+        NetworkPollScope, NetworkPollSource, NetworkPollState, NetworkPumpAction,
+        NetworkPumpCadence, NetworkShard, ReplicaHandle, TcpListenerId, TcpReadProgress,
+        UdpSocketId, icmp_echo_payload, limit_udp_datagram_bytes, map_ipv4_address, parse_ipv6,
+        receive_pair_order,
     };
 
     fn ipv6_tcp_frame(
@@ -2020,6 +2164,17 @@ mod tests {
         RxFrame::new(Bytes::copy_from_slice(bytes))
     }
 
+    /// The one shard a frame belongs to. A frame the whole node owns has
+    /// no single shard, and asking for it is a test's mistake.
+    fn owning_shard(frame: &RxFrame, shard_count: usize) -> usize {
+        match super::rx_frame_owner(frame, shard_count) {
+            super::RxFrameOwner::Shard(shard_idx) => shard_idx,
+            super::RxFrameOwner::ResolutionAnswer => {
+                panic!("a Neighbor Advertisement has no single owning shard")
+            }
+        }
+    }
+
     fn test_network_shard() -> NetworkShard {
         NetworkShard::new(test_stack_config(), 1, 0, 1, test_root_entropy())
     }
@@ -2054,109 +2209,571 @@ mod tests {
         TcpListenerId(ReplicaHandle::new(slot).get())
     }
 
+    /// A restored machine may be on another network, so a client that
+    /// holds a lease asks the link to confirm it (INIT-REBOOT) and keeps
+    /// the address while it waits; one with no lease has an exchange of
+    /// its own under way and is left alone.
+    #[test]
+    fn a_restored_machine_asks_the_link_to_confirm_its_lease() {
+        let mut shard = test_network_shard();
+        assert!(
+            !shard.begin_lease_revalidation(9, StackInstant::from_nanos(SECOND)),
+            "a client still in INIT has no lease to confirm"
+        );
+        assert_eq!(shard.dhcp.state(), DhcpState::Init);
+        let own_exchange = shard.dhcp.transaction_id();
+        drive_dhcp_ok(&mut shard, SECOND);
+        assert_eq!(shard.dhcp.state(), DhcpState::Selecting);
+        assert!(
+            !shard.begin_lease_revalidation(9, StackInstant::from_nanos(SECOND)),
+            "a client mid-DISCOVER has no lease to confirm"
+        );
+        assert_eq!(shard.dhcp.state(), DhcpState::Selecting);
+        assert_eq!(shard.dhcp.transaction_id(), own_exchange);
+
+        let mut shard = dhcp_bound_shard();
+        let start = 100 * SECOND;
+        assert!(shard.begin_lease_revalidation(9, StackInstant::from_nanos(start)));
+        assert_eq!(shard.dhcp.state(), DhcpState::Rebooting);
+        assert_eq!(shard.dhcp.transaction_id(), 9);
+        assert!(
+            !drive_dhcp_ok(&mut shard, start),
+            "a question about the lease changes nothing yet"
+        );
+        assert_eq!(
+            shard.stack.ipv4_addresses().count(),
+            1,
+            "the address stays in use until the link answers"
+        );
+        let frames = drain_outbound(&mut shard);
+        let (destination, port, payload) = dhcp_datagram(
+            frames
+                .last()
+                .expect("a DHCP REQUEST frame should be queued"),
+        );
+        assert_eq!(destination, Ipv4Address::BROADCAST);
+        assert_eq!(port, DHCP_SERVER_PORT);
+        // The requested-IP option (50) names the held address.
+        assert!(
+            payload
+                .windows(6)
+                .any(|option| option == [50, 4, 192, 0, 2, 10])
+        );
+    }
+
+    /// A link that never confirms the lease leaves the client no reason
+    /// to trust it: after the attempts the shard takes the address, the
+    /// route and the resolvers off the interface, and asks for a new
+    /// lease.
+    #[test]
+    fn an_unconfirmed_lease_is_taken_off_the_interface() {
+        let mut shard = dhcp_bound_shard();
+        let start = 100 * SECOND;
+        assert!(shard.begin_lease_revalidation(9, StackInstant::from_nanos(start)));
+
+        for attempt in 0..4 {
+            assert!(!drive_dhcp_ok(&mut shard, start + attempt * SECOND));
+            assert_eq!(shard.stack.ipv4_addresses().count(), 1);
+        }
+        drain_outbound(&mut shard);
+
+        assert!(
+            drive_dhcp_ok(&mut shard, start + 4 * SECOND),
+            "the lease ended"
+        );
+
+        assert_eq!(shard.stack.ipv4_addresses().count(), 0);
+        assert!(!has_default_route(&shard));
+        assert!(shard.dns_servers.is_empty());
+        assert_eq!(shard.dhcp.state(), DhcpState::Selecting);
+        let frames = drain_outbound(&mut shard);
+        let (destination, port, _) = dhcp_datagram(
+            frames
+                .last()
+                .expect("a DHCP DISCOVER frame should be queued"),
+        );
+        assert_eq!(destination, Ipv4Address::BROADCAST);
+        assert_eq!(port, DHCP_SERVER_PORT);
+    }
+
+    /// A server on the new link may confirm another address than the one
+    /// the machine held: the shard swaps the old one for it.
+    #[test]
+    fn a_confirmation_that_names_another_address_replaces_the_one_held() {
+        let mut shard = dhcp_bound_shard();
+        let start = 100 * SECOND;
+        assert!(shard.begin_lease_revalidation(9, StackInstant::from_nanos(start)));
+        drive_dhcp_ok(&mut shard, start);
+        drain_outbound(&mut shard);
+        let moved = Ipv4Address::new([192, 0, 2, 77]);
+        let mut ack = dhcp_reply(&shard.dhcp, DhcpMessageType::Ack);
+        ack.your_ip = moved;
+        deliver_dhcp(&mut shard, &ack, start + SECOND);
+
+        assert!(drive_dhcp_ok(&mut shard, start + SECOND));
+
+        assert_eq!(shard.dhcp.state(), DhcpState::Bound);
+        assert_eq!(shard.stack.ipv4_addresses().count(), 1);
+        assert_eq!(
+            shard.stack.primary_ipv4_address(),
+            Some(Ipv4Cidr::new(moved, 24))
+        );
+    }
+
     /// A link that comes back is not the link that went away: the lease,
     /// the routes it pointed at and the resolvers that came with it are
     /// all stale, and nothing would ask the new link for an address
     /// unless the client is put back at the start.
     #[test]
     fn a_link_bounce_restarts_interface_configuration() {
-        let mut shard = test_network_shard();
-        shard
-            .stack
-            .add_ipv4_address(Ipv4Cidr::new(Ipv4Address::new([192, 0, 2, 10]), 24))
-            .expect("test address should be accepted");
-        shard
-            .stack
-            .routes_mut()
-            .add(Route {
-                destination: IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::UNSPECIFIED, 0)),
-                gateway: Some(IpAddress::Ipv4(Ipv4Address::new([192, 0, 2, 1]))),
-                expires_at: None,
-            })
-            .expect("test gateway should be accepted");
-        shard.dhcp = DhcpClientState::Bound;
-        shard
-            .dns_servers
-            .push(helios_netstack::Ipv4Address::new([192, 0, 2, 1]));
+        let mut shard = dhcp_bound_shard();
+        assert_eq!(shard.dhcp.state(), DhcpState::Bound);
 
         shard.restart_link_configuration(9);
 
-        assert_eq!(shard.dhcp, DhcpClientState::Init { transaction_id: 9 });
+        assert_eq!(shard.dhcp.state(), DhcpState::Init);
+        assert_eq!(shard.dhcp.transaction_id(), 9);
         assert_eq!(shard.stack.ipv4_addresses().count(), 0);
         assert!(shard.stack.routes().iter().next().is_none());
         assert!(shard.dns_servers.is_empty());
 
         // With the client back at Init the next configuration round
         // sends a fresh DISCOVER for the new link.
-        shard
-            .drive_dhcp(StackInstant::from_nanos(1))
-            .expect("a restarted DHCP client should send DISCOVER");
-        assert_eq!(
-            shard.dhcp,
-            DhcpClientState::Selecting {
-                transaction_id: 9,
-                last_sent: StackInstant::from_nanos(1),
-            }
+        drive_dhcp_ok(&mut shard, 1);
+        assert_eq!(shard.dhcp.state(), DhcpState::Selecting);
+        let frames = drain_outbound(&mut shard);
+        let (destination, port, _) = dhcp_datagram(
+            frames
+                .last()
+                .expect("a DHCP DISCOVER frame should be queued"),
         );
-        let frame = shard
-            .stack
-            .take_outbound()
-            .expect("a DHCP DISCOVER frame should be queued");
-        let ethernet = EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
-        let ipv4 = Ipv4Packet::parse(ethernet.payload).expect("IPv4 packet should parse");
-        let udp = UdpPacket::parse(ipv4.payload).expect("UDP datagram should parse");
-        assert_eq!(udp.destination_port, helios_netstack::DHCP_SERVER_PORT);
+        assert_eq!(destination, Ipv4Address::BROADCAST);
+        assert_eq!(port, DHCP_SERVER_PORT);
     }
 
-    fn dhcp_reply(
-        message_type: DhcpMessageType,
-        transaction_id: u32,
-        server_identifier: Option<Ipv4Address>,
-    ) -> DhcpServerMessage {
+    const SECOND: u64 = 1_000_000_000;
+    const DHCP_SERVER: Ipv4Address = Ipv4Address::new([192, 0, 2, 1]);
+    const DHCP_LEASED: Ipv4Address = Ipv4Address::new([192, 0, 2, 10]);
+    const DHCP_ROUTER: Ipv4Address = Ipv4Address::new([192, 0, 2, 254]);
+    const DHCP_LEASE_SECONDS: u32 = 3600;
+
+    /// What `client`'s server would send back in `message_type`: a
+    /// 24-bit lease of [`DHCP_LEASED`] with a router and a resolver
+    /// for [`DHCP_LEASE_SECONDS`].
+    fn dhcp_reply(client: &DhcpClient, message_type: DhcpMessageType) -> DhcpServerMessage {
+        let mut dns_servers = DhcpDnsServers::new();
+        dns_servers.push(DHCP_SERVER);
         DhcpServerMessage {
             message_type,
-            transaction_id,
-            your_ip: Ipv4Address::UNSPECIFIED,
-            server_identifier,
-            subnet_mask: None,
-            router: None,
-            dns_servers: DhcpDnsServers::new(),
-            lease_seconds: None,
+            transaction_id: client.transaction_id(),
+            client_mac: test_stack_config().mac,
+            your_ip: DHCP_LEASED,
+            server_identifier: Some(DHCP_SERVER),
+            subnet_mask: Some(Ipv4Address::new([255, 255, 255, 0])),
+            router: Some(DHCP_ROUTER),
+            dns_servers,
+            lease_seconds: Some(DHCP_LEASE_SECONDS),
+            renewal_seconds: None,
+            rebinding_seconds: None,
         }
     }
 
-    /// RFC 2131 §4.4.1: only a client waiting on a REQUEST takes a
-    /// DHCPNAK, and only one for its own exchange from the server it
-    /// selected.
-    #[test]
-    fn dhcp_nak_is_accepted_only_from_the_selected_server_while_requesting() {
-        let server = Ipv4Address::new([192, 0, 2, 1]);
-        let stranger = Ipv4Address::new([192, 0, 2, 66]);
-        let requesting = DhcpClientState::Requesting {
-            transaction_id: 7,
-            requested_ip: Ipv4Address::new([192, 0, 2, 10]),
-            server_identifier: server,
-            last_sent: StackInstant::from_nanos(0),
-        };
+    /// Puts a server's reply in the DHCP client's socket the way the
+    /// receive path does: a broadcast datagram to port 68.
+    fn deliver_dhcp(shard: &mut NetworkShard, message: &DhcpServerMessage, now: u64) {
+        let mut payload = [0u8; 548];
+        let len = message
+            .encode(&mut payload)
+            .expect("a DHCP reply should fit a datagram");
+        let (frame, frame_len) = ipv4_udp_frame(
+            DHCP_SERVER,
+            DHCP_SERVER_PORT,
+            Ipv4Address::BROADCAST,
+            DHCP_CLIENT_PORT,
+            &payload[..len],
+        );
+        shard
+            .stack
+            .receive_frame(&frame[..frame_len], StackInstant::from_nanos(now))
+            .expect("a DHCP reply should be handled");
+    }
 
-        let nak = |transaction_id, server_identifier| {
-            dhcp_reply(DhcpMessageType::Nak, transaction_id, server_identifier)
-        };
-        assert!(requesting.accepts_reply(&nak(7, Some(server))));
-        assert!(!requesting.accepts_reply(&nak(8, Some(server))));
-        assert!(!requesting.accepts_reply(&nak(7, Some(stranger))));
-        assert!(!requesting.accepts_reply(&nak(7, None)));
-
-        for state in [
-            DhcpClientState::Bound,
-            DhcpClientState::Init { transaction_id: 7 },
-            DhcpClientState::Selecting {
-                transaction_id: 7,
-                last_sent: StackInstant::from_nanos(0),
-            },
-        ] {
-            assert!(!state.accepts_reply(&nak(7, Some(server))));
+    fn drain_outbound(shard: &mut NetworkShard) -> Vec<Vec<u8>> {
+        let mut frames = Vec::new();
+        while let Some(frame) = shard.stack.take_outbound() {
+            frames.push(frame.as_slice().to_vec());
         }
+        frames
+    }
+
+    /// The destination address, the destination port and the payload of
+    /// the IPv4 UDP datagram a frame carries.
+    fn dhcp_datagram(frame: &[u8]) -> (Ipv4Address, u16, Vec<u8>) {
+        let ethernet = EthernetFrame::parse(frame).expect("Ethernet frame should parse");
+        let ipv4 = Ipv4Packet::parse(ethernet.payload).expect("IPv4 packet should parse");
+        let udp = UdpPacket::parse(ipv4.payload).expect("UDP datagram should parse");
+        (ipv4.destination, udp.destination_port, udp.payload.to_vec())
+    }
+
+    /// Drives the shard's DHCP client at `now` nanoseconds, a drive that
+    /// must not fail, and reports whether it changed the lease.
+    fn drive_dhcp_ok(shard: &mut NetworkShard, now: u64) -> bool {
+        let drive = shard.drive_dhcp(StackInstant::from_nanos(now));
+        drive.result.expect("the DHCP drive should not fail");
+        drive.lease_changed
+    }
+
+    /// Runs the shard's DHCP client through DISCOVER, OFFER and REQUEST
+    /// at `start` nanoseconds, and leaves it waiting for the ACK.
+    fn dhcp_offered(shard: &mut NetworkShard, start: u64) {
+        assert!(!drive_dhcp_ok(shard, start), "DISCOVER changes no lease");
+        let offer = dhcp_reply(&shard.dhcp, DhcpMessageType::Offer);
+        deliver_dhcp(shard, &offer, start);
+        assert!(!drive_dhcp_ok(shard, start), "REQUEST changes no lease");
+        assert_eq!(shard.dhcp.state(), DhcpState::Requesting);
+        drain_outbound(shard);
+    }
+
+    /// Runs the shard's DHCP client through DISCOVER, OFFER, REQUEST
+    /// and ACK, the exchange starting at `start` nanoseconds.
+    fn dhcp_exchange(shard: &mut NetworkShard, start: u64) {
+        dhcp_offered(shard, start);
+        let ack = dhcp_reply(&shard.dhcp, DhcpMessageType::Ack);
+        deliver_dhcp(shard, &ack, start);
+        assert!(
+            drive_dhcp_ok(shard, start),
+            "an installed lease is a change to the lease"
+        );
+        drain_outbound(shard);
+    }
+
+    /// A shard whose client holds a one hour lease from `0 s`.
+    fn dhcp_bound_shard() -> NetworkShard {
+        let mut shard = test_network_shard();
+        dhcp_exchange(&mut shard, 0);
+        assert_eq!(shard.dhcp.state(), DhcpState::Bound);
+        assert_eq!(
+            shard.stack.primary_ipv4_address(),
+            Some(Ipv4Cidr::new(DHCP_LEASED, 24))
+        );
+        shard
+    }
+
+    fn has_default_route(shard: &NetworkShard) -> bool {
+        shard
+            .stack
+            .routes()
+            .iter()
+            .any(|route| route.gateway.is_some())
+    }
+
+    /// RFC 2131 §4.4.5: at T1, half the lease, the client asks the
+    /// server it leased from to renew, and the address stays configured
+    /// while it waits and after the ACK.
+    #[test]
+    fn a_lease_is_renewed_at_t1() {
+        let mut shard = dhcp_bound_shard();
+
+        assert!(!drive_dhcp_ok(&mut shard, 1799 * SECOND));
+        assert_eq!(shard.dhcp.state(), DhcpState::Bound);
+        assert!(drain_outbound(&mut shard).is_empty());
+
+        assert!(!drive_dhcp_ok(&mut shard, 1800 * SECOND));
+        assert_eq!(shard.dhcp.state(), DhcpState::Renewing);
+        assert_eq!(shard.stack.ipv4_addresses().count(), 1);
+        // The REQUEST is unicast to the server, whose hardware address
+        // this shard has not learned, so what left is the ARP request
+        // for it; the client asks again a second later rather than a
+        // minute.
+        let frames = drain_outbound(&mut shard);
+        let ethernet = EthernetFrame::parse(&frames[0]).expect("Ethernet frame should parse");
+        assert_eq!(ethernet.protocol, EthernetProtocol::Arp);
+        assert_eq!(
+            shard.dhcp.next_deadline(),
+            Some(StackInstant::from_nanos(1801 * SECOND))
+        );
+
+        let ack = dhcp_reply(&shard.dhcp, DhcpMessageType::Ack);
+        deliver_dhcp(&mut shard, &ack, 1801 * SECOND);
+        assert!(drive_dhcp_ok(&mut shard, 1801 * SECOND));
+        assert_eq!(shard.dhcp.state(), DhcpState::Bound);
+        // The renewed lease runs from the request at T1 (RFC 2131 §4.4.1).
+        assert_eq!(
+            shard.dhcp.lease().and_then(|lease| lease.expires_at),
+            Some(StackInstant::from_nanos((1800 + 3600) * SECOND))
+        );
+        assert_eq!(shard.stack.ipv4_addresses().count(), 1);
+    }
+
+    /// RFC 2131 §4.4.5: at T2, seven eighths of the lease, the client
+    /// asks every server by broadcast, with its address in `ciaddr`.
+    #[test]
+    fn a_lease_is_rebound_at_t2() {
+        let mut shard = dhcp_bound_shard();
+        drive_dhcp_ok(&mut shard, 1800 * SECOND);
+        drain_outbound(&mut shard);
+
+        assert!(!drive_dhcp_ok(&mut shard, 3150 * SECOND));
+
+        assert_eq!(shard.dhcp.state(), DhcpState::Rebinding);
+        let frames = drain_outbound(&mut shard);
+        let (destination, port, payload) =
+            dhcp_datagram(frames.last().expect("a REQUEST should be queued"));
+        assert_eq!(destination, Ipv4Address::BROADCAST);
+        assert_eq!(port, DHCP_SERVER_PORT);
+        // `ciaddr` is the fourth word of the BOOTP header.
+        assert_eq!(&payload[12..16], &DHCP_LEASED.octets());
+        assert_eq!(shard.stack.ipv4_addresses().count(), 1);
+    }
+
+    /// RFC 2131 §4.4.5: a lease nobody renewed is given up at its
+    /// expiry, with the router and the resolvers that came with it,
+    /// and the client starts over from DISCOVER.
+    #[test]
+    fn an_expired_lease_is_removed() {
+        let mut shard = dhcp_bound_shard();
+        drive_dhcp_ok(&mut shard, 1800 * SECOND);
+        drive_dhcp_ok(&mut shard, 3150 * SECOND);
+        drain_outbound(&mut shard);
+        assert!(has_default_route(&shard));
+        assert!(!shard.dns_servers.is_empty());
+
+        let changed = drive_dhcp_ok(&mut shard, 3600 * SECOND);
+
+        assert!(changed);
+        assert_eq!(shard.stack.ipv4_addresses().count(), 0);
+        assert!(!has_default_route(&shard));
+        assert!(shard.dns_servers.is_empty());
+        assert_eq!(shard.dhcp.state(), DhcpState::Selecting);
+        let frames = drain_outbound(&mut shard);
+        let (destination, port, _) =
+            dhcp_datagram(frames.last().expect("a DISCOVER should be queued"));
+        assert_eq!(destination, Ipv4Address::BROADCAST);
+        assert_eq!(port, DHCP_SERVER_PORT);
+    }
+
+    /// An ACK that carries no subnet mask is neither an error for
+    /// whoever waits on an address nor a lease declined: the prefix is
+    /// the one the address class names, 24 bits for 192.0.2.10
+    /// (RFC 791 §3.2), and the interface is configured with it.
+    #[test]
+    fn an_ack_without_a_subnet_mask_configures_the_class_prefix() {
+        let mut shard = test_network_shard();
+        dhcp_offered(&mut shard, 0);
+        let mut ack = dhcp_reply(&shard.dhcp, DhcpMessageType::Ack);
+        ack.subnet_mask = None;
+        deliver_dhcp(&mut shard, &ack, 0);
+
+        let changed = drive_dhcp_ok(&mut shard, 0);
+
+        assert!(changed);
+        assert_eq!(shard.dhcp.state(), DhcpState::Bound);
+        assert_eq!(
+            shard.stack.primary_ipv4_address(),
+            Some(Ipv4Cidr::new(DHCP_LEASED, 24))
+        );
+        assert!(has_default_route(&shard));
+        assert!(drain_outbound(&mut shard).is_empty());
+    }
+
+    /// A lease the shard has no room for is not left bound in the
+    /// client with nothing on the interface: the drive reports the
+    /// failure and the change, keeps the addresses that were there, and
+    /// the client starts over after its backoff.
+    #[test]
+    fn a_lease_the_shard_cannot_install_sends_the_client_back_to_init() {
+        let mut shard = test_network_shard();
+        let mut statics = 0;
+        while shard
+            .stack
+            .add_ipv4_address(Ipv4Cidr::new(
+                Ipv4Address::new([198, 51, 100, statics + 1]),
+                32,
+            ))
+            .is_ok()
+        {
+            statics += 1;
+        }
+        dhcp_offered(&mut shard, 0);
+        let ack = dhcp_reply(&shard.dhcp, DhcpMessageType::Ack);
+        deliver_dhcp(&mut shard, &ack, 0);
+
+        let drive = shard.drive_dhcp(StackInstant::from_nanos(0));
+
+        assert!(matches!(
+            drive.result,
+            Err(crate::NetworkControlError::InvalidAddress)
+        ));
+        assert!(drive.lease_changed);
+        assert_eq!(shard.dhcp.state(), DhcpState::Init);
+        assert_eq!(shard.dhcp.lease(), None);
+        assert_eq!(
+            shard.dhcp.next_deadline(),
+            Some(StackInstant::from_nanos(10 * SECOND))
+        );
+        assert_eq!(shard.stack.ipv4_addresses().count(), usize::from(statics));
+        assert!(
+            shard
+                .stack
+                .ipv4_addresses()
+                .all(|address| address.address() != DHCP_LEASED)
+        );
+        assert!(!has_default_route(&shard));
+        assert!(shard.dns_servers.is_empty());
+        assert!(drain_outbound(&mut shard).is_empty());
+    }
+
+    /// A drive that took a NAK's lease off the shard and then could not
+    /// queue the DISCOVER that follows still reports the removal, or the
+    /// control plane would keep the refused address and the next sync
+    /// would put it back.
+    #[test]
+    fn a_lease_change_is_reported_when_a_later_step_of_the_drive_fails() {
+        let now = 1800 * SECOND;
+        let mut shard = dhcp_bound_shard();
+        drive_dhcp_ok(&mut shard, now);
+        drain_outbound(&mut shard);
+        let nak = dhcp_reply(&shard.dhcp, DhcpMessageType::Nak);
+        deliver_dhcp(&mut shard, &nak, now);
+        let filled = (0..=MAX_OUTBOUND_FRAMES).any(|_| {
+            shard
+                .stack
+                .send_udp_ipv4_from(
+                    Ipv4Address::UNSPECIFIED,
+                    Ipv4Address::BROADCAST,
+                    super::UdpEgress {
+                        source_port: DHCP_CLIENT_PORT,
+                        destination_port: DHCP_SERVER_PORT,
+                        payload: b"filler",
+                        hop_limit: super::DEFAULT_HOP_LIMIT,
+                    },
+                    0,
+                    StackInstant::from_nanos(now),
+                )
+                .is_err()
+        });
+        assert!(filled, "the outbound queue should fill");
+
+        let drive = shard.drive_dhcp(StackInstant::from_nanos(now));
+
+        assert!(matches!(
+            drive.result,
+            Err(crate::NetworkControlError::BackendFault)
+        ));
+        assert!(drive.lease_changed);
+        assert_eq!(shard.stack.ipv4_addresses().count(), 0);
+        assert!(!has_default_route(&shard));
+        // The client moved on, and its DISCOVER is due again a second on.
+        assert_eq!(shard.dhcp.state(), DhcpState::Selecting);
+        assert_eq!(
+            shard.dhcp.next_deadline(),
+            Some(StackInstant::from_nanos(now + SECOND))
+        );
+    }
+
+    /// The service over a clock the test moves, with its DHCP client
+    /// bound to a one hour lease at `0 s`, and the control plane told.
+    fn dhcp_bound_service() -> (
+        super::NetworkService<ManualClockCpu, RecordingNetworkInterface>,
+        ManualClockCpu,
+    ) {
+        let cpu = ManualClockCpu::new();
+        let service = super::NetworkService::new(
+            cpu.clone(),
+            crate::test_support::single_node_pool(1),
+            crate::test_support::test_profile_sink(),
+            crate::test_support::test_uptime_clock(),
+            crate::test_support::test_timer(cpu.clone()),
+            RecordingNetworkInterface::new(1),
+            test_root_entropy(),
+        );
+        {
+            let mut shard = service.inner.state.shard_for_default().lock();
+            dhcp_exchange(&mut shard, 0);
+            service.inner.control.publish_from_shard(&shard);
+        }
+        service.synchronize_control_plane();
+        assert_eq!(
+            service.inner.control.list_ipv4_addresses().len(),
+            1,
+            "the control plane learned the lease"
+        );
+        (service, cpu)
+    }
+
+    /// The regression this change is for: a NAK removed the address from
+    /// the default shard alone, the control plane kept it, and the next
+    /// synchronisation put it back on every shard.
+    #[test]
+    fn a_nak_while_renewing_leaves_no_shard_holding_the_address_after_a_sync() {
+        let (service, cpu) = dhcp_bound_service();
+        // A second shard, which an earlier sync gave the lease.
+        let mut other = test_network_shard();
+        service.inner.control.synchronize_shard(&mut other);
+        assert_eq!(other.stack.ipv4_addresses().count(), 1);
+
+        cpu.advance(1800 * SECOND);
+        service.drive_interface_configuration();
+        {
+            let mut shard = service.inner.state.shard_for_default().lock();
+            assert_eq!(shard.dhcp.state(), DhcpState::Renewing);
+            let nak = dhcp_reply(&shard.dhcp, DhcpMessageType::Nak);
+            deliver_dhcp(&mut shard, &nak, 1800 * SECOND);
+        }
+        service.drive_interface_configuration();
+        service.synchronize_control_plane();
+        // The poll round runs the sync again, and it has nothing to
+        // put back.
+        service.synchronize_control_plane();
+        service.inner.control.synchronize_shard(&mut other);
+
+        assert!(service.inner.control.list_ipv4_addresses().is_empty());
+        service.inner.state.for_each(|shard| {
+            assert_eq!(shard.stack.ipv4_addresses().count(), 0);
+            assert!(!has_default_route(shard));
+            assert!(shard.dns_servers.is_empty());
+        });
+        assert_eq!(other.stack.ipv4_addresses().count(), 0);
+        assert!(!has_default_route(&other));
+        let shard = service.inner.state.shard_for_default().lock();
+        assert_eq!(shard.dhcp.state(), DhcpState::Selecting);
+    }
+
+    /// A lease that expires leaves the control plane the same way.
+    #[test]
+    fn an_expired_lease_leaves_the_control_plane() {
+        let (service, cpu) = dhcp_bound_service();
+
+        cpu.advance(3600 * SECOND);
+        service.drive_interface_configuration();
+        service.synchronize_control_plane();
+
+        assert!(service.inner.control.list_ipv4_addresses().is_empty());
+        service.inner.state.for_each(|shard| {
+            assert_eq!(shard.stack.ipv4_addresses().count(), 0);
+            assert!(!has_default_route(shard));
+        });
+    }
+
+    /// The pump's park ends when the DHCP client is next due, not a
+    /// second later than a lease deadline and not on a timer nothing
+    /// needs.
+    #[test]
+    fn the_configuration_wait_follows_the_dhcp_deadline() {
+        let (service, cpu) = dhcp_bound_service();
+
+        // T1 is half an hour away and the bound is the poll interval
+        // that covers router solicitation.
+        assert_eq!(
+            service.configuration_wait(),
+            core::time::Duration::from_nanos(super::CONFIGURATION_POLL_NANOS)
+        );
+
+        cpu.advance(1800 * SECOND - 250_000_000);
+        assert_eq!(
+            service.configuration_wait(),
+            core::time::Duration::from_millis(250)
+        );
     }
 
     #[test]
@@ -2426,7 +3043,7 @@ mod tests {
         });
         let key = IcmpEchoKey {
             destination: IpAddress::Ipv4(remote),
-            identifier: state.next_icmp_echo_identifier(),
+            identifier: state.draw_icmp_echo_identifier(),
             sequence: 1,
         };
         let payload = icmp_echo_payload();
@@ -2876,15 +3493,16 @@ mod tests {
         // cross-processor.
         let cpu = RecordingSmpCpu::new(0, 2);
         let control = super::NetworkControlPlane::new();
-        let state = super::NetworkShardSet::new(2, |index| {
-            NetworkShard::new(
-                test_stack_config(),
-                1 + index as u32,
-                index,
-                2,
-                test_root_entropy(),
-            )
-        });
+        let state =
+            super::NetworkShardSet::new(crate::test_support::single_node_pool(2), |index| {
+                NetworkShard::new(
+                    test_stack_config(),
+                    1 + index as u32,
+                    index,
+                    2,
+                    test_root_entropy(),
+                )
+            });
         // A bound datagram socket is replicated: the same slot on every
         // shard, with the receive path deciding which replica gets a
         // given datagram.
@@ -2997,18 +3615,19 @@ mod tests {
         let owner = 1;
         let cpu = RecordingSmpCpu::new(0, 2);
         let control = super::NetworkControlPlane::new();
-        let state = super::NetworkShardSet::new(2, |index| {
-            NetworkShard::new(
-                test_stack_config(),
-                1 + index as u32,
-                index,
-                2,
-                test_root_entropy(),
-            )
-        });
+        let state =
+            super::NetworkShardSet::new(crate::test_support::single_node_pool(2), |index| {
+                NetworkShard::new(
+                    test_stack_config(),
+                    1 + index as u32,
+                    index,
+                    2,
+                    test_root_entropy(),
+                )
+            });
         // The port the connection is opened on is the one whose replies
         // hash back to the owning shard, exactly as
-        // `allocate_tcp_local_port_for` picks it.
+        // `open_ephemeral_tcp_connect` picks it.
         let local_port = (49_152..u16::MAX)
             .find(|local_port| {
                 super::shard_idx_for_flow(
@@ -3145,7 +3764,7 @@ mod tests {
     /// them: it raises no arrival, completes no descriptor and arms no
     /// timer, so a writer that queued its bytes and returned left the
     /// segment for the packet pump — which, having nothing to do, was
-    /// parked for `DHCP_RETRANSMIT_NANOS`.
+    /// parked for `CONFIGURATION_POLL_NANOS`.
     ///
     /// A request/response exchange therefore paid a second per round
     /// trip: `tcp-latency`'s 5000 sixteen-byte round trips could not
@@ -3349,15 +3968,16 @@ mod tests {
         // pump depends on rather than a local one.
         let owner = 1;
         let cpu = RecordingSmpCpu::new(0, 2);
-        let state = super::NetworkShardSet::new(2, |index| {
-            NetworkShard::new(
-                test_stack_config(),
-                1 + index as u32,
-                index,
-                2,
-                test_root_entropy(),
-            )
-        });
+        let state =
+            super::NetworkShardSet::new(crate::test_support::single_node_pool(2), |index| {
+                NetworkShard::new(
+                    test_stack_config(),
+                    1 + index as u32,
+                    index,
+                    2,
+                    test_root_entropy(),
+                )
+            });
 
         let stream = {
             let mut shard = state.shard_at(owner).lock();
@@ -3461,8 +4081,9 @@ mod tests {
 
         // The application reads. Nothing else can make room, so this is
         // the whole event the pump is waiting for.
+        let pairs = super::PairRoutes::new(2, 2);
         let read = state
-            .with_handle_receive_drain(stream, 2, |shard| {
+            .with_handle_receive_drain(stream, &pairs, |shard| {
                 shard.poll_tcp_read(stream, SEGMENT_BYTES, StackInstant::from_nanos(1_000))
             })
             .expect("the queued data should read");
@@ -3487,7 +4108,7 @@ mod tests {
         let wait = state.shard_wait(owner);
         let mut parked = core::pin::pin!(state.arrival_for(wait.target).changed(wait.mark));
         let read = state
-            .with_handle_receive_drain(stream, 2, |shard| {
+            .with_handle_receive_drain(stream, &pairs, |shard| {
                 shard.poll_tcp_read(stream, SEGMENT_BYTES, StackInstant::from_nanos(1_001))
             })
             .expect("the rest of the queued data should read");
@@ -3510,6 +4131,7 @@ mod tests {
         let cpu = TestCpu::without_entropy();
         super::NetworkService::new(
             cpu,
+            crate::test_support::single_node_pool(1),
             crate::test_support::test_profile_sink(),
             crate::test_support::test_uptime_clock(),
             crate::test_support::test_timer(cpu),
@@ -3660,6 +4282,109 @@ mod tests {
         );
     }
 
+    /// Two drainers of one receive ring deliver its frames to the stack
+    /// in ring order (#776).
+    ///
+    /// The pair's pump is caught mid-delivery on its own thread: the
+    /// first segments of a flow are in the socket, the next one is off
+    /// the ring and in the pump's hands, the rest are still on the ring,
+    /// and the pump holds the pair. An operation sweeping every pair —
+    /// what any socket call on another processor does when its read
+    /// finds no data — drains concurrently in that window. It must take
+    /// nothing: had it taken the segments behind the one the pump is
+    /// holding, it would land them first, and the stack would queue
+    /// each one out of order behind a hole and owe the peer a duplicate
+    /// acknowledgement for it. Once the pump finishes, the socket holds
+    /// the whole flow in sequence with nothing out of order, no
+    /// duplicate acknowledgement owed and no segment read as a resend.
+    #[test]
+    fn two_drainers_of_one_pair_deliver_a_flow_in_ring_order() {
+        use super::fixture::EstablishedTcpFixture;
+
+        const SEGMENTS: usize = 6;
+        const SEGMENT_BYTES: usize = 100;
+        const PAUSE_AFTER: usize = 2;
+
+        let fixture = EstablishedTcpFixture::new();
+        let service = fixture.service();
+        let payloads: Vec<Vec<u8>> = (0..SEGMENTS)
+            .map(|index| alloc::vec![b'a' + index as u8; SEGMENT_BYTES])
+            .collect();
+        for (index, payload) in payloads.iter().enumerate() {
+            let offset = u32::try_from(index * SEGMENT_BYTES).expect("test offset fits");
+            fixture.deliver_rx(
+                TcpHeader {
+                    source_port: EstablishedTcpFixture::PEER_PORT,
+                    destination_port: EstablishedTcpFixture::LOCAL_PORT,
+                    sequence: EstablishedTcpFixture::PEER_SEQUENCE + 1 + offset,
+                    acknowledgement: EstablishedTcpFixture::LOCAL_SEQUENCE + 1,
+                    flags: TcpFlags::ACK,
+                    window_size: u16::MAX,
+                },
+                payload,
+            );
+        }
+        let pause = service.inner.device.pause_drain(0, PAUSE_AFTER);
+        let pump_poll = NetworkPollState::new(
+            service.inner.poll.base_rx_budget,
+            service.inner.poll.base_tx_completion_budget,
+            service.inner.poll.base_tx_frame_budget,
+        );
+        assert!(
+            pump_poll.budget().rx_frames >= SEGMENTS,
+            "the pump has to be able to take the whole flow in one pass"
+        );
+
+        let (pump, operation) = std::thread::scope(|scope| {
+            let pump = scope.spawn(|| {
+                block_on(service.poll_network_once_with_tcp_read(
+                    NetworkPollSource::Pump,
+                    None,
+                    true,
+                    NetworkPollScope::Pair {
+                        pair: 0,
+                        interface_wide: true,
+                    },
+                    &pump_poll,
+                ))
+                .expect("the pump drains its pair")
+            });
+            pause.wait_until_reached();
+            let operation = block_on(service.poll_network_receive_once(NetworkPollSource::Tcp));
+            // Resumed before anything here can panic, so a failure is
+            // reported rather than left waiting on the paused pump.
+            pause.resume();
+            let pump = pump.join().expect("the pump thread finishes");
+            let (operation, _) =
+                operation.expect("the operation's sweep runs while the pump holds the pair");
+            (pump, operation)
+        });
+
+        assert_eq!(
+            operation.received_frames, 0,
+            "a second drainer took frames from a pair another processor was delivering"
+        );
+        assert_eq!(pump.progress.received_frames, SEGMENTS);
+
+        let counters = service.inner.state.tcp_counters(super::DEFAULT_SHARD_IDX);
+        assert_eq!(counters.out_of_order_queued_bytes, 0);
+        assert_eq!(counters.duplicate_acks_requested, 0);
+        assert_eq!(counters.peer_retransmits_received, 0);
+        let stream = fixture.stream();
+        let now = StackInstant::from_nanos(service.now_nanos());
+        let read = service
+            .inner
+            .state
+            .with_handle(stream, |state| {
+                state.poll_tcp_read(stream, SEGMENTS * SEGMENT_BYTES, now)
+            })
+            .expect("the stream is readable");
+        let TcpReadProgress::Data(bytes) = read else {
+            panic!("the flow did not reach the socket");
+        };
+        assert_eq!(bytes.as_ref(), payloads.concat().as_slice());
+    }
+
     /// One pump per queue pair, decided from the topology: with more
     /// processors than pairs, exactly the lowest processor mapped to
     /// each pair runs one.
@@ -3722,6 +4447,263 @@ mod tests {
         assert!(
             owners.iter().all(Option::is_some),
             "every negotiated pair has exactly one pump"
+        );
+    }
+
+    fn online_set(processors: &[u16], possible: usize) -> crate::exec::OnlineSet {
+        let set = crate::exec::OnlineSet::new(possible);
+        for processor in processors {
+            set.insert(helios_hal::cpu::ProcessorId::new(*processor));
+        }
+        set
+    }
+
+    /// With every online processor draining a pair, a departure shrinks
+    /// the device's live pair count; the last pair's owner moves onto the
+    /// departing pair with its interrupt, the pair that stopped is
+    /// steered where its shards now fold, and the processor coming back
+    /// takes up the pair that is not live and grows the count again.
+    #[test]
+    fn a_departing_pair_owner_shrinks_the_live_pairs_and_an_arrival_grows_them() {
+        use helios_hal::cpu::ProcessorId;
+
+        let device = RecordingNetworkInterface::new(4);
+        let service = test_network_service_smp(4, device.clone());
+        let online = online_set(&[0, 1, 2, 3], 4);
+
+        service.hand_off_pair(ProcessorId::new(1), &online);
+        assert_eq!(device.live_pairs(), 3);
+        assert_eq!(
+            device.steered(),
+            [(1, ProcessorId::new(3)), (3, ProcessorId::new(0))],
+            "pair 1 follows its new owner; pair 3 folds onto pair 0's owner"
+        );
+        assert!(service.pump_assignment_for(ProcessorId::new(1)).is_none());
+        let moved = service
+            .pump_assignment_for(ProcessorId::new(3))
+            .expect("the last pair's owner moved onto the departing pair");
+        assert_eq!(moved.pair, 1);
+        assert!(!moved.interface_wide);
+        let shard_pairs: Vec<usize> = (0..4)
+            .map(|shard| service.inner.pairs.pair_of_shard(shard))
+            .collect();
+        assert_eq!(
+            shard_pairs,
+            [0, 1, 2, 0],
+            "shard 3's pair stopped, so it folds onto a live one; every other shard stays"
+        );
+
+        online.remove(ProcessorId::new(1));
+        service.take_up_pair(ProcessorId::new(1));
+        assert_eq!(device.live_pairs(), 4);
+        assert_eq!(device.steered().last(), Some(&(3, ProcessorId::new(1))));
+        assert_eq!(
+            service
+                .pump_assignment_for(ProcessorId::new(1))
+                .map(|assignment| assignment.pair),
+            Some(3)
+        );
+    }
+
+    /// With more processors than pairs, an idle online processor adopts
+    /// the departing pair, the live count stays, and the idle pump's
+    /// park on the routing table is released so it reads its new pair.
+    #[test]
+    fn an_idle_processor_adopts_a_departing_pair_and_its_pump_is_released() {
+        use helios_hal::cpu::ProcessorId;
+
+        let device = RecordingNetworkInterface::new(2);
+        let service = test_network_service_smp(4, device.clone());
+        let online = online_set(&[0, 1, 2, 3], 4);
+        assert!(service.pump_assignment_for(ProcessorId::new(2)).is_none());
+        let idle_mark = service.inner.pairs.mark();
+        let mut idle_park = core::pin::pin!(service.inner.pairs.changed().changed(idle_mark));
+        assert!(block_on(poll_once(idle_park.as_mut())).is_none());
+
+        service.hand_off_pair(ProcessorId::new(1), &online);
+        assert_eq!(device.live_pairs(), 2, "nothing stopped");
+        assert_eq!(device.steered(), [(1, ProcessorId::new(2))]);
+        assert_eq!(
+            service
+                .pump_assignment_for(ProcessorId::new(2))
+                .map(|assignment| assignment.pair),
+            Some(1)
+        );
+        assert!(
+            block_on(poll_once(idle_park.as_mut())).is_some(),
+            "the hand-off releases the idle pump's park"
+        );
+
+        // A processor that drains nothing hands nothing off.
+        service.hand_off_pair(ProcessorId::new(3), &online);
+        assert_eq!(device.steered().len(), 1);
+    }
+
+    /// An established connection on the departing processor's shard
+    /// keeps working while its pair is out of service and after the
+    /// processor comes back: the shard and its socket stay where they
+    /// are, its data is drained by whichever pump owns the live pair it
+    /// folds onto, and its acknowledgements leave on a live pair.
+    #[test]
+    fn a_connection_on_the_departing_shard_survives_offline_and_online() {
+        use helios_hal::cpu::ProcessorId;
+
+        const SEGMENT_BYTES: usize = 64;
+
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([198, 51, 100, 20]);
+        let device = RecordingNetworkInterface::accepting_transmissions(2);
+        let service = test_network_service_smp(2, device.clone());
+        let owner = 1usize;
+        let local_port = (49_152u16..)
+            .find(|port| {
+                super::shard_idx_for_flow(
+                    IpAddress::Ipv4(local),
+                    *port,
+                    IpAddress::Ipv4(peer),
+                    80,
+                    2,
+                ) == owner
+            })
+            .expect("some ephemeral port hashes to the departing processor's shard");
+
+        let stream = {
+            let mut shard = service.inner.state.shard_at(owner).lock();
+            shard
+                .stack
+                .add_ipv4_address(Ipv4Cidr::new(local, 24))
+                .expect("test address should be accepted");
+            shard.stack.learn_neighbor(NeighborEntry {
+                ip: IpAddress::Ipv4(peer),
+                mac: PEER_MAC,
+                state: NeighborState::Reachable,
+                updated_at: StackInstant::from_nanos(0),
+            });
+            service.inner.control.publish_from_shard(&shard);
+            let socket = shard
+                .stack
+                .open_tcp_connect(
+                    TcpEndpoint {
+                        address: IpAddress::Ipv4(local),
+                        port: local_port,
+                    },
+                    TcpEndpoint {
+                        address: IpAddress::Ipv4(peer),
+                        port: 80,
+                    },
+                    7,
+                )
+                .expect("the test connection should allocate a socket");
+            shard.insert_tcp_stream(socket)
+        };
+        let segment = |sequence: u32, flags: TcpFlags, payload: &[u8]| {
+            ipv4_tcp_frame(
+                peer,
+                local,
+                TcpHeader {
+                    source_port: 80,
+                    destination_port: local_port,
+                    sequence,
+                    acknowledgement: 8,
+                    flags,
+                    window_size: u16::MAX,
+                },
+                payload,
+            )
+        };
+        let poll = NetworkPollState::new(
+            service.inner.poll.base_rx_budget,
+            service.inner.poll.base_tx_completion_budget,
+            service.inner.poll.base_tx_frame_budget,
+        );
+        let pump_round = |pair: usize| {
+            let outcome = block_on(service.poll_network_once_with_tcp_read(
+                NetworkPollSource::Pump,
+                None,
+                true,
+                NetworkPollScope::Pair {
+                    pair,
+                    interface_wide: pair == 0,
+                },
+                &poll,
+            ))
+            .expect("the pump drives its pair");
+            assert_eq!(
+                outcome.progress.received_frames, 1,
+                "the pump on pair {pair} takes the segment off its ring"
+            );
+        };
+        let read_all = || {
+            let now = StackInstant::from_nanos(service.now_nanos());
+            match service.inner.state.with_handle(stream, |shard| {
+                shard.poll_tcp_read(stream, SEGMENT_BYTES * 4, now)
+            }) {
+                Ok(TcpReadProgress::Data(bytes)) => bytes.to_vec(),
+                Ok(_) => panic!("the stream should have data to read"),
+                Err(error) => panic!("the stream should be readable: {error}"),
+            }
+        };
+
+        // Established before the departure, the way the other
+        // connection fixtures establish one.
+        let (frame, len) = segment(100, TcpFlags::SYN.union(TcpFlags::ACK), &[]);
+        service
+            .inner
+            .state
+            .shard_at(owner)
+            .lock()
+            .stack
+            .receive_frame(&frame[..len], StackInstant::from_nanos(1))
+            .expect("the SYN-ACK should establish the connection");
+
+        // Processor 1 departs: its pair stops being live, and shard 1
+        // folds onto pair 0, which processor 0's pump drains.
+        let online = online_set(&[0, 1], 2);
+        service.hand_off_pair(ProcessorId::new(1), &online);
+        online.remove(ProcessorId::new(1));
+        assert_eq!(device.live_pairs(), 1);
+        assert_eq!(service.inner.pairs.pair_of_shard(owner), 0);
+        let sent_before = device.transmitted_frames().len();
+        let first = [b'a'; SEGMENT_BYTES];
+        let (frame, len) = segment(101, TcpFlags::ACK, &first);
+        device.deliver_on(0, &frame[..len]);
+        pump_round(0);
+        assert_eq!(
+            service.inner.state.frame_counts(owner).0,
+            1,
+            "the segment drained off pair 0 reached the stream's shard"
+        );
+        let counters = service.inner.state.tcp_counters(owner);
+        assert_eq!(
+            (
+                counters.receive_queued_bytes,
+                counters.out_of_order_queued_bytes,
+                counters.sockets
+            ),
+            (SEGMENT_BYTES as u64, 0, 1)
+        );
+        assert_eq!(read_all(), first);
+        assert!(
+            device.transmitted_frames().len() > sent_before,
+            "the departed shard's acknowledgement left through pair 0's pump"
+        );
+
+        // Processor 1 is back and takes pair 1 up again.
+        service.take_up_pair(ProcessorId::new(1));
+        assert_eq!(device.live_pairs(), 2);
+        assert_eq!(service.inner.pairs.pair_of_shard(owner), 1);
+        let sent_before = device.transmitted_frames().len();
+        let second = [b'b'; SEGMENT_BYTES];
+        let sequence = 101 + u32::try_from(SEGMENT_BYTES).expect("segment fits");
+        let (frame, len) = segment(sequence, TcpFlags::ACK, &second);
+        device.deliver_on(1, &frame[..len]);
+        pump_round(1);
+        assert_eq!(read_all(), second);
+        assert!(device.transmitted_frames().len() > sent_before);
+        assert_eq!(
+            device.transmitted_pairs()[sent_before..].to_vec(),
+            alloc::vec![1; device.transmitted_frames().len() - sent_before],
+            "the shard submits on its own pair again"
         );
     }
 
@@ -3795,12 +4777,474 @@ mod tests {
         let cpu = RecordingSmpCpu::new(0, processors);
         super::NetworkService::new(
             cpu.clone(),
+            crate::test_support::single_node_pool(processors),
             crate::test_support::test_profile_sink(),
             crate::test_support::test_uptime_clock(),
             crate::test_support::test_timer(cpu),
             device,
             test_root_entropy(),
         )
+    }
+
+    /// The address family a resolution test runs over.
+    #[derive(Clone, Copy)]
+    enum ResolutionFamily {
+        Ipv4,
+        Ipv6,
+    }
+
+    /// What one transmitted frame was, as far as the resolution tests
+    /// care.
+    #[derive(Clone, Debug)]
+    enum Wire {
+        /// An ARP request or a Neighbor Solicitation.
+        Resolution,
+        Tcp {
+            flags: TcpFlags,
+            payload: Vec<u8>,
+        },
+        Other,
+    }
+
+    impl ResolutionFamily {
+        const LOCAL_V4: Ipv4Address = Ipv4Address::new([192, 0, 2, 10]);
+        const PEER_V4: Ipv4Address = Ipv4Address::new([192, 0, 2, 20]);
+        /// The device's own address, which every frame a test injects is
+        /// addressed to.
+        const LOCAL_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 1];
+
+        fn local(self) -> IpAddress {
+            match self {
+                Self::Ipv4 => IpAddress::Ipv4(Self::LOCAL_V4),
+                Self::Ipv6 => IpAddress::Ipv6(connect_local()),
+            }
+        }
+
+        fn peer(self) -> IpAddress {
+            match self {
+                Self::Ipv4 => IpAddress::Ipv4(Self::PEER_V4),
+                Self::Ipv6 => IpAddress::Ipv6(connect_remote()),
+            }
+        }
+
+        fn configure(self, shard: &mut NetworkShard) {
+            match self {
+                Self::Ipv4 => shard
+                    .stack
+                    .add_ipv4_address(Ipv4Cidr::new(Self::LOCAL_V4, 24)),
+                Self::Ipv6 => shard
+                    .stack
+                    .add_ipv6_address(Ipv6Cidr::new(connect_local(), 64)),
+            }
+            .expect("test address should be accepted");
+        }
+
+        /// The peer's answer to a request for its link-layer address: an
+        /// ARP reply or a solicited Neighbor Advertisement.
+        fn resolution_reply(self) -> Vec<u8> {
+            let mut frame = [0; ETHERNET_FRAME_BYTES];
+            let len = match self {
+                Self::Ipv4 => {
+                    let offset = EthernetFrame::encode_header(
+                        &mut frame,
+                        Self::LOCAL_MAC,
+                        PEER_MAC,
+                        EthernetProtocol::Arp,
+                    )
+                    .expect("test Ethernet header should fit");
+                    offset
+                        + ArpPacket {
+                            operation: ArpOperation::Reply,
+                            sender_hardware: PEER_MAC,
+                            sender_protocol: Self::PEER_V4,
+                            target_hardware: Self::LOCAL_MAC,
+                            target_protocol: Self::LOCAL_V4,
+                        }
+                        .encode(&mut frame[offset..])
+                        .expect("test ARP reply should fit")
+                }
+                Self::Ipv6 => {
+                    let mut body = [0u8; Icmpv6Packet::NEIGHBOR_MESSAGE_LEN];
+                    Icmpv6Packet::encode_neighbor_advertisement(
+                        &mut body,
+                        connect_remote(),
+                        connect_local(),
+                        connect_remote(),
+                        PEER_MAC,
+                    )
+                    .expect("test Neighbor Advertisement should fit");
+                    let mut offset = EthernetFrame::encode_header(
+                        &mut frame,
+                        Self::LOCAL_MAC,
+                        PEER_MAC,
+                        EthernetProtocol::Ipv6,
+                    )
+                    .expect("test Ethernet header should fit");
+                    offset += Ipv6Packet::encode_header(
+                        &mut frame[offset..],
+                        connect_remote(),
+                        connect_local(),
+                        IpProtocol::Icmpv6,
+                        body.len(),
+                        255,
+                    )
+                    .expect("test IPv6 header should fit");
+                    frame[offset..offset + body.len()].copy_from_slice(&body);
+                    offset + body.len()
+                }
+            };
+            frame[..len].to_vec()
+        }
+
+        /// A segment from the peer to the device.
+        fn tcp_from_peer(self, header: TcpHeader) -> Vec<u8> {
+            let (frame, len) = match self {
+                Self::Ipv4 => ipv4_tcp_frame(Self::PEER_V4, Self::LOCAL_V4, header, &[]),
+                Self::Ipv6 => ipv6_tcp_frame(connect_remote(), connect_local(), header),
+            };
+            frame[..len].to_vec()
+        }
+
+        fn classify(self, frame: &[u8]) -> Wire {
+            let Some(ethernet) = EthernetFrame::parse(frame) else {
+                return Wire::Other;
+            };
+            let tcp = match self {
+                Self::Ipv4 => {
+                    if ethernet.protocol == EthernetProtocol::Arp {
+                        return Wire::Resolution;
+                    }
+                    let Some(ipv4) = Ipv4Packet::parse(ethernet.payload) else {
+                        return Wire::Other;
+                    };
+                    (ipv4.protocol == IpProtocol::Tcp).then(|| TcpPacket::parse(ipv4.payload))
+                }
+                Self::Ipv6 => {
+                    let Some(ipv6) = Ipv6Packet::parse(ethernet.payload) else {
+                        return Wire::Other;
+                    };
+                    if ipv6.next_header == IpProtocol::Icmpv6 {
+                        return Wire::Resolution;
+                    }
+                    (ipv6.next_header == IpProtocol::Tcp).then(|| TcpPacket::parse(ipv6.payload))
+                }
+            };
+            match tcp.flatten() {
+                Some(tcp) => Wire::Tcp {
+                    flags: tcp.flags,
+                    payload: tcp.payload.to_vec(),
+                },
+                None => Wire::Other,
+            }
+        }
+    }
+
+    const PEER_PORT: u16 = 80;
+    const LOCAL_SEQUENCE: u32 = 7;
+    const PEER_SEQUENCE: u32 = 100;
+    /// The shard the resolution tests open their connection on: not the
+    /// default one.
+    const OWNER: usize = 1;
+
+    /// Two shards on two pairs, both with the local address and the
+    /// control plane's copy of the first, and a connection opened on
+    /// the second shard, which asks for the peer's address when polled.
+    struct ConnectOnSecondShard {
+        service: super::NetworkService<RecordingSmpCpu, RecordingNetworkInterface>,
+        device: RecordingNetworkInterface,
+        local_port: u16,
+        socket: helios_netstack::SocketId,
+    }
+
+    impl ConnectOnSecondShard {
+        fn open(family: ResolutionFamily) -> Self {
+            let device = RecordingNetworkInterface::accepting_transmissions(2);
+            let service = test_network_service_smp(2, device.clone());
+            let state = &service.inner.state;
+            assert_eq!(state.shard_count(), 2);
+            for idx in 0..2 {
+                family.configure(&mut state.shard_at(idx).lock());
+            }
+            service
+                .inner
+                .control
+                .publish_from_shard(&state.shard_at(0).lock());
+            let local_port = (49_152..u16::MAX)
+                .find(|port| {
+                    super::shard_idx_for_flow(family.local(), *port, family.peer(), PEER_PORT, 2)
+                        == OWNER
+                })
+                .expect("some ephemeral port hashes to the second shard");
+            let socket = {
+                let mut shard = state.shard_at(OWNER).lock();
+                let socket = shard
+                    .stack
+                    .open_tcp_connect(
+                        TcpEndpoint {
+                            address: family.local(),
+                            port: local_port,
+                        },
+                        TcpEndpoint {
+                            address: family.peer(),
+                            port: PEER_PORT,
+                        },
+                        LOCAL_SEQUENCE,
+                    )
+                    .expect("the test connection should allocate a socket");
+                shard.insert_tcp_stream(socket);
+                socket
+            };
+            Self {
+                service,
+                device,
+                local_port,
+                socket,
+            }
+        }
+    }
+
+    /// Issue #809, the sequence the first connection of a boot takes: a
+    /// connect whose flow hashes to a shard other than the default one
+    /// asks for the peer's address from that shard, the reply is
+    /// learned on the default shard, and the connection's own shard
+    /// receives its SYN-ACK. The request that shard made is its own
+    /// business and must not reach the control plane, where it would
+    /// replace the resolved neighbour on every shard.
+    fn a_pending_resolution_on_another_shard_leaves_the_resolved_neighbor(
+        family: ResolutionFamily,
+    ) {
+        let ConnectOnSecondShard {
+            service,
+            device,
+            local_port,
+            socket,
+        } = ConnectOnSecondShard::open(family);
+        let state = &service.inner.state;
+
+        // One interface-scope poll, and what it put on the wire.
+        let mut seen = 0;
+        let mut poll = || {
+            block_on(service.poll_network_once(NetworkPollSource::Tcp))
+                .expect("the poll should drive the device");
+            let frames = device.transmitted_frames();
+            let new = frames[seen..]
+                .iter()
+                .map(|frame| family.classify(frame))
+                .collect::<Vec<_>>();
+            seen = frames.len();
+            new
+        };
+
+        let wire = poll();
+        assert!(
+            wire.iter().any(|wire| matches!(wire, Wire::Resolution)),
+            "the shard asks for the peer's address: {wire:?}"
+        );
+        assert!(
+            !wire.iter().any(|wire| matches!(wire, Wire::Tcp { .. })),
+            "nothing is sent before the address is known: {wire:?}"
+        );
+
+        // The reply lands on the default shard. The next poll learns it,
+        // and the one after hands it to the connection's shard.
+        device.deliver_on(0, &family.resolution_reply());
+        let wire = [poll(), poll()].concat();
+        assert!(
+            wire.iter().any(|wire| matches!(
+                wire,
+                Wire::Tcp { flags, .. } if flags.contains(TcpFlags::SYN)
+            )),
+            "the SYN leaves once the address is known: {wire:?}"
+        );
+
+        device.deliver_on(
+            0,
+            &family.tcp_from_peer(TcpHeader {
+                source_port: PEER_PORT,
+                destination_port: local_port,
+                sequence: PEER_SEQUENCE,
+                acknowledgement: LOCAL_SEQUENCE.wrapping_add(1),
+                flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                window_size: u16::MAX,
+            }),
+        );
+        poll();
+
+        state
+            .shard_at(OWNER)
+            .lock()
+            .stack
+            .tcp_send(socket, b"hello")
+            .expect("data should queue on the established socket");
+        let wire = poll();
+
+        for idx in 0..2 {
+            let shard = state.shard_at(idx).lock();
+            assert!(
+                shard.stack.neighbors().any(|entry| {
+                    entry.ip == family.peer()
+                        && entry.mac == PEER_MAC
+                        && entry.state == NeighborState::Reachable
+                }),
+                "shard {idx} lost the peer's resolved address"
+            );
+        }
+        assert!(
+            wire.iter().any(|wire| matches!(
+                wire,
+                Wire::Tcp { payload, .. } if payload == b"hello"
+            )),
+            "the poll sends the data: {wire:?}"
+        );
+        assert!(
+            !wire.iter().any(|wire| matches!(wire, Wire::Resolution)),
+            "the poll asks for nothing the shards already know: {wire:?}"
+        );
+    }
+
+    #[test]
+    fn a_pending_ipv4_resolution_on_another_shard_leaves_the_resolved_neighbor() {
+        a_pending_resolution_on_another_shard_leaves_the_resolved_neighbor(ResolutionFamily::Ipv4);
+    }
+
+    #[test]
+    fn a_pending_ipv6_resolution_on_another_shard_leaves_the_resolved_neighbor() {
+        a_pending_resolution_on_another_shard_leaves_the_resolved_neighbor(ResolutionFamily::Ipv6);
+    }
+
+    /// One poll of the receive path of queue pair `pair`, as that pair's
+    /// pump runs it: it takes the pair's frames and never synchronizes
+    /// the control plane.
+    fn poll_pair_without_synchronizing(
+        service: &super::NetworkService<RecordingSmpCpu, RecordingNetworkInterface>,
+        pair: usize,
+    ) {
+        let poll = NetworkPollState::new(
+            service.inner.poll.base_rx_budget,
+            service.inner.poll.base_tx_completion_budget,
+            service.inner.poll.base_tx_frame_budget,
+        );
+        block_on(service.poll_network_once_with_tcp_read(
+            NetworkPollSource::Pump,
+            None,
+            true,
+            NetworkPollScope::Pair {
+                pair,
+                interface_wide: false,
+            },
+            &poll,
+        ))
+        .expect("the pair's pump drains it");
+    }
+
+    /// Issue #809: the Neighbor Advertisement lands on the default
+    /// shard's pair, and the pump that drains that pair never
+    /// synchronizes the control plane. The shard that asked is answered
+    /// by the dispatch itself, and its waiters are signalled.
+    #[test]
+    fn a_neighbor_advertisement_answers_the_shard_that_asked_without_a_synchronization() {
+        let family = ResolutionFamily::Ipv6;
+        let fixture = ConnectOnSecondShard::open(family);
+        let service = &fixture.service;
+        block_on(service.poll_network_once(NetworkPollSource::Tcp))
+            .expect("the poll should drive the device");
+        assert!(
+            service
+                .inner
+                .state
+                .shard_at(OWNER)
+                .lock()
+                .stack
+                .neighbors()
+                .all(|entry| entry.ip != family.peer()),
+            "the shard has only asked"
+        );
+
+        // The mark is sampled before the answer arrives, the way every
+        // operation takes its own.
+        let asker_wait = service.shard_wait(OWNER);
+        fixture.device.deliver_on(0, &family.resolution_reply());
+        let mut parked = core::pin::pin!(
+            service.wait_for_shard_progress(asker_wait, core::time::Duration::from_secs(3600))
+        );
+        assert!(
+            block_on(poll_once(parked.as_mut())).is_none(),
+            "a frame on pair 0 is not an event the asker's wait watches"
+        );
+
+        poll_pair_without_synchronizing(service, 0);
+
+        assert!(
+            block_on(poll_once(parked.as_mut())).is_some(),
+            "the answered shard's waiters are signalled"
+        );
+        let learned = |entry: NeighborEntry| {
+            entry.ip == family.peer()
+                && entry.mac == PEER_MAC
+                && entry.state == NeighborState::Reachable
+        };
+        assert!(
+            service
+                .inner
+                .state
+                .shard_at(OWNER)
+                .lock()
+                .stack
+                .neighbors()
+                .any(learned),
+            "the shard that asked holds the answer"
+        );
+        assert!(
+            service
+                .inner
+                .control
+                .neighbors
+                .load_full()
+                .iter()
+                .any(learned),
+            "the control plane holds it"
+        );
+    }
+
+    /// An advertisement for an address no shard asked about creates no
+    /// entry anywhere, on the shard that received it or on the control
+    /// plane (RFC 4861 section 7.2.5).
+    #[test]
+    fn an_unasked_neighbor_advertisement_creates_no_entry_on_any_shard() {
+        let family = ResolutionFamily::Ipv6;
+        let device = RecordingNetworkInterface::accepting_transmissions(2);
+        let service = test_network_service_smp(2, device.clone());
+        let state = &service.inner.state;
+        for idx in 0..2 {
+            family.configure(&mut state.shard_at(idx).lock());
+        }
+
+        device.deliver_on(0, &family.resolution_reply());
+        poll_pair_without_synchronizing(&service, 0);
+        block_on(service.poll_network_once(NetworkPollSource::Tcp))
+            .expect("the poll should drive the device");
+
+        for idx in 0..2 {
+            assert!(
+                state
+                    .shard_at(idx)
+                    .lock()
+                    .stack
+                    .neighbors()
+                    .all(|entry| entry.ip != family.peer()),
+                "shard {idx} took an address nobody asked for"
+            );
+        }
+        assert!(
+            service
+                .inner
+                .control
+                .neighbors
+                .load_full()
+                .iter()
+                .all(|entry| entry.ip != family.peer()),
+            "the control plane took an address nobody asked for"
+        );
     }
 
     /// The receive rule and the placement rule have to agree, or a
@@ -3822,7 +5266,7 @@ mod tests {
                     let (frame, len) =
                         ipv4_udp_frame(peer, peer_port, local, local_port, b"payload");
                     assert_eq!(
-                        super::shard_idx_for_frame(&unhashed(&frame[..len]), shard_count),
+                        owning_shard(&unhashed(&frame[..len]), shard_count),
                         placed,
                         "the demux and the placement rule must agree"
                     );
@@ -3842,7 +5286,7 @@ mod tests {
         for shard_count in [1usize, 2, 3, 4, 8] {
             for peer_port in [53u16, 443, 8080, 40_000] {
                 let (frame, len) = ipv4_udp_frame(peer, peer_port, local, 49_153, b"payload");
-                let computed = super::shard_idx_for_frame(&unhashed(&frame[..len]), shard_count);
+                let computed = owning_shard(&unhashed(&frame[..len]), shard_count);
 
                 // What the device would have written into the receive
                 // header: the same function over the same bytes.
@@ -3855,7 +5299,7 @@ mod tests {
                     },
                 );
                 assert_eq!(
-                    super::shard_idx_for_frame(&reported, shard_count),
+                    owning_shard(&reported, shard_count),
                     computed,
                     "a steered frame and a software-hashed one belong to the same shard"
                 );
@@ -3879,7 +5323,7 @@ mod tests {
                 b"offer",
             );
             assert_eq!(
-                super::shard_idx_for_frame(&unhashed(&offer[..offer_len]), shard_count),
+                owning_shard(&unhashed(&offer[..offer_len]), shard_count),
                 super::DEFAULT_SHARD_IDX
             );
             let (discover, discover_len) = ipv4_udp_frame(
@@ -3890,7 +5334,7 @@ mod tests {
                 b"discover",
             );
             assert_eq!(
-                super::shard_idx_for_frame(&unhashed(&discover[..discover_len]), shard_count),
+                owning_shard(&unhashed(&discover[..discover_len]), shard_count),
                 super::DEFAULT_SHARD_IDX
             );
         }
@@ -3916,7 +5360,7 @@ mod tests {
             shard_count,
         );
         assert_eq!(
-            super::shard_idx_for_frame(&unhashed(&error[..error_len]), shard_count),
+            owning_shard(&unhashed(&error[..error_len]), shard_count),
             flow
         );
     }
@@ -3927,7 +5371,7 @@ mod tests {
     fn a_frame_without_a_flow_falls_to_the_default_shard() {
         for shard_count in [1usize, 2, 4] {
             assert_eq!(
-                super::shard_idx_for_frame(&unhashed(&[]), shard_count),
+                owning_shard(&unhashed(&[]), shard_count),
                 super::DEFAULT_SHARD_IDX,
                 "an unparseable frame has no flow"
             );
@@ -3940,9 +5384,66 @@ mod tests {
             )
             .expect("test Ethernet header should fit");
             assert_eq!(
-                super::shard_idx_for_frame(&unhashed(&arp[..len]), shard_count),
+                owning_shard(&unhashed(&arp[..len]), shard_count),
                 super::DEFAULT_SHARD_IDX,
                 "ARP carries no ports"
+            );
+        }
+    }
+
+    /// A Neighbor Advertisement answers whichever shard asked, so it
+    /// belongs to every shard; a Neighbor Solicitation and ARP, which
+    /// only the default shard's control plane answers, stay with it.
+    #[test]
+    fn a_neighbor_advertisement_is_an_answer_for_every_shard() {
+        let advertisement = ResolutionFamily::Ipv6.resolution_reply();
+        let arp = ResolutionFamily::Ipv4.resolution_reply();
+        let mut solicitation = [0; ETHERNET_FRAME_BYTES];
+        let mut offset = EthernetFrame::encode_header(
+            &mut solicitation,
+            [0x33, 0x33, 0xff, 0, 0, 1],
+            PEER_MAC,
+            EthernetProtocol::Ipv6,
+        )
+        .expect("test Ethernet header should fit");
+        let mut body = [0u8; Icmpv6Packet::NEIGHBOR_MESSAGE_LEN];
+        Icmpv6Packet::encode_neighbor_solicitation(
+            &mut body,
+            connect_remote(),
+            connect_local().solicited_node_multicast(),
+            connect_local(),
+            PEER_MAC,
+        )
+        .expect("test Neighbor Solicitation should fit");
+        offset += Ipv6Packet::encode_header(
+            &mut solicitation[offset..],
+            connect_remote(),
+            connect_local().solicited_node_multicast(),
+            IpProtocol::Icmpv6,
+            body.len(),
+            255,
+        )
+        .expect("test IPv6 header should fit");
+        solicitation[offset..offset + body.len()].copy_from_slice(&body);
+        let solicitation = &solicitation[..offset + body.len()];
+
+        for shard_count in [1usize, 2, 4, 8] {
+            assert!(
+                matches!(
+                    super::rx_frame_owner(&unhashed(&advertisement), shard_count),
+                    super::RxFrameOwner::ResolutionAnswer
+                ),
+                "an advertisement answers a resolution on any of {shard_count} shards"
+            );
+            assert_eq!(
+                owning_shard(&unhashed(solicitation), shard_count),
+                super::DEFAULT_SHARD_IDX,
+                "a solicitation is the default shard's to answer"
+            );
+            assert_eq!(
+                owning_shard(&unhashed(&arp), shard_count),
+                super::DEFAULT_SHARD_IDX,
+                "ARP is the default shard's"
             );
         }
     }
@@ -4034,6 +5535,379 @@ mod tests {
         }
     }
 
+    const CONNECT_REMOTE_PORT: u16 = 443;
+
+    fn connect_local() -> Ipv6Address {
+        Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1])
+    }
+
+    fn connect_remote() -> Ipv6Address {
+        Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2])
+    }
+
+    /// A shard set whose every shard has the local address and a
+    /// reachable neighbour, so a connect opened on any of them emits
+    /// its SYN.
+    fn connect_shard_set(shard_count: usize) -> super::NetworkShardSet {
+        super::NetworkShardSet::new(
+            crate::test_support::single_node_pool(shard_count),
+            |index| {
+                let mut shard = NetworkShard::new(
+                    test_stack_config(),
+                    1 + index as u32,
+                    index,
+                    shard_count,
+                    test_root_entropy(),
+                );
+                shard
+                    .stack
+                    .add_ipv6_address(Ipv6Cidr::new(connect_local(), 64))
+                    .expect("test address should be accepted");
+                shard.stack.learn_neighbor(NeighborEntry {
+                    ip: IpAddress::Ipv6(connect_remote()),
+                    mac: [0x02, 0, 0, 0, 0, 2],
+                    state: NeighborState::Reachable,
+                    updated_at: StackInstant::from_nanos(0),
+                });
+                shard
+            },
+        )
+    }
+
+    fn connect_request() -> super::TcpConnectRequest {
+        super::TcpConnectRequest {
+            local: IpAddress::Ipv6(connect_local()),
+            destination: IpAddress::Ipv6(connect_remote()),
+            port: CONNECT_REMOTE_PORT,
+            hop_limit: helios_netstack::DEFAULT_HOP_LIMIT,
+            opened_at: StackInstant::from_nanos(0),
+        }
+    }
+
+    /// Opens a connection from `local_port` on `shard` and leaves it
+    /// non-closed, so it holds its four-tuple the way a TIME-WAIT
+    /// socket does.
+    fn hold_four_tuple(shard: &mut NetworkShard, local_port: u16) {
+        let request = connect_request();
+        shard
+            .start_tcp_connect(
+                request.local,
+                request.destination,
+                request.port,
+                local_port,
+                request.hop_limit,
+                request.opened_at,
+            )
+            .expect("a free four-tuple should open");
+    }
+
+    /// The source port of every SYN this shard has queued.
+    fn queued_syn_source_ports(shard: &mut NetworkShard) -> Vec<u16> {
+        shard
+            .stack
+            .drive_tcp(StackInstant::from_nanos(1))
+            .expect("TCP SYNs should be queued");
+        let mut ports = Vec::new();
+        while let Some(frame) = shard.stack.take_outbound() {
+            let ethernet =
+                EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
+            let ipv6 = Ipv6Packet::parse(ethernet.payload).expect("IPv6 packet should parse");
+            let tcp = TcpPacket::parse(ipv6.payload).expect("TCP packet should parse");
+            assert!(tcp.flags.contains(TcpFlags::SYN));
+            ports.push(tcp.source_port);
+        }
+        ports
+    }
+
+    /// Issue #788: a walk that starts on ports whose four-tuple to this
+    /// remote a lingering connection still holds takes the next
+    /// candidate instead of failing the connect.
+    #[test]
+    fn an_ephemeral_connect_skips_a_port_whose_four_tuple_is_held() {
+        const HELD: u16 = 3;
+        let state = connect_shard_set(1);
+        let mut shard = state.shard_at(0).lock();
+        let (first, last) = shard.ephemeral_window();
+        for offset in 0..HELD {
+            hold_four_tuple(&mut shard, first + offset);
+        }
+        let walk = super::EphemeralWalk::starting_at(first, last, 0);
+
+        shard
+            .open_tcp_connect_along_own_flows(walk, connect_request(), 1)
+            .expect("an in-use candidate is not a failure")
+            .expect("the candidate after the held ones opens");
+
+        let mut ports = queued_syn_source_ports(&mut shard);
+        ports.sort_unstable();
+        let expected: Vec<u16> = (first..=first + HELD).collect();
+        assert_eq!(
+            ports, expected,
+            "the new connection takes the first port after the held run"
+        );
+    }
+
+    /// A connect that does not name its port keeps succeeding as
+    /// four-tuples to one remote accumulate, and never reuses a port.
+    #[test]
+    fn repeated_ephemeral_connects_to_one_remote_never_collide() {
+        const CONNECTS: usize = 100;
+        let state = connect_shard_set(2);
+        let mut ports = Vec::new();
+        for _ in 0..CONNECTS {
+            let stream = state
+                .open_ephemeral_tcp_connect(0, connect_request())
+                .expect("every connect finds a port");
+            let owner = state.shard_idx_for_handle(stream);
+            ports.extend(queued_syn_source_ports(&mut state.shard_at(owner).lock()));
+        }
+        let mut distinct = ports.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(ports.len(), CONNECTS);
+        assert_eq!(
+            distinct.len(),
+            CONNECTS,
+            "a local port was handed out twice"
+        );
+    }
+
+    /// Connects to one remote, each closed before the next (so the
+    /// four-tuple is free again, as it is for a guest that closed second
+    /// or whose peer holds no state), never take a local port twice
+    /// while the accepting shard's own-flow candidates of the window are
+    /// not exhausted. The design's bound: a connect takes the first
+    /// own-flow candidate at or after its start and the next start is the
+    /// port after it, so the taken ports ascend through the window's own
+    /// flow candidates and the first repeat is the connect after the last
+    /// of them. This is the issue #881 reuse, which the previous uniformly
+    /// random start made likely within a few connects.
+    #[test]
+    fn closed_connects_to_one_remote_walk_the_window_before_reusing_a_port() {
+        const CONNECTS: usize = 600;
+        let state = connect_shard_set(2);
+        let (first, last) = state.shard_at(0).lock().ephemeral_window();
+        let own_candidates = (first..=last)
+            .filter(|port| connect_request().owner_of(*port, 2) == 0)
+            .count();
+        assert!(
+            own_candidates > CONNECTS,
+            "the bound must not bite inside the test"
+        );
+        let mut ports = Vec::new();
+        for _ in 0..CONNECTS {
+            let stream = state
+                .open_ephemeral_tcp_connect(0, connect_request())
+                .expect("every connect finds a port");
+            let owner = state.shard_idx_for_handle(stream);
+            assert_eq!(owner, 0, "an own-flow candidate is free, so it is taken");
+            let syn = queued_syn_source_ports(&mut state.shard_at(owner).lock());
+            assert_eq!(syn.len(), 1);
+            ports.push(syn[0]);
+            state.with_handle(stream, |shard| {
+                shard.remove_tcp_stream(stream, StackInstant::from_nanos(1));
+            });
+        }
+        let mut distinct = ports.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            CONNECTS,
+            "a local port was reused: {ports:?}"
+        );
+    }
+
+    /// Two destinations that differ in address or in port start at
+    /// unrelated offsets of the window.
+    #[test]
+    fn different_remotes_start_at_unrelated_offsets() {
+        let state = connect_shard_set(1);
+        let shard = state.shard_at(0).lock();
+        let start = |request: &super::TcpConnectRequest| {
+            shard
+                .connect_walk(request)
+                .0
+                .next()
+                .expect("a walk has a first candidate")
+        };
+        let base = connect_request();
+        let mut starts = Vec::new();
+        for step in 0..8_u8 {
+            let mut octets = connect_remote().octets();
+            octets[15] = step;
+            starts.push(start(&super::TcpConnectRequest {
+                destination: IpAddress::Ipv6(Ipv6Address::new(octets)),
+                ..base
+            }));
+            starts.push(start(&super::TcpConnectRequest {
+                port: CONNECT_REMOTE_PORT + 1 + u16::from(step),
+                ..base
+            }));
+        }
+        let mut distinct = starts.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            starts.len(),
+            "sixteen destinations of a 16384 port window started alike: {starts:?}"
+        );
+        let sequential = starts
+            .windows(2)
+            .all(|pair| pair[1] == pair[0].wrapping_add(1));
+        assert!(
+            !sequential,
+            "starts follow the destination in order: {starts:?}"
+        );
+    }
+
+    /// The first port of a destination depends on the shard's secret:
+    /// another shard of the same service and another service's shard
+    /// start the same destination at different offsets, so a sender that
+    /// cannot read the key cannot name the port.
+    #[test]
+    fn the_first_port_of_a_destination_depends_on_the_shards_secret() {
+        let offsets = |shard_idx: usize, fill: u8| -> Vec<u16> {
+            let entropy = crate::RootEntropyHandle::new(
+                crate::RootEntropy::from_platform(
+                    &crate::test_support::TestCpu::with_entropy(fill),
+                    None,
+                    None,
+                    crate::MachineGeneration::new(None),
+                )
+                .expect("the test CPU has an entropy source"),
+            );
+            let shard = NetworkShard::new(test_stack_config(), 1, shard_idx, 2, entropy);
+            let (first, _) = shard.ephemeral_window();
+            (0..16_u16)
+                .map(|port| {
+                    let request = super::TcpConnectRequest {
+                        port: CONNECT_REMOTE_PORT + port,
+                        ..connect_request()
+                    };
+                    shard.connect_walk(&request).0.next().expect("a first port") - first
+                })
+                .collect()
+        };
+        let own = offsets(0, 0x5a);
+        assert_eq!(own, offsets(0, 0x5a), "the same secret is deterministic");
+        let agreeing = |other: Vec<u16>| own.iter().zip(&other).filter(|(a, b)| a == b).count();
+        assert!(
+            agreeing(offsets(1, 0x5a)) <= 1,
+            "another shard of the service starts destinations alike"
+        );
+        assert!(
+            agreeing(offsets(0, 0x5b)) <= 1,
+            "another secret starts destinations alike"
+        );
+    }
+
+    /// The ports of `first..=first + 63` that hash to the accepting
+    /// shard 0 and to the other shard of a two-shard set.
+    fn split_by_owner(first: u16) -> (Vec<u16>, Vec<u16>) {
+        (first..first + 64).partition(|port| {
+            super::shard_idx_for_flow(
+                IpAddress::Ipv6(connect_local()),
+                *port,
+                IpAddress::Ipv6(connect_remote()),
+                CONNECT_REMOTE_PORT,
+                2,
+            ) == 0
+        })
+    }
+
+    /// Candidates that hash to another shard are tried on that shard,
+    /// in walk order, once no candidate of the accepting shard opens.
+    #[test]
+    fn an_ephemeral_connect_falls_to_a_foreign_shard_candidate() {
+        let first = super::EPHEMERAL_PORT_START;
+        let state = connect_shard_set(2);
+        let (own, foreign) = split_by_owner(first);
+        assert!(foreign.len() >= 2, "the fixture needs two foreign ports");
+        for port in &own {
+            hold_four_tuple(&mut state.shard_at(0).lock(), *port);
+        }
+        hold_four_tuple(&mut state.shard_at(1).lock(), foreign[0]);
+        let walk = super::EphemeralWalk::starting_at(first, first + 63, 0);
+
+        let own_flow = state
+            .shard_at(0)
+            .lock()
+            .open_tcp_connect_along_own_flows(walk, connect_request(), 2)
+            .expect("an in-use candidate is not a failure");
+        assert!(own_flow.is_none(), "every own-shard candidate is held");
+        let stream = state
+            .open_tcp_connect_along_foreign_flows(walk, 0, connect_request())
+            .expect("the second foreign candidate opens")
+            .stream;
+
+        assert_eq!(state.shard_idx_for_handle(stream), 1);
+        let mut ports = queued_syn_source_ports(&mut state.shard_at(1).lock());
+        ports.sort_unstable();
+        let mut expected = Vec::from([foreign[0], foreign[1]]);
+        expected.sort_unstable();
+        assert_eq!(ports, expected);
+    }
+
+    /// Only a window with every candidate in use fails the connect.
+    #[test]
+    fn an_ephemeral_connect_fails_only_when_every_candidate_is_held() {
+        let first = super::EPHEMERAL_PORT_START;
+        let state = connect_shard_set(2);
+        let (own, foreign) = split_by_owner(first);
+        for port in &own {
+            hold_four_tuple(&mut state.shard_at(0).lock(), *port);
+        }
+        for port in &foreign {
+            hold_four_tuple(&mut state.shard_at(1).lock(), *port);
+        }
+        let walk = super::EphemeralWalk::starting_at(first, first + 63, 0);
+
+        let own_flow = state
+            .shard_at(0)
+            .lock()
+            .open_tcp_connect_along_own_flows(walk, connect_request(), 2)
+            .expect("an in-use candidate is not a failure");
+        assert!(own_flow.is_none());
+        let error = state
+            .open_tcp_connect_along_foreign_flows(walk, 0, connect_request())
+            .err()
+            .expect("no candidate is free");
+        assert_eq!(error.detail, crate::NetworkErrorDetail::TcpNoEphemeralPorts);
+    }
+
+    /// A port the program bound is one attempt: its conflict is
+    /// reported as a start failure, never walked past.
+    #[test]
+    fn a_bound_port_whose_four_tuple_is_held_reports_the_conflict() {
+        let mut shard = test_network_shard();
+        shard
+            .stack
+            .add_ipv6_address(Ipv6Cidr::new(connect_local(), 64))
+            .expect("test address should be accepted");
+        let request = connect_request();
+        hold_four_tuple(&mut shard, 50_000);
+
+        let conflict = shard
+            .start_tcp_connect(
+                request.local,
+                request.destination,
+                request.port,
+                50_000,
+                request.hop_limit,
+                request.opened_at,
+            )
+            .err()
+            .expect("the held four-tuple cannot open twice");
+
+        assert!(matches!(conflict, super::TcpConnectStartError::PortInUse));
+        assert_eq!(
+            conflict.into_tcp_error().detail,
+            crate::NetworkErrorDetail::TcpConnectStartFailed
+        );
+    }
+
     /// A lookup's two question ids differ and are nonzero, and
     /// successive lookups are not counted up.
     #[test]
@@ -4050,6 +5924,21 @@ mod tests {
             ids.windows(2)
                 .any(|pair| pair[1] != pair[0].wrapping_add(1)),
             "ids were handed out in order: {ids:?}"
+        );
+    }
+
+    /// An echo identifier is nonzero, and successive pings are not
+    /// counted up.
+    #[test]
+    fn icmp_echo_identifiers_are_random_and_nonzero() {
+        let mut shard = test_network_shard();
+        let identifiers: Vec<u16> = (0..32).map(|_| shard.draw_icmp_echo_identifier()).collect();
+        assert!(identifiers.iter().all(|&identifier| identifier != 0));
+        assert!(
+            identifiers
+                .windows(2)
+                .any(|pair| pair[1] != pair[0].wrapping_add(1)),
+            "identifiers were handed out in order: {identifiers:?}"
         );
     }
 
@@ -4166,15 +6055,16 @@ mod tests {
     fn accept_starts_at_the_callers_shard_and_visits_the_rest() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([198, 51, 100, 20]);
-        let state = super::NetworkShardSet::new(3, |index| {
-            NetworkShard::new(
-                test_stack_config(),
-                1 + index as u32,
-                index,
-                3,
-                test_root_entropy(),
-            )
-        });
+        let state =
+            super::NetworkShardSet::new(crate::test_support::single_node_pool(3), |index| {
+                NetworkShard::new(
+                    test_stack_config(),
+                    1 + index as u32,
+                    index,
+                    3,
+                    test_root_entropy(),
+                )
+            });
         let listener = TcpListenerId(ReplicaHandle::new(FIRST_TEST_LISTENER_SLOT).get());
         state
             .install_replica(
@@ -4319,15 +6209,16 @@ mod tests {
     #[test]
     fn shard_arrivals_deduplicate_within_one_receive_batch() {
         let cpu = RecordingSmpCpu::new(0, 4);
-        let state = super::NetworkShardSet::new(4, |index| {
-            NetworkShard::new(
-                test_stack_config(),
-                1 + index as u32,
-                index,
-                4,
-                test_root_entropy(),
-            )
-        });
+        let state =
+            super::NetworkShardSet::new(crate::test_support::single_node_pool(4), |index| {
+                NetworkShard::new(
+                    test_stack_config(),
+                    1 + index as u32,
+                    index,
+                    4,
+                    test_root_entropy(),
+                )
+            });
         let mut arrivals = super::ShardArrivals::new();
         arrivals.record(2);
         arrivals.record(2);
@@ -4361,15 +6252,16 @@ mod tests {
         let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         let peer = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
         let router = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]);
-        let state = super::NetworkShardSet::new(2, |index| {
-            NetworkShard::new(
-                test_stack_config(),
-                1 + index as u32,
-                index,
-                2,
-                test_root_entropy(),
-            )
-        });
+        let state =
+            super::NetworkShardSet::new(crate::test_support::single_node_pool(2), |index| {
+                NetworkShard::new(
+                    test_stack_config(),
+                    1 + index as u32,
+                    index,
+                    2,
+                    test_root_entropy(),
+                )
+            });
         let socket = UdpSocketId(ReplicaHandle::new(FIRST_TEST_UDP_SLOT).get());
         state
             .install_replica(

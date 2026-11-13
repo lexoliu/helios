@@ -1,20 +1,27 @@
 extern crate alloc;
 
-use acpi::platform::{AcpiPlatform, ProcessorState};
-use acpi::{AcpiTables, Handler, PciAddress, PhysicalMapping};
+use acpi::sdt::madt::{Madt, MadtEntry};
+use acpi::{AcpiTables, Handler, PciAddress, RawPhysicalMapping};
 use alloc::alloc::{Layout, alloc_zeroed};
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::arch::x86_64::__cpuid;
 use core::num::NonZeroUsize;
 
+use core::arch::global_asm;
 use core::ops::Range;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{
+    AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicUsize, Ordering, compiler_fence,
+};
+use helios_artifact::ProbeAnswers;
 use helios_hal::cpu::{GUEST_STACK_LIMIT_OFFSET, ProcessorId, Timebase};
 use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::watchdog::Watchdog;
-use helios_kernel::{InstructionSampler, SampleCapture, Timer, WasmtimeTlsSlots};
+use helios_kernel::{
+    InstructionSampler, LocalMemory, PerProcessor, SampleCapture, Timer, UserMemoryPool,
+    WasmtimeTlsSlots,
+};
 use pci_types::ConfigRegionAccess;
 use spin::Once;
 use x86::apic::x2apic::X2APIC;
@@ -44,7 +51,9 @@ use crate::exceptions::{
     DeviceInterruptRoutes, EXCEPTION_STACK_BYTES, ProcessorIdt, ProcessorSegments,
 };
 use crate::extended_state::Xcr0;
-use crate::ioapic::IoApic;
+use crate::hotplug::SciEvents;
+use crate::ioapic::IoApics;
+use crate::mtrr::Mtrrs;
 use crate::pci::LegacyPciConfigAccess;
 use crate::read_tsc;
 use crate::watchdog::X86Watchdog;
@@ -209,6 +218,9 @@ pub(crate) struct ProcessorRuntime {
     timer: Once<Timer<crate::X86Cpu>>,
     program_service: Once<debug_state::ProgramService>,
     device_interrupts: Once<&'static DeviceInterruptRoutes>,
+    /// The SCI's latch. Installed on the bootstrap processor only, the
+    /// one processor the I/O APIC delivers the SCI to.
+    sci_events: Once<&'static SciEvents>,
     local_timer_ready: AtomicBool,
     /// The instruction sampler this processor's timer feeds while
     /// instruction sampling runs.
@@ -236,6 +248,14 @@ pub(crate) struct ProcessorRuntime {
     /// slept through. AArch64 carries the same latch for the same
     /// reason (`aarch64/src/lib.rs`).
     wake_pending: AtomicBool,
+    /// Where this processor is in a stop and restart: [`STOP_RUNNING`],
+    /// [`STOP_STOPPED`] or [`STOP_RESTARTING`]; see [`stop_current_processor`]
+    /// for the handshake and which side writes each transition.
+    stop_state: AtomicU8,
+    /// The stack pointer `helios_x86_stop_current` saved the callee-saved
+    /// context at. Written by this processor before it publishes
+    /// [`STOP_STOPPED`], read by the restarter after it observes that.
+    saved_stack: AtomicUsize,
 }
 
 impl ProcessorAnchor {
@@ -292,6 +312,12 @@ impl ProcessorRuntime {
 pub(crate) struct BootContext {
     platform: Arc<X86PlatformState>,
     xcr0: Xcr0,
+    /// The bootstrap processor's answer to every ISA level feature, taken
+    /// after it programmed XCR0. Immutable; each secondary compares its own.
+    isa_answers: ProbeAnswers,
+    /// The bootstrap processor's MTRRs, read once from what firmware
+    /// programmed; every processor the kernel starts loads them.
+    mtrrs: Mtrrs,
 }
 
 pub(crate) struct X86PlatformState {
@@ -300,14 +326,24 @@ pub(crate) struct X86PlatformState {
     physical_memory_offset: usize,
     debug_state: debug_state::RuntimeState,
     watchdog: X86Watchdog,
-    io_apic: IoApic,
-    processors: Box<[ProcessorSlot]>,
+    io_apics: IoApics,
+    /// One slot per possible processor, present or not, in memory of the
+    /// processor's node. Index: logical processor id.
+    processors: PerProcessor<ProcessorSlot>,
     wakeup_page: Option<WakeupPage>,
     boot_context: AtomicPtr<BootContext>,
+    /// Serialises use of the one wakeup page: a start or restart patches
+    /// it, sends INIT/SIPI and holds this until the target has read the
+    /// patched words, so two launches never overwrite each other's.
+    wakeup_lock: spin::Mutex<()>,
 }
 
 struct ProcessorSlot {
     apic_id: u32,
+    /// Whether the MADT listed this processor as enabled when the machine
+    /// booted. A slot that is not present is possible and online-capable:
+    /// boot builds it and never starts it.
+    present_at_boot: bool,
     runtime: ProcessorRuntime,
     stack_top: usize,
 }
@@ -324,89 +360,126 @@ pub(crate) struct PhysicalOffsetAcpiHandler {
     pub(crate) timebase: Timebase,
 }
 
+/// The handler the machine's AML interpreter runs through: this
+/// backend's, with every `Notify` queued for processor hotplug.
+pub(crate) type NotifyingAcpiHandler = helios_acpi::NotifyRecorder<PhysicalOffsetAcpiHandler>;
+
+/// The machine's one AML namespace, built at bring-up from the DSDT and
+/// every SSDT and kept for the processor-hotplug task.
+pub(crate) type AcpiNamespace = helios_acpi::Interpreter<NotifyingAcpiHandler>;
+
+/// A processor the MADT describes that the machine can run: a Local APIC
+/// or x2APIC entry that is enabled, or that firmware may enable later.
+pub(crate) struct PossibleProcessor {
+    pub(crate) apic_id: u32,
+    /// The entry's enabled flag: the processor exists now. Without it the
+    /// processor is possible but not present until firmware hot-adds it.
+    pub(crate) present: bool,
+}
+
+/// The MADT's possible processors in table order, the first being the
+/// bootstrap processor.
+///
+/// An enabled entry is present. Whether a disabled entry is a processor
+/// firmware may hot-add depends on the table's revision: ACPI 6.3
+/// (MADT revision 5) added the online-capable flag and made a disabled
+/// entry without it unusable, while earlier revisions list every possible
+/// processor as a disabled entry with no flag at all — QEMU's MADT is
+/// revision 3 and marks each processor beyond `-smp` that way
+/// (`hw/i386/acpi-common.c`, `pc_madt_cpu_entry`).
+///
+/// Iterates the table without allocating, so it can size the bootstrap
+/// allocator before the heap exists.
+pub(crate) fn possible_processors(
+    madt: core::pin::Pin<&Madt>,
+) -> impl Iterator<Item = PossibleProcessor> + '_ {
+    const LAPIC_ENABLED: u32 = 1 << 0;
+    const LAPIC_ONLINE_CAPABLE: u32 = 1 << 1;
+    // ACPI 6.3, 5.2.12.2: the revision that defines the online-capable flag.
+    const ONLINE_CAPABLE_REVISION: u8 = 5;
+
+    let online_capable_defined = madt.header.revision >= ONLINE_CAPABLE_REVISION;
+    madt.entries().filter_map(move |entry| {
+        let (apic_id, flags) = match entry {
+            MadtEntry::LocalApic(apic) => (u32::from(apic.apic_id), apic.flags),
+            MadtEntry::LocalX2Apic(apic) => (apic.x2apic_id, apic.flags),
+            _ => return None,
+        };
+        let present = flags & LAPIC_ENABLED != 0;
+        let possible = present || !online_capable_defined || flags & LAPIC_ONLINE_CAPABLE != 0;
+        possible.then_some(PossibleProcessor { apic_id, present })
+    })
+}
+
 pub(crate) fn build_boot_context(
     rsdp_address: usize,
-    physical_memory_offset: usize,
+    handler: PhysicalOffsetAcpiHandler,
     wakeup_page: Option<Range<usize>>,
-    tsc_base: u64,
-    timebase: Timebase,
     debug_state: debug_state::RuntimeState,
     xcr0: Xcr0,
+    pool: &UserMemoryPool,
 ) -> &'static BootContext {
-    let tsc_hz = timebase.frequency();
-    let handler = PhysicalOffsetAcpiHandler {
-        physical_memory_offset,
-        tsc_base,
-        timebase,
-    };
+    let tsc_hz = handler.timebase.frequency();
     let tables = unsafe { AcpiTables::from_rsdp(handler.clone(), rsdp_address) }
         .unwrap_or_else(|error| panic!("failed to parse ACPI tables: {error:?}"));
-    let watchdog = crate::watchdog::discover(&tables, physical_memory_offset);
+    let watchdog = crate::watchdog::discover(&tables, handler.physical_memory_offset);
     // Probed before the MADT is consumed: the I/O APIC's destination
     // encoding depends on which local-APIC mode the machine runs.
     let apic_mode = LocalApicMode::probe();
-    let io_apic = crate::ioapic::discover(&tables, physical_memory_offset, apic_mode);
-    let platform = AcpiPlatform::new(tables, handler.clone())
-        .unwrap_or_else(|error| panic!("failed to construct ACPI platform info: {error:?}"));
-    let processor_info = platform
-        .processor_info
-        .as_ref()
-        .unwrap_or_else(|| panic!("ACPI platform info did not expose processor topology"));
-
-    let mut processors =
-        alloc::vec::Vec::with_capacity(1 + processor_info.application_processors.len());
-    processors.push(ProcessorSlot {
-        apic_id: processor_info.boot_processor.local_apic_id,
-        runtime: ProcessorRuntime {
-            anchor: ProcessorAnchor::new(0),
-            physical_memory_offset,
-            tsc_hz,
-            apic_mode,
-            wasmtime_tls: WasmtimeTlsSlots::new(),
-            exception_idt: ProcessorIdt::new(),
-            segments: ProcessorSegments::new(
-                exception_stack(),
-                exception_stack(),
-                exception_stack(),
-            ),
-            interrupt_in_progress: AtomicBool::new(false),
-            probe_fault: AtomicUsize::new(0),
-            probe_frame: AtomicUsize::new(0),
-            watchdog: watchdog.clone(),
-            timer: Once::new(),
-            program_service: Once::new(),
-            device_interrupts: Once::new(),
-            local_timer_ready: AtomicBool::new(false),
-            instruction_sampler: debug_state.instruction_sampler(),
-            scheduler_tick_count: AtomicU32::new(0),
-            timer_sampling: AtomicBool::new(false),
-            samples_since_scheduler_tick: AtomicU32::new(0),
-            local_apic_attached: AtomicBool::new(false),
-            started: AtomicBool::new(false),
-            wake_pending: AtomicBool::new(false),
-        },
-        stack_top: 0,
-    });
-    for (index, processor) in processor_info.application_processors.iter().enumerate() {
-        assert!(
-            processor.state != ProcessorState::Disabled,
-            "ACPI exposed disabled application processor apic_id={}",
-            processor.local_apic_id
-        );
-        let stack = allocate_aligned_zeroed(KERNEL_STACK_BYTES, 16);
-        processors.push(ProcessorSlot {
-            apic_id: processor.local_apic_id,
+    let io_apics = crate::ioapic::discover(&tables, handler.physical_memory_offset, apic_mode);
+    let madt = tables
+        .find_table::<Madt>()
+        .unwrap_or_else(|| panic!("ACPI tables did not expose an MADT"));
+    // The same possible set, in the same order, the kernel was primed with
+    // (`MadtProcessors`), so a logical id names the same processor in
+    // every per-processor and per-node structure.
+    let possible: alloc::vec::Vec<PossibleProcessor> = possible_processors(madt.get()).collect();
+    let boot_processor = possible
+        .first()
+        .unwrap_or_else(|| panic!("MADT did not list any possible processors"));
+    assert!(
+        boot_processor.present,
+        "MADT lists the bootstrap processor apic_id={} as not enabled",
+        boot_processor.apic_id
+    );
+    assert_eq!(
+        pool.locality().processor_count(),
+        possible.len(),
+        "the kernel was primed for {} processors and the MADT names {} possible",
+        pool.locality().processor_count(),
+        possible.len()
+    );
+    // Each processor's slot, its exception stacks and, for a secondary,
+    // its kernel stack are carved from the memory of the node the
+    // processor is on. A possible processor that is not present still
+    // gets its slot, stacks and runtime on the node the SRAT gives it, so
+    // that bringing it online later is the start path a never-run
+    // processor takes; boot only skips starting it. Processor 0 is the
+    // bootstrap processor, which keeps the stack the bootloader gave it.
+    let processors = PerProcessor::new(pool, |processor, local| {
+        let index = usize::from(processor.id());
+        let possible_processor = possible
+            .get(index)
+            .unwrap_or_else(|| panic!("the MADT names no possible processor {index}"));
+        let stack_top = if index == 0 {
+            0
+        } else {
+            carve_aligned_zeroed(local, KERNEL_STACK_BYTES, 16) + KERNEL_STACK_BYTES
+        };
+        ProcessorSlot {
+            apic_id: possible_processor.apic_id,
+            present_at_boot: possible_processor.present,
             runtime: ProcessorRuntime {
-                anchor: ProcessorAnchor::new((index + 1) as u16),
-                physical_memory_offset,
+                anchor: ProcessorAnchor::new(processor.id()),
+                physical_memory_offset: handler.physical_memory_offset,
                 tsc_hz,
                 apic_mode,
                 wasmtime_tls: WasmtimeTlsSlots::new(),
                 exception_idt: ProcessorIdt::new(),
                 segments: ProcessorSegments::new(
-                    exception_stack(),
-                    exception_stack(),
-                    exception_stack(),
+                    exception_stack(local),
+                    exception_stack(local),
+                    exception_stack(local),
                 ),
                 interrupt_in_progress: AtomicBool::new(false),
                 probe_fault: AtomicUsize::new(0),
@@ -415,6 +488,7 @@ pub(crate) fn build_boot_context(
                 timer: Once::new(),
                 program_service: Once::new(),
                 device_interrupts: Once::new(),
+                sci_events: Once::new(),
                 local_timer_ready: AtomicBool::new(false),
                 instruction_sampler: debug_state.instruction_sampler(),
                 scheduler_tick_count: AtomicU32::new(0),
@@ -423,10 +497,12 @@ pub(crate) fn build_boot_context(
                 local_apic_attached: AtomicBool::new(false),
                 started: AtomicBool::new(false),
                 wake_pending: AtomicBool::new(false),
+                stop_state: AtomicU8::new(STOP_RUNNING),
+                saved_stack: AtomicUsize::new(0),
             },
-            stack_top: stack + KERNEL_STACK_BYTES,
-        });
-    }
+            stack_top,
+        }
+    });
     let wakeup_page = if processors.len() > 1 {
         let wakeup_page =
             wakeup_page.unwrap_or_else(|| panic!("x86 SMP startup requires a wakeup page"));
@@ -434,29 +510,34 @@ pub(crate) fn build_boot_context(
             physical_start: wakeup_page.start,
             virtual_start: wakeup_page
                 .start
-                .checked_add(physical_memory_offset)
+                .checked_add(handler.physical_memory_offset)
                 .unwrap_or_else(|| panic!("x86 wakeup page virtual address overflow")),
         })
     } else {
         None
     };
-    let mut processors = processors.into_boxed_slice();
-    publish_anchor_identities(&mut processors);
+    publish_anchor_identities(&processors);
     let platform = Arc::new(X86PlatformState {
-        tsc_base,
-        timebase,
-        physical_memory_offset,
+        tsc_base: handler.tsc_base,
+        timebase: handler.timebase,
+        physical_memory_offset: handler.physical_memory_offset,
         debug_state,
         watchdog,
-        io_apic,
+        io_apics,
         processors,
         wakeup_page,
         boot_context: AtomicPtr::new(core::ptr::null_mut()),
+        wakeup_lock: spin::Mutex::new(()),
     });
     if let Some(wakeup_page) = platform.wakeup_page.as_ref() {
         prepare_wakeup_page(&platform, wakeup_page);
     }
-    let context = Box::leak(Box::new(BootContext { platform, xcr0 }));
+    let context = Box::leak(Box::new(BootContext {
+        platform,
+        xcr0,
+        isa_answers: crate::probe_isa_answers(),
+        mtrrs: Mtrrs::capture(),
+    }));
     context
         .platform
         .boot_context
@@ -469,12 +550,17 @@ pub(crate) fn build_boot_context(
 ///
 /// The identity has to be the runtime's final address — it is what
 /// [`current_runtime`] dereferences and what the critical section uses as its
-/// owner key — and a runtime that is still inside the `Vec` is one
-/// `into_boxed_slice` away from moving.
-fn publish_anchor_identities(processors: &mut [ProcessorSlot]) {
-    for slot in processors {
+/// owner key — and a runtime that is still being built is one move away from
+/// going elsewhere. A [`PerProcessor`] block never moves once it exists, but
+/// it is only shared once built, so the identity is stored through the
+/// anchor's atomic; no other processor is running yet to read it.
+fn publish_anchor_identities(processors: &PerProcessor<ProcessorSlot>) {
+    for (_, slot) in processors.iter() {
         let address = core::ptr::from_ref(&slot.runtime) as usize;
-        *slot.runtime.anchor.identity.get_mut() = address;
+        slot.runtime
+            .anchor
+            .identity
+            .store(address, Ordering::Relaxed);
     }
 }
 
@@ -511,6 +597,184 @@ pub(crate) fn activate_runtime(runtime: &ProcessorRuntime) {
 /// unflushed.
 pub(crate) fn join_shootdown_targets() {
     let bit = processor_bit(usize::from(current_processor().id()));
+    ONLINE_PROCESSOR_MASK.fetch_or(bit, Ordering::AcqRel);
+}
+
+// Stopping and restarting a processor.
+//
+// A processor's `stop_state` moves through three values, each transition
+// written by exactly one side:
+//
+//   STOP_RUNNING    --(departing, `halt_stopped`)-->  STOP_STOPPED
+//   STOP_STOPPED    --(restarter, compare-exchange)-> STOP_RESTARTING
+//   STOP_RESTARTING --(restarted, `resume_current_rust`)--> STOP_RUNNING
+//
+// `stop_current_processor` runs on the departing processor with the
+// kernel's teardown done. It masks the local APIC timer, leaves the
+// shootdown target set under `TLB_SHOOTDOWN_LOCK` (with interrupts still
+// enabled, so a broadcast that already counts it as a target is
+// acknowledged while the lock is awaited), masks interrupts, pushes the
+// callee-saved registers, records the stack pointer in `saved_stack`, and
+// only then publishes `STOP_STOPPED` and halts with interrupts masked.
+// Everything the resumed processor needs is therefore in memory before a
+// restarter can observe `STOP_STOPPED`, and a restart that arrives
+// earlier waits for it (`X86PlatformState::restart_processor`); one that
+// arrives between the publication and the `hlt` is harmless, because the
+// processor executes nothing but the halt loop by then and INIT resets it
+// wherever it is.
+//
+// The restarter sends INIT/SIPI through the same wakeup page a first
+// start uses, entering `resume_current_rust` on the stack just below the
+// saved context. That function re-seeds what INIT reset — XCR0, the local
+// APIC, GDT, TSS and IDT (`IA32_FS_BASE` was written by the trampoline) —
+// and the page-attribute table, which only RESET clears but which a vCPU
+// firmware ejected and re-added starts from,
+// rejoins the shootdown set after a full local TLB flush, publishes
+// `STOP_RUNNING` and restores the saved MXCSR, x87 control word and
+// registers, which returns from
+// `stop_current_processor` on the original stack. The local APIC timer is
+// left disarmed: the kernel's `set_deadline` arms it again, the way it
+// armed it the first time.
+
+/// The processor is running kernel code, or has not stopped yet.
+const STOP_RUNNING: u8 = 0;
+/// The processor saved its context and is, or is about to be, halted.
+const STOP_STOPPED: u8 = 1;
+/// A restarter claimed the stop and has sent, or is sending, INIT/SIPI.
+const STOP_RESTARTING: u8 = 2;
+
+global_asm!(include_str!("stop.S"));
+
+unsafe extern "C" {
+    /// Saves the callee-saved context, stores its stack pointer through
+    /// the first argument and halts through [`helios_x86_halt_stopped`];
+    /// returns when [`helios_x86_resume_current`] resumes it.
+    fn helios_x86_stop_current(saved_stack: *mut usize, stop_state: *const AtomicU8);
+    /// Pops the context saved at the given stack pointer and returns into
+    /// the caller of [`helios_x86_stop_current`].
+    fn helios_x86_resume_current(saved_stack: usize) -> !;
+}
+
+/// Takes the executing processor out of service until
+/// [`X86PlatformState::restart_processor`] restarts it, and returns once
+/// it has, on the same stack. Interrupts are enabled again on return.
+///
+/// # Concurrency
+///
+/// Runs on the departing processor only, with interrupts enabled and no
+/// lock held. The handshake is described above; the shootdown set is the
+/// only state shared with other processors besides `stop_state`.
+pub(crate) fn stop_current_processor() {
+    assert!(
+        x86_64::instructions::interrupts::are_enabled(),
+        "x86 stop_current was entered with interrupts masked: leaving the shootdown set \
+         would not be able to acknowledge a broadcast that already counts this processor"
+    );
+    let runtime = current_runtime();
+    assert_eq!(
+        runtime.stop_state.load(Ordering::Relaxed),
+        STOP_RUNNING,
+        "x86 processor {} stopped while already stopped",
+        runtime.logical_id()
+    );
+    runtime.mask_local_timer();
+    leave_shootdown_targets();
+    x86_64::instructions::interrupts::disable();
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: the context saved here is popped by `resume_current_rust` on
+    // this same processor, on this same stack, which nothing else touches
+    // while the processor is stopped.
+    unsafe {
+        helios_x86_stop_current(runtime.saved_stack.as_ptr(), &runtime.stop_state);
+    }
+    x86_64::instructions::interrupts::enable();
+}
+
+/// Publishes the stop and halts, on the stack under the saved context.
+/// Never returns: a restart resets the processor and enters
+/// [`resume_current_rust`] instead.
+#[unsafe(no_mangle)]
+extern "C" fn helios_x86_halt_stopped(stop_state: *const AtomicU8) -> ! {
+    // SAFETY: `stop_current_processor` passes its own runtime's stop word,
+    // which lives as long as the processor table.
+    let stop_state = unsafe { &*stop_state };
+    stop_state.store(STOP_STOPPED, Ordering::Release);
+    loop {
+        // SAFETY: interrupts are masked, so only NMI, SMI and INIT end the
+        // halt, and INIT is the restart.
+        unsafe {
+            core::arch::asm!("cli; hlt", options(nomem, nostack));
+        }
+    }
+}
+
+/// The entry a restarted processor runs, called by the wakeup trampoline
+/// on the stack under the saved context, with interrupts masked and
+/// `IA32_FS_BASE` already addressing this processor's anchor.
+pub(crate) extern "C" fn resume_current_rust(
+    boot: *const BootContext,
+    runtime: *const ProcessorRuntime,
+) -> ! {
+    let boot = unsafe { &*boot };
+    let runtime = unsafe { &*runtime };
+    crate::extended_state::enable_on_secondary_processor(boot.xcr0());
+    // INIT keeps the page-attribute table, but a vCPU firmware ejected
+    // and added again starts from RESET, whose table maps no type
+    // write-combined; this is the table a first start programs.
+    crate::memory_type::program_page_attribute_table();
+    // The same holds for the MTRRs: RESET clears them, INIT keeps them,
+    // and loading them again is idempotent.
+    boot.mtrrs().apply();
+    // The same holds for what it offers: a re-added vCPU is a new one,
+    // and guest code compiled for the bootstrap processor's level runs
+    // on it.
+    assert_eq!(
+        crate::probe_isa_answers(),
+        boot.isa_answers(),
+        "x86 processor {} came back answering the ISA level features differently from the \
+         bootstrap processor",
+        runtime.logical_id()
+    );
+    // The trampoline has read every patched word by now, so the wakeup
+    // page is free for the next launch.
+    assert_eq!(
+        runtime.stop_state.swap(STOP_RUNNING, Ordering::AcqRel),
+        STOP_RESTARTING,
+        "x86 processor {} resumed without a restart claiming its stop",
+        runtime.logical_id()
+    );
+    runtime.reset_local_apic_state();
+    runtime.attach_local_apic();
+    crate::exceptions::install_for_current_processor();
+    rejoin_shootdown_targets();
+    let saved_stack = runtime.saved_stack.load(Ordering::Acquire);
+    // SAFETY: `saved_stack` is where `helios_x86_stop_current` pushed this
+    // processor's context; nothing has run on the stack above it since.
+    unsafe { helios_x86_resume_current(saved_stack) }
+}
+
+/// Removes the calling processor from the set every TLB shootdown waits
+/// on, under the lock a broadcast holds from publication to its last
+/// acknowledgement. Taking the lock waits out a broadcast that already
+/// counted this processor, which is acknowledged meanwhile because the
+/// caller's interrupts are enabled; once it is held, no broadcast is in
+/// flight and none that starts later targets this processor.
+fn leave_shootdown_targets() {
+    let bit = processor_bit(usize::from(current_processor().id()));
+    let _broadcast = TLB_SHOOTDOWN_LOCK.lock();
+    ONLINE_PROCESSOR_MASK.fetch_and(!bit, Ordering::AcqRel);
+}
+
+/// Joins the shootdown set again after a stop, with a full local TLB
+/// flush done under the lock: translations this processor cached while
+/// it was stopped or restarting were not covered by any broadcast, and
+/// every broadcast that starts after the lock is released counts it.
+/// The processor is not a target while it takes the lock with interrupts
+/// masked, so it cannot hold up a broadcaster.
+fn rejoin_shootdown_targets() {
+    let bit = processor_bit(usize::from(current_processor().id()));
+    let _broadcast = TLB_SHOOTDOWN_LOCK.lock();
+    tlb::flush_all();
     ONLINE_PROCESSOR_MASK.fetch_or(bit, Ordering::AcqRel);
 }
 
@@ -692,6 +956,40 @@ impl ProcessorRuntime {
         }
     }
 
+    /// Masks this processor's timer interrupt and stops its countdown.
+    /// The calibrated period survives in `scheduler_tick_count`, so
+    /// [`enable_local_scheduler_timer`] re-arms without calibrating again.
+    fn mask_local_timer(&self) {
+        match self.apic_mode {
+            LocalApicMode::X2Apic => unsafe {
+                wrmsr(
+                    IA32_X2APIC_LVT_TIMER,
+                    rdmsr(IA32_X2APIC_LVT_TIMER) | APIC_TIMER_MASKED,
+                );
+                wrmsr(IA32_X2APIC_INIT_COUNT, 0);
+            },
+            LocalApicMode::XApic { physical_base } => {
+                let apic_region = xapic_mmio_region(physical_base, self.physical_memory_offset);
+                let lvt = u64::from(read_xapic_register(apic_region, XAPIC_LVT_TIMER))
+                    | APIC_TIMER_MASKED;
+                write_xapic_register(apic_region, XAPIC_LVT_TIMER, lvt as u32);
+                write_xapic_register(apic_region, XAPIC_TIMER_INIT_COUNT, 0);
+            }
+        }
+    }
+
+    /// Forgets the local APIC and timer state a stop invalidated, so the
+    /// next [`Self::attach_local_apic`] and `set_deadline` bring both up
+    /// again. Runs on this processor, after its restart.
+    fn reset_local_apic_state(&self) {
+        self.local_apic_attached.store(false, Ordering::Relaxed);
+        self.local_timer_ready.store(false, Ordering::Relaxed);
+        self.timer_sampling.store(false, Ordering::Relaxed);
+        self.samples_since_scheduler_tick
+            .store(0, Ordering::Relaxed);
+        self.wake_pending.store(false, Ordering::Relaxed);
+    }
+
     fn platform_tsc_hz(&self) -> u64 {
         self.tsc_hz
     }
@@ -744,8 +1042,23 @@ impl BootContext {
         self.xcr0
     }
 
+    /// The bootstrap processor's ISA level feature answers; see
+    /// [`crate::probe_isa_answers`].
+    pub(crate) fn isa_answers(&self) -> ProbeAnswers {
+        self.isa_answers
+    }
+
+    /// The bootstrap processor's MTRRs; see [`Mtrrs::apply`].
+    pub(crate) fn mtrrs(&self) -> &Mtrrs {
+        &self.mtrrs
+    }
+
     pub(crate) fn bootstrap_runtime(&self) -> &ProcessorRuntime {
-        &self.platform.processors[0].runtime
+        &self
+            .platform
+            .processors
+            .get(self.platform.bootstrap_processor())
+            .runtime
     }
 }
 
@@ -766,8 +1079,15 @@ impl X86PlatformState {
         self.watchdog.clone()
     }
 
+    /// The size of the possible set: every slot built, present or not.
     pub(crate) fn processor_count(&self) -> usize {
         self.processors.len()
+    }
+
+    /// Whether `processor` was present at boot, and so is started by boot
+    /// rather than left offline for a later online.
+    pub(crate) fn present_at_boot(&self, processor: ProcessorId) -> bool {
+        self.processor_slot(processor).present_at_boot
     }
 
     /// Publishes the device interrupt routes every processor dispatches
@@ -798,7 +1118,7 @@ impl X86PlatformState {
              processor is online; online mask {secondaries_online:#b}"
         );
         let routes: &'static DeviceInterruptRoutes = Box::leak(Box::new(routes));
-        for slot in self.processors.iter() {
+        for (_, slot) in self.processors.iter() {
             assert!(
                 slot.runtime.device_interrupts.get().is_none(),
                 "x86 device interrupt routes were installed more than once"
@@ -807,9 +1127,47 @@ impl X86PlatformState {
         }
     }
 
-    /// The I/O APIC carrying COM1's line, located from the MADT at boot.
-    pub(crate) fn io_apic(&self) -> &IoApic {
-        &self.io_apic
+    /// The I/O APICs carrying COM1's line and the SCI, located from the
+    /// MADT at boot.
+    pub(crate) fn io_apics(&self) -> &IoApics {
+        &self.io_apics
+    }
+
+    /// Publishes the SCI's latch to the bootstrap processor, the one the
+    /// SCI's redirection entry delivers to. Runs once, before that entry
+    /// is programmed.
+    pub(crate) fn install_sci_events(&self, events: &'static SciEvents) {
+        let runtime = &self.processor_slot(self.bootstrap_processor()).runtime;
+        assert!(
+            runtime.sci_events.get().is_none(),
+            "x86 SCI events were installed more than once"
+        );
+        runtime.sci_events.call_once(|| events);
+    }
+
+    /// The possible processor whose local APIC has `apic_id`, if the MADT
+    /// listed one at boot.
+    pub(crate) fn processor_with_apic_id(&self, apic_id: u32) -> Option<ProcessorId> {
+        self.processors
+            .iter()
+            .find(|(_, slot)| slot.apic_id == apic_id)
+            .map(|(processor, _)| processor)
+    }
+
+    /// Whether `processor` executes nothing: it never started, or it has
+    /// published [`STOP_STOPPED`] and runs only its halt loop, where
+    /// INIT, or firmware destroying the vCPU, can take it at any point.
+    pub(crate) fn has_stopped(&self, processor: ProcessorId) -> bool {
+        let runtime = &self.processor_slot(processor).runtime;
+        !runtime.started.load(Ordering::Acquire)
+            || runtime.stop_state.load(Ordering::Acquire) == STOP_STOPPED
+    }
+
+    /// How long a processor the kernel has published as stopping may take
+    /// to reach its halt, in TSC ticks: the stop path masks a timer,
+    /// takes the shootdown lock and saves a few registers.
+    pub(crate) fn stop_reach_ticks(&self) -> u64 {
+        self.timebase.frequency() / 2
     }
 
     pub(crate) fn bootstrap_processor(&self) -> ProcessorId {
@@ -820,9 +1178,7 @@ impl X86PlatformState {
     /// logical id. Used by the wake / TLB-shootdown IPI dispatch path
     /// to address a remote core through the local APIC ICR.
     pub(crate) fn apic_id_of(&self, processor: ProcessorId) -> Option<u32> {
-        self.processors
-            .get(processor.id() as usize)
-            .map(|slot| slot.apic_id)
+        self.processors.try_get(processor).map(|slot| slot.apic_id)
     }
 
     /// Publishes a wake for `processor` and answers with the local-APIC
@@ -833,31 +1189,108 @@ impl X86PlatformState {
     /// test there, or takes an interrupt that is already pending when
     /// its halt begins; either way the wake is not lost.
     pub(crate) fn publish_wake(&self, processor: ProcessorId) -> Option<u32> {
-        let slot = self.processors.get(processor.id() as usize)?;
+        let slot = self.processors.try_get(processor)?;
         slot.runtime.wake_pending.store(true, Ordering::Release);
         Some(slot.apic_id)
     }
 
     pub(crate) fn start_processor(&self, processor: ProcessorId, entry: usize) {
         let slot = self.processor_slot(processor);
-        let wakeup_page = self
-            .wakeup_page
-            .as_ref()
-            .unwrap_or_else(|| panic!("x86 startup state is missing the AP wakeup page"));
         assert!(
             processor != self.bootstrap_processor(),
             "bootstrap processor cannot be started twice"
         );
+        let _launch = self.wakeup_lock.lock();
         assert!(
             !slot.runtime.started.load(Ordering::Acquire),
             "processor {} was started more than once",
             processor.id()
         );
+        self.launch_processor(processor, slot.stack_top, entry, || {
+            slot.runtime.started.load(Ordering::Acquire)
+        });
+    }
+
+    /// Restarts a processor [`stop_current_processor`] took out of
+    /// service, so that its `stop_current` returns.
+    ///
+    /// Waits for the processor to publish [`STOP_STOPPED`], which closes
+    /// the window between the kernel's "stopping" and the hardware halt:
+    /// until then the processor is still running the stop path, and an
+    /// INIT would reset it mid-way. Past that point it only executes
+    /// `cli; hlt`, so the INIT/SIPI lands harmlessly whenever it arrives.
+    /// The transition to [`STOP_RESTARTING`] is a compare-exchange, so a
+    /// second restart for the same stop panics instead of sending a
+    /// second SIPI. The wakeup page is entered on the stack just below
+    /// the saved context, which is where [`resume_current_rust`] finds it.
+    pub(crate) fn restart_processor(&self, processor: ProcessorId, entry: usize) {
+        let slot = self.processor_slot(processor);
+        assert!(
+            processor != self.bootstrap_processor(),
+            "bootstrap processor cannot be restarted: it never stops"
+        );
+        let _launch = self.wakeup_lock.lock();
+        let deadline = read_tsc()
+            .checked_add(self.stop_reach_ticks())
+            .unwrap_or_else(|| panic!("x86 AP restart deadline overflow"));
+        while slot.runtime.stop_state.load(Ordering::Acquire) != STOP_STOPPED {
+            assert!(
+                slot.runtime.stop_state.load(Ordering::Acquire) != STOP_RESTARTING
+                    && read_tsc() <= deadline,
+                "x86 processor {} was restarted twice for one stop, or never reached its halt",
+                processor.id()
+            );
+            core::hint::spin_loop();
+        }
+        slot.runtime
+            .stop_state
+            .compare_exchange(
+                STOP_STOPPED,
+                STOP_RESTARTING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .unwrap_or_else(|state| {
+                panic!(
+                    "x86 processor {} was restarted twice for one stop (state {state})",
+                    processor.id()
+                )
+            });
+        // The context starts at `saved_stack`, which `stop.S` leaves
+        // 16-aligned; the trampoline's stack grows down from there, so
+        // its `call` is aligned and every saved word stays untouched.
+        let stack_top = slot.runtime.saved_stack.load(Ordering::Acquire);
+        assert!(
+            stack_top.is_multiple_of(16),
+            "x86 processor {} saved its stop context at {stack_top:#x}, not 16-aligned",
+            processor.id()
+        );
+        self.launch_processor(processor, stack_top, entry, || {
+            slot.runtime.stop_state.load(Ordering::Acquire) == STOP_RUNNING
+        });
+    }
+
+    /// Patches the wakeup page and sends INIT/SIPI to `processor`, then
+    /// waits until `reached_rust` says it has run its entry point, which
+    /// is after the trampoline read every patched word. The caller holds
+    /// `wakeup_lock`.
+    fn launch_processor(
+        &self,
+        processor: ProcessorId,
+        stack_top: usize,
+        entry: usize,
+        reached_rust: impl Fn() -> bool,
+    ) {
+        let slot = self.processor_slot(processor);
+        let wakeup_page = self
+            .wakeup_page
+            .as_ref()
+            .unwrap_or_else(|| panic!("x86 startup state is missing the AP wakeup page"));
 
         patch_wakeup_page(
             wakeup_page.virtual_start,
             current_cr3(),
-            slot.stack_top,
+            stack_top,
             self.boot_context_ptr(),
             &slot.runtime as *const _ as usize,
             entry,
@@ -882,7 +1315,7 @@ impl X86PlatformState {
         let deadline = read_tsc()
             .checked_add(self.timebase.frequency() / 2)
             .unwrap_or_else(|| panic!("x86 AP startup deadline overflow"));
-        while !slot.runtime.started.load(Ordering::Acquire) {
+        while !reached_rust() {
             assert!(
                 read_tsc() <= deadline,
                 "x86 processor {} did not reach Rust startup",
@@ -894,7 +1327,7 @@ impl X86PlatformState {
 
     fn processor_slot(&self, processor: ProcessorId) -> &ProcessorSlot {
         self.processors
-            .get(processor.id() as usize)
+            .try_get(processor)
             .unwrap_or_else(|| panic!("x86 processor {} is out of range", processor.id()))
     }
 
@@ -999,6 +1432,22 @@ pub(crate) fn handle_device_interrupt(vector: u8) {
         routes.route(vector),
         "x86 device interrupt vector {vector:#x} has no registered handler"
     );
+    local_apic_eoi();
+}
+
+/// The SCI: masks and remembers every GPE that raised it, for the hotplug
+/// task to serve, and ends the interrupt. Masking the pending GPEs is
+/// what lowers the level-triggered line before the EOI.
+pub(crate) fn handle_sci_interrupt() {
+    let runtime = current_runtime();
+    let events = runtime.sci_events.get().unwrap_or_else(|| {
+        panic!(
+            "x86 SCI fired on processor {}, which holds no SCI latch; the SCI is routed to the \
+             bootstrap processor once its latch is installed",
+            runtime.logical_id()
+        )
+    });
+    events.on_interrupt();
     local_apic_eoi();
 }
 
@@ -1186,9 +1635,19 @@ fn processor_bit(processor: usize) -> usize {
 fn enable_local_scheduler_timer(vector: u8) {
     let runtime = current_runtime();
     runtime.attach_local_apic();
+    // A processor restarted after a stop knows its period already; the
+    // calibration also programs the divide configuration INIT reset.
+    let calibrated = runtime.scheduler_tick_count.load(Ordering::Relaxed);
     match runtime.apic_mode() {
         LocalApicMode::X2Apic => {
-            let initial_count = calibrate_x2apic_timer(runtime.platform_tsc_hz());
+            let initial_count = if calibrated != 0 {
+                unsafe {
+                    wrmsr(IA32_X2APIC_DIV_CONF, u64::from(APIC_TIMER_DIVIDE_BY_ONE));
+                }
+                calibrated
+            } else {
+                calibrate_x2apic_timer(runtime.platform_tsc_hz())
+            };
             runtime
                 .scheduler_tick_count
                 .store(initial_count, Ordering::Relaxed);
@@ -1196,7 +1655,12 @@ fn enable_local_scheduler_timer(vector: u8) {
         }
         LocalApicMode::XApic { physical_base } => {
             let apic_region = xapic_mmio_region(physical_base, runtime.physical_memory_offset);
-            let initial_count = calibrate_xapic_timer(apic_region, runtime.platform_tsc_hz());
+            let initial_count = if calibrated != 0 {
+                write_xapic_register(apic_region, XAPIC_TIMER_DIV_CONF, APIC_TIMER_DIVIDE_BY_ONE);
+                calibrated
+            } else {
+                calibrate_xapic_timer(apic_region, runtime.platform_tsc_hz())
+            };
             runtime
                 .scheduler_tick_count
                 .store(initial_count, Ordering::Relaxed);
@@ -1430,18 +1894,22 @@ impl Handler for PhysicalOffsetAcpiHandler {
         &self,
         physical_address: usize,
         size: usize,
-    ) -> PhysicalMapping<Self, T> {
+    ) -> RawPhysicalMapping<T> {
         ensure_hhdm_range_mapped(self.physical_memory_offset, physical_address, size);
-        PhysicalMapping {
-            physical_start: physical_address,
-            virtual_start: self.physical_to_virtual(physical_address),
-            region_length: size,
-            mapped_length: size,
-            handler: self.clone(),
+        // SAFETY: the virtual address is the direct-map alias of the
+        // physical range, which no other mapping of this handler aliases
+        // mutably, and `unmap_physical_region` has nothing to undo.
+        unsafe {
+            RawPhysicalMapping::new(
+                physical_address,
+                self.physical_to_virtual(physical_address),
+                size,
+                size,
+            )
         }
     }
 
-    fn unmap_physical_region<T>(_region: &PhysicalMapping<Self, T>) {}
+    unsafe fn unmap_physical_region<T>(&self, _region: RawPhysicalMapping<T>) {}
 
     fn read_u8(&self, address: usize) -> u8 {
         unsafe { (address as *const u8).read_volatile() }
@@ -1540,17 +2008,34 @@ impl Handler for PhysicalOffsetAcpiHandler {
         self.stall(milliseconds.saturating_mul(1_000));
     }
 
+    /// AML mutexes need no state here, and the handle is the same for
+    /// every one of them.
+    ///
+    /// A mutex keeps two threads of control out of the same AML region.
+    /// The one AML interpreter this backend builds runs on the bootstrap
+    /// processor only: `vmgenid` discovery during bring-up, before any
+    /// secondary starts, and then the processor-hotplug task, which is
+    /// local to that processor and evaluates each method to completion
+    /// without awaiting in between. It therefore has one thread of
+    /// control: every acquire succeeds at once, recursive acquires
+    /// included, and a release has nothing to hand over.
+    /// [`Self::acquire`] asserts that rather than assuming it, so an
+    /// interpreter that ever ran elsewhere fails here instead of silently
+    /// losing mutual exclusion.
     fn create_mutex(&self) -> acpi::Handle {
-        panic!("AML mutex creation is unsupported in the x86 ACPI handler")
+        acpi::Handle(0)
     }
 
     fn acquire(&self, _mutex: acpi::Handle, _timeout: u16) -> Result<(), acpi::aml::AmlError> {
-        panic!("AML mutex acquisition is unsupported in the x86 ACPI handler")
+        assert!(
+            current_processor() == ProcessorId::new(0),
+            "the AML interpreter ran outside the bootstrap processor, where its mutexes would \
+             no longer provide mutual exclusion"
+        );
+        Ok(())
     }
 
-    fn release(&self, _mutex: acpi::Handle) {
-        panic!("AML mutex release is unsupported in the x86 ACPI handler")
-    }
+    fn release(&self, _mutex: acpi::Handle) {}
 }
 
 fn prepare_wakeup_page(platform: &X86PlatformState, wakeup_page: &WakeupPage) {
@@ -1946,20 +2431,24 @@ unsafe impl FrameAllocator<Size4KiB> for DirectMappedFrameAllocator {
 }
 
 /// One exception or interrupt stack for one processor, as the byte
-/// range the TSS names the top of.
-fn exception_stack() -> Range<usize> {
-    let base = allocate_aligned_zeroed(EXCEPTION_STACK_BYTES, 16);
+/// range the TSS names the top of, in the memory of the node `local`
+/// is on.
+fn exception_stack(local: &LocalMemory<'_, UserMemoryPool>) -> Range<usize> {
+    let base = carve_aligned_zeroed(local, EXCEPTION_STACK_BYTES, 16);
     base..base + EXCEPTION_STACK_BYTES
 }
 
-fn allocate_aligned_zeroed(size: usize, align: usize) -> usize {
+/// `size` zeroed bytes aligned to `align`, carved from the node `local`
+/// is on, as an address. They are never returned.
+fn carve_aligned_zeroed(
+    local: &LocalMemory<'_, UserMemoryPool>,
+    size: usize,
+    align: usize,
+) -> usize {
     let layout = Layout::from_size_align(size, align).unwrap_or_else(|_| {
         panic!("failed to build aligned allocation layout size={size} align={align}")
     });
-    let pointer = unsafe { alloc_zeroed(layout) };
-    NonNull::new(pointer)
-        .unwrap_or_else(|| panic!("aligned allocation of {size} bytes failed"))
-        .as_ptr() as usize
+    local.carve_zeroed(layout).as_ptr() as usize
 }
 
 use helios_hal::{align_down, align_up};

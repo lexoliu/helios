@@ -50,13 +50,13 @@ const HTTP_PLUGIN_INSTANCE_NAME: &str = "http-client-plugin";
 /// is installed. Reading the artifact here (rather than on first use) is what
 /// lets an image without the plugin answer `configuration-error` immediately
 /// instead of discovering the absence mid-request.
-pub(super) fn install_http_client_plugin<CpuImpl, Net, HostFs>(
-    service: &UserProgramService<CpuImpl, Net, HostFs>,
-    exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
+pub(super) fn install_http_client_plugin<CpuImpl, Net, StorageImpl>(
+    service: &UserProgramService<CpuImpl, Net, StorageImpl>,
+    exec_context: ProgramExecContext<CpuImpl, Net, StorageImpl>,
 ) where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let Some(artifact) = read_bootfs_artifact(&exec_context.runtime_state, HTTP_CLIENT_PLUGIN_PATH)
     else {
@@ -86,15 +86,15 @@ pub(super) fn install_http_client_plugin<CpuImpl, Net, HostFs>(
 
 /// Own the plugin for the lifetime of the kernel, rebuilding it when its
 /// runtime stops being trustworthy.
-async fn run_http_plugin_supervisor<CpuImpl, Net, HostFs>(
-    service: UserProgramService<CpuImpl, Net, HostFs>,
-    exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
+async fn run_http_plugin_supervisor<CpuImpl, Net, StorageImpl>(
+    service: UserProgramService<CpuImpl, Net, StorageImpl>,
+    exec_context: ProgramExecContext<CpuImpl, Net, StorageImpl>,
     artifact: BootfsBytes,
     receiver: ProviderReceiver<HttpExchange>,
 ) where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     loop {
         // Nothing is instantiated until there is work: an idle kernel parks
@@ -125,9 +125,9 @@ async fn run_http_plugin_supervisor<CpuImpl, Net, HostFs>(
 }
 
 /// Build one plugin instance and serve exchanges with it until it dies.
-async fn run_http_plugin_once<CpuImpl, Net, HostFs>(
-    service: &UserProgramService<CpuImpl, Net, HostFs>,
-    exec_context: &ProgramExecContext<CpuImpl, Net, HostFs>,
+async fn run_http_plugin_once<CpuImpl, Net, StorageImpl>(
+    service: &UserProgramService<CpuImpl, Net, StorageImpl>,
+    exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
     artifact: &BootfsBytes,
     first: HttpExchange,
     receiver: &ProviderReceiver<HttpExchange>,
@@ -135,7 +135,7 @@ async fn run_http_plugin_once<CpuImpl, Net, HostFs>(
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let started_at = exec_context
         .runtime_state
@@ -146,7 +146,7 @@ where
         crate::OomPolicy::KernelPlugin,
     );
 
-    let payload = trusted_bootfs_payload(artifact)?;
+    let payload = trusted_bootfs_payload(artifact);
     let instance_pre = service.load_precompiled_component(
         HTTP_CLIENT_PLUGIN_PATH,
         payload,
@@ -157,7 +157,7 @@ where
 
     let (mut store, interrupts) = crate::wasmtime_adapter::store_with_state(
         &service.inner.engine,
-        StoreData::<CpuImpl, Net, HostFs>::new(
+        StoreData::<CpuImpl, Net, StorageImpl>::new(
             ResourceTable::new(),
             exec_context.cpu.clone(),
             exec_context.timer.clone(),
@@ -166,12 +166,12 @@ where
             // cannot starve the plugins the kernel depends on.
             exec_context
                 .spawner
-                .instance_spawner(crate::TaskFunding::Kernel),
+                .instance_spawner(crate::TaskFunding::Kernel, &instance),
             exec_context.runtime_state.clone(),
             exec_context.instance_registry.clone(),
             instance,
             None,
-            DebugFileSystem::new(exec_context.runtime_state.clone()),
+            exec_context.runtime_state.root_namespace().descend(),
             alloc::vec![String::from(HTTP_CLIENT_PLUGIN_PATH)],
             Vec::new(),
             // Same authority the system components get: the plugin needs the
@@ -209,15 +209,15 @@ where
 }
 
 /// Hand one exchange to a background task so several can be in flight.
-fn dispatch_exchange<CpuImpl, Net, HostFs>(
-    accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>,
+fn dispatch_exchange<CpuImpl, Net, StorageImpl>(
+    accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
     guest: &exports::wasi::http::handler::Guest,
     exchange: HttpExchange,
 ) -> wasmtime::Result<()>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     accessor.spawn(HandleExchange {
         guest: guest.clone(),
@@ -229,27 +229,29 @@ where
 
 /// The store's type parameters, carried by a task that names them without
 /// holding a value of any of them.
-type StoreTypeMarker<CpuImpl, Net, HostFs> =
-    core::marker::PhantomData<fn() -> (CpuImpl, Net, HostFs)>;
+type StoreTypeMarker<CpuImpl, Net, StorageImpl> =
+    core::marker::PhantomData<fn() -> (CpuImpl, Net, StorageImpl)>;
 
 /// One `wasi:http/handler.handle` call, start to finish.
-struct HandleExchange<CpuImpl, Net, HostFs> {
+struct HandleExchange<CpuImpl, Net, StorageImpl> {
     guest: exports::wasi::http::handler::Guest,
     exchange: HttpExchange,
-    _marker: StoreTypeMarker<CpuImpl, Net, HostFs>,
+    _marker: StoreTypeMarker<CpuImpl, Net, StorageImpl>,
 }
 
-impl<CpuImpl, Net, HostFs>
-    AccessorTask<StoreData<CpuImpl, Net, HostFs>, HasSelf<StoreData<CpuImpl, Net, HostFs>>>
-    for HandleExchange<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl>
+    AccessorTask<
+        StoreData<CpuImpl, Net, StorageImpl>,
+        HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
+    > for HandleExchange<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     async fn run(
         self,
-        accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>,
+        accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
     ) -> wasmtime::Result<()> {
         let Self {
             guest, exchange, ..

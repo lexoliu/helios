@@ -16,21 +16,33 @@
 //! machine that offers neither cannot be brought up and says so.
 //! Neither path ever fills in a gap in the other.
 //!
+//! A device-tree boot reads two trees. Devices and the console come from
+//! the one Limine hands over; locality comes from the firmware's own,
+//! which [`efi`] finds through the UEFI configuration table, because
+//! Limine deletes every memory node from the copy it hands over.
+//!
 //! Concurrency contract: the description is built once, on the
 //! bootstrap processor, before any secondary is started, and is
 //! read-only from then on. Nothing here takes a lock.
 
 use core::fmt;
+use core::ptr::NonNull;
 
 use arm_gic::{IntId, Trigger};
+pub(crate) use helios_firmware::MPIDR_AFFINITY_MASK;
+use helios_firmware::{DeviceTreeNuma, FirmwareNumaError, ProcessorIdentities};
+use helios_hal::numa::NumaTopology;
+use r_efi::efi::SystemTable;
 use thiserror::Error;
 
 use crate::LimineBootHandoff;
 
 mod acpi;
 mod dt;
+mod efi;
 
 pub(crate) use acpi::AcpiError;
+use efi::{FirmwareTreeError, FirmwareTreeLocator};
 
 /// Slots the `virt` board and Arm server platforms expose for
 /// transport-discovered virtio devices. QEMU's `virt` publishes exactly
@@ -120,6 +132,19 @@ pub(crate) struct ConsoleDescription {
     pub(crate) interrupt: SpiInterrupt,
 }
 
+/// The machine's TPM 2.0, as the firmware describes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TpmDescription {
+    /// Locality 0 of a TPM whose interface the firmware named.
+    Described {
+        base: u64,
+        interface: helios_tpm::InterfaceDescription,
+    },
+    /// A TPM the ACPI TPM2 table describes through a start method this
+    /// kernel does not drive.
+    Unsupported { start_method: u32 },
+}
+
 /// Which redistributor frame belongs to which processor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RedistributorAffinity {
@@ -176,10 +201,19 @@ impl GicDescription {
     }
 }
 
-/// Affinity bits of `MPIDR_EL1`: Aff0..Aff2 in the low word and Aff3 in
-/// bits 32..40. The MADT reports a processor's MPIDR in the same shape,
-/// but firmware is not required to zero the bits outside them.
-const MPIDR_AFFINITY_MASK: u64 = 0x0000_00ff_00ff_ffff;
+/// The instruction a PSCI call enters firmware with.
+///
+/// The discriminants are the values a processor's resume context carries
+/// across a power-down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum PsciConduit {
+    /// `hvc`: PSCI is served by a hypervisor, as under KVM and QEMU's
+    /// `virt` board without EL3.
+    Hvc = 0,
+    /// `smc`: PSCI is served by secure firmware.
+    Smc = 1,
+}
 
 /// Where the description came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -203,12 +237,20 @@ pub(crate) struct PlatformDescription {
     pub(crate) source: PlatformSource,
     pub(crate) console: ConsoleDescription,
     pub(crate) gic: GicDescription,
+    /// The conduit of the PSCI service that powers processors on and
+    /// off, when the firmware describes one. A machine without it still
+    /// runs; it just cannot take a processor offline, and says so when
+    /// asked to.
+    pub(crate) psci: Option<PsciConduit>,
     /// The real-time clock, when the platform has one. A machine
     /// without one leaves the kernel's wall clock reading as uptime.
     pub(crate) rtc: Option<MmioRegion>,
     pub(crate) virtio: Slots<VirtioMmioSlot, MAX_VIRTIO_MMIO_SLOTS>,
     /// Hardware no kernel driver claims, offered to driver plugins.
     pub(crate) grantable: Slots<GrantableDevice, MAX_GRANTABLE_DEVICES>,
+    /// The TPM 2.0, when the firmware describes one: the ACPI TPM2
+    /// table, or a `tcg,tpm-tis-mmio` node.
+    pub(crate) tpm: Option<TpmDescription>,
     /// The entropy the bootloader left behind, from the device tree's
     /// `/chosen/rng-seed`. ACPI has no equivalent property, so an
     /// ACPI-described machine starts from the processor's own random
@@ -276,6 +318,27 @@ pub(crate) enum PlatformError {
     DeviceTreeMissing(&'static str),
     #[error(transparent)]
     Acpi(#[from] AcpiError),
+    #[error("the firmware's NUMA description is refused: {0}")]
+    Numa(#[from] FirmwareNumaError),
+    #[error("the firmware's own device tree cannot be read: {0}")]
+    FirmwareTree(#[from] FirmwareTreeError),
+    #[error(
+        "the UEFI configuration table holds no device tree, and the tree Limine handed over \
+         places processors on {nodes} NUMA nodes with its memory nodes deleted, so no memory \
+         can be placed on them"
+    )]
+    NumaWithoutFirmwareTree { nodes: usize },
+}
+
+/// What the bootstrap processor does with the machine's NUMA description.
+///
+/// Each firmware path describes locality with a type of its own and the
+/// consumer is generic over it, so [`PlatformTables::with_numa`] hands the
+/// description over instead of returning one type for both paths.
+pub(crate) trait NumaConsumer {
+    type Output;
+
+    fn consume<Numa: NumaTopology>(self, numa: &Numa) -> Self::Output;
 }
 
 /// The firmware tables Limine handed this kernel.
@@ -284,16 +347,43 @@ pub(crate) enum PlatformError {
 /// kernel has a heap and the rest of the description is needed after,
 /// and re-parsing between the two would be two chances to disagree.
 pub(crate) enum PlatformTables {
-    DeviceTree(fdt::Fdt<'static>),
+    DeviceTree(DeviceTreeTables),
     Acpi(acpi::AcpiPlatformTables),
+}
+
+/// The two trees a device-tree boot reads.
+pub(crate) struct DeviceTreeTables {
+    /// The tree Limine handed over: the firmware's, copied, with every
+    /// `/memory` node deleted. The console and every device are read
+    /// from it.
+    handed: fdt::Fdt<'static>,
+    /// Where the firmware's own tree is found. Locality is read from it
+    /// and from nothing else, because memory nodes are what place memory
+    /// on a node.
+    firmware: FirmwareTreeLocator,
 }
 
 impl PlatformTables {
     /// Picks the firmware description: the device tree when Limine
     /// provides one, otherwise ACPI.
-    pub(crate) fn discover(handoff: &LimineBootHandoff) -> Result<Self, PlatformError> {
+    ///
+    /// `efi_system_table` is Limine's EFI system table response, at its
+    /// direct-map address. Only a device-tree boot reads it, and only
+    /// once [`Self::with_numa`] runs, so a failure to find the
+    /// firmware's tree reaches the console.
+    pub(crate) fn discover(
+        handoff: &LimineBootHandoff,
+        efi_system_table: Option<NonNull<SystemTable>>,
+    ) -> Result<Self, PlatformError> {
         if let Some(dtb) = handoff.tables.device_tree_blob {
-            return Ok(Self::DeviceTree(dt::parse(dtb)?));
+            return Ok(Self::DeviceTree(DeviceTreeTables {
+                handed: dt::parse(dtb)?,
+                firmware: FirmwareTreeLocator::new(
+                    efi_system_table,
+                    handoff.memory_map.entries,
+                    crate::physical_memory_offset(),
+                ),
+            }));
         }
         let rsdp = handoff
             .tables
@@ -311,8 +401,53 @@ impl PlatformTables {
     /// `acpi` crate reads through a mapping.
     pub(crate) fn console(&self) -> Result<ConsoleDescription, PlatformError> {
         match self {
-            Self::DeviceTree(fdt) => dt::console(fdt),
+            Self::DeviceTree(tables) => dt::console(&tables.handed),
             Self::Acpi(tables) => Ok(acpi::console(tables)?),
+        }
+    }
+
+    /// The machine's NUMA description, handed to `consumer`.
+    ///
+    /// `identities` maps each processor to the affinity bits of its
+    /// `MPIDR_EL1`. Neither path allocates, so this runs before the heap
+    /// exists, which is when the bootstrap allocator needs the
+    /// description: a device tree is read in place by
+    /// [`DeviceTreeNuma`], and the SRAT, SLIT and MADT in place by
+    /// [`acpi::numa`].
+    ///
+    /// A device-tree boot reads the firmware's own tree. A configuration
+    /// table with no tree in it leaves only the one Limine handed over,
+    /// which has no memory nodes: it describes the machine only when it
+    /// carries no NUMA property at all, the one node `DeviceTreeNuma`
+    /// then answers, and a tree that places processors on nodes is
+    /// refused rather than read as one with no memory.
+    pub(crate) fn with_numa<Identities, Consumer>(
+        &self,
+        identities: Identities,
+        consumer: Consumer,
+    ) -> Result<Consumer::Output, PlatformError>
+    where
+        Identities: ProcessorIdentities,
+        Consumer: NumaConsumer,
+    {
+        match self {
+            Self::DeviceTree(tables) => match tables.firmware.open()? {
+                Some(firmware) => {
+                    Ok(consumer.consume(&DeviceTreeNuma::new(&firmware, identities)?))
+                }
+                None => {
+                    let numa = DeviceTreeNuma::new(&tables.handed, identities).map_err(
+                        |error| match error {
+                            FirmwareNumaError::NumaWithoutMemory { nodes } => {
+                                PlatformError::NumaWithoutFirmwareTree { nodes }
+                            }
+                            error => PlatformError::Numa(error),
+                        },
+                    )?;
+                    Ok(consumer.consume(&numa))
+                }
+            },
+            Self::Acpi(tables) => Ok(consumer.consume(&acpi::numa(tables, identities)?)),
         }
     }
 
@@ -326,7 +461,7 @@ impl PlatformTables {
         console: ConsoleDescription,
     ) -> Result<PlatformDescription, PlatformError> {
         match self {
-            Self::DeviceTree(fdt) => dt::describe(fdt, console),
+            Self::DeviceTree(tables) => dt::describe(&tables.handed, console),
             Self::Acpi(tables) => Ok(acpi::describe(tables, console)?),
         }
     }

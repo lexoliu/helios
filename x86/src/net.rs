@@ -5,19 +5,23 @@
 //! `NetworkDevice` contract and installs the network service.
 //!
 //! Concurrency contract: the device is brought up on the bootstrap
-//! processor before interrupts are unmasked, and its MSI-X message
-//! targets that processor's local APIC. Afterwards the driver is shared
-//! across processors through `Arc` and is internally synchronised.
+//! processor before interrupts are unmasked; its configuration message
+//! targets that processor's local APIC, and queue pair `i`'s message
+//! processor `i`'s. Afterwards the driver is shared across processors
+//! through `Arc` and is internally synchronised. A pair's message is
+//! retargeted only by `steer_queue_pair`, which the network service
+//! calls from a processor lifecycle step — one at a time, under the
+//! lifecycle's transition lock.
 
 extern crate alloc;
 
 use alloc::sync::Arc;
 
-use helios_hal::io::IoError;
+use helios_hal::io::{IoError, IoResult};
 use helios_hal::watchdog::Watchdog;
 use helios_kernel::{
     ExternalInterruptHandler, InterfaceCapabilities, InterfaceEventMark, Kernel, LinkState,
-    NetworkDevice, PacketBuffer,
+    NetworkDevice,
 };
 use helios_virtio::{DeviceType, VirtioNetDevice, VirtioPciTransport};
 use pci_types::PciAddress;
@@ -27,8 +31,7 @@ use helios_hal::cpu::{Cpu, ProcessorId};
 use crate::X86Cpu;
 use crate::debug_state::RuntimeState;
 use crate::iommu::X86DmaPool;
-use crate::pci::MsixMessage;
-use crate::pci::PciRoot;
+use crate::pci::{MsixMessage, MsixTable, PciRoot, VirtioFunctions};
 
 type X86VirtioNetDevice = VirtioNetDevice<VirtioPciTransport<X86DmaPool>>;
 
@@ -42,6 +45,43 @@ pub(crate) struct VirtioNetworkDevice {
     /// lookup and the handler knows what it was woken for without
     /// scanning anything.
     role: InterruptRole,
+    /// Where each queue pair's message is delivered, for steering.
+    messages: PairMessages,
+}
+
+/// The MSI-X entries the queue pairs raise, and how to point one at a
+/// processor.
+#[derive(Clone)]
+struct PairMessages {
+    cpu: X86Cpu,
+    table: MsixTable,
+    /// Entries with a pair of their own, after the configuration entry:
+    /// pair `i < steered` raises entry `1 + i`, and the pairs past them
+    /// share the last one (`MsixBinding::per_queue_pair`).
+    steered: usize,
+}
+
+impl PairMessages {
+    /// Points `pair`'s message at `processor`'s local APIC.
+    ///
+    /// A pair past the table's own entries shares the last entry with
+    /// the pair that entry is named for (`steered - 1`), and the entry
+    /// follows that pair: the shared tail cannot follow one of its pairs
+    /// without moving the others. With no entry of its own at all
+    /// (`steered == 0`) the function has one shared message, delivered
+    /// to the bootstrap processor, which never goes offline.
+    fn steer(&self, pair: usize, processor: ProcessorId) {
+        if pair >= self.steered {
+            return;
+        }
+        self.table.retarget(
+            1 + pair as u16,
+            MsixMessage {
+                vector: crate::exceptions::NETWORK_QUEUE_INTERRUPT_VECTORS[pair],
+                destination_apic_id: self.cpu.apic_id_of_processor(processor),
+            },
+        );
+    }
 }
 
 /// What a network interrupt message means.
@@ -56,8 +96,8 @@ enum InterruptRole {
 }
 
 /// The PCI function that carries the platform's virtio-net device.
-pub(crate) fn discover(pci: &PciRoot) -> Option<PciAddress> {
-    pci.find_virtio_function(DeviceType::Network)
+pub(crate) fn discover(virtio: &VirtioFunctions) -> Option<PciAddress> {
+    virtio.find_virtio_function(DeviceType::Network)
 }
 
 /// The PCI function a virtio device is brought up on, and the DMA pool
@@ -77,15 +117,16 @@ pub(crate) struct MsixDelivery {
 
 /// Brings up the virtio-net function and installs the kernel network
 /// service on top of it.
-pub(crate) fn install<WatchdogImpl>(
+pub(crate) fn install<WatchdogImpl, MeasuredBootImpl>(
     cpu: &X86Cpu,
-    kernel: &Kernel<X86Cpu, WatchdogImpl>,
+    kernel: &Kernel<X86Cpu, WatchdogImpl, MeasuredBootImpl>,
     function: PciFunction<'_>,
     delivery: MsixDelivery,
     debug_state: &RuntimeState,
 ) -> NetworkInterrupts
 where
     WatchdogImpl: Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
 {
     // One message per queue pair, each delivered to the local APIC of
     // the processor whose shard drains that pair, plus one for
@@ -137,7 +178,13 @@ where
             destination_apic_id: cpu.apic_id_of_processor(ProcessorId::new(index as u16)),
         };
     }
-    let msix = pci.bind_msix_vectors(address, &messages[..=steered]);
+    let table = pci.bind_msix_vectors(address, &messages[..=steered]);
+    let msix = table.first_entry();
+    let pair_messages = PairMessages {
+        cpu: cpu.clone(),
+        table,
+        steered,
+    };
     // A table with nothing left over after the configuration entry
     // cannot steer at all: every structure of the function shares the
     // one message, which is what `shared` describes.
@@ -166,6 +213,7 @@ where
     let configuration = VirtioNetworkDevice {
         inner: device.clone(),
         role: InterruptRole::Configuration,
+        messages: pair_messages.clone(),
     };
     kernel.install_network_interface(debug_state, configuration.clone());
     tracing::info!(
@@ -190,6 +238,7 @@ where
                     VirtioNetworkDevice {
                         inner: device.clone(),
                         role: InterruptRole::QueuePair(pair_idx),
+                        messages: pair_messages.clone(),
                     },
                 )
             })
@@ -227,6 +276,17 @@ impl NetworkDevice for VirtioNetworkDevice {
         self.inner.queue_pair_count()
     }
 
+    fn set_active_queue_pairs(&self, pairs: usize) -> IoResult<()> {
+        self.inner.set_active_queue_pairs(pairs)
+    }
+
+    /// Retargets the pair's MSI-X entry at `processor`'s local APIC, and
+    /// records the owner the driver reports for the pair.
+    fn steer_queue_pair(&self, pair: usize, processor: ProcessorId) {
+        self.inner.steer_pair(pair, processor);
+        self.messages.steer(pair, processor);
+    }
+
     fn capabilities(&self) -> InterfaceCapabilities {
         self.inner.interface_capabilities()
     }
@@ -235,47 +295,17 @@ impl NetworkDevice for VirtioNetworkDevice {
         self.inner.link_state()
     }
 
-    async fn try_receive(&self, buffer: &mut PacketBuffer) -> Result<bool, IoError> {
-        buffer.clear();
-        let Some(frame_len) = self
-            .inner
-            .try_receive_into(buffer.spare_capacity_mut())
-            .await?
-        else {
-            return Ok(false);
-        };
-        buffer.set_len(frame_len);
-        Ok(true)
-    }
-
-    async fn try_receive_frame(&self) -> Result<Option<helios_virtio::RxFrame>, IoError> {
-        self.inner.try_receive_frame().await
-    }
-
-    async fn repost_rx_frame(&self, frame: helios_virtio::RxFrame) -> Result<(), IoError> {
-        self.inner.repost_rx_frame(frame).await
-    }
-
-    fn repost_rx_frames_immediate<'a, 'slots>(
-        &'a self,
-        frames: &'slots mut [Option<helios_virtio::RxFrame>],
-    ) -> Result<Option<()>, IoError>
-    where
-        'a: 'slots,
-    {
-        self.inner.repost_rx_frames_immediate(frames)
-    }
-
-    fn try_receive_frames_immediate_on<'a, 'slots>(
-        &'a self,
+    fn try_receive_frames_immediate_on<Sink>(
+        &self,
         queue_idx: usize,
-        frames: &'slots mut [Option<helios_virtio::RxFrame>],
+        budget: usize,
+        sink: Sink,
     ) -> Option<helios_virtio::RxDrain>
     where
-        'a: 'slots,
+        Sink: FnMut(&helios_virtio::RxFrame),
     {
         self.inner
-            .try_receive_frames_immediate_on_pair(queue_idx, frames)
+            .try_receive_frames_immediate_on_pair(queue_idx, budget, sink)
     }
 
     fn try_transmit_scatter_immediate_on(

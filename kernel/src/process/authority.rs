@@ -70,6 +70,17 @@ bitflags! {
 }
 
 bitflags! {
+    /// Rights over the kernel's mount table.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct MountAuthorityRights: u8 {
+        /// Attach a filesystem at a directory the holder may change.
+        const MOUNT = 1 << 0;
+        /// Detach a filesystem from a directory the holder may change.
+        const UNMOUNT = 1 << 1;
+    }
+}
+
+bitflags! {
     /// The machine-wide device classes an instance may claim.
     ///
     /// Each class is one resource with one owner role, so authority names
@@ -81,6 +92,29 @@ bitflags! {
         const INPUT = 1 << 1;
         const GPU = 1 << 2;
         const AUDIO = 1 << 3;
+    }
+}
+
+bitflags! {
+    /// What an instance may do to the machine's diagnostics, beyond
+    /// reading its own.
+    ///
+    /// `OBSERVE_MACHINE` covers the tracing and profiling controls and
+    /// reading any instance's records. Every observer in the tree uses
+    /// both, so one right covers them.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct DiagnosticAuthorityRights: u8 {
+        const OBSERVE_MACHINE = 1 << 0;
+    }
+}
+
+bitflags! {
+    /// What an instance may do to the machine itself rather than to
+    /// what runs on it.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct MachineAuthorityRights: u8 {
+        /// Take processors offline and bring them online.
+        const CONTROL_PROCESSORS = 1 << 0;
     }
 }
 
@@ -149,7 +183,7 @@ macro_rules! typed_device_class_cap {
 
 typed_device_class_cap!(DisplayClaimCap, DeviceClassRights::DISPLAY);
 typed_device_class_cap!(InputClaimCap, DeviceClassRights::INPUT);
-typed_device_class_cap!(GpuClaimCap, DeviceClassRights::GPU);
+typed_device_class_cap!(GpuOpenCap, DeviceClassRights::GPU);
 typed_device_class_cap!(AudioClaimCap, DeviceClassRights::AUDIO);
 
 /// Proof that the instance was granted one named device. The name is
@@ -160,6 +194,36 @@ pub struct DeviceGrantClaimCap(DeviceName);
 impl DeviceGrantClaimCap {
     pub const fn name(&self) -> &DeviceName {
         &self.0
+    }
+}
+
+/// Proof, checked on the owning task, that the instance may control the
+/// machine's tracing and profiling and read every instance's records.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ObserveMachineCap(DiagnosticAuthorityRights);
+
+impl ObserveMachineCap {
+    pub const fn required_rights() -> DiagnosticAuthorityRights {
+        DiagnosticAuthorityRights::OBSERVE_MACHINE
+    }
+
+    pub const fn rights(self) -> DiagnosticAuthorityRights {
+        self.0
+    }
+}
+
+/// Proof, checked on the owning task, that the instance may take
+/// processors offline and bring them online.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ControlProcessorsCap(MachineAuthorityRights);
+
+impl ControlProcessorsCap {
+    pub const fn required_rights() -> MachineAuthorityRights {
+        MachineAuthorityRights::CONTROL_PROCESSORS
+    }
+
+    pub const fn rights(self) -> MachineAuthorityRights {
+        self.0
     }
 }
 
@@ -177,6 +241,25 @@ pub struct SpawnAuthority(ProcessAuthorityRights);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExecAuthority(ProcessAuthorityRights);
+
+/// Proof that the holder derived a process right that may start a
+/// compile: SPAWN or EXEC. It is built only from one of those two
+/// tokens, so every route into the in-kernel compiler has to have
+/// derived a process right first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompileAuthority(ProcessAuthorityRights);
+
+impl From<&SpawnAuthority> for CompileAuthority {
+    fn from(authority: &SpawnAuthority) -> Self {
+        Self(authority.rights())
+    }
+}
+
+impl From<&ExecAuthority> for CompileAuthority {
+    fn from(authority: &ExecAuthority) -> Self {
+        Self(authority.rights())
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ForkAuthority(ProcessAuthorityRights);
@@ -199,6 +282,19 @@ pub struct SymlinkCreateCap(LinkAuthorityRights);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SymlinkReadCap(LinkAuthorityRights);
 
+/// Authority to attach a filesystem at one mount point: the holder has the
+/// mount right and may change the directory at `point`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MountCap {
+    point: String,
+}
+
+/// Authority to detach the filesystem at one mount point.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnmountCap {
+    point: String,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProcessAuthority {
     directory_preopens: Vec<DirectoryPreopen>,
@@ -208,10 +304,13 @@ pub struct ProcessAuthority {
     terminal: TerminalAuthorityRights,
     process: ProcessAuthorityRights,
     link: LinkAuthorityRights,
+    mount: MountAuthorityRights,
     device_classes: DeviceClassRights,
     /// Raw devices this instance may claim by name. Bounded by the
     /// registry's own capacity, because the registry cannot publish more.
     devices: ArrayVec<DeviceName, MAX_GRANTS>,
+    diagnostics: DiagnosticAuthorityRights,
+    machine: MachineAuthorityRights,
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -242,6 +341,12 @@ pub enum ProcessAuthorityError {
     ProcessGrantExceedsAuthority(ProcessAuthorityRights),
     #[error("link grant exceeds caller authority: {0:?}")]
     LinkGrantExceedsAuthority(LinkAuthorityRights),
+    #[error("mount grant rights must not be empty")]
+    EmptyMountRights,
+    #[error("mount grant exceeds caller authority: {0:?}")]
+    MountGrantExceedsAuthority(MountAuthorityRights),
+    #[error("mount point {0} is outside the caller's mutate-directory authority")]
+    MountPointOutsideAuthority(String),
     #[error("device class grant rights must not be empty")]
     EmptyDeviceClassRights,
     #[error("device class grant exceeds caller authority: {0:?}")]
@@ -252,6 +357,14 @@ pub enum ProcessAuthorityError {
     DeviceNameTooLong,
     #[error("an instance holds at most {} named devices", MAX_GRANTS)]
     TooManyDeviceGrants,
+    #[error("diagnostic grant rights must not be empty")]
+    EmptyDiagnosticRights,
+    #[error("diagnostic grant exceeds caller authority: {0:?}")]
+    DiagnosticGrantExceedsAuthority(DiagnosticAuthorityRights),
+    #[error("machine grant rights must not be empty")]
+    EmptyMachineRights,
+    #[error("machine grant exceeds caller authority: {0:?}")]
+    MachineGrantExceedsAuthority(MachineAuthorityRights),
 }
 
 impl DirectoryPreopen {
@@ -347,6 +460,7 @@ macro_rules! impl_process_cap {
 
 impl_process_cap!(SpawnAuthority);
 impl_process_cap!(ExecAuthority);
+impl_process_cap!(CompileAuthority);
 impl_process_cap!(ForkAuthority);
 impl_process_cap!(JoinAuthority);
 impl_process_cap!(SignalAuthority);
@@ -366,6 +480,20 @@ impl_link_cap!(LinkTargetDirectoryCap);
 impl_link_cap!(SymlinkCreateCap);
 impl_link_cap!(SymlinkReadCap);
 
+impl MountCap {
+    /// The normalized guest path the filesystem is attached at.
+    pub fn point(&self) -> &str {
+        &self.point
+    }
+}
+
+impl UnmountCap {
+    /// The normalized guest path the filesystem is detached from.
+    pub fn point(&self) -> &str {
+        &self.point
+    }
+}
+
 impl ProcessAuthority {
     pub const fn empty() -> Self {
         Self {
@@ -376,14 +504,19 @@ impl ProcessAuthority {
             terminal: TerminalAuthorityRights::empty(),
             process: ProcessAuthorityRights::empty(),
             link: LinkAuthorityRights::empty(),
+            mount: MountAuthorityRights::empty(),
             device_classes: DeviceClassRights::empty(),
             devices: ArrayVec::new_const(),
+            diagnostics: DiagnosticAuthorityRights::empty(),
+            machine: MachineAuthorityRights::empty(),
         }
     }
 
-    /// Every right except the device ones. The kernel adds the device
-    /// classes and named devices a component needs where it starts that
-    /// component, so no program inherits a claim through this value.
+    /// Every right except the device, diagnostic and machine ones. The
+    /// kernel adds the device classes, named devices, diagnostic and
+    /// machine rights a component needs where it starts that component,
+    /// so no program inherits a claim, the machine's diagnostics or
+    /// control of its processors through this value.
     pub fn root() -> Self {
         let mut authority = Self::empty();
         authority.insert_directory_preopen(
@@ -429,6 +562,7 @@ impl ProcessAuthority {
                 | LinkAuthorityRights::SYMLINK_CREATE
                 | LinkAuthorityRights::SYMLINK_READ,
         );
+        authority.grant_mount_rights(MountAuthorityRights::MOUNT | MountAuthorityRights::UNMOUNT);
         authority
     }
 
@@ -476,12 +610,32 @@ impl ProcessAuthority {
         self.link
     }
 
+    pub fn mount_rights(&self) -> MountAuthorityRights {
+        self.mount
+    }
+
     pub fn device_class_rights(&self) -> DeviceClassRights {
         self.device_classes
     }
 
     pub fn granted_devices(&self) -> &[DeviceName] {
         &self.devices
+    }
+
+    pub fn diagnostic_rights(&self) -> DiagnosticAuthorityRights {
+        self.diagnostics
+    }
+
+    pub fn grant_diagnostic_rights(&mut self, rights: DiagnosticAuthorityRights) {
+        self.diagnostics |= rights;
+    }
+
+    pub fn machine_rights(&self) -> MachineAuthorityRights {
+        self.machine
+    }
+
+    pub fn grant_machine_rights(&mut self, rights: MachineAuthorityRights) {
+        self.machine |= rights;
     }
 
     pub fn grant_device_classes(&mut self, rights: DeviceClassRights) {
@@ -517,6 +671,10 @@ impl ProcessAuthority {
 
     pub fn grant_link_rights(&mut self, rights: LinkAuthorityRights) {
         self.link |= rights;
+    }
+
+    pub fn grant_mount_rights(&mut self, rights: MountAuthorityRights) {
+        self.mount |= rights;
     }
 
     pub fn derive_directory_preopen(
@@ -717,6 +875,59 @@ impl ProcessAuthority {
             .map(SymlinkReadCap)
     }
 
+    pub fn derive_mount_rights(
+        &self,
+        rights: MountAuthorityRights,
+    ) -> Result<MountAuthorityRights, ProcessAuthorityError> {
+        if rights.is_empty() {
+            return Err(ProcessAuthorityError::EmptyMountRights);
+        }
+        if !self.mount.contains(rights) {
+            return Err(ProcessAuthorityError::MountGrantExceedsAuthority(rights));
+        }
+        Ok(rights)
+    }
+
+    pub fn derive_diagnostic_rights(
+        &self,
+        rights: DiagnosticAuthorityRights,
+    ) -> Result<DiagnosticAuthorityRights, ProcessAuthorityError> {
+        if rights.is_empty() {
+            return Err(ProcessAuthorityError::EmptyDiagnosticRights);
+        }
+        if !self.diagnostics.contains(rights) {
+            return Err(ProcessAuthorityError::DiagnosticGrantExceedsAuthority(
+                rights,
+            ));
+        }
+        Ok(rights)
+    }
+
+    pub fn derive_observe_machine_cap(&self) -> Result<ObserveMachineCap, ProcessAuthorityError> {
+        self.derive_diagnostic_rights(ObserveMachineCap::required_rights())
+            .map(ObserveMachineCap)
+    }
+
+    pub fn derive_machine_rights(
+        &self,
+        rights: MachineAuthorityRights,
+    ) -> Result<MachineAuthorityRights, ProcessAuthorityError> {
+        if rights.is_empty() {
+            return Err(ProcessAuthorityError::EmptyMachineRights);
+        }
+        if !self.machine.contains(rights) {
+            return Err(ProcessAuthorityError::MachineGrantExceedsAuthority(rights));
+        }
+        Ok(rights)
+    }
+
+    pub fn derive_control_processors_cap(
+        &self,
+    ) -> Result<ControlProcessorsCap, ProcessAuthorityError> {
+        self.derive_machine_rights(ControlProcessorsCap::required_rights())
+            .map(ControlProcessorsCap)
+    }
+
     pub fn derive_device_class_rights(
         &self,
         rights: DeviceClassRights,
@@ -732,6 +943,33 @@ impl ProcessAuthority {
         Ok(rights)
     }
 
+    /// Authority to attach a filesystem at `point`: the mount right, and
+    /// mutate-directory authority over the point, since a mount replaces
+    /// what the directory shows.
+    pub fn derive_mount_cap(&self, point: &str) -> Result<MountCap, ProcessAuthorityError> {
+        self.derive_mount_rights(MountAuthorityRights::MOUNT)?;
+        Ok(MountCap {
+            point: self.mutable_mount_point(point)?,
+        })
+    }
+
+    /// Authority to detach the filesystem at `point`, under the same
+    /// directory authority attaching it needed.
+    pub fn derive_unmount_cap(&self, point: &str) -> Result<UnmountCap, ProcessAuthorityError> {
+        self.derive_mount_rights(MountAuthorityRights::UNMOUNT)?;
+        Ok(UnmountCap {
+            point: self.mutable_mount_point(point)?,
+        })
+    }
+
+    fn mutable_mount_point(&self, point: &str) -> Result<String, ProcessAuthorityError> {
+        let point = normalize_authority_path(point)?;
+        if !self.has_directory_authority(&point, DirectoryAuthorityRights::MUTATE_DIRECTORY) {
+            return Err(ProcessAuthorityError::MountPointOutsideAuthority(point));
+        }
+        Ok(point)
+    }
+
     pub fn derive_display_claim_cap(&self) -> Result<DisplayClaimCap, ProcessAuthorityError> {
         self.derive_device_class_rights(DisplayClaimCap::required_rights())
             .map(DisplayClaimCap)
@@ -742,9 +980,9 @@ impl ProcessAuthority {
             .map(InputClaimCap)
     }
 
-    pub fn derive_gpu_claim_cap(&self) -> Result<GpuClaimCap, ProcessAuthorityError> {
-        self.derive_device_class_rights(GpuClaimCap::required_rights())
-            .map(GpuClaimCap)
+    pub fn derive_gpu_open_cap(&self) -> Result<GpuOpenCap, ProcessAuthorityError> {
+        self.derive_device_class_rights(GpuOpenCap::required_rights())
+            .map(GpuOpenCap)
     }
 
     pub fn derive_audio_claim_cap(&self) -> Result<AudioClaimCap, ProcessAuthorityError> {
@@ -766,8 +1004,23 @@ impl ProcessAuthority {
     }
 
     pub fn can_load_program(&self, path: &str) -> bool {
-        self.has_directory_authority(path, DirectoryAuthorityRights::READ)
-            || self.has_directory_authority(path, DirectoryAuthorityRights::EXECUTE)
+        self.program_load_floor(path).is_some()
+    }
+
+    /// The directory whose grant lets `path` be loaded as a program: the
+    /// widest such grant, which is the floor a symbolic link the load
+    /// follows may not leave.
+    pub fn program_load_floor(&self, path: &str) -> Option<&str> {
+        let loads = |rights: DirectoryAuthorityRights| {
+            rights.intersects(DirectoryAuthorityRights::READ | DirectoryAuthorityRights::EXECUTE)
+        };
+        self.directory_preopens
+            .iter()
+            .map(|preopen| (preopen.source_path(), preopen.rights()))
+            .chain(self.cwd.iter().map(|cwd| (cwd.source_path(), cwd.rights())))
+            .filter(|(directory, rights)| directory_contains(directory, path) && loads(*rights))
+            .map(|(directory, _)| directory)
+            .min_by_key(|directory| directory.len())
     }
 
     pub fn can_write_path(&self, path: &str) -> bool {
@@ -795,7 +1048,10 @@ impl ProcessAuthority {
             && self.terminal.contains(child.terminal)
             && self.process.contains(child.process)
             && self.link.contains(child.link)
+            && self.mount.contains(child.mount)
             && self.device_classes.contains(child.device_classes)
+            && self.diagnostics.contains(child.diagnostics)
+            && self.machine.contains(child.machine)
             && child
                 .devices
                 .iter()
@@ -816,7 +1072,7 @@ impl ProcessAuthority {
 #[cfg(test)]
 pub(crate) mod test_caps {
     use super::{
-        AudioClaimCap, DeviceClassRights, DeviceGrantClaimCap, DisplayClaimCap, GpuClaimCap,
+        AudioClaimCap, DeviceClassRights, DeviceGrantClaimCap, DisplayClaimCap, GpuOpenCap,
         InputClaimCap, ProcessAuthority,
     };
     use crate::device::DeviceName;
@@ -839,9 +1095,9 @@ pub(crate) mod test_caps {
             .expect("the authority holds the input class")
     }
 
-    pub(crate) fn gpu() -> GpuClaimCap {
+    pub(crate) fn gpu() -> GpuOpenCap {
         holding(DeviceClassRights::GPU)
-            .derive_gpu_claim_cap()
+            .derive_gpu_open_cap()
             .expect("the authority holds the GPU class")
     }
 
@@ -878,9 +1134,10 @@ fn directory_contains(directory: &str, path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClockAuthorityRights, DeviceClassRights, DirectoryAuthorityRights, LinkAuthorityRights,
-        NetworkAuthorityRights, ProcessAuthority, ProcessAuthorityError, ProcessAuthorityRights,
-        TerminalAuthorityRights,
+        ClockAuthorityRights, DeviceClassRights, DiagnosticAuthorityRights,
+        DirectoryAuthorityRights, LinkAuthorityRights, MachineAuthorityRights,
+        MountAuthorityRights, NetworkAuthorityRights, ProcessAuthority, ProcessAuthorityError,
+        ProcessAuthorityRights, TerminalAuthorityRights,
     };
     use crate::device::{DeviceName, MAX_GRANTS};
 
@@ -1099,6 +1356,90 @@ mod tests {
     }
 
     #[test]
+    fn mount_requires_the_mount_right() {
+        let mut authority = ProcessAuthority::empty();
+        authority.insert_directory_preopen(
+            super::DirectoryPreopen::new(
+                "/",
+                "/",
+                DirectoryAuthorityRights::READ | DirectoryAuthorityRights::MUTATE_DIRECTORY,
+            )
+            .expect("test preopen should be valid"),
+        );
+
+        assert!(matches!(
+            authority
+                .derive_mount_cap("/mnt")
+                .expect_err("a mount without the mount right must be refused"),
+            ProcessAuthorityError::MountGrantExceedsAuthority(MountAuthorityRights::MOUNT)
+        ));
+        assert!(matches!(
+            authority
+                .derive_unmount_cap("/mnt")
+                .expect_err("an unmount without the unmount right must be refused"),
+            ProcessAuthorityError::MountGrantExceedsAuthority(MountAuthorityRights::UNMOUNT)
+        ));
+    }
+
+    #[test]
+    fn mount_point_must_lie_under_mutate_directory_authority() {
+        let mut authority = ProcessAuthority::empty();
+        authority.grant_mount_rights(MountAuthorityRights::MOUNT);
+        authority.insert_directory_preopen(
+            super::DirectoryPreopen::new("/", "/", DirectoryAuthorityRights::READ)
+                .expect("test preopen should be valid"),
+        );
+        authority.insert_directory_preopen(
+            super::DirectoryPreopen::new(
+                "/data",
+                "/data",
+                DirectoryAuthorityRights::READ | DirectoryAuthorityRights::MUTATE_DIRECTORY,
+            )
+            .expect("test preopen should be valid"),
+        );
+
+        assert!(matches!(
+            authority
+                .derive_mount_cap("/mnt")
+                .expect_err("a read-only directory must not take a mount"),
+            ProcessAuthorityError::MountPointOutsideAuthority(_)
+        ));
+        assert!(matches!(
+            authority
+                .derive_mount_cap("/data/../data/disk")
+                .expect_err("an absolute mount point never climbs with `..`"),
+            ProcessAuthorityError::InvalidPath(_)
+        ));
+        let cap = authority
+            .derive_mount_cap("/data/disk")
+            .expect("a directory the caller may change takes a mount");
+        assert_eq!(cap.point(), "/data/disk");
+    }
+
+    #[test]
+    fn root_holds_mount_authority_and_delegates_a_subset() {
+        let root = ProcessAuthority::root();
+        assert_eq!(
+            root.derive_mount_cap("/mnt")
+                .expect("root may mount anywhere")
+                .point(),
+            "/mnt"
+        );
+
+        let mut child = ProcessAuthority::empty();
+        child.grant_mount_rights(
+            root.derive_mount_rights(MountAuthorityRights::MOUNT)
+                .expect("root may delegate the mount right"),
+        );
+        assert!(root.contains_authority(&child));
+        assert!(!child.contains_authority(&root));
+        assert!(matches!(
+            child.derive_mount_rights(MountAuthorityRights::UNMOUNT),
+            Err(ProcessAuthorityError::MountGrantExceedsAuthority(_))
+        ));
+    }
+
+    #[test]
     fn cwd_is_set_only_from_derived_directory_capability() {
         let mut authority = ProcessAuthority::empty();
         authority.insert_directory_preopen(
@@ -1189,12 +1530,14 @@ mod tests {
         child.grant_process_rights(ProcessAuthorityRights::SPAWN);
         child.grant_link_rights(LinkAuthorityRights::SOURCE);
         child.grant_device_classes(DeviceClassRights::DISPLAY);
+        child.grant_diagnostic_rights(DiagnosticAuthorityRights::OBSERVE_MACHINE);
         child
             .grant_device(device_name("pci:0000:00:04.0"))
             .expect("one named device fits");
 
         let mut parent = parent;
         parent.grant_device_classes(DeviceClassRights::all());
+        parent.grant_diagnostic_rights(DiagnosticAuthorityRights::OBSERVE_MACHINE);
         parent
             .grant_device(device_name("pci:0000:00:04.0"))
             .expect("one named device fits");
@@ -1217,6 +1560,82 @@ mod tests {
             .grant_device(device_name("pci:0000:00:04.0"))
             .expect("one named device fits");
         assert!(!device_only_parent.contains_authority(&child));
+
+        let mut diagnostics_less_parent = ProcessAuthority::root();
+        diagnostics_less_parent.grant_device_classes(DeviceClassRights::all());
+        diagnostics_less_parent
+            .grant_device(device_name("pci:0000:00:04.0"))
+            .expect("one named device fits");
+        assert!(!diagnostics_less_parent.contains_authority(&child));
+    }
+
+    #[test]
+    fn diagnostic_grant_must_be_subset_of_caller_authority() {
+        let mut parent = ProcessAuthority::empty();
+        parent.grant_diagnostic_rights(DiagnosticAuthorityRights::OBSERVE_MACHINE);
+
+        assert_eq!(
+            parent
+                .derive_diagnostic_rights(DiagnosticAuthorityRights::OBSERVE_MACHINE)
+                .expect("caller may derive a right it holds"),
+            DiagnosticAuthorityRights::OBSERVE_MACHINE
+        );
+        assert_eq!(
+            parent
+                .derive_diagnostic_rights(DiagnosticAuthorityRights::empty())
+                .expect_err("an empty diagnostic grant is a mistake"),
+            ProcessAuthorityError::EmptyDiagnosticRights
+        );
+        assert!(parent.derive_observe_machine_cap().is_ok());
+
+        let holder_less = ProcessAuthority::empty();
+        assert_eq!(
+            holder_less
+                .derive_diagnostic_rights(DiagnosticAuthorityRights::OBSERVE_MACHINE)
+                .expect_err("a caller without the right must not hand it on"),
+            ProcessAuthorityError::DiagnosticGrantExceedsAuthority(
+                DiagnosticAuthorityRights::OBSERVE_MACHINE
+            )
+        );
+        assert!(matches!(
+            holder_less.derive_observe_machine_cap(),
+            Err(ProcessAuthorityError::DiagnosticGrantExceedsAuthority(_))
+        ));
+    }
+
+    #[test]
+    fn root_authority_holds_no_diagnostic_rights() {
+        let root = ProcessAuthority::root();
+        assert_eq!(root.diagnostic_rights(), DiagnosticAuthorityRights::empty());
+        assert!(root.derive_observe_machine_cap().is_err());
+    }
+
+    #[test]
+    fn machine_grant_must_be_subset_of_caller_authority() {
+        let mut parent = ProcessAuthority::root();
+        parent.grant_machine_rights(MachineAuthorityRights::CONTROL_PROCESSORS);
+        assert!(parent.derive_control_processors_cap().is_ok());
+        assert_eq!(
+            parent
+                .derive_machine_rights(MachineAuthorityRights::empty())
+                .expect_err("an empty machine grant is a mistake"),
+            ProcessAuthorityError::EmptyMachineRights
+        );
+
+        let root = ProcessAuthority::root();
+        assert_eq!(root.machine_rights(), MachineAuthorityRights::empty());
+        assert_eq!(
+            root.derive_control_processors_cap()
+                .expect_err("root authority does not control processors"),
+            ProcessAuthorityError::MachineGrantExceedsAuthority(
+                MachineAuthorityRights::CONTROL_PROCESSORS
+            )
+        );
+
+        let mut child = ProcessAuthority::root();
+        child.grant_machine_rights(MachineAuthorityRights::CONTROL_PROCESSORS);
+        assert!(parent.contains_authority(&child));
+        assert!(!root.contains_authority(&child));
     }
 
     #[test]
@@ -1248,7 +1667,7 @@ mod tests {
         assert!(parent.derive_display_claim_cap().is_ok());
         assert!(parent.derive_input_claim_cap().is_ok());
         assert!(matches!(
-            parent.derive_gpu_claim_cap(),
+            parent.derive_gpu_open_cap(),
             Err(ProcessAuthorityError::DeviceClassGrantExceedsAuthority(_))
         ));
         assert!(matches!(
@@ -1312,7 +1731,7 @@ mod tests {
         assert!(root.granted_devices().is_empty());
         assert!(root.derive_display_claim_cap().is_err());
         assert!(root.derive_input_claim_cap().is_err());
-        assert!(root.derive_gpu_claim_cap().is_err());
+        assert!(root.derive_gpu_open_cap().is_err());
         assert!(root.derive_audio_claim_cap().is_err());
     }
 }

@@ -38,18 +38,20 @@ use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use futures::future::{Either, select};
 use helios_hal::cpu::Cpu;
 use helios_hal::display::{
-    DisplayDevice, DisplayError, FramebufferId, MAX_SCANOUTS, Rect, ScanoutId,
+    BlobId, DisplayDevice, DisplayError, FramebufferId, MAX_SCANOUTS, Rect, ScanoutId,
 };
 use helios_hal::watchdog::Watchdog;
 use triomphe::Arc;
 
 use crate::Kernel;
+use crate::buffer::Buffer;
 use crate::component::{ProviderReceiver, provider_channel};
 use crate::exec::monotonic_nanos;
+use crate::gpu::ScanoutHold;
 
 use super::service::{
     ClaimState, ControlRequest, CursorRequest, DisplayService, DisplayShared, FrameToken,
-    REQUEST_QUEUE_DEPTH,
+    REQUEST_QUEUE_DEPTH, SurfaceSource,
 };
 use super::{DisplayServiceError, MAX_PINNED_FRAMES};
 
@@ -59,14 +61,15 @@ use super::{DisplayServiceError, MAX_PINNED_FRAMES};
 /// The device is never handed anywhere else. What callers get back is a
 /// handle to the tasks this spawns, which is what a claim and every
 /// frame after it travels through.
-pub fn install_display_device<CpuImpl, WatchdogImpl, Device>(
-    kernel: &Kernel<CpuImpl, WatchdogImpl>,
+pub fn install_display_device<CpuImpl, WatchdogImpl, MeasuredBootImpl, Device>(
+    kernel: &Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
     cpu: &CpuImpl,
     device: Device,
 ) -> DisplayService
 where
     CpuImpl: Cpu + Clone + Send + Sync + 'static,
     WatchdogImpl: Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
     Device: DisplayDevice + Clone,
 {
     let (shared, control_rx, cursor_rx) = display_channels();
@@ -118,7 +121,6 @@ pub(super) fn display_channels() -> (
         release: crate::exec::Notify::new(),
         changes: Arc::new(super::SequenceSignal::new()),
         scanout_count: AtomicU32::new(0),
-        returned: concurrent_queue::ConcurrentQueue::bounded(1),
     });
     (shared, control_rx, cursor_rx)
 }
@@ -195,9 +197,39 @@ pub(super) async fn follow_display_topology<Device, CpuImpl>(
     }
 }
 
-/// One frame buffer the current claim created.
+/// What one surface's record holds of the resource it shows.
+enum SurfaceResource {
+    /// A frame buffer the display owner created, and the display
+    /// engine's attachment to its backing. The buffer is dropped only
+    /// once the resource is destroyed, which is what keeps the run from
+    /// going back to a pool the device is still reading, and never when
+    /// the engine would not destroy it.
+    Framebuffer { id: FramebufferId, backing: Buffer },
+    /// A renderer's blob on one scanout, which the gpu path owns and
+    /// destroys. The record's hold keeps the gpu path from destroying
+    /// the blob until the scanout has stopped reading it.
+    Blob {
+        id: BlobId,
+        scanout: ScanoutId,
+        hold: ScanoutHold,
+    },
+}
+
+impl SurfaceResource {
+    const fn source(&self) -> SurfaceSource {
+        match self {
+            Self::Framebuffer { id, .. } => SurfaceSource::Framebuffer(*id),
+            Self::Blob { id, scanout, .. } => SurfaceSource::Blob {
+                blob: *id,
+                scanout: *scanout,
+            },
+        }
+    }
+}
+
+/// One surface the current claim created.
 struct SurfaceRecord {
-    framebuffer: FramebufferId,
+    resource: SurfaceResource,
     /// The output it was attached to, absent for a cursor plane's own
     /// resource, which no scanout latches.
     scanout: Option<ScanoutId>,
@@ -215,7 +247,7 @@ struct ClaimResources {
     surfaces: ArrayVec<SurfaceRecord, MAX_PINNED_FRAMES>,
     /// The outputs this claim pointed at something. Blanked before
     /// anything is destroyed, so the display engine is never reading a
-    /// resource whose pages are on their way back to a pool.
+    /// resource whose frames are on their way back to a pool.
     scanouts: ArrayVec<ScanoutId, MAX_SCANOUTS>,
 }
 
@@ -228,10 +260,18 @@ impl ClaimResources {
         }
     }
 
-    fn record(&mut self, framebuffer: FramebufferId) -> Option<&mut SurfaceRecord> {
+    /// Remember that the claim pointed `scanout` at something, so the
+    /// release blanks it.
+    fn note_scanout(&mut self, scanout: ScanoutId) {
+        if !self.scanouts.contains(&scanout) && !self.scanouts.is_full() {
+            self.scanouts.push(scanout);
+        }
+    }
+
+    fn record(&mut self, surface: SurfaceSource) -> Option<&mut SurfaceRecord> {
         self.surfaces
             .iter_mut()
-            .find(|record| record.framebuffer == framebuffer)
+            .find(|record| record.resource.source() == surface)
     }
 }
 
@@ -255,13 +295,9 @@ pub(super) async fn serve_control<Device, CpuImpl>(
         let next = pin!(inbox.recv());
         match select(released, next).await {
             Either::Left(((), _)) => {
+                // The records' references to the frame buffers go as
+                // the resources do, after every output stopped latching.
                 release_claim(device, &mut held).await;
-                // Only now: the display engine has stopped reading, so
-                // dropping the arena hands the pages back to a pool
-                // nothing is scanning out.
-                while let Ok(pins) = shared.returned.pop() {
-                    drop(pins);
-                }
                 shared.claim.store(ClaimState::FREE, Ordering::Release);
             }
             Either::Right((Some(request), _)) => {
@@ -314,8 +350,37 @@ async fn serve_control_request<Device, CpuImpl>(
             reply,
             ..
         } => {
+            // A host call that stopped waiting closes its end before it
+            // goes. One that went before this was served is owed
+            // nothing, and one that went while the device was creating
+            // the resource can never learn its identity to destroy it,
+            // so the resource goes back here.
+            if reply.is_canceled() {
+                return;
+            }
             let outcome = create_surface(device, held, scanout, mode, format, backing).await;
-            let _ = reply.send(outcome);
+            if let Err(Ok(framebuffer)) = reply.send(outcome) {
+                destroy_surface(device, held, SurfaceSource::Framebuffer(framebuffer)).await;
+            }
+        }
+        ControlRequest::CreateBlobSurface {
+            scanout,
+            layout,
+            hold,
+            reply,
+            ..
+        } => {
+            if reply.is_canceled() {
+                return;
+            }
+            let outcome = create_blob_surface(device, held, scanout, layout, hold).await;
+            if let Err(Ok(())) = reply.send(outcome) {
+                let surface = SurfaceSource::Blob {
+                    blob: layout.blob,
+                    scanout,
+                };
+                destroy_surface(device, held, surface).await;
+            }
         }
         ControlRequest::CreateCursor {
             format,
@@ -326,19 +391,26 @@ async fn serve_control_request<Device, CpuImpl>(
             let outcome = create_cursor(device, held, format, backing).await;
             let _ = reply.send(outcome);
         }
-        ControlRequest::DestroySurface { framebuffer, .. } => {
-            destroy_surface(device, held, framebuffer).await;
+        ControlRequest::DestroySurface { surface, .. } => {
+            destroy_surface(device, held, surface).await;
         }
         ControlRequest::Present {
-            framebuffer,
+            surface,
             region,
             vsync,
             reply,
             ..
         } => {
-            let outcome = match device.flush(framebuffer, region).await {
+            // A frame buffer's pixels are the compositor's pages, copied
+            // in before the flush; a blob's are already the device's, so
+            // presenting it is the flush alone.
+            let flushed = match surface {
+                SurfaceSource::Framebuffer(framebuffer) => device.flush(framebuffer, region).await,
+                SurfaceSource::Blob { blob, .. } => device.flush_blob(blob, region).await,
+            };
+            let outcome = match flushed {
                 Ok(()) => {
-                    let sequence = match held.record(framebuffer) {
+                    let sequence = match held.record(surface) {
                         Some(record) => {
                             record.sequence += 1;
                             record.sequence
@@ -379,15 +451,12 @@ async fn create_surface<Device: DisplayDevice>(
     scanout: ScanoutId,
     mode: helios_hal::display::DisplayMode,
     format: helios_hal::display::PixelFormat,
-    backing: helios_hal::pmm::PhysFrameRange,
+    backing: Buffer,
 ) -> Result<FramebufferId, DisplayServiceError> {
     if held.surfaces.is_full() {
         return Err(DisplayServiceError::TooManySurfaces);
     }
-    let framebuffer = device
-        .create_framebuffer(mode, format, &[backing])
-        .await
-        .map_err(DisplayServiceError::from)?;
+    let (framebuffer, backing) = create_framebuffer(device, mode, format, backing).await?;
     if let Err(error) = device
         .set_scanout(scanout, framebuffer, Rect::of(mode))
         .await
@@ -395,55 +464,124 @@ async fn create_surface<Device: DisplayDevice>(
         // The resource exists but nothing shows it. Handing the caller a
         // surface it could draw into and never see would be worse than
         // the refusal, so the resource goes back before the error does.
-        if let Err(destroy) = device.destroy_framebuffer(framebuffer).await {
-            tracing::warn!(
-                %destroy,
-                "a frame buffer the display engine would not release after a failed scanout"
-            );
-        }
+        release_framebuffer(device, framebuffer, backing).await;
         return Err(DisplayServiceError::from(error));
     }
     held.surfaces.push(SurfaceRecord {
-        framebuffer,
+        resource: SurfaceResource::Framebuffer {
+            id: framebuffer,
+            backing,
+        },
         scanout: Some(scanout),
         sequence: 0,
     });
-    if !held.scanouts.contains(&scanout) && !held.scanouts.is_full() {
-        held.scanouts.push(scanout);
-    }
+    held.note_scanout(scanout);
     Ok(framebuffer)
+}
+
+/// Point `scanout` at a frame inside a renderer's blob.
+///
+/// Nothing is created: the blob is the gpu path's resource. A blob may
+/// be shown on several scanouts, one surface each.
+async fn create_blob_surface<Device: DisplayDevice>(
+    device: &Device,
+    held: &mut ClaimResources,
+    scanout: ScanoutId,
+    layout: helios_hal::display::BlobScanout,
+    hold: ScanoutHold,
+) -> Result<(), DisplayServiceError> {
+    debug_assert_eq!(hold.blob(), layout.blob, "the hold is on the blob shown");
+    if held.surfaces.is_full() {
+        return Err(DisplayServiceError::TooManySurfaces);
+    }
+    device
+        .set_scanout_blob(scanout, layout)
+        .await
+        .map_err(DisplayServiceError::from)?;
+    held.surfaces.push(SurfaceRecord {
+        resource: SurfaceResource::Blob {
+            id: layout.blob,
+            scanout,
+            hold,
+        },
+        scanout: Some(scanout),
+        sequence: 0,
+    });
+    held.note_scanout(scanout);
+    Ok(())
 }
 
 async fn create_cursor<Device: DisplayDevice>(
     device: &Device,
     held: &mut ClaimResources,
     format: helios_hal::display::PixelFormat,
-    backing: helios_hal::pmm::PhysFrameRange,
+    backing: Buffer,
 ) -> Result<FramebufferId, DisplayServiceError> {
     if held.surfaces.is_full() {
         return Err(DisplayServiceError::TooManySurfaces);
     }
-    let framebuffer = device
-        .create_framebuffer(helios_hal::display::CursorImage::MODE, format, &[backing])
-        .await
-        .map_err(DisplayServiceError::from)?;
+    let (framebuffer, backing) = create_framebuffer(
+        device,
+        helios_hal::display::CursorImage::MODE,
+        format,
+        backing,
+    )
+    .await?;
     held.surfaces.push(SurfaceRecord {
-        framebuffer,
+        resource: SurfaceResource::Framebuffer {
+            id: framebuffer,
+            backing,
+        },
         scanout: None,
         sequence: 0,
     });
     Ok(framebuffer)
 }
 
+/// Create a frame buffer over `backing`, and let the run go on a failure
+/// only if the display engine answered.
+///
+/// A refusal the engine answered leaves it holding nothing, so the run
+/// goes back with the error. A transport error is not an answer: the
+/// request that names the run may still be with the device, which may
+/// read those pages at any later time, so the run never goes back to the
+/// pool, for the reason [`release_framebuffer`] keeps one the engine
+/// would not destroy.
+async fn create_framebuffer<Device: DisplayDevice>(
+    device: &Device,
+    mode: helios_hal::display::DisplayMode,
+    format: helios_hal::display::PixelFormat,
+    backing: Buffer,
+) -> Result<(FramebufferId, Buffer), DisplayServiceError> {
+    match device
+        .create_framebuffer(mode, format, &[backing.frames()])
+        .await
+    {
+        Ok(framebuffer) => Ok((framebuffer, backing)),
+        Err(error) => {
+            if let DisplayError::Transport(_) = &error {
+                tracing::error!(
+                    %error,
+                    bytes = backing.bytes(),
+                    "the display engine did not answer a frame buffer create; its run is kept \
+                     out of the pool for good, because the engine may still be reading it"
+                );
+                backing.leak();
+            }
+            Err(DisplayServiceError::from(error))
+        }
+    }
+}
+
 async fn destroy_surface<Device: DisplayDevice>(
     device: &Device,
     held: &mut ClaimResources,
-    framebuffer: FramebufferId,
+    surface: SurfaceSource,
 ) {
     let Some(index) = held
         .surfaces
         .iter()
-        .position(|record| record.framebuffer == framebuffer)
+        .position(|record| record.resource.source() == surface)
     else {
         return;
     };
@@ -457,20 +595,56 @@ async fn destroy_surface<Device: DisplayDevice>(
             "the display engine would not blank a scanout whose surface is going away"
         );
     }
+    release_resource(device, record.resource).await;
+}
+
+/// Let one surface's resource go once no output latches it: destroy a
+/// frame buffer, and drop the record's hold on a blob. The blob itself
+/// is the gpu path's to destroy, which it does only once no scanout
+/// holds it.
+async fn release_resource<Device: DisplayDevice>(device: &Device, resource: SurfaceResource) {
+    match resource {
+        SurfaceResource::Framebuffer { id, backing } => {
+            release_framebuffer(device, id, backing).await;
+        }
+        // The scanout was blanked before this, so nothing of the display
+        // engine reads the blob any more: the record's hold ends here,
+        // and a blob its handle already let go is destroyed after it.
+        SurfaceResource::Blob { hold, .. } => drop(hold),
+    }
+}
+
+/// Destroy one resource, and let its frame buffer go only if the display
+/// engine agreed.
+///
+/// A resource the engine would not destroy is one it may still latch,
+/// so the run behind it never goes back to the pool: the device is
+/// outside the kernel's trust, and a run handed to the next instance
+/// while the engine still reads it would put that instance's memory on
+/// the screen. The bytes are lost instead, and said so.
+async fn release_framebuffer<Device: DisplayDevice>(
+    device: &Device,
+    framebuffer: FramebufferId,
+    backing: Buffer,
+) {
     if let Err(error) = device.destroy_framebuffer(framebuffer).await {
-        tracing::warn!(
+        tracing::error!(
             %error,
-            "the display engine would not release a frame buffer its owner destroyed"
+            framebuffer = ?framebuffer,
+            bytes = backing.bytes(),
+            "the display engine would not release a frame buffer; its run is kept out of the \
+             pool for good, because the engine may still be reading it"
         );
+        backing.leak();
     }
 }
 
 /// Hand everything the claim held back to the machine.
 ///
-/// The order is what makes it safe to release the caller's pages
+/// The order is what makes it safe to drop the records' frame buffers
 /// afterwards: the pointer comes off, every output stops latching, and
 /// only then is a resource dropped. A device still reading a resource
-/// whose pages had gone back to a pool would put another instance's
+/// whose frames had gone back to a pool would put another instance's
 /// memory on the screen.
 async fn release_claim<Device: DisplayDevice>(device: &Device, held: &mut ClaimResources) {
     for scanout in &held.scanouts {
@@ -489,20 +663,16 @@ async fn release_claim<Device: DisplayDevice>(device: &Device, held: &mut ClaimR
             );
         }
     }
-    for record in &held.surfaces {
-        if let Err(error) = device.destroy_framebuffer(record.framebuffer).await {
-            tracing::warn!(
-                %error,
-                "the display engine would not release a frame buffer of a claim that ended"
-            );
-        }
+    let records = core::mem::take(&mut held.surfaces);
+    let surfaces = records.len();
+    for record in records {
+        release_resource(device, record.resource).await;
     }
     tracing::info!(
-        surfaces = held.surfaces.len(),
+        surfaces,
         scanouts = held.scanouts.len(),
         "display claim released"
     );
-    held.surfaces.clear();
     held.scanouts.clear();
 }
 
@@ -550,7 +720,10 @@ impl From<DisplayError> for DisplayServiceError {
             DisplayError::InvalidParameter | DisplayError::CursorSize { .. } => {
                 Self::UnsupportedMode
             }
-            DisplayError::RegionOutOfBounds { .. } => Self::OutOfBounds,
+            DisplayError::RegionOutOfBounds { .. } | DisplayError::BlobLayout { .. } => {
+                Self::OutOfBounds
+            }
+            DisplayError::BlobScanoutUnsupported => Self::NoBlobScanout,
             // Everything left is the display engine failing rather than
             // refusing: a resource the kernel's own bookkeeping named
             // and the device does not have, a backing the kernel built
@@ -559,6 +732,7 @@ impl From<DisplayError> for DisplayServiceError {
             // beyond giving the display back.
             DisplayError::Unspecified
             | DisplayError::UnknownFramebuffer(_)
+            | DisplayError::UnknownBlob(_)
             | DisplayError::UnexpectedResponse { .. }
             | DisplayError::TooManyBackingRanges { .. }
             | DisplayError::TooManyFramebuffers { .. }

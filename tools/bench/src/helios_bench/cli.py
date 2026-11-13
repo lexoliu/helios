@@ -58,8 +58,10 @@ def command_run(args: argparse.Namespace) -> int:
         sides=sides,
         workload_names=args.workloads,
         iterations=args.iterations,
+        rounds=args.rounds,
         runner_label=args.runner_label,
         allow_busy_host=args.allow_busy_host,
+        prebuilt=args.prebuilt,
         helios_timeout_seconds=args.helios_timeout_seconds,
         helios_side_timeout_seconds=args.helios_side_timeout_seconds,
         skip_linux_workloads=tuple(args.skip_linux_workloads),
@@ -78,6 +80,8 @@ def command_run(args: argparse.Namespace) -> int:
             args.baseline_rebuild_profile_use.resolve() if args.baseline_rebuild_profile_use else None
         ),
         plain_baseline=plain_baseline,
+        compiler_isa_level=args.compiler_isa_level,
+        profile_boot=not args.no_profile_boot,
     )
     report = run_suite(options, manifest, dry_run=args.dry_run)
     if report is None:
@@ -94,6 +98,10 @@ def command_lanes(args: argparse.Namespace) -> int:
     manifest = load_manifest()
     lanes = manifest.lanes if args.select == "all" else [manifest.lane(args.select)]
     if args.format == "github-matrix":
+        if args.select == "all":
+            # `all` is every lane a workflow can schedule; a lane without a
+            # hosted runner is run by hand and named explicitly.
+            lanes = [lane for lane in lanes if lane.shared_runner is not None]
         print(json.dumps([lane.github_matrix_entry() for lane in lanes]))
     else:
         for lane in lanes:
@@ -230,8 +238,38 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--sides", default="helios,linux_native,linux_wasmtime")
     run.add_argument("--workload", dest="workloads", action="append", default=[])
     run.add_argument("--iterations", type=int)
+    run.add_argument(
+        "--rounds",
+        type=int,
+        help="alternating rounds (an even number): each round times both sides once and consecutive "
+        "rounds swap which goes first; overrides the lane's `rounds`",
+    )
+    run.add_argument(
+        "--compiler-isa-level",
+        help="the name of the ISA level a counterpart naming {compiler_isa_level} compiles for, such as "
+        "x86-64-v4+vbmi+bitalg; for a run that does not time the helios side, whose guest otherwise "
+        "reports it",
+    )
     run.add_argument("--runner-label")
     run.add_argument("--allow-busy-host", action="store_true")
+    run.add_argument(
+        "--prebuilt",
+        action="store_true",
+        help=(
+            "build nothing on this host: the inspector, helios-cli, the kernel image, its "
+            "helios-bootfs and the native counterparts must already be in place, and the run "
+            "lists every one that is missing before it starts a guest"
+        ),
+    )
+    run.add_argument(
+        "--no-profile-boot",
+        action="store_true",
+        help=(
+            "skip the untimed second boot of every Helios unit that produces the kernel "
+            "profile, flamegraph and perf metrics (docs/benchmarks.md): for a run that only "
+            "wants timings. Timed boots run with no profiler either way"
+        ),
+    )
     run.add_argument("--helios-timeout-seconds", type=int, default=9000)
     run.add_argument("--helios-side-timeout-seconds", type=int, default=10800)
     run.add_argument(

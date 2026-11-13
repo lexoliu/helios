@@ -7,20 +7,20 @@
 //!
 //! Concurrency contract: the devices are discovered and programmed on
 //! the bootstrap hart before external interrupts are unmasked.
-//! Afterwards each reports on the PLIC source the device tree names,
-//! delivered to that same hart, which is why the kernel task that
-//! drains a device is local to it.
+//! Afterwards each reports on the PLIC line the device tree names, on
+//! the hart that takes that PLIC's interrupts. The kernel task that
+//! drains a device stays local to the bootstrap hart, which spawned it;
+//! the handler's notification wakes it from whichever hart that is.
 
 extern crate alloc;
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::num::NonZeroU32;
 
 use fdt::Fdt;
 use helios_kernel::ExternalInterruptHandler;
 
-use crate::net::InterruptSourceId;
+use crate::net::PlicInterrupt;
 
 /// The interrupt route's view of one input device.
 ///
@@ -33,9 +33,9 @@ pub(crate) struct VirtioInputDevice {
 }
 
 /// One input device the bootstrap hart brought up, together with the
-/// PLIC source the device tree routes it to.
+/// PLIC line the device tree routes it to.
 pub(crate) struct InputInterrupt {
-    pub(crate) source: InterruptSourceId,
+    pub(crate) line: PlicInterrupt,
     pub(crate) device: VirtioInputDevice,
 }
 
@@ -84,10 +84,9 @@ fn discover_input_devices(fdt: &Fdt<'_>) -> Vec<InputInterrupt> {
             let base = candidate.base;
             let header = core::ptr::NonNull::new(base as *mut u8)
                 .unwrap_or_else(|| panic!("virtio MMIO base {base:#x} was unexpectedly null"));
-            let source = candidate
+            let line = candidate
                 .interrupt
-                .and_then(|interrupt| NonZeroU32::new(interrupt.number))
-                .map(InterruptSourceId)
+                .and_then(PlicInterrupt::from_specifier)
                 .unwrap_or_else(|| {
                     panic!("virtio-input node at {base:#x} has no valid interrupt source")
                 });
@@ -96,7 +95,7 @@ fn discover_input_devices(fdt: &Fdt<'_>) -> Vec<InputInterrupt> {
                     panic!("failed to initialize virtio-input device at {base:#x}: {error}")
                 });
             InputInterrupt {
-                source,
+                line,
                 device: VirtioInputDevice {
                     inner: Arc::new(device),
                 },

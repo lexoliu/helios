@@ -57,8 +57,30 @@ INSTRUCTION_PROFILE_REPORT = re.compile(
 )
 # Beside each image's JSONL: how its boots were sampled, for the report.
 INSTRUCTION_SAMPLING_RECORD = "instruction-sampling.json"
+# The span profiler and the kernel counters cost every guest a stamp per
+# span, and the Linux guests carry nothing like it, so no timed boot runs
+# with them (#747). The kernel profile, its flamegraph and `perf.json` come
+# from a second boot of the same image and workloads that is never timed;
+# its own JSONL, which nothing reads, is kept in this directory under the
+# image's output directory, and what it booted is recorded beside the
+# image's JSONL for the report.
+PROFILE_BOOT_DIR = "profile-boot"
+PROFILE_BOOT_RECORD = "profile-boot.json"
+# What the inspector turns into guest profiling for a whole boot
+# (`workload-bench.sh` maps each to a `workload-bench` option). Every one
+# is withheld from a timed boot.
+TIMED_BOOT_PROFILE_VARIABLES = (
+    "HELIOS_WORKLOAD_BENCH_KERNEL_PROFILE_OUTPUT",
+    "HELIOS_WORKLOAD_BENCH_PERF_METRICS_OUTPUT",
+    "HELIOS_WORKLOAD_BENCH_PROFILE_OUTPUT",
+    "HELIOS_WORKLOAD_BENCH_USER_PROFILE_OUTPUT",
+)
 from tcp_echo_server import TcpEchoServer, start_tcp_echo_server
-from tcp_throughput_server import DEFAULT_PAYLOAD_BYTES, start_tcp_throughput_server
+from tcp_throughput_server import (
+    DEFAULT_PAYLOAD_BYTES,
+    start_tcp_download_server,
+    start_tcp_upload_server,
+)
 
 # Workload classes in the order the report lists them; each names the design
 # claim its workloads isolate (see docs/benchmarks.md).
@@ -156,11 +178,15 @@ def class_budget(remaining_seconds: float, classes_left: int, per_class_cap: int
     return max(0, min(per_class_cap, int(remaining_seconds // classes_left)))
 
 
-def side_boots(units: int, images: int, control_workload: dict | None) -> int:
+def side_boots(
+    units: int, images: int, control_workload: dict | None, profile_boot: bool
+) -> int:
     """Every boot the Helios side's budget has to cover.
 
     One per image per unit, plus the control workload before and after
-    for each image. The control boots are counted rather than reserved:
+    for each image, plus a second, untimed boot per image per unit when
+    the run takes the kernel profile (#747). The control boots are counted
+    rather than reserved:
     reserving them at the per-unit cap instead put two caps, 18 000
     seconds of them, in front of a three-hour side budget, and run
     33997256902 refused all forty-eight of its boots as over budget
@@ -170,7 +196,8 @@ def side_boots(units: int, images: int, control_workload: dict | None) -> int:
     them, and a boot that finishes early hands the rest back.
     """
     controls = 2 * images if control_workload is not None else 0
-    return units * images + controls
+    profiles = units * images if profile_boot else 0
+    return units * images + controls + profiles
 
 
 # How long a relayed stderr may stay open once its command's process
@@ -481,6 +508,7 @@ class HostEndpoints:
     local_http_url: str | None = None
     tcp_host: str | None = None
     tcp_port: int | None = None
+    tcp_upload_port: int | None = None
     tcp_echo_port: int | None = None
 
 
@@ -510,16 +538,19 @@ class HostServices:
                 http_url = f"http://{self.http_host}:{port}/{HTTP_PAYLOAD_FILE}"
                 local_http_url = f"http://127.0.0.1:{port}/{HTTP_PAYLOAD_FILE}"
             tcp_port = None
+            tcp_upload_port = None
             if self.tcp:
                 tcp_port = retain(
-                    start_tcp_throughput_server(HOST_SERVER_BIND_ADDRESS, 0, HTTP_LARGE_PAYLOAD_BYTES)
+                    start_tcp_download_server(HOST_SERVER_BIND_ADDRESS, 0, HTTP_LARGE_PAYLOAD_BYTES)
                 )
+                tcp_upload_port = retain(start_tcp_upload_server(HOST_SERVER_BIND_ADDRESS, 0))
             echo_port = retain(start_host_tcp_echo()) if self.tcp_echo else None
             yield HostEndpoints(
                 http_url=http_url,
                 local_http_url=local_http_url,
                 tcp_host=self.tcp_host if self.tcp or self.tcp_echo else None,
                 tcp_port=tcp_port,
+                tcp_upload_port=tcp_upload_port,
                 tcp_echo_port=echo_port,
             )
 
@@ -604,6 +635,21 @@ class HeliosUnit:
     key: str
     classes: list[str]
     names: list[str]
+
+
+class ProfileBootFailed(HeliosRunFailed):
+    """A profile boot that did not finish, after every timed record was taken.
+
+    Raised once the run's timed work is complete and written: `log` is the
+    first image's JSONL, whole, and the caller may finish its report from
+    it before ending the run with this failure. The run still fails — a
+    report whose kernel profile is missing is not the report that was asked
+    for.
+    """
+
+    def __init__(self, message: str, log: Path) -> None:
+        super().__init__(message)
+        self.log = log
 
 
 class IdenticalHeliosImages(RuntimeError):
@@ -957,7 +1003,18 @@ def run_helios(
     keep_going: bool,
     shared_endpoints: HostEndpoints | None = None,
     unit_orders: dict[str, str] | None = None,
+    *,
+    profile_boot: bool,
 ) -> Path:
+    """Times every image of the Helios side and returns the first image's JSONL.
+
+    With `profile_boot`, every image then boots each unit it finished a
+    second time, untimed, to produce the kernel profile and the perf
+    metrics (#747). Those boots run after every timed boot and control of
+    the run, and nothing they write is read as a timing. When one fails
+    the rest still run under `keep_going`, and the run then ends in
+    `ProfileBootFailed` with the timed records already on disk.
+    """
     paired = len(images) > 1
     units = helios_units(workloads, paired)
     if unit_orders:
@@ -1035,7 +1092,7 @@ def run_helios(
     # budget as it goes: nothing is reserved up front, so the first boot
     # sees the whole of it and each later one sees what its predecessors
     # handed back.
-    boots_left = side_boots(len(units), len(images), control_workload)
+    boots_left = side_boots(len(units), len(images), control_workload, profile_boot)
 
     def next_budget() -> int:
         nonlocal boots_left
@@ -1043,7 +1100,14 @@ def run_helios(
         boots_left -= 1
         return budget
 
-    def run_boot(image: HeliosImage, log: Path, classes: list[str], names: list[str], budget: int) -> None:
+    def run_boot(
+        image: HeliosImage,
+        log: Path,
+        classes: list[str],
+        names: list[str],
+        budget: int,
+        profile_for: Path | None = None,
+    ) -> None:
         scope = nullcontext(shared_endpoints) if shared_endpoints is not None else host_services.serve()
         with scope as endpoints:
             boot = run_helios_once(
@@ -1058,10 +1122,12 @@ def run_helios(
                 endpoints.http_url,
                 endpoints.tcp_host,
                 endpoints.tcp_port,
+                endpoints.tcp_upload_port,
                 endpoints.tcp_echo_port,
                 timeout_seconds=budget,
                 keep_going=keep_going,
                 paired=paired,
+                profile_for=profile_for,
             )
         record_sampled(image, boot)
 
@@ -1157,6 +1223,78 @@ def run_helios(
             file=sys.stderr,
             flush=True,
         )
+
+    if not profile_boot:
+        for image in images:
+            # A record left by an earlier run into this directory would
+            # tell the report these artifacts came from a boot this run
+            # did not take.
+            (image.out_dir / PROFILE_BOOT_RECORD).unlink(missing_ok=True)
+        return images[0].log()
+
+    # The profile boots come last, so that nothing a timed boot or a
+    # control measured sat behind a profiled one, and every timed record
+    # of the run is already written when one of them can fail. A unit
+    # whose timed boot was lost is not booted again: a guest that just
+    # died on it would spend the budget a second time. Nothing a profile
+    # boot writes is a timing: its own JSONL goes under `profile-boot/`,
+    # where no reader looks, and only the kernel profile and the perf
+    # metrics land beside the timed logs, under their names.
+    profiled: dict[str, list[str]] = {image.name: [] for image in images}
+    profile_failed: dict[str, dict[str, str]] = {image.name: {} for image in images}
+    stopped = False
+    for unit in units:
+        for image in images:
+            if stopped or f"{image.name}/{unit.key}" in lost:
+                continue
+            timed_log = image.log(unit.key)
+            profile_log = image.out_dir / PROFILE_BOOT_DIR / timed_log.name
+            profile_log.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                budget = next_budget()
+                if budget <= 0:
+                    raise HeliosRunFailed(
+                        "the Helios side's budget was spent before this boot could run"
+                    )
+                run_boot(image, profile_log, unit.classes, unit.names, budget, timed_log)
+                profiled[image.name].append(unit.key)
+            except HeliosRunFailed as error:
+                print(
+                    f"helios image {image.name!r} unit {unit.key!r}: the profile boot did not "
+                    f"finish, so its kernel profile and perf metrics are missing: {error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                profile_failed[image.name][unit.key] = str(error)
+                # Without `keep_going` the first failure ends the run, the
+                # way a lost timed boot does; with it, every other unit
+                # still gets its profile before the run fails.
+                stopped = not keep_going
+    for image in images:
+        (image.out_dir / PROFILE_BOOT_RECORD).write_text(
+            json.dumps(
+                {
+                    "timed": False,
+                    "iterations": iterations,
+                    "units": profiled[image.name],
+                    "failed": sorted(profile_failed[image.name]),
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    failures = [
+        f"{name}/{key}: {error}"
+        for name, units_failed in profile_failed.items()
+        for key, error in units_failed.items()
+    ]
+    if failures:
+        raise ProfileBootFailed(
+            "the profile boots of these units failed, so they have no kernel profile or perf "
+            "metrics; every timed record of the run is complete: " + "; ".join(failures),
+            images[0].log(),
+        )
     return images[0].log()
 
 
@@ -1248,13 +1386,29 @@ def run_helios_once(
     host_http_url: str | None,
     host_tcp_host: str | None,
     host_tcp_port: int | None,
+    host_tcp_upload_port: int | None,
     host_tcp_echo_port: int | None,
     timeout_seconds: int,
     keep_going: bool,
     paired: bool,
+    profile_for: Path | None = None,
 ) -> SampledBoot | None:
-    """Boots `image` once for `names`; what its sampler captured, if it ran."""
+    """Boots `image` once for `names`; what its sampler captured, if it ran.
+
+    A timed boot (`profile_for` is None) is asked for no profile of any
+    kind, whatever its caller's environment names: the span profiler and
+    the kernel counters would be inside every iteration (#747). The
+    profile boot of the same unit passes the timed boot's log as
+    `profile_for`; the kernel profile and the perf metrics are written
+    under that log's name, so the artifacts keep one name however they
+    were produced, and `log` is only where this boot's own, never-read
+    records go. It does not sample instructions: the sampler stays a
+    property of the timed boots, whose timings carry it.
+    """
     env = os.environ.copy()
+    if profile_for is None:
+        for variable in TIMED_BOOT_PROFILE_VARIABLES:
+            env[variable] = ""
     env["HELIOS_WORKLOAD_BENCH_ARCH"] = arch
     if accel:
         # The inspector requires the profile's native accelerator when
@@ -1267,9 +1421,12 @@ def run_helios_once(
     # the run was asked for is this checkout's.
     env["HELIOS_WORKLOAD_BENCH_MANIFEST"] = str(Path(manifest).resolve())
     env["HELIOS_WORKLOAD_BENCH_LOG"] = str(log)
-    env["HELIOS_WORKLOAD_BENCH_KERNEL_PROFILE_OUTPUT"] = str(log.with_suffix(".kernel.folded"))
-    env["HELIOS_WORKLOAD_BENCH_PERF_METRICS_OUTPUT"] = str(log.with_suffix(".perf.json"))
-    sampling = samples_instructions(arch)
+    if profile_for is not None:
+        env["HELIOS_WORKLOAD_BENCH_KERNEL_PROFILE_OUTPUT"] = str(
+            profile_for.with_suffix(".kernel.folded")
+        )
+        env["HELIOS_WORKLOAD_BENCH_PERF_METRICS_OUTPUT"] = str(profile_for.with_suffix(".perf.json"))
+    sampling = profile_for is None and samples_instructions(arch)
     profile = log.with_suffix(".pc.folded")
     if sampling:
         # Beside the scoped profile, the functions the processors were
@@ -1288,8 +1445,10 @@ def run_helios_once(
         # and raw debug-serial capture overwrite the first's — so a
         # failure in the earlier boot leaves no evidence. The image's own
         # name is part of the path because a paired run boots the same
-        # unit twice.
-        env["HELIOS_WORKLOAD_BENCH_RUNTIME_DIR"] = str(Path(runtime_dir) / image.name / log.stem)
+        # unit twice, and its profile boot is a third.
+        env["HELIOS_WORKLOAD_BENCH_RUNTIME_DIR"] = str(
+            Path(runtime_dir) / image.name / (log.stem if profile_for is None else f"{log.stem}-profile")
+        )
     if classes:
         env["HELIOS_WORKLOAD_BENCH_CLASSES"] = ",".join(classes)
     if names:
@@ -1300,6 +1459,8 @@ def run_helios_once(
         env["HELIOS_WORKLOAD_BENCH_HOST_TCP_HOST"] = host_tcp_host
     if host_tcp_port is not None:
         env["HELIOS_WORKLOAD_BENCH_HOST_TCP_PORT"] = str(host_tcp_port)
+    if host_tcp_upload_port is not None:
+        env["HELIOS_WORKLOAD_BENCH_HOST_TCP_UPLOAD_PORT"] = str(host_tcp_upload_port)
     if host_tcp_echo_port is not None:
         env["HELIOS_WORKLOAD_BENCH_HOST_TCP_ECHO_PORT"] = str(host_tcp_echo_port)
     if keep_going:
@@ -1338,6 +1499,7 @@ def run_linux(
     host_http_url: str | None,
     host_tcp_host: str | None,
     linux_tcp_port: int | None,
+    linux_tcp_upload_port: int | None,
     linux_tcp_echo_port: int | None,
     quickjs_source_archive: Path | None,
     wasmtime_linux_bin: Path | None,
@@ -1347,6 +1509,8 @@ def run_linux(
     native_bin_dir: Path | None,
     control_workload: dict | None,
     keep_going: bool,
+    compiler_plugin_wasm: Path | None,
+    compiler: runner.CompilerRequest,
 ) -> tuple[Path | None, Path | None, dict]:
     return run_fedora_qemu_linux(
         repo_root(),
@@ -1365,6 +1529,7 @@ def run_linux(
         host_http_url,
         host_tcp_host,
         linux_tcp_port,
+        linux_tcp_upload_port,
         linux_tcp_echo_port,
         quickjs_source_archive,
         wasmtime_linux_bin,
@@ -1374,6 +1539,8 @@ def run_linux(
         native_bin_dir=native_bin_dir,
         control_workload=control_workload,
         keep_going=keep_going,
+        compiler_plugin_wasm=compiler_plugin_wasm,
+        compiler=compiler,
     )
 
 
@@ -1434,6 +1601,22 @@ def parse_jsonl(path: Path | None) -> tuple[dict, dict[str, dict]]:
     return run_record, summaries
 
 
+def guest_isa_level_name(run_record: dict) -> str:
+    """The ISA level name a Helios side's `run` record says its guest compiled for.
+
+    The record's `level` and `extras` are the name split at its `+`
+    (`IsaLevel::base_name` and `IsaLevel::extras` in `artifact/src/isa.rs`), so
+    joining them gives the exact name the kernel sends the compiler plugin.
+    """
+    guest_isa = run_record.get("guest_isa")
+    if guest_isa is None:
+        raise SystemExit(
+            "the Helios run record carries no `guest_isa`, so the ISA level the Linux compile asks for "
+            "is not known"
+        )
+    return "+".join([guest_isa["level"], *guest_isa["extras"]])
+
+
 def parse_linux_jsonl(path: Path | None) -> dict[str, dict]:
     """Per-workload summaries of one Linux side, keyed by workload name.
 
@@ -1458,6 +1641,16 @@ def parse_linux_jsonl(path: Path | None) -> dict[str, dict]:
                     "metrics": metrics.get(record["workload"], []),
                 }
     return summaries
+
+
+def read_profile_boot_record(helios_jsonl: Path | None) -> dict | None:
+    """What the run's profile boots booted, or None when it took none."""
+    if helios_jsonl is None:
+        return None
+    record = helios_jsonl.parent / PROFILE_BOOT_RECORD
+    if not record.is_file():
+        return None
+    return json.loads(record.read_text(encoding="utf-8"))
 
 
 def helios_perf_metric_paths(helios_jsonl: Path | None) -> list[Path]:
@@ -1778,6 +1971,7 @@ def write_summary_json(
     component_heap: list[dict],
     helios_kernel_flamegraphs: list[Path],
     helios_kernel_profile_top: list[dict],
+    helios_profile_boot: dict | None,
 ) -> None:
     payload = {
         "schema_version": 1,
@@ -1829,6 +2023,10 @@ def write_summary_json(
         ],
         "wasm_simd": wasm_simd_provenance(manifest, workloads),
         "quickjs_simd_fairness": quickjs_simd_fairness(linux_provenance),
+        # Which boot the kernel profile, the flamegraphs and the perf
+        # metrics above came from: an untimed second boot of the same
+        # workloads (#747), or null when the run took no profile boot.
+        "helios_profile_boot": helios_profile_boot,
         "helios_kernel_flamegraphs": [str(path) for path in helios_kernel_flamegraphs],
         "helios_kernel_profile_top": [
             {
@@ -2080,6 +2278,7 @@ def write_report(
     perf_metric_paths = helios_perf_metric_paths(helios_jsonl)
     helios_kernel_flamegraphs = render_helios_kernel_flamegraphs(helios_jsonl)
     helios_kernel_profile_top = helios_kernel_profile_top_rows(helios_jsonl)
+    helios_profile_boot = read_profile_boot_record(helios_jsonl)
     baseline_label = linux_baseline_label(linux_provenance)
     svg_path = path.with_name("helios-vs-linux.svg")
     write_svg(svg_path, rows, baseline_label)
@@ -2102,6 +2301,7 @@ def write_report(
         component_heap,
         helios_kernel_flamegraphs,
         helios_kernel_profile_top,
+        helios_profile_boot,
     )
     lines = [
         "# Helios vs Fedora QEMU Linux and Wasmtime Benchmark",
@@ -2344,6 +2544,13 @@ def write_report(
             f"- Wasmtime-on-Linux raw iteration timings are in `{wasmtime_linux_json or 'not-run'}`.",
         ]
     )
+    if helios_profile_boot is not None:
+        lines.append(
+            "- The Helios perf metrics, kernel profile and flamegraphs below come from a "
+            f"second, untimed boot of the same workloads ({helios_profile_boot['iterations']} "
+            "iterations each, recorded in `profile-boot.json`); no timed iteration ran with "
+            "them enabled."
+        )
     for perf_path in perf_metric_paths:
         lines.append(f"- Helios perf metrics are in `{perf_path}`.")
     if helios_jsonl:
@@ -2428,7 +2635,35 @@ def build_parser() -> argparse.ArgumentParser:
         "--native-bin-dir",
         type=Path,
         default=None,
-        help="Static Linux binaries from tools/bench/native/build.sh; defaults to artifacts/bench-native/<guest-arch>.",
+        help="Linux binaries from tools/bench/native/build.sh; defaults to artifacts/bench-native/<guest-arch>.",
+    )
+    parser.add_argument(
+        "--compiler-plugin-wasm",
+        type=Path,
+        default=None,
+        help=(
+            "The compiler plugin's core module (kernel-prebuild's compiler_plugin.wasm) that a "
+            "Linux counterpart naming {compiler_plugin} hosts."
+        ),
+    )
+    parser.add_argument(
+        "--compiler-target",
+        default=None,
+        help="The Helios kernel target triple a counterpart naming {compiler_target} compiles for.",
+    )
+    parser.add_argument(
+        "--compiler-isa-level",
+        default=None,
+        help=(
+            "The name of the ISA level the Helios guest compiled for, such as x86-64-v4+vbmi+bitalg, "
+            "that a counterpart naming {compiler_isa_level} compiles for."
+        ),
+    )
+    parser.add_argument(
+        "--compiler-workers",
+        type=int,
+        default=None,
+        help="The kernel's compiler worker count a counterpart naming {compiler_workers} compiles with.",
     )
     parser.add_argument("--linux-vm-qemu-bin", default=None)
     parser.add_argument(
@@ -2583,6 +2818,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--helios-no-profile-boot",
+        action="store_true",
+        help=(
+            "Take no kernel profile, flamegraph or perf metrics. By default every "
+            "Helios image boots each unit a second time after all timed boots, "
+            "untimed and with the span profiler on, to produce them: no timed "
+            "boot runs with profiling, because the Linux columns carry nothing "
+            "like it (#747). This skips that second boot, for a run that only "
+            "wants timings."
+        ),
+    )
+    parser.add_argument(
         "--helios-skip-build",
         action="store_true",
         help=(
@@ -2643,6 +2890,8 @@ def main() -> None:
             "--helios-baseline-out-dir needs --helios-baseline-root, --helios-profile-use or "
             "--helios-baseline-without-kernel-profile"
         )
+    if args.helios_no_profile_boot and args.skip_helios:
+        raise SystemExit("--helios-no-profile-boot has no profile boot to skip under --skip-helios")
     if args.helios_baseline_without_kernel_profile and args.skip_helios:
         raise SystemExit("--helios-baseline-without-kernel-profile has nothing to build under --skip-helios")
     if args.helios_baseline_root is not None:
@@ -2758,6 +3007,7 @@ def main() -> None:
 
     with services.serve() as endpoints:
         helios_jsonl = None
+        profile_failure: ProfileBootFailed | None = None
         linux_json = None
         wasmtime_linux_json = None
         linux_provenance = None
@@ -2825,24 +3075,41 @@ def main() -> None:
                 raise SystemExit(
                     "--helios-unit-order orders the images of a paired run; this run times one image"
                 )
-            helios_jsonl = run_helios(
-                args.manifest,
-                images,
-                args.iterations,
-                workloads,
-                args.arch,
-                args.helios_accel,
-                services,
-                args.helios_timeout_seconds,
-                args.helios_side_timeout_seconds,
-                args.helios_build_timeout_seconds,
-                args.helios_skip_build,
-                control_workload,
-                args.keep_going,
-                shared_endpoints=endpoints if args.reuse_host_listeners else None,
-                unit_orders=args.helios_unit_orders,
-            )
+            try:
+                helios_jsonl = run_helios(
+                    args.manifest,
+                    images,
+                    args.iterations,
+                    workloads,
+                    args.arch,
+                    args.helios_accel,
+                    services,
+                    args.helios_timeout_seconds,
+                    args.helios_side_timeout_seconds,
+                    args.helios_build_timeout_seconds,
+                    args.helios_skip_build,
+                    control_workload,
+                    args.keep_going,
+                    shared_endpoints=endpoints if args.reuse_host_listeners else None,
+                    unit_orders=args.helios_unit_orders,
+                    profile_boot=not args.helios_no_profile_boot,
+                )
+            except ProfileBootFailed as error:
+                # Every timed record is on disk and complete, so the report
+                # is still written from them; the run ends failed below.
+                helios_jsonl = error.log
+                profile_failure = error
         if not args.skip_linux:
+            compiler_isa_level = args.compiler_isa_level
+            if not args.skip_helios:
+                # The level is the processor's, so the Linux compile asks for
+                # the one this invocation's Helios guest just reported.
+                if compiler_isa_level is not None:
+                    raise SystemExit(
+                        "--compiler-isa-level names the level of a run that does not time Helios; "
+                        "this run times it, and the Linux compile follows the level its guest reports"
+                    )
+                compiler_isa_level = guest_isa_level_name(parse_jsonl(helios_jsonl)[0])
             linux_json, wasmtime_linux_json, linux_provenance = run_linux(
                 args.manifest,
                 out_dir,
@@ -2860,6 +3127,7 @@ def main() -> None:
                 endpoints.http_url,
                 endpoints.tcp_host,
                 endpoints.tcp_port,
+                endpoints.tcp_upload_port,
                 endpoints.tcp_echo_port,
                 args.quickjs_source_archive,
                 args.wasmtime_linux_bin,
@@ -2869,6 +3137,8 @@ def main() -> None:
                 args.native_bin_dir,
                 control_workload,
                 args.keep_going,
+                args.compiler_plugin_wasm,
+                runner.CompilerRequest(args.compiler_target, args.compiler_workers, compiler_isa_level),
             )
         if args.wasmtime_profile_workload:
             wasmtime_profiles = run_wasmtime_profiles(
@@ -2895,6 +3165,8 @@ def main() -> None:
             wasmtime_profiles,
         )
         print(report)
+        if profile_failure is not None:
+            raise profile_failure
 
 
 if __name__ == "__main__":

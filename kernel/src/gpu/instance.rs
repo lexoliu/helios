@@ -1,168 +1,146 @@
-//! One instance's hold on the machine's 3D engine.
+//! One instance's session on the machine's 3D engine.
 //!
-//! What an instance's store carries for the renderer is small: the
-//! claim itself and the arena its command buffers and guest blobs are
-//! pinned in, which is also where the host's own blob storage is
-//! mapped. Both are needed together, because all of that lives *inside*
-//! that instance's linear memory and the arena is what says where.
+//! What an instance's store carries for the renderer is small: its
+//! session, how many `gpu` handles hold it open, and the set of views —
+//! command buffers, guest blobs, aperture placements — that ends when
+//! the session does. The views live in the store's [`ViewTable`]; the
+//! buffers behind them are held by the handles that name them and by
+//! the requests that have the device read them.
+//!
+//! One session per instance, however many `gpu` handles it opens: a
+//! second `open` is another handle onto the session the first made, so
+//! the instance's own bounds on contexts and blobs are bounds on what
+//! the instance holds rather than on what one of its handles does.
 //!
 //! # Concurrency contract
 //!
 //! Store state is owned by the one task running the instance, so
-//! nothing here is shared and nothing here locks. The claim word and
-//! the request queues behind [`Gpu3dClaim`] are the shared part and
-//! carry their own synchronisation.
+//! nothing here is shared and nothing here locks. The session record
+//! and the request queues behind [`Gpu3dSession`] are the shared part
+//! and carry their own synchronisation.
 //!
-//! # What a drop has to do, and what it must not
+//! # What an end has to do, and what it must not
 //!
-//! Dropping this — which is what killing an instance does — has to end
-//! with the renderer holding nothing of this instance's, and it cannot
-//! await anything. So it does neither of the two obvious things: it
-//! does not tell the device (that is asynchronous) and it does not
-//! free the pages (the renderer may still be reading a guest blob).
-//! It hands the arena to the owner task and raises the release signal;
-//! the owner destroys the contexts, unmaps and destroys the blobs, and
-//! only then lets the arena go, which is the point at which the pages
-//! are the instance's pool's again.
+//! Ending the session while the instance lives — its last `gpu` handle
+//! dropped — ends every view of the session first: an aperture
+//! placement must not stay shown in the instance's memory once the owner
+//! task takes the blob out of the aperture, and a buffer shown nowhere
+//! goes back to the pool as soon as the device has let go of it. Dying
+//! ends them the same way, earlier: the store's view table is dropped
+//! before this, so every span is withdrawn by the time the session's
+//! drop raises the release. Neither path awaits the device; the owner
+//! task destroys the session's contexts, unmaps and destroys its blobs,
+//! and drops its references to their buffers.
 
-use helios_hal::device::DeviceRegion;
+use crate::buffer::{ViewError, ViewGroup, ViewTable};
 
-use crate::device::DeviceWindow;
-use crate::pins::PinnedRun;
-use crate::process::GpuClaimCap;
+use crate::process::GpuOpenCap;
 
-use super::service::{Gpu3dClaim, Gpu3dService};
-use super::{Gpu3dServiceError, GpuPins};
+use super::{Gpu3dServiceError, MAX_GPU_VIEWS};
+
+use super::service::{Gpu3dService, Gpu3dSession, SessionId};
 
 /// One instance's side of the 3D path.
 #[derive(Default)]
 pub struct Gpu3dOwnership {
-    /// The 3D engine, once this instance claimed it.
-    claim: Option<Gpu3dClaim>,
-    /// Where its command buffers, guest blobs and mapped host windows
-    /// live. Present exactly when `claim` is.
-    pins: Option<GpuPins>,
+    /// The session, once this instance opened one.
+    session: Option<Gpu3dSession>,
+    /// The set of views that ends when the session does. Present
+    /// exactly when `session` is.
+    views: Option<ViewGroup>,
+    /// How many `gpu` handles hold the session open.
+    handles: usize,
 }
 
 impl Gpu3dOwnership {
     pub const fn new() -> Self {
         Self {
-            claim: None,
-            pins: None,
+            session: None,
+            views: None,
+            handles: 0,
         }
     }
 
-    /// Whether this instance holds the 3D engine.
-    pub const fn holds_gpu(&self) -> bool {
-        self.claim.is_some()
+    /// Whether this instance has a session open.
+    pub const fn is_open(&self) -> bool {
+        self.session.is_some()
     }
 
-    /// The window this instance's renderer state lives in, while it
-    /// holds the engine. There is no window before a claim: an instance
-    /// that renders nothing is an ordinary instance and pays nothing
-    /// for the path existing.
-    pub fn window(&self) -> Option<DeviceWindow> {
-        self.pins.as_ref().map(GpuPins::window)
-    }
-
-    /// How many bytes of this instance's memory its pinned runs and
-    /// device windows hold.
-    pub fn pinned_bytes(&self) -> u64 {
-        self.pins.as_ref().map_or(0, GpuPins::pinned_bytes)
-    }
-
-    /// Take exclusive ownership of the machine's 3D engine, with
-    /// `window` as the span of this instance's linear memory its
-    /// command buffers and mapped blobs go in.
+    /// Open this instance's session, or hold the open one once more.
     ///
-    /// Refused when this instance already holds it — a second claim
-    /// would make the release ambiguous — and when somebody else does.
-    pub fn claim(
+    /// `views` is the set every view of a new session goes in; it is
+    /// unused when the session is already open, whose set it already
+    /// has.
+    pub fn open(
         &mut self,
         service: &Gpu3dService,
-        window: DeviceWindow,
-        cap: GpuClaimCap,
-    ) -> Result<(), Gpu3dServiceError> {
-        if self.claim.is_some() {
-            return Err(Gpu3dServiceError::AlreadyClaimed);
+        views: impl FnOnce() -> ViewGroup,
+        cap: GpuOpenCap,
+    ) -> Result<SessionId, Gpu3dServiceError> {
+        if self.session.is_none() {
+            self.session = Some(service.open(cap)?);
+            self.views = Some(views());
         }
-        let claim = service.claim(cap)?;
-        self.pins = Some(GpuPins::new(window));
-        self.claim = Some(claim);
+        self.handles += 1;
+        Ok(self.session_ref()?.id())
+    }
+
+    /// The session, or the reason there is none.
+    pub fn session_ref(&self) -> Result<&Gpu3dSession, Gpu3dServiceError> {
+        self.session.as_ref().ok_or(Gpu3dServiceError::SessionEnded)
+    }
+
+    /// The session, if it is the one `id` names.
+    pub fn session_of(&self, id: SessionId) -> Result<&Gpu3dSession, Gpu3dServiceError> {
+        match &self.session {
+            Some(session) if session.id() == id => Ok(session),
+            _ => Err(Gpu3dServiceError::SessionEnded),
+        }
+    }
+
+    /// Whether `id` names the session that is open now.
+    pub fn is_current(&self, id: SessionId) -> bool {
+        self.session_of(id).is_ok()
+    }
+
+    /// The set the session's views go in, or the reason there is none.
+    pub fn views(&self) -> Result<ViewGroup, Gpu3dServiceError> {
+        self.views.ok_or(Gpu3dServiceError::SessionEnded)
+    }
+
+    /// The set the session's next view goes in, refused once the
+    /// session shows [`MAX_GPU_VIEWS`]: the session's share of the
+    /// store's table, which a plugin creating command buffers without
+    /// bound would otherwise take from the store's other paths.
+    pub fn room_for_view(&self, table: &ViewTable) -> Result<ViewGroup, Gpu3dServiceError> {
+        let group = self.views()?;
+        if table.group_len(group) >= MAX_GPU_VIEWS {
+            return Err(Gpu3dServiceError::TooManyViews);
+        }
+        Ok(group)
+    }
+
+    /// Let one `gpu` handle of session `id` go, ending the session when
+    /// it was the last.
+    ///
+    /// A handle of a session that has already ended changes nothing.
+    /// Ending a session ends every view of it first, then the session's
+    /// drop raises the release. Fails, holding on to the session, only
+    /// when a view cannot be ended for want of memory to put back.
+    pub fn close(&mut self, id: SessionId, views: &mut ViewTable) -> Result<(), ViewError> {
+        if !self.is_current(id) {
+            return Ok(());
+        }
+        if self.handles > 1 {
+            self.handles -= 1;
+            return Ok(());
+        }
+        if let Some(group) = self.views {
+            views.end_group(group)?;
+        }
+        self.views = None;
+        self.session = None;
+        self.handles = 0;
         Ok(())
-    }
-
-    /// The claim, or the reason there is none.
-    pub fn claim_ref(&self) -> Result<&Gpu3dClaim, Gpu3dServiceError> {
-        self.claim.as_ref().ok_or(Gpu3dServiceError::NotClaimed)
-    }
-
-    /// Commit a physically contiguous run of `bytes` from this
-    /// instance's pool.
-    ///
-    /// The one kind of pin the renderer's own memory takes: a command
-    /// buffer the instance writes and the device reads, and a guest
-    /// blob's backing store, are the same thing to the arena.
-    pub fn pin(&mut self, bytes: u64) -> Result<PinnedRun, Gpu3dServiceError> {
-        self.pins
-            .as_mut()
-            .ok_or(Gpu3dServiceError::NotClaimed)?
-            .pin(bytes)
-            .map_err(Gpu3dServiceError::from)
-    }
-
-    /// Map `region` — a window the display engine published — into this
-    /// instance's window.
-    ///
-    /// Nothing is allocated and nothing is charged: the bytes behind
-    /// the region are the renderer's, placed in the engine's
-    /// host-visible aperture, and this arena holds only the path to
-    /// them.
-    pub fn map_blob(&mut self, region: DeviceRegion) -> Result<PinnedRun, Gpu3dServiceError> {
-        self.pins
-            .as_mut()
-            .ok_or(Gpu3dServiceError::NotClaimed)?
-            .map_device(region)
-            .map_err(Gpu3dServiceError::from)
-    }
-
-    /// Hand one run back: unmaps a device window or releases pinned
-    /// pages, whichever the frame is.
-    ///
-    /// Called once the renderer has let the resource go, never before:
-    /// a blob unmapped while the engine still places it would leave the
-    /// device decoding a span that no longer names anything.
-    pub fn unpin(&mut self, frame: PinnedRun) {
-        if let Some(pins) = self.pins.as_mut() {
-            pins.unpin(frame);
-        }
-    }
-
-    /// Give the 3D engine back.
-    ///
-    /// The same path a death takes, so the two cannot diverge: the
-    /// arena goes to the owner task, the claim's drop raises the
-    /// release, and the pages come back to the pool once the renderer
-    /// has let everything go.
-    pub fn release(&mut self) {
-        self.hand_back();
-        self.claim = None;
-    }
-
-    /// Hand the arena to the owner task, if there is one to hand.
-    fn hand_back(&mut self) {
-        let (Some(claim), Some(pins)) = (self.claim.as_ref(), self.pins.take()) else {
-            return;
-        };
-        claim.return_pins(pins);
-    }
-}
-
-impl Drop for Gpu3dOwnership {
-    fn drop(&mut self) {
-        // Before `claim` is dropped, because dropping it is what tells
-        // the owner task to look: an arena handed over afterwards would
-        // arrive at a task that had already finished releasing.
-        self.hand_back();
     }
 }

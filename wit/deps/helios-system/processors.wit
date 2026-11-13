@@ -1,0 +1,79 @@
+package helios:system@0.1.0;
+
+/// The machine's processors: which exist, which run, and taking one out
+/// of service and back.
+///
+/// The possible set is every processor the machine can ever run, fixed
+/// at boot; the online set is the part of it the kernel schedules on
+/// now. An offline either completes or leaves the machine as it was,
+/// and transitions are serialised machine-wide, so a call that returns
+/// has seen its own transition settle.
+interface processors {
+  /// A processor's index in the machine's processor table, the `id`
+  /// `stats` reports utilization under.
+  type processor-id = u32;
+
+  record processor-sets {
+    /// How many processors the machine can ever run: the possible set
+    /// is `0..possible`.
+    possible: u32,
+    /// The bootstrap processor, which never goes offline.
+    bootstrap: processor-id,
+    /// The processors online when the call read the set, ascending.
+    online: list<processor-id>,
+  }
+
+  /// Why a processor refused to go offline. It stays online and nothing
+  /// it owns has changed.
+  ///
+  /// One case per refusal the kernel's lifecycle can give: a refusal
+  /// the kernel adds is a case added here, never folded into another.
+  variant offline-refusal {
+    /// Tasks pinned to the processor are still alive; their futures
+    /// cannot move to another one. Carries how many.
+    pinned-tasks(u64),
+    /// The machine has a network interface whose service is not up yet,
+    /// so the queue pair the processor drains cannot be handed off.
+    /// Asked again once the interface is up, the offline proceeds.
+    network-starting,
+  }
+
+  variant offline-error {
+    /// The machine has no such processor. Carries the size of the
+    /// possible set.
+    not-possible(u32),
+    /// The bootstrap processor stays online.
+    bootstrap,
+    /// The call ran on the processor it asked to take offline; another
+    /// online processor has to initiate it.
+    current-processor,
+    /// The processor is not online.
+    not-online,
+    /// The processor refused, and stays online.
+    refused(offline-refusal),
+    /// The caller does not hold the right to control processors.
+    denied,
+  }
+
+  variant online-error {
+    /// The machine has no such processor. Carries the size of the
+    /// possible set.
+    not-possible(u32),
+    /// The processor is not offline.
+    not-offline,
+    /// The caller does not hold the right to control processors.
+    denied,
+  }
+
+  /// The possible and online sets.
+  sets: func() -> processor-sets;
+
+  /// Takes `processor` offline: it hands its timers and queued work to
+  /// the processor the call runs on and stops. Returns once it has
+  /// stopped, or with the reason it did not.
+  offline: async func(processor: processor-id) -> result<_, offline-error>;
+
+  /// Brings `processor` online, starting it if it has never run.
+  /// Returns once it has joined the online set.
+  online: async func(processor: processor-id) -> result<_, online-error>;
+}

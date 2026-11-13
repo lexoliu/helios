@@ -12,14 +12,19 @@ mod exceptions;
 mod extended_state;
 mod gpu;
 mod host_fs;
+mod hotplug;
 mod input;
 mod ioapic;
 mod iommu;
+mod memory_type;
+mod mtrr;
 mod net;
 mod pci;
 mod rtc;
 mod smp;
 mod snd;
+mod tpm;
+mod vmgenid;
 mod vsock;
 mod watchdog;
 
@@ -27,29 +32,40 @@ mod debug_state {
     /// The network service this machine's virtio-net function backs.
     pub(crate) type NetworkService =
         helios_kernel::NetworkService<crate::X86Cpu, crate::net::VirtioNetworkDevice>;
-    pub(crate) type RuntimeState = helios_kernel::HostRuntimeState<
-        crate::X86Cpu,
-        NetworkService,
-        crate::host_fs::HostFileSystemService,
-    >;
-    pub(crate) type ProgramService = helios_kernel::UserProgramService<
-        crate::X86Cpu,
-        NetworkService,
-        crate::host_fs::HostFileSystemService,
-    >;
+    pub(crate) type RuntimeState =
+        helios_kernel::HostRuntimeState<crate::X86Cpu, NetworkService, Storage>;
+    pub(crate) type ProgramService =
+        helios_kernel::UserProgramService<crate::X86Cpu, NetworkService, Storage>;
+
+    /// This machine's storage: the virtio-9p host share and the
+    /// virtio-blk disks.
+    #[derive(Clone, Copy)]
+    pub(crate) struct Storage;
+
+    impl helios_kernel::Storage for Storage {
+        type HostShare = crate::host_fs::HostFileSystemService;
+        type Disk = crate::block::X86VirtioBlockDevice;
+    }
 }
 
+use acpi::sdt::madt::Madt;
+use acpi::{AcpiTables, PhysicalMapping};
 use alloc::sync::Arc;
 use core::arch::asm;
 use core::arch::global_asm;
 use core::arch::x86_64::{__cpuid, __cpuid_count, _rdrand64_step, _rdtsc};
 use core::ops::Range;
-use core::sync::atomic::{Ordering, compiler_fence};
-use helios_hal::boot::{BootMemoryMap, BootReservedRanges, usable_region_segments};
+use core::sync::atomic::{AtomicU8, Ordering, compiler_fence};
+use helios_artifact::{ProbeAnswers, cwasm_target_isa_levels};
+use helios_firmware::{AcpiNuma, LocalApicKey, ProcessorIdentities};
+use helios_hal::boot::{
+    BootMemoryMap, BootReservedRanges, usable_node_regions, usable_region_segments,
+};
 use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase, TimerInterrupt, current_processor};
 use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
 use helios_hal::memory::MemoryRegion;
+use helios_hal::numa::NumaTopology;
 use helios_hal::serial::ByteSerial;
 use helios_hal::watchdog::Watchdog;
 use helios_hal::{
@@ -182,6 +198,9 @@ fn x86_kernel_main() -> ! {
     smp::install_bootstrap_anchor();
     // The one place COM1 is configured; see `serial_uart_init`.
     serial_uart_init();
+    // Before anything can map device memory write-combined; every
+    // secondary processor programs the same table on its own way in.
+    memory_type::program_page_attribute_table();
     let xcr0 = extended_state::enable_on_bootstrap_processor();
     assert!(
         boot::base_revision_supported(),
@@ -195,23 +214,32 @@ fn x86_kernel_main() -> ! {
         .tables
         .acpi_rsdp
         .unwrap_or_else(|| panic!("Limine handoff did not include an ACPI RSDP address"));
-    let processor_count = processor_count(rsdp_address, physical_memory_offset);
-    helios_kernel::prime_bootstrap_allocator(
+    // The MADT and the SRAT/SLIT are read in place before the bootstrap
+    // allocator is primed: the processor count and each processor's and
+    // each memory range's node size its per-processor and per-node
+    // structures.
+    // The processor count is the MADT's possible set, so a processor
+    // firmware hot-adds later was counted, and placed on its SRAT node,
+    // here.
+    let pre_heap_tables = pre_heap_acpi_tables(rsdp_address, physical_memory_offset);
+    let processors = MadtProcessors::new(&pre_heap_tables);
+    let processor_count = processors.processor_count();
+    let numa = AcpiNuma::new(&pre_heap_tables, processors, LocalApicKey)
+        .unwrap_or_else(|error| panic!("x86 NUMA discovery failed: {error}"));
+    let pool = helios_kernel::prime_bootstrap_allocator(
         boot_memory_regions(
             &handoff,
             physical_memory_offset,
             &reserved_ranges,
             Some(reserved_wakeup_page.clone()),
+            &numa,
         ),
-        processor_count,
+        &numa,
+        // `smp` numbers processors in MADT order, whose first entry is
+        // this one, the bootstrap processor.
+        ProcessorId::new(0),
     );
     let wakeup_page = (processor_count > 1).then_some(reserved_wakeup_page);
-    let memory_regions = boot_memory_regions(
-        &handoff,
-        physical_memory_offset,
-        &reserved_ranges,
-        wakeup_page.clone(),
-    );
     // The memory a confined device is allowed to reach is exactly what
     // the allocator was primed with, captured here while the boot
     // handoff is still in hand.
@@ -220,11 +248,18 @@ fn x86_kernel_main() -> ! {
         physical_memory_offset,
         &reserved_ranges,
         wakeup_page.clone(),
+        &numa,
     );
     let timebase = Timebase::new(detect_tsc_frequency_hz());
     let tsc_base = read_tsc();
     let payload = helios_kernel::BootPayload::from_boot_modules(&handoff.modules);
-    let debug_state = debug_state::RuntimeState::new(timebase, processor_count, 0, payload);
+    let debug_state = debug_state::RuntimeState::new(
+        timebase,
+        processor_count,
+        0,
+        payload,
+        helios_kernel::GuestIsa::for_build_target(Some(detect_x86_native_feature)),
+    );
     // Every processor's periodic timer samples the instruction it
     // interrupted while instruction sampling runs
     // (`smp::handle_local_timer_interrupt`).
@@ -233,12 +268,15 @@ fn x86_kernel_main() -> ! {
         .install_capture(smp::instruction_sample_capture(handoff.kernel.virtual_base));
     let boot = smp::build_boot_context(
         rsdp_address,
-        physical_memory_offset,
+        smp::PhysicalOffsetAcpiHandler {
+            physical_memory_offset,
+            tsc_base,
+            timebase,
+        },
         wakeup_page,
-        tsc_base,
-        timebase,
         debug_state.clone(),
         xcr0,
+        pool,
     );
     smp::activate_runtime(boot.bootstrap_runtime());
     // The local APIC is enabled once, here, and never re-attached on the
@@ -256,15 +294,25 @@ fn x86_kernel_main() -> ! {
     // may publish, and that has to be settled before the first ring is
     // allocated.
     let iommu_topology = iommu::discover(rsdp_address, physical_memory_offset);
-    let network_function = net::discover(&pci);
-    let host_share_function = host_fs::discover(&pci);
-    let entropy_function = entropy::discover(&pci);
-    let balloon_function = balloon::discover(&pci);
-    let vsock_function = vsock::discover(&pci);
-    let display_function = gpu::discover(&pci);
-    let input_functions = input::discover(&pci);
-    let sound_function = snd::discover(&pci);
-    let block_functions = block::discover(&pci);
+    let virtio = pci.virtio_functions();
+    let network_function = net::discover(&virtio);
+    let host_share_function = host_fs::discover(&virtio);
+    let entropy_function = entropy::discover(&virtio);
+    let balloon_function = balloon::discover(&virtio);
+    let vsock_function = vsock::discover(&virtio);
+    let display_function = gpu::discover(&virtio);
+    let input_functions = input::discover(&virtio);
+    let sound_function = snd::discover(&virtio);
+    let block_functions = block::discover(&virtio);
+    // The TPM is checked before the kernel exists, because whether the
+    // kernel is handed one is part of the platform it is built from; the
+    // outcome is reported once the logger is up.
+    let (measured_boot, measured_boot_discovery) = tpm::discover(
+        rsdp_address,
+        physical_memory_offset,
+        cpu.clone(),
+        handoff.tables.measurement_log,
+    );
     let mut devices = DeviceInventory::new().with_debug_serial();
     if network_function.is_some() {
         devices = devices.with_network();
@@ -285,7 +333,7 @@ fn x86_kernel_main() -> ! {
         devices = devices.with_block_devices(block_functions.len());
     }
     let kernel = helios_kernel::init_with_watchdog(
-        Platform::with_watchdog(console, memory_regions, cpu.clone(), cpu.watchdog())
+        Platform::with_watchdog(console, cpu.clone(), cpu.watchdog())
             .with_topology(
                 ProcessorTopology::start_all_secondaries(
                     cpu.bootstrap_processor(),
@@ -294,7 +342,8 @@ fn x86_kernel_main() -> ! {
                 .with_startup_policy(ProcessorStartupPolicy::BootstrapOnly),
             )
             .with_dma_model(DmaModel::Translated)
-            .with_devices(devices),
+            .with_devices(devices)
+            .with_measured_boot(measured_boot),
     );
     smp::current_runtime().install_timer(kernel.timer());
     // The first line the logger can carry. The bootloader decides where
@@ -307,6 +356,11 @@ fn x86_kernel_main() -> ! {
         physical_base = format_args!("{:#x}", handoff.kernel.physical_base),
         "kernel image loaded"
     );
+    if measured_boot_discovery.is_refusal() {
+        tracing::warn!("{measured_boot_discovery}");
+    } else {
+        tracing::info!("{measured_boot_discovery}");
+    }
     let (xsave_standard_bytes, xsave_max_bytes) = extended_state::xsave_sizes();
     let supervisor_state = extended_state::supervisor_state_support();
     tracing::info!(
@@ -331,10 +385,45 @@ fn x86_kernel_main() -> ! {
     // before it is programmed, and that pass also programs the block
     // device, which needs the root DRBG this call produces. It joins
     // through the reseed task once the executor runs.
-    // No VM generation ID window is discovered on this platform yet, so
-    // the machine generation moves only through `advance`.
-    let machine_generation = helios_kernel::MachineGeneration::new(None);
+    // QEMU's `vmgenid` device publishes the VM generation ID window
+    // through an ACPI SSDT. It is found before the root DRBG is seeded so
+    // that the identifier the machine boots with is the one every later
+    // observation is compared against.
+    // The machine's one AML namespace: vmgenid is found in it here, and
+    // the processor-hotplug task owns it once the SCI is routed.
+    let acpi_handler = smp::PhysicalOffsetAcpiHandler {
+        physical_memory_offset,
+        tsc_base,
+        timebase,
+    };
+    // SAFETY: the RSDP address comes from the bootloader's handoff and the
+    // handler maps through the direct map it left in place.
+    let acpi_tables = unsafe { acpi::AcpiTables::from_rsdp(acpi_handler.clone(), rsdp_address) }
+        .unwrap_or_else(|error| panic!("failed to parse ACPI tables: {error:?}"));
+    let acpi_recorder = helios_acpi::NotifyRecorder::new(acpi_handler);
+    let acpi_namespace = helios_acpi::load_namespace(&acpi_tables, &acpi_recorder)
+        .unwrap_or_else(|error| panic!("x86 ACPI: {error}"));
+    let vmgenid_window = vmgenid::discover(&acpi_namespace, physical_memory_offset);
+    let machine_generation =
+        helios_kernel::MachineGeneration::new(vmgenid_window.map(|found| found.window));
+    match vmgenid_window {
+        Some(found) => tracing::info!(
+            address = format_args!("{:#x}", found.address.get()),
+            // The 16 bytes in the order they sit in the window.
+            generation = format_args!(
+                "{:032x}",
+                u128::from_be_bytes(*found.window.read().as_bytes())
+            ),
+            "vmgenid online"
+        ),
+        None => tracing::info!(
+            "no VM generation ID device; restores of this machine are invisible to it"
+        ),
+    }
     debug_state.install_machine_generation(machine_generation.clone());
+    // Entropy observes the generation on every draw; this task bounds how
+    // late the other reactions to a restore notice it.
+    helios_kernel::spawn_generation_probe(&kernel, &machine_generation);
     let root_entropy = helios_kernel::seed_root_entropy(
         &cpu,
         None,
@@ -344,15 +433,18 @@ fn x86_kernel_main() -> ! {
     debug_state.install_root_entropy(root_entropy.clone());
     // The calendar is read once, here, before any component can ask
     // what time it is. The TSC carries wall time forward from that
-    // reading; nothing re-synchronises it afterwards.
-    match rtc::discover(rsdp_address, physical_memory_offset) {
+    // reading; only a machine restore re-reads it, which the reactions
+    // task does with the same clock.
+    let rtc = rtc::discover(rsdp_address, physical_memory_offset);
+    match &rtc {
         Some(rtc) => {
-            debug_state.seed_wall_clock(cpu.now().ticks(), &rtc);
+            debug_state.seed_wall_clock(cpu.now().ticks(), rtc);
         }
         None => {
             tracing::warn!("the FADT points at no readable CMOS clock; wall time reads as uptime");
         }
     }
+    helios_kernel::install_generation_reactions(&kernel, debug_state.clone(), rtc);
     // Devices are brought up while the bootstrap processor still runs
     // with interrupts masked, so their MSI-X routes are published before
     // the first message can be delivered.
@@ -375,8 +467,14 @@ fn x86_kernel_main() -> ! {
         &debug_state,
         root_entropy,
     );
+    // The SCI is routed with this processor's interrupts still masked,
+    // after its latch is installed, so no delivery precedes its handler.
+    let processor_hotplug = hotplug::install(&cpu, &acpi_tables, acpi_namespace, acpi_recorder);
     smp::join_shootdown_targets();
     x86_64::instructions::interrupts::enable();
+    if let Some(firmware) = processor_hotplug {
+        kernel.spawn_processor_hotplug(firmware);
+    }
     let program_service = helios_kernel::install_component_host_program_service(
         &kernel,
         &cpu,
@@ -392,7 +490,11 @@ fn x86_kernel_main() -> ! {
             cpu.processor_count(),
             cpu.bootstrap_processor(),
         ) {
-            cpu.start_processor(processor);
+            // A possible processor that is not present stays offline: its
+            // slot is built, and `ProcessorControl::online` starts it.
+            if cpu.state.present_at_boot(processor) {
+                cpu.start_processor(processor);
+            }
         }
     }
     run_current_processor(cpu, kernel, debug_state)
@@ -411,9 +513,9 @@ fn x86_kernel_main() -> ! {
 /// an interrupt from a device the kernel never claimed fails loudly
 /// instead of being silently acknowledged.
 #[allow(clippy::too_many_arguments)]
-fn install_pci_devices<WatchdogImpl>(
+fn install_pci_devices<WatchdogImpl, MeasuredBootImpl>(
     cpu: &X86Cpu,
-    kernel: &helios_kernel::Kernel<X86Cpu, WatchdogImpl>,
+    kernel: &helios_kernel::Kernel<X86Cpu, WatchdogImpl, MeasuredBootImpl>,
     pci: &pci::PciRoot,
     physical_memory_offset: usize,
     iommu_topology: Option<iommu::IommuTopology>,
@@ -431,6 +533,7 @@ fn install_pci_devices<WatchdogImpl>(
     root_entropy: helios_kernel::RootEntropyHandle,
 ) where
     WatchdogImpl: Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
 {
     let destination_apic_id = cpu.bootstrap_apic_id();
     let mut routes = exceptions::DeviceInterruptRoutes::new();
@@ -548,7 +651,13 @@ fn install_pci_devices<WatchdogImpl>(
         tracing::info!("no virtio-gpu function on the PCI bus; this machine has no display");
     }
     if let Some(address) = balloon_function {
-        let handle = balloon::install(kernel, pci, address, physical_memory_offset);
+        let handle = balloon::install(
+            kernel,
+            pci,
+            address,
+            physical_memory_offset,
+            debug_state.machine_generation_handle(),
+        );
         debug_state.install_memory_balloon(handle);
     }
     if input_functions.is_empty() {
@@ -616,46 +725,70 @@ fn install_pci_devices<WatchdogImpl>(
         DebugSerial::console().interrupt_handler::<DebugSerial>(),
     );
     cpu.platform_state().install_device_interrupts(routes);
-    cpu.platform_state().io_apic().program_redirection(
+    cpu.platform_state().io_apics().program_redirection(
+        ioapic::COM1,
         exceptions::DEBUG_SERIAL_INTERRUPT_VECTOR,
         destination_apic_id,
     );
 }
 
-/// Counts usable processors from the MADT. Runs before the bootstrap
-/// allocator is primed (the count sizes the allocator's per-processor
-/// structures), so it must not allocate: iterate MADT entries directly
-/// instead of building `AcpiPlatform` processor info.
-fn processor_count(rsdp_address: usize, physical_memory_offset: usize) -> usize {
-    use acpi::sdt::madt::{Madt, MadtEntry};
-
-    const LAPIC_ENABLED: u32 = 1 << 0;
-    const LAPIC_ONLINE_CAPABLE: u32 = 1 << 1;
-    const LAPIC_USABLE: u32 = LAPIC_ENABLED | LAPIC_ONLINE_CAPABLE;
-
+/// The ACPI tables, opened before the bootstrap allocator is primed.
+/// Nothing read through them may allocate: MADT and SRAT entries are
+/// walked in place rather than collected into `AcpiPlatform`.
+fn pre_heap_acpi_tables(
+    rsdp_address: usize,
+    physical_memory_offset: usize,
+) -> AcpiTables<smp::PhysicalOffsetAcpiHandler> {
     let handler = smp::PhysicalOffsetAcpiHandler {
         physical_memory_offset,
         tsc_base: 0,
         timebase: Timebase::new(1),
     };
-    let tables =
-        unsafe { acpi::AcpiTables::from_rsdp(handler, rsdp_address) }.unwrap_or_else(|error| {
-            panic!("failed to parse ACPI tables for processor count: {error:?}")
-        });
-    let madt = tables
-        .find_table::<Madt>()
-        .unwrap_or_else(|| panic!("ACPI tables did not expose an MADT"));
-    let count = madt
-        .get()
-        .entries()
-        .filter(|entry| match entry {
-            MadtEntry::LocalApic(apic) => apic.flags & LAPIC_USABLE != 0,
-            MadtEntry::LocalX2Apic(apic) => apic.flags & LAPIC_USABLE != 0,
-            _ => false,
-        })
-        .count();
-    assert!(count > 0, "MADT did not list any usable processors");
-    count
+    unsafe { AcpiTables::from_rsdp(handler, rsdp_address) }
+        .unwrap_or_else(|error| panic!("failed to parse ACPI tables before the heap: {error:?}"))
+}
+
+/// Each possible processor's local APIC id, present or not
+/// ([`smp::possible_processors`]), in MADT entry order: the order `smp`
+/// numbers processors in, whose first entry is the bootstrap processor.
+/// The possible set, not the present one, sizes every per-processor and
+/// per-node structure, so a processor firmware hot-adds later already
+/// has its slot on the node the SRAT gives it. Read in place, so it
+/// answers before the heap exists.
+struct MadtProcessors {
+    madt: PhysicalMapping<smp::PhysicalOffsetAcpiHandler, Madt>,
+}
+
+impl MadtProcessors {
+    fn new(tables: &AcpiTables<smp::PhysicalOffsetAcpiHandler>) -> Self {
+        let madt = tables
+            .find_table::<Madt>()
+            .unwrap_or_else(|| panic!("ACPI tables did not expose an MADT"));
+        let processors = Self { madt };
+        assert!(
+            processors.apic_ids().next().is_some(),
+            "MADT did not list any possible processors"
+        );
+        processors
+    }
+
+    fn apic_ids(&self) -> impl Iterator<Item = u32> + '_ {
+        smp::possible_processors(self.madt.get()).map(|processor| processor.apic_id)
+    }
+}
+
+impl ProcessorIdentities for MadtProcessors {
+    fn processor_count(&self) -> usize {
+        self.apic_ids().count()
+    }
+
+    fn hardware_id(&self, processor: ProcessorId) -> u64 {
+        let index = usize::from(processor.id());
+        self.apic_ids()
+            .nth(index)
+            .map(u64::from)
+            .unwrap_or_else(|| panic!("the MADT names no possible processor {index}"))
+    }
 }
 
 fn boot_reserved_ranges(handoff: &boot::LimineBootHandoff) -> BootReservedRanges {
@@ -713,28 +846,23 @@ fn reserve_wakeup_page(
         .unwrap_or_else(|| panic!("failed to reserve a low-memory wakeup page for x86 AP startup"))
 }
 
-fn boot_memory_regions(
+/// The usable memory the kernel may own, each region on its node.
+fn boot_memory_regions<'n, Numa: NumaTopology>(
     handoff: &boot::LimineBootHandoff,
     physical_memory_offset: usize,
     reserved_ranges: &BootReservedRanges,
     excluded: Option<Range<usize>>,
-) -> impl IntoIterator<Item = MemoryRegion> {
+    numa: &'n Numa,
+) -> impl Iterator<Item = MemoryRegion> + use<'n, Numa> {
     let mut reserved_ranges = reserved_ranges.clone();
     if let Some(excluded) = excluded {
         reserved_ranges.reserve(excluded);
     }
     handoff.memory_map.regions().flat_map(move |region| {
-        usable_region_segments(region, &reserved_ranges)
-            .into_iter()
-            .flatten()
-            .map(move |segment| {
-                let start = segment.start + physical_memory_offset;
-                let len = segment.end - segment.start;
-                let slice = core::ptr::slice_from_raw_parts_mut(start as *mut u8, len);
-                core::ptr::NonNull::new(slice).unwrap_or_else(|| {
-                    panic!("usable memory segment had a null start: {segment:?}")
-                })
-            })
+        // SAFETY: Limine's usable entries are RAM nothing else owns, mapped
+        // in the higher-half direct map at `physical_memory_offset`, and
+        // the kernel image, modules and the wakeup page are reserved out.
+        unsafe { usable_node_regions(region, &reserved_ranges, physical_memory_offset, numa) }
     })
 }
 
@@ -743,19 +871,25 @@ fn boot_memory_regions(
 /// It is exactly what the bootstrap allocator was primed with: every
 /// buffer a driver hands to a device is a kernel heap allocation, so a
 /// domain that maps these runs reaches every buffer and nothing else.
-fn dma_capable_ranges(
+fn dma_capable_ranges<Numa: NumaTopology>(
     handoff: &boot::LimineBootHandoff,
     physical_memory_offset: usize,
     reserved_ranges: &BootReservedRanges,
     excluded: Option<Range<usize>>,
+    numa: &Numa,
 ) -> alloc::vec::Vec<helios_hal::iommu::PhysicalRange> {
-    boot_memory_regions(handoff, physical_memory_offset, reserved_ranges, excluded)
-        .into_iter()
-        .map(|region| {
-            let start = region.as_ptr().cast::<u8>() as usize - physical_memory_offset;
-            helios_hal::iommu::PhysicalRange::new(start as u64, region.len() as u64)
-        })
-        .collect()
+    boot_memory_regions(
+        handoff,
+        physical_memory_offset,
+        reserved_ranges,
+        excluded,
+        numa,
+    )
+    .map(|region| {
+        let start = region.start() - physical_memory_offset;
+        helios_hal::iommu::PhysicalRange::new(start as u64, region.len() as u64)
+    })
+    .collect()
 }
 
 /// The kernel console: every record is retained for the debugger and
@@ -834,6 +968,51 @@ extern "Rust" fn helios_current_processor() -> ProcessorId {
     smp::current_processor()
 }
 
+/// Reads `CR8`, the local APIC's task-priority class.
+fn read_cr8() -> u64 {
+    let value: u64;
+    // SAFETY: reading CR8 has no side effect.
+    unsafe {
+        asm!("mov {}, cr8", out(reg) value, options(nomem, nostack, preserves_flags));
+    }
+    value
+}
+
+/// Writes `CR8`, the local APIC's task-priority class.
+///
+/// # Safety
+///
+/// The class decides which interrupts the processor takes: the caller
+/// restores the previous value before it relies on an interrupt that the
+/// new one withholds.
+unsafe fn write_cr8(value: u64) {
+    // SAFETY: forwarded to the caller.
+    unsafe {
+        asm!("mov cr8, {}", in(reg) value, options(nomem, nostack, preserves_flags));
+    }
+}
+
+/// `CR8` raised to [`exceptions::WAKE_ONLY_TASK_PRIORITY`] on the
+/// processor that took it, and put back to what it was when dropped.
+///
+/// The local APIC then holds every vector below class 14 pending (the
+/// timer, the device vectors, the APIC error) and still delivers the
+/// wake and shootdown IPIs, which sit in class 14. It leaves the
+/// interrupt flag alone. `CR8` is the processor's own register, so the
+/// value is not `Send`.
+pub(crate) struct X86WakeOnlyMask {
+    previous: u64,
+    _processor_local: core::marker::PhantomData<*mut ()>,
+}
+
+impl Drop for X86WakeOnlyMask {
+    fn drop(&mut self) {
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: restores the value read when the mask was raised.
+        unsafe { write_cr8(self.previous) };
+    }
+}
+
 impl Cpu for X86Cpu {
     // The local APIC timer runs in periodic mode at the scheduler tick;
     // `set_deadline` only starts it.
@@ -881,9 +1060,75 @@ impl Cpu for X86Cpu {
         }
     }
 
+    type WakeOnlyMask = X86WakeOnlyMask;
+
+    fn mask_to_wake_only(&self) -> X86WakeOnlyMask {
+        // Raise the task-priority register so the local APIC holds every
+        // vector below class 14 pending: the timer, the device vectors,
+        // the APIC error. The wake and shootdown IPIs sit in class 14 and
+        // still get through (`exceptions::WAKE_INTERRUPT_VECTOR`).
+        // `mov cr8` is the 64-bit form of the TPR write and works in
+        // xAPIC and x2APIC mode alike.
+        let previous = read_cr8();
+        // SAFETY: CR8 is the task-priority register, and raising it only
+        // withholds interrupts; the guard puts the previous value back.
+        unsafe { write_cr8(exceptions::WAKE_ONLY_TASK_PRIORITY) };
+        compiler_fence(Ordering::SeqCst);
+        X86WakeOnlyMask {
+            previous,
+            _processor_local: core::marker::PhantomData,
+        }
+    }
+
+    fn park_wake_only(&self, word: &AtomicU8, held: u8) {
+        assert!(
+            !x86_64::instructions::interrupts::are_enabled(),
+            "x86 park_wake_only was entered with interrupts enabled, before the finer mask \
+             was in place"
+        );
+        let mask = self.mask_to_wake_only();
+        while word.load(Ordering::Acquire) == held {
+            // `sti; hlt` is atomic: a wake IPI already pending, or one
+            // that arrives during the halt, completes it, and the
+            // handler runs in the instruction shadow before `cli`.
+            // Nothing else can be taken, because the register above
+            // withholds it. The word was tested with interrupts masked,
+            // so a store made after the test raises a wake that this
+            // halt completes on.
+            //
+            // SAFETY: interrupts were masked on entry and are masked
+            // again before the next test.
+            unsafe {
+                core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+            }
+        }
+        drop(mask);
+        // The wake the loop took, or one that raced it, leaves its latch
+        // set; `park_current` would take it as a wake for work it does
+        // not have.
+        smp::current_runtime().take_wake_pending();
+    }
+
     fn start_processor(&self, processor: ProcessorId) {
         self.state
             .start_processor(processor, secondary_start_rust as *const () as usize);
+    }
+
+    /// Saves the callee-saved context, leaves the shootdown set, masks the
+    /// local APIC timer and halts with interrupts masked until
+    /// [`Cpu::restart_processor`] sends INIT/SIPI; the handshake and what
+    /// is re-seeded on the way back are in `smp::stop_current_processor`.
+    fn stop_current(&self) {
+        smp::stop_current_processor();
+    }
+
+    /// May land at any point after the kernel published the stop: the
+    /// restart waits for the processor to reach its halt, then claims the
+    /// stop with a compare-exchange, so it restarts the processor exactly
+    /// once (`smp::X86PlatformState::restart_processor`).
+    fn restart_processor(&self, processor: ProcessorId) {
+        self.state
+            .restart_processor(processor, smp::resume_current_rust as *const () as usize);
     }
 
     fn wake_processor(&self, processor: ProcessorId) {
@@ -958,12 +1203,11 @@ fn x86_has_rdrand() -> bool {
 }
 
 fn fill_with_rdrand(buffer: &mut [u8]) {
-    let mut chunks = buffer.chunks_exact_mut(core::mem::size_of::<u64>());
-    for chunk in chunks.by_ref() {
-        chunk.copy_from_slice(&rdrand64().to_le_bytes());
+    let (words, remainder) = buffer.as_chunks_mut::<{ core::mem::size_of::<u64>() }>();
+    for word in words {
+        *word = rdrand64().to_le_bytes();
     }
 
-    let remainder = chunks.into_remainder();
     if !remainder.is_empty() {
         let word = rdrand64().to_le_bytes();
         remainder.copy_from_slice(&word[..remainder.len()]);
@@ -985,13 +1229,14 @@ fn rdrand64() -> u64 {
     unsafe { rdrand64_enabled() }.expect("x86 RDRAND failed after retries")
 }
 
-fn run_current_processor<WatchdogImpl>(
+fn run_current_processor<WatchdogImpl, MeasuredBootImpl>(
     cpu: X86Cpu,
-    kernel: helios_kernel::Kernel<X86Cpu, WatchdogImpl>,
+    kernel: helios_kernel::Kernel<X86Cpu, WatchdogImpl, MeasuredBootImpl>,
     debug_state: debug_state::RuntimeState,
 ) -> !
 where
     WatchdogImpl: Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
 {
     helios_kernel::run_component_host_processor_forever(
         cpu,
@@ -1023,6 +1268,24 @@ extern "C" fn secondary_start_rust(
     // configured it before it woke anyone, and configuring it again is
     // destructive rather than idempotent. See `serial_uart_init`.
     extended_state::enable_on_secondary_processor(boot.xcr0());
+    // The same page-attribute table the bootstrap processor runs with,
+    // before this processor can touch a write-combined mapping.
+    memory_type::program_page_attribute_table();
+    // And the bootstrap processor's MTRRs, which a started processor
+    // leaves reset without.
+    boot.mtrrs().apply();
+    // Guest code is compiled once for the ISA level the bootstrap processor
+    // satisfies and runs on any processor, so every processor must answer
+    // every level feature the same way. XCR0 is programmed, which the AVX
+    // answers depend on.
+    let isa_answers = probe_isa_answers();
+    assert_eq!(
+        isa_answers,
+        boot.isa_answers(),
+        "x86 processor with initial APIC ID {} answers the ISA level features differently from \
+         the bootstrap processor; Helios requires every processor to offer the same features",
+        __cpuid(1).ebx >> 24
+    );
     let runtime = unsafe { &*runtime };
     smp::activate_runtime(runtime);
     smp::current_runtime().attach_local_apic();
@@ -1034,7 +1297,6 @@ extern "C" fn secondary_start_rust(
     let cpu = X86Cpu::new(boot.platform());
     let kernel = helios_kernel::init_with_watchdog(Platform::with_watchdog(
         console,
-        core::iter::empty::<MemoryRegion>(),
         cpu.clone(),
         cpu.watchdog(),
     ));
@@ -1046,6 +1308,14 @@ extern "C" fn secondary_start_rust(
         .unwrap_or_else(|| panic!("x86 secondary started before program service installation"));
     smp::current_runtime().install_program_service(program_service);
     run_current_processor(cpu, kernel, debug_state)
+}
+
+/// What `detect_x86_native_feature` answers for every ISA level feature on
+/// the executing processor.
+pub(crate) fn probe_isa_answers() -> ProbeAnswers {
+    cwasm_target_isa_levels("x86_64-unknown-none")
+        .probe_answers(detect_x86_native_feature)
+        .unwrap_or_else(|error| panic!("x86 native feature probe is incomplete: {error}"))
 }
 
 fn detect_x86_native_feature(feature: &str) -> Option<bool> {

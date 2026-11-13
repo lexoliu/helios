@@ -12,13 +12,14 @@ use core::task::{Context, Poll};
 use core::time::Duration;
 
 use atomic_waker::AtomicWaker;
-use concurrent_queue::{ConcurrentQueue, PopError, PushError};
-use helios_hal::cpu::{Cpu, Instant, TimerInterrupt, current_processor};
+use concurrent_queue::{ConcurrentQueue, PushError};
+use helios_hal::cpu::{Cpu, Instant, ProcessorId, TimerInterrupt, current_processor};
 use helios_hal::critical_section::with_local_interrupts_masked;
 use objectpool::Pool;
-use triomphe::Arc;
+use spin::Once;
 
-use super::executor::TimerOwner;
+use super::executor::ExecutorGroup;
+use crate::memory::{PerProcessor, UserMemoryPool};
 
 /// How long a guest holds its processor before it is preempted and
 /// yields to the executor.
@@ -70,17 +71,29 @@ const TIMER_WHEEL_SLOTS: usize = 256;
 const TIMER_INBOX_CAPACITY: usize = TIMER_WHEEL_SLOTS * 16;
 const TIMER_READY_POOL_SLOTS: usize = 8;
 const TIMER_READY_RETAINED_ENTRIES: usize = TIMER_WHEEL_SLOTS;
-/// Slots reserved for the per-Timer SleepState pool. A slot is held
+/// Slots reserved for the per-base SleepState pool. A slot is held
 /// exactly as long as its `Sleep` future is alive — the wheel holds
 /// generation-validated weak handles and never pins a slot — so this
-/// bounds the number of concurrently live pending sleeps on one timer,
-/// matching the `TIMER_INBOX_CAPACITY` capacity contract.
+/// bounds the number of concurrently live pending sleeps registered on
+/// one base, matching the `TIMER_INBOX_CAPACITY` capacity contract.
 const SLEEP_STATE_POOL_SLOTS: usize = TIMER_INBOX_CAPACITY;
 
+/// A handle on the kernel's timers.
+///
+/// The handle names no processor. A sleep is registered on the timer
+/// base of the processor that first polls it, the per-processor timer
+/// base model Linux's hrtimers use: the processor that registers a
+/// sleep is the one whose hardware deadline it lowers, so registration
+/// never has to reach another processor's comparator, and a handle
+/// cloned into a long-lived service does not tie every sleep of that
+/// service to whichever processor built the handle — or to a processor
+/// that has since gone offline. The base-driving operations (firing,
+/// the timer interrupt, the idle loop's arming) act on the base of the
+/// processor executing them.
 #[derive(Clone)]
 pub struct Timer<CpuImpl: Cpu + Clone> {
     cpu: CpuImpl,
-    shared: Arc<TimerShared>,
+    group: &'static ExecutorGroup,
 }
 
 pub struct Sleep<CpuImpl: Cpu + Clone> {
@@ -93,21 +106,46 @@ struct TimerState {
     wheel: TimingWheel,
 }
 
-/// One processor's timer state.
+/// Every processor's timer base, one per possible processor.
+///
+/// A base is built the first time its processor comes online and kept
+/// for the life of the kernel. A processor going offline hands its
+/// pending entries to another base ([`Timer::migrate_base`]) but keeps
+/// the base, because the sleeps behind those entries still hold their
+/// state slots in its pool, and it finds the base again when it comes
+/// back.
+///
+/// Each slot is a [`PerProcessor`] block: on a cache line of its own and
+/// in memory of its processor's node, since the owner walks its base on
+/// every pass. What the base allocates once built (its wheel buckets, its
+/// pools) comes from the kernel heap, on the owner.
+pub(crate) struct TimerBases {
+    bases: PerProcessor<Once<TimerShared>>,
+}
+
+/// One processor's timer base.
 ///
 /// # Concurrency contract
 ///
-/// A `Timer` belongs to the processor that built it, its owner
-/// ([`TimerOwner`]). A `Sleep` may be registered from any processor,
-/// because a task holding a clone of the timer runs wherever it runs.
+/// A base belongs to one processor, its owner. A sleep is registered
+/// on the owner's base by the owner itself, because registration picks
+/// the base of the processor polling the sleep; the only pushes that
+/// arrive from another processor are a departing processor's entries,
+/// handed over once on its way offline.
 ///
 /// - `state`, the timing wheel, is the owner's event loop's alone.
-///   Interrupt handlers never touch it.
-/// - `inbox` is a lock-free MPSC queue: any processor pushes a new
-///   sleep, the owner drains it into the wheel.
-/// - `next_sleep_deadline` is the earliest pending sleep. Any processor
-///   lowers it with a compare-and-swap after pushing to `inbox`; the
-///   owner stores the wheel's earliest after draining.
+///   Interrupt handlers never touch it. A departing processor drains
+///   its own wheel as its last timer act.
+/// - `inbox` is a lock-free MPSC queue the owner pushes its own new
+///   sleeps through and drains into the wheel; `adopted` is the
+///   unbounded MPSC queue a departing processor pushes its whole wheel
+///   onto, which the owner drains the same way. It is unbounded because
+///   a wheel arrives at once and the departing processor cannot wait
+///   for the owner to make room.
+/// - `next_sleep_deadline` is the earliest pending sleep. A departing
+///   processor lowers it with a compare-and-swap after pushing to
+///   `adopted`; the owner lowers it for its own sleeps and stores the
+///   wheel's earliest after draining.
 /// - `armed_deadline` is the deadline programmed into the owner's
 ///   hardware. Only the owner writes it, from task context with local
 ///   interrupts masked and from its timer interrupt, so the record and
@@ -118,15 +156,17 @@ struct TimerState {
 ///   the owner is parked. An executor pass about to run work pulls it
 ///   to within a tick ([`Timer::arm_scheduler_tick`]), so a processor
 ///   running a guest takes an interrupt at least once a tick and an
-///   idle one keeps its long deadline, with no arm per guest poll. A processor that is not the owner
-///   never programs a deadline: [`Cpu::set_deadline`] reaches the
-///   executing processor's comparator, not the owner's. It wakes the
-///   owner instead, when the owner is parked, and the owner programs
-///   the new deadline before it parks again.
+///   idle one keeps its long deadline, with no arm per guest poll. A
+///   processor that is not the owner never programs a deadline:
+///   [`Cpu::set_deadline`] reaches the executing processor's
+///   comparator, not the owner's. It wakes the owner instead, when the
+///   owner is parked, and the owner programs the new deadline before it
+///   parks again.
 struct TimerShared {
-    owner: TimerOwner,
+    processor: ProcessorId,
     state: UnsafeCell<TimerState>,
     inbox: ConcurrentQueue<TimerEntry>,
+    adopted: ConcurrentQueue<TimerEntry>,
     next_sleep_deadline: AtomicU64,
     armed_deadline: AtomicU64,
     tick_ticks: u64,
@@ -183,20 +223,24 @@ struct SleepStateSlot {
 unsafe impl Send for SleepStateSlot {}
 unsafe impl Sync for SleepStateSlot {}
 
-/// Pool-backed strong handle. The `shared` Arc keeps the pool alive
-/// for the lifetime of every clone of this handle; the slot is
-/// reclaimed once the last ref drops.
+/// Pool-backed strong handle on the base the sleep was registered on.
+/// Bases live as long as the kernel's executor group, so the handle
+/// borrows its base instead of counting a reference to it; the slot is
+/// reclaimed once the last handle drops.
 struct SleepRef {
-    shared: Arc<TimerShared>,
+    base: &'static TimerShared,
     idx: u32,
 }
 
 /// Weak, generation-validated handle held by timer inbox and wheel
 /// entries. It pins nothing: the slot is reclaimed the moment the
 /// owning `Sleep` drops, and a stale handle just fails validation.
-/// All accesses go through the pool the handle was minted from.
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// It names the pool its slot is in, because an entry handed to another
+/// base on a processor's way offline sits in that base's wheel while
+/// its slot stays in the pool it was registered on.
+#[derive(Clone, Copy)]
 struct SleepHandle {
+    pool: &'static SleepStatePool,
     idx: u32,
     generation: u64,
 }
@@ -213,15 +257,37 @@ struct WheelLevel {
     buckets: Box<[Vec<TimerEntry>]>,
 }
 
-impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
-    /// The timer of `owner`, built on `owner` itself: the deadline it
-    /// programs here is the owner's.
-    pub(crate) fn new(cpu: CpuImpl, owner: TimerOwner) -> Self {
-        assert_eq!(
-            current_processor(),
-            owner.processor(),
-            "a timer is built on the processor that owns it"
-        );
+impl TimerBases {
+    /// One empty slot per possible processor of the machine `pool`
+    /// describes.
+    pub(crate) fn new(pool: &UserMemoryPool) -> Self {
+        Self {
+            bases: PerProcessor::new(pool, |_, _| Once::new()),
+        }
+    }
+
+    fn slot(&self, processor: ProcessorId) -> &Once<TimerShared> {
+        self.bases.try_get(processor).unwrap_or_else(|| {
+            panic!(
+                "processor {} is outside the {} possible processors' timer bases",
+                processor.id(),
+                self.bases.len()
+            )
+        })
+    }
+
+    fn get(&self, processor: ProcessorId) -> &TimerShared {
+        self.slot(processor).get().unwrap_or_else(|| {
+            panic!(
+                "processor {} has no timer base: it has never come online",
+                processor.id()
+            )
+        })
+    }
+}
+
+impl TimerShared {
+    fn new<CpuImpl: Cpu>(cpu: &CpuImpl, processor: ProcessorId) -> Self {
         let timebase = cpu.timebase();
         let tick_ticks = timebase.duration_to_ticks(SCHEDULER_TICK);
         let idle_interval_ticks = timebase.duration_to_ticks(IDLE_INTERRUPT_INTERVAL);
@@ -234,31 +300,116 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
             wheel_quantum_ticks != 0,
             "timer wheel quantum {TIMER_WHEEL_QUANTUM:?} converted to zero timer ticks"
         );
-        // The owner is running when it builds its timer. On a periodic
-        // platform this call is what starts the interrupt.
-        let initial_deadline = cpu.now().saturating_add(tick_ticks);
-        cpu.set_deadline(initial_deadline);
-        let current_tick = wheel_tick_floor(cpu.now(), wheel_quantum_ticks);
         Self {
-            cpu,
-            shared: Arc::new(TimerShared {
-                owner,
-                state: UnsafeCell::new(TimerState {
-                    wheel: TimingWheel::new(current_tick),
-                }),
-                inbox: ConcurrentQueue::bounded(TIMER_INBOX_CAPACITY),
-                next_sleep_deadline: AtomicU64::new(u64::MAX),
-                armed_deadline: AtomicU64::new(initial_deadline.ticks()),
-                tick_ticks,
-                idle_interval_ticks,
-                wheel_quantum_ticks,
-                ready_pool: Pool::bounded(
-                    TIMER_READY_POOL_SLOTS,
-                    Vec::new,
-                    reset_timer_ready_entries,
-                ),
-                sleep_pool: SleepStatePool::new(SLEEP_STATE_POOL_SLOTS),
+            processor,
+            state: UnsafeCell::new(TimerState {
+                wheel: TimingWheel::new(wheel_tick_floor(cpu.now(), wheel_quantum_ticks)),
             }),
+            inbox: ConcurrentQueue::bounded(TIMER_INBOX_CAPACITY),
+            adopted: ConcurrentQueue::unbounded(),
+            next_sleep_deadline: AtomicU64::new(u64::MAX),
+            armed_deadline: AtomicU64::new(u64::MAX),
+            tick_ticks,
+            idle_interval_ticks,
+            wheel_quantum_ticks,
+            ready_pool: Pool::bounded(TIMER_READY_POOL_SLOTS, Vec::new, reset_timer_ready_entries),
+            sleep_pool: SleepStatePool::new(SLEEP_STATE_POOL_SLOTS),
+        }
+    }
+
+    /// Moves everything pushed onto this base since the last drain into
+    /// the wheel. Owner only.
+    fn drain_inbox(&self, wheel: &mut TimingWheel) {
+        for queue in [&self.inbox, &self.adopted] {
+            while let Ok(entry) = queue.pop() {
+                wheel.insert(entry);
+            }
+        }
+    }
+}
+
+impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
+    /// A handle on the timers of `group`'s processors. Building it
+    /// brings no base online: [`Self::bring_base_online`] does that, on
+    /// the processor whose base it is.
+    pub(crate) fn new(cpu: CpuImpl, group: &'static ExecutorGroup) -> Self {
+        Self { cpu, group }
+    }
+
+    /// The executing processor's base.
+    fn base(&self) -> &'static TimerShared {
+        self.group.timer_bases().get(current_processor())
+    }
+
+    /// Brings the executing processor's base online: builds it on the
+    /// processor's first bring-up and finds it again on a later one,
+    /// then starts the processor's timer interrupt one scheduler tick
+    /// out. On a periodic platform this is what starts the interrupt.
+    ///
+    /// The base's wheel is empty either way — new, or emptied when the
+    /// processor went offline — so its clock is moved to now, rather
+    /// than left to walk every wheel tick the processor was away for.
+    pub(crate) fn bring_base_online(&self) {
+        let processor = current_processor();
+        let base = self
+            .group
+            .timer_bases()
+            .slot(processor)
+            .call_once(|| TimerShared::new(&self.cpu, processor));
+        let now = self.cpu.now();
+        // SAFETY: this processor is the base's owner, the only one that
+        // touches its wheel.
+        let wheel = unsafe { &mut (*base.state.get()).wheel };
+        wheel.current_tick = wheel_tick_floor(now, base.wheel_quantum_ticks);
+        let initial_deadline = now.saturating_add(base.tick_ticks);
+        with_local_interrupts_masked(|| {
+            base.armed_deadline
+                .store(initial_deadline.ticks(), AtomicOrdering::Relaxed);
+            self.cpu.set_deadline(initial_deadline);
+        });
+    }
+
+    /// The timer step of the executing processor going offline: every
+    /// sleep still pending on its base moves to `successor`'s base,
+    /// which fires it from then on.
+    ///
+    /// Runs on the departing processor, after it has left the online
+    /// set and run its last task, so nothing registers on its base any
+    /// more: registration is always on the polling processor's base, and
+    /// this processor polls nothing until it comes back. The entries go
+    /// onto `successor`'s `adopted` queue and the earliest of them is
+    /// published there the way any lowered deadline is, so a parked
+    /// successor is woken to arm it. The sleeps' state slots stay in
+    /// this base's pool, which every entry names.
+    pub(crate) fn migrate_base(&self, successor: ProcessorId) {
+        let processor = current_processor();
+        assert_ne!(
+            processor,
+            successor,
+            "processor {} cannot hand its timers to itself",
+            processor.id()
+        );
+        let bases = self.group.timer_bases();
+        let base = bases.get(processor);
+        let target = bases.get(successor);
+        // SAFETY: this processor is the base's owner, the only one that
+        // touches its wheel.
+        let wheel = unsafe { &mut (*base.state.get()).wheel };
+        base.drain_inbox(wheel);
+        let mut earliest = u64::MAX;
+        wheel.drain_all(|entry| {
+            earliest = earliest.min(entry.deadline.ticks());
+            target.adopted.push(entry).unwrap_or_else(|_| {
+                panic!("timer base {} closed its adopted queue", successor.id())
+            });
+        });
+        base.next_sleep_deadline
+            .store(u64::MAX, AtomicOrdering::SeqCst);
+        if earliest != u64::MAX {
+            // The pushes before the lowering, as in `enqueue`; the
+            // owner's side of this fence is in `fire_expired`.
+            fence(AtomicOrdering::SeqCst);
+            self.publish_deadline(target, Instant::new(earliest));
         }
     }
 
@@ -271,14 +422,15 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
         &self.cpu
     }
 
-    /// Whether a sleep deadline is already due as of `now` — the idle
-    /// loop's reason to stop polling without parking.
+    /// Whether a sleep deadline is already due on the executing
+    /// processor's base as of `now` — the idle loop's reason to stop
+    /// polling without parking.
     ///
     /// `SeqCst`: after the owner has published `Parked`, this is the
     /// parker half of the wake handshake [`Self::publish_deadline`]
     /// describes.
     pub(crate) fn is_due(&self, now: Instant) -> bool {
-        self.shared.next_sleep_deadline.load(AtomicOrdering::SeqCst) <= now.ticks()
+        self.base().next_sleep_deadline.load(AtomicOrdering::SeqCst) <= now.ticks()
     }
 
     /// Programs the published sleep deadline into the owner's hardware
@@ -288,9 +440,10 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
     /// and so did not wake it for, is armed before the owner stops
     /// looking.
     pub(crate) fn arm_published_deadline(&self) {
+        let base = self.base();
         // `SeqCst`: the parker half of the wake handshake.
-        let published = self.shared.next_sleep_deadline.load(AtomicOrdering::SeqCst);
-        self.arm_earlier(published);
+        let published = base.next_sleep_deadline.load(AtomicOrdering::SeqCst);
+        self.arm_earlier(base, published);
     }
 
     /// Pulls the owner's deadline to within one [`SCHEDULER_TICK`]. The
@@ -305,7 +458,8 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
         if CpuImpl::TIMER_INTERRUPT == TimerInterrupt::Periodic {
             return;
         }
-        self.arm_earlier(self.now().ticks().saturating_add(self.shared.tick_ticks));
+        let base = self.base();
+        self.arm_earlier(base, self.now().ticks().saturating_add(base.tick_ticks));
     }
 
     pub fn sleep_until(&self, deadline: Instant) -> Sleep<CpuImpl> {
@@ -329,89 +483,85 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
         self.sleep_until(self.now().saturating_add(ticks))
     }
 
+    /// Fires every sleep due on the executing processor's base.
     pub fn fire_expired(&self) -> usize {
+        let base = self.base();
         let now = self.now();
-        let mut ready = self.shared.ready_pool.get_owned();
-        // SAFETY: the timing wheel is owned by the kernel event loop on this
-        // processor. Sleep futures only enqueue through the lock-free inbox, and
-        // interrupt handlers only disarm the hardware timer.
-        let state = unsafe { &mut *self.shared.state.get() };
-        let pool = &self.shared.sleep_pool;
-        let now_tick = wheel_tick_floor(now, self.shared.wheel_quantum_ticks);
+        let mut ready = base.ready_pool.get_owned();
+        // SAFETY: the timing wheel is owned by the kernel event loop on
+        // this processor. Sleeps reach it only through the lock-free
+        // inbox and adopted queues, and interrupt handlers only disarm
+        // the hardware timer.
+        let wheel = unsafe { &mut (*base.state.get()).wheel };
+        let now_tick = wheel_tick_floor(now, base.wheel_quantum_ticks);
 
         loop {
-            self.drain_inbox(state);
-            state.wheel.drain_expired(pool, now_tick, &mut ready);
-            let next_deadline = state.wheel.next_live_deadline(pool);
-            self.shared.next_sleep_deadline.store(
+            base.drain_inbox(wheel);
+            wheel.drain_expired(now_tick, &mut ready);
+            let next_deadline = wheel.next_live_deadline();
+            base.next_sleep_deadline.store(
                 next_deadline.map_or(u64::MAX, |deadline| deadline.ticks()),
                 AtomicOrdering::SeqCst,
             );
-            // A sleep pushed after the drain above may have lowered the
-            // published deadline before the store overwrote it. Its
-            // `enqueue` fences between the push and the lowering, and
-            // this fence sits between the store and the emptiness test,
-            // so either that lowering read this store and stands, or
-            // this test sees the push and the loop drains it.
+            // An entry pushed after the drain above may have lowered the
+            // published deadline before the store overwrote it. Its push
+            // fences between the push and the lowering, and this fence
+            // sits between the store and the emptiness test, so either
+            // that lowering read this store and stands, or this test
+            // sees the push and the loop drains it.
             fence(AtomicOrdering::SeqCst);
-            if self.shared.inbox.is_empty() {
+            if base.inbox.is_empty() && base.adopted.is_empty() {
                 break;
             }
         }
 
         for entry in ready.iter() {
-            entry.state.fire(pool);
+            entry.state.fire();
         }
 
-        self.arm_earlier(
-            self.shared
-                .next_sleep_deadline
-                .load(AtomicOrdering::Relaxed),
-        );
+        self.arm_earlier(base, base.next_sleep_deadline.load(AtomicOrdering::Relaxed));
         ready.len()
     }
 
-    /// The owner's timer interrupt: arms the next one, at the earlier of
-    /// the next sleep and one [`SCHEDULER_TICK`] on, or one
-    /// [`IDLE_INTERRUPT_INTERVAL`] on when the owner is parked.
+    /// The executing processor's timer interrupt: arms the next one, at
+    /// the earlier of the next sleep and one [`SCHEDULER_TICK`] on, or
+    /// one [`IDLE_INTERRUPT_INTERVAL`] on when the owner is parked.
     ///
     /// A sleep already due is left to the event loop, which this
     /// interrupt has just woken or will reach after the running task.
     /// Arming it would re-raise the interrupt at once.
     pub fn handle_interrupt(&self) -> usize {
+        let base = self.base();
         let now = self.now();
-        let interval = if self.shared.owner.is_parked() {
-            self.shared.idle_interval_ticks
+        let interval = if self.group.needs_wake(base.processor) {
+            base.idle_interval_ticks
         } else {
-            self.shared.tick_ticks
+            base.tick_ticks
         };
         let periodic = now.ticks().saturating_add(interval);
-        let sleep = self
-            .shared
-            .next_sleep_deadline
-            .load(AtomicOrdering::Acquire);
+        let sleep = base.next_sleep_deadline.load(AtomicOrdering::Acquire);
         let deadline = if sleep > now.ticks() {
             periodic.min(sleep)
         } else {
             periodic
         };
-        self.arm_deadline(Instant::new(deadline));
+        self.arm_deadline(base, Instant::new(deadline));
         0
     }
 
-    fn enqueue(&self, deadline: Instant, state: SleepHandle) {
+    fn enqueue(&self, base: &TimerShared, deadline: Instant, state: SleepHandle) {
         let entry = TimerEntry {
             deadline,
-            deadline_tick: wheel_tick_ceil(deadline, self.shared.wheel_quantum_ticks),
+            deadline_tick: wheel_tick_ceil(deadline, base.wheel_quantum_ticks),
             state,
         };
 
-        match self.shared.inbox.push(entry) {
+        match base.inbox.push(entry) {
             Ok(()) => {
                 // The push before the lowering in `publish_deadline`; the
                 // owner's side of this fence is in `fire_expired`.
                 fence(AtomicOrdering::SeqCst);
-                self.publish_deadline(deadline);
+                self.publish_deadline(base, deadline);
             }
             Err(PushError::Full(_)) => {
                 panic!("timer inbox capacity {TIMER_INBOX_CAPACITY} exhausted")
@@ -420,23 +570,15 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
         }
     }
 
-    fn drain_inbox(&self, state: &mut TimerState) {
-        loop {
-            match self.shared.inbox.pop() {
-                Ok(entry) => state.wheel.insert(&self.shared.sleep_pool, entry),
-                Err(PopError::Empty | PopError::Closed) => return,
-            }
-        }
-    }
-
-    /// Lowers the published sleep deadline to `deadline` and makes sure
-    /// the owner's hardware will interrupt by then.
+    /// Lowers `base`'s published sleep deadline to `deadline` and makes
+    /// sure its owner's hardware will interrupt by then.
     ///
     /// On the owner that is a reprogramming of its own comparator. On
-    /// any other processor it is not, because [`Cpu::set_deadline`]
-    /// would program the executing processor's comparator, replacing
-    /// that processor's own deadline with this one. The owner is
-    /// reached through the executor's idle handshake instead:
+    /// any other processor — a departing one handing its sleeps over —
+    /// it is not, because [`Cpu::set_deadline`] would program the
+    /// executing processor's comparator, replacing that processor's own
+    /// deadline with this one. The owner is reached through the
+    /// executor's idle handshake instead:
     ///
     /// - this side lowers `next_sleep_deadline`, then reads the owner's
     ///   idle state, and wakes it only if it has published `Parked`;
@@ -450,14 +592,14 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
     /// it on its next executor pass or before its next park. A periodic
     /// timer interrupt needs neither: no deadline is programmed, and the
     /// owner's next tick finds the sleep.
-    fn publish_deadline(&self, deadline: Instant) {
+    fn publish_deadline(&self, base: &TimerShared, deadline: Instant) {
         let deadline = deadline.ticks();
-        let mut published = self.shared.next_sleep_deadline.load(AtomicOrdering::SeqCst);
+        let mut published = base.next_sleep_deadline.load(AtomicOrdering::SeqCst);
         loop {
             if deadline >= published {
                 return;
             }
-            match self.shared.next_sleep_deadline.compare_exchange_weak(
+            match base.next_sleep_deadline.compare_exchange_weak(
                 published,
                 deadline,
                 AtomicOrdering::SeqCst,
@@ -468,11 +610,11 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
             }
         }
 
-        let owner = self.shared.owner.processor();
+        let owner = base.processor;
         if current_processor() == owner {
-            self.arm_earlier(deadline);
+            self.arm_earlier(base, deadline);
         } else if CpuImpl::TIMER_INTERRUPT == TimerInterrupt::Deadline
-            && self.shared.owner.is_parked()
+            && self.group.needs_wake(owner)
         {
             self.cpu.wake_processor(owner);
         }
@@ -487,17 +629,17 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
     /// next deadline. Moving it later on every pass would reprogram the
     /// comparator on every pass, and would undo the tick a running
     /// guest needs. `u64::MAX`, no sleep pending, is never earlier.
-    fn arm_earlier(&self, deadline: u64) {
+    fn arm_earlier(&self, base: &TimerShared, deadline: u64) {
         if CpuImpl::TIMER_INTERRUPT == TimerInterrupt::Periodic
-            || deadline >= self.shared.armed_deadline.load(AtomicOrdering::Relaxed)
+            || deadline >= base.armed_deadline.load(AtomicOrdering::Relaxed)
         {
             return;
         }
         // Re-checked with interrupts masked: the owner's timer interrupt
         // may have re-armed between the test above and the mask.
         with_local_interrupts_masked(|| {
-            if deadline < self.shared.armed_deadline.load(AtomicOrdering::Relaxed) {
-                self.arm_deadline(Instant::new(deadline));
+            if deadline < base.armed_deadline.load(AtomicOrdering::Relaxed) {
+                self.arm_deadline(base, Instant::new(deadline));
             }
         });
     }
@@ -509,21 +651,20 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
     /// programming, so the owner's timer interrupt, which re-arms
     /// through here too, cannot land between them and leave the record
     /// naming a deadline the comparator does not hold.
-    fn arm_deadline(&self, deadline: Instant) {
+    fn arm_deadline(&self, base: &TimerShared, deadline: Instant) {
         // A periodic interrupt has no deadline to program; the owner
-        // started it when it built the timer.
+        // started it when it brought its base online.
         if CpuImpl::TIMER_INTERRUPT == TimerInterrupt::Periodic {
             return;
         }
         assert_eq!(
             current_processor(),
-            self.shared.owner.processor(),
-            "only the processor that owns a timer programs its deadline"
+            base.processor,
+            "only the processor that owns a timer base programs its deadline"
         );
         let deadline_ticks = deadline.ticks();
         with_local_interrupts_masked(|| {
-            let previous = self
-                .shared
+            let previous = base
                 .armed_deadline
                 .swap(deadline_ticks, AtomicOrdering::Relaxed);
             if previous != deadline_ticks {
@@ -550,7 +691,7 @@ impl<CpuImpl: Cpu + Clone> Future for Sleep<CpuImpl> {
         }
 
         if this.state.is_none() {
-            this.state = Some(SleepRef::new(&this.timer.shared));
+            this.state = Some(SleepRef::new(this.timer.base()));
         }
         let state = this
             .state
@@ -564,7 +705,7 @@ impl<CpuImpl: Cpu + Clone> Future for Sleep<CpuImpl> {
         state.waker.register(cx.waker());
 
         if !state.queued.swap(true, AtomicOrdering::AcqRel) {
-            this.timer.enqueue(deadline, state.downgrade());
+            this.timer.enqueue(state.base, deadline, state.downgrade());
         }
 
         if state.fired.load(AtomicOrdering::Acquire) {
@@ -677,16 +818,13 @@ impl SleepStatePool {
 }
 
 impl SleepRef {
-    fn new(shared: &Arc<TimerShared>) -> Self {
-        let idx = shared.sleep_pool.acquire(SleepState::new());
-        Self {
-            shared: shared.clone(),
-            idx,
-        }
+    fn new(base: &'static TimerShared) -> Self {
+        let idx = base.sleep_pool.acquire(SleepState::new());
+        Self { base, idx }
     }
 
     fn state(&self) -> &SleepState {
-        let slot = self.shared.sleep_pool.slot(self.idx);
+        let slot = self.base.sleep_pool.slot(self.idx);
         debug_assert!(
             slot.refcount.load(AtomicOrdering::Relaxed) > 0,
             "sleep slot dereferenced after final drop"
@@ -702,10 +840,11 @@ impl SleepRef {
     /// generation under a live strong ref is race-free: it only moves
     /// when the refcount reaches zero.
     fn downgrade(&self) -> SleepHandle {
-        let slot = self.shared.sleep_pool.slot(self.idx);
+        let pool = &self.base.sleep_pool;
         SleepHandle {
+            pool,
             idx: self.idx,
-            generation: slot.generation.load(AtomicOrdering::Relaxed),
+            generation: pool.slot(self.idx).generation.load(AtomicOrdering::Relaxed),
         }
     }
 }
@@ -714,8 +853,8 @@ impl SleepHandle {
     /// True once the owning `Sleep` released the slot (or the slot has
     /// been recycled for a newer sleeper). Only touches the slot
     /// header, never the cell, so it is safe on stale handles.
-    fn is_dead(&self, pool: &SleepStatePool) -> bool {
-        let slot = pool.slot(self.idx);
+    fn is_dead(&self) -> bool {
+        let slot = self.pool.slot(self.idx);
         slot.refcount.load(AtomicOrdering::Acquire) == 0
             || slot.generation.load(AtomicOrdering::Acquire) != self.generation
     }
@@ -723,7 +862,8 @@ impl SleepHandle {
     /// Wakes the sleeper if this handle is still current. Takes a
     /// temporary strong reference so the cell cannot be torn down
     /// mid-wake by a concurrent `Sleep` drop on another processor.
-    fn fire(&self, pool: &SleepStatePool) {
+    fn fire(&self) {
+        let pool = self.pool;
         let slot = pool.slot(self.idx);
         let mut refcount = slot.refcount.load(AtomicOrdering::Acquire);
         loop {
@@ -750,6 +890,16 @@ impl SleepHandle {
     }
 }
 
+impl PartialEq for SleepHandle {
+    fn eq(&self, other: &Self) -> bool {
+        core::ptr::eq(self.pool, other.pool)
+            && self.idx == other.idx
+            && self.generation == other.generation
+    }
+}
+
+impl Eq for SleepHandle {}
+
 impl Deref for SleepRef {
     type Target = SleepState;
 
@@ -760,7 +910,7 @@ impl Deref for SleepRef {
 
 impl Drop for SleepRef {
     fn drop(&mut self) {
-        self.shared.sleep_pool.release(self.idx);
+        self.base.sleep_pool.release(self.idx);
     }
 }
 
@@ -775,10 +925,10 @@ impl TimingWheel {
         }
     }
 
-    fn insert(&mut self, pool: &SleepStatePool, entry: TimerEntry) {
+    fn insert(&mut self, entry: TimerEntry) {
         // A sleep dropped between enqueue and drain arrives already dead;
         // dropping it here keeps wheel buckets bounded by live sleeps.
-        if entry.is_dead(pool) {
+        if entry.is_dead() {
             return;
         }
         self.observe_deadline(entry.deadline, entry.deadline_tick);
@@ -789,22 +939,40 @@ impl TimingWheel {
         self.levels[level].buckets[slot].push(entry);
     }
 
-    fn drain_expired(&mut self, pool: &SleepStatePool, now_tick: u64, ready: &mut Vec<TimerEntry>) {
+    fn drain_expired(&mut self, now_tick: u64, ready: &mut Vec<TimerEntry>) {
         while self.current_tick < now_tick {
             self.current_tick = self.current_tick.saturating_add(1);
-            self.cascade(pool);
-            self.drain_current_slot(pool, ready);
+            self.cascade();
+            self.drain_current_slot(ready);
         }
-        self.drain_current_slot(pool, ready);
+        self.drain_current_slot(ready);
     }
 
-    fn next_live_deadline(&mut self, pool: &SleepStatePool) -> Option<Instant> {
+    /// Takes every live entry out of the wheel, whatever its deadline,
+    /// leaving the wheel empty with no deadline cached. Buckets keep
+    /// their capacity.
+    fn drain_all(&mut self, mut take: impl FnMut(TimerEntry)) {
+        for level in &mut self.levels {
+            for bucket in level.buckets.iter_mut() {
+                for entry in bucket.drain(..) {
+                    if !entry.is_dead() {
+                        take(entry);
+                    }
+                }
+            }
+        }
+        self.next_deadline = None;
+        self.next_deadline_tick = None;
+        self.next_deadline_dirty = false;
+    }
+
+    fn next_live_deadline(&mut self) -> Option<Instant> {
         if self.next_deadline_dirty
             || self
                 .next_deadline_tick
                 .is_some_and(|deadline_tick| deadline_tick <= self.current_tick)
         {
-            self.rebuild_next_deadline(pool);
+            self.rebuild_next_deadline();
         }
         self.next_deadline
     }
@@ -819,50 +987,50 @@ impl TimingWheel {
         }
     }
 
-    fn rebuild_next_deadline(&mut self, pool: &SleepStatePool) {
+    fn rebuild_next_deadline(&mut self) {
         let next = self
             .levels
             .iter()
             .flat_map(|level| level.buckets.iter())
             .flat_map(|bucket| bucket.iter())
-            .filter(|entry| !entry.is_dead(pool))
+            .filter(|entry| !entry.is_dead())
             .min_by_key(|entry| entry.deadline);
         self.next_deadline = next.map(|entry| entry.deadline);
         self.next_deadline_tick = next.map(|entry| entry.deadline_tick);
         self.next_deadline_dirty = false;
     }
 
-    fn cascade(&mut self, pool: &SleepStatePool) {
+    fn cascade(&mut self) {
         for level in (1..TIMER_WHEEL_LEVELS).rev() {
             let lower_mask = (1_u64 << (level * 8)) - 1;
             if self.current_tick & lower_mask == 0 {
-                self.cascade_level(pool, level);
+                self.cascade_level(level);
             }
         }
     }
 
-    fn cascade_level(&mut self, pool: &SleepStatePool, level: usize) {
+    fn cascade_level(&mut self, level: usize) {
         let slot = wheel_slot(self.current_tick, level);
         while let Some(entry) = self.levels[level].buckets[slot].pop() {
             self.next_deadline_dirty = true;
-            if entry.is_dead(pool) {
+            if entry.is_dead() {
                 continue;
             }
-            self.insert(pool, entry);
+            self.insert(entry);
         }
     }
 
-    fn drain_current_slot(&mut self, pool: &SleepStatePool, ready: &mut Vec<TimerEntry>) {
+    fn drain_current_slot(&mut self, ready: &mut Vec<TimerEntry>) {
         let slot = wheel_slot(self.current_tick, 0);
         while let Some(entry) = self.levels[0].buckets[slot].pop() {
             self.next_deadline_dirty = true;
-            if entry.is_dead(pool) {
+            if entry.is_dead() {
                 continue;
             }
             if entry.deadline_tick <= self.current_tick {
                 ready.push(entry);
             } else {
-                self.insert(pool, entry);
+                self.insert(entry);
             }
         }
     }
@@ -879,8 +1047,8 @@ impl WheelLevel {
 }
 
 impl TimerEntry {
-    fn is_dead(&self, pool: &SleepStatePool) -> bool {
-        self.state.is_dead(pool)
+    fn is_dead(&self) -> bool {
+        self.state.is_dead()
     }
 }
 
@@ -919,6 +1087,9 @@ fn reset_timer_ready_entries(ready: &mut Vec<TimerEntry>) {
     }
 }
 
+// SAFETY: `state` is touched only by the base's owner, per the
+// concurrency contract on `TimerShared`; everything else is atomic or a
+// lock-free queue.
 unsafe impl Send for TimerShared {}
 unsafe impl Sync for TimerShared {}
 
@@ -965,9 +1136,27 @@ mod tests {
 
         fn park_current(&self) {}
 
+        type WakeOnlyMask = ();
+
+        fn mask_to_wake_only(&self) {
+            panic!("this test platform never freezes")
+        }
+
+        fn park_wake_only(&self, _word: &core::sync::atomic::AtomicU8, _held: u8) {
+            panic!("this test platform never freezes")
+        }
+
         fn start_processor(&self, _processor: ProcessorId) {}
 
         fn wake_processor(&self, _processor: ProcessorId) {}
+
+        fn stop_current(&self) {
+            panic!("test CPU never stops a processor")
+        }
+
+        fn restart_processor(&self, _processor: ProcessorId) {
+            panic!("test CPU never restarts a processor")
+        }
 
         fn now(&self) -> Instant {
             Instant::new(self.now)
@@ -1007,7 +1196,7 @@ mod tests {
         deadline: u64,
         quantum_ticks: u64,
     ) -> (super::SleepRef, TimerEntry) {
-        let state = super::SleepRef::new(&timer.shared);
+        let state = super::SleepRef::new(timer.base());
         let entry = TimerEntry {
             deadline: Instant::new(deadline),
             deadline_tick: wheel_tick_ceil(Instant::new(deadline), quantum_ticks),
@@ -1026,16 +1215,15 @@ mod tests {
     #[test]
     fn timing_wheel_expires_entries_after_deadline_tick() {
         let timer = test_timer();
-        let pool = &timer.shared.sleep_pool;
         let mut wheel = TimingWheel::new(0);
         let (state, entry) = timer_entry(&timer, 150, 50);
         let handle = entry.state;
-        wheel.insert(pool, entry);
+        wheel.insert(entry);
 
         let mut ready = Vec::new();
-        wheel.drain_expired(pool, 2, &mut ready);
+        wheel.drain_expired(2, &mut ready);
         assert!(ready.is_empty());
-        wheel.drain_expired(pool, 3, &mut ready);
+        wheel.drain_expired(3, &mut ready);
         assert_eq!(ready.len(), 1);
         assert!(ready[0].state == handle);
         drop(state);
@@ -1044,16 +1232,15 @@ mod tests {
     #[test]
     fn timing_wheel_cascades_higher_level_entries() {
         let timer = test_timer();
-        let pool = &timer.shared.sleep_pool;
         let mut wheel = TimingWheel::new(0);
         let (state, entry) = timer_entry(&timer, 300 * 50, 50);
         let handle = entry.state;
-        wheel.insert(pool, entry);
+        wheel.insert(entry);
 
         let mut ready = Vec::new();
-        wheel.drain_expired(pool, 255, &mut ready);
+        wheel.drain_expired(255, &mut ready);
         assert!(ready.is_empty());
-        wheel.drain_expired(pool, 300, &mut ready);
+        wheel.drain_expired(300, &mut ready);
         assert_eq!(ready.len(), 1);
         assert!(ready[0].state == handle);
         drop(state);
@@ -1062,35 +1249,33 @@ mod tests {
     #[test]
     fn timing_wheel_skips_cancelled_entries() {
         let timer = test_timer();
-        let pool = &timer.shared.sleep_pool;
         let mut wheel = TimingWheel::new(0);
         let (state, entry) = timer_entry(&timer, 100, 50);
         drop(state);
-        wheel.insert(pool, entry);
+        wheel.insert(entry);
 
         let mut ready = Vec::new();
-        wheel.drain_expired(pool, 2, &mut ready);
+        wheel.drain_expired(2, &mut ready);
         assert!(ready.is_empty());
     }
 
     #[test]
     fn cancelled_sleep_releases_slot_and_stale_handles_fail_validation() {
         let timer = test_timer();
-        let pool = &timer.shared.sleep_pool;
         let (state, entry) = timer_entry(&timer, 300 * 50, 50);
         let handle = entry.state;
 
         // Cancelling releases the slot immediately even though a wheel
         // entry could still reference it until its distant deadline.
         drop(state);
-        assert!(handle.is_dead(pool));
+        assert!(handle.is_dead());
 
         // Recycle slots until the same index is handed out again and
         // prove the stale handle never validates against the new
         // occupant while the fresh handle does.
         let mut held = Vec::new();
         let reused = loop {
-            let sleep_ref = super::SleepRef::new(&timer.shared);
+            let sleep_ref = super::SleepRef::new(timer.base());
             if sleep_ref.idx == handle.idx {
                 break sleep_ref;
             }
@@ -1099,24 +1284,23 @@ mod tests {
         let fresh = reused.downgrade();
         assert_eq!(fresh.idx, handle.idx);
         assert_ne!(fresh.generation, handle.generation);
-        assert!(handle.is_dead(pool));
-        assert!(!fresh.is_dead(pool));
+        assert!(handle.is_dead());
+        assert!(!fresh.is_dead());
         let _ = entry;
     }
 
     #[test]
     fn timing_wheel_drain_retains_bucket_capacity() {
         let timer = test_timer();
-        let pool = &timer.shared.sleep_pool;
         let mut wheel = TimingWheel::new(0);
         let (state, entry) = timer_entry(&timer, 100, 50);
-        wheel.insert(pool, entry);
+        wheel.insert(entry);
         let slot = super::wheel_slot(2, 0);
         let retained_capacity = wheel.levels[0].buckets[slot].capacity();
         assert_ne!(retained_capacity, 0);
 
         let mut ready = Vec::new();
-        wheel.drain_expired(pool, 2, &mut ready);
+        wheel.drain_expired(2, &mut ready);
 
         assert_eq!(ready.len(), 1);
         assert_eq!(wheel.levels[0].buckets[slot].capacity(), retained_capacity);
@@ -1126,16 +1310,15 @@ mod tests {
     #[test]
     fn timing_wheel_cascade_retains_bucket_capacity() {
         let timer = test_timer();
-        let pool = &timer.shared.sleep_pool;
         let mut wheel = TimingWheel::new(0);
         let (state, entry) = timer_entry(&timer, 300 * 50, 50);
-        wheel.insert(pool, entry);
+        wheel.insert(entry);
         let slot = super::wheel_slot(256, 1);
         let retained_capacity = wheel.levels[1].buckets[slot].capacity();
         assert_ne!(retained_capacity, 0);
 
         let mut ready = Vec::new();
-        wheel.drain_expired(pool, 256, &mut ready);
+        wheel.drain_expired(256, &mut ready);
 
         assert!(ready.is_empty());
         assert_eq!(wheel.levels[1].buckets[slot].capacity(), retained_capacity);
@@ -1145,24 +1328,42 @@ mod tests {
     #[test]
     fn timing_wheel_rebuilds_cached_deadline_after_cancelled_front_entry() {
         let timer = test_timer();
-        let pool = &timer.shared.sleep_pool;
         let mut wheel = TimingWheel::new(0);
         let (cancelled, entry) = timer_entry(&timer, 100, 50);
         drop(cancelled);
-        wheel.insert(pool, entry);
+        wheel.insert(entry);
         let (state, entry) = timer_entry(&timer, 200, 50);
-        wheel.insert(pool, entry);
+        wheel.insert(entry);
 
         let mut ready = Vec::new();
-        wheel.drain_expired(pool, 2, &mut ready);
+        wheel.drain_expired(2, &mut ready);
         assert!(ready.is_empty());
         assert_eq!(
-            wheel
-                .next_live_deadline(pool)
-                .map(|deadline| deadline.ticks()),
+            wheel.next_live_deadline().map(|deadline| deadline.ticks()),
             Some(200)
         );
         drop(state);
+    }
+
+    #[test]
+    fn draining_a_whole_wheel_takes_every_live_entry_and_forgets_its_deadline() {
+        let timer = test_timer();
+        let mut wheel = TimingWheel::new(0);
+        let (near, entry) = timer_entry(&timer, 100, 50);
+        wheel.insert(entry);
+        let (far, entry) = timer_entry(&timer, 300 * 50, 50);
+        wheel.insert(entry);
+        let (cancelled, entry) = timer_entry(&timer, 200, 50);
+        wheel.insert(entry);
+        drop(cancelled);
+
+        let mut taken = Vec::new();
+        wheel.drain_all(|entry| taken.push(entry.deadline.ticks()));
+        taken.sort_unstable();
+
+        assert_eq!(taken, [100, 300 * 50]);
+        assert!(wheel.next_live_deadline().is_none());
+        drop((near, far));
     }
 
     #[test]
@@ -1190,7 +1391,7 @@ mod tests {
     fn timer_inbox_is_bounded_to_kernel_capacity() {
         let timer = crate::test_support::test_timer(TestCpu::at(100));
 
-        assert_eq!(timer.shared.inbox.capacity(), Some(TIMER_INBOX_CAPACITY));
+        assert_eq!(timer.base().inbox.capacity(), Some(TIMER_INBOX_CAPACITY));
     }
 
     #[test]

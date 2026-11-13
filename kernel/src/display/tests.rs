@@ -4,8 +4,8 @@
 //! is appended to a log, so a test asserts on the exact sequence the
 //! display engine was asked for rather than on what the kernel intended.
 //! The address space is the recording surface `device::platform`'s test
-//! hooks install, so a test can also see when a frame buffer's pages
-//! were committed and when they went back.
+//! hooks install, so a test can also see when a frame buffer's run was
+//! taken and when it went back.
 
 use alloc::vec::Vec;
 use core::future::Future;
@@ -14,31 +14,35 @@ use core::pin::pin;
 use futures::channel::oneshot;
 use futures_lite::future::block_on;
 use helios_hal::display::{
-    CursorImage, DisplayDevice, DisplayMode, DisplayResult, FramebufferId, PixelFormat, Point,
-    Rect, ScanoutId, ScanoutInfo, ScanoutList,
+    BlobId, BlobScanout, CursorImage, DisplayDevice, DisplayError, DisplayMode, DisplayResult,
+    FramebufferId, PixelFormat, Point, Rect, ScanoutId, ScanoutInfo, ScanoutList,
 };
+use helios_hal::io::IoError;
 use helios_hal::pmm::PhysFrameRange;
-use helios_hal::vmm::VirtAddr;
 use std::sync::Mutex;
 use triomphe::Arc;
 
+use crate::buffer::Buffer;
 use crate::component::ProviderReceiver;
-use crate::device::{DISPLAY_WINDOW_BYTES, DeviceWindow, test_hooks};
+use crate::device::test_hooks;
+use crate::gpu::ScanoutHold;
 use crate::process::test_caps;
 use crate::test_support::TestCpu;
 
 use super::owner::{display_channels, serve_control};
-use super::service::{ControlRequest, DisplayService, DisplayShared};
+use super::service::{ControlRequest, DisplayService, DisplayShared, SurfaceSource};
 use super::{DisplayOwnership, DisplayServiceError};
 
-/// The one linear-memory reservation the kernel builds, and where the
-/// tests pretend it sits.
-const RESERVATION_BYTES: u64 = 1 << 32;
-const MEMORY_BASE: usize = 0x1_0000_0000;
-
-/// A mode small enough that several fit the window, and whose frame is a
-/// whole number of pages.
+/// A mode whose frame is a whole number of pages.
 const SMALL: DisplayMode = DisplayMode::new(64, 64);
+
+/// A frame buffer for one [`SMALL`] frame, as `create` pins it.
+fn small_frame() -> Buffer {
+    let bytes = SMALL
+        .frame_bytes(PixelFormat::Bgrx8888)
+        .expect("a 64 by 64 frame fits") as u64;
+    Buffer::pinned(bytes).expect("the test pool has room for one frame")
+}
 
 /// One thing the display engine was asked to do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,12 +55,37 @@ enum Call {
     HideCursor(ScanoutId),
     MoveCursor(ScanoutId, Point),
     Destroy(FramebufferId),
+    SetScanoutBlob(ScanoutId, BlobScanout),
+    FlushBlob(BlobId, Rect),
 }
 
-/// A display engine that records what it was asked and always agrees.
+/// The receiving end of a `CreateSurface` reply.
+type CreateAnswer = oneshot::Receiver<Result<FramebufferId, DisplayServiceError>>;
+
+/// A display engine that records what it was asked and agrees, unless a
+/// test made it refuse to destroy.
 struct FakeDisplay {
     calls: Mutex<Vec<Call>>,
     next: Mutex<u32>,
+    /// Answer every `destroy_framebuffer` with a fault, as an engine
+    /// that may still be latching the resource would.
+    refuse_destroy: bool,
+    /// A caller's end of the reply, dropped while the next resource is
+    /// being created: the caller stopped waiting mid-create.
+    abandon_on_create: Mutex<Option<CreateAnswer>>,
+    /// How every `create_framebuffer` fails, while a test wants it to.
+    create_failure: Mutex<Option<CreateFailure>>,
+}
+
+/// The two ways a create can fail, which differ in what the engine may
+/// be left holding.
+#[derive(Clone, Copy)]
+enum CreateFailure {
+    /// The engine answered with a refusal, so it holds nothing.
+    Refused,
+    /// No answer came, as on a faulted queue: the request may still be
+    /// with the engine.
+    Unanswered,
 }
 
 impl FakeDisplay {
@@ -64,6 +93,20 @@ impl FakeDisplay {
         Self {
             calls: Mutex::new(Vec::new()),
             next: Mutex::new(1),
+            refuse_destroy: false,
+            abandon_on_create: Mutex::new(None),
+            create_failure: Mutex::new(None),
+        }
+    }
+
+    fn fail_creates(&self, failure: CreateFailure) {
+        *self.create_failure.lock().expect("no test panics here") = Some(failure);
+    }
+
+    fn refusing_destroy() -> Self {
+        Self {
+            refuse_destroy: true,
+            ..Self::new()
         }
     }
 
@@ -104,11 +147,24 @@ impl DisplayDevice for FakeDisplay {
             id
         };
         self.record(Call::Create(id, mode));
-        Ok(id)
+        drop(
+            self.abandon_on_create
+                .lock()
+                .expect("no test panics here")
+                .take(),
+        );
+        match *self.create_failure.lock().expect("no test panics here") {
+            Some(CreateFailure::Refused) => Err(DisplayError::Unspecified),
+            Some(CreateFailure::Unanswered) => Err(DisplayError::Transport(IoError::DeviceFault)),
+            None => Ok(id),
+        }
     }
 
     async fn destroy_framebuffer(&self, framebuffer: FramebufferId) -> DisplayResult<()> {
         self.record(Call::Destroy(framebuffer));
+        if self.refuse_destroy {
+            return Err(DisplayError::Unspecified);
+        }
         Ok(())
     }
 
@@ -119,6 +175,16 @@ impl DisplayDevice for FakeDisplay {
         _source: Rect,
     ) -> DisplayResult<()> {
         self.record(Call::SetScanout(scanout, framebuffer));
+        Ok(())
+    }
+
+    async fn set_scanout_blob(&self, scanout: ScanoutId, layout: BlobScanout) -> DisplayResult<()> {
+        self.record(Call::SetScanoutBlob(scanout, layout));
+        Ok(())
+    }
+
+    async fn flush_blob(&self, blob: BlobId, region: Rect) -> DisplayResult<()> {
+        self.record(Call::FlushBlob(blob, region));
         Ok(())
     }
 
@@ -159,11 +225,6 @@ impl DisplayDevice for FakeDisplay {
     }
 }
 
-/// The display window of an instance whose memory sits at [`MEMORY_BASE`].
-fn window() -> DeviceWindow {
-    DeviceWindow::top_of(VirtAddr::new(MEMORY_BASE), RESERVATION_BYTES).below(DISPLAY_WINDOW_BYTES)
-}
-
 /// Run `work` with the control server running beside it.
 ///
 /// The server never returns, so the result is the work's; what the
@@ -187,26 +248,33 @@ fn with_server<T>(
     })
 }
 
-/// A claim, its arena, and the queue into the server.
+/// A claim and the queue into the server.
 fn claimed(shared: &Arc<DisplayShared>) -> DisplayOwnership {
     let service = DisplayService::from_shared(shared.clone());
     let mut ownership = DisplayOwnership::new();
     ownership
-        .claim(&service, window(), test_caps::display())
+        .claim(&service, test_caps::display())
         .expect("the display is free");
     ownership
 }
 
-/// Ask the server to create one surface for `ownership`.
-async fn create_surface(ownership: &mut DisplayOwnership) -> FramebufferId {
+/// Ask the server to create one surface for `ownership`, handing it the
+/// only reference to a fresh frame buffer.
+async fn create_surface(ownership: &DisplayOwnership) -> FramebufferId {
+    request_surface(ownership)
+        .await
+        .expect("the fake display agrees")
+}
+
+/// [`create_surface`], with the engine's answer left to the caller.
+async fn request_surface(
+    ownership: &DisplayOwnership,
+) -> Result<FramebufferId, DisplayServiceError> {
     let generation = ownership
         .claim_ref()
         .expect("the claim is held")
         .generation();
     let sender = ownership.claim_ref().expect("the claim is held").sender();
-    let frame = ownership
-        .pin_frame(SMALL, PixelFormat::Bgrx8888.bytes_per_pixel())
-        .expect("the window has room");
     let (reply, answer) = oneshot::channel();
     sender
         .control(
@@ -215,13 +283,12 @@ async fn create_surface(ownership: &mut DisplayOwnership) -> FramebufferId {
                 scanout: ScanoutId::new(0),
                 mode: SMALL,
                 format: PixelFormat::Bgrx8888,
-                backing: frame.backing,
+                backing: small_frame(),
                 reply,
             },
             answer,
         )
         .await
-        .expect("the fake display agrees")
 }
 
 /// A second instance is refused rather than queued: a compositor waiting
@@ -261,63 +328,57 @@ fn one_instance_holds_the_display_once() {
     let mut ownership = DisplayOwnership::new();
 
     ownership
-        .claim(&service, window(), test_caps::display())
+        .claim(&service, test_caps::display())
         .expect("the display is free");
     assert_eq!(
-        ownership
-            .claim(&service, window(), test_caps::display())
-            .err(),
+        ownership.claim(&service, test_caps::display()).err(),
         Some(DisplayServiceError::AlreadyClaimed)
     );
 }
 
-/// The frame buffer is the instance's own memory: committed from its
-/// pool, counted against it, and inside its own window.
+/// The display engine's record of a resource holds its frame buffer: a
+/// run handed over with its only reference stays pinned for as long as
+/// the resource exists, and creating it changes no translation.
 #[test]
-fn a_frame_buffer_is_pinned_in_the_instance_s_own_window() {
+fn the_display_engine_s_record_keeps_a_frame_buffer_pinned() {
     test_hooks::install();
     let (shared, control, _cursor) = display_channels();
-    let mut ownership = claimed(&shared);
-    let before = test_hooks::shootdowns();
+    let ownership = claimed(&shared);
+    let (runs, shootdowns) = (test_hooks::live_runs(), test_hooks::shootdowns());
 
+    // The record is the owner task's, so the run is counted while that
+    // task is still alive.
     let framebuffer = with_server(&FakeDisplay::new(), &shared, &control, async {
-        create_surface(&mut ownership).await
+        let framebuffer = create_surface(&ownership).await;
+        assert_eq!(
+            test_hooks::live_runs() - runs,
+            1,
+            "the run outlives the caller's reference while the resource exists"
+        );
+        framebuffer
     });
 
-    let frame_bytes = SMALL
-        .frame_bytes(PixelFormat::Bgrx8888)
-        .expect("a 64 by 64 frame fits") as u64;
     assert_eq!(framebuffer, FramebufferId::new(1));
-    assert_eq!(ownership.pinned_bytes(), frame_bytes);
     assert_eq!(
-        test_hooks::shootdowns() - before,
-        1,
-        "one contiguous commit, one shootdown"
-    );
-    let placement = window();
-    assert!(
-        ownership.window().expect("a claim has a window").offset() == placement.offset(),
-        "the frame buffer's window is the one the instance was given"
+        test_hooks::shootdowns(),
+        shootdowns,
+        "pinning a run maps nothing, so nothing is shot down"
     );
 }
 
-/// The window is a bound, and reaching it is answered rather than
-/// quietly reusing memory the display engine may still be reading.
+/// A mode the address space cannot describe is refused before anything
+/// is pinned, as a mode no display engine drives.
 #[test]
-fn a_frame_buffer_larger_than_the_window_is_refused() {
+fn a_frame_buffer_no_address_space_could_describe_is_an_unsupported_mode() {
     test_hooks::install();
-    let (shared, _control, _cursor) = display_channels();
-    let mut ownership = claimed(&shared);
-
-    // A mode whose frame is larger than the whole display window.
-    let huge = DisplayMode::new(16384, 16384);
+    let runs = test_hooks::live_runs();
     assert_eq!(
-        ownership
-            .pin_frame(huge, PixelFormat::Bgrx8888.bytes_per_pixel())
+        Buffer::pinned(u64::MAX)
+            .map_err(DisplayServiceError::from)
             .err(),
-        Some(DisplayServiceError::WindowExhausted)
+        Some(DisplayServiceError::UnsupportedMode)
     );
-    assert_eq!(ownership.pinned_bytes(), 0);
+    assert_eq!(test_hooks::live_runs(), runs);
 }
 
 /// A surface reaches its scanout through create-then-attach, and a
@@ -327,11 +388,11 @@ fn a_surface_is_attached_when_it_is_created_and_a_present_flushes_it() {
     test_hooks::install();
     let (shared, control, _cursor) = display_channels();
     let device = FakeDisplay::new();
-    let mut ownership = claimed(&shared);
+    let ownership = claimed(&shared);
 
     let region = Rect::of(SMALL);
     with_server(&device, &shared, &control, async {
-        let framebuffer = create_surface(&mut ownership).await;
+        let framebuffer = create_surface(&ownership).await;
         let generation = ownership
             .claim_ref()
             .expect("the claim is held")
@@ -343,7 +404,7 @@ fn a_surface_is_attached_when_it_is_created_and_a_present_flushes_it() {
             .control(
                 ControlRequest::Present {
                     generation,
-                    framebuffer,
+                    surface: SurfaceSource::Framebuffer(framebuffer),
                     region,
                     vsync: vsync.clone(),
                     reply,
@@ -370,9 +431,100 @@ fn a_surface_is_attached_when_it_is_created_and_a_present_flushes_it() {
     );
 }
 
+/// A blob reaches its scanout once, through the blob scanout command, and
+/// every present after that is one flush of the blob's changed region.
+/// Releasing the claim blanks the output and destroys nothing: the blob
+/// is the gpu path's.
+#[test]
+fn a_blob_surface_is_scanned_out_once_and_each_present_flushes_the_blob() {
+    test_hooks::install();
+    let (shared, control, _cursor) = display_channels();
+    let device = FakeDisplay::new();
+    let mut ownership = claimed(&shared);
+
+    let blob = BlobId::new(7);
+    let layout = BlobScanout {
+        blob,
+        mode: SMALL,
+        format: PixelFormat::Bgrx8888,
+        offset: 0,
+        // One row of `SMALL` at four bytes a pixel, unpadded.
+        stride: SMALL.width * 4,
+    };
+    let scanout = ScanoutId::new(0);
+    let surface = SurfaceSource::Blob { blob, scanout };
+    // The gpu path's record of the blob, which the surface holds.
+    let held_blob = Arc::new(crate::gpu::BlobShared::new(
+        blob,
+        Arc::new(crate::exec::Notify::new()),
+    ));
+    let region = Rect::of(SMALL);
+    with_server(&device, &shared, &control, async {
+        let claim = ownership.claim_ref().expect("the claim is held");
+        let (generation, sender) = (claim.generation(), claim.sender());
+        let (reply, answer) = oneshot::channel();
+        sender
+            .control(
+                ControlRequest::CreateBlobSurface {
+                    generation,
+                    scanout,
+                    layout,
+                    hold: ScanoutHold::new(&held_blob),
+                    reply,
+                },
+                answer,
+            )
+            .await
+            .expect("the fake display agrees");
+
+        let vsync = Arc::new(super::SequenceSignal::new());
+        for expected in 1..=2 {
+            let (reply, answer) = oneshot::channel();
+            let token = sender
+                .control(
+                    ControlRequest::Present {
+                        generation,
+                        surface,
+                        region,
+                        vsync: vsync.clone(),
+                        reply,
+                    },
+                    answer,
+                )
+                .await
+                .expect("the fake display agrees");
+            assert_eq!(token.sequence, expected);
+        }
+        assert!(
+            held_blob.is_scanned_out(),
+            "the surface holds the blob while it shows it"
+        );
+
+        ownership.release();
+        crate::yield_now().await;
+        crate::yield_now().await;
+    });
+    assert!(
+        !held_blob.is_scanned_out(),
+        "the release lets the blob go, after blanking its scanout"
+    );
+
+    assert_eq!(
+        device.calls(),
+        alloc::vec![
+            Call::SetScanoutBlob(scanout, layout),
+            Call::FlushBlob(blob, region),
+            Call::FlushBlob(blob, region),
+            Call::HideCursor(scanout),
+            Call::Blank(scanout),
+        ],
+        "one scanout, one flush per present, and no destroy on release"
+    );
+}
+
 /// Letting go blanks the outputs before it drops the resources, and the
-/// pages come back only after that: a device still reading a resource
-/// whose pages had gone back to a pool would put another instance's
+/// run comes back only after that: a device still reading a resource
+/// whose run had gone back to a pool would put another instance's
 /// memory on the screen.
 #[test]
 fn a_released_claim_blanks_before_it_destroys_and_frees_after() {
@@ -380,24 +532,21 @@ fn a_released_claim_blanks_before_it_destroys_and_frees_after() {
     let (shared, control, _cursor) = display_channels();
     let device = FakeDisplay::new();
     let mut ownership = claimed(&shared);
-    let frame_bytes = SMALL
-        .frame_bytes(PixelFormat::Bgrx8888)
-        .expect("a 64 by 64 frame fits") as u64;
+    let runs = test_hooks::live_runs();
 
     // One server for the whole scenario: what has to be given back is
     // the owner task's own record of what it created, and a second
     // server would start with an empty one.
     with_server(&device, &shared, &control, async {
-        create_surface(&mut ownership).await;
-        assert_eq!(ownership.pinned_bytes(), frame_bytes);
-        let committed = test_hooks::changes().len();
+        create_surface(&ownership).await;
+        assert_eq!(test_hooks::live_runs() - runs, 1);
 
         // Killing the instance is dropping its store, which is this.
         ownership.release();
         assert_eq!(
-            test_hooks::changes().len(),
-            committed,
-            "the pages are not freed by the drop itself"
+            test_hooks::live_runs() - runs,
+            1,
+            "the run is not freed by the drop itself"
         );
 
         // The owner task takes it from here. The release is a banked
@@ -427,10 +576,11 @@ fn a_released_claim_blanks_before_it_destroys_and_frees_after() {
     assert!(
         matches!(
             test_hooks::changes().last(),
-            Some(test_hooks::MappingChange::Released(_))
+            Some(test_hooks::MappingChange::Freed(_))
         ),
-        "the pages go back once the display engine has let go"
+        "the run goes back once the display engine has let go"
     );
+    assert_eq!(test_hooks::live_runs(), runs);
 
     let service = DisplayService::from_shared(shared.clone());
     assert!(
@@ -449,9 +599,7 @@ fn a_request_that_outlived_its_claim_is_not_served() {
     let mut ownership = claimed(&shared);
     let stale = ownership.claim_ref().expect("the claim is held").sender();
     let stale_generation = stale.generation();
-    let frame = ownership
-        .pin_frame(SMALL, PixelFormat::Bgrx8888.bytes_per_pixel())
-        .expect("the window has room");
+    let frame = small_frame();
 
     with_server(&device, &shared, &control, async {
         // The first claim ends and a second one takes the display.
@@ -468,7 +616,7 @@ fn a_request_that_outlived_its_claim_is_not_served() {
                     scanout: ScanoutId::new(0),
                     mode: SMALL,
                     format: PixelFormat::Bgrx8888,
-                    backing: frame.backing,
+                    backing: frame,
                     reply,
                 },
                 answer,
@@ -484,6 +632,211 @@ fn a_request_that_outlived_its_claim_is_not_served() {
             .any(|call| matches!(call, Call::Create(_, _))),
         "nothing was created for a claim that had ended"
     );
+}
+
+/// A request sitting in the inbox when its claim is let go is dropped
+/// rather than served, however long the display then sits unclaimed: the
+/// generation advances on release, not only on the next claim.
+#[test]
+fn a_request_queued_before_release_is_dropped() {
+    test_hooks::install();
+    let (shared, control, _cursor) = display_channels();
+    let device = FakeDisplay::new();
+    let mut ownership = claimed(&shared);
+    let claim = ownership.claim_ref().expect("the claim is held");
+    let (generation, sender) = (claim.generation(), claim.sender());
+    let runs = test_hooks::live_runs();
+
+    // The request lands in the inbox before the server runs and before
+    // the claim is let go; the reply stays open, so only the generation
+    // can refuse it.
+    let (reply, _answer) = oneshot::channel();
+    block_on(sender.control_oneway(ControlRequest::CreateSurface {
+        generation,
+        scanout: ScanoutId::new(0),
+        mode: SMALL,
+        format: PixelFormat::Bgrx8888,
+        backing: small_frame(),
+        reply,
+    }))
+    .expect("the inbox has room");
+    ownership.release();
+
+    // No second claim: nothing moves the generation but the release.
+    with_server(&device, &shared, &control, async {
+        for _ in 0..3 {
+            crate::yield_now().await;
+        }
+    });
+
+    assert!(
+        !device
+            .calls()
+            .iter()
+            .any(|call| matches!(call, Call::Create(_, _) | Call::SetScanout(_, _))),
+        "nothing was created or scanned out for a claim that had ended: {:?}",
+        device.calls()
+    );
+    assert_eq!(
+        test_hooks::live_runs(),
+        runs,
+        "the dropped request's frame goes back"
+    );
+}
+
+/// A `create` its compositor stopped waiting for closes its end of the
+/// reply as it goes. One that went before its request was served is
+/// owed nothing and gets nothing made; one that went while the engine
+/// was making the resource can never learn its identity, so the owner
+/// task destroys it, and the run goes back.
+#[test]
+fn a_resource_made_for_a_caller_that_stopped_waiting_is_destroyed_by_the_owner() {
+    test_hooks::install();
+    let (shared, control, _cursor) = display_channels();
+    let device = FakeDisplay::new();
+    let ownership = claimed(&shared);
+    let claim = ownership.claim_ref().expect("the claim is held");
+    let (generation, sender) = (claim.generation(), claim.sender());
+    let runs = test_hooks::live_runs();
+    let request = |reply| ControlRequest::CreateSurface {
+        generation,
+        scanout: ScanoutId::new(0),
+        mode: SMALL,
+        format: PixelFormat::Bgrx8888,
+        backing: small_frame(),
+        reply,
+    };
+
+    with_server(&device, &shared, &control, async {
+        let (reply, answer) = oneshot::channel();
+        drop(answer);
+        sender
+            .control_oneway(request(reply))
+            .await
+            .expect("the owner task is serving");
+        for _ in 0..3 {
+            crate::yield_now().await;
+        }
+        assert!(
+            device.calls().is_empty(),
+            "nothing is made for a caller that left before it was served"
+        );
+
+        let (reply, answer) = oneshot::channel();
+        *device
+            .abandon_on_create
+            .lock()
+            .expect("no test panics here") = Some(answer);
+        sender
+            .control_oneway(request(reply))
+            .await
+            .expect("the owner task is serving");
+        for _ in 0..3 {
+            crate::yield_now().await;
+        }
+    });
+
+    let calls = device.calls();
+    let made = FramebufferId::new(1);
+    assert_eq!(calls.first(), Some(&Call::Create(made, SMALL)));
+    assert!(
+        calls.contains(&Call::Destroy(made)),
+        "the resource nobody can name is destroyed: {calls:?}"
+    );
+    assert_eq!(
+        test_hooks::live_runs(),
+        runs,
+        "its run goes back once the engine has let go"
+    );
+}
+
+/// A resource the display engine would not destroy may still be latched,
+/// so its run never goes back to the pool — whether it was destroyed on
+/// its own or with the claim — and the device is not trusted into a
+/// panic either.
+#[test]
+fn a_frame_buffer_the_engine_would_not_release_stays_pinned() {
+    test_hooks::install();
+    let (shared, control, _cursor) = display_channels();
+    let device = FakeDisplay::refusing_destroy();
+    let mut ownership = claimed(&shared);
+    let runs = test_hooks::live_runs();
+
+    with_server(&device, &shared, &control, async {
+        let first = create_surface(&ownership).await;
+        create_surface(&ownership).await;
+        assert_eq!(test_hooks::live_runs() - runs, 2);
+
+        let claim = ownership.claim_ref().expect("the claim is held");
+        claim
+            .sender()
+            .control_oneway(ControlRequest::DestroySurface {
+                generation: claim.generation(),
+                surface: SurfaceSource::Framebuffer(first),
+            })
+            .await
+            .expect("the owner task is serving");
+        for _ in 0..3 {
+            crate::yield_now().await;
+        }
+        assert_eq!(
+            device.calls().last(),
+            Some(&Call::Destroy(first)),
+            "the surface's own destroy was served before the release"
+        );
+        ownership.release();
+        for _ in 0..3 {
+            crate::yield_now().await;
+        }
+    });
+
+    let destroyed = device
+        .calls()
+        .iter()
+        .filter(|call| matches!(call, Call::Destroy(_)))
+        .count();
+    assert_eq!(destroyed, 2, "both resources were asked to go");
+    assert_eq!(
+        test_hooks::live_runs() - runs,
+        2,
+        "neither run goes back to a pool the engine may still be reading"
+    );
+}
+
+/// A create the display engine never answered may have left the request
+/// that names the run with the engine, so the run stays out of the pool;
+/// a create it refused attached nothing, and the run goes back.
+#[test]
+fn a_frame_buffer_is_kept_only_when_its_create_was_never_answered() {
+    test_hooks::install();
+    let (shared, control, _cursor) = display_channels();
+    let device = FakeDisplay::new();
+    let ownership = claimed(&shared);
+    let runs = test_hooks::live_runs();
+
+    with_server(&device, &shared, &control, async {
+        device.fail_creates(CreateFailure::Refused);
+        assert!(request_surface(&ownership).await.is_err());
+        for _ in 0..3 {
+            crate::yield_now().await;
+        }
+        assert_eq!(
+            test_hooks::live_runs(),
+            runs,
+            "an answered refusal frees the frame buffer's run"
+        );
+
+        device.fail_creates(CreateFailure::Unanswered);
+        assert!(request_surface(&ownership).await.is_err());
+        for _ in 0..3 {
+            crate::yield_now().await;
+        }
+        assert_eq!(
+            test_hooks::live_runs() - runs,
+            1,
+            "a create the engine never answered keeps its run"
+        );
+    });
 }
 
 /// What a component sees when it calls `display.claim`: the claim is
@@ -508,14 +861,9 @@ mod component_host {
         authority: ProcessAuthority,
         service: &DisplayService,
     ) -> test_store::TestStoreData {
-        let mut data = test_store::store_data_authorized(authority, |runtime_state| {
+        test_store::store_data_authorized(authority, |runtime_state| {
             runtime_state.install_display_service(service.clone());
-        });
-        data.device.set_memory(crate::device::LinearMemory {
-            base: VirtAddr::new(MEMORY_BASE),
-            reservation_bytes: RESERVATION_BYTES,
-        });
-        data
+        })
     }
 
     /// An ordinary program is told what a machine with no display tells

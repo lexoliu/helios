@@ -3,18 +3,19 @@
 //! Concurrency contract: the device is discovered and programmed on the
 //! bootstrap hart before external interrupts are unmasked. Afterwards
 //! its completions and its display-change announcements arrive on the
-//! PLIC source the device tree names, delivered to that same hart, which
-//! is why the kernel task that follows the topology is local to it.
+//! PLIC line the device tree names, on the hart that takes that PLIC's
+//! interrupts. The kernel task that follows the topology stays local to
+//! the bootstrap hart, which spawned it; the handler's notification
+//! wakes it from whichever hart that is.
 
 extern crate alloc;
 
 use alloc::sync::Arc;
-use core::num::NonZeroU32;
 
 use fdt::Fdt;
 use helios_kernel::ExternalInterruptHandler;
 
-use crate::net::InterruptSourceId;
+use crate::net::PlicInterrupt;
 
 /// The interrupt route's view of the platform's display engine.
 ///
@@ -27,9 +28,9 @@ pub(crate) struct VirtioDisplayDevice {
 }
 
 /// The display device the bootstrap hart brought up, together with the
-/// PLIC source the device tree routes it to.
+/// PLIC line the device tree routes it to.
 pub(crate) struct DisplayInterrupt {
-    pub(crate) source: InterruptSourceId,
+    pub(crate) line: PlicInterrupt,
     pub(crate) device: VirtioDisplayDevice,
 }
 
@@ -53,25 +54,24 @@ pub(crate) fn install<WatchdogImpl>(
 where
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
 {
-    let (device, source) = discover_display_device(fdt)?;
+    let (device, line) = discover_display_device(fdt)?;
     let service = helios_kernel::install_display_device(kernel, cpu, device.inner.clone());
     debug_state.install_display_service(service);
     let service = helios_kernel::install_gpu3d_device(kernel, cpu, device.inner.clone());
     debug_state.install_gpu3d_service(service);
-    Some(DisplayInterrupt { source, device })
+    Some(DisplayInterrupt { line, device })
 }
 
-fn discover_display_device(fdt: &Fdt<'_>) -> Option<(VirtioDisplayDevice, InterruptSourceId)> {
+fn discover_display_device(fdt: &Fdt<'_>) -> Option<(VirtioDisplayDevice, PlicInterrupt)> {
     let candidate = helios_virtio::mmio_candidates(fdt).find(|candidate| {
         crate::matches_virtio_mmio_device(candidate.base, helios_virtio::DeviceType::Gpu)
     })?;
     let base = candidate.base;
     let header = core::ptr::NonNull::new(base as *mut u8)
         .unwrap_or_else(|| panic!("virtio MMIO base {base:#x} was unexpectedly null"));
-    let source = candidate
+    let line = candidate
         .interrupt
-        .and_then(|interrupt| NonZeroU32::new(interrupt.number))
-        .map(InterruptSourceId)
+        .and_then(PlicInterrupt::from_specifier)
         .unwrap_or_else(|| panic!("virtio-gpu node at {base:#x} has no valid interrupt source"));
     let device =
         unsafe { helios_virtio::gpu_from_mmio(header, candidate.size) }.unwrap_or_else(|error| {
@@ -81,6 +81,6 @@ fn discover_display_device(fdt: &Fdt<'_>) -> Option<(VirtioDisplayDevice, Interr
         VirtioDisplayDevice {
             inner: Arc::new(device),
         },
-        source,
+        line,
     ))
 }

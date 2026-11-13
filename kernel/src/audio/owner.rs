@@ -81,13 +81,14 @@ use super::service::{
 /// The device is never handed anywhere else. What callers get back is a
 /// handle to the tasks this spawns, which is what a claim and every
 /// period after it travels through.
-pub fn install_audio_device<CpuImpl, WatchdogImpl, Device>(
-    kernel: &Kernel<CpuImpl, WatchdogImpl>,
+pub fn install_audio_device<CpuImpl, WatchdogImpl, MeasuredBootImpl, Device>(
+    kernel: &Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
     device: Device,
 ) -> AudioService
 where
     CpuImpl: Cpu + Clone + Send + Sync + 'static,
     WatchdogImpl: Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
     Device: PlaybackDevice + Clone,
 {
     let mut playback = ArrayVec::new();
@@ -229,11 +230,11 @@ pub(super) async fn serve_playback<Device, CpuImpl>(
 
 /// Hand everything a released claim held back to the machine.
 ///
-/// The order is what makes it safe to release the caller's pages
-/// afterwards: the clock stops, the device gives up what it allocated
-/// for the stream, and only then is the arena dropped. A device still
-/// latching a period whose pages had gone back to a pool would play
-/// another instance's memory.
+/// The clock stops and the device gives up what it allocated for the
+/// stream. The period buffers are not this function's to free: a ring
+/// the pump was playing from is held by the pump until it has collected
+/// every chain it submitted, so a device still latching a period never
+/// sees its run go back to a pool.
 async fn finish_release<Device: PlaybackDevice>(device: &Device, shared: &StreamShared) {
     if let Err(error) = quiesce(device, shared).await {
         // The claim is going back either way — the device is told, its
@@ -244,9 +245,6 @@ async fn finish_release<Device: PlaybackDevice>(device: &Device, shared: &Stream
             stream = shared.id().index(),
             "the sound device would not release a stream whose claim is going back"
         );
-    }
-    while let Ok(pins) = shared.returned.pop() {
-        drop(pins);
     }
     shared.drain_feedback();
     // A claim let go without ever playing still owes its reader an end.

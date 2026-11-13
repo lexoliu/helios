@@ -1,6 +1,6 @@
 [toolchain]
-channel = "nightly-2026-06-15"
-components = ["rust-src", "clippy", "rustfmt"]
+channel = "nightly-2026-11-03"
+components = ["rust-src", "clippy", "rustfmt", "llvm-tools"]
 targets = [
     "aarch64-unknown-none",
     "riscv64gc-unknown-none-elf",
@@ -9,4 +9,8 @@ targets = [
     "wasm32-wasip1-threads",
     "wasm32-wasip1",
     "wasm32-unknown-unknown",
+    # `helios-compiler-host`, cross-built for the bench's Fedora guests by
+    # tools/bench/native/build.sh.
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
 ]

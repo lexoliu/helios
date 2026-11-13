@@ -71,9 +71,13 @@ pub mod device {
             path: "../wit",
             world: "device-host",
             imports: {
-                // The one call that hands back a stream has to see the
-                // store, so it can build the reader against it.
+                // The call that hands back a stream has to see the store,
+                // so it can build the reader against it; the two that
+                // take a span have to see it to read the memory's base
+                // and current size at the call.
                 "helios:system/device.[method]grant.interrupts": store | trappable,
+                "helios:system/device.[method]grant.map-region": store | trappable,
+                "helios:system/device.[method]grant.dma-alloc": store | trappable,
                 default: trappable,
             },
             with: {
@@ -118,6 +122,13 @@ pub mod display {
                     crate::wasmtime_adapter::component_host::DisplayHandle,
                 "helios:system/display.surface":
                     crate::wasmtime_adapter::component_host::SurfaceHandle,
+                // A blob surface names a `gpu.blob`, which is the gpu
+                // bindings' resource: one type for one handle, whichever
+                // interface the guest passes it through.
+                "helios:system/gpu":
+                    crate::wasmtime_adapter::bindings::gpu::bindings::helios::system::gpu,
+                "helios:system/memory":
+                    crate::wasmtime_adapter::bindings::gpu::bindings::helios::system::memory,
             },
             require_store_data_send: true,
         });
@@ -216,8 +227,8 @@ pub mod gpu {
                 "helios:system/gpu.[method]context.fences": store | trappable,
                 // Everything that reaches the display engine is an
                 // `async func` in the WIT and is generated against the
-                // store on its own account. What is left — claiming,
-                // reading back where a buffer landed, dropping a handle
+                // store on its own account. What is left — opening,
+                // reading back a blob's resource id, dropping a handle
                 // — is store bookkeeping and answers without waiting.
                 default: trappable,
             },
@@ -268,6 +279,35 @@ pub mod audio {
                 "helios:system/audio.playback":
                     crate::wasmtime_adapter::component_host::PlaybackHandle,
             },
+            require_store_data_send: true,
+        });
+    }
+}
+
+/// Bindings for the interface a program reaches the machine's processor
+/// lifecycle through.
+///
+/// Generated from the `processors-host` world, for the reason
+/// `audio-host` is: the kernel implements this one interface for both
+/// program worlds, and the program bindings above already provide every
+/// `wasi:cli` import a caller also has.
+pub mod processors {
+    pub mod bindings {
+        use wasmtime;
+
+        wasmtime::component::bindgen!({
+            path: "../wit",
+            world: "processors-host",
+            imports: {
+                // The transitions are `async func` in the WIT and are
+                // generated against the store on their own account;
+                // reading the sets is two atomic loads per processor
+                // and answers without waiting.
+                default: trappable,
+            },
+            // The answers are compared case for case where the
+            // lifecycle's results are mapped onto them.
+            additional_derives: [PartialEq, Eq],
             require_store_data_send: true,
         });
     }

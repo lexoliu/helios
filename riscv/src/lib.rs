@@ -20,16 +20,20 @@ mod debug_state {
     /// The network service this machine's virtio-net device backs.
     pub(crate) type NetworkService =
         helios_kernel::NetworkService<crate::RiscvCpu, crate::net::VirtioNetworkDevice>;
-    pub(crate) type RuntimeState = helios_kernel::HostRuntimeState<
-        crate::RiscvCpu,
-        NetworkService,
-        crate::host_fs::HostFileSystemService,
-    >;
-    pub(crate) type ProgramService = helios_kernel::UserProgramService<
-        crate::RiscvCpu,
-        NetworkService,
-        crate::host_fs::HostFileSystemService,
-    >;
+    pub(crate) type RuntimeState =
+        helios_kernel::HostRuntimeState<crate::RiscvCpu, NetworkService, Storage>;
+    pub(crate) type ProgramService =
+        helios_kernel::UserProgramService<crate::RiscvCpu, NetworkService, Storage>;
+
+    /// This machine's storage: the virtio-9p host share and the
+    /// virtio-blk disks.
+    #[derive(Clone, Copy)]
+    pub(crate) struct Storage;
+
+    impl helios_kernel::Storage for Storage {
+        type HostShare = crate::host_fs::HostFileSystemService;
+        type Disk = crate::block::RiscvVirtioBlockDevice;
+    }
 }
 
 use ns16550a::{Break, DLAB, ParityBit, ParitySelect, StickParity, StopBits, Uart, WordLength};
@@ -44,9 +48,9 @@ const UART_IER_RDI: u8 = 1 << 0;
 #[derive(Clone, Copy)]
 pub(crate) struct DebugTransport {
     uart_base: usize,
-    /// The PLIC source the same device-tree node routes the port's
+    /// The PLIC line the same device-tree node routes the port's
     /// interrupt to.
-    plic_source: net::InterruptSourceId,
+    plic_line: net::PlicInterrupt,
 }
 
 impl DebugTransport {
@@ -71,9 +75,8 @@ impl DebugTransport {
         let region = node.reg()?.next()?;
         // The PLIC's specifier is a bare source number, the same
         // one-cell binding the grant walk decodes.
-        let plic_source = helios_virtio::node_interrupt(fdt, &node)
-            .and_then(|interrupt| NonZeroU32::new(interrupt.number))
-            .map(net::InterruptSourceId)
+        let plic_line = helios_virtio::node_interrupt(fdt, &node)
+            .and_then(net::PlicInterrupt::from_specifier)
             .unwrap_or_else(|| {
                 panic!(
                     "the {} debug UART node declares no PLIC source in its interrupts cell; \
@@ -83,7 +86,7 @@ impl DebugTransport {
             });
         Some(Self {
             uart_base: region.starting_address as usize,
-            plic_source,
+            plic_line,
         })
     }
 
@@ -138,29 +141,33 @@ pub(crate) fn count_virtio_mmio_devices(fdt: &Fdt<'_>, expected: DeviceType) -> 
 }
 
 use core::arch::{asm, global_asm};
-use core::num::{NonZeroU32, NonZeroUsize};
+use core::num::NonZeroUsize;
 use core::ops::Range;
-use core::sync::atomic::{AtomicUsize, Ordering, compiler_fence};
+use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering, compiler_fence};
 
 use arrayvec::ArrayVec;
 use fdt::Fdt;
+use helios_firmware::{DeviceTreeNuma, ProcessorIdentities};
+use helios_hal::boot::{BootMemoryKind, BootMemoryRegion, BootReservedRanges, usable_node_regions};
 use helios_hal::cpu::{
     Cpu, GUEST_STACK_LIMIT_OFFSET, Instant, ProcessorId, Timebase, TimerInterrupt,
     current_processor,
 };
 use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::memory::MemoryRegion;
+use helios_hal::numa::NumaTopology;
 use helios_hal::serial::ByteSerial;
 use helios_hal::{DeviceInventory, DmaModel, ProcessorStartupPolicy, ProcessorTopology};
 use helios_kernel::{
-    DebugSerialAccess, KernelException, KernelExceptionCause, KernelExceptionDispatch,
-    KernelNativeTrapHandler, Timer, WasmtimeTlsSlots,
+    DebugSerialAccess, KernelException, KernelExceptionCause, KernelNativeTrapHandler, Timer,
+    WasmtimeTlsSlots,
 };
 use riscv::interrupt::Trap;
 use riscv::interrupt::supervisor::{Exception, Interrupt};
 use riscv_rt::entry;
 use spin::Once;
 
+mod lifecycle;
 mod trap;
 
 pub use trap::{GeneralRegs, TrapFrame};
@@ -351,8 +358,17 @@ struct HartRuntime {
     hart_id: ProcessorId,
     timer: Timer<RiscvCpu>,
     wasmtime_tls: WasmtimeTlsSlots,
-    external_interrupts: Option<net::ExternalInterrupts>,
+    /// The PLIC domains this hart takes interrupts for, if any; the
+    /// `SupervisorExternal` trap arm claims from them.
+    external_interrupts: Option<net::HartInterrupts>,
     program_service: Option<debug_state::ProgramService>,
+    /// The stack a kernel exception the kernel did not resolve is handed
+    /// to the runtime from (`trap::hand_over_trap`). It is not the trap
+    /// stack because the hand-over gives that back before the runtime's
+    /// handler runs, so the next trap can carve its region at the top.
+    hand_over_stack: Range<usize>,
+    /// The record of this hart's trap hand-over self-check.
+    hand_over_probe: trap::HandOverProbe,
 }
 
 const _: () = assert!(
@@ -454,6 +470,32 @@ extern "Rust" fn helios_current_processor() -> ProcessorId {
     }
 }
 
+/// The supervisor timer and external interrupt enables cleared on the
+/// hart that took them, and put back as they were when dropped. Only the
+/// software interrupt, the wake, stays enabled meanwhile; the rest stays
+/// pending in `sip`. `sie` is the hart's own register, so the value is
+/// not `Send`; it leaves `sstatus.SIE` alone.
+pub struct RiscvWakeOnlyMask {
+    timer: bool,
+    external: bool,
+    _processor_local: core::marker::PhantomData<*mut ()>,
+}
+
+impl Drop for RiscvWakeOnlyMask {
+    fn drop(&mut self) {
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: restores the bits read when the mask was raised.
+        unsafe {
+            if self.timer {
+                riscv::register::sie::set_stimer();
+            }
+            if self.external {
+                riscv::register::sie::set_sext();
+            }
+        }
+    }
+}
+
 impl Cpu for RiscvCpu {
     // SBI `set_timer` programs this hart's one-shot comparator.
     const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
@@ -470,12 +512,58 @@ impl Cpu for RiscvCpu {
         riscv::asm::wfi();
     }
 
+    type WakeOnlyMask = RiscvWakeOnlyMask;
+
+    fn mask_to_wake_only(&self) -> RiscvWakeOnlyMask {
+        // The wake is the supervisor software interrupt; the timer and the
+        // external interrupt (every device) are taken out of `sie`, so
+        // they stay pending in `sip` and a `wfi` neither ends on them nor
+        // delivers them. The shootdown is an SBI call that needs no
+        // supervisor interrupt on this hart.
+        let sie = riscv::register::sie::read();
+        let (timer, external) = (sie.stimer(), sie.sext());
+        // SAFETY: both bits are put back when the guard drops.
+        unsafe {
+            riscv::register::sie::clear_stimer();
+            riscv::register::sie::clear_sext();
+        }
+        compiler_fence(Ordering::SeqCst);
+        RiscvWakeOnlyMask {
+            timer,
+            external,
+            _processor_local: core::marker::PhantomData,
+        }
+    }
+
+    fn park_wake_only(&self, word: &AtomicU8, held: u8) {
+        assert!(
+            !riscv::register::sstatus::read().sie(),
+            "RISC-V park_wake_only was entered with supervisor interrupts enabled, before the \
+             enable set was narrowed"
+        );
+        // A `wfi` ends on any pending interrupt that `sie` enables,
+        // whatever `sstatus.SIE` says, so a wake raised between the test
+        // below and the `wfi` completes it at once.
+        let mask = self.mask_to_wake_only();
+        while word.load(Ordering::Acquire) == held {
+            riscv::asm::wfi();
+            // The wait leaves the software interrupt pending: taking it
+            // runs the trap handler that clears it. Nothing else is
+            // enabled in `sie`, so nothing else is taken in the window.
+            // SAFETY: the window is closed again on the next line.
+            unsafe { riscv::interrupt::supervisor::enable() };
+            riscv::interrupt::supervisor::disable();
+        }
+        drop(mask);
+    }
+
     fn start_processor(&self, hart: ProcessorId) {
         match hart_status(hart) {
             sbi_spec::hsm::hart_state::STARTED => {
                 self.wake_processor(hart);
             }
             sbi_spec::hsm::hart_state::STOPPED => {
+                lifecycle::assert_never_stopped(hart);
                 let ret = sbi_rt::hart_start(
                     hart.id() as usize,
                     core::ptr::addr_of!(_secondary_start).addr(),
@@ -498,6 +586,14 @@ impl Cpu for RiscvCpu {
                 state
             ),
         }
+    }
+
+    fn stop_current(&self) {
+        lifecycle::stop_current();
+    }
+
+    fn restart_processor(&self, hart: ProcessorId) {
+        lifecycle::restart_processor(hart);
     }
 
     fn wake_processor(&self, hart: ProcessorId) {
@@ -608,9 +704,14 @@ fn trap_dispatch(tf: &mut TrapFrame) {
             }
             current_hart_runtime().timer.handle_interrupt();
         }
-        Ok(Trap::Interrupt(Interrupt::SupervisorSoft)) => unsafe {
-            riscv::register::sip::clear_ssoft();
-        },
+        Ok(Trap::Interrupt(Interrupt::SupervisorSoft)) => {
+            if let Some(runtime) = installed_hart_runtime() {
+                runtime.hand_over_probe.record_interrupt(tf);
+            }
+            unsafe {
+                riscv::register::sip::clear_ssoft();
+            }
+        }
         Ok(Trap::Interrupt(Interrupt::SupervisorExternal)) => {
             let runtime = current_hart_runtime();
             let interrupts = runtime.external_interrupts.as_ref().unwrap_or_else(|| {
@@ -621,6 +722,10 @@ fn trap_dispatch(tf: &mut TrapFrame) {
             });
             interrupts.handle();
         }
+        // The trap hand-over self-check's second trap is resolved in place.
+        Ok(Trap::Exception(Exception::Breakpoint))
+            if installed_hart_runtime()
+                .is_some_and(|runtime| runtime.hand_over_probe.resolve_returning_trap(tf)) => {}
         Ok(Trap::Exception(exception)) => {
             handle_exception(exception, tf);
         }
@@ -639,9 +744,21 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     write_hart_identity(ProcessorIdentity::bootstrapping(hart_id));
     let fdt = unsafe { Fdt::from_ptr(fdt_addr as *const u8) }
         .expect("OpenSBI did not provide a valid FDT");
-    let mut cpus = fdt.cpus();
-    let first_cpu = cpus.next().expect("FDT does not describe any CPU");
+    let mut cpus = fdt.cpus().filter(|cpu| cpu_is_usable(*cpu));
+    let first_cpu = cpus.next().expect("FDT does not describe any usable CPU");
     let hart_count = 1 + cpus.count();
+    // Processor ids are the hart ids and the possible set is dense, so the
+    // usable harts must be exactly `0..hart_count`: a gap would name a
+    // processor the machine cannot start, and an id past the count one
+    // the kernel never sizes for.
+    for cpu in fdt.cpus().filter(|cpu| cpu_is_usable(*cpu)) {
+        let id = cpu.ids().first();
+        assert!(
+            id < hart_count,
+            "FDT describes usable hart {id} but only {hart_count} harts are usable; \
+             processor ids are hart ids and must be dense"
+        );
+    }
     assert!(
         hart_count <= MAX_TRACKED_HARTS,
         "FDT describes {hart_count} harts but this backend tracks at most {MAX_TRACKED_HARTS}"
@@ -653,7 +770,11 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     // allocator is primed with below.
     let initrd = initrd_range(&fdt);
     let allocator_window = allocator_window();
-    let memory_regions = collect_memory_regions(fdt.memory(), allocator_window.clone(), &initrd);
+    // A tree without `numa-node-id` describes one node holding every hart
+    // and all of memory.
+    let numa = DeviceTreeNuma::new(&fdt, HartIds { harts: hart_count })
+        .unwrap_or_else(|error| panic!("FDT NUMA description refused: {error}"));
+    let memory_regions = collect_memory_regions(&fdt, allocator_window.clone(), &initrd, &numa);
     let current_hart = ProcessorId::new(hart_id as u16);
     let bootstrap_processor = remember_bootstrap_hart(hart_id);
     mark_hart_online(current_hart);
@@ -666,8 +787,7 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     // the identity map is owned by `RiscvUserAddressSpace`, which is
     // where the runtime's linear-memory reservations live.
     for region in &memory_regions {
-        let start = region.as_ptr().cast::<u8>() as usize;
-        let end = start + region.len();
+        let (start, end) = (region.start(), region.end());
         assert!(
             end <= vmm::KERNEL_IDENTITY_LIMIT,
             "firmware reports physical memory at {start:#x}..{end:#x}, past the {:#x} the Sv48 \
@@ -688,7 +808,11 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         release_early_boot_harts();
     }
     if current_hart == bootstrap_processor {
-        helios_kernel::prime_bootstrap_allocator(memory_regions.iter().copied(), hart_count);
+        helios_kernel::prime_bootstrap_allocator(
+            memory_regions.iter().copied(),
+            &numa,
+            bootstrap_processor,
+        );
     }
 
     let debug_state = shared_debug_state(timebase, hart_count, initrd.clone());
@@ -739,19 +863,14 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         tracing::info!("no virtio-snd node in the device tree; this machine has no sound device");
     }
     let kernel = helios_kernel::init_with_watchdog(
-        helios_kernel::Platform::with_watchdog(
-            console,
-            memory_regions.into_iter(),
-            cpu.clone(),
-            watchdog,
-        )
-        .with_topology(
-            ProcessorTopology::start_all_secondaries(bootstrap_processor, hart_count)
-                .with_startup_policy(ProcessorStartupPolicy::BootstrapOnly),
-        )
-        .with_timer_frequency_hz(timebase.frequency())
-        .with_dma_model(DmaModel::Identity)
-        .with_devices(devices),
+        helios_kernel::Platform::with_watchdog(console, cpu.clone(), watchdog)
+            .with_topology(
+                ProcessorTopology::start_all_secondaries(bootstrap_processor, hart_count)
+                    .with_startup_policy(ProcessorStartupPolicy::BootstrapOnly),
+            )
+            .with_timer_frequency_hz(timebase.frequency())
+            .with_dma_model(DmaModel::Identity)
+            .with_devices(devices),
     );
     // The root DRBG is seeded once, on the bootstrap hart, before
     // anything can ask for random bytes. RISC-V has no unprivileged
@@ -782,10 +901,12 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         debug_state.install_root_entropy(root.clone());
         // The calendar is read once, on the bootstrap hart, before any
         // component can ask what time it is. The hart timer carries wall
-        // time forward from that reading; nothing re-synchronises it.
-        match rtc::discover(&fdt) {
+        // time forward from that reading; only a machine restore re-reads
+        // it, which the reactions task does with the same clock.
+        let rtc = rtc::discover(&fdt);
+        match &rtc {
             Some(rtc) => {
-                debug_state.seed_wall_clock(cpu.now().ticks(), &rtc);
+                debug_state.seed_wall_clock(cpu.now().ticks(), rtc);
             }
             None => {
                 tracing::warn!(
@@ -793,96 +914,110 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
                 );
             }
         }
+        helios_kernel::install_generation_reactions(&kernel, debug_state.clone(), rtc);
         root
     });
     // Only the bootstrap hart brings devices up, and it is the hart
     // that holds the root DRBG handle.
-    let external_interrupts = root_entropy.and_then(|root_entropy| {
-        // Every platform device shares one PLIC context, so the context
-        // is opened once and each device attaches its own source to it.
-        net::discover_plic_context(&fdt, bootstrap_processor.id()).map(|(plic, context)| {
-            let mut interrupts = net::ExternalInterrupts::new(plic, context);
-            // The device path's platform surface comes up with the
-            // controller and before any grant is published, which the
-            // registry enforces.
-            device::install_hooks(plic, context);
-            // The boot UART is a device the kernel drives itself: its
-            // PLIC source is enabled and prioritised like the virtio
-            // devices'. The handler masks the receive line at the port
-            // and raises the debug console's receive signal; the waiter
-            // re-arms the line while it listens.
-            if let Some(transport) = DEBUG_TRANSPORT.get().copied() {
-                interrupts.attach_debug_serial(
-                    transport.plic_source,
-                    DebugTransport::console().interrupt_handler::<DebugTransport>(),
-                );
-            }
-            if let Some(network) = net::install_network_service(&cpu, &kernel, &fdt, &debug_state) {
-                interrupts.attach_network(network);
-            }
-            if let Some(host_fs) = host_fs::install(&cpu, &fdt, &debug_state) {
-                interrupts.attach_host_fs(host_fs);
-            }
-            if let Some(entropy) = entropy_device {
-                entropy::install(&kernel, &entropy, root_entropy.clone());
-                interrupts.attach_entropy(entropy);
-            }
-            if let Some(balloon) = balloon::install(&kernel, &fdt) {
-                debug_state.install_memory_balloon(balloon.handle.clone());
-                interrupts.attach_balloon(balloon);
-            }
-            if let Some(vsock) = vsock::install(&kernel, &cpu, &fdt, &debug_state) {
-                interrupts.attach_vsock(vsock);
-            }
-            if let Some(display) = gpu::install(&cpu, &kernel, &fdt, &debug_state) {
-                interrupts.attach_display(display);
-            }
-            for device in input::install(&kernel, &fdt, &debug_state) {
-                interrupts.attach_input(device);
-            }
-            if let Some(sound) = snd::install(&kernel, &fdt, &debug_state) {
-                interrupts.attach_sound(sound);
-            }
-            for block in block::install(&cpu, &kernel, &fdt, &debug_state, root_entropy) {
-                interrupts.attach_block(block);
-            }
-            // Everything the kernel drives itself has claimed its
-            // source by now, so what the tree describes and nobody took
-            // is exactly what a driver plugin may be handed.
-            for (source, route) in device::publish_grants(&fdt, debug_state.device_grants()) {
-                interrupts.attach_device(source, route);
-            }
-            // The Sv48 address space reserves and commits lazily, so a page
-            // could be taken away here — but the backend has not wired the
-            // other half: no `SwapVmHooks` table, so a not-present PTE
-            // carries no swap token and the fault handler has nothing to
-            // look the page up by. Extending swap to this backend is #25's
-            // follow-up to #59.
-            helios_kernel::disable_swap(helios_kernel::SwapDisabled::NoSwapHooks);
-            interrupts
-        })
-    });
-    // The debug console's readers park on the UART's interrupt, so a
-    // machine that describes the UART but gives this hart no PLIC
-    // context to route it through would hang every serial read; refuse
-    // it here rather than at the first parked reader.
-    assert!(
-        current_hart != bootstrap_processor
-            || external_interrupts.is_some()
-            || DEBUG_TRANSPORT.get().is_none(),
-        "the device tree describes a debug UART but no PLIC supervisor-external context for \
-         hart {hart_id}; the serial line could only be polled"
-    );
+    if let Some(root_entropy) = root_entropy {
+        // A machine may carry several PLICs — QEMU's `virt` gives every
+        // socket its own and wires devices to different ones — so each
+        // PLIC is its own domain, taken by one hart with a context in
+        // it, and each device attaches to the domain its node's
+        // interrupt parent names.
+        let mut domains = net::InterruptDomains::discover(&fdt, bootstrap_processor);
+        // The device path's platform surface comes up before any grant
+        // is published, which the registry enforces.
+        device::install_hooks();
+        // The boot UART is a device the kernel drives itself: its
+        // PLIC source is enabled and prioritised like the virtio
+        // devices'. The handler masks the receive line at the port
+        // and raises the debug console's receive signal; the waiter
+        // re-arms the line while it listens.
+        if let Some(transport) = DEBUG_TRANSPORT.get().copied() {
+            // The debug console's readers park on the UART's interrupt,
+            // so a UART on a controller no hart takes interrupts from
+            // would hang every serial read; refuse it here rather than
+            // at the first parked reader.
+            assert!(
+                domains.takes(transport.plic_line.controller),
+                "the device tree wires the debug UART to the interrupt controller at {:#x}, in \
+                 which no hart has a PLIC supervisor-external context; the serial line could \
+                 only be polled",
+                transport.plic_line.controller.base()
+            );
+            domains.attach_debug_serial(
+                transport.plic_line,
+                DebugTransport::console().interrupt_handler::<DebugTransport>(),
+            );
+        }
+        if let Some(network) = net::install_network_service(&cpu, &kernel, &fdt, &debug_state) {
+            domains.attach_network(network);
+        }
+        if let Some(host_fs) = host_fs::install(&cpu, &fdt, &debug_state) {
+            domains.attach_host_fs(host_fs);
+        }
+        if let Some(entropy) = entropy_device {
+            entropy::install(&kernel, &entropy, root_entropy.clone());
+            domains.attach_entropy(entropy);
+        }
+        if let Some(balloon) =
+            balloon::install(&kernel, &fdt, debug_state.machine_generation_handle())
+        {
+            debug_state.install_memory_balloon(balloon.handle.clone());
+            domains.attach_balloon(balloon);
+        }
+        if let Some(vsock) = vsock::install(&kernel, &cpu, &fdt, &debug_state) {
+            domains.attach_vsock(vsock);
+        }
+        if let Some(display) = gpu::install(&cpu, &kernel, &fdt, &debug_state) {
+            domains.attach_display(display);
+        }
+        for device in input::install(&kernel, &fdt, &debug_state) {
+            domains.attach_input(device);
+        }
+        if let Some(sound) = snd::install(&kernel, &fdt, &debug_state) {
+            domains.attach_sound(sound);
+        }
+        for block in block::install(&cpu, &kernel, &fdt, &debug_state, root_entropy) {
+            domains.attach_block(block);
+        }
+        // Everything the kernel drives itself has claimed its
+        // source by now, so what the tree describes and nobody took
+        // is exactly what a driver plugin may be handed.
+        let grants = device::publish_grants(&fdt, debug_state.device_grants(), &domains);
+        for (line, route) in grants {
+            domains.attach_device(line, route);
+        }
+        // Every route is in place, and no secondary hart has been
+        // started: each takes its domains from the published table when
+        // it builds its runtime below.
+        net::publish_interrupt_domains(domains);
+        // The Sv48 address space reserves and commits lazily, so a page
+        // could be taken away here — but the backend has not wired the
+        // other half: no `SwapVmHooks` table, so a not-present PTE
+        // carries no swap token and the fault handler has nothing to
+        // look the page up by. Extending swap to this backend is #25's
+        // follow-up to #59.
+        helios_kernel::disable_swap(helios_kernel::SwapDisabled::NoSwapHooks);
+    }
     let mut hart_runtime = HartRuntime {
         trap_stack: trap::allocate_trap_stack(),
         guest_stack_limit: AtomicUsize::new(usize::MAX),
         hart_id: current_hart,
         timer: kernel.timer(),
         wasmtime_tls: WasmtimeTlsSlots::new(),
-        external_interrupts,
+        external_interrupts: net::HartInterrupts::of(current_hart),
         program_service: None,
+        hand_over_stack: trap::allocate_trap_stack(),
+        hand_over_probe: trap::HandOverProbe::new(),
     };
     hart_runtime.install();
+    // Only now, on the hart itself: the firmware reset this hart's PLIC
+    // contexts when it started it, after the bootstrap hart's bring-up.
+    if let Some(interrupts) = hart_runtime.external_interrupts {
+        interrupts.open();
+    }
     // Every hart's timer preempts the guest running on it, so every hart
     // holds the service: the bootstrap hart installs it, and the others,
     // which it starts only afterwards, take the installed one.
@@ -937,9 +1072,26 @@ fn shared_debug_state(
                 hart_count,
                 riscv::register::time::read64(),
                 payload,
+                // The RISC-V `Cpu` answers no feature probe (`native_feature_probe`).
+                helios_kernel::GuestIsa::for_build_target(None),
             )
         })
         .clone()
+}
+
+/// Whether a `/cpus/cpu*` node describes a hart the machine can run.
+///
+/// The device tree specification defaults `status` to `okay` when absent;
+/// `disabled` is a hart that is present but not started (it may be brought
+/// up later), and `reserved` and `fail` are not usable at all. None of the
+/// three is a processor this kernel's possible set holds.
+fn cpu_is_usable(cpu: fdt::standard_nodes::Cpu<'_, '_>) -> bool {
+    cpu.property("status").is_none_or(|status| {
+        status
+            .as_str()
+            .unwrap_or_else(|| panic!("a cpu node's status is not a string"))
+            == "okay"
+    })
 }
 
 fn shared_watchdog(fdt: &Fdt<'_>) -> watchdog::RiscvWatchdog {
@@ -950,6 +1102,7 @@ unsafe extern "C" {
     static __ebss: u8;
     static _stack_start: u8;
     static _secondary_start: u8;
+    static _hart_restart: u8;
     fn _release_mp_harts();
 }
 
@@ -994,15 +1147,51 @@ fn initrd_range(fdt: &Fdt<'_>) -> Range<usize> {
     start..end
 }
 
-fn collect_memory_regions<'fdt>(
-    memory: fdt::standard_nodes::Memory<'fdt, 'fdt>,
+/// The firmware identity of each processor. A hart's [`ProcessorId`] is its
+/// hart id (`run_hart`), and a devicetree cpu node's `reg` is the hart id
+/// too, so the mapping is the identity.
+struct HartIds {
+    harts: usize,
+}
+
+impl ProcessorIdentities for HartIds {
+    fn processor_count(&self) -> usize {
+        self.harts
+    }
+
+    fn hardware_id(&self, processor: ProcessorId) -> u64 {
+        u64::from(processor.id())
+    }
+}
+
+/// Capacity for the allocator regions: a devicetree carries one `memory`
+/// node per range, and the initrd carve-out splits one of them in two. A
+/// tree that describes more is refused by name below.
+const MAX_MEMORY_REGIONS: usize = 16;
+
+/// Every `reg` range of every node whose `device_type` is `memory`, clipped
+/// to the allocator window with the initrd taken out.
+fn collect_memory_regions<Numa: NumaTopology>(
+    fdt: &Fdt<'_>,
     allocator_window: Range<usize>,
     initrd: &Range<usize>,
-) -> ArrayVec<MemoryRegion, 8> {
+    numa: &Numa,
+) -> ArrayVec<MemoryRegion, MAX_MEMORY_REGIONS> {
     let mut regions = ArrayVec::new();
+    let mut reserved = BootReservedRanges::new();
+    reserved.reserve(initrd.clone());
 
-    for region in memory
-        .regions()
+    for region in fdt
+        .all_nodes()
+        .filter(|node| {
+            node.property("device_type")
+                .is_some_and(|property| property.value == b"memory\0")
+        })
+        .flat_map(|node| {
+            node.reg().unwrap_or_else(|| {
+                panic!("FDT memory node {} has no usable reg property", node.name)
+            })
+        })
         .map(|region| {
             let start = region.starting_address as usize;
             let end = start
@@ -1012,9 +1201,15 @@ fn collect_memory_regions<'fdt>(
             start..end
         })
         .filter_map(|region| intersect(region, allocator_window.clone()))
-        .flat_map(|region| subtract(region, initrd))
-        .flatten()
-        .map(range_to_memory_region)
+        .map(|region| BootMemoryRegion {
+            start: region.start as u64,
+            end: region.end as u64,
+            kind: BootMemoryKind::Usable,
+        })
+        // SAFETY: the memory nodes are RAM nothing else owns, reachable at
+        // its physical address through the kernel identity map, and the
+        // initrd is reserved out.
+        .flat_map(|region| unsafe { usable_node_regions(region, &reserved, 0, numa) })
     {
         regions.try_push(region).unwrap_or_else(|_| {
             panic!("FDT described more memory regions than the kernel supports")
@@ -1024,30 +1219,11 @@ fn collect_memory_regions<'fdt>(
     regions
 }
 
-/// `region` with `reserved` taken out of it: up to two pieces, either of
-/// which may be empty. The riscv backend's only reservation is the
-/// initrd, a single contiguous range, so a region never splits further.
-fn subtract(region: Range<usize>, reserved: &Range<usize>) -> [Option<Range<usize>>; 2] {
-    if reserved.end <= region.start || reserved.start >= region.end {
-        return [Some(region), None];
-    }
-    let below = (reserved.start > region.start).then_some(region.start..reserved.start);
-    let above = (reserved.end < region.end).then_some(reserved.end..region.end);
-    [below, above]
-}
-
 fn intersect(left: Range<usize>, right: Range<usize>) -> Option<Range<usize>> {
     let start = left.start.max(right.start);
     let end = left.end.min(right.end);
 
     (start < end).then_some(start..end)
-}
-
-fn range_to_memory_region(range: Range<usize>) -> MemoryRegion {
-    let len = range.end - range.start;
-    let slice = core::ptr::slice_from_raw_parts_mut(range.start as *mut u8, len);
-
-    unsafe { MemoryRegion::new_unchecked(slice) }
 }
 
 use helios_hal::align_up;
@@ -1241,15 +1417,17 @@ unsafe fn configure_interrupts() {
     // prove it round-trips the floating-point file. §3.4: every hart proves
     // it for itself, because `FS` and the trap vector are per-hart state.
     trap::verify_trap_preserves_fp_state();
+    // `sscratch` and the hand-over stack are per-hart state too.
+    trap::verify_trap_hand_over();
 }
 
 /// Handles one synchronous exception.
 ///
 /// Returns only when the fault was resolved in place and the trap
 /// epilogue should restore the interrupted context and run the faulting
-/// instruction again. Every other path diverges: into the runtime's trap
-/// handler, which unwinds the guest and never comes back, or into a
-/// panic.
+/// instruction again. Every other path diverges: into the hand-over to
+/// the runtime's trap handler (`trap::hand_over_trap`), which leaves the
+/// trap stack for good, or into a panic.
 fn handle_exception(exception: Exception, tf: &TrapFrame) {
     let stval = riscv::register::stval::read();
     // A reserved page inside a live fiber stack is a demand commit the
@@ -1266,56 +1444,36 @@ fn handle_exception(exception: Exception, tf: &TrapFrame) {
     }
     match trap_origin(tf) {
         TrapOrigin::Kernel => {
-            if dispatch_kernel_exception(exception, stval, tf) == KernelExceptionDispatch::Unhandled
-            {
+            let Some(cause) = kernel_exception_cause(exception) else {
                 panic!(
                     "kernel exception: {exception:?}, sepc={:#x}, stval={:#x}{stack_fault}, \
                      tf={tf:#x?}",
                     tf.sepc, stval,
                 );
-            }
-            unreachable!("handled kernel exception returned to the RISC-V dispatcher")
+            };
+            let refusal = trap::hand_over_trap(
+                trap::TrapHandOver {
+                    exception: KernelException {
+                        cause,
+                        instruction_pointer: tf.sepc,
+                        frame_pointer: tf.general.s0,
+                        faulting_address: kernel_exception_faulting_address(exception, stval),
+                    },
+                    cause: exception,
+                    stval,
+                    stack_fault,
+                    frame_address: core::ptr::from_ref(tf) as usize,
+                    frame: *tf,
+                },
+                tf,
+            );
+            panic!(
+                "kernel exception: {exception:?}, sepc={:#x}, stval={:#x}{stack_fault}, \
+                 tf={tf:#x?}; not handed to the runtime because {refusal}",
+                tf.sepc, stval,
+            )
         }
         TrapOrigin::User => handle_user_exception(exception, stval, tf),
-    }
-}
-
-fn dispatch_kernel_exception(
-    exception: Exception,
-    stval: usize,
-    tf: &TrapFrame,
-) -> KernelExceptionDispatch {
-    let Some(cause) = kernel_exception_cause(exception) else {
-        return KernelExceptionDispatch::Unhandled;
-    };
-    trap::restore_trap_stack_for_unwind(tf);
-    restore_sie_for_unwind(tf);
-    helios_kernel::dispatch_native_trap(KernelException {
-        cause,
-        instruction_pointer: tf.sepc,
-        frame_pointer: tf.general.s0,
-        faulting_address: kernel_exception_faulting_address(exception, stval),
-    })
-}
-
-/// Puts the interrupted context's supervisor interrupt enable back
-/// before an exception is handed to the runtime's trap handler.
-///
-/// The handler never returns for a trap it claims: it unwinds out of
-/// this handler onto the interrupted stack, so the `sret` that would
-/// have restored `SIE` from `SPIE` never runs and the trap entry's
-/// clearing of it would outlive the handler. Everything the unwind
-/// lands in — the store's teardown, its fiber stack's release, the TLB
-/// shootdown that release broadcasts — is the interrupted code's
-/// continuation and runs on that code's terms, so `SIE` is restored
-/// here, before the hand-over. The panic path for a trap the runtime
-/// declines runs with it restored too.
-fn restore_sie_for_unwind(tf: &TrapFrame) {
-    if tf.sstatus & SSTATUS_SPIE_BIT != 0 {
-        // SAFETY: the interrupted context ran with supervisor interrupts
-        // enabled, and what runs from here is that context's
-        // continuation.
-        unsafe { riscv::interrupt::supervisor::enable() };
     }
 }
 

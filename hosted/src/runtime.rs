@@ -2,14 +2,16 @@ use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle, Thread};
 use std::time::{Duration, Instant as StdInstant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase};
 use helios_hal::memory::MemoryRegion;
+use helios_hal::numa::{NodeId, SingleNode};
 use helios_hal::{DeviceInventory, DmaModel, Platform, ProcessorStartupPolicy, ProcessorTopology};
+use helios_kernel::Timer;
 
 use crate::config::HostedConfig;
 use crate::console::HostedConsole;
@@ -22,7 +24,17 @@ const NANOS_PER_SECOND: u64 = 1_000_000_000;
 
 type HostedNetworkService = helios_kernel::NetworkService<HostedCpu, HostedNetworkDevice>;
 type HostedRuntimeState =
-    helios_kernel::HostRuntimeState<HostedCpu, HostedNetworkService, HostedFileSystem>;
+    helios_kernel::HostRuntimeState<HostedCpu, HostedNetworkService, HostedStorage>;
+
+/// The hosted machine's storage: the host directory it shares, and no
+/// disk.
+#[derive(Clone, Copy)]
+pub(crate) struct HostedStorage;
+
+impl helios_kernel::Storage for HostedStorage {
+    type HostShare = HostedFileSystem;
+    type Disk = helios_kernel::NoDisks;
+}
 
 /// Shared debug state across all hosted processor threads.
 static DEBUG_STATE: OnceLock<HostedRuntimeState> = OnceLock::new();
@@ -132,6 +144,10 @@ const DEBUG_SERIAL_WRITER: helios_kernel::DebugSerialWriter =
 pub struct HostedRuntime {
     machine: Arc<HostedMachine>,
     config: HostedConfig,
+    /// The user payload `--bootfs` named, parsed once at start-up and
+    /// shared by every processor thread — the hosted backend's boot
+    /// module.
+    payload: helios_kernel::BootPayload,
 }
 
 pub(crate) struct HostedMachine {
@@ -142,10 +158,6 @@ pub(crate) struct HostedMachine {
     /// nanosecond.
     timebase: Timebase,
     heap: HeapReservation,
-    /// The user payload `--bootfs` named, parsed once at start-up and
-    /// shared by every processor thread — the hosted backend's boot
-    /// module.
-    payload: helios_kernel::BootPayload,
     slots: Box<[ProcessorSlot]>,
     timer_tx: Sender<TimerCommand>,
 }
@@ -153,6 +165,34 @@ pub(crate) struct HostedMachine {
 struct ProcessorSlot {
     thread: OnceLock<Thread>,
     started: AtomicBool,
+    /// Whether the processor is in service. A hosted processor taken out
+    /// of service waits on `restarted` rather than parking, so neither a
+    /// wake nor its timer thread's deadline can bring it back: only
+    /// `restart_processor` does.
+    run: Mutex<SlotRun>,
+    restarted: Condvar,
+    /// This processor's kernel timer, installed once its own
+    /// `helios_kernel::init` has run, so the timer interrupt can advance
+    /// it. Written once by the processor's own thread and read only by
+    /// it: only the owner runs its interrupt step.
+    timer: OnceLock<Timer<HostedCpu>>,
+    /// The processor's timer interrupt, raised by the timer thread when
+    /// the processor's deadline expires, before it unparks the
+    /// processor, and taken by the processor in `park_current`. It is a
+    /// level, not a count: expiries before the processor takes it are
+    /// one interrupt, as with a hardware comparator.
+    timer_interrupt: AtomicBool,
+}
+
+/// Where a hosted processor's thread stands between a stop and a restart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SlotRun {
+    Running,
+    Stopped,
+    /// The restart arrived before the processor reached its stop: the
+    /// window between the kernel publishing that it is stopping and the
+    /// thread getting here. The stop consumes it and returns at once.
+    RestartPending,
 }
 
 struct HeapReservation {
@@ -167,7 +207,12 @@ struct TimerCommand {
 impl HostedRuntime {
     pub fn new(config: HostedConfig) -> Self {
         Self {
-            machine: HostedMachine::new(&config),
+            machine: HostedMachine::new(
+                config.processor_count(),
+                config.bootstrap_processor(),
+                config.heap_bytes(),
+            ),
+            payload: load_payload(config.bootfs()),
             config,
         }
     }
@@ -181,6 +226,7 @@ impl HostedRuntime {
             let handle = spawn_processor_thread(
                 self.machine.clone(),
                 self.config.clone(),
+                self.payload,
                 processor,
                 ready_tx.clone(),
             );
@@ -206,20 +252,20 @@ impl HostedRuntime {
 }
 
 impl HostedMachine {
-    pub(crate) fn new(config: &HostedConfig) -> Arc<Self> {
+    pub(crate) fn new(
+        processor_count: usize,
+        bootstrap_processor: ProcessorId,
+        heap_bytes: usize,
+    ) -> Arc<Self> {
         let (timer_tx, timer_rx) = crossbeam_channel::unbounded();
         let started_at = StdInstant::now();
-        let payload = load_payload(config.bootfs());
         let machine = Arc::new(Self {
-            processor_count: config.processor_count(),
-            bootstrap_processor: config.bootstrap_processor(),
+            processor_count,
+            bootstrap_processor,
             started_at,
             timebase: Timebase::new(NANOS_PER_SECOND),
-            heap: HeapReservation::new(config.heap_bytes()),
-            payload,
-            slots: (0..config.processor_count())
-                .map(|_| ProcessorSlot::new())
-                .collect(),
+            heap: HeapReservation::new(heap_bytes),
+            slots: (0..processor_count).map(|_| ProcessorSlot::new()).collect(),
             timer_tx,
         });
         spawn_timer_thread(machine.clone(), timer_rx);
@@ -265,10 +311,107 @@ impl HostedMachine {
             .unpark();
     }
 
+    /// Whether `start_processor` has been called for `processor`; a
+    /// test's processor thread parks until it has, and a park can
+    /// return spuriously.
+    #[cfg(test)]
+    pub(crate) fn is_started(&self, processor: ProcessorId) -> bool {
+        self.slot(processor).started.load(Ordering::Acquire)
+    }
+
+    /// Raises `processor`'s timer interrupt and wakes it to take it.
+    ///
+    /// The level is published before the unpark: the unpark's token
+    /// outlives a processor that is not parked yet, so the park it
+    /// reaches returns at once and finds the level.
+    fn raise_timer_interrupt(&self, processor: ProcessorId) {
+        self.slot(processor)
+            .timer_interrupt
+            .store(true, Ordering::Release);
+        self.wake_processor(processor);
+    }
+
+    /// Installs `processor`'s kernel timer. Called once, on the
+    /// processor's own thread, after its `helios_kernel::init`.
+    pub(crate) fn install_timer(&self, processor: ProcessorId, timer: Timer<HostedCpu>) {
+        self.slot(processor).timer.set(timer).unwrap_or_else(|_| {
+            panic!(
+                "processor {} timer was installed more than once",
+                processor.id()
+            )
+        });
+    }
+
+    /// Runs the timer's interrupt step on `processor` if the timer thread
+    /// raised its interrupt since it last took one, the way a bare-metal
+    /// backend's timer interrupt handler does. Called on that processor's
+    /// own thread. Before the timer is installed the level stays raised
+    /// and is taken at the first park after the install, as a masked
+    /// comparator's interrupt is taken once it is unmasked.
+    pub(crate) fn take_timer_interrupt(&self, processor: ProcessorId) {
+        let slot = self.slot(processor);
+        let Some(timer) = slot.timer.get() else {
+            return;
+        };
+        if slot.timer_interrupt.swap(false, Ordering::AcqRel) {
+            timer.handle_interrupt();
+        }
+    }
+
     pub(crate) fn wake_processor(&self, processor: ProcessorId) {
         let slot = self.slot(processor);
         if let Some(thread) = slot.thread.get() {
             thread.unpark();
+        }
+    }
+
+    /// Takes the calling processor's thread out of service until
+    /// [`Self::restart_processor`] names it.
+    ///
+    /// Its timer deadline is withdrawn first, so the timer thread does
+    /// not keep firing for a processor that runs nothing; bringing the
+    /// timer base back online programs a fresh one.
+    pub(crate) fn stop_current(&self, processor: ProcessorId) {
+        let _ = self.timer_tx.send(TimerCommand {
+            processor,
+            deadline: None,
+        });
+        let slot = self.slot(processor);
+        let mut run = slot.run.lock().unwrap();
+        match *run {
+            SlotRun::Running => *run = SlotRun::Stopped,
+            SlotRun::RestartPending => {
+                *run = SlotRun::Running;
+                return;
+            }
+            SlotRun::Stopped => {
+                panic!("processor {} stopped while already stopped", processor.id())
+            }
+        }
+        while *run == SlotRun::Stopped {
+            run = slot.restarted.wait(run).unwrap();
+        }
+        // A comparator that expired before the withdrawal reached the
+        // timer thread fired into a stopped processor, which takes no
+        // interrupt: it comes back with a fresh deadline of its own.
+        slot.timer_interrupt.store(false, Ordering::Release);
+    }
+
+    /// Puts a stopped processor's thread back in service; one that has
+    /// not reached its stop yet returns from it at once.
+    pub(crate) fn restart_processor(&self, processor: ProcessorId) {
+        let slot = self.slot(processor);
+        let mut run = slot.run.lock().unwrap();
+        match *run {
+            SlotRun::Stopped => {
+                *run = SlotRun::Running;
+                slot.restarted.notify_one();
+            }
+            SlotRun::Running => *run = SlotRun::RestartPending,
+            SlotRun::RestartPending => panic!(
+                "processor {} was restarted twice for one stop",
+                processor.id()
+            ),
         }
     }
 
@@ -286,15 +429,10 @@ impl HostedMachine {
             .unwrap_or_else(|_| panic!("processor {} thread was registered twice", processor.id()));
     }
 
-    pub(crate) fn bootstrap_memory_regions(
-        &self,
-        processor: ProcessorId,
-    ) -> core::iter::Once<MemoryRegion> {
-        if processor == self.bootstrap_processor {
-            core::iter::once(self.heap.as_memory_region())
-        } else {
-            core::iter::once(NonNull::from(&[] as &[u8]))
-        }
+    /// The memory the bootstrap processor primes the kernel with: the one
+    /// region the host reserved, on the only node the host machine has.
+    pub(crate) fn bootstrap_memory_regions(&self) -> core::iter::Once<MemoryRegion> {
+        core::iter::once(self.heap.as_memory_region())
     }
 
     fn now_ticks(&self) -> u64 {
@@ -310,6 +448,7 @@ impl HostedMachine {
 fn spawn_processor_thread(
     machine: Arc<HostedMachine>,
     config: HostedConfig,
+    payload: helios_kernel::BootPayload,
     processor: ProcessorId,
     ready_tx: Sender<ProcessorId>,
 ) -> JoinHandle<()> {
@@ -325,12 +464,20 @@ fn spawn_processor_thread(
 
             let console = HostedConsole::new();
             let cpu = HostedCpu::new(processor, machine.clone());
-            let memory_regions = machine.bootstrap_memory_regions(processor);
+            if processor == machine.bootstrap_processor() {
+                // The host machine reports no NUMA description: one node
+                // holds every processor and all of the reserved heap.
+                helios_kernel::prime_bootstrap_allocator(
+                    machine.bootstrap_memory_regions(),
+                    &SingleNode::new(machine.processor_count()),
+                    processor,
+                );
+            }
             let mut devices = DeviceInventory::new().with_debug_serial();
             if config.init_wasi_root().is_some() {
                 devices = devices.with_host_share();
             }
-            let platform = Platform::new(console, memory_regions, cpu.clone())
+            let platform = Platform::new(console, cpu.clone())
                 .with_topology(
                     ProcessorTopology::start_all_secondaries(
                         machine.bootstrap_processor(),
@@ -341,7 +488,8 @@ fn spawn_processor_thread(
                 .with_dma_model(DmaModel::Translated)
                 .with_devices(devices);
             let kernel = helios_kernel::init(platform);
-            let debug_state = shared_debug_state(&machine);
+            cpu.install_timer(kernel.timer());
+            let debug_state = shared_debug_state(&machine, payload);
             if processor == machine.bootstrap_processor() {
                 init_serial();
 
@@ -366,6 +514,11 @@ fn spawn_processor_thread(
                 // read once, here, before any component can ask what
                 // time it is.
                 debug_state.seed_wall_clock(cpu.now().ticks(), &HostRtc);
+                helios_kernel::install_generation_reactions(
+                    &kernel,
+                    debug_state.clone(),
+                    Some(HostRtc),
+                );
 
                 // Install host filesystem if configured.
                 if let Some(root) = config.init_wasi_root() {
@@ -414,14 +567,20 @@ fn load_payload(path: &std::path::Path) -> helios_kernel::BootPayload {
     })
 }
 
-fn shared_debug_state(machine: &HostedMachine) -> HostedRuntimeState {
+fn shared_debug_state(
+    machine: &HostedMachine,
+    payload: helios_kernel::BootPayload,
+) -> HostedRuntimeState {
     DEBUG_STATE
         .get_or_init(|| {
             helios_kernel::RuntimeState::new(
                 machine.timebase(),
                 machine.processor_count(),
                 machine.now_ticks(),
-                machine.payload,
+                payload,
+                helios_kernel::GuestIsa::for_build_target(Some(
+                    crate::cpu::detect_host_native_feature,
+                )),
             )
         })
         .clone()
@@ -444,6 +603,10 @@ impl ProcessorSlot {
         Self {
             thread: OnceLock::new(),
             started: AtomicBool::new(false),
+            run: Mutex::new(SlotRun::Running),
+            restarted: Condvar::new(),
+            timer: OnceLock::new(),
+            timer_interrupt: AtomicBool::new(false),
         }
     }
 }
@@ -456,7 +619,9 @@ impl HeapReservation {
     }
 
     fn as_memory_region(&self) -> MemoryRegion {
-        NonNull::from(self.backing.as_ref())
+        // SAFETY: the reservation is host memory nothing else touches, and
+        // the machine that owns it lives as long as the kernel runs.
+        unsafe { MemoryRegion::new(NonNull::from(self.backing.as_ref()), NodeId::FIRST) }
     }
 }
 
@@ -506,7 +671,7 @@ fn fire_expired_deadlines(machine: &HostedMachine, deadlines: &mut [Option<Insta
             && d <= now
         {
             *deadline = None;
-            machine.wake_processor(ProcessorId::new(slot as u16));
+            machine.raise_timer_interrupt(ProcessorId::new(slot as u16));
         }
     }
 }

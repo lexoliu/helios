@@ -33,7 +33,7 @@ helios_x86_interrupt_timer:
 .global helios_x86_interrupt_wake
 helios_x86_interrupt_wake:
     push 0
-    push 0x21
+    push {wake_vector}
     jmp helios_x86_interrupt_common
 
 .global helios_x86_interrupt_apic_error
@@ -45,7 +45,7 @@ helios_x86_interrupt_apic_error:
 .global helios_x86_interrupt_tlb_shootdown
 helios_x86_interrupt_tlb_shootdown:
     push 0
-    push 0x22
+    push {tlb_shootdown_vector}
     jmp helios_x86_interrupt_common
 
 .global helios_x86_interrupt_network
@@ -186,6 +186,12 @@ helios_x86_interrupt_debug_serial:
     push 0x3e
     jmp helios_x86_interrupt_common
 
+.global helios_x86_interrupt_sci
+helios_x86_interrupt_sci:
+    push 0
+    push 0x3f
+    jmp helios_x86_interrupt_common
+
 helios_x86_exception_common:
     push rax
     push rcx
@@ -215,6 +221,10 @@ helios_x86_exception_common:
     mov dword ptr [rsp], 0x1f80
     fninit
     ldmxcsr [rsp]
+    // The SysV ABI requires DF clear at every call, and the interrupted
+    // code may have been inside a `std; rep movs; cld` window. `iretq`
+    // restores the interrupted RFLAGS, so DF comes back as it was.
+    cld
     call helios_x86_exception_dispatch
     add rsp, 16
     fxrstor64 [rsp]
@@ -263,6 +273,8 @@ helios_x86_interrupt_common:
     mov dword ptr [rsp], 0x1f80
     fninit
     ldmxcsr [rsp]
+    // See `helios_x86_exception_common`: DF is clear for every Rust call.
+    cld
     call helios_x86_interrupt_dispatch
     add rsp, 16
     fxrstor64 [rsp]

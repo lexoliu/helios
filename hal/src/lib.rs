@@ -3,7 +3,6 @@ extern crate alloc;
 use core::fmt::Write;
 
 use crate::cpu::ProcessorId;
-use crate::memory::MemoryRegion;
 
 pub mod audio;
 pub mod balloon;
@@ -19,9 +18,13 @@ pub mod input;
 pub mod interrupt;
 pub mod io;
 pub mod iommu;
+pub mod measured_boot;
+pub mod measured_boot_model;
 pub mod memory;
 pub mod mmio;
+pub mod numa;
 pub mod pmm;
+pub mod processor_hotplug;
 pub mod resource;
 pub mod rtc;
 pub mod serial;
@@ -192,43 +195,36 @@ impl DeviceInventory {
 pub struct Platform<
     Console: Write + Send + 'static,
     Cpu: cpu::Cpu,
-    Regions,
     WatchdogImpl = watchdog::NoWatchdog,
+    MeasuredBootImpl = measured_boot::NoMeasuredBoot,
 > where
-    Regions: IntoIterator<Item = MemoryRegion>,
     WatchdogImpl: watchdog::Watchdog,
+    MeasuredBootImpl: measured_boot::MeasuredBoot,
 {
     pub console: Console,
     pub cpu: Cpu,
-    pub memory_regions: Regions,
     pub topology: ProcessorTopology,
     pub timer_frequency_hz: u64,
     pub dma_model: DmaModel,
     pub devices: DeviceInventory,
     pub watchdog: WatchdogImpl,
+    /// The platform's measured-boot device, present only when the chain
+    /// that loaded the kernel measured it into that device.
+    pub measured_boot: Option<MeasuredBootImpl>,
 }
 
-impl<Console: Write + Send + 'static, Cpu: cpu::Cpu, Regions> Platform<Console, Cpu, Regions>
-where
-    Regions: IntoIterator<Item = MemoryRegion>,
-{
-    pub fn new(console: Console, memory_regions: Regions, cpu: Cpu) -> Self {
-        Self::with_watchdog(console, memory_regions, cpu, watchdog::NoWatchdog)
+impl<Console: Write + Send + 'static, Cpu: cpu::Cpu> Platform<Console, Cpu> {
+    pub fn new(console: Console, cpu: Cpu) -> Self {
+        Self::with_watchdog(console, cpu, watchdog::NoWatchdog)
     }
 }
 
-impl<Console: Write + Send + 'static, Cpu: cpu::Cpu, Regions, WatchdogImpl>
-    Platform<Console, Cpu, Regions, WatchdogImpl>
+impl<Console: Write + Send + 'static, Cpu: cpu::Cpu, WatchdogImpl>
+    Platform<Console, Cpu, WatchdogImpl>
 where
-    Regions: IntoIterator<Item = MemoryRegion>,
     WatchdogImpl: watchdog::Watchdog,
 {
-    pub fn with_watchdog(
-        console: Console,
-        memory_regions: Regions,
-        cpu: Cpu,
-        watchdog: WatchdogImpl,
-    ) -> Self {
+    pub fn with_watchdog(console: Console, cpu: Cpu, watchdog: WatchdogImpl) -> Self {
         let topology = ProcessorTopology::start_all_secondaries(
             cpu.bootstrap_processor(),
             cpu.processor_count(),
@@ -236,13 +232,49 @@ where
         let timer_frequency_hz = cpu.timebase().frequency();
         Self {
             console,
-            memory_regions,
             cpu,
             topology,
             timer_frequency_hz,
             dma_model: DmaModel::Identity,
             devices: DeviceInventory::new(),
             watchdog,
+            measured_boot: None,
+        }
+    }
+}
+
+impl<Console: Write + Send + 'static, Cpu: cpu::Cpu, WatchdogImpl, MeasuredBootImpl>
+    Platform<Console, Cpu, WatchdogImpl, MeasuredBootImpl>
+where
+    WatchdogImpl: watchdog::Watchdog,
+    MeasuredBootImpl: measured_boot::MeasuredBoot,
+{
+    /// The same platform with `measured_boot` as its measured-boot
+    /// device. A backend passes `None` when the device is absent or the
+    /// chain that loaded the kernel did not measure into it.
+    pub fn with_measured_boot<Next: measured_boot::MeasuredBoot>(
+        self,
+        measured_boot: Option<Next>,
+    ) -> Platform<Console, Cpu, WatchdogImpl, Next> {
+        let Self {
+            console,
+            cpu,
+            topology,
+            timer_frequency_hz,
+            dma_model,
+            devices,
+            watchdog,
+            measured_boot: _,
+        } = self;
+        Platform {
+            console,
+            cpu,
+            topology,
+            timer_frequency_hz,
+            dma_model,
+            devices,
+            watchdog,
+            measured_boot,
         }
     }
 
@@ -327,12 +359,30 @@ mod tests {
             panic!("test CPU should not park")
         }
 
+        type WakeOnlyMask = ();
+
+        fn mask_to_wake_only(&self) {
+            panic!("test CPU should not park")
+        }
+
+        fn park_wake_only(&self, _word: &core::sync::atomic::AtomicU8, _held: u8) {
+            panic!("test CPU should not park")
+        }
+
         fn start_processor(&self, _processor: ProcessorId) {
             panic!("test CPU should not start processors")
         }
 
         fn wake_processor(&self, _processor: ProcessorId) {
             panic!("test CPU should not wake processors")
+        }
+
+        fn stop_current(&self) {
+            panic!("test CPU should not stop processors")
+        }
+
+        fn restart_processor(&self, _processor: ProcessorId) {
+            panic!("test CPU should not restart processors")
         }
 
         fn now(&self) -> cpu::Instant {
@@ -364,13 +414,9 @@ mod tests {
         }
     }
 
-    fn empty_regions() -> [MemoryRegion; 0] {
-        []
-    }
-
     #[test]
     fn platform_new_captures_cpu_defaults() {
-        let platform = Platform::new(TestConsole, empty_regions(), TestCpu::new());
+        let platform = Platform::new(TestConsole, TestCpu::new());
 
         assert_eq!(
             platform.topology,
@@ -379,11 +425,28 @@ mod tests {
         assert_eq!(platform.timer_frequency_hz, 24_000_000);
         assert_eq!(platform.dma_model, DmaModel::Identity);
         assert_eq!(platform.devices, DeviceInventory::new());
+        assert!(platform.measured_boot.is_none());
+    }
+
+    #[test]
+    fn a_measured_boot_device_replaces_the_absent_one() {
+        use crate::measured_boot::{MeasuredBoot, MeasurementRegister, MeasurementSet};
+        use crate::measured_boot_model::MeasuredBootModel;
+
+        let registers =
+            MeasurementSet::of(&[MeasurementRegister::new(4), MeasurementRegister::new(9)]);
+        let platform = Platform::new(TestConsole, TestCpu::new())
+            .with_measured_boot(Some(MeasuredBootModel::new(registers)));
+
+        let device = platform
+            .measured_boot
+            .expect("the platform must carry the device it was given");
+        assert_eq!(device.kernel_image_registers(), registers);
     }
 
     #[test]
     fn platform_builders_override_platform_facts() {
-        let platform = Platform::new(TestConsole, empty_regions(), TestCpu::new())
+        let platform = Platform::new(TestConsole, TestCpu::new())
             .with_topology(
                 ProcessorTopology::start_all_secondaries(ProcessorId::new(1), 4)
                     .with_startup_policy(ProcessorStartupPolicy::BootstrapOnly),

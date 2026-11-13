@@ -3,13 +3,15 @@
 //! `irq_safe` carries the lock every allocator here is built on: an
 //! interrupt handler allocates, so the lock that guards an allocator
 //! has to mask interrupts while it is held.
-//! `pmm` exposes the kernel's physical-frame allocator wrapper.
+//! `compressed` is the compressed page pool, the in-memory tier a page
+//! goes to before a disk.
 //! `fiber_stack` owns the arena the runtime's async stacks are committed
 //! out of one page-fault at a time, and `frame_reserve` holds the frames
 //! that fault path is allowed to allocate.
-//! `user` carries the per-program user-memory pool used by Wasmtime
-//! linear memories. `frame_slab` is the per-processor frame cache
-//! that backs both. `entropy` owns the boot-seeded root DRBG and the
+//! `per_processor` carves one block per processor out of memory of the
+//! node the processor is on. `user` carries the per-program user-memory pool used by Wasmtime
+//! linear memories, one buddy pool per NUMA node. `frame_slab` is the
+//! per-(processor, node) frame cache that backs it. `entropy` owns the boot-seeded root DRBG and the
 //! per-instance pools derived from it. `reservations` is the AddressSpace
 //! reservation/committed-region bookkeeping shared by every backend,
 //! `mapping_cost` says what mapping user address space costs the kernel
@@ -18,15 +20,17 @@
 //! domains.
 
 mod balloon;
+mod compressed;
 mod entropy;
 mod fiber_stack;
 mod frame_pool;
 mod frame_reserve;
 mod frame_slab;
 mod irq_safe;
+mod locality;
 mod mapping_cost;
 mod owner;
-mod pmm;
+mod per_processor;
 mod policy;
 mod reported;
 mod reservations;
@@ -34,6 +38,10 @@ mod swap;
 mod user;
 
 pub use balloon::{BalloonHandle, BalloonStats, FREE_PAGE_REPORT_INTERVAL, install_memory_balloon};
+pub use compressed::{
+    COMPRESSED_PAGE_BYTES, CompressRefusal, CompressedPage, CompressedPool, CompressedPoolError,
+    CompressedPoolStats, DEFAULT_COMPRESSION_LEVEL, DEFAULT_POOL_PERCENT, INCOMPRESSIBLE_BYTES,
+};
 pub use entropy::{
     ENTROPY_RESEED_INTERVAL, EntropyPool, EntropySources, HardwareEntropySource,
     NoCryptographicEntropy, NoEntropyDevice, ROOT_ENTROPY_MATERIAL_BYTES, RootEntropy,
@@ -48,15 +56,16 @@ pub use fiber_stack::{
 pub(crate) use fiber_stack::{fiber_parking, parked_fibers};
 pub use frame_reserve::reserved_bytes as page_fault_frame_reserve_bytes;
 pub(crate) use frame_reserve::{
-    configure_processors as configure_frame_reserve_processors, top_up as top_up_frame_reserve,
+    configure as configure_frame_reserve, top_up as top_up_frame_reserve,
 };
 pub(crate) use irq_safe::IrqSafeMutex;
+pub use locality::{Locality, NodeRun};
 pub use mapping_cost::user_mapping_kernel_heap_bytes;
 pub use owner::{
     MemoryOwner, UserMemoryOwnerScope, UserMemoryOwners, configure_user_memory_owner_processors,
     current_user_memory_owner, enter_user_memory_owner,
 };
-pub use pmm::KernelPhysFrameAllocator;
+pub use per_processor::{LocalMemory, LocalSlice, NodeLocalArena, NodeMemory, PerProcessor};
 pub use policy::{
     BootMemoryPlan, BootRegionSplitter, KERNEL_HEAP_BOOTSTRAP_BYTES,
     KERNEL_HEAP_GROWTH_CHUNK_BYTES, KERNEL_HEAP_MAX_BOOT_FRACTION, KERNEL_HEAP_MIN_RESERVE_BYTES,
@@ -64,20 +73,25 @@ pub use policy::{
     USER_POOL_MIN_REGION_BYTES, kernel_reserve_for, task_arena_bytes_for,
 };
 pub use reservations::{
-    AccessibilityPlan, CommittedRegion, ReleasedReservation, ReservationLookup, ReservationTracker,
-    SwapEntry, VaCursor, validate_range,
+    AccessibilityPlan, CommittedRegion, CommittedRemoval, Decommitted, ReleasedReservation,
+    ReservationLookup, ReservationTracker, SwapEntry, VaCursor, ranges_outside, validate_range,
 };
 pub use swap::{
-    IDLE_SWAP_AFTER, SWAP_BATCH_BYTES, SWAP_TICK, SwapDisabled, SwapFaultError, SwapHandle,
+    AGE_BATCH_PAGES, GuestResidency, IDLE_SWAP_AFTER, InstalledAddressSpace, SWAP_BATCH_BYTES,
+    SWAP_TICK, SwapDisabled, SwapFaultError, SwapFaultIn, SwapHandle, SwapLeafFormat, SwapSpace,
     SwapStats, SwapVmHooks, disable_swap, install_swap, install_swap_hooks, installed_swap_handle,
-    installed_swap_hooks, swapped_token,
+    installed_swap_hooks, swap_vm_hooks, swapped_token,
 };
+#[cfg(test)]
+pub(crate) use swap::{GUEST_SWAP_PAGE, GuestSwap};
 pub use user::{
-    UserHeapStats, UserMemoryPool, allocate_user_frame_uninit_on, allocate_user_frame_zeroed,
-    allocate_user_frame_zeroed_on, allocate_user_run_zeroed_on, deallocate_user_frame,
-    deallocate_user_frame_on, deallocate_user_run_on, largest_servable_user_bytes, user_heap_stats,
+    MemoryNodeStats, UserHeapStats, UserMemoryPool, allocate_user_frame_uninit_on,
+    allocate_user_frame_uninit_on_node, allocate_user_frame_zeroed, allocate_user_frame_zeroed_on,
+    allocate_user_run_zeroed_on, deallocate_user_frame, deallocate_user_frame_on,
+    deallocate_user_run_on, install_user_memory_pool, largest_servable_user_bytes, locality,
+    user_frame_node, user_heap_stats, user_node_stats,
 };
 pub(crate) use user::{
-    allocate_user_memory_pool, install_user_memory_pool, lend_user_memory_to_kernel_heap,
+    lend_user_memory_to_kernel_heap, release_processor_frames, user_memory_pool,
     user_pool_available_bytes,
 };

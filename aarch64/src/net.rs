@@ -5,7 +5,7 @@ use helios_hal::io::IoError;
 use helios_hal::watchdog::Watchdog;
 use helios_kernel::{
     ExternalInterruptHandler, InterfaceCapabilities, InterfaceEventMark, Kernel, LinkState,
-    NetworkDevice, PacketBuffer,
+    NetworkDevice,
 };
 use triomphe::Arc;
 
@@ -27,7 +27,13 @@ pub(crate) struct VirtioNetworkDevice {
 
 impl ExternalInterruptHandler for VirtioNetworkDevice {
     fn handle_interrupt(&self) {
-        helios_kernel::wake_queue_owners(&self.cpu, self.inner.handle_interrupt().iter());
+        let progress = self.inner.handle_interrupt();
+        helios_kernel::wake_queue_owners(
+            &self.cpu,
+            progress
+                .iter()
+                .map(|pair| self.inner.queue_pair_owner(pair)),
+        );
     }
 }
 
@@ -39,9 +45,9 @@ pub(crate) struct NetworkInterrupt {
     pub(crate) device: VirtioNetworkDevice,
 }
 
-pub(crate) fn install<WatchdogImpl>(
+pub(crate) fn install<WatchdogImpl, MeasuredBootImpl>(
     cpu: &crate::Aarch64Cpu,
-    kernel: &Kernel<crate::Aarch64Cpu, WatchdogImpl>,
+    kernel: &Kernel<crate::Aarch64Cpu, WatchdogImpl, MeasuredBootImpl>,
     platform: &PlatformDescription,
     physical_memory_offset: usize,
     handoff: &crate::LimineBootHandoff,
@@ -49,6 +55,7 @@ pub(crate) fn install<WatchdogImpl>(
 ) -> Option<NetworkInterrupt>
 where
     WatchdogImpl: Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
 {
     // The pair budget is the processor count: every activated pair is
     // drained by the one packet pump its owning processor runs, so a
@@ -89,6 +96,16 @@ impl NetworkDevice for VirtioNetworkDevice {
         self.inner.queue_pair_count()
     }
 
+    fn set_active_queue_pairs(&self, pairs: usize) -> helios_hal::io::IoResult<()> {
+        self.inner.set_active_queue_pairs(pairs)
+    }
+
+    /// The SPI is the device's one line, so there is no message to
+    /// retarget: steering is the owner the handler wakes.
+    fn steer_queue_pair(&self, pair: usize, processor: helios_hal::cpu::ProcessorId) {
+        self.inner.steer_pair(pair, processor);
+    }
+
     fn capabilities(&self) -> InterfaceCapabilities {
         self.inner.interface_capabilities()
     }
@@ -97,47 +114,17 @@ impl NetworkDevice for VirtioNetworkDevice {
         self.inner.link_state()
     }
 
-    async fn try_receive(&self, buffer: &mut PacketBuffer) -> Result<bool, IoError> {
-        buffer.clear();
-        let Some(frame_len) = self
-            .inner
-            .try_receive_into(buffer.spare_capacity_mut())
-            .await?
-        else {
-            return Ok(false);
-        };
-        buffer.set_len(frame_len);
-        Ok(true)
-    }
-
-    async fn try_receive_frame(&self) -> Result<Option<helios_virtio::RxFrame>, IoError> {
-        self.inner.try_receive_frame().await
-    }
-
-    async fn repost_rx_frame(&self, frame: helios_virtio::RxFrame) -> Result<(), IoError> {
-        self.inner.repost_rx_frame(frame).await
-    }
-
-    fn repost_rx_frames_immediate<'a, 'slots>(
-        &'a self,
-        frames: &'slots mut [Option<helios_virtio::RxFrame>],
-    ) -> Result<Option<()>, IoError>
-    where
-        'a: 'slots,
-    {
-        self.inner.repost_rx_frames_immediate(frames)
-    }
-
-    fn try_receive_frames_immediate_on<'a, 'slots>(
-        &'a self,
+    fn try_receive_frames_immediate_on<Sink>(
+        &self,
         queue_idx: usize,
-        frames: &'slots mut [Option<helios_virtio::RxFrame>],
+        budget: usize,
+        sink: Sink,
     ) -> Option<helios_virtio::RxDrain>
     where
-        'a: 'slots,
+        Sink: FnMut(&helios_virtio::RxFrame),
     {
         self.inner
-            .try_receive_frames_immediate_on_pair(queue_idx, frames)
+            .try_receive_frames_immediate_on_pair(queue_idx, budget, sink)
     }
 
     fn try_transmit_scatter_immediate_on(

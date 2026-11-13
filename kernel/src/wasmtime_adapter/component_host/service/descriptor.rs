@@ -191,6 +191,10 @@ pub(super) struct Preview1Cwd {
 pub(super) struct Preview1DescriptorTable<Net: ComponentHostNetwork> {
     pub(super) entries: Vec<Option<Preview1DescriptorEntry<Net>>>,
     pub(super) free: FreeDescriptorSlots,
+    /// Descriptor numbers at or past this are never handed out or accepted.
+    /// The table's owner assigns it; `from_entries` starts at the default
+    /// and `clone_for_exec` and `Clone` carry it to the child.
+    pub(super) limit: DescriptorLimit,
 }
 
 #[derive(Clone)]
@@ -384,15 +388,15 @@ pub(super) async fn p1_wait_step<CpuImpl>(
 /// Descriptors backed by a kernel channel register a real waiter, and
 /// serial-backed stdin parks on the console's receive signal. Network
 /// sockets have no wakeup source, so they only set the re-probe flag.
-pub(super) fn p1_add_wait_target<CpuImpl, Net, HostFs>(
-    store: &Preview1ProgramStore<CpuImpl, Net, HostFs>,
+pub(super) fn p1_add_wait_target<CpuImpl, Net, StorageImpl>(
+    store: &Preview1ProgramStore<CpuImpl, Net, StorageImpl>,
     fd: i32,
     event_type: u8,
     wait: &mut P1WaitSet,
 ) where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     match store.descriptors.get(fd) {
         Some(Preview1Descriptor::PipeRead { reader, carry })
@@ -455,15 +459,15 @@ pub(super) fn p1_add_wait_target<CpuImpl, Net, HostFs>(
 
 /// Resolve a descriptor's readiness, consulting the network service when the
 /// descriptor is a socket and the console when it is serial-backed stdin.
-pub(super) async fn p1_descriptor_readiness<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn p1_descriptor_readiness<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     event_type: u8,
 ) -> Result<P1Readiness, i32>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     if event_type == P1_EVENTTYPE_FD_READ
         && matches!(
@@ -1136,6 +1140,7 @@ pub(super) fn preview1_cwd_from_authority(authority: &ProcessAuthority) -> Optio
             kind: FsNodeKind::Directory,
             flags: directory_authority_to_descriptor_flags(preopen.rights()),
             identity: None,
+            mount: None,
         },
     })
 }
@@ -1183,6 +1188,7 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
                 kind: FsNodeKind::Directory,
                 flags: directory_authority_to_descriptor_flags(preopen.rights()),
                 identity: None,
+                mount: None,
             };
             table.entries.push(Some(Preview1DescriptorEntry::new(
                 Preview1Descriptor::Preopen {
@@ -1202,7 +1208,11 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
                 free.release(index);
             }
         }
-        Self { entries, free }
+        Self {
+            entries,
+            free,
+            limit: DescriptorLimit::DEFAULT,
+        }
     }
 
     pub(super) fn get(&self, fd: i32) -> Option<&Preview1Descriptor<Net>> {
@@ -1247,9 +1257,20 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
     }
 
     pub(super) fn insert_entry(&mut self, entry: Preview1DescriptorEntry<Net>) -> Result<u32, i32> {
-        let index = self.allocate_slot_index();
+        let index = self.allocate_slot_index()?;
         self.entries[index] = Some(entry);
         u32::try_from(index).map_err(|_| p1::errno::OVERFLOW)
+    }
+
+    /// The slot a guest-named descriptor number `fd` denotes as the target
+    /// of a dup2, renumber or spawn action: `BADF` when it is negative or
+    /// at or past the limit. Every caller that accepts a number checks it
+    /// here before touching the table.
+    pub(super) fn target_index(&self, fd: i32) -> Result<usize, i32> {
+        usize::try_from(fd)
+            .ok()
+            .filter(|index| self.limit.admits(*index))
+            .ok_or(p1::errno::BADF)
     }
 
     pub(super) fn dup(&mut self, fd: i32) -> Result<u32, i32> {
@@ -1259,6 +1280,7 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
     }
 
     pub(super) fn dup_to(&mut self, fd: i32, to_fd: i32, close_on_exec: bool) -> Result<u32, i32> {
+        self.target_index(to_fd)?;
         let mut entry = self.get_entry(fd).cloned().ok_or(p1::errno::BADF)?;
         entry.close_on_exec = close_on_exec;
         self.insert_entry_at(to_fd, entry)
@@ -1278,7 +1300,7 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
         fd: i32,
         entry: Preview1DescriptorEntry<Net>,
     ) -> Result<u32, i32> {
-        let to = usize::try_from(fd).map_err(|_| p1::errno::BADF)?;
+        let to = self.target_index(fd)?;
         if self.entries.len() <= to {
             let previous_len = self.entries.len();
             self.entries.resize_with(to + 1, || None);
@@ -1347,7 +1369,7 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
     }
 
     pub(super) fn clone_for_exec(&self) -> Self {
-        Self::from_entries(
+        let mut table = Self::from_entries(
             self.entries
                 .iter()
                 .map(|entry| match entry {
@@ -1355,7 +1377,9 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
                     _ => entry.clone(),
                 })
                 .collect(),
-        )
+        );
+        table.limit = self.limit;
+        table
     }
 
     pub(super) fn close(&mut self, fd: i32) -> i32 {
@@ -1369,15 +1393,27 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
             .map_or(p1::errno::BADF, |_| p1::errno::SUCCESS)
     }
 
-    pub(super) fn allocate_slot_index(&mut self) -> usize {
+    /// The lowest free descriptor number below the limit, or `MFILE`;
+    /// nothing is allocated on failure.
+    pub(super) fn allocate_slot_index(&mut self) -> Result<usize, i32> {
         while let Some(index) = self.free.allocate() {
+            if !self.limit.admits(index) {
+                // The heap pops the lowest number, so every other free
+                // number is at or past the limit too. Keep this one free
+                // for when the limit is raised.
+                self.free.release(index);
+                break;
+            }
             if self.entries.get(index).is_some_and(Option::is_none) {
-                return index;
+                return Ok(index);
             }
         }
         let index = self.entries.len();
+        if !self.limit.admits(index) {
+            return Err(p1::errno::MFILE);
+        }
         self.entries.push(None);
-        index
+        Ok(index)
     }
 
     pub(super) fn get_owned_entry(
@@ -1399,7 +1435,7 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
     }
 
     pub(super) fn renumber(&mut self, from: i32, to: i32) -> i32 {
-        let Ok(to) = usize::try_from(to) else {
+        let Ok(to) = self.target_index(to) else {
             return p1::errno::BADF;
         };
         let Ok((from, mut entry)) = self.get_owned_entry(from) else {
@@ -1418,6 +1454,121 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
         self.close_slot(from);
         self.entries[to] = Some(entry);
         p1::errno::SUCCESS
+    }
+
+    /// POSIX `dup2`: `to` becomes a copy of `from`, which stays open, and
+    /// whatever `to` held is closed. Naming the same descriptor twice
+    /// leaves it as it is.
+    pub(super) fn dup2(&mut self, from: i32, to: i32) -> i32 {
+        if from == to {
+            return match self.get_entry(from) {
+                Some(_) => p1::errno::SUCCESS,
+                None => p1::errno::BADF,
+            };
+        }
+        match self.dup_to(from, to, false) {
+            Ok(_) => p1::errno::SUCCESS,
+            Err(errno) => errno,
+        }
+    }
+
+    /// The stdio a component program launched over this table gets:
+    /// `wasi:cli` stdin, stdout and stderr are descriptors 0, 1 and 2,
+    /// whatever the launching process left in them. `inherited` is the
+    /// launching process's own stdio, which the `Stdin`, `Stdout` and
+    /// `Stderr` descriptors name; a table whose three slots are exactly
+    /// those hands the component `inherited` itself.
+    ///
+    /// A closed slot is a closed stream: stdin reads end of file and a
+    /// write to stdout or stderr fails, as a write to a closed descriptor
+    /// does.
+    pub(super) fn component_output_mode(
+        &self,
+        inherited: &OutputMode,
+    ) -> Result<OutputMode, ComponentStdioRefusal> {
+        let inherits_stdin = matches!(
+            self.get(0),
+            Some(Preview1Descriptor::Stdin { carry }) if carry.is_empty()
+        );
+        if inherits_stdin
+            && matches!(self.get(1), Some(Preview1Descriptor::Stdout))
+            && matches!(self.get(2), Some(Preview1Descriptor::Stderr))
+        {
+            return Ok(inherited.clone());
+        }
+        Ok(OutputMode::RoutedChild {
+            stdin_rx: self.component_stdin(inherited)?,
+            stdout: self.component_output(1, inherited)?,
+            stderr: self.component_output(2, inherited)?,
+        })
+    }
+
+    fn component_stdin(
+        &self,
+        inherited: &OutputMode,
+    ) -> Result<crate::ByteReader, ComponentStdioRefusal> {
+        let closed = || crate::byte_channel().1;
+        match self.get(0) {
+            None | Some(Preview1Descriptor::NullDevice) => Ok(closed()),
+            Some(Preview1Descriptor::Stdin { carry }) if carry.is_empty() => {
+                Ok(inherited.child_stdin().cloned().unwrap_or_else(closed))
+            }
+            Some(Preview1Descriptor::PipeRead { reader, carry }) if carry.is_empty() => {
+                Ok(reader.clone())
+            }
+            Some(descriptor) => Err(ComponentStdioRefusal {
+                fd: 0,
+                held: unbindable_stdio(descriptor),
+            }),
+        }
+    }
+
+    fn component_output(
+        &self,
+        fd: u8,
+        inherited: &OutputMode,
+    ) -> Result<OutputRoute, ComponentStdioRefusal> {
+        match self.get(i32::from(fd)) {
+            None => Ok(OutputRoute::Child(crate::byte_channel().0)),
+            Some(Preview1Descriptor::Stdout) => {
+                Ok(inherited.route(crate::ComponentOutputStreamKind::Stdout))
+            }
+            Some(Preview1Descriptor::Stderr) => {
+                Ok(inherited.route(crate::ComponentOutputStreamKind::Stderr))
+            }
+            Some(Preview1Descriptor::PipeWrite { writer }) => {
+                Ok(OutputRoute::Child(writer.clone()))
+            }
+            Some(Preview1Descriptor::NullDevice) => Ok(OutputRoute::Discard),
+            Some(descriptor) => Err(ComponentStdioRefusal {
+                fd,
+                held: unbindable_stdio(descriptor),
+            }),
+        }
+    }
+}
+
+/// What a descriptor that cannot be a component's standard stream holds.
+fn unbindable_stdio<Net: ComponentHostNetwork>(
+    descriptor: &Preview1Descriptor<Net>,
+) -> UnbindableStdio {
+    match descriptor {
+        Preview1Descriptor::Stdin { carry } | Preview1Descriptor::PipeRead { carry, .. }
+            if !carry.is_empty() =>
+        {
+            UnbindableStdio::ReadAhead
+        }
+        Preview1Descriptor::Stdin { .. }
+        | Preview1Descriptor::PipeRead { .. }
+        | Preview1Descriptor::Stdout
+        | Preview1Descriptor::Stderr
+        | Preview1Descriptor::PipeWrite { .. }
+        | Preview1Descriptor::NullDevice => UnbindableStdio::WrongDirection,
+        Preview1Descriptor::File { .. } => UnbindableStdio::File,
+        Preview1Descriptor::Preopen { .. } => UnbindableStdio::Directory,
+        Preview1Descriptor::Socket(_) => UnbindableStdio::Socket,
+        Preview1Descriptor::Event(_) => UnbindableStdio::Event,
+        Preview1Descriptor::Epoll(_) => UnbindableStdio::Epoll,
     }
 }
 
@@ -1863,10 +2014,4 @@ pub(super) fn p1_probe_descriptor<Net: ComponentHostNetwork>(
         (Some(_), _) => Err(p1::errno::INVAL),
         (None, _) => Err(p1::errno::BADF),
     }
-}
-
-pub(super) fn p1_descriptor_stat_from_host_metadata(
-    metadata: &crate::HostMetadata,
-) -> fs_types::DescriptorStat {
-    crate::wasmtime_adapter::wasi::descriptor_stat_from_host_metadata(metadata)
 }

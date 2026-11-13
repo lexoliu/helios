@@ -7,30 +7,31 @@ use core::arch::{asm, global_asm};
 use core::cell::UnsafeCell;
 use core::num::NonZeroUsize;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
 
 use alloc::boxed::Box;
-use alloc::vec::Vec;
 use arm_gic::IntId;
+use helios_artifact::{ProbeAnswers, cwasm_target_isa_levels};
+use helios_firmware::ProcessorIdentities;
 use helios_hal::boot::{
     BootFirmwareTables, BootHandoff, BootKernelImage, BootMemoryKind, BootMemoryMap,
     BootMemoryRegion, BootModule, BootModules, BootReservedRanges, FirmwareKind,
-    usable_region_segments,
+    usable_node_regions,
 };
 use helios_hal::cpu::{
-    Cpu, GUEST_STACK_LIMIT_OFFSET, HardwarePerfCounters, Instant, ProcessorId, Timebase,
-    TimerInterrupt,
+    ControlFlowIntegrity, Cpu, GUEST_STACK_LIMIT_OFFSET, HardwarePerfCounters, Instant,
+    ProcessorId, ReturnAddressSigning, Timebase, TimerInterrupt,
 };
 use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
-use helios_hal::memory::MemoryRegion;
+use helios_hal::numa::NumaTopology;
 use helios_hal::serial::ByteSerial;
 use helios_hal::{
     DeviceInventory, DmaModel, Platform, ProcessorStartupPolicy, ProcessorTopology, align_up,
 };
 use helios_kernel::{
-    DebugSerialAccess, DebugSerialInterrupt, KernelException, KernelExceptionCause, Timer,
-    WasmtimeTlsSlots,
+    DebugSerialAccess, DebugSerialInterrupt, KernelException, KernelExceptionCause, PerProcessor,
+    Timer, UserMemoryPool, WasmtimeTlsSlots,
 };
 use limine::BaseRevision;
 use limine::file::File;
@@ -40,10 +41,11 @@ use limine::firmware::{
 use limine::memmap::{Entry, MEMMAP_USABLE};
 use limine::mp::MpInfo;
 use limine::request::{
-    DtbRequest, ExecutableAddressRequest, ExecutableCmdlineRequest, ExecutableFileRequest,
-    FirmwareTypeRequest, HhdmRequest, MemmapRequest, ModulesRequest, MpRequest, RsdpRequest,
-    StackSizeRequest,
+    DtbRequest, EfiRequest, ExecutableAddressRequest, ExecutableCmdlineRequest,
+    ExecutableFileRequest, FirmwareTypeRequest, HhdmRequest, MemmapRequest, ModulesRequest,
+    MpRequest, RsdpRequest, StackSizeRequest,
 };
+use r_efi::efi::SystemTable;
 use spin::Once;
 
 const KERNEL_STACK_BYTES: usize = 4 * 1024 * 1024;
@@ -72,6 +74,15 @@ const PAGE_PXN: u64 = 1 << 53;
 const PAGE_UXN: u64 = 1 << 54;
 const MAIR_DEVICE_ATTR_INDEX_SHIFT: u64 = PAGE_ATTR_DEVICE_INDEX * 8;
 const MAIR_DEVICE_NGNRNE: u64 = 0x00;
+/// The MAIR index a write-combined mapping selects: Normal memory,
+/// inner and outer non-cacheable, which lets stores gather and merge
+/// without any cache holding them — what a host renderer means by
+/// write-combining.
+const PAGE_ATTR_NORMAL_NC_INDEX: u64 = 6;
+const MAIR_NORMAL_NC_ATTR_INDEX_SHIFT: u64 = PAGE_ATTR_NORMAL_NC_INDEX * 8;
+/// `0b0100_0100`: Normal memory, outer non-cacheable, inner
+/// non-cacheable (Arm ARM D19.2 "MAIR_EL1", the `Attr<n>` encoding).
+const MAIR_NORMAL_NON_CACHEABLE: u64 = 0x44;
 const PL011_DATA: usize = 0x000;
 const PL011_FLAG: usize = 0x018;
 const PL011_FLAG_RXFE: u32 = 1 << 4;
@@ -168,32 +179,40 @@ mod vmm;
 pub use vmm::Aarch64UserAddressSpace;
 mod balloon;
 mod block;
+mod cfi;
 mod device;
 mod entropy;
 mod gic;
 mod gpu;
+mod hand_over;
 mod host_fs;
 mod input;
+mod lifecycle;
 mod net;
 mod platform;
 mod rtc;
 mod snd;
+mod tpm;
 mod vsock;
 
 mod debug_state {
     /// The network service this machine's virtio-net device backs.
     pub(crate) type NetworkService =
         helios_kernel::NetworkService<crate::Aarch64Cpu, crate::net::VirtioNetworkDevice>;
-    pub(crate) type RuntimeState = helios_kernel::HostRuntimeState<
-        crate::Aarch64Cpu,
-        NetworkService,
-        crate::host_fs::HostFileSystemService,
-    >;
-    pub(crate) type ProgramService = helios_kernel::UserProgramService<
-        crate::Aarch64Cpu,
-        NetworkService,
-        crate::host_fs::HostFileSystemService,
-    >;
+    pub(crate) type RuntimeState =
+        helios_kernel::HostRuntimeState<crate::Aarch64Cpu, NetworkService, Storage>;
+    pub(crate) type ProgramService =
+        helios_kernel::UserProgramService<crate::Aarch64Cpu, NetworkService, Storage>;
+
+    /// This machine's storage: the virtio-9p host share and the
+    /// virtio-blk disks.
+    #[derive(Clone, Copy)]
+    pub(crate) struct Storage;
+
+    impl helios_kernel::Storage for Storage {
+        type HostShare = crate::host_fs::HostFileSystemService;
+        type Disk = crate::block::Aarch64VirtioBlockDevice;
+    }
 }
 
 /// Interrupt routes the bootstrap processor installs for the virtio
@@ -235,8 +254,17 @@ static FIRMWARE_TYPE_REQUEST: FirmwareTypeRequest = FirmwareTypeRequest::new();
 static DEVICE_TREE_BLOB_REQUEST: DtbRequest = DtbRequest::new();
 #[used]
 static RSDP_REQUEST: RsdpRequest = RsdpRequest::new();
+/// The UEFI system table, whose configuration table names the firmware's
+/// own device tree (`platform::efi`).
+#[used]
+static EFI_SYSTEM_TABLE_REQUEST: EfiRequest = EfiRequest::new();
 #[used]
 static STACK_SIZE_REQUEST: StackSizeRequest = StackSizeRequest::new(KERNEL_STACK_BYTES as u64);
+/// The firmware's TPM event log, which the measured-boot discovery reads
+/// to learn whether Limine measured the kernel (`tpm::discover`).
+#[used]
+static TPM_EVENT_LOG_REQUEST: helios_kernel::LimineTpmEventLogRequest =
+    helios_kernel::LimineTpmEventLogRequest::new();
 static DEBUG_SERIAL_BASE: AtomicUsize = AtomicUsize::new(0);
 static CRITICAL_SECTION_STATE: helios_hal::critical_section::CriticalSectionState =
     helios_hal::critical_section::CriticalSectionState::new();
@@ -297,6 +325,12 @@ struct ProcessorRuntime {
     /// interrupt sentinel into it.
     guest_stack_limit: AtomicUsize,
     exception_stack: ExceptionStack,
+    /// The stack a synchronous exception the kernel did not resolve is
+    /// handed to the runtime from (`hand_over`). It is not the exception
+    /// stack because the hand-over gives that back before the runtime's
+    /// handler runs, so the next exception can build its frame at the
+    /// top.
+    hand_over_stack: ExceptionStack,
     wasmtime_tls: WasmtimeTlsSlots,
     /// This processor's kernel timer, published once its own
     /// `helios_kernel::init` has run so the timer PPI can advance it.
@@ -307,6 +341,8 @@ struct ProcessorRuntime {
     /// Device interrupt routes, installed on the bootstrap processor
     /// only: every device SPI is routed to it.
     device_interrupts: Once<DeviceInterruptRoutes>,
+    /// The record of this processor's trap hand-over self-check.
+    hand_over_probe: hand_over::HandOverProbe,
 }
 
 impl ProcessorRuntime {
@@ -319,10 +355,12 @@ impl ProcessorRuntime {
             wake_pending: AtomicBool::new(false),
             guest_stack_limit: AtomicUsize::new(usize::MAX),
             exception_stack: ExceptionStack::new(),
+            hand_over_stack: ExceptionStack::new(),
             wasmtime_tls: WasmtimeTlsSlots::new(),
             timer: Once::new(),
             program_service: Once::new(),
             device_interrupts: Once::new(),
+            hand_over_probe: hand_over::HandOverProbe::new(),
         }
     }
 }
@@ -339,63 +377,84 @@ impl ExceptionStack {
     const fn new() -> Self {
         Self([0; EXCEPTION_STACK_BYTES])
     }
+
+    /// The stack's bytes; its top is `end`, 16-byte aligned.
+    fn range(&self) -> core::ops::Range<usize> {
+        let base = core::ptr::from_ref(self) as usize;
+        base..base + EXCEPTION_STACK_BYTES
+    }
 }
 
 struct Aarch64ProcessorSlot {
     mp_info: &'static MpInfo,
     runtime: ProcessorRuntime,
+    /// Whether the processor is in service, and what it resumes from.
+    power: lifecycle::ProcessorPower,
 }
 
 struct Aarch64PlatformState {
-    processors: Box<[Aarch64ProcessorSlot]>,
+    processors: PerProcessor<Aarch64ProcessorSlot>,
+    /// The PSCI service that stops and restarts processors, when the
+    /// platform describes one.
+    psci: Option<lifecycle::Psci>,
     timebase: Timebase,
+    /// How a failed return-address authentication shows on every
+    /// processor, probed on the bootstrap processor before any other starts
+    /// and never written again (`cfi`).
+    return_address_signing: ReturnAddressSigning,
+    /// The key every processor installs, held only while the secondaries
+    /// start (`cfi`).
+    instruction_key: cfi::SharedInstructionKey,
     debug_state: Once<debug_state::RuntimeState>,
     gic: Once<gic::Gic>,
+    /// The bootstrap processor's answer to every ISA level feature. Written
+    /// once before any secondary starts; each secondary compares its own.
+    isa_answers: ProbeAnswers,
+}
+
+/// What `detect_aarch64_native_feature` answers for every ISA level feature
+/// on the executing processor.
+fn probe_isa_answers() -> ProbeAnswers {
+    cwasm_target_isa_levels("aarch64-unknown-none")
+        .probe_answers(detect_aarch64_native_feature)
+        .unwrap_or_else(|error| panic!("AArch64 native feature probe is incomplete: {error}"))
 }
 
 impl Aarch64PlatformState {
-    fn from_limine_mp(timebase: Timebase) -> &'static Self {
-        let response = MP_REQUEST
-            .response()
-            .unwrap_or_else(|| panic!("Limine did not provide an AArch64 MP response"));
-        let cpus = response.cpus();
-        assert!(
-            !cpus.is_empty(),
-            "Limine AArch64 MP response did not describe any CPU"
+    /// Every processor's slot, each in memory of its processor's node.
+    ///
+    /// A slot outlives every stop and restart of its processor: its node
+    /// is the one the NUMA description gave it, and its power state and
+    /// resume context are found again when it comes back.
+    fn from_limine_mp(
+        timebase: Timebase,
+        pool: &UserMemoryPool,
+        psci: Option<platform::PsciConduit>,
+    ) -> &'static Self {
+        assert_eq!(
+            pool.locality().processor_count(),
+            limine_processors().count(),
+            "the NUMA locality and Limine's MP response disagree on the processor count"
         );
-        let bootstrap_mpidr = response.bsp_mpidr;
-        let bootstrap = cpus
-            .iter()
-            .copied()
-            .find(|cpu| cpu.mpidr == bootstrap_mpidr)
-            .unwrap_or_else(|| {
-                panic!("Limine AArch64 MP response omitted bootstrap MPIDR {bootstrap_mpidr:#x}")
-            });
-        let mut ordered = Vec::with_capacity(cpus.len());
-        ordered.push(bootstrap);
-        for &cpu in cpus {
-            if cpu.mpidr != bootstrap_mpidr {
-                ordered.push(cpu);
+        let processors = PerProcessor::new(pool, |processor, _| {
+            let index = usize::from(processor.id());
+            Aarch64ProcessorSlot {
+                mp_info: limine_processors()
+                    .nth(index)
+                    .unwrap_or_else(|| panic!("Limine's MP response has no processor {index}")),
+                runtime: ProcessorRuntime::new(processor.id()),
+                power: lifecycle::ProcessorPower::new(),
             }
-        }
-        let processors = ordered
-            .into_iter()
-            .enumerate()
-            .map(|(index, mp_info)| {
-                let logical_id = u16::try_from(index)
-                    .unwrap_or_else(|_| panic!("AArch64 processor index {index} exceeds u16"));
-                Aarch64ProcessorSlot {
-                    mp_info,
-                    runtime: ProcessorRuntime::new(logical_id),
-                }
-            })
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
+        });
         Box::leak(Box::new(Self {
             processors,
+            psci: psci.map(lifecycle::Psci::new),
             timebase,
+            return_address_signing: cfi::bootstrap_capability(),
+            instruction_key: cfi::SharedInstructionKey::new(),
             debug_state: Once::new(),
             gic: Once::new(),
+            isa_answers: probe_isa_answers(),
         }))
     }
 
@@ -428,17 +487,27 @@ impl Aarch64PlatformState {
             .unwrap_or_else(|| panic!("AArch64 processor ran before the interrupt controller"))
     }
 
+    /// The PSCI service a processor is stopped and restarted through.
+    fn psci(&self) -> lifecycle::Psci {
+        self.psci.unwrap_or_else(|| {
+            panic!(
+                "the platform describes no PSCI service (a device tree psci node, or the FADT's \
+                 PSCI_COMPLIANT flag), so a processor cannot be stopped or restarted"
+            )
+        })
+    }
+
     fn bootstrap_mpidr(&self) -> u64 {
-        self.processors[0].mp_info.mpidr
+        self.processors.get(ProcessorId::new(0)).mp_info.mpidr
     }
 
     /// The MPIDR of every processor Limine started, bootstrap first.
     fn processor_mpidrs(&self) -> impl Iterator<Item = u64> + Clone + '_ {
-        self.processors.iter().map(|slot| slot.mp_info.mpidr)
+        self.processors.iter().map(|(_, slot)| slot.mp_info.mpidr)
     }
 
     fn bootstrap_runtime(&'static self) -> &'static ProcessorRuntime {
-        &self.processors[0].runtime
+        &self.processors.get(ProcessorId::new(0)).runtime
     }
 
     fn processor_count(&self) -> usize {
@@ -447,13 +516,14 @@ impl Aarch64PlatformState {
 
     fn processor_slot(&self, processor: ProcessorId) -> &Aarch64ProcessorSlot {
         self.processors
-            .get(processor.id() as usize)
+            .try_get(processor)
             .unwrap_or_else(|| panic!("AArch64 processor {} is out of range", processor.id()))
     }
 
     fn processor_slot_by_mpidr(&self, mpidr: u64) -> &Aarch64ProcessorSlot {
         self.processors
             .iter()
+            .map(|(_, slot)| slot)
             .find(|slot| slot.mp_info.mpidr == mpidr)
             .unwrap_or_else(|| panic!("AArch64 processor MPIDR {mpidr:#x} is unknown"))
     }
@@ -496,6 +566,82 @@ fn aarch64_processor_count() -> usize {
         "Limine AArch64 MP response did not describe any CPU"
     );
     processor_count
+}
+
+/// The processors Limine started, in [`ProcessorId`] order: the bootstrap
+/// processor first, then the rest in the order Limine lists them. Read
+/// straight from the MP response, so it answers before the heap exists.
+fn limine_processors() -> impl Iterator<Item = &'static MpInfo> {
+    let response = MP_REQUEST
+        .response()
+        .unwrap_or_else(|| panic!("Limine did not provide an AArch64 MP response"));
+    let cpus = response.cpus();
+    assert!(
+        !cpus.is_empty(),
+        "Limine AArch64 MP response did not describe any CPU"
+    );
+    let bootstrap_mpidr = response.bsp_mpidr;
+    let bootstrap = cpus
+        .iter()
+        .copied()
+        .find(|cpu| cpu.mpidr == bootstrap_mpidr)
+        .unwrap_or_else(|| {
+            panic!("Limine AArch64 MP response omitted bootstrap MPIDR {bootstrap_mpidr:#x}")
+        });
+    core::iter::once(bootstrap).chain(
+        cpus.iter()
+            .copied()
+            .filter(move |cpu| cpu.mpidr != bootstrap_mpidr),
+    )
+}
+
+/// Each processor's firmware identity: the affinity bits of its
+/// `MPIDR_EL1`, which is what a device tree cpu node's `reg` holds
+/// (`Documentation/devicetree/bindings/arm/cpus.yaml`). Answered from the
+/// MP response in [`limine_processors`] order, the order the processor
+/// table is later built in, because the description is read before the
+/// heap the table lives in exists.
+struct LimineProcessorIdentities;
+
+impl ProcessorIdentities for LimineProcessorIdentities {
+    fn processor_count(&self) -> usize {
+        aarch64_processor_count()
+    }
+
+    fn hardware_id(&self, processor: ProcessorId) -> u64 {
+        let index = usize::from(processor.id());
+        let entry = limine_processors().nth(index).unwrap_or_else(|| {
+            panic!("AArch64 processor {index} is beyond the Limine MP response")
+        });
+        entry.mpidr & platform::MPIDR_AFFINITY_MASK
+    }
+}
+
+/// Seeds the kernel's bootstrap allocator with Limine's usable memory,
+/// each region on the node the firmware's NUMA description places it.
+struct PrimeBootstrapAllocator<'h> {
+    handoff: &'h LimineBootHandoff,
+    physical_memory_offset: usize,
+}
+
+impl platform::NumaConsumer for PrimeBootstrapAllocator<'_> {
+    type Output = &'static UserMemoryPool;
+
+    fn consume<Numa: NumaTopology>(self, numa: &Numa) -> &'static UserMemoryPool {
+        let reserved_ranges = boot_reserved_ranges(self.handoff);
+        let memory_regions = self.handoff.memory_map.regions().flat_map(|region| {
+            // SAFETY: Limine's usable entries are RAM nothing else owns,
+            // mapped in the higher-half direct map at
+            // `physical_memory_offset`, and the kernel image is reserved
+            // out.
+            unsafe {
+                usable_node_regions(region, &reserved_ranges, self.physical_memory_offset, numa)
+            }
+        });
+        // Limine hands control to the bootstrap processor, which the
+        // processor table lists first.
+        helios_kernel::prime_bootstrap_allocator(memory_regions, numa, ProcessorId::new(0))
+    }
 }
 
 struct Aarch64InterruptOps;
@@ -557,13 +703,14 @@ extern "C" fn aarch64_kernel_main() -> ! {
         "Limine bootloader does not support the required base protocol revision"
     );
     install_exception_vectors();
+    install_memory_attributes();
     let handoff = limine_boot_handoff();
     let physical_memory_offset = physical_memory_offset();
     // The firmware description comes up before anything else, because
     // the console is part of it and a panic from here on should reach a
     // serial port. Reading the console out of it allocates nothing, in
     // either description.
-    let tables = platform::PlatformTables::discover(&handoff)
+    let tables = platform::PlatformTables::discover(&handoff, efi_system_table())
         .unwrap_or_else(|error| panic!("AArch64 platform discovery failed: {error}"));
     let console = tables
         .console()
@@ -571,10 +718,15 @@ extern "C" fn aarch64_kernel_main() -> ! {
     let debug_serial = DebugSerial::map(console, physical_memory_offset, &handoff);
     debug_serial.init();
     DEBUG_SERIAL_BASE.store(debug_serial.base, Ordering::Release);
-    let processor_count = aarch64_processor_count();
-    let reserved_ranges = boot_reserved_ranges(&handoff);
-    let memory_regions = boot_memory_regions(&handoff, physical_memory_offset, &reserved_ranges);
-    helios_kernel::prime_bootstrap_allocator(memory_regions, processor_count);
+    let pool = tables
+        .with_numa(
+            LimineProcessorIdentities,
+            PrimeBootstrapAllocator {
+                handoff: &handoff,
+                physical_memory_offset,
+            },
+        )
+        .unwrap_or_else(|error| panic!("AArch64 NUMA discovery failed: {error}"));
     let payload = helios_kernel::BootPayload::from_boot_modules(&handoff.modules);
     // The rest of the description needs the heap: the ACPI path has to
     // interpret AML to reach a device's `_CRS`.
@@ -582,7 +734,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
         .describe(console)
         .unwrap_or_else(|error| panic!("AArch64 platform description failed: {error}"));
     vmm::install_user_address_space(physical_memory_offset);
-    let platform_state = Aarch64PlatformState::from_limine_mp(timebase());
+    let platform_state = Aarch64PlatformState::from_limine_mp(timebase(), pool, platform.psci);
     activate_processor_runtime(platform_state.bootstrap_runtime());
 
     let cpu = Aarch64Cpu {
@@ -593,6 +745,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
         cpu.processor_count(),
         cpu.now().ticks(),
         payload,
+        helios_kernel::GuestIsa::for_build_target(cpu.native_feature_probe()),
     );
     platform_state.install_debug_state(debug_state.clone());
     let console = helios_kernel::RecordingConsole::new(
@@ -631,8 +784,13 @@ extern "C" fn aarch64_kernel_main() -> ! {
     if block_device_count != 0 {
         devices = devices.with_block_devices(block_device_count);
     }
+    // The TPM is checked before the kernel exists, because whether the
+    // kernel is handed one is part of the platform it is built from; the
+    // outcome is reported once the logger is up.
+    let (measured_boot, measured_boot_discovery) =
+        tpm::discover(&platform, physical_memory_offset, &handoff, cpu);
     let kernel = helios_kernel::init(
-        Platform::new(console, core::iter::empty::<MemoryRegion>(), cpu)
+        Platform::new(console, cpu)
             .with_topology(
                 ProcessorTopology::start_all_secondaries(
                     cpu.bootstrap_processor(),
@@ -642,8 +800,14 @@ extern "C" fn aarch64_kernel_main() -> ! {
             )
             .with_timer_frequency_hz(cpu.timebase().frequency())
             .with_dma_model(DmaModel::Translated)
-            .with_devices(devices),
+            .with_devices(devices)
+            .with_measured_boot(measured_boot),
     );
+    if measured_boot_discovery.is_refusal() {
+        tracing::warn!("{measured_boot_discovery}");
+    } else {
+        tracing::info!("{measured_boot_discovery}");
+    }
     tracing::info!(
         "platform described by {} console={:#x} gicd={:#x} gicr={:#x} virtio-slots={} rtc={}",
         platform.source,
@@ -676,18 +840,33 @@ extern "C" fn aarch64_kernel_main() -> ! {
         machine_generation,
     );
     debug_state.install_root_entropy(root_entropy.clone());
+    // Every function this processor ran up to here has returned, and the
+    // one still live, this one, never does, so none holds a return address
+    // that the enable would make unauthenticatable. The key is drawn here
+    // because this is the earliest point the DRBG is seeded on every
+    // supported configuration, and everything after it is signed.
+    // SAFETY: `SCTLR_EL1.EnIA` is clear, no secondary has started, and
+    // `aarch64_kernel_main` is `-> !`.
+    unsafe {
+        cfi::install_bootstrap_key(&platform_state.instruction_key, &root_entropy);
+        cfi::enable_instruction_key_a();
+    }
     // The calendar is read once, here, before any component can ask
     // what time it is. The processor's timer carries wall time forward
-    // from that reading; nothing re-synchronises it afterwards.
-    match platform.rtc {
-        Some(region) => {
-            let rtc = rtc::map(region, physical_memory_offset, &handoff);
-            debug_state.seed_wall_clock(cpu.now().ticks(), &rtc);
+    // from that reading; only a machine restore re-reads it, which the
+    // reactions task does with the same clock.
+    let rtc = platform
+        .rtc
+        .map(|region| rtc::map(region, physical_memory_offset, &handoff));
+    match &rtc {
+        Some(rtc) => {
+            debug_state.seed_wall_clock(cpu.now().ticks(), rtc);
         }
         None => {
             tracing::warn!("the platform describes no PL031; the wall clock reads as uptime");
         }
     }
+    helios_kernel::install_generation_reactions(&kernel, debug_state.clone(), rtc);
     let gic = platform_state.install_gic(gic::Gic::new(
         &platform.gic,
         platform_state.processor_mpidrs(),
@@ -753,7 +932,13 @@ extern "C" fn aarch64_kernel_main() -> ! {
         );
         routes.set_entropy(entropy.interrupt, entropy.device);
     }
-    if let Some(balloon) = balloon::install(&kernel, &platform, physical_memory_offset, &handoff) {
+    if let Some(balloon) = balloon::install(
+        &kernel,
+        &platform,
+        physical_memory_offset,
+        &handoff,
+        debug_state.machine_generation_handle(),
+    ) {
         gic.enable_device_interrupt(
             balloon.interrupt,
             balloon.trigger,
@@ -864,6 +1049,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
     // and device routes are published, and every device SPI is routed
     // here, so an arriving interrupt now finds a handler.
     unsafe { unmask_irq() };
+    hand_over::verify_trap_hand_over(platform_state.bootstrap_mpidr());
 
     for processor in helios_kernel::component_host_processors_to_start(
         cpu.processor_count(),
@@ -871,6 +1057,14 @@ extern "C" fn aarch64_kernel_main() -> ! {
     ) {
         cpu.start_processor(processor);
     }
+    // Each secondary read the key before it set `started`, and
+    // `start_processor` returned only after that, so nothing reads it again.
+    platform_state.instruction_key.wipe();
+    #[cfg(helios_cfi_self_test)]
+    // SAFETY: `EnIA` was set with the machine's key on this processor above.
+    unsafe {
+        cfi::self_test()
+    };
 
     helios_kernel::run_component_host_processor_forever(
         cpu,
@@ -894,6 +1088,22 @@ pub struct Aarch64Cpu {
 #[unsafe(no_mangle)]
 extern "Rust" fn helios_current_processor() -> ProcessorId {
     current_processor_runtime().logical_id()
+}
+
+/// The GIC CPU interface's priority mask raised so that only the wake
+/// SGI gets through, on the processor that took it, and put back to the
+/// value it replaced when dropped. Every other interrupt stays pending in
+/// the GIC meanwhile. The mask is the processor's own register, so the
+/// value is not `Send`; it leaves PSTATE.I alone.
+pub struct Aarch64WakeOnlyMask {
+    previous: u8,
+    _processor_local: core::marker::PhantomData<*mut ()>,
+}
+
+impl Drop for Aarch64WakeOnlyMask {
+    fn drop(&mut self) {
+        gic::restore_priority_mask(self.previous);
+    }
 }
 
 impl Cpu for Aarch64Cpu {
@@ -928,8 +1138,67 @@ impl Cpu for Aarch64Cpu {
         unsafe { write_daif(daif) };
     }
 
+    type WakeOnlyMask = Aarch64WakeOnlyMask;
+
+    fn mask_to_wake_only(&self) -> Aarch64WakeOnlyMask {
+        Aarch64WakeOnlyMask {
+            previous: gic::raise_priority_mask_to_wake_only(),
+            _processor_local: core::marker::PhantomData,
+        }
+    }
+
+    fn park_wake_only(&self, word: &AtomicU8, held: u8) {
+        let runtime = current_processor_runtime();
+        assert!(
+            read_daif() & DAIF_IRQ_MASKED != 0,
+            "AArch64 park_wake_only was entered with IRQ unmasked, before the priority mask \
+             was in place"
+        );
+        // Only the wake SGI is more urgent than the mask, so every device
+        // interrupt and the timer stay pending in the GIC while the
+        // processor waits. WFI ends on a pending interrupt the CPU
+        // interface signals even while PSTATE.I is set, and the word is
+        // tested with IRQ masked first, so a wake raised after the test
+        // completes the wait instead of being slept through.
+        let mask = self.mask_to_wake_only();
+        while word.load(Ordering::Acquire) == held {
+            if !runtime.wake_pending.swap(false, Ordering::AcqRel) {
+                // SAFETY: `wfi` has no operands and touches no memory.
+                unsafe {
+                    asm!("wfi", options(nomem, nostack, preserves_flags));
+                }
+            }
+            // The wake SGI the wait ended on is still pending: taking it
+            // acknowledges it, and the wait would otherwise end at once
+            // forever. The mask above admits nothing else.
+            take_pending_irq();
+        }
+        drop(mask);
+        // The wake the loop took, or one that raced it, leaves its latch
+        // set; `park_current` would take it as a wake for work it does
+        // not have.
+        runtime.wake_pending.store(false, Ordering::Release);
+    }
+
     fn start_processor(&self, processor: ProcessorId) {
         self.state.start_processor(processor);
+    }
+
+    fn stop_current(&self) {
+        let runtime = current_processor_runtime();
+        let slot = self.state.processor_slot(runtime.logical_id());
+        slot.power.stop(
+            self.state.psci(),
+            slot.mp_info.mpidr,
+            self.state.gic(),
+            &runtime.wake_pending,
+        );
+    }
+
+    fn restart_processor(&self, processor: ProcessorId) {
+        let slot = self.state.processor_slot(processor);
+        slot.power
+            .restart(self.state.psci(), slot.mp_info.mpidr, self.state.timebase);
     }
 
     fn wake_processor(&self, processor: ProcessorId) {
@@ -968,35 +1237,7 @@ impl Cpu for Aarch64Cpu {
         if len == 0 {
             return;
         }
-        let start = ptr as usize;
-        let end = start
-            .checked_add(len)
-            .unwrap_or_else(|| panic!("AArch64 executable publish range overflow"));
-        let mut address = start & !(cache_line_bytes() - 1);
-        while address < end {
-            unsafe {
-                asm!("dc cvau, {addr}", addr = in(reg) address, options(nostack, preserves_flags));
-            }
-            address = address
-                .checked_add(cache_line_bytes())
-                .unwrap_or_else(|| panic!("AArch64 data-cache clean iteration overflow"));
-        }
-        unsafe {
-            asm!("dsb ish", options(nostack, preserves_flags));
-        }
-        let mut address = start & !(cache_line_bytes() - 1);
-        while address < end {
-            unsafe {
-                asm!("ic ivau, {addr}", addr = in(reg) address, options(nostack, preserves_flags));
-            }
-            address = address.checked_add(cache_line_bytes()).unwrap_or_else(|| {
-                panic!("AArch64 instruction-cache invalidate iteration overflow")
-            });
-        }
-        unsafe {
-            asm!("dsb ish", options(nostack, preserves_flags));
-            asm!("isb", options(nostack, preserves_flags));
-        }
+        make_instructions_coherent(ptr, len);
         helios_kernel::runtime_memory::publish_code_memory(ptr, len);
     }
 
@@ -1010,6 +1251,14 @@ impl Cpu for Aarch64Cpu {
 
     fn has_lazy_commit_virtual_memory(&self) -> bool {
         true
+    }
+
+    /// Every processor signs and authenticates its return addresses: a
+    /// processor without FEAT_PAuth does not boot (`cfi`).
+    fn control_flow_integrity(&self) -> ControlFlowIntegrity {
+        ControlFlowIntegrity {
+            return_addresses: Some(self.state.return_address_signing),
+        }
     }
 
     unsafe fn zero_memory(&self, ptr: NonNull<u8>, size: usize) {
@@ -1073,9 +1322,7 @@ impl ProcessorRuntime {
 
 fn activate_processor_runtime(runtime: &'static ProcessorRuntime) {
     let ptr = runtime as *const _ as usize;
-    let exception_stack_top = (&raw const runtime.exception_stack as usize)
-        .checked_add(EXCEPTION_STACK_BYTES)
-        .unwrap_or_else(|| panic!("AArch64 exception stack top overflow"));
+    let exception_stack_top = runtime.exception_stack.range().end;
     unsafe {
         asm!("msr tpidr_el1, {ptr}", ptr = in(reg) ptr, options(nomem, nostack, preserves_flags));
         // The kernel never leaves EL1 and always runs on SP_EL1, so
@@ -1200,6 +1447,32 @@ unsafe extern "C" fn aarch64_secondary_main(mp_info: &MpInfo) -> ! {
     );
     let state = unsafe { &*state };
     let slot = state.processor_slot_by_mpidr(mp_info.mpidr);
+    // Guest code is compiled once for the ISA level the bootstrap processor
+    // satisfies and runs on any processor, so every processor must answer
+    // every level feature the same way.
+    let isa_answers = probe_isa_answers();
+    assert_eq!(
+        isa_answers, state.isa_answers,
+        "AArch64 processor with MPIDR {:#x} answers the ISA level features differently from the \
+         bootstrap processor; Helios requires every processor to offer the same features",
+        mp_info.mpidr
+    );
+    // Everything this processor ran up to here has returned, and the one
+    // function still live, this one, never does. The key is installed
+    // before `started` is set, so `start_processor` returns for this
+    // processor only after its enable, and the bootstrap processor wipes the
+    // shared key only after every secondary has read it.
+    // SAFETY: `SCTLR_EL1.EnIA` is clear on this processor, the bootstrap
+    // processor published the key before it started this one, and
+    // `aarch64_secondary_main` is `-> !`.
+    unsafe {
+        cfi::install_secondary_key(
+            state.return_address_signing,
+            &state.instruction_key,
+            mp_info.mpidr,
+        );
+        cfi::enable_instruction_key_a();
+    }
     activate_processor_runtime(&slot.runtime);
     state.gic().attach_current_processor(mp_info.mpidr);
 
@@ -1211,7 +1484,7 @@ unsafe extern "C" fn aarch64_secondary_main(mp_info: &MpInfo) -> ! {
         Some(DEBUG_SERIAL_WRITER),
     );
     let kernel = helios_kernel::init(
-        Platform::new(console, core::iter::empty::<MemoryRegion>(), cpu)
+        Platform::new(console, cpu)
             .with_timer_frequency_hz(cpu.timebase().frequency())
             .with_dma_model(DmaModel::Translated)
             .with_devices(DeviceInventory::new().with_debug_serial()),
@@ -1229,6 +1502,7 @@ unsafe extern "C" fn aarch64_secondary_main(mp_info: &MpInfo) -> ! {
     // timer is published; device interrupts are routed to the
     // bootstrap processor, so only private interrupts arrive here.
     unsafe { unmask_irq() };
+    hand_over::verify_trap_hand_over(mp_info.mpidr);
     helios_kernel::run_component_host_processor_forever(
         cpu,
         kernel,
@@ -1250,6 +1524,7 @@ fn prepare_current_processor() {
         asm!("msr cpacr_el1, {cpacr}", cpacr = in(reg) cpacr, options(nomem, nostack, preserves_flags));
         asm!("isb", options(nostack, preserves_flags));
     }
+    install_memory_attributes();
     enable_pmu_for_current_processor();
     install_exception_vectors();
 }
@@ -1286,6 +1561,13 @@ extern "C" fn aarch64_handle_sync_exception(
     frame: *mut SyncTrapFrame,
 ) {
     let exception_class = (esr_el1 >> 26) & 0x3f;
+    // A failed return-address authentication is never the runtime's: a
+    // guest cannot form a native return address, so it is a corrupted host
+    // stack or a compiler bug. It is refused before anything below can
+    // claim the fault as a page fault.
+    // SAFETY: the entry wrote a complete frame at `frame`, and nothing else
+    // touches it while this handler runs.
+    cfi::refuse_authentication_failure(esr_el1, far_el1, unsafe { (*frame).elr });
     let (cause, faulting_address) = match exception_class {
         0b100000 | 0b100001 => (KernelExceptionCause::InstructionFault, Some(far_el1)),
         0b100100 | 0b100101 => (KernelExceptionCause::DataFault, Some(far_el1)),
@@ -1293,6 +1575,17 @@ extern "C" fn aarch64_handle_sync_exception(
         0b001110 => (KernelExceptionCause::IllegalInstruction, None),
         _ => (KernelExceptionCause::IllegalInstruction, None),
     };
+    // The trap hand-over self-check's second trap is resolved in place.
+    // SAFETY: the entry wrote a complete frame at `frame`, and nothing
+    // else touches it while this handler runs.
+    if cause == KernelExceptionCause::Breakpoint
+        && let Some(runtime) = installed_processor_runtime()
+        && runtime
+            .hand_over_probe
+            .resolve_returning_trap(unsafe { &mut *frame })
+    {
+        return;
+    }
 
     let mut stack_fault = helios_kernel::StackFault::Elsewhere;
     if faulting_address.is_some() {
@@ -1305,44 +1598,49 @@ extern "C" fn aarch64_handle_sync_exception(
         {
             return;
         }
-        // A reserved page inside a live fiber stack is a demand commit
-        // the kernel resolves here, with no lock and no allocation; the
-        // guard page below one is a stack overflow and stays a fault.
-        stack_fault = helios_kernel::resolve_stack_fault(helios_hal::vmm::VirtAddr::new(far_el1));
-        if stack_fault == helios_kernel::StackFault::Committed {
-            return;
-        }
-        // A swapped-out page is ours to resolve, and resolving it means
-        // waiting for the swap device. Redirect the faulting context
-        // onto a kernel trampoline running on its own stack, which can
-        // block the fiber the way a host call does; everything else —
-        // guard pages included — still belongs to the runtime.
-        if helios_kernel::swapped_token(helios_hal::vmm::VirtAddr::new(far_el1)).is_some() {
-            // SAFETY: `frame` is the frame the entry above wrote, and
-            // `enter_swap_fault_trampoline` only rewrites fields in it.
-            unsafe {
-                enter_swap_fault_trampoline(frame, far_el1);
+        match helios_kernel::classify_user_page_fault(helios_hal::vmm::VirtAddr::new(far_el1)) {
+            // A reserved page inside a live fiber stack was a demand
+            // commit the kernel resolved in place.
+            helios_kernel::UserPageFault::Resolved => return,
+            // A swapped-out page is ours to resolve, and resolving it
+            // means waiting for the swap device. Redirect the faulting
+            // context onto a kernel trampoline running on its own stack,
+            // which can block the fiber the way a host call does.
+            helios_kernel::UserPageFault::Swapped => {
+                // SAFETY: `frame` is the frame the entry above wrote, and
+                // `enter_swap_fault_trampoline` only rewrites fields in it.
+                unsafe {
+                    enter_swap_fault_trampoline(frame, far_el1);
+                }
+                return;
             }
-            return;
+            // Everything else — guard pages included — still belongs to
+            // the runtime.
+            helios_kernel::UserPageFault::Unclaimed(fault) => stack_fault = fault,
         }
     }
 
-    // SAFETY: the entry wrote a complete frame at this address.
-    let (elr_el1, frame_pointer) = unsafe { ((*frame).elr as usize, (*frame).x[29] as usize) };
-    // A claimed trap unwinds out of this stack and never comes back, so
-    // reaching the panic below is the runtime declining the exception.
-    // SAFETY: the frame is intact; only its saved `spsr` is read.
-    restore_irq_mask_for_unwind(unsafe { (*frame).spsr });
-    let _ = helios_kernel::dispatch_native_trap(KernelException {
+    // SAFETY: the entry wrote a complete frame at this address, and
+    // nothing else touches it while this handler runs.
+    let saved = unsafe { &*frame };
+    let elr_el1 = saved.elr as usize;
+    let exception = KernelException {
         cause,
         instruction_pointer: elr_el1,
-        frame_pointer,
+        frame_pointer: saved.x[29] as usize,
         faulting_address,
-    });
-
+    };
+    // Everything else goes to the runtime from the hand-over stack and
+    // never comes back; only an exception that must not leave the
+    // exception stack is reported here.
+    let refusal = hand_over::hand_over_trap(
+        hand_over::TrapHandOver::new(exception, esr_el1, far_el1, stack_fault, saved),
+        saved.spsr,
+    );
     panic!(
         "unhandled AArch64 synchronous exception ec={exception_class:#x} esr={esr_el1:#x} \
-         elr={elr_el1:#x} far={far_el1:#x}{stack_fault}"
+         elr={elr_el1:#x} far={far_el1:#x}{stack_fault}; not handed to the runtime because \
+         {refusal}"
     )
 }
 
@@ -1390,45 +1688,37 @@ unsafe fn enter_swap_fault_trampoline(frame: *mut SyncTrapFrame, faulting_addres
 /// runtime's trap handler, which unwinds the guest. Only a fault the
 /// runtime does not claim either is fatal.
 extern "C" fn swap_fault_trampoline(frame: *mut SyncTrapFrame, faulting_address: usize) -> ! {
-    let outcome = helios_kernel::resolve_swap_fault_blocking(helios_hal::vmm::VirtAddr::new(
-        faulting_address,
-    ));
-    if outcome.is_ok() {
+    // SAFETY: the frame is intact; only its saved registers are read. The
+    // trampoline runs with the interrupt mask the faulting context had
+    // (`SPSR` was left alone), so what the runtime's unwind lands in runs
+    // on that context's terms without a mask to restore.
+    let (elr_el1, frame_pointer) = unsafe { ((*frame).elr as usize, (*frame).x[29] as usize) };
+    helios_kernel::run_swap_fault_trampoline(
+        helios_hal::vmm::VirtAddr::new(faulting_address),
+        KernelException {
+            cause: KernelExceptionCause::DataFault,
+            instruction_pointer: elr_el1,
+            frame_pointer,
+            faulting_address: Some(faulting_address),
+        },
         // SAFETY: `frame` is the copy `enter_swap_fault_trampoline` put
         // one frame below this stack's interrupted SP, and this code is
         // running on that stack.
-        unsafe { __helios_aarch64_swap_fault_resume(frame) }
-    }
-    // SAFETY: the frame is intact; only its saved registers are read.
-    let (elr_el1, frame_pointer) = unsafe { ((*frame).elr as usize, (*frame).x[29] as usize) };
-    tracing::error!(
-        target: "helios_aarch64::swap",
-        addr = faulting_address,
-        error = ?outcome.err(),
-        "page fault on a swapped-out page could not be resolved"
-    );
-    // As above: the handler returns only when it did not claim the fault.
-    // SAFETY: the frame is intact; only its saved `spsr` is read.
-    restore_irq_mask_for_unwind(unsafe { (*frame).spsr });
-    let _ = helios_kernel::dispatch_native_trap(KernelException {
-        cause: KernelExceptionCause::DataFault,
-        instruction_pointer: elr_el1,
-        frame_pointer,
-        faulting_address: Some(faulting_address),
-    });
-    panic!("unresolvable swap fault at {faulting_address:#x} that the runtime did not claim either")
+        || unsafe { __helios_aarch64_swap_fault_resume(frame) },
+    )
 }
 
 /// IRQ entry point for every exception level slot, called from
 /// `entry.S` on the per-processor exception stack with `PSTATE.I` still
-/// set, so the handler never nests.
+/// set, so the handler never nests. `frame` is the frame the entry built.
 ///
 /// The CPU interface signals one interrupt at a time; the loop drains
 /// every pending one before returning so a level-triggered device that
 /// re-asserts while its handler runs is picked up in the same entry.
 #[unsafe(no_mangle)]
-extern "C" fn aarch64_handle_irq() {
+extern "C" fn aarch64_handle_irq(frame: *const IrqTrapFrame) {
     let runtime = current_processor_runtime();
+    runtime.hand_over_probe.record_interrupt(frame as usize);
     while let Some(intid) = gic::acknowledge_interrupt() {
         if intid == gic::WAKE_SGI {
             // The wake carries no payload: returning from `wfi` is the
@@ -1465,26 +1755,6 @@ extern "C" fn aarch64_handle_irq() {
 /// it disabled.
 const SPSR_IRQ_MASK: u64 = 1 << 7;
 
-/// Puts the interrupted context's IRQ mask back before an exception is
-/// handed to the runtime's trap handler.
-///
-/// The handler never returns for a trap it claims: it unwinds out of
-/// this handler onto the interrupted stack, so the `eret` that would
-/// have restored `PSTATE` from the saved `SPSR_EL1` never runs and the
-/// mask the exception entry set would stay set. Everything the unwind
-/// lands in — the store's teardown, its fiber stack's release, the TLB
-/// shootdown that release broadcasts — is the interrupted code's
-/// continuation and runs on that code's terms, so its mask is restored
-/// here, before the hand-over. The panic path for a trap the runtime
-/// declines runs with it restored too.
-fn restore_irq_mask_for_unwind(spsr: u64) {
-    if spsr & SPSR_IRQ_MASK == 0 {
-        // SAFETY: the interrupted context ran with IRQs unmasked, and
-        // what runs from here is that context's continuation.
-        unsafe { unmask_irq() };
-    }
-}
-
 fn mask_irq() {
     unsafe {
         asm!(
@@ -1512,6 +1782,27 @@ fn read_daif() -> u64 {
 unsafe fn write_daif(daif: u64) {
     unsafe {
         asm!("msr daif, {daif}", daif = in(reg) daif, options(nomem, nostack, preserves_flags));
+    }
+}
+
+/// `DAIF.I`: set while IRQ is masked.
+const DAIF_IRQ_MASKED: u64 = 1 << 7;
+
+/// Opens an interrupt window for exactly the interrupts the priority
+/// mask admits, and closes it again: a pending IRQ is taken before the
+/// `isb` completes, so the handler has run by the time IRQ is masked
+/// once more.
+fn take_pending_irq() {
+    // SAFETY: the caller's priority mask admits only the wake SGI,
+    // whose handler needs nothing the caller holds; the window is
+    // closed before the asm ends.
+    unsafe {
+        asm!(
+            "msr daifclr, #0x2",
+            "isb",
+            "msr daifset, #0x2",
+            options(nomem, nostack, preserves_flags)
+        );
     }
 }
 
@@ -1552,18 +1843,31 @@ fn read_processor_runtime() -> usize {
 }
 
 fn current_processor_runtime() -> &'static ProcessorRuntime {
+    installed_processor_runtime()
+        .unwrap_or_else(|| panic!("AArch64 processor runtime was not installed before use"))
+}
+
+/// This processor's runtime, or `None` before `activate_processor_runtime`
+/// has published it in `tpidr_el1`.
+fn installed_processor_runtime() -> Option<&'static ProcessorRuntime> {
     let ptr = read_processor_runtime() as *const ProcessorRuntime;
-    assert!(
-        !ptr.is_null(),
-        "AArch64 processor runtime was not installed before use"
-    );
-    unsafe { &*ptr }
+    // SAFETY: only `activate_processor_runtime` writes `tpidr_el1`, from a
+    // `&'static ProcessorRuntime`.
+    unsafe { ptr.as_ref() }
 }
 
 fn detect_aarch64_native_feature(feature: &str) -> Option<bool> {
     match feature {
         "lse" => Some(read_id_aa64isar0_el1() & 0xf00_000 != 0),
-        "fp16" => Some(aarch64_id_field(read_id_aa64pfr0_el1(), 16) == 1),
+        // Scalar and vector half-precision arithmetic: ID_AA64PFR0_EL1.FP
+        // (bits 19:16) and .AdvSIMD (bits 23:20) both 0b0001, Linux's FPHP
+        // and ASIMDHP together. Cranelift's `has_fp16` lowers vector ops.
+        "fp16" => {
+            let pfr0 = read_id_aa64pfr0_el1();
+            Some(aarch64_id_field(pfr0, 16) == 1 && aarch64_id_field(pfr0, 20) == 1)
+        }
+        // ID_AA64ISAR0_EL1.DP (bits 47:44): SDOT and UDOT.
+        "dotprod" => Some(aarch64_id_field(read_id_aa64isar0_el1(), 44) >= 1),
         "neon" => Some(true),
         _ => None,
     }
@@ -1677,6 +1981,43 @@ fn timebase() -> Timebase {
     Timebase::new(value)
 }
 
+/// Makes bytes written through the data side visible to instruction fetch on
+/// every processor: clean the data cache to the point of unification, then
+/// invalidate the instruction cache over the range, as the Arm ARM requires
+/// before newly written code runs. Shared by code publication and by swap
+/// reinstating an executable page.
+pub(crate) fn make_instructions_coherent(ptr: *const u8, len: usize) {
+    let start = ptr as usize;
+    let end = start
+        .checked_add(len)
+        .unwrap_or_else(|| panic!("AArch64 executable publish range overflow"));
+    let mut address = start & !(cache_line_bytes() - 1);
+    while address < end {
+        unsafe {
+            asm!("dc cvau, {addr}", addr = in(reg) address, options(nostack, preserves_flags));
+        }
+        address = address
+            .checked_add(cache_line_bytes())
+            .unwrap_or_else(|| panic!("AArch64 data-cache clean iteration overflow"));
+    }
+    unsafe {
+        asm!("dsb ish", options(nostack, preserves_flags));
+    }
+    let mut address = start & !(cache_line_bytes() - 1);
+    while address < end {
+        unsafe {
+            asm!("ic ivau, {addr}", addr = in(reg) address, options(nostack, preserves_flags));
+        }
+        address = address
+            .checked_add(cache_line_bytes())
+            .unwrap_or_else(|| panic!("AArch64 instruction-cache invalidate iteration overflow"));
+    }
+    unsafe {
+        asm!("dsb ish", options(nostack, preserves_flags));
+        asm!("isb", options(nostack, preserves_flags));
+    }
+}
+
 fn cache_line_bytes() -> usize {
     let ctr_el0: u64;
     unsafe {
@@ -1708,13 +2049,25 @@ fn read_ttbr1_el1() -> usize {
     value & PAGE_ADDRESS_MASK as usize
 }
 
-fn install_device_memory_attribute() {
+/// Programs the two MAIR indexes this backend owns on the calling
+/// processor: [`PAGE_ATTR_DEVICE_INDEX`] as Device-nGnRnE and
+/// [`PAGE_ATTR_NORMAL_NC_INDEX`] as Normal non-cacheable.
+///
+/// Called on every processor during its bring-up, before it maps
+/// anything with either index — the bootstrap processor at the top of
+/// its entry point, every secondary in `prepare_current_processor` — so
+/// each processor decodes a leaf's attribute index the same way. The
+/// other six indexes keep what the loader programmed, index 0 among
+/// them, which every ordinary mapping uses.
+fn install_memory_attributes() {
     let mair: u64;
     unsafe {
         asm!("mrs {mair}, mair_el1", mair = out(reg) mair, options(nomem, nostack, preserves_flags));
     }
-    let mask = 0xff << MAIR_DEVICE_ATTR_INDEX_SHIFT;
-    let mair = (mair & !mask) | (MAIR_DEVICE_NGNRNE << MAIR_DEVICE_ATTR_INDEX_SHIFT);
+    let mask = (0xff << MAIR_DEVICE_ATTR_INDEX_SHIFT) | (0xff << MAIR_NORMAL_NC_ATTR_INDEX_SHIFT);
+    let mair = (mair & !mask)
+        | (MAIR_DEVICE_NGNRNE << MAIR_DEVICE_ATTR_INDEX_SHIFT)
+        | (MAIR_NORMAL_NON_CACHEABLE << MAIR_NORMAL_NC_ATTR_INDEX_SHIFT);
     unsafe {
         asm!("msr mair_el1, {mair}", mair = in(reg) mair, options(nomem, nostack, preserves_flags));
         asm!("isb", options(nostack, preserves_flags));
@@ -1726,7 +2079,6 @@ fn map_mmio_page(
     physical_memory_offset: usize,
     handoff: &LimineBootHandoff,
 ) {
-    install_device_memory_attribute();
     let virtual_address = mmio_virtual_base(physical_address, physical_memory_offset);
     let block_virtual = virtual_address & !(MMIO_BLOCK_BYTES - 1);
     let block_physical = physical_address & !(MMIO_BLOCK_BYTES - 1);
@@ -1855,8 +2207,8 @@ fn fdt_cells(bytes: &[u8]) -> Option<usize> {
         return None;
     }
     let mut value = 0usize;
-    for cell in bytes.chunks_exact(4) {
-        let cell = u32::from_be_bytes(cell.try_into().ok()?) as usize;
+    for &cell in bytes.as_chunks::<4>().0 {
+        let cell = u32::from_be_bytes(cell) as usize;
         value = value.checked_shl(32)? | cell;
     }
     Some(value)
@@ -2048,6 +2400,16 @@ fn physical_memory_offset() -> usize {
         .offset as usize
 }
 
+/// The firmware's UEFI system table, at the direct-map address Limine
+/// returns for it from base revision 5 on, or `None` when Limine gave no
+/// response.
+fn efi_system_table() -> Option<NonNull<SystemTable>> {
+    EFI_SYSTEM_TABLE_REQUEST.response().map(|response| {
+        NonNull::new(response.address.cast::<SystemTable>().cast_mut())
+            .unwrap_or_else(|| panic!("Limine's EFI system table response holds a null address"))
+    })
+}
+
 #[derive(Clone, Copy)]
 struct LimineMemoryMap {
     entries: &'static [&'static Entry],
@@ -2145,6 +2507,7 @@ fn limine_boot_handoff() -> LimineBootHandoff {
             device_tree_blob: DEVICE_TREE_BLOB_REQUEST
                 .response()
                 .map(|response| response.dtb_ptr as usize),
+            measurement_log: TPM_EVENT_LOG_REQUEST.measurement_log(),
         },
     }
 }
@@ -2203,26 +2566,6 @@ fn boot_reserved_ranges(handoff: &LimineBootHandoff) -> BootReservedRanges {
     reserved.reserve(loaded_executable_start..loaded_executable_end);
     reserved.reserve(file_start..file_end);
     reserved
-}
-
-fn boot_memory_regions(
-    handoff: &LimineBootHandoff,
-    physical_memory_offset: usize,
-    reserved_ranges: &BootReservedRanges,
-) -> impl IntoIterator<Item = MemoryRegion> {
-    handoff.memory_map.regions().flat_map(move |region| {
-        usable_region_segments(region, reserved_ranges)
-            .into_iter()
-            .flatten()
-            .map(move |segment| {
-                let start = segment.start + physical_memory_offset;
-                let len = segment.end - segment.start;
-                let slice = core::ptr::slice_from_raw_parts_mut(start as *mut u8, len);
-                core::ptr::NonNull::new(slice).unwrap_or_else(|| {
-                    panic!("usable memory segment had a null start: {segment:?}")
-                })
-            })
-    })
 }
 
 #[cfg(target_os = "none")]

@@ -34,15 +34,16 @@ pub(super) enum NetworkTransmitStop {
     RingFull,
 }
 
-/// The queue pair one processor's packet pump owns, decided once from
-/// the topology rather than by whichever task happens to run first.
+/// The queue pair one processor's packet pump owns right now, read from
+/// the routing table (`routes`) rather than decided by whichever task
+/// happens to run first.
 ///
 /// `pair` names everything the pump covers: the queue pair it drains
 /// and submits on, and the shard whose arrival it parks on —
 /// `shard == pair` in the shard-per-processor layout the service
-/// builds. `interface_wide` marks the pump on the bootstrap
-/// processor's pair: the only one that also carries the duties no
-/// pair owns.
+/// builds. `interface_wide` marks the pump on pair 0, the one pair that
+/// is live for the interface's whole life: the only one that also
+/// carries the duties no pair owns.
 #[derive(Clone, Copy)]
 pub struct NetworkPumpAssignment {
     pub(crate) pair: usize,
@@ -72,18 +73,18 @@ pub(super) enum NetworkPollScope {
     /// stack itself needs.
     Interface,
     /// One queue pair: its rings, and the shards whose egress submits
-    /// on it. `interface_wide` is set on the pump that owns the
-    /// bootstrap processor's pair alone — link and configuration
-    /// events and control-plane publication belong to it, because
-    /// they arrive on no pair at all.
+    /// on it. `interface_wide` is set on the pump that owns pair 0
+    /// alone, the one pair live for the interface's whole life — link
+    /// and configuration events and control-plane publication belong
+    /// to it, because they arrive on no pair at all.
     Pair { pair: usize, interface_wide: bool },
 }
 
 impl NetworkPollScope {
     /// Whether this poll acts on link and configuration state and
     /// republishes the control plane — true for operations, which keep
-    /// their whole-interface shape, and for the bootstrap processor's
-    /// pump, which carries the duties no pair owns.
+    /// their whole-interface shape, and for pair 0's pump, which
+    /// carries the duties no pair owns.
     pub(super) const fn interface_wide(self) -> bool {
         match self {
             Self::Interface => true,
@@ -91,14 +92,14 @@ impl NetworkPollScope {
         }
     }
 
-    /// Whether this poll drives `shard_idx`'s timers and submits its
-    /// egress. A pump serves the shards that submit on its pair — the
-    /// ones whose index folds onto it — so with more processors than
-    /// pairs the pair's pump still covers every shard the pair carries.
-    pub(super) fn serves_shard(self, shard_idx: usize, pair_count: usize) -> bool {
+    /// Whether this poll drives the timers and submits the egress of a
+    /// shard that folds onto `shard_pair`. A pump serves the shards that
+    /// submit on its pair, so with more shards than live pairs the
+    /// pair's pump still covers every shard the pair carries.
+    pub(super) fn serves_shard_on(self, shard_pair: usize) -> bool {
         match self {
             Self::Interface => true,
-            Self::Pair { pair, .. } => shard_idx % pair_count == pair,
+            Self::Pair { pair, .. } => shard_pair == pair,
         }
     }
 
@@ -112,24 +113,12 @@ impl NetworkPollScope {
         }
     }
 
-    /// Whether the pair-agnostic async receive fallback is this scope's
-    /// to use. The fallback drains pair zero under its async lock, so
-    /// it belongs to the scope that owns pair zero — every operation,
-    /// and the pump on pair zero — not to a pump whose pair somebody
-    /// else is already draining.
-    pub(super) const fn covers_pair_zero(self) -> bool {
-        match self {
-            Self::Interface => true,
-            Self::Pair { pair, .. } => pair == 0,
-        }
-    }
-
     /// Whether this poll owes the interface's configuration state
     /// machines — the DHCP exchange and router solicitation — a drive.
     /// An operation that is configuring drives them itself through
-    /// `drive_ipv4_configuration`; the duty otherwise belongs to the
-    /// bootstrap processor's pump, which is the only task still
-    /// advancing the interface when no socket is polling it.
+    /// `drive_ipv4_configuration`; the duty otherwise belongs to pair
+    /// 0's pump, which is the only task still advancing the interface
+    /// when no socket is polling it.
     pub(super) const fn drives_configuration(self) -> bool {
         matches!(
             self,
@@ -259,17 +248,6 @@ impl NetworkPollSource {
         }
     }
 
-    pub(super) const fn rx_fallback_phase(self) -> &'static str {
-        match self {
-            Self::Pump => "rx-fallback-pump",
-            Self::Ping => "rx-fallback-ping",
-            Self::Dns => "rx-fallback-dns",
-            Self::Tcp => "rx-fallback-tcp",
-            Self::Udp => "rx-fallback-udp",
-            Self::Configuration => "rx-fallback-configuration",
-        }
-    }
-
     pub(super) const fn rx_signal_phase(self) -> &'static str {
         match self {
             Self::Pump => "rx-signal-pump",
@@ -335,6 +313,74 @@ pub(super) struct NetworkPerfStart {
     pub(super) counters: HardwarePerfCounters,
 }
 
+/// Time and hardware counters spent between two profile samples.
+///
+/// A span is what a phase records, and unlike a pair of samples it can
+/// be summed over disjoint intervals and taken out of the interval that
+/// encloses them — which is how a phase that runs in slices inside
+/// another one, like the receive demux inside the device's hold of a
+/// ring, is reported apart from it.
+#[derive(Clone, Copy, Default)]
+pub(super) struct NetworkPerfSpan {
+    pub(super) nanos: u64,
+    pub(super) counters: HardwarePerfCounterDelta,
+}
+
+impl NetworkPerfSpan {
+    /// The span between two samples, or `None` when profiling was off
+    /// for either of them.
+    pub(super) fn between(
+        start: Option<NetworkPerfStart>,
+        end: Option<NetworkPerfStart>,
+    ) -> Option<Self> {
+        let (start, end) = (start?, end?);
+        Some(Self {
+            nanos: end.nanos.saturating_sub(start.nanos),
+            counters: end.counters.delta_since(start.counters),
+        })
+    }
+
+    /// Adds a disjoint interval to this one.
+    pub(super) fn add(&mut self, other: Self) {
+        self.nanos = self.nanos.saturating_add(other.nanos);
+        self.counters = HardwarePerfCounterDelta {
+            reference_cycles: self
+                .counters
+                .reference_cycles
+                .saturating_add(other.counters.reference_cycles),
+            cpu_cycles: self
+                .counters
+                .cpu_cycles
+                .saturating_add(other.counters.cpu_cycles),
+            instructions_retired: self
+                .counters
+                .instructions_retired
+                .saturating_add(other.counters.instructions_retired),
+        };
+    }
+
+    /// This span without `nested`, an interval inside it.
+    pub(super) fn excluding(self, nested: Self) -> Self {
+        Self {
+            nanos: self.nanos.saturating_sub(nested.nanos),
+            counters: HardwarePerfCounterDelta {
+                reference_cycles: self
+                    .counters
+                    .reference_cycles
+                    .saturating_sub(nested.counters.reference_cycles),
+                cpu_cycles: self
+                    .counters
+                    .cpu_cycles
+                    .saturating_sub(nested.counters.cpu_cycles),
+                instructions_retired: self
+                    .counters
+                    .instructions_retired
+                    .saturating_sub(nested.counters.instructions_retired),
+            },
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum NetworkPumpAction {
     Continue,
@@ -347,79 +393,59 @@ where
     CpuImpl: Cpu + Clone,
     DeviceImpl: NetworkDevice,
 {
-    /// The queue pair a processor's packet pump owns, if it runs one.
+    /// The queue pair a processor's packet pump drains now, if any.
     ///
-    /// Pair `p` belongs to the lowest processor whose shard folds onto
-    /// it: processor `i`'s shard is `i % shard_count` and a shard
-    /// submits on pair `shard % pair_count`, so pair `p`'s candidate
-    /// owners are processors `p`, `p + pair_count`, … and `p` itself is
-    /// the smallest. With more processors than pairs the rest run no
-    /// pump. More pairs than processors cannot happen: bring-up clamps
-    /// the pairs a device activates to the processor count it is handed
-    /// as the pair budget, so every pair has its pump the same way
-    /// `wake_queue_owners` reaches it — one processor each.
+    /// Read from the routing table (`routes`): at boot pair `i` is
+    /// processor `i`'s, so with more processors than pairs the rest
+    /// drain none, and a processor going offline or online moves pairs
+    /// between processors from then on. More pairs than processors
+    /// cannot happen: bring-up clamps the pairs a device activates to
+    /// the processor count it is handed as the pair budget, and the
+    /// table refuses such a device when the service is built.
     ///
-    /// The bootstrap processor's pump is identified through its pair:
-    /// it is the pump on the pair the bootstrap processor's shard
-    /// submits on, which is the bootstrap processor's own pump whenever
-    /// it owns one.
+    /// The interface-wide duties belong to the pump on pair 0, which is
+    /// live as long as the interface is.
     pub(crate) fn pump_assignment_for(
         &self,
         processor: helios_hal::cpu::ProcessorId,
     ) -> Option<NetworkPumpAssignment> {
-        let pair_count = self.inner.device.queue_pair_count().max(1);
-        let processor_count = self.inner.cpu.processor_count();
-        assert!(
-            pair_count <= processor_count,
-            "the device was brought up with {pair_count} queue pairs on a \
-             {processor_count}-processor machine: a pair past the processor \
-             count is activated on the device and drained by nobody"
-        );
-        let shard = self.inner.state.shard_idx_for_processor(processor);
-        let pair = shard % pair_count;
-        if usize::from(processor.id()) != pair {
-            // This processor's shard submits on a pair a lower
-            // processor already pumps.
-            return None;
-        }
-        let bootstrap = self.inner.cpu.bootstrap_processor();
-        let bootstrap_pair = self.inner.state.shard_idx_for_processor(bootstrap) % pair_count;
-        Some(NetworkPumpAssignment {
-            pair,
-            interface_wide: pair == bootstrap_pair,
-        })
+        self.inner
+            .pairs
+            .drained_by(processor)
+            .map(|pair| NetworkPumpAssignment {
+                pair,
+                interface_wide: pair == 0,
+            })
     }
 
-    /// Drives one queue pair for as long as the interface lives.
+    /// Drives whichever queue pair `processor` owns, for as long as the
+    /// task runs.
     ///
-    /// There is one of these per queue pair, pinned by
-    /// `spawn_local_detached` to the processor that owns the pair
-    /// ([`Self::pump_assignment_for`]). The pump parks on
-    /// `shard_wait(pair)`: the pair's event mark for work the device
-    /// reports there, and the arrival of the shard its index names —
-    /// the signal raised for a frame another processor drained into it
-    /// and for work queued on any shard the pair serves. On a wake it
-    /// drains its own pair only, hands each frame to the shard its
-    /// flow hashes to through the existing demux, reclaims the pair's
-    /// transmit completions, drives the TCP timers of the shards the
-    /// pair serves, and submits their egress back onto the pair. It
-    /// never sweeps the other pairs — that is the whole point (#378):
-    /// a completion the host steered to pair `q` wakes pump `q` and
-    /// nobody else.
+    /// Every online processor runs one of these as a local task, which
+    /// its network lifecycle step spawns on the way up and cancels on
+    /// the way down, after it has handed the pair to another processor
+    /// — so the pump is never pinned work an offline has to wait out.
+    /// It reads its pair at the top of every round
+    /// ([`Self::pump_assignment_for`]); a processor that owns none parks
+    /// on the routing table's change signal, armed before the read.
     ///
-    /// The pump on the bootstrap processor's pair additionally carries
-    /// the duties no pair has — link and configuration events and
-    /// control-plane publication — and is the only one that arms the
-    /// device-wide channel to learn of them.
-    pub async fn run_packet_pump(&self, assignment: NetworkPumpAssignment) -> ! {
-        let NetworkPumpAssignment {
-            pair,
-            interface_wide,
-        } = assignment;
-        let scope = NetworkPollScope::Pair {
-            pair,
-            interface_wide,
-        };
+    /// The pump parks on `shard_wait(pair)`: the pair's event mark for
+    /// work the device reports there, and the arrival of the shard its
+    /// index names — the signal raised for a frame another processor
+    /// drained into it, for work queued on any shard the pair serves,
+    /// and for a hand-off. On a wake it drains its own pair only, hands
+    /// each frame to the shard its flow hashes to through the existing
+    /// demux, reclaims the pair's transmit completions, drives the TCP
+    /// timers of the shards the pair serves, and submits their egress
+    /// back onto the pair. It never sweeps the other pairs — that is the
+    /// whole point (#378): a completion the host steered to pair `q`
+    /// wakes pump `q` and nobody else.
+    ///
+    /// The pump on pair 0 additionally carries the duties no pair has —
+    /// link and configuration events and control-plane publication — and
+    /// is the only one that arms the device-wide channel to learn of
+    /// them.
+    pub async fn run_packet_pump(&self, processor: helios_hal::cpu::ProcessorId) -> ! {
         let mut cadence = NetworkPumpCadence::new();
         // The adaptive budget is the pump's own: a pair running hot
         // widens its own drain rather than every pair's.
@@ -429,6 +455,22 @@ where
             self.inner.poll.base_tx_frame_budget,
         );
         loop {
+            // Armed before the pair is read: a hand-off publishes the
+            // table and then raises the signal.
+            let routes_changed = self.inner.pairs.mark();
+            let Some(NetworkPumpAssignment {
+                pair,
+                interface_wide,
+            }) = self.pump_assignment_for(processor)
+            else {
+                cadence.reset();
+                self.inner.pairs.changed().changed(routes_changed).await;
+                continue;
+            };
+            let scope = NetworkPollScope::Pair {
+                pair,
+                interface_wide,
+            };
             // Like every other waiter, the pump samples the mark
             // *before* the poll that decides whether to park, so
             // progress made in between is not slept through.
@@ -441,14 +483,14 @@ where
                     NetworkPumpAction::Continue => {}
                     NetworkPumpAction::Yield => crate::yield_now().await,
                     NetworkPumpAction::Wait => {
-                        self.wait_for_shard_progress(wait, self.pump_wait(pair))
+                        self.wait_for_shard_progress(wait, self.pump_wait(pair, interface_wide))
                             .await;
                     }
                 },
                 Err(error) => {
                     cadence.reset();
                     tracing::debug!(?error, "network packet pump failed to drive device");
-                    self.wait_for_shard_progress(wait, self.pump_wait(pair))
+                    self.wait_for_shard_progress(wait, self.pump_wait(pair, interface_wide))
                         .await;
                 }
             }
@@ -507,11 +549,14 @@ where
         let transmit_started = self.profile_start();
         let mut transmit_stop = NetworkTransmitStop::Drained;
         let shard_count = self.inner.state.shard_count();
-        let pair_count = self.inner.device.queue_pair_count().max(1);
+        // One layout for the round: a shard is submitted on the pair the
+        // scope check folded it onto.
+        let layout = self.inner.pairs.layout();
         while transmitted < budget.tx_frames {
             let mut immediate_submitted = false;
             for shard_idx in 0..shard_count {
-                if !scope.serves_shard(shard_idx, pair_count) {
+                let shard_pair = layout.pair_of_shard(shard_idx);
+                if !scope.serves_shard_on(shard_pair) {
                     continue;
                 }
                 if transmitted >= budget.tx_frames {
@@ -532,13 +577,13 @@ where
                             // device keeps each accepted payload's
                             // handle until its descriptor completes, so
                             // releasing the outbound slot here is safe.
-                            // A shard submits on the pair its index
+                            // A shard submits on the live pair it
                             // folds onto, which is also how the scope's
-                            // `serves_shard` picked this shard.
+                            // `serves_shard_on` picked this shard.
                             let result = self
                                 .inner
                                 .device
-                                .try_transmit_scatter_immediate_on(shard_idx % pair_count, frames);
+                                .try_transmit_scatter_immediate_on(shard_pair, frames);
                             immediate_device_finished = self.profile_start();
                             result
                         },
@@ -600,49 +645,133 @@ where
     }
 }
 
+impl<CpuImpl, DeviceImpl> NetworkService<CpuImpl, DeviceImpl>
+where
+    CpuImpl: Cpu + Clone,
+    DeviceImpl: NetworkDevice,
+{
+    /// Hands the pair `departing` drains to an online processor, as the
+    /// routing table plans it (`routes`).
+    ///
+    /// Runs on `departing` from its network lifecycle step, before the
+    /// processor leaves the online set and while the initiator holds the
+    /// transition lock; `online` still holds `departing`. In order: a
+    /// shrink publishes the smaller live count, so no new submission
+    /// lands on the pair that stops, and tells the device; the moved
+    /// pair's interrupt is steered to its new owner before the owner is
+    /// published, so the new owner's first round, which polls the pair
+    /// before it parks, sees every completion whose interrupt went to
+    /// `departing`; the pair that stopped being live is steered to the
+    /// owner of the pair its shards now fold onto, so a late completion
+    /// on it never interrupts a stopped processor; and every pump is
+    /// woken to read its pair again. The departing processor's own pump
+    /// is cancelled by the caller afterwards.
+    ///
+    /// A device that refuses a live count it accepted at bring-up is a
+    /// device fault the interface cannot run past, and panics naming the
+    /// count.
+    pub(crate) fn hand_off_pair(
+        &self,
+        departing: helios_hal::cpu::ProcessorId,
+        online: &crate::exec::OnlineSet,
+    ) {
+        let pairs = &self.inner.pairs;
+        let departure = pairs.plan_departure(departing, online);
+        match departure {
+            Departure::Idle => return,
+            Departure::Adopted { pair, by } => {
+                self.inner.device.steer_queue_pair(pair, by);
+                pairs.publish_owner(pair, by);
+                pairs.publish_drain(by, Some(pair));
+            }
+            Departure::Shrunk { pair, active, by } => {
+                pairs.publish_active(active);
+                self.set_live_pairs(active);
+                if let Some(by) = by {
+                    self.inner.device.steer_queue_pair(pair, by);
+                    pairs.publish_owner(pair, by);
+                    pairs.publish_drain(by, Some(pair));
+                }
+                let stopped = active;
+                let fold_owner = pairs.owner(pairs.layout().pair_of_shard(stopped));
+                self.inner.device.steer_queue_pair(stopped, fold_owner);
+                pairs.publish_owner(stopped, fold_owner);
+            }
+        }
+        pairs.publish_drain(departing, None);
+        pairs.announce();
+        self.wake_packet_pumps();
+        tracing::info!(
+            processor = departing.id(),
+            ?departure,
+            live_pairs = pairs.layout().active(),
+            "network queue pair handed off"
+        );
+    }
+
+    /// Gives `arriving` the next pair when one is not live, as the
+    /// routing table plans it (`routes`).
+    ///
+    /// Runs on `arriving` from its network lifecycle step, after a
+    /// restart or after a refused offline, while the initiator holds the
+    /// transition lock. The pair is steered to `arriving` and published
+    /// as its own before the device is told it is live, so the pump that
+    /// drains it exists before the device delivers on it; the live count
+    /// is published last, so no shard submits on the pair before the
+    /// device reads it.
+    pub(crate) fn take_up_pair(&self, arriving: helios_hal::cpu::ProcessorId) {
+        let pairs = &self.inner.pairs;
+        let arrival = pairs.plan_arrival(arriving);
+        let Arrival::Grown { pair } = arrival else {
+            return;
+        };
+        self.inner.device.steer_queue_pair(pair, arriving);
+        pairs.publish_owner(pair, arriving);
+        pairs.publish_drain(arriving, Some(pair));
+        self.set_live_pairs(pair + 1);
+        pairs.publish_active(pair + 1);
+        pairs.announce();
+        self.wake_packet_pumps();
+        tracing::info!(
+            processor = arriving.id(),
+            pair,
+            live_pairs = pair + 1,
+            "network queue pair taken up"
+        );
+    }
+
+    fn set_live_pairs(&self, live: usize) {
+        self.inner
+            .device
+            .set_active_queue_pairs(live)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "the network device refused {live} live queue pairs, a count it accepted at \
+                     bring-up: {error}"
+                )
+            });
+    }
+}
+
 impl<CpuImpl, DeviceImpl> crate::NetworkPacketPump for NetworkService<CpuImpl, DeviceImpl>
 where
     CpuImpl: Cpu + Clone,
     DeviceImpl: NetworkDevice,
 {
     async fn run_packet_pump(&self, processor: helios_hal::cpu::ProcessorId) {
-        let Some(assignment) = self.pump_assignment_for(processor) else {
-            return;
-        };
-        self.run_packet_pump(assignment).await;
+        self.run_packet_pump(processor).await
     }
-}
 
-impl NetworkShard {
-    pub(super) fn retransmit_dhcp(&mut self, now: StackInstant) -> Result<(), NetworkControlError> {
-        match self.dhcp {
-            DhcpClientState::Selecting {
-                transaction_id,
-                last_sent,
-            } if now.nanos().saturating_sub(last_sent.nanos()) >= DHCP_RETRANSMIT_NANOS => {
-                self.send_dhcp_discover(transaction_id, now)?;
-                self.dhcp = DhcpClientState::Selecting {
-                    transaction_id,
-                    last_sent: now,
-                };
-            }
-            DhcpClientState::Requesting {
-                transaction_id,
-                requested_ip,
-                server_identifier,
-                last_sent,
-            } if now.nanos().saturating_sub(last_sent.nanos()) >= DHCP_RETRANSMIT_NANOS => {
-                self.send_dhcp_request(transaction_id, requested_ip, server_identifier, now)?;
-                self.dhcp = DhcpClientState::Requesting {
-                    transaction_id,
-                    requested_ip,
-                    server_identifier,
-                    last_sent: now,
-                };
-            }
-            _ => {}
-        }
-        Ok(())
+    fn hand_off_queue_pair(
+        &self,
+        departing: helios_hal::cpu::ProcessorId,
+        online: &crate::exec::OnlineSet,
+    ) {
+        self.hand_off_pair(departing, online);
+    }
+
+    fn take_up_queue_pair(&self, arriving: helios_hal::cpu::ProcessorId) {
+        self.take_up_pair(arriving);
     }
 }
 

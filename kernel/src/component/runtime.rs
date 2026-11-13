@@ -7,8 +7,8 @@ use bytes::Bytes;
 
 use crate::io::{ByteReader, ByteWriter, TryRead};
 use crate::{
-    EntropyPool, InstanceActivity, InstanceRegistry, KernelClock, KillReason, ProcessAuthority,
-    RegisteredInstance, SetWallClockCap, Sleep, Timer,
+    EntropyPool, InstanceActivity, InstanceId, InstanceRegistry, KernelClock, KillReason,
+    ProcessAuthority, RegisteredInstance, SetWallClockCap, Sleep, Timer,
 };
 use helios_hal::cpu::{Cpu, Instant};
 
@@ -169,11 +169,12 @@ pub enum ComponentOutputRoute {
 
 impl ComponentOutputRoute {
     /// Borrow this route as a sink so every writer path matches on one
-    /// exhaustive set of destinations.
-    pub fn sink(&self) -> ComponentOutputSink<'_> {
+    /// exhaustive set of destinations. `instance` is the writer; a
+    /// [`LocalOutputSink::Trace`] attributes what it records to it.
+    pub fn sink(&self, instance: InstanceId) -> ComponentOutputSink<'_> {
         match self {
             Self::Serial => ComponentOutputSink::Local(LocalOutputSink::Serial),
-            Self::Trace => ComponentOutputSink::Local(LocalOutputSink::Trace),
+            Self::Trace => ComponentOutputSink::Local(LocalOutputSink::Trace(instance)),
             Self::Child(writer) => ComponentOutputSink::Child(writer),
             Self::Discard => ComponentOutputSink::Local(LocalOutputSink::Discard),
         }
@@ -202,7 +203,8 @@ pub enum ComponentOutputSink<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LocalOutputSink {
     Serial,
-    Trace,
+    /// Observer console text, attributed to the instance that wrote it.
+    Trace(InstanceId),
     Discard,
 }
 
@@ -228,11 +230,11 @@ impl LocalOutputSink {
     {
         match self {
             Self::Serial => serial_writer.write_stream(bytes),
-            Self::Trace => {
+            Self::Trace(instance) => {
                 let text = core::str::from_utf8(bytes).unwrap_or_else(|error| {
                     panic!("guest attempted to write non-utf8 stdout/stderr bytes: {error}")
                 });
-                runtime_state.record_console_text(cpu.now().ticks(), text);
+                runtime_state.record_console_text(cpu.now().ticks(), Some(instance), text);
                 bytes.len()
             }
             Self::Discard => bytes.len(),
@@ -286,11 +288,43 @@ impl ComponentOutputMode {
         }
     }
 
+    /// Where `kind` goes, as a route a child launched from this mode can
+    /// inherit: the same destination, with a cloned writer handle when
+    /// it is a channel.
+    pub fn route(&self, kind: ComponentOutputStreamKind) -> ComponentOutputRoute {
+        match (self, kind) {
+            (ComponentOutputMode::Serial, _) => ComponentOutputRoute::Serial,
+            (ComponentOutputMode::Trace, _) => ComponentOutputRoute::Trace,
+            (ComponentOutputMode::Child { stdout_tx, .. }, ComponentOutputStreamKind::Stdout) => {
+                ComponentOutputRoute::Child(stdout_tx.clone())
+            }
+            (ComponentOutputMode::Child { stderr_tx, .. }, ComponentOutputStreamKind::Stderr) => {
+                ComponentOutputRoute::Child(stderr_tx.clone())
+            }
+            (
+                ComponentOutputMode::RoutedChild { stdout, .. },
+                ComponentOutputStreamKind::Stdout,
+            ) => stdout.clone(),
+            (
+                ComponentOutputMode::RoutedChild { stderr, .. },
+                ComponentOutputStreamKind::Stderr,
+            ) => stderr.clone(),
+        }
+    }
+
     /// Resolve where `kind` goes without cloning a writer handle.
-    pub fn sink(&self, kind: ComponentOutputStreamKind) -> ComponentOutputSink<'_> {
+    /// `instance` is the writer; a [`LocalOutputSink::Trace`] attributes
+    /// what it records to it.
+    pub fn sink(
+        &self,
+        kind: ComponentOutputStreamKind,
+        instance: InstanceId,
+    ) -> ComponentOutputSink<'_> {
         match (self, kind) {
             (ComponentOutputMode::Serial, _) => ComponentOutputSink::Local(LocalOutputSink::Serial),
-            (ComponentOutputMode::Trace, _) => ComponentOutputSink::Local(LocalOutputSink::Trace),
+            (ComponentOutputMode::Trace, _) => {
+                ComponentOutputSink::Local(LocalOutputSink::Trace(instance))
+            }
             (ComponentOutputMode::Child { stdout_tx, .. }, ComponentOutputStreamKind::Stdout) => {
                 ComponentOutputSink::Child(stdout_tx)
             }
@@ -300,11 +334,11 @@ impl ComponentOutputMode {
             (
                 ComponentOutputMode::RoutedChild { stdout, .. },
                 ComponentOutputStreamKind::Stdout,
-            ) => stdout.sink(),
+            ) => stdout.sink(instance),
             (
                 ComponentOutputMode::RoutedChild { stderr, .. },
                 ComponentOutputStreamKind::Stderr,
-            ) => stderr.sink(),
+            ) => stderr.sink(instance),
         }
     }
 
@@ -334,7 +368,9 @@ pub trait ComponentRuntimeState: Clone + Send + 'static {
     /// wall time cannot be told apart from uptime.
     fn wall_clock_offset_nanos(&self) -> i128;
 
-    fn record_console_text(&self, current_ticks: u64, text: &str);
+    /// Records `text` as console events attributed to `origin`: the
+    /// instance that wrote it, or `None` for the kernel's own console.
+    fn record_console_text(&self, current_ticks: u64, origin: Option<InstanceId>, text: &str);
 
     /// The kernel's root DRBG, from which this instance's pool is
     /// derived.
@@ -388,13 +424,9 @@ pub trait ComponentRuntimeState: Clone + Send + 'static {
         weight_nanos: u64,
     );
 
-    fn record_profile_stack_parts_nanos(
-        &self,
-        scope: crate::ProfileScope,
-        prefix: &str,
-        suffix: &str,
-        weight_nanos: u64,
-    );
+    /// Records `weight_nanos` of time `instance`, running the program
+    /// named `program`, spent in user code.
+    fn record_user_profile(&self, instance: InstanceId, program: &str, weight_nanos: u64);
 
     fn record_perf_metric_parts(
         &self,
@@ -424,8 +456,19 @@ pub(crate) struct ComponentExecutionContext<FileSystem> {
     output_mode: ComponentOutputMode,
 }
 
-pub struct ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem, ResourceTableImpl>
-where
+/// One instance's store data.
+///
+/// `LinearMemoryImpl` is the runtime's handle on the instance's one
+/// unshared linear memory: the kernel never looks inside it, and the
+/// runtime adapter reads the memory's current extent through it each
+/// time a guest names a span.
+pub struct ComponentStoreData<
+    CpuImpl,
+    RuntimeStateImpl,
+    FileSystem,
+    ResourceTableImpl,
+    LinearMemoryImpl,
+> where
     CpuImpl: Cpu + Clone,
     RuntimeStateImpl: ComponentRuntimeState,
 {
@@ -447,9 +490,25 @@ where
     execution_context: ComponentExecutionContext<FileSystem>,
     serial_reader: crate::SerialReader,
     serial_writer: crate::DebugSerialWriter,
-    /// Where this instance's linear memory sits and the device it
-    /// holds, if any. Empty on every instance that never asks for one,
-    /// which is every instance that is not a driver.
+    /// The runtime's handle on this instance's linear memory, once the
+    /// instance is built. Absent when its component lowers through a
+    /// shared memory, or through more than one: nothing is ever shown
+    /// in such a memory.
+    pub linear_memory: Option<LinearMemoryImpl>,
+    /// Every buffer and device region shown in this instance's linear
+    /// memory.
+    ///
+    /// Declared before `device` on purpose: fields drop in order, so a
+    /// dying store withdraws every view before any claim it holds is
+    /// let go, and the claims' owner tasks — which may run on another
+    /// processor the moment a claim drops — never act on a device whose
+    /// memory this instance can still reach. The runtime drops store
+    /// data before it deallocates the instance and resets the memory
+    /// slot, so no view outlives the memory it was shown in.
+    pub views: crate::buffer::ViewTable,
+    /// The devices, display, desktop windows, 3D engine and playback
+    /// stream this instance holds, if any. Empty on every instance that
+    /// never asks for one.
     pub device: crate::device::DeviceOwnership,
     /// The input devices this instance holds, if any. Empty on every
     /// instance that never claims one, which is every instance that is
@@ -496,8 +555,8 @@ impl<FileSystem> ComponentExecutionContext<FileSystem> {
     }
 }
 
-impl<CpuImpl, RuntimeStateImpl, FileSystem, ResourceTableImpl>
-    ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem, ResourceTableImpl>
+impl<CpuImpl, RuntimeStateImpl, FileSystem, ResourceTableImpl, LinearMemoryImpl>
+    ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem, ResourceTableImpl, LinearMemoryImpl>
 where
     CpuImpl: Cpu + Clone,
     RuntimeStateImpl: ComponentRuntimeState,
@@ -545,6 +604,8 @@ where
             ),
             serial_reader,
             serial_writer,
+            linear_memory: None,
+            views: crate::buffer::ViewTable::new(),
             device: crate::device::DeviceOwnership::new(),
             input: crate::input::InputOwnership::new(),
             requested_exit: None,
@@ -598,10 +659,6 @@ where
 
     pub(crate) fn filesystem(&self) -> &FileSystem {
         &self.execution_context.filesystem
-    }
-
-    pub(crate) fn filesystem_mut(&mut self) -> &mut FileSystem {
-        &mut self.execution_context.filesystem
     }
 
     pub(crate) fn arguments(&self) -> &[String] {
@@ -662,9 +719,9 @@ where
         self.entropy.secure_u64(self.runtime_state.root_entropy())
     }
 
-    pub(crate) fn insecure_random_bytes(&mut self, len: usize) -> Vec<u8> {
+    pub(crate) fn fill_insecure_random(&mut self, buffer: &mut [u8]) {
         self.entropy
-            .insecure_bytes(self.runtime_state.root_entropy(), len)
+            .fill_insecure(self.runtime_state.root_entropy(), buffer);
     }
 
     pub(crate) fn insecure_random_u64(&mut self) -> u64 {
@@ -703,7 +760,11 @@ where
             *pending = None;
             return core::task::Poll::Ready(());
         }
-        match self.execution_context.output_mode.sink(stream) {
+        match self
+            .execution_context
+            .output_mode
+            .sink(stream, self.instance().id())
+        {
             ComponentOutputSink::Local(local) => {
                 // The waiter is armed before the port is tried, so a
                 // transmit release that lands between the write and the

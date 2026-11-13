@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from helios_bench import REPO_ROOT, TOOLS_BENCH_ROOT, WASI_APPS_ROOT
 from helios_bench.wasi_apps import fedora_baseline
@@ -34,6 +34,62 @@ class Statistics(BaseModel):
     bootstrap_seed: int
 
 
+def validate_rounds(rounds: int) -> int:
+    """A run of alternating rounds is an even number of them (#491).
+
+    Consecutive rounds swap which side goes first, so only an even count
+    gives each side the first slot as often as the second.
+    """
+    if rounds < 2 or rounds % 2 != 0:
+        raise ValueError(
+            f"rounds is {rounds}: alternating the order of the two sides needs an even number of "
+            "rounds, at least 2, so each side goes first as often as it goes second"
+        )
+    return rounds
+
+
+def validate_guest_memory(lane: Lane) -> Lane:
+    """The two guests of a lane get one memory size, unless the lane says why not (#491).
+
+    A guest with more memory than the other is a different machine, so a
+    lane whose fields differ without a stated reason is refused, and so is
+    a reason left behind on a lane whose fields agree.
+    """
+    if lane.memory != lane.linux_vm_memory and lane.memory_differs_because is None:
+        raise ValueError(
+            f"lane {lane.name!r} gives the Helios guest memory = {lane.memory!r} and the Linux "
+            f"guest linux_vm_memory = {lane.linux_vm_memory!r}: the two columns compare alike "
+            "only on equal guests, so set them equal or state memory_differs_because"
+        )
+    if lane.memory == lane.linux_vm_memory and lane.memory_differs_because is not None:
+        raise ValueError(
+            f"lane {lane.name!r} states memory_differs_because, and memory and linux_vm_memory "
+            f"are both {lane.memory!r}"
+        )
+    return lane
+
+
+class SidedFact(BaseModel):
+    """One fact stated for each of the two columns."""
+
+    helios: str
+    linux: str
+
+
+class StatedAsymmetries(BaseModel):
+    """What still differs between a lane's two columns by construction (#491).
+
+    Facts fixed by the lane's own construction, stated once here so the
+    report's pins repeat them from the manifest instead of from prose
+    that could go stale. What a run can read (the Wasmtime revisions) is
+    not stated here: `helios_bench.asymmetries` reads it.
+    """
+
+    stack_limit_interruption: SidedFact = Field(
+        description="whether stack-limit interruption is compiled into each side's code"
+    )
+
+
 class Lane(BaseModel):
     name: str
     helios_arch: str
@@ -41,26 +97,65 @@ class Lane(BaseModel):
     accelerator: str
     rpc_transport: Literal["serial", "vsock"]
     runner_label: str
-    shared_runner: str
+    # The hosted runner the lane's job takes in advisory mode. A lane no
+    # hosted runner can carry has none: it is run by hand on its dedicated
+    # host and is not part of the workflow matrix.
+    shared_runner: str | None = None
     qemu_version: str
     boot_timeout_seconds: int = Field(ge=1)
     vcpus: int = Field(ge=1)
+    # The worker count the kernel's compiler plugin runs with on this lane's
+    # guest, which the Linux + Wasmtime column of `aot-curl` is given.
+    compiler_workers: int = Field(ge=1)
     memory: str
     linux_vm_memory: str
+    # Why the lane gives its two guests different memory sizes. The two
+    # columns compare alike only on equal guests, so a lane that sets
+    # `memory` and `linux_vm_memory` apart says why, and one that keeps
+    # them equal has nothing to say (#491).
+    memory_differs_because: str | None = None
     net_backend: str
     net_host: str
     devices: list[str]
+    # How many alternating rounds one run of the lane is: a round times both
+    # sides once, and consecutive rounds swap which goes first, so host
+    # drift between the two halves of a round lands on each column in turn.
+    # None is a single pass, Helios then Linux.
+    rounds: int | None = None
+    # What still differs between the lane's two columns by construction,
+    # for the lanes whose parity table states it beside the pins.
+    stated_asymmetries: StatedAsymmetries | None = None
+
+    @field_validator("rounds")
+    @classmethod
+    def rounds_are_even(cls, rounds: int | None) -> int | None:
+        return None if rounds is None else validate_rounds(rounds)
+
+    @model_validator(mode="after")
+    def guests_have_equal_memory(self) -> Lane:
+        return validate_guest_memory(self)
 
     @property
     def qemu_binary(self) -> str:
         return f"qemu-system-{self.guest_arch}"
 
     def runs_on(self, advisory: bool) -> str:
-        """The runner this lane runs on in the given mode."""
-        return self.shared_runner if advisory else self.runner_label
+        """The runner this lane runs on in the given mode.
+
+        An advisory run of a lane with no hosted runner is still taken on
+        its dedicated host: there is nowhere else it can run.
+        """
+        if advisory and self.shared_runner is not None:
+            return self.shared_runner
+        return self.runner_label
 
     def github_matrix_entry(self) -> dict[str, str]:
         """One `include` entry of the bench-suite workflow matrix."""
+        if self.shared_runner is None:
+            raise SystemExit(
+                f"lane {self.name!r} has no hosted runner and is not part of the workflow matrix; "
+                f"run it on its dedicated host with `helios-bench run --lane {self.name}`"
+            )
         return {
             "lane": self.name,
             "shared-runner": self.shared_runner,

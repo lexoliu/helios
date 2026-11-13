@@ -4,8 +4,8 @@ use alloc::vec::Vec;
 use core::future::Future;
 
 use crate::{
-    ComponentOutputMode, ComponentRuntimeState, HostFileSystem, InstanceId, InstanceRegistry,
-    ProcessAuthority, RegisteredInstance, Timer,
+    ComponentOutputMode, ComponentRuntimeState, InstanceId, InstanceRegistry, ProcessAuthority,
+    RegisteredInstance, Storage, Timer,
 };
 use helios_hal::cpu::Cpu;
 
@@ -30,11 +30,11 @@ pub enum ComponentExitStatus {
 
 /// Kernel-owned execution context passed to the runtime when launching a
 /// component.  Contains no runtime-specific types.
-pub struct ComponentExecContext<CpuImpl, RuntimeStateImpl, HostFs>
+pub struct ComponentExecContext<CpuImpl, RuntimeStateImpl, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     RuntimeStateImpl: ComponentRuntimeState,
-    HostFs: HostFileSystem,
+    StorageImpl: Storage,
 {
     pub cpu: CpuImpl,
     pub timer: Timer<CpuImpl>,
@@ -50,14 +50,15 @@ where
     pub output_mode: ComponentOutputMode,
     pub serial_reader: crate::SerialReader,
     pub serial_writer: crate::DebugSerialWriter,
-    _host_fs: core::marker::PhantomData<HostFs>,
+    _host_fs: core::marker::PhantomData<StorageImpl>,
 }
 
-impl<CpuImpl, RuntimeStateImpl, HostFs> ComponentExecContext<CpuImpl, RuntimeStateImpl, HostFs>
+impl<CpuImpl, RuntimeStateImpl, StorageImpl>
+    ComponentExecContext<CpuImpl, RuntimeStateImpl, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     RuntimeStateImpl: ComponentRuntimeState,
-    HostFs: HostFileSystem,
+    StorageImpl: Storage,
 {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -135,12 +136,12 @@ pub trait ComponentExecutor: Send + 'static {
 ///
 /// Each associated error type is runtime-specific and avoids heap-allocated
 /// strings.
-pub trait ComponentRuntimeFactory<CpuImpl, RuntimeStateImpl, HostFs>:
+pub trait ComponentRuntimeFactory<CpuImpl, RuntimeStateImpl, StorageImpl>:
     Clone + Send + Sync + 'static
 where
     CpuImpl: Cpu + Clone,
     RuntimeStateImpl: ComponentRuntimeState,
-    HostFs: HostFileSystem,
+    StorageImpl: Storage,
 {
     type Engine: ComponentRuntimeEngine;
     type Executor: ComponentExecutor;
@@ -159,6 +160,6 @@ where
         engine: &Self::Engine,
         compiled: &<Self::Engine as ComponentRuntimeEngine>::Compiled,
         world: ComponentWorld,
-        context: ComponentExecContext<CpuImpl, RuntimeStateImpl, HostFs>,
+        context: ComponentExecContext<CpuImpl, RuntimeStateImpl, StorageImpl>,
     ) -> impl Future<Output = Result<Self::Executor, Self::InstantiateError>> + Send;
 }

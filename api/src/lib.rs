@@ -1,8 +1,8 @@
 //! Async-first userland SDK for Helios wasm programs.
 //!
 //! Each capability area lives behind a Cargo feature so programs only
-//! link the WIT interfaces they use: `fs`, `http`, `http-handler`, `io`,
-//! `net`, `programs`, `serial`, `stats`, `sync`, `task`, `tracing`,
+//! link the WIT interfaces they use: `fs`, `http`, `http-handler`, `http-kit-io`, `io`,
+//! `mounts`, `net`, `programs`, `serial`, `stats`, `sync`, `task`, `tracing`,
 //! `profiling`, `instances`, `display`, `gpu`, `input`, `surface`,
 //! `compositor`, `audio`, `vsock`, and `channel`. `bindings` exposes the raw generated WIT
 //! bindings for anything the typed helpers do not cover, and
@@ -25,21 +25,31 @@ pub mod fs;
 pub mod gpu;
 #[cfg(feature = "http")]
 pub mod http;
+#[cfg(feature = "http-kit-io")]
+pub mod http_kit;
 #[cfg(feature = "input")]
 pub mod input;
 #[cfg(feature = "instances")]
 pub mod instances;
 #[cfg(feature = "io")]
 pub mod io;
+#[cfg(any(feature = "display", feature = "gpu", feature = "surface"))]
+pub mod memory;
+#[cfg(feature = "mounts")]
+pub mod mounts;
 #[cfg(feature = "net")]
 pub mod net;
 pub mod prelude;
+#[cfg(feature = "processors")]
+pub mod processors;
 #[cfg(feature = "profiling")]
 pub mod profiling;
 #[cfg(feature = "programs")]
 pub mod programs;
 #[cfg(feature = "serial")]
 pub mod serial;
+#[cfg(feature = "snapshot")]
+pub mod snapshot;
 #[cfg(feature = "stats")]
 pub mod stats;
 #[cfg(feature = "surface")]

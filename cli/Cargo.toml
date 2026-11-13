@@ -5,14 +5,14 @@ edition.workspace = true
 
 [dependencies]
 askama = "0.15.6"
-clap = { version = "4.5.38", features = ["derive"] }
+clap = { version = "4.5.38", features = ["derive", "env"] }
 ed25519-dalek = { version = "3.0.0", default-features = false, features = ["alloc", "rand_core"] }
 fatfs = "0.3.6"
 helios-artifact.workspace = true
 helios-compiler-support.workspace = true
 helios-profdata.workspace = true
+helios-venus-gen.workspace = true
 helios-workspace-root.workspace = true
-hex = "0.4.3"
 mbrman = "0.5.4"
 # Writes the kernel image onto the boot disk without its DWARF (#451).
 object = { version = "0.39", default-features = false, features = ["build", "std"] }

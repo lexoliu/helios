@@ -18,7 +18,8 @@
 //! routed to.
 //!
 //! * The drain parks on the device's own notification and never polls.
-//!   It is the single producer of that device's event queue, and it
+//!   It is the single producer of the holding claim's event queue (none
+//!   when the device is unclaimed), and it
 //!   never waits on the queue: a report that does not fit is dropped
 //!   whole and counted, because a drain that waits is a ring that stops.
 //! * The indicator server owns the direction that travels towards the
@@ -56,13 +57,14 @@ use super::{InputService, InputServiceError, MAX_CLAIMED_DEVICES};
 /// devices, which is more than the kernel can route interrupts for: a
 /// device past that bound is one whose events would never arrive, and
 /// bringing it up silently would leave a keyboard that never reports.
-pub fn install_input_devices<CpuImpl, WatchdogImpl, Device, Devices>(
-    kernel: &Kernel<CpuImpl, WatchdogImpl>,
+pub fn install_input_devices<CpuImpl, WatchdogImpl, MeasuredBootImpl, Device, Devices>(
+    kernel: &Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
     devices: Devices,
 ) -> InputService
 where
     CpuImpl: Cpu + Clone + Send + Sync + 'static,
     WatchdogImpl: Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
     Device: InputDevice + Clone,
     Devices: IntoIterator<Item = Device>,
 {

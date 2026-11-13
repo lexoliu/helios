@@ -147,4 +147,36 @@ __helios_riscv_trap_entry:
     ld x2, HELIOS_TRAP_SP(sp)
     sret
 
+// Leaves the trap stack for good and calls
+// `__helios_riscv_trap_hand_over_main` on this hart's hand-over stack, in
+// the state the exit above would have restored for the outermost frame:
+// `sscratch` back at the trap stack top and `SIE` as the interrupted
+// context had it. The runtime's trap handler, which runs from there,
+// ends a trap it claims by writing `sp` and jumping, so nothing on the
+// trap stack is live when the next trap carves its region at the top.
+//
+// a0: the hand-over record, 16-byte aligned at the top of the hand-over
+//     stack; it becomes the stack pointer, so the record sits above
+//     everything pushed after it.
+// a1: the trap stack top to hand back to `sscratch`.
+// a2: non-zero when the interrupted context had `SIE` set.
+//
+// Entered from the dispatcher of an outermost frame, so `sscratch` is
+// zero and `SIE` clear until the steps below: the stack switch comes
+// first, and only then is the trap stack handed back and `SIE` set.
+.equ HELIOS_SSTATUS_SIE, 0x2
+.section .text.helios_trap_hand_over, "ax"
+.global __helios_riscv_trap_hand_over
+.balign 4
+__helios_riscv_trap_hand_over:
+    mv sp, a0
+    csrw sscratch, a1
+    // Nothing above the hand-over is a frame anyone returns to.
+    mv s0, zero
+    beqz a2, 1f
+    csrsi sstatus, HELIOS_SSTATUS_SIE
+1:
+    call __helios_riscv_trap_hand_over_main
+    unimp
+
 .option pop

@@ -4,11 +4,12 @@
 //! beside its scanouts: a set of *capability sets*, each naming a
 //! renderer the host is willing to speak; *contexts*, which are that
 //! renderer's per-client state; *blobs*, which are the resources a
-//! context works on; and *fences*, which are how the device says a
-//! submission has been consumed. None of it is a consumer's vocabulary
-//! — a Vulkan driver, a compositor, a media stack all use the same four
-//! — so the contract lives here and the concrete driver encodes it onto
-//! its own wire format.
+//! context works on; and *fences*, which are how the device says the
+//! work before a point on one of a context's timelines has been
+//! consumed. None of it is a consumer's vocabulary — a Vulkan driver, a
+//! compositor, a media stack all use the same four — so the contract
+//! lives here and the concrete driver encodes it onto its own wire
+//! format.
 //!
 //! # What this contract does not do
 //!
@@ -31,9 +32,20 @@
 //!   host. The guest reaches it only by asking the device to place it in
 //!   the engine's host-visible aperture, which is what
 //!   [`Gpu3d::map_blob`] does and what it hands back a [`DeviceRegion`]
-//!   for.
+//!   for, carrying the memory type the renderer asked the mapping to
+//!   have.
 //! * [`BlobMemory::Host3dGuest`] — both: host storage the renderer
 //!   works on, backed by pages the caller owns.
+//!
+//! # Timelines
+//!
+//! A context carries between one and [`MAX_RINGS`] fence timelines, its
+//! *rings*, chosen when it is created. Ring 0 is the renderer's CPU
+//! timeline, signalled once the renderer has processed a command; the
+//! others are bound to the renderer's queues by the guest's own
+//! protocol. A fence names a point on one ring of one context and
+//! retires only work submitted there, so one context's progress — or
+//! one queue's — never answers for another's.
 //!
 //! # SMP contract
 //!
@@ -41,26 +53,26 @@
 //! from several tasks at once; an implementation serialises access to
 //! its own rings internally. Ordering between two concurrent calls is
 //! the ordering the device sees, so a caller that needs one submission
-//! to precede another awaits the first, or fences them.
+//! to precede another lets the first reach the device — its `posted`
+//! signal — before it starts the second.
 //!
-//! Fences are the exception, and the reason they exist: they are the
-//! one ordering guarantee this contract makes without a caller waiting.
-//! A context's fence timeline is monotone, so the newest signalled
-//! fence answers for every one before it: a reader that asks for "the
-//! first fence after `n`" may be handed the newest of several retired
-//! since it last looked, and has still missed nothing.
+//! Fences are the one ordering guarantee this contract makes without a
+//! caller waiting. A ring's timeline is monotone, so the newest
+//! signalled fence answers for every one before it: a reader that asks
+//! for "the first fence after `n`" may be handed the newest of several
+//! retired since it last looked, and has still missed nothing.
 
 use core::future::Future;
 
 use arrayvec::{ArrayString, ArrayVec};
 use thiserror::Error;
 
-use crate::device::DeviceRegion;
+use crate::device::{DeviceRegion, MemoryKind};
 use crate::io::IoError;
 use crate::iommu::PhysicalRange;
 use crate::pmm::PhysFrameRange;
 
-use super::MAX_BACKING_RANGES;
+use super::{MAX_BACKING_RANGES, PixelFormat};
 
 /// Capability sets one display engine may carry.
 ///
@@ -77,6 +89,15 @@ pub const MAX_CAPSETS: usize = 8;
 /// bounded by what the wire format carries — virtio-gpu's `debug_name`
 /// is 64 bytes — rather than by anything the kernel chooses.
 pub const MAX_CONTEXT_NAME: usize = 64;
+
+/// Fence timelines one context may carry.
+///
+/// Linux's virtgpu uAPI bounds `VIRTGPU_CONTEXT_PARAM_NUM_RINGS` at 64
+/// (`virtgpu_ioctl.c`, `MAX_RINGS`), Mesa's Venus driver asks for
+/// exactly that many (`vn_renderer_virtgpu.c`, `max_timeline_count`),
+/// and the wire's `ring_idx` is one byte, so a ring index is always
+/// below this.
+pub const MAX_RINGS: usize = 64;
 
 /// One renderer the host is willing to speak, as the device names it.
 ///
@@ -136,7 +157,7 @@ pub type ContextName = ArrayString<MAX_CONTEXT_NAME>;
 /// One renderer context the device holds for a caller.
 ///
 /// The identifier is opaque and names device-side state: the renderer's
-/// per-client object table, its command timeline, and the resources
+/// per-client object table, its command timelines, and the resources
 /// attached to it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ContextId(u32);
@@ -152,6 +173,10 @@ impl ContextId {
 }
 
 /// One blob resource the device holds for a caller.
+///
+/// The number is the device's resource id itself — what a renderer's
+/// own protocol names the resource by when it describes a ring, a reply
+/// stream or a scanout — so it is handed to the guest as it is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BlobId(u32);
 
@@ -165,12 +190,77 @@ impl BlobId {
     }
 }
 
-/// One point on a context's completion timeline.
+/// One of a context's fence timelines.
+///
+/// Always below [`MAX_RINGS`]; whether it is below the count a given
+/// context was created with is [`RingCount::contains`]'s question.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RingIndex(u8);
+
+impl RingIndex {
+    /// The renderer's CPU timeline, which every context has.
+    pub const CPU: Self = Self(0);
+
+    /// The ring `index` names, or `None` when no context can carry one
+    /// that high.
+    pub const fn new(index: u8) -> Option<Self> {
+        if (index as usize) < MAX_RINGS {
+            Some(Self(index))
+        } else {
+            None
+        }
+    }
+
+    pub const fn raw(self) -> u8 {
+        self.0
+    }
+
+    /// The ring as an index into a per-ring table.
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// How many fence timelines a context carries: between one and
+/// [`MAX_RINGS`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RingCount(u8);
+
+impl RingCount {
+    /// One ring: the CPU timeline alone.
+    pub const ONE: Self = Self(1);
+
+    /// The count `rings` names, or `None` when it is zero or past
+    /// [`MAX_RINGS`].
+    pub const fn new(rings: u8) -> Option<Self> {
+        if rings != 0 && (rings as usize) <= MAX_RINGS {
+            Some(Self(rings))
+        } else {
+            None
+        }
+    }
+
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+
+    /// Whether `ring` is one of this many.
+    pub const fn contains(self, ring: RingIndex) -> bool {
+        ring.0 < self.0
+    }
+
+    /// Every ring of this many, lowest first.
+    pub fn rings(self) -> impl Iterator<Item = RingIndex> {
+        (0..self.0).map(RingIndex)
+    }
+}
+
+/// One point on one of a context's completion timelines.
 ///
 /// A caller chooses the number and the device hands it back once every
-/// command submitted before it has been consumed. Increasing per
-/// context, which is the whole of the ordering [`Gpu3d::fences`] rests
-/// on.
+/// command submitted before it on that ring has been consumed.
+/// Increasing per ring, which is the whole of the ordering
+/// [`Gpu3d::fences`] rests on.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FenceId(u64);
 
@@ -199,6 +289,19 @@ pub enum BlobMemory {
     Host3d,
     /// Host storage backed by pages the caller owns.
     Host3dGuest,
+}
+
+impl BlobMemory {
+    /// Whether the renderer owns storage of its own for the blob, which
+    /// is what a renderer blob id names.
+    pub const fn is_host(self) -> bool {
+        matches!(self, Self::Host3d | Self::Host3dGuest)
+    }
+
+    /// Whether the caller's pages back the blob.
+    pub const fn is_guest_backed(self) -> bool {
+        matches!(self, Self::Guest | Self::Host3dGuest)
+    }
 }
 
 bitflags::bitflags! {
@@ -231,17 +334,80 @@ pub struct BlobRequest<'a> {
     pub memory: BlobMemory,
     /// What the caller intends to do with it.
     pub usage: BlobUsage,
-    /// How many bytes it covers.
+    /// How many bytes it covers. The driver rounds what it asks the
+    /// device for up to the device's own blob alignment.
     pub size: u64,
-    /// The renderer's own handle for the host allocation, for
-    /// [`BlobMemory::Host3d`] and [`BlobMemory::Host3dGuest`]. It comes
-    /// out of the command stream the guest submitted, so the kernel
-    /// carries it and never mints one.
-    pub host_id: u64,
+    /// The renderer's own name for the host allocation — virtio-gpu's
+    /// `blob_id`. For Venus it is 0 for shared memory and the
+    /// `VkDeviceMemory` object id otherwise; it comes out of the command
+    /// stream the guest submitted, so the kernel carries it and never
+    /// mints one. A blob with no host storage ([`BlobMemory::Guest`])
+    /// has nothing for it to name and carries 0.
+    pub blob_id: u64,
     /// The caller's pages, for [`BlobMemory::Guest`] and
     /// [`BlobMemory::Host3dGuest`]. Empty for [`BlobMemory::Host3d`],
     /// whose storage is the host's.
     pub backing: &'a [PhysFrameRange],
+}
+
+/// Where a submission's command stream is.
+#[derive(Clone, Copy, Debug)]
+pub enum CommandStream<'a> {
+    /// A physical run the caller owns and keeps owning until the
+    /// submission is answered: the device reads the bytes where the
+    /// guest wrote them.
+    Pages(PhysicalRange),
+    /// A short stream held in the caller's own memory for as long as
+    /// the submission future lives. The driver publishes the slice as
+    /// it is; nothing is copied into a buffer of the driver's.
+    Inline(&'a [u8]),
+}
+
+impl CommandStream<'_> {
+    /// How many bytes the stream carries.
+    pub const fn bytes(&self) -> u64 {
+        match self {
+            Self::Pages(range) => range.bytes,
+            Self::Inline(bytes) => bytes.len() as u64,
+        }
+    }
+}
+
+/// One command stream for one context's renderer.
+#[derive(Clone, Copy, Debug)]
+pub struct Submission<'a> {
+    /// The context whose renderer reads the stream.
+    pub context: ContextId,
+    /// The bytes, in the renderer's own command format.
+    pub commands: CommandStream<'a>,
+    /// The timeline the fence, if there is one, is a point on.
+    pub ring: RingIndex,
+    /// The point the device signals once it has consumed this stream and
+    /// everything before it on `ring`; `None` for a stream nobody waits
+    /// on, which the device answers as soon as it has processed it.
+    pub fence: Option<FenceId>,
+}
+
+/// Which of a display engine's tables a [`Gpu3dError::TooMany`] is
+/// about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Gpu3dTable {
+    /// Capability sets the device carries.
+    Capsets,
+    /// Renderer contexts the driver tracks.
+    Contexts,
+    /// Blob resources the driver tracks.
+    Blobs,
+}
+
+impl core::fmt::Display for Gpu3dTable {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str(match self {
+            Self::Capsets => "capability sets",
+            Self::Contexts => "contexts",
+            Self::Blobs => "blobs",
+        })
+    }
 }
 
 /// Why a 3D operation did not happen.
@@ -264,37 +430,31 @@ pub enum Gpu3dError {
     /// No such context on this device.
     #[error("context {} does not exist on this device", .0.raw())]
     UnknownContext(ContextId),
+    /// The context was created with fewer rings than the one named.
+    #[error("context {} carries no ring {}", .context.raw(), .ring.raw())]
+    UnknownRing { context: ContextId, ring: RingIndex },
     /// No such blob on this device.
     #[error("blob {} does not exist on this device", .0.raw())]
     UnknownBlob(BlobId),
-    /// The device holds as many contexts, or as many blobs, as it has
-    /// room to track.
-    #[error("the display engine already holds its maximum of {limit} {resource}")]
-    TooMany {
-        resource: &'static str,
-        limit: usize,
-    },
+    /// The device holds as many contexts, or as many blobs, as the
+    /// driver has room to track.
+    #[error("the display engine already holds its maximum of {limit} {table}")]
+    TooMany { table: Gpu3dTable, limit: usize },
     /// The blob's parameters do not describe a resource: no bytes, a
-    /// host-3D blob with guest pages, a guest blob without them.
+    /// host-3D blob with guest pages, a guest blob without them or with
+    /// a renderer blob id, or a size the pages do not cover once
+    /// rounded to the device's alignment.
     #[error("the blob request does not describe a resource this engine can create")]
     InvalidBlob,
     /// The blob was not created mappable, or is already mapped, or is
     /// not mapped and was asked to be unmapped.
     #[error("blob {} cannot be mapped in its current state", .0.raw())]
     NotMappable(BlobId),
-    /// The host requires a mapped blob to be accessed in a way the
-    /// kernel does not map the aperture with.
-    ///
-    /// The aperture is ordinary memory in every address space Helios
-    /// builds. A host that answers a mapping with "uncached" or
-    /// "write-combining" is naming a coherency contract the guest would
-    /// then be reading the blob under a different one from, and a
-    /// silent disagreement about coherency is a corruption nobody can
-    /// see, so the mapping is refused with the host's own answer in it.
-    #[error(
-        "the host requires a mapped blob to be accessed as {map_info:#x}, which is not how this kernel maps its aperture"
-    )]
-    UnsupportedCaching { map_info: u32 },
+    /// The host answered a mapping with a caching mode virtio-gpu
+    /// defines no meaning for, which is a device fault rather than a
+    /// refusal. The placement is taken back before this is returned.
+    #[error("the host answered a blob mapping with the undefined caching mode {map_info:#x}")]
+    UnknownCaching { map_info: u32 },
     /// The engine's host-visible aperture has no room left for another
     /// mapping. This is the host's window, not the guest's memory: a
     /// caller unmaps a blob it has finished with.
@@ -317,16 +477,56 @@ pub enum Gpu3dError {
     /// carries.
     #[error("a blob's backing may span at most {limit} ranges, not {ranges}")]
     TooManyBackingRanges { ranges: usize, limit: usize },
-    /// A command buffer of no bytes, or longer than one submission
+    /// A command stream of no bytes, or longer than one submission
     /// carries.
-    #[error("a command buffer of {bytes} bytes is not one this engine can submit")]
+    #[error("a command stream of {bytes} bytes is not one this engine can submit")]
     CommandBufferLength { bytes: u64 },
     /// The transport underneath the display engine failed.
     #[error("display transport: {0}")]
     Transport(#[from] IoError),
 }
 
+impl Gpu3dError {
+    /// The device's own response code, for the refusals that carry one,
+    /// so a caller that records a refusal can name what the device said.
+    pub const fn device_code(&self) -> Option<u32> {
+        match self {
+            Self::UnexpectedResponse { code } => Some(*code),
+            Self::UnknownCaching { map_info } => Some(*map_info),
+            _ => None,
+        }
+    }
+}
+
 pub type Gpu3dResult<T> = Result<T, Gpu3dError>;
+
+/// The memory type a mapped blob's caching mode calls for.
+///
+/// A host renderer decides per allocation how the guest must reach its
+/// storage, and the mapping carries that decision rather than one the
+/// kernel chose: a write-combining or uncached answer names a coherency
+/// contract the renderer relies on, and reading the blob under another
+/// one would be a disagreement nobody can see.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlobCaching {
+    /// Ordinary cacheable memory.
+    Cached,
+    /// Memory every access must reach uncached.
+    Uncached,
+    /// Memory stores reach through a write-combining buffer.
+    WriteCombining,
+}
+
+impl BlobCaching {
+    /// The memory kind a mapping of this caching mode is shown with.
+    pub const fn memory_kind(self) -> MemoryKind {
+        match self {
+            Self::Cached => MemoryKind::Normal,
+            Self::Uncached => MemoryKind::Device,
+            Self::WriteCombining => MemoryKind::WriteCombining,
+        }
+    }
+}
 
 /// The rendering half of a display engine.
 ///
@@ -354,8 +554,8 @@ pub trait Gpu3d: Send + Sync + 'static {
     /// every engine that renders nothing.
     fn capsets(&self) -> impl Future<Output = Gpu3dResult<CapsetList>> + Send + '_;
 
-    /// Writes the bytes of one capability set into `out`, and reports
-    /// how many.
+    /// Writes the bytes of one capability set, at `version`, into
+    /// `out`, and reports how many.
     ///
     /// The bytes are the renderer's, opaque here and opaque in the
     /// kernel: they reach the guest that asked for them unchanged.
@@ -372,7 +572,8 @@ pub trait Gpu3d: Send + Sync + 'static {
         out: &'a mut [u8],
     ) -> impl Future<Output = Gpu3dResult<usize>> + Send + 'a;
 
-    /// Creates a renderer context of the type `capset` names.
+    /// Creates a renderer context of the type `capset` names, carrying
+    /// `rings` fence timelines.
     ///
     /// `name` is what the host renderer prints when this context
     /// faults, and is the only thing here a guest chooses that the host
@@ -380,6 +581,7 @@ pub trait Gpu3d: Send + Sync + 'static {
     fn create_context(
         &self,
         capset: CapsetId,
+        rings: RingCount,
         name: ContextName,
     ) -> impl Future<Output = Gpu3dResult<ContextId>> + Send + '_;
 
@@ -393,13 +595,24 @@ pub trait Gpu3d: Send + Sync + 'static {
     ///
     /// The pages in [`BlobRequest::backing`], where there are any, stay
     /// the caller's: the device only reads and writes them, and only
-    /// between this call and [`Gpu3d::destroy_blob`].
+    /// between this call and [`Gpu3d::destroy_blob`]. The device is not
+    /// told to attach the blob to its context's command stream; that is
+    /// [`Gpu3d::attach_resource`], for the caller to ask for.
+    ///
+    /// [`Gpu3dError::Transport`] means the request may have reached the
+    /// device: it may hold the blob and every page of the backing, and
+    /// the caller has no handle to release it by.
     fn create_blob<'a>(
         &'a self,
         request: BlobRequest<'a>,
     ) -> impl Future<Output = Gpu3dResult<BlobId>> + Send + 'a;
 
     /// Releases a blob and hands any backing pages back.
+    ///
+    /// The pages are the caller's again only when this resolves `Ok`.
+    /// Any error leaves the device free to keep reading and writing
+    /// them, and [`Gpu3dError::Transport`] in particular means the
+    /// request may never have reached it.
     fn destroy_blob(&self, blob: BlobId) -> impl Future<Output = Gpu3dResult<()>> + Send + '_;
 
     /// Places a blob's host storage in the engine's host-visible
@@ -408,9 +621,10 @@ pub trait Gpu3d: Send + Sync + 'static {
     /// The region is physical memory of the machine — the engine's own
     /// aperture, not the caller's pages — so it is a [`DeviceRegion`]
     /// and it is the caller's business to map it wherever its owner can
-    /// reach it. Its memory kind is normal rather than device: the
-    /// bytes behind it are a renderer's buffer, with no read side
-    /// effects and nothing that ordering rules have to be relaxed for.
+    /// reach it. Its memory kind is the one the renderer's caching
+    /// answer calls for ([`BlobCaching::memory_kind`]): a renderer's
+    /// buffer is ordinary memory unless the renderer said it must be
+    /// reached write-combining or uncached.
     fn map_blob(&self, blob: BlobId)
     -> impl Future<Output = Gpu3dResult<DeviceRegion>> + Send + '_;
 
@@ -434,43 +648,49 @@ pub trait Gpu3d: Send + Sync + 'static {
         blob: BlobId,
     ) -> impl Future<Output = Gpu3dResult<()>> + Send + '_;
 
-    /// Hands the command buffer at `commands` to `context`'s renderer,
-    /// fenced at `fence`.
+    /// Hands a command stream to its context's renderer.
     ///
     /// The bytes are the renderer's own command format and are never
-    /// read here — nor copied. `commands` is a physical run the caller
-    /// owns and keeps owning, exactly as [`BlobRequest::backing`] is,
-    /// because the buffer a guest wrote is the buffer the device reads:
-    /// a display engine takes its command stream by address, and an
-    /// implementation that took a slice would be one that had already
-    /// copied a guest's pages into its own.
+    /// read here — nor copied. A [`CommandStream::Pages`] stream is a
+    /// physical run the caller owns and keeps owning, exactly as
+    /// [`BlobRequest::backing`] is, because the buffer a guest wrote is
+    /// the buffer the device reads; a [`CommandStream::Inline`] one is
+    /// published from where the caller holds it.
     ///
-    /// The future resolves when the device has taken the buffer, which
-    /// is not when the renderer has finished with it: that is what
-    /// `fence` is for, and it is delivered on [`Gpu3d::fences`]. The
-    /// caller keeps the pages until then.
-    ///
-    /// A submission the device refuses still signals its fence, so a
-    /// reader of the fence stream never waits for a point the device
+    /// Two moments matter, and the call reports both. `posted` runs
+    /// once, as soon as the device's queue holds the command; it never
+    /// runs for a call refused before that. The future then resolves
+    /// with the device's answer, which for a fenced submission comes
+    /// only once `fence` has passed on `ring`: the renderer has finished
+    /// reading the stream by then, and a caller may release its pages
+    /// on any answer other than [`Gpu3dError::Transport`]. The fence is
+    /// retired on [`Gpu3d::fences`] with the answer, whatever the answer
+    /// was, so a reader of the ring never waits for a point the device
     /// has decided will not come.
-    fn submit(
-        &self,
-        context: ContextId,
-        commands: PhysicalRange,
-        fence: FenceId,
-    ) -> impl Future<Output = Gpu3dResult<()>> + Send + '_;
-
-    /// The newest fence `context` has signalled past `after`.
     ///
-    /// This is the context's completion stream, read one point at a
-    /// time: the timeline is monotone, so an implementation that has
-    /// retired several fences since the reader last asked hands back
-    /// the newest of them rather than every one between — the newest
-    /// answers for all that came before it. A reader that has seen none
-    /// passes [`FenceId::START`].
+    /// [`Gpu3dError::Transport`] means no answer was obtained: the
+    /// device may still hold the stream and may read it at any later
+    /// time, so the caller must never release its pages.
+    fn submit<'a, Posted>(
+        &'a self,
+        submission: Submission<'a>,
+        posted: &'a mut Posted,
+    ) -> impl Future<Output = Gpu3dResult<()>> + Send + 'a
+    where
+        Posted: FnMut() + Send;
+
+    /// The newest fence `context` has signalled on `ring` past `after`.
+    ///
+    /// This is one ring's completion stream, read one point at a time:
+    /// the timeline is monotone, so an implementation that has retired
+    /// several fences since the reader last asked hands back the newest
+    /// of them rather than every one between — the newest answers for
+    /// all that came before it. A reader that has seen none passes
+    /// [`FenceId::START`].
     fn fences(
         &self,
         context: ContextId,
+        ring: RingIndex,
         after: FenceId,
     ) -> impl Future<Output = Gpu3dResult<FenceId>> + Send + '_;
 }
@@ -480,7 +700,7 @@ pub trait Gpu3d: Send + Sync + 'static {
 /// A backend hands the same driver to two owners at once — the kernel
 /// task that owns the display and the one that owns the renderer — so
 /// the shared handle satisfies the contract without every backend
-/// writing the same eleven forwarding methods, exactly as
+/// writing the same forwarding methods, exactly as
 /// [`super::DisplayDevice`]'s shared impl does.
 impl<Device: Gpu3d + ?Sized> Gpu3d for alloc::sync::Arc<Device> {
     fn renders(&self) -> bool {
@@ -503,9 +723,10 @@ impl<Device: Gpu3d + ?Sized> Gpu3d for alloc::sync::Arc<Device> {
     fn create_context(
         &self,
         capset: CapsetId,
+        rings: RingCount,
         name: ContextName,
     ) -> impl Future<Output = Gpu3dResult<ContextId>> + Send + '_ {
-        Device::create_context(self, capset, name)
+        Device::create_context(self, capset, rings, name)
     }
 
     fn destroy_context(
@@ -553,21 +774,24 @@ impl<Device: Gpu3d + ?Sized> Gpu3d for alloc::sync::Arc<Device> {
         Device::detach_resource(self, context, blob)
     }
 
-    fn submit(
-        &self,
-        context: ContextId,
-        commands: PhysicalRange,
-        fence: FenceId,
-    ) -> impl Future<Output = Gpu3dResult<()>> + Send + '_ {
-        Device::submit(self, context, commands, fence)
+    fn submit<'a, Posted>(
+        &'a self,
+        submission: Submission<'a>,
+        posted: &'a mut Posted,
+    ) -> impl Future<Output = Gpu3dResult<()>> + Send + 'a
+    where
+        Posted: FnMut() + Send,
+    {
+        Device::submit(self, submission, posted)
     }
 
     fn fences(
         &self,
         context: ContextId,
+        ring: RingIndex,
         after: FenceId,
     ) -> impl Future<Output = Gpu3dResult<FenceId>> + Send + '_ {
-        Device::fences(self, context, after)
+        Device::fences(self, context, ring, after)
     }
 }
 
@@ -587,17 +811,78 @@ impl BlobRequest<'_> {
             // caller's would be memory the device is told about twice.
             BlobMemory::Host3d => self.backing.is_empty(),
             // The caller's pages *are* the resource, so there have to
-            // be some.
-            BlobMemory::Guest | BlobMemory::Host3dGuest => {
+            // be some; and a renderer blob id names host storage this
+            // blob does not have (Linux refuses the same in
+            // `virtgpu_ioctl.c`'s `verify_blob`).
+            BlobMemory::Guest => {
+                self.blob_id == 0
+                    && !self.backing.is_empty()
+                    && self.backing.len() <= MAX_BACKING_RANGES
+            }
+            BlobMemory::Host3dGuest => {
                 !self.backing.is_empty() && self.backing.len() <= MAX_BACKING_RANGES
             }
         }
+    }
+
+    /// How many bytes the caller's pages cover.
+    pub fn backing_bytes(&self) -> u64 {
+        self.backing
+            .iter()
+            .map(|range| range.byte_size() as u64)
+            .sum()
+    }
+}
+
+/// How a blob's bytes are read as one scanout's frame.
+///
+/// A blob carries no geometry of its own — it is a run of bytes the
+/// renderer filled — so the layout is named when it is scanned out:
+/// the frame's mode and pixel format, where its first row starts, and
+/// how far apart rows are.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlobScanout {
+    /// The blob whose bytes are the frame.
+    pub blob: BlobId,
+    /// The frame's width and height in pixels.
+    pub mode: super::DisplayMode,
+    /// How each pixel's bytes are read.
+    pub format: PixelFormat,
+    /// Where the first row starts, in bytes from the blob's start.
+    pub offset: u32,
+    /// Bytes from the start of one row to the start of the next.
+    pub stride: u32,
+}
+
+impl BlobScanout {
+    /// Whether the layout describes a frame inside a blob of `bytes`:
+    /// rows at least as wide as the mode, and `height` whole strides
+    /// from the offset ending inside the blob.
+    ///
+    /// Whole strides rather than a last row cut short at the mode's
+    /// width, because that is the bound the device checks
+    /// (`virtio_gpu_scanout_blob_to_fb` in QEMU's `hw/display/virtio-gpu.c`
+    /// refuses `offset + stride * height > blob_size`), and a layout
+    /// passed here that the device then refused would answer with an
+    /// unspecified error instead of this one.
+    pub fn fits_in(&self, bytes: u64) -> bool {
+        let row = u64::from(self.mode.width) * self.format.bytes_per_pixel() as u64;
+        if self.mode.width == 0 || self.mode.height == 0 || u64::from(self.stride) < row {
+            return false;
+        }
+        let end = u64::from(self.offset) + u64::from(self.stride) * u64::from(self.mode.height);
+        end <= bytes
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{BlobMemory, BlobRequest, BlobUsage, CapsetId, ContextId, FenceId};
+    use super::{
+        BlobCaching, BlobMemory, BlobRequest, BlobScanout, BlobUsage, CapsetId, ContextId, FenceId,
+        MAX_RINGS, RingCount, RingIndex,
+    };
+    use crate::device::MemoryKind;
+    use crate::display::{DisplayMode, PixelFormat};
     use crate::pmm::{PhysFrame, PhysFrameRange};
 
     fn pages() -> [PhysFrameRange; 1] {
@@ -613,7 +898,7 @@ mod tests {
             memory,
             usage: BlobUsage::MAPPABLE,
             size: 4096,
-            host_id: 7,
+            blob_id: 0,
             backing,
         }
     }
@@ -629,6 +914,23 @@ mod tests {
         assert!(!request(BlobMemory::Guest, &[]).is_coherent());
         assert!(request(BlobMemory::Host3dGuest, &pages()).is_coherent());
         assert!(!request(BlobMemory::Host3dGuest, &[]).is_coherent());
+    }
+
+    /// A renderer blob id names host storage; a guest blob has none, so
+    /// one that carries an id is refused, while the two kinds with host
+    /// storage carry theirs.
+    #[test]
+    fn only_a_blob_with_host_storage_carries_a_renderer_blob_id() {
+        let backing = pages();
+        let mut guest = request(BlobMemory::Guest, &backing);
+        guest.blob_id = 9;
+        assert!(!guest.is_coherent());
+        let mut host = request(BlobMemory::Host3d, &[]);
+        host.blob_id = 9;
+        assert!(host.is_coherent());
+        let mut both = request(BlobMemory::Host3dGuest, &backing);
+        both.blob_id = 9;
+        assert!(both.is_coherent());
     }
 
     #[test]
@@ -657,5 +959,69 @@ mod tests {
     fn the_fence_stream_starts_before_every_fence() {
         assert_eq!(FenceId::START.raw(), 0);
         assert!(FenceId::new(1) > FenceId::START);
+    }
+
+    /// A context carries one to sixty-four rings, and a ring is one of
+    /// them only when its index is below the count.
+    #[test]
+    fn a_ring_belongs_to_a_context_only_below_its_count() {
+        assert!(RingCount::new(0).is_none());
+        assert!(RingCount::new(MAX_RINGS as u8 + 1).is_none());
+        assert!(RingIndex::new(MAX_RINGS as u8).is_none());
+        let two = RingCount::new(2).expect("two rings is a count");
+        assert!(two.contains(RingIndex::CPU));
+        assert!(two.contains(RingIndex::new(1).expect("an index")));
+        assert!(!two.contains(RingIndex::new(2).expect("an index")));
+        assert_eq!(two.rings().count(), 2);
+    }
+
+    /// The renderer's caching answer picks the memory kind the mapping
+    /// is shown with, uncached being device memory.
+    #[test]
+    fn a_caching_answer_picks_the_mapping_s_memory_kind() {
+        assert_eq!(BlobCaching::Cached.memory_kind(), MemoryKind::Normal);
+        assert_eq!(BlobCaching::Uncached.memory_kind(), MemoryKind::Device);
+        assert_eq!(
+            BlobCaching::WriteCombining.memory_kind(),
+            MemoryKind::WriteCombining
+        );
+    }
+
+    /// A scanout layout fits a blob only when every row is at least the
+    /// mode's width and `height` whole strides end inside it.
+    #[test]
+    fn a_scanout_layout_fits_only_inside_its_blob() {
+        let layout = BlobScanout {
+            blob: super::BlobId::new(3),
+            mode: DisplayMode::new(4, 2),
+            format: PixelFormat::Bgrx8888,
+            offset: 0,
+            stride: 16,
+        };
+        assert!(layout.fits_in(32));
+        assert!(!layout.fits_in(31));
+        assert!(
+            !BlobScanout {
+                stride: 15,
+                ..layout
+            }
+            .fits_in(64)
+        );
+        assert!(
+            BlobScanout {
+                offset: 8,
+                stride: 20,
+                ..layout
+            }
+            .fits_in(48)
+        );
+        assert!(
+            !BlobScanout {
+                offset: 8,
+                stride: 20,
+                ..layout
+            }
+            .fits_in(47)
+        );
     }
 }

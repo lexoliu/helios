@@ -30,5 +30,9 @@ deny = [
         "wasmtime-environ",
         "wasmtime-internal-component-macro",
         "wasmtime-internal-wit-bindgen",
+        # The fork's CLIF parser, and Cranelift's disassembly support
+        # (`disas`), both used only by `compiler-support`'s lowering tests.
+        "cranelift-reader",
+        "cranelift-codegen",
     ] },
 ]

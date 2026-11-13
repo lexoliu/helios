@@ -9,12 +9,11 @@
 extern crate alloc;
 
 use alloc::sync::Arc;
-use core::num::NonZeroU32;
 
 use fdt::Fdt;
 use helios_kernel::{BalloonHandle, ExternalInterruptHandler};
 
-use crate::net::InterruptSourceId;
+use crate::net::PlicInterrupt;
 
 /// The interrupt half of the balloon: what the PLIC dispatches to.
 ///
@@ -32,9 +31,9 @@ impl ExternalInterruptHandler for VirtioBalloonInterrupt {
 }
 
 /// The balloon the bootstrap hart brought up, together with the PLIC
-/// source the device tree routes it to.
+/// line the device tree routes it to.
 pub(crate) struct BalloonInterrupt {
-    pub(crate) source: InterruptSourceId,
+    pub(crate) line: PlicInterrupt,
     pub(crate) handler: VirtioBalloonInterrupt,
     pub(crate) handle: BalloonHandle,
 }
@@ -48,6 +47,7 @@ pub(crate) fn has_balloon_device(fdt: &Fdt<'_>) -> bool {
 pub(crate) fn install<WatchdogImpl>(
     kernel: &helios_kernel::Kernel<crate::RiscvCpu, WatchdogImpl>,
     fdt: &Fdt<'_>,
+    generation: helios_kernel::MachineGenerationHandle,
 ) -> Option<BalloonInterrupt>
 where
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
@@ -58,10 +58,9 @@ where
     let base = candidate.base;
     let header = core::ptr::NonNull::new(base as *mut u8)
         .unwrap_or_else(|| panic!("virtio MMIO base {base:#x} was unexpectedly null"));
-    let source = candidate
+    let line = candidate
         .interrupt
-        .and_then(|interrupt| NonZeroU32::new(interrupt.number))
-        .map(InterruptSourceId)
+        .and_then(PlicInterrupt::from_specifier)
         .unwrap_or_else(|| {
             panic!("virtio-balloon node at {base:#x} has no valid interrupt source")
         });
@@ -70,10 +69,10 @@ where
             panic!("failed to initialize virtio-balloon device at {base:#x}: {error}")
         });
     let device = Arc::new(device);
-    let handle = helios_kernel::install_memory_balloon(kernel, device.clone());
-    tracing::info!("virtio balloon online irq={}", source.0.get());
+    let handle = helios_kernel::install_memory_balloon(kernel, device.clone(), generation);
+    tracing::info!("virtio balloon online irq={}", line.number());
     Some(BalloonInterrupt {
-        source,
+        line,
         handler: VirtioBalloonInterrupt { inner: device },
         handle,
     })

@@ -1,8 +1,8 @@
-use core::mem::{align_of, size_of};
-use core::ptr;
 use std::sync::Once;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
+use helios_artifact::CwasmTarget;
 use helios_compiler_abi::{
     CompileHint, CompilerRequestHeader, CompilerResponseHeader, CompilerStatus,
     HELIOS_COMPILER_ABI_VERSION, HELIOS_COMPILER_REQUEST_PROFILE, OutputKind,
@@ -35,20 +35,46 @@ pub extern "C" fn helios_compiler_initialize(thread_pointer: u32) {
     }
 }
 
+/// Bytes currently owned across the interface: what `helios_compiler_alloc`
+/// and the response allocations added, less what `helios_compiler_free`
+/// returned. The plugin's own state, read through
+/// `helios_compiler_outstanding_bytes`.
+static OUTSTANDING_BYTES: AtomicU32 = AtomicU32::new(0);
+
+fn add_outstanding(len: usize) {
+    // The plugin's memory is a 32-bit address space, so a live allocation's
+    // length always fits.
+    let len = u32::try_from(len).expect("compiler allocation exceeds the 32-bit address space");
+    OUTSTANDING_BYTES.fetch_add(len, Ordering::Relaxed);
+}
+
+/// Allocates a buffer the caller owns until it frees it through
+/// `helios_compiler_free` (see `helios_compiler_abi` for the contract).
+/// Returns 0 when the plugin's memory is exhausted.
 #[unsafe(no_mangle)]
 pub extern "C" fn helios_compiler_alloc(len: usize, align: usize) -> *mut u8 {
     let layout = std::alloc::Layout::from_size_align(len, align)
         .unwrap_or_else(|error| panic!("invalid compiler allocation layout: {error}"));
-    unsafe { std::alloc::alloc(layout) }
+    assert_ne!(
+        layout.size(),
+        0,
+        "zero-length buffers are never allocated across the compiler ABI"
+    );
+    let ptr = unsafe { std::alloc::alloc(layout) };
+    if !ptr.is_null() {
+        add_outstanding(len);
+    }
+    ptr
 }
 
-/// Releases an allocation made by `helios_compiler_alloc`.
+/// Releases an allocation made by `helios_compiler_alloc` or handed over in a
+/// compiler response.
 ///
 /// # Safety
 ///
-/// `ptr` must come from `helios_compiler_alloc`, `len` and `align`
-/// must be the ones it was allocated with, and the allocation must not
-/// have been freed already.
+/// `ptr` must come from `helios_compiler_alloc` or a response, `len` and
+/// `align` must be the ones the compiler ABI states for that buffer, and the
+/// allocation must not have been freed already.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn helios_compiler_free(ptr: *mut u8, len: usize, align: usize) {
     let layout = std::alloc::Layout::from_size_align(len, align)
@@ -56,6 +82,14 @@ pub unsafe extern "C" fn helios_compiler_free(ptr: *mut u8, len: usize, align: u
     unsafe {
         std::alloc::dealloc(ptr, layout);
     }
+    let len = u32::try_from(len).expect("compiler allocation exceeds the 32-bit address space");
+    OUTSTANDING_BYTES.fetch_sub(len, Ordering::Relaxed);
+}
+
+/// Bytes currently owned across the interface; see `helios_compiler_abi`.
+#[unsafe(no_mangle)]
+pub extern "C" fn helios_compiler_outstanding_bytes() -> u32 {
+    OUTSTANDING_BYTES.load(Ordering::Relaxed)
 }
 
 /// Compiles the request encoded at `request_ptr` and returns the
@@ -81,7 +115,7 @@ pub unsafe extern "C" fn helios_compiler_compile(request_ptr: u32, request_len: 
 
 struct CompileRequest<'a> {
     wasm: &'a [u8],
-    target: &'a str,
+    target: CwasmTarget<'a>,
     hint: AotCompileHint,
     profile: bool,
 }
@@ -90,14 +124,14 @@ unsafe fn read_request<'a>(
     request_ptr: u32,
     request_len: u32,
 ) -> Result<CompileRequest<'a>, String> {
-    let request_len = request_len as usize;
-    if request_len < size_of::<CompilerRequestHeader>() {
+    let request = unsafe { slice_from_abi(request_ptr, request_len) };
+    let Some((header, _)) = request.split_first_chunk::<{ CompilerRequestHeader::SIZE }>() else {
         return Err(format!(
             "compiler request length {request_len} is smaller than header {}",
-            size_of::<CompilerRequestHeader>()
+            CompilerRequestHeader::SIZE
         ));
-    }
-    let header = unsafe { ptr::read_unaligned(request_ptr as *const CompilerRequestHeader) };
+    };
+    let header = CompilerRequestHeader::from_bytes(header);
     if header.abi_version != HELIOS_COMPILER_ABI_VERSION {
         return Err(format!(
             "unsupported compiler ABI version {}, expected {}",
@@ -108,8 +142,11 @@ unsafe fn read_request<'a>(
     let target = unsafe { slice_from_abi(header.target_ptr, header.target_len) };
     let target = core::str::from_utf8(target)
         .map_err(|error| format!("compiler target triple is not UTF-8: {error}"))?;
-    let hint = match header.hint {
-        CompileHint::Fast => AotCompileHint::Fast,
+    let isa_level = unsafe { slice_from_abi(header.isa_level_ptr, header.isa_level_len) };
+    let isa_level = core::str::from_utf8(isa_level)
+        .map_err(|error| format!("compiler ISA level is not UTF-8: {error}"))?;
+    let target = compile_target(target, isa_level)?;
+    let hint = match CompileHint::try_from(header.hint).map_err(|error| error.to_string())? {
         CompileHint::Balanced => AotCompileHint::Balanced,
         CompileHint::Performance => AotCompileHint::Performance,
     };
@@ -121,7 +158,23 @@ unsafe fn read_request<'a>(
     })
 }
 
+/// Names the level `isa_level` of `triple`'s chain; an unknown level's
+/// diagnostic lists the levels the target defines.
+fn compile_target<'a>(triple: &'a str, isa_level: &str) -> Result<CwasmTarget<'a>, String> {
+    CwasmTarget::new(triple, isa_level)
+        .map_err(|error| format!("invalid compiler ISA level for target {triple}: {error}"))
+}
+
+/// The bytes a `(ptr, len)` pair of the compiler ABI names; a zero length is
+/// the empty slice whatever the pointer.
+///
+/// # Safety
+///
+/// A non-zero `len` names a readable range of this module's linear memory.
 unsafe fn slice_from_abi<'a>(ptr: u32, len: u32) -> &'a [u8] {
+    if len == 0 {
+        return &[];
+    }
     unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) }
 }
 
@@ -132,10 +185,10 @@ fn compile(request: CompileRequest<'_>) -> u32 {
     let started = request.profile.then(Instant::now);
     let memory_pages_before = request.profile.then(compiler_memory_pages);
     let result = if request.profile {
-        precompile_artifact_profiled(request.wasm, request.target, request.hint)
+        precompile_artifact_profiled(request.wasm, &request.target, request.hint)
             .map(|(artifact, profile)| (artifact, Some(profile)))
     } else {
-        precompile_artifact(request.wasm, request.target, request.hint)
+        precompile_artifact(request.wasm, &request.target, request.hint)
             .map(|artifact| (artifact, None))
     };
     match result {
@@ -264,32 +317,68 @@ fn response(
     precompiled: Vec<u8>,
     diagnostic: Vec<u8>,
 ) -> u32 {
-    let response_len = size_of::<CompilerResponseHeader>();
-    let response_ptr = helios_compiler_alloc(response_len, align_of::<CompilerResponseHeader>());
+    let response_ptr =
+        helios_compiler_alloc(CompilerResponseHeader::SIZE, CompilerResponseHeader::ALIGN);
     assert!(
         !response_ptr.is_null(),
         "compiler response allocation returned null"
     );
-    let precompiled = leak_vec(precompiled);
-    let diagnostic = leak_vec(diagnostic);
+    let precompiled = hand_over(precompiled);
+    let diagnostic = hand_over(diagnostic);
     let header = CompilerResponseHeader {
         abi_version: HELIOS_COMPILER_ABI_VERSION,
-        status,
-        output_kind,
+        status: status.into(),
+        output_kind: output_kind.into(),
         precompiled_ptr: precompiled.0,
         precompiled_len: precompiled.1,
         diagnostic_ptr: diagnostic.0,
         diagnostic_len: diagnostic.1,
     };
+    let bytes = header.to_bytes();
+    // SAFETY: `response_ptr` is a live allocation of `SIZE` bytes just made
+    // above, and a byte copy has no alignment requirement.
     unsafe {
-        ptr::write_unaligned(response_ptr as *mut CompilerResponseHeader, header);
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), response_ptr, bytes.len());
     }
     response_ptr as u32
 }
 
-fn leak_vec(bytes: Vec<u8>) -> (u32, u32) {
+/// Gives `bytes` to the caller as a `(ptr, len)` pair, to be returned through
+/// `helios_compiler_free` with `align` 1.
+///
+/// The buffer is a boxed slice, so its allocation is exactly `len` bytes with
+/// no spare capacity, which is the layout `helios_compiler_free` is told. An
+/// empty buffer is `(0, 0)`: nothing is allocated and nothing is freed.
+fn hand_over(bytes: Vec<u8>) -> (u32, u32) {
+    if bytes.is_empty() {
+        return (0, 0);
+    }
     let boxed = bytes.into_boxed_slice();
     let len = boxed.len();
+    add_outstanding(len);
     let ptr = Box::into_raw(boxed) as *mut u8;
     (ptr as u32, len as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compile_target;
+
+    #[test]
+    fn an_unknown_isa_level_is_rejected_naming_the_defined_levels() {
+        let error = compile_target("x86_64-unknown-none", "x86-64-v9")
+            .expect_err("a level the target does not define is refused");
+        assert!(error.contains("x86-64-v9"), "{error}");
+        assert!(
+            error.contains("x86-64-v3, x86-64-v4, x86-64-v4+vbmi+bitalg"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_defined_isa_level_is_accepted() {
+        let target = compile_target("aarch64-unknown-none", "aarch64-lse-fp16-dotprod")
+            .expect("a defined level is accepted");
+        assert_eq!(target.level().name(), "aarch64-lse-fp16-dotprod");
+    }
 }

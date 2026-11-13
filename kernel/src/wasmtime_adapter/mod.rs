@@ -20,6 +20,7 @@ pub(crate) mod fiber_stack;
 #[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]
 pub mod parking;
 pub(crate) mod preemption;
+pub(crate) mod residency;
 pub mod store;
 pub mod swap_fault;
 #[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]
@@ -43,8 +44,7 @@ use self::component_host::{
 use self::preemption::{GuestInterrupts, StoreInterrupts};
 use crate::{
     CompiledComponent, ComponentExecContext, ComponentExecutor, ComponentExitStatus,
-    ComponentRunResult, ComponentRuntimeEngine, ComponentRuntimeFactory, ComponentWorld,
-    HostFileSystem,
+    ComponentRunResult, ComponentRuntimeEngine, ComponentRuntimeFactory, ComponentWorld, Storage,
 };
 
 const _: fn() -> bool = wasix::manifest_is_mapped;
@@ -110,22 +110,22 @@ impl ComponentRuntimeEngine for WasmtimeEngine {
 }
 
 /// A running Wasmtime component instance.
-pub struct WasmtimeExecutor<CpuImpl, Net, HostFs>
+pub struct WasmtimeExecutor<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: HostFileSystem,
+    StorageImpl: Storage,
 {
-    store: wasmtime::Store<StoreData<CpuImpl, Net, HostFs>>,
+    store: wasmtime::Store<StoreData<CpuImpl, Net, StorageImpl>>,
     interrupts: StoreInterrupts<CpuImpl>,
     run_func: wasmtime::component::TypedFunc<(), (core::result::Result<(), ()>,)>,
 }
 
-impl<CpuImpl, Net, HostFs> ComponentExecutor for WasmtimeExecutor<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> ComponentExecutor for WasmtimeExecutor<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: HostFileSystem,
+    StorageImpl: Storage,
 {
     type Error = wasmtime::Error;
 
@@ -156,14 +156,14 @@ where
 /// Runtime traps that correspond to `wasi:cli/exit` requests are treated as
 /// a clean exit with the code the guest supplied; other traps still bubble
 /// up as `wasmtime::Error`.
-fn interpret_run_result<CpuImpl, Net, HostFs>(
+fn interpret_run_result<CpuImpl, Net, StorageImpl>(
     raw: wasmtime::Result<wasmtime::Result<(Result<(), ()>,)>>,
-    store_data: &mut StoreData<CpuImpl, Net, HostFs>,
+    store_data: &mut StoreData<CpuImpl, Net, StorageImpl>,
 ) -> wasmtime::Result<(ComponentExitStatus, u32)>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: HostFileSystem,
+    StorageImpl: Storage,
 {
     match raw {
         Ok(Ok((Ok(()),))) => Ok((ComponentExitStatus::Ok, 0)),
@@ -197,17 +197,17 @@ impl<P: Cpu + Clone> WasmtimeComponentRuntime<P> {
     }
 }
 
-impl<CpuImpl, Net, HostFs, P>
-    ComponentRuntimeFactory<CpuImpl, HostRuntimeState<CpuImpl, Net, HostFs>, HostFs>
+impl<CpuImpl, Net, StorageImpl, P>
+    ComponentRuntimeFactory<CpuImpl, HostRuntimeState<CpuImpl, Net, StorageImpl>, StorageImpl>
     for WasmtimeComponentRuntime<P>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: HostFileSystem,
+    StorageImpl: Storage,
     P: Cpu + Clone,
 {
     type Engine = WasmtimeEngine;
-    type Executor = WasmtimeExecutor<CpuImpl, Net, HostFs>;
+    type Executor = WasmtimeExecutor<CpuImpl, Net, StorageImpl>;
     type CreateEngineError = wasmtime::Error;
     type InstantiateError = wasmtime::Error;
 
@@ -227,7 +227,11 @@ where
         engine: &Self::Engine,
         compiled: &WasmtimeCompiledComponent,
         world: ComponentWorld,
-        context: ComponentExecContext<CpuImpl, HostRuntimeState<CpuImpl, Net, HostFs>, HostFs>,
+        context: ComponentExecContext<
+            CpuImpl,
+            HostRuntimeState<CpuImpl, Net, StorageImpl>,
+            StorageImpl,
+        >,
     ) -> Result<Self::Executor, Self::InstantiateError> {
         let binding_set = match world {
             ComponentWorld::System => ComponentBindingSet::System,
@@ -244,8 +248,9 @@ where
 
         let linker = component_linker(&engine.engine, binding_set, &compiled.component)?;
 
-        let filesystem =
-            crate::wasmtime_adapter::wasi::DebugFileSystem::new(context.host_filesystem_state);
+        // A system component is kernel-launched: its tree descends from
+        // the root namespace and sees the kernel's mounts.
+        let filesystem = context.host_filesystem_state.root_namespace().descend();
         let debug_port = if context.has_debug_port {
             Some(())
         } else {
@@ -254,11 +259,11 @@ where
 
         let (mut store, interrupts) = store_with_state(
             engine,
-            StoreData::<CpuImpl, Net, HostFs>::new(
+            StoreData::<CpuImpl, Net, StorageImpl>::new(
                 wasmtime::component::ResourceTable::new(),
                 context.cpu,
                 context.timer,
-                context.spawner.instance_spawner(funding),
+                context.spawner.instance_spawner(funding, &context.instance),
                 context.runtime_state,
                 context.instance_registry,
                 context.instance,

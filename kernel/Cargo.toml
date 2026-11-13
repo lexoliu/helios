@@ -37,11 +37,15 @@ async-lock = { version = "3.4.2", default-features = false }
 async-task = { version = "4.7.1", default-features = false }
 atomic-waker = "1.1.2"
 arrayvec = { version = "0.7.6", default-features = false }
-buddy_system_allocator = "0.12.0"
 bytes = { version = "1.12.1", default-features = false }
 concurrent-queue = { version = "2.5.0", default-features = false }
 crossbeam-utils.workspace = true
 critical-section = "1.2.0"
+crc = { version = "3.4.0", default-features = false }
+# The reader of upstream `erofs-rs` imports `rustix`, which does not build
+# for `target_os = "none"`; the fork's reader does not, and it publishes
+# the path lookup and resumable listings the mount kind is built on.
+erofs-rs = { git = "https://github.com/lexoliu/erofs-rs", branch = "no-std-bare-metal", default-features = false, features = ["deflate", "lz4"] }
 event-listener = { version = "5.4.1", default-features = false, features = ["critical-section"] }
 futures = { version = "0.3.31", default-features = false, features = ["alloc"] }
 hashbrown = { version = "0.16.1", default-features = false, features = ["allocator-api2", "default-hasher", "equivalent", "inline-more"] }
@@ -60,17 +64,31 @@ tracing.workspace = true
 bitflags = "2.11.0"
 lru = { version = "0.16.3", default-features = false, features = ["hashbrown"] }
 rand_chacha = { version = "0.3.1", default-features = false }
+siphasher = { version = "1.0.4", default-features = false }
 rand_core = { version = "0.6.4", default-features = false }
-sha2 = { version = "0.10.9", default-features = false }
+sha2 = { version = "0.11.0", default-features = false, features = ["zeroize"] }
+# The compiler-signing key: an Ed25519 key HKDF-SHA256 derives from the
+# boot's seed. `zeroize` makes the signing key, the HMAC state and the
+# SHA-256 state wipe themselves when dropped.
+ed25519-dalek = { version = "3.0.0", default-features = false, features = ["zeroize"] }
+hkdf = { version = "0.13.0", default-features = false }
+hmac = { version = "0.13.0", default-features = false, features = ["zeroize"] }
+zeroize = { version = "1.9.1", default-features = false }
 smallvec = { version = "1.15.1", default-features = false }
 slab = { version = "0.4.12", default-features = false }
 spin = { version = "0.9.8", default-features = false, features = ["mutex", "once", "rwlock", "spin_mutex"] }
 wasmparser = { version = "0.245.0", default-features = false, features = ["component-model"] }
 talc = { version = "=5.1.0", default-features = false, features = ["counters"] }
 frame-alloc = { version = "=0.1.0", default-features = false, features = ["stats"] }
+# The fork makes `CompressContext` available without `std` (paddor/zrip#106).
+zrip = { git = "https://github.com/lexoliu/zrip", branch = "compress-context-alloc", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 critical-section = { version = "1.2.0", features = ["std"] }
+# The image builder writes the EROFS fixtures that run on every host;
+# `mkfs.erofs` writes the ones CI runs (see `vfs/erofs/tests.rs`).
+erofs-rs = { git = "https://github.com/lexoliu/erofs-rs", branch = "no-std-bare-metal", default-features = false, features = ["deflate", "lz4", "std"] }
+tempfile.workspace = true
 # The console-gate tests drive the real `KernelConsoleSubscriber` through
 # `tracing::subscriber::with_default`, which is a std-only dispatcher.
 tracing = { workspace = true, features = ["std"] }

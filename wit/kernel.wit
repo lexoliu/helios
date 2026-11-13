@@ -3,6 +3,7 @@ package helios:kernel@0.1.0;
 world init {
   include wasi:cli/command@0.3.0;
   import helios:system/programs@0.1.0;
+  import helios:system/mounts@0.1.0;
   import helios:system/net@0.1.0;
   import helios:system/vsock@0.1.0;
   import helios:system/stats@0.1.0;
@@ -15,6 +16,7 @@ world init {
   import helios:system/surface@0.1.0;
   import helios:system/gpu@0.1.0;
   import helios:system/audio@0.1.0;
+  import helios:system/processors@0.1.0;
   import wasi:http/types@0.3.0;
   import wasi:http/client@0.3.0;
 }
@@ -22,6 +24,7 @@ world init {
 world debugger{
   include wasi:cli/command@0.3.0;
   import helios:system/programs@0.1.0;
+  import helios:system/mounts@0.1.0;
   import helios:system/net@0.1.0;
   import helios:system/vsock@0.1.0;
   import helios:system/stats@0.1.0;
@@ -30,23 +33,29 @@ world debugger{
   import helios:system/sync@0.1.0;
   import helios:system/serial@0.1.0;
   import helios:system/instances@0.1.0;
+  import helios:system/snapshot@0.1.0;
   import helios:system/display@0.1.0;
   import helios:system/input@0.1.0;
   import helios:system/surface@0.1.0;
   import helios:system/gpu@0.1.0;
   import helios:system/audio@0.1.0;
+  import helios:system/processors@0.1.0;
   import wasi:http/types@0.3.0;
   import wasi:http/client@0.3.0;
 }
 
 /// World implemented by the `http-client` kernel plugin: it speaks HTTP over
 /// the kernel's sockets and answers exchanges the kernel forwards to it.
+/// `wasi:sockets` carries its connections and name lookups, which is what
+/// the `http-kit-io` implementation in `helios-api` is written on.
 ///
 /// The plugin must not import `wasi:http/client` — it *is* the client.
 world http-handler {
   include wasi:cli/imports@0.3.0;
   import helios:system/net@0.1.0;
   import helios:system/sync@0.1.0;
+  import wasi:sockets/types@0.3.0;
+  import wasi:sockets/ip-name-lookup@0.3.0;
   import wasi:http/types@0.3.0;
   export wasi:http/handler@0.3.0;
 }
@@ -180,4 +189,15 @@ world compositor-host {
 /// instead of regenerating every `wasi:cli` import a player also has.
 world audio-host {
   import helios:system/audio@0.1.0;
+}
+
+/// World the kernel generates its own `helios:system/processors`
+/// bindings from.
+///
+/// Separate from the program worlds for the reason `audio-host` is: the
+/// kernel serves this one interface to both the `init` and `debugger`
+/// worlds, and one generated type set keeps the two from mapping the
+/// lifecycle's result twice.
+world processors-host {
+  import helios:system/processors@0.1.0;
 }
