@@ -341,7 +341,7 @@ fn drain_byte_channel(reader: helios_kernel::ByteReader, count: usize) {
 fn futex_prepare_complete_distinct_keys(bencher: Bencher, count: usize) {
     let memory = ProcessMemoryIdentity::new(1);
     bencher.counter(ItemsCount::new(count)).bench_local(|| {
-        let mut table = FutexTable::new();
+        let table = FutexTable::new();
         let mut registrations = [const { None }; 64];
         for (index, registration) in registrations.iter_mut().take(count).enumerate() {
             *registration = Some(table.prepare_wait(FutexKey::new(
@@ -355,9 +355,8 @@ fn futex_prepare_complete_distinct_keys(bencher: Bencher, count: usize) {
                     .notify(),
             );
         }
-        for registration in registrations.into_iter().take(count).flatten() {
-            table.complete_wait(registration);
-        }
+        // Dropping a registration completes it.
+        drop(registrations);
     });
 }
 

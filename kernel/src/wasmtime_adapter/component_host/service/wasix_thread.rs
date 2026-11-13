@@ -954,10 +954,6 @@ where
         })
         .await?;
     if current != expected {
-        caller
-            .data()
-            .runtime_state
-            .complete_futex_wait(registration);
         return Ok(p1::errno::INVAL);
     }
 
@@ -979,10 +975,7 @@ where
             true
         }
     };
-    caller
-        .data()
-        .runtime_state
-        .complete_futex_wait(registration);
+    drop(registration);
     memory
         .write_u8(GuestAddress::wasm32(ret_woken), u8::from(woken))
         .await?;
