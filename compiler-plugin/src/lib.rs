@@ -147,7 +147,6 @@ unsafe fn read_request<'a>(
         .map_err(|error| format!("compiler ISA level is not UTF-8: {error}"))?;
     let target = compile_target(target, isa_level)?;
     let hint = match CompileHint::try_from(header.hint).map_err(|error| error.to_string())? {
-        CompileHint::Fast => AotCompileHint::Fast,
         CompileHint::Balanced => AotCompileHint::Balanced,
         CompileHint::Performance => AotCompileHint::Performance,
     };
