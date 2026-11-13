@@ -14,6 +14,8 @@ use siphasher::sip::SipHasher24;
 
 use crate::address::lifetime_deadline;
 use crate::icmp_rate::IcmpRateLimit;
+use crate::index::{IndexKey, SocketIndex};
+use crate::secret::{KeyDomain, SipKey, StackSecret, write_address, write_endpoint};
 use crate::{
     AddressLifetimes, AdvertisedAddress, ArpOperation, ArpPacket, BbrV3, CongestionControl,
     DEFAULT_POLL_BUDGET, DhcpDnsServers, EthernetAddress, EthernetFrame, EthernetProtocol,
@@ -151,10 +153,11 @@ pub struct StackConfig {
     pub mtu: usize,
     pub rx_budget: usize,
     pub rx_checksum_offload: RxChecksumOffload,
-    /// The per-boot key of the initial sequence number function
-    /// (RFC 6528). The embedding kernel draws it once and gives every
-    /// stack the same value.
-    pub isn_secret: crate::IsnSecret,
+    /// The per-boot secret the stack's keyed functions (the initial
+    /// sequence number function of RFC 6528 and the socket indexes' hash)
+    /// derive their keys from. The embedding kernel draws it once and
+    /// gives every stack the same value.
+    pub secret: StackSecret,
     /// Seed TCP/UDP transmit checksums with the pseudo-header sum and
     /// let the device finish them; enabled by the embedding kernel only
     /// when the interface negotiated transmit checksum offload.
@@ -292,7 +295,7 @@ pub struct RxChecksumOffload {
 }
 
 impl StackConfig {
-    pub const fn new(mac: EthernetAddress, mtu: usize, isn_secret: crate::IsnSecret) -> Self {
+    pub const fn new(mac: EthernetAddress, mtu: usize, secret: StackSecret) -> Self {
         assert!(
             mtu >= MINIMUM_INTERFACE_FRAME_MTU,
             "MTU must hold a minimum IPv4 packet"
@@ -302,7 +305,7 @@ impl StackConfig {
             mtu,
             rx_budget: DEFAULT_POLL_BUDGET,
             rx_checksum_offload: RxChecksumOffload::none(),
-            isn_secret,
+            secret,
             tx_checksum_offload: false,
             direct_tx_dma: false,
             segmentation: SegmentationOffload::none(),
@@ -1571,17 +1574,6 @@ struct TcpEndpointKey {
     remote: TcpEndpoint,
 }
 
-#[derive(Clone, Debug)]
-struct TcpSocketIndex<Key: Copy + Eq, const SLOTS: usize> {
-    entries: [Option<TcpSocketIndexEntry<Key>>; SLOTS],
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct TcpSocketIndexEntry<Key: Copy + Eq> {
-    key: Key,
-    socket_index: usize,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct TcpTimerEntry {
     deadline_nanos: u64,
@@ -1620,17 +1612,6 @@ struct IcmpQuotedEndpoint {
 struct UdpQueuedReceive {
     socket: UdpSocketId,
     datagram: UdpReceive,
-}
-
-#[derive(Clone, Debug)]
-struct UdpSocketIndex<Key: Copy + Eq, const SLOTS: usize> {
-    entries: [Option<UdpSocketIndexEntry<Key>>; SLOTS],
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct UdpSocketIndexEntry<Key: Copy + Eq> {
-    key: Key,
-    socket_index: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1693,17 +1674,9 @@ enum Ipv4ReassemblyResult {
     CacheFull,
 }
 
-trait TcpIndexKey: Copy + Eq {
-    fn hash(self) -> usize;
-}
-
-trait UdpIndexKey: Copy + Eq {
-    fn hash(self) -> usize;
-}
-
-type TcpEndpointIndex = TcpSocketIndex<TcpEndpointKey, TCP_ENDPOINT_INDEX_SLOTS>;
-type TcpListenerIndex = TcpSocketIndex<TcpEndpoint, TCP_LISTENER_INDEX_SLOTS>;
-type UdpBindingIndex = UdpSocketIndex<UdpSocketBinding, UDP_BINDING_INDEX_SLOTS>;
+type TcpEndpointIndex = SocketIndex<TcpEndpointKey, TCP_ENDPOINT_INDEX_SLOTS>;
+type TcpListenerIndex = SocketIndex<TcpEndpoint, TCP_LISTENER_INDEX_SLOTS>;
+type UdpBindingIndex = SocketIndex<UdpSocketBinding, UDP_BINDING_INDEX_SLOTS>;
 
 impl PathMtuKey {
     const fn new(source: IpAddress, destination: IpAddress) -> Self {
@@ -2206,7 +2179,7 @@ impl<C> TcpSocketSlab<C>
 where
     C: CongestionControl,
 {
-    fn new() -> Self {
+    fn new(index_key: SipKey) -> Self {
         Self {
             inline_slots: [const { MaybeUninit::uninit() }; TCP_SOCKET_SLAB_CHUNK_SLOTS],
             heap_slots: core::array::from_fn(|_| None),
@@ -2218,8 +2191,8 @@ where
             active: [0; MAX_TCP_SOCKET_INDICES],
             active_positions: [0; MAX_TCP_SOCKET_INDICES],
             active_len: 0,
-            endpoint_index: TcpEndpointIndex::new(),
-            listener_index: TcpListenerIndex::new(),
+            endpoint_index: TcpEndpointIndex::new(index_key),
+            listener_index: TcpListenerIndex::new(index_key),
             terminal_errors: [None; MAX_TCP_SOCKET_INDICES],
         }
     }
@@ -2518,81 +2491,16 @@ impl TcpEndpointKey {
     }
 }
 
-impl TcpIndexKey for TcpEndpointKey {
-    fn hash(self) -> usize {
-        let mut hash = 0xcbf2_9ce4_8422_2325u64;
-        hash = mix_endpoint(hash, self.local);
-        hash = mix_endpoint(hash, self.remote);
-        hash as usize
+impl IndexKey for TcpEndpointKey {
+    fn hash_into<H: Hasher>(self, hasher: &mut H) {
+        write_endpoint(hasher, self.local);
+        write_endpoint(hasher, self.remote);
     }
 }
 
-impl TcpIndexKey for TcpEndpoint {
-    fn hash(self) -> usize {
-        mix_endpoint(0xcbf2_9ce4_8422_2325u64, self) as usize
-    }
-}
-
-impl<Key: TcpIndexKey, const SLOTS: usize> TcpSocketIndex<Key, SLOTS> {
-    fn new() -> Self {
-        assert!(SLOTS != 0, "TCP socket index capacity must be non-zero");
-        Self {
-            entries: [None; SLOTS],
-        }
-    }
-
-    fn insert(&mut self, key: Key, socket_index: usize) {
-        for index in Self::probe_indices(key) {
-            match self.entries[index] {
-                Some(entry) if entry.key == key => {
-                    panic!("TCP socket index duplicate key");
-                }
-                Some(_) => {}
-                None => {
-                    self.entries[index] = Some(TcpSocketIndexEntry { key, socket_index });
-                    return;
-                }
-            }
-        }
-        panic!("TCP socket index is full");
-    }
-
-    fn remove(&mut self, key: Key) {
-        for index in Self::probe_indices(key) {
-            match self.entries[index] {
-                Some(entry) if entry.key == key => {
-                    self.entries[index] = None;
-                    self.reinsert_probe_cluster_after(index);
-                    return;
-                }
-                Some(_) => {}
-                None => return,
-            }
-        }
-    }
-
-    fn lookup(&self, key: Key) -> Option<usize> {
-        for index in Self::probe_indices(key) {
-            match self.entries[index] {
-                Some(entry) if entry.key == key => return Some(entry.socket_index),
-                Some(_) => {}
-                None => return None,
-            }
-        }
-        None
-    }
-
-    fn reinsert_probe_cluster_after(&mut self, removed_index: usize) {
-        let mut index = (removed_index + 1) % SLOTS;
-        while let Some(entry) = self.entries[index].take() {
-            self.insert(entry.key, entry.socket_index);
-            index = (index + 1) % SLOTS;
-        }
-    }
-
-    fn probe_indices(key: Key) -> impl Iterator<Item = usize> {
-        let start = key.hash() % SLOTS;
-        (0..SLOTS).map(move |offset| (start + offset) % SLOTS)
+impl IndexKey for TcpEndpoint {
+    fn hash_into<H: Hasher>(self, hasher: &mut H) {
+        write_endpoint(hasher, self);
     }
 }
 
@@ -2607,7 +2515,7 @@ impl UdpSocketState {
 }
 
 impl UdpSocketSlab {
-    fn new() -> Self {
+    fn new(index_key: SipKey) -> Self {
         Self {
             sockets: [const { None }; MAX_UDP_SOCKETS],
             free: core::array::from_fn(|index| MAX_UDP_SOCKETS - 1 - index),
@@ -2615,7 +2523,7 @@ impl UdpSocketSlab {
             active: [0; MAX_UDP_SOCKETS],
             active_positions: [0; MAX_UDP_SOCKETS],
             active_len: 0,
-            binding_index: UdpBindingIndex::new(),
+            binding_index: UdpBindingIndex::new(index_key),
         }
     }
 
@@ -2825,84 +2733,24 @@ impl UdpSocketSlab {
     }
 }
 
-impl UdpIndexKey for UdpSocketBinding {
-    fn hash(self) -> usize {
-        let mut hash = 0xcbf2_9ce4_8422_2325u64;
-        hash = mix_optional_ip_address(hash, self.local_address);
-        hash = mix_u16(hash, self.local_port);
+impl IndexKey for UdpSocketBinding {
+    fn hash_into<H: Hasher>(self, hasher: &mut H) {
+        match self.local_address {
+            Some(address) => {
+                hasher.write_u8(1);
+                write_address(hasher, address);
+            }
+            None => hasher.write_u8(0),
+        }
+        hasher.write_u16(self.local_port);
         match self.remote {
             Some(remote) => {
-                hash = mix_ip_address(hash, remote.address);
-                hash = mix_u16(hash, remote.port);
+                hasher.write_u8(1);
+                write_address(hasher, remote.address);
+                hasher.write_u16(remote.port);
             }
-            None => {
-                hash = mix_u8(hash, 0);
-            }
+            None => hasher.write_u8(0),
         }
-        hash as usize
-    }
-}
-
-impl<Key: UdpIndexKey, const SLOTS: usize> UdpSocketIndex<Key, SLOTS> {
-    fn new() -> Self {
-        assert!(SLOTS != 0, "UDP socket index capacity must be non-zero");
-        Self {
-            entries: [None; SLOTS],
-        }
-    }
-
-    fn insert(&mut self, key: Key, socket_index: usize) {
-        for index in Self::probe_indices(key) {
-            match self.entries[index] {
-                Some(entry) if entry.key == key => {
-                    panic!("UDP socket index duplicate key");
-                }
-                Some(_) => {}
-                None => {
-                    self.entries[index] = Some(UdpSocketIndexEntry { key, socket_index });
-                    return;
-                }
-            }
-        }
-        panic!("UDP socket index is full");
-    }
-
-    fn remove(&mut self, key: Key) {
-        for index in Self::probe_indices(key) {
-            match self.entries[index] {
-                Some(entry) if entry.key == key => {
-                    self.entries[index] = None;
-                    self.reinsert_probe_cluster_after(index);
-                    return;
-                }
-                Some(_) => {}
-                None => return,
-            }
-        }
-    }
-
-    fn lookup(&self, key: Key) -> Option<usize> {
-        for index in Self::probe_indices(key) {
-            match self.entries[index] {
-                Some(entry) if entry.key == key => return Some(entry.socket_index),
-                Some(_) => {}
-                None => return None,
-            }
-        }
-        None
-    }
-
-    fn reinsert_probe_cluster_after(&mut self, removed_index: usize) {
-        let mut index = (removed_index + 1) % SLOTS;
-        while let Some(entry) = self.entries[index].take() {
-            self.insert(entry.key, entry.socket_index);
-            index = (index + 1) % SLOTS;
-        }
-    }
-
-    fn probe_indices(key: Key) -> impl Iterator<Item = usize> {
-        let start = key.hash() % SLOTS;
-        (0..SLOTS).map(move |offset| (start + offset) % SLOTS)
     }
 }
 
@@ -3423,6 +3271,7 @@ where
     C: CongestionControl,
 {
     pub fn new_with_congestion(config: StackConfig, congestion: C) -> Self {
+        let index_key = config.secret.derive(KeyDomain::SocketIndex);
         Self {
             config,
             congestion,
@@ -3440,7 +3289,7 @@ where
             icmp_echo_rate: IcmpRateLimit::new(),
             outbound: OutboundFrameQueue::new(),
             events: StackEvents::new(),
-            udp: UdpSocketSlab::new(),
+            udp: UdpSocketSlab::new(index_key),
             udp_rx: Deque::new(),
             icmp_echo_exchanges: ArrayVec::new(),
             udp_rx_counts: [0; MAX_UDP_SOCKETS],
@@ -3449,7 +3298,7 @@ where
             tcp_listener_children: [None; MAX_TCP_SOCKET_INDICES],
             tcp_half_open_ages: TcpHalfOpenAges::new(),
             tcp_orphans: TcpOrphans::new(),
-            tcp: TcpSocketSlab::new(),
+            tcp: TcpSocketSlab::new(index_key),
             tcp_drive_start: 0,
             tcp_timers: BinaryHeap::new(),
             tcp_timer_generations: [0; MAX_TCP_SOCKET_INDICES],
@@ -4274,7 +4123,7 @@ where
         remote: TcpEndpoint,
         now: StackInstant,
     ) -> u32 {
-        crate::initial_sequence_number(&self.config.isn_secret, local, remote, now)
+        crate::initial_sequence_number(&self.config.secret, local, remote, now)
     }
 
     pub fn open_tcp_connect(
@@ -8570,11 +8419,6 @@ const fn socket_slot_chunk(index: usize) -> (usize, usize) {
     )
 }
 
-fn mix_endpoint(mut hash: u64, endpoint: TcpEndpoint) -> u64 {
-    hash = mix_ip_address(hash, endpoint.address);
-    mix_u16(hash, endpoint.port)
-}
-
 fn wildcard_endpoint(endpoint: TcpEndpoint) -> TcpEndpoint {
     TcpEndpoint {
         address: match endpoint.address {
@@ -8608,13 +8452,6 @@ fn mix_ip_address(hash: u64, address: IpAddress) -> u64 {
     match address {
         IpAddress::Ipv4(address) => mix_bytes(hash, &address.octets()),
         IpAddress::Ipv6(address) => mix_bytes(hash, &address.octets()),
-    }
-}
-
-fn mix_optional_ip_address(hash: u64, address: Option<IpAddress>) -> u64 {
-    match address {
-        Some(address) => mix_ip_address(mix_u8(hash, 1), address),
-        None => mix_u8(hash, 0),
     }
 }
 
@@ -8701,7 +8538,7 @@ mod tests {
 
     const LOCAL_MAC: EthernetAddress = [0x02, 0, 0, 0, 0, 1];
     const PEER_MAC: EthernetAddress = [0x02, 0, 0, 0, 0, 2];
-    const TEST_ISN_SECRET: crate::IsnSecret = crate::IsnSecret::from_bytes([0x5a; 16]);
+    const TEST_SECRET: StackSecret = StackSecret::from_bytes([0x5a; 16]);
 
     fn tcp_segment(
         source: Ipv4Address,
@@ -8795,7 +8632,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -9369,7 +9206,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv4(peer),
@@ -9453,7 +9290,7 @@ mod tests {
         let (mut stack, _socket) = established_tcp_stack(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         let payload = [0u8; 100];
 
@@ -9523,7 +9360,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv4(peer),
@@ -9598,7 +9435,7 @@ mod tests {
     /// The sequence number a listener's SYN-ACK carries for a SYN from
     /// `peer:49152` to `local:8080` arriving at `now` nanoseconds, on a
     /// stack keyed with `secret`.
-    fn passive_open_sequence(secret: crate::IsnSecret, now: u64) -> u32 {
+    fn passive_open_sequence(secret: StackSecret, now: u64) -> u32 {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let mut stack = Stack::new(StackConfig::new(
@@ -9638,11 +9475,11 @@ mod tests {
         let stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
 
         assert_eq!(
-            passive_open_sequence(TEST_ISN_SECRET, now),
+            passive_open_sequence(TEST_SECRET, now),
             stack.tcp_initial_sequence(local, remote, StackInstant::from_nanos(now)),
             "the passive open and the active open share one function"
         );
@@ -9651,23 +9488,23 @@ mod tests {
     #[test]
     fn passive_open_sequence_depends_on_the_secret() {
         let now = 8_000_000;
-        let other = crate::IsnSecret::from_bytes([0xa5; 16]);
+        let other = StackSecret::from_bytes([0xa5; 16]);
         assert_ne!(
-            passive_open_sequence(TEST_ISN_SECRET, now),
+            passive_open_sequence(TEST_SECRET, now),
             passive_open_sequence(other, now),
             "two boots must not agree on a flow's sequence number"
         );
         // What the stack derived before the secret existed: the clock and
         // the two ports, which anyone on the path can compute.
         let unkeyed = (now as u32).wrapping_add(8080).wrapping_add(49152);
-        assert_ne!(passive_open_sequence(TEST_ISN_SECRET, now), unkeyed);
+        assert_ne!(passive_open_sequence(TEST_SECRET, now), unkeyed);
         assert_ne!(passive_open_sequence(other, now), unkeyed);
     }
 
     #[test]
     fn passive_open_sequence_advances_with_the_clock() {
-        let early = passive_open_sequence(TEST_ISN_SECRET, 4_000);
-        let late = passive_open_sequence(TEST_ISN_SECRET, 4_004_000);
+        let early = passive_open_sequence(TEST_SECRET, 4_000);
+        let late = passive_open_sequence(TEST_SECRET, 4_004_000);
         assert_eq!(
             late.wrapping_sub(early),
             1_000,
@@ -9682,7 +9519,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         let local = TcpEndpoint {
             address: IpAddress::Ipv4(local),
@@ -9709,7 +9546,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
 
         stack
@@ -9741,7 +9578,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
 
         stack
@@ -9777,7 +9614,7 @@ mod tests {
         let (mut stack, socket, _, _) = open_pending_tcp_connect_stack(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         let (mut syn_ack, syn_ack_len) = tcp_segment(
             peer,
@@ -9815,7 +9652,7 @@ mod tests {
     /// it summed.
     #[test]
     fn tcp_receive_trusts_a_device_validated_frame() {
-        let config = StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_ISN_SECRET)
+        let config = StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_SECRET)
             .with_rx_checksum_offload(RxChecksumOffload::new(false, true, false));
         let (mut stack, socket, local, peer) = open_pending_tcp_connect_stack(config);
         let (mut syn_ack, syn_ack_len) = corrupt_tcp_syn_ack(peer, local);
@@ -9841,7 +9678,7 @@ mod tests {
     /// those are verified in software like any other.
     #[test]
     fn tcp_receive_verifies_a_frame_the_device_did_not_validate() {
-        let config = StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_ISN_SECRET)
+        let config = StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_SECRET)
             .with_rx_checksum_offload(RxChecksumOffload::new(false, true, false));
         let (mut stack, socket, local, peer) = open_pending_tcp_connect_stack(config);
         let (syn_ack, syn_ack_len) = corrupt_tcp_syn_ack(peer, local);
@@ -9869,7 +9706,7 @@ mod tests {
     /// delivered even though a software verification would reject it.
     #[test]
     fn tcp_receive_completes_a_partial_checksum_frame() {
-        let config = StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_ISN_SECRET)
+        let config = StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_SECRET)
             .with_rx_checksum_offload(RxChecksumOffload::new(false, true, false));
         let (mut stack, socket, local, peer) = open_pending_tcp_connect_stack(config);
         let (mut syn_ack, syn_ack_len) = tcp_segment(
@@ -9919,7 +9756,7 @@ mod tests {
     /// and the frame is dropped.
     #[test]
     fn tcp_receive_drops_an_inconsistent_partial_checksum_frame() {
-        let config = StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_ISN_SECRET)
+        let config = StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_SECRET)
             .with_rx_checksum_offload(RxChecksumOffload::new(false, true, false));
         let (mut stack, socket, local, peer) = open_pending_tcp_connect_stack(config);
         let (mut syn_ack, syn_ack_len) = tcp_segment(
@@ -10082,7 +9919,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -10146,7 +9983,7 @@ mod tests {
 
     #[test]
     fn tcp_connect_resets_stale_ack_then_retransmits_syn_and_establishes() {
-        let config = StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_ISN_SECRET);
+        let config = StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_SECRET);
         let (mut stack, socket, local, peer) = open_pending_tcp_connect_stack(config);
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -10233,7 +10070,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -10284,7 +10121,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -10335,7 +10172,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         let socket = stack
             .open_tcp_connect(
@@ -10390,7 +10227,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -10445,7 +10282,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -10491,7 +10328,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -10546,7 +10383,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv6_address(Ipv6Cidr::new(local, 64))
@@ -10577,7 +10414,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -10645,7 +10482,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv6_address(Ipv6Cidr::new(local, 64))
@@ -10705,7 +10542,7 @@ mod tests {
             let mut stack = Stack::new(StackConfig::new(
                 LOCAL_MAC,
                 crate::ETHERNET_FRAME_BYTES,
-                TEST_ISN_SECRET,
+                TEST_SECRET,
             ));
             match local {
                 IpAddress::Ipv4(local) => stack
@@ -10948,7 +10785,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -11017,7 +10854,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
 
         stack
@@ -11054,7 +10891,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         let first = stack
             .open_udp(UdpSocketBinding::connected(
@@ -11128,7 +10965,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         let v4 = stack
             .open_udp(UdpSocketBinding::exact(UdpEndpoint {
@@ -11191,7 +11028,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         let socket = stack
             .open_udp(UdpSocketBinding::exact(UdpEndpoint {
@@ -11222,7 +11059,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -11247,7 +11084,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -11281,7 +11118,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -11313,7 +11150,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -11347,7 +11184,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -11373,7 +11210,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -11444,7 +11281,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -11473,7 +11310,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -11503,7 +11340,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -11552,7 +11389,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -11593,7 +11430,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -11653,7 +11490,7 @@ mod tests {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let group = Ipv4Address::new([224, 0, 0, 251]);
         let mut stack = Stack::new(
-            StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_ISN_SECRET)
+            StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_SECRET)
                 .with_tx_checksum_offload(true),
         );
         stack
@@ -11798,7 +11635,7 @@ mod tests {
         let (mut stack, socket) = established_tcp_stack(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         // The handshake sent the SYN with sequence 7, so the first data
         // byte is sequence 8.
@@ -11996,7 +11833,7 @@ mod tests {
     #[test]
     fn bulk_tcp_data_is_scattered_when_the_device_reads_borrowed_bytes() {
         let (mut stack, socket) = established_tcp_stack(
-            StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_ISN_SECRET)
+            StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_SECRET)
                 .with_tx_checksum_offload(true)
                 .with_direct_tx_dma(true),
         );
@@ -12027,7 +11864,7 @@ mod tests {
     #[test]
     fn bulk_tcp_data_is_copied_when_the_device_cannot_read_borrowed_bytes() {
         let (mut stack, socket) = established_tcp_stack(
-            StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_ISN_SECRET)
+            StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_SECRET)
                 .with_tx_checksum_offload(true),
         );
         let payload = vec![0x5a_u8; TCP_SCATTER_MIN_PAYLOAD_BYTES];
@@ -12054,7 +11891,7 @@ mod tests {
     #[test]
     fn a_tso_interface_receives_one_coalesced_frame_with_gso_metadata() {
         let (mut stack, socket) = established_tcp_stack(
-            StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_ISN_SECRET)
+            StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_SECRET)
                 .with_tx_checksum_offload(true)
                 .with_segmentation_offload(tso_ipv4_offload()),
         );
@@ -12112,7 +11949,7 @@ mod tests {
     #[test]
     fn an_interface_without_segmentation_still_receives_mss_sized_frames() {
         let (mut stack, socket) = established_tcp_stack(
-            StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_ISN_SECRET)
+            StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_SECRET)
                 .with_tx_checksum_offload(true),
         );
         let payload: Vec<u8> = (0..40 * 1024).map(|index| index as u8).collect();
@@ -12147,7 +11984,7 @@ mod tests {
     #[test]
     fn a_coalesced_burst_still_retransmits_one_segment_at_a_time() {
         let (mut stack, socket) = established_tcp_stack(
-            StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_ISN_SECRET)
+            StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_SECRET)
                 .with_tx_checksum_offload(true)
                 .with_segmentation_offload(tso_ipv4_offload()),
         );
@@ -12186,7 +12023,7 @@ mod tests {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer_addr = Ipv4Address::new([192, 0, 2, 20]);
         let mut stack = Stack::new(
-            StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_ISN_SECRET)
+            StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_SECRET)
                 .with_tx_checksum_offload(true)
                 .with_direct_tx_dma(true),
         );
@@ -12265,7 +12102,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -12297,7 +12134,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv6_address(Ipv6Cidr::new(local, 64))
@@ -12323,7 +12160,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -12363,7 +12200,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv6_address(Ipv6Cidr::new(local, 64))
@@ -12403,7 +12240,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -12446,7 +12283,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv6_address(Ipv6Cidr::new(local, 64))
@@ -12490,7 +12327,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -12525,7 +12362,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         let socket = stack
             .open_udp(UdpSocketBinding::wildcard(4040))
@@ -12549,7 +12386,7 @@ mod tests {
     fn udp_receive_trusts_a_device_validated_datagram() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
-        let config = StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_ISN_SECRET)
+        let config = StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_SECRET)
             .with_rx_checksum_offload(RxChecksumOffload::new(false, false, true));
         let mut stack = Stack::new(config);
         let socket = stack
@@ -12579,7 +12416,7 @@ mod tests {
     fn udp_receive_completes_a_partial_checksum_datagram() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
-        let config = StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_ISN_SECRET)
+        let config = StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_SECRET)
             .with_rx_checksum_offload(RxChecksumOffload::new(false, false, true));
         let mut stack = Stack::new(config);
         let socket = stack
@@ -12617,7 +12454,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         let socket = stack
             .open_udp(UdpSocketBinding::wildcard(4040))
@@ -12647,7 +12484,7 @@ mod tests {
     fn ipv4_receive_trusts_configured_rx_header_checksum_offload() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
-        let config = StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_ISN_SECRET)
+        let config = StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_SECRET)
             .with_rx_checksum_offload(RxChecksumOffload::new(true, false, false));
         let mut stack = Stack::new(config);
         stack
@@ -12705,7 +12542,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -12778,7 +12615,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -12820,7 +12657,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -12848,7 +12685,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -12893,7 +12730,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -12924,7 +12761,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -12959,7 +12796,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -12992,7 +12829,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -13028,7 +12865,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -13069,7 +12906,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -13111,7 +12948,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         let socket = stack
             .open_udp(UdpSocketBinding::wildcard(4040))
@@ -13139,7 +12976,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -13194,7 +13031,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -13232,7 +13069,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv6_address(Ipv6Cidr::new(local, 64))
@@ -13289,7 +13126,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv6_address(Ipv6Cidr::new(local, 64))
@@ -13344,7 +13181,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         let socket = stack
             .open_udp(UdpSocketBinding::wildcard(4040))
@@ -13376,7 +13213,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         let saturated = stack
             .open_udp(UdpSocketBinding::wildcard(4040))
@@ -13453,7 +13290,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -13506,7 +13343,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -13559,7 +13396,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -13612,7 +13449,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -13657,7 +13494,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -13988,7 +13825,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -14497,7 +14334,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -14619,7 +14456,7 @@ mod tests {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let mut stack = Stack::new_with_congestion(
-            StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_ISN_SECRET),
+            StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_SECRET),
             NewReno::new(1460),
         );
 
@@ -14654,7 +14491,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv4(peer),
@@ -14733,7 +14570,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -14826,7 +14663,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -14903,7 +14740,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         for peer in [first_peer, second_peer] {
             stack.learn_neighbor(NeighborEntry {
@@ -14996,7 +14833,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         for peer in [first_peer, second_peer] {
             stack.learn_neighbor(NeighborEntry {
@@ -15055,7 +14892,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv4(first_peer),
@@ -15125,7 +14962,7 @@ mod tests {
         Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ))
     }
 
@@ -15625,7 +15462,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv4(peer),
@@ -15684,7 +15521,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -15746,7 +15583,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         let socket = stack
             .open_tcp_connect(
@@ -15827,7 +15664,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         let socket = stack
             .open_tcp_connect(
@@ -15936,7 +15773,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv4(peer),
@@ -16023,7 +15860,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -16136,7 +15973,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -16246,7 +16083,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv4(peer),
@@ -16390,7 +16227,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         let socket = stack
             .open_tcp_connect(
@@ -16576,7 +16413,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -17010,7 +16847,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         let first = stack
             .open_tcp_listen(
@@ -17060,7 +16897,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         let first = stack
             .open_tcp_listen(
@@ -17218,7 +17055,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .configure_ipv6_link_local()
@@ -17235,7 +17072,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         let link_local = stack
             .configure_ipv6_link_local()
@@ -17264,7 +17101,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .configure_ipv6_link_local()
@@ -17363,7 +17200,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .configure_ipv6_link_local()
@@ -17388,7 +17225,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .configure_ipv6_link_local()
@@ -17536,7 +17373,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .configure_ipv6_link_local()
@@ -17570,7 +17407,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .configure_ipv6_link_local()
@@ -17626,7 +17463,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         let address = advertised_address(3, 3600, 86_400);
         stack.apply_ipv6_router_configuration(address_advertisement(address), seconds(0));
@@ -17684,7 +17521,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         let address = advertised_address(4, 3600, 86_400);
         stack.apply_ipv6_router_configuration(address_advertisement(address), seconds(0));
@@ -17716,7 +17553,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .configure_ipv6_link_local()
@@ -17762,7 +17599,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         let local = Ipv4Address::new([192, 0, 2, 10]);
         stack
@@ -17819,7 +17656,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .configure_ipv6_link_local()
@@ -17852,7 +17689,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         let off_link = IpAddress::Ipv6(Ipv6Address::new([
             0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
@@ -17882,7 +17719,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         let default_route = Route {
             destination: IpCidr::Ipv6(Ipv6Cidr::new(Ipv6Address::UNSPECIFIED, 0)),
@@ -17907,7 +17744,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         let gateway = Route {
             destination: IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::UNSPECIFIED, 0)),
@@ -17940,7 +17777,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         // Fill the route table with local routes.
         for index in 0..MAX_ROUTES as u8 {
@@ -17968,7 +17805,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         let mut host = 0u8;
         while stack
@@ -18161,7 +17998,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .configure_ipv6_link_local()
@@ -18404,7 +18241,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(LOCAL_V4, 16))
@@ -18568,7 +18405,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -18703,7 +18540,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .configure_ipv6_link_local()
@@ -19732,7 +19569,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(local, 24))
@@ -19853,7 +19690,7 @@ mod tests {
         // data octets and an IPv6 one of 538.
         // Each family builds its own stack in its own frame: a `Stack` is
         // too large for one frame to hold several.
-        let config = StackConfig::new(LOCAL_MAC, 600, TEST_ISN_SECRET);
+        let config = StackConfig::new(LOCAL_MAC, 600, TEST_SECRET);
         ipv4_echo_replies_are_bounded_by_the_mtu(config);
         ipv6_echo_replies_are_bounded_by_the_mtu(config);
 
@@ -20076,7 +19913,7 @@ mod tests {
         );
 
         // A small interface holds less still.
-        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, 600, TEST_ISN_SECRET));
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, 600, TEST_SECRET));
         stack
             .configure_ipv6_link_local()
             .expect("link-local address should be accepted");
@@ -20306,7 +20143,7 @@ mod tests {
         let mut stack = Stack::new(StackConfig::new(
             LOCAL_MAC,
             crate::ETHERNET_FRAME_BYTES,
-            TEST_ISN_SECRET,
+            TEST_SECRET,
         ));
         stack
             .add_ipv4_address(Ipv4Cidr::new(FLOW_LOCAL, 24))
@@ -21035,5 +20872,152 @@ mod tests {
         assert_eq!(events.len(), 2, "{events:?}");
         assert!(events.contains(&StackEvent::TcpClosed { socket: sockets[1] }));
         assert!(events.contains(&StackEvent::TcpClosed { socket: reused }));
+    }
+}
+
+#[cfg(test)]
+mod socket_index_hash_tests {
+    use alloc::vec::Vec;
+
+    use super::*;
+
+    const SECRET_A: StackSecret = StackSecret::from_bytes([0x11; StackSecret::BYTES]);
+    const SECRET_B: StackSecret = StackSecret::from_bytes([0x22; StackSecret::BYTES]);
+    const COLLIDING_TUPLES: usize = 32;
+    /// More tuples than this sharing one home slot is a cluster, not chance:
+    /// 32 keys over 1024 slots.
+    const MAX_SHARED_HOME: usize = 3;
+
+    fn index_under(secret: StackSecret) -> TcpEndpointIndex {
+        TcpEndpointIndex::new(secret.derive(KeyDomain::SocketIndex))
+    }
+
+    fn endpoint(octets: [u8; 4], port: u16) -> TcpEndpoint {
+        TcpEndpoint {
+            address: IpAddress::Ipv4(Ipv4Address::new(octets)),
+            port,
+        }
+    }
+
+    /// The hash the index used before it was keyed: FNV-1a from the published
+    /// offset basis over the address octets and big-endian ports, reduced
+    /// modulo the table size. Kept here only to build tuples that collide
+    /// under it.
+    fn fnv_home(key: TcpEndpointKey) -> usize {
+        fn mix(mut hash: u64, bytes: &[u8]) -> u64 {
+            for byte in bytes {
+                hash ^= u64::from(*byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            hash
+        }
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for endpoint in [key.local, key.remote] {
+            let IpAddress::Ipv4(address) = endpoint.address else {
+                unreachable!("the test builds IPv4 tuples");
+            };
+            hash = mix(hash, &address.octets());
+            hash = mix(hash, &endpoint.port.to_be_bytes());
+        }
+        hash as usize % TCP_ENDPOINT_INDEX_SLOTS
+    }
+
+    /// Four-tuples a remote sender could pick that all start probing at one
+    /// slot under the old hash.
+    fn tuples_colliding_under_fnv() -> Vec<TcpEndpointKey> {
+        let local = endpoint([192, 0, 2, 10], 443);
+        let remote_address = [198, 51, 100, 7];
+        let key = |port| TcpEndpointKey::new(local, endpoint(remote_address, port));
+        let target = fnv_home(key(1024));
+        let tuples: Vec<_> = (1024..=u16::MAX)
+            .map(key)
+            .filter(|candidate| fnv_home(*candidate) == target)
+            .take(COLLIDING_TUPLES)
+            .collect();
+        assert_eq!(tuples.len(), COLLIDING_TUPLES);
+        tuples
+    }
+
+    fn largest_shared_home(homes: &[usize]) -> usize {
+        homes
+            .iter()
+            .map(|home| homes.iter().filter(|other| *other == home).count())
+            .max()
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn tuples_that_collide_under_the_old_hash_no_longer_share_a_probe_sequence() {
+        let tuples = tuples_colliding_under_fnv();
+        let old: Vec<usize> = tuples.iter().map(|key| fnv_home(*key)).collect();
+        assert_eq!(
+            largest_shared_home(&old),
+            COLLIDING_TUPLES,
+            "the tuples must form one cluster under the old hash"
+        );
+
+        let mut placements = Vec::new();
+        for secret in [SECRET_A, SECRET_B] {
+            let index = index_under(secret);
+            let homes: Vec<usize> = tuples.iter().map(|key| index.home_slot(*key)).collect();
+            assert!(
+                largest_shared_home(&homes) <= MAX_SHARED_HOME,
+                "{secret:?} still clusters the tuples: {homes:?}"
+            );
+            placements.push(homes);
+        }
+        // The two secrets do not agree on where one tuple lands, so the
+        // layout cannot be computed without the secret.
+        let agreeing = placements[0]
+            .iter()
+            .zip(&placements[1])
+            .filter(|(first, second)| first == second)
+            .count();
+        assert!(
+            agreeing <= MAX_SHARED_HOME,
+            "two secrets placed {agreeing} tuples alike"
+        );
+    }
+
+    #[test]
+    fn the_colliding_tuples_insert_and_remove_under_a_keyed_index() {
+        let tuples = tuples_colliding_under_fnv();
+        let mut index = index_under(SECRET_A);
+        for (position, key) in tuples.iter().enumerate() {
+            index.insert(*key, position);
+        }
+        for (position, key) in tuples.iter().enumerate() {
+            assert_eq!(index.lookup(*key), Some(position));
+        }
+        for key in &tuples {
+            index.remove(*key);
+        }
+        for key in &tuples {
+            assert_eq!(index.lookup(*key), None);
+        }
+    }
+
+    #[test]
+    fn two_stacks_with_different_secrets_place_one_tuple_differently() {
+        let config =
+            |secret| StackConfig::new([0x02, 0, 0, 0, 0, 1], crate::ETHERNET_FRAME_BYTES, secret);
+        let stack_a = Stack::new(config(SECRET_A));
+        let stack_a_again = Stack::new(config(SECRET_A));
+        let stack_b = Stack::new(config(SECRET_B));
+        let tuples = tuples_colliding_under_fnv();
+        let home = |stack: &Stack, key| stack.tcp.endpoint_index.home_slot(key);
+        let mut differing = 0;
+        for key in &tuples {
+            assert_eq!(
+                home(&stack_a, *key),
+                home(&stack_a_again, *key),
+                "one secret must place a tuple the same way on every shard"
+            );
+            differing += usize::from(home(&stack_a, *key) != home(&stack_b, *key));
+        }
+        assert!(
+            differing >= COLLIDING_TUPLES - MAX_SHARED_HOME,
+            "only {differing} of {COLLIDING_TUPLES} tuples moved"
+        );
     }
 }
