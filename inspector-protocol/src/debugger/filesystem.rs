@@ -442,17 +442,28 @@ mod guest {
                     .map_err(|code| filesystem_error(path, "write file", code))
             },
             async move {
-                tx.write(bytes).await;
+                let unwritten = tx.write_all(bytes).await.len();
                 drop(tx);
-                Ok::<(), std::io::Error>(())
+                if unwritten == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        format!(
+                            "file stream closed by the reader with {unwritten} bytes unwritten"
+                        ),
+                    ))
+                }
             },
         )
         .await;
+        // The host's own error names the cause; a reader that closed early
+        // is only the symptom.
+        write_result?;
         feed_result.map_err(|source| DispatchError::Io {
             operation: "filesystem.write",
             source,
-        })?;
-        write_result
+        })
     }
 
     async fn copy_path(source: &str, destination: &str) -> Result<(), DispatchError> {
