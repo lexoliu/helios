@@ -1635,9 +1635,18 @@ where
                 )
             })
         });
-        let pacing_deadline = self
-            .next_pacing_send_nanos
-            .filter(|_| !self.transmit_queue_is_empty());
+        // The pacing deadline is when the socket next sends only while
+        // the windows would let it. A window-blocked socket waits on an
+        // ACK, and its passed pacing deadline would otherwise report a
+        // timer that is always due.
+        let pacing_deadline = self.next_pacing_send_nanos.filter(|_| {
+            !self.transmit_queue_is_empty()
+                && self.available_send_window() != 0
+                && !self
+                    .in_flight
+                    .as_ref()
+                    .is_some_and(TcpInFlightQueue::is_full)
+        });
         let persist_deadline = self.persist_timer.map(TcpPersistTimer::deadline_nanos);
         min_deadline(
             min_deadline(
@@ -4155,6 +4164,35 @@ mod tests {
         );
         assert_eq!(socket.reno_sacked_bytes, 0);
         assert_eq!(socket.pipe_bytes(), 0);
+    }
+
+    #[test]
+    fn a_window_blocked_socket_reports_no_passed_pacing_deadline() {
+        let rate = PacingRate::from_bytes_per_second(1_000_000);
+        // A 16-byte window: one 16-byte segment fills it.
+        let mut socket = established_fixed_pacing_socket(rate);
+        assert_eq!(socket.queue_send(&[0x5a; 64]), 64);
+        let sent_at = TCP_INITIAL_RTO_NANOS + 1;
+        let segment = socket
+            .take_transmit_segment(sent_at, full_segment_budget())
+            .expect("the window holds one segment");
+        assert_eq!(segment.sequence_len, 16);
+
+        // Well past the 16 µs the pacing rate spaces segments by, the
+        // window is still full: the socket's next deadline is its
+        // retransmission timer, not a pacing deadline already behind it.
+        let now = sent_at + 1_000_000;
+        assert_eq!(
+            socket.take_transmit_segment(now, full_segment_budget()),
+            None
+        );
+        let deadline = socket
+            .next_deadline_nanos()
+            .expect("the segment's retransmission timer is armed");
+        assert!(
+            deadline > now,
+            "a deadline of {deadline} at {now} would fire at once and send nothing"
+        );
     }
 
     #[test]
