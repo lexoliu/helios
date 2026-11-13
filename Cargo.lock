@@ -1967,6 +1967,7 @@ dependencies = [
  "helios-tpm",
  "helios-virtio",
  "limine 0.6.5",
+ "r-efi 7.1.0",
  "spin 0.12.3",
  "thiserror 2.0.21",
  "tracing",
@@ -4142,6 +4143,12 @@ name = "r-efi"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
+
+[[package]]
+name = "r-efi"
+version = "7.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b0ff379dd174eec5b2cab797063a2e7592dfcf0bf0323a50eeee724ee3537f13"
 
 [[package]]
 name = "radium"

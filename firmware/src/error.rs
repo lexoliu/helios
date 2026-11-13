@@ -47,6 +47,11 @@ pub enum FirmwareNumaError {
     CpuWithoutNode { node: NodeName },
     #[error("memory node `{node}` has no `numa-node-id` while other nodes do")]
     MemoryWithoutNode { node: NodeName },
+    #[error(
+        "the device tree places processors on {nodes} NUMA nodes but has no memory node, so no \
+         memory belongs to any of them"
+    )]
+    NumaWithoutMemory { nodes: usize },
     #[error("node `{node}`: `reg` is missing or does not hold whole address/size entries")]
     RegMalformed { node: NodeName },
     #[error(

@@ -529,6 +529,52 @@ fn a_memory_node_without_a_node_id_among_ones_that_have_it_is_refused() {
     }
 }
 
+/// The tree Limine hands over on QEMU's `virt` board booted with two
+/// NUMA nodes: the firmware's, with every `/memory` node deleted
+/// (`common/protos/limine.c`), so the cpu nodes keep their
+/// `numa-node-id` and the distance map survives while nothing places
+/// memory anywhere.
+#[test]
+fn node_ids_on_cpus_with_no_memory_node_are_refused() {
+    let mpidr_cpu = |mpidr: u32, id: u32| {
+        node(&format!("cpu@{mpidr:x}"))
+            .string("device_type", "cpu")
+            .cells("reg", &[0, mpidr])
+            .cells("numa-node-id", &[id])
+    };
+    let cpus = node("cpus")
+        .cells("#address-cells", &[2])
+        .cells("#size-cells", &[0])
+        .child(mpidr_cpu(0x0, 0))
+        .child(mpidr_cpu(0x1, 0))
+        .child(mpidr_cpu(0x2, 1))
+        .child(mpidr_cpu(0x3, 1));
+    let tree = root(
+        2,
+        vec![
+            cpus,
+            distance_map(&[[0, 0, 10], [0, 1, 20], [1, 0, 20], [1, 1, 10]]),
+        ],
+    );
+    assert_eq!(
+        refusal(tree, vec![0x0, 0x1, 0x2, 0x3]),
+        FirmwareNumaError::NumaWithoutMemory { nodes: 2 }
+    );
+}
+
+/// The same stripped tree on a one-node boot carries no NUMA property at
+/// all, and is the one node it describes.
+#[test]
+fn no_node_ids_and_no_memory_node_is_one_node() {
+    let tree = root(2, vec![cpus(vec![cpu(0, None), cpu(1, None)])]);
+    let bytes = blob(&tree);
+    let fdt = Fdt::new(&bytes).unwrap();
+    let numa = DeviceTreeNuma::new(&fdt, Ids(vec![0, 1])).unwrap();
+    let single = SingleNode::new(2);
+    assert_eq!(numa.node_count(), 1);
+    assert_eq!(memory_of(&numa), memory_of(&single));
+}
+
 #[test]
 fn a_hardware_id_with_no_cpu_node_is_refused() {
     assert_eq!(

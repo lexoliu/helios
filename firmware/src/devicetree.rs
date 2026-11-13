@@ -54,6 +54,17 @@ impl<'f, P: ProcessorIdentities> DeviceTreeNuma<'f, P> {
         if this.node_ids.is_empty() {
             return Ok(this);
         }
+        // Node ids place processors, but only memory nodes place memory:
+        // a tree with the first and none of the second describes no node
+        // any memory belongs to. Linux's `of_numa_parse_memory_nodes`
+        // refuses the same tree (it returns `-EINVAL` when no memory node
+        // is found), and a bootloader that deletes `/memory` nodes from
+        // the tree it hands over produces exactly this one.
+        if this.memory_nodes().next().is_none() {
+            return Err(FirmwareNumaError::NumaWithoutMemory {
+                nodes: this.node_ids.len(),
+            });
+        }
         this.validate_memory()?;
         this.read_distances()?;
         this.validate_processors()?;

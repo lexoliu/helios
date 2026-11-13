@@ -23,6 +23,9 @@ helios-kernel = { workspace = true, default-features = false, features = ["wasmt
 helios-virtio.workspace = true
 helios-tpm.workspace = true
 limine = "0.6.5"
+# The UEFI system and configuration table layouts and the device-tree table
+# GUID, through which the firmware's own device tree is found.
+r-efi = { version = "7.1.0", default-features = false }
 spin = "0.12.3"
 thiserror = { version = "2.0.20", default-features = false }
 triomphe = { version = "0.1.16", default-features = false }

@@ -41,10 +41,11 @@ use limine::firmware::{
 use limine::memmap::{Entry, MEMMAP_USABLE};
 use limine::mp::MpInfo;
 use limine::request::{
-    DtbRequest, ExecutableAddressRequest, ExecutableCmdlineRequest, ExecutableFileRequest,
-    FirmwareTypeRequest, HhdmRequest, MemmapRequest, ModulesRequest, MpRequest, RsdpRequest,
-    StackSizeRequest,
+    DtbRequest, EfiRequest, ExecutableAddressRequest, ExecutableCmdlineRequest,
+    ExecutableFileRequest, FirmwareTypeRequest, HhdmRequest, MemmapRequest, ModulesRequest,
+    MpRequest, RsdpRequest, StackSizeRequest,
 };
+use r_efi::efi::SystemTable;
 use spin::Once;
 
 const KERNEL_STACK_BYTES: usize = 4 * 1024 * 1024;
@@ -252,6 +253,10 @@ static FIRMWARE_TYPE_REQUEST: FirmwareTypeRequest = FirmwareTypeRequest::new();
 static DEVICE_TREE_BLOB_REQUEST: DtbRequest = DtbRequest::new();
 #[used]
 static RSDP_REQUEST: RsdpRequest = RsdpRequest::new();
+/// The UEFI system table, whose configuration table names the firmware's
+/// own device tree (`platform::efi`).
+#[used]
+static EFI_SYSTEM_TABLE_REQUEST: EfiRequest = EfiRequest::new();
 #[used]
 static STACK_SIZE_REQUEST: StackSizeRequest = StackSizeRequest::new(KERNEL_STACK_BYTES as u64);
 /// The firmware's TPM event log, which the measured-boot discovery reads
@@ -678,7 +683,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
     // the console is part of it and a panic from here on should reach a
     // serial port. Reading the console out of it allocates nothing, in
     // either description.
-    let tables = platform::PlatformTables::discover(&handoff)
+    let tables = platform::PlatformTables::discover(&handoff, efi_system_table())
         .unwrap_or_else(|error| panic!("AArch64 platform discovery failed: {error}"));
     let console = tables
         .console()
@@ -2349,6 +2354,16 @@ fn physical_memory_offset() -> usize {
         .response()
         .unwrap_or_else(|| panic!("Limine did not provide an HHDM response"))
         .offset as usize
+}
+
+/// The firmware's UEFI system table, at the direct-map address Limine
+/// returns for it from base revision 5 on, or `None` when Limine gave no
+/// response.
+fn efi_system_table() -> Option<NonNull<SystemTable>> {
+    EFI_SYSTEM_TABLE_REQUEST.response().map(|response| {
+        NonNull::new(response.address.cast::<SystemTable>().cast_mut())
+            .unwrap_or_else(|| panic!("Limine's EFI system table response holds a null address"))
+    })
 }
 
 #[derive(Clone, Copy)]

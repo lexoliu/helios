@@ -16,24 +16,33 @@
 //! machine that offers neither cannot be brought up and says so.
 //! Neither path ever fills in a gap in the other.
 //!
+//! A device-tree boot reads two trees. Devices and the console come from
+//! the one Limine hands over; locality comes from the firmware's own,
+//! which [`efi`] finds through the UEFI configuration table, because
+//! Limine deletes every memory node from the copy it hands over.
+//!
 //! Concurrency contract: the description is built once, on the
 //! bootstrap processor, before any secondary is started, and is
 //! read-only from then on. Nothing here takes a lock.
 
 use core::fmt;
+use core::ptr::NonNull;
 
 use arm_gic::{IntId, Trigger};
 pub(crate) use helios_firmware::MPIDR_AFFINITY_MASK;
 use helios_firmware::{DeviceTreeNuma, FirmwareNumaError, ProcessorIdentities};
 use helios_hal::numa::NumaTopology;
+use r_efi::efi::SystemTable;
 use thiserror::Error;
 
 use crate::LimineBootHandoff;
 
 mod acpi;
 mod dt;
+mod efi;
 
 pub(crate) use acpi::AcpiError;
+use efi::{FirmwareTreeError, FirmwareTreeLocator};
 
 /// Slots the `virt` board and Arm server platforms expose for
 /// transport-discovered virtio devices. QEMU's `virt` publishes exactly
@@ -292,6 +301,14 @@ pub(crate) enum PlatformError {
     Acpi(#[from] AcpiError),
     #[error("the firmware's NUMA description is refused: {0}")]
     Numa(#[from] FirmwareNumaError),
+    #[error("the firmware's own device tree cannot be read: {0}")]
+    FirmwareTree(#[from] FirmwareTreeError),
+    #[error(
+        "the UEFI configuration table holds no device tree, and the tree Limine handed over \
+         places processors on {nodes} NUMA nodes with its memory nodes deleted, so no memory \
+         can be placed on them"
+    )]
+    NumaWithoutFirmwareTree { nodes: usize },
 }
 
 /// What the bootstrap processor does with the machine's NUMA description.
@@ -311,16 +328,43 @@ pub(crate) trait NumaConsumer {
 /// kernel has a heap and the rest of the description is needed after,
 /// and re-parsing between the two would be two chances to disagree.
 pub(crate) enum PlatformTables {
-    DeviceTree(fdt::Fdt<'static>),
+    DeviceTree(DeviceTreeTables),
     Acpi(acpi::AcpiPlatformTables),
+}
+
+/// The two trees a device-tree boot reads.
+pub(crate) struct DeviceTreeTables {
+    /// The tree Limine handed over: the firmware's, copied, with every
+    /// `/memory` node deleted. The console and every device are read
+    /// from it.
+    handed: fdt::Fdt<'static>,
+    /// Where the firmware's own tree is found. Locality is read from it
+    /// and from nothing else, because memory nodes are what place memory
+    /// on a node.
+    firmware: FirmwareTreeLocator,
 }
 
 impl PlatformTables {
     /// Picks the firmware description: the device tree when Limine
     /// provides one, otherwise ACPI.
-    pub(crate) fn discover(handoff: &LimineBootHandoff) -> Result<Self, PlatformError> {
+    ///
+    /// `efi_system_table` is Limine's EFI system table response, at its
+    /// direct-map address. Only a device-tree boot reads it, and only
+    /// once [`Self::with_numa`] runs, so a failure to find the
+    /// firmware's tree reaches the console.
+    pub(crate) fn discover(
+        handoff: &LimineBootHandoff,
+        efi_system_table: Option<NonNull<SystemTable>>,
+    ) -> Result<Self, PlatformError> {
         if let Some(dtb) = handoff.tables.device_tree_blob {
-            return Ok(Self::DeviceTree(dt::parse(dtb)?));
+            return Ok(Self::DeviceTree(DeviceTreeTables {
+                handed: dt::parse(dtb)?,
+                firmware: FirmwareTreeLocator::new(
+                    efi_system_table,
+                    handoff.memory_map.entries,
+                    crate::physical_memory_offset(),
+                ),
+            }));
         }
         let rsdp = handoff
             .tables
@@ -338,7 +382,7 @@ impl PlatformTables {
     /// `acpi` crate reads through a mapping.
     pub(crate) fn console(&self) -> Result<ConsoleDescription, PlatformError> {
         match self {
-            Self::DeviceTree(fdt) => dt::console(fdt),
+            Self::DeviceTree(tables) => dt::console(&tables.handed),
             Self::Acpi(tables) => Ok(acpi::console(tables)?),
         }
     }
@@ -351,6 +395,13 @@ impl PlatformTables {
     /// description: a device tree is read in place by
     /// [`DeviceTreeNuma`], and the SRAT, SLIT and MADT in place by
     /// [`acpi::numa`].
+    ///
+    /// A device-tree boot reads the firmware's own tree. A configuration
+    /// table with no tree in it leaves only the one Limine handed over,
+    /// which has no memory nodes: it describes the machine only when it
+    /// carries no NUMA property at all, the one node `DeviceTreeNuma`
+    /// then answers, and a tree that places processors on nodes is
+    /// refused rather than read as one with no memory.
     pub(crate) fn with_numa<Identities, Consumer>(
         &self,
         identities: Identities,
@@ -361,7 +412,22 @@ impl PlatformTables {
         Consumer: NumaConsumer,
     {
         match self {
-            Self::DeviceTree(fdt) => Ok(consumer.consume(&DeviceTreeNuma::new(fdt, identities)?)),
+            Self::DeviceTree(tables) => match tables.firmware.open()? {
+                Some(firmware) => {
+                    Ok(consumer.consume(&DeviceTreeNuma::new(&firmware, identities)?))
+                }
+                None => {
+                    let numa = DeviceTreeNuma::new(&tables.handed, identities).map_err(
+                        |error| match error {
+                            FirmwareNumaError::NumaWithoutMemory { nodes } => {
+                                PlatformError::NumaWithoutFirmwareTree { nodes }
+                            }
+                            error => PlatformError::Numa(error),
+                        },
+                    )?;
+                    Ok(consumer.consume(&numa))
+                }
+            },
             Self::Acpi(tables) => Ok(consumer.consume(&acpi::numa(tables, identities)?)),
         }
     }
@@ -376,7 +442,7 @@ impl PlatformTables {
         console: ConsoleDescription,
     ) -> Result<PlatformDescription, PlatformError> {
         match self {
-            Self::DeviceTree(fdt) => dt::describe(fdt, console),
+            Self::DeviceTree(tables) => dt::describe(&tables.handed, console),
             Self::Acpi(tables) => Ok(acpi::describe(tables, console)?),
         }
     }
