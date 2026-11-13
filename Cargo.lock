@@ -1975,6 +1975,7 @@ dependencies = [
  "helios-tpm",
  "helios-virtio",
  "limine 0.6.5",
+ "smccc",
  "spin 0.12.3",
  "thiserror 2.0.21",
  "tracing",
@@ -4923,6 +4924,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9be42f50aa861c555654aa3a37f52f4b1074bacf4e48fe0ef7fa584e80f1f0f"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "smccc"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "597fda855abe96a6a39b2beeca3ee15de3a73c8ed3ff3432778fd2f1db400fcd"
+dependencies = [
+ "thiserror 2.0.21",
 ]
 
 [[package]]
