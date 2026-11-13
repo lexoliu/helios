@@ -1612,11 +1612,15 @@ pub(crate) mod fixture {
         pub(crate) payload_len: usize,
     }
 
+    /// A connection whose clock the test moves: time passes only when
+    /// the test says it does, so a paced sender, a retransmission timer
+    /// and a round trip all run on the time the test states.
     pub(crate) struct EstablishedTcpFixture {
         service: NetworkService<
-            crate::test_support::TestCpu,
+            crate::test_support::ManualClockCpu,
             crate::test_support::RecordingNetworkInterface,
         >,
+        clock: crate::test_support::ManualClockCpu,
         stream: TcpStreamId,
     }
 
@@ -1632,6 +1636,11 @@ pub(crate) mod fixture {
         pub(crate) const LOCAL_SEQUENCE: u32 = 7;
         /// The peer's, for the acknowledgement they carry back.
         pub(crate) const PEER_SEQUENCE: u32 = 100;
+        /// The round trip the handshake measures: the SYN-ACK arrives
+        /// this long after the SYN left. One millisecond is the order of
+        /// a guest's path to its host, and any non-zero value gives the
+        /// connection a real first sample rather than a zero one.
+        pub(crate) const ROUND_TRIP_NANOS: u64 = 1_000_000;
 
         /// A connection in `ESTABLISHED`, with the handshake's own
         /// frames already drained so the next segment on the wire is
@@ -1646,17 +1655,18 @@ pub(crate) mod fixture {
         pub(crate) fn with_interface(
             device: crate::test_support::RecordingNetworkInterface,
         ) -> Self {
-            let cpu = crate::test_support::TestCpu::without_entropy();
+            let clock = crate::test_support::ManualClockCpu::new();
             let service = NetworkService::new(
-                cpu,
+                clock.clone(),
                 crate::test_support::test_profile_sink(),
                 crate::test_support::test_uptime_clock(),
-                crate::test_support::test_timer(cpu),
+                crate::test_support::test_timer(clock.clone()),
                 device,
                 crate::test_support::test_root_entropy(),
             );
             let fixture = Self {
                 service,
+                clock,
                 stream: {
                     // Placeholder: replaced below once the shard has
                     // the socket. `TcpStreamId` is non-zero, so the
@@ -1699,6 +1709,10 @@ pub(crate) mod fixture {
                 shard.insert_tcp_stream(socket)
             };
             let fixture = Self { stream, ..fixture };
+            // The SYN leaves, and its answer comes back a round trip
+            // later.
+            let _ = fixture.drive();
+            fixture.advance(Self::ROUND_TRIP_NANOS);
             fixture.deliver(
                 TcpHeader {
                     source_port: Self::PEER_PORT,
@@ -1718,10 +1732,15 @@ pub(crate) mod fixture {
         pub(crate) fn service(
             &self,
         ) -> NetworkService<
-            crate::test_support::TestCpu,
+            crate::test_support::ManualClockCpu,
             crate::test_support::RecordingNetworkInterface,
         > {
             self.service.clone()
+        }
+
+        /// Moves the connection's clock forward by `nanos`.
+        pub(crate) fn advance(&self, nanos: u64) {
+            self.clock.advance(nanos);
         }
 
         /// The stream handle a component-host owner holds.

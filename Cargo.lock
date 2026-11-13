@@ -2380,6 +2380,7 @@ dependencies = [
  "divan",
  "heapless",
  "helios-hal",
+ "num-integer",
  "siphasher",
  "thiserror 2.0.21",
  "tracing",
@@ -3657,6 +3658,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "num-integer"
+version = "0.1.47"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7ce2d95d4b3734dc35aa2f45e1aa22cd416814592a4f9d9205e11affd5b8e10b"
+dependencies = [
+ "num-traits",
 ]
 
 [[package]]
