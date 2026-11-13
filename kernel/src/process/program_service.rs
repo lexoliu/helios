@@ -1,6 +1,7 @@
 use core::fmt::{self, Write};
 
 use arrayvec::ArrayString;
+use helios_hal::fs::FsError;
 use thiserror::Error;
 
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
@@ -25,12 +26,16 @@ pub enum ProgramExecErrorKind {
     Unavailable,
     #[error("the kernel rejected the program for an internal reason")]
     Internal,
+    #[error("the program file does not exist")]
+    NotFound,
+    #[error("reading the program file failed with an I/O error")]
+    Io,
 }
 
 impl ProgramExecErrorKind {
     /// Every kind, in one order — the launch timeline's `error_kind`
     /// slot stores the index into it.
-    pub(crate) const ALL: [Self; 10] = [
+    pub(crate) const ALL: [Self; 12] = [
         Self::InvalidBinary,
         Self::MissingEntry,
         Self::UnsupportedImport,
@@ -41,6 +46,8 @@ impl ProgramExecErrorKind {
         Self::OutOfMemory,
         Self::Unavailable,
         Self::Internal,
+        Self::NotFound,
+        Self::Io,
     ];
 
     /// The `error_kind` name the launch-phase line prints.
@@ -56,6 +63,8 @@ impl ProgramExecErrorKind {
             Self::OutOfMemory => "out-of-memory",
             Self::Unavailable => "unavailable",
             Self::Internal => "internal",
+            Self::NotFound => "not-found",
+            Self::Io => "io",
         }
     }
 
@@ -74,6 +83,8 @@ impl ProgramExecErrorKind {
             Self::OutOfMemory => 7,
             Self::Unavailable => 8,
             Self::Internal => 9,
+            Self::NotFound => 10,
+            Self::Io => 11,
         }
     }
 }
@@ -181,6 +192,8 @@ pub enum ProgramExecErrorDetail {
     ProcessAuthorityDenied,
     #[error("filesystem operation failed")]
     FilesystemOperationFailed,
+    #[error("program file could not be read: {0}")]
+    ProgramSourceUnreadable(FsError),
     #[error("host filesystem service is unavailable")]
     HostFilesystemUnavailable,
     #[error("artifact signature verification failed")]
@@ -256,7 +269,12 @@ impl ProgramExecErrorDetail {
                 "program artifact destination is not granted by process authority"
             }
             Self::ProcessAuthorityDenied => "process authority rejected the requested grant",
+            // The filesystem error is in the error's `Display` and the
+            // kernel log; `as_str` has no storage to format it into.
             Self::FilesystemOperationFailed => "filesystem operation failed",
+            // The filesystem error is in the error's `Display` and the
+            // kernel log; `as_str` has no storage to format it into.
+            Self::ProgramSourceUnreadable(_) => "program file could not be read",
             Self::HostFilesystemUnavailable => "host filesystem service is unavailable",
             Self::ArtifactSignatureInvalid => "artifact signature verification failed",
             Self::ArtifactProfileInvalid => "artifact profile is unsupported",
@@ -307,6 +325,51 @@ impl ProgramExecErrorDetail {
 pub struct ProgramExecError {
     pub kind: ProgramExecErrorKind,
     pub detail: ProgramExecErrorDetail,
+}
+
+impl ProgramExecError {
+    /// The error a failed read of a program file becomes.
+    ///
+    /// Every [`FsError`] is named: a missing file is
+    /// [`ProgramExecErrorKind::NotFound`] and a failing device
+    /// [`ProgramExecErrorKind::Io`], so a guest reads `ENOENT` and `EIO`
+    /// where each happened, and the filesystem's own error travels in the
+    /// detail. The one refusal a read itself makes,
+    /// [`FsError::NotPermitted`] for a symbolic link that leads out of the
+    /// directory whose grant admitted the load, is process authority
+    /// refusing the path and stays
+    /// [`ProgramExecErrorDetail::ProgramSourceNotGranted`].
+    pub(crate) fn from_source_read_error(error: FsError) -> Self {
+        // Not a kernel fault: a `PATH` search misses on most candidates.
+        tracing::debug!(?error, "program file read failed during exec");
+        let kind = match error {
+            FsError::NotPermitted => {
+                return Self {
+                    kind: ProgramExecErrorKind::PermissionDenied,
+                    detail: ProgramExecErrorDetail::ProgramSourceNotGranted,
+                };
+            }
+            FsError::NoEntry => ProgramExecErrorKind::NotFound,
+            FsError::Io => ProgramExecErrorKind::Io,
+            FsError::NotDirectory
+            | FsError::IsDirectory
+            | FsError::ReadOnly
+            | FsError::Exists
+            | FsError::IllegalByteSequence
+            | FsError::Invalid
+            | FsError::Overflow => ProgramExecErrorKind::InvalidPath,
+            FsError::NotEmpty
+            | FsError::CrossDevice
+            | FsError::Busy
+            | FsError::Loop
+            | FsError::NameTooLong
+            | FsError::Unsupported => ProgramExecErrorKind::Internal,
+        };
+        Self {
+            kind,
+            detail: ProgramExecErrorDetail::ProgramSourceUnreadable(error),
+        }
+    }
 }
 
 /// Every fallible program operation returns this by value, so its size is a

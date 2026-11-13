@@ -149,6 +149,8 @@ mod guest {
             host_programs::ExecErrorKind::OutOfMemory => ExecErrorKind::OutOfMemory,
             host_programs::ExecErrorKind::Unavailable => ExecErrorKind::Unavailable,
             host_programs::ExecErrorKind::Internal => ExecErrorKind::Internal,
+            host_programs::ExecErrorKind::NotFound => ExecErrorKind::NotFound,
+            host_programs::ExecErrorKind::Io => ExecErrorKind::Io,
         }
     }
 

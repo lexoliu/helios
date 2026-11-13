@@ -9,7 +9,7 @@
 //! them and only translate types.
 
 use helios_hal::fs::{
-    FileSystem, FsError as VfsError, Metadata, NodeKind, OpenFlags, WritePosition,
+    FileSystem, FsError as VfsError, FsResult, Metadata, NodeKind, OpenFlags, WritePosition,
 };
 use pin_project_lite::pin_project;
 
@@ -769,20 +769,20 @@ where
 ///
 /// `floor` is the directory whose grant admits the load
 /// ([`crate::ProcessAuthority::program_load_floor`]); a symbolic link
-/// that leads out of it is refused.
+/// that leads out of it is refused. The filesystem's own error comes back
+/// untranslated: the caller decides what each kind means to its surface.
 pub(crate) async fn read_program_file<HostFs>(
     namespace: &Namespace<HostFs>,
     absolute: &str,
     floor: &str,
-) -> FsOpResult<FileContents>
+) -> FsResult<FileContents>
 where
     HostFs: crate::HostFileSystem,
 {
     let resolved = namespace
         .resolve_following(absolute, Follow::Within(floor))
-        .await
-        .map_err(fs_error_code)?;
-    resolved.read_whole().await.map_err(fs_error_code)
+        .await?;
+    resolved.read_whole().await
 }
 
 /// Creates or replaces the file `absolute` names with `bytes`.
