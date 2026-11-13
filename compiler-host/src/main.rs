@@ -55,7 +55,6 @@ struct Args {
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Hint {
-    Fast,
     Balanced,
     Performance,
 }
@@ -63,7 +62,6 @@ enum Hint {
 impl From<Hint> for CompileHint {
     fn from(hint: Hint) -> Self {
         match hint {
-            Hint::Fast => CompileHint::Fast,
             Hint::Balanced => CompileHint::Balanced,
             Hint::Performance => CompileHint::Performance,
         }

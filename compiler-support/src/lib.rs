@@ -1,7 +1,6 @@
 use helios_artifact::{
-    CWASM_MEMORY_GUARD_SIZE, CWASM_MEMORY_RESERVATION, CwasmCodeProtection, CwasmTarget,
-    cwasm_target_code_protection, cwasm_target_guest_stack_limit_offset,
-    cwasm_target_supports_wasm_simd,
+    CWASM_MEMORY_GUARD_SIZE, CWASM_MEMORY_RESERVATION, CwasmTarget, cwasm_target_code_protection,
+    cwasm_target_guest_stack_limit_offset, cwasm_target_supports_wasm_simd,
 };
 use std::cell::{Cell, RefCell};
 use std::env;
@@ -14,7 +13,6 @@ use wasmtime::{Config, Engine, ModuleVersionStrategy, OptLevel, StackLimitLocati
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AotCompileHint {
-    Fast,
     Balanced,
     Performance,
 }
@@ -421,22 +419,6 @@ fn compiler_worker_count() -> usize {
         .map_or(1, NonZeroUsize::get)
 }
 
-/// The protection the machine code of a `hint` compile for `target` carries.
-///
-/// Cranelift's code carries what the target's ISA flags ask for, which is
-/// the same at every ISA level. Winch's does not: its aarch64 frame setup is
-/// `stp fp, lr` with no `paci*` or `auti*`
-/// (`winch/codegen/src/isa/aarch64/masm.rs`), so a `Fast` compile is
-/// unprotected even though `sign_return_address` is among its ISA flags.
-fn code_protection(target: &CwasmTarget<'_>, hint: AotCompileHint) -> CwasmCodeProtection {
-    match hint {
-        AotCompileHint::Fast => CwasmCodeProtection::NONE,
-        AotCompileHint::Balanced | AotCompileHint::Performance => {
-            cwasm_target_code_protection(target.triple())
-        }
-    }
-}
-
 /// The engine configuration that decides the machine code a precompile for
 /// `target` under `hint` produces: the target and its ISA flags, the compiler
 /// strategy and optimisation level, the wasm features, and the memory
@@ -461,9 +443,6 @@ pub fn codegen_config(target: &CwasmTarget<'_>, hint: AotCompileHint) -> Result<
         }
     }
     match hint {
-        AotCompileHint::Fast => {
-            config.strategy(Strategy::Winch);
-        }
         AotCompileHint::Balanced => {
             config.strategy(Strategy::Cranelift);
             config.cranelift_opt_level(OptLevel::None);
@@ -476,7 +455,7 @@ pub fn codegen_config(target: &CwasmTarget<'_>, hint: AotCompileHint) -> Result<
     // The version string records the protection the machine code carries,
     // and the kernel engine refuses an artifact whose string differs from
     // the protection it requires.
-    if let Some(version) = code_protection(target, hint)
+    if let Some(version) = cwasm_target_code_protection(triple)
         .module_version(ModuleVersionStrategy::WasmtimeVersion.as_str())
     {
         config
@@ -558,10 +537,9 @@ fn build_engine_config(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        AotCompileHint, CwasmCodeProtection, CwasmTarget, build_engine_config, code_protection,
-        precompile_artifact,
-    };
+    use super::{AotCompileHint, CwasmTarget, build_engine_config, precompile_artifact};
+    #[cfg(target_arch = "x86_64")]
+    use helios_artifact::CwasmCodeProtection;
     use helios_artifact::cwasm_target_isa_levels;
     #[cfg(target_arch = "x86_64")]
     use wasmtime::{Engine, Module, ModuleVersionStrategy};
@@ -610,26 +588,6 @@ mod tests {
                     contains_marker(&artifact.bytes),
                     "{} {hint:?}",
                     target.level().name()
-                );
-            }
-        }
-    }
-
-    /// Winch's aarch64 output does not sign, so a `Fast` compile records
-    /// the protection of unprotected code whatever the target's flags say.
-    #[test]
-    fn a_winch_compile_records_no_protection() {
-        for target in every_level("aarch64-unknown-none") {
-            let level = target.level().name();
-            assert_eq!(
-                code_protection(&target, AotCompileHint::Fast),
-                CwasmCodeProtection::NONE,
-                "{level}"
-            );
-            for hint in [AotCompileHint::Balanced, AotCompileHint::Performance] {
-                assert!(
-                    code_protection(&target, hint).return_addresses_signed,
-                    "{level} {hint:?}"
                 );
             }
         }
