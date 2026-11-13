@@ -1906,6 +1906,13 @@ where
     let instance = state.instance().id();
     let mut store = Store::new(engine.raw(), state);
     store.limiter(|state| state);
+    // The runtime copies guest bytes for streams and futures off any
+    // fiber, so on a machine that can swap every such copy waits until
+    // its pages are present. A machine that cannot swap registers
+    // nothing, and the copies pay a single branch.
+    if let Some(residency) = crate::wasmtime_adapter::residency::SwapResidencyHook::installed() {
+        store.set_guest_memory_residency(residency);
+    }
     // No call hook. A host call that does not suspend changes nothing
     // the kernel accounts: the processor turn, the user-memory owner and
     // the socket retirements all change hands where the fiber does,

@@ -1442,6 +1442,24 @@ mod network {
             Ok(crate::TcpReadProgress::Data(Bytes::from_static(&[4, 2])))
         }
 
+        /// The same reply as [`Self::tcp_read`], as much of it as the
+        /// buffer takes: the peer this models always has it to send.
+        fn tcp_read_into<'a>(
+            &'a self,
+            _: Self::TcpStream,
+            buffer: &'a mut crate::RegisteredTcpReadBuffer<'_>,
+            _: u64,
+        ) -> impl core::future::Future<Output = Result<crate::TcpReadInto, crate::TcpError>> + Send + 'a
+        {
+            let failure = self.drive_error();
+            core::future::ready(match failure {
+                Some(error) => Err(error),
+                None => Ok(crate::TcpReadInto::Data(
+                    helios_netstack::TcpReceiveBuffer::write_from(buffer, &[4, 2]),
+                )),
+            })
+        }
+
         fn tcp_send_room(
             &self,
             _: Self::TcpStream,

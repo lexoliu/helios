@@ -2,7 +2,7 @@
 //!
 //! The kernel is not generic over the address space: there is exactly one
 //! per machine, chosen at link time, and the consumers that need it (the
-//! swap service, [`SwapHandle::ensure_present`](super::SwapHandle), the
+//! swap service, [`GuestResidency`](super::GuestResidency), the
 //! backend's page-fault entry) hold no value of its type. The table is
 //! therefore a `&'static` of plain function items, which puts no vtable on
 //! the fault path, and a backend names its address space once instead of

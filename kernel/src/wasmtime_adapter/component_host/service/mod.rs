@@ -124,7 +124,6 @@ const WASIX_STREAM_SECURITY_CLASSIC_ENCRYPTION: u8 = 1 << 2;
 const WASIX_STREAM_SECURITY_DOUBLE_ENCRYPTION: u8 = 1 << 3;
 const DEFAULT_WASIX_EXEC_SEARCH_PATHS: &[&str] = &["/usr/local/bin", "/bin", "/usr/bin"];
 type Preview1Iovs = SmallVec<[(u32, u32); 8]>;
-type Preview1IovRanges = SmallVec<[(usize, usize); 8]>;
 type CompilerThreadTasks = SmallVec<[crate::JoinHandle<CompilerThreadReport>; 8]>;
 type CompilerThreadReports = SmallVec<[CompilerThreadReport; 8]>;
 type CompilerPluginHandle<CpuImpl, Net, StorageImpl> =
@@ -2268,19 +2267,24 @@ where
                 0
             },
         };
-        let memory = store.data().memory();
-        let written = write_shared_memory(memory, GuestAddress::wasm32(wasm_ptr), wasm)
-            .and_then(|()| write_shared_memory(memory, GuestAddress::wasm32(target_ptr), target))
-            .and_then(|()| {
-                write_shared_memory(memory, GuestAddress::wasm32(isa_level_ptr), isa_level)
-            })
-            .and_then(|()| {
-                write_shared_memory(
-                    memory,
-                    GuestAddress::wasm32(request_ptr),
-                    &header.to_bytes(),
-                )
-            });
+        // The instance is off every processor between its calls, so the
+        // request is written during one of its turns (`in_guest_turn`).
+        let memory = Preview1AsyncMemory::of_shared(store.data().memory());
+        let written = in_guest_turn(store.data().guest_turns(), async {
+            memory
+                .write_bytes(GuestAddress::wasm32(wasm_ptr), wasm)
+                .await?;
+            memory
+                .write_bytes(GuestAddress::wasm32(target_ptr), target)
+                .await?;
+            memory
+                .write_bytes(GuestAddress::wasm32(isa_level_ptr), isa_level)
+                .await?;
+            memory
+                .write_bytes(GuestAddress::wasm32(request_ptr), &header.to_bytes())
+                .await
+        })
+        .await;
         if let Err(error) = written {
             return Ok(Err(error));
         }
@@ -2307,13 +2311,10 @@ where
             0
         };
         let response_ptr = response_ptr.map_err(map_program_runtime_error)? as u32;
-        Ok(accept_compiler_response(
-            store.data(),
-            allocations,
-            response_ptr,
-            profile,
-            phases,
-        ))
+        Ok(
+            accept_compiler_response(store.data(), allocations, response_ptr, profile, phases)
+                .await,
+        )
     }
 
     fn read_compiler_plugin_artifact(
@@ -3774,11 +3775,6 @@ mod tests {
                 preview1_read_memory_into(memory, field, &mut bytes).is_err(),
                 "{family}: read at u32::MAX - 2 + {offset} must fail",
             );
-            assert_eq!(
-                preview1_read_u32(memory, field).map_err(|error| error.detail),
-                Err(ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds),
-                "{family}: u32 read must be out of bounds",
-            );
         }
         assert!(
             guest.iter().all(|byte| *byte == 0xAA),
@@ -3789,12 +3785,16 @@ mod tests {
     #[test]
     fn guest_iovec_array_beyond_guest_space_faults() {
         let guest = [0_u8; 16];
-        let memory = Preview1Memory {
+        let memory = Preview1AsyncMemory::new(Preview1Memory {
             base: guest.as_ptr() as usize,
             len: guest.len(),
+        });
+        let layout = Preview1IovLayout {
+            iovs: SmallVec::from_slice(&[(u32::MAX - 2, 4)]),
+            byte_len: 4,
         };
         assert_eq!(
-            p1_iovs_memory_ranges(memory, &[(u32::MAX - 2, 4)]).err(),
+            Preview1Gather::new(&memory, &layout).err(),
             Some(p1::errno::FAULT),
         );
     }

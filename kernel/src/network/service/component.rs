@@ -480,9 +480,9 @@ where
     async fn tcp_read_into<'a>(
         &'a self,
         stream: Self::TcpStream,
-        buffer: RegisteredTcpReadBuffer<'a>,
+        buffer: &'a mut RegisteredTcpReadBuffer<'_>,
         timeout_nanos: u64,
-    ) -> Result<Option<usize>, TcpError> {
+    ) -> Result<crate::TcpReadInto, TcpError> {
         NetworkService::tcp_read_into(self, stream, buffer, timeout_nanos).await
     }
 

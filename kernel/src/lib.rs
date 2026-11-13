@@ -188,8 +188,8 @@ pub use memory::{
     NoCryptographicEntropy, NoEntropyDevice, NodeLocalArena, NodeMemory, NodeRun, PerProcessor,
     ROOT_ENTROPY_MATERIAL_BYTES, RegionShares, ReleasedReservation, ReservationLookup,
     ReservationTracker, RootEntropy, RootEntropyHandle, SWAP_BATCH_BYTES, SWAP_TICK, StackFault,
-    SwapDisabled, SwapEntry, SwapFaultError, SwapHandle, SwapLeafFormat, SwapSpace, SwapStats,
-    SwapVmHooks, TASK_ARENA_FRACTION, TASK_ARENA_MIN_BYTES, USER_POOL_MIN_REGION_BYTES,
+    SwapDisabled, SwapEntry, SwapFaultError, SwapFaultIn, SwapHandle, SwapLeafFormat, SwapSpace,
+    SwapStats, SwapVmHooks, TASK_ARENA_FRACTION, TASK_ARENA_MIN_BYTES, USER_POOL_MIN_REGION_BYTES,
     UserHeapStats, UserMemoryOwnerScope, UserMemoryOwners, UserMemoryPool, VaCursor,
     allocate_user_frame_uninit_on, allocate_user_frame_uninit_on_node, allocate_user_frame_zeroed,
     allocate_user_frame_zeroed_on, allocate_user_run_zeroed_on, claim_fiber_stack,
@@ -241,8 +241,8 @@ pub use runtime::{
     HostFilledWrite, HostFsError, HostFsErrorKind, HostMetadata, HostShareRestore, HostWrite,
     Ipv4Address, NetworkErrorDetail, NetworkHandle, NetworkIpAddress, NetworkPacketPump,
     ObjectIdentity, PingError, PingErrorKind, PingReply, RegisteredTcpReadBuffer, RuntimeState,
-    SocketReadiness, TcpAccepted, TcpError, TcpErrorKind, TcpListener, TcpReadProgress,
-    TcpWriteProgress, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
+    SocketReadiness, TcpAccepted, TcpError, TcpErrorKind, TcpListener, TcpReadInto,
+    TcpReadProgress, TcpWriteProgress, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
 };
 pub use signing_key::{
     CwasmSigningKey, PAYLOAD_REGISTER, ProvisionCause, SeedSource, SettledSigningKey,
