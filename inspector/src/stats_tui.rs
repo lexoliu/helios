@@ -1189,6 +1189,8 @@ mod tests {
                 configured: 0,
                 online: 0,
                 utilization: Vec::new(),
+                guest_isa_level: String::new(),
+                guest_isa_extras: Vec::new(),
             },
             memory: stats::Memory {
                 total_bytes: 0,
