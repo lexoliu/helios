@@ -383,4 +383,4 @@ fn log_scratch_disk<Device: BlockDevice>(scratch: &ScratchDisk<Device>) {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

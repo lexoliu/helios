@@ -97,13 +97,13 @@ fn compositor_authority() -> ProcessAuthority {
 /// service is installed. Reading the artifact here rather than on first
 /// use is what lets an image without the plugin answer `unavailable`
 /// immediately instead of discovering the absence mid-request.
-pub(super) fn install_compositor_plugin<CpuImpl, Net, HostFs>(
-    service: &UserProgramService<CpuImpl, Net, HostFs>,
-    exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
+pub(super) fn install_compositor_plugin<CpuImpl, Net, StorageImpl>(
+    service: &UserProgramService<CpuImpl, Net, StorageImpl>,
+    exec_context: ProgramExecContext<CpuImpl, Net, StorageImpl>,
 ) where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let Some(artifact) = read_bootfs_artifact(&exec_context.runtime_state, COMPOSITOR_PLUGIN_PATH)
     else {
@@ -167,15 +167,15 @@ fn desktop_refusal(runtime_state: &impl ComponentRuntimeState) -> Option<Desktop
 
 /// Own the desktop for the lifetime of the kernel, rebuilding it when it
 /// dies.
-async fn run_compositor_supervisor<CpuImpl, Net, HostFs>(
-    service: UserProgramService<CpuImpl, Net, HostFs>,
-    exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
+async fn run_compositor_supervisor<CpuImpl, Net, StorageImpl>(
+    service: UserProgramService<CpuImpl, Net, StorageImpl>,
+    exec_context: ProgramExecContext<CpuImpl, Net, StorageImpl>,
     artifact: BootfsBytes,
     receiver: ProviderReceiver<SurfaceRequest>,
 ) where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let registry = exec_context.runtime_state.surface_service();
     let timer = exec_context.timer.clone();
@@ -215,16 +215,16 @@ async fn run_compositor_supervisor<CpuImpl, Net, HostFs>(
 
 /// Build one compositor instance and serve the desktop with it until it
 /// dies.
-async fn run_compositor_once<CpuImpl, Net, HostFs>(
-    service: &UserProgramService<CpuImpl, Net, HostFs>,
-    exec_context: &ProgramExecContext<CpuImpl, Net, HostFs>,
+async fn run_compositor_once<CpuImpl, Net, StorageImpl>(
+    service: &UserProgramService<CpuImpl, Net, StorageImpl>,
+    exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
     artifact: &BootfsBytes,
     receiver: &ProviderReceiver<SurfaceRequest>,
 ) -> Result<(), ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let started_at = exec_context
         .runtime_state
@@ -247,7 +247,7 @@ where
 
     let (mut store, interrupts) = crate::wasmtime_adapter::store_with_state(
         &service.inner.engine,
-        StoreData::<CpuImpl, Net, HostFs>::new(
+        StoreData::<CpuImpl, Net, StorageImpl>::new(
             ResourceTable::new(),
             exec_context.cpu.clone(),
             exec_context.timer.clone(),
@@ -319,8 +319,8 @@ where
 }
 
 /// Serve one surface call against the live compositor.
-async fn serve_request<CpuImpl, Net, HostFs>(
-    accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>,
+async fn serve_request<CpuImpl, Net, StorageImpl>(
+    accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
     guest: &exports::helios::system::compositor::Guest,
     registry: &SurfaceService,
     request: SurfaceRequest,
@@ -328,7 +328,7 @@ async fn serve_request<CpuImpl, Net, HostFs>(
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     match request {
         SurfaceRequest::Create(create) => serve_create(accessor, guest, registry, create).await,
@@ -358,8 +358,8 @@ where
 /// the buffer is shown; the interface promises it no `commit` for the
 /// window before the buffer is there, and this task serves the commit
 /// queue, so none is served in between.
-async fn serve_create<CpuImpl, Net, HostFs>(
-    accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>,
+async fn serve_create<CpuImpl, Net, StorageImpl>(
+    accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
     guest: &exports::helios::system::compositor::Guest,
     registry: &SurfaceService,
     create: SurfaceCreate,
@@ -367,7 +367,7 @@ async fn serve_create<CpuImpl, Net, HostFs>(
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let SurfaceCreate {
         id,
@@ -454,15 +454,15 @@ where
 /// The view goes first: the interface promises the compositor its span
 /// is ordinary zeroed memory again before `destroy` is called, and the
 /// buffer goes back to the client's pool with the view's reference.
-async fn destroy_surface<CpuImpl, Net, HostFs>(
-    accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>,
+async fn destroy_surface<CpuImpl, Net, StorageImpl>(
+    accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
     guest: &exports::helios::system::compositor::Guest,
     id: SurfaceId,
 ) -> wasmtime::Result<()>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     accessor
         .with(|mut access| {
@@ -494,27 +494,29 @@ const fn from_guest_error(
 
 /// The store's type parameters, carried by a task that names them
 /// without holding a value of any of them.
-type StoreTypeMarker<CpuImpl, Net, HostFs> =
-    core::marker::PhantomData<fn() -> (CpuImpl, Net, HostFs)>;
+type StoreTypeMarker<CpuImpl, Net, StorageImpl> =
+    core::marker::PhantomData<fn() -> (CpuImpl, Net, StorageImpl)>;
 
 /// The desktop itself: one `helios:system/compositor.run` that lasts as
 /// long as the instance does.
-struct RunDesktop<CpuImpl, Net, HostFs> {
+struct RunDesktop<CpuImpl, Net, StorageImpl> {
     guest: exports::helios::system::compositor::Guest,
-    _marker: StoreTypeMarker<CpuImpl, Net, HostFs>,
+    _marker: StoreTypeMarker<CpuImpl, Net, StorageImpl>,
 }
 
-impl<CpuImpl, Net, HostFs>
-    AccessorTask<StoreData<CpuImpl, Net, HostFs>, HasSelf<StoreData<CpuImpl, Net, HostFs>>>
-    for RunDesktop<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl>
+    AccessorTask<
+        StoreData<CpuImpl, Net, StorageImpl>,
+        HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
+    > for RunDesktop<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     async fn run(
         self,
-        accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>,
+        accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
     ) -> wasmtime::Result<()> {
         let outcome = self.guest.call_run(accessor).await?;
         // A compositor that returned is a desktop that stopped, whatever
@@ -533,23 +535,25 @@ where
 /// The drain that takes back every window a client let go: the windows
 /// of a client that died, a window a client dropped, and a window whose
 /// `create` its client stopped waiting for.
-struct DrainReturnedSurfaces<CpuImpl, Net, HostFs> {
+struct DrainReturnedSurfaces<CpuImpl, Net, StorageImpl> {
     guest: exports::helios::system::compositor::Guest,
     registry: SurfaceService,
-    _marker: StoreTypeMarker<CpuImpl, Net, HostFs>,
+    _marker: StoreTypeMarker<CpuImpl, Net, StorageImpl>,
 }
 
-impl<CpuImpl, Net, HostFs>
-    AccessorTask<StoreData<CpuImpl, Net, HostFs>, HasSelf<StoreData<CpuImpl, Net, HostFs>>>
-    for DrainReturnedSurfaces<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl>
+    AccessorTask<
+        StoreData<CpuImpl, Net, StorageImpl>,
+        HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
+    > for DrainReturnedSurfaces<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     async fn run(
         self,
-        accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>,
+        accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
     ) -> wasmtime::Result<()> {
         let registry = self.registry;
         // Armed before the first look, and re-armed as part of every

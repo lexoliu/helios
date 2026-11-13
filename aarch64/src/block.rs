@@ -21,7 +21,7 @@ use helios_kernel::ExternalInterruptHandler;
 use crate::Aarch64Cpu;
 use crate::debug_state::RuntimeState;
 
-type Aarch64VirtioBlockDevice = helios_virtio::VirtioBlockResource<
+pub(crate) type Aarch64VirtioBlockDevice = helios_virtio::VirtioBlockResource<
     helios_virtio::VirtioMmioTransport<helios_virtio::MmioBus<helios_virtio::OffsetDmaPool>>,
     Aarch64Cpu,
     helios_kernel::BlockPages,
@@ -75,14 +75,15 @@ where
     let spawner = kernel.spawner();
     let timer = kernel.timer();
     let swap_cpu = *cpu;
-    // Nothing mounts a disk yet, so the mount sources' cache is held by
-    // its reclaim task alone.
     helios_kernel::install_block_devices(
         kernel,
         root,
         devices,
-        move |service, scratch, _mount_sources| {
+        move |service, scratch, mount_sources| {
             state.install_block_service(service);
+            if let Some(cache) = mount_sources {
+                state.install_mount_sources(cache);
+            }
             if let Some(swap) = helios_kernel::install_scratch_swap(
                 state.instance_registry(),
                 scratch,

@@ -132,8 +132,8 @@ pub use gpu::{
 pub use helios_hal::Platform;
 pub use helios_netstack::{
     ChecksumOffload, DEFAULT_POLL_BUDGET, EventDeliveryCapabilities, InterfaceCapabilities,
-    InterfaceEventMark, LinkState, NetworkInterface as NetworkDevice, PacketBuffer, RxDrain,
-    RxFrame, RxFrameOffload, SegmentationOffload, TxFrameRef,
+    InterfaceEventMark, LinkState, NetworkInterface as NetworkDevice, RxDrain, RxFrame,
+    RxFrameOffload, SegmentationOffload, TxFrameRef,
 };
 pub use host_fs::{
     FilledHostFsWrite, HOST_SHARE_GUEST_MOUNT_PATH, HOST_SHARE_MOUNT_TAG, HostFsCacheStats,
@@ -252,10 +252,11 @@ pub use surface::{
     SurfaceServiceError, SurfaceShared,
 };
 pub use vfs::{
-    BOOT_DEVICE, FileContents, Follow, HeldPath, HostShare, HostShareWrite, MAX_MOUNTS,
-    MAX_SYMLINK_DEPTH, MemoryFs, MemoryWrite, MountError, MountHold, MountRequestError,
-    MountSource, MountTable, MountedFs, MountedWrite, Namespace, ROOT_LAYER_DEVICE, Resolved,
-    RootFs, RootWrite, object_identity, request_mount, request_unmount, symlink_target,
+    AttachedStorage, BOOT_DEVICE, DiskImage, ErofsError, ErofsFs, FileContents, Follow, HeldPath,
+    HostShare, HostShareWrite, MAX_MOUNTS, MAX_SYMLINK_DEPTH, MemoryFs, MemoryWrite, MountError,
+    MountHold, MountRequestError, MountSource, MountTable, MountedFs, MountedWrite, Namespace,
+    NoDisks, ROOT_LAYER_DEVICE, ReaderError, Resolved, RootFs, RootWrite, Storage,
+    UnsupportedStorage, object_identity, request_mount, request_unmount, symlink_target,
     within_directory,
 };
 pub use vsock::{

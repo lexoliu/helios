@@ -42,6 +42,11 @@ bytes = { version = "1.12.1", default-features = false }
 concurrent-queue = { version = "2.5.0", default-features = false }
 crossbeam-utils.workspace = true
 critical-section = "1.2.0"
+crc = { version = "3.4.0", default-features = false }
+# The reader of upstream `erofs-rs` imports `rustix`, which does not build
+# for `target_os = "none"`; the fork's reader does not, and it publishes
+# the path lookup and resumable listings the mount kind is built on.
+erofs-rs = { git = "https://github.com/lexoliu/erofs-rs", branch = "no-std-bare-metal", default-features = false, features = ["deflate", "lz4"] }
 event-listener = { version = "5.4.1", default-features = false, features = ["critical-section"] }
 futures = { version = "0.3.31", default-features = false, features = ["alloc"] }
 hashbrown = { version = "0.16.1", default-features = false, features = ["allocator-api2", "default-hasher", "equivalent", "inline-more"] }
@@ -80,6 +85,10 @@ zrip = { git = "https://github.com/lexoliu/zrip", branch = "compress-context-all
 
 [dev-dependencies]
 critical-section = { version = "1.2.0", features = ["std"] }
+# The image builder writes the EROFS fixtures that run on every host;
+# `mkfs.erofs` writes the ones CI runs (see `vfs/erofs/tests.rs`).
+erofs-rs = { git = "https://github.com/lexoliu/erofs-rs", branch = "no-std-bare-metal", default-features = false, features = ["deflate", "lz4", "std"] }
+tempfile.workspace = true
 # The console-gate tests drive the real `KernelConsoleSubscriber` through
 # `tracing::subscriber::with_default`, which is a std-only dispatcher.
 tracing = { workspace = true, features = ["std"] }

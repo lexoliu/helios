@@ -30,16 +30,20 @@ mod debug_state {
     /// The network service this machine's virtio-net function backs.
     pub(crate) type NetworkService =
         helios_kernel::NetworkService<crate::X86Cpu, crate::net::VirtioNetworkDevice>;
-    pub(crate) type RuntimeState = helios_kernel::HostRuntimeState<
-        crate::X86Cpu,
-        NetworkService,
-        crate::host_fs::HostFileSystemService,
-    >;
-    pub(crate) type ProgramService = helios_kernel::UserProgramService<
-        crate::X86Cpu,
-        NetworkService,
-        crate::host_fs::HostFileSystemService,
-    >;
+    pub(crate) type RuntimeState =
+        helios_kernel::HostRuntimeState<crate::X86Cpu, NetworkService, Storage>;
+    pub(crate) type ProgramService =
+        helios_kernel::UserProgramService<crate::X86Cpu, NetworkService, Storage>;
+
+    /// This machine's storage: the virtio-9p host share and the
+    /// virtio-blk disks.
+    #[derive(Clone, Copy)]
+    pub(crate) struct Storage;
+
+    impl helios_kernel::Storage for Storage {
+        type HostShare = crate::host_fs::HostFileSystemService;
+        type Disk = crate::block::X86VirtioBlockDevice;
+    }
 }
 
 use alloc::sync::Arc;

@@ -202,7 +202,7 @@ jobs:
           sudo rm -f /etc/apt/sources.list.d/google-chrome*
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libudev-dev just cmake ninja-build
+            libudev-dev just cmake ninja-build erofs-utils
       - uses: taiki-e/install-action@v2
         with:
           tool: wasm-tools,cargo-deny,nextest
@@ -261,7 +261,7 @@ jobs:
           sudo rm -f /etc/apt/sources.list.d/google-chrome*
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libudev-dev just cmake ninja-build \
+            libudev-dev just cmake ninja-build erofs-utils \
             qemu-system-misc opensbi
           qemu-system-riscv64 --version
       - uses: taiki-e/install-action@v2
@@ -387,6 +387,48 @@ jobs:
           cat coreutils-smoke.out
           grep -Fqx coreutils:ok coreutils-smoke.out
           grep -Fqx bin coreutils-smoke.out
+      - name: Mount an EROFS disk from init
+        timeout-minutes: 5
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          set -o pipefail
+          # A read-only disk with a serial other than the scratch disk's
+          # is a mount source. The session runs init, which mounts it from
+          # /etc/fstab; mounts belong to a process tree, so the reads run
+          # from /etc/rc, under init (#511).
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/erofs"
+          mkdir -p "$runtime/tree/docs" "$runtime/bootfs/etc" "$runtime/bootfs/image"
+          printf 'erofs:ok\n' > "$runtime/tree/hello.txt"
+          printf '中文\n' > "$runtime/tree/docs/中文.txt"
+          printf '日本語\n' > "$runtime/tree/docs/日本語.txt"
+          printf '한국어\n' > "$runtime/tree/docs/한국어.txt"
+          mkfs.erofs -zlz4 "$runtime/image.erofs" "$runtime/tree"
+          printf 'helios init: erofs smoke\n' > "$runtime/bootfs/init.txt"
+          printf 'disk:erofs-smoke /image ro\n' > "$runtime/bootfs/etc/fstab"
+          printf 'cat /image/hello.txt\nls /image/docs\n' > "$runtime/bootfs/etc/rc"
+          ./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
+            --accel tcg \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --bootfs-root "$runtime/bootfs" \
+            --disk "$runtime/image.erofs,serial=erofs-smoke,readonly" \
+            --boot-program dash --boot-program debugger \
+            --boot-program ls --boot-program cat --boot-program init \
+            --no-compiler-plugin \
+            shell -c init 2>&1 > erofs-smoke.out | tee "$runtime/inspector.log"
+          cat erofs-smoke.out
+          grep -Fqx 'helios init: mounted disk:erofs-smoke at /image' erofs-smoke.out
+          grep -Fqx 'helios init: listing /image' erofs-smoke.out
+          grep -Fqx 'dir docs' erofs-smoke.out
+          grep -Fqx 'file hello.txt' erofs-smoke.out
+          # The rest is /etc/rc: cat and ls, children of init, reading
+          # through the mount.
+          grep -Fqx 'erofs:ok' erofs-smoke.out
+          grep -Fqx '中文.txt' erofs-smoke.out
+          grep -Fqx '日本語.txt' erofs-smoke.out
+          grep -Fqx '한국어.txt' erofs-smoke.out
       - name: Run CPython
         timeout-minutes: 5
         shell: bash
@@ -599,7 +641,7 @@ jobs:
           sudo rm -f /etc/apt/sources.list.d/google-chrome*
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libudev-dev just cmake ninja-build \
+            libudev-dev just cmake ninja-build erofs-utils \
             python3-venv pkg-config flex bison \
             libglib2.0-dev libpixman-1-dev libslirp-dev libfdt-dev zlib1g-dev \
             swtpm
@@ -744,6 +786,50 @@ jobs:
           # rather than something that quietly starts or stops being
           # true.
           ! grep -qF 'device grant published' "$runtime/inspector.log"
+      - name: Mount an EROFS disk from init
+        timeout-minutes: 5
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+          HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          set -o pipefail
+          # A read-only disk with a serial other than the scratch disk's
+          # is a mount source. The session runs init, which mounts it from
+          # /etc/fstab; mounts belong to a process tree, so the reads run
+          # from /etc/rc, under init (#511).
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/erofs"
+          mkdir -p "$runtime/tree/docs" "$runtime/bootfs/etc" "$runtime/bootfs/image"
+          printf 'erofs:ok\n' > "$runtime/tree/hello.txt"
+          printf '中文\n' > "$runtime/tree/docs/中文.txt"
+          printf '日本語\n' > "$runtime/tree/docs/日本語.txt"
+          printf '한국어\n' > "$runtime/tree/docs/한국어.txt"
+          mkfs.erofs -zlz4 "$runtime/image.erofs" "$runtime/tree"
+          printf 'helios init: erofs smoke\n' > "$runtime/bootfs/init.txt"
+          printf 'disk:erofs-smoke /image ro\n' > "$runtime/bootfs/etc/fstab"
+          printf 'cat /image/hello.txt\nls /image/docs\n' > "$runtime/bootfs/etc/rc"
+          ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G \
+            --accel tcg \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --bootfs-root "$runtime/bootfs" \
+            --disk "$runtime/image.erofs,serial=erofs-smoke,readonly" \
+            --boot-program dash --boot-program debugger \
+            --boot-program ls --boot-program cat --boot-program init \
+            --no-compiler-plugin \
+            shell -c init 2>&1 > erofs-smoke.out | tee "$runtime/inspector.log"
+          cat erofs-smoke.out
+          grep -Fqx 'helios init: mounted disk:erofs-smoke at /image' erofs-smoke.out
+          grep -Fqx 'helios init: listing /image' erofs-smoke.out
+          grep -Fqx 'dir docs' erofs-smoke.out
+          grep -Fqx 'file hello.txt' erofs-smoke.out
+          # The rest is /etc/rc: cat and ls, children of init, reading
+          # through the mount.
+          grep -Fqx 'erofs:ok' erofs-smoke.out
+          grep -Fqx '中文.txt' erofs-smoke.out
+          grep -Fqx '日本語.txt' erofs-smoke.out
+          grep -Fqx '한국어.txt' erofs-smoke.out
       - name: Take a wasm trap on aarch64
         timeout-minutes: 10
         shell: bash
@@ -1008,7 +1094,7 @@ jobs:
           sudo rm -f /etc/apt/sources.list.d/google-chrome*
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libudev-dev just cmake ninja-build \
+            libudev-dev just cmake ninja-build erofs-utils \
             qemu-system-x86 ovmf swtpm
           qemu-system-x86_64 --version
           swtpm --version
@@ -1232,6 +1318,46 @@ jobs:
           cat coreutils-smoke.out
           grep -Fqx coreutils:ok coreutils-smoke.out
           grep -Fqx bin coreutils-smoke.out
+      - name: Mount an EROFS disk from init
+        timeout-minutes: 5
+        shell: bash
+        working-directory: helios
+        run: |
+          set -o pipefail
+          # A read-only disk with a serial other than the scratch disk's
+          # is a mount source. The session runs init, which mounts it from
+          # /etc/fstab; mounts belong to a process tree, so the reads run
+          # from /etc/rc, under init (#511).
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/erofs"
+          mkdir -p "$runtime/tree/docs" "$runtime/bootfs/etc" "$runtime/bootfs/image"
+          printf 'erofs:ok\n' > "$runtime/tree/hello.txt"
+          printf '中文\n' > "$runtime/tree/docs/中文.txt"
+          printf '日本語\n' > "$runtime/tree/docs/日本語.txt"
+          printf '한국어\n' > "$runtime/tree/docs/한국어.txt"
+          mkfs.erofs -zlz4 "$runtime/image.erofs" "$runtime/tree"
+          printf 'helios init: erofs smoke\n' > "$runtime/bootfs/init.txt"
+          printf 'disk:erofs-smoke /image ro\n' > "$runtime/bootfs/etc/fstab"
+          printf 'cat /image/hello.txt\nls /image/docs\n' > "$runtime/bootfs/etc/rc"
+          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            --accel kvm \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --bootfs-root "$runtime/bootfs" \
+            --disk "$runtime/image.erofs,serial=erofs-smoke,readonly" \
+            --boot-program dash --boot-program debugger \
+            --boot-program ls --boot-program cat --boot-program init \
+            --no-compiler-plugin \
+            shell -c init 2>&1 > erofs-smoke.out | tee "$runtime/inspector.log"
+          cat erofs-smoke.out
+          grep -Fqx 'helios init: mounted disk:erofs-smoke at /image' erofs-smoke.out
+          grep -Fqx 'helios init: listing /image' erofs-smoke.out
+          grep -Fqx 'dir docs' erofs-smoke.out
+          grep -Fqx 'file hello.txt' erofs-smoke.out
+          # The rest is /etc/rc: cat and ls, children of init, reading
+          # through the mount.
+          grep -Fqx 'erofs:ok' erofs-smoke.out
+          grep -Fqx '中文.txt' erofs-smoke.out
+          grep -Fqx '日本語.txt' erofs-smoke.out
+          grep -Fqx '한국어.txt' erofs-smoke.out
       - name: Run CPython twice and record its launch phases
         timeout-minutes: 5
         shell: bash

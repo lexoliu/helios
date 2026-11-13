@@ -5,7 +5,7 @@ use helios_hal::io::IoError;
 use helios_hal::watchdog::Watchdog;
 use helios_kernel::{
     ExternalInterruptHandler, InterfaceCapabilities, InterfaceEventMark, Kernel, LinkState,
-    NetworkDevice, PacketBuffer,
+    NetworkDevice,
 };
 use triomphe::Arc;
 
@@ -98,47 +98,17 @@ impl NetworkDevice for VirtioNetworkDevice {
         self.inner.link_state()
     }
 
-    async fn try_receive(&self, buffer: &mut PacketBuffer) -> Result<bool, IoError> {
-        buffer.clear();
-        let Some(frame_len) = self
-            .inner
-            .try_receive_into(buffer.spare_capacity_mut())
-            .await?
-        else {
-            return Ok(false);
-        };
-        buffer.set_len(frame_len);
-        Ok(true)
-    }
-
-    async fn try_receive_frame(&self) -> Result<Option<helios_virtio::RxFrame>, IoError> {
-        self.inner.try_receive_frame().await
-    }
-
-    async fn repost_rx_frame(&self, frame: helios_virtio::RxFrame) -> Result<(), IoError> {
-        self.inner.repost_rx_frame(frame).await
-    }
-
-    fn repost_rx_frames_immediate<'a, 'slots>(
-        &'a self,
-        frames: &'slots mut [Option<helios_virtio::RxFrame>],
-    ) -> Result<Option<()>, IoError>
-    where
-        'a: 'slots,
-    {
-        self.inner.repost_rx_frames_immediate(frames)
-    }
-
-    fn try_receive_frames_immediate_on<'a, 'slots>(
-        &'a self,
+    fn try_receive_frames_immediate_on<Sink>(
+        &self,
         queue_idx: usize,
-        frames: &'slots mut [Option<helios_virtio::RxFrame>],
+        budget: usize,
+        sink: Sink,
     ) -> Option<helios_virtio::RxDrain>
     where
-        'a: 'slots,
+        Sink: FnMut(&helios_virtio::RxFrame),
     {
         self.inner
-            .try_receive_frames_immediate_on_pair(queue_idx, frames)
+            .try_receive_frames_immediate_on_pair(queue_idx, budget, sink)
     }
 
     fn try_transmit_scatter_immediate_on(

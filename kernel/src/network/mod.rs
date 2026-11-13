@@ -70,17 +70,17 @@ where
     /// Publishing the service is what releases them: each pump is
     /// pinned to the processor that owns its pair and was already
     /// parked on this install completing.
-    pub fn install_network_interface<ProgramService, HostFsService, DeviceImpl>(
+    pub fn install_network_interface<ProgramService, StorageImpl, DeviceImpl>(
         &self,
         runtime_state: &crate::RuntimeState<
             ProgramService,
             NetworkService<CpuImpl, DeviceImpl>,
-            HostFsService,
+            StorageImpl,
         >,
         device: DeviceImpl,
     ) where
         ProgramService: Clone + Send + Sync + 'static,
-        HostFsService: Clone + Send + Sync + 'static,
+        StorageImpl: crate::Storage,
         DeviceImpl: crate::NetworkDevice,
     {
         let service = NetworkService::new(
