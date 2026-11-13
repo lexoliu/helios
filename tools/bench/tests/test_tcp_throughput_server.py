@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import socket
 
+import pytest
+
 from helios_bench import WASI_APPS_ROOT
 from helios_bench.wasi_apps import gap_bench
 
@@ -45,10 +47,56 @@ def test_download_handler_streams_the_payload_without_reading_or_waiting() -> No
     request = RefusingRequest()
     handler = module.TcpDownloadHandler.__new__(module.TcpDownloadHandler)
     handler.request = request
-    handler.server = type("Server", (), {"payload_bytes": PAYLOAD_BYTES})()
+    handler.server = type("Server", (), {"payload_bytes": PAYLOAD_BYTES, "progress": None})()
     handler.handle()
     assert len(request.sent) == PAYLOAD_BYTES
     assert bytes(request.sent[: module.DEFAULT_CHUNK_BYTES]) == module.PAYLOAD_CHUNK
+
+
+def test_download_progress_marks_the_transfer_begun_and_then_ended(tmp_path) -> None:
+    module = server_module()
+    request = RefusingRequest()
+    handler = module.TcpDownloadHandler.__new__(module.TcpDownloadHandler)
+    handler.request = request
+    begun_bytes = 2 * module.DEFAULT_CHUNK_BYTES
+    handler.server = type(
+        "Server",
+        (),
+        {
+            "payload_bytes": PAYLOAD_BYTES,
+            "progress": module.TransferProgress(tmp_path, begun_bytes),
+        },
+    )()
+    handler.handle()
+    assert (tmp_path / module.BEGUN_MARKER).read_text() == f"{begun_bytes}\n"
+    assert (tmp_path / module.ENDED_MARKER).read_text() == f"{PAYLOAD_BYTES}\n"
+    assert sorted(path.name for path in tmp_path.iterdir()) == [
+        module.BEGUN_MARKER,
+        module.ENDED_MARKER,
+    ]
+
+
+def test_a_download_cut_short_marks_it_ended_but_never_begun(tmp_path) -> None:
+    module = server_module()
+
+    class ResettingRequest(RefusingRequest):
+        def sendall(self, data: bytes) -> None:
+            raise ConnectionResetError("the guest went away")
+
+    handler = module.TcpDownloadHandler.__new__(module.TcpDownloadHandler)
+    handler.request = ResettingRequest()
+    handler.server = type(
+        "Server",
+        (),
+        {
+            "payload_bytes": PAYLOAD_BYTES,
+            "progress": module.TransferProgress(tmp_path, module.DEFAULT_CHUNK_BYTES),
+        },
+    )()
+    with pytest.raises(ConnectionResetError):
+        handler.handle()
+    assert not (tmp_path / module.BEGUN_MARKER).exists()
+    assert (tmp_path / module.ENDED_MARKER).read_text() == "0\n"
 
 
 def test_download_server_sends_to_a_client_that_never_writes() -> None:

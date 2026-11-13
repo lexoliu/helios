@@ -1765,7 +1765,10 @@ where
         kind: ProgramExecErrorKind::Internal,
         detail: ProgramExecErrorDetail::ChildExitAlreadyConsumed,
     })?;
-    store.data_mut().insert_child(pid, child_signal_state, exit);
+    store
+        .data_mut()
+        .children
+        .insert(pid, child_signal_state, exit);
     Ok(pid)
 }
 
