@@ -10,11 +10,17 @@
 //! # Concurrency contract
 //!
 //! One requester, the *freezer*, runs [`Executor::freeze`] on its
-//! processor. Every other processor is a *secondary*. The freezer never
-//! waits on a lock of the barrier's: it publishes a word, wakes the
-//! secondaries and awaits their arrival, and a secondary parks on the
-//! word. (What the caller's `interrupt_guests` does is its own contract;
-//! the runtime's takes no lock.)
+//! processor. Every other processor in the online set
+//! ([`OnlineSet`]) is a *secondary*; a processor outside it is stopped
+//! or has never run, polls nothing, and is neither woken nor waited
+//! for. The freezer never waits on a lock of the barrier's: it publishes
+//! a word, wakes the secondaries and awaits their arrival, and a
+//! secondary parks on the word. The one lock it takes is the processor
+//! lifecycle's transition lock (`lifecycle`'s module docs), awaited
+//! before it holds anything and kept until the thaw is done, so that no
+//! offline or online runs while the barrier counts the online set or
+//! holds it. (What the caller's `interrupt_guests` does is its own
+//! contract; the runtime's takes no lock.)
 //!
 //! State, each word with one writer:
 //!
@@ -36,8 +42,10 @@
 //!
 //! The freezer:
 //!
-//! 1. takes `phase` from `Running` to `Freezing`, publishes `freezer`,
-//!    then `hold` (`Release`);
+//! 1. takes `phase` from `Running` to `Freezing`, awaits the transition
+//!    lock (a future dropped while it waits returns `phase` to
+//!    `Running`), publishes `freezer`, then `hold` (`SeqCst`, for the
+//!    join handshake below);
 //! 2. asks the guests that are running to stop, which ends each at its
 //!    next function entry or loop header and returns it to the executor
 //!    (the caller supplies that, because the scheduler knows nothing of
@@ -50,7 +58,8 @@
 //!    processor that is polling has not published `Parked` and a wake it
 //!    is owed would otherwise be skipped;
 //! 4. awaits, with the wait armed before each test of the arrival words,
-//!    until every secondary's word equals `hold`, or until the arrival
+//!    until the word of every processor in the online set but its own
+//!    equals `hold`, or until the arrival
 //!    deadline the caller gave passes. The freeze does not decide how
 //!    long a processor may take: a wall-clock bound cannot tell a
 //!    descheduled virtual processor from a task that does not yield, and
@@ -109,8 +118,23 @@
 //! order: `phase` to `Thawing`, `hold` to its released value, a wake to
 //! every secondary, and then a wait, a hardware-synchronisation spin
 //! bounded by IPI latency, until no secondary's arrival word still equals
-//! the held value, so that each has left its park. Last, `phase` returns
-//! to `Running` and the freezer's own mask is lifted.
+//! the held value, so that each has left its park. Then `phase` returns
+//! to `Running`, the transition lock is released, and last the
+//! freezer's own mask is lifted.
+//!
+//! # Joining the online set
+//!
+//! Under the transition lock the online set changes only by a
+//! processor's first bring-up at boot, which no initiator serialises.
+//! The joiner inserts itself into the online set (`SeqCst`) and then, at
+//! the end of its bring-up and before its run loop fires a timer or
+//! polls a task, reads `hold` (`SeqCst`,
+//! [`FreezeBarrier::join_checkpoint`]); the freezer stores `hold`
+//! (`SeqCst`) before it first reads the set (`SeqCst`). In that single
+//! order either the freezer sees the joiner online and waits for it to
+//! arrive at a boundary like any secondary, or the joiner sees `hold`
+//! and parks at once. A joiner the freezer did not count is online by
+//! the time it parks, so the thaw's wake reaches it.
 //!
 //! No wake is lost:
 //!
@@ -140,15 +164,14 @@ use core::sync::atomic::{AtomicU8, AtomicU16, Ordering};
 use core::task::Poll;
 use core::time::Duration;
 
+use crate::exec::executor::{Executor, ExecutorGroup};
+use crate::exec::lifecycle::OnlineSet;
+use crate::exec::sync::{Notify, RawMutexLease};
+use crate::exec::timer::Timer;
 use crossbeam_utils::CachePadded;
 use helios_hal::cpu::{Cpu, ProcessorId, current_processor};
 use helios_hal::critical_section::LocalInterruptsMasked;
 use helios_hal::watchdog::{NoWatchdog, Watchdog};
-use triomphe::Arc as NoWeakArc;
-
-use crate::exec::executor::{Executor, ExecutorGroup};
-use crate::exec::sync::Notify;
-use crate::exec::timer::Timer;
 
 /// `hold` is held while this bit is set.
 const HELD: u8 = 1;
@@ -315,30 +338,70 @@ impl FreezeBarrier {
         }
     }
 
-    /// The lowest-numbered secondary that has not parked against `held`.
-    fn first_missing(&self, freezer: ProcessorId, held: u8) -> Option<ProcessorId> {
+    /// A processor that has just joined the online set, at the end of its
+    /// bring-up and before its run loop fires a timer or polls a task: the
+    /// joiner's half of the handshake in the module documentation. The
+    /// `SeqCst` load pairs with the freezer's `SeqCst` store of `hold`
+    /// and the `SeqCst` insert into the online set before it, so either
+    /// the freezer counts this processor or this processor parks here.
+    pub(crate) fn join_checkpoint<CpuImpl: Cpu>(&self, cpu: &CpuImpl) {
+        if self.control.hold.load(Ordering::SeqCst) & HELD != 0 {
+            self.arrive(cpu);
+        }
+    }
+
+    /// The lowest-numbered online secondary that has not parked against
+    /// `held`. A processor outside the online set is stopped or has never
+    /// run, so it polls nothing and is not waited for.
+    fn first_missing(
+        &self,
+        online: &OnlineSet,
+        freezer: ProcessorId,
+        held: u8,
+    ) -> Option<ProcessorId> {
         self.arrivals
             .iter()
             .enumerate()
             .filter(|(index, _)| *index != usize::from(freezer.id()))
-            .find(|(_, arrival)| arrival.load(Ordering::Acquire) != held)
-            .map(|(index, _)| {
-                ProcessorId::new(u16::try_from(index).expect("processor index fits a ProcessorId"))
+            .find(|(index, arrival)| {
+                online.contains(processor_at(*index)) && arrival.load(Ordering::Acquire) != held
             })
+            .map(|(index, _)| processor_at(index))
+    }
+
+    /// Wakes every online processor but the freezer. A stopped processor
+    /// is never sent a wake, and one that never ran has nothing to wake.
+    fn wake_secondaries<CpuImpl: Cpu>(
+        &self,
+        cpu: &CpuImpl,
+        online: &OnlineSet,
+        freezer: ProcessorId,
+    ) {
+        for index in 0..self.arrivals.len() {
+            let processor = processor_at(index);
+            if processor != freezer && online.contains(processor) {
+                cpu.wake_processor(processor);
+            }
+        }
     }
 
     /// Releases the secondaries, in the order of the module
     /// documentation, and returns once every one has left its park.
-    fn release<CpuImpl: Cpu>(&self, cpu: &CpuImpl, freezer: ProcessorId, held: u8) {
+    fn release<CpuImpl: Cpu>(
+        &self,
+        cpu: &CpuImpl,
+        online: &OnlineSet,
+        freezer: ProcessorId,
+        held: u8,
+    ) {
         self.control
             .phase
             .store(Phase::Thawing as u8, Ordering::Release);
         self.control.hold.store(held & !HELD, Ordering::Release);
-        for index in 0..self.arrivals.len() {
-            if index != usize::from(freezer.id()) {
-                cpu.wake_processor(processor_at(index));
-            }
-        }
+        // Every parked processor is online: it joined the set before it
+        // could reach a boundary, and none leaves it while the freezer
+        // holds the transition lock.
+        self.wake_secondaries(cpu, online, freezer);
         for (index, arrival) in self.arrivals.iter().enumerate() {
             if index == usize::from(freezer.id()) {
                 continue;
@@ -360,20 +423,45 @@ fn processor_at(index: usize) -> ProcessorId {
     ProcessorId::new(u16::try_from(index).expect("processor index fits a ProcessorId"))
 }
 
+/// A freeze that has claimed `phase` and not yet taken the transition
+/// lock: a future dropped while it waits for the lock returns `phase` to
+/// `Running`, having published nothing else.
+struct PhaseClaim<'a> {
+    phase: &'a AtomicU8,
+}
+
+impl PhaseClaim<'_> {
+    /// The freeze has the lock, and from here [`Release`] owns undoing it.
+    fn hand_to_release(self) {
+        core::mem::forget(self);
+    }
+}
+
+impl Drop for PhaseClaim<'_> {
+    fn drop(&mut self) {
+        self.phase.store(Phase::Running as u8, Ordering::Release);
+    }
+}
+
 /// A freeze that has set `hold` and has not released it: what a dropped
 /// future or a returned guard releases.
 struct Release<CpuImpl: Cpu + Clone> {
-    group: NoWeakArc<ExecutorGroup>,
+    group: &'static ExecutorGroup,
     cpu: CpuImpl,
     freezer: ProcessorId,
     held: u8,
+    /// The lifecycle's transition lock, held from before `hold` is set
+    /// until the release has finished: no processor joins or leaves the
+    /// online set by an offline or online while the barrier counts it.
+    /// Dropped after [`Drop::drop`] has released the secondaries.
+    _transition: RawMutexLease<'static>,
 }
 
 impl<CpuImpl: Cpu + Clone> Drop for Release<CpuImpl> {
     fn drop(&mut self) {
         self.group
             .freeze
-            .release(&self.cpu, self.freezer, self.held);
+            .release(&self.cpu, self.group.online(), self.freezer, self.held);
     }
 }
 
@@ -458,7 +546,9 @@ impl Executor {
         // must stay on that processor's own queue (`spawn_local`), never
         // in the global queue another processor could pop it from.
         let processor_local = PhantomData::<*mut ()>;
-        let barrier = &self.group.freeze;
+        let group = self.group();
+        let barrier = &group.freeze;
+        let online = group.online();
         let cpu = timer.cpu();
         let freezer = current_processor();
 
@@ -472,28 +562,34 @@ impl Executor {
                 Ordering::Acquire,
             )
             .map_err(|_| FreezeError::AlreadyFreezing)?;
+        // An offline or online in flight finishes before the barrier
+        // counts anything, and none starts until the thaw is done.
+        let claim = PhaseClaim {
+            phase: &barrier.control.phase,
+        };
+        let transition = group.lifecycle().lock_transitions().await;
+        claim.hand_to_release();
         let generation = ((barrier.control.hold.load(Ordering::Relaxed) >> 1) + 1) % GENERATIONS;
         let held = (generation << 1) | HELD;
         barrier
             .control
             .freezer
             .store(freezer.id(), Ordering::Relaxed);
-        barrier.control.hold.store(held, Ordering::Release);
+        // `SeqCst`, before any read of the online set: the freezer's half
+        // of the join handshake (`FreezeBarrier::join_checkpoint`).
+        barrier.control.hold.store(held, Ordering::SeqCst);
         // From here a drop, whether of the guard or of this future,
         // releases the machine.
         let release = Release {
-            group: self.group.clone(),
+            group,
             cpu: cpu.clone(),
             freezer,
             held,
+            _transition: transition,
         };
 
         interrupt_guests();
-        for index in 0..barrier.arrivals.len() {
-            if index != usize::from(freezer.id()) {
-                cpu.wake_processor(processor_at(index));
-            }
-        }
+        barrier.wake_secondaries(cpu, online, freezer);
 
         let deadline = cpu
             .now()
@@ -502,7 +598,7 @@ impl Executor {
         let mut arrival = barrier.arrived.waiter();
         let arrived = poll_fn(|context| {
             loop {
-                let Some(missing) = barrier.first_missing(freezer, held) else {
+                let Some(missing) = barrier.first_missing(online, freezer, held) else {
                     return Poll::Ready(Ok(()));
                 };
                 if expiry.as_mut().poll(context).is_ready() {
@@ -540,12 +636,18 @@ impl Executor {
     /// [`FreezeBarrier::checkpoint`].
     #[inline(always)]
     pub(crate) fn freeze_checkpoint<CpuImpl: Cpu + Clone>(&self, cpu: &CpuImpl) {
-        self.group.freeze.checkpoint(cpu);
+        self.group().freeze.checkpoint(cpu);
+    }
+
+    /// The boundary a processor reaches once it has joined the online
+    /// set; see [`FreezeBarrier::join_checkpoint`].
+    pub(crate) fn freeze_join_checkpoint<CpuImpl: Cpu + Clone>(&self, cpu: &CpuImpl) {
+        self.group().freeze.join_checkpoint(cpu);
     }
 
     /// Whether a freeze that this processor did not ask for is holding
     /// the machine.
     pub(crate) fn freeze_requested_of_this_processor(&self) -> bool {
-        self.group.freeze.requested_of(self.owner_processor)
+        self.group().freeze.requested_of(self.owner_processor())
     }
 }

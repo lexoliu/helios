@@ -114,15 +114,17 @@ pub use exec::{
     Executor, ExecutorRunStats, FoldedProfileSample, FreezeError, FrozenMachine, GUEST_TIME_SLICE,
     IdleOutcome, InstanceSpawner, JoinHandle, KernelClock, LocalJoinHandle,
     MAX_FILTER_PREFIX_BYTES, MAX_FILTER_PREFIXES, Mutex, MutexGuard, Notified, Notify,
-    NotifyWaiter, ObservationScope, OwnInstance, OwnedRawMutexLease, OwnedRawRwLockReadLease,
-    OwnedRawRwLockWriteLease, PerfMetricFilter, PerfMetricHistory, PerfMetricSample, PerfSample,
-    PrefixSet, PrefixSetError, PressureLevel, ProfileFilter, ProfileHistory, ProfileScope,
+    NotifyWaiter, ObservationScope, OfflineError, OfflineRefusal, OnlineError, OnlineSet,
+    OwnInstance, OwnedRawMutexLease, OwnedRawRwLockReadLease, OwnedRawRwLockWriteLease,
+    PerfMetricFilter, PerfMetricHistory, PerfMetricSample, PerfSample, PinnedTasks, PrefixSet,
+    PrefixSetError, PressureLevel, ProcessorControl, ProfileFilter, ProfileHistory, ProfileScope,
     ProfileSink, ProgressChanged, ProgressMark, ProgressSignal, RawMutex, RawMutexLease, RawRwLock,
     RawRwLockReadLease, RawRwLockWriteLease, ReadyLink, RwLock, RwLockReadGuard, RwLockWriteGuard,
     Sleep, Spawner, StatsSample, TaskCapacityError, TaskFunding, Timer, TraceEvent, TraceField,
     TraceFilter, TraceHistory, TraceLevel, TraceLog, TraceValue, UptimeClock, YieldNow,
     elapsed_millis, matches_perf_metric_filter, matches_profile_filter, matches_trace_filter,
-    monotonic_nanos, parse_console_text, wall_clock_offset_nanos, yield_now,
+    monotonic_nanos, online_processor_count, parse_console_text, wall_clock_offset_nanos,
+    yield_now,
 };
 pub use gpu::{
     ContextRecord, ContextShared, Gpu3dOwnership, Gpu3dSender, Gpu3dService, Gpu3dServiceError,
@@ -868,6 +870,9 @@ pub struct Kernel<
     executor: Executor,
     timer: Timer<CpuImpl>,
     watchdog: WatchdogImpl,
+    /// This processor's watchdog pet while it is online and the
+    /// watchdog is enabled; its lifecycle step spawns and cancels it.
+    watchdog_pet: core::cell::RefCell<Option<LocalJoinHandle<()>>>,
     /// The platform's measured-boot device, on the bootstrap processor
     /// until bring-up settles the compiler-signing key with it
     /// ([`Self::take_measured_boot`]); empty on every other processor
@@ -948,8 +953,10 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone, MeasuredBootImpl: Mea
         self.timer.sleep_for(duration)
     }
 
-    /// Holds every processor still at a scheduler boundary, from this
-    /// one, until the returned [`FrozenMachine`] is dropped.
+    /// Holds every online processor still at a scheduler boundary, from
+    /// this one, until the returned [`FrozenMachine`] is dropped. An
+    /// offline or online in flight finishes first, and none runs until
+    /// the thaw.
     ///
     /// `arrival_deadline` is how long the caller lets the other
     /// processors take to reach a boundary: its policy for a host that
@@ -981,6 +988,10 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone, MeasuredBootImpl: Mea
     }
 
     pub fn run_until_stalled_with_stats(&self) -> KernelRunStats {
+        // Every run loop comes through here between tasks, holding
+        // nothing, which is where a processor asked to go offline tears
+        // itself down and stops.
+        self.service_lifecycle();
         // The page-fault path that commits a fiber stack page takes its
         // frame from this processor's reserve and may not wait on the
         // pool's lock to refill it, so the refill happens here instead:
@@ -1062,9 +1073,12 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone, MeasuredBootImpl: Mea
         }
     }
 
-    fn spawn_watchdog_supervisor(&self) {
+    /// Spawns this processor's watchdog pet when the watchdog is
+    /// enabled: a silent local task that pets the watchdog whenever the
+    /// executor records progress, at most once per check interval.
+    fn spawn_watchdog_pet(&self) -> Option<LocalJoinHandle<()>> {
         if !self.watchdog.is_enabled() {
-            return;
+            return None;
         }
 
         let timeout = self.watchdog.timeout();
@@ -1089,10 +1103,7 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone, MeasuredBootImpl: Mea
         let cpu = self.cpu.clone();
         let watchdog = self.watchdog.clone();
         let progress_notify = self.spawner().progress_notify();
-        if current_processor() == self.topology.bootstrap_processor {
-            watchdog.arm();
-        }
-        self.spawner().spawn_local_detached_silent(async move {
+        Some(self.spawner().spawn_local_silent(async move {
             let mut last_pet_at = cpu.now();
             loop {
                 progress_notify.notified().await;
@@ -1103,7 +1114,7 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone, MeasuredBootImpl: Mea
                 watchdog.pet();
                 last_pet_at = now;
             }
-        });
+        }))
     }
 
     #[cfg(helios_watchdog_self_test)]
@@ -1115,17 +1126,19 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone, MeasuredBootImpl: Mea
         let timer = self.timer();
         let processor = current_processor().id();
         let delay = watchdog_self_test_delay();
-        self.spawner().spawn_local_detached_silent(async move {
-            timer.sleep_for(delay).await;
-            tracing::error!(
-                processor,
-                delay_ms = delay.as_millis() as u64,
-                "watchdog self-test hanging processor"
-            );
-            loop {
-                core::hint::spin_loop();
-            }
-        });
+        self.spawner()
+            .spawn_local_silent(async move {
+                timer.sleep_for(delay).await;
+                tracing::error!(
+                    processor,
+                    delay_ms = delay.as_millis() as u64,
+                    "watchdog self-test hanging processor"
+                );
+                loop {
+                    core::hint::spin_loop();
+                }
+            })
+            .detach();
     }
 }
 
@@ -1271,10 +1284,11 @@ where
     };
     let executor = Executor::new(progress, topology.configured_processors, current_processor);
     let kernel = Kernel {
-        timer: executor.timer(cpu.clone()),
+        timer: executor.timer_handle(cpu.clone()),
         cpu,
         executor,
         watchdog,
+        watchdog_pet: core::cell::RefCell::new(None),
         measured_boot: spin::Mutex::new(measured_boot),
         topology,
         dma_model,
@@ -1286,11 +1300,14 @@ where
         "watchdog self-test requires an enabled hardware watchdog"
     );
 
+    if kernel.watchdog.is_enabled() && current_processor == topology.bootstrap_processor {
+        kernel.watchdog.arm();
+    }
+    kernel.bring_up();
     let processor_id = current_processor.id();
     kernel.spawn_detached(async move {
         tracing::info!("Processor online processor={processor_id}");
     });
-    kernel.spawn_watchdog_supervisor();
     #[cfg(helios_watchdog_self_test)]
     kernel.spawn_watchdog_self_test();
 
