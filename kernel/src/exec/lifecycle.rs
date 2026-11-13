@@ -21,6 +21,17 @@
 //! step before its second on the way up and after it on the way down,
 //! so the reverse order is not something a caller can get wrong.
 //!
+//! A layer above the kernel that owns per-processor state the kernel
+//! cannot name — the component host's network step, which owns the
+//! processor's packet pump and its queue pair — lends its step to the
+//! run loop it drives (`Kernel::run_until_stalled_with_steps`). It is
+//! composed after [`STEPS`], so it comes up last and goes down first,
+//! while every kernel owner is still up. A run loop that lends none
+//! still services the lifecycle with [`STEPS`] alone, and any local task
+//! that layer left on the processor is then pinned work the executor
+//! step refuses on, so a forgotten step costs an offline, never a
+//! stranded owner.
+//!
 //! A teardown step may refuse, and refuses before it changes anything.
 //! The steps already torn down are then brought back up in order, and
 //! the processor stays online: an offline either completes or leaves the
@@ -180,15 +191,21 @@ impl LifecycleState {
     }
 }
 
+/// Which [`OfflineRefusal`] a lifecycle cell records.
+const REFUSED_PINNED_TASKS: u8 = 0;
+const REFUSED_NETWORK_STARTING: u8 = 1;
+
 /// One processor's lifecycle cell.
 ///
 /// `state` is written by the initiator (a request) and by the processor
 /// itself (a completion), and `changed` is raised on every completion.
-/// `successor` and `refused_live` are written before the `state` store
-/// that publishes them and read after the load that observes it.
+/// `successor`, `refused_kind` and `refused_live` are written before the
+/// `state` store that publishes them and read after the load that
+/// observes it.
 struct LifecycleCell {
     state: AtomicU8,
     successor: AtomicU16,
+    refused_kind: AtomicU8,
     refused_live: AtomicUsize,
     changed: Notify,
 }
@@ -198,8 +215,31 @@ impl LifecycleCell {
         Self {
             state: AtomicU8::new(LifecycleState::Absent as u8),
             successor: AtomicU16::new(0),
+            refused_kind: AtomicU8::new(REFUSED_PINNED_TASKS),
             refused_live: AtomicUsize::new(0),
             changed: Notify::new(),
+        }
+    }
+
+    /// Records why the processor refused, before the `Online` publish.
+    fn record_refusal(&self, refusal: OfflineRefusal) {
+        let (kind, live) = match refusal {
+            OfflineRefusal::PinnedTasks(pinned) => (REFUSED_PINNED_TASKS, pinned.live),
+            OfflineRefusal::NetworkStarting { .. } => (REFUSED_NETWORK_STARTING, 0),
+        };
+        self.refused_kind.store(kind, Ordering::Relaxed);
+        self.refused_live.store(live, Ordering::Relaxed);
+    }
+
+    /// The refusal [`Self::record_refusal`] recorded for `processor`.
+    fn refusal(&self, processor: ProcessorId) -> OfflineRefusal {
+        match self.refused_kind.load(Ordering::Relaxed) {
+            REFUSED_PINNED_TASKS => OfflineRefusal::PinnedTasks(PinnedTasks {
+                processor,
+                live: self.refused_live.load(Ordering::Relaxed),
+            }),
+            REFUSED_NETWORK_STARTING => OfflineRefusal::NetworkStarting { processor },
+            kind => panic!("offline refusal {kind} was never recorded"),
         }
     }
 
@@ -282,6 +322,16 @@ pub enum OfflineRefusal {
     /// they cannot move to another processor.
     #[error(transparent)]
     PinnedTasks(#[from] PinnedTasks),
+    /// The machine has a network interface whose service is not
+    /// installed yet, so the queue pair the processor drains has no
+    /// routing table to be handed off through. Asked again once the
+    /// interface is up, the offline proceeds.
+    #[error(
+        "processor {} cannot go offline before the network interface is up: its queue pair \
+         has nowhere to be handed off yet",
+        processor.id()
+    )]
+    NetworkStarting { processor: ProcessorId },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -429,12 +479,7 @@ impl<CpuImpl: Cpu + Clone> ProcessorControl<CpuImpl> {
         }
         match cell.settled(LifecycleState::Departing).await {
             LifecycleState::Offline => Ok(()),
-            LifecycleState::Online => Err(OfflineError::Refused(OfflineRefusal::PinnedTasks(
-                PinnedTasks {
-                    processor,
-                    live: cell.refused_live.load(Ordering::Relaxed),
-                },
-            ))),
+            LifecycleState::Online => Err(OfflineError::Refused(cell.refusal(processor))),
             state => panic!(
                 "processor {} left Departing for {state:?}, which no teardown publishes",
                 processor.id()
@@ -505,6 +550,59 @@ pub(crate) trait ProcessorStep {
         CpuImpl: Cpu + Clone,
         WatchdogImpl: Watchdog + Clone,
         MeasuredBootImpl: MeasuredBoot;
+}
+
+/// The step a run loop adds when its layer owns nothing per processor.
+impl ProcessorStep for () {
+    fn online<CpuImpl, WatchdogImpl, MeasuredBootImpl>(
+        &self,
+        _kernel: &Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
+    ) where
+        CpuImpl: Cpu + Clone,
+        WatchdogImpl: Watchdog + Clone,
+        MeasuredBootImpl: MeasuredBoot,
+    {
+    }
+
+    fn offline<CpuImpl, WatchdogImpl, MeasuredBootImpl>(
+        &self,
+        _kernel: &Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
+        _successor: ProcessorId,
+    ) -> Result<(), OfflineRefusal>
+    where
+        CpuImpl: Cpu + Clone,
+        WatchdogImpl: Watchdog + Clone,
+        MeasuredBootImpl: MeasuredBoot,
+    {
+        Ok(())
+    }
+}
+
+/// A step its run loop lends the lifecycle.
+impl<Step: ProcessorStep> ProcessorStep for &Step {
+    fn online<CpuImpl, WatchdogImpl, MeasuredBootImpl>(
+        &self,
+        kernel: &Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
+    ) where
+        CpuImpl: Cpu + Clone,
+        WatchdogImpl: Watchdog + Clone,
+        MeasuredBootImpl: MeasuredBoot,
+    {
+        (**self).online(kernel);
+    }
+
+    fn offline<CpuImpl, WatchdogImpl, MeasuredBootImpl>(
+        &self,
+        kernel: &Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
+        successor: ProcessorId,
+    ) -> Result<(), OfflineRefusal>
+    where
+        CpuImpl: Cpu + Clone,
+        WatchdogImpl: Watchdog + Clone,
+        MeasuredBootImpl: MeasuredBoot,
+    {
+        (**self).offline(kernel, successor)
+    }
 }
 
 /// `First` comes up before `Then` and goes down after it; a refusal by
@@ -689,6 +787,12 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone, MeasuredBootImpl: Mea
         ProcessorControl::new(self.cpu.clone(), self.executor.group())
     }
 
+    /// The online set, live: what a lifecycle step reads to find the
+    /// processors that stay.
+    pub(crate) fn online_set(&self) -> &'static OnlineSet {
+        self.executor.group().online()
+    }
+
     /// This processor's first bring-up, from `init`: every step, in
     /// order, then the processor is online.
     pub(crate) fn bring_up(&self) {
@@ -715,17 +819,23 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone, MeasuredBootImpl: Mea
     /// the stop, and — once another processor restarts it — the
     /// bring-up. Called at the top of every run-loop pass, where the
     /// processor holds nothing.
-    pub(crate) fn service_lifecycle(&self) {
+    ///
+    /// `extra` is the step of the layer whose run loop this is — the
+    /// component host's network step — composed after [`STEPS`]: it
+    /// comes up last and goes down first, while every kernel owner is
+    /// still up. A run loop whose layer owns nothing per processor
+    /// passes `&()`.
+    pub(crate) fn service_lifecycle<Extra: ProcessorStep>(&self, extra: &Extra) {
         let processor = self.executor.owner_processor();
         let lifecycles = self.executor.group().lifecycle();
         if !lifecycles.departure_requested(processor) {
             return;
         }
+        let steps = (STEPS, extra);
         let cell = lifecycles.cell(processor);
         let successor = ProcessorId::new(cell.successor.load(Ordering::Relaxed));
-        if let Err(refusal) = STEPS.offline(self, successor) {
-            let OfflineRefusal::PinnedTasks(pinned) = refusal;
-            cell.refused_live.store(pinned.live, Ordering::Relaxed);
+        if let Err(refusal) = steps.offline(self, successor) {
+            cell.record_refusal(refusal);
             tracing::info!(
                 processor = processor.id(),
                 %refusal,
@@ -748,7 +858,7 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone, MeasuredBootImpl: Mea
             "processor {} returned from stop_current without a restart",
             processor.id()
         );
-        STEPS.online(self);
+        steps.online(self);
         // No join checkpoint: the initiator holds the transition lock
         // until this publish, so no freeze has set `hold`, and one that
         // starts after it counts this processor, already online.

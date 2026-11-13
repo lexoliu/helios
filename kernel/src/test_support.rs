@@ -6,7 +6,7 @@
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase, TimerInterrupt};
 use helios_hal::numa::{MemoryAffinity, NodeDistance, NodeId, NumaTopology};
@@ -781,6 +781,13 @@ struct RecordingInterfaceState {
     /// Every frame the transmit ring took, headers and payload joined,
     /// in the order it took them.
     transmitted: spin::Mutex<alloc::vec::Vec<alloc::vec::Vec<u8>>>,
+    /// The pair each taken frame was submitted on, in the same order.
+    transmitted_on: spin::Mutex<alloc::vec::Vec<usize>>,
+    /// The live pair count the device was last told.
+    live_pairs: AtomicUsize,
+    /// Every pair whose interrupt was steered, with its destination, in
+    /// order.
+    steered: spin::Mutex<alloc::vec::Vec<(usize, helios_hal::cpu::ProcessorId)>>,
 }
 
 impl RecordingNetworkInterface {
@@ -812,6 +819,9 @@ impl RecordingNetworkInterface {
                 device_signal: crate::ProgressSignal::new(),
                 accept_transmissions,
                 transmitted: spin::Mutex::new(alloc::vec::Vec::new()),
+                transmitted_on: spin::Mutex::new(alloc::vec::Vec::new()),
+                live_pairs: AtomicUsize::new(queue_pairs),
+                steered: spin::Mutex::new(alloc::vec::Vec::new()),
             }),
         }
     }
@@ -820,6 +830,22 @@ impl RecordingNetworkInterface {
     /// built, each with its scatter payload appended to its headers.
     pub(crate) fn transmitted_frames(&self) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
         self.inner.transmitted.lock().clone()
+    }
+
+    /// The pair each frame in [`Self::transmitted_frames`] was
+    /// submitted on.
+    pub(crate) fn transmitted_pairs(&self) -> alloc::vec::Vec<usize> {
+        self.inner.transmitted_on.lock().clone()
+    }
+
+    /// The live pair count the device was last told.
+    pub(crate) fn live_pairs(&self) -> usize {
+        self.inner.live_pairs.load(Ordering::Acquire)
+    }
+
+    /// Every steering the interface was asked for, in order.
+    pub(crate) fn steered(&self) -> alloc::vec::Vec<(usize, helios_hal::cpu::ProcessorId)> {
+        self.inner.steered.lock().clone()
     }
 
     /// Puts a frame in one queue pair's receive ring, where the next
@@ -1001,21 +1027,47 @@ impl helios_netstack::NetworkInterface for RecordingNetworkInterface {
         Some(drain)
     }
 
+    fn set_active_queue_pairs(&self, pairs: usize) -> helios_hal::io::IoResult<()> {
+        assert!(
+            (1..=self.inner.queues.len()).contains(&pairs),
+            "{pairs} live pairs out of {}",
+            self.inner.queues.len()
+        );
+        self.inner.live_pairs.store(pairs, Ordering::Release);
+        Ok(())
+    }
+
+    fn steer_queue_pair(&self, pair: usize, processor: helios_hal::cpu::ProcessorId) {
+        assert!(
+            pair < self.inner.queues.len(),
+            "pair {pair} was never brought up"
+        );
+        self.inner.steered.lock().push((pair, processor));
+    }
+
     fn try_transmit_scatter_immediate_on(
         &self,
-        _: usize,
+        queue_idx: usize,
         frames: &[helios_netstack::TxFrameRef<'_>],
     ) -> helios_hal::io::IoResult<Option<usize>> {
         if !self.inner.accept_transmissions {
             return Ok(Some(0));
         }
+        let pair = self.inner.pair(queue_idx);
+        assert!(
+            pair < self.live_pairs(),
+            "a frame was submitted on pair {pair}, which the device does not read: {} pairs are live",
+            self.live_pairs()
+        );
         let mut transmitted = self.inner.transmitted.lock();
+        let mut transmitted_on = self.inner.transmitted_on.lock();
         for frame in frames {
             let mut bytes = frame.bytes.to_vec();
             if let Some(payload) = frame.payload {
                 bytes.extend_from_slice(payload);
             }
             transmitted.push(bytes);
+            transmitted_on.push(pair);
         }
         Ok(Some(frames.len()))
     }
@@ -1660,6 +1712,13 @@ mod network {
         /// pump to own — whichever processor calls, the answer is that
         /// there is nothing to drive.
         async fn run_packet_pump(&self, _: helios_hal::cpu::ProcessorId) {}
+
+        /// No pairs, so a departing processor has none to hand off.
+        fn hand_off_queue_pair(&self, _: helios_hal::cpu::ProcessorId, _: &crate::exec::OnlineSet) {
+        }
+
+        /// No pairs, so an arriving processor has none to take up.
+        fn take_up_queue_pair(&self, _: helios_hal::cpu::ProcessorId) {}
     }
 }
 

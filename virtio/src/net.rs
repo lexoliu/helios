@@ -29,9 +29,10 @@ use core::future::Future;
 use core::mem::size_of;
 use core::num::NonZeroU16;
 use core::ops::Range;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use crossbeam_utils::CachePadded;
 
+use helios_hal::cpu::ProcessorId;
 use helios_hal::io::{IoError, IoResult};
 use helios_netstack::{
     ChecksumOffload, DEFAULT_POLL_BUDGET, EventDeliveryCapabilities, FlowHash,
@@ -279,6 +280,18 @@ const fn tx_queue_index(pair_idx: u16) -> u16 {
 /// *device* advertises rather than every pair the driver brought up.
 const fn control_queue_index(device_max_pairs: u16) -> u16 {
     device_max_pairs * 2
+}
+
+/// The receive queue RSS indirection slot `slot` names while pairs
+/// `0..live` of the `brought_up` pairs are live.
+///
+/// The slot's pair with every pair live, folded onto the live prefix:
+/// a slot whose pair is live keeps it, so a change of the live count
+/// moves only the flows of the pairs that stopped or started being live.
+/// The kernel folds a shard onto a live pair by the same rule, which is
+/// what keeps a steered frame on the pair whose pump serves its shard.
+const fn rss_live_queue(slot: usize, brought_up: usize, live: usize) -> usize {
+    rss_indirection_entry(rss_indirection_entry(slot, brought_up), live)
 }
 
 /// How long a queue may hold a notification back.
@@ -732,6 +745,16 @@ struct NetQueuePair<T: VirtioTransport> {
     /// processor that drains the pair, so the counts spread instead of
     /// piling on whichever processor owns a single vector.
     interrupt_count: AtomicU64,
+    /// The processor this pair's completions are for, as a
+    /// [`ProcessorId`]: pair `i` starts on processor `i`, the layout
+    /// every backend binds at bring-up, and
+    /// [`VirtioNetDevice::steer_pair`] moves it. A transport with one
+    /// interrupt line wakes this processor for the pair; a transport
+    /// with per-pair messages retargets the message alongside.
+    ///
+    /// Written only by `steer_pair`, whose caller serialises it; read
+    /// from interrupt context on any processor.
+    interrupt_owner: AtomicU16,
     /// Times receive on this queue pair had to pause because every
     /// reassembly buffer was checked out.
     rx_pool_stalls: AtomicU64,
@@ -826,6 +849,14 @@ pub struct VirtioNetDevice<T: VirtioTransport> {
     /// and compared, because a device that advertises another count has
     /// its control queue somewhere else.
     max_pairs: u16,
+    /// How many of `queue_pairs`, from the first, the device has been
+    /// told are live: every pair at bring-up, then whatever
+    /// [`Self::set_active_queue_pairs`] last set. A reset device is told
+    /// this count again, not the bring-up one.
+    ///
+    /// Written by bring-up and by `set_active_queue_pairs`, whose
+    /// caller serialises it against itself and against a reset.
+    active_pairs: AtomicU16,
     /// Set once a restore command timed out and the device is lost.
     lost: Lost,
 }
@@ -935,7 +966,6 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
     /// the stall #381's review caught.
     pub fn new(transport: T, pair_budget: QueuePairBudget) -> IoResult<Self> {
         let device = Self::build(transport, pair_budget)?;
-        let features = device.features;
 
         // Activate every queue pair on the device side. The device
         // ships with a single pair active by default; without this
@@ -950,44 +980,56 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         device
             .program_control(&mut || false)
             .map_err(ControlError::without_deadline)?;
+        device.log_online();
+        Ok(device)
+    }
 
-        // The negotiated set is the only record of what the host packet
-        // path was actually able to offer: a slirp-backed device
-        // negotiates neither multiqueue nor segmentation offload, so a
-        // measurement taken against it exercises none of the driver's
-        // offload paths. Logging it at bring-up puts the feature set of
-        // every run into the boot log, where a benchmark lane can record
-        // which backend it really measured. The ring bits are already on
-        // the `virtio features negotiated` line this device emitted, so
-        // only the device-class facts are repeated here.
+    /// Reports the device-class facts and the live pair count.
+    ///
+    /// The negotiated set is the only record of what the host packet
+    /// path was actually able to offer: a slirp-backed device negotiates
+    /// neither multiqueue nor segmentation offload, so a measurement
+    /// taken against it exercises none of the driver's offload paths.
+    /// Logging it at bring-up puts the feature set of every run into the
+    /// boot log, where a benchmark lane can record which backend it
+    /// really measured. The ring bits are already on the `virtio
+    /// features negotiated` line this device emitted, so only the
+    /// device-class facts are repeated here.
+    ///
+    /// The line is emitted again every time the live pair count changes,
+    /// so a run whose processors went offline and online records the
+    /// count it had after each change: `queue_pairs` is the live count,
+    /// `brought_up_pairs` the pairs whose rings exist.
+    fn log_online(&self) {
+        let features = self.features;
         tracing::info!(
-            queue_pairs = device.queue_pair_count(),
-            csum = device.tx_checksum_negotiated,
-            host_tso4 = device.tso_v4_negotiated,
-            host_tso6 = device.tso_v6_negotiated,
-            host_ecn = device.tso_ecn_negotiated,
-            guest_csum = device.guest_checksum_negotiated,
-            guest_tso4 = device.guest_tso_v4_negotiated,
-            guest_tso6 = device.guest_tso_v6_negotiated,
+            queue_pairs = self.active_queue_pair_count(),
+            brought_up_pairs = self.queue_pair_count(),
+            csum = self.tx_checksum_negotiated,
+            host_tso4 = self.tso_v4_negotiated,
+            host_tso6 = self.tso_v6_negotiated,
+            host_ecn = self.tso_ecn_negotiated,
+            guest_csum = self.guest_checksum_negotiated,
+            guest_tso4 = self.guest_tso_v4_negotiated,
+            guest_tso6 = self.guest_tso_v6_negotiated,
             guest_ecn = features.device(NET_FEATURE_GUEST_ECN),
-            guest_ufo = device.guest_ufo_negotiated,
-            mrg_rxbuf = device.mergeable_rx_buffers,
+            guest_ufo = self.guest_ufo_negotiated,
+            mrg_rxbuf = self.mergeable_rx_buffers,
             mq = features.device(NET_FEATURE_MQ),
             ctrl_vq = features.device(NET_FEATURE_CTRL_VQ),
-            rss = device.steers_receives(),
+            rss = self.steers_receives(),
             hash_report = features.device(NET_FEATURE_HASH_REPORT),
             notf_coal = features.device(NET_FEATURE_NOTF_COAL),
             vq_notf_coal = features.device(NET_FEATURE_VQ_NOTF_COAL),
             notf_coal_max_packets = NET_NOTF_COAL_MAX_PACKETS,
             notf_coal_max_usecs = NET_NOTF_COAL_MAX_USECS,
-            status = device.status_negotiated,
-            link_up = device.link_up.load(Ordering::Relaxed),
-            max_frame_len = device.max_frame_len,
-            max_receive_frame_len = device.max_receive_frame_len,
-            rx_buffer_len = device.rx_buffer_len,
+            status = self.status_negotiated,
+            link_up = self.link_up.load(Ordering::Relaxed),
+            max_frame_len = self.max_frame_len,
+            max_receive_frame_len = self.max_receive_frame_len,
+            rx_buffer_len = self.rx_buffer_len,
             "virtio-net online"
         );
-        Ok(device)
     }
 
     /// Negotiates, programs every queue and sets `DRIVER_OK`, leaving
@@ -1291,6 +1333,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
 
             queue_pairs.push(CachePadded::new(NetQueuePair {
                 interrupt_count: AtomicU64::new(0),
+                interrupt_owner: AtomicU16::new(pair_idx),
                 rx_pool_stalls: AtomicU64::new(0),
                 interrupts: Notify::new(),
                 rx_state: AsyncMutex::new(NetRxState {
@@ -1371,9 +1414,14 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                 .notify(&transport);
         }
 
+        let active_pairs = AtomicU16::new(
+            u16::try_from(queue_pairs.len())
+                .unwrap_or_else(|_| panic!("{} queue pairs exceed u16", queue_pairs.len())),
+        );
         let device = Self {
             transport,
             queue_pairs: queue_pairs.into_boxed_slice(),
+            active_pairs,
             control,
             rx_buffer_len,
             interrupts: Notify::new(),
@@ -1497,10 +1545,14 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
     /// control state for the device's whole life, and the caller treats
     /// the device as lost.
     ///
-    /// Commands are issued only from bring-up and from `reinitialize`,
-    /// each on one processor with nothing else running, so the control
-    /// state's own lock is the only discipline needed: no second command
-    /// can be between its submission and its ack.
+    /// Commands are issued from bring-up and from `reinitialize`, each
+    /// on one processor with nothing else running, and from
+    /// [`Self::set_active_queue_pairs`], whose caller serialises it
+    /// against itself and against a reset (the kernel issues it from a
+    /// processor lifecycle step, which holds the transition lock a
+    /// freeze also holds). So the control state's own lock is the only
+    /// discipline needed: no second command can be between its
+    /// submission and its ack.
     fn send_control_command(
         &self,
         class: u8,
@@ -1567,15 +1619,106 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
     /// a device that lost them is given them again by running this
     /// again.
     fn program_control(&self, expired: &mut impl FnMut() -> bool) -> Result<(), ControlError> {
-        if self.steers_receives() {
-            self.send_rss_config(expired)?;
-        } else if self.features.device(NET_FEATURE_MQ) && self.queue_pair_count() > 1 {
-            self.send_set_vq_pairs(self.queue_pair_count(), expired)?;
-        }
+        let active = self.active_queue_pair_count();
+        self.send_live_pairs(active, expired)?;
         if self.features.device(NET_FEATURE_NOTF_COAL) {
-            self.send_notification_coalescing(expired)?;
+            self.send_notification_coalescing(0..active, expired)?;
         }
         Ok(())
+    }
+
+    /// Tells the device that pairs `0..pairs` are live: inside the RSS
+    /// configuration on a device that steers, through `VQ_PAIRS_SET` on
+    /// one that does not. A single-pair device has nothing to be told.
+    fn send_live_pairs(
+        &self,
+        pairs: usize,
+        expired: &mut impl FnMut() -> bool,
+    ) -> Result<(), ControlError> {
+        if self.steers_receives() {
+            self.send_rss_config(pairs, expired)
+        } else if self.features.device(NET_FEATURE_MQ) && self.queue_pair_count() > 1 {
+            self.send_set_vq_pairs(pairs, expired)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// How many queue pairs, from the first, the device delivers on and
+    /// reads from now.
+    pub fn active_queue_pair_count(&self) -> usize {
+        usize::from(self.active_pairs.load(Ordering::Acquire))
+    }
+
+    /// Makes pairs `0..pairs` the live ones and reports the new count on
+    /// the `virtio-net online` line.
+    ///
+    /// The command is polled without a deadline, as bring-up's are: the
+    /// device answers it in the time a descriptor completes. A pair that
+    /// becomes live again has its notification coalescing programmed
+    /// again, because the per-virtqueue form addresses queues the device
+    /// must hold live.
+    ///
+    /// # Concurrency contract
+    ///
+    /// The caller serialises this against itself and against a reset
+    /// (see [`Self::send_control_command`]). It touches no ring: the
+    /// pairs that stop being live keep their buffers posted and their
+    /// in-flight transmissions, which complete or resume when the pair
+    /// is live again, and every data path may keep running while it is
+    /// issued.
+    pub fn set_active_queue_pairs(&self, pairs: usize) -> IoResult<()> {
+        self.program_active_pairs(pairs, &mut || false)
+            .map_err(ControlError::without_deadline)
+    }
+
+    fn program_active_pairs(
+        &self,
+        pairs: usize,
+        expired: &mut impl FnMut() -> bool,
+    ) -> Result<(), ControlError> {
+        assert!(
+            (1..=self.queue_pair_count()).contains(&pairs),
+            "virtio-net was asked to make {pairs} queue pairs live out of the {} it brought up",
+            self.queue_pair_count()
+        );
+        let previous = self.active_queue_pair_count();
+        self.send_live_pairs(pairs, expired)?;
+        if pairs > previous && self.features.device(NET_FEATURE_NOTF_COAL) {
+            self.send_notification_coalescing(previous..pairs, expired)?;
+        }
+        self.active_pairs.store(
+            u16::try_from(pairs).unwrap_or_else(|_| panic!("{pairs} queue pairs exceed u16")),
+            Ordering::Release,
+        );
+        self.log_online();
+        Ok(())
+    }
+
+    /// The processor `pair`'s completions are delivered to.
+    pub fn queue_pair_owner(&self, pair: usize) -> ProcessorId {
+        ProcessorId::new(
+            self.queue_pairs[self.normalize_pair_idx(pair)]
+                .interrupt_owner
+                .load(Ordering::Acquire),
+        )
+    }
+
+    /// Records that `pair`'s completions are for `processor` from now
+    /// on, which is the processor a single-line transport's interrupt
+    /// handler wakes for the pair. A backend with per-pair messages
+    /// retargets the pair's message as well.
+    ///
+    /// The caller serialises this, and names an online processor.
+    pub fn steer_pair(&self, pair: usize, processor: ProcessorId) {
+        assert!(
+            pair < self.queue_pair_count(),
+            "virtio-net pair {pair} was steered but only {} were brought up",
+            self.queue_pair_count()
+        );
+        self.queue_pairs[pair]
+            .interrupt_owner
+            .store(processor.id(), Ordering::Release);
     }
 
     fn send_set_vq_pairs(
@@ -1589,17 +1732,17 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         self.send_control_command(CTRL_CLASS_MQ, CTRL_CMD_MQ_VQ_PAIRS_SET, &payload, expired)
     }
 
-    /// Programs notification coalescing for every queue this device
-    /// brought up.
+    /// Programs notification coalescing for the live pairs in `pairs`.
     ///
     /// A per-CPU queue layout wants the per-virtqueue form: each pair is
     /// driven by its own processor at its own rate, and one device-wide
     /// setting would make an idle pair pay the busy pair's delay. When
     /// the device only offers the device-wide form the same budget is
     /// programmed once for receive and once for transmit, which is the
-    /// same policy at a coarser grain.
+    /// same policy at a coarser grain, and `pairs` does not matter.
     fn send_notification_coalescing(
         &self,
+        pairs: Range<usize>,
         expired: &mut impl FnMut() -> bool,
     ) -> Result<(), ControlError> {
         let budget = CoalescingBudget {
@@ -1607,7 +1750,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             max_usecs: NET_NOTF_COAL_MAX_USECS,
         };
         if self.features.device(NET_FEATURE_VQ_NOTF_COAL) {
-            for pair_idx in 0..self.queue_pair_count() {
+            for pair_idx in pairs {
                 let pair_idx = u16::try_from(pair_idx).map_err(|_| IoError::DeviceFault)?;
                 for queue in [rx_queue_index(pair_idx), tx_queue_index(pair_idx)] {
                     self.send_control_command(
@@ -1637,13 +1780,22 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
     /// Hands the device the indirection table and the key the driver's
     /// own demux is defined in terms of.
     ///
-    /// The table is not stored: entry `i` is `i % pairs`, which is
-    /// exactly what [`rss_indirection_entry`] computes when the receive
-    /// path has to reach the same answer in software. Programming it
-    /// this way is the whole point — a frame the device steers and a
-    /// frame the driver hashes land on the same shard.
-    fn send_rss_config(&self, expired: &mut impl FnMut() -> bool) -> Result<(), ControlError> {
-        let pairs = u16::try_from(self.queue_pair_count()).map_err(|_| IoError::DeviceFault)?;
+    /// The table is not stored: entry `i` is [`rss_live_queue`] of it,
+    /// which with every pair live is `i % pairs` — exactly what
+    /// [`rss_indirection_entry`] computes when the receive path has to
+    /// reach the same answer in software. Programming it this way is the
+    /// whole point: a frame the device steers and a frame the driver
+    /// hashes land on the same shard. With fewer pairs live, a slot
+    /// whose pair is not live is folded onto a live one the same way
+    /// the kernel folds that pair's shards, and every other slot keeps
+    /// its queue.
+    fn send_rss_config(
+        &self,
+        live: usize,
+        expired: &mut impl FnMut() -> bool,
+    ) -> Result<(), ControlError> {
+        let brought_up = self.queue_pair_count();
+        let pairs = u16::try_from(live).map_err(|_| IoError::DeviceFault)?;
         let mut payload = [0_u8; CTRL_RSS_CONFIG_PAYLOAD_BYTES];
         let mut offset = 0;
         let mut push = |bytes: &[u8]| {
@@ -1658,7 +1810,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         // the driver's own rule sends a frame with no flow to.
         push(&0_u16.to_le_bytes());
         for slot in 0..RSS_INDIRECTION_ENTRIES {
-            let queue = rss_indirection_entry(slot, usize::from(pairs));
+            let queue = rss_live_queue(slot, brought_up, live);
             push(&(queue as u16).to_le_bytes());
         }
         push(&pairs.to_le_bytes());
@@ -2932,6 +3084,7 @@ mod tests {
     use crate::resume::{DeviceReset, QuiesceError, ReinitError};
     use crate::testing::{FakeTransport, FakeTransportConfig};
     use crate::transport::{DeviceType, VirtioFeatures};
+    use helios_hal::cpu::ProcessorId;
     use helios_hal::io::IoError;
     use helios_netstack::LinkState;
 
@@ -4889,5 +5042,174 @@ mod tests {
                 device: DeviceType::Network
             })
         );
+    }
+
+    /// Plays the device on the control queue, recording every request
+    /// whole and acknowledging it.
+    fn recording_requests<'a>(
+        device: &'a VirtioNetDevice<FakeTransport>,
+        seen: &'a core::cell::RefCell<Vec<Vec<u8>>>,
+    ) -> impl FnMut() -> bool + 'a {
+        move || {
+            let state = device
+                .control
+                .as_ref()
+                .expect("the device negotiated a control queue")
+                .lock();
+            if let Some(&token) = state.queue.device_in_flight_heads().first() {
+                seen.borrow_mut().push(state.queue.device_request(token));
+                state.queue.device_respond(token, &[super::CTRL_ACK_OK]);
+                state.queue.device_complete(token, 1);
+            }
+            false
+        }
+    }
+
+    /// The indirection table and the transmit-queue count a recorded
+    /// `RSS_CONFIG` request carries.
+    fn rss_request_layout(request: &[u8]) -> (Vec<u16>, u16) {
+        assert_eq!(
+            (request[0], request[1]),
+            (super::CTRL_CLASS_MQ, super::CTRL_CMD_MQ_RSS_CONFIG)
+        );
+        // Class and command, then hash types (4), table mask (2) and the
+        // unclassified queue (2) come before the table.
+        let table_start = 2 + 4 + 2 + 2;
+        let table = (0..super::RSS_INDIRECTION_ENTRIES)
+            .map(|slot| {
+                let at = table_start + 2 * slot;
+                u16::from_le_bytes([request[at], request[at + 1]])
+            })
+            .collect();
+        let tx_at = table_start + 2 * super::RSS_INDIRECTION_ENTRIES;
+        (
+            table,
+            u16::from_le_bytes([request[tx_at], request[tx_at + 1]]),
+        )
+    }
+
+    /// Taking a pair out of service tells a steering device the smaller
+    /// count inside its RSS configuration, with every slot folded onto
+    /// the live pairs; bringing it back restores the full table and
+    /// programs the returning pair's coalescing again. A reset in
+    /// between is told the count that was live, not the bring-up one.
+    #[test]
+    fn the_live_pair_count_is_programmed_and_survives_a_reset() {
+        let device = steered_device();
+        assert_eq!(device.active_queue_pair_count(), 2);
+
+        let seen = core::cell::RefCell::new(Vec::new());
+        device
+            .program_active_pairs(1, &mut recording_requests(&device, &seen))
+            .expect("the device takes the smaller count");
+        assert_eq!(device.active_queue_pair_count(), 1);
+        let requests = seen.take();
+        assert_eq!(requests.len(), 1, "shrinking programs no coalescing");
+        let (table, transmit_queues) = rss_request_layout(&requests[0]);
+        assert!(table.iter().all(|queue| *queue == 0));
+        assert_eq!(transmit_queues, 1);
+
+        device.quiesce(|| false).expect("the control queue is idle");
+        device.transport.reset_behind_the_driver();
+        assert_eq!(
+            device.reinitialize(recording_requests(&device, &seen)),
+            Ok(DeviceReset {
+                device: DeviceType::Network
+            })
+        );
+        let (table, transmit_queues) = rss_request_layout(&seen.take()[0]);
+        assert!(table.iter().all(|queue| *queue == 0));
+        assert_eq!(transmit_queues, 1, "a reset keeps the live count");
+
+        device
+            .program_active_pairs(2, &mut recording_requests(&device, &seen))
+            .expect("the device takes the full count back");
+        let requests = seen.take();
+        let (table, transmit_queues) = rss_request_layout(&requests[0]);
+        for (slot, queue) in table.iter().enumerate() {
+            assert_eq!(usize::from(*queue), slot % 2);
+        }
+        assert_eq!(transmit_queues, 2);
+        assert_eq!(
+            requests[1..]
+                .iter()
+                .map(|request| (request[0], request[1]))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    super::CTRL_CLASS_NOTF_COAL,
+                    super::CTRL_CMD_NOTF_COAL_RX_SET
+                ),
+                (
+                    super::CTRL_CLASS_NOTF_COAL,
+                    super::CTRL_CMD_NOTF_COAL_TX_SET
+                ),
+            ],
+            "a pair that is live again has its coalescing programmed"
+        );
+    }
+
+    /// A slot keeps its queue while that queue is live, and a slot whose
+    /// queue is not live lands where the kernel folds that pair.
+    #[test]
+    fn a_shrunk_rss_table_moves_only_the_slots_of_pairs_no_longer_live() {
+        for brought_up in 1..=8usize {
+            for live in 1..=brought_up {
+                for slot in 0..super::RSS_INDIRECTION_ENTRIES {
+                    let full = super::rss_indirection_entry(slot, brought_up);
+                    let queue = super::rss_live_queue(slot, brought_up, live);
+                    assert!(queue < live);
+                    if full < live {
+                        assert_eq!(queue, full);
+                    } else {
+                        assert_eq!(queue, full % live);
+                    }
+                }
+            }
+        }
+    }
+
+    /// A device that cannot steer is told the live count through
+    /// `VQ_PAIRS_SET`.
+    #[test]
+    fn an_unsteered_device_is_told_the_live_count_through_vq_pairs_set() {
+        let device = VirtioNetDevice::build(
+            multiqueue_transport(NET_FEATURE_MQ | NET_FEATURE_CTRL_VQ, 4, &[]),
+            QueuePairBudget::new(4),
+        )
+        .expect("a four-pair device comes up");
+        let seen = core::cell::RefCell::new(Vec::new());
+        device
+            .program_active_pairs(3, &mut recording_requests(&device, &seen))
+            .expect("the device takes the smaller count");
+        assert_eq!(
+            seen.take(),
+            [alloc::vec![
+                super::CTRL_CLASS_MQ,
+                super::CTRL_CMD_MQ_VQ_PAIRS_SET,
+                3,
+                0
+            ]]
+        );
+        assert_eq!(device.active_queue_pair_count(), 3);
+    }
+
+    /// A pair's completions start on the processor its index names and
+    /// follow it when steered; a pair index past the pairs is folded the
+    /// way every other per-pair query folds it.
+    #[test]
+    fn a_steered_pair_names_its_new_owner() {
+        let device = steered_device();
+        assert_eq!(device.queue_pair_owner(1), ProcessorId::new(1));
+        device.steer_pair(1, ProcessorId::new(5));
+        assert_eq!(device.queue_pair_owner(1), ProcessorId::new(5));
+        assert_eq!(device.queue_pair_owner(0), ProcessorId::new(0));
+    }
+
+    #[test]
+    #[should_panic(expected = "asked to make 3 queue pairs live out of the 2")]
+    fn more_live_pairs_than_were_brought_up_is_a_caller_bug() {
+        let device = steered_device();
+        let _ = device.program_active_pairs(3, &mut || false);
     }
 }

@@ -49,7 +49,41 @@ enum CliError {
     #[error("{0}")]
     VenusProtocolFetch(#[from] venus_fetch::VenusFetchError),
     #[error("{0}")]
+    WasmBuild(#[from] WasmProgramsError),
+    #[error("{0}")]
     WorkspaceRoot(#[from] WorkspaceRootError),
+}
+
+/// Why the guest wasm directory `wasm-build` writes could not be produced.
+#[derive(Debug, thiserror::Error)]
+enum WasmProgramsError {
+    #[error("{0}")]
+    WorkspaceRoot(#[from] WorkspaceRootError),
+    #[error("{0}")]
+    BootPrograms(#[from] BootProgramError),
+    #[error("{0}")]
+    WasmBuild(#[from] WasmBuildError),
+    #[error("failed to create {path}: {source}")]
+    CreateDir {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to copy {from} to {to}: {source}")]
+    Copy {
+        from: String,
+        to: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error(
+        "{first} and {second} both build {artifact}; a prebuilt directory is keyed by artifact name"
+    )]
+    DuplicateArtifact {
+        artifact: String,
+        first: String,
+        second: String,
+    },
 }
 
 /// Why the root signing keypair could not be read or written.
@@ -171,6 +205,11 @@ enum WasmBuildError {
          llvm-tools component that ships it"
     )]
     LlvmArMissing { path: String },
+    #[error(
+        "prebuilt wasm {path} is missing; `helios-cli wasm-build --profile {profile}` \
+         writes the directory --prebuilt-wasm names"
+    )]
+    PrebuiltMissing { path: String, profile: String },
 }
 
 /// Why the set of boot programs could not be resolved from the
@@ -567,6 +606,13 @@ enum ProfileFetchError {
 }
 
 const COMPILER_PLUGIN_BOOTFS_PATH: &str = "bin/compiler.cwasm";
+const COMPILER_PLUGIN_MANIFEST: &str = "compiler-plugin/Cargo.toml";
+const COMPILER_PLUGIN_TARGET_DIR: &str = "compiler-plugin-target";
+const COMPILER_PLUGIN_TRIPLE: &str = "wasm32-wasip1-threads";
+/// The file the compiler plugin's `cdylib` builds to.
+const COMPILER_PLUGIN_WASM: &str = "helios_compiler_plugin.wasm";
+/// The file `programs/init` builds to.
+const INIT_WASM: &str = "helios_init.wasm";
 const COMPILER_PLUGIN_SHARED_MEMORY_MAX_BYTES: usize = 512 * 1024 * 1024;
 const LIMINE_IMAGE_BYTES: u64 = 768 * 1024 * 1024;
 const LIMINE_PARTITION_START_LBA: u32 = 2048;
@@ -600,6 +646,11 @@ enum Commands {
     KernelPrebuild(KernelPrebuildCommand),
     LimineUefiImage(LimineUefiImageCommand),
     ProfileFetch(ProfileFetchCommand),
+    /// Build the architecture-independent guest wasm once: the compiler
+    /// plugin and every program under `programs/`. `kernel-prebuild
+    /// --prebuilt-wasm` then precompiles it for a target without
+    /// building it again.
+    WasmBuild(WasmBuildCommand),
     /// Download the venus-protocol files `venus/protocol-inputs.toml` pins,
     /// which the `helios-venus` build reads.
     VenusProtocolFetch,
@@ -642,6 +693,21 @@ struct KernelPrebuildCommand {
     boot_artifacts_manifest: PathBuf,
     #[arg(long = "no-compiler-plugin", default_value_t = false)]
     no_compiler_plugin: bool,
+    /// Take the guest wasm from this directory, as `wasm-build` wrote it,
+    /// instead of building it.
+    ///
+    /// The wasm is read from `<DIR>/<profile>/`; a file that is not there
+    /// fails the prebuild, which never builds it instead. The init
+    /// program is the one `programs/init` builds, so `--init-manifest`
+    /// cannot be combined with it. A relative path is relative to the
+    /// workspace root.
+    #[arg(
+        long,
+        value_name = "DIR",
+        env = "HELIOS_PREBUILT_WASM",
+        conflicts_with = "init_manifest"
+    )]
+    prebuilt_wasm: Option<PathBuf>,
     /// Sign the payload with the 32-byte Ed25519 secret in this file
     /// instead of the key generated in `--out-dir`.
     ///
@@ -650,6 +716,17 @@ struct KernelPrebuildCommand {
     /// installed.
     #[arg(long, value_name = "PATH")]
     root_secret_key: Option<PathBuf>,
+}
+
+#[derive(Parser)]
+struct WasmBuildCommand {
+    /// Directory the wasm lands in, under `<DIR>/<profile>/`.
+    #[arg(long)]
+    out_dir: PathBuf,
+    #[arg(long, value_parser = ["release", "debug"])]
+    profile: String,
+    #[arg(long)]
+    cargo: PathBuf,
 }
 
 #[derive(Parser)]
@@ -762,12 +839,112 @@ struct ExternalBootArtifact {
 /// They travel together because each asset is compiled by the same cargo, for
 /// the same profile and target, and resolved against the same checkout.
 struct BootBuild<'a> {
-    cargo: &'a Path,
-    profile: &'a str,
+    wasm: &'a WasmSource<'a>,
     out_dir: &'a Path,
     /// The level every boot artifact is compiled for: the target's floor.
     target: &'a CwasmTarget<'a>,
     workspace_root: &'a WorkspaceRoot,
+}
+
+/// Where the architecture-independent guest wasm of a boot payload comes
+/// from: compiled by this run, or read from the directory `wasm-build`
+/// wrote. Only the precompile to a target is the payload's own work.
+enum WasmSource<'a> {
+    Build {
+        cargo: &'a Path,
+        profile: &'a str,
+        /// Where cargo's target directories go.
+        out_dir: &'a Path,
+    },
+    Prebuilt {
+        /// The profile's own directory of the prebuilt tree.
+        dir: PathBuf,
+        profile: &'a str,
+    },
+}
+
+impl<'a> WasmSource<'a> {
+    fn new(
+        cargo: &'a Path,
+        profile: &'a str,
+        out_dir: &'a Path,
+        prebuilt: Option<PathBuf>,
+    ) -> Self {
+        match prebuilt {
+            Some(root) => Self::Prebuilt {
+                dir: root.join(profile_dir_name(profile)),
+                profile,
+            },
+            None => Self::Build {
+                cargo,
+                profile,
+                out_dir,
+            },
+        }
+    }
+
+    /// The `wasm32-wasip2` core module or component `manifest_path`
+    /// builds, whose file is named `artifact_name`.
+    fn component(
+        &self,
+        manifest_path: &Path,
+        artifact_name: &str,
+    ) -> Result<PathBuf, WasmBuildError> {
+        match self {
+            Self::Build {
+                cargo,
+                profile,
+                out_dir,
+            } => build_component_program(cargo, profile, out_dir, manifest_path, artifact_name),
+            Self::Prebuilt { dir, profile } => prebuilt_wasm(dir, profile, artifact_name),
+        }
+    }
+
+    /// The in-kernel compiler's `wasm32-wasip1-threads` module.
+    fn compiler_plugin(&self, workspace_root: &WorkspaceRoot) -> Result<PathBuf, WasmBuildError> {
+        match self {
+            Self::Build {
+                cargo,
+                profile,
+                out_dir,
+            } => build_wasm_program(
+                cargo,
+                profile,
+                out_dir,
+                &workspace_root.join(Path::new(COMPILER_PLUGIN_MANIFEST)),
+                COMPILER_PLUGIN_TARGET_DIR,
+                COMPILER_PLUGIN_TRIPLE,
+                COMPILER_PLUGIN_WASM,
+            ),
+            Self::Prebuilt { dir, profile } => prebuilt_wasm(dir, profile, COMPILER_PLUGIN_WASM),
+        }
+    }
+}
+
+/// The subdirectory of a `wasm-build` tree a cargo profile's wasm lives
+/// in: the two profiles the guest programs build with.
+fn profile_dir_name(profile: &str) -> &'static str {
+    if profile == "release" {
+        "release"
+    } else {
+        "debug"
+    }
+}
+
+fn prebuilt_wasm(
+    dir: &Path,
+    profile: &str,
+    artifact_name: &str,
+) -> Result<PathBuf, WasmBuildError> {
+    let path = dir.join(artifact_name);
+    if path.is_file() {
+        Ok(path)
+    } else {
+        Err(WasmBuildError::PrebuiltMissing {
+            path: path.display().to_string(),
+            profile: profile.to_owned(),
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -796,6 +973,10 @@ fn run(cli: Cli) -> Result<(), CliError> {
             Ok(run_kernel_prebuild(command, cli.workspace_root.as_deref())?)
         }
         Commands::LimineUefiImage(command) => Ok(run_limine_uefi_image(command)?),
+        Commands::WasmBuild(command) => Ok(run_wasm_build(
+            &command,
+            &WorkspaceRoot::resolve(cli.workspace_root.as_deref())?,
+        )?),
         Commands::ProfileFetch(command) => {
             Ok(run_profile_fetch(command, cli.workspace_root.as_deref())?)
         }
@@ -841,13 +1022,16 @@ fn run_kernel_prebuild(
         &workspace_root,
     )?;
 
-    let init_component = build_component_program(
+    let wasm = WasmSource::new(
         &command.cargo,
         &command.profile,
         &command.out_dir,
-        &init_manifest,
-        "helios_init.wasm",
-    )?;
+        command
+            .prebuilt_wasm
+            .as_deref()
+            .map(|dir| workspace_root.join(dir)),
+    );
+    let init_component = wasm.component(&init_manifest, INIT_WASM)?;
     let init_cwasm = command.out_dir.join("init_component.cwasm");
     let init_component_bytes = encode_component(&init_component)?;
     // The boot payload stays at the floor level: every processor the target
@@ -863,8 +1047,7 @@ fn run_kernel_prebuild(
     })?;
 
     let build = BootBuild {
-        cargo: &command.cargo,
-        profile: &command.profile,
+        wasm: &wasm,
         out_dir: &command.out_dir,
         target: &target,
         workspace_root: &workspace_root,
@@ -1432,17 +1615,7 @@ impl Seek for FileSlice<'_> {
 }
 
 fn build_compiler_plugin_asset(build: &BootBuild<'_>) -> Result<BootAsset, BootfsError> {
-    let wasm_path = build_wasm_program(
-        build.cargo,
-        build.profile,
-        build.out_dir,
-        &build
-            .workspace_root
-            .join(Path::new("compiler-plugin/Cargo.toml")),
-        "compiler-plugin-target",
-        "wasm32-wasip1-threads",
-        "helios_compiler_plugin.wasm",
-    )?;
+    let wasm_path = build.wasm.compiler_plugin(build.workspace_root)?;
     let wasm = fs::read(&wasm_path).map_err(|source| BootfsError::Read {
         path: wasm_path.display().to_string(),
         source,
@@ -1521,24 +1694,8 @@ fn build_boot_program_assets(
     let mut manifests = Vec::new();
     let mut external_artifacts = read_external_boot_artifacts(boot_artifacts_manifest)?;
 
-    for entry in
-        fs::read_dir(&programs_root).map_err(|source| BootProgramError::ReadProgramsRoot {
-            path: programs_root.display().to_string(),
-            source,
-        })?
-    {
-        let entry = entry.map_err(|source| BootProgramError::ReadProgramsEntry { source })?;
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let Some(command) = path.file_name().and_then(|name| name.to_str()) else {
-            return Err(BootProgramError::ProgramNameNotUtf8 {
-                path: path.display().to_string(),
-            }
-            .into());
-        };
-        available_programs.insert(command.to_owned());
+    for (command, path) in program_dirs(&programs_root)? {
+        available_programs.insert(command.clone());
         // Init is built once, as the payload's init component; the
         // prebuild publishes that same artifact at `bin/init`.
         if command == INIT_COMMAND {
@@ -1546,11 +1703,11 @@ fn build_boot_program_assets(
         }
         if selected_programs
             .as_ref()
-            .is_some_and(|selected| !selected.contains(command))
+            .is_some_and(|selected| !selected.contains(&command))
         {
             continue;
         }
-        manifests.push(read_program_manifest(command, &path.join("Cargo.toml"))?);
+        manifests.push(read_program_manifest(&command, &path.join("Cargo.toml"))?);
     }
     for artifact in &external_artifacts {
         if !available_programs.insert(artifact.command.clone()) {
@@ -1596,6 +1753,92 @@ fn build_boot_program_assets(
         assets.extend(build_external_boot_artifact_assets(build, artifact)?);
     }
     Ok(assets)
+}
+
+/// Every program directory under `programs_root`, as its command name and
+/// path.
+fn program_dirs(programs_root: &Path) -> Result<Vec<(String, PathBuf)>, BootProgramError> {
+    let mut dirs = Vec::new();
+    for entry in
+        fs::read_dir(programs_root).map_err(|source| BootProgramError::ReadProgramsRoot {
+            path: programs_root.display().to_string(),
+            source,
+        })?
+    {
+        let entry = entry.map_err(|source| BootProgramError::ReadProgramsEntry { source })?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(command) = path.file_name().and_then(|name| name.to_str()) else {
+            return Err(BootProgramError::ProgramNameNotUtf8 {
+                path: path.display().to_string(),
+            });
+        };
+        dirs.push((command.to_owned(), path));
+    }
+    Ok(dirs)
+}
+
+/// Builds the compiler plugin and every program under `programs/` into
+/// `<out-dir>/<profile>/`, one file per artifact name: the wasm every
+/// target's boot payload is precompiled from.
+fn run_wasm_build(
+    command: &WasmBuildCommand,
+    workspace_root: &WorkspaceRoot,
+) -> Result<(), WasmProgramsError> {
+    let dest = command.out_dir.join(profile_dir_name(&command.profile));
+    fs::create_dir_all(&dest).map_err(|source| WasmProgramsError::CreateDir {
+        path: dest.display().to_string(),
+        source,
+    })?;
+    // Cargo's target directories sit beside the result, never in it, so
+    // what is uploaded or handed to `--prebuilt-wasm` is the wasm alone.
+    let scratch = command
+        .out_dir
+        .join(format!("{}-target", profile_dir_name(&command.profile)));
+    let wasm = WasmSource::Build {
+        cargo: &command.cargo,
+        profile: &command.profile,
+        out_dir: &scratch,
+    };
+
+    let mut built = vec![(
+        COMPILER_PLUGIN_MANIFEST.to_owned(),
+        wasm.compiler_plugin(workspace_root)?,
+    )];
+    let mut programs = program_dirs(&workspace_root.join(Path::new("programs")))?;
+    programs.sort();
+    for (command_name, path) in programs {
+        let manifest = read_program_manifest(&command_name, &path.join("Cargo.toml"))?;
+        let artifact = wasm.component(&manifest.manifest_path, &manifest.artifact_name)?;
+        built.push((manifest.manifest_path.display().to_string(), artifact));
+    }
+
+    let mut names = BTreeSet::new();
+    for (source_manifest, artifact) in &built {
+        let name = artifact
+            .file_name()
+            .expect("a built artifact is a file, which has a name");
+        if !names.insert(name.to_owned()) {
+            let first = built
+                .iter()
+                .find(|(_, other)| other.file_name() == Some(name))
+                .map_or_else(String::new, |(manifest, _)| manifest.clone());
+            return Err(WasmProgramsError::DuplicateArtifact {
+                artifact: name.to_string_lossy().into_owned(),
+                first,
+                second: source_manifest.clone(),
+            });
+        }
+        let to = dest.join(name);
+        fs::copy(artifact, &to).map_err(|source| WasmProgramsError::Copy {
+            from: artifact.display().to_string(),
+            to: to.display().to_string(),
+            source,
+        })?;
+    }
+    Ok(())
 }
 
 fn read_external_boot_artifacts(
@@ -1750,13 +1993,9 @@ fn build_boot_program_asset(
     build: &BootBuild<'_>,
     manifest: ProgramManifest,
 ) -> Result<BootAsset, BootfsError> {
-    let wasm_path = build_component_program(
-        build.cargo,
-        build.profile,
-        build.out_dir,
-        &manifest.manifest_path,
-        &manifest.artifact_name,
-    )?;
+    let wasm_path = build
+        .wasm
+        .component(&manifest.manifest_path, &manifest.artifact_name)?;
     let component_bytes = encode_component(&wasm_path)?;
     let payload =
         precompile_artifact(&component_bytes, build.target, Hint::Performance.into())?.bytes;
@@ -1991,15 +2230,10 @@ fn build_wasm_program(
         });
     }
 
-    let profile_dir = if profile == "release" {
-        "release"
-    } else {
-        "debug"
-    };
     fs::canonicalize(
         target_dir
             .join(target_triple)
-            .join(profile_dir)
+            .join(profile_dir_name(profile))
             .join(artifact_name),
     )
     .map_err(|source| WasmBuildError::ResolveArtifact {
@@ -2572,6 +2806,45 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
+
+    #[test]
+    fn a_prebuilt_tree_is_read_from_its_profile_directory() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let release = root.path().join("release");
+        fs::create_dir(&release).expect("a profile directory");
+        fs::write(release.join(INIT_WASM), b"\0asm").expect("a wasm file");
+        let source = WasmSource::new(
+            Path::new("cargo"),
+            "release",
+            Path::new("unused"),
+            Some(root.path().to_path_buf()),
+        );
+        let found = source
+            .component(Path::new("unused/Cargo.toml"), INIT_WASM)
+            .expect("the prebuilt file is found");
+        assert_eq!(found, release.join(INIT_WASM));
+    }
+
+    #[test]
+    fn a_missing_prebuilt_file_is_refused_and_never_built() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        // Only the release tree exists, so a debug prebuild finds nothing.
+        fs::create_dir(root.path().join("release")).expect("a profile directory");
+        let source = WasmSource::new(
+            Path::new("cargo"),
+            "debug",
+            Path::new("unused"),
+            Some(root.path().to_path_buf()),
+        );
+        let Err(error) = source.component(Path::new("unused/Cargo.toml"), INIT_WASM) else {
+            panic!("a file that is not there is refused");
+        };
+        assert!(
+            matches!(&error, WasmBuildError::PrebuiltMissing { path, profile }
+                if path.ends_with("debug/helios_init.wasm") && profile == "debug"),
+            "{error}"
+        );
+    }
 
     #[test]
     fn a_new_root_secret_is_readable_by_its_owner_alone() {

@@ -927,11 +927,12 @@ where
     ) -> Result<TcpReadProgress, TcpError> {
         let started = self.profile_start();
         let now = StackInstant::from_nanos(self.now_nanos());
-        let read = self.inner.state.with_handle_receive_drain(
-            stream,
-            self.inner.device.queue_pair_count().max(1),
-            |state| state.poll_tcp_read(stream, max_bytes, now),
-        )?;
+        let read =
+            self.inner
+                .state
+                .with_handle_receive_drain(stream, &self.inner.pairs, |state| {
+                    state.poll_tcp_read(stream, max_bytes, now)
+                })?;
         self.record_tcp_read_progress(profile_prefix, started, &read);
         Ok(read)
     }
@@ -944,11 +945,12 @@ where
     ) -> Result<TcpReadIntoProgress, TcpError> {
         let started = self.profile_start();
         let now = StackInstant::from_nanos(self.now_nanos());
-        let read = self.inner.state.with_handle_receive_drain(
-            stream,
-            self.inner.device.queue_pair_count().max(1),
-            |state| state.poll_tcp_read_into(stream, buffer, now),
-        )?;
+        let read =
+            self.inner
+                .state
+                .with_handle_receive_drain(stream, &self.inner.pairs, |state| {
+                    state.poll_tcp_read_into(stream, buffer, now)
+                })?;
         self.record_tcp_read_into_progress(profile_prefix, started, &read);
         Ok(read)
     }
@@ -1163,9 +1165,11 @@ where
     ///
     /// An operation sweeps every pair — it is the stack's whole driver
     /// while it runs — while a pump reclaims only the pair it owns:
-    /// every other pair has a pump of its own parked on it. A pair
-    /// another processor currently holds is skipped either way: that
-    /// processor is draining it, and this poll has nothing to add.
+    /// every other pair has a pump of its own parked on it. The sweep
+    /// covers every pair brought up, live or not, so what a pair held
+    /// when it stopped being live is still collected. A pair another
+    /// processor currently holds is skipped either way: that processor
+    /// is draining it, and this poll has nothing to add.
     fn reclaim_transmit_completions(
         &self,
         budget: usize,
@@ -1322,7 +1326,7 @@ where
         // configuration the control plane is about to push into the
         // shards. Both are interface-wide duties — an operation driving
         // the stack itself keeps them, and of the pumps only the one on
-        // the bootstrap processor's pair does, since a link or
+        // pair 0 does, since a link or
         // configuration event arrives on no pair. That pump also runs
         // the configuration state machines themselves, between the link
         // check that may have restarted them and the publication of
@@ -1479,17 +1483,18 @@ where
         };
         match scope {
             NetworkPollScope::Interface => self.inner.state.for_each(drive_tcp),
-            NetworkPollScope::Pair { pair, .. } => self
-                .inner
-                .state
-                .for_each_on_pair(pair, pair_count, drive_tcp),
+            NetworkPollScope::Pair { pair, .. } => {
+                self.inner
+                    .state
+                    .for_each_on_pair(pair, self.inner.pairs.layout(), drive_tcp)
+            }
         }
         let tcp_finished = self.profile_start();
         if let Some(probe) = tcp_read_probe {
             tcp_read_started = self.profile_start();
             tcp_read = Some(self.inner.state.with_handle_receive_drain(
                 probe.stream,
-                pair_count,
+                &self.inner.pairs,
                 |state| state.poll_tcp_read(probe.stream, probe.max_bytes, now),
             ));
             tcp_read_finished = self.profile_start();
@@ -1657,7 +1662,7 @@ pub(super) struct TcpConnectRequest {
 
 impl TcpConnectRequest {
     /// The shard the flow hashes to once it has `local_port`.
-    fn owner_of(&self, local_port: u16, shard_count: usize) -> usize {
+    pub(super) fn owner_of(&self, local_port: u16, shard_count: usize) -> usize {
         shard_idx_for_flow(
             self.local,
             local_port,
@@ -1673,24 +1678,41 @@ impl TcpConnectRequest {
         &self,
         shard: &mut NetworkShard,
         local_port: u16,
-    ) -> Result<TcpStreamId, TcpConnectStartError> {
-        shard.start_tcp_connect(
-            self.local,
-            self.destination,
-            self.port,
-            local_port,
-            self.hop_limit,
-            self.opened_at,
-        )
+    ) -> Result<OpenedTcpConnect, TcpConnectStartError> {
+        shard
+            .start_tcp_connect(
+                self.local,
+                self.destination,
+                self.port,
+                local_port,
+                self.hop_limit,
+                self.opened_at,
+            )
+            .map(|stream| OpenedTcpConnect { stream, local_port })
     }
+}
+
+/// A connection an ephemeral-port connect opened, and the port it took.
+#[derive(Clone, Copy)]
+pub(super) struct OpenedTcpConnect {
+    pub(super) stream: TcpStreamId,
+    pub(super) local_port: u16,
 }
 
 impl NetworkShardSet {
     /// Chooses an ephemeral port and opens the connection from it, as
     /// one step, from the window of shard `accepting`.
     ///
-    /// The window is walked once from a random start (RFC 6056
-    /// §3.3.1). Under one acquisition of the accepting shard's lock,
+    /// The window is walked once from a start that depends on the
+    /// destination (RFC 6056 §3.3.3, [`ConnectPortSelector`]), so
+    /// successive connects to one destination take successive
+    /// candidates and a four-tuple a peer may still hold is not drawn
+    /// again before the window has been walked. Once a candidate
+    /// opens, the destination's counter advances past it: by the
+    /// candidate's distance from the walk's start plus one, whether it
+    /// was an own-flow candidate or a foreign one, so the next walk to
+    /// that destination starts at the port after the one taken. Under
+    /// one acquisition of the accepting shard's lock,
     /// the candidates whose flow hashes back to it are tried first:
     /// the connection is then also received on the processor that
     /// opened it, with no cross-processor hop for its whole life. The
@@ -1706,17 +1728,22 @@ impl NetworkShardSet {
         request: TcpConnectRequest,
     ) -> Result<TcpStreamId, TcpError> {
         let shard_count = self.shard_count();
-        let walk = {
+        let (walk, slot) = {
             let mut shard = self.shard_at(accepting).lock();
-            let walk = shard.ephemeral_walk();
-            if let Some(stream) =
+            let (walk, slot) = shard.connect_walk(&request);
+            if let Some(opened) =
                 shard.open_tcp_connect_along_own_flows(walk, request, shard_count)?
             {
-                return Ok(stream);
+                shard.connect_taken(slot, &walk, opened.local_port);
+                return Ok(opened.stream);
             }
-            walk
+            (walk, slot)
         };
-        self.open_tcp_connect_along_foreign_flows(walk, accepting, request)
+        let opened = self.open_tcp_connect_along_foreign_flows(walk, accepting, request)?;
+        self.shard_at(accepting)
+            .lock()
+            .connect_taken(slot, &walk, opened.local_port);
+        Ok(opened.stream)
     }
 
     /// The second half of [`Self::open_ephemeral_tcp_connect`]: the
@@ -1727,7 +1754,7 @@ impl NetworkShardSet {
         walk: EphemeralWalk,
         accepting: usize,
         request: TcpConnectRequest,
-    ) -> Result<TcpStreamId, TcpError> {
+    ) -> Result<OpenedTcpConnect, TcpError> {
         let shard_count = self.shard_count();
         for candidate in walk {
             let owner = request.owner_of(candidate, shard_count);
@@ -1736,7 +1763,7 @@ impl NetworkShardSet {
                 continue;
             }
             match request.start_on(&mut self.shard_at(owner).lock(), candidate) {
-                Ok(stream) => return Ok(stream),
+                Ok(opened) => return Ok(opened),
                 Err(TcpConnectStartError::PortInUse) => {}
                 Err(TcpConnectStartError::Failed(error)) => return Err(error),
             }
@@ -1814,13 +1841,13 @@ impl NetworkShard {
         walk: EphemeralWalk,
         request: TcpConnectRequest,
         shard_count: usize,
-    ) -> Result<Option<TcpStreamId>, TcpError> {
+    ) -> Result<Option<OpenedTcpConnect>, TcpError> {
         for candidate in walk {
             if request.owner_of(candidate, shard_count) != self.shard_idx {
                 continue;
             }
             match request.start_on(self, candidate) {
-                Ok(stream) => return Ok(Some(stream)),
+                Ok(opened) => return Ok(Some(opened)),
                 Err(TcpConnectStartError::PortInUse) => {}
                 Err(TcpConnectStartError::Failed(error)) => return Err(error),
             }
