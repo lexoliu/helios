@@ -71,6 +71,7 @@ use core::sync::atomic::{AtomicU8, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 
 use crossbeam_utils::CachePadded;
 use helios_hal::cpu::{Cpu, ProcessorId, current_processor};
+use helios_hal::measured_boot::MeasuredBoot;
 use helios_hal::watchdog::Watchdog;
 
 use super::executor::{ExecutorGroup, PinnedTasks, machine_executor_group};
@@ -473,35 +474,51 @@ pub fn online_processor_count() -> usize {
 ///
 /// Both halves run on the processor whose state they bring up or tear
 /// down. `offline` either refuses with nothing changed or completes.
-pub(crate) trait ProcessorStep<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> {
-    fn online(&self, kernel: &Kernel<CpuImpl, WatchdogImpl>);
-
-    fn offline(
+pub(crate) trait ProcessorStep {
+    fn online<CpuImpl, WatchdogImpl, MeasuredBootImpl>(
         &self,
-        kernel: &Kernel<CpuImpl, WatchdogImpl>,
+        kernel: &Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
+    ) where
+        CpuImpl: Cpu + Clone,
+        WatchdogImpl: Watchdog + Clone,
+        MeasuredBootImpl: MeasuredBoot;
+
+    fn offline<CpuImpl, WatchdogImpl, MeasuredBootImpl>(
+        &self,
+        kernel: &Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
         successor: ProcessorId,
-    ) -> Result<(), OfflineRefusal>;
+    ) -> Result<(), OfflineRefusal>
+    where
+        CpuImpl: Cpu + Clone,
+        WatchdogImpl: Watchdog + Clone,
+        MeasuredBootImpl: MeasuredBoot;
 }
 
 /// `First` comes up before `Then` and goes down after it; a refusal by
 /// `First` brings `Then` back up.
-impl<CpuImpl, WatchdogImpl, First, Then> ProcessorStep<CpuImpl, WatchdogImpl> for (First, Then)
-where
-    CpuImpl: Cpu + Clone,
-    WatchdogImpl: Watchdog + Clone,
-    First: ProcessorStep<CpuImpl, WatchdogImpl>,
-    Then: ProcessorStep<CpuImpl, WatchdogImpl>,
-{
-    fn online(&self, kernel: &Kernel<CpuImpl, WatchdogImpl>) {
+impl<First: ProcessorStep, Then: ProcessorStep> ProcessorStep for (First, Then) {
+    fn online<CpuImpl, WatchdogImpl, MeasuredBootImpl>(
+        &self,
+        kernel: &Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
+    ) where
+        CpuImpl: Cpu + Clone,
+        WatchdogImpl: Watchdog + Clone,
+        MeasuredBootImpl: MeasuredBoot,
+    {
         self.0.online(kernel);
         self.1.online(kernel);
     }
 
-    fn offline(
+    fn offline<CpuImpl, WatchdogImpl, MeasuredBootImpl>(
         &self,
-        kernel: &Kernel<CpuImpl, WatchdogImpl>,
+        kernel: &Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
         successor: ProcessorId,
-    ) -> Result<(), OfflineRefusal> {
+    ) -> Result<(), OfflineRefusal>
+    where
+        CpuImpl: Cpu + Clone,
+        WatchdogImpl: Watchdog + Clone,
+        MeasuredBootImpl: MeasuredBoot,
+    {
         self.1.offline(kernel, successor)?;
         self.0.offline(kernel, successor).inspect_err(|_| {
             self.1.online(kernel);
@@ -532,63 +549,99 @@ struct WatchdogStep;
 const STEPS: (MemoryStep, (TimerStep, (ExecutorStep, WatchdogStep))) =
     (MemoryStep, (TimerStep, (ExecutorStep, WatchdogStep)));
 
-impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> ProcessorStep<CpuImpl, WatchdogImpl>
-    for MemoryStep
-{
-    fn online(&self, _kernel: &Kernel<CpuImpl, WatchdogImpl>) {}
-
-    fn offline(
+impl ProcessorStep for MemoryStep {
+    fn online<CpuImpl, WatchdogImpl, MeasuredBootImpl>(
         &self,
-        kernel: &Kernel<CpuImpl, WatchdogImpl>,
+        _kernel: &Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
+    ) where
+        CpuImpl: Cpu + Clone,
+        WatchdogImpl: Watchdog + Clone,
+        MeasuredBootImpl: MeasuredBoot,
+    {
+    }
+
+    fn offline<CpuImpl, WatchdogImpl, MeasuredBootImpl>(
+        &self,
+        kernel: &Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
         _successor: ProcessorId,
-    ) -> Result<(), OfflineRefusal> {
+    ) -> Result<(), OfflineRefusal>
+    where
+        CpuImpl: Cpu + Clone,
+        WatchdogImpl: Watchdog + Clone,
+        MeasuredBootImpl: MeasuredBoot,
+    {
         crate::memory::release_processor_frames(kernel.executor.owner_processor());
         Ok(())
     }
 }
 
-impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> ProcessorStep<CpuImpl, WatchdogImpl>
-    for TimerStep
-{
-    fn online(&self, kernel: &Kernel<CpuImpl, WatchdogImpl>) {
+impl ProcessorStep for TimerStep {
+    fn online<CpuImpl, WatchdogImpl, MeasuredBootImpl>(
+        &self,
+        kernel: &Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
+    ) where
+        CpuImpl: Cpu + Clone,
+        WatchdogImpl: Watchdog + Clone,
+        MeasuredBootImpl: MeasuredBoot,
+    {
         kernel.timer.bring_base_online();
     }
 
-    fn offline(
+    fn offline<CpuImpl, WatchdogImpl, MeasuredBootImpl>(
         &self,
-        kernel: &Kernel<CpuImpl, WatchdogImpl>,
+        kernel: &Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
         successor: ProcessorId,
-    ) -> Result<(), OfflineRefusal> {
+    ) -> Result<(), OfflineRefusal>
+    where
+        CpuImpl: Cpu + Clone,
+        WatchdogImpl: Watchdog + Clone,
+        MeasuredBootImpl: MeasuredBoot,
+    {
         kernel.timer.migrate_base(successor);
         Ok(())
     }
 }
 
-impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> ProcessorStep<CpuImpl, WatchdogImpl>
-    for ExecutorStep
-{
-    fn online(&self, kernel: &Kernel<CpuImpl, WatchdogImpl>) {
+impl ProcessorStep for ExecutorStep {
+    fn online<CpuImpl, WatchdogImpl, MeasuredBootImpl>(
+        &self,
+        kernel: &Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
+    ) where
+        CpuImpl: Cpu + Clone,
+        WatchdogImpl: Watchdog + Clone,
+        MeasuredBootImpl: MeasuredBoot,
+    {
         kernel
             .executor
             .group()
             .bring_processor_online(kernel.executor.owner_processor());
     }
 
-    fn offline(
+    fn offline<CpuImpl, WatchdogImpl, MeasuredBootImpl>(
         &self,
-        kernel: &Kernel<CpuImpl, WatchdogImpl>,
+        kernel: &Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
         successor: ProcessorId,
-    ) -> Result<(), OfflineRefusal> {
+    ) -> Result<(), OfflineRefusal>
+    where
+        CpuImpl: Cpu + Clone,
+        WatchdogImpl: Watchdog + Clone,
+        MeasuredBootImpl: MeasuredBoot,
+    {
         kernel.timer.arm_scheduler_tick();
         kernel.executor.take_offline(&kernel.cpu, successor)?;
         Ok(())
     }
 }
 
-impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> ProcessorStep<CpuImpl, WatchdogImpl>
-    for WatchdogStep
-{
-    fn online(&self, kernel: &Kernel<CpuImpl, WatchdogImpl>) {
+impl ProcessorStep for WatchdogStep {
+    fn online<CpuImpl, WatchdogImpl, MeasuredBootImpl>(
+        &self,
+        kernel: &Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
+    ) where
+        CpuImpl: Cpu + Clone,
+        WatchdogImpl: Watchdog + Clone,
+        MeasuredBootImpl: MeasuredBoot,
+    {
         let pet = kernel.spawn_watchdog_pet();
         let previous = kernel.watchdog_pet.replace(pet);
         assert!(
@@ -598,11 +651,16 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> ProcessorStep<CpuImpl
         );
     }
 
-    fn offline(
+    fn offline<CpuImpl, WatchdogImpl, MeasuredBootImpl>(
         &self,
-        kernel: &Kernel<CpuImpl, WatchdogImpl>,
+        kernel: &Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
         _successor: ProcessorId,
-    ) -> Result<(), OfflineRefusal> {
+    ) -> Result<(), OfflineRefusal>
+    where
+        CpuImpl: Cpu + Clone,
+        WatchdogImpl: Watchdog + Clone,
+        MeasuredBootImpl: MeasuredBoot,
+    {
         // Dropping the handle cancels the task; its owner's executor
         // drops the future when the executor step runs what is queued.
         drop(kernel.watchdog_pet.take());
@@ -610,7 +668,9 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> ProcessorStep<CpuImpl
     }
 }
 
-impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> Kernel<CpuImpl, WatchdogImpl> {
+impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone, MeasuredBootImpl: MeasuredBoot>
+    Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>
+{
     /// The initiator's handle on the processor lifecycle.
     pub fn processor_control(&self) -> ProcessorControl<CpuImpl> {
         ProcessorControl::new(self.cpu.clone(), self.executor.group())
