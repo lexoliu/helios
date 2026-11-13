@@ -15,9 +15,9 @@ use helios_kernel::{
     FutexKey, FutexTable, GuestAddress, Ipv4Address, Ipv4Cidr, Ipv4Route, MacAddress,
     NetworkAdminBackend, NetworkBridgeRequest, NetworkControlError, NetworkErrorDetail,
     NetworkIpAddress, NetworkPortId, Notify, PingError, PingErrorKind, PingReply,
-    ProcessMemoryIdentity, TcpAccepted, TcpError, TcpErrorKind, TcpListener, TcpReadProgress,
-    TcpWriteProgress, TryRead, TryWrite, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
-    byte_channel,
+    ProcessMemoryIdentity, RegisteredTcpReadBuffer, TcpAccepted, TcpError, TcpErrorKind,
+    TcpListener, TcpReadInto, TcpReadProgress, TcpWriteProgress, TryRead, TryWrite, UdpBinding,
+    UdpDatagram, UdpError, UdpErrorKind, byte_channel,
 };
 use spin::{Mutex, Once};
 
@@ -341,7 +341,7 @@ fn drain_byte_channel(reader: helios_kernel::ByteReader, count: usize) {
 fn futex_prepare_complete_distinct_keys(bencher: Bencher, count: usize) {
     let memory = ProcessMemoryIdentity::new(1);
     bencher.counter(ItemsCount::new(count)).bench_local(|| {
-        let mut table = FutexTable::new();
+        let table = FutexTable::new();
         let mut registrations = [const { None }; 64];
         for (index, registration) in registrations.iter_mut().take(count).enumerate() {
             *registration = Some(table.prepare_wait(FutexKey::new(
@@ -355,9 +355,8 @@ fn futex_prepare_complete_distinct_keys(bencher: Bencher, count: usize) {
                     .notify(),
             );
         }
-        for registration in registrations.into_iter().take(count).flatten() {
-            table.complete_wait(registration);
-        }
+        // Dropping a registration completes it.
+        drop(registrations);
     });
 }
 
@@ -717,6 +716,17 @@ impl ComponentNetworkService for BenchNetworkService {
         _max_bytes: usize,
     ) -> Result<TcpReadProgress, TcpError> {
         Ok(TcpReadProgress::Data(self.payload.clone()))
+    }
+
+    async fn tcp_read_into<'a>(
+        &'a self,
+        _stream: Self::TcpStream,
+        buffer: &'a mut RegisteredTcpReadBuffer<'_>,
+        _timeout_nanos: u64,
+    ) -> Result<TcpReadInto, TcpError> {
+        Ok(TcpReadInto::Data(
+            helios_netstack::TcpReceiveBuffer::write_from(buffer, &self.payload),
+        ))
     }
 
     fn tcp_send_room(&self, _stream: Self::TcpStream) -> Result<TcpWriteProgress, TcpError> {

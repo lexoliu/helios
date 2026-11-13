@@ -2,11 +2,14 @@
 //!
 //! # SMP contract
 //!
-//! There is one [`NetworkShard`] per processor and every shard owns an
-//! independent `Stack`, socket slab and port allocator. A flow belongs
-//! to exactly one shard ([`rx_frame_owner`]), so the frames for a
-//! socket are always placed in that socket's shard whichever processor
-//! drained them off the device.
+//! There is one [`NetworkShard`] per possible processor and every shard
+//! owns an independent `Stack`, socket slab and port allocator. A flow
+//! belongs to exactly one shard ([`rx_frame_owner`]), so the frames for
+//! a socket are always placed in that socket's shard whichever processor
+//! drained them off the device. The set is never re-partitioned: a
+//! processor going offline leaves its shard, its sockets and its port
+//! window where they are, and only the queue pair whose pump serves the
+//! shard changes (`routes`).
 //!
 //! One frame is the exception: a Neighbor Advertisement belongs to the
 //! whole node, because the shard that asked for the address is the one
@@ -236,6 +239,9 @@ pub(super) struct NetworkShard {
     /// Where this shard draws ephemeral ports and DNS question ids
     /// from. Touched only under the shard's lock.
     pub(super) entropy: ShardEntropy,
+    /// Where an outbound TCP connect's walk starts (RFC 6056 §3.3.3).
+    /// Touched only under the shard's lock.
+    pub(super) connect_ports: ConnectPortSelector,
     pub(super) tcp_streams: HandleSlab<helios_netstack::SocketId, MAX_TCP_STREAM_HANDLES>,
     pub(super) tcp_listeners: HandleSlab<TcpListenerState, MAX_TCP_LISTENER_HANDLES>,
     pub(super) udp_sockets: HandleSlab<UdpSocketState, MAX_UDP_SOCKET_HANDLES>,
@@ -883,7 +889,7 @@ impl NetworkShardSet {
     pub(super) fn with_handle_receive_drain<H, R>(
         &self,
         handle: H,
-        pair_count: usize,
+        pairs: &PairRoutes,
         f: impl FnOnce(&mut NetworkShard) -> R,
     ) -> R
     where
@@ -901,7 +907,7 @@ impl NetworkShardSet {
         };
         if relieved {
             self.raise_shard_progress(shard_idx);
-            let pump_shard = shard_idx % pair_count;
+            let pump_shard = pairs.pair_of_shard(shard_idx);
             if pump_shard != shard_idx {
                 self.raise_shard_progress(pump_shard);
             }
@@ -1060,16 +1066,21 @@ impl NetworkShardSet {
     /// Iterates the shards whose egress submits on `pair_idx`, calling
     /// `f` once per shard under its own lock.
     ///
-    /// Shard `s` submits on pair `s % pair_count`, so a pump that owns
-    /// a pair drives every shard that shares it — with fewer pairs than
-    /// processors, the pair's shards are exactly the ones its pump can
-    /// ever move.
-    pub(super) fn for_each_on_pair<F>(&self, pair_idx: usize, pair_count: usize, mut f: F)
+    /// A shard submits on the live pair `layout` folds it onto, so a
+    /// pump that owns a pair drives every shard that shares it — with
+    /// fewer live pairs than shards, the pair's shards are exactly the
+    /// ones its pump can ever move. One layout is used for the whole
+    /// walk, so a hand-off in the middle of it neither skips a shard
+    /// nor visits one twice.
+    pub(super) fn for_each_on_pair<F>(&self, pair_idx: usize, layout: PairLayout, mut f: F)
     where
         F: FnMut(&mut NetworkShard),
     {
-        for shard_idx in (pair_idx..self.shards.len()).step_by(pair_count) {
-            let mut guard = self.shards[shard_idx].inner.lock();
+        for (shard_idx, shard) in self.shards.iter().enumerate() {
+            if layout.pair_of_shard(shard_idx) != pair_idx {
+                continue;
+            }
+            let mut guard = shard.inner.lock();
             f(&mut guard);
         }
     }
@@ -1079,10 +1090,10 @@ impl NetworkShardSet {
     pub(super) fn pair_tcp_deadline_nanos(
         &self,
         pair_idx: usize,
-        pair_count: usize,
+        layout: PairLayout,
     ) -> Option<u64> {
         let mut next = None;
-        self.for_each_on_pair(pair_idx, pair_count, |shard| {
+        self.for_each_on_pair(pair_idx, layout, |shard| {
             if let Some(deadline) = shard.stack.next_tcp_deadline().map(StackInstant::nanos) {
                 next = Some(next.map_or(deadline, |current: u64| current.min(deadline)));
             }
@@ -1138,11 +1149,14 @@ impl NetworkShard {
             "DHCP internal UDP socket slot changed"
         );
         let dhcp = DhcpClient::new(stack.config().mac, transaction_id);
+        let mut entropy = ShardEntropy::derive(root_entropy, shard_idx);
+        let connect_ports = ConnectPortSelector::new(&mut entropy);
         Self {
             stack,
             shard_idx,
             shard_count,
-            entropy: ShardEntropy::derive(root_entropy, shard_idx),
+            entropy,
+            connect_ports,
             tcp_streams: HandleSlab::new(),
             tcp_listeners: HandleSlab::new(),
             udp_sockets,
@@ -1234,13 +1248,35 @@ impl NetworkShard {
     }
 
     /// A walk over every port in this shard's window, from a random
-    /// starting point (RFC 6056 §3.3.1). An allocation takes the first
-    /// port it finds suitable, and gives up only after the whole window
-    /// has been tried.
+    /// starting point (RFC 6056 §3.3.1), for an allocation with no peer
+    /// whose four-tuple a previous use could leave held: a UDP socket
+    /// or a listener. An allocation takes the first port it finds
+    /// suitable, and gives up only after the whole window has been
+    /// tried. An outbound TCP connect uses
+    /// [`Self::connect_walk`] instead.
     pub(super) fn ephemeral_walk(&mut self) -> EphemeralWalk {
         let (first, last) = self.ephemeral_window();
         let offset = self.entropy.below(EphemeralWalk::window_len(first, last));
         EphemeralWalk::starting_at(first, last, offset)
+    }
+
+    /// The walk over this shard's window for an outbound TCP connect to
+    /// `request`'s destination (RFC 6056 §3.3.3), and the counter to
+    /// [`Self::connect_taken`] once a port is taken.
+    pub(super) fn connect_walk(&self, request: &TcpConnectRequest) -> (EphemeralWalk, ConnectSlot) {
+        let (first, last) = self.ephemeral_window();
+        self.connect_ports.walk(
+            first,
+            last,
+            request.local,
+            request.destination,
+            request.port,
+        )
+    }
+
+    /// Records that a connect which started at `walk` took `port`.
+    pub(super) fn connect_taken(&mut self, slot: ConnectSlot, walk: &EphemeralWalk, port: u16) {
+        self.connect_ports.advance(slot, walk, walk.steps_to(port));
     }
 
     pub(super) fn add_ipv4_address(

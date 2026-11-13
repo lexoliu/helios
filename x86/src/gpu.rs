@@ -15,7 +15,7 @@ use helios_virtio::{DeviceType, VirtioGpuDevice, VirtioPciTransport};
 use pci_types::PciAddress;
 
 use crate::iommu::X86DmaPool;
-use crate::pci::PciRoot;
+use crate::pci::{PciRoot, VirtioFunctions};
 
 type X86VirtioGpuDevice = VirtioGpuDevice<VirtioPciTransport<X86DmaPool>>;
 
@@ -31,8 +31,8 @@ impl ExternalInterruptHandler for VirtioDisplayDevice {
 }
 
 /// The PCI function that carries the platform's display engine.
-pub(crate) fn discover(pci: &PciRoot) -> Option<PciAddress> {
-    pci.find_virtio_function(DeviceType::Gpu)
+pub(crate) fn discover(virtio: &VirtioFunctions) -> Option<PciAddress> {
+    virtio.find_virtio_function(DeviceType::Gpu)
 }
 
 /// Brings up the virtio-gpu function at `address` and hands it to the

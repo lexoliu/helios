@@ -75,11 +75,13 @@ pub use reservations::{
     ReservationLookup, ReservationTracker, SwapEntry, VaCursor, ranges_outside, validate_range,
 };
 pub use swap::{
-    AGE_BATCH_PAGES, IDLE_SWAP_AFTER, InstalledAddressSpace, SWAP_BATCH_BYTES, SWAP_TICK,
-    SwapDisabled, SwapFaultError, SwapHandle, SwapLeafFormat, SwapSpace, SwapStats, SwapVmHooks,
-    disable_swap, install_swap, install_swap_hooks, installed_swap_handle, installed_swap_hooks,
-    swap_vm_hooks, swapped_token,
+    AGE_BATCH_PAGES, GuestResidency, IDLE_SWAP_AFTER, InstalledAddressSpace, SWAP_BATCH_BYTES,
+    SWAP_TICK, SwapDisabled, SwapFaultError, SwapFaultIn, SwapHandle, SwapLeafFormat, SwapSpace,
+    SwapStats, SwapVmHooks, disable_swap, install_swap, install_swap_hooks, installed_swap_handle,
+    installed_swap_hooks, swap_vm_hooks, swapped_token,
 };
+#[cfg(test)]
+pub(crate) use swap::{GUEST_SWAP_PAGE, GuestSwap};
 pub use user::{
     UserHeapStats, UserMemoryPool, allocate_user_frame_uninit_on, allocate_user_frame_zeroed,
     allocate_user_frame_zeroed_on, allocate_user_memory_pool, allocate_user_run_zeroed_on,

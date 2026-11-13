@@ -117,14 +117,14 @@ pub use exec::{
     NotifyWaiter, ObservationScope, OfflineError, OfflineRefusal, OnlineError, OnlineSet,
     OwnInstance, OwnedRawMutexLease, OwnedRawRwLockReadLease, OwnedRawRwLockWriteLease,
     PerfMetricFilter, PerfMetricHistory, PerfMetricSample, PerfSample, PinnedTasks, PrefixSet,
-    PrefixSetError, PressureLevel, ProcessorControl, ProfileFilter, ProfileHistory, ProfileScope,
-    ProfileSink, ProgressChanged, ProgressMark, ProgressSignal, RawMutex, RawMutexLease, RawRwLock,
-    RawRwLockReadLease, RawRwLockWriteLease, ReadyLink, RwLock, RwLockReadGuard, RwLockWriteGuard,
-    Sleep, Spawner, StatsSample, TaskCapacityError, TaskFunding, Timer, TraceEvent, TraceField,
-    TraceFilter, TraceHistory, TraceLevel, TraceLog, TraceValue, UptimeClock, YieldNow,
-    elapsed_millis, matches_perf_metric_filter, matches_profile_filter, matches_trace_filter,
-    monotonic_nanos, online_processor_count, parse_console_text, wall_clock_offset_nanos,
-    yield_now,
+    PrefixSetError, PressureLevel, ProcessorControl, ProcessorLifecycle, ProfileFilter,
+    ProfileHistory, ProfileScope, ProfileSink, ProgressChanged, ProgressMark, ProgressSignal,
+    RawMutex, RawMutexLease, RawRwLock, RawRwLockReadLease, RawRwLockWriteLease, ReadyLink, RwLock,
+    RwLockReadGuard, RwLockWriteGuard, Sleep, Spawner, StatsSample, TaskCapacityError, TaskFunding,
+    Timer, TraceEvent, TraceField, TraceFilter, TraceHistory, TraceLevel, TraceLog, TraceValue,
+    UptimeClock, YieldNow, elapsed_millis, matches_perf_metric_filter, matches_profile_filter,
+    matches_trace_filter, monotonic_nanos, online_processor_count, parse_console_text,
+    wall_clock_offset_nanos, yield_now,
 };
 pub use gpu::{
     ContextRecord, ContextShared, Gpu3dOwnership, Gpu3dSender, Gpu3dService, Gpu3dServiceError,
@@ -187,8 +187,8 @@ pub use memory::{
     KERNEL_HEAP_RESERVE_FRACTION, KernelPhysFrameAllocator, MemoryOwner, NoCryptographicEntropy,
     NoEntropyDevice, ROOT_ENTROPY_MATERIAL_BYTES, RegionShares, ReleasedReservation,
     ReservationLookup, ReservationTracker, RootEntropy, RootEntropyHandle, SWAP_BATCH_BYTES,
-    SWAP_TICK, StackFault, SwapDisabled, SwapEntry, SwapFaultError, SwapHandle, SwapLeafFormat,
-    SwapSpace, SwapStats, SwapVmHooks, TASK_ARENA_FRACTION, TASK_ARENA_MIN_BYTES,
+    SWAP_TICK, StackFault, SwapDisabled, SwapEntry, SwapFaultError, SwapFaultIn, SwapHandle,
+    SwapLeafFormat, SwapSpace, SwapStats, SwapVmHooks, TASK_ARENA_FRACTION, TASK_ARENA_MIN_BYTES,
     USER_POOL_MIN_REGION_BYTES, UserHeapStats, UserMemoryOwnerScope, UserMemoryOwners,
     UserMemoryPool, VaCursor, allocate_user_frame_uninit_on, allocate_user_frame_zeroed,
     allocate_user_frame_zeroed_on, allocate_user_memory_pool, allocate_user_run_zeroed_on,
@@ -214,19 +214,21 @@ pub use network::{
     validate_http_path_with_query, validate_http_status_code,
 };
 pub use process::{
-    AudioClaimCap, ClockAuthorityRights, CompileAuthority, DescriptorEntry, DescriptorId,
-    DescriptorLimit, DescriptorTable, DescriptorTableError, DeviceClassRights, DeviceGrantClaimCap,
-    DiagnosticAuthorityRights, DirectoryAuthorityRights, DirectoryCap, DirectoryPreopen,
-    DisplayClaimCap, DnsCap, ExecAuthority, ForkAuthority, FutexKey, FutexTable,
-    FutexWaitRegistration, GpuOpenCap, GuestAddress, InputClaimCap, JoinAuthority,
-    LinkAuthorityRights, LinkSourceCap, LinkTargetDirectoryCap, MountAuthorityRights, MountCap,
-    MulticastCap, NetworkAdminCap, NetworkAuthorityRights, NetworkCap, ObserveMachineCap,
-    PrivilegedBindCap, ProcessAuthority, ProcessAuthorityError, ProcessAuthorityRights, ProcessId,
+    AudioClaimCap, ClockAuthorityRights, CompileAuthority, ComponentStdioRefusal,
+    ControlProcessorsCap, DescriptorEntry, DescriptorId, DescriptorLimit, DescriptorTable,
+    DescriptorTableError, DeviceClassRights, DeviceGrantClaimCap, DiagnosticAuthorityRights,
+    DirectoryAuthorityRights, DirectoryCap, DirectoryPreopen, DisplayClaimCap, DnsCap,
+    ExecAuthority, ForkAuthority, FutexKey, FutexTable, FutexWaitRegistration, GpuOpenCap,
+    GuestAddress, InputClaimCap, JoinAuthority, LinkAuthorityRights, LinkSourceCap,
+    LinkTargetDirectoryCap, MachineAuthorityRights, MountAuthorityRights, MountCap, MulticastCap,
+    NetworkAdminCap, NetworkAuthorityRights, NetworkCap, ObserveMachineCap, PrivilegedBindCap,
+    ProcessAuthority, ProcessAuthorityError, ProcessAuthorityRights, ProcessId,
     ProcessMemoryIdentity, ProcessRecord, ProcessState, ProcessTable, ProcessTableError,
     ProgramExecError, ProgramExecErrorDetail, ProgramExecErrorKind, ProgramOutOfMemory,
     RuntimeMessage, SetWallClockCap, SignalAuthority, SpawnAuthority, SymlinkCreateCap,
     SymlinkReadCap, TcpCap, TerminalAuthorityRights, TerminalInputCap, TerminalOutputCap, ThreadId,
-    ThreadRecord, ThreadState, ThreadTable, ThreadTableError, TtyControlCap, UdpCap, UnmountCap,
+    ThreadRecord, ThreadState, ThreadTable, ThreadTableError, TtyControlCap, UdpCap,
+    UnbindableStdio, UnmountCap,
 };
 pub use profiling::{
     CodeAttribution, InstructionProfile, InstructionProfileError, InstructionSampler,
@@ -240,8 +242,8 @@ pub use runtime::{
     HostFilledWrite, HostFsError, HostFsErrorKind, HostMetadata, HostShareRestore, HostWrite,
     Ipv4Address, NetworkErrorDetail, NetworkHandle, NetworkIpAddress, NetworkPacketPump,
     ObjectIdentity, PingError, PingErrorKind, PingReply, RegisteredTcpReadBuffer, RuntimeState,
-    SocketReadiness, TcpAccepted, TcpError, TcpErrorKind, TcpListener, TcpReadProgress,
-    TcpWriteProgress, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
+    SocketReadiness, TcpAccepted, TcpError, TcpErrorKind, TcpListener, TcpReadInto,
+    TcpReadProgress, TcpWriteProgress, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
 };
 pub use signing_key::{
     CwasmSigningKey, PAYLOAD_REGISTER, ProvisionCause, SeedSource, SettledSigningKey,
@@ -988,10 +990,21 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone, MeasuredBootImpl: Mea
     }
 
     pub fn run_until_stalled_with_stats(&self) -> KernelRunStats {
+        self.run_until_stalled_with_steps(&())
+    }
+
+    /// [`Self::run_until_stalled_with_stats`] for a run loop whose layer
+    /// owns per-processor state of its own: `steps` goes down first and
+    /// comes up last when this processor goes offline and back
+    /// (`exec::lifecycle`).
+    pub(crate) fn run_until_stalled_with_steps<Steps: exec::ProcessorStep>(
+        &self,
+        steps: &Steps,
+    ) -> KernelRunStats {
         // Every run loop comes through here between tasks, holding
         // nothing, which is where a processor asked to go offline tears
         // itself down and stops.
-        self.service_lifecycle();
+        self.service_lifecycle(steps);
         // The page-fault path that commits a fiber stack page takes its
         // frame from this processor's reserve and may not wait on the
         // pool's lock to refill it, so the refill happens here instead:
@@ -1033,8 +1046,14 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone, MeasuredBootImpl: Mea
     }
 
     pub fn run(&self) -> ! {
+        self.run_with_steps(&())
+    }
+
+    /// [`Self::run`] for a run loop whose layer owns per-processor state
+    /// of its own, as [`Self::run_until_stalled_with_steps`] describes.
+    pub(crate) fn run_with_steps<Steps: exec::ProcessorStep>(&self, steps: &Steps) -> ! {
         loop {
-            if self.run_until_stalled() == 0 {
+            if self.run_until_stalled_with_steps(steps).progress_count() == 0 {
                 self.park_until_work();
             }
         }

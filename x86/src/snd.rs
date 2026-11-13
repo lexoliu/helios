@@ -15,7 +15,7 @@ use helios_virtio::{DeviceType, VirtioPciTransport, VirtioSndDevice};
 use pci_types::PciAddress;
 
 use crate::iommu::X86DmaPool;
-use crate::pci::PciRoot;
+use crate::pci::{PciRoot, VirtioFunctions};
 
 type X86VirtioSndDevice = VirtioSndDevice<VirtioPciTransport<X86DmaPool>>;
 
@@ -36,8 +36,8 @@ impl ExternalInterruptHandler for VirtioSoundDevice {
 }
 
 /// The PCI function that carries the platform's sound device.
-pub(crate) fn discover(pci: &PciRoot) -> Option<PciAddress> {
-    pci.find_virtio_function(DeviceType::Sound)
+pub(crate) fn discover(virtio: &VirtioFunctions) -> Option<PciAddress> {
+    virtio.find_virtio_function(DeviceType::Sound)
 }
 
 /// Brings up the virtio-snd function at `address` and hands it to the

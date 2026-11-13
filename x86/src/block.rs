@@ -23,7 +23,7 @@ use pci_types::PciAddress;
 use crate::X86Cpu;
 use crate::exceptions::BLOCK_INTERRUPT_VECTORS;
 use crate::iommu::X86DmaPool;
-use crate::pci::PciRoot;
+use crate::pci::{PciRoot, VirtioFunctions};
 
 pub(crate) type X86VirtioBlockDevice =
     VirtioBlockResource<VirtioPciTransport<X86DmaPool>, X86Cpu, helios_kernel::BlockPages>;
@@ -48,8 +48,8 @@ impl ExternalInterruptHandler for VirtioBlockDevice {
 
 /// Every PCI function that carries a block device, up to the block
 /// interrupt vectors this backend has; the rest are refused by name.
-pub(crate) fn discover(pci: &PciRoot) -> Vec<PciAddress> {
-    helios_kernel::admit_block_devices(pci.find_virtio_functions(DeviceType::Block).collect())
+pub(crate) fn discover(virtio: &VirtioFunctions) -> Vec<PciAddress> {
+    helios_kernel::admit_block_devices(virtio.find_virtio_functions(DeviceType::Block).collect())
 }
 
 /// Brings up every block function and hands them to the kernel, which
