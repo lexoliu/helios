@@ -20,27 +20,27 @@ echo "target $target"
 # run under it.
 /host/tcp-throughput.wasm "$host" "$port" "$bytes" &
 
-# An offline is refused while the interface is still bringing itself up
-# (its queue pair cannot be handed off yet), which is also before the
-# transfer can connect, so the first offline waits for the network.
-attempt=1
-until cpu offline "$target" 2>&1; do
-    attempt=$((attempt + 1))
-    if [ "$attempt" -gt 200 ]; then
-        echo "status:first-offline-refused"
+# The cycles start once the transfer is demonstrably moving: the host
+# peer writes `transfer-begun` into the share after it has sent more
+# than the guest's receive window and its own send buffer hold, so the
+# guest has read bytes by then. A transfer that ends first, whatever
+# ended it, leaves `transfer-ended` instead, and no cycle runs.
+until [ -e /host/transfer-begun ]; do
+    if [ -e /host/transfer-ended ]; then
+        echo "status:transfer-ended-before-it-began"
+        cycles=0
         break
     fi
 done
+echo "transfer:begun"
 
 cycle=1
 while [ "$cycle" -le "$cycles" ]; do
+    cpu offline "$target" || echo "status:cycle-offline $?"
     echo "sets:offline $(cpu list)"
     cpu online "$target" || echo "status:cycle-online $?"
     echo "sets:online $(cpu list)"
     cycle=$((cycle + 1))
-    if [ "$cycle" -le "$cycles" ]; then
-        cpu offline "$target" || echo "status:cycle-offline $?"
-    fi
 done
 echo "cycles:done"
 

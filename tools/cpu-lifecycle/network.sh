@@ -13,7 +13,9 @@
 # the extra options name them (`--net-ifname`, `--net-bridge`). The host
 # peer is reached on the bridge's address, `HELIOS_NET_HOST` (default
 # `10.77.0.1`, the address `net-setup` gives the bridge). Run from the
-# repository root: the host share is `artifacts/wasi-tools`.
+# repository root: the guest's host share is `<runtime-dir>/share`, which
+# holds a copy of `artifacts/wasi-tools/tcp-throughput.wasm` and the
+# markers the host peer writes as the transfer progresses.
 set -euo pipefail
 
 inspector="${1:?inspector binary}"
@@ -33,10 +35,20 @@ bytes=17179869184
 cycles=40
 download_port=45871
 upload_port=45872
+# 64 MiB: the bytes the peer sends before it marks the transfer begun. Its
+# kernel can hold at most the guest's 1 MiB receive window
+# (`TCP_RECEIVE_WINDOW_BYTES`, netstack/src/tcp.rs) plus its own send
+# buffer, whose ceiling is Linux's `net.ipv4.tcp_wmem` maximum (4 MiB by
+# default), so past this the guest has read what the rest was.
+begun_bytes=67108864
 
 mkdir -p "$runtime"
 out="$runtime/shell.out"
 script="$runtime/network-guest.sh"
+share="$runtime/share"
+rm -rf "$share"
+mkdir "$share"
+cp artifacts/wasi-tools/tcp-throughput.wasm "$share/"
 {
     printf 'host=%s\nport=%s\nbytes=%s\ncycles=%s\n' \
         "$host" "$download_port" "$bytes" "$cycles"
@@ -44,10 +56,12 @@ script="$runtime/network-guest.sh"
 } >"$script"
 
 # The host peer, the same server `workload-bench` runs `tcp-throughput`
-# against.
+# against, writing its progress markers into the guest's share.
 python3 tools/wasi-apps/tcp_throughput_server.py --host 0.0.0.0 \
     --download-port "$download_port" --upload-port "$upload_port" \
-    --payload-bytes "$bytes" >"$runtime/peer.log" 2>&1 &
+    --payload-bytes "$bytes" \
+    --progress-dir "$share" --begun-bytes "$begun_bytes" \
+    >"$runtime/peer.log" 2>&1 &
 peer=$!
 trap 'kill "$peer" 2>/dev/null || true' EXIT
 
@@ -55,7 +69,7 @@ trap 'kill "$peer" 2>/dev/null || true' EXIT
     --runtime-dir "$runtime" --keep-runtime-dir \
     --smp "$processors" --net-backend tap --net-queues "$processors" \
     --boot-program dash --boot-program debugger --boot-program cpu \
-    --shared-dir artifacts/wasi-tools \
+    --shared-dir "$share" \
     "$@" \
     shell "$script" 2>&1 >"$out" | tee "$runtime/inspector.log"
 cat "$out"
@@ -83,12 +97,18 @@ if grep -q '^status:' "$out"; then
     fail "a request failed: $(grep '^status:' "$out")"
 fi
 
-# The transfer completed in full, and the cycles all ran before it did,
-# so the transitions were taken under it.
+# The transfer completed in full, the cycles began only once it was
+# moving, and they all ran before it finished, so every transition was
+# taken under it.
 expect_line "tcp-throughput:$bytes"
+expect_line "transfer:begun"
 expect_line "cycles:done"
+begun="$(grep -nFx -m1 'transfer:begun' "$out" | cut -d: -f1)"
+first_offline="$(grep -nFx -m1 "offline $target" "$out" | cut -d: -f1)"
 cycles_done="$(grep -nFx -m1 'cycles:done' "$out" | cut -d: -f1)"
 transferred="$(grep -nFx -m1 "tcp-throughput:$bytes" "$out" | cut -d: -f1)"
+test -n "$first_offline" && test "$begun" -lt "$first_offline" ||
+    fail "the first offline ran before the transfer had begun"
 test "$cycles_done" -lt "$transferred" ||
     fail "the transfer finished before the cycles did, so not every one ran under it"
 
