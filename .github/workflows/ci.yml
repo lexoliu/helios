@@ -1485,6 +1485,8 @@ jobs:
           # shell's own stdout still works after that redirection (#904).
           runtime="$GITHUB_WORKSPACE/smoke-runtime/coreutils"
           mkdir -p "$runtime"
+          # The single-quoted -c argument is the guest dash's command line; $(date) must reach dash unexpanded, so the host shell must not expand it.
+          # shellcheck disable=SC2016
           ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
             --accel kvm \
             --runtime-dir "$runtime" --keep-runtime-dir \
