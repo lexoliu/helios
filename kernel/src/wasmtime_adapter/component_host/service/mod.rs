@@ -2224,7 +2224,6 @@ where
         let header = CompilerRequestHeader {
             abi_version: HELIOS_COMPILER_ABI_VERSION,
             hint: u32::from(match hint {
-                AotCompileHint::Fast => CompilerAbiHint::Fast,
                 AotCompileHint::Balanced => CompilerAbiHint::Balanced,
                 AotCompileHint::Performance => CompilerAbiHint::Performance,
             }),
@@ -4386,5 +4385,32 @@ mod tests {
                 .set_time(WASIX_SOCK_OPTION_SEND_BUF_SIZE, None),
             p1::errno::INVAL
         );
+    }
+
+    /// An exec of a path the authority admits but no file backs is the
+    /// filesystem's no-entry, not an authority refusal (#502): the kind is
+    /// `NotFound`, the detail carries the filesystem's error, and the
+    /// guest reads `ENOENT`.
+    #[test]
+    fn wasix_exec_of_a_missing_program_file_is_not_found() {
+        let namespace = Namespace::<crate::UnsupportedHostFileSystem>::new(crate::MountTable::new(
+            crate::BootFs::new(crate::EmbeddedBootFs::new(&[], &[]), crate::BOOT_DEVICE),
+            1,
+        ));
+        let authority = ProcessAuthority::root();
+
+        let error = futures_lite::future::block_on(read_program_source_from(
+            &namespace, &authority, "/forged",
+        ))
+        .err()
+        .expect("a path no file backs cannot be read as a program");
+
+        assert_eq!(error.kind, ProgramExecErrorKind::NotFound);
+        assert_eq!(
+            error.detail,
+            ProgramExecErrorDetail::ProgramSourceUnreadable(helios_hal::fs::FsError::NoEntry),
+            "the filesystem's own error travels in the detail"
+        );
+        assert_eq!(p1_errno_from_program_exec_error(&error), p1::errno::NOENT);
     }
 }

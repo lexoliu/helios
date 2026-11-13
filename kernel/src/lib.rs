@@ -165,8 +165,9 @@ pub use kernel_exception::{
     dispatch_native_trap, install_native_trap_handler,
 };
 pub use machine::{
-    AdvanceCause, DeviceResets, Generation, MachineGeneration, MachineGenerationHandle,
-    ResetDevice, UnhandledAdvances, install_generation_reactions,
+    AdvanceCause, DeviceResets, GENERATION_PROBE_INTERVAL, Generation, MachineGeneration,
+    MachineGenerationHandle, ResetDevice, UnhandledAdvances, install_generation_reactions,
+    spawn_generation_probe,
 };
 pub use memory::{
     AGE_BATCH_PAGES, AccessibilityPlan, BalloonHandle, BalloonStats, BootMemoryPlan,

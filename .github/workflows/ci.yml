@@ -933,6 +933,9 @@ jobs:
           grep -aF 'mount source online serial="src-a"' "$runtime/debug-serial.log" | grep -aF 'read_only=false'
           grep -aF 'mount source online serial="src-b"' "$runtime/debug-serial.log" | grep -aF 'read_only=true'
           grep -aF 'block device identified as the kernel scratch disk serial="helios-data"' "$runtime/debug-serial.log"
+          # The inspector attaches `vmgenid` on the x86 profile, so the
+          # guest has to have found its generation ID window (#572).
+          grep -aF 'vmgenid online' "$runtime/debug-serial.log"
       - name: Run the coreutils applets through dash
         timeout-minutes: 5
         shell: bash
