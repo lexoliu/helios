@@ -142,12 +142,43 @@ test-units:
     # generated encoders with the pinned Mesa generator's output.
     cargo run -p helios-cli --quiet -- venus-protocol-fetch
     cargo nextest run -p helios-venus -p helios-venus-gen
+    # The ACPI library runs QEMU's own CPU hotplug AML, from the pinned
+    # tables the fetch below hash-verifies.
+    just acpi-tables-fetch
+    cargo nextest run -p helios-acpi
     cargo nextest run -p helios-kernel --test hal_layering
     # The hosted backend boots the same kernel on the host OS; its tests
     # cover the memory-policy density checks and the OOM killer, and
     # `embedded_debugger_is_provisioned` reads the prebuild payload above.
     HELIOS_BOOTFS="${out_dir}/helios-bootfs" cargo nextest run -p helios-hosted
     python3 "{{repo_root}}/x86/tests/interrupt_state.py"
+
+# Fetch the ACPI tables `acpi/tests/qemu-tables.sha256` pins — QEMU's own
+# expected tables for its q35 machine, from its `tests/data/acpi` at the
+# v9.2.0 commit — into `target/acpi-tables` (or `$HELIOS_ACPI_TABLES_DIR`).
+# A file already there at its pinned hash is kept; a fetched one replaces
+# nothing unless it matches.
+acpi-tables-fetch:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # QEMU v9.2.0.
+    commit="ae35f033b874c627d81d51070187fbf55f0bf1a7"
+    dir="${HELIOS_ACPI_TABLES_DIR:-{{repo_root}}/target/acpi-tables}"
+    while read -r hash path; do
+        file="${dir}/${path}"
+        if [[ -f "${file}" ]] && echo "${hash}  ${file}" | shasum -a 256 -c --status; then
+            continue
+        fi
+        mkdir -p "$(dirname "${file}")"
+        curl --fail --silent --show-error --location --retry 3 --output "${file}.part" \
+            "https://gitlab.com/qemu-project/qemu/-/raw/${commit}/tests/data/acpi/${path}"
+        if ! echo "${hash}  ${file}.part" | shasum -a 256 -c --status; then
+            echo "QEMU ${path} at ${commit} does not hash to the pinned ${hash}; nothing was stored" >&2
+            rm -f "${file}.part"
+            exit 1
+        fi
+        mv "${file}.part" "${file}"
+    done < "{{repo_root}}/acpi/tests/qemu-tables.sha256"
 
 # Mount the EROFS images `mkfs.erofs` builds, intact and corrupted. Needs
 # erofs-utils on PATH; the `erofs-rs` builder's images run in test-units.

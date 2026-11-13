@@ -5,7 +5,7 @@ version = 4
 [[package]]
 name = "acpi"
 version = "7.0.0-pre1"
-source = "git+https://github.com/lexoliu/acpi?branch=fix%2Fsrat-slit-accessors#87886866cba621c2b6f567e039f6a327139a1cdf"
+source = "git+https://github.com/lexoliu/acpi?branch=helios#66a72c1d9418d18a9723b4a6123de3e4014189f4"
 dependencies = [
  "bit_field",
  "bitflags 2.13.1",
@@ -1960,6 +1960,7 @@ dependencies = [
  "bytes",
  "critical-section",
  "fdt",
+ "helios-acpi",
  "helios-artifact",
  "helios-firmware",
  "helios-hal",
@@ -1974,6 +1975,18 @@ dependencies = [
  "tracing",
  "triomphe",
  "zeroize",
+]
+
+[[package]]
+name = "helios-acpi"
+version = "0.1.0"
+dependencies = [
+ "acpi",
+ "helios-hal",
+ "hex",
+ "sha2 0.10.9",
+ "thiserror 2.0.21",
+ "tracing",
 ]
 
 [[package]]
@@ -2273,6 +2286,7 @@ dependencies = [
  "console",
  "crossterm",
  "directories",
+ "ed25519-dalek",
  "futures-io",
  "futures-lite",
  "futures-util",
@@ -2285,6 +2299,7 @@ dependencies = [
  "indicatif",
  "ipnet",
  "libc",
+ "memchr",
  "nu-ansi-term",
  "object",
  "ratatui",
@@ -2559,6 +2574,7 @@ dependencies = [
  "bitflags 2.13.1",
  "bytes",
  "critical-section",
+ "helios-acpi",
  "helios-artifact",
  "helios-firmware",
  "helios-hal",

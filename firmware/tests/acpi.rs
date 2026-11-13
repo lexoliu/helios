@@ -6,7 +6,8 @@
 
 use std::ptr::NonNull;
 
-use acpi::{AcpiTables, Handler, PciAddress, RawPhysicalMapping};
+use acpi::aml::AmlError;
+use acpi::{AcpiTables, Handle, Handler, PciAddress, RawPhysicalMapping};
 use helios_firmware::{
     AcpiNuma, FirmwareNumaError, GiccUidKey, LocalApicKey, ProcessorIdentities, SratProcessorKey,
 };
@@ -121,6 +122,18 @@ impl Handler for HostMemory {
 
     fn sleep(&self, _milliseconds: u64) {
         unreachable!("the NUMA reader keeps no time")
+    }
+
+    fn create_mutex(&self) -> Handle {
+        unreachable!("the NUMA reader runs no AML")
+    }
+
+    fn acquire(&self, _mutex: Handle, _timeout: u16) -> Result<(), AmlError> {
+        unreachable!("the NUMA reader runs no AML")
+    }
+
+    fn release(&self, _mutex: Handle) {
+        unreachable!("the NUMA reader runs no AML")
     }
 }
 

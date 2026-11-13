@@ -24,7 +24,7 @@ never depends on anything above it.
 | Backends | `aarch64/`, `riscv/`, `x86/`, `hosted/` | Boot, trap, IRQ, timer, MMIO, UART, virtio transport and SMP wiring, and nothing else. `hosted/` runs the same kernel on the host OS under the same restriction. |
 | Kernel image | the root crate `helios` (`src/`) | The binary that links whichever backend the target selects, and runs `hosted` on the host. |
 | User space | `api/`, `api-macro/`, `programs/*`, `venus/` | The userland SDK and the wasm programs, kernel plugins included: `init`, `debugger`, `http-client`, `date`, `ping`, `perf`, `oob-load`. `compiler-plugin/` is the in-kernel compiler, a kernel plugin built by the host tools. `venus/` is the Venus wire protocol a program's GPU driver links: the hand-written sinks and the encoders generated at build time. |
-| Host tools | `inspector/`, `inspector-protocol/`, `cli/`, `compiler-support/`, `compiler-host/`, `profdata/`, `venus-gen/`, `workspace-root/` | `std` crates that boot, build and observe a guest. `inspector-protocol/` is the WIT RPC contract between the inspector and the guest debugger. `profdata/` is the kernel profile's header check and fetched-profile store, shared by `cli/` and `inspector/`. `venus-gen/` generates `venus/`'s encoders from the pinned venus-protocol registry. `compiler-host/` runs the compiler plugin under Wasmtime on Linux, the bench's Linux + Wasmtime column of `aot-curl`. |
+| Host tools | `inspector/`, `inspector-protocol/`, `cli/`, `compiler-support/`, `compiler-host/`, `profdata/`, `venus-gen/`, `workspace-root/` | `std` crates that boot, build and observe a guest. `inspector-protocol/` is the WIT RPC contract between the inspector and the guest debugger. `profdata/` is the kernel profile's header check and fetched-profile store, shared by `cli/` and `inspector/`. `workspace-root/` finds the workspace and holds the root key file format those two share. `venus-gen/` generates `venus/`'s encoders from the pinned venus-protocol registry. `compiler-host/` runs the compiler plugin under Wasmtime on Linux, the bench's Linux + Wasmtime column of `aot-curl`. |
 
 The rules that follow from the table:
 
@@ -431,7 +431,8 @@ kernel-prebuild` themselves and export the trusted-root public key file it
 writes as `HELIOS_KERNEL_ROOT_PUBLIC_KEY`, the only prebuild output the
 kernel build tracks; a recipe that compiles the kernel's tests also exports
 `HELIOS_KERNEL_ROOT_SECRET_KEY`, which only a test build reads and no
-kernel image is given; the `helios-bootfs`
+kernel image is given (the inspector's image build searches every image
+it links for that key and fails on a match); the `helios-bootfs`
 payload it also writes is loaded at boot, never compiled in, so changing
 the boot programs never relinks the kernel. The `check-target` set is the
 backends the diff can reach: a change in `hal/`, a library crate, a shared

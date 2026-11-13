@@ -83,6 +83,7 @@ const _: () = {
         DISPLAY_INTERRUPT_VECTOR,
         SOUND_INTERRUPT_VECTOR,
         DEBUG_SERIAL_INTERRUPT_VECTOR,
+        SCI_INTERRUPT_VECTOR,
     ]));
     assert!(held_by_wake_only_mask(&NETWORK_QUEUE_INTERRUPT_VECTORS));
     assert!(held_by_wake_only_mask(&INPUT_INTERRUPT_VECTORS));
@@ -120,6 +121,12 @@ pub(crate) const SOUND_INTERRUPT_VECTOR: u8 = 0x3d;
 /// message: the UART raises ISA IRQ 4 and an I/O APIC redirection entry
 /// translates that line into this local-APIC vector.
 pub(crate) const DEBUG_SERIAL_INTERRUPT_VECTOR: u8 = 0x3e;
+/// The ACPI SCI, the other line an I/O APIC entry translates: firmware
+/// raises it for a general-purpose event, which is how a hypervisor
+/// announces a hot-added or hot-removed vCPU. It is routed to the
+/// bootstrap processor and dispatched beside, not through, the device
+/// routes (`smp::handle_sci_interrupt`).
+pub(crate) const SCI_INTERRUPT_VECTOR: u8 = 0x3f;
 /// One vector per block device the routing table can hold: the platform
 /// exposes the boot image and the kernel's own disk as separate
 /// functions, and each of them delivers its completions on its own
@@ -188,6 +195,7 @@ unsafe extern "C" {
     fn helios_x86_interrupt_block_2();
     fn helios_x86_interrupt_block_3();
     fn helios_x86_interrupt_debug_serial();
+    fn helios_x86_interrupt_sci();
 }
 
 pub(crate) struct ProcessorIdt {
@@ -312,6 +320,7 @@ impl ProcessorIdt {
                 DEBUG_SERIAL_INTERRUPT_VECTOR,
                 helios_x86_interrupt_debug_serial,
             );
+            install_interrupt(table, SCI_INTERRUPT_VECTOR, helios_x86_interrupt_sci);
             table.load_unsafe();
         }
     }
@@ -674,6 +683,9 @@ extern "C" fn helios_x86_interrupt_dispatch(frame: &mut ExceptionFrame) {
         Ok(TLB_SHOOTDOWN_INTERRUPT_VECTOR) => {
             smp::handle_tlb_shootdown_interrupt();
         }
+        Ok(SCI_INTERRUPT_VECTOR) => {
+            smp::handle_sci_interrupt();
+        }
         Ok(vector) if is_device_interrupt(vector) => {
             smp::handle_device_interrupt(vector);
         }
@@ -683,7 +695,7 @@ extern "C" fn helios_x86_interrupt_dispatch(frame: &mut ExceptionFrame) {
              entropy={ENTROPY_INTERRUPT_VECTOR:#x} vsock={VSOCK_INTERRUPT_VECTOR:#x} \
              display={DISPLAY_INTERRUPT_VECTOR:#x} input={INPUT_INTERRUPT_VECTORS:#x?} \
              sound={SOUND_INTERRUPT_VECTOR:#x} block={BLOCK_INTERRUPT_VECTORS:#x?} \
-             debug-serial={DEBUG_SERIAL_INTERRUPT_VECTOR:#x}",
+             debug-serial={DEBUG_SERIAL_INTERRUPT_VECTOR:#x} sci={SCI_INTERRUPT_VECTOR:#x}",
             frame.vector, frame.rip
         ),
     }

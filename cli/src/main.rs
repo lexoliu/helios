@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
@@ -17,6 +17,9 @@ use helios_compiler_support::{AotCompileHint, CompileError, precompile_artifact}
 use helios_profdata::{
     FetchedProfile, KERNEL_PROFILE_ARTIFACT, KERNEL_PROFILE_ASSET, KERNEL_PROFILE_WORKFLOW,
     KernelProfileStore, KernelProfileStoreError, ProfileUseError, RELEASE_REPOSITORY,
+};
+use helios_workspace_root::root_key::{
+    ROOT_PUBLIC_FILE, ROOT_SECRET_FILE, RootSecretReadError, SECRET_KEY_MODE, read_root_secret_seed,
 };
 use helios_workspace_root::{WorkspaceRoot, WorkspaceRootError};
 use mbrman::{BOOT_ACTIVE, CHS, MBR, MBRPartitionEntry};
@@ -52,18 +55,8 @@ enum CliError {
 /// Why the root signing keypair could not be read or written.
 #[derive(Debug, thiserror::Error)]
 enum KeyError {
-    #[error("failed to read {path}: {source}")]
-    Read {
-        path: String,
-        #[source]
-        source: io::Error,
-    },
-    #[error("{path} does not contain a 32-byte Ed25519 secret key: {source}")]
-    NotThirtyTwoBytes {
-        path: String,
-        #[source]
-        source: std::array::TryFromSliceError,
-    },
+    #[error("{0}")]
+    Read(#[from] RootSecretReadError),
     #[error("failed to write {path}: {source}")]
     Write {
         path: String,
@@ -76,21 +69,10 @@ enum KeyError {
         source: rand::rngs::SysError,
     },
     #[error(
-        "{path} is a secret key with mode {mode:03o}; it must be readable by its owner alone (600)"
-    )]
-    SecretKeyExposed { path: String, mode: u32 },
-    #[error(
         "--root-secret-key {path} is not a file; the key a release signs with is never generated"
     )]
     SuppliedKeyMissing { path: String },
 }
-
-/// The mode a secret key file is created with: its owner reads and writes
-/// it, and nobody else can open it.
-const SECRET_KEY_MODE: u32 = 0o600;
-
-/// The permission bits of everyone but the owner.
-const GROUP_AND_OTHER: u32 = 0o077;
 
 /// Why the kernel-prebuild manifest and the bootfs it describes could
 /// not be produced.
@@ -460,8 +442,6 @@ enum LimineError {
     },
 }
 
-const ROOT_SECRET_FILE: &str = "helios-root-secret.key";
-const ROOT_PUBLIC_FILE: &str = "helios-root-public.key";
 const PREBUILD_MANIFEST_FILE: &str = "kernel-prebuild.json";
 /// The payload `kernel-prebuild` writes beside the manifest: the whole
 /// user payload the kernel used to link in, delivered as a boot module.
@@ -2167,30 +2147,7 @@ fn write_root_public_key(
 }
 
 fn read_signing_key(path: &Path) -> Result<SigningKey, KeyError> {
-    let read_error = |source| KeyError::Read {
-        path: path.display().to_string(),
-        source,
-    };
-    let mut file = fs::File::open(path).map_err(read_error)?;
-    // Judged on the open handle, so the file read is the file checked.
-    let mode = file.metadata().map_err(read_error)?.permissions().mode() & 0o777;
-    if mode & GROUP_AND_OTHER != 0 {
-        return Err(KeyError::SecretKeyExposed {
-            path: path.display().to_string(),
-            mode,
-        });
-    }
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).map_err(read_error)?;
-    let secret_bytes: [u8; 32] =
-        bytes
-            .as_slice()
-            .try_into()
-            .map_err(|source| KeyError::NotThirtyTwoBytes {
-                path: path.display().to_string(),
-                source,
-            })?;
-    Ok(SigningKey::from_bytes(&secret_bytes))
+    Ok(SigningKey::from_bytes(&read_root_secret_seed(path)?))
 }
 
 /// GitHub's REST API, where a release's tag and its assets are read from.
@@ -2612,6 +2569,8 @@ fn bearer_header(variable: &'static str, token: &str) -> Result<String, ProfileF
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
 
     #[test]
@@ -2635,7 +2594,10 @@ mod tests {
         let error = ensure_root_keypair(&secret, &dir.path().join("root.pub"))
             .expect_err("a world-readable secret is refused");
         assert!(
-            matches!(error, KeyError::SecretKeyExposed { mode: 0o644, .. }),
+            matches!(
+                error,
+                KeyError::Read(RootSecretReadError::SecretKeyExposed { mode: 0o644, .. })
+            ),
             "{error}"
         );
     }
@@ -2692,7 +2654,10 @@ mod tests {
         let error =
             supplied_root_keypair(&supplied, &public).expect_err("a group-readable key is refused");
         assert!(
-            matches!(error, KeyError::SecretKeyExposed { mode: 0o640, .. }),
+            matches!(
+                error,
+                KeyError::Read(RootSecretReadError::SecretKeyExposed { mode: 0o640, .. })
+            ),
             "{error}"
         );
         assert!(

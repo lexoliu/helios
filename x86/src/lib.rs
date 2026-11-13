@@ -12,6 +12,7 @@ mod exceptions;
 mod extended_state;
 mod gpu;
 mod host_fs;
+mod hotplug;
 mod input;
 mod ioapic;
 mod iommu;
@@ -46,7 +47,7 @@ mod debug_state {
     }
 }
 
-use acpi::sdt::madt::{Madt, MadtEntry};
+use acpi::sdt::madt::Madt;
 use acpi::{AcpiTables, PhysicalMapping};
 use alloc::sync::Arc;
 use core::arch::asm;
@@ -216,10 +217,13 @@ fn x86_kernel_main() -> ! {
     // allocator is primed: the processor count and each processor's and
     // each memory range's node size its per-processor and per-node
     // structures.
-    let acpi_tables = pre_heap_acpi_tables(rsdp_address, physical_memory_offset);
-    let processors = MadtProcessors::new(&acpi_tables);
+    // The processor count is the MADT's possible set, so a processor
+    // firmware hot-adds later was counted, and placed on its SRAT node,
+    // here.
+    let pre_heap_tables = pre_heap_acpi_tables(rsdp_address, physical_memory_offset);
+    let processors = MadtProcessors::new(&pre_heap_tables);
     let processor_count = processors.processor_count();
-    let numa = AcpiNuma::new(&acpi_tables, processors, LocalApicKey)
+    let numa = AcpiNuma::new(&pre_heap_tables, processors, LocalApicKey)
         .unwrap_or_else(|error| panic!("x86 NUMA discovery failed: {error}"));
     let pool = helios_kernel::prime_bootstrap_allocator(
         boot_memory_regions(
@@ -383,14 +387,21 @@ fn x86_kernel_main() -> ! {
     // through an ACPI SSDT. It is found before the root DRBG is seeded so
     // that the identifier the machine boots with is the one every later
     // observation is compared against.
-    let vmgenid_window = vmgenid::discover(
-        smp::PhysicalOffsetAcpiHandler {
-            physical_memory_offset,
-            tsc_base,
-            timebase,
-        },
-        rsdp_address,
-    );
+    // The machine's one AML namespace: vmgenid is found in it here, and
+    // the processor-hotplug task owns it once the SCI is routed.
+    let acpi_handler = smp::PhysicalOffsetAcpiHandler {
+        physical_memory_offset,
+        tsc_base,
+        timebase,
+    };
+    // SAFETY: the RSDP address comes from the bootloader's handoff and the
+    // handler maps through the direct map it left in place.
+    let acpi_tables = unsafe { acpi::AcpiTables::from_rsdp(acpi_handler.clone(), rsdp_address) }
+        .unwrap_or_else(|error| panic!("failed to parse ACPI tables: {error:?}"));
+    let acpi_recorder = helios_acpi::NotifyRecorder::new(acpi_handler);
+    let acpi_namespace = helios_acpi::load_namespace(&acpi_tables, &acpi_recorder)
+        .unwrap_or_else(|error| panic!("x86 ACPI: {error}"));
+    let vmgenid_window = vmgenid::discover(&acpi_namespace, physical_memory_offset);
     let machine_generation =
         helios_kernel::MachineGeneration::new(vmgenid_window.map(|found| found.window));
     match vmgenid_window {
@@ -454,8 +465,14 @@ fn x86_kernel_main() -> ! {
         &debug_state,
         root_entropy,
     );
+    // The SCI is routed with this processor's interrupts still masked,
+    // after its latch is installed, so no delivery precedes its handler.
+    let processor_hotplug = hotplug::install(&cpu, &acpi_tables, acpi_namespace, acpi_recorder);
     smp::join_shootdown_targets();
     x86_64::instructions::interrupts::enable();
+    if let Some(firmware) = processor_hotplug {
+        kernel.spawn_processor_hotplug(firmware);
+    }
     let program_service = helios_kernel::install_component_host_program_service(
         &kernel,
         &cpu,
@@ -471,7 +488,11 @@ fn x86_kernel_main() -> ! {
             cpu.processor_count(),
             cpu.bootstrap_processor(),
         ) {
-            cpu.start_processor(processor);
+            // A possible processor that is not present stays offline: its
+            // slot is built, and `ProcessorControl::online` starts it.
+            if cpu.state.present_at_boot(processor) {
+                cpu.start_processor(processor);
+            }
         }
     }
     run_current_processor(cpu, kernel, debug_state)
@@ -702,7 +723,8 @@ fn install_pci_devices<WatchdogImpl, MeasuredBootImpl>(
         DebugSerial::console().interrupt_handler::<DebugSerial>(),
     );
     cpu.platform_state().install_device_interrupts(routes);
-    cpu.platform_state().io_apic().program_redirection(
+    cpu.platform_state().io_apics().program_redirection(
+        ioapic::COM1,
         exceptions::DEBUG_SERIAL_INTERRUPT_VECTOR,
         destination_apic_id,
     );
@@ -724,15 +746,13 @@ fn pre_heap_acpi_tables(
         .unwrap_or_else(|error| panic!("failed to parse ACPI tables before the heap: {error:?}"))
 }
 
-/// The MADT Processor Local APIC and Local x2APIC structures' flags:
-/// bit 0 Enabled, bit 1 Online Capable (ACPI 6.5, Local APIC Flags).
-const LAPIC_ENABLED: u32 = 1 << 0;
-const LAPIC_ONLINE_CAPABLE: u32 = 1 << 1;
-const LAPIC_USABLE: u32 = LAPIC_ENABLED | LAPIC_ONLINE_CAPABLE;
-
-/// Each usable processor's local APIC id, in MADT entry order: the order
-/// `smp` numbers processors in, whose first entry is the bootstrap
-/// processor. Read in place, so it answers before the heap exists.
+/// Each possible processor's local APIC id, present or not
+/// ([`smp::possible_processors`]), in MADT entry order: the order `smp`
+/// numbers processors in, whose first entry is the bootstrap processor.
+/// The possible set, not the present one, sizes every per-processor and
+/// per-node structure, so a processor firmware hot-adds later already
+/// has its slot on the node the SRAT gives it. Read in place, so it
+/// answers before the heap exists.
 struct MadtProcessors {
     madt: PhysicalMapping<smp::PhysicalOffsetAcpiHandler, Madt>,
 }
@@ -745,19 +765,13 @@ impl MadtProcessors {
         let processors = Self { madt };
         assert!(
             processors.apic_ids().next().is_some(),
-            "MADT did not list any usable processors"
+            "MADT did not list any possible processors"
         );
         processors
     }
 
     fn apic_ids(&self) -> impl Iterator<Item = u32> + '_ {
-        self.madt.get().entries().filter_map(|entry| match entry {
-            MadtEntry::LocalApic(apic) if apic.flags & LAPIC_USABLE != 0 => {
-                Some(u32::from(apic.apic_id))
-            }
-            MadtEntry::LocalX2Apic(apic) if apic.flags & LAPIC_USABLE != 0 => Some(apic.x2apic_id),
-            _ => None,
-        })
+        smp::possible_processors(self.madt.get()).map(|processor| processor.apic_id)
     }
 }
 
@@ -771,7 +785,7 @@ impl ProcessorIdentities for MadtProcessors {
         self.apic_ids()
             .nth(index)
             .map(u64::from)
-            .unwrap_or_else(|| panic!("the MADT names no usable processor {index}"))
+            .unwrap_or_else(|| panic!("the MADT names no possible processor {index}"))
     }
 }
 

@@ -9,6 +9,7 @@ embedded-debugger = ["helios-kernel/embedded-debugger"]
 
 [dependencies]
 acpi = { workspace = true, features = ["aml"] }
+helios-acpi.workspace = true
 arm-gic = "0.9.1"
 # The ID, key and control registers return-address signing programs. `arm-gic`
 # pins its sysreg subcrates to exactly 0.4.0, so this stays at that version.

@@ -1,0 +1,17 @@
+[package]
+name = "helios-acpi"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+acpi = { workspace = true, features = ["aml"] }
+helios-hal.workspace = true
+thiserror = { version = "2.0.20", default-features = false }
+tracing.workspace = true
+
+[dev-dependencies]
+hex = { version = "0.4.3", default-features = false, features = ["std"] }
+sha2 = { version = "0.10.9", default-features = false }
+
+[lints]
+workspace = true

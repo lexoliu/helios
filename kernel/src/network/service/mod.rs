@@ -66,6 +66,10 @@ const EPHEMERAL_PORT_END: u16 = 65_535;
 /// with, so all of them are demultiplexed here on every backend. It is
 /// also where unqualified control-plane operations run, so a route the
 /// ARP reply taught and the query that reads it meet on one shard.
+///
+/// A Neighbor Advertisement is received here too, and is then also
+/// offered to every other shard as the answer to a resolution that
+/// shard is pending (`RxFrameOwner::ResolutionAnswer`).
 const DEFAULT_SHARD_IDX: usize = 0;
 
 const INTERNAL_DHCP_SOCKET_INDEX: usize = 0;
@@ -2123,6 +2127,17 @@ mod tests {
     /// every backend without `HASH_REPORT` delivers.
     fn unhashed(bytes: &[u8]) -> RxFrame {
         RxFrame::new(Bytes::copy_from_slice(bytes))
+    }
+
+    /// The one shard a frame belongs to. A frame the whole node owns has
+    /// no single shard, and asking for it is a test's mistake.
+    fn owning_shard(frame: &RxFrame, shard_count: usize) -> usize {
+        match super::rx_frame_owner(frame, shard_count) {
+            super::RxFrameOwner::Shard(shard_idx) => shard_idx,
+            super::RxFrameOwner::ResolutionAnswer => {
+                panic!("a Neighbor Advertisement has no single owning shard")
+            }
+        }
     }
 
     fn test_network_shard() -> NetworkShard {
@@ -4478,6 +4493,467 @@ mod tests {
         )
     }
 
+    /// The address family a resolution test runs over.
+    #[derive(Clone, Copy)]
+    enum ResolutionFamily {
+        Ipv4,
+        Ipv6,
+    }
+
+    /// What one transmitted frame was, as far as the resolution tests
+    /// care.
+    #[derive(Clone, Debug)]
+    enum Wire {
+        /// An ARP request or a Neighbor Solicitation.
+        Resolution,
+        Tcp {
+            flags: TcpFlags,
+            payload: Vec<u8>,
+        },
+        Other,
+    }
+
+    impl ResolutionFamily {
+        const LOCAL_V4: Ipv4Address = Ipv4Address::new([192, 0, 2, 10]);
+        const PEER_V4: Ipv4Address = Ipv4Address::new([192, 0, 2, 20]);
+        /// The device's own address, which every frame a test injects is
+        /// addressed to.
+        const LOCAL_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 1];
+
+        fn local(self) -> IpAddress {
+            match self {
+                Self::Ipv4 => IpAddress::Ipv4(Self::LOCAL_V4),
+                Self::Ipv6 => IpAddress::Ipv6(connect_local()),
+            }
+        }
+
+        fn peer(self) -> IpAddress {
+            match self {
+                Self::Ipv4 => IpAddress::Ipv4(Self::PEER_V4),
+                Self::Ipv6 => IpAddress::Ipv6(connect_remote()),
+            }
+        }
+
+        fn configure(self, shard: &mut NetworkShard) {
+            match self {
+                Self::Ipv4 => shard
+                    .stack
+                    .add_ipv4_address(Ipv4Cidr::new(Self::LOCAL_V4, 24)),
+                Self::Ipv6 => shard
+                    .stack
+                    .add_ipv6_address(Ipv6Cidr::new(connect_local(), 64)),
+            }
+            .expect("test address should be accepted");
+        }
+
+        /// The peer's answer to a request for its link-layer address: an
+        /// ARP reply or a solicited Neighbor Advertisement.
+        fn resolution_reply(self) -> Vec<u8> {
+            let mut frame = [0; ETHERNET_FRAME_BYTES];
+            let len = match self {
+                Self::Ipv4 => {
+                    let offset = EthernetFrame::encode_header(
+                        &mut frame,
+                        Self::LOCAL_MAC,
+                        PEER_MAC,
+                        EthernetProtocol::Arp,
+                    )
+                    .expect("test Ethernet header should fit");
+                    offset
+                        + ArpPacket {
+                            operation: ArpOperation::Reply,
+                            sender_hardware: PEER_MAC,
+                            sender_protocol: Self::PEER_V4,
+                            target_hardware: Self::LOCAL_MAC,
+                            target_protocol: Self::LOCAL_V4,
+                        }
+                        .encode(&mut frame[offset..])
+                        .expect("test ARP reply should fit")
+                }
+                Self::Ipv6 => {
+                    let mut body = [0u8; Icmpv6Packet::NEIGHBOR_MESSAGE_LEN];
+                    Icmpv6Packet::encode_neighbor_advertisement(
+                        &mut body,
+                        connect_remote(),
+                        connect_local(),
+                        connect_remote(),
+                        PEER_MAC,
+                    )
+                    .expect("test Neighbor Advertisement should fit");
+                    let mut offset = EthernetFrame::encode_header(
+                        &mut frame,
+                        Self::LOCAL_MAC,
+                        PEER_MAC,
+                        EthernetProtocol::Ipv6,
+                    )
+                    .expect("test Ethernet header should fit");
+                    offset += Ipv6Packet::encode_header(
+                        &mut frame[offset..],
+                        connect_remote(),
+                        connect_local(),
+                        IpProtocol::Icmpv6,
+                        body.len(),
+                        255,
+                    )
+                    .expect("test IPv6 header should fit");
+                    frame[offset..offset + body.len()].copy_from_slice(&body);
+                    offset + body.len()
+                }
+            };
+            frame[..len].to_vec()
+        }
+
+        /// A segment from the peer to the device.
+        fn tcp_from_peer(self, header: TcpHeader) -> Vec<u8> {
+            let (frame, len) = match self {
+                Self::Ipv4 => ipv4_tcp_frame(Self::PEER_V4, Self::LOCAL_V4, header, &[]),
+                Self::Ipv6 => ipv6_tcp_frame(connect_remote(), connect_local(), header),
+            };
+            frame[..len].to_vec()
+        }
+
+        fn classify(self, frame: &[u8]) -> Wire {
+            let Some(ethernet) = EthernetFrame::parse(frame) else {
+                return Wire::Other;
+            };
+            let tcp = match self {
+                Self::Ipv4 => {
+                    if ethernet.protocol == EthernetProtocol::Arp {
+                        return Wire::Resolution;
+                    }
+                    let Some(ipv4) = Ipv4Packet::parse(ethernet.payload) else {
+                        return Wire::Other;
+                    };
+                    (ipv4.protocol == IpProtocol::Tcp).then(|| TcpPacket::parse(ipv4.payload))
+                }
+                Self::Ipv6 => {
+                    let Some(ipv6) = Ipv6Packet::parse(ethernet.payload) else {
+                        return Wire::Other;
+                    };
+                    if ipv6.next_header == IpProtocol::Icmpv6 {
+                        return Wire::Resolution;
+                    }
+                    (ipv6.next_header == IpProtocol::Tcp).then(|| TcpPacket::parse(ipv6.payload))
+                }
+            };
+            match tcp.flatten() {
+                Some(tcp) => Wire::Tcp {
+                    flags: tcp.flags,
+                    payload: tcp.payload.to_vec(),
+                },
+                None => Wire::Other,
+            }
+        }
+    }
+
+    const PEER_PORT: u16 = 80;
+    const LOCAL_SEQUENCE: u32 = 7;
+    const PEER_SEQUENCE: u32 = 100;
+    /// The shard the resolution tests open their connection on: not the
+    /// default one.
+    const OWNER: usize = 1;
+
+    /// Two shards on two pairs, both with the local address and the
+    /// control plane's copy of the first, and a connection opened on
+    /// the second shard, which asks for the peer's address when polled.
+    struct ConnectOnSecondShard {
+        service: super::NetworkService<RecordingSmpCpu, RecordingNetworkInterface>,
+        device: RecordingNetworkInterface,
+        local_port: u16,
+        socket: helios_netstack::SocketId,
+    }
+
+    impl ConnectOnSecondShard {
+        fn open(family: ResolutionFamily) -> Self {
+            let device = RecordingNetworkInterface::accepting_transmissions(2);
+            let service = test_network_service_smp(2, device.clone());
+            let state = &service.inner.state;
+            assert_eq!(state.shard_count(), 2);
+            for idx in 0..2 {
+                family.configure(&mut state.shard_at(idx).lock());
+            }
+            service
+                .inner
+                .control
+                .publish_from_shard(&state.shard_at(0).lock());
+            let local_port = (49_152..u16::MAX)
+                .find(|port| {
+                    super::shard_idx_for_flow(family.local(), *port, family.peer(), PEER_PORT, 2)
+                        == OWNER
+                })
+                .expect("some ephemeral port hashes to the second shard");
+            let socket = {
+                let mut shard = state.shard_at(OWNER).lock();
+                let socket = shard
+                    .stack
+                    .open_tcp_connect(
+                        TcpEndpoint {
+                            address: family.local(),
+                            port: local_port,
+                        },
+                        TcpEndpoint {
+                            address: family.peer(),
+                            port: PEER_PORT,
+                        },
+                        LOCAL_SEQUENCE,
+                    )
+                    .expect("the test connection should allocate a socket");
+                shard.insert_tcp_stream(socket);
+                socket
+            };
+            Self {
+                service,
+                device,
+                local_port,
+                socket,
+            }
+        }
+    }
+
+    /// Issue #809, the sequence the first connection of a boot takes: a
+    /// connect whose flow hashes to a shard other than the default one
+    /// asks for the peer's address from that shard, the reply is
+    /// learned on the default shard, and the connection's own shard
+    /// receives its SYN-ACK. The request that shard made is its own
+    /// business and must not reach the control plane, where it would
+    /// replace the resolved neighbour on every shard.
+    fn a_pending_resolution_on_another_shard_leaves_the_resolved_neighbor(
+        family: ResolutionFamily,
+    ) {
+        let ConnectOnSecondShard {
+            service,
+            device,
+            local_port,
+            socket,
+        } = ConnectOnSecondShard::open(family);
+        let state = &service.inner.state;
+
+        // One interface-scope poll, and what it put on the wire.
+        let mut seen = 0;
+        let mut poll = || {
+            block_on(service.poll_network_once(NetworkPollSource::Tcp))
+                .expect("the poll should drive the device");
+            let frames = device.transmitted_frames();
+            let new = frames[seen..]
+                .iter()
+                .map(|frame| family.classify(frame))
+                .collect::<Vec<_>>();
+            seen = frames.len();
+            new
+        };
+
+        let wire = poll();
+        assert!(
+            wire.iter().any(|wire| matches!(wire, Wire::Resolution)),
+            "the shard asks for the peer's address: {wire:?}"
+        );
+        assert!(
+            !wire.iter().any(|wire| matches!(wire, Wire::Tcp { .. })),
+            "nothing is sent before the address is known: {wire:?}"
+        );
+
+        // The reply lands on the default shard. The next poll learns it,
+        // and the one after hands it to the connection's shard.
+        device.deliver_on(0, &family.resolution_reply());
+        let wire = [poll(), poll()].concat();
+        assert!(
+            wire.iter().any(|wire| matches!(
+                wire,
+                Wire::Tcp { flags, .. } if flags.contains(TcpFlags::SYN)
+            )),
+            "the SYN leaves once the address is known: {wire:?}"
+        );
+
+        device.deliver_on(
+            0,
+            &family.tcp_from_peer(TcpHeader {
+                source_port: PEER_PORT,
+                destination_port: local_port,
+                sequence: PEER_SEQUENCE,
+                acknowledgement: LOCAL_SEQUENCE.wrapping_add(1),
+                flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                window_size: u16::MAX,
+            }),
+        );
+        poll();
+
+        state
+            .shard_at(OWNER)
+            .lock()
+            .stack
+            .tcp_send(socket, b"hello")
+            .expect("data should queue on the established socket");
+        let wire = poll();
+
+        for idx in 0..2 {
+            let shard = state.shard_at(idx).lock();
+            assert!(
+                shard.stack.neighbors().any(|entry| {
+                    entry.ip == family.peer()
+                        && entry.mac == PEER_MAC
+                        && entry.state == NeighborState::Reachable
+                }),
+                "shard {idx} lost the peer's resolved address"
+            );
+        }
+        assert!(
+            wire.iter().any(|wire| matches!(
+                wire,
+                Wire::Tcp { payload, .. } if payload == b"hello"
+            )),
+            "the poll sends the data: {wire:?}"
+        );
+        assert!(
+            !wire.iter().any(|wire| matches!(wire, Wire::Resolution)),
+            "the poll asks for nothing the shards already know: {wire:?}"
+        );
+    }
+
+    #[test]
+    fn a_pending_ipv4_resolution_on_another_shard_leaves_the_resolved_neighbor() {
+        a_pending_resolution_on_another_shard_leaves_the_resolved_neighbor(ResolutionFamily::Ipv4);
+    }
+
+    #[test]
+    fn a_pending_ipv6_resolution_on_another_shard_leaves_the_resolved_neighbor() {
+        a_pending_resolution_on_another_shard_leaves_the_resolved_neighbor(ResolutionFamily::Ipv6);
+    }
+
+    /// One poll of the receive path of queue pair `pair`, as that pair's
+    /// pump runs it: it takes the pair's frames and never synchronizes
+    /// the control plane.
+    fn poll_pair_without_synchronizing(
+        service: &super::NetworkService<RecordingSmpCpu, RecordingNetworkInterface>,
+        pair: usize,
+    ) {
+        let poll = NetworkPollState::new(
+            service.inner.poll.base_rx_budget,
+            service.inner.poll.base_tx_completion_budget,
+            service.inner.poll.base_tx_frame_budget,
+        );
+        block_on(service.poll_network_once_with_tcp_read(
+            NetworkPollSource::Pump,
+            None,
+            true,
+            NetworkPollScope::Pair {
+                pair,
+                interface_wide: false,
+            },
+            &poll,
+        ))
+        .expect("the pair's pump drains it");
+    }
+
+    /// Issue #809: the Neighbor Advertisement lands on the default
+    /// shard's pair, and the pump that drains that pair never
+    /// synchronizes the control plane. The shard that asked is answered
+    /// by the dispatch itself, and its waiters are signalled.
+    #[test]
+    fn a_neighbor_advertisement_answers_the_shard_that_asked_without_a_synchronization() {
+        let family = ResolutionFamily::Ipv6;
+        let fixture = ConnectOnSecondShard::open(family);
+        let service = &fixture.service;
+        block_on(service.poll_network_once(NetworkPollSource::Tcp))
+            .expect("the poll should drive the device");
+        assert!(
+            service
+                .inner
+                .state
+                .shard_at(OWNER)
+                .lock()
+                .stack
+                .neighbors()
+                .all(|entry| entry.ip != family.peer()),
+            "the shard has only asked"
+        );
+
+        // The mark is sampled before the answer arrives, the way every
+        // operation takes its own.
+        let asker_wait = service.shard_wait(OWNER);
+        fixture.device.deliver_on(0, &family.resolution_reply());
+        let mut parked = core::pin::pin!(
+            service.wait_for_shard_progress(asker_wait, core::time::Duration::from_secs(3600))
+        );
+        assert!(
+            block_on(poll_once(parked.as_mut())).is_none(),
+            "a frame on pair 0 is not an event the asker's wait watches"
+        );
+
+        poll_pair_without_synchronizing(service, 0);
+
+        assert!(
+            block_on(poll_once(parked.as_mut())).is_some(),
+            "the answered shard's waiters are signalled"
+        );
+        let learned = |entry: NeighborEntry| {
+            entry.ip == family.peer()
+                && entry.mac == PEER_MAC
+                && entry.state == NeighborState::Reachable
+        };
+        assert!(
+            service
+                .inner
+                .state
+                .shard_at(OWNER)
+                .lock()
+                .stack
+                .neighbors()
+                .any(learned),
+            "the shard that asked holds the answer"
+        );
+        assert!(
+            service
+                .inner
+                .control
+                .neighbors
+                .load_full()
+                .iter()
+                .any(learned),
+            "the control plane holds it"
+        );
+    }
+
+    /// An advertisement for an address no shard asked about creates no
+    /// entry anywhere, on the shard that received it or on the control
+    /// plane (RFC 4861 section 7.2.5).
+    #[test]
+    fn an_unasked_neighbor_advertisement_creates_no_entry_on_any_shard() {
+        let family = ResolutionFamily::Ipv6;
+        let device = RecordingNetworkInterface::accepting_transmissions(2);
+        let service = test_network_service_smp(2, device.clone());
+        let state = &service.inner.state;
+        for idx in 0..2 {
+            family.configure(&mut state.shard_at(idx).lock());
+        }
+
+        device.deliver_on(0, &family.resolution_reply());
+        poll_pair_without_synchronizing(&service, 0);
+        block_on(service.poll_network_once(NetworkPollSource::Tcp))
+            .expect("the poll should drive the device");
+
+        for idx in 0..2 {
+            assert!(
+                state
+                    .shard_at(idx)
+                    .lock()
+                    .stack
+                    .neighbors()
+                    .all(|entry| entry.ip != family.peer()),
+                "shard {idx} took an address nobody asked for"
+            );
+        }
+        assert!(
+            service
+                .inner
+                .control
+                .neighbors
+                .load_full()
+                .iter()
+                .all(|entry| entry.ip != family.peer()),
+            "the control plane took an address nobody asked for"
+        );
+    }
+
     /// The receive rule and the placement rule have to agree, or a
     /// socket is opened on a shard its own frames never reach.
     #[test]
@@ -4497,7 +4973,7 @@ mod tests {
                     let (frame, len) =
                         ipv4_udp_frame(peer, peer_port, local, local_port, b"payload");
                     assert_eq!(
-                        super::shard_idx_for_frame(&unhashed(&frame[..len]), shard_count),
+                        owning_shard(&unhashed(&frame[..len]), shard_count),
                         placed,
                         "the demux and the placement rule must agree"
                     );
@@ -4517,7 +4993,7 @@ mod tests {
         for shard_count in [1usize, 2, 3, 4, 8] {
             for peer_port in [53u16, 443, 8080, 40_000] {
                 let (frame, len) = ipv4_udp_frame(peer, peer_port, local, 49_153, b"payload");
-                let computed = super::shard_idx_for_frame(&unhashed(&frame[..len]), shard_count);
+                let computed = owning_shard(&unhashed(&frame[..len]), shard_count);
 
                 // What the device would have written into the receive
                 // header: the same function over the same bytes.
@@ -4530,7 +5006,7 @@ mod tests {
                     },
                 );
                 assert_eq!(
-                    super::shard_idx_for_frame(&reported, shard_count),
+                    owning_shard(&reported, shard_count),
                     computed,
                     "a steered frame and a software-hashed one belong to the same shard"
                 );
@@ -4554,7 +5030,7 @@ mod tests {
                 b"offer",
             );
             assert_eq!(
-                super::shard_idx_for_frame(&unhashed(&offer[..offer_len]), shard_count),
+                owning_shard(&unhashed(&offer[..offer_len]), shard_count),
                 super::DEFAULT_SHARD_IDX
             );
             let (discover, discover_len) = ipv4_udp_frame(
@@ -4565,7 +5041,7 @@ mod tests {
                 b"discover",
             );
             assert_eq!(
-                super::shard_idx_for_frame(&unhashed(&discover[..discover_len]), shard_count),
+                owning_shard(&unhashed(&discover[..discover_len]), shard_count),
                 super::DEFAULT_SHARD_IDX
             );
         }
@@ -4591,7 +5067,7 @@ mod tests {
             shard_count,
         );
         assert_eq!(
-            super::shard_idx_for_frame(&unhashed(&error[..error_len]), shard_count),
+            owning_shard(&unhashed(&error[..error_len]), shard_count),
             flow
         );
     }
@@ -4602,7 +5078,7 @@ mod tests {
     fn a_frame_without_a_flow_falls_to_the_default_shard() {
         for shard_count in [1usize, 2, 4] {
             assert_eq!(
-                super::shard_idx_for_frame(&unhashed(&[]), shard_count),
+                owning_shard(&unhashed(&[]), shard_count),
                 super::DEFAULT_SHARD_IDX,
                 "an unparseable frame has no flow"
             );
@@ -4615,9 +5091,66 @@ mod tests {
             )
             .expect("test Ethernet header should fit");
             assert_eq!(
-                super::shard_idx_for_frame(&unhashed(&arp[..len]), shard_count),
+                owning_shard(&unhashed(&arp[..len]), shard_count),
                 super::DEFAULT_SHARD_IDX,
                 "ARP carries no ports"
+            );
+        }
+    }
+
+    /// A Neighbor Advertisement answers whichever shard asked, so it
+    /// belongs to every shard; a Neighbor Solicitation and ARP, which
+    /// only the default shard's control plane answers, stay with it.
+    #[test]
+    fn a_neighbor_advertisement_is_an_answer_for_every_shard() {
+        let advertisement = ResolutionFamily::Ipv6.resolution_reply();
+        let arp = ResolutionFamily::Ipv4.resolution_reply();
+        let mut solicitation = [0; ETHERNET_FRAME_BYTES];
+        let mut offset = EthernetFrame::encode_header(
+            &mut solicitation,
+            [0x33, 0x33, 0xff, 0, 0, 1],
+            PEER_MAC,
+            EthernetProtocol::Ipv6,
+        )
+        .expect("test Ethernet header should fit");
+        let mut body = [0u8; Icmpv6Packet::NEIGHBOR_MESSAGE_LEN];
+        Icmpv6Packet::encode_neighbor_solicitation(
+            &mut body,
+            connect_remote(),
+            connect_local().solicited_node_multicast(),
+            connect_local(),
+            PEER_MAC,
+        )
+        .expect("test Neighbor Solicitation should fit");
+        offset += Ipv6Packet::encode_header(
+            &mut solicitation[offset..],
+            connect_remote(),
+            connect_local().solicited_node_multicast(),
+            IpProtocol::Icmpv6,
+            body.len(),
+            255,
+        )
+        .expect("test IPv6 header should fit");
+        solicitation[offset..offset + body.len()].copy_from_slice(&body);
+        let solicitation = &solicitation[..offset + body.len()];
+
+        for shard_count in [1usize, 2, 4, 8] {
+            assert!(
+                matches!(
+                    super::rx_frame_owner(&unhashed(&advertisement), shard_count),
+                    super::RxFrameOwner::ResolutionAnswer
+                ),
+                "an advertisement answers a resolution on any of {shard_count} shards"
+            );
+            assert_eq!(
+                owning_shard(&unhashed(solicitation), shard_count),
+                super::DEFAULT_SHARD_IDX,
+                "a solicitation is the default shard's to answer"
+            );
+            assert_eq!(
+                owning_shard(&unhashed(&arp), shard_count),
+                super::DEFAULT_SHARD_IDX,
+                "ARP is the default shard's"
             );
         }
     }

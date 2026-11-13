@@ -17,6 +17,12 @@ fdt = { version = "0.1.5", default-features = false, optional = true }
 helios-hal.workspace = true
 thiserror = { version = "2.0.20", default-features = false }
 
+[dev-dependencies]
+# `aml` adds methods to `acpi::Handler`, and a build that also holds a
+# crate running AML (`helios-acpi`, a backend) turns it on; fixing it on
+# for the tests gives their handler one shape in every build.
+acpi = { workspace = true, features = ["aml"] }
+
 [[test]]
 name = "acpi"
 required-features = ["acpi"]
