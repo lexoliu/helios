@@ -16,6 +16,7 @@ world init {
   import helios:system/surface@0.1.0;
   import helios:system/gpu@0.1.0;
   import helios:system/audio@0.1.0;
+  import helios:system/processors@0.1.0;
   import wasi:http/types@0.3.0;
   import wasi:http/client@0.3.0;
 }
@@ -38,6 +39,7 @@ world debugger{
   import helios:system/surface@0.1.0;
   import helios:system/gpu@0.1.0;
   import helios:system/audio@0.1.0;
+  import helios:system/processors@0.1.0;
   import wasi:http/types@0.3.0;
   import wasi:http/client@0.3.0;
 }
@@ -187,4 +189,15 @@ world compositor-host {
 /// instead of regenerating every `wasi:cli` import a player also has.
 world audio-host {
   import helios:system/audio@0.1.0;
+}
+
+/// World the kernel generates its own `helios:system/processors`
+/// bindings from.
+///
+/// Separate from the program worlds for the reason `audio-host` is: the
+/// kernel serves this one interface to both the `init` and `debugger`
+/// worlds, and one generated type set keeps the two from mapping the
+/// lifecycle's result twice.
+world processors-host {
+  import helios:system/processors@0.1.0;
 }

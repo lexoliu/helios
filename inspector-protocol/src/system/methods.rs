@@ -9,6 +9,11 @@ pub const INSTANCES_INSTANCE: &str = "helios:system/instances@0.1.0";
 pub const INSTANCES_SNAPSHOT: &str = "snapshot";
 pub const INSTANCES_KILL: &str = "kill";
 
+pub const PROCESSORS_INSTANCE: &str = "helios:system/processors@0.1.0";
+pub const PROCESSORS_SETS: &str = "sets";
+pub const PROCESSORS_OFFLINE: &str = "offline";
+pub const PROCESSORS_ONLINE: &str = "online";
+
 pub const TRACING_INSTANCE: &str = "helios:system/tracing@0.1.0";
 pub const TRACING_RECENT: &str = "recent";
 pub const TRACING_SET_TARGET_ENABLED: &str = "set-target-enabled";

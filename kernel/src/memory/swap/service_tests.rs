@@ -510,3 +510,313 @@ fn fault_latency_counts_the_time_a_request_spent_queued() {
         "latency runs from the request to its completion, queue included"
     );
 }
+
+/// The checks a host call or a runtime copy makes, over the fake address
+/// space and the harness's swap service.
+fn residency(handle: &SwapHandle) -> GuestResidency {
+    GuestResidency {
+        hooks: &TEST_HOOKS,
+        // Leaked: a residency names its handle `'static`, as the machine's
+        // one swap handle is.
+        handle: Box::leak(Box::new(Once::initialized(handle.clone()))),
+    }
+}
+
+/// Stands in for a host call's copy: writes `byte` at the start of each
+/// page, and refuses to run while any of them is out.
+fn copy_into(pages: &[VirtAddr], byte: u8) {
+    with_space(|space| {
+        for page in pages {
+            match space.pages.get_mut(&page.raw()) {
+                Some(FakePage::Present(bytes)) => bytes[0] = byte,
+                _ => panic!("the copy ran while page {:#x} was out", page.raw()),
+            }
+        }
+    });
+}
+
+/// The issue's done-when case: a page a host call is about to write was
+/// evicted while its instance was idle. The call waits for the page
+/// rather than faulting outside a fiber, and completes, its write
+/// landing, once the page is back.
+#[test]
+fn a_host_call_writing_into_an_evicted_page_completes_once_it_is_back() {
+    let mut harness = Harness::new();
+    let head = harness.resident(1, 0x10);
+    let tail = harness.resident(2, 0x20);
+    harness.evict(tail).expect("evict the page the call writes");
+    let residency = residency(&harness.handle);
+
+    // Eight bytes either side of the page boundary.
+    let range = VirtRange::new(VirtAddr::new(tail.raw() - 8), 16);
+    let mut call = Box::pin(residency.with_present(range, || {
+        copy_into(&[head, tail], 0xee);
+        "written"
+    }));
+    assert!(
+        poll(&mut call).is_none(),
+        "the call waits for the page instead of touching it"
+    );
+    assert!(
+        harness.index_of(tail).is_some(),
+        "nothing has read the page back yet"
+    );
+
+    harness.serve();
+    assert_eq!(poll(&mut call), Some(Ok("written")));
+    let mut expected = pattern(0x20);
+    expected[0] = 0xee;
+    assert_eq!(
+        harness.contents(tail),
+        expected,
+        "the page came back with its bytes, and the call's write landed on it"
+    );
+}
+
+/// A page brought back for one check may be taken again before the
+/// waiter is next polled; the access runs only after a check that finds
+/// every page present, in its own poll.
+#[test]
+fn a_page_taken_again_before_the_access_runs_is_brought_back_again() {
+    let mut harness = Harness::new();
+    let page = harness.resident(1, 0x30);
+    harness.evict(page).expect("evict");
+    let residency = residency(&harness.handle);
+
+    let mut call = Box::pin(residency.with_present(VirtRange::new(page, PAGE), || {
+        copy_into(&[page], 0x31);
+    }));
+    assert!(poll(&mut call).is_none());
+    harness.serve();
+    // Back in, and out again before the waiter runs.
+    harness.evict(page).expect("evict again");
+    assert!(
+        poll(&mut call).is_none(),
+        "the re-check finds the page out and waits again"
+    );
+    harness.serve();
+    assert_eq!(poll(&mut call), Some(Ok(())));
+    assert_eq!(harness.contents(page)[0], 0x31);
+    assert_eq!(harness.handle.stats().pages_in, 2);
+}
+
+/// A page that cannot be read back fails the access, which never runs:
+/// the caller traps its guest rather than copying memory that is gone.
+#[test]
+fn a_page_that_cannot_come_back_fails_the_access_without_running_it() {
+    let mut harness = Harness::new();
+    let page = harness.resident(1, 0x40);
+    harness.evict(page).expect("evict");
+    harness.backend.fail_reads(1);
+    let residency = residency(&harness.handle);
+
+    let mut call = Box::pin(residency.with_present(VirtRange::new(page, PAGE), || {
+        panic!("the access ran over a page that never came back")
+    }));
+    assert!(poll(&mut call).is_none());
+    harness.serve();
+    assert_eq!(poll(&mut call), Some(Err(SwapFaultError::Backend)));
+}
+
+/// Before the swap device comes up nothing can have been swapped out, so
+/// an access runs at once without asking the address space anything.
+#[test]
+fn an_access_before_swap_comes_up_runs_at_once() {
+    let residency = GuestResidency {
+        hooks: &TEST_HOOKS,
+        handle: Box::leak(Box::new(Once::new())),
+    };
+    let mut call =
+        Box::pin(residency.with_present(VirtRange::new(VirtAddr::new(PAGE), PAGE), || "ran"));
+    assert_eq!(poll(&mut call), Some(Ok("ran")));
+}
+
+/// The stream path: a page of a guest's read buffer is swapped out when
+/// a host producer is about to deliver into it. The runtime asks the
+/// residency hook in the poll that would make the copy; the hook hands
+/// back the fault-in instead of letting the copy through, and once that
+/// has resolved the same check lets the delivery go ahead.
+#[cfg(feature = "wasmtime-runtime")]
+#[test]
+fn a_stream_delivery_into_an_evicted_read_buffer_waits_for_the_fault_in() {
+    use core::ptr::NonNull;
+
+    use wasmtime::component::GuestMemoryResidency;
+
+    use crate::wasmtime_adapter::residency::SwapResidencyHook;
+
+    let mut harness = Harness::new();
+    let buffer = harness.resident(3, 0x50);
+    let tail = harness.resident(4, 0x60);
+    harness
+        .evict(tail)
+        .expect("evict the second page of the read buffer");
+    let mut hook = SwapResidencyHook::new(residency(&harness.handle));
+
+    // The guest's read buffer as the runtime names it: host addresses,
+    // two pages long. The fake address space is never dereferenced.
+    let read_buffer = NonNull::slice_from_raw_parts(
+        NonNull::new(buffer.raw() as *mut u8).expect("a page is never at address zero"),
+        2 * PAGE,
+    );
+    let mut wait = Box::pin(
+        hook.wait_until_resident(read_buffer)
+            .expect("a page of the read buffer is out, so the delivery must wait"),
+    );
+    assert!(
+        poll(&mut wait).is_none(),
+        "the fault-in waits for the device"
+    );
+    harness.serve();
+    assert_eq!(poll(&mut wait), Some(Ok(())));
+    assert!(
+        hook.wait_until_resident(read_buffer).is_none(),
+        "every page of the buffer is back, so the delivery goes ahead in this poll"
+    );
+    assert_eq!(harness.contents(tail), pattern(0x60));
+}
+
+/// A guest's linear memory whose pages swap through the fake address
+/// space and the harness's swap service, for tests outside this module
+/// that run a host call's guest-memory step against an evicted page.
+///
+/// The memory is real and page-aligned, so the code under test reads and
+/// writes it as it would a guest's. Evicting a page hands its bytes to the
+/// swap backend and fills the page with [`Self::POISON`], as a frame that
+/// went back to the pool holds whatever its next owner wrote; reading the
+/// page back restores its bytes. A copy that ran while its page was out
+/// therefore reads the poison, or loses what it wrote when the page comes
+/// back, and the test sees either.
+pub(crate) struct GuestSwap {
+    harness: Harness,
+    base: core::ptr::NonNull<u8>,
+    /// Which pages are out, their real bytes poisoned.
+    out: Vec<bool>,
+}
+
+impl GuestSwap {
+    /// What an evicted page holds until it comes back.
+    pub(crate) const POISON: u8 = 0xa5;
+
+    /// A zeroed memory of `pages` pages, every one of them present.
+    pub(crate) fn new(pages: usize) -> Self {
+        let harness = Harness::new();
+        // SAFETY: the layout is non-empty: every test memory has a page.
+        let base =
+            core::ptr::NonNull::new(unsafe { alloc::alloc::alloc_zeroed(Self::layout(pages)) })
+                .expect("the test memory allocates");
+        let memory = Self {
+            harness,
+            base,
+            out: vec![false; pages],
+        };
+        for page in 0..pages {
+            let addr = memory.page_addr(page);
+            with_space(|space| {
+                space
+                    .pages
+                    .insert(addr.raw(), FakePage::Present(vec![0; PAGE]));
+            });
+        }
+        memory
+    }
+
+    fn layout(pages: usize) -> alloc::alloc::Layout {
+        assert!(pages > 0, "a test memory has at least one page");
+        alloc::alloc::Layout::from_size_align(pages * PAGE, PAGE)
+            .expect("a test memory is a whole number of pages")
+    }
+
+    /// The host address the memory starts at.
+    pub(crate) fn base(&self) -> usize {
+        self.base.as_ptr() as usize
+    }
+
+    /// The memory's length in bytes.
+    pub(crate) fn len(&self) -> usize {
+        self.out.len() * PAGE
+    }
+
+    /// The memory as the guest would see it now: an evicted page reads
+    /// as poison.
+    pub(crate) fn bytes(&self) -> &[u8] {
+        // SAFETY: the allocation is `len` bytes and lives as long as `self`.
+        unsafe { core::slice::from_raw_parts(self.base.as_ptr(), self.len()) }
+    }
+
+    /// The memory, for a test to lay out what the guest passes in.
+    pub(crate) fn bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: as in `bytes`, borrowed mutably through `self`.
+        unsafe { core::slice::from_raw_parts_mut(self.base.as_ptr(), self.len()) }
+    }
+
+    /// The checks a host call makes over this memory.
+    pub(crate) fn residency(&self) -> GuestResidency {
+        residency(&self.harness.handle)
+    }
+
+    fn page_addr(&self, page: usize) -> VirtAddr {
+        assert!(
+            page < self.out.len(),
+            "page {page} is outside the test memory"
+        );
+        VirtAddr::new(self.base() + page * PAGE)
+    }
+
+    /// Takes page `page` out, the way a pass over an idle instance would.
+    pub(crate) fn evict(&mut self, page: usize) {
+        let addr = self.page_addr(page);
+        let range = page * PAGE..(page + 1) * PAGE;
+        let bytes = self.bytes()[range.clone()].to_vec();
+        with_space(|space| {
+            space.pages.insert(addr.raw(), FakePage::Present(bytes));
+        });
+        self.harness.evict(addr).expect("the page goes out");
+        self.bytes_mut()[range].fill(Self::POISON);
+        self.out[page] = true;
+    }
+
+    /// Whether page `page` is out.
+    pub(crate) fn is_out(&self, page: usize) -> bool {
+        self.harness.index_of(self.page_addr(page)).is_some()
+    }
+
+    /// How many fault-ins wait for the swap service.
+    pub(crate) fn queued_faults(&self) -> usize {
+        self.harness.handle.shared.faults.len()
+    }
+
+    /// Makes the next `count` reads from the swap device fail, so a page
+    /// faulted in meanwhile cannot come back.
+    pub(crate) fn fail_reads(&self, count: u32) {
+        self.harness.backend.fail_reads(count);
+    }
+
+    /// Runs the swap service over every queued fault-in, and puts each
+    /// page that came back where the code under test reads it.
+    pub(crate) fn serve(&mut self) {
+        self.harness.serve();
+        for page in 0..self.out.len() {
+            if !self.out[page] || self.is_out(page) {
+                continue;
+            }
+            let addr = self.page_addr(page);
+            let bytes = with_space(|space| match &space.pages[&addr.raw()] {
+                FakePage::Present(bytes) => bytes.clone(),
+                FakePage::Swapped(_) => unreachable!("a page with no swap token is present"),
+            });
+            self.bytes_mut()[page * PAGE..(page + 1) * PAGE].copy_from_slice(&bytes);
+            self.out[page] = false;
+        }
+    }
+}
+
+impl Drop for GuestSwap {
+    fn drop(&mut self) {
+        // SAFETY: allocated in `new` with this layout and freed only here.
+        unsafe { alloc::alloc::dealloc(self.base.as_ptr(), Self::layout(self.out.len())) };
+    }
+}
+
+/// The page size [`GuestSwap`] works in.
+pub(crate) const GUEST_SWAP_PAGE: usize = PAGE;

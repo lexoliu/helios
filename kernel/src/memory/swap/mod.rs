@@ -26,11 +26,18 @@
 //! instruction is retried; the runtime above never learns a fault
 //! happened.
 //!
-//! Kernel code is not on a fiber and has no trampoline. **Any kernel
-//! path that reads or writes user memory directly must call
-//! [`SwapHandle::ensure_present`] on the range first.** A fault taken
-//! outside a fiber is fatal, and it is fatal on purpose: silently
-//! resolving it would need a nested executor.
+//! Kernel code is not on a fiber and has no trampoline, and neither is a
+//! host call that already holds its fiber's blocking context (an async
+//! host function, polled inside the fiber's `block_on`). A fault taken
+//! there is fatal, and it is fatal on purpose: silently resolving it
+//! would need a nested executor. **A kernel or runtime path may touch a
+//! guest page only during a turn of the page's own instance, after
+//! seeing the page present in that same poll, with no await between the
+//! check and the copy. When a page is absent the path awaits its
+//! fault-in, which ends the turn, and checks again in its next poll.**
+//! [`GuestResidency::with_present`] is that contract as an accessor, and
+//! the Wasmtime adapter's residency hook is the same check for the
+//! copies the runtime makes for streams and futures.
 //!
 //! The matching half of that contract is enforced here rather than at
 //! every host call: **a page is only ever detached from an instance
@@ -56,10 +63,11 @@
 //! `Red` phase — which takes only cold pages — passes over it; and an
 //! instance that has just taken a fault or made a host call is by
 //! definition not ten seconds idle, so the `Yellow` phase, which
-//! ignores age, has no claim on it either. That is what makes
-//! [`SwapHandle::ensure_present`] a sound contract for kernel paths:
-//! the pages it faults in stay in until the host call that asked for
-//! them has finished with them.
+//! ignores age, has no claim on it either. Neither property keeps a page
+//! in across an await, though: an await ends the instance's turn, and
+//! from then on the page may leave again. A page faulted in ahead of a
+//! copy that comes after an await is no guarantee at all, which is why
+//! the check and the copy share a poll.
 //!
 //! # Order against the balloon
 //!
@@ -79,7 +87,10 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::future::Future;
+use core::pin::Pin;
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use core::task::{Context, Poll, ready};
 use core::time::Duration;
 
 use concurrent_queue::ConcurrentQueue;
@@ -92,7 +103,7 @@ use spin::Once;
 use thiserror::Error;
 
 use crate::exec::Spawner;
-use crate::exec::{PressureLevel, monotonic_nanos};
+use crate::exec::{NotifyWaiter, PressureLevel, monotonic_nanos};
 use crate::instance::InstanceRegistry;
 use crate::{Notify, Timer};
 
@@ -380,67 +391,171 @@ impl SwapHandle {
     /// device.
     ///
     /// This is what the page-fault trampoline blocks the faulting fiber
-    /// on, and what [`Self::ensure_present`] calls per page.
+    /// on, and what [`GuestResidency`] awaits for a page a kernel or
+    /// runtime copy found absent. The request is queued when the future
+    /// is first polled.
     ///
     /// Callers ask about an address whose entry carried a swap token when
     /// they looked. Succeeding means the page is present now: it was read
     /// back for this request, or another request got there first. The
     /// instruction is retried either way, and if the entry has since been
     /// released or decommitted the retry takes a fresh fault that the
-    /// fault entry classifies again.
-    pub async fn fault_in(&self, addr: VirtAddr) -> Result<(), SwapFaultError> {
-        // A fault reports the address the instruction touched, not the
-        // page it lives in; everything below this point works in pages.
-        let addr = addr.page_floor();
-        let reply = Arc::new(SwapFaultReply::new());
-        let request = SwapFaultRequest {
-            addr,
-            reply: reply.clone(),
-            issued_nanos: self.shared.clock.now_nanos(),
-        };
-        if self.shared.faults.push(request).is_err() {
-            // The queue is full or closed. Either way nothing will ever
-            // read this page back, and a caller that returns to the
-            // faulting instruction would fault forever.
-            return Err(SwapFaultError::Backend);
+    /// fault entry classifies again. Present *now* is all it means: by the
+    /// time the waiter is next polled its instance may have been off a
+    /// processor long enough for the page to leave again, so a copy
+    /// checks for itself in the poll that makes it.
+    pub fn fault_in(&self, addr: VirtAddr) -> SwapFaultIn {
+        SwapFaultIn {
+            shared: self.shared.clone(),
+            // A fault reports the address the instruction touched, not
+            // the page it lives in; everything below this point works in
+            // pages.
+            addr: addr.page_floor(),
+            issued: None,
         }
-        self.shared.work.notify_one_coalesced();
-        loop {
-            if let Some(outcome) = reply.read() {
-                return outcome;
-            }
-            reply.ready.notified().await;
-        }
-    }
-
-    /// Reads back every swapped-out page in `range`.
-    ///
-    /// Kernel code that touches user memory directly — a host call
-    /// copying a guest buffer, a byte channel taking bytes out of guest
-    /// memory, a DMA source built over a guest slice — calls this before
-    /// the copy. Kernel stacks have no fault trampoline, so a fault
-    /// there is fatal by design; pre-faulting is how those paths stay
-    /// correct.
-    pub async fn ensure_present(&self, range: VirtRange) -> Result<(), SwapFaultError> {
-        let Some(hooks) = installed_swap_hooks() else {
-            return Ok(());
-        };
-        let mut addr = range.start.page_floor().raw();
-        let end = range.end().raw();
-        while addr < end {
-            let page = VirtAddr::new(addr);
-            if (hooks.swapped_token)(page).is_some() {
-                self.fault_in(page).await?;
-            }
-            addr += PhysFrame::SIZE;
-        }
-        Ok(())
     }
 
     /// Wakes the policy, for callers that have just changed how much
     /// memory is free.
     pub fn poke(&self) {
         self.shared.work.notify_one_coalesced();
+    }
+}
+
+/// A page being read back in for [`SwapHandle::fault_in`].
+///
+/// One waiter: whoever polls it. The swap service settles the reply from
+/// whatever processor it runs on, and the settle stores a permit, so the
+/// outcome is never missed whichever of the two gets there first.
+#[must_use = "a fault-in is queued when it is first polled"]
+pub struct SwapFaultIn {
+    shared: Arc<SwapShared>,
+    addr: VirtAddr,
+    /// The request once it is queued, and the wait on its reply.
+    issued: Option<IssuedFault>,
+}
+
+struct IssuedFault {
+    reply: Arc<SwapFaultReply>,
+    waiter: NotifyWaiter,
+}
+
+impl Future for SwapFaultIn {
+    type Output = Result<(), SwapFaultError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = &mut *self;
+        let issued = match &mut this.issued {
+            Some(issued) => issued,
+            None => {
+                let reply = Arc::new(SwapFaultReply::new());
+                let request = SwapFaultRequest {
+                    addr: this.addr,
+                    reply: reply.clone(),
+                    issued_nanos: this.shared.clock.now_nanos(),
+                };
+                if this.shared.faults.push(request).is_err() {
+                    // The queue is full or closed. Either way nothing will
+                    // ever read this page back, and a caller that returns to
+                    // the faulting instruction would fault forever.
+                    return Poll::Ready(Err(SwapFaultError::Backend));
+                }
+                this.shared.work.notify_one_coalesced();
+                let waiter = reply.ready.waiter();
+                this.issued.insert(IssuedFault { reply, waiter })
+            }
+        };
+        loop {
+            if let Some(outcome) = issued.reply.read() {
+                return Poll::Ready(outcome);
+            }
+            ready!(issued.reply.ready.poll_notified(cx, &mut issued.waiter));
+        }
+    }
+}
+
+/// What a kernel or runtime path checks before it copies to or from a
+/// guest page swap may have taken.
+///
+/// # Concurrency
+///
+/// Every check is lock-free: it reads the page-table entries of the
+/// range through [`SwapVmHooks::swapped_token`], which any processor may
+/// call at any time, and the swap handle's `Once`. A fault-in it hands
+/// out queues one request on the swap service and parks on that
+/// request's own reply. A check answers for the moment it runs; it
+/// stays true for the rest of the poll only because a page is detached
+/// solely from an instance that is off every processor, and the check
+/// runs inside a turn of the page's own instance (see the module docs).
+#[derive(Clone, Copy)]
+pub struct GuestResidency {
+    hooks: &'static SwapVmHooks,
+    /// Published once the swap device comes up, which may be after the
+    /// stores that consult this were built. Until then no page has been
+    /// taken, so no check needs to walk anything.
+    handle: &'static Once<SwapHandle>,
+}
+
+impl GuestResidency {
+    /// The machine's swap, or `None` when the platform cannot swap at all
+    /// (its address space installed no swap hooks), in which case no guest
+    /// page is ever absent and nothing needs checking.
+    pub fn installed() -> Option<Self> {
+        Some(Self {
+            hooks: installed_swap_hooks()?,
+            handle: &HANDLE,
+        })
+    }
+
+    /// The first page of `range` that is swapped out right now, or `None`
+    /// when every page of it is present.
+    ///
+    /// A copy that may stop part-way asks this of the span it is about to
+    /// touch and copies only what lies before the page it names.
+    pub fn first_swapped(&self, range: VirtRange) -> Option<VirtAddr> {
+        // Before the swap device comes up no page has been taken.
+        self.handle.get()?;
+        let end = range.end().raw();
+        let mut page = range.start.page_floor().raw();
+        while page < end {
+            let addr = VirtAddr::new(page);
+            if (self.hooks.swapped_token)(addr).is_some() {
+                return Some(addr);
+            }
+            page += PhysFrame::SIZE;
+        }
+        None
+    }
+
+    /// A fault-in of the first page of `range` that is swapped out right
+    /// now, or `None` when every page of it is present.
+    pub fn fault_in_first_swapped(&self, range: VirtRange) -> Option<SwapFaultIn> {
+        let page = self.first_swapped(range)?;
+        let handle = self
+            .handle
+            .get()
+            .expect("a page is swapped out only once the swap handle is published");
+        Some(handle.fault_in(page))
+    }
+
+    /// Runs `access` once every page of `range` is present, in the same
+    /// poll as the check that found them present.
+    ///
+    /// `access` is synchronous, so nothing can await between the check
+    /// and the bytes it touches. Each absent page is faulted in and the
+    /// whole range checked again afterwards, because a page brought back
+    /// for one round may be gone by the next.
+    pub async fn with_present<R>(
+        &self,
+        range: VirtRange,
+        access: impl FnOnce() -> R,
+    ) -> Result<R, SwapFaultError> {
+        loop {
+            match self.fault_in_first_swapped(range) {
+                None => return Ok(access()),
+                Some(fault) => fault.await?,
+            }
+        }
     }
 }
 
@@ -799,7 +914,7 @@ where
         // A request exists only for an address whose entry carried a token
         // when the fault was taken (the backend's fault entry checks
         // `swapped_token` before it enters the trampoline, and
-        // `ensure_present` before it asks). One that carries none now has
+        // `GuestResidency` before it asks). One that carries none now has
         // changed since: an earlier request reinstated the page, which is
         // the case of several guest threads or fibers faulting on one
         // page, or the address space dropped the entry. Either way the
@@ -1165,6 +1280,8 @@ fn current_pressure() -> PressureLevel {
 
 #[cfg(test)]
 mod service_tests;
+#[cfg(test)]
+pub(crate) use service_tests::{GUEST_SWAP_PAGE, GuestSwap};
 #[cfg(test)]
 mod space_tests;
 

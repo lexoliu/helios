@@ -17,6 +17,7 @@ mod input;
 mod ioapic;
 mod iommu;
 mod memory_type;
+mod mtrr;
 mod net;
 mod pci;
 mod rtc;
@@ -274,15 +275,16 @@ fn x86_kernel_main() -> ! {
     // may publish, and that has to be settled before the first ring is
     // allocated.
     let iommu_topology = iommu::discover(rsdp_address, physical_memory_offset);
-    let network_function = net::discover(&pci);
-    let host_share_function = host_fs::discover(&pci);
-    let entropy_function = entropy::discover(&pci);
-    let balloon_function = balloon::discover(&pci);
-    let vsock_function = vsock::discover(&pci);
-    let display_function = gpu::discover(&pci);
-    let input_functions = input::discover(&pci);
-    let sound_function = snd::discover(&pci);
-    let block_functions = block::discover(&pci);
+    let virtio = pci.virtio_functions();
+    let network_function = net::discover(&virtio);
+    let host_share_function = host_fs::discover(&virtio);
+    let entropy_function = entropy::discover(&virtio);
+    let balloon_function = balloon::discover(&virtio);
+    let vsock_function = vsock::discover(&virtio);
+    let display_function = gpu::discover(&virtio);
+    let input_functions = input::discover(&virtio);
+    let sound_function = snd::discover(&virtio);
+    let block_functions = block::discover(&virtio);
     // The TPM is checked before the kernel exists, because whether the
     // kernel is handed one is part of the platform it is built from; the
     // outcome is reported once the logger is up.
@@ -1214,6 +1216,9 @@ extern "C" fn secondary_start_rust(
     // The same page-attribute table the bootstrap processor runs with,
     // before this processor can touch a write-combined mapping.
     memory_type::program_page_attribute_table();
+    // And the bootstrap processor's MTRRs, which a started processor
+    // leaves reset without.
+    boot.mtrrs().apply();
     // Guest code is compiled once for the ISA level the bootstrap processor
     // satisfies and runs on any processor, so every processor must answer
     // every level feature the same way. XCR0 is programmed, which the AVX

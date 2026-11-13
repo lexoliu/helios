@@ -50,6 +50,7 @@ use crate::exceptions::{
 use crate::extended_state::Xcr0;
 use crate::hotplug::SciEvents;
 use crate::ioapic::IoApics;
+use crate::mtrr::Mtrrs;
 use crate::pci::LegacyPciConfigAccess;
 use crate::read_tsc;
 use crate::watchdog::X86Watchdog;
@@ -311,6 +312,9 @@ pub(crate) struct BootContext {
     /// The bootstrap processor's answer to every ISA level feature, taken
     /// after it programmed XCR0. Immutable; each secondary compares its own.
     isa_answers: ProbeAnswers,
+    /// The bootstrap processor's MTRRs, read once from what firmware
+    /// programmed; every processor the kernel starts loads them.
+    mtrrs: Mtrrs,
 }
 
 pub(crate) struct X86PlatformState {
@@ -551,6 +555,7 @@ pub(crate) fn build_boot_context(
         platform,
         xcr0,
         isa_answers: crate::probe_isa_answers(),
+        mtrrs: Mtrrs::capture(),
     }));
     context
         .platform
@@ -731,6 +736,9 @@ pub(crate) extern "C" fn resume_current_rust(
     // and added again starts from RESET, whose table maps no type
     // write-combined; this is the table a first start programs.
     crate::memory_type::program_page_attribute_table();
+    // The same holds for the MTRRs: RESET clears them, INIT keeps them,
+    // and loading them again is idempotent.
+    boot.mtrrs().apply();
     // The same holds for what it offers: a re-added vCPU is a new one,
     // and guest code compiled for the bootstrap processor's level runs
     // on it.
@@ -1052,6 +1060,11 @@ impl BootContext {
     /// [`crate::probe_isa_answers`].
     pub(crate) fn isa_answers(&self) -> ProbeAnswers {
         self.isa_answers
+    }
+
+    /// The bootstrap processor's MTRRs; see [`Mtrrs::apply`].
+    pub(crate) fn mtrrs(&self) -> &Mtrrs {
+        &self.mtrrs
     }
 
     pub(crate) fn bootstrap_runtime(&self) -> &ProcessorRuntime {

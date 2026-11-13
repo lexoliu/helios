@@ -20,6 +20,7 @@ pub(crate) mod fiber_stack;
 #[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]
 pub mod parking;
 pub(crate) mod preemption;
+pub(crate) mod residency;
 pub mod store;
 pub mod swap_fault;
 #[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]

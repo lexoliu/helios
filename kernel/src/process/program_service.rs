@@ -250,6 +250,36 @@ pub enum ProgramExecErrorDetail {
     ExecutorTaskCapacityExhausted,
     #[error("internal invariant was violated")]
     InternalInvariant,
+    #[error("{0}")]
+    ComponentStdioUnbindable(ComponentStdioRefusal),
+}
+
+/// A standard descriptor a launching process hands to a component
+/// program that the component's stdin, stdout or stderr cannot carry.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+#[error("descriptor {fd} is {held}, which a component's standard stream cannot carry")]
+pub struct ComponentStdioRefusal {
+    pub fd: u8,
+    pub held: UnbindableStdio,
+}
+
+/// What an unbindable standard descriptor holds.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum UnbindableStdio {
+    #[error("a file")]
+    File,
+    #[error("a directory")]
+    Directory,
+    #[error("a socket")]
+    Socket,
+    #[error("an event descriptor")]
+    Event,
+    #[error("an epoll descriptor")]
+    Epoll,
+    #[error("a stream open in the other direction")]
+    WrongDirection,
+    #[error("an input stream holding bytes already read from it")]
+    ReadAhead,
 }
 
 impl ProgramExecErrorDetail {
@@ -319,6 +349,11 @@ impl ProgramExecErrorDetail {
                 "the executor has no task capacity left for another instance"
             }
             Self::InternalInvariant => "internal invariant was violated",
+            // The descriptor and what it holds are in the error's
+            // `Display`; `as_str` has no storage to format them into.
+            Self::ComponentStdioUnbindable(_) => {
+                "a standard descriptor cannot be a component's standard stream"
+            }
         }
     }
 }

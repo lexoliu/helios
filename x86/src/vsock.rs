@@ -14,7 +14,7 @@ use helios_kernel::ExternalInterruptHandler;
 use helios_virtio::{DeviceType, OffsetDmaPool, VirtioPciTransport, VirtioVsockDevice};
 use pci_types::PciAddress;
 
-use crate::pci::PciRoot;
+use crate::pci::{PciRoot, VirtioFunctions};
 
 type X86VirtioVsockDevice = VirtioVsockDevice<VirtioPciTransport<OffsetDmaPool>>;
 
@@ -35,8 +35,8 @@ impl ExternalInterruptHandler for VirtioVsockFunction {
 }
 
 /// The PCI function that carries the platform's vsock device.
-pub(crate) fn discover(pci: &PciRoot) -> Option<PciAddress> {
-    pci.find_virtio_function(DeviceType::Vsock)
+pub(crate) fn discover(virtio: &VirtioFunctions) -> Option<PciAddress> {
+    virtio.find_virtio_function(DeviceType::Vsock)
 }
 
 /// Brings up the virtio-vsock function at `address` and publishes it as

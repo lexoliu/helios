@@ -88,6 +88,9 @@ pub(super) enum TcpReadIntoProgress {
     Pending,
     Data(usize),
     Eof,
+    /// Bytes are queued, but the page of the buffer they land on next is
+    /// swapped out, so the stack handed over none of them.
+    PageAbsent,
 }
 
 /// The kernel-side reading of a netstack close kind.
@@ -241,9 +244,9 @@ where
     pub async fn tcp_read_into(
         &self,
         stream: TcpStreamId,
-        buffer: RegisteredTcpReadBuffer<'_>,
+        buffer: &mut RegisteredTcpReadBuffer<'_>,
         timeout_nanos: u64,
-    ) -> Result<Option<usize>, TcpError> {
+    ) -> Result<TcpReadInto, TcpError> {
         self.execute_tcp_read_into(stream, buffer, timeout_nanos)
             .await
     }
@@ -829,44 +832,40 @@ where
         }
     }
 
+    /// The read behind [`Self::tcp_read_into`].
+    ///
+    /// Every copy into `buffer` happens inside a synchronous step of this
+    /// future's own poll — the caller's host call, a turn of the instance
+    /// that owns the buffer — never in a task of the network service. A
+    /// page of the buffer that is out is faulted in here, which ends the
+    /// turn, and the read starts over without counting the wait against
+    /// the deadline: the bytes it is for are already queued.
     pub(super) async fn execute_tcp_read_into(
         &self,
         stream: TcpStreamId,
-        mut buffer: RegisteredTcpReadBuffer<'_>,
+        buffer: &mut RegisteredTcpReadBuffer<'_>,
         timeout_nanos: u64,
-    ) -> Result<Option<usize>, TcpError> {
+    ) -> Result<TcpReadInto, TcpError> {
         let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
-        let max_bytes = buffer.capacity();
         loop {
             let wait = self.shard_wait_for_handle(stream);
-            match self.poll_tcp_read_into_once(
-                stream,
-                &mut buffer,
-                TcpReadPhasePrefix::IntoInitial,
-            )? {
-                TcpReadIntoProgress::Data(bytes) => return Ok(Some(bytes)),
-                TcpReadIntoProgress::Eof => return Ok(None),
-                TcpReadIntoProgress::Pending => {}
-            }
-
-            let drive_started = self.profile_start();
-            self.drive_tcp_read_network_burst(max_bytes).await?;
-            self.record_network_profile("tcp-read-into-drive-network", drive_started);
-            match self.poll_tcp_read_into_once(
-                stream,
-                &mut buffer,
-                TcpReadPhasePrefix::IntoAfterDrive,
-            )? {
-                TcpReadIntoProgress::Data(bytes) => return Ok(Some(bytes)),
-                TcpReadIntoProgress::Eof => return Ok(None),
-                TcpReadIntoProgress::Pending => {}
-            }
             match self
-                .poll_tcp_read_into_without_interrupt_sleep(stream, &mut buffer, deadline_nanos)
+                .poll_tcp_read_into_round(stream, buffer, deadline_nanos)
                 .await?
             {
-                TcpReadIntoProgress::Data(bytes) => return Ok(Some(bytes)),
-                TcpReadIntoProgress::Eof => return Ok(None),
+                TcpReadIntoProgress::Data(bytes) => {
+                    return self.finish_tcp_read_into(stream, buffer, bytes).await;
+                }
+                TcpReadIntoProgress::Eof => return Ok(TcpReadInto::Eof),
+                TcpReadIntoProgress::PageAbsent => {
+                    let fault_started = self.profile_start();
+                    let fault = buffer.bring_in_next_page().await;
+                    self.record_network_profile("tcp-read-into-page-in", fault_started);
+                    match fault {
+                        Ok(()) => continue,
+                        Err(error) => return Ok(TcpReadInto::PageLost(error)),
+                    }
+                }
                 TcpReadIntoProgress::Pending => {}
             }
             if self.now_nanos() >= deadline_nanos {
@@ -880,6 +879,74 @@ where
             self.wait_for_tcp_progress(wait, deadline_nanos).await;
             self.record_network_profile("tcp-read-into-wait", wait_started);
         }
+    }
+
+    /// Completes a read that has delivered `delivered` bytes.
+    ///
+    /// A copy that stopped in front of a page of the buffer that is out,
+    /// with bytes still queued behind it, takes them once the page is
+    /// back, the way a read that meets a page fault in place carries on:
+    /// the read still never waits for bytes that have not arrived. A page
+    /// that cannot come back ends the read with its loss, which traps the
+    /// guest whose memory it was.
+    async fn finish_tcp_read_into(
+        &self,
+        stream: TcpStreamId,
+        buffer: &mut RegisteredTcpReadBuffer<'_>,
+        mut delivered: usize,
+    ) -> Result<TcpReadInto, TcpError> {
+        while buffer.awaits_page() && self.tcp_receive_queued(stream)? {
+            if let Err(error) = buffer.bring_in_next_page().await {
+                return Ok(TcpReadInto::PageLost(error));
+            }
+            match self.poll_tcp_read_into_once(stream, buffer, TcpReadPhasePrefix::IntoInitial)? {
+                TcpReadIntoProgress::Data(more) => delivered += more,
+                // Taken again before this poll; the loop brings it back.
+                TcpReadIntoProgress::PageAbsent => {}
+                TcpReadIntoProgress::Pending | TcpReadIntoProgress::Eof => break,
+            }
+        }
+        Ok(TcpReadInto::Data(delivered))
+    }
+
+    /// Whether `stream`'s receive queue holds bytes a read would take
+    /// now, without taking them or driving the device.
+    fn tcp_receive_queued(&self, stream: TcpStreamId) -> Result<bool, TcpError> {
+        let now = StackInstant::from_nanos(self.now_nanos());
+        self.inner.state.with_handle(stream, |state| {
+            let socket = state.tcp_socket(stream)?;
+            let read = state.stack.tcp_read(socket, 0, now).map_err(|_| TcpError {
+                kind: TcpErrorKind::Unavailable,
+                detail: NetworkErrorDetail::TcpReceiveFailed,
+            })?;
+            Ok(matches!(read, TcpReadState::Data(_)))
+        })
+    }
+
+    /// One round of [`Self::execute_tcp_read_into`] short of parking: the
+    /// receive queue as it stands, then after one drive of the device,
+    /// then, on a device with no interrupts, the polling rounds. The
+    /// first answer that is not `Pending` ends the round.
+    async fn poll_tcp_read_into_round(
+        &self,
+        stream: TcpStreamId,
+        buffer: &mut RegisteredTcpReadBuffer<'_>,
+        deadline_nanos: u64,
+    ) -> Result<TcpReadIntoProgress, TcpError> {
+        let read = self.poll_tcp_read_into_once(stream, buffer, TcpReadPhasePrefix::IntoInitial)?;
+        if !matches!(read, TcpReadIntoProgress::Pending) {
+            return Ok(read);
+        }
+        let drive_started = self.profile_start();
+        self.drive_tcp_read_network_burst(buffer.capacity()).await?;
+        self.record_network_profile("tcp-read-into-drive-network", drive_started);
+        let read =
+            self.poll_tcp_read_into_once(stream, buffer, TcpReadPhasePrefix::IntoAfterDrive)?;
+        if !matches!(read, TcpReadIntoProgress::Pending) {
+            return Ok(read);
+        }
+        self.poll_tcp_read_into_without_interrupt_sleep(stream, buffer, deadline_nanos)
+            .await
     }
 
     /// Names the receive state a read gave up on.
@@ -927,11 +994,12 @@ where
     ) -> Result<TcpReadProgress, TcpError> {
         let started = self.profile_start();
         let now = StackInstant::from_nanos(self.now_nanos());
-        let read = self.inner.state.with_handle_receive_drain(
-            stream,
-            self.inner.device.queue_pair_count().max(1),
-            |state| state.poll_tcp_read(stream, max_bytes, now),
-        )?;
+        let read =
+            self.inner
+                .state
+                .with_handle_receive_drain(stream, &self.inner.pairs, |state| {
+                    state.poll_tcp_read(stream, max_bytes, now)
+                })?;
         self.record_tcp_read_progress(profile_prefix, started, &read);
         Ok(read)
     }
@@ -944,11 +1012,12 @@ where
     ) -> Result<TcpReadIntoProgress, TcpError> {
         let started = self.profile_start();
         let now = StackInstant::from_nanos(self.now_nanos());
-        let read = self.inner.state.with_handle_receive_drain(
-            stream,
-            self.inner.device.queue_pair_count().max(1),
-            |state| state.poll_tcp_read_into(stream, buffer, now),
-        )?;
+        let read =
+            self.inner
+                .state
+                .with_handle_receive_drain(stream, &self.inner.pairs, |state| {
+                    state.poll_tcp_read_into(stream, buffer, now)
+                })?;
         self.record_tcp_read_into_progress(profile_prefix, started, &read);
         Ok(read)
     }
@@ -1037,7 +1106,9 @@ where
                 })?;
             self.record_network_profile("tcp-read-into-polling-drive-network", drive_started);
             match self.poll_tcp_read_into_once(stream, buffer, TcpReadPhasePrefix::IntoPolling)? {
-                ready @ (TcpReadIntoProgress::Data(_) | TcpReadIntoProgress::Eof) => {
+                ready @ (TcpReadIntoProgress::Data(_)
+                | TcpReadIntoProgress::Eof
+                | TcpReadIntoProgress::PageAbsent) => {
                     return Ok(ready);
                 }
                 TcpReadIntoProgress::Pending => {}
@@ -1163,9 +1234,11 @@ where
     ///
     /// An operation sweeps every pair — it is the stack's whole driver
     /// while it runs — while a pump reclaims only the pair it owns:
-    /// every other pair has a pump of its own parked on it. A pair
-    /// another processor currently holds is skipped either way: that
-    /// processor is draining it, and this poll has nothing to add.
+    /// every other pair has a pump of its own parked on it. The sweep
+    /// covers every pair brought up, live or not, so what a pair held
+    /// when it stopped being live is still collected. A pair another
+    /// processor currently holds is skipped either way: that processor
+    /// is draining it, and this poll has nothing to add.
     fn reclaim_transmit_completions(
         &self,
         budget: usize,
@@ -1322,7 +1395,7 @@ where
         // configuration the control plane is about to push into the
         // shards. Both are interface-wide duties — an operation driving
         // the stack itself keeps them, and of the pumps only the one on
-        // the bootstrap processor's pair does, since a link or
+        // pair 0 does, since a link or
         // configuration event arrives on no pair. That pump also runs
         // the configuration state machines themselves, between the link
         // check that may have restarted them and the publication of
@@ -1479,17 +1552,18 @@ where
         };
         match scope {
             NetworkPollScope::Interface => self.inner.state.for_each(drive_tcp),
-            NetworkPollScope::Pair { pair, .. } => self
-                .inner
-                .state
-                .for_each_on_pair(pair, pair_count, drive_tcp),
+            NetworkPollScope::Pair { pair, .. } => {
+                self.inner
+                    .state
+                    .for_each_on_pair(pair, self.inner.pairs.layout(), drive_tcp)
+            }
         }
         let tcp_finished = self.profile_start();
         if let Some(probe) = tcp_read_probe {
             tcp_read_started = self.profile_start();
             tcp_read = Some(self.inner.state.with_handle_receive_drain(
                 probe.stream,
-                pair_count,
+                &self.inner.pairs,
                 |state| state.poll_tcp_read(probe.stream, probe.max_bytes, now),
             ));
             tcp_read_finished = self.profile_start();
@@ -1602,7 +1676,8 @@ where
         read: &TcpReadIntoProgress,
     ) {
         let (phase, bytes) = match read {
-            TcpReadIntoProgress::Pending => (
+            // A read that waits for a page of its buffer moved nothing yet.
+            TcpReadIntoProgress::Pending | TcpReadIntoProgress::PageAbsent => (
                 tcp_read_profile_phase(prefix, TcpReadPhaseOutcome::Pending),
                 0,
             ),
@@ -1680,24 +1755,52 @@ impl TcpConnectRequest {
     }
 }
 
+/// A connection an ephemeral-port connect opened, and the candidate it
+/// took: an [`OwnCandidate`] or a [`ForeignCandidate`], which advance
+/// different counters of the destination.
+#[derive(Clone, Copy)]
+pub(super) struct OpenedTcpConnect<Taken> {
+    pub(super) stream: TcpStreamId,
+    pub(super) taken: Taken,
+}
+
 impl NetworkShardSet {
     /// Chooses an ephemeral port and opens the connection from it, as
     /// one step, from the window of shard `accepting`.
     ///
-    /// The window is classified once ([`EphemeralCandidates`]), outside
-    /// every lock: the accepting shard's lock is taken only to read its
-    /// window and draw from its entropy, then released while the
-    /// window is classified, and taken again for the own half. The
-    /// ports whose flow hashes back to the accepting shard are tried
-    /// first, under that lock, from one drawn uniformly among them: the
-    /// connection is then also received on the processor that opened
-    /// it, with no cross-processor hop for its whole life. The ports
-    /// that hash elsewhere are then tried on their owning shards, from a
-    /// random place (RFC 6056 §3.3.1), one lock at a time, never two,
-    /// and none across an await. A candidate in use
-    /// ([`TcpConnectStartError::PortInUse`]) moves on to the next; any
-    /// other failure ends the search. Only a window with every
-    /// candidate in use fails with
+    /// The start depends on the destination (RFC 6056 §3.3.3,
+    /// [`ConnectPortSelector`]) and the walk runs over the accepting
+    /// shard's own ports in rank order ([`EphemeralCandidates`]): every
+    /// own port is first for an equal share of the keyed starts, and
+    /// successive connects to one destination take successive own ports,
+    /// so a four-tuple a peer may still hold is not drawn again before a
+    /// lap of them. A port whose flow hashes back to the accepting shard
+    /// is preferred because the connection is then also received on the
+    /// processor that opened it, with no cross-processor hop for its
+    /// whole life. Only with every own port in use are the ports that
+    /// hash elsewhere tried, on their owning shards, in window order
+    /// from the keyed start plus the destination's foreign count. Once a
+    /// candidate opens, the count of its kind advances past it.
+    ///
+    /// Locks: the accepting shard's lock is held to read its window, the
+    /// key and the destination's counters, released while the window is
+    /// classified, taken again for the own half and for recording an own
+    /// take, and once more to record a foreign take. Each foreign
+    /// candidate is tried under its owner's lock alone; no two shard
+    /// locks are ever held, and none across an await.
+    ///
+    /// Two connects to one destination may read the same counters
+    /// before either records its take and so start at the same rank.
+    /// The one that tries a port second finds it in use, because the
+    /// test and the open both run under the lock of the port's owner,
+    /// and moves on to the next; each then advances the count by the
+    /// ranks it passed plus one, and since the advances add, the count
+    /// ends past both ports. A race only moves a destination's start
+    /// further on, never back onto a port just taken.
+    ///
+    /// A candidate in use ([`TcpConnectStartError::PortInUse`]) moves
+    /// on to the next; any other failure ends the search. Only a window
+    /// with every candidate in use fails with
     /// [`NetworkErrorDetail::TcpNoEphemeralPorts`].
     pub(super) fn open_ephemeral_tcp_connect(
         &self,
@@ -1705,18 +1808,22 @@ impl NetworkShardSet {
         request: TcpConnectRequest,
     ) -> Result<TcpStreamId, TcpError> {
         let owners = request.port_owners(self.shard_count());
-        let (first, last, draw) = self.shard_at(accepting).lock().connect_draw();
-        let candidates = EphemeralCandidates::classify(first, last, draw, |port| {
-            owners.owner_of(port) == accepting
-        });
-        if let Some(stream) = self
-            .shard_at(accepting)
-            .lock()
-            .open_tcp_connect_along_own_flows(&candidates, request)?
+        let (start, slot) = self.shard_at(accepting).lock().connect_start(&request);
+        let candidates =
+            EphemeralCandidates::classify(start, |port| owners.owner_of(port) == accepting);
         {
-            return Ok(stream);
+            let mut shard = self.shard_at(accepting).lock();
+            if let Some(opened) = shard.open_tcp_connect_along_own_flows(&candidates, request)? {
+                shard.connect_ports.took_own(slot, opened.taken);
+                return Ok(opened.stream);
+            }
         }
-        self.open_tcp_connect_along_foreign_flows(&candidates, &owners, request)
+        let opened = self.open_tcp_connect_along_foreign_flows(&candidates, &owners, request)?;
+        self.shard_at(accepting)
+            .lock()
+            .connect_ports
+            .took_foreign(slot, opened.taken);
+        Ok(opened.stream)
     }
 
     /// The second half of [`Self::open_ephemeral_tcp_connect`]: the
@@ -1727,11 +1834,16 @@ impl NetworkShardSet {
         candidates: &EphemeralCandidates,
         owners: &PortOwners,
         request: TcpConnectRequest,
-    ) -> Result<TcpStreamId, TcpError> {
+    ) -> Result<OpenedTcpConnect<ForeignCandidate>, TcpError> {
         for candidate in candidates.foreign_ports() {
-            let owner = owners.owner_of(candidate);
-            match request.start_on(&mut self.shard_at(owner).lock(), candidate) {
-                Ok(stream) => return Ok(stream),
+            let owner = owners.owner_of(candidate.port);
+            match request.start_on(&mut self.shard_at(owner).lock(), candidate.port) {
+                Ok(stream) => {
+                    return Ok(OpenedTcpConnect {
+                        stream,
+                        taken: candidate,
+                    });
+                }
                 Err(TcpConnectStartError::PortInUse) => {}
                 Err(TcpConnectStartError::Failed(error)) => return Err(error),
             }
@@ -1794,16 +1906,6 @@ impl NetworkShard {
         Ok(self.insert_tcp_stream(socket))
     }
 
-    /// This shard's window `(first, last)` and the draw, below the
-    /// window's length, that [`EphemeralCandidates::classify`] selects
-    /// its starting points from. The entropy stream is touched only
-    /// here, under this shard's lock, which the caller holds.
-    pub(super) fn connect_draw(&mut self) -> (u16, u16, u32) {
-        let (first, last) = self.ephemeral_window();
-        let draw = self.entropy.below(EphemeralWalk::window_len(first, last));
-        (first, last, draw)
-    }
-
     /// Opens an ephemeral-port connection on this shard from the own
     /// ports of `candidates`, this shard's own window.
     ///
@@ -1818,10 +1920,15 @@ impl NetworkShard {
         &mut self,
         candidates: &EphemeralCandidates,
         request: TcpConnectRequest,
-    ) -> Result<Option<TcpStreamId>, TcpError> {
+    ) -> Result<Option<OpenedTcpConnect<OwnCandidate>>, TcpError> {
         for candidate in candidates.own_ports() {
-            match request.start_on(self, candidate) {
-                Ok(stream) => return Ok(Some(stream)),
+            match request.start_on(self, candidate.port) {
+                Ok(stream) => {
+                    return Ok(Some(OpenedTcpConnect {
+                        stream,
+                        taken: candidate,
+                    }));
+                }
                 Err(TcpConnectStartError::PortInUse) => {}
                 Err(TcpConnectStartError::Failed(error)) => return Err(error),
             }
@@ -2051,6 +2158,11 @@ impl NetworkShard {
                 detail: NetworkErrorDetail::TcpReceiveFailed,
             })? {
             TcpReadIntoState::Pending => Ok(TcpReadIntoProgress::Pending),
+            // The stack hands over nothing, though bytes are queued, only
+            // when the buffer reported no room: full, or its next page out.
+            TcpReadIntoState::Data(0) if buffer.awaits_page() => {
+                Ok(TcpReadIntoProgress::PageAbsent)
+            }
             TcpReadIntoState::Data(bytes) => Ok(TcpReadIntoProgress::Data(bytes)),
             TcpReadIntoState::Closed(close) => match tcp_close_error(close) {
                 Some(error) => Err(error),
@@ -2139,5 +2251,158 @@ impl NetworkShard {
         self.tcp_listeners
             .iter()
             .all(|state| state.local_port != port)
+    }
+}
+
+/// The zero-copy receive against guest pages swap has taken: bytes go
+/// from the stream's receive queue into guest memory once, and only into
+/// a page the copying step saw present.
+#[cfg(test)]
+mod read_into_tests {
+    use alloc::vec::Vec;
+    use core::future::Future;
+    use core::pin::{Pin, pin};
+    use core::task::{Context, Poll, Waker};
+
+    use helios_netstack::{TcpFlags, TcpHeader};
+
+    use crate::memory::{GUEST_SWAP_PAGE, GuestSwap, SwapFaultError};
+    use crate::network::EstablishedTcpFixture;
+    use crate::{RegisteredTcpReadBuffer, TcpReadInto};
+
+    const PAGE: usize = GUEST_SWAP_PAGE;
+
+    /// The bytes of one segment the peer sends.
+    const SEGMENT: usize = 1_400;
+
+    fn poll_once<F: Future>(future: Pin<&mut F>) -> Option<F::Output> {
+        match future.poll(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(output) => Some(output),
+            Poll::Pending => None,
+        }
+    }
+
+    /// What a read finished with, if it finished in this poll; the stream
+    /// is live, so it never fails.
+    fn read_result(
+        read: Pin<&mut impl Future<Output = Result<TcpReadInto, crate::TcpError>>>,
+    ) -> Option<TcpReadInto> {
+        poll_once(read).map(|read| read.expect("the stream is live"))
+    }
+
+    /// Text in Chinese, Japanese and Korean, repeated to `len` bytes.
+    fn cjk_bytes(len: usize) -> Vec<u8> {
+        "数据データ데이터".bytes().cycle().take(len).collect()
+    }
+
+    /// The peer sends `payload` as segments of [`SEGMENT`] bytes, in order.
+    fn deliver(fixture: &EstablishedTcpFixture, payload: &[u8]) {
+        for (index, segment) in payload.chunks(SEGMENT).enumerate() {
+            fixture.deliver(
+                TcpHeader {
+                    source_port: EstablishedTcpFixture::PEER_PORT,
+                    destination_port: EstablishedTcpFixture::LOCAL_PORT,
+                    // The handshake took one sequence number on each side.
+                    sequence: EstablishedTcpFixture::PEER_SEQUENCE + 1 + (index * SEGMENT) as u32,
+                    acknowledgement: EstablishedTcpFixture::LOCAL_SEQUENCE + 1,
+                    flags: TcpFlags::ACK.union(TcpFlags::PSH),
+                    window_size: u16::MAX,
+                },
+                segment,
+            );
+        }
+    }
+
+    fn buffer<'a>(swap: &GuestSwap, ranges: &'a [(usize, usize)]) -> RegisteredTcpReadBuffer<'a> {
+        // SAFETY: every range lies inside the test memory, which outlives
+        // the buffer, and nothing else writes it while the read runs.
+        unsafe { RegisteredTcpReadBuffer::new(swap.base(), ranges, Some(swap.residency())) }
+    }
+
+    /// Bytes that arrived while the page they land on was out stay queued
+    /// until the page is back, then land on it intact.
+    #[test]
+    fn bytes_for_an_evicted_page_land_intact_once_it_is_back() {
+        let fixture = EstablishedTcpFixture::new();
+        let service = fixture.service();
+        let mut swap = GuestSwap::new(2);
+        swap.evict(1);
+        let payload = cjk_bytes(SEGMENT);
+        deliver(&fixture, &payload);
+
+        let ranges = [(PAGE, SEGMENT)];
+        let mut buffer = buffer(&swap, &ranges);
+        let mut read = pin!(service.tcp_read_into(fixture.stream(), &mut buffer, 0));
+        assert!(
+            poll_once(read.as_mut()).is_none(),
+            "the read waits for the page instead of writing it"
+        );
+        assert_eq!(swap.queued_faults(), 1, "the page was asked for");
+        assert!(swap.is_out(1), "nothing has read the page back yet");
+
+        swap.serve();
+        assert_eq!(read_result(read.as_mut()), Some(TcpReadInto::Data(SEGMENT)));
+        assert!(swap.bytes()[PAGE..PAGE + SEGMENT] == payload[..]);
+    }
+
+    /// One read over two segments whose buffer starts on a present page
+    /// and runs onto an evicted one: what fits before the page that is
+    /// out lands at once, the rest once that page is back, all in one
+    /// read and in order.
+    #[test]
+    fn a_read_spanning_a_present_and_an_evicted_page_lands_whole() {
+        let fixture = EstablishedTcpFixture::new();
+        let service = fixture.service();
+        let mut swap = GuestSwap::new(2);
+        swap.evict(1);
+        let payload = cjk_bytes(2 * SEGMENT);
+        deliver(&fixture, &payload);
+
+        let head = 1_000;
+        let ranges = [(PAGE - head, head), (PAGE, 2 * SEGMENT - head)];
+        let mut buffer = buffer(&swap, &ranges);
+        let mut read = pin!(service.tcp_read_into(fixture.stream(), &mut buffer, 0));
+        assert!(poll_once(read.as_mut()).is_none());
+        assert!(
+            swap.bytes()[PAGE - head..PAGE] == payload[..head],
+            "the bytes for the present page landed in the first poll"
+        );
+        assert_eq!(swap.queued_faults(), 1);
+
+        swap.serve();
+        assert_eq!(
+            read_result(read.as_mut()),
+            Some(TcpReadInto::Data(2 * SEGMENT))
+        );
+        assert!(swap.bytes()[PAGE - head..PAGE - head + 2 * SEGMENT] == payload[..]);
+    }
+
+    /// A page that cannot come back ends the read with its loss, and the
+    /// bytes it was for stay queued on the stream.
+    #[test]
+    fn a_lost_page_ends_the_read_and_leaves_the_bytes_queued() {
+        let fixture = EstablishedTcpFixture::new();
+        let service = fixture.service();
+        let mut swap = GuestSwap::new(2);
+        swap.evict(1);
+        swap.fail_reads(1);
+        let payload = cjk_bytes(SEGMENT);
+        deliver(&fixture, &payload);
+
+        let ranges = [(PAGE, SEGMENT)];
+        let mut lost = buffer(&swap, &ranges);
+        let mut read = pin!(service.tcp_read_into(fixture.stream(), &mut lost, 0));
+        assert!(poll_once(read.as_mut()).is_none());
+        swap.serve();
+        assert_eq!(
+            read_result(read.as_mut()),
+            Some(TcpReadInto::PageLost(SwapFaultError::Backend))
+        );
+
+        let ranges = [(0, SEGMENT)];
+        let mut present = buffer(&swap, &ranges);
+        let mut read = pin!(service.tcp_read_into(fixture.stream(), &mut present, 0));
+        assert_eq!(read_result(read.as_mut()), Some(TcpReadInto::Data(SEGMENT)));
+        assert!(swap.bytes()[..SEGMENT] == payload[..]);
     }
 }

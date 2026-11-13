@@ -17,7 +17,7 @@ use helios_virtio::{DeviceType, VirtioPciTransport, VirtioRngDevice};
 use pci_types::PciAddress;
 
 use crate::iommu::X86DmaPool;
-use crate::pci::PciRoot;
+use crate::pci::{PciRoot, VirtioFunctions};
 
 type X86VirtioRngDevice = VirtioRngDevice<VirtioPciTransport<X86DmaPool>>;
 
@@ -46,8 +46,8 @@ impl HardwareEntropySource for VirtioEntropyDevice {
 }
 
 /// The PCI function that carries the platform's entropy device.
-pub(crate) fn discover(pci: &PciRoot) -> Option<PciAddress> {
-    pci.find_virtio_function(DeviceType::Entropy)
+pub(crate) fn discover(virtio: &VirtioFunctions) -> Option<PciAddress> {
+    virtio.find_virtio_function(DeviceType::Entropy)
 }
 
 /// Brings up the virtio-entropy function at `address` and hands it to

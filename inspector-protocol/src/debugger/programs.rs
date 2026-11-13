@@ -113,6 +113,7 @@ mod guest {
                         host_programs::root_mount_grant(),
                         host_programs::all_device_classes_grant(),
                         host_programs::observe_machine_grant(),
+                        host_programs::control_processors_grant(),
                     ],
                 })
                 .await
