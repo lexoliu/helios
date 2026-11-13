@@ -893,6 +893,12 @@ where
     persist_timer: Option<TcpPersistTimer>,
     persist_probe: Option<TcpPersistProbe>,
     next_pacing_send_nanos: Option<u64>,
+    /// While set, the socket has something to send and no link-layer
+    /// address to send it to, and this is when the stack asks again. It
+    /// replaces the pacing deadline in [`Self::next_deadline_nanos`]: a
+    /// pacing deadline that has already passed would wake the socket's
+    /// writer again and again for a segment nothing can address.
+    resolution_retry_nanos: Option<u64>,
     delayed_ack_deadline_nanos: Option<u64>,
     time_wait_deadline_nanos: Option<u64>,
     unacked_receive_segments: u8,
@@ -1085,6 +1091,7 @@ where
             persist_timer: None,
             persist_probe: None,
             next_pacing_send_nanos: None,
+            resolution_retry_nanos: None,
             delayed_ack_deadline_nanos: None,
             time_wait_deadline_nanos: None,
             unacked_receive_segments: 0,
@@ -1555,6 +1562,9 @@ where
         now_nanos: u64,
         budget: TcpSegmentBudget,
     ) -> Option<TcpTransmitSegment> {
+        // A caller takes only for a next hop it resolved, so the wait
+        // for a link-layer address is over.
+        self.resolution_retry_nanos = None;
         self.arm_persist_timer_if_needed(now_nanos);
         let local = self.local?;
         let remote = self.remote?;
@@ -1669,7 +1679,27 @@ where
         })
     }
 
+    /// Records that the segment this socket would send has no link-layer
+    /// address to go to yet, and that the stack asks for one again at
+    /// `retry_nanos`.
+    ///
+    /// Until the socket takes a segment again, `retry_nanos` is its
+    /// transmit deadline in place of the pacing deadline, which a stalled
+    /// pacing clock leaves in the past.
+    pub fn await_resolution(&mut self, retry_nanos: u64) {
+        self.resolution_retry_nanos = Some(retry_nanos);
+    }
+
     pub fn expire_timers(&mut self, now_nanos: u64) {
+        // The wait for a link-layer address is over; whether the socket
+        // still has anything to send is for the drive that follows to
+        // find, and it re-arms the wait if the address is still missing.
+        if self
+            .resolution_retry_nanos
+            .is_some_and(|deadline| now_nanos >= deadline)
+        {
+            self.resolution_retry_nanos = None;
+        }
         if self
             .delayed_ack_deadline_nanos
             .is_some_and(|deadline| now_nanos >= deadline)
@@ -1695,23 +1725,27 @@ where
                 )
             })
         });
-        // The pacing deadline is when the socket next sends only while
-        // the windows would let it. A window-blocked socket waits on an
-        // ACK, and its passed pacing deadline would otherwise report a
+        // A socket waiting for a link-layer address cannot send at its
+        // pacing time, so the time it asks again stands in for it. The
+        // pacing time itself is when the socket next sends only while
+        // the windows would let it: a window-blocked socket waits on an
+        // ACK, and its passed pacing time would otherwise report a
         // timer that is always due.
-        let pacing_deadline = self.next_pacing_send_nanos.filter(|_| {
-            !self.transmit_queue_is_empty()
-                && self.available_send_window() != 0
-                && !self
-                    .in_flight
-                    .as_ref()
-                    .is_some_and(TcpInFlightQueue::is_full)
+        let transmit_deadline = self.resolution_retry_nanos.or_else(|| {
+            self.next_pacing_send_nanos.filter(|_| {
+                !self.transmit_queue_is_empty()
+                    && self.available_send_window() != 0
+                    && !self
+                        .in_flight
+                        .as_ref()
+                        .is_some_and(TcpInFlightQueue::is_full)
+            })
         });
         let persist_deadline = self.persist_timer.map(TcpPersistTimer::deadline_nanos);
         min_deadline(
             min_deadline(
                 min_deadline(
-                    min_deadline(rto_deadline, pacing_deadline),
+                    min_deadline(rto_deadline, transmit_deadline),
                     persist_deadline,
                 ),
                 self.delayed_ack_deadline_nanos,
@@ -2429,6 +2463,7 @@ where
         self.persist_timer = None;
         self.persist_probe = None;
         self.next_pacing_send_nanos = None;
+        self.resolution_retry_nanos = None;
         self.delayed_ack_deadline_nanos = None;
         self.time_wait_deadline_nanos = None;
         self.unacked_receive_segments = 0;

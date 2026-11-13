@@ -43,10 +43,10 @@ pub const MAX_UDP_RX: usize = 64;
 /// exchange is forgotten once the table fills.
 pub const MAX_ICMP_ECHO_EXCHANGES: usize = 8;
 /// Next hops whose address resolution one stack paces at once: one per
-/// entry the neighbor cache holds, since every resolution under way
-/// keeps an Incomplete entry there. A record is displaced only once its
-/// last request is a full interval old, so this is also the most
-/// requests one stack puts on the wire per interval.
+/// entry the neighbor cache holds, since a resolution under way ends in
+/// an entry there. A record is displaced only once its last request is
+/// a full interval old, so this is also the most requests one stack puts
+/// on the wire per interval.
 const MAX_PENDING_RESOLUTIONS: usize = MAX_NEIGHBORS;
 /// The time between two requests for the same address: RFC 1122 section
 /// 2.3.2.1 asks for at most one ARP request per second per destination,
@@ -196,6 +196,14 @@ struct FramePath<A> {
     local_mac: EthernetAddress,
     source: A,
     destination: A,
+}
+
+/// Where a TCP segment leaves for: the next hop's link-layer address, or
+/// the instant the next request for it may go out.
+#[derive(Clone, Copy, Debug)]
+enum TcpLink {
+    Resolved(EthernetAddress),
+    Unresolved { next_request_at: StackInstant },
 }
 
 /// How a queued TCP segment carries its payload to the frame encoders.
@@ -437,18 +445,6 @@ pub struct IcmpEchoReply {
     pub payload_bytes: u16,
 }
 
-/// An address whose link-layer address this stack is asking for: how
-/// many requests went out and when the last one did. The neighbor cache
-/// holds the Incomplete entry, but it cannot carry this: the kernel
-/// replaces every shard's cache with its own mirror whenever it
-/// synchronizes the control plane, which would restart the pacing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct AddressResolution {
-    target: IpAddress,
-    requests: u8,
-    last_request_at: StackInstant,
-}
-
 /// The fields of a Neighbor Advertisement (RFC 4861 section 4.4) the
 /// stack acts on.
 #[derive(Clone, Copy, Debug)]
@@ -471,15 +467,24 @@ struct RxLink {
     group_destination: bool,
 }
 
+/// What a resolved neighbor's link-layer address is worth (RFC 4861 §7.3.2
+/// without the unresolved state: an address still being asked for has no
+/// link-layer address to hold and lives in the asking stack's pending
+/// resolutions instead).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NeighborState {
-    Incomplete,
     Reachable,
     Stale,
     Delay,
     Probe,
 }
 
+/// A neighbor whose link-layer address is known.
+///
+/// This is the only neighbor a [`StackEvent::NeighborUpdated`] carries and
+/// the only one a [`NeighborCache`] holds, so a request that is still
+/// waiting for its answer cannot be published to, or replace an entry in,
+/// anything that shares neighbors between stacks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NeighborEntry {
     pub ip: IpAddress,
@@ -488,15 +493,178 @@ pub struct NeighborEntry {
     pub updated_at: StackInstant,
 }
 
-/// A bounded neighbor cache.
+/// An address whose link-layer address a stack is asking for: how many
+/// requests went out and when the last one did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AddressResolution {
+    target: IpAddress,
+    requests: u8,
+    last_request_at: StackInstant,
+}
+
+/// What [`PendingResolutions::request`] decided for one send that found
+/// its next hop unresolved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResolutionRequest {
+    /// A request for the address is to go on the wire now.
+    send: bool,
+    /// The instant the next request for the address may go out, which is
+    /// when a send that is waiting for the answer asks again.
+    next_request_at: StackInstant,
+}
+
+/// The addresses one stack is asking for, and the pacing of the requests.
+///
+/// The records are this stack's own and are never published: the kernel
+/// replaces every shard's neighbor cache with its own mirror whenever it
+/// synchronizes the control plane, so neither the pacing nor a request
+/// still waiting for its answer can live in the cache, and a request one
+/// shard makes never touches the resolved entry another shard holds for
+/// the same address. An answer (a resolved neighbor for the address,
+/// from this stack's own traffic or from the control plane) ends the
+/// resolution.
+///
+/// Concurrency: a plain value owned by one stack, like the cache; every
+/// operation runs on the shard that owns the stack, under that shard's
+/// lock. A Neighbor Advertisement received by another stack reaches the
+/// record through [`Stack::answer_resolution`], which the kernel calls
+/// from the demux under this stack's own lock, one shard lock at a time,
+/// so the record is never read or written from two processors at once
+/// and nothing here is shared.
+#[derive(Clone, Debug, Default)]
+struct PendingResolutions {
+    entries: ArrayVec<AddressResolution, MAX_PENDING_RESOLUTIONS>,
+}
+
+impl PendingResolutions {
+    const fn new() -> Self {
+        Self {
+            entries: ArrayVec::new_const(),
+        }
+    }
+
+    /// Whether nothing is being asked for.
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Whether `target` is being asked for.
+    fn contains(&self, target: IpAddress) -> bool {
+        self.entries.iter().any(|entry| entry.target == target)
+    }
+
+    /// Decides whether a send that found `target` unresolved is to put a
+    /// request for it on the wire at `now`: at most one request per
+    /// [`ADDRESS_RESOLUTION_RETRANSMIT_NANOS`] and
+    /// [`ADDRESS_RESOLUTION_MAX_REQUESTS`] of them (RFC 1122 section
+    /// 2.3.2.1, RFC 4861 section 7.2.2). A send inside the interval, the
+    /// ARP and the Neighbor Discovery path alike, only reports the
+    /// resolution as pending.
+    ///
+    /// A new resolution displaces, when the table is full, only a record
+    /// whose last request is a full interval old: displacing a younger one
+    /// would let its address be asked for again at once. When every record
+    /// is younger, the new address is refused and its send stays pending,
+    /// so no number of distinct addresses lifts the per-address limit or
+    /// the total of [`MAX_PENDING_RESOLUTIONS`] requests per interval.
+    ///
+    /// Once the last request has gone unanswered for a full interval the
+    /// resolution has failed: it is forgotten, the call that noticed asks
+    /// for nothing, and the next send to the address begins afresh.
+    ///
+    /// A request counts as sent when `send` is true, even if the output
+    /// queue then has no room for the frame.
+    ///
+    /// `next_request_at` is the instant the pacing rules above next allow a
+    /// request for `target`, which is one of:
+    /// - request sent: `now` plus the interval, when the next request goes
+    ///   out, or, after the last one, when the failure is noticed;
+    /// - inside the interval: the end of the interval the last request
+    ///   started, which is when the one pending is allowed to repeat;
+    /// - refused because the table is full of younger records: the end of
+    ///   the interval the oldest record's last request started, the first
+    ///   instant a record can be displaced;
+    /// - the call that notices a failed resolution: `now`, since the
+    ///   resolution is forgotten and the next send begins afresh, which
+    ///   asks at once.
+    fn request(&mut self, target: IpAddress, now: StackInstant) -> ResolutionRequest {
+        let interval_end = |last_request_at: StackInstant| {
+            StackInstant::from_nanos(
+                last_request_at
+                    .nanos()
+                    .saturating_add(ADDRESS_RESOLUTION_RETRANSMIT_NANOS),
+            )
+        };
+        let interval_elapsed = |last_request_at: StackInstant| now >= interval_end(last_request_at);
+        let refused = |next_request_at| ResolutionRequest {
+            send: false,
+            next_request_at,
+        };
+        match self
+            .entries
+            .iter()
+            .position(|resolution| resolution.target == target)
+        {
+            Some(index) => {
+                let resolution = &mut self.entries[index];
+                if !interval_elapsed(resolution.last_request_at) {
+                    return refused(interval_end(resolution.last_request_at));
+                }
+                if resolution.requests == ADDRESS_RESOLUTION_MAX_REQUESTS {
+                    tracing::debug!(
+                        ?target,
+                        requests = resolution.requests,
+                        "address resolution failed"
+                    );
+                    self.entries.swap_remove(index);
+                    return refused(now);
+                }
+                resolution.requests += 1;
+                resolution.last_request_at = now;
+            }
+            None => {
+                if self.entries.is_full() {
+                    let (oldest, last_request_at) = self
+                        .entries
+                        .iter()
+                        .enumerate()
+                        .map(|(index, resolution)| (index, resolution.last_request_at))
+                        .min_by_key(|&(_, last_request_at)| last_request_at)
+                        .unwrap_or_else(|| panic!("a full resolution table has an oldest entry"));
+                    if !interval_elapsed(last_request_at) {
+                        return refused(interval_end(last_request_at));
+                    }
+                    self.entries.swap_remove(oldest);
+                }
+                self.entries.push(AddressResolution {
+                    target,
+                    requests: 1,
+                    last_request_at: now,
+                });
+            }
+        }
+        ResolutionRequest {
+            send: true,
+            next_request_at: interval_end(now),
+        }
+    }
+
+    /// Forgets the resolution of `target`: its answer arrived.
+    fn answer(&mut self, target: IpAddress) {
+        if let Some(position) = self.entries.iter().position(|entry| entry.target == target) {
+            self.entries.swap_remove(position);
+        }
+    }
+}
+
+/// A bounded cache of resolved neighbors.
 ///
 /// Holds at most [`MAX_NEIGHBORS`] entries and never refuses an
 /// insertion: when full, a new address displaces the entry that is cheapest
 /// to lose. A pinned entry (a next hop the routes depend on) outlasts every
-/// unpinned one, then an in-flight resolution goes before a resolved entry,
-/// a stale one before a live one, and the least recently updated before the
-/// most recent. A resolved entry that is evicted costs one more ARP or
-/// Neighbor Discovery exchange the next time it is needed.
+/// unpinned one, then a stale one goes before a live one, and the least
+/// recently updated before the most recent. An entry that is evicted costs
+/// one more ARP or Neighbor Discovery exchange the next time it is needed.
 ///
 /// Concurrency: a plain value with no interior mutability. A stack owns one
 /// (so does exactly one shard), and the control plane keeps its own copy
@@ -545,11 +713,10 @@ impl NeighborCache {
         };
         let victim = self.entries.iter_mut().min_by_key(|candidate| {
             let rank = match candidate.state {
-                NeighborState::Incomplete => 0u8,
-                NeighborState::Stale => 1,
-                NeighborState::Probe => 2,
-                NeighborState::Delay => 3,
-                NeighborState::Reachable => 4,
+                NeighborState::Stale => 0u8,
+                NeighborState::Probe => 1,
+                NeighborState::Delay => 2,
+                NeighborState::Reachable => 3,
             };
             (pinned(candidate.ip), rank, candidate.updated_at)
         });
@@ -2666,9 +2833,10 @@ where
     ipv6_dns_servers: Ipv6DnsServers,
     ipv4_multicast_memberships: ArrayVec<Ipv4MulticastMembership, MAX_IPV4_MULTICAST_MEMBERSHIPS>,
     neighbors: NeighborCache,
-    /// Pacing of the requests for next hops that are not resolved yet,
-    /// oldest ask first; see [`Stack::next_resolution_request`].
-    resolutions: ArrayVec<AddressResolution, MAX_PENDING_RESOLUTIONS>,
+    /// Addresses this stack has asked for and not had answered, with the
+    /// pacing of the requests. Never published: a request belongs to the
+    /// shard that made it.
+    pending_resolutions: PendingResolutions,
     /// The bucket the ICMP and ICMPv6 errors this stack originates are
     /// drawn from.
     icmp_error_rate: IcmpRateLimit,
@@ -3107,7 +3275,7 @@ where
             ipv6_dns_servers: Ipv6DnsServers::new(),
             ipv4_multicast_memberships: ArrayVec::new(),
             neighbors: NeighborCache::new(),
-            resolutions: ArrayVec::new(),
+            pending_resolutions: PendingResolutions::new(),
             icmp_error_rate: IcmpRateLimit::new(),
             icmp_echo_rate: IcmpRateLimit::new(),
             outbound: OutboundFrameQueue::new(),
@@ -3227,27 +3395,42 @@ where
         self.neighbors.iter()
     }
 
-    /// Replaces the cache with `neighbors`, keeping the entries the cache
-    /// would keep when the list is longer than its capacity. Routes are
-    /// replaced first so a gateway's entry is the one that survives.
+    /// Applies a shared table of resolved neighbors to this stack.
+    ///
+    /// Replaces: every resolved entry, with `neighbors`, keeping the
+    /// entries the cache would keep when the list is longer than its
+    /// capacity (routes are replaced first so a gateway's entry is the one
+    /// that survives). The table is the authority for resolved addresses,
+    /// which is how a link reset that empties it empties every stack that
+    /// applies it.
+    ///
+    /// Keeps: this stack's pending resolutions, which are its own and not
+    /// in the table, so applying the table never makes it forget a request
+    /// it is waiting on. A request the table answers is dropped, because
+    /// its answer is now cached here.
+    ///
+    /// Nothing is downgraded: the table holds resolved neighbors only, so
+    /// no entry it replaces can become a placeholder for an unresolved one.
+    /// No [`StackEvent::NeighborUpdated`] is raised; the table is where the
+    /// entries came from.
     pub fn replace_neighbors(&mut self, neighbors: impl IntoIterator<Item = NeighborEntry>) {
         self.neighbors.clear();
         let routes = &self.routes;
         for entry in neighbors {
             self.neighbors
                 .learn(entry, |address| routes.is_gateway(address));
+            self.pending_resolutions.answer(entry.ip);
         }
     }
 
+    /// Caches a resolved neighbor, answers any request for it and reports
+    /// it to whoever shares neighbors between stacks.
     pub fn learn_neighbor(&mut self, entry: NeighborEntry) {
-        if entry.state != NeighborState::Incomplete {
-            // The address is resolved, so the requests for it are over.
-            self.resolutions
-                .retain(|resolution| resolution.target != entry.ip);
-        }
         let routes = &self.routes;
         self.neighbors
             .learn(entry, |address| routes.is_gateway(address));
+        // The address is resolved, so the requests for it are over.
+        self.pending_resolutions.answer(entry.ip);
         self.push_event(StackEvent::NeighborUpdated(entry));
     }
 
@@ -4338,10 +4521,17 @@ where
             }
             // Unresolved, the next hop has been solicited and the data
             // stays queued on the socket until it answers.
-            let Some(link) = self.resolve_tcp_link_address(local, remote, now)? else {
-                return Ok(());
-            };
-            Some(link)
+            match self.resolve_tcp_link_address(local, remote, now)? {
+                TcpLink::Resolved(link) => Some(link),
+                TcpLink::Unresolved { next_request_at } => {
+                    // The socket's deadline becomes the next request
+                    // rather than a pacing time its writer would be
+                    // woken on again and again.
+                    self.active_tcp_socket_mut(index)
+                        .await_resolution(next_request_at.nanos());
+                    return Ok(());
+                }
+            }
         } else {
             None
         };
@@ -5168,14 +5358,13 @@ where
     }
 
     /// The link address a TCP segment from `local` to `remote` leaves
-    /// for, or `None` after queuing the solicitation that will resolve
-    /// it.
+    /// for, or, after asking for it, when the next request may go out.
     fn resolve_tcp_link_address(
         &mut self,
         local: TcpEndpoint,
         remote: TcpEndpoint,
         now: StackInstant,
-    ) -> Result<Option<EthernetAddress>, StackError> {
+    ) -> Result<TcpLink, StackError> {
         match (local.address, remote.address) {
             (IpAddress::Ipv4(source), IpAddress::Ipv4(destination)) => {
                 self.resolve_ipv4_link_address(source, destination, now)
@@ -5192,18 +5381,19 @@ where
         source: Ipv4Address,
         destination: Ipv4Address,
         now: StackInstant,
-    ) -> Result<Option<EthernetAddress>, StackError> {
+    ) -> Result<TcpLink, StackError> {
         let next_hop = self.next_hop(IpAddress::Ipv4(destination));
         let next_hop = match next_hop {
             Some(IpAddress::Ipv4(next_hop)) => next_hop,
             Some(IpAddress::Ipv6(_)) => panic!("IPv4 route resolved to IPv6 next hop"),
             None => destination,
         };
-        let mac = self.neighbor_mac(IpAddress::Ipv4(next_hop));
-        if mac.is_none() {
-            self.queue_arp_request(source, next_hop, now)?;
+        match self.neighbor_mac(IpAddress::Ipv4(next_hop)) {
+            Some(mac) => Ok(TcpLink::Resolved(mac)),
+            None => Ok(TcpLink::Unresolved {
+                next_request_at: self.queue_arp_request(source, next_hop, now)?,
+            }),
         }
-        Ok(mac)
     }
 
     fn resolve_ipv6_link_address(
@@ -5211,18 +5401,19 @@ where
         source: Ipv6Address,
         destination: Ipv6Address,
         now: StackInstant,
-    ) -> Result<Option<EthernetAddress>, StackError> {
+    ) -> Result<TcpLink, StackError> {
         let next_hop = self.next_hop(IpAddress::Ipv6(destination));
         let next_hop = match next_hop {
             Some(IpAddress::Ipv6(next_hop)) => next_hop,
             Some(IpAddress::Ipv4(_)) => panic!("IPv6 route resolved to IPv4 next hop"),
             None => destination,
         };
-        let mac = self.neighbor_mac(IpAddress::Ipv6(next_hop));
-        if mac.is_none() {
-            self.queue_ndp_solicitation(source, next_hop, now)?;
+        match self.neighbor_mac(IpAddress::Ipv6(next_hop)) {
+            Some(mac) => Ok(TcpLink::Resolved(mac)),
+            None => Ok(TcpLink::Unresolved {
+                next_request_at: self.queue_ndp_solicitation(source, next_hop, now)?,
+            }),
         }
-        Ok(mac)
     }
 
     /// Queues `segment`, or reports `false` after soliciting the next
@@ -5236,7 +5427,9 @@ where
         now: StackInstant,
     ) -> Result<bool, StackError> {
         self.ensure_tcp_segment_fits(local, remote, &segment)?;
-        let Some(destination_mac) = self.resolve_tcp_link_address(local, remote, now)? else {
+        let TcpLink::Resolved(destination_mac) =
+            self.resolve_tcp_link_address(local, remote, now)?
+        else {
             return Ok(false);
         };
         self.queue_tcp_frame(destination_mac, local, remote, segment, identification)?;
@@ -5609,105 +5802,26 @@ where
             .map(|entry| entry.cidr().address())
     }
 
-    /// Whether a send that found `target` unresolved is to put a request
-    /// for it on the wire at `now`: at most one request per
-    /// [`ADDRESS_RESOLUTION_RETRANSMIT_NANOS`] and
-    /// [`ADDRESS_RESOLUTION_MAX_REQUESTS`] of them (RFC 1122 section
-    /// 2.3.2.1, RFC 4861 section 7.2.2). A send inside the interval, the
-    /// ARP and the Neighbor Discovery path alike, only reports the
-    /// resolution as pending.
-    ///
-    /// A new resolution displaces, when the table is full, only a record
-    /// whose last request is a full interval old: displacing a younger one
-    /// would let its address be asked for again at once. When every record
-    /// is younger, the new address is refused and its send stays pending,
-    /// so no number of distinct addresses lifts the per-address limit or
-    /// the total of [`MAX_PENDING_RESOLUTIONS`] requests per interval.
-    ///
-    /// Once the last request has gone unanswered for a full interval the
-    /// resolution has failed: it is forgotten, the call that noticed asks
-    /// for nothing, and the next send to the address begins afresh.
-    ///
-    /// When a request is due and the cache holds no Incomplete entry for
-    /// `target` (resolution begins, or the cache displaced or replaced
-    /// the entry since), one is written: an advertisement only completes
-    /// an entry that exists. A request counts as sent when this returns
-    /// true, even if the output queue then has no room for the frame.
-    fn take_resolution_request(&mut self, target: IpAddress, now: StackInstant) -> bool {
-        let interval_elapsed = |last_request_at: StackInstant| {
-            now.nanos().saturating_sub(last_request_at.nanos())
-                >= ADDRESS_RESOLUTION_RETRANSMIT_NANOS
-        };
-        match self
-            .resolutions
-            .iter()
-            .position(|resolution| resolution.target == target)
-        {
-            Some(index) => {
-                let resolution = &mut self.resolutions[index];
-                if !interval_elapsed(resolution.last_request_at) {
-                    return false;
-                }
-                if resolution.requests == ADDRESS_RESOLUTION_MAX_REQUESTS {
-                    tracing::debug!(
-                        ?target,
-                        requests = resolution.requests,
-                        "address resolution failed"
-                    );
-                    self.resolutions.swap_remove(index);
-                    return false;
-                }
-                resolution.requests += 1;
-                resolution.last_request_at = now;
-            }
-            None => {
-                if self.resolutions.is_full() {
-                    let (oldest, last_request_at) = self
-                        .resolutions
-                        .iter()
-                        .enumerate()
-                        .map(|(index, resolution)| (index, resolution.last_request_at))
-                        .min_by_key(|&(_, last_request_at)| last_request_at)
-                        .unwrap_or_else(|| panic!("a full resolution table has an oldest entry"));
-                    if !interval_elapsed(last_request_at) {
-                        return false;
-                    }
-                    self.resolutions.swap_remove(oldest);
-                }
-                self.resolutions.push(AddressResolution {
-                    target,
-                    requests: 1,
-                    last_request_at: now,
-                });
-            }
-        }
-        if self
-            .neighbors
-            .get(target)
-            .is_none_or(|entry| entry.state != NeighborState::Incomplete)
-        {
-            self.learn_neighbor(NeighborEntry {
-                ip: target,
-                mac: [0; 6],
-                state: NeighborState::Incomplete,
-                updated_at: now,
-            });
-        }
-        true
-    }
-
+    /// Asks for `target`'s link-layer address when the pacing of
+    /// [`PendingResolutions::request`] allows a request at `now`, and
+    /// returns the instant the next request may go out (the cases are
+    /// listed there). The request is this stack's own state: it writes no
+    /// neighbor and raises no event.
     fn queue_ndp_solicitation(
         &mut self,
         source: Ipv6Address,
         target: Ipv6Address,
         now: StackInstant,
-    ) -> Result<(), StackError> {
-        if !self.take_resolution_request(IpAddress::Ipv6(target), now) {
-            return Ok(());
+    ) -> Result<StackInstant, StackError> {
+        let request = self
+            .pending_resolutions
+            .request(IpAddress::Ipv6(target), now);
+        if request.send {
+            let destination = target.solicited_node_multicast();
+            let destination_mac = ipv6_multicast_mac(destination);
+            self.queue_icmpv6_neighbor_solicitation(source, destination, target, destination_mac)?;
         }
-        let destination = target.solicited_node_multicast();
-        let destination_mac = ipv6_multicast_mac(destination);
-        self.queue_icmpv6_neighbor_solicitation(source, destination, target, destination_mac)
+        Ok(request.next_request_at)
     }
 
     fn queue_icmpv6_neighbor_solicitation(
@@ -5804,6 +5918,8 @@ where
         }
     }
 
+    /// The link-layer address frames for `ip` may be sent to: a stale or
+    /// delayed entry still is one (RFC 4861 §7.3.3), a probed one is not.
     fn neighbor_mac(&self, ip: IpAddress) -> Option<EthernetAddress> {
         self.neighbors
             .get(ip)
@@ -5816,25 +5932,33 @@ where
             .map(|entry| entry.mac)
     }
 
+    /// Asks for `target`'s link-layer address when the pacing of
+    /// [`PendingResolutions::request`] allows a request at `now`, and
+    /// returns the instant the next request may go out (the cases are
+    /// listed there). The request is this stack's own state: it writes no
+    /// neighbor and raises no event.
     fn queue_arp_request(
         &mut self,
         source: Ipv4Address,
         target: Ipv4Address,
         now: StackInstant,
-    ) -> Result<(), StackError> {
-        if !self.take_resolution_request(IpAddress::Ipv4(target), now) {
-            return Ok(());
+    ) -> Result<StackInstant, StackError> {
+        let request = self
+            .pending_resolutions
+            .request(IpAddress::Ipv4(target), now);
+        if request.send {
+            self.queue_arp(
+                [0xff; 6],
+                ArpPacket {
+                    operation: ArpOperation::Request,
+                    sender_hardware: self.config.mac,
+                    sender_protocol: source,
+                    target_hardware: [0; 6],
+                    target_protocol: target,
+                },
+            )?;
         }
-        self.queue_arp(
-            [0xff; 6],
-            ArpPacket {
-                operation: ArpOperation::Request,
-                sender_hardware: self.config.mac,
-                sender_protocol: source,
-                target_hardware: [0; 6],
-                target_protocol: target,
-            },
-        )
+        Ok(request.next_request_at)
     }
 
     fn queue_arp_reply(
@@ -6491,8 +6615,14 @@ where
 
     /// Takes in a Neighbor Advertisement (RFC 4861 sections 7.1.2 and
     /// 7.2.5). A message that fails validation changes nothing, and one
-    /// for an address nobody asked about creates no entry: only an entry
-    /// that exists is updated.
+    /// for an address nobody asked about creates no entry: only an
+    /// address this stack is asking for (a pending resolution) or one it
+    /// has an entry for is updated.
+    ///
+    /// An advertisement received here may also be the answer to another
+    /// stack's pending resolution: the kernel offers it to that stack
+    /// through [`Stack::answer_resolution`], which applies the same
+    /// checks and completes nothing but a pending record.
     fn receive_neighbor_advertisement(
         &mut self,
         packet: Ipv6Packet<'_>,
@@ -6505,35 +6635,26 @@ where
             override_cache,
             options,
         } = advertisement;
-        if !Self::neighbor_message_is_valid(packet, target, options)
-            // An advertisement sent to a multicast address answers no
-            // solicitation.
-            || (packet.destination.is_multicast() && solicited)
-        {
+        if !Self::neighbor_advertisement_is_valid(packet, &advertisement) {
             return;
         }
-        let Some(cached) = self.neighbors.get(IpAddress::Ipv6(target)) else {
-            return;
-        };
+        let ip = IpAddress::Ipv6(target);
         // RFC 4861 section 4.4: the target link-layer option names the
         // node the advertisement speaks for, which is not the Ethernet
         // source when a router proxies for it.
         let advertised_mac = options.target_link_layer_address();
-        let updated = if cached.state == NeighborState::Incomplete {
-            let Some(mac) = advertised_mac else {
-                return;
-            };
-            NeighborEntry {
-                mac,
-                state: if solicited {
-                    NeighborState::Reachable
-                } else {
-                    NeighborState::Stale
-                },
-                updated_at: now,
-                ..cached
-            }
-        } else if override_cache || advertised_mac.is_none_or(|mac| mac == cached.mac) {
+        if self.complete_resolution(target, solicited, advertised_mac, now) {
+            return;
+        }
+        if self.pending_resolutions.contains(ip) {
+            // The address is being asked for but the advertisement carries
+            // no address to answer with.
+            return;
+        }
+        let Some(cached) = self.neighbors.get(ip) else {
+            return;
+        };
+        let updated = if override_cache || advertised_mac.is_none_or(|mac| mac == cached.mac) {
             let mac = advertised_mac.unwrap_or(cached.mac);
             if !solicited && mac == cached.mac {
                 // Neither the address nor the state changes, so there is
@@ -6562,6 +6683,105 @@ where
             return;
         };
         self.learn_neighbor(updated);
+    }
+
+    /// The checks a Neighbor Advertisement must pass before it changes
+    /// anything (RFC 4861 section 7.1.2): the checks every neighbor
+    /// message has, and a destination that is not a multicast address
+    /// when the advertisement claims to answer a solicitation.
+    fn neighbor_advertisement_is_valid(
+        packet: Ipv6Packet<'_>,
+        advertisement: &NeighborAdvertisement<'_>,
+    ) -> bool {
+        Self::neighbor_message_is_valid(packet, advertisement.target, advertisement.options)
+            // An advertisement sent to a multicast address answers no
+            // solicitation.
+            && !(packet.destination.is_multicast() && advertisement.solicited)
+    }
+
+    /// Completes this stack's pending resolution of `target` with the
+    /// address a validated advertisement carries: the entry is Reachable
+    /// when the advertisement answers a solicitation and Stale when it
+    /// does not, replaces whatever the cache holds, and ends the
+    /// resolution. Returns whether it did; nothing changes when no
+    /// resolution of `target` is pending or the advertisement carries no
+    /// target link-layer address.
+    fn complete_resolution(
+        &mut self,
+        target: Ipv6Address,
+        solicited: bool,
+        advertised_mac: Option<EthernetAddress>,
+        now: StackInstant,
+    ) -> bool {
+        let ip = IpAddress::Ipv6(target);
+        if !self.pending_resolutions.contains(ip) {
+            return false;
+        }
+        let Some(mac) = advertised_mac else {
+            return false;
+        };
+        self.learn_neighbor(NeighborEntry {
+            ip,
+            mac,
+            state: if solicited {
+                NeighborState::Reachable
+            } else {
+                NeighborState::Stale
+            },
+            updated_at: now,
+        });
+        true
+    }
+
+    /// A Neighbor Advertisement this host received on another stack,
+    /// offered to this one as the answer to a resolution it is pending;
+    /// it changes nothing else. Returns whether the advertisement
+    /// completed a resolution, in which case the neighbor is cached and
+    /// reported through [`StackEvent::NeighborUpdated`].
+    ///
+    /// The frame is checked as [`Stack::receive_rx_frame`] checks it, and
+    /// an advertisement for an address this stack is not asking for is
+    /// discarded (RFC 4861 section 7.2.5), so neither a neighbor this
+    /// stack holds nor one it does not is created or updated here:
+    /// updates belong to the stack that received the frame.
+    ///
+    /// Concurrency: runs on the shard that owns this stack, under its lock.
+    pub fn answer_resolution(&mut self, frame: &RxFrame, now: StackInstant) -> bool {
+        if self.pending_resolutions.is_empty() {
+            return false;
+        }
+        let Some(ethernet) = EthernetFrame::parse(frame.bytes.as_ref()) else {
+            return false;
+        };
+        if ethernet.protocol != EthernetProtocol::Ipv6 {
+            return false;
+        }
+        let Some(packet) = Ipv6Packet::parse(ethernet.payload) else {
+            return false;
+        };
+        if packet.next_header != crate::IpProtocol::Icmpv6
+            || !self.accepts_ipv6_icmp_destination(packet.destination)
+            || !icmpv6_checksum_valid(packet.source, packet.destination, packet.payload)
+        {
+            return false;
+        }
+        let Some(Icmpv6Packet::NeighborAdvertisement {
+            target,
+            solicited,
+            override_cache,
+            options,
+        }) = Icmpv6Packet::parse(packet.payload)
+        else {
+            return false;
+        };
+        let advertisement = NeighborAdvertisement {
+            target,
+            solicited,
+            override_cache,
+            options,
+        };
+        Self::neighbor_advertisement_is_valid(packet, &advertisement)
+            && self.complete_resolution(target, solicited, options.target_link_layer_address(), now)
     }
 
     /// Answers an ICMPv6 echo request addressed to a unicast address of
@@ -11244,6 +11464,195 @@ mod tests {
             .take_outbound()
             .expect("handshake ACK frame should be queued");
         (stack, socket)
+    }
+
+    /// Issue #809: a data segment is taken only for a next hop the stack
+    /// has resolved. A miss asks for the address and leaves the bytes
+    /// queued with nothing in flight, so the answer costs one round trip
+    /// where a segment taken and lost to the miss costs a retransmission
+    /// timeout.
+    #[test]
+    fn tcp_data_waits_for_an_unresolved_ipv4_next_hop() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let (mut stack, socket) = established_tcp_stack(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
+        // The handshake sent the SYN with sequence 7, so the first data
+        // byte is sequence 8.
+        const FIRST_DATA_SEQUENCE: u32 = 8;
+        stack.replace_neighbors(core::iter::empty());
+        stack
+            .tcp_send(socket, b"hello")
+            .expect("data should queue on the established socket");
+
+        stack
+            .drive_tcp(StackInstant::from_nanos(2))
+            .expect("the drive should ask for the peer's address");
+
+        let request = stack
+            .take_outbound()
+            .expect("the miss asks for the peer's address");
+        let ethernet =
+            EthernetFrame::parse(request.as_slice()).expect("Ethernet frame should parse");
+        assert_eq!(ethernet.protocol, EthernetProtocol::Arp);
+        assert!(
+            stack.take_outbound().is_none(),
+            "the miss sends no TCP segment"
+        );
+        assert!(
+            !stack
+                .tcp_socket(socket)
+                .expect("the socket exists")
+                .sequence_in_flight(FIRST_DATA_SEQUENCE),
+            "a segment the stack could not address must not be in flight"
+        );
+        assert!(
+            stack
+                .next_tcp_deadline()
+                .is_none_or(|deadline| deadline > StackInstant::from_nanos(2)),
+            "a socket waiting for resolution reports no past-due deadline"
+        );
+
+        let (reply, reply_len) = arp_frame(ArpOperation::Reply, PEER_MAC, peer, local);
+        stack
+            .receive_frame(&reply[..reply_len], StackInstant::from_nanos(3))
+            .expect("the ARP reply should be handled");
+        stack
+            .drive_tcp(StackInstant::from_nanos(3))
+            .expect("the resolved next hop should take the data");
+
+        let frame = stack
+            .take_outbound()
+            .expect("the data leaves once resolved");
+        let ethernet = EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
+        assert_eq!(ethernet.destination, PEER_MAC);
+        let ipv4 = Ipv4Packet::parse(ethernet.payload).expect("IPv4 packet should parse");
+        let tcp = TcpPacket::parse(ipv4.payload).expect("TCP segment should parse");
+        assert_eq!(tcp.sequence, FIRST_DATA_SEQUENCE);
+        assert_eq!(tcp.payload, b"hello");
+    }
+
+    /// The IPv6 form of the test above, with the router as next hop and
+    /// a Neighbor Solicitation as the request.
+    #[test]
+    fn tcp_data_waits_for_an_unresolved_ipv6_next_hop() {
+        const FIRST_DATA_SEQUENCE: u32 = 1001;
+        let mut stack = autoconfigured_stack();
+        let local_address = slaac_expected_address(LOCAL_MAC).address();
+        let remote_address =
+            Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        let socket = stack
+            .open_tcp_connect(
+                TcpEndpoint {
+                    address: IpAddress::Ipv6(local_address),
+                    port: 49152,
+                },
+                TcpEndpoint {
+                    address: IpAddress::Ipv6(remote_address),
+                    port: 80,
+                },
+                FIRST_DATA_SEQUENCE - 1,
+            )
+            .expect("IPv6 TCP connect should allocate");
+        stack
+            .drive_tcp(StackInstant::from_nanos(10))
+            .expect("SYN should be queued");
+        while stack.take_outbound().is_some() {}
+        let mut segment = [0u8; crate::ETHERNET_FRAME_BYTES];
+        let segment_len = TcpPacket::encode(
+            &mut segment,
+            IpAddress::Ipv6(remote_address),
+            IpAddress::Ipv6(local_address),
+            TcpHeader {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 5000,
+                acknowledgement: FIRST_DATA_SEQUENCE,
+                flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                window_size: u16::MAX,
+            },
+            &[],
+            TransportChecksum::Software,
+        )
+        .expect("test SYN-ACK should fit");
+        let mut frame = [0u8; crate::ETHERNET_FRAME_BYTES];
+        let mut offset =
+            EthernetFrame::encode_header(&mut frame, LOCAL_MAC, ROUTER_MAC, EthernetProtocol::Ipv6)
+                .expect("test Ethernet header should fit");
+        offset += Ipv6Packet::encode_header(
+            &mut frame[offset..],
+            remote_address,
+            local_address,
+            crate::IpProtocol::Tcp,
+            segment_len,
+            64,
+        )
+        .expect("test IPv6 header should fit");
+        frame[offset..offset + segment_len].copy_from_slice(&segment[..segment_len]);
+        offset += segment_len;
+        stack
+            .receive_frame(&frame[..offset], StackInstant::from_nanos(11))
+            .expect("SYN-ACK should be handled");
+        stack
+            .drive_tcp(StackInstant::from_nanos(12))
+            .expect("handshake ACK should be queued");
+        while stack.take_outbound().is_some() {}
+
+        stack.replace_neighbors(core::iter::empty());
+        stack
+            .tcp_send(socket, b"hello")
+            .expect("data should queue on the established socket");
+        stack
+            .drive_tcp(StackInstant::from_nanos(13))
+            .expect("the drive should ask for the router's address");
+
+        let request = stack
+            .take_outbound()
+            .expect("the miss asks for the router's address");
+        let ethernet =
+            EthernetFrame::parse(request.as_slice()).expect("Ethernet frame should parse");
+        let ipv6 = Ipv6Packet::parse(ethernet.payload).expect("IPv6 packet should parse");
+        assert_eq!(ipv6.next_header, crate::IpProtocol::Icmpv6);
+        assert!(
+            stack.take_outbound().is_none(),
+            "the miss sends no TCP segment"
+        );
+        assert!(
+            !stack
+                .tcp_socket(socket)
+                .expect("the socket exists")
+                .sequence_in_flight(FIRST_DATA_SEQUENCE),
+            "a segment the stack could not address must not be in flight"
+        );
+        assert!(
+            stack
+                .next_tcp_deadline()
+                .is_none_or(|deadline| deadline > StackInstant::from_nanos(13)),
+            "a socket waiting for resolution reports no past-due deadline"
+        );
+
+        stack.learn_neighbor(NeighborEntry {
+            ip: IpAddress::Ipv6(ROUTER_LINK_LOCAL),
+            mac: ROUTER_MAC,
+            state: NeighborState::Reachable,
+            updated_at: StackInstant::from_nanos(14),
+        });
+        stack
+            .drive_tcp(StackInstant::from_nanos(14))
+            .expect("the resolved next hop should take the data");
+
+        let frame = stack
+            .take_outbound()
+            .expect("the data leaves once resolved");
+        let ethernet = EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
+        assert_eq!(ethernet.destination, ROUTER_MAC);
+        let ipv6 = Ipv6Packet::parse(ethernet.payload).expect("IPv6 packet should parse");
+        let tcp = TcpPacket::parse(ipv6.payload).expect("TCP segment should parse");
+        assert_eq!(tcp.sequence, FIRST_DATA_SEQUENCE);
+        assert_eq!(tcp.payload, b"hello");
     }
 
     /// Segmentation capability of a device that splits IPv4 TCP up to a
@@ -17360,8 +17769,93 @@ mod tests {
         assert_eq!(stack.neighbors().count(), 1);
     }
 
+    /// Issue #809: a request for an address is the asking stack's own
+    /// state. It raises no neighbor event, so nothing shared can hold it,
+    /// it goes out at most once per interval however often the socket is
+    /// driven, and applying a shared table that does not know the address
+    /// leaves it outstanding.
     #[test]
-    fn a_full_cache_evicts_unresolved_and_stale_entries_before_reachable_ones() {
+    fn a_request_for_an_address_stays_with_the_stack_that_asked() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
+        stack
+            .open_tcp_connect(
+                TcpEndpoint {
+                    address: IpAddress::Ipv4(local),
+                    port: 49152,
+                },
+                TcpEndpoint {
+                    address: IpAddress::Ipv4(peer),
+                    port: 80,
+                },
+                7,
+            )
+            .expect("test TCP connect should allocate a socket");
+        while stack.take_event().is_some() {}
+        let protocol_of = |stack: &mut Stack| {
+            let frame = stack.take_outbound()?;
+            let ethernet = EthernetFrame::parse(frame.as_slice())?;
+            Some(ethernet.protocol)
+        };
+
+        stack
+            .drive_tcp(StackInstant::from_nanos(1))
+            .expect("the drive should ask for the peer's address");
+        assert_eq!(protocol_of(&mut stack), Some(EthernetProtocol::Arp));
+        assert!(stack.take_outbound().is_none());
+        while let Some(event) = stack.take_event() {
+            assert!(
+                !matches!(event, StackEvent::NeighborUpdated(_)),
+                "a request is not a neighbor: {event:?}"
+            );
+        }
+        assert_eq!(stack.neighbors().count(), 0);
+
+        stack
+            .drive_tcp(StackInstant::from_nanos(2))
+            .expect("the drive should not repeat the request");
+        assert!(
+            stack.take_outbound().is_none(),
+            "a request goes out at most once per interval"
+        );
+
+        stack.replace_neighbors(core::iter::empty());
+        stack
+            .drive_tcp(StackInstant::from_nanos(3))
+            .expect("the drive should not repeat the request");
+        assert!(
+            stack.take_outbound().is_none(),
+            "applying a table that lacks the address keeps the request outstanding"
+        );
+
+        let retry_at = 1 + ADDRESS_RESOLUTION_RETRANSMIT_NANOS;
+        stack
+            .drive_tcp(StackInstant::from_nanos(retry_at))
+            .expect("the drive should repeat the request");
+        assert_eq!(protocol_of(&mut stack), Some(EthernetProtocol::Arp));
+
+        stack.replace_neighbors([NeighborEntry {
+            ip: IpAddress::Ipv4(peer),
+            mac: PEER_MAC,
+            state: NeighborState::Reachable,
+            updated_at: StackInstant::from_nanos(retry_at),
+        }]);
+        stack
+            .drive_tcp(StackInstant::from_nanos(retry_at + 1))
+            .expect("the resolved next hop should take the SYN");
+        assert_eq!(protocol_of(&mut stack), Some(EthernetProtocol::Ipv4));
+    }
+
+    #[test]
+    fn a_full_cache_evicts_stale_and_probed_entries_before_reachable_ones() {
         let mut cache = NeighborCache::new();
         let entry = |last: u8, state, at| NeighborEntry {
             ip: IpAddress::Ipv4(Ipv4Address::new([10, 0, 0, last])),
@@ -17370,8 +17864,8 @@ mod tests {
             updated_at: StackInstant::from_nanos(at),
         };
         let none = |_| false;
-        cache.learn(entry(0, NeighborState::Incomplete, 50), none);
-        cache.learn(entry(1, NeighborState::Stale, 1), none);
+        cache.learn(entry(0, NeighborState::Probe, 1), none);
+        cache.learn(entry(1, NeighborState::Stale, 50), none);
         for last in 2..MAX_NEIGHBORS as u8 {
             cache.learn(entry(last, NeighborState::Reachable, 100), none);
         }
@@ -17380,19 +17874,20 @@ mod tests {
         cache.learn(entry(200, NeighborState::Reachable, 200), none);
         assert!(
             cache
-                .get(entry(0, NeighborState::Reachable, 0).ip)
-                .is_none()
+                .get(entry(1, NeighborState::Reachable, 0).ip)
+                .is_none(),
+            "a stale entry goes before a probed one, whatever their ages"
         );
         assert!(
             cache
-                .get(entry(1, NeighborState::Reachable, 0).ip)
+                .get(entry(0, NeighborState::Reachable, 0).ip)
                 .is_some()
         );
 
         cache.learn(entry(201, NeighborState::Reachable, 201), none);
         assert!(
             cache
-                .get(entry(1, NeighborState::Reachable, 0).ip)
+                .get(entry(0, NeighborState::Reachable, 0).ip)
                 .is_none()
         );
 
@@ -17504,13 +17999,8 @@ mod tests {
         options: &'a [u8],
     }
 
-    /// Delivers one neighbor message to `stack` and returns the stack's
-    /// outbound frames as `(destination MAC, IPv6 payload)` pairs.
-    fn deliver_neighbor_message(
-        stack: &mut Stack,
-        message: TestNeighborMessage<'_>,
-        now: u64,
-    ) -> Vec<Vec<u8>> {
+    /// The Ethernet frame that carries `message`.
+    fn neighbor_message_frame(message: TestNeighborMessage<'_>) -> Vec<u8> {
         let (body, len) = neighbor_message(
             message.source,
             message.destination,
@@ -17533,14 +18023,40 @@ mod tests {
             message.hop_limit,
             &body[..len],
         );
+        frame[..frame_len].to_vec()
+    }
+
+    /// Delivers one neighbor message to `stack` and returns the stack's
+    /// outbound frames as `(destination MAC, IPv6 payload)` pairs.
+    fn deliver_neighbor_message(
+        stack: &mut Stack,
+        message: TestNeighborMessage<'_>,
+        now: u64,
+    ) -> Vec<Vec<u8>> {
         stack
-            .receive_frame(&frame[..frame_len], StackInstant::from_nanos(now))
+            .receive_frame(
+                &neighbor_message_frame(message),
+                StackInstant::from_nanos(now),
+            )
             .expect("a neighbor message should be handled");
         let mut sent = Vec::new();
         while let Some(frame) = stack.take_outbound() {
             sent.push(frame.as_slice().to_vec());
         }
         sent
+    }
+
+    /// Offers one neighbor message to `stack` as another stack's
+    /// answer, and returns whether the stack took it.
+    fn offer_neighbor_message(
+        stack: &mut Stack,
+        message: TestNeighborMessage<'_>,
+        now: u64,
+    ) -> bool {
+        stack.answer_resolution(
+            &RxFrame::new(Bytes::from(neighbor_message_frame(message))),
+            StackInstant::from_nanos(now),
+        )
     }
 
     const NS: u8 = 135;
@@ -17703,28 +18219,171 @@ mod tests {
     fn an_unsolicited_neighbor_advertisement_creates_no_entry() {
         let mut stack = link_local_stack();
         let local = stack.ipv6_link_local_address().expect("link-local address");
+        let message = TestNeighborMessage {
+            source_mac: PEER_MAC,
+            source: LINK_LOCAL_PEER,
+            destination: local,
+            hop_limit: 255,
+            kind: NA,
+            code: 0,
+            flags: NA_OVERRIDE,
+            target: LINK_LOCAL_PEER,
+            options: &link_layer_option(2, PEER_MAC),
+        };
 
-        deliver_neighbor_message(
-            &mut stack,
-            TestNeighborMessage {
-                source_mac: PEER_MAC,
-                source: LINK_LOCAL_PEER,
-                destination: local,
-                hop_limit: 255,
-                kind: NA,
-                code: 0,
-                flags: NA_OVERRIDE,
-                target: LINK_LOCAL_PEER,
-                options: &link_layer_option(2, PEER_MAC),
-            },
-            5,
+        deliver_neighbor_message(&mut stack, message, 5);
+        assert_eq!(stack.neighbors().count(), 0);
+
+        assert!(
+            !offer_neighbor_message(&mut stack, message, 6),
+            "an advertisement nobody asked for answers nothing"
         );
-
         assert_eq!(stack.neighbors().count(), 0);
     }
 
+    /// Issue #809: an advertisement another stack received is the answer
+    /// to a resolution this stack is pending, and to nothing else: it
+    /// neither creates an entry for an address nobody asked about nor
+    /// updates one this stack holds, because updates belong to the stack
+    /// that received the frame.
     #[test]
-    fn a_neighbor_advertisement_resolves_an_incomplete_entry_only_as_the_rfc_says() {
+    fn an_answer_completes_only_a_pending_resolution() {
+        let local = link_local_stack()
+            .ipv6_link_local_address()
+            .expect("link-local address");
+        let target_option = link_layer_option(2, PEER_MAC);
+        let advertisement = |flags: u8, mac: EthernetAddress| TestNeighborMessage {
+            source_mac: mac,
+            source: LINK_LOCAL_PEER,
+            destination: local,
+            hop_limit: 255,
+            kind: NA,
+            code: 0,
+            flags,
+            target: LINK_LOCAL_PEER,
+            options: &target_option,
+        };
+        let pending_stack = || {
+            let mut stack = link_local_stack();
+            stack
+                .queue_ndp_solicitation(local, LINK_LOCAL_PEER, StackInstant::from_nanos(1))
+                .expect("the solicitation should be queued");
+            while stack.take_event().is_some() {}
+            stack
+        };
+
+        let mut stack = link_local_stack();
+        assert!(
+            !offer_neighbor_message(
+                &mut stack,
+                advertisement(NA_SOLICITED | NA_OVERRIDE, PEER_MAC),
+                5
+            ),
+            "nothing pending: the answer is refused"
+        );
+        assert_eq!(stack.neighbors().count(), 0, "nothing pending: no entry");
+
+        let known = NeighborEntry {
+            ip: IpAddress::Ipv6(LINK_LOCAL_PEER),
+            mac: SECOND_MAC,
+            state: NeighborState::Reachable,
+            updated_at: StackInstant::from_nanos(0),
+        };
+        stack.learn_neighbor(known);
+        while stack.take_event().is_some() {}
+        assert!(
+            !offer_neighbor_message(
+                &mut stack,
+                advertisement(NA_SOLICITED | NA_OVERRIDE, PEER_MAC),
+                5
+            ),
+            "an entry without a pending resolution is not the answer's to update"
+        );
+        assert_eq!(cached(&stack, LINK_LOCAL_PEER), Some(known));
+        assert!(stack.take_event().is_none(), "nothing is reported");
+
+        let mut stack = pending_stack();
+        assert!(
+            offer_neighbor_message(
+                &mut stack,
+                advertisement(NA_SOLICITED | NA_OVERRIDE, PEER_MAC),
+                5
+            ),
+            "a pending resolution takes the answer"
+        );
+        assert_eq!(
+            cached(&stack, LINK_LOCAL_PEER).map(|entry| (entry.mac, entry.state)),
+            Some((PEER_MAC, NeighborState::Reachable))
+        );
+        assert!(
+            !stack
+                .pending_resolutions
+                .contains(IpAddress::Ipv6(LINK_LOCAL_PEER)),
+            "the record is gone"
+        );
+        let mut updates = 0;
+        while let Some(event) = stack.take_event() {
+            if matches!(event, StackEvent::NeighborUpdated(_)) {
+                updates += 1;
+            }
+        }
+        assert_eq!(updates, 1, "one neighbor update is reported");
+
+        let mut stack = pending_stack();
+        assert!(offer_neighbor_message(
+            &mut stack,
+            advertisement(NA_OVERRIDE, PEER_MAC),
+            5
+        ));
+        assert_eq!(
+            cached(&stack, LINK_LOCAL_PEER).map(|entry| (entry.mac, entry.state)),
+            Some((PEER_MAC, NeighborState::Stale)),
+            "without the solicited flag the address is not yet confirmed"
+        );
+    }
+
+    /// Asking for one address does not make a stack take another stack's
+    /// answer about a different one.
+    #[test]
+    fn an_answer_for_another_address_leaves_a_pending_resolution_alone() {
+        let mut stack = link_local_stack();
+        let local = stack.ipv6_link_local_address().expect("link-local address");
+        stack
+            .queue_ndp_solicitation(local, ROUTER_LINK_LOCAL, StackInstant::from_nanos(1))
+            .expect("the solicitation should be queued");
+        while stack.take_event().is_some() {}
+        let target_option = link_layer_option(2, PEER_MAC);
+
+        assert!(
+            !offer_neighbor_message(
+                &mut stack,
+                TestNeighborMessage {
+                    source_mac: PEER_MAC,
+                    source: LINK_LOCAL_PEER,
+                    destination: local,
+                    hop_limit: 255,
+                    kind: NA,
+                    code: 0,
+                    flags: NA_SOLICITED | NA_OVERRIDE,
+                    target: LINK_LOCAL_PEER,
+                    options: &target_option,
+                },
+                5
+            ),
+            "a resolution pending for another address is not answered by this one"
+        );
+        assert_eq!(cached(&stack, LINK_LOCAL_PEER), None);
+        assert!(stack.take_event().is_none(), "nothing is reported");
+        assert!(
+            stack
+                .pending_resolutions
+                .contains(IpAddress::Ipv6(ROUTER_LINK_LOCAL)),
+            "the other address is still being asked for"
+        );
+    }
+
+    #[test]
+    fn a_neighbor_advertisement_resolves_a_pending_resolution_only_as_the_rfc_says() {
         let local = link_local_stack()
             .ipv6_link_local_address()
             .expect("link-local address");
@@ -17746,18 +18405,36 @@ mod tests {
                 options,
             }
         }
-        let incomplete = NeighborEntry {
-            ip: IpAddress::Ipv6(LINK_LOCAL_PEER),
-            mac: [0; 6],
-            state: NeighborState::Incomplete,
-            updated_at: StackInstant::from_nanos(1),
-        };
         let target_option = link_layer_option(2, PEER_MAC);
+        // The cached address and state after the message, and whether the
+        // stack is still asking for the address. The message reaches the
+        // stack that asked as a received frame and as another stack's
+        // answer, which decide alike.
         let state_after = |message: TestNeighborMessage<'_>| {
-            let mut stack = link_local_stack();
-            stack.learn_neighbor(incomplete);
-            deliver_neighbor_message(&mut stack, message, 5);
-            cached(&stack, LINK_LOCAL_PEER).map(|entry| (entry.mac, entry.state))
+            let outcome = |answered: bool| {
+                let mut stack = link_local_stack();
+                stack
+                    .queue_ndp_solicitation(local, LINK_LOCAL_PEER, StackInstant::from_nanos(1))
+                    .expect("the solicitation should be queued");
+                if answered {
+                    offer_neighbor_message(&mut stack, message, 5);
+                } else {
+                    deliver_neighbor_message(&mut stack, message, 5);
+                }
+                (
+                    cached(&stack, LINK_LOCAL_PEER).map(|entry| (entry.mac, entry.state)),
+                    stack
+                        .pending_resolutions
+                        .contains(IpAddress::Ipv6(LINK_LOCAL_PEER)),
+                )
+            };
+            let received = outcome(false);
+            assert_eq!(
+                outcome(true),
+                received,
+                "an answer decides as the stack that received the frame does"
+            );
+            received
         };
 
         assert_eq!(
@@ -17767,17 +18444,17 @@ mod tests {
                 NA_SOLICITED | NA_OVERRIDE,
                 &target_option
             )),
-            Some((PEER_MAC, NeighborState::Reachable)),
+            (Some((PEER_MAC, NeighborState::Reachable)), false),
             "a solicited advertisement completes the resolution"
         );
         assert_eq!(
             state_after(advertise(local, 255, NA_OVERRIDE, &target_option)),
-            Some((PEER_MAC, NeighborState::Stale)),
+            (Some((PEER_MAC, NeighborState::Stale)), false),
             "an unsolicited one gives an address that is not yet confirmed"
         );
         assert_eq!(
             state_after(advertise(local, 255, NA_SOLICITED, &[])),
-            Some(([0; 6], NeighborState::Incomplete)),
+            (None, true),
             "without a target link-layer address there is nothing to record"
         );
         assert_eq!(
@@ -17787,12 +18464,12 @@ mod tests {
                 NA_SOLICITED | NA_OVERRIDE,
                 &target_option
             )),
-            Some(([0; 6], NeighborState::Incomplete)),
+            (None, true),
             "an advertisement that was routed is dropped"
         );
         assert_eq!(
             state_after(advertise(local, 255, 0, &[2, 0, 0, 0, 0, 0, 0, 0])),
-            Some(([0; 6], NeighborState::Incomplete)),
+            (None, true),
             "an option of length zero voids the message"
         );
     }
@@ -17911,7 +18588,7 @@ mod tests {
     }
 
     #[test]
-    fn a_resolution_whose_incomplete_entry_was_replaced_is_still_completed() {
+    fn a_resolution_still_pending_after_the_cache_was_replaced_is_completed() {
         let mut stack = autoconfigured_stack();
         let local = stack.ipv6_link_local_address().expect("link-local address");
         let peer = Ipv6Address::new([0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9]);
@@ -17929,16 +18606,17 @@ mod tests {
         };
         assert_eq!(send(&mut stack, 0), Ok(0));
         while stack.take_outbound().is_some() {}
+        assert_eq!(cached(&stack, peer), None, "a request is not a neighbor");
         // The kernel replaces a shard's cache with the control plane's
-        // copy, which need not hold the Incomplete entry.
+        // copy, which holds nothing for an address being asked for.
         stack.replace_neighbors([]);
 
         assert_eq!(send(&mut stack, ONE_SECOND), Ok(0));
         assert_eq!(stack.take_outbound().into_iter().count(), 1, "the repeat");
         assert_eq!(
-            cached(&stack, peer).map(|entry| entry.state),
-            Some(NeighborState::Incomplete),
-            "the repeat restores the entry the answer completes"
+            cached(&stack, peer),
+            None,
+            "the repeat writes no entry: the pending resolution is what the answer completes"
         );
         deliver_neighbor_message(
             &mut stack,
@@ -17995,6 +18673,7 @@ mod tests {
     fn stack_with_unresolved_gateway() -> Stack {
         let mut stack = stack_with_resolved_gateway();
         stack.replace_neighbors([]);
+        while stack.take_event().is_some() {}
         stack
     }
 
@@ -18033,14 +18712,15 @@ mod tests {
                 assert_eq!(arp.target_protocol, GATEWAY);
                 requests.push(now);
             }
-            if now < 3 * ONE_SECOND {
-                assert_eq!(
-                    stack
-                        .neighbors()
-                        .find(|entry| entry.ip == IpAddress::Ipv4(GATEWAY))
-                        .map(|entry| entry.updated_at),
-                    Some(StackInstant::from_nanos(0)),
-                    "pending sends leave the entry's timestamp alone"
+            assert_eq!(
+                stack.neighbors().count(),
+                0,
+                "a pending resolution is no neighbor"
+            );
+            while let Some(event) = stack.take_event() {
+                assert!(
+                    !matches!(event, StackEvent::NeighborUpdated(_)),
+                    "a request raises no neighbor event: {event:?}"
                 );
             }
         }
@@ -18145,6 +18825,7 @@ mod tests {
         let mut stack = autoconfigured_stack();
         let peer = Ipv6Address::new([0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9]);
         let mut solicitations = Vec::new();
+        while stack.take_event().is_some() {}
         for step in 0..=50u64 {
             let now = step * ONE_SECOND / 10;
             assert_eq!(
@@ -18170,11 +18851,15 @@ mod tests {
                 ));
                 solicitations.push(now);
             }
-            if now < 3 * ONE_SECOND {
-                assert_eq!(
-                    cached(&stack, peer).map(|entry| entry.updated_at),
-                    Some(StackInstant::from_nanos(0)),
-                    "pending sends and retries leave the entry's timestamp alone"
+            assert_eq!(
+                cached(&stack, peer),
+                None,
+                "pending sends and retries write no entry"
+            );
+            while let Some(event) = stack.take_event() {
+                assert!(
+                    !matches!(event, StackEvent::NeighborUpdated(_)),
+                    "a solicitation raises no neighbor event: {event:?}"
                 );
             }
         }
@@ -19300,6 +19985,116 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].payload, payload);
         assert_eq!(frames[0].sequence, FLOW_LOCAL_NEXT);
+    }
+
+    #[test]
+    fn a_socket_waiting_on_an_unresolved_next_hop_asks_at_the_resolution_pace() {
+        let mut stack = flow_stack(true);
+        let socket = establish_flows(&mut stack, 1, false)[0];
+        stack.replace_neighbors(core::iter::empty());
+        let payload = flow_payload(0);
+        assert_eq!(stack.tcp_send(socket, &payload), Ok(payload.len()));
+
+        // A driver that runs the stack every 100 ms for four seconds, far
+        // inside the retransmission timeout.
+        let mut requests = Vec::new();
+        for step in 0..=40u64 {
+            let now = 2 + step * ONE_SECOND / 10;
+            stack
+                .drive_tcp(at(now))
+                .expect("an unresolved next hop leaves the data pending");
+            while let Some(frame) = stack.take_outbound() {
+                let ethernet =
+                    EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
+                assert_eq!(
+                    ethernet.protocol,
+                    EthernetProtocol::Arp,
+                    "the data waits for its next hop"
+                );
+                let arp = ArpPacket::parse(ethernet.payload).expect("ARP packet should parse");
+                assert_eq!(arp.operation, ArpOperation::Request);
+                assert_eq!(arp.target_protocol, FLOW_PEER);
+                requests.push(now);
+            }
+        }
+
+        assert_eq!(
+            requests[..3],
+            [2, 2 + ONE_SECOND, 2 + 2 * ONE_SECOND],
+            "{requests:?}: a request a second, and no more than the limit of them"
+        );
+        assert_eq!(requests.len(), 4, "{requests:?}");
+        assert!(
+            requests[3] > 2 + 3 * ONE_SECOND && requests[3] < 2 + 4 * ONE_SECOND,
+            "{requests:?}: the failed resolution begins afresh once it is noticed"
+        );
+
+        stack.learn_neighbor(flow_peer_neighbor());
+        let frames = settle(&mut stack, 2 + 4 * ONE_SECOND);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].payload, payload);
+        assert_eq!(frames[0].sequence, FLOW_LOCAL_NEXT);
+    }
+
+    #[test]
+    fn a_resolution_request_reports_when_the_next_may_go_out() {
+        let instant = StackInstant::from_nanos;
+        let address = |last: u8| IpAddress::Ipv4(Ipv4Address::new([10, 0, 0, last]));
+        let sent = |now: u64| ResolutionRequest {
+            send: true,
+            next_request_at: instant(now + ONE_SECOND),
+        };
+        let refused = |next: u64| ResolutionRequest {
+            send: false,
+            next_request_at: instant(next),
+        };
+        let mut pending = PendingResolutions::new();
+
+        assert_eq!(pending.request(address(0), instant(5)), sent(5));
+        assert_eq!(
+            pending.request(address(0), instant(6)),
+            refused(5 + ONE_SECOND),
+            "inside the interval: when the last request's interval ends"
+        );
+        assert_eq!(
+            pending.request(address(0), instant(5 + ONE_SECOND)),
+            sent(5 + ONE_SECOND)
+        );
+        assert_eq!(
+            pending.request(address(0), instant(5 + 2 * ONE_SECOND)),
+            sent(5 + 2 * ONE_SECOND)
+        );
+        assert_eq!(
+            pending.request(address(0), instant(5 + 3 * ONE_SECOND)),
+            refused(5 + 3 * ONE_SECOND),
+            "the call that notices the failure: now, the next send begins afresh"
+        );
+        assert!(!pending.contains(address(0)));
+        assert_eq!(
+            pending.request(address(0), instant(5 + 3 * ONE_SECOND)),
+            sent(5 + 3 * ONE_SECOND)
+        );
+
+        // A table full of records a second old takes a new address, and
+        // one full of younger records refuses it until the oldest is a
+        // full interval old.
+        let mut pending = PendingResolutions::new();
+        for last in 0..MAX_PENDING_RESOLUTIONS as u8 {
+            assert_eq!(pending.request(address(last), instant(10)), sent(10));
+        }
+        let newcomer = address(MAX_PENDING_RESOLUTIONS as u8);
+        assert_eq!(
+            pending.request(newcomer, instant(11)),
+            refused(10 + ONE_SECOND),
+            "full of younger records: when the oldest can be displaced"
+        );
+        assert!(!pending.contains(newcomer));
+        assert_eq!(
+            pending.request(newcomer, instant(10 + ONE_SECOND)),
+            sent(10 + ONE_SECOND)
+        );
+        assert!(pending.contains(newcomer));
+        assert_eq!(pending.entries.len(), MAX_PENDING_RESOLUTIONS);
     }
 
     #[test]

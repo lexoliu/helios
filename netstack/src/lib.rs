@@ -617,6 +617,32 @@ pub trait NetworkInterface: Clone + Send + Sync + 'static {
         1
     }
 
+    /// Makes queue pairs `0..pairs` the ones the device delivers
+    /// received frames on and reads transmissions from.
+    ///
+    /// A multiqueue device activates its pairs by count, never one by
+    /// one, so the live pairs are always a prefix of the
+    /// [`Self::queue_pair_count`] pairs brought up. Every pair keeps its
+    /// rings and buffers while it is not live, so raising the count
+    /// again resumes it where it stopped. `pairs` is at least one and at
+    /// most [`Self::queue_pair_count`].
+    ///
+    /// Synchronous: the device answers a control command in the time a
+    /// descriptor completes, and the caller polls for the answer. The
+    /// caller serialises calls; two in flight at once is a caller bug.
+    /// An `Err` means the device refused the count and kept the one it
+    /// had.
+    fn set_active_queue_pairs(&self, pairs: usize) -> IoResult<()>;
+
+    /// Delivers `pair`'s completion interrupts to `processor` from the
+    /// next one on.
+    ///
+    /// No interrupt is lost across the change: one already raised is
+    /// handled where it was sent, and one raised while the delivery is
+    /// being changed arrives at the new destination. The caller
+    /// serialises calls and names an online processor.
+    fn steer_queue_pair(&self, pair: usize, processor: helios_hal::cpu::ProcessorId);
+
     /// Returns hardware capabilities used to select stack data paths.
     fn capabilities(&self) -> InterfaceCapabilities {
         InterfaceCapabilities {

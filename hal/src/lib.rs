@@ -24,6 +24,7 @@ pub mod measured_boot_model;
 pub mod memory;
 pub mod mmio;
 pub mod pmm;
+pub mod processor_hotplug;
 pub mod resource;
 pub mod rtc;
 pub mod serial;

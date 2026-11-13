@@ -4,6 +4,8 @@ mod error;
 use error::*;
 mod pump;
 use pump::*;
+mod routes;
+use routes::*;
 mod tcp;
 use tcp::*;
 mod udp;
@@ -66,6 +68,10 @@ const EPHEMERAL_PORT_END: u16 = 65_535;
 /// with, so all of them are demultiplexed here on every backend. It is
 /// also where unqualified control-plane operations run, so a route the
 /// ARP reply taught and the query that reads it meet on one shard.
+///
+/// A Neighbor Advertisement is received here too, and is then also
+/// offered to every other shard as the answer to a resolution that
+/// shard is pending (`RxFrameOwner::ResolutionAnswer`).
 const DEFAULT_SHARD_IDX: usize = 0;
 
 const INTERNAL_DHCP_SOCKET_INDEX: usize = 0;
@@ -152,6 +158,9 @@ where
     timer: Timer<CpuImpl>,
     device: Device,
     state: NetworkShardSet,
+    /// Which processor drains each queue pair and which pairs are live
+    /// (`routes`' module docs).
+    pairs: PairRoutes,
     control: NetworkControlPlane,
     /// Adaptive poll budget shared across all shards. Lifted out of
     /// `NetworkShard` so its atomic-load reads on the network poll
@@ -726,6 +735,10 @@ where
                 root_entropy.clone(),
             )
         });
+        // Shards are sized to the possible processors and never
+        // re-partition; the pairs that are live follow the online set
+        // instead (`routes`).
+        let pairs = PairRoutes::new(device.queue_pair_count().max(1), shard_count);
         Self {
             inner: Arc::new(NetworkServiceInner {
                 cpu,
@@ -733,6 +746,7 @@ where
                 clock,
                 timer,
                 state,
+                pairs,
                 control: NetworkControlPlane::new(),
                 poll: NetworkPollState::new(rx_poll_budget, tx_completion_budget, rx_poll_budget),
                 stack_rx_budget,
@@ -1077,7 +1091,7 @@ where
     /// whatever they learned to the control plane.
     ///
     /// This is the no-operation path of `drive_ipv4_configuration`:
-    /// the pump on the bootstrap processor's pair runs it on every
+    /// the pump on pair 0 runs it on every
     /// poll round, so a dropped DISCOVER or solicitation is still
     /// retransmitted while every socket on the machine is parked. The
     /// default shard submits on pair zero, which is that pump's own
@@ -1151,7 +1165,7 @@ where
     ///
     /// The pump has no caller deadline, but it does own the stack's
     /// timer duties for the shards its pair serves — TCP retransmit
-    /// and delayed-ACK deadlines, and on the bootstrap pump DHCP
+    /// and delayed-ACK deadlines, and on pair 0's pump DHCP
     /// retransmission besides — so the park has to be bounded by the
     /// soonest of them. Left purely event-driven, a lost DHCP reply
     /// would never be retransmitted, because the wake that would drive
@@ -1163,17 +1177,16 @@ where
     /// relieved receive backpressure — raises the arrival signal the
     /// park races this bound against.
     fn pump_wait(&self, pair: usize, interface_wide: bool) -> Duration {
-        let pair_count = self.inner.device.queue_pair_count().max(1);
         let now = self.now_nanos();
         let next_tcp_deadline = self
             .inner
             .state
-            .pair_tcp_deadline_nanos(pair, pair_count)
+            .pair_tcp_deadline_nanos(pair, self.inner.pairs.layout())
             .map_or(CONFIGURATION_POLL_NANOS, |deadline| {
                 deadline.saturating_sub(now).min(CONFIGURATION_POLL_NANOS)
             });
         let bound = Duration::from_nanos(next_tcp_deadline);
-        // The configuration duty is the bootstrap pump's alone, so its
+        // The configuration duty is pair 0's pump's alone, so its
         // park is bounded by the DHCP client's next deadline as well.
         let bound = if interface_wide {
             bound.min(self.configuration_wait())
@@ -1233,7 +1246,10 @@ where
     /// processor placed, and the interface's event counters for a frame
     /// still sitting in the ring.
     fn shard_wait(&self, idx: usize) -> NetworkWait {
-        self.network_wait(idx, self.inner.state.shard_wait(idx))
+        self.network_wait(
+            self.inner.pairs.pair_of_shard(idx),
+            self.inner.state.shard_wait(idx),
+        )
     }
 
     /// The same for a waiter that belongs to no single shard: a
@@ -1244,10 +1260,12 @@ where
     /// processor drains — because the cross-shard hand-off is the
     /// arrival signal's job, not the device's.
     fn any_shard_wait(&self) -> NetworkWait {
-        let queue_idx = self
-            .inner
-            .state
-            .shard_idx_for_processor(current_processor());
+        let processor = current_processor();
+        let queue_idx = self.inner.pairs.drained_by(processor).unwrap_or_else(|| {
+            self.inner
+                .pairs
+                .pair_of_shard(self.inner.state.shard_idx_for_processor(processor))
+        });
         self.network_wait(queue_idx, self.inner.state.any_shard_wait())
     }
 
@@ -1257,12 +1275,13 @@ where
     /// for work the device reports there, and the arrival of the shard
     /// the pair's index names — which is also the signal raised for
     /// work queued on any shard the pair serves, since a shard's egress
-    /// submits on the pair its index folds onto. The bootstrap
-    /// processor's pump is the only one that also arms the device-wide
-    /// channel: link and configuration events arrive on no pair, and
-    /// nobody else may act on them.
+    /// submits on the live pair it folds onto, and the signal a
+    /// hand-off raises so the pump reads its pair again. The pump on
+    /// pair 0 is the only one that also arms the device-wide channel:
+    /// link and configuration events arrive on no pair, and nobody else
+    /// may act on them.
     fn pump_shard_wait(&self, pair: usize, interface_wide: bool) -> NetworkWait {
-        let mut wait = self.shard_wait(pair);
+        let mut wait = self.network_wait(pair, self.inner.state.shard_wait(pair));
         if !interface_wide {
             wait.device.device = None;
         }
@@ -1404,9 +1423,9 @@ where
     /// a synchronous close queued leaves on the next executor turn
     /// rather than the next protocol timer (#232, #231).
     ///
-    /// A shard's egress submits on the pair its index folds onto, so
-    /// the pump parked on that pair's arrival signal is the one to
-    /// raise.
+    /// A shard's egress submits on the live pair it folds onto
+    /// (`routes`), so the pump parked on that pair's arrival signal is
+    /// the one to raise.
     ///
     /// Private because the kick is not a duty an owner can be asked to
     /// remember: every close that can queue a segment —
@@ -1414,20 +1433,16 @@ where
     /// [`NetworkService::tcp_listener_close`] — ends with it, so a
     /// `Drop` that retires a handle has nothing left to do (#231).
     fn wake_packet_pump(&self, shard_idx: usize) {
-        let pair = shard_idx % self.inner.device.queue_pair_count().max(1);
+        let pair = self.inner.pairs.pair_of_shard(shard_idx);
         self.inner.state.raise_shard_progress(pair);
     }
 
     /// Wakes every pair's packet pump, for a close whose queued
     /// segments could sit on any shard — a replicated listener's
-    /// backlog scatters them wherever a connection waited.
+    /// backlog scatters them wherever a connection waited — and for a
+    /// hand-off, after which every pump reads its pair again.
     fn wake_packet_pumps(&self) {
-        let pumps = self
-            .inner
-            .state
-            .shard_count()
-            .min(self.inner.device.queue_pair_count().max(1));
-        for pair in 0..pumps {
+        for pair in 0..self.inner.pairs.brought_up() {
             self.inner.state.raise_shard_progress(pair);
         }
     }
@@ -1754,10 +1769,13 @@ pub(crate) mod fixture {
         ///
         /// The pump parks on the arrival signal of the shard its pair
         /// is named for — the shard this fixture's stream lives on,
-        /// since a shard submits on the pair its index folds onto.
+        /// since a shard submits on the live pair it folds onto.
         pub(crate) fn pump_park(&self) -> PumpPark<'_> {
-            let pair_count = self.service.inner.device.queue_pair_count().max(1);
-            let pair = self.service.inner.state.shard_idx_for_handle(self.stream) % pair_count;
+            let pair = self
+                .service
+                .inner
+                .pairs
+                .pair_of_shard(self.service.inner.state.shard_idx_for_handle(self.stream));
             let wait = self.service.inner.state.shard_wait(pair);
             PumpPark {
                 parked: Box::pin(
@@ -2131,6 +2149,17 @@ mod tests {
     /// every backend without `HASH_REPORT` delivers.
     fn unhashed(bytes: &[u8]) -> RxFrame {
         RxFrame::new(Bytes::copy_from_slice(bytes))
+    }
+
+    /// The one shard a frame belongs to. A frame the whole node owns has
+    /// no single shard, and asking for it is a test's mistake.
+    fn owning_shard(frame: &RxFrame, shard_count: usize) -> usize {
+        match super::rx_frame_owner(frame, shard_count) {
+            super::RxFrameOwner::Shard(shard_idx) => shard_idx,
+            super::RxFrameOwner::ResolutionAnswer => {
+                panic!("a Neighbor Advertisement has no single owning shard")
+            }
+        }
     }
 
     fn test_network_shard() -> NetworkShard {
@@ -4035,8 +4064,9 @@ mod tests {
 
         // The application reads. Nothing else can make room, so this is
         // the whole event the pump is waiting for.
+        let pairs = super::PairRoutes::new(2, 2);
         let read = state
-            .with_handle_receive_drain(stream, 2, |shard| {
+            .with_handle_receive_drain(stream, &pairs, |shard| {
                 shard.poll_tcp_read(stream, SEGMENT_BYTES, StackInstant::from_nanos(1_000))
             })
             .expect("the queued data should read");
@@ -4061,7 +4091,7 @@ mod tests {
         let wait = state.shard_wait(owner);
         let mut parked = core::pin::pin!(state.arrival_for(wait.target).changed(wait.mark));
         let read = state
-            .with_handle_receive_drain(stream, 2, |shard| {
+            .with_handle_receive_drain(stream, &pairs, |shard| {
                 shard.poll_tcp_read(stream, SEGMENT_BYTES, StackInstant::from_nanos(1_001))
             })
             .expect("the rest of the queued data should read");
@@ -4402,6 +4432,263 @@ mod tests {
         );
     }
 
+    fn online_set(processors: &[u16], possible: usize) -> crate::exec::OnlineSet {
+        let set = crate::exec::OnlineSet::new(possible);
+        for processor in processors {
+            set.insert(helios_hal::cpu::ProcessorId::new(*processor));
+        }
+        set
+    }
+
+    /// With every online processor draining a pair, a departure shrinks
+    /// the device's live pair count; the last pair's owner moves onto the
+    /// departing pair with its interrupt, the pair that stopped is
+    /// steered where its shards now fold, and the processor coming back
+    /// takes up the pair that is not live and grows the count again.
+    #[test]
+    fn a_departing_pair_owner_shrinks_the_live_pairs_and_an_arrival_grows_them() {
+        use helios_hal::cpu::ProcessorId;
+
+        let device = RecordingNetworkInterface::new(4);
+        let service = test_network_service_smp(4, device.clone());
+        let online = online_set(&[0, 1, 2, 3], 4);
+
+        service.hand_off_pair(ProcessorId::new(1), &online);
+        assert_eq!(device.live_pairs(), 3);
+        assert_eq!(
+            device.steered(),
+            [(1, ProcessorId::new(3)), (3, ProcessorId::new(0))],
+            "pair 1 follows its new owner; pair 3 folds onto pair 0's owner"
+        );
+        assert!(service.pump_assignment_for(ProcessorId::new(1)).is_none());
+        let moved = service
+            .pump_assignment_for(ProcessorId::new(3))
+            .expect("the last pair's owner moved onto the departing pair");
+        assert_eq!(moved.pair, 1);
+        assert!(!moved.interface_wide);
+        let shard_pairs: Vec<usize> = (0..4)
+            .map(|shard| service.inner.pairs.pair_of_shard(shard))
+            .collect();
+        assert_eq!(
+            shard_pairs,
+            [0, 1, 2, 0],
+            "shard 3's pair stopped, so it folds onto a live one; every other shard stays"
+        );
+
+        online.remove(ProcessorId::new(1));
+        service.take_up_pair(ProcessorId::new(1));
+        assert_eq!(device.live_pairs(), 4);
+        assert_eq!(device.steered().last(), Some(&(3, ProcessorId::new(1))));
+        assert_eq!(
+            service
+                .pump_assignment_for(ProcessorId::new(1))
+                .map(|assignment| assignment.pair),
+            Some(3)
+        );
+    }
+
+    /// With more processors than pairs, an idle online processor adopts
+    /// the departing pair, the live count stays, and the idle pump's
+    /// park on the routing table is released so it reads its new pair.
+    #[test]
+    fn an_idle_processor_adopts_a_departing_pair_and_its_pump_is_released() {
+        use helios_hal::cpu::ProcessorId;
+
+        let device = RecordingNetworkInterface::new(2);
+        let service = test_network_service_smp(4, device.clone());
+        let online = online_set(&[0, 1, 2, 3], 4);
+        assert!(service.pump_assignment_for(ProcessorId::new(2)).is_none());
+        let idle_mark = service.inner.pairs.mark();
+        let mut idle_park = core::pin::pin!(service.inner.pairs.changed().changed(idle_mark));
+        assert!(block_on(poll_once(idle_park.as_mut())).is_none());
+
+        service.hand_off_pair(ProcessorId::new(1), &online);
+        assert_eq!(device.live_pairs(), 2, "nothing stopped");
+        assert_eq!(device.steered(), [(1, ProcessorId::new(2))]);
+        assert_eq!(
+            service
+                .pump_assignment_for(ProcessorId::new(2))
+                .map(|assignment| assignment.pair),
+            Some(1)
+        );
+        assert!(
+            block_on(poll_once(idle_park.as_mut())).is_some(),
+            "the hand-off releases the idle pump's park"
+        );
+
+        // A processor that drains nothing hands nothing off.
+        service.hand_off_pair(ProcessorId::new(3), &online);
+        assert_eq!(device.steered().len(), 1);
+    }
+
+    /// An established connection on the departing processor's shard
+    /// keeps working while its pair is out of service and after the
+    /// processor comes back: the shard and its socket stay where they
+    /// are, its data is drained by whichever pump owns the live pair it
+    /// folds onto, and its acknowledgements leave on a live pair.
+    #[test]
+    fn a_connection_on_the_departing_shard_survives_offline_and_online() {
+        use helios_hal::cpu::ProcessorId;
+
+        const SEGMENT_BYTES: usize = 64;
+
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([198, 51, 100, 20]);
+        let device = RecordingNetworkInterface::accepting_transmissions(2);
+        let service = test_network_service_smp(2, device.clone());
+        let owner = 1usize;
+        let local_port = (49_152u16..)
+            .find(|port| {
+                super::shard_idx_for_flow(
+                    IpAddress::Ipv4(local),
+                    *port,
+                    IpAddress::Ipv4(peer),
+                    80,
+                    2,
+                ) == owner
+            })
+            .expect("some ephemeral port hashes to the departing processor's shard");
+
+        let stream = {
+            let mut shard = service.inner.state.shard_at(owner).lock();
+            shard
+                .stack
+                .add_ipv4_address(Ipv4Cidr::new(local, 24))
+                .expect("test address should be accepted");
+            shard.stack.learn_neighbor(NeighborEntry {
+                ip: IpAddress::Ipv4(peer),
+                mac: PEER_MAC,
+                state: NeighborState::Reachable,
+                updated_at: StackInstant::from_nanos(0),
+            });
+            service.inner.control.publish_from_shard(&shard);
+            let socket = shard
+                .stack
+                .open_tcp_connect(
+                    TcpEndpoint {
+                        address: IpAddress::Ipv4(local),
+                        port: local_port,
+                    },
+                    TcpEndpoint {
+                        address: IpAddress::Ipv4(peer),
+                        port: 80,
+                    },
+                    7,
+                )
+                .expect("the test connection should allocate a socket");
+            shard.insert_tcp_stream(socket)
+        };
+        let segment = |sequence: u32, flags: TcpFlags, payload: &[u8]| {
+            ipv4_tcp_frame(
+                peer,
+                local,
+                TcpHeader {
+                    source_port: 80,
+                    destination_port: local_port,
+                    sequence,
+                    acknowledgement: 8,
+                    flags,
+                    window_size: u16::MAX,
+                },
+                payload,
+            )
+        };
+        let poll = NetworkPollState::new(
+            service.inner.poll.base_rx_budget,
+            service.inner.poll.base_tx_completion_budget,
+            service.inner.poll.base_tx_frame_budget,
+        );
+        let pump_round = |pair: usize| {
+            let outcome = block_on(service.poll_network_once_with_tcp_read(
+                NetworkPollSource::Pump,
+                None,
+                true,
+                NetworkPollScope::Pair {
+                    pair,
+                    interface_wide: pair == 0,
+                },
+                &poll,
+            ))
+            .expect("the pump drives its pair");
+            assert_eq!(
+                outcome.progress.received_frames, 1,
+                "the pump on pair {pair} takes the segment off its ring"
+            );
+        };
+        let read_all = || {
+            let now = StackInstant::from_nanos(service.now_nanos());
+            match service.inner.state.with_handle(stream, |shard| {
+                shard.poll_tcp_read(stream, SEGMENT_BYTES * 4, now)
+            }) {
+                Ok(TcpReadProgress::Data(bytes)) => bytes.to_vec(),
+                Ok(_) => panic!("the stream should have data to read"),
+                Err(error) => panic!("the stream should be readable: {error}"),
+            }
+        };
+
+        // Established before the departure, the way the other
+        // connection fixtures establish one.
+        let (frame, len) = segment(100, TcpFlags::SYN.union(TcpFlags::ACK), &[]);
+        service
+            .inner
+            .state
+            .shard_at(owner)
+            .lock()
+            .stack
+            .receive_frame(&frame[..len], StackInstant::from_nanos(1))
+            .expect("the SYN-ACK should establish the connection");
+
+        // Processor 1 departs: its pair stops being live, and shard 1
+        // folds onto pair 0, which processor 0's pump drains.
+        let online = online_set(&[0, 1], 2);
+        service.hand_off_pair(ProcessorId::new(1), &online);
+        online.remove(ProcessorId::new(1));
+        assert_eq!(device.live_pairs(), 1);
+        assert_eq!(service.inner.pairs.pair_of_shard(owner), 0);
+        let sent_before = device.transmitted_frames().len();
+        let first = [b'a'; SEGMENT_BYTES];
+        let (frame, len) = segment(101, TcpFlags::ACK, &first);
+        device.deliver_on(0, &frame[..len]);
+        pump_round(0);
+        assert_eq!(
+            service.inner.state.frame_counts(owner).0,
+            1,
+            "the segment drained off pair 0 reached the stream's shard"
+        );
+        let counters = service.inner.state.tcp_counters(owner);
+        assert_eq!(
+            (
+                counters.receive_queued_bytes,
+                counters.out_of_order_queued_bytes,
+                counters.sockets
+            ),
+            (SEGMENT_BYTES as u64, 0, 1)
+        );
+        assert_eq!(read_all(), first);
+        assert!(
+            device.transmitted_frames().len() > sent_before,
+            "the departed shard's acknowledgement left through pair 0's pump"
+        );
+
+        // Processor 1 is back and takes pair 1 up again.
+        service.take_up_pair(ProcessorId::new(1));
+        assert_eq!(device.live_pairs(), 2);
+        assert_eq!(service.inner.pairs.pair_of_shard(owner), 1);
+        let sent_before = device.transmitted_frames().len();
+        let second = [b'b'; SEGMENT_BYTES];
+        let sequence = 101 + u32::try_from(SEGMENT_BYTES).expect("segment fits");
+        let (frame, len) = segment(sequence, TcpFlags::ACK, &second);
+        device.deliver_on(1, &frame[..len]);
+        pump_round(1);
+        assert_eq!(read_all(), second);
+        assert!(device.transmitted_frames().len() > sent_before);
+        assert_eq!(
+            device.transmitted_pairs()[sent_before..].to_vec(),
+            alloc::vec![1; device.transmitted_frames().len() - sent_before],
+            "the shard submits on its own pair again"
+        );
+    }
+
     /// A device reporting more pairs than the machine has processors
     /// is a bring-up bug — the clamp exists so this cannot happen — so
     /// the assignment fails fast naming both counts rather than
@@ -4480,6 +4767,467 @@ mod tests {
         )
     }
 
+    /// The address family a resolution test runs over.
+    #[derive(Clone, Copy)]
+    enum ResolutionFamily {
+        Ipv4,
+        Ipv6,
+    }
+
+    /// What one transmitted frame was, as far as the resolution tests
+    /// care.
+    #[derive(Clone, Debug)]
+    enum Wire {
+        /// An ARP request or a Neighbor Solicitation.
+        Resolution,
+        Tcp {
+            flags: TcpFlags,
+            payload: Vec<u8>,
+        },
+        Other,
+    }
+
+    impl ResolutionFamily {
+        const LOCAL_V4: Ipv4Address = Ipv4Address::new([192, 0, 2, 10]);
+        const PEER_V4: Ipv4Address = Ipv4Address::new([192, 0, 2, 20]);
+        /// The device's own address, which every frame a test injects is
+        /// addressed to.
+        const LOCAL_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 1];
+
+        fn local(self) -> IpAddress {
+            match self {
+                Self::Ipv4 => IpAddress::Ipv4(Self::LOCAL_V4),
+                Self::Ipv6 => IpAddress::Ipv6(connect_local()),
+            }
+        }
+
+        fn peer(self) -> IpAddress {
+            match self {
+                Self::Ipv4 => IpAddress::Ipv4(Self::PEER_V4),
+                Self::Ipv6 => IpAddress::Ipv6(connect_remote()),
+            }
+        }
+
+        fn configure(self, shard: &mut NetworkShard) {
+            match self {
+                Self::Ipv4 => shard
+                    .stack
+                    .add_ipv4_address(Ipv4Cidr::new(Self::LOCAL_V4, 24)),
+                Self::Ipv6 => shard
+                    .stack
+                    .add_ipv6_address(Ipv6Cidr::new(connect_local(), 64)),
+            }
+            .expect("test address should be accepted");
+        }
+
+        /// The peer's answer to a request for its link-layer address: an
+        /// ARP reply or a solicited Neighbor Advertisement.
+        fn resolution_reply(self) -> Vec<u8> {
+            let mut frame = [0; ETHERNET_FRAME_BYTES];
+            let len = match self {
+                Self::Ipv4 => {
+                    let offset = EthernetFrame::encode_header(
+                        &mut frame,
+                        Self::LOCAL_MAC,
+                        PEER_MAC,
+                        EthernetProtocol::Arp,
+                    )
+                    .expect("test Ethernet header should fit");
+                    offset
+                        + ArpPacket {
+                            operation: ArpOperation::Reply,
+                            sender_hardware: PEER_MAC,
+                            sender_protocol: Self::PEER_V4,
+                            target_hardware: Self::LOCAL_MAC,
+                            target_protocol: Self::LOCAL_V4,
+                        }
+                        .encode(&mut frame[offset..])
+                        .expect("test ARP reply should fit")
+                }
+                Self::Ipv6 => {
+                    let mut body = [0u8; Icmpv6Packet::NEIGHBOR_MESSAGE_LEN];
+                    Icmpv6Packet::encode_neighbor_advertisement(
+                        &mut body,
+                        connect_remote(),
+                        connect_local(),
+                        connect_remote(),
+                        PEER_MAC,
+                    )
+                    .expect("test Neighbor Advertisement should fit");
+                    let mut offset = EthernetFrame::encode_header(
+                        &mut frame,
+                        Self::LOCAL_MAC,
+                        PEER_MAC,
+                        EthernetProtocol::Ipv6,
+                    )
+                    .expect("test Ethernet header should fit");
+                    offset += Ipv6Packet::encode_header(
+                        &mut frame[offset..],
+                        connect_remote(),
+                        connect_local(),
+                        IpProtocol::Icmpv6,
+                        body.len(),
+                        255,
+                    )
+                    .expect("test IPv6 header should fit");
+                    frame[offset..offset + body.len()].copy_from_slice(&body);
+                    offset + body.len()
+                }
+            };
+            frame[..len].to_vec()
+        }
+
+        /// A segment from the peer to the device.
+        fn tcp_from_peer(self, header: TcpHeader) -> Vec<u8> {
+            let (frame, len) = match self {
+                Self::Ipv4 => ipv4_tcp_frame(Self::PEER_V4, Self::LOCAL_V4, header, &[]),
+                Self::Ipv6 => ipv6_tcp_frame(connect_remote(), connect_local(), header),
+            };
+            frame[..len].to_vec()
+        }
+
+        fn classify(self, frame: &[u8]) -> Wire {
+            let Some(ethernet) = EthernetFrame::parse(frame) else {
+                return Wire::Other;
+            };
+            let tcp = match self {
+                Self::Ipv4 => {
+                    if ethernet.protocol == EthernetProtocol::Arp {
+                        return Wire::Resolution;
+                    }
+                    let Some(ipv4) = Ipv4Packet::parse(ethernet.payload) else {
+                        return Wire::Other;
+                    };
+                    (ipv4.protocol == IpProtocol::Tcp).then(|| TcpPacket::parse(ipv4.payload))
+                }
+                Self::Ipv6 => {
+                    let Some(ipv6) = Ipv6Packet::parse(ethernet.payload) else {
+                        return Wire::Other;
+                    };
+                    if ipv6.next_header == IpProtocol::Icmpv6 {
+                        return Wire::Resolution;
+                    }
+                    (ipv6.next_header == IpProtocol::Tcp).then(|| TcpPacket::parse(ipv6.payload))
+                }
+            };
+            match tcp.flatten() {
+                Some(tcp) => Wire::Tcp {
+                    flags: tcp.flags,
+                    payload: tcp.payload.to_vec(),
+                },
+                None => Wire::Other,
+            }
+        }
+    }
+
+    const PEER_PORT: u16 = 80;
+    const LOCAL_SEQUENCE: u32 = 7;
+    const PEER_SEQUENCE: u32 = 100;
+    /// The shard the resolution tests open their connection on: not the
+    /// default one.
+    const OWNER: usize = 1;
+
+    /// Two shards on two pairs, both with the local address and the
+    /// control plane's copy of the first, and a connection opened on
+    /// the second shard, which asks for the peer's address when polled.
+    struct ConnectOnSecondShard {
+        service: super::NetworkService<RecordingSmpCpu, RecordingNetworkInterface>,
+        device: RecordingNetworkInterface,
+        local_port: u16,
+        socket: helios_netstack::SocketId,
+    }
+
+    impl ConnectOnSecondShard {
+        fn open(family: ResolutionFamily) -> Self {
+            let device = RecordingNetworkInterface::accepting_transmissions(2);
+            let service = test_network_service_smp(2, device.clone());
+            let state = &service.inner.state;
+            assert_eq!(state.shard_count(), 2);
+            for idx in 0..2 {
+                family.configure(&mut state.shard_at(idx).lock());
+            }
+            service
+                .inner
+                .control
+                .publish_from_shard(&state.shard_at(0).lock());
+            let local_port = (49_152..u16::MAX)
+                .find(|port| {
+                    super::shard_idx_for_flow(family.local(), *port, family.peer(), PEER_PORT, 2)
+                        == OWNER
+                })
+                .expect("some ephemeral port hashes to the second shard");
+            let socket = {
+                let mut shard = state.shard_at(OWNER).lock();
+                let socket = shard
+                    .stack
+                    .open_tcp_connect(
+                        TcpEndpoint {
+                            address: family.local(),
+                            port: local_port,
+                        },
+                        TcpEndpoint {
+                            address: family.peer(),
+                            port: PEER_PORT,
+                        },
+                        LOCAL_SEQUENCE,
+                    )
+                    .expect("the test connection should allocate a socket");
+                shard.insert_tcp_stream(socket);
+                socket
+            };
+            Self {
+                service,
+                device,
+                local_port,
+                socket,
+            }
+        }
+    }
+
+    /// Issue #809, the sequence the first connection of a boot takes: a
+    /// connect whose flow hashes to a shard other than the default one
+    /// asks for the peer's address from that shard, the reply is
+    /// learned on the default shard, and the connection's own shard
+    /// receives its SYN-ACK. The request that shard made is its own
+    /// business and must not reach the control plane, where it would
+    /// replace the resolved neighbour on every shard.
+    fn a_pending_resolution_on_another_shard_leaves_the_resolved_neighbor(
+        family: ResolutionFamily,
+    ) {
+        let ConnectOnSecondShard {
+            service,
+            device,
+            local_port,
+            socket,
+        } = ConnectOnSecondShard::open(family);
+        let state = &service.inner.state;
+
+        // One interface-scope poll, and what it put on the wire.
+        let mut seen = 0;
+        let mut poll = || {
+            block_on(service.poll_network_once(NetworkPollSource::Tcp))
+                .expect("the poll should drive the device");
+            let frames = device.transmitted_frames();
+            let new = frames[seen..]
+                .iter()
+                .map(|frame| family.classify(frame))
+                .collect::<Vec<_>>();
+            seen = frames.len();
+            new
+        };
+
+        let wire = poll();
+        assert!(
+            wire.iter().any(|wire| matches!(wire, Wire::Resolution)),
+            "the shard asks for the peer's address: {wire:?}"
+        );
+        assert!(
+            !wire.iter().any(|wire| matches!(wire, Wire::Tcp { .. })),
+            "nothing is sent before the address is known: {wire:?}"
+        );
+
+        // The reply lands on the default shard. The next poll learns it,
+        // and the one after hands it to the connection's shard.
+        device.deliver_on(0, &family.resolution_reply());
+        let wire = [poll(), poll()].concat();
+        assert!(
+            wire.iter().any(|wire| matches!(
+                wire,
+                Wire::Tcp { flags, .. } if flags.contains(TcpFlags::SYN)
+            )),
+            "the SYN leaves once the address is known: {wire:?}"
+        );
+
+        device.deliver_on(
+            0,
+            &family.tcp_from_peer(TcpHeader {
+                source_port: PEER_PORT,
+                destination_port: local_port,
+                sequence: PEER_SEQUENCE,
+                acknowledgement: LOCAL_SEQUENCE.wrapping_add(1),
+                flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                window_size: u16::MAX,
+            }),
+        );
+        poll();
+
+        state
+            .shard_at(OWNER)
+            .lock()
+            .stack
+            .tcp_send(socket, b"hello")
+            .expect("data should queue on the established socket");
+        let wire = poll();
+
+        for idx in 0..2 {
+            let shard = state.shard_at(idx).lock();
+            assert!(
+                shard.stack.neighbors().any(|entry| {
+                    entry.ip == family.peer()
+                        && entry.mac == PEER_MAC
+                        && entry.state == NeighborState::Reachable
+                }),
+                "shard {idx} lost the peer's resolved address"
+            );
+        }
+        assert!(
+            wire.iter().any(|wire| matches!(
+                wire,
+                Wire::Tcp { payload, .. } if payload == b"hello"
+            )),
+            "the poll sends the data: {wire:?}"
+        );
+        assert!(
+            !wire.iter().any(|wire| matches!(wire, Wire::Resolution)),
+            "the poll asks for nothing the shards already know: {wire:?}"
+        );
+    }
+
+    #[test]
+    fn a_pending_ipv4_resolution_on_another_shard_leaves_the_resolved_neighbor() {
+        a_pending_resolution_on_another_shard_leaves_the_resolved_neighbor(ResolutionFamily::Ipv4);
+    }
+
+    #[test]
+    fn a_pending_ipv6_resolution_on_another_shard_leaves_the_resolved_neighbor() {
+        a_pending_resolution_on_another_shard_leaves_the_resolved_neighbor(ResolutionFamily::Ipv6);
+    }
+
+    /// One poll of the receive path of queue pair `pair`, as that pair's
+    /// pump runs it: it takes the pair's frames and never synchronizes
+    /// the control plane.
+    fn poll_pair_without_synchronizing(
+        service: &super::NetworkService<RecordingSmpCpu, RecordingNetworkInterface>,
+        pair: usize,
+    ) {
+        let poll = NetworkPollState::new(
+            service.inner.poll.base_rx_budget,
+            service.inner.poll.base_tx_completion_budget,
+            service.inner.poll.base_tx_frame_budget,
+        );
+        block_on(service.poll_network_once_with_tcp_read(
+            NetworkPollSource::Pump,
+            None,
+            true,
+            NetworkPollScope::Pair {
+                pair,
+                interface_wide: false,
+            },
+            &poll,
+        ))
+        .expect("the pair's pump drains it");
+    }
+
+    /// Issue #809: the Neighbor Advertisement lands on the default
+    /// shard's pair, and the pump that drains that pair never
+    /// synchronizes the control plane. The shard that asked is answered
+    /// by the dispatch itself, and its waiters are signalled.
+    #[test]
+    fn a_neighbor_advertisement_answers_the_shard_that_asked_without_a_synchronization() {
+        let family = ResolutionFamily::Ipv6;
+        let fixture = ConnectOnSecondShard::open(family);
+        let service = &fixture.service;
+        block_on(service.poll_network_once(NetworkPollSource::Tcp))
+            .expect("the poll should drive the device");
+        assert!(
+            service
+                .inner
+                .state
+                .shard_at(OWNER)
+                .lock()
+                .stack
+                .neighbors()
+                .all(|entry| entry.ip != family.peer()),
+            "the shard has only asked"
+        );
+
+        // The mark is sampled before the answer arrives, the way every
+        // operation takes its own.
+        let asker_wait = service.shard_wait(OWNER);
+        fixture.device.deliver_on(0, &family.resolution_reply());
+        let mut parked = core::pin::pin!(
+            service.wait_for_shard_progress(asker_wait, core::time::Duration::from_secs(3600))
+        );
+        assert!(
+            block_on(poll_once(parked.as_mut())).is_none(),
+            "a frame on pair 0 is not an event the asker's wait watches"
+        );
+
+        poll_pair_without_synchronizing(service, 0);
+
+        assert!(
+            block_on(poll_once(parked.as_mut())).is_some(),
+            "the answered shard's waiters are signalled"
+        );
+        let learned = |entry: NeighborEntry| {
+            entry.ip == family.peer()
+                && entry.mac == PEER_MAC
+                && entry.state == NeighborState::Reachable
+        };
+        assert!(
+            service
+                .inner
+                .state
+                .shard_at(OWNER)
+                .lock()
+                .stack
+                .neighbors()
+                .any(learned),
+            "the shard that asked holds the answer"
+        );
+        assert!(
+            service
+                .inner
+                .control
+                .neighbors
+                .load_full()
+                .iter()
+                .any(learned),
+            "the control plane holds it"
+        );
+    }
+
+    /// An advertisement for an address no shard asked about creates no
+    /// entry anywhere, on the shard that received it or on the control
+    /// plane (RFC 4861 section 7.2.5).
+    #[test]
+    fn an_unasked_neighbor_advertisement_creates_no_entry_on_any_shard() {
+        let family = ResolutionFamily::Ipv6;
+        let device = RecordingNetworkInterface::accepting_transmissions(2);
+        let service = test_network_service_smp(2, device.clone());
+        let state = &service.inner.state;
+        for idx in 0..2 {
+            family.configure(&mut state.shard_at(idx).lock());
+        }
+
+        device.deliver_on(0, &family.resolution_reply());
+        poll_pair_without_synchronizing(&service, 0);
+        block_on(service.poll_network_once(NetworkPollSource::Tcp))
+            .expect("the poll should drive the device");
+
+        for idx in 0..2 {
+            assert!(
+                state
+                    .shard_at(idx)
+                    .lock()
+                    .stack
+                    .neighbors()
+                    .all(|entry| entry.ip != family.peer()),
+                "shard {idx} took an address nobody asked for"
+            );
+        }
+        assert!(
+            service
+                .inner
+                .control
+                .neighbors
+                .load_full()
+                .iter()
+                .all(|entry| entry.ip != family.peer()),
+            "the control plane took an address nobody asked for"
+        );
+    }
+
     /// The receive rule and the placement rule have to agree, or a
     /// socket is opened on a shard its own frames never reach.
     #[test]
@@ -4499,7 +5247,7 @@ mod tests {
                     let (frame, len) =
                         ipv4_udp_frame(peer, peer_port, local, local_port, b"payload");
                     assert_eq!(
-                        super::shard_idx_for_frame(&unhashed(&frame[..len]), shard_count),
+                        owning_shard(&unhashed(&frame[..len]), shard_count),
                         placed,
                         "the demux and the placement rule must agree"
                     );
@@ -4519,7 +5267,7 @@ mod tests {
         for shard_count in [1usize, 2, 3, 4, 8] {
             for peer_port in [53u16, 443, 8080, 40_000] {
                 let (frame, len) = ipv4_udp_frame(peer, peer_port, local, 49_153, b"payload");
-                let computed = super::shard_idx_for_frame(&unhashed(&frame[..len]), shard_count);
+                let computed = owning_shard(&unhashed(&frame[..len]), shard_count);
 
                 // What the device would have written into the receive
                 // header: the same function over the same bytes.
@@ -4532,7 +5280,7 @@ mod tests {
                     },
                 );
                 assert_eq!(
-                    super::shard_idx_for_frame(&reported, shard_count),
+                    owning_shard(&reported, shard_count),
                     computed,
                     "a steered frame and a software-hashed one belong to the same shard"
                 );
@@ -4556,7 +5304,7 @@ mod tests {
                 b"offer",
             );
             assert_eq!(
-                super::shard_idx_for_frame(&unhashed(&offer[..offer_len]), shard_count),
+                owning_shard(&unhashed(&offer[..offer_len]), shard_count),
                 super::DEFAULT_SHARD_IDX
             );
             let (discover, discover_len) = ipv4_udp_frame(
@@ -4567,7 +5315,7 @@ mod tests {
                 b"discover",
             );
             assert_eq!(
-                super::shard_idx_for_frame(&unhashed(&discover[..discover_len]), shard_count),
+                owning_shard(&unhashed(&discover[..discover_len]), shard_count),
                 super::DEFAULT_SHARD_IDX
             );
         }
@@ -4593,7 +5341,7 @@ mod tests {
             shard_count,
         );
         assert_eq!(
-            super::shard_idx_for_frame(&unhashed(&error[..error_len]), shard_count),
+            owning_shard(&unhashed(&error[..error_len]), shard_count),
             flow
         );
     }
@@ -4604,7 +5352,7 @@ mod tests {
     fn a_frame_without_a_flow_falls_to_the_default_shard() {
         for shard_count in [1usize, 2, 4] {
             assert_eq!(
-                super::shard_idx_for_frame(&unhashed(&[]), shard_count),
+                owning_shard(&unhashed(&[]), shard_count),
                 super::DEFAULT_SHARD_IDX,
                 "an unparseable frame has no flow"
             );
@@ -4617,9 +5365,66 @@ mod tests {
             )
             .expect("test Ethernet header should fit");
             assert_eq!(
-                super::shard_idx_for_frame(&unhashed(&arp[..len]), shard_count),
+                owning_shard(&unhashed(&arp[..len]), shard_count),
                 super::DEFAULT_SHARD_IDX,
                 "ARP carries no ports"
+            );
+        }
+    }
+
+    /// A Neighbor Advertisement answers whichever shard asked, so it
+    /// belongs to every shard; a Neighbor Solicitation and ARP, which
+    /// only the default shard's control plane answers, stay with it.
+    #[test]
+    fn a_neighbor_advertisement_is_an_answer_for_every_shard() {
+        let advertisement = ResolutionFamily::Ipv6.resolution_reply();
+        let arp = ResolutionFamily::Ipv4.resolution_reply();
+        let mut solicitation = [0; ETHERNET_FRAME_BYTES];
+        let mut offset = EthernetFrame::encode_header(
+            &mut solicitation,
+            [0x33, 0x33, 0xff, 0, 0, 1],
+            PEER_MAC,
+            EthernetProtocol::Ipv6,
+        )
+        .expect("test Ethernet header should fit");
+        let mut body = [0u8; Icmpv6Packet::NEIGHBOR_MESSAGE_LEN];
+        Icmpv6Packet::encode_neighbor_solicitation(
+            &mut body,
+            connect_remote(),
+            connect_local().solicited_node_multicast(),
+            connect_local(),
+            PEER_MAC,
+        )
+        .expect("test Neighbor Solicitation should fit");
+        offset += Ipv6Packet::encode_header(
+            &mut solicitation[offset..],
+            connect_remote(),
+            connect_local().solicited_node_multicast(),
+            IpProtocol::Icmpv6,
+            body.len(),
+            255,
+        )
+        .expect("test IPv6 header should fit");
+        solicitation[offset..offset + body.len()].copy_from_slice(&body);
+        let solicitation = &solicitation[..offset + body.len()];
+
+        for shard_count in [1usize, 2, 4, 8] {
+            assert!(
+                matches!(
+                    super::rx_frame_owner(&unhashed(&advertisement), shard_count),
+                    super::RxFrameOwner::ResolutionAnswer
+                ),
+                "an advertisement answers a resolution on any of {shard_count} shards"
+            );
+            assert_eq!(
+                owning_shard(&unhashed(solicitation), shard_count),
+                super::DEFAULT_SHARD_IDX,
+                "a solicitation is the default shard's to answer"
+            );
+            assert_eq!(
+                owning_shard(&unhashed(&arp), shard_count),
+                super::DEFAULT_SHARD_IDX,
+                "ARP is the default shard's"
             );
         }
     }
@@ -4845,6 +5650,137 @@ mod tests {
         );
     }
 
+    /// Connects to one remote, each closed before the next (so the
+    /// four-tuple is free again, as it is for a guest that closed second
+    /// or whose peer holds no state), never take a local port twice
+    /// while the accepting shard's own-flow candidates of the window are
+    /// not exhausted. The design's bound: a connect takes the first
+    /// own-flow candidate at or after its start and the next start is the
+    /// port after it, so the taken ports ascend through the window's own
+    /// flow candidates and the first repeat is the connect after the last
+    /// of them. This is the issue #881 reuse, which the previous uniformly
+    /// random start made likely within a few connects.
+    #[test]
+    fn closed_connects_to_one_remote_walk_the_window_before_reusing_a_port() {
+        const CONNECTS: usize = 600;
+        let state = connect_shard_set(2);
+        let (first, last) = state.shard_at(0).lock().ephemeral_window();
+        let own_candidates = (first..=last)
+            .filter(|port| connect_request().owner_of(*port, 2) == 0)
+            .count();
+        assert!(
+            own_candidates > CONNECTS,
+            "the bound must not bite inside the test"
+        );
+        let mut ports = Vec::new();
+        for _ in 0..CONNECTS {
+            let stream = state
+                .open_ephemeral_tcp_connect(0, connect_request())
+                .expect("every connect finds a port");
+            let owner = state.shard_idx_for_handle(stream);
+            assert_eq!(owner, 0, "an own-flow candidate is free, so it is taken");
+            let syn = queued_syn_source_ports(&mut state.shard_at(owner).lock());
+            assert_eq!(syn.len(), 1);
+            ports.push(syn[0]);
+            state.with_handle(stream, |shard| {
+                shard.remove_tcp_stream(stream, StackInstant::from_nanos(1));
+            });
+        }
+        let mut distinct = ports.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            CONNECTS,
+            "a local port was reused: {ports:?}"
+        );
+    }
+
+    /// Two destinations that differ in address or in port start at
+    /// unrelated offsets of the window.
+    #[test]
+    fn different_remotes_start_at_unrelated_offsets() {
+        let state = connect_shard_set(1);
+        let shard = state.shard_at(0).lock();
+        let start = |request: &super::TcpConnectRequest| {
+            shard
+                .connect_walk(request)
+                .0
+                .next()
+                .expect("a walk has a first candidate")
+        };
+        let base = connect_request();
+        let mut starts = Vec::new();
+        for step in 0..8_u8 {
+            let mut octets = connect_remote().octets();
+            octets[15] = step;
+            starts.push(start(&super::TcpConnectRequest {
+                destination: IpAddress::Ipv6(Ipv6Address::new(octets)),
+                ..base
+            }));
+            starts.push(start(&super::TcpConnectRequest {
+                port: CONNECT_REMOTE_PORT + 1 + u16::from(step),
+                ..base
+            }));
+        }
+        let mut distinct = starts.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            starts.len(),
+            "sixteen destinations of a 16384 port window started alike: {starts:?}"
+        );
+        let sequential = starts
+            .windows(2)
+            .all(|pair| pair[1] == pair[0].wrapping_add(1));
+        assert!(
+            !sequential,
+            "starts follow the destination in order: {starts:?}"
+        );
+    }
+
+    /// The first port of a destination depends on the shard's secret:
+    /// another shard of the same service and another service's shard
+    /// start the same destination at different offsets, so a sender that
+    /// cannot read the key cannot name the port.
+    #[test]
+    fn the_first_port_of_a_destination_depends_on_the_shards_secret() {
+        let offsets = |shard_idx: usize, fill: u8| -> Vec<u16> {
+            let entropy = crate::RootEntropyHandle::new(
+                crate::RootEntropy::from_platform(
+                    &crate::test_support::TestCpu::with_entropy(fill),
+                    None,
+                    None,
+                    crate::MachineGeneration::new(None),
+                )
+                .expect("the test CPU has an entropy source"),
+            );
+            let shard = NetworkShard::new(test_stack_config(), 1, shard_idx, 2, entropy);
+            let (first, _) = shard.ephemeral_window();
+            (0..16_u16)
+                .map(|port| {
+                    let request = super::TcpConnectRequest {
+                        port: CONNECT_REMOTE_PORT + port,
+                        ..connect_request()
+                    };
+                    shard.connect_walk(&request).0.next().expect("a first port") - first
+                })
+                .collect()
+        };
+        let own = offsets(0, 0x5a);
+        assert_eq!(own, offsets(0, 0x5a), "the same secret is deterministic");
+        let agreeing = |other: Vec<u16>| own.iter().zip(&other).filter(|(a, b)| a == b).count();
+        assert!(
+            agreeing(offsets(1, 0x5a)) <= 1,
+            "another shard of the service starts destinations alike"
+        );
+        assert!(
+            agreeing(offsets(0, 0x5b)) <= 1,
+            "another secret starts destinations alike"
+        );
+    }
+
     /// The ports of `first..=first + 63` that hash to the accepting
     /// shard 0 and to the other shard of a two-shard set.
     fn split_by_owner(first: u16) -> (Vec<u16>, Vec<u16>) {
@@ -4881,7 +5817,8 @@ mod tests {
         assert!(own_flow.is_none(), "every own-shard candidate is held");
         let stream = state
             .open_tcp_connect_along_foreign_flows(walk, 0, connect_request())
-            .expect("the second foreign candidate opens");
+            .expect("the second foreign candidate opens")
+            .stream;
 
         assert_eq!(state.shard_idx_for_handle(stream), 1);
         let mut ports = queued_syn_source_ports(&mut state.shard_at(1).lock());

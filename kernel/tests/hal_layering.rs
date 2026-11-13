@@ -45,7 +45,7 @@ fn hal_does_not_name_wasm_or_wasi_abstractions() {
 
 /// The device and protocol libraries of AGENTS.md §1: each builds on
 /// `hal/` and none on the kernel.
-const DEVICE_LIBRARIES: &[&str] = &["netstack", "virtio", "i6300esb", "tpm"];
+const DEVICE_LIBRARIES: &[&str] = &["netstack", "virtio", "i6300esb", "tpm", "acpi"];
 
 #[test]
 fn device_libraries_never_depend_on_the_kernel() {

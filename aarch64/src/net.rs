@@ -27,7 +27,13 @@ pub(crate) struct VirtioNetworkDevice {
 
 impl ExternalInterruptHandler for VirtioNetworkDevice {
     fn handle_interrupt(&self) {
-        helios_kernel::wake_queue_owners(&self.cpu, self.inner.handle_interrupt().iter());
+        let progress = self.inner.handle_interrupt();
+        helios_kernel::wake_queue_owners(
+            &self.cpu,
+            progress
+                .iter()
+                .map(|pair| self.inner.queue_pair_owner(pair)),
+        );
     }
 }
 
@@ -88,6 +94,16 @@ impl NetworkDevice for VirtioNetworkDevice {
 
     fn queue_pair_count(&self) -> usize {
         self.inner.queue_pair_count()
+    }
+
+    fn set_active_queue_pairs(&self, pairs: usize) -> helios_hal::io::IoResult<()> {
+        self.inner.set_active_queue_pairs(pairs)
+    }
+
+    /// The SPI is the device's one line, so there is no message to
+    /// retarget: steering is the owner the handler wakes.
+    fn steer_queue_pair(&self, pair: usize, processor: helios_hal::cpu::ProcessorId) {
+        self.inner.steer_pair(pair, processor);
     }
 
     fn capabilities(&self) -> InterfaceCapabilities {

@@ -27,7 +27,10 @@ prebuild root key. The init component, the compiler plugin and every
 boot program inside it are bare Wasmtime artifacts with no per-artifact
 signature trailer: the footer vouches for them as a whole.
 
-The root key never lives in the repository or in an image. A development
+The root key never lives in the repository or in an image, and the
+inspector's image build enforces the second half: it searches the linked
+kernel image for the key's seed and its expanded forms and fails the
+build if any is there. A development
 build generates it in its own prebuild directory and embeds its public
 half in the kernel. A release names its key with `--root-secret-key
 <file>` (on `helios-cli kernel-prebuild` and on the inspector's `vm`,

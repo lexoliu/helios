@@ -318,30 +318,24 @@ where
 /// Pulls the owner of every queue that made progress out of its idle
 /// park, skipping the processor already running the handler.
 ///
-/// A device queue is drained by the processor whose shard owns it, so
-/// its completions are only useful to that processor. A transport with
-/// one interrupt line delivers them somewhere else, and this is the
+/// A device queue is drained by the processor its pair is steered to,
+/// so its completions are only useful to that processor. A transport
+/// with one interrupt line delivers them somewhere else, and this is the
 /// hand-off; a transport with per-queue vectors delivers them to the
-/// right processor already and never calls this.
+/// right processor already and never calls this. `owners` names the
+/// processor of each queue that made progress, as the driver records it
+/// (`VirtioNetDevice::queue_pair_owner`): the network service steers a
+/// pair away from a processor before that processor leaves the online
+/// set, so every owner named is online.
 ///
 /// # SMP contract
 ///
 /// Called from interrupt context on any processor. It takes no locks
 /// and allocates nothing; `Cpu::wake_processor` is the only thing it
 /// does, once per queue, and never for the processor it runs on.
-pub fn wake_queue_owners<CpuImpl: Cpu>(cpu: &CpuImpl, queues: impl Iterator<Item = usize>) {
+pub fn wake_queue_owners<CpuImpl: Cpu>(cpu: &CpuImpl, owners: impl Iterator<Item = ProcessorId>) {
     let current = current_processor();
-    let processors = cpu.processor_count();
-    for queue in queues {
-        // A queue beyond the processor count belongs to no shard: the
-        // service sizes its shard set to the processors it has.
-        if queue >= processors {
-            continue;
-        }
-        let owner = ProcessorId::new(
-            u16::try_from(queue)
-                .unwrap_or_else(|_| panic!("queue {queue} exceeds the processor id range")),
-        );
+    for owner in owners {
         if owner != current {
             cpu.wake_processor(owner);
         }
@@ -409,25 +403,13 @@ mod tests {
     fn only_foreign_queue_owners_are_woken() {
         let cpu = RecordingSmpCpu::new(1, 4);
 
-        super::wake_queue_owners(&cpu, [0usize, 1, 3].into_iter());
+        super::wake_queue_owners(&cpu, [0u16, 1, 3].map(ProcessorId::new).into_iter());
 
         assert_eq!(
             cpu.woken(),
             alloc::vec![ProcessorId::new(0), ProcessorId::new(3)],
             "queue 1 belongs to this processor and costs no IPI"
         );
-    }
-
-    /// A device may expose more queues than the machine has processors;
-    /// the shard set is sized to the processors, so a queue past that
-    /// belongs to nobody.
-    #[test]
-    fn a_queue_without_a_processor_is_not_woken() {
-        let cpu = RecordingSmpCpu::new(0, 2);
-
-        super::wake_queue_owners(&cpu, [1usize, 2, 7].into_iter());
-
-        assert_eq!(cpu.woken(), alloc::vec![ProcessorId::new(1)]);
     }
 
     #[test]

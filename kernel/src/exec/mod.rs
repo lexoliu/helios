@@ -13,6 +13,7 @@
 mod compaction;
 mod executor;
 mod freeze;
+mod hotplug;
 mod idle;
 mod in_flight;
 mod lifecycle;
@@ -38,6 +39,7 @@ pub use executor::{
 pub use freeze::{FreezeError, FrozenMachine};
 pub use idle::IdleOutcome;
 pub use in_flight::InFlight;
+pub(crate) use lifecycle::ProcessorStep;
 pub use lifecycle::{
     OfflineError, OfflineRefusal, OnlineError, OnlineSet, ProcessorControl, online_processor_count,
 };

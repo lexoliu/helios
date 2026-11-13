@@ -2,11 +2,22 @@
 //!
 //! # SMP contract
 //!
-//! There is one [`NetworkShard`] per processor and every shard owns an
-//! independent `Stack`, socket slab and port allocator. A flow belongs
-//! to exactly one shard ([`shard_idx_for_frame`]), so the frames for a
-//! socket are always placed in that socket's shard whichever processor
-//! drained them off the device.
+//! There is one [`NetworkShard`] per possible processor and every shard
+//! owns an independent `Stack`, socket slab and port allocator. A flow
+//! belongs to exactly one shard ([`rx_frame_owner`]), so the frames for
+//! a socket are always placed in that socket's shard whichever processor
+//! drained them off the device. The set is never re-partitioned: a
+//! processor going offline leaves its shard, its sockets and its port
+//! window where they are, and only the queue pair whose pump serves the
+//! shard changes (`routes`).
+//!
+//! One frame is the exception: a Neighbor Advertisement belongs to the
+//! whole node, because the shard that asked for the address is the one
+//! whose socket needed it. The default shard takes it as the receiver,
+//! and [`NetworkShardSet::dispatch_rx_frame`] then offers it to every
+//! other shard, one lock at a time, where it can complete a resolution
+//! that shard is pending and nothing else. The shards that answered are
+//! signalled after their locks are released.
 //!
 //! Placement is therefore routinely cross-processor: the shard lock is
 //! taken by the draining CPU, not the owning one. That hand-off is
@@ -34,7 +45,19 @@
 use super::*;
 use crossbeam_utils::CachePadded;
 
-/// The shard a received frame belongs to.
+/// Who a received frame belongs to.
+pub(super) enum RxFrameOwner {
+    /// One shard, which takes the frame and nobody else does.
+    Shard(usize),
+    /// A Neighbor Advertisement, which answers a resolution that any
+    /// shard may be pending. The default shard takes it as the receiver,
+    /// and every other shard is offered it as the answer to its own
+    /// pending resolution, which is all it can do there
+    /// (`Stack::answer_resolution`).
+    ResolutionAnswer,
+}
+
+/// The owner of a received frame.
 ///
 /// This is the one receive-side ownership rule in the kernel, and it is
 /// the rule a device's RSS engine reproduces: the flow's Toeplitz hash,
@@ -47,7 +70,8 @@ use crossbeam_utils::CachePadded;
 /// Three kinds of frame have no flow the hash can name and belong to
 /// [`DEFAULT_SHARD_IDX`]:
 ///
-/// * ARP, ICMP echo and neighbour discovery, which carry no ports;
+/// * ARP, ICMP echo and the neighbour discovery that is not an
+///   advertisement, which carry no ports;
 /// * anything unparseable, which the owning stack will drop;
 /// * the DHCP client's exchange, which is broadcast at a moment when
 ///   the interface has no address to hash a flow with.
@@ -55,22 +79,39 @@ use crossbeam_utils::CachePadded;
 /// An ICMP error is not one of them: it quotes the packet that provoked
 /// it, so the flow it concerns is recoverable and the error is routed to
 /// that flow's shard rather than to a shard with no socket to tell.
-pub(super) fn shard_idx_for_frame(frame: &RxFrame, shard_count: usize) -> usize {
+///
+/// A Neighbor Advertisement is the one frame that belongs to the whole
+/// node: the shard that asked for the address is whichever shard's
+/// socket needed it, and no hash names that shard, so the frame is a
+/// [`RxFrameOwner::ResolutionAnswer`]. With a single shard that is the
+/// default shard alone.
+pub(super) fn rx_frame_owner(frame: &RxFrame, shard_count: usize) -> RxFrameOwner {
     // A device that steers has already hashed the frame to pick the
     // queue it delivered on, so taking its number rather than
     // recomputing the same one is the whole benefit of `HASH_REPORT`.
     // It is the same function over the same bytes under the same key,
     // so the answer does not depend on which side produced it.
     if let Some(hash) = frame.offload.flow_hash {
-        return hash.bucket(shard_count);
+        return RxFrameOwner::Shard(hash.bucket(shard_count));
     }
-    flow_tuple_for_frame(frame.as_ref())
-        .map(|tuple| flow_hash(&tuple).bucket(shard_count))
-        .unwrap_or(DEFAULT_SHARD_IDX)
+    match frame_flow(frame.as_ref()) {
+        Some(FrameFlow::Tuple(tuple)) => RxFrameOwner::Shard(flow_hash(&tuple).bucket(shard_count)),
+        Some(FrameFlow::NeighborAdvertisement) => RxFrameOwner::ResolutionAnswer,
+        None => RxFrameOwner::Shard(DEFAULT_SHARD_IDX),
+    }
 }
 
-/// The received flow a frame belongs to, or `None` when it has none.
-fn flow_tuple_for_frame(frame: &[u8]) -> Option<FlowTuple> {
+/// What the headers of a received frame say about who owns it.
+enum FrameFlow {
+    /// A flow the hash names.
+    Tuple(FlowTuple),
+    /// A Neighbor Advertisement.
+    NeighborAdvertisement,
+}
+
+/// What a frame belongs to, or `None` when it has no flow and no
+/// owner but the default shard.
+fn frame_flow(frame: &[u8]) -> Option<FrameFlow> {
     let ethernet = EthernetFrame::parse(frame)?;
     let (protocol, l4_payload) = match ethernet.protocol {
         EthernetProtocol::Ipv4 => {
@@ -88,10 +129,10 @@ fn flow_tuple_for_frame(frame: &[u8]) -> Option<FlowTuple> {
             if is_dhcp_exchange(protocol, l4_payload) {
                 return None;
             }
-            FlowTuple::from_frame(frame)
+            FlowTuple::from_frame(frame).map(FrameFlow::Tuple)
         }
-        IpProtocol::Icmp => icmpv4_quoted_flow(l4_payload),
-        IpProtocol::Icmpv6 => icmpv6_quoted_flow(l4_payload),
+        IpProtocol::Icmp => icmpv4_quoted_flow(l4_payload).map(FrameFlow::Tuple),
+        IpProtocol::Icmpv6 => icmpv6_flow(l4_payload),
     }
 }
 
@@ -127,16 +168,22 @@ fn icmpv4_quoted_flow(bytes: &[u8]) -> Option<FlowTuple> {
     Some(FlowTuple::ipv4(quoted.source, ports.0, quoted.destination, ports.1).reversed())
 }
 
-/// The flow an ICMPv6 error concerns, in the receive direction.
-fn icmpv6_quoted_flow(bytes: &[u8]) -> Option<FlowTuple> {
+/// What an ICMPv6 message belongs to: the flow an error concerns, in the
+/// receive direction, or the node for a Neighbor Advertisement.
+fn icmpv6_flow(bytes: &[u8]) -> Option<FrameFlow> {
     let original = match Icmpv6Packet::parse(bytes)? {
+        Icmpv6Packet::NeighborAdvertisement { .. } => {
+            return Some(FrameFlow::NeighborAdvertisement);
+        }
         Icmpv6Packet::DestinationUnreachable(unreachable) => unreachable.original,
         Icmpv6Packet::PacketTooBig(packet_too_big) => packet_too_big.original,
         _ => return None,
     };
     let quoted = Ipv6Packet::parse_quoted(original)?;
     let ports = quoted_ports(quoted.next_header, quoted.payload)?;
-    Some(FlowTuple::ipv6(quoted.source, ports.0, quoted.destination, ports.1).reversed())
+    Some(FrameFlow::Tuple(
+        FlowTuple::ipv6(quoted.source, ports.0, quoted.destination, ports.1).reversed(),
+    ))
 }
 
 /// The port pair of a quoted transport header. An ICMP error only has
@@ -192,6 +239,9 @@ pub(super) struct NetworkShard {
     /// Where this shard draws ephemeral ports and DNS question ids
     /// from. Touched only under the shard's lock.
     pub(super) entropy: ShardEntropy,
+    /// Where an outbound TCP connect's walk starts (RFC 6056 §3.3.3).
+    /// Touched only under the shard's lock.
+    pub(super) connect_ports: ConnectPortSelector,
     pub(super) tcp_streams: HandleSlab<helios_netstack::SocketId, MAX_TCP_STREAM_HANDLES>,
     pub(super) tcp_listeners: HandleSlab<TcpListenerState, MAX_TCP_LISTENER_HANDLES>,
     pub(super) udp_sockets: HandleSlab<UdpSocketState, MAX_UDP_SOCKET_HANDLES>,
@@ -839,7 +889,7 @@ impl NetworkShardSet {
     pub(super) fn with_handle_receive_drain<H, R>(
         &self,
         handle: H,
-        pair_count: usize,
+        pairs: &PairRoutes,
         f: impl FnOnce(&mut NetworkShard) -> R,
     ) -> R
     where
@@ -857,7 +907,7 @@ impl NetworkShardSet {
         };
         if relieved {
             self.raise_shard_progress(shard_idx);
-            let pump_shard = shard_idx % pair_count;
+            let pump_shard = pairs.pair_of_shard(shard_idx);
             if pump_shard != shard_idx {
                 self.raise_shard_progress(pump_shard);
             }
@@ -874,13 +924,40 @@ impl NetworkShardSet {
     /// shard index is what the caller signals once it has let go.
     /// Non-IP and non-TCP/UDP frames (ARP, ICMP, malformed) carry no
     /// local port and route to shard 0.
+    ///
+    /// A Neighbor Advertisement is received by shard 0 like any other
+    /// frame and then offered to every other shard
+    /// ([`Self::answer_resolutions`]); the returned dispatch is shard
+    /// 0's. No two shard locks are ever held together, and the shards
+    /// that answered are signalled after their locks are released.
     pub(super) fn dispatch_rx_frame(
         &self,
         frame: &RxFrame,
         received_at: StackInstant,
         control: &NetworkControlPlane,
     ) -> RxFrameDispatch {
-        let shard_idx = shard_idx_for_frame(frame, self.shard_count());
+        match rx_frame_owner(frame, self.shard_count()) {
+            RxFrameOwner::Shard(shard_idx) => {
+                self.deliver_to_shard(shard_idx, frame, received_at, control)
+            }
+            RxFrameOwner::ResolutionAnswer => {
+                let dispatch =
+                    self.deliver_to_shard(DEFAULT_SHARD_IDX, frame, received_at, control);
+                self.answer_resolutions(frame, received_at, control);
+                dispatch
+            }
+        }
+    }
+
+    /// Hands `frame` to shard `shard_idx`'s stack as its receiver and
+    /// publishes what the stack learned, under that shard's lock.
+    fn deliver_to_shard(
+        &self,
+        shard_idx: usize,
+        frame: &RxFrame,
+        received_at: StackInstant,
+        control: &NetworkControlPlane,
+    ) -> RxFrameDispatch {
         let mut shard = self.shards[shard_idx].inner.lock();
         let dispatch = match shard.stack.receive_rx_frame(frame.clone(), received_at) {
             Ok(_) => RxFrameDispatch::Delivered { shard_idx },
@@ -892,6 +969,38 @@ impl NetworkShardSet {
         };
         shard.drain_control_events(control);
         dispatch
+    }
+
+    /// Offers a Neighbor Advertisement to every shard but the default
+    /// one, in index order, as the answer to a resolution it is pending.
+    ///
+    /// Concurrency: each shard is locked on its own and released before
+    /// the next, and a shard that answered publishes the entry it
+    /// learned under its lock, as every receive does. The answered
+    /// shard's waiters and the set-wide signal are raised after that
+    /// lock is released. The frame is on loan for this receive pass and
+    /// nothing retains it. Answered shards are not counted as arrivals:
+    /// the frame was received once, by the default shard.
+    fn answer_resolutions(
+        &self,
+        frame: &RxFrame,
+        received_at: StackInstant,
+        control: &NetworkControlPlane,
+    ) {
+        for shard_idx in (0..self.shard_count()).filter(|idx| *idx != DEFAULT_SHARD_IDX) {
+            let answered = {
+                let mut shard = self.shards[shard_idx].inner.lock();
+                let answered = shard.stack.answer_resolution(frame, received_at);
+                if answered {
+                    shard.drain_control_events(control);
+                }
+                answered
+            };
+            if answered {
+                self.raise_shard_progress(shard_idx);
+                self.any_arrival.signal();
+            }
+        }
     }
 
     /// Locks shard `idx` directly. Used by the RX demux which has
@@ -957,16 +1066,21 @@ impl NetworkShardSet {
     /// Iterates the shards whose egress submits on `pair_idx`, calling
     /// `f` once per shard under its own lock.
     ///
-    /// Shard `s` submits on pair `s % pair_count`, so a pump that owns
-    /// a pair drives every shard that shares it — with fewer pairs than
-    /// processors, the pair's shards are exactly the ones its pump can
-    /// ever move.
-    pub(super) fn for_each_on_pair<F>(&self, pair_idx: usize, pair_count: usize, mut f: F)
+    /// A shard submits on the live pair `layout` folds it onto, so a
+    /// pump that owns a pair drives every shard that shares it — with
+    /// fewer live pairs than shards, the pair's shards are exactly the
+    /// ones its pump can ever move. One layout is used for the whole
+    /// walk, so a hand-off in the middle of it neither skips a shard
+    /// nor visits one twice.
+    pub(super) fn for_each_on_pair<F>(&self, pair_idx: usize, layout: PairLayout, mut f: F)
     where
         F: FnMut(&mut NetworkShard),
     {
-        for shard_idx in (pair_idx..self.shards.len()).step_by(pair_count) {
-            let mut guard = self.shards[shard_idx].inner.lock();
+        for (shard_idx, shard) in self.shards.iter().enumerate() {
+            if layout.pair_of_shard(shard_idx) != pair_idx {
+                continue;
+            }
+            let mut guard = shard.inner.lock();
             f(&mut guard);
         }
     }
@@ -976,10 +1090,10 @@ impl NetworkShardSet {
     pub(super) fn pair_tcp_deadline_nanos(
         &self,
         pair_idx: usize,
-        pair_count: usize,
+        layout: PairLayout,
     ) -> Option<u64> {
         let mut next = None;
-        self.for_each_on_pair(pair_idx, pair_count, |shard| {
+        self.for_each_on_pair(pair_idx, layout, |shard| {
             if let Some(deadline) = shard.stack.next_tcp_deadline().map(StackInstant::nanos) {
                 next = Some(next.map_or(deadline, |current: u64| current.min(deadline)));
             }
@@ -1035,11 +1149,14 @@ impl NetworkShard {
             "DHCP internal UDP socket slot changed"
         );
         let dhcp = DhcpClient::new(stack.config().mac, transaction_id);
+        let mut entropy = ShardEntropy::derive(root_entropy, shard_idx);
+        let connect_ports = ConnectPortSelector::new(&mut entropy);
         Self {
             stack,
             shard_idx,
             shard_count,
-            entropy: ShardEntropy::derive(root_entropy, shard_idx),
+            entropy,
+            connect_ports,
             tcp_streams: HandleSlab::new(),
             tcp_listeners: HandleSlab::new(),
             udp_sockets,
@@ -1131,13 +1248,35 @@ impl NetworkShard {
     }
 
     /// A walk over every port in this shard's window, from a random
-    /// starting point (RFC 6056 §3.3.1). An allocation takes the first
-    /// port it finds suitable, and gives up only after the whole window
-    /// has been tried.
+    /// starting point (RFC 6056 §3.3.1), for an allocation with no peer
+    /// whose four-tuple a previous use could leave held: a UDP socket
+    /// or a listener. An allocation takes the first port it finds
+    /// suitable, and gives up only after the whole window has been
+    /// tried. An outbound TCP connect uses
+    /// [`Self::connect_walk`] instead.
     pub(super) fn ephemeral_walk(&mut self) -> EphemeralWalk {
         let (first, last) = self.ephemeral_window();
         let offset = self.entropy.below(EphemeralWalk::window_len(first, last));
         EphemeralWalk::starting_at(first, last, offset)
+    }
+
+    /// The walk over this shard's window for an outbound TCP connect to
+    /// `request`'s destination (RFC 6056 §3.3.3), and the counter to
+    /// [`Self::connect_taken`] once a port is taken.
+    pub(super) fn connect_walk(&self, request: &TcpConnectRequest) -> (EphemeralWalk, ConnectSlot) {
+        let (first, last) = self.ephemeral_window();
+        self.connect_ports.walk(
+            first,
+            last,
+            request.local,
+            request.destination,
+            request.port,
+        )
+    }
+
+    /// Records that a connect which started at `walk` took `port`.
+    pub(super) fn connect_taken(&mut self, slot: ConnectSlot, walk: &EphemeralWalk, port: u16) {
+        self.connect_ports.advance(slot, walk, walk.steps_to(port));
     }
 
     pub(super) fn add_ipv4_address(
