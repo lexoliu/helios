@@ -32,7 +32,10 @@
 //!   `ProcessorLifecycles::transition`, the kernel's async mutex, for
 //!   the whole of one offline or online; at most one processor is ever
 //!   between states, so the processor a departing one hands its timers
-//!   to cannot itself be departing. Nothing on a hot path takes it.
+//!   to cannot itself be departing. Nothing on a hot path takes it. A
+//!   removal (`ProcessorControl::remove`, firmware ejecting a processor)
+//!   keeps it through the platform's release too, so no online restarts
+//!   a processor firmware is destroying.
 //! - The initiator is a task on any online processor other than the
 //!   target ([`ProcessorControl`]). It publishes the request in the
 //!   target's lifecycle cell, wakes the target if it has parked, and
@@ -67,6 +70,7 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use core::future::Future;
 use core::sync::atomic::{AtomicU8, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 
 use crossbeam_utils::CachePadded;
@@ -388,6 +392,52 @@ impl<CpuImpl: Cpu + Clone> ProcessorControl<CpuImpl> {
     /// Refused with [`OfflineError::Refused`] when the processor still
     /// runs work pinned to it, which leaves it online and unchanged.
     pub async fn offline(&self, processor: ProcessorId) -> Result<(), OfflineError> {
+        self.check_offline_target(processor)?;
+        let _transition = self.group.lifecycle().lock_transitions().await;
+        let cell = self.group.lifecycle().cell(processor);
+        if cell.state() != LifecycleState::Online {
+            return Err(OfflineError::NotOnline { processor });
+        }
+        self.depart(processor, cell).await
+    }
+
+    /// Takes `processor` out of the machine: offline when it is online,
+    /// then `release` hands it back to the platform while the transition
+    /// lock is still held, so no online can restart it until `release`
+    /// has returned. A processor already offline, or one that never ran,
+    /// goes straight to `release`.
+    ///
+    /// Refused as [`Self::offline`] refuses, and with
+    /// [`OfflineError::NotOnline`] when the processor is still in its
+    /// first bring-up; `release` runs only when the processor is
+    /// offline or never started.
+    pub async fn remove<Release, Released>(
+        &self,
+        processor: ProcessorId,
+        release: Release,
+    ) -> Result<(), OfflineError>
+    where
+        Release: FnOnce(ProcessorId) -> Released,
+        Released: Future<Output = ()>,
+    {
+        self.check_offline_target(processor)?;
+        let _transition = self.group.lifecycle().lock_transitions().await;
+        let cell = self.group.lifecycle().cell(processor);
+        match cell.state() {
+            LifecycleState::Online => self.depart(processor, cell).await?,
+            LifecycleState::Offline | LifecycleState::Absent => {}
+            // Under the lock only a first bring-up at boot is between
+            // states; it has not finished arriving.
+            LifecycleState::Arriving | LifecycleState::Departing => {
+                return Err(OfflineError::NotOnline { processor });
+            }
+        }
+        release(processor).await;
+        Ok(())
+    }
+
+    /// The checks an offline makes before it takes the transition lock.
+    fn check_offline_target(&self, processor: ProcessorId) -> Result<(), OfflineError> {
         if !self.possible(processor) {
             return Err(OfflineError::NotPossible {
                 processor,
@@ -397,15 +447,20 @@ impl<CpuImpl: Cpu + Clone> ProcessorControl<CpuImpl> {
         if processor == self.cpu.bootstrap_processor() {
             return Err(OfflineError::Bootstrap { processor });
         }
-        let _transition = self.group.lifecycle().lock_transitions().await;
+        Ok(())
+    }
+
+    /// Asks an online `processor` to go offline and waits for its answer.
+    /// The caller holds the transition lock.
+    async fn depart(
+        &self,
+        processor: ProcessorId,
+        cell: &LifecycleCell,
+    ) -> Result<(), OfflineError> {
         // Read after the lock: the task may have resumed elsewhere.
         let successor = current_processor();
         if successor == processor {
             return Err(OfflineError::CurrentProcessor { processor });
-        }
-        let cell = self.group.lifecycle().cell(processor);
-        if cell.state() != LifecycleState::Online {
-            return Err(OfflineError::NotOnline { processor });
         }
         cell.successor.store(successor.id(), Ordering::Relaxed);
         // `SeqCst` store, then the target's idle state: the requester

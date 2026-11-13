@@ -5,7 +5,7 @@ version = 4
 [[package]]
 name = "acpi"
 version = "7.0.0-pre1"
-source = "git+https://github.com/rust-osdev/acpi?branch=main#bd878824a20bd7af1386cc7daf861eb1aee50a5f"
+source = "git+https://github.com/lexoliu/acpi?branch=aml-notify-handler#a85ab3c933741d69a6a4241184b16e845740fdd2"
 dependencies = [
  "bit_field",
  "bitflags 2.13.1",
@@ -1969,6 +1969,7 @@ dependencies = [
  "bytes",
  "critical-section",
  "fdt",
+ "helios-acpi",
  "helios-artifact",
  "helios-hal",
  "helios-kernel",
@@ -1981,6 +1982,18 @@ dependencies = [
  "tracing",
  "triomphe",
  "zeroize",
+]
+
+[[package]]
+name = "helios-acpi"
+version = "0.1.0"
+dependencies = [
+ "acpi",
+ "helios-hal",
+ "hex",
+ "sha2 0.10.9",
+ "thiserror 2.0.21",
+ "tracing",
 ]
 
 [[package]]
@@ -2555,6 +2568,7 @@ dependencies = [
  "bitflags 2.13.1",
  "bytes",
  "critical-section",
+ "helios-acpi",
  "helios-artifact",
  "helios-hal",
  "helios-kernel",
