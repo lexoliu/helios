@@ -79,6 +79,7 @@ def write_jsonl(path: Path, cells: dict[str, list]) -> None:
                     {
                         "type": "iteration",
                         "workload": name,
+                        "runner": "program",
                         "iteration": iteration.index,
                         "elapsed_ms": iteration.elapsed_ms,
                         "metrics": dict(iteration.metrics),
@@ -166,7 +167,9 @@ def suite(options: RunOptions, manifest, monkeypatch, report: Report) -> Report:
     monkeypatch.setattr(runner, "kernel_profiles", lambda options: runner.KernelProfiles(candidate=None))
     monkeypatch.setattr(runner, "kernel_pgo_uncovered", lambda *args: None)
     monkeypatch.setattr(runner, "collect_hardware", lambda lane: report.hardware)
-    monkeypatch.setattr(runner, "collect_pins", lambda lane, workloads, kernel_build, baseline: report.pins)
+    monkeypatch.setattr(
+        runner, "collect_pins", lambda lane, workloads, kernel_build, baseline, sides: report.pins
+    )
     return run_suite(options, manifest)
 
 

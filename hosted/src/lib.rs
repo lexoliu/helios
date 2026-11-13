@@ -7,9 +7,11 @@ mod device;
 mod device_tests;
 #[cfg(test)]
 mod executor_storm_tests;
+mod freeze_tests;
 mod host_fs;
 #[cfg(test)]
 mod init_program;
+mod lifecycle_tests;
 mod memory_policy_tests;
 mod net;
 mod oom_killer_tests;
@@ -21,6 +23,7 @@ mod swap;
 mod swap_tests;
 #[cfg(test)]
 mod timer_cross_processor_tests;
+mod timer_tests;
 mod vmm;
 
 pub use device::{

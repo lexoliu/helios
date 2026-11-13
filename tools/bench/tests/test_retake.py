@@ -98,6 +98,7 @@ def write_retake(out_dir: Path, side: Side, name: str, values, out_name: str = R
                 {
                     "type": "iteration",
                     "workload": name,
+                    "runner": "program",
                     "iteration": iteration.index,
                     "elapsed_ms": iteration.elapsed_ms,
                     "metrics": {},

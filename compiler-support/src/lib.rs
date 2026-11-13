@@ -1,5 +1,5 @@
 use helios_artifact::{
-    CWASM_MEMORY_GUARD_SIZE, CWASM_MEMORY_RESERVATION, cwasm_target_cranelift_flags,
+    CWASM_MEMORY_GUARD_SIZE, CWASM_MEMORY_RESERVATION, CwasmTarget, cwasm_target_code_protection,
     cwasm_target_guest_stack_limit_offset, cwasm_target_supports_wasm_simd,
 };
 use std::cell::{Cell, RefCell};
@@ -9,11 +9,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use thiserror::Error;
 use wasmparser::{Encoding, Parser, Payload};
-use wasmtime::{Config, Engine, OptLevel, StackLimitLocation, Strategy};
+use wasmtime::{Config, Engine, ModuleVersionStrategy, OptLevel, StackLimitLocation, Strategy};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AotCompileHint {
-    Fast,
     Balanced,
     Performance,
 }
@@ -84,6 +83,11 @@ pub enum CompileError {
         target: String,
         source: wasmtime::Error,
     },
+    #[error("Wasmtime rejected artifact version {version:?}: {source}")]
+    ModuleVersion {
+        version: String,
+        source: wasmtime::Error,
+    },
     #[error("failed to precompile core module: {0}")]
     CoreModule(wasmtime::Error),
     #[error("failed to precompile component: {0}")]
@@ -100,7 +104,7 @@ pub type Result<T> = core::result::Result<T, CompileError>;
 
 pub fn precompile_artifact(
     bytes: &[u8],
-    target: &str,
+    target: &CwasmTarget<'_>,
     hint: AotCompileHint,
 ) -> Result<PrecompiledArtifact> {
     Ok(precompile_artifact_inner(bytes, target, hint, false)?.0)
@@ -108,7 +112,7 @@ pub fn precompile_artifact(
 
 pub fn precompile_artifact_profiled(
     bytes: &[u8],
-    target: &str,
+    target: &CwasmTarget<'_>,
     hint: AotCompileHint,
 ) -> Result<(PrecompiledArtifact, CompileProfile)> {
     precompile_artifact_inner(bytes, target, hint, true)
@@ -116,7 +120,7 @@ pub fn precompile_artifact_profiled(
 
 fn precompile_artifact_inner(
     bytes: &[u8],
-    target: &str,
+    target: &CwasmTarget<'_>,
     hint: AotCompileHint,
     profile: bool,
 ) -> Result<(PrecompiledArtifact, CompileProfile)> {
@@ -125,7 +129,7 @@ fn precompile_artifact_inner(
     let engine =
         Engine::new(&build_engine_config(target, hint, worker_count)?).map_err(|source| {
             CompileError::Engine {
-                target: target.to_owned(),
+                target: target.triple().to_owned(),
                 source,
             }
         })?;
@@ -424,23 +428,21 @@ fn compiler_worker_count() -> usize {
 /// compiler adds its own runtime mechanisms on top (`build_engine_config`),
 /// and `helios-compiler-host` runs the compiler plugin's own module under
 /// this configuration on Linux, so the plugin's code is the same on both.
-pub fn codegen_config(target: &str, hint: AotCompileHint) -> Result<Config> {
+pub fn codegen_config(target: &CwasmTarget<'_>, hint: AotCompileHint) -> Result<Config> {
+    let triple = target.triple();
     let mut config = Config::new();
     config
-        .target(target)
+        .target(triple)
         .map_err(|source| CompileError::Target {
-            target: target.to_owned(),
+            target: triple.to_owned(),
             source,
         })?;
-    for flag in cwasm_target_cranelift_flags(target) {
+    for flag in target.cranelift_flags() {
         unsafe {
             config.cranelift_flag_enable(flag);
         }
     }
     match hint {
-        AotCompileHint::Fast => {
-            config.strategy(Strategy::Winch);
-        }
         AotCompileHint::Balanced => {
             config.strategy(Strategy::Cranelift);
             config.cranelift_opt_level(OptLevel::None);
@@ -450,12 +452,22 @@ pub fn codegen_config(target: &str, hint: AotCompileHint) -> Result<Config> {
             config.cranelift_opt_level(OptLevel::Speed);
         }
     }
+    // The version string records the protection the machine code carries,
+    // and the kernel engine refuses an artifact whose string differs from
+    // the protection it requires.
+    if let Some(version) = cwasm_target_code_protection(triple)
+        .module_version(ModuleVersionStrategy::WasmtimeVersion.as_str())
+    {
+        config
+            .module_version(ModuleVersionStrategy::Custom(version.clone()))
+            .map_err(|source| CompileError::ModuleVersion { version, source })?;
+    }
     config.wasm_component_model(true);
     config.wasm_component_model_async(true);
     config.wasm_component_model_more_async_builtins(true);
     config.wasm_component_model_async_stackful(true);
     config.wasm_component_model_threading(true);
-    let wasm_simd = cwasm_target_supports_wasm_simd(target);
+    let wasm_simd = cwasm_target_supports_wasm_simd(triple);
     config.wasm_simd(wasm_simd);
     config.wasm_relaxed_simd(wasm_simd);
     config.relaxed_simd_deterministic(false);
@@ -501,14 +513,19 @@ pub const MAX_WASM_STACK: usize = 8 * 1024 * 1024;
 /// the wasm limit plus 1 MiB of headroom for the host functions it calls.
 pub const WASM_THREAD_STACK: usize = 9 * 1024 * 1024;
 
-fn build_engine_config(target: &str, hint: AotCompileHint, worker_count: usize) -> Result<Config> {
+fn build_engine_config(
+    target: &CwasmTarget<'_>,
+    hint: AotCompileHint,
+    worker_count: usize,
+) -> Result<Config> {
+    let triple = target.triple();
     let mut config = codegen_config(target, hint)?;
     config.parallel_compilation(worker_count > 1);
     config.stack_limit_interruption(true);
     // The kernel engine reads the limit from the same location (see
     // `cwasm_target_guest_stack_limit_offset`) and refuses a cwasm compiled
     // for the other one.
-    if let Some(offset) = cwasm_target_guest_stack_limit_offset(target) {
+    if let Some(offset) = cwasm_target_guest_stack_limit_offset(triple) {
         config.stack_limit_location(StackLimitLocation::PerProcessor { offset });
     }
     // Wasmtime validates `max_wasm_stack <= async_stack_size`; keep the async
@@ -518,10 +535,14 @@ fn build_engine_config(target: &str, hint: AotCompileHint, worker_count: usize) 
     Ok(config)
 }
 
-#[cfg(all(test, target_arch = "x86_64"))]
+#[cfg(test)]
 mod tests {
-    use super::{AotCompileHint, build_engine_config, precompile_artifact};
-    use wasmtime::{Engine, Module};
+    use super::{AotCompileHint, CwasmTarget, build_engine_config, precompile_artifact};
+    #[cfg(target_arch = "x86_64")]
+    use helios_artifact::CwasmCodeProtection;
+    use helios_artifact::cwasm_target_isa_levels;
+    #[cfg(target_arch = "x86_64")]
+    use wasmtime::{Engine, Module, ModuleVersionStrategy};
 
     const MINIMAL_MODULE: &[u8] = &[
         0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // wasm header
@@ -531,31 +552,204 @@ mod tests {
         0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b, // body
     ];
 
+    /// One target of each architecture Helios defines levels for.
+    const TARGETS: [&str; 3] = [
+        "x86_64-unknown-none",
+        "aarch64-unknown-none",
+        "riscv64gc-unknown-none-elf",
+    ];
+
+    /// Every level of `triple`, as a compile target.
+    fn every_level(triple: &str) -> impl Iterator<Item = CwasmTarget<'_>> {
+        cwasm_target_isa_levels(triple)
+            .iter()
+            .map(move |level| CwasmTarget::new(triple, level.name()).expect("a defined level"))
+    }
+
+    /// The marker `CwasmCodeProtection::module_version` puts in the version
+    /// string, which sits uncompressed in the artifact's engine section.
+    const SIGNING_MARKER: &[u8] = b"+return-address-signing";
+
+    fn contains_marker(bytes: &[u8]) -> bool {
+        bytes
+            .windows(SIGNING_MARKER.len())
+            .any(|window| window == SIGNING_MARKER)
+    }
+
+    /// Cranelift's aarch64 output records that it signs return addresses, at
+    /// every ISA level.
     #[test]
-    fn deserialization_rejects_an_unavailable_enabled_isa_flag() {
-        let target = "x86_64-unknown-linux-gnu";
-        let artifact = precompile_artifact(MINIMAL_MODULE, target, AotCompileHint::Performance)
+    fn aarch64_cranelift_artifacts_record_return_address_signing() {
+        for target in every_level("aarch64-unknown-none") {
+            for hint in [AotCompileHint::Balanced, AotCompileHint::Performance] {
+                let artifact = precompile_artifact(MINIMAL_MODULE, &target, hint)
+                    .expect("the minimal module precompiles for aarch64");
+                assert!(
+                    contains_marker(&artifact.bytes),
+                    "{} {hint:?}",
+                    target.level().name()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn targets_without_signing_record_no_protection() {
+        for triple in ["x86_64-unknown-none", "riscv64gc-unknown-none-elf"] {
+            for target in every_level(triple) {
+                let artifact =
+                    precompile_artifact(MINIMAL_MODULE, &target, AotCompileHint::Performance)
+                        .expect("the minimal module precompiles");
+                assert!(
+                    !contains_marker(&artifact.bytes),
+                    "{triple} {}",
+                    target.level().name()
+                );
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn an_engine_requiring_signed_code_refuses_an_unsigned_artifact() {
+        let triple = "x86_64-unknown-linux-gnu";
+        let target = CwasmTarget::new(triple, cwasm_target_isa_levels(triple).floor().name())
+            .expect("a floor belongs to its own target");
+        let artifact = precompile_artifact(MINIMAL_MODULE, &target, AotCompileHint::Performance)
             .expect("the minimal module precompiles");
 
-        let mut unavailable = build_engine_config(target, AotCompileHint::Performance, 1)
-            .expect("the mismatch engine config builds");
-        unsafe {
-            unavailable.detect_host_feature(|feature| Some(feature != "avx2"));
-        }
-        let unavailable_engine = Engine::new(&unavailable).expect("the mismatch engine builds");
-        let error = unsafe { Module::deserialize(&unavailable_engine, &artifact.bytes) }
-            .expect_err("an artifact requiring avx2 must not deserialize");
-        let debug = format!("{error:?}");
-        assert!(debug.contains("has_avx2"), "{debug}");
-        assert!(debug.contains("not available on the host"), "{debug}");
+        let same = build_engine_config(&target, AotCompileHint::Performance, 1)
+            .expect("the engine config builds");
+        let same_engine = Engine::new(&same).expect("the engine builds");
+        unsafe { Module::deserialize(&same_engine, &artifact.bytes) }
+            .expect("an artifact deserializes into an engine with the config it was built under");
 
-        let mut available = build_engine_config(target, AotCompileHint::Performance, 1)
-            .expect("the compatible engine config builds");
-        unsafe {
-            available.detect_host_feature(|_| Some(true));
+        let mut requiring_signed = build_engine_config(&target, AotCompileHint::Performance, 1)
+            .expect("the engine config builds");
+        let version = CwasmCodeProtection {
+            return_addresses_signed: true,
         }
-        let available_engine = Engine::new(&available).expect("the compatible engine builds");
-        unsafe { Module::deserialize(&available_engine, &artifact.bytes) }
-            .expect("the same artifact deserializes when every feature is available");
+        .module_version(ModuleVersionStrategy::WasmtimeVersion.as_str())
+        .expect("signed code has its own version");
+        requiring_signed
+            .module_version(ModuleVersionStrategy::Custom(version))
+            .expect("the version string is accepted");
+        let engine = Engine::new(&requiring_signed).expect("the engine builds");
+        let error = unsafe { Module::deserialize(&engine, &artifact.bytes) }
+            .expect_err("unsigned code must not load into an engine that requires signing");
+        let debug = format!("{error:?}");
+        assert!(debug.contains("incompatible version"), "{debug}");
+    }
+
+    #[test]
+    fn every_level_of_every_target_compiles() {
+        for triple in TARGETS {
+            for target in every_level(triple) {
+                precompile_artifact(MINIMAL_MODULE, &target, AotCompileHint::Performance)
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "{triple} level {} does not compile: {error}",
+                            target.level().name()
+                        )
+                    });
+            }
+        }
+    }
+
+    /// Deserialization needs a target that is the host itself, so it runs only
+    /// where the host is a platform Helios develops on; the other
+    /// architectures' levels are covered by compilation alone.
+    #[cfg(any(
+        all(target_arch = "x86_64", target_os = "linux"),
+        all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
+    ))]
+    mod deserialize {
+        use std::cell::{Cell, RefCell};
+
+        use wasmtime::{Engine, Module};
+
+        use super::{AotCompileHint, CwasmTarget, MINIMAL_MODULE, build_engine_config};
+        use super::{cwasm_target_isa_levels, precompile_artifact};
+
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        const HOST_TARGET: &str = "x86_64-unknown-linux-gnu";
+        #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+        const HOST_TARGET: &str = "aarch64-unknown-linux-gnu";
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        const HOST_TARGET: &str = "aarch64-apple-darwin";
+
+        // `detect_host_feature` takes a function pointer, so the probe under
+        // test reports through thread-local test state.
+        thread_local! {
+            static ASKED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+            static DENIED: Cell<Option<&'static str>> = const { Cell::new(None) };
+        }
+
+        fn recording_probe(name: &str) -> Option<bool> {
+            ASKED.with(|asked| asked.borrow_mut().push(name.to_owned()));
+            Some(DENIED.get() != Some(name))
+        }
+
+        /// Deserializes the artifact compiled for `target` on an engine whose
+        /// probe is `recording_probe`, returning the names the probe was
+        /// asked and the outcome.
+        fn deserialize(target: &CwasmTarget<'_>) -> (Vec<String>, wasmtime::Result<Module>) {
+            let artifact = precompile_artifact(MINIMAL_MODULE, target, AotCompileHint::Performance)
+                .expect("the minimal module precompiles");
+            let mut config = build_engine_config(target, AotCompileHint::Performance, 1)
+                .expect("the engine config builds");
+            unsafe {
+                config.detect_host_feature(recording_probe);
+            }
+            let engine = Engine::new(&config).expect("the engine builds");
+            ASKED.with(|asked| asked.borrow_mut().clear());
+            let outcome = unsafe { Module::deserialize(&engine, &artifact.bytes) };
+            (ASKED.with(|asked| asked.take()), outcome)
+        }
+
+        #[test]
+        fn a_level_is_checked_against_exactly_its_probe_names() {
+            DENIED.set(None);
+            for level in cwasm_target_isa_levels(HOST_TARGET).iter() {
+                let target = CwasmTarget::new(HOST_TARGET, level.name()).expect("a defined level");
+                let (mut asked, outcome) = deserialize(&target);
+                outcome.unwrap_or_else(|error| {
+                    panic!("level {} does not deserialize: {error:?}", level.name())
+                });
+                asked.sort();
+                asked.dedup();
+                let mut expected: Vec<_> = level
+                    .features()
+                    .map(|feature| feature.probe_name().to_owned())
+                    .collect();
+                expected.sort();
+                assert_eq!(asked, expected, "level {}", level.name());
+            }
+        }
+
+        #[test]
+        fn a_missing_feature_is_refused_naming_its_cranelift_flag() {
+            for level in cwasm_target_isa_levels(HOST_TARGET).iter() {
+                let target = CwasmTarget::new(HOST_TARGET, level.name()).expect("a defined level");
+                for feature in level.features() {
+                    DENIED.set(Some(feature.probe_name()));
+                    let (_, outcome) = deserialize(&target);
+                    let error = outcome.expect_err(&format!(
+                        "level {} must not deserialize without {}",
+                        level.name(),
+                        feature.probe_name()
+                    ));
+                    let debug = format!("{error:?}");
+                    assert!(
+                        debug.contains(feature.cranelift_flag()),
+                        "level {} without {}: {debug}",
+                        level.name(),
+                        feature.probe_name()
+                    );
+                    assert!(debug.contains("not available on the host"), "{debug}");
+                }
+            }
+            DENIED.set(None);
+        }
     }
 }

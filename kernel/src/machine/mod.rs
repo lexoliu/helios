@@ -6,6 +6,9 @@ mod reactions;
 #[cfg(test)]
 pub(crate) use generation::test_window;
 pub use generation::{
-    AdvanceCause, Generation, MachineGeneration, MachineGenerationHandle, UnhandledAdvances,
+    AdvanceCause, DeviceResets, GENERATION_PROBE_INTERVAL, Generation, MachineGeneration,
+    MachineGenerationHandle, ResetDevice, UnhandledAdvances, spawn_generation_probe,
 };
 pub use reactions::install_generation_reactions;
+#[cfg(test)]
+pub(crate) use reactions::{ReactionSteps, react_forever};

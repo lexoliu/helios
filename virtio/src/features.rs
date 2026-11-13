@@ -14,7 +14,7 @@
 use helios_hal::io::{IoError, IoResult};
 
 use crate::bus::{DeviceBus, DmaAddressing, DmaPool};
-use crate::transport::{DeviceStatus, VirtioFeatures, VirtioTransport};
+use crate::transport::{DeviceStatus, DeviceType, VirtioFeatures, VirtioTransport};
 
 /// Transport-level ring features every helios driver asks for.
 ///
@@ -199,14 +199,92 @@ where
     Ok(features)
 }
 
+/// Why a device that was reset could not be put back on the features it
+/// had.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum RenegotiateError {
+    /// The device no longer offers a feature the driver had accepted.
+    /// Every ring and every request the driver holds was built on it, so
+    /// there is nothing to fall back to.
+    #[error("virtio {device:?} no longer offers feature bit {bit}, which the driver negotiated")]
+    FeatureWithdrawn {
+        /// The device that withdrew the feature.
+        device: DeviceType,
+        /// The lowest feature bit that is missing.
+        bit: u8,
+    },
+    /// The device refused the very feature set it accepted before the
+    /// reset.
+    #[error("virtio {device:?} rejected the feature set it accepted before the reset")]
+    FeaturesRejected {
+        /// The device that refused.
+        device: DeviceType,
+    },
+}
+
+/// Re-runs the status handshake on a device that was reset, accepting
+/// exactly the features `previous` holds.
+///
+/// A guest resumed from a snapshot meets a device that has lost its
+/// status, its features and its queues, while every ring and every
+/// request the driver holds was built for what it negotiated before.
+/// The driver therefore asks for the same set again instead of choosing
+/// afresh, and a device that no longer offers all of it is refused with
+/// the missing bit named. The device may offer *more* than before; that
+/// is ignored, because the driver's structures know nothing of it.
+///
+/// The caller re-programs its virtqueues afterwards and sets `DRIVER_OK`
+/// itself, as after [`negotiate`].
+///
+/// Concurrency contract: runs on one processor while no request can be
+/// submitted to the device, before any queue is re-programmed and before
+/// the device may raise an interrupt. It takes no locks.
+pub fn renegotiate<T: VirtioTransport>(
+    transport: &T,
+    previous: NegotiatedFeatures,
+) -> Result<NegotiatedFeatures, RenegotiateError> {
+    let device = transport.device_type();
+    // Writing zero to a device the host already reset is harmless, and
+    // is what brings one that was not back to the same state.
+    transport.reset();
+    transport.set_status(DeviceStatus::ACKNOWLEDGE);
+    transport.set_status(DeviceStatus::ACKNOWLEDGE | DeviceStatus::DRIVER);
+
+    let withdrawn = previous.bits() & !transport.device_features();
+    if withdrawn != 0 {
+        transport
+            .set_status(DeviceStatus::ACKNOWLEDGE | DeviceStatus::DRIVER | DeviceStatus::FAILED);
+        return Err(RenegotiateError::FeatureWithdrawn {
+            device,
+            // A u64 has at most 63 trailing zeros, so this fits a u8.
+            bit: withdrawn.trailing_zeros() as u8,
+        });
+    }
+
+    transport.set_driver_features(previous.bits());
+    transport
+        .set_status(DeviceStatus::ACKNOWLEDGE | DeviceStatus::DRIVER | DeviceStatus::FEATURES_OK);
+    if !transport.status().contains(DeviceStatus::FEATURES_OK) {
+        transport
+            .set_status(DeviceStatus::ACKNOWLEDGE | DeviceStatus::DRIVER | DeviceStatus::FAILED);
+        return Err(RenegotiateError::FeaturesRejected { device });
+    }
+    tracing::info!(
+        device = ?device,
+        accepted = previous.bits(),
+        "virtio features renegotiated after reset"
+    );
+    Ok(previous)
+}
+
 #[cfg(test)]
 mod tests {
     use helios_hal::iommu::{DmaTranslation, DmaWindow, IoVirtAddr};
 
-    use super::{RING_FEATURES, negotiate};
+    use super::{RING_FEATURES, RenegotiateError, negotiate, renegotiate};
     use crate::bus::{IdentityDmaPool, PlatformDmaPool};
     use crate::testing::{FakeTransport, FakeTransportConfig};
-    use crate::transport::VirtioFeatures;
+    use crate::transport::{DeviceStatus, DeviceType, VirtioFeatures, VirtioTransport};
 
     /// A pool that puts its device behind a translation, which is what
     /// makes VIRTIO_F_ACCESS_PLATFORM mandatory for that device.
@@ -318,6 +396,67 @@ mod tests {
 
         negotiate(&transport, RING_FEATURES)
             .expect_err("a device that demands platform addresses needs a domain");
+    }
+
+    #[test]
+    fn renegotiation_accepts_exactly_the_previous_features() {
+        let transport = FakeTransport::new(FakeTransportConfig {
+            offered_features: VirtioFeatures::VERSION_1.bits()
+                | VirtioFeatures::RING_EVENT_IDX.bits(),
+            ..FakeTransportConfig::default()
+        });
+        let first = negotiate(&transport, RING_FEATURES).expect("negotiation should succeed");
+        transport.reset_behind_the_driver();
+
+        // The device now offers a feature it did not before. The driver's
+        // rings know nothing of it, so it must not be taken.
+        transport.offer_features(VirtioFeatures::RING_PACKED.bits());
+        let again = renegotiate(&transport, first).expect("the same features are still offered");
+
+        assert_eq!(again, first);
+        assert_eq!(transport.driver_features(), first.bits());
+        assert!(
+            transport.status().contains(DeviceStatus::FEATURES_OK),
+            "the handshake leaves the device at FEATURES_OK, ready for its queues"
+        );
+        assert!(!transport.status().contains(DeviceStatus::DRIVER_OK));
+    }
+
+    #[test]
+    fn renegotiation_names_the_feature_a_device_withdrew() {
+        let transport = FakeTransport::new(FakeTransportConfig {
+            offered_features: VirtioFeatures::VERSION_1.bits()
+                | VirtioFeatures::RING_EVENT_IDX.bits(),
+            ..FakeTransportConfig::default()
+        });
+        let first = negotiate(&transport, RING_FEATURES).expect("negotiation should succeed");
+        transport.withdraw_features(VirtioFeatures::RING_EVENT_IDX.bits());
+
+        assert_eq!(
+            renegotiate(&transport, first),
+            Err(RenegotiateError::FeatureWithdrawn {
+                device: DeviceType::Block,
+                bit: 29,
+            })
+        );
+        assert!(transport.status().contains(DeviceStatus::FAILED));
+    }
+
+    #[test]
+    fn renegotiation_reports_a_device_that_refuses_its_old_features() {
+        let transport = FakeTransport::new(FakeTransportConfig {
+            offered_features: VirtioFeatures::VERSION_1.bits(),
+            ..FakeTransportConfig::default()
+        });
+        let first = negotiate(&transport, RING_FEATURES).expect("negotiation should succeed");
+        transport.refuse_features_ok();
+
+        assert_eq!(
+            renegotiate(&transport, first),
+            Err(RenegotiateError::FeaturesRejected {
+                device: DeviceType::Block
+            })
+        );
     }
 
     /// An ordinary machine's devices must not be told to translate.

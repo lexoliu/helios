@@ -3,6 +3,7 @@ package helios:kernel@0.1.0;
 world init {
   include wasi:cli/command@0.3.0;
   import helios:system/programs@0.1.0;
+  import helios:system/mounts@0.1.0;
   import helios:system/net@0.1.0;
   import helios:system/vsock@0.1.0;
   import helios:system/stats@0.1.0;
@@ -22,6 +23,7 @@ world init {
 world debugger{
   include wasi:cli/command@0.3.0;
   import helios:system/programs@0.1.0;
+  import helios:system/mounts@0.1.0;
   import helios:system/net@0.1.0;
   import helios:system/vsock@0.1.0;
   import helios:system/stats@0.1.0;
@@ -42,12 +44,16 @@ world debugger{
 
 /// World implemented by the `http-client` kernel plugin: it speaks HTTP over
 /// the kernel's sockets and answers exchanges the kernel forwards to it.
+/// `wasi:sockets` carries its connections and name lookups, which is what
+/// the `http-kit-io` implementation in `helios-api` is written on.
 ///
 /// The plugin must not import `wasi:http/client` — it *is* the client.
 world http-handler {
   include wasi:cli/imports@0.3.0;
   import helios:system/net@0.1.0;
   import helios:system/sync@0.1.0;
+  import wasi:sockets/types@0.3.0;
+  import wasi:sockets/ip-name-lookup@0.3.0;
   import wasi:http/types@0.3.0;
   export wasi:http/handler@0.3.0;
 }

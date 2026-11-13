@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 
 from helios_bench.assemble import assemble_report, build_control
-from helios_bench.report import Hardware, Iteration, Pins, Report, RunInfo, Side, Thresholds
+from helios_bench.report import GuestIsa, Hardware, Iteration, Pins, Report, RunInfo, Side, Thresholds
 from helios_bench.sources import RawCell, RawSide
 
 THRESHOLDS = Thresholds(
@@ -166,6 +166,8 @@ def make_report(
         qemu_version="10.2.2",
     )
     pins = Pins(
+        guest_isa=GuestIsa(level="x86-64-v4", extras=["vbmi", "bitalg"]),
+        linux_wasmtime_inferred_isa_flags=["has_avx", "has_avx2", "has_avx512f", "has_sse3"],
         wasmtime_revision="b83d18c8558b6d32fb0c0727d1c6a32639842c49",
         wasmtime_linux_release="wasmtime-v48.0.0-aarch64-linux",
         fedora_image_url="https://download.fedoraproject.org/example.qcow2",

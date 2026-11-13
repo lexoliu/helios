@@ -8,7 +8,7 @@ use crate::error::DispatchError;
 use crate::system::accept;
 use crate::system::server::{self, Dispatcher, Invocations};
 
-use super::bindings::helios::system::{instances, profiling, programs, stats, tracing};
+use super::bindings::helios::system::{filters, instances, profiling, programs, stats, tracing};
 use super::methods::{
     INSTANCES_INSTANCE, INSTANCES_KILL, INSTANCES_SNAPSHOT, PROFILING_CLEAR, PROFILING_FOLDED,
     PROFILING_INSTANCE, PROFILING_INSTRUCTION_SAMPLES, PROFILING_METRICS,
@@ -118,6 +118,7 @@ async fn dispatch(
                         stdout: result.output.stdout,
                         stderr: result.output.stderr,
                     },
+                    launch_nanos: result.launch_nanos,
                 })
                 .map_err(|error| programs::ExecError {
                     kind: convert_launch_error_kind(error.kind),
@@ -208,6 +209,7 @@ async fn dispatch(
                     host_tracing::TargetError::UnknownTarget(name) => {
                         tracing::TargetError::UnknownTarget(name)
                     }
+                    host_tracing::TargetError::Denied => tracing::TargetError::Denied,
                 });
             postcard::to_allocvec(&result).map_err(|source| DispatchError::Encode {
                 operation: "tracing.set-target-enabled",
@@ -221,9 +223,8 @@ async fn dispatch(
                     source,
                 })?;
             let events = host_tracing::recent(&convert_filter(filter), limit)
-                .into_iter()
-                .map(convert_event)
-                .collect::<Vec<_>>();
+                .map(|events| events.into_iter().map(convert_event).collect::<Vec<_>>())
+                .map_err(convert_filter_error);
             postcard::to_allocvec(&events).map_err(|source| DispatchError::Encode {
                 operation: "tracing.recent",
                 source,
@@ -235,8 +236,8 @@ async fn dispatch(
                     operation: "profiling.set-enabled",
                     source,
                 })?;
-            host_profiling::set_enabled(enabled);
-            postcard::to_allocvec(&()).map_err(|source| DispatchError::Encode {
+            let result = host_profiling::set_enabled(enabled).map_err(convert_control_error);
+            postcard::to_allocvec(&result).map_err(|source| DispatchError::Encode {
                 operation: "profiling.set-enabled",
                 source,
             })
@@ -247,8 +248,8 @@ async fn dispatch(
                     operation: "profiling.clear",
                 });
             }
-            host_profiling::clear();
-            postcard::to_allocvec(&()).map_err(|source| DispatchError::Encode {
+            let result = host_profiling::clear().map_err(convert_control_error);
+            postcard::to_allocvec(&result).map_err(|source| DispatchError::Encode {
                 operation: "profiling.clear",
                 source,
             })
@@ -260,9 +261,13 @@ async fn dispatch(
                     source,
                 })?;
             let samples = host_profiling::folded(&convert_profile_filter(filter), limit)
-                .into_iter()
-                .map(convert_profile_sample)
-                .collect::<Vec<_>>();
+                .map(|samples| {
+                    samples
+                        .into_iter()
+                        .map(convert_profile_sample)
+                        .collect::<Vec<_>>()
+                })
+                .map_err(convert_filter_error);
             postcard::to_allocvec(&samples).map_err(|source| DispatchError::Encode {
                 operation: "profiling.folded",
                 source,
@@ -275,9 +280,13 @@ async fn dispatch(
                     source,
                 })?;
             let samples = host_profiling::metrics(&convert_metric_filter(filter), limit)
-                .into_iter()
-                .map(convert_metric_sample)
-                .collect::<Vec<_>>();
+                .map(|samples| {
+                    samples
+                        .into_iter()
+                        .map(convert_metric_sample)
+                        .collect::<Vec<_>>()
+                })
+                .map_err(convert_filter_error);
             postcard::to_allocvec(&samples).map_err(|source| DispatchError::Encode {
                 operation: "profiling.metrics",
                 source,
@@ -416,12 +425,30 @@ fn map_capability_grants_to_host(
                         .collect(),
                 })
             }
+            programs::CapabilityGrant::Mount(grant) => {
+                host_programs::CapabilityGrant::Mount(host_programs::MountGrant {
+                    rights: grant
+                        .rights
+                        .into_iter()
+                        .map(map_mount_right_to_host)
+                        .collect(),
+                })
+            }
             programs::CapabilityGrant::Device(grant) => {
                 host_programs::CapabilityGrant::Device(host_programs::DeviceGrant {
                     classes: grant
                         .classes
                         .into_iter()
                         .map(map_device_class_to_host)
+                        .collect(),
+                })
+            }
+            programs::CapabilityGrant::Diagnostics(grant) => {
+                host_programs::CapabilityGrant::Diagnostics(host_programs::DiagnosticsGrant {
+                    rights: grant
+                        .rights
+                        .into_iter()
+                        .map(map_diagnostics_right_to_host)
                         .collect(),
                 })
             }
@@ -486,12 +513,29 @@ fn map_link_right_to_host(right: programs::LinkRight) -> host_programs::LinkRigh
     }
 }
 
+fn map_mount_right_to_host(right: programs::MountRight) -> host_programs::MountRight {
+    match right {
+        programs::MountRight::Mount => host_programs::MountRight::Mount,
+        programs::MountRight::Unmount => host_programs::MountRight::Unmount,
+    }
+}
+
 fn map_device_class_to_host(class: programs::DeviceClass) -> host_programs::DeviceClass {
     match class {
         programs::DeviceClass::Display => host_programs::DeviceClass::Display,
         programs::DeviceClass::Input => host_programs::DeviceClass::Input,
         programs::DeviceClass::Gpu => host_programs::DeviceClass::Gpu,
         programs::DeviceClass::Audio => host_programs::DeviceClass::Audio,
+    }
+}
+
+fn map_diagnostics_right_to_host(
+    right: programs::DiagnosticsRight,
+) -> host_programs::DiagnosticsRight {
+    match right {
+        programs::DiagnosticsRight::ObserveMachine => {
+            host_programs::DiagnosticsRight::ObserveMachine
+        }
     }
 }
 
@@ -509,6 +553,8 @@ fn convert_launch_error_kind(kind: host_programs::ExecErrorKind) -> programs::Ex
         host_programs::ExecErrorKind::OutOfMemory => programs::ExecErrorKind::OutOfMemory,
         host_programs::ExecErrorKind::Unavailable => programs::ExecErrorKind::Unavailable,
         host_programs::ExecErrorKind::Internal => programs::ExecErrorKind::Internal,
+        host_programs::ExecErrorKind::NotFound => programs::ExecErrorKind::NotFound,
+        host_programs::ExecErrorKind::Io => programs::ExecErrorKind::Io,
     }
 }
 
@@ -526,6 +572,8 @@ fn convert_sample(sample: host_stats::Sample) -> stats::Sample {
                 .into_iter()
                 .map(convert_processor)
                 .collect(),
+            guest_isa_level: sample.processors.guest_isa_level,
+            guest_isa_extras: sample.processors.guest_isa_extras,
         },
         memory: stats::Memory {
             total_bytes: sample.memory.total_bytes,
@@ -606,6 +654,15 @@ fn convert_network(network: host_stats::Network) -> stats::Network {
                 tcp_window_updates_sent: queue.tcp_window_updates_sent,
                 tcp_retransmits_sent: queue.tcp_retransmits_sent,
                 tcp_sockets: queue.tcp_sockets,
+                tcp_orphan_sockets: queue.tcp_orphan_sockets,
+                tcp_orphan_send_queued_bytes: queue.tcp_orphan_send_queued_bytes,
+                tcp_orphan_fin_wait_1: queue.tcp_orphan_fin_wait_1,
+                tcp_orphan_fin_wait_2: queue.tcp_orphan_fin_wait_2,
+                tcp_orphan_closing: queue.tcp_orphan_closing,
+                tcp_orphan_last_ack: queue.tcp_orphan_last_ack,
+                tcp_orphan_time_wait: queue.tcp_orphan_time_wait,
+                tcp_orphan_other_state: queue.tcp_orphan_other_state,
+                tcp_orphan_retransmit_armed: queue.tcp_orphan_retransmit_armed,
                 tcp_receive_backpressured_sockets: queue.tcp_receive_backpressured_sockets,
                 tcp_receive_window_bytes: queue.tcp_receive_window_bytes,
                 receive_queued_bytes: queue.receive_queued_bytes,
@@ -717,6 +774,16 @@ fn convert_filter(filter: tracing::Filter) -> host_tracing::Filter {
     }
 }
 
+fn convert_filter_error(error: host_tracing::FilterError) -> filters::FilterError {
+    use filters::FilterError as Wire;
+    use host_tracing::FilterError as Host;
+
+    match error {
+        Host::TooManyPrefixes(limit) => Wire::TooManyPrefixes(limit),
+        Host::PrefixTooLong(limit) => Wire::PrefixTooLong(limit),
+    }
+}
+
 fn convert_raw_profile_error(error: host_profiling::RawProfileError) -> profiling::RawProfileError {
     use host_profiling::RawProfileError as Host;
     use profiling::RawProfileError as Wire;
@@ -727,6 +794,13 @@ fn convert_raw_profile_error(error: host_profiling::RawProfileError) -> profilin
         Host::MalformedSection(section) => Wire::MalformedSection(convert_profile_section(section)),
         Host::OutOfRange(len) => Wire::OutOfRange(len),
         Host::ReadTooLarge(limit) => Wire::ReadTooLarge(limit),
+        Host::Denied => Wire::Denied,
+    }
+}
+
+fn convert_control_error(error: host_profiling::ControlError) -> profiling::ControlError {
+    match error {
+        host_profiling::ControlError::Denied => profiling::ControlError::Denied,
     }
 }
 
@@ -770,6 +844,9 @@ fn convert_instruction_profile_error(
     match error {
         host_profiling::InstructionProfileError::NotCaptured => {
             profiling::InstructionProfileError::NotCaptured
+        }
+        host_profiling::InstructionProfileError::Denied => {
+            profiling::InstructionProfileError::Denied
         }
     }
 }

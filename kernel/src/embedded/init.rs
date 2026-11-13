@@ -3,8 +3,10 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write;
 
-use helios_artifact::bootfs::{self, BootfsError, EntryKind};
+use helios_artifact::bootfs::{self, BootfsError, Digest256, EntryKind};
 use helios_hal::boot::{BootModule, BootModules};
+
+use crate::wasmtime_adapter::cwasm::trusted_root_public_keys;
 
 use crate::{EmbeddedBootDirectory, EmbeddedBootFile, EmbeddedBootFs, EmbeddedComponent};
 
@@ -24,6 +26,7 @@ const EMBEDDED_SYSTEM_COMPONENT_PATH: &str = "bin/debugger";
 #[derive(Clone, Copy)]
 pub struct BootPayload {
     init: EmbeddedInit,
+    digest: Digest256,
 }
 
 /// The boot-time contents of a [`BootPayload`]: the init component, its
@@ -59,7 +62,12 @@ impl EmbeddedInit {
 }
 
 impl BootPayload {
-    /// Parses the payload image a backend loaded.
+    /// Verifies and parses the payload image a backend loaded.
+    ///
+    /// The image's signature footer is checked against the embedded
+    /// trusted root public keys over a single hash of the body, before
+    /// any body field is read; a refusal is the [`BootfsError`] the
+    /// backend's panic message carries.
     ///
     /// The wire format's entry table records path and data as
     /// offset-length pairs into its own sections, while the kernel's
@@ -68,7 +76,8 @@ impl BootPayload {
     /// index slices here, at bring-up. File contents stay borrowed from
     /// the image itself.
     pub fn parse(bytes: &'static [u8]) -> Result<Self, BootfsError> {
-        let image = bootfs::Image::parse(bytes)?;
+        let signed = bootfs::Image::parse_signed(bytes, trusted_root_public_keys())?;
+        let image = signed.image;
         let init_component = image
             .entry_of_kind(EntryKind::InitComponent)
             .expect("a parsed image carries exactly one init-component entry");
@@ -93,6 +102,7 @@ impl BootPayload {
             }
         }
         Ok(Self {
+            digest: signed.digest,
             init: EmbeddedInit {
                 component: EmbeddedComponent::new(init_component.path(), init_component.data()),
                 argv0: init_argv0.path(),
@@ -146,6 +156,12 @@ impl BootPayload {
             unsafe { core::slice::from_raw_parts(module.address as *const u8, module.size) };
         Self::parse(bytes)
             .unwrap_or_else(|error| panic!("helios-bootfs module is not a valid payload: {error}"))
+    }
+
+    /// SHA-256 of the verified image body, the value its signature
+    /// commits to.
+    pub const fn digest(&self) -> Digest256 {
+        self.digest
     }
 
     /// The boot-time view the payload carries.
@@ -204,6 +220,75 @@ impl BootPayload {
                 modified_nanos: 0,
             },
         ]);
-        Self::parse(Box::leak(image.into_boxed_slice())).expect("test payload must parse")
+        Self::parse(Box::leak(
+            crate::wasmtime_adapter::cwasm::sign_bootfs_image_for_tests(image).into_boxed_slice(),
+        ))
+        .expect("test payload must parse")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wasmtime_adapter::cwasm::sign_bootfs_image_for_tests;
+
+    fn body() -> Vec<u8> {
+        bootfs::write_image(&[
+            bootfs::WriteEntry {
+                kind: EntryKind::InitComponent,
+                path: "init",
+                data: b"component",
+                modified_nanos: 0,
+            },
+            bootfs::WriteEntry {
+                kind: EntryKind::InitArgv0,
+                path: "init",
+                data: b"",
+                modified_nanos: 0,
+            },
+            bootfs::WriteEntry {
+                kind: EntryKind::File,
+                path: "bin/tool",
+                data: b"tool",
+                modified_nanos: 0,
+            },
+        ])
+    }
+
+    #[test]
+    fn signed_payload_parses_and_exposes_its_digest() {
+        let body = body();
+        let message = bootfs::signing_message(&body);
+        let signed = Box::leak(sign_bootfs_image_for_tests(body).into_boxed_slice());
+        let payload = BootPayload::parse(signed).expect("a payload signed by the root parses");
+        assert_eq!(
+            payload.digest()[..],
+            message[bootfs::SIGNATURE_DOMAIN.len()..]
+        );
+        assert_eq!(payload.embedded_init().argv0(), "init");
+        assert!(payload.boot_component("bin/tool").is_some());
+    }
+
+    #[test]
+    fn flipped_byte_is_refused_before_parsing() {
+        let mut signed = sign_bootfs_image_for_tests(body());
+        // A data byte: the shape stays valid, so only the signature
+        // can refuse it.
+        let last_data_byte = signed.len() - bootfs::SIGNATURE_FOOTER_BYTES - 1;
+        signed[last_data_byte] ^= 1;
+        let signed = Box::leak(signed.into_boxed_slice());
+        assert!(matches!(
+            BootPayload::parse(signed),
+            Err(BootfsError::SignatureMismatch)
+        ));
+    }
+
+    #[test]
+    fn unsigned_body_is_refused() {
+        let unsigned = Box::leak(body().into_boxed_slice());
+        assert!(matches!(
+            BootPayload::parse(unsigned),
+            Err(BootfsError::MissingSignature)
+        ));
     }
 }

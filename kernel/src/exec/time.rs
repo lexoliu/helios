@@ -226,9 +226,27 @@ mod tests {
 
         fn park_current(&self) {}
 
+        type WakeOnlyMask = ();
+
+        fn mask_to_wake_only(&self) {
+            panic!("this test platform never freezes")
+        }
+
+        fn park_wake_only(&self, _: &core::sync::atomic::AtomicU8, _: u8) {
+            panic!("this test platform never freezes")
+        }
+
         fn start_processor(&self, _: ProcessorId) {}
 
         fn wake_processor(&self, _: ProcessorId) {}
+
+        fn stop_current(&self) {
+            panic!("test CPU never stops a processor")
+        }
+
+        fn restart_processor(&self, _: ProcessorId) {
+            panic!("test CPU never restarts a processor")
+        }
 
         fn now(&self) -> Instant {
             Instant::new(self.ticks.load(Ordering::Acquire))
@@ -293,7 +311,7 @@ mod tests {
             i128::from(self.wall_clock.offset_nanos())
         }
 
-        fn record_console_text(&self, _: u64, _: &str) {}
+        fn record_console_text(&self, _: u64, _: Option<crate::InstanceId>, _: &str) {}
 
         fn root_entropy(&self) -> &crate::RootEntropy {
             panic!("the clock test state has no root entropy")
@@ -341,7 +359,7 @@ mod tests {
 
         fn record_profile_stack_nanos(&self, _: ProfileScope, _: String, _: u64) {}
 
-        fn record_profile_stack_parts_nanos(&self, _: ProfileScope, _: &str, _: &str, _: u64) {}
+        fn record_user_profile(&self, _: crate::InstanceId, _: &str, _: u64) {}
 
         fn record_perf_metric_parts(
             &self,

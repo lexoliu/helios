@@ -388,15 +388,15 @@ pub(super) async fn p1_wait_step<CpuImpl>(
 /// Descriptors backed by a kernel channel register a real waiter, and
 /// serial-backed stdin parks on the console's receive signal. Network
 /// sockets have no wakeup source, so they only set the re-probe flag.
-pub(super) fn p1_add_wait_target<CpuImpl, Net, HostFs>(
-    store: &Preview1ProgramStore<CpuImpl, Net, HostFs>,
+pub(super) fn p1_add_wait_target<CpuImpl, Net, StorageImpl>(
+    store: &Preview1ProgramStore<CpuImpl, Net, StorageImpl>,
     fd: i32,
     event_type: u8,
     wait: &mut P1WaitSet,
 ) where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     match store.descriptors.get(fd) {
         Some(Preview1Descriptor::PipeRead { reader, carry })
@@ -459,15 +459,15 @@ pub(super) fn p1_add_wait_target<CpuImpl, Net, HostFs>(
 
 /// Resolve a descriptor's readiness, consulting the network service when the
 /// descriptor is a socket and the console when it is serial-backed stdin.
-pub(super) async fn p1_descriptor_readiness<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn p1_descriptor_readiness<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     event_type: u8,
 ) -> Result<P1Readiness, i32>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     if event_type == P1_EVENTTYPE_FD_READ
         && matches!(
@@ -1140,6 +1140,7 @@ pub(super) fn preview1_cwd_from_authority(authority: &ProcessAuthority) -> Optio
             kind: FsNodeKind::Directory,
             flags: directory_authority_to_descriptor_flags(preopen.rights()),
             identity: None,
+            mount: None,
         },
     })
 }
@@ -1187,6 +1188,7 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
                 kind: FsNodeKind::Directory,
                 flags: directory_authority_to_descriptor_flags(preopen.rights()),
                 identity: None,
+                mount: None,
             };
             table.entries.push(Some(Preview1DescriptorEntry::new(
                 Preview1Descriptor::Preopen {
@@ -1897,10 +1899,4 @@ pub(super) fn p1_probe_descriptor<Net: ComponentHostNetwork>(
         (Some(_), _) => Err(p1::errno::INVAL),
         (None, _) => Err(p1::errno::BADF),
     }
-}
-
-pub(super) fn p1_descriptor_stat_from_host_metadata(
-    metadata: &crate::HostMetadata,
-) -> fs_types::DescriptorStat {
-    crate::wasmtime_adapter::wasi::descriptor_stat_from_host_metadata(metadata)
 }

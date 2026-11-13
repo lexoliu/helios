@@ -1,27 +1,43 @@
+//! The guest filesystem as every WASI surface sees it.
+//!
+//! The functions here are the one implementation of WASI filesystem
+//! semantics: descriptor rights, open flags, symbolic-link following and
+//! directory listing order. They resolve every path through the store's
+//! [`Namespace`], so the mount that owns a path decides which filesystem
+//! answers; no surface knows which filesystems exist. Preview3 below,
+//! preview2 (`preview2.rs`) and preview1 (`component_host::service`) call
+//! them and only translate types.
+
+use helios_hal::fs::{
+    FileSystem, FsError as VfsError, FsResult, Metadata, NodeKind, OpenFlags, WritePosition,
+};
 use pin_project_lite::pin_project;
 
-use crate::ComponentHostNetwork;
+use crate::{
+    ComponentHostNetwork, FileContents, Follow, HeldPath, MountHold, Namespace, Resolved,
+    object_identity,
+};
 
 use super::*;
 
-pub(super) struct ComponentFsProfile<CpuImpl, Net, HostFs>
+pub(super) struct ComponentFsProfile<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    pub(super) runtime_state: HostRuntimeState<CpuImpl, Net, HostFs>,
+    pub(super) runtime_state: HostRuntimeState<CpuImpl, Net, StorageImpl>,
     pub(super) cpu: CpuImpl,
     pub(super) started_ticks: u64,
 }
 
-pub(super) fn component_fs_profile<CpuImpl, Net, HostFs>(
-    store: &StoreData<CpuImpl, Net, HostFs>,
-) -> Option<ComponentFsProfile<CpuImpl, Net, HostFs>>
+pub(super) fn component_fs_profile<CpuImpl, Net, StorageImpl>(
+    store: &StoreData<CpuImpl, Net, StorageImpl>,
+) -> Option<ComponentFsProfile<CpuImpl, Net, StorageImpl>>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     store
         .runtime_state
@@ -33,13 +49,13 @@ where
         })
 }
 
-pub(super) fn record_component_fs_profile<CpuImpl, Net, HostFs>(
-    profile: Option<ComponentFsProfile<CpuImpl, Net, HostFs>>,
+pub(super) fn record_component_fs_profile<CpuImpl, Net, StorageImpl>(
+    profile: Option<ComponentFsProfile<CpuImpl, Net, StorageImpl>>,
     operation: &'static str,
 ) where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     if let Some(profile) = profile {
         profile.runtime_state.record_profile_stack_parts(
@@ -55,370 +71,771 @@ pub(super) fn record_component_fs_profile<CpuImpl, Net, HostFs>(
     }
 }
 
-/// What a node holds, and where it came from.
-///
-/// A file seeded from the boot payload holds [`crate::BootfsBytes`]; every
-/// write, truncate or creation stores [`FileContents::Written`], so a
-/// node that anyone has modified can no longer claim the payload's trust.
-/// Directories and symlinks hold `Written` bytes (empty, or the link
-/// target).
-#[derive(Clone, Debug)]
-pub(crate) enum FileContents {
-    Bootfs(crate::BootfsBytes),
-    Written(Bytes),
-}
-
-// Every instance seeds one node per bootfs entry, so carrying provenance
-// must not make a node larger than the plain `Bytes` it replaced.
-const _: () = assert!(
-    core::mem::size_of::<FileContents>() == core::mem::size_of::<Bytes>(),
-    "FileContents must stay the size of Bytes"
-);
-
-impl FileContents {
-    pub(crate) fn as_slice(&self) -> &[u8] {
-        match self {
-            Self::Bootfs(bytes) => bytes.as_slice(),
-            Self::Written(bytes) => bytes,
-        }
-    }
-
-    fn slice(&self, range: core::ops::Range<usize>) -> Bytes {
-        match self {
-            Self::Bootfs(bytes) => Bytes::from_static(&bytes.as_slice()[range]),
-            Self::Written(bytes) => bytes.slice(range),
-        }
-    }
-
-    fn into_bytes(self) -> Bytes {
-        match self {
-            Self::Bootfs(bytes) => bytes.to_bytes(),
-            Self::Written(bytes) => bytes,
-        }
-    }
-
-    const fn empty() -> Self {
-        Self::Written(Bytes::new())
-    }
-}
-
-#[derive(Clone, Debug)]
-pub(super) struct FsNode {
-    pub(super) path: String,
-    pub(super) kind: FsNodeKind,
-    pub(super) contents: FileContents,
-    pub(super) identity: ObjectIdentity,
-    pub(super) access_nanos: u64,
-    pub(super) modified_nanos: u64,
-    pub(super) status_nanos: u64,
-    pub(super) readonly: bool,
-    pub(super) link_count: u64,
-}
-
-#[derive(Debug)]
-pub(super) struct DebugFileSystemState {
-    pub(super) nodes: Vec<FsNode>,
-    pub(super) path_index: HashMap<String, usize>,
-    pub(super) next_inode: u64,
-}
-
-#[derive(Clone)]
-pub(crate) struct DebugFileSystemSnapshot {
-    pub(super) inner: Arc<Mutex<DebugFileSystemState>>,
-}
-
-impl core::fmt::Debug for DebugFileSystemSnapshot {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("DebugFileSystemSnapshot")
-            .finish_non_exhaustive()
-    }
-}
-
-impl FsNode {
-    pub(super) fn new(
-        path: String,
-        kind: FsNodeKind,
-        contents: FileContents,
-        identity: ObjectIdentity,
-        timestamp_nanos: u64,
-        readonly: bool,
-    ) -> Self {
-        Self {
-            path,
-            kind,
-            contents,
-            identity,
-            access_nanos: timestamp_nanos,
-            modified_nanos: timestamp_nanos,
-            status_nanos: timestamp_nanos,
-            readonly,
-            link_count: 1,
-        }
-    }
-
-    pub(super) fn touch_status(&mut self, now_nanos: u64) {
-        self.status_nanos = now_nanos;
-    }
-
-    pub(super) fn touch_modified(&mut self, now_nanos: u64) {
-        self.modified_nanos = now_nanos;
-        self.status_nanos = now_nanos;
-    }
-
-    pub(super) fn set_times(
-        &mut self,
-        access_nanos: Option<u64>,
-        modified_nanos: Option<u64>,
-        status_nanos: u64,
-    ) {
-        if let Some(access_nanos) = access_nanos {
-            self.access_nanos = access_nanos;
-        }
-        if let Some(modified_nanos) = modified_nanos {
-            self.modified_nanos = modified_nanos;
-        }
-        if access_nanos.is_some() || modified_nanos.is_some() {
-            self.status_nanos = status_nanos;
-        }
-    }
-}
-
-impl DebugFileSystemState {
-    pub(super) fn with_root() -> Self {
-        let mut state = Self {
-            nodes: Vec::new(),
-            path_index: HashMap::new(),
-            next_inode: 2,
-        };
-        state.insert_node(FsNode::new(
-            String::from("/"),
-            FsNodeKind::Directory,
-            FileContents::empty(),
-            ObjectIdentity::new(AuthorityDomain::GUEST_BOOTFS, 1),
-            0,
-            false,
-        ));
-        state
-    }
-
-    pub(super) fn insert_node(&mut self, node: FsNode) {
-        let path = node.path.clone();
-        let index = self.nodes.len();
-        assert!(
-            self.path_index.insert(path.clone(), index).is_none(),
-            "debug filesystem path {path} already exists"
-        );
-        self.nodes.push(node);
-    }
-
-    pub(super) fn node_index(&self, path: &str) -> Option<usize> {
-        self.path_index.get(path).copied()
-    }
-
-    pub(super) fn node(&self, path: &str) -> Option<&FsNode> {
-        self.node_index(path).map(|index| &self.nodes[index])
-    }
-
-    pub(super) fn node_mut(&mut self, path: &str) -> Option<&mut FsNode> {
-        let index = self.node_index(path)?;
-        Some(&mut self.nodes[index])
-    }
-
-    pub(super) fn remove_node(&mut self, path: &str) -> Option<FsNode> {
-        let index = self.path_index.remove(path)?;
-        let removed = self.nodes.swap_remove(index);
-        if index < self.nodes.len() {
-            let moved_path = self.nodes[index].path.clone();
-            let previous = self.path_index.insert(moved_path.clone(), index);
-            assert!(
-                previous.is_some(),
-                "debug filesystem index lost moved path {moved_path}"
-            );
-        }
-        Some(removed)
-    }
-
-    pub(super) fn retain_nodes(&mut self, mut keep: impl FnMut(&FsNode) -> bool) {
-        self.nodes.retain(|node| keep(node));
-        self.rebuild_path_index();
-    }
-
-    pub(super) fn rebuild_path_index(&mut self) {
-        self.path_index.clear();
-        for (index, node) in self.nodes.iter().enumerate() {
-            assert!(
-                self.path_index.insert(node.path.clone(), index).is_none(),
-                "debug filesystem duplicate path {}",
-                node.path
-            );
-        }
-    }
-}
-
+/// An open guest descriptor: the guest path it names, what it named when
+/// it was opened, and the rights it was opened with.
 #[derive(Clone)]
 pub struct FsDescriptor {
     pub(crate) path: String,
     pub(crate) kind: FsNodeKind,
     pub(crate) flags: fs_types::DescriptorFlags,
     pub(crate) identity: Option<ObjectIdentity>,
+    /// The hold on the mount `open-at` resolved this through, which keeps
+    /// that mount from being unmounted while the descriptor lives. `None`
+    /// for a preopen or a working directory, which the process's authority
+    /// names rather than an open, and for the namespace's root.
+    #[expect(
+        dead_code,
+        reason = "held for its effect: a live share is what makes unmount busy"
+    )]
+    pub(crate) mount: Option<MountHold>,
 }
 
-pub(super) fn embedded_absolute_path(relative: &str) -> String {
-    let mut path = String::with_capacity(relative.len() + 1);
-    path.push('/');
-    path.push_str(relative);
-    path
-}
+/// What every filesystem operation here resolves with.
+pub(crate) type FsOpResult<T> = core::result::Result<T, fs_types::ErrorCode>;
 
-pub(super) fn join_embedded_child(parent: &str, child: &str) -> String {
-    let slash = usize::from(parent != "/");
-    let mut path = String::with_capacity(parent.len() + slash + child.len());
-    path.push_str(parent);
-    if parent != "/" {
-        path.push('/');
+pub(crate) fn fs_error_code(error: VfsError) -> fs_types::ErrorCode {
+    match error {
+        VfsError::NoEntry => fs_types::ErrorCode::NoEntry,
+        VfsError::Exists => fs_types::ErrorCode::Exist,
+        VfsError::NotDirectory => fs_types::ErrorCode::NotDirectory,
+        VfsError::IsDirectory => fs_types::ErrorCode::IsDirectory,
+        VfsError::NotEmpty => fs_types::ErrorCode::NotEmpty,
+        VfsError::ReadOnly => fs_types::ErrorCode::ReadOnly,
+        VfsError::NotPermitted => fs_types::ErrorCode::NotPermitted,
+        VfsError::CrossDevice => fs_types::ErrorCode::CrossDevice,
+        VfsError::Busy => fs_types::ErrorCode::Busy,
+        VfsError::Loop => fs_types::ErrorCode::Loop,
+        VfsError::Invalid => fs_types::ErrorCode::Invalid,
+        VfsError::Overflow => fs_types::ErrorCode::Overflow,
+        VfsError::IllegalByteSequence => fs_types::ErrorCode::IllegalByteSequence,
+        VfsError::NameTooLong => fs_types::ErrorCode::NameTooLong,
+        VfsError::Unsupported => fs_types::ErrorCode::Unsupported,
+        VfsError::Io => fs_types::ErrorCode::Io,
     }
-    path.push_str(child);
-    path
 }
 
-pub(super) fn append_path_suffix(path: &str, suffix: &str) -> String {
-    let mut combined = String::with_capacity(path.len() + suffix.len());
-    combined.push_str(path);
-    combined.push_str(suffix);
-    combined
-}
-
-pub(crate) fn resolve_symlink_payload(
-    link_path: &str,
-    payload: &str,
-) -> core::result::Result<String, fs_types::ErrorCode> {
-    if payload.is_empty() || payload.starts_with('/') {
-        return Err(fs_types::ErrorCode::NotPermitted);
+pub(crate) fn node_kind(kind: NodeKind) -> FsNodeKind {
+    match kind {
+        NodeKind::Directory => FsNodeKind::Directory,
+        NodeKind::File => FsNodeKind::File,
+        NodeKind::Symlink => FsNodeKind::Symlink,
     }
-    if payload.split('/').any(|segment| segment == "..") {
-        return Err(fs_types::ErrorCode::NotPermitted);
+}
+
+pub(crate) fn descriptor_type_from_node_kind(kind: FsNodeKind) -> fs_types::DescriptorType {
+    match kind {
+        FsNodeKind::Directory => fs_types::DescriptorType::Directory,
+        FsNodeKind::File => fs_types::DescriptorType::RegularFile,
+        FsNodeKind::Symlink => fs_types::DescriptorType::SymbolicLink,
     }
-    let parent = crate::parent_path(link_path);
-    crate::resolve_child_path(parent, payload).map_err(map_component_fs_path_error)
 }
 
-pub(crate) struct DebugFileSystem<State, HostFsService> {
-    pub(super) snapshot: DebugFileSystemSnapshot,
-    pub(super) runtime_state: State,
-    pub(super) _host_fs: PhantomData<HostFsService>,
+pub(crate) fn descriptor_stat(metadata: &Metadata) -> fs_types::DescriptorStat {
+    fs_types::DescriptorStat {
+        type_: descriptor_type_from_node_kind(node_kind(metadata.kind)),
+        link_count: metadata.link_count,
+        size: metadata.size,
+        data_access_timestamp: Some(system_time_from_nanos(metadata.access_nanos)),
+        data_modification_timestamp: Some(system_time_from_nanos(metadata.modified_nanos)),
+        status_change_timestamp: Some(system_time_from_nanos(metadata.status_nanos)),
+    }
 }
 
-#[derive(Clone, Copy)]
-pub(super) enum FileWriteMode {
-    At(usize),
-    Append,
+pub(crate) fn metadata_hash_value(
+    identity: ObjectIdentity,
+    upper_entropy: u64,
+) -> fs_types::MetadataHashValue {
+    fs_types::MetadataHashValue {
+        lower: identity.local(),
+        upper: identity.domain().raw() ^ upper_entropy,
+    }
 }
 
-pub(super) enum FsWriteOffset {
-    At(usize),
-    Append,
+/// A hash that changes when the object's identity, size or modification
+/// time does.
+pub(crate) fn metadata_hash(metadata: &Metadata) -> fs_types::MetadataHashValue {
+    metadata_hash_value(
+        object_identity(metadata),
+        metadata.modified_nanos ^ metadata.size,
+    )
 }
 
-/// A host-share file a stream is bound to.
+fn resolve<'a, StorageImpl>(
+    namespace: &'a Namespace<StorageImpl>,
+    absolute: &'a str,
+) -> FsOpResult<Resolved<'a, StorageImpl>>
+where
+    StorageImpl: crate::Storage,
+{
+    namespace.resolve(absolute).map_err(fs_error_code)
+}
+
+pub(crate) fn child_path(base: &FsDescriptor, path: &str) -> FsOpResult<String> {
+    crate::resolve_child_path(&base.path, path).map_err(map_component_fs_path_error)
+}
+
+/// Opens `path` below `base` as WASI `open-at` does.
 ///
-/// Streams carry their own service handle and host-relative path so each
-/// chunk can be driven from a `poll` context without re-entering the store.
-#[derive(Clone)]
-pub(crate) struct HostFileStreamTarget<HostFs>
-where
-    HostFs: crate::HostFileSystem,
-{
-    pub(crate) service: HostFs,
-    pub(crate) path: String,
-}
-
-impl<HostFs> HostFileStreamTarget<HostFs>
-where
-    HostFs: crate::HostFileSystem,
-{
-    /// Binds a descriptor to the host share when its path lives under the
-    /// host mount, otherwise reports that the embedded filesystem owns it.
-    pub(crate) fn for_descriptor<CpuImpl, Net>(
-        store: &StoreData<CpuImpl, Net, HostFs>,
-        descriptor: &FsDescriptor,
-    ) -> core::result::Result<Option<Self>, fs_types::ErrorCode>
-    where
-        CpuImpl: Cpu + Clone,
-        Net: ComponentHostNetwork,
-    {
-        let Some(path) = crate::guest_host_share_path(&descriptor.path) else {
-            return Ok(None);
-        };
-        Ok(Some(Self {
-            service: store.filesystem().host_service()?,
-            path: path.to_owned(),
-        }))
-    }
-}
-
-/// What one bounded host read resolves with.
-type HostReadResult = core::result::Result<Vec<u8>, fs_types::ErrorCode>;
-
-/// What one host write resolves with: the number of bytes handed over.
-type HostWriteResult = core::result::Result<usize, fs_types::ErrorCode>;
-
-/// One bounded 9p read, as a future the producer can own by value.
+/// The lookup itself needs `base`'s `read`, which the signature proves
+/// before anything is resolved.
 ///
-/// A free `async fn` rather than a method so its future has a type the
-/// producer can name through a `Fut` parameter: the target it reads
-/// through is owned by the future, so it borrows nothing across a poll.
-async fn read_host_file<HostFs>(
-    host: HostFileStreamTarget<HostFs>,
-    offset: u64,
-    max_bytes: u32,
-) -> HostReadResult
+/// A descriptor may be opened with any rights `base` holds, whatever the
+/// filesystem would let it do: a file on a read-only filesystem opens for
+/// writing, and the write itself is what fails. Creating changes the
+/// directory, so it needs `base`'s `mutate-directory` and a writable
+/// mount; truncating also changes the file's data, so it needs `base`'s
+/// `write` as well. Both rights are demanded whether or not the file
+/// exists, and before the path is resolved: a refused open reaches no
+/// filesystem and leaves it as it was.
+pub(crate) async fn open_at<StorageImpl>(
+    namespace: &Namespace<StorageImpl>,
+    base: Granted<'_, Directory, Read>,
+    path_flags: fs_types::PathFlags,
+    path: &str,
+    open_flags: fs_types::OpenFlags,
+    requested: fs_types::DescriptorFlags,
+    now: u64,
+) -> FsOpResult<FsDescriptor>
 where
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    host.service
-        .read_file_range(&host.path, offset, max_bytes)
+    let base = base.descriptor();
+    // Every right the flags need is proved before the path is resolved, so a
+    // refusal reaches no filesystem, a host share included, and holds
+    // whether or not the file exists.
+    let truncate = open_flags
+        .contains(fs_types::OpenFlags::TRUNCATE)
+        .then(|| Ok::<_, fs_types::ErrorCode>((base.grant()?, base.grant()?)))
+        .transpose()?;
+    let create = open_flags
+        .contains(fs_types::OpenFlags::CREATE)
+        .then(|| base.grant())
+        .transpose()?;
+    let absolute = child_path(base, path)?;
+    let resolved = namespace
+        .resolve_following(&absolute, follow_within(base, path_flags))
         .await
-        .map_err(map_host_fs_error)
+        .map_err(fs_error_code)?;
+    let fs = resolved.fs();
+    let (metadata, flags) = match fs.stat(resolved.path()).await {
+        Ok(existing) => {
+            if open_flags.contains(fs_types::OpenFlags::EXCLUSIVE)
+                && open_flags.contains(fs_types::OpenFlags::CREATE)
+            {
+                return Err(fs_types::ErrorCode::Exist);
+            }
+            let directory = existing.kind == NodeKind::Directory;
+            if open_flags.contains(fs_types::OpenFlags::DIRECTORY) && !directory {
+                return Err(fs_types::ErrorCode::NotDirectory);
+            }
+            if !open_flags.contains(fs_types::OpenFlags::DIRECTORY) && directory {
+                return Err(fs_types::ErrorCode::IsDirectory);
+            }
+            let flags =
+                effective_open_descriptor_flags(base.flags, requested, node_kind(existing.kind))?;
+            match truncate {
+                None => (existing, flags),
+                Some(rights) => {
+                    if existing.kind != NodeKind::File {
+                        return Err(fs_types::ErrorCode::IsDirectory);
+                    }
+                    (truncate_file(&resolved, rights, now).await?, flags)
+                }
+            }
+        }
+        Err(VfsError::NoEntry) => {
+            let Some(mutate) = create else {
+                return Err(fs_types::ErrorCode::NoEntry);
+            };
+            if open_flags.contains(fs_types::OpenFlags::DIRECTORY) {
+                return Err(fs_types::ErrorCode::Unsupported);
+            }
+            let flags = effective_open_descriptor_flags(base.flags, requested, FsNodeKind::File)?;
+            (create_file(&resolved, mutate, now).await?, flags)
+        }
+        Err(error) => return Err(fs_error_code(error)),
+    };
+    let kind = node_kind(metadata.kind);
+    Ok(FsDescriptor {
+        path: String::from(resolved.absolute()),
+        kind,
+        flags,
+        identity: Some(object_identity(&metadata)),
+        mount: resolved.hold(),
+    })
 }
 
-/// One 9p write, as a future the consumer can own by value.
-///
-/// Positional writes carry the stream offset; append writes resolve the
-/// host's end of file inside the client so a concurrently grown file is
-/// never overwritten. Both resolve with the number of bytes handed over.
-async fn write_host_file<HostFs>(
-    host: HostFileStreamTarget<HostFs>,
-    mode: FileWriteMode,
-    bytes: Vec<u8>,
-) -> HostWriteResult
+/// Creates the file `resolved` names, in the directory `_mutate` proves the
+/// guest may change.
+async fn create_file<StorageImpl>(
+    resolved: &Resolved<'_, StorageImpl>,
+    _mutate: Granted<'_, Directory, Mutate>,
+    now: u64,
+) -> FsOpResult<Metadata>
 where
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    let written = bytes.len();
-    match mode {
-        FileWriteMode::At(offset) => {
-            let offset = u64::try_from(offset).expect("file offset overflowed u64");
-            host.service
-                .write_file(&host.path, offset, &bytes)
-                .await
-                .map_err(map_host_fs_error)?;
-        }
-        FileWriteMode::Append => {
-            host.service
-                .append_file(&host.path, &bytes)
-                .await
-                .map_err(map_host_fs_error)?;
-        }
-    }
-    Ok(written)
+    resolved
+        .writable()
+        .map_err(fs_error_code)?
+        .open(resolved.path(), OpenFlags::CREATE, now)
+        .await
+        .map_err(fs_error_code)
 }
 
-/// Answers the `future<result>` a `read-via-stream`, `write-via-stream`
-/// or `append-via-stream` handed the guest, once. A dropped receiver
-/// means the guest stopped caring, which is not this side's problem.
+/// Truncates the file `resolved` names: the guest may change its directory
+/// and write through the same base.
+async fn truncate_file<StorageImpl>(
+    resolved: &Resolved<'_, StorageImpl>,
+    _rights: (
+        Granted<'_, Directory, Mutate>,
+        Granted<'_, Directory, Write>,
+    ),
+    now: u64,
+) -> FsOpResult<Metadata>
+where
+    StorageImpl: crate::Storage,
+{
+    resolved
+        .writable()
+        .map_err(fs_error_code)?
+        .open(resolved.path(), OpenFlags::TRUNCATE, now)
+        .await
+        .map_err(fs_error_code)
+}
+
+/// How a path below `base` follows a final symbolic link: when the guest
+/// asks it to, and then never out of `base`.
+pub(crate) fn follow_within(base: &FsDescriptor, path_flags: fs_types::PathFlags) -> Follow<'_> {
+    if path_flags.contains(fs_types::PathFlags::SYMLINK_FOLLOW) {
+        Follow::Within(&base.path)
+    } else {
+        Follow::No
+    }
+}
+
+/// Describes the object `absolute` names, following a final symbolic link
+/// as `follow` says.
+pub(crate) async fn stat_path<StorageImpl>(
+    namespace: &Namespace<StorageImpl>,
+    absolute: &str,
+    follow: Follow<'_>,
+) -> FsOpResult<Metadata>
+where
+    StorageImpl: crate::Storage,
+{
+    namespace
+        .stat(absolute, follow)
+        .await
+        .map_err(fs_error_code)
+}
+
+/// The metadata of `path` below `base`, which must be readable.
+pub(crate) async fn stat_at<StorageImpl>(
+    namespace: &Namespace<StorageImpl>,
+    base: Granted<'_, Directory, Read>,
+    path_flags: fs_types::PathFlags,
+    path: &str,
+) -> FsOpResult<Metadata>
+where
+    StorageImpl: crate::Storage,
+{
+    let base = base.descriptor();
+    let absolute = child_path(base, path)?;
+    stat_path(namespace, &absolute, follow_within(base, path_flags)).await
+}
+
+/// The path below `base` that `path` names, refused when it names `base`
+/// itself (an empty path, `.`, or one that climbs back to it): the
+/// directory a descriptor stands for is never removed, renamed, or
+/// replaced through that descriptor.
+fn child_below(base: &FsDescriptor, path: &str) -> FsOpResult<String> {
+    let absolute = child_path(base, path)?;
+    if absolute == base.path {
+        return Err(fs_types::ErrorCode::Invalid);
+    }
+    Ok(absolute)
+}
+
+/// Reads at most `max_bytes` at `offset`; an empty result is end of file.
+pub(crate) async fn read<StorageImpl>(
+    namespace: &Namespace<StorageImpl>,
+    file: Granted<'_, RegularFile, Read>,
+    offset: u64,
+    max_bytes: usize,
+) -> FsOpResult<Bytes>
+where
+    StorageImpl: crate::Storage,
+{
+    read_resolved(
+        &resolve(namespace, &file.descriptor().path)?,
+        offset,
+        max_bytes,
+    )
+    .await
+}
+
+/// The file a stream reads across polls.
+pub(crate) fn read_stream_target<StorageImpl>(
+    namespace: &Namespace<StorageImpl>,
+    file: Granted<'_, RegularFile, Read>,
+) -> FsOpResult<HeldPath<StorageImpl>>
+where
+    StorageImpl: crate::Storage,
+{
+    resolve(namespace, &file.descriptor().path).map(|resolved| resolved.held())
+}
+
+/// The file a stream writes across polls.
+pub(crate) fn write_stream_target<StorageImpl>(
+    namespace: &Namespace<StorageImpl>,
+    file: Granted<'_, RegularFile, Write>,
+) -> FsOpResult<HeldPath<StorageImpl>>
+where
+    StorageImpl: crate::Storage,
+{
+    resolve(namespace, &file.descriptor().path).map(|resolved| resolved.held())
+}
+
+/// One positional read through `resolved`.
+pub(crate) async fn read_resolved<StorageImpl>(
+    resolved: &Resolved<'_, StorageImpl>,
+    offset: u64,
+    max_bytes: usize,
+) -> FsOpResult<Bytes>
+where
+    StorageImpl: crate::Storage,
+{
+    resolved
+        .fs()
+        .read_at(resolved.path(), offset, max_bytes)
+        .await
+        .map_err(fs_error_code)
+}
+
+/// One positional read through a held path, for a stream that must own
+/// its read across polls.
+pub(crate) async fn read_held<StorageImpl>(
+    held: HeldPath<StorageImpl>,
+    offset: u64,
+    max_bytes: usize,
+) -> FsOpResult<Bytes>
+where
+    StorageImpl: crate::Storage,
+{
+    read_resolved(&held.resolved(), offset, max_bytes).await
+}
+
+/// Writes `bytes` to the file `descriptor` names, and resolves with the
+/// offset just past them: where a sequential writer continues.
+pub(crate) async fn write<StorageImpl>(
+    namespace: &Namespace<StorageImpl>,
+    file: Granted<'_, RegularFile, Write>,
+    position: WritePosition,
+    bytes: &[u8],
+    now: u64,
+) -> FsOpResult<u64>
+where
+    StorageImpl: crate::Storage,
+{
+    write_resolved(&writable_file(namespace, file)?, position, bytes, now).await
+}
+
+/// The file `file` names, resolved for a write.
+pub(crate) fn writable_file<'a, StorageImpl>(
+    namespace: &'a Namespace<StorageImpl>,
+    file: Granted<'a, RegularFile, Write>,
+) -> FsOpResult<Resolved<'a, StorageImpl>>
+where
+    StorageImpl: crate::Storage,
+{
+    resolve(namespace, &file.descriptor().path)
+}
+
+/// Writes `bytes` through `resolved`, and resolves with the offset just
+/// past them.
+pub(crate) async fn write_resolved<StorageImpl>(
+    resolved: &Resolved<'_, StorageImpl>,
+    position: WritePosition,
+    bytes: &[u8],
+    now: u64,
+) -> FsOpResult<u64>
+where
+    StorageImpl: crate::Storage,
+{
+    write_resolved_with(resolved, position, bytes.len(), now, |at, destination| {
+        destination.copy_from_slice(&bytes[at..at + destination.len()]);
+    })
+    .await
+}
+
+/// Writes `len` bytes that `source` copies straight into the
+/// filesystem's destination ([`helios_hal::fs::write_with`]), and
+/// resolves with the offset just past them. An append lands at the end of
+/// the file as the filesystem sees it when the write arrives, so its end
+/// is the filesystem's answer, never the caller's idea of where the file
+/// ended.
+///
+/// `source(at, destination)` fills `destination` with the write's bytes
+/// from offset `at`. It runs between awaits, never across one, once per
+/// destination region; what it reads must stay valid for the whole call,
+/// which guest memory does for the host call that holds it.
+pub(crate) async fn write_resolved_with<StorageImpl, S>(
+    resolved: &Resolved<'_, StorageImpl>,
+    position: WritePosition,
+    len: usize,
+    now: u64,
+    source: S,
+) -> FsOpResult<u64>
+where
+    StorageImpl: crate::Storage,
+    S: FnMut(usize, &mut [u8]),
+{
+    let fs = resolved.writable().map_err(fs_error_code)?;
+    let landed = helios_hal::fs::write_with(fs, resolved.path(), position, len, now, source)
+        .await
+        .map_err(fs_error_code)?;
+    landed
+        .checked_add(len as u64)
+        .ok_or(fs_types::ErrorCode::Overflow)
+}
+
+pub(crate) async fn set_size<StorageImpl>(
+    namespace: &Namespace<StorageImpl>,
+    file: Granted<'_, RegularFile, Write>,
+    size: u64,
+    now: u64,
+) -> FsOpResult<()>
+where
+    StorageImpl: crate::Storage,
+{
+    let resolved = resolve(namespace, &file.descriptor().path)?;
+    resolved
+        .writable()
+        .map_err(fs_error_code)?
+        .set_size(resolved.path(), size, now)
+        .await
+        .map_err(fs_error_code)
+}
+
+/// Sets the times of the object `target` names; `None` leaves one alone.
+pub(crate) async fn set_times<StorageImpl>(
+    namespace: &Namespace<StorageImpl>,
+    target: Granted<'_, AnyKind, Touch>,
+    access_nanos: Option<u64>,
+    modified_nanos: Option<u64>,
+    now: u64,
+) -> FsOpResult<()>
+where
+    StorageImpl: crate::Storage,
+{
+    set_times_of(
+        namespace,
+        &target.descriptor().path,
+        access_nanos,
+        modified_nanos,
+        now,
+    )
+    .await
+}
+
+/// Sets the times of the object at `path` below `base`; `None` leaves one
+/// alone.
+pub(crate) async fn set_times_at<StorageImpl>(
+    namespace: &Namespace<StorageImpl>,
+    base: Granted<'_, Directory, Retime>,
+    path: &str,
+    access_nanos: Option<u64>,
+    modified_nanos: Option<u64>,
+    now: u64,
+) -> FsOpResult<()>
+where
+    StorageImpl: crate::Storage,
+{
+    let absolute = child_path(base.descriptor(), path)?;
+    set_times_of(namespace, &absolute, access_nanos, modified_nanos, now).await
+}
+
+async fn set_times_of<StorageImpl>(
+    namespace: &Namespace<StorageImpl>,
+    absolute: &str,
+    access_nanos: Option<u64>,
+    modified_nanos: Option<u64>,
+    now: u64,
+) -> FsOpResult<()>
+where
+    StorageImpl: crate::Storage,
+{
+    let resolved = resolve(namespace, absolute)?;
+    resolved
+        .writable()
+        .map_err(fs_error_code)?
+        .set_times(resolved.path(), access_nanos, modified_nanos, now)
+        .await
+        .map_err(fs_error_code)
+}
+
+/// Every entry of the directory `descriptor` names, directories first and
+/// each group by name, with the mount points inside it.
+pub(crate) async fn read_directory<StorageImpl>(
+    namespace: &Namespace<StorageImpl>,
+    directory: Granted<'_, Directory, Read>,
+) -> FsOpResult<Vec<fs_types::DirectoryEntry>>
+where
+    StorageImpl: crate::Storage,
+{
+    let mut entries: Vec<fs_types::DirectoryEntry> = namespace
+        .list(&directory.descriptor().path)
+        .await
+        .map_err(fs_error_code)?
+        .into_iter()
+        .map(|entry| fs_types::DirectoryEntry {
+            type_: descriptor_type_from_node_kind(node_kind(entry.kind)),
+            name: entry.name,
+        })
+        .collect();
+    entries.sort_by(|left, right| {
+        is_dir_first(left.type_.clone())
+            .cmp(&is_dir_first(right.type_.clone()))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    Ok(entries)
+}
+
+pub(crate) async fn create_directory_at<StorageImpl>(
+    namespace: &Namespace<StorageImpl>,
+    base: Granted<'_, Directory, Mutate>,
+    path: &str,
+    now: u64,
+) -> FsOpResult<()>
+where
+    StorageImpl: crate::Storage,
+{
+    let absolute = child_path(base.descriptor(), path)?;
+    let resolved = resolve(namespace, &absolute)?;
+    if resolved.is_mount_root() {
+        return Err(fs_types::ErrorCode::Exist);
+    }
+    resolved
+        .writable()
+        .map_err(fs_error_code)?
+        .create_directory(resolved.path(), now)
+        .await
+        .map_err(fs_error_code)
+}
+
+pub(crate) async fn remove_directory_at<StorageImpl>(
+    namespace: &Namespace<StorageImpl>,
+    base: Granted<'_, Directory, Mutate>,
+    path: &str,
+) -> FsOpResult<()>
+where
+    StorageImpl: crate::Storage,
+{
+    let absolute = child_below(base.descriptor(), path)?;
+    namespace
+        .remove_directory(&absolute)
+        .await
+        .map_err(fs_error_code)
+}
+
+pub(crate) async fn unlink_file_at<StorageImpl>(
+    namespace: &Namespace<StorageImpl>,
+    base: Granted<'_, Directory, Mutate>,
+    path: &str,
+) -> FsOpResult<()>
+where
+    StorageImpl: crate::Storage,
+{
+    let absolute = child_below(base.descriptor(), path)?;
+    let resolved = resolve(namespace, &absolute)?;
+    if resolved.is_mount_root() {
+        return Err(fs_types::ErrorCode::IsDirectory);
+    }
+    resolved
+        .writable()
+        .map_err(fs_error_code)?
+        .unlink(resolved.path())
+        .await
+        .map_err(fs_error_code)
+}
+
+/// Renames within one mount; across two, `cross-device`. A rename is a link
+/// that also removes the source entry, so it follows the link's rule.
+pub(crate) async fn rename_at<StorageImpl>(
+    namespace: &Namespace<StorageImpl>,
+    rename: RenameGrant<'_, '_>,
+    source_path: &str,
+    destination_path: &str,
+    now: u64,
+) -> FsOpResult<()>
+where
+    StorageImpl: crate::Storage,
+{
+    let source = child_below(rename.source(), source_path)?;
+    let destination = child_below(rename.destination(), destination_path)?;
+    namespace
+        .rename(&source, &destination, now)
+        .await
+        .map_err(fs_error_code)
+}
+
+/// Links within one mount; across two, `cross-device`.
+pub(crate) async fn link_at<StorageImpl>(
+    namespace: &Namespace<StorageImpl>,
+    link: AliasGrant<'_, '_>,
+    source_path: &str,
+    destination_path: &str,
+    now: u64,
+) -> FsOpResult<()>
+where
+    StorageImpl: crate::Storage,
+{
+    let source = child_path(link.source(), source_path)?;
+    let destination = child_path(link.destination(), destination_path)?;
+    namespace
+        .link(&source, &destination, now)
+        .await
+        .map_err(fs_error_code)
+}
+
+/// Creates a symbolic link at `path` below `base` whose target text is
+/// `target`. The target must name something inside the link's directory.
+pub(crate) async fn symlink_at<StorageImpl>(
+    namespace: &Namespace<StorageImpl>,
+    base: Granted<'_, Directory, Mutate>,
+    target: &str,
+    path: &str,
+    now: u64,
+) -> FsOpResult<()>
+where
+    StorageImpl: crate::Storage,
+{
+    let absolute = child_below(base.descriptor(), path)?;
+    crate::symlink_target(&absolute, target).map_err(fs_error_code)?;
+    let resolved = resolve(namespace, &absolute)?;
+    resolved
+        .writable()
+        .map_err(fs_error_code)?
+        .symlink(target, resolved.path(), now)
+        .await
+        .map_err(fs_error_code)
+}
+
+/// The target text of the symbolic link at `path` below `base`, refused
+/// when it would name something outside the link's directory.
+pub(crate) async fn readlink_at<StorageImpl>(
+    namespace: &Namespace<StorageImpl>,
+    base: Granted<'_, Directory, Read>,
+    path: &str,
+) -> FsOpResult<String>
+where
+    StorageImpl: crate::Storage,
+{
+    let absolute = child_path(base.descriptor(), path)?;
+    let resolved = resolve(namespace, &absolute)?;
+    let target = resolved
+        .fs()
+        .read_link(resolved.path())
+        .await
+        .map_err(fs_error_code)?;
+    crate::symlink_target(resolved.absolute(), &target).map_err(fs_error_code)?;
+    Ok(target)
+}
+
+/// Makes the descriptor's object durable: its data, and its metadata
+/// unless `data_only`.
+pub(crate) async fn sync<StorageImpl>(
+    namespace: &Namespace<StorageImpl>,
+    descriptor: &FsDescriptor,
+    data_only: bool,
+) -> FsOpResult<()>
+where
+    StorageImpl: crate::Storage,
+{
+    let resolved = resolve(namespace, &descriptor.path)?;
+    let fs = resolved.fs();
+    if data_only {
+        fs.sync_data(resolved.path()).await
+    } else {
+        fs.sync(resolved.path()).await
+    }
+    .map_err(fs_error_code)
+}
+
+/// Reads the whole of the program file `absolute` names, typed by the
+/// layer that produced its bytes: only the boot image's own bytes may
+/// skip signature verification (#483).
+///
+/// `floor` is the directory whose grant admits the load
+/// ([`crate::ProcessAuthority::program_load_floor`]); a symbolic link
+/// that leads out of it is refused. The filesystem's own error comes back
+/// untranslated: the caller decides what each kind means to its surface.
+pub(crate) async fn read_program_file<StorageImpl>(
+    namespace: &Namespace<StorageImpl>,
+    absolute: &str,
+    floor: &str,
+) -> FsResult<FileContents>
+where
+    StorageImpl: crate::Storage,
+{
+    let resolved = namespace
+        .resolve_following(absolute, Follow::Within(floor))
+        .await?;
+    resolved.read_whole().await
+}
+
+/// Creates or replaces the file `absolute` names with `bytes`.
+pub(crate) async fn write_program_file<StorageImpl>(
+    namespace: &Namespace<StorageImpl>,
+    absolute: &str,
+    bytes: &[u8],
+    now: u64,
+) -> FsOpResult<()>
+where
+    StorageImpl: crate::Storage,
+{
+    let resolved = resolve(namespace, absolute)?;
+    let fs = resolved.writable().map_err(fs_error_code)?;
+    fs.open(
+        resolved.path(),
+        OpenFlags::CREATE | OpenFlags::TRUNCATE,
+        now,
+    )
+    .await
+    .map_err(fs_error_code)?;
+    write_resolved(&resolved, WritePosition::At(0), bytes, now)
+        .await
+        .map(drop)
+}
+
+/// What one bounded read resolves with.
+type ChunkReadResult = FsOpResult<Bytes>;
+
+/// What one write resolves with: the number of bytes handed over.
+type ChunkWriteResult = FsOpResult<usize>;
+
+/// One write of a stream's batch, as a future the consumer owns by value.
+async fn write_chunk<StorageImpl>(
+    held: HeldPath<StorageImpl>,
+    mode: WritePosition,
+    bytes: Vec<u8>,
+    now: u64,
+) -> ChunkWriteResult
+where
+    StorageImpl: crate::Storage,
+{
+    write_resolved(&held.resolved(), mode, &bytes, now).await?;
+    Ok(bytes.len())
+}
+
+/// Answers the `future<result>` a `read-via-stream`, `write-via-stream`,
+/// `append-via-stream` or `read-directory` handed the guest, once. A
+/// dropped receiver means the guest stopped caring, which is not this
+/// side's problem.
 fn complete_file_transfer(
-    result: &mut Option<oneshot::Sender<core::result::Result<(), fs_types::ErrorCode>>>,
-    outcome: core::result::Result<(), fs_types::ErrorCode>,
+    result: &mut Option<oneshot::Sender<FsOpResult<()>>>,
+    outcome: FsOpResult<()>,
 ) {
     if let Some(sender) = result.take() {
         let _ = sender.send(outcome);
@@ -426,127 +843,53 @@ fn complete_file_transfer(
 }
 
 pin_project! {
-    /// The `write-via-stream` and `append-via-stream` sink for one file.
+    /// The `read-via-stream` source for one file.
     ///
-    /// The in-flight 9p transfer is held by value under a `Fut`
-    /// parameter that [`file_write_consumer`] infers from
-    /// [`write_host_file`], and `start` is the function pointer that
-    /// mints the next one. A boxed `dyn Future` here would erase the
-    /// host filesystem the whole component host is generic over for the
-    /// sake of one field.
-    pub(super) struct FileWriteConsumer<T, CpuImpl, Net, HostFs, Fut>
-    where
-        // `pin_project!` parses each where-clause bound as one path, so
-        // `Cpu` and `Clone` are two predicates here rather than `Cpu + Clone`.
-        CpuImpl: Cpu,
-        CpuImpl: Clone,
-        Net: ComponentHostNetwork,
-        HostFs: crate::HostFileSystem,
-    {
-        pub(super) getter: fn(&mut T) -> &mut StoreData<CpuImpl, Net, HostFs>,
-        pub(super) descriptor: FsDescriptor,
-        pub(super) mode: FileWriteMode,
-        pub(super) host: Option<HostFileStreamTarget<HostFs>>,
-        pub(super) start: fn(HostFileStreamTarget<HostFs>, FileWriteMode, Vec<u8>) -> Fut,
-        #[pin]
-        pub(super) pending: Option<Fut>,
-        pub(super) result: Option<oneshot::Sender<core::result::Result<(), fs_types::ErrorCode>>>,
-    }
-
-    impl<T, CpuImpl, Net, HostFs, Fut> PinnedDrop
-        for FileWriteConsumer<T, CpuImpl, Net, HostFs, Fut>
-    where
-        CpuImpl: Cpu,
-        CpuImpl: Clone,
-        Net: ComponentHostNetwork,
-        HostFs: crate::HostFileSystem,
-    {
-        fn drop(this: Pin<&mut Self>) {
-            complete_file_transfer(this.project().result, Ok(()));
-        }
-    }
-}
-
-pin_project! {
-    /// The `read-via-stream` source for one file, the mirror of
-    /// [`FileWriteConsumer`]: the in-flight read is held by value under
-    /// a `Fut` parameter [`file_read_producer`] infers from
-    /// [`read_host_file`].
-    pub(super) struct FileReadStreamProducer<T, CpuImpl, Net, HostFs, Fut>
-    where
-        // `pin_project!` parses each where-clause bound as one path, so
-        // `Cpu` and `Clone` are two predicates here rather than `Cpu + Clone`.
-        CpuImpl: Cpu,
-        CpuImpl: Clone,
-        Net: ComponentHostNetwork,
-        HostFs: crate::HostFileSystem,
-    {
-        pub(super) getter: fn(&mut T) -> &mut StoreData<CpuImpl, Net, HostFs>,
-        pub(super) descriptor: FsDescriptor,
+    /// The in-flight read is held by value under a `Fut` parameter that
+    /// [`file_read_producer`] infers from [`read_held`], and `start`
+    /// mints the next one: only one chunk is ever in flight, so a stream
+    /// over a large file never holds more than one chunk of kernel memory.
+    pub(super) struct FileReadStreamProducer<StorageImpl: crate::Storage, Fut> {
+        pub(super) held: HeldPath<StorageImpl>,
         pub(super) offset: u64,
         pub(super) chunk_bytes: usize,
-        pub(super) host: Option<HostFileStreamTarget<HostFs>>,
-        pub(super) start: fn(HostFileStreamTarget<HostFs>, u64, u32) -> Fut,
+        pub(super) start: fn(HeldPath<StorageImpl>, u64, usize) -> Fut,
         #[pin]
         pub(super) pending: Option<Fut>,
-        pub(super) result: Option<oneshot::Sender<core::result::Result<(), fs_types::ErrorCode>>>,
+        pub(super) result: Option<oneshot::Sender<FsOpResult<()>>>,
     }
 
-    impl<T, CpuImpl, Net, HostFs, Fut> PinnedDrop
-        for FileReadStreamProducer<T, CpuImpl, Net, HostFs, Fut>
-    where
-        CpuImpl: Cpu,
-        CpuImpl: Clone,
-        Net: ComponentHostNetwork,
-        HostFs: crate::HostFileSystem,
-    {
+    impl<StorageImpl: crate::Storage, Fut> PinnedDrop for FileReadStreamProducer<StorageImpl, Fut> {
         fn drop(this: Pin<&mut Self>) {
             complete_file_transfer(this.project().result, Ok(()));
         }
     }
 }
 
-/// The `read-via-stream` source for one file, with the host read
-/// future's type inferred here and carried by the producer.
-pub(super) fn file_read_producer<T, CpuImpl, Net, HostFs>(
-    getter: fn(&mut T) -> &mut StoreData<CpuImpl, Net, HostFs>,
-    descriptor: FsDescriptor,
+/// The `read-via-stream` source for `held`, from `offset`.
+pub(super) fn file_read_producer<StorageImpl>(
+    held: HeldPath<StorageImpl>,
     offset: u64,
     chunk_bytes: usize,
-    host: Option<HostFileStreamTarget<HostFs>>,
-    result: oneshot::Sender<core::result::Result<(), fs_types::ErrorCode>>,
-) -> FileReadStreamProducer<
-    T,
-    CpuImpl,
-    Net,
-    HostFs,
-    impl core::future::Future<Output = HostReadResult> + Send,
->
+    result: oneshot::Sender<FsOpResult<()>>,
+) -> FileReadStreamProducer<StorageImpl, impl core::future::Future<Output = ChunkReadResult> + Send>
 where
-    T: 'static,
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     FileReadStreamProducer {
-        getter,
-        descriptor,
+        held,
         offset,
         chunk_bytes,
-        host,
-        start: read_host_file::<HostFs>,
+        start: read_held::<StorageImpl>,
         pending: None,
         result: Some(result),
     }
 }
 
-impl<T: 'static, CpuImpl, Net, HostFs, Fut> StreamProducer<T>
-    for FileReadStreamProducer<T, CpuImpl, Net, HostFs, Fut>
+impl<T: 'static, StorageImpl, Fut> StreamProducer<T> for FileReadStreamProducer<StorageImpl, Fut>
 where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
-    Fut: core::future::Future<Output = HostReadResult> + Send + 'static,
+    StorageImpl: crate::Storage,
+    Fut: core::future::Future<Output = ChunkReadResult> + Send + 'static,
 {
     type Item = u8;
     type Buffer = BytesStreamBuffer;
@@ -563,72 +906,24 @@ where
             complete_file_transfer(this.result, Ok(()));
             return Poll::Ready(Ok(StreamResult::Cancelled));
         }
-
-        if let Some(host) = this.host.as_ref() {
-            if this.descriptor.kind != FsNodeKind::File {
-                complete_file_transfer(this.result, Err(fs_types::ErrorCode::IsDirectory));
-                return Poll::Ready(Ok(StreamResult::Dropped));
+        if this.pending.is_none() {
+            let capacity = destination.remaining(&mut store);
+            if capacity == Some(0) {
+                return Poll::Ready(Ok(StreamResult::Completed));
             }
-            if !this
-                .descriptor
-                .flags
-                .contains(fs_types::DescriptorFlags::READ)
-            {
-                complete_file_transfer(this.result, Err(fs_types::ErrorCode::NotPermitted));
-                return Poll::Ready(Ok(StreamResult::Dropped));
-            }
-            if this.pending.is_none() {
-                let capacity = destination.remaining(&mut store);
-                if capacity == Some(0) {
-                    return Poll::Ready(Ok(StreamResult::Completed));
-                }
-                // Only `chunk_bytes` are ever in flight, so a stream over a
-                // multi-gigabyte host file never holds more than one chunk of
-                // kernel memory.
-                let request = capacity.unwrap_or(*this.chunk_bytes).min(*this.chunk_bytes);
-                let max_bytes = u32::try_from(request).unwrap_or(u32::MAX);
-                let read = (*this.start)(host.clone(), *this.offset, max_bytes);
-                this.pending.set(Some(read));
-            }
-            let bytes = match this.pending.as_mut().as_pin_mut() {
-                Some(pending) => match pending.poll(cx) {
-                    Poll::Pending => return Poll::Pending,
-                    Poll::Ready(result) => result,
-                },
-                None => unreachable!("host read future must be present before polling"),
-            };
-            this.pending.set(None);
-            return match bytes {
-                Ok(bytes) if bytes.is_empty() => {
-                    complete_file_transfer(this.result, Ok(()));
-                    Poll::Ready(Ok(StreamResult::Dropped))
-                }
-                Ok(bytes) => {
-                    *this.offset = this
-                        .offset
-                        .checked_add(
-                            u64::try_from(bytes.len()).expect("read chunk size overflowed u64"),
-                        )
-                        .ok_or_else(|| {
-                            wasmtime::Error::new(WasiAdapterTrap::FileReadOffsetOverflow)
-                        })?;
-                    destination.set_buffer(BytesStreamBuffer::new(Bytes::from(bytes)));
-                    Poll::Ready(Ok(StreamResult::Completed))
-                }
-                Err(error) => {
-                    complete_file_transfer(this.result, Err(error));
-                    Poll::Ready(Ok(StreamResult::Dropped))
-                }
-            };
+            let request = capacity.unwrap_or(*this.chunk_bytes).min(*this.chunk_bytes);
+            let read = (*this.start)(this.held.clone(), *this.offset, request);
+            this.pending.set(Some(read));
         }
-
-        let getter = *this.getter;
-        let store_data = getter(store.data_mut());
-        match store_data.filesystem().read_file_chunk(
-            this.descriptor,
-            *this.offset,
-            *this.chunk_bytes,
-        ) {
+        let bytes = match this.pending.as_mut().as_pin_mut() {
+            Some(pending) => match pending.poll(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(result) => result,
+            },
+            None => unreachable!("a read future was started above"),
+        };
+        this.pending.set(None);
+        match bytes {
             Ok(bytes) if bytes.is_empty() => {
                 complete_file_transfer(this.result, Ok(()));
                 Poll::Ready(Ok(StreamResult::Dropped))
@@ -636,9 +931,7 @@ where
             Ok(bytes) => {
                 *this.offset = this
                     .offset
-                    .checked_add(
-                        u64::try_from(bytes.len()).expect("read chunk size overflowed u64"),
-                    )
+                    .checked_add(bytes.len() as u64)
                     .ok_or_else(|| wasmtime::Error::new(WasiAdapterTrap::FileReadOffsetOverflow))?;
                 destination.set_buffer(BytesStreamBuffer::new(bytes));
                 Poll::Ready(Ok(StreamResult::Completed))
@@ -651,47 +944,78 @@ where
     }
 }
 
-/// The `write-via-stream` and `append-via-stream` sink for one file,
-/// with the host write future's type inferred here and carried by the
-/// consumer. `mode` decides whether each batch lands at the stream's
-/// own offset or at the host's end of file.
-pub(super) fn file_write_consumer<T, CpuImpl, Net, HostFs>(
-    getter: fn(&mut T) -> &mut StoreData<CpuImpl, Net, HostFs>,
-    descriptor: FsDescriptor,
-    mode: FileWriteMode,
-    host: Option<HostFileStreamTarget<HostFs>>,
-    result: oneshot::Sender<core::result::Result<(), fs_types::ErrorCode>>,
+pin_project! {
+    /// The `write-via-stream` and `append-via-stream` sink for one file,
+    /// the mirror of [`FileReadStreamProducer`]. `mode` decides whether
+    /// each batch lands at the stream's own offset or at the end of file.
+    pub(super) struct FileWriteConsumer<T, CpuImpl, Net, StorageImpl, Fut>
+    where
+        // `pin_project!` parses each where-clause bound as one path, so
+        // `Cpu` and `Clone` are two predicates here rather than `Cpu + Clone`.
+        CpuImpl: Cpu,
+        CpuImpl: Clone,
+        Net: ComponentHostNetwork,
+        StorageImpl: crate::Storage,
+    {
+        pub(super) getter: fn(&mut T) -> &mut StoreData<CpuImpl, Net, StorageImpl>,
+        pub(super) held: HeldPath<StorageImpl>,
+        pub(super) mode: WritePosition,
+        pub(super) start: fn(HeldPath<StorageImpl>, WritePosition, Vec<u8>, u64) -> Fut,
+        #[pin]
+        pub(super) pending: Option<Fut>,
+        pub(super) result: Option<oneshot::Sender<FsOpResult<()>>>,
+    }
+
+    impl<T, CpuImpl, Net, StorageImpl, Fut> PinnedDrop
+        for FileWriteConsumer<T, CpuImpl, Net, StorageImpl, Fut>
+    where
+        CpuImpl: Cpu,
+        CpuImpl: Clone,
+        Net: ComponentHostNetwork,
+        StorageImpl: crate::Storage,
+    {
+        fn drop(this: Pin<&mut Self>) {
+            complete_file_transfer(this.project().result, Ok(()));
+        }
+    }
+}
+
+/// The `write-via-stream` and `append-via-stream` sink for `held`.
+pub(super) fn file_write_consumer<T, CpuImpl, Net, StorageImpl>(
+    getter: fn(&mut T) -> &mut StoreData<CpuImpl, Net, StorageImpl>,
+    held: HeldPath<StorageImpl>,
+    mode: WritePosition,
+    result: oneshot::Sender<FsOpResult<()>>,
 ) -> FileWriteConsumer<
     T,
     CpuImpl,
     Net,
-    HostFs,
-    impl core::future::Future<Output = HostWriteResult> + Send,
+    StorageImpl,
+    impl core::future::Future<Output = ChunkWriteResult> + Send,
 >
 where
     T: 'static,
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     FileWriteConsumer {
         getter,
-        descriptor,
+        held,
         mode,
-        host,
-        start: write_host_file::<HostFs>,
+        start: write_chunk::<StorageImpl>,
         pending: None,
         result: Some(result),
     }
 }
 
-impl<T: 'static, CpuImpl, Net, HostFs, Fut> StreamConsumer<T>
-    for FileWriteConsumer<T, CpuImpl, Net, HostFs, Fut>
+impl<T: 'static, CpuImpl, Net, StorageImpl, Fut> StreamConsumer<T>
+    for FileWriteConsumer<T, CpuImpl, Net, StorageImpl, Fut>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
-    Fut: core::future::Future<Output = HostWriteResult> + Send + 'static,
+    StorageImpl: crate::Storage,
+    Fut: core::future::Future<Output = ChunkWriteResult> + Send + 'static,
 {
     type Item = u8;
 
@@ -703,87 +1027,34 @@ where
         _: bool,
     ) -> Poll<Result<StreamResult>> {
         let mut this = self.project();
-        if let Some(host) = this.host.as_ref() {
-            if this.descriptor.kind != FsNodeKind::File {
-                complete_file_transfer(this.result, Err(fs_types::ErrorCode::IsDirectory));
-                return Poll::Ready(Ok(StreamResult::Dropped));
+        if this.pending.is_none() {
+            let available = source.remaining(&mut store);
+            if available == 0 {
+                return Poll::Ready(Ok(StreamResult::Completed));
             }
-            if !this
-                .descriptor
-                .flags
-                .contains(fs_types::DescriptorFlags::WRITE)
-            {
-                complete_file_transfer(this.result, Err(fs_types::ErrorCode::NotPermitted));
-                return Poll::Ready(Ok(StreamResult::Dropped));
-            }
-            if this.pending.is_none() {
-                let available = source.remaining(&mut store);
-                if available == 0 {
-                    return Poll::Ready(Ok(StreamResult::Completed));
-                }
-                let mut bytes = Vec::with_capacity(available);
-                source.read(&mut store, &mut bytes)?;
-                let write = (*this.start)(host.clone(), *this.mode, bytes);
-                this.pending.set(Some(write));
-            }
-            let written = match this.pending.as_mut().as_pin_mut() {
-                Some(pending) => match pending.poll(cx) {
-                    Poll::Pending => return Poll::Pending,
-                    Poll::Ready(result) => result,
-                },
-                None => unreachable!("host write future must be present before polling"),
-            };
-            this.pending.set(None);
-            return match written {
-                Ok(written) => {
-                    if let FileWriteMode::At(offset) = this.mode {
-                        *offset = offset
-                            .checked_add(written)
-                            .expect("file write offset overflowed usize");
-                    }
-                    Poll::Ready(Ok(StreamResult::Completed))
-                }
-                Err(error) => {
-                    complete_file_transfer(this.result, Err(error));
-                    Poll::Ready(Ok(StreamResult::Dropped))
-                }
-            };
+            let mut bytes = Vec::with_capacity(available);
+            source.read(&mut store, &mut bytes)?;
+            let now = (*this.getter)(store.data_mut()).now_nanos();
+            let write = (*this.start)(this.held.clone(), *this.mode, bytes, now);
+            this.pending.set(Some(write));
         }
-
-        let available = source.remaining(&mut store);
-        if available == 0 {
-            return Poll::Ready(Ok(StreamResult::Completed));
-        }
-
-        let mut bytes = Vec::with_capacity(available);
-        source.read(&mut store, &mut bytes)?;
-
-        let getter = *this.getter;
-        let store_data = getter(store.data_mut());
-        let descriptor = this.descriptor.clone();
-        let now_nanos = store_data.now_nanos();
-        let write_result = match this.mode {
-            FileWriteMode::At(offset) => {
-                let result =
-                    store_data
-                        .filesystem_mut()
-                        .write_at(&descriptor, *offset, &bytes, now_nanos);
-                if result.is_ok() {
-                    *offset = offset
-                        .checked_add(bytes.len())
-                        .expect("file write offset overflowed usize");
-                }
-                result
-            }
-            FileWriteMode::Append => {
-                store_data
-                    .filesystem_mut()
-                    .append(&descriptor, &bytes, now_nanos)
-            }
+        let written = match this.pending.as_mut().as_pin_mut() {
+            Some(pending) => match pending.poll(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(result) => result,
+            },
+            None => unreachable!("a write future was started above"),
         };
-
-        match write_result {
-            Ok(()) => Poll::Ready(Ok(StreamResult::Completed)),
+        this.pending.set(None);
+        match written {
+            Ok(written) => {
+                if let WritePosition::At(offset) = this.mode {
+                    *offset = offset.checked_add(written as u64).ok_or_else(|| {
+                        wasmtime::Error::new(WasiAdapterTrap::FileWriteOffsetOverflow)
+                    })?;
+                }
+                Poll::Ready(Ok(StreamResult::Completed))
+            }
             Err(error) => {
                 complete_file_transfer(this.result, Err(error));
                 Poll::Ready(Ok(StreamResult::Dropped))
@@ -792,1183 +1063,80 @@ where
     }
 }
 
-impl<State, HostFsService> DebugFileSystem<State, HostFsService>
+pin_project! {
+    /// The `read-directory` stream: the whole listing, once it arrives.
+    pub(super) struct DirectoryStreamProducer<Fut> {
+        #[pin]
+        listing: Fut,
+        result: Option<oneshot::Sender<FsOpResult<()>>>,
+    }
+
+    impl<Fut> PinnedDrop for DirectoryStreamProducer<Fut> {
+        fn drop(this: Pin<&mut Self>) {
+            complete_file_transfer(this.project().result, Ok(()));
+        }
+    }
+}
+
+/// Lists `descriptor` through an owned namespace, for a stream that must
+/// own the listing across polls.
+async fn list_owned<StorageImpl>(
+    namespace: Namespace<StorageImpl>,
+    descriptor: FsDescriptor,
+) -> FsOpResult<Vec<fs_types::DirectoryEntry>>
 where
-    State: crate::ComponentHostFilesystemState<HostFsService>,
-    HostFsService: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    pub(crate) fn new(runtime_state: State) -> Self {
-        let mut filesystem = Self {
-            snapshot: DebugFileSystemSnapshot {
-                inner: Arc::new(Mutex::new(DebugFileSystemState::with_root())),
-            },
-            runtime_state,
-            _host_fs: PhantomData,
+    read_directory(&namespace, descriptor.grant()?).await
+}
+
+pub(super) fn directory_producer<StorageImpl>(
+    namespace: Namespace<StorageImpl>,
+    descriptor: FsDescriptor,
+    result: oneshot::Sender<FsOpResult<()>>,
+) -> DirectoryStreamProducer<
+    impl core::future::Future<Output = FsOpResult<Vec<fs_types::DirectoryEntry>>> + Send,
+>
+where
+    StorageImpl: crate::Storage,
+{
+    DirectoryStreamProducer {
+        listing: list_owned(namespace, descriptor),
+        result: Some(result),
+    }
+}
+
+impl<T: 'static, Fut> StreamProducer<T> for DirectoryStreamProducer<Fut>
+where
+    Fut: core::future::Future<Output = FsOpResult<Vec<fs_types::DirectoryEntry>>> + Send + 'static,
+{
+    type Item = fs_types::DirectoryEntry;
+    type Buffer = wasmtime::component::VecBuffer<fs_types::DirectoryEntry>;
+
+    fn poll_produce<'a>(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        _: wasmtime::StoreContextMut<'_, T>,
+        mut destination: Destination<'a, Self::Item, Self::Buffer>,
+        finish: bool,
+    ) -> Poll<wasmtime::Result<StreamResult>> {
+        let this = self.project();
+        let listing = match this.listing.poll(cx) {
+            Poll::Ready(listing) => listing,
+            Poll::Pending if finish => {
+                complete_file_transfer(this.result, Ok(()));
+                return Poll::Ready(Ok(StreamResult::Cancelled));
+            }
+            Poll::Pending => return Poll::Pending,
         };
-
-        if let Some(bootfs) = filesystem.runtime_state.bootfs() {
-            filesystem.seed_bootfs(bootfs);
-        }
-        if filesystem.runtime_state.host_filesystem_service().is_some() {
-            filesystem.ensure_directory(crate::HOST_SHARE_GUEST_MOUNT_PATH, true);
-        }
-
-        filesystem
-    }
-
-    pub(crate) fn from_snapshot(runtime_state: State, snapshot: DebugFileSystemSnapshot) -> Self {
-        Self {
-            snapshot,
-            runtime_state,
-            _host_fs: PhantomData,
-        }
-    }
-
-    pub(crate) fn snapshot(&self) -> DebugFileSystemSnapshot {
-        self.snapshot.clone()
-    }
-
-    pub(crate) fn replace_with_snapshot(&mut self, snapshot: DebugFileSystemSnapshot) {
-        self.snapshot = snapshot;
-    }
-
-    pub(super) fn seed_bootfs(&mut self, image: EmbeddedBootFs) {
-        for directory in image.directories() {
-            self.insert_bootfs_directory(directory);
-        }
-        for file in image.files() {
-            self.insert_bootfs_file(file);
-        }
-    }
-
-    pub(super) fn insert_bootfs_directory(&mut self, directory: &crate::EmbeddedBootDirectory) {
-        let absolute = embedded_absolute_path(directory.path());
-        let mut current = String::from("/");
-
-        for segment in directory
-            .path()
-            .split('/')
-            .filter(|segment| !segment.is_empty())
-        {
-            let next = join_embedded_child(&current, segment);
-            if next == absolute {
-                break;
+        match listing {
+            Ok(entries) => {
+                destination.set_buffer(entries.into());
+                complete_file_transfer(this.result, Ok(()));
             }
-
-            self.ensure_directory(&next, true);
-            current = next;
+            Err(error) => complete_file_transfer(this.result, Err(error)),
         }
-
-        self.ensure_bootfs_directory(&absolute, directory.modified_nanos());
-    }
-
-    pub(super) fn insert_bootfs_file(&mut self, file: &crate::EmbeddedBootFile) {
-        let absolute = embedded_absolute_path(file.path());
-        let mut current = String::from("/");
-
-        for segment in file.path().split('/').filter(|segment| !segment.is_empty()) {
-            let next = join_embedded_child(&current, segment);
-
-            if next == absolute {
-                break;
-            }
-
-            self.ensure_directory(&next, true);
-            current = next;
-        }
-
-        if self.get_node(&absolute).is_ok() {
-            return;
-        }
-
-        let identity = self.allocate_identity();
-        let modified_nanos = file.modified_nanos();
-        self.snapshot.inner.lock().insert_node(FsNode::new(
-            absolute,
-            FsNodeKind::File,
-            FileContents::Bootfs(file.bootfs_bytes()),
-            identity,
-            modified_nanos,
-            true,
-        ));
-    }
-
-    /// Drops the embedded nodes mirroring a host subtree.
-    ///
-    /// Only directory listings are mirrored, so this clears stale directory
-    /// entries after a remove or rename rather than any cached file content.
-    pub(crate) fn invalidate_host_subtree(&mut self, path: &str) {
-        let mut state = self.snapshot.inner.lock();
-        state.retain_nodes(|node| {
-            node.path != path && !crate::path_is_within_directory(&node.path, path)
-        });
-    }
-
-    /// Seed direct children of a host directory into the embedded FS so that
-    /// later `read_directory` calls see the same entries without awaiting
-    /// host I/O inside a sync stream context.
-    pub(crate) fn seed_host_directory_entries(
-        &mut self,
-        path: &str,
-        entries: Vec<crate::HostDirEntry>,
-    ) {
-        self.ensure_directory(path, true);
-        let prefix = crate::directory_prefix(path);
-        for entry in entries {
-            let child_path = append_path_suffix(&prefix, &entry.name);
-            if self.get_node(&child_path).is_ok() {
-                continue;
-            }
-            let identity = self.allocate_identity();
-            self.snapshot.inner.lock().insert_node(FsNode::new(
-                child_path,
-                if entry.is_directory {
-                    FsNodeKind::Directory
-                } else {
-                    FsNodeKind::File
-                },
-                FileContents::empty(),
-                identity,
-                0,
-                true,
-            ));
-        }
-    }
-
-    pub(super) fn ensure_directory(&mut self, path: &str, readonly: bool) {
-        self.ensure_directory_with_timestamp(path, readonly, 0);
-    }
-
-    pub(super) fn ensure_bootfs_directory(&mut self, path: &str, modified_nanos: u64) {
-        self.ensure_directory_with_timestamp(path, true, modified_nanos);
-    }
-
-    pub(super) fn ensure_directory_with_timestamp(
-        &mut self,
-        path: &str,
-        readonly: bool,
-        timestamp_nanos: u64,
-    ) {
-        if path == "/" {
-            return;
-        }
-
-        let mut state = self.snapshot.inner.lock();
-        if let Some(existing) = state.node_mut(path) {
-            assert!(
-                existing.kind == FsNodeKind::Directory,
-                "bootfs directory path {} collided with an existing file",
-                path
-            );
-            existing.readonly |= readonly;
-            if timestamp_nanos != 0 {
-                existing.access_nanos = timestamp_nanos;
-                existing.modified_nanos = timestamp_nanos;
-                existing.status_nanos = timestamp_nanos;
-            }
-            return;
-        }
-
-        let local = state.next_inode;
-        state.next_inode += 1;
-        let identity = ObjectIdentity::new(AuthorityDomain::GUEST_BOOTFS, local);
-        state.insert_node(FsNode::new(
-            path.to_owned(),
-            FsNodeKind::Directory,
-            FileContents::empty(),
-            identity,
-            timestamp_nanos,
-            readonly,
-        ));
-    }
-
-    pub(super) fn allocate_identity(&self) -> ObjectIdentity {
-        let mut state = self.snapshot.inner.lock();
-        let local = state.next_inode;
-        state.next_inode += 1;
-        ObjectIdentity::new(AuthorityDomain::GUEST_BOOTFS, local)
-    }
-
-    pub(super) fn node_size(node: &FsNode) -> u64 {
-        match node.kind {
-            FsNodeKind::Directory => 0,
-            FsNodeKind::File | FsNodeKind::Symlink => node.contents.as_slice().len() as u64,
-        }
-    }
-
-    pub(super) fn descriptor_type(kind: FsNodeKind) -> fs_types::DescriptorType {
-        descriptor_type_from_node_kind(kind)
-    }
-
-    pub(super) fn descriptor_identity(
-        &self,
-        descriptor: &FsDescriptor,
-    ) -> core::result::Result<ObjectIdentity, fs_types::ErrorCode> {
-        descriptor.identity.map_or_else(
-            || self.get_node(&descriptor.path).map(|node| node.identity),
-            Ok,
-        )
-    }
-
-    pub(super) fn require_same_authority_domain(
-        &self,
-        left: &FsDescriptor,
-        right: &FsDescriptor,
-    ) -> core::result::Result<(), fs_types::ErrorCode> {
-        if self.descriptor_identity(left)?.domain() != self.descriptor_identity(right)?.domain() {
-            return Err(fs_types::ErrorCode::NotPermitted);
-        }
-        Ok(())
-    }
-
-    pub(super) fn resolve_symlink_payload(
-        link_path: &str,
-        payload: &str,
-    ) -> core::result::Result<String, fs_types::ErrorCode> {
-        resolve_symlink_payload(link_path, payload)
-    }
-
-    pub(super) fn resolve_open_path(
-        &self,
-        absolute: &str,
-        follow_symlink: bool,
-        depth: usize,
-    ) -> core::result::Result<String, fs_types::ErrorCode> {
-        if depth > MAX_SYMLINK_DEPTH {
-            return Err(fs_types::ErrorCode::Loop);
-        }
-        let node = self.get_node(absolute)?;
-        if node.kind != FsNodeKind::Symlink || !follow_symlink {
-            return Ok(absolute.to_owned());
-        }
-        let payload = core::str::from_utf8(node.contents.as_slice())
-            .map_err(|_| fs_types::ErrorCode::IllegalByteSequence)?;
-        let target = Self::resolve_symlink_payload(absolute, payload)?;
-        self.resolve_open_path(&target, follow_symlink, depth + 1)
-    }
-
-    pub(super) fn host_path<'a>(&self, path: &'a str) -> Option<&'a str> {
-        crate::guest_host_share_path(path)
-    }
-
-    pub(crate) fn host_service(&self) -> core::result::Result<HostFsService, fs_types::ErrorCode> {
-        self.runtime_state
-            .host_filesystem_service()
-            .ok_or(fs_types::ErrorCode::NoEntry)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn root_descriptor(&self) -> FsDescriptor {
-        let root = self
-            .get_node("/")
-            .expect("debug filesystem root node must exist");
-        FsDescriptor {
-            path: String::from("/"),
-            kind: FsNodeKind::Directory,
-            flags: fs_types::DescriptorFlags::READ
-                | fs_types::DescriptorFlags::WRITE
-                | fs_types::DescriptorFlags::MUTATE_DIRECTORY,
-            identity: Some(root.identity),
-        }
-    }
-
-    pub(super) fn get_node(&self, path: &str) -> core::result::Result<FsNode, fs_types::ErrorCode> {
-        self.snapshot
-            .inner
-            .lock()
-            .node(path)
-            .cloned()
-            .ok_or(fs_types::ErrorCode::NoEntry)
-    }
-
-    pub(super) fn with_node<R>(
-        &self,
-        path: &str,
-        read: impl FnOnce(&FsNode) -> core::result::Result<R, fs_types::ErrorCode>,
-    ) -> core::result::Result<R, fs_types::ErrorCode> {
-        let state = self.snapshot.inner.lock();
-        let node = state.node(path).ok_or(fs_types::ErrorCode::NoEntry)?;
-        read(node)
-    }
-
-    pub(crate) fn stat(
-        &self,
-        path: &str,
-    ) -> core::result::Result<fs_types::DescriptorStat, fs_types::ErrorCode> {
-        // Host paths are answered asynchronously in the WASI trait impls,
-        // which never reach here. What does reach here for a host path is a
-        // directory node mirrored by `seed_host_directory_entries`; anything
-        // else is genuinely absent and reports NoEntry rather than panicking.
-        self.with_node(path, |node| {
-            let size = Self::node_size(node);
-            Ok(fs_types::DescriptorStat {
-                type_: Self::descriptor_type(node.kind),
-                link_count: node.link_count,
-                size,
-                data_access_timestamp: Some(system_time_from_nanos(node.access_nanos)),
-                data_modification_timestamp: Some(system_time_from_nanos(node.modified_nanos)),
-                status_change_timestamp: Some(system_time_from_nanos(node.status_nanos)),
-            })
-        })
-    }
-
-    /// Object identity of an embedded node, for surfaces that report
-    /// `st_dev`/`st_ino` rather than a metadata hash.
-    pub(crate) fn identity_at_path(
-        &self,
-        path: &str,
-    ) -> core::result::Result<ObjectIdentity, fs_types::ErrorCode> {
-        self.with_node(path, |node| Ok(node.identity))
-    }
-
-    pub(crate) fn metadata_hash(
-        &self,
-        path: &str,
-    ) -> core::result::Result<fs_types::MetadataHashValue, fs_types::ErrorCode> {
-        // Host paths are answered asynchronously in the WASI trait impls;
-        // only mirrored host directories reach the embedded view here.
-        self.with_node(path, |node| {
-            let size = Self::node_size(node);
-            Ok(metadata_hash_value(
-                node.identity,
-                node.modified_nanos ^ size,
-            ))
-        })
-    }
-
-    pub(crate) fn read_directory(
-        &self,
-        path: &str,
-    ) -> core::result::Result<Vec<fs_types::DirectoryEntry>, fs_types::ErrorCode> {
-        // Opening a host directory seeds its direct children into the
-        // embedded FS, so listing one walks the same node list as a
-        // guest-owned directory. If nothing was seeded, report NoEntry.
-        let node = self.get_node(path)?;
-        if node.kind != FsNodeKind::Directory {
-            return Err(fs_types::ErrorCode::NotDirectory);
-        }
-
-        let mut entries = Vec::new();
-        let state = self.snapshot.inner.lock();
-        for child in &state.nodes {
-            if child.path == path {
-                continue;
-            }
-            let Some(remainder) = crate::strip_directory_prefix(&child.path, path) else {
-                continue;
-            };
-            if let Some((name, _)) = remainder.split_once('/') {
-                push_directory_entry_if_absent(
-                    &mut entries,
-                    fs_types::DescriptorType::Directory,
-                    name,
-                );
-                continue;
-            }
-            entries.push(fs_types::DirectoryEntry {
-                type_: Self::descriptor_type(child.kind),
-                name: remainder.to_string(),
-            });
-        }
-        drop(state);
-
-        if path == "/" && self.runtime_state.host_filesystem_service().is_some() {
-            let has_host_mount = entries.iter().any(|entry| entry.name == "host");
-            if !has_host_mount {
-                entries.push(fs_types::DirectoryEntry {
-                    type_: fs_types::DescriptorType::Directory,
-                    name: String::from("host"),
-                });
-            }
-        }
-
-        entries.sort_by(|left, right| {
-            is_dir_first(left.type_.clone())
-                .cmp(&is_dir_first(right.type_.clone()))
-                .then_with(|| left.name.cmp(&right.name))
-        });
-        Ok(entries)
-    }
-
-    pub(crate) fn read_file_chunk(
-        &self,
-        descriptor: &FsDescriptor,
-        offset: u64,
-        max_bytes: usize,
-    ) -> core::result::Result<Bytes, fs_types::ErrorCode> {
-        // Host file contents are never cached here: a stream over a host
-        // file carries its own `HostFileStreamTarget` and pulls bounded
-        // chunks over 9p instead. This path serves embedded nodes only, and
-        // a missing node is NoEntry.
-        let node = self.get_node(&descriptor.path)?;
-        if node.kind != FsNodeKind::File {
-            return Err(fs_types::ErrorCode::IsDirectory);
-        }
-        if !descriptor.flags.contains(fs_types::DescriptorFlags::READ) {
-            return Err(fs_types::ErrorCode::ReadOnly);
-        }
-
-        let offset: usize = offset
-            .try_into()
-            .map_err(|_| fs_types::ErrorCode::Overflow)?;
-        let len = node.contents.as_slice().len();
-        if offset >= len {
-            return Ok(Bytes::new());
-        }
-        let end = offset
-            .checked_add(max_bytes)
-            .map(|value| value.min(len))
-            .ok_or(fs_types::ErrorCode::Overflow)?;
-        Ok(node.contents.slice(offset..end))
-    }
-
-    /// The contents of the file at `path` with their provenance, which
-    /// is what decides how far a program read from it is trusted.
-    pub(crate) fn read_program_file(
-        &self,
-        path: &str,
-    ) -> core::result::Result<FileContents, fs_types::ErrorCode> {
-        let node = self.get_node(path)?;
-        if node.kind != FsNodeKind::File {
-            return Err(fs_types::ErrorCode::IsDirectory);
-        }
-        Ok(node.contents.clone())
-    }
-
-    pub(crate) fn write_program_file(
-        &mut self,
-        path: &str,
-        bytes: &[u8],
-        now_nanos: u64,
-    ) -> core::result::Result<(), fs_types::ErrorCode> {
-        if self.host_path(path).is_some() {
-            return Err(fs_types::ErrorCode::Unsupported);
-        }
-
-        let mut state = self.snapshot.inner.lock();
-        match state.node(path).cloned() {
-            Some(node) => {
-                if node.kind != FsNodeKind::File {
-                    return Err(fs_types::ErrorCode::IsDirectory);
-                }
-                if node.readonly {
-                    return Err(fs_types::ErrorCode::ReadOnly);
-                }
-                let contents = Bytes::copy_from_slice(bytes);
-                for linked in state
-                    .nodes
-                    .iter_mut()
-                    .filter(|linked| linked.identity == node.identity)
-                {
-                    linked.contents = FileContents::Written(contents.clone());
-                    linked.touch_modified(now_nanos);
-                }
-                Ok(())
-            }
-            None => {
-                let parent = crate::parent_path(path);
-                let parent_node = state.node(parent).ok_or(fs_types::ErrorCode::NoEntry)?;
-                if parent_node.kind != FsNodeKind::Directory {
-                    return Err(fs_types::ErrorCode::NotDirectory);
-                }
-                if parent_node.readonly {
-                    return Err(fs_types::ErrorCode::ReadOnly);
-                }
-                let local = state.next_inode;
-                state.next_inode += 1;
-                let identity = ObjectIdentity::new(AuthorityDomain::GUEST_BOOTFS, local);
-                state.insert_node(FsNode::new(
-                    path.to_owned(),
-                    FsNodeKind::File,
-                    FileContents::Written(Bytes::copy_from_slice(bytes)),
-                    identity,
-                    now_nanos,
-                    false,
-                ));
-                Ok(())
-            }
-        }
-    }
-
-    pub(crate) fn write_at(
-        &mut self,
-        descriptor: &FsDescriptor,
-        offset: usize,
-        bytes: &[u8],
-        now_nanos: u64,
-    ) -> core::result::Result<(), fs_types::ErrorCode> {
-        self.write_at_or_append(descriptor, FsWriteOffset::At(offset), bytes, now_nanos)
-    }
-
-    pub(crate) fn write_at_with<Fill>(
-        &mut self,
-        descriptor: &FsDescriptor,
-        offset: usize,
-        byte_len: usize,
-        now_nanos: u64,
-        fill: Fill,
-    ) -> core::result::Result<(), fs_types::ErrorCode>
-    where
-        Fill: FnOnce(&mut [u8]),
-    {
-        self.write_at_or_append_with(
-            descriptor,
-            FsWriteOffset::At(offset),
-            byte_len,
-            now_nanos,
-            fill,
-        )
-    }
-
-    pub(super) fn write_at_or_append(
-        &mut self,
-        descriptor: &FsDescriptor,
-        offset: FsWriteOffset,
-        bytes: &[u8],
-        now_nanos: u64,
-    ) -> core::result::Result<(), fs_types::ErrorCode> {
-        self.write_at_or_append_with(descriptor, offset, bytes.len(), now_nanos, |destination| {
-            destination.copy_from_slice(bytes)
-        })
-    }
-
-    pub(super) fn write_at_or_append_with<Fill>(
-        &mut self,
-        descriptor: &FsDescriptor,
-        offset: FsWriteOffset,
-        byte_len: usize,
-        now_nanos: u64,
-        fill: Fill,
-    ) -> core::result::Result<(), fs_types::ErrorCode>
-    where
-        Fill: FnOnce(&mut [u8]),
-    {
-        // This is the synchronous embedded-filesystem writer. Host-share
-        // writes go through the 9p client from the async WASI entry points
-        // and the stream consumer, both of which branch on the path before
-        // calling here; reaching this with a host path would mean a caller
-        // bypassed that routing.
-        if self.host_path(&descriptor.path).is_some() {
-            return Err(fs_types::ErrorCode::Unsupported);
-        }
-
-        let mut state = self.snapshot.inner.lock();
-        let Some(index) = state.node_index(&descriptor.path) else {
-            return Err(fs_types::ErrorCode::NoEntry);
-        };
-        let node = &state.nodes[index];
-        if node.kind != FsNodeKind::File {
-            return Err(fs_types::ErrorCode::IsDirectory);
-        }
-        if node.readonly {
-            return Err(fs_types::ErrorCode::ReadOnly);
-        }
-        if !descriptor.flags.contains(fs_types::DescriptorFlags::WRITE) {
-            return Err(fs_types::ErrorCode::ReadOnly);
-        }
-        let identity = node.identity;
-        let linked_count = node.link_count;
-        let offset = match offset {
-            FsWriteOffset::At(offset) => offset,
-            FsWriteOffset::Append => node.contents.as_slice().len(),
-        };
-        let end = offset
-            .checked_add(byte_len)
-            .ok_or(fs_types::ErrorCode::Overflow)?;
-        let contents = core::mem::replace(&mut state.nodes[index].contents, FileContents::empty())
-            .into_bytes();
-        let mut contents = if linked_count == 1 {
-            match contents.try_into_mut() {
-                Ok(contents) => contents,
-                Err(contents) => BytesMut::from(contents.as_ref()),
-            }
-        } else {
-            BytesMut::from(contents.as_ref())
-        };
-        if contents.len() < offset {
-            contents.resize(offset, 0);
-        }
-        if contents.len() < end {
-            contents.resize(end, 0);
-        }
-        fill(&mut contents[offset..end]);
-        let contents = contents.freeze();
-        for linked in state
-            .nodes
-            .iter_mut()
-            .filter(|node| node.identity == identity)
-        {
-            linked.contents = FileContents::Written(contents.clone());
-            linked.touch_modified(now_nanos);
-        }
-        Ok(())
-    }
-
-    pub(crate) fn append(
-        &mut self,
-        descriptor: &FsDescriptor,
-        bytes: &[u8],
-        now_nanos: u64,
-    ) -> core::result::Result<(), fs_types::ErrorCode> {
-        self.write_at_or_append(descriptor, FsWriteOffset::Append, bytes, now_nanos)
-    }
-
-    pub(crate) fn append_with<Fill>(
-        &mut self,
-        descriptor: &FsDescriptor,
-        byte_len: usize,
-        now_nanos: u64,
-        fill: Fill,
-    ) -> core::result::Result<(), fs_types::ErrorCode>
-    where
-        Fill: FnOnce(&mut [u8]),
-    {
-        self.write_at_or_append_with(descriptor, FsWriteOffset::Append, byte_len, now_nanos, fill)
-    }
-
-    pub(crate) fn set_size(
-        &mut self,
-        descriptor: &FsDescriptor,
-        size: u64,
-        now_nanos: u64,
-    ) -> core::result::Result<(), fs_types::ErrorCode> {
-        if self.host_path(&descriptor.path).is_some() {
-            return Err(fs_types::ErrorCode::Unsupported);
-        }
-        if !descriptor.flags.contains(fs_types::DescriptorFlags::WRITE) {
-            return Err(fs_types::ErrorCode::ReadOnly);
-        }
-
-        let size: usize = size.try_into().map_err(|_| fs_types::ErrorCode::Overflow)?;
-        let mut state = self.snapshot.inner.lock();
-        let Some(index) = state.node_index(&descriptor.path) else {
-            return Err(fs_types::ErrorCode::NoEntry);
-        };
-        let node = &state.nodes[index];
-        if node.kind != FsNodeKind::File {
-            return Err(fs_types::ErrorCode::IsDirectory);
-        }
-        if node.readonly {
-            return Err(fs_types::ErrorCode::ReadOnly);
-        }
-        let identity = node.identity;
-        let linked_count = node.link_count;
-        let contents = core::mem::replace(&mut state.nodes[index].contents, FileContents::empty())
-            .into_bytes();
-        let mut contents = if linked_count == 1 {
-            match contents.try_into_mut() {
-                Ok(contents) => contents,
-                Err(contents) => BytesMut::from(contents.as_ref()),
-            }
-        } else {
-            BytesMut::from(contents.as_ref())
-        };
-        contents.resize(size, 0);
-        let contents = contents.freeze();
-        for linked in state
-            .nodes
-            .iter_mut()
-            .filter(|node| node.identity == identity)
-        {
-            linked.contents = FileContents::Written(contents.clone());
-            linked.touch_modified(now_nanos);
-        }
-        Ok(())
-    }
-
-    pub(crate) fn set_times_at_path(
-        &mut self,
-        path: &str,
-        access_nanos: Option<u64>,
-        modified_nanos: Option<u64>,
-        status_nanos: u64,
-    ) -> core::result::Result<(), fs_types::ErrorCode> {
-        if self.host_path(path).is_some() {
-            return Err(fs_types::ErrorCode::Unsupported);
-        }
-        let node = self.get_node(path)?;
-        if node.readonly {
-            return Err(fs_types::ErrorCode::ReadOnly);
-        }
-        let identity = node.identity;
-        for linked in self
-            .snapshot
-            .inner
-            .lock()
-            .nodes
-            .iter_mut()
-            .filter(|node| node.identity == identity)
-        {
-            linked.set_times(access_nanos, modified_nanos, status_nanos);
-        }
-        Ok(())
-    }
-
-    pub(crate) fn set_times(
-        &mut self,
-        descriptor: &FsDescriptor,
-        access_nanos: Option<u64>,
-        modified_nanos: Option<u64>,
-        status_nanos: u64,
-    ) -> core::result::Result<(), fs_types::ErrorCode> {
-        self.set_times_at_path(&descriptor.path, access_nanos, modified_nanos, status_nanos)
-    }
-
-    pub(crate) fn open_at(
-        &mut self,
-        base: &FsDescriptor,
-        path_flags: fs_types::PathFlags,
-        path: &str,
-        open_flags: fs_types::OpenFlags,
-        descriptor_flags: fs_types::DescriptorFlags,
-        now_nanos: u64,
-    ) -> core::result::Result<FsDescriptor, fs_types::ErrorCode> {
-        if base.kind != FsNodeKind::Directory {
-            return Err(fs_types::ErrorCode::NotDirectory);
-        }
-        let absolute =
-            crate::resolve_child_path(&base.path, path).map_err(map_component_fs_path_error)?;
-        let follow_symlink = path_flags.contains(fs_types::PathFlags::SYMLINK_FOLLOW);
-        let absolute = if self.get_node(&absolute).is_ok() {
-            self.resolve_open_path(&absolute, follow_symlink, 0)?
-        } else {
-            absolute
-        };
-        // Host-backed paths are handled in the async WASI trait impl;
-        // this embedded path only handles paths that already have a
-        // node (either genuinely local or previously seeded from the
-        // host mount).
-        let existing = self.get_node(&absolute).ok();
-        if let Some(existing) = existing {
-            if open_flags.contains(fs_types::OpenFlags::EXCLUSIVE)
-                && open_flags.contains(fs_types::OpenFlags::CREATE)
-            {
-                return Err(fs_types::ErrorCode::Exist);
-            }
-            if open_flags.contains(fs_types::OpenFlags::DIRECTORY)
-                && existing.kind != FsNodeKind::Directory
-            {
-                return Err(fs_types::ErrorCode::NotDirectory);
-            }
-            if !open_flags.contains(fs_types::OpenFlags::DIRECTORY)
-                && existing.kind == FsNodeKind::Directory
-            {
-                return Err(fs_types::ErrorCode::IsDirectory);
-            }
-            if existing.kind == FsNodeKind::Symlink && follow_symlink {
-                return Err(fs_types::ErrorCode::Loop);
-            }
-            let descriptor_flags =
-                effective_open_descriptor_flags(base.flags, descriptor_flags, existing.kind)?;
-            if open_flags.contains(fs_types::OpenFlags::TRUNCATE) {
-                if existing.kind != FsNodeKind::File {
-                    return Err(fs_types::ErrorCode::IsDirectory);
-                }
-                if existing.readonly {
-                    return Err(fs_types::ErrorCode::ReadOnly);
-                }
-                if !base
-                    .flags
-                    .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
-                {
-                    return Err(fs_types::ErrorCode::ReadOnly);
-                }
-                let identity = existing.identity;
-                for linked in self
-                    .snapshot
-                    .inner
-                    .lock()
-                    .nodes
-                    .iter_mut()
-                    .filter(|node| node.identity == identity)
-                {
-                    linked.contents = FileContents::empty();
-                    linked.touch_modified(now_nanos);
-                }
-            }
-            return Ok(FsDescriptor {
-                path: absolute,
-                kind: existing.kind,
-                flags: descriptor_flags,
-                identity: Some(existing.identity),
-            });
-        }
-
-        if !open_flags.contains(fs_types::OpenFlags::CREATE) {
-            return Err(fs_types::ErrorCode::NoEntry);
-        }
-        if open_flags.contains(fs_types::OpenFlags::DIRECTORY) {
-            return Err(fs_types::ErrorCode::Unsupported);
-        }
-        if self.get_node(&base.path)?.readonly {
-            return Err(fs_types::ErrorCode::ReadOnly);
-        }
-        if !base
-            .flags
-            .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
-        {
-            return Err(fs_types::ErrorCode::ReadOnly);
-        }
-        let descriptor_flags =
-            effective_open_descriptor_flags(base.flags, descriptor_flags, FsNodeKind::File)?;
-
-        let parent = crate::parent_path(&absolute);
-        let parent_node = self.get_node(parent)?;
-        if parent_node.kind != FsNodeKind::Directory {
-            return Err(fs_types::ErrorCode::NotDirectory);
-        }
-
-        let identity = self.allocate_identity();
-        let node = FsNode::new(
-            absolute.clone(),
-            FsNodeKind::File,
-            FileContents::empty(),
-            identity,
-            now_nanos,
-            false,
-        );
-        self.snapshot.inner.lock().insert_node(node);
-        Ok(FsDescriptor {
-            path: absolute,
-            kind: FsNodeKind::File,
-            flags: descriptor_flags,
-            identity: Some(identity),
-        })
-    }
-
-    pub(crate) fn remove_directory_at(
-        &mut self,
-        base: &FsDescriptor,
-        path: &str,
-    ) -> core::result::Result<(), fs_types::ErrorCode> {
-        if !base
-            .flags
-            .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
-        {
-            return Err(fs_types::ErrorCode::ReadOnly);
-        }
-        let absolute =
-            crate::resolve_child_path(&base.path, path).map_err(map_component_fs_path_error)?;
-        if absolute == "/" {
-            return Err(fs_types::ErrorCode::NotPermitted);
-        }
-        let node = self.get_node(&absolute)?;
-        if node.readonly {
-            return Err(fs_types::ErrorCode::ReadOnly);
-        }
-        if node.kind != FsNodeKind::Directory {
-            return Err(fs_types::ErrorCode::NotDirectory);
-        }
-        if self
-            .snapshot
-            .inner
-            .lock()
-            .nodes
-            .iter()
-            .any(|child| crate::path_is_within_directory(&child.path, &absolute))
-        {
-            return Err(fs_types::ErrorCode::NotEmpty);
-        }
-        let identity = node.identity;
-        let mut state = self.snapshot.inner.lock();
-        if state.remove_node(&absolute).is_some() {
-            for linked in state
-                .nodes
-                .iter_mut()
-                .filter(|node| node.identity == identity)
-            {
-                linked.link_count = linked
-                    .link_count
-                    .checked_sub(1)
-                    .expect("filesystem hardlink count underflow");
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn create_directory_at(
-        &mut self,
-        base: &FsDescriptor,
-        path: &str,
-        now_nanos: u64,
-    ) -> core::result::Result<(), fs_types::ErrorCode> {
-        if !base
-            .flags
-            .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
-        {
-            return Err(fs_types::ErrorCode::ReadOnly);
-        }
-        if base.kind != FsNodeKind::Directory {
-            return Err(fs_types::ErrorCode::NotDirectory);
-        }
-        let absolute =
-            crate::resolve_child_path(&base.path, path).map_err(map_component_fs_path_error)?;
-        if self.get_node(&base.path)?.readonly {
-            return Err(fs_types::ErrorCode::ReadOnly);
-        }
-
-        if absolute == "/" {
-            return Err(fs_types::ErrorCode::Exist);
-        }
-        if self.get_node(&absolute).is_ok() {
-            return Err(fs_types::ErrorCode::Exist);
-        }
-
-        let parent = crate::parent_path(&absolute);
-        let parent_node = self.get_node(parent)?;
-        if parent_node.kind != FsNodeKind::Directory {
-            return Err(fs_types::ErrorCode::NotDirectory);
-        }
-
-        let identity = self.allocate_identity();
-        self.snapshot.inner.lock().insert_node(FsNode::new(
-            absolute,
-            FsNodeKind::Directory,
-            FileContents::empty(),
-            identity,
-            now_nanos,
-            false,
-        ));
-        Ok(())
-    }
-
-    pub(crate) fn unlink_file_at(
-        &mut self,
-        base: &FsDescriptor,
-        path: &str,
-    ) -> core::result::Result<(), fs_types::ErrorCode> {
-        if !base
-            .flags
-            .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
-        {
-            return Err(fs_types::ErrorCode::ReadOnly);
-        }
-        let absolute =
-            crate::resolve_child_path(&base.path, path).map_err(map_component_fs_path_error)?;
-        let node = self.get_node(&absolute)?;
-        if node.readonly {
-            return Err(fs_types::ErrorCode::ReadOnly);
-        }
-        if node.kind == FsNodeKind::Directory {
-            return Err(fs_types::ErrorCode::IsDirectory);
-        }
-        self.snapshot.inner.lock().remove_node(&absolute);
-        Ok(())
-    }
-
-    pub(crate) fn link_at(
-        &mut self,
-        source_base: &FsDescriptor,
-        source_path: &str,
-        destination_base: &FsDescriptor,
-        destination_path: &str,
-        now_nanos: u64,
-    ) -> core::result::Result<(), fs_types::ErrorCode> {
-        if source_base.kind != FsNodeKind::Directory
-            || destination_base.kind != FsNodeKind::Directory
-        {
-            return Err(fs_types::ErrorCode::NotDirectory);
-        }
-        if !destination_base
-            .flags
-            .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
-        {
-            return Err(fs_types::ErrorCode::ReadOnly);
-        }
-        self.require_same_authority_domain(source_base, destination_base)?;
-
-        let source_absolute = crate::resolve_child_path(&source_base.path, source_path)
-            .map_err(map_component_fs_path_error)?;
-        let destination_absolute =
-            crate::resolve_child_path(&destination_base.path, destination_path)
-                .map_err(map_component_fs_path_error)?;
-        if source_absolute == "/" || destination_absolute == "/" {
-            return Err(fs_types::ErrorCode::NotPermitted);
-        }
-        if self.get_node(&destination_absolute).is_ok() {
-            return Err(fs_types::ErrorCode::Exist);
-        }
-
-        let source_node = self.get_node(&source_absolute)?;
-        if source_node.kind == FsNodeKind::Directory {
-            return Err(fs_types::ErrorCode::NotPermitted);
-        }
-        let destination_parent = crate::parent_path(&destination_absolute);
-        let destination_parent_node = self.get_node(destination_parent)?;
-        if destination_parent_node.kind != FsNodeKind::Directory {
-            return Err(fs_types::ErrorCode::NotDirectory);
-        }
-        if destination_parent_node.readonly {
-            return Err(fs_types::ErrorCode::ReadOnly);
-        }
-
-        let identity = source_node.identity;
-        let link_count = source_node
-            .link_count
-            .checked_add(1)
-            .expect("filesystem hardlink count overflow");
-        let mut linked = source_node.clone();
-        linked.path = destination_absolute;
-        linked.link_count = link_count;
-        linked.touch_status(now_nanos);
-        let mut state = self.snapshot.inner.lock();
-        for node in state
-            .nodes
-            .iter_mut()
-            .filter(|node| node.identity == identity)
-        {
-            node.link_count = link_count;
-            node.touch_status(now_nanos);
-        }
-        state.insert_node(linked);
-        Ok(())
-    }
-
-    pub(crate) fn symlink_at(
-        &mut self,
-        base: &FsDescriptor,
-        path: &str,
-        payload: &str,
-        now_nanos: u64,
-    ) -> core::result::Result<(), fs_types::ErrorCode> {
-        if base.kind != FsNodeKind::Directory {
-            return Err(fs_types::ErrorCode::NotDirectory);
-        }
-        if !base
-            .flags
-            .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
-        {
-            return Err(fs_types::ErrorCode::ReadOnly);
-        }
-        let absolute =
-            crate::resolve_child_path(&base.path, path).map_err(map_component_fs_path_error)?;
-        Self::resolve_symlink_payload(&absolute, payload)?;
-        if self.get_node(&absolute).is_ok() {
-            return Err(fs_types::ErrorCode::Exist);
-        }
-        let parent = crate::parent_path(&absolute);
-        let parent_node = self.get_node(parent)?;
-        if parent_node.kind != FsNodeKind::Directory {
-            return Err(fs_types::ErrorCode::NotDirectory);
-        }
-        if parent_node.readonly {
-            return Err(fs_types::ErrorCode::ReadOnly);
-        }
-        let identity = self.allocate_identity();
-        self.snapshot.inner.lock().insert_node(FsNode::new(
-            absolute,
-            FsNodeKind::Symlink,
-            FileContents::Written(Bytes::copy_from_slice(payload.as_bytes())),
-            identity,
-            now_nanos,
-            false,
-        ));
-        Ok(())
-    }
-
-    pub(crate) fn readlink_at(
-        &self,
-        base: &FsDescriptor,
-        path: &str,
-    ) -> core::result::Result<String, fs_types::ErrorCode> {
-        if base.kind != FsNodeKind::Directory {
-            return Err(fs_types::ErrorCode::NotDirectory);
-        }
-        let absolute =
-            crate::resolve_child_path(&base.path, path).map_err(map_component_fs_path_error)?;
-        let node = self.get_node(&absolute)?;
-        if node.kind != FsNodeKind::Symlink {
-            return Err(fs_types::ErrorCode::Invalid);
-        }
-        let payload = core::str::from_utf8(node.contents.as_slice())
-            .map_err(|_| fs_types::ErrorCode::IllegalByteSequence)?;
-        Ok(payload.to_owned())
-    }
-
-    pub(crate) fn rename_at(
-        &mut self,
-        source_base: &FsDescriptor,
-        source_path: &str,
-        destination_base: &FsDescriptor,
-        destination_path: &str,
-        now_nanos: u64,
-    ) -> core::result::Result<(), fs_types::ErrorCode> {
-        if source_base.kind != FsNodeKind::Directory
-            || destination_base.kind != FsNodeKind::Directory
-        {
-            return Err(fs_types::ErrorCode::NotDirectory);
-        }
-        if !source_base
-            .flags
-            .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
-            || !destination_base
-                .flags
-                .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
-        {
-            return Err(fs_types::ErrorCode::ReadOnly);
-        }
-        self.require_same_authority_domain(source_base, destination_base)?;
-        let source_absolute = crate::resolve_child_path(&source_base.path, source_path)
-            .map_err(map_component_fs_path_error)?;
-        let destination_absolute =
-            crate::resolve_child_path(&destination_base.path, destination_path)
-                .map_err(map_component_fs_path_error)?;
-
-        if self.get_node(&source_base.path)?.readonly
-            || self.get_node(&destination_base.path)?.readonly
-        {
-            return Err(fs_types::ErrorCode::ReadOnly);
-        }
-        if source_absolute == "/" || destination_absolute == "/" {
-            return Err(fs_types::ErrorCode::NotPermitted);
-        }
-        if source_absolute == destination_absolute {
-            return Ok(());
-        }
-
-        let source_node = self.get_node(&source_absolute)?.clone();
-        if source_node.readonly {
-            return Err(fs_types::ErrorCode::ReadOnly);
-        }
-        if self.get_node(&destination_absolute).is_ok() {
-            return Err(fs_types::ErrorCode::Exist);
-        }
-
-        let destination_parent = crate::parent_path(&destination_absolute);
-        let destination_parent_node = self.get_node(destination_parent)?;
-        if destination_parent_node.kind != FsNodeKind::Directory {
-            return Err(fs_types::ErrorCode::NotDirectory);
-        }
-        if destination_parent_node.readonly {
-            return Err(fs_types::ErrorCode::ReadOnly);
-        }
-
-        if source_node.kind == FsNodeKind::Directory
-            && (destination_absolute == source_absolute
-                || crate::path_is_within_directory(&destination_absolute, &source_absolute))
-        {
-            return Err(fs_types::ErrorCode::NotPermitted);
-        }
-
-        let mut state = self.snapshot.inner.lock();
-        for node in &mut state.nodes {
-            if node.path == source_absolute {
-                node.path = destination_absolute.clone();
-                node.touch_status(now_nanos);
-                continue;
-            }
-
-            if source_node.kind == FsNodeKind::Directory
-                && crate::path_is_within_directory(&node.path, &source_absolute)
-            {
-                node.path =
-                    append_path_suffix(&destination_absolute, &node.path[source_absolute.len()..]);
-                node.touch_status(now_nanos);
-            }
-        }
-        state.rebuild_path_index();
-
-        Ok(())
+        Poll::Ready(Ok(StreamResult::Dropped))
     }
 }
 
@@ -1978,53 +1146,7 @@ pub(crate) fn preopen_descriptor(preopen: &crate::DirectoryPreopen) -> FsDescrip
         kind: FsNodeKind::Directory,
         flags: descriptor_flags_from_authority(preopen.rights()),
         identity: None,
-    }
-}
-
-/// Node kind of a host-share object, from its 9p qid type bits.
-pub(crate) fn host_metadata_node_kind(metadata: &crate::HostMetadata) -> FsNodeKind {
-    if metadata.qid_type & P9_QID_TYPE_DIRECTORY != 0 {
-        FsNodeKind::Directory
-    } else {
-        FsNodeKind::File
-    }
-}
-
-/// Builds a WASI `descriptor-stat` from host-share metadata.
-///
-/// Timestamps and link count come from the host's own `Rgetattr`, so a guest
-/// sees the same mtime the host does. Object identity is not part of
-/// `descriptor-stat`; p2/p3 expose it through `metadata-hash` and preview1
-/// through `st_dev`/`st_ino`, both derived from
-/// [`crate::HostMetadata::identity`].
-pub(crate) fn descriptor_stat_from_host_metadata(
-    metadata: &crate::HostMetadata,
-) -> fs_types::DescriptorStat {
-    fs_types::DescriptorStat {
-        type_: descriptor_type_from_node_kind(host_metadata_node_kind(metadata)),
-        link_count: metadata.link_count,
-        size: metadata.size,
-        data_access_timestamp: Some(system_time_from_nanos(metadata.access_nanos)),
-        data_modification_timestamp: Some(system_time_from_nanos(metadata.modified_nanos)),
-        status_change_timestamp: Some(system_time_from_nanos(metadata.status_nanos)),
-    }
-}
-
-pub(crate) fn descriptor_type_from_node_kind(kind: FsNodeKind) -> fs_types::DescriptorType {
-    match kind {
-        FsNodeKind::Directory => fs_types::DescriptorType::Directory,
-        FsNodeKind::File => fs_types::DescriptorType::RegularFile,
-        FsNodeKind::Symlink => fs_types::DescriptorType::SymbolicLink,
-    }
-}
-
-pub(crate) fn metadata_hash_value(
-    identity: ObjectIdentity,
-    upper_entropy: u64,
-) -> fs_types::MetadataHashValue {
-    fs_types::MetadataHashValue {
-        lower: identity.local(),
-        upper: identity.domain().raw() ^ upper_entropy,
+        mount: None,
     }
 }
 
@@ -2044,24 +1166,10 @@ pub(super) fn descriptor_flags_from_authority(
     flags
 }
 
-pub(super) fn push_directory_entry_if_absent(
-    entries: &mut Vec<fs_types::DirectoryEntry>,
-    type_: fs_types::DescriptorType,
-    name: &str,
-) {
-    if entries.iter().any(|entry| entry.name == name) {
-        return;
-    }
-    entries.push(fs_types::DirectoryEntry {
-        type_,
-        name: name.to_string(),
-    });
-}
-
 pub(crate) fn validate_descriptor_flags_within_base(
     base_flags: fs_types::DescriptorFlags,
     requested: fs_types::DescriptorFlags,
-) -> core::result::Result<(), fs_types::ErrorCode> {
+) -> FsOpResult<()> {
     let authority_flags = fs_types::DescriptorFlags::READ
         | fs_types::DescriptorFlags::WRITE
         | fs_types::DescriptorFlags::MUTATE_DIRECTORY;
@@ -2075,7 +1183,7 @@ pub(crate) fn effective_open_descriptor_flags(
     base_flags: fs_types::DescriptorFlags,
     requested: fs_types::DescriptorFlags,
     kind: FsNodeKind,
-) -> core::result::Result<fs_types::DescriptorFlags, fs_types::ErrorCode> {
+) -> FsOpResult<fs_types::DescriptorFlags> {
     let mut effective = fs_types::DescriptorFlags::empty();
     if requested.contains(fs_types::DescriptorFlags::READ) {
         effective |= fs_types::DescriptorFlags::READ;
@@ -2092,11 +1200,62 @@ pub(crate) fn effective_open_descriptor_flags(
     Ok(effective)
 }
 
-impl<CpuImpl, Net, HostFs> wasi::filesystem::preopens::Host for StoreData<CpuImpl, Net, HostFs>
+/// A descriptor of the store's table and the store's namespace, for an
+/// operation to run on after the store is released.
+pub(crate) fn descriptor_in<CpuImpl, Net, StorageImpl>(
+    store: &mut StoreData<CpuImpl, Net, StorageImpl>,
+    resource: &Resource<FsDescriptor>,
+) -> FsOpResult<(FsDescriptor, Namespace<StorageImpl>)>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
+{
+    let descriptor = get_fs_descriptor(store, resource)?;
+    Ok((descriptor, store.filesystem().clone()))
+}
+
+/// Two descriptors of the store's table and the store's namespace.
+pub(crate) fn descriptor_pair_in<CpuImpl, Net, StorageImpl>(
+    store: &mut StoreData<CpuImpl, Net, StorageImpl>,
+    first: &Resource<FsDescriptor>,
+    second: &Resource<FsDescriptor>,
+) -> FsOpResult<(FsDescriptor, FsDescriptor, Namespace<StorageImpl>)>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    let first = get_fs_descriptor(store, first)?;
+    let second = get_fs_descriptor(store, second)?;
+    Ok((first, second, store.filesystem().clone()))
+}
+
+/// Answers a stream's `future<result>` with what its producer reports, or
+/// success when the producer went away without reporting.
+fn transfer_outcome<S: wasmtime::AsContextMut>(
+    store: S,
+    receiver: oneshot::Receiver<FsOpResult<()>>,
+) -> Result<FutureReader<FsOpResult<()>>> {
+    FutureReader::new(store, async move {
+        Ok::<_, wasmtime::Error>(receiver.await.unwrap_or(Ok(())))
+    })
+}
+
+/// A `future<result>` that already failed with `error`.
+fn failed_transfer<S: wasmtime::AsContextMut>(
+    store: S,
+    error: fs_types::ErrorCode,
+) -> Result<FutureReader<FsOpResult<()>>> {
+    FutureReader::new(store, async move { Ok::<_, wasmtime::Error>(Err(error)) })
+}
+
+impl<CpuImpl, Net, StorageImpl> wasi::filesystem::preopens::Host
+    for StoreData<CpuImpl, Net, StorageImpl>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
 {
     fn get_directories(&mut self) -> Result<Vec<(Resource<FsDescriptor>, String)>> {
         let preopens = self.process_authority().directory_preopens().to_vec();
@@ -2111,22 +1270,24 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> wasi::filesystem::types::Host for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> wasi::filesystem::types::Host
+    for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn convert_error_code(&mut self, error: FsError) -> Result<fs_types::ErrorCode> {
         error.downcast()
     }
 }
-impl<CpuImpl, Net, HostFs> wasi::filesystem::types::HostDescriptor
-    for StoreData<CpuImpl, Net, HostFs>
+
+impl<CpuImpl, Net, StorageImpl> wasi::filesystem::types::HostDescriptor
+    for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn drop(&mut self, descriptor: Resource<FsDescriptor>) -> Result<()> {
         self.table.delete(descriptor)?;
@@ -2134,107 +1295,53 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs, U> wasi::filesystem::types::HostDescriptorWithStore<U>
-    for HasSelf<StoreData<CpuImpl, Net, HostFs>>
+impl<CpuImpl, Net, StorageImpl, U> wasi::filesystem::types::HostDescriptorWithStore<U>
+    for HasSelf<StoreData<CpuImpl, Net, StorageImpl>>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn read_via_stream(
         mut accessor: Access<'_, U, Self>,
         descriptor: Resource<FsDescriptor>,
         offset: u64,
-    ) -> Result<(
-        StreamReader<u8>,
-        FutureReader<core::result::Result<(), fs_types::ErrorCode>>,
-    )> {
-        let getter = accessor.getter();
-        let descriptor = get_fs_descriptor(accessor.get(), &descriptor)?;
-        let host = HostFileStreamTarget::for_descriptor(accessor.get(), &descriptor)?;
-        let (tx, rx) = oneshot::channel();
-        let stream = StreamReader::new(
-            &mut accessor,
-            file_read_producer(getter, descriptor, offset, FILE_READ_CHUNK_BYTES, host, tx),
-        )?;
-        let future = FutureReader::new(&mut accessor, async move {
-            match rx.await {
-                Ok(result) => Ok::<_, wasmtime::Error>(result),
-                Err(_) => Ok::<_, wasmtime::Error>(Ok::<(), fs_types::ErrorCode>(())),
+    ) -> Result<(StreamReader<u8>, FutureReader<FsOpResult<()>>)> {
+        let resolved =
+            descriptor_in(accessor.get(), &descriptor).and_then(|(descriptor, namespace)| {
+                read_stream_target(&namespace, descriptor.grant()?)
+            });
+        match resolved {
+            Ok(resolved) => {
+                let (tx, rx) = oneshot::channel();
+                let stream = StreamReader::new(
+                    &mut accessor,
+                    file_read_producer(resolved, offset, FILE_READ_CHUNK_BYTES, tx),
+                )?;
+                Ok((stream, transfer_outcome(&mut accessor, rx)?))
             }
-        })
-        .map_err(FsError::trap)?;
-        Ok((stream, future))
+            Err(error) => {
+                let stream = StreamReader::new(&mut accessor, Vec::<u8>::new())?;
+                Ok((stream, failed_transfer(&mut accessor, error)?))
+            }
+        }
     }
 
     fn write_via_stream(
-        mut accessor: Access<'_, U, Self>,
+        accessor: Access<'_, U, Self>,
         descriptor: Resource<FsDescriptor>,
-        mut data: StreamReader<u8>,
+        data: StreamReader<u8>,
         offset: u64,
-    ) -> Result<FutureReader<core::result::Result<(), fs_types::ErrorCode>>> {
-        let offset: usize = offset
-            .try_into()
-            .map_err(|_| wasmtime::Error::new(WasiAdapterTrap::FileWriteOffsetOverflow))?;
-        let descriptor = get_fs_descriptor(accessor.get(), &descriptor).and_then(|descriptor| {
-            let host = HostFileStreamTarget::for_descriptor(accessor.get(), &descriptor)?;
-            Ok((descriptor, host))
-        });
-        let getter = accessor.getter();
-        match descriptor {
-            Ok((descriptor, host)) => {
-                let (tx, rx) = oneshot::channel();
-                data.pipe(
-                    &mut accessor,
-                    file_write_consumer(getter, descriptor, FileWriteMode::At(offset), host, tx),
-                )?;
-                FutureReader::new(&mut accessor, async move {
-                    match rx.await {
-                        Ok(result) => Ok::<_, wasmtime::Error>(result),
-                        Err(_) => Ok::<_, wasmtime::Error>(Ok::<(), fs_types::ErrorCode>(())),
-                    }
-                })
-            }
-            Err(error) => {
-                data.close(&mut accessor)?;
-                FutureReader::new(&mut accessor, async move {
-                    Ok::<_, wasmtime::Error>(Err::<(), fs_types::ErrorCode>(error))
-                })
-            }
-        }
+    ) -> Result<FutureReader<FsOpResult<()>>> {
+        pipe_into_file(accessor, descriptor, data, WritePosition::At(offset))
     }
 
     fn append_via_stream(
-        mut accessor: Access<'_, U, Self>,
+        accessor: Access<'_, U, Self>,
         descriptor: Resource<FsDescriptor>,
-        mut data: StreamReader<u8>,
-    ) -> Result<FutureReader<core::result::Result<(), fs_types::ErrorCode>>> {
-        let descriptor = get_fs_descriptor(accessor.get(), &descriptor).and_then(|descriptor| {
-            let host = HostFileStreamTarget::for_descriptor(accessor.get(), &descriptor)?;
-            Ok((descriptor, host))
-        });
-        let getter = accessor.getter();
-        match descriptor {
-            Ok((descriptor, host)) => {
-                let (tx, rx) = oneshot::channel();
-                data.pipe(
-                    &mut accessor,
-                    file_write_consumer(getter, descriptor, FileWriteMode::Append, host, tx),
-                )?;
-                FutureReader::new(&mut accessor, async move {
-                    match rx.await {
-                        Ok(result) => Ok::<_, wasmtime::Error>(result),
-                        Err(_) => Ok::<_, wasmtime::Error>(Ok::<(), fs_types::ErrorCode>(())),
-                    }
-                })
-            }
-            Err(error) => {
-                data.close(&mut accessor)?;
-                FutureReader::new(&mut accessor, async move {
-                    Ok::<_, wasmtime::Error>(Err::<(), fs_types::ErrorCode>(error))
-                })
-            }
-        }
+        data: StreamReader<u8>,
+    ) -> Result<FutureReader<FsOpResult<()>>> {
+        pipe_into_file(accessor, descriptor, data, WritePosition::End)
     }
 
     async fn advise(
@@ -2254,7 +1361,9 @@ where
         accessor: &Accessor<U, Self>,
         descriptor: Resource<FsDescriptor>,
     ) -> Result<(), FsError> {
-        sync_descriptor(accessor, descriptor).await
+        let (descriptor, namespace) =
+            accessor.with(|mut access| descriptor_in(access.get(), &descriptor))?;
+        Ok(sync(&namespace, &descriptor, true).await?)
     }
 
     async fn get_flags(
@@ -2274,12 +1383,7 @@ where
         let profile = accessor.with(|mut access| component_fs_profile(access.get()));
         let result = accessor.with(|mut access| {
             let descriptor = get_fs_descriptor(access.get(), &descriptor)?;
-            let kind = match descriptor.kind {
-                FsNodeKind::Directory => fs_types::DescriptorType::Directory,
-                FsNodeKind::File => fs_types::DescriptorType::RegularFile,
-                FsNodeKind::Symlink => fs_types::DescriptorType::SymbolicLink,
-            };
-            Ok(kind)
+            Ok(descriptor_type_from_node_kind(descriptor.kind))
         });
         record_component_fs_profile(profile, "get-type");
         result
@@ -2290,41 +1394,11 @@ where
         descriptor: Resource<FsDescriptor>,
         size: u64,
     ) -> Result<(), FsError> {
-        let (path, flags) = accessor
-            .with(|mut access| {
-                let descriptor = get_fs_descriptor(access.get(), &descriptor)?;
-                Ok::<_, FsError>((descriptor.path.clone(), descriptor.flags))
-            })
-            .map_err(FsError::trap)?;
-        if let Some(host_path) = crate::guest_host_share_path(&path).map(|p| p.to_owned()) {
-            if !flags.contains(fs_types::DescriptorFlags::WRITE) {
-                return Err(fs_types::ErrorCode::NotPermitted.into());
-            }
-            let service = accessor.with(|mut access| {
-                access
-                    .get()
-                    .filesystem()
-                    .host_service()
-                    .map_err(FsError::from)
-            })?;
-            service
-                .set_file_size(&host_path, size)
-                .await
-                .map_err(map_host_fs_error)?;
-            accessor.with(|mut access| {
-                access.get().filesystem_mut().invalidate_host_subtree(&path);
-            });
-            return Ok(());
-        }
-        accessor.with(|mut access| {
-            let descriptor = get_fs_descriptor(access.get(), &descriptor)?;
-            let now_nanos = access.get().now_nanos();
-            access
-                .get()
-                .filesystem_mut()
-                .set_size(&descriptor, size, now_nanos)
-                .map_err(Into::into)
-        })
+        let (descriptor, namespace, now) = accessor.with(|mut access| {
+            let (descriptor, namespace) = descriptor_in(access.get(), &descriptor)?;
+            Ok::<_, fs_types::ErrorCode>((descriptor, namespace, access.get().now_nanos()))
+        })?;
+        Ok(self::set_size(&namespace, descriptor.grant()?, size, now).await?)
     }
 
     async fn set_times(
@@ -2333,41 +1407,28 @@ where
         data_access_timestamp: fs_types::NewTimestamp,
         data_modification_timestamp: fs_types::NewTimestamp,
     ) -> Result<(), FsError> {
-        let (path, access_nanos, modified_nanos) = accessor
-            .with(|mut access| {
-                let now_nanos = access.get().system_time_nanos();
-                let access_nanos = p3_new_timestamp_nanos(data_access_timestamp, now_nanos)?;
-                let modified_nanos =
-                    p3_new_timestamp_nanos(data_modification_timestamp, now_nanos)?;
-                let descriptor = get_fs_descriptor(access.get(), &descriptor)?;
-                Ok::<_, FsError>((descriptor.path.clone(), access_nanos, modified_nanos))
-            })
-            .map_err(FsError::trap)?;
-        if let Some(host_path) = crate::guest_host_share_path(&path).map(|p| p.to_owned()) {
-            let service = accessor.with(|mut access| {
-                access
-                    .get()
-                    .filesystem()
-                    .host_service()
-                    .map_err(FsError::from)
-            })?;
-            service
-                .set_times(&host_path, access_nanos, modified_nanos)
-                .await
-                .map_err(map_host_fs_error)?;
+        let (descriptor, namespace, access_nanos, modified_nanos, now) =
             accessor.with(|mut access| {
-                access.get().filesystem_mut().invalidate_host_subtree(&path);
-            });
-            return Ok(());
-        }
-        accessor.with(|mut access| {
-            let now_nanos = access.get().system_time_nanos();
-            access
-                .get()
-                .filesystem_mut()
-                .set_times_at_path(&path, access_nanos, modified_nanos, now_nanos)
-                .map_err(Into::into)
-        })
+                let now = access.get().system_time_nanos();
+                let access_nanos = p3_new_timestamp_nanos(data_access_timestamp, now)?;
+                let modified_nanos = p3_new_timestamp_nanos(data_modification_timestamp, now)?;
+                let (descriptor, namespace) = descriptor_in(access.get(), &descriptor)?;
+                Ok::<_, fs_types::ErrorCode>((
+                    descriptor,
+                    namespace,
+                    access_nanos,
+                    modified_nanos,
+                    now,
+                ))
+            })?;
+        Ok(self::set_times(
+            &namespace,
+            descriptor.grant_touch()?,
+            access_nanos,
+            modified_nanos,
+            now,
+        )
+        .await?)
     }
 
     fn read_directory(
@@ -2375,29 +1436,21 @@ where
         descriptor: Resource<FsDescriptor>,
     ) -> Result<(
         StreamReader<fs_types::DirectoryEntry>,
-        FutureReader<core::result::Result<(), fs_types::ErrorCode>>,
+        FutureReader<FsOpResult<()>>,
     )> {
-        let profile = component_fs_profile(accessor.get());
-        let entries = {
-            let descriptor = get_fs_descriptor(accessor.get(), &descriptor)?;
-            accessor.get().filesystem().read_directory(&descriptor.path)
-        };
-        record_component_fs_profile(profile, "read-directory");
-        match entries {
-            Ok(entries) => {
-                let stream = StreamReader::new(&mut accessor, entries)?;
-                let future = FutureReader::new(&mut accessor, async {
-                    Ok::<_, wasmtime::Error>(Ok::<(), fs_types::ErrorCode>(()))
-                })?;
-                Ok((stream, future))
+        match descriptor_in(accessor.get(), &descriptor) {
+            Ok((descriptor, namespace)) => {
+                let (tx, rx) = oneshot::channel();
+                let stream = StreamReader::new(
+                    &mut accessor,
+                    directory_producer(namespace, descriptor, tx),
+                )?;
+                Ok((stream, transfer_outcome(&mut accessor, rx)?))
             }
             Err(error) => {
                 let stream =
                     StreamReader::new(&mut accessor, Vec::<fs_types::DirectoryEntry>::new())?;
-                let future = FutureReader::new(&mut accessor, async move {
-                    Ok::<_, wasmtime::Error>(Err::<(), fs_types::ErrorCode>(error))
-                })?;
-                Ok((stream, future))
+                Ok((stream, failed_transfer(&mut accessor, error)?))
             }
         }
     }
@@ -2406,7 +1459,9 @@ where
         accessor: &Accessor<U, Self>,
         descriptor: Resource<FsDescriptor>,
     ) -> Result<(), FsError> {
-        sync_descriptor(accessor, descriptor).await
+        let (descriptor, namespace) =
+            accessor.with(|mut access| descriptor_in(access.get(), &descriptor))?;
+        Ok(self::sync(&namespace, &descriptor, false).await?)
     }
 
     async fn create_directory_at(
@@ -2414,49 +1469,11 @@ where
         descriptor: Resource<FsDescriptor>,
         path: String,
     ) -> Result<(), FsError> {
-        let (absolute, base_flags, base_kind) = accessor
-            .with(|mut access| {
-                let base = get_fs_descriptor(access.get(), &descriptor)?;
-                let absolute = crate::resolve_child_path(&base.path, &path)
-                    .map_err(map_component_fs_path_error)?;
-                Ok::<_, FsError>((absolute, base.flags, base.kind))
-            })
-            .map_err(FsError::trap)?;
-        if !base_flags.contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY) {
-            return Err(fs_types::ErrorCode::ReadOnly.into());
-        }
-        if base_kind != FsNodeKind::Directory {
-            return Err(fs_types::ErrorCode::NotDirectory.into());
-        }
-        if let Some(host_path) = crate::guest_host_share_path(&absolute).map(|p| p.to_owned()) {
-            let service = accessor.with(|mut access| {
-                access
-                    .get()
-                    .filesystem()
-                    .host_service()
-                    .map_err(FsError::from)
-            })?;
-            service
-                .create_directory(&host_path)
-                .await
-                .map_err(map_host_fs_error)?;
-            accessor.with(|mut access| {
-                access
-                    .get()
-                    .filesystem_mut()
-                    .invalidate_host_subtree(&absolute);
-            });
-            return Ok(());
-        }
-        accessor.with(|mut access| {
-            let descriptor = get_fs_descriptor(access.get(), &descriptor)?;
-            let now_nanos = access.get().now_nanos();
-            access
-                .get()
-                .filesystem_mut()
-                .create_directory_at(&descriptor, &path, now_nanos)
-                .map_err(Into::into)
-        })
+        let (base, namespace, now) = accessor.with(|mut access| {
+            let (base, namespace) = descriptor_in(access.get(), &descriptor)?;
+            Ok::<_, fs_types::ErrorCode>((base, namespace, access.get().now_nanos()))
+        })?;
+        Ok(self::create_directory_at(&namespace, base.grant()?, &path, now).await?)
     }
 
     async fn stat(
@@ -2464,36 +1481,13 @@ where
         descriptor: Resource<FsDescriptor>,
     ) -> Result<fs_types::DescriptorStat, FsError> {
         let profile = accessor.with(|mut access| component_fs_profile(access.get()));
-        // Extract path from the descriptor synchronously, then do the
-        // (potentially async) FS operation outside the accessor so the
-        // kernel executor can drive the 9p transport concurrently.
-        let path = accessor
-            .with(|mut access| {
-                let descriptor = get_fs_descriptor(access.get(), &descriptor)?;
-                Ok::<_, FsError>(descriptor.path.clone())
-            })
-            .map_err(FsError::trap)?;
-        let host_path = crate::guest_host_share_path(&path).map(|p| p.to_owned());
-        if let Some(host_path) = host_path {
-            let service = accessor.with(|mut access| {
-                access
-                    .get()
-                    .filesystem()
-                    .host_service()
-                    .map_err(FsError::from)
-            })?;
-            let metadata = service
-                .stat_path(&host_path)
-                .await
-                .map_err(map_host_fs_error)?;
-            let result = descriptor_stat_from_host_metadata(&metadata);
-            record_component_fs_profile(profile, "stat");
-            return Ok(result);
-        }
-        let result =
-            accessor.with(|mut access| access.get().filesystem().stat(&path).map_err(Into::into));
+        let (descriptor, namespace) =
+            accessor.with(|mut access| descriptor_in(access.get(), &descriptor))?;
+        let result = stat_path(&namespace, &descriptor.path, Follow::No)
+            .await
+            .map(|metadata| descriptor_stat(&metadata));
         record_component_fs_profile(profile, "stat");
-        result
+        Ok(result?)
     }
 
     async fn stat_at(
@@ -2503,42 +1497,13 @@ where
         path: String,
     ) -> Result<fs_types::DescriptorStat, FsError> {
         let profile = accessor.with(|mut access| component_fs_profile(access.get()));
-        // Guest filesystem has no symlinks; SYMLINK_FOLLOW is a no-op.
-        let _ = path_flags;
-        let absolute = accessor
-            .with(|mut access| {
-                let descriptor = get_fs_descriptor(access.get(), &descriptor)?;
-                crate::resolve_child_path(&descriptor.path, &path)
-                    .map_err(map_component_fs_path_error)
-                    .map_err(FsError::from)
-            })
-            .map_err(FsError::trap)?;
-        let host_path = crate::guest_host_share_path(&absolute).map(|p| p.to_owned());
-        if let Some(host_path) = host_path {
-            let service = accessor.with(|mut access| {
-                access
-                    .get()
-                    .filesystem()
-                    .host_service()
-                    .map_err(FsError::from)
-            })?;
-            let metadata = service
-                .stat_path(&host_path)
-                .await
-                .map_err(map_host_fs_error)?;
-            let result = descriptor_stat_from_host_metadata(&metadata);
-            record_component_fs_profile(profile, "stat-at");
-            return Ok(result);
-        }
-        let result = accessor.with(|mut access| {
-            access
-                .get()
-                .filesystem()
-                .stat(&absolute)
-                .map_err(Into::into)
-        });
+        let (base, namespace) =
+            accessor.with(|mut access| descriptor_in(access.get(), &descriptor))?;
+        let result = self::stat_at(&namespace, base.grant()?, path_flags, &path)
+            .await
+            .map(|metadata| descriptor_stat(&metadata));
         record_component_fs_profile(profile, "stat-at");
-        result
+        Ok(result?)
     }
 
     async fn set_times_at(
@@ -2549,45 +1514,23 @@ where
         data_access_timestamp: fs_types::NewTimestamp,
         data_modification_timestamp: fs_types::NewTimestamp,
     ) -> Result<(), FsError> {
-        let (absolute, access_nanos, modified_nanos, now_nanos) = accessor
-            .with(|mut access| {
-                let now_nanos = access.get().system_time_nanos();
-                let access_nanos = p3_new_timestamp_nanos(data_access_timestamp, now_nanos)?;
-                let modified_nanos =
-                    p3_new_timestamp_nanos(data_modification_timestamp, now_nanos)?;
-                let descriptor = get_fs_descriptor(access.get(), &descriptor)?;
-                let absolute = crate::resolve_child_path(&descriptor.path, &path)
-                    .map_err(map_component_fs_path_error)?;
-                Ok::<_, FsError>((absolute, access_nanos, modified_nanos, now_nanos))
-            })
-            .map_err(FsError::trap)?;
-        if let Some(host_path) = crate::guest_host_share_path(&absolute).map(|p| p.to_owned()) {
-            let service = accessor.with(|mut access| {
-                access
-                    .get()
-                    .filesystem()
-                    .host_service()
-                    .map_err(FsError::from)
-            })?;
-            service
-                .set_times(&host_path, access_nanos, modified_nanos)
-                .await
-                .map_err(map_host_fs_error)?;
+        let (base, namespace, access_nanos, modified_nanos, now) =
             accessor.with(|mut access| {
-                access
-                    .get()
-                    .filesystem_mut()
-                    .invalidate_host_subtree(&absolute);
-            });
-            return Ok(());
-        }
-        accessor.with(|mut access| {
-            access
-                .get()
-                .filesystem_mut()
-                .set_times_at_path(&absolute, access_nanos, modified_nanos, now_nanos)
-                .map_err(Into::into)
-        })
+                let now = access.get().system_time_nanos();
+                let access_nanos = p3_new_timestamp_nanos(data_access_timestamp, now)?;
+                let modified_nanos = p3_new_timestamp_nanos(data_modification_timestamp, now)?;
+                let (base, namespace) = descriptor_in(access.get(), &descriptor)?;
+                Ok::<_, fs_types::ErrorCode>((base, namespace, access_nanos, modified_nanos, now))
+            })?;
+        Ok(self::set_times_at(
+            &namespace,
+            base.grant()?,
+            &path,
+            access_nanos,
+            modified_nanos,
+            now,
+        )
+        .await?)
     }
 
     async fn link_at(
@@ -2598,93 +1541,25 @@ where
         destination_descriptor: Resource<FsDescriptor>,
         destination_path: String,
     ) -> Result<(), FsError> {
-        let allowed = accessor
-            .with(|mut access| {
-                let authority = access.get().process_authority();
-                Ok::<_, wasmtime::Error>(
-                    authority.derive_link_source_cap().is_ok()
-                        && authority.derive_link_target_directory_cap().is_ok(),
-                )
-            })
-            .map_err(FsError::trap)?;
-        if !allowed {
-            return Err(fs_types::ErrorCode::NotPermitted.into());
-        }
-
-        let (
-            source_absolute,
-            destination_absolute,
-            source_kind,
-            destination_kind,
-            destination_flags,
-        ) = accessor.with(|mut access| {
-            let source_base = get_fs_descriptor(access.get(), &source_descriptor)?;
-            let destination_base = get_fs_descriptor(access.get(), &destination_descriptor)?;
-            let source_absolute = crate::resolve_child_path(&source_base.path, &source_path)
-                .map_err(map_component_fs_path_error)?;
-            let destination_absolute =
-                crate::resolve_child_path(&destination_base.path, &destination_path)
-                    .map_err(map_component_fs_path_error)?;
-            Ok::<_, FsError>((
-                source_absolute,
-                destination_absolute,
-                source_base.kind,
-                destination_base.kind,
-                destination_base.flags,
-            ))
-        })?;
-        if source_kind != FsNodeKind::Directory || destination_kind != FsNodeKind::Directory {
-            return Err(fs_types::ErrorCode::NotDirectory.into());
-        }
-        let source_host = crate::guest_host_share_path(&source_absolute).map(|p| p.to_owned());
-        let destination_host =
-            crate::guest_host_share_path(&destination_absolute).map(|p| p.to_owned());
-        if source_host.is_some() || destination_host.is_some() {
-            if !destination_flags.contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY) {
-                return Err(fs_types::ErrorCode::ReadOnly.into());
+        let (source_base, destination_base, namespace, now) = accessor.with(|mut access| {
+            let authority = access.get().process_authority();
+            if authority.derive_link_source_cap().is_err()
+                || authority.derive_link_target_directory_cap().is_err()
+            {
+                return Err(fs_types::ErrorCode::NotPermitted);
             }
-            let Some(source_host) = source_host else {
-                return Err(fs_types::ErrorCode::CrossDevice.into());
-            };
-            let Some(destination_host) = destination_host else {
-                return Err(fs_types::ErrorCode::CrossDevice.into());
-            };
-            let service = accessor.with(|mut access| {
-                access
-                    .get()
-                    .filesystem()
-                    .host_service()
-                    .map_err(FsError::from)
-            })?;
-            service
-                .hard_link(&source_host, &destination_host)
-                .await
-                .map_err(map_host_fs_error)?;
-            accessor.with(|mut access| {
-                access
-                    .get()
-                    .filesystem_mut()
-                    .invalidate_host_subtree(&destination_absolute);
-            });
-            return Ok(());
-        }
-
-        accessor.with(|mut access| {
-            let source_base = get_fs_descriptor(access.get(), &source_descriptor)?;
-            let destination_base = get_fs_descriptor(access.get(), &destination_descriptor)?;
-            let now_nanos = access.get().now_nanos();
-            access
-                .get()
-                .filesystem_mut()
-                .link_at(
-                    &source_base,
-                    &source_path,
-                    &destination_base,
-                    &destination_path,
-                    now_nanos,
-                )
-                .map_err(Into::into)
-        })
+            let (source, destination, namespace) =
+                descriptor_pair_in(access.get(), &source_descriptor, &destination_descriptor)?;
+            Ok((source, destination, namespace, access.get().now_nanos()))
+        })?;
+        Ok(self::link_at(
+            &namespace,
+            source_base.grant()?.alias_into(destination_base.grant()?)?,
+            &source_path,
+            &destination_path,
+            now,
+        )
+        .await?)
     }
 
     async fn open_at(
@@ -2696,153 +1571,23 @@ where
         flags: fs_types::DescriptorFlags,
     ) -> Result<Resource<FsDescriptor>, FsError> {
         let profile = accessor.with(|mut access| component_fs_profile(access.get()));
-        // Extract base descriptor data and resolve absolute path synchronously.
-        let (base_path, base_kind, base_flags) = accessor.with(|mut access| {
-            let base = get_fs_descriptor(access.get(), &descriptor)?;
-            Ok::<_, FsError>((base.path.clone(), base.kind, base.flags))
+        let (base, namespace, now) = accessor.with(|mut access| {
+            let (base, namespace) = descriptor_in(access.get(), &descriptor)?;
+            Ok::<_, fs_types::ErrorCode>((base, namespace, access.get().now_nanos()))
         })?;
-
-        // No symlinks in our guest FS — SYMLINK_FOLLOW is a no-op.
-        let _ = path_flags;
-        if base_kind != FsNodeKind::Directory {
-            return Err(fs_types::ErrorCode::NotDirectory.into());
-        }
-
-        let absolute =
-            crate::resolve_child_path(&base_path, &path).map_err(map_component_fs_path_error)?;
-        let host_path = crate::guest_host_share_path(&absolute).map(|p| p.to_owned());
-
-        if let Some(host_path) = host_path {
-            // Host filesystem path — do async I/O outside accessor.
-            let service = accessor.with(|mut access| {
-                access
-                    .get()
-                    .filesystem()
-                    .host_service()
-                    .map_err(FsError::from)
-            })?;
-
-            let metadata = service.stat_path(&host_path).await;
-            match metadata {
-                Ok(metadata) => {
-                    let kind = host_metadata_node_kind(&metadata);
-                    if open_flags.contains(fs_types::OpenFlags::EXCLUSIVE)
-                        && open_flags.contains(fs_types::OpenFlags::CREATE)
-                    {
-                        return Err(fs_types::ErrorCode::Exist.into());
-                    }
-                    if open_flags.contains(fs_types::OpenFlags::DIRECTORY)
-                        && kind != FsNodeKind::Directory
-                    {
-                        return Err(fs_types::ErrorCode::NotDirectory.into());
-                    }
-                    if !open_flags.contains(fs_types::OpenFlags::DIRECTORY)
-                        && kind == FsNodeKind::Directory
-                    {
-                        return Err(fs_types::ErrorCode::IsDirectory.into());
-                    }
-                    let descriptor_flags =
-                        effective_open_descriptor_flags(base_flags, flags, kind)?;
-                    if open_flags.contains(fs_types::OpenFlags::TRUNCATE) {
-                        if kind != FsNodeKind::File {
-                            return Err(fs_types::ErrorCode::IsDirectory.into());
-                        }
-                        if !base_flags.contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY) {
-                            return Err(fs_types::ErrorCode::ReadOnly.into());
-                        }
-                        service
-                            .truncate_file(&host_path)
-                            .await
-                            .map_err(map_host_fs_error)?;
-                    }
-                    // Host files are not materialised in kernel memory here:
-                    // the descriptor only records where the file lives, and
-                    // `read-via-stream` pulls bounded chunks over 9p as the
-                    // guest consumes them.
-                    if kind == FsNodeKind::File {
-                        let opened = FsDescriptor {
-                            path: absolute,
-                            kind,
-                            flags: descriptor_flags,
-                            identity: Some(metadata.identity),
-                        };
-                        let result = accessor
-                            .with(|mut access| access.get().table.push(opened))
-                            .map_err(FsError::trap);
-                        record_component_fs_profile(profile, "open-at");
-                        return result;
-                    }
-                    // Directory — eagerly seed its direct children into the
-                    // embedded FS so read_directory can walk them without
-                    // re-entering async 9p I/O.
-                    // The whole listing is mirrored, so the bound is the mirror's.
-                    let entries = service
-                        .read_dir(&host_path, GUEST_DIRECTORY_MIRROR_LIMIT)
-                        .await
-                        .map_err(map_host_fs_error)?;
-                    let opened = FsDescriptor {
-                        path: absolute.clone(),
-                        kind,
-                        flags: descriptor_flags,
-                        identity: Some(metadata.identity),
-                    };
-                    let result = accessor.with(|mut access| {
-                        access
-                            .get()
-                            .filesystem_mut()
-                            .seed_host_directory_entries(&absolute, entries);
-                        access.get().table.push(opened).map_err(FsError::trap)
-                    });
-                    record_component_fs_profile(profile, "open-at");
-                    return result;
-                }
-                Err(err) => {
-                    let err = map_host_fs_error(err);
-                    if matches!(err, fs_types::ErrorCode::NoEntry)
-                        && open_flags.contains(fs_types::OpenFlags::CREATE)
-                    {
-                        if !base_flags.contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY) {
-                            return Err(fs_types::ErrorCode::ReadOnly.into());
-                        }
-                        service
-                            .create_file(&host_path)
-                            .await
-                            .map_err(map_host_fs_error)?;
-                        let metadata = service
-                            .stat_path(&host_path)
-                            .await
-                            .map_err(map_host_fs_error)?;
-                        let descriptor_flags =
-                            effective_open_descriptor_flags(base_flags, flags, FsNodeKind::File)?;
-                        let opened = FsDescriptor {
-                            path: absolute,
-                            kind: FsNodeKind::File,
-                            flags: descriptor_flags,
-                            identity: Some(metadata.identity),
-                        };
-                        let result = accessor.with(|mut access| {
-                            access.get().table.push(opened).map_err(FsError::trap)
-                        });
-                        record_component_fs_profile(profile, "open-at");
-                        return result;
-                    }
-                    return Err(err.into());
-                }
-            }
-        }
-
-        // Embedded filesystem path — fully synchronous.
-        let result = accessor.with(|mut access| {
-            let base = get_fs_descriptor(access.get(), &descriptor)?;
-            let now_nanos = access.get().now_nanos();
-            let opened = access
-                .get()
-                .filesystem_mut()
-                .open_at(&base, path_flags, &path, open_flags, flags, now_nanos)
-                .map_err(FsError::from)?;
-            let resource = access.get().table.push(opened).map_err(FsError::trap)?;
-            Ok(resource)
-        });
+        let opened = self::open_at(
+            &namespace,
+            base.grant()?,
+            path_flags,
+            &path,
+            open_flags,
+            flags,
+            now,
+        )
+        .await?;
+        let result = accessor
+            .with(|mut access| access.get().table.push(opened))
+            .map_err(FsError::trap);
         record_component_fs_profile(profile, "open-at");
         result
     }
@@ -2852,53 +1597,18 @@ where
         descriptor: Resource<FsDescriptor>,
         path: String,
     ) -> Result<String, FsError> {
-        let allowed = accessor
-            .with(|mut access| {
-                Ok::<_, wasmtime::Error>(
-                    access
-                        .get()
-                        .process_authority()
-                        .derive_symlink_read_cap()
-                        .is_ok(),
-                )
-            })
-            .map_err(FsError::trap)?;
-        if !allowed {
-            return Err(fs_types::ErrorCode::NotPermitted.into());
-        }
-        let (absolute, host_path) = accessor.with(|mut access| {
-            let descriptor = get_fs_descriptor(access.get(), &descriptor)?;
-            if descriptor.kind != FsNodeKind::Directory {
-                return Err(fs_types::ErrorCode::NotDirectory.into());
-            }
-            let absolute = crate::resolve_child_path(&descriptor.path, &path)
-                .map_err(map_component_fs_path_error)?;
-            let host_path = crate::guest_host_share_path(&absolute).map(|p| p.to_owned());
-            Ok::<_, FsError>((absolute, host_path))
-        })?;
-        if let Some(host_path) = host_path {
-            let service = accessor.with(|mut access| {
-                access
-                    .get()
-                    .filesystem()
-                    .host_service()
-                    .map_err(FsError::from)
-            })?;
-            let payload = service
-                .read_link(&host_path)
-                .await
-                .map_err(map_host_fs_error)?;
-            resolve_symlink_payload(&absolute, &payload)?;
-            return Ok(payload);
-        }
-        accessor.with(|mut access| {
-            let descriptor = get_fs_descriptor(access.get(), &descriptor)?;
-            access
+        let (base, namespace) = accessor.with(|mut access| {
+            if access
                 .get()
-                .filesystem()
-                .readlink_at(&descriptor, &path)
-                .map_err(Into::into)
-        })
+                .process_authority()
+                .derive_symlink_read_cap()
+                .is_err()
+            {
+                return Err(fs_types::ErrorCode::NotPermitted);
+            }
+            descriptor_in(access.get(), &descriptor)
+        })?;
+        Ok(self::readlink_at(&namespace, base.grant()?, &path).await?)
     }
 
     async fn remove_directory_at(
@@ -2906,44 +1616,9 @@ where
         descriptor: Resource<FsDescriptor>,
         path: String,
     ) -> Result<(), FsError> {
-        let (absolute, base_flags) = accessor.with(|mut access| {
-            let base = get_fs_descriptor(access.get(), &descriptor)?;
-            let absolute = crate::resolve_child_path(&base.path, &path)
-                .map_err(map_component_fs_path_error)?;
-            Ok::<_, FsError>((absolute, base.flags))
-        })?;
-        if !base_flags.contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY) {
-            return Err(fs_types::ErrorCode::ReadOnly.into());
-        }
-        if let Some(host_path) = crate::guest_host_share_path(&absolute).map(|p| p.to_owned()) {
-            let service = accessor.with(|mut access| {
-                access
-                    .get()
-                    .filesystem()
-                    .host_service()
-                    .map_err(FsError::from)
-            })?;
-            service
-                .remove(&host_path, true)
-                .await
-                .map_err(map_host_fs_error)?;
-            // Drop any cached embedded entries that mirrored this host path.
-            accessor.with(|mut access| {
-                access
-                    .get()
-                    .filesystem_mut()
-                    .invalidate_host_subtree(&absolute);
-            });
-            return Ok(());
-        }
-        accessor.with(|mut access| {
-            let descriptor = get_fs_descriptor(access.get(), &descriptor)?;
-            access
-                .get()
-                .filesystem_mut()
-                .remove_directory_at(&descriptor, &path)
-                .map_err(Into::into)
-        })
+        let (base, namespace) =
+            accessor.with(|mut access| descriptor_in(access.get(), &descriptor))?;
+        Ok(self::remove_directory_at(&namespace, base.grant()?, &path).await?)
     }
 
     async fn rename_at(
@@ -2953,71 +1628,22 @@ where
         destination_descriptor: Resource<FsDescriptor>,
         destination_path: String,
     ) -> Result<(), FsError> {
-        let (source_absolute, destination_absolute, source_flags, destination_flags) = accessor
-            .with(|mut access| {
-                let source_base = get_fs_descriptor(access.get(), &source_descriptor)?;
-                let destination_base = get_fs_descriptor(access.get(), &destination_descriptor)?;
-                let source_absolute = crate::resolve_child_path(&source_base.path, &source_path)
-                    .map_err(map_component_fs_path_error)?;
-                let destination_absolute =
-                    crate::resolve_child_path(&destination_base.path, &destination_path)
-                        .map_err(map_component_fs_path_error)?;
-                Ok::<_, FsError>((
-                    source_absolute,
-                    destination_absolute,
-                    source_base.flags,
-                    destination_base.flags,
-                ))
-            })?;
-        if !source_flags.contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
-            || !destination_flags.contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
-        {
-            return Err(fs_types::ErrorCode::ReadOnly.into());
-        }
-        let source_host = crate::guest_host_share_path(&source_absolute).map(|p| p.to_owned());
-        let destination_host =
-            crate::guest_host_share_path(&destination_absolute).map(|p| p.to_owned());
-        if source_host.is_some() || destination_host.is_some() {
-            let Some(source_host) = source_host else {
-                return Err(fs_types::ErrorCode::CrossDevice.into());
-            };
-            let Some(destination_host) = destination_host else {
-                return Err(fs_types::ErrorCode::CrossDevice.into());
-            };
-            let service = accessor.with(|mut access| {
-                access
-                    .get()
-                    .filesystem()
-                    .host_service()
-                    .map_err(FsError::from)
-            })?;
-            service
-                .rename(&source_host, &destination_host)
-                .await
-                .map_err(map_host_fs_error)?;
-            accessor.with(|mut access| {
-                let fs = access.get().filesystem_mut();
-                fs.invalidate_host_subtree(&source_absolute);
-                fs.invalidate_host_subtree(&destination_absolute);
-            });
-            return Ok(());
-        }
-        accessor.with(|mut access| {
-            let source_base = get_fs_descriptor(access.get(), &source_descriptor)?;
-            let destination_base = get_fs_descriptor(access.get(), &destination_descriptor)?;
-            let now_nanos = access.get().now_nanos();
-            access
-                .get()
-                .filesystem_mut()
-                .rename_at(
-                    &source_base,
-                    &source_path,
-                    &destination_base,
-                    &destination_path,
-                    now_nanos,
-                )
-                .map_err(Into::into)
-        })
+        let (source_base, destination_base, namespace, now) = accessor.with(|mut access| {
+            let (source, destination, namespace) =
+                descriptor_pair_in(access.get(), &source_descriptor, &destination_descriptor)?;
+            Ok::<_, fs_types::ErrorCode>((source, destination, namespace, access.get().now_nanos()))
+        })?;
+        Ok(self::rename_at(
+            &namespace,
+            source_base
+                .grant()?
+                .alias_into(destination_base.grant()?)?
+                .removing_source()?,
+            &source_path,
+            &destination_path,
+            now,
+        )
+        .await?)
     }
 
     async fn symlink_at(
@@ -3026,62 +1652,19 @@ where
         old_path: String,
         new_path: String,
     ) -> Result<(), FsError> {
-        let allowed = accessor
-            .with(|mut access| {
-                Ok::<_, wasmtime::Error>(
-                    access
-                        .get()
-                        .process_authority()
-                        .derive_symlink_create_cap()
-                        .is_ok(),
-                )
-            })
-            .map_err(FsError::trap)?;
-        if !allowed {
-            return Err(fs_types::ErrorCode::NotPermitted.into());
-        }
-        let (absolute, base_flags) = accessor.with(|mut access| {
-            let descriptor = get_fs_descriptor(access.get(), &descriptor)?;
-            if descriptor.kind != FsNodeKind::Directory {
-                return Err(fs_types::ErrorCode::NotDirectory.into());
-            }
-            let absolute = crate::resolve_child_path(&descriptor.path, &new_path)
-                .map_err(map_component_fs_path_error)?;
-            resolve_symlink_payload(&absolute, &old_path)?;
-            Ok::<_, FsError>((absolute, descriptor.flags))
-        })?;
-        if let Some(host_path) = crate::guest_host_share_path(&absolute).map(|p| p.to_owned()) {
-            if !base_flags.contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY) {
-                return Err(fs_types::ErrorCode::ReadOnly.into());
-            }
-            let service = accessor.with(|mut access| {
-                access
-                    .get()
-                    .filesystem()
-                    .host_service()
-                    .map_err(FsError::from)
-            })?;
-            service
-                .symlink(&old_path, &host_path)
-                .await
-                .map_err(map_host_fs_error)?;
-            accessor.with(|mut access| {
-                access
-                    .get()
-                    .filesystem_mut()
-                    .invalidate_host_subtree(&absolute);
-            });
-            return Ok(());
-        }
-        accessor.with(|mut access| {
-            let descriptor = get_fs_descriptor(access.get(), &descriptor)?;
-            let now_nanos = access.get().now_nanos();
-            access
+        let (base, namespace, now) = accessor.with(|mut access| {
+            if access
                 .get()
-                .filesystem_mut()
-                .symlink_at(&descriptor, &new_path, &old_path, now_nanos)
-                .map_err(Into::into)
-        })
+                .process_authority()
+                .derive_symlink_create_cap()
+                .is_err()
+            {
+                return Err(fs_types::ErrorCode::NotPermitted);
+            }
+            let (base, namespace) = descriptor_in(access.get(), &descriptor)?;
+            Ok((base, namespace, access.get().now_nanos()))
+        })?;
+        Ok(self::symlink_at(&namespace, base.grant()?, &old_path, &new_path, now).await?)
     }
 
     async fn unlink_file_at(
@@ -3089,43 +1672,9 @@ where
         descriptor: Resource<FsDescriptor>,
         path: String,
     ) -> Result<(), FsError> {
-        let (absolute, base_flags) = accessor.with(|mut access| {
-            let base = get_fs_descriptor(access.get(), &descriptor)?;
-            let absolute = crate::resolve_child_path(&base.path, &path)
-                .map_err(map_component_fs_path_error)?;
-            Ok::<_, FsError>((absolute, base.flags))
-        })?;
-        if !base_flags.contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY) {
-            return Err(fs_types::ErrorCode::ReadOnly.into());
-        }
-        if let Some(host_path) = crate::guest_host_share_path(&absolute).map(|p| p.to_owned()) {
-            let service = accessor.with(|mut access| {
-                access
-                    .get()
-                    .filesystem()
-                    .host_service()
-                    .map_err(FsError::from)
-            })?;
-            service
-                .remove(&host_path, false)
-                .await
-                .map_err(map_host_fs_error)?;
-            accessor.with(|mut access| {
-                access
-                    .get()
-                    .filesystem_mut()
-                    .invalidate_host_subtree(&absolute);
-            });
-            return Ok(());
-        }
-        accessor.with(|mut access| {
-            let descriptor = get_fs_descriptor(access.get(), &descriptor)?;
-            access
-                .get()
-                .filesystem_mut()
-                .unlink_file_at(&descriptor, &path)
-                .map_err(Into::into)
-        })
+        let (base, namespace) =
+            accessor.with(|mut access| descriptor_in(access.get(), &descriptor))?;
+        Ok(self::unlink_file_at(&namespace, base.grant()?, &path).await?)
     }
 
     async fn is_same_object(
@@ -3148,38 +1697,13 @@ where
         descriptor: Resource<FsDescriptor>,
     ) -> Result<fs_types::MetadataHashValue, FsError> {
         let profile = accessor.with(|mut access| component_fs_profile(access.get()));
-        let path = accessor.with(|mut access| {
-            let descriptor = get_fs_descriptor(access.get(), &descriptor)?;
-            Ok::<_, FsError>(descriptor.path.clone())
-        })?;
-        if let Some(host_path) = crate::guest_host_share_path(&path).map(|p| p.to_owned()) {
-            let service = accessor.with(|mut access| {
-                access
-                    .get()
-                    .filesystem()
-                    .host_service()
-                    .map_err(FsError::from)
-            })?;
-            let metadata = service
-                .stat_path(&host_path)
-                .await
-                .map_err(map_host_fs_error)?;
-            let result = metadata_hash_value(
-                metadata.identity,
-                u64::from(metadata.mode) << 32 ^ metadata.size,
-            );
-            record_component_fs_profile(profile, "metadata-hash");
-            return Ok(result);
-        }
-        let result = accessor.with(|mut access| {
-            access
-                .get()
-                .filesystem_mut()
-                .metadata_hash(&path)
-                .map_err(Into::into)
-        });
+        let (descriptor, namespace) =
+            accessor.with(|mut access| descriptor_in(access.get(), &descriptor))?;
+        let result = stat_path(&namespace, &descriptor.path, Follow::No)
+            .await
+            .map(|metadata| self::metadata_hash(&metadata));
         record_component_fs_profile(profile, "metadata-hash");
-        result
+        Ok(result?)
     }
 
     async fn metadata_hash_at(
@@ -3189,91 +1713,56 @@ where
         path: String,
     ) -> Result<fs_types::MetadataHashValue, FsError> {
         let profile = accessor.with(|mut access| component_fs_profile(access.get()));
-        // No symlinks in our guest FS — SYMLINK_FOLLOW is a no-op.
-        let _ = path_flags;
-        let absolute = accessor.with(|mut access| {
-            let descriptor = get_fs_descriptor(access.get(), &descriptor)?;
-            crate::resolve_child_path(&descriptor.path, &path)
-                .map_err(map_component_fs_path_error)
-                .map_err(FsError::from)
-        })?;
-        if let Some(host_path) = crate::guest_host_share_path(&absolute).map(|p| p.to_owned()) {
-            let service = accessor.with(|mut access| {
-                access
-                    .get()
-                    .filesystem()
-                    .host_service()
-                    .map_err(FsError::from)
-            })?;
-            let metadata = service
-                .stat_path(&host_path)
-                .await
-                .map_err(map_host_fs_error)?;
-            let result = metadata_hash_value(
-                metadata.identity,
-                u64::from(metadata.mode) << 32 ^ metadata.size,
-            );
-            record_component_fs_profile(profile, "metadata-hash-at");
-            return Ok(result);
-        }
-        let result = accessor.with(|mut access| {
-            access
-                .get()
-                .filesystem_mut()
-                .metadata_hash(&absolute)
-                .map_err(Into::into)
-        });
+        let (base, namespace) =
+            accessor.with(|mut access| descriptor_in(access.get(), &descriptor))?;
+        let result = self::stat_at(&namespace, base.grant()?, path_flags, &path)
+            .await
+            .map(|metadata| self::metadata_hash(&metadata));
         record_component_fs_profile(profile, "metadata-hash-at");
-        result
+        Ok(result?)
     }
 }
 
-/// Flushes a descriptor's host-side buffers.
-///
-/// `sync` and `sync-data` differ only in whether inode metadata is included;
-/// 9p exposes a single `Tfsync`, which the host translates to `fsync`, so both
-/// take the same path for the host share. The embedded filesystem holds every
-/// node in memory with no write-back stage, so there is nothing a sync could
-/// flush there — that no-op is the correct answer, not a missing feature, and
-/// is spelled out here rather than left implicit.
-async fn sync_descriptor<U, CpuImpl, Net, HostFs>(
-    accessor: &Accessor<U, HasSelf<StoreData<CpuImpl, Net, HostFs>>>,
+/// Pipes the guest's `data` into the file `descriptor` names, at an
+/// offset or at the end of file as `mode` says.
+fn pipe_into_file<U, CpuImpl, Net, StorageImpl>(
+    mut accessor: Access<'_, U, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>,
     descriptor: Resource<FsDescriptor>,
-) -> Result<(), FsError>
+    mut data: StreamReader<u8>,
+    mode: WritePosition,
+) -> Result<FutureReader<FsOpResult<()>>>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    let path = accessor.with(|mut access| {
-        let descriptor = get_fs_descriptor(access.get(), &descriptor)?;
-        Ok::<_, FsError>(descriptor.path.clone())
-    })?;
-    let Some(host_path) = crate::guest_host_share_path(&path).map(|path| path.to_owned()) else {
-        return Ok(());
-    };
-    let service = accessor.with(|mut access| {
-        access
-            .get()
-            .filesystem()
-            .host_service()
-            .map_err(FsError::from)
-    })?;
-    service
-        .sync_file(&host_path)
-        .await
-        .map_err(map_host_fs_error)?;
-    Ok(())
+    let resolved = descriptor_in(accessor.get(), &descriptor)
+        .and_then(|(descriptor, namespace)| write_stream_target(&namespace, descriptor.grant()?));
+    let getter = accessor.getter();
+    match resolved {
+        Ok(resolved) => {
+            let (tx, rx) = oneshot::channel();
+            data.pipe(
+                &mut accessor,
+                file_write_consumer(getter, resolved, mode, tx),
+            )?;
+            transfer_outcome(&mut accessor, rx)
+        }
+        Err(error) => {
+            data.close(&mut accessor)?;
+            failed_transfer(&mut accessor, error)
+        }
+    }
 }
 
-pub(super) fn get_fs_descriptor<CpuImpl, Net, HostFs>(
-    store: &mut StoreData<CpuImpl, Net, HostFs>,
+pub(super) fn get_fs_descriptor<CpuImpl, Net, StorageImpl>(
+    store: &mut StoreData<CpuImpl, Net, StorageImpl>,
     resource: &Resource<FsDescriptor>,
-) -> core::result::Result<FsDescriptor, fs_types::ErrorCode>
+) -> FsOpResult<FsDescriptor>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     store
         .table
@@ -3317,33 +1806,5 @@ pub(super) fn map_component_fs_path_error(
     match error {
         crate::ComponentFsPathError::InvalidBasePath => fs_types::ErrorCode::Invalid,
         crate::ComponentFsPathError::NotPermitted => fs_types::ErrorCode::NotPermitted,
-    }
-}
-
-/// The most a guest's directory listing may mirror from the host share.
-///
-/// Every WASI surface pulls a host directory whole into the embedded
-/// filesystem as nodes (`seed_host_directory_entries`) before the guest reads
-/// it, so the guest's buffer pages an already-held listing and bounds nothing,
-/// and the kernel keeps no per-guest budget for the mirror. This is therefore
-/// a policy bound chosen here, not one derived from a stated budget: it keeps
-/// a host that never ends a listing from growing kernel memory without limit,
-/// while a real directory of tens of thousands of names still lists.
-pub(crate) const GUEST_DIRECTORY_MIRROR_LIMIT: crate::HostDirLimit = crate::HostDirLimit {
-    max_entries: 65_536,
-    max_name_bytes: 4 * 1024 * 1024,
-};
-
-pub(crate) fn map_host_fs_error(error: crate::HostFsError) -> fs_types::ErrorCode {
-    match error.kind() {
-        HostFsErrorKind::NoEntry => fs_types::ErrorCode::NoEntry,
-        HostFsErrorKind::Exist => fs_types::ErrorCode::Exist,
-        HostFsErrorKind::NotDirectory => fs_types::ErrorCode::NotDirectory,
-        HostFsErrorKind::IsDirectory => fs_types::ErrorCode::IsDirectory,
-        HostFsErrorKind::NotEmpty => fs_types::ErrorCode::NotEmpty,
-        HostFsErrorKind::ReadOnly => fs_types::ErrorCode::ReadOnly,
-        HostFsErrorKind::Unsupported => fs_types::ErrorCode::Unsupported,
-        HostFsErrorKind::NameTooLong => fs_types::ErrorCode::NameTooLong,
-        HostFsErrorKind::Io => fs_types::ErrorCode::Io,
     }
 }

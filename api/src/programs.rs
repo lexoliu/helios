@@ -13,9 +13,10 @@ use futures_lite::future::zip;
 
 pub use crate::bindings::helios::system::programs::{
     AotHint, AotRequest, AotResult, CapabilityGrant, ClockGrant, ClockRight, DeviceClass,
-    DeviceGrant, DirectoryGrant, ExecError, ExecErrorKind, ExecOutput, ExecRequest, ExecResult,
-    ExitStatus, FilesystemRight, LinkGrant, LinkRight, NetworkGrant, NetworkRight, ProcessGrant,
-    ProcessRight, SpawnError, SpawnErrorKind, SpawnRequest, TerminalGrant, TerminalRight,
+    DeviceGrant, DiagnosticsGrant, DiagnosticsRight, DirectoryGrant, ExecError, ExecErrorKind,
+    ExecOutput, ExecRequest, ExecResult, ExitStatus, FilesystemRight, LinkGrant, LinkRight,
+    MountGrant, MountRight, NetworkGrant, NetworkRight, ProcessGrant, ProcessRight, SpawnError,
+    SpawnErrorKind, SpawnRequest, TerminalGrant, TerminalRight,
 };
 
 /// Build a directory capability grant for `helios:system/programs`.
@@ -73,6 +74,16 @@ pub fn link_grant(rights: Vec<LinkRight>) -> CapabilityGrant {
     CapabilityGrant::Link(LinkGrant { rights })
 }
 
+/// Build a mount-table capability grant: the child may attach or detach
+/// filesystems at directories its directory grants let it change.
+pub fn mount_grant(rights: Vec<MountRight>) -> CapabilityGrant {
+    CapabilityGrant::Mount(MountGrant { rights })
+}
+
+pub fn root_mount_grant() -> CapabilityGrant {
+    mount_grant(vec![MountRight::Mount, MountRight::Unmount])
+}
+
 pub fn root_link_grant() -> CapabilityGrant {
     link_grant(vec![
         LinkRight::Source,
@@ -97,6 +108,19 @@ pub fn all_device_classes_grant() -> CapabilityGrant {
         DeviceClass::Gpu,
         DeviceClass::Audio,
     ])
+}
+
+/// Build a diagnostics grant. A program holds a right only when its
+/// parent granted it, so the rights must be a subset of the caller's.
+pub fn diagnostics_grant(rights: Vec<DiagnosticsRight>) -> CapabilityGrant {
+    CapabilityGrant::Diagnostics(DiagnosticsGrant { rights })
+}
+
+/// Control the machine's tracing and profiling and read every
+/// instance's records, for a trusted launcher that runs programs on the
+/// machine owner's behalf.
+pub fn observe_machine_grant() -> CapabilityGrant {
+    diagnostics_grant(vec![DiagnosticsRight::ObserveMachine])
 }
 
 pub fn root_process_grant() -> CapabilityGrant {

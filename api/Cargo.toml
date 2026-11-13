@@ -14,8 +14,10 @@ input = ["dep:helios-hal", "dep:thiserror"]
 fs = ["dep:futures-lite"]
 http = ["io", "dep:http", "dep:thiserror"]
 http-handler = ["http"]
+http-kit-io = ["http-handler", "task", "dep:executor-core", "dep:futures-lite", "dep:http-kit-io", "dep:thiserror"]
 instances = []
 io = ["dep:futures-io", "dep:futures-lite"]
+mounts = []
 net = []
 programs = ["dep:futures-lite"]
 profiling = []
@@ -30,10 +32,12 @@ vsock = []
 
 [dependencies]
 async-channel = { version = "2.5.0", optional = true }
+executor-core = { version = "0.7.2", default-features = false, features = ["async-task", "std"], optional = true }
 futures-io = { version = "0.3.34", optional = true }
 futures-lite = { version = "2.6.1", optional = true }
 helios-api-macro = { path = "../api-macro" }
 helios-hal = { path = "../hal", optional = true }
+http-kit-io = { git = "https://github.com/zen-rs/http-kit", branch = "main", default-features = false, optional = true }
 http = { version = "1.5.0", optional = true }
 thiserror = { version = "2.0.20", optional = true }
 wit-bindgen = { workspace = true, features = ["async", "async-spawn", "inter-task-wakeup", "macros", "realloc"] }

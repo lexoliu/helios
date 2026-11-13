@@ -29,7 +29,6 @@
 
 extern crate alloc;
 
-use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::pin;
 use core::task::{Context, Poll, Waker};
@@ -431,13 +430,14 @@ pub const ENTROPY_RESEED_INTERVAL: Duration = Duration::from_secs(60);
 /// completions are: a backend routes the entropy interrupt to the
 /// processor that brought the device up, so its sole reader belongs on
 /// that processor's run queue rather than on the work-stealing one.
-pub fn install_entropy_device<CpuImpl, WatchdogImpl, Device>(
-    kernel: &Kernel<CpuImpl, WatchdogImpl>,
+pub fn install_entropy_device<CpuImpl, WatchdogImpl, MeasuredBootImpl, Device>(
+    kernel: &Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
     root: RootEntropyHandle,
     device: Device,
 ) where
     CpuImpl: Cpu + Clone + Send + Sync + 'static,
     WatchdogImpl: Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
     Device: HardwareEntropySource,
 {
     let timer = kernel.timer();
@@ -600,11 +600,9 @@ impl EntropyPool {
         self.secure.next_u64()
     }
 
-    pub fn insecure_bytes(&mut self, root: &RootEntropy, len: usize) -> Vec<u8> {
+    pub fn fill_insecure(&mut self, root: &RootEntropy, buffer: &mut [u8]) {
         self.rekey_if_restored(root);
-        let mut bytes = alloc::vec![0_u8; len];
-        self.insecure.fill_bytes(&mut bytes);
-        bytes
+        self.insecure.fill_bytes(buffer);
     }
 
     pub fn insecure_u64(&mut self, root: &RootEntropy) -> u64 {
@@ -800,7 +798,9 @@ mod tests {
 
         assert_ne!(pool.secure_u64(&root), pool.insecure_u64(&root));
         assert_ne!(pool.insecure_seed(&root), (0, 0));
-        assert_eq!(pool.insecure_bytes(&root, 16).len(), 16);
+        let mut insecure = [0_u8; 16];
+        pool.fill_insecure(&root, &mut insecure);
+        assert_ne!(insecure, [0_u8; 16]);
     }
 
     #[test]

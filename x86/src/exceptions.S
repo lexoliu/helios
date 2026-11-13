@@ -33,7 +33,7 @@ helios_x86_interrupt_timer:
 .global helios_x86_interrupt_wake
 helios_x86_interrupt_wake:
     push 0
-    push 0x21
+    push {wake_vector}
     jmp helios_x86_interrupt_common
 
 .global helios_x86_interrupt_apic_error
@@ -45,7 +45,7 @@ helios_x86_interrupt_apic_error:
 .global helios_x86_interrupt_tlb_shootdown
 helios_x86_interrupt_tlb_shootdown:
     push 0
-    push 0x22
+    push {tlb_shootdown_vector}
     jmp helios_x86_interrupt_common
 
 .global helios_x86_interrupt_network
@@ -184,6 +184,12 @@ helios_x86_interrupt_block_3:
 helios_x86_interrupt_debug_serial:
     push 0
     push 0x3e
+    jmp helios_x86_interrupt_common
+
+.global helios_x86_interrupt_sci
+helios_x86_interrupt_sci:
+    push 0
+    push 0x3f
     jmp helios_x86_interrupt_common
 
 helios_x86_exception_common:
