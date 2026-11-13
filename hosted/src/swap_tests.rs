@@ -6,17 +6,16 @@
 //! deliberately do not do is measure anything — `hosted` sits on the
 //! host page cache and is not evidence about swap on a real target.
 
-use std::alloc::{Layout, alloc_zeroed};
 use std::path::Path;
-use std::sync::Once;
+use std::sync::OnceLock;
 
 use helios_hal::cpu::ProcessorId;
-use helios_hal::pmm::PhysFrame;
 use helios_hal::vmm::{
     AddressSpace, PageAge, PageFlags, SwapBackend, SwapToken, Translation, VirtAddr, VirtRange,
 };
 use helios_kernel::{
-    MemoryOwner, allocate_user_memory_pool, enter_user_memory_owner, install_user_memory_pool,
+    MemoryOwner, UserMemoryPool, configure_user_memory_owner_processors, enter_user_memory_owner,
+    install_user_memory_pool,
 };
 
 use crate::swap::FileSwapBackend;
@@ -24,31 +23,19 @@ use crate::vmm::HostedAddressSpace;
 
 const PAGE: usize = 4096;
 
-/// Bytes of user memory the swap frames come from.
-const POOL_BYTES: usize = 1 << 20;
-
 /// The machine these tests run on: one processor, the owner table that
 /// attributes commits to it, and the user pool the shared swap core takes
-/// its frames from.
+/// its frames from and the owner table is carved out of.
 ///
 /// The pool is process-global and installed once, so the first test in a
 /// process builds it and the rest share it. Any test that swaps a page
 /// out, wherever it lives, runs on this machine.
 pub(crate) fn machine() {
-    static POOL: Once = Once::new();
+    static POOL: OnceLock<&'static UserMemoryPool> = OnceLock::new();
     crate::cpu::set_current_processor(ProcessorId::new(0));
-    helios_kernel::configure_user_memory_owner_processors(1);
-    POOL.call_once(|| {
-        let layout = Layout::from_size_align(POOL_BYTES, PhysFrame::SIZE).expect("pool layout");
-        // Leaked on purpose: the pool is a `&'static` for the life of the
-        // process.
-        // SAFETY: the layout has a non-zero size.
-        let base = unsafe { alloc_zeroed(layout) } as usize;
-        assert!(base != 0, "pool backing");
-        let pool = install_user_memory_pool(allocate_user_memory_pool());
-        pool.initialize(&[(base, base + POOL_BYTES)]);
-        pool.configure_processors(1);
-    });
+    let pool =
+        POOL.get_or_init(|| install_user_memory_pool(crate::test_pool::single_node_machine(1)));
+    configure_user_memory_owner_processors(pool);
 }
 
 fn block_on<F: Future>(future: F) -> F::Output {

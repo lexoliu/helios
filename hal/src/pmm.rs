@@ -3,14 +3,16 @@
 //! Backends own physical memory; the kernel borrows frames through this
 //! trait. The allocator hands out 4 KiB frames (and contiguous runs of
 //! them) backed by some pool the backend wired up at boot — typically the
-//! buddy heap built from `Platform::memory_regions`.
+//! buddy heap built from the regions the backend primed the kernel with.
 //!
 //! # SMP contract
 //!
 //! All methods take `&self` and are safe to call from any processor at
 //! any time. Implementations are expected to use per-CPU caches that feed
-//! from a global freelist so the steady-state path is lock-free; locked
-//! contention happens only on cache refill or drain.
+//! from each node's own free lists so the steady-state path is lock-free;
+//! locked contention happens only on cache refill or drain. A frame
+//! belongs to the node whose memory it lies in: a free returns it to that
+//! node, whichever processor calls.
 //!
 //! Frames are stable: the allocator does not relocate them behind the
 //! caller's back. Coalescing of the *free* portion of the pool may happen
@@ -28,6 +30,8 @@
 use core::future::Future;
 
 use thiserror::Error;
+
+use crate::numa::NodeId;
 
 /// A single 4 KiB physical frame, identified by its frame number.
 ///
@@ -147,7 +151,14 @@ impl FrameAllocStats {
 
 /// Physical-frame allocator. See module docs for the SMP contract.
 pub trait PhysFrameAllocator: Send + Sync + 'static {
-    /// Allocate `count` contiguous frames.
+    /// Nodes the allocator pools memory for, as [`NumaTopology`] named
+    /// them: every [`NodeId`] below this is valid for the methods below.
+    ///
+    /// [`NumaTopology`]: crate::numa::NumaTopology
+    fn node_count(&self) -> usize;
+
+    /// Allocate `count` contiguous frames from `node` and from no other
+    /// node.
     ///
     /// When `zero_first_use` is `true`, the implementation guarantees the
     /// frames contain only zero bytes when this call returns. When
@@ -161,11 +172,13 @@ pub trait PhysFrameAllocator: Send + Sync + 'static {
     /// a promise the allocator can keep for it.
     fn allocate(
         &self,
+        node: NodeId,
         count: usize,
         zero_first_use: bool,
     ) -> Result<PhysFrameRange, FrameAllocError>;
 
-    /// Shows contiguous runs of currently free memory to `visit`.
+    /// Shows contiguous runs of `node`'s currently free memory to
+    /// `visit`.
     ///
     /// This is the free-page reporting primitive: a consumer that wants
     /// to know which memory the guest has no use for — a virtio balloon
@@ -190,6 +203,7 @@ pub trait PhysFrameAllocator: Send + Sync + 'static {
     /// it would be handed to someone whose writes then vanish.
     fn free_runs<Visit, Visited>(
         &self,
+        node: NodeId,
         min_frames: usize,
         max_runs: usize,
         visit: Visit,
@@ -198,7 +212,8 @@ pub trait PhysFrameAllocator: Send + Sync + 'static {
         Visit: FnMut(PhysFrameRange) -> Visited + Send,
         Visited: Future<Output = ()> + Send;
 
-    /// Return frames to the pool.
+    /// Return frames to the node they came from, whichever processor
+    /// calls.
     ///
     /// # Safety contract (logical, not `unsafe`)
     /// The caller must guarantee that no live mapping references any
@@ -207,7 +222,8 @@ pub trait PhysFrameAllocator: Send + Sync + 'static {
     /// use-after-free.
     fn deallocate(&self, range: PhysFrameRange);
 
-    /// Return frames to the pool already marked *reported*.
+    /// Return frames to the node they came from already marked
+    /// *reported*.
     ///
     /// [`PhysFrameAllocator::deallocate`] returns frames whose contents
     /// are still what the guest wrote. This returns frames whose contents
@@ -229,5 +245,5 @@ pub trait PhysFrameAllocator: Send + Sync + 'static {
     /// references any frame in `range`.
     fn deallocate_reported(&self, range: PhysFrameRange);
 
-    fn stats(&self) -> FrameAllocStats;
+    fn stats(&self, node: NodeId) -> FrameAllocStats;
 }

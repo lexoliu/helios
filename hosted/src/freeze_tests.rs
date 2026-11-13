@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use helios_hal::cpu::{Cpu, ProcessorId};
+use helios_hal::numa::SingleNode;
 use helios_hal::{DeviceInventory, DmaModel, Platform, ProcessorStartupPolicy, ProcessorTopology};
 use helios_kernel::{FreezeError, Kernel, ProcessorLifecycle, Spawner, yield_now};
 
@@ -126,20 +127,26 @@ fn boot() -> TestMachine {
                 thread::park();
 
                 let cpu = HostedCpu::new(processor, machine.clone());
-                let platform = Platform::new(
-                    HostedConsole::new(),
-                    machine.bootstrap_memory_regions(processor),
-                    cpu.clone(),
-                )
-                .with_topology(
-                    ProcessorTopology::start_all_secondaries(
-                        machine.bootstrap_processor(),
-                        machine.processor_count(),
+                if processor == machine.bootstrap_processor() {
+                    // The host machine reports no NUMA description: one
+                    // node holds every processor and all of the reserved
+                    // heap.
+                    helios_kernel::prime_bootstrap_allocator(
+                        machine.bootstrap_memory_regions(),
+                        &SingleNode::new(machine.processor_count()),
+                        processor,
+                    );
+                }
+                let platform = Platform::new(HostedConsole::new(), cpu.clone())
+                    .with_topology(
+                        ProcessorTopology::start_all_secondaries(
+                            machine.bootstrap_processor(),
+                            machine.processor_count(),
+                        )
+                        .with_startup_policy(ProcessorStartupPolicy::BootstrapOnly),
                     )
-                    .with_startup_policy(ProcessorStartupPolicy::BootstrapOnly),
-                )
-                .with_dma_model(DmaModel::Translated)
-                .with_devices(DeviceInventory::new());
+                    .with_dma_model(DmaModel::Translated)
+                    .with_devices(DeviceInventory::new());
                 // The loop below never ends, so the kernel is never
                 // dropped and a task may borrow it for good.
                 let kernel: &'static Kernel<HostedCpu> =

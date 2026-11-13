@@ -13,13 +13,13 @@ use core::time::Duration;
 
 use atomic_waker::AtomicWaker;
 use concurrent_queue::{ConcurrentQueue, PushError};
-use crossbeam_utils::CachePadded;
 use helios_hal::cpu::{Cpu, Instant, ProcessorId, TimerInterrupt, current_processor};
 use helios_hal::critical_section::with_local_interrupts_masked;
 use objectpool::Pool;
 use spin::Once;
 
 use super::executor::ExecutorGroup;
+use crate::memory::{PerProcessor, UserMemoryPool};
 
 /// How long a guest holds its processor before it is preempted and
 /// yields to the executor.
@@ -114,8 +114,13 @@ struct TimerState {
 /// the base, because the sleeps behind those entries still hold their
 /// state slots in its pool, and it finds the base again when it comes
 /// back.
+///
+/// Each slot is a [`PerProcessor`] block: on a cache line of its own and
+/// in memory of its processor's node, since the owner walks its base on
+/// every pass. What the base allocates once built (its wheel buckets, its
+/// pools) comes from the kernel heap, on the owner.
 pub(crate) struct TimerBases {
-    bases: Box<[CachePadded<Once<TimerShared>>]>,
+    bases: PerProcessor<Once<TimerShared>>,
 }
 
 /// One processor's timer base.
@@ -253,24 +258,22 @@ struct WheelLevel {
 }
 
 impl TimerBases {
-    pub(crate) fn new(possible_processors: usize) -> Self {
+    /// One empty slot per possible processor of the machine `pool`
+    /// describes.
+    pub(crate) fn new(pool: &UserMemoryPool) -> Self {
         Self {
-            bases: (0..possible_processors)
-                .map(|_| CachePadded::new(Once::new()))
-                .collect(),
+            bases: PerProcessor::new(pool, |_, _| Once::new()),
         }
     }
 
     fn slot(&self, processor: ProcessorId) -> &Once<TimerShared> {
-        self.bases
-            .get(usize::from(processor.id()))
-            .unwrap_or_else(|| {
-                panic!(
-                    "processor {} is outside the {} possible processors' timer bases",
-                    processor.id(),
-                    self.bases.len()
-                )
-            })
+        self.bases.try_get(processor).unwrap_or_else(|| {
+            panic!(
+                "processor {} is outside the {} possible processors' timer bases",
+                processor.id(),
+                self.bases.len()
+            )
+        })
     }
 
     fn get(&self, processor: ProcessorId) -> &TimerShared {
@@ -530,7 +533,7 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
     pub fn handle_interrupt(&self) -> usize {
         let base = self.base();
         let now = self.now();
-        let interval = if self.group.needs_wake(usize::from(base.processor.id())) {
+        let interval = if self.group.needs_wake(base.processor) {
             base.idle_interval_ticks
         } else {
             base.tick_ticks
@@ -611,7 +614,7 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
         if current_processor() == owner {
             self.arm_earlier(base, deadline);
         } else if CpuImpl::TIMER_INTERRUPT == TimerInterrupt::Deadline
-            && self.group.needs_wake(usize::from(owner.id()))
+            && self.group.needs_wake(owner)
         {
             self.cpu.wake_processor(owner);
         }

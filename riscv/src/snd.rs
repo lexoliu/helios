@@ -2,19 +2,20 @@
 //!
 //! Concurrency contract: the device is discovered and programmed on the
 //! bootstrap hart before external interrupts are unmasked. Afterwards
-//! its completions and its event reports arrive on the PLIC source the
-//! device tree names, delivered to that same hart, which is why the
-//! kernel task that drains its event ring is local to it.
+//! its completions and its event reports arrive on the PLIC line the
+//! device tree names, on the hart that takes that PLIC's interrupts.
+//! The kernel task that drains its event ring stays local to the
+//! bootstrap hart, which spawned it; the handler's notification wakes
+//! it from whichever hart that is.
 
 extern crate alloc;
 
 use alloc::sync::Arc;
-use core::num::NonZeroU32;
 
 use fdt::Fdt;
 use helios_kernel::ExternalInterruptHandler;
 
-use crate::net::InterruptSourceId;
+use crate::net::PlicInterrupt;
 
 /// The interrupt route's view of the machine's sound device.
 ///
@@ -27,9 +28,9 @@ pub(crate) struct VirtioSoundDevice {
 }
 
 /// The sound device the bootstrap hart brought up, together with the
-/// PLIC source the device tree routes it to.
+/// PLIC line the device tree routes it to.
 pub(crate) struct SoundInterrupt {
-    pub(crate) source: InterruptSourceId,
+    pub(crate) line: PlicInterrupt,
     pub(crate) device: VirtioSoundDevice,
 }
 
@@ -52,23 +53,22 @@ pub(crate) fn install<WatchdogImpl>(
 where
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
 {
-    let (device, source) = discover_sound_device(fdt)?;
+    let (device, line) = discover_sound_device(fdt)?;
     let service = helios_kernel::install_audio_device(kernel, device.inner.clone());
     debug_state.install_audio_service(service);
-    Some(SoundInterrupt { source, device })
+    Some(SoundInterrupt { line, device })
 }
 
-fn discover_sound_device(fdt: &Fdt<'_>) -> Option<(VirtioSoundDevice, InterruptSourceId)> {
+fn discover_sound_device(fdt: &Fdt<'_>) -> Option<(VirtioSoundDevice, PlicInterrupt)> {
     let candidate = helios_virtio::mmio_candidates(fdt).find(|candidate| {
         crate::matches_virtio_mmio_device(candidate.base, helios_virtio::DeviceType::Sound)
     })?;
     let base = candidate.base;
     let header = core::ptr::NonNull::new(base as *mut u8)
         .unwrap_or_else(|| panic!("virtio MMIO base {base:#x} was unexpectedly null"));
-    let source = candidate
+    let line = candidate
         .interrupt
-        .and_then(|interrupt| NonZeroU32::new(interrupt.number))
-        .map(InterruptSourceId)
+        .and_then(PlicInterrupt::from_specifier)
         .unwrap_or_else(|| panic!("virtio-snd node at {base:#x} has no valid interrupt source"));
     let device =
         unsafe { helios_virtio::snd_from_mmio(header, candidate.size) }.unwrap_or_else(|error| {
@@ -78,6 +78,6 @@ fn discover_sound_device(fdt: &Fdt<'_>) -> Option<(VirtioSoundDevice, InterruptS
         VirtioSoundDevice {
             inner: Arc::new(device),
         },
-        source,
+        line,
     ))
 }

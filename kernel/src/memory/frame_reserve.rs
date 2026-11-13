@@ -22,16 +22,17 @@
 //!
 //! # Concurrency contract
 //!
-//! One shard per processor, each on its own cache line, and every word
-//! in a shard is written by its own processor:
+//! One shard per processor ([`PerProcessor`]: its own cache line, in
+//! memory of its processor's node), and every word in a shard is written
+//! by its own processor:
 //!
 //! - [`take_frame`] runs on the owning processor, in fault context,
 //!   with that processor's interrupts masked by the exception entry.
 //! - [`top_up`] runs on the owning processor outside fault context: the
 //!   executor loop calls it on every iteration and stack creation calls
 //!   it once more.
-//! - [`configure_processors`] runs once, on the bootstrap processor,
-//!   before any secondary is started.
+//! - [`configure`] runs once, on the bootstrap processor, before any
+//!   secondary is started.
 //!
 //! A shard is a lock-free stack — one atomic head, pushed and popped
 //! with compare-and-swap — and not a locked list, because the one
@@ -55,17 +56,17 @@
 
 extern crate alloc;
 
-use alloc::boxed::Box;
-use alloc::vec::Vec;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
-use crossbeam_utils::CachePadded;
 use helios_hal::cpu::ProcessorId;
 use helios_hal::pmm::PhysFrame;
 use spin::Once;
 
-use super::user::{allocate_user_frame_zeroed_on, try_allocate_user_frame_zeroed_on};
+use super::per_processor::PerProcessor;
+use super::user::{
+    UserMemoryPool, allocate_user_frame_zeroed_on, try_allocate_user_frame_zeroed_on,
+};
 
 /// Frames one processor's reserve holds when it is full.
 ///
@@ -91,8 +92,8 @@ struct FreeFrame {
 }
 
 /// One processor's frames. `head` and `len` are written only by that
-/// processor; the padding around the shard is what keeps a neighbour's
-/// pushes off this processor's cache line.
+/// processor; the padding [`PerProcessor`] puts around the shard is what
+/// keeps a neighbour's pushes off this processor's cache line.
 ///
 /// `len` follows `head` by one atomic step, so a reader that lands
 /// between the two sees a count off by one. Every use of it is a
@@ -175,9 +176,9 @@ impl ReserveShard {
     }
 }
 
-/// Per-processor reserves, built once the processor count is known.
+/// Per-processor reserves, built once the pool they refill from exists.
 struct FrameReserve {
-    shards: Once<Box<[CachePadded<ReserveShard>]>>,
+    shards: Once<PerProcessor<ReserveShard>>,
 }
 
 impl FrameReserve {
@@ -188,34 +189,21 @@ impl FrameReserve {
     }
 
     fn shard(&self, processor: ProcessorId) -> &ReserveShard {
-        let shards = self
-            .shards
+        self.shards
             .get()
-            .unwrap_or_else(|| panic!("per-processor frame reserve used before configuration"));
-        shards.get(usize::from(processor.id())).unwrap_or_else(|| {
-            panic!(
-                "processor {} is outside the configured frame reserve shard count {}",
-                processor.id(),
-                shards.len()
-            )
-        })
+            .unwrap_or_else(|| panic!("per-processor frame reserve used before configuration"))
+            .get(processor)
     }
 }
 
 static RESERVE: FrameReserve = FrameReserve::new();
 
-/// Builds one reserve per processor. Called once, on the bootstrap
-/// processor, before any secondary runs.
-pub(crate) fn configure_processors(processor_count: usize) {
-    assert!(
-        processor_count != 0,
-        "frame reserve requires at least one processor"
-    );
-    RESERVE.shards.call_once(|| {
-        let mut shards = Vec::with_capacity(processor_count);
-        shards.resize_with(processor_count, || CachePadded::new(ReserveShard::new()));
-        shards.into_boxed_slice()
-    });
+/// Builds one reserve per processor of `pool`'s machine. Called once,
+/// on the bootstrap processor, before any secondary runs.
+pub(crate) fn configure(pool: &UserMemoryPool) {
+    RESERVE
+        .shards
+        .call_once(|| PerProcessor::new(pool, |_, _| ReserveShard::new()));
 }
 
 /// Whether the reserve exists yet on this machine.
@@ -307,7 +295,9 @@ pub(crate) fn release(processor: ProcessorId) {
     }
     let shard = RESERVE.shard(processor);
     while let Some(frame) = shard.pop() {
-        super::deallocate_user_frame(frame);
+        // In the departing processor's name: the frame goes onto its
+        // list for the frame's node, which the memory step drains next.
+        super::deallocate_user_frame_on(processor, frame);
     }
 }
 
@@ -334,7 +324,7 @@ fn try_refill(shard: &ReserveShard, processor: ProcessorId) {
 /// Frames the reserve is holding across every processor, in bytes.
 pub fn reserved_bytes() -> usize {
     RESERVE.shards.get().map_or(0, |shards| {
-        shards.iter().map(|shard| shard.len()).sum::<usize>() * PhysFrame::SIZE
+        shards.iter().map(|(_, shard)| shard.len()).sum::<usize>() * PhysFrame::SIZE
     })
 }
 

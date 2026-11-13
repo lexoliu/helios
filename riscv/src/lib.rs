@@ -48,9 +48,9 @@ const UART_IER_RDI: u8 = 1 << 0;
 #[derive(Clone, Copy)]
 pub(crate) struct DebugTransport {
     uart_base: usize,
-    /// The PLIC source the same device-tree node routes the port's
+    /// The PLIC line the same device-tree node routes the port's
     /// interrupt to.
-    plic_source: net::InterruptSourceId,
+    plic_line: net::PlicInterrupt,
 }
 
 impl DebugTransport {
@@ -75,9 +75,8 @@ impl DebugTransport {
         let region = node.reg()?.next()?;
         // The PLIC's specifier is a bare source number, the same
         // one-cell binding the grant walk decodes.
-        let plic_source = helios_virtio::node_interrupt(fdt, &node)
-            .and_then(|interrupt| NonZeroU32::new(interrupt.number))
-            .map(net::InterruptSourceId)
+        let plic_line = helios_virtio::node_interrupt(fdt, &node)
+            .and_then(net::PlicInterrupt::from_specifier)
             .unwrap_or_else(|| {
                 panic!(
                     "the {} debug UART node declares no PLIC source in its interrupts cell; \
@@ -87,7 +86,7 @@ impl DebugTransport {
             });
         Some(Self {
             uart_base: region.starting_address as usize,
-            plic_source,
+            plic_line,
         })
     }
 
@@ -142,18 +141,21 @@ pub(crate) fn count_virtio_mmio_devices(fdt: &Fdt<'_>, expected: DeviceType) -> 
 }
 
 use core::arch::{asm, global_asm};
-use core::num::{NonZeroU32, NonZeroUsize};
+use core::num::NonZeroUsize;
 use core::ops::Range;
 use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering, compiler_fence};
 
 use arrayvec::ArrayVec;
 use fdt::Fdt;
+use helios_firmware::{DeviceTreeNuma, ProcessorIdentities};
+use helios_hal::boot::{BootMemoryKind, BootMemoryRegion, BootReservedRanges, usable_node_regions};
 use helios_hal::cpu::{
     Cpu, GUEST_STACK_LIMIT_OFFSET, Instant, ProcessorId, Timebase, TimerInterrupt,
     current_processor,
 };
 use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::memory::MemoryRegion;
+use helios_hal::numa::NumaTopology;
 use helios_hal::serial::ByteSerial;
 use helios_hal::{DeviceInventory, DmaModel, ProcessorStartupPolicy, ProcessorTopology};
 use helios_kernel::{
@@ -356,7 +358,9 @@ struct HartRuntime {
     hart_id: ProcessorId,
     timer: Timer<RiscvCpu>,
     wasmtime_tls: WasmtimeTlsSlots,
-    external_interrupts: Option<net::ExternalInterrupts>,
+    /// The PLIC domains this hart takes interrupts for, if any; the
+    /// `SupervisorExternal` trap arm claims from them.
+    external_interrupts: Option<net::HartInterrupts>,
     program_service: Option<debug_state::ProgramService>,
     /// The stack a kernel exception the kernel did not resolve is handed
     /// to the runtime from (`trap::hand_over_trap`). It is not the trap
@@ -766,7 +770,11 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     // allocator is primed with below.
     let initrd = initrd_range(&fdt);
     let allocator_window = allocator_window();
-    let memory_regions = collect_memory_regions(fdt.memory(), allocator_window.clone(), &initrd);
+    // A tree without `numa-node-id` describes one node holding every hart
+    // and all of memory.
+    let numa = DeviceTreeNuma::new(&fdt, HartIds { harts: hart_count })
+        .unwrap_or_else(|error| panic!("FDT NUMA description refused: {error}"));
+    let memory_regions = collect_memory_regions(&fdt, allocator_window.clone(), &initrd, &numa);
     let current_hart = ProcessorId::new(hart_id as u16);
     let bootstrap_processor = remember_bootstrap_hart(hart_id);
     mark_hart_online(current_hart);
@@ -779,8 +787,7 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     // the identity map is owned by `RiscvUserAddressSpace`, which is
     // where the runtime's linear-memory reservations live.
     for region in &memory_regions {
-        let start = region.as_ptr().cast::<u8>() as usize;
-        let end = start + region.len();
+        let (start, end) = (region.start(), region.end());
         assert!(
             end <= vmm::KERNEL_IDENTITY_LIMIT,
             "firmware reports physical memory at {start:#x}..{end:#x}, past the {:#x} the Sv48 \
@@ -801,7 +808,11 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         release_early_boot_harts();
     }
     if current_hart == bootstrap_processor {
-        helios_kernel::prime_bootstrap_allocator(memory_regions.iter().copied(), hart_count);
+        helios_kernel::prime_bootstrap_allocator(
+            memory_regions.iter().copied(),
+            &numa,
+            bootstrap_processor,
+        );
     }
 
     let debug_state = shared_debug_state(timebase, hart_count, initrd.clone());
@@ -852,19 +863,14 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         tracing::info!("no virtio-snd node in the device tree; this machine has no sound device");
     }
     let kernel = helios_kernel::init_with_watchdog(
-        helios_kernel::Platform::with_watchdog(
-            console,
-            memory_regions.into_iter(),
-            cpu.clone(),
-            watchdog,
-        )
-        .with_topology(
-            ProcessorTopology::start_all_secondaries(bootstrap_processor, hart_count)
-                .with_startup_policy(ProcessorStartupPolicy::BootstrapOnly),
-        )
-        .with_timer_frequency_hz(timebase.frequency())
-        .with_dma_model(DmaModel::Identity)
-        .with_devices(devices),
+        helios_kernel::Platform::with_watchdog(console, cpu.clone(), watchdog)
+            .with_topology(
+                ProcessorTopology::start_all_secondaries(bootstrap_processor, hart_count)
+                    .with_startup_policy(ProcessorStartupPolicy::BootstrapOnly),
+            )
+            .with_timer_frequency_hz(timebase.frequency())
+            .with_dma_model(DmaModel::Identity)
+            .with_devices(devices),
     );
     // The root DRBG is seeded once, on the bootstrap hart, before
     // anything can ask for random bytes. RISC-V has no unprivileged
@@ -913,96 +919,105 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     });
     // Only the bootstrap hart brings devices up, and it is the hart
     // that holds the root DRBG handle.
-    let external_interrupts = root_entropy.and_then(|root_entropy| {
-        // Every platform device shares one PLIC context, so the context
-        // is opened once and each device attaches its own source to it.
-        net::discover_plic_context(&fdt, bootstrap_processor.id()).map(|(plic, context)| {
-            let mut interrupts = net::ExternalInterrupts::new(plic, context);
-            // The device path's platform surface comes up with the
-            // controller and before any grant is published, which the
-            // registry enforces.
-            device::install_hooks(plic, context);
-            // The boot UART is a device the kernel drives itself: its
-            // PLIC source is enabled and prioritised like the virtio
-            // devices'. The handler masks the receive line at the port
-            // and raises the debug console's receive signal; the waiter
-            // re-arms the line while it listens.
-            if let Some(transport) = DEBUG_TRANSPORT.get().copied() {
-                interrupts.attach_debug_serial(
-                    transport.plic_source,
-                    DebugTransport::console().interrupt_handler::<DebugTransport>(),
-                );
-            }
-            if let Some(network) = net::install_network_service(&cpu, &kernel, &fdt, &debug_state) {
-                interrupts.attach_network(network);
-            }
-            if let Some(host_fs) = host_fs::install(&cpu, &fdt, &debug_state) {
-                interrupts.attach_host_fs(host_fs);
-            }
-            if let Some(entropy) = entropy_device {
-                entropy::install(&kernel, &entropy, root_entropy.clone());
-                interrupts.attach_entropy(entropy);
-            }
-            if let Some(balloon) =
-                balloon::install(&kernel, &fdt, debug_state.machine_generation_handle())
-            {
-                debug_state.install_memory_balloon(balloon.handle.clone());
-                interrupts.attach_balloon(balloon);
-            }
-            if let Some(vsock) = vsock::install(&kernel, &cpu, &fdt, &debug_state) {
-                interrupts.attach_vsock(vsock);
-            }
-            if let Some(display) = gpu::install(&cpu, &kernel, &fdt, &debug_state) {
-                interrupts.attach_display(display);
-            }
-            for device in input::install(&kernel, &fdt, &debug_state) {
-                interrupts.attach_input(device);
-            }
-            if let Some(sound) = snd::install(&kernel, &fdt, &debug_state) {
-                interrupts.attach_sound(sound);
-            }
-            for block in block::install(&cpu, &kernel, &fdt, &debug_state, root_entropy) {
-                interrupts.attach_block(block);
-            }
-            // Everything the kernel drives itself has claimed its
-            // source by now, so what the tree describes and nobody took
-            // is exactly what a driver plugin may be handed.
-            for (source, route) in device::publish_grants(&fdt, debug_state.device_grants()) {
-                interrupts.attach_device(source, route);
-            }
-            // The Sv48 address space reserves and commits lazily, so a page
-            // could be taken away here — but the backend has not wired the
-            // other half: no `SwapVmHooks` table, so a not-present PTE
-            // carries no swap token and the fault handler has nothing to
-            // look the page up by. Extending swap to this backend is #25's
-            // follow-up to #59.
-            helios_kernel::disable_swap(helios_kernel::SwapDisabled::NoSwapHooks);
-            interrupts
-        })
-    });
-    // The debug console's readers park on the UART's interrupt, so a
-    // machine that describes the UART but gives this hart no PLIC
-    // context to route it through would hang every serial read; refuse
-    // it here rather than at the first parked reader.
-    assert!(
-        current_hart != bootstrap_processor
-            || external_interrupts.is_some()
-            || DEBUG_TRANSPORT.get().is_none(),
-        "the device tree describes a debug UART but no PLIC supervisor-external context for \
-         hart {hart_id}; the serial line could only be polled"
-    );
+    if let Some(root_entropy) = root_entropy {
+        // A machine may carry several PLICs — QEMU's `virt` gives every
+        // socket its own and wires devices to different ones — so each
+        // PLIC is its own domain, taken by one hart with a context in
+        // it, and each device attaches to the domain its node's
+        // interrupt parent names.
+        let mut domains = net::InterruptDomains::discover(&fdt, bootstrap_processor);
+        // The device path's platform surface comes up before any grant
+        // is published, which the registry enforces.
+        device::install_hooks();
+        // The boot UART is a device the kernel drives itself: its
+        // PLIC source is enabled and prioritised like the virtio
+        // devices'. The handler masks the receive line at the port
+        // and raises the debug console's receive signal; the waiter
+        // re-arms the line while it listens.
+        if let Some(transport) = DEBUG_TRANSPORT.get().copied() {
+            // The debug console's readers park on the UART's interrupt,
+            // so a UART on a controller no hart takes interrupts from
+            // would hang every serial read; refuse it here rather than
+            // at the first parked reader.
+            assert!(
+                domains.takes(transport.plic_line.controller),
+                "the device tree wires the debug UART to the interrupt controller at {:#x}, in \
+                 which no hart has a PLIC supervisor-external context; the serial line could \
+                 only be polled",
+                transport.plic_line.controller.base()
+            );
+            domains.attach_debug_serial(
+                transport.plic_line,
+                DebugTransport::console().interrupt_handler::<DebugTransport>(),
+            );
+        }
+        if let Some(network) = net::install_network_service(&cpu, &kernel, &fdt, &debug_state) {
+            domains.attach_network(network);
+        }
+        if let Some(host_fs) = host_fs::install(&cpu, &fdt, &debug_state) {
+            domains.attach_host_fs(host_fs);
+        }
+        if let Some(entropy) = entropy_device {
+            entropy::install(&kernel, &entropy, root_entropy.clone());
+            domains.attach_entropy(entropy);
+        }
+        if let Some(balloon) =
+            balloon::install(&kernel, &fdt, debug_state.machine_generation_handle())
+        {
+            debug_state.install_memory_balloon(balloon.handle.clone());
+            domains.attach_balloon(balloon);
+        }
+        if let Some(vsock) = vsock::install(&kernel, &cpu, &fdt, &debug_state) {
+            domains.attach_vsock(vsock);
+        }
+        if let Some(display) = gpu::install(&cpu, &kernel, &fdt, &debug_state) {
+            domains.attach_display(display);
+        }
+        for device in input::install(&kernel, &fdt, &debug_state) {
+            domains.attach_input(device);
+        }
+        if let Some(sound) = snd::install(&kernel, &fdt, &debug_state) {
+            domains.attach_sound(sound);
+        }
+        for block in block::install(&cpu, &kernel, &fdt, &debug_state, root_entropy) {
+            domains.attach_block(block);
+        }
+        // Everything the kernel drives itself has claimed its
+        // source by now, so what the tree describes and nobody took
+        // is exactly what a driver plugin may be handed.
+        let grants = device::publish_grants(&fdt, debug_state.device_grants(), &domains);
+        for (line, route) in grants {
+            domains.attach_device(line, route);
+        }
+        // Every route is in place, and no secondary hart has been
+        // started: each takes its domains from the published table when
+        // it builds its runtime below.
+        net::publish_interrupt_domains(domains);
+        // The Sv48 address space reserves and commits lazily, so a page
+        // could be taken away here — but the backend has not wired the
+        // other half: no `SwapVmHooks` table, so a not-present PTE
+        // carries no swap token and the fault handler has nothing to
+        // look the page up by. Extending swap to this backend is #25's
+        // follow-up to #59.
+        helios_kernel::disable_swap(helios_kernel::SwapDisabled::NoSwapHooks);
+    }
     let mut hart_runtime = HartRuntime {
         trap_stack: trap::allocate_trap_stack(),
         guest_stack_limit: AtomicUsize::new(usize::MAX),
         hart_id: current_hart,
         timer: kernel.timer(),
         wasmtime_tls: WasmtimeTlsSlots::new(),
-        external_interrupts,
+        external_interrupts: net::HartInterrupts::of(current_hart),
         program_service: None,
         hand_over_stack: trap::allocate_trap_stack(),
         hand_over_probe: trap::HandOverProbe::new(),
     };
     hart_runtime.install();
+    // Only now, on the hart itself: the firmware reset this hart's PLIC
+    // contexts when it started it, after the bootstrap hart's bring-up.
+    if let Some(interrupts) = hart_runtime.external_interrupts {
+        interrupts.open();
+    }
     // Every hart's timer preempts the guest running on it, so every hart
     // holds the service: the bootstrap hart installs it, and the others,
     // which it starts only afterwards, take the installed one.
@@ -1132,15 +1147,51 @@ fn initrd_range(fdt: &Fdt<'_>) -> Range<usize> {
     start..end
 }
 
-fn collect_memory_regions<'fdt>(
-    memory: fdt::standard_nodes::Memory<'fdt, 'fdt>,
+/// The firmware identity of each processor. A hart's [`ProcessorId`] is its
+/// hart id (`run_hart`), and a devicetree cpu node's `reg` is the hart id
+/// too, so the mapping is the identity.
+struct HartIds {
+    harts: usize,
+}
+
+impl ProcessorIdentities for HartIds {
+    fn processor_count(&self) -> usize {
+        self.harts
+    }
+
+    fn hardware_id(&self, processor: ProcessorId) -> u64 {
+        u64::from(processor.id())
+    }
+}
+
+/// Capacity for the allocator regions: a devicetree carries one `memory`
+/// node per range, and the initrd carve-out splits one of them in two. A
+/// tree that describes more is refused by name below.
+const MAX_MEMORY_REGIONS: usize = 16;
+
+/// Every `reg` range of every node whose `device_type` is `memory`, clipped
+/// to the allocator window with the initrd taken out.
+fn collect_memory_regions<Numa: NumaTopology>(
+    fdt: &Fdt<'_>,
     allocator_window: Range<usize>,
     initrd: &Range<usize>,
-) -> ArrayVec<MemoryRegion, 8> {
+    numa: &Numa,
+) -> ArrayVec<MemoryRegion, MAX_MEMORY_REGIONS> {
     let mut regions = ArrayVec::new();
+    let mut reserved = BootReservedRanges::new();
+    reserved.reserve(initrd.clone());
 
-    for region in memory
-        .regions()
+    for region in fdt
+        .all_nodes()
+        .filter(|node| {
+            node.property("device_type")
+                .is_some_and(|property| property.value == b"memory\0")
+        })
+        .flat_map(|node| {
+            node.reg().unwrap_or_else(|| {
+                panic!("FDT memory node {} has no usable reg property", node.name)
+            })
+        })
         .map(|region| {
             let start = region.starting_address as usize;
             let end = start
@@ -1150,9 +1201,15 @@ fn collect_memory_regions<'fdt>(
             start..end
         })
         .filter_map(|region| intersect(region, allocator_window.clone()))
-        .flat_map(|region| subtract(region, initrd))
-        .flatten()
-        .map(range_to_memory_region)
+        .map(|region| BootMemoryRegion {
+            start: region.start as u64,
+            end: region.end as u64,
+            kind: BootMemoryKind::Usable,
+        })
+        // SAFETY: the memory nodes are RAM nothing else owns, reachable at
+        // its physical address through the kernel identity map, and the
+        // initrd is reserved out.
+        .flat_map(|region| unsafe { usable_node_regions(region, &reserved, 0, numa) })
     {
         regions.try_push(region).unwrap_or_else(|_| {
             panic!("FDT described more memory regions than the kernel supports")
@@ -1162,30 +1219,11 @@ fn collect_memory_regions<'fdt>(
     regions
 }
 
-/// `region` with `reserved` taken out of it: up to two pieces, either of
-/// which may be empty. The riscv backend's only reservation is the
-/// initrd, a single contiguous range, so a region never splits further.
-fn subtract(region: Range<usize>, reserved: &Range<usize>) -> [Option<Range<usize>>; 2] {
-    if reserved.end <= region.start || reserved.start >= region.end {
-        return [Some(region), None];
-    }
-    let below = (reserved.start > region.start).then_some(region.start..reserved.start);
-    let above = (reserved.end < region.end).then_some(reserved.end..region.end);
-    [below, above]
-}
-
 fn intersect(left: Range<usize>, right: Range<usize>) -> Option<Range<usize>> {
     let start = left.start.max(right.start);
     let end = left.end.min(right.end);
 
     (start < end).then_some(start..end)
-}
-
-fn range_to_memory_region(range: Range<usize>) -> MemoryRegion {
-    let len = range.end - range.start;
-    let slice = core::ptr::slice_from_raw_parts_mut(range.start as *mut u8, len);
-
-    unsafe { MemoryRegion::new_unchecked(slice) }
 }
 
 use helios_hal::align_up;

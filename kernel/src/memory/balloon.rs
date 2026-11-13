@@ -51,12 +51,13 @@
 //! nothing: the frames the guest inflated into it and the free pages it
 //! reported are forgotten. The guest still has those frames out of its
 //! pool, and the host may have discarded what was in them. Resynchronising
-//! returns every inflated run to the pool marked reported
+//! returns every inflated run to the node it came from marked reported
 //! ([`PhysFrameAllocator::deallocate_reported`]), so whoever allocates it
 //! next gets zeroes; publishes an `actual` and a reported total of zero,
 //! which is what the device holds; and has the next reporting pass offer
-//! every free frame again, marked or not, because the device remembers
-//! none of them. The host's target is then followed afresh.
+//! every free frame on every node again, marked or not, because the
+//! device remembers none of them. The host's target is then followed
+//! afresh.
 //!
 //! Concurrency contract: the inflated-run list is owned by the single
 //! task that services the target, so it needs no lock. Every other
@@ -85,7 +86,8 @@ use core::time::Duration;
 use arrayvec::ArrayVec;
 use helios_hal::balloon::{MemoryBalloon, MemoryStat, MemoryStatTag};
 use helios_hal::cpu::Cpu;
-use helios_hal::pmm::{PhysFrame, PhysFrameAllocator, PhysFrameRange};
+use helios_hal::numa::NodeId;
+use helios_hal::pmm::{FrameAllocStats, PhysFrame, PhysFrameAllocator, PhysFrameRange};
 use helios_hal::watchdog::Watchdog;
 use triomphe::Arc;
 
@@ -145,6 +147,10 @@ const ACTUAL_PUBLISH_RUNS: usize = 64;
 /// the OOM killer then acts on.
 const PRESSURE_FLOOR_DIVISOR: usize = 4;
 
+/// Every node's bit in a per-node word such as
+/// `BalloonShared::reports_forgotten`.
+const EVERY_NODE: u64 = u64::MAX;
+
 /// What the balloon holds, as observers see it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BalloonStats {
@@ -170,10 +176,13 @@ struct BalloonShared {
     deflate_requested: AtomicBool,
     /// Set by the machine reactions task when the device was reset.
     resync_requested: AtomicBool,
-    /// Set by a resynchronisation, taken by the reporting task: the
-    /// device remembers no report, so the next pass offers every free
-    /// frame, whether the pool has it marked reported or not.
-    reports_forgotten: AtomicBool,
+    /// One bit per node ([`NodeId::index`]), set for every node by a
+    /// resynchronisation and taken by the reporting task: the device
+    /// remembers no report, so the next pass over a node offers every
+    /// free frame on it, whether the pool has it marked reported or not.
+    /// A node's bit stays set until a pass names something on it.
+    /// `MAX_NODES` is 64, so one word holds every node.
+    reports_forgotten: AtomicU64,
     /// Wakes the task that owns the inflated runs.
     ///
     /// One consumer, level-triggered: every raise means "the target or
@@ -195,7 +204,7 @@ impl BalloonHandle {
                 reported_bytes: AtomicU64::new(0),
                 deflate_requested: AtomicBool::new(false),
                 resync_requested: AtomicBool::new(false),
-                reports_forgotten: AtomicBool::new(false),
+                reports_forgotten: AtomicU64::new(0),
                 work: Notify::new(),
             }),
         }
@@ -470,7 +479,7 @@ impl<Pool: PhysFrameAllocator, Device: MemoryBalloon + Clone> BalloonService<Poo
         self.handle
             .shared
             .reports_forgotten
-            .store(true, Ordering::Release);
+            .store(EVERY_NODE, Ordering::Release);
         self.publish_actual();
         tracing::info!(
             returned_frames = returned,
@@ -488,12 +497,24 @@ impl<Pool: PhysFrameAllocator, Device: MemoryBalloon + Clone> BalloonService<Poo
         self.device.set_actual(pages);
     }
 
-    /// How many more frames the balloon may take without pushing the
-    /// pool into the pressure band the OOM killer acts on.
+    /// The node with the most room above its pressure floor, and how many
+    /// frames the balloon may still take from it. The floor is held on
+    /// every node, not only in sum: taking from one node would push that
+    /// node's instances off-node while the machine-wide number still
+    /// looked healthy.
+    fn richest_node(&self) -> (NodeId, usize) {
+        node_ids(self.pool)
+            .map(|node| (node, node_budget(self.pool.stats(node))))
+            .max_by_key(|&(_, budget)| budget)
+            .unwrap_or_else(|| panic!("a frame allocator pools at least one node"))
+    }
+
+    /// How many more frames the balloon may take without pushing any
+    /// node into the pressure band the OOM killer acts on.
     fn inflation_budget(&self) -> usize {
-        let stats = PhysFrameAllocator::stats(self.pool);
-        let floor = stats.total_frames / PRESSURE_FLOOR_DIVISOR;
-        stats.free_frames().saturating_sub(floor)
+        node_ids(self.pool)
+            .map(|node| node_budget(self.pool.stats(node)))
+            .sum()
     }
 
     async fn inflate_to(&mut self, target: usize) {
@@ -522,12 +543,13 @@ impl<Pool: PhysFrameAllocator, Device: MemoryBalloon + Clone> BalloonService<Poo
                 // `adjust`.
                 break;
             }
-            let available = run_frames.min(wanted).min(self.inflation_budget());
+            let (node, budget) = self.richest_node();
+            let available = run_frames.min(wanted).min(budget);
             if available == 0 {
                 break;
             }
             run_frames = 1 << available.ilog2();
-            let Ok(range) = self.pool.allocate(run_frames, false) else {
+            let Ok(range) = self.pool.allocate(node, run_frames, false) else {
                 // A pool with nothing that contiguous left may still
                 // have smaller runs; halving is what turns a
                 // fragmentation failure into progress instead of a
@@ -607,19 +629,29 @@ impl<Pool: PhysFrameAllocator, Device: MemoryBalloon + Clone> BalloonService<Poo
             );
             return;
         }
-        let device = self.device.clone();
-        let named = self
-            .pool
-            .free_runs(MIN_REPORT_RUN_FRAMES, REPORT_RUNS_PER_PASS, move |run| {
-                let device = device.clone();
-                async move {
-                    let mut ranges = [unsafe { range_bytes(run) }];
-                    if let Err(error) = device.hint_free_pages(&mut ranges).await {
-                        tracing::warn!(?error, "memory balloon free-page hint failed");
-                    }
-                }
-            })
-            .await;
+        // A hint covers the machine, so every node is walked, each under
+        // the same per-pass bound.
+        let mut named = 0usize;
+        for node in node_ids(self.pool) {
+            let device = self.device.clone();
+            named += self
+                .pool
+                .free_runs(
+                    node,
+                    MIN_REPORT_RUN_FRAMES,
+                    REPORT_RUNS_PER_PASS,
+                    move |run| {
+                        let device = device.clone();
+                        async move {
+                            let mut ranges = [unsafe { range_bytes(run) }];
+                            if let Err(error) = device.hint_free_pages(&mut ranges).await {
+                                tracing::warn!(?error, "memory balloon free-page hint failed");
+                            }
+                        }
+                    },
+                )
+                .await;
+        }
         if let Err(error) = self.device.end_free_page_hint().await {
             tracing::warn!(
                 ?error,
@@ -659,7 +691,7 @@ async fn report_free_memory_forever<CpuImpl, Pool, Device>(
 }
 
 /// One reporting pass: names free memory the host has not been told
-/// about, and answers how many frames it named.
+/// about, one pass per node, and answers how many frames it named.
 async fn report_free_memory_once<Pool, Device>(
     pool: &Pool,
     device: &Device,
@@ -669,56 +701,64 @@ where
     Pool: PhysFrameAllocator,
     Device: MemoryBalloon + Clone,
 {
-    let stats = PhysFrameAllocator::stats(pool);
     // A device that was reset remembers no report, so every free frame
-    // is news to it, whatever the pool has marked.
-    let forgotten = handle
-        .shared
-        .reports_forgotten
-        .swap(false, Ordering::AcqRel);
-    // Free memory the host has not been told about. It shrinks as a pass
-    // names runs and grows again when memory that was named is allocated
-    // and released, which is exactly when the host needs to hear about it
-    // a second time.
-    let unreported = if forgotten {
-        stats.free_frames()
-    } else {
-        stats.free_frames().saturating_sub(stats.reported_frames)
-    };
-    // A pass holds every run it names, so it may only reach for the
-    // memory that sits above the floor the runtime defends.
-    let spare = stats
-        .free_frames()
-        .saturating_sub(stats.total_frames / PRESSURE_FLOOR_DIVISOR);
-    let runs = (unreported.min(spare) / MIN_REPORT_RUN_FRAMES).min(REPORT_RUNS_PER_PASS);
-
+    // on a node it is owed is news to it, whatever the pool has marked.
+    let forgotten = handle.shared.reports_forgotten.swap(0, Ordering::AcqRel);
+    let mut still_owed = 0u64;
     let mut reported_frames = 0usize;
-    if runs != 0 {
-        let reporter = device.clone();
-        pool.free_runs(MIN_REPORT_RUN_FRAMES, runs, |run| {
-            reported_frames += run.frame_count;
-            let device = reporter.clone();
-            async move {
-                let mut ranges = [unsafe { range_bytes(run) }];
-                if let Err(error) = device.report_free(&mut ranges).await {
-                    tracing::warn!(?error, "memory balloon free-page report failed");
+    // One pass per node, each bounded by that node's own spare.
+    for node in node_ids(pool) {
+        let node_bit = 1u64 << node.index();
+        let node_forgotten = forgotten & node_bit != 0;
+        let stats = pool.stats(node);
+        // Free memory the host has not been told about. It shrinks as a
+        // pass names runs and grows again when memory that was named is
+        // allocated and released, which is exactly when the host needs to
+        // hear about it a second time.
+        let unreported = if node_forgotten {
+            stats.free_frames()
+        } else {
+            stats.free_frames().saturating_sub(stats.reported_frames)
+        };
+        // A pass holds every run it names, so it may only reach for the
+        // memory that sits above the floor the runtime defends.
+        let spare = node_budget(stats);
+        let runs = (unreported.min(spare) / MIN_REPORT_RUN_FRAMES).min(REPORT_RUNS_PER_PASS);
+
+        let mut named = 0usize;
+        if runs != 0 {
+            let reporter = device.clone();
+            pool.free_runs(node, MIN_REPORT_RUN_FRAMES, runs, |run| {
+                named += run.frame_count;
+                let device = reporter.clone();
+                async move {
+                    let mut ranges = [unsafe { range_bytes(run) }];
+                    if let Err(error) = device.report_free(&mut ranges).await {
+                        tracing::warn!(?error, "memory balloon free-page report failed");
+                    }
                 }
-            }
-        })
-        .await;
+            })
+            .await;
+        }
+        if named == 0 && node_forgotten {
+            // Nothing could be named on this node this time; the device
+            // is still owed everything on it.
+            still_owed |= node_bit;
+        }
+        reported_frames += named;
+    }
+    if still_owed != 0 {
+        // Or-ed rather than stored, so a resynchronisation that landed
+        // during the pass keeps every bit it set.
+        handle
+            .shared
+            .reports_forgotten
+            .fetch_or(still_owed, Ordering::Release);
     }
     if reported_frames == 0 {
-        if forgotten {
-            // Nothing could be named this time; the device is still owed
-            // everything.
-            handle
-                .shared
-                .reports_forgotten
-                .store(true, Ordering::Release);
-        }
         return 0;
     }
-    let bytes = (PhysFrameAllocator::stats(pool).reported_frames * PhysFrame::SIZE) as u64;
+    let bytes = (machine_stats(pool).reported_frames * PhysFrame::SIZE) as u64;
     handle.shared.reported_bytes.store(bytes, Ordering::Release);
     tracing::info!(
         named_bytes = (reported_frames * PhysFrame::SIZE) as u64,
@@ -738,7 +778,8 @@ where
     Device: MemoryBalloon + Clone,
 {
     loop {
-        let stats = PhysFrameAllocator::stats(pool);
+        // The host's statistics carry no node, so they are machine-wide.
+        let stats = machine_stats(pool);
         let total = (stats.total_frames * PhysFrame::SIZE) as u64;
         let free = (stats.free_frames() * PhysFrame::SIZE) as u64;
         let floor = ((stats.total_frames / PRESSURE_FLOOR_DIVISOR) * PhysFrame::SIZE) as u64;
@@ -765,6 +806,38 @@ where
     }
 }
 
+/// The nodes `pool` pools memory for.
+fn node_ids<Pool: PhysFrameAllocator>(pool: &Pool) -> impl Iterator<Item = NodeId> + use<Pool> {
+    (0..pool.node_count()).map(NodeId::new)
+}
+
+/// How many frames of a node the balloon or a free-page pass may take
+/// without pushing the node into the pressure band the OOM killer acts
+/// on.
+fn node_budget(stats: FrameAllocStats) -> usize {
+    stats
+        .free_frames()
+        .saturating_sub(stats.total_frames / PRESSURE_FLOOR_DIVISOR)
+}
+
+/// Every node's statistics added up.
+fn machine_stats<Pool: PhysFrameAllocator>(pool: &Pool) -> FrameAllocStats {
+    node_ids(pool).map(|node| pool.stats(node)).fold(
+        FrameAllocStats {
+            total_frames: 0,
+            allocated_frames: 0,
+            largest_free_run: 0,
+            reported_frames: 0,
+        },
+        |sum, node| FrameAllocStats {
+            total_frames: sum.total_frames + node.total_frames,
+            allocated_frames: sum.allocated_frames + node.allocated_frames,
+            largest_free_run: sum.largest_free_run.max(node.largest_free_run),
+            reported_frames: sum.reported_frames + node.reported_frames,
+        },
+    )
+}
+
 const fn pages_to_bytes(pages: u32) -> u64 {
     pages as u64 * PhysFrame::SIZE as u64
 }
@@ -785,12 +858,13 @@ unsafe fn range_bytes<'a>(range: PhysFrameRange) -> &'a mut [u8] {
 #[cfg(test)]
 mod tests {
     use super::{
-        BalloonHandle, BalloonService, BalloonStats, INFLATE_RUN_FRAMES, MemoryBalloon, MemoryStat,
-        MemoryStatTag, PRESSURE_FLOOR_DIVISOR, PhysFrame, PhysFrameAllocator,
-        publish_stats_forever, report_free_memory_once,
+        BalloonHandle, BalloonService, BalloonStats, INFLATE_RUN_FRAMES, MIN_REPORT_RUN_FRAMES,
+        MemoryBalloon, MemoryStat, MemoryStatTag, NodeId, PRESSURE_FLOOR_DIVISOR, PhysFrame,
+        PhysFrameAllocator, node_budget, publish_stats_forever, report_free_memory_once,
     };
     use crate::machine::{MachineGeneration, MachineGenerationHandle, ResetDevice};
     use crate::memory::user::UserMemoryPool;
+    use crate::test_support::TestMachine;
     use alloc::boxed::Box;
     use alloc::vec::Vec;
     use core::alloc::Layout;
@@ -806,9 +880,10 @@ mod tests {
         let layout = Layout::from_size_align(bytes, PhysFrame::SIZE).expect("pool layout");
         let start = unsafe { alloc::alloc::alloc(layout) } as usize;
         assert!(start != 0, "host allocation for the user pool failed");
-        let pool: &'static UserMemoryPool = Box::leak(Box::new(UserMemoryPool::empty()));
-        pool.initialize(&[(start, start + bytes)]);
-        pool
+        Box::leak(Box::new(UserMemoryPool::single_node(
+            1,
+            &[(start, start + bytes)],
+        )))
     }
 
     /// A balloon device that records what the guest handed it.
@@ -983,7 +1058,7 @@ mod tests {
     }
 
     fn free_frames(pool: &UserMemoryPool) -> usize {
-        PhysFrameAllocator::stats(pool).free_frames()
+        PhysFrameAllocator::stats(pool, NodeId::FIRST).free_frames()
     }
 
     /// A host may ask for more than the guest can spare. Handing it over
@@ -992,7 +1067,7 @@ mod tests {
     #[test]
     fn inflation_stops_at_the_pressure_floor() {
         let pool = pool(64 * 1024 * 1024);
-        let total = PhysFrameAllocator::stats(pool).total_frames;
+        let total = PhysFrameAllocator::stats(pool, NodeId::FIRST).total_frames;
         let floor = total / PRESSURE_FLOOR_DIVISOR;
         let device = FakeBalloon::new(false);
         let (mut service, handle) = service(pool, device.clone());
@@ -1023,8 +1098,10 @@ mod tests {
     #[test]
     fn non_power_of_two_targets_and_budgets_use_exact_frame_occupancy() {
         let pool = pool(4 * 1024 * 1024);
-        let outside = pool.allocate(1, false).expect("non-balloon frame");
-        let total = PhysFrameAllocator::stats(pool).total_frames;
+        let outside = pool
+            .allocate(NodeId::FIRST, 1, false)
+            .expect("non-balloon frame");
+        let total = PhysFrameAllocator::stats(pool, NodeId::FIRST).total_frames;
         let floor = total / PRESSURE_FLOOR_DIVISOR;
         let before = free_frames(pool);
         let device = FakeBalloon::new(false);
@@ -1156,7 +1233,7 @@ mod tests {
         block_on(publish_stats_forever(pool, device.clone()));
 
         let published = device.inner.published.lock().clone();
-        let stats = PhysFrameAllocator::stats(pool);
+        let stats = PhysFrameAllocator::stats(pool, NodeId::FIRST);
         let total = (stats.total_frames * PhysFrame::SIZE) as u64;
         let free = (stats.free_frames() * PhysFrame::SIZE) as u64;
         let floor = ((stats.total_frames / PRESSURE_FLOOR_DIVISOR) * PhysFrame::SIZE) as u64;
@@ -1224,7 +1301,7 @@ mod tests {
             "the counters describe an empty device"
         );
         assert_eq!(device.actual(), 0);
-        let stats = PhysFrameAllocator::stats(pool);
+        let stats = PhysFrameAllocator::stats(pool, NodeId::FIRST);
         assert!(
             stats.reported_frames >= target,
             "the returned frames are marked, so whoever allocates them next gets zeroes"
@@ -1316,6 +1393,80 @@ mod tests {
         );
         assert_eq!(service.held_frames(), target);
         assert_eq!(free_frames(pool), free_before - target);
+    }
+
+    /// On a machine of several nodes a resynchronisation returns every
+    /// run to the node it came from, and the device is owed every node's
+    /// free memory: a node that could name nothing in the next pass,
+    /// because it sat at its floor, is still owed after it while a node
+    /// that named something is not.
+    #[test]
+    fn a_reset_device_is_owed_every_node_until_each_names_something() {
+        const NODE_BYTES: usize = 16 * 1024 * 1024;
+        let pool = TestMachine::round_robin(2, 2).pool(NODE_BYTES);
+        let (node_0, node_1) = (NodeId::new(0), NodeId::new(1));
+        let generation = MachineGeneration::new(None);
+        let device = FakeBalloon::new(false);
+        let (mut service, handle) = service_on(pool, device.clone(), generation.clone());
+        let free_on = |node| PhysFrameAllocator::stats(pool, node).free_frames();
+        let free_before = [free_on(node_0), free_on(node_1)];
+
+        let target = 4 * INFLATE_RUN_FRAMES;
+        device.set_target_pages(u32::try_from(target).expect("target fits"));
+        block_on(service.adjust());
+        assert_eq!(service.held_frames(), target);
+        assert!(
+            free_on(node_0) < free_before[0] && free_on(node_1) < free_before[1],
+            "the balloon drew from both nodes"
+        );
+
+        device.reset();
+        generation.record_device_reset(ResetDevice::MemoryBalloon);
+        handle.resynchronise();
+        block_on(service.adjust());
+        assert_eq!(service.held_frames(), 0);
+        assert_eq!(
+            [free_on(node_0), free_on(node_1)],
+            free_before,
+            "every run went back to the node it came from"
+        );
+        for node in [node_0, node_1] {
+            assert!(
+                PhysFrameAllocator::stats(pool, node).reported_frames > 0,
+                "node {} keeps the marks of the runs returned to it",
+                node.index()
+            );
+        }
+
+        // Node 1 at its floor: a pass can name nothing on it.
+        let mut held = Vec::new();
+        while node_budget(PhysFrameAllocator::stats(pool, node_1)) >= MIN_REPORT_RUN_FRAMES {
+            held.push(
+                PhysFrameAllocator::allocate(pool, node_1, 64, false).expect("node 1 has frames"),
+            );
+        }
+        assert!(block_on(report_free_memory_once(pool, &device, &handle)) > 0);
+        let owed = handle.shared.reports_forgotten.load(Ordering::Acquire);
+        assert_eq!(
+            owed & (1 << node_0.index()),
+            0,
+            "node 0 named memory, so it is owed nothing more"
+        );
+        assert_ne!(
+            owed & (1 << node_1.index()),
+            0,
+            "node 1 named nothing, so the device is still owed all of it"
+        );
+
+        for range in held {
+            PhysFrameAllocator::deallocate(pool, range);
+        }
+        assert!(block_on(report_free_memory_once(pool, &device, &handle)) > 0);
+        assert_eq!(
+            handle.shared.reports_forgotten.load(Ordering::Acquire),
+            0,
+            "node 1 named memory once it had room"
+        );
     }
 
     /// Polls `future` once, reporting whether it finished.

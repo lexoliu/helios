@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use futures_lite::future;
 use helios_hal::cpu::{Cpu, ProcessorId, current_processor};
-use helios_hal::memory::MemoryRegion;
+use helios_hal::numa::SingleNode;
 use helios_hal::{DeviceInventory, DmaModel, Platform, ProcessorStartupPolicy, ProcessorTopology};
 use helios_kernel::{
     Notify, OfflineError, OfflineRefusal, OnlineError, PinnedTasks, ProcessorLifecycle, Sleep,
@@ -35,23 +35,30 @@ const SECONDARY: ProcessorId = ProcessorId::new(1);
 /// How long any one step of the test may take before it is a hang.
 const STEP_DEADLINE: Duration = Duration::from_secs(10);
 
+/// `processor`'s platform on a machine of `processors`. On the bootstrap
+/// processor it first primes the allocator, as every backend does before
+/// `init`: the host machine reports no NUMA description, so one node holds
+/// every processor and all of the reserved heap.
 fn platform(
     machine: &Arc<HostedMachine>,
     processor: ProcessorId,
     processors: usize,
-) -> Platform<HostedConsole, HostedCpu, core::iter::Once<MemoryRegion>> {
+) -> Platform<HostedConsole, HostedCpu> {
     let cpu = HostedCpu::new(processor, machine.clone());
-    Platform::new(
-        HostedConsole::new(),
-        machine.bootstrap_memory_regions(processor),
-        cpu,
-    )
-    .with_topology(
-        ProcessorTopology::start_all_secondaries(BOOTSTRAP, processors)
-            .with_startup_policy(ProcessorStartupPolicy::BootstrapOnly),
-    )
-    .with_dma_model(DmaModel::Translated)
-    .with_devices(DeviceInventory::new())
+    if processor == BOOTSTRAP {
+        helios_kernel::prime_bootstrap_allocator(
+            machine.bootstrap_memory_regions(),
+            &SingleNode::new(processors),
+            processor,
+        );
+    }
+    Platform::new(HostedConsole::new(), cpu)
+        .with_topology(
+            ProcessorTopology::start_all_secondaries(BOOTSTRAP, processors)
+                .with_startup_policy(ProcessorStartupPolicy::BootstrapOnly),
+        )
+        .with_dma_model(DmaModel::Translated)
+        .with_devices(DeviceInventory::new())
 }
 
 /// Waits, a millisecond at a time, until `condition` holds; panics

@@ -39,6 +39,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use arm_gic::Trigger;
 use core::str::FromStr;
+use helios_firmware::{AcpiNuma, FirmwareNumaError, GiccUidKey, ProcessorIdentities};
 use helios_hal::cpu::Timebase;
 use helios_tpm::{AcpiTpm2, AcpiTpm2Locality, InterfaceDescription};
 use thiserror::Error;
@@ -127,6 +128,23 @@ pub(super) fn open(rsdp: usize) -> Result<AcpiPlatformTables, AcpiError> {
     let tables =
         unsafe { AcpiTables::from_rsdp(handler.clone(), rsdp) }.map_err(AcpiError::Tables)?;
     Ok(AcpiPlatformTables { tables, handler })
+}
+
+/// The machine's NUMA description from the SRAT and SLIT, each processor
+/// keyed by the ACPI processor UID its MADT GICC entry pairs with its
+/// MPIDR.
+///
+/// Allocation-free, so this runs before the kernel has a heap: every
+/// table is read in place through its mapping.
+pub(super) fn numa<Identities: ProcessorIdentities>(
+    tables: &AcpiPlatformTables,
+    identities: Identities,
+) -> Result<
+    AcpiNuma<Aarch64AcpiHandler, Identities, GiccUidKey<Aarch64AcpiHandler>>,
+    FirmwareNumaError,
+> {
+    let key = GiccUidKey::new(&tables.tables)?;
+    AcpiNuma::new(&tables.tables, identities, key)
 }
 
 /// The console the firmware was redirecting to, from the SPCR.

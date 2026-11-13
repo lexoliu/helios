@@ -311,7 +311,9 @@ impl ReadyShared {
     }
 }
 
-/// The machine-wide ready queue.
+/// A ready queue of global tasks, which any processor's run loop may
+/// pop: the executor keeps one per NUMA node, and a one-node machine's
+/// one queue is the machine-wide queue.
 pub(crate) struct GlobalReadyQueue {
     /// Written by every pusher.
     pub(crate) shared: CachePadded<ReadyShared>,

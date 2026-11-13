@@ -85,6 +85,7 @@ where
     {
         let service = NetworkService::new(
             self.cpu.clone(),
+            crate::memory::user_memory_pool(),
             runtime_state.profiles(),
             runtime_state.uptime_clock(),
             self.timer(),

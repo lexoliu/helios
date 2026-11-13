@@ -2,14 +2,15 @@
 //!
 //! # SMP contract
 //!
-//! There is one [`NetworkShard`] per possible processor and every shard
-//! owns an independent `Stack`, socket slab and port allocator. A flow
-//! belongs to exactly one shard ([`rx_frame_owner`]), so the frames for
-//! a socket are always placed in that socket's shard whichever processor
-//! drained them off the device. The set is never re-partitioned: a
-//! processor going offline leaves its shard, its sockets and its port
-//! window where they are, and only the queue pair whose pump serves the
-//! shard changes (`routes`).
+//! There is one [`NetworkShard`] per possible processor, in memory of
+//! that processor's node ([`PerProcessor`]: each shard's cell on cache
+//! lines of its own), and every shard owns an independent `Stack`,
+//! socket slab and port allocator. A flow belongs to exactly one shard
+//! ([`rx_frame_owner`]), so the frames for a socket are always placed in
+//! that socket's shard whichever processor drained them off the device.
+//! The set is never re-partitioned: a processor going offline leaves its
+//! shard, its sockets and its port window where they are, and only the
+//! queue pair whose pump serves the shard changes (`routes`).
 //!
 //! One frame is the exception: a Neighbor Advertisement belongs to the
 //! whole node, because the shard that asked for the address is the one
@@ -43,7 +44,8 @@
 //! an await point.
 
 use super::*;
-use crossbeam_utils::CachePadded;
+use crate::memory::{PerProcessor, UserMemoryPool};
+use helios_hal::cpu::ProcessorId;
 
 /// Who a received frame belongs to.
 pub(super) enum RxFrameOwner {
@@ -556,8 +558,34 @@ pub(super) enum WaitTarget {
     AnyShard,
 }
 
+/// The shards of a set, one per processor, each in memory of its
+/// processor's node. A shard's index is its processor's.
+pub(super) struct ShardTable {
+    cells: PerProcessor<ShardCell>,
+}
+
+impl ShardTable {
+    pub(super) fn len(&self) -> usize {
+        self.cells.len()
+    }
+
+    pub(super) fn iter(&self) -> impl Iterator<Item = &ShardCell> {
+        self.cells.iter().map(|(_, cell)| cell)
+    }
+}
+
+impl core::ops::Index<usize> for ShardTable {
+    type Output = ShardCell;
+
+    fn index(&self, index: usize) -> &ShardCell {
+        let processor = u16::try_from(index)
+            .unwrap_or_else(|_| panic!("network shard index {index} exceeds u16 range"));
+        self.cells.get(ProcessorId::new(processor))
+    }
+}
+
 pub(super) struct NetworkShardSet {
-    pub(super) shards: Box<[CachePadded<ShardCell>]>,
+    pub(super) shards: ShardTable,
     /// Slots for listeners, which exist on every shard because an
     /// inbound connection's hash is not known when the port is opened.
     pub(super) listener_slots: ReplicaSlots<MAX_TCP_LISTENER_HANDLES>,
@@ -612,28 +640,27 @@ impl ShardArrivals {
 }
 
 impl NetworkShardSet {
-    /// Builds a shard set sized to `shard_count`. Each shard owns
+    /// Builds a shard set with one shard per processor of `pool`'s
+    /// machine, each in its processor's node's memory. Each shard owns
     /// an independent `NetworkShard`, produced by `factory(i)` so
     /// the ctor can stagger per-shard fields (port allocator base,
     /// DHCP transaction id) across the set.
-    pub(super) fn new<F>(shard_count: usize, mut factory: F) -> Self
+    pub(super) fn new<F>(pool: &UserMemoryPool, mut factory: F) -> Self
     where
         F: FnMut(usize) -> NetworkShard,
     {
-        assert!(shard_count != 0, "network shard count must be non-zero");
-        let mut shards: Vec<CachePadded<ShardCell>> = Vec::with_capacity(shard_count);
-        for index in 0..shard_count {
-            shards.push(CachePadded::new(ShardCell {
-                inner: SpinMutex::new(factory(index)),
+        let shards = ShardTable {
+            cells: PerProcessor::new(pool, |processor, _| ShardCell {
+                inner: SpinMutex::new(factory(usize::from(processor.id()))),
                 rx_frames: AtomicU64::new(0),
                 tx_frames: AtomicU64::new(0),
                 rx_refused_frames: AtomicU64::new(0),
                 rx_device_refusals: AtomicU64::new(0),
                 arrival: ProgressSignal::new(),
-            }));
-        }
+            }),
+        };
         Self {
-            shards: shards.into_boxed_slice(),
+            shards,
             listener_slots: ReplicaSlots::new(0),
             // Slot zero is the DHCP client, which every shard reserves
             // so a replicated bind cannot land on top of it.
@@ -657,7 +684,7 @@ impl NetworkShardSet {
         for (installed, shard) in self.shards.iter().enumerate() {
             let outcome = install(&mut shard.inner.lock(), slot);
             if let Err(error) = outcome {
-                for unwound in &self.shards[..installed] {
+                for unwound in self.shards.iter().take(installed) {
                     remove(&mut unwound.inner.lock(), slot);
                 }
                 return Err(error);
@@ -1096,7 +1123,7 @@ impl NetworkShardSet {
     where
         F: FnMut(&mut NetworkShard),
     {
-        for shard in &self.shards {
+        for shard in self.shards.iter() {
             let mut guard = shard.inner.lock();
             f(&mut guard);
         }
