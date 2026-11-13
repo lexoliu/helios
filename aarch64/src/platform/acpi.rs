@@ -48,7 +48,7 @@ use thiserror::Error;
 
 use super::{
     ConsoleDescription, GicDescription, MmioRegion, PlatformDescription, PlatformSource,
-    RedistributorAffinity, Slots, SpiInterrupt, TpmDescription, VirtioMmioSlot,
+    PsciConduit, RedistributorAffinity, Slots, SpiInterrupt, TpmDescription, VirtioMmioSlot,
 };
 
 /// The first 32 INTIDs are software-generated and private peripheral
@@ -243,6 +243,7 @@ pub(super) fn describe(
         source: PlatformSource::Acpi,
         console,
         gic,
+        psci: psci(tables)?,
         // See the module comment: ACPI describes a calendar through the
         // Time and Alarm Device, not through the PL031 the device-tree
         // path finds.
@@ -358,6 +359,22 @@ fn gic(tables: &AcpiPlatformTables) -> Result<GicDescription, AcpiError> {
 
 /// A GICD register frame is 64KiB in every GIC architecture version.
 const GICD_FRAME_BYTES: usize = 0x1_0000;
+
+/// The PSCI conduit the FADT's ARM boot architecture flags declare.
+fn psci(tables: &AcpiPlatformTables) -> Result<Option<PsciConduit>, AcpiError> {
+    let fadt = tables
+        .tables
+        .find_table::<Fadt>()
+        .ok_or(AcpiError::MissingTable(Signature::FADT))?;
+    let flags = fadt.arm_boot_arch;
+    Ok(flags.implements_psci().then(|| {
+        if flags.use_hvc_as_psci_conduit() {
+            PsciConduit::Hvc
+        } else {
+            PsciConduit::Smc
+        }
+    }))
+}
 
 /// Loads the DSDT and every SSDT into a fresh AML namespace.
 fn load_namespace(tables: &AcpiPlatformTables) -> Result<Interpreter, AcpiError> {

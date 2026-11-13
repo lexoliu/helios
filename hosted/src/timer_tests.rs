@@ -7,7 +7,6 @@
 
 #![cfg(test)]
 
-use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -16,7 +15,7 @@ use helios_hal::cpu::ProcessorId;
 use helios_hal::{DeviceInventory, DmaModel, Platform, ProcessorStartupPolicy, ProcessorTopology};
 use helios_kernel::Kernel;
 
-use crate::config::HostedConfig;
+use crate::config::DEFAULT_HEAP_BYTES;
 use crate::console::HostedConsole;
 use crate::cpu::HostedCpu;
 use crate::runtime::HostedMachine;
@@ -36,12 +35,8 @@ const SLEEPS: usize = 4;
 /// A lone processor fires consecutive sleeps, each on time.
 #[test]
 fn a_lone_processor_fires_consecutive_sleeps() {
-    let bootfs = PathBuf::from(
-        std::env::var_os("HELIOS_BOOTFS")
-            .expect("HELIOS_BOOTFS must name the kernel-prebuild payload"),
-    );
-    let machine = HostedMachine::new(&HostedConfig::for_test(1, bootfs));
     let processor = ProcessorId::new(0);
+    let machine = HostedMachine::new(1, processor, DEFAULT_HEAP_BYTES);
     let (jobs_tx, jobs) = unbounded::<Box<dyn FnOnce(&'static Kernel<HostedCpu>) + Send>>();
     let (registered_tx, registered) = bounded(1);
 

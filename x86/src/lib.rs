@@ -455,7 +455,11 @@ fn x86_kernel_main() -> ! {
             cpu.processor_count(),
             cpu.bootstrap_processor(),
         ) {
-            cpu.start_processor(processor);
+            // A possible processor that is not present stays offline: its
+            // slot is built, and `ProcessorControl::online` starts it.
+            if cpu.state.present_at_boot(processor) {
+                cpu.start_processor(processor);
+            }
         }
     }
     run_current_processor(cpu, kernel, debug_state)
@@ -692,16 +696,12 @@ fn install_pci_devices<WatchdogImpl, MeasuredBootImpl>(
     );
 }
 
-/// Counts usable processors from the MADT. Runs before the bootstrap
-/// allocator is primed (the count sizes the allocator's per-processor
-/// structures), so it must not allocate: iterate MADT entries directly
-/// instead of building `AcpiPlatform` processor info.
+/// Counts the possible processors the MADT lists, present or not. Runs
+/// before the bootstrap allocator is primed (the count sizes the
+/// allocator's per-processor structures), so it must not allocate: it
+/// iterates the MADT entries directly.
 fn processor_count(rsdp_address: usize, physical_memory_offset: usize) -> usize {
-    use acpi::sdt::madt::{Madt, MadtEntry};
-
-    const LAPIC_ENABLED: u32 = 1 << 0;
-    const LAPIC_ONLINE_CAPABLE: u32 = 1 << 1;
-    const LAPIC_USABLE: u32 = LAPIC_ENABLED | LAPIC_ONLINE_CAPABLE;
+    use acpi::sdt::madt::Madt;
 
     let handler = smp::PhysicalOffsetAcpiHandler {
         physical_memory_offset,
@@ -715,16 +715,8 @@ fn processor_count(rsdp_address: usize, physical_memory_offset: usize) -> usize 
     let madt = tables
         .find_table::<Madt>()
         .unwrap_or_else(|| panic!("ACPI tables did not expose an MADT"));
-    let count = madt
-        .get()
-        .entries()
-        .filter(|entry| match entry {
-            MadtEntry::LocalApic(apic) => apic.flags & LAPIC_USABLE != 0,
-            MadtEntry::LocalX2Apic(apic) => apic.flags & LAPIC_USABLE != 0,
-            _ => false,
-        })
-        .count();
-    assert!(count > 0, "MADT did not list any usable processors");
+    let count = smp::possible_processors(madt.get()).count();
+    assert!(count > 0, "MADT did not list any possible processors");
     count
 }
 
@@ -1048,6 +1040,23 @@ impl Cpu for X86Cpu {
     fn start_processor(&self, processor: ProcessorId) {
         self.state
             .start_processor(processor, secondary_start_rust as *const () as usize);
+    }
+
+    /// Saves the callee-saved context, leaves the shootdown set, masks the
+    /// local APIC timer and halts with interrupts masked until
+    /// [`Cpu::restart_processor`] sends INIT/SIPI; the handshake and what
+    /// is re-seeded on the way back are in `smp::stop_current_processor`.
+    fn stop_current(&self) {
+        smp::stop_current_processor();
+    }
+
+    /// May land at any point after the kernel published the stop: the
+    /// restart waits for the processor to reach its halt, then claims the
+    /// stop with a compare-exchange, so it restarts the processor exactly
+    /// once (`smp::X86PlatformState::restart_processor`).
+    fn restart_processor(&self, processor: ProcessorId) {
+        self.state
+            .restart_processor(processor, smp::resume_current_rust as *const () as usize);
     }
 
     fn wake_processor(&self, processor: ProcessorId) {

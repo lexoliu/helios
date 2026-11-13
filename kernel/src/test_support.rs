@@ -110,6 +110,14 @@ impl Cpu for TestCpu {
 
     fn wake_processor(&self, _: ProcessorId) {}
 
+    fn stop_current(&self) {
+        panic!("test CPU never stops a processor")
+    }
+
+    fn restart_processor(&self, _: ProcessorId) {
+        panic!("test CPU never restarts a processor")
+    }
+
     fn now(&self) -> Instant {
         Instant::new(11)
     }
@@ -157,10 +165,11 @@ pub(crate) fn test_root_entropy() -> crate::RootEntropyHandle {
     )
 }
 
-/// A timer owned by the processor the calling test thread stands for,
-/// as [`crate::Executor::timer`] builds one on every processor.
+/// A timer whose base belongs to the processor the calling test thread
+/// stands for, as [`crate::Executor::timer`] brings one online on every
+/// processor, on a group of its own so no other test's sleeps share it.
 pub(crate) fn test_timer<CpuImpl: Cpu + Clone>(cpu: CpuImpl) -> crate::Timer<CpuImpl> {
-    crate::Executor::new(
+    crate::Executor::isolated(
         helios_hal::watchdog::ProgressCounter::new(),
         cpu.processor_count(),
         helios_hal::cpu::current_processor(),
@@ -219,6 +228,14 @@ impl Cpu for ManualClockCpu {
     fn start_processor(&self, _: ProcessorId) {}
 
     fn wake_processor(&self, _: ProcessorId) {}
+
+    fn stop_current(&self) {
+        panic!("test CPU never stops a processor")
+    }
+
+    fn restart_processor(&self, _: ProcessorId) {
+        panic!("test CPU never restarts a processor")
+    }
 
     fn now(&self) -> Instant {
         Instant::new(self.nanos.load(Ordering::Relaxed))
@@ -330,6 +347,14 @@ impl Cpu for RecordingSmpCpu {
 
     fn wake_processor(&self, processor: ProcessorId) {
         self.woken.lock().push(processor);
+    }
+
+    fn stop_current(&self) {
+        self.base.stop_current();
+    }
+
+    fn restart_processor(&self, processor: ProcessorId) {
+        self.base.restart_processor(processor);
     }
 
     fn now(&self) -> Instant {
