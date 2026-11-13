@@ -39,6 +39,39 @@ impl Iterator for ReceivePairOrder {
     }
 }
 
+/// What one receive batch's frames became, gathered by the drain's sink
+/// while the device holds each frame's pair and read by the poll once
+/// the device has let go.
+///
+/// Owned by the polling task alone: the sink runs synchronously on the
+/// processor that called the drain, so nothing here is shared.
+struct RxBatchDelivery {
+    /// Shards that took a frame, signalled once the batch is done.
+    arrivals: ShardArrivals,
+    /// Frames a shard consumed — delivered or unparseable — which is
+    /// what the poll's receive budget counts.
+    delivered: usize,
+    delivered_bytes: usize,
+    /// Bytes of every frame the device lent, refused ones included:
+    /// the ring phase's byte count.
+    lent_bytes: usize,
+    /// Time spent demuxing inside the device's hold, summed over the
+    /// batch's frames, which the ring phase is reported without.
+    dispatch: NetworkPerfSpan,
+}
+
+impl RxBatchDelivery {
+    fn new() -> Self {
+        Self {
+            arrivals: ShardArrivals::new(),
+            delivered: 0,
+            delivered_bytes: 0,
+            lent_bytes: 0,
+            dispatch: NetworkPerfSpan::default(),
+        }
+    }
+}
+
 pub(super) struct TcpListenerState {
     pub(super) stack_socket: helios_netstack::SocketId,
     pub(super) local_port: u16,
@@ -1157,6 +1190,60 @@ where
         Ok(reclaimed)
     }
 
+    /// Demuxes one frame the device lent to the shard that owns its
+    /// flow, and records what became of it in `batch`.
+    ///
+    /// This is the receive drain's sink, so it runs with the frame's
+    /// queue pair held: the pair's receive state ranks above the shard
+    /// lock `dispatch_rx_frame` takes, and nothing here waits for the
+    /// pair. The shard that took the frame is remembered rather than
+    /// signalled: the signal belongs after every lock is released, and
+    /// a batch that lands several frames in the same shard should
+    /// release its waiters once.
+    ///
+    /// Each frame takes its owning shard's lock on its own, so frames
+    /// for different flows are processed in parallel by other
+    /// processors and each shard's stack only sees the connections it
+    /// owns.
+    fn deliver_rx_frame(
+        &self,
+        frame: &RxFrame,
+        received_at: StackInstant,
+        batch: &mut RxBatchDelivery,
+    ) {
+        let dispatch_started = self.profile_start();
+        let frame_len = frame.len();
+        batch.lent_bytes = batch.lent_bytes.saturating_add(frame_len);
+        match self
+            .inner
+            .state
+            .dispatch_rx_frame(frame, received_at, &self.inner.control)
+        {
+            RxFrameDispatch::Delivered { shard_idx } => {
+                batch.arrivals.record(shard_idx);
+                self.inner.state.record_received(shard_idx, 1);
+                batch.delivered += 1;
+                batch.delivered_bytes = batch.delivered_bytes.saturating_add(frame_len);
+            }
+            // The frame is already off the ring and cannot be put back,
+            // so it is lost — which is what a closed receive window
+            // means and what the peer's retransmission is for. The rest
+            // of the batch belongs to other shards and is delivered
+            // regardless: one saturated flow does not get to drop
+            // another flow's segments, nor an ARP request.
+            RxFrameDispatch::Backpressured { shard_idx } => {
+                self.inner.state.record_receive_refused(shard_idx, 1);
+            }
+            RxFrameDispatch::Malformed => {
+                batch.delivered += 1;
+                batch.delivered_bytes = batch.delivered_bytes.saturating_add(frame_len);
+            }
+        }
+        if let Some(dispatch) = NetworkPerfSpan::between(dispatch_started, self.profile_start()) {
+            batch.dispatch.add(dispatch);
+        }
+    }
+
     /// Drains received frames from the queue pairs this poll scope
     /// owns, which is what puts a reply into the shard that is waiting
     /// for it.
@@ -1169,37 +1256,45 @@ where
     /// A pump visits only the pair it owns; every other pair has a pump
     /// of its own parked on it, so a frame is never without a drainer.
     ///
+    /// Each frame reaches `sink` while the device still holds the pair
+    /// it came from, so frames of one pair are delivered in ring order
+    /// however many processors drain it: a second drainer cannot take
+    /// the frames behind a batch and deliver them before the batch
+    /// lands.
+    ///
     /// The local pair is visited first, so a processor drains its own
     /// ring before it looks at anyone else's, and a pair another
     /// processor already holds is skipped by the device's `try_lock` —
-    /// that processor is draining it and this poll has nothing to add.
-    /// `None` means every pair the scope covers was held, which is the
-    /// same "come back later" a single-pair drain reports.
+    /// that processor is delivering it, and wakes the pair's waiters if
+    /// it lets go with frames still on the ring, so this poll has
+    /// nothing to add. `None` means every pair the scope covers was
+    /// held, which is the same "come back later" a single-pair drain
+    /// reports.
+    ///
+    /// `limit` bounds the frames the whole sweep hands to `sink`, and
+    /// with it how long any one pair is held.
     ///
     /// A pair that refuses ends the sweep, and the refusal travels back
-    /// beside the frames the sweep had already collected rather than in
-    /// place of them. Those frames are off the ring and no used entry
-    /// can be put back, so dropping them to report the error costs up
-    /// to a whole batch of good frames per malformed chain and makes
-    /// the peer retransmit data the guest did receive. The refusal is
-    /// counted against the pair that produced it here, because this is
-    /// the last place that knows which pair that was.
+    /// beside the count of frames the sweep had already delivered. The
+    /// refusal is counted against the pair that produced it here,
+    /// because this is the last place that knows which pair that was.
     fn receive_frames_immediate(
         &self,
         pairs: impl Iterator<Item = usize>,
-        frames: &mut [Option<RxFrame>],
+        limit: usize,
+        mut sink: impl FnMut(&RxFrame),
     ) -> Option<RxDrain> {
         let mut received = 0usize;
         let mut drained_a_pair = false;
         for pair_idx in pairs {
-            if received >= frames.len() {
+            if received >= limit {
                 break;
             }
-            let Some(drain) = self
-                .inner
-                .device
-                .try_receive_frames_immediate_on(pair_idx, &mut frames[received..])
-            else {
+            let Some(drain) = self.inner.device.try_receive_frames_immediate_on(
+                pair_idx,
+                limit - received,
+                &mut sink,
+            ) else {
                 continue;
             };
             drained_a_pair = true;
@@ -1287,148 +1382,78 @@ where
             }
 
             let receive_limit = remaining_rx_budget.min(NETWORK_RX_BATCH_FRAMES);
-            let mut frames: [Option<RxFrame>; NETWORK_RX_BATCH_FRAMES] =
-                core::array::from_fn(|_| None);
+            let received_at = StackInstant::from_nanos(self.now_nanos());
+            let mut batch = RxBatchDelivery::new();
+            // Each frame is demuxed to its shard from inside the drain,
+            // while the device still holds the pair it came from. That
+            // is what keeps two drainers of one pair — its pump and an
+            // operation sweeping every pair — from delivering its frames
+            // in an order the ring never had. A drain that popped a
+            // batch and released the pair before demuxing it let the
+            // other drainer pop the frames behind the batch and land
+            // them first, and the stack read every overtaken segment as
+            // a hole: it queued the earlier segment out of order and
+            // owed the peer a duplicate acknowledgement, and the peer
+            // fast-retransmitted data that was never lost (#776).
             let ring_started = self.profile_start();
             let drain = self.receive_frames_immediate(
                 scope.pairs(local_pair, pair_count),
-                &mut frames[..receive_limit],
+                receive_limit,
+                |frame| self.deliver_rx_frame(frame, received_at, &mut batch),
             );
-            // Only the immediate path's frames count as ring events: a
-            // fallback's frames come from pair zero's async receive and
-            // belong to `rx-fallback`.
-            let ring_frames = drain.as_ref().map_or(0, |drain| drain.received);
-            self.record_network_profile_events_bytes(
+            let ring_finished = self.profile_start();
+            // The hold interleaves the driver's ring work with the demux
+            // frame by frame, so the two phases are the hold split by
+            // the demux time summed inside it: `rx-dispatch` is that
+            // sum, and `rx-ring` the rest of the hold — popping, chain
+            // assembly, and posting the pass's buffers back.
+            let received_batch = drain.as_ref().map_or(0, |drain| drain.received);
+            let hold = NetworkPerfSpan::between(ring_started, ring_finished);
+            self.record_network_profile_span(
                 source.rx_ring_phase(),
-                ring_started,
-                ring_frames,
-                frames[..ring_frames]
-                    .iter()
-                    .flatten()
-                    .map(RxFrame::len)
-                    .sum(),
-            );
-            let RxDrain {
-                received: received_batch,
-                refusal,
-            } = match drain {
-                Some(drain) => drain,
-                // The immediate path found every pair it covers held
-                // mid-drain by somebody else. The pair-agnostic receive
-                // is pair zero's async lock — worth taking only when
-                // this scope owns pair zero; any other held pair is
-                // being drained by its pump and needs nothing from us.
-                None if scope.covers_pair_zero() => {
-                    let mut received_batch = 0usize;
-                    for frame in &mut frames[..receive_limit] {
-                        let Some(received_frame) = self.inner.device.try_receive_frame().await?
-                        else {
-                            break;
-                        };
-                        // The lock wait inside `try_receive_frame` is
-                        // outside this span: only the synchronous
-                        // hand-off of the frame it produced is measured.
-                        let fallback_started = self.profile_start();
-                        *frame = Some(received_frame);
-                        received_batch += 1;
-                        self.record_network_profile_events(
-                            source.rx_fallback_phase(),
-                            fallback_started,
-                            1,
-                        );
-                    }
-                    RxDrain::completed(received_batch)
-                }
-                None => break,
-            };
-            // A refused drain still falls through the demux below, so
-            // the frames it did take reach their shards and their
-            // receive slots go back to the device before the error is
-            // reported at the bottom of the iteration.
-            if received_batch == 0 && refusal.is_none() {
-                break;
-            }
-
-            let received_at = StackInstant::from_nanos(self.now_nanos());
-            // Demux each frame to the shard owning its destination
-            // port. The previous single-shard path locked
-            // `shard_for_default` once per batch; under multi-shard
-            // we lock the owning shard per-frame so different
-            // ports can be processed in parallel by other CPUs and
-            // each shard's Stack only sees the connections it
-            // actually owns.
-            //
-            // The shard that took a frame is remembered rather than
-            // signalled here: the signal belongs after the lock is
-            // released, and a batch that lands several frames in the
-            // same shard should release its waiters once.
-            let mut arrivals = ShardArrivals::new();
-            let dispatch_started = self.profile_start();
-            for frame in frames[..received_batch].iter().flatten() {
-                let frame_len = frame.len();
-                match self
-                    .inner
-                    .state
-                    .dispatch_rx_frame(frame, received_at, &self.inner.control)
-                {
-                    RxFrameDispatch::Delivered { shard_idx } => {
-                        arrivals.record(shard_idx);
-                        self.inner.state.record_received(shard_idx, 1);
-                        received += 1;
-                        received_bytes = received_bytes.saturating_add(frame_len);
-                    }
-                    // The frame is already off the ring and cannot be
-                    // put back, so it is lost — which is what a closed
-                    // receive window means and what the peer's
-                    // retransmission is for. The rest of the batch
-                    // belongs to other shards and is delivered
-                    // regardless: one saturated flow does not get to
-                    // drop another flow's segments, nor an ARP request.
-                    RxFrameDispatch::Backpressured { shard_idx } => {
-                        self.inner.state.record_receive_refused(shard_idx, 1);
-                    }
-                    RxFrameDispatch::Malformed => {
-                        received += 1;
-                        received_bytes = received_bytes.saturating_add(frame_len);
-                    }
-                }
-            }
-            self.record_network_profile_events(
-                source.rx_dispatch_phase(),
-                dispatch_started,
+                hold.map(|hold| hold.excluding(batch.dispatch)),
                 received_batch,
+                batch.lent_bytes,
             );
-            // Every shard that took a frame is released here. Without
-            // this a reply demuxed into a foreign shard would sit there
-            // until its waiter's own deadline expired.
+            if received_batch != 0 {
+                self.record_network_profile_span(
+                    source.rx_dispatch_phase(),
+                    hold.map(|_| batch.dispatch),
+                    received_batch,
+                    0,
+                );
+            }
+            // `None`: every pair this scope covers is held by somebody
+            // else, who is delivering it and wakes the pair's waiters
+            // if it lets go with frames left on the ring. The caller
+            // parks on the wait it armed before this poll.
+            let Some(RxDrain { refusal, .. }) = drain else {
+                break;
+            };
+            received += batch.delivered;
+            received_bytes = received_bytes.saturating_add(batch.delivered_bytes);
+            // Every shard that took a frame is released here, after the
+            // ring and shard locks are gone, so a woken waiter never
+            // contends with the drain that woke it. Without this a reply
+            // demuxed into a foreign shard would sit there until its
+            // waiter's own deadline expired.
             let signal_started = self.profile_start();
-            self.inner.state.notify_arrivals(&arrivals);
+            self.inner.state.notify_arrivals(&batch.arrivals);
             self.record_network_profile_events(
                 source.rx_signal_phase(),
                 signal_started,
-                arrivals.len(),
+                batch.arrivals.len(),
             );
 
-            let repost_started = self.profile_start();
-            let reposted = self
-                .inner
-                .device
-                .repost_rx_frames_immediate(&mut frames[..received_batch])?;
-            // Returning the batch's slots is the same driver receive the
-            // ring phase covers; it records no frames of its own.
-            self.record_network_profile_events(source.rx_ring_phase(), repost_started, 0);
-            if reposted.is_none() {
-                for frame in &mut frames[..received_batch] {
-                    drop(frame.take());
-                }
-            }
-
-            // The drain that produced this batch was refused. Its
-            // frames have reached their shards and their receive slots
-            // are back with the device, so the error is what is left to
-            // report.
+            // The drain that produced this batch was refused. The frames
+            // in front of the refusal have reached their shards and
+            // their receive slots are back with the device, so the error
+            // is what is left to report.
             if let Some(refusal) = refusal {
                 return Err(refusal);
+            }
+            if received_batch == 0 {
+                break;
             }
         }
         self.record_network_profile_events_bytes(
