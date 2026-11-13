@@ -3,9 +3,11 @@ description: >-
   Waits for the `wasm-programs` job of this run to upload the guest wasm of
   one profile, then downloads it. The lane that calls it runs in parallel
   with that job, so this is the step placed right before the lane's first
-  kernel prebuild. It fails at once when the job concluded with anything but
-  success, and when the artifact has not appeared within the bound. The
-  calling job needs `actions: read`.
+  kernel prebuild. It waits for as long as the job is queued or running,
+  whose own timeout bounds that, and fails at once when the job concluded
+  with anything but success, when it succeeded without the artifact, and
+  when the run has not listed the job within the bound. The calling job
+  needs `actions: read`.
 inputs:
   profile:
     description: The guest programs' cargo profile, `release` or `debug`.
@@ -14,7 +16,7 @@ inputs:
     description: Directory to download into, relative to the workspace.
     required: true
   timeout-seconds:
-    description: How long to wait for the artifact.
+    description: How long to wait for the run to list the job.
     required: false
     default: "1800"
 runs:
@@ -31,24 +33,43 @@ runs:
         artifact="helios-wasm-${PROFILE}"
         job="wasm-programs (${PROFILE})"
         run="repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+        uploaded() {
+          [[ -n "$(gh api --paginate "${run}/artifacts" \
+            --jq ".artifacts[] | select(.name == \"${artifact}\" and (.expired | not)) | .id")" ]]
+        }
         deadline=$((SECONDS + TIMEOUT_SECONDS))
         while true; do
-          found="$(gh api --paginate "${run}/artifacts" \
-            --jq ".artifacts[] | select(.name == \"${artifact}\" and (.expired | not)) | .id")"
-          if [[ -n "${found}" ]]; then
+          if uploaded; then
             echo "${artifact} is uploaded"
             exit 0
           fi
-          conclusion="$(gh api --paginate "${run}/attempts/${GITHUB_RUN_ATTEMPT}/jobs" \
-            --jq ".jobs[] | select(.name == \"${job}\") | .conclusion // \"\"")"
-          if [[ -n "${conclusion}" && "${conclusion}" != success ]]; then
-            echo "::error::the '${job}' job of this run concluded '${conclusion}', so ${artifact} will not appear"
-            exit 1
-          fi
-          if ((SECONDS >= deadline)); then
-            echo "::error::${artifact} did not appear within ${TIMEOUT_SECONDS} s; the '${job}' job has not finished or did not run"
-            exit 1
-          fi
+          # "<status> <conclusion>", empty while the run does not list the job.
+          state="$(gh api --paginate "${run}/attempts/${GITHUB_RUN_ATTEMPT}/jobs" \
+            --jq ".jobs[] | select(.name == \"${job}\") | \"\(.status) \(.conclusion // \"\")\"")"
+          case "${state}" in
+            "")
+              if ((SECONDS >= deadline)); then
+                echo "::error::this run listed no '${job}' job within ${TIMEOUT_SECONDS} s, so ${artifact} will not appear"
+                exit 1
+              fi
+              ;;
+            "completed success")
+              # The upload is the job's last step, so the artifact exists
+              # by now or never will.
+              if uploaded; then
+                echo "${artifact} is uploaded"
+                exit 0
+              fi
+              echo "::error::the '${job}' job of this run succeeded without uploading ${artifact}"
+              exit 1
+              ;;
+            completed\ *)
+              echo "::error::the '${job}' job of this run concluded '${state#completed }', so ${artifact} will not appear"
+              exit 1
+              ;;
+            # Queued or running: a producer that waited for a runner is
+            # late, not failed, and its own timeout bounds the wait.
+          esac
           sleep 10
         done
     - uses: actions/download-artifact@v4
