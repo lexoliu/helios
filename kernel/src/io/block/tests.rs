@@ -69,7 +69,7 @@ struct Queue {
 
 /// The waiter of one [`MemoryDisk`] data request. Dropping it detaches
 /// it; the request is still answered and its buffer completed.
-struct MemoryWaiter {
+pub(crate) struct MemoryWaiter {
     answer: Arc<Mutex<Answer>>,
 }
 
@@ -107,7 +107,9 @@ struct DiskState {
     max_segments: u32,
     serial: &'static str,
     read_only: bool,
-    fail_reads: bool,
+    /// While set, every read the disk is asked for fails, as a device
+    /// that develops a fault after it was mounted.
+    fail_reads: AtomicBool,
     /// A logical block whose writes the device refuses.
     fail_writes_at: Option<usize>,
     /// Mirrors a device whose write cache is never committed: reads
@@ -122,11 +124,30 @@ struct DiskState {
 /// A disk in host memory that answers a fixed serial and logs every
 /// request it serves.
 #[derive(Clone)]
-struct MemoryDisk {
+pub(crate) struct MemoryDisk {
     state: Arc<DiskState>,
 }
 
 impl MemoryDisk {
+    /// A read-only disk of 512-byte blocks holding `image`, zero-padded
+    /// to whole cache blocks: an image a filesystem test mounts. With
+    /// `fail_reads`, every read the disk is asked for fails.
+    pub(crate) fn holding(serial: &'static str, image: &[u8], fail_reads: bool) -> Self {
+        let blocks = image.len().div_ceil(CACHE_BLOCK_BYTES) * (CACHE_BLOCK_BYTES / 512);
+        let mut state = Self::build(serial, 512, blocks);
+        let bytes = state.bytes.get_mut();
+        bytes.fill(0);
+        bytes[..image.len()].copy_from_slice(image);
+        state.read_only = true;
+        *state.fail_reads.get_mut() = fail_reads;
+        Self::from(state)
+    }
+
+    /// Makes every later read fail, or succeed again.
+    pub(crate) fn fail_reads(&self, fail: bool) {
+        self.state.fail_reads.store(fail, Ordering::SeqCst);
+    }
+
     fn build(serial: &'static str, block_bytes: usize, blocks: usize) -> DiskState {
         let mut bytes = alloc::vec![0_u8; block_bytes * blocks];
         // Every cache-sized block starts filled with its own number, so
@@ -142,7 +163,7 @@ impl MemoryDisk {
             max_segments: 32,
             serial,
             read_only: false,
-            fail_reads: false,
+            fail_reads: AtomicBool::new(false),
             fail_writes_at: None,
             corrupt_readback: false,
             queue: Mutex::new(Queue::default()),
@@ -285,7 +306,7 @@ impl MemoryDisk {
         let blocks: usize =
             bufs.iter().map(|buf| buf.len()).sum::<usize>() / self.state.block_bytes;
         self.state.log.lock().push(Op::Read(block_id, blocks));
-        if self.state.fail_reads {
+        if self.state.fail_reads.load(Ordering::SeqCst) {
             return Err(IoError::DeviceFault);
         }
         let bytes = self.state.bytes.lock();
@@ -405,7 +426,11 @@ fn root() -> RootEntropyHandle {
 }
 
 /// A cache over one disk, sized and shaped by the test.
-fn cache_over(disk: &MemoryDisk, max_blocks: usize, processors: usize) -> BlockCache<MemoryDisk> {
+pub(crate) fn cache_over(
+    disk: &MemoryDisk,
+    max_blocks: usize,
+    processors: usize,
+) -> BlockCache<MemoryDisk> {
     let layout = DiskLayout::new(disk.geometry()).expect("the test disk fits the cache");
     BlockCache::new(
         BlockCacheLimits { max_blocks },
@@ -1390,7 +1415,7 @@ fn a_read_only_disk_refuses_writes_before_reaching_the_device() {
 #[test]
 fn a_failed_read_is_reported_and_a_later_read_retries() {
     let mut state = MemoryDisk::build("images", CACHE_BLOCK_BYTES, 16);
-    state.fail_reads = true;
+    *state.fail_reads.get_mut() = true;
     let disk = MemoryDisk::from(state);
     let cache = cache_over(&disk, 16, 1);
     let view = cache.disk(0);

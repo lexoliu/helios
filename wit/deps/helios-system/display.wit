@@ -19,12 +19,17 @@ package helios:system@0.1.0;
 /// copy of the resource, then tell the scanouts showing it to re-read —
 /// and nothing is copied anywhere else.
 ///
+/// A frame a renderer drew needs no copy either: `create-from-blob`
+/// points a scanout straight at a `gpu.blob`, and `present` on that
+/// surface only tells the scanout to re-read it.
+///
 /// The pointer is the display engine's, not the compositor's.
 /// `set-cursor` writes the cursor plane's own small resource and
 /// `move-cursor` moves it and does nothing else, so pointer motion costs
 /// no pixels and never waits on a repaint.
 interface display {
   use memory.{span};
+  use gpu.{blob};
 
   /// Why a request was refused.
   enum error {
@@ -53,6 +58,12 @@ interface display {
     /// contiguous run of that size left, or the instance's own memory
     /// accounting refused it.
     out-of-memory,
+    /// The display engine cannot scan a blob out: it negotiated no blob
+    /// resources.
+    no-blob-scanout,
+    /// The blob was made under a `gpu` this instance has since let go
+    /// of with every other `gpu` it held.
+    stale-blob,
     /// The display engine answered a request with something that does
     /// not belong to it, which is a device fault rather than a refusal.
     device-fault,
@@ -130,17 +141,21 @@ interface display {
     presented-nanos: u64,
   }
 
-  /// One frame buffer on one scanout.
+  /// One frame on one scanout: a frame buffer `create` made, or a
+  /// renderer's blob `create-from-blob` pointed the scanout at.
   ///
-  /// The bytes at the span it was created with are the device's backing
-  /// store, not a staging copy: what is written there is what the
-  /// display engine reads when `present` names it. Rows are `width * 4`
-  /// bytes, top row first, no padding between them.
+  /// A frame buffer's bytes at the span it was created with are the
+  /// device's backing store, not a staging copy: what is written there
+  /// is what the display engine reads when `present` names it. Rows are
+  /// `width * 4` bytes, top row first, no padding between them. A blob
+  /// surface's bytes are the blob's, laid out as `create-from-blob` was
+  /// told.
   ///
-  /// Dropping the surface takes it off its scanout and hands the
-  /// device's resource back; the span is ordinary zeroed memory again
+  /// Dropping the surface takes it off its scanout. A frame buffer's
+  /// resource is handed back; the span is ordinary zeroed memory again
   /// once the drop returns, and the frames go back to the instance's
-  /// pool when the display engine has let go of them.
+  /// pool when the display engine has let go of them. A blob stays the
+  /// renderer's, and is untouched.
   resource surface {
     /// The mode the surface was created at.
     resolution: func() -> mode;
@@ -148,8 +163,9 @@ interface display {
     /// Publish the pixels written into `region`.
     ///
     /// The returned future resolves when the display engine has taken
-    /// the frame: one copy of the rectangle into the device's own copy
-    /// of the resource, then one flush of the scanouts showing it. A
+    /// the frame: for a frame buffer, one copy of the rectangle into
+    /// the device's own copy of the resource, then one flush of the
+    /// scanouts showing it; for a blob, the flush alone. A
     /// compositor that wants to pace itself awaits the future; one that
     /// does not may present again before it resolves, and the kernel
     /// serialises them in the order they were asked for.
@@ -209,6 +225,22 @@ interface display {
     /// zeroed. A call that does not return a surface — refused, or
     /// cancelled by the caller — shows nothing at `buffer`.
     create: async func(scanout: u32, %mode: mode, format: pixel-format, buffer: span) -> result<surface, error>;
+
+    /// Point `scanout` at a `mode` frame in `format` read straight out
+    /// of `blob`, starting `offset` bytes in, with `stride` bytes from
+    /// one row to the next.
+    ///
+    /// Nothing is copied and nothing is pinned: the frame is whatever a
+    /// renderer drew into the blob, and `present` on the surface tells
+    /// the scanout to re-read it. `stride` is at least `width * 4`, and
+    /// `height` whole strides from `offset` lie inside the blob, or the
+    /// call is refused `out-of-bounds`. The blob must be one this
+    /// instance's `gpu` made and still holds. The surface keeps the blob
+    /// alive: dropping the blob handle — or the `gpu` it came from —
+    /// while the surface shows it destroys nothing until the surface is
+    /// dropped, and then the scanout is blanked before the blob goes.
+    /// Either may be dropped first.
+    create-from-blob: async func(scanout: u32, %mode: mode, format: pixel-format, blob: borrow<blob>, offset: u32, stride: u32) -> result<surface, error>;
 
     /// Every change to the device's set of outputs, from now on.
     changed: func() -> stream<display-change>;

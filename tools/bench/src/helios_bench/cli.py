@@ -80,6 +80,7 @@ def command_run(args: argparse.Namespace) -> int:
             args.baseline_rebuild_profile_use.resolve() if args.baseline_rebuild_profile_use else None
         ),
         plain_baseline=plain_baseline,
+        compiler_isa_level=args.compiler_isa_level,
         profile_boot=not args.no_profile_boot,
     )
     report = run_suite(options, manifest, dry_run=args.dry_run)
@@ -242,6 +243,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="alternating rounds (an even number): each round times both sides once and consecutive "
         "rounds swap which goes first; overrides the lane's `rounds`",
+    )
+    run.add_argument(
+        "--compiler-isa-level",
+        help="the name of the ISA level a counterpart naming {compiler_isa_level} compiles for, such as "
+        "x86-64-v4+vbmi+bitalg; for a run that does not time the helios side, whose guest otherwise "
+        "reports it",
     )
     run.add_argument("--runner-label")
     run.add_argument("--allow-busy-host", action="store_true")

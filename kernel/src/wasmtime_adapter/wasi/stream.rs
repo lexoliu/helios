@@ -30,13 +30,13 @@ pub(super) fn read_bounded_chunk<T: 'static>(
     Ok(bytes)
 }
 
-pub(super) struct SerialStreamConsumer<T, CpuImpl, Net, HostFs>
+pub(super) struct SerialStreamConsumer<T, CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    pub(super) getter: fn(&mut T) -> &mut StoreData<CpuImpl, Net, HostFs>,
+    pub(super) getter: fn(&mut T) -> &mut StoreData<CpuImpl, Net, StorageImpl>,
     pub(super) stream: OutputStreamKind,
     pub(super) result: Option<oneshot::Sender<core::result::Result<(), cli_types::ErrorCode>>>,
     /// Batch that the sink could not take yet. Held here — never dropped
@@ -48,22 +48,22 @@ where
     pub(super) serial_wait: Option<crate::NotifyWaiter>,
 }
 
-impl<T, CpuImpl, Net, HostFs> Unpin for SerialStreamConsumer<T, CpuImpl, Net, HostFs>
+impl<T, CpuImpl, Net, StorageImpl> Unpin for SerialStreamConsumer<T, CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
 }
 
-impl<T, CpuImpl, Net, HostFs> SerialStreamConsumer<T, CpuImpl, Net, HostFs>
+impl<T, CpuImpl, Net, StorageImpl> SerialStreamConsumer<T, CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     pub(super) fn new(
-        getter: fn(&mut T) -> &mut StoreData<CpuImpl, Net, HostFs>,
+        getter: fn(&mut T) -> &mut StoreData<CpuImpl, Net, StorageImpl>,
         result: oneshot::Sender<core::result::Result<(), cli_types::ErrorCode>>,
         stream: OutputStreamKind,
     ) -> Self {
@@ -84,23 +84,23 @@ where
     }
 }
 
-impl<T, CpuImpl, Net, HostFs> Drop for SerialStreamConsumer<T, CpuImpl, Net, HostFs>
+impl<T, CpuImpl, Net, StorageImpl> Drop for SerialStreamConsumer<T, CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn drop(&mut self) {
         self.complete(Ok(()));
     }
 }
 
-impl<T: 'static, CpuImpl, Net, HostFs> StreamConsumer<T>
-    for SerialStreamConsumer<T, CpuImpl, Net, HostFs>
+impl<T: 'static, CpuImpl, Net, StorageImpl> StreamConsumer<T>
+    for SerialStreamConsumer<T, CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     type Item = u8;
 

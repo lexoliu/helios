@@ -13,11 +13,14 @@ use helios_virtio::{InterruptTrigger, MmioInterrupt};
 
 use super::{
     ConsoleDescription, GicDescription, GrantableDevice, MAX_GRANTABLE_DEVICES, MmioRegion,
-    PlatformDescription, PlatformError, PlatformSource, Slots, SpiInterrupt, VirtioMmioSlot,
+    PlatformDescription, PlatformError, PlatformSource, PsciConduit, Slots, SpiInterrupt,
+    VirtioMmioSlot,
 };
 
 /// `compatible` string of the interrupt controller this backend drives.
 const GIC_V3: &str = "arm,gic-v3";
+/// `compatible` strings of the PSCI service node, 0.2 and later.
+const PSCI: [&str; 2] = ["arm,psci-1.0", "arm,psci-0.2"];
 /// `compatible` string of the console UART.
 const PL011: &str = "arm,pl011";
 /// `compatible` string of the real-time clock.
@@ -25,6 +28,10 @@ const PL031: &str = "arm,pl031";
 /// `compatible` string of a virtio transport slot, which the virtio
 /// walk already claims.
 const VIRTIO_MMIO: &str = "virtio,mmio";
+/// `compatible` string of a TPM's FIFO interface over MMIO, the one
+/// QEMU writes for its `tpm-tis-device` (`hw/core/sysbus-fdt.c`,
+/// `add_tpm_tis_fdt_node`).
+const TPM_TIS_MMIO: &str = "tcg,tpm-tis-mmio";
 
 /// The mapping granule a grant's region has to respect.
 const FRAME: usize = helios_hal::pmm::PhysFrame::SIZE;
@@ -75,13 +82,109 @@ pub(super) fn describe(
         source: PlatformSource::DeviceTree,
         console,
         gic: gic(fdt)?,
+        psci: psci(fdt)?,
         rtc: find_compatible(fdt, PL031)
             .map(|node| first_region(&node, PL031))
             .transpose()?,
         virtio,
         grantable: grantable(fdt),
+        tpm: tpm(fdt)?,
         boot_entropy_seed: helios_hal::entropy::device_tree_seed(fdt),
     })
+}
+
+/// The TPM's FIFO interface, when the tree has a `tcg,tpm-tis-mmio`
+/// node.
+///
+/// QEMU puts the node on its platform bus (`/platform-bus@c000000`),
+/// whose children name addresses relative to the bus, so the node's
+/// `reg` is translated through the bus's `ranges` into the root's
+/// address space. A node directly under the root needs no translation;
+/// one nested deeper than one bus is refused rather than read at the
+/// wrong address.
+fn tpm(fdt: &Fdt<'static>) -> Result<Option<super::TpmDescription>, PlatformError> {
+    let is_tpm = |node: &FdtNode<'_, '_>| {
+        node.compatible()
+            .is_some_and(|entries| entries.all().any(|entry| entry == TPM_TIS_MMIO))
+    };
+    let described = |base: usize| super::TpmDescription::Described {
+        base: base as u64,
+        interface: helios_tpm::InterfaceDescription::DeviceTreeFifo,
+    };
+    let root_cells = fdt.root().cell_sizes();
+    for node in fdt
+        .find_node("/")
+        .into_iter()
+        .flat_map(|root| root.children())
+    {
+        if is_tpm(&node) {
+            return Ok(Some(described(first_region(&node, TPM_TIS_MMIO)?.base)));
+        }
+        for child in node.children() {
+            if is_tpm(&child) {
+                let region = first_region(&child, TPM_TIS_MMIO)?;
+                let base = translate(&node, root_cells.address_cells, region.base)?;
+                return Ok(Some(described(base)));
+            }
+        }
+    }
+    if find_compatible(fdt, TPM_TIS_MMIO).is_some() {
+        return Err(PlatformError::DeviceTree(
+            "the tcg,tpm-tis-mmio node sits deeper than one bus below the root, whose address \
+             translation this backend does not follow",
+        ));
+    }
+    Ok(None)
+}
+
+/// The root-space address of `address` on `bus`, through the bus's
+/// `ranges`: each entry is a child address, a parent address and a
+/// length, in the bus's `#address-cells`, its parent's
+/// `#address-cells` and the bus's `#size-cells` (Devicetree
+/// Specification, "ranges"). An empty `ranges` is the identity.
+fn translate(
+    bus: &FdtNode<'_, '_>,
+    parent_address_cells: usize,
+    address: usize,
+) -> Result<usize, PlatformError> {
+    let ranges = bus.property("ranges").ok_or(PlatformError::DeviceTree(
+        "the bus above the tcg,tpm-tis-mmio node has no ranges property, so its addresses do \
+         not reach the processor",
+    ))?;
+    if ranges.value.is_empty() {
+        return Ok(address);
+    }
+    let cells = bus.cell_sizes();
+    let child_bytes = cells.address_cells * 4;
+    let parent_bytes = parent_address_cells * 4;
+    let size_bytes = cells.size_cells * 4;
+    let entry_bytes = child_bytes + parent_bytes + size_bytes;
+    if entry_bytes == 0 || !ranges.value.len().is_multiple_of(entry_bytes) {
+        return Err(PlatformError::DeviceTree(
+            "the bus above the tcg,tpm-tis-mmio node has a ranges property of the wrong size",
+        ));
+    }
+    for entry in ranges.value.chunks_exact(entry_bytes) {
+        let (child, rest) = entry.split_at(child_bytes);
+        let (parent, size) = rest.split_at(parent_bytes);
+        let (Some(child), Some(parent), Some(size)) = (
+            crate::fdt_cells(child),
+            crate::fdt_cells(parent),
+            crate::fdt_cells(size),
+        ) else {
+            return Err(PlatformError::DeviceTree(
+                "a ranges entry above the tcg,tpm-tis-mmio node is not one or two cells per field",
+            ));
+        };
+        if let Some(offset) = address.checked_sub(child).filter(|offset| *offset < size) {
+            return parent.checked_add(offset).ok_or(PlatformError::DeviceTree(
+                "the tcg,tpm-tis-mmio node translates past the end of the address space",
+            ));
+        }
+    }
+    Err(PlatformError::DeviceTree(
+        "no ranges entry of its bus covers the tcg,tpm-tis-mmio node's registers",
+    ))
 }
 
 /// Every node this backend has no driver for and can hand to one in
@@ -156,7 +259,7 @@ fn drives_itself(node: &FdtNode<'_, '_>) -> bool {
     node.compatible().is_some_and(|entries| {
         entries
             .all()
-            .any(|entry| matches!(entry, GIC_V3 | PL011 | PL031 | VIRTIO_MMIO))
+            .any(|entry| matches!(entry, GIC_V3 | PL011 | PL031 | VIRTIO_MMIO | TPM_TIS_MMIO))
     })
 }
 
@@ -196,6 +299,35 @@ fn gic(fdt: &Fdt<'_>) -> Result<GicDescription, PlatformError> {
         // each frame by the affinity it reports for itself.
         redistributors: Slots::new(),
     })
+}
+
+/// The conduit of the `psci` node, when the tree has one this backend
+/// can call.
+///
+/// Only the PSCI 0.2 and later bindings are taken: they fix the function
+/// identifiers, where the original `arm,psci` binding names them in
+/// properties of the node and is not something any platform this backend
+/// runs on publishes.
+fn psci(fdt: &Fdt<'_>) -> Result<Option<PsciConduit>, PlatformError> {
+    let Some(node) = fdt.all_nodes().find(|node| {
+        node.compatible()
+            .is_some_and(|entries| entries.all().any(|entry| PSCI.contains(&entry)))
+    }) else {
+        return Ok(None);
+    };
+    let method = node
+        .property("method")
+        .and_then(|method| method.as_str())
+        .ok_or(PlatformError::DeviceTree(
+            "the psci node has no method property",
+        ))?;
+    match method {
+        "hvc" => Ok(Some(PsciConduit::Hvc)),
+        "smc" => Ok(Some(PsciConduit::Smc)),
+        _ => Err(PlatformError::DeviceTree(
+            "the psci node's method is neither hvc nor smc",
+        )),
+    }
 }
 
 fn spi(interrupt: MmioInterrupt) -> Result<SpiInterrupt, PlatformError> {

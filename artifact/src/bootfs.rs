@@ -19,7 +19,28 @@
 //! +--------------------+
 //! | data               |  every referenced blob at a 16-aligned offset
 //! +--------------------+
+//! | signature footer   |  128 bytes, see [`SIGNATURE_FOOTER_BYTES`]
+//! +--------------------+
 //! ```
+//!
+//! Everything above the footer is the *body*, and the data section ends
+//! exactly where the body does. The footer is the image's signature:
+//!
+//! ```text
+//! +------+--------------------------------------------------+
+//! |    0 | magic `HLBFSSIG`                                 |
+//! |    8 | footer version (u32)                             |
+//! |   12 | algorithm (u32, 1 = Ed25519)                     |
+//! |   16 | signer public key (32 bytes)                     |
+//! |   48 | signature (64 bytes)                             |
+//! |  112 | reserved, zero (16 bytes)                        |
+//! +------+--------------------------------------------------+
+//! ```
+//!
+//! The signed message is [`SIGNATURE_DOMAIN`] followed by the SHA-256 of
+//! the body, so the header is covered. [`Image::parse_signed`] verifies
+//! the signature against a set of trusted public keys before it reads a
+//! single field of the body.
 //!
 //! An entry names one object: a bootfs directory, a bootfs file, the init
 //! component, or the init component's `argv0`. Path and data offsets are
@@ -27,15 +48,42 @@
 
 use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
+use core::fmt;
 use core::ops::Range;
 
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 /// Magic every `helios-bootfs` image starts with.
 pub const MAGIC: [u8; 8] = *b"HLBOOTFS";
 
 /// The only image version this reader and writer speak.
-pub const VERSION: u32 = 1;
+///
+/// Version 2 is version 1's body followed by a signature footer, with
+/// the data section required to end where the body does.
+pub const VERSION: u32 = 2;
+
+/// Magic the signature footer starts with.
+pub const SIGNATURE_MAGIC: [u8; 8] = *b"HLBFSSIG";
+
+/// The only footer version this reader and writer speak.
+pub const SIGNATURE_VERSION: u32 = 1;
+
+/// The algorithm field of an Ed25519 footer.
+pub const ALGORITHM_ED25519: u32 = 1;
+
+/// Size of the signature footer every image ends with.
+pub const SIGNATURE_FOOTER_BYTES: usize = 128;
+
+/// The domain-separation prefix of the signed message.
+pub const SIGNATURE_DOMAIN: &[u8] = b"helios-bootfs-signature-v1";
+
+/// Length of the signed message: the domain and a SHA-256 digest.
+pub const SIGNING_MESSAGE_BYTES: usize = SIGNATURE_DOMAIN.len() + 32;
+
+/// A SHA-256 digest of an image body.
+pub type Digest256 = [u8; 32];
 
 /// The alignment every offset in the image carries.
 pub const SECTION_ALIGN: u64 = 16;
@@ -50,6 +98,13 @@ const STRING_TABLE_OFFSET_OFFSET: usize = 16;
 const STRING_TABLE_LEN_OFFSET: usize = 24;
 const DATA_OFFSET_OFFSET: usize = 32;
 const DATA_LEN_OFFSET: usize = 40;
+
+// Footer field offsets.
+const FOOTER_VERSION_OFFSET: usize = 8;
+const FOOTER_ALGORITHM_OFFSET: usize = 12;
+const FOOTER_SIGNER_OFFSET: usize = 16;
+const FOOTER_SIGNATURE_OFFSET: usize = 48;
+const FOOTER_RESERVED_OFFSET: usize = 112;
 
 // Entry field offsets.
 const ENTRY_KIND_OFFSET: usize = 0;
@@ -140,7 +195,64 @@ impl ImageEntry {
     }
 }
 
-/// A parsed `helios-bootfs` image: a validated view over `bytes`.
+/// A short, stable name for a public key in diagnostics: the first eight
+/// bytes of its SHA-256, shown as hex.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Fingerprint([u8; 8]);
+
+impl Fingerprint {
+    pub fn of(public_key: &[u8; 32]) -> Self {
+        let digest = Sha256::digest(public_key);
+        Self(
+            digest[..8]
+                .try_into()
+                .expect("a SHA-256 digest is 32 bytes"),
+        )
+    }
+}
+
+impl fmt::Display for Fingerprint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.iter().try_for_each(|byte| write!(f, "{byte:02x}"))
+    }
+}
+
+impl fmt::Debug for Fingerprint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Fingerprint({self})")
+    }
+}
+
+/// The fingerprints of the trusted keys, rendered as a list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FingerprintList(pub Vec<Fingerprint>);
+
+impl fmt::Display for FingerprintList {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[")?;
+        for (index, fingerprint) in self.0.iter().enumerate() {
+            if index > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{fingerprint}")?;
+        }
+        f.write_str("]")
+    }
+}
+
+/// A verified, parsed image and the digest its signature covers.
+#[derive(Clone)]
+pub struct SignedImage {
+    /// The parsed body.
+    pub image: Image,
+    /// SHA-256 of the body, the value the signature commits to. A later
+    /// stage extends a measurement register with it.
+    pub digest: Digest256,
+    /// The trusted key that signed the image.
+    pub signer: [u8; 32],
+}
+
+/// A parsed `helios-bootfs` image: a validated view over its body.
 ///
 /// `parse` checks every offset the image records against the slice it
 /// was handed, so accessors cannot fail and the returned views never
@@ -154,11 +266,30 @@ pub struct Image {
 }
 
 impl Image {
-    /// Parses and validates a `helios-bootfs` image.
+    /// Verifies a signed `helios-bootfs` image and parses it.
+    ///
+    /// The body is hashed once and its signature checked against
+    /// `trusted_public_keys` before any body field is read, so a refused
+    /// image never reaches the shape parser.
+    pub fn parse_signed(
+        bytes: &'static [u8],
+        trusted_public_keys: &[[u8; 32]],
+    ) -> Result<SignedImage, BootfsError> {
+        let (body, signer, digest) = verify_signature(bytes, trusted_public_keys)?;
+        let image = Self::parse(body)?;
+        Ok(SignedImage {
+            image,
+            digest,
+            signer,
+        })
+    }
+
+    /// Parses and validates an image body, the signature footer already
+    /// stripped and verified.
     ///
     /// Every failure names the field that was wrong; a parsed image's
     /// entries borrow `bytes` and never read outside it.
-    pub fn parse(bytes: &'static [u8]) -> Result<Self, BootfsError> {
+    fn parse(bytes: &'static [u8]) -> Result<Self, BootfsError> {
         if bytes.len() < HEADER_BYTES {
             return Err(BootfsError::TruncatedHeader { len: bytes.len() });
         }
@@ -196,6 +327,12 @@ impl Image {
             Section::StringTable,
         )?;
         let data = checked_section(data_offset, data_len, bytes.len(), Section::Data)?;
+        if data.end != bytes.len() {
+            return Err(BootfsError::TrailingBytes {
+                data_end: data.end as u64,
+                body_len: bytes.len() as u64,
+            });
+        }
         if entries_end > string_table.start {
             return Err(BootfsError::SectionOrder {
                 section: Section::EntryTable,
@@ -362,11 +499,12 @@ pub struct WriteEntry<'a> {
     pub modified_nanos: u64,
 }
 
-/// Serialises `entries` into a `helios-bootfs` image.
+/// Serialises `entries` into an unsigned image body.
 ///
-/// The layout is the one [`Image::parse`] reads: fixed header, entry
-/// table, string table, file data, every referenced offset 16-byte
-/// aligned.
+/// The layout is the one [`Image::parse_signed`] reads once a footer is
+/// attached: fixed header, entry table, string table, file data, every
+/// referenced offset 16-byte aligned. [`sign_image`] or
+/// [`attach_signature`] completes it.
 pub fn write_image(entries: &[WriteEntry<'_>]) -> Vec<u8> {
     let entry_table_len = entries.len() * ENTRY_BYTES;
     let mut string_table = Vec::new();
@@ -413,6 +551,95 @@ pub fn write_image(entries: &[WriteEntry<'_>]) -> Vec<u8> {
     image.extend_from_slice(&data);
     debug_assert_eq!(image.len() as u64, image_len);
     image
+}
+
+/// The message a signer signs for `body`.
+pub fn signing_message(body: &[u8]) -> [u8; SIGNING_MESSAGE_BYTES] {
+    let mut message = [0_u8; SIGNING_MESSAGE_BYTES];
+    message[..SIGNATURE_DOMAIN.len()].copy_from_slice(SIGNATURE_DOMAIN);
+    message[SIGNATURE_DOMAIN.len()..].copy_from_slice(&Sha256::digest(body));
+    message
+}
+
+/// Appends the signature footer to `body`, after checking that
+/// `signature` is `signer`'s signature over [`signing_message`].
+///
+/// This is the writer half for a signer that holds no key file: the
+/// message goes to the signer, the signature comes back here.
+pub fn attach_signature(
+    mut body: Vec<u8>,
+    signer: &[u8; 32],
+    signature: &[u8; 64],
+) -> Result<Vec<u8>, BootfsError> {
+    let key = VerifyingKey::from_bytes(signer).map_err(|_| BootfsError::InvalidSignerKey)?;
+    key.verify_strict(&signing_message(&body), &Signature::from_bytes(signature))
+        .map_err(|_| BootfsError::SignatureMismatch)?;
+    body.reserve(SIGNATURE_FOOTER_BYTES);
+    body.extend_from_slice(&SIGNATURE_MAGIC);
+    body.extend_from_slice(&SIGNATURE_VERSION.to_le_bytes());
+    body.extend_from_slice(&ALGORITHM_ED25519.to_le_bytes());
+    body.extend_from_slice(signer);
+    body.extend_from_slice(signature);
+    body.extend_from_slice(&[0_u8; SIGNATURE_FOOTER_BYTES - FOOTER_RESERVED_OFFSET]);
+    Ok(body)
+}
+
+/// Signs `body` with `key` and appends the footer.
+pub fn sign_image(body: Vec<u8>, key: &SigningKey) -> Vec<u8> {
+    let signature = key.sign(&signing_message(&body)).to_bytes();
+    attach_signature(body, &VerifyingKey::from(key).to_bytes(), &signature)
+        .expect("a signature just made with the key verifies under its public key")
+}
+
+/// [`sign_image`] for a key given as its 32-byte secret seed.
+pub fn sign_image_with_secret_key_bytes(body: Vec<u8>, secret_key: &[u8; 32]) -> Vec<u8> {
+    sign_image(body, &SigningKey::from_bytes(secret_key))
+}
+
+/// Splits `bytes` into body and footer and verifies the footer's
+/// signature, returning the body, the signer and the body's digest.
+fn verify_signature(
+    bytes: &'static [u8],
+    trusted_public_keys: &[[u8; 32]],
+) -> Result<(&'static [u8], [u8; 32], Digest256), BootfsError> {
+    let Some(body_len) = bytes.len().checked_sub(SIGNATURE_FOOTER_BYTES) else {
+        return Err(BootfsError::MissingSignature);
+    };
+    let (body, footer) = bytes.split_at(body_len);
+    if footer[..8] != SIGNATURE_MAGIC {
+        return Err(BootfsError::MissingSignature);
+    }
+    let version = read_u32(footer, FOOTER_VERSION_OFFSET);
+    let algorithm = read_u32(footer, FOOTER_ALGORITHM_OFFSET);
+    if version != SIGNATURE_VERSION || algorithm != ALGORITHM_ED25519 {
+        return Err(BootfsError::UnsupportedSignature { version, algorithm });
+    }
+    if footer[FOOTER_RESERVED_OFFSET..]
+        .iter()
+        .any(|&byte| byte != 0)
+    {
+        return Err(BootfsError::FooterReserved);
+    }
+    let signer: [u8; 32] = footer[FOOTER_SIGNER_OFFSET..FOOTER_SIGNATURE_OFFSET]
+        .try_into()
+        .expect("signer field is 32 bytes");
+    if !trusted_public_keys.contains(&signer) {
+        return Err(BootfsError::UntrustedSigner {
+            signer: Fingerprint::of(&signer),
+            trusted: FingerprintList(trusted_public_keys.iter().map(Fingerprint::of).collect()),
+        });
+    }
+    let signature: [u8; 64] = footer[FOOTER_SIGNATURE_OFFSET..FOOTER_RESERVED_OFFSET]
+        .try_into()
+        .expect("signature field is 64 bytes");
+    let key = VerifyingKey::from_bytes(&signer).map_err(|_| BootfsError::InvalidSignerKey)?;
+    let digest: Digest256 = Sha256::digest(body).into();
+    let mut message = [0_u8; SIGNING_MESSAGE_BYTES];
+    message[..SIGNATURE_DOMAIN.len()].copy_from_slice(SIGNATURE_DOMAIN);
+    message[SIGNATURE_DOMAIN.len()..].copy_from_slice(&digest);
+    key.verify_strict(&message, &Signature::from_bytes(&signature))
+        .map_err(|_| BootfsError::SignatureMismatch)?;
+    Ok((body, signer, digest))
 }
 
 fn is_aligned(offset: u64) -> bool {
@@ -493,6 +720,26 @@ impl core::fmt::Display for Section {
 pub enum BootfsError {
     #[error("bootfs image is {len} bytes, smaller than the {HEADER_BYTES}-byte header")]
     TruncatedHeader { len: usize },
+    #[error("bootfs image carries no signature footer")]
+    MissingSignature,
+    #[error(
+        "bootfs signature footer version {version} algorithm {algorithm} is not supported, \
+         expected version {SIGNATURE_VERSION} algorithm {ALGORITHM_ED25519}"
+    )]
+    UnsupportedSignature { version: u32, algorithm: u32 },
+    #[error("bootfs signature footer reserved bytes are not zero")]
+    FooterReserved,
+    #[error("bootfs signer public key is not a valid Ed25519 point")]
+    InvalidSignerKey,
+    #[error("bootfs signer {signer} is not among the trusted keys {trusted}")]
+    UntrustedSigner {
+        signer: Fingerprint,
+        trusted: FingerprintList,
+    },
+    #[error("bootfs signature does not match the image body")]
+    SignatureMismatch,
+    #[error("data section ends at {data_end:#x} but the body is {body_len:#x} bytes")]
+    TrailingBytes { data_end: u64, body_len: u64 },
     #[error("bootfs image magic {found:02x?} is not {MAGIC:02x?}")]
     BadMagic { found: [u8; 8] },
     #[error("bootfs image version {found} is not supported, expected {VERSION}")]
@@ -675,8 +922,8 @@ mod tests {
     #[test]
     fn bad_version_fails() {
         assert!(matches!(
-            Image::parse(corrupt(VERSION_OFFSET, &2_u32.to_le_bytes())),
-            Err(BootfsError::BadVersion { found: 2 })
+            Image::parse(corrupt(VERSION_OFFSET, &1_u32.to_le_bytes())),
+            Err(BootfsError::BadVersion { found: 1 })
         ));
     }
 
@@ -980,6 +1227,185 @@ mod tests {
         assert!(matches!(
             Image::parse(bytes),
             Err(BootfsError::InitArgv0Count { found: 2 })
+        ));
+    }
+
+    // ---- signature footer ----
+
+    fn signing_key() -> SigningKey {
+        SigningKey::from_bytes(&[0x42; 32])
+    }
+
+    fn other_key() -> SigningKey {
+        SigningKey::from_bytes(&[0x43; 32])
+    }
+
+    fn trusted() -> [[u8; 32]; 1] {
+        [VerifyingKey::from(&signing_key()).to_bytes()]
+    }
+
+    fn signed() -> Vec<u8> {
+        sign_image(fixture().to_vec(), &signing_key())
+    }
+
+    fn leak(bytes: Vec<u8>) -> &'static [u8] {
+        Box::leak(bytes.into_boxed_slice())
+    }
+
+    fn flipped(bytes: &[u8], offset: usize) -> &'static [u8] {
+        let mut bytes = bytes.to_vec();
+        bytes[offset] ^= 0x01;
+        leak(bytes)
+    }
+
+    fn u64_at(bytes: &[u8], offset: usize) -> usize {
+        read_u64(bytes, offset) as usize
+    }
+
+    #[test]
+    fn signed_image_verifies() {
+        let bytes = leak(signed());
+        let verified = Image::parse_signed(bytes, &trusted()).expect("signed image verifies");
+        assert_eq!(verified.image.entries().count(), 4);
+        assert_eq!(verified.digest, <[u8; 32]>::from(Sha256::digest(fixture())));
+        assert_eq!(verified.signer, trusted()[0]);
+    }
+
+    #[test]
+    fn signing_message_is_domain_then_digest() {
+        let message = signing_message(fixture());
+        assert!(message.starts_with(b"helios-bootfs-signature-v1"));
+        assert_eq!(
+            &message[SIGNATURE_DOMAIN.len()..],
+            &Sha256::digest(fixture())[..]
+        );
+    }
+
+    #[test]
+    fn attached_signature_matches_signed_image() {
+        let key = signing_key();
+        let signature = key.sign(&signing_message(fixture())).to_bytes();
+        let attached = attach_signature(
+            fixture().to_vec(),
+            &VerifyingKey::from(&key).to_bytes(),
+            &signature,
+        )
+        .expect("a valid signature attaches");
+        assert_eq!(attached, signed());
+        assert!(matches!(
+            attach_signature(
+                fixture().to_vec(),
+                &VerifyingKey::from(&key).to_bytes(),
+                &[0; 64]
+            ),
+            Err(BootfsError::SignatureMismatch)
+        ));
+    }
+
+    #[test]
+    fn flipped_byte_in_each_body_section_is_refused() {
+        let signed = signed();
+        let body = fixture();
+        let entry_table = HEADER_BYTES;
+        let string_table = u64_at(body, STRING_TABLE_OFFSET_OFFSET);
+        let data = u64_at(body, DATA_OFFSET_OFFSET);
+        for (section, offset) in [
+            ("header", VERSION_OFFSET),
+            ("entry table", entry_table),
+            ("string table", string_table),
+            ("data", data),
+        ] {
+            assert!(
+                matches!(
+                    Image::parse_signed(flipped(&signed, offset), &trusted()),
+                    Err(BootfsError::SignatureMismatch)
+                ),
+                "flipped {section} byte"
+            );
+        }
+    }
+
+    #[test]
+    fn flipped_byte_in_each_footer_field_is_refused() {
+        let signed = signed();
+        let footer = signed.len() - SIGNATURE_FOOTER_BYTES;
+        let at = |field: usize| flipped(&signed, footer + field);
+        assert!(matches!(
+            Image::parse_signed(at(0), &trusted()),
+            Err(BootfsError::MissingSignature)
+        ));
+        assert!(matches!(
+            Image::parse_signed(at(FOOTER_VERSION_OFFSET), &trusted()),
+            Err(BootfsError::UnsupportedSignature { version: 0, .. })
+        ));
+        assert!(matches!(
+            Image::parse_signed(at(FOOTER_ALGORITHM_OFFSET), &trusted()),
+            Err(BootfsError::UnsupportedSignature { algorithm: 0, .. })
+        ));
+        assert!(matches!(
+            Image::parse_signed(at(FOOTER_SIGNER_OFFSET), &trusted()),
+            Err(BootfsError::UntrustedSigner { .. })
+        ));
+        assert!(matches!(
+            Image::parse_signed(at(FOOTER_SIGNATURE_OFFSET), &trusted()),
+            Err(BootfsError::SignatureMismatch)
+        ));
+        assert!(matches!(
+            Image::parse_signed(at(FOOTER_RESERVED_OFFSET), &trusted()),
+            Err(BootfsError::FooterReserved)
+        ));
+    }
+
+    #[test]
+    fn untrusted_signer_is_refused_with_fingerprints() {
+        let bytes = leak(sign_image(fixture().to_vec(), &other_key()));
+        let Err(BootfsError::UntrustedSigner {
+            signer,
+            trusted: roots,
+        }) = Image::parse_signed(bytes, &trusted())
+        else {
+            panic!("a foreign signer must be refused");
+        };
+        assert_eq!(
+            signer,
+            Fingerprint::of(&VerifyingKey::from(&other_key()).to_bytes())
+        );
+        assert_eq!(roots.0, [Fingerprint::of(&trusted()[0])]);
+    }
+
+    #[test]
+    fn trailing_bytes_after_the_data_section_are_refused() {
+        // Signed correctly, so only the shape check can refuse it.
+        let mut body = fixture().to_vec();
+        body.extend_from_slice(&[0; 16]);
+        let bytes = leak(sign_image(body, &signing_key()));
+        assert!(matches!(
+            Image::parse_signed(bytes, &trusted()),
+            Err(BootfsError::TrailingBytes { .. })
+        ));
+    }
+
+    #[test]
+    fn version_one_image_is_refused() {
+        // A version-1 image is a body with no footer.
+        let mut v1 = fixture().to_vec();
+        v1[VERSION_OFFSET..VERSION_OFFSET + 4].copy_from_slice(&1_u32.to_le_bytes());
+        assert!(matches!(
+            Image::parse_signed(leak(v1.clone()), &trusted()),
+            Err(BootfsError::MissingSignature)
+        ));
+        // Signed with a v1 header it still fails on the version.
+        assert!(matches!(
+            Image::parse_signed(leak(sign_image(v1, &signing_key())), &trusted()),
+            Err(BootfsError::BadVersion { found: 1 })
+        ));
+    }
+
+    #[test]
+    fn short_input_has_no_signature() {
+        assert!(matches!(
+            Image::parse_signed(&[0; 16], &trusted()),
+            Err(BootfsError::MissingSignature)
         ));
     }
 }

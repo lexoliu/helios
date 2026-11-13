@@ -245,7 +245,9 @@ impl LaunchEnd {
     /// program itself is a refusal.
     pub(crate) fn of(kind: ProgramExecErrorKind) -> Self {
         match kind {
-            ProgramExecErrorKind::OutOfMemory | ProgramExecErrorKind::Internal => Self::Failed,
+            ProgramExecErrorKind::OutOfMemory
+            | ProgramExecErrorKind::Internal
+            | ProgramExecErrorKind::Io => Self::Failed,
             _ => Self::Refused,
         }
     }

@@ -21,7 +21,7 @@ use helios_kernel::ExternalInterruptHandler;
 use crate::Aarch64Cpu;
 use crate::debug_state::RuntimeState;
 
-type Aarch64VirtioBlockDevice = helios_virtio::VirtioBlockResource<
+pub(crate) type Aarch64VirtioBlockDevice = helios_virtio::VirtioBlockResource<
     helios_virtio::VirtioMmioTransport<helios_virtio::MmioBus<helios_virtio::OffsetDmaPool>>,
     Aarch64Cpu,
     helios_kernel::BlockPages,
@@ -53,9 +53,9 @@ pub(crate) fn count_block_devices(platform: &PlatformDescription) -> usize {
 /// Brings up every block device on the platform bus and hands them to
 /// the kernel, which gives each the role its serial names and returns
 /// the scratch disk for swap.
-pub(crate) fn install<WatchdogImpl>(
+pub(crate) fn install<WatchdogImpl, MeasuredBootImpl>(
     cpu: &Aarch64Cpu,
-    kernel: &helios_kernel::Kernel<Aarch64Cpu, WatchdogImpl>,
+    kernel: &helios_kernel::Kernel<Aarch64Cpu, WatchdogImpl, MeasuredBootImpl>,
     platform: &PlatformDescription,
     physical_memory_offset: usize,
     handoff: &crate::LimineBootHandoff,
@@ -64,6 +64,7 @@ pub(crate) fn install<WatchdogImpl>(
 ) -> Vec<BlockInterrupt>
 where
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
 {
     let discovered = discover_block_devices(cpu, platform, physical_memory_offset, handoff);
     let devices = discovered
@@ -74,14 +75,15 @@ where
     let spawner = kernel.spawner();
     let timer = kernel.timer();
     let swap_cpu = *cpu;
-    // Nothing mounts a disk yet, so the mount sources' cache is held by
-    // its reclaim task alone.
     helios_kernel::install_block_devices(
         kernel,
         root,
         devices,
-        move |service, scratch, _mount_sources| {
+        move |service, scratch, mount_sources| {
             state.install_block_service(service);
+            if let Some(cache) = mount_sources {
+                state.install_mount_sources(cache);
+            }
             if let Some(swap) = helios_kernel::install_scratch_swap(
                 state.instance_registry(),
                 scratch,
