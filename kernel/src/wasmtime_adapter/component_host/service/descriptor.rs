@@ -1,11 +1,142 @@
 use super::*;
 
-pub(super) struct WasixChildProcess {
+/// The exit report a child's launch task sends its parent.
+pub(super) type WasixChildExit =
+    futures::channel::oneshot::Receiver<Result<ChildExit, ProgramExecError>>;
+
+/// A process's children, in spawn order, until each one is joined.
+///
+/// # Concurrency contract
+///
+/// The table is the parent store's own and is touched only by the task
+/// driving that store. A child's exit arrives from its launch task, on
+/// whichever processor that runs, through the child's oneshot; a join
+/// that polls the table registers its waker with every child it waits
+/// on, so the first of them to exit wakes it.
+pub(super) struct WasixChildren {
+    children: Vec<WasixChildProcess>,
+}
+
+struct WasixChildProcess {
+    pid: u32,
+    signal_state: WasixSignalState,
+    state: WasixChildState,
+}
+
+enum WasixChildState {
+    Running(WasixChildExit),
+    /// Exited with this code, and not joined yet.
+    Exited(u32),
+}
+
+/// The child a join took off the table, and the code it exited with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct WasixJoinedChild {
     pub(super) pid: u32,
-    pub(super) signal_state: WasixSignalState,
-    pub(super) exit:
-        Option<futures::channel::oneshot::Receiver<Result<ChildExit, ProgramExecError>>>,
-    pub(super) completed: Option<u32>,
+    pub(super) code: u32,
+}
+
+impl WasixChildren {
+    pub(super) const fn new() -> Self {
+        Self {
+            children: Vec::new(),
+        }
+    }
+
+    pub(super) fn insert(
+        &mut self,
+        pid: u32,
+        signal_state: WasixSignalState,
+        exit: WasixChildExit,
+    ) {
+        self.children.push(WasixChildProcess {
+            pid,
+            signal_state,
+            state: WasixChildState::Running(exit),
+        });
+    }
+
+    /// The signal mailbox of child `pid` while it can still take a
+    /// signal: `None` for a pid that names no child and for a child
+    /// whose exit has been seen.
+    pub(super) fn signal_target(&self, pid: u32) -> Option<&WasixSignalState> {
+        self.children
+            .iter()
+            .find(|child| child.pid == pid)
+            .filter(|child| matches!(child.state, WasixChildState::Running(_)))
+            .map(|child| &child.signal_state)
+    }
+
+    /// Joins the child `pid` names, or any child for `None`.
+    ///
+    /// Every running child the join names is polled, so each exit that
+    /// has arrived is recorded and `cx` is registered with every child
+    /// still running: an any-child join takes the oldest child that has
+    /// exited, never waits on one child while another has already
+    /// exited, and is woken by whichever exits first. A shell reaps each
+    /// foreground command this way while its background jobs, older
+    /// children, keep running.
+    ///
+    /// `Ready(None)` when `pid` names no child, `Ready(Some)` with the
+    /// child taken off the table once one it names has exited, and
+    /// `Pending` while every child it names is still running. `adopt`
+    /// receives the filesystem layer each exit observed here hands back
+    /// to the parent.
+    pub(super) fn poll_join(
+        &mut self,
+        pid: Option<u32>,
+        cx: &mut Context<'_>,
+        mut adopt: impl FnMut(MemoryFs),
+    ) -> Poll<Option<WasixJoinedChild>> {
+        let mut named = false;
+        let mut exited = None;
+        for (index, child) in self.children.iter_mut().enumerate() {
+            if pid.is_some_and(|pid| child.pid != pid) {
+                continue;
+            }
+            named = true;
+            if let WasixChildState::Running(exit) = &mut child.state
+                && let Poll::Ready(result) = Pin::new(exit).poll(cx)
+            {
+                child.state = WasixChildState::Exited(exit_code(result, &mut adopt));
+            }
+            if exited.is_none() && matches!(child.state, WasixChildState::Exited(_)) {
+                exited = Some(index);
+            }
+        }
+        let Some(index) = exited else {
+            return if named {
+                Poll::Pending
+            } else {
+                Poll::Ready(None)
+            };
+        };
+        let child = self.children.remove(index);
+        let WasixChildState::Exited(code) = child.state else {
+            unreachable!("a joined child was just seen to have exited");
+        };
+        Poll::Ready(Some(WasixJoinedChild {
+            pid: child.pid,
+            code,
+        }))
+    }
+}
+
+/// The code a child's exit report gives its parent: the child's own, or
+/// `EIO` when its launch failed or the report was lost.
+fn exit_code(
+    result: Result<Result<ChildExit, ProgramExecError>, futures::channel::oneshot::Canceled>,
+    adopt: &mut impl FnMut(MemoryFs),
+) -> u32 {
+    match result {
+        Ok(Ok(exit)) => {
+            if let Some(filesystem) = exit.filesystem {
+                adopt(filesystem);
+            }
+            exit.exit_code
+        }
+        Ok(Err(_)) | Err(_) => u32::from(p1::errno::IO as u16),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2013,5 +2144,134 @@ pub(super) fn p1_probe_descriptor<Net: ComponentHostNetwork>(
         ) => local(P1Readiness::Pending),
         (Some(_), _) => Err(p1::errno::INVAL),
         (None, _) => Err(p1::errno::BADF),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use alloc::sync::Arc;
+    use core::sync::atomic::AtomicUsize;
+    use futures::channel::oneshot;
+    use std::task::Wake;
+
+    type ExitSender = oneshot::Sender<Result<ChildExit, ProgramExecError>>;
+
+    /// A waker that counts its wakes.
+    struct CountingWaker(AtomicUsize);
+
+    impl Wake for CountingWaker {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+    }
+
+    fn spawn_child(children: &mut WasixChildren, pid: u32) -> ExitSender {
+        let (sender, exit) = oneshot::channel();
+        children.insert(pid, WasixSignalState::new(), exit);
+        sender
+    }
+
+    fn exit_with(sender: ExitSender, pid: u32, exit_code: u32) {
+        sender
+            .send(Ok(ChildExit {
+                instance_id: crate::InstanceId::from_raw(u64::from(pid)),
+                exit_code,
+                filesystem: None,
+            }))
+            .unwrap_or_else(|_| panic!("child {pid}'s parent dropped its exit report"));
+    }
+
+    fn join(children: &mut WasixChildren, pid: Option<u32>) -> Poll<Option<WasixJoinedChild>> {
+        let mut context = Context::from_waker(futures::task::noop_waker_ref());
+        children.poll_join(pid, &mut context, |_| {
+            panic!("no child in these tests hands back a filesystem layer")
+        })
+    }
+
+    /// A shell reaps every foreground command with an any-child wait
+    /// while its background job runs, and the job's being the oldest
+    /// child never holds that reap up (#926).
+    #[test]
+    fn an_any_child_join_takes_the_exited_child_behind_a_running_older_one() {
+        let mut children = WasixChildren::new();
+        let background = spawn_child(&mut children, 10);
+        let foreground = spawn_child(&mut children, 11);
+        exit_with(foreground, 11, 0);
+
+        assert_eq!(
+            join(&mut children, None),
+            Poll::Ready(Some(WasixJoinedChild { pid: 11, code: 0 })),
+            "the exited foreground child is joined while the background one runs"
+        );
+        assert_eq!(join(&mut children, None), Poll::Pending);
+
+        exit_with(background, 10, 3);
+        assert_eq!(
+            join(&mut children, None),
+            Poll::Ready(Some(WasixJoinedChild { pid: 10, code: 3 }))
+        );
+        assert_eq!(
+            join(&mut children, None),
+            Poll::Ready(None),
+            "a process with no children left has nothing to join"
+        );
+    }
+
+    /// A blocking any-child join waits on every running child, so the
+    /// exit of the youngest wakes it as the exit of the oldest would.
+    #[test]
+    fn a_waiting_any_child_join_is_woken_by_whichever_child_exits() {
+        let mut children = WasixChildren::new();
+        let _background = spawn_child(&mut children, 20);
+        let foreground = spawn_child(&mut children, 21);
+        let wakes = Arc::new(CountingWaker(AtomicUsize::new(0)));
+        let waker = core::task::Waker::from(wakes.clone());
+        let mut context = Context::from_waker(&waker);
+        let mut join_waiting = || children.poll_join(None, &mut context, |_| {});
+
+        assert_eq!(join_waiting(), Poll::Pending);
+        exit_with(foreground, 21, 7);
+        assert_eq!(
+            wakes.0.load(AtomicOrdering::SeqCst),
+            1,
+            "the youngest child's exit wakes the parked join"
+        );
+        assert_eq!(
+            join_waiting(),
+            Poll::Ready(Some(WasixJoinedChild { pid: 21, code: 7 }))
+        );
+    }
+
+    /// A join for one pid waits on that child alone, and a signal finds
+    /// a child only until its exit has been seen.
+    #[test]
+    fn a_join_for_one_pid_waits_on_that_child_and_ends_its_signal_target() {
+        let mut children = WasixChildren::new();
+        let first = spawn_child(&mut children, 30);
+        let second = spawn_child(&mut children, 31);
+        exit_with(first, 30, 1);
+
+        assert_eq!(join(&mut children, Some(31)), Poll::Pending);
+        assert!(children.signal_target(31).is_some());
+        exit_with(second, 31, 2);
+        assert_eq!(
+            join(&mut children, Some(31)),
+            Poll::Ready(Some(WasixJoinedChild { pid: 31, code: 2 }))
+        );
+        assert!(
+            children.signal_target(31).is_none(),
+            "a joined child is gone"
+        );
+        assert_eq!(join(&mut children, Some(99)), Poll::Ready(None));
+        assert_eq!(
+            join(&mut children, None),
+            Poll::Ready(Some(WasixJoinedChild { pid: 30, code: 1 }))
+        );
     }
 }

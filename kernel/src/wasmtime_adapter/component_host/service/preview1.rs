@@ -48,7 +48,7 @@ where
     pub(super) signal_dispositions: Vec<WasixSignalDisposition>,
     pub(super) descriptors: Preview1DescriptorTable<Net>,
     pub(super) asyncify: WasixAsyncifyState<Net>,
-    pub(super) children: Vec<WasixChildProcess>,
+    pub(super) children: WasixChildren,
     pub(super) thread_id: u32,
     /// The threads of this store's process, shared by every store of it.
     pub(super) threads: WasixImageThreads<CpuImpl, Net, StorageImpl>,
@@ -129,7 +129,7 @@ where
             signal_dispositions,
             descriptors,
             asyncify: WasixAsyncifyState::new(),
-            children: Vec::new(),
+            children: WasixChildren::new(),
             thread_id: 0,
             threads,
             requested_exit: None,
@@ -391,63 +391,17 @@ where
         self.output_mode.route(stream)
     }
 
-    pub(super) fn insert_child(
+    /// [`WasixChildren::poll_join`] on this store's children, with each
+    /// filesystem layer an exit hands back adopted into this store's
+    /// namespace.
+    pub(super) fn poll_child_join(
         &mut self,
-        pid: u32,
-        signal_state: WasixSignalState,
-        exit: futures::channel::oneshot::Receiver<Result<ChildExit, ProgramExecError>>,
-    ) {
-        self.children.push(WasixChildProcess {
-            pid,
-            signal_state,
-            exit: Some(exit),
-            completed: None,
-        });
-    }
-
-    pub(super) fn poll_child_exit(&mut self, index: usize) -> Result<Option<u32>, i32> {
-        if let Some(code) = self.children[index].completed {
-            return Ok(Some(code));
-        }
-        let Some(exit) = self.children[index].exit.as_mut() else {
-            return Ok(self.children[index].completed);
-        };
-        let waker = futures::task::noop_waker_ref();
-        let mut context = Context::from_waker(waker);
-        match Pin::new(exit).poll(&mut context) {
-            Poll::Pending => Ok(None),
-            Poll::Ready(Ok(Ok(exit))) => {
-                let code = exit.exit_code;
-                if let Some(filesystem) = exit.filesystem {
-                    self.filesystem.adopt_root_layer(filesystem);
-                }
-                self.children[index].completed = Some(code);
-                self.children[index].exit = None;
-                Ok(Some(code))
-            }
-            Poll::Ready(Ok(Err(_))) | Poll::Ready(Err(_)) => {
-                let code = u32::from(p1::errno::IO as u16);
-                self.children[index].completed = Some(code);
-                self.children[index].exit = None;
-                Ok(Some(code))
-            }
-        }
-    }
-
-    pub(super) fn find_child_index(&self, pid: Option<u32>) -> Option<usize> {
-        match pid {
-            Some(pid) => self.children.iter().position(|child| child.pid == pid),
-            None => {
-                if let Some(index) = self
-                    .children
-                    .iter()
-                    .position(|child| child.completed.is_some())
-                {
-                    return Some(index);
-                }
-                (!self.children.is_empty()).then_some(0)
-            }
-        }
+        pid: Option<u32>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<WasixJoinedChild>> {
+        let filesystem = &mut self.filesystem;
+        self.children
+            .poll_join(pid, cx, |layer| filesystem.adopt_root_layer(layer))
     }
 
     pub(super) async fn read_stdin(&mut self, max_bytes: u32) -> Bytes {

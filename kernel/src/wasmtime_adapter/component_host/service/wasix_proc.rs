@@ -1535,13 +1535,10 @@ where
             .request_exit(128u32.saturating_add(signal));
         return Err(wasmtime::Error::new(Preview1Exit));
     }
-    let Some(index) = caller.data().find_child_index(Some(pid)) else {
+    let Some(target) = caller.data().children.signal_target(pid) else {
         return Ok(p1::errno::SRCH);
     };
-    if caller.data().children[index].completed.is_some() {
-        return Ok(p1::errno::SRCH);
-    }
-    caller.data().children[index].signal_state.raise(signal);
+    target.raise(signal);
     Ok(p1::errno::SUCCESS)
 }
 
@@ -2602,58 +2599,28 @@ where
     }
     let (pid, ret_status) = (GuestAddress::wasm32(pid), GuestAddress::wasm32(ret_status));
     let requested_pid = wasix_read_option_pid(&memory, pid).await?;
-    let Some(index) = caller.data().find_child_index(requested_pid) else {
-        wasix_write_join_nothing(&memory, ret_status).await?;
-        return Ok(p1::errno::SUCCESS);
-    };
-    if flags & WASIX_JOIN_FLAG_NON_BLOCKING != 0 {
-        match caller.data_mut().poll_child_exit(index) {
-            Ok(Some(code)) => {
-                let child = caller.data_mut().children.swap_remove(index);
-                wasix_write_join_exit(&memory, pid, ret_status, child.pid, code).await?;
-            }
-            Ok(None) => {
+    let joined = if flags & WASIX_JOIN_FLAG_NON_BLOCKING != 0 {
+        let polled = caller.data_mut().poll_child_join(
+            requested_pid,
+            &mut Context::from_waker(futures::task::noop_waker_ref()),
+        );
+        match polled {
+            Poll::Ready(joined) => joined,
+            Poll::Pending => {
                 crate::yield_now().await;
-                wasix_write_join_nothing(&memory, ret_status).await?;
+                None
             }
-            Err(errno) => return Ok(errno),
         }
     } else {
-        let child_pid = caller.data().children[index].pid;
-        match caller.data_mut().poll_child_exit(index) {
-            Ok(Some(code)) => {
-                let child = caller.data_mut().children.swap_remove(index);
-                wasix_write_join_exit(&memory, pid, ret_status, child.pid, code).await?;
-                return Ok(p1::errno::SUCCESS);
-            }
-            Ok(None) => {}
-            Err(errno) => return Ok(errno),
+        core::future::poll_fn(|cx| caller.data_mut().poll_child_join(requested_pid, cx)).await
+    };
+    match joined {
+        Some(child) => {
+            wasix_write_join_exit(&memory, pid, ret_status, child.pid, child.code).await?;
         }
-        let Some(exit) = caller.data_mut().children[index].exit.take() else {
-            wasix_write_join_nothing(&memory, ret_status).await?;
-            return Ok(p1::errno::SUCCESS);
-        };
-        let (code, filesystem) = wasix_child_exit_result(exit.await);
-        if let Some(filesystem) = filesystem {
-            caller.data_mut().filesystem.adopt_root_layer(filesystem);
-        }
-        let Some(index) = caller.data().find_child_index(Some(child_pid)) else {
-            wasix_write_join_nothing(&memory, ret_status).await?;
-            return Ok(p1::errno::SUCCESS);
-        };
-        let child = caller.data_mut().children.swap_remove(index);
-        wasix_write_join_exit(&memory, pid, ret_status, child.pid, code).await?;
+        None => wasix_write_join_nothing(&memory, ret_status).await?,
     }
     Ok(p1::errno::SUCCESS)
-}
-
-pub(super) fn wasix_child_exit_result(
-    result: Result<Result<ChildExit, ProgramExecError>, futures::channel::oneshot::Canceled>,
-) -> (u32, Option<MemoryFs>) {
-    match result {
-        Ok(Ok(exit)) => (exit.exit_code, exit.filesystem),
-        Ok(Err(_)) | Err(_) => (u32::from(p1::errno::IO as u16), None),
-    }
 }
 
 pub(super) async fn wasix_proc_snapshot<CpuImpl, Net, StorageImpl>(
@@ -3582,7 +3549,8 @@ where
     let exit = child.take_wait().ok_or(p1::errno::IO)?;
     caller
         .data_mut()
-        .insert_child(pid, child.signal_state(), exit);
+        .children
+        .insert(pid, child.signal_state(), exit);
     trace.set_instance(child.instance_id);
     trace.record(LaunchPhase::Reply);
     Ok(WasixSpawnResult {
