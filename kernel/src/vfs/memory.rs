@@ -31,7 +31,7 @@ use bytes::{Bytes, BytesMut};
 use hashbrown::{HashMap, HashSet};
 use helios_hal::fs::{
     DeviceId, DirCookie, DirEntry, FileSystem, FsError, FsPath, FsResult, Metadata, NodeId,
-    NodeKind, OpenFlags, WritePosition,
+    NodeKind, OpenFlags, PreparedWrite, WritePosition, WriteProgress,
 };
 use spin::Mutex;
 use triomphe::Arc;
@@ -466,10 +466,74 @@ impl MemoryState {
     }
 }
 
+/// A write to a [`MemoryFs`], staged at once: its one round is the whole
+/// write, and its submit has the filler write straight into the file's
+/// own storage under the tree's lock.
+pub struct MemoryWrite<'a> {
+    fs: &'a MemoryFs,
+    path: FsPath<'a>,
+    position: WritePosition,
+    len: usize,
+    now: u64,
+}
+
+impl<'a> MemoryWrite<'a> {
+    /// Stages a write of `len` bytes to the regular file at `path`,
+    /// refusing it at once when `path` names none.
+    pub(super) fn prepare(
+        fs: &'a MemoryFs,
+        path: FsPath<'a>,
+        position: WritePosition,
+        len: usize,
+        now: u64,
+    ) -> FsResult<Self> {
+        match fs.state.lock().inode(path)?.1.kind {
+            NodeKind::File => {}
+            NodeKind::Directory => return Err(FsError::IsDirectory),
+            NodeKind::Symlink => return Err(FsError::Invalid),
+        }
+        Ok(Self {
+            fs,
+            path,
+            position,
+            len,
+            now,
+        })
+    }
+
+    /// Lands the write and resolves with the offset it began at. The
+    /// checks of [`Self::prepare`] are made again under the lock, since
+    /// the file may have changed in between.
+    pub(super) fn land(self, mut fill: impl FnMut(usize, &mut [u8])) -> FsResult<u64> {
+        self.fs.write_now(
+            self.path,
+            self.position,
+            self.len,
+            self.now,
+            |destination| fill(0, destination),
+        )
+    }
+}
+
+impl PreparedWrite for MemoryWrite<'_> {
+    fn staged_len(&self) -> usize {
+        self.len
+    }
+
+    fn submit<F>(self, fill: F) -> impl Future<Output = FsResult<WriteProgress<Self>>> + Send
+    where
+        F: FnMut(usize, &mut [u8]),
+    {
+        // The write is done here, under the lock; the future only reports
+        // it, so it holds nothing of `fill`.
+        core::future::ready(self.land(fill).map(WriteProgress::Done))
+    }
+}
+
 impl MemoryFs {
-    /// [`FileSystem::write_with`], done at once: `fill` writes straight
+    /// Writes `len` bytes at `position` at once: `fill` writes straight
     /// into the file's storage.
-    pub(super) fn write_now(
+    fn write_now(
         &self,
         path: FsPath<'_>,
         position: WritePosition,
@@ -498,6 +562,8 @@ impl MemoryFs {
 }
 
 impl FileSystem for MemoryFs {
+    type Write<'a> = MemoryWrite<'a>;
+
     async fn stat(&self, path: FsPath<'_>) -> FsResult<Metadata> {
         self.state.lock().metadata(self.device, path)
     }
@@ -547,20 +613,14 @@ impl FileSystem for MemoryFs {
         Ok(inode.contents.slice(offset..end))
     }
 
-    fn write_with<'a, F>(
+    fn prepare_write<'a>(
         &'a self,
         path: FsPath<'a>,
         position: WritePosition,
         len: usize,
         now: u64,
-        fill: F,
-    ) -> impl Future<Output = FsResult<u64>> + Send + 'a
-    where
-        F: FnOnce(&mut [u8]),
-    {
-        // The write is done here, under the lock; the future only reports
-        // it, so it holds nothing of `fill`.
-        core::future::ready(self.write_now(path, position, len, now, fill))
+    ) -> impl Future<Output = FsResult<MemoryWrite<'a>>> + Send + 'a {
+        core::future::ready(MemoryWrite::prepare(self, path, position, len, now))
     }
 
     async fn set_size(&self, path: FsPath<'_>, size: u64, now: u64) -> FsResult<()> {
@@ -695,7 +755,8 @@ mod tests {
 
     use futures_lite::future::block_on;
     use helios_hal::fs::{
-        DeviceId, DirCookie, FileSystem, FsError, FsPath, NodeKind, OpenFlags, WritePosition,
+        DeviceId, DirCookie, FileSystem, FsError, FsPath, NodeKind, OpenFlags, PreparedWrite,
+        WritePosition, WriteProgress,
     };
 
     use super::MemoryFs;
@@ -717,6 +778,98 @@ mod tests {
             .collect()
     }
 
+    /// Creates of one path that race on several processors: one wins,
+    /// every other is told the name exists, and none panics. Each round
+    /// races the four ways a name comes into being.
+    #[test]
+    fn racing_creates_of_one_path_leave_one_winner() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        const RACERS: usize = 8;
+        const ROUNDS: usize = 200;
+
+        let fs = tree();
+        block_on(fs.open(path("existing"), OpenFlags::CREATE, 0)).expect("creates");
+        for round in 0..ROUNDS {
+            let name = alloc::format!("raced-{round}");
+            let barrier = Barrier::new(RACERS);
+            let outcomes: Vec<Result<(), FsError>> = thread::scope(|scope| {
+                let racers: Vec<_> = (0..RACERS)
+                    .map(|racer| {
+                        let (fs, name, barrier) = (&fs, &name, &barrier);
+                        scope.spawn(move || {
+                            let new = path(name);
+                            barrier.wait();
+                            block_on(async {
+                                match racer % 4 {
+                                    0 => fs
+                                        .open(new, OpenFlags::CREATE | OpenFlags::EXCLUSIVE, 1)
+                                        .await
+                                        .map(drop),
+                                    1 => fs.create_directory(new, 1).await,
+                                    2 => fs.symlink("existing", new, 1).await,
+                                    _ => fs.link(path("existing"), new, 1).await,
+                                }
+                            })
+                        })
+                    })
+                    .collect();
+                racers
+                    .into_iter()
+                    .map(|racer| racer.join().expect("no create panics"))
+                    .collect()
+            });
+            let winners = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
+            assert_eq!(winners, 1, "round {round}: {outcomes:?}");
+            assert!(
+                outcomes
+                    .iter()
+                    .all(|outcome| matches!(outcome, Ok(()) | Err(FsError::Exists))),
+                "round {round}: {outcomes:?}"
+            );
+            block_on(fs.stat(path(&name))).expect("the winner's node is there");
+        }
+    }
+
+    #[test]
+    fn a_write_is_refused_while_staging_and_a_dropped_one_changes_nothing() {
+        let fs = tree();
+        block_on(fs.create_directory(path("d"), 1)).expect("creates the directory");
+        block_on(fs.open(path("f"), OpenFlags::CREATE, 1)).expect("creates the file");
+        block_on(write_bytes(
+            &fs,
+            path("f"),
+            WritePosition::At(0),
+            b"kept",
+            2,
+        ))
+        .expect("writes");
+
+        assert!(matches!(
+            block_on(fs.prepare_write(path("d"), WritePosition::At(0), 1, 3)),
+            Err(FsError::IsDirectory)
+        ));
+        assert!(matches!(
+            block_on(fs.prepare_write(path("missing"), WritePosition::End, 1, 3)),
+            Err(FsError::NoEntry)
+        ));
+        // Staged, then dropped at the end of the statement.
+        assert_eq!(
+            block_on(fs.prepare_write(path("f"), WritePosition::At(0), 4, 3))
+                .expect("stages")
+                .staged_len(),
+            4
+        );
+
+        let read = block_on(fs.read_at(path("f"), 0, 64)).expect("reads");
+        assert_eq!(read.as_ref(), b"kept");
+        assert_eq!(
+            block_on(fs.stat(path("f"))).expect("stats").modified_nanos,
+            2
+        );
+    }
+
     #[test]
     fn creates_writes_and_reads_back_positionally() {
         let fs = tree();
@@ -726,16 +879,18 @@ mod tests {
             Ok(2),
             "writes past the end"
         );
-        // The filesystem hands its own storage to the filler.
-        assert_eq!(
-            block_on(
-                fs.write_with(path("f"), WritePosition::End, 2, 7, |destination| {
-                    assert_eq!(destination, [0, 0]);
-                    destination.copy_from_slice(b"ef");
-                })
-            ),
-            Ok(4)
-        );
+        // The filesystem stages the whole write in one round and hands its
+        // own storage to the filler.
+        let staged =
+            block_on(fs.prepare_write(path("f"), WritePosition::End, 2, 7)).expect("stages");
+        assert_eq!(staged.staged_len(), 2);
+        assert!(matches!(
+            block_on(staged.submit(|at, destination| {
+                assert_eq!((at, &*destination), (0, &[0, 0][..]));
+                destination.copy_from_slice(b"ef");
+            })),
+            Ok(WriteProgress::Done(4))
+        ));
         let read = block_on(fs.read_at(path("f"), 0, 64)).expect("reads");
         assert_eq!(read.as_ref(), b"\0\0cdef");
         let stat = block_on(fs.stat(path("f"))).expect("stats");

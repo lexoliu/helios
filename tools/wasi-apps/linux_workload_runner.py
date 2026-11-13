@@ -85,11 +85,13 @@ class HostEndpoints:
 @dataclass(frozen=True)
 class CompilerRequest:
     """What the Helios column's compile asks the compiler plugin for: the
-    kernel's target triple and the kernel's worker count, so a counterpart
-    hosting the same plugin asks for the same compile."""
+    kernel's target triple, the name of the ISA level the Helios guest
+    compiled for and the kernel's worker count, so a counterpart hosting the
+    same plugin asks for the same compile."""
 
     target: str | None = None
     workers: int | None = None
+    isa_level: str | None = None
 
 
 @dataclass(frozen=True)
@@ -265,6 +267,10 @@ def render(template: str, context: RenderContext, workload: dict) -> str:
         if not context.compiler.target:
             raise SystemExit(f"workload {workload['name']} requires --compiler-target")
         rendered = rendered.replace("{compiler_target}", context.compiler.target)
+    if "{compiler_isa_level}" in rendered:
+        if not context.compiler.isa_level:
+            raise SystemExit(f"workload {workload['name']} requires --compiler-isa-level")
+        rendered = rendered.replace("{compiler_isa_level}", context.compiler.isa_level)
     if "{compiler_workers}" in rendered:
         if context.compiler.workers is None:
             raise SystemExit(f"workload {workload['name']} requires --compiler-workers")
@@ -550,6 +556,27 @@ def median(values: list[float]) -> float:
     return (ordered[lower] + ordered[upper]) / 2
 
 
+def inferred_isa_flags(wasmtime_bin: str) -> list[str]:
+    """The Cranelift ISA flags Wasmtime enables on this machine, sorted.
+
+    `wasmtime settings --json` prints, under `inferred`, every boolean ISA
+    flag its own host detection turned on: what `wasmtime compile` and
+    `wasmtime run` compile this guest's wasm with. The benchmark report pins
+    it, because the Helios side compiles for the ISA level its own
+    processor probe selects and the two columns are comparable only while
+    the two sets are known.
+    """
+    completed = subprocess.run(
+        [wasmtime_bin, "settings", "--json"], capture_output=True, text=True, check=True
+    )
+    inferred = json.loads(completed.stdout).get("inferred")
+    if not isinstance(inferred, list):
+        raise SystemExit(
+            f"`{wasmtime_bin} settings --json` reported no `inferred` flag list: {completed.stdout[:200]!r}"
+        )
+    return sorted(inferred)
+
+
 def run_workloads(
     manifest_path: Path,
     names: list[str],
@@ -562,21 +589,19 @@ def run_workloads(
 ) -> None:
     manifest = load_manifest(manifest_path)
     env = os.environ.copy()
+    run_record = {
+        "type": "run",
+        "schema_version": SCHEMA_VERSION,
+        "side": side,
+        "manifest": str(manifest_path),
+        "iterations": iterations,
+        "selected_workloads": names,
+        "wasmtime_bin": context.wasmtime_bin,
+    }
+    if side == "linux_wasmtime":
+        run_record["inferred_isa_flags"] = inferred_isa_flags(context.wasmtime_bin)
     with output.open("w", encoding="utf-8") as handle:
-        handle.write(
-            json.dumps(
-                {
-                    "type": "run",
-                    "schema_version": SCHEMA_VERSION,
-                    "side": side,
-                    "manifest": str(manifest_path),
-                    "iterations": iterations,
-                    "selected_workloads": names,
-                    "wasmtime_bin": context.wasmtime_bin,
-                }
-            )
-            + "\n"
-        )
+        handle.write(json.dumps(run_record) + "\n")
         # Every workload gets an equal share of the budget the caller gave
         # this side, so no single cell can spend the whole of it.
         share = side_timeout_seconds / len(names) if side_timeout_seconds else None
@@ -715,6 +740,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="the target triple the Helios column's compiler plugin compiles for ({compiler_target})",
     )
     run_parser.add_argument(
+        "--compiler-isa-level",
+        help="the name of the ISA level the Helios guest's compiler plugin compiled for, such as "
+        "x86-64-v4+vbmi+bitalg ({compiler_isa_level})",
+    )
+    run_parser.add_argument(
         "--compiler-workers",
         type=int,
         help="the worker count the Helios column's compiler plugin compiles with ({compiler_workers})",
@@ -757,7 +787,7 @@ def main() -> None:
                 args.host_tcp_echo_port,
             ),
             workdir=Path(tempfile.mkdtemp(prefix="helios-bench-")),
-            compiler=CompilerRequest(args.compiler_target, args.compiler_workers),
+            compiler=CompilerRequest(args.compiler_target, args.compiler_workers, args.compiler_isa_level),
         )
         run_workloads(
             args.manifest,

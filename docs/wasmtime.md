@@ -297,6 +297,35 @@ incompatible package identities. The files currently track the released
 `crates/wasi/src/p3/wit/deps` and `crates/wasi-http/src/p3/wit/deps` when the
 vendored revision moves, rather than pointing bindgen at the sibling tree.
 
+## Cranelift x86 vector-state properties
+
+The x86 backend preserves no vector state beyond FXSAVE at interrupts and the
+`preserve_all` trampoline's 128-bit xmm0-xmm15 save at stack-limit checks
+(`x86/src/extended_state.rs`). That is sound only while the fork's x64
+Cranelift backend keeps three properties, which hold at
+`1ed7678a8ee4f57cbe4a4e89ade7f7fda6092055` and which every move of the fork
+must keep:
+
+- **A, 128-bit only.** Every EVEX instruction in the assembler is declared
+  `evex(L128, …)` (`cranelift/assembler-x64/meta/src/instructions/`), and no
+  VEX instruction is declared 256-bit. Compiled code never names a `ymm` or
+  `zmm` register.
+- **B, no opmask.** The EVEX encoder hard-codes `aaa = 0b000`, mask register
+  k0 (`cranelift/assembler-x64/src/evex.rs`). Compiled code never names k1-k7.
+- **C, xmm0-xmm15 only.** The x64 register environment holds xmm0-xmm15 and
+  leaves the Vector class empty (`create_reg_env_systemv` in
+  `cranelift/codegen/src/isa/x64/abi.rs`), and Winch defines only xmm0-xmm15
+  (`winch/codegen/src/isa/x64/regs.rs`). Compiled code never names
+  xmm16-xmm31.
+
+`compiler-support/tests/avx512_lowerings.rs` pins all three. It compiles
+`compiler-support/tests/data/avx512-lowerings.clif` for x86-64 with every flag
+of the top level of `helios_artifact::cwasm_target_isa_levels`, requires the
+EVEX forms (`vpmullq`, `vpabsq`, `vpsraq`, `vpopcntb`, `vpermi2b`,
+`vcvtudq2ps`) so that it notices AVX-512 not being exercised, and fails on any
+`ymm`, `zmm`, `k1`-`k7` or `xmm16`-`xmm31` operand. A fork revision that fails
+it needs full XSAVE state handling in the x86 backend before it can be taken.
+
 ## Per-target memory profile
 
 Every target helios runs on — `aarch64-unknown-none`, `riscv64gc-unknown-none-elf`,

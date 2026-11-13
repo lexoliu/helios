@@ -1,0 +1,53 @@
+; Every operation the x64 backend lowers to an EVEX instruction when the
+; AVX-512 flags of the top x86 level are enabled. The test in
+; `avx512_lowerings.rs` compiles this file and pins the register and vector
+; length properties the x86 backend's state-preservation design rests on.
+
+function %imul_i64x2(i64x2, i64x2) -> i64x2 {
+block0(v0: i64x2, v1: i64x2):
+    v2 = imul v0, v1
+    return v2
+}
+
+function %abs_i64x2(i64x2) -> i64x2 {
+block0(v0: i64x2):
+    v1 = iabs v0
+    return v1
+}
+
+function %sshr_i64x2(i64x2, i64) -> i64x2 {
+block0(v0: i64x2, v1: i64):
+    v2 = sshr v0, v1
+    return v2
+}
+
+function %sshr_imm_i64x2(i64x2) -> i64x2 {
+block0(v0: i64x2):
+    v1 = iconst.i32 7
+    v2 = sshr v0, v1
+    return v2
+}
+
+function %popcnt_i8x16(i8x16) -> i8x16 {
+block0(v0: i8x16):
+    v1 = popcnt v0
+    return v1
+}
+
+function %swizzle(i8x16, i8x16) -> i8x16 {
+block0(v0: i8x16, v1: i8x16):
+    v2 = swizzle v0, v1
+    return v2
+}
+
+function %shuffle_two_inputs(i8x16, i8x16) -> i8x16 {
+block0(v0: i8x16, v1: i8x16):
+    v2 = shuffle v0, v1, 0x11000000000000000000000000000000
+    return v2
+}
+
+function %fcvt_from_uint_i32x4(i32x4) -> f32x4 {
+block0(v0: i32x4):
+    v1 = fcvt_from_uint.f32x4 v0
+    return v1
+}

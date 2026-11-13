@@ -19,16 +19,16 @@ use wasmtime_wasi_io::streams::{InputStream, OutputStream, StreamError, StreamRe
 use crate::io::{ByteReader, ByteWriter};
 use crate::wasmtime_adapter::component_host::{StoreData, deliver_kill};
 use crate::{
-    ComponentHostNetwork, ComponentRuntimeState, ComponentStoreData, HostFileSystem,
-    KernelHeapHeadroom, MemoryPool, OomKillOutcome, ProgramOutOfMemory,
-    allow_instance_resource_growth, heap_stats, monotonic_nanos, user_heap_stats,
+    ComponentHostNetwork, ComponentRuntimeState, ComponentStoreData, KernelHeapHeadroom,
+    MemoryPool, OomKillOutcome, ProgramOutOfMemory, Storage, allow_instance_resource_growth,
+    heap_stats, monotonic_nanos, user_heap_stats,
 };
 
-impl<CpuImpl, Net, HostFs> ResourceLimiter for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> ResourceLimiter for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: HostFileSystem,
+    StorageImpl: Storage,
 {
     fn memory_growing(
         &mut self,
@@ -73,11 +73,11 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: HostFileSystem,
+    StorageImpl: Storage,
 {
     /// Decide whether `growth` extra bytes of user memory can be granted.
     ///

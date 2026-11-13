@@ -7,8 +7,8 @@ use bytes::Bytes;
 
 use crate::io::{ByteReader, ByteWriter, TryRead};
 use crate::{
-    EntropyPool, InstanceActivity, InstanceRegistry, KernelClock, KillReason, ProcessAuthority,
-    RegisteredInstance, SetWallClockCap, Sleep, Timer,
+    EntropyPool, InstanceActivity, InstanceId, InstanceRegistry, KernelClock, KillReason,
+    ProcessAuthority, RegisteredInstance, SetWallClockCap, Sleep, Timer,
 };
 use helios_hal::cpu::{Cpu, Instant};
 
@@ -169,11 +169,12 @@ pub enum ComponentOutputRoute {
 
 impl ComponentOutputRoute {
     /// Borrow this route as a sink so every writer path matches on one
-    /// exhaustive set of destinations.
-    pub fn sink(&self) -> ComponentOutputSink<'_> {
+    /// exhaustive set of destinations. `instance` is the writer; a
+    /// [`LocalOutputSink::Trace`] attributes what it records to it.
+    pub fn sink(&self, instance: InstanceId) -> ComponentOutputSink<'_> {
         match self {
             Self::Serial => ComponentOutputSink::Local(LocalOutputSink::Serial),
-            Self::Trace => ComponentOutputSink::Local(LocalOutputSink::Trace),
+            Self::Trace => ComponentOutputSink::Local(LocalOutputSink::Trace(instance)),
             Self::Child(writer) => ComponentOutputSink::Child(writer),
             Self::Discard => ComponentOutputSink::Local(LocalOutputSink::Discard),
         }
@@ -202,7 +203,8 @@ pub enum ComponentOutputSink<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LocalOutputSink {
     Serial,
-    Trace,
+    /// Observer console text, attributed to the instance that wrote it.
+    Trace(InstanceId),
     Discard,
 }
 
@@ -228,11 +230,11 @@ impl LocalOutputSink {
     {
         match self {
             Self::Serial => serial_writer.write_stream(bytes),
-            Self::Trace => {
+            Self::Trace(instance) => {
                 let text = core::str::from_utf8(bytes).unwrap_or_else(|error| {
                     panic!("guest attempted to write non-utf8 stdout/stderr bytes: {error}")
                 });
-                runtime_state.record_console_text(cpu.now().ticks(), text);
+                runtime_state.record_console_text(cpu.now().ticks(), Some(instance), text);
                 bytes.len()
             }
             Self::Discard => bytes.len(),
@@ -287,10 +289,18 @@ impl ComponentOutputMode {
     }
 
     /// Resolve where `kind` goes without cloning a writer handle.
-    pub fn sink(&self, kind: ComponentOutputStreamKind) -> ComponentOutputSink<'_> {
+    /// `instance` is the writer; a [`LocalOutputSink::Trace`] attributes
+    /// what it records to it.
+    pub fn sink(
+        &self,
+        kind: ComponentOutputStreamKind,
+        instance: InstanceId,
+    ) -> ComponentOutputSink<'_> {
         match (self, kind) {
             (ComponentOutputMode::Serial, _) => ComponentOutputSink::Local(LocalOutputSink::Serial),
-            (ComponentOutputMode::Trace, _) => ComponentOutputSink::Local(LocalOutputSink::Trace),
+            (ComponentOutputMode::Trace, _) => {
+                ComponentOutputSink::Local(LocalOutputSink::Trace(instance))
+            }
             (ComponentOutputMode::Child { stdout_tx, .. }, ComponentOutputStreamKind::Stdout) => {
                 ComponentOutputSink::Child(stdout_tx)
             }
@@ -300,11 +310,11 @@ impl ComponentOutputMode {
             (
                 ComponentOutputMode::RoutedChild { stdout, .. },
                 ComponentOutputStreamKind::Stdout,
-            ) => stdout.sink(),
+            ) => stdout.sink(instance),
             (
                 ComponentOutputMode::RoutedChild { stderr, .. },
                 ComponentOutputStreamKind::Stderr,
-            ) => stderr.sink(),
+            ) => stderr.sink(instance),
         }
     }
 
@@ -334,7 +344,9 @@ pub trait ComponentRuntimeState: Clone + Send + 'static {
     /// wall time cannot be told apart from uptime.
     fn wall_clock_offset_nanos(&self) -> i128;
 
-    fn record_console_text(&self, current_ticks: u64, text: &str);
+    /// Records `text` as console events attributed to `origin`: the
+    /// instance that wrote it, or `None` for the kernel's own console.
+    fn record_console_text(&self, current_ticks: u64, origin: Option<InstanceId>, text: &str);
 
     /// The kernel's root DRBG, from which this instance's pool is
     /// derived.
@@ -388,13 +400,9 @@ pub trait ComponentRuntimeState: Clone + Send + 'static {
         weight_nanos: u64,
     );
 
-    fn record_profile_stack_parts_nanos(
-        &self,
-        scope: crate::ProfileScope,
-        prefix: &str,
-        suffix: &str,
-        weight_nanos: u64,
-    );
+    /// Records `weight_nanos` of time `instance`, running the program
+    /// named `program`, spent in user code.
+    fn record_user_profile(&self, instance: InstanceId, program: &str, weight_nanos: u64);
 
     fn record_perf_metric_parts(
         &self,
@@ -687,9 +695,9 @@ where
         self.entropy.secure_u64(self.runtime_state.root_entropy())
     }
 
-    pub(crate) fn insecure_random_bytes(&mut self, len: usize) -> Vec<u8> {
+    pub(crate) fn fill_insecure_random(&mut self, buffer: &mut [u8]) {
         self.entropy
-            .insecure_bytes(self.runtime_state.root_entropy(), len)
+            .fill_insecure(self.runtime_state.root_entropy(), buffer);
     }
 
     pub(crate) fn insecure_random_u64(&mut self) -> u64 {
@@ -728,7 +736,11 @@ where
             *pending = None;
             return core::task::Poll::Ready(());
         }
-        match self.execution_context.output_mode.sink(stream) {
+        match self
+            .execution_context
+            .output_mode
+            .sink(stream, self.instance().id())
+        {
             ComponentOutputSink::Local(local) => {
                 // The waiter is armed before the port is tried, so a
                 // transmit release that lands between the write and the

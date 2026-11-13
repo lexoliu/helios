@@ -67,6 +67,36 @@ pub struct BootFirmwareTables {
     /// in it is reached by physical address, so the only thing a reader
     /// needs is somewhere to read it from.
     pub device_tree_blob: Option<usize>,
+    /// The log of every measurement the chain before the kernel made,
+    /// when the firmware kept one and the bootloader handed it over.
+    pub measurement_log: Option<MeasurementLog>,
+}
+
+/// The firmware's log of the measurements the boot chain extended into
+/// its measurement device, mapped and readable.
+///
+/// Like a device tree it is one self-contained blob, so it is handed
+/// over by where it can be read from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MeasurementLog {
+    pub format: MeasurementLogFormat,
+    pub address: usize,
+    pub size: usize,
+}
+
+/// How a [`MeasurementLog`]'s records are laid out, by the
+/// `EFI_TCG2_EVENT_LOG_FORMAT` bit the firmware produced it under (TCG
+/// EFI Protocol Specification, "EFI_TCG2_PROTOCOL.GetEventLog").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MeasurementLogFormat {
+    /// `EFI_TCG2_EVENT_LOG_FORMAT_TCG_1_2`: SHA-1 records only.
+    Tcg12,
+    /// `EFI_TCG2_EVENT_LOG_FORMAT_TCG_2`: the crypto-agile log, one
+    /// digest per active bank in every record.
+    Tcg2,
+    /// A format code this kernel does not know, as the bootloader gave
+    /// it.
+    Other(u64),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
