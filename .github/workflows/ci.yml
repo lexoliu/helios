@@ -227,6 +227,23 @@ jobs:
       # quota holds these four and nothing more, and a pull request's
       # entry is restorable from its own merge ref alone. Every other
       # lane, workflow and action builds cold.
+      # rust-cache hashes `rustc -vV` and `rustup run <t> rustc -vV` for
+      # every installed toolchain (src/config.ts `getRustVersions`), run
+      # from the checkout root where no `rust-toolchain.toml` applies. On
+      # a fresh runner that is only the image's stable, so an image update
+      # changed every key and forced a cold build (#884). Installing the
+      # pinned toolchain from `helios/rust-toolchain.toml`, making it the
+      # default and removing every other toolchain leaves the pinned
+      # compiler as the only one the key can see.
+      - name: Make the pinned toolchain the only one rust-cache sees
+        if: matrix.rust-cache
+        working-directory: helios
+        run: |
+          rustup toolchain install
+          pinned="$(rustup show active-toolchain | cut -d' ' -f1)"
+          rustup default "$pinned"
+          rustup toolchain list --quiet | grep -vxF "$pinned" | xargs -r -n1 rustup toolchain uninstall
+          rustup toolchain list
       - uses: Swatinem/rust-cache@v2
         if: matrix.rust-cache
         with:
