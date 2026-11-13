@@ -49,8 +49,9 @@ use crossbeam_utils::CachePadded;
 pub(super) enum RxFrameOwner {
     /// One shard, which takes the frame and nobody else does.
     Shard(usize),
-    /// A Neighbor Advertisement, which answers a resolution that any
-    /// shard may be pending. The default shard takes it as the receiver,
+    /// A Neighbor Advertisement or an ARP reply, which answers a
+    /// resolution that any shard may be pending. The default shard takes
+    /// it as the receiver,
     /// and every other shard is offered it as the answer to its own
     /// pending resolution, which is all it can do there
     /// (`Stack::answer_resolution`).
@@ -70,7 +71,7 @@ pub(super) enum RxFrameOwner {
 /// Three kinds of frame have no flow the hash can name and belong to
 /// [`DEFAULT_SHARD_IDX`]:
 ///
-/// * ARP, ICMP echo and the neighbour discovery that is not an
+/// * an ARP request, ICMP echo and the neighbour discovery that is not an
 ///   advertisement, which carry no ports;
 /// * anything unparseable, which the owning stack will drop;
 /// * the DHCP client's exchange, which is broadcast at a moment when
@@ -80,9 +81,9 @@ pub(super) enum RxFrameOwner {
 /// it, so the flow it concerns is recoverable and the error is routed to
 /// that flow's shard rather than to a shard with no socket to tell.
 ///
-/// A Neighbor Advertisement is the one frame that belongs to the whole
-/// node: the shard that asked for the address is whichever shard's
-/// socket needed it, and no hash names that shard, so the frame is a
+/// A Neighbor Advertisement and an ARP reply are the frames that belong
+/// to the whole node: the shard that asked for the address is whichever
+/// shard's socket needed it, and no hash names that shard, so the frame is a
 /// [`RxFrameOwner::ResolutionAnswer`]. With a single shard that is the
 /// default shard alone.
 pub(super) fn rx_frame_owner(frame: &RxFrame, shard_count: usize) -> RxFrameOwner {
@@ -96,7 +97,7 @@ pub(super) fn rx_frame_owner(frame: &RxFrame, shard_count: usize) -> RxFrameOwne
     }
     match frame_flow(frame.as_ref()) {
         Some(FrameFlow::Tuple(tuple)) => RxFrameOwner::Shard(flow_hash(&tuple).bucket(shard_count)),
-        Some(FrameFlow::NeighborAdvertisement) => RxFrameOwner::ResolutionAnswer,
+        Some(FrameFlow::ResolutionAnswer) => RxFrameOwner::ResolutionAnswer,
         None => RxFrameOwner::Shard(DEFAULT_SHARD_IDX),
     }
 }
@@ -105,8 +106,8 @@ pub(super) fn rx_frame_owner(frame: &RxFrame, shard_count: usize) -> RxFrameOwne
 enum FrameFlow {
     /// A flow the hash names.
     Tuple(FlowTuple),
-    /// A Neighbor Advertisement.
-    NeighborAdvertisement,
+    /// A Neighbor Advertisement or an ARP reply.
+    ResolutionAnswer,
 }
 
 /// What a frame belongs to, or `None` when it has no flow and no
@@ -122,7 +123,11 @@ fn frame_flow(frame: &[u8]) -> Option<FrameFlow> {
             let packet = Ipv6Packet::parse(ethernet.payload)?;
             (packet.next_header, packet.payload)
         }
-        _ => return None,
+        EthernetProtocol::Arp => {
+            return ArpPacket::parse(ethernet.payload)
+                .filter(|packet| packet.operation == ArpOperation::Reply)
+                .map(|_| FrameFlow::ResolutionAnswer);
+        }
     };
     match protocol {
         IpProtocol::Tcp | IpProtocol::Udp => {
@@ -173,7 +178,7 @@ fn icmpv4_quoted_flow(bytes: &[u8]) -> Option<FlowTuple> {
 fn icmpv6_flow(bytes: &[u8]) -> Option<FrameFlow> {
     let original = match Icmpv6Packet::parse(bytes)? {
         Icmpv6Packet::NeighborAdvertisement { .. } => {
-            return Some(FrameFlow::NeighborAdvertisement);
+            return Some(FrameFlow::ResolutionAnswer);
         }
         Icmpv6Packet::DestinationUnreachable(unreachable) => unreachable.original,
         Icmpv6Packet::PacketTooBig(packet_too_big) => packet_too_big.original,
@@ -922,8 +927,8 @@ impl NetworkShardSet {
     /// Non-IP and non-TCP/UDP frames (ARP, ICMP, malformed) carry no
     /// local port and route to shard 0.
     ///
-    /// A Neighbor Advertisement is received by shard 0 like any other
-    /// frame and then offered to every other shard
+    /// A Neighbor Advertisement or an ARP reply is received by shard 0
+    /// like any other frame and then offered to every other shard
     /// ([`Self::answer_resolutions`]); the returned dispatch is shard
     /// 0's. No two shard locks are ever held together, and the shards
     /// that answered are signalled after their locks are released.
@@ -968,7 +973,7 @@ impl NetworkShardSet {
         dispatch
     }
 
-    /// Offers a Neighbor Advertisement to every shard but the default
+    /// Offers a Neighbor Advertisement or an ARP reply to every shard but the default
     /// one, in index order, as the answer to a resolution it is pending.
     ///
     /// Concurrency: each shard is locked on its own and released before

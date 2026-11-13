@@ -31,15 +31,15 @@ use bytes::Bytes;
 use helios_hal::cpu::{Cpu, HardwarePerfCounterDelta, HardwarePerfCounters, current_processor};
 use helios_hal::io::IoError;
 use helios_netstack::{
-    DEFAULT_HOP_LIMIT, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DNS_PORT, DhcpAction, DhcpClient,
-    DhcpDestination, DhcpDnsServers, DhcpLease, DhcpPacket, DhcpTransmit, DnsQuery,
-    DnsQuestionWriter, DnsRecordType, DnsResponse, EthernetFrame, EthernetProtocol, FlowTuple,
-    IcmpEchoKey, IcmpEchoReply, Icmpv4Packet, Icmpv6Packet, InterfaceEventMark, IpAddress, IpCidr,
-    IpProtocol, Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6AddressEntry, Ipv6Cidr,
-    Ipv6Packet, IsnSecret, MAX_OUTBOUND_FRAMES, NeighborCache, NeighborEntry,
-    NetworkInterface as NetworkDevice, OutboundBatchStatus, Route, RouteTable, RxChecksumOffload,
-    RxDrain, RxFrame, SegmentationOffload, Stack, StackConfig, StackError, StackEvent,
-    StackInstant, TcpCloseKind, TcpConnectState, TcpConnectTerminalError, TcpEndpoint,
+    ArpOperation, ArpPacket, DEFAULT_HOP_LIMIT, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DNS_PORT,
+    DhcpAction, DhcpClient, DhcpDestination, DhcpDnsServers, DhcpLease, DhcpPacket, DhcpTransmit,
+    DnsQuery, DnsQuestionWriter, DnsRecordType, DnsResponse, EthernetFrame, EthernetProtocol,
+    FlowTuple, IcmpEchoKey, IcmpEchoReply, Icmpv4Packet, Icmpv6Packet, InterfaceEventMark,
+    IpAddress, IpCidr, IpProtocol, Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Address,
+    Ipv6AddressEntry, Ipv6Cidr, Ipv6Packet, IsnSecret, MAX_OUTBOUND_FRAMES, NeighborCache,
+    NeighborEntry, NetworkInterface as NetworkDevice, OutboundBatchStatus, Route, RouteTable,
+    RxChecksumOffload, RxDrain, RxFrame, SegmentationOffload, Stack, StackConfig, StackError,
+    StackEvent, StackInstant, TcpCloseKind, TcpConnectState, TcpConnectTerminalError, TcpEndpoint,
     TcpListenBacklog, TcpPacket, TcpReadIntoState, TcpReadState, TcpReceiveDiagnostics,
     TcpSendState, TcpStackCounters, UdpEgress, UdpEndpoint, UdpPacket, UdpPayload,
     UdpSocketBinding, UdpSocketError, flow_hash, next_transaction_id,
@@ -69,8 +69,8 @@ const EPHEMERAL_PORT_END: u16 = 65_535;
 /// also where unqualified control-plane operations run, so a route the
 /// ARP reply taught and the query that reads it meet on one shard.
 ///
-/// A Neighbor Advertisement is received here too, and is then also
-/// offered to every other shard as the answer to a resolution that
+/// A Neighbor Advertisement or an ARP reply is received here too, and
+/// is then also offered to every other shard as the answer to a resolution that
 /// shard is pending (`RxFrameOwner::ResolutionAnswer`).
 const DEFAULT_SHARD_IDX: usize = 0;
 
@@ -5105,7 +5105,24 @@ mod tests {
     /// by the dispatch itself, and its waiters are signalled.
     #[test]
     fn a_neighbor_advertisement_answers_the_shard_that_asked_without_a_synchronization() {
-        let family = ResolutionFamily::Ipv6;
+        a_resolution_reply_answers_the_shard_that_asked_without_a_synchronization(
+            ResolutionFamily::Ipv6,
+        );
+    }
+
+    /// Issue #899: an ARP reply is answered the same way, so a connect
+    /// on a shard other than the default one does not wait for the
+    /// control plane's next synchronization.
+    #[test]
+    fn an_arp_reply_answers_the_shard_that_asked_without_a_synchronization() {
+        a_resolution_reply_answers_the_shard_that_asked_without_a_synchronization(
+            ResolutionFamily::Ipv4,
+        );
+    }
+
+    fn a_resolution_reply_answers_the_shard_that_asked_without_a_synchronization(
+        family: ResolutionFamily,
+    ) {
         let fixture = ConnectOnSecondShard::open(family);
         let service = &fixture.service;
         block_on(service.poll_network_once(NetworkPollSource::Tcp))
@@ -5173,7 +5190,36 @@ mod tests {
     /// plane (RFC 4861 section 7.2.5).
     #[test]
     fn an_unasked_neighbor_advertisement_creates_no_entry_on_any_shard() {
-        let family = ResolutionFamily::Ipv6;
+        an_unasked_resolution_reply_creates_no_entry_on_any_shard(ResolutionFamily::Ipv6);
+    }
+
+    /// An ARP reply nobody asked for is not learned through the answer
+    /// path, on any shard but the one that received it.
+    #[test]
+    fn an_unasked_arp_reply_is_not_offered_to_another_shard() {
+        let family = ResolutionFamily::Ipv4;
+        let device = RecordingNetworkInterface::accepting_transmissions(2);
+        let service = test_network_service_smp(2, device.clone());
+        let state = &service.inner.state;
+        for idx in 0..2 {
+            family.configure(&mut state.shard_at(idx).lock());
+        }
+
+        device.deliver_on(0, &family.resolution_reply());
+        poll_pair_without_synchronizing(&service, 0);
+
+        assert!(
+            state
+                .shard_at(1)
+                .lock()
+                .stack
+                .neighbors()
+                .all(|entry| entry.ip != family.peer()),
+            "shard 1 took an address nobody asked for"
+        );
+    }
+
+    fn an_unasked_resolution_reply_creates_no_entry_on_any_shard(family: ResolutionFamily) {
         let device = RecordingNetworkInterface::accepting_transmissions(2);
         let service = test_network_service_smp(2, device.clone());
         let state = &service.inner.state;
@@ -5353,13 +5399,17 @@ mod tests {
         }
     }
 
-    /// A Neighbor Advertisement answers whichever shard asked, so it
-    /// belongs to every shard; a Neighbor Solicitation and ARP, which
-    /// only the default shard's control plane answers, stay with it.
+    /// A Neighbor Advertisement and an ARP reply answer whichever shard
+    /// asked, so they belong to every shard; a Neighbor Solicitation and
+    /// an ARP request, which only the default shard's control plane
+    /// answers, stay with it.
     #[test]
     fn a_neighbor_advertisement_is_an_answer_for_every_shard() {
         let advertisement = ResolutionFamily::Ipv6.resolution_reply();
-        let arp = ResolutionFamily::Ipv4.resolution_reply();
+        let arp_reply = ResolutionFamily::Ipv4.resolution_reply();
+        let (arp_request, arp_request_len) =
+            arp_request_frame(ResolutionFamily::PEER_V4, ResolutionFamily::LOCAL_V4);
+        let arp_request = &arp_request[..arp_request_len];
         let mut solicitation = [0; ETHERNET_FRAME_BYTES];
         let mut offset = EthernetFrame::encode_header(
             &mut solicitation,
@@ -5402,10 +5452,17 @@ mod tests {
                 super::DEFAULT_SHARD_IDX,
                 "a solicitation is the default shard's to answer"
             );
+            assert!(
+                matches!(
+                    super::rx_frame_owner(&unhashed(&arp_reply), shard_count),
+                    super::RxFrameOwner::ResolutionAnswer
+                ),
+                "an ARP reply answers a resolution on any of {shard_count} shards"
+            );
             assert_eq!(
-                owning_shard(&unhashed(&arp), shard_count),
+                owning_shard(&unhashed(arp_request), shard_count),
                 super::DEFAULT_SHARD_IDX,
-                "ARP is the default shard's"
+                "an ARP request is the default shard's"
             );
         }
     }
@@ -5604,6 +5661,62 @@ mod tests {
             ports, expected,
             "the new connection takes the first port after the held run"
         );
+    }
+
+    /// Issue #899: a connection belongs to the processor its caller
+    /// names, not to whichever processor polls the connect task, so a
+    /// connect handed to the global queue still opens on its owner's
+    /// shard.
+    #[test]
+    fn a_connect_opens_on_the_shard_of_the_processor_that_requested_it() {
+        for requested in 0..2u16 {
+            let device = RecordingNetworkInterface::accepting_transmissions(2);
+            let service = test_network_service_smp(2, device);
+            let state = &service.inner.state;
+            for idx in 0..2 {
+                let mut shard = state.shard_at(idx).lock();
+                shard
+                    .stack
+                    .add_ipv6_address(Ipv6Cidr::new(connect_local(), 64))
+                    .expect("test address should be accepted");
+                shard.stack.learn_neighbor(NeighborEntry {
+                    ip: IpAddress::Ipv6(connect_remote()),
+                    mac: PEER_MAC,
+                    state: NeighborState::Reachable,
+                    updated_at: StackInstant::from_nanos(0),
+                });
+            }
+
+            // The task that runs the connect is polled by processor 0,
+            // wherever the caller asked for it to belong.
+            crate::test_processor_identity::set(helios_hal::cpu::ProcessorId::new(0));
+            let mut connect = core::pin::pin!(service.tcp_connect_address(
+                crate::NetworkIpAddress::Ipv6(connect_remote()),
+                CONNECT_REMOTE_PORT,
+                0,
+                helios_netstack::DEFAULT_HOP_LIMIT,
+                helios_hal::cpu::ProcessorId::new(requested),
+                u64::MAX,
+            ));
+            assert!(
+                block_on(poll_once(connect.as_mut())).is_none(),
+                "no peer answers, so the handshake is still open"
+            );
+
+            for idx in 0..2 {
+                let has_connection = state
+                    .shard_at(idx)
+                    .lock()
+                    .stack
+                    .next_tcp_deadline()
+                    .is_some();
+                assert_eq!(
+                    has_connection,
+                    idx == usize::from(requested),
+                    "a connect requested for processor {requested} opened on shard {idx}"
+                );
+            }
+        }
     }
 
     /// A connect that does not name its port keeps succeeding as
