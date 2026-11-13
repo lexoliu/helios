@@ -28,7 +28,7 @@ use crate::X86Cpu;
 use crate::debug_state::RuntimeState;
 use crate::iommu::X86DmaPool;
 use crate::pci::MsixMessage;
-use crate::pci::PciRoot;
+use crate::pci::{PciRoot, VirtioFunctions};
 
 type X86VirtioNetDevice = VirtioNetDevice<VirtioPciTransport<X86DmaPool>>;
 
@@ -56,8 +56,8 @@ enum InterruptRole {
 }
 
 /// The PCI function that carries the platform's virtio-net device.
-pub(crate) fn discover(pci: &PciRoot) -> Option<PciAddress> {
-    pci.find_virtio_function(DeviceType::Network)
+pub(crate) fn discover(virtio: &VirtioFunctions) -> Option<PciAddress> {
+    virtio.find_virtio_function(DeviceType::Network)
 }
 
 /// The PCI function a virtio device is brought up on, and the DMA pool

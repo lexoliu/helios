@@ -7,6 +7,7 @@
 //! space is only needed by the watchdog, which keeps its own ECAM
 //! accessor.
 
+use alloc::vec::Vec;
 use core::ptr::NonNull;
 
 use helios_hal::io::{IoError, IoResult};
@@ -158,64 +159,56 @@ impl PciRoot {
     /// segment the bus number alone addresses a function, and the walk
     /// then covers devices behind bridges without the kernel having to
     /// re-derive the firmware's bridge numbering.
+    ///
+    /// A slot is probed at function 0 alone unless that function is
+    /// there and sets the multi-function bit of its header type: the PCI
+    /// Local Bus Specification requires every device to implement
+    /// function 0 and to set that bit when it implements any other, so
+    /// an empty slot costs one configuration read instead of eight.
+    /// Under a hypervisor every one of those reads is a pair of port
+    /// accesses that exit to the device model.
     fn functions(&self) -> impl Iterator<Item = PciAddress> + '_ {
         (0..=u8::MAX).flat_map(move |bus| {
             (0..PCI_MAX_DEVICES).flat_map(move |device| {
-                (0..PCI_MAX_FUNCTIONS).filter_map(move |function| {
+                let first = PciAddress::new(0, bus, device, 0);
+                let header = PciHeader::new(first);
+                let (vendor_id, _) = header.id(self.access);
+                let functions = if vendor_id == PCI_INVALID_VENDOR_ID {
+                    0
+                } else if header.has_multiple_functions(self.access) {
+                    PCI_MAX_FUNCTIONS
+                } else {
+                    1
+                };
+                (0..functions).filter_map(move |function| {
+                    if function == 0 {
+                        return Some(first);
+                    }
                     let address = PciAddress::new(0, bus, device, function);
-                    let header = PciHeader::new(address);
-                    let (vendor_id, _) = header.id(self.access);
-                    if vendor_id == PCI_INVALID_VENDOR_ID {
-                        return None;
-                    }
-                    if function != 0
-                        && !PciHeader::new(PciAddress::new(0, bus, device, 0))
-                            .has_multiple_functions(self.access)
-                    {
-                        return None;
-                    }
-                    Some(address)
+                    let (vendor_id, _) = PciHeader::new(address).id(self.access);
+                    (vendor_id != PCI_INVALID_VENDOR_ID).then_some(address)
                 })
             })
         })
     }
 
-    /// Locates the first modern virtio function of the requested type.
-    pub(crate) fn find_virtio_function(&self, device_type: DeviceType) -> Option<PciAddress> {
-        self.find_virtio_functions(device_type).next()
-    }
-
-    /// Every modern virtio function of the requested type, in bus order.
+    /// Every virtio function in segment 0, found by one walk of the bus.
     ///
-    /// Device classes the platform exposes more than once — block
-    /// devices, where the boot image and the kernel's own disk sit on
-    /// the same bus — are brought up from this rather than from the
-    /// first match.
-    pub(crate) fn find_virtio_functions(
-        &self,
-        device_type: DeviceType,
-    ) -> impl Iterator<Item = PciAddress> + '_ {
-        self.functions().filter(move |address| {
-            if helios_virtio::virtio_pci_device_type(&self.access, *address) != Some(device_type) {
-                return false;
-            }
-            // MSI-X is the only interrupt path this backend programs:
-            // every driver it installs is bound to a message, and there
-            // is no INTx fallback to fall back to. A function without
-            // one is a function the kernel cannot drive, which is the
-            // same situation as the device not being there — and the
-            // callers all handle that. Panicking the machine over an
-            // optional device would not.
-            if self.msix_table_size(*address).is_none() {
-                tracing::warn!(
-                    function = %address,
-                    ?device_type,
-                    "ignoring a virtio function that exposes no MSI-X capability"
-                );
-                return false;
-            }
-            true
-        })
+    /// Each device class is looked up in what this returns rather than by
+    /// a walk of its own, so boot pays for the bus once however many
+    /// classes the backend drives.
+    pub(crate) fn virtio_functions(&self) -> VirtioFunctions {
+        let functions = self
+            .functions()
+            .filter_map(|address| {
+                helios_virtio::virtio_pci_device_type(&self.access, address)
+                    .map(|device_type| (address, device_type))
+            })
+            .collect();
+        VirtioFunctions {
+            root: *self,
+            functions,
+        }
     }
 
     /// Points one MSI-X table entry of `address` at `vector` on the
@@ -352,6 +345,54 @@ impl PciRoot {
             "PCI function {address} refused to enable MSI-X"
         );
         MSIX_VIRTIO_ENTRY
+    }
+}
+
+/// The virtio functions of segment 0 and the device class each carries,
+/// in bus order, as one walk of the bus found them.
+pub(crate) struct VirtioFunctions {
+    root: PciRoot,
+    functions: Vec<(PciAddress, DeviceType)>,
+}
+
+impl VirtioFunctions {
+    /// Locates the first modern virtio function of the requested type.
+    pub(crate) fn find_virtio_function(&self, device_type: DeviceType) -> Option<PciAddress> {
+        self.find_virtio_functions(device_type).next()
+    }
+
+    /// Every modern virtio function of the requested type, in bus order.
+    ///
+    /// Device classes the platform exposes more than once — block
+    /// devices, where the boot image and the kernel's own disk sit on
+    /// the same bus — are brought up from this rather than from the
+    /// first match.
+    pub(crate) fn find_virtio_functions(
+        &self,
+        device_type: DeviceType,
+    ) -> impl Iterator<Item = PciAddress> + '_ {
+        self.functions
+            .iter()
+            .filter(move |(_, function_type)| *function_type == device_type)
+            .map(|(address, _)| *address)
+            .filter(move |address| {
+                // MSI-X is the only interrupt path this backend programs:
+                // every driver it installs is bound to a message, and there
+                // is no INTx fallback to fall back to. A function without
+                // one is a function the kernel cannot drive, which is the
+                // same situation as the device not being there — and the
+                // callers all handle that. Panicking the machine over an
+                // optional device would not.
+                if self.root.msix_table_size(*address).is_none() {
+                    tracing::warn!(
+                        function = %address,
+                        ?device_type,
+                        "ignoring a virtio function that exposes no MSI-X capability"
+                    );
+                    return false;
+                }
+                true
+            })
     }
 }
 
