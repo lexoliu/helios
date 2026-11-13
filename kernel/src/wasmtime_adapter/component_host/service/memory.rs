@@ -49,6 +49,43 @@ pub(super) enum GuestAccessError {
     Swap(#[from] SwapFaultError),
 }
 
+/// What ends an async host call before it reaches its own result: the
+/// errno it answers the guest with, or the loss of a guest page that traps
+/// the guest.
+///
+/// A guest address out of bounds is the errno `EFAULT`, which is what
+/// converting a [`GuestAccessError`] gives, so a body reaches guest memory
+/// with `?` and answers every other failure with the errno it computed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum P1Stop {
+    Errno(i32),
+    Trap(SwapFaultError),
+}
+
+impl From<i32> for P1Stop {
+    fn from(errno: i32) -> Self {
+        Self::Errno(errno)
+    }
+}
+
+impl From<GuestAccessError> for P1Stop {
+    fn from(error: GuestAccessError) -> Self {
+        match error {
+            GuestAccessError::OutOfBounds => Self::Errno(p1::errno::FAULT),
+            GuestAccessError::Swap(error) => Self::Trap(error),
+        }
+    }
+}
+
+/// The result an async host function hands the runtime for its body's
+/// answer: the errno, or a trap for the guest whose page was lost.
+pub(super) fn p1_reply(answer: Result<i32, P1Stop>) -> wasmtime::Result<i32> {
+    match answer {
+        Ok(errno) | Err(P1Stop::Errno(errno)) => Ok(errno),
+        Err(P1Stop::Trap(error)) => Err(wasmtime::Error::new(error)),
+    }
+}
+
 impl Preview1AsyncMemory {
     pub(super) fn new(memory: Preview1Memory) -> Self {
         Self {
@@ -57,16 +94,128 @@ impl Preview1AsyncMemory {
         }
     }
 
+    /// The length of the guest's linear memory.
+    pub(super) fn len(&self) -> usize {
+        self.memory.len
+    }
+
+    /// The `N` guest bytes at `ptr`.
+    pub(super) async fn read_array<const N: usize>(
+        &self,
+        ptr: GuestAddress,
+    ) -> Result<[u8; N], GuestAccessError> {
+        self.read(ptr, N, |bytes| {
+            let mut array = [0_u8; N];
+            array.copy_from_slice(bytes);
+            array
+        })
+        .await
+    }
+
+    pub(super) async fn read_u8(&self, ptr: GuestAddress) -> Result<u8, GuestAccessError> {
+        Ok(self.read_array::<1>(ptr).await?[0])
+    }
+
+    pub(super) async fn read_u16(&self, ptr: GuestAddress) -> Result<u16, GuestAccessError> {
+        self.read_array(ptr).await.map(u16::from_le_bytes)
+    }
+
+    pub(super) async fn read_u32(&self, ptr: GuestAddress) -> Result<u32, GuestAccessError> {
+        self.read_array(ptr).await.map(u32::from_le_bytes)
+    }
+
+    pub(super) async fn read_u64(&self, ptr: GuestAddress) -> Result<u64, GuestAccessError> {
+        self.read_array(ptr).await.map(u64::from_le_bytes)
+    }
+
+    /// An owned copy of the `len` guest bytes at `ptr`. The range is
+    /// checked against linear memory before anything is allocated for it.
+    pub(super) async fn read_bytes(
+        &self,
+        ptr: GuestAddress,
+        len: usize,
+    ) -> Result<Vec<u8>, GuestAccessError> {
+        self.read(ptr, len, <[u8]>::to_vec).await
+    }
+
+    /// The UTF-8 string of `len` bytes at `ptr`. A range outside linear
+    /// memory and bytes that are not UTF-8 are both `EFAULT`.
+    pub(super) async fn read_path(&self, ptr: GuestAddress, len: u32) -> Result<String, P1Stop> {
+        let bytes = self.read_bytes(ptr, len as usize).await?;
+        String::from_utf8(bytes).map_err(|_| P1Stop::Errno(p1::errno::FAULT))
+    }
+
+    /// Copies `bytes` to the guest at `ptr`.
+    pub(super) async fn write_bytes(
+        &self,
+        ptr: GuestAddress,
+        bytes: &[u8],
+    ) -> Result<(), GuestAccessError> {
+        self.write(ptr, bytes.len(), |destination| {
+            destination.copy_from_slice(bytes)
+        })
+        .await
+    }
+
+    pub(super) async fn write_u8(
+        &self,
+        ptr: GuestAddress,
+        value: u8,
+    ) -> Result<(), GuestAccessError> {
+        self.write_bytes(ptr, &[value]).await
+    }
+
+    pub(super) async fn write_u16(
+        &self,
+        ptr: GuestAddress,
+        value: u16,
+    ) -> Result<(), GuestAccessError> {
+        self.write_bytes(ptr, &value.to_le_bytes()).await
+    }
+
+    pub(super) async fn write_u32(
+        &self,
+        ptr: GuestAddress,
+        value: u32,
+    ) -> Result<(), GuestAccessError> {
+        self.write_bytes(ptr, &value.to_le_bytes()).await
+    }
+
+    pub(super) async fn write_u64(
+        &self,
+        ptr: GuestAddress,
+        value: u64,
+    ) -> Result<(), GuestAccessError> {
+        self.write_bytes(ptr, &value.to_le_bytes()).await
+    }
+
+    /// Scatters `bytes` over the buffers `iovs` name, in order, each as
+    /// far as `bytes` reaches, and writes how many went to `written_out`.
+    /// A buffer is brought in before it is written, so a swapped-out one
+    /// waits for its page; the buffers already written stand if a later
+    /// one is out of bounds.
+    pub(super) async fn write_iovs_from_bytes(
+        &self,
+        iovs: &[(u32, u32)],
+        bytes: &[u8],
+        written_out: GuestAddress,
+    ) -> Result<(), P1Stop> {
+        let mut copied = 0usize;
+        for &(ptr, len) in iovs {
+            if copied >= bytes.len() {
+                break;
+            }
+            let len = (len as usize).min(bytes.len() - copied);
+            self.write_bytes(GuestAddress::wasm32(ptr), &bytes[copied..copied + len])
+                .await?;
+            copied += len;
+        }
+        let copied = u32::try_from(copied).map_err(|_| P1Stop::Errno(p1::errno::OVERFLOW))?;
+        Ok(self.write_u32(written_out, copied).await?)
+    }
+
     /// Runs `access` over the `len` guest bytes at `ptr` once they are
     /// all present, in the poll that found them so.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the read half of the accessor; its first callers are the async host \
-                      calls of preview1 and WASIX net and proc, which still hold the raw view"
-        )
-    )]
     pub(super) async fn read<R>(
         &self,
         ptr: GuestAddress,
@@ -157,17 +306,6 @@ const P1_IOVEC_BYTES: usize = 8;
 /// (`UIO_MAXIOV`) and wasi-libc's `limits.h` define it. A larger count is
 /// `EINVAL`, as `readv`/`writev` answer.
 pub(super) const P1_IOV_MAX: usize = 1024;
-
-/// The `N` guest bytes at `ptr`, or `EFAULT` when they are not inside
-/// `memory`: a fixed-size read that needs no caller and allocates nothing.
-pub(super) fn p1_read_array<const N: usize>(
-    memory: Preview1Memory,
-    ptr: GuestAddress,
-) -> Result<[u8; N], i32> {
-    let mut bytes = [0_u8; N];
-    preview1_read_memory_into(memory, ptr, &mut bytes).map_err(|_| p1::errno::FAULT)?;
-    Ok(bytes)
-}
 
 /// How many random bytes one pass of [`p1_fill_random`] draws into its
 /// stack buffer: one page of the kernel stack.
@@ -432,55 +570,68 @@ pub(super) fn preview1_write_u32(memory: Preview1Memory, ptr: GuestAddress, valu
 // copy. Keep length accounting in the guest-table decode pass so hot read and
 // recv syscalls do not rescan the same SmallVec before touching the real I/O
 // path.
-pub(super) fn p1_read_iovs_with_byte_len(
-    memory: Preview1Memory,
+pub(super) async fn p1_read_iovs_with_byte_len(
+    memory: &Preview1AsyncMemory,
     iovs: GuestAddress,
     iovs_len: u32,
-) -> Result<Preview1IovLayout, i32> {
+) -> Result<Preview1IovLayout, P1Stop> {
     // An iovec count above `IOV_MAX` is refused before the array is read,
     // and the array and every buffer it names must lie in linear memory
     // before anything is collected for them.
     if iovs_len as usize > P1_IOV_MAX {
-        return Err(p1::errno::INVAL);
+        return Err(P1Stop::Errno(p1::errno::INVAL));
     }
-    p1_checked_guest_array(memory.len, iovs, iovs_len as usize, P1_IOVEC_BYTES)?;
-    let read_u32 = |ptr: GuestAddress| p1_read_array(memory, ptr).map(u32::from_le_bytes);
-    let mut result = Preview1Iovs::new();
-    let mut byte_len = 0_u32;
-    for index in 0..iovs_len {
-        let iov = iovs.offset(u64::from(index) * P1_IOVEC_BYTES as u64);
-        let ptr = read_u32(iov)?;
-        let len = read_u32(iov.offset(4))?;
-        p1_checked_guest_array(memory.len, GuestAddress::wasm32(ptr), len as usize, 1)?;
-        // Iovecs may overlap, so the sum is not bounded by memory; it is
-        // bounded by the `size` result type, as POSIX `readv`/`writev`
-        // refuse a sum that overflows theirs.
-        byte_len = byte_len.checked_add(len).ok_or(p1::errno::INVAL)?;
-        result.push((ptr, len));
-    }
-    Ok(Preview1IovLayout {
-        iovs: result,
-        byte_len,
-    })
+    let memory_len = memory.len();
+    let layout = memory
+        .read(iovs, iovs_len as usize * P1_IOVEC_BYTES, |table| {
+            let mut result = Preview1Iovs::new();
+            let mut byte_len = 0_u32;
+            for entry in table.as_chunks::<P1_IOVEC_BYTES>().0 {
+                let (ptr, len) = entry.split_at(4);
+                let ptr = u32::from_le_bytes(ptr.try_into().expect("an iovec holds a u32 address"));
+                let len = u32::from_le_bytes(len.try_into().expect("an iovec holds a u32 length"));
+                p1_checked_guest_array(memory_len, GuestAddress::wasm32(ptr), len as usize, 1)?;
+                // Iovecs may overlap, so the sum is not bounded by memory; it is
+                // bounded by the `size` result type, as POSIX `readv`/`writev`
+                // refuse a sum that overflows theirs.
+                byte_len = byte_len.checked_add(len).ok_or(p1::errno::INVAL)?;
+                result.push((ptr, len));
+            }
+            Ok::<_, i32>(Preview1IovLayout {
+                iovs: result,
+                byte_len,
+            })
+        })
+        .await?;
+    Ok(layout?)
 }
 
 /// The guest bytes `layout`'s iovecs name, copied out one bounded chunk at
 /// a time ([`P1_IO_CHUNK_BYTES`]) so a gathered write holds kernel memory
 /// for a chunk, never for the whole transfer.
+///
+/// Each span of a chunk is read through the accessor, so a span whose page
+/// is swapped out waits for it, and nothing but the position of the next
+/// byte is kept across that wait: a chunk that stops part-way leaves the
+/// gather at the last span it finished.
 pub(super) struct Preview1Gather {
-    memory: Preview1Memory,
-    ranges: Preview1IovRanges,
-    /// The range the next byte comes from, and how far into it.
+    iovs: Preview1Iovs,
+    /// The iovec the next byte comes from, and how far into it.
     range: usize,
     offset: usize,
     remaining: usize,
 }
 
 impl Preview1Gather {
-    pub(super) fn new(memory: Preview1Memory, layout: &Preview1IovLayout) -> Result<Self, i32> {
+    pub(super) fn new(
+        memory: &Preview1AsyncMemory,
+        layout: &Preview1IovLayout,
+    ) -> Result<Self, i32> {
+        for &(ptr, len) in &layout.iovs {
+            p1_checked_guest_array(memory.len(), GuestAddress::wasm32(ptr), len as usize, 1)?;
+        }
         Ok(Self {
-            memory,
-            ranges: p1_iovs_memory_ranges(memory, &layout.iovs)?,
+            iovs: layout.iovs.clone(),
             range: 0,
             offset: 0,
             remaining: layout.byte_len as usize,
@@ -499,59 +650,64 @@ impl Preview1Gather {
 
     /// Copies the next `destination.len()` bytes, which is at most
     /// [`Self::remaining`], into `destination`.
-    pub(super) fn fill(&mut self, destination: &mut [u8]) {
+    pub(super) async fn fill(
+        &mut self,
+        memory: &Preview1AsyncMemory,
+        destination: &mut [u8],
+    ) -> Result<(), GuestAccessError> {
         debug_assert!(
             destination.len() <= self.remaining,
             "a gathered chunk is no longer than what is left"
         );
-        let taken = destination.len();
         let mut rest = destination;
         while !rest.is_empty() {
-            let (start, len) = self.ranges[self.range];
-            let available = len - self.offset;
+            let (ptr, len) = self.iovs[self.range];
+            let available = len as usize - self.offset;
             if available == 0 {
                 self.range += 1;
                 self.offset = 0;
                 continue;
             }
             let take = available.min(rest.len());
-            // SAFETY: each range was checked against the guest memory's
-            // length (`p1_iovs_memory_ranges`), and guest memory neither
-            // moves nor shrinks during the host call that holds `memory`.
-            let source = unsafe {
-                core::slice::from_raw_parts(
-                    (self.memory.base as *const u8).add(start + self.offset),
-                    take,
-                )
-            };
             let (head, tail) = rest.split_at_mut(take);
-            head.copy_from_slice(source);
+            let source = GuestAddress::wasm32(ptr).offset(self.offset as u64);
+            memory
+                .read(source, take, |bytes| head.copy_from_slice(bytes))
+                .await?;
             rest = tail;
             self.offset += take;
+            self.remaining -= take;
         }
-        self.remaining -= taken;
+        Ok(())
     }
 
     /// The next chunk, or `None` once every byte was taken.
-    pub(super) fn next_chunk(&mut self) -> Option<Vec<u8>> {
+    pub(super) async fn next_chunk(
+        &mut self,
+        memory: &Preview1AsyncMemory,
+    ) -> Result<Option<Vec<u8>>, GuestAccessError> {
         if self.remaining == 0 {
-            return None;
+            return Ok(None);
         }
         let mut chunk = vec![0; self.next_len()];
-        self.fill(&mut chunk);
-        Some(chunk)
+        self.fill(memory, &mut chunk).await?;
+        Ok(Some(chunk))
     }
 
     /// Everything still held, in one piece, for a datagram that can carry
     /// at most `max` bytes. A datagram goes out whole, so a payload the
     /// protocol cannot carry is `EMSGSIZE` before any kernel memory is
     /// held for it.
-    pub(super) fn datagram(&mut self, max: usize) -> Result<Vec<u8>, i32> {
+    pub(super) async fn datagram(
+        &mut self,
+        memory: &Preview1AsyncMemory,
+        max: usize,
+    ) -> Result<Vec<u8>, P1Stop> {
         if self.remaining > max {
-            return Err(p1::errno::MSGSIZE);
+            return Err(P1Stop::Errno(p1::errno::MSGSIZE));
         }
         let mut payload = vec![0; self.remaining];
-        self.fill(&mut payload);
+        self.fill(memory, &mut payload).await?;
         Ok(payload)
     }
 }
@@ -561,22 +717,23 @@ impl Preview1Gather {
 /// once. A refusal after some chunks went leaves them sent: the guest meets
 /// the refusal on its next call.
 pub(super) async fn p1_send_gathered<SendChunk, ChunkSent>(
+    memory: &Preview1AsyncMemory,
     gather: &mut Preview1Gather,
     mut send: SendChunk,
-) -> Result<u32, i32>
+) -> Result<u32, P1Stop>
 where
     SendChunk: FnMut(Vec<u8>) -> ChunkSent,
     ChunkSent: Future<Output = Result<(), i32>>,
 {
     let mut sent = 0_u32;
     loop {
-        let chunk = gather.next_chunk().unwrap_or_default();
+        let chunk = gather.next_chunk(memory).await?.unwrap_or_default();
         let len = chunk.len();
         match send(chunk).await {
             // The iovecs' sum fits a `u32`, so no count of it overflows.
             Ok(()) => sent += len as u32,
             Err(_) if sent > 0 => break,
-            Err(errno) => return Err(errno),
+            Err(errno) => return Err(P1Stop::Errno(errno)),
         }
         if gather.remaining() == 0 {
             break;
@@ -590,15 +747,19 @@ pub(super) trait Preview1ChunkedFile {
     /// Why the file refused a chunk.
     type Refusal;
 
-    /// Takes the next `len` bytes out of `gather`, lands them at
-    /// `position`, and answers the end of the file they reached.
+    /// Lands `chunk` at `position`, and answers the end of the file it
+    /// reached.
     fn land(
         &mut self,
-        gather: &mut Preview1Gather,
+        chunk: &[u8],
         position: WritePosition,
-        len: usize,
     ) -> impl Future<Output = Result<u64, Self::Refusal>> + Send;
 }
+
+/// What a gathered write to a file came to: the end of the file its last
+/// chunk reached and how many bytes landed, or why the file refused the
+/// first chunk.
+pub(super) type Preview1Landed<Refusal> = Result<(u64, u32), Refusal>;
 
 /// Lands everything `gather` still holds in `file`, one chunk at a time
 /// from `position`, and reports the end of the file the last chunk reached
@@ -609,42 +770,34 @@ pub(super) trait Preview1ChunkedFile {
 /// so it never lands on what another writer appended in between; a
 /// positioned write continues where its last chunk ended. A refusal after
 /// some chunks landed is a short write: the guest meets the refusal on its
-/// next call.
+/// next call. A chunk is read out of guest memory before it is landed, so a
+/// page that has to come back from swap holds up the write and never the
+/// file.
 pub(super) async fn p1_write_gathered<File: Preview1ChunkedFile + Send>(
+    memory: &Preview1AsyncMemory,
     gather: &mut Preview1Gather,
     position: WritePosition,
     file: &mut File,
-) -> Result<(u64, u32), File::Refusal> {
-    let len = gather.next_len();
-    let mut end = file.land(gather, position, len).await?;
+) -> Result<Preview1Landed<File::Refusal>, GuestAccessError> {
+    let chunk = gather.next_chunk(memory).await?.unwrap_or_default();
+    let mut end = match file.land(&chunk, position).await {
+        Ok(end) => end,
+        Err(refusal) => return Ok(Err(refusal)),
+    };
     // The iovecs' sum fits a `u32`, so no count of it overflows.
-    let mut written = len as u32;
-    while gather.remaining() > 0 {
+    let mut written = chunk.len() as u32;
+    while let Some(chunk) = gather.next_chunk(memory).await? {
         let next = match position {
             WritePosition::End => WritePosition::End,
             WritePosition::At(_) => WritePosition::At(end),
         };
-        let len = gather.next_len();
-        let Ok(chunk_end) = file.land(gather, next, len).await else {
+        let Ok(chunk_end) = file.land(&chunk, next).await else {
             break;
         };
         end = chunk_end;
-        written += len as u32;
+        written += chunk.len() as u32;
     }
-    Ok((end, written))
-}
-
-pub(super) fn p1_iovs_memory_ranges(
-    memory: Preview1Memory,
-    iovs: &[(u32, u32)],
-) -> Result<Preview1IovRanges, i32> {
-    let mut ranges = Preview1IovRanges::with_capacity(iovs.len());
-    for (ptr, len) in iovs {
-        let len = usize::try_from(*len).map_err(|_| p1::errno::OVERFLOW)?;
-        let start = p1_checked_guest_array(memory.len, GuestAddress::wasm32(*ptr), len, 1)?;
-        ranges.push((start, len));
-    }
-    Ok(ranges)
+    Ok(Ok((end, written)))
 }
 
 pub(super) fn p1_read_memory<T>(
@@ -694,16 +847,6 @@ pub(super) fn p1_try_read_u8<T>(
     Ok(bytes[0])
 }
 
-pub(super) fn p1_try_read_u16<T>(
-    caller: &mut Caller<'_, T>,
-    memory: Preview1Memory,
-    ptr: GuestAddress,
-) -> Result<u16, ProgramExecError> {
-    let mut bytes = [0_u8; 2];
-    p1_read_memory_into(caller, memory, ptr, &mut bytes)?;
-    Ok(u16::from_le_bytes(bytes))
-}
-
 pub(super) fn p1_try_read_u64<T>(
     caller: &mut Caller<'_, T>,
     memory: Preview1Memory,
@@ -748,37 +891,6 @@ pub(super) fn p1_write_u64<T>(
     value: u64,
 ) -> i32 {
     p1_write_memory(caller, memory, ptr, &value.to_le_bytes())
-}
-
-pub(super) fn p1_write_iovs_from_bytes<T>(
-    caller: &mut Caller<'_, T>,
-    memory: Preview1Memory,
-    iovs: Preview1Iovs,
-    bytes: &[u8],
-    written_out: GuestAddress,
-) -> i32 {
-    let mut copied = 0usize;
-    for (ptr, len) in iovs {
-        if copied >= bytes.len() {
-            break;
-        }
-        let len = (len as usize).min(bytes.len() - copied);
-        let status = p1_write_memory(
-            caller,
-            memory,
-            GuestAddress::wasm32(ptr),
-            &bytes[copied..copied + len],
-        );
-        if status != p1::errno::SUCCESS {
-            return status;
-        }
-        copied += len;
-    }
-    let copied = match u32::try_from(copied) {
-        Ok(copied) => copied,
-        Err(_) => return p1::errno::OVERFLOW,
-    };
-    p1_write_u32(caller, memory, written_out, copied)
 }
 
 #[cfg(test)]
@@ -841,6 +953,121 @@ mod tests {
         );
         assert!(!ran, "an out-of-bounds access never reaches its closure");
         assert_eq!(backing, vec![0_u8; 64]);
+    }
+
+    /// Every width reads little-endian, as the guest stores it, and a
+    /// write of the same width reads back as what was written.
+    #[test]
+    fn integers_round_trip_little_endian_at_every_width() {
+        let mut backing = vec![0_u8; 64];
+        let memory = memory_over(&mut backing);
+        run(async {
+            memory.write_u8(GuestAddress::wasm32(1), 0xa5).await?;
+            memory.write_u16(GuestAddress::wasm32(2), 0x1234).await?;
+            memory
+                .write_u32(GuestAddress::wasm32(8), 0xdead_beef)
+                .await?;
+            memory
+                .write_u64(GuestAddress::wasm32(16), 0x0102_0304_0506_0708)
+                .await?;
+            assert_eq!(memory.read_u8(GuestAddress::wasm32(1)).await?, 0xa5);
+            assert_eq!(memory.read_u16(GuestAddress::wasm32(2)).await?, 0x1234);
+            assert_eq!(memory.read_u32(GuestAddress::wasm32(8)).await?, 0xdead_beef);
+            assert_eq!(
+                memory.read_u64(GuestAddress::wasm32(16)).await?,
+                0x0102_0304_0506_0708
+            );
+            assert_eq!(
+                memory.read_array::<2>(GuestAddress::wasm32(2)).await?,
+                [0x34, 0x12]
+            );
+            Ok::<_, GuestAccessError>(())
+        })
+        .expect("in bounds");
+        assert_eq!(backing[2..4], [0x34, 0x12]);
+        assert_eq!(backing[8..12], [0xef, 0xbe, 0xad, 0xde]);
+    }
+
+    /// A fixed-width access that runs past the end is refused whole.
+    #[test]
+    fn a_wide_access_straddling_the_end_is_refused() {
+        let mut backing = vec![0_u8; 8];
+        let memory = memory_over(&mut backing);
+        assert_eq!(
+            run(memory.write_u64(GuestAddress::wasm32(4), u64::MAX)),
+            Err(GuestAccessError::OutOfBounds)
+        );
+        assert_eq!(
+            run(memory.read_u32(GuestAddress::wasm32(6))),
+            Err(GuestAccessError::OutOfBounds)
+        );
+        assert_eq!(backing, vec![0_u8; 8], "nothing of a refused write landed");
+    }
+
+    /// A path is read as UTF-8 whatever script it is in, and bytes that
+    /// are not UTF-8 are `EFAULT`, as is a range outside memory.
+    #[test]
+    fn a_path_reads_as_utf8_in_chinese_japanese_and_korean() {
+        for path in ["/数据/文件.txt", "/データ/ファイル.txt", "/데이터/파일.txt"] {
+            let mut backing = vec![0_u8; 128];
+            backing[10..10 + path.len()].copy_from_slice(path.as_bytes());
+            let memory = memory_over(&mut backing);
+            assert_eq!(
+                run(memory.read_path(GuestAddress::wasm32(10), path.len() as u32)),
+                Ok(path.to_owned())
+            );
+        }
+        let mut backing = vec![0xff_u8; 16];
+        let memory = memory_over(&mut backing);
+        assert_eq!(
+            run(memory.read_path(GuestAddress::wasm32(0), 4)),
+            Err(P1Stop::Errno(p1::errno::FAULT))
+        );
+        assert_eq!(
+            run(memory.read_path(GuestAddress::wasm32(8), 16)),
+            Err(P1Stop::Errno(p1::errno::FAULT))
+        );
+    }
+
+    /// Bytes scatter over the buffers in order, each as far as they reach,
+    /// and the count that went is written last.
+    #[test]
+    fn bytes_scatter_over_the_buffers_in_order() {
+        let mut backing = vec![0_u8; 64];
+        let memory = memory_over(&mut backing);
+        let payload = "你好こんにちは안녕".as_bytes();
+        run(memory.write_iovs_from_bytes(
+            &[(0, 4), (10, 5), (20, 100)],
+            payload,
+            GuestAddress::wasm32(60),
+        ))
+        .expect("every buffer is in bounds");
+        assert_eq!(backing[0..4], payload[0..4]);
+        assert_eq!(backing[10..15], payload[4..9]);
+        assert_eq!(backing[20..20 + payload.len() - 9], payload[9..]);
+        assert_eq!(
+            backing[60..64],
+            (payload.len() as u32).to_le_bytes(),
+            "the count of bytes that went"
+        );
+    }
+
+    /// A buffer out of bounds stops the scatter with `EFAULT` and leaves
+    /// the buffers before it written.
+    #[test]
+    fn a_scatter_stops_at_a_buffer_out_of_bounds() {
+        let mut backing = vec![0_u8; 32];
+        let memory = memory_over(&mut backing);
+        assert_eq!(
+            run(memory.write_iovs_from_bytes(
+                &[(0, 4), (30, 8)],
+                &[7; 12],
+                GuestAddress::wasm32(16)
+            )),
+            Err(P1Stop::Errno(p1::errno::FAULT))
+        );
+        assert_eq!(backing[0..4], [7; 4]);
+        assert_eq!(backing[16..20], [0; 4], "no count was reported");
     }
 
     #[test]
