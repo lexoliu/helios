@@ -99,6 +99,11 @@ pub(crate) enum VmError {
 pub(crate) enum VmConfigError {
     #[error("--release and --kernel-debug cannot be used together")]
     ReleaseWithKernelDebug,
+    #[error(
+        "--max-processors {max_processors} is below --smp {smp}: QEMU cannot bring online \
+         more processors than it can hold"
+    )]
+    MaxProcessorsBelowSmp { smp: u16, max_processors: u16 },
     #[error("renderer_hostmem sizes a renderer's aperture, and the VM config names no renderer")]
     RendererHostmemWithoutRenderer,
     #[error(
@@ -1543,6 +1548,8 @@ pub(crate) struct VmConfigFile {
     #[serde(default)]
     pub(crate) smp: Option<u16>,
     #[serde(default)]
+    pub(crate) max_processors: Option<u16>,
+    #[serde(default)]
     pub(crate) memory: Option<String>,
     #[serde(default)]
     pub(crate) guest_ram: Option<VmGuestRam>,
@@ -1704,6 +1711,10 @@ pub(crate) struct VmCommand {
 
     #[arg(long)]
     smp: Option<u16>,
+
+    /// Processors QEMU can bring online beyond `--smp` (`-smp N,maxcpus=M`).
+    #[arg(long)]
+    max_processors: Option<u16>,
 
     #[arg(long)]
     memory: Option<String>,
@@ -2208,6 +2219,7 @@ struct ResolvedVmCommand {
     serial_pty: bool,
     no_build: bool,
     smp: u16,
+    max_processors: Option<u16>,
     memory: String,
     guest_ram: ResolvedGuestRam,
     bios: Option<String>,
@@ -2663,6 +2675,15 @@ fn resolve_bootfs_path(
     }
 }
 
+/// The value of QEMU's `-smp`: `maxcpus` is named only when the VM holds
+/// processors beyond the ones online at boot.
+fn smp_argument(smp: u16, max_processors: Option<u16>) -> String {
+    match max_processors {
+        Some(max_processors) => format!("{smp},maxcpus={max_processors}"),
+        None => smp.to_string(),
+    }
+}
+
 fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
     let file = load_config_file(command.config.as_deref())?;
     let session_command: Option<ResolvedVmSessionCommand> = command.command.take().map(Into::into);
@@ -2677,6 +2698,15 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
     let kernel = resolve_kernel_path(command.kernel, file.kernel, &build)?;
     let bootfs = resolve_bootfs_path(command.bootfs, file.bootfs, &build)?;
     let smp = command.smp.or(file.smp).unwrap_or(profile.default_smp);
+    let max_processors = command.max_processors.or(file.max_processors);
+    if let Some(max_processors) = max_processors
+        && max_processors < smp
+    {
+        return Err(VmConfigError::MaxProcessorsBelowSmp {
+            smp,
+            max_processors,
+        });
+    }
     let memory = command
         .memory
         .or(file.memory)
@@ -2831,6 +2861,7 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
         serial_pty: command.serial_pty,
         no_build: command.no_build,
         smp,
+        max_processors,
         memory,
         guest_ram,
         bios,
@@ -5364,7 +5395,8 @@ impl VmRuntime {
         if let Some(backend) = guest_ram_backend(command) {
             qemu.arg("-object").arg(backend.to_string());
         }
-        qemu.arg("-smp").arg(command.smp.to_string());
+        qemu.arg("-smp")
+            .arg(smp_argument(command.smp, command.max_processors));
         if command.serial_stdio {
             qemu.arg("-serial").arg("stdio");
         } else if let Some(serial_pty) = &serial_pty {
@@ -8181,6 +8213,7 @@ mod tests {
             serial_pty: false,
             no_build: true,
             smp: None,
+            max_processors: None,
             memory: None,
             guest_ram: None,
             bios: None,
@@ -8249,6 +8282,7 @@ mod tests {
             serial_pty: false,
             no_build: true,
             smp: None,
+            max_processors: None,
             memory: None,
             guest_ram: None,
             bios: None,
@@ -8581,6 +8615,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn max_processors_adds_maxcpus_to_smp() {
+        let tempdir =
+            tempfile::tempdir().expect("temporary directory for VM config resolution must exist");
+        let config = tempdir.path().join("missing-vm.json");
+        let rendered = |smp, max_processors| {
+            let resolved = resolve(VmCommand {
+                smp,
+                max_processors,
+                config: Some(config.clone()),
+                ..minimal_command()
+            })
+            .expect("a maximum at or above --smp resolves");
+            smp_argument(resolved.smp, resolved.max_processors)
+        };
+        assert_eq!(rendered(Some(2), Some(4)), "2,maxcpus=4");
+        assert_eq!(rendered(Some(2), None), "2");
+
+        let error = resolve(VmCommand {
+            smp: Some(4),
+            max_processors: Some(2),
+            config: Some(config.clone()),
+            ..minimal_command()
+        })
+        .expect_err("a maximum below --smp is refused");
+        assert!(
+            matches!(
+                error,
+                VmConfigError::MaxProcessorsBelowSmp {
+                    smp: 4,
+                    max_processors: 2
+                }
+            ),
+            "{error}"
+        );
+
+        let file = tempdir.path().join("vm.json");
+        std::fs::write(&file, r#"{ "smp": 2, "max_processors": 4 }"#)
+            .expect("the VM config must be writable");
+        let from_file = resolve(VmCommand {
+            config: Some(file),
+            ..minimal_command()
+        })
+        .expect("the profile file sets the maximum");
+        assert_eq!(
+            smp_argument(from_file.smp, from_file.max_processors),
+            "2,maxcpus=4"
+        );
+    }
+
     /// aarch64 puts its TPM on the platform bus in both firmware
     /// descriptions; riscv64 takes none, and says so before anything is
     /// built.
@@ -8685,6 +8769,7 @@ mod tests {
             serial_pty: false,
             no_build: true,
             smp: None,
+            max_processors: None,
             memory: None,
             guest_ram: None,
             bios: None,
@@ -8880,6 +8965,7 @@ mod tests {
             serial_pty: false,
             no_build: true,
             smp: profile.default_smp,
+            max_processors: None,
             memory: profile.default_memory.to_owned(),
             guest_ram: ResolvedGuestRam::Lazy,
             bios: profile.default_bios.map(str::to_owned),
@@ -9097,6 +9183,7 @@ mod tests {
             serial_pty: false,
             no_build: true,
             smp: profile.default_smp,
+            max_processors: None,
             memory: profile.default_memory.to_owned(),
             guest_ram: ResolvedGuestRam::Lazy,
             bios: profile.default_bios.map(str::to_owned),

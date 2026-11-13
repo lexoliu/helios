@@ -1,6 +1,6 @@
 extern crate alloc;
 
-use acpi::platform::{AcpiPlatform, ProcessorState};
+use acpi::sdt::madt::{Madt, MadtEntry};
 use acpi::{AcpiTables, Handler, PciAddress, RawPhysicalMapping};
 use alloc::alloc::{Layout, alloc_zeroed};
 use alloc::boxed::Box;
@@ -327,6 +327,10 @@ pub(crate) struct X86PlatformState {
 
 struct ProcessorSlot {
     apic_id: u32,
+    /// Whether the MADT listed this processor as enabled when the machine
+    /// booted. A slot that is not present is possible and online-capable:
+    /// boot builds it and never starts it.
+    present_at_boot: bool,
     runtime: ProcessorRuntime,
     stack_top: usize,
 }
@@ -341,6 +345,49 @@ pub(crate) struct PhysicalOffsetAcpiHandler {
     pub(crate) physical_memory_offset: usize,
     pub(crate) tsc_base: u64,
     pub(crate) timebase: Timebase,
+}
+
+/// A processor the MADT describes that the machine can run: a Local APIC
+/// or x2APIC entry that is enabled, or that firmware may enable later.
+pub(crate) struct PossibleProcessor {
+    pub(crate) apic_id: u32,
+    /// The entry's enabled flag: the processor exists now. Without it the
+    /// processor is possible but not present until firmware hot-adds it.
+    pub(crate) present: bool,
+}
+
+/// The MADT's possible processors in table order, the first being the
+/// bootstrap processor.
+///
+/// An enabled entry is present. Whether a disabled entry is a processor
+/// firmware may hot-add depends on the table's revision: ACPI 6.3
+/// (MADT revision 5) added the online-capable flag and made a disabled
+/// entry without it unusable, while earlier revisions list every possible
+/// processor as a disabled entry with no flag at all — QEMU's MADT is
+/// revision 3 and marks each processor beyond `-smp` that way
+/// (`hw/i386/acpi-common.c`, `pc_madt_cpu_entry`).
+///
+/// Iterates the table without allocating, so it can size the bootstrap
+/// allocator before the heap exists.
+pub(crate) fn possible_processors(
+    madt: core::pin::Pin<&Madt>,
+) -> impl Iterator<Item = PossibleProcessor> + '_ {
+    const LAPIC_ENABLED: u32 = 1 << 0;
+    const LAPIC_ONLINE_CAPABLE: u32 = 1 << 1;
+    // ACPI 6.3, 5.2.12.2: the revision that defines the online-capable flag.
+    const ONLINE_CAPABLE_REVISION: u8 = 5;
+
+    let online_capable_defined = madt.header.revision >= ONLINE_CAPABLE_REVISION;
+    madt.entries().filter_map(move |entry| {
+        let (apic_id, flags) = match entry {
+            MadtEntry::LocalApic(apic) => (u32::from(apic.apic_id), apic.flags),
+            MadtEntry::LocalX2Apic(apic) => (apic.x2apic_id, apic.flags),
+            _ => return None,
+        };
+        let present = flags & LAPIC_ENABLED != 0;
+        let possible = present || !online_capable_defined || flags & LAPIC_ONLINE_CAPABLE != 0;
+        possible.then_some(PossibleProcessor { apic_id, present })
+    })
 }
 
 pub(crate) fn build_boot_context(
@@ -365,17 +412,24 @@ pub(crate) fn build_boot_context(
     // encoding depends on which local-APIC mode the machine runs.
     let apic_mode = LocalApicMode::probe();
     let io_apic = crate::ioapic::discover(&tables, physical_memory_offset, apic_mode);
-    let platform = AcpiPlatform::new(tables, handler.clone())
-        .unwrap_or_else(|error| panic!("failed to construct ACPI platform info: {error:?}"));
-    let processor_info = platform
-        .processor_info
-        .as_ref()
-        .unwrap_or_else(|| panic!("ACPI platform info did not expose processor topology"));
+    let madt = tables
+        .find_table::<Madt>()
+        .unwrap_or_else(|| panic!("ACPI tables did not expose an MADT"));
+    let possible_count = possible_processors(madt.get()).count();
+    let mut possible = possible_processors(madt.get());
+    let boot_processor = possible
+        .next()
+        .unwrap_or_else(|| panic!("MADT did not list any possible processors"));
+    assert!(
+        boot_processor.present,
+        "MADT lists the bootstrap processor apic_id={} as not enabled",
+        boot_processor.apic_id
+    );
 
-    let mut processors =
-        alloc::vec::Vec::with_capacity(1 + processor_info.application_processors.len());
+    let mut processors = alloc::vec::Vec::with_capacity(possible_count);
     processors.push(ProcessorSlot {
-        apic_id: processor_info.boot_processor.local_apic_id,
+        apic_id: boot_processor.apic_id,
+        present_at_boot: true,
         runtime: ProcessorRuntime {
             anchor: ProcessorAnchor::new(0),
             physical_memory_offset,
@@ -408,15 +462,14 @@ pub(crate) fn build_boot_context(
         },
         stack_top: 0,
     });
-    for (index, processor) in processor_info.application_processors.iter().enumerate() {
-        assert!(
-            processor.state != ProcessorState::Disabled,
-            "ACPI exposed disabled application processor apic_id={}",
-            processor.local_apic_id
-        );
+    // A possible processor that is not present still gets its slot,
+    // stack and runtime, so that bringing it online later is the start
+    // path a never-run processor takes; boot only skips starting it.
+    for (index, processor) in possible.enumerate() {
         let stack = allocate_aligned_zeroed(KERNEL_STACK_BYTES, 16);
         processors.push(ProcessorSlot {
-            apic_id: processor.local_apic_id,
+            apic_id: processor.apic_id,
+            present_at_boot: processor.present,
             runtime: ProcessorRuntime {
                 anchor: ProcessorAnchor::new((index + 1) as u16),
                 physical_memory_offset,
@@ -993,8 +1046,15 @@ impl X86PlatformState {
         self.watchdog.clone()
     }
 
+    /// The size of the possible set: every slot built, present or not.
     pub(crate) fn processor_count(&self) -> usize {
         self.processors.len()
+    }
+
+    /// Whether `processor` was present at boot, and so is started by boot
+    /// rather than left offline for a later online.
+    pub(crate) fn present_at_boot(&self, processor: ProcessorId) -> bool {
+        self.processor_slot(processor).present_at_boot
     }
 
     /// Publishes the device interrupt routes every processor dispatches
