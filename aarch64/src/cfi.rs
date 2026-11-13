@@ -283,6 +283,50 @@ pub(crate) unsafe extern "C" fn enable_instruction_key_a() {
     )
 }
 
+/// The bit of a return address the self-test flips. The pointer
+/// authentication code of a kernel (TTBR1) address occupies bits `[54:VA_SIZE]`,
+/// and also `[63:56]` when `TCR_EL1.TBI1` is clear; bit 55 selects the table
+/// and is never part of it. With a virtual address size of at most 52 bits,
+/// bit 54 is in the field whatever `TBI1` is.
+#[cfg(helios_cfi_self_test)]
+const SELF_TEST_PAC_BIT: u64 = 1 << 54;
+
+/// Signs `LR`, flips one bit of its authentication code and authenticates it.
+/// It is meant not to return: the authentication fails, with an exception
+/// under FEAT_FPAC and with a poisoned `LR` that the `ret` takes an
+/// instruction abort through otherwise. Naked, so the frame is exactly these
+/// four instructions.
+#[cfg(helios_cfi_self_test)]
+#[unsafe(naked)]
+unsafe extern "C" fn corrupt_signed_return_address() {
+    core::arch::naked_asm!(
+        "paciasp",
+        "eor x30, x30, #{bit}",
+        "autiasp",
+        "ret",
+        bit = const SELF_TEST_PAC_BIT,
+    )
+}
+
+/// Proves at run time that a corrupted return address is refused, for the
+/// image built with `HELIOS_CFI_SELF_TEST`. The bootstrap processor calls it
+/// once every processor has started.
+///
+/// # Safety
+///
+/// `SCTLR_EL1.EnIA` is set on this processor, with the machine's key
+/// installed.
+#[cfg(helios_cfi_self_test)]
+pub(crate) unsafe fn self_test() {
+    // SAFETY: the caller guarantees the key is enabled. The routine touches
+    // no memory and returns only if authentication did not fail.
+    unsafe { corrupt_signed_return_address() };
+    panic!(
+        "return-address signing self-test: a return address with a corrupted authentication code \
+         was accepted"
+    );
+}
+
 /// Whether this processor's failed authentication raises an exception at the
 /// authenticating instruction (FEAT_FPAC).
 fn faults_at_authentication() -> bool {

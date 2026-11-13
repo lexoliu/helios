@@ -376,7 +376,7 @@ where
         if bytes.is_empty() {
             return RoutedOutput::Local(0);
         }
-        match self.output_mode.sink(stream) {
+        match self.output_mode.sink(stream, self.instance().id()) {
             crate::ComponentOutputSink::Local(local) => RoutedOutput::Local(local.write(
                 &self.cpu,
                 &self.runtime_state,
@@ -2350,6 +2350,31 @@ where
     p1_write_filestat(caller, stat, identity, stat_value)
 }
 
+/// Resolves `path` below the directory `base` to its object identity and
+/// descriptor stat, the way `stat-at` does: `base` must be readable, which
+/// is proved before the path is resolved.
+pub(super) async fn p1_stat_below<CpuImpl, Net, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+    base: &FsDescriptor,
+    path_flags: fs_types::PathFlags,
+    path: &str,
+) -> Result<(crate::ObjectIdentity, fs_types::DescriptorStat), i32>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    HostFs: crate::HostFileSystem,
+{
+    let base = p1_grant(base)?;
+    let namespace = p1_namespace(caller);
+    let metadata = wasi_fs::stat_at(&namespace, base, path_flags, path)
+        .await
+        .map_err(p1_errno_from_fs)?;
+    Ok((
+        crate::object_identity(&metadata),
+        wasi_fs::descriptor_stat(&metadata),
+    ))
+}
+
 /// Resolves a guest-absolute path through the store's namespace to its
 /// object identity and descriptor stat, following a final symbolic link
 /// when `follow` is set.
@@ -2744,9 +2769,15 @@ impl<HostFs: crate::HostFileSystem> Preview1ChunkedFile for ResolvedFileChunks<'
         position: WritePosition,
         len: usize,
     ) -> Result<u64, fs_types::ErrorCode> {
-        wasi_fs::write_resolved_with(self.file, position, len, self.now_nanos, |destination| {
-            gather.fill(destination)
-        })
+        // The regions arrive in write order and cover the chunk exactly,
+        // which is the order `gather` hands its bytes out in.
+        wasi_fs::write_resolved_with(
+            self.file,
+            position,
+            len,
+            self.now_nanos,
+            |_, destination| gather.fill(destination),
+        )
         .await
     }
 }
@@ -2769,7 +2800,11 @@ where
         return p1::errno::BADF;
     };
     let namespace = p1_namespace(caller);
-    let entries = match wasi_fs::read_directory(&namespace, &descriptor).await {
+    let directory = match p1_grant(&descriptor) {
+        Ok(directory) => directory,
+        Err(errno) => return errno,
+    };
+    let entries = match wasi_fs::read_directory(&namespace, directory).await {
         Ok(entries) => entries,
         Err(error) => return p1_errno_from_fs(error),
     };
@@ -3091,6 +3126,7 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
+    let base = p1_grant(base)?;
     let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
     wasi_fs::open_at(
@@ -3160,7 +3196,7 @@ where
         Ok(path) => path,
         Err(_) => return p1::errno::FAULT,
     };
-    let (base, _, absolute) = match caller.data().resolve_preview1_path(fd, &path) {
+    let (base, path, absolute) = match caller.data().resolve_preview1_path(fd, &path) {
         Ok(resolved) => resolved,
         Err(errno) => return errno,
     };
@@ -3172,11 +3208,11 @@ where
             p1_null_device_stat(),
         );
     }
-    let follow = wasi_fs::follow_within(&base, p1_path_flags(flags));
-    let (identity, stat_value) = match p1_stat_absolute_path(caller, &absolute, follow).await {
-        Ok(stat) => stat,
-        Err(errno) => return errno,
-    };
+    let (identity, stat_value) =
+        match p1_stat_below(caller, &base, p1_path_flags(flags), &path).await {
+            Ok(stat) => stat,
+            Err(errno) => return errno,
+        };
     p1_write_filestat(caller, stat, identity, stat_value)
 }
 
@@ -3268,20 +3304,17 @@ where
         };
     let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
-    let destination = match p1_grant(&destination_base) {
-        Ok(destination) => destination,
+    let link = match p1_grant(&source_base).and_then(|source| {
+        source
+            .alias_into(p1_grant(&destination_base)?)
+            .map_err(p1_errno_from_fs)
+    }) {
+        Ok(link) => link,
         Err(errno) => return errno,
     };
-    wasi_fs::link_at(
-        &namespace,
-        &source_base,
-        &old_path,
-        destination,
-        &new_path,
-        now_nanos,
-    )
-    .await
-    .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
+    wasi_fs::link_at(&namespace, link, &old_path, &new_path, now_nanos)
+        .await
+        .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
 
 pub(super) async fn p1_path_readlink<CpuImpl, Net, HostFs>(
@@ -3314,7 +3347,11 @@ where
         Err(errno) => return errno,
     };
     let namespace = p1_namespace(caller);
-    let target = match wasi_fs::readlink_at(&namespace, &base, &path).await {
+    let base = match p1_grant(&base) {
+        Ok(base) => base,
+        Err(errno) => return errno,
+    };
+    let target = match wasi_fs::readlink_at(&namespace, base, &path).await {
         Ok(target) => target,
         Err(error) => return p1_errno_from_fs(error),
     };
@@ -3401,20 +3438,18 @@ where
         };
     let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
-    let (source, destination) = match (p1_grant(&source_base), p1_grant(&destination_base)) {
-        (Ok(source), Ok(destination)) => (source, destination),
-        (Err(errno), _) | (_, Err(errno)) => return errno,
+    let rename = match p1_grant(&source_base).and_then(|source| {
+        source
+            .alias_into(p1_grant(&destination_base)?)
+            .and_then(|alias| alias.removing_source())
+            .map_err(p1_errno_from_fs)
+    }) {
+        Ok(rename) => rename,
+        Err(errno) => return errno,
     };
-    wasi_fs::rename_at(
-        &namespace,
-        source,
-        &old_path,
-        destination,
-        &new_path,
-        now_nanos,
-    )
-    .await
-    .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
+    wasi_fs::rename_at(&namespace, rename, &old_path, &new_path, now_nanos)
+        .await
+        .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
 
 pub(super) async fn p1_path_symlink<CpuImpl, Net, HostFs>(
@@ -3850,7 +3885,8 @@ pub(super) fn p1_errno_from_program_exec_error(error: &ProgramExecError) -> i32 
         ProgramExecErrorKind::PermissionDenied => p1::errno::NOTCAPABLE,
         ProgramExecErrorKind::OutOfMemory => p1::errno::NOMEM,
         ProgramExecErrorKind::Unavailable => p1::errno::NOTSUP,
-        ProgramExecErrorKind::Internal => p1::errno::IO,
+        ProgramExecErrorKind::Internal | ProgramExecErrorKind::Io => p1::errno::IO,
+        ProgramExecErrorKind::NotFound => p1::errno::NOENT,
     }
 }
 
@@ -4837,7 +4873,7 @@ mod tests {
         };
         let file = block_on(wasi_fs::open_at(
             &namespace,
-            &owner,
+            owner.grant().expect("the owner may read the directory"),
             fs_types::PathFlags::empty(),
             "notes.txt",
             fs_types::OpenFlags::CREATE,
@@ -4861,7 +4897,7 @@ mod tests {
         for rights in [P1_RIGHT_FD_READ | P1_RIGHT_FD_WRITE, P1_RIGHT_FD_READ] {
             let opened = block_on(wasi_fs::open_at(
                 &namespace,
-                &preopen,
+                preopen.grant().expect("the preopen may be read"),
                 fs_types::PathFlags::empty(),
                 "notes.txt",
                 p1_open_flags(8),
@@ -4900,7 +4936,7 @@ mod tests {
         };
         block_on(wasi_fs::open_at(
             &namespace,
-            &owner,
+            owner.grant().expect("the owner may read the directory"),
             fs_types::PathFlags::empty(),
             "data",
             fs_types::OpenFlags::CREATE,

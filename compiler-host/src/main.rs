@@ -3,7 +3,8 @@
 //!
 //! It starts, precompiles the plugin, writes `{"type":"ready"}` on stdout
 //! and waits. Every `compile` line on stdin compiles `--input` for
-//! `--target` under `--hint` with `--workers` workers, writes the artifact
+//! `--target` at ISA level `--isa-level` under `--hint` with `--workers`
+//! workers, writes the artifact
 //! to `--output`, and answers one `{"type":"compiled",...}` JSON line on
 //! stdout. It exits 0 at the end of stdin, and on any failure logs it to
 //! stderr, answers nothing and exits non-zero. A harness times each request
@@ -41,6 +42,10 @@ struct Args {
     /// The target triple the plugin compiles for.
     #[arg(long)]
     target: String,
+    /// The name of the target's ISA level the artifact is compiled for, as
+    /// the Helios kernel sends it, such as `x86-64-v4+vbmi+bitalg`.
+    #[arg(long)]
+    isa_level: String,
     #[arg(long, value_enum)]
     hint: Hint,
     /// The worker count the plugin is told through `RAYON_NUM_THREADS`.
@@ -50,7 +55,6 @@ struct Args {
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Hint {
-    Fast,
     Balanced,
     Performance,
 }
@@ -58,7 +62,6 @@ enum Hint {
 impl From<Hint> for CompileHint {
     fn from(hint: Hint) -> Self {
         match hint {
-            Hint::Fast => CompileHint::Fast,
             Hint::Balanced => CompileHint::Balanced,
             Hint::Performance => CompileHint::Performance,
         }
@@ -154,7 +157,7 @@ fn serve(args: &Args) -> Result<(), ServeError> {
             return Err(ServeError::Protocol { line });
         }
         let input = read(&args.input, "input")?;
-        let compiled = host.compile(&input, &args.target, args.hint.into())?;
+        let compiled = host.compile(&input, &args.target, &args.isa_level, args.hint.into())?;
         std::fs::write(&args.output, &compiled.output).map_err(|source| {
             ServeError::WriteOutput {
                 path: args.output.clone(),

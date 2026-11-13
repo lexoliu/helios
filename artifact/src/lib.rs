@@ -3,6 +3,12 @@
 extern crate alloc;
 
 pub mod bootfs;
+mod isa;
+
+pub use isa::{
+    CwasmIsaLevels, CwasmTarget, IsaFeature, IsaLevel, IsaLevelError, NativeFeatureProbe,
+    ProbeAnswers, cwasm_target_isa_levels,
+};
 
 use alloc::format;
 use alloc::string::String;
@@ -62,42 +68,6 @@ pub fn cwasm_target_guest_stack_limit_offset(target: &str) -> Option<i32> {
     (os == Some("none")).then_some(GUEST_STACK_LIMIT_OFFSET)
 }
 
-/// Returns the ISA flags shared by host prebuilds and in-kernel compilation.
-pub fn cwasm_target_cranelift_flags(target: &str) -> &'static [&'static str] {
-    if target.starts_with("aarch64-") {
-        // `sign_return_address` signs the return address of every function
-        // that sets up a frame, with HINT-space instructions that do nothing
-        // on a processor that does not enforce them. `has_pauth` is not
-        // enabled: it would allow the non-HINT forms.
-        return &["has_lse", "has_fp16", "sign_return_address"];
-    }
-    if target.starts_with("x86_64-") {
-        return &[
-            "has_cmpxchg16b",
-            "has_sse3",
-            "has_ssse3",
-            "has_sse41",
-            "has_sse42",
-            "has_popcnt",
-            "has_bmi1",
-            "has_bmi2",
-            "has_lzcnt",
-            // This is x86-64-v3 (AVX2/FMA/BMI/LZCNT), exposed by every x86
-            // cloud KVM instance type. AVX-512 is excluded because artifacts
-            // are compiled once for host prebuild/bootfs and the in-kernel
-            // compiler plugin with this same set, while much of the x86 KVM
-            // fleet lacks AVX-512. Kernel engines call
-            // Config::detect_host_feature(detect_x86_native_feature), and
-            // Wasmtime rejects unavailable enabled ISA flags before mapping
-            // an artifact's code.
-            "has_avx",
-            "has_avx2",
-            "has_fma",
-        ];
-    }
-    &[]
-}
-
 /// The code protection the machine code of a cwasm artifact carries.
 ///
 /// It is part of an artifact's compatibility: the compiler records it in the
@@ -132,12 +102,14 @@ impl CwasmCodeProtection {
 }
 
 /// The code protection every Cranelift-compiled cwasm artifact for `target`
-/// carries, derived from [`cwasm_target_cranelift_flags`] so the two cannot
-/// drift apart.
+/// carries, at any of its ISA levels. It is derived from the settings every
+/// level's Cranelift flags include
+/// ([`CwasmIsaLevels::cranelift_settings`]), so the two cannot drift apart.
 pub fn cwasm_target_code_protection(target: &str) -> CwasmCodeProtection {
     CwasmCodeProtection {
-        return_addresses_signed: cwasm_target_cranelift_flags(target)
-            .contains(&"sign_return_address"),
+        return_addresses_signed: cwasm_target_isa_levels(target)
+            .cranelift_settings()
+            .contains(&isa::SIGN_RETURN_ADDRESS),
     }
 }
 
@@ -345,9 +317,11 @@ impl fmt::Display for SignatureAlgorithm {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec::Vec;
+
     use super::{
-        CwasmCodeProtection, GUEST_STACK_LIMIT_OFFSET, cwasm_target_code_protection,
-        cwasm_target_cranelift_flags, cwasm_target_guest_stack_limit_offset,
+        CwasmCodeProtection, CwasmTarget, GUEST_STACK_LIMIT_OFFSET, cwasm_target_code_protection,
+        cwasm_target_guest_stack_limit_offset, cwasm_target_isa_levels,
     };
 
     #[test]
@@ -380,17 +354,24 @@ mod tests {
 
     /// Only the HINT-space signing flag is enabled: `has_pauth` would allow
     /// non-HINT instructions the kernel's feature probe does not answer for,
-    /// and the B key is not the one the kernel enables.
+    /// and the B key is not the one the kernel enables. Every level of the
+    /// target signs.
     #[test]
     fn aarch64_flags_sign_with_the_hint_forms_and_key_a_only() {
-        let flags = cwasm_target_cranelift_flags("aarch64-unknown-none");
-        assert!(flags.contains(&"sign_return_address"), "{flags:?}");
-        assert!(!flags.contains(&"has_pauth"), "{flags:?}");
-        assert!(
-            !flags.contains(&"sign_return_address_with_bkey"),
-            "{flags:?}"
-        );
-        assert!(!flags.contains(&"sign_return_address_all"), "{flags:?}");
+        let triple = "aarch64-unknown-none";
+        for level in cwasm_target_isa_levels(triple).iter() {
+            let flags: Vec<_> = CwasmTarget::new(triple, level.name())
+                .expect("a defined level")
+                .cranelift_flags()
+                .collect();
+            assert!(flags.contains(&"sign_return_address"), "{flags:?}");
+            assert!(!flags.contains(&"has_pauth"), "{flags:?}");
+            assert!(
+                !flags.contains(&"sign_return_address_with_bkey"),
+                "{flags:?}"
+            );
+            assert!(!flags.contains(&"sign_return_address_all"), "{flags:?}");
+        }
     }
 
     #[test]

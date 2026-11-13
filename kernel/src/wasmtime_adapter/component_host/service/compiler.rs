@@ -129,6 +129,17 @@ pub(super) fn ensure_compiler_buffers_returned(
 /// program `Err`.
 pub(super) type CompilerCallOutcome = Result<Result<Vec<u8>, ProgramExecError>, ProgramExecError>;
 
+/// What one compile asks of the plugin: the module, the ISA the artifact
+/// is for, and how hard to optimise it.
+#[derive(Clone, Copy)]
+pub(super) struct CompileRequest<'a> {
+    pub(super) wasm: &'a Bytes,
+    pub(super) guest_isa: GuestIsa,
+    pub(super) hint: AotCompileHint,
+    /// Whether the plugin reports its pass timings.
+    pub(super) profile: bool,
+}
+
 /// A buffer in the plugin's memory, with the layout it was allocated with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PluginBuffer {
@@ -137,7 +148,7 @@ struct PluginBuffer {
     align: usize,
 }
 
-/// The plugin allocations of one compile call: the three request buffers the
+/// The plugin allocations of one compile call: the four request buffers the
 /// kernel allocates and the three response buffers the plugin hands over (the
 /// ownership table is in `helios_compiler_abi`).
 ///
@@ -147,8 +158,8 @@ struct PluginBuffer {
 /// reaches `release`, and its allocations die with the runtime.
 #[must_use = "the plugin's allocations leak unless released"]
 pub(super) struct CompilerAllocations {
-    /// Three request buffers and three response buffers.
-    buffers: SmallVec<[PluginBuffer; 6]>,
+    /// Four request buffers and three response buffers.
+    buffers: SmallVec<[PluginBuffer; 7]>,
 }
 
 impl CompilerAllocations {
@@ -1038,7 +1049,13 @@ mod tests {
                 TestCpu,
                 crate::test_support::TestNetworkService,
                 crate::UnsupportedHostFileSystem,
-            > = crate::RuntimeState::new(cpu.timebase(), 1, 0, crate::BootPayload::for_tests());
+            > = crate::RuntimeState::new(
+                cpu.timebase(),
+                1,
+                0,
+                crate::BootPayload::for_tests(),
+                GuestIsa::for_build_target(cpu.native_feature_probe()),
+            );
             runtime_state.install_root_entropy(triomphe::Arc::new(
                 crate::RootEntropy::from_platform(
                     &cpu,
