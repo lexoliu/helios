@@ -89,11 +89,11 @@ pub(super) enum Visibility {
 }
 
 impl Visibility {
-    pub(super) fn of<CpuImpl, Net, HostFs>(data: &StoreData<CpuImpl, Net, HostFs>) -> Self
+    pub(super) fn of<CpuImpl, Net, StorageImpl>(data: &StoreData<CpuImpl, Net, StorageImpl>) -> Self
     where
         CpuImpl: Cpu + Clone,
         Net: ComponentHostNetwork,
-        HostFs: crate::HostFileSystem,
+        StorageImpl: crate::Storage,
     {
         match data.process_authority().derive_observe_machine_cap() {
             Ok(cap) => Self::Machine(cap),
@@ -103,13 +103,13 @@ impl Visibility {
 }
 
 /// The proof that the caller may control and read the whole machine.
-fn observe_machine<CpuImpl, Net, HostFs>(
-    data: &StoreData<CpuImpl, Net, HostFs>,
+fn observe_machine<CpuImpl, Net, StorageImpl>(
+    data: &StoreData<CpuImpl, Net, StorageImpl>,
 ) -> Result<ObserveMachineCap, Denied>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     data.process_authority()
         .derive_observe_machine_cap()
@@ -117,15 +117,15 @@ where
 }
 
 /// `tracing.set-target-enabled`.
-pub(super) fn set_target_enabled<CpuImpl, Net, HostFs>(
-    data: &StoreData<CpuImpl, Net, HostFs>,
+pub(super) fn set_target_enabled<CpuImpl, Net, StorageImpl>(
+    data: &StoreData<CpuImpl, Net, StorageImpl>,
     target: &str,
     enabled: bool,
 ) -> Result<(), TargetRefusal>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     observe_machine(data)?;
     crate::log::set_gated_target(target, enabled)
@@ -133,15 +133,15 @@ where
 }
 
 /// `tracing.recent`, after the filter is lifted.
-pub(super) fn recent_events<CpuImpl, Net, HostFs>(
-    data: &StoreData<CpuImpl, Net, HostFs>,
+pub(super) fn recent_events<CpuImpl, Net, StorageImpl>(
+    data: &StoreData<CpuImpl, Net, StorageImpl>,
     filter: &TraceFilter,
     limit: u32,
 ) -> Vec<Arc<TraceEvent>>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     match Visibility::of(data) {
         Visibility::Machine(scope) => data.runtime_state.recent(&scope, filter, limit),
@@ -150,14 +150,14 @@ where
 }
 
 /// `profiling.set-enabled`.
-pub(super) fn set_profiling_enabled<CpuImpl, Net, HostFs>(
-    data: &StoreData<CpuImpl, Net, HostFs>,
+pub(super) fn set_profiling_enabled<CpuImpl, Net, StorageImpl>(
+    data: &StoreData<CpuImpl, Net, StorageImpl>,
     enabled: bool,
 ) -> Result<(), Denied>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     observe_machine(data)?;
     data.runtime_state.set_profiling_enabled(enabled);
@@ -165,13 +165,13 @@ where
 }
 
 /// `profiling.clear`.
-pub(super) fn clear_profile<CpuImpl, Net, HostFs>(
-    data: &StoreData<CpuImpl, Net, HostFs>,
+pub(super) fn clear_profile<CpuImpl, Net, StorageImpl>(
+    data: &StoreData<CpuImpl, Net, StorageImpl>,
 ) -> Result<(), Denied>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     observe_machine(data)?;
     data.runtime_state.clear_profile();
@@ -179,15 +179,15 @@ where
 }
 
 /// `profiling.folded`, after the filter is lifted.
-pub(super) fn folded_samples<CpuImpl, Net, HostFs>(
-    data: &StoreData<CpuImpl, Net, HostFs>,
+pub(super) fn folded_samples<CpuImpl, Net, StorageImpl>(
+    data: &StoreData<CpuImpl, Net, StorageImpl>,
     filter: &ProfileFilter,
     limit: u32,
 ) -> Vec<FoldedProfileSample>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let ticks = data.cpu.now().ticks();
     match Visibility::of(data) {
@@ -201,15 +201,15 @@ where
 }
 
 /// `profiling.metrics`, after the filter is lifted.
-pub(super) fn metric_samples<CpuImpl, Net, HostFs>(
-    data: &StoreData<CpuImpl, Net, HostFs>,
+pub(super) fn metric_samples<CpuImpl, Net, StorageImpl>(
+    data: &StoreData<CpuImpl, Net, StorageImpl>,
     filter: &PerfMetricFilter,
     limit: u32,
 ) -> Vec<PerfMetricSample>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     match Visibility::of(data) {
         Visibility::Machine(scope) => data.runtime_state.perf_metrics(&scope, filter, limit),
@@ -218,14 +218,14 @@ where
 }
 
 /// `profiling.set-instruction-sampling`.
-pub(super) fn set_instruction_sampling<CpuImpl, Net, HostFs>(
-    data: &StoreData<CpuImpl, Net, HostFs>,
+pub(super) fn set_instruction_sampling<CpuImpl, Net, StorageImpl>(
+    data: &StoreData<CpuImpl, Net, StorageImpl>,
     enabled: bool,
 ) -> Result<(), Refused<InstructionProfileError>>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     observe_machine(data)?;
     data.runtime_state
@@ -239,13 +239,13 @@ where
 /// The outer error is a bring-up ordering defect, not a refusal: only the
 /// program service knows the wasm code that can run, so a read before it
 /// exists is not an empty profile.
-pub(super) fn instruction_samples<CpuImpl, Net, HostFs>(
-    data: &StoreData<CpuImpl, Net, HostFs>,
+pub(super) fn instruction_samples<CpuImpl, Net, StorageImpl>(
+    data: &StoreData<CpuImpl, Net, StorageImpl>,
 ) -> wasmtime::Result<Result<InstructionProfile, Refused<InstructionProfileError>>>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     if observe_machine(data).is_err() {
         return Ok(Err(Refused::Denied));
@@ -263,28 +263,28 @@ where
 }
 
 /// `profiling.raw-profile-size`.
-pub(super) fn raw_profile_size<CpuImpl, Net, HostFs>(
-    data: &StoreData<CpuImpl, Net, HostFs>,
+pub(super) fn raw_profile_size<CpuImpl, Net, StorageImpl>(
+    data: &StoreData<CpuImpl, Net, StorageImpl>,
 ) -> Result<u64, Refused<LlvmProfileError>>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     observe_machine(data)?;
     KernelLlvmProfile.size().map_err(Refused::Failed)
 }
 
 /// `profiling.raw-profile-read`.
-pub(super) fn raw_profile_read<CpuImpl, Net, HostFs>(
-    data: &StoreData<CpuImpl, Net, HostFs>,
+pub(super) fn raw_profile_read<CpuImpl, Net, StorageImpl>(
+    data: &StoreData<CpuImpl, Net, StorageImpl>,
     offset: u64,
     length: u32,
 ) -> Result<Vec<u8>, Refused<LlvmProfileError>>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     observe_machine(data)?;
     super::read_raw_profile(offset, length).map_err(Refused::Failed)

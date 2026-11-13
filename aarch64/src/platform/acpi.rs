@@ -43,11 +43,12 @@ use alloc::vec::Vec;
 use arm_gic::Trigger;
 use core::str::FromStr;
 use helios_hal::cpu::Timebase;
+use helios_tpm::{AcpiTpm2, AcpiTpm2Locality, InterfaceDescription};
 use thiserror::Error;
 
 use super::{
     ConsoleDescription, GicDescription, MmioRegion, PlatformDescription, PlatformSource,
-    PsciConduit, RedistributorAffinity, Slots, SpiInterrupt, VirtioMmioSlot,
+    PsciConduit, RedistributorAffinity, Slots, SpiInterrupt, TpmDescription, VirtioMmioSlot,
 };
 
 /// The first 32 INTIDs are software-generated and private peripheral
@@ -57,6 +58,12 @@ const FIRST_SPI_INTID: u32 = 32;
 
 /// `_HID` of QEMU's virtio-mmio transport, an ARM Linaro identifier.
 const VIRTIO_MMIO_HID: &str = "LNRO0005";
+
+/// `_HID` of a TPM 2.0 device object (TCG ACPI Specification, "TPM 2.0
+/// device object"; QEMU's `TPM0`).
+const TPM_HID: &str = "MSFT0101";
+
+const TPM2_SIGNATURE: &str = "TPM2";
 
 /// The `acpi` crate's own errors, plus the ones this decode adds.
 #[derive(Debug, Error)]
@@ -90,6 +97,13 @@ pub(crate) enum AcpiError {
          can be routed to a processor"
     )]
     NotAnSpi(u32),
+    #[error("the ACPI TPM2 table is malformed: {0}")]
+    Tpm2(helios_tpm::AcpiTpm2Error),
+    #[error(
+        "the ACPI TPM2 table names the FIFO interface, and the DSDT has no MSFT0101 device whose \
+         _CRS says where it is"
+    )]
+    Tpm2WithoutDevice,
 }
 
 /// The region handler type of this backend's AML interpreter.
@@ -212,6 +226,7 @@ pub(super) fn describe(
     let gic = gic(tables)?;
     let interpreter = load_namespace(tables)?;
     let mut virtio = Slots::new();
+    let mut tpm_device = None;
     for (name, hid) in devices(&interpreter)? {
         if hid == VIRTIO_MMIO_HID {
             let (region, interrupt) = memory_and_interrupt_resource(&interpreter, &name)?;
@@ -219,8 +234,11 @@ pub(super) fn describe(
                 VirtioMmioSlot { region, interrupt },
                 "virtio-mmio transports",
             );
+        } else if hid == TPM_HID {
+            tpm_device = Some(name);
         }
     }
+    let tpm = tpm(tables, &interpreter, tpm_device.as_ref())?;
     Ok(PlatformDescription {
         source: PlatformSource::Acpi,
         console,
@@ -239,12 +257,59 @@ pub(super) fn describe(
         // than guessing: an ACPI-described machine offers no grantable
         // device yet.
         grantable: Slots::new(),
+        tpm,
         // ACPI has no counterpart to the device tree's
         // `/chosen/rng-seed`, so an ACPI-described machine starts from
         // the processor's own random source alone until the entropy
         // device joins it.
         boot_entropy_seed: None,
     })
+}
+
+/// The TPM the TPM2 table describes, when there is one.
+///
+/// The table names the interface by its start method. For the CRB it
+/// names the control area, whose page is locality 0; for the FIFO
+/// interface it names no address, and the `MSFT0101` device's `_CRS`
+/// does, which is how QEMU's `virt` publishes its `tpm-tis-device`
+/// (`hw/arm/virt-acpi-build.c`, `acpi_dsdt_add_tpm`).
+fn tpm(
+    tables: &AcpiPlatformTables,
+    interpreter: &Interpreter<Aarch64AcpiHandler>,
+    device: Option<&AmlName>,
+) -> Result<Option<TpmDescription>, AcpiError> {
+    let Some((physical_address, header)) = tables
+        .tables
+        .table_headers()
+        .find(|(_, header)| header.signature.as_str() == TPM2_SIGNATURE)
+    else {
+        return Ok(None);
+    };
+    // `SdtHeader` is packed, so the field is copied out first.
+    let length = header.length as usize;
+    // SAFETY: the address and length come from the RSDT entry the
+    // firmware published, and firmware tables sit in the direct map.
+    let bytes = unsafe {
+        let mapping = tables
+            .handler
+            .map_physical_region::<u8>(physical_address, length);
+        core::slice::from_raw_parts(mapping.virtual_start.as_ptr(), length)
+    };
+    let table = AcpiTpm2::parse(bytes).map_err(AcpiError::Tpm2)?;
+    let interface = InterfaceDescription::AcpiStartMethod(table.start_method());
+    Ok(Some(match table.locality().map_err(AcpiError::Tpm2)? {
+        AcpiTpm2Locality::Crb { base } => TpmDescription::Described { base, interface },
+        AcpiTpm2Locality::Fifo => {
+            let device = device.ok_or(AcpiError::Tpm2WithoutDevice)?;
+            TpmDescription::Described {
+                base: memory_resource(interpreter, device)?.base as u64,
+                interface,
+            }
+        }
+        AcpiTpm2Locality::Unsupported { start_method } => {
+            TpmDescription::Unsupported { start_method }
+        }
+    }))
 }
 
 fn gic(tables: &AcpiPlatformTables) -> Result<GicDescription, AcpiError> {

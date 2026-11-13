@@ -21,18 +21,18 @@ use spin::{Mutex, Once};
 
 use crate::memory::BalloonHandle;
 
-use crate::BlockService;
 use crate::ComponentHostVsockService;
 use crate::component::{ComponentRuntimeState, ProviderSlot};
 use crate::device::DeviceGrantRegistry;
 use crate::network::HttpExchange;
+use crate::{AttachedStorage, BlockCache, BlockService, HostFileSystem, Storage};
 
 #[derive(Clone)]
-pub struct RuntimeState<ProgramService, NetworkService, HostFsService> {
-    inner: Arc<RuntimeStateInner<ProgramService, NetworkService, HostFsService>>,
+pub struct RuntimeState<ProgramService, NetworkService, StorageImpl: Storage> {
+    inner: Arc<RuntimeStateInner<ProgramService, NetworkService, StorageImpl>>,
 }
 
-struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
+struct RuntimeStateInner<ProgramService, NetworkService, StorageImpl: Storage> {
     boot_ticks: u64,
     timebase: Timebase,
     processor_count: u32,
@@ -60,7 +60,11 @@ struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     /// that does not provision the plugin, in which case the runtime adapter
     /// answers a configuration error rather than trapping.
     http_client: ProviderSlot<HttpExchange>,
-    host_fs_service: Mutex<Option<HostFsService>>,
+    host_fs_service: Mutex<Option<StorageImpl::HostShare>>,
+    /// The block cache over the machine's mount-source disks, once the
+    /// kernel identified them. Empty on a machine with none, where a
+    /// disk mount is refused as unavailable.
+    mount_sources: Once<BlockCache<StorageImpl::Disk>>,
     /// What the kernel publishes about its disks once it identified them
     /// and proved the scratch disk: the scratch disk's counters and the
     /// compressed pool's settings. Empty on a machine with no block
@@ -122,7 +126,7 @@ struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     /// program's tree descends from. Its root is the payload's boot
     /// filesystem; the host share joins its table once a backend installs
     /// the 9p client.
-    namespace: Namespace<HostFsService>,
+    namespace: Namespace<StorageImpl>,
     tracing: TraceLog,
     /// The profile and perf histories, held as a handle rather than as
     /// fields so a subsystem this state owns can record into them
@@ -316,12 +320,12 @@ fn heap_size_class_metric_name(kind: HeapMetricKind, index: usize) -> &'static s
     }
 }
 
-impl<ProgramService, NetworkService, HostFsService>
-    RuntimeState<ProgramService, NetworkService, HostFsService>
+impl<ProgramService, NetworkService, StorageImpl>
+    RuntimeState<ProgramService, NetworkService, StorageImpl>
 where
     ProgramService: Clone,
     NetworkService: Clone,
-    HostFsService: Clone,
+    StorageImpl: Storage,
 {
     pub fn new(
         timebase: Timebase,
@@ -346,6 +350,7 @@ where
                 wall_clock: crate::exec::WallClock::new(),
                 http_client: ProviderSlot::new(),
                 host_fs_service: Mutex::new(None),
+                mount_sources: Once::new(),
                 block_service: Once::new(),
                 device_grants: DeviceGrantRegistry::new(),
                 iommu_report: Once::new(),
@@ -1018,7 +1023,7 @@ where
 
     /// Installs the host share's 9p client and mounts the share at
     /// [`HOST_SHARE_GUEST_MOUNT_PATH`].
-    pub fn install_host_fs_service(&self, service: HostFsService) {
+    pub fn install_host_fs_service(&self, service: StorageImpl::HostShare) {
         let mut slot = self.inner.host_fs_service.lock();
         assert!(
             slot.is_none(),
@@ -1038,12 +1043,39 @@ where
 
     /// The root namespace. A program the kernel launches runs in a tree
     /// that descends from it ([`Namespace::descend`]).
-    pub fn root_namespace(&self) -> &Namespace<HostFsService> {
+    pub fn root_namespace(&self) -> &Namespace<StorageImpl> {
         &self.inner.namespace
     }
 
-    pub fn host_fs_service(&self) -> Option<HostFsService> {
+    pub fn host_fs_service(&self) -> Option<StorageImpl::HostShare> {
         self.inner.host_fs_service.lock().clone()
+    }
+
+    /// Publishes the block cache over the machine's mount-source disks,
+    /// which a disk mount names by serial.
+    ///
+    /// Called from the task that identified every disk, once.
+    pub fn install_mount_sources(&self, cache: BlockCache<StorageImpl::Disk>) {
+        let mut installed = false;
+        self.inner.mount_sources.call_once(|| {
+            installed = true;
+            cache
+        });
+        assert!(installed, "mount sources were installed more than once");
+    }
+
+    /// The block cache over the mount-source disks, or `None` on a
+    /// machine with none.
+    pub fn mount_sources(&self) -> Option<BlockCache<StorageImpl::Disk>> {
+        self.inner.mount_sources.get().cloned()
+    }
+
+    /// The storage a mount request builds its source from.
+    pub fn attached_storage(&self) -> AttachedStorage<StorageImpl> {
+        AttachedStorage {
+            host_share: self.host_fs_service(),
+            disks: self.mount_sources(),
+        }
     }
 
     /// Publishes what the kernel knows about the machine's disks.
@@ -1153,6 +1185,12 @@ where
     pub fn has_system_component(&self) -> bool {
         self.inner.payload.has_system_component()
     }
+
+    /// SHA-256 of the payload body whose signature the kernel verified,
+    /// the value bring-up measures before it reads the sealed seed.
+    pub fn payload_digest(&self) -> helios_artifact::bootfs::Digest256 {
+        self.inner.payload.digest()
+    }
 }
 
 /// The system-wide observation snapshot.
@@ -1160,12 +1198,12 @@ where
 /// This sits in its own block because reporting the host share's cache
 /// counters needs the filesystem service to actually be a filesystem,
 /// which the rest of `RuntimeState` does not care about.
-impl<ProgramService, NetworkService, HostFsService>
-    RuntimeState<ProgramService, NetworkService, HostFsService>
+impl<ProgramService, NetworkService, StorageImpl>
+    RuntimeState<ProgramService, NetworkService, StorageImpl>
 where
     ProgramService: Clone,
     NetworkService: crate::NetworkAdminBackend,
-    HostFsService: crate::HostFileSystem,
+    StorageImpl: Storage,
 {
     pub fn snapshot(&self, current_ticks: u64) -> StatsSample {
         let uptime = self.ticks_to_nanos(current_ticks.saturating_sub(self.inner.boot_ticks));
@@ -1210,12 +1248,12 @@ where
     }
 }
 
-impl<ProgramService, NetworkService, HostFsService> ComponentRuntimeState
-    for RuntimeState<ProgramService, NetworkService, HostFsService>
+impl<ProgramService, NetworkService, StorageImpl> ComponentRuntimeState
+    for RuntimeState<ProgramService, NetworkService, StorageImpl>
 where
     ProgramService: Clone + Send + 'static,
     NetworkService: crate::ComponentNetworkService,
-    HostFsService: Clone + Send + Sync + 'static,
+    StorageImpl: Storage,
 {
     fn retire_network_handles(&self, retired: &crate::SocketRetirementQueue) {
         if retired.is_empty() {
@@ -1317,7 +1355,7 @@ mod tests {
 
     #[test]
     fn a_reseed_moves_the_wall_clock_to_the_new_reading() {
-        let state = RuntimeState::<(), (), ()>::new(
+        let state = RuntimeState::<(), (), crate::UnsupportedStorage>::new(
             Timebase::new(1_000_000_000),
             1,
             0,
@@ -1331,7 +1369,7 @@ mod tests {
 
         // The machine was stopped and the calendar moved a day.
         rtc.0.set(1_000 + 86_400);
-        let wall = RuntimeState::<(), (), ()>::read_rtc(&rtc);
+        let wall = RuntimeState::<(), (), crate::UnsupportedStorage>::read_rtc(&rtc);
         state.reseed_wall_clock(6_000_000_000, wall);
         assert_eq!(state.wall_clock_nanos(6_000_000_000), 87_400_000_000_000);
     }
@@ -1339,7 +1377,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "seeded more than once")]
     fn seeding_the_wall_clock_twice_is_a_bring_up_fault() {
-        let state = RuntimeState::<(), (), ()>::new(
+        let state = RuntimeState::<(), (), crate::UnsupportedStorage>::new(
             Timebase::new(1_000_000_000),
             1,
             0,
@@ -1353,7 +1391,7 @@ mod tests {
 
     #[test]
     fn runtime_state_records_kernel_heap_delta_metrics() {
-        let state = RuntimeState::<(), (), ()>::new(
+        let state = RuntimeState::<(), (), crate::UnsupportedStorage>::new(
             Timebase::new(1_000_000_000),
             1,
             0,

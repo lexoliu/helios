@@ -31,7 +31,7 @@
     "surfaces": ["x86"]
   },
   "test-units": {
-    "command": "just test-units",
+    "command": "just test-units && just test-erofs-mkfs",
     "rust-cache": true,
     "surfaces": ["x86", "hosted", "host_tools", "programs"]
   },

@@ -73,6 +73,7 @@ use core::time::Duration;
 use crossbeam_utils::CachePadded;
 use helios_hal::cpu::Cpu;
 use helios_hal::generation::{GenerationIdWindow, VmGenerationId};
+use helios_hal::measured_boot::MeasuredBoot;
 use helios_hal::watchdog::Watchdog;
 use triomphe::Arc;
 
@@ -96,12 +97,13 @@ pub const GENERATION_PROBE_INTERVAL: Duration = Duration::from_millis(100);
 /// [`MachineGeneration::observe`], which is lock-free while the identifier
 /// is unchanged and otherwise takes the advance lock, so the task can run
 /// on any processor alongside the entropy draws that observe as well.
-pub fn spawn_generation_probe<CpuImpl, WatchdogImpl>(
-    kernel: &Kernel<CpuImpl, WatchdogImpl>,
+pub fn spawn_generation_probe<CpuImpl, WatchdogImpl, MeasuredBootImpl>(
+    kernel: &Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
     generation: &MachineGenerationHandle,
 ) where
     CpuImpl: Cpu + Clone,
     WatchdogImpl: Watchdog + Clone,
+    MeasuredBootImpl: MeasuredBoot,
 {
     if !generation.has_window() {
         return;

@@ -46,15 +46,17 @@ use super::super::StoreData;
 /// instance. `available` and `claim` check the instance's input device
 /// class, and an instance without it is told what a machine with no
 /// input device tells every program: no devices, and `unavailable`.
-pub(in crate::wasmtime_adapter::component_host) fn add_input_to_linker<CpuImpl, Net, HostFs>(
-    linker: &mut Linker<StoreData<CpuImpl, Net, HostFs>>,
+pub(in crate::wasmtime_adapter::component_host) fn add_input_to_linker<CpuImpl, Net, StorageImpl>(
+    linker: &mut Linker<StoreData<CpuImpl, Net, StorageImpl>>,
 ) -> wasmtime::Result<()>
 where
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    input_wit::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, HostFs>>>(linker, |state| state)
+    input_wit::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>(linker, |state| {
+        state
+    })
 }
 
 /// A program's hold on one input device, as its store records it.
@@ -130,11 +132,11 @@ const fn to_wit_abs_axis(axis: &AbsAxis) -> input_wit::AbsAxis {
     }
 }
 
-impl<CpuImpl, Net, HostFs> StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     /// The indicator queue of one held device, checked against the
     /// generation the handle names.
@@ -147,11 +149,11 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> input_wit::Host for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> input_wit::Host for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn available(&mut self) -> wasmtime::Result<Vec<input_wit::Capabilities>> {
         // Without the input class the list is the one a machine with no
@@ -198,11 +200,11 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> input_wit::HostDevice for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> input_wit::HostDevice for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn capabilities(
         &mut self,
@@ -271,13 +273,13 @@ impl<T: 'static> StreamProducer<T> for InputEventStreamProducer {
     }
 }
 
-impl<CpuImpl, Net, HostFs, U> input_wit::HostDeviceWithStore<U>
-    for HasSelf<StoreData<CpuImpl, Net, HostFs>>
+impl<CpuImpl, Net, StorageImpl, U> input_wit::HostDeviceWithStore<U>
+    for HasSelf<StoreData<CpuImpl, Net, StorageImpl>>
 where
     U: 'static,
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn events(
         mut accessor: Access<'_, U, Self>,

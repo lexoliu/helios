@@ -15,9 +15,44 @@ entry table (kind, path offset/length, data offset/length,
 `modified_nanos`), a string table, then the file bytes, every offset
 16-byte aligned. The entry table holds every bootfs file and empty
 directory plus two distinguished entries: the init component and its
-`argv0`. The kernel parses it with `bootfs::Image::parse`, a zero-copy
-reader that validates every offset against the slice and fails with a
-typed error naming the field that was wrong.
+`argv0`. The data section ends exactly where that body ends; a version-2
+image is the body followed by a fixed 128-byte signature footer.
+
+The footer holds the magic `HLBFSSIG`, a footer version, the algorithm
+(Ed25519), the signer's public key, a 64-byte signature and reserved
+zeros. The signature covers `b"helios-bootfs-signature-v1"` followed by
+the SHA-256 of the body, so the header is covered too.
+`helios-cli kernel-prebuild` signs the finished image once with the
+prebuild root key. The init component, the compiler plugin and every
+boot program inside it are bare Wasmtime artifacts with no per-artifact
+signature trailer: the footer vouches for them as a whole.
+
+The root key never lives in the repository or in an image. A development
+build generates it in its own prebuild directory and embeds its public
+half in the kernel. A release names its key with `--root-secret-key
+<file>` (on `helios-cli kernel-prebuild` and on the inspector's `vm`,
+which forwards it): the file is read in place, and the release workflow
+writes it from the repository secret `HELIOS_BOOTFS_ROOT_KEY`, the base64
+of the 32 raw key bytes, to a file in the runner's temporary directory
+and removes it after the upload. The signed payload ships beside the
+kernel as the release asset `helios-bootfs-x86-64`, located with
+`vm … bootfs-path`.
+
+The kernel reads it with `BootPayload::parse`, the single entry on every
+backend. It hashes the body once, verifies the footer against the
+trusted root public keys embedded in the kernel image, and only then
+parses the shape with `bootfs::Image::parse_signed`, a zero-copy reader
+that validates every offset against the slice. The digest stays on the
+`BootPayload` for a measurement register to extend. A refusal is a typed
+`BootfsError` naming what was wrong: `MissingSignature`,
+`UnsupportedSignature`, `UntrustedSigner` (with the signer's and the
+trusted keys' fingerprints), `SignatureMismatch`, `TrailingBytes` or a
+shape error, and each backend's panic message carries it. A bootfs file
+is classified as a precompiled artifact by Wasmtime's own header check,
+not by a trailer. A cwasm outside the payload (a file a guest wrote, one
+on the host share) still carries the signature trailer and is verified
+when it loads against the kernel's compiler-signing key, never against
+the trusted roots (`kernel/src/signing_key.rs`).
 
 ## How each backend hands it over
 
