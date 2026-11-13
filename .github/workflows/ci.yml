@@ -61,6 +61,9 @@ jobs:
       # `true` when the change moves the kernel profile's format or the
       # compiler that reads it; `kernel-profile` then collects this run's.
       profile_format: ${{ steps.filter.outputs.profile_format || 'false' }}
+      # JSON array of the guest-program profiles the selected smoke lanes
+      # read, which `wasm-programs` builds.
+      wasm_profiles: ${{ steps.select.outputs.wasm_profiles }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -160,8 +163,16 @@ jobs:
             | map(select(.value.command and (.key as $name | $lanes | index($name))))
             | map({name: .key, command: .value.command,
                    "rust-cache": (.value["rust-cache"] // false)})' .github/ci-lanes.json)"
-          echo "lanes=${lanes}" >> "$GITHUB_OUTPUT"
-          echo "checks=${checks}" >> "$GITHUB_OUTPUT"
+          # `release` for the lanes that boot optimised kernels, `debug`
+          # for the two that boot debug ones.
+          wasm_profiles="$(jq -c '
+            [(if any(.[]; IN("smoke-x86-64", "smoke-riscv64", "smoke-aarch64")) then "release" else empty end),
+             (if any(.[]; IN("smoke-aarch64-cfi", "smoke-x86-64-venus")) then "debug" else empty end)]' <<< "${lanes}")"
+          {
+            echo "wasm_profiles=${wasm_profiles}"
+            echo "lanes=${lanes}"
+            echo "checks=${checks}"
+          } >> "$GITHUB_OUTPUT"
           echo "${lanes}"
 
   # The collection a `profile_format` change spends in place of dev's
@@ -175,6 +186,50 @@ jobs:
     permissions:
       contents: read
     uses: ./.github/workflows/kernel-profile.yml
+
+  # The wasm every smoke lane precompiles into its guest: the compiler
+  # plugin, `init` and every program under `programs/`. None of it depends
+  # on the target, so it is built once per run, in each profile a selected
+  # lane boots (`release` for the optimised kernels, `debug` for the debug
+  # inspector of `smoke-x86-64-venus` and the debug kernel of
+  # `smoke-aarch64-cfi`). The lanes start beside this job rather than after
+  # it, because their set-up outlasts most of the build: each downloads the
+  # result with the `prebuilt-wasm` action just before its first prebuild,
+  # and reads it through `HELIOS_PREBUILT_WASM`, so a file missing from it
+  # fails the lane's prebuild instead of being built there (#882).
+  wasm-programs:
+    name: wasm-programs (${{ matrix.profile }})
+    needs: changes
+    # An empty matrix is an error, not a skip.
+    if: needs.changes.outputs.wasm_profiles != '[]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      matrix:
+        profile: ${{ fromJSON(needs.changes.outputs.wasm_profiles) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: helios
+      - uses: ./helios/.github/actions/checkout-wasmtime
+      - name: Install host dependencies
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/google-chrome*
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libudev-dev cmake ninja-build
+      - name: Build the guest wasm
+        working-directory: helios
+        run: >-
+          cargo run -p helios-cli --
+          wasm-build --out-dir target/wasm-programs
+          --profile ${{ matrix.profile }} --cargo cargo
+      - uses: actions/upload-artifact@v4
+        with:
+          name: helios-wasm-${{ matrix.profile }}
+          path: helios/target/wasm-programs/${{ matrix.profile }}
+          if-no-files-found: error
+          retention-days: 1
 
   checks:
     name: ${{ matrix.name }}
@@ -268,6 +323,13 @@ jobs:
     if: contains(fromJSON(needs.changes.outputs.lanes), 'smoke-riscv64')
     runs-on: ubuntu-24.04
     timeout-minutes: 300
+    # `actions: read` is what the prebuilt-wasm action lists the run's
+    # artifacts and jobs with.
+    permissions:
+      contents: read
+      actions: read
+    env:
+      HELIOS_PREBUILT_WASM: ${{ github.workspace }}/helios/target/wasm-programs
     steps:
       - uses: actions/checkout@v4
         with:
@@ -303,6 +365,11 @@ jobs:
       - name: Build inspector
         working-directory: helios
         run: cargo build --release -p helios-inspector
+      # The first step that prebuilds: `vm` builds the guest image.
+      - uses: ./helios/.github/actions/prebuilt-wasm
+        with:
+          profile: release
+          path: helios/target/wasm-programs/release
       - name: Boot riscv64 guest
         timeout-minutes: 30
         shell: bash
@@ -642,7 +709,11 @@ jobs:
     if: contains(fromJSON(needs.changes.outputs.lanes), 'smoke-aarch64')
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 300
+    permissions:
+      contents: read
+      actions: read
     env:
+      HELIOS_PREBUILT_WASM: ${{ github.workspace }}/helios/target/wasm-programs
       QEMU_VERSION: "11.1.1"
       # download.qemu.org publishes a detached signature but no checksum
       # file; this is the digest of the tarball that signature covers.
@@ -732,6 +803,11 @@ jobs:
       - name: Build inspector
         working-directory: helios
         run: cargo build --release -p helios-inspector
+      # The first step that prebuilds: `vm` builds the guest image.
+      - uses: ./helios/.github/actions/prebuilt-wasm
+        with:
+          profile: release
+          path: helios/target/wasm-programs/release
       # The aarch64 backend takes its whole platform description from
       # the firmware, and QEMU's `virt` publishes a device tree or ACPI
       # tables but never both. Both descriptions have to boot, so the
@@ -1080,7 +1156,12 @@ jobs:
     if: contains(fromJSON(needs.changes.outputs.lanes), 'smoke-aarch64-cfi')
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 300
+    permissions:
+      contents: read
+      actions: read
     env:
+      # The debug guest programs the test's kernel prebuild reads.
+      HELIOS_PREBUILT_WASM: ${{ github.workspace }}/helios/target/wasm-programs
       # The QEMU `smoke-aarch64` pins, restored from the same cache entry.
       QEMU_VERSION: "11.1.1"
       QEMU_SHA256: 079ffbff8a7111bbc89022107cbabf3bbfd614d5fc9d7cc675991196aca12482
@@ -1136,6 +1217,12 @@ jobs:
           tar -xzf "$RUNNER_TEMP/limine-binary.tar.gz" --strip-components=1 \
             -C "$GITHUB_WORKSPACE/limine"
           make -C "$GITHUB_WORKSPACE/limine"
+      # The only step, and it prebuilds: the test builds its own kernel
+      # and the bootfs it boots.
+      - uses: ./helios/.github/actions/prebuilt-wasm
+        with:
+          profile: debug
+          path: helios/target/wasm-programs/debug
       - name: Refuse a corrupted return address
         timeout-minutes: 60
         shell: bash
@@ -1158,6 +1245,7 @@ jobs:
       actions: read
     timeout-minutes: 180
     env:
+      HELIOS_PREBUILT_WASM: ${{ github.workspace }}/helios/target/wasm-programs
       HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
       HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
       # Every boot below names `--accel kvm`. The inspector no longer
@@ -1243,6 +1331,12 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: cargo run --release -p helios-cli -- profile-fetch --run "${{ github.run_id }}"
+      # The first step that prebuilds: `vm` builds the guest image. The
+      # steps before it only fetch the profile, which builds no guest.
+      - uses: ./helios/.github/actions/prebuilt-wasm
+        with:
+          profile: release
+          path: helios/target/wasm-programs/release
       - name: Boot x86-64 guest
         timeout-minutes: 30
         shell: bash
@@ -2267,7 +2361,12 @@ jobs:
     if: contains(fromJSON(needs.changes.outputs.lanes), 'smoke-x86-64-venus')
     runs-on: ubuntu-24.04
     timeout-minutes: 180
+    permissions:
+      contents: read
+      actions: read
     env:
+      # The debug guest programs the lane's debug inspector prebuilds from.
+      HELIOS_PREBUILT_WASM: ${{ github.workspace }}/helios/target/wasm-programs
       HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
       HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
       HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
@@ -2394,6 +2493,11 @@ jobs:
       - name: Build inspector
         working-directory: helios
         run: cargo build -p helios-inspector
+      # The first step that prebuilds: `vm` builds the guest image.
+      - uses: ./helios/.github/actions/prebuilt-wasm
+        with:
+          profile: debug
+          path: helios/target/wasm-programs/debug
       - name: Run gpu-test against Venus
         # The debug build and the boot take a few minutes; a fence the
         # host never retires otherwise holds the step until the job's limit.
