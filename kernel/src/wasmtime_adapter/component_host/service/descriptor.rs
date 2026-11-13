@@ -1455,6 +1455,121 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
         self.entries[to] = Some(entry);
         p1::errno::SUCCESS
     }
+
+    /// POSIX `dup2`: `to` becomes a copy of `from`, which stays open, and
+    /// whatever `to` held is closed. Naming the same descriptor twice
+    /// leaves it as it is.
+    pub(super) fn dup2(&mut self, from: i32, to: i32) -> i32 {
+        if from == to {
+            return match self.get_entry(from) {
+                Some(_) => p1::errno::SUCCESS,
+                None => p1::errno::BADF,
+            };
+        }
+        match self.dup_to(from, to, false) {
+            Ok(_) => p1::errno::SUCCESS,
+            Err(errno) => errno,
+        }
+    }
+
+    /// The stdio a component program launched over this table gets:
+    /// `wasi:cli` stdin, stdout and stderr are descriptors 0, 1 and 2,
+    /// whatever the launching process left in them. `inherited` is the
+    /// launching process's own stdio, which the `Stdin`, `Stdout` and
+    /// `Stderr` descriptors name; a table whose three slots are exactly
+    /// those hands the component `inherited` itself.
+    ///
+    /// A closed slot is a closed stream: stdin reads end of file and a
+    /// write to stdout or stderr fails, as a write to a closed descriptor
+    /// does.
+    pub(super) fn component_output_mode(
+        &self,
+        inherited: &OutputMode,
+    ) -> Result<OutputMode, ComponentStdioRefusal> {
+        let inherits_stdin = matches!(
+            self.get(0),
+            Some(Preview1Descriptor::Stdin { carry }) if carry.is_empty()
+        );
+        if inherits_stdin
+            && matches!(self.get(1), Some(Preview1Descriptor::Stdout))
+            && matches!(self.get(2), Some(Preview1Descriptor::Stderr))
+        {
+            return Ok(inherited.clone());
+        }
+        Ok(OutputMode::RoutedChild {
+            stdin_rx: self.component_stdin(inherited)?,
+            stdout: self.component_output(1, inherited)?,
+            stderr: self.component_output(2, inherited)?,
+        })
+    }
+
+    fn component_stdin(
+        &self,
+        inherited: &OutputMode,
+    ) -> Result<crate::ByteReader, ComponentStdioRefusal> {
+        let closed = || crate::byte_channel().1;
+        match self.get(0) {
+            None | Some(Preview1Descriptor::NullDevice) => Ok(closed()),
+            Some(Preview1Descriptor::Stdin { carry }) if carry.is_empty() => {
+                Ok(inherited.child_stdin().cloned().unwrap_or_else(closed))
+            }
+            Some(Preview1Descriptor::PipeRead { reader, carry }) if carry.is_empty() => {
+                Ok(reader.clone())
+            }
+            Some(descriptor) => Err(ComponentStdioRefusal {
+                fd: 0,
+                held: unbindable_stdio(descriptor),
+            }),
+        }
+    }
+
+    fn component_output(
+        &self,
+        fd: u8,
+        inherited: &OutputMode,
+    ) -> Result<OutputRoute, ComponentStdioRefusal> {
+        match self.get(i32::from(fd)) {
+            None => Ok(OutputRoute::Child(crate::byte_channel().0)),
+            Some(Preview1Descriptor::Stdout) => {
+                Ok(inherited.route(crate::ComponentOutputStreamKind::Stdout))
+            }
+            Some(Preview1Descriptor::Stderr) => {
+                Ok(inherited.route(crate::ComponentOutputStreamKind::Stderr))
+            }
+            Some(Preview1Descriptor::PipeWrite { writer }) => {
+                Ok(OutputRoute::Child(writer.clone()))
+            }
+            Some(Preview1Descriptor::NullDevice) => Ok(OutputRoute::Discard),
+            Some(descriptor) => Err(ComponentStdioRefusal {
+                fd,
+                held: unbindable_stdio(descriptor),
+            }),
+        }
+    }
+}
+
+/// What a descriptor that cannot be a component's standard stream holds.
+fn unbindable_stdio<Net: ComponentHostNetwork>(
+    descriptor: &Preview1Descriptor<Net>,
+) -> UnbindableStdio {
+    match descriptor {
+        Preview1Descriptor::Stdin { carry } | Preview1Descriptor::PipeRead { carry, .. }
+            if !carry.is_empty() =>
+        {
+            UnbindableStdio::ReadAhead
+        }
+        Preview1Descriptor::Stdin { .. }
+        | Preview1Descriptor::PipeRead { .. }
+        | Preview1Descriptor::Stdout
+        | Preview1Descriptor::Stderr
+        | Preview1Descriptor::PipeWrite { .. }
+        | Preview1Descriptor::NullDevice => UnbindableStdio::WrongDirection,
+        Preview1Descriptor::File { .. } => UnbindableStdio::File,
+        Preview1Descriptor::Preopen { .. } => UnbindableStdio::Directory,
+        Preview1Descriptor::Socket(_) => UnbindableStdio::Socket,
+        Preview1Descriptor::Event(_) => UnbindableStdio::Event,
+        Preview1Descriptor::Epoll(_) => UnbindableStdio::Epoll,
+    }
 }
 
 impl<Net: ComponentHostNetwork> Preview1DescriptorEntry<Net> {

@@ -40,6 +40,8 @@ pub mod mounts;
 #[cfg(feature = "net")]
 pub mod net;
 pub mod prelude;
+#[cfg(feature = "processors")]
+pub mod processors;
 #[cfg(feature = "profiling")]
 pub mod profiling;
 #[cfg(feature = "programs")]

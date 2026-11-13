@@ -22,7 +22,7 @@ use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use helios_hal::cpu::{Cpu, ProcessorId};
 use helios_hal::numa::SingleNode;
 use helios_hal::{DeviceInventory, DmaModel, Platform, ProcessorStartupPolicy, ProcessorTopology};
-use helios_kernel::{FreezeError, Kernel, Spawner, yield_now};
+use helios_kernel::{FreezeError, Kernel, ProcessorLifecycle, Spawner, yield_now};
 
 use crate::config::DEFAULT_HEAP_BYTES;
 use crate::console::HostedConsole;

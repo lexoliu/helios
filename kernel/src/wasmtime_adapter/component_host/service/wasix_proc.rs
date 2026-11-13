@@ -860,7 +860,7 @@ where
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              from: i32,
              to: i32|
-             -> i32 { p1_fd_renumber(&mut caller, from, to) },
+             -> i32 { wasix_fd_renumber(&mut caller, from, to) },
         )
         .map_err(map_program_runtime_error)?;
     linker
@@ -1124,6 +1124,23 @@ where
         Err(errno) => return errno,
     };
     p1_write_u32(caller, memory, GuestAddress::wasm32(ret_fd), duplicated)
+}
+
+/// WASIX `fd_renumber` copies: `to` becomes a duplicate of `from` and
+/// `from` stays open, which is POSIX `dup2` and the call the WASIX libc's
+/// `dup2` makes. Preview 1's call of the same name moves the descriptor
+/// instead, so the two modules link different functions.
+pub(super) fn wasix_fd_renumber<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+    from: i32,
+    to: i32,
+) -> i32
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    caller.data_mut().descriptors.dup2(from, to)
 }
 
 pub(super) fn wasix_fd_dup2<CpuImpl, Net, StorageImpl>(
@@ -2310,6 +2327,9 @@ pub(super) fn wasix_proc_spawn_inherited_non_directory_authority(
     // The observation right follows the shell the same way: the programs
     // a launcher runs through `dash` observe the machine as it does.
     authority.grant_diagnostic_rights(parent.diagnostic_rights());
+    // So does the right to control processors: `cpu` run from the
+    // launcher's shell acts with the launcher's authority.
+    authority.grant_machine_rights(parent.machine_rights());
     authority
 }
 

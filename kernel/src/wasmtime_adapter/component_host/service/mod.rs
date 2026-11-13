@@ -26,6 +26,8 @@ pub(super) use surface::add_surface_to_linker;
 mod audio;
 pub use audio::PlaybackHandle;
 pub(super) use audio::add_audio_to_linker;
+mod processors;
+pub(super) use processors::add_processors_to_linker;
 mod compile_session;
 use compile_session::*;
 mod compiler;
@@ -65,7 +67,10 @@ use crate::wasmtime_adapter::{
         bindings::filesystem::types as fs_types, preview1 as p1,
     },
 };
-use crate::{BootfsBytes, GuestAddress, ProgramExecErrorDetail, RuntimeMessage};
+use crate::{
+    BootfsBytes, ComponentStdioRefusal, GuestAddress, ProgramExecErrorDetail, RuntimeMessage,
+    UnbindableStdio,
+};
 use crate::{FileContents, MemoryFs, Namespace};
 use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
@@ -2943,6 +2948,192 @@ mod tests {
         ])
     }
 
+    /// dash applies `2>&1` around a command in the shell itself and
+    /// restores afterwards: save fd 2 (`fcntl(F_DUPFD)`, which is
+    /// `fd_dup`), `dup2(1, 2)`, run the command, `dup2(saved, 2)`,
+    /// `close(saved)`. The WASIX libc's `dup2` is `fd_renumber`, so the
+    /// shell's own stdout survives the pair only if `fd_renumber` copies.
+    #[test]
+    fn wasix_dup2_and_restore_of_stderr_leaves_stdout_open() {
+        let mut table = stdio_table();
+
+        let saved = i32::try_from(table.dup(2).expect("fd 2 is open")).expect("small fd");
+        assert_eq!(table.dup2(1, 2), p1::errno::SUCCESS);
+        assert!(matches!(table.get(1), Some(Preview1Descriptor::Stdout)));
+        assert!(matches!(table.get(2), Some(Preview1Descriptor::Stdout)));
+
+        assert_eq!(table.dup2(saved, 2), p1::errno::SUCCESS);
+        assert_eq!(table.close(saved), p1::errno::SUCCESS);
+        assert!(matches!(table.get(1), Some(Preview1Descriptor::Stdout)));
+        assert!(matches!(table.get(2), Some(Preview1Descriptor::Stderr)));
+        assert!(table.get(saved).is_none());
+    }
+
+    #[test]
+    fn wasix_dup2_onto_itself_changes_nothing_and_needs_an_open_source() {
+        let mut table = stdio_table();
+        assert_eq!(table.set_close_on_exec(1, true), p1::errno::SUCCESS);
+
+        assert_eq!(table.dup2(1, 1), p1::errno::SUCCESS);
+        assert_eq!(table.close_on_exec(1), Ok(true));
+        assert_eq!(table.dup2(7, 7), p1::errno::BADF);
+        assert_eq!(table.dup2(7, 1), p1::errno::BADF);
+        assert!(matches!(table.get(1), Some(Preview1Descriptor::Stdout)));
+    }
+
+    /// The writer a component's stream `kind` resolves to under `mode`.
+    fn component_channel(
+        mode: &OutputMode,
+        kind: crate::ComponentOutputStreamKind,
+    ) -> crate::ByteWriter {
+        match mode.route(kind) {
+            OutputRoute::Child(writer) => writer,
+            _ => panic!("the component's stream is not a channel"),
+        }
+    }
+
+    /// The process's own stdio as the debugger hands it to a shell: three
+    /// channels whose far ends the test holds.
+    fn session_stdio() -> (OutputMode, crate::ByteReader, crate::ByteReader) {
+        let (_, stdin_rx) = crate::byte_channel();
+        let (stdout_tx, stdout_rx) = crate::byte_channel();
+        let (stderr_tx, stderr_rx) = crate::byte_channel();
+        (
+            OutputMode::Child {
+                stdin_rx,
+                stdout_tx,
+                stderr_tx,
+            },
+            stdout_rx,
+            stderr_rx,
+        )
+    }
+
+    /// `$(component)`: the shell's child puts a pipe's write end at fd 1
+    /// and execs the component, whose stdout must reach the pipe rather
+    /// than the session.
+    #[test]
+    fn component_launched_with_a_pipe_at_stdout_writes_to_the_pipe() {
+        let (session, session_stdout, session_stderr) = session_stdio();
+        let (pipe_tx, pipe_rx) = crate::byte_channel();
+        let mut table = stdio_table();
+        let pipe = table
+            .insert(Preview1Descriptor::PipeWrite { writer: pipe_tx })
+            .expect("a free slot");
+        let pipe = i32::try_from(pipe).expect("small fd");
+        assert_eq!(table.dup2(pipe, 1), p1::errno::SUCCESS);
+        assert_eq!(table.close(pipe), p1::errno::SUCCESS);
+
+        let mode = table
+            .clone_for_exec()
+            .component_output_mode(&session)
+            .expect("a pipe is a component stdout");
+        drop(table);
+
+        let stdout = component_channel(&mode, crate::ComponentOutputStreamKind::Stdout);
+        assert!(matches!(
+            stdout.try_write(Bytes::from_static(b"possible 4\n")),
+            crate::TryWrite::Written
+        ));
+        assert!(matches!(
+            pipe_rx.try_read(),
+            crate::io::TryRead::Ready(bytes) if bytes.as_ref() == b"possible 4\n"
+        ));
+        assert!(matches!(
+            session_stdout.try_read(),
+            crate::io::TryRead::Pending
+        ));
+
+        let stderr = component_channel(&mode, crate::ComponentOutputStreamKind::Stderr);
+        assert!(matches!(
+            stderr.try_write(Bytes::from_static(b"usage\n")),
+            crate::TryWrite::Written
+        ));
+        assert!(matches!(
+            session_stderr.try_read(),
+            crate::io::TryRead::Ready(bytes) if bytes.as_ref() == b"usage\n"
+        ));
+
+        // The component's stream is the pipe's last write end, so the
+        // shell reading the substitution sees end of file once it ends.
+        drop((stdout, mode));
+        assert!(matches!(pipe_rx.try_read(), crate::io::TryRead::Eof));
+    }
+
+    /// `component 2>&1`: fd 2 is a copy of fd 1, so the component's stderr
+    /// goes where the shell's stdout goes.
+    #[test]
+    fn component_launched_with_stderr_on_stdout_writes_stderr_to_stdout() {
+        let (session, session_stdout, session_stderr) = session_stdio();
+        let mut table = stdio_table();
+        assert_eq!(table.dup2(1, 2), p1::errno::SUCCESS);
+
+        let mode = table
+            .component_output_mode(&session)
+            .expect("stdout is a component stderr");
+        let stderr = component_channel(&mode, crate::ComponentOutputStreamKind::Stderr);
+        assert!(matches!(
+            stderr.try_write(Bytes::from_static(b"usage\n")),
+            crate::TryWrite::Written
+        ));
+        assert!(matches!(
+            session_stdout.try_read(),
+            crate::io::TryRead::Ready(bytes) if bytes.as_ref() == b"usage\n"
+        ));
+        assert!(matches!(
+            session_stderr.try_read(),
+            crate::io::TryRead::Pending
+        ));
+    }
+
+    #[test]
+    fn component_launched_over_the_process_stdio_keeps_the_process_mode() {
+        let mode = stdio_table()
+            .component_output_mode(&OutputMode::Serial)
+            .expect("the process's own stdio");
+        assert!(matches!(mode, OutputMode::Serial));
+    }
+
+    #[test]
+    fn component_stdio_closed_slots_are_closed_streams_and_files_are_refused() {
+        let (session, _, _) = session_stdio();
+        let mut table = stdio_table();
+        assert_eq!(table.close(0), p1::errno::SUCCESS);
+        assert_eq!(table.close(1), p1::errno::SUCCESS);
+        let mode = table
+            .component_output_mode(&session)
+            .expect("closed slots are closed streams");
+        let OutputMode::RoutedChild { stdin_rx, .. } = &mode else {
+            panic!("a redirected table routes each stream");
+        };
+        assert!(matches!(stdin_rx.try_read(), crate::io::TryRead::Eof));
+        let stdout = component_channel(&mode, crate::ComponentOutputStreamKind::Stdout);
+        assert!(matches!(
+            stdout.try_write(Bytes::from_static(b"lost\n")),
+            crate::TryWrite::Closed
+        ));
+
+        let file: TestDescriptor = Preview1Descriptor::File {
+            descriptor: FsDescriptor {
+                path: "/redirected".into(),
+                kind: FsNodeKind::File,
+                flags: fs_types::DescriptorFlags::WRITE,
+                identity: None,
+                mount: None,
+            },
+            offset: 0,
+            fdflags: 0,
+        };
+        assert_eq!(table.insert_at(1, file, false), Ok(1));
+        assert_eq!(
+            table.component_output_mode(&session).err(),
+            Some(ComponentStdioRefusal {
+                fd: 1,
+                held: UnbindableStdio::File,
+            })
+        );
+    }
+
     #[test]
     fn fd_renumber_past_the_descriptor_limit_is_badf_and_allocates_nothing() {
         let mut table = stdio_table();
@@ -3249,6 +3440,7 @@ mod tests {
             crate::DeviceClassRights::DISPLAY | crate::DeviceClassRights::AUDIO,
         );
         parent.grant_diagnostic_rights(crate::DiagnosticAuthorityRights::OBSERVE_MACHINE);
+        parent.grant_machine_rights(crate::MachineAuthorityRights::CONTROL_PROCESSORS);
 
         let child = wasix_proc_spawn_inherited_non_directory_authority(&parent);
 
@@ -3274,6 +3466,10 @@ mod tests {
         assert_eq!(
             child.diagnostic_rights(),
             crate::DiagnosticAuthorityRights::OBSERVE_MACHINE
+        );
+        assert_eq!(
+            child.machine_rights(),
+            crate::MachineAuthorityRights::CONTROL_PROCESSORS
         );
         assert!(parent.contains_authority(&child));
     }

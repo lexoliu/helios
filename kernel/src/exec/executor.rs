@@ -23,7 +23,7 @@ use crate::exec::freeze::FreezeBarrier;
 use crate::exec::idle::{
     IDLE_POLL_GROW_START, IDLE_POLL_MAX, IdleOutcome, IdleState, ProcessorIdle,
 };
-use crate::exec::lifecycle::{OnlineSet, ProcessorLifecycles};
+use crate::exec::lifecycle::{OnlineSet, ProcessorControl, ProcessorLifecycles};
 use crate::exec::ready::{
     GlobalPop, GlobalReadyQueue, ReadyLink, ReadyRunnable, ReadyShared, RunList,
 };
@@ -1274,6 +1274,12 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
         self.progress.clone()
     }
 
+    /// The initiator's handle on the lifecycle of the machine this
+    /// spawner's executor group runs.
+    pub(crate) fn processor_control(&self) -> ProcessorControl<CpuImpl> {
+        ProcessorControl::new(self.cpu.clone(), self.group)
+    }
+
     pub(crate) fn progress_notify(&self) -> NoWeakArc<Notify> {
         self.progress_notify.clone()
     }
@@ -1515,6 +1521,11 @@ impl<CpuImpl: Cpu + Clone> InstanceSpawner<CpuImpl> {
     /// takes it.
     pub(crate) fn launch_spawner(&self) -> &Spawner<CpuImpl> {
         &self.inner
+    }
+
+    /// The initiator's handle on the machine's processor lifecycle.
+    pub(crate) fn processor_control(&self) -> ProcessorControl<CpuImpl> {
+        self.inner.processor_control()
     }
 
     pub fn try_spawn<Fut>(&self, future: Fut) -> Result<JoinHandle<Fut::Output>, TaskCapacityError>

@@ -26,7 +26,7 @@ use helios_hal::processor_hotplug::{
 };
 use helios_hal::watchdog::Watchdog;
 
-use super::lifecycle::{OfflineError, OnlineError, ProcessorControl};
+use super::lifecycle::{OfflineError, OnlineError, ProcessorControl, ProcessorLifecycle};
 use crate::Kernel;
 
 /// Answers every request `firmware` raises, for the life of the machine.

@@ -2154,6 +2154,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "helios-cpu"
+version = "0.1.0"
+dependencies = [
+ "helios-api",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "helios-date"
 version = "0.1.0"
 dependencies = [
