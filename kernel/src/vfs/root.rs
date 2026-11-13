@@ -37,10 +37,10 @@ use core::future::Future;
 use bytes::Bytes;
 use helios_hal::fs::{
     DirCookie, DirEntry, FileSystem, FsError, FsPath, FsResult, Metadata, NodeKind, OpenFlags,
-    WritePosition,
+    PreparedWrite, WritePosition, WriteProgress,
 };
 
-use super::memory::UpperView;
+use super::memory::{MemoryWrite, UpperView};
 use super::{FileContents, MemoryFs, read_all};
 use crate::BootFs;
 
@@ -93,7 +93,7 @@ impl RootFs {
     /// The object `path` names, and the layer it comes from.
     ///
     /// This and the other helpers below answer at once: both layers are in
-    /// memory, and [`FileSystem::write_with`] must copy up before it
+    /// memory, and a [`RootWrite`]'s submit must copy up before it
     /// returns.
     fn find(&self, path: FsPath<'_>) -> FsResult<Found> {
         let upper = self.upper.view(path)?;
@@ -225,7 +225,70 @@ impl RootFs {
     }
 }
 
+/// A write to a namespace's root, staged at once like the tree it lands
+/// in. A boot-image file is copied up when the write is submitted, so a
+/// write dropped before then leaves the boot layer serving the file.
+pub struct RootWrite<'a> {
+    root: &'a RootFs,
+    path: FsPath<'a>,
+    position: WritePosition,
+    len: usize,
+    now: u64,
+}
+
+impl<'a> RootWrite<'a> {
+    fn prepare(
+        root: &'a RootFs,
+        path: FsPath<'a>,
+        position: WritePosition,
+        len: usize,
+        now: u64,
+    ) -> FsResult<Self> {
+        match root.find(path)?.metadata.kind {
+            NodeKind::File => {}
+            NodeKind::Directory => return Err(FsError::IsDirectory),
+            NodeKind::Symlink => return Err(FsError::Invalid),
+        }
+        Ok(Self {
+            root,
+            path,
+            position,
+            len,
+            now,
+        })
+    }
+
+    fn land(self, fill: impl FnMut(usize, &mut [u8])) -> FsResult<u64> {
+        self.root.copy_up(self.path)?;
+        MemoryWrite::prepare(
+            &self.root.upper,
+            self.path,
+            self.position,
+            self.len,
+            self.now,
+        )?
+        .land(fill)
+    }
+}
+
+impl PreparedWrite for RootWrite<'_> {
+    fn staged_len(&self) -> usize {
+        self.len
+    }
+
+    fn submit<F>(self, fill: F) -> impl Future<Output = FsResult<WriteProgress<Self>>> + Send
+    where
+        F: FnMut(usize, &mut [u8]),
+    {
+        // The copy-up and the write are done here; the future only reports
+        // them, so it holds nothing of `fill`.
+        core::future::ready(self.land(fill).map(WriteProgress::Done))
+    }
+}
+
 impl FileSystem for RootFs {
+    type Write<'a> = RootWrite<'a>;
+
     async fn stat(&self, path: FsPath<'_>) -> FsResult<Metadata> {
         self.find(path).map(|found| found.metadata)
     }
@@ -253,23 +316,14 @@ impl FileSystem for RootFs {
         }
     }
 
-    fn write_with<'a, F>(
+    fn prepare_write<'a>(
         &'a self,
         path: FsPath<'a>,
         position: WritePosition,
         len: usize,
         now: u64,
-        fill: F,
-    ) -> impl Future<Output = FsResult<u64>> + Send + 'a
-    where
-        F: FnOnce(&mut [u8]),
-    {
-        // The copy-up and the write are done here; the future only reports
-        // them, so it holds nothing of `fill`.
-        core::future::ready(
-            self.copy_up(path)
-                .and_then(|_| self.upper.write_now(path, position, len, now, fill)),
-        )
+    ) -> impl Future<Output = FsResult<RootWrite<'a>>> + Send + 'a {
+        core::future::ready(RootWrite::prepare(self, path, position, len, now))
     }
 
     async fn set_size(&self, path: FsPath<'_>, size: u64, now: u64) -> FsResult<()> {

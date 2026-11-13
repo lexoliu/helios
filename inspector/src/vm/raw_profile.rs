@@ -106,6 +106,8 @@ pub(crate) enum GuestProfileRefusal {
     OutOfRange { len: u64 },
     #[error("the guest serves at most {limit} bytes per read")]
     ReadTooLarge { limit: u32 },
+    #[error("the session does not hold the right to observe the machine")]
+    Denied,
 }
 
 impl From<RawProfileError> for GuestProfileRefusal {
@@ -122,6 +124,7 @@ impl From<RawProfileError> for GuestProfileRefusal {
             },
             RawProfileError::OutOfRange(len) => Self::OutOfRange { len },
             RawProfileError::ReadTooLarge(limit) => Self::ReadTooLarge { limit },
+            RawProfileError::Denied => Self::Denied,
         }
     }
 }

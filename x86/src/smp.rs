@@ -1,7 +1,7 @@
 extern crate alloc;
 
 use acpi::platform::{AcpiPlatform, ProcessorState};
-use acpi::{AcpiTables, Handler, PciAddress, PhysicalMapping};
+use acpi::{AcpiTables, Handler, PciAddress, RawPhysicalMapping};
 use alloc::alloc::{Layout, alloc_zeroed};
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -14,6 +14,7 @@ use core::ptr::NonNull;
 use core::sync::atomic::{
     AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicUsize, Ordering, compiler_fence,
 };
+use helios_artifact::ProbeAnswers;
 use helios_hal::cpu::{GUEST_STACK_LIMIT_OFFSET, ProcessorId, Timebase};
 use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::watchdog::Watchdog;
@@ -303,6 +304,9 @@ impl ProcessorRuntime {
 pub(crate) struct BootContext {
     platform: Arc<X86PlatformState>,
     xcr0: Xcr0,
+    /// The bootstrap processor's answer to every ISA level feature, taken
+    /// after it programmed XCR0. Immutable; each secondary compares its own.
+    isa_answers: ProbeAnswers,
 }
 
 pub(crate) struct X86PlatformState {
@@ -476,7 +480,11 @@ pub(crate) fn build_boot_context(
     if let Some(wakeup_page) = platform.wakeup_page.as_ref() {
         prepare_wakeup_page(&platform, wakeup_page);
     }
-    let context = Box::leak(Box::new(BootContext { platform, xcr0 }));
+    let context = Box::leak(Box::new(BootContext {
+        platform,
+        xcr0,
+        isa_answers: crate::probe_isa_answers(),
+    }));
     context
         .platform
         .boot_context
@@ -955,6 +963,12 @@ impl BootContext {
     /// [`crate::extended_state::enable_on_secondary_processor`].
     pub(crate) fn xcr0(&self) -> Xcr0 {
         self.xcr0
+    }
+
+    /// The bootstrap processor's ISA level feature answers; see
+    /// [`crate::probe_isa_answers`].
+    pub(crate) fn isa_answers(&self) -> ProbeAnswers {
+        self.isa_answers
     }
 
     pub(crate) fn bootstrap_runtime(&self) -> &ProcessorRuntime {
@@ -1735,18 +1749,22 @@ impl Handler for PhysicalOffsetAcpiHandler {
         &self,
         physical_address: usize,
         size: usize,
-    ) -> PhysicalMapping<Self, T> {
+    ) -> RawPhysicalMapping<T> {
         ensure_hhdm_range_mapped(self.physical_memory_offset, physical_address, size);
-        PhysicalMapping {
-            physical_start: physical_address,
-            virtual_start: self.physical_to_virtual(physical_address),
-            region_length: size,
-            mapped_length: size,
-            handler: self.clone(),
+        // SAFETY: the virtual address is the direct-map alias of the
+        // physical range, which no other mapping of this handler aliases
+        // mutably, and `unmap_physical_region` has nothing to undo.
+        unsafe {
+            RawPhysicalMapping::new(
+                physical_address,
+                self.physical_to_virtual(physical_address),
+                size,
+                size,
+            )
         }
     }
 
-    fn unmap_physical_region<T>(_region: &PhysicalMapping<Self, T>) {}
+    unsafe fn unmap_physical_region<T>(&self, _region: RawPhysicalMapping<T>) {}
 
     fn read_u8(&self, address: usize) -> u8 {
         unsafe { (address as *const u8).read_volatile() }
@@ -1845,17 +1863,32 @@ impl Handler for PhysicalOffsetAcpiHandler {
         self.stall(milliseconds.saturating_mul(1_000));
     }
 
+    /// AML mutexes need no state here, and the handle is the same for
+    /// every one of them.
+    ///
+    /// A mutex keeps two threads of control out of the same AML region.
+    /// The only AML interpreter this backend builds (`vmgenid`) is
+    /// created, used and dropped on the bootstrap processor during
+    /// bring-up, before any secondary starts and before the executor
+    /// exists, so it has one thread of control: every acquire succeeds at
+    /// once, recursive acquires included, and a release has nothing to
+    /// hand over. [`Self::acquire`] asserts that rather than assuming it,
+    /// so an interpreter that ever ran elsewhere fails here instead of
+    /// silently losing mutual exclusion.
     fn create_mutex(&self) -> acpi::Handle {
-        panic!("AML mutex creation is unsupported in the x86 ACPI handler")
+        acpi::Handle(0)
     }
 
     fn acquire(&self, _mutex: acpi::Handle, _timeout: u16) -> Result<(), acpi::aml::AmlError> {
-        panic!("AML mutex acquisition is unsupported in the x86 ACPI handler")
+        assert!(
+            current_processor() == ProcessorId::new(0),
+            "the AML interpreter ran outside the bootstrap processor, where its mutexes would \
+             no longer provide mutual exclusion"
+        );
+        Ok(())
     }
 
-    fn release(&self, _mutex: acpi::Handle) {
-        panic!("AML mutex release is unsupported in the x86 ACPI handler")
-    }
+    fn release(&self, _mutex: acpi::Handle) {}
 }
 
 fn prepare_wakeup_page(platform: &X86PlatformState, wakeup_page: &WakeupPage) {

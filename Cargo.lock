@@ -4,16 +4,18 @@ version = 4
 
 [[package]]
 name = "acpi"
-version = "6.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b763acdc1d85c36d61acf97a59938f23202d0e8efe45e8759de10c02db242744"
+version = "7.0.0-pre1"
+source = "git+https://github.com/rust-osdev/acpi?branch=main#bd878824a20bd7af1386cc7daf861eb1aee50a5f"
 dependencies = [
  "bit_field",
  "bitflags 2.13.1",
  "byteorder",
+ "lock_api",
  "log",
  "pci_types",
+ "smallvec",
  "spinning_top",
+ "static_assertions",
 ]
 
 [[package]]
@@ -568,6 +570,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "capstone"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f442ae0f2f3f1b923334b4a5386c95c69c1cfa072bafa23d6fae6d9682eb1dd4"
+dependencies = [
+ "capstone-sys",
+ "static_assertions",
+]
+
+[[package]]
+name = "capstone-sys"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4e8087cab6731295f5a2a2bd82989ba4f41d3a428aab2e7c98d8f4db38aac05"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "castaway"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -896,7 +917,9 @@ dependencies = [
 name = "cranelift-codegen"
 version = "0.135.0"
 dependencies = [
+ "anyhow",
  "bumpalo",
+ "capstone",
  "cranelift-assembler-x64",
  "cranelift-bforest",
  "cranelift-bitset",
@@ -974,6 +997,16 @@ version = "0.135.0"
 dependencies = [
  "cranelift-codegen",
  "libc",
+ "target-lexicon",
+]
+
+[[package]]
+name = "cranelift-reader"
+version = "0.135.0"
+dependencies = [
+ "anyhow",
+ "cranelift-codegen",
+ "smallvec",
  "target-lexicon",
 ]
 
@@ -1844,9 +1877,11 @@ version = "0.1.0"
 dependencies = [
  "acpi",
  "arm-gic",
+ "arm-sysregs",
  "bytes",
  "critical-section",
  "fdt",
+ "helios-artifact",
  "helios-hal",
  "helios-kernel",
  "helios-virtio",
@@ -1856,6 +1891,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tracing",
  "triomphe",
+ "zeroize",
 ]
 
 [[package]]
@@ -1964,6 +2000,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "getrandom 0.3.4",
+ "helios-artifact",
  "helios-compiler-abi",
  "helios-compiler-support",
  "serde",
@@ -1983,6 +2020,7 @@ name = "helios-compiler-plugin"
 version = "0.1.0"
 dependencies = [
  "cranelift-codegen",
+ "helios-artifact",
  "helios-compiler-abi",
  "helios-compiler-support",
  "tracing",
@@ -1995,6 +2033,7 @@ name = "helios-compiler-support"
 version = "0.1.0"
 dependencies = [
  "cranelift-codegen",
+ "cranelift-reader",
  "helios-artifact",
  "rayon",
  "thiserror 2.0.21",
@@ -2085,6 +2124,7 @@ dependencies = [
  "crossbeam-channel",
  "futures-lite",
  "getrandom 0.3.4",
+ "helios-artifact",
  "helios-hal",
  "helios-inspector-protocol",
  "helios-kernel",
@@ -2404,6 +2444,7 @@ dependencies = [
  "bitflags 2.13.1",
  "bytes",
  "critical-section",
+ "helios-artifact",
  "helios-hal",
  "helios-kernel",
  "helios-virtio",

@@ -11,7 +11,8 @@
 ;;
 ;; `helios_compiler_compile` answers a well-formed request by spawning one
 ;; thread, waiting for it, and returning
-;; `[hint: u32][environ bytes][target][input]` as the "precompiled" output,
+;; `[hint: u32][environ bytes][target][isa level][input]` as the
+;; "precompiled" output,
 ;; so a test can read the whole request back. An input whose first byte is
 ;; 1 makes the thread trap; 2 answers ABI version 99 (its response header
 ;; uncounted, as a plugin of another layout would keep it); 3 answers
@@ -97,6 +98,8 @@
     (local $wasm_len i32)
     (local $target i32)
     (local $target_len i32)
+    (local $isa i32)
+    (local $isa_len i32)
     (local $first i32)
     (local $environ_len i32)
     (local $output i32)
@@ -104,27 +107,29 @@
     (local $diagnostic i32)
     (local $response i32)
     ;; The host adopted the TLS block and initialised the thread pointer
-    ;; from it, and sent a version-2 header of the declared length.
+    ;; from it, and sent a version-3 header of the declared length.
     (if (i32.or
           (i32.ne (i32.load (i32.const 8)) (i32.add (global.get $tls_base) (i32.const 16)))
           (i32.or
-            (i32.ne (local.get $request_len) (i32.const 28))
-            (i32.ne (i32.load (local.get $request)) (i32.const 2))))
+            (i32.ne (local.get $request_len) (i32.const 36))
+            (i32.ne (i32.load (local.get $request)) (i32.const 3))))
       (then
-        (return (call $respond (i32.const 2) (i32.const 1) (i32.const 0)
+        (return (call $respond (i32.const 3) (i32.const 1) (i32.const 0)
           (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)))))
     (local.set $hint (i32.load offset=4 (local.get $request)))
     (local.set $wasm (i32.load offset=8 (local.get $request)))
     (local.set $wasm_len (i32.load offset=12 (local.get $request)))
     (local.set $target (i32.load offset=16 (local.get $request)))
     (local.set $target_len (i32.load offset=20 (local.get $request)))
+    (local.set $isa (i32.load offset=24 (local.get $request)))
+    (local.set $isa_len (i32.load offset=28 (local.get $request)))
     (if (i32.eqz (local.get $wasm_len))
       (then
         (local.set $diagnostic (call $alloc (i32.const 5) (i32.const 1)))
         ;; "empt" little-endian, then "y".
         (i32.store (local.get $diagnostic) (i32.const 0x74706d65))
         (i32.store8 offset=4 (local.get $diagnostic) (i32.const 0x79))
-        (return (call $respond (i32.const 2) (i32.const 3) (i32.const 0)
+        (return (call $respond (i32.const 3) (i32.const 3) (i32.const 0)
           (i32.const 0) (i32.const 0) (local.get $diagnostic) (i32.const 5)))))
     (local.set $first (i32.load8_u (local.get $wasm)))
     (if (i32.eq (local.get $first) (i32.const 2))
@@ -136,18 +141,18 @@
         (return (local.get $response))))
     (if (i32.eq (local.get $first) (i32.const 3))
       (then
-        (return (call $respond (i32.const 2) (i32.const 77) (i32.const 0)
+        (return (call $respond (i32.const 3) (i32.const 77) (i32.const 0)
           (call $alloc (i32.const 3) (i32.const 1)) (i32.const 3)
           (i32.const 0) (i32.const 0)))))
     (if (i32.eq (local.get $first) (i32.const 4))
       (then
-        (return (call $respond (i32.const 2) (i32.const 0) (i32.const 55)
+        (return (call $respond (i32.const 3) (i32.const 0) (i32.const 55)
           (call $alloc (i32.const 3) (i32.const 1)) (i32.const 3)
           (i32.const 0) (i32.const 0)))))
     (i32.atomic.store (i32.const 12) (i32.const 0))
     (if (i32.lt_s (call $spawn (i32.eq (local.get $first) (i32.const 1))) (i32.const 0))
       (then
-        (return (call $respond (i32.const 2) (i32.const 3) (i32.const 0)
+        (return (call $respond (i32.const 3) (i32.const 3) (i32.const 0)
           (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)))))
     ;; A thread told to trap never raises the flag, so only a healthy
     ;; one is waited for.
@@ -163,7 +168,9 @@
     (local.set $output_len
       (i32.add
         (i32.add (i32.const 4) (local.get $environ_len))
-        (i32.add (local.get $target_len) (local.get $wasm_len))))
+        (i32.add
+          (i32.add (local.get $target_len) (local.get $isa_len))
+          (local.get $wasm_len))))
     (local.set $output (call $alloc (local.get $output_len) (i32.const 4)))
     (i32.store (local.get $output) (local.get $hint))
     (drop (call $environ_get (i32.const 40) (i32.add (local.get $output) (i32.const 4))))
@@ -175,10 +182,18 @@
       (i32.add
         (i32.add (i32.add (local.get $output) (i32.const 4)) (local.get $environ_len))
         (local.get $target_len))
+      (local.get $isa)
+      (local.get $isa_len))
+    (memory.copy
+      (i32.add
+        (i32.add
+          (i32.add (i32.add (local.get $output) (i32.const 4)) (local.get $environ_len))
+          (local.get $target_len))
+        (local.get $isa_len))
       (local.get $wasm)
       (local.get $wasm_len))
     (local.set $response
-      (call $respond (i32.const 2) (i32.const 0) (i32.const 0)
+      (call $respond (i32.const 3) (i32.const 0) (i32.const 0)
         (local.get $output) (local.get $output_len) (i32.const 0) (i32.const 0)))
     (if (i32.eq (local.get $first) (i32.const 5))
       (then (call $count (i32.const 7))))

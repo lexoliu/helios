@@ -5,6 +5,12 @@ repo_root := justfile_directory()
 # Default profile directory used by `kernel-prebuild --profile`.
 default_profile := "debug"
 
+# The one bare-metal target whose rustflags carry `-Zbranch-protection`, which
+# rustc refuses to mix with a precompiled `core`, `alloc` or
+# `compiler_builtins` (`.cargo/config.toml`). Its builds rebuild them.
+build_std_target := "aarch64-unknown-none"
+build_std_flag := "-Zbuild-std=core,alloc"
+
 # Generate the kernel-prebuild manifest for `target` and run `cargo check` against it.
 # helios-kernel is checked with the feature set the bare-metal backends select,
 # not its host defaults: `wasmtime-host` on a `target_os = "none"` target is a
@@ -22,10 +28,12 @@ check-target target package:
         --cargo cargo
     export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
     export HELIOS_KERNEL_ROOT_SECRET_KEY="${out_dir}/helios-root-secret.key"
-    cargo check -p helios-kernel \
+    build_std="{{ if target == build_std_target { build_std_flag } else { "" } }}"
+    # Unquoted on purpose: an empty value must expand to no argument.
+    cargo check ${build_std} -p helios-kernel \
         --no-default-features --features wasmtime-bare-metal,embedded-debugger \
         --target "{{target}}"
-    cargo check -p "{{package}}" --target "{{target}}"
+    cargo check ${build_std} -p "{{package}}" --target "{{target}}"
 
 # Every clippy and rustfmt gate CI enforces.
 lint:
@@ -154,11 +162,13 @@ clippy-target target package:
     # Two invocations, for the same reason `check-target` uses explicit
     # features: cargo would otherwise unify helios-kernel's host defaults with
     # the backend's `wasmtime-bare-metal` selection.
-    cargo clippy \
+    build_std="{{ if target == build_std_target { build_std_flag } else { "" } }}"
+    # Unquoted on purpose: an empty value must expand to no argument.
+    cargo clippy ${build_std} \
         -p helios-kernel --no-default-features \
         --features wasmtime-bare-metal,embedded-debugger \
         --target "{{target}}" -- -D warnings
-    cargo clippy \
+    cargo clippy ${build_std} \
         -p "{{package}}" --target "{{target}}" -- -D warnings
 
 # Build the instrumented kernel image of docs/pgo.md for `arch` (aarch64,

@@ -21,6 +21,10 @@ mod host_fs;
 mod input;
 mod instance;
 mod io;
+#[cfg(feature = "wasmtime-runtime")]
+mod isa;
+#[cfg(feature = "wasmtime-runtime")]
+pub use isa::GuestIsa;
 mod kernel_exception;
 mod log;
 mod machine;
@@ -104,21 +108,24 @@ pub use exec::{
     CompactionBudget, CompactionPolicy, CompactionReport, CompactionTarget, Compactor,
     DEFAULT_PERF_METRIC_CAPACITY, DEFAULT_PROFILE_STACK_CAPACITY, DEFAULT_TRACE_HISTORY_CAPACITY,
     Executor, ExecutorRunStats, FoldedProfileSample, FreezeError, FrozenMachine, GUEST_TIME_SLICE,
-    IdleOutcome, InstanceSpawner, JoinHandle, KernelClock, LocalJoinHandle, Mutex, MutexGuard,
-    Notified, Notify, NotifyWaiter, OfflineError, OfflineRefusal, OnlineError, OnlineSet,
-    OwnedRawMutexLease, OwnedRawRwLockReadLease, OwnedRawRwLockWriteLease, PerfMetricFilter,
-    PerfMetricHistory, PerfMetricSample, PerfSample, PinnedTasks, PressureLevel, ProcessorControl,
-    ProfileFilter, ProfileHistory, ProfileScope, ProfileSink, ProgressChanged, ProgressMark,
-    ProgressSignal, RawMutex, RawMutexLease, RawRwLock, RawRwLockReadLease, RawRwLockWriteLease,
-    ReadyLink, RwLock, RwLockReadGuard, RwLockWriteGuard, Sleep, Spawner, StatsSample,
-    TaskCapacityError, TaskFunding, Timer, TraceEvent, TraceField, TraceFilter, TraceHistory,
-    TraceLevel, TraceValue, UptimeClock, YieldNow, elapsed_millis, matches_perf_metric_filter,
-    matches_profile_filter, matches_trace_filter, monotonic_nanos, online_processor_count,
-    parse_console_text, wall_clock_offset_nanos, yield_now,
+    IdleOutcome, InstanceSpawner, JoinHandle, KernelClock, LocalJoinHandle,
+    MAX_FILTER_PREFIX_BYTES, MAX_FILTER_PREFIXES, Mutex, MutexGuard, Notified, Notify,
+    NotifyWaiter, ObservationScope, OfflineError, OfflineRefusal, OnlineError, OnlineSet,
+    OwnInstance, OwnedRawMutexLease, OwnedRawRwLockReadLease, OwnedRawRwLockWriteLease,
+    PerfMetricFilter, PerfMetricHistory, PerfMetricSample, PerfSample, PinnedTasks, PrefixSet,
+    PrefixSetError, PressureLevel, ProcessorControl, ProfileFilter, ProfileHistory, ProfileScope,
+    ProfileSink, ProgressChanged, ProgressMark, ProgressSignal, RawMutex, RawMutexLease, RawRwLock,
+    RawRwLockReadLease, RawRwLockWriteLease, ReadyLink, RwLock, RwLockReadGuard, RwLockWriteGuard,
+    Sleep, Spawner, StatsSample, TaskCapacityError, TaskFunding, Timer, TraceEvent, TraceField,
+    TraceFilter, TraceHistory, TraceLevel, TraceLog, TraceValue, UptimeClock, YieldNow,
+    elapsed_millis, matches_perf_metric_filter, matches_profile_filter, matches_trace_filter,
+    monotonic_nanos, online_processor_count, parse_console_text, wall_clock_offset_nanos,
+    yield_now,
 };
 pub use gpu::{
-    ContextRecord, Gpu3dClaim, Gpu3dOwnership, Gpu3dSender, Gpu3dService, Gpu3dServiceError,
-    MAX_GPU_BLOBS, MAX_GPU_CONTEXTS, MAX_GPU_VIEWS, install_gpu3d_device,
+    ContextRecord, ContextShared, Gpu3dOwnership, Gpu3dSender, Gpu3dService, Gpu3dServiceError,
+    Gpu3dSession, MAX_EXECUTE_BYTES, MAX_GPU_BLOBS, MAX_GPU_CONTEXTS, MAX_GPU_VIEWS,
+    MAX_MACHINE_GPU_BLOBS, MAX_MACHINE_GPU_CONTEXTS, RingTimeline, SessionId, install_gpu3d_device,
 };
 pub use helios_hal::Platform;
 pub use helios_netstack::{
@@ -127,8 +134,8 @@ pub use helios_netstack::{
     RxFrame, RxFrameOffload, SegmentationOffload, TxFrameRef,
 };
 pub use host_fs::{
-    HOST_SHARE_GUEST_MOUNT_PATH, HOST_SHARE_MOUNT_TAG, HostFsCacheStats, HostFsClient,
-    HostFsTransport, UnsupportedHostFileSystem,
+    FilledHostFsWrite, HOST_SHARE_GUEST_MOUNT_PATH, HOST_SHARE_MOUNT_TAG, HostFsCacheStats,
+    HostFsClient, HostFsTransport, HostFsWrite, UnsupportedHostFileSystem,
 };
 pub use input::{
     DeviceIndex, EVENT_QUEUE_DEPTH, EventBurst, InputClaim, InputDeviceSnapshot, InputEvents,
@@ -159,8 +166,9 @@ pub use kernel_exception::{
     dispatch_native_trap, install_native_trap_handler,
 };
 pub use machine::{
-    AdvanceCause, DeviceResets, Generation, MachineGeneration, MachineGenerationHandle,
-    ResetDevice, UnhandledAdvances, install_generation_reactions,
+    AdvanceCause, DeviceResets, GENERATION_PROBE_INTERVAL, Generation, MachineGeneration,
+    MachineGenerationHandle, ResetDevice, UnhandledAdvances, install_generation_reactions,
+    spawn_generation_probe,
 };
 pub use memory::{
     AGE_BATCH_PAGES, AccessibilityPlan, BalloonHandle, BalloonStats, BootMemoryPlan,
@@ -203,17 +211,17 @@ pub use network::{
 pub use process::{
     AudioClaimCap, ClockAuthorityRights, CompileAuthority, DescriptorEntry, DescriptorId,
     DescriptorLimit, DescriptorTable, DescriptorTableError, DeviceClassRights, DeviceGrantClaimCap,
-    DirectoryAuthorityRights, DirectoryCap, DirectoryPreopen, DisplayClaimCap, DnsCap,
-    ExecAuthority, ForkAuthority, FutexKey, FutexTable, FutexWaitRegistration, GpuClaimCap,
-    GuestAddress, InputClaimCap, JoinAuthority, LinkAuthorityRights, LinkSourceCap,
-    LinkTargetDirectoryCap, MountAuthorityRights, MountCap, MulticastCap, NetworkAdminCap,
-    NetworkAuthorityRights, NetworkCap, PrivilegedBindCap, ProcessAuthority, ProcessAuthorityError,
-    ProcessAuthorityRights, ProcessId, ProcessMemoryIdentity, ProcessRecord, ProcessState,
-    ProcessTable, ProcessTableError, ProgramExecError, ProgramExecErrorDetail,
-    ProgramExecErrorKind, ProgramOutOfMemory, RuntimeMessage, SetWallClockCap, SignalAuthority,
-    SpawnAuthority, SymlinkCreateCap, SymlinkReadCap, TcpCap, TerminalAuthorityRights,
-    TerminalInputCap, TerminalOutputCap, ThreadId, ThreadRecord, ThreadState, ThreadTable,
-    ThreadTableError, TtyControlCap, UdpCap, UnmountCap,
+    DiagnosticAuthorityRights, DirectoryAuthorityRights, DirectoryCap, DirectoryPreopen,
+    DisplayClaimCap, DnsCap, ExecAuthority, ForkAuthority, FutexKey, FutexTable,
+    FutexWaitRegistration, GpuOpenCap, GuestAddress, InputClaimCap, JoinAuthority,
+    LinkAuthorityRights, LinkSourceCap, LinkTargetDirectoryCap, MountAuthorityRights, MountCap,
+    MulticastCap, NetworkAdminCap, NetworkAuthorityRights, NetworkCap, ObserveMachineCap,
+    PrivilegedBindCap, ProcessAuthority, ProcessAuthorityError, ProcessAuthorityRights, ProcessId,
+    ProcessMemoryIdentity, ProcessRecord, ProcessState, ProcessTable, ProcessTableError,
+    ProgramExecError, ProgramExecErrorDetail, ProgramExecErrorKind, ProgramOutOfMemory,
+    RuntimeMessage, SetWallClockCap, SignalAuthority, SpawnAuthority, SymlinkCreateCap,
+    SymlinkReadCap, TcpCap, TerminalAuthorityRights, TerminalInputCap, TerminalOutputCap, ThreadId,
+    ThreadRecord, ThreadState, ThreadTable, ThreadTableError, TtyControlCap, UdpCap, UnmountCap,
 };
 pub use profiling::{
     CodeAttribution, InstructionProfile, InstructionProfileError, InstructionSampler,
@@ -224,11 +232,11 @@ pub use profiling::{
 pub use runtime::{
     AuthorityDomain, ComponentHostNetwork, ComponentNetworkService, ComponentNetworkState,
     DnsError, DnsErrorKind, ExecOutput, ExecResult, HostDirEntry, HostDirLimit, HostFileSystem,
-    HostFsError, HostFsErrorKind, HostMetadata, HostShareRestore, Ipv4Address, NetworkErrorDetail,
-    NetworkHandle, NetworkIpAddress, NetworkPacketPump, ObjectIdentity, PingError, PingErrorKind,
-    PingReply, RegisteredTcpReadBuffer, RuntimeState, SocketReadiness, TcpAccepted, TcpError,
-    TcpErrorKind, TcpListener, TcpReadProgress, TcpWriteProgress, UdpBinding, UdpDatagram,
-    UdpError, UdpErrorKind,
+    HostFilledWrite, HostFsError, HostFsErrorKind, HostMetadata, HostShareRestore, HostWrite,
+    Ipv4Address, NetworkErrorDetail, NetworkHandle, NetworkIpAddress, NetworkPacketPump,
+    ObjectIdentity, PingError, PingErrorKind, PingReply, RegisteredTcpReadBuffer, RuntimeState,
+    SocketReadiness, TcpAccepted, TcpError, TcpErrorKind, TcpListener, TcpReadProgress,
+    TcpWriteProgress, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
 };
 pub use surface::{
     MAX_INSTANCE_SURFACES, MAX_LIVE_SURFACES, ReturnedSurface, ReturnedSurfaces,
@@ -237,10 +245,11 @@ pub use surface::{
     SurfaceServiceError, SurfaceShared,
 };
 pub use vfs::{
-    BOOT_DEVICE, FileContents, Follow, HeldPath, HostShare, MAX_MOUNTS, MAX_SYMLINK_DEPTH,
-    MemoryFs, MountError, MountHold, MountRequestError, MountSource, MountTable, MountedFs,
-    Namespace, ROOT_LAYER_DEVICE, Resolved, RootFs, object_identity, request_mount,
-    request_unmount, symlink_target, within_directory,
+    BOOT_DEVICE, FileContents, Follow, HeldPath, HostShare, HostShareWrite, MAX_MOUNTS,
+    MAX_SYMLINK_DEPTH, MemoryFs, MemoryWrite, MountError, MountHold, MountRequestError,
+    MountSource, MountTable, MountedFs, MountedWrite, Namespace, ROOT_LAYER_DEVICE, Resolved,
+    RootFs, RootWrite, object_identity, request_mount, request_unmount, symlink_target,
+    within_directory,
 };
 pub use vsock::{
     ComponentHostVsockService, MAX_VSOCK_BACKLOG, MAX_VSOCK_CONNECTIONS, MAX_VSOCK_LISTENERS,

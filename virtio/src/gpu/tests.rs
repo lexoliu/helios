@@ -19,20 +19,26 @@ use helios_hal::display::{
 use helios_hal::io::IoError;
 use helios_hal::pmm::{PhysFrame, PhysFrameRange};
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
+use helios_hal::device::DeviceRegionAttributes;
 use helios_hal::display::{
-    BlobId, BlobMemory, BlobRequest, BlobUsage, CapsetId, ContextId, ContextName, FenceId, Gpu3d,
-    Gpu3dError,
+    BlobId, BlobMemory, BlobRequest, BlobScanout, BlobUsage, CapsetId, CommandStream, ContextId,
+    ContextName, FenceId, Gpu3d, Gpu3dError, Gpu3dResult, Gpu3dTable, RingCount, RingIndex,
+    Submission,
 };
 use helios_hal::iommu::PhysicalRange;
 
 use super::render::{
     APERTURE_ALIGN, BLOB_MEM_GUEST, BLOB_MEM_HOST3D, CMD_CTX_ATTACH_RESOURCE, CMD_CTX_CREATE,
     CMD_CTX_DESTROY, CMD_CTX_DETACH_RESOURCE, CMD_GET_CAPSET, CMD_GET_CAPSET_INFO,
-    CMD_RESOURCE_CREATE_BLOB, CMD_RESOURCE_MAP_BLOB, CMD_RESOURCE_UNMAP_BLOB, CMD_SUBMIT_3D,
-    CTRL_FLAG_FENCE, GPU_FEATURE_CONTEXT_INIT, GPU_FEATURE_RESOURCE_BLOB,
-    GPU_FEATURE_RESOURCE_UUID, GPU_FEATURE_VIRGL, MAP_CACHE_CACHED, RESP_CAPSET_INFO_BYTES,
-    RESP_ERR_INVALID_CONTEXT_ID, RESP_MAP_INFO_BYTES, RESP_OK_CAPSET, RESP_OK_CAPSET_INFO,
-    RESP_OK_MAP_INFO, SHM_ID_HOST_VISIBLE, SHM_ID_UNDEFINED,
+    CMD_RESOURCE_CREATE_BLOB, CMD_RESOURCE_MAP_BLOB, CMD_RESOURCE_UNMAP_BLOB, CMD_SET_SCANOUT_BLOB,
+    CMD_SUBMIT_3D, CTRL_FLAG_FENCE, CTRL_FLAG_INFO_RING_IDX, CTRL_RING_IDX_OFFSET,
+    GPU_FEATURE_BLOB_ALIGNMENT, GPU_FEATURE_CONTEXT_INIT, GPU_FEATURE_RESOURCE_BLOB,
+    GPU_FEATURE_RESOURCE_UUID, GPU_FEATURE_VIRGL, MAP_CACHE_CACHED, MAP_CACHE_UNCACHED,
+    MAP_CACHE_WC, MAX_CONTEXTS, RESP_CAPSET_INFO_BYTES, RESP_ERR_INVALID_CONTEXT_ID,
+    RESP_MAP_INFO_BYTES, RESP_OK_CAPSET, RESP_OK_CAPSET_INFO, RESP_OK_MAP_INFO,
+    SET_SCANOUT_BLOB_BYTES, SHM_ID_HOST_VISIBLE, SHM_ID_UNDEFINED,
 };
 use super::{
     CMD_GET_DISPLAY_INFO, CMD_MOVE_CURSOR, CMD_RESOURCE_ATTACH_BACKING, CMD_RESOURCE_CREATE_2D,
@@ -992,6 +998,30 @@ const APERTURE_BYTES: u64 = 16 << 20;
 /// A device that carries a renderer with `capsets` capability sets and
 /// a host-visible aperture.
 fn render_device(capsets: u32) -> VirtioGpuDevice<FakeTransport> {
+    VirtioGpuDevice::new(render_transport(capsets, 0))
+        .expect("the rendering device should initialize")
+}
+
+/// `blob_alignment` in `struct virtio_gpu_config`, as a device publishes
+/// it (Linux `include/uapi/linux/virtio_gpu.h`).
+const CONFIG_BLOB_ALIGNMENT: usize = 16;
+
+/// A rendering device that offers `VIRTIO_GPU_F_BLOB_ALIGNMENT` and
+/// publishes `alignment`.
+fn aligned_transport(alignment: u32) -> FakeTransport {
+    let transport = render_transport(1, GPU_FEATURE_BLOB_ALIGNMENT);
+    transport.set_config_u32(CONFIG_BLOB_ALIGNMENT, alignment);
+    transport
+}
+
+fn aligned_render_device(alignment: u32) -> VirtioGpuDevice<FakeTransport> {
+    VirtioGpuDevice::new(aligned_transport(alignment))
+        .expect("the rendering device should initialize")
+}
+
+/// The transport of a rendering device, offering `extra` features on
+/// top of the whole 3D set.
+fn render_transport(capsets: u32, extra: u64) -> FakeTransport {
     let transport = FakeTransport::new(FakeTransportConfig {
         device_type: DeviceType::Gpu,
         offered_features: VirtioFeatures::VERSION_1.bits()
@@ -999,7 +1029,8 @@ fn render_device(capsets: u32) -> VirtioGpuDevice<FakeTransport> {
             | GPU_FEATURE_VIRGL
             | GPU_FEATURE_RESOURCE_UUID
             | GPU_FEATURE_RESOURCE_BLOB
-            | GPU_FEATURE_CONTEXT_INIT,
+            | GPU_FEATURE_CONTEXT_INIT
+            | extra,
         queue_size: 8,
         supports_queue_reset: false,
         absent_queues: &[],
@@ -1015,7 +1046,7 @@ fn render_device(capsets: u32) -> VirtioGpuDevice<FakeTransport> {
         1,
         PhysicalRange::new(APERTURE_BASE, APERTURE_BYTES),
     );
-    VirtioGpuDevice::new(transport).expect("the rendering device should initialize")
+    transport
 }
 
 /// A `virtio_gpu_resp_capset_info` for one capability set.
@@ -1072,8 +1103,13 @@ fn exchange<Output>(
 /// A context the device accepted, for the tests that need one before
 /// they can test anything else.
 fn open_context(device: &VirtioGpuDevice<FakeTransport>) -> ContextId {
+    open_context_with(device, RingCount::ONE)
+}
+
+/// A context of `rings` rings.
+fn open_context_with(device: &VirtioGpuDevice<FakeTransport>, rings: RingCount) -> ContextId {
     let name = ContextName::from("venus").expect("a five-character name fits");
-    let future = pin!(device.create_context(CapsetId::VENUS, name));
+    let future = pin!(device.create_context(CapsetId::VENUS, rings, name));
     let (_, context) = exchange(device, future, &header_response(RESP_OK_NODATA));
     context.expect("the device accepted the context")
 }
@@ -1085,12 +1121,69 @@ fn open_blob(device: &VirtioGpuDevice<FakeTransport>, context: ContextId, size: 
         memory: BlobMemory::Host3d,
         usage: BlobUsage::MAPPABLE,
         size,
-        host_id: 0x1234,
+        blob_id: 0x1234,
         backing: &[],
     };
     let future = pin!(device.create_blob(request));
     let (_, blob) = exchange(device, future, &header_response(RESP_OK_NODATA));
     blob.expect("the device accepted the blob")
+}
+
+fn ring(index: u8) -> RingIndex {
+    RingIndex::new(index).expect("a ring index below the table's bound")
+}
+
+fn rings(count: u8) -> RingCount {
+    RingCount::new(count).expect("a ring count of one to sixty-four")
+}
+
+/// A submission of the guest's own pages.
+fn pages_submission(
+    context: ContextId,
+    commands: &[u8],
+    ring: RingIndex,
+    fence: Option<u64>,
+) -> Submission<'static> {
+    Submission {
+        context,
+        commands: CommandStream::Pages(command_buffer(commands)),
+        ring,
+        fence: fence.map(FenceId::new),
+    }
+}
+
+/// Runs one submission to completion against `response`, and reports
+/// the wire bytes, the outcome, and whether the driver said the command
+/// was posted.
+fn run_submit(
+    device: &VirtioGpuDevice<FakeTransport>,
+    submission: Submission<'_>,
+    response: &[u8],
+) -> (Vec<u8>, Gpu3dResult<()>, bool) {
+    let posted = AtomicBool::new(false);
+    let mut mark = || posted.store(true, Ordering::Relaxed);
+    let (wire, outcome) = {
+        let future = pin!(device.submit(submission, &mut mark));
+        exchange(device, future, response)
+    };
+    (wire, outcome, posted.load(Ordering::Relaxed))
+}
+
+/// Submits `commands` fenced at `fence` on `ring` and expects the device
+/// to take it.
+fn fenced(
+    device: &VirtioGpuDevice<FakeTransport>,
+    context: ContextId,
+    ring: RingIndex,
+    fence: u64,
+) {
+    let commands = [1_u8, 2, 3, 4];
+    let (_, outcome, _) = run_submit(
+        device,
+        pages_submission(context, &commands, ring, Some(fence)),
+        &header_response(RESP_OK_NODATA),
+    );
+    outcome.expect("the device took the command buffer");
 }
 
 /// Every capability set is read with its own `GET_CAPSET_INFO`, indexed
@@ -1179,7 +1272,7 @@ fn a_capability_set_reaches_the_caller_undecoded() {
 fn a_context_names_its_renderer_and_carries_its_debug_name() {
     let device = render_device(1);
     let name = ContextName::from("venus").expect("a five-character name fits");
-    let future = pin!(device.create_context(CapsetId::VENUS, name));
+    let future = pin!(device.create_context(CapsetId::VENUS, rings(2), name));
 
     let (request, context) = exchange(&device, future, &header_response(RESP_OK_NODATA));
     let context = context.expect("the device accepted the context");
@@ -1209,12 +1302,47 @@ fn a_context_names_its_renderer_and_carries_its_debug_name() {
 fn a_context_leaves_context_init_alone_when_the_device_did_not_offer_it() {
     let device = device_with(1, OFFERED_EDID | GPU_FEATURE_VIRGL);
     let name = ContextName::from("virgl").expect("a five-character name fits");
-    let future = pin!(device.create_context(CapsetId::VIRGL2, name));
+    let future = pin!(device.create_context(CapsetId::VIRGL2, RingCount::ONE, name));
 
     let (request, context) = exchange(&device, future, &header_response(RESP_OK_NODATA));
 
     context.expect("the device accepted the context");
     assert_eq!(word_at(&request, CTRL_HEADER_BYTES + 4), 0);
+}
+
+/// Without context-init the device reads no ring index, so a context of
+/// more than the CPU ring would have every fence land on one timeline;
+/// it is refused before the device is asked.
+#[test]
+fn a_context_of_several_rings_needs_context_init() {
+    let device = device_with(1, OFFERED_EDID | GPU_FEATURE_VIRGL);
+    let name = ContextName::from("virgl").expect("a five-character name fits");
+
+    let refused = block_on(device.create_context(CapsetId::VIRGL2, rings(2), name));
+
+    assert_eq!(refused.err(), Some(Gpu3dError::InvalidParameter));
+    assert_eq!(device.transport.kick_count(), 0);
+}
+
+/// The context table is the device's whole bound across every instance,
+/// and filling it says which table is full.
+#[test]
+fn the_context_table_says_when_it_is_full() {
+    let device = render_device(1);
+    for _ in 0..MAX_CONTEXTS {
+        open_context(&device);
+    }
+    let name = ContextName::from("venus").expect("a five-character name fits");
+
+    let refused = block_on(device.create_context(CapsetId::VENUS, RingCount::ONE, name));
+
+    assert_eq!(
+        refused.err(),
+        Some(Gpu3dError::TooMany {
+            table: Gpu3dTable::Contexts,
+            limit: MAX_CONTEXTS,
+        })
+    );
 }
 
 /// Every 3D call on a device with no renderer is refused, and none of
@@ -1224,12 +1352,12 @@ fn a_device_with_no_renderer_refuses_every_rendering_call() {
     let device = device_with(1, OFFERED_EDID);
     let name = ContextName::from("venus").expect("a five-character name fits");
 
-    let created = block_on(device.create_context(CapsetId::VENUS, name));
+    let created = block_on(device.create_context(CapsetId::VENUS, RingCount::ONE, name));
     assert_eq!(created.err(), Some(Gpu3dError::Unsupported));
+    let commands = [0_u8; 4];
     let submitted = block_on(device.submit(
-        ContextId::new(1),
-        command_buffer(&[0_u8; 4]),
-        FenceId::new(1),
+        pages_submission(ContextId::new(1), &commands, RingIndex::CPU, Some(1)),
+        &mut || {},
     ));
     assert_eq!(submitted.err(), Some(Gpu3dError::Unsupported));
     let mapped = block_on(device.map_blob(BlobId::new(1)));
@@ -1248,7 +1376,7 @@ fn a_host_three_d_blob_carries_the_renderers_handle_and_no_pages() {
         memory: BlobMemory::Host3d,
         usage: BlobUsage::MAPPABLE | BlobUsage::SHAREABLE,
         size: 0x2000,
-        host_id: 0xfeed_face,
+        blob_id: 0xfeed_face,
         backing: &[],
     };
     let future = pin!(device.create_blob(request));
@@ -1286,7 +1414,7 @@ fn a_guest_blob_publishes_the_pages_it_is_backed_by() {
         memory: BlobMemory::Guest,
         usage: BlobUsage::MAPPABLE,
         size: 0x2000,
-        host_id: 0,
+        blob_id: 0,
         backing: &pages,
     };
     let future = pin!(device.create_blob(request));
@@ -1315,7 +1443,7 @@ fn a_blob_that_names_the_wrong_memory_is_refused_before_the_device_sees_it() {
         memory: BlobMemory::Host3d,
         usage: BlobUsage::MAPPABLE,
         size: 0x1000,
-        host_id: 1,
+        blob_id: 1,
         backing: &pages,
     };
 
@@ -1323,6 +1451,109 @@ fn a_blob_that_names_the_wrong_memory_is_refused_before_the_device_sees_it() {
 
     assert_eq!(refused.err(), Some(Gpu3dError::InvalidBlob));
     assert_eq!(device.transport.kick_count(), kicks);
+}
+
+/// A pure guest blob has no host object to name, so a non-zero blob id
+/// on one is refused before the wire, as Linux's `verify_blob` refuses
+/// it.
+#[test]
+fn a_guest_blob_that_names_a_host_object_is_refused() {
+    let device = render_device(1);
+    let context = open_context(&device);
+    let kicks = device.transport.kick_count();
+    let pages = backing(1);
+    let request = BlobRequest {
+        context,
+        memory: BlobMemory::Guest,
+        usage: BlobUsage::MAPPABLE,
+        size: 0x1000,
+        blob_id: 7,
+        backing: &pages,
+    };
+
+    let refused = block_on(device.create_blob(request));
+
+    assert_eq!(refused.err(), Some(Gpu3dError::InvalidBlob));
+    assert_eq!(device.transport.kick_count(), kicks);
+}
+
+/// A device that states no blob alignment imposes none: the size goes
+/// on the wire as the caller gave it.
+#[test]
+fn a_blob_size_goes_unrounded_to_a_device_that_states_no_alignment() {
+    let device = render_device(1);
+    let context = open_context(&device);
+    let request = BlobRequest {
+        context,
+        memory: BlobMemory::Host3d,
+        usage: BlobUsage::MAPPABLE,
+        size: 0x1801,
+        blob_id: 9,
+        backing: &[],
+    };
+    let future = pin!(device.create_blob(request));
+
+    let (wire, blob) = exchange(&device, future, &header_response(RESP_OK_NODATA));
+
+    blob.expect("the device accepted the blob");
+    assert_eq!(long_word_at(&wire, CTRL_HEADER_BYTES + 24), 0x1801);
+}
+
+/// A device that offers `VIRTIO_GPU_F_BLOB_ALIGNMENT` is asked for its
+/// alignment, and every blob size is rounded up to it.
+#[test]
+fn a_blob_size_is_rounded_to_the_alignment_the_device_publishes() {
+    let device = aligned_render_device(0x1_0000);
+    assert!(device.features().device(GPU_FEATURE_BLOB_ALIGNMENT));
+    let context = open_context(&device);
+    let request = BlobRequest {
+        context,
+        memory: BlobMemory::Host3d,
+        usage: BlobUsage::MAPPABLE,
+        size: 0x1801,
+        blob_id: 9,
+        backing: &[],
+    };
+    let future = pin!(device.create_blob(request));
+
+    let (wire, blob) = exchange(&device, future, &header_response(RESP_OK_NODATA));
+
+    blob.expect("the device accepted the blob");
+    assert_eq!(long_word_at(&wire, CTRL_HEADER_BYTES + 24), 0x1_0000);
+}
+
+/// A guest blob's rounded size may not reach past the pages it is
+/// backed by: the device would read memory the caller did not give it.
+#[test]
+fn a_guest_blob_too_small_for_the_device_alignment_is_refused() {
+    let device = aligned_render_device(0x1_0000);
+    let context = open_context(&device);
+    let kicks = device.transport.kick_count();
+    let pages = backing(1);
+    let request = BlobRequest {
+        context,
+        memory: BlobMemory::Guest,
+        usage: BlobUsage::MAPPABLE,
+        size: 0x1000,
+        blob_id: 0,
+        backing: &pages,
+    };
+
+    let refused = block_on(device.create_blob(request));
+
+    assert_eq!(refused.err(), Some(Gpu3dError::InvalidBlob));
+    assert_eq!(device.transport.kick_count(), kicks);
+}
+
+/// An alignment that is not a power of two describes no address
+/// arithmetic, so the device is refused at bring-up.
+#[test]
+fn a_blob_alignment_that_is_not_a_power_of_two_is_refused_at_bring_up() {
+    let transport = aligned_transport(0x3000);
+    assert!(matches!(
+        VirtioGpuDevice::new(transport),
+        Err(IoError::InvalidDeviceConfig(_))
+    ));
 }
 
 /// The aperture lives under `VIRTIO_GPU_SHM_ID_HOST_VISIBLE` — the
@@ -1435,13 +1666,40 @@ fn two_maps_in_flight_at_once_get_different_spans() {
     assert_eq!(second_region.physical.start, APERTURE_BASE + APERTURE_ALIGN);
 }
 
-/// The kernel maps the aperture as ordinary memory. A host that wants a
-/// blob accessed any other way is telling the guest a coherency rule
-/// nothing here can keep, so the mapping is taken back rather than
-/// handed over under the wrong one.
+/// The host's `map_info` answer is carried to the mapping: a blob it
+/// wants write-combined is reported as write-combining memory, and one
+/// it wants uncached as memory every access must reach uncached.
 #[test]
-fn a_mapping_the_host_wants_uncached_is_refused_and_given_back() {
-    const MAP_CACHE_WC: u32 = 0x0003;
+fn a_mapping_carries_the_caching_the_host_requires() {
+    for (map_info, expected) in [
+        (MAP_CACHE_WC, DeviceRegionAttributes::WRITE_COMBINING_MEMORY),
+        (MAP_CACHE_UNCACHED, DeviceRegionAttributes::UNCACHED_MEMORY),
+        (
+            MAP_CACHE_CACHED,
+            DeviceRegionAttributes::PREFETCHABLE_MEMORY,
+        ),
+    ] {
+        let device = render_device(1);
+        let context = open_context(&device);
+        let blob = open_blob(&device, context, 0x1000);
+        let future = pin!(device.map_blob(blob));
+
+        let (_, region) = exchange(&device, future, &map_info_response(map_info));
+
+        assert_eq!(
+            region.expect("the device mapped the blob").attributes,
+            expected,
+            "map_info {map_info:#x}"
+        );
+    }
+}
+
+/// A caching mode the specification gives no meaning to is a rule
+/// nothing here can keep, so the mapping is taken back rather than
+/// handed over under a guess.
+#[test]
+fn a_mapping_under_an_unknown_caching_mode_is_given_back() {
+    const UNDEFINED_CACHING: u32 = 0x0007;
 
     let device = render_device(1);
     let context = open_context(&device);
@@ -1449,7 +1707,7 @@ fn a_mapping_the_host_wants_uncached_is_refused_and_given_back() {
     let mut future = pin!(device.map_blob(blob));
 
     let map = pending_control(&device, future.as_mut());
-    answer_control(&device, map, &map_info_response(MAP_CACHE_WC));
+    answer_control(&device, map, &map_info_response(UNDEFINED_CACHING));
     let unmap = pending_control(&device, future.as_mut());
     let wire = control_request(&device, unmap);
     answer_control(&device, unmap, &header_response(RESP_OK_NODATA));
@@ -1458,8 +1716,8 @@ fn a_mapping_the_host_wants_uncached_is_refused_and_given_back() {
     assert_eq!(command_of(&wire), CMD_RESOURCE_UNMAP_BLOB);
     assert_eq!(
         refused.err(),
-        Some(Gpu3dError::UnsupportedCaching {
-            map_info: MAP_CACHE_WC
+        Some(Gpu3dError::UnknownCaching {
+            map_info: UNDEFINED_CACHING
         })
     );
 }
@@ -1510,28 +1768,140 @@ fn attaching_a_resource_names_the_context_and_the_resource() {
     assert_eq!(command_of(&wire), CMD_CTX_DETACH_RESOURCE);
 }
 
-/// A submission carries the fence flag, the fence the caller chose, its
-/// context, and the command buffer as a descriptor of its own — the
+/// A fenced submission asks for a context fence on its ring: the fence
+/// flag and the ring flag, the fence the caller chose, its context, the
+/// ring index, and the command buffer as a descriptor of its own — the
 /// driver never copies the guest's bytes.
 #[test]
-fn a_submission_carries_its_fence_and_the_guests_own_command_buffer() {
+fn a_fenced_submission_names_its_ring_on_the_wire() {
     let device = render_device(1);
-    let context = open_context(&device);
+    let context = open_context_with(&device, rings(4));
     let commands = [0x11_u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
-    let future = pin!(device.submit(context, command_buffer(&commands), FenceId::new(7)));
 
-    let (wire, submitted) = exchange(&device, future, &header_response(RESP_OK_NODATA));
+    let (wire, submitted, posted) = run_submit(
+        &device,
+        pages_submission(context, &commands, ring(3), Some(7)),
+        &header_response(RESP_OK_NODATA),
+    );
     submitted.expect("the device took the command buffer");
 
+    assert!(posted, "the driver said the command reached the queue");
     assert_eq!(command_of(&wire), CMD_SUBMIT_3D);
-    assert_eq!(word_at(&wire, 4), CTRL_FLAG_FENCE);
+    assert_eq!(word_at(&wire, 4), CTRL_FLAG_FENCE | CTRL_FLAG_INFO_RING_IDX);
     assert_eq!(long_word_at(&wire, 8), 7, "the fence the caller chose");
     assert_eq!(word_at(&wire, 16), context.raw());
+    assert_eq!(wire[CTRL_RING_IDX_OFFSET], 3, "the ring the fence is on");
     assert_eq!(word_at(&wire, CTRL_HEADER_BYTES), commands.len() as u32);
     assert_eq!(
         &wire[CTRL_HEADER_BYTES + 8..],
         &commands,
         "the command buffer travels as it was written"
+    );
+}
+
+/// An unfenced submission carries neither flag, no fence id and no ring:
+/// the device answers it once it has processed it, and creates no fence.
+#[test]
+fn an_unfenced_submission_carries_no_fence_flag() {
+    let device = render_device(1);
+    let context = open_context_with(&device, rings(2));
+    let commands = [1_u8, 2, 3, 4];
+
+    let (wire, submitted, _) = run_submit(
+        &device,
+        pages_submission(context, &commands, ring(1), None),
+        &header_response(RESP_OK_NODATA),
+    );
+    submitted.expect("the device took the command buffer");
+
+    assert_eq!(word_at(&wire, 4), 0, "no flag at all");
+    assert_eq!(long_word_at(&wire, 8), 0, "no fence id");
+    assert_eq!(wire[CTRL_RING_IDX_OFFSET], 0, "no ring index");
+}
+
+/// A short command stream the caller holds goes on the wire from where
+/// it is, after the request, exactly as a page run would.
+#[test]
+fn an_inline_command_stream_travels_after_the_request() {
+    let device = render_device(1);
+    let context = open_context(&device);
+    let commands = [0xa1_u8, 0xa2, 0xa3, 0xa4];
+
+    let (wire, submitted, _) = run_submit(
+        &device,
+        Submission {
+            context,
+            commands: CommandStream::Inline(&commands),
+            ring: RingIndex::CPU,
+            fence: Some(FenceId::new(1)),
+        },
+        &header_response(RESP_OK_NODATA),
+    );
+    submitted.expect("the device took the command stream");
+
+    assert_eq!(word_at(&wire, CTRL_HEADER_BYTES), commands.len() as u32);
+    assert_eq!(&wire[CTRL_HEADER_BYTES + 8..], &commands);
+}
+
+/// The driver says a command is posted the moment its chain is in the
+/// ring — while the device still holds it — so the caller can let the
+/// next command follow it without waiting for this one's answer.
+#[test]
+fn a_submission_is_posted_before_the_device_answers() {
+    let device = render_device(1);
+    let context = open_context(&device);
+    let commands = [1_u8, 2, 3, 4];
+    let posted = AtomicBool::new(false);
+    let mut mark = || posted.store(true, Ordering::Relaxed);
+    let mut future = pin!(device.submit(
+        pages_submission(context, &commands, RingIndex::CPU, Some(1)),
+        &mut mark,
+    ));
+
+    let token = pending_control(&device, future.as_mut());
+    assert!(
+        posted.load(Ordering::Relaxed),
+        "posted while the device still holds the command"
+    );
+    answer_control(&device, token, &header_response(RESP_OK_NODATA));
+    block_on(future).expect("the device took the command buffer");
+}
+
+/// A ring the context was not created with is refused before the wire,
+/// and the caller's command is never posted.
+#[test]
+fn a_ring_past_the_context_s_count_is_refused() {
+    let device = render_device(1);
+    let context = open_context_with(&device, rings(2));
+    let kicks = device.transport.kick_count();
+    let commands = [1_u8, 2, 3, 4];
+    let posted = AtomicBool::new(false);
+
+    let refused = block_on(device.submit(
+        pages_submission(context, &commands, ring(2), Some(1)),
+        &mut || posted.store(true, Ordering::Relaxed),
+    ));
+
+    assert_eq!(
+        refused.err(),
+        Some(Gpu3dError::UnknownRing {
+            context,
+            ring: ring(2)
+        })
+    );
+    assert!(!posted.load(Ordering::Relaxed));
+    assert_eq!(device.transport.kick_count(), kicks);
+    assert_eq!(
+        block_on(poll_once(pin!(device.fences(
+            context,
+            ring(2),
+            FenceId::START
+        )))),
+        Some(Err(Gpu3dError::UnknownRing {
+            context,
+            ring: ring(2)
+        })),
+        "the ring has no fence stream either"
     );
 }
 
@@ -1543,7 +1913,15 @@ fn an_empty_command_buffer_never_reaches_the_device() {
     let context = open_context(&device);
     let kicks = device.transport.kick_count();
 
-    let refused = block_on(device.submit(context, PhysicalRange::new(0, 0), FenceId::new(1)));
+    let refused = block_on(device.submit(
+        Submission {
+            context,
+            commands: CommandStream::Pages(PhysicalRange::new(0, 0)),
+            ring: RingIndex::CPU,
+            fence: Some(FenceId::new(1)),
+        },
+        &mut || {},
+    ));
 
     assert_eq!(
         refused.err(),
@@ -1560,27 +1938,22 @@ fn the_fence_stream_is_read_in_order_from_where_the_reader_left_off() {
     let device = render_device(1);
     let context = open_context(&device);
 
-    let mut waiting = pin!(device.fences(context, FenceId::START));
+    let mut waiting = pin!(device.fences(context, RingIndex::CPU, FenceId::START));
     assert!(
         block_on(poll_once(waiting.as_mut())).is_none(),
         "no fence has retired yet"
     );
 
-    let future = pin!(device.submit(context, command_buffer(&[1_u8, 2, 3, 4]), FenceId::new(4)));
-    let (_, submitted) = exchange(&device, future, &header_response(RESP_OK_NODATA));
-    submitted.expect("the device took the command buffer");
-
+    fenced(&device, context, RingIndex::CPU, 4);
     let fence = block_on(waiting).expect("the fence the submission carried");
     assert_eq!(fence, FenceId::new(4));
 
-    let mut waiting = pin!(device.fences(context, fence));
+    let mut waiting = pin!(device.fences(context, RingIndex::CPU, fence));
     assert!(
         block_on(poll_once(waiting.as_mut())).is_none(),
         "a reader that has seen fence four is not handed it again"
     );
-    let future = pin!(device.submit(context, command_buffer(&[5_u8, 6, 7, 8]), FenceId::new(9)));
-    let (_, submitted) = exchange(&device, future, &header_response(RESP_OK_NODATA));
-    submitted.expect("the device took the second command buffer");
+    fenced(&device, context, RingIndex::CPU, 9);
     assert_eq!(
         block_on(waiting).expect("the second fence"),
         FenceId::new(9)
@@ -1588,21 +1961,17 @@ fn the_fence_stream_is_read_in_order_from_where_the_reader_left_off() {
 }
 
 /// A reader that was away while several fences retired is handed the
-/// newest of them rather than the next in sequence: the timeline is
+/// newest of them rather than the next in sequence: the ring is
 /// monotone, so the newest answers for every one before it.
 #[test]
 fn a_lagging_fence_reader_is_handed_the_newest_fence() {
     let device = render_device(1);
     let context = open_context(&device);
 
-    let future = pin!(device.submit(context, command_buffer(&[1_u8, 2, 3, 4]), FenceId::new(4)));
-    let (_, submitted) = exchange(&device, future, &header_response(RESP_OK_NODATA));
-    submitted.expect("the device took the first command buffer");
-    let future = pin!(device.submit(context, command_buffer(&[5_u8, 6, 7, 8]), FenceId::new(9)));
-    let (_, submitted) = exchange(&device, future, &header_response(RESP_OK_NODATA));
-    submitted.expect("the device took the second command buffer");
+    fenced(&device, context, RingIndex::CPU, 4);
+    fenced(&device, context, RingIndex::CPU, 9);
 
-    let fence = block_on(device.fences(context, FenceId::START))
+    let fence = block_on(device.fences(context, RingIndex::CPU, FenceId::START))
         .expect("two fences have retired since the reader last looked");
     assert_eq!(
         fence,
@@ -1612,51 +1981,86 @@ fn a_lagging_fence_reader_is_handed_the_newest_fence() {
 }
 
 /// One context's fences are not another's: a reader following one
-/// timeline is not woken through by work on the other.
+/// context's ring is not woken through by work on another context's
+/// ring of the same index.
 #[test]
 fn a_fence_belongs_to_the_context_that_submitted_it() {
     let device = render_device(1);
     let first = open_context(&device);
     let second = open_context(&device);
 
-    let mut waiting = pin!(device.fences(second, FenceId::START));
+    let mut waiting = pin!(device.fences(second, RingIndex::CPU, FenceId::START));
     assert!(block_on(poll_once(waiting.as_mut())).is_none());
 
-    let future = pin!(device.submit(first, command_buffer(&[1_u8, 2, 3, 4]), FenceId::new(3)));
-    let (_, submitted) = exchange(&device, future, &header_response(RESP_OK_NODATA));
-    submitted.expect("the device took the command buffer");
-
+    fenced(&device, first, RingIndex::CPU, 3);
     assert!(
         block_on(poll_once(waiting.as_mut())).is_none(),
-        "the other context's timeline has not moved"
+        "the other context's ring has not moved"
     );
-    let future = pin!(device.submit(second, command_buffer(&[5_u8, 6, 7, 8]), FenceId::new(1)));
-    let (_, submitted) = exchange(&device, future, &header_response(RESP_OK_NODATA));
-    submitted.expect("the device took the second command buffer");
+    fenced(&device, second, RingIndex::CPU, 1);
     assert_eq!(
         block_on(waiting).expect("this context's fence"),
         FenceId::new(1)
     );
 }
 
+/// One ring's fences are not another's on the same context: each ring
+/// is a timeline of its own, and retiring a fence on one leaves every
+/// other where it was.
+#[test]
+fn a_fence_belongs_to_the_ring_it_was_submitted_on() {
+    let device = render_device(1);
+    let context = open_context_with(&device, rings(3));
+
+    let mut cpu = pin!(device.fences(context, RingIndex::CPU, FenceId::START));
+    let mut second = pin!(device.fences(context, ring(2), FenceId::START));
+    assert!(block_on(poll_once(cpu.as_mut())).is_none());
+    assert!(block_on(poll_once(second.as_mut())).is_none());
+
+    fenced(&device, context, ring(1), 40);
+    assert!(
+        block_on(poll_once(cpu.as_mut())).is_none(),
+        "ring zero has not moved"
+    );
+    assert!(
+        block_on(poll_once(second.as_mut())).is_none(),
+        "ring two has not moved"
+    );
+    assert_eq!(
+        block_on(device.fences(context, ring(1), FenceId::START)),
+        Ok(FenceId::new(40))
+    );
+
+    fenced(&device, context, ring(2), 2);
+    assert_eq!(block_on(second), Ok(FenceId::new(2)));
+    assert!(
+        block_on(poll_once(cpu.as_mut())).is_none(),
+        "ring zero still has not moved"
+    );
+}
+
 /// A command the device refuses still retires its fence: a reader of
-/// the timeline must not be left waiting for a point the device has
-/// already decided will not come.
+/// the ring must not be left waiting for a point the device has already
+/// decided will not come.
 #[test]
 fn a_rejected_submission_still_retires_its_fence() {
     let device = render_device(1);
     let context = open_context(&device);
 
-    let mut waiting = pin!(device.fences(context, FenceId::START));
+    let mut waiting = pin!(device.fences(context, RingIndex::CPU, FenceId::START));
     assert!(block_on(poll_once(waiting.as_mut())).is_none());
 
-    let future = pin!(device.submit(context, command_buffer(&[1_u8, 2, 3, 4]), FenceId::new(2)));
-    let (_, submitted) = exchange(
+    let commands = [1_u8, 2, 3, 4];
+    let (_, submitted, posted) = run_submit(
         &device,
-        future,
+        pages_submission(context, &commands, RingIndex::CPU, Some(2)),
         &header_response(super::RESP_ERR_INVALID_PARAMETER),
     );
 
+    assert!(
+        posted,
+        "the command reached the queue before it was refused"
+    );
     assert_eq!(submitted.err(), Some(Gpu3dError::InvalidParameter));
     assert_eq!(
         block_on(waiting).expect("the fence of a refused command"),
@@ -1670,11 +2074,11 @@ fn a_rejected_submission_still_retires_its_fence() {
 fn an_invalid_context_answer_names_the_context_that_was_asked_for() {
     let device = render_device(1);
     let context = open_context(&device);
-    let future = pin!(device.submit(context, command_buffer(&[1_u8, 2, 3, 4]), FenceId::new(1)));
+    let commands = [1_u8, 2, 3, 4];
 
-    let (_, submitted) = exchange(
+    let (_, submitted, _) = run_submit(
         &device,
-        future,
+        pages_submission(context, &commands, RingIndex::CPU, Some(1)),
         &header_response(RESP_ERR_INVALID_CONTEXT_ID),
     );
 
@@ -1693,9 +2097,127 @@ fn a_destroyed_context_is_not_this_devices_any_more() {
     assert_eq!(command_of(&wire), CMD_CTX_DESTROY);
     assert_eq!(word_at(&wire, 16), context.raw());
 
-    let refused =
-        block_on(device.submit(context, command_buffer(&[1_u8, 2, 3, 4]), FenceId::new(1)));
+    let commands = [1_u8, 2, 3, 4];
+    let refused = block_on(device.submit(
+        pages_submission(context, &commands, RingIndex::CPU, Some(1)),
+        &mut || {},
+    ));
     assert_eq!(refused.err(), Some(Gpu3dError::UnknownContext(context)));
+}
+
+/// `SET_SCANOUT_BLOB` names the scanout, the blob, the frame's geometry
+/// and format, and one plane's stride and offset, with the whole frame
+/// as the source rectangle.
+#[test]
+fn a_blob_scanout_is_encoded_as_the_specification_lays_it_out() {
+    let device = render_device(1);
+    let context = open_context(&device);
+    let blob = open_blob(&device, context, 0x20_0000);
+    let layout = BlobScanout {
+        blob,
+        mode: DisplayMode::new(640, 480),
+        format: PixelFormat::Bgrx8888,
+        offset: 0x100,
+        stride: 2560,
+    };
+    let future = pin!(device.set_scanout_blob(ScanoutId::new(0), layout));
+
+    let (wire, shown) = exchange(&device, future, &header_response(RESP_OK_NODATA));
+    shown.expect("the device showed the blob");
+
+    assert_eq!(wire.len(), SET_SCANOUT_BLOB_BYTES);
+    assert_eq!(command_of(&wire), CMD_SET_SCANOUT_BLOB);
+    let rect = CTRL_HEADER_BYTES;
+    assert_eq!(
+        [
+            word_at(&wire, rect),
+            word_at(&wire, rect + 4),
+            word_at(&wire, rect + 8),
+            word_at(&wire, rect + 12)
+        ],
+        [0, 0, 640, 480],
+        "the source rectangle is the whole frame"
+    );
+    let body = CTRL_HEADER_BYTES + 16;
+    assert_eq!(word_at(&wire, body), 0, "scanout id");
+    assert_eq!(word_at(&wire, body + 4), blob.raw(), "resource id");
+    assert_eq!(word_at(&wire, body + 8), 640, "width");
+    assert_eq!(word_at(&wire, body + 12), 480, "height");
+    assert_eq!(
+        word_at(&wire, body + 16),
+        2,
+        "VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM"
+    );
+    assert_eq!(word_at(&wire, body + 24), 2560, "strides[0]");
+    assert_eq!(word_at(&wire, body + 28), 0, "strides[1]");
+    assert_eq!(word_at(&wire, body + 40), 0x100, "offsets[0]");
+    assert_eq!(word_at(&wire, body + 44), 0, "offsets[1]");
+}
+
+/// A frame that ends past the blob is refused with the numbers that say
+/// why, before the device sees it.
+#[test]
+fn a_blob_scanout_that_does_not_fit_never_reaches_the_device() {
+    let device = render_device(1);
+    let context = open_context(&device);
+    let blob = open_blob(&device, context, 0x1000);
+    let kicks = device.transport.kick_count();
+    let layout = BlobScanout {
+        blob,
+        mode: DisplayMode::new(64, 64),
+        format: PixelFormat::Bgrx8888,
+        offset: 0,
+        stride: 256,
+    };
+
+    let refused = block_on(device.set_scanout_blob(ScanoutId::new(0), layout));
+
+    assert_eq!(
+        refused.err(),
+        Some(DisplayError::BlobLayout {
+            width: 64,
+            height: 64,
+            offset: 0,
+            stride: 256,
+            blob_bytes: 0x1000,
+        })
+    );
+    assert_eq!(device.transport.kick_count(), kicks);
+}
+
+/// A device that negotiated no blob resources scans no blob out.
+#[test]
+fn a_device_without_blob_resources_scans_no_blob_out() {
+    let device = device_with(1, OFFERED_EDID | GPU_FEATURE_VIRGL);
+    let layout = BlobScanout {
+        blob: BlobId::new(1),
+        mode: DisplayMode::new(64, 64),
+        format: PixelFormat::Bgrx8888,
+        offset: 0,
+        stride: 256,
+    };
+
+    let refused = block_on(device.set_scanout_blob(ScanoutId::new(0), layout));
+
+    assert_eq!(refused.err(), Some(DisplayError::BlobScanoutUnsupported));
+    assert_eq!(device.transport.kick_count(), 0);
+}
+
+/// Presenting a blob is a `RESOURCE_FLUSH` naming it, with no transfer
+/// first: the bytes are already the device's.
+#[test]
+fn flushing_a_blob_is_one_resource_flush() {
+    let device = render_device(1);
+    let context = open_context(&device);
+    let blob = open_blob(&device, context, 0x10_0000);
+    let future = pin!(device.flush_blob(blob, Rect::new(0, 0, 640, 480)));
+
+    let (wire, flushed) = exchange(&device, future, &header_response(RESP_OK_NODATA));
+    flushed.expect("the device flushed the blob");
+
+    assert_eq!(command_of(&wire), CMD_RESOURCE_FLUSH);
+    assert_eq!(word_at(&wire, CTRL_HEADER_BYTES + 8), 640);
+    assert_eq!(word_at(&wire, CTRL_HEADER_BYTES + 16), blob.raw());
 }
 
 /// A device that publishes no host-visible aperture maps nothing, and
@@ -2090,6 +2612,39 @@ fn a_frame_buffer_that_is_still_shown_cannot_be_destroyed() {
         })
         .expect("the device comes back");
     assert_eq!(requests.len(), 9);
+}
+
+/// A blob scanned out in a frame buffer's place replaces it on the
+/// scanout, so the frame buffer is shown no longer and its destroy
+/// reaches the device.
+#[test]
+fn a_frame_buffer_replaced_by_a_blob_scanout_can_be_destroyed() {
+    let device = render_device(1);
+    let mode = DisplayMode::new(64, 32);
+    let frame = create_framebuffer(&device, mode);
+    let shown = pin!(device.set_scanout(ScanoutId::new(0), frame, Rect::of(mode)));
+    let (_, outcome) = exchange(&device, shown, &header_response(RESP_OK_NODATA));
+    outcome.expect("the scanout is set");
+
+    let context = open_context(&device);
+    let blob = open_blob(&device, context, 0x20_0000);
+    let layout = BlobScanout {
+        blob,
+        mode,
+        format: PixelFormat::Bgrx8888,
+        offset: 0,
+        stride: 256,
+    };
+    let replaced = pin!(device.set_scanout_blob(ScanoutId::new(0), layout));
+    let (_, outcome) = exchange(&device, replaced, &header_response(RESP_OK_NODATA));
+    outcome.expect("the device showed the blob");
+
+    let mut destroy = pin!(device.destroy_framebuffer(frame));
+    let token = pending_control(&device, destroy.as_mut());
+    assert_eq!(
+        command_of(&control_request(&device, token)),
+        CMD_RESOURCE_DETACH_BACKING
+    );
 }
 
 /// The create was answered while the machine froze, and the attach had

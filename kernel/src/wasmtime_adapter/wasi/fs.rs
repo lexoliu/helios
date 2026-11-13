@@ -9,7 +9,7 @@
 //! them and only translate types.
 
 use helios_hal::fs::{
-    FileSystem, FsError as VfsError, Metadata, NodeKind, OpenFlags, WritePosition,
+    FileSystem, FsError as VfsError, FsResult, Metadata, NodeKind, OpenFlags, WritePosition,
 };
 use pin_project_lite::pin_project;
 
@@ -174,14 +174,10 @@ pub(crate) fn child_path(base: &FsDescriptor, path: &str) -> FsOpResult<String> 
     crate::resolve_child_path(&base.path, path).map_err(map_component_fs_path_error)
 }
 
-fn require_directory(base: &FsDescriptor) -> FsOpResult<()> {
-    if base.kind != FsNodeKind::Directory {
-        return Err(fs_types::ErrorCode::NotDirectory);
-    }
-    Ok(())
-}
-
 /// Opens `path` below `base` as WASI `open-at` does.
+///
+/// The lookup itself needs `base`'s `read`, which the signature proves
+/// before anything is resolved.
 ///
 /// A descriptor may be opened with any rights `base` holds, whatever the
 /// filesystem would let it do: a file on a read-only filesystem opens for
@@ -193,7 +189,7 @@ fn require_directory(base: &FsDescriptor) -> FsOpResult<()> {
 /// filesystem and leaves it as it was.
 pub(crate) async fn open_at<HostFs>(
     namespace: &Namespace<HostFs>,
-    base: &FsDescriptor,
+    base: Granted<'_, Directory, Read>,
     path_flags: fs_types::PathFlags,
     path: &str,
     open_flags: fs_types::OpenFlags,
@@ -203,7 +199,7 @@ pub(crate) async fn open_at<HostFs>(
 where
     HostFs: crate::HostFileSystem,
 {
-    require_directory(base)?;
+    let base = base.descriptor();
     // Every right the flags need is proved before the path is resolved, so a
     // refusal reaches no filesystem, a host share included, and holds
     // whether or not the file exists.
@@ -334,15 +330,17 @@ where
         .map_err(fs_error_code)
 }
 
+/// The metadata of `path` below `base`, which must be readable.
 pub(crate) async fn stat_at<HostFs>(
     namespace: &Namespace<HostFs>,
-    base: &FsDescriptor,
+    base: Granted<'_, Directory, Read>,
     path_flags: fs_types::PathFlags,
     path: &str,
 ) -> FsOpResult<Metadata>
 where
     HostFs: crate::HostFileSystem,
 {
+    let base = base.descriptor();
     let absolute = child_path(base, path)?;
     stat_path(namespace, &absolute, follow_within(base, path_flags)).await
 }
@@ -465,40 +463,41 @@ pub(crate) async fn write_resolved<HostFs>(
 where
     HostFs: crate::HostFileSystem,
 {
-    write_resolved_with(resolved, position, bytes.len(), now, |destination| {
-        destination.copy_from_slice(bytes)
+    write_resolved_with(resolved, position, bytes.len(), now, |at, destination| {
+        destination.copy_from_slice(&bytes[at..at + destination.len()]);
     })
     .await
 }
 
-/// Writes `len` bytes that `fill` puts straight into the filesystem's
-/// destination ([`FileSystem::write_with`]), and resolves with the offset
-/// just past them. An append lands at the end of the file as the
-/// filesystem sees it when the write arrives, so its end is the
-/// filesystem's answer, never the caller's idea of where the file ended.
+/// Writes `len` bytes that `source` copies straight into the
+/// filesystem's destination ([`helios_hal::fs::write_with`]), and
+/// resolves with the offset just past them. An append lands at the end of
+/// the file as the filesystem sees it when the write arrives, so its end
+/// is the filesystem's answer, never the caller's idea of where the file
+/// ended.
 ///
-/// `fill` runs before this returns, so it may read guest memory; the
-/// future holds nothing of it.
-pub(crate) fn write_resolved_with<'r, HostFs, F>(
-    resolved: &'r Resolved<'_, HostFs>,
+/// `source(at, destination)` fills `destination` with the write's bytes
+/// from offset `at`. It runs between awaits, never across one, once per
+/// destination region; what it reads must stay valid for the whole call,
+/// which guest memory does for the host call that holds it.
+pub(crate) async fn write_resolved_with<HostFs, S>(
+    resolved: &Resolved<'_, HostFs>,
     position: WritePosition,
     len: usize,
     now: u64,
-    fill: F,
-) -> impl Future<Output = FsOpResult<u64>> + Send + 'r
+    source: S,
+) -> FsOpResult<u64>
 where
     HostFs: crate::HostFileSystem,
-    F: FnOnce(&mut [u8]),
+    S: FnMut(usize, &mut [u8]),
 {
-    let write = resolved
-        .writable()
-        .map(|fs| fs.write_with(resolved.path(), position, len, now, fill));
-    async move {
-        let landed = write.map_err(fs_error_code)?.await.map_err(fs_error_code)?;
-        landed
-            .checked_add(len as u64)
-            .ok_or(fs_types::ErrorCode::Overflow)
-    }
+    let fs = resolved.writable().map_err(fs_error_code)?;
+    let landed = helios_hal::fs::write_with(fs, resolved.path(), position, len, now, source)
+        .await
+        .map_err(fs_error_code)?;
+    landed
+        .checked_add(len as u64)
+        .ok_or(fs_types::ErrorCode::Overflow)
 }
 
 pub(crate) async fn set_size<HostFs>(
@@ -580,14 +579,13 @@ where
 /// each group by name, with the mount points inside it.
 pub(crate) async fn read_directory<HostFs>(
     namespace: &Namespace<HostFs>,
-    descriptor: &FsDescriptor,
+    directory: Granted<'_, Directory, Read>,
 ) -> FsOpResult<Vec<fs_types::DirectoryEntry>>
 where
     HostFs: crate::HostFileSystem,
 {
-    require_directory(descriptor)?;
     let mut entries: Vec<fs_types::DirectoryEntry> = namespace
-        .list(&descriptor.path)
+        .list(&directory.descriptor().path)
         .await
         .map_err(fs_error_code)?
         .into_iter()
@@ -662,20 +660,20 @@ where
         .map_err(fs_error_code)
 }
 
-/// Renames within one mount; across two, `cross-device`.
+/// Renames within one mount; across two, `cross-device`. A rename is a link
+/// that also removes the source entry, so it follows the link's rule.
 pub(crate) async fn rename_at<HostFs>(
     namespace: &Namespace<HostFs>,
-    source_base: Granted<'_, Directory, Mutate>,
+    rename: RenameGrant<'_, '_>,
     source_path: &str,
-    destination_base: Granted<'_, Directory, Mutate>,
     destination_path: &str,
     now: u64,
 ) -> FsOpResult<()>
 where
     HostFs: crate::HostFileSystem,
 {
-    let source = child_below(source_base.descriptor(), source_path)?;
-    let destination = child_below(destination_base.descriptor(), destination_path)?;
+    let source = child_below(rename.source(), source_path)?;
+    let destination = child_below(rename.destination(), destination_path)?;
     namespace
         .rename(&source, &destination, now)
         .await
@@ -685,18 +683,16 @@ where
 /// Links within one mount; across two, `cross-device`.
 pub(crate) async fn link_at<HostFs>(
     namespace: &Namespace<HostFs>,
-    source_base: &FsDescriptor,
+    link: AliasGrant<'_, '_>,
     source_path: &str,
-    destination_base: Granted<'_, Directory, Mutate>,
     destination_path: &str,
     now: u64,
 ) -> FsOpResult<()>
 where
     HostFs: crate::HostFileSystem,
 {
-    require_directory(source_base)?;
-    let source = child_path(source_base, source_path)?;
-    let destination = child_path(destination_base.descriptor(), destination_path)?;
+    let source = child_path(link.source(), source_path)?;
+    let destination = child_path(link.destination(), destination_path)?;
     namespace
         .link(&source, &destination, now)
         .await
@@ -730,14 +726,13 @@ where
 /// when it would name something outside the link's directory.
 pub(crate) async fn readlink_at<HostFs>(
     namespace: &Namespace<HostFs>,
-    base: &FsDescriptor,
+    base: Granted<'_, Directory, Read>,
     path: &str,
 ) -> FsOpResult<String>
 where
     HostFs: crate::HostFileSystem,
 {
-    require_directory(base)?;
-    let absolute = child_path(base, path)?;
+    let absolute = child_path(base.descriptor(), path)?;
     let resolved = resolve(namespace, &absolute)?;
     let target = resolved
         .fs()
@@ -774,20 +769,20 @@ where
 ///
 /// `floor` is the directory whose grant admits the load
 /// ([`crate::ProcessAuthority::program_load_floor`]); a symbolic link
-/// that leads out of it is refused.
+/// that leads out of it is refused. The filesystem's own error comes back
+/// untranslated: the caller decides what each kind means to its surface.
 pub(crate) async fn read_program_file<HostFs>(
     namespace: &Namespace<HostFs>,
     absolute: &str,
     floor: &str,
-) -> FsOpResult<FileContents>
+) -> FsResult<FileContents>
 where
     HostFs: crate::HostFileSystem,
 {
     let resolved = namespace
         .resolve_following(absolute, Follow::Within(floor))
-        .await
-        .map_err(fs_error_code)?;
-    resolved.read_whole().await.map_err(fs_error_code)
+        .await?;
+    resolved.read_whole().await
 }
 
 /// Creates or replaces the file `absolute` names with `bytes`.
@@ -1092,7 +1087,7 @@ async fn list_owned<HostFs>(
 where
     HostFs: crate::HostFileSystem,
 {
-    read_directory(&namespace, &descriptor).await
+    read_directory(&namespace, descriptor.grant()?).await
 }
 
 pub(super) fn directory_producer<HostFs>(
@@ -1502,7 +1497,7 @@ where
         let profile = accessor.with(|mut access| component_fs_profile(access.get()));
         let (base, namespace) =
             accessor.with(|mut access| descriptor_in(access.get(), &descriptor))?;
-        let result = self::stat_at(&namespace, &base, path_flags, &path)
+        let result = self::stat_at(&namespace, base.grant()?, path_flags, &path)
             .await
             .map(|metadata| descriptor_stat(&metadata));
         record_component_fs_profile(profile, "stat-at");
@@ -1557,9 +1552,8 @@ where
         })?;
         Ok(self::link_at(
             &namespace,
-            &source_base,
+            source_base.grant()?.alias_into(destination_base.grant()?)?,
             &source_path,
-            destination_base.grant()?,
             &destination_path,
             now,
         )
@@ -1579,8 +1573,16 @@ where
             let (base, namespace) = descriptor_in(access.get(), &descriptor)?;
             Ok::<_, fs_types::ErrorCode>((base, namespace, access.get().now_nanos()))
         })?;
-        let opened =
-            self::open_at(&namespace, &base, path_flags, &path, open_flags, flags, now).await?;
+        let opened = self::open_at(
+            &namespace,
+            base.grant()?,
+            path_flags,
+            &path,
+            open_flags,
+            flags,
+            now,
+        )
+        .await?;
         let result = accessor
             .with(|mut access| access.get().table.push(opened))
             .map_err(FsError::trap);
@@ -1604,7 +1606,7 @@ where
             }
             descriptor_in(access.get(), &descriptor)
         })?;
-        Ok(self::readlink_at(&namespace, &base, &path).await?)
+        Ok(self::readlink_at(&namespace, base.grant()?, &path).await?)
     }
 
     async fn remove_directory_at(
@@ -1631,9 +1633,11 @@ where
         })?;
         Ok(self::rename_at(
             &namespace,
-            source_base.grant()?,
+            source_base
+                .grant()?
+                .alias_into(destination_base.grant()?)?
+                .removing_source()?,
             &source_path,
-            destination_base.grant()?,
             &destination_path,
             now,
         )
@@ -1709,7 +1713,7 @@ where
         let profile = accessor.with(|mut access| component_fs_profile(access.get()));
         let (base, namespace) =
             accessor.with(|mut access| descriptor_in(access.get(), &descriptor))?;
-        let result = self::stat_at(&namespace, &base, path_flags, &path)
+        let result = self::stat_at(&namespace, base.grant()?, path_flags, &path)
             .await
             .map(|metadata| self::metadata_hash(&metadata));
         record_component_fs_profile(profile, "metadata-hash-at");

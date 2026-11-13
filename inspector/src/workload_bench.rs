@@ -47,6 +47,30 @@ pub(crate) const DEFAULT_WORKLOAD_TIMEOUT_SECONDS: u32 = 180;
 /// time and not a minute of it.
 const NETWORK_COUNTER_DEADLINE_SECONDS: u32 = 10;
 
+/// How long the read of the guest's ISA level at the start of a run may
+/// take. The guest has just answered the boot handshake, so a few seconds
+/// is the bound a healthy one needs.
+const GUEST_ISA_DEADLINE_SECONDS: u32 = 10;
+
+/// The instruction-set level the guest kernel compiled guest code for, as
+/// the guest reports it through `helios:system/stats`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct GuestIsa {
+    /// The level name, such as `x86-64-v4`.
+    pub(crate) level: String,
+    /// The features used beyond the level; empty when there are none.
+    pub(crate) extras: Vec<String>,
+}
+
+impl From<&helios_inspector_protocol::system::stats::Processors> for GuestIsa {
+    fn from(processors: &helios_inspector_protocol::system::stats::Processors) -> Self {
+        Self {
+            level: processors.guest_isa_level.clone(),
+            extras: processors.guest_isa_extras.clone(),
+        }
+    }
+}
+
 /// A workload that never came back.
 ///
 /// Typed rather than a bare message because the deadline is the one
@@ -555,6 +579,9 @@ enum JsonlRecord<'a> {
         /// record names the host it ran on (#173).
         host_cpu: String,
         vm: &'a VmProvenance,
+        /// The ISA level the guest kernel compiled guest code for during
+        /// this run, read from the guest over the inspector RPC.
+        guest_isa: GuestIsa,
         manifest: String,
         iterations: u16,
         selected_workloads: Vec<String>,
@@ -655,11 +682,19 @@ pub(crate) async fn run_inner(
         .iter()
         .map(|workload| workload.name.clone())
         .collect::<Vec<_>>();
+    let processors = guest_step_under_deadline(
+        "guest ISA level",
+        GUEST_ISA_DEADLINE_SECONDS,
+        vcpus,
+        async { Ok::<_, WorkloadBenchError>(crate::system::fetch_stats(client).await?.processors) },
+    )
+    .await?;
     write_record(&JsonlRecord::Run {
         schema_version: 1,
         git_sha: git_sha().unwrap_or_else(|_| "unknown".to_owned()),
         host_cpu: host_cpu()?,
         vm: provenance,
+        guest_isa: GuestIsa::from(&processors),
         manifest: manifest_path.display().to_string(),
         iterations: command.iterations,
         selected_workloads,
@@ -2050,6 +2085,25 @@ mod tests {
         .expect("a workload that answers in time must not be failed");
 
         assert_eq!(output.elapsed_ms, 24.375);
+    }
+
+    /// The run record names the ISA level the guest reported, and its extras
+    /// as a list.
+    #[test]
+    fn the_run_record_carries_the_guest_isa() {
+        let processors = helios_inspector_protocol::system::stats::Processors {
+            configured: 2,
+            online: 2,
+            utilization: Vec::new(),
+            guest_isa_level: "x86-64-v4".to_owned(),
+            guest_isa_extras: vec!["vbmi".to_owned(), "bitalg".to_owned()],
+        };
+        let guest_isa = GuestIsa::from(&processors);
+        let encoded = serde_json::to_value(&guest_isa).expect("the ISA must serialise");
+        assert_eq!(
+            encoded,
+            serde_json::json!({"level": "x86-64-v4", "extras": ["vbmi", "bitalg"]})
+        );
     }
 
     /// An iteration keeps its sub-millisecond digits all the way into the

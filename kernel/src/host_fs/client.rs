@@ -46,6 +46,11 @@
 //!   returned on every exit path, error paths included, and the
 //!   session's own root fid is never opened, walked over or clunked by
 //!   an operation — every operation walks a fid of its own from it.
+//! * A staged write ([`HostFsWrite`]) is one operation from its prepare
+//!   to its last submit, inside the gate the whole time. Dropped before
+//!   it finishes, it cannot await a `Tclunk`, so its fid joins a list
+//!   the next operation, or a snapshot hold, clunks; the number stays
+//!   allocated until then, so no walk reuses a fid the server holds.
 //! * A reply is matched against the tag and the message type of the
 //!   request it answers. A mismatch is a protocol error, not something
 //!   to parse anyway.
@@ -64,8 +69,9 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use bytes::BytesMut;
 use core::future::Future;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use helios_hal::cpu::{Cpu, HardwarePerfCounters};
+use helios_hal::fs::{WritePosition, WriteProgress};
 use helios_hal::io::IoError;
 use objectpool::{Pool, ReusableObject};
 use slab::Slab;
@@ -74,8 +80,9 @@ use triomphe::Arc;
 
 use super::cache::{CachedAttributes, HostFsCache, HostFsCacheStats, PooledReadFid};
 use crate::{
-    AuthorityDomain, HostDirEntry, HostDirLimit, HostFileSystem, HostFsError, HostFsErrorKind,
-    HostMetadata, HostShareRestore, Notify, ObjectIdentity, ProfileSink, RawMutex,
+    AuthorityDomain, HostDirEntry, HostDirLimit, HostFileSystem, HostFilledWrite, HostFsError,
+    HostFsErrorKind, HostMetadata, HostShareRestore, HostWrite, Notify, ObjectIdentity,
+    ProfileSink, RawMutex,
 };
 
 /// The msize this client asks for. The server answers with its own
@@ -148,8 +155,14 @@ const P9_RGETATTR_MTIME_SECONDS: usize = 96;
 const P9_RGETATTR_CTIME_SECONDS: usize = 112;
 /// Full `Rgetattr` reply length, up to and including `data_version`.
 const P9_RGETATTR_LEN: usize = 160;
+/// Where the `tag[2]` field of every message starts, after `size[4]
+/// type[1]`.
+const P9_TAG_OFFSET: usize = 5;
 const P9_DEFAULT_REQUEST_BODY_BYTES: usize = 256;
 const P9_TWRITE_FIXED_BODY_BYTES: usize = 4 + 8 + 4;
+/// Where a `Twrite`'s payload starts: the header, then `fid[4]
+/// offset[8] count[4]`.
+const P9_TWRITE_HEADER_LEN: usize = P9_HEADER_LEN + P9_TWRITE_FIXED_BODY_BYTES;
 /// Reply sizes that the protocol fixes independently of the msize.
 /// Every one of them has to leave room for an `Rlerror`, which is
 /// 11 bytes: a reply the buffer cannot hold arrives truncated and is
@@ -581,6 +594,22 @@ struct ClientInner<Transport: HostFsTransport, CpuImpl: Cpu + Clone> {
     cache: HostFsCache,
     request_buffers: Pool<BytesMut>,
     response_buffers: Pool<BytesMut>,
+    /// How many request buffers the pool keeps: the transport's pipeline
+    /// depth, and the most frames one round of a staged write holds.
+    request_depth: usize,
+    /// Fids of writes dropped before they finished, waiting for a clunk.
+    abandoned: AbandonedFids,
+}
+
+/// Fids whose write was dropped before it could clunk them.
+///
+/// Any processor may push (a write is dropped wherever its task runs) and
+/// any operation drains; the spin lock is taken only to push or take the
+/// list and never held across an await. `pending` lets the operations
+/// that find nothing queued skip the lock with one shared load.
+struct AbandonedFids {
+    pending: AtomicBool,
+    fids: SpinMutex<Vec<u32>>,
 }
 
 pub struct HostFsClient<Transport: HostFsTransport, CpuImpl: Cpu + Clone> {
@@ -616,6 +645,11 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
                 cache: HostFsCache::new(profiles.clone()),
                 request_buffers: Pool::bounded(depth, BytesMut::new, reset_p9_buffer),
                 response_buffers: Pool::bounded(depth, BytesMut::new, reset_p9_buffer),
+                request_depth: depth,
+                abandoned: AbandonedFids {
+                    pending: AtomicBool::new(false),
+                    fids: SpinMutex::new(Vec::new()),
+                },
                 transport,
                 cpu,
                 profiles,
@@ -678,6 +712,9 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         for fid in parked {
             self.clunk_value(fid).await;
         }
+        // A write dropped before it finished left its fid open on the
+        // server, and QEMU snapshots no share with a fid attached.
+        self.clunk_abandoned().await;
         self.clunk_value(session.root_fid).await;
         tracing::info!(parked_fids, "9p session released for a snapshot");
     }
@@ -773,6 +810,7 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         payload: impl FnOnce(&T) -> usize + Send,
     ) -> Result<T, HostFsError> {
         let _inside = self.inner.gate.enter().await;
+        self.clunk_abandoned().await;
         let start = self.profile_start();
         let result = operation.await;
         if let Some(start) = start {
@@ -905,7 +943,6 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         response_len: usize,
     ) -> Result<ReusableObject<BytesMut>, HostFsError> {
         let mut request = self.inner.request_buffers.get_owned();
-        let mut response = self.inner.response_buffers.get_owned();
         request.clear();
         request.reserve(P9_HEADER_LEN + body_capacity);
         request.extend_from_slice(&0_u32.to_le_bytes());
@@ -915,7 +952,20 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         let size =
             u32::try_from(request.len()).map_err(|_| HostFsError::Protocol("request too large"))?;
         request[..4].copy_from_slice(&size.to_le_bytes());
+        self.send_frame(tag, ty, request, response_len).await
+    }
 
+    /// Hands a fully encoded Tmessage carrying `tag` to the transport and
+    /// validates the reply against it; the request buffer goes back to
+    /// its pool as soon as the transport is done with it.
+    async fn send_frame(
+        &self,
+        tag: u16,
+        ty: P9Message,
+        request: ReusableObject<BytesMut>,
+        response_len: usize,
+    ) -> Result<ReusableObject<BytesMut>, HostFsError> {
+        let mut response = self.inner.response_buffers.get_owned();
         let submitted = self.profile_start();
         self.inner
             .transport
@@ -935,7 +985,7 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         // in it is worth reading: several requests are in flight at
         // once, and a transport that crossed two of them must not be
         // parsed as if it had not.
-        let response_tag = read_u16_le(&response, 5)?;
+        let response_tag = read_u16_le(&response, P9_TAG_OFFSET)?;
         if response_tag != tag {
             tracing::error!(
                 expected = tag,
@@ -1356,44 +1406,111 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         .map(|_| ())
     }
 
-    async fn write_chunks(
-        &self,
-        session: Session,
-        fid: u32,
-        mut offset: u64,
-        mut bytes: &[u8],
-    ) -> Result<(), HostFsError> {
-        let chunk = session.payload_chunk();
-        while !bytes.is_empty() {
-            let count = bytes.len().min(chunk);
-            let payload = &bytes[..count];
-            let response = self
-                .transact_with_capacity(
-                    P9Message::Write,
-                    write_request_body_capacity(count),
-                    |body| {
-                        push_u32(body, fid);
-                        push_u64(body, offset);
-                        push_u32(
-                            body,
-                            u32::try_from(count).expect("write chunk length overflowed u32"),
-                        );
-                        body.extend_from_slice(payload);
-                    },
-                    P9_SMALL_REPLY_LEN,
-                )
-                .await?;
-            let written = usize::try_from(read_u32_le(&response, P9_HEADER_LEN)?)
-                .map_err(|_| HostFsError::Protocol("write count overflowed usize"))?;
-            if written != count {
-                return Err(HostFsError::Protocol("short 9p write"));
+    /// Stages a write: walks `path`, opens it for writing, resolves where
+    /// the bytes land and readies the first round of `Twrite` frames.
+    ///
+    /// An append resolves the end of file with `Tgetattr` on the same fid
+    /// that then performs the write: 9p `Twrite` always carries an
+    /// explicit offset (the server `pwrite`s, so `O_APPEND` on `Tlopen`
+    /// would not make the write positionless), and this is the closest
+    /// the protocol gets to append semantics.
+    ///
+    /// The write counts as an operation inside the snapshot gate from
+    /// here until it finishes or is dropped, and its `op-write` or
+    /// `op-append` phase spans the same interval.
+    async fn prepare_write_impl<'a>(
+        &'a self,
+        path: &'a str,
+        position: WritePosition,
+        len: usize,
+    ) -> Result<HostFsWrite<'a, Transport, CpuImpl>, HostFsError> {
+        let inside = self.inner.gate.enter().await;
+        self.clunk_abandoned().await;
+        let started = self.profile_start();
+        let phase = match position {
+            WritePosition::At(_) => "op-write",
+            WritePosition::End => "op-append",
+        };
+        match self.open_for_write(path, position, len).await {
+            Ok((session, fid, landed)) => {
+                let mut write = HostFsWrite {
+                    client: self,
+                    path,
+                    session,
+                    fid: Some(fid),
+                    _inside: inside,
+                    started,
+                    phase,
+                    landed,
+                    len,
+                    staged_from: 0,
+                    frames: Vec::with_capacity(self.inner.request_depth),
+                };
+                write.stage_round();
+                Ok(write)
             }
-            offset = offset
-                .checked_add(u64::try_from(written).expect("written length overflowed u64"))
-                .ok_or(HostFsError::Protocol("write offset overflowed u64"))?;
-            bytes = &bytes[written..];
+            Err(error) => {
+                if let Some(started) = started {
+                    self.record_phase(phase, started, 1, 0);
+                }
+                Err(error)
+            }
         }
-        Ok(())
+    }
+
+    /// The session, a fid open for writing on `path`, and the offset a
+    /// write of `len` bytes at `position` lands at. A failure clunks the
+    /// fid it walked.
+    async fn open_for_write(
+        &self,
+        path: &str,
+        position: WritePosition,
+        len: usize,
+    ) -> Result<(Session, Handle<'_>, u64), HostFsError> {
+        let session = self.session().await?;
+        let file = self.walk(session, path).await?;
+        let opened = async {
+            let landed = match position {
+                WritePosition::At(offset) => offset,
+                WritePosition::End => self.get_attr(file.value()).await?.size,
+            };
+            u64::try_from(len)
+                .ok()
+                .and_then(|len| landed.checked_add(len))
+                .ok_or(HostFsError::Protocol("write offset overflowed u64"))?;
+            self.open(file.value(), P9_DOTL_WRONLY).await?;
+            Ok(landed)
+        }
+        .await;
+        match opened {
+            Ok(landed) => Ok((session, file, landed)),
+            Err(error) => {
+                self.clunk(file).await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Queues the fid of a write dropped before it finished for the next
+    /// operation to clunk: dropping cannot await a `Tclunk`, and the
+    /// number stays allocated until the server has let it go, so no
+    /// later walk can name a fid the server still holds open.
+    fn abandon_fid(&self, fid: u32) {
+        self.inner.abandoned.fids.lock().push(fid);
+        self.inner.abandoned.pending.store(true, Ordering::Release);
+    }
+
+    /// Clunks every fid a dropped write left behind.
+    async fn clunk_abandoned(&self) {
+        if !self.inner.abandoned.pending.load(Ordering::Acquire)
+            || !self.inner.abandoned.pending.swap(false, Ordering::AcqRel)
+        {
+            return;
+        }
+        let fids = core::mem::take(&mut *self.inner.abandoned.fids.lock());
+        for fid in fids {
+            self.clunk_value(fid).await;
+        }
     }
 
     async fn stat_path_impl(&self, path: &str) -> Result<HostMetadata, HostFsError> {
@@ -1620,48 +1737,6 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         result
     }
 
-    async fn write_file_impl(
-        &self,
-        path: &str,
-        offset: u64,
-        bytes: &[u8],
-    ) -> Result<(), HostFsError> {
-        let session = self.session().await?;
-        let file = self.walk(session, path).await?;
-        let result = async {
-            self.open(file.value(), P9_DOTL_WRONLY).await?;
-            self.write_chunks(session, file.value(), offset, bytes)
-                .await
-        }
-        .await;
-        self.clunk(file).await;
-        self.invalidate_contents(path).await;
-        result
-    }
-
-    /// Appends at the host's current end of file.
-    ///
-    /// 9p `Twrite` always carries an explicit offset — the server `pwrite`s,
-    /// so `O_APPEND` on `Tlopen` would not make the write positionless. The
-    /// end of file is therefore resolved with `Tgetattr` on the same fid that
-    /// then performs the write, which is the closest the protocol gets to
-    /// append semantics.
-    async fn append_file_impl(&self, path: &str, bytes: &[u8]) -> Result<u64, HostFsError> {
-        let session = self.session().await?;
-        let file = self.walk(session, path).await?;
-        let result = async {
-            let offset = self.get_attr(file.value()).await?.size;
-            self.open(file.value(), P9_DOTL_WRONLY).await?;
-            self.write_chunks(session, file.value(), offset, bytes)
-                .await?;
-            Ok(offset)
-        }
-        .await;
-        self.clunk(file).await;
-        self.invalidate_contents(path).await;
-        result
-    }
-
     async fn sync_file_impl(&self, path: &str) -> Result<(), HostFsError> {
         let session = self.session().await?;
         let file = self.walk(session, path).await?;
@@ -1834,6 +1909,8 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
 impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFileSystem
     for HostFsClient<Transport, CpuImpl>
 {
+    type Write<'a> = HostFsWrite<'a, Transport, CpuImpl>;
+
     fn cache_stats(&self) -> Option<HostFsCacheStats> {
         Some(self.cache_stats())
     }
@@ -1892,25 +1969,13 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFileSystem
         .await
     }
 
-    async fn write_file<'a>(
+    async fn prepare_write<'a>(
         &'a self,
         path: &'a str,
-        offset: u64,
-        bytes: &'a [u8],
-    ) -> Result<(), HostFsError> {
-        self.profiled(
-            "op-write",
-            self.write_file_impl(path, offset, bytes),
-            |_| bytes.len(),
-        )
-        .await
-    }
-
-    async fn append_file<'a>(&'a self, path: &'a str, bytes: &'a [u8]) -> Result<u64, HostFsError> {
-        self.profiled("op-append", self.append_file_impl(path, bytes), |_| {
-            bytes.len()
-        })
-        .await
+        position: WritePosition,
+        len: usize,
+    ) -> Result<HostFsWrite<'a, Transport, CpuImpl>, HostFsError> {
+        self.prepare_write_impl(path, position, len).await
     }
 
     async fn sync_file<'a>(&'a self, path: &'a str) -> Result<(), HostFsError> {
@@ -2034,6 +2099,188 @@ fn p9_optional_timestamp(flag: u32, nanos: Option<u64>) -> (u32, u64, u64) {
         return (0, 0, 0);
     };
     (flag, nanos / 1_000_000_000, nanos % 1_000_000_000)
+}
+
+/// A host-share write staged as `Twrite` frames: the client's
+/// [`HostWrite`].
+///
+/// A round holds at most as many frames as the request pool keeps (the
+/// transport's [`HostFsTransport::pipeline_depth`]), one pooled request
+/// buffer each, every one carrying a whole message's payload but the
+/// last: the guest's bytes go straight into the frames the transport
+/// sends, and the kernel memory a write holds is bounded
+/// by the request pool, never by the write's length. Each frame's tag is
+/// allocated when it is sent, so a staged frame holds no tag.
+pub struct HostFsWrite<'a, Transport: HostFsTransport, CpuImpl: Cpu + Clone> {
+    client: &'a HostFsClient<Transport, CpuImpl>,
+    path: &'a str,
+    session: Session,
+    /// The fid open for writing, until the write is finished or dropped.
+    fid: Option<Handle<'a>>,
+    /// Counts the write as an operation in flight for a snapshot hold.
+    _inside: GateEntry<'a>,
+    started: Option<HostFsPerfStart>,
+    /// `op-write` or `op-append`.
+    phase: &'static str,
+    /// The file offset the write's first byte lands at.
+    landed: u64,
+    len: usize,
+    /// Where this round's bytes start, as an offset into the write.
+    staged_from: usize,
+    /// This round's frames, in write order.
+    frames: Vec<ReusableObject<BytesMut>>,
+}
+
+/// A round of a [`HostFsWrite`] whose frames are filled.
+pub struct FilledHostFsWrite<'a, Transport: HostFsTransport, CpuImpl: Cpu + Clone> {
+    write: HostFsWrite<'a, Transport, CpuImpl>,
+}
+
+impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsWrite<'_, Transport, CpuImpl> {
+    /// Readies the frames of the round that starts at `staged_from`: the
+    /// header of each `Twrite`, and a payload region of its length.
+    fn stage_round(&mut self) {
+        let chunk = self.session.payload_chunk();
+        let fid = self
+            .fid
+            .as_ref()
+            .expect("a write is staged only while its fid is open")
+            .value();
+        let end = self.round_end();
+        let mut at = self.staged_from;
+        self.frames.clear();
+        while at < end {
+            let count = (end - at).min(chunk);
+            let offset = self.landed + at as u64;
+            let frame_len = P9_HEADER_LEN + write_request_body_capacity(count);
+            let mut frame = self.client.inner.request_buffers.get_owned();
+            frame.clear();
+            frame.reserve(frame_len);
+            frame.extend_from_slice(
+                &u32::try_from(frame_len)
+                    .expect("a Twrite frame is bounded by the msize")
+                    .to_le_bytes(),
+            );
+            frame.extend_from_slice(&[P9Message::Write.wire()]);
+            // The tag is the sender's to fill in.
+            push_u16(&mut frame, P9_NOTAG);
+            push_u32(&mut frame, fid);
+            push_u64(&mut frame, offset);
+            push_u32(
+                &mut frame,
+                u32::try_from(count).expect("a Twrite payload is bounded by the msize"),
+            );
+            frame.resize(frame_len, 0);
+            self.frames.push(frame);
+            at += count;
+        }
+    }
+
+    /// One past the last byte of the round that starts at `staged_from`.
+    fn round_end(&self) -> usize {
+        let round = self
+            .session
+            .payload_chunk()
+            .saturating_mul(self.client.inner.request_depth);
+        self.staged_from.saturating_add(round).min(self.len)
+    }
+
+    /// Sends this round's frames in order, each under a tag of its own,
+    /// and checks that the host took every byte of each.
+    async fn send_round(&mut self) -> Result<(), HostFsError> {
+        let client = self.client;
+        for mut frame in self.frames.drain(..) {
+            let count = frame.len() - P9_TWRITE_HEADER_LEN;
+            let tag = client.inner.tags.allocate()?;
+            let value = u16::try_from(tag.value()).expect("a 9p tag is bounded below NOTAG");
+            frame[P9_TAG_OFFSET..P9_HEADER_LEN].copy_from_slice(&value.to_le_bytes());
+            let response = client
+                .send_frame(value, P9Message::Write, frame, P9_SMALL_REPLY_LEN)
+                .await?;
+            let written = usize::try_from(read_u32_le(&response, P9_HEADER_LEN)?)
+                .map_err(|_| HostFsError::Protocol("write count overflowed usize"))?;
+            if written != count {
+                return Err(HostFsError::Protocol("short 9p write"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Ends the write: the fid goes back to the server, the caches forget
+    /// what they knew of the file, and the operation's phase records the
+    /// bytes that landed — all of them, or none for a failed write.
+    async fn finish(&mut self, landed_all: bool) {
+        if let Some(fid) = self.fid.take() {
+            self.client.clunk(fid).await;
+        }
+        self.client.invalidate_contents(self.path).await;
+        if let Some(started) = self.started {
+            let bytes = if landed_all { self.len } else { 0 };
+            self.client.record_phase(self.phase, started, 1, bytes);
+        }
+    }
+}
+
+impl<'a, Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostWrite
+    for HostFsWrite<'a, Transport, CpuImpl>
+{
+    type Filled = FilledHostFsWrite<'a, Transport, CpuImpl>;
+
+    fn staged_len(&self) -> usize {
+        self.round_end() - self.staged_from
+    }
+
+    fn fill<F>(mut self, mut fill: F) -> Self::Filled
+    where
+        F: FnMut(usize, &mut [u8]),
+    {
+        let mut at = self.staged_from;
+        for frame in &mut self.frames {
+            let payload = &mut frame[P9_TWRITE_HEADER_LEN..];
+            fill(at, payload);
+            at += payload.len();
+        }
+        FilledHostFsWrite { write: self }
+    }
+}
+
+impl<'a, Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFilledWrite
+    for FilledHostFsWrite<'a, Transport, CpuImpl>
+{
+    type Next = HostFsWrite<'a, Transport, CpuImpl>;
+
+    async fn submit(self) -> Result<WriteProgress<Self::Next>, HostFsError> {
+        let mut write = self.write;
+        if let Err(error) = write.send_round().await {
+            write.finish(false).await;
+            return Err(error);
+        }
+        write.staged_from = write.round_end();
+        if write.staged_from == write.len {
+            write.finish(true).await;
+            return Ok(WriteProgress::Done(write.landed));
+        }
+        write.stage_round();
+        Ok(WriteProgress::More(write))
+    }
+}
+
+/// A write dropped before it finished returns its frames to the pool
+/// with the vector that holds them, and its fid to the server through
+/// the abandoned list. The caches forget the file: a round may have
+/// landed, in whole or, if a submit was dropped part way, in part.
+impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> Drop
+    for HostFsWrite<'_, Transport, CpuImpl>
+{
+    fn drop(&mut self) {
+        let Some(fid) = self.fid.take() else {
+            return;
+        };
+        self.client.abandon_fid(fid.retain());
+        if let Some(orphaned) = self.client.inner.cache.invalidate_contents(self.path) {
+            self.client.abandon_fid(orphaned);
+        }
+    }
 }
 
 fn write_request_body_capacity(payload_len: usize) -> usize {
@@ -2474,6 +2721,8 @@ mod tests {
         types: Vec<u8>,
         /// `(fid, newfid, nwname)` of every `Twalk`, in arrival order.
         walk_requests: Vec<(u32, u32, u16)>,
+        /// `(fid, offset, payload)` of every `Twrite`, in arrival order.
+        writes: Vec<(u32, u64, Vec<u8>)>,
     }
 
     impl ServerLog {
@@ -2609,7 +2858,21 @@ mod tests {
                     reply.extend(core::iter::repeat_n(b'x', len));
                 }
                 P9_TWRITE => {
+                    let fid = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+                    let offset = u64::from_le_bytes([
+                        body[4], body[5], body[6], body[7], body[8], body[9], body[10], body[11],
+                    ]);
                     let count = u32::from_le_bytes([body[12], body[13], body[14], body[15]]);
+                    assert_eq!(
+                        body.len() - P9_TWRITE_FIXED_BODY_BYTES,
+                        count as usize,
+                        "a Twrite's count is its payload's length"
+                    );
+                    self.log().writes.push((
+                        fid,
+                        offset,
+                        body[P9_TWRITE_FIXED_BODY_BYTES..].to_vec(),
+                    ));
                     reply.extend_from_slice(&count.to_le_bytes());
                 }
                 P9_TREADDIR => match self.inner.fault.readdir {
@@ -2816,8 +3079,13 @@ mod tests {
             },
         );
 
-        block_on(client.write_file_impl("/alpha", 0, b"payload"))
-            .expect_err("the server refuses to open the file");
+        block_on(write_bytes(
+            &client,
+            "/alpha",
+            WritePosition::At(0),
+            b"payload",
+        ))
+        .expect_err("the server refuses to open the file");
 
         assert_eq!(
             client.inner.fids.live_count(),
@@ -2825,6 +3093,241 @@ mod tests {
             "the walked fid goes back to the fid space even though the open failed"
         );
         assert_eq!(client.inner.tags.live_count(), 0);
+    }
+
+    /// Writes `bytes` to `path` through the staged write, landing every
+    /// round, and resolves with the offset the write began at and the
+    /// length of each round.
+    async fn write_rounds(
+        client: &HostFsClient<FakeTransport, ManualClockCpu>,
+        path: &str,
+        position: WritePosition,
+        bytes: &[u8],
+    ) -> Result<(u64, Vec<usize>), HostFsError> {
+        let mut write = client.prepare_write(path, position, bytes.len()).await?;
+        let mut rounds = Vec::new();
+        loop {
+            rounds.push(write.staged_len());
+            let filled = write.fill(|at, destination| {
+                destination.copy_from_slice(&bytes[at..at + destination.len()]);
+            });
+            match filled.submit().await? {
+                WriteProgress::More(next) => write = next,
+                WriteProgress::Done(landed) => return Ok((landed, rounds)),
+            }
+        }
+    }
+
+    async fn write_bytes(
+        client: &HostFsClient<FakeTransport, ManualClockCpu>,
+        path: &str,
+        position: WritePosition,
+        bytes: &[u8],
+    ) -> Result<u64, HostFsError> {
+        write_rounds(client, path, position, bytes)
+            .await
+            .map(|(landed, _)| landed)
+    }
+
+    /// Bytes the guest might write: no run of them repeats at a frame
+    /// boundary, so a payload sent at the wrong offset cannot match.
+    fn patterned(len: usize) -> Vec<u8> {
+        (0..len).map(|index| (index % 251) as u8).collect()
+    }
+
+    #[test]
+    fn a_write_larger_than_one_message_goes_out_as_consecutive_frames_in_pool_sized_rounds() {
+        let Fixture {
+            client, transport, ..
+        } = fixture(P9_MIN_MSIZE, FakeFault::default());
+        let chunk = (P9_MIN_MSIZE - P9_MAX_FIXED_HEADER_BYTES) as usize;
+        let depth = transport.inner.depth;
+        // Two full rounds and part of a third.
+        let bytes = patterned(chunk * depth * 2 + chunk + 100);
+
+        let (landed, rounds) = block_on(write_rounds(
+            &client,
+            "/alpha",
+            WritePosition::At(4096),
+            &bytes,
+        ))
+        .expect("write");
+
+        assert_eq!(landed, 4096);
+        assert_eq!(
+            rounds,
+            [chunk * depth, chunk * depth, chunk + 100],
+            "a round holds no more frames than the request pool keeps"
+        );
+        let log = transport.log();
+        assert_eq!(log.writes.len(), depth * 2 + 2);
+        let mut expected_offset = 4096_u64;
+        let mut sent = Vec::new();
+        for (fid, offset, payload) in &log.writes {
+            assert_eq!(*fid, log.writes[0].0, "every frame names the write's fid");
+            assert_eq!(*offset, expected_offset, "frames land back to back");
+            assert!(payload.len() <= chunk);
+            expected_offset += payload.len() as u64;
+            sent.extend_from_slice(payload);
+        }
+        assert_eq!(sent, bytes, "the host received the guest's bytes in order");
+        assert_eq!(
+            client.inner.fids.live_count(),
+            1,
+            "the write's fid is clunked"
+        );
+        assert_eq!(client.inner.tags.live_count(), 0);
+    }
+
+    /// The mount's write fills the 9p frames straight from the caller's
+    /// source, region by region, and lands where the host share says.
+    #[test]
+    fn a_host_share_write_fills_the_frames_from_the_callers_source() {
+        let Fixture {
+            client, transport, ..
+        } = fixture(P9_MIN_MSIZE, FakeFault::default());
+        let chunk = (P9_MIN_MSIZE - P9_MAX_FIXED_HEADER_BYTES) as usize;
+        let share = crate::HostShare::new(client);
+        let bytes = patterned(chunk * 2 + 3);
+        let mut regions = Vec::new();
+
+        let landed = block_on(helios_hal::fs::write_with(
+            &share,
+            helios_hal::fs::FsPath::new("alpha").expect("valid path"),
+            WritePosition::At(0),
+            bytes.len(),
+            0,
+            |at, destination| {
+                regions.push((at, destination.len()));
+                destination.copy_from_slice(&bytes[at..at + destination.len()]);
+            },
+        ))
+        .expect("write");
+
+        assert_eq!(landed, 0);
+        assert_eq!(regions, [(0, chunk), (chunk, chunk), (chunk * 2, 3)]);
+        let sent: Vec<u8> = transport
+            .log()
+            .writes
+            .iter()
+            .flat_map(|(_, _, payload)| payload.iter().copied())
+            .collect();
+        assert_eq!(sent, bytes);
+    }
+
+    #[test]
+    fn an_append_lands_at_the_end_of_file_the_host_reports() {
+        let Fixture {
+            client, transport, ..
+        } = fixture(P9_MIN_MSIZE, FakeFault::default());
+        let chunk = (P9_MIN_MSIZE - P9_MAX_FIXED_HEADER_BYTES) as usize;
+        let bytes = patterned(chunk + 7);
+
+        let landed =
+            block_on(write_bytes(&client, "/log", WritePosition::End, &bytes)).expect("append");
+
+        assert_eq!(landed, FILE_CONTENT_LEN as u64);
+        let log = transport.log();
+        assert_eq!(log.getattrs, 1, "the end of file is asked for once");
+        let offsets: Vec<u64> = log.writes.iter().map(|(_, offset, _)| *offset).collect();
+        assert_eq!(
+            offsets,
+            [FILE_CONTENT_LEN as u64, (FILE_CONTENT_LEN + chunk) as u64]
+        );
+    }
+
+    #[test]
+    fn a_write_refused_while_staging_asks_for_no_bytes_and_sends_none() {
+        let Fixture {
+            client, transport, ..
+        } = fixture(
+            P9_REQUESTED_MSIZE,
+            FakeFault {
+                fail_type: Some(P9_TLOPEN),
+                ..FakeFault::default()
+            },
+        );
+
+        let refused = block_on(client.prepare_write("/alpha", WritePosition::At(0), 64));
+
+        assert!(
+            matches!(refused, Err(HostFsError::Server(_))),
+            "the open the server refused fails the prepare"
+        );
+        assert!(transport.log().writes.is_empty());
+        assert_eq!(client.inner.fids.live_count(), 1);
+        assert_eq!(client.inner.tags.live_count(), 0);
+    }
+
+    #[test]
+    fn a_write_whose_end_overflows_the_file_offset_is_refused_while_staging() {
+        let Fixture {
+            client, transport, ..
+        } = fixture(P9_REQUESTED_MSIZE, FakeFault::default());
+
+        let refused = block_on(client.prepare_write("/alpha", WritePosition::At(u64::MAX), 2));
+
+        assert!(matches!(refused, Err(HostFsError::Protocol(_))));
+        assert!(transport.log().writes.is_empty());
+        assert_eq!(client.inner.fids.live_count(), 1);
+    }
+
+    #[test]
+    fn a_write_dropped_before_its_submit_sends_nothing_and_its_fid_is_clunked_next() {
+        let Fixture {
+            client, transport, ..
+        } = fixture(P9_REQUESTED_MSIZE, FakeFault::default());
+
+        block_on(async {
+            let staged = client
+                .prepare_write("/alpha", WritePosition::At(0), 4)
+                .await
+                .expect("prepare");
+            let fid = staged
+                .fid
+                .as_ref()
+                .expect("a staged write holds its fid")
+                .value();
+            drop(staged.fill(|_, destination| destination.fill(b'z')));
+            assert_eq!(
+                client.inner.fids.live_count(),
+                2,
+                "the fid stays allocated until the server lets it go"
+            );
+            client.stat_path("/beta").await.expect("stat");
+            assert!(
+                transport.log().clunked.contains(&fid),
+                "the next operation clunks the dropped write's fid"
+            );
+        });
+
+        assert!(
+            transport.log().writes.is_empty(),
+            "nothing reached the file"
+        );
+        assert_eq!(client.inner.fids.live_count(), 1);
+    }
+
+    #[test]
+    fn a_snapshot_hold_clunks_the_fid_of_a_dropped_write() {
+        let Fixture {
+            client, transport, ..
+        } = fixture(P9_REQUESTED_MSIZE, FakeFault::default());
+
+        block_on(async {
+            let staged = client
+                .prepare_write("/alpha", WritePosition::End, 4)
+                .await
+                .expect("prepare");
+            let fid = staged
+                .fid
+                .as_ref()
+                .expect("a staged write holds its fid")
+                .value();
+            drop(staged);
+            client.prepare_snapshot().await;
+            assert!(transport.log().clunked.contains(&fid));
+        });
     }
 
     #[test]
@@ -3600,8 +4103,7 @@ mod tests {
 
         block_on(async {
             client.stat_path_impl("/alpha/beta").await.expect("stat");
-            client
-                .write_file_impl("/alpha/beta", 0, b"payload")
+            write_bytes(&client, "/alpha/beta", WritePosition::At(0), b"payload")
                 .await
                 .expect("write");
             client.stat_path_impl("/alpha/beta").await.expect("restat");
@@ -3677,16 +4179,16 @@ mod tests {
         profiles: &crate::ProfileSink,
     ) -> alloc::collections::BTreeMap<String, crate::PerfMetricSample> {
         profiles
-            .perf_metrics()
-            .lock()
-            .recent(
+            .metrics(
+                &crate::test_support::test_observe_machine_cap(),
                 &crate::PerfMetricFilter {
-                    name_prefixes: alloc::vec!["kernel;hostfs;".to_owned()],
+                    name_prefixes: crate::PrefixSet::from_prefixes(["kernel;hostfs;"])
+                        .expect("one short prefix fits the filter bounds"),
                 },
                 u32::MAX,
             )
             .into_iter()
-            .map(|sample| (sample.name.clone(), sample))
+            .map(|sample| (String::from(&*sample.name), sample))
             .collect()
     }
 
@@ -3793,8 +4295,13 @@ mod tests {
             },
         );
 
-        block_on(client.write_file("/alpha", 0, b"payload"))
-            .expect_err("the server refuses to open the file");
+        block_on(write_bytes(
+            &client,
+            "/alpha",
+            WritePosition::At(0),
+            b"payload",
+        ))
+        .expect_err("the server refuses to open the file");
 
         let samples = hostfs_samples(&profiles);
         let metric = |name: &str| {
