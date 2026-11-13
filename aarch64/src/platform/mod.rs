@@ -120,6 +120,19 @@ pub(crate) struct ConsoleDescription {
     pub(crate) interrupt: SpiInterrupt,
 }
 
+/// The machine's TPM 2.0, as the firmware describes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TpmDescription {
+    /// Locality 0 of a TPM whose interface the firmware named.
+    Described {
+        base: u64,
+        interface: helios_tpm::InterfaceDescription,
+    },
+    /// A TPM the ACPI TPM2 table describes through a start method this
+    /// kernel does not drive.
+    Unsupported { start_method: u32 },
+}
+
 /// Which redistributor frame belongs to which processor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RedistributorAffinity {
@@ -181,6 +194,20 @@ impl GicDescription {
 /// but firmware is not required to zero the bits outside them.
 const MPIDR_AFFINITY_MASK: u64 = 0x0000_00ff_00ff_ffff;
 
+/// The instruction a PSCI call enters firmware with.
+///
+/// The discriminants are the values a processor's resume context carries
+/// across a power-down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum PsciConduit {
+    /// `hvc`: PSCI is served by a hypervisor, as under KVM and QEMU's
+    /// `virt` board without EL3.
+    Hvc = 0,
+    /// `smc`: PSCI is served by secure firmware.
+    Smc = 1,
+}
+
 /// Where the description came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PlatformSource {
@@ -203,12 +230,20 @@ pub(crate) struct PlatformDescription {
     pub(crate) source: PlatformSource,
     pub(crate) console: ConsoleDescription,
     pub(crate) gic: GicDescription,
+    /// The conduit of the PSCI service that powers processors on and
+    /// off, when the firmware describes one. A machine without it still
+    /// runs; it just cannot take a processor offline, and says so when
+    /// asked to.
+    pub(crate) psci: Option<PsciConduit>,
     /// The real-time clock, when the platform has one. A machine
     /// without one leaves the kernel's wall clock reading as uptime.
     pub(crate) rtc: Option<MmioRegion>,
     pub(crate) virtio: Slots<VirtioMmioSlot, MAX_VIRTIO_MMIO_SLOTS>,
     /// Hardware no kernel driver claims, offered to driver plugins.
     pub(crate) grantable: Slots<GrantableDevice, MAX_GRANTABLE_DEVICES>,
+    /// The TPM 2.0, when the firmware describes one: the ACPI TPM2
+    /// table, or a `tcg,tpm-tis-mmio` node.
+    pub(crate) tpm: Option<TpmDescription>,
     /// The entropy the bootloader left behind, from the device tree's
     /// `/chosen/rng-seed`. ACPI has no equivalent property, so an
     /// ACPI-described machine starts from the processor's own random

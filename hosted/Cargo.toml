@@ -21,6 +21,7 @@ thiserror = { version = "2.0.20", default-features = false }
 tracing.workspace = true
 
 [dev-dependencies]
+helios-artifact.workspace = true
 helios-inspector-protocol.workspace = true
 tokio = { version = "1.48.0", features = ["rt-multi-thread"] }
 tokio-util = { version = "0.7.16", features = ["compat"] }

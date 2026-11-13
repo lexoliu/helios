@@ -21,8 +21,7 @@
 
 use core::future::Future;
 
-use helios_hal::io::IoError;
-use helios_kernel::{InterfaceEventMark, NetworkDevice, PacketBuffer, RxFrame};
+use helios_kernel::{InterfaceEventMark, NetworkDevice, RxDrain, RxFrame};
 
 /// The hosted machine's network interface, of which there is none.
 #[derive(Clone)]
@@ -41,24 +40,17 @@ impl NetworkDevice for HostedNetworkDevice {
         match *self {}
     }
 
-    fn try_receive<'a>(
-        &'a self,
-        buffer: &'a mut PacketBuffer,
-    ) -> impl Future<Output = Result<bool, IoError>> + Send + 'a {
-        let _ = buffer;
-        core::future::ready(match *self {})
-    }
-
-    fn try_receive_frame(&self) -> impl Future<Output = Result<Option<RxFrame>, IoError>> + Send {
-        core::future::ready(match *self {})
-    }
-
-    fn repost_rx_frame<'a>(
-        &'a self,
-        frame: RxFrame,
-    ) -> impl Future<Output = Result<(), IoError>> + Send + 'a {
-        let _ = frame;
-        core::future::ready(match *self {})
+    fn try_receive_frames_immediate_on<Sink>(
+        &self,
+        queue_idx: usize,
+        budget: usize,
+        sink: Sink,
+    ) -> Option<RxDrain>
+    where
+        Sink: FnMut(&RxFrame),
+    {
+        let _ = (queue_idx, budget, sink);
+        match *self {}
     }
 
     fn event_mark(&self, queue_idx: usize) -> InterfaceEventMark {

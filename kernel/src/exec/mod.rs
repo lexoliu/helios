@@ -2,7 +2,8 @@
 //!
 //! `executor` and `task` carry the per-CPU run-queue executor and
 //! its task-spawning surface. `idle` holds the per-processor
-//! haltpoll handshake behind `Executor::park_until_work`. `sync`
+//! haltpoll handshake behind `Executor::park_until_work`. `freeze`
+//! holds every processor at a scheduler boundary. `sync`
 //! provides async-aware mutex /
 //! rwlock / notify primitives. `timer` exposes the timing wheel and
 //! the Sleep future. `time` provides the kernel monotonic clock.
@@ -11,8 +12,11 @@
 
 mod compaction;
 mod executor;
+mod freeze;
+mod hotplug;
 mod idle;
 mod in_flight;
+mod lifecycle;
 mod observer;
 pub(crate) mod phases;
 mod ready;
@@ -29,17 +33,22 @@ pub use compaction::{
 pub(crate) use executor::executor_test_guard;
 pub(crate) use executor::task_arena_bytes;
 pub use executor::{
-    Executor, ExecutorRunStats, InstanceSpawner, JoinHandle, LocalJoinHandle, READY_BATCH_TASKS,
-    Spawner, TaskCapacityError, TaskFunding,
+    Executor, ExecutorRunStats, InstanceSpawner, JoinHandle, LocalJoinHandle, PinnedTasks,
+    READY_BATCH_TASKS, Spawner, TaskCapacityError, TaskFunding,
 };
+pub use freeze::{FreezeError, FrozenMachine};
 pub use idle::IdleOutcome;
 pub use in_flight::InFlight;
+pub use lifecycle::{
+    OfflineError, OfflineRefusal, OnlineError, OnlineSet, ProcessorControl, online_processor_count,
+};
 pub use observer::{
     DEFAULT_PERF_METRIC_CAPACITY, DEFAULT_PROFILE_STACK_CAPACITY, DEFAULT_TRACE_HISTORY_CAPACITY,
-    FoldedProfileSample, PerfMetricFilter, PerfMetricHistory, PerfMetricSample, PerfSample,
-    ProfileFilter, ProfileHistory, ProfileScope, ProfileSink, StatsSample, TraceEvent, TraceField,
-    TraceFilter, TraceHistory, TraceLevel, TraceValue, matches_perf_metric_filter,
-    matches_profile_filter, matches_trace_filter, parse_console_text,
+    FoldedProfileSample, MAX_FILTER_PREFIX_BYTES, MAX_FILTER_PREFIXES, ObservationScope,
+    OwnInstance, PerfMetricFilter, PerfMetricHistory, PerfMetricSample, PerfSample, PrefixSet,
+    PrefixSetError, ProfileFilter, ProfileHistory, ProfileScope, ProfileSink, StatsSample,
+    TraceEvent, TraceField, TraceFilter, TraceHistory, TraceLevel, TraceLog, TraceValue,
+    matches_perf_metric_filter, matches_profile_filter, matches_trace_filter, parse_console_text,
 };
 pub use ready::ReadyLink;
 pub use sync::{

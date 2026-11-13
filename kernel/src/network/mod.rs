@@ -49,10 +49,11 @@ pub(crate) use service::fixture::EstablishedTcpFixture;
 /// loop, which awaits the install this publishes
 /// ([`crate::RuntimeState::wait_for_network_service`]).
 #[cfg(feature = "wasmtime-runtime")]
-impl<CpuImpl, WatchdogImpl> crate::Kernel<CpuImpl, WatchdogImpl>
+impl<CpuImpl, WatchdogImpl, MeasuredBootImpl> crate::Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>
 where
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
 {
     /// Installs the network service over `device`.
     ///
@@ -69,17 +70,17 @@ where
     /// Publishing the service is what releases them: each pump is
     /// pinned to the processor that owns its pair and was already
     /// parked on this install completing.
-    pub fn install_network_interface<ProgramService, HostFsService, DeviceImpl>(
+    pub fn install_network_interface<ProgramService, StorageImpl, DeviceImpl>(
         &self,
         runtime_state: &crate::RuntimeState<
             ProgramService,
             NetworkService<CpuImpl, DeviceImpl>,
-            HostFsService,
+            StorageImpl,
         >,
         device: DeviceImpl,
     ) where
         ProgramService: Clone + Send + Sync + 'static,
-        HostFsService: Clone + Send + Sync + 'static,
+        StorageImpl: crate::Storage,
         DeviceImpl: crate::NetworkDevice,
     {
         let service = NetworkService::new(

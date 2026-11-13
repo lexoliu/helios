@@ -1,3 +1,4 @@
+pub use super::bindings::helios::system::filters::FilterError;
 pub use super::bindings::helios::system::tracing::{
     Event, Field, Filter, Level, MonoNanos, TargetError, Value,
 };
@@ -10,11 +11,13 @@ mod host {
     use crate::transport::Client;
     use futures_io::{AsyncRead, AsyncWrite};
 
+    /// The newest events matching `filter`. `Ok(Err(..))` is the guest
+    /// refusing a filter that exceeds its prefix bounds.
     pub async fn recent<R, W>(
         client: &Client<R, W>,
         filter: &Filter,
         limit: u32,
-    ) -> Result<Vec<Event>, RpcError>
+    ) -> Result<Result<Vec<Event>, FilterError>, RpcError>
     where
         R: AsyncRead + Send + Unpin + 'static,
         W: AsyncWrite + Send + Unpin + 'static,
@@ -76,3 +79,24 @@ mod host {
 
 #[cfg(feature = "host")]
 pub use host::*;
+
+#[cfg(test)]
+mod tests {
+    use super::{Event, FilterError};
+
+    /// What the guest sends for a refused filter reaches the inspector
+    /// with the limit it names intact.
+    #[test]
+    fn filter_error_round_trips_the_wire() {
+        for error in [
+            FilterError::TooManyPrefixes(8),
+            FilterError::PrefixTooLong(128),
+        ] {
+            let sent: Result<Vec<Event>, FilterError> = Err(error);
+            let bytes = postcard::to_allocvec(&sent).expect("a filter refusal encodes");
+            let received: Result<Vec<Event>, FilterError> =
+                postcard::from_bytes(&bytes).expect("a filter refusal decodes");
+            assert_eq!(format!("{received:?}"), format!("{sent:?}"));
+        }
+    }
+}

@@ -10,12 +10,6 @@ struct TrustedRootsTemplate<'a> {
     root_public_key: &'a [u8],
 }
 
-#[derive(Template)]
-#[template(path = "trusted_signing_key.rs.askama", escape = "none")]
-struct TrustedSigningKeyTemplate<'a> {
-    root_secret_key: &'a [u8],
-}
-
 fn main() {
     // Set by the `profile-generate` build's rustflags, alongside
     // `-C profile-generate`, so the profile runtime and the instrumentation
@@ -24,7 +18,6 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(helios_watchdog_self_test)");
     println!("cargo:rerun-if-env-changed=HELIOS_BUILD_TARGET");
     println!("cargo:rerun-if-env-changed=HELIOS_KERNEL_ROOT_PUBLIC_KEY");
-    println!("cargo:rerun-if-env-changed=HELIOS_KERNEL_ROOT_SECRET_KEY");
     println!("cargo:rerun-if-env-changed=HELIOS_WATCHDOG_SELF_TEST");
     println!("cargo:rerun-if-env-changed=HELIOS_WATCHDOG_SELF_TEST_DELAY_MS");
 
@@ -58,7 +51,6 @@ fn trusted_key_file(env_name: &str) -> PathBuf {
 
 fn write_trusted_root_file(out_dir: &Path) {
     let root_public_key = trusted_key_file("HELIOS_KERNEL_ROOT_PUBLIC_KEY");
-    let root_secret_key = trusted_key_file("HELIOS_KERNEL_ROOT_SECRET_KEY");
 
     let bytes = fs::read(&root_public_key)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", root_public_key.display()));
@@ -75,22 +67,6 @@ fn write_trusted_root_file(out_dir: &Path) {
     .render()
     .unwrap_or_else(|error| panic!("failed to render trusted roots template: {error}"));
     write_if_changed(&destination, source.as_bytes());
-
-    let secret_bytes = fs::read(&root_secret_key)
-        .unwrap_or_else(|error| panic!("failed to read {}: {error}", root_secret_key.display()));
-    assert!(
-        secret_bytes.len() == 32,
-        "trusted root secret key {} must be 32 bytes, got {}",
-        root_secret_key.display(),
-        secret_bytes.len()
-    );
-    let signing_destination = out_dir.join("trusted_signing_key.rs");
-    let signing_source = TrustedSigningKeyTemplate {
-        root_secret_key: &secret_bytes,
-    }
-    .render()
-    .unwrap_or_else(|error| panic!("failed to render trusted signing key template: {error}"));
-    write_if_changed(&signing_destination, signing_source.as_bytes());
 }
 
 /// Writes `bytes` to `destination` only when the content differs. The

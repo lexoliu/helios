@@ -146,6 +146,11 @@ impl FrameSlabCache {
         }
     }
 
+    /// Empties `processor`'s shard alone, for a processor going offline.
+    pub(crate) fn drain_processor(&self, processor: ProcessorId, release: impl FnMut(NonNull<u8>)) {
+        self.processor_shard(processor).drain(release);
+    }
+
     pub(crate) fn cached_bytes(&self) -> usize {
         let processor_cached = self
             .shards

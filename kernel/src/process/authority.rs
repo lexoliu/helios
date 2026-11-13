@@ -95,6 +95,19 @@ bitflags! {
     }
 }
 
+bitflags! {
+    /// What an instance may do to the machine's diagnostics, beyond
+    /// reading its own.
+    ///
+    /// `OBSERVE_MACHINE` covers the tracing and profiling controls and
+    /// reading any instance's records. Every observer in the tree uses
+    /// both, so one right covers them.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct DiagnosticAuthorityRights: u8 {
+        const OBSERVE_MACHINE = 1 << 0;
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DirectoryPreopen {
     source_path: String,
@@ -160,7 +173,7 @@ macro_rules! typed_device_class_cap {
 
 typed_device_class_cap!(DisplayClaimCap, DeviceClassRights::DISPLAY);
 typed_device_class_cap!(InputClaimCap, DeviceClassRights::INPUT);
-typed_device_class_cap!(GpuClaimCap, DeviceClassRights::GPU);
+typed_device_class_cap!(GpuOpenCap, DeviceClassRights::GPU);
 typed_device_class_cap!(AudioClaimCap, DeviceClassRights::AUDIO);
 
 /// Proof that the instance was granted one named device. The name is
@@ -171,6 +184,21 @@ pub struct DeviceGrantClaimCap(DeviceName);
 impl DeviceGrantClaimCap {
     pub const fn name(&self) -> &DeviceName {
         &self.0
+    }
+}
+
+/// Proof, checked on the owning task, that the instance may control the
+/// machine's tracing and profiling and read every instance's records.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ObserveMachineCap(DiagnosticAuthorityRights);
+
+impl ObserveMachineCap {
+    pub const fn required_rights() -> DiagnosticAuthorityRights {
+        DiagnosticAuthorityRights::OBSERVE_MACHINE
+    }
+
+    pub const fn rights(self) -> DiagnosticAuthorityRights {
+        self.0
     }
 }
 
@@ -256,6 +284,7 @@ pub struct ProcessAuthority {
     /// Raw devices this instance may claim by name. Bounded by the
     /// registry's own capacity, because the registry cannot publish more.
     devices: ArrayVec<DeviceName, MAX_GRANTS>,
+    diagnostics: DiagnosticAuthorityRights,
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -302,6 +331,10 @@ pub enum ProcessAuthorityError {
     DeviceNameTooLong,
     #[error("an instance holds at most {} named devices", MAX_GRANTS)]
     TooManyDeviceGrants,
+    #[error("diagnostic grant rights must not be empty")]
+    EmptyDiagnosticRights,
+    #[error("diagnostic grant exceeds caller authority: {0:?}")]
+    DiagnosticGrantExceedsAuthority(DiagnosticAuthorityRights),
 }
 
 impl DirectoryPreopen {
@@ -444,12 +477,14 @@ impl ProcessAuthority {
             mount: MountAuthorityRights::empty(),
             device_classes: DeviceClassRights::empty(),
             devices: ArrayVec::new_const(),
+            diagnostics: DiagnosticAuthorityRights::empty(),
         }
     }
 
-    /// Every right except the device ones. The kernel adds the device
-    /// classes and named devices a component needs where it starts that
-    /// component, so no program inherits a claim through this value.
+    /// Every right except the device and diagnostic ones. The kernel adds
+    /// the device classes, named devices and diagnostic rights a component
+    /// needs where it starts that component, so no program inherits a
+    /// claim or the machine's diagnostics through this value.
     pub fn root() -> Self {
         let mut authority = Self::empty();
         authority.insert_directory_preopen(
@@ -553,6 +588,14 @@ impl ProcessAuthority {
 
     pub fn granted_devices(&self) -> &[DeviceName] {
         &self.devices
+    }
+
+    pub fn diagnostic_rights(&self) -> DiagnosticAuthorityRights {
+        self.diagnostics
+    }
+
+    pub fn grant_diagnostic_rights(&mut self, rights: DiagnosticAuthorityRights) {
+        self.diagnostics |= rights;
     }
 
     pub fn grant_device_classes(&mut self, rights: DeviceClassRights) {
@@ -805,6 +848,26 @@ impl ProcessAuthority {
         Ok(rights)
     }
 
+    pub fn derive_diagnostic_rights(
+        &self,
+        rights: DiagnosticAuthorityRights,
+    ) -> Result<DiagnosticAuthorityRights, ProcessAuthorityError> {
+        if rights.is_empty() {
+            return Err(ProcessAuthorityError::EmptyDiagnosticRights);
+        }
+        if !self.diagnostics.contains(rights) {
+            return Err(ProcessAuthorityError::DiagnosticGrantExceedsAuthority(
+                rights,
+            ));
+        }
+        Ok(rights)
+    }
+
+    pub fn derive_observe_machine_cap(&self) -> Result<ObserveMachineCap, ProcessAuthorityError> {
+        self.derive_diagnostic_rights(ObserveMachineCap::required_rights())
+            .map(ObserveMachineCap)
+    }
+
     pub fn derive_device_class_rights(
         &self,
         rights: DeviceClassRights,
@@ -857,9 +920,9 @@ impl ProcessAuthority {
             .map(InputClaimCap)
     }
 
-    pub fn derive_gpu_claim_cap(&self) -> Result<GpuClaimCap, ProcessAuthorityError> {
-        self.derive_device_class_rights(GpuClaimCap::required_rights())
-            .map(GpuClaimCap)
+    pub fn derive_gpu_open_cap(&self) -> Result<GpuOpenCap, ProcessAuthorityError> {
+        self.derive_device_class_rights(GpuOpenCap::required_rights())
+            .map(GpuOpenCap)
     }
 
     pub fn derive_audio_claim_cap(&self) -> Result<AudioClaimCap, ProcessAuthorityError> {
@@ -927,6 +990,7 @@ impl ProcessAuthority {
             && self.link.contains(child.link)
             && self.mount.contains(child.mount)
             && self.device_classes.contains(child.device_classes)
+            && self.diagnostics.contains(child.diagnostics)
             && child
                 .devices
                 .iter()
@@ -947,7 +1011,7 @@ impl ProcessAuthority {
 #[cfg(test)]
 pub(crate) mod test_caps {
     use super::{
-        AudioClaimCap, DeviceClassRights, DeviceGrantClaimCap, DisplayClaimCap, GpuClaimCap,
+        AudioClaimCap, DeviceClassRights, DeviceGrantClaimCap, DisplayClaimCap, GpuOpenCap,
         InputClaimCap, ProcessAuthority,
     };
     use crate::device::DeviceName;
@@ -970,9 +1034,9 @@ pub(crate) mod test_caps {
             .expect("the authority holds the input class")
     }
 
-    pub(crate) fn gpu() -> GpuClaimCap {
+    pub(crate) fn gpu() -> GpuOpenCap {
         holding(DeviceClassRights::GPU)
-            .derive_gpu_claim_cap()
+            .derive_gpu_open_cap()
             .expect("the authority holds the GPU class")
     }
 
@@ -1009,9 +1073,10 @@ fn directory_contains(directory: &str, path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClockAuthorityRights, DeviceClassRights, DirectoryAuthorityRights, LinkAuthorityRights,
-        MountAuthorityRights, NetworkAuthorityRights, ProcessAuthority, ProcessAuthorityError,
-        ProcessAuthorityRights, TerminalAuthorityRights,
+        ClockAuthorityRights, DeviceClassRights, DiagnosticAuthorityRights,
+        DirectoryAuthorityRights, LinkAuthorityRights, MountAuthorityRights,
+        NetworkAuthorityRights, ProcessAuthority, ProcessAuthorityError, ProcessAuthorityRights,
+        TerminalAuthorityRights,
     };
     use crate::device::{DeviceName, MAX_GRANTS};
 
@@ -1404,12 +1469,14 @@ mod tests {
         child.grant_process_rights(ProcessAuthorityRights::SPAWN);
         child.grant_link_rights(LinkAuthorityRights::SOURCE);
         child.grant_device_classes(DeviceClassRights::DISPLAY);
+        child.grant_diagnostic_rights(DiagnosticAuthorityRights::OBSERVE_MACHINE);
         child
             .grant_device(device_name("pci:0000:00:04.0"))
             .expect("one named device fits");
 
         let mut parent = parent;
         parent.grant_device_classes(DeviceClassRights::all());
+        parent.grant_diagnostic_rights(DiagnosticAuthorityRights::OBSERVE_MACHINE);
         parent
             .grant_device(device_name("pci:0000:00:04.0"))
             .expect("one named device fits");
@@ -1432,6 +1499,54 @@ mod tests {
             .grant_device(device_name("pci:0000:00:04.0"))
             .expect("one named device fits");
         assert!(!device_only_parent.contains_authority(&child));
+
+        let mut diagnostics_less_parent = ProcessAuthority::root();
+        diagnostics_less_parent.grant_device_classes(DeviceClassRights::all());
+        diagnostics_less_parent
+            .grant_device(device_name("pci:0000:00:04.0"))
+            .expect("one named device fits");
+        assert!(!diagnostics_less_parent.contains_authority(&child));
+    }
+
+    #[test]
+    fn diagnostic_grant_must_be_subset_of_caller_authority() {
+        let mut parent = ProcessAuthority::empty();
+        parent.grant_diagnostic_rights(DiagnosticAuthorityRights::OBSERVE_MACHINE);
+
+        assert_eq!(
+            parent
+                .derive_diagnostic_rights(DiagnosticAuthorityRights::OBSERVE_MACHINE)
+                .expect("caller may derive a right it holds"),
+            DiagnosticAuthorityRights::OBSERVE_MACHINE
+        );
+        assert_eq!(
+            parent
+                .derive_diagnostic_rights(DiagnosticAuthorityRights::empty())
+                .expect_err("an empty diagnostic grant is a mistake"),
+            ProcessAuthorityError::EmptyDiagnosticRights
+        );
+        assert!(parent.derive_observe_machine_cap().is_ok());
+
+        let holder_less = ProcessAuthority::empty();
+        assert_eq!(
+            holder_less
+                .derive_diagnostic_rights(DiagnosticAuthorityRights::OBSERVE_MACHINE)
+                .expect_err("a caller without the right must not hand it on"),
+            ProcessAuthorityError::DiagnosticGrantExceedsAuthority(
+                DiagnosticAuthorityRights::OBSERVE_MACHINE
+            )
+        );
+        assert!(matches!(
+            holder_less.derive_observe_machine_cap(),
+            Err(ProcessAuthorityError::DiagnosticGrantExceedsAuthority(_))
+        ));
+    }
+
+    #[test]
+    fn root_authority_holds_no_diagnostic_rights() {
+        let root = ProcessAuthority::root();
+        assert_eq!(root.diagnostic_rights(), DiagnosticAuthorityRights::empty());
+        assert!(root.derive_observe_machine_cap().is_err());
     }
 
     #[test]
@@ -1463,7 +1578,7 @@ mod tests {
         assert!(parent.derive_display_claim_cap().is_ok());
         assert!(parent.derive_input_claim_cap().is_ok());
         assert!(matches!(
-            parent.derive_gpu_claim_cap(),
+            parent.derive_gpu_open_cap(),
             Err(ProcessAuthorityError::DeviceClassGrantExceedsAuthority(_))
         ));
         assert!(matches!(
@@ -1527,7 +1642,7 @@ mod tests {
         assert!(root.granted_devices().is_empty());
         assert!(root.derive_display_claim_cap().is_err());
         assert!(root.derive_input_claim_cap().is_err());
-        assert!(root.derive_gpu_claim_cap().is_err());
+        assert!(root.derive_gpu_open_cap().is_err());
         assert!(root.derive_audio_claim_cap().is_err());
     }
 }

@@ -1,5 +1,7 @@
 mod fs;
 pub(crate) use fs::*;
+mod rights;
+pub(crate) use rights::*;
 #[cfg(test)]
 mod fs_tests;
 pub(in crate::wasmtime_adapter) mod net;

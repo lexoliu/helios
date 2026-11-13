@@ -20,16 +20,20 @@ mod debug_state {
     /// The network service this machine's virtio-net device backs.
     pub(crate) type NetworkService =
         helios_kernel::NetworkService<crate::RiscvCpu, crate::net::VirtioNetworkDevice>;
-    pub(crate) type RuntimeState = helios_kernel::HostRuntimeState<
-        crate::RiscvCpu,
-        NetworkService,
-        crate::host_fs::HostFileSystemService,
-    >;
-    pub(crate) type ProgramService = helios_kernel::UserProgramService<
-        crate::RiscvCpu,
-        NetworkService,
-        crate::host_fs::HostFileSystemService,
-    >;
+    pub(crate) type RuntimeState =
+        helios_kernel::HostRuntimeState<crate::RiscvCpu, NetworkService, Storage>;
+    pub(crate) type ProgramService =
+        helios_kernel::UserProgramService<crate::RiscvCpu, NetworkService, Storage>;
+
+    /// This machine's storage: the virtio-9p host share and the
+    /// virtio-blk disks.
+    #[derive(Clone, Copy)]
+    pub(crate) struct Storage;
+
+    impl helios_kernel::Storage for Storage {
+        type HostShare = crate::host_fs::HostFileSystemService;
+        type Disk = crate::block::RiscvVirtioBlockDevice;
+    }
 }
 
 use ns16550a::{Break, DLAB, ParityBit, ParitySelect, StickParity, StopBits, Uart, WordLength};
@@ -140,7 +144,7 @@ pub(crate) fn count_virtio_mmio_devices(fdt: &Fdt<'_>, expected: DeviceType) -> 
 use core::arch::{asm, global_asm};
 use core::num::{NonZeroU32, NonZeroUsize};
 use core::ops::Range;
-use core::sync::atomic::{AtomicUsize, Ordering, compiler_fence};
+use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering, compiler_fence};
 
 use arrayvec::ArrayVec;
 use fdt::Fdt;
@@ -161,6 +165,7 @@ use riscv::interrupt::supervisor::{Exception, Interrupt};
 use riscv_rt::entry;
 use spin::Once;
 
+mod lifecycle;
 mod trap;
 
 pub use trap::{GeneralRegs, TrapFrame};
@@ -461,6 +466,32 @@ extern "Rust" fn helios_current_processor() -> ProcessorId {
     }
 }
 
+/// The supervisor timer and external interrupt enables cleared on the
+/// hart that took them, and put back as they were when dropped. Only the
+/// software interrupt, the wake, stays enabled meanwhile; the rest stays
+/// pending in `sip`. `sie` is the hart's own register, so the value is
+/// not `Send`; it leaves `sstatus.SIE` alone.
+pub struct RiscvWakeOnlyMask {
+    timer: bool,
+    external: bool,
+    _processor_local: core::marker::PhantomData<*mut ()>,
+}
+
+impl Drop for RiscvWakeOnlyMask {
+    fn drop(&mut self) {
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: restores the bits read when the mask was raised.
+        unsafe {
+            if self.timer {
+                riscv::register::sie::set_stimer();
+            }
+            if self.external {
+                riscv::register::sie::set_sext();
+            }
+        }
+    }
+}
+
 impl Cpu for RiscvCpu {
     // SBI `set_timer` programs this hart's one-shot comparator.
     const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
@@ -477,12 +508,58 @@ impl Cpu for RiscvCpu {
         riscv::asm::wfi();
     }
 
+    type WakeOnlyMask = RiscvWakeOnlyMask;
+
+    fn mask_to_wake_only(&self) -> RiscvWakeOnlyMask {
+        // The wake is the supervisor software interrupt; the timer and the
+        // external interrupt (every device) are taken out of `sie`, so
+        // they stay pending in `sip` and a `wfi` neither ends on them nor
+        // delivers them. The shootdown is an SBI call that needs no
+        // supervisor interrupt on this hart.
+        let sie = riscv::register::sie::read();
+        let (timer, external) = (sie.stimer(), sie.sext());
+        // SAFETY: both bits are put back when the guard drops.
+        unsafe {
+            riscv::register::sie::clear_stimer();
+            riscv::register::sie::clear_sext();
+        }
+        compiler_fence(Ordering::SeqCst);
+        RiscvWakeOnlyMask {
+            timer,
+            external,
+            _processor_local: core::marker::PhantomData,
+        }
+    }
+
+    fn park_wake_only(&self, word: &AtomicU8, held: u8) {
+        assert!(
+            !riscv::register::sstatus::read().sie(),
+            "RISC-V park_wake_only was entered with supervisor interrupts enabled, before the \
+             enable set was narrowed"
+        );
+        // A `wfi` ends on any pending interrupt that `sie` enables,
+        // whatever `sstatus.SIE` says, so a wake raised between the test
+        // below and the `wfi` completes it at once.
+        let mask = self.mask_to_wake_only();
+        while word.load(Ordering::Acquire) == held {
+            riscv::asm::wfi();
+            // The wait leaves the software interrupt pending: taking it
+            // runs the trap handler that clears it. Nothing else is
+            // enabled in `sie`, so nothing else is taken in the window.
+            // SAFETY: the window is closed again on the next line.
+            unsafe { riscv::interrupt::supervisor::enable() };
+            riscv::interrupt::supervisor::disable();
+        }
+        drop(mask);
+    }
+
     fn start_processor(&self, hart: ProcessorId) {
         match hart_status(hart) {
             sbi_spec::hsm::hart_state::STARTED => {
                 self.wake_processor(hart);
             }
             sbi_spec::hsm::hart_state::STOPPED => {
+                lifecycle::assert_never_stopped(hart);
                 let ret = sbi_rt::hart_start(
                     hart.id() as usize,
                     core::ptr::addr_of!(_secondary_start).addr(),
@@ -505,6 +582,14 @@ impl Cpu for RiscvCpu {
                 state
             ),
         }
+    }
+
+    fn stop_current(&self) {
+        lifecycle::stop_current();
+    }
+
+    fn restart_processor(&self, hart: ProcessorId) {
+        lifecycle::restart_processor(hart);
     }
 
     fn wake_processor(&self, hart: ProcessorId) {
@@ -655,9 +740,21 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     write_hart_identity(ProcessorIdentity::bootstrapping(hart_id));
     let fdt = unsafe { Fdt::from_ptr(fdt_addr as *const u8) }
         .expect("OpenSBI did not provide a valid FDT");
-    let mut cpus = fdt.cpus();
-    let first_cpu = cpus.next().expect("FDT does not describe any CPU");
+    let mut cpus = fdt.cpus().filter(|cpu| cpu_is_usable(*cpu));
+    let first_cpu = cpus.next().expect("FDT does not describe any usable CPU");
     let hart_count = 1 + cpus.count();
+    // Processor ids are the hart ids and the possible set is dense, so the
+    // usable harts must be exactly `0..hart_count`: a gap would name a
+    // processor the machine cannot start, and an id past the count one
+    // the kernel never sizes for.
+    for cpu in fdt.cpus().filter(|cpu| cpu_is_usable(*cpu)) {
+        let id = cpu.ids().first();
+        assert!(
+            id < hart_count,
+            "FDT describes usable hart {id} but only {hart_count} harts are usable; \
+             processor ids are hart ids and must be dense"
+        );
+    }
     assert!(
         hart_count <= MAX_TRACKED_HARTS,
         "FDT describes {hart_count} harts but this backend tracks at most {MAX_TRACKED_HARTS}"
@@ -846,7 +943,9 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
                 entropy::install(&kernel, &entropy, root_entropy.clone());
                 interrupts.attach_entropy(entropy);
             }
-            if let Some(balloon) = balloon::install(&kernel, &fdt) {
+            if let Some(balloon) =
+                balloon::install(&kernel, &fdt, debug_state.machine_generation_handle())
+            {
                 debug_state.install_memory_balloon(balloon.handle.clone());
                 interrupts.attach_balloon(balloon);
             }
@@ -958,9 +1057,26 @@ fn shared_debug_state(
                 hart_count,
                 riscv::register::time::read64(),
                 payload,
+                // The RISC-V `Cpu` answers no feature probe (`native_feature_probe`).
+                helios_kernel::GuestIsa::for_build_target(None),
             )
         })
         .clone()
+}
+
+/// Whether a `/cpus/cpu*` node describes a hart the machine can run.
+///
+/// The device tree specification defaults `status` to `okay` when absent;
+/// `disabled` is a hart that is present but not started (it may be brought
+/// up later), and `reserved` and `fail` are not usable at all. None of the
+/// three is a processor this kernel's possible set holds.
+fn cpu_is_usable(cpu: fdt::standard_nodes::Cpu<'_, '_>) -> bool {
+    cpu.property("status").is_none_or(|status| {
+        status
+            .as_str()
+            .unwrap_or_else(|| panic!("a cpu node's status is not a string"))
+            == "okay"
+    })
 }
 
 fn shared_watchdog(fdt: &Fdt<'_>) -> watchdog::RiscvWatchdog {
@@ -971,6 +1087,7 @@ unsafe extern "C" {
     static __ebss: u8;
     static _stack_start: u8;
     static _secondary_start: u8;
+    static _hart_restart: u8;
     fn _release_mp_harts();
 }
 

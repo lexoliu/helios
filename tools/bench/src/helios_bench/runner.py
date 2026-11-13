@@ -43,7 +43,10 @@ from helios_bench.manifest import (
     wasmtime_linux_release,
 )
 from helios_bench.report import (
+    HELIOS_SIDES,
     Control,
+    GuestIsa,
+    GuestRam,
     Hardware,
     InstructionSampling,
     NoiseRetry,
@@ -57,12 +60,14 @@ from helios_bench.report import (
 )
 from helios_bench.sources import (
     SIDE_CONTROL_JSONL,
+    SIDE_JSONL,
     RawCell,
     RawSide,
     read_control,
     read_optional_side,
+    read_run_record,
 )
-from helios_bench.wasi_apps import gap_bench, workload_runner
+from helios_bench.wasi_apps import fedora_baseline, gap_bench, workload_runner
 from helios_bench.workloads import load_workloads, select_workloads
 
 GAP_BENCH = WASI_APPS_ROOT / "linux-gap-bench.py"
@@ -84,6 +89,11 @@ RECONFIRM_OUT = "reconfirm"
 RETRY_OUT = "retry"
 LINUX_OUT = "linux"
 LINUX_SIDES = {Side.LINUX_NATIVE, Side.LINUX_WASMTIME}
+#: How every Helios boot's RAM is backed (`--guest-ram`): preallocated, as
+#: the Fedora guest's always is (`guest_ram_backend` in
+#: fedora_qemu_baseline.py), so neither column pays host page faults the
+#: other does not (#491).
+HELIOS_GUEST_RAM = "prealloc"
 # The cargo profiles a Helios image of a run can be built with, as the
 # inspector names them. The baseline image is always the plain one: a
 # pairing varies the candidate.
@@ -226,6 +236,12 @@ class RunOptions:
     # this checkout's profile-guided release kernel against its plain one;
     # with a baseline commit, that commit's plain kernel.
     plain_baseline: bool = False
+    # The name of the ISA level a counterpart naming `{compiler_isa_level}`
+    # compiles for, such as `x86-64-v4+vbmi+bitalg`, for a run that does not
+    # time the `helios` side. A run that does takes it from that side's own
+    # `run` record, because the level is the processor's and the CI runner's
+    # CPU model changes from run to run; the two together are refused.
+    compiler_isa_level: str | None = None
     # Whether the first Helios pass ends with an untimed second boot of
     # every unit that takes the kernel profile, the flamegraph and the perf
     # metrics the report publishes (#747). No timed boot ever runs with the
@@ -357,10 +373,38 @@ class PlannedCommand:
     #: times, for the host gate to bracket; None for a step that times nothing.
     side: str | None = None
     round: int | None = None
+    #: The directory of a Helios invocation's output whose `run` record
+    #: names the ISA level this invocation's compile asks for. The record
+    #: exists only once that invocation has run, so the flag is appended
+    #: when this one starts (`resolved`), not when the plan is made.
+    isa_level_source: Path | None = None
+
+    def resolved(self) -> list[str]:
+        """The argv to run: ``argv`` plus the ISA level read from the Helios
+        record this invocation follows."""
+        if self.isa_level_source is None:
+            return self.argv
+        return [*self.argv, "--compiler-isa-level", guest_isa_level_name(self.isa_level_source)]
 
     def shell(self) -> str:
         exports = " ".join(f"{key}={shlex.quote(value)}" for key, value in sorted(self.env.items()))
         return f"{exports} {shlex.join(self.argv)}".strip()
+
+
+def guest_isa_level_name(helios_out: Path) -> str:
+    """The ISA level name the Helios guest compiled for, from its `run` record.
+
+    The driver owns the reading of the record: its `level` and `extras` are
+    the level name split at its `+`, and it joins them back.
+    """
+    path = helios_out / SIDE_JSONL[Side.HELIOS]
+    if not path.is_file():
+        raise SystemExit(
+            f"{path} does not exist, so the ISA level of the Helios guest is not known: the Helios "
+            "invocation must run before the Linux one, or pass --compiler-isa-level to a run that "
+            "does not time the helios side"
+        )
+    return gap_bench().guest_isa_level_name(read_run_record(path))
 
 
 def git_sha() -> str:
@@ -424,6 +468,7 @@ def helios_command(
     lane = options.lane
     env = {
         "HELIOS_WORKLOAD_BENCH_VM_MEMORY": lane.memory,
+        "HELIOS_WORKLOAD_BENCH_GUEST_RAM": HELIOS_GUEST_RAM,
         "HELIOS_WORKLOAD_BENCH_VM_SMP": str(lane.vcpus),
         "HELIOS_WORKLOAD_BENCH_NET_BACKEND": lane.net_backend,
         "HELIOS_WORKLOAD_BENCH_RPC_TRANSPORT": lane.rpc_transport,
@@ -473,12 +518,25 @@ def round_out_root(options: RunOptions, number: int) -> Path:
 
 
 def linux_command(
-    options: RunOptions, common: list[str], out_root: Path, description: str, number: int
+    options: RunOptions,
+    common: list[str],
+    out_root: Path,
+    description: str,
+    number: int,
+    isa_level_source: Path | None,
 ) -> PlannedCommand:
-    """The driver invocation that times both Linux counterparts in the pinned Fedora guest."""
+    """The driver invocation that times both Linux counterparts in the pinned Fedora guest.
+
+    ``isa_level_source`` is the output directory of a Helios invocation that
+    runs before this one, whose guest's ISA level the Linux compile asks for;
+    None for a run that does not time the `helios` side, which names the
+    level itself with ``--compiler-isa-level`` or has the driver refuse a
+    counterpart that needs it.
+    """
     lane = options.lane
     return PlannedCommand(
         description=f"{description} in the pinned Fedora guest",
+        isa_level_source=isa_level_source,
         argv=[
             *common,
             "--skip-helios",
@@ -504,6 +562,11 @@ def linux_command(
             CARGO_TARGETS[lane.helios_arch],
             "--compiler-workers",
             str(lane.compiler_workers),
+            *(
+                ["--compiler-isa-level", options.compiler_isa_level]
+                if options.compiler_isa_level is not None
+                else []
+            ),
             "--out-dir",
             str(out_root / LINUX_OUT),
         ],
@@ -552,7 +615,17 @@ def plan(options: RunOptions, manifest: Manifest, workloads: list[dict]) -> list
             )
         if options.sides & LINUX_SIDES:
             side_commands.append(
-                linux_command(options, common, out_root, f"{label}time every counterpart", number)
+                linux_command(
+                    options,
+                    common,
+                    out_root,
+                    f"{label}time every counterpart",
+                    number,
+                    # Round 1 times Helios first, so its record exists before
+                    # any Linux invocation starts, even one of an even round,
+                    # which runs ahead of its own round's Helios.
+                    round_out_root(options, 1) / HELIOS_OUT if Side.HELIOS in options.sides else None,
+                )
             )
         # Consecutive rounds swap which side goes first: Helios on the odd
         # rounds, Linux on the even ones.
@@ -672,8 +745,9 @@ def execute_gated(command: PlannedCommand, gate: HostGateRecorder) -> None:
 def execute(command: PlannedCommand) -> None:
     env = os.environ.copy()
     env.update(command.env)
-    print(f"==> {command.description}\n    {command.shell()}", flush=True)
-    subprocess.run(command.argv, cwd=command.cwd, env=env, check=True)
+    argv = command.resolved()
+    print(f"==> {command.description}\n    {replace(command, argv=argv).shell()}", flush=True)
+    subprocess.run(argv, cwd=command.cwd, env=env, check=True)
 
 
 def wasm_artifact_digests(workloads: list[dict]) -> dict[str, str]:
@@ -906,6 +980,57 @@ def bootfs_cwasm_digests(lane: Lane, kernel_build: str) -> dict[str, str]:
     return {path.name: sha256_of(path) for path in sorted(prebuild.glob("*.cwasm"))}
 
 
+def guest_isa_of(run: dict, side: Side, *, required: bool) -> GuestIsa | None:
+    """The ISA level a Helios side's `run` record says its guest compiled for.
+
+    The `helios` side is the candidate, built from this commit, so its guest
+    always reports one and a record without it is a broken run. The baseline
+    image is an older commit that may predate the report.
+    """
+    raw = run.get("guest_isa")
+    if raw is None:
+        if required:
+            raise SystemExit(f"the {side} side's run record carries no `guest_isa`")
+        return None
+    return GuestIsa.model_validate(raw)
+
+
+def linux_wasmtime_isa_flags(run: dict) -> list[str]:
+    """The ISA flags the Linux guest's Wasmtime inferred, from its `run` record."""
+    flags = run.get("inferred_isa_flags")
+    if flags is None:
+        raise SystemExit("the linux_wasmtime side's run record carries no `inferred_isa_flags`")
+    return list(flags)
+
+
+def helios_guest_ram(run: dict) -> GuestRam:
+    """How the Helios guest's RAM was backed, as its inspector's run record states (#491)."""
+    vm = run.get("vm")
+    if vm is None or "guest_ram" not in vm:
+        raise SystemExit(
+            "the helios run record states no vm.guest_ram, so the inspector that boots it "
+            "predates --guest-ram and the report cannot say how its RAM was backed"
+        )
+    backing = vm["guest_ram"]
+    return GuestRam(
+        backing=backing["backing"], size=vm["memory"], prealloc_threads=backing.get("prealloc_threads")
+    )
+
+
+def linux_guest_ram(lane: Lane) -> GuestRam:
+    """How the Fedora guest's RAM is backed: the `-object` its script hands QEMU (#491)."""
+    spec = fedora_baseline().guest_ram_backend(lane.linux_vm_memory)
+    kind, *entries = spec.split(",")
+    if kind != "memory-backend-ram":
+        raise SystemExit(f"the Fedora guest's RAM backend is {spec!r}, not a memory-backend-ram")
+    options = dict(entry.split("=", 1) for entry in entries)
+    return GuestRam(
+        backing="prealloc" if options.get("prealloc") == "on" else "lazy",
+        size=options["size"],
+        prealloc_threads=int(options["prealloc-threads"]) if "prealloc-threads" in options else None,
+    )
+
+
 def compiler_pins(lane: Lane, workloads: list[dict], kernel_build: str) -> tuple[str | None, str | None]:
     """The digests of the compiler plugin build and of the
     `helios-compiler-host` the selection's workloads hosted it with, each
@@ -926,13 +1051,33 @@ def compiler_pins(lane: Lane, workloads: list[dict], kernel_build: str) -> tuple
     return plugin_digest, host_digest
 
 
-def collect_pins(lane: Lane, workloads: list[dict], kernel_build: str, baseline: Baseline | None) -> Pins:
+def collect_pins(
+    lane: Lane,
+    workloads: list[dict],
+    kernel_build: str,
+    baseline: Baseline | None,
+    sides: dict[Side, RawSide],
+) -> Pins:
+    """Every pin of the run. ``sides`` holds the sides this run timed; a
+    side it did not time contributes no pin read from its run record."""
     image_url, image_sha256 = fedora_image(lane.guest_arch)
     plugin_digest, host_digest = compiler_pins(lane, workloads, kernel_build)
+    helios = sides.get(Side.HELIOS)
+    helios_baseline = sides.get(Side.HELIOS_BASELINE)
+    linux_wasmtime = sides.get(Side.LINUX_WASMTIME)
     wasmtime_revision = vendored_wasmtime_pin().revision
     linux_release = wasmtime_linux_release(lane.guest_arch)
     return Pins(
         asymmetries=collect_asymmetries(lane, wasmtime_revision, linux_release),
+        guest_isa=guest_isa_of(helios.run, Side.HELIOS, required=True) if helios is not None else None,
+        baseline_guest_isa=(
+            guest_isa_of(helios_baseline.run, Side.HELIOS_BASELINE, required=False)
+            if helios_baseline is not None
+            else None
+        ),
+        linux_wasmtime_inferred_isa_flags=(
+            linux_wasmtime_isa_flags(linux_wasmtime.run) if linux_wasmtime is not None else None
+        ),
         wasmtime_revision=wasmtime_revision,
         baseline_wasmtime_revision=baseline.wasmtime.revision if baseline is not None else None,
         wasmtime_linux_release=linux_release,
@@ -942,6 +1087,8 @@ def collect_pins(lane: Lane, workloads: list[dict], kernel_build: str, baseline:
         vcpus=lane.vcpus,
         memory=lane.memory,
         linux_vm_memory=lane.linux_vm_memory,
+        helios_guest_ram=helios_guest_ram(helios.run) if helios is not None else None,
+        linux_guest_ram=linux_guest_ram(lane),
         net_backend=lane.net_backend,
         rpc_transport=lane.rpc_transport,
         devices=lane.devices,
@@ -1027,7 +1174,7 @@ def read_side_rounds(options: RunOptions, side: Side, thresholds: Thresholds) ->
     per_round: list[RawSide] = []
     for number in range(1, (options.effective_rounds or 0) + 1):
         out_dir = round_out_root(options, number) / SIDE_OUT[side]
-        raw = read_optional_side(out_dir, side, thresholds.warmup_discard, number)
+        raw = read_optional_side(out_dir, side, options.lane.rpc_transport, thresholds.warmup_discard, number)
         if raw is None:
             raise SystemExit(f"the {side} side produced no JSONL in round {number} under {out_dir}")
         per_round.append(raw)
@@ -1057,7 +1204,7 @@ def read_sides(options: RunOptions, thresholds: Thresholds) -> dict[Side, RawSid
             sides[side] = read_side_rounds(options, side, thresholds)
             continue
         out_dir = options.out_dir / SIDE_OUT[side]
-        raw = read_optional_side(out_dir, side, thresholds.warmup_discard)
+        raw = read_optional_side(out_dir, side, options.lane.rpc_transport, thresholds.warmup_discard)
         if raw is None:
             raise SystemExit(f"the {side} side produced no JSONL under {out_dir}")
         sides[side] = raw
@@ -1071,18 +1218,20 @@ def read_controls(options: RunOptions, thresholds: Thresholds) -> dict[Side, tup
     rounds = options.effective_rounds
     controls = {}
     for side in options.sides:
+        transport = options.lane.rpc_transport
         before = read_control(
-            round_out_root(options, 1) / SIDE_OUT[side], side, "before", thresholds.warmup_discard
+            round_out_root(options, 1) / SIDE_OUT[side], side, transport, "before", thresholds.warmup_discard
         )
         after = read_control(
-            round_out_root(options, rounds or 1) / SIDE_OUT[side], side, "after", thresholds.warmup_discard
+            round_out_root(options, rounds or 1) / SIDE_OUT[side],
+            side,
+            transport,
+            "after",
+            thresholds.warmup_discard,
         )
         if before is not None and after is not None:
             controls[side] = (before, after)
     return controls
-
-
-HELIOS_SIDES = frozenset({Side.HELIOS, Side.HELIOS_BASELINE, Side.HELIOS_BASELINE_REBUILD})
 
 
 def dispersed_headline_workloads(
@@ -1145,7 +1294,7 @@ def retake_workloads(
     replaced: dict[Side, dict[str, RawCell]] = {}
     for side in options.sides & HELIOS_SIDES:
         out_dir = options.out_dir / out_name / SIDE_OUT[side]
-        raw = read_optional_side(out_dir, side, thresholds.warmup_discard)
+        raw = read_optional_side(out_dir, side, options.lane.rpc_transport, thresholds.warmup_discard)
         if raw is None:
             raise SystemExit(f"the second pass produced no JSONL for the {side} side under {out_dir}")
         for name in names:
@@ -1423,6 +1572,11 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
             "--prebuilt builds nothing, and a paired run builds its second Helios image: "
             "drop --prebuilt or the pairing options"
         )
+    if options.compiler_isa_level is not None and Side.HELIOS in options.sides:
+        raise SystemExit(
+            "--compiler-isa-level names the level of a run that does not time the helios side; "
+            "this run times it, and the Linux compile follows the level its guest reports"
+        )
     workload_manifest = load_workloads()
     workloads = select_workloads(workload_manifest, options.workload_names)
     commands = plan(options, manifest, workloads)
@@ -1561,7 +1715,7 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
             control=control,
             run=run,
             hardware=collect_hardware(lane),
-            pins=collect_pins(lane, workloads, options.kernel_build, options.baseline),
+            pins=collect_pins(lane, workloads, options.kernel_build, options.baseline, sides),
             thresholds=thresholds,
             first_pass=reconfirmation.first_pass,
         )

@@ -41,9 +41,56 @@ pub(crate) const EXCEPTION_STACK_BYTES: usize = 64 * 1024;
 /// page-fault probe has been resolved, distinct from every page address.
 const PROBE_RESOLVED: usize = usize::MAX;
 pub(crate) const TIMER_INTERRUPT_VECTOR: u8 = 0x20;
-pub(crate) const WAKE_INTERRUPT_VECTOR: u8 = 0x21;
-pub(crate) const TLB_SHOOTDOWN_INTERRUPT_VECTOR: u8 = 0x22;
+/// The wake IPI and the TLB-shootdown IPI sit in priority class 14
+/// (vector bits 7:4), above every device vector, the timer and the APIC
+/// error vector, which all sit below class 4. The local APIC delivers a
+/// vector only when its class is above the task-priority register's, so
+/// a processor can hold off everything but these two by raising the
+/// register to [`WAKE_ONLY_TASK_PRIORITY`] (`Cpu::mask_to_wake_only`).
+/// The stubs in `exceptions.S` push these constants, passed to the
+/// assembler as `const` operands, so the stub and the dispatcher cannot
+/// disagree; a const assertion below puts every other vector the IDT
+/// installs at or below the mask.
+pub(crate) const WAKE_INTERRUPT_VECTOR: u8 = 0xe1;
+pub(crate) const TLB_SHOOTDOWN_INTERRUPT_VECTOR: u8 = 0xe2;
+/// The `CR8` value that passes only priority class 14 and above: `CR8`
+/// holds the task-priority class in bits 3:0, and a vector is delivered
+/// when its class is greater than it.
+pub(crate) const WAKE_ONLY_TASK_PRIORITY: u64 = 0xd;
 pub(crate) const APIC_ERROR_INTERRUPT_VECTOR: u8 = 0x23;
+/// Whether the local APIC holds every one of `vectors` pending while
+/// `CR8` is [`WAKE_ONLY_TASK_PRIORITY`]: a vector is delivered only when
+/// its priority class (bits 7:4) is greater than `CR8`.
+const fn held_by_wake_only_mask(vectors: &[u8]) -> bool {
+    let mut index = 0;
+    while index < vectors.len() {
+        if (vectors[index] >> 4) as u64 > WAKE_ONLY_TASK_PRIORITY {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+const _: () = {
+    assert!((WAKE_INTERRUPT_VECTOR >> 4) as u64 > WAKE_ONLY_TASK_PRIORITY);
+    assert!((TLB_SHOOTDOWN_INTERRUPT_VECTOR >> 4) as u64 > WAKE_ONLY_TASK_PRIORITY);
+    // Every other external vector the IDT installs below.
+    assert!(held_by_wake_only_mask(&[
+        TIMER_INTERRUPT_VECTOR,
+        APIC_ERROR_INTERRUPT_VECTOR,
+        NETWORK_INTERRUPT_VECTOR,
+        HOST_FS_INTERRUPT_VECTOR,
+        ENTROPY_INTERRUPT_VECTOR,
+        VSOCK_INTERRUPT_VECTOR,
+        DISPLAY_INTERRUPT_VECTOR,
+        SOUND_INTERRUPT_VECTOR,
+        DEBUG_SERIAL_INTERRUPT_VECTOR,
+        SCI_INTERRUPT_VECTOR,
+    ]));
+    assert!(held_by_wake_only_mask(&NETWORK_QUEUE_INTERRUPT_VECTORS));
+    assert!(held_by_wake_only_mask(&INPUT_INTERRUPT_VECTORS));
+    assert!(held_by_wake_only_mask(&BLOCK_INTERRUPT_VECTORS));
+};
 /// MSI-X vectors for the PCI devices the kernel drives. One vector per
 /// device keeps dispatch a direct lookup in [`DeviceInterruptRoutes`]
 /// without a shared interrupt-status scan.
@@ -76,6 +123,12 @@ pub(crate) const SOUND_INTERRUPT_VECTOR: u8 = 0x3d;
 /// message: the UART raises ISA IRQ 4 and an I/O APIC redirection entry
 /// translates that line into this local-APIC vector.
 pub(crate) const DEBUG_SERIAL_INTERRUPT_VECTOR: u8 = 0x3e;
+/// The ACPI SCI, the other line an I/O APIC entry translates: firmware
+/// raises it for a general-purpose event, which is how a hypervisor
+/// announces a hot-added or hot-removed vCPU. It is routed to the
+/// bootstrap processor and dispatched beside, not through, the device
+/// routes (`smp::handle_sci_interrupt`).
+pub(crate) const SCI_INTERRUPT_VECTOR: u8 = 0x3f;
 /// One vector per block device the routing table can hold: the platform
 /// exposes the boot image and the kernel's own disk as separate
 /// functions, and each of them delivers its completions on its own
@@ -102,7 +155,11 @@ pub(crate) type DeviceInterruptRoutes = helios_kernel::ExternalInterruptRoutes<
     helios_kernel::DebugSerialInterrupt<crate::DebugSerial>,
 >;
 
-global_asm!(include_str!("exceptions.S"));
+global_asm!(
+    include_str!("exceptions.S"),
+    wake_vector = const WAKE_INTERRUPT_VECTOR,
+    tlb_shootdown_vector = const TLB_SHOOTDOWN_INTERRUPT_VECTOR,
+);
 
 unsafe extern "C" {
     fn helios_x86_exception_divide_error();
@@ -140,6 +197,7 @@ unsafe extern "C" {
     fn helios_x86_interrupt_block_2();
     fn helios_x86_interrupt_block_3();
     fn helios_x86_interrupt_debug_serial();
+    fn helios_x86_interrupt_sci();
 }
 
 pub(crate) struct ProcessorIdt {
@@ -264,6 +322,7 @@ impl ProcessorIdt {
                 DEBUG_SERIAL_INTERRUPT_VECTOR,
                 helios_x86_interrupt_debug_serial,
             );
+            install_interrupt(table, SCI_INTERRUPT_VECTOR, helios_x86_interrupt_sci);
             table.load_unsafe();
         }
     }
@@ -634,6 +693,9 @@ extern "C" fn helios_x86_interrupt_dispatch(frame: &mut ExceptionFrame) {
         Ok(TLB_SHOOTDOWN_INTERRUPT_VECTOR) => {
             smp::handle_tlb_shootdown_interrupt();
         }
+        Ok(SCI_INTERRUPT_VECTOR) => {
+            smp::handle_sci_interrupt();
+        }
         Ok(vector) if is_device_interrupt(vector) => {
             smp::handle_device_interrupt(vector);
         }
@@ -643,7 +705,7 @@ extern "C" fn helios_x86_interrupt_dispatch(frame: &mut ExceptionFrame) {
              entropy={ENTROPY_INTERRUPT_VECTOR:#x} vsock={VSOCK_INTERRUPT_VECTOR:#x} \
              display={DISPLAY_INTERRUPT_VECTOR:#x} input={INPUT_INTERRUPT_VECTORS:#x?} \
              sound={SOUND_INTERRUPT_VECTOR:#x} block={BLOCK_INTERRUPT_VECTORS:#x?} \
-             debug-serial={DEBUG_SERIAL_INTERRUPT_VECTOR:#x}",
+             debug-serial={DEBUG_SERIAL_INTERRUPT_VECTOR:#x} sci={SCI_INTERRUPT_VECTOR:#x}",
             frame.vector, frame.rip
         ),
     }

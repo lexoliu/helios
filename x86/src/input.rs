@@ -67,8 +67,8 @@ pub(crate) fn discover(pci: &PciRoot) -> Vec<PciAddress> {
 /// One call for every function rather than one per function: the kernel
 /// owns the machine's input devices as a set, because that is what a
 /// program asking "what can I read?" is answered from.
-pub(crate) fn install<WatchdogImpl>(
-    kernel: &helios_kernel::Kernel<crate::X86Cpu, WatchdogImpl>,
+pub(crate) fn install<WatchdogImpl, MeasuredBootImpl>(
+    kernel: &helios_kernel::Kernel<crate::X86Cpu, WatchdogImpl, MeasuredBootImpl>,
     pci: &PciRoot,
     functions: &[(PciAddress, X86DmaPool)],
     destination_apic_id: u32,
@@ -76,6 +76,7 @@ pub(crate) fn install<WatchdogImpl>(
 ) -> Vec<InputInterrupt>
 where
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
 {
     let discovered: Vec<InputInterrupt> = functions
         .iter()

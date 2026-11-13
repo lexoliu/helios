@@ -821,6 +821,12 @@ where
     persist_timer: Option<TcpPersistTimer>,
     persist_probe: Option<TcpPersistProbe>,
     next_pacing_send_nanos: Option<u64>,
+    /// While set, the socket has something to send and no link-layer
+    /// address to send it to, and this is when the stack asks again. It
+    /// replaces the pacing deadline in [`Self::next_deadline_nanos`]: a
+    /// pacing deadline that has already passed would wake the socket's
+    /// writer again and again for a segment nothing can address.
+    resolution_retry_nanos: Option<u64>,
     delayed_ack_deadline_nanos: Option<u64>,
     time_wait_deadline_nanos: Option<u64>,
     unacked_receive_segments: u8,
@@ -1007,6 +1013,7 @@ where
             persist_timer: None,
             persist_probe: None,
             next_pacing_send_nanos: None,
+            resolution_retry_nanos: None,
             delayed_ack_deadline_nanos: None,
             time_wait_deadline_nanos: None,
             unacked_receive_segments: 0,
@@ -1474,6 +1481,9 @@ where
         now_nanos: u64,
         budget: TcpSegmentBudget,
     ) -> Option<TcpTransmitSegment> {
+        // A caller takes only for a next hop it resolved, so the wait
+        // for a link-layer address is over.
+        self.resolution_retry_nanos = None;
         self.arm_persist_timer_if_needed(now_nanos);
         let local = self.local?;
         let remote = self.remote?;
@@ -1591,7 +1601,27 @@ where
         })
     }
 
+    /// Records that the segment this socket would send has no link-layer
+    /// address to go to yet, and that the stack asks for one again at
+    /// `retry_nanos`.
+    ///
+    /// Until the socket takes a segment again, `retry_nanos` is its
+    /// transmit deadline in place of the pacing deadline, which a stalled
+    /// pacing clock leaves in the past.
+    pub fn await_resolution(&mut self, retry_nanos: u64) {
+        self.resolution_retry_nanos = Some(retry_nanos);
+    }
+
     pub fn expire_timers(&mut self, now_nanos: u64) {
+        // The wait for a link-layer address is over; whether the socket
+        // still has anything to send is for the drive that follows to
+        // find, and it re-arms the wait if the address is still missing.
+        if self
+            .resolution_retry_nanos
+            .is_some_and(|deadline| now_nanos >= deadline)
+        {
+            self.resolution_retry_nanos = None;
+        }
         if self
             .delayed_ack_deadline_nanos
             .is_some_and(|deadline| now_nanos >= deadline)
@@ -1617,14 +1647,17 @@ where
                 )
             })
         });
-        let pacing_deadline = self
-            .next_pacing_send_nanos
-            .filter(|_| !self.transmit_queue_is_empty());
+        // A socket waiting for a link-layer address cannot send at its
+        // pacing time, so the time it asks again stands in for it.
+        let transmit_deadline = self.resolution_retry_nanos.or_else(|| {
+            self.next_pacing_send_nanos
+                .filter(|_| !self.transmit_queue_is_empty())
+        });
         let persist_deadline = self.persist_timer.map(TcpPersistTimer::deadline_nanos);
         min_deadline(
             min_deadline(
                 min_deadline(
-                    min_deadline(rto_deadline, pacing_deadline),
+                    min_deadline(rto_deadline, transmit_deadline),
                     persist_deadline,
                 ),
                 self.delayed_ack_deadline_nanos,
@@ -1803,11 +1836,23 @@ where
         } else {
             u32::try_from(payload_len).unwrap_or(u32::MAX)
         };
+        // RFC 7323 section 3.2: TSval is the clock when the segment is
+        // sent, and a retransmission is sent now. Its ACK then echoes
+        // this transmission, so the echo is a round trip of it alone
+        // (section 4.1) and not of the wait since the first one.
+        let options = if in_flight.options.timestamp().is_some() {
+            in_flight.options.with_timestamp(TcpTimestampOption {
+                value: timestamp_value(now_nanos),
+                echo_reply: self.peer_timestamp.map_or(0, |timestamp| timestamp.value),
+            })
+        } else {
+            in_flight.options
+        };
         Some(TcpTransmitSegment {
             local,
             remote,
             header: in_flight.header,
-            options: in_flight.options,
+            options,
             payload: in_flight.payload.slice(..payload_len),
             sequence_len,
             segment_bytes: payload_len as u32,
@@ -2289,6 +2334,7 @@ where
         self.persist_timer = None;
         self.persist_probe = None;
         self.next_pacing_send_nanos = None;
+        self.resolution_retry_nanos = None;
         self.delayed_ack_deadline_nanos = None;
         self.time_wait_deadline_nanos = None;
         self.unacked_receive_segments = 0;
@@ -3766,6 +3812,61 @@ mod tests {
                 interval_nanos: 123,
             }
         );
+    }
+
+    #[test]
+    fn a_retransmission_is_acknowledged_with_a_round_trip_of_its_own() {
+        let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, BbrV3::new(1460));
+        socket.mark_syn_queued(0);
+        let _ = deliver_segment(
+            &mut socket,
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 100,
+                acknowledgement: 8,
+                flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                window_size: u16::MAX,
+                options: TcpOptions::parse(&[8, 10, 0, 0, 0, 9, 0, 0, 0, 0])
+                    .expect("timestamp option should parse"),
+                payload: &[],
+            },
+            TCP_INITIAL_RTO_NANOS,
+        );
+        socket.mark_ack_queued();
+        assert_eq!(socket.queue_send(b"hello"), 5);
+        let sent_at = 2 * TCP_INITIAL_RTO_NANOS;
+        let first = socket
+            .take_transmit_segment(sent_at, TcpSegmentBudget::wire_segments(usize::MAX))
+            .expect("established socket should transmit queued bytes");
+
+        let retransmitted_at = sent_at + socket.retransmission_timer.timeout_nanos();
+        let retransmission = socket
+            .pending_retransmission(retransmitted_at)
+            .expect("the segment should come due after its timeout");
+        socket.mark_retransmission_queued(first.header.sequence, retransmitted_at);
+        let echoed = retransmission
+            .options
+            .timestamp()
+            .expect("the retransmission carries a timestamp");
+
+        let round_trip = 3_000_000;
+        let acked_at = retransmitted_at + round_trip;
+        let timing = socket.ack_sample_timing(
+            first.header.sequence + first.sequence_len,
+            acked_at,
+            Some(TcpTimestampOption {
+                value: 10,
+                echo_reply: echoed.value,
+            }),
+        );
+
+        assert!(
+            timing.rtt_nanos <= round_trip,
+            "a sample of {} ns is longer than the {round_trip} ns since the retransmission",
+            timing.rtt_nanos
+        );
+        assert_eq!(echoed.value, timestamp_value(retransmitted_at));
     }
 
     #[test]

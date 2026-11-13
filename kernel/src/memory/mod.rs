@@ -87,4 +87,6 @@ pub use user::{
     deallocate_user_frame, deallocate_user_frame_on, deallocate_user_run_on,
     install_user_memory_pool, largest_servable_user_bytes, user_heap_stats,
 };
-pub(crate) use user::{lend_user_memory_to_kernel_heap, user_pool_available_bytes};
+pub(crate) use user::{
+    lend_user_memory_to_kernel_heap, release_processor_frames, user_pool_available_bytes,
+};
