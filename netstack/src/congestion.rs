@@ -186,6 +186,11 @@ pub struct NewReno {
     cwnd: u32,
     ssthresh: u32,
     mss: u32,
+    /// Inside a fast-retransmit recovery episode, where RFC 6582 holds
+    /// the window at `ssthresh` (this transport does not inflate it) and
+    /// RFC 5681's growth, which runs on ACKs of new data outside
+    /// recovery, does not apply.
+    in_recovery: bool,
 }
 
 impl NewReno {
@@ -195,6 +200,7 @@ impl NewReno {
             cwnd: mss * 10,
             ssthresh: u32::MAX,
             mss,
+            in_recovery: false,
         }
     }
 
@@ -214,6 +220,9 @@ impl CongestionControl for NewReno {
     fn on_packet_sent(&mut self, _packet: PacketSent) {}
 
     fn on_ack(&mut self, sample: AckSample) -> RecoveryAction {
+        if self.in_recovery {
+            return self.action();
+        }
         if self.cwnd < self.ssthresh {
             self.cwnd = self.cwnd.saturating_add(sample.newly_acked);
         } else {
@@ -234,6 +243,7 @@ impl CongestionControl for NewReno {
             } => {
                 self.ssthresh = cmp::max(outstanding_bytes / 2, self.mss * 2);
                 self.cwnd = self.ssthresh;
+                self.in_recovery = true;
             }
             CongestionEvent::RecoveryStarted {
                 trigger: RecoveryTrigger::RetransmissionTimeout,
@@ -241,8 +251,12 @@ impl CongestionControl for NewReno {
             } => {
                 self.ssthresh = cmp::max(self.cwnd / 2, self.mss * 2);
                 self.cwnd = self.mss;
+                // RFC 5681 section 3.1: slow start resends the loss
+                // window.
+                self.in_recovery = false;
             }
-            CongestionEvent::PacketLost(_) | CongestionEvent::RecoveryEnded { .. } => {}
+            CongestionEvent::RecoveryEnded { .. } => self.in_recovery = false,
+            CongestionEvent::PacketLost(_) => {}
         }
         self.action()
     }
@@ -343,6 +357,13 @@ pub struct Cubic {
     /// 4.8 starts it with `K = 0` and `W_max` at its own starting
     /// window.
     after_timeout: bool,
+    /// Inside a fast-retransmit recovery episode. Section 4.6 sets the
+    /// window once on entering recovery and the growth of sections 4.2
+    /// to 4.4 runs on new ACKs in congestion avoidance, so nothing an
+    /// ACK reports inside the episode grows it, as in Linux, which
+    /// skips `cong_avoid` while it is reducing the window. A timeout's
+    /// episode is not one: its window slow-starts.
+    in_recovery: bool,
     last_ack_nanos: Option<u64>,
 }
 
@@ -377,6 +398,7 @@ impl Cubic {
             cwnd_prior: Segments(0),
             epoch: None,
             after_timeout: false,
+            in_recovery: false,
             last_ack_nanos: None,
         }
     }
@@ -482,6 +504,9 @@ impl CongestionControl for Cubic {
 
     fn on_ack(&mut self, sample: AckSample) -> RecoveryAction {
         let previous_ack = self.last_ack_nanos.replace(sample.now_nanos);
+        if self.in_recovery {
+            return self.action();
+        }
         if !sample.cwnd_limited {
             // Section 5.8: an application-limited flow does not grow its
             // window, and its epoch clock does not run.
@@ -528,6 +553,7 @@ impl CongestionControl for Cubic {
                     .ssthresh
                     .expect("a reduction sets ssthresh")
                     .max(Segments::whole(2));
+                self.in_recovery = true;
             }
             CongestionEvent::RecoveryStarted {
                 trigger: RecoveryTrigger::RetransmissionTimeout,
@@ -539,8 +565,12 @@ impl CongestionControl for Cubic {
                 self.reduce(outstanding_bytes);
                 self.cwnd = Segments::ONE;
                 self.after_timeout = true;
+                // RFC 5681 section 3.1: a timeout's window grows again
+                // in slow start while the lost data is resent.
+                self.in_recovery = false;
             }
-            CongestionEvent::PacketLost(_) | CongestionEvent::RecoveryEnded { .. } => {}
+            CongestionEvent::RecoveryEnded { .. } => self.in_recovery = false,
+            CongestionEvent::PacketLost(_) => {}
         }
         self.action()
     }
@@ -1728,6 +1758,57 @@ fn bytes_over(rate: u64, nanos: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const MSS: u32 = 1460;
+
+    /// An acknowledgement of `newly_acked` bytes on a window-limited
+    /// flow.
+    fn ack(newly_acked: u32, now_nanos: u64) -> AckSample {
+        AckSample {
+            newly_acked,
+            delivered: 0,
+            bytes_in_flight: 0,
+            rtt_nanos: Some(20_000_000),
+            smoothed_rtt_nanos: Some(20_000_000),
+            rate: None,
+            cwnd_limited: true,
+            has_selective_acks: false,
+            now_nanos,
+        }
+    }
+
+    fn fast_retransmit(outstanding_bytes: u32) -> CongestionEvent {
+        CongestionEvent::RecoveryStarted {
+            trigger: RecoveryTrigger::FastRetransmit,
+            outstanding_bytes,
+            bytes_in_flight: outstanding_bytes,
+            now_nanos: 0,
+        }
+    }
+
+    /// Whatever the ACKs inside a fast-recovery episode report, the
+    /// window they leave is the one the reduction set; growth resumes
+    /// on the ACK after the episode ends.
+    fn assert_holds_through_fast_recovery<C: CongestionControl>(mut congestion: C) {
+        let reduced = congestion
+            .on_congestion_event(fast_retransmit(20 * MSS))
+            .cwnd;
+        for step in 1..=10 {
+            assert_eq!(congestion.on_ack(ack(MSS, step)).cwnd, reduced);
+        }
+        let _ = congestion.on_congestion_event(CongestionEvent::RecoveryEnded { now_nanos: 11 });
+        assert!(congestion.on_ack(ack(MSS, 12)).cwnd.bytes() > reduced.bytes());
+    }
+
+    #[test]
+    fn newreno_holds_its_window_through_fast_recovery() {
+        assert_holds_through_fast_recovery(NewReno::new(MSS));
+    }
+
+    #[test]
+    fn cubic_holds_its_window_through_fast_recovery() {
+        assert_holds_through_fast_recovery(Cubic::new(MSS));
+    }
 
     #[test]
     fn the_windowed_max_forgets_a_sample_once_its_window_has_passed() {
