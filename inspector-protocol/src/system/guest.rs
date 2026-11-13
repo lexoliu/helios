@@ -644,6 +644,12 @@ fn convert_sample(sample: host_stats::Sample) -> stats::Sample {
             total_bytes: sample.memory.total_bytes,
             available_bytes: sample.memory.available_bytes,
             pressure: convert_memory_pressure(sample.memory.pressure),
+            nodes: sample
+                .memory
+                .nodes
+                .into_iter()
+                .map(convert_memory_node)
+                .collect(),
         },
         block: sample.block.map(convert_block_device),
         iommu: sample.iommu.map(convert_iommu),
@@ -654,6 +660,15 @@ fn convert_sample(sample: host_stats::Sample) -> stats::Sample {
         devices: sample.devices.into_iter().map(convert_device).collect(),
         inputs: sample.inputs.into_iter().map(convert_input).collect(),
         audio: sample.audio.into_iter().map(convert_audio_stream).collect(),
+    }
+}
+
+fn convert_memory_node(node: host_stats::MemoryNode) -> stats::MemoryNode {
+    stats::MemoryNode {
+        id: node.id,
+        total_bytes: node.total_bytes,
+        available_bytes: node.available_bytes,
+        off_node_allocations: node.off_node_allocations,
     }
 }
 

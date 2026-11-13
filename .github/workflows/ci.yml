@@ -584,6 +584,33 @@ jobs:
             shell -c 'echo ok' > vsock-smoke.out
           cat vsock-smoke.out
           grep -Fqx ok vsock-smoke.out
+      - name: Boot riscv64 guest on two NUMA nodes
+        timeout-minutes: 5
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          # Every other boot describes one node, so nothing else reads
+          # `numa-node-id` or the distance map from a real device tree
+          # (#516). The kernel prints the layout it placed memory and
+          # processors by; the log carries colour escapes, hence `-a`.
+          # The RPC rides vsock here because the boot UART carries the
+          # kernel log only when the debugger does not need the line.
+          set -o pipefail
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/numa"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
+            --accel tcg --smp 4 --numa-nodes 2 --numa-distance 20 \
+            --rpc-transport vsock \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger --no-compiler-plugin \
+            shell -c 'echo ok' 2>&1 > boot-numa.out | tee "$runtime/inspector.log"
+          cat boot-numa.out
+          grep -Fqx ok boot-numa.out
+          grep -aF 'NUMA topology nodes=2 distances=10,20;20,10' "$runtime/debug-serial.log"
+          grep -aF 'NUMA node node=0' "$runtime/debug-serial.log" | grep -aF 'processors=0-1'
+          grep -aF 'NUMA node node=1' "$runtime/debug-serial.log" | grep -aF 'processors=2-3'
       - name: Fetch over virtio-net with curl
         timeout-minutes: 5
         shell: bash
@@ -845,6 +872,56 @@ jobs:
           # proves the walk still sees a real device rather than
           # nothing.
           grep -F 'device grant published device=pl061@9030000' "$runtime/inspector.log"
+      - name: Boot aarch64 guest on two NUMA nodes from the device tree
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+          HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          # Every other boot describes one node, so nothing else reads
+          # `numa-node-id` or the distance map from a real device tree
+          # (#516). The kernel prints the layout it placed memory and
+          # processors by; the log carries colour escapes, hence `-a`.
+          set -o pipefail
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/numa"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G \
+            --accel tcg --smp 4 --numa-nodes 2 --numa-distance 20 \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger --no-compiler-plugin \
+            shell -c 'echo ok' 2>&1 > boot-numa.out | tee "$runtime/inspector.log"
+          cat boot-numa.out
+          grep -Fqx ok boot-numa.out
+          grep -aF 'NUMA topology nodes=2 distances=10,20;20,10' "$runtime/debug-serial.log"
+          grep -aF 'NUMA node node=0' "$runtime/debug-serial.log" | grep -aF 'processors=0-1'
+          grep -aF 'NUMA node node=1' "$runtime/debug-serial.log" | grep -aF 'processors=2-3'
+      - name: Boot aarch64 guest on two NUMA nodes from ACPI
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+          HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          # The same machine as the boot above, described by the SRAT, the
+          # SLIT and the MADT's GICC entries instead of `numa-node-id` and
+          # the distance map (#516).
+          set -o pipefail
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/acpi-numa"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G --acpi \
+            --accel tcg --smp 4 --numa-nodes 2 --numa-distance 20 \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger --no-compiler-plugin \
+            shell -c 'echo ok' 2>&1 > boot-acpi-numa.out | tee "$runtime/inspector.log"
+          cat boot-acpi-numa.out
+          grep -Fqx ok boot-acpi-numa.out
+          grep -F 'platform described by acpi' "$runtime/inspector.log"
+          grep -aF 'NUMA topology nodes=2 distances=10,20;20,10' "$runtime/debug-serial.log"
+          grep -aF 'NUMA node node=0' "$runtime/debug-serial.log" | grep -aF 'processors=0-1'
+          grep -aF 'NUMA node node=1' "$runtime/debug-serial.log" | grep -aF 'processors=2-3'
       # The same guest under the same accelerator as the device-tree
       # boot above, described the other way. ACPI carries no counterpart
       # to `/chosen/rng-seed`, so this boot's seed comes from the CPU's
@@ -1383,6 +1460,30 @@ jobs:
           # The inspector attaches `vmgenid` on the x86 profile, so the
           # guest has to have found its generation ID window (#572).
           grep -aF 'vmgenid online' "$runtime/debug-serial.log"
+      - name: Boot x86-64 guest on two NUMA nodes
+        timeout-minutes: 5
+        shell: bash
+        working-directory: helios
+        run: |
+          # Every other boot describes one node, so nothing else reads the
+          # SRAT or the SLIT from real ACPI tables (#516). `-smp
+          # 4,sockets=2,cores=2` gives processors 0-3 APIC ids 0-3 in MADT
+          # order, and `-numa node,cpus=` puts 0-1 on node 0 and 2-3 on
+          # node 1. The kernel prints the layout it placed memory and
+          # processors by; the log carries colour escapes, hence `-a`.
+          set -o pipefail
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/numa"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            --accel kvm --smp 4 --numa-nodes 2 --numa-distance 20 \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger --no-compiler-plugin \
+            shell -c 'echo ok' 2>&1 > boot-numa.out | tee "$runtime/inspector.log"
+          cat boot-numa.out
+          grep -Fqx ok boot-numa.out
+          grep -aF 'NUMA topology nodes=2 distances=10,20;20,10' "$runtime/debug-serial.log"
+          grep -aF 'NUMA node node=0' "$runtime/debug-serial.log" | grep -aF 'processors=0-1'
+          grep -aF 'NUMA node node=1' "$runtime/debug-serial.log" | grep -aF 'processors=2-3'
       - uses: ./helios/.github/actions/swtpm
       # The kernel's signing seed is sealed in the TPM to the measured
       # boot chain (#602). Two boots of one payload on one TPM state

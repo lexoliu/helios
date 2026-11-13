@@ -67,7 +67,13 @@
 //! slot are only ever faulted in by one processor at a time; the atomics
 //! below are what keep that true against a fiber that migrates between
 //! polls, and what keep a claim on one processor from racing a release
-//! on another. Per-processor counters sit on their own cache lines.
+//! on another. Per-processor counters are a [`PerProcessor`] table: each
+//! processor's on a cache line of its own, in its own node's memory.
+//!
+//! A slot's `node` is written by the claiming processor (any processor)
+//! on a cold claim and read by every claim's scan for a warm slot; it
+//! sits in the slot's padded block, which claim and release already
+//! write.
 //!
 //! A slot's guard page is never mapped. Guest code that overflows its
 //! stack hits it and the runtime turns the fault into a wasm trap;
@@ -86,12 +92,15 @@ use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering}
 
 use crossbeam_utils::CachePadded;
 use helios_hal::cpu::{ProcessorId, current_processor};
+use helios_hal::numa::NodeId;
 use helios_hal::pmm::PhysFrame;
 use helios_hal::vmm::{AddressSpaceError, PageFlags, VirtAddr, VirtRange};
 use spin::Once;
 use thiserror::Error;
 
 use super::frame_reserve;
+use super::locality::Locality;
+use super::per_processor::PerProcessor;
 #[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]
 use crate::wasmtime_adapter::parking::ParkedFibers;
 
@@ -200,6 +209,14 @@ const SLOT_LIVE: u8 = 2;
 /// on another without a lock.
 struct FiberStackSlot {
     state: AtomicU8,
+    /// The node whose memory the slot's pages were last committed from:
+    /// written with the claimant's node by a cold claim, which commits
+    /// the top page and takes most of the rest by fault on the
+    /// claimant's processor, and read by every claim's scan for a warm
+    /// slot. A warm slot outlives the processor that faulted it, so this
+    /// is what lets the next claimant prefer pages on its own node.
+    /// Meaningless while the slot is cold.
+    node: AtomicU8,
     watermark: AtomicUsize,
     /// The Wasmtime unpark generation the fiber on this stack last
     /// returned from a parking wait at; see
@@ -222,14 +239,12 @@ pub struct FiberStackArena {
     /// Bytes warm slots hold now. Written on every claim and release from
     /// whichever processor runs them, so it sits on its own line.
     retained_bytes: CachePadded<AtomicUsize>,
-    /// Demand commits this processor has resolved. One counter per
-    /// processor, each on its own line, because every one of them is
-    /// written from fault context on its own processor.
-    demand_commits: Box<[CachePadded<AtomicU64>]>,
-    /// Whether the console has already been told this processor is
-    /// resolving commits. Written from the release path, which is a
-    /// place a `tracing` call is allowed; see [`Self::announce_processors`].
-    announced: Box<[CachePadded<AtomicBool>]>,
+    /// One block per processor, on its own line and in its own node's
+    /// memory, because `demand_commits` is written from fault context on
+    /// its own processor.
+    processors: PerProcessor<ProcessorCommits>,
+    /// Where each processor sits, for the warm-slot node preference.
+    locality: &'static Locality,
     /// What every released stack cost, summed. Written on the release
     /// path from whichever processor tears the store down, which is why
     /// the pair sits on its own line rather than beside a per-processor
@@ -240,6 +255,18 @@ pub struct FiberStackArena {
     /// notifying wasm thread, so it sits on its own line.
     #[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]
     parked: CachePadded<ParkedFibers>,
+}
+
+/// What one processor has done for the arena.
+struct ProcessorCommits {
+    /// Demand commits this processor has resolved. Written by this
+    /// processor alone, from fault context.
+    demand_commits: AtomicU64,
+    /// Whether the console has already been told this processor is
+    /// resolving commits. Swapped once, from the release path, which is a
+    /// place a `tracing` call is allowed; see
+    /// [`FiberStackArena::announce_processors`].
+    announced: AtomicBool,
 }
 
 struct ReleasedTotals {
@@ -301,12 +328,7 @@ pub fn install_fiber_stack_hooks(hooks: &'static FiberStackVmHooks) {
 /// a target that has no second way to place a fiber stack, so they are
 /// reported here rather than answered with a smaller stack or an eagerly
 /// committed one.
-pub fn install_fiber_stack_arena(
-    slots: usize,
-    stack_bytes: usize,
-    processor_count: usize,
-    retain_bytes: usize,
-) {
+pub fn install_fiber_stack_arena(slots: usize, stack_bytes: usize, retain_bytes: usize) {
     ARENA.call_once(|| {
         let hooks = *HOOKS.get().unwrap_or_else(|| {
             panic!(
@@ -319,10 +341,7 @@ pub fn install_fiber_stack_arena(
             stack_bytes != 0 && stack_bytes.is_multiple_of(PhysFrame::SIZE),
             "a fiber stack of {stack_bytes} bytes is not a whole number of pages"
         );
-        assert!(
-            processor_count != 0,
-            "the fiber stack arena needs at least one processor to count commits for"
-        );
+        let pool = super::user_memory_pool();
         let slot_bytes = FIBER_STACK_GUARD_BYTES
             .checked_add(stack_bytes)
             .unwrap_or_else(|| panic!("fiber stack slot size overflows"));
@@ -336,15 +355,12 @@ pub fn install_fiber_stack_arena(
         slot_states.resize_with(slots, || {
             CachePadded::new(FiberStackSlot {
                 state: AtomicU8::new(SLOT_COLD),
+                node: AtomicU8::new(0),
                 watermark: AtomicUsize::new(0),
                 #[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]
                 parked_generation: AtomicU64::new(0),
             })
         });
-        let mut counters = Vec::with_capacity(processor_count);
-        counters.resize_with(processor_count, || CachePadded::new(AtomicU64::new(0)));
-        let mut announced = Vec::with_capacity(processor_count);
-        announced.resize_with(processor_count, || CachePadded::new(AtomicBool::new(false)));
         tracing::info!(
             target: "helios_kernel::fiber_stack",
             base = range.start.raw(),
@@ -363,8 +379,11 @@ pub fn install_fiber_stack_arena(
             slots: slot_states.into_boxed_slice(),
             retain_budget: retain_bytes,
             retained_bytes: CachePadded::new(AtomicUsize::new(0)),
-            demand_commits: counters.into_boxed_slice(),
-            announced: announced.into_boxed_slice(),
+            processors: PerProcessor::new(pool, |_, _| ProcessorCommits {
+                demand_commits: AtomicU64::new(0),
+                announced: AtomicBool::new(false),
+            }),
+            locality: pool.locality(),
             released: CachePadded::new(ReleasedTotals {
                 stacks: AtomicU64::new(0),
                 committed_bytes: AtomicU64::new(0),
@@ -391,8 +410,8 @@ pub fn fiber_stack_arena_stats() -> Option<FiberStackArenaStats> {
 pub fn fiber_stack_demand_commits_on(processor: ProcessorId) -> u64 {
     ARENA
         .get()
-        .and_then(|arena| arena.demand_commits.get(usize::from(processor.id())))
-        .map_or(0, |counter| counter.load(Ordering::Relaxed))
+        .and_then(|arena| arena.processors.try_get(processor))
+        .map_or(0, |commits| commits.demand_commits.load(Ordering::Relaxed))
 }
 
 /// Classifies `addr` and, when it is a demand-commit page, resolves it.
@@ -480,7 +499,10 @@ impl FiberStackArena {
             }
         }
         slot.watermark.fetch_min(page.raw(), Ordering::AcqRel);
-        self.demand_commits[usize::from(processor.id())].fetch_add(1, Ordering::Relaxed);
+        self.processors
+            .get(processor)
+            .demand_commits
+            .fetch_add(1, Ordering::Relaxed);
         // Nothing is logged from here. `tracing` reaches the debug
         // console, which is a lock the interrupted code may be holding
         // on this very processor; the counter above is what the release
@@ -498,7 +520,8 @@ impl FiberStackArena {
             });
         }
         let processor = current_processor();
-        if let Some(index) = self.take_slot(SLOT_WARM) {
+        let node = self.locality.node_of(processor);
+        if let Some(index) = self.take_warm_slot(node) {
             // The pages its last stack touched are still mapped, so the
             // runtime's first frame lands on a committed page and nothing
             // here touches the address space.
@@ -508,7 +531,7 @@ impl FiberStackArena {
             return Ok(FiberStack { arena: self, index });
         }
         let index = self
-            .take_slot(SLOT_COLD)
+            .take_slot(SLOT_COLD, None)
             .ok_or(FiberStackError::Exhausted {
                 slots: self.slots.len(),
             })?;
@@ -519,6 +542,12 @@ impl FiberStackArena {
             return Err(FiberStackError::Prepare(error));
         }
         let body_top = body.end().raw();
+        // Every page this claim commits, the top one below and the rest
+        // by fault, comes from the claimant's processor, so that is the
+        // node the slot's pages are on until it goes cold again.
+        self.slots[index]
+            .node
+            .store(node.index() as u8, Ordering::Relaxed);
         self.slots[index]
             .watermark
             .store(body_top, Ordering::Release);
@@ -554,14 +583,32 @@ impl FiberStackArena {
     /// leaf tables an earlier claim already built, and the warm slots
     /// stay packed at the bottom of the arena. The load before the
     /// exchange keeps a scan over hundreds of live slots to plain reads.
-    fn take_slot(&self, from: u8) -> Option<usize> {
+    ///
+    /// With `on_node`, only a slot whose pages sit on that node.
+    fn take_slot(&self, from: u8, on_node: Option<NodeId>) -> Option<usize> {
         self.slots.iter().position(|slot| {
             slot.state.load(Ordering::Acquire) == from
+                && on_node.is_none_or(|node| {
+                    usize::from(slot.node.load(Ordering::Relaxed)) == node.index()
+                })
                 && slot
                     .state
                     .compare_exchange(from, SLOT_LIVE, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
         })
+    }
+
+    /// A warm slot for a claimant on `node`: one whose pages are on that
+    /// node if there is one, any warm slot otherwise, lowest first within
+    /// each. A machine with one node has no node to prefer, so it scans
+    /// once.
+    fn take_warm_slot(&self, node: NodeId) -> Option<usize> {
+        if self.locality.node_count() > 1
+            && let Some(index) = self.take_slot(SLOT_WARM, Some(node))
+        {
+            return Some(index);
+        }
+        self.take_slot(SLOT_WARM, None)
     }
 
     /// Bytes slot `index` has committed: from its watermark to its top.
@@ -624,14 +671,20 @@ impl FiberStackArena {
     /// crash, and a machine where only the bootstrap processor ever
     /// resolved one is a machine where the others were never asked.
     fn announce_processors(&self) {
-        for (processor, counter) in self.demand_commits.iter().enumerate() {
-            let commits = counter.load(Ordering::Relaxed);
-            if commits == 0 || self.announced[processor].swap(true, Ordering::AcqRel) {
+        for (processor, counters) in self.processors.iter() {
+            let commits = counters.demand_commits.load(Ordering::Relaxed);
+            // The flag shares its processor's line with the counter the
+            // fault path writes, so it is read first and written once:
+            // a swap is a write even when it changes nothing.
+            if commits == 0
+                || counters.announced.load(Ordering::Acquire)
+                || counters.announced.swap(true, Ordering::AcqRel)
+            {
                 continue;
             }
             tracing::info!(
                 target: "helios_kernel::fiber_stack",
-                processor,
+                processor = processor.id(),
                 demand_commits = commits,
                 "processor is resolving fiber stack demand commits"
             );
@@ -661,9 +714,9 @@ impl FiberStackArena {
             committed_bytes,
             eager_bytes: live_slots * self.stack_bytes,
             demand_commits: self
-                .demand_commits
+                .processors
                 .iter()
-                .map(|counter| counter.load(Ordering::Relaxed))
+                .map(|(_, counters)| counters.demand_commits.load(Ordering::Relaxed))
                 .sum(),
             released_stacks,
             released_committed_bytes: self.released.committed_bytes.load(Ordering::Relaxed),
@@ -820,17 +873,13 @@ mod tests {
         let base = unsafe { alloc::alloc::alloc_zeroed(layout) } as usize;
         assert!(base != 0, "pool backing");
         let pool =
-            super::super::install_user_memory_pool(super::super::allocate_user_memory_pool());
-        pool.initialize(&[(base, base + POOL_BYTES)]);
-        pool.configure_processors(TEST_PROCESSORS);
-        frame_reserve::configure_processors(TEST_PROCESSORS);
+            super::super::install_user_memory_pool(super::super::UserMemoryPool::single_node(
+                TEST_PROCESSORS,
+                &[(base, base + POOL_BYTES)],
+            ));
+        frame_reserve::configure(pool);
         install_fiber_stack_hooks(&TEST_HOOKS);
-        install_fiber_stack_arena(
-            TEST_SLOTS,
-            TEST_STACK_BYTES,
-            TEST_PROCESSORS,
-            TEST_RETAIN_BYTES,
-        );
+        install_fiber_stack_arena(TEST_SLOTS, TEST_STACK_BYTES, TEST_RETAIN_BYTES);
     }
 
     #[test]

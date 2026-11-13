@@ -84,7 +84,6 @@ use alloc::boxed::Box;
 use core::future::Future;
 use core::sync::atomic::{AtomicU8, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 
-use crossbeam_utils::CachePadded;
 use helios_hal::cpu::{Cpu, ProcessorId, current_processor};
 use helios_hal::measured_boot::MeasuredBoot;
 use helios_hal::watchdog::Watchdog;
@@ -92,6 +91,7 @@ use helios_hal::watchdog::Watchdog;
 use super::executor::{ExecutorGroup, PinnedTasks, machine_executor_group};
 use super::sync::{Notify, RawMutex, RawMutexLease};
 use crate::Kernel;
+use crate::memory::{PerProcessor, UserMemoryPool};
 
 /// The kernel's online set: one bit per possible processor.
 ///
@@ -159,50 +159,6 @@ impl OnlineSet {
     /// How many processors are online.
     pub fn count(&self) -> usize {
         self.count.load(Ordering::SeqCst)
-    }
-
-    /// The online processor `start` places among the online processors
-    /// other than `exclude`, or `None` when there is none.
-    ///
-    /// The words are read twice — once to count, once to select — so a
-    /// transition between the reads can make the selection come up
-    /// empty. That is a transition's own window, and the departing
-    /// processor's handoff wake covers the work a lost pick was for.
-    pub(crate) fn nth_after(&self, start: usize, exclude: ProcessorId) -> Option<ProcessorId> {
-        let (exclude_word, exclude_bit) = self.word_and_bit(exclude);
-        let candidates = |word: &AtomicU64| {
-            let bits = word.load(Ordering::SeqCst);
-            if core::ptr::eq(word, exclude_word) {
-                bits & !exclude_bit
-            } else {
-                bits
-            }
-        };
-        let total: usize = self
-            .words
-            .iter()
-            .map(|word| candidates(word).count_ones() as usize)
-            .sum();
-        if total == 0 {
-            return None;
-        }
-        let mut target = start % total;
-        for (index, word) in self.words.iter().enumerate() {
-            let mut bits = candidates(word);
-            let ones = bits.count_ones() as usize;
-            if target >= ones {
-                target -= ones;
-                continue;
-            }
-            for _ in 0..target {
-                bits &= bits - 1;
-            }
-            let processor = index * 64 + bits.trailing_zeros() as usize;
-            return Some(ProcessorId::new(u16::try_from(processor).unwrap_or_else(
-                |_| panic!("online processor {processor} does not fit a processor identifier"),
-            )));
-        }
-        None
     }
 }
 
@@ -314,31 +270,33 @@ impl LifecycleCell {
 
 /// Every processor's lifecycle cell, and the lock that serialises
 /// transitions.
+///
+/// Each cell is a [`PerProcessor`] block, on a cache line of its own and
+/// in memory of its processor's node: the processor reads its own cell
+/// on every run-loop pass, and an initiator writes it once per
+/// transition.
 pub(crate) struct ProcessorLifecycles {
-    cells: Box<[CachePadded<LifecycleCell>]>,
+    cells: PerProcessor<LifecycleCell>,
     transition: RawMutex,
 }
 
 impl ProcessorLifecycles {
-    pub(crate) fn new(possible_processors: usize) -> Self {
+    /// One cell per possible processor of the machine `pool` describes.
+    pub(crate) fn new(pool: &UserMemoryPool) -> Self {
         Self {
-            cells: (0..possible_processors)
-                .map(|_| CachePadded::new(LifecycleCell::new()))
-                .collect(),
+            cells: PerProcessor::new(pool, |_, _| LifecycleCell::new()),
             transition: RawMutex::new(),
         }
     }
 
     fn cell(&self, processor: ProcessorId) -> &LifecycleCell {
-        self.cells
-            .get(usize::from(processor.id()))
-            .unwrap_or_else(|| {
-                panic!(
-                    "processor {} is outside the {} possible processors' lifecycle cells",
-                    processor.id(),
-                    self.cells.len()
-                )
-            })
+        self.cells.try_get(processor).unwrap_or_else(|| {
+            panic!(
+                "processor {} is outside the {} possible processors' lifecycle cells",
+                processor.id(),
+                self.cells.len()
+            )
+        })
     }
 
     /// Takes the lock that serialises transitions. An offline or online
@@ -543,7 +501,7 @@ impl<CpuImpl: Cpu + Clone> ProcessorControl<CpuImpl> {
         // `SeqCst` store, then the target's idle state: the requester
         // half of the handshake `departure_requested` describes.
         cell.publish(LifecycleState::Departing);
-        if self.group.needs_wake(usize::from(processor.id())) {
+        if self.group.needs_wake(processor) {
             self.cpu.wake_processor(processor);
         }
         match cell.settled(LifecycleState::Departing).await {
@@ -977,35 +935,30 @@ mod tests {
     use crate::exec::Executor;
     use crate::exec::executor::PinnedTasks;
     use crate::test_processor_identity;
-    use crate::test_support::{ManualClockCpu, RecordingSmpCpu};
+    use crate::test_support::{ManualClockCpu, RecordingSmpCpu, single_node_pool};
 
     const P0: ProcessorId = ProcessorId::new(0);
     const P1: ProcessorId = ProcessorId::new(1);
     const P2: ProcessorId = ProcessorId::new(2);
 
+    /// The set answers membership and its count across its words: a
+    /// processor past the first 64 lives in the second word.
     #[test]
-    fn a_global_wake_picks_only_online_processors_other_than_the_waker() {
+    fn the_online_set_tracks_joins_and_departures_across_its_words() {
+        let p65 = ProcessorId::new(65);
         let online = OnlineSet::new(70);
-        for processor in [P0, P2, ProcessorId::new(65)] {
+        for processor in [P0, P2, p65] {
             online.insert(processor);
         }
         assert_eq!(online.count(), 3);
-
-        let picks: alloc::vec::Vec<_> = (0..4).map(|start| online.nth_after(start, P0)).collect();
-        assert_eq!(
-            picks,
-            [
-                Some(P2),
-                Some(ProcessorId::new(65)),
-                Some(P2),
-                Some(ProcessorId::new(65))
-            ]
-        );
+        assert!(online.contains(P0) && online.contains(P2) && online.contains(p65));
+        assert!(!online.contains(P1));
 
         online.remove(P2);
-        online.remove(ProcessorId::new(65));
-        assert_eq!(online.nth_after(0, P0), None);
+        online.remove(p65);
         assert!(!online.contains(P2));
+        assert!(!online.contains(p65));
+        assert!(online.contains(P0));
         assert_eq!(online.count(), 1);
     }
 
@@ -1024,7 +977,7 @@ mod tests {
     #[test]
     fn a_pinned_local_task_refuses_the_departure_until_it_is_gone() {
         let cpu = RecordingSmpCpu::new(0, 2);
-        let executor0 = Executor::isolated(ProgressCounter::new(), 2, P0);
+        let executor0 = Executor::isolated(ProgressCounter::new(), single_node_pool(2), P0);
         let group = executor0.group();
         group.bring_processor_online(P0);
 
@@ -1065,7 +1018,7 @@ mod tests {
     fn a_departing_processors_pending_sleep_fires_on_its_successor() {
         let cpu = ManualClockCpu::new();
         test_processor_identity::set(P0);
-        let executor0 = Executor::isolated(ProgressCounter::new(), 2, P0);
+        let executor0 = Executor::isolated(ProgressCounter::new(), single_node_pool(2), P0);
         let timer0 = executor0.timer(cpu.clone());
 
         test_processor_identity::set(P1);

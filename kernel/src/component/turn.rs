@@ -382,7 +382,7 @@ mod tests {
     /// memory it commits, nested in the turn of a store that does.
     #[test]
     fn a_turn_of_an_unowned_store_names_no_memory_owner() {
-        configure_user_memory_owner_processors(1);
+        configure_user_memory_owner_processors(crate::test_support::single_node_pool(1));
         let processor = current_processor();
         let registry = InstanceRegistry::new();
         let requester = registry.register("requester", 0);
@@ -428,7 +428,7 @@ mod tests {
     /// processor back to the parent.
     #[test]
     fn a_turn_names_its_instance_as_the_memory_owner() {
-        configure_user_memory_owner_processors(1);
+        configure_user_memory_owner_processors(crate::test_support::single_node_pool(1));
         let processor = current_processor();
         let registry = InstanceRegistry::new();
         let parent = registry.register("parent", 0);

@@ -12,16 +12,24 @@
 //! Both tables are installed once, on the bootstrap hart, before any
 //! secondary is started.
 //!
+//! A granted source is masked and unmasked on its own PLIC, at the
+//! context of the hart that takes that PLIC's interrupts. The number a
+//! grant carries is the backend's encoding of both (see
+//! `net::InterruptDomains::grant_interrupt`), and the hooks decode it
+//! through the domains the bootstrap hart publishes at the end of
+//! bring-up. No hook runs before then: the kernel calls them only for a
+//! grant's owner, or from that grant's interrupt route.
+//!
 //! Masking is not a single store. A PLIC enable bit lives in a 32-bit
 //! word shared with thirty-one other sources, and the `plic` crate
 //! reads, modifies and writes that whole word — so two harts arming or
 //! holding off two *different* sources in the same word lose a bit
-//! between them. [`set_source_enabled`] is the only writer of those
-//! words in this backend, and it serialises them; see the lock's own
-//! comment for why the critical section is part of that.
+//! between them. `net::ExternalInterrupts::set_source_enabled` is the
+//! only writer of those words in this backend, and it serialises them
+//! per PLIC; see its lock's comment for why the critical section is
+//! part of that.
 
 use alloc::vec::Vec;
-use core::num::NonZeroU32;
 
 use fdt::Fdt;
 use fdt::node::FdtNode;
@@ -33,64 +41,8 @@ use helios_kernel::{
     DEFAULT_DMA_BUDGET_BYTES, DeviceGrant, DeviceGrantRegistry, DeviceInterruptHooks,
     DeviceInterruptRoute, DeviceName, DeviceVmHooks, DmaBudget, GrantError, GrantInterrupt,
 };
-use plic::Plic;
-use spin::{Mutex, Once};
 
-use crate::net::{InterruptSourceId, PlicContext};
-
-/// The controller the masking hooks drive, and the context a granted
-/// source is enabled on.
-///
-/// The hooks are plain function pointers, by design — see
-/// `DeviceVmHooks` — so what they act on is reached through a
-/// write-once cell rather than carried in a closure. Every platform
-/// device on this backend shares one PLIC context, which is why one
-/// pair suffices.
-static CONTROLLER: Once<(&'static Plic, PlicContext)> = Once::new();
-
-fn controller() -> (&'static Plic, PlicContext) {
-    *CONTROLLER
-        .get()
-        .expect("a granted device's interrupt was masked before the controller was published")
-}
-
-/// Serialises the PLIC's enable words.
-///
-/// `plic::Plic::enable` and `disable` are a read-modify-write of the
-/// 32-bit word that carries a source's enable bit, and that word covers
-/// thirty-two sources. Two harts touching two different sources in the
-/// same word therefore race, and one of them loses its bit — a granted
-/// device that stops delivering, or worse, a kernel device that does.
-///
-/// The lock is taken with interrupts masked on the local hart because
-/// one of the writers is a granted device's [`mask`], which runs in
-/// interrupt context: a task holding this lock and then interrupted
-/// into `mask` on its own hart would spin on itself.
-static ENABLE_WORDS: Mutex<()> = Mutex::new(());
-
-/// Arm or hold off one PLIC source, without disturbing the thirty-one
-/// that share its enable word.
-pub(crate) fn set_source_enabled(
-    plic: &Plic,
-    context: PlicContext,
-    source: InterruptSourceId,
-    enabled: bool,
-) {
-    critical_section::with(|_| {
-        let _words = ENABLE_WORDS.lock();
-        if enabled {
-            plic.enable(source, context);
-        } else {
-            plic.disable(source, context);
-        }
-    });
-}
-
-fn source(raw: u32) -> InterruptSourceId {
-    InterruptSourceId(
-        NonZeroU32::new(raw).unwrap_or_else(|| panic!("PLIC source 0 is not an interrupt")),
-    )
-}
+use crate::net::{InterruptDomains, PlicInterrupt};
 
 fn allocate_run(bytes: usize, placement: DmaPlacement) -> Result<PhysicalRange, AddressSpaceError> {
     crate::vmm::user_address_space_or_panic().allocate_run(bytes, placement)
@@ -144,13 +96,13 @@ static VM_HOOKS: DeviceVmHooks = DeviceVmHooks {
 };
 
 fn mask(raw: u32) {
-    let (plic, context) = controller();
-    set_source_enabled(plic, context, source(raw), false);
+    let (domain, source) = crate::net::interrupt_domains().granted_source(raw);
+    domain.set_source_enabled(source, false);
 }
 
 fn unmask(raw: u32) {
-    let (plic, context) = controller();
-    set_source_enabled(plic, context, source(raw), true);
+    let (domain, source) = crate::net::interrupt_domains().granted_source(raw);
+    domain.set_source_enabled(source, true);
 }
 
 static INTERRUPT_HOOKS: DeviceInterruptHooks = DeviceInterruptHooks { mask, unmask };
@@ -160,8 +112,7 @@ static INTERRUPT_HOOKS: DeviceInterruptHooks = DeviceInterruptHooks { mask, unma
 /// Runs before any grant is published, which the registry checks: a
 /// grant claimable before the hooks existed would be a driver holding a
 /// device the kernel cannot map.
-pub(crate) fn install_hooks(plic: &'static Plic, context: PlicContext) {
-    CONTROLLER.call_once(|| (plic, context));
+pub(crate) fn install_hooks() {
     helios_kernel::install_device_vm_hooks(&VM_HOOKS);
     helios_kernel::install_device_interrupt_hooks(&INTERRUPT_HOOKS);
 }
@@ -172,7 +123,10 @@ pub(crate) struct GrantableDevice {
     pub(crate) name: &'static str,
     base: usize,
     bytes: usize,
-    pub(crate) source: InterruptSourceId,
+    /// The PLIC line the device raises.
+    pub(crate) line: PlicInterrupt,
+    /// The number the grant carries for `line`.
+    interrupt: GrantInterrupt,
     coherent: bool,
 }
 
@@ -196,17 +150,19 @@ const KERNEL_DRIVEN: &[&str] = &[
 ];
 
 /// Publish a grant for every device the firmware described and no
-/// kernel driver claimed, and return the sources they need routed.
+/// kernel driver claimed, and return the lines they need routed.
 ///
-/// Each source is given a priority and then left disabled at the PLIC.
-/// Nothing owns the device yet, so an interrupt arriving now would have
-/// nowhere to go; the first `unmask` from the driver that claims it is
-/// what arms the hardware.
+/// Each line is attached to its own PLIC's domain by the caller, which
+/// gives it a priority and leaves it disabled. Nothing owns the device
+/// yet, so an interrupt arriving now would have nowhere to go; the
+/// first `unmask` from the driver that claims it is what arms the
+/// hardware.
 pub(crate) fn publish_grants(
     fdt: &Fdt<'static>,
     registry: &DeviceGrantRegistry,
-) -> Vec<(InterruptSourceId, DeviceInterruptRoute)> {
-    let discovered = discover(fdt);
+    domains: &InterruptDomains,
+) -> Vec<(PlicInterrupt, DeviceInterruptRoute)> {
+    let discovered = discover(fdt, domains);
     let mut grants = Vec::new();
     for device in &discovered {
         match build_grant(device) {
@@ -229,20 +185,14 @@ pub(crate) fn publish_grants(
         panic!("RISC-V could not publish the machine's device grants: {error}")
     });
 
-    let (plic, context) = controller();
     let mut routes = Vec::new();
     for device in &discovered {
         let Some(published) = registry.device(device.name) else {
             continue;
         };
-        plic.set_priority(device.source, 1);
-        set_source_enabled(plic, context, device.source, false);
         routes.push((
-            device.source,
-            DeviceInterruptRoute::new(
-                published.clone(),
-                GrantInterrupt::new(device.source.0.get()),
-            ),
+            device.line,
+            DeviceInterruptRoute::new(published.clone(), device.interrupt),
         ));
     }
     routes
@@ -255,8 +205,9 @@ pub(crate) fn publish_grants(
 /// rather than refused: it is a device this backend cannot isolate, not
 /// a machine it cannot boot. Mapping it would put a neighbour's
 /// registers in the same page, which is the one thing a grant must
-/// never do.
-fn discover(fdt: &Fdt<'static>) -> Vec<GrantableDevice> {
+/// never do. A node wired to a controller no hart takes interrupts from
+/// is skipped the same way: a driver could map it but never hear it.
+fn discover(fdt: &Fdt<'static>, domains: &InterruptDomains) -> Vec<GrantableDevice> {
     let frame = PhysFrame::SIZE;
     let mut devices = Vec::new();
     for node in fdt.all_nodes() {
@@ -267,11 +218,19 @@ fn discover(fdt: &Fdt<'static>) -> Vec<GrantableDevice> {
             continue;
         };
         // The PLIC's specifier is a bare source number, so any node
-        // that names one names something this controller can route.
-        let Some(interrupt) = helios_virtio::node_interrupt(fdt, &node) else {
+        // that names one on a PLIC names something it can route.
+        let Some(line) =
+            helios_virtio::node_interrupt(fdt, &node).and_then(PlicInterrupt::from_specifier)
+        else {
             continue;
         };
-        let Some(number) = NonZeroU32::new(interrupt.number) else {
+        let Some(interrupt) = domains.grant_interrupt(line) else {
+            tracing::warn!(
+                node = node.name,
+                controller = line.controller.base(),
+                "the device tree wires a device to an interrupt controller no hart takes \
+                 interrupts from; it is not offered to a driver"
+            );
             continue;
         };
         if !base.is_multiple_of(frame) || !bytes.is_multiple_of(frame) {
@@ -288,7 +247,8 @@ fn discover(fdt: &Fdt<'static>) -> Vec<GrantableDevice> {
             name: node.name,
             base,
             bytes,
-            source: InterruptSourceId(number),
+            line,
+            interrupt,
             coherent: node.property("dma-coherent").is_some(),
         });
     }
@@ -340,5 +300,5 @@ fn build_grant(device: &GrantableDevice) -> Result<DeviceGrant, GrantError> {
         // this walk does not decode one.
         attributes: DeviceRegionAttributes::REGISTERS,
     })?
-    .with_interrupt(GrantInterrupt::new(device.source.0.get()))
+    .with_interrupt(device.interrupt)
 }

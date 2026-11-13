@@ -10,12 +10,11 @@
 extern crate alloc;
 
 use alloc::sync::Arc;
-use core::num::NonZeroU32;
 
 use fdt::Fdt;
 use helios_kernel::ExternalInterruptHandler;
 
-use crate::net::InterruptSourceId;
+use crate::net::PlicInterrupt;
 
 /// The interrupt route's view of the platform's vsock device.
 ///
@@ -28,9 +27,9 @@ pub(crate) struct VirtioVsockDevice {
 }
 
 /// The vsock device the bootstrap hart brought up, together with the
-/// PLIC source the device tree routes it to.
+/// PLIC line the device tree routes it to.
 pub(crate) struct VsockInterrupt {
-    pub(crate) source: InterruptSourceId,
+    pub(crate) line: PlicInterrupt,
     pub(crate) device: VirtioVsockDevice,
 }
 
@@ -55,27 +54,26 @@ pub(crate) fn install<WatchdogImpl>(
 where
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
 {
-    let (device, source) = discover_vsock_device(fdt)?;
+    let (device, line) = discover_vsock_device(fdt)?;
     let service = helios_kernel::install_vsock_device(kernel, cpu, device.inner.clone());
     let guest_cid = service.guest_cid();
     debug_state.install_vsock_service(helios_kernel::ComponentHostVsockService::from_service(
         service,
     ));
-    tracing::info!(guest_cid, irq = source.0.get(), "virtio vsock online");
-    Some(VsockInterrupt { source, device })
+    tracing::info!(guest_cid, irq = line.number(), "virtio vsock online");
+    Some(VsockInterrupt { line, device })
 }
 
-fn discover_vsock_device(fdt: &Fdt<'_>) -> Option<(VirtioVsockDevice, InterruptSourceId)> {
+fn discover_vsock_device(fdt: &Fdt<'_>) -> Option<(VirtioVsockDevice, PlicInterrupt)> {
     let candidate = helios_virtio::mmio_candidates(fdt).find(|candidate| {
         crate::matches_virtio_mmio_device(candidate.base, helios_virtio::DeviceType::Vsock)
     })?;
     let base = candidate.base;
     let header = core::ptr::NonNull::new(base as *mut u8)
         .unwrap_or_else(|| panic!("virtio MMIO base {base:#x} was unexpectedly null"));
-    let source = candidate
+    let line = candidate
         .interrupt
-        .and_then(|interrupt| NonZeroU32::new(interrupt.number))
-        .map(InterruptSourceId)
+        .and_then(PlicInterrupt::from_specifier)
         .unwrap_or_else(|| panic!("virtio-vsock node at {base:#x} has no valid interrupt source"));
     let device =
         unsafe { helios_virtio::vsock_from_mmio(header, candidate.size) }.unwrap_or_else(|error| {
@@ -85,6 +83,6 @@ fn discover_vsock_device(fdt: &Fdt<'_>) -> Option<(VirtioVsockDevice, InterruptS
         VirtioVsockDevice {
             inner: Arc::new(device),
         },
-        source,
+        line,
     ))
 }

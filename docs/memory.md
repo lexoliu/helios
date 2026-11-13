@@ -10,8 +10,13 @@ what that division means for how many instances a guest can hold.
 The policy itself lives in one place, `kernel/src/memory/policy.rs`, and
 every backend reaches it through the same call. `riscv/`, `x86/`,
 `aarch64/` and `hosted/` each hand `helios_kernel::prime_bootstrap_allocator`
-the usable regions of their boot memory map and nothing else; no backend
-decides how much memory either domain gets.
+the usable regions of their boot memory map, each tagged with its NUMA
+node, the platform's NUMA description and the bootstrap processor; no
+backend decides how much memory either domain gets. The kernel boot
+share is taken from the bootstrap processor's node first, and the user
+pool is one buddy pool per node: an allocation is served by the
+executing processor's node, then by the other nodes nearest first, and
+a frame always returns to the node it came from.
 
 ## The policy
 
@@ -126,13 +131,6 @@ Balloon inflation requests power-of-two runs no larger than the current
 pressure budget or remaining target. This accounts for actual occupied
 frames rather than a smaller requested count that the pool would round
 up, and rechecks available budget after awaiting the host (#266).
-
-`KernelPhysFrameAllocator` (`kernel/src/memory/pmm.rs`) also contains a
-buddy heap and frame slab, but has no production allocation call path in
-the current tree. Its constructors are used by tests; x86 page-table
-allocation uses `DirectMappedFrameAllocator` and the global allocator.
-Issue #249 was closed as not planned after this call-path check, rather
-than attributing benchmark costs to an unused allocator.
 
 ## Why the split is not a fraction
 

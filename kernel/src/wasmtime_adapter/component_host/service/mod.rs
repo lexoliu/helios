@@ -1433,7 +1433,7 @@ where
         // executor capacity the kernel needs for its own tasks.
         let spawner = exec_context
             .spawner
-            .instance_spawner(crate::TaskFunding::Instance);
+            .instance_spawner(crate::TaskFunding::Instance, &launched_instance);
         let run_spawner = spawner.clone();
         let progress = spawner.progress_counter();
 

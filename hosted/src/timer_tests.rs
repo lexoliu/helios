@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{bounded, unbounded};
 use helios_hal::cpu::ProcessorId;
+use helios_hal::numa::SingleNode;
 use helios_hal::{DeviceInventory, DmaModel, Platform, ProcessorStartupPolicy, ProcessorTopology};
 use helios_kernel::Kernel;
 
@@ -50,17 +51,20 @@ fn a_lone_processor_fires_consecutive_sleeps() {
             thread::park();
 
             let cpu = HostedCpu::new(processor, machine.clone());
-            let platform = Platform::new(
-                HostedConsole::new(),
-                machine.bootstrap_memory_regions(processor),
-                cpu.clone(),
-            )
-            .with_topology(
-                ProcessorTopology::start_all_secondaries(processor, 1)
-                    .with_startup_policy(ProcessorStartupPolicy::BootstrapOnly),
-            )
-            .with_dma_model(DmaModel::Translated)
-            .with_devices(DeviceInventory::new());
+            // The host machine reports no NUMA description: one node
+            // holds the processor and all of the reserved heap.
+            helios_kernel::prime_bootstrap_allocator(
+                machine.bootstrap_memory_regions(),
+                &SingleNode::new(1),
+                processor,
+            );
+            let platform = Platform::new(HostedConsole::new(), cpu.clone())
+                .with_topology(
+                    ProcessorTopology::start_all_secondaries(processor, 1)
+                        .with_startup_policy(ProcessorStartupPolicy::BootstrapOnly),
+                )
+                .with_dma_model(DmaModel::Translated)
+                .with_devices(DeviceInventory::new());
             let kernel: &'static Kernel<HostedCpu> =
                 Box::leak(Box::new(helios_kernel::init(platform)));
             cpu.install_timer(kernel.timer());

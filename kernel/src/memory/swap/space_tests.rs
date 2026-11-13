@@ -22,7 +22,7 @@ use helios_hal::vmm::{AddressSpaceError, PageAge, PageFlags, SwapToken, VirtAddr
 
 use super::{AGE_BATCH_PAGES, SwapLeafFormat, SwapSpace};
 use crate::memory::{
-    MemoryOwner, ReservationTracker, allocate_user_frame_zeroed_on, allocate_user_memory_pool,
+    MemoryOwner, ReservationTracker, UserMemoryPool, allocate_user_frame_zeroed_on,
     deallocate_user_frame_on, install_user_memory_pool, user_heap_stats,
 };
 
@@ -66,9 +66,7 @@ fn serialise() -> MutexGuard<'static, ()> {
         // SAFETY: the layout has a non-zero size.
         let base = unsafe { alloc_zeroed(layout) } as usize;
         assert!(base != 0, "pool backing");
-        let pool = install_user_memory_pool(allocate_user_memory_pool());
-        pool.initialize(&[(base, base + POOL_BYTES)]);
-        pool.configure_processors(1);
+        install_user_memory_pool(UserMemoryPool::single_node(1, &[(base, base + POOL_BYTES)]));
     });
     guard
 }

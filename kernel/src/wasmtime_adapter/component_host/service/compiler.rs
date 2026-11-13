@@ -1069,7 +1069,7 @@ mod tests {
             ));
             let executor = crate::Executor::new(
                 helios_hal::watchdog::ProgressCounter::new(),
-                1,
+                crate::test_support::single_node_pool(1),
                 helios_hal::cpu::ProcessorId::new(0),
             );
             let registry = crate::InstanceRegistry::new();

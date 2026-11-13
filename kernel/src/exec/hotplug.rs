@@ -133,7 +133,7 @@ mod tests {
     use crate::exec::Executor;
     use crate::exec::lifecycle::ProcessorControl;
     use crate::test_processor_identity;
-    use crate::test_support::RecordingSmpCpu;
+    use crate::test_support::{RecordingSmpCpu, single_node_pool};
     use helios_hal::watchdog::ProgressCounter;
 
     const P0: ProcessorId = ProcessorId::new(0);
@@ -173,7 +173,7 @@ mod tests {
     fn an_eject_releases_a_never_started_processor_and_refuses_the_bootstrap() {
         test_processor_identity::set(P0);
         let cpu = RecordingSmpCpu::new(0, 2);
-        let executor = Executor::isolated(ProgressCounter::new(), 2, P0);
+        let executor = Executor::isolated(ProgressCounter::new(), single_node_pool(2), P0);
         executor.group().bring_processor_online(P0);
         let control = ProcessorControl::new(cpu, executor.group());
         let mut firmware = RecordingFirmware::default();
