@@ -26,6 +26,8 @@ pub(super) use surface::add_surface_to_linker;
 mod audio;
 pub use audio::PlaybackHandle;
 pub(super) use audio::add_audio_to_linker;
+mod processors;
+pub(super) use processors::add_processors_to_linker;
 mod compile_session;
 use compile_session::*;
 mod compiler;
@@ -3266,6 +3268,7 @@ mod tests {
             crate::DeviceClassRights::DISPLAY | crate::DeviceClassRights::AUDIO,
         );
         parent.grant_diagnostic_rights(crate::DiagnosticAuthorityRights::OBSERVE_MACHINE);
+        parent.grant_machine_rights(crate::MachineAuthorityRights::CONTROL_PROCESSORS);
 
         let child = wasix_proc_spawn_inherited_non_directory_authority(&parent);
 
@@ -3291,6 +3294,10 @@ mod tests {
         assert_eq!(
             child.diagnostic_rights(),
             crate::DiagnosticAuthorityRights::OBSERVE_MACHINE
+        );
+        assert_eq!(
+            child.machine_rights(),
+            crate::MachineAuthorityRights::CONTROL_PROCESSORS
         );
         assert!(parent.contains_authority(&child));
     }

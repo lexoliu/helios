@@ -4,6 +4,7 @@ pub(crate) mod bindings;
 mod guest;
 pub mod instances;
 pub mod methods;
+pub mod processors;
 pub mod profiling;
 pub mod programs;
 pub mod server;

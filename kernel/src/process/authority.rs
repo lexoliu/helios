@@ -108,6 +108,16 @@ bitflags! {
     }
 }
 
+bitflags! {
+    /// What an instance may do to the machine itself rather than to
+    /// what runs on it.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct MachineAuthorityRights: u8 {
+        /// Take processors offline and bring them online.
+        const CONTROL_PROCESSORS = 1 << 0;
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DirectoryPreopen {
     source_path: String,
@@ -202,6 +212,21 @@ impl ObserveMachineCap {
     }
 }
 
+/// Proof, checked on the owning task, that the instance may take
+/// processors offline and bring them online.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ControlProcessorsCap(MachineAuthorityRights);
+
+impl ControlProcessorsCap {
+    pub const fn required_rights() -> MachineAuthorityRights {
+        MachineAuthorityRights::CONTROL_PROCESSORS
+    }
+
+    pub const fn rights(self) -> MachineAuthorityRights {
+        self.0
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TerminalInputCap(TerminalAuthorityRights);
 
@@ -285,6 +310,7 @@ pub struct ProcessAuthority {
     /// registry's own capacity, because the registry cannot publish more.
     devices: ArrayVec<DeviceName, MAX_GRANTS>,
     diagnostics: DiagnosticAuthorityRights,
+    machine: MachineAuthorityRights,
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -335,6 +361,10 @@ pub enum ProcessAuthorityError {
     EmptyDiagnosticRights,
     #[error("diagnostic grant exceeds caller authority: {0:?}")]
     DiagnosticGrantExceedsAuthority(DiagnosticAuthorityRights),
+    #[error("machine grant rights must not be empty")]
+    EmptyMachineRights,
+    #[error("machine grant exceeds caller authority: {0:?}")]
+    MachineGrantExceedsAuthority(MachineAuthorityRights),
 }
 
 impl DirectoryPreopen {
@@ -478,13 +508,15 @@ impl ProcessAuthority {
             device_classes: DeviceClassRights::empty(),
             devices: ArrayVec::new_const(),
             diagnostics: DiagnosticAuthorityRights::empty(),
+            machine: MachineAuthorityRights::empty(),
         }
     }
 
-    /// Every right except the device and diagnostic ones. The kernel adds
-    /// the device classes, named devices and diagnostic rights a component
-    /// needs where it starts that component, so no program inherits a
-    /// claim or the machine's diagnostics through this value.
+    /// Every right except the device, diagnostic and machine ones. The
+    /// kernel adds the device classes, named devices, diagnostic and
+    /// machine rights a component needs where it starts that component,
+    /// so no program inherits a claim, the machine's diagnostics or
+    /// control of its processors through this value.
     pub fn root() -> Self {
         let mut authority = Self::empty();
         authority.insert_directory_preopen(
@@ -596,6 +628,14 @@ impl ProcessAuthority {
 
     pub fn grant_diagnostic_rights(&mut self, rights: DiagnosticAuthorityRights) {
         self.diagnostics |= rights;
+    }
+
+    pub fn machine_rights(&self) -> MachineAuthorityRights {
+        self.machine
+    }
+
+    pub fn grant_machine_rights(&mut self, rights: MachineAuthorityRights) {
+        self.machine |= rights;
     }
 
     pub fn grant_device_classes(&mut self, rights: DeviceClassRights) {
@@ -868,6 +908,26 @@ impl ProcessAuthority {
             .map(ObserveMachineCap)
     }
 
+    pub fn derive_machine_rights(
+        &self,
+        rights: MachineAuthorityRights,
+    ) -> Result<MachineAuthorityRights, ProcessAuthorityError> {
+        if rights.is_empty() {
+            return Err(ProcessAuthorityError::EmptyMachineRights);
+        }
+        if !self.machine.contains(rights) {
+            return Err(ProcessAuthorityError::MachineGrantExceedsAuthority(rights));
+        }
+        Ok(rights)
+    }
+
+    pub fn derive_control_processors_cap(
+        &self,
+    ) -> Result<ControlProcessorsCap, ProcessAuthorityError> {
+        self.derive_machine_rights(ControlProcessorsCap::required_rights())
+            .map(ControlProcessorsCap)
+    }
+
     pub fn derive_device_class_rights(
         &self,
         rights: DeviceClassRights,
@@ -991,6 +1051,7 @@ impl ProcessAuthority {
             && self.mount.contains(child.mount)
             && self.device_classes.contains(child.device_classes)
             && self.diagnostics.contains(child.diagnostics)
+            && self.machine.contains(child.machine)
             && child
                 .devices
                 .iter()
@@ -1074,9 +1135,9 @@ fn directory_contains(directory: &str, path: &str) -> bool {
 mod tests {
     use super::{
         ClockAuthorityRights, DeviceClassRights, DiagnosticAuthorityRights,
-        DirectoryAuthorityRights, LinkAuthorityRights, MountAuthorityRights,
-        NetworkAuthorityRights, ProcessAuthority, ProcessAuthorityError, ProcessAuthorityRights,
-        TerminalAuthorityRights,
+        DirectoryAuthorityRights, LinkAuthorityRights, MachineAuthorityRights,
+        MountAuthorityRights, NetworkAuthorityRights, ProcessAuthority, ProcessAuthorityError,
+        ProcessAuthorityRights, TerminalAuthorityRights,
     };
     use crate::device::{DeviceName, MAX_GRANTS};
 
@@ -1547,6 +1608,34 @@ mod tests {
         let root = ProcessAuthority::root();
         assert_eq!(root.diagnostic_rights(), DiagnosticAuthorityRights::empty());
         assert!(root.derive_observe_machine_cap().is_err());
+    }
+
+    #[test]
+    fn machine_grant_must_be_subset_of_caller_authority() {
+        let mut parent = ProcessAuthority::root();
+        parent.grant_machine_rights(MachineAuthorityRights::CONTROL_PROCESSORS);
+        assert!(parent.derive_control_processors_cap().is_ok());
+        assert_eq!(
+            parent
+                .derive_machine_rights(MachineAuthorityRights::empty())
+                .expect_err("an empty machine grant is a mistake"),
+            ProcessAuthorityError::EmptyMachineRights
+        );
+
+        let root = ProcessAuthority::root();
+        assert_eq!(root.machine_rights(), MachineAuthorityRights::empty());
+        assert_eq!(
+            root.derive_control_processors_cap()
+                .expect_err("root authority does not control processors"),
+            ProcessAuthorityError::MachineGrantExceedsAuthority(
+                MachineAuthorityRights::CONTROL_PROCESSORS
+            )
+        );
+
+        let mut child = ProcessAuthority::root();
+        child.grant_machine_rights(MachineAuthorityRights::CONTROL_PROCESSORS);
+        assert!(parent.contains_authority(&child));
+        assert!(!root.contains_authority(&child));
     }
 
     #[test]

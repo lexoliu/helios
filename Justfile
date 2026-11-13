@@ -82,7 +82,7 @@ clippy-host:
         --workspace --all-targets \
         --exclude helios \
         --exclude helios-aarch64 --exclude helios-riscv --exclude helios-x86 \
-        --exclude helios-audio-test --exclude helios-compositor \
+        --exclude helios-audio-test --exclude helios-compositor --exclude helios-cpu \
         --exclude helios-date --exclude helios-debugger --exclude helios-display-test \
         --exclude helios-gpu-test --exclude helios-http-client \
         --exclude helios-init --exclude helios-input-test \
@@ -98,7 +98,7 @@ clippy-programs:
     # One program per invocation: they select mutually exclusive
     # `helios-api` worlds, and a single invocation covering several of
     # them would unify those features and fail to build.
-    for package in helios-audio-test helios-compositor helios-date helios-debugger helios-display-test helios-gpu-test \
+    for package in helios-audio-test helios-compositor helios-cpu helios-date helios-debugger helios-display-test helios-gpu-test \
         helios-http-client \
         helios-init helios-input-test helios-oob-load helios-perf helios-ping \
         helios-procbench helios-sched-tasks helios-surface-test; do

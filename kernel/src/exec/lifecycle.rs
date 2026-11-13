@@ -359,6 +359,49 @@ pub enum OnlineError {
     NotOffline { processor: ProcessorId },
 }
 
+/// The processor lifecycle as a system capability: the possible and
+/// online sets, and the two transitions between them.
+///
+/// The kernel's services reach the lifecycle through this trait, and
+/// `helios:system/processors` is its WIT face.
+///
+/// # Concurrency contract
+///
+/// The set reads are lock-free atomic loads, callable from any
+/// processor; a read concurrent with a transition sees the set before
+/// or after it. `offline` and `online` take the kernel's async
+/// transition mutex for the whole transition and fan out to exactly the
+/// target processor (and, for an offline, the successor the call runs
+/// on), so concurrent requests from any number of processors are
+/// serialised and each one's result describes its own transition.
+pub trait ProcessorLifecycle {
+    /// How many processors the machine can ever run: the possible set
+    /// is `0..possible_processors()`.
+    fn possible_processors(&self) -> usize;
+
+    /// The processor that booted the machine, which stays online.
+    fn bootstrap_processor(&self) -> ProcessorId;
+
+    /// Whether `processor`, one of the possible processors, is online.
+    fn is_online(&self, processor: ProcessorId) -> bool;
+
+    /// Takes `processor` offline: it runs its teardown steps, hands its
+    /// pending timers and queued global work to the processor the call
+    /// runs on, and stops. Resolves once it has stopped, or with why it
+    /// did not; a refusal leaves it online and unchanged.
+    fn offline(
+        &self,
+        processor: ProcessorId,
+    ) -> impl Future<Output = Result<(), OfflineError>> + Send + '_;
+
+    /// Brings `processor` online, starting it when it has never run.
+    /// Resolves once it has run its bring-up and joined the online set.
+    fn online(
+        &self,
+        processor: ProcessorId,
+    ) -> impl Future<Output = Result<(), OnlineError>> + Send + '_;
+}
+
 /// The initiator's side of the lifecycle: takes processors offline and
 /// brings them online from a task on any online processor.
 #[derive(Clone)]
@@ -380,14 +423,26 @@ impl<CpuImpl: Cpu + Clone> ProcessorControl<CpuImpl> {
     fn possible(&self, processor: ProcessorId) -> bool {
         usize::from(processor.id()) < self.group.possible_processors()
     }
+}
 
-    /// Takes `processor` offline: it runs its teardown steps, hands its
-    /// pending timers and queued global work to the processor this
-    /// call runs on, and stops through [`Cpu::stop_current`].
+impl<CpuImpl: Cpu + Clone> ProcessorLifecycle for ProcessorControl<CpuImpl> {
+    fn possible_processors(&self) -> usize {
+        self.group.possible_processors()
+    }
+
+    fn bootstrap_processor(&self) -> ProcessorId {
+        self.cpu.bootstrap_processor()
+    }
+
+    fn is_online(&self, processor: ProcessorId) -> bool {
+        self.online_set().contains(processor)
+    }
+
+    /// Takes `processor` offline through [`Cpu::stop_current`].
     ///
     /// Refused with [`OfflineError::Refused`] when the processor still
     /// runs work pinned to it, which leaves it online and unchanged.
-    pub async fn offline(&self, processor: ProcessorId) -> Result<(), OfflineError> {
+    async fn offline(&self, processor: ProcessorId) -> Result<(), OfflineError> {
         if !self.possible(processor) {
             return Err(OfflineError::NotPossible {
                 processor,
@@ -429,10 +484,9 @@ impl<CpuImpl: Cpu + Clone> ProcessorControl<CpuImpl> {
         }
     }
 
-    /// Brings `processor` online: restarts it when it was taken offline,
-    /// starts it when it has never run, and returns once it has run its
-    /// bring-up steps and joined the online set.
-    pub async fn online(&self, processor: ProcessorId) -> Result<(), OnlineError> {
+    /// Restarts `processor` when it was taken offline and starts it
+    /// when it has never run.
+    async fn online(&self, processor: ProcessorId) -> Result<(), OnlineError> {
         if !self.possible(processor) {
             return Err(OnlineError::NotPossible {
                 processor,

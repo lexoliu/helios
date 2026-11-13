@@ -2246,6 +2246,9 @@ pub(super) fn wasix_proc_spawn_inherited_non_directory_authority(
     // The observation right follows the shell the same way: the programs
     // a launcher runs through `dash` observe the machine as it does.
     authority.grant_diagnostic_rights(parent.diagnostic_rights());
+    // So does the right to control processors: `cpu` run from the
+    // launcher's shell acts with the launcher's authority.
+    authority.grant_machine_rights(parent.machine_rights());
     authority
 }
 
