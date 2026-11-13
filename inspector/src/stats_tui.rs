@@ -582,12 +582,44 @@ fn draw_memory_panel(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats:
             Span::raw(memory.free_detail()),
         ]),
     ];
+    lines.extend(node_lines(sample));
     lines.extend(balloon_lines(sample));
     lines.extend(swap_lines(sample));
     let details = Paragraph::new(Text::from(lines))
         .block(Block::default().title("Memory").borders(Borders::ALL))
         .wrap(Wrap { trim: true });
     frame.render_widget(details, layout[2]);
+}
+
+/// How the user pool is split across NUMA nodes, one line per node.
+///
+/// A machine with one node reports one record that repeats the gauges
+/// above it, so nothing is drawn for it. The off-node count is the number
+/// worth seeing: a node whose processors keep being served from another
+/// node has run its own memory out.
+fn node_lines(sample: &stats::Sample) -> Vec<Line<'static>> {
+    if sample.memory.nodes.len() < 2 {
+        return Vec::new();
+    }
+    sample
+        .memory
+        .nodes
+        .iter()
+        .map(|node| {
+            Line::from(vec![
+                Span::styled(
+                    format!("node {:<4}", node.id),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::raw(format!(
+                    "{} free of {}, {} off-node",
+                    format_bytes(node.available_bytes),
+                    format_bytes(node.total_bytes),
+                    node.off_node_allocations
+                )),
+            ])
+        })
+        .collect()
 }
 
 /// What the host is holding through the memory balloon, on a machine
@@ -1141,5 +1173,78 @@ fn memory_pressure_label(pressure: MemoryPressure) -> &'static str {
         MemoryPressure::Elevated => "elevated",
         MemoryPressure::High => "high",
         MemoryPressure::Critical => "critical",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample(nodes: Vec<stats::MemoryNode>) -> stats::Sample {
+        stats::Sample {
+            timestamp: 0,
+            uptime: 0,
+            wall_clock: 0,
+            processors: stats::Processors {
+                configured: 0,
+                online: 0,
+                utilization: Vec::new(),
+                guest_isa_level: String::new(),
+                guest_isa_extras: Vec::new(),
+            },
+            memory: stats::Memory {
+                total_bytes: 0,
+                available_bytes: 0,
+                pressure: MemoryPressure::Nominal,
+                nodes,
+            },
+            block: None,
+            iommu: None,
+            balloon: None,
+            swap: None,
+            host_share: None,
+            network: None,
+            devices: Vec::new(),
+            inputs: Vec::new(),
+            audio: Vec::new(),
+        }
+    }
+
+    fn node(id: u32, total_bytes: u64, available_bytes: u64, off: u64) -> stats::MemoryNode {
+        stats::MemoryNode {
+            id,
+            total_bytes,
+            available_bytes,
+            off_node_allocations: off,
+        }
+    }
+
+    fn text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn a_single_node_draws_no_node_lines() {
+        assert!(node_lines(&sample(vec![node(0, 1 << 30, 1 << 29, 0)])).is_empty());
+        assert!(node_lines(&sample(Vec::new())).is_empty());
+    }
+
+    #[test]
+    fn each_node_gets_a_line_with_its_own_numbers() {
+        let lines = node_lines(&sample(vec![
+            node(0, 1 << 30, 1 << 29, 0),
+            node(1, 2 << 30, 1 << 20, 12),
+        ]));
+        let lines: Vec<_> = lines.iter().map(text).collect();
+        assert_eq!(
+            lines,
+            [
+                "node 0   512.0 MiB free of 1.0 GiB, 0 off-node",
+                "node 1   1.0 MiB free of 2.0 GiB, 12 off-node",
+            ]
+        );
     }
 }

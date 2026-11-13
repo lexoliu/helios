@@ -5,7 +5,7 @@ version = 4
 [[package]]
 name = "acpi"
 version = "7.0.0-pre1"
-source = "git+https://github.com/lexoliu/acpi?branch=aml-notify-handler#a85ab3c933741d69a6a4241184b16e845740fdd2"
+source = "git+https://github.com/lexoliu/acpi?branch=helios#66a72c1d9418d18a9723b4a6123de3e4014189f4"
 dependencies = [
  "bit_field",
  "bitflags 2.13.1",
@@ -545,15 +545,6 @@ dependencies = [
  "futures-io",
  "futures-lite",
  "piper",
-]
-
-[[package]]
-name = "buddy_system_allocator"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b672b945a3e4f4f40bfd4cd5ee07df9e796a42254ce7cd6d2599ad969244c44a"
-dependencies = [
- "spin 0.10.1",
 ]
 
 [[package]]
@@ -1971,11 +1962,13 @@ dependencies = [
  "fdt",
  "helios-acpi",
  "helios-artifact",
+ "helios-firmware",
  "helios-hal",
  "helios-kernel",
  "helios-tpm",
  "helios-virtio",
  "limine 0.6.5",
+ "r-efi 7.1.0",
  "smccc",
  "spin 0.12.3",
  "thiserror 2.0.21",
@@ -2205,6 +2198,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "helios-firmware"
+version = "0.1.0"
+dependencies = [
+ "acpi",
+ "arrayvec",
+ "fdt",
+ "helios-hal",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "helios-gpu-test"
 version = "0.1.0"
 dependencies = [
@@ -2350,7 +2354,6 @@ dependencies = [
  "async-task",
  "atomic-waker",
  "bitflags 2.13.1",
- "buddy_system_allocator",
  "bytes",
  "concurrent-queue",
  "crc",
@@ -2464,6 +2467,7 @@ dependencies = [
  "bytes",
  "critical-section",
  "fdt",
+ "helios-firmware",
  "helios-hal",
  "helios-kernel",
  "helios-virtio",
@@ -2582,6 +2586,7 @@ dependencies = [
  "critical-section",
  "helios-acpi",
  "helios-artifact",
+ "helios-firmware",
  "helios-hal",
  "helios-kernel",
  "helios-tpm",
@@ -4176,6 +4181,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
+name = "r-efi"
+version = "7.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b0ff379dd174eec5b2cab797063a2e7592dfcf0bf0323a50eeee724ee3537f13"
+
+[[package]]
 name = "radium"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4988,12 +4999,6 @@ checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
 dependencies = [
  "lock_api",
 ]
-
-[[package]]
-name = "spin"
-version = "0.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "023a211cb3138dbc438680b32560ad89f699977624c9f8dbb95a47d5b4c07dd3"
 
 [[package]]
 name = "spin"

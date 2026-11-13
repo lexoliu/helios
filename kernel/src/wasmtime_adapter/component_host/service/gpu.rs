@@ -1366,7 +1366,11 @@ pub(crate) mod test_store {
             .expect("the fixture CPU has an entropy source"),
         ));
         configure(&runtime_state);
-        let executor = Executor::new(ProgressCounter::new(), 1, ProcessorId::new(0));
+        let executor = Executor::new(
+            ProgressCounter::new(),
+            crate::test_support::single_node_pool(1),
+            ProcessorId::new(0),
+        );
         let registry = InstanceRegistry::new();
         let instance = registry.register("gpu-store", 0);
         ComponentStoreData::new(
@@ -1375,7 +1379,7 @@ pub(crate) mod test_store {
             executor.timer(cpu),
             executor
                 .spawner(cpu)
-                .instance_spawner(TaskFunding::Instance),
+                .instance_spawner(TaskFunding::Instance, &instance),
             runtime_state.clone(),
             registry,
             instance,

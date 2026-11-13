@@ -544,7 +544,7 @@ impl Executor {
         // later is not kept across an await, and would not count): the
         // freezer is the processor that polls this first, and its task
         // must stay on that processor's own queue (`spawn_local`), never
-        // in the global queue another processor could pop it from.
+        // in a node queue another processor could pop it from.
         let processor_local = PhantomData::<*mut ()>;
         let group = self.group();
         let barrier = &group.freeze;

@@ -2164,6 +2164,18 @@ where
         }
     }
 
+    /// Whether `packet` would move this connection out of `SYN-RECEIVED`:
+    /// an ACK, not a RST, of exactly the SYN-ACK this socket sent.
+    ///
+    /// Lets the stack decide whether it can take the connection on before
+    /// the segment is applied, since applying it is irreversible.
+    pub(crate) fn completes_handshake(&self, packet: TcpPacket<'_>) -> bool {
+        self.state == TcpState::SynReceived
+            && packet.flags.contains(TcpFlags::ACK)
+            && !packet.flags.contains(TcpFlags::RST)
+            && packet.acknowledgement == self.send_next
+    }
+
     pub fn on_segment(
         &mut self,
         packet: TcpPacket<'_>,
@@ -2237,7 +2249,7 @@ where
                 TcpSegmentOutcome::default()
             }
             TcpState::SynReceived if packet.flags.contains(TcpFlags::ACK) => {
-                if packet.acknowledgement != self.send_next {
+                if !self.completes_handshake(packet) {
                     return TcpSegmentOutcome {
                         reset: self.unacceptable_ack_reset(packet.acknowledgement),
                         ..TcpSegmentOutcome::default()

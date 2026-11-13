@@ -4,8 +4,8 @@ use crate::bindings::helios::system::stats as raw;
 pub use crate::bindings::helios::system::stats::subscribe;
 pub use crate::bindings::helios::system::stats::{
     AudioStream, BlockDevice, GrantedDevice, HostShareCache, InputDevice, Iommu, IommuEndpoint,
-    Memory, MemoryBalloon, MemoryPressure, MonoNanos, Network, NetworkQueue, Permille, Processor,
-    Processors, Sample, Swap,
+    Memory, MemoryBalloon, MemoryNode, MemoryPressure, MonoNanos, Network, NetworkQueue, Permille,
+    Processor, Processors, Sample, Swap,
 };
 
 /// Returns the latest coherent system statistics snapshot.
