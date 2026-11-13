@@ -22,6 +22,7 @@ use helios_inspector_protocol::system::stats;
 use helios_profdata::{
     KernelProfileStore, KernelProfileStoreError, ProfileDigest, ProfileUseError,
 };
+use helios_workspace_root::root_key::{ROOT_PUBLIC_FILE, ROOT_SECRET_FILE};
 use helios_workspace_root::{WorkspaceRoot, WorkspaceRootError};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
@@ -46,6 +47,7 @@ mod network;
 mod qemu;
 mod qmp;
 mod raw_profile;
+mod root_secret_scan;
 mod tpm;
 mod vcpu_state;
 mod x86_image_audit;
@@ -221,6 +223,8 @@ pub(crate) enum VmBuildError {
     Tool(#[from] ToolDiscoveryError),
     #[error("{0}")]
     WorkspaceRoot(#[from] WorkspaceRootError),
+    #[error("{0}")]
+    RootSecretScan(#[from] root_secret_scan::RootSecretScanError),
     #[error("{0}")]
     X86ImageAudit(#[from] x86_image_audit::X86ImageAuditError),
 }
@@ -2487,6 +2491,15 @@ impl KernelBuildSpec {
             .join(self.kind.directory())
             .join(self.profile.kernel_artifact_name))
     }
+
+    /// The root secret key this build's prebuild signs with: the file
+    /// `--root-secret-key` names, else the one the prebuild directory holds.
+    fn root_secret_key_path(&self) -> Result<PathBuf, WorkspaceRootError> {
+        match &self.root_secret_key {
+            Some(path) => Ok(path.clone()),
+            None => Ok(kernel_prebuild_dir(self)?.join(ROOT_SECRET_FILE)),
+        }
+    }
 }
 
 fn debug_shortcut(command: &VmCommand, file: &VmConfigFile) -> bool {
@@ -3122,6 +3135,9 @@ fn build_vm(command: &KernelBuildSpec) -> Result<(), VmBuildError> {
     } else {
         run_step(&kernel_label, &mut kernel_build)?;
     }
+    // The image carries the public key alone; the secret this build's
+    // prebuild signed with must not be anywhere in it.
+    root_secret_scan::scan_image(&command.kernel_path()?, &command.root_secret_key_path()?)?;
     if command.profile.arch == VmArch::X86_64 && command.kind.audited_for_legacy_encoding() {
         x86_image_audit::audit(&command.kernel_path()?)?;
     }
@@ -3357,7 +3373,7 @@ fn export_trusted_root_public_key<'a>(
 ) -> Result<&'a mut Command, WorkspaceRootError> {
     Ok(kernel_build.env(
         "HELIOS_KERNEL_ROOT_PUBLIC_KEY",
-        kernel_prebuild_dir(build)?.join("helios-root-public.key"),
+        kernel_prebuild_dir(build)?.join(ROOT_PUBLIC_FILE),
     ))
 }
 
