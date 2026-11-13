@@ -3205,13 +3205,13 @@ where
 /// shape. One registration therefore serves the debugger and program
 /// worlds, and the whole interface is registered, so neither can
 /// instantiate against a missing function.
-fn add_settings_to_linker<CpuImpl, Net, HostFs>(
-    linker: &mut Linker<StoreData<CpuImpl, Net, HostFs>>,
+fn add_settings_to_linker<CpuImpl, Net, StorageImpl>(
+    linker: &mut Linker<StoreData<CpuImpl, Net, StorageImpl>>,
 ) -> wasmtime::Result<()>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     use settings::{SettingView, ValueView, WriteErrorView};
     use wasmtime::AsContext;

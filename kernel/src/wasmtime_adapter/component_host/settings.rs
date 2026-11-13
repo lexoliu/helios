@@ -48,13 +48,13 @@ pub(super) enum WriteRefusal {
 }
 
 /// The proof that the caller may write settings.
-fn write_settings<CpuImpl, Net, HostFs>(
-    data: &StoreData<CpuImpl, Net, HostFs>,
+fn write_settings<CpuImpl, Net, StorageImpl>(
+    data: &StoreData<CpuImpl, Net, StorageImpl>,
 ) -> Result<WriteSettingsCap, WriteRefusal>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     data.process_authority()
         .derive_write_settings_cap()
@@ -62,40 +62,40 @@ where
 }
 
 /// `settings.list`.
-pub(super) fn list<CpuImpl, Net, HostFs>(
-    data: &StoreData<CpuImpl, Net, HostFs>,
+pub(super) fn list<CpuImpl, Net, StorageImpl>(
+    data: &StoreData<CpuImpl, Net, StorageImpl>,
 ) -> [SettingEntry; SETTING_COUNT]
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     data.runtime_state.settings().entries()
 }
 
 /// `settings.read`, after the name is decoded.
-pub(super) fn read<CpuImpl, Net, HostFs>(
-    data: &StoreData<CpuImpl, Net, HostFs>,
+pub(super) fn read<CpuImpl, Net, StorageImpl>(
+    data: &StoreData<CpuImpl, Net, StorageImpl>,
     name: &str,
 ) -> Option<SettingEntry>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     data.runtime_state.settings().read_by_name(name)
 }
 
 /// `settings.write`, after the name is decoded.
-pub(super) fn write<CpuImpl, Net, HostFs>(
-    data: &StoreData<CpuImpl, Net, HostFs>,
+pub(super) fn write<CpuImpl, Net, StorageImpl>(
+    data: &StoreData<CpuImpl, Net, StorageImpl>,
     name: &str,
     value: SettingValue,
 ) -> Result<SettingValue, WriteRefusal>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let proof = write_settings(data)?;
     data.runtime_state
@@ -199,13 +199,13 @@ impl From<WriteRefusal> for WriteErrorView {
 }
 
 /// The listing as the one list the call hands back.
-pub(super) fn listing<CpuImpl, Net, HostFs>(
-    data: &StoreData<CpuImpl, Net, HostFs>,
+pub(super) fn listing<CpuImpl, Net, StorageImpl>(
+    data: &StoreData<CpuImpl, Net, StorageImpl>,
 ) -> Vec<SettingView>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     list(data).into_iter().map(SettingView::from).collect()
 }
