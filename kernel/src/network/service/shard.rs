@@ -192,6 +192,9 @@ pub(super) struct NetworkShard {
     /// Where this shard draws ephemeral ports and DNS question ids
     /// from. Touched only under the shard's lock.
     pub(super) entropy: ShardEntropy,
+    /// Where an outbound TCP connect's walk starts (RFC 6056 §3.3.3).
+    /// Touched only under the shard's lock.
+    pub(super) connect_ports: ConnectPortSelector,
     pub(super) tcp_streams: HandleSlab<helios_netstack::SocketId, MAX_TCP_STREAM_HANDLES>,
     pub(super) tcp_listeners: HandleSlab<TcpListenerState, MAX_TCP_LISTENER_HANDLES>,
     pub(super) udp_sockets: HandleSlab<UdpSocketState, MAX_UDP_SOCKET_HANDLES>,
@@ -1035,11 +1038,14 @@ impl NetworkShard {
             "DHCP internal UDP socket slot changed"
         );
         let dhcp = DhcpClient::new(stack.config().mac, transaction_id);
+        let mut entropy = ShardEntropy::derive(root_entropy, shard_idx);
+        let connect_ports = ConnectPortSelector::new(&mut entropy);
         Self {
             stack,
             shard_idx,
             shard_count,
-            entropy: ShardEntropy::derive(root_entropy, shard_idx),
+            entropy,
+            connect_ports,
             tcp_streams: HandleSlab::new(),
             tcp_listeners: HandleSlab::new(),
             udp_sockets,
@@ -1131,13 +1137,35 @@ impl NetworkShard {
     }
 
     /// A walk over every port in this shard's window, from a random
-    /// starting point (RFC 6056 §3.3.1). An allocation takes the first
-    /// port it finds suitable, and gives up only after the whole window
-    /// has been tried.
+    /// starting point (RFC 6056 §3.3.1), for an allocation with no peer
+    /// whose four-tuple a previous use could leave held: a UDP socket
+    /// or a listener. An allocation takes the first port it finds
+    /// suitable, and gives up only after the whole window has been
+    /// tried. An outbound TCP connect uses
+    /// [`Self::connect_walk`] instead.
     pub(super) fn ephemeral_walk(&mut self) -> EphemeralWalk {
         let (first, last) = self.ephemeral_window();
         let offset = self.entropy.below(EphemeralWalk::window_len(first, last));
         EphemeralWalk::starting_at(first, last, offset)
+    }
+
+    /// The walk over this shard's window for an outbound TCP connect to
+    /// `request`'s destination (RFC 6056 §3.3.3), and the counter to
+    /// [`Self::connect_taken`] once a port is taken.
+    pub(super) fn connect_walk(&self, request: &TcpConnectRequest) -> (EphemeralWalk, ConnectSlot) {
+        let (first, last) = self.ephemeral_window();
+        self.connect_ports.walk(
+            first,
+            last,
+            request.local,
+            request.destination,
+            request.port,
+        )
+    }
+
+    /// Records that a connect which started at `walk` took `port`.
+    pub(super) fn connect_taken(&mut self, slot: ConnectSlot, walk: &EphemeralWalk, port: u16) {
+        self.connect_ports.advance(slot, walk, walk.steps_to(port));
     }
 
     pub(super) fn add_ipv4_address(
