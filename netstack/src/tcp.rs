@@ -2008,12 +2008,10 @@ where
                     return TcpSegmentOutcome::default();
                 }
                 self.set_state(TcpState::Closed, TcpStateChangeReason::SynSentReset);
+                // A reset is not a timeout: the controller is told
+                // nothing, and the outcome reports where it stands.
                 TcpSegmentOutcome {
-                    recovery: Some(
-                        self.congestion.on_congestion_event(
-                            CongestionEvent::RetransmissionTimeout { now_nanos },
-                        ),
-                    ),
+                    recovery: Some(self.congestion_state()),
                     readable: false,
                     receive_backpressure: false,
                     reset: None,
@@ -2120,9 +2118,7 @@ where
                     if packet.sequence == self.receive_next {
                         self.set_state(TcpState::Closed, TcpStateChangeReason::PeerReset);
                         return TcpSegmentOutcome {
-                            recovery: Some(self.congestion.on_congestion_event(
-                                CongestionEvent::RetransmissionTimeout { now_nanos },
-                            )),
+                            recovery: Some(self.congestion_state()),
                             readable: false,
                             receive_backpressure: false,
                             reset: None,
@@ -2537,6 +2533,14 @@ where
             now_nanos,
             app_limited,
         }))
+    }
+
+    /// The congestion controller's current window and pacing rate.
+    fn congestion_state(&self) -> RecoveryAction {
+        RecoveryAction {
+            cwnd: self.congestion.congestion_window(),
+            pacing_rate: self.congestion.pacing_rate(),
+        }
     }
 
     fn note_duplicate_ack(&mut self, now_nanos: u64) -> Option<RecoveryAction> {
@@ -3344,7 +3348,8 @@ fn min_deadline(left: Option<u64>, right: Option<u64>) -> Option<u64> {
 mod tests {
     use super::*;
     use crate::{
-        BbrV3, CongestionWindow, Ipv4Address, PacingRate, TcpOptions, TcpSackBlock, TcpSackBlocks,
+        BbrV3, CongestionWindow, Ipv4Address, NewReno, PacingRate, TcpOptions, TcpSackBlock,
+        TcpSackBlocks,
     };
 
     /// Test fixture that derives the owning `Bytes` payload from a
@@ -3888,6 +3893,41 @@ mod tests {
         assert!(retransmit.retransmission);
         assert_eq!(retransmit.header.sequence, data.header.sequence);
         assert_eq!(retransmit.payload, data.payload);
+    }
+
+    #[test]
+    fn a_peer_reset_leaves_the_congestion_window_alone() {
+        let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, NewReno::new(1460));
+        socket.mark_syn_queued(0);
+        let _ = deliver_segment(
+            &mut socket,
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 100,
+                acknowledgement: 8,
+                flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                window_size: u16::MAX,
+                options: TcpOptions::empty(),
+                payload: &[],
+            },
+            TCP_INITIAL_RTO_NANOS,
+        );
+        socket.mark_ack_queued();
+        let window = socket.congestion().congestion_window();
+
+        let outcome = deliver_segment(
+            &mut socket,
+            TcpPacket {
+                flags: TcpFlags::RST,
+                ..peer_ack(8, u16::MAX)
+            },
+            TCP_INITIAL_RTO_NANOS + 1,
+        );
+        assert_eq!(socket.state(), TcpState::Closed);
+        // A reset ends the connection; it says nothing about the path.
+        assert_eq!(outcome.recovery.map(|action| action.cwnd), Some(window));
+        assert_eq!(socket.congestion().congestion_window(), window);
     }
 
     #[test]
