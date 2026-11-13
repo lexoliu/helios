@@ -117,7 +117,7 @@ struct RuntimeStateInner<ProgramService, NetworkService, StorageImpl: Storage> {
     /// device up. Empty on a machine with no vsock device, where the
     /// runtime adapter answers `unavailable` rather than trapping.
     vsock_service: Once<ComponentHostVsockService>,
-    futex_table: Mutex<FutexTable>,
+    futex_table: FutexTable,
     /// The user payload the backend handed the kernel — init component,
     /// `argv0`, and the boot filesystem it carries — parsed from the
     /// boot module at bring-up.
@@ -364,7 +364,7 @@ where
                 compositor: ProviderSlot::new(),
                 audio_service: Once::new(),
                 vsock_service: Once::new(),
-                futex_table: Mutex::new(FutexTable::new()),
+                futex_table: FutexTable::new(),
                 payload,
                 namespace: Namespace::new(MountTable::new(
                     BootFs::new(payload.bootfs(), BOOT_DEVICE),
@@ -1159,19 +1159,15 @@ where
     }
 
     pub fn prepare_futex_wait(&self, key: FutexKey) -> FutexWaitRegistration {
-        self.inner.futex_table.lock().prepare_wait(key)
-    }
-
-    pub fn complete_futex_wait(&self, registration: FutexWaitRegistration) {
-        self.inner.futex_table.lock().complete_wait(registration);
+        self.inner.futex_table.prepare_wait(key)
     }
 
     pub fn wake_futex(&self, key: FutexKey, count: usize) -> usize {
-        self.inner.futex_table.lock().wake(key, count)
+        self.inner.futex_table.wake(key, count)
     }
 
     pub fn wake_all_futex(&self, key: FutexKey) -> usize {
-        self.inner.futex_table.lock().wake_all(key)
+        self.inner.futex_table.wake_all(key)
     }
 
     /// The system component this payload carries, when this build would
