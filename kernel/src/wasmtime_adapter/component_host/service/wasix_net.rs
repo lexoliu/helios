@@ -2163,19 +2163,19 @@ where
             };
             let fdflags = caller.data().descriptors.fdflags(fd)?;
             let timeout = wasix_effective_socket_timeout(options.receive_timeout, fdflags);
-            // The stack hands the bytes up as an owned value: it may deliver
-            // them many polls from now, and a guest page it wrote then would
-            // not have been checked.
-            let bytes = match service.tcp_read(stream.id(), capacity, timeout).await {
-                Ok(Some(bytes)) => bytes,
-                Ok(None) => Bytes::new(),
-                Err(error) => {
-                    return Ok(p1_errno_from_tcp_error_for_fdflags(error, fdflags));
-                }
+            // The stack copies straight out of its receive queue into the
+            // guest's buffers, on this call's own poll, each page checked
+            // present in the step that writes it.
+            let ranges = memory.iov_ranges(&layout.iovs)?;
+            let mut buffer = memory.tcp_receive_buffer(&ranges);
+            let read = service
+                .tcp_read_into(stream.id(), &mut buffer, timeout)
+                .await;
+            let received = match p1_tcp_received(read)? {
+                Ok(received) => received,
+                Err(error) => return Ok(p1_errno_from_tcp_error_for_fdflags(error, fdflags)),
             };
-            memory
-                .write_iovs_from_bytes(&layout.iovs, &bytes, ret_size)
-                .await?;
+            memory.write_u32(ret_size, received).await?;
             memory.write_u16(ret_flags, 0).await?;
             Ok(p1::errno::SUCCESS)
         }
@@ -2890,6 +2890,79 @@ mod tests {
             read(30),
             Err(P1Stop::Errno(p1::errno::FAULT)),
             "the value of a record that starts inside memory but ends outside it"
+        );
+    }
+
+    /// An IPv4 address record that straddles a present page and one swap
+    /// has taken, at the end of a two-page memory.
+    fn ip4_record_over_an_evicted_page() -> (crate::memory::GuestSwap, GuestAddress) {
+        let mut swap = crate::memory::GuestSwap::new(2);
+        // The tag on page zero, the octets on page one.
+        let at = TEST_PAGE - WASIX_ADDR_IP_UNION_OFFSET as usize;
+        swap.bytes_mut()[at] = WASIX_ADDRESS_FAMILY_IP_INET4;
+        swap.bytes_mut()[TEST_PAGE..TEST_PAGE + 4].copy_from_slice(&[198, 51, 100, 7]);
+        swap.evict(1);
+        (swap, GuestAddress::wasm32(at as u32))
+    }
+
+    /// Reading a socket address whose octets are on a page that is out
+    /// waits for the page, asks for it, and once it is back decodes the
+    /// address the guest wrote, not the page's absence.
+    #[test]
+    fn an_address_on_an_evicted_page_reads_once_the_page_is_back() {
+        let (mut swap, record) = ip4_record_over_an_evicted_page();
+        let memory = Preview1AsyncMemory::over_swap(&swap);
+        let mut read = core::pin::pin!(wasix_read_addr_ip4(&memory, record));
+        assert!(poll_once(read.as_mut()).is_none(), "the read waits");
+        assert_eq!(swap.queued_faults(), 1, "the page was asked for");
+
+        swap.serve();
+        assert_eq!(
+            poll_once(read.as_mut()),
+            Some(Ok(crate::Ipv4Address::new([198, 51, 100, 7])))
+        );
+    }
+
+    /// The address's page cannot come back, so the call traps the guest.
+    #[test]
+    fn an_address_on_a_lost_page_traps_the_guest() {
+        let (mut swap, record) = ip4_record_over_an_evicted_page();
+        swap.fail_reads(1);
+        let memory = Preview1AsyncMemory::over_swap(&swap);
+        let mut read = core::pin::pin!(wasix_read_addr_ip4(&memory, record));
+        assert!(poll_once(read.as_mut()).is_none());
+        swap.serve();
+        assert_eq!(
+            poll_once(read.as_mut()),
+            Some(Err(P1Stop::Trap(crate::memory::SwapFaultError::Backend)))
+        );
+    }
+
+    /// A receive's source address lands on a page that was out once the
+    /// page is back, whole.
+    #[test]
+    fn a_peer_address_lands_on_an_evicted_page_once_it_is_back() {
+        let mut swap = crate::memory::GuestSwap::new(2);
+        swap.evict(1);
+        let memory = Preview1AsyncMemory::over_swap(&swap);
+        let at = GuestAddress::wasm32((TEST_PAGE - 4) as u32);
+        let peer = crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([203, 0, 113, 9]));
+        let mut write = core::pin::pin!(write_wasix_addr_port_async(&memory, at, Some(peer), 8080));
+        assert!(poll_once(write.as_mut()).is_none());
+        swap.serve();
+        assert_eq!(poll_once(write.as_mut()), Some(Ok(())));
+
+        let mut plain = vec![0_u8; 2 * TEST_PAGE];
+        run(write_wasix_addr_port_async(
+            &memory_over(&mut plain),
+            at,
+            Some(peer),
+            8080,
+        ))
+        .expect("in bounds");
+        assert!(
+            swap.bytes()[TEST_PAGE - 4..TEST_PAGE + 16] == plain[TEST_PAGE - 4..TEST_PAGE + 16],
+            "the record is the one a present page gets"
         );
     }
 }

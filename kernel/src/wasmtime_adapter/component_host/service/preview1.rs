@@ -2664,7 +2664,8 @@ where
 }
 
 /// Writes the bytes `layout` names in guest memory to the file `fd`,
-/// gathered one chunk at a time: at `at` when
+/// gathered straight into the filesystem's destination, one chunk at a
+/// time: at `at` when
 /// given (`fd_pwrite`, which leaves the offset alone), else at the
 /// descriptor's offset or, in append mode, at the end of the file, moving
 /// the offset past them.
@@ -2716,8 +2717,8 @@ where
     Ok(written)
 }
 
-/// A resolved file as what a gathered write lands in: each chunk, already
-/// read out of guest memory, is written through the resolved file.
+/// A resolved file as what a gathered write lands in: each chunk goes
+/// straight from guest memory into the file system's own destination.
 struct ResolvedFileChunks<'file, 'namespace, HostFs: crate::HostFileSystem> {
     file: &'file crate::vfs::Resolved<'namespace, HostFs>,
     now_nanos: u64,
@@ -2728,10 +2729,26 @@ impl<HostFs: crate::HostFileSystem> Preview1ChunkedFile for ResolvedFileChunks<'
 
     async fn land(
         &mut self,
-        chunk: &[u8],
+        memory: &Preview1AsyncMemory,
+        gather: &mut Preview1Gather,
         position: WritePosition,
-    ) -> Result<u64, fs_types::ErrorCode> {
-        wasi_fs::write_resolved(self.file, position, chunk, self.now_nanos).await
+        len: usize,
+    ) -> Result<Result<u64, fs_types::ErrorCode>, GuestAccessError> {
+        // The chunk's pages are brought in before the write is staged, so
+        // waiting on swap holds up this write and never the file; each
+        // round checks them again in the poll that fills it.
+        gather.bring_in(memory, len).await?;
+        let write =
+            match wasi_fs::prepare_resolved_write(self.file, position, len, self.now_nanos).await {
+                Ok(write) => write,
+                Err(refusal) => return Ok(Err(refusal)),
+            };
+        let landed = gather.submit_staged(memory, write).await?;
+        Ok(landed.map_err(wasi_fs::fs_error_code).and_then(|landed| {
+            landed
+                .checked_add(len as u64)
+                .ok_or(fs_types::ErrorCode::Overflow)
+        }))
     }
 }
 
@@ -4096,20 +4113,41 @@ where
     } else {
         u64::MAX
     };
-    // The stack hands the bytes up as an owned value: it may deliver them
-    // many polls from now, and a guest page it wrote then would not have
-    // been checked.
+    // The stack copies straight out of its receive queue into the guest's
+    // buffers, on this call's own poll, each page checked present in the
+    // step that writes it.
+    let ranges = memory.iov_ranges(&layout.iovs)?;
+    let mut buffer = memory.tcp_receive_buffer(&ranges);
     let service_started = p1_kernel_profile_start(caller.data());
-    let bytes = match service.tcp_read(stream, capacity, timeout).await {
-        Ok(Some(bytes)) => bytes,
-        Ok(None) => Bytes::new(),
+    let received = p1_tcp_received(service.tcp_read_into(stream, &mut buffer, timeout).await);
+    p1_record_optional_kernel_profile(caller.data(), "sock_recv_tcp_read", service_started);
+    let received = match received? {
+        Ok(received) => received,
         Err(error) => return Ok(p1_errno_from_tcp_error_for_fdflags(error, fdflags)),
     };
-    p1_record_optional_kernel_profile(caller.data(), "sock_recv_tcp_read", service_started);
     let write_started = p1_kernel_profile_start(caller.data());
-    let status = p1_write_received(&memory, &layout.iovs, &bytes, ro_datalen, ro_flags).await;
+    memory.write_u32(ro_datalen, received).await?;
+    memory.write_u16(ro_flags, 0).await?;
     p1_record_optional_kernel_profile(caller.data(), "sock_recv_write_iovs", write_started);
-    status
+    Ok(p1::errno::SUCCESS)
+}
+
+/// The byte count a read into a guest's registered buffer delivered, or
+/// the stream's error for the caller to answer with its errno; a buffer
+/// page that could not come back from swap traps the guest.
+pub(super) fn p1_tcp_received(
+    read: Result<crate::TcpReadInto, crate::TcpError>,
+) -> Result<Result<u32, crate::TcpError>, P1Stop> {
+    let received = match read {
+        Ok(crate::TcpReadInto::Data(received)) => received,
+        Ok(crate::TcpReadInto::Eof) => 0,
+        Ok(crate::TcpReadInto::PageLost(error)) => return Err(P1Stop::Trap(error)),
+        Err(error) => return Ok(Err(error)),
+    };
+    // The buffer's capacity is the iovecs' sum, which fits a `u32`.
+    Ok(Ok(u32::try_from(received).expect(
+        "a TCP read delivers no more than its buffer, whose length fits a u32",
+    )))
 }
 
 /// Hands a receive's `bytes` to the guest: scattered over its buffers, the
@@ -6094,14 +6132,19 @@ mod tests {
     impl Preview1ChunkedFile for ChunkedFile {
         type Refusal = i32;
 
-        async fn land(&mut self, chunk: &[u8], position: WritePosition) -> Result<u64, i32> {
-            let len = chunk.len();
+        async fn land(
+            &mut self,
+            memory: &Preview1AsyncMemory,
+            gather: &mut Preview1Gather,
+            position: WritePosition,
+            len: usize,
+        ) -> Result<Result<u64, i32>, GuestAccessError> {
             if self.positions.len() == 1 {
                 self.bytes.extend_from_slice(self.other_writer);
             }
             self.positions.push(position);
             if self.accepts == 0 {
-                return Err(p1::errno::IO);
+                return Ok(Err(p1::errno::IO));
             }
             self.accepts -= 1;
             let at = match position {
@@ -6111,8 +6154,8 @@ mod tests {
             if self.bytes.len() < at + len {
                 self.bytes.resize(at + len, 0);
             }
-            self.bytes[at..at + len].copy_from_slice(chunk);
-            Ok((at + len) as u64)
+            gather.fill(memory, &mut self.bytes[at..at + len]).await?;
+            Ok(Ok((at + len) as u64))
         }
     }
 
@@ -6211,5 +6254,68 @@ mod tests {
         .expect("the guest's pages are present");
         assert_eq!(landed, Ok((4, 0)));
         assert_eq!(file.positions, [WritePosition::End]);
+    }
+
+    /// A receive whose buffers run from a present page onto one swap has
+    /// taken, over a memory with its count and flags slots on page zero.
+    fn receive_over_an_evicted_page() -> (crate::memory::GuestSwap, [(u32, u32); 2], Vec<u8>) {
+        let mut swap = crate::memory::GuestSwap::new(3);
+        swap.evict(2);
+        let iovs = [
+            ((TEST_PAGE + 100) as u32, 100),
+            ((2 * TEST_PAGE) as u32, 200),
+        ];
+        (swap, iovs, cjk_bytes(300))
+    }
+
+    /// The scatter of a receive waits for a buffer page that is out
+    /// rather than writing it, asks for it, and once it is back lands
+    /// every byte, the count and the flags.
+    #[test]
+    fn a_receive_into_an_evicted_buffer_page_lands_once_the_page_is_back() {
+        let (mut swap, iovs, payload) = receive_over_an_evicted_page();
+        let memory = Preview1AsyncMemory::over_swap(&swap);
+        let mut write = core::pin::pin!(p1_write_received(
+            &memory,
+            &iovs,
+            &payload,
+            GuestAddress::wasm32(0),
+            GuestAddress::wasm32(8),
+        ));
+        assert!(poll_once(write.as_mut()).is_none(), "the scatter waits");
+        assert_eq!(swap.queued_faults(), 1, "the page was asked for");
+        assert!(swap.is_out(2));
+
+        swap.serve();
+        assert_eq!(poll_once(write.as_mut()), Some(Ok(p1::errno::SUCCESS)));
+        let bytes = swap.bytes();
+        assert!(bytes[TEST_PAGE + 100..TEST_PAGE + 200] == payload[..100]);
+        assert!(bytes[2 * TEST_PAGE..2 * TEST_PAGE + 200] == payload[100..]);
+        assert_eq!(bytes[0..4], 300_u32.to_le_bytes());
+        assert_eq!(bytes[8..10], [0, 0]);
+    }
+
+    /// A buffer page that cannot come back traps the guest instead of
+    /// answering it an errno.
+    #[test]
+    fn a_receive_into_a_lost_buffer_page_traps_the_guest() {
+        let (mut swap, iovs, payload) = receive_over_an_evicted_page();
+        swap.fail_reads(1);
+        let memory = Preview1AsyncMemory::over_swap(&swap);
+        let mut write = core::pin::pin!(p1_write_received(
+            &memory,
+            &iovs,
+            &payload,
+            GuestAddress::wasm32(0),
+            GuestAddress::wasm32(8),
+        ));
+        assert!(poll_once(write.as_mut()).is_none());
+        swap.serve();
+        let stop = poll_once(write.as_mut()).expect("the scatter ends");
+        assert_eq!(
+            stop,
+            Err(P1Stop::Trap(crate::memory::SwapFaultError::Backend))
+        );
+        assert!(p1_reply(stop).is_err(), "the guest traps");
     }
 }

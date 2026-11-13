@@ -2249,16 +2249,21 @@ where
                 0
             },
         };
-        let memory = store.data().memory();
-        let written = write_shared_memory(memory, GuestAddress::wasm32(wasm_ptr), wasm)
-            .and_then(|()| write_shared_memory(memory, GuestAddress::wasm32(target_ptr), target))
-            .and_then(|()| {
-                write_shared_memory(
-                    memory,
-                    GuestAddress::wasm32(request_ptr),
-                    &header.to_bytes(),
-                )
-            });
+        // The instance is off every processor between its calls, so the
+        // request is written during one of its turns (`in_guest_turn`).
+        let memory = Preview1AsyncMemory::of_shared(store.data().memory());
+        let written = in_guest_turn(store.data().guest_turns(), async {
+            memory
+                .write_bytes(GuestAddress::wasm32(wasm_ptr), wasm)
+                .await?;
+            memory
+                .write_bytes(GuestAddress::wasm32(target_ptr), target)
+                .await?;
+            memory
+                .write_bytes(GuestAddress::wasm32(request_ptr), &header.to_bytes())
+                .await
+        })
+        .await;
         if let Err(error) = written {
             return Ok(Err(error));
         }
@@ -2285,13 +2290,10 @@ where
             0
         };
         let response_ptr = response_ptr.map_err(map_program_runtime_error)? as u32;
-        Ok(accept_compiler_response(
-            store.data(),
-            allocations,
-            response_ptr,
-            profile,
-            phases,
-        ))
+        Ok(
+            accept_compiler_response(store.data(), allocations, response_ptr, profile, phases)
+                .await,
+        )
     }
 
     fn read_compiler_plugin_artifact(
@@ -3746,11 +3748,6 @@ mod tests {
             assert!(
                 preview1_read_memory_into(memory, field, &mut bytes).is_err(),
                 "{family}: read at u32::MAX - 2 + {offset} must fail",
-            );
-            assert_eq!(
-                preview1_read_u32(memory, field).map_err(|error| error.detail),
-                Err(ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds),
-                "{family}: u32 read must be out of bounds",
             );
         }
         assert!(

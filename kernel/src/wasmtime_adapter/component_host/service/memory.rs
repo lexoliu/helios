@@ -1,7 +1,9 @@
+use helios_hal::fs::{FsResult, PreparedWrite, WriteProgress};
 use helios_hal::vmm::{VirtAddr, VirtRange};
 use thiserror::Error;
 
 use super::*;
+use crate::RegisteredTcpReadBuffer;
 use crate::memory::{GuestResidency, SwapFaultError};
 
 pub(super) struct Preview1IovLayout {
@@ -10,6 +12,11 @@ pub(super) struct Preview1IovLayout {
     /// preview1's `size`, by construction.
     pub(super) byte_len: u32,
 }
+
+/// The `(offset, len)` spans of linear memory a guest's iovecs name, in
+/// the order they fill, each checked to lie inside that memory
+/// ([`Preview1AsyncMemory::iov_ranges`]).
+pub(super) struct Preview1IovRanges(SmallVec<[(usize, usize); 8]>);
 
 #[derive(Clone, Copy)]
 pub(super) struct Preview1Memory {
@@ -86,12 +93,74 @@ pub(super) fn p1_reply(answer: Result<i32, P1Stop>) -> wasmtime::Result<i32> {
     }
 }
 
+/// Runs `access` during one turn of the store that owns the memory it
+/// reaches, for a kernel path that reaches guest memory between the
+/// guest's calls: the WASIX asyncify driver and the compiler plugin's
+/// request and response.
+///
+/// Between calls the instance is off every processor, so swap may take
+/// any of its pages, and a check found true there would not hold for the
+/// copy that follows it. Inside `turns.drive` the instance is on a
+/// processor for each poll, which is what keeps a page present from the
+/// accessor's check to its copy (`crate::memory::swap`). A lost page is
+/// reported the way a host call's trap over one is; a stop or kill the
+/// turn meets is the drive's own error.
+pub(super) async fn in_guest_turn<CpuImpl, RuntimeStateImpl, Epilogue, Value>(
+    turns: crate::component::GuestTurns<CpuImpl, RuntimeStateImpl, Epilogue>,
+    access: impl Future<Output = Result<Value, GuestAccessError>>,
+) -> Result<Value, ProgramExecError>
+where
+    CpuImpl: Cpu + Clone,
+    RuntimeStateImpl: crate::ComponentRuntimeState,
+    Epilogue: crate::component::TurnEpilogue<RuntimeStateImpl, wasmtime::Error>,
+{
+    let driven = turns
+        .drive(async { Ok::<_, wasmtime::Error>(access.await) })
+        .await
+        .map_err(map_program_runtime_error)?;
+    driven.map_err(|error| match error {
+        GuestAccessError::OutOfBounds => ProgramExecError {
+            kind: ProgramExecErrorKind::InvalidBinary,
+            detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
+        },
+        GuestAccessError::Swap(error) => map_program_runtime_error(wasmtime::Error::new(error)),
+    })
+}
+
 impl Preview1AsyncMemory {
     pub(super) fn new(memory: Preview1Memory) -> Self {
         Self {
             memory,
             residency: GuestResidency::installed(),
         }
+    }
+
+    /// The linear memory `instance` exports, or the shared memory its
+    /// store imported when it exports none.
+    pub(super) fn of_instance<CpuImpl, Net, HostFs>(
+        store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+        instance: &wasmtime::Instance,
+    ) -> Result<Self, ProgramExecError>
+    where
+        CpuImpl: Cpu + Clone,
+        Net: ComponentHostNetwork,
+        HostFs: crate::HostFileSystem,
+    {
+        p1_memory_from_instance(store, instance)
+            .map(Self::new)
+            .ok_or(ProgramExecError {
+                kind: ProgramExecErrorKind::InvalidBinary,
+                detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
+            })
+    }
+
+    /// `memory` at its current size.
+    pub(super) fn of_shared(memory: &SharedMemory) -> Self {
+        let data = memory.data();
+        Self::new(Preview1Memory {
+            base: data.as_ptr().cast::<u8>() as usize,
+            len: data.len(),
+        })
     }
 
     /// The length of the guest's linear memory.
@@ -214,6 +283,38 @@ impl Preview1AsyncMemory {
         Ok(self.write_u32(written_out, copied).await?)
     }
 
+    /// The spans of linear memory `iovs` name, each checked to lie inside
+    /// it, for a receive that copies straight into them.
+    pub(super) fn iov_ranges(
+        &self,
+        iovs: &[(u32, u32)],
+    ) -> Result<Preview1IovRanges, GuestAccessError> {
+        iovs.iter()
+            .map(|&(ptr, len)| {
+                let len = len as usize;
+                let start =
+                    p1_checked_guest_array(self.memory.len, GuestAddress::wasm32(ptr), len, 1)
+                        .map_err(|_| GuestAccessError::OutOfBounds)?;
+                Ok((start, len))
+            })
+            .collect::<Result<_, _>>()
+            .map(Preview1IovRanges)
+    }
+
+    /// A buffer over `ranges` that the TCP stack copies received bytes
+    /// straight into, each page checked present in the step that writes
+    /// it (see [`RegisteredTcpReadBuffer`]).
+    pub(super) fn tcp_receive_buffer<'a>(
+        &self,
+        ranges: &'a Preview1IovRanges,
+    ) -> RegisteredTcpReadBuffer<'a> {
+        // SAFETY: `iov_ranges` checked every span against this linear
+        // memory, which never moves or shrinks while the instance lives,
+        // and the guest that owns it is suspended in the host call that
+        // holds the buffer.
+        unsafe { RegisteredTcpReadBuffer::new(self.memory.base, &ranges.0, self.residency) }
+    }
+
     /// Runs `access` over the `len` guest bytes at `ptr` once they are
     /// all present, in the poll that found them so.
     pub(super) async fn read<R>(
@@ -251,6 +352,16 @@ impl Preview1AsyncMemory {
         .await
     }
 
+    /// Whether the `len` guest bytes at `ptr` lie inside linear memory,
+    /// for a call that hands the range on without touching it.
+    pub(super) fn check_bounds(
+        &self,
+        ptr: GuestAddress,
+        len: usize,
+    ) -> Result<(), GuestAccessError> {
+        self.checked_host_address(ptr, len).map(drop)
+    }
+
     /// The host address of the `len` guest bytes at `ptr`, or
     /// [`GuestAccessError::OutOfBounds`].
     fn checked_host_address(
@@ -276,6 +387,41 @@ impl Preview1AsyncMemory {
             None => Ok(access()),
         }
     }
+}
+
+#[cfg(test)]
+impl Preview1AsyncMemory {
+    /// The accessor over `swap`'s memory, whose pages a test takes out.
+    pub(super) fn over_swap(swap: &crate::memory::GuestSwap) -> Self {
+        Self {
+            memory: Preview1Memory {
+                base: swap.base(),
+                len: swap.len(),
+            },
+            residency: Some(swap.residency()),
+        }
+    }
+}
+
+/// Polls `future` once, the way the executor does when the store's turn
+/// comes round, and answers what it returned if it finished.
+#[cfg(test)]
+pub(super) fn poll_once<F: Future>(future: core::pin::Pin<&mut F>) -> Option<F::Output> {
+    match future.poll(&mut Context::from_waker(core::task::Waker::noop())) {
+        Poll::Ready(output) => Some(output),
+        Poll::Pending => None,
+    }
+}
+
+/// The page size the swap tests lay guest memory out in.
+#[cfg(test)]
+pub(super) const TEST_PAGE: usize = crate::memory::GUEST_SWAP_PAGE;
+
+/// `len` bytes of text in Chinese, Japanese and Korean, repeated, for a
+/// test that moves guest bytes and checks they arrive whole.
+#[cfg(test)]
+pub(super) fn cjk_bytes(len: usize) -> Vec<u8> {
+    "数据データ데이터".bytes().cycle().take(len).collect()
 }
 
 /// The caller's linear memory, as an async host function reaches it.
@@ -552,16 +698,6 @@ pub(super) fn preview1_write_memory(
     p1::errno::SUCCESS
 }
 
-pub(super) fn preview1_read_u32(
-    memory: Preview1Memory,
-    ptr: GuestAddress,
-) -> Result<u32, ProgramExecError> {
-    let bytes = preview1_read_memory(memory, ptr, 4)?;
-    Ok(u32::from_le_bytes(bytes.try_into().unwrap_or_else(|_| {
-        panic!("Preview1 raw u32 read must return exactly 4 bytes")
-    })))
-}
-
 pub(super) fn preview1_write_u32(memory: Preview1Memory, ptr: GuestAddress, value: u32) -> i32 {
     preview1_write_memory(memory, ptr, &value.to_le_bytes())
 }
@@ -694,6 +830,104 @@ impl Preview1Gather {
         Ok(Some(chunk))
     }
 
+    /// Lands everything `write` staged straight from the guest's buffers
+    /// into the filesystem's own destinations, so each byte is copied
+    /// once, and answers the offset the write began at.
+    ///
+    /// Before each round is submitted, every page its bytes come from is
+    /// brought in, and the final check that finds them all present runs
+    /// in the poll that fills them: `submit` runs its fill before it
+    /// returns, so nothing awaits between the two.
+    pub(super) async fn submit_staged<Write: PreparedWrite>(
+        &mut self,
+        memory: &Preview1AsyncMemory,
+        mut write: Write,
+    ) -> Result<FsResult<u64>, GuestAccessError> {
+        loop {
+            self.bring_in(memory, write.staged_len()).await?;
+            let submitted = write.submit(|_, destination| self.fill_present(memory, destination));
+            match submitted.await {
+                Ok(WriteProgress::More(next)) => write = next,
+                Ok(WriteProgress::Done(landed)) => return Ok(Ok(landed)),
+                Err(error) => return Ok(Err(error)),
+            }
+        }
+    }
+
+    /// Returns in a poll that has found every page of the next `len`
+    /// gathered bytes present, faulting in each one that is out first.
+    pub(super) async fn bring_in(
+        &self,
+        memory: &Preview1AsyncMemory,
+        len: usize,
+    ) -> Result<(), GuestAccessError> {
+        let Some(residency) = &memory.residency else {
+            return Ok(());
+        };
+        'check: loop {
+            let mut range = self.range;
+            let mut offset = self.offset;
+            let mut left = len;
+            while left > 0 {
+                let (ptr, span) = self.iovs[range];
+                let available = span as usize - offset;
+                if available == 0 {
+                    range += 1;
+                    offset = 0;
+                    continue;
+                }
+                let take = available.min(left);
+                let at = memory.memory.base + ptr as usize + offset;
+                if let Some(fault) =
+                    residency.fault_in_first_swapped(VirtRange::new(VirtAddr::new(at), take))
+                {
+                    fault.await?;
+                    continue 'check;
+                }
+                offset += take;
+                left -= take;
+            }
+            return Ok(());
+        }
+    }
+
+    /// Copies the next `destination.len()` bytes, which is at most
+    /// [`Self::remaining`], into `destination`, from pages the caller saw
+    /// present in this poll ([`Self::bring_in`]).
+    fn fill_present(&mut self, memory: &Preview1AsyncMemory, destination: &mut [u8]) {
+        debug_assert!(
+            destination.len() <= self.remaining,
+            "a gathered round is no longer than what is left"
+        );
+        let mut rest = destination;
+        while !rest.is_empty() {
+            let (ptr, len) = self.iovs[self.range];
+            let available = len as usize - self.offset;
+            if available == 0 {
+                self.range += 1;
+                self.offset = 0;
+                continue;
+            }
+            let take = available.min(rest.len());
+            // SAFETY: `Self::new` checked every iovec against the guest's
+            // linear memory, which never moves or shrinks while the
+            // instance lives, and `bring_in` found these pages present in
+            // this poll, which a page leaves only while its instance is
+            // off every processor.
+            let source = unsafe {
+                core::slice::from_raw_parts(
+                    (memory.memory.base + ptr as usize + self.offset) as *const u8,
+                    take,
+                )
+            };
+            let (head, tail) = rest.split_at_mut(take);
+            head.copy_from_slice(source);
+            rest = tail;
+            self.offset += take;
+            self.remaining -= take;
+        }
+    }
+
     /// Everything still held, in one piece, for a datagram that can carry
     /// at most `max` bytes. A datagram goes out whole, so a payload the
     /// protocol cannot carry is `EMSGSIZE` before any kernel memory is
@@ -747,13 +981,16 @@ pub(super) trait Preview1ChunkedFile {
     /// Why the file refused a chunk.
     type Refusal;
 
-    /// Lands `chunk` at `position`, and answers the end of the file it
-    /// reached.
+    /// Takes the next `len` bytes out of `gather`, lands them at
+    /// `position`, and answers the end of the file they reached. A page of
+    /// the guest's buffers that cannot come back from swap ends the write.
     fn land(
         &mut self,
-        chunk: &[u8],
+        memory: &Preview1AsyncMemory,
+        gather: &mut Preview1Gather,
         position: WritePosition,
-    ) -> impl Future<Output = Result<u64, Self::Refusal>> + Send;
+        len: usize,
+    ) -> impl Future<Output = Result<Result<u64, Self::Refusal>, GuestAccessError>> + Send;
 }
 
 /// What a gathered write to a file came to: the end of the file its last
@@ -770,32 +1007,31 @@ pub(super) type Preview1Landed<Refusal> = Result<(u64, u32), Refusal>;
 /// so it never lands on what another writer appended in between; a
 /// positioned write continues where its last chunk ended. A refusal after
 /// some chunks landed is a short write: the guest meets the refusal on its
-/// next call. A chunk is read out of guest memory before it is landed, so a
-/// page that has to come back from swap holds up the write and never the
-/// file.
+/// next call.
 pub(super) async fn p1_write_gathered<File: Preview1ChunkedFile + Send>(
     memory: &Preview1AsyncMemory,
     gather: &mut Preview1Gather,
     position: WritePosition,
     file: &mut File,
 ) -> Result<Preview1Landed<File::Refusal>, GuestAccessError> {
-    let chunk = gather.next_chunk(memory).await?.unwrap_or_default();
-    let mut end = match file.land(&chunk, position).await {
+    let len = gather.next_len();
+    let mut end = match file.land(memory, gather, position, len).await? {
         Ok(end) => end,
         Err(refusal) => return Ok(Err(refusal)),
     };
     // The iovecs' sum fits a `u32`, so no count of it overflows.
-    let mut written = chunk.len() as u32;
-    while let Some(chunk) = gather.next_chunk(memory).await? {
+    let mut written = len as u32;
+    while gather.remaining() > 0 {
         let next = match position {
             WritePosition::End => WritePosition::End,
             WritePosition::At(_) => WritePosition::At(end),
         };
-        let Ok(chunk_end) = file.land(&chunk, next).await else {
+        let len = gather.next_len();
+        let Ok(chunk_end) = file.land(memory, gather, next, len).await? else {
             break;
         };
         end = chunk_end;
-        written += chunk.len() as u32;
+        written += len as u32;
     }
     Ok(Ok((end, written)))
 }
@@ -1078,5 +1314,241 @@ mod tests {
             run(memory.read(GuestAddress::wasm32(64), 0, <[u8]>::len)),
             Ok(0)
         );
+    }
+
+    /// A staged write of one round that records what its fill copied, the
+    /// way a filesystem's destination takes a round's bytes.
+    struct RecordingWrite {
+        len: usize,
+        landed: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+    }
+
+    impl PreparedWrite for RecordingWrite {
+        fn staged_len(&self) -> usize {
+            self.len
+        }
+
+        fn submit<F>(
+            self,
+            mut fill: F,
+        ) -> impl Future<Output = FsResult<WriteProgress<Self>>> + Send
+        where
+            F: FnMut(usize, &mut [u8]),
+        {
+            let mut destination = vec![0_u8; self.len];
+            fill(0, &mut destination);
+            *self.landed.lock().expect("the record is not poisoned") = Some(destination);
+            core::future::ready(Ok(WriteProgress::Done(0)))
+        }
+    }
+
+    /// A file write whose source spans a present page and an evicted one.
+    struct StagedWrite {
+        swap: crate::memory::GuestSwap,
+        /// The gather the write reads from.
+        gather: Preview1Gather,
+        write: RecordingWrite,
+        /// What the write's fill landed, once it ran.
+        landed: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+        /// The bytes the guest wrote.
+        source: Vec<u8>,
+    }
+
+    fn staged_write_over_an_evicted_page() -> StagedWrite {
+        let mut swap = crate::memory::GuestSwap::new(3);
+        let source = cjk_bytes(600);
+        let start = 2 * TEST_PAGE - 200;
+        swap.bytes_mut()[start..start + source.len()].copy_from_slice(&source);
+        swap.bytes_mut()[..8].copy_from_slice(
+            &[
+                (start as u32).to_le_bytes(),
+                (source.len() as u32).to_le_bytes(),
+            ]
+            .concat(),
+        );
+        let memory = Preview1AsyncMemory::over_swap(&swap);
+        let layout = run(p1_read_iovs_with_byte_len(
+            &memory,
+            GuestAddress::wasm32(0),
+            1,
+        ))
+        .unwrap_or_else(|_| panic!("the iovec fits"));
+        let gather = Preview1Gather::new(&memory, &layout).expect("the buffer fits");
+        swap.evict(2);
+        let landed = std::sync::Arc::default();
+        let write = RecordingWrite {
+            len: source.len(),
+            landed: std::sync::Arc::clone(&landed),
+        };
+        StagedWrite {
+            swap,
+            gather,
+            write,
+            landed,
+            source,
+        }
+    }
+
+    /// A gathered file write over a page that is out stages nothing until
+    /// the page is back, then copies its bytes once, straight into the
+    /// filesystem's destination, intact.
+    #[test]
+    fn a_staged_write_waits_for_an_evicted_source_page_then_lands_it_whole() {
+        let StagedWrite {
+            mut swap,
+            mut gather,
+            write,
+            landed,
+            source,
+        } = staged_write_over_an_evicted_page();
+        let memory = Preview1AsyncMemory::over_swap(&swap);
+        let mut submit = core::pin::pin!(gather.submit_staged(&memory, write));
+        assert!(
+            poll_once(submit.as_mut()).is_none(),
+            "the round waits for the page"
+        );
+        assert!(
+            landed.lock().expect("unpoisoned").is_none(),
+            "the fill did not run over a page that is out"
+        );
+        assert_eq!(swap.queued_faults(), 1, "the page was asked for");
+
+        swap.serve();
+        assert!(matches!(poll_once(submit.as_mut()), Some(Ok(Ok(0)))));
+        assert!(
+            landed.lock().expect("unpoisoned").as_deref() == Some(&source[..]),
+            "the bytes landed as the guest wrote them"
+        );
+    }
+
+    /// A source page that cannot come back ends the write with the swap
+    /// failure, which traps the guest, and the fill never runs.
+    #[test]
+    fn a_staged_write_over_a_lost_page_traps_without_filling() {
+        let StagedWrite {
+            mut swap,
+            mut gather,
+            write,
+            landed,
+            ..
+        } = staged_write_over_an_evicted_page();
+        swap.fail_reads(1);
+        let memory = Preview1AsyncMemory::over_swap(&swap);
+        let mut submit = core::pin::pin!(gather.submit_staged(&memory, write));
+        assert!(poll_once(submit.as_mut()).is_none());
+        swap.serve();
+        assert!(matches!(
+            poll_once(submit.as_mut()),
+            Some(Err(GuestAccessError::Swap(SwapFaultError::Backend)))
+        ));
+        assert!(landed.lock().expect("unpoisoned").is_none());
+    }
+
+    /// A guest memory of three pages whose middle page holds text and is
+    /// out, the instance it belongs to, and the turns its driver takes.
+    struct DriverMemory {
+        swap: crate::memory::GuestSwap,
+        registry: crate::InstanceRegistry,
+        /// The store's activity, which has to outlive the turns.
+        _activity: crate::InstanceActivity,
+        cpu: crate::test_support::ManualClockCpu,
+        turns: crate::component::GuestTurns<
+            crate::test_support::ManualClockCpu,
+            crate::test_support::TestRuntimeState,
+            (),
+        >,
+        /// The text on the evicted page.
+        text: Vec<u8>,
+    }
+
+    fn driver_over_an_evicted_page() -> DriverMemory {
+        let mut swap = crate::memory::GuestSwap::new(3);
+        let text = cjk_bytes(300);
+        let start = TEST_PAGE - 100;
+        swap.bytes_mut()[start..start + text.len()].copy_from_slice(&text);
+        swap.evict(1);
+        let registry = crate::InstanceRegistry::new();
+        let instance = registry.register("asyncify-driver", 0);
+        let activity = crate::InstanceActivity::new(instance, 0);
+        let cpu = crate::test_support::ManualClockCpu::new();
+        let turns = crate::component::GuestTurns::new(
+            activity.turns(),
+            cpu.clone(),
+            crate::test_support::TestRuntimeState::default(),
+            (),
+        );
+        DriverMemory {
+            swap,
+            registry,
+            _activity: activity,
+            cpu,
+            turns,
+            text,
+        }
+    }
+
+    /// A read the driver makes between the guest's calls waits for an
+    /// evicted page off the processor, then copies while its instance is
+    /// on one, which is what keeps the page in from the check to the copy.
+    #[test]
+    fn a_driver_read_over_an_evicted_page_copies_inside_a_turn() {
+        let DriverMemory {
+            mut swap,
+            registry,
+            _activity,
+            cpu,
+            turns,
+            text,
+        } = driver_over_an_evicted_page();
+        let memory = Preview1AsyncMemory::over_swap(&swap);
+        let read = memory.read(
+            GuestAddress::wasm32((TEST_PAGE - 100) as u32),
+            text.len(),
+            |bytes| {
+                let idle = registry.idle_instances(cpu.now().ticks(), 0);
+                (bytes.to_vec(), idle)
+            },
+        );
+        let mut driven = core::pin::pin!(in_guest_turn(turns, read));
+        assert!(poll_once(driven.as_mut()).is_none());
+        assert_eq!(swap.queued_faults(), 1);
+        assert_eq!(
+            registry.idle_instances(cpu.now().ticks(), 0).len(),
+            1,
+            "the instance waits for its page off the processor"
+        );
+        swap.serve();
+        let (bytes, idle) = poll_once(driven.as_mut())
+            .expect("the page is back")
+            .expect("the read lands");
+        assert_eq!(bytes, text);
+        assert!(idle.is_empty(), "the copy ran during the instance's turn");
+    }
+
+    /// A page the driver needs that cannot come back is the guest's trap,
+    /// reported the way a host call's trap over a lost page is.
+    #[test]
+    fn a_driver_read_over_a_lost_page_fails_the_program() {
+        let DriverMemory {
+            mut swap,
+            _activity,
+            turns,
+            text,
+            ..
+        } = driver_over_an_evicted_page();
+        swap.fail_reads(1);
+        let memory = Preview1AsyncMemory::over_swap(&swap);
+        let read = memory.read_bytes(GuestAddress::wasm32((TEST_PAGE - 100) as u32), text.len());
+        let mut driven = core::pin::pin!(in_guest_turn(turns, read));
+        assert!(poll_once(driven.as_mut()).is_none());
+        swap.serve();
+        let error = poll_once(driven.as_mut())
+            .expect("the fault is answered")
+            .expect_err("the page is lost");
+        assert_eq!(error.kind, ProgramExecErrorKind::Internal);
+        assert!(matches!(
+            error.detail,
+            ProgramExecErrorDetail::RuntimeFailure(_)
+        ));
     }
 }

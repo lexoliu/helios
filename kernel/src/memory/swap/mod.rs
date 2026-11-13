@@ -507,20 +507,35 @@ impl GuestResidency {
         })
     }
 
-    /// A fault-in of the first page of `range` that is swapped out right
-    /// now, or `None` when every page of it is present.
-    pub fn fault_in_first_swapped(&self, range: VirtRange) -> Option<SwapFaultIn> {
-        let handle = self.handle.get()?;
+    /// The first page of `range` that is swapped out right now, or `None`
+    /// when every page of it is present.
+    ///
+    /// A copy that may stop part-way asks this of the span it is about to
+    /// touch and copies only what lies before the page it names.
+    pub fn first_swapped(&self, range: VirtRange) -> Option<VirtAddr> {
+        // Before the swap device comes up no page has been taken.
+        self.handle.get()?;
         let end = range.end().raw();
         let mut page = range.start.page_floor().raw();
         while page < end {
             let addr = VirtAddr::new(page);
             if (self.hooks.swapped_token)(addr).is_some() {
-                return Some(handle.fault_in(addr));
+                return Some(addr);
             }
             page += PhysFrame::SIZE;
         }
         None
+    }
+
+    /// A fault-in of the first page of `range` that is swapped out right
+    /// now, or `None` when every page of it is present.
+    pub fn fault_in_first_swapped(&self, range: VirtRange) -> Option<SwapFaultIn> {
+        let page = self.first_swapped(range)?;
+        let handle = self
+            .handle
+            .get()
+            .expect("a page is swapped out only once the swap handle is published");
+        Some(handle.fault_in(page))
     }
 
     /// Runs `access` once every page of `range` is present, in the same
@@ -1265,6 +1280,8 @@ fn current_pressure() -> PressureLevel {
 
 #[cfg(test)]
 mod service_tests;
+#[cfg(test)]
+pub(crate) use service_tests::{GUEST_SWAP_PAGE, GuestSwap};
 #[cfg(test)]
 mod space_tests;
 

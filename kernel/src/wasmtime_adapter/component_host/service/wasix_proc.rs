@@ -77,7 +77,7 @@ where
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
              (args, ret_tid): (i32, i32)| {
                 Box::new(async move {
-                    wasix_thread_spawn_v2(&mut caller, args as u32, ret_tid as u32).await
+                    p1_reply(wasix_thread_spawn_v2(&mut caller, args as u32, ret_tid as u32).await)
                 })
             },
         )
@@ -89,7 +89,10 @@ where
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
              (snapshot, ret_value): (i32, i32)| {
                 Box::new(async move {
-                    wasix_stack_checkpoint(&mut caller, snapshot as u32, ret_value as u32).await
+                    p1_reply(
+                        wasix_stack_checkpoint(&mut caller, snapshot as u32, ret_value as u32)
+                            .await,
+                    )
                 })
             },
         )
@@ -646,14 +649,16 @@ where
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
              (futex, expected, timeout, ret_woken): (i32, i32, i32, i32)| {
                 Box::new(async move {
-                    wasix_futex_wait(
-                        &mut caller,
-                        futex as u32,
-                        expected as u32,
-                        timeout as u32,
-                        ret_woken as u32,
+                    p1_reply(
+                        wasix_futex_wait(
+                            &mut caller,
+                            futex as u32,
+                            expected as u32,
+                            timeout as u32,
+                            ret_woken as u32,
+                        )
+                        .await,
                     )
-                    .await
                 })
             },
         )
@@ -4102,6 +4107,52 @@ mod tests {
             )),
             Err(P1Stop::Errno(p1::errno::FAULT)),
             "the record's action byte is past the end of memory"
+        );
+    }
+
+    /// A launch string in Chinese, Japanese and Korean that runs from a
+    /// present page onto one swap has taken.
+    fn launch_string_over_an_evicted_page() -> (crate::memory::GuestSwap, u32, String) {
+        let text = "程序\nプログラム\n프로그램".repeat(40);
+        let mut swap = crate::memory::GuestSwap::new(2);
+        let at = TEST_PAGE - text.len() / 2;
+        swap.bytes_mut()[at..at + text.len()].copy_from_slice(text.as_bytes());
+        swap.evict(1);
+        (swap, at as u32, text)
+    }
+
+    /// Reading a launch string whose tail is on a page that is out waits
+    /// for the page, asks for it, and once it is back reads the string the
+    /// guest wrote.
+    #[test]
+    fn a_launch_string_on_an_evicted_page_reads_once_the_page_is_back() {
+        let (mut swap, at, text) = launch_string_over_an_evicted_page();
+        let memory = Preview1AsyncMemory::over_swap(&swap);
+        let mut read = core::pin::pin!(wasix_read_exec_string(&memory, at, text.len() as u32));
+        assert!(poll_once(read.as_mut()).is_none(), "the read waits");
+        assert_eq!(swap.queued_faults(), 1, "the page was asked for");
+
+        swap.serve();
+        let read = poll_once(read.as_mut()).expect("the page is back");
+        assert_eq!(read.ok().as_deref(), Some(text.as_str()));
+    }
+
+    /// The string's page cannot come back, so the launch call traps the
+    /// guest rather than answering it `EFAULT`.
+    #[test]
+    fn a_launch_string_on_a_lost_page_traps_the_guest() {
+        let (mut swap, at, text) = launch_string_over_an_evicted_page();
+        swap.fail_reads(1);
+        let memory = Preview1AsyncMemory::over_swap(&swap);
+        let mut read = core::pin::pin!(wasix_read_exec_string(&memory, at, text.len() as u32));
+        assert!(poll_once(read.as_mut()).is_none());
+        swap.serve();
+        let error = poll_once(read.as_mut())
+            .expect("the read ends")
+            .expect_err("the page is gone");
+        assert_eq!(
+            read_error_stop(error),
+            P1Stop::Trap(crate::memory::SwapFaultError::Backend)
         );
     }
 }

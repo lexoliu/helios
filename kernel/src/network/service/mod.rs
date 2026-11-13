@@ -51,8 +51,8 @@ use crate::{
     NetworkBridgeRequest, NetworkControlError, NetworkErrorDetail, NetworkIpAddress, NetworkPortId,
     PingError, PingErrorKind, PingReply, ProfileSink, ProgressMark, ProgressSignal,
     RegisteredTcpReadBuffer, RootEntropyHandle, TcpAccepted, TcpError, TcpErrorKind, TcpListener,
-    TcpReadProgress, TcpWriteProgress, Timer, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
-    UptimeClock,
+    TcpReadInto, TcpReadProgress, TcpWriteProgress, Timer, UdpBinding, UdpDatagram, UdpError,
+    UdpErrorKind, UptimeClock,
 };
 use triomphe::Arc;
 

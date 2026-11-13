@@ -209,31 +209,44 @@ where
     };
     // The wait above awaited, so the guest's pages are checked again here,
     // in the poll that writes them.
-    let event_size = WASIX_EPOLL_EVENT_SIZE as usize;
-    let written = async {
-        memory
-            .write(
-                GuestAddress::wasm32(events),
-                ready.len() * event_size,
-                |records| {
-                    for (event, record) in ready.iter().zip(records.chunks_exact_mut(event_size)) {
-                        wasix_encode_epoll_event(event, record);
-                    }
-                },
-            )
-            .await?;
-        memory
-            .write(GuestAddress::wasm32(ret_nevents), 4, |count| {
-                count.copy_from_slice(&returned.to_le_bytes());
-            })
-            .await
-    }
+    let written = wasix_write_epoll_events(
+        &memory,
+        GuestAddress::wasm32(events),
+        &ready,
+        GuestAddress::wasm32(ret_nevents),
+        returned,
+    )
     .await;
     match written {
         Ok(()) => Ok(p1::errno::SUCCESS),
         Err(GuestAccessError::OutOfBounds) => Ok(p1::errno::FAULT),
         Err(GuestAccessError::Swap(error)) => Err(error),
     }
+}
+
+/// Lays `ready` out as the guest's `epoll_event` records at `events` and
+/// stores their count, `returned`, at `ret_nevents`, each write in the
+/// poll that found its pages present.
+pub(super) async fn wasix_write_epoll_events(
+    memory: &Preview1AsyncMemory,
+    events: GuestAddress,
+    ready: &[EpollInterest],
+    ret_nevents: GuestAddress,
+    returned: u32,
+) -> Result<(), GuestAccessError> {
+    let event_size = WASIX_EPOLL_EVENT_SIZE as usize;
+    memory
+        .write(events, ready.len() * event_size, |records| {
+            for (event, record) in ready.iter().zip(records.chunks_exact_mut(event_size)) {
+                wasix_encode_epoll_event(event, record);
+            }
+        })
+        .await?;
+    memory
+        .write(ret_nevents, 4, |count| {
+            count.copy_from_slice(&returned.to_le_bytes());
+        })
+        .await
 }
 
 pub(super) fn poll_epoll_wait_targets(
@@ -565,5 +578,77 @@ mod tests {
             wasix_epoll_mask_bit(Err(p1::errno::BADF), P1_EVENTTYPE_FD_READ),
             WASIX_EPOLL_TYPE_EPOLLERR
         );
+    }
+
+    /// Two ready interests whose records run from a present page onto
+    /// one swap has taken, with the count slot on page zero.
+    fn events_over_an_evicted_page() -> (crate::memory::GuestSwap, GuestAddress, [EpollInterest; 2])
+    {
+        let mut swap = crate::memory::GuestSwap::new(2);
+        swap.evict(1);
+        let events = GuestAddress::wasm32((TEST_PAGE - WASIX_EPOLL_EVENT_SIZE as usize) as u32);
+        let ready = [3, 4].map(|fd| EpollInterest {
+            fd,
+            events: WASIX_EPOLL_TYPE_EPOLLIN,
+            data: EpollUserData {
+                ptr: 0x1000 + fd as u32,
+                fd: fd as u32,
+                data1: 7,
+                data2: 0x0102_0304_0506_0708,
+            },
+        });
+        (swap, events, ready)
+    }
+
+    /// `epoll_wait`'s records wait for a page that is out, then land as a
+    /// present page would have them, the count after them.
+    #[test]
+    fn epoll_events_land_on_an_evicted_page_once_it_is_back() {
+        let (mut swap, events, ready) = events_over_an_evicted_page();
+        let memory = Preview1AsyncMemory::over_swap(&swap);
+        let mut write = core::pin::pin!(wasix_write_epoll_events(
+            &memory,
+            events,
+            &ready,
+            GuestAddress::wasm32(0),
+            2,
+        ));
+        assert!(poll_once(write.as_mut()).is_none(), "the records wait");
+        assert_eq!(swap.queued_faults(), 1, "the page was asked for");
+
+        swap.serve();
+        assert_eq!(poll_once(write.as_mut()), Some(Ok(())));
+        let size = WASIX_EPOLL_EVENT_SIZE as usize;
+        let mut expected = vec![0_u8; 2 * size];
+        for (event, record) in ready.iter().zip(expected.chunks_exact_mut(size)) {
+            wasix_encode_epoll_event(event, record);
+        }
+        let start = events.raw() as usize;
+        assert!(swap.bytes()[start..start + 2 * size] == expected[..]);
+        assert_eq!(swap.bytes()[0..4], 2_u32.to_le_bytes());
+    }
+
+    /// The records' page cannot come back, so `epoll_wait` traps.
+    #[test]
+    fn epoll_events_for_a_lost_page_trap() {
+        let (mut swap, events, ready) = events_over_an_evicted_page();
+        swap.fail_reads(1);
+        let memory = Preview1AsyncMemory::over_swap(&swap);
+        let mut write = core::pin::pin!(wasix_write_epoll_events(
+            &memory,
+            events,
+            &ready,
+            GuestAddress::wasm32(0),
+            2,
+        ));
+        assert!(poll_once(write.as_mut()).is_none());
+        swap.serve();
+        assert_eq!(
+            poll_once(write.as_mut()),
+            Some(Err(GuestAccessError::Swap(
+                crate::memory::SwapFaultError::Backend
+            )))
+        );
+        assert_eq!(swap.bytes()[0..4], [0; 4], "no count was reported");
     }
 }
