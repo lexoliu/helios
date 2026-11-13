@@ -469,6 +469,29 @@ where
     .await
 }
 
+/// Stages a write of `len` bytes at `position` through `resolved`, for a
+/// caller that fills each round itself straight from where its bytes are
+/// ([`helios_hal::fs::PreparedWrite::submit`]) and has to wait before a
+/// round for those bytes to be readable, as guest pages back from swap.
+/// The rounds land at consecutive offsets from the one the write begins
+/// at, which the last submit answers.
+pub(crate) async fn prepare_resolved_write<'a, StorageImpl>(
+    resolved: &'a Resolved<'_, StorageImpl>,
+    position: WritePosition,
+    len: usize,
+    now: u64,
+) -> FsOpResult<impl helios_hal::fs::PreparedWrite + 'a>
+where
+    StorageImpl: crate::Storage,
+{
+    resolved
+        .writable()
+        .map_err(fs_error_code)?
+        .prepare_write(resolved.path(), position, len, now)
+        .await
+        .map_err(fs_error_code)
+}
+
 /// Writes `len` bytes that `source` copies straight into the
 /// filesystem's destination ([`helios_hal::fs::write_with`]), and
 /// resolves with the offset just past them. An append lands at the end of

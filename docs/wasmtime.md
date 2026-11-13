@@ -5,13 +5,24 @@ at `../wasmtime/crates/wasmtime`.
 
 ## Required revision
 
-The local checkout must be at (branch `helios/next-solver-bindgen`):
+The local checkout must be at (branch `helios/guest-memory-residency`):
 
 ```text
-18b428e6becfb6138b877a3fe70afb08bf5724ba
+d10291f68ec29a00ec0261fb72d42069be198770
 ```
 
-That revision is `helios/stack-limit-percpu` at
+That revision is `helios/next-solver-bindgen` at
+`18b428e6becfb6138b877a3fe70afb08bf5724ba` plus one additive commit (#537):
+a store may register a `GuestMemoryResidency`
+(`Store::set_guest_memory_residency`), which the component event loop asks,
+in the poll that copies, whether the guest bytes a `stream` or `future`
+transfer is about to touch are present; an absent page makes the copy wait
+for the embedder's fault-in and check again. A host consumer whose payload
+holds strings or lists is polled on a worker fiber when a hook is
+registered, because the bytes its lift follows cannot be named in advance.
+A store with no hook pays one branch per copy.
+
+`helios/next-solver-bindgen` is `helios/stack-limit-percpu` at
 `1ed7678a8ee4f57cbe4a4e89ade7f7fda6092055` plus upstream
 bytecodealliance/wasmtime#14193 (30dddb655), which spells out the type
 arguments of `with_getter` and `Access::new` in the code `bindgen!`

@@ -1175,26 +1175,14 @@ where
             mut memory_stack,
             stack_pointer,
         } => {
-            let memory = p1_memory_from_instance(store, instance).ok_or(ProgramExecError {
-                kind: ProgramExecErrorKind::InvalidBinary,
-                detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
-            })?;
-            let unwind_stack_finish = preview1_read_u32(memory, GuestAddress::wasm32(stack_lower))?;
-            if unwind_stack_finish < unwind_stack_begin || unwind_stack_finish > stack_pointer {
-                return Err(ProgramExecError {
-                    kind: ProgramExecErrorKind::InvalidBinary,
-                    detail: ProgramExecErrorDetail::StackBoundsInvalid,
-                });
-            }
-            let unwind_len =
-                usize::try_from(unwind_stack_finish - unwind_stack_begin).map_err(|_| {
-                    ProgramExecError {
-                        kind: ProgramExecErrorKind::InvalidBinary,
-                        detail: ProgramExecErrorDetail::StackBoundsInvalid,
-                    }
-                })?;
-            let rewind_stack =
-                preview1_read_memory(memory, GuestAddress::wasm32(unwind_stack_begin), unwind_len)?;
+            let rewind_stack = wasix_read_unwound_stack(
+                store,
+                instance,
+                stack_lower,
+                unwind_stack_begin,
+                stack_pointer,
+            )
+            .await?;
             wasix_call_instance_func0(store, interrupts, instance, "asyncify_stop_unwind").await?;
 
             let hash = wasix_next_stack_hash(store);
@@ -1212,18 +1200,12 @@ where
                     memory_stack[offset..end].copy_from_slice(&snapshot_bytes);
                 }
             } else {
-                let memory = p1_memory_from_instance(store, instance).ok_or(ProgramExecError {
-                    kind: ProgramExecErrorKind::InvalidBinary,
-                    detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
-                })?;
-                if preview1_write_memory(memory, GuestAddress::wasm32(snapshot), &snapshot_bytes)
-                    != p1::errno::SUCCESS
-                {
-                    return Err(ProgramExecError {
-                        kind: ProgramExecErrorKind::InvalidBinary,
-                        detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
-                    });
-                }
+                let memory = Preview1AsyncMemory::of_instance(store, instance)?;
+                in_guest_turn(
+                    store.data().guest_turns(),
+                    memory.write_bytes(GuestAddress::wasm32(snapshot), &snapshot_bytes),
+                )
+                .await?;
             }
 
             store
@@ -1294,26 +1276,14 @@ where
             mut memory_stack,
             stack_pointer,
         } => {
-            let memory = p1_memory_from_instance(store, instance).ok_or(ProgramExecError {
-                kind: ProgramExecErrorKind::InvalidBinary,
-                detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
-            })?;
-            let unwind_stack_finish = preview1_read_u32(memory, GuestAddress::wasm32(stack_lower))?;
-            if unwind_stack_finish < unwind_stack_begin || unwind_stack_finish > stack_pointer {
-                return Err(ProgramExecError {
-                    kind: ProgramExecErrorKind::InvalidBinary,
-                    detail: ProgramExecErrorDetail::StackBoundsInvalid,
-                });
-            }
-            let unwind_len =
-                usize::try_from(unwind_stack_finish - unwind_stack_begin).map_err(|_| {
-                    ProgramExecError {
-                        kind: ProgramExecErrorKind::InvalidBinary,
-                        detail: ProgramExecErrorDetail::StackBoundsInvalid,
-                    }
-                })?;
-            let rewind_stack =
-                preview1_read_memory(memory, GuestAddress::wasm32(unwind_stack_begin), unwind_len)?;
+            let rewind_stack = wasix_read_unwound_stack(
+                store,
+                instance,
+                stack_lower,
+                unwind_stack_begin,
+                stack_pointer,
+            )
+            .await?;
             wasix_call_instance_func0(store, interrupts, instance, "asyncify_stop_unwind").await?;
             let child_pid = spawn_wasix_fork_child(
                 store,
@@ -1336,18 +1306,12 @@ where
                     memory_stack[offset..end].copy_from_slice(&snapshot_bytes);
                 }
             } else {
-                let memory = p1_memory_from_instance(store, instance).ok_or(ProgramExecError {
-                    kind: ProgramExecErrorKind::InvalidBinary,
-                    detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
-                })?;
-                if preview1_write_memory(memory, GuestAddress::wasm32(ret_pid), &snapshot_bytes)
-                    != p1::errno::SUCCESS
-                {
-                    return Err(ProgramExecError {
-                        kind: ProgramExecErrorKind::InvalidBinary,
-                        detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
-                    });
-                }
+                let memory = Preview1AsyncMemory::of_instance(store, instance)?;
+                in_guest_turn(
+                    store.data().guest_turns(),
+                    memory.write_bytes(GuestAddress::wasm32(ret_pid), &snapshot_bytes),
+                )
+                .await?;
             }
             wasix_begin_rewind(
                 store,
@@ -1372,26 +1336,14 @@ where
             memory_stack,
             stack_pointer,
         } => {
-            let memory = p1_memory_from_instance(store, instance).ok_or(ProgramExecError {
-                kind: ProgramExecErrorKind::InvalidBinary,
-                detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
-            })?;
-            let unwind_stack_finish = preview1_read_u32(memory, GuestAddress::wasm32(stack_lower))?;
-            if unwind_stack_finish < unwind_stack_begin || unwind_stack_finish > stack_pointer {
-                return Err(ProgramExecError {
-                    kind: ProgramExecErrorKind::InvalidBinary,
-                    detail: ProgramExecErrorDetail::StackBoundsInvalid,
-                });
-            }
-            let unwind_len =
-                usize::try_from(unwind_stack_finish - unwind_stack_begin).map_err(|_| {
-                    ProgramExecError {
-                        kind: ProgramExecErrorKind::InvalidBinary,
-                        detail: ProgramExecErrorDetail::StackBoundsInvalid,
-                    }
-                })?;
-            let rewind_stack =
-                preview1_read_memory(memory, GuestAddress::wasm32(unwind_stack_begin), unwind_len)?;
+            let rewind_stack = wasix_read_unwound_stack(
+                store,
+                instance,
+                stack_lower,
+                unwind_stack_begin,
+                stack_pointer,
+            )
+            .await?;
             wasix_call_instance_func0(store, interrupts, instance, "asyncify_stop_unwind").await?;
             let snapshot = wasix_capture_process_snapshot(
                 store,
@@ -1400,7 +1352,8 @@ where
                 stack_pointer,
                 memory_stack.clone(),
                 rewind_stack.clone(),
-            )?;
+            )
+            .await?;
             store.data_mut().asyncify.process_snapshots.push(snapshot);
             let snapshot_count = store.data().asyncify.process_snapshots.len();
             if let Some(snapshot) = store.data().asyncify.process_snapshots.last() {
@@ -1424,6 +1377,41 @@ where
             Ok(true)
         }
     }
+}
+
+/// The stack an asyncify unwind wrote between `unwind_stack_begin` and
+/// the end the guest recorded at `stack_lower`, read during one of the
+/// store's turns.
+async fn wasix_read_unwound_stack<CpuImpl, Net, StorageImpl>(
+    store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+    instance: &wasmtime::Instance,
+    stack_lower: u32,
+    unwind_stack_begin: u32,
+    stack_pointer: u32,
+) -> Result<Vec<u8>, ProgramExecError>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    let bounds_invalid = ProgramExecError {
+        kind: ProgramExecErrorKind::InvalidBinary,
+        detail: ProgramExecErrorDetail::StackBoundsInvalid,
+    };
+    let memory = Preview1AsyncMemory::of_instance(store, instance)?;
+    let unwound = in_guest_turn(store.data().guest_turns(), async {
+        let unwind_stack_finish = memory.read_u32(GuestAddress::wasm32(stack_lower)).await?;
+        if unwind_stack_finish < unwind_stack_begin || unwind_stack_finish > stack_pointer {
+            return Ok(None);
+        }
+        let unwind_len = (unwind_stack_finish - unwind_stack_begin) as usize;
+        memory
+            .read_bytes(GuestAddress::wasm32(unwind_stack_begin), unwind_len)
+            .await
+            .map(Some)
+    })
+    .await?;
+    unwound.ok_or(bounds_invalid)
 }
 
 pub(super) async fn wasix_begin_rewind<CpuImpl, Net, StorageImpl>(
@@ -1451,18 +1439,12 @@ where
             detail: ProgramExecErrorDetail::StackBoundsInvalid,
         });
     }
-    let memory = p1_memory_from_instance(store, instance).ok_or(ProgramExecError {
-        kind: ProgramExecErrorKind::InvalidBinary,
-        detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
-    })?;
-    if preview1_write_memory(memory, GuestAddress::wasm32(stack_pointer), &memory_stack)
-        != p1::errno::SUCCESS
-    {
-        return Err(ProgramExecError {
-            kind: ProgramExecErrorKind::InvalidBinary,
-            detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
-        });
-    }
+    let memory = Preview1AsyncMemory::of_instance(store, instance)?;
+    in_guest_turn(
+        store.data().guest_turns(),
+        memory.write_bytes(GuestAddress::wasm32(stack_pointer), &memory_stack),
+    )
+    .await?;
     wasix_set_global_u32_from_instance(store, instance, "__stack_pointer", stack_pointer)?;
 
     let rewind_stack_begin =
@@ -1488,28 +1470,20 @@ where
             detail: ProgramExecErrorDetail::StackBoundsInvalid,
         });
     }
-    let memory = p1_memory_from_instance(store, instance).ok_or(ProgramExecError {
-        kind: ProgramExecErrorKind::InvalidBinary,
-        detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
-    })?;
+    let memory = Preview1AsyncMemory::of_instance(store, instance)?;
     let stack_lower_address = GuestAddress::wasm32(stack_lower);
-    let status = preview1_write_u32(memory, stack_lower_address, rewind_stack_end)
-        .max(preview1_write_u32(
-            memory,
-            stack_lower_address.offset(4),
-            stack_upper,
-        ))
-        .max(preview1_write_memory(
-            memory,
-            GuestAddress::wasm32(rewind_stack_begin),
-            &rewind_stack,
-        ));
-    if status != p1::errno::SUCCESS {
-        return Err(ProgramExecError {
-            kind: ProgramExecErrorKind::InvalidBinary,
-            detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
-        });
-    }
+    in_guest_turn(store.data().guest_turns(), async {
+        memory
+            .write_u32(stack_lower_address, rewind_stack_end)
+            .await?;
+        memory
+            .write_u32(stack_lower_address.offset(4), stack_upper)
+            .await?;
+        memory
+            .write_bytes(GuestAddress::wasm32(rewind_stack_begin), &rewind_stack)
+            .await
+    })
+    .await?;
     store.data_mut().asyncify.rewind_value = value;
     wasix_call_instance_func1(
         store,
@@ -1522,7 +1496,7 @@ where
     Ok(())
 }
 
-pub(super) fn wasix_capture_process_snapshot<CpuImpl, Net, StorageImpl>(
+pub(super) async fn wasix_capture_process_snapshot<CpuImpl, Net, StorageImpl>(
     store: &wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     stack_lower: u32,
     stack_upper: u32,
@@ -1548,17 +1522,18 @@ where
             kind: ProgramExecErrorKind::InvalidBinary,
             detail: ProgramExecErrorDetail::ImportedSharedMemoryContractInvalid,
         })?;
-    let memory = memory.data();
+    let memory = Preview1AsyncMemory::of_shared(memory);
     let memory_len = memory.len();
     let memory_pages = memory_len.div_ceil(WASM_PAGE_SIZE);
     let memory_pages = u32::try_from(memory_pages).map_err(|_| ProgramExecError {
         kind: ProgramExecErrorKind::OutOfMemory,
         detail: ProgramExecErrorDetail::ImportedSharedMemoryBudgetExceeded,
     })?;
-    // SAFETY: `memory` is the guest's live linear memory, so its first
-    // `memory_len` bytes are readable for the duration of this borrow.
-    let memory_bytes =
-        unsafe { core::slice::from_raw_parts(memory.as_ptr().cast::<u8>(), memory_len) }.to_vec();
+    let memory_bytes = in_guest_turn(
+        store.data().guest_turns(),
+        memory.read_bytes(GuestAddress::wasm32(0), memory_len),
+    )
+    .await?;
     if let Some(snapshot_started) = snapshot_started {
         record_program_kernel_profile(
             &store.data().runtime_state,
@@ -1676,8 +1651,7 @@ where
         memory_spec,
     )
     .await?;
-    let fork_data = fork_memory.data();
-    if fork_data.len() < current_bytes {
+    if fork_memory.data_size() < current_bytes {
         return Err(ProgramExecError {
             kind: ProgramExecErrorKind::OutOfMemory,
             detail: ProgramExecErrorDetail::ImportedSharedMemoryBudgetExceeded,
@@ -1688,13 +1662,23 @@ where
         .runtime_state
         .profiling_enabled()
         .then(|| store.data().cpu.now().ticks());
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            parent_memory.data().as_ptr().cast::<u8>(),
-            fork_data.as_ptr().cast::<u8>().cast_mut(),
-            current_bytes,
-        );
-    }
+    let parent = Preview1AsyncMemory::of_shared(&parent_memory);
+    in_guest_turn(
+        store.data().guest_turns(),
+        parent.read(GuestAddress::wasm32(0), current_bytes, |source| {
+            // SAFETY: the fork's memory came out of the pool for this
+            // fork alone and holds at least `current_bytes` (checked
+            // above); no instance runs over it yet.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    source.as_ptr(),
+                    fork_memory.data().as_ptr().cast::<u8>().cast_mut(),
+                    current_bytes,
+                );
+            }
+        }),
+    )
+    .await?;
     if let Some(copy_started) = copy_started {
         record_program_kernel_profile(
             &store.data().runtime_state,
