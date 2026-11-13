@@ -1162,8 +1162,17 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    fn filesystem_error_code(&mut self, _: Resource<IoError>) -> Result<Option<p2fs::ErrorCode>> {
-        Ok(None)
+    /// The code a file stream's failed operation carried, read back from
+    /// the `wasi:io/error` resource `convert_stream_error` pushed for it.
+    /// An error that did not come from a file stream has no filesystem code.
+    fn filesystem_error_code(
+        &mut self,
+        error: Resource<IoError>,
+    ) -> Result<Option<p2fs::ErrorCode>> {
+        let error = self.table.get::<IoError>(&error)?;
+        Ok(error
+            .downcast_ref::<P2FileStreamError>()
+            .map(|P2FileStreamError::Failed(code)| *code))
     }
 }
 
@@ -3379,13 +3388,15 @@ mod tests {
 
     use crate::wasmtime_adapter::component_host::service::test_store;
 
-    use super::filesystem_bindings::filesystem::types::HostDescriptor;
+    use wasmtime_wasi_io::bindings::wasi::io::streams;
+
+    use super::filesystem_bindings::filesystem::types::{Host, HostDescriptor};
     use super::{
         EmptyInputStream, PREVIEW2_WIT_PACKAGES, WasiTcpSocketFamily, WasiUdpSocketError,
         WasiUdpSocketFamily, format_p2_tcp_socket_address, format_p2_udp_family,
         format_p2_udp_socket_address, map_p2_tcp_core_error, map_p2_tcp_family,
-        map_p2_tcp_socket_error, p2net, p2tcp, p2tcp_create, p2udp, parse_p2_tcp_socket_address,
-        parse_p2_udp_socket_address,
+        map_p2_tcp_socket_error, p2fs, p2net, p2tcp, p2tcp_create, p2udp,
+        parse_p2_tcp_socket_address, parse_p2_udp_socket_address,
     };
     use super::{FsDescriptor, FsNodeKind, p3fs};
 
@@ -3482,6 +3493,76 @@ mod tests {
         ))
         .expect("the written file must be readable");
         assert_eq!(written.as_ref(), "helios 日本語 한국어".as_bytes());
+    }
+
+    /// A file stream's failed write reaches the guest as a `wasi:io/error`
+    /// resource, and `filesystem-error-code` answers the code it carried
+    /// instead of `none`, so a preview1 guest reports the real errno (#501).
+    /// An error that is not a filesystem one still answers `none`.
+    #[test]
+    fn p2_filesystem_error_code_answers_the_code_a_failed_stream_write_carried() {
+        let mut store = test_store::store_data_with(|_| {});
+        let root = FsDescriptor {
+            path: String::from("/"),
+            kind: FsNodeKind::Directory,
+            flags: p3fs::DescriptorFlags::READ
+                | p3fs::DescriptorFlags::WRITE
+                | p3fs::DescriptorFlags::MUTATE_DIRECTORY,
+            identity: None,
+            mount: None,
+        };
+        let file = block_on(crate::wasmtime_adapter::wasi::open_at(
+            store.filesystem(),
+            root.grant().expect("the root holds read"),
+            p3fs::PathFlags::empty(),
+            "doomed",
+            p3fs::OpenFlags::CREATE | p3fs::OpenFlags::TRUNCATE,
+            p3fs::DescriptorFlags::READ | p3fs::DescriptorFlags::WRITE,
+            1,
+        ))
+        .expect("creating a file at the root must succeed");
+        let file = store.table.push(file).expect("the descriptor must fit");
+        let stream = HostDescriptor::write_via_stream(&mut store, file, 0)
+            .expect("write-via-stream must not trap")
+            .expect("write-via-stream must open on a writable file");
+        // Remove the file under the open stream so the batch has nowhere to land.
+        let root = store.table.push(root).expect("the root must fit");
+        block_on(HostDescriptor::unlink_file_at(
+            &mut store,
+            root,
+            String::from("doomed"),
+        ))
+        .expect("unlink-file-at must not trap")
+        .expect("the file must unlink");
+        let stream = store
+            .table
+            .get_mut::<DynOutputStream>(&stream)
+            .expect("the stream resource must be live");
+        stream
+            .write(Bytes::from_static("日本語 한국어".as_bytes()))
+            .expect("the write is parked until the stream is ready");
+        block_on(stream.ready());
+        let failure = stream
+            .check_write()
+            .expect_err("the parked write must have failed");
+
+        let error = match streams::Host::convert_stream_error(&mut store.table, failure)
+            .expect("a failed operation converts without trapping")
+        {
+            streams::StreamError::LastOperationFailed(error) => error,
+            streams::StreamError::Closed => panic!("a failed write is not a closed stream"),
+        };
+        let code =
+            Host::filesystem_error_code(&mut store, error).expect("the error resource is live");
+        assert_eq!(code, Some(p2fs::ErrorCode::NoEntry));
+
+        let foreign = store
+            .table
+            .push(wasmtime::Error::msg("not a filesystem error"))
+            .expect("the error must fit");
+        let code =
+            Host::filesystem_error_code(&mut store, foreign).expect("the error resource is live");
+        assert_eq!(code, None);
     }
 
     #[test]

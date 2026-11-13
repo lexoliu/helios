@@ -738,7 +738,7 @@ fn a_link_at_the_base_does_not_lead_out_of_it() {
     // A load granted at `/work` reads nothing through the link either.
     assert!(matches!(
         block_on(read_program_file(&namespace, "/work", "/work")),
-        Err(fs_types::ErrorCode::NotPermitted)
+        Err(helios_hal::fs::FsError::NotPermitted)
     ));
     // The parent, whose floor holds both, still follows it.
     let followed = block_on(open_at(

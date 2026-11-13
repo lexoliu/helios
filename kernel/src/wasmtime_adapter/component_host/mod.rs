@@ -1491,7 +1491,7 @@ where
     let namespace = accessor.with(|mut access| access.get().filesystem().clone());
     let contents = crate::wasmtime_adapter::wasi::read_program_file(&namespace, &absolute, floor)
         .await
-        .map_err(map_fs_error_to_program_exec)?;
+        .map_err(ProgramExecError::from_source_read_error)?;
     Ok(Ok(ProgramSource::from_file(contents)))
 }
 
@@ -3389,6 +3389,8 @@ fn convert_launch_error(error: crate::ProgramExecError) -> debugger_wit::program
             ProgramExecErrorKind::OutOfMemory => debugger_wit::programs::ExecErrorKind::OutOfMemory,
             ProgramExecErrorKind::Unavailable => debugger_wit::programs::ExecErrorKind::Unavailable,
             ProgramExecErrorKind::Internal => debugger_wit::programs::ExecErrorKind::Internal,
+            ProgramExecErrorKind::NotFound => debugger_wit::programs::ExecErrorKind::NotFound,
+            ProgramExecErrorKind::Io => debugger_wit::programs::ExecErrorKind::Io,
         },
         detail: error.detail.as_str().to_owned(),
     }
@@ -3434,6 +3436,8 @@ fn convert_program_launch_error(
             ProgramExecErrorKind::OutOfMemory => program_wit::programs::ExecErrorKind::OutOfMemory,
             ProgramExecErrorKind::Unavailable => program_wit::programs::ExecErrorKind::Unavailable,
             ProgramExecErrorKind::Internal => program_wit::programs::ExecErrorKind::Internal,
+            ProgramExecErrorKind::NotFound => program_wit::programs::ExecErrorKind::NotFound,
+            ProgramExecErrorKind::Io => program_wit::programs::ExecErrorKind::Io,
         },
         detail: error.detail.as_str().to_owned(),
     }
