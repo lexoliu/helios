@@ -1356,9 +1356,7 @@ pub(crate) mod test_store {
     pub(crate) fn store_data_routed(
         authority: ProcessAuthority,
         output_mode: ComponentOutputMode,
-        configure: impl FnOnce(
-            &HostRuntimeState<TestCpu, TestNetworkService, UnsupportedHostFileSystem>,
-        ),
+        configure: impl FnOnce(&HostRuntimeState<TestCpu, TestNetworkService, UnsupportedStorage>),
     ) -> TestStoreData {
         let cpu = TestCpu::with_entropy(0x5a);
         let runtime_state: HostRuntimeState<TestCpu, TestNetworkService, UnsupportedStorage> =
