@@ -26,19 +26,16 @@
 //! interpreter is built, used, and dropped inside [`describe`].
 
 use acpi::address::AddressSpace;
+use acpi::aml::AmlError;
 use acpi::aml::namespace::{AmlName, NamespaceLevel};
 use acpi::aml::object::Object;
-use acpi::aml::op_region::{OpRegion, RegionHandler};
 use acpi::aml::resource::{self, MemoryRangeDescriptor, Resource};
-use acpi::aml::{AmlError, BaseInterpreter};
-use acpi::registers::FixedRegisters;
+use acpi::sdt::Signature;
 use acpi::sdt::fadt::Fadt;
 use acpi::sdt::madt::{Madt, MadtEntry};
 use acpi::sdt::spcr::Spcr;
-use acpi::sdt::{SdtHeader, Signature};
-use acpi::{AcpiTables, Handle, Handler, PciAddress, PhysicalMapping, RawPhysicalMapping};
+use acpi::{AcpiTables, Handle, Handler, PciAddress, RawPhysicalMapping};
 use alloc::string::String;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use arm_gic::Trigger;
 use core::str::FromStr;
@@ -88,6 +85,8 @@ pub(crate) enum AcpiError {
     MadtMissing(&'static str),
     #[error("interpreting the DSDT failed: {0:?}")]
     Aml(AmlError),
+    #[error(transparent)]
+    Namespace(helios_acpi::NamespaceError),
     #[error("the {0} device's _CRS declares no {1}")]
     ResourceMissing(String, &'static str),
     #[error("the {0} device's _CRS declares {1} interrupts; exactly one is required")]
@@ -106,50 +105,8 @@ pub(crate) enum AcpiError {
     Tpm2WithoutDevice,
 }
 
-/// The region handler type of this backend's AML interpreter.
-///
-/// The backend installs no operation-region handlers, so the
-/// interpreter's region handler type has no values. Naming it keeps the
-/// interpreter free of the `dyn RegionHandler` the `acpi` crate's own
-/// `Interpreter` alias would impose.
-enum NoRegionHandler {}
-
-impl RegionHandler for NoRegionHandler {
-    fn read_u8(&self, _region: &OpRegion) -> Result<u8, AmlError> {
-        match *self {}
-    }
-
-    fn read_u16(&self, _region: &OpRegion) -> Result<u16, AmlError> {
-        match *self {}
-    }
-
-    fn read_u32(&self, _region: &OpRegion) -> Result<u32, AmlError> {
-        match *self {}
-    }
-
-    fn read_u64(&self, _region: &OpRegion) -> Result<u64, AmlError> {
-        match *self {}
-    }
-
-    fn write_u8(&self, _region: &OpRegion, _value: u8) -> Result<(), AmlError> {
-        match *self {}
-    }
-
-    fn write_u16(&self, _region: &OpRegion, _value: u16) -> Result<(), AmlError> {
-        match *self {}
-    }
-
-    fn write_u32(&self, _region: &OpRegion, _value: u32) -> Result<(), AmlError> {
-        match *self {}
-    }
-
-    fn write_u64(&self, _region: &OpRegion, _value: u64) -> Result<(), AmlError> {
-        match *self {}
-    }
-}
-
 /// The AML interpreter this backend builds.
-type Interpreter = BaseInterpreter<Aarch64AcpiHandler, NoRegionHandler>;
+type Interpreter = helios_acpi::Interpreter<Aarch64AcpiHandler>;
 
 /// The ACPI tables Limine's RSDP led to.
 pub(crate) struct AcpiPlatformTables {
@@ -377,53 +334,15 @@ fn psci(tables: &AcpiPlatformTables) -> Result<Option<PsciConduit>, AcpiError> {
 }
 
 /// Loads the DSDT and every SSDT into a fresh AML namespace.
+///
+/// On the hardware-reduced ACPI that every AArch64 platform uses, the
+/// PM1 blocks are absent and map to an empty system-IO address that the
+/// register block never touches. Constructing them is what the
+/// interpreter's `Store` opcode needs to exist; nothing here reads or
+/// writes them. The interpreter, its registers and every object it
+/// builds live and die on the bootstrap processor inside `describe`.
 fn load_namespace(tables: &AcpiPlatformTables) -> Result<Interpreter, AcpiError> {
-    let fadt = tables
-        .tables
-        .find_table::<Fadt>()
-        .ok_or(AcpiError::MissingTable(Signature::FADT))?;
-    // On the hardware-reduced ACPI that every AArch64 platform uses,
-    // the PM1 blocks are absent and map to an empty system-IO address
-    // that the register block never touches. Constructing them is what
-    // the interpreter's `Store` opcode needs to exist; nothing here
-    // reads or writes them.
-    // The `acpi` crate's interpreter takes its register block as an
-    // `Arc`. The interpreter, its registers and every object it builds
-    // live and die on the bootstrap processor inside `describe`.
-    let registers =
-        Arc::new(FixedRegisters::new(&fadt, tables.handler.clone()).map_err(AcpiError::Tables)?);
-    let dsdt = tables.tables.dsdt().map_err(AcpiError::Tables)?;
-    let interpreter = Interpreter::new(tables.handler.clone(), dsdt.revision, registers, None);
-    load_table(&interpreter, tables, dsdt)?;
-    for ssdt in tables.tables.ssdts() {
-        load_table(&interpreter, tables, ssdt)?;
-    }
-    Ok(interpreter)
-}
-
-fn load_table(
-    interpreter: &Interpreter,
-    tables: &AcpiPlatformTables,
-    table: acpi::AmlTable,
-) -> Result<(), AcpiError> {
-    let header_bytes = core::mem::size_of::<SdtHeader>();
-    // SAFETY: the address and length come from a table header the
-    // `acpi` crate already validated, and the mapping is the direct
-    // physical map the bootloader left in place.
-    let mapping = unsafe {
-        PhysicalMapping::<_, u8>::new(
-            table.phys_address,
-            table.length as usize,
-            tables.handler.clone(),
-        )
-    };
-    let stream = unsafe {
-        core::slice::from_raw_parts(
-            mapping.as_ptr().add(header_bytes),
-            table.length as usize - header_bytes,
-        )
-    };
-    interpreter.load_table(stream).map_err(AcpiError::Aml)
+    helios_acpi::load_namespace(&tables.tables, &tables.handler).map_err(AcpiError::Namespace)
 }
 
 /// Every device object in the namespace that names a hardware ID,

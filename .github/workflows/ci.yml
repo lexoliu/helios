@@ -227,6 +227,23 @@ jobs:
       # quota holds these four and nothing more, and a pull request's
       # entry is restorable from its own merge ref alone. Every other
       # lane, workflow and action builds cold.
+      # rust-cache hashes `rustc -vV` and `rustup run <t> rustc -vV` for
+      # every installed toolchain (src/config.ts `getRustVersions`), run
+      # from the checkout root where no `rust-toolchain.toml` applies. On
+      # a fresh runner that is only the image's stable, so an image update
+      # changed every key and forced a cold build (#884). Installing the
+      # pinned toolchain from `helios/rust-toolchain.toml`, making it the
+      # default and removing every other toolchain leaves the pinned
+      # compiler as the only one the key can see.
+      - name: Make the pinned toolchain the only one rust-cache sees
+        if: matrix.rust-cache
+        working-directory: helios
+        run: |
+          rustup toolchain install
+          pinned="$(rustup show active-toolchain | cut -d' ' -f1)"
+          rustup default "$pinned"
+          rustup toolchain list --quiet | grep -vxF "$pinned" | xargs -r -n1 rustup toolchain uninstall
+          rustup toolchain list
       - uses: Swatinem/rust-cache@v2
         if: matrix.rust-cache
         with:
@@ -1047,14 +1064,78 @@ jobs:
             helios/target/kernel-prebuild/aarch64-unknown-none/kernel-release/compiler_plugin.wasm
           if-no-files-found: error
           retention-days: 90
-      # A kernel built with HELIOS_CFI_SELF_TEST corrupts a signed return
-      # address once every processor has started, and the guest has to panic
-      # with a control-flow violation. It is a debug build of its own kernel
-      # and bootfs, so it runs after the steps that take the release image
-      # from the target directory. The test runs under `cargo test`, not
-      # nextest: its slow-timeout would kill the build it makes. The pinned
-      # QEMU is already on PATH, which is where the inspector looks for
-      # `qemu-system-aarch64`.
+  # A kernel built with HELIOS_CFI_SELF_TEST corrupts a signed return
+  # address once every processor has started, and the guest has to panic
+  # with a control-flow violation. The test builds a debug `helios-cli`,
+  # debug boot programs and a debug kernel of its own, none of which the
+  # `smoke-aarch64` boots use, so it runs beside that lane rather than
+  # after it (#883). It needs the pinned QEMU, the Limine share and the
+  # host dependencies the kernel build reads, and nothing the boots stage
+  # for their guests (WASI tooling, `wasm-tools`, zig, the release
+  # inspector). The test runs under `cargo test`, not nextest: its
+  # slow-timeout would kill the build it makes.
+  smoke-aarch64-cfi:
+    name: smoke-aarch64-cfi
+    needs: changes
+    if: contains(fromJSON(needs.changes.outputs.lanes), 'smoke-aarch64-cfi')
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 300
+    env:
+      # The QEMU `smoke-aarch64` pins, restored from the same cache entry.
+      QEMU_VERSION: "11.1.1"
+      QEMU_SHA256: 079ffbff8a7111bbc89022107cbabf3bbfd614d5fc9d7cc675991196aca12482
+      QEMU_PREFIX: ${{ github.workspace }}/qemu-install
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: helios
+      - uses: ./helios/.github/actions/checkout-wasmtime
+      - name: Install host dependencies
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/google-chrome*
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libudev-dev just cmake ninja-build erofs-utils \
+            python3-venv pkg-config flex bison \
+            libglib2.0-dev libpixman-1-dev libslirp-dev libfdt-dev zlib1g-dev \
+            swtpm
+      - name: Restore the pinned QEMU install prefix
+        id: qemu-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.QEMU_PREFIX }}
+          key: qemu-${{ env.QEMU_VERSION }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/.github/qemu/aarch64-configure.args') }}
+      - name: Build the pinned QEMU
+        if: steps.qemu-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          tarball="qemu-${QEMU_VERSION}.tar.xz"
+          curl -fsSLO "https://download.qemu.org/${tarball}"
+          echo "${QEMU_SHA256}  ${tarball}" | sha256sum -c -
+          tar xf "${tarball}"
+          cd "qemu-${QEMU_VERSION}"
+          mapfile -t flags < "${GITHUB_WORKSPACE}/helios/.github/qemu/aarch64-configure.args"
+          ./configure --prefix="${QEMU_PREFIX}" "${flags[@]}"
+          ninja -C build install
+      # The inspector looks for `qemu-system-aarch64` on PATH.
+      - name: Put the pinned QEMU on PATH
+        run: |
+          echo "${QEMU_PREFIX}/bin" >> "$GITHUB_PATH"
+      - name: Record the QEMU in use
+        run: |
+          command -v qemu-system-aarch64
+          qemu-system-aarch64 --version
+      - name: Stage Limine bootloader share
+        run: |
+          curl --fail --silent --show-error --location \
+            --output "$RUNNER_TEMP/limine-binary.tar.gz" \
+            https://github.com/limine-bootloader/limine/releases/download/v12.9.6/limine-binary.tar.gz
+          echo "b38aabb042b0c0f9f562b7741be3c1204838d7bbacfa78bb411c674bd5b984ee  $RUNNER_TEMP/limine-binary.tar.gz" \
+            | sha256sum --check -
+          mkdir -p "$GITHUB_WORKSPACE/limine"
+          tar -xzf "$RUNNER_TEMP/limine-binary.tar.gz" --strip-components=1 \
+            -C "$GITHUB_WORKSPACE/limine"
+          make -C "$GITHUB_WORKSPACE/limine"
       - name: Refuse a corrupted return address
         timeout-minutes: 60
         shell: bash
@@ -1454,6 +1535,40 @@ jobs:
           grep -Fqx oob-load:before-fault oob-load-smoke.out
           grep -Fqx guest-alive oob-load-smoke.out
           ! grep -Fq 'Kernel panic' oob-load-smoke.out
+      - name: Boot with online-capable processors that are not present
+        timeout-minutes: 5
+        shell: bash
+        working-directory: helios
+        run: |
+          set -o pipefail
+          # `-smp 2,maxcpus=4`: the MADT lists two enabled processors and
+          # two that are only online-capable. Boot builds a slot for all
+          # four and starts the two that are present (#493).
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/maxcpus"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            --accel kvm --smp 2 --max-processors 4 \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger \
+            --no-compiler-plugin \
+            shell --trace-log "$runtime/guest-tracing.log" \
+            -c 'echo guest-alive' \
+            2>&1 > maxcpus-smoke.out | tee "$runtime/inspector.log"
+          cat maxcpus-smoke.out
+          cat "$runtime/guest-tracing.log"
+          grep -Fqx guest-alive maxcpus-smoke.out
+          if grep -Fq 'Kernel panic' maxcpus-smoke.out "$runtime/inspector.log"; then
+            echo "the guest panicked" >&2
+            exit 1
+          fi
+          boot_log="$(cat "$runtime/inspector.log" "$runtime/guest-tracing.log")"
+          grep -Fq 'Processor topology possible=4' <<<"$boot_log"
+          grep -Fq 'Processor online processor=0' <<<"$boot_log"
+          grep -Fq 'Processor online processor=1' <<<"$boot_log"
+          if grep -Eq 'Processor online processor=[23]\b' <<<"$boot_log"; then
+            echo "a processor that is not present came online" >&2
+            exit 1
+          fi
       - name: Refuse a guest-written cwasm whose signature does not verify
         timeout-minutes: 5
         shell: bash

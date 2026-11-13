@@ -12,6 +12,7 @@ mod exceptions;
 mod extended_state;
 mod gpu;
 mod host_fs;
+mod hotplug;
 mod input;
 mod ioapic;
 mod iommu;
@@ -367,14 +368,21 @@ fn x86_kernel_main() -> ! {
     // through an ACPI SSDT. It is found before the root DRBG is seeded so
     // that the identifier the machine boots with is the one every later
     // observation is compared against.
-    let vmgenid_window = vmgenid::discover(
-        smp::PhysicalOffsetAcpiHandler {
-            physical_memory_offset,
-            tsc_base,
-            timebase,
-        },
-        rsdp_address,
-    );
+    // The machine's one AML namespace: vmgenid is found in it here, and
+    // the processor-hotplug task owns it once the SCI is routed.
+    let acpi_handler = smp::PhysicalOffsetAcpiHandler {
+        physical_memory_offset,
+        tsc_base,
+        timebase,
+    };
+    // SAFETY: the RSDP address comes from the bootloader's handoff and the
+    // handler maps through the direct map it left in place.
+    let acpi_tables = unsafe { acpi::AcpiTables::from_rsdp(acpi_handler.clone(), rsdp_address) }
+        .unwrap_or_else(|error| panic!("failed to parse ACPI tables: {error:?}"));
+    let acpi_recorder = helios_acpi::NotifyRecorder::new(acpi_handler);
+    let acpi_namespace = helios_acpi::load_namespace(&acpi_tables, &acpi_recorder)
+        .unwrap_or_else(|error| panic!("x86 ACPI: {error}"));
+    let vmgenid_window = vmgenid::discover(&acpi_namespace, physical_memory_offset);
     let machine_generation =
         helios_kernel::MachineGeneration::new(vmgenid_window.map(|found| found.window));
     match vmgenid_window {
@@ -438,8 +446,14 @@ fn x86_kernel_main() -> ! {
         &debug_state,
         root_entropy,
     );
+    // The SCI is routed with this processor's interrupts still masked,
+    // after its latch is installed, so no delivery precedes its handler.
+    let processor_hotplug = hotplug::install(&cpu, &acpi_tables, acpi_namespace, acpi_recorder);
     smp::join_shootdown_targets();
     x86_64::instructions::interrupts::enable();
+    if let Some(firmware) = processor_hotplug {
+        kernel.spawn_processor_hotplug(firmware);
+    }
     let program_service = helios_kernel::install_component_host_program_service(
         &kernel,
         &cpu,
@@ -455,7 +469,11 @@ fn x86_kernel_main() -> ! {
             cpu.processor_count(),
             cpu.bootstrap_processor(),
         ) {
-            cpu.start_processor(processor);
+            // A possible processor that is not present stays offline: its
+            // slot is built, and `ProcessorControl::online` starts it.
+            if cpu.state.present_at_boot(processor) {
+                cpu.start_processor(processor);
+            }
         }
     }
     run_current_processor(cpu, kernel, debug_state)
@@ -686,22 +704,19 @@ fn install_pci_devices<WatchdogImpl, MeasuredBootImpl>(
         DebugSerial::console().interrupt_handler::<DebugSerial>(),
     );
     cpu.platform_state().install_device_interrupts(routes);
-    cpu.platform_state().io_apic().program_redirection(
+    cpu.platform_state().io_apics().program_redirection(
+        ioapic::COM1,
         exceptions::DEBUG_SERIAL_INTERRUPT_VECTOR,
         destination_apic_id,
     );
 }
 
-/// Counts usable processors from the MADT. Runs before the bootstrap
-/// allocator is primed (the count sizes the allocator's per-processor
-/// structures), so it must not allocate: iterate MADT entries directly
-/// instead of building `AcpiPlatform` processor info.
+/// Counts the possible processors the MADT lists, present or not. Runs
+/// before the bootstrap allocator is primed (the count sizes the
+/// allocator's per-processor structures), so it must not allocate: it
+/// iterates the MADT entries directly.
 fn processor_count(rsdp_address: usize, physical_memory_offset: usize) -> usize {
-    use acpi::sdt::madt::{Madt, MadtEntry};
-
-    const LAPIC_ENABLED: u32 = 1 << 0;
-    const LAPIC_ONLINE_CAPABLE: u32 = 1 << 1;
-    const LAPIC_USABLE: u32 = LAPIC_ENABLED | LAPIC_ONLINE_CAPABLE;
+    use acpi::sdt::madt::Madt;
 
     let handler = smp::PhysicalOffsetAcpiHandler {
         physical_memory_offset,
@@ -715,16 +730,8 @@ fn processor_count(rsdp_address: usize, physical_memory_offset: usize) -> usize 
     let madt = tables
         .find_table::<Madt>()
         .unwrap_or_else(|| panic!("ACPI tables did not expose an MADT"));
-    let count = madt
-        .get()
-        .entries()
-        .filter(|entry| match entry {
-            MadtEntry::LocalApic(apic) => apic.flags & LAPIC_USABLE != 0,
-            MadtEntry::LocalX2Apic(apic) => apic.flags & LAPIC_USABLE != 0,
-            _ => false,
-        })
-        .count();
-    assert!(count > 0, "MADT did not list any usable processors");
+    let count = smp::possible_processors(madt.get()).count();
+    assert!(count > 0, "MADT did not list any possible processors");
     count
 }
 
