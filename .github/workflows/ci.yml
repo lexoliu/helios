@@ -2454,6 +2454,45 @@ jobs:
           path: smoke-runtime/cpu-lifecycle
           if-no-files-found: ignore
           retention-days: 14
+      # The same multi-queue tap the benchmark lane provisions: only a
+      # tap serves more than one queue pair, and the handoff of a
+      # departing processor's pair needs more than one.
+      - name: Provision the multi-queue tap network backend
+        working-directory: helios
+        run: |
+          sudo apt-get install -y --no-install-recommends \
+            iproute2 nftables dnsmasq-base
+          sudo modprobe vhost_net
+          sudo chmod 0666 /dev/vhost-net
+          ./target/release/helios-inspector vm net-setup \
+            --net-backend tap \
+            --net-ifname helios0 \
+            --net-bridge helios-br0 \
+            --net-dhcp
+      - name: Survive a processor offline mid-transfer
+        timeout-minutes: 30
+        shell: bash
+        working-directory: helios
+        run: |
+          tools/cpu-lifecycle/network.sh ./target/release/helios-inspector \
+            "$GITHUB_WORKSPACE/smoke-runtime/cpu-lifecycle-network" \
+            --net-ifname helios0 --net-bridge helios-br0
+      - name: Upload the network inspector runtime directory
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-x86-64-cpu-lifecycle-network-runtime
+          path: smoke-runtime/cpu-lifecycle-network
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Remove the tap network backend
+        if: always()
+        working-directory: helios
+        run: |
+          ./target/release/helios-inspector vm net-teardown \
+            --net-backend tap \
+            --net-ifname helios0 \
+            --net-bridge helios-br0
 
   # The 3D path against a real renderer: `gpu-test` opens a virgl
   # context, retires a fence on it, maps a host blob and a guest blob,
