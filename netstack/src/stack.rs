@@ -206,6 +206,23 @@ enum TcpLink {
     Unresolved { next_request_at: StackInstant },
 }
 
+/// What [`Stack::queue_tcp`] did with a segment.
+#[derive(Clone, Copy, Debug)]
+enum TcpQueued {
+    /// The segment is in the outbound queue.
+    Queued,
+    /// The next hop has no link-layer address yet, so the segment was
+    /// not queued; the next request for it may go out at
+    /// `next_request_at`.
+    Held { next_request_at: StackInstant },
+}
+
+impl TcpQueued {
+    fn is_queued(self) -> bool {
+        matches!(self, Self::Queued)
+    }
+}
+
 /// How a queued TCP segment carries its payload to the frame encoders.
 #[derive(Clone, Copy)]
 enum TcpTxPayload<'a> {
@@ -4410,15 +4427,28 @@ where
         } else {
             if let Some(header) = socket.pending_syn() {
                 let options = socket.pending_syn_options(now.nanos());
-                if self.queue_tcp_control(index, local, remote, header, options, now)? {
-                    self.active_tcp_socket_mut(index)
-                        .mark_syn_queued(now.nanos());
+                match self.queue_tcp_control(index, local, remote, header, options, now)? {
+                    TcpQueued::Queued => self
+                        .active_tcp_socket_mut(index)
+                        .mark_syn_queued(now.nanos()),
+                    TcpQueued::Held { next_request_at } => {
+                        // The handshake cannot go on until the SYN is
+                        // out, and the data pass below would clear the
+                        // wait just armed.
+                        self.await_tcp_resolution(index, next_request_at);
+                        return Ok(());
+                    }
                 }
             } else if let Some(header) = socket.pending_syn_ack() {
                 let options = socket.pending_syn_ack_options(now.nanos());
-                if self.queue_tcp_control(index, local, remote, header, options, now)? {
-                    self.active_tcp_socket_mut(index)
-                        .mark_syn_ack_queued(now.nanos());
+                match self.queue_tcp_control(index, local, remote, header, options, now)? {
+                    TcpQueued::Queued => self
+                        .active_tcp_socket_mut(index)
+                        .mark_syn_ack_queued(now.nanos()),
+                    TcpQueued::Held { next_request_at } => {
+                        self.await_tcp_resolution(index, next_request_at);
+                        return Ok(());
+                    }
                 }
             }
             self.emit_tcp_data(index, local, remote, budget, now)?;
@@ -4455,18 +4485,21 @@ where
         let sequence = segment.header.sequence;
         let identification = segment.sequence_len as u16;
         let hop_limit = self.tcp_socket_hop_limit(index);
-        if self.queue_tcp(
-            segment.local,
-            segment.remote,
-            TcpEgress {
-                header: segment.header,
-                options: segment.options,
-                payload: self.tcp_tx_payload(segment),
-                hop_limit,
-            },
-            identification,
-            now,
-        )? {
+        if self
+            .queue_tcp(
+                segment.local,
+                segment.remote,
+                TcpEgress {
+                    header: segment.header,
+                    options: segment.options,
+                    payload: self.tcp_tx_payload(segment),
+                    hop_limit,
+                },
+                identification,
+                now,
+            )?
+            .is_queued()
+        {
             self.active_tcp_socket_mut(index)
                 .mark_retransmission_queued(sequence, now.nanos());
             self.tcp_transmit_counters.retransmits_sent += 1;
@@ -4484,7 +4517,7 @@ where
         header: TcpHeader,
         options: TcpHeaderOptions,
         now: StackInstant,
-    ) -> Result<bool, StackError> {
+    ) -> Result<TcpQueued, StackError> {
         let hop_limit = self.tcp_socket_hop_limit(index);
         self.queue_tcp(
             local,
@@ -4498,6 +4531,15 @@ where
             index as u16,
             now,
         )
+    }
+
+    /// Makes socket `index`'s deadline the next request for the next
+    /// hop's link-layer address rather than a pacing time its writer
+    /// would be woken on again and again, so that a request or reply
+    /// lost on the wire is asked for again on schedule.
+    fn await_tcp_resolution(&mut self, index: usize, next_request_at: StackInstant) {
+        self.active_tcp_socket_mut(index)
+            .await_resolution(next_request_at.nanos());
     }
 
     /// Sends the next segment `index` has queued, if any.
@@ -4524,11 +4566,7 @@ where
             match self.resolve_tcp_link_address(local, remote, now)? {
                 TcpLink::Resolved(link) => Some(link),
                 TcpLink::Unresolved { next_request_at } => {
-                    // The socket's deadline becomes the next request
-                    // rather than a pacing time its writer would be
-                    // woken on again and again.
-                    self.active_tcp_socket_mut(index)
-                        .await_resolution(next_request_at.nanos());
+                    self.await_tcp_resolution(index, next_request_at);
                     return Ok(());
                 }
             }
@@ -4586,7 +4624,7 @@ where
         // retransmits a hole ahead of its own timer.
         for ack in 0..acks {
             let queued = match self.queue_tcp_control(index, local, remote, header, options, now) {
-                Ok(queued) => queued,
+                Ok(queued) => queued.is_queued(),
                 // The first acknowledgement is what the peer is
                 // owed; the duplicates behind it are a loss hint,
                 // and must not take the last outbound slot from the
@@ -5425,15 +5463,16 @@ where
         segment: TcpEgress<'_>,
         identification: u16,
         now: StackInstant,
-    ) -> Result<bool, StackError> {
+    ) -> Result<TcpQueued, StackError> {
         self.ensure_tcp_segment_fits(local, remote, &segment)?;
-        let TcpLink::Resolved(destination_mac) =
-            self.resolve_tcp_link_address(local, remote, now)?
-        else {
-            return Ok(false);
+        let destination_mac = match self.resolve_tcp_link_address(local, remote, now)? {
+            TcpLink::Resolved(destination_mac) => destination_mac,
+            TcpLink::Unresolved { next_request_at } => {
+                return Ok(TcpQueued::Held { next_request_at });
+            }
         };
         self.queue_tcp_frame(destination_mac, local, remote, segment, identification)?;
-        Ok(true)
+        Ok(TcpQueued::Queued)
     }
 
     /// Checks `segment` against the path MTU. A coalesced burst is
@@ -6733,17 +6772,42 @@ where
         true
     }
 
-    /// A Neighbor Advertisement this host received on another stack,
-    /// offered to this one as the answer to a resolution it is pending;
-    /// it changes nothing else. Returns whether the advertisement
+    /// The ARP half of [`Self::answer_resolution`]: a reply to one of
+    /// this host's addresses from the address this stack is asking for.
+    fn answer_arp_resolution(&mut self, bytes: &[u8], now: StackInstant) -> bool {
+        let Some(packet) = ArpPacket::parse(bytes) else {
+            return false;
+        };
+        let sender = IpAddress::Ipv4(packet.sender_protocol);
+        if packet.operation != ArpOperation::Reply
+            || !self
+                .ipv4_addresses
+                .iter()
+                .any(|address| address.address() == packet.target_protocol)
+            || !self.pending_resolutions.contains(sender)
+        {
+            return false;
+        }
+        self.learn_neighbor(NeighborEntry {
+            ip: sender,
+            mac: packet.sender_hardware,
+            state: NeighborState::Reachable,
+            updated_at: now,
+        });
+        true
+    }
+
+    /// A Neighbor Advertisement or an ARP reply this host received on
+    /// another stack, offered to this one as the answer to a resolution
+    /// it is pending; it changes nothing else. Returns whether the frame
     /// completed a resolution, in which case the neighbor is cached and
     /// reported through [`StackEvent::NeighborUpdated`].
     ///
     /// The frame is checked as [`Stack::receive_rx_frame`] checks it, and
-    /// an advertisement for an address this stack is not asking for is
-    /// discarded (RFC 4861 section 7.2.5), so neither a neighbor this
-    /// stack holds nor one it does not is created or updated here:
-    /// updates belong to the stack that received the frame.
+    /// an advertisement (RFC 4861 section 7.2.5) or a reply for an
+    /// address this stack is not asking for is discarded, so neither a
+    /// neighbor this stack holds nor one it does not is created or
+    /// updated here: updates belong to the stack that received the frame.
     ///
     /// Concurrency: runs on the shard that owns this stack, under its lock.
     pub fn answer_resolution(&mut self, frame: &RxFrame, now: StackInstant) -> bool {
@@ -6753,8 +6817,10 @@ where
         let Some(ethernet) = EthernetFrame::parse(frame.bytes.as_ref()) else {
             return false;
         };
-        if ethernet.protocol != EthernetProtocol::Ipv6 {
-            return false;
+        match ethernet.protocol {
+            EthernetProtocol::Arp => return self.answer_arp_resolution(ethernet.payload, now),
+            EthernetProtocol::Ipv6 => {}
+            _ => return false,
         }
         let Some(packet) = Ipv6Packet::parse(ethernet.payload) else {
             return false;
@@ -18756,6 +18822,80 @@ mod tests {
         assert_eq!(ethernet.destination, PEER_MAC);
     }
 
+    /// An ARP frame offered to `stack` as another stack's answer, and
+    /// whether the stack took it.
+    fn offer_arp(
+        stack: &mut Stack,
+        operation: ArpOperation,
+        sender: Ipv4Address,
+        target: Ipv4Address,
+        now: u64,
+    ) -> bool {
+        let (frame, len) = arp_frame(operation, PEER_MAC, sender, target);
+        stack.answer_resolution(
+            &RxFrame::new(Bytes::copy_from_slice(&frame[..len])),
+            StackInstant::from_nanos(now),
+        )
+    }
+
+    #[test]
+    fn an_arp_reply_answers_the_resolution_that_asked_for_it() {
+        let mut stack = stack_with_unresolved_gateway();
+        assert!(
+            !offer_arp(&mut stack, ArpOperation::Reply, GATEWAY, LOCAL_V4, 1),
+            "a reply nobody asked for is not learned through this path"
+        );
+        assert_eq!(stack.neighbors().count(), 0);
+
+        assert_eq!(send_to_remote(&mut stack, 2), Ok(0));
+        while stack.take_outbound().is_some() {}
+        while stack.take_event().is_some() {}
+
+        let other = Ipv4Address::new([10, 0, 0, 99]);
+        assert!(
+            !offer_arp(&mut stack, ArpOperation::Reply, other, LOCAL_V4, 3),
+            "a reply from an address nobody is asking for is not an answer"
+        );
+        assert!(
+            !offer_arp(&mut stack, ArpOperation::Reply, GATEWAY, other, 3),
+            "a reply to an address that is not ours is not an answer"
+        );
+        assert!(
+            !offer_arp(&mut stack, ArpOperation::Request, GATEWAY, LOCAL_V4, 3),
+            "a request is not an answer"
+        );
+        assert_eq!(stack.neighbors().count(), 0);
+        assert!(stack.take_event().is_none(), "nothing is reported");
+        assert!(
+            stack.pending_resolutions.contains(IpAddress::Ipv4(GATEWAY)),
+            "the gateway is still being asked for"
+        );
+
+        assert!(offer_arp(
+            &mut stack,
+            ArpOperation::Reply,
+            GATEWAY,
+            LOCAL_V4,
+            4
+        ));
+        assert_eq!(
+            stack
+                .neighbors()
+                .map(|entry| (entry.ip, entry.mac, entry.state))
+                .collect::<Vec<_>>(),
+            [(IpAddress::Ipv4(GATEWAY), PEER_MAC, NeighborState::Reachable)]
+        );
+        assert!(matches!(
+            stack.take_event(),
+            Some(StackEvent::NeighborUpdated(entry)) if entry.ip == IpAddress::Ipv4(GATEWAY)
+        ));
+        assert!(
+            !stack.pending_resolutions.contains(IpAddress::Ipv4(GATEWAY)),
+            "the resolution is over"
+        );
+        assert_eq!(send_to_remote(&mut stack, 5), Ok(5));
+    }
+
     #[test]
     fn cycling_through_more_unresolved_addresses_than_the_stack_paces_lifts_no_limit() {
         let mut stack = stack_with_unresolved_gateway();
@@ -19443,19 +19583,21 @@ mod tests {
         identification: u16,
         now: StackInstant,
     ) -> Result<bool, StackError> {
-        stack.queue_tcp(
-            TcpEndpoint {
-                address: IpAddress::Ipv4(source),
-                port: segment.header.source_port,
-            },
-            TcpEndpoint {
-                address: IpAddress::Ipv4(destination),
-                port: segment.header.destination_port,
-            },
-            segment,
-            identification,
-            now,
-        )
+        stack
+            .queue_tcp(
+                TcpEndpoint {
+                    address: IpAddress::Ipv4(source),
+                    port: segment.header.source_port,
+                },
+                TcpEndpoint {
+                    address: IpAddress::Ipv4(destination),
+                    port: segment.header.destination_port,
+                },
+                segment,
+                identification,
+                now,
+            )
+            .map(TcpQueued::is_queued)
     }
 
     fn flow_peer_neighbor() -> NeighborEntry {
@@ -19665,6 +19807,44 @@ mod tests {
         let flows: BTreeSet<u16> = frames.iter().map(|frame| frame.flow).collect();
         assert_eq!(frames.len(), 20);
         assert_eq!(flows.len(), 20);
+    }
+
+    /// A SYN held for its next hop's address leaves the socket with the
+    /// next request for that address as its deadline, and the request
+    /// goes out again when it is reached.
+    #[test]
+    fn a_syn_held_for_an_unresolved_next_hop_arms_the_resolution_retry() {
+        let mut stack = flow_stack(false);
+        flow_connect(&mut stack, 0);
+        stack
+            .drive_tcp(at(1))
+            .expect("an unresolved next hop leaves the SYN pending");
+        let first = stack.take_outbound().expect("the next hop is asked for");
+        let arp = |frame: &PacketBuffer| {
+            let ethernet =
+                EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
+            assert_eq!(ethernet.protocol, EthernetProtocol::Arp);
+            ArpPacket::parse(ethernet.payload).expect("ARP packet should parse")
+        };
+        assert_eq!(arp(&first).target_protocol, FLOW_PEER);
+        assert!(stack.take_outbound().is_none(), "no SYN without an address");
+
+        let retry = 1 + ONE_SECOND;
+        assert_eq!(
+            stack.next_tcp_deadline(),
+            Some(at(retry)),
+            "the socket waits for the next request, not for a pump timeout"
+        );
+
+        stack.drive_tcp(at(retry)).expect("the retry should run");
+        let second = stack.take_outbound().expect("the request is repeated");
+        assert_eq!(arp(&second).target_protocol, FLOW_PEER);
+        assert!(stack.take_outbound().is_none());
+
+        stack.learn_neighbor(flow_peer_neighbor());
+        let frames = settle(&mut stack, retry + 1);
+        assert_eq!(frames.len(), 1, "{frames:?}");
+        assert_eq!(frames[0].flags, TcpFlags::SYN);
     }
 
     #[test]

@@ -368,6 +368,7 @@ where
         port: u16,
         local_port: u16,
         hop_limit: u8,
+        processor: helios_hal::cpu::ProcessorId,
         timeout_nanos: u64,
     ) -> Result<Self::TcpStream, TcpError> {
         NetworkService::tcp_connect_address(
@@ -376,6 +377,7 @@ where
             port,
             local_port,
             hop_limit,
+            processor,
             timeout_nanos,
         )
         .await
