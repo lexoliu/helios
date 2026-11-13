@@ -808,6 +808,15 @@ where
     bytes_in_flight: u32,
     /// Bytes of the in-flight segments a SACK block covers.
     sacked_bytes: u32,
+    /// Bytes counted delivered on duplicate ACKs from a peer that sends
+    /// no SACK, not yet covered by the cumulative acknowledgement.
+    ///
+    /// Each such duplicate reports one segment that left the network
+    /// past the hole, so it is counted delivered when it arrives, as
+    /// Linux's `tcp_add_reno_sack` emulates a SACK for it; the
+    /// cumulative ACK that later covers those segments counts only what
+    /// the duplicates did not (`tcp_remove_reno_sacks`).
+    reno_sacked_bytes: u32,
     delivered_bytes: u64,
     syn_queued: bool,
     syn_ack_queued: bool,
@@ -1002,6 +1011,7 @@ where
             in_flight: None,
             bytes_in_flight: 0,
             sacked_bytes: 0,
+            reno_sacked_bytes: 0,
             delivered_bytes: 0,
             syn_queued: false,
             syn_ack_queued: false,
@@ -1866,6 +1876,7 @@ where
             self.set_state(TcpState::Closed, TcpStateChangeReason::RetransmissionLimit);
             self.bytes_in_flight = 0;
             self.sacked_bytes = 0;
+            self.reno_sacked_bytes = 0;
             if let Some(in_flight) = self.in_flight.as_mut() {
                 in_flight.clear();
             }
@@ -2290,6 +2301,7 @@ where
         self.set_state(TcpState::Closed, TcpStateChangeReason::Abort);
         self.bytes_in_flight = 0;
         self.sacked_bytes = 0;
+        self.reno_sacked_bytes = 0;
         self.receive_queue = None;
         self.receive_queued_bytes = 0;
         self.receive_fin_sequence = None;
@@ -2493,7 +2505,11 @@ where
         duplicate_ack_eligible: bool,
     ) -> Option<RecoveryAction> {
         if sequence_leq(acknowledgement, self.send_unacknowledged) {
-            let action = (acknowledgement == self.send_unacknowledged && duplicate_ack_eligible)
+            let duplicate = acknowledgement == self.send_unacknowledged && duplicate_ack_eligible;
+            if duplicate && !self.peer_sack_permitted {
+                self.count_reno_sack();
+            }
+            let action = duplicate
                 .then(|| self.note_duplicate_ack(now_nanos))
                 .flatten();
             // A window update carried by an ACK that acknowledges
@@ -2522,11 +2538,21 @@ where
             self.pending_pmtu_retransmit_sequence = None;
         }
         let probe_acked = self.discard_acked_persist_probe(acknowledgement);
+        // `tcp_remove_reno_sacks`: the first segment the cumulative ACK
+        // covers is the hole and counts in full; the rest were counted by
+        // the duplicates they drew, as far as those reach.
+        let hole = self
+            .in_flight
+            .as_ref()
+            .and_then(TcpInFlightQueue::front)
+            .map_or(0, |segment| segment.sequence_len);
+        let reno_credit = self.reno_sacked_bytes.min(acked.saturating_sub(hole));
+        self.reno_sacked_bytes -= reno_credit;
         self.bytes_in_flight = self.bytes_in_flight.saturating_sub(acked);
         self.discard_acked_segments(acknowledgement);
         self.delivered_bytes = self
             .delivered_bytes
-            .saturating_add(u64::from(acked.saturating_add(probe_acked)));
+            .saturating_add(u64::from((acked - reno_credit).saturating_add(probe_acked)));
         // RFC 6582 section 3.2, step 5: an acknowledgement that advances
         // but stops short of the recovery point names the next hole, and
         // the sender resends it without waiting for three more
@@ -2640,9 +2666,30 @@ where
 
     /// `C.inflight`, RFC 6675's pipe: what was sent and is still
     /// believed in the network. Outstanding data less what the peer
-    /// selectively acknowledged.
+    /// selectively acknowledged and, from a peer that sends no SACK,
+    /// what its duplicate ACKs reported delivered.
+    ///
+    /// The duplicate-ACK estimate is bounded when each duplicate
+    /// arrives and only estimates which segments left, so that last
+    /// term saturates as Linux's `tcp_packets_in_flight` relies on
+    /// `tcp_limit_reno_sacked` to.
     fn pipe_bytes(&self) -> u32 {
-        self.bytes_in_flight - self.sacked_bytes
+        (self.bytes_in_flight - self.sacked_bytes).saturating_sub(self.reno_sacked_bytes)
+    }
+
+    /// `tcp_add_reno_sack`: a duplicate ACK from a peer that sends no
+    /// SACK reports one segment past the hole delivered. It counts as
+    /// delivered now, bounded, as Linux's `tcp_limit_reno_sacked`
+    /// bounds it, by what is outstanding past the hole.
+    fn count_reno_sack(&mut self) {
+        let Some(front) = self.in_flight.as_ref().and_then(TcpInFlightQueue::front) else {
+            return;
+        };
+        let limit = self.bytes_in_flight.saturating_sub(front.sequence_len);
+        let segment = u32::try_from(self.peer_max_segment_size).unwrap_or(u32::MAX);
+        let credited = segment.min(limit.saturating_sub(self.reno_sacked_bytes));
+        self.reno_sacked_bytes += credited;
+        self.delivered_bytes = self.delivered_bytes.saturating_add(u64::from(credited));
     }
 
     fn ack_sample_timing(
@@ -4075,6 +4122,39 @@ mod tests {
             .take_transmit_segment(now, full_segment_budget())
             .expect("two segments left the network, so new data may follow");
         assert_eq!(segment.header.sequence, hole + 4 * mss);
+    }
+
+    #[test]
+    fn duplicates_without_sack_count_one_segment_delivered_each() {
+        let mss = TCP_RECEIVE_SEGMENT_BYTES as u32;
+        let mut socket = established_window_socket(6, TcpOptions::empty());
+        let sent_at = TCP_INITIAL_RTO_NANOS + 1;
+        let hole = send_flight(&mut socket, 6, sent_at);
+        let delivered_before = socket.delivered_bytes;
+
+        for duplicate in 1..=5 {
+            let now = sent_at + duplicate;
+            let _ = deliver_segment(&mut socket, peer_ack(hole, u16::MAX), now);
+            if duplicate == 3 {
+                socket.mark_retransmission_queued(hole, now);
+            }
+        }
+        // Each duplicate reported one segment past the hole delivered,
+        // and only the resent hole is still in the network.
+        assert_eq!(
+            socket.delivered_bytes - delivered_before,
+            u64::from(5 * mss)
+        );
+        assert_eq!(socket.pipe_bytes(), mss);
+
+        // The cumulative ACK that covers everything counts only the hole.
+        let _ = deliver_segment(&mut socket, peer_ack(hole + 6 * mss, u16::MAX), sent_at + 6);
+        assert_eq!(
+            socket.delivered_bytes - delivered_before,
+            u64::from(6 * mss)
+        );
+        assert_eq!(socket.reno_sacked_bytes, 0);
+        assert_eq!(socket.pipe_bytes(), 0);
     }
 
     #[test]
