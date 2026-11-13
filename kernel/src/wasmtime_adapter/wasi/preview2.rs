@@ -2558,6 +2558,10 @@ where
         };
         let profile_cpu = self.cpu.clone();
         let profile_runtime_state = self.runtime_state.clone();
+        // The detached task is polled by whichever processor takes it
+        // from the global queue, so the processor the connection belongs
+        // to is read here, on the instance's own.
+        let processor = helios_hal::cpu::current_processor();
         let spawned = self.spawner().try_spawn_detached({
             let inner = inner.clone();
             async move {
@@ -2568,6 +2572,7 @@ where
                         remote_address.port,
                         local_port,
                         hop_limit,
+                        processor,
                         u64::MAX,
                     )
                     .await;

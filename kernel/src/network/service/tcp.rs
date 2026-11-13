@@ -154,6 +154,7 @@ where
         port: u16,
         local_port: u16,
         hop_limit: u8,
+        processor: helios_hal::cpu::ProcessorId,
         timeout_nanos: u64,
     ) -> Result<TcpStreamId, TcpError> {
         self.execute_tcp_connect_address(
@@ -161,6 +162,7 @@ where
             port,
             local_port,
             hop_limit,
+            processor,
             timeout_nanos,
         )
         .await
@@ -522,6 +524,7 @@ where
     ) -> Result<TcpStreamId, TcpError> {
         let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
         let candidates = self.resolve_host_tcp(host, deadline_nanos).await?;
+        let processor = helios_hal::cpu::current_processor();
         // Every candidate shares the caller's deadline: a refused or
         // unreachable answer hands whatever time is left to the next
         // address instead of restarting the timeout.
@@ -531,6 +534,7 @@ where
                 port,
                 local_port,
                 hop_limit,
+                processor,
                 deadline_nanos,
             )
         })
@@ -543,6 +547,7 @@ where
         port: u16,
         local_port: u16,
         hop_limit: u8,
+        processor: helios_hal::cpu::ProcessorId,
         timeout_nanos: u64,
     ) -> Result<TcpStreamId, TcpError> {
         let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
@@ -551,17 +556,24 @@ where
             port,
             local_port,
             hop_limit,
+            processor,
             deadline_nanos,
         )
         .await
     }
 
+    /// Opens a connection to `destination` on the shard `processor` maps
+    /// to and waits for its handshake. `processor` is chosen by the
+    /// caller, never read here: this future may be polled by any
+    /// processor, and the connection has to be received where its owner
+    /// reads it.
     pub(super) async fn execute_tcp_connect_address_until(
         &self,
         destination: IpAddress,
         port: u16,
         local_port: u16,
         hop_limit: u8,
+        processor: helios_hal::cpu::ProcessorId,
         deadline_nanos: u64,
     ) -> Result<TcpStreamId, TcpError> {
         if matches!(destination, IpAddress::Ipv4(_)) {
@@ -583,7 +595,7 @@ where
             // (TIME-WAIT included) can only be seen by opening, so the
             // walk moves on at that conflict instead of failing.
             self.inner.state.open_ephemeral_tcp_connect(
-                self.accepting_shard_idx(),
+                self.inner.state.shard_idx_for_processor(processor),
                 TcpConnectRequest {
                     local,
                     destination,

@@ -1988,7 +1988,14 @@ where
     // The typed address entry point keeps the family intact; formatting
     // it back into a host string would lose IPv6 outright.
     let stream = match service
-        .tcp_connect_address(address, port, local_port, hop_limit, timeout)
+        .tcp_connect_address(
+            address,
+            port,
+            local_port,
+            hop_limit,
+            helios_hal::cpu::current_processor(),
+            timeout,
+        )
         .await
     {
         Ok(stream) => stream,

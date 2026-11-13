@@ -1178,6 +1178,7 @@ mod network {
             _: u16,
             local_port: u16,
             _: u8,
+            _: helios_hal::cpu::ProcessorId,
             _: u64,
         ) -> impl core::future::Future<Output = Result<Self::TcpStream, crate::TcpError>> + Send + '_
         {

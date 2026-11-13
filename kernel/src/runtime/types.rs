@@ -8,6 +8,7 @@ use core::ptr;
 
 use crate::InstanceId;
 use bytes::Bytes;
+use helios_hal::cpu::ProcessorId;
 use helios_hal::fs::{WritePosition, WriteProgress};
 use helios_hal::io::IoError;
 use thiserror::Error;
@@ -768,12 +769,19 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
     /// The hop limit is applied before the SYN leaves the stack, so a guest
     /// that sets it on an unconnected socket sees it on every packet of the
     /// connection rather than from the first data segment onwards.
+    ///
+    /// `processor` is the processor the connection belongs to: the one
+    /// its owner runs on, read by the caller before it hands the connect
+    /// to a task that may be polled anywhere. The connection is opened
+    /// on that processor's shard, so its segments are received where its
+    /// reader runs.
     fn tcp_connect_address(
         &self,
         remote_address: NetworkIpAddress,
         port: u16,
         local_port: u16,
         hop_limit: u8,
+        processor: ProcessorId,
         timeout_nanos: u64,
     ) -> impl Future<Output = Result<Self::TcpStream, TcpError>> + Send + '_;
 

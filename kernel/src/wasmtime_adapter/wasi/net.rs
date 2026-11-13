@@ -837,6 +837,7 @@ impl TcpSocket {
                 remote_address.port,
                 local_port,
                 hop_limit,
+                helios_hal::cpu::current_processor(),
                 u64::MAX,
             )
             .await

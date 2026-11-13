@@ -331,6 +331,7 @@ mod tests {
             _: u16,
             local_port: u16,
             _: u8,
+            _: helios_hal::cpu::ProcessorId,
             _: u64,
         ) -> impl Future<Output = Result<Self::TcpStream, TcpError>> + Send + '_ {
             core::future::ready(Ok(if local_port == 0 {

@@ -629,6 +629,7 @@ impl ComponentNetworkService for BenchNetworkService {
         _port: u16,
         _local_port: u16,
         _hop_limit: u8,
+        _processor: ProcessorId,
         _timeout_nanos: u64,
     ) -> Result<Self::TcpStream, TcpError> {
         Ok(1)
