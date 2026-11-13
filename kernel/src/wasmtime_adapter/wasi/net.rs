@@ -1441,35 +1441,37 @@ where
         _: bool,
     ) -> Poll<Result<StreamResult>> {
         let mut this = self.project();
-        if this.pending.is_none() {
-            // One chunk per poll, the size preview1's `sock_send` moves to
-            // the same socket; the guest's `stream.write` returns the
-            // count taken and the rest is its next write.
-            let bytes = read_bounded_chunk(&mut source, &mut store, GUEST_IO_CHUNK_BYTES)?;
-            if bytes.is_empty() {
-                return Poll::Ready(Ok(StreamResult::Completed));
+        // The guest's whole write, one chunk at a time: `Completed` ends its
+        // `stream.write`, so it is reported only once the source is empty.
+        loop {
+            if this.pending.is_none() {
+                // One chunk per write, the size preview1's `sock_send`
+                // moves to the same socket.
+                let bytes = read_bounded_chunk(&mut source, &mut store, GUEST_IO_CHUNK_BYTES)?;
+                if bytes.is_empty() {
+                    return Poll::Ready(Ok(StreamResult::Completed));
+                }
+                let write = (*this.start)(
+                    this.socket.clone(),
+                    this.service.clone(),
+                    Bytes::from(bytes),
+                );
+                this.pending.set(Some(write));
             }
-            let write = (*this.start)(
-                this.socket.clone(),
-                this.service.clone(),
-                Bytes::from(bytes),
-            );
-            this.pending.set(Some(write));
-        }
 
-        let result = match this.pending.as_mut().as_pin_mut() {
-            Some(pending) => match pending.poll(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(result) => result,
-            },
-            None => unreachable!("tcp write future must be present before polling"),
-        };
-        this.pending.set(None);
-        match result {
-            Ok(()) => Poll::Ready(Ok(StreamResult::Completed)),
-            Err(error) => {
+            let result = match this.pending.as_mut().as_pin_mut() {
+                Some(pending) => match pending.poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(result) => result,
+                },
+                None => unreachable!("tcp write future must be present before polling"),
+            };
+            this.pending.set(None);
+            if let Err(error) = result {
+                // The error is reported through `completion`, the chunk in
+                // hand is lost and the rest of the write stays unread.
                 complete_socket_transfer(this.completion, Err(error));
-                Poll::Ready(Ok(StreamResult::Dropped))
+                return Poll::Ready(Ok(StreamResult::Dropped));
             }
         }
     }

@@ -14,9 +14,11 @@ pub(super) const fn bounded_chunk_len(remaining: usize, limit: usize) -> usize {
 /// every consumer that copies a write out of guest memory reads through
 /// this and names the bound of its own sink.
 ///
-/// The writer is told how many bytes were taken (`Source::read` advances
-/// the write by what it moved), and Wasmtime does not poll again for the
-/// rest: the guest's `stream.write` completes with that short count.
+/// `Source::read` advances the write by what it moved, and a consumer that
+/// reports `Completed` ends the guest's `stream.write` with that count: a
+/// guest that writes once and does not loop loses the rest. A consumer
+/// therefore reads chunk after chunk until the source is empty
+/// ([`drain_write`]) and reports `Completed` only then.
 pub(super) fn read_bounded_chunk<T: 'static>(
     source: &mut Source<'_, u8>,
     store: &mut StoreContextMut<'_, T>,
@@ -28,6 +30,37 @@ pub(super) fn read_bounded_chunk<T: 'static>(
         source.read(&mut *store, &mut bytes)?;
     }
     Ok(bytes)
+}
+
+/// The loop of a consumer whose sink takes owned [`Bytes`]: take one chunk
+/// of the write into `pending`, hand it to `flush`, and take the next until
+/// the source is empty. `flush` answers `Ready(None)` when `pending` went
+/// out whole, `Ready(Some(result))` to end the poll with `result` (the sink
+/// closed), and `Pending` when the sink is full, which parks with `pending`
+/// kept for the next poll. Kernel memory holds one chunk, never the write.
+///
+/// `Completed` is reported only when the source is empty, which is also
+/// where a zero-length write ends.
+pub(super) fn drain_write<T: 'static>(
+    source: &mut Source<'_, u8>,
+    store: &mut StoreContextMut<'_, T>,
+    pending: &mut Option<Bytes>,
+    mut flush: impl FnMut(&mut StoreContextMut<'_, T>, &mut Option<Bytes>) -> Poll<Option<StreamResult>>,
+) -> Poll<Result<StreamResult>> {
+    loop {
+        if pending.is_none() {
+            let bytes = read_bounded_chunk(source, store, GUEST_IO_CHUNK_BYTES)?;
+            if bytes.is_empty() {
+                return Poll::Ready(Ok(StreamResult::Completed));
+            }
+            *pending = Some(Bytes::from(bytes));
+        }
+        match flush(store, pending) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Some(result)) => return Poll::Ready(Ok(result)),
+            Poll::Ready(None) => {}
+        }
+    }
 }
 
 pub(super) struct SerialStreamConsumer<T, CpuImpl, Net, StorageImpl>
@@ -104,18 +137,20 @@ where
 {
     type Item = u8;
 
-    /// Copy one chunk of the guest's batch into the store's stdout/stderr
-    /// sink.
-    ///
-    /// The chunk is [`GUEST_IO_CHUNK_BYTES`] at most and the guest's
-    /// `stream.write` returns the count taken, so the rest of a larger
-    /// write comes back as the guest's next write. The console segments
-    /// what it is offered at its own bound, so a chunk costs one pass
-    /// through that loop, and `pending` never holds more than one chunk.
+    /// Copy the guest's whole write into the store's stdout/stderr sink,
+    /// one chunk of [`GUEST_IO_CHUNK_BYTES`] at most at a time
+    /// ([`drain_write`]), so the guest's single `stream.write` takes all of
+    /// it. The console segments what it is offered at its own bound, so a
+    /// chunk costs one pass through that loop, and `pending` never holds
+    /// more than one chunk.
     ///
     /// A child-pipe sink is bounded, so this parks — `pending` keeps the
     /// bytes and `poll_write_output_bytes` registers the waker — instead
-    /// of dropping the batch or reporting a spurious error.
+    /// of dropping the batch or reporting a spurious error; the poll after
+    /// the wake carries on with the rest of the write. `finish` is not
+    /// consulted: the sink never errors or closes, so the forwarding is
+    /// allowed to complete, as the Wasmtime contract permits when the
+    /// writer has no way to learn how much was forwarded.
     fn poll_consume(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -123,27 +158,21 @@ where
         mut source: Source<'_, Self::Item>,
         _: bool,
     ) -> Poll<Result<StreamResult>> {
-        if self.pending.is_none() {
-            let bytes = read_bounded_chunk(&mut source, &mut store, GUEST_IO_CHUNK_BYTES)?;
-            if bytes.is_empty() {
-                return Poll::Ready(Ok(StreamResult::Completed));
-            }
-            self.pending = Some(Bytes::from(bytes));
-        }
-
         let consumer = &mut *self;
         let getter = consumer.getter;
         let stream = consumer.stream;
-        match getter(store.data_mut()).poll_write_output_bytes(
-            stream,
-            cx,
-            &mut consumer.write_wait,
-            &mut consumer.serial_wait,
+        let write_wait = &mut consumer.write_wait;
+        let serial_wait = &mut consumer.serial_wait;
+        drain_write(
+            &mut source,
+            &mut store,
             &mut consumer.pending,
-        ) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(()) => Poll::Ready(Ok(StreamResult::Completed)),
-        }
+            |store, pending| {
+                getter(store.data_mut())
+                    .poll_write_output_bytes(stream, cx, write_wait, serial_wait, pending)
+                    .map(|()| None)
+            },
+        )
     }
 }
 
@@ -323,15 +352,18 @@ impl Drop for ChannelStreamConsumer {
 impl<T: 'static> StreamConsumer<T> for ChannelStreamConsumer {
     type Item = u8;
 
-    /// Copy one chunk of the parent's batch into the child's stdin channel,
-    /// parking on a full channel the way
+    /// Copy the parent's whole write into the child's stdin channel, one
+    /// chunk at a time ([`drain_write`]), parking on a full channel the way
     /// [`TcpWriteConsumer`](super::net::TcpWriteConsumer) parks on a busy
     /// socket.
     ///
     /// The channel bounds how many chunks it queues, not their size, so a
     /// chunk is [`GUEST_IO_CHUNK_BYTES`] at most and what the channel
-    /// holds is that many bytes per slot. The guest's `stream.write`
-    /// returns the count taken and the rest is its next write.
+    /// holds is that many bytes per slot. The guest's single `stream.write`
+    /// takes all of the write: `Completed` is reported once the source is
+    /// empty. A closed channel ends the stream with `Dropped`, discarding
+    /// the chunk in hand and leaving the rest of the write unread. `finish`
+    /// is not consulted: the forwarding is allowed to run on.
     fn poll_consume(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -339,23 +371,22 @@ impl<T: 'static> StreamConsumer<T> for ChannelStreamConsumer {
         mut source: Source<'_, Self::Item>,
         _: bool,
     ) -> Poll<Result<StreamResult>> {
-        if self.pending.is_none() {
-            let bytes = read_bounded_chunk(&mut source, &mut store, GUEST_IO_CHUNK_BYTES)?;
-            if bytes.is_empty() {
-                return Poll::Ready(Ok(StreamResult::Completed));
-            }
-            self.pending = Some(Bytes::from(bytes));
-        }
-
         let consumer = &mut *self;
-        let wait = consumer
-            .write_wait
-            .get_or_insert_with(|| consumer.writer.wait_state());
-        match consumer.writer.poll_write(cx, wait, &mut consumer.pending) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(StreamResult::Completed)),
-            Poll::Ready(Err(_closed)) => Poll::Ready(Ok(StreamResult::Dropped)),
-        }
+        let writer = &consumer.writer;
+        let write_wait = &mut consumer.write_wait;
+        drain_write(
+            &mut source,
+            &mut store,
+            &mut consumer.pending,
+            |_, pending| {
+                let wait = write_wait.get_or_insert_with(|| writer.wait_state());
+                match writer.poll_write(cx, wait, pending) {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(Ok(())) => Poll::Ready(None),
+                    Poll::Ready(Err(_closed)) => Poll::Ready(Some(StreamResult::Dropped)),
+                }
+            },
+        )
     }
 }
 
@@ -367,6 +398,7 @@ mod tests {
         TestStoreData, store_data_routed,
     };
     use futures_lite::future::block_on;
+    use wasmtime::AsContextMut;
     use wasmtime::component::StreamReader;
 
     /// A guest write several chunks long whose last chunk is short, with
@@ -420,6 +452,40 @@ mod tests {
         assert_eq!(arrived, guest, "every byte arrives, in order");
     }
 
+    /// Wraps a consumer and records, for every `Completed` it reports, how
+    /// many bytes of the guest's write were still unread: the guest's
+    /// `stream.write` ends with that result, so a nonzero figure is a write
+    /// that ended short. `pipe` loops, so only this sees it.
+    struct ShortWriteProbe<C> {
+        inner: C,
+        left_at_completed: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl<T: 'static, C: StreamConsumer<T, Item = u8> + Unpin> StreamConsumer<T> for ShortWriteProbe<C> {
+        type Item = u8;
+
+        fn poll_consume(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            mut store: wasmtime::StoreContextMut<'_, T>,
+            mut source: Source<'_, Self::Item>,
+            finish: bool,
+        ) -> Poll<Result<StreamResult>> {
+            let this = &mut *self;
+            let polled = Pin::new(&mut this.inner).poll_consume(
+                cx,
+                store.as_context_mut(),
+                source.reborrow(),
+                finish,
+            );
+            if let Poll::Ready(Ok(StreamResult::Completed)) = polled {
+                let left = source.remaining(&mut store);
+                this.left_at_completed.lock().push(left);
+            }
+            polled
+        }
+    }
+
     #[test]
     fn a_write_larger_than_any_heap_asks_for_one_chunk() {
         // `usize::MAX` is a write no heap could hold: the reservation is
@@ -460,6 +526,88 @@ mod tests {
         }))
         .expect("the concurrent run completes");
 
+        assert_arrived_in_bounded_chunks(&chunks, &long_guest_write());
+    }
+
+    fn assert_one_write_took_everything(left_at_completed: &Mutex<Vec<usize>>) {
+        assert_eq!(
+            *left_at_completed.lock(),
+            [0],
+            "one write ends once, with nothing of it left unread"
+        );
+    }
+
+    #[test]
+    fn child_stdin_consumer_takes_the_whole_write_in_one_operation() {
+        let engine = async_engine();
+        let mut store = wasmtime::Store::new(&engine, ());
+        let (writer, reader) = crate::byte_channel();
+        let guest = long_guest_write();
+        let total = guest.len();
+        let left_at_completed = Arc::new(Mutex::new(Vec::new()));
+        let probe = ShortWriteProbe {
+            inner: ChannelStreamConsumer::detached(writer),
+            left_at_completed: left_at_completed.clone(),
+        };
+
+        let chunks = block_on(store.run_concurrent(async move |accessor| {
+            accessor.with(|mut access| {
+                let stream = StreamReader::new(&mut access, guest.clone())
+                    .expect("a host stream over the guest's bytes");
+                stream
+                    .pipe(&mut access, probe)
+                    .expect("the consumer takes the stream");
+            });
+            chunks_until(&reader, total).await
+        }))
+        .expect("the concurrent run completes");
+
+        assert_one_write_took_everything(&left_at_completed);
+        assert_arrived_in_bounded_chunks(&chunks, &long_guest_write());
+    }
+
+    #[test]
+    fn stdout_consumer_takes_the_whole_write_in_one_operation() {
+        let engine = async_engine();
+        let (stdout_tx, stdout_rx) = crate::byte_channel();
+        let (stderr_tx, _stderr_rx) = crate::byte_channel();
+        let (_stdin_tx, stdin_rx) = crate::byte_channel();
+        let data: TestStoreData = store_data_routed(
+            ProcessAuthority::empty(),
+            crate::ComponentOutputMode::Child {
+                stdin_rx,
+                stdout_tx,
+                stderr_tx,
+            },
+            |_| {},
+        );
+        let mut store = wasmtime::Store::new(&engine, data);
+        let guest = long_guest_write();
+        let total = guest.len();
+        let (result_tx, _result_rx) = oneshot::channel();
+        let left_at_completed = Arc::new(Mutex::new(Vec::new()));
+        let probe = ShortWriteProbe {
+            inner: SerialStreamConsumer::new(
+                |data: &mut TestStoreData| data,
+                result_tx,
+                OutputStreamKind::Stdout,
+            ),
+            left_at_completed: left_at_completed.clone(),
+        };
+
+        let chunks = block_on(store.run_concurrent(async move |accessor| {
+            accessor.with(|mut access| {
+                let stream = StreamReader::new(&mut access, guest.clone())
+                    .expect("a host stream over the guest's bytes");
+                stream
+                    .pipe(&mut access, probe)
+                    .expect("the consumer takes the stream");
+            });
+            chunks_until(&stdout_rx, total).await
+        }))
+        .expect("the concurrent run completes");
+
+        assert_one_write_took_everything(&left_at_completed);
         assert_arrived_in_bounded_chunks(&chunks, &long_guest_write());
     }
 
