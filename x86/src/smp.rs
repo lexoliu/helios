@@ -348,18 +348,24 @@ pub(crate) struct PhysicalOffsetAcpiHandler {
 }
 
 /// A processor the MADT describes that the machine can run: a Local APIC
-/// or x2APIC entry with the enabled or the online-capable flag.
+/// or x2APIC entry that is enabled, or that firmware may enable later.
 pub(crate) struct PossibleProcessor {
     pub(crate) apic_id: u32,
     /// The entry's enabled flag: the processor exists now. Without it the
-    /// processor is only online-capable, a possible processor that is not
-    /// present until firmware hot-adds it.
+    /// processor is possible but not present until firmware hot-adds it.
     pub(crate) present: bool,
 }
 
 /// The MADT's possible processors in table order, the first being the
-/// bootstrap processor. An entry with neither the enabled nor the
-/// online-capable flag is not a processor and is skipped.
+/// bootstrap processor.
+///
+/// An enabled entry is present. Whether a disabled entry is a processor
+/// firmware may hot-add depends on the table's revision: ACPI 6.3
+/// (MADT revision 5) added the online-capable flag and made a disabled
+/// entry without it unusable, while earlier revisions list every possible
+/// processor as a disabled entry with no flag at all — QEMU's MADT is
+/// revision 3 and marks each processor beyond `-smp` that way
+/// (`hw/i386/acpi-common.c`, `pc_madt_cpu_entry`).
 ///
 /// Iterates the table without allocating, so it can size the bootstrap
 /// allocator before the heap exists.
@@ -368,17 +374,19 @@ pub(crate) fn possible_processors(
 ) -> impl Iterator<Item = PossibleProcessor> + '_ {
     const LAPIC_ENABLED: u32 = 1 << 0;
     const LAPIC_ONLINE_CAPABLE: u32 = 1 << 1;
+    // ACPI 6.3, 5.2.12.2: the revision that defines the online-capable flag.
+    const ONLINE_CAPABLE_REVISION: u8 = 5;
 
-    madt.entries().filter_map(|entry| {
+    let online_capable_defined = madt.header.revision >= ONLINE_CAPABLE_REVISION;
+    madt.entries().filter_map(move |entry| {
         let (apic_id, flags) = match entry {
             MadtEntry::LocalApic(apic) => (u32::from(apic.apic_id), apic.flags),
             MadtEntry::LocalX2Apic(apic) => (apic.x2apic_id, apic.flags),
             _ => return None,
         };
-        (flags & (LAPIC_ENABLED | LAPIC_ONLINE_CAPABLE) != 0).then_some(PossibleProcessor {
-            apic_id,
-            present: flags & LAPIC_ENABLED != 0,
-        })
+        let present = flags & LAPIC_ENABLED != 0;
+        let possible = present || !online_capable_defined || flags & LAPIC_ONLINE_CAPABLE != 0;
+        possible.then_some(PossibleProcessor { apic_id, present })
     })
 }
 
