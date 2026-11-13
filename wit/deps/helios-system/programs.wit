@@ -251,6 +251,10 @@ interface programs {
     out-of-memory,
     unavailable,
     internal,
+    /// The program file does not exist.
+    not-found,
+    /// Reading the program file failed with an I/O error.
+    io,
   }
 
   record spawn-error {

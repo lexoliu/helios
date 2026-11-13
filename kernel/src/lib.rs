@@ -169,8 +169,9 @@ pub use kernel_exception::{
 };
 pub use limine_tpm_event_log::LimineTpmEventLogRequest;
 pub use machine::{
-    AdvanceCause, DeviceResets, Generation, MachineGeneration, MachineGenerationHandle,
-    ResetDevice, UnhandledAdvances, install_generation_reactions,
+    AdvanceCause, DeviceResets, GENERATION_PROBE_INTERVAL, Generation, MachineGeneration,
+    MachineGenerationHandle, ResetDevice, UnhandledAdvances, install_generation_reactions,
+    spawn_generation_probe,
 };
 pub use memory::{
     AGE_BATCH_PAGES, AccessibilityPlan, BalloonHandle, BalloonStats, BootMemoryPlan,

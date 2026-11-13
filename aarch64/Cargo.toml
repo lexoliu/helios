@@ -8,7 +8,7 @@ default = ["embedded-debugger"]
 embedded-debugger = ["helios-kernel/embedded-debugger"]
 
 [dependencies]
-acpi = "6.1.1"
+acpi = { git = "https://github.com/rust-osdev/acpi", branch = "main", default-features = false, features = ["aml"] }
 arm-gic = "0.9.1"
 # The ID, key and control registers return-address signing programs. `arm-gic`
 # pins its sysreg subcrates to exactly 0.4.0, so this stays at that version.

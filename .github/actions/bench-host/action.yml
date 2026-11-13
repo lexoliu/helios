@@ -71,9 +71,12 @@ runs:
     # the input; every caller checks out at `helios`.
     - uses: ./helios/.github/actions/vhost-vsock
     - uses: astral-sh/setup-uv@v6
+    # `tools/bench/native/build.sh`, which `helios-bench run` starts with
+    # whenever a Linux side is in the run, links `helios-compiler-host`
+    # through `cargo zigbuild` and refuses to start without it.
     - uses: taiki-e/install-action@v2
       with:
-        tool: wasm-tools
+        tool: wasm-tools,cargo-zigbuild
     - uses: mlugg/setup-zig@v2
       with:
         version: 0.13.0

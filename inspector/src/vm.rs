@@ -1058,6 +1058,10 @@ struct VmProfile {
     host_share: Option<VmHostShareProfile>,
     watchdog: Option<VmWatchdogProfile>,
     entropy: VmEntropyProfile,
+    /// Whether this machine can carry QEMU's `vmgenid` device, which
+    /// publishes the VM Generation ID through an ACPI SSDT. Only the x86
+    /// machines build that table; `virt` on aarch64 and riscv64 has none.
+    vm_generation_id: bool,
     /// The `-machine` option list that makes this machine publish ACPI
     /// tables instead of a device tree, when it can publish both.
     acpi_machine: Option<&'static str>,
@@ -1131,6 +1135,7 @@ const AARCH64_VIRT_HVF_PROFILE: VmProfile = VmProfile {
     host_share: Some(VmHostShareProfile::Virtio9pMmio),
     watchdog: Some(VmWatchdogProfile::I6300Esb),
     entropy: VmEntropyProfile::VirtioRngMmio,
+    vm_generation_id: false,
     // The virtio devices of the `virt` machines are memory-mapped, and
     // virtio-iommu translates PCI endpoints only, so there is nothing
     // here it could confine.
@@ -1166,6 +1171,7 @@ const AARCH64_VIRT_TCG_PROFILE: VmProfile = VmProfile {
     host_share: Some(VmHostShareProfile::Virtio9pMmio),
     watchdog: Some(VmWatchdogProfile::I6300Esb),
     entropy: VmEntropyProfile::VirtioRngMmio,
+    vm_generation_id: false,
     // The virtio devices of the `virt` machines are memory-mapped, and
     // virtio-iommu translates PCI endpoints only, so there is nothing
     // here it could confine.
@@ -1200,6 +1206,7 @@ const RISCV64_VM_PROFILE: VmProfile = VmProfile {
     host_share: Some(VmHostShareProfile::Virtio9pMmio),
     watchdog: Some(VmWatchdogProfile::I6300Esb),
     entropy: VmEntropyProfile::VirtioRngMmio,
+    vm_generation_id: false,
     // The virtio devices of the `virt` machines are memory-mapped, and
     // virtio-iommu translates PCI endpoints only, so there is nothing
     // here it could confine.
@@ -1236,6 +1243,7 @@ const X86_64_VM_PROFILE: VmProfile = VmProfile {
     host_share: Some(VmHostShareProfile::Virtio9pPci),
     watchdog: Some(VmWatchdogProfile::I6300Esb),
     entropy: VmEntropyProfile::VirtioRngPci,
+    vm_generation_id: true,
     acpi_machine: None,
     iommu: Some(VmIommuProfile::VirtioIommuPci),
     balloon: VmBalloonProfile::VirtioBalloonPci,
@@ -5470,6 +5478,9 @@ impl VmRuntime {
             configure_watchdog(&mut qemu, watchdog);
         }
         configure_entropy_device(&mut qemu, command.profile.entropy, command.virtio_devices);
+        if command.profile.vm_generation_id {
+            configure_vm_generation_id(&mut qemu);
+        }
         configure_balloon(&mut qemu, command.profile.balloon, command.virtio_devices);
         if command.desktop {
             configure_display(
@@ -6373,6 +6384,13 @@ fn configure_sound(
     qemu.arg("-device").arg(device.to_string());
 }
 
+/// Attaches the VM Generation ID device. `guid=auto` has QEMU draw a
+/// fresh identifier at start and write a new one on every snapshot
+/// restore, which is what the guest compares against.
+fn configure_vm_generation_id(qemu: &mut Command) {
+    qemu.arg("-device").arg("vmgenid,guid=auto");
+}
+
 fn configure_watchdog(qemu: &mut Command, watchdog: VmWatchdogProfile) {
     match watchdog {
         VmWatchdogProfile::I6300Esb => {
@@ -6444,13 +6462,20 @@ mod tests {
         Step(#[from] BuildStepError),
         #[error("{0}")]
         WorkspaceRoot(#[from] WorkspaceRootError),
-        #[error("failed to spawn cargo for watchdog self-test kernel build: {source}")]
+        #[error("failed to spawn cargo for the self-test kernel build: {source}")]
         SpawnCargo {
             #[source]
             source: io::Error,
         },
-        #[error("watchdog self-test kernel build exited with status {status}")]
+        #[error("self-test kernel build exited with status {status}")]
         CargoExited { status: std::process::ExitStatus },
+        #[error("failed to open the guest serial link: {source}")]
+        OpenSerial {
+            #[source]
+            source: crate::serial::SerialError,
+        },
+        #[error("expected a {CFI_VIOLATION_MESSAGE:?} panic from the guest, got: {outcome}")]
+        NotAControlFlowViolation { outcome: String },
         #[error("socket path must be valid UTF-8")]
         SocketPathNotUtf8,
         #[error("failed to connect {purpose} RPC client: {source}")]
@@ -6518,6 +6543,9 @@ mod tests {
 
     const WATCHDOG_SELF_TEST_DELAY_MS: &str = "5000";
 
+    /// What the aarch64 kernel's panic carries when a return address fails
+    /// authentication (`aarch64/src/cfi.rs`).
+    const CFI_VIOLATION_MESSAGE: &str = "control-flow violation:";
     const WATCHDOG_TIMEOUT_SECS: &str = "10";
     const WATCHDOG_STAGE_TIMEOUT: Duration = Duration::from_secs(120);
     const DIRECT_EXEC_TIMEOUT: Duration = Duration::from_secs(900);
@@ -7413,6 +7441,22 @@ mod tests {
             Some(VmWatchdogProfile::I6300Esb)
         );
         assert_eq!(X86_64_VM_PROFILE.entropy, VmEntropyProfile::VirtioRngPci);
+    }
+
+    /// Only the x86 machines build the ACPI table the device publishes
+    /// through, so only the x86 profile attaches it.
+    #[test]
+    fn only_the_x86_profile_attaches_the_vm_generation_id() {
+        const {
+            assert!(X86_64_VM_PROFILE.vm_generation_id);
+            assert!(!AARCH64_VIRT_HVF_PROFILE.vm_generation_id);
+            assert!(!AARCH64_VIRT_TCG_PROFILE.vm_generation_id);
+            assert!(!RISCV64_VM_PROFILE.vm_generation_id);
+        }
+        assert_eq!(
+            rendered(configure_vm_generation_id),
+            ["-device", "vmgenid,guid=auto"]
+        );
     }
 
     /// A `vm` invocation with nothing but its defaults, for tests that
@@ -8692,17 +8736,72 @@ mod tests {
         Ok(())
     }
 
+    /// The aarch64 kernel built with `HELIOS_CFI_SELF_TEST` corrupts a signed
+    /// return address on the bootstrap processor once every processor has
+    /// started, so a machine that enforces return-address signing panics with
+    /// a control-flow violation before the debugger reports that it runs.
+    #[test]
+    #[ignore = "requires qemu and a cross-compiled aarch64 kernel"]
+    fn cfi_self_test_panics_aarch64() -> Result<(), GuestTestFailure> {
+        let command = guest_test_command(&AARCH64_VIRT_TCG_PROFILE);
+        build_self_test_kernel(&command, &[("HELIOS_CFI_SELF_TEST", "1")])?;
+        let mut runtime = VmRuntime::spawn(&command)?;
+        let socket = runtime
+            .socket_path()
+            .to_str()
+            .ok_or(GuestTestFailure::SocketPathNotUtf8)?
+            .to_owned();
+        let baud = command.baud;
+        let outcome = crate::runtime::block_on(async move {
+            let io = crate::serial::open(&socket, baud)
+                .await
+                .map_err(|source| GuestTestFailure::OpenSerial { source })?;
+            let (read, _write) = io.into_split();
+            Ok::<_, GuestTestFailure>(crate::ready::wait_for_boot(read).await.map(drop))
+        })?;
+        runtime.shutdown();
+        match outcome {
+            Err(crate::ready::BootError::GuestPanicked { report, trailer })
+                if report.contains(CFI_VIOLATION_MESSAGE)
+                    || trailer.contains(CFI_VIOLATION_MESSAGE) =>
+            {
+                Ok(())
+            }
+            Err(other) => Err(GuestTestFailure::NotAControlFlowViolation {
+                outcome: other.to_string(),
+            }),
+            Ok(()) => Err(GuestTestFailure::NotAControlFlowViolation {
+                outcome: "the guest booted to the debugger".to_owned(),
+            }),
+        }
+    }
+
     fn assert_watchdog_reset(arch: VmArch) -> Result<(), GuestTestFailure> {
-        build_watchdog_test_kernel(arch)?;
         let command = watchdog_test_command(arch);
+        build_self_test_kernel(
+            &command,
+            &[
+                ("HELIOS_WATCHDOG_SELF_TEST", "1"),
+                ("HELIOS_WATCHDOG_TIMEOUT_SECS", WATCHDOG_TIMEOUT_SECS),
+                (
+                    "HELIOS_WATCHDOG_SELF_TEST_DELAY_MS",
+                    WATCHDOG_SELF_TEST_DELAY_MS,
+                ),
+            ],
+        )?;
         let mut runtime = VmRuntime::spawn(&command)?;
         wait_for_stage_occurrences(runtime.socket_path(), DEBUGGER_RUN_STAGE_MARKER, 2)?;
         runtime.shutdown();
         Ok(())
     }
 
-    fn build_watchdog_test_kernel(arch: VmArch) -> Result<(), GuestTestFailure> {
-        let command = watchdog_test_command(arch);
+    /// Builds the kernel `command` boots with the self-test environment
+    /// `envs` set, after the host tools and the bootfs it needs.
+    fn build_self_test_kernel(
+        command: &ResolvedVmCommand,
+        envs: &[(&str, &str)],
+    ) -> Result<(), GuestTestFailure> {
+        let profile = command.profile;
         run_step(
             "building helios-cli",
             command
@@ -8719,17 +8818,12 @@ mod tests {
         let status = cargo
             .current_dir(repo_root()?)
             .arg("build")
-            .args(arch.build_std_arguments())
+            .args(profile.arch.build_std_arguments())
             .arg("--target")
-            .arg(arch.profile().cargo_target)
+            .arg(profile.cargo_target)
             .arg("--bin")
-            .arg(arch.profile().kernel_artifact_name)
-            .env("HELIOS_WATCHDOG_SELF_TEST", "1")
-            .env("HELIOS_WATCHDOG_TIMEOUT_SECS", WATCHDOG_TIMEOUT_SECS)
-            .env(
-                "HELIOS_WATCHDOG_SELF_TEST_DELAY_MS",
-                WATCHDOG_SELF_TEST_DELAY_MS,
-            )
+            .arg(profile.kernel_artifact_name)
+            .envs(envs.iter().copied())
             .status()
             .map_err(|source| GuestTestFailure::SpawnCargo { source })?;
         if status.success() {
@@ -8739,7 +8833,12 @@ mod tests {
     }
 
     fn watchdog_test_command(arch: VmArch) -> ResolvedVmCommand {
-        let profile = arch.profile();
+        guest_test_command(arch.profile())
+    }
+
+    /// The debug kernel with only the debugger in its bootfs, booted on
+    /// `profile`'s defaults.
+    fn guest_test_command(profile: &'static VmProfile) -> ResolvedVmCommand {
         let build = KernelBuildSpec {
             profile,
             kind: KernelBuildProfile::Debug,

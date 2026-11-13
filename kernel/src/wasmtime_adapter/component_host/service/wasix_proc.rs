@@ -1048,11 +1048,11 @@ where
             p1_null_device_stat(),
         );
     }
-    let follow = wasi_fs::follow_within(&base, p1_path_flags(flags));
-    let (identity, stat_value) = match p1_stat_absolute_path(caller, &absolute, follow).await {
-        Ok(stat) => stat,
-        Err(errno) => return errno,
-    };
+    let (identity, stat_value) =
+        match p1_stat_below(caller, &base, p1_path_flags(flags), &path).await {
+            Ok(stat) => stat,
+            Err(errno) => return errno,
+        };
     p1_write_filestat(caller, stat, identity, stat_value)
 }
 
@@ -3332,24 +3332,38 @@ where
     HostFs: crate::HostFileSystem,
 {
     let namespace = p1_namespace(caller);
-    let not_granted = || {
-        wasmtime::Error::new(ProgramExecError {
+    read_program_source_from(&namespace, &caller.data().authority, source_path)
+        .await
+        .map_err(wasmtime::Error::new)
+}
+
+/// Reads the program file `source_path` names from `namespace`, if
+/// `authority` admits loading it.
+///
+/// A path the authority refuses is
+/// [`ProgramExecErrorDetail::ProgramSourceNotGranted`]; once admitted, a
+/// failing read is the filesystem's own error, so a missing file is
+/// [`ProgramExecErrorKind::NotFound`] and never a refusal.
+pub(super) async fn read_program_source_from<HostFs>(
+    namespace: &Namespace<HostFs>,
+    authority: &ProcessAuthority,
+    source_path: &str,
+) -> Result<ProgramSource, ProgramExecError>
+where
+    HostFs: crate::HostFileSystem,
+{
+    let floor = authority
+        .program_load_floor(source_path)
+        .ok_or(ProgramExecError {
             kind: ProgramExecErrorKind::PermissionDenied,
             detail: ProgramExecErrorDetail::ProgramSourceNotGranted,
-        })
-    };
-    let floor = caller
-        .data()
-        .authority
-        .program_load_floor(source_path)
-        .ok_or_else(not_granted)?
-        .to_owned();
+        })?;
     // Trust follows the layer that produced the bytes, never the path or
     // the mount: only boot-image bytes skip verification (#483).
-    wasi_fs::read_program_file(&namespace, source_path, &floor)
+    wasi_fs::read_program_file(namespace, source_path, floor)
         .await
         .map(ProgramSource::from_file)
-        .map_err(|_| not_granted())
+        .map_err(ProgramExecError::from_source_read_error)
 }
 
 pub(super) fn wasix_resolve_exec_guest_name<CpuImpl, Net, HostFs>(

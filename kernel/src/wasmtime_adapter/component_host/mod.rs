@@ -212,6 +212,34 @@ pub type SbiRawRwLock = crate::ComponentRawRwLock;
 pub type SbiRawRwLockReadGuard = crate::ComponentRawRwLockReadGuard;
 pub type SbiRawRwLockWriteGuard = crate::ComponentRawRwLockWriteGuard;
 
+/// A WIT `aot-hint` a program request carries, taken into the kernel's own
+/// hint. The one place a hint the kernel cannot compile for is refused, so a
+/// request that names it fails before its source is read or anything is
+/// compiled.
+trait RequestedAotHint {
+    fn compile_hint(self) -> Result<AotCompileHint, ProgramExecError>;
+}
+
+macro_rules! impl_requested_aot_hint {
+    ($bindings:ident) => {
+        impl RequestedAotHint for $bindings::helios::system::programs::AotHint {
+            fn compile_hint(self) -> Result<AotCompileHint, ProgramExecError> {
+                match self {
+                    Self::Fast => Err(ProgramExecError {
+                        kind: ProgramExecErrorKind::InvalidHint,
+                        detail: ProgramExecErrorDetail::UnsupportedAotHint,
+                    }),
+                    Self::Balanced => Ok(AotCompileHint::Balanced),
+                    Self::Performance => Ok(AotCompileHint::Performance),
+                }
+            }
+        }
+    };
+}
+
+impl_requested_aot_hint!(debugger_bindings);
+impl_requested_aot_hint!(program_bindings);
+
 macro_rules! impl_program_bindings {
     ($bindings:ident, $convert_result:ident, $convert_error:ident, $build_authority:ident) => {
         impl<CpuImpl, Net, HostFs> $bindings::helios::system::programs::Host
@@ -564,6 +592,15 @@ macro_rules! impl_program_bindings {
                                 return Ok(Err($convert_error(error)));
                             }
                         };
+                    // Refused before the source is read: the hint is a
+                    // property of the request alone.
+                    let hint = match request.hint.map(RequestedAotHint::compile_hint).transpose() {
+                        Ok(hint) => hint,
+                        Err(error) => {
+                            launch.refused(error.kind);
+                            return Ok(Err($convert_error(error)));
+                        }
+                    };
                     let source =
                         match read_program_source(accessor, &request.path, &caller_authority).await
                         {
@@ -583,18 +620,6 @@ macro_rules! impl_program_bindings {
                         };
                     launch.record(LaunchPhase::SourceRead);
                     launch.record_source_bytes(source.payload_len());
-                    let hint = match request.hint {
-                        Some($bindings::helios::system::programs::AotHint::Fast) => {
-                            Some(AotCompileHint::Fast)
-                        }
-                        Some($bindings::helios::system::programs::AotHint::Balanced) => {
-                            Some(AotCompileHint::Balanced)
-                        }
-                        Some($bindings::helios::system::programs::AotHint::Performance) => {
-                            Some(AotCompileHint::Performance)
-                        }
-                        None => None,
-                    };
                     let executed = service
                         .exec_buffered(
                             &compile_authority,
@@ -659,6 +684,12 @@ macro_rules! impl_program_bindings {
                         Ok(authority) => authority,
                         Err(error) => return Ok(Err($convert_error(error))),
                     };
+                    // Refused before the source is read: the hint is a
+                    // property of the request alone.
+                    let hint = match request.hint.compile_hint() {
+                        Ok(hint) => hint,
+                        Err(error) => return Ok(Err($convert_error(error))),
+                    };
                     let source = match read_program_source(
                         accessor,
                         &request.source_path,
@@ -680,15 +711,6 @@ macro_rules! impl_program_bindings {
                             kind: $bindings::helios::system::programs::ExecErrorKind::InvalidHint,
                             detail: "aot only accepts raw wasm inputs".to_owned(),
                         }));
-                    };
-                    let hint = match request.hint {
-                        $bindings::helios::system::programs::AotHint::Fast => AotCompileHint::Fast,
-                        $bindings::helios::system::programs::AotHint::Balanced => {
-                            AotCompileHint::Balanced
-                        }
-                        $bindings::helios::system::programs::AotHint::Performance => {
-                            AotCompileHint::Performance
-                        }
                     };
                     // The compile runs in its own session task, which stops
                     // the compile when this call is dropped.
@@ -1034,6 +1056,49 @@ mod lowering_tests {
         assert_eq!(lowered.as_slice(), [1, 2, 3, 4]);
         assert_eq!(lowered.as_ptr(), source_ptr);
     }
+}
+
+#[cfg(test)]
+mod hint_tests {
+    use super::{
+        AotCompileHint, ProgramExecErrorDetail, ProgramExecErrorKind, RequestedAotHint,
+        debugger_bindings, program_bindings,
+    };
+
+    macro_rules! hint_cases {
+        ($name:ident, $bindings:ident) => {
+            mod $name {
+                use super::*;
+                use $bindings::helios::system::programs::AotHint;
+
+                /// The conversion both the exec and the aot request make
+                /// before the source is read and the compiler is asked.
+                #[test]
+                fn a_request_for_fast_is_refused() {
+                    let error = AotHint::Fast
+                        .compile_hint()
+                        .expect_err("fast must be refused at the request");
+                    assert_eq!(error.kind, ProgramExecErrorKind::InvalidHint);
+                    assert_eq!(error.detail, ProgramExecErrorDetail::UnsupportedAotHint);
+                }
+
+                #[test]
+                fn the_other_hints_convert() {
+                    assert_eq!(
+                        AotHint::Balanced.compile_hint(),
+                        Ok(AotCompileHint::Balanced)
+                    );
+                    assert_eq!(
+                        AotHint::Performance.compile_hint(),
+                        Ok(AotCompileHint::Performance)
+                    );
+                }
+            }
+        };
+    }
+
+    hint_cases!(debugger, debugger_bindings);
+    hint_cases!(program, program_bindings);
 }
 
 #[cfg(test)]
@@ -1490,7 +1555,7 @@ where
     let namespace = accessor.with(|mut access| access.get().filesystem().clone());
     let contents = crate::wasmtime_adapter::wasi::read_program_file(&namespace, &absolute, floor)
         .await
-        .map_err(map_fs_error_to_program_exec)?;
+        .map_err(ProgramExecError::from_source_read_error)?;
     Ok(Ok(ProgramSource::from_file(contents)))
 }
 
@@ -3386,6 +3451,8 @@ fn convert_launch_error(error: crate::ProgramExecError) -> debugger_wit::program
             ProgramExecErrorKind::OutOfMemory => debugger_wit::programs::ExecErrorKind::OutOfMemory,
             ProgramExecErrorKind::Unavailable => debugger_wit::programs::ExecErrorKind::Unavailable,
             ProgramExecErrorKind::Internal => debugger_wit::programs::ExecErrorKind::Internal,
+            ProgramExecErrorKind::NotFound => debugger_wit::programs::ExecErrorKind::NotFound,
+            ProgramExecErrorKind::Io => debugger_wit::programs::ExecErrorKind::Io,
         },
         detail: error.detail.as_str().to_owned(),
     }
@@ -3431,6 +3498,8 @@ fn convert_program_launch_error(
             ProgramExecErrorKind::OutOfMemory => program_wit::programs::ExecErrorKind::OutOfMemory,
             ProgramExecErrorKind::Unavailable => program_wit::programs::ExecErrorKind::Unavailable,
             ProgramExecErrorKind::Internal => program_wit::programs::ExecErrorKind::Internal,
+            ProgramExecErrorKind::NotFound => program_wit::programs::ExecErrorKind::NotFound,
+            ProgramExecErrorKind::Io => program_wit::programs::ExecErrorKind::Io,
         },
         detail: error.detail.as_str().to_owned(),
     }
